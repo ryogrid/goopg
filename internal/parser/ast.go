@@ -1904,6 +1904,14 @@ type CompatNoopStmt struct {
 	// the statement is not a CREATE CAST. DU-002 slice 395.
 	CastContext string
 	CastMethod  string
+	// CastFuncName / CastFuncArgs carry a `WITH FUNCTION fn[(argtypes)]` clause's
+	// referenced function name and explicit argument-type list (empty when the
+	// cast is WITHOUT FUNCTION / WITH INOUT, or when the function form omits the
+	// parenthesised arg list). The executor resolves these to the function's
+	// pg_proc OID and stores it as pg_cast.castfunc so dumpCast's
+	// findFuncByOid succeeds and re-emits `WITH FUNCTION <ns>.<sig>`. DU-002 slice 397.
+	CastFuncName ObjectName
+	CastFuncArgs []string
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

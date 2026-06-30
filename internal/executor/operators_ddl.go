@@ -12802,11 +12802,37 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
 		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).
 		// ArgTypes carries [source, target]; CastContext/CastMethod carry
-		// castcontext/castmethod. WITH FUNCTION casts (Method=="f") are not dumped
-		// — castfunc stays 0 and dumpCast would warn — so only the binary/INOUT
-		// forms (castfunc=0) are registered for fidelity. DU-002 slice 395.
-		if len(s.ArgTypes) == 2 && s.CastMethod != "f" {
-			im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod)
+		// castcontext/castmethod. DU-002 slice 395.
+		if len(s.ArgTypes) == 2 {
+			var funcOID uint32
+			if s.CastMethod == "f" {
+				// WITH FUNCTION: resolve the referenced function to its pg_proc
+				// OID so pg_cast.castfunc is non-zero and dumpCast's findFuncByOid
+				// re-emits `WITH FUNCTION <ns>.<signature>`. The OID is the
+				// routine's OID, identical to the one goopg's pg_proc virtual view
+				// assigns the function, so the dump's func/cast cross-reference
+				// matches. Resolution mirrors COMMENT ON FUNCTION (slice 147): the
+				// explicit arg-type list keys the right overload; a bare
+				// `WITH FUNCTION fn` (no args) falls back to the sole overload.
+				// DU-002 slice 397.
+				if rs := im.Routines(); rs != nil && s.CastFuncName.Name != "" {
+					if len(s.CastFuncArgs) > 0 {
+						argTypes := make([]catalog.Type, len(s.CastFuncArgs))
+						for i, a := range s.CastFuncArgs {
+							argTypes[i] = catalog.Type{Name: strings.ToLower(a)}
+						}
+						if r, ok := rs.Lookup(s.CastFuncName, argTypes); ok && r != nil {
+							funcOID = r.OID
+						}
+					}
+					if funcOID == 0 {
+						if overloads := rs.LookupByName(s.CastFuncName); len(overloads) == 1 {
+							funcOID = overloads[0].OID
+						}
+					}
+				}
+			}
+			im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)
 		}
 	case "schema":
 		// Register user-created schema so schema-qualified queries resolve correctly.

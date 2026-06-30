@@ -3400,6 +3400,20 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup` asserts `COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea';`,
       verified byte-identical vs real pg_dump 18.3; parser coverage `TestParseCommentOnCast`. In-memory only (no restart
       persistence), like the cast registry.
+      **2026-07-01 (loop #37, design 0110-0001 slice 397): WITH FUNCTION cast round-trip** (closes the slice-395 WITH
+      FUNCTION deferral). `dumpCast`'s `COERCION_METHOD_FUNCTION` arm renders `WITH FUNCTION <ns>.<signature>` via
+      `findFuncByOid(castfunc)` + `format_function_signature` (signature read from the function's real
+      `pg_proc.proargtypes`), so the only requirement is `pg_cast.castfunc == the function's pg_proc.oid`. Slice 395 left
+      `castfunc = 0` and deferred this form. Three-layer fix: (parser) `parseCreateCastTail`'s `method="f"` branch now
+      parses `WITH FUNCTION funcname[(argtypes)]` into new `CompatNoopStmt.CastFuncName`/`CastFuncArgs` (was discarded);
+      (executor) `execCompatNoop` "cast" resolves the routine via `Routines().Lookup` (explicit arg list → exact overload,
+      mirrors COMMENT ON FUNCTION slice 147; `LookupByName` sole-overload fallback when parens omitted) and passes the
+      routine OID as the new `funcOID` param to `RegisterCast`; (catalog) `RegisterCast` stores it on `Cast.FuncOID` (the
+      pg_cast virtual row already surfaced FuncOID/Method). `Routine.OID` == the pg_proc virtual-view OID, so the func/cast
+      cross-reference matches. Fixture `public.text_as_int(text) RETURNS integer` + `CREATE CAST (text AS integer) WITH
+      FUNCTION public.text_as_int(text)` (text→integer has no built-in cast per pg_cast.dat) →
+      `CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);` byte-identical vs real pg_dump 18.3 (live
+      /tmp/castfn_pg); parser coverage `TestParseCreateCastWithFunction`. In-memory only (no restart persistence).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

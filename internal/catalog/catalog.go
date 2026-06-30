@@ -6497,8 +6497,9 @@ func (c *InMemory) registerSystemTables() {
 	// view stays correct for the no-user-cast case); dumpCast renders the source/
 	// target via getFormattedTypeName(castsource/casttarget) — hence the type names
 	// resolve to their canonical pg_type OIDs, which goopg already surfaces in
-	// pg_type. castfunc=0 (WITHOUT FUNCTION / WITH INOUT) skips findFuncByOid.
-	// DU-002 slice 395.
+	// pg_type. castfunc=0 (WITHOUT FUNCTION / WITH INOUT) skips findFuncByOid; a
+	// WITH FUNCTION cast carries the resolved pg_proc OID so dumpCast re-emits the
+	// `WITH FUNCTION <ns>.<signature>` clause. DU-002 slices 395, 397.
 	pgCast.VirtualRows = func() [][]string {
 		casts := c.ListCasts()
 		if len(casts) == 0 {
@@ -6510,7 +6511,7 @@ func (c *InMemory) registerSystemTables() {
 				strconv.FormatUint(uint64(cs.OID), 10),                // oid
 				strconv.FormatUint(uint64(TypeNameToOID(cs.SourceType)), 10), // castsource
 				strconv.FormatUint(uint64(TypeNameToOID(cs.TargetType)), 10), // casttarget
-				strconv.FormatUint(uint64(cs.FuncOID), 10),            // castfunc (0 for this slice)
+				strconv.FormatUint(uint64(cs.FuncOID), 10),            // castfunc (0 unless WITH FUNCTION)
 				cs.Context,                                            // castcontext
 				cs.Method,                                             // castmethod
 			})
@@ -9946,8 +9947,10 @@ type Cast struct {
 
 // RegisterCast records a user-defined cast, allocating a stable OID on first
 // sight. Idempotent: re-registering the same (source, target) pair refreshes the
-// context/method but keeps the OID. DU-002 slice 395.
-func (c *InMemory) RegisterCast(source, target, context, method string) *Cast {
+// context/method/funcOID but keeps the OID. funcOID is pg_cast.castfunc — 0 for
+// WITHOUT FUNCTION / WITH INOUT, or the resolved pg_proc OID for WITH FUNCTION
+// casts (DU-002 slice 397). DU-002 slice 395.
+func (c *InMemory) RegisterCast(source, target, context, method string, funcOID uint32) *Cast {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.casts == nil {
@@ -9961,9 +9964,10 @@ func (c *InMemory) RegisterCast(source, target, context, method string) *Cast {
 		if method != "" {
 			cs.Method = method
 		}
+		cs.FuncOID = funcOID
 		return cs
 	}
-	cs := &Cast{OID: c.allocOIDLocked(), SourceType: source, TargetType: target, Context: context, Method: method}
+	cs := &Cast{OID: c.allocOIDLocked(), SourceType: source, TargetType: target, Context: context, Method: method, FuncOID: funcOID}
 	c.casts[key] = cs
 	return cs
 }

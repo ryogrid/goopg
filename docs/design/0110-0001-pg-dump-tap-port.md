@@ -9758,6 +9758,41 @@ and asserts the trailing `COMMENT ON CAST (text AS bytea) IS '...';` appears, ve
 18.3. Parser coverage: `TestParseCommentOnCast`. Like the cast registry itself, the comment is in-memory only (no
 restart persistence).
 
+### Slice 397 — **WITH FUNCTION cast round-trip** (closes the slice-395 WITH FUNCTION deferral)
+
+Slice 395 registered binary (`WITHOUT FUNCTION`) and `WITH INOUT` casts but left `castfunc = 0` and deferred the
+`WITH FUNCTION` form, because `dumpCast`'s `COERCION_METHOD_FUNCTION` arm calls `findFuncByOid(cast->castfunc)` and
+`pg_fatal`s (or, with a 0 OID, warns "bogus value in pg_cast.castfunc") unless the cast references a real `pg_proc`
+row. With user functions already round-tripping (slices 147+), the missing piece was wiring the parsed function
+reference through to a resolved OID.
+
+`dumpCast` renders the clause as `WITH FUNCTION %s.%s` where the namespace is `fmtId(funcInfo->dobj.namespace…)` and the
+signature is `format_function_signature(fout, funcInfo, true)` — i.e. `funcname(argtype, …)` built from the function's
+**actual** `pg_proc.proargtypes`, not from whatever arg list the user typed. So the only requirement is that
+`pg_cast.castfunc` equal the function's `pg_proc.oid`.
+
+Three layers:
+
+- **parser** (`internal/parser/ddl.go` `parseCreateCastTail`): the `method = "f"` branch now parses
+  `WITH FUNCTION funcname [ (argtype [, …]) ]` — `parseObjectName` for the (schema-qualifiable) function name and a
+  comma-separated `parseCastTypeName` loop for the optional bare arg-type list — into new
+  `CompatNoopStmt.CastFuncName`/`CastFuncArgs` (`ast.go`). PG's cast grammar permits only bare types here (no arg names).
+- **executor** (`internal/executor/operators_ddl.go` `execCompatNoop` `case "cast"`): for `Method == "f"` it resolves
+  the routine via `Routines().Lookup(CastFuncName, argTypes)` (explicit arg list → exact overload, mirroring
+  COMMENT ON FUNCTION / slice 147) with a `LookupByName` sole-overload fallback when the parens are omitted, and passes
+  the routine's `OID` as the new `funcOID` parameter to `RegisterCast`. That OID is identical to the one goopg's
+  `pg_proc` virtual view assigns the function (both are `Routine.OID`), so the dump's func/cast cross-reference matches.
+- **catalog** (`internal/catalog/catalog.go`): `RegisterCast` gains a `funcOID uint32` parameter stored on
+  `Cast.FuncOID`; the `pg_cast` virtual row already surfaced `cs.FuncOID` as `castfunc` and `cs.Method` as `castmethod`,
+  so no view change was needed.
+
+The `TestPort_PgDumpConnectionSetup` fixture creates `public.text_as_int(text) RETURNS integer` and
+`CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)` (text→integer has no built-in cast per
+`pg_cast.dat`, so the user cast is unambiguous) and asserts
+`CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);` — verified byte-identical vs real pg_dump 18.3
+(live `/tmp/castfn_pg` cluster). Parser coverage: `TestParseCreateCastWithFunction`. The cast/comment registry remains
+in-memory only (no restart persistence) — the same carry-forward deferral as slices 389–396.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

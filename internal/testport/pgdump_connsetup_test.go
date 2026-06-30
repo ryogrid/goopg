@@ -5032,6 +5032,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea'"); err != nil {
 		t.Fatalf("comment on cast text->bytea: %v", err)
 	}
+	// Slice 397: a WITH FUNCTION cast must round-trip. pg_dump's dumpCast
+	// COERCION_METHOD_FUNCTION arm calls findFuncByOid(castfunc) and renders
+	// `WITH FUNCTION <ns>.<signature>` via format_function_signature (which
+	// reads the function's real pg_proc.proargtypes). goopg previously parsed
+	// the WITH FUNCTION form but discarded the function reference (castfunc
+	// stayed 0), so dumpCast warned "bogus value in pg_cast.castfunc". The parser
+	// now captures the function name + arg types, and the executor resolves them
+	// to the routine's pg_proc OID (identical to the OID goopg's pg_proc virtual
+	// view assigns the function), so castfunc is non-zero and the func/cast
+	// cross-reference matches. text->integer has no built-in cast in PG (pg_cast.dat),
+	// so the user cast is unambiguous. Verified byte-identical vs real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.text_as_int(text) RETURNS integer LANGUAGE sql AS $$ SELECT length($1) $$"); err != nil {
+		t.Fatalf("create function text_as_int: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)"); err != nil {
+		t.Fatalf("create cast text->integer with function: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7784,6 +7801,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// parser branch re-surfaces exactly here.
 		if want := "COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea';"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing cast comment %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 397 (asserted):** a WITH FUNCTION cast must round-trip via
+		// dumpCast's COERCION_METHOD_FUNCTION arm. The clause names the function
+		// schema-qualified with its real signature (format_function_signature).
+		// A regression that dropped the castfunc resolution (castfunc back to 0)
+		// makes dumpCast warn and emit a bare `WITH FUNCTION` with no name — caught
+		// exactly here.
+		if want := "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing WITH FUNCTION cast %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

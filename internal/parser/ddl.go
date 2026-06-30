@@ -752,9 +752,9 @@ func (p *parser) parseCastTypeName() string {
 //
 // form, recording the source/target types, castmethod and castcontext on a
 // CompatNoopStmt so the executor registers the cast and pg_dump round-trips it
-// (pg_cast virtual view → getCasts/dumpCast). WITH FUNCTION is parsed but its
-// referenced function is not resolved (castfunc stays 0); that form is deferred.
-// DU-002 slice 395.
+// (pg_cast virtual view → getCasts/dumpCast). The WITH FUNCTION form also
+// captures the referenced function name + arg types (CastFuncName/CastFuncArgs)
+// so the executor can resolve pg_cast.castfunc. DU-002 slices 395, 397.
 func (p *parser) parseCreateCastTail(pos int) (Stmt, error) {
 	ns := &CompatNoopStmt{pos: pos, Tag: "CREATE CAST", ObjType: "cast"}
 	if !p.acceptSymbol("(") {
@@ -779,6 +779,26 @@ func (p *parser) parseCreateCastTail(pos int) (Stmt, error) {
 		} else {
 			_ = p.acceptKeyword(KwFunction)
 			method = "f"
+			// WITH FUNCTION funcname [ (argtype [, ...]) ]. Capture the function
+			// name and its explicit argument-type list so the executor can
+			// resolve the routine's pg_proc OID for pg_cast.castfunc. PG's cast
+			// grammar permits only bare argument types here (no arg names), so a
+			// comma-separated parseCastTypeName loop suffices. DU-002 slice 397.
+			if fn, err := p.parseObjectName(); err == nil {
+				ns.CastFuncName = fn
+			}
+			if p.acceptSymbol("(") {
+				for !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") && p.cur().Kind != TokenEOF {
+					at := p.parseCastTypeName()
+					if at != "" {
+						ns.CastFuncArgs = append(ns.CastFuncArgs, at)
+					}
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				_ = p.acceptSymbol(")")
+			}
 		}
 	}
 	ns.CastMethod = method
