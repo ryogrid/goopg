@@ -8984,6 +8984,27 @@ captures it for dump fidelity only. (2) the `WITH (check_option=…)` reloption 
 persistence — `SecurityInvoker` is in-memory only (the same shared-catalog runtime-write gap as the other
 restart-durability slices).
 
+### Slice 368 — **trigger `EXECUTE FUNCTION f('a', 'b')` string arguments (TG_ARGV)** (oracle fixture only)
+
+A `CREATE TRIGGER … EXECUTE FUNCTION fn('arg1', 'arg2')` stores its arguments in `pg_trigger.tgargs` (a bytea of
+null-terminated strings); `pg_get_triggerdef_worker` (ruleutils.c:462-486) re-renders them after the function name as a
+comma-separated (`, `) list, each single-quoted via `simple_quote_literal` (embedded single-quotes doubled). pg_dump's
+`dumpTrigger` emits the result verbatim.
+
+goopg's CREATE TRIGGER path already supported this end-to-end: the parser collects the string-literal arguments into
+`CreateTriggerStmt.FuncArgs` (`parseCreateTriggerTail`'s `EXECUTE FUNCTION` arm), `execCreateTrigger` threads them to
+`catalog.Trigger.Args`, and `buildTriggerDefString` (executor `expr.go`) re-emits them with identical `', '` separation and
+`''`-doubled quoting (the lexer already collapses `''`→`'` on the way in, so the stored value is unescaped and re-escaping is
+symmetric). The unit `TestBuildTriggerDefString` already pinned the rendered form (`'a', 'b''c'`) — this slice adds the
+**missing oracle-verified end-to-end fixture** `trg_arg` in `TestPort_PgDumpConnectionSetup` (two args, the second carrying an
+embedded single quote) plus a parser-level `TestParseCreateTriggerFuncArgs` pinning the `FuncArgs` capture. **No production
+change.** Verified byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** the parser **silently skips non-string trigger arguments** (`parseCreateTriggerTail`'s
+`else { p.advance() }` arm) — PG accepts e.g. `EXECUTE FUNCTION fn(42)` and stores `"42"` in tgargs, dumping it back as the
+quoted `'42'`; goopg drops such an arg, so a numeric/identifier trigger argument would not round-trip. (Restart persistence is
+the usual in-memory-catalog gap.)
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

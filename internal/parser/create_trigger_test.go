@@ -63,6 +63,47 @@ func TestParseCreateTriggerUpdateOf(t *testing.T) {
 	}
 }
 
+// TestParseCreateTriggerFuncArgs pins capture of the EXECUTE FUNCTION string
+// arguments (TG_ARGV) into CreateTriggerStmt.FuncArgs. pg_get_triggerdef →
+// pg_dump reconstruct `EXECUTE FUNCTION f('a', 'b')` from pg_trigger.tgargs;
+// goopg threads FuncArgs → catalog.Trigger.Args → buildTriggerDefString (DU-002
+// slice 368). The lexer already collapses a doubled `''` to a single quote, so
+// the stored arg value is unescaped; an arg-less call yields a nil slice.
+func TestParseCreateTriggerFuncArgs(t *testing.T) {
+	cases := []struct {
+		name     string
+		sql      string
+		wantArgs []string
+	}{
+		{
+			name:     "two string args, second with embedded quote",
+			sql:      "CREATE TRIGGER t1 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f('hello', 'wo''rld')",
+			wantArgs: []string{"hello", "wo'rld"},
+		},
+		{
+			name:     "no args",
+			sql:      "CREATE TRIGGER t2 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()",
+			wantArgs: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			s, ok := stmts[0].(*CreateTriggerStmt)
+			if !ok {
+				t.Fatalf("got %T, want *CreateTriggerStmt", stmts[0])
+			}
+			if !eqStrs(s.FuncArgs, tc.wantArgs) {
+				t.Errorf("FuncArgs = %v, want %v", s.FuncArgs, tc.wantArgs)
+			}
+		})
+	}
+}
+
 // TestParseCreateConstraintTrigger pins capture of CREATE CONSTRAINT TRIGGER and
 // the optional `[NOT] DEFERRABLE [INITIALLY {IMMEDIATE|DEFERRED}]` clause that
 // follows the ON-table name. pg_get_triggerdef → pg_dump reconstruct

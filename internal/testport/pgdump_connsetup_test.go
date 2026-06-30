@@ -3143,6 +3143,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_whna BEFORE INSERT ON public.trig_t FOR EACH ROW WHEN (NEW.a > 0) EXECUTE FUNCTION public.trig_fn()"); err != nil {
 		t.Fatalf("create trigger trg_whna: %v", err)
 	}
+	// Slice 368: a trigger whose EXECUTE FUNCTION carries STRING arguments
+	// (TG_ARGV). pg_get_triggerdef (ruleutils.c pg_get_triggerdef_worker:462-486)
+	// renders `EXECUTE FUNCTION public.trig_fn(` then each tgargs entry
+	// comma-separated (`, `) and single-quoted via simple_quote_literal (embedded
+	// single-quotes doubled). goopg's parser already collected the string-literal
+	// args into CreateTriggerStmt.FuncArgs, execCreateTrigger threads them to
+	// catalog.Trigger.Args, and buildTriggerDefString re-emits them with identical
+	// `', '` separation and `''`-doubled quoting. trg_arg passes two args, the
+	// second carrying an embedded single quote to exercise the simple_quote_literal
+	// escaping path. NO production change — the whole parse→catalog→deparse path
+	// already existed but had no oracle-verified fixture pinning the rendered form.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_arg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('hello', 'wo''rld')"); err != nil {
+		t.Fatalf("create trigger trg_arg with function args: %v", err)
+	}
 
 	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
 	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
@@ -7716,6 +7730,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_whna BEFORE INSERT ON public.trig_t FOR EACH ROW WHEN ((new.a > 0)) EXECUTE FUNCTION public.trig_fn();") {
 			t.Errorf("pg_dump dropped/mangled the WHEN-condition trigger (NEW vs constant)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 368 (asserted):** a trigger whose EXECUTE FUNCTION carries STRING
+		// arguments (TG_ARGV) must round-trip. pg_get_triggerdef (ruleutils.c
+		// pg_get_triggerdef_worker:462-486) renders the call with each tgargs entry
+		// comma-separated (`, `) and single-quoted via simple_quote_literal (embedded
+		// single-quotes doubled → `wo''rld`). goopg's parser collected the args into
+		// CreateTriggerStmt.FuncArgs, execCreateTrigger threaded them to
+		// catalog.Trigger.Args, and buildTriggerDefString re-emitted them with the
+		// same separation/escaping — this slice pins the rendered form (including an
+		// embedded-quote arg) with an oracle fixture. Verified byte-identical to real
+		// pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_arg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('hello', 'wo''rld');") {
+			t.Errorf("pg_dump dropped/mangled the trigger function string arguments\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
 		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint

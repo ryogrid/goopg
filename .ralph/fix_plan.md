@@ -3084,6 +3084,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** security_invoker has NO runtime
       effect (permission-model: invoking-vs-owner ACL not implemented); the `WITH (check_option=...)`
       reloption form stays parsed-and-ignored; restart persistence (in-memory only).
+
+      **2026-06-30 (loop #99, design 0110-0001 slice 368): trigger `EXECUTE FUNCTION f('a','b')`
+      string arguments (TG_ARGV) round-trip.** A `CREATE TRIGGER … EXECUTE FUNCTION fn('arg1','arg2')`
+      now has an oracle-verified fixture. PG stores the args in `pg_trigger.tgargs` and
+      `pg_get_triggerdef_worker` re-renders them comma-separated, each single-quoted via
+      `simple_quote_literal`. goopg's whole path already existed (parser → `FuncArgs` →
+      `catalog.Trigger.Args` → `buildTriggerDefString` with `''`-doubled quoting); the lexer collapses
+      `''`→`'` on input so re-escaping is symmetric. **No production change** — fixture-only slice.
+      Byte-identical vs real pg_dump 18.3. Tests slice-368 `trg_arg` `TestPort_PgDumpConnectionSetup`
+      (two args, second with embedded quote) + new `TestParseCreateTriggerFuncArgs` (parser);
+      `TestBuildTriggerDefString` already pinned the render. **Deferred (ledger):** the parser
+      silently SKIPS non-string trigger args (`fn(42)` → arg dropped); PG stores+dumps `'42'`.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`
