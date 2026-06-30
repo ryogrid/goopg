@@ -3068,6 +3068,22 @@ documentation-only and is exempt from the design-doc requirement.)
       effect (planner qual-fencing not implemented); `security_invoker` + the
       `WITH (check_option=...)` reloption form stay parsed-and-ignored; restart persistence
       (in-memory only).
+
+      **2026-06-30 (loop #98, design 0110-0001 slice 367): view `WITH (security_invoker=<bool>)`
+      round-trip.** The sibling of slice 366. A view created `WITH (security_invoker=true)` now
+      dumps the `WITH (security_invoker='true')` clause after the view name. PG stores it as the
+      `security_invoker=<bool>` pg_class.reloption; like security_barrier, pg_dump's getTables
+      KEEPS it in the reloptions array and dumpTableSchema re-emits it via appendReloptionsArray.
+      Parser captures `security_invoker` into `CreateViewStmt.SecurityInvoker` (`*bool`; bare
+      option → true; values normalize via `parseBoolReloptionValue`); `execCreateView` sets
+      `catalog.Table.SecurityInvoker`/`SecurityInvokerSet`; the pg_class virtual reloptions builder
+      appends `security_invoker=<bool>` after security_barrier and before the check_option element.
+      **No pg_dump-query change.** Byte-identical vs real pg_dump 18.3. Tests
+      `TestParseCreateViewSecurityInvoker` (parser) +
+      `TestViewSecurityInvokerSurfacesInPgClassReloptions` (executor) + slice-367 `vsecinv`
+      `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** security_invoker has NO runtime
+      effect (permission-model: invoking-vs-owner ACL not implemented); the `WITH (check_option=...)`
+      reloption form stays parsed-and-ignored; restart persistence (in-memory only).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

@@ -8959,6 +8959,31 @@ leaky operators (`subquery_planner`/`security_barrier` RTE flag); goopg captures
 `security_invoker` and the `WITH (check_option=…)` reloption *form* are still parsed-and-ignored. (3) restart persistence —
 `SecurityBarrier` is in-memory only (the same shared-catalog runtime-write gap as the other restart-durability slices).
 
+### Slice 367 — **view `WITH (security_invoker=<bool>)`** → `WITH (security_invoker='true')` clause (PRODUCTION fix)
+
+The sibling of slice 366. PostgreSQL stores a view's pre-`AS` `WITH (security_invoker=<bool>)` storage option as the
+`security_invoker=<bool>` pg_class.reloption (`view_reloptions`, reloptions.c). Like `security_barrier`, pg_dump's `getTables`
+KEEPS it in the reloptions array (`array_remove` strips only `check_option=*`) and `dumpTableSchema` re-emits it via
+`appendReloptionsArray` as the **`WITH (security_invoker='true')` clause after the view name and before `AS`**. The value is
+single-quoted because `fmtId('true')!='true'`.
+
+The parser captures `security_invoker` into `CreateViewStmt.SecurityInvoker` (a `*bool`: non-nil when specified; a bare
+`WITH (security_invoker)` defaults to true; identifier / boolean-keyword / string-literal / numeric values all normalize via
+`parseBoolReloptionValue`, mirroring PG's `parse_bool`). `execCreateView` sets
+`catalog.Table.SecurityInvoker`/`SecurityInvokerSet`, and the pg_class virtual-row reloptions builder appends
+`security_invoker=<bool>` to the relation's reloptions array (placed **after** `security_barrier` and **before** the
+`check_option` element, matching PG's stored WITH-clause order). From there the existing `appendReloptionsArray` machinery in
+the real pg_dump binary formats the `WITH (...)` clause — so **no pg_dump-query change** is needed, only catalog plumbing.
+Both `true` and `false` round-trip (false is meaningful), and a plain view emits no reloptions. Verified byte-identical vs
+real pg_dump 18.3. Fixture `vsecinv` in `TestPort_PgDumpConnectionSetup` (slice 367) + unit
+`TestParseCreateViewSecurityInvoker` (parser) / `TestViewSecurityInvokerSurfacesInPgClassReloptions` (executor).
+
+**Deferred (ledger):** (1) `security_invoker` has **no runtime effect** — PG uses it to run the view's underlying query under
+the *invoking* user's permissions rather than the view owner's (ACL check in `rewriteRuleAction`/`fireRIRrules`); goopg
+captures it for dump fidelity only. (2) the `WITH (check_option=…)` reloption *form* is still parsed-and-ignored. (3) restart
+persistence — `SecurityInvoker` is in-memory only (the same shared-catalog runtime-write gap as the other
+restart-durability slices).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

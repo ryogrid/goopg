@@ -1218,9 +1218,9 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	}
 	// Optional WITH (view_option_name [= view_option_value] [, ...]) before AS.
 	// PostgreSQL supports security_invoker, security_barrier, check_option.
-	// goopg captures security_barrier (M0119-0004 slice 366) so it round-trips
-	// as a pg_class.reloption; security_invoker and the reloption form of
-	// check_option are still accepted-and-ignored.
+	// goopg captures security_barrier (M0119-0004 slice 366) and security_invoker
+	// (slice 367) so they round-trip as pg_class.reloptions; the reloption form of
+	// check_option is still accepted-and-ignored.
 	if p.acceptKeyword(KwWith) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after WITH in CREATE VIEW")
@@ -1251,6 +1251,16 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 					b = parseBoolReloptionValue(optVal)
 				}
 				stmt.SecurityBarrier = &b
+			}
+			// security_invoker surfaces as the `security_invoker=<bool>`
+			// pg_class.reloption (slice 367). Same bare-option-defaults-true
+			// boolean handling as security_barrier.
+			if strings.EqualFold(optName.Value, "security_invoker") {
+				b := true
+				if hasVal {
+					b = parseBoolReloptionValue(optVal)
+				}
+				stmt.SecurityInvoker = &b
 			}
 			p.acceptSymbol(",")
 		}

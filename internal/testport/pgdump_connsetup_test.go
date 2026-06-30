@@ -2684,6 +2684,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create view vsecbar: %v", err)
 	}
 
+	// Slice 367: a VIEW created `WITH (security_invoker=true)` round-trips the
+	// reloption, the sibling of security_barrier. PostgreSQL stores it as the
+	// `security_invoker=true` pg_class.reloption; like security_barrier, pg_dump's
+	// getTables KEEPS it in the reloptions array (array_remove strips only
+	// check_option=*) and re-emits it via appendReloptionsArray as the
+	// `WITH (security_invoker='true')` clause after the view name (pg_dump.c
+	// dumpTableSchema). goopg captures the flag on catalog.Table.SecurityInvoker
+	// and surfaces it through the reloptions cell. `vsecinv` is on its own view so
+	// the assert is isolated.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vsecinv WITH (security_invoker=true) AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
+		t.Fatalf("create view vsecinv: %v", err)
+	}
+
 	// Slice 59: a GENERATED ALWAYS AS (expr) STORED column must round-trip with
 	// its generation clause. pg_dump prints `GENERATED ALWAYS AS (%s) STORED`
 	// only when the column carries BOTH pg_attribute.attgenerated='s' AND a
@@ -8754,6 +8767,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// clause after the view name (appendReloptionsArray quotes the value).
 		if sub := "CREATE VIEW public.vsecbar WITH (security_barrier='true') AS"; !strings.Contains(res.Stdout, sub) {
 			t.Errorf("pg_dump dropped the view security_barrier reloption; missing %q\n  full stdout=%q", sub, res.Stdout)
+		}
+
+		// **Slice 367 (asserted):** a VIEW `WITH (security_invoker=true)` must
+		// round-trip the reloption, the sibling of security_barrier. pg_dump keeps
+		// it in the reloptions array and emits it as the `WITH (security_invoker='true')`
+		// clause after the view name (appendReloptionsArray quotes the value).
+		if sub := "CREATE VIEW public.vsecinv WITH (security_invoker='true') AS"; !strings.Contains(res.Stdout, sub) {
+			t.Errorf("pg_dump dropped the view security_invoker reloption; missing %q\n  full stdout=%q", sub, res.Stdout)
 		}
 
 		// **Slice 59 (asserted):** a GENERATED ALWAYS AS (expr) STORED column

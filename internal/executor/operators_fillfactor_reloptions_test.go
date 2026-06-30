@@ -3007,3 +3007,61 @@ func TestViewSecurityBarrierSurfacesInPgClassReloptions(t *testing.T) {
 		t.Errorf("pg_class.reloptions for vsb_plain = %q, want \"\" (NULL)", got["vsb_plain"])
 	}
 }
+
+// TestViewSecurityInvokerSurfacesInPgClassReloptions verifies that a view's
+// `WITH (security_invoker=<bool>)` storage option surfaces as the
+// `security_invoker=<bool>` pg_class.reloption. Like security_barrier, pg_dump's
+// getTables keeps it in the reloptions array and re-emits it as the
+// `WITH (security_invoker='true')` clause; both true and false must round-trip
+// (false is meaningful), and a plain view carries no reloptions.
+// M0119-0004 (DU-002 slice 367).
+func TestViewSecurityInvokerSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE sibase (id integer PRIMARY KEY, q integer)`); err != nil {
+		t.Fatalf("CREATE TABLE sibase: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsi_on WITH (security_invoker=true) AS SELECT id, q FROM sibase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsi_on: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsi_off WITH (security_invoker=false) AS SELECT id, q FROM sibase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsi_off: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsi_plain AS SELECT id, q FROM sibase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsi_plain: %v", err)
+	}
+
+	for name, want := range map[string]bool{"vsi_on": true, "vsi_off": false} {
+		vt, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s view not found", name)
+		}
+		if !vt.SecurityInvokerSet {
+			t.Errorf("%s.SecurityInvokerSet = false, want true", name)
+		}
+		if vt.SecurityInvoker != want {
+			t.Errorf("%s.SecurityInvoker = %v, want %v", name, vt.SecurityInvoker, want)
+		}
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vsi_on" || r[1] == "vsi_off" || r[1] == "vsi_plain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vsi_on"] != "{security_invoker=true}" {
+		t.Errorf("pg_class.reloptions for vsi_on = %q, want %q", got["vsi_on"], "{security_invoker=true}")
+	}
+	if got["vsi_off"] != "{security_invoker=false}" {
+		t.Errorf("pg_class.reloptions for vsi_off = %q, want %q", got["vsi_off"], "{security_invoker=false}")
+	}
+	if got["vsi_plain"] != "" {
+		t.Errorf("pg_class.reloptions for vsi_plain = %q, want \"\" (NULL)", got["vsi_plain"])
+	}
+}

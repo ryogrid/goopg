@@ -1683,6 +1683,13 @@ type CreateViewStmt struct {
 	// the reloptions array and re-emits it as the `WITH (security_barrier='true')`
 	// clause after the view name. M0119-0004 DU-002 slice 366.
 	SecurityBarrier *bool
+	// SecurityInvoker captures a pre-AS `WITH (security_invoker = <bool>)` view
+	// storage option: non-nil when the option was specified, pointing at the
+	// parsed boolean. PostgreSQL stores it as the `security_invoker=<bool>`
+	// pg_class.reloption; like security_barrier, pg_dump's getTables keeps it in
+	// the reloptions array and re-emits it as the `WITH (security_invoker='true')`
+	// clause after the view name. M0119-0004 DU-002 slice 367.
+	SecurityInvoker *bool
 }
 
 func (s *CreateViewStmt) Pos() int  { return s.pos }

@@ -133,6 +133,45 @@ func TestParseCreateViewSecurityBarrier(t *testing.T) {
 	}
 }
 
+// TestParseCreateViewSecurityInvoker pins that a pre-AS
+// `WITH (security_invoker = <bool>)` storage option is captured into
+// CreateViewStmt.SecurityInvoker (nil when unspecified; a bare option defaults
+// to true; string/keyword/identifier values all normalize via parse_bool), so
+// it surfaces as the `security_invoker=<bool>` pg_class.reloption that pg_dump
+// re-emits as `WITH (security_invoker='true')`. M0119-0004 (slice 367).
+func TestParseCreateViewSecurityInvoker(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	cases := []struct {
+		src  string
+		want *bool
+	}{
+		{"CREATE VIEW v WITH (security_invoker=true) AS SELECT id FROM d", boolPtr(true)},
+		{"CREATE VIEW v WITH (security_invoker = false) AS SELECT id FROM d", boolPtr(false)},
+		{"CREATE VIEW v WITH (security_invoker='true') AS SELECT id FROM d", boolPtr(true)},
+		{"CREATE VIEW v WITH (security_invoker) AS SELECT id FROM d", boolPtr(true)},
+		{"CREATE VIEW v WITH (security_barrier=true) AS SELECT id FROM d", nil},
+		{"CREATE VIEW v AS SELECT id FROM d", nil},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.src, err)
+		}
+		cv, ok := stmts[0].(*CreateViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateViewStmt", tc.src, stmts[0])
+		}
+		switch {
+		case tc.want == nil && cv.SecurityInvoker != nil:
+			t.Errorf("Parse(%q): SecurityInvoker=%v want nil", tc.src, *cv.SecurityInvoker)
+		case tc.want != nil && cv.SecurityInvoker == nil:
+			t.Errorf("Parse(%q): SecurityInvoker=nil want %v", tc.src, *tc.want)
+		case tc.want != nil && *cv.SecurityInvoker != *tc.want:
+			t.Errorf("Parse(%q): SecurityInvoker=%v want %v", tc.src, *cv.SecurityInvoker, *tc.want)
+		}
+	}
+}
+
 // TestParseCreateMatViewRawDef pins that a materialized view's body text is
 // captured verbatim into CreateMatViewStmt.RawDef (trimmed of surrounding
 // whitespace; the trailing WITH [NO] DATA clause is NOT part of the body).

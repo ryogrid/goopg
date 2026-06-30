@@ -329,6 +329,17 @@ type Table struct {
 	SecurityBarrier    bool
 	SecurityBarrierSet bool
 
+	// SecurityInvoker / SecurityInvokerSet capture a view's
+	// `WITH (security_invoker = <bool>)` storage option. PostgreSQL records it
+	// as the `security_invoker=<bool>` pg_class.reloption; like security_barrier,
+	// pg_dump's getTables keeps it in the reloptions array (array_remove strips
+	// only check_option=*) and re-emits it as the `WITH (security_invoker='true')`
+	// clause after the view name (appendReloptionsArray). SecurityInvokerSet
+	// guards whether the option was specified, since false is a meaningful value.
+	// M0119-0004 (DU-002 slice 367).
+	SecurityInvoker    bool
+	SecurityInvokerSet bool
+
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil
 	// as "no statistics yet" and falls back to the legacy
@@ -4034,6 +4045,16 @@ func (c *InMemory) registerSystemTables() {
 			// PostgreSQL's stored order. M0119-0004 (slice 366).
 			if t.SecurityBarrierSet {
 				relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
+			}
+			// A view's `WITH (security_invoker=<bool>)` is stored by PostgreSQL as
+			// the `security_invoker=<bool>` pg_class.reloption. Like security_barrier,
+			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
+			// the `WITH (security_invoker='true')` clause after the view name
+			// (appendReloptionsArray). Placed after security_barrier and before
+			// check_option so a view carrying several options surfaces in PG's stored
+			// WITH-clause order. M0119-0004 (slice 367).
+			if t.SecurityInvokerSet {
+				relopts = append(relopts, "security_invoker="+strconv.FormatBool(t.SecurityInvoker))
 			}
 			// A view's `WITH [CASCADED|LOCAL] CHECK OPTION` is stored by PostgreSQL
 			// as the `check_option=<mode>` pg_class.reloption. pg_dump's getTables
