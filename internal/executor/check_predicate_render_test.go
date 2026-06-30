@@ -34,6 +34,35 @@ func TestRenderCheckPredicate(t *testing.T) {
 	}
 }
 
+// TestRenderDomainCheckPredicate pins renderDomainCheckPredicate to real
+// pg_dump 18.3 bytes for *generic* (non-IN) domain CHECK constraints. PG deparses
+// the value placeholder as the uppercase keyword VALUE (CoerceToDomainValue) and
+// fully parenthesizes every sub-node, so a single comparison keeps one inner paren
+// layer (byte-identical to the legacy slice-96 wrap) while a compound predicate
+// parenthesizes each operand and a function call carries no padding spaces. The
+// expected strings were captured from a throwaway PG 18.3 cluster (DU-002 slice 363).
+func TestRenderDomainCheckPredicate(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		// Single comparison (slice 96) must be byte-unchanged by the re-deparse.
+		{"VALUE > 0", "CHECK ((VALUE > 0))"},
+		// Compound boolean predicates gain PG's per-operand parens; the placeholder
+		// stays uppercase across every nested ColumnRef.
+		{"VALUE > 0 AND VALUE < 100", "CHECK (((VALUE > 0) AND (VALUE < 100)))"},
+		// A function-call predicate loses the token-reconstruction padding spaces
+		// and preserves VALUE as a call argument.
+		{"length(VALUE) > 0", "CHECK ((length(VALUE) > 0))"},
+		{"length ( VALUE ) > 0", "CHECK ((length(VALUE) > 0))"},
+	}
+	for _, tc := range cases {
+		if got := renderDomainCheckPredicate(tc.raw); got != tc.want {
+			t.Errorf("renderDomainCheckPredicate(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+}
+
 // TestRenderCheckPredicateFallback verifies the re-parse round-trip guard: an
 // input the deparser cannot faithfully render (or that does not parse) keeps the
 // legacy double-paren raw-text wrap so the dump never emits non-SQL garbage.

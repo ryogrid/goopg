@@ -4312,6 +4312,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.named_chk AS integer CONSTRAINT must_be_pos CHECK (VALUE > 0)"); err != nil {
 		t.Fatalf("create domain named_chk: %v", err)
 	}
+	// DU-002 slice 363: a COMPOUND (`VALUE > 0 AND VALUE < 100`) or FUNCTION-CALL
+	// (`length(VALUE) > 0`) generic domain CHECK. Like the table-CHECK twin
+	// (slice 362), PG's pg_get_constraintdef re-deparses the stored node with
+	// get_rule_expr, fully parenthesizing every sub-node and deparsing the value
+	// placeholder as the uppercase keyword VALUE: `CHECK (((VALUE > 0) AND (VALUE
+	// < 100)))` and `CHECK ((length(VALUE) > 0))`. goopg previously emitted its
+	// token-reconstructed raw text wrapped once (`CHECK ((VALUE > 0 AND VALUE <
+	// 100))`), which diverged on the per-operand parens and the call-paren spacing.
+	// renderDomainCheckPredicate now re-parses + deparses through the same
+	// fully-parenthesizing renderer the table path uses, upcasing the placeholder.
+	// Verified byte-identical against a throwaway real PG 18.3 cluster. The
+	// single-comparison posqty/named_chk above stay byte-unchanged. (A negative
+	// literal like `VALUE < -5` would dump `'-5'::integer` — the type-blind
+	// literal-cast gap, deferred — so the compound case uses positive literals.)
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkand AS integer CHECK (VALUE > 0 AND VALUE < 100)"); err != nil {
+		t.Fatalf("create domain dchkand: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkfn AS text CHECK (length(VALUE) > 0)"); err != nil {
+		t.Fatalf("create domain dchkfn: %v", err)
+	}
 	// DU-002 slice 97: a `CHECK (VALUE IN (...))` over a text domain. goopg captures
 	// the membership list in CheckInValues (runtime validation) but previously emitted
 	// no pg_constraint row, so the check vanished from pg_dump. The executor now
@@ -4657,7 +4677,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `ALTER TYPE public.multi_comp ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C"`); err != nil {
 		t.Fatalf("alter type multi_comp multi-subcommand: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, dca dchkand, dcf dchkfn, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -9661,6 +9681,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.named_chk AS integer",
 			"CONSTRAINT must_be_pos CHECK ((VALUE > 0))",
 			"nc public.named_chk",
+			// Slice 363: compound + function-call generic domain CHECKs gain PG's
+			// per-operand parens and call-paren spacing; the value placeholder stays
+			// uppercase across every nested ColumnRef. Byte-identical to real PG 18.3.
+			"CREATE DOMAIN public.dchkand AS integer",
+			"CONSTRAINT dchkand_check CHECK (((VALUE > 0) AND (VALUE < 100)))",
+			"dca public.dchkand",
+			"CREATE DOMAIN public.dchkfn AS text",
+			"CONSTRAINT dchkfn_check CHECK ((length(VALUE) > 0))",
+			"dcf public.dchkfn",
 			// Slice 97: a `CHECK (VALUE IN (...))` over a text domain deparses to a
 			// ScalarArrayOpExpr — byte-identical to real pg_dump 18.3.
 			"CREATE DOMAIN public.colr AS text",

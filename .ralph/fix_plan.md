@@ -3016,6 +3016,23 @@ documentation-only and is exempt from the design-doc requirement.)
       persistence — `DeclaredHash` is in-memory only, so a re-loaded hash index after
       a server restart would dump `USING btree` (same shared-catalog runtime-write gap
       as the other restart-durability slices).
+      **2026-06-30 (loop #93, design 0110-0001 slice 363): compound/function-call
+      DOMAIN CHECK dump (resolves slice-362 deferred-(a)).** A generic (non-IN) domain
+      `CHECK (VALUE > 0 AND VALUE < 100)` now dumps `CHECK (((VALUE > 0) AND (VALUE <
+      100)))` and `CHECK (length(VALUE) > 0)` dumps `CHECK ((length(VALUE) > 0))`,
+      instead of the legacy token-text wrap `CHECK ((<raw>))`. New
+      `renderDomainCheckPredicate` (the domain twin of `renderCheckPredicate`) re-parses
+      the stored raw text and deparses via the fully-parenthesizing `defaultExprToSQL`,
+      with the same re-parse round-trip fallback guard; `upcaseDomainValuePlaceholder`
+      rewrites every bare `value` ColumnRef back to the uppercase `VALUE` keyword (the
+      lexer case-folds it on re-parse, but PG deparses the CoerceToDomainValue placeholder
+      uppercase). The dump site routes ONLY generic CHECKs through it; a `VALUE IN (...)`
+      form (`len(d.CheckInValues)>0`) keeps the legacy raw wrap (pre-synthesized byte-exact
+      ScalarArrayOp deparse). Single-comparison slice-96 domains byte-unchanged. Byte-
+      identical vs real pg_dump 18.3. Tests `TestRenderDomainCheckPredicate` +
+      slice-363 `dchkand`/`dchkfn` `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
+      a negative literal in a domain CHECK (`VALUE < -5` → PG `'-5'::integer`) still
+      byte-diverges (type-blind `defaultExprToSQL`, same gap as slice-360(a)/362(b)).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

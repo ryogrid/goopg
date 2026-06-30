@@ -3694,6 +3694,91 @@ func renderCheckPredicate(rawExpr string) string {
 	return "CHECK ((" + rawExpr + "))"
 }
 
+// renderDomainCheckPredicate is renderCheckPredicate's domain twin: it produces
+// the `CHECK (<expr>)` text for a *generic* (non-IN) domain CHECK constraint,
+// mirroring pg_get_constraintdef_worker over a CoerceToDomainValue-bearing node.
+// It re-parses the stored raw text and deparses it through defaultExprToSQL — the
+// same fully-parenthesizing renderer the table-CHECK path uses — so a compound
+// domain predicate like `VALUE > 0 AND VALUE < 100` dumps `CHECK (((VALUE > 0)
+// AND (VALUE < 100)))` and a function call like `length(VALUE) > 0` dumps
+// `CHECK ((length(VALUE) > 0))`, matching real pg_dump 18.3 instead of goopg's
+// legacy token-text wrap `CHECK ((<raw>))`.
+//
+// The one wrinkle versus the table path: PG deparses the domain value placeholder
+// as the uppercase keyword `VALUE` (get_rule_expr T_CoerceToDomainValue), but
+// goopg stores it as a plain identifier and the lexer case-folds it to `value` on
+// re-parse. In a domain CHECK the ONLY column reference is the value placeholder
+// (there is no table to name a real column), so upcaseDomainValuePlaceholder
+// rewrites every bare `value` ColumnRef in the re-parsed tree back to `VALUE`
+// before deparsing. The same re-parse round-trip guard as renderCheckPredicate
+// falls back to the raw wrap if the text fails to parse or the deparse is not
+// itself re-parseable, so we never emit non-SQL garbage.
+//
+// Callers must NOT route a `CHECK (VALUE IN (...))` domain through here: that form
+// is stored as a pre-synthesized, byte-exact ScalarArrayOp deparse
+// (domainInValuesCheckExpr) that defaultExprToSQL cannot reproduce; the dump site
+// keeps its legacy wrap for that case. DU-002 slice 363.
+func renderDomainCheckPredicate(rawExpr string) string {
+	if e, err := parser.ParseExpr(rawExpr); err == nil {
+		upcaseDomainValuePlaceholder(e)
+		if deparsed := defaultExprToSQL(e); deparsed != "" {
+			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				return "CHECK (" + deparsed + ")"
+			}
+		}
+	}
+	return "CHECK ((" + rawExpr + "))"
+}
+
+// upcaseDomainValuePlaceholder walks a freshly-parsed domain CHECK expression and
+// rewrites every bare (unqualified) `value` ColumnRef to the uppercase keyword
+// `VALUE` in place, so defaultExprToSQL (which renders a ColumnRef verbatim)
+// reproduces PG's CoerceToDomainValue deparse. The tree is a throwaway from
+// parser.ParseExpr, so in-place mutation is safe. The recursion covers exactly the
+// container node types defaultExprToSQL renders; nodes it cannot render are left
+// untouched and the renderDomainCheckPredicate round-trip guard rejects them.
+func upcaseDomainValuePlaceholder(e parser.Expr) {
+	switch v := e.(type) {
+	case *parser.ColumnRef:
+		if v.Schema == "" && v.Table == "" && strings.EqualFold(v.Column, "value") {
+			v.Column = "VALUE"
+		}
+	case *parser.BinaryOp:
+		upcaseDomainValuePlaceholder(v.Left)
+		upcaseDomainValuePlaceholder(v.Right)
+	case *parser.UnaryOp:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.FuncCall:
+		for _, a := range v.Args {
+			upcaseDomainValuePlaceholder(a)
+		}
+	case *parser.CastExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.IsNullExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.IsBoolExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.IsDistinctFromExpr:
+		upcaseDomainValuePlaceholder(v.Left)
+		upcaseDomainValuePlaceholder(v.Right)
+	case *parser.CaseExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+		for _, w := range v.Whens {
+			upcaseDomainValuePlaceholder(w.When)
+			upcaseDomainValuePlaceholder(w.Then)
+		}
+		upcaseDomainValuePlaceholder(v.Else)
+	case *parser.RowExpr:
+		for _, el := range v.Elems {
+			upcaseDomainValuePlaceholder(el)
+		}
+	case *parser.ArrayConstructorExpr:
+		for _, el := range v.Elements {
+			upcaseDomainValuePlaceholder(el)
+		}
+	}
+}
+
 // execCreateView registers a view in the catalog. Column
 // types default to `unknown` because v0 doesn't run the
 // type-inference pass against the inner SELECT during DDL —

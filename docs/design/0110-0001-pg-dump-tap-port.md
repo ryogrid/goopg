@@ -8852,6 +8852,35 @@ unit `TestRenderCheckPredicate`/`TestRenderCheckPredicateFallback` (executor pkg
 > type in scope, so a CHECK carrying an unknown-type literal in an operator argument would still byte-diverge and is kept
 > on the legacy fallback by the re-parse guard.
 
+### Slice 363 — **compound / function-call domain CHECK** `CHECK (VALUE > 0 AND VALUE < 100)` → `CHECK (((VALUE > 0) AND (VALUE < 100)))` (PRODUCTION fix)
+
+The domain twin of slice 362, closing deferred-(a) above. A *generic* (non-IN) domain CHECK is stored as token-reconstructed
+raw text (`parser.parseDomainCheckExpr`, which already upcases the value placeholder to `VALUE`); the dump path — the
+`pg_get_constraintdef` branch over `AllDomains()` in `internal/executor/expr.go` — wrapped it as `CHECK ((<raw>))`. As with
+the table path, that double-paren wrap is byte-correct only for a single bare comparison (`VALUE > 0` → `CHECK ((VALUE > 0))`,
+matching slice 96). PostgreSQL re-deparses the stored node via `get_rule_expr` (over a `CoerceToDomainValue` placeholder),
+fully parenthesizing every sub-node:
+
+- `CHECK (VALUE > 0 AND VALUE < 100)` → `CHECK (((VALUE > 0) AND (VALUE < 100)))`;
+- `CHECK (length(VALUE) > 0)` → `CHECK ((length(VALUE) > 0))` — no padding spaces around the call's parentheses.
+
+Both forms were verified byte-identical against a throwaway PG 18.3 cluster. The fix is `renderDomainCheckPredicate`
+(`internal/executor/operators_ddl.go`), the domain twin of `renderCheckPredicate`: re-parse the raw text and deparse it
+through `defaultExprToSQL`, then wrap once as `CHECK (%s)`, with the same re-parse round-trip guard. The one wrinkle versus
+the table path: PG deparses the domain value placeholder as the uppercase keyword `VALUE`, but goopg's lexer case-folds it
+to `value` on re-parse. In a domain CHECK the only column reference *is* the placeholder (there is no table to name a real
+column), so `upcaseDomainValuePlaceholder` walks the freshly-parsed tree and rewrites every bare `value` ColumnRef back to
+`VALUE` before deparsing. The dump site routes only generic CHECKs through the new renderer; a `CHECK (VALUE IN (...))` form
+(`len(d.CheckInValues) > 0`) keeps the legacy raw wrap because it is stored as a pre-synthesized, byte-exact ScalarArrayOp
+deparse (`domainInValuesCheckExpr`) that `defaultExprToSQL` cannot reproduce. Fixtures `dchkand`/`dchkfn` in
+`TestPort_PgDumpConnectionSetup` (slice 363) + unit `TestRenderDomainCheckPredicate` (executor pkg).
+
+> **Deferred (ledgered):** the **negative-literal cast** inside a domain CHECK (`VALUE < -5` dumps `'-5'::integer`, not the
+> bare `-5` goopg's type-blind `defaultExprToSQL` emits) is the same gap as the slice-360(a)/slice-362 typed-literal-cast
+> limitation — PG's parser folds a unary minus on a literal into a negative typed `Const` that `get_const_expr` quotes-and-
+> casts. The re-parse guard keeps such a form on the legacy fallback (so no garbage), but it still byte-diverges; closing it
+> needs operand-type threading into `defaultExprToSQL`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

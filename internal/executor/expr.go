@@ -7411,14 +7411,23 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
 			// getDomainConstraints renders each via pg_get_constraintdef and
-			// dumpDomain emits `CONSTRAINT <name> <def>`; the deparser wraps the
-			// predicate in an extra paren layer (CHECK ((expr))), mirroring the
-			// table-CHECK path above. DU-002 slice 96.
+			// dumpDomain emits `CONSTRAINT <name> <def>`; the deparser fully
+			// parenthesizes every sub-node, so a compound/function-call predicate
+			// dumps `CHECK (((VALUE > 0) AND (VALUE < 100)))` /
+			// `CHECK ((length(VALUE) > 0))` — reproduced by renderDomainCheckPredicate
+			// (the domain twin of the table-CHECK renderer), which also upcases the
+			// `VALUE` placeholder. A `CHECK (VALUE IN (...))` form is stored as a
+			// pre-synthesized, byte-exact ScalarArrayOp deparse that defaultExprToSQL
+			// cannot reproduce, so it keeps the legacy raw double-paren wrap.
+			// DU-002 slice 96 (single comparison) / slice 363 (compound + function).
 			for _, d := range im.AllDomains() {
 				if d.CheckOID == 0 || d.CheckOID != targetOID {
 					continue
 				}
-				return NewStringDatum("CHECK ((" + d.CheckExpr + "))"), nil
+				if len(d.CheckInValues) > 0 {
+					return NewStringDatum("CHECK ((" + d.CheckExpr + "))"), nil
+				}
+				return NewStringDatum(renderDomainCheckPredicate(d.CheckExpr)), nil
 			}
 		}
 		return NullDatum, nil
