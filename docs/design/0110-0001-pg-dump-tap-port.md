@@ -9372,6 +9372,43 @@ re-register preserves, non-empty refreshes), and the `goopg_srv_tv` fixture in `
 is deferred — `srvtype`/`srvversion` are opaque text and client-side `appendStringLiteralAH` handles escaping; the in-memory-only limitation
 (servers vanish on restart) still applies. The remaining SERVER work is `ALTER SERVER … OPTIONS`/`VERSION`.
 
+### Slice 382 — **`quote_ident` reserved-keyword quoting** (cross-cutting builtin fix)
+
+The latent gap surfaced by slice 379: `pgQuoteIdent` (`internal/executor/expr.go` — the server-side `quote_ident` builtin, `%I` in
+`format()`, and the column-list / trigger-transition-table identifier rendering that backs several `pg_get_*def` paths) claimed in its comment
+to skip reserved words but performed **no keyword check**. So `quote_ident('user')` returned the bare `user` where PostgreSQL returns the
+quoted `"user"` — a divergence at every `quote_ident` call site (pg_dump's `getPolicies` TO-clause, `getForeignServers`, `dumpUserMappings`, …).
+
+PostgreSQL's `quote_identifier()` (`src/backend/utils/adt/ruleutils.c`), after confirming the identifier is bare-safe (all-lowercase, valid
+char class), does:
+
+```c
+int kwnum = ScanKeywordLookup(ident, &ScanKeywords);
+if (kwnum >= 0 && ScanKeywordCategories[kwnum] != UNRESERVED_KEYWORD)
+    safe = false;   /* keyword → must quote */
+```
+
+i.e. it quotes **every** keyword except the UNRESERVED ones.
+
+- **New** `internal/executor/quote_ident_keywords.go`: `pgReservedQuoteKeywords`, the set of the 164 `kwlist.h` (PG 18.3) entries whose
+  category is not `UNRESERVED_KEYWORD` (RESERVED / TYPE_FUNC_NAME / COL_NAME). Stored lowercase; `pgQuoteIdent` only consults it after the
+  all-lowercase check, so no case folding is needed. UNRESERVED keywords (`name`, `type`, `version`, `value`, `option`, …) are deliberately
+  absent — they need no quoting, matching PG.
+- **`pgQuoteIdent`** (`internal/executor/expr.go`): after the char-class loop, a char-class-safe identifier that is in
+  `pgReservedQuoteKeywords` is marked unsafe → double-quoted. Because `%I`, the `quote_ident` builtin, trigger transition-table names, and
+  column lists all funnel through `pgQuoteIdent`, the fix lands at all of them at once.
+
+Covered by the new `TestPgQuoteIdentReservedKeywords` (unit: `user`/`select`/`table`/`authorization`/`between`/`values`/`freeze` → quoted;
+`name`/`type`/`version`/`username`/`foo_bar` → bare; char-class/case/empty/embedded-quote rules unchanged) and by DU-002 **slice 382** in
+`TestPort_PgDumpConnectionSetup`: `CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (user 'remote')` now dumps as the quoted
+`"user" 'remote'` byte-identical vs pg_dump 18.3 (the slice-379 keyword caveat is now resolved end-to-end).
+
+**Deferred (siblings):** two other identifier-quoters still lack the keyword check and are recorded in the deferral ledger —
+`quoteViewIdent` (`expr.go`, `pg_get_viewdef` alias rendering) and `quoteCollationIdent` (`internal/catalog/catalog.go`,
+`pg_get_indexdef` / `COLLATE` rendering; its own comment already concedes reserved-word quoting is not reproduced). The latter is in the
+`catalog` package and cannot import the executor-resident keyword set without an import cycle, so sharing it needs a leaf-package placement
+decision first.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

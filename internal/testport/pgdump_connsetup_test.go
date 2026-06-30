@@ -4793,14 +4793,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// dumps don't collide. goopg captures the OPTIONS clause in the parser, stores
 	// it in the user-mapping registry, and surfaces it as the umoptions array
 	// literal — driving goopg's own pg_options_to_table SRF. Verified against real
-	// pg_dump 18.3. (Non-keyword option names are used so quote_ident is a no-op on
-	// both sides; the reserved-keyword `user` option exposes a latent quote_ident
-	// gap — see the deferral ledger.)
+	// pg_dump 18.3. (Non-keyword option names are used here so quote_ident is a
+	// no-op on both sides; the reserved-keyword `user` option name is exercised
+	// separately by slice 382, which now round-trips correctly.)
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_um FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("create server for um options: %v", err)
 	}
 	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (username 'remote', password 'secret')"); err != nil {
 		t.Fatalf("create user mapping with options: %v", err)
+	}
+	// Slice 382: an OPTION NAME that is a reserved SQL keyword (`user`) must be
+	// double-quoted on the way out. pg_dump expands umoptions server-side with
+	// `quote_ident(option_name)`, and PostgreSQL's quote_identifier() quotes every
+	// keyword whose category is not UNRESERVED_KEYWORD — so `user` emits as the
+	// quoted `"user"`, never the bare keyword. This closes the latent quote_ident
+	// gap flagged by slice 379 (goopg's pgQuoteIdent had no reserved-word check
+	// despite its comment claiming one; now mirrors ruleutils.c via
+	// pgReservedQuoteKeywords). A dedicated server keeps this mapping's srvid
+	// distinct. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_kw FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create server for keyword-option um: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (user 'remote')"); err != nil {
+		t.Fatalf("create user mapping with keyword option: %v", err)
 	}
 	// Slice 378: a FOREIGN SERVER created `WITH OPTIONS (name 'value', …)` must
 	// round-trip its options. PostgreSQL stores them in pg_foreign_server.srvoptions
@@ -10133,6 +10148,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		srvTVStmt := "CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'remote'\n);"
 		if !strings.Contains(res.Stdout, srvTVStmt) {
 			t.Errorf("pg_dump dropped the SERVER TYPE/VERSION (slice-381); missing %q\n  full stdout=%q", srvTVStmt, res.Stdout)
+		}
+		// Slice 382: a reserved-keyword OPTION NAME must round-trip double-quoted.
+		// quote_ident('user') = "user" (RESERVED_KEYWORD), so dumpUserMappings emits
+		// the option as `"user" 'remote'`, not the bare `user 'remote'`. The bare
+		// form is what goopg produced before pgQuoteIdent gained its keyword check;
+		// this pins the fix end-to-end through pg_dump. Verified against real
+		// pg_dump 18.3.
+		umKwStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (\n    \"user\" 'remote'\n);"
+		if !strings.Contains(res.Stdout, umKwStmt) {
+			t.Errorf("pg_dump mis-quoted the reserved-keyword option name (slice-382); missing %q\n  full stdout=%q", umKwStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

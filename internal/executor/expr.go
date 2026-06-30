@@ -11208,6 +11208,14 @@ func pgQuoteIdent(s string) string {
 			}
 		}
 	}
+	// Mirror PostgreSQL quote_identifier(): even a char-class-safe, all-lowercase
+	// identifier must be quoted when it is a non-UNRESERVED keyword, so that e.g.
+	// quote_ident('user') yields "user" and quote_ident('select') yields "select".
+	if safe {
+		if _, isKeyword := pgReservedQuoteKeywords[s]; isKeyword {
+			safe = false
+		}
+	}
 	if safe {
 		return s
 	}
