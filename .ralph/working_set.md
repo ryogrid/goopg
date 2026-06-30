@@ -1,36 +1,22 @@
-Loop #39 COMPLETE: M0119-0004 DU-002 slice 399 — CREATE [DEFAULT] CONVERSION
-pg_dump round-trip (new feature). goopg now re-emits a user conversion through
-real pg_dump 18.3's getConversions/dumpConversion.
+(idle — nothing in flight)
 
-Landed:
-- internal/parser/ddl.go: parseCreateConversionTail(pos,isDefault) parses
-  `name FOR 'src' TO 'dest' FROM func`; new `case p.acceptKeyword(KwDefault)`
-  dispatch arm handles CREATE DEFAULT CONVERSION. New CompatNoopStmt fields
-  ConvForEncoding/ConvToEncoding/ConvFuncName/ConvDefault (ast.go).
-- internal/catalog/encoding.go (NEW): EncodingIDToName / EncodingNameToID +
-  pgConvEncNames (42 canonical pg_enc names, dup'd from initdb — cycle).
-- internal/catalog/catalog.go: UserConversion struct + userConversions field +
-  CreateConversion/DropConversion/ListUserConversions; pg_conversion VirtualRows
-  populated (conproc retyped oid→regproc).
-- internal/executor/expr.go: new pg_encoding_to_char(int4) builtin.
-- internal/executor/operators_ddl.go: execCompatNoop case "conversion" registers;
-  DROP path calls DropConversion.
-- docs/design/0110-0001-pg-dump-tap-port.md: slice 399 section.
-- .ralph/deferral_ledger.md: slice-399 row (deferrals a–c below).
-- Tests: parser/conversion_test.go, catalog/conversion_test.go, slice-399
-  asserts in testport/pgdump_connsetup_test.go.
+Loop #42 COMPLETE (pending commit): M0119-0004 DU-002 slice 401 — CREATE
+CONVERSION encoding-name validation (closes encoding-name half of slice-399
+deferral (b)). New executor helper validateCreateConversionEncodings
+(operators_ddl.go) mirrors PG CreateConversionCommand static checks: unknown
+source/destination encoding → 42704; SQL_ASCII endpoint → 42P17. execCompatNoop
+case "conversion" calls it and reuses resolved forEnc/toEnc IDs. Tests:
+TestValidateCreateConversionEncodings (executor) + slice-401 negative assertions
+in TestPort_PgDumpConnectionSetup. Gates: executor validation + cast tests PASS;
+TestPort_PgDumpConnectionSetup PASS (4.9s); pgbench smoke = pre-commit hook.
 
-Gates: go build PASS; TestParseCreateConversion PASS; TestEncodingIDNameRoundTrip
-+ TestPgConversionVirtualRows PASS; full parser+catalog+executor suites PASS;
-TestPort_PgDumpConnectionSetup PASS (5.3s, byte-identical vs pg_dump 18.3);
-ralph-state-guard OK; pgbench smoke = pre-commit hook on commit.
-
-Deferred (carry-forward): (a) EncodingNameToID resolves only 42 canonical names,
-not pg_encname_tbl aliases (unicode→UTF8); (b) conversion func not validated
-against pg_proc (stored as written, lenient); (c) restart persistence (in-memory
-only — recurring 389–398 shared-catalog runtime-write gap).
-
-Next loop: fresh M0119-0004 pg_dump slice. Candidates: CREATE CONVERSION
-encoding-alias resolution + pg_proc func validation (closes 399 (a)/(b));
-cast/conversion/collation registry RESTART PERSISTENCE (the recurring deferral);
-column-level attacl heap re-sync GRANT slice; CREATE TRANSFORM round-trip.
+Next loop candidates (M0119-0004 pg_dump slices):
+- CONVERSION FROM-function pg_proc validation (closes slice-399 deferral (b)
+  remainder): needs a real (int4,int4,cstring,internal,int4,bool)→int4 function
+  in the catalog so im.Routines().LookupByName resolves; store proc OID, surface
+  conproc as regproc→pg_proc cross-ref like castfunc (slice 397). The slice-399
+  test's myconv_func does not exist, so faithful validation needs the test to
+  CREATE FUNCTION first. Runtime OidFunctionCall6 probe needs a conversion engine.
+- cast/conversion/collation registry RESTART PERSISTENCE (recurring deferral c):
+  WAL-log CreateConversion + replay like CREATE SCHEMA.
+- CREATE TRANSFORM round-trip; column-level attacl heap re-sync GRANT slice.

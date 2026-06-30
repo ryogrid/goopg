@@ -12677,6 +12677,30 @@ func castTypeOIDMatch(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }
 
+// validateCreateConversionEncodings mirrors the encoding-name checks PostgreSQL
+// performs in CreateConversionCommand (src/backend/commands/conversioncmds.c):
+// the source and destination encoding names must resolve (pg_char_to_encoding),
+// and SQL_ASCII (pg_enc ID 0, PG_SQL_ASCII) may not be either endpoint. It
+// returns the resolved pg_enc IDs and a ready-to-return *ExecError on failure.
+// An unknown encoding is ERRCODE_UNDEFINED_OBJECT (42704); SQL_ASCII is
+// ERRCODE_INVALID_OBJECT_DEFINITION (42P17). The FROM-function existence /
+// return-type / runtime-probe checks stay deferred (no encoding-conversion
+// engine in goopg). DU-002 slice 401.
+func validateCreateConversionEncodings(forName, toName string) (forEnc, toEnc int32, err error) {
+	forEnc = catalog.EncodingNameToID(forName)
+	if forEnc < 0 {
+		return 0, 0, &ExecError{Code: "42704", Message: fmt.Sprintf("source encoding %q does not exist", forName)}
+	}
+	toEnc = catalog.EncodingNameToID(toName)
+	if toEnc < 0 {
+		return 0, 0, &ExecError{Code: "42704", Message: fmt.Sprintf("destination encoding %q does not exist", toName)}
+	}
+	if forEnc == 0 || toEnc == 0 { // PG_SQL_ASCII == 0
+		return 0, 0, &ExecError{Code: "42P17", Message: `encoding conversion to or from "SQL_ASCII" is not supported`}
+	}
+	return forEnc, toEnc, nil
+}
+
 // validateCreateCast mirrors the argument/return-type rules PostgreSQL enforces
 // in CreateCast (src/backend/commands/functioncmds.c). routine is the resolved
 // WITH FUNCTION routine, or nil for WITHOUT FUNCTION / WITH INOUT (or a WITH
@@ -12942,12 +12966,24 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	case "conversion":
 		// Register the conversion (CREATE [DEFAULT] CONVERSION name FOR 'src' TO
 		// 'dest' FROM func) so it round-trips through pg_dump (pg_conversion view →
-		// getConversions / dumpConversion). The encoding names resolve to pg_enc
-		// integer IDs (conforencoding/contoencoding); an unknown encoding name
-		// leaves the ID at -1, which pg_encoding_to_char renders as the empty
-		// string — lenient, matching how goopg models these compat objects without
-		// a real encoding-conversion engine. The compat object is still registered
-		// so DROP CONVERSION succeeds. DU-002 slice 399.
+		// getConversions / dumpConversion). DU-002 slice 399.
+		//
+		// Before registering, validate the encoding names exactly as PG's
+		// CreateConversionCommand (conversioncmds.c) does: an unknown source or
+		// destination encoding is rejected with ERRCODE_UNDEFINED_OBJECT (42704),
+		// and a conversion to or from SQL_ASCII (pg_enc ID 0, PG_SQL_ASCII) is
+		// rejected with ERRCODE_INVALID_OBJECT_DEFINITION (42P17) — PG forbids it
+		// because pg_do_encoding_conversion has hard-wired SQL_ASCII fast paths, so
+		// such a conversion function could never be used. These are the static
+		// checks PG performs via pg_char_to_encoding; the FROM-function existence /
+		// return-type / runtime-probe checks (LookupFuncName + get_func_rettype +
+		// OidFunctionCall6) stay deferred — goopg has no encoding-conversion engine
+		// and no in-catalog conversion functions to resolve against. DU-002 slice
+		// 401 (closes slice-399 deferral (b) for the encoding-name half).
+		forEnc, toEnc, cerr := validateCreateConversionEncodings(s.ConvForEncoding, s.ConvToEncoding)
+		if cerr != nil {
+			return cerr
+		}
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 		schema := s.ObjName.Schema
 		if schema == "" {
@@ -12957,8 +12993,8 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		uc := &catalog.UserConversion{
 			Name:        s.ObjName.Name,
 			Owner:       owner,
-			ForEncoding: catalog.EncodingNameToID(s.ConvForEncoding),
-			ToEncoding:  catalog.EncodingNameToID(s.ConvToEncoding),
+			ForEncoding: forEnc,
+			ToEncoding:  toEnc,
 			ProcSchema:  s.ConvFuncName.Schema,
 			ProcName:    s.ConvFuncName.Name,
 			Default:     s.ConvDefault,

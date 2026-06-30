@@ -382,6 +382,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/util"
 )
@@ -5076,6 +5078,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// FOR '' instead). Closes slice-399 deferral (a).
 	if err := runSQLSimple(t, c, "CREATE CONVERSION public.aliasconv FOR 'mskanji' TO 'unicode' FROM public.aliasconv_func"); err != nil {
 		t.Fatalf("create conversion with encoding aliases: %v", err)
+	}
+	// Slice 401: CREATE CONVERSION now validates the FOR/TO encoding names exactly
+	// as PG's CreateConversionCommand (conversioncmds.c): an unknown encoding is
+	// ERRCODE_UNDEFINED_OBJECT (42704) and SQL_ASCII as either endpoint is
+	// ERRCODE_INVALID_OBJECT_DEFINITION (42P17). This closes the encoding-name half
+	// of slice-399 deferral (b); the FROM-function existence/return-type checks
+	// stay deferred (no encoding-conversion engine). These rows must NOT register —
+	// the conversions above are the only dumpable pg_conversion rows.
+	for _, neg := range []struct{ sql, code, msg string }{
+		{"CREATE CONVERSION public.badenc FOR 'NOSUCHENC' TO 'UTF8' FROM public.f",
+			"42704", `source encoding "NOSUCHENC" does not exist`},
+		{"CREATE CONVERSION public.badenc FOR 'UTF8' TO 'BOGUS' FROM public.f",
+			"42704", `destination encoding "BOGUS" does not exist`},
+		{"CREATE CONVERSION public.badenc FOR 'SQL_ASCII' TO 'UTF8' FROM public.f",
+			"42P17", `encoding conversion to or from "SQL_ASCII" is not supported`},
+	} {
+		err := runSQLSimple(t, c, neg.sql)
+		if err == nil {
+			t.Fatalf("expected error for %q, got nil", neg.sql)
+		}
+		if pe, ok := err.(*pq.Error); ok {
+			if string(pe.Code) != neg.code {
+				t.Errorf("%q: SQLSTATE = %s, want %s (msg=%s)", neg.sql, pe.Code, neg.code, pe.Message)
+			}
+			if !strings.Contains(pe.Message, neg.msg) {
+				t.Errorf("%q: message %q does not contain %q", neg.sql, pe.Message, neg.msg)
+			}
+		} else {
+			t.Errorf("%q: error = %T (%v), want *pq.Error", neg.sql, err, err)
+		}
 	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
