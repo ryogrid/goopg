@@ -8474,6 +8474,26 @@ func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
 	return nil, false
 }
 
+// UserCollationOIDByName resolves a user-created collation's OID by its bare
+// name (case-insensitive). The attcollation surfacing for a table column /
+// composite field uses it to shadow the column type's typcollation when the
+// column was declared `COLLATE <usercoll>`, so pg_dump's getTableAttrs reports
+// `attcollation <> typcollation` and re-emits the inline COLLATE clause
+// (schema-qualified via findCollationByOid → fmtQualifiedDumpable). Returns 0
+// when no user collation by that name exists — built-in collations are resolved
+// separately (collationNameToOID in the executor), so the caller only falls back
+// here for a non-built-in name. M0119-0004 (DU-002 slice 394).
+func (c *InMemory) UserCollationOIDByName(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, uc := range c.userCollations {
+		if strings.EqualFold(uc.Name, name) {
+			return uc.OID
+		}
+	}
+	return 0
+}
+
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
 // It returns the two bootstrap tablespaces (pg_default OID 1663, pg_global OID
 // 1664, owned by the bootstrap superuser per pg_tablespace.dat) followed by any

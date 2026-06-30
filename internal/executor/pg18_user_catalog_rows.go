@@ -786,6 +786,13 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if col.Collation != "" && attrs.TypCollation != 0 {
 		if oid := collationNameToOID(col.Collation); oid != 0 {
 			attCollationOID = oid
+		} else if im, ok := cat.(*catalog.InMemory); ok {
+			// Not a built-in collation name — resolve a CREATE COLLATION (user)
+			// collation's OID so a column declared `COLLATE <usercoll>` shadows the
+			// type default and pg_dump re-emits `COLLATE <schema>.<name>`. DU-002 slice 394.
+			if oid := im.UserCollationOIDByName(col.Collation); oid != 0 {
+				attCollationOID = oid
+			}
 		}
 	}
 	// attacl carries the column's materialized pg_attribute.attacl as a PG-native
@@ -1706,6 +1713,13 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 	if field.Collation != "" && attrs.TypCollation != 0 {
 		if oid := collationNameToOID(field.Collation); oid != 0 {
 			attCollationOID = oid
+		} else if im, ok := cat.(*catalog.InMemory); ok {
+			// User (CREATE COLLATION) collation on a composite field — same fallback
+			// as the table-column path so dumpCompositeType re-emits the COLLATE
+			// clause. DU-002 slice 394.
+			if oid := im.UserCollationOIDByName(field.Collation); oid != 0 {
+				attCollationOID = oid
+			}
 		}
 	}
 	return Row{

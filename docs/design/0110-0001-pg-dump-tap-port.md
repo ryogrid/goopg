@@ -9663,6 +9663,36 @@ libc two-clause, icu locale/rules/deterministic, builtin) is covered by a round-
 heap-backed); the BKI built-in rows still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump
 skips pinned collations).
 
+### Slice 394 — **a column collated with a USER collation** (`COLLATE public.usercoll`)
+
+Slices 389–393 made a user collation itself round-trip (`CREATE COLLATION`), and slice 188 made a column collated with a
+*built-in* collation round-trip (`a text COLLATE pg_catalog."C"`). The composition — a table column (or composite field)
+declared `COLLATE <user-collation>` — was still silently dropped from the dump. pg_dump's `getTableAttrs` reports a
+column's `attcollation` only when `a.attcollation <> t.typcollation`, then `dumpTableSchema` re-emits the inline COLLATE
+clause via `findCollationByOid` → `fmtQualifiedDumpable` (which schema-qualifies a non-`pg_catalog` collation, so a public
+user collation dumps as `COLLATE public.usercoll`, unlike the `pg_catalog."C"` built-in form).
+
+The gap was in goopg's attcollation surfacing: `buildUserPGAttributeRow` / `buildUserPGAttributeRowForCompositeField`
+resolved the declared collation name to an OID only through `collationNameToOID`, which knows just the seven built-in
+collations and returns 0 for everything else. A user-collation name therefore fell through to the type default
+(`typcollation`), `getTableAttrs` saw no difference, and pg_dump emitted no clause. Both sites now fall back to the
+user-collation registry — `catalog.InMemory.UserCollationOIDByName(name)` (a bare-name, case-insensitive search of
+`userCollations`) — when `collationNameToOID` returns 0, so the shadowed `attcollation` OID is the real user-collation OID
+whose `pg_collation` row pg_dump already reads (slices 389+). The COLLATE rendering, schema-qualification, and the
+`attcollation <> typcollation` suppression test are entirely pg_dump-client-side and unchanged; goopg only supplies the
+correct OID.
+
+This slice is a one-line-each executor fallback at the two sibling attcollation sites plus the catalog helper, with one
+`TestPort_PgDumpConnectionSetup` fixture (`CREATE COLLATION public.usercoll (LOCALE = 'C')` +
+`CREATE TABLE public.usercollcol (a text COLLATE public.usercoll, b text)`) confirmed byte-identical vs real pg_dump 18.3;
+the negative assertion is scoped to the `usercollcol` block because another fixture (`collcol.b`) legitimately carries a
+built-in `COLLATE pg_catalog."POSIX"`.
+
+**Deferred** (ledger): the user collation is resolved by bare name only — two user collations of the same name in
+different schemas are not disambiguated by the column's schema (acceptable for the common single-schema case; goopg does
+not actually collate, so this is dump-OID fidelity only). The in-memory-registry / no-restart-persistence deferral from
+slices 389–393 still applies.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -3355,6 +3355,22 @@ documentation-only and is exempt from the design-doc requirement.)
       (the executor/catalog already handled both providers). With this every dumpCollation provider limb goopg can emit (libc
       collapse, libc two-clause, icu locale/rules/deterministic, builtin) is round-trip-asserted; collation pg_dump fidelity is
       complete. Deferral row appended (carry-forward only: registry still in-memory; BKI '' vs NULL; dump-only no real ordering).
+      **2026-07-01 (loop #34, design 0110-0001 slice 394): a column collated with a USER collation round-trip.** Slices
+      389–393 made a user collation itself dump (`CREATE COLLATION`) and slice 188 made a column collated with a *built-in*
+      collation dump (`a text COLLATE pg_catalog."C"`), but the composition — a table column / composite field declared
+      `COLLATE <user-collation>` — was silently dropped: the attcollation surfacing
+      (`buildUserPGAttributeRow{,ForCompositeField}`) resolved the declared name to an OID only via `collationNameToOID`
+      (the seven built-ins), so a user-collation name fell through to the type default (`typcollation`), pg_dump's
+      `getTableAttrs` saw no `attcollation <> typcollation` difference, and no COLLATE clause was emitted. Both sibling
+      sites now fall back to a new `catalog.InMemory.UserCollationOIDByName(name)` (bare-name, case-insensitive search of
+      `userCollations`) when `collationNameToOID` returns 0, so the shadowed `attcollation` carries the real user-collation
+      OID whose `pg_collation` row pg_dump already reads (slices 389+); the COLLATE rendering / schema-qualification
+      (`public.usercoll`, vs the built-in `pg_catalog."C"` form) is all pg_dump-client-side and unchanged. One
+      `TestPort_PgDumpConnectionSetup` fixture (`CREATE COLLATION public.usercoll (LOCALE = 'C')` +
+      `CREATE TABLE public.usercollcol (a text COLLATE public.usercoll, b text)`), byte-identical vs real pg_dump 18.3;
+      negative assertion scoped to the usercollcol block (collcol.b legitimately carries `COLLATE pg_catalog."POSIX"`).
+      Deferred: bare-name resolution doesn't disambiguate same-named collations across schemas (dump-OID fidelity only;
+      goopg does not actually collate); in-memory-registry/no-restart-persistence carry-forward from 389–393.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

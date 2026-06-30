@@ -4980,6 +4980,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C')"); err != nil {
 		t.Fatalf("create collation builtin_coll: %v", err)
 	}
+	// Slice 394: a table column declared `COLLATE <user-collation>` must round-trip.
+	// Slices 389–393 made a user collation itself dump (CREATE COLLATION), and slice
+	// 188 made a column collated with a BUILT-IN collation dump (`COLLATE
+	// pg_catalog."C"`), but a column referencing a CREATE COLLATION collation was
+	// silently dropped: the attcollation surfacing only resolved built-in collation
+	// names (collationNameToOID) to an OID, so a user-collation name fell through to
+	// the type default (typcollation), getTableAttrs saw no difference, and pg_dump
+	// emitted no COLLATE clause. The executor now falls back to the user-collation
+	// registry (catalog.UserCollationOIDByName) for a non-built-in name, so the
+	// shadowed attcollation OID lets pg_dump's findCollationByOid →
+	// fmtQualifiedDumpable re-emit the schema-qualified `COLLATE public.usercoll`.
+	// The uncollated `b` keeps the type default and must stay clause-free.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.usercoll (LOCALE = 'C')"); err != nil {
+		t.Fatalf("create collation usercoll: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.usercollcol (a text COLLATE public.usercoll, b text)"); err != nil {
+		t.Fatalf("create table usercollcol: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7689,6 +7707,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "d text COLLATE") {
 			t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (collcol.d)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 394 (asserted):** a column collated with a USER collation. Unlike
+		// the built-in case (pg_catalog."C"), a CREATE COLLATION collation in public
+		// dumps schema-qualified as `COLLATE public.usercoll`. Before the fix the
+		// attcollation surfacing resolved only built-in names, so usercollcol.a fell
+		// back to the type default and the clause vanished. The negative check is
+		// scoped to the usercollcol block because another table (collcol.b) legitimately
+		// carries `b text COLLATE pg_catalog."POSIX"`.
+		if idx := strings.Index(res.Stdout, "CREATE TABLE public.usercollcol ("); idx < 0 {
+			t.Errorf("pg_dump dropped the usercollcol table entirely\n  full stdout=%q", res.Stdout)
+		} else {
+			block := res.Stdout[idx:]
+			if end := strings.Index(block, ");"); end >= 0 {
+				block = block[:end]
+			}
+			if !strings.Contains(block, "a text COLLATE public.usercoll") {
+				t.Errorf("pg_dump dropped a column's user-collation COLLATE clause; missing %q\n  usercollcol block=%q", "a text COLLATE public.usercoll", block)
+			}
+			if strings.Contains(block, "b text COLLATE") {
+				t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (usercollcol.b)\n  usercollcol block=%q", block)
+			}
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation
