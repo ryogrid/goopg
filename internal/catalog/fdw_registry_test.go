@@ -18,17 +18,21 @@ func TestForeignDataWrapperRegistry(t *testing.T) {
 		t.Fatalf("empty FDW registry: pg_foreign_data_wrapper has %d rows, want 0", len(rows))
 	}
 
-	f := c.RegisterForeignDataWrapper("myfdw")
+	f := c.RegisterForeignDataWrapper("myfdw", []string{"debug=true"})
 	if f.OID < FirstUserOID {
 		t.Fatalf("RegisterForeignDataWrapper minted OID %d below FirstUserOID %d", f.OID, FirstUserOID)
 	}
-	// Idempotent: same name returns the same OID, no churn.
-	if f2 := c.RegisterForeignDataWrapper("myfdw"); f2.OID != f.OID {
+	// Idempotent: same name returns the same OID, no churn. Empty options on
+	// re-registration do not clobber the stored OPTIONS.
+	if f2 := c.RegisterForeignDataWrapper("myfdw", nil); f2.OID != f.OID {
 		t.Fatalf("re-register myfdw changed OID: %d → %d", f.OID, f2.OID)
+	}
+	if len(f.Options) != 1 || f.Options[0] != "debug=true" {
+		t.Fatalf("re-register with nil options clobbered OPTIONS: %+v", f.Options)
 	}
 
 	// A second FDW gets a distinct OID; ListForeignDataWrappers is name-sorted.
-	c.RegisterForeignDataWrapper("alpha_fdw")
+	c.RegisterForeignDataWrapper("alpha_fdw", nil)
 	list := c.ListForeignDataWrappers()
 	if len(list) != 2 || list[0].Name != "alpha_fdw" || list[1].Name != "myfdw" {
 		t.Fatalf("ListForeignDataWrappers = %+v; want [alpha_fdw, myfdw]", list)
@@ -45,7 +49,9 @@ func TestForeignDataWrapperRegistry(t *testing.T) {
 		t.Fatalf("pg_foreign_data_wrapper has %d rows, want 2", len(rows))
 	}
 	myrow := rows[1] // sorted: alpha_fdw, myfdw
-	want := []string{strconv.FormatUint(uint64(f.OID), 10), "myfdw", "10", "0", "0", "", ""}
+	// fdwoptions renders the text[] external literal "{debug=true}" that
+	// pg_dump's pg_options_to_table(fdwoptions) expands back into an OPTIONS clause.
+	want := []string{strconv.FormatUint(uint64(f.OID), 10), "myfdw", "10", "0", "0", "", "{debug=true}"}
 	if len(myrow) != len(want) {
 		t.Fatalf("FDW row width %d, want %d", len(myrow), len(want))
 	}
@@ -82,7 +88,7 @@ func TestForeignServerRegistry(t *testing.T) {
 	}
 
 	// The server references an FDW by name; srvfdw must resolve to its OID.
-	fdw := c.RegisterForeignDataWrapper("goopg_fdw")
+	fdw := c.RegisterForeignDataWrapper("goopg_fdw", nil)
 	s := c.RegisterForeignServer("srv1", "goopg_fdw", nil)
 	if s.OID < FirstUserOID {
 		t.Fatalf("RegisterForeignServer minted OID %d below FirstUserOID %d", s.OID, FirstUserOID)
@@ -196,7 +202,7 @@ func TestUserMappingRegistry(t *testing.T) {
 	}
 
 	// Register a server + role so the mapping resolves srvid and umuser.
-	c.RegisterForeignDataWrapper("goopg_fdw")
+	c.RegisterForeignDataWrapper("goopg_fdw", nil)
 	srv := c.RegisterForeignServer("goopg_srv", "goopg_fdw", nil)
 	c.RegisterRole("um_role")
 	roleOID, _ := c.RoleOID("um_role")

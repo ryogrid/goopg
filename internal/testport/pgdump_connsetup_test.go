@@ -4816,6 +4816,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'localhost', dbname 'mydb')"); err != nil {
 		t.Fatalf("create server with options: %v", err)
 	}
+	// Slice 380: a FOREIGN DATA WRAPPER created `WITH OPTIONS (name 'value', …)`
+	// must round-trip its options. PostgreSQL stores them in
+	// pg_foreign_data_wrapper.fdwoptions as a text[] of `name=value` elements;
+	// pg_dump's getForeignDataWrappers expands them server-side via
+	// `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||
+	// quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+	// option_name), E',\n    ')`, and dumpForeignDataWrapper re-emits
+	// `CREATE FOREIGN DATA WRAPPER <name> OPTIONS (\n    <opt>,\n    <opt>\n);`.
+	// Options are emitted ORDER BY option_name (so debug precedes delimiter
+	// regardless of CREATE order). goopg now captures the OPTIONS clause in the
+	// parser, stores it in the FDW registry, and surfaces it as the fdwoptions
+	// array literal — driving goopg's own pg_options_to_table SRF. A dedicated
+	// wrapper (goopg_fdw stays bare so the slice-375 no-OPTIONS assertion holds).
+	// CREATE order (delimiter, debug) differs from option_name order (debug,
+	// delimiter) so the ORDER BY is exercised. Metachar-free values keep the
+	// text[] literal unambiguous (array-metachar quoting is deferred — see the
+	// ledger). Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (delimiter 'pipe', debug 'true')"); err != nil {
+		t.Fatalf("create fdw with options: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -10081,6 +10101,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		umOptStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (\n    password 'secret',\n    username 'remote'\n);"
 		if !strings.Contains(res.Stdout, umOptStmt) {
 			t.Errorf("pg_dump dropped the USER MAPPING OPTIONS (slice-379); missing %q\n  full stdout=%q", umOptStmt, res.Stdout)
+		}
+		// Slice 380: a FOREIGN DATA WRAPPER WITH OPTIONS must round-trip the OPTIONS
+		// clause. dumpForeignDataWrapper renders the options ORDER BY option_name
+		// (debug before delimiter, regardless of CREATE order) as a `,\n    `-joined
+		// `name 'value'` list inside ` OPTIONS (\n    …\n)`, exercising goopg's
+		// pg_options_to_table SRF over the fdwoptions text[] literal
+		// `{delimiter=pipe,debug=true}`. Verified against real pg_dump 18.3.
+		fdwOptStmt := "CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (\n    debug 'true',\n    delimiter 'pipe'\n);"
+		if !strings.Contains(res.Stdout, fdwOptStmt) {
+			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER OPTIONS (slice-380); missing %q\n  full stdout=%q", fdwOptStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

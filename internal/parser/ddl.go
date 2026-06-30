@@ -321,19 +321,32 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		if p.acceptIdentKeyword("data") {
 			_ = p.acceptIdentKeyword("wrapper")
-			// CREATE FOREIGN DATA WRAPPER name [OPTIONS (...)] — register as compat object.
+			// CREATE FOREIGN DATA WRAPPER name [HANDLER f | NO HANDLER]
+			// [VALIDATOR f | NO VALIDATOR] [OPTIONS (...)] — register as compat
+			// object. The OPTIONS clause (always last) round-trips through pg_dump
+			// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper). The
+			// HANDLER/VALIDATOR func references are skipped (goopg tracks no funcs).
+			// DU-002 slice 380.
 			name, err := p.parseObjectName()
 			if err != nil {
 				return nil, err
 			}
+			var options []string
 			for {
 				tok := p.cur()
 				if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
 					break
 				}
+				// Detect "OPTIONS ( name 'value', … )".
+				if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "options") {
+					options = p.scanFDWOptionsList()
+					continue
+				}
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "foreign-data wrapper", ObjName: name}, nil
+			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "foreign-data wrapper", ObjName: name}
+			ns.Options = options
+			return ns, nil
 		}
 		// Other CREATE FOREIGN ... → skip.
 		return p.parseSkipToSemicolon(t.Pos)

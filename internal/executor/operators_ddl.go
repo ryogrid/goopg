@@ -12668,8 +12668,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
 		// round-trips through pg_dump (pg_foreign_data_wrapper virtual view →
 		// dumpForeignDataWrapper). The dedicated registry mints a stable OID so
-		// repeated VirtualRows calls return the same identity. DU-002 slice 375.
-		im.RegisterForeignDataWrapper(s.ObjName.String())
+		// repeated VirtualRows calls return the same identity. Options threads
+		// the OPTIONS (...) clause so fdwoptions round-trips
+		// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper).
+		// DU-002 slice 375 (options: slice 380).
+		im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
 	case "user mapping":
 		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
 		// so it round-trips through pg_dump (pg_user_mappings virtual view →

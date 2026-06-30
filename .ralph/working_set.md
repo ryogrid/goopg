@@ -1,42 +1,43 @@
 (idle — nothing in flight)
 
-Loop #18 COMPLETE: M0119-0004 DU-002 slice 379 — `CREATE USER MAPPING …
+Loop #19 COMPLETE: M0119-0004 DU-002 slice 380 — `CREATE FOREIGN DATA WRAPPER …
 OPTIONS (name 'value', …)` round-trip THROUGH pg_dump.
 
-Slice 377 dumped a user mapping but discarded OPTIONS (umoptions always NULL).
-This slice round-trips them, REUSING the slice-378 machinery wholesale. pg_dump's
-dumpUserMappings expands umoptions server-side via the identical
-`array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(
-option_value) FROM pg_options_to_table(umoptions) ORDER BY option_name),
-E',\n    '))` → ` OPTIONS (\n    %s\n)`. Options sort by name (password<username).
+Completes the FDW/SERVER/MAPPING OPTIONS trilogy (378/379/380). Slice 375 dumped
+an FDW but discarded fdwoptions (always NULL). pg_dump's getForeignDataWrappers
+expands fdwoptions server-side via the same array_to_string(ARRAY(SELECT
+quote_ident(name)||' '||quote_literal(val) FROM pg_options_to_table(fdwoptions)
+ORDER BY option_name), E',\n    ')) shape → CREATE FOREIGN DATA WRAPPER <name>
+OPTIONS (\n    %s\n);. Options sorted by name (debug<delimiter).
 
-Fix (3 layers, mirrors slice 378):
-- parser (ddl.go): scanUserMappingForServer now ALSO returns options via the
-  shared scanFDWOptionsList; CREATE arm stores in CompatNoopStmt.Options, DROP
-  caller discards (`_`).
-- catalog (catalog.go): UserMapping.Options []string; RegisterUserMapping signature
-  now (user,server,options) (idempotent re-register refreshes only when non-empty);
-  umoptions cell renders optionsArrayLiteral(m.Options).
-- executor (operators_ddl.go): user-mapping arm threads s.Options.
+Fix (3 layers, mirrors slice 378/379):
+- parser (ddl.go): CREATE FOREIGN DATA WRAPPER arm now scans for OPTIONS token,
+  consumes via shared scanFDWOptionsList → CompatNoopStmt.Options (HANDLER/
+  VALIDATOR clauses still skipped).
+- catalog (catalog.go): ForeignDataWrapper.Options []string;
+  RegisterForeignDataWrapper signature now (name,options) (idempotent re-register
+  refreshes only when non-empty); fdwoptions cell renders optionsArrayLiteral(f.Options).
+- executor (operators_ddl.go): foreign-data wrapper arm threads s.Options.
 
 Files: internal/parser/ddl.go, internal/parser/op_compat_test.go
-(TestParseCreateUserMapping extended), internal/catalog/catalog.go,
-internal/catalog/fdw_registry_test.go (umoptions assert + 3 caller sig fixes),
+(new TestParseCreateFDWOptions), internal/catalog/catalog.go,
+internal/catalog/fdw_registry_test.go (fdwoptions assert + 6 caller sig fixes),
 internal/executor/operators_ddl.go, internal/testport/pgdump_connsetup_test.go
-(goopg_srv_um fixture + assert), docs/design/0110-0001-pg-dump-tap-port.md
-(Slice 379), fix_plan, ledger.
+(goopg_fdw_opt fixture + assert), docs/design/0110-0001-pg-dump-tap-port.md
+(Slice 380), fix_plan, ledger.
 
-Gates: TestParseCreateUserMapping + TestUserMappingRegistry + full parser/catalog
-suites PASS; TestPort_PgDumpConnectionSetup PASS (byte-identical vs pg_dump 18.3)
-+ NEGATIVE CONTROL confirmed assertion live. go build ./... clean. pgbench smoke =
-pre-commit hook. No TPC-H (metadata-only virtual-catalog change).
+Gates: TestParseCreateFDWOptions + TestForeignDataWrapperRegistry + full
+parser/catalog suites PASS; TestPort_PgDumpConnectionSetup PASS (byte-identical
+vs pg_dump 18.3) + NEGATIVE CONTROL confirmed (slice-380 assertion fired when
+fdwoptions render broken). go build ./... clean. pgbench smoke = pre-commit hook.
+No TPC-H (metadata-only virtual-catalog change).
 
-DISCOVERY (ledger): goopg's pgQuoteIdent does NOT guard reserved keywords (comment
-lies) → reserved-keyword option name `user` emits bare `user 'x'` vs pg_dump's
-`"user" 'x'`; latent at every quote_ident site. Sidestepped with non-keyword names.
+GOTCHA THIS LOOP: `git checkout catalog.go` to revert a negative-control sed
+ALSO wiped the real uncommitted edits — had to re-apply all 3 catalog changes.
+Use targeted sed-revert, not git checkout, on uncommitted files.
 
-Next loop: fresh M0119-0004 pg_dump slice. Candidates: FDW OPTIONS (fdwoptions —
-reuse scanFDWOptionsList in CREATE FOREIGN DATA WRAPPER arm + optionsArrayLiteral);
-pgQuoteIdent reserved-keyword fix (cross-cutting); array-metachar quoting in
-optionsArrayLiteral; SERVER TYPE/VERSION; range types; aggregates; operators;
-text-search configs; CREATE COLLATION.
+Next loop: fresh M0119-0004 pg_dump slice. FDW/SERVER/MAPPING OPTIONS now
+COMPLETE. Candidates: array-metachar quoting in optionsArrayLiteral (cross-cutting
+w/ reloptions); pgQuoteIdent reserved-keyword fix (cross-cutting); ALTER … OPTIONS
+ADD/SET/DROP; SERVER TYPE/VERSION; range types; aggregates; operators; text-search
+configs; CREATE COLLATION.

@@ -3232,6 +3232,24 @@ documentation-only and is exempt from the design-doc requirement.)
       like `user` emits bare `user 'x'` where real pg_dump emits `"user" 'x'` — latent at every quote_ident site;
       sidestepped here with non-keyword names. **Deferred (ledger):** FDW (`fdwoptions`) OPTIONS still discarded;
       array-metachar value quoting + in-memory-only limits carry over from slice 378.
+
+      **2026-06-30 (loop #19, design 0110-0001 slice 380): `CREATE FOREIGN DATA WRAPPER … OPTIONS (name 'value', …)`
+      round-trip (PRODUCTION fix).** Slice 375 dumped an FDW but discarded its OPTIONS (`fdwoptions` always NULL).
+      Completes the FDW/SERVER/MAPPING OPTIONS trilogy (378/379/380) reusing the shared `scanFDWOptionsList` +
+      `optionsArrayLiteral` machinery: pg_dump's `getForeignDataWrappers` expands `fdwoptions` server-side via the
+      identical `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(option_value) FROM
+      pg_options_to_table(fdwoptions) ORDER BY option_name), E',\n    ')` shape (options sorted by name → `debug`
+      before `delimiter`). Parser: the `CREATE FOREIGN DATA WRAPPER` arm now scans for the OPTIONS token and consumes
+      it via `scanFDWOptionsList` (HANDLER/VALIDATOR clauses still skipped) → `CompatNoopStmt.Options`. Catalog:
+      `ForeignDataWrapper.Options []string`; `RegisterForeignDataWrapper(name,options)` (idempotent re-register
+      refreshes only when non-empty); `pg_foreign_data_wrapper` `fdwoptions` cell renders via `optionsArrayLiteral`.
+      Executor threads `s.Options` into RegisterForeignDataWrapper. Emits `CREATE FOREIGN DATA WRAPPER goopg_fdw_opt
+      OPTIONS (\n    debug 'true',\n    delimiter 'pipe'\n);` byte-identical vs pg_dump 18.3 (negative control confirms
+      the order assertion is live; `goopg_fdw` stays bare so the slice-375 no-OPTIONS assertion holds). Tests new
+      `TestParseCreateFDWOptions` + `fdwoptions` in `TestForeignDataWrapperRegistry` + DU-002 slice 380 fixture.
+      **Deferred (ledger):** array-metachar value quoting STILL absent (metachar-free `pipe`/`true` used); ALTER
+      FOREIGN DATA WRAPPER OPTIONS, HANDLER/VALIDATOR func refs, reserved-keyword quote_ident gap, in-memory-only all
+      carry over. With this slice the FDW/SERVER/USER-MAPPING OPTIONS round-trip is complete.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

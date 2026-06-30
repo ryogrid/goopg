@@ -186,6 +186,52 @@ func TestParseCreateServerOptions(t *testing.T) {
 	}
 }
 
+// TestParseCreateFDWOptions verifies that CREATE FOREIGN DATA WRAPPER captures an
+// OPTIONS (name 'value', …) clause as "name=value" elements (and skips any
+// HANDLER/VALIDATOR clauses preceding it), so the wrapper's options round-trip
+// through pg_dump (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper).
+// DU-002 slice 380.
+func TestParseCreateFDWOptions(t *testing.T) {
+	// Bare CREATE FOREIGN DATA WRAPPER (no OPTIONS) carries nil Options.
+	stmts, err := Parse("CREATE FOREIGN DATA WRAPPER goopg_fdw")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ObjType != "foreign-data wrapper" || ns.ObjName.Name != "goopg_fdw" {
+		t.Errorf("bare FDW mis-parsed: %+v", ns)
+	}
+	if ns.Options != nil {
+		t.Errorf("bare FDW Options = %+v, want nil", ns.Options)
+	}
+
+	// CREATE FOREIGN DATA WRAPPER … OPTIONS (…) captures options in clause order,
+	// even when an unrelated NO HANDLER / VALIDATOR clause precedes them.
+	stmts, err = Parse("CREATE FOREIGN DATA WRAPPER goopg_fdw NO HANDLER OPTIONS (debug 'true', delimiter ',')")
+	if err != nil {
+		t.Fatalf("Parse error with OPTIONS: %v", err)
+	}
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ObjName.Name != "goopg_fdw" {
+		t.Errorf("FDW name lost with OPTIONS: %q", ns.ObjName.Name)
+	}
+	want := []string{"debug=true", "delimiter=,"}
+	if len(ns.Options) != len(want) {
+		t.Fatalf("Options = %+v, want %+v", ns.Options, want)
+	}
+	for i := range want {
+		if ns.Options[i] != want[i] {
+			t.Errorf("Options[%d] = %q, want %q", i, ns.Options[i], want[i])
+		}
+	}
+}
+
 func TestParseCreateRuleTableName(t *testing.T) {
 	sql := `CREATE RULE test_rule_exists AS ON INSERT TO test_exists
     DO INSTEAD

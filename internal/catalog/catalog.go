@@ -6702,7 +6702,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                                   // fdwhandler (regproc 0 → '-')
 				"0",                                   // fdwvalidator (regproc 0 → '-')
 				"",                                    // fdwacl (NULL)
-				"",                                    // fdwoptions (NULL)
+				optionsArrayLiteral(f.Options),        // fdwoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
 		return out
@@ -9468,21 +9468,31 @@ type ForeignDataWrapper struct {
 	Name  string // fdwname
 	OID   uint32 // pg_foreign_data_wrapper.oid (assigned from the catalog OID counter)
 	Owner uint32 // fdwowner; 0 → defaults to the bootstrap superuser at render time
+	// Options holds the wrapper's OPTIONS as "name=value" elements, the on-disk
+	// pg_foreign_data_wrapper.fdwoptions text[] representation. pg_dump's
+	// getForeignDataWrappers expands these via pg_options_to_table(fdwoptions) and
+	// dumpForeignDataWrapper re-emits an `OPTIONS (name 'value', …)` clause.
+	// Nil/empty → no OPTIONS clause. DU-002 slice 380.
+	Options []string
 }
 
 // RegisterForeignDataWrapper records an FDW, allocating a stable OID on first
 // sight. Idempotent: re-registering an existing name returns the existing entry
-// without changing its OID. DU-002 slice 375.
-func (c *InMemory) RegisterForeignDataWrapper(name string) *ForeignDataWrapper {
+// without changing its OID (the OPTIONS are refreshed when non-empty).
+// DU-002 slice 375 (options: slice 380).
+func (c *InMemory) RegisterForeignDataWrapper(name string, options []string) *ForeignDataWrapper {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.fdws == nil {
 		c.fdws = make(map[string]*ForeignDataWrapper)
 	}
 	if f, ok := c.fdws[name]; ok {
+		if len(options) > 0 {
+			f.Options = options
+		}
 		return f
 	}
-	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked()}
+	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked(), Options: options}
 	c.fdws[name] = f
 	return f
 }

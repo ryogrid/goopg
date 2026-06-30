@@ -9313,6 +9313,39 @@ pg_dump 18.3 (`dumpUserMappings`), with a negative control confirming the option
 this one. This slice sidesteps it with non-keyword option names; the array-metacharacter value-quoting gap and the in-memory-only limitation
 from slice 378 also still apply.
 
+### Slice 380 — **`CREATE FOREIGN DATA WRAPPER … OPTIONS (name 'value', …)`** round-trip (PRODUCTION fix)
+
+Slice 375 made a foreign-data wrapper dumpable but discarded its `OPTIONS` (the `fdwoptions` cell was always NULL). This slice round-trips
+them, completing the FDW/SERVER/MAPPING `OPTIONS` trilogy (slices 378/379/380 all reuse the same `scanFDWOptionsList` +
+`optionsArrayLiteral` machinery). PostgreSQL stores wrapper options in `pg_foreign_data_wrapper.fdwoptions` as a `text[]` of `name=value`
+elements; pg_dump's `getForeignDataWrappers` expands them **server-side** via
+`array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+option_name), E',\n    ')`, and `dumpForeignDataWrapper` re-emits `CREATE FOREIGN DATA WRAPPER <name> OPTIONS (\n    %s\n);`. Because the
+list is `ORDER BY option_name`, `debug` precedes `delimiter` regardless of `CREATE` order.
+
+- **Parser** (`internal/parser/ddl.go`): the `CREATE FOREIGN DATA WRAPPER` arm previously skipped its whole tail to the semicolon. It now
+  scans for the `OPTIONS` token and consumes the clause via the shared `scanFDWOptionsList` helper (storing the `name=value` list in
+  `CompatNoopStmt.Options`); any `HANDLER`/`VALIDATOR` func clauses preceding `OPTIONS` are still skipped (goopg tracks no funcs).
+- **Catalog** (`internal/catalog/catalog.go`): `ForeignDataWrapper` gains an `Options []string` field; `RegisterForeignDataWrapper(name,
+  options)` stores it (re-registration refreshes options only when non-empty, so an idempotent `nil` re-register is non-destructive). The
+  `pg_foreign_data_wrapper` `VirtualRows` `fdwoptions` cell renders the options via the existing `optionsArrayLiteral` helper, which goopg's
+  own `pg_options_to_table` SRF then expands back into `(option_name, option_value)` rows.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `foreign-data wrapper` arm threads `s.Options` into
+  `RegisterForeignDataWrapper`.
+
+Covered by the new `TestParseCreateFDWOptions` (parser: `OPTIONS` form → ordered `name=value` slice, with a preceding `NO HANDLER` clause
+skipped, and the bare form → `nil`), the `fdwoptions` assertions in `TestForeignDataWrapperRegistry` (registry: `fdwoptions` renders
+`{debug=true}`; `nil` re-register preserves options), and the `goopg_fdw_opt` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact
+multi-line `CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (\n    debug 'true',\n    delimiter 'pipe'\n);`; the existing `goopg_fdw` stays
+bare so the slice-375 no-OPTIONS assertion still holds). Verified against real pg_dump 18.3 (`dumpForeignDataWrapper`), with a negative
+control confirming the `fdwoptions` assertion is live.
+
+**Deferred (ledger):** option VALUES containing array metacharacters (comma/brace/space/double-quote/backslash) are still not quoted in the
+`optionsArrayLiteral` text[] literal (plain comma join), so such a value corrupts `pg_options_to_table` splitting — the fixture uses
+metachar-free values (`pipe`, `true`). The reserved-keyword `quote_ident` gap (slice 379) and the in-memory-only limitation also still apply.
+With this slice the FDW/SERVER/USER-MAPPING `OPTIONS` round-trip is complete; the remaining FDW work is `ALTER FOREIGN DATA WRAPPER …
+OPTIONS` (ADD/SET/DROP) and `HANDLER`/`VALIDATOR` function references.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
