@@ -9089,6 +9089,30 @@ real pg_dump 18.3.
 **Deferred (ledger):** restart persistence (in-memory `pg_description`). Remaining `COMMENT ON` targets still dropped — `COLLATION`,
 `LANGUAGE`, `DATABASE`, `EXTENSION` — each a sibling slice when its object type becomes dumpable.
 
+### Slice 373 — **TABLE column typed as a user-defined COMPOSITE type** round-trip (PRODUCTION fix)
+
+A composite type itself round-trips (slices 242/243), and a composite *field* whose declared type is another composite/enum/domain
+resolves to the schema-qualified name (slices 248–252). But a **table column** whose declared type is a composite (`c public.addr`)
+did **not**: a composite name is not a built-in, so the `CREATE TABLE` column path folds it to the text fallback
+(`catalog.TypeNameToOID` knows only built-ins; `InMemory.ResolveColumnType` preserves the bare composite name unchanged because it is
+not a domain). `buildUserPGAttributeRow` (the single source of every table-column `pg_attribute` heap row) had an enum branch (slice 88)
+and a domain branch (slice 90) over the text fallback, but **no composite branch** — so `pg_attribute.atttypid` stayed text (OID 25) and
+pg_dump's `getTableAttrs` → `format_type(atttypid, atttypmod)` rendered the column as `text` (and `text[]` for an array column). The
+dump was *unrestorable*: it silently dropped the composite typing.
+
+This slice adds the composite branch, the table-column analogue of slice 249's nested-composite FIELD. Mirroring the enum/domain
+branches: when the column folded to the text OID and matched no enum, `cat.LookupCompositeType(col.Type.Name)` re-resolves the bare name
+(the parser splits a schema-qualified `public.addr` into `Schema`+`Name`, so `Type.Name` is the bare key the composite registry uses) to
+the composite's dynamically-allocated pg_type OID — the scalar OID for `c addr`, or the auto-generated array OID (`ct.ArrayOID`,
+`attndims=1`) for `c addr[]`. The physical layout follows `buildUserPGTypeRowForComposite`: varlena (`attlen=-1`), `attbyval=false`,
+`attalign='d'` (double, like RECORD), `attstorage='x'` (extended). `format_type` already resolves a composite OID / array OID back to
+its schema-qualified name (slices 249/250 via `LookupCompositeTypeByOID` / `…ByArrayOID`), so no other site changed. Covered by
+`TestUserPGAttributeCompositeColumn` (unit: scalar + array atttypid/layout + nil-catalog fallback) and the `public.comptcol` table in
+`TestPort_PgDumpConnectionSetup` (`c public.addr`, `carr public.addr[]`). Verified byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** composite-column *values* (INSERT/COPY of a literal `(a,b)` row) are not exercised — this slice is schema-dump
+fidelity only. A composite column in a non-`public` schema isn't covered (composite types are registered by bare name).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

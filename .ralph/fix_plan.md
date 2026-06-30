@@ -3147,6 +3147,21 @@ documentation-only and is exempt from the design-doc requirement.)
       + slice-372 `r_noins` rule-comment line in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
       restart persistence (in-memory pg_description); COMMENT ON {COLLATION,LANGUAGE,DATABASE,EXTENSION}
       still dropped (sibling slices).
+      **2026-06-30 (loop #12, design 0110-0001 slice 373): TABLE column typed as a user-defined
+      COMPOSITE type round-trip (PRODUCTION fix).** A composite TYPE round-trips (slices 242/243) and a
+      composite FIELD typed as another composite resolves to the qualified name (slice 249), but a TABLE
+      COLUMN `c public.addr` did NOT: a composite name is not a built-in, so the CREATE TABLE column path
+      folds it to the text fallback (`TypeNameToOID`/`ResolveColumnType`). `buildUserPGAttributeRow` had
+      enum (slice 88) + domain (slice 90) branches over the text fallback but NO composite branch, so
+      `pg_attribute.atttypid` stayed text(25) and pg_dump's `getTableAttrs`→`format_type` rendered the
+      column as `text` / `text[]` — an UNRESTORABLE dump. Added the composite branch (mirrors enum/domain):
+      `cat.LookupCompositeType(col.Type.Name)` → composite OID (scalar) / `ct.ArrayOID` (`addr[]`,
+      attndims=1), varlena/`attalign='d'`/`attstorage='x'` layout (mirrors `buildUserPGTypeRowForComposite`).
+      `format_type` already resolves composite OID/array OID back to the qualified name (slices 249/250) —
+      no other site changed. Byte-identical vs real pg_dump 18.3. Tests `TestUserPGAttributeCompositeColumn`
+      (unit) + `public.comptcol` table in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
+      composite-column VALUES (INSERT/COPY) not exercised — schema-dump fidelity only; non-public-schema
+      composite columns uncovered.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

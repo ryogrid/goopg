@@ -4691,6 +4691,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TYPE public.dom_arr_comp AS (label text, zips zipcode[])"); err != nil {
 		t.Fatalf("create type dom_arr_comp: %v", err)
 	}
+	// Slice 373: a TABLE COLUMN whose declared type is a user-defined COMPOSITE
+	// type (`c public.addr`) — the table-column analogue of slice 249's nested
+	// composite FIELD. A composite name is not a built-in, so the CREATE TABLE
+	// column path folds it to the text fallback (TypeNameToOID/ResolveColumnType);
+	// buildUserPGAttributeRow had no composite branch, so pg_attribute.atttypid
+	// stayed text and pg_dump's getTableAttrs → format_type(atttypid, atttypmod)
+	// rendered the column as `text` (and `text[]` for an array column), producing
+	// an UNRESTORABLE dump that silently dropped the composite typing. The builder
+	// now re-resolves the bare composite name to its pg_type OID (scalar) or its
+	// auto-generated array OID (`addr[]`), with the composite's varlena/double-
+	// aligned/extended layout, so the column round-trips as `public.addr` /
+	// `public.addr[]`. public.addr was created above (lower OID dumps first).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.comptcol (c public.addr, carr public.addr[], lbl text)"); err != nil {
+		t.Fatalf("create table comptcol: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -9842,6 +9857,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Slice 252: the domain-array composite field must not degrade to text[].
 		if strings.Contains(res.Stdout, "zips text[]") {
 			t.Errorf("pg_dump rendered the domain-array composite field as text[] (slice-252 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 373: a TABLE COLUMN typed as a user-defined composite (and its
+		// array) must round-trip as the schema-qualified composite name. Assert
+		// the exact contiguous CREATE TABLE body so a regression that re-folds the
+		// column type to text / text[] (the pre-fix behaviour) fails here.
+		comptColBlock := "CREATE TABLE public.comptcol (\n    c public.addr,\n    carr public.addr[],\n    lbl text\n);"
+		if !strings.Contains(res.Stdout, comptColBlock) {
+			t.Errorf("pg_dump mangled the composite-typed TABLE column round-trip (slice-373); missing contiguous block %q\n  full stdout=%q", comptColBlock, res.Stdout)
+		}
+		// The composite column must NOT degrade to the text fallback (the bug this
+		// slice fixed): neither the scalar nor the array column may render as text.
+		if strings.Contains(res.Stdout, "    c text,") && strings.Contains(res.Stdout, "comptcol") {
+			t.Errorf("pg_dump rendered the composite TABLE column as text (slice-373 atttypid resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "    carr text[],") {
+			t.Errorf("pg_dump rendered the composite-array TABLE column as text[] (slice-373 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

@@ -1,36 +1,43 @@
 (idle — nothing in flight)
 
-Loop #11 COMPLETE: M0119-0004 DU-002 slice 372 — `COMMENT ON RULE <name> ON
-<table>` now round-trips through pg_dump (PRODUCTION fix).
+Loop #12 COMPLETE: M0119-0004 DU-002 slice 373 — a TABLE column typed as a
+user-defined COMPOSITE type (`c public.addr`, `carr public.addr[]`) now
+round-trips through pg_dump (PRODUCTION fix).
 
-How: PG stores a query-rewrite-rule comment in pg_description keyed
-(classoid=pg_rewrite=2618, objoid=rule.oid, objsubid=0); pg_dump's dumpRule
-(pg_dump.c:19359) builds prefix "RULE %s ON" + qtabname and calls dumpComment so
-a dump re-emits `COMMENT ON RULE <name> ON <schema>.<table> IS '...';`. goopg's
-parseCommentOnTail had NO RULE branch → fell to unsupported-default arm, server
-silently swallowed it. Added: parser branch capturing `RULE <name> ON
-[schema.]table` (same shape as COMMENT ON TRIGGER/POLICY) → SubName=name,
-ObjName=table, ObjKind="rule"; executor execCommentOn case "rule" resolves the
-rule by name on the table (LookupTable→Table.Rules) → SetComment(2618, r.OID, 0,
-desc). CREATE RULE already round-trips (slice 324; each RuleInfo carries its own
-OID, projected into pg_rewrite virtual catalog); pg_description path is
-classoid-agnostic (slices 370/371) → NO catalog-query change.
+Bug: a composite type name is not a built-in, so the CREATE TABLE column path
+folds it to the text fallback (catalog.TypeNameToOID / InMemory.ResolveColumnType
+both preserve the bare name unchanged — it's not a domain). buildUserPGAttributeRow
+(pg18_user_catalog_rows.go) had an enum branch (slice 88) and a domain branch
+(slice 90) over the text fallback but NO composite branch, so pg_attribute.atttypid
+stayed text(25) → pg_dump getTableAttrs→format_type rendered the column `text` /
+`text[]` (UNRESTORABLE dump).
+
+Fix: added the composite branch mirroring enum/domain — when typOID==OIDText and
+no enum matched, `cat.LookupCompositeType(col.Type.Name)` → composite OID (scalar)
+or ct.ArrayOID (`addr[]`, attndims=1). Layout = varlena/attlen=-1/attbyval=false/
+attalign='d'/attstorage='x' (mirrors buildUserPGTypeRowForComposite). The parser
+splits `public.addr` into Schema+Name so Type.Name is the bare registry key.
+format_type already resolves composite OID/array OID → qualified name (slices
+249/250), so no other site changed.
 
 Files:
-- internal/parser/parser.go (parseCommentOnTail: "rule" case)
-- internal/parser/comment_on_test.go (TestParseCommentOnRule)
-- internal/executor/operators_ddl.go (execCommentOn: oidPgRewrite + case "rule")
-- internal/testport/pgdump_connsetup_test.go (slice-372 r_noins fixture+assert)
-- docs/design/0110-0001-pg-dump-tap-port.md (Slice 372)
-- .ralph/deferral_ledger.md + .ralph/fix_plan.md (slice 372)
+- internal/executor/pg18_user_catalog_rows.go (buildUserPGAttributeRow: composite
+  branch + array-OID remap case + attrs layout case)
+- internal/executor/pg18_user_catalog_rows_test.go (TestUserPGAttributeCompositeColumn)
+- internal/testport/pgdump_connsetup_test.go (public.comptcol fixture + assertions)
+- docs/design/0110-0001-pg-dump-tap-port.md (Slice 373)
+- .ralph/fix_plan.md + .ralph/deferral_ledger.md (slice 373)
 
-Gates: parser suite PASS; TestPort_PgDumpConnectionSetup PASS (5.7s, byte-identical
-vs real pg_dump 18.3); build clean; pgbench smoke = pre-commit hook.
+Gates: TestUserPGAttributeCompositeColumn + executor + catalog suites PASS;
+TestPort_PgDumpConnectionSetup PASS (5.1s, byte-identical vs real pg_dump 18.3);
+build/gofmt/vet clean; pgbench smoke = pre-commit hook. No TPC-H (metadata-only
+catalog-row builder; composite types absent from TPC-H schema — precedent slices
+370-372).
 
-Deferred (ledger): restart persistence (in-memory pg_description); COMMENT ON
-{COLLATION,LANGUAGE,DATABASE,EXTENSION} still dropped (no parser branch —
-sibling slices).
+Deferred (ledger): composite-column VALUES (INSERT/COPY) not exercised (schema-dump
+fidelity only); non-public-schema composite columns uncovered (registry is bare-name).
 
-Next loop: pick a fresh M0119-0004 pg_dump slice. Remaining COMMENT ON targets
-(COLLATION/LANGUAGE/DATABASE/EXTENSION) each block on that object type becoming
-dumpable; otherwise look for a fresh non-COMMENT DU-002 catalog-view parity slice.
+Next loop: pick a fresh M0119-0004 pg_dump slice. Empirical probe (throwaway
+zz_probe_test.go dumping a feature-rich schema, then visually diff vs known PG
+output) is the fastest way to find the next divergence given the deep existing
+coverage.

@@ -1662,6 +1662,93 @@ func TestUserPGAttributeDomainArrayColumn(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeColumn verifies that a TABLE column whose declared
+// type is a user-defined COMPOSITE type (`c addr`) re-resolves to the composite's
+// pg_type OID with the composite's varlena/double-aligned/extended layout, and
+// that an array column (`addr[]`) resolves to the auto-generated array OID with
+// attndims=1. Without this, buildUserPGAttributeRow left atttypid at the text
+// fallback and pg_dump rendered the column as `text` / `text[]` — an unrestorable
+// dump. The table-column analogue of the composite-FIELD path. DU-002 slice 373.
+func TestUserPGAttributeCompositeColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	ct := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
+		{Name: "street", ColType: "text"},
+		{Name: "zip", ColType: "int"},
+	})
+	if ct == nil || ct.OID == 0 || ct.ArrayOID != ct.OID+1 {
+		t.Fatalf("RegisterCompositeTypeWithFields OID alloc: %+v", ct)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "comptcol", OID: 16500}
+
+	// Scalar composite column: atttypid = composite OID, varlena/double-aligned/
+	// extended-storage/non-by-value layout (mirrors buildUserPGTypeRowForComposite).
+	scalar := catalog.Column{Name: "c", Type: catalog.Type{Name: "addr"}, Ordinal: 0}
+	srow := buildUserPGAttributeRow(cat, tbl, scalar)
+	if got := uint32(srow[atttypidIdx].Int); got != ct.OID {
+		t.Errorf("composite column: atttypid=%d want %d (composite OID)", got, ct.OID)
+	}
+	if got := srow[attndimsIdx].Int; got != 0 {
+		t.Errorf("composite column: attndims=%d want 0", got)
+	}
+	if got := srow[attlenIdx].Int; got != -1 {
+		t.Errorf("composite column: attlen=%d want -1", got)
+	}
+	if got := srow[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("composite column: attbyval=%v want false", got)
+	}
+	if got := srow[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("composite column: attalign=%q want \"d\"", got)
+	}
+	if got := srow[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("composite column: attstorage=%q want \"x\"", got)
+	}
+
+	// Array composite column: atttypid = array OID, attndims=1, varlena-array layout.
+	arr := catalog.Column{Name: "carr", Type: catalog.Type{Name: "addr", IsArray: true}, Ordinal: 1}
+	arow := buildUserPGAttributeRow(cat, tbl, arr)
+	if got := uint32(arow[atttypidIdx].Int); got != ct.ArrayOID {
+		t.Errorf("composite-array column: atttypid=%d want %d (composite ArrayOID)", got, ct.ArrayOID)
+	}
+	if got := arow[attndimsIdx].Int; got != 1 {
+		t.Errorf("composite-array column: attndims=%d want 1", got)
+	}
+	if got := arow[attlenIdx].Int; got != -1 {
+		t.Errorf("composite-array column: attlen=%d want -1", got)
+	}
+	if got := arow[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("composite-array column: attalign=%q want \"d\"", got)
+	}
+	if got := arow[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("composite-array column: attstorage=%q want \"x\"", got)
+	}
+
+	// LookupCompositeTypeByOID / ByArrayOID are the inverses format_type uses to
+	// render the column type back to its schema-qualified composite name.
+	if got, ok := cat.LookupCompositeTypeByOID(ct.OID); !ok || got.Name != "addr" {
+		t.Errorf("LookupCompositeTypeByOID(%d)=%v,%v want addr,true", ct.OID, got, ok)
+	}
+	if got, ok := cat.LookupCompositeTypeByArrayOID(ct.ArrayOID); !ok || got.Name != "addr" {
+		t.Errorf("LookupCompositeTypeByArrayOID(%d)=%v,%v want addr,true", ct.ArrayOID, got, ok)
+	}
+
+	// nil catalog (unit fixture without a registry): no re-resolution, the scalar
+	// column folds to the built-in text OID and the array to text[].
+	if got := uint32(buildUserPGAttributeRow(nil, tbl, scalar)[atttypidIdx].Int); got != uint32(catalog.OIDText) {
+		t.Errorf("nil-catalog composite column: atttypid=%d want %d (text)", got, catalog.OIDText)
+	}
+	if got := uint32(buildUserPGAttributeRow(nil, tbl, arr)[atttypidIdx].Int); got != catalog.ArrayOIDForBase(catalog.OIDText) {
+		t.Errorf("nil-catalog composite-array column: atttypid=%d want %d (text[])", got, catalog.ArrayOIDForBase(catalog.OIDText))
+	}
+}
+
 // TestUserPGAttributeTypmod pins the atttypmod computation for typmod-bearing
 // columns and the matching format_type round-trip (DU-002 slice 48). Before
 // this, buildUserPGAttributeRow hardcoded atttypmod=-1, so pg_dump rendered

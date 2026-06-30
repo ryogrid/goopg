@@ -624,6 +624,30 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 		}
 	}
+	// A column whose declared type is a user-defined COMPOSITE type (`CREATE TYPE
+	// x AS (...)`) likewise resolves to the text fallback above (TypeNameToOID and
+	// ResolveColumnType both preserve the bare composite name, which is not a
+	// built-in). Re-resolve it to the composite's dynamically-allocated pg_type
+	// OID so pg_attribute.atttypid points at the composite and pg_dump's
+	// format_type(atttypid, atttypmod) renders the column as the schema-qualified
+	// composite name (LookupCompositeTypeByOID, expr.go) rather than `text`. The
+	// parser splits a schema-qualified type (`public.compt`) into Schema+Name, so
+	// col.Type.Name is the bare name the composite registry is keyed on. A
+	// `compt[]` column resolves to the composite's auto-generated array OID. Guard
+	// on no enum match so the two user-type branches stay mutually exclusive.
+	// DU-002 slice 373.
+	compositeOID := uint32(0)
+	compositeArrayOID := uint32(0)
+	if cat != nil && typOID == catalog.OIDText && enumOID == 0 && enumArrayOID == 0 {
+		if ct := cat.LookupCompositeType(col.Type.Name); ct != nil {
+			if col.Type.IsArray {
+				compositeArrayOID = ct.ArrayOID
+			} else {
+				typOID = ct.OID
+				compositeOID = ct.OID
+			}
+		}
+	}
 	// A column whose declared type is a user-defined DOMAIN is stored with its
 	// type name already resolved to the BASE type (catalog.ResolveColumnType at
 	// CREATE TABLE), with the original domain name preserved in DeclaredTypeName.
@@ -664,6 +688,10 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			// Domain array OIDs are dynamic too. DU-002 slice 251.
 			typOID = domainArrayOID
 			attndims = 1
+		case compositeArrayOID != 0:
+			// Composite array OIDs are dynamic too. DU-002 slice 373.
+			typOID = compositeArrayOID
+			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
 				typOID = aoid
@@ -692,6 +720,16 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	case domainBaseOID != 0:
 		// A domain inherits its base type's physical layout. DU-002 slice 90.
 		attrs = userTypeAttrsForOID(domainBaseOID)
+	case compositeOID != 0:
+		// A composite type is a varlena, double-aligned, extended-storage,
+		// non-collatable value (mirrors buildUserPGTypeRowForComposite). The
+		// dynamic composite OID can't be cased by userTypeAttrsForOID. DU-002
+		// slice 373.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case compositeArrayOID != 0:
+		// A composite's array type shares the composite element's layout
+		// (mirrors buildUserPGTypeRowForCompositeArray). DU-002 slice 373.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	// A per-column storage override (ALTER COLUMN ... SET STORAGE) shadows the
 	// type's default storage in pg_attribute.attstorage. pg_dump compares
