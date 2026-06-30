@@ -39,6 +39,25 @@ func TestEncodingIDNameRoundTrip(t *testing.T) {
 	if got := EncodingNameToID("NO_SUCH_ENC"); got != -1 {
 		t.Errorf("EncodingNameToID(NO_SUCH_ENC) = %d, want -1", got)
 	}
+	// Non-canonical aliases from pg_encname_tbl resolve just as
+	// pg_char_to_encoding does (DU-002 slice 400, closes 399 deferral (a)).
+	aliasCases := []struct {
+		name string
+		id   int32
+	}{
+		{"unicode", 6},       // → UTF8
+		{"UNICODE", 6},       // case-insensitive
+		{"windows-1252", 24}, // → WIN1252 (punctuation stripped)
+		{"mskanji", 35},      // → SJIS
+		{"iso-8859-1", 8},    // → LATIN1
+		{"koi8", 22},         // _dirty_ alias → KOI8R
+		{"win950", 36},       // → BIG5
+	}
+	for _, tc := range aliasCases {
+		if got := EncodingNameToID(tc.name); got != tc.id {
+			t.Errorf("EncodingNameToID(%q) = %d, want %d", tc.name, got, tc.id)
+		}
+	}
 }
 
 // TestPgConversionVirtualRows verifies that a registered conversion surfaces as

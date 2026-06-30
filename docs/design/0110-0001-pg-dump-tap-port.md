@@ -9857,6 +9857,28 @@ real fmgr encoding-conversion engine; only the dump text is compared). Coverage:
 (stored as written, lenient like pre-398 casts); restart persistence (the registry is in-memory only, the recurring
 389–398 shared-catalog runtime-write gap).
 
+### Slice 400 — **CONVERSION encoding-alias resolution** (closes slice-399 deferral (a))
+
+Slice 399's `EncodingNameToID` recognized only the 42 canonical `pg_enc2name` names, so
+`CREATE CONVERSION … FOR 'unicode' TO 'mskanji' …` resolved both encodings to `-1` and dumped
+`FOR '' TO ''` — a silent divergence from PostgreSQL, whose `CREATE CONVERSION` accepts the full
+`pg_encname_tbl` alias set via `pg_char_to_encoding` (`postgres/src/common/encnames.c`).
+
+- **Catalog** (`internal/catalog/encoding.go`): a new `pgConvEncAliases` map (cleaned alias →
+  canonical `pg_enc` name) mirrors `pg_encname_tbl`. `EncodingNameToID` now tries the canonical
+  `pg_enc2name` names first (fast path), then falls back to the alias map — so `unicode`→UTF8,
+  `windows1252`→WIN1252, `mskanji`→SJIS, `iso-8859-1`→LATIN1, the `_dirty_` aliases `koi8`→KOI8R /
+  `win`→WIN1251, etc. resolve exactly as `pg_char_to_encoding` does. `clean_encoding_name`
+  (lowercase + strip punctuation) keys both sides, so case and separators are irrelevant.
+
+Because the resolved IDs are canonical, `dumpConversion`'s `pg_encoding_to_char` re-emits the
+canonical names: a conversion declared with aliases dumps `FOR 'SJIS' TO 'UTF8'`. Verified
+byte-identical vs real pg_dump 18.3. Coverage: alias cases in `TestEncodingIDNameRoundTrip`
+(`internal/catalog/conversion_test.go`) and a slice-400 alias-conversion assertion in
+`TestPort_PgDumpConnectionSetup`. **Still deferred (ledger):** the conversion function is not
+resolved/validated against `pg_proc` (slice-399 deferral (b), still open); restart persistence
+(in-memory registry, the recurring shared-catalog runtime-write gap).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

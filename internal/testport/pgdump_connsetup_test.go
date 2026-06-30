@@ -5068,6 +5068,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func"); err != nil {
 		t.Fatalf("create default conversion: %v", err)
 	}
+	// Slice 400: the FOR/TO names accept the full pg_encname_tbl alias set, not
+	// just the 42 canonical pg_enc2name names — `pg_char_to_encoding` resolves
+	// "unicode"→UTF8 and "mskanji"→SJIS. The stored conforencoding/contoencoding
+	// IDs are canonical, so dumpConversion's pg_encoding_to_char re-emits the
+	// canonical 'SJIS'/'UTF8', proving the alias resolved (a bare -1 would dump
+	// FOR '' instead). Closes slice-399 deferral (a).
+	if err := runSQLSimple(t, c, "CREATE CONVERSION public.aliasconv FOR 'mskanji' TO 'unicode' FROM public.aliasconv_func"); err != nil {
+		t.Fatalf("create conversion with encoding aliases: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7839,6 +7848,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// FOR '' / FROM with the wrong name).
 		if want := "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing DEFAULT CONVERSION %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 400 (asserted):** a CONVERSION created with non-canonical encoding
+		// aliases ('mskanji'→SJIS, 'unicode'→UTF8 via pg_encname_tbl) must dump the
+		// canonical names. If alias resolution regressed, the IDs would be -1 and the
+		// dump would read FOR '' TO '' instead.
+		if want := "CREATE CONVERSION public.aliasconv FOR 'SJIS' TO 'UTF8' FROM public.aliasconv_func;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing alias CONVERSION %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation
