@@ -12701,6 +12701,55 @@ func validateCreateConversionEncodings(forName, toName string) (forEnc, toEnc in
 	return forEnc, toEnc, nil
 }
 
+// resolveConversionFunc mirrors the FROM-function checks PostgreSQL performs in
+// CreateConversionCommand (conversioncmds.c) after the encoding-name checks
+// (validateCreateConversionEncodings) pass: LookupFuncName requires an exact
+// overload matching the fixed conversion-function signature
+// (int4, int4, cstring, internal, int4, bool), and get_func_rettype requires
+// that overload to return int4. PG reports a missing/mismatched signature as
+// ERRCODE_UNDEFINED_FUNCTION (42883) "function %s(integer, integer, cstring,
+// internal, integer, boolean) does not exist" (the fixed required signature,
+// regardless of what overloads actually exist) and a wrong return type as
+// ERRCODE_INVALID_OBJECT_DEFINITION (42P17) "encoding conversion function %s
+// must return type integer". DU-002 slice 401 deferral (b)-remainder.
+//
+// The runtime OidFunctionCall6 empty-input probe and the ACL_EXECUTE check
+// stay deferred: goopg has no encoding-conversion engine to actually invoke
+// the function against, and DDL slices run as the bootstrap superuser so an
+// EXECUTE-revoked-from-owner scenario cannot occur here.
+func resolveConversionFunc(rs *catalog.Routines, funcName parser.ObjectName) (*catalog.Routine, error) {
+	requiredSig := fmt.Sprintf("%s(integer, integer, cstring, internal, integer, boolean)", funcName.String())
+	var candidate *catalog.Routine
+	for _, r := range rs.LookupByName(funcName) {
+		inArgs := make([]catalog.Type, 0, len(r.ArgTypes))
+		for i, t := range r.ArgTypes {
+			if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+				continue
+			}
+			inArgs = append(inArgs, t)
+		}
+		if len(inArgs) != 6 {
+			continue
+		}
+		if catalog.TypeNameToOID(inArgs[0].Name) == catalog.OIDInt4 &&
+			catalog.TypeNameToOID(inArgs[1].Name) == catalog.OIDInt4 &&
+			strings.EqualFold(inArgs[2].Name, "cstring") &&
+			strings.EqualFold(inArgs[3].Name, "internal") &&
+			catalog.TypeNameToOID(inArgs[4].Name) == catalog.OIDInt4 &&
+			catalog.TypeNameToOID(inArgs[5].Name) == catalog.OIDBool {
+			candidate = r
+			break
+		}
+	}
+	if candidate == nil {
+		return nil, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s does not exist", requiredSig)}
+	}
+	if catalog.TypeNameToOID(candidate.ReturnType.Name) != catalog.OIDInt4 {
+		return nil, &ExecError{Code: "42P17", Message: fmt.Sprintf("encoding conversion function %s must return type integer", funcName.String())}
+	}
+	return candidate, nil
+}
+
 // validateCreateCast mirrors the argument/return-type rules PostgreSQL enforces
 // in CreateCast (src/backend/commands/functioncmds.c). routine is the resolved
 // WITH FUNCTION routine, or nil for WITHOUT FUNCTION / WITH INOUT (or a WITH
@@ -12968,21 +13017,29 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// 'dest' FROM func) so it round-trips through pg_dump (pg_conversion view →
 		// getConversions / dumpConversion). DU-002 slice 399.
 		//
-		// Before registering, validate the encoding names exactly as PG's
-		// CreateConversionCommand (conversioncmds.c) does: an unknown source or
-		// destination encoding is rejected with ERRCODE_UNDEFINED_OBJECT (42704),
-		// and a conversion to or from SQL_ASCII (pg_enc ID 0, PG_SQL_ASCII) is
-		// rejected with ERRCODE_INVALID_OBJECT_DEFINITION (42P17) — PG forbids it
-		// because pg_do_encoding_conversion has hard-wired SQL_ASCII fast paths, so
-		// such a conversion function could never be used. These are the static
-		// checks PG performs via pg_char_to_encoding; the FROM-function existence /
-		// return-type / runtime-probe checks (LookupFuncName + get_func_rettype +
-		// OidFunctionCall6) stay deferred — goopg has no encoding-conversion engine
-		// and no in-catalog conversion functions to resolve against. DU-002 slice
-		// 401 (closes slice-399 deferral (b) for the encoding-name half).
+		// Before registering, validate exactly as PG's CreateConversionCommand
+		// (conversioncmds.c) does, in order: (1) the encoding names — an unknown
+		// source or destination encoding is ERRCODE_UNDEFINED_OBJECT (42704), and a
+		// conversion to or from SQL_ASCII (pg_enc ID 0, PG_SQL_ASCII) is
+		// ERRCODE_INVALID_OBJECT_DEFINITION (42P17) — PG forbids it because
+		// pg_do_encoding_conversion has hard-wired SQL_ASCII fast paths, so such a
+		// conversion function could never be used (DU-002 slice 401, encoding half);
+		// then (2) the FROM function — it must resolve to a routine with the fixed
+		// signature (int4, int4, cstring, internal, int4, bool) -> int4
+		// (resolveConversionFunc), mirroring LookupFuncName + get_func_rettype
+		// (slice 401, function half, closes the slice-399 deferral (b) remainder).
+		// The runtime OidFunctionCall6 probe and EXECUTE ACL check stay deferred —
+		// see resolveConversionFunc's doc comment.
 		forEnc, toEnc, cerr := validateCreateConversionEncodings(s.ConvForEncoding, s.ConvToEncoding)
 		if cerr != nil {
 			return cerr
+		}
+		rs := im.Routines()
+		if rs == nil {
+			return &ExecError{Code: "XX000", Message: "CREATE CONVERSION requires routine registry"}
+		}
+		if _, ferr := resolveConversionFunc(rs, s.ConvFuncName); ferr != nil {
+			return ferr
 		}
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 		schema := s.ObjName.Schema

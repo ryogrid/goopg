@@ -5051,7 +5051,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)"); err != nil {
 		t.Fatalf("create cast text->integer with function: %v", err)
 	}
-	// Slice 399: a CREATE [DEFAULT] CONVERSION must round-trip. pg_dump's
+	// Slice 399/401: a CREATE [DEFAULT] CONVERSION must round-trip. pg_dump's
 	// getConversions reads every pg_conversion row (built-ins live in pg_catalog
 	// and are filtered out at dump-out time, so a no-user-conversion cluster stays
 	// empty), then dumpConversion queries pg_encoding_to_char(conforencoding/
@@ -5061,12 +5061,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// conversion never round-tripped. The parser now captures the FOR/TO encoding
 	// names + FROM function + DEFAULT flag, the executor resolves the encodings to
 	// pg_enc IDs and registers the conversion, and the pg_conversion virtual view
-	// surfaces a dumpable row. goopg does not validate that the conversion
-	// function exists (it has no real encoding-conversion engine), so the
-	// `FROM public.myconv_func` reference is stored as-written and re-emitted
-	// schema-qualified (matching pg_dump's empty-search_path regproc output).
-	// Verified byte-identical vs real pg_dump 18.3 (whose conversion function is a
-	// genuine fmgr-callable; only the dump text is compared here).
+	// surfaces a dumpable row. The `FROM public.myconv_func` reference is stored
+	// as-written and re-emitted schema-qualified (matching pg_dump's
+	// empty-search_path regproc output). Verified byte-identical vs real pg_dump
+	// 18.3 (whose conversion function is a genuine fmgr-callable; only the dump
+	// text is compared here).
+	//
+	// Slice 401 (function half): CreateConversionCommand requires the FROM
+	// function to resolve to the fixed signature
+	// (int4, int4, cstring, internal, int4, bool) -> int4 (LookupFuncName +
+	// get_func_rettype), so myconv_func/aliasconv_func must be real catalog
+	// functions, not bare names — a LANGUAGE C stub body is never invoked (goopg
+	// has no encoding-conversion engine), only its signature/return type matter.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.myconv_func(integer, integer, cstring, internal, integer, boolean) RETURNS integer LANGUAGE c AS 'myconv_func'"); err != nil {
+		t.Fatalf("create function myconv_func: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func"); err != nil {
 		t.Fatalf("create default conversion: %v", err)
 	}
@@ -5076,16 +5085,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// IDs are canonical, so dumpConversion's pg_encoding_to_char re-emits the
 	// canonical 'SJIS'/'UTF8', proving the alias resolved (a bare -1 would dump
 	// FOR '' instead). Closes slice-399 deferral (a).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.aliasconv_func(integer, integer, cstring, internal, integer, boolean) RETURNS integer LANGUAGE c AS 'aliasconv_func'"); err != nil {
+		t.Fatalf("create function aliasconv_func: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE CONVERSION public.aliasconv FOR 'mskanji' TO 'unicode' FROM public.aliasconv_func"); err != nil {
 		t.Fatalf("create conversion with encoding aliases: %v", err)
 	}
-	// Slice 401: CREATE CONVERSION now validates the FOR/TO encoding names exactly
-	// as PG's CreateConversionCommand (conversioncmds.c): an unknown encoding is
-	// ERRCODE_UNDEFINED_OBJECT (42704) and SQL_ASCII as either endpoint is
-	// ERRCODE_INVALID_OBJECT_DEFINITION (42P17). This closes the encoding-name half
-	// of slice-399 deferral (b); the FROM-function existence/return-type checks
-	// stay deferred (no encoding-conversion engine). These rows must NOT register —
-	// the conversions above are the only dumpable pg_conversion rows.
+	// Slice 401 (encoding half): CREATE CONVERSION validates the FOR/TO encoding
+	// names exactly as PG's CreateConversionCommand (conversioncmds.c): an unknown
+	// encoding is ERRCODE_UNDEFINED_OBJECT (42704) and SQL_ASCII as either
+	// endpoint is ERRCODE_INVALID_OBJECT_DEFINITION (42P17). The encoding checks
+	// run before the FROM-function lookup (matching PG's check order), so these
+	// negative cases reach 42704/42P17 even though `public.f` does not exist.
+	// These rows must NOT register — the conversions above are the only dumpable
+	// pg_conversion rows.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.badretconv_func(integer, integer, cstring, internal, integer, boolean) RETURNS boolean LANGUAGE c AS 'badretconv_func'"); err != nil {
+		t.Fatalf("create function badretconv_func: %v", err)
+	}
 	for _, neg := range []struct{ sql, code, msg string }{
 		{"CREATE CONVERSION public.badenc FOR 'NOSUCHENC' TO 'UTF8' FROM public.f",
 			"42704", `source encoding "NOSUCHENC" does not exist`},
@@ -5093,6 +5109,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"42704", `destination encoding "BOGUS" does not exist`},
 		{"CREATE CONVERSION public.badenc FOR 'SQL_ASCII' TO 'UTF8' FROM public.f",
 			"42P17", `encoding conversion to or from "SQL_ASCII" is not supported`},
+		// Slice 401 (function half): a non-existent FROM function is rejected with
+		// 42883 reporting the FIXED required signature (not whatever overloads
+		// happen to exist), matching LookupFuncName's error.
+		{"CREATE CONVERSION public.badfunc FOR 'LATIN1' TO 'UTF8' FROM public.nosuchconvfunc",
+			"42883", `function public.nosuchconvfunc(integer, integer, cstring, internal, integer, boolean) does not exist`},
+		// Slice 401 (function half): a FROM function with the right signature but
+		// the wrong return type (boolean, not integer) is rejected with 42P17,
+		// matching get_func_rettype's check.
+		{"CREATE CONVERSION public.badretconv FOR 'LATIN1' TO 'UTF8' FROM public.badretconv_func",
+			"42P17", `encoding conversion function public.badretconv_func must return type integer`},
 	} {
 		err := runSQLSimple(t, c, neg.sql)
 		if err == nil {
