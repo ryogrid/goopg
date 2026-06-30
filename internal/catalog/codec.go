@@ -660,7 +660,12 @@ func PGAttributeColumns() []Column {
 		{Name: "attislocal", Type: Type{Name: "bool"}},
 		{Name: "attinhcount", Type: Type{Name: "int2"}},
 		{Name: "attcollation", Type: Type{Name: "oid"}},
-		{Name: "attacl", Type: Type{Name: "text"}},
+		// attacl is a PG-native _aclitem array (OID 1034), not text: a column GRANT
+		// stores it as a binary ArrayType blob that the seqscan/index-scan ACL hook
+		// decodes to canonical aclitemout text on read (mirrors pg_type.typacl).
+		// Declaring it text made the physical decoder hand the raw blob back as a
+		// KindString, which pg_dump could not parse. M0119-0004-ACLHEAP.
+		{Name: "attacl", Type: Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: Type{Name: "text"}},
 		{Name: "attmissingval", Type: Type{Name: "text"}},

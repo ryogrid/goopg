@@ -331,6 +331,165 @@ func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 	return tac
 }
 
+// grantHasColumnList reports whether the GRANT/REVOKE token run carries a
+// parenthesised column list BEFORE the ON keyword — the signature of a
+// column-level grant (`GRANT SELECT (a, b) ON TABLE t …`). A function grant's
+// parentheses follow ON (`GRANT EXECUTE ON FUNCTION f(int) …`), so depth/position
+// matters. toks is every token after the GRANT/REVOKE keyword. M0119-0004-ACLHEAP.
+func grantHasColumnList(toks []Token) bool {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 {
+		onIdx = len(toks)
+	}
+	for i := 0; i < onIdx; i++ {
+		if toks[i].Kind == TokenSymbol && toks[i].Value == "(" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildAttrACLChange parses the token run of a column-level GRANT/REVOKE —
+// `GRANT <priv>(<cols>) ON [TABLE] <names> TO|FROM <roles> [WITH GRANT OPTION]` —
+// into an AttrACLChange. toks is every token after the GRANT/REVOKE keyword with
+// the trailing ';' excluded. Returns nil when any required list is empty (an
+// unparseable form the caller leaves as a successful no-op). M0119-0004-ACLHEAP.
+func buildAttrACLChange(revoke bool, toks []Token) *AttrACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 {
+		return nil
+	}
+	nameStart := onIdx + 1
+	if nameStart < len(toks) && strings.EqualFold(toks[nameStart].Value, "table") {
+		nameStart++ // skip the optional TABLE keyword
+	}
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	aac := &AttrACLChange{
+		Revoke:          revoke,
+		Privileges:      splitTokColumnPrivileges(toks[:onIdx]),
+		TableNames:      splitTokObjectNames(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(aac.Privileges) == 0 || len(aac.TableNames) == 0 || len(aac.Grantees) == 0 {
+		return nil
+	}
+	return aac
+}
+
+// splitTokRunsParenAware splits a token slice on top-level (paren-depth-0) ","
+// symbols, dropping empty runs. Unlike splitTokRuns it ignores commas nested
+// inside parentheses, so `SELECT (a, b), UPDATE (c)` splits into two privilege
+// runs rather than four. M0119-0004-ACLHEAP.
+func splitTokRunsParenAware(toks []Token) [][]Token {
+	var out [][]Token
+	start := 0
+	depth := 0
+	for i := 0; i < len(toks); i++ {
+		if toks[i].Kind == TokenSymbol {
+			switch toks[i].Value {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			case ",":
+				if depth == 0 {
+					if i > start {
+						out = append(out, toks[start:i])
+					}
+					start = i + 1
+				}
+			}
+		}
+	}
+	if start < len(toks) {
+		out = append(out, toks[start:])
+	}
+	return out
+}
+
+// splitTokColumnPrivileges parses the privilege section of a column GRANT
+// (everything before ON) into a slice of ColumnPrivilege. Each top-level run is
+// `PRIV ( col [, col …] )`; a run with no column list is skipped (a whole-table
+// privilege never reaches this column path). M0119-0004-ACLHEAP.
+func splitTokColumnPrivileges(toks []Token) []ColumnPrivilege {
+	var out []ColumnPrivilege
+	for _, run := range splitTokRunsParenAware(toks) {
+		lp := -1
+		for i, tk := range run {
+			if tk.Kind == TokenSymbol && tk.Value == "(" {
+				lp = i
+				break
+			}
+		}
+		if lp <= 0 {
+			continue // no privilege keyword or no column list
+		}
+		privParts := make([]string, 0, lp)
+		for _, tk := range run[:lp] {
+			privParts = append(privParts, strings.ToUpper(tk.Value))
+		}
+		priv := strings.Join(privParts, " ")
+		rp := len(run)
+		for i := lp + 1; i < len(run); i++ {
+			if run[i].Kind == TokenSymbol && run[i].Value == ")" {
+				rp = i
+				break
+			}
+		}
+		cols := splitTokColumnNames(run[lp+1 : rp])
+		if priv == "" || len(cols) == 0 {
+			continue
+		}
+		out = append(out, ColumnPrivilege{Privilege: priv, Columns: cols})
+	}
+	return out
+}
+
+// splitTokColumnNames renders each comma-separated column-name run inside a
+// column list as an unquoted identifier. M0119-0004-ACLHEAP.
+func splitTokColumnNames(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		if len(run) == 0 {
+			continue
+		}
+		name := strings.Trim(run[len(run)-1].Value, `"`)
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // tokIndexOf returns the index of the first token at or after `from` whose value
 // equals kw (case-insensitive), or -1.
 func tokIndexOf(toks []Token, from int, kw string) int {
@@ -671,6 +830,15 @@ identLedStatement:
 			ns := &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}
 			if typeClass != "" {
 				ns.TypeACL = buildTypeACLChange(strings.EqualFold(t.Value, "revoke"), typeClass == "domain", toks)
+			} else if grantHasColumnList(toks) {
+				// A column-level GRANT/REVOKE targets pg_attribute.attacl (heap-backed),
+				// not the whole-relation pg_class.relacl. Capture the parsed clause for
+				// execAttrACLChange and clear TableACL so the relacl-xmax serialization
+				// machinery (intra-grant-inplace) does not fire for a column grant.
+				if aac := buildAttrACLChange(strings.EqualFold(t.Value, "revoke"), toks); aac != nil {
+					ns.AttrACL = aac
+					ns.TableACL = ""
+				}
 			}
 			return ns, nil
 		case "comment":

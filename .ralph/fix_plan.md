@@ -2992,7 +2992,12 @@ documentation-only and is exempt from the design-doc requirement.)
       `make ralph-state-guard` OK; pgbench smoke = pre-commit. The remaining M0119-0004 item
       is now **M0119-0004-ACLHEAP** plus extended-protocol commit-time deferral; the
       virtual-path ACL slice run is closed.
-- [ ] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
+- [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
+      **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
+      through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`
+      (column GRANT, loop #89). `datacl` (pg_database) stays permanently deferred: heap-backed
+      **and** `pg_dump --create`-only, so untestable under the `--no-create` connsetup harness
+      (ledger). Box checked: all testable heap-ACL objects are covered.
       (source: design `0119-0004-acl-grant-heap-vs-virtual-typacl.md`). Round-trip
       `pg_type.typacl` (TYPE/DOMAIN GRANT), then `pg_attribute.attacl` (column GRANT), by
       routing GRANT/REVOKE on a heap-backed object through `dispatchSimpleQueryViaExecutor`

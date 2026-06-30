@@ -12410,6 +12410,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return err
 		}
 	}
+	// A column-level GRANT/REVOKE — `GRANT <priv>(<col>) ON [TABLE] <name> …` —
+	// changes pg_attribute.attacl, which is heap-backed exactly like pg_type.typacl,
+	// so it must update the (relOID, attnum)-keyed column ACL store AND re-sync the
+	// affected pg_attribute heap rows. The server excludes a parenthesised-column
+	// GRANT from its fast path (isHeapACLObject in query.go) so it reaches the
+	// executor here with an *executor.Context in scope. M0119-0004-ACLHEAP.
+	if s.AttrACL != nil {
+		if err := o.execAttrACLChange(s.AttrACL); err != nil {
+			return err
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}
@@ -12625,6 +12636,161 @@ func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind user
 	}
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 	return nil
+}
+
+// attrACLAllPrivs is the expansion of GRANT ALL [PRIVILEGES] (cols) ON a TABLE:
+// the column-grantable privilege subset, in PostgreSQL's canonical attacl bit
+// order (INSERT/SELECT/UPDATE/REFERENCES). DELETE/TRUNCATE/TRIGGER/MAINTAIN are
+// table-only and never appear in attacl. M0119-0004-ACLHEAP (attacl half).
+var attrACLAllPrivs = []string{"INSERT", "SELECT", "UPDATE", "REFERENCES"}
+
+// expandColumnPrivs maps a parsed column-privilege keyword to the concrete
+// privilege set it grants. "ALL"/"ALL PRIVILEGES" fans out to the full
+// column-grantable subset; any single recognised keyword passes through; an
+// unrecognised keyword yields nil (a no-op grant). M0119-0004-ACLHEAP.
+func expandColumnPrivs(priv string) []string {
+	switch strings.ToUpper(strings.TrimSpace(priv)) {
+	case "ALL", "ALL PRIVILEGES":
+		return attrACLAllPrivs
+	case "INSERT", "SELECT", "UPDATE", "REFERENCES":
+		return []string{strings.ToUpper(priv)}
+	default:
+		return nil
+	}
+}
+
+// columnAttNum resolves a column name (case-insensitive) to its 1-based
+// pg_attribute.attnum on tbl, or 0 when the column does not exist. attnum is
+// Ordinal+1 (the same mapping buildUserPGAttributeRow writes). M0119-0004-ACLHEAP.
+func columnAttNum(tbl *catalog.Table, colName string) int16 {
+	for _, c := range tbl.Columns {
+		if strings.EqualFold(c.Name, colName) {
+			return int16(c.Ordinal + 1)
+		}
+	}
+	return 0
+}
+
+// execAttrACLChange applies a column-level GRANT/REVOKE to the (relOID, attnum)-
+// keyed column ACL store and re-syncs the heap-backed pg_attribute.attacl for each
+// touched column. A column has no acldefault('c', owner) entry, so — unlike
+// execTypeACLChange — there is no implicit owner/PUBLIC seeding: a plain GRANT
+// adds exactly the granted grantee→priv entries and a REVOKE removes exactly
+// them, with attacl returning to NULL once the last column privilege is revoked.
+// Unknown table/column names are a successful no-op. M0119-0004-ACLHEAP.
+func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, tn := range ac.TableNames {
+		tbl, ok := im.LookupTable(tn)
+		if !ok || tbl == nil {
+			continue
+		}
+		touched := make(map[int16]bool)
+		for _, cp := range ac.Privileges {
+			privs := expandColumnPrivs(cp.Privilege)
+			if len(privs) == 0 {
+				continue
+			}
+			for _, colName := range cp.Columns {
+				attNum := columnAttNum(tbl, colName)
+				if attNum == 0 {
+					continue
+				}
+				touched[attNum] = true
+				for _, role := range ac.Grantees {
+					for _, priv := range privs {
+						if ac.Revoke {
+							im.RevokeColumnPrivilege(tbl.OID, attNum, role, priv)
+						} else {
+							im.GrantColumnPrivilegeWithGrantOption(tbl.OID, attNum, role, priv, ac.WithGrantOption)
+						}
+					}
+				}
+			}
+		}
+		for attNum := range touched {
+			col, ok := columnByAttNum(tbl, attNum)
+			if !ok {
+				continue
+			}
+			if err := o.resyncAttrACLHeapRow(im, tbl, col, attNum); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// columnByAttNum returns the catalog column at the given 1-based attnum on tbl.
+// M0119-0004-ACLHEAP.
+func columnByAttNum(tbl *catalog.Table, attNum int16) (catalog.Column, bool) {
+	for _, c := range tbl.Columns {
+		if int16(c.Ordinal+1) == attNum {
+			return c, true
+		}
+	}
+	return catalog.Column{}, false
+}
+
+// resyncAttrACLHeapRow rewrites the heap-backed pg_attribute row for one column so
+// its attacl column carries the projected ACL as a PG-native _aclitem ArrayType
+// (read by a PG18 standby / basebackup and by goopg's own pg_attribute seqscan
+// decode hook). It mirrors resyncTypeACLHeapRow: stamp the stale row's xmax with
+// this txn's writer XID (deleteAttributeFromCatalogHeap), append the rebuilt row
+// (buildUserPGAttributeRow now fills attacl from the store), and mirror to the
+// postgres DB. A no-op when the catalog heap relfiles are absent (in-memory test
+// fixture). M0119-0004-ACLHEAP (attacl half).
+func (o *ddlOp) resyncAttrACLHeapRow(im *catalog.InMemory, tbl *catalog.Table, col catalog.Column, attNum int16) error {
+	ctx := o.ctx
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	deleteAttributeFromCatalogHeap(ctx, catalog.DefaultDBOid, tbl.OID, attNum, ctx.Tx.XID)
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	row := buildUserPGAttributeRow(im, tbl, col)
+	attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), row)
+	if err != nil {
+		return err
+	}
+	// Re-index the rebuilt row so a pg_attribute (attrelid, attnum) index lookup
+	// finds the new tuple, matching syncTableToCatalogHeap's index maintenance.
+	if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, attNum, attrTID); err != nil {
+		return err
+	}
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AttributeRelationId)
+	return nil
+}
+
+// deleteAttributeFromCatalogHeap stamps xmax on the single live pg_attribute row
+// for (relOID, attNum), making the stale tuple invisible before the re-synced row
+// is appended. The column analogue of deleteTypeFromCatalogHeap, narrowed to one
+// column by matching both attrelid and attnum. M0119-0004-ACLHEAP (attacl half).
+func deleteAttributeFromCatalogHeap(ctx *Context, dbOid, relOID uint32, attNum int16, xmax storage.TransactionID) {
+	attrRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
+		row, err := catalog.DecodePGAttributeRow(data)
+		if err != nil {
+			row, err = catalog.DecodePGAttributePhysicalRow(data)
+		}
+		return err == nil && row.AttRelID == relOID && row.AttNum == int32(attNum)
+	})
 }
 
 // execCommentOn stores a description for a TABLE, INDEX, COLUMN, or CONSTRAINT

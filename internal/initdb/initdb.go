@@ -5779,7 +5779,12 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
-		{Name: "attacl", Type: catalog.Type{Name: "text"}},
+		// attacl is a PG-native _aclitem array (OID 1034), not text: a column
+		// GRANT stores it as a binary ArrayType blob and the seqscan/index-scan ACL
+		// hook decodes it to canonical aclitemout text on read. Declaring it text
+		// here made the decoder hand back the raw blob as a KindString (pg_dump then
+		// failed to parse the ACL). Mirrors pg_type.typacl. M0119-0004-ACLHEAP.
+		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},

@@ -3563,6 +3563,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant usage on type gtype to typg_grantee: %v", err)
 	}
 
+	// Slice 358 (M0119-0004-ACLHEAP, attacl half): a column-level GRANT must
+	// round-trip from the heap-backed pg_attribute.attacl — the column analogue of
+	// the TYPE grant (slice 357). `GRANT SELECT (cola) ON TABLE public.gcoltbl TO
+	// colgrantee` runs through the executor (query.go excludes a parenthesised-column
+	// GRANT from the server fast path), which updates the (relOID, attnum)-keyed
+	// column ACL store and re-syncs the pg_attribute heap row's attacl to a PG-native
+	// _aclitem array "{colgrantee=r/postgres}". A column has no acldefault('c', owner),
+	// so attacl stays NULL until this GRANT. pg_dump's getColumnACLs reads attacl back
+	// (decoded to canonical aclitemout text by the seqscan hook) and emits
+	// `GRANT SELECT(cola) ON TABLE public.gcoltbl TO colgrantee;`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.gcoltbl (cola int, colb int)"); err != nil {
+		t.Fatalf("create table gcoltbl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE colgrantee NOLOGIN"); err != nil {
+		t.Fatalf("create role colgrantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT (cola) ON TABLE public.gcoltbl TO colgrantee"); err != nil {
+		t.Fatalf("grant select(cola) on gcoltbl to colgrantee: %v", err)
+	}
+
 	// Slice 350: a sequence GRANT followed by a partial REVOKE must round-trip,
 	// the sequence analogue of the table partial-REVOKE slice 338 and the schema
 	// partial-REVOKE slice 339. A sequence exposes three privileges
@@ -7791,6 +7811,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// it from the dump.
 		if want := "GRANT ALL ON TYPE public.gtype TO typg_grantee;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered the TYPE GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 358 (asserted, M0119-0004-ACLHEAP attacl half):** a column-level
+		// GRANT round-trips from the heap-backed pg_attribute.attacl — the column
+		// analogue of slice 357. `GRANT SELECT (cola) ON TABLE public.gcoltbl TO
+		// colgrantee` runs through the executor (not the server virtual fast path),
+		// which updates the (relOID, attnum)-keyed column ACL store and re-syncs the
+		// pg_attribute heap row's attacl to "{colgrantee=r/postgres}". pg_dump's
+		// getAdditionalACLs finds the non-NULL attacl, getColumnACLs reads it back
+		// (decoded by the seqscan hook), and buildACLCommands emits the column GRANT
+		// with the privilege keyword carrying the column name in parentheses
+		// (AddAcl → "SELECT(cola)"). Verified against real pg_dump 18.3. Before this
+		// milestone goopg baked attacl NULL on every pg_attribute row, dropping every
+		// column GRANT from the dump.
+		if want := "GRANT SELECT(cola) ON TABLE public.gcoltbl TO colgrantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the column GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 350 (asserted):** a sequence GRANT followed by a partial REVOKE
 		// round-trips (the sequence analogue of slices 338/339). `GRANT USAGE, SELECT

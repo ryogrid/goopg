@@ -90,7 +90,7 @@ func pgAttributeColumnsPG18() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
-		{Name: "attacl", Type: catalog.Type{Name: "text"}},
+		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
@@ -750,6 +750,28 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			attCollationOID = oid
 		}
 	}
+	// attacl carries the column's materialized pg_attribute.attacl as a PG-native
+	// _aclitem ArrayType blob (KindBytes), populated from the (relOID, attnum)-keyed
+	// column ACL store. A column has no acldefault('c', owner), so attacl stays NULL
+	// until the first column GRANT and returns to NULL once the last privilege is
+	// revoked. Filling it here (rather than only in resyncAttrACLHeapRow) keeps the
+	// heap consistent across every rebuild — a later unrelated re-sync preserves the
+	// grant instead of wiping it. The pg_attribute seqscan decode hook
+	// (operators_storage.go) renders the blob back to canonical aclitemout text on
+	// read. cat==nil (unit fixtures) leaves attacl NULL. M0119-0004-ACLHEAP.
+	attaclDatum := NullDatum
+	if im, ok := cat.(*catalog.InMemory); ok {
+		if txt := im.AttrACLText(tbl.OID, int16(col.Ordinal+1)); txt != "" {
+			if blob, err := encodeAclItemArrayText(txt, func(roleName string) uint32 {
+				if roid, ok := im.RoleOID(roleName); ok {
+					return roid
+				}
+				return 0
+			}); err == nil {
+				attaclDatum = NewBytesDatum(blob)
+			}
+		}
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),            // attrelid
 		NewStringDatum(col.Name),               // attname (name)
@@ -781,7 +803,7 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// EncodeRowPG to skip the column and the bitmap helper to clear
 		// its bit. attstattarget (last) is NULL by default but carries the
 		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
-		NullDatum,          // attacl
+		attaclDatum,        // attacl (NULL default; _aclitem blob after a column GRANT)
 		attOptionsDatum,    // attoptions (NULL default; text[] literal when set)
 		NullDatum,          // attfdwoptions
 		NullDatum,          // attmissingval

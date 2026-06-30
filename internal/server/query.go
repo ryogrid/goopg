@@ -70,6 +70,17 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// pg_type row. Exclude it from the server GRANT/REVOKE fast path so it falls
 	// through. M0119-0004-ACLHEAP.
 	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ")
+	// A column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON [TABLE] <name> …` —
+	// changes pg_attribute.attacl, which is heap-backed like pg_type.typacl, so it
+	// too must run through the executor (where an *executor.Context re-syncs the heap
+	// row). Its signature is a parenthesised column list BEFORE the ON keyword (a
+	// function GRANT's parens follow ON), so a '(' earlier than " ON " marks it.
+	// M0119-0004-ACLHEAP (attacl half).
+	if onPos := strings.Index(upper, " ON "); onPos > 0 {
+		if lp := strings.IndexByte(upper, '('); lp >= 0 && lp < onPos {
+			isHeapACLObject = true
+		}
+	}
 
 	// A single-statement, autocommit table-level GRANT is recorded in the
 	// catalog ACL store so SET ROLE + a privileged command (e.g. TRUNCATE) is

@@ -1820,6 +1820,14 @@ type CompatNoopStmt struct {
 	// executor (execCompatNoop) can update the OID-keyed ACL store and re-sync the
 	// heap row. Nil for every other object class. M0119-0004-ACLHEAP.
 	TypeACL *TypeACLChange
+	// AttrACL is set for a column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON
+	// [TABLE] <name> …`. Column privileges live in pg_attribute.attacl, which is
+	// heap-backed exactly like pg_type.typacl, so the change must update the
+	// OID+attnum-keyed ACL store AND re-sync the real pg_attribute heap row — work
+	// that needs an *executor.Context. The parser captures the parsed clause here
+	// so the executor (execCompatNoop → execAttrACLChange) can apply it. Nil for a
+	// table-level (whole-relation) GRANT. M0119-0004-ACLHEAP (attacl half).
+	AttrACL *AttrACLChange
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …
@@ -1835,6 +1843,33 @@ type TypeACLChange struct {
 	TypeNames       []ObjectName
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+}
+
+// ColumnPrivilege pairs a single column-grantable privilege keyword with the
+// parenthesised column list it applies to, e.g. `SELECT (a, b)`. PostgreSQL's
+// column-grant grammar attaches an independent column list to each privilege
+// (`GRANT SELECT (a), UPDATE (b) ON …`), so a column GRANT carries a slice of
+// these. The privilege is upper-cased; "ALL"/"ALL PRIVILEGES" is left
+// unexpanded for the executor to fan out to INSERT/SELECT/UPDATE/REFERENCES.
+// M0119-0004-ACLHEAP (attacl half).
+type ColumnPrivilege struct {
+	Privilege string   // "SELECT" | "INSERT" | "UPDATE" | "REFERENCES" | "ALL" | "ALL PRIVILEGES"
+	Columns   []string // unquoted column names the privilege applies to
+}
+
+// AttrACLChange carries the parsed pieces of a column-level GRANT/REVOKE —
+// `GRANT <priv>(<cols>) ON [TABLE] <name> TO <roles>` — so the executor can
+// update the (relOID, attnum)-keyed column ACL store and re-sync the heap-backed
+// pg_attribute.attacl. Unlike a type, a column has NO acldefault('c', owner)
+// entry, so attacl is NULL until the first column GRANT and returns to NULL once
+// the last privilege is revoked (no implicit owner/PUBLIC seeding).
+// M0119-0004-ACLHEAP (attacl half).
+type AttrACLChange struct {
+	Revoke          bool              // true for REVOKE, false for GRANT
+	Privileges      []ColumnPrivilege // per-privilege column lists (≥1)
+	TableNames      []ObjectName      // relation(s) after ON [TABLE]
+	Grantees        []string          // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool              // GRANT … WITH GRANT OPTION
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

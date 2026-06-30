@@ -318,6 +318,58 @@ mirroring `TypeACLChange`); (2) executor — `execAttrACLChange` + `resyncAttrAC
 `attacl` decode hook, the sibling of the `pg_type` `typacl` hook; (4) the DU-002 connsetup
 slice `GRANT SELECT (col) ON TABLE t TO role` → assert pg_dump emits it.
 
+### Progress — the `attacl` heap-write + read half LANDED (loop #89, 2026-06-30) — column GRANT round-trips
+
+`GRANT SELECT (cola) ON TABLE public.gcoltbl TO colgrantee` now round-trips end-to-end from
+the heap-backed `pg_attribute.attacl`: real pg_dump 18.3 re-emits
+`GRANT SELECT(cola) ON TABLE public.gcoltbl TO colgrantee;`, byte-identical
+(`TestPort_PgDumpConnectionSetup` slice 358, strict). The column analogue of loop #87's
+`typacl` round-trip, wired end-to-end:
+
+1. **parser** (`ast.go` + `parser.go`) — a column GRANT/REVOKE is detected by a parenthesised
+   column list appearing **before** the `ON` keyword (`grantHasColumnList`; a function GRANT's
+   parens follow `ON`). `buildAttrACLChange` captures it into `CompatNoopStmt.AttrACL`
+   (`[]ColumnPrivilege` per-privilege column lists + table names + grantees + grant-option),
+   and **clears `TableACL`** so the relacl-xmax serialization machinery stays dormant. New
+   paren-aware splitters `splitTokRunsParenAware` / `splitTokColumnPrivileges` /
+   `splitTokColumnNames` (commas inside a `(…)` list separate columns, not privileges).
+2. **dispatch** (`server/query.go`) — `isHeapACLObject` now also fires for a `(` before `" ON "`,
+   so a column GRANT/REVOKE falls through the server virtual fast path to
+   `dispatchSimpleQueryViaExecutor` (the executor has the `*Context` the heap re-sync needs).
+3. **executor** (`operators_ddl.go`) — `execCompatNoop`'s new `s.AttrACL != nil` branch runs
+   `execAttrACLChange`: resolve table + column → `(relOID, attnum)` (`columnAttNum` =
+   `Ordinal+1`), apply `GrantColumnPrivilegeWithGrantOption` / `RevokeColumnPrivilege` per
+   grantee×privilege (`expandColumnPrivs` fans out `ALL`), then `resyncAttrACLHeapRow` per
+   touched column: `deleteAttributeFromCatalogHeap` stamps the stale row's xmax (matched on
+   `attrelid` **and** `attnum`), `buildUserPGAttributeRow` rebuilds the row (now filling
+   `attacl` from the store as an `encodeAclItemArrayText` `_aclitem` blob), `writeHeapRowCanonical`
+   appends it, the `(attrelid, attnum)` index entry is re-inserted, and the page is mirrored to
+   the postgres DB. Gated on `catalogHeapSyncAvailable` (no-op for the in-memory fixture).
+4. **read** (`operators_storage.go` + `operators_index.go`) — the `pg_attribute` seqscan
+   `attacl` decode hook (sibling of the `typacl` hook) renders the `_aclitem` blob (KindBytes)
+   to canonical aclitemout text via `decodeAclItemArrayText` + `RoleNameForOID`. A shared
+   `renderHeapACLColumnInto` covers the index-scan path too — pg_dump's `getColumnACLs` reaches
+   `pg_attribute` by an `attrelid` index scan, so the seqscan-only hook is not sufficient on its
+   own (defensive; the observed plan was a seqscan).
+
+**The bug that ate most of the loop — two read schemas disagreed on the `attacl` type.** The
+heap *write* schema (`pgAttributeColumnsPG18`) and the runtime *read* schemas
+(`catalog.PGAttributeColumns`, `initdb.go`'s bootstrap `pg_attribute`) declared `attacl` as
+`text`, while the write blob was a binary `_aclitem`. The physical decoder's `text` branch
+handed the raw blob back as a **KindString**, so the ACL hook's `KindBytes` check never fired
+and pg_dump received a raw byte (`could not parse ACL list (\x01)`). Fixed by declaring
+`attacl` as `aclitem[]` (OID 1034) in **all three** schemas, mirroring `pg_type.typacl` exactly
+— a textbook "sibling paths must agree" case (encode↔decode↔every read schema).
+
+`datacl` (`pg_database`) stays permanently deferred: it is heap-backed **and** only dumped by
+`pg_dump --create`, which the `--no-create` connsetup harness never exercises (ledger).
+
+Gates (all PASS): `TestPort_PgDumpConnectionSetup` (column GRANT slice 358);
+`TestE2E_PhysicalReplication{,Sync}` (standby reads `pg_attribute`); `-race`
+executor/catalog/storage/mvcc; parser/catalog/initdb/executor/server units +
+`TestExpandColumnPrivs`/`TestColumnAttNum`/`TestParseGrantAttrACL`; TPC-H Q12=2/Q13=33;
+pgbench smoke (pre-commit).
+
 ## Why not just do it now
 
 Single-loop autonomous discipline + the hard-won "silent row-count / visibility regression
