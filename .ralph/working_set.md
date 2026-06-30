@@ -1,27 +1,30 @@
 (idle — nothing in flight)
 
-Last landed: M0119-0004 DU-002 **slice 356** (Partial-REVOKE-keeps-slot in relacl —
-TEST-ONLY, no engine change). Complement of slice 355. PG's aclupdate (acl.c)
-distinguishes a FULL revoke (privilege count → 0 → aclitem DELETED, later GRANT
-re-appends at END) from a PARTIAL revoke (bits removed, entry survives → modified
-IN PLACE, array index unchanged). A grantee that keeps ≥1 privilege after REVOKE
-stays in its original grant-order slot. Verified vs real PG 18.3
-(./postgres/local_install): GRANT SELECT,INSERT→pr_a; GRANT SELECT→pr_b; REVOKE
-INSERT FROM pr_a → {postgres=arwdDxtm/postgres,pr_a=r/postgres,pr_b=r/postgres}
-(pr_a stays AHEAD of pr_b).
+Last landed: M0119-0004 **architectural finding** (loop #83, DOCUMENTATION — no code change).
+Closed the DU-002 ACL **GRANT round-trip** slice thread (330–356): it is COMPLETE for every
+object class goopg serves VIRTUALLY (table/sequence `relacl`, schema `nspacl`, function
+`proacl`). The three still-open cases (`typacl`, `attacl`, `datacl`) share ONE root cause,
+now documented in design `0119-0004-acl-grant-heap-vs-virtual-typacl.md`:
 
-No production code changed: RevokeTablePrivilege (internal/catalog/catalog.go)
-calls dropTableACLOrderRole ONLY when the grantee's privilege set empties
-(len(privs)==0), so a partial revoke leaves tableACLOrder untouched. Added unit
-catalog/relacl_test.go:TestRelaclTextPartialRevokeKeepsSlot (partial-keeps-slot +
-contrast guard: full revoke + re-grant → pr_a appends after pr_b). Design
-0119-0004-partial-revoke-keeps-slot-relacl.md + README row 0119-0004bf. Gates:
-catalog TestRelacl PASS; build clean; state-guard OK; pgbench smoke = pre-commit.
+  GRANT is recorded SERVER-SIDE (`internal/server/query.go:69-87`) with only the in-memory
+  ACL store in scope — NO executor `*Context`, so NO heap write. That works for the virtual
+  catalogs (pg_class/pg_namespace virtual builders + `pg_proc_view.go:388` project the ACL
+  live; `execCreateFunction` writes NO pg_proc heap row) but NOT for `pg_type` — the ONLY
+  user catalog written to REAL heap rows (`writeHeapRowCanonical` at CREATE TYPE/DOMAIN bakes
+  `typacl=NULL`) for M0097-0022 PG-standby compat. No virtual pg_type overlay → `getTypes`
+  reads NULL → `GRANT USAGE ON TYPE` is a silent no-op (`grant_ddl.go:137` bails). `attacl`
+  (pg_attribute heap) same; `datacl` same AND `--create`-only (untestable under `--no-create`).
 
-NEXT M0119-0004 GRANT/ACL slices (remaining are deeper engine work):
-- column-level GRANT (`pg_attribute.attacl`, heap re-sync — entangled).
-- database GRANT (`datacl`, only under `--create`; harness runs --no-create).
-- TYPE/DOMAIN GRANT (`pg_type.typacl`): grant_ddl.go bails on non-table/sequence
-  → typacl UNMODELLED; new ACL surface (pg_type virtual — check tractability).
-- Extended-protocol commit-time deferral stays architecturally entangled
-  ([[goopg_extended_protocol_autocommit]]).
+Files this loop: docs/design/0119-0004-acl-grant-heap-vs-virtual-typacl.md (new),
+docs/design/README.md (row 0119-0004bg), .ralph/fix_plan.md (ledger + new task
+M0119-0004-ACLHEAP), .ralph/deferral_ledger.md. Gates: `go build ./...` clean;
+`make ralph-state-guard` OK; pgbench smoke = pre-commit hook.
+
+NEXT (M0119-0004-ACLHEAP — the next REAL task, milestone-sized not a slice): route GRANT on a
+heap-backed object through `dispatchSimpleQueryViaExecutor` (Context in scope) + executor
+GRANT op that updates the ACL store AND re-syncs the pg_type heap `typacl` (mirror
+`deleteTypeFromCatalogHeap` delete+reinsert; new `TypeACLText` = `relaclTextLockedFor` over
+`{USAGE}`/`acldefault('T',owner)`); gates MUST include TestE2E_PhysicalReplication (standby
+reads pg_type) + TPC-H Q12/Q13 + pgbench. See the design doc §"Forward plan" for the full
+step list and the de-risking catalog accessors (LookupEnum/Domain/CompositeType ...ByOID).
+Alternatively pick a different open milestone (M0119-0005 pg_waldump server tier, etc.).

@@ -2968,6 +2968,41 @@ documentation-only and is exempt from the design-doc requirement.)
       pre-commit. Still open under M0119-0004: column-level (`attacl`, heap re-sync) /
       database (`datacl`, `--create`-only) / TYPE-DOMAIN (`typacl`, unmodelled) GRANT
       projection; extended-protocol commit-time deferral.
+      **2026-06-30 (loop #83, design 0119-0004-acl-grant-heap-vs-virtual-typacl,
+      ARCHITECTURAL FINDING — no code change):** the DU-002 ACL **GRANT round-trip** thread
+      (slices 330–356) is **complete for every object class goopg serves virtually**
+      (table/sequence `relacl`, schema `nspacl`, function `proacl`). The three still-open
+      cases (`typacl`, `attacl`, `datacl`) share ONE root cause, now documented: GRANT is
+      recorded **server-side** (`internal/server/query.go:69-87`) with only the in-memory
+      ACL store in scope — **no executor `*Context`, no heap write**. That works for the
+      virtual catalogs (`pg_class`/`pg_namespace` virtual builders + `pg_proc_view.go:388`
+      project the ACL live; `execCreateFunction` writes NO `pg_proc` heap row) but NOT for
+      `pg_type`, the **only** user catalog written to **real heap rows**
+      (`writeHeapRowCanonical` at CREATE TYPE/DOMAIN bakes `typacl=NULL`) for M0097-0022
+      PG-standby basebackup compat — there is no virtual `pg_type` overlay, so `getTypes`
+      reads the baked NULL and `GRANT USAGE ON TYPE` is a silent no-op (`grant_ddl.go:137`
+      bails). `attacl` (pg_attribute heap) shares it; `datacl` (pg_database heap) shares it
+      AND is `--create`-only (untestable under the `--no-create` connsetup harness).
+      Closing these is a NEW capability **M0119-0004-ACLHEAP** (below), not a slice: route
+      GRANT on a heap-backed object through the executor (Context in scope) + re-sync the
+      `pg_type` heap `typacl` (mirror `deleteTypeFromCatalogHeap` + re-insert; new
+      `TypeACLText` = `relaclTextLockedFor` over `{USAGE}`/`acldefault('T',owner)`). High
+      blast radius (heap mutation + MVCC + PG-standby read path) → needs TPC-H + recovery
+      E2E + full regress, a dedicated loop. Gates this loop: design doc + README + ledger;
+      `make ralph-state-guard` OK; pgbench smoke = pre-commit. The remaining M0119-0004 item
+      is now **M0119-0004-ACLHEAP** plus extended-protocol commit-time deferral; the
+      virtual-path ACL slice run is closed.
+- [ ] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
+      (source: design `0119-0004-acl-grant-heap-vs-virtual-typacl.md`). Round-trip
+      `pg_type.typacl` (TYPE/DOMAIN GRANT), then `pg_attribute.attacl` (column GRANT), by
+      routing GRANT/REVOKE on a heap-backed object through `dispatchSimpleQueryViaExecutor`
+      and adding an executor GRANT operator that updates the OID-keyed ACL store AND
+      re-syncs the heap row (delete-old + re-insert with the projected ACL, mirroring
+      `deleteTypeFromCatalogHeap`). New `TypeACLText`/`AttrACLText` renderers reuse
+      `relaclTextLockedFor`. Gates: new DU-002 TYPE-grant connsetup slice +
+      `TestE2E_PhysicalReplication`/recovery testport (standby reads pg_type) + TPC-H
+      Q12/Q13 + full executor/catalog/parser suites + pgbench. `datacl` stays deferred
+      (`--create`-only; untestable under the current harness).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
