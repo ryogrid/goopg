@@ -9252,6 +9252,37 @@ in-memory only. The user-spec kind (CURRENT_USER/SESSION_USER/etc.) is not disti
 non-`public` pseudo-user that is not a registered role renders with `umuser=0`. `pg_user_mapping` (the heap catalog, OID 1418) is not
 populated; the view is registry-backed for dump fidelity only.
 
+### Slice 378 — **`CREATE SERVER … OPTIONS (name 'value', …)`** round-trip (PRODUCTION fix)
+
+Slice 376 made a foreign server dumpable but discarded its `OPTIONS` (the `srvoptions` cell was always NULL). This slice round-trips the
+options. PostgreSQL stores server options in `pg_foreign_server.srvoptions` as a `text[]` of `name=value` elements; pg_dump's
+`getForeignServers` expands them **server-side** via `array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY option_name), E',\n    ') AS srvoptions`, and
+`dumpForeignServer` re-emits ` OPTIONS (\n    %s\n)`. Because the option list is `ORDER BY option_name`, `dbname` precedes `host`
+regardless of the `CREATE` order.
+
+- **Parser** (`internal/parser/ddl.go`): the `CREATE SERVER` arm now detects an `OPTIONS (...)` clause via the new `scanFDWOptionsList`
+  helper, which consumes `OPTIONS ( name 'value' [, …] )` and returns each pair as a `"name=value"` string (the on-disk `srvoptions`
+  element form). The list is stored in the new `CompatNoopStmt.Options` field; the `FOREIGN DATA WRAPPER` association is still captured in
+  parallel. The CREATE form has no `ADD/SET/DROP` action verbs (those belong to `ALTER SERVER`).
+- **Catalog** (`internal/catalog/catalog.go`): `ForeignServer` gains an `Options []string` field; `RegisterForeignServer(name, fdw,
+  options)` stores it (re-registration refreshes options only when non-empty, so an idempotent re-register with `nil` is non-destructive).
+  The `pg_foreign_server` `VirtualRows` `srvoptions` cell renders the options as the PostgreSQL `text[]` external literal
+  (`{name=value,…}`) via the new `optionsArrayLiteral` helper (mirrors the reloptions `"{" + join(",") + "}"` rendering). goopg's own
+  `pg_options_to_table` SRF then expands that literal back into `(option_name, option_value)` rows when pg_dump runs its query.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `server` arm threads `s.Options` into `RegisterForeignServer`.
+
+Covered by `TestParseCreateServerOptions` (parser: bare server → nil Options; `OPTIONS` form → ordered `name=value` slice + FDW
+association intact), the `opt_srv` assertions in `TestForeignServerRegistry` (registry: `srvoptions` renders `{host=localhost,dbname=mydb}`;
+`nil` re-register preserves options), and the `goopg_srv_opt` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact multi-line
+`CREATE SERVER … OPTIONS (\n    dbname 'mydb',\n    host 'localhost'\n);`). Verified against real pg_dump 18.3 (`getForeignServers` +
+`dumpForeignServer`), with a negative control confirming the option-order assertion is live.
+
+**Deferred (ledger):** FDW (`fdwoptions`) and USER MAPPING (`umoptions`) OPTIONS are still discarded — only `CREATE SERVER` options round-trip
+this slice. Option **values** containing array metacharacters (comma, brace, space, double-quote, backslash) are not yet quoted in the
+`text[]` literal (`optionsArrayLiteral` uses a plain comma join, matching the existing reloptions renderer), so such a value would corrupt
+`pg_options_to_table` splitting. `ALTER SERVER … OPTIONS (ADD/SET/DROP …)` is not modelled. Servers remain in-memory only.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

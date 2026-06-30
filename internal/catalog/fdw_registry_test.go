@@ -83,17 +83,17 @@ func TestForeignServerRegistry(t *testing.T) {
 
 	// The server references an FDW by name; srvfdw must resolve to its OID.
 	fdw := c.RegisterForeignDataWrapper("goopg_fdw")
-	s := c.RegisterForeignServer("srv1", "goopg_fdw")
+	s := c.RegisterForeignServer("srv1", "goopg_fdw", nil)
 	if s.OID < FirstUserOID {
 		t.Fatalf("RegisterForeignServer minted OID %d below FirstUserOID %d", s.OID, FirstUserOID)
 	}
 	// Idempotent: same name returns the same OID, no churn.
-	if s2 := c.RegisterForeignServer("srv1", "goopg_fdw"); s2.OID != s.OID {
+	if s2 := c.RegisterForeignServer("srv1", "goopg_fdw", nil); s2.OID != s.OID {
 		t.Fatalf("re-register srv1 changed OID: %d → %d", s.OID, s2.OID)
 	}
 
 	// A second server gets a distinct OID; ListForeignServers is name-sorted.
-	c.RegisterForeignServer("alpha_srv", "goopg_fdw")
+	c.RegisterForeignServer("alpha_srv", "goopg_fdw", nil)
 	list := c.ListForeignServers()
 	if len(list) != 2 || list[0].Name != "alpha_srv" || list[1].Name != "srv1" {
 		t.Fatalf("ListForeignServers = %+v; want [alpha_srv, srv1]", list)
@@ -134,6 +134,38 @@ func TestForeignServerRegistry(t *testing.T) {
 		t.Fatalf("ForeignDataWrapperOID(nope) = %d, want 0", oid)
 	}
 
+	// A server created WITH OPTIONS surfaces them as the srvoptions text[] literal
+	// ("{name=value,…}") that pg_dump's pg_options_to_table(srvoptions) expands.
+	// DU-002 slice 378.
+	c.RegisterForeignServer("opt_srv", "goopg_fdw", []string{"host=localhost", "dbname=mydb"})
+	optView := c.tables["pg_catalog.pg_foreign_server"].VirtualRows()
+	var optRow []string
+	for _, r := range optView {
+		if r[1] == "opt_srv" {
+			optRow = r
+			break
+		}
+	}
+	if optRow == nil {
+		t.Fatalf("opt_srv not found in pg_foreign_server view")
+	}
+	if got := optRow[7]; got != "{host=localhost,dbname=mydb}" {
+		t.Fatalf("opt_srv srvoptions = %q, want %q", got, "{host=localhost,dbname=mydb}")
+	}
+	// Re-registering with new options refreshes them; nil options leave them intact.
+	c.RegisterForeignServer("opt_srv", "goopg_fdw", nil)
+	if list := c.ListForeignServers(); func() bool {
+		for _, sv := range list {
+			if sv.Name == "opt_srv" && len(sv.Options) == 2 {
+				return false
+			}
+		}
+		return true
+	}() {
+		t.Fatalf("nil re-register dropped opt_srv options")
+	}
+	c.DropForeignServer("opt_srv")
+
 	// Drop removes it from the view; dropping a missing name is a no-op.
 	if !c.DropForeignServer("srv1") {
 		t.Fatalf("DropForeignServer(srv1) returned false")
@@ -165,7 +197,7 @@ func TestUserMappingRegistry(t *testing.T) {
 
 	// Register a server + role so the mapping resolves srvid and umuser.
 	c.RegisterForeignDataWrapper("goopg_fdw")
-	srv := c.RegisterForeignServer("goopg_srv", "goopg_fdw")
+	srv := c.RegisterForeignServer("goopg_srv", "goopg_fdw", nil)
 	c.RegisterRole("um_role")
 	roleOID, _ := c.RoleOID("um_role")
 

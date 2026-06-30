@@ -4781,6 +4781,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv"); err != nil {
 		t.Fatalf("create user mapping: %v", err)
 	}
+	// Slice 378: a FOREIGN SERVER created `WITH OPTIONS (name 'value', …)` must
+	// round-trip its options. PostgreSQL stores them in pg_foreign_server.srvoptions
+	// as a text[] of `name=value` elements; pg_dump's getForeignServers expands them
+	// server-side via `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||
+	// quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY
+	// option_name), E',\n    ')`, and dumpForeignServer re-emits
+	// `… OPTIONS (\n    <opt>,\n    <opt>\n)`. Options are emitted ORDER BY
+	// option_name (so dbname precedes host regardless of CREATE order). goopg now
+	// captures the OPTIONS clause in the parser, stores it in the foreign-server
+	// registry, and surfaces it as the srvoptions array literal — driving goopg's
+	// own pg_options_to_table SRF. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'localhost', dbname 'mydb')"); err != nil {
+		t.Fatalf("create server with options: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -10028,6 +10042,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// NULL→empty-array projection regressed.
 		if strings.Contains(res.Stdout, "CREATE USER MAPPING FOR um_role SERVER goopg_srv OPTIONS") {
 			t.Errorf("pg_dump emitted a spurious OPTIONS clause on the option-less user mapping (slice-377)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 378: a FOREIGN SERVER WITH OPTIONS must round-trip the OPTIONS clause.
+		// pg_dump renders the options ORDER BY option_name (dbname before host) as a
+		// `,\n    `-joined `name 'value'` list inside ` OPTIONS (\n    …\n)`. This
+		// exercises goopg's own pg_options_to_table SRF over the srvoptions text[]
+		// literal `{host=localhost,dbname=mydb}`. Verified against real pg_dump 18.3.
+		srvOptStmt := "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    dbname 'mydb',\n    host 'localhost'\n);"
+		if !strings.Contains(res.Stdout, srvOptStmt) {
+			t.Errorf("pg_dump dropped the SERVER OPTIONS (slice-378); missing %q\n  full stdout=%q", srvOptStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

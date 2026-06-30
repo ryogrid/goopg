@@ -131,6 +131,50 @@ func TestParseCreateUserMapping(t *testing.T) {
 	}
 }
 
+// TestParseCreateServerOptions verifies that CREATE SERVER captures both the
+// FOREIGN DATA WRAPPER association and an OPTIONS (name 'value', …) clause as
+// "name=value" elements, so the server's options round-trip through pg_dump
+// (pg_foreign_server.srvoptions → dumpForeignServer). DU-002 slice 378.
+func TestParseCreateServerOptions(t *testing.T) {
+	// Bare CREATE SERVER (no OPTIONS) carries the FDW association and nil Options.
+	stmts, err := Parse("CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ObjType != "server" || ns.ObjName.Name != "goopg_srv" || ns.TableName.Name != "goopg_fdw" {
+		t.Errorf("bare server mis-parsed: %+v", ns)
+	}
+	if ns.Options != nil {
+		t.Errorf("bare server Options = %+v, want nil", ns.Options)
+	}
+
+	// CREATE SERVER … OPTIONS (…) captures the options in OPTIONS-clause order.
+	stmts, err = Parse("CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'localhost', dbname 'mydb')")
+	if err != nil {
+		t.Fatalf("Parse error with OPTIONS: %v", err)
+	}
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.TableName.Name != "goopg_fdw" {
+		t.Errorf("FDW association lost with OPTIONS: %q", ns.TableName.Name)
+	}
+	want := []string{"host=localhost", "dbname=mydb"}
+	if len(ns.Options) != len(want) {
+		t.Fatalf("Options = %+v, want %+v", ns.Options, want)
+	}
+	for i := range want {
+		if ns.Options[i] != want[i] {
+			t.Errorf("Options[%d] = %q, want %q", i, ns.Options[i], want[i])
+		}
+	}
+}
+
 func TestParseCreateRuleTableName(t *testing.T) {
 	sql := `CREATE RULE test_rule_exists AS ON INSERT TO test_exists
     DO INSTEAD

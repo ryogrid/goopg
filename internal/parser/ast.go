@@ -1858,6 +1858,12 @@ type CompatNoopStmt struct {
 	// so the executor (execCompatNoop → execAttrACLChange) can apply it. Nil for a
 	// table-level (whole-relation) GRANT. M0119-0004-ACLHEAP (attacl half).
 	AttrACL *AttrACLChange
+	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
+	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
+	// executor stores them in the catalog's foreign-server registry so pg_dump
+	// re-emits the OPTIONS clause from pg_foreign_server.srvoptions. Nil when the
+	// statement carries no OPTIONS. DU-002 slice 378.
+	Options []string
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

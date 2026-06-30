@@ -266,8 +266,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Look for FOREIGN DATA WRAPPER fdwname to record the FDW association.
+		// Look for FOREIGN DATA WRAPPER fdwname to record the FDW association, and
+		// an OPTIONS (...) clause so the server's options round-trip through pg_dump
+		// (pg_foreign_server.srvoptions → dumpForeignServer). DU-002 slice 378.
 		var fdwName ObjectName
+		var options []string
 		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -282,12 +285,18 @@ func (p *parser) parseCreate() (Stmt, error) {
 				}
 				continue
 			}
+			// Detect "OPTIONS ( name 'value', … )".
+			if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "options") {
+				options = p.scanFDWOptionsList()
+				continue
+			}
 			p.advance()
 		}
 		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "server", ObjName: name}
 		if fdwName.Name != "" {
 			ns.TableName = fdwName // reuse TableName field to store FDW association
 		}
+		ns.Options = options
 		return ns, nil
 	// CREATE USER MAPPING FOR <user> SERVER <server> [OPTIONS (...)] — register so
 	// it round-trips through pg_dump (pg_user_mappings view → dumpUserMappings).
@@ -405,6 +414,45 @@ func (p *parser) scanUserMappingForServer() (user, server string) {
 		p.advance()
 	}
 	return user, server
+}
+
+// scanFDWOptionsList consumes an `OPTIONS ( name 'value' [, …] )` clause,
+// assuming the cursor is positioned ON the OPTIONS keyword. Each option is
+// returned as a "name=value" string — the on-disk srvoptions/fdwoptions text[]
+// element form that pg_dump's pg_options_to_table SRF expands. The CREATE form
+// has no ADD/SET/DROP action verbs (those belong to ALTER), so every entry is a
+// bare `name 'value'` pair. A malformed clause (no opening paren / missing
+// value) is tolerated: the helper returns what it has parsed and leaves the
+// cursor for the caller's outer skip loop. DU-002 slice 378.
+func (p *parser) scanFDWOptionsList() []string {
+	p.advance() // consume OPTIONS
+	if c := p.cur(); c.Kind != TokenSymbol || c.Value != "(" {
+		return nil
+	}
+	p.advance() // consume '('
+	var opts []string
+	for {
+		c := p.cur()
+		if c.Kind == TokenEOF || (c.Kind == TokenSymbol && c.Value == ")") {
+			break
+		}
+		if c.Kind == TokenSymbol && c.Value == "," {
+			p.advance()
+			continue
+		}
+		// Option name: an identifier or (rarely) a keyword used as a name.
+		name := c.Value
+		p.advance()
+		// Option value: a string literal.
+		if v := p.cur(); v.Kind == TokenStringLit {
+			opts = append(opts, name+"="+v.Value)
+			p.advance()
+		}
+	}
+	if c := p.cur(); c.Kind == TokenSymbol && c.Value == ")" {
+		p.advance()
+	}
+	return opts
 }
 
 // parseCreateExtensionTail parses the tail of

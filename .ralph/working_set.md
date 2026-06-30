@@ -1,42 +1,44 @@
 (idle — nothing in flight)
 
-Loop #16 COMPLETE: M0119-0004 DU-002 slice 377 — `CREATE USER MAPPING FOR <user>
-SERVER <srv>` round-trip THROUGH pg_dump + **exit-0 pipeline REPAIR**.
+Loop #17 COMPLETE: M0119-0004 DU-002 slice 378 — `CREATE SERVER … OPTIONS
+(name 'value', …)` round-trip THROUGH pg_dump.
 
-CRITICAL find: slice 376 (CREATE SERVER) silently regressed the whole
-TestPort_PgDumpConnectionSetup — a dumpable foreign server makes pg_dump's
-dumpForeignServer ALWAYS call dumpUserMappings, which queries `pg_user_mappings`
-(a view goopg lacked) → pg_dump aborted (exit=1, empty dump). The test runs its
-positive asserts ONLY inside `if res.ExitCode==0`, so every slice's round-trip
-assertion (incl. 375/376) was being SKIPPED. Confirmed via -v: the "remaining
-DU-002 catalog-parity gap exit=1 … relation pg_user_mappings does not exist" log.
-This slice restores exit 0 AND round-trips the mapping.
+Slice 376 dumped a server but discarded OPTIONS (srvoptions always NULL). This
+slice round-trips them. pg_dump's getForeignServers expands srvoptions server-side
+via `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(
+option_value) FROM pg_options_to_table(srvoptions) ORDER BY option_name),
+E',\n    '))` → dumpForeignServer emits ` OPTIONS (\n    %s\n)`. Options sort by
+name (dbname before host). goopg's own pg_options_to_table SRF expands the
+text[] literal `{name=value,…}` surfaced by pg_foreign_server.VirtualRows.
 
-Fix (mirrors slice 375/376 registry pattern):
-- catalog: `pg_user_mappings` virtual relation (umid,srvid,srvname,umuser,usename,
-  umoptions) over UserMapping{OID,UmUser,SrvName} registry + RegisterUserMapping/
-  DropUserMapping/ListUserMappings + `ForeignServerOID` helper. srvid←server OID,
-  umuser←RoleOID, PUBLIC→'public'/0, umoptions NULL→no OPTIONS clause.
-- parser: CREATE/DROP USER MAPPING arms caught BEFORE generic `user` role/compat
-  stubs (plain CREATE USER still errors → server-layer role DDL). scanUserMappingForServer.
-- executor: execCompatNoop `user mapping`→RegisterUserMapping; DropCompatStmt arm.
+Fix (3 layers):
+- parser (ddl.go): new scanFDWOptionsList consumes `OPTIONS ( name 'value', … )`
+  → `name=value` elements; CREATE SERVER arm stores them in new CompatNoopStmt.Options.
+- catalog (catalog.go): ForeignServer.Options []string; RegisterForeignServer
+  signature now (name,fdw,options) (idempotent re-register refreshes only when
+  non-empty); srvoptions cell renders text[] literal via new optionsArrayLiteral
+  ("{"+join(",")+"}" — mirrors reloptions renderer).
+- executor (operators_ddl.go): execCompatNoop server arm threads s.Options.
 
-Files: internal/catalog/catalog.go (field+view+struct+5 methods),
-internal/catalog/fdw_registry_test.go (TestUserMappingRegistry),
-internal/parser/ddl.go (CREATE+DROP arms + scanUserMappingForServer),
-internal/parser/op_compat_test.go (TestParseCreateUserMapping),
-internal/executor/operators_ddl.go (2 arms),
-internal/testport/pgdump_connsetup_test.go (um_role/goopg_srv fixture + asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 377), fix_plan, ledger.
+Files: internal/parser/ddl.go (CREATE SERVER arm + scanFDWOptionsList),
+internal/parser/ast.go (CompatNoopStmt.Options), internal/parser/op_compat_test.go
+(TestParseCreateServerOptions), internal/catalog/catalog.go (struct+register+
+VirtualRows+optionsArrayLiteral), internal/catalog/fdw_registry_test.go (opt_srv +
+3 caller sig fixes), internal/executor/operators_ddl.go (1 call site),
+internal/testport/pgdump_connsetup_test.go (goopg_srv_opt fixture + assert),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 378), fix_plan, ledger.
 
-Gates: TestUserMappingRegistry+TestForeignServer/FDWRegistry + TestParseCreateUserMapping
-+ full parser/catalog/executor suites PASS; TestPort_PgDumpConnectionSetup now reaches
-exit 0 (asserts re-armed). go build ./... + gofmt(my lines) clean. pgbench smoke = pre-commit.
-No TPC-H (metadata-only virtual-catalog change).
+Gates: TestParseCreateServerOptions + TestForeignServerRegistry +
+TestUserMappingRegistry + full parser/catalog suites PASS; TestPort_PgDumpConnection
+Setup PASS (byte-identical vs pg_dump 18.3) + NEGATIVE CONTROL confirmed assertion
+live. go build ./... clean; gofmt of my lines clean (pre-existing 1.25/1.26 noise
+left untouched). pgbench smoke = pre-commit hook. No TPC-H (metadata-only virtual-
+catalog change).
 
-Deferred (ledger): mapping OPTIONS discarded; in-memory only; user-spec kind not
-distinguished (non-public non-registered → umuser=0); pg_user_mapping heap (1418) not populated.
+Deferred (ledger): FDW/MAPPING OPTIONS still discarded; option values with array
+metacharacters not quoted; ALTER SERVER OPTIONS not modelled; in-memory only.
 
-Next loop: fresh M0119-0004 pg_dump slice. Candidates: SERVER/MAPPING/FDW OPTIONS
-rendering (text[] options array); range types (CREATE TYPE AS RANGE); aggregates;
-operators; text-search configs; CREATE COLLATION (parser doesn't accept).
+Next loop: fresh M0119-0004 pg_dump slice. Candidates: FDW/USER MAPPING OPTIONS
+(reuse scanFDWOptionsList + optionsArrayLiteral on the FDW + mapping arms);
+SERVER TYPE/VERSION; array-metachar quoting in optionsArrayLiteral; range types
+(CREATE TYPE AS RANGE); aggregates; operators; text-search configs; CREATE COLLATION.

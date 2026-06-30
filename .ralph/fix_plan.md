@@ -3198,6 +3198,23 @@ documentation-only and is exempt from the design-doc requirement.)
       exit 0, also re-arms slices 375/376 and all earlier asserts). **Deferred (ledger):** mapping `OPTIONS`
       discarded (umoptions NULL); mappings in-memory only; user-spec kind not distinguished (non-`public`
       non-registered user → umuser=0); `pg_user_mapping` heap (OID 1418) not populated.
+      **2026-06-30 (loop #17, design 0110-0001 slice 378): `CREATE SERVER … OPTIONS (name 'value', …)`
+      round-trip (PRODUCTION fix).** Slice 376 dumped a foreign server but discarded its OPTIONS
+      (`srvoptions` always NULL). pg_dump's `getForeignServers` expands them server-side via
+      `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(option_value) FROM
+      pg_options_to_table(srvoptions) ORDER BY option_name), E',\n    ')` and `dumpForeignServer` re-emits
+      ` OPTIONS (\n    %s\n)` (options sorted by name → `dbname` before `host`). Parser: new
+      `scanFDWOptionsList` consumes `OPTIONS ( name 'value', … )` into `name=value` elements stored in new
+      `CompatNoopStmt.Options`. Catalog: `ForeignServer.Options []string`; `RegisterForeignServer(name,fdw,
+      options)` (idempotent re-register refreshes only when non-empty); `pg_foreign_server` `srvoptions` cell
+      renders the PG text[] literal `{name=value,…}` via new `optionsArrayLiteral`, which goopg's own
+      `pg_options_to_table` SRF expands. Executor threads `s.Options` into RegisterForeignServer. Emits
+      `CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    dbname 'mydb',\n    host
+      'localhost'\n);` byte-identical vs pg_dump 18.3 (negative control confirms the option-order assertion is
+      live). Tests `TestParseCreateServerOptions` + `opt_srv` in `TestForeignServerRegistry` + DU-002 slice 378
+      fixture. **Deferred (ledger):** FDW (`fdwoptions`) / USER MAPPING (`umoptions`) OPTIONS still discarded;
+      option values with array metacharacters not quoted in the text[] literal; `ALTER SERVER … OPTIONS` not
+      modelled; servers in-memory only.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

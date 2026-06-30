@@ -6759,10 +6759,10 @@ func (c *InMemory) registerSystemTables() {
 				s.Name,                                // srvname
 				strconv.FormatUint(uint64(owner), 10), // srvowner
 				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
-				"", // srvtype (NULL)
-				"", // srvversion (NULL)
-				"", // srvacl (NULL)
-				"", // srvoptions (NULL)
+				"",                             // srvtype (NULL)
+				"",                             // srvversion (NULL)
+				"",                             // srvacl (NULL)
+				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
 		return out
@@ -9533,18 +9533,39 @@ func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
 // execute foreign servers; this records just enough metadata to round-trip the
 // CREATE/DROP through pg_dump (pg_foreign_server virtual view →
 // getForeignServers/dumpForeignServer). DU-002 slice 376.
+// optionsArrayLiteral renders a list of "name=value" option elements as the
+// PostgreSQL text[] external literal (e.g. {host=localhost,dbname=mydb}) that
+// pg_dump's pg_options_to_table(srvoptions) SRF expands back into one
+// (option_name, option_value) row per element. An empty list yields "" (SQL
+// NULL, so no OPTIONS clause is emitted). Mirrors the reloptions text[]
+// rendering ("{" + join(",") + "}"); option values containing array
+// metacharacters (comma, brace, space, quote) are not yet quoted — see the
+// deferral ledger. DU-002 slice 378.
+func optionsArrayLiteral(opts []string) string {
+	if len(opts) == 0 {
+		return ""
+	}
+	return "{" + strings.Join(opts, ",") + "}"
+}
+
 type ForeignServer struct {
 	Name    string // srvname
 	OID     uint32 // pg_foreign_server.oid (assigned from the catalog OID counter)
 	Owner   uint32 // srvowner; 0 → defaults to the bootstrap superuser at render time
 	FdwName string // the referenced FDW name; resolved to srvfdw OID at render time
+	// Options holds the server's OPTIONS as "name=value" elements, the on-disk
+	// pg_foreign_server.srvoptions text[] representation. pg_dump's
+	// getForeignServers expands these via pg_options_to_table(srvoptions) and
+	// dumpForeignServer re-emits an `OPTIONS (name 'value', …)` clause. Nil/empty
+	// → no OPTIONS clause. DU-002 slice 378.
+	Options []string
 }
 
 // RegisterForeignServer records a foreign server, allocating a stable OID on
 // first sight. Idempotent: re-registering an existing name returns the existing
-// entry without changing its OID (the FDW association is refreshed). DU-002
-// slice 376.
-func (c *InMemory) RegisterForeignServer(name, fdwName string) *ForeignServer {
+// entry without changing its OID (the FDW association and OPTIONS are refreshed
+// when non-empty). DU-002 slice 376 (options: slice 378).
+func (c *InMemory) RegisterForeignServer(name, fdwName string, options []string) *ForeignServer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
@@ -9554,9 +9575,12 @@ func (c *InMemory) RegisterForeignServer(name, fdwName string) *ForeignServer {
 		if fdwName != "" {
 			s.FdwName = fdwName
 		}
+		if len(options) > 0 {
+			s.Options = options
+		}
 		return s
 	}
-	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName}
+	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Options: options}
 	c.foreignServers[name] = s
 	return s
 }
