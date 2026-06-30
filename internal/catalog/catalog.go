@@ -10000,6 +10000,23 @@ func (c *InMemory) ListCasts() []*Cast {
 	return out
 }
 
+// CastByTypes returns the user-defined cast registered for the given source and
+// target type names (case-insensitive, same key as RegisterCast/DropCast), or
+// nil if none exists. Used by COMMENT ON CAST to resolve the cast's OID so the
+// comment is stored under pg_cast (classoid 2605). DU-002 slice 396.
+func (c *InMemory) CastByTypes(source, target string) *Cast {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.casts == nil {
+		return nil
+	}
+	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	if cs, ok := c.casts[key]; ok {
+		return cs
+	}
+	return nil
+}
+
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>
 // SERVER <server>). goopg does not execute foreign access; this records just
 // enough metadata to round-trip the CREATE/DROP through pg_dump (pg_user_mappings

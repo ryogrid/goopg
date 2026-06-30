@@ -2748,6 +2748,24 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("cast"):
+		// COMMENT ON CAST (source AS target) IS '...'. Casts live in pg_cast
+		// (classoid 2605); pg_dump's dumpCast keys the comment lookup on the cast's
+		// catalogId (tableoid=pg_cast=2605) and objsubid 0, then re-emits
+		// `COMMENT ON CAST (<source> AS <target>) IS '...'`. The identity is the
+		// (source, target) type pair, not a name — parse `(src AS tgt)` with the
+		// same helper CREATE/DROP CAST uses. "cast" is an unreserved ident-keyword.
+		// DU-002 slice 396 (follows the CREATE CAST object family, slice 395).
+		cs.ObjKind = "cast"
+		if !p.acceptSymbol("(") {
+			return nil, true, p.errAtCur("expected ( after CAST in COMMENT ON")
+		}
+		cs.CastSource = p.parseCastTypeName()
+		_ = p.acceptKeyword(KwAs)
+		cs.CastTarget = p.parseCastTypeName()
+		if !p.acceptSymbol(")") {
+			return nil, true, p.errAtCur("expected ) after cast types in COMMENT ON CAST")
+		}
 	case p.acceptKeyword(KwFunction):
 		// COMMENT ON FUNCTION [schema.]name([argtypes]) IS '...'. Functions live
 		// in pg_proc (classoid 1255); pg_dump re-emits `COMMENT ON FUNCTION …`

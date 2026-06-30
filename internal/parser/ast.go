@@ -1964,6 +1964,8 @@ type CommentOnStmt struct {
 	ObjName     ObjectName    // table/index name, or table for constraint/column, or routine name for function
 	SubName     string        // column name (ObjKind=column) or constraint name (ObjKind=constraint)
 	Args        []FunctionArg // routine argument signature (ObjKind=function); nil for all other kinds
+	CastSource  string        // cast source type (ObjKind=cast); resolved to castsource OID at exec time
+	CastTarget  string        // cast target type (ObjKind=cast); resolved to casttarget OID at exec time
 	Description string        // comment text; empty string = IS NULL (delete comment)
 }
 

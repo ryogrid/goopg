@@ -3386,6 +3386,20 @@ documentation-only and is exempt from the design-doc requirement.)
       parsed but not dumped (castfunc=0 — needs a pg_proc row for `dumpCast`'s findFuncByOid); only built-in binary-coercible
       type pairs reachable (PG rejects composite/enum/array/domain WITHOUT FUNCTION, goopg cannot create base types);
       bare/built-in TypeNameToOID only; in-memory registry (no restart persistence).
+
+      **2026-07-01 (loop #36, design 0110-0001 slice 396): COMMENT ON CAST round-trip** (follow-on to slice 395). `dumpCast`
+      appends a trailing `COMMENT ON CAST (<src> AS <tgt>) IS '...';` when the cast's `dobj` carries
+      `DUMP_COMPONENT_COMMENT` — i.e. when `collectComments` found a `pg_description` row keyed on the cast's catalogId
+      (`classoid = pg_cast = 2605`, objsubid 0). The COMMENT identity is the type pair `(source AS target)`, not a name.
+      goopg's COMMENT-ON parser had no CAST branch and silently swallowed the statement, so the comment never reached
+      pg_description. Three-layer fix mirroring slice 390 (COMMENT ON COLLATION): (parser) new `case
+      p.acceptIdentKeyword("cast")` parses `(src AS tgt)` via `parseCastTypeName` into new `CommentOnStmt.CastSource`/
+      `CastTarget`; (executor) new `case "cast"` resolves the cast OID via `catalog.CastByTypes` and stores under pg_cast
+      with `SetComment(2605, cast.OID, 0, desc)` (built-in/unknown cast → OID 0 → harmless no-op); (catalog) new
+      `CastByTypes` lookup; the generic `pg_description` virtual view (walks `AllComments`) surfaces the row, no view change.
+      `TestPort_PgDumpConnectionSetup` asserts `COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea';`,
+      verified byte-identical vs real pg_dump 18.3; parser coverage `TestParseCommentOnCast`. In-memory only (no restart
+      persistence), like the cast registry.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

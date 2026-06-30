@@ -13167,6 +13167,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgFdw          = 2328 // pg_foreign_data_wrapper: foreign-data wrappers
 		oidPgExtension    = 3079 // pg_extension: installed extensions
 		oidPgCollation    = 3456 // pg_collation: collations
+		oidPgCast         = 2605 // pg_cast: casts
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13260,6 +13261,20 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgCollation, uc.OID, 0, s.Description)
+	case "cast":
+		// Casts live in pg_cast (classoid 2605). pg_dump's dumpCast keys the
+		// comment lookup on the cast's catalogId (tableoid=pg_cast=2605) and
+		// objsubid 0, then re-emits `COMMENT ON CAST (<source> AS <target>)
+		// IS '...'`. Resolve the user cast's OID by its (source, target) type
+		// pair via the same registry getCasts dumps from. A COMMENT on a cast
+		// goopg never registered (e.g. a built-in coercion) is a harmless no-op.
+		// Without this a COMMENT ON CAST was silently swallowed (parser dropped
+		// it) and never reached pg_description. DU-002 slice 396.
+		cst := im.CastByTypes(s.CastSource, s.CastTarget)
+		if cst == nil || cst.OID == 0 {
+			return nil
+		}
+		im.SetComment(oidPgCast, cst.OID, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {

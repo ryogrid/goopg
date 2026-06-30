@@ -346,3 +346,47 @@ func TestParseCommentOnCollation(t *testing.T) {
 		}
 	}
 }
+
+
+// TestParseCommentOnCast covers COMMENT ON CAST (source AS target). Casts live
+// in pg_cast (classoid 2605); pg_dump's dumpCast re-emits
+// `COMMENT ON CAST (<source> AS <target>) IS '...'`. The identity is the
+// (source, target) type pair, captured into CastSource/CastTarget — not a name.
+// "cast" is an unreserved ident-keyword. Before slice 396 the parser had no CAST
+// branch and silently swallowed the statement. DU-002 slice 396.
+func TestParseCommentOnCast(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantSource string
+		wantTarget string
+	}{
+		{"COMMENT ON CAST (text AS bytea) IS 'a cast comment'", "text", "bytea"},
+		{"COMMENT ON CAST (integer AS bigint) IS 'c'", "integer", "bigint"},
+		{"COMMENT ON CAST (character varying AS text) IS 'cv'", "character varying", "text"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "cast" {
+			t.Errorf("%q: ObjKind=%q, want cast", tc.sql, cs.ObjKind)
+		}
+		if cs.CastSource != tc.wantSource {
+			t.Errorf("%q: CastSource=%q, want %q", tc.sql, cs.CastSource, tc.wantSource)
+		}
+		if cs.CastTarget != tc.wantTarget {
+			t.Errorf("%q: CastTarget=%q, want %q", tc.sql, cs.CastTarget, tc.wantTarget)
+		}
+	}
+}

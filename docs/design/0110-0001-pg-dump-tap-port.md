@@ -9730,6 +9730,34 @@ WITHOUT FUNCTION, and goopg cannot create base types), and `TypeNameToOID` resol
 schema-qualified user type would fall back to `text`. The cast registry is in-memory (no restart persistence), matching
 the collation/foreign-server registries.
 
+### Slice 396 — **COMMENT ON CAST round-trip** (follow-on to slice 395)
+
+With the CREATE CAST object family in place, a comment on a cast must also round-trip. `dumpCast` appends a trailing
+`COMMENT ON CAST (<src> AS <tgt>) IS '...';` whenever the cast's `dobj` carries `DUMP_COMPONENT_COMMENT` — i.e. when
+`collectComments` found a `pg_description` row keyed on the cast's `catalogId` (`classoid = pg_cast = 2605`,
+`objsubid 0`). The comment-object identity is the **type pair** `(source AS target)`, not a name (`dumpComment(fout,
+"CAST", castargs, …)` where `castargs == "(text AS bytea)"`).
+
+Before this slice goopg's COMMENT-ON parser had no CAST branch — it fell through and silently swallowed the statement,
+so the comment never reached `pg_description` and pg_dump could not re-emit it. Three small layers, mirroring slice 390
+(COMMENT ON COLLATION):
+
+- **parser** (`internal/parser/parser.go`): a new `case p.acceptIdentKeyword("cast")` in the COMMENT-ON dispatch parses
+  `(source AS target)` via the existing `parseCastTypeName` helper, capturing the pair into new
+  `CommentOnStmt.CastSource`/`CastTarget` fields (`ast.go`). `cast` is an unreserved ident-keyword.
+- **executor** (`internal/executor/operators_ddl.go`): a new `case "cast"` in the COMMENT handler resolves the cast's
+  OID via `catalog.InMemory.CastByTypes(source, target)` (the same `lower(src)\x00lower(tgt)` key as
+  `RegisterCast`/`DropCast`) and stores the description under `pg_cast` (classoid 2605) with
+  `SetComment(2605, cast.OID, 0, desc)`. A COMMENT on a cast goopg never registered (e.g. a built-in coercion, OID 0) is
+  a harmless no-op.
+- **catalog** (`internal/catalog/catalog.go`): a new `CastByTypes` lookup; the existing generic `pg_description`
+  virtual view (which walks `AllComments`) then surfaces the row automatically — no view-specific change.
+
+The `TestPort_PgDumpConnectionSetup` fixture adds `COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea'`
+and asserts the trailing `COMMENT ON CAST (text AS bytea) IS '...';` appears, verified byte-identical vs real pg_dump
+18.3. Parser coverage: `TestParseCommentOnCast`. Like the cast registry itself, the comment is in-memory only (no
+restart persistence).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

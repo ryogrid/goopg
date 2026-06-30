@@ -5019,6 +5019,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT"); err != nil {
 		t.Fatalf("create cast bytea->text: %v", err)
 	}
+	// Slice 396: a COMMENT on a user-defined CAST must round-trip. pg_dump's
+	// dumpCast emits a trailing `COMMENT ON CAST (<src> AS <tgt>) IS '...';` when
+	// the cast's catalogId (classoid=pg_cast=2605, objsubid 0) carries a
+	// pg_description row. goopg's parser previously had no COMMENT ON CAST branch
+	// and silently swallowed it (the comment never reached pg_description). The
+	// parser now captures the (source, target) type pair into
+	// CastSource/CastTarget, the executor resolves the cast's OID via
+	// catalog.CastByTypes and stores the comment under pg_cast, and the
+	// pg_description virtual view surfaces it so dumpCast re-emits the COMMENT.
+	// Verified byte-identical vs real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea'"); err != nil {
+		t.Fatalf("comment on cast text->bytea: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7763,6 +7776,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, want) {
 				t.Errorf("pg_dump missing user cast %q\n  full stdout=%q", want, res.Stdout)
 			}
+		}
+		// **Slice 396 (asserted):** a COMMENT on a user-defined cast must round-trip
+		// via dumpCast's trailing COMMENT ON CAST. The comment text reaches
+		// pg_description keyed on (classoid=pg_cast=2605, objoid=cast.oid); a
+		// regression that dropped the pg_cast comment storage or the COMMENT ON CAST
+		// parser branch re-surfaces exactly here.
+		if want := "COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea';"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing cast comment %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation
