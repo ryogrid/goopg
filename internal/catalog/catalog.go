@@ -9456,6 +9456,28 @@ func quoteCollationIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
+// indexKeyIsBareFuncCall reports whether an index key expression is a plain
+// function call, mirroring PG's pg_get_indexdef_worker parenthesization test
+// (`IsA(indexkey, FuncExpr) && ((FuncExpr *) indexkey)->funcformat ==
+// COERCE_EXPLICIT_CALL`, ruleutils.c). Such keys are emitted WITHOUT the
+// surrounding parens the worker otherwise adds to every expression column.
+// A no-paren SQL value function (CURRENT_TIMESTAMP, CURRENT_USER, …) deparses
+// to a bare keyword rather than a COERCE_EXPLICIT_CALL FuncExpr, so it is
+// excluded and keeps the parens. DU-002 slice 360.
+func indexKeyIsBareFuncCall(e *parser.Expr) bool {
+	if e == nil {
+		return false
+	}
+	fc, ok := (*e).(*parser.FuncCall)
+	if !ok {
+		return false
+	}
+	if len(fc.Args) == 0 && fc.Name.Schema == "" && parser.IsNoParenFuncName(strings.ToLower(fc.Name.Name)) {
+		return false
+	}
+	return true
+}
+
 func BuildIndexDef(idx *Index) string {
 	var sb strings.Builder
 	sb.WriteString("CREATE ")
@@ -9492,9 +9514,24 @@ func BuildIndexDef(idx *Index) string {
 				exprStr = idx.ColExprStrings[i]
 			}
 			if exprStr != "" {
-				sb.WriteByte('(')
-				sb.WriteString(exprStr)
-				sb.WriteByte(')')
+				// PG's pg_get_indexdef_worker (ruleutils.c) wraps an expression
+				// key column in parens UNLESS it is a bare function call
+				// (IsA(indexkey, FuncExpr) && funcformat == COERCE_EXPLICIT_CALL):
+				// `lower(name)` dumps WITHOUT the extra parens, while a non-function
+				// expression such as `((qty + id) * mgr_id)` keeps the wrapping
+				// parens. Mirror that by skipping the wrap when the parsed key AST
+				// is a plain function call. DU-002 slice 360.
+				var keyAST *parser.Expr
+				if i < len(idx.ColExprs) {
+					keyAST = idx.ColExprs[i]
+				}
+				if indexKeyIsBareFuncCall(keyAST) {
+					sb.WriteString(exprStr)
+				} else {
+					sb.WriteByte('(')
+					sb.WriteString(exprStr)
+					sb.WriteByte(')')
+				}
 			} else {
 				sb.WriteString("(expr)")
 			}

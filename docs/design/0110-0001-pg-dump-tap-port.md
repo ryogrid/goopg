@@ -8771,6 +8771,27 @@ guard that the pre-fix `DEFAULT &{` Go-pointer corruption does **not** appear.
 > renderer); `OpUnaryPos` (`+x`) / `OpBitNot` (`~x`) unary-default arms (still fall through to `fmt.Sprintf` garbage); or
 > a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
+### Slice 360 — **bare function-call expression-index key** `lower(name)` → `USING btree (lower(name))` (PRODUCTION fix)
+
+A counterpart to slice 299's arithmetic key, on the parenthesization decision PG's `pg_get_indexdef_worker`
+(`ruleutils.c`) makes *before* the deparsed key text: every expression key column is wrapped in `(%s)` **unless** its
+top node is a bare function call (`IsA(indexkey, FuncExpr) && ((FuncExpr *) indexkey)->funcformat ==
+COERCE_EXPLICIT_CALL`), which prints as-is. So real pg_dump 18.3 emits `USING btree (lower(name))` /
+`(lpad(name, 5))` (one paren level) but keeps `((((qty + id) * mgr_id)))` for the arithmetic key.
+
+goopg's `catalog.BuildIndexDef` previously wrapped **every** expression key unconditionally, dumping the
+byte-divergent `((lower(name)))`. The fix adds `catalog.indexKeyIsBareFuncCall`, keyed on the parsed
+`catalog.Index.ColExprs[i]` AST (a `*parser.FuncCall` that is not a no-paren SQL value function), and suppresses the
+wrap only for that shape — every other expression (arithmetic, cast, CASE, …) keeps its parens. Byte-verified against
+real pg_dump 18.3 (`/tmp/du_ref_pg`); fixtures `foo_lower_idx` + `foo_lpad_idx` in `TestPort_PgDumpConnectionSetup`.
+
+> **Deferred (ledgered):** (a) a typed string-literal **cast inside a function-arg** — PG dumps
+> `upper((name || '_x'::text))` (the `'_x'` literal carries its `::text` type), but goopg's type-blind
+> `defaultExprToSQL` renders `'_x'` (and an operator arg without the inner parens); needs operand-type threading like
+> slice 302's `'-N'::type`. (b) **restart persistence** — `ColExprs`/`ColExprStrings` are in-memory only and
+> `pg_index.indexprs` is dumped NULL, so a function-call index would not round-trip after a server restart (the
+> renderer falls back to the wrap when the AST is absent). Both unchanged by this slice.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

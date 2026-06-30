@@ -2480,6 +2480,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))"); err != nil {
 		t.Fatalf("create nested-arithmetic expression index: %v", err)
 	}
+	// Slice 360: a BARE FUNCTION-CALL expression-index key (`lower(name)`,
+	// `lpad(name, 5)`) must dump WITHOUT the extra wrapping parens that slice 299's
+	// arithmetic key carries. PG's pg_get_indexdef_worker (ruleutils.c) parenthesizes
+	// an expression key column with `(%s)` UNLESS the top node is a bare function
+	// call (`IsA(indexkey, FuncExpr) && funcformat == COERCE_EXPLICIT_CALL`), in
+	// which case it prints the deparsed call as-is. Real pg_dump 18.3 emits
+	// `USING btree (lower(name))` / `(lpad(name, 5))` — one paren level — whereas the
+	// nested-arithmetic key (slice 299) keeps `((((qty + id) * mgr_id)))`. Before this
+	// slice goopg's catalog.BuildIndexDef unconditionally wrapped every expression
+	// key, so a function-call index dumped the byte-divergent `((lower(name)))` /
+	// `((lpad(name, 5)))` (one extra paren pair) — semantically harmless but not a
+	// byte-identical round-trip. The fix (catalog.indexKeyIsBareFuncCall, keyed on
+	// the parsed ColExprs AST) suppresses the wrap for a plain FuncCall while
+	// preserving it for every other expression shape. Verified byte-identical vs
+	// real pg_dump 18.3 (reference /tmp/du_ref_pg).
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_lower_idx ON public.foo (lower(name))"); err != nil {
+		t.Fatalf("create lower() expression index: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_lpad_idx ON public.foo (lpad(name, 5))"); err != nil {
+		t.Fatalf("create lpad() expression index: %v", err)
+	}
 	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
 		t.Fatalf("create DESC index: %v", err)
@@ -8383,6 +8404,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// to real pg_dump 18.3. Locks in slice 298's defaultExprToSQL BinaryOp
 			// parenthesization in the index-key-expression deparse context.
 			"CREATE INDEX foo_calc_expr_idx ON public.foo USING btree ((((qty + id) * mgr_id)));",
+			// Slice 360: a bare function-call key dumps WITHOUT the extra wrapping
+			// parens (pg_get_indexdef_worker prints a COERCE_EXPLICIT_CALL FuncExpr
+			// as-is); one paren level only, NOT the double-paren the arithmetic key
+			// above carries. Byte-identical to real pg_dump 18.3.
+			"CREATE INDEX foo_lower_idx ON public.foo USING btree (lower(name));",
+			"CREATE INDEX foo_lpad_idx ON public.foo USING btree (lpad(name, 5));",
 			// DESC with a non-default NULLS LAST override
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
