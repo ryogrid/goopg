@@ -12398,6 +12398,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 		}
 	}
+	// A GRANT/REVOKE … ON TYPE|DOMAIN … changes pg_type.typacl. Unlike
+	// table/schema/function ACLs (whose catalogs goopg serves virtually, so the
+	// server short-circuit records them), pg_type is heap-backed for PG18-standby
+	// basebackup parity (M0097-0022), so the change must update the OID-keyed ACL
+	// store AND re-sync the real pg_type heap row — which needs the *executor.Context
+	// in scope here. The parser routed this statement to the executor (query.go
+	// excludes ON TYPE/DOMAIN from the server GRANT fast path). M0119-0004-ACLHEAP.
+	if s.TypeACL != nil {
+		if err := o.execTypeACLChange(s.TypeACL); err != nil {
+			return err
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}
@@ -12463,6 +12475,155 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// conversion, text search dictionary/configuration/parser/template, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	}
+	return nil
+}
+
+// typeACLAllPrivs is the expansion of GRANT ALL [PRIVILEGES] ON a TYPE/DOMAIN:
+// USAGE is the only grantable type privilege, so any ALL / USAGE / unrecognised
+// privilege keyword on a type collapses to USAGE (matching acldefault('T', …)).
+var typeACLAllPrivs = []string{"USAGE"}
+
+// userTypeKind selects which pg_type row builder re-syncs a user type's heap row.
+type userTypeKind int
+
+const (
+	typeKindNone userTypeKind = iota
+	typeKindEnum
+	typeKindDomain
+	typeKindComposite
+)
+
+// resolveUserTypeOID maps a user TYPE/DOMAIN name to its pg_type OID and the row
+// builder kind, searching the enum, domain, and composite registries in turn. A
+// name that resolves to none of them returns (0, typeKindNone) so a GRANT on an
+// unknown / built-in type is a successful no-op. M0119-0004-ACLHEAP.
+func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind) {
+	if et, ok := im.LookupEnum(name); ok && et != nil {
+		return et.OID, typeKindEnum
+	}
+	if d, ok := im.LookupDomain(name); ok && d != nil {
+		return d.OID, typeKindDomain
+	}
+	if ct := im.LookupCompositeType(name); ct != nil {
+		return ct.OID, typeKindComposite
+	}
+	return 0, typeKindNone
+}
+
+// execTypeACLChange applies a GRANT/REVOKE … ON TYPE|DOMAIN … to the OID-keyed
+// ACL store and re-syncs the heap-backed pg_type.typacl. A type's only grantable
+// privilege is USAGE, and acldefault('T', owner) grants USAGE to BOTH the owner
+// and PUBLIC (structurally identical to the function EXECUTE default), so the
+// store update mirrors recordFunctionGrant / recordFunctionRevoke verbatim with
+// USAGE. Unknown type names are a successful no-op. M0119-0004-ACLHEAP.
+func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, tn := range tc.TypeNames {
+		oid, kind := resolveUserTypeOID(im, tn.Name)
+		if oid == 0 {
+			continue
+		}
+		if tc.Revoke {
+			// A type's acldefault grants USAGE to owner + PUBLIC; PG materializes
+			// that array on the first GRANT/REVOKE. Seed both implicit entries
+			// while typacl is still NULL so an owner-side REVOKE leaves the
+			// surviving entry explicit (mirrors recordFunctionRevoke for proacl).
+			if im.TypeACLText(oid) == "" {
+				im.MaterializeOwnerACL(oid, "postgres", typeACLAllPrivs)
+				im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
+			}
+			for _, role := range tc.Grantees {
+				im.RevokeTablePrivilege(oid, role, "USAGE")
+			}
+		} else {
+			// Seed the implicit PUBLIC USAGE that acldefault('T', …) carries so the
+			// materialized typacl matches PG's array; the owner entry is supplied
+			// by the renderer's owner branch (TypeACLText / relaclTextLockedFor).
+			im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
+			for _, role := range tc.Grantees {
+				im.GrantTablePrivilegeWithGrantOption(oid, role, "USAGE", tc.WithGrantOption)
+			}
+		}
+		if err := o.resyncTypeACLHeapRow(im, oid, kind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resyncTypeACLHeapRow rewrites the heap-backed pg_type row for a user type so
+// its typacl column carries the projected ACL as a PG-native _aclitem ArrayType
+// (read by a PG18 standby / basebackup). It mirrors the delete-old + insert-new +
+// mirror-to-postgres-DB template syncEnumTypeToCatalogHeap and deleteTypeFromCatalogHeap
+// already use for CREATE/DROP TYPE. A no-op when the catalog heap relfiles are
+// absent (in-memory test fixture): goopg's own reads project typacl from the ACL
+// store via the seqscan hook, so the heap write is purely standby parity.
+// M0119-0004-ACLHEAP (design 0119-0004).
+func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind userTypeKind) error {
+	ctx := o.ctx
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	var row Row
+	switch kind {
+	case typeKindEnum:
+		et, ok := im.LookupEnumByOID(oid)
+		if !ok || et == nil {
+			return nil
+		}
+		row = buildUserPGTypeRowForEnum(et)
+	case typeKindDomain:
+		d, ok := im.LookupDomainByOID(oid)
+		if !ok || d == nil {
+			return nil
+		}
+		row = buildUserPGTypeRowForDomain(d)
+	case typeKindComposite:
+		ct, ok := im.LookupCompositeTypeByOID(oid)
+		if !ok || ct == nil {
+			return nil
+		}
+		row = buildUserPGTypeRowForComposite(ct)
+	default:
+		return nil
+	}
+	// Fill typacl (the final pg_type column) from the projected ACL text. PG
+	// keeps typacl NULL until the array is non-empty; an owner-side REVOKE ALL
+	// yields the non-NULL empty array "{}" (encoded as an empty _aclitem).
+	aclText := im.TypeACLText(oid)
+	typaclIdx := len(row) - 1
+	if aclText == "" {
+		row[typaclIdx] = NullDatum
+	} else {
+		blob, err := encodeAclItemArrayText(aclText, func(roleName string) uint32 {
+			if roid, ok := im.RoleOID(roleName); ok {
+				return roid
+			}
+			return 0
+		})
+		if err != nil {
+			return err
+		}
+		row[typaclIdx] = NewBytesDatum(blob)
+	}
+	// Stamp the stale row's xmax with this txn's writer XID, append the rebuilt
+	// row, and mirror to the postgres DB (the session reads from DBOid=5).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	deleteTypeFromCatalogHeap(ctx, catalog.DefaultDBOid, oid, ctx.Tx.XID)
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), row); err != nil {
+		return err
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 	return nil
 }
 

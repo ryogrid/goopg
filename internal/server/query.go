@@ -61,12 +61,22 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 
 	upper := strings.ToUpper(matchable)
 
+	// A GRANT/REVOKE … ON TYPE|DOMAIN … changes pg_type.typacl, which is
+	// heap-backed (PG18-standby basebackup parity, M0097-0022) — unlike the
+	// table/sequence/schema/function ACLs the server records virtually below. It
+	// must run through the executor (dispatchSimpleQueryViaExecutor at the foot of
+	// this function), where an *executor.Context is in scope to re-sync the heap
+	// row; execCompatNoop updates the OID-keyed ACL store and rewrites the
+	// pg_type row. Exclude it from the server GRANT/REVOKE fast path so it falls
+	// through. M0119-0004-ACLHEAP.
+	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ")
+
 	// A single-statement, autocommit table-level GRANT is recorded in the
 	// catalog ACL store so SET ROLE + a privileged command (e.g. TRUNCATE) is
 	// enforced (truncate-conflict isolation spec, M0118-0008). Inside an
 	// explicit transaction we fall through to the executor's no-op path so
 	// transaction state and the protocol response are handled normally.
-	if strings.HasPrefix(upper, "GRANT ") && (connTx == nil || !connTx.InExplicit()) {
+	if strings.HasPrefix(upper, "GRANT ") && !isHeapACLObject && (connTx == nil || !connTx.InExplicit()) {
 		s.tryRecordTableGrant(matchable)
 		if err := w.WriteCommandComplete("GRANT"); err != nil {
 			return err
@@ -78,7 +88,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// materialized relacl drops the revoked privileges and pg_dump re-emits only
 	// what remains (DU-002 slice 338). Like GRANT it is left to the executor's
 	// no-op path inside an explicit transaction.
-	if strings.HasPrefix(upper, "REVOKE ") && (connTx == nil || !connTx.InExplicit()) {
+	if strings.HasPrefix(upper, "REVOKE ") && !isHeapACLObject && (connTx == nil || !connTx.InExplicit()) {
 		s.tryRecordTableRevoke(matchable)
 		if err := w.WriteCommandComplete("REVOKE"); err != nil {
 			return err

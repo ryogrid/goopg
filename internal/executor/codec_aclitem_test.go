@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // roleOIDFixture is a tiny role registry used by the aclitem codec tests. It
@@ -24,6 +26,42 @@ func fixtureResolveName(oid uint32) string {
 		}
 	}
 	return ""
+}
+
+// TestAclItemHeapDecodeCase verifies the heap-read codec path: an _aclitem
+// ArrayType varlena (as stored in pg_type.typacl) decoded through
+// decodePhysicalPGValueMctx is returned as KindBytes carrying the full blob
+// (incl. its 4-byte varlena header), NOT the shared default branch's
+// meaningless string. The seqscan hook then renders that KindBytes to canonical
+// aclitemout text via decodeAclItemArrayText — the sibling of the on-disk write.
+// M0119-0004-ACLHEAP.
+func TestAclItemHeapDecodeCase(t *testing.T) {
+	blob, err := encodeAclItemArrayText("{postgres=U/postgres,=U/postgres,grantee=U/postgres}", fixtureResolveOID)
+	if err != nil {
+		t.Fatalf("encodeAclItemArrayText: %v", err)
+	}
+	typ := catalog.Type{Name: "aclitem[]"}
+	d, n, err := decodePhysicalPGValueMctx(typ, blob, nil)
+	if err != nil {
+		t.Fatalf("decodePhysicalPGValueMctx(aclitem[]): %v", err)
+	}
+	if d.Kind != KindBytes {
+		t.Fatalf("decoded typacl Kind = %v, want KindBytes", d.Kind)
+	}
+	if n != len(blob) {
+		t.Errorf("consumed %d bytes, want %d (full varlena)", n, len(blob))
+	}
+	if !bytes.Equal(d.BytesValue(), blob) {
+		t.Errorf("decoded bytes differ from the stored blob")
+	}
+	// The seqscan hook re-renders the KindBytes blob to aclitemout text.
+	txt, err := decodeAclItemArrayText(d.BytesValue(), fixtureResolveName)
+	if err != nil {
+		t.Fatalf("decodeAclItemArrayText: %v", err)
+	}
+	if want := "{postgres=U/postgres,=U/postgres,grantee=U/postgres}"; txt != want {
+		t.Errorf("round-tripped typacl text = %q, want %q", txt, want)
+	}
 }
 
 func TestAclModeFromPrivLetters(t *testing.T) {

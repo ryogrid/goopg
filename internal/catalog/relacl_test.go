@@ -17,6 +17,40 @@ func relaclTextSeq(c *InMemory, relOID uint32) string {
 	return c.relaclTextLockedSeq(relOID)
 }
 
+// TestRoleNameForOID pins the OID→name reverse resolver the pg_type.typacl
+// heap-decode path uses to render grantee/grantor role NAMES back from the
+// stored AclItem OIDs (M0119-0004-ACLHEAP). OID 0 = PUBLIC (empty grantee),
+// OID 10 = the bootstrap superuser "postgres", a registered role resolves to
+// its case-preserved spelling, and an unknown OID falls back to its numeric
+// form (PG's rendering of a since-dropped role).
+func TestRoleNameForOID(t *testing.T) {
+	c := NewInMemory()
+	if got := c.RoleNameForOID(0); got != "" {
+		t.Errorf("RoleNameForOID(0) = %q, want \"\" (PUBLIC)", got)
+	}
+	if got := c.RoleNameForOID(10); got != "postgres" {
+		t.Errorf("RoleNameForOID(10) = %q, want \"postgres\"", got)
+	}
+	c.RegisterRole("typg_grantee")
+	oid, ok := c.RoleOID("typg_grantee")
+	if !ok || oid == 0 {
+		t.Fatalf("RoleOID(typg_grantee) = %d, %v; want a non-zero OID", oid, ok)
+	}
+	if got := c.RoleNameForOID(oid); got != "typg_grantee" {
+		t.Errorf("RoleNameForOID(%d) = %q, want \"typg_grantee\"", oid, got)
+	}
+	// A case-significant (double-quoted) role keeps its original spelling.
+	c.GrantTablePrivilegeWithGrantOption(999, "MixedCase", "USAGE", false)
+	c.RegisterRole("MixedCase")
+	mc, _ := c.RoleOID("MixedCase")
+	if got := c.RoleNameForOID(mc); got != "MixedCase" {
+		t.Errorf("RoleNameForOID(%d) = %q, want \"MixedCase\" (case-preserved)", mc, got)
+	}
+	if got := c.RoleNameForOID(4242); got != "4242" {
+		t.Errorf("RoleNameForOID(4242) = %q, want \"4242\" (numeric fallback)", got)
+	}
+}
+
 // TestRelaclText pins the pg_class.relacl projection that lets a table-level
 // GRANT round-trip through pg_dump (DU-002 slice 331). PostgreSQL leaves relacl
 // NULL until the first GRANT, then materializes an aclitem[] with the owner's

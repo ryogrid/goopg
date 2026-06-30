@@ -3027,6 +3027,32 @@ documentation-only and is exempt from the design-doc requirement.)
       details now reach a parsed AST node `execCompatNoop` runs with a full
       `*executor.Context`. Box stays unchecked: remaining = `query.go` dispatch reroute
       + the `execCompatNoop` heap-resync branch + the full gate set.
+      **2026-06-30 (loop #87) — typacl heap-write + read half LANDED; the TYPE GRANT
+      round-trip is COMPLETE (design `0119-0004-*` "the heap-write + read half").**
+      `GRANT USAGE ON TYPE public.gtype TO typg_grantee` → real pg_dump emits
+      `GRANT ALL ON TYPE public.gtype TO typg_grantee;`, byte-identical to PG 18.3
+      (`TestPort_PgDumpConnectionSetup` slice 357, strict). Three pieces wired end-to-end:
+      (1) **dispatch** — `query.go` excludes `" ON TYPE "`/`" ON DOMAIN "` from the
+      autocommit GRANT/REVOKE server fast path (`isHeapACLObject`) so it falls through to
+      `dispatchSimpleQueryViaExecutor`; (2) **write** — `execCompatNoop`'s new
+      `s.TypeACL != nil` branch (`execTypeACLChange`) updates the OID-keyed ACL store like
+      `recordFunctionGrant`/`Revoke` but with USAGE (`typeACLAllPrivs`), then
+      `resyncTypeACLHeapRow` rebuilds the `pg_type` row via
+      `buildUserPGTypeRowFor{Enum,Domain,Composite}` with `typacl` =
+      `NewBytesDatum(encodeAclItemArrayText(TypeACLText(oid), RoleOID))` and applies the
+      proven `deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` +
+      `mirrorCatalogRelToPostgresDB` template (gated on `catalogHeapSyncAvailable`); (3)
+      **read** — `decodePhysicalPGValueMctx` returns an `aclitem[]` heap value as KindBytes
+      (full varlena), and the `seqScanOp` pg_type hook renders it to canonical aclitemout
+      text via `decodeAclItemArrayText` + the new `catalog.InMemory.RoleNameForOID` reverse
+      resolver, so the heap is the single read source (no virtual overlay). Gates ALL PASS:
+      DU-002 connsetup (TYPE grant); `TestE2E_PhysicalReplication`; `-race`
+      executor/catalog/storage/mvcc; executor/catalog/parser/server units; TPC-H Q12=2/Q13=33;
+      pgbench smoke (pre-commit). Units `TestRoleNameForOID` + `TestAclItemHeapDecodeCase`.
+      Box stays unchecked: **`attacl`** (column-level GRANT) reuses this exact template
+      against the heap-backed `pg_attribute` — the remaining follow-up; **`datacl`** stays
+      deferred (`pg_database` heap-backed AND `--create`-only, untestable in the `--no-create`
+      connsetup harness).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

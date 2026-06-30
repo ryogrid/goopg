@@ -3538,6 +3538,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant usage on gowgo_seq to seq_wgo_role with grant option: %v", err)
 	}
 
+	// Slice 357 (M0119-0004-ACLHEAP): a TYPE-level GRANT must round-trip through
+	// pg_dump from pg_type.typacl. Unlike relacl/proacl/nspacl — whose catalogs
+	// goopg serves *virtually* (the server records the GRANT in the ACL store and
+	// the virtual builder re-projects it) — pg_type is heap-backed for PG18-standby
+	// basebackup parity (M0097-0022), so a `GRANT USAGE ON TYPE … TO role` must run
+	// through the executor (query.go excludes ON TYPE from the server fast path),
+	// which updates the OID-keyed ACL store AND re-syncs the pg_type heap row's
+	// typacl to a PG-native _aclitem ArrayType. A type's acldefault('T', owner)
+	// grants USAGE to BOTH the owner and PUBLIC, so the GRANT materializes typacl as
+	// "{postgres=U/postgres,=U/postgres,typg_grantee=U/postgres}". pg_dump's getTypes
+	// reads typacl, diffs it against acldefault('T', 10), and buildACLCommands emits
+	// `GRANT ALL ON TYPE public.gtype TO typg_grantee;` (USAGE is the sole type
+	// privilege, so the grantee's full set renders as ALL — like a function's
+	// EXECUTE). Before this milestone goopg baked typacl NULL on every pg_type row
+	// and bailed on every TYPE GRANT, so it was silently dropped from the dump.
+	if err := runSQLSimple(t, c, "CREATE TYPE public.gtype AS ENUM ('lo', 'hi')"); err != nil {
+		t.Fatalf("create type gtype: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE typg_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role typg_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON TYPE public.gtype TO typg_grantee"); err != nil {
+		t.Fatalf("grant usage on type gtype to typg_grantee: %v", err)
+	}
+
 	// Slice 350: a sequence GRANT followed by a partial REVOKE must round-trip,
 	// the sequence analogue of the table partial-REVOKE slice 338 and the schema
 	// partial-REVOKE slice 339. A sequence exposes three privileges
@@ -7750,6 +7775,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `GRANT USAGE …;`.
 		if want := "GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered the sequence WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 357 (asserted, M0119-0004-ACLHEAP):** a TYPE-level GRANT round-trips
+		// from the heap-backed pg_type.typacl — the new capability this milestone adds.
+		// `GRANT USAGE ON TYPE public.gtype TO typg_grantee` runs through the executor
+		// (not the server virtual-ACL fast path), which updates the OID-keyed ACL store
+		// and re-syncs the pg_type heap row's typacl to a PG-native _aclitem array
+		// "{postgres=U/postgres,=U/postgres,typg_grantee=U/postgres}". pg_dump's getTypes
+		// reads typacl back (decoded to canonical aclitemout text by the seqscan hook),
+		// diffs it against acldefault('T', 10) = "{=U/postgres,postgres=U/postgres}", and
+		// buildACLCommands emits a single `GRANT ALL ON TYPE public.gtype TO typg_grantee;`
+		// (USAGE is the sole type privilege, so the grantee's full set renders ALL, like a
+		// function's EXECUTE). Verified against real pg_dump 18.3. Before this milestone
+		// goopg baked typacl NULL on every pg_type row and bailed on TYPE GRANT, dropping
+		// it from the dump.
+		if want := "GRANT ALL ON TYPE public.gtype TO typg_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the TYPE GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 350 (asserted):** a sequence GRANT followed by a partial REVOKE
 		// round-trips (the sequence analogue of slices 338/339). `GRANT USAGE, SELECT

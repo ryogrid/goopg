@@ -799,6 +799,19 @@ type seqScanOp struct {
 	// enumTypes[i] is non-nil when cols[i] is a user-defined enum type.
 	// Used to convert KindString heap datums to KindEnum for correct ORDER BY. M0097-enum.
 	enumTypes []*catalog.EnumType
+
+	// typeACLCat / typeACLColIdx / typeACLOidIdx drive the pg_type.typacl
+	// heap-decode override (M0119-0004-ACLHEAP). pg_type is heap-backed for
+	// PG18-standby basebackup parity, and a USAGE GRANT/REVOKE stores typacl as
+	// a PG-native _aclitem binary blob (decoded to KindBytes by
+	// decodePhysicalPGValueMctx). When scanning pg_type this hook renders that
+	// blob to canonical aclitemout text — resolving grantee/grantor OIDs back to
+	// role names via the catalog — so a goopg-served `SELECT typacl FROM pg_type`
+	// (pg_dump's getTypes) reads the same text pg_class.relacl projects virtually.
+	// typeACLColIdx is -1 for every non-pg_type scan (the common case → no-op).
+	typeACLCat    *catalog.InMemory
+	typeACLColIdx int
+	typeACLOidIdx int
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -970,6 +983,26 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		for i, col := range o.cols {
 			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
 				o.enumTypes[i] = et
+			}
+		}
+	}
+	// M0119-0004-ACLHEAP: arm the pg_type.typacl heap-decode override only when
+	// scanning the heap-backed pg_type catalog. Resolved once here (column
+	// positions are stable) so Next() does a single bool/index check per row.
+	o.typeACLColIdx = -1
+	o.typeACLOidIdx = -1
+	if o.tbl != nil && o.tbl.OID == catalog.TypeRelationId {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for i, col := range o.cols {
+				switch col.Name {
+				case "typacl":
+					o.typeACLColIdx = i
+				case "oid":
+					o.typeACLOidIdx = i
+				}
+			}
+			if o.typeACLColIdx >= 0 && o.typeACLOidIdx >= 0 {
+				o.typeACLCat = im
 			}
 		}
 	}
@@ -1423,6 +1456,19 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			}
 			if o.pinned != nil {
 				o.pinned.RUnlock()
+			}
+			// M0119-0004-ACLHEAP: render the heap-backed pg_type.typacl blob
+			// (KindBytes _aclitem ArrayType, written by a USAGE GRANT/REVOKE)
+			// to canonical aclitemout text, resolving grantee/grantor OIDs back
+			// to role names via the catalog. row was deep-copied by
+			// cloneRowOwned above, so this post-RUnlock mutation is safe. Dormant
+			// for an unpopulated (NULL) typacl and every non-pg_type scan (-1).
+			if o.typeACLColIdx >= 0 && o.typeACLColIdx < len(row) {
+				if d := row[o.typeACLColIdx]; d.Kind == KindBytes {
+					if txt, derr := decodeAclItemArrayText(d.BytesValue(), o.typeACLCat.RoleNameForOID); derr == nil {
+						row[o.typeACLColIdx] = NewStringDatum(txt)
+					}
+				}
 			}
 			// M0115-0004: write HeapXminCommitted to the on-page infomask.
 			// Acquire WLock briefly; o.pinned pin prevents eviction between

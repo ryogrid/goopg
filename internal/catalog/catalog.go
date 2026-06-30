@@ -8422,6 +8422,34 @@ func (c *InMemory) RoleOID(name string) (uint32, bool) {
 	return oid, ok
 }
 
+// RoleNameForOID is the reverse of RoleOID: it resolves a role OID back to the
+// name aclitemout / pg_dump prints. OID 0 (ACL_ID_PUBLIC) renders as the empty
+// string (the PUBLIC pseudo-role); OID 10 (BOOTSTRAP_SUPERUSERID) is "postgres";
+// a registered user role resolves to its case-preserved spelling (the same
+// override the relacl renderer uses); an unknown OID falls back to its numeric
+// form, matching PostgreSQL's rendering of a since-dropped role. Used by the
+// pg_type typacl heap-decode path so a goopg-served `SELECT typacl FROM pg_type`
+// returns role NAMES, not OIDs (M0119-0004-ACLHEAP).
+func (c *InMemory) RoleNameForOID(oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	if oid == 10 {
+		return "postgres"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, roid := range c.roles {
+		if roid == oid {
+			if disp, ok := c.roleACLDisplay[name]; ok {
+				return disp
+			}
+			return name
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
 // GrantTablePrivilege records that role may exercise priv on relOID. See the
 // Catalog interface doc. Role names are stored lower-cased and privilege
 // keywords upper-cased so lookups are case-insensitive. M0118-0008.

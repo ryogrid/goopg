@@ -214,24 +214,70 @@ This is the encode/decode primitive every later heap-ACL re-sync (typacl now,
 attacl next) builds on; the GRANT path can now produce a PG-faithful `typacl`
 heap value instead of silently storing an empty/mis-typed array.
 
-**Remaining for M0119-0004-ACLHEAP** (the high-blast-radius half — still a dedicated
-full-gate loop): the rest of step 1 (route GRANT/REVOKE on a heap-backed object
-through `dispatchSimpleQueryViaExecutor` — flip the `query.go:69-87` short-circuit
-so an autocommit `GRANT … ON TYPE|DOMAIN` falls through to the executor),
-2b (the `execCompatNoop` branch that, when `s.TypeACL != nil`, updates the
-OID-keyed ACL store like `recordFunctionGrant` but with USAGE, then re-syncs the
-`pg_type` heap row via `deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` with
-`row[31]` = `NewBytesDatum(encodeAclItemArrayText(TypeACLText(oid), …))` — the
-codec passes the blob through `codec.go`'s `aclitem[]` `KindBytes` branch — and
-wires `decodeAclItemArrayText` into the `SELECT … typacl FROM pg_type` read path),
-3 (mirror to the postgres DB), and 4 (the DU-002 connsetup slice +
-`TestE2E_PhysicalReplication` + TPC-H Q12/Q13 + pgbench gates; re-init the data
-dir since the `pg_type` row layout gains a populated `typacl`).
+### Progress — the heap-write + read half LANDED (loop #87, 2026-06-30) — `typacl` round-trips
 
-Catalog accessors that already exist and de-risk step 2: `LookupEnum`/`LookupEnumByOID`
-(`catalog.go:9803/9816`), `LookupCompositeType`/`...ByOID` (`10097/10108`),
-`LookupDomain`/`...ByOID` (`10215/10238`) — a `lookupTypeOID(name)` can resolve a
-TYPE/DOMAIN name to its OID directly.
+The high-blast-radius half is **in tree** and the `typacl` GRANT round-trip is **complete**.
+`GRANT USAGE ON TYPE public.gtype TO typg_grantee` → real `pg_dump` emits
+`GRANT ALL ON TYPE public.gtype TO typg_grantee;`, byte-identical to PG 18.3
+(`TestPort_PgDumpConnectionSetup` slice 357, strict).
+
+**Step 1 — dispatch reroute** (`internal/server/query.go`): the autocommit GRANT/REVOKE
+server fast path now skips any statement whose upper-cased text contains `" ON TYPE "` or
+`" ON DOMAIN "` (`isHeapACLObject`), so it falls through the simple-query switch to
+`dispatchSimpleQueryViaExecutor`. The virtual classes (table/sequence/schema/function)
+keep the lower-overhead server recorder. Explicit-txn GRANT already routed to the executor,
+so the command-tag / txn-state handling was already in place.
+
+**Step 2b — executor ACL store update + heap re-sync** (`internal/executor/operators_ddl.go`):
+`execCompatNoop` gained a `s.TypeACL != nil` branch → `execTypeACLChange`, which resolves
+each `TypeName` to its OID + builder kind (`resolveUserTypeOID` over
+`LookupEnum`/`LookupDomain`/`LookupCompositeType`) and updates the OID-keyed ACL store
+exactly as `recordFunctionGrant`/`recordFunctionRevoke` do for `proacl`, but with the type's
+sole privilege **USAGE** (`typeACLAllPrivs = {USAGE}`; GRANT seeds the implicit PUBLIC USAGE,
+REVOKE seeds owner+PUBLIC while `typacl` is still NULL). It then calls
+`resyncTypeACLHeapRow`, which rebuilds the base `pg_type` row via the matching
+`buildUserPGTypeRowFor{Enum,Domain,Composite}`, fills the final `typacl` column with
+`NewBytesDatum(encodeAclItemArrayText(TypeACLText(oid), RoleOID-resolver))` (or `NullDatum`
+when the ACL is empty), and applies the proven delete-old + insert-new + mirror template:
+`deleteTypeFromCatalogHeap(DefaultDBOid, oid, Tx.XID)` (xmax-stamps the stale row) →
+`writeHeapRowCanonical(pg_type, …)` → `mirrorCatalogRelToPostgresDB(TypeRelationId)`.
+Gated on `catalogHeapSyncAvailable` (a no-op in the in-memory VM fixture).
+
+**Step 2c — read path** (`internal/executor/codec.go` + `operators_storage.go`): a new
+`case "aclitem[]", "_aclitem":` in `decodePhysicalPGValueMctx` returns the full `_aclitem`
+varlena (incl. its 4-byte header) as **KindBytes** instead of the shared `default` branch's
+meaningless string. The `seqScanOp` then renders it: armed only when scanning `pg_type`
+(`typeACLColIdx`/`typeACLOidIdx`/`typeACLCat` resolved once in `Open`), a per-row hook
+(modelled on the existing enum injector) converts the KindBytes `typacl` to canonical
+aclitemout text via `decodeAclItemArrayText` with the new
+`catalog.InMemory.RoleNameForOID` reverse resolver (0→PUBLIC, 10→postgres, registered role
+→ case-preserved name, else numeric). So a goopg-served `SELECT typacl FROM pg_type`
+(pg_dump's `getTypes`) reads the same role-NAME text `pg_class.relacl` projects virtually —
+**the heap is the single read source of truth**, no second overlay. Dormant for every
+non-pg_type scan and for an unpopulated (NULL) `typacl`; `pg_class.relacl` is virtual so it
+never hits the decode case.
+
+**Step 3 — mirror**: `resyncTypeACLHeapRow` calls `mirrorCatalogRelToPostgresDB` so the
+session (which reads from DBOid=5) and an attaching PG18 standby see the re-synced row.
+
+**Step 4 — gates (all run, this loop)**: `TestPort_PgDumpConnectionSetup` (the DU-002
+TYPE-grant round-trip, PASS); `TestE2E_PhysicalReplication` (standby still reads `pg_type`,
+PASS); `-race ./internal/executor ./internal/catalog ./internal/storage ./internal/mvcc`
+(PASS); full `internal/executor` / `internal/catalog` / `internal/parser` / `internal/server`
+suites (PASS); TPC-H Q12/Q13 spot-check + pgbench smoke (pre-commit). Unit:
+`TestRoleNameForOID`, the `aclitem[]` decode case, and the existing `codec_aclitem` round-trip
+goldens.
+
+**Still open under M0119-0004-ACLHEAP** (follow-ups, NOT regressions): `attacl` (column-level
+GRANT) reuses this exact template against `pg_attribute` (heap-backed; the
+`pg_attribute_alter_needs_heap_resync` precedent); `datacl` stays deferred (`pg_database` is
+heap-backed AND only emitted by `pg_dump --create`, which the `--no-create` connsetup harness
+cannot exercise). Type-ACL durability across a goopg restart is in-memory-only, matching every
+other goopg ACL (relacl/nspacl/proacl) — the heap `typacl` blob is for standby/basebackup
+parity; goopg's own read derives from the same store the heap was synced from.
+
+Catalog accessors used: `LookupEnum`/`LookupEnumByOID`, `LookupCompositeType`/`...ByOID`,
+`LookupDomain`/`...ByOID`, and the new `RoleNameForOID`.
 
 ## Why not just do it now
 
