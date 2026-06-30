@@ -12294,6 +12294,12 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if toCanon == "" {
 			toCanon = toType
 		}
+		// If goopg registered this user cast (CREATE CAST, DU-002 slice 395), drop
+		// it from the registry so it stops round-tripping through pg_dump. An
+		// unregistered cast falls through to the PG-style "does not exist" error.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.DropCast(fromType, toType) {
+			return nil
+		}
 		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
 		if s.IfExists {
 			o.ctx.AddNotice(msg + ", skipping")
@@ -12792,6 +12798,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		key := s.ObjName.Name + "(" + leftCanon + "," + rightCanon + ")"
 		im.RegisterCompatObject("operator", key)
+	case "cast":
+		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
+		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).
+		// ArgTypes carries [source, target]; CastContext/CastMethod carry
+		// castcontext/castmethod. WITH FUNCTION casts (Method=="f") are not dumped
+		// — castfunc stays 0 and dumpCast would warn — so only the binary/INOUT
+		// forms (castfunc=0) are registered for fidelity. DU-002 slice 395.
+		if len(s.ArgTypes) == 2 && s.CastMethod != "f" {
+			im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod)
+		}
 	case "schema":
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if s.ObjName.Name != "" {

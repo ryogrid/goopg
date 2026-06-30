@@ -2172,6 +2172,14 @@ type InMemory struct {
 	// fidelity. Key: lowercase "<user>\x00<server>". DU-002 slice 377.
 	userMappings map[string]*UserMapping
 
+	// casts tracks user-defined casts (CREATE CAST) with a stable OID so they
+	// round-trip through pg_dump's getCasts (pg_cast virtual view → dumpCast).
+	// goopg does not perform user casts; only enough metadata is kept for dump
+	// fidelity (source/target type OIDs, castcontext, castmethod; castfunc stays 0
+	// for WITHOUT FUNCTION / WITH INOUT). Key: lowercase "<source>\x00<target>".
+	// DU-002 slice 395.
+	casts map[string]*Cast
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -6484,7 +6492,31 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2605,
 	}
-	pgCast.VirtualRows = func() [][]string { return nil }
+	// Surface user-defined casts (CREATE CAST) so they round-trip. getCasts reads
+	// every row (built-in casts are excluded by OID at dump-out time, so an empty
+	// view stays correct for the no-user-cast case); dumpCast renders the source/
+	// target via getFormattedTypeName(castsource/casttarget) — hence the type names
+	// resolve to their canonical pg_type OIDs, which goopg already surfaces in
+	// pg_type. castfunc=0 (WITHOUT FUNCTION / WITH INOUT) skips findFuncByOid.
+	// DU-002 slice 395.
+	pgCast.VirtualRows = func() [][]string {
+		casts := c.ListCasts()
+		if len(casts) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(casts))
+		for _, cs := range casts {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(cs.OID), 10),                // oid
+				strconv.FormatUint(uint64(TypeNameToOID(cs.SourceType)), 10), // castsource
+				strconv.FormatUint(uint64(TypeNameToOID(cs.TargetType)), 10), // casttarget
+				strconv.FormatUint(uint64(cs.FuncOID), 10),            // castfunc (0 for this slice)
+				cs.Context,                                            // castcontext
+				cs.Method,                                             // castmethod
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_cast"] = pgCast
 
 	// pg_transform — transform catalog (OID 3576). goopg implements no
@@ -9888,6 +9920,84 @@ func (c *InMemory) ForeignServerOID(name string) uint32 {
 		return s.OID
 	}
 	return 0
+}
+
+// Cast is a user-defined cast (CREATE CAST (source AS target) …). goopg does not
+// actually perform user casts; this records just enough metadata to round-trip
+// the definition through pg_dump (pg_cast virtual view → getCasts/dumpCast).
+// DU-002 slice 395.
+type Cast struct {
+	OID        uint32 // pg_cast.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
+	SourceType string // the parsed source type name; resolved to castsource OID via TypeNameToOID at render time
+	TargetType string // the parsed target type name; resolved to casttarget OID at render time
+	// FuncOID is pg_cast.castfunc. 0 for WITHOUT FUNCTION (binary-coercible) and
+	// WITH INOUT casts — the only forms this slice models. WITH FUNCTION casts
+	// reference a pg_proc OID and are deferred (dumpCast's findFuncByOid would need
+	// a matching pg_proc row).
+	FuncOID uint32
+	// Context is pg_cast.castcontext: 'e' explicit (default), 'a' assignment, 'i'
+	// implicit. dumpCast emits ` AS ASSIGNMENT` / ` AS IMPLICIT` for 'a' / 'i'.
+	Context string
+	// Method is pg_cast.castmethod: 'b' binary (WITHOUT FUNCTION), 'i' INOUT
+	// (WITH INOUT), 'f' function (WITH FUNCTION). dumpCast renders the matching
+	// `WITHOUT FUNCTION` / `WITH INOUT` / `WITH FUNCTION …` clause.
+	Method string
+}
+
+// RegisterCast records a user-defined cast, allocating a stable OID on first
+// sight. Idempotent: re-registering the same (source, target) pair refreshes the
+// context/method but keeps the OID. DU-002 slice 395.
+func (c *InMemory) RegisterCast(source, target, context, method string) *Cast {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		c.casts = make(map[string]*Cast)
+	}
+	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	if cs, ok := c.casts[key]; ok {
+		if context != "" {
+			cs.Context = context
+		}
+		if method != "" {
+			cs.Method = method
+		}
+		return cs
+	}
+	cs := &Cast{OID: c.allocOIDLocked(), SourceType: source, TargetType: target, Context: context, Method: method}
+	c.casts[key] = cs
+	return cs
+}
+
+// DropCast removes a user-defined cast from the registry. Returns true if found.
+// DU-002 slice 395.
+func (c *InMemory) DropCast(source, target string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		return false
+	}
+	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	if _, ok := c.casts[key]; ok {
+		delete(c.casts, key)
+		return true
+	}
+	return false
+}
+
+// ListCasts returns all registered user casts sorted by OID (stable creation
+// order). DU-002 slice 395.
+func (c *InMemory) ListCasts() []*Cast {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.casts) == 0 {
+		return nil
+	}
+	out := make([]*Cast, 0, len(c.casts))
+	for _, cs := range c.casts {
+		out = append(out, cs)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
 }
 
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>

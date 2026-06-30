@@ -3371,6 +3371,21 @@ documentation-only and is exempt from the design-doc requirement.)
       negative assertion scoped to the usercollcol block (collcol.b legitimately carries `COLLATE pg_catalog."POSIX"`).
       Deferred: bare-name resolution doesn't disambiguate same-named collations across schemas (dump-OID fidelity only;
       goopg does not actually collate); in-memory-registry/no-restart-persistence carry-forward from 389–393.
+
+      **2026-07-01 (loop #35, design 0110-0001 slice 395): a user-defined CAST round-trip — a NEW object family.** pg_dump's
+      `getCasts` reads all `pg_cast` rows (built-in casts excluded by OID at dump-out time via `selectDumpableCast`), then
+      `dumpCast` renders `CREATE CAST (<src> AS <tgt>) WITHOUT FUNCTION[ AS ASSIGNMENT|IMPLICIT];`. goopg previously had NO
+      CREATE CAST dispatch case — `parseCreate` fell through to its `expected TABLE, INDEX, …` error, rejecting the statement
+      outright. Three-layer fix: (parser) new `case "cast"` → `parseCreateCastTail` parses `(src AS tgt) {WITHOUT FUNCTION |
+      WITH INOUT | WITH FUNCTION …} [AS ASSIGNMENT|IMPLICIT]`, recording source/target (`ArgTypes`), castmethod
+      (`CastMethod` b/i/f) and castcontext (`CastContext` e/a/i) on a `CompatNoopStmt`; (executor) `execCompatNoop` `case
+      "cast"` calls `catalog.RegisterCast` for the binary/INOUT forms (castfunc=0), and DROP CAST calls `DropCast`; (catalog)
+      a `Cast` registry + `pg_cast` virtual view surfacing each cast, resolving type names to castsource/casttarget OIDs via
+      `TypeNameToOID` (text=25, bytea=17). Two `TestPort_PgDumpConnectionSetup` casts (`text→bytea` explicit;
+      `bytea→text` AS ASSIGNMENT), byte-identical vs real pg_dump 18.3 (reference /tmp/castpg). Deferred: WITH FUNCTION casts
+      parsed but not dumped (castfunc=0 — needs a pg_proc row for `dumpCast`'s findFuncByOid); only built-in binary-coercible
+      type pairs reachable (PG rejects composite/enum/array/domain WITHOUT FUNCTION, goopg cannot create base types);
+      bare/built-in TypeNameToOID only; in-memory registry (no restart persistence).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

@@ -156,6 +156,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return p.parseCreateTriggerTail(t.Pos, true)
 		}
 		return nil, p.errAtCur("expected TRIGGER after CREATE CONSTRAINT")
+	// CREATE CAST (source AS target) { WITHOUT FUNCTION | WITH INOUT |
+	//   WITH FUNCTION fn[(args)] } [ AS ASSIGNMENT | AS IMPLICIT ] — register in the
+	//   runtime pg_cast registry so pg_dump round-trips it. DU-002 slice 395.
+	case p.acceptIdentKeyword("cast"):
+		return p.parseCreateCastTail(t.Pos)
 	// CREATE AGGREGATE name (sfunc=F, basetype=T, stype=S [, ...]) — validate basetype.
 	// M0097-regress.
 	case p.acceptIdentKeyword("aggregate"):
@@ -704,6 +709,95 @@ func (p *parser) parseCreateTablespaceTail(pos int) (Stmt, error) {
 		}
 	}
 	return stmt, nil
+}
+
+// parseCastTypeName reads a (possibly schema-qualified, possibly multi-word)
+// type name in a CREATE/DROP CAST `(source AS target)` clause, stopping at the
+// AS keyword, a comma, or a closing/opening paren. CREATE CAST type names carry
+// no typmod, so the scan never has to balance parens. DU-002 slice 395.
+func (p *parser) parseCastTypeName() string {
+	var parts []string
+	for {
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			break
+		}
+		// AS separates source from target / introduces ASSIGNMENT|IMPLICIT; never
+		// part of a type name.
+		if tok.Kind == TokenKeyword && tok.Keyword == KwAs {
+			break
+		}
+		word := tok.Value
+		p.advance()
+		// schema-qualified: <schema>.<type>
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+			p.advance()
+			if nt := p.cur(); nt.Kind == TokenIdent || nt.Kind == TokenKeyword {
+				word = word + "." + nt.Value
+				p.advance()
+			}
+		}
+		parts = append(parts, word)
+		if p.cur().Kind == TokenSymbol && (p.cur().Value == ")" || p.cur().Value == "(" || p.cur().Value == ",") {
+			break
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// parseCreateCastTail picks up after "CREATE CAST". It parses the
+//
+//	(source AS target) { WITHOUT FUNCTION | WITH INOUT | WITH FUNCTION fn[(args)] }
+//	  [ AS ASSIGNMENT | AS IMPLICIT ]
+//
+// form, recording the source/target types, castmethod and castcontext on a
+// CompatNoopStmt so the executor registers the cast and pg_dump round-trips it
+// (pg_cast virtual view → getCasts/dumpCast). WITH FUNCTION is parsed but its
+// referenced function is not resolved (castfunc stays 0); that form is deferred.
+// DU-002 slice 395.
+func (p *parser) parseCreateCastTail(pos int) (Stmt, error) {
+	ns := &CompatNoopStmt{pos: pos, Tag: "CREATE CAST", ObjType: "cast"}
+	if !p.acceptSymbol("(") {
+		return nil, p.errSyntaxAtCur()
+	}
+	source := p.parseCastTypeName()
+	_ = p.acceptKeyword(KwAs)
+	target := p.parseCastTypeName()
+	_ = p.acceptSymbol(")")
+	ns.ArgTypes = []string{source, target}
+
+	// Coercion method. Default to binary so a malformed tail still produces a
+	// sane WITHOUT FUNCTION cast rather than nothing.
+	method := "b"
+	switch {
+	case p.acceptIdentKeyword("without"):
+		_ = p.acceptKeyword(KwFunction)
+		method = "b"
+	case p.acceptKeyword(KwWith):
+		if p.acceptKeyword(KwInout) {
+			method = "i"
+		} else {
+			_ = p.acceptKeyword(KwFunction)
+			method = "f"
+		}
+	}
+	ns.CastMethod = method
+
+	// Coercion context: `AS ASSIGNMENT` → 'a', `AS IMPLICIT` → 'i', absent → 'e'
+	// (explicit). The remaining tail (a WITH FUNCTION signature) is discarded by
+	// the skip-to-semicolon below.
+	context := "e"
+	if p.acceptKeyword(KwAs) {
+		switch {
+		case p.acceptIdentKeyword("assignment"):
+			context = "a"
+		case p.acceptIdentKeyword("implicit"):
+			context = "i"
+		}
+	}
+	ns.CastContext = context
+
+	return parseSkipToSemicolonHelper(p, ns)
 }
 
 // parseCreateAggregateTail picks up after "CREATE AGGREGATE".  It parses just

@@ -1896,6 +1896,14 @@ type CompatNoopStmt struct {
 	// Empty when the clause is absent. DU-002 slice 381.
 	ServerType    string
 	ServerVersion string
+	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
+	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
+	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
+	// "f" function (WITH FUNCTION). The executor records them in the catalog cast
+	// registry so pg_dump's getCasts/dumpCast re-emit the CREATE CAST. Empty when
+	// the statement is not a CREATE CAST. DU-002 slice 395.
+	CastContext string
+	CastMethod  string
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

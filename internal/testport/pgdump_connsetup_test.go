@@ -4998,6 +4998,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TABLE public.usercollcol (a text COLLATE public.usercoll, b text)"); err != nil {
 		t.Fatalf("create table usercollcol: %v", err)
 	}
+	// Slice 395: a user-defined CAST (`CREATE CAST (src AS tgt) WITHOUT FUNCTION`)
+	// must round-trip. pg_dump's getCasts reads ALL pg_cast rows (built-in casts
+	// are excluded by OID at dump-out time, so a no-user-cast cluster stays empty),
+	// then dumpCast renders `CREATE CAST (<src> AS <tgt>) WITHOUT FUNCTION[ AS
+	// ASSIGNMENT|IMPLICIT];`, recovering the type names via
+	// getFormattedTypeName(castsource/casttarget). goopg previously parsed CREATE
+	// CAST as an outright error (no dispatch case), so the catalog never saw it.
+	// The parser now records source/target + castcontext/castmethod on a
+	// CompatNoopStmt, the executor registers it in the catalog cast registry, and
+	// the pg_cast virtual view surfaces a dumpable row whose castsource/casttarget
+	// resolve to the canonical built-in pg_type OIDs (text=25, bytea=17). castfunc
+	// stays 0 (WITHOUT FUNCTION), so dumpCast skips findFuncByOid. The two casts
+	// exercise the default explicit context (no AS clause) and AS ASSIGNMENT.
+	// Verified byte-identical vs real pg_dump 18.3 (reference /tmp/castpg). WITH
+	// FUNCTION casts are deferred (need a pg_proc row for findFuncByOid).
+	if err := runSQLSimple(t, c, "CREATE CAST (text AS bytea) WITHOUT FUNCTION"); err != nil {
+		t.Fatalf("create cast text->bytea: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT"); err != nil {
+		t.Fatalf("create cast bytea->text: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7727,6 +7748,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 			if strings.Contains(block, "b text COLLATE") {
 				t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (usercollcol.b)\n  usercollcol block=%q", block)
+			}
+		}
+		// **Slice 395 (asserted):** user-defined casts (CREATE CAST … WITHOUT
+		// FUNCTION) must round-trip via getCasts → dumpCast. The explicit-context
+		// cast renders with no AS clause; the assignment cast appends AS ASSIGNMENT.
+		// Both byte-identical to real pg_dump 18.3. A regression that dropped the
+		// pg_cast registry surfacing (or mis-resolved the type OIDs) re-surfaces
+		// exactly here.
+		for _, want := range []string{
+			"CREATE CAST (text AS bytea) WITHOUT FUNCTION;",
+			"CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump missing user cast %q\n  full stdout=%q", want, res.Stdout)
 			}
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a

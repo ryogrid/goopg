@@ -9693,6 +9693,43 @@ different schemas are not disambiguated by the column's schema (acceptable for t
 not actually collate, so this is dump-OID fidelity only). The in-memory-registry / no-restart-persistence deferral from
 slices 389–393 still applies.
 
+### Slice 395 — **a user-defined CAST** (`CREATE CAST (text AS bytea) WITHOUT FUNCTION`)
+
+A new object family. pg_dump's `getCasts` reads **all** `pg_cast` rows (built-in casts are excluded at dump-out time by
+`selectDumpableCast`, which marks a cast `DUMP_COMPONENT_NONE` when its OID `<= g_last_builtin_oid`), then `dumpCast`
+renders `CREATE CAST (<src> AS <tgt>) WITHOUT FUNCTION[ AS ASSIGNMENT|IMPLICIT];`. The source/target type names are
+recovered client-side via `getFormattedTypeName(castsource/casttarget)`, so goopg only has to surface the right
+`pg_cast` row with the canonical built-in type OIDs; the `castfunc=0` path (WITHOUT FUNCTION / WITH INOUT) skips
+`findFuncByOid`.
+
+Before this slice goopg had **no** CREATE CAST dispatch case at all — `parseCreate` fell through to its
+`expected TABLE, INDEX, …` error, so the statement was rejected outright and never reached the catalog. The fix spans the
+three usual layers:
+
+- **parser** (`internal/parser/ddl.go`): a new `case p.acceptIdentKeyword("cast")` → `parseCreateCastTail`, which parses
+  `(source AS target) { WITHOUT FUNCTION | WITH INOUT | WITH FUNCTION … } [AS ASSIGNMENT | AS IMPLICIT]` and records the
+  source/target type names (`ArgTypes`), `castmethod` (`CastMethod`: `b`/`i`/`f`) and `castcontext` (`CastContext`:
+  `e`/`a`/`i`) on a `CompatNoopStmt`. A small `parseCastTypeName` helper reads a (schema-qualified, multi-word) type name,
+  stopping at `AS`/`)`/`,`.
+- **executor** (`internal/executor/operators_ddl.go`): a new `case "cast"` in `execCompatNoop` calls
+  `catalog.InMemory.RegisterCast(source, target, context, method)` for the binary/INOUT forms (`castfunc=0`); WITH FUNCTION
+  is skipped (its `castfunc` would need a real `pg_proc` row). `DROP CAST` now calls `DropCast` before falling through to
+  the PG-style "does not exist" error.
+- **catalog** (`internal/catalog/catalog.go`): a `Cast` registry (`RegisterCast`/`DropCast`/`ListCasts`, keyed on
+  `lower(source)\x00lower(target)` with a stable OID from `allocOIDLocked`), and the `pg_cast` virtual view now surfaces
+  each registered cast, resolving the type names to `castsource`/`casttarget` OIDs via `TypeNameToOID` (text=25, bytea=17).
+
+The `TestPort_PgDumpConnectionSetup` fixture creates `CREATE CAST (text AS bytea) WITHOUT FUNCTION` (explicit context, no
+AS clause) and `CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT`, asserting both render byte-identically vs
+real pg_dump 18.3 (reference `/tmp/castpg`).
+
+**Deferred** (ledger): WITH FUNCTION casts are parsed but not dumped (`castfunc` stays 0 — a faithful dump needs a
+`pg_proc` row so `dumpCast`'s `findFuncByOid` resolves the function and `format_function_signature` renders it). Only
+binary-coercible built-in type pairs are reachable (composite/enum/array/domain are rejected by PG's `CreateCast` for
+WITHOUT FUNCTION, and goopg cannot create base types), and `TypeNameToOID` resolves bare/built-in names only — a
+schema-qualified user type would fall back to `text`. The cast registry is in-memory (no restart persistence), matching
+the collation/foreign-server registries.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
