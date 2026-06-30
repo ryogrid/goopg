@@ -817,3 +817,111 @@ func TestProcACLRevokeFromOwner(t *testing.T) {
 		}
 	})
 }
+
+// TestTypeACLText pins the pg_type.typacl projection that the GRANT-on-TYPE
+// round-trip needs (M0119-0004-ACLHEAP). A type/domain's acldefault('T', owner)
+// is "{=U/postgres,postgres=U/postgres}" — owner AND PUBLIC both hold USAGE,
+// structurally identical to a function's EXECUTE default — so the recorder seeds
+// the PUBLIC entry explicitly and the owner entry is supplied by
+// ownerTypeACLString. pg_dump's getTypes diffs the materialized typacl against
+// acldefault('T', typowner) and re-emits the GRANT for the new grantee only.
+// Unlike proacl this text must additionally be written back into the heap-backed
+// pg_type row by the GRANT path; this test pins only the renderer half.
+func TestTypeACLText(t *testing.T) {
+	c := NewInMemory()
+	const typeOID = 16500 // a user type OID distinct from the routine/relation tests
+
+	// No grants → NULL typacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.TypeACLText(typeOID); got != "" {
+		t.Fatalf("typacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE … TO a grantee seeds the implicit PUBLIC default plus the
+	// grantee; the owner entry is rendered from the owner-default string. Grantees
+	// render in GRANT order (PUBLIC granted first, then grantee_ty) with the owner
+	// pulled to the head, mirroring the proacl projection.
+	c.GrantTablePrivilege(typeOID, "PUBLIC", "USAGE")
+	c.GrantTablePrivilege(typeOID, "grantee_ty", "USAGE")
+	want := "{postgres=U/postgres,=U/postgres,grantee_ty=U/postgres}"
+	if got := c.TypeACLText(typeOID); got != want {
+		t.Fatalf("typacl after GRANT USAGE TO grantee_ty = %q; want %q", got, want)
+	}
+
+	// A non-USAGE keyword is not a type privilege and renders nothing for that
+	// grantee (relaclTextLockedFor skips letters outside typeACLPrivOrder).
+	c.GrantTablePrivilege(typeOID, "noise_role", "SELECT")
+	if got := c.TypeACLText(typeOID); got != want {
+		t.Fatalf("typacl must ignore a non-type privilege: got %q; want %q", got, want)
+	}
+}
+
+// TestTypeACLGrantWithGrantOption pins the grant-option (`*`) projection for a
+// type-level GRANT … WITH GRANT OPTION. The grantee's USAGE is recorded with the
+// grant-option flag so typacl renders "grantee_ty=U*/postgres"; the implicit
+// owner/PUBLIC default entries stay plain (acldefault carries no grant option).
+func TestTypeACLGrantWithGrantOption(t *testing.T) {
+	c := NewInMemory()
+	const typeOID = 16501
+
+	c.GrantTablePrivilege(typeOID, "PUBLIC", "USAGE")
+	c.GrantTablePrivilegeWithGrantOption(typeOID, "grantee_ty", "USAGE", true)
+	want := "{postgres=U/postgres,=U/postgres,grantee_ty=U*/postgres}"
+	if got := c.TypeACLText(typeOID); got != want {
+		t.Fatalf("typacl after GRANT USAGE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+}
+
+// TestTypeACLRevokeFromPublic exercises the type-level REVOKE … FROM PUBLIC
+// primitive. A type's implicit default typacl grants USAGE to BOTH the owner and
+// PUBLIC; PostgreSQL leaves typacl NULL until the first GRANT/REVOKE. `REVOKE
+// USAGE … FROM PUBLIC` on a never-granted type materializes the owner's default
+// entry (the PUBLIC half is implicit and simply omitted once revoked), yielding
+// typacl = "{postgres=U/postgres}", which pg_dump diffs against acldefault('T',
+// 10) to emit `REVOKE ALL ON TYPE … FROM PUBLIC;`.
+func TestTypeACLRevokeFromPublic(t *testing.T) {
+	c := NewInMemory()
+	const typeOID = 16502
+
+	if got := c.TypeACLText(typeOID); got != "" {
+		t.Fatalf("typacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	c.MaterializeOwnerACL(typeOID, "postgres", []string{"USAGE"})
+	c.RevokeTablePrivilege(typeOID, "PUBLIC", "USAGE")
+	want := "{postgres=U/postgres}"
+	if got := c.TypeACLText(typeOID); got != want {
+		t.Fatalf("typacl after REVOKE USAGE FROM PUBLIC = %q; want %q", got, want)
+	}
+}
+
+// TestTypeACLRevokeFromOwner pins the owner-side type REVOKE. A type's
+// acldefault('T', owner) grants USAGE to BOTH the owner and PUBLIC, so revoking
+// the owner's implicit default leaves PUBLIC's entry behind ("{=U/postgres}"),
+// distinct from a relation whose default grants only the owner. Revoking BOTH
+// empties the array to "{}".
+func TestTypeACLRevokeFromOwner(t *testing.T) {
+	t.Run("owner_only_leaves_public", func(t *testing.T) {
+		c := NewInMemory()
+		const typeOID = 16503
+
+		c.MaterializeOwnerACL(typeOID, "postgres", []string{"USAGE"})
+		c.GrantTablePrivilege(typeOID, "PUBLIC", "USAGE")
+		c.RevokeTablePrivilege(typeOID, "postgres", "USAGE")
+		if want, got := "{=U/postgres}", c.TypeACLText(typeOID); got != want {
+			t.Fatalf("typacl after REVOKE USAGE FROM postgres = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("owner_and_public_empties", func(t *testing.T) {
+		c := NewInMemory()
+		const typeOID = 16504
+
+		c.MaterializeOwnerACL(typeOID, "postgres", []string{"USAGE"})
+		c.GrantTablePrivilege(typeOID, "PUBLIC", "USAGE")
+		c.RevokeTablePrivilege(typeOID, "postgres", "USAGE")
+		c.RevokeTablePrivilege(typeOID, "PUBLIC", "USAGE")
+		if want, got := "{}", c.TypeACLText(typeOID); got != want {
+			t.Fatalf("typacl after REVOKE USAGE FROM postgres,PUBLIC = %q; want %q", got, want)
+		}
+	})
+}

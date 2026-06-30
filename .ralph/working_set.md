@@ -1,30 +1,33 @@
-(idle — nothing in flight)
+Task: M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs.
+This loop (#84) landed the FIRST self-contained building block (step-2 renderer half),
+low blast radius, committed. The milestone continues — the heap-write half remains.
 
-Last landed: M0119-0004 **architectural finding** (loop #83, DOCUMENTATION — no code change).
-Closed the DU-002 ACL **GRANT round-trip** slice thread (330–356): it is COMPLETE for every
-object class goopg serves VIRTUALLY (table/sequence `relacl`, schema `nspacl`, function
-`proacl`). The three still-open cases (`typacl`, `attacl`, `datacl`) share ONE root cause,
-now documented in design `0119-0004-acl-grant-heap-vs-virtual-typacl.md`:
+LANDED loop #84 (renderer half of step 2, behaviour-neutral — no GRANT path calls it):
+  - `catalog.InMemory.TypeACLText(typeOID)` (internal/catalog/catalog.go) — pg_type
+    analogue of `ProcACLText`; delegates to `relaclTextLockedFor` with new
+    `typeACLPrivOrder = {USAGE/'U'}` + `ownerTypeACLString = "U"`. Added to `Catalog`
+    interface. `acldefault('T',owner) = {=U/owner,owner=U/owner}` == function EXECUTE
+    default shape, so machinery reused verbatim.
+  - Tests (internal/catalog/relacl_test.go): TestTypeACLText / …GrantWithGrantOption /
+    …RevokeFromPublic / …RevokeFromOwner — mirror ProcACL goldens with USAGE.
+  - Gates: `go build ./...` clean; full `internal/catalog` suite PASS; pgbench smoke =
+    pre-commit hook. Design `0119-0004-acl-grant-heap-vs-virtual-typacl.md` + fix_plan
+    updated with a Progress note (box stays UNCHECKED).
 
-  GRANT is recorded SERVER-SIDE (`internal/server/query.go:69-87`) with only the in-memory
-  ACL store in scope — NO executor `*Context`, so NO heap write. That works for the virtual
-  catalogs (pg_class/pg_namespace virtual builders + `pg_proc_view.go:388` project the ACL
-  live; `execCreateFunction` writes NO pg_proc heap row) but NOT for `pg_type` — the ONLY
-  user catalog written to REAL heap rows (`writeHeapRowCanonical` at CREATE TYPE/DOMAIN bakes
-  `typacl=NULL`) for M0097-0022 PG-standby compat. No virtual pg_type overlay → `getTypes`
-  reads NULL → `GRANT USAGE ON TYPE` is a silent no-op (`grant_ddl.go:137` bails). `attacl`
-  (pg_attribute heap) same; `datacl` same AND `--create`-only (untestable under `--no-create`).
-
-Files this loop: docs/design/0119-0004-acl-grant-heap-vs-virtual-typacl.md (new),
-docs/design/README.md (row 0119-0004bg), .ralph/fix_plan.md (ledger + new task
-M0119-0004-ACLHEAP), .ralph/deferral_ledger.md. Gates: `go build ./...` clean;
-`make ralph-state-guard` OK; pgbench smoke = pre-commit hook.
-
-NEXT (M0119-0004-ACLHEAP — the next REAL task, milestone-sized not a slice): route GRANT on a
-heap-backed object through `dispatchSimpleQueryViaExecutor` (Context in scope) + executor
-GRANT op that updates the ACL store AND re-syncs the pg_type heap `typacl` (mirror
-`deleteTypeFromCatalogHeap` delete+reinsert; new `TypeACLText` = `relaclTextLockedFor` over
-`{USAGE}`/`acldefault('T',owner)`); gates MUST include TestE2E_PhysicalReplication (standby
-reads pg_type) + TPC-H Q12/Q13 + pgbench. See the design doc §"Forward plan" for the full
-step list and the de-risking catalog accessors (LookupEnum/Domain/CompositeType ...ByOID).
-Alternatively pick a different open milestone (M0119-0005 pg_waldump server tier, etc.).
+NEXT (the high-blast-radius half — a dedicated full-gate loop, see design doc
+§"Forward plan" / §"Progress"):
+  1. Route GRANT/REVOKE ON TYPE/DOMAIN (and column-level) through
+     `dispatchSimpleQueryViaExecutor` (Context in scope) instead of the
+     `internal/server/query.go:69-87` server short-circuit. Keep the fast path for
+     the virtual classes (table/seq/schema/function).
+  2b. Executor GRANT op: update the OID-keyed ACL store (same calls as
+     `grant_ddl.go`) THEN re-sync the heap pg_type row — mirror
+     `deleteTypeFromCatalogHeap` (operators_ddl.go:10455) delete+reinsert via
+     `writeHeapRowCanonical`, filling `typacl` from the new `TypeACLText(oid)`.
+     Resolve TYPE/DOMAIN name→OID via LookupEnum/Domain/CompositeType(...ByOID).
+  3. `mirrorCatalogRelToPostgresDB(ctx, TypeRelationId)` for standby/basebackup.
+  4. Gates (MANDATORY): new DU-002 connsetup TYPE-grant slice (pg_dump stdout vs PG
+     18.3) + TestE2E_PhysicalReplication + TPC-H Q12/Q13 + pgbench + executor/catalog/
+     parser suites. Re-init data dir if pg_type row layout touched.
+`attacl` follows the same template (pg_attribute heap re-sync precedent: memory
+`pg_attribute_alter_needs_heap_resync`); `datacl` stays deferred (`--create`-only).

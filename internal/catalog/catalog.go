@@ -1778,6 +1778,14 @@ type Catalog interface {
 	// REVOKE recorder uses the NULL result to decide whether to expand the
 	// implicit acldefault('f', …) on the first mutation. DU-002 slice 347.
 	ProcACLText(procOID uint32) string
+	// TypeACLText renders the materialized pg_type.typacl text for a type/domain
+	// OID, or "" when typacl is still NULL (no GRANT/REVOKE recorded). A type's
+	// acldefault('T', owner) grants USAGE to BOTH the owner and PUBLIC, exactly
+	// like a function's EXECUTE default, so the projection is identical to
+	// ProcACLText with the USAGE privilege. Unlike proacl, pg_type is heap-backed
+	// (M0097-0022), so the GRANT path must re-sync this text into the heap row;
+	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
+	TypeACLText(typeOID uint32) string
 	// DropTableACL forgets all privileges recorded for relOID (called when the
 	// relation is dropped so a recycled OID does not inherit stale grants).
 	DropTableACL(relOID uint32)
@@ -8693,6 +8701,24 @@ var functionACLPrivOrder = []aclPrivLetter{
 // slice 345.
 const ownerFunctionACLString = "X"
 
+// typeACLPrivOrder lists the type/domain (pg_type) privileges in PostgreSQL's
+// canonical aclitemout order. A type has a single privilege, USAGE('U').
+// pg_dump's getTypes diffs a type's typacl against acldefault('T', typowner)
+// client-side in buildACLCommands and re-emits `GRANT … ON TYPE …`, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_type.typacl. M0119-0004-ACLHEAP.
+var typeACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+}
+
+// ownerTypeACLString is the privilege-letter string for the owner's full set of
+// type privileges, i.e. "U". The owner half of acldefault('T', owner) is
+// "postgres=U/postgres"; the other half is the implicit PUBLIC USAGE grant
+// ("=U/postgres"), which the type GRANT recorder seeds explicitly so a
+// materialized typacl reproduces both default entries — structurally identical
+// to the function EXECUTE default (ownerFunctionACLString). M0119-0004-ACLHEAP.
+const ownerTypeACLString = "U"
+
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
 // for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
@@ -8749,6 +8775,25 @@ func (c *InMemory) ProcACLText(procOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString)
+}
+
+// TypeACLText renders the materialized pg_type.typacl text for the type/domain
+// identified by typeOID, or "" (SQL NULL) when no privileges have been granted
+// away. Types share the OID-keyed ACL store with relations, schemas, and
+// routines (goopg mints type OIDs from a disjoint range, so there is no
+// collision). A type's acldefault('T', owner) is "{=U/owner,owner=U/owner}" —
+// owner AND PUBLIC both hold USAGE — so the type GRANT recorder seeds the PUBLIC
+// entry explicitly and the owner entry is supplied here by ownerTypeACLString
+// (the owner branch of relaclTextLockedFor), exactly as ProcACLText does for the
+// function EXECUTE default. pg_dump's getTypes diffs typacl against
+// acldefault('T', typowner) client-side in buildACLCommands, so projecting the
+// correct aclitem[] text is the renderer half of the `GRANT … ON TYPE …`
+// round-trip; the GRANT path must additionally re-sync this text into the
+// heap-backed pg_type row (M0119-0004-ACLHEAP, see design 0119-0004).
+func (c *InMemory) TypeACLText(typeOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString)
 }
 
 // relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it

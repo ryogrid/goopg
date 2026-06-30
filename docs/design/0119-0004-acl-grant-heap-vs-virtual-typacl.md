@@ -123,6 +123,32 @@ acquire heap-write capability:
    `internal/parser` suites; **TPC-H Q12/Q13 spot-check** and **pgbench smoke**
    (executor-path change). Re-init the data dir if the `pg_type` row layout is touched.
 
+### Progress — step 2 renderer landed (loop #84, 2026-06-30)
+
+The renderer half of step 2 is **in tree** as a self-contained, behaviour-neutral
+building block (no GRANT path calls it yet, so blast radius is nil):
+
+- `catalog.InMemory.TypeACLText(typeOID)` (`internal/catalog/catalog.go`) — the
+  pg_type analogue of `ProcACLText`, delegating to the object-agnostic
+  `relaclTextLockedFor` with the new `typeACLPrivOrder = {USAGE/'U'}` and
+  `ownerTypeACLString = "U"`. A type's `acldefault('T', owner)` =
+  `{=U/owner,owner=U/owner}` (owner + PUBLIC both hold USAGE) is structurally
+  identical to the function `EXECUTE` default, so the projection reuses the proven
+  proacl machinery verbatim. Added to the `Catalog` interface.
+- Unit tests (`internal/catalog/relacl_test.go`): `TestTypeACLText`,
+  `TestTypeACLGrantWithGrantOption`, `TestTypeACLRevokeFromPublic`,
+  `TestTypeACLRevokeFromOwner` — mirror the ProcACL goldens with USAGE, pinning
+  NULL→materialize, grant-option `*`, REVOKE-FROM-PUBLIC, and owner-side REVOKE
+  (leaves `{=U/postgres}` / empties to `{}`).
+
+**Remaining for M0119-0004-ACLHEAP** (the high-blast-radius half — still a dedicated
+full-gate loop): steps 1 (route GRANT/REVOKE on a heap-backed object through
+`dispatchSimpleQueryViaExecutor`), 2b (the executor GRANT op that calls
+`TypeACLText` and re-syncs the `pg_type` heap row via the
+`deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` template), 3 (mirror to the
+postgres DB), and 4 (the DU-002 connsetup slice + `TestE2E_PhysicalReplication` +
+TPC-H Q12/Q13 + pgbench gates).
+
 Catalog accessors that already exist and de-risk step 2: `LookupEnum`/`LookupEnumByOID`
 (`catalog.go:9803/9816`), `LookupCompositeType`/`...ByOID` (`10097/10108`),
 `LookupDomain`/`...ByOID` (`10215/10238`) — a `lookupTypeOID(name)` can resolve a

@@ -3003,6 +3003,17 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestE2E_PhysicalReplication`/recovery testport (standby reads pg_type) + TPC-H
       Q12/Q13 + full executor/catalog/parser suites + pgbench. `datacl` stays deferred
       (`--create`-only; untestable under the current harness).
+      **2026-06-30 (loop #84) — renderer building block LANDED (low blast, no GRANT
+      path calls it yet):** `catalog.InMemory.TypeACLText(typeOID)` (the pg_type
+      analogue of `ProcACLText`) + `typeACLPrivOrder = {USAGE/'U'}` +
+      `ownerTypeACLString = "U"`, added to the `Catalog` interface. A type's
+      `acldefault('T', owner) = {=U/owner,owner=U/owner}` (owner + PUBLIC USAGE) is
+      structurally identical to the function EXECUTE default, so the projection reuses
+      `relaclTextLockedFor` verbatim. Unit tests `TestTypeACLText` /
+      `…GrantWithGrantOption` / `…RevokeFromPublic` / `…RevokeFromOwner` mirror the
+      ProcACL goldens. Box stays unchecked: the high-blast-radius half (dispatch
+      reroute + heap re-sync + the full gate set) is still a dedicated loop. Design
+      doc updated with a "Progress" section.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
