@@ -3106,6 +3106,20 @@ documentation-only and is exempt from the design-doc requirement.)
       vs real pg_dump 18.3 (oracle-verified). Tests slice-369 `trg_narg` `TestPort_PgDumpConnectionSetup`
       + extended `TestParseCreateTriggerFuncArgs` (int/float/ident/string). **Deferred (ledger):** int
       canonicalisation covers Go-int range only (PG rejects larger first → fallback unreachable).
+      **2026-06-30 (loop #9, design 0110-0001 slice 370): `COMMENT ON TRIGGER <name> ON <table>`
+      round-trip (PRODUCTION fix).** PG stores a trigger comment in pg_description keyed
+      `(classoid=pg_trigger=2620, objoid=trig.oid, objsubid=0)`; pg_dump's `dumpTrigger`
+      (pg_dump.c:19251) calls `dumpComment` so a dump re-emits `COMMENT ON TRIGGER … ON … IS '...';`.
+      `parseCommentOnTail` had no TRIGGER branch → the statement fell to the unsupported-default arm and
+      the server silently swallowed it (comment never reached pg_description). Added the parser branch
+      (captures `TRIGGER <name> ON [schema.]table`, the same `<name> ON <table>` shape as COMMENT ON
+      CONSTRAINT) + `execCommentOn` `case "trigger"` (`LookupTable`→`Table.Triggers`→`SetComment(2620,
+      trig.OID, 0, desc)`). pg_trigger already surfaces each user trigger with oid/tableoid=2620 (slice
+      319) and pg_dump's collectComments reads the keyed row — no catalog-query change. Byte-identical vs
+      real pg_dump 18.3. Tests `TestParseCommentOnTrigger` (parser) + slice-370 `trg_biu` trigger-comment
+      line in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** restart persistence (in-memory
+      pg_description); COMMENT ON {RULE,POLICY,COLLATION,LANGUAGE,DATABASE,EXTENSION} still dropped (no
+      parser branch — sibling slices).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

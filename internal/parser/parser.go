@@ -2568,6 +2568,27 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptKeyword(KwTrigger):
+		// COMMENT ON TRIGGER <name> ON [schema.]table IS '...'. Triggers live in
+		// pg_trigger (classoid 2620); pg_dump's dumpTrigger re-emits
+		// `COMMENT ON TRIGGER <name> ON <table> IS '...'`. The shape mirrors
+		// COMMENT ON CONSTRAINT — a bare trigger name followed by ON <table>.
+		// DU-002 slice 370.
+		cs.ObjKind = "trigger"
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, true, p.errAtCur("expected trigger name")
+		}
+		cs.SubName = tok.Value
+		p.advance()
+		if !p.acceptKeyword(KwOn) {
+			return nil, true, p.errAtCur("expected ON after trigger name in COMMENT ON TRIGGER")
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptIdentKeyword("statistics"):
 		// COMMENT ON STATISTICS name IS '...'. M0097-0023.
 		cs.ObjKind = "statistics"

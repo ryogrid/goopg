@@ -12951,6 +12951,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgConstraint   = 2606 // pg_constraint
 		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
+		oidPgTrigger      = 2620 // pg_trigger
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13042,6 +13043,23 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		for _, fk := range tbl.ForeignKeys {
 			if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
 				im.SetComment(oidPgConstraint, fk.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "trigger":
+		// Triggers live in pg_trigger (classoid 2620). pg_dump's dumpTrigger keys
+		// the comment lookup on the trigger's catalogId.tableoid (pg_trigger =
+		// 2620) and objsubid 0, then re-emits `COMMENT ON TRIGGER <name> ON
+		// <table> IS '...'`. Resolve the trigger by name on the named table.
+		// Without this a COMMENT ON TRIGGER was silently swallowed (parser dropped
+		// it) and never reached pg_description. DU-002 slice 370.
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, trig := range tbl.Triggers {
+			if strings.EqualFold(trig.Name, s.SubName) && trig.OID != 0 {
+				im.SetComment(oidPgTrigger, trig.OID, 0, s.Description)
 				return nil
 			}
 		}

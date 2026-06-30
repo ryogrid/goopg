@@ -9025,6 +9025,27 @@ byte-identical vs real pg_dump 18.3.
 out-of-range before this point, so the raw-lexeme fallback is unreachable in practice). Restart persistence remains the usual
 in-memory-catalog gap shared by all trigger slices.
 
+### Slice 370 — **`COMMENT ON TRIGGER <name> ON <table>`** round-trip (PRODUCTION fix)
+
+PostgreSQL stores a trigger comment in `pg_description` keyed by `(classoid=pg_trigger=2620, objoid=trigger_oid, objsubid=0)`,
+and pg_dump's `dumpTrigger` (pg_dump.c:19251) calls `dumpComment(fout, "TRIGGER <name> ON", qtabname, …, tginfo->dobj.catId, 0,
+…)` so a dumped schema re-emits `COMMENT ON TRIGGER <name> ON <schema>.<table> IS '...';`. goopg's `parseCommentOnTail` had no
+`TRIGGER` branch, so the statement fell through to the unsupported-default arm and the server silently swallowed it — the comment
+never reached `pg_description` and pg_dump emitted nothing.
+
+This slice adds the missing branch. The parser captures `TRIGGER <name> ON [schema.]table` (the exact shape pg_dump emits, the
+same `<name> ON <table>` structure as `COMMENT ON CONSTRAINT`): the trigger name into `CommentOnStmt.SubName`, the ON-table into
+`ObjName`, `ObjKind="trigger"`. `execCommentOn` resolves the trigger by name on the named table (`LookupTable` →
+`Table.Triggers`) and stores the description via `SetComment(2620, trig.OID, 0, desc)`. The pg_trigger relation already surfaces
+each user trigger with `oid`/`tableoid=2620` (slice 319), and pg_dump's `collectComments` reads the keyed `pg_description` row,
+so no catalog-query change was needed. Covered by `TestParseCommentOnTrigger` (parser) and the `trg_biu` trigger-comment line in
+`TestPort_PgDumpConnectionSetup`. Verified byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** restart persistence remains the usual in-memory-catalog gap (the comment lives in the runtime
+`pg_description` store, not an on-disk catalog). Other `COMMENT ON` targets PG supports but goopg still drops — `RULE`, `POLICY`,
+`COLLATION`, `LANGUAGE`, `DATABASE`, `EXTENSION` — remain unported (no parser branch); each is a sibling slice when its object
+type becomes dumpable.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
