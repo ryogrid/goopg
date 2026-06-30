@@ -7384,7 +7384,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if nc.OID == 0 || nc.OID != targetOID {
 						continue
 					}
-					def := "CHECK ((" + nc.Expr + "))"
+					def := renderCheckPredicate(nc.Expr)
 					if nc.NoInherit {
 						def += " NO INHERIT"
 					}

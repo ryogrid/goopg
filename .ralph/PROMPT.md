@@ -111,6 +111,27 @@ the test suite is happy.
 5. **After codec/format changes**: re-run the full regress-port suite; 6 silent
    regressions escaped this way once (M0106).
 
+## ⚠️ Memory Guard (OOM protection — a heavy process may be SIGKILLed)
+A resident watchdog (`~/.ralph/mem_guard.py`, one instance per `ralph_loop.sh`
+run, started automatically by the loop) protects the host from kernel OOM events
+that have crashed this WSL2 environment. Every few seconds it sums the **RSS +
+swap** of the loop's descendant processes **excluding the `claude` agent and its
+MCP/helper infra** (serena, the MCP servers, the guard itself). When that sum
+exceeds **70% of (physical RAM + swap)** it sends `kill -KILL` to the **single
+heaviest** unprotected process — almost always a runaway `go test`/build/`goopg`
+server/`pgbench`.
+
+What this means for you:
+- A build or test process that dies abruptly (signal 9 / "Killed", no panic, no
+  assertion) **may be the memory guard relieving pressure, not a product bug** —
+  check `~/.ralph/logs/mem_guard.log` for a `PRESSURE …` line before debugging.
+- Keep test/build memory bounded so you never trip it: run server/benchmark
+  workloads through the cgroup-cap wrapper (`scripts/goopg-test-run.sh`, see
+  Hard-won Rule #3), avoid unbounded `go test ./...` fan-out (cap `-p`/`-parallel`
+  on big packages), and don't generate oversized data sets in-process.
+- The guard never targets `claude` or the MCP servers, so your agent session and
+  its tools are not at risk — only the workload processes it spawns.
+
 ## Protected Files (DO NOT MODIFY)
 The following files and directories are part of Ralph's infrastructure.
 NEVER delete, move, rename, or overwrite these under any circumstances:

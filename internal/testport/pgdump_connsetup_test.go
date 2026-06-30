@@ -670,6 +670,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TABLE public.chk3 (z integer, CONSTRAINT chk3_pos CHECK (z > 0) NO INHERIT)"); err != nil {
 		t.Fatalf("create table chk3: %v", err)
 	}
+	// Slice 362: a COMPOUND or function-call table-level CHECK predicate must
+	// round-trip with PostgreSQL's per-node parenthesization, not goopg's legacy
+	// token-text wrap. goopg stores a CHECK body as token-reconstructed raw text
+	// (parser.parseCheckExpr); the dump path wrapped it as `CHECK ((<raw>))`, which
+	// is byte-correct ONLY for a single bare comparison. For a boolean combination
+	// PG re-deparses each operand with its own parens (`a > 0 AND b > 0` →
+	// `CHECK (((a > 0) AND (b > 0)))`), and a function call must lose the spaces the
+	// token join inserts around parentheses (`length(name) > 0` →
+	// `CHECK ((length(name) > 0))`). renderCheckPredicate (operators_ddl.go) now
+	// re-parses the raw text and deparses it through defaultExprToSQL — the same
+	// fully-parenthesizing renderer the index-predicate / expression-index /
+	// partition-key paths use — reproducing PG's bytes; the single outer paren layer
+	// comes from the `CHECK (%s)` wrapper (defaultExprToSQL already parenthesizes the
+	// top-level OpExpr/BoolExpr). The single-comparison slices 127–129 are unchanged
+	// (`a < b` still deparses to `(a < b)` → `CHECK ((a < b))`). Auto-naming already
+	// matches PG (autoCheckName counts distinct columns via ParseExpr): the
+	// two-column `chkand`/`chkor` get the table-only name, the one-column `chkfn` the
+	// column-qualified name. Each on its own table so existing CHECK asserts are
+	// untouched. Verified byte-identical to real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chkand (a integer, b integer, CHECK (a > 0 AND b > 0))"); err != nil {
+		t.Fatalf("create table chkand: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chkor (a integer, b integer, CHECK (a < 0 OR b > 10))"); err != nil {
+		t.Fatalf("create table chkor: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chkfn (name text, CHECK (length(name) > 0))"); err != nil {
+		t.Fatalf("create table chkfn: %v", err)
+	}
 
 	// Slice 54: a non-empty reloptions (`WITH (fillfactor=70)`) must surface in
 	// the dump. Slice 47 made an EMPTY reloptions read as SQL NULL (no WITH
@@ -7343,6 +7371,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// its user-given name AND re-emit the ` NO INHERIT` suffix; the
 			// PartitionCheckConstraint per-constraint flag was previously absent.
 			"CONSTRAINT chk3_pos CHECK ((z > 0)) NO INHERIT",
+			// **Slice 362:** a compound/function-call table-level CHECK round-trips
+			// with PG's per-node parenthesization. `a > 0 AND b > 0` deparses each
+			// operand with its own parens; `length(name) > 0` drops the spaces the
+			// token reconstruction inserts around the call's parens. The legacy
+			// `CHECK ((<raw>))` wrap produced `CHECK ((a > 0 AND b > 0))` and
+			// `CHECK ((length ( name ) > 0))` — both byte-divergences from real pg_dump.
+			"CONSTRAINT chkand_check CHECK (((a > 0) AND (b > 0)))",
+			"CONSTRAINT chkor_check CHECK (((a < 0) OR (b > 10)))",
+			"CONSTRAINT chkfn_name_check CHECK ((length(name) > 0))",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
@@ -7391,6 +7428,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// before `);`), silently changing its inheritance semantics on restore.
 		if strings.Contains(res.Stdout, "CONSTRAINT chk2_y_check CHECK ((y > 0))\n") {
 			t.Errorf("pg_dump dropped NO INHERIT from an anonymous CHECK\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 362 negative guards: the legacy token-text wrap would emit the
+		// un-parenthesized compound predicate and the space-padded function call;
+		// either is a byte-divergence that would re-parse with different precedence.
+		for _, neg := range []string{
+			"CHECK ((a > 0 AND b > 0))",
+			"CHECK ((a < 0 OR b > 10))",
+			"length ( name )",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted the legacy token-text CHECK wrap: %q\n  full stdout=%q", neg, res.Stdout)
+			}
 		}
 		// Slice 129 negative guard: dropping the per-constraint flag on the named
 		// path would render chk3_pos as a plain inheritable CHECK (terminated by a

@@ -3663,6 +3663,37 @@ func defaultExprToSQL(e parser.Expr) string {
 	return fmt.Sprintf("%v", e)
 }
 
+// renderCheckPredicate produces the `CHECK (<expr>)` text for a table-level CHECK
+// constraint, mirroring pg_get_constraintdef_worker (ruleutils.c). PostgreSQL
+// re-deparses the stored constraint node (pg_constraint.conbin) via get_rule_expr,
+// which fully parenthesizes every sub-expression: a compound predicate like
+// `a > 0 AND b > 0` dumps as `CHECK (((a > 0) AND (b > 0)))` and a function call
+// like `length(name) > 0` as `CHECK ((length(name) > 0))`. goopg stores the CHECK
+// body as token-reconstructed raw text (parser.parseCheckExpr), so the legacy
+// `CHECK ((<raw>))` wrap only matched PG for a single bare comparison; anything
+// compound (AND/OR) or carrying a function call diverged on PG's per-node
+// parenthesization (and on the spaces the token join inserts around parentheses).
+// Re-parse the raw text and deparse it through defaultExprToSQL — the same
+// fully-parenthesizing renderer the index-predicate, expression-index and
+// partition-key paths use — which reproduces PG's bytes for every expression form
+// it handles; the single outer paren layer is supplied by the `CHECK (%s)` wrapper
+// because defaultExprToSQL already parenthesizes the top-level OpExpr/BoolExpr (so
+// a single comparison still renders the byte-identical `CHECK ((a < b))`). Guard
+// with a re-parse round-trip: if the raw text fails to parse, or the deparsed form
+// is not itself re-parseable (defaultExprToSQL hit a node it cannot render and fell
+// through to its Go-value fallback), keep the legacy double-paren raw wrap so we
+// never emit non-SQL garbage. DU-002 slice 362.
+func renderCheckPredicate(rawExpr string) string {
+	if e, err := parser.ParseExpr(rawExpr); err == nil {
+		if deparsed := defaultExprToSQL(e); deparsed != "" {
+			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				return "CHECK (" + deparsed + ")"
+			}
+		}
+	}
+	return "CHECK ((" + rawExpr + "))"
+}
+
 // execCreateView registers a view in the catalog. Column
 // types default to `unknown` because v0 doesn't run the
 // type-inference pass against the inner SELECT during DDL —

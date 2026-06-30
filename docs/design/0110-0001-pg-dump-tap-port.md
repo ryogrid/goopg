@@ -8815,6 +8815,43 @@ plus a contrast plain-btree case).
 > connsetup harness dumps in the same session as the CREATE, so this slice round-trips; durable `pg_am`/`pg_index`
 > access-method persistence is the same shared-catalog runtime-write gap that blocks the other restart-durability slices.
 
+### Slice 362 — **compound / function-call table CHECK** `CHECK (a > 0 AND b > 0)` → `CHECK (((a > 0) AND (b > 0)))` (PRODUCTION fix)
+
+goopg stores a CHECK constraint body as token-reconstructed raw text (`parser.parseCheckExpr` joins the lexed tokens with
+single spaces and re-quotes string literals). The dump path — the `pg_get_constraintdef` branch over a table's
+`NamedChecks` in `internal/executor/expr.go` — wrapped that raw text as `CHECK ((<raw>))`. That double-paren wrap is
+byte-correct **only** for a single bare comparison (`a < b` → `CHECK ((a < b))`, matching slices 127–129), because
+PostgreSQL's `pg_get_constraintdef_worker` re-deparses the stored node (`pg_constraint.conbin`) with `get_rule_expr`,
+which fully parenthesizes **every** sub-expression:
+
+- `CHECK (a > 0 AND b > 0)` → `CHECK (((a > 0) AND (b > 0)))` — each boolean operand carries its own parens;
+- `CHECK (a < 0 OR b > 10)` → `CHECK (((a < 0) OR (b > 10)))`;
+- `CHECK (length(name) > 0)` → `CHECK ((length(name) > 0))` — no padding spaces around the call's parentheses (the token
+  join would have emitted `length ( name )`).
+
+All three forms were verified byte-identical against a throwaway PG 18.3 cluster. Before this slice the legacy wrap
+emitted `CHECK ((a > 0 AND b > 0))` / `CHECK ((length ( name ) > 0))` — divergences that re-parse with different operator
+precedence on restore.
+
+The fix is `renderCheckPredicate` (`internal/executor/operators_ddl.go`): re-parse the raw text with `parser.ParseExpr`
+and deparse it through `defaultExprToSQL` — the same fully-parenthesizing renderer the index-predicate, expression-index
+and partition-key paths already use — then wrap once as `CHECK (%s)` (the single outer paren layer is supplied here
+because `defaultExprToSQL` already parenthesizes the top-level OpExpr/BoolExpr). A re-parse round-trip guards the change:
+if the raw text fails to parse, or the deparsed string is not itself re-parseable (the renderer hit a node it cannot
+render and fell through to its Go-value fallback), the legacy `CHECK ((<raw>))` wrap is kept so the dump never emits
+non-SQL garbage. Auto-naming already matched PG (`autoCheckName` counts distinct columns via `ParseExpr`, mirroring
+`pull_var_clause`): the two-column `chkand`/`chkor` get the table-only `<table>_check` name, the one-column `chkfn` the
+column-qualified `chkfn_name_check`. Fixtures `chkand`/`chkor`/`chkfn` in `TestPort_PgDumpConnectionSetup` (slice 362) +
+unit `TestRenderCheckPredicate`/`TestRenderCheckPredicateFallback` (executor pkg).
+
+> **Deferred (ledgered):** **domain CHECK predicates** (`pg_get_constraintdef` over `AllDomains()`, same file) still use
+> the legacy `CHECK ((<raw>))` wrap and would diverge identically for a compound/function-call domain CHECK; they were
+> left out of scope because the domain path also carries the elaborate `VALUE IN (...)` ScalarArrayOp renderer and the
+> `VALUE` keyword, so converting it needs its own slice. **Type-blind literal casts** inside a CHECK (the same gap as the
+> expression-index slice 360(a): `name || '_x'` dumps `'_x'` not `'_x'::text`) remain — `defaultExprToSQL` has no operand
+> type in scope, so a CHECK carrying an unknown-type literal in an operator argument would still byte-diverge and is kept
+> on the legacy fallback by the re-parse guard.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
