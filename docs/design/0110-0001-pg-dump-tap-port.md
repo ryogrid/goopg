@@ -9495,6 +9495,25 @@ Covered by the new `TestParseCommentOnServer` parser pin plus a `COMMENT ON SERV
 fixture/assertion in `TestPort_PgDumpConnectionSetup` (`goopg_srv` is the bare foreign server from slice 376), verified
 byte-identical against real pg_dump 18.3.
 
+### Slice 387 — **COMMENT ON FOREIGN DATA WRAPPER round-trip** (parser + executor gap)
+
+The sibling of slice 386. A foreign-data wrapper (`pg_foreign_data_wrapper`, classoid 2328) can carry a comment. pg_dump's
+`dumpForeignDataWrapper` calls `dumpComment` with the FDW's `catalogId` (`tableoid=2328`, `objsubid=0`), finds the
+`pg_description` row, and re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. goopg's `parseCommentOnTail` had no
+`FOREIGN DATA WRAPPER` branch, so the statement fell through to the COMMENT fallback and was silently swallowed — the comment
+never reached `pg_description`, and pg_dump could not re-emit it.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptKeyword(KwForeign)` arm that consumes the `DATA WRAPPER` ident-keyword
+  pair (errors if absent), sets `ObjKind="foreign data wrapper"`, and parses a bare (schema-less) object name — FDWs are
+  top-level objects. `FOREIGN` is a reserved keyword (`KwForeign`); `DATA`/`WRAPPER` are unreserved ident-keywords.
+- **`executor.execCommentOn`** adds a `"foreign data wrapper"` case: it resolves the FDW OID via
+  `catalog.InMemory.ForeignDataWrapperOID(name)` and stores the description under `pg_foreign_data_wrapper` (classoid 2328,
+  objsubid 0) via `SetComment`. A new `oidPgFdw = 2328` classoid constant joins the existing block.
+
+Covered by the new `TestParseCommentOnForeignDataWrapper` parser pin plus a
+`COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'` fixture/assertion in `TestPort_PgDumpConnectionSetup`
+(`goopg_fdw` is the bare FDW from slice 375), verified byte-identical against real pg_dump 18.3.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

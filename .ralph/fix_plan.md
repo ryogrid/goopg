@@ -3271,6 +3271,17 @@ documentation-only and is exempt from the design-doc requirement.)
       `catalog.InMemory.ForeignServerOID` and stores the comment under classoid 1417 (new `oidPgForeignSrv` constant).
       Tests new `TestParseCommentOnServer` (parser) + `COMMENT ON SERVER goopg_srv IS 'a server comment'` fixture/assert
       in `TestPort_PgDumpConnectionSetup` (byte-identical vs pg_dump 18.3). No new deferral.
+
+      **2026-07-01 (loop #27, design 0110-0001 slice 387): COMMENT ON FOREIGN DATA WRAPPER round-trip** (sibling of
+      slice 386). A foreign-data wrapper (`pg_foreign_data_wrapper`, classoid 2328) can carry a comment; pg_dump's
+      `dumpForeignDataWrapper` re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. goopg's `parseCommentOnTail`
+      had no FOREIGN DATA WRAPPER branch, so the statement was silently swallowed and never reached `pg_description`.
+      Added a `case p.acceptKeyword(KwForeign)` arm to `parseCommentOnTail` (consumes the DATA WRAPPER ident-keyword pair;
+      `ObjKind="foreign data wrapper"`, bare schema-less name) and a `"foreign data wrapper"` case to `execCommentOn` that
+      resolves the FDW OID via `catalog.InMemory.ForeignDataWrapperOID` and stores the comment under classoid 2328 (new
+      `oidPgFdw` constant). Tests new `TestParseCommentOnForeignDataWrapper` (parser) +
+      `COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'` fixture/assert in `TestPort_PgDumpConnectionSetup`
+      (byte-identical vs pg_dump 18.3). No new deferral.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

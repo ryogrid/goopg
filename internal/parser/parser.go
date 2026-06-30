@@ -2708,6 +2708,22 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptKeyword(KwForeign):
+		// COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'. Foreign-data wrappers
+		// live in pg_foreign_data_wrapper (classoid 2328); pg_dump's
+		// dumpForeignDataWrapper re-emits `COMMENT ON FOREIGN DATA WRAPPER <name>
+		// IS '...'`. FOREIGN is a reserved keyword (KwForeign); DATA and WRAPPER
+		// are unreserved ident-keywords. An FDW is a top-level object (no schema),
+		// so parse a bare name. DU-002 slice 387.
+		if !p.acceptIdentKeyword("data") || !p.acceptIdentKeyword("wrapper") {
+			return nil, true, p.errAtCur("expected DATA WRAPPER after FOREIGN in COMMENT ON")
+		}
+		cs.ObjKind = "foreign data wrapper"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptKeyword(KwFunction):
 		// COMMENT ON FUNCTION [schema.]name([argtypes]) IS '...'. Functions live
 		// in pg_proc (classoid 1255); pg_dump re-emits `COMMENT ON FUNCTION …`

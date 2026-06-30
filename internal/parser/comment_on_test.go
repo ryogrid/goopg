@@ -225,3 +225,42 @@ func TestParseCommentOnServer(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCommentOnForeignDataWrapper covers COMMENT ON FOREIGN DATA WRAPPER,
+// the sibling of COMMENT ON SERVER. FOREIGN is a reserved keyword and DATA/
+// WRAPPER are unreserved ident-keywords; an FDW is a top-level (schema-less)
+// object. DU-002 slice 387.
+func TestParseCommentOnForeignDataWrapper(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantName string
+	}{
+		{"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'", "goopg_fdw"},
+		{"COMMENT ON FOREIGN DATA WRAPPER my_fdw IS 'c'", "my_fdw"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "foreign data wrapper" {
+			t.Errorf("%q: ObjKind=%q, want foreign data wrapper", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != "" {
+			t.Errorf("%q: ObjName.Schema=%q, want empty (FDW is schema-less)", tc.sql, cs.ObjName.Schema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}

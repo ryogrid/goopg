@@ -5402,6 +5402,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `COMMENT ON SERVER <name> IS '...'`. goopg_srv is the bare foreign server
 		// created in slice 376.
 		"COMMENT ON SERVER goopg_srv IS 'a server comment'",
+		// Slice 387: COMMENT ON FOREIGN DATA WRAPPER must survive the dump, the
+		// sibling of COMMENT ON SERVER. Before this slice, parseCommentOnTail had
+		// no FOREIGN DATA WRAPPER branch, so the statement was silently swallowed
+		// and the comment never reached pg_description. The parser now recognises
+		// `FOREIGN DATA WRAPPER <name>` (FOREIGN is a reserved keyword, DATA/WRAPPER
+		// are ident-keywords; a top-level, schema-less object), and execCommentOn
+		// resolves the FDW by name (catalog ForeignDataWrapperOID) and keys it under
+		// pg_foreign_data_wrapper (classoid 2328, objsubid 0). pg_dump's
+		// dumpForeignDataWrapper calls dumpComment with the FDW's catalogId
+		// (tableoid=2328), finds the pg_description row, and re-emits
+		// `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. goopg_fdw is the bare
+		// foreign-data wrapper created in slice 375.
+		"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -7888,6 +7901,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// dumpComment with the server's catalogId (tableoid=1417) and re-emits
 			// the line below.
 			"COMMENT ON SERVER goopg_srv IS 'a server comment';",
+			// **Slice 387 (asserted):** COMMENT ON FOREIGN DATA WRAPPER must
+			// round-trip, the sibling of COMMENT ON SERVER. It was silently
+			// swallowed (parser had no FOREIGN DATA WRAPPER branch). The parser now
+			// captures `FOREIGN DATA WRAPPER <name>` and execCommentOn keys the
+			// comment under pg_foreign_data_wrapper (classoid 2328). pg_dump's
+			// dumpForeignDataWrapper calls dumpComment with the FDW's catalogId
+			// (tableoid=2328) and re-emits the line below.
+			"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

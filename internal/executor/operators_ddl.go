@@ -13056,6 +13056,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgPolicy       = 3256 // pg_policy
 		oidPgRewrite      = 2618 // pg_rewrite: query-rewrite rules
 		oidPgForeignSrv   = 1417 // pg_foreign_server: foreign servers
+		oidPgFdw          = 2328 // pg_foreign_data_wrapper: foreign-data wrappers
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13109,6 +13110,19 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgForeignSrv, oid, 0, s.Description)
+	case "foreign data wrapper":
+		// Foreign-data wrappers live in pg_foreign_data_wrapper (classoid 2328).
+		// pg_dump's dumpForeignDataWrapper keys the comment lookup on the FDW's
+		// catalogId (tableoid=pg_foreign_data_wrapper=2328) and objsubid 0, then
+		// re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. Without this
+		// a COMMENT ON FOREIGN DATA WRAPPER was silently swallowed (parser dropped
+		// it) and never reached pg_description, so pg_dump could not re-emit it.
+		// DU-002 slice 387.
+		oid := im.ForeignDataWrapperOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgFdw, oid, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {
