@@ -2894,3 +2894,58 @@ func TestToastVacuumIndexCleanupInvalidRejected(t *testing.T) {
 		t.Errorf("toast.vacuum_index_cleanup=OFF: unexpected error %v", err)
 	}
 }
+
+// TestViewCheckOptionSurfacesInPgClassReloptions verifies that a view's
+// `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
+// `check_option=<mode>` pg_class.reloption — the form pg_dump's getTables
+// reads (it strips that element via array_remove and re-emits the
+// `WITH <MODE> CHECK OPTION` view suffix). A bare `WITH CHECK OPTION`
+// defaults to cascaded; an explicit `WITH LOCAL CHECK OPTION` records local;
+// a plain view carries no reloptions. M0119-0004 (DU-002 slice 365).
+func TestViewCheckOptionSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE cobase (id integer PRIMARY KEY, q integer)`); err != nil {
+		t.Fatalf("CREATE TABLE cobase: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vco_def AS SELECT id, q FROM cobase WHERE q > 0 WITH CHECK OPTION`); err != nil {
+		t.Fatalf("CREATE VIEW vco_def: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vco_local AS SELECT id, q FROM cobase WHERE q > 0 WITH LOCAL CHECK OPTION`); err != nil {
+		t.Fatalf("CREATE VIEW vco_local: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vco_plain AS SELECT id, q FROM cobase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vco_plain: %v", err)
+	}
+
+	for name, want := range map[string]string{"vco_def": "cascaded", "vco_local": "local", "vco_plain": ""} {
+		vt, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s view not found", name)
+		}
+		if vt.CheckOption != want {
+			t.Errorf("%s.CheckOption = %q, want %q", name, vt.CheckOption, want)
+		}
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vco_def" || r[1] == "vco_local" || r[1] == "vco_plain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vco_def"] != "{check_option=cascaded}" {
+		t.Errorf("pg_class.reloptions for vco_def = %q, want %q", got["vco_def"], "{check_option=cascaded}")
+	}
+	if got["vco_local"] != "{check_option=local}" {
+		t.Errorf("pg_class.reloptions for vco_local = %q, want %q", got["vco_local"], "{check_option=local}")
+	}
+	if got["vco_plain"] != "" {
+		t.Errorf("pg_class.reloptions for vco_plain = %q, want \"\" (NULL)", got["vco_plain"])
+	}
+}

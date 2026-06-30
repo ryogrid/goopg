@@ -8905,6 +8905,33 @@ PG 18.3 cluster across all of those contexts. Fixtures `dchkneg`/`neglit`/`negli
 (slice 364) + unit `TestDefaultExprToSQLBinaryParen` (executor) / `TestFormatExprForAttrdefExpr` (catalog), both updated from
 the old bare `-1` to `'-1'::integer`.
 
+### Slice 365 — **view `WITH [CASCADED|LOCAL] CHECK OPTION`** → `\n  WITH <MODE> CHECK OPTION;` suffix (PRODUCTION fix)
+
+PostgreSQL stores a view's `WITH [CASCADED|LOCAL] CHECK OPTION` clause as the `check_option=<mode>` `pg_class.reloption`
+(`DefineRelation`/`view.c`). pg_dump's `getTables` reads it in two halves (pg_dump.c:7158-7165): the reloptions column
+**strips** the marker — `array_remove(array_remove(c.reloptions,'check_option=local'),'check_option=cascaded')` — so it is not
+re-emitted inside a `WITH (...)` storage-option list, and a separate `checkoption` CASE column derives
+`'CASCADED'`/`'LOCAL'` from the same array. `dumpTableSchema` (pg_dump.c:16982) then appends
+`\n  WITH <MODE> CHECK OPTION` **after** the view body (the body itself comes from `createViewAsClause`/`pg_get_viewdef`,
+trailing `;` stripped).
+
+The parser already accepted-and-ignored the trailing clause; it now captures the mode into `CreateViewStmt.CheckOption`
+("cascaded" is the default when the qualifier is omitted, matching PG's grammar). `execCreateView` stores it on
+`catalog.Table.CheckOption`, and the pg_class virtual-row reloptions builder (`catalog.go`) appends `check_option=<mode>`
+to the relation's reloptions array when it is set. From there the whole flow is already-exercised goopg machinery: the
+`array_remove` strip (DU-002 slice 5, `TestArrayRemove*`) keeps the marker out of the WITH-clause, and the `= ANY(reloptions)`
+CASE column derives the mode — so **no pg_dump-query change** is needed, only the catalog plumbing. A bare
+`WITH CHECK OPTION` dumps `\n  WITH CASCADED CHECK OPTION;`, an explicit `WITH LOCAL CHECK OPTION` dumps
+`\n  WITH LOCAL CHECK OPTION;`, and a plain view emits no suffix. Verified byte-identical vs real pg_dump 18.3. Fixtures
+`vchk`/`vchk_local` in `TestPort_PgDumpConnectionSetup` (slice 365) + unit `TestParseCreateViewCheckOption` (parser) /
+`TestViewCheckOptionSurfacesInPgClassReloptions` (executor).
+
+**Deferred (ledger):** (1) goopg does not yet **enforce** the CHECK OPTION — an INSERT/UPDATE through the view that violates
+the view qual is not rejected (PG's `rewriteHandler.c` adds the WCO check); this slice is catalog/dump fidelity only.
+(2) the `WITH (check_option=...)` reloption **form** placed *before* `AS` is still parsed-and-ignored (only the trailing
+clause is captured); `security_barrier`/`security_invoker` likewise stay ignored. (3) restart persistence — `CheckOption`
+is in-memory only (the same shared-catalog runtime-write gap as the other restart-durability slices).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

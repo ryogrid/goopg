@@ -1670,6 +1670,12 @@ type CreateViewStmt struct {
 	// pg_get_viewdef can echo it for pg_dump. Empty if the source text was
 	// unavailable to the parser.
 	RawDef string
+	// CheckOption captures the trailing `WITH [CASCADED|LOCAL] CHECK OPTION`
+	// clause: "cascaded" (the default when the qualifier is omitted), "local",
+	// or "" when no CHECK OPTION clause was given. PostgreSQL stores this as the
+	// `check_option=<mode>` pg_class.reloption, which pg_dump re-emits as the
+	// `WITH <MODE> CHECK OPTION` view-definition suffix. M0119-0004 DU-002 slice 365.
+	CheckOption string
 }
 
 func (s *CreateViewStmt) Pos() int  { return s.pos }

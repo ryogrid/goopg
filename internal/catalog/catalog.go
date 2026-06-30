@@ -310,6 +310,14 @@ type Table struct {
 	// performed — a known fidelity gap tracked in the pg_dump TAP port.
 	ViewDef string
 
+	// CheckOption captures a view's `WITH [CASCADED|LOCAL] CHECK OPTION` clause:
+	// "cascaded", "local", or "" (no clause). PostgreSQL records it as the
+	// `check_option=<mode>` pg_class.reloption; pg_dump's getTables strips that
+	// element from the reloptions array and instead re-emits the
+	// `WITH <MODE> CHECK OPTION` view-definition suffix. M0119-0004 (DU-002 slice 365).
+	// goopg does not yet ENFORCE the option on INSERT/UPDATE through the view.
+	CheckOption string
+
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil
 	// as "no statistics yet" and falls back to the legacy
@@ -4005,6 +4013,13 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.VacuumIndexCleanupSet {
 				relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
+			}
+			// A view's `WITH [CASCADED|LOCAL] CHECK OPTION` is stored by PostgreSQL
+			// as the `check_option=<mode>` pg_class.reloption. pg_dump's getTables
+			// then strips it from the reloptions array (array_remove) and re-emits
+			// it as the `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (slice 365).
+			if t.CheckOption != "" {
+				relopts = append(relopts, "check_option="+t.CheckOption)
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

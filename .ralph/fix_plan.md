@@ -3033,6 +3033,22 @@ documentation-only and is exempt from the design-doc requirement.)
       slice-363 `dchkand`/`dchkfn` `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
       a negative literal in a domain CHECK (`VALUE < -5` → PG `'-5'::integer`) still
       byte-diverges (type-blind `defaultExprToSQL`, same gap as slice-360(a)/362(b)).
+      **2026-06-30 (loop #96, design 0110-0001 slice 365): view `WITH [CASCADED|LOCAL]
+      CHECK OPTION` round-trip.** A view created `WITH CHECK OPTION` now dumps the
+      `\n  WITH <MODE> CHECK OPTION;` suffix after its body. PG stores the clause as the
+      `check_option=<mode>` pg_class.reloption (view.c); pg_dump's getTables strips it
+      from the reloptions array (array_remove, slice 5) and derives CASCADED/LOCAL via a
+      `= ANY(reloptions)` CASE column, then dumpTableSchema appends the suffix
+      (pg_dump.c:16982). Parser captures the mode into `CreateViewStmt.CheckOption` (bare
+      clause → cascaded); `execCreateView` stores `catalog.Table.CheckOption`; the
+      pg_class virtual reloptions builder appends `check_option=<mode>`. **No pg_dump-query
+      change** — reuses the existing array_remove + ANY machinery. Byte-identical vs real
+      pg_dump 18.3. Tests `TestParseCreateViewCheckOption` (parser) +
+      `TestViewCheckOptionSurfacesInPgClassReloptions` (executor) + slice-365
+      `vchk`/`vchk_local` `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** the
+      CHECK OPTION is NOT enforced on INSERT/UPDATE through the view (catalog/dump fidelity
+      only); the `WITH (check_option=...)` reloption form before AS + `security_barrier`/
+      `security_invoker` stay parsed-and-ignored; restart persistence (in-memory only).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

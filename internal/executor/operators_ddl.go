@@ -3903,6 +3903,10 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// Preserve the raw view body so pg_get_viewdef can echo it for pg_dump.
 	if vt != nil {
 		vt.ViewDef = s.RawDef
+		// A `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
+		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the
+		// `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (DU-002 slice 365).
+		vt.CheckOption = s.CheckOption
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
 	// can detect that this view relies on the constraint. M0097-0036.

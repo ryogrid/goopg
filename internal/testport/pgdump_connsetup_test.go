@@ -2653,6 +2653,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create view foo_rview: %v", err)
 	}
 
+	// Slice 365: a VIEW created `WITH [CASCADED|LOCAL] CHECK OPTION` round-trips
+	// the clause. PostgreSQL stores the option as the `check_option=<mode>`
+	// pg_class.reloption; pg_dump's getTables strips that element from the
+	// reloptions array (array_remove, already handled, DU-002 slice 5) and instead
+	// re-emits the `\n  WITH <MODE> CHECK OPTION` suffix after the view body
+	// (pg_dump.c dumpTableSchema). goopg captures the mode on
+	// catalog.Table.CheckOption and surfaces it through the reloptions cell so the
+	// pg_dump checkoption CASE (`'check_option=cascaded' = ANY (c.reloptions)`)
+	// derives CASCADED/LOCAL. goopg does not yet ENFORCE the option on
+	// INSERT/UPDATE through the view — catalog/dump fidelity only. `vchk` carries
+	// the bare (→ CASCADED) form, `vchk_local` the LOCAL form, both on their own
+	// view so the asserts are isolated from foo_view.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vchk AS SELECT id, name FROM public.foo WHERE qty > 0 WITH CHECK OPTION"); err != nil {
+		t.Fatalf("create view vchk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vchk_local AS SELECT id, name FROM public.foo WHERE qty > 0 WITH LOCAL CHECK OPTION"); err != nil {
+		t.Fatalf("create view vchk_local: %v", err)
+	}
+
 	// Slice 59: a GENERATED ALWAYS AS (expr) STORED column must round-trip with
 	// its generation clause. pg_dump prints `GENERATED ALWAYS AS (%s) STORED`
 	// only when the column carries BOTH pg_attribute.attgenerated='s' AND a
@@ -8694,6 +8713,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped renamed view columns; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
+		// **Slice 365 (asserted):** a VIEW `WITH [CASCADED|LOCAL] CHECK OPTION`
+		// must round-trip the clause as the `\n  WITH <MODE> CHECK OPTION` suffix
+		// after the view body (pg_dump.c dumpTableSchema). goopg surfaces the mode
+		// as the `check_option=<mode>` reloption; pg_dump's getTables derives
+		// CASCADED/LOCAL from it and strips it from the array, so the clause must
+		// appear as the suffix and NOT inside a `WITH (...)` storage-option list.
+		checkOptDefs := []string{
+			"CREATE VIEW public.vchk AS",
+			"  WITH CASCADED CHECK OPTION;",
+			"CREATE VIEW public.vchk_local AS",
+			"  WITH LOCAL CHECK OPTION;",
+		}
+		for _, sub := range checkOptDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a view CHECK OPTION clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The check_option must NOT leak into a `WITH (...)` reloptions clause —
+		// pg_dump strips it from the array and emits it only as the suffix.
+		if strings.Contains(res.Stdout, "WITH (check_option") {
+			t.Errorf("pg_dump leaked check_option into a WITH (...) reloptions clause\n  full stdout=%q", res.Stdout)
+		}
+
 		// **Slice 59 (asserted):** a GENERATED ALWAYS AS (expr) STORED column
 		// must round-trip with its generation clause. atthasdef now reports true
 		// for generated columns and pg_attrdef emits a row whose adbin is the raw

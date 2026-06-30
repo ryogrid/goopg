@@ -1264,10 +1264,17 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	// keyword up to the next unconsumed token) so pg_get_viewdef can echo it
 	// verbatim for pg_dump. p.cur() now points just past the body.
 	stmt.RawDef = p.captureSrcSpan(cur.Pos, p.cur())
-	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause.
-	// goopg accepts and ignores the clause (check enforcement not yet implemented).
+	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause. The mode is
+	// captured into CheckOption ("cascaded" is the default when the qualifier is
+	// omitted) so it surfaces as the `check_option` pg_class.reloption for pg_dump.
+	// goopg does not yet ENFORCE the check at INSERT/UPDATE time (M0119-0004 slice 365).
 	if p.acceptKeyword(KwWith) {
-		_ = p.acceptIdentKeyword("cascaded") || p.acceptKeyword(KwLocal) || p.acceptIdentKeyword("local")
+		mode := "cascaded"
+		if p.acceptIdentKeyword("cascaded") {
+			mode = "cascaded"
+		} else if p.acceptKeyword(KwLocal) || p.acceptIdentKeyword("local") {
+			mode = "local"
+		}
 		if p.cur().Kind != TokenKeyword || p.cur().Keyword != KwCheck {
 			return nil, p.errAtCur("expected CHECK after WITH in view definition")
 		}
@@ -1275,6 +1282,7 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		if !p.acceptIdentKeyword("option") {
 			return nil, p.errAtCur("expected OPTION after WITH [CASCADED|LOCAL] CHECK")
 		}
+		stmt.CheckOption = mode
 	}
 	return stmt, nil
 }

@@ -65,6 +65,35 @@ func TestParseCreateViewRawDef(t *testing.T) {
 	}
 }
 
+// TestParseCreateViewCheckOption pins that the trailing
+// `WITH [CASCADED|LOCAL] CHECK OPTION` clause is captured into
+// CreateViewStmt.CheckOption ("cascaded" is the default when the qualifier is
+// omitted), while a view with no clause leaves it empty. M0119-0004 (slice 365).
+func TestParseCreateViewCheckOption(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{"CREATE VIEW v AS SELECT id FROM d WHERE id > 0 WITH CHECK OPTION", "cascaded"},
+		{"CREATE VIEW v AS SELECT id FROM d WHERE id > 0 WITH CASCADED CHECK OPTION", "cascaded"},
+		{"CREATE VIEW v AS SELECT id FROM d WHERE id > 0 WITH LOCAL CHECK OPTION", "local"},
+		{"CREATE VIEW v AS SELECT id FROM d WHERE id > 0", ""},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.src, err)
+		}
+		cv, ok := stmts[0].(*CreateViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateViewStmt", tc.src, stmts[0])
+		}
+		if cv.CheckOption != tc.want {
+			t.Errorf("Parse(%q): CheckOption=%q want %q", tc.src, cv.CheckOption, tc.want)
+		}
+	}
+}
+
 // TestParseCreateMatViewRawDef pins that a materialized view's body text is
 // captured verbatim into CreateMatViewStmt.RawDef (trimmed of surrounding
 // whitespace; the trailing WITH [NO] DATA clause is NOT part of the body).
