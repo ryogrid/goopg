@@ -959,3 +959,135 @@ func TestTypeACLRevokeFromOwner(t *testing.T) {
 		}
 	})
 }
+
+// TestAttrACLText pins the pg_attribute.attacl projection the column-GRANT
+// round-trip needs (M0119-0004-ACLHEAP, attacl half). Unlike relacl/typacl/proacl
+// a column has an EMPTY acldefault('c', owner) — the owner and PUBLIC hold no
+// implicit column privilege — so attacl carries NO leading owner aclitem and no
+// implicit PUBLIC entry: `GRANT SELECT(c) ON t TO grantee` materializes attacl as
+// "{grantee=r/postgres}" only, verified against PostgreSQL 18.3. pg_dump's
+// getTableAttrs diffs this against the empty default and re-emits the column
+// GRANT.
+func TestAttrACLText(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16600
+	const attNum int16 = 2
+
+	// No grants → NULL attacl (matches the empty acldefault, so pg_dump emits no
+	// column GRANT).
+	if got := c.AttrACLText(relOID, attNum); got != "" {
+		t.Fatalf("attacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT SELECT(col) … TO a grantee materializes ONLY the grantee — no owner
+	// entry, no implicit PUBLIC entry (the key difference from typacl/proacl).
+	c.GrantColumnPrivilege(relOID, attNum, "grantee_col", "SELECT")
+	if want, got := "{grantee_col=r/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after GRANT SELECT(col) TO grantee_col = %q; want %q", got, want)
+	}
+
+	// A second column privilege to the same grantee accumulates in canonical bit
+	// order (INSERT(a) before UPDATE(w)): "arw" needs a,r,w sorted.
+	c.GrantColumnPrivilege(relOID, attNum, "grantee_col", "INSERT")
+	c.GrantColumnPrivilege(relOID, attNum, "grantee_col", "UPDATE")
+	if want, got := "{grantee_col=arw/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after GRANT INSERT,UPDATE(col) = %q; want %q", got, want)
+	}
+
+	// A second grantee appends in grant order; PUBLIC renders as an empty grantee.
+	c.GrantColumnPrivilege(relOID, attNum, "PUBLIC", "SELECT")
+	if want, got := "{grantee_col=arw/postgres,=r/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after GRANT SELECT(col) TO PUBLIC = %q; want %q", got, want)
+	}
+
+	// A non-column keyword (DELETE is table-only) renders nothing for its grantee.
+	c.GrantColumnPrivilege(relOID, attNum, "noise_role", "DELETE")
+	if want, got := "{grantee_col=arw/postgres,=r/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl must ignore a non-column privilege: got %q; want %q", got, want)
+	}
+
+	// A different column of the same relation has an independent ACL.
+	if got := c.AttrACLText(relOID, 3); got != "" {
+		t.Fatalf("attacl for an ungranted sibling column = %q; want \"\" (NULL)", got)
+	}
+}
+
+// TestAttrACLGrantWithGrantOption pins the grant-option (`*`) projection for a
+// column-level GRANT … WITH GRANT OPTION: the grantee's privilege renders with a
+// trailing `*` and pg_dump re-emits WITH GRANT OPTION. M0119-0004-ACLHEAP.
+func TestAttrACLGrantWithGrantOption(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16601
+	const attNum int16 = 1
+
+	c.GrantColumnPrivilegeWithGrantOption(relOID, attNum, "grantee_col", "UPDATE", true)
+	if want, got := "{grantee_col=w*/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after GRANT UPDATE(col) WITH GRANT OPTION = %q; want %q", got, want)
+	}
+}
+
+// TestAttrACLRevoke exercises the column REVOKE path: removing the last column
+// privilege drops the grantee, and an emptied column returns attacl to NULL (a
+// column has no owner default to fall back to, distinct from a table that empties
+// to "{}"). M0119-0004-ACLHEAP.
+func TestAttrACLRevoke(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16602
+	const attNum int16 = 4
+
+	c.GrantColumnPrivilege(relOID, attNum, "a_role", "SELECT")
+	c.GrantColumnPrivilege(relOID, attNum, "a_role", "UPDATE")
+	c.GrantColumnPrivilege(relOID, attNum, "b_role", "SELECT")
+
+	// Revoke one of a_role's two privileges: it stays, with the remaining letter.
+	c.RevokeColumnPrivilege(relOID, attNum, "a_role", "UPDATE")
+	if want, got := "{a_role=r/postgres,b_role=r/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after REVOKE UPDATE(col) FROM a_role = %q; want %q", got, want)
+	}
+
+	// Revoke a_role's last privilege: it is dropped, b_role preserved in order.
+	c.RevokeColumnPrivilege(relOID, attNum, "a_role", "SELECT")
+	if want, got := "{b_role=r/postgres}", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after REVOKE SELECT(col) FROM a_role = %q; want %q", got, want)
+	}
+
+	// Revoke the last grantee: attacl returns to NULL (not "{}").
+	c.RevokeColumnPrivilege(relOID, attNum, "b_role", "SELECT")
+	if want, got := "", c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after revoking every grantee = %q; want %q (NULL)", got, want)
+	}
+
+	// A revoke of a privilege never held is a no-op.
+	c.RevokeColumnPrivilege(relOID, attNum, "ghost", "SELECT")
+	if got := c.AttrACLText(relOID, attNum); got != "" {
+		t.Fatalf("no-op revoke perturbed attacl: %q", got)
+	}
+}
+
+// TestAttrACLGranteeNameRendering pins grantee-name handling in attacl, shared
+// with the relacl roleACLDisplay/aclQuoteName paths: a mixed-case but
+// all-alphanumeric name keeps its original spelling UNQUOTED (PG's putid only
+// quotes names with bytes outside [A-Za-z0-9_]), while a name with an unsafe
+// char (a hyphen) is double-quoted exactly as aclitemout renders it.
+// M0119-0004-ACLHEAP.
+func TestAttrACLGranteeNameRendering(t *testing.T) {
+	t.Run("mixed_case_preserved_unquoted", func(t *testing.T) {
+		c := NewInMemory()
+		const relOID = 16603
+		const attNum int16 = 1
+		c.GrantColumnPrivilege(relOID, attNum, "MixedCase", "SELECT")
+		if want, got := "{MixedCase=r/postgres}", c.AttrACLText(relOID, attNum); got != want {
+			t.Fatalf("attacl for a mixed-case grantee = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("unsafe_char_quoted", func(t *testing.T) {
+		c := NewInMemory()
+		const relOID = 16604
+		const attNum int16 = 1
+		c.GrantColumnPrivilege(relOID, attNum, "needs-quote", "SELECT")
+		if want, got := `{"needs-quote"=r/postgres}`, c.AttrACLText(relOID, attNum); got != want {
+			t.Fatalf("attacl for an unsafe-char grantee = %q; want %q", got, want)
+		}
+	})
+}

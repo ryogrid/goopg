@@ -1786,6 +1786,17 @@ type Catalog interface {
 	// (M0097-0022), so the GRANT path must re-sync this text into the heap row;
 	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
 	TypeACLText(typeOID uint32) string
+	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
+	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
+	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
+	// materialized attacl text for a column, or "" when it is still NULL. Unlike
+	// relacl/typacl/proacl a column has an empty acldefault, so attacl carries no
+	// owner/PUBLIC default entry and returns to NULL once the last column
+	// privilege is revoked. M0119-0004-ACLHEAP (attacl half).
+	GrantColumnPrivilege(relOID uint32, attNum int16, role, priv string)
+	GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool)
+	RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv string)
+	AttrACLText(relOID uint32, attNum int16) string
 	// DropTableACL forgets all privileges recorded for relOID (called when the
 	// relation is dropped so a recycled OID does not inherit stale grants).
 	DropTableACL(relOID uint32)
@@ -2063,6 +2074,26 @@ type InMemory struct {
 	// re-materializes the owner and clears the flag. Key: relOID → present.
 	// DU-002 slice 347.
 	relACLOwnerRevoked map[uint32]bool
+
+	// attrACLs records column-level (pg_attribute.attacl) privileges granted to
+	// non-owner roles, keyed by (relOID, attnum) → lower-cased role name →
+	// upper-cased privilege keyword ("SELECT"/"INSERT"/"UPDATE"/"REFERENCES") →
+	// grant-option flag. Unlike relacl/typacl/proacl, a column has an EMPTY
+	// acldefault ('c': columns grant no implicit privilege to the owner or
+	// PUBLIC), so attacl stays NULL until the first column GRANT and returns to
+	// NULL once every column privilege is revoked — there is no owner or PUBLIC
+	// default entry to materialize, so the relACLEmptied/relACLOwnerRevoked
+	// machinery the table/type/function stores need does not apply here. This is
+	// why column ACLs live in their own composite-keyed store rather than the
+	// OID-keyed tableACLs map. M0119-0004-ACLHEAP (attacl half).
+	attrACLs map[attrACLKey]map[string]map[string]bool
+
+	// attrACLOrder records, per column, the order in which grantee roles first
+	// appeared in a column GRANT, so attacl preserves grant order (PostgreSQL
+	// appends a new grantee's aclitem to the end of the array) rather than
+	// alphabetical order — the column analogue of tableACLOrder. A role is removed
+	// when its column privilege set is fully revoked. M0119-0004-ACLHEAP.
+	attrACLOrder map[attrACLKey][]string
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
@@ -2457,6 +2488,8 @@ func NewInMemory() *InMemory {
 		roleACLDisplay:     make(map[string]string),
 		relACLEmptied:      make(map[uint32]bool),
 		relACLOwnerRevoked: make(map[uint32]bool),
+		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
+		attrACLOrder:       make(map[attrACLKey][]string),
 		comments:           make(map[commentKey]string),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
@@ -8582,6 +8615,90 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	}
 }
 
+// GrantColumnPrivilege records that role may exercise the column-level priv
+// ("SELECT"/"INSERT"/"UPDATE"/"REFERENCES", upper-cased) on column attNum of
+// the relation relOID. role is matched case-insensitively; "PUBLIC" is the
+// pseudo-role. The column analogue of GrantTablePrivilege. M0119-0004-ACLHEAP.
+func (c *InMemory) GrantColumnPrivilege(relOID uint32, attNum int16, role, priv string) {
+	c.GrantColumnPrivilegeWithGrantOption(relOID, attNum, role, priv, false)
+}
+
+// GrantColumnPrivilegeWithGrantOption is GrantColumnPrivilege plus a grant-
+// option flag, OR-ed in exactly as GrantTablePrivilegeWithGrantOption does (a
+// later plain GRANT does not clear a previously set option). M0119-0004-ACLHEAP.
+func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool) {
+	display := strings.TrimSpace(role)
+	role = strings.ToLower(display)
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Preserve the grantee's original-case spelling so attacl renders the role's
+	// true name (shared with the relacl store; DU-002 slice 337).
+	if display != role {
+		c.roleACLDisplay[role] = display
+	}
+	key := attrACLKey{relOID: relOID, attNum: attNum}
+	byRole := c.attrACLs[key]
+	if byRole == nil {
+		byRole = make(map[string]map[string]bool)
+		c.attrACLs[key] = byRole
+	}
+	privs := byRole[role]
+	if privs == nil {
+		privs = make(map[string]bool)
+		byRole[role] = privs
+		c.attrACLOrder[key] = append(c.attrACLOrder[key], role)
+	}
+	privs[priv] = privs[priv] || withGrantOption
+}
+
+// RevokeColumnPrivilege removes a single column-level priv for role on column
+// attNum of relOID. When the role's column privilege set becomes empty its entry
+// is dropped (so AttrACLText no longer lists it); when the column has no
+// grantees left the whole entry is removed and attacl returns to NULL (a column
+// has no owner default to fall back to). A revoke of a privilege never held is a
+// no-op. The column analogue of RevokeTablePrivilege. M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv string) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := attrACLKey{relOID: relOID, attNum: attNum}
+	byRole := c.attrACLs[key]
+	if byRole == nil {
+		return
+	}
+	privs := byRole[role]
+	if privs == nil {
+		return
+	}
+	delete(privs, priv)
+	if len(privs) == 0 {
+		delete(byRole, role)
+		if order := c.attrACLOrder[key]; len(order) > 0 {
+			for i, r := range order {
+				if r == role {
+					c.attrACLOrder[key] = append(order[:i], order[i+1:]...)
+					break
+				}
+			}
+			if len(c.attrACLOrder[key]) == 0 {
+				delete(c.attrACLOrder, key)
+			}
+		}
+	}
+	if len(byRole) == 0 {
+		delete(c.attrACLs, key)
+		delete(c.attrACLOrder, key)
+	}
+}
+
 // MaterializeOwnerACL records an explicit owner aclitem for relOID holding
 // exactly ownerPrivs, but only if no explicit owner entry exists yet. See the
 // Catalog interface doc. The owner privileges are stored without the grant
@@ -8747,6 +8864,30 @@ var typeACLPrivOrder = []aclPrivLetter{
 // to the function EXECUTE default (ownerFunctionACLString). M0119-0004-ACLHEAP.
 const ownerTypeACLString = "U"
 
+// attrACLKey identifies one table column for column-level (pg_attribute.attacl)
+// privilege tracking: the owning relation's OID plus the column's 1-based
+// attribute number. Real table OIDs routinely exceed 2^16, so a packed
+// (relOID<<16 | attnum) uint32 would overflow — a struct key is used instead.
+// M0119-0004-ACLHEAP (attacl half).
+type attrACLKey struct {
+	relOID uint32
+	attNum int16
+}
+
+// attrACLPrivOrder lists the column (pg_attribute.attacl) privileges in
+// PostgreSQL's canonical aclitemout bit order. Column-level GRANT supports only
+// the subset INSERT(a)/SELECT(r)/UPDATE(w)/REFERENCES(x) — the remaining table
+// privilege letters (DELETE/TRUNCATE/TRIGGER/MAINTAIN) never appear in attacl.
+// Unlike a table/type/function there is NO owner-default privilege string: a
+// column's acldefault('c', owner) is empty, so attacl renders grantees only
+// (AttrACLText). M0119-0004-ACLHEAP.
+var attrACLPrivOrder = []aclPrivLetter{
+	{"INSERT", 'a'},
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+	{"REFERENCES", 'x'},
+}
+
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
 // for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
@@ -8822,6 +8963,74 @@ func (c *InMemory) TypeACLText(typeOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString)
+}
+
+// AttrACLText renders the materialized pg_attribute.attacl text for the column
+// identified by (relOID, attNum), or "" (SQL NULL) when no column-level
+// privilege has been granted away. Unlike relacl/typacl/proacl, a column's
+// acldefault('c', owner) is EMPTY — the owner and PUBLIC hold no implicit
+// column privilege — so attacl has no leading owner aclitem and no implicit
+// PUBLIC entry: it renders the grantees only, in grant order, and returns to
+// NULL once the last column privilege is revoked. This is the column analogue of
+// TypeACLText; pg_dump's getTableAttrs selects attacl directly and diffs it
+// against the empty default client-side in buildACLCommands, re-emitting
+// `GRANT <priv>(<col>) ON TABLE … TO …`, so projecting the correct aclitem[]
+// text is the renderer half of the column-GRANT round-trip (the GRANT path must
+// additionally re-sync this text into the heap-backed pg_attribute row).
+// M0119-0004-ACLHEAP (attacl half).
+func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := attrACLKey{relOID: relOID, attNum: attNum}
+	byRole := c.attrACLs[key]
+	if len(byRole) == 0 {
+		return "" // NULL attacl — empty acldefault, so pg_dump emits no column GRANT
+	}
+	// Render grantees in grant order (the order roles first appeared in a column
+	// GRANT), matching PostgreSQL's append semantics for the aclitem[] array. Fall
+	// back to a sorted snapshot only for any role present in byRole but missing
+	// from the order list (defensive — never silently drop a grant).
+	roles := make([]string, 0, len(byRole))
+	seen := make(map[string]bool, len(byRole))
+	for _, role := range c.attrACLOrder[key] {
+		if seen[role] {
+			continue
+		}
+		if _, ok := byRole[role]; !ok {
+			continue // stale order entry (role fully revoked)
+		}
+		seen[role] = true
+		roles = append(roles, role)
+	}
+	var missing []string
+	for role := range byRole {
+		if seen[role] {
+			continue
+		}
+		missing = append(missing, role)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		roles = append(roles, missing...)
+	}
+	var items []string
+	for _, role := range roles {
+		letters := renderACLLetters(byRole[role], attrACLPrivOrder)
+		if letters == "" {
+			continue // role holds only non-column privileges
+		}
+		// PUBLIC renders as an empty grantee ("=<privs>/postgres"); a mixed-case
+		// role restores its original spelling; an unsafe name is double-quoted —
+		// identical to relaclTextLockedFor's grantee handling.
+		grantee := role
+		if grantee == publicPseudoRole {
+			grantee = ""
+		} else if disp, ok := c.roleACLDisplay[role]; ok {
+			grantee = disp
+		}
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+	}
+	return "{" + strings.Join(items, ",") + "}"
 }
 
 // relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it

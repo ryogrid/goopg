@@ -279,6 +279,45 @@ parity; goopg's own read derives from the same store the heap was synced from.
 Catalog accessors used: `LookupEnum`/`LookupEnumByOID`, `LookupCompositeType`/`...ByOID`,
 `LookupDomain`/`...ByOID`, and the new `RoleNameForOID`.
 
+### Progress — `attacl` step 2 renderer + column-ACL store landed (loop #88, 2026-06-30)
+
+Low-blast-radius building block, the column analogue of loop #84's `TypeACLText`: nothing on
+the GRANT path calls it yet, so live behaviour is unchanged. Lands the catalog half of the
+`attacl` follow-up.
+
+**Key divergence from typacl/proacl that drove the design:** a column's
+`acldefault('c', owner)` is **empty** — the owner and PUBLIC hold no implicit column
+privilege. So `attacl` is NULL until the first column GRANT, has **no leading owner aclitem
+and no implicit PUBLIC entry**, and returns to NULL once the last column privilege is revoked
+(a table empties to `{}`, a column to NULL). This means the `attacl` renderer **cannot** reuse
+`relaclTextLockedFor` (which unconditionally prepends the owner entry) — it needs a dedicated
+renderer, and the `relACLEmptied`/`relACLOwnerRevoked` machinery does not apply.
+
+Landed (`internal/catalog/catalog.go`):
+- `attrACLKey{relOID uint32; attNum int16}` — a struct key, not a packed `relOID<<16|attnum`
+  uint32, because real table OIDs routinely exceed 2^16 and would overflow.
+- New composite-keyed stores `attrACLs map[attrACLKey]map[string]map[string]bool` (grantee →
+  priv → grant-option) + `attrACLOrder map[attrACLKey][]string` (grant order), initialized in
+  `NewInMemory`.
+- `attrACLPrivOrder = {INSERT/a, SELECT/r, UPDATE/w, REFERENCES/x}` — the column-grantable
+  subset in canonical aclitemout bit order (no DELETE/TRUNCATE/TRIGGER/MAINTAIN).
+- `GrantColumnPrivilege` / `GrantColumnPrivilegeWithGrantOption` / `RevokeColumnPrivilege`
+  (mirror the table-ACL recorders; share `roleACLDisplay`) + `AttrACLText(relOID, attNum)`
+  renderer (grantees only, grant order, PUBLIC→empty grantee, `aclQuoteName` for unsafe
+  names). All four added to the `Catalog` interface.
+- Tests `TestAttrACLText` / `TestAttrACLGrantWithGrantOption` / `TestAttrACLRevoke` /
+  `TestAttrACLGranteeNameRendering` (case-preserved-unquoted + unsafe-char-quoted).
+
+**Remaining `attacl` steps** (the high-blast-radius half — a dedicated loop, per the
+WAL/MVCC practice card): (1) parser — capture `GRANT priv (col,…) ON TABLE t TO role` into a
+new `CompatNoopStmt.AttrACL *AttrACLChange` (the column-list is the ON-detection signal,
+mirroring `TypeACLChange`); (2) executor — `execAttrACLChange` + `resyncAttrACLHeapRow`
+(delete-old `pg_attribute` rows + `syncTableToCatalogHeap` per the
+`pg_attribute_alter_needs_heap_resync` precedent; set `attacl` via
+`encodeAclItemArrayText(AttrACLText(relOID,attnum), …)`); (3) read — a `pg_attribute` seqscan
+`attacl` decode hook, the sibling of the `pg_type` `typacl` hook; (4) the DU-002 connsetup
+slice `GRANT SELECT (col) ON TABLE t TO role` → assert pg_dump emits it.
+
 ## Why not just do it now
 
 Single-loop autonomous discipline + the hard-won "silent row-count / visibility regression

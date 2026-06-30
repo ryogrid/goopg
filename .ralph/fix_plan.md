@@ -3053,6 +3053,25 @@ documentation-only and is exempt from the design-doc requirement.)
       against the heap-backed `pg_attribute` — the remaining follow-up; **`datacl`** stays
       deferred (`pg_database` heap-backed AND `--create`-only, untestable in the `--no-create`
       connsetup harness).
+      **2026-06-30 (loop #88) — `attacl` step 2 renderer + column-ACL store LANDED
+      (low blast, no GRANT path calls it yet; the column analogue of loop #84's
+      `TypeACLText`).** `internal/catalog/catalog.go`: new composite-keyed stores
+      `attrACLs`/`attrACLOrder` (key `attrACLKey{relOID, attNum int16}` — a struct, NOT a
+      packed `relOID<<16|attnum` uint32 which would overflow for real table OIDs >2^16);
+      `attrACLPrivOrder = {INSERT/a,SELECT/r,UPDATE/w,REFERENCES/x}` (the column-grantable
+      subset); `GrantColumnPrivilege`/`GrantColumnPrivilegeWithGrantOption`/
+      `RevokeColumnPrivilege` + `AttrACLText(relOID, attNum)` renderer, all added to the
+      `Catalog` interface. **Key design divergence:** a column's `acldefault('c', owner)` is
+      EMPTY (no owner/PUBLIC implicit privilege), so `attacl` is NULL until the first column
+      GRANT, has NO leading owner aclitem, and returns to NULL once the last privilege is
+      revoked (a table empties to `{}`, a column to NULL) — the renderer therefore CANNOT
+      reuse `relaclTextLockedFor` (which always prepends the owner entry) and the
+      `relACLEmptied`/`relACLOwnerRevoked` machinery does not apply. Tests `TestAttrACLText`/
+      `…GrantWithGrantOption`/`…Revoke`/`…GranteeNameRendering`; full catalog pkg + `go vet`
+      executor/server/catalog clean; design `0119-0004-*` "attacl step 2" + ledger row.
+      Remaining `attacl` (the high-blast-radius half, a dedicated loop): parser `AttrACLChange`
+      capture + `execAttrACLChange`/`resyncAttrACLHeapRow` + pg_attribute seqscan `attacl`
+      decode hook + DU-002 column-GRANT connsetup slice.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
