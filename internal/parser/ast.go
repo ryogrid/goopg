@@ -380,6 +380,11 @@ type CreateRuleStmt struct {
 	Event   string // "INSERT" | "UPDATE" | "DELETE"
 	Table   ObjectName
 	Instead bool // DO INSTEAD NOTHING (true) vs DO [ALSO] NOTHING (false)
+	// Qual is the optional WHERE qualification of a conditional DO-NOTHING rule
+	// (`ON UPDATE TO t WHERE (old.a <> new.a) DO INSTEAD NOTHING`), captured as a
+	// real expression AST so pg_get_ruledef can deparse it byte-identically to
+	// PostgreSQL. nil for the unconditional form. DU-002 slice 359.
+	Qual Expr
 	// RuleKind carries the COPY-DML rule-kind string the CompatNoop path would
 	// have recorded (e.g. "DO INSTEAD NOTHING", "DO ALSO"), so execCreateRule can
 	// register it identically via RegisterTableRuleKind.

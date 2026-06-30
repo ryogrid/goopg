@@ -1269,6 +1269,12 @@ type RuleInfo struct {
 	// Instead is pg_rewrite.is_instead: true for DO INSTEAD NOTHING, false for
 	// DO [ALSO] NOTHING.
 	Instead bool
+	// Qual is the deparsed WHERE qualification of a conditional DO-NOTHING rule,
+	// already rendered to the canonical pg_get_ruledef form (e.g.
+	// "(old.a <> new.a)", parens included). Empty for an unconditional rule.
+	// pg_rewrite stores it as ev_qual; goopg keeps the deparsed text since the
+	// rewrite system is not executed. DU-002 slice 359.
+	Qual string
 	// Enabled is pg_rewrite.ev_enabled set by `ALTER TABLE … {ENABLE|DISABLE}
 	// [REPLICA|ALWAYS] RULE`: 'O' (origin — the default), 'D' (disabled),
 	// 'R' (replica), 'A' (always). A zero value is treated as 'O'. pg_dump's
@@ -6939,14 +6945,16 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2618,
 	}
-	// A CREATE RULE … DO [INSTEAD] NOTHING rule is recorded on its table
-	// (catalog.Table.Rules) and projected here so pg_dump's getRules reads it and
-	// dumpRule re-emits the CREATE RULE (via pg_get_ruledef, reconstructed from
-	// the same RuleInfo). getRules selects only oid/rulename/ev_class/ev_type/
-	// is_instead/ev_enabled, so ev_qual/ev_action stay empty (→ SQL NULL); the
-	// rule text itself comes from the executor's pg_get_ruledef handler, not from
-	// these columns. View _RETURN rules (ev_type '1') are still absent — goopg
-	// has no stored user views feeding this dump path. DU-002 slice 324.
+	// A CREATE RULE … [WHERE qual] DO [INSTEAD] NOTHING rule is recorded on its
+	// table (catalog.Table.Rules) and projected here so pg_dump's getRules reads
+	// it and dumpRule re-emits the CREATE RULE (via pg_get_ruledef, reconstructed
+	// from the same RuleInfo, including the conditional WHERE — DU-002 slice 359).
+	// getRules selects only oid/rulename/ev_class/ev_type/is_instead/ev_enabled,
+	// so ev_qual/ev_action stay empty (→ SQL NULL) even for a conditional rule;
+	// the rule text (with its WHERE) comes from the executor's pg_get_ruledef
+	// handler, not from these columns. View _RETURN rules (ev_type '1') are still
+	// absent — goopg has no stored user views feeding this dump path. DU-002
+	// slice 324.
 	pgRewrite.VirtualRows = func() [][]string {
 		c.mu.RLock()
 		defer c.mu.RUnlock()

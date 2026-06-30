@@ -4799,12 +4799,21 @@ func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	return b.String()
 }
 
-// buildRuleDefString reconstructs the CREATE RULE statement for an
-// unconditional DO-NOTHING rewrite rule, byte-identical to PostgreSQL's
-// single-argument pg_get_ruledef (PRETTYFLAG_INDENT) which pg_dump's dumpRule
-// emits verbatim. Only the DO-NOTHING form is modelled (see catalog.RuleInfo),
-// so there is never a WHERE qualification or an action command to deparse.
-// DU-002 slice 324.
+// buildRuleDefString reconstructs the CREATE RULE statement for a DO-NOTHING
+// rewrite rule, byte-identical to PostgreSQL's single-argument pg_get_ruledef
+// (PRETTYFLAG_INDENT) which pg_dump's dumpRule emits verbatim. Both the
+// unconditional form (DU-002 slice 324) and the conditional `WHERE (qual)` form
+// (DU-002 slice 359) are modelled; an action command is never deparsed (see
+// catalog.RuleInfo). PG's pretty-printer lays a conditional rule out as:
+//
+//	CREATE RULE r AS
+//	    ON UPDATE TO public.t
+//	   WHERE (old.a <> new.a) DO INSTEAD NOTHING;
+//
+// i.e. the WHERE clause goes on its own line with a 3-space indent and the DO
+// action trails it on the SAME line; the unconditional form keeps DO on the
+// `ON … TO …` line. The qual text is already the canonical parenthesized form
+// stored by execCreateRule.
 func buildRuleDefString(tbl *catalog.Table, r catalog.RuleInfo) string {
 	schema := tbl.Schema
 	if schema == "" {
@@ -4819,6 +4828,10 @@ func buildRuleDefString(tbl *catalog.Table, r catalog.RuleInfo) string {
 	b.WriteString(schema)
 	b.WriteByte('.')
 	b.WriteString(tbl.Name)
+	if r.Qual != "" {
+		b.WriteString("\n   WHERE ")
+		b.WriteString(r.Qual)
+	}
 	b.WriteString(" DO ")
 	if r.Instead {
 		b.WriteString("INSTEAD ")

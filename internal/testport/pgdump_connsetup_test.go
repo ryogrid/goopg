@@ -3803,6 +3803,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("enable always rule r_nodel: %v", err)
 	}
 
+	// Slice 359: a CONDITIONAL DO-NOTHING CREATE RULE (`WHERE (qual) DO INSTEAD
+	// NOTHING`) must round-trip through pg_dump — the follow-up slice 324 deferred.
+	// pg_get_ruledef's PRETTYFLAG_INDENT layout puts the WHERE clause on its own
+	// line with a 3-space indent and trails the DO action on that line:
+	//   CREATE RULE r AS
+	//       ON UPDATE TO public.rcond
+	//      WHERE (old.a <> new.a) DO INSTEAD NOTHING;
+	// (verified byte-identical vs real pg_dump 18.3, reference /tmp/du359_ref).
+	// Before this slice goopg captured only the unconditional form (slice 324);
+	// a conditional rule fell through to the CompatNoopStmt path and was silently
+	// dropped on dump. goopg now parses the WHERE qual into an expression AST
+	// (parser.CreateRuleStmt.Qual), deparses it via defaultExprToSQL (the same
+	// renderer the trigger WHEN + index-predicate paths use → single-paren
+	// `(old.a <> new.a)`), stores it on catalog.RuleInfo.Qual, and emits it from
+	// the pg_get_ruledef handler. goopg implements no rewrite system — dump
+	// fidelity only. `rcond` carries both a parenthesized (UPDATE) and a
+	// no-paren (DELETE) source qual; both must normalize to the canonical form.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.rcond (a integer, b integer)"); err != nil {
+		t.Fatalf("create table rcond: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE rcond_upd AS ON UPDATE TO public.rcond WHERE (old.a <> new.a) DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("create rule rcond_upd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE rcond_del AS ON DELETE TO public.rcond WHERE old.b > 0 DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("create rule rcond_del: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7963,6 +7990,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// r_noins stays origin ('O'); dumpRule emits NO ALTER TABLE … RULE for it.
 		if strings.Contains(res.Stdout, "RULE r_noins;") {
 			t.Errorf("pg_dump emitted a spurious ALTER TABLE … RULE r_noins (rule is origin-enabled)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 359 (asserted):** a CONDITIONAL DO-NOTHING CREATE RULE must
+		// round-trip its WHERE clause. pg_get_ruledef's PRETTYFLAG_INDENT layout
+		// puts WHERE on its own line (3-space indent) and trails DO INSTEAD NOTHING
+		// on that line; the qual is the single-paren `(old.x <> new.x)` form
+		// regardless of whether the source had outer parens. Verified byte-identical
+		// to real pg_dump 18.3 (reference /tmp/du359_ref).
+		for _, want := range []string{
+			"CREATE RULE rcond_upd AS\n    ON UPDATE TO public.rcond\n   WHERE (old.a <> new.a) DO INSTEAD NOTHING;",
+			"CREATE RULE rcond_del AS\n    ON DELETE TO public.rcond\n   WHERE (old.b > 0) DO INSTEAD NOTHING;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped or mis-rendered conditional rule: want %q\n  full stdout=%q", want, res.Stdout)
+			}
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

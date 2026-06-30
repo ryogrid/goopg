@@ -70,15 +70,17 @@ func TestParseCreateRuleNothing(t *testing.T) {
 	}
 }
 
-// TestParseCreateRuleNonNothingStaysNoop verifies the slice-324 modelling never
-// captures rules it cannot faithfully round-trip: action commands, conditional
-// WHERE quals, and ON SELECT view rules all stay CompatNoopStmt.
+// TestParseCreateRuleNonNothingStaysNoop verifies the modelling never captures
+// rules it cannot faithfully round-trip: action commands and ON SELECT view
+// rules stay CompatNoopStmt. (The conditional WHERE DO-NOTHING form IS captured
+// — see TestParseCreateRuleConditional — but an action command WITH a WHERE
+// still falls back.)
 func TestParseCreateRuleNonNothingStaysNoop(t *testing.T) {
 	sqls := []string{
 		// Action command (not NOTHING).
 		"CREATE RULE r1 AS ON INSERT TO t DO INSTEAD INSERT INTO log VALUES (1)",
-		// Conditional WHERE.
-		"CREATE RULE r2 AS ON UPDATE TO t WHERE (a > 0) DO INSTEAD NOTHING",
+		// Conditional WHERE WITH an action command (not NOTHING).
+		"CREATE RULE r1b AS ON UPDATE TO t WHERE (a > 0) DO INSTEAD UPDATE t SET a = 1",
 		// ON SELECT (view rule).
 		"CREATE RULE r3 AS ON SELECT TO t DO INSTEAD NOTHING",
 	}
@@ -90,5 +92,70 @@ func TestParseCreateRuleNonNothingStaysNoop(t *testing.T) {
 		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
 			t.Errorf("Parse(%q): expected *CompatNoopStmt, got %T", sql, stmts[0])
 		}
+	}
+}
+
+// TestParseCreateRuleConditional pins the conditional DO-NOTHING grammar that
+// DU-002 slice 359 models as a first-class CreateRuleStmt carrying the WHERE
+// qualification as an expression AST, so pg_get_ruledef can deparse it.
+func TestParseCreateRuleConditional(t *testing.T) {
+	cases := []struct {
+		name      string
+		sql       string
+		wantName  string
+		wantEvent string
+		instead   bool
+	}{
+		{
+			name:      "update where instead nothing",
+			sql:       "CREATE RULE r_c AS ON UPDATE TO public.t WHERE (old.a <> new.a) DO INSTEAD NOTHING",
+			wantName:  "r_c",
+			wantEvent: "UPDATE",
+			instead:   true,
+		},
+		{
+			name:      "delete where no parens instead nothing",
+			sql:       "CREATE RULE r_d AS ON DELETE TO t WHERE old.b > 0 DO INSTEAD NOTHING",
+			wantName:  "r_d",
+			wantEvent: "DELETE",
+			instead:   true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+			rs, ok := stmts[0].(*CreateRuleStmt)
+			if !ok {
+				t.Fatalf("expected *CreateRuleStmt, got %T", stmts[0])
+			}
+			if rs.Name != tc.wantName {
+				t.Errorf("Name = %q, want %q", rs.Name, tc.wantName)
+			}
+			if rs.Event != tc.wantEvent {
+				t.Errorf("Event = %q, want %q", rs.Event, tc.wantEvent)
+			}
+			if rs.Instead != tc.instead {
+				t.Errorf("Instead = %v, want %v", rs.Instead, tc.instead)
+			}
+			if rs.Qual == nil {
+				t.Fatalf("Qual is nil, expected the WHERE expression to be captured")
+			}
+			bo, ok := rs.Qual.(*BinaryOp)
+			if !ok {
+				t.Fatalf("Qual = %T, want *BinaryOp", rs.Qual)
+			}
+			// The qualifier must survive (lower-cased) on the left operand so the
+			// deparse renders old./new. — the heart of the round-trip.
+			cr, ok := bo.Left.(*ColumnRef)
+			if !ok {
+				t.Fatalf("Qual.Left = %T, want *ColumnRef", bo.Left)
+			}
+			if cr.Table != "old" {
+				t.Errorf("Qual.Left.Table = %q, want %q", cr.Table, "old")
+			}
+		})
 	}
 }

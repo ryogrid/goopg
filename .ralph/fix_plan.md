@@ -2992,6 +2992,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `make ralph-state-guard` OK; pgbench smoke = pre-commit. The remaining M0119-0004 item
       is now **M0119-0004-ACLHEAP** plus extended-protocol commit-time deferral; the
       virtual-path ACL slice run is closed.
+      **2026-06-30 (loop #90, design 0119-0004-conditional-rule-pgdump, DU-002 slice 359):
+      conditional CREATE RULE round-trip.** The `WHERE (qual) DO INSTEAD NOTHING` form (the
+      follow-up slice 324 deferred) now round-trips: parser `CreateRuleStmt.Qual Expr` parses
+      the WHERE via `p.parseExpr()` and widens the first-class return to admit a captured qual;
+      catalog `RuleInfo.Qual string` holds the deparsed text; `execCreateRule` deparses via
+      `defaultExprToSQL` (single-paren `(old.a <> new.a)`, no extra layer — same convention as
+      pg_get_indexdef's WHERE); `buildRuleDefString` emits the WHERE on its own 3-space-indented
+      line with DO INSTEAD NOTHING trailing. Byte-identical vs real pg_dump 18.3 (`/tmp/du359_ref`).
+      Tests `TestParseCreateRuleConditional` + `TestDDLCreateRuleConditionalRoundTrip` + slice-359
+      `TestPort_PgDumpConnectionSetup` PASS; parser/catalog/executor suites PASS. **Still open
+      under M0119-0004:** action-command / `DO ALSO <stmt>` rules (full query reverse-compiler);
+      reserved-keyword-named-role quoting; extended-protocol commit-time deferral.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

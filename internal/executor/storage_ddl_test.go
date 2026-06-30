@@ -769,6 +769,49 @@ func TestDDLCreateRuleRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDDLCreateRuleConditionalRoundTrip verifies a conditional DO-NOTHING
+// CREATE RULE (`WHERE (qual) DO INSTEAD NOTHING`) records its deparsed qual and
+// pg_get_ruledef reconstructs the WHERE clause byte-identically to real PG 18.3
+// (captured from a live PG cluster). DU-002 slice 359.
+func TestDDLCreateRuleConditionalRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE rcond (a int, b int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "rcond"})
+	if !ok {
+		t.Fatal("table rcond not in catalog")
+	}
+
+	// Parenthesized qual (UPDATE) and no-paren qual (DELETE); both must deparse to
+	// the canonical single-paren WHERE form.
+	if err := runDDL(t, ctx, "CREATE RULE rcond_upd AS ON UPDATE TO rcond WHERE (old.a <> new.a) DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE rcond_upd: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE rcond_del AS ON DELETE TO rcond WHERE old.b > 0 DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE rcond_del: %v", err)
+	}
+
+	want := map[string]string{
+		"rcond_upd": "CREATE RULE rcond_upd AS\n    ON UPDATE TO public.rcond\n   WHERE (old.a <> new.a) DO INSTEAD NOTHING;",
+		"rcond_del": "CREATE RULE rcond_del AS\n    ON DELETE TO public.rcond\n   WHERE (old.b > 0) DO INSTEAD NOTHING;",
+	}
+	if len(tbl.Rules) != 2 {
+		t.Fatalf("got %d rules, want 2", len(tbl.Rules))
+	}
+	for _, r := range tbl.Rules {
+		if r.Qual == "" {
+			t.Errorf("rule %s has empty Qual", r.Name)
+		}
+		got := buildRuleDefString(tbl, r)
+		if got != want[r.Name] {
+			t.Errorf("pg_get_ruledef(%s) =\n%q\nwant\n%q", r.Name, got, want[r.Name])
+		}
+	}
+}
+
 // TestDDLAlterTableRuleEnabledState verifies `ALTER TABLE … {ENABLE|DISABLE}
 // [REPLICA|ALWAYS] RULE name` sets pg_rewrite.ev_enabled for the named rule
 // (origin 'O', disabled 'D', replica 'R', always 'A') so pg_dump's dumpRule

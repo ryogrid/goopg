@@ -1,10 +1,16 @@
 (idle — nothing in flight)
 
-M0119-0004-ACLHEAP is COMPLETE (loop #89). Both heap-backed user-facing ACL columns now
-round-trip through real pg_dump 18.3: typacl (TYPE/DOMAIN, loop #87) + attacl (column GRANT,
-loop #89). datacl is permanently deferred (pg_database heap + pg_dump --create-only →
-untestable under the --no-create connsetup harness; ledger). The fix_plan box is [x].
+Loop #90 COMPLETE: M0119-0004 DU-002 slice 359 — conditional CREATE RULE
+(`WHERE (qual) DO INSTEAD NOTHING`) now round-trips through real pg_dump 18.3.
+parser CreateRuleStmt.Qual + catalog RuleInfo.Qual + execCreateRule deparse via
+defaultExprToSQL + buildRuleDefString WHERE-on-own-line. Byte-identical golden
+captured from real PG (/tmp/du359_ref). Committed.
 
-Next loop: pick a fresh M0119 item from the fix_plan (e.g. M0119-0005 pg_waldump server tier,
-M0119-0006 pg_amcheck server tier) or the next DU-002 pg_dump catalog-parity slice via the
-self-promoting TestPort_PgDumpConnectionSetup guard.
+Next loop: pick a fresh M0119-0004 pg_dump slice or another M0119 item. Open
+under M0119-0004: action-command CREATE RULE (`DO INSTEAD INSERT/UPDATE/…` —
+needs a full query reverse-compiler, milestone-sized, ledgered loop #90);
+reserved-keyword-named-role quoting (claimed working — guard slice if a real
+gap); extended-protocol commit-time deferral (architecturally entangled).
+Heavier M0119 items: M0119-0002 (CLOG store swap, full-gate session),
+M0119-0005/0006 server tiers (need index AMs / verify_heapam), M0119-0007
+(logical decoding — not actionable).

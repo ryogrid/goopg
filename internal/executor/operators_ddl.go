@@ -10936,11 +10936,22 @@ func (o *ddlOp) execCreateRule(s *parser.CreateRuleStmt) error {
 				Message: fmt.Sprintf("rule %q for relation %q already exists", s.Name, tbl.Name)}
 		}
 	}
+	// DU-002 slice 359: deparse a conditional rule's WHERE qualification via the
+	// same defaultExprToSQL renderer the trigger WHEN and index-predicate paths
+	// use, so pg_dump round-trips it byte-identically. defaultExprToSQL already
+	// fully parenthesizes a top-level OpExpr (`old.a <> new.a` → `(old.a <>
+	// new.a)`), matching pg_get_ruledef's single-paren WHERE form — do NOT add
+	// another layer (that is the same convention pg_get_indexdef's WHERE uses).
+	var qual string
+	if s.Qual != nil {
+		qual = defaultExprToSQL(s.Qual)
+	}
 	tbl.Rules = append(tbl.Rules, catalog.RuleInfo{
 		Name:    s.Name,
 		OID:     o.ctx.Catalog.AllocOID(),
 		Event:   s.Event,
 		Instead: s.Instead,
+		Qual:    qual,
 	})
 	// Preserve the historical CompatNoop bookkeeping so DROP RULE existence
 	// checks and COPY-DML rule-kind handling behave exactly as before this slice

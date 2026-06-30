@@ -793,6 +793,7 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 	event := ""          // ON <event> captured before TO (DU-002 slice 324)
 	isNothing := false   // a NOTHING action was seen at depth 0 after DO
 	hasAction := false   // a non-NOTHING action token was seen after DO
+	var qual Expr        // WHERE qualification captured before DO (DU-002 slice 359)
 
 	for {
 		tok := p.cur()
@@ -838,6 +839,19 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 				continue
 			case kw == "WHERE" && !seenDo:
 				hasWhere = true
+				// DU-002 slice 359: capture the WHERE qualification as a real
+				// expression AST so a conditional DO INSTEAD NOTHING rule can
+				// round-trip through pg_get_ruledef. Parse the a_expr directly
+				// rather than letting the flat token scan discard it; parseExpr
+				// consumes the whole balanced expression (including any parens) and
+				// leaves us positioned at DO, so skip the trailing p.advance().
+				p.advance() // consume WHERE
+				q, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				qual = q
+				continue
 			case kw == "DO" && !seenDo:
 				seenDo = true
 			case seenDo && !seenInstead && !seenAlso && kw == "INSTEAD":
@@ -875,16 +889,21 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 
 	// DU-002 slice 324: the unconditional DO-NOTHING form (no WHERE, no action
 	// command) on an INSERT/UPDATE/DELETE event is modelled as a proper
-	// CreateRuleStmt so it round-trips through pg_dump. Every other form keeps
-	// the historical CompatNoopStmt behaviour untouched.
-	if isNothing && !hasWhere && !hasAction && ns.ObjName.Name != "" && ns.TableName.Name != "" &&
-		(event == "INSERT" || event == "UPDATE" || event == "DELETE") {
+	// CreateRuleStmt so it round-trips through pg_dump. DU-002 slice 359 extends
+	// this to the CONDITIONAL DO-NOTHING form (`WHERE (qual) DO [INSTEAD]
+	// NOTHING`): the captured qual rides CreateRuleStmt.Qual and is deparsed at
+	// dump time. Every other form (action commands, DO ALSO with an action,
+	// utility actions) keeps the historical CompatNoopStmt behaviour untouched.
+	if isNothing && !hasAction && ns.ObjName.Name != "" && ns.TableName.Name != "" &&
+		(event == "INSERT" || event == "UPDATE" || event == "DELETE") &&
+		(!hasWhere || qual != nil) {
 		return &CreateRuleStmt{
 			pos:      pos,
 			Name:     ns.ObjName.Name,
 			Event:    event,
 			Table:    ns.TableName,
 			Instead:  seenInstead,
+			Qual:     qual,
 			RuleKind: ns.RuleKind,
 		}, nil
 	}
