@@ -9403,11 +9403,32 @@ Covered by the new `TestPgQuoteIdentReservedKeywords` (unit: `user`/`select`/`ta
 `TestPort_PgDumpConnectionSetup`: `CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (user 'remote')` now dumps as the quoted
 `"user" 'remote'` byte-identical vs pg_dump 18.3 (the slice-379 keyword caveat is now resolved end-to-end).
 
-**Deferred (siblings):** two other identifier-quoters still lack the keyword check and are recorded in the deferral ledger —
+**Sibling quoters (resolved in slice 383, below):** two other identifier-quoters originally lacked the keyword check —
 `quoteViewIdent` (`expr.go`, `pg_get_viewdef` alias rendering) and `quoteCollationIdent` (`internal/catalog/catalog.go`,
-`pg_get_indexdef` / `COLLATE` rendering; its own comment already concedes reserved-word quoting is not reproduced). The latter is in the
-`catalog` package and cannot import the executor-resident keyword set without an import cycle, so sharing it needs a leaf-package placement
-decision first.
+`pg_get_indexdef` / `COLLATE` rendering). They are fixed in slice 383.
+
+### Slice 383 — **sibling identifier-quoter reserved-keyword fix** (leaf-package lift)
+
+Closes the two sibling quoters deferred at the end of slice 382. The keyword check had to reach two packages — `executor`
+(`pgQuoteIdent`, `quoteViewIdent`) and `catalog` (`quoteCollationIdent`) — but `catalog` cannot import `executor` (import cycle).
+The fix lifts the shared set into a leaf package:
+
+- **New** `internal/sqlkeywords` (leaf package, **no goopg-internal imports**): holds the 164-entry `kwlist.h` reserved-quote set
+  (moved verbatim out of the now-deleted `internal/executor/quote_ident_keywords.go`) and exposes
+  `func IsReservedForQuoting(s string) bool`. Both `executor` and `catalog` import it, resolving the package-placement decision
+  recorded in the slice-382 deferral.
+- **`pgQuoteIdent`** (`executor/expr.go`) now delegates its keyword test to `sqlkeywords.IsReservedForQuoting` — behaviour identical
+  (verified by the unchanged `TestPgQuoteIdentReservedKeywords` and `TestPort_PgDumpConnectionSetup`).
+- **`quoteViewIdent`** (`executor/expr.go`) and **`quoteCollationIdent`** (`catalog/catalog.go`) gain the same
+  `IsReservedForQuoting` check after their char-class loop, so a view column alias or a collation named e.g. `select` now renders
+  `"select"` instead of the bare keyword. `quoteCollationIdent`'s comment that conceded "reserved-word quoting is not reproduced"
+  is removed.
+
+Covered by the new `TestIsReservedForQuoting` (leaf pkg), `TestQuoteViewIdentReservedKeywords` and
+`TestQuoteCollationIdentReservedKeywords` (per-quoter unit pins), plus a new "reserved-keyword alias gets quoted" case in
+`TestApplyViewColumnAliases` that proves the wiring through the real `pg_get_viewdef` alias-splicing callsite. All three identifier
+quoters now share one authoritative keyword set. (An external-binary pg_dump fixture exercising a keyword-named view alias / collation
+remains a low-value follow-up, recorded in the ledger.)
 
 ## Deferred (002–010) — catalog surface estimate
 

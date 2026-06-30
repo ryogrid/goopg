@@ -50,3 +50,27 @@ func TestPgQuoteIdentReservedKeywords(t *testing.T) {
 		}
 	}
 }
+
+// TestQuoteViewIdentReservedKeywords pins quoteViewIdent (pg_get_viewdef column
+// alias rendering) to the same quote_identifier() reserved-word rule as
+// pgQuoteIdent. Both now share internal/sqlkeywords, so a view alias named
+// e.g. "select" must round-trip quoted, not bare (DU-002 slice 383: closes the
+// sibling-quoter gap deferred in slice 382).
+func TestQuoteViewIdentReservedKeywords(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"select", `"select"`}, // RESERVED_KEYWORD
+		{"user", `"user"`},     // RESERVED_KEYWORD
+		{"values", `"values"`}, // COL_NAME_KEYWORD
+		{"name", "name"},       // UNRESERVED_KEYWORD -> bare
+		{"col1", "col1"},       // ordinary identifier -> bare
+		{"Col", `"Col"`},       // uppercase -> quoted (char-class)
+	}
+	for _, c := range cases {
+		if got := quoteViewIdent(c.in); got != c.want {
+			t.Errorf("quoteViewIdent(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

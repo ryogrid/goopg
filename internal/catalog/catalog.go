@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -9933,6 +9934,12 @@ func quoteCollationIdent(s string) string {
 			safe = false
 			break
 		}
+	}
+	// Mirror PostgreSQL quote_identifier(): a char-class-safe, all-lowercase
+	// identifier must still be quoted when it is a non-UNRESERVED keyword, so a
+	// collation named e.g. "select" renders as "select" in pg_get_indexdef.
+	if safe && sqlkeywords.IsReservedForQuoting(s) {
+		safe = false
 	}
 	if safe {
 		return s

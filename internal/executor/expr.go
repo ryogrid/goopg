@@ -26,6 +26,7 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/sqlkeywords"
 )
 
 // sessionPRNG is the per-process random-number generator used by random(),
@@ -10934,6 +10935,12 @@ func quoteViewIdent(s string) string {
 			}
 		}
 	}
+	// Mirror PostgreSQL quote_identifier(): a char-class-safe, all-lowercase
+	// identifier must still be quoted when it is a non-UNRESERVED keyword, so a
+	// view column alias named e.g. "select" round-trips as "select".
+	if simple && sqlkeywords.IsReservedForQuoting(s) {
+		simple = false
+	}
 	if simple {
 		return s
 	}
@@ -11211,10 +11218,8 @@ func pgQuoteIdent(s string) string {
 	// Mirror PostgreSQL quote_identifier(): even a char-class-safe, all-lowercase
 	// identifier must be quoted when it is a non-UNRESERVED keyword, so that e.g.
 	// quote_ident('user') yields "user" and quote_ident('select') yields "select".
-	if safe {
-		if _, isKeyword := pgReservedQuoteKeywords[s]; isKeyword {
-			safe = false
-		}
+	if safe && sqlkeywords.IsReservedForQuoting(s) {
+		safe = false
 	}
 	if safe {
 		return s

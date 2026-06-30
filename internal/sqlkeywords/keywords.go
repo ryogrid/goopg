@@ -1,8 +1,14 @@
-package executor
+// Package sqlkeywords is a leaf package (no goopg-internal imports) holding the
+// set of SQL keywords that PostgreSQL's quote_identifier() must always
+// double-quote. It exists so that identifier-rendering code in both the
+// executor and the catalog packages can share one authoritative keyword set:
+// the catalog package cannot import the executor package (that would create an
+// import cycle), so the set is lifted here where both can reach it.
+package sqlkeywords
 
-// pgReservedQuoteKeywords is the set of SQL keywords that quote_identifier()
-// must always double-quote because their category is NOT UNRESERVED_KEYWORD
-// (i.e. RESERVED_KEYWORD, TYPE_FUNC_NAME_KEYWORD, or COL_NAME_KEYWORD).
+// reservedQuoteKeywords is the set of SQL keywords that quote_identifier() must
+// always double-quote because their category is NOT UNRESERVED_KEYWORD (i.e.
+// RESERVED_KEYWORD, TYPE_FUNC_NAME_KEYWORD, or COL_NAME_KEYWORD).
 //
 // Mirrors PostgreSQL's quote_identifier() in
 // src/backend/utils/adt/ruleutils.c, which does:
@@ -13,11 +19,11 @@ package executor
 //
 // The list is derived verbatim from src/include/parser/kwlist.h (PG 18.3),
 // keeping every entry whose category is not UNRESERVED_KEYWORD. Keywords are
-// stored lowercase; quote_identifier only consults this set after confirming
-// the identifier is already all-lowercase, so a case-insensitive lookup is
-// unnecessary. UNRESERVED_KEYWORDs (e.g. "name", "type", "version") are
-// deliberately absent: they need no quoting.
-var pgReservedQuoteKeywords = map[string]struct{}{
+// stored lowercase; IsReservedForQuoting is only consulted after the caller has
+// confirmed the identifier is already all-lowercase, so a case-insensitive
+// lookup is unnecessary. UNRESERVED_KEYWORDs (e.g. "name", "type", "version")
+// are deliberately absent: they need no quoting.
+var reservedQuoteKeywords = map[string]struct{}{
 	"all":               {}, // RESERVED_KEYWORD
 	"analyse":           {}, // RESERVED_KEYWORD
 	"analyze":           {}, // RESERVED_KEYWORD
@@ -182,4 +188,16 @@ var pgReservedQuoteKeywords = map[string]struct{}{
 	"xmlroot":           {}, // COL_NAME_KEYWORD
 	"xmlserialize":      {}, // COL_NAME_KEYWORD
 	"xmltable":          {}, // COL_NAME_KEYWORD
+}
+
+// IsReservedForQuoting reports whether the all-lowercase identifier s is a SQL
+// keyword whose category is not UNRESERVED_KEYWORD, and therefore must be
+// double-quoted by quote_identifier()-style rendering even when it is otherwise
+// char-class-safe. Callers pass an already-lowercased identifier; the lookup is
+// case-sensitive (PostgreSQL's ScanKeywordLookup down-cases before lookup, but
+// the goopg quoters only reach this check once the identifier is confirmed
+// all-lowercase).
+func IsReservedForQuoting(s string) bool {
+	_, ok := reservedQuoteKeywords[s]
+	return ok
 }
