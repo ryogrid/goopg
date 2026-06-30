@@ -12516,6 +12516,14 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					return nil
 				}
 			}
+		case "user mapping":
+			// DROP USER MAPPING FOR <user> SERVER <server>: Names = [user, server].
+			// Remove the dump-visible registry entry (DU-002 slice 377).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
+				if im.DropUserMapping(s.Names[0].String(), s.Names[1].String()) {
+					return nil
+				}
+			}
 		case "foreign-data wrapper":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				fdwName := s.Names[0].String()
@@ -12662,6 +12670,14 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// dumpForeignDataWrapper). The dedicated registry mints a stable OID so
 		// repeated VirtualRows calls return the same identity. DU-002 slice 375.
 		im.RegisterForeignDataWrapper(s.ObjName.String())
+	case "user mapping":
+		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
+		// so it round-trips through pg_dump (pg_user_mappings virtual view →
+		// dumpUserMappings). ObjName carries the mapped user; TableName carries the
+		// server association. Without this, creating any foreign server makes
+		// pg_dump query the (previously missing) pg_user_mappings view and abort.
+		// DU-002 slice 377.
+		im.RegisterUserMapping(s.ObjName.String(), s.TableName.String())
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""

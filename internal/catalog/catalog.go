@@ -2159,6 +2159,13 @@ type InMemory struct {
 	// srvname. DU-002 slice 376.
 	foreignServers map[string]*ForeignServer
 
+	// userMappings tracks user mappings (CREATE USER MAPPING FOR <user> SERVER
+	// <server>) with a stable OID so they round-trip through pg_dump's
+	// dumpUserMappings (pg_user_mappings virtual view, queried per foreign server).
+	// goopg does not execute foreign access; only enough metadata is kept for dump
+	// fidelity. Key: lowercase "<user>\x00<server>". DU-002 slice 377.
+	userMappings map[string]*UserMapping
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -6762,6 +6769,64 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
 
+	// pg_user_mappings — the publicly-readable view over pg_user_mapping JOIN
+	// pg_foreign_server (system_views.sql). For every foreign server, pg_dump's
+	// dumpForeignServer runs dumpUserMappings, which queries
+	//   SELECT usename, array_to_string(ARRAY(SELECT quote_ident(option_name) ||
+	//   ' ' || quote_literal(option_value) FROM pg_options_to_table(umoptions)
+	//   ORDER BY option_name), E',\n    ') AS umoptions FROM pg_user_mappings
+	//   WHERE srvid = '<oid>' ORDER BY usename
+	// Once any CREATE SERVER exists (slice 376), this query runs for real, so the
+	// view MUST exist or pg_dump aborts with `relation "pg_user_mappings" does not
+	// exist` (exit 1, empty dump). goopg models it as a virtual relation surfacing
+	// the user-mapping registry. Schema mirrors the system view's output columns:
+	// umid oid, srvid oid, srvname name, umuser oid, usename name, umoptions text[].
+	// DU-002 slice 377.
+	pgUserMappings := &Table{
+		Schema: "pg_catalog", Name: "pg_user_mappings", Virtual: true,
+		Columns: []Column{
+			{Name: "umid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "srvid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "srvname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "umuser", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "usename", Type: Type{Name: "name"}, Ordinal: 4},
+			{Name: "umoptions", Type: Type{Name: "text[]"}, Ordinal: 5},
+		},
+	}
+	// Surface user-created user mappings (CREATE USER MAPPING). srvid resolves to
+	// the referenced server's stable OID (the column pg_dump filters on); usename
+	// is the mapped role name (PUBLIC → 'public'); umuser is its role OID (0 for
+	// PUBLIC). umoptions is NULL (empty), so pg_options_to_table(umoptions) yields
+	// 0 rows → array_to_string returns '' → dumpUserMappings omits the OPTIONS
+	// clause and emits the bare `CREATE USER MAPPING FOR <usename> SERVER <srv>;`.
+	// DU-002 slice 377.
+	pgUserMappings.VirtualRows = func() [][]string {
+		mappings := c.ListUserMappings()
+		if len(mappings) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(mappings))
+		for _, m := range mappings {
+			usename := m.UmUser
+			umuser := uint32(0) // ACL_ID_PUBLIC
+			if usename == "" || strings.EqualFold(usename, "public") {
+				usename = "public"
+			} else if oid, ok := c.RoleOID(m.UmUser); ok {
+				umuser = oid
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),                         // umid
+				strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName)), 10), // srvid
+				m.SrvName,                              // srvname
+				strconv.FormatUint(uint64(umuser), 10), // umuser
+				usename,                                // usename
+				"",                                     // umoptions (NULL)
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_user_mappings"] = pgUserMappings
+
 	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
 	// pg_dump's getUserMappings short-circuits (no foreign servers → no catalog
 	// query), so the next catalog query is getDefaultACLs:
@@ -9524,6 +9589,89 @@ func (c *InMemory) ListForeignServers() []*ForeignServer {
 		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ForeignServerOID returns the stable OID of the named foreign server, or 0 if
+// no such server is registered. Used by pg_user_mappings.VirtualRows to populate
+// srvid (the column pg_dump's dumpUserMappings filters on). DU-002 slice 377.
+func (c *InMemory) ForeignServerOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if s, ok := c.foreignServers[name]; ok {
+		return s.OID
+	}
+	return 0
+}
+
+// UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>
+// SERVER <server>). goopg does not execute foreign access; this records just
+// enough metadata to round-trip the CREATE/DROP through pg_dump (pg_user_mappings
+// virtual view → dumpUserMappings). DU-002 slice 377.
+type UserMapping struct {
+	OID     uint32 // pg_user_mapping.oid (assigned from the catalog OID counter)
+	UmUser  string // the mapped role name; "" / "public" → the PUBLIC pseudo-role
+	SrvName string // the referenced server name; resolved to srvid OID at render time
+}
+
+// userMappingKey builds the registry key for a (user, server) pair. The user and
+// server names are matched case-insensitively (goopg lowercases unquoted idents).
+func userMappingKey(user, server string) string {
+	return strings.ToLower(user) + "\x00" + strings.ToLower(server)
+}
+
+// RegisterUserMapping records a user mapping, allocating a stable OID on first
+// sight. Idempotent: re-registering an existing (user, server) pair returns the
+// existing entry without changing its OID. DU-002 slice 377.
+func (c *InMemory) RegisterUserMapping(user, server string) *UserMapping {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userMappings == nil {
+		c.userMappings = make(map[string]*UserMapping)
+	}
+	key := userMappingKey(user, server)
+	if m, ok := c.userMappings[key]; ok {
+		return m
+	}
+	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server}
+	c.userMappings[key] = m
+	return m
+}
+
+// DropUserMapping removes a user mapping from the registry. Returns true if found.
+// DU-002 slice 377.
+func (c *InMemory) DropUserMapping(user, server string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userMappings == nil {
+		return false
+	}
+	key := userMappingKey(user, server)
+	if _, ok := c.userMappings[key]; ok {
+		delete(c.userMappings, key)
+		return true
+	}
+	return false
+}
+
+// ListUserMappings returns all registered user mappings sorted by server name
+// then user name (deterministic dump order). DU-002 slice 377.
+func (c *InMemory) ListUserMappings() []*UserMapping {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userMappings) == 0 {
+		return nil
+	}
+	out := make([]*UserMapping, 0, len(c.userMappings))
+	for _, m := range c.userMappings {
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SrvName != out[j].SrvName {
+			return out[i].SrvName < out[j].SrvName
+		}
+		return out[i].UmUser < out[j].UmUser
+	})
 	return out
 }
 

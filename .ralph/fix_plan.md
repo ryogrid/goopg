@@ -3180,6 +3180,24 @@ documentation-only and is exempt from the design-doc requirement.)
       `public.addr2type`/`public.typedtab` in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
       per-column `OF type (col WITH OPTIONS …)` form rejected; non-public-schema composite `OF` uncovered;
       pg_class.reltype stays 0.
+      **2026-06-30 (loop #16, design 0110-0001 slice 377): `CREATE USER MAPPING FOR <user>
+      SERVER <srv>` round-trip + exit-0 pipeline REPAIR (PRODUCTION fix).** Slice 376 made a foreign
+      server dumpable, which makes pg_dump's `dumpForeignServer` ALWAYS call `dumpUserMappings` →
+      `SELECT usename,…umoptions FROM pg_user_mappings WHERE srvid='<oid>'`. goopg had no
+      `pg_user_mappings` view, so pg_dump aborted (`exit=1`, empty dump) and `TestPort_PgDumpConnectionSetup`
+      silently skipped EVERY positive assertion (they run only inside `if res.ExitCode==0`) — the suite was
+      green while verifying nothing. Added a `pg_user_mappings` virtual relation (umid,srvid,srvname,umuser,
+      usename,umoptions) over a dedicated user-mapping registry (`catalog.UserMapping{OID,UmUser,SrvName}` +
+      RegisterUserMapping/DropUserMapping/ListUserMappings + `ForeignServerOID` helper; srvid resolves to the
+      server OID, umuser via RoleOID, PUBLIC→usename 'public'/umuser 0, umoptions NULL → `pg_options_to_table`
+      yields 0 rows → no OPTIONS clause). Parser CREATE/DROP USER MAPPING arms caught BEFORE the generic
+      `user` role/compat stubs (plain `CREATE USER <role>` still errors → server-layer role DDL handles it);
+      executor `execCompatNoop` `user mapping`→RegisterUserMapping, `DropCompatStmt` `user mapping`→DropUserMapping.
+      Emits bare `CREATE USER MAPPING FOR um_role SERVER goopg_srv;` byte-identical vs pg_dump 18.3. Tests
+      `TestUserMappingRegistry` + `TestParseCreateUserMapping` + DU-002 slice 377 fixture (which, by reaching
+      exit 0, also re-arms slices 375/376 and all earlier asserts). **Deferred (ledger):** mapping `OPTIONS`
+      discarded (umoptions NULL); mappings in-memory only; user-spec kind not distinguished (non-`public`
+      non-registered user → umuser=0); `pg_user_mapping` heap (OID 1418) not populated.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

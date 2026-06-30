@@ -4764,6 +4764,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("create server: %v", err)
 	}
+	// Slice 377: a USER MAPPING (`CREATE USER MAPPING FOR <user> SERVER <srv>`)
+	// must round-trip — AND, critically, this is the slice that REPAIRS the whole
+	// exit-0 pipeline: once any CREATE SERVER exists (slice 376), pg_dump's
+	// dumpForeignServer calls dumpUserMappings, which queries the pg_user_mappings
+	// view. goopg had no such view, so pg_dump aborted with
+	// `relation "pg_user_mappings" does not exist` (exit 1, empty dump) — silently
+	// skipping every positive assertion below. goopg now models pg_user_mappings as
+	// a virtual relation over a dedicated user-mapping registry; dumpUserMappings
+	// reads `usename`/`umoptions WHERE srvid='<oid>'` and emits the bare
+	// `CREATE USER MAPPING FOR <usename> SERVER <srv>;` (no OPTIONS — deferred). The
+	// mapped role must exist first so umuser resolves to a real OID.
+	if err := runSQLSimple(t, c, "CREATE ROLE um_role"); err != nil {
+		t.Fatalf("create role um_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv"); err != nil {
+		t.Fatalf("create user mapping: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -9993,6 +10010,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "CREATE SERVER goopg_srv TYPE") ||
 			strings.Contains(res.Stdout, "CREATE SERVER goopg_srv VERSION") {
 			t.Errorf("pg_dump emitted a spurious TYPE/VERSION on the bare server (slice-376 NULL srvtype/srvversion regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 377: a USER MAPPING must round-trip as the bare
+		// `CREATE USER MAPPING FOR <user> SERVER <srv>;` form (no OPTIONS — deferred).
+		// dumpUserMappings reads usename from the pg_user_mappings view (filtered by
+		// srvid) and the server name from the server's catalog entry. This assertion
+		// ALSO proves the exit-0 repair: before this slice the pg_user_mappings query
+		// failed (relation does not exist) and the whole dump aborted, so reaching
+		// this branch at all means the view now resolves. Verified against real
+		// pg_dump 18.3 (dumpUserMappings).
+		umStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv;"
+		if !strings.Contains(res.Stdout, umStmt) {
+			t.Errorf("pg_dump dropped the USER MAPPING (slice-377); missing %q\n  full stdout=%q", umStmt, res.Stdout)
+		}
+		// umoptions is NULL, so pg_options_to_table yields no rows and dumpUserMappings
+		// must omit the OPTIONS clause — a spurious empty `OPTIONS (` would mean the
+		// NULL→empty-array projection regressed.
+		if strings.Contains(res.Stdout, "CREATE USER MAPPING FOR um_role SERVER goopg_srv OPTIONS") {
+			t.Errorf("pg_dump emitted a spurious OPTIONS clause on the option-less user mapping (slice-377)\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

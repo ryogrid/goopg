@@ -70,6 +70,67 @@ func TestParseCreateOperatorArgTypes(t *testing.T) {
 	}
 }
 
+// TestParseCreateUserMapping verifies CREATE/DROP USER MAPPING parses to a
+// CompatNoopStmt/DropCompatStmt carrying the (user, server) pair, while a plain
+// CREATE USER (role) still fails to parse so the server-layer role-DDL path
+// handles it. DU-002 slice 377.
+func TestParseCreateUserMapping(t *testing.T) {
+	stmts, err := Parse("CREATE USER MAPPING FOR um_role SERVER goopg_srv")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ObjType != "user mapping" {
+		t.Errorf("ObjType = %q, want %q", ns.ObjType, "user mapping")
+	}
+	if ns.ObjName.Name != "um_role" {
+		t.Errorf("user = %q, want um_role", ns.ObjName.Name)
+	}
+	if ns.TableName.Name != "goopg_srv" {
+		t.Errorf("server = %q, want goopg_srv", ns.TableName.Name)
+	}
+
+	// OPTIONS clause is tolerated (and discarded) — the user/server still parse.
+	stmts, err = Parse("CREATE USER MAPPING FOR um_role SERVER goopg_srv OPTIONS (user 'x', password 'y')")
+	if err != nil {
+		t.Fatalf("Parse error with OPTIONS: %v", err)
+	}
+	if ns, _ := stmts[0].(*CompatNoopStmt); ns == nil || ns.ObjName.Name != "um_role" || ns.TableName.Name != "goopg_srv" {
+		t.Errorf("OPTIONS form mis-parsed: %+v", stmts[0])
+	}
+
+	// DROP USER MAPPING FOR <user> SERVER <server>: Names = [user, server].
+	stmts, err = Parse("DROP USER MAPPING FOR um_role SERVER goopg_srv")
+	if err != nil {
+		t.Fatalf("Parse error (drop): %v", err)
+	}
+	ds, ok := stmts[0].(*DropCompatStmt)
+	if !ok {
+		t.Fatalf("Expected *DropCompatStmt, got %T", stmts[0])
+	}
+	if ds.ObjType != "user mapping" {
+		t.Errorf("drop ObjType = %q, want %q", ds.ObjType, "user mapping")
+	}
+	if len(ds.Names) != 2 || ds.Names[0].Name != "um_role" || ds.Names[1].Name != "goopg_srv" {
+		t.Errorf("drop Names = %+v, want [um_role goopg_srv]", ds.Names)
+	}
+
+	// DROP USER MAPPING IF EXISTS sets the flag.
+	stmts, _ = Parse("DROP USER MAPPING IF EXISTS FOR um_role SERVER goopg_srv")
+	if ds, _ := stmts[0].(*DropCompatStmt); ds == nil || !ds.IfExists {
+		t.Errorf("DROP USER MAPPING IF EXISTS did not set IfExists: %+v", stmts[0])
+	}
+
+	// A plain CREATE USER (role DDL) must NOT parse here — it returns an error so
+	// the server-layer role-DDL intercept handles it.
+	if _, err := Parse("CREATE USER alice"); err == nil {
+		t.Errorf("CREATE USER alice parsed successfully; it must fall through to the role-DDL path")
+	}
+}
+
 func TestParseCreateRuleTableName(t *testing.T) {
 	sql := `CREATE RULE test_rule_exists AS ON INSERT TO test_exists
     DO INSTEAD

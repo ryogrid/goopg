@@ -9213,6 +9213,45 @@ round-trips without them. Servers are in-memory only (do not survive a restart).
 `srvfdw=0`, which would make pg_dump's single-row subquery fail — goopg does not validate the reference (PG rejects it at CREATE time).
 `CREATE USER MAPPING` is still not dumped (`dumpUserMappings` runs after each server).
 
+### Slice 377 — **`CREATE USER MAPPING FOR <user> SERVER <srv>`** round-trip + **exit-0 pipeline repair** (PRODUCTION fix)
+
+The direct follow-on to slice 376 — and, more urgently, the repair for a regression slice 376 introduced. Once *any* foreign server
+exists, pg_dump's `dumpForeignServer` always calls `dumpUserMappings` (servers unconditionally get `DUMP_COMPONENT_USERMAP`), which runs
+`SELECT usename, array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) FROM
+pg_options_to_table(umoptions) ORDER BY option_name), E',\n    ') AS umoptions FROM pg_user_mappings WHERE srvid = '<oid>' ORDER BY
+usename` against the **`pg_user_mappings`** view (system_views.sql: `pg_user_mapping JOIN pg_foreign_server`). goopg had no such view, so
+the moment slice 376 made a server dumpable, this query failed with `relation "pg_user_mappings" does not exist` → pg_dump aborted with
+`exit=1` and an **empty dump**. Because `TestPort_PgDumpConnectionSetup` only runs its positive assertions inside `if res.ExitCode == 0`,
+*every* slice's round-trip assertion (including slice 376's own) was silently skipped — the suite was green while verifying nothing.
+
+This slice both restores exit 0 and round-trips the mapping:
+
+- **Catalog** (`internal/catalog/catalog.go`): a `pg_user_mappings` virtual relation (columns `umid, srvid, srvname, umuser, usename,
+  umoptions` — the system view's output shape) backed by a dedicated user-mapping registry (`UserMapping{OID, UmUser, SrvName}` keyed by
+  lowercase `"<user>\x00<server>"`). `RegisterUserMapping` mints a stable OID (idempotent); `ForeignServerOID(name)` resolves the server
+  to the `srvid` pg_dump filters on; `umuser` resolves via `RoleOID` (`PUBLIC` → usename `'public'`, umuser `0`). `umoptions` is NULL
+  (empty), so `pg_options_to_table(NULL)` returns 0 rows → `array_to_string` is `''` → `dumpUserMappings` omits the `OPTIONS` clause and
+  emits the bare `CREATE USER MAPPING FOR <usename> SERVER <srv>;`.
+- **Parser** (`internal/parser/ddl.go`): a `CREATE USER MAPPING FOR <user> SERVER <server> [OPTIONS (...)]` arm produces a
+  `CompatNoopStmt{ObjType:"user mapping"}` (user in `ObjName`, server in `TableName`); a `DROP USER MAPPING [IF EXISTS] FOR <user> SERVER
+  <server>` arm produces a `DropCompatStmt{ObjType:"user mapping", Names:[user, server]}`. Both are caught **before** the generic `user`
+  role/compat stubs (which would otherwise treat `MAPPING` as a role name). A plain `CREATE USER <role>` still returns a parse error so the
+  server-layer role-DDL intercept handles it unchanged. `scanUserMappingForServer` loosely extracts the `FOR`/`SERVER` operands and skips
+  `OPTIONS`.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `user mapping` arm calls `RegisterUserMapping`; the
+  `DropCompatStmt` `user mapping` arm calls `DropUserMapping`.
+
+Covered by `TestUserMappingRegistry` (unit: view exists + empty by default, stable/idempotent OID, srvid/umuser resolution, PUBLIC row,
+drop), `TestParseCreateUserMapping` (CREATE/DROP/OPTIONS/IF-EXISTS parse + the plain-`CREATE USER` fall-through), and the `um_role`/`goopg_srv`
+fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact `CREATE USER MAPPING …;` statement, the absence of a spurious `OPTIONS`
+clause, **and** — by reaching the `ExitCode==0` branch at all — that the whole dump pipeline is restored). Verified against real pg_dump
+18.3 (`dumpUserMappings`).
+
+**Deferred (ledger):** mapping `OPTIONS (user '…', password '…')` are discarded by the parser (`umoptions` always NULL). Mappings are
+in-memory only. The user-spec kind (CURRENT_USER/SESSION_USER/etc.) is not distinguished — only the literal token is kept, so a
+non-`public` pseudo-user that is not a registered role renders with `umuser=0`. `pg_user_mapping` (the heap catalog, OID 1418) is not
+populated; the view is registry-backed for dump fidelity only.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

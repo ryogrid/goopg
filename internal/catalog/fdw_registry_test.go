@@ -145,3 +145,86 @@ func TestForeignServerRegistry(t *testing.T) {
 		t.Fatalf("after drop: pg_foreign_server has %d rows, want 1", len(rows))
 	}
 }
+
+// TestUserMappingRegistry verifies the user-mapping registry and the
+// pg_user_mappings virtual view that pg_dump's dumpUserMappings reads. The view
+// MUST exist (returning 0 rows by default) so that creating any foreign server
+// does not make pg_dump abort on a missing relation. DU-002 slice 377.
+func TestUserMappingRegistry(t *testing.T) {
+	c := NewInMemory()
+
+	// The view exists and is empty on a fresh server (this is the exit-0 guard:
+	// pg_dump queries pg_user_mappings for every foreign server).
+	umView, ok := c.tables["pg_catalog.pg_user_mappings"]
+	if !ok {
+		t.Fatalf("pg_user_mappings virtual view is not registered")
+	}
+	if rows := umView.VirtualRows(); len(rows) != 0 {
+		t.Fatalf("empty mapping registry: pg_user_mappings has %d rows, want 0", len(rows))
+	}
+
+	// Register a server + role so the mapping resolves srvid and umuser.
+	c.RegisterForeignDataWrapper("goopg_fdw")
+	srv := c.RegisterForeignServer("goopg_srv", "goopg_fdw")
+	c.RegisterRole("um_role")
+	roleOID, _ := c.RoleOID("um_role")
+
+	m := c.RegisterUserMapping("um_role", "goopg_srv")
+	if m.OID < FirstUserOID {
+		t.Fatalf("RegisterUserMapping minted OID %d below FirstUserOID %d", m.OID, FirstUserOID)
+	}
+	// Idempotent: same (user, server) returns the same OID.
+	if m2 := c.RegisterUserMapping("um_role", "goopg_srv"); m2.OID != m.OID {
+		t.Fatalf("re-register mapping changed OID: %d → %d", m.OID, m2.OID)
+	}
+
+	// The view row mirrors dumpUserMappings' inputs: srvid resolves to the server
+	// OID, usename is the role name, umuser its OID, umoptions NULL (empty).
+	rows := umView.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("pg_user_mappings has %d rows, want 1", len(rows))
+	}
+	want := []string{
+		strconv.FormatUint(uint64(m.OID), 10),   // umid
+		strconv.FormatUint(uint64(srv.OID), 10), // srvid → server OID
+		"goopg_srv",                             // srvname
+		strconv.FormatUint(uint64(roleOID), 10), // umuser → role OID
+		"um_role",                               // usename
+		"",                                      // umoptions (NULL)
+	}
+	if len(rows[0]) != len(want) {
+		t.Fatalf("mapping row width %d, want %d", len(rows[0]), len(want))
+	}
+	for i := range want {
+		if rows[0][i] != want[i] {
+			t.Fatalf("mapping row col %d = %q, want %q (full row %+v)", i, rows[0][i], want[i], rows[0])
+		}
+	}
+
+	// A PUBLIC mapping renders usename='public' with umuser=0 (ACL_ID_PUBLIC).
+	c.RegisterUserMapping("public", "goopg_srv")
+	pubRows := umView.VirtualRows()
+	var foundPublic bool
+	for _, r := range pubRows {
+		if r[4] == "public" {
+			foundPublic = true
+			if r[3] != "0" {
+				t.Fatalf("PUBLIC mapping umuser = %q, want 0", r[3])
+			}
+		}
+	}
+	if !foundPublic {
+		t.Fatalf("PUBLIC mapping missing from pg_user_mappings: %+v", pubRows)
+	}
+
+	// Drop removes it; dropping a missing pair is a no-op.
+	if !c.DropUserMapping("um_role", "goopg_srv") {
+		t.Fatalf("DropUserMapping(um_role, goopg_srv) returned false")
+	}
+	if c.DropUserMapping("um_role", "goopg_srv") {
+		t.Fatalf("DropUserMapping second call returned true")
+	}
+	if rows := umView.VirtualRows(); len(rows) != 1 { // only the PUBLIC mapping remains
+		t.Fatalf("after drop: pg_user_mappings has %d rows, want 1", len(rows))
+	}
+}

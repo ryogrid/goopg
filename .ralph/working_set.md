@@ -1,41 +1,42 @@
 (idle — nothing in flight)
 
-Loop #15 COMPLETE: M0119-0004 DU-002 slice 376 — `CREATE SERVER <name> FOREIGN
-DATA WRAPPER <fdw>` now round-trips through pg_dump (PRODUCTION fix).
+Loop #16 COMPLETE: M0119-0004 DU-002 slice 377 — `CREATE USER MAPPING FOR <user>
+SERVER <srv>` round-trip THROUGH pg_dump + **exit-0 pipeline REPAIR**.
 
-Natural follow-on to slice 375 (FDW registry). goopg parsed CREATE SERVER into a
-CompatNoopStmt (server name + FDW association already extracted by the parser)
-but only registered a bare compat object; pg_foreign_server.VirtualRows was
-hard-wired to 0 rows, so a created server vanished from the dump. Real pg_dump's
-getForeignServers reads all pg_foreign_server rows; dumpForeignServer recovers
-the wrapper name via `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid =
-srvfdw` (single-row subquery) and emits `CREATE SERVER <n> FOREIGN DATA WRAPPER
-<fdw>;` + `ALTER SERVER <n> OWNER TO postgres;`.
+CRITICAL find: slice 376 (CREATE SERVER) silently regressed the whole
+TestPort_PgDumpConnectionSetup — a dumpable foreign server makes pg_dump's
+dumpForeignServer ALWAYS call dumpUserMappings, which queries `pg_user_mappings`
+(a view goopg lacked) → pg_dump aborted (exit=1, empty dump). The test runs its
+positive asserts ONLY inside `if res.ExitCode==0`, so every slice's round-trip
+assertion (incl. 375/376) was being SKIPPED. Confirmed via -v: the "remaining
+DU-002 catalog-parity gap exit=1 … relation pg_user_mappings does not exist" log.
+This slice restores exit 0 AND round-trips the mapping.
 
-Fix (mirrors slice-375 FDW pattern):
-- catalog: ForeignServer{Name,OID,Owner,FdwName} registry + RegisterForeignServer
-  /DropForeignServer/ListForeignServers + ForeignDataWrapperOID helper;
-  pg_foreign_server.VirtualRows resolves srvfdw to the FDW's stable OID,
-  srvtype/srvversion/srvacl/srvoptions = NULL, owner = 10.
-- executor: `server` CompatNoopStmt arm ALSO calls RegisterForeignServer (compat
-  + fdw-server association kept for CASCADE); DROP SERVER + FDW-cascade call
-  DropForeignServer.
+Fix (mirrors slice 375/376 registry pattern):
+- catalog: `pg_user_mappings` virtual relation (umid,srvid,srvname,umuser,usename,
+  umoptions) over UserMapping{OID,UmUser,SrvName} registry + RegisterUserMapping/
+  DropUserMapping/ListUserMappings + `ForeignServerOID` helper. srvid←server OID,
+  umuser←RoleOID, PUBLIC→'public'/0, umoptions NULL→no OPTIONS clause.
+- parser: CREATE/DROP USER MAPPING arms caught BEFORE generic `user` role/compat
+  stubs (plain CREATE USER still errors → server-layer role DDL). scanUserMappingForServer.
+- executor: execCompatNoop `user mapping`→RegisterUserMapping; DropCompatStmt arm.
 
-Files: internal/catalog/catalog.go (field+VirtualRows+struct+methods),
-internal/catalog/fdw_registry_test.go (TestForeignServerRegistry, appended),
-internal/executor/operators_ddl.go (3 wiring sites),
-internal/testport/pgdump_connsetup_test.go (goopg_srv fixture + asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 376), ledger.
+Files: internal/catalog/catalog.go (field+view+struct+5 methods),
+internal/catalog/fdw_registry_test.go (TestUserMappingRegistry),
+internal/parser/ddl.go (CREATE+DROP arms + scanUserMappingForServer),
+internal/parser/op_compat_test.go (TestParseCreateUserMapping),
+internal/executor/operators_ddl.go (2 arms),
+internal/testport/pgdump_connsetup_test.go (um_role/goopg_srv fixture + asserts),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 377), fix_plan, ledger.
 
-Gates: TestForeignServerRegistry + TestForeignDataWrapperRegistry +
-TestPort_PgDumpConnectionSetup PASS; catalog/parser suites PASS;
-go build ./... + gofmt(my lines) clean. pgbench smoke = pre-commit hook.
-No TPC-H (metadata-only virtual-catalog change; servers absent from TPC-H).
+Gates: TestUserMappingRegistry+TestForeignServer/FDWRegistry + TestParseCreateUserMapping
++ full parser/catalog/executor suites PASS; TestPort_PgDumpConnectionSetup now reaches
+exit 0 (asserts re-armed). go build ./... + gofmt(my lines) clean. pgbench smoke = pre-commit.
+No TPC-H (metadata-only virtual-catalog change).
 
-Deferred (ledger): TYPE/VERSION/OPTIONS discarded by parser; servers in-memory
-only; CREATE USER MAPPING still not dumped; non-registered-FDW reference → srvfdw=0.
+Deferred (ledger): mapping OPTIONS discarded; in-memory only; user-spec kind not
+distinguished (non-public non-registered → umuser=0); pg_user_mapping heap (1418) not populated.
 
-Next loop: pick a fresh M0119-0004 pg_dump slice via empirical probe. Candidates
-NOT yet done: CREATE USER MAPPING (dumpUserMappings, follow-on to this slice),
-range types (CREATE TYPE AS RANGE — large), aggregates, operators, text-search
-configs, CREATE COLLATION (parser doesn't accept).
+Next loop: fresh M0119-0004 pg_dump slice. Candidates: SERVER/MAPPING/FDW OPTIONS
+rendering (text[] options array); range types (CREATE TYPE AS RANGE); aggregates;
+operators; text-search configs; CREATE COLLATION (parser doesn't accept).

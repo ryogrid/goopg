@@ -289,6 +289,19 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.TableName = fdwName // reuse TableName field to store FDW association
 		}
 		return ns, nil
+	// CREATE USER MAPPING FOR <user> SERVER <server> [OPTIONS (...)] — register so
+	// it round-trips through pg_dump (pg_user_mappings view → dumpUserMappings).
+	// Only the MAPPING form is parsed here; plain CREATE USER/ROLE is handled at
+	// the server layer (role DDL), so when "mapping" does not follow we return a
+	// parse error and the statement falls through to that path. DU-002 slice 377.
+	case p.acceptIdentKeyword("user"):
+		if !p.acceptIdentKeyword("mapping") {
+			return nil, p.errAtCur("expected MAPPING after CREATE USER")
+		}
+		userName, srvName := p.scanUserMappingForServer()
+		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "user mapping", ObjName: ObjectName{Name: userName}}
+		ns.TableName = ObjectName{Name: srvName} // reuse TableName for the server association
+		return ns, nil
 	// CREATE FOREIGN TABLE / CREATE FOREIGN DATA WRAPPER. M0097-0071.
 	// FOREIGN is a reserved keyword so acceptKeyword is required (not acceptIdentKeyword).
 	case p.acceptKeyword(KwForeign):
@@ -356,6 +369,42 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return p.parseCreateTablespaceTail(t.Pos)
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, TRIGGER, EXTENSION, or TABLESPACE after CREATE")
+}
+
+// scanUserMappingForServer loosely scans the tail of a
+//
+//	[CREATE|DROP] USER MAPPING [IF ...] FOR <user> SERVER <server> [OPTIONS (...)]
+//
+// statement, returning the mapped user name (the token after FOR) and the server
+// name (the token after SERVER), then skipping to the statement terminator. The
+// user may be a role name, PUBLIC, or CURRENT_USER/CURRENT_ROLE/SESSION_USER/USER;
+// goopg keeps only enough to round-trip the mapping through pg_dump, so OPTIONS
+// and the precise user-spec kind are intentionally not modelled. DU-002 slice 377.
+func (p *parser) scanUserMappingForServer() (user, server string) {
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+			break
+		}
+		if tok.Kind == TokenKeyword && tok.Keyword == KwFor {
+			p.advance()
+			if ut := p.cur(); ut.Kind == TokenIdent || ut.Kind == TokenKeyword {
+				user = ut.Value
+				p.advance()
+			}
+			continue
+		}
+		if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "server") {
+			p.advance()
+			if st := p.cur(); st.Kind == TokenIdent || st.Kind == TokenKeyword {
+				server = st.Value
+				p.advance()
+			}
+			continue
+		}
+		p.advance()
+	}
+	return user, server
 }
 
 // parseCreateExtensionTail parses the tail of
@@ -3828,6 +3877,25 @@ func (p *parser) parseDrop() (Stmt, error) {
 		}
 		return &DropCompatStmt{pos: t.Pos, ObjType: objType, IfExists: ifExists,
 			Names: names, Behavior: behavior}, nil
+	}
+	// DROP USER MAPPING [IF EXISTS] FOR <user> SERVER <server> — must be caught
+	// before the generic "user" compat-stub (which would treat MAPPING as a role
+	// name). Records the (user, server) pair so the executor unregisters it.
+	// DU-002 slice 377.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "user") &&
+		(p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "mapping")) {
+		p.advance() // user
+		p.advance() // mapping
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		userName, srvName := p.scanUserMappingForServer()
+		return &DropCompatStmt{pos: t.Pos, ObjType: "user mapping", IfExists: ifExists,
+			Names: []ObjectName{{Name: userName}, {Name: srvName}}}, nil
 	}
 	// DROP AGGREGATE [IF EXISTS] name ( argtype_list ) [CASCADE|RESTRICT]
 	// PG requires the parenthesised argument-type list; without it the grammar
