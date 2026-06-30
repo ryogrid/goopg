@@ -299,3 +299,48 @@ func TestUserMappingRegistry(t *testing.T) {
 		t.Fatalf("after drop: pg_user_mappings has %d rows, want 1", len(rows))
 	}
 }
+
+// TestQuoteArrayElement pins goopg's reproduction of PostgreSQL's array_out
+// element-quoting rules (src/backend/utils/adt/arrayfuncs.c). Option values
+// carrying array metacharacters (comma, brace, space, quote, backslash) must be
+// double-quoted in the srvoptions/fdwoptions/umoptions text[] literal so
+// pg_options_to_table re-splits them correctly when pg_dump round-trips them.
+// DU-002 slice 384.
+func TestQuoteArrayElement(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"host=localhost", "host=localhost"}, // metachar-free → bare
+		{"host=a,b", `"host=a,b"`},           // embedded delimiter → quoted
+		{"path=/a b", `"path=/a b"`},         // whitespace → quoted
+		{"k={x}", `"k={x}"`},                 // braces → quoted
+		{`k=a"b`, `"k=a\"b"`},                // embedded quote → escaped
+		{`k=a\b`, `"k=a\\b"`},                // embedded backslash → escaped
+		{"", `""`},                           // empty → quoted
+		{"NULL", `"NULL"`},                   // null word (any case) → quoted
+		{"null", `"null"`},                   // null word (any case) → quoted
+	}
+	for _, tc := range cases {
+		if got := quoteArrayElement(tc.in); got != tc.want {
+			t.Errorf("quoteArrayElement(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestOptionsArrayLiteralMetachar verifies the full text[] literal wraps each
+// element per array_out, so a comma-bearing option value yields a quoted element
+// rather than a comma that would corrupt pg_options_to_table splitting.
+// DU-002 slice 384.
+func TestOptionsArrayLiteralMetachar(t *testing.T) {
+	if got := optionsArrayLiteral(nil); got != "" {
+		t.Errorf("optionsArrayLiteral(nil) = %q, want empty (SQL NULL)", got)
+	}
+	// Metachar-free options stay bare → byte-identical to the pre-slice-384 output.
+	if got, want := optionsArrayLiteral([]string{"host=localhost", "dbname=mydb"}), "{host=localhost,dbname=mydb}"; got != want {
+		t.Errorf("optionsArrayLiteral metachar-free = %q, want %q", got, want)
+	}
+	// A value with an embedded comma must quote that whole element only.
+	if got, want := optionsArrayLiteral([]string{"host=a,b", "dbname=mydb"}), `{"host=a,b",dbname=mydb}`; got != want {
+		t.Errorf("optionsArrayLiteral metachar = %q, want %q", got, want)
+	}
+}

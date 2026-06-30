@@ -4864,6 +4864,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (delimiter 'pipe', debug 'true')"); err != nil {
 		t.Fatalf("create fdw with options: %v", err)
 	}
+	// Slice 384: an OPTIONS value containing an array metacharacter (here a comma)
+	// must round-trip. PostgreSQL stores srvoptions as a text[] of `name=value`
+	// elements rendered with array_out, which double-quotes any element carrying a
+	// comma/brace/space/quote/backslash — `{"host=a,b"}` — so pg_dump's
+	// pg_options_to_table(srvoptions) re-splits the element on its first `=` and
+	// recovers value `a,b` intact. Before slice 384 goopg comma-joined the literal
+	// bare (`{host=a,b}`), so the SRF split on the embedded comma and corrupted the
+	// option list. goopg now quotes each element per array_out (quoteArrayElement),
+	// so the value survives. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'a,b')"); err != nil {
+		t.Fatalf("create server with metachar option: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -10158,6 +10170,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		umKwStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (\n    \"user\" 'remote'\n);"
 		if !strings.Contains(res.Stdout, umKwStmt) {
 			t.Errorf("pg_dump mis-quoted the reserved-keyword option name (slice-382); missing %q\n  full stdout=%q", umKwStmt, res.Stdout)
+		}
+		// Slice 384: an OPTIONS value containing an array metacharacter must
+		// round-trip. goopg stores `host=a,b` as the array_out-quoted srvoptions
+		// element `{"host=a,b"}`; pg_dump's pg_options_to_table re-splits it on the
+		// element's first `=` and recovers value `a,b`, so dumpForeignServer emits
+		// `host 'a,b'`. Before slice 384 goopg comma-joined the literal bare
+		// (`{host=a,b}`), so the SRF split on the embedded comma and produced a
+		// corrupt two-row option list (`host 'a'` plus a bogus nameless option).
+		// Verified against real pg_dump 18.3.
+		srvMcStmt := "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'a,b'\n);"
+		if !strings.Contains(res.Stdout, srvMcStmt) {
+			t.Errorf("pg_dump corrupted the metachar OPTION value (slice-384); missing %q\n  full stdout=%q", srvMcStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

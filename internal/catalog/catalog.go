@@ -4102,7 +4102,7 @@ func (c *InMemory) registerSystemTables() {
 			}
 			reloptions := ""
 			if len(relopts) > 0 {
-				reloptions = "{" + strings.Join(relopts, ",") + "}"
+				reloptions = arrayTextLiteral(relopts)
 			}
 			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
 			// table / materialized view with at least one toastable (varlena)
@@ -4217,7 +4217,7 @@ func (c *InMemory) registerSystemTables() {
 				// reloptions is NULL unless the table set explicit toast.* params.
 				toastReloptions := ""
 				if len(t.ToastReloptions) > 0 {
-					toastReloptions = "{" + strings.Join(t.ToastReloptions, ",") + "}"
+					toastReloptions = arrayTextLiteral(t.ToastReloptions)
 				}
 				out = append(out, []string{
 					strconv.Itoa(toastOID), // 0:  oid
@@ -4358,7 +4358,7 @@ func (c *InMemory) registerSystemTables() {
 				for i, kv := range opts {
 					parts[i] = kv[0] + "=" + kv[1]
 				}
-				idxReloptions = "{" + strings.Join(parts, ",") + "}"
+				idxReloptions = arrayTextLiteral(parts)
 			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
@@ -9545,19 +9545,68 @@ func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
 // execute foreign servers; this records just enough metadata to round-trip the
 // CREATE/DROP through pg_dump (pg_foreign_server virtual view →
 // getForeignServers/dumpForeignServer). DU-002 slice 376.
+// quoteArrayElement renders a single text[] element using PostgreSQL's array_out
+// quoting rules (array_out / ARRAY_QUOTE in src/backend/utils/adt/arrayfuncs.c).
+// An element is wrapped in double quotes — with embedded `"` and `\` backslash-
+// escaped — when it is empty, equals the word NULL case-insensitively, or
+// contains a double-quote, backslash, brace, the element delimiter (comma for
+// text[]), or ASCII whitespace; otherwise it is emitted bare. Without this an
+// option value carrying array metacharacters (e.g. host 'a,b' → element
+// `host=a,b`) would be split on its embedded comma when pg_dump re-parses the
+// srvoptions/fdwoptions/umoptions text[] via pg_options_to_table, corrupting the
+// round-trip. DU-002 slice 384.
+func quoteArrayElement(s string) string {
+	needquote := s == "" || strings.EqualFold(s, "NULL")
+	if !needquote {
+		for i := 0; i < len(s); i++ {
+			switch s[i] {
+			case '"', '\\', '{', '}', ',', ' ', '\t', '\n', '\r', '\v', '\f':
+				needquote = true
+			}
+			if needquote {
+				break
+			}
+		}
+	}
+	if !needquote {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' || s[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// arrayTextLiteral renders elements as a PostgreSQL text[] external literal
+// ("{elem,elem,…}"), quoting each element per array_out's rules (see
+// quoteArrayElement). Callers must guard the empty case themselves.
+func arrayTextLiteral(parts []string) string {
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = quoteArrayElement(p)
+	}
+	return "{" + strings.Join(quoted, ",") + "}"
+}
+
 // optionsArrayLiteral renders a list of "name=value" option elements as the
 // PostgreSQL text[] external literal (e.g. {host=localhost,dbname=mydb}) that
 // pg_dump's pg_options_to_table(srvoptions) SRF expands back into one
 // (option_name, option_value) row per element. An empty list yields "" (SQL
-// NULL, so no OPTIONS clause is emitted). Mirrors the reloptions text[]
-// rendering ("{" + join(",") + "}"); option values containing array
-// metacharacters (comma, brace, space, quote) are not yet quoted — see the
-// deferral ledger. DU-002 slice 378.
+// NULL, so no OPTIONS clause is emitted). Each element is quoted per PG's
+// array_out rules (quoteArrayElement), so option values containing array
+// metacharacters (comma, brace, space, quote, backslash) round-trip intact.
+// DU-002 slice 378 (metachar quoting: slice 384).
 func optionsArrayLiteral(opts []string) string {
 	if len(opts) == 0 {
 		return ""
 	}
-	return "{" + strings.Join(opts, ",") + "}"
+	return arrayTextLiteral(opts)
 }
 
 type ForeignServer struct {

@@ -9430,6 +9430,28 @@ Covered by the new `TestIsReservedForQuoting` (leaf pkg), `TestQuoteViewIdentRes
 quoters now share one authoritative keyword set. (An external-binary pg_dump fixture exercising a keyword-named view alias / collation
 remains a low-value follow-up, recorded in the ledger.)
 
+### Slice 384 — **array-metachar OPTIONS value quoting** (cross-cutting renderer fix)
+
+Closes the array-metacharacter quoting deferral carried since slices 378–380. PostgreSQL stores foreign
+`srvoptions`/`fdwoptions`/`umoptions` as a `text[]` of `name=value` elements rendered by `array_out`, which double-quotes any
+element containing a comma, brace, ASCII whitespace, double-quote, or backslash (and the empty string / the word `NULL`,
+case-insensitively), backslash-escaping embedded `"`/`\`. goopg previously comma-joined the literal bare
+(`{host=a,b}`), so a value carrying a metacharacter (`host 'a,b'`) split on its embedded comma when pg_dump re-parsed it via
+`pg_options_to_table`, yielding a corrupt option list.
+
+- **New `quoteArrayElement(s string) string`** (`catalog/catalog.go`) reproduces `array_out`'s element-quoting rules
+  (`src/backend/utils/adt/arrayfuncs.c`).
+- **New `arrayTextLiteral(parts []string) string`** wraps the elements as `{…}`, quoting each via `quoteArrayElement`.
+- **`optionsArrayLiteral`** now delegates to `arrayTextLiteral`, so `{host=localhost,dbname=mydb}` stays byte-identical
+  (metachar-free elements emit bare) while `host 'a,b'` renders `{"host=a,b"}` and round-trips intact.
+- The three `pg_class.reloptions` renderers (table/toast/index) also route through `arrayTextLiteral` for one authoritative
+  quoter; their values are numeric/bool/enum-word so the output is unchanged, but the path is now metachar-safe.
+
+goopg's existing `parseTextArray` already unquotes `"host=a,b"` → `host=a,b`, which `pg_options_to_table` then splits on the
+element's first `=` to recover value `a,b`. Covered by the new `TestQuoteArrayElement` and `TestOptionsArrayLiteralMetachar`
+unit pins plus a new end-to-end `goopg_srv_mc` (`OPTIONS (host 'a,b')`) fixture/assertion in `TestPort_PgDumpConnectionSetup`,
+verified byte-identical against real pg_dump 18.3.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
