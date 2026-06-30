@@ -9113,6 +9113,39 @@ its schema-qualified name (slices 249/250 via `LookupCompositeTypeByOID` / `…B
 **Deferred (ledger):** composite-column *values* (INSERT/COPY of a literal `(a,b)` row) are not exercised — this slice is schema-dump
 fidelity only. A composite column in a non-`public` schema isn't covered (composite types are registered by bare name).
 
+### Slice 374 — **typed table `CREATE TABLE name OF composite_type`** round-trip (PRODUCTION fix)
+
+A composite type round-trips (slices 242/243) and a table *column* typed as a composite round-trips (slice 373), but a **typed table** —
+one whose entire column set is *derived* from a composite type via `CREATE TABLE name OF type` — could not be created at all: goopg's
+`CREATE TABLE` parser had no `OF` arm, so the statement raised a syntax error before reaching the executor. PostgreSQL records
+`pg_class.reloftype = <type OID>` for such a table; pg_dump's `dumpTableSchema` appends ` OF <format_type(reloftype)>` after the table
+name and then **skips every type-derived column** (the `OidIsValid(reloftype) && !print_default && !print_notnull` branch in the attr
+loop), so the `CREATE TABLE` carries *no parenthesized column list at all* — just `CREATE TABLE public.typedtab OF public.addr2type;`.
+
+This slice wires the feature end-to-end at the dump-fidelity layer:
+
+- **Parser** (`internal/parser/ddl.go`): after the table name, an `OF type_name` arm records `CreateTableStmt.OfType` (a new
+  `*ObjectName` AST field) and consumes the standard trailing suffix clauses. A per-column `( … WITH OPTIONS … )` list is explicitly
+  rejected (not silently dropped) — deferred.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCreateTable` looks up the composite type
+  (`InMemory.LookupCompositeType`), synthesizes one `parser.ColumnDef` per field (`compositeFieldColumnType` converts the stored
+  `ColType` token string into `{Name, Args, IsArray}`, mirroring `parseCompositeFieldType`), and feeds them through the normal
+  column-build path so a field typed as a domain/enum/array resolves identically to an explicit column. PG keeps `attislocal=true` on
+  these columns (`makeColumnDef` default; `transformOfType` does not clear it) and pg_dump skips them via the *reloftype* test, not
+  `attislocal`, so **no inheritance plumbing is needed**. The composite's pg_type OID is stamped onto `catalog.Table.OfTypeOID`.
+- **Catalog** (`internal/catalog/catalog.go`): the new `Table.OfTypeOID` field is surfaced as `pg_class.reloftype` in *both* the virtual
+  `VirtualRows` builder (the one pg_dump reads) and — as the maintained sibling — the heap `buildUserPGClassRow`
+  (`internal/executor/pg18_user_catalog_rows.go`). `format_type` already resolves the OID to the qualified composite name (slices
+  249/250).
+
+Covered by `TestUserPGClassRowOfType` + `TestCompositeFieldColumnType` (unit) and the `public.addr2type`/`public.typedtab` pair in
+`TestPort_PgDumpConnectionSetup` (asserts the exact `OF` statement, the *absence* of an inline column list, the `COPY (a, b)` list, and a
+round-tripped data row `7\tseven`). Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du374_pgdata`).
+
+**Deferred (ledger):** the per-column option/constraint form `CREATE TABLE name OF type (col WITH OPTIONS DEFAULT …, CONSTRAINT …)` is
+rejected, not supported. A typed table `OF` a composite in a non-`public` schema isn't covered (composite registry is bare-name).
+`pg_class.reltype` (the table's own rowtype) stays 0, as for every other goopg table.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

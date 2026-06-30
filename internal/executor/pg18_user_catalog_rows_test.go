@@ -1889,6 +1889,85 @@ func TestUserPGClassRowReplicaIdentity(t *testing.T) {
 	}
 }
 
+// TestUserPGClassRowOfType verifies buildUserPGClassRow projects a typed table's
+// catalog.Table.OfTypeOID to pg_class.reloftype. pg_dump's dumpTableSchema keys
+// the `CREATE TABLE name OF type` form off reloftype, so a regression that
+// hard-wired it to 0 would silently demote a typed table to an ordinary one
+// (re-emitting the type-derived columns inline). DU-002 slice 374.
+func TestUserPGClassRowOfType(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	idx := -1
+	for i, c := range cols {
+		if c.Name == "reloftype" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("reloftype column not found in pgClassColumnsPG18")
+	}
+	cases := []struct {
+		name string
+		oid  uint32
+		want int64
+	}{
+		{"ordinary-table", 0, 0},
+		{"typed-table", 16742, 16742},
+	}
+	for _, tc := range cases {
+		tbl := &catalog.Table{
+			Schema:    "public",
+			Name:      "of_tbl",
+			OID:       16700,
+			OfTypeOID: tc.oid,
+			Columns: []catalog.Column{
+				{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+				{Name: "b", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+			},
+		}
+		row := buildUserPGClassRow(nil, tbl)
+		if got := row[idx].Int; got != tc.want {
+			t.Errorf("%s: reloftype = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestCompositeFieldColumnType verifies the ColType→parser.ColumnType conversion
+// used to synthesize a typed table's columns from its composite type's fields.
+// DU-002 slice 374.
+func TestCompositeFieldColumnType(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantName  string
+		wantArgs  []int64
+		wantArray bool
+	}{
+		{"integer", "integer", nil, false},
+		{"text", "text", nil, false},
+		{"numeric ( 10 , 2 )", "numeric", []int64{10, 2}, false},
+		{"double precision", "double precision", nil, false},
+		{"text [ ]", "text", nil, true},
+		{"numeric ( 10 , 2 ) [ ]", "numeric", []int64{10, 2}, true},
+	}
+	for _, tc := range cases {
+		got := compositeFieldColumnType(tc.in)
+		if got.Name != tc.wantName || got.IsArray != tc.wantArray {
+			t.Errorf("compositeFieldColumnType(%q) = {Name:%q IsArray:%v}, want {Name:%q IsArray:%v}",
+				tc.in, got.Name, got.IsArray, tc.wantName, tc.wantArray)
+		}
+		if len(got.Args) != len(tc.wantArgs) {
+			t.Errorf("compositeFieldColumnType(%q) Args = %v, want %v", tc.in, got.Args, tc.wantArgs)
+			continue
+		}
+		for i := range got.Args {
+			if got.Args[i] != tc.wantArgs[i] {
+				t.Errorf("compositeFieldColumnType(%q) Args = %v, want %v", tc.in, got.Args, tc.wantArgs)
+				break
+			}
+		}
+	}
+}
+
 // TestUserPGIndexRowReplicaIdentity verifies buildUserPGIndexRow projects the
 // index's IsReplicaIdentity flag to pg_index.indisreplident. pg_dump reads this
 // to emit `ALTER TABLE ONLY <t> REPLICA IDENTITY USING INDEX <idx>` at

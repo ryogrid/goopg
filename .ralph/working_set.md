@@ -1,43 +1,45 @@
 (idle — nothing in flight)
 
-Loop #12 COMPLETE: M0119-0004 DU-002 slice 373 — a TABLE column typed as a
-user-defined COMPOSITE type (`c public.addr`, `carr public.addr[]`) now
-round-trips through pg_dump (PRODUCTION fix).
+Loop #13 COMPLETE: M0119-0004 DU-002 slice 374 — typed table
+`CREATE TABLE name OF composite_type` now round-trips through pg_dump as the
+`OF type` form with NO inline column list (PRODUCTION fix).
 
-Bug: a composite type name is not a built-in, so the CREATE TABLE column path
-folds it to the text fallback (catalog.TypeNameToOID / InMemory.ResolveColumnType
-both preserve the bare name unchanged — it's not a domain). buildUserPGAttributeRow
-(pg18_user_catalog_rows.go) had an enum branch (slice 88) and a domain branch
-(slice 90) over the text fallback but NO composite branch, so pg_attribute.atttypid
-stayed text(25) → pg_dump getTableAttrs→format_type rendered the column `text` /
-`text[]` (UNRESTORABLE dump).
+Bug: goopg's CREATE TABLE parser had no `OF` arm → syntax error, so a typed
+table could not be created or dumped. PG records pg_class.reloftype; pg_dump's
+dumpTableSchema appends ` OF <type>` and skips every type-derived column (the
+reloftype attr-loop branch), so the dump is `CREATE TABLE public.typedtab OF
+public.addr2type;`.
 
-Fix: added the composite branch mirroring enum/domain — when typOID==OIDText and
-no enum matched, `cat.LookupCompositeType(col.Type.Name)` → composite OID (scalar)
-or ct.ArrayOID (`addr[]`, attndims=1). Layout = varlena/attlen=-1/attbyval=false/
-attalign='d'/attstorage='x' (mirrors buildUserPGTypeRowForComposite). The parser
-splits `public.addr` into Schema+Name so Type.Name is the bare registry key.
-format_type already resolves composite OID/array OID → qualified name (slices
-249/250), so no other site changed.
+Fix (end-to-end, dump-fidelity): parser arm → CreateTableStmt.OfType (new AST
+*ObjectName). execCreateTable looks up the composite (LookupCompositeType),
+synthesizes a ColumnDef per field (compositeFieldColumnType parses the stored
+ColType token string) through the normal column-build path, and stamps
+catalog.Table.OfTypeOID. Surfaced as pg_class.reloftype in BOTH the virtual
+VirtualRows builder (pg_dump reads this) and the heap buildUserPGClassRow
+sibling. PG keeps attislocal=true on OF-type columns (makeColumnDef default;
+transformOfType does not clear it) — pg_dump skips them via the reloftype check,
+not attislocal — so no inheritance plumbing. Columns are real: COPY (a,b) +
+data row 7\tseven round-trip.
 
 Files:
-- internal/executor/pg18_user_catalog_rows.go (buildUserPGAttributeRow: composite
-  branch + array-OID remap case + attrs layout case)
-- internal/executor/pg18_user_catalog_rows_test.go (TestUserPGAttributeCompositeColumn)
-- internal/testport/pgdump_connsetup_test.go (public.comptcol fixture + assertions)
-- docs/design/0110-0001-pg-dump-tap-port.md (Slice 373)
-- .ralph/fix_plan.md + .ralph/deferral_ledger.md (slice 373)
+- internal/parser/ast.go (CreateTableStmt.OfType)
+- internal/parser/ddl.go (parseCreateTableTail OF arm; rejects (col WITH OPTIONS))
+- internal/catalog/catalog.go (Table.OfTypeOID + virtual pg_class reloftype via relOfType local)
+- internal/executor/operators_ddl.go (execCreateTable OF block + compositeFieldColumnType helper)
+- internal/executor/pg18_user_catalog_rows.go (heap pg_class reloftype sibling)
+- internal/executor/pg18_user_catalog_rows_test.go (TestUserPGClassRowOfType + TestCompositeFieldColumnType)
+- internal/testport/pgdump_connsetup_test.go (public.addr2type/typedtab fixture + asserts)
+- docs/design/0110-0001-pg-dump-tap-port.md (Slice 374)
+- .ralph/fix_plan.md + .ralph/deferral_ledger.md (slice 374)
 
-Gates: TestUserPGAttributeCompositeColumn + executor + catalog suites PASS;
-TestPort_PgDumpConnectionSetup PASS (5.1s, byte-identical vs real pg_dump 18.3);
-build/gofmt/vet clean; pgbench smoke = pre-commit hook. No TPC-H (metadata-only
-catalog-row builder; composite types absent from TPC-H schema — precedent slices
-370-372).
+Gates: unit + TestPort_PgDumpConnectionSetup PASS (5.9s, byte-identical vs real
+pg_dump 18.3, ref /tmp/du374_pgdata); parser/catalog/executor suites PASS;
+build/gofmt(my lines)/vet clean; pgbench smoke = pre-commit hook. No TPC-H
+(metadata-only catalog-row builder; typed tables absent from TPC-H schema).
 
-Deferred (ledger): composite-column VALUES (INSERT/COPY) not exercised (schema-dump
-fidelity only); non-public-schema composite columns uncovered (registry is bare-name).
+Deferred (ledger): per-column `OF type (col WITH OPTIONS …)` form rejected;
+non-public-schema composite OF uncovered; pg_class.reltype stays 0.
 
-Next loop: pick a fresh M0119-0004 pg_dump slice. Empirical probe (throwaway
-zz_probe_test.go dumping a feature-rich schema, then visually diff vs known PG
-output) is the fastest way to find the next divergence given the deep existing
-coverage.
+Next loop: pick a fresh M0119-0004 pg_dump slice via empirical probe (throwaway
+zz_probe_test.go dumping a feature-rich schema → diff vs real pg_dump 18.3).
+Coverage is very deep; typed tables was the cleanest remaining divergence found.

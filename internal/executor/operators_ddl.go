@@ -500,6 +500,42 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 	return nil
 }
 
+// compositeFieldColumnType converts a composite type field's column-type string
+// (as stored in catalog.CompositeField.ColType — parser tokens joined by spaces,
+// e.g. "integer", "numeric ( 10 , 2 )", "text [ ]") into the parser.ColumnType a
+// synthesized typed-table column carries. It mirrors the splitting in
+// parseCompositeFieldType (array suffix, then optional typmod args), collapsing
+// the multi-word base name to the single-spaced form column-type resolution
+// recognizes. DU-002 slice 374.
+func compositeFieldColumnType(colType string) parser.ColumnType {
+	str := strings.TrimSpace(colType)
+	isArray := false
+	if i := strings.IndexByte(str, '['); i >= 0 {
+		isArray = true
+		str = strings.TrimSpace(str[:i])
+	}
+	base := str
+	var args []int64
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		inner := base[i+1:]
+		base = strings.TrimSpace(base[:i])
+		if j := strings.IndexByte(inner, ')'); j >= 0 {
+			inner = inner[:j]
+		}
+		for _, part := range strings.Split(inner, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if n, err := strconv.ParseInt(part, 10, 64); err == nil {
+				args = append(args, n)
+			}
+		}
+	}
+	base = strings.Join(strings.Fields(base), " ")
+	return parser.ColumnType{Name: base, Args: args, IsArray: isArray}
+}
+
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
@@ -567,6 +603,38 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// The data is populated by the SELECT execution.
 	if s.SelectSource != nil {
 		return o.execCreateTableAs(s)
+	}
+
+	// CREATE TABLE name OF type_name — a typed table whose columns are derived
+	// from a composite type. We synthesize a ColumnDef per composite field and
+	// feed them through the normal column-build path (so domain/enum/array field
+	// types resolve identically to an explicit column). pg_class.reloftype is set
+	// to the composite type's OID after the table is created, so pg_dump re-emits
+	// the `OF type_name` form and suppresses the type-derived column list. PG keeps
+	// attislocal=true on these columns (makeColumnDef default; transformOfType does
+	// not clear it), and pg_dump skips them on dump via the reloftype check rather
+	// than attislocal — so no inheritance plumbing is needed. DU-002 slice 374.
+	var ofTypeOID uint32
+	if s.OfType != nil {
+		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "typed tables are not supported on this catalog"}
+		}
+		ct := im.LookupCompositeType(s.OfType.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.OfType.String())}
+		}
+		ofTypeOID = ct.OID
+		derived := make([]parser.ColumnDef, 0, len(ct.Fields))
+		for _, f := range ct.Fields {
+			derived = append(derived, parser.ColumnDef{
+				Name:      f.Name,
+				Type:      compositeFieldColumnType(f.ColType),
+				Collation: f.Collation,
+			})
+		}
+		s.Columns = derived
 	}
 
 	// Build the column list, merging inherited columns first (M0096-0009).
@@ -1959,6 +2027,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
 	tbl.Unlogged = s.Unlogged
+	tbl.OfTypeOID = ofTypeOID // typed table `OF type` → pg_class.reloftype (DU-002 slice 374)
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)

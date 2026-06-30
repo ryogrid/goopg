@@ -4706,6 +4706,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TABLE public.comptcol (c public.addr, carr public.addr[], lbl text)"); err != nil {
 		t.Fatalf("create table comptcol: %v", err)
 	}
+	// Slice 374: a TYPED TABLE `CREATE TABLE name OF composite_type` — the table's
+	// columns are derived from the composite type's fields rather than written in a
+	// column list. PG records pg_class.reloftype = the type's OID; pg_dump's
+	// dumpTableSchema appends ` OF public.addr2type` after the table name and SKIPS
+	// every type-derived column (the `reloftype && !print_default && !print_notnull`
+	// branch), so the CREATE TABLE carries NO parenthesized column list at all —
+	// `CREATE TABLE public.typedtab OF public.addr2type;`. goopg previously rejected
+	// the `OF` form at the parser (syntax error), so a typed table could not be
+	// created, let alone dumped. The parser now accepts it, the executor materializes
+	// the type's fields as ordinary columns (attislocal=true, matching PG's
+	// transformOfType) and stamps catalog.Table.OfTypeOID, and both pg_class builders
+	// (virtual + heap) surface it as reloftype. format_type resolves the reloftype OID
+	// to the qualified composite name (slices 249/250). The COPY column list (a, b)
+	// and a round-tripped data row confirm the columns are real (not dump-only
+	// metadata). A dedicated `addr2type`/`typedtab` pair keeps the comptcol asserts
+	// untouched. (Per-column WITH OPTIONS / non-public composite types remain
+	// deferred — dump-fidelity layer only.)
+	if err := runSQLSimple(t, c, "CREATE TYPE public.addr2type AS (a integer, b text)"); err != nil {
+		t.Fatalf("create type addr2type: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.typedtab OF public.addr2type"); err != nil {
+		t.Fatalf("create typed table: %v", err)
+	}
+	if err := runSQLSimple(t, c, "INSERT INTO public.typedtab (a, b) VALUES (7, 'seven')"); err != nil {
+		t.Fatalf("insert into typed table: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -9873,6 +9899,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "    carr text[],") {
 			t.Errorf("pg_dump rendered the composite-array TABLE column as text[] (slice-373 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 374: a TYPED TABLE (`CREATE TABLE name OF composite_type`) must dump
+		// as the `OF type` form with NO column list (every column is type-derived and
+		// suppressed by pg_dump's reloftype check). The exact statement is verified
+		// byte-for-byte against real pg_dump 18.3 (reference /tmp/du374_pgdata).
+		typedTabStmt := "CREATE TABLE public.typedtab OF public.addr2type;"
+		if !strings.Contains(res.Stdout, typedTabStmt) {
+			t.Errorf("pg_dump dropped the typed-table OF form (slice-374); missing %q\n  full stdout=%q", typedTabStmt, res.Stdout)
+		}
+		// A regression that lost reloftype would re-emit the columns inline as a
+		// normal table (`CREATE TABLE public.typedtab (` with a parenthesized list);
+		// the OF form carries no '(' so this exact prefix must be absent.
+		if strings.Contains(res.Stdout, "CREATE TABLE public.typedtab (") {
+			t.Errorf("pg_dump emitted the typed table with an inline column list (slice-374 reloftype regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// The type-derived columns are real: the COPY column list names them in
+		// order and the inserted row round-trips through the data section.
+		if !strings.Contains(res.Stdout, "COPY public.typedtab (a, b) FROM stdin;") {
+			t.Errorf("pg_dump typed-table COPY column list regressed (slice-374)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "7\tseven") {
+			t.Errorf("pg_dump typed-table data row missing (slice-374)\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

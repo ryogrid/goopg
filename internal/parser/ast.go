@@ -1268,6 +1268,11 @@ type CreateTableStmt struct {
 	// M0096-0009 will use these; for now the field is populated so the
 	// syntax is accepted and the executor can create the child table.
 	Inherits []ObjectName
+	// OfType is non-nil for a typed table `CREATE TABLE name OF type_name`.
+	// The table's columns are derived from the named composite type and
+	// pg_class.reloftype is set to the type's OID, so pg_dump re-emits the
+	// `OF type_name` form (suppressing the column list). DU-002 slice 374.
+	OfType *ObjectName
 	// ColumnAliases holds the optional column-name list from
 	// `CREATE TABLE name (col1, col2, …) AS SELECT …`. When non-nil its
 	// length must not exceed the number of columns the SELECT returns; alias

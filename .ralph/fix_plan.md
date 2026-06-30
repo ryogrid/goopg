@@ -3162,6 +3162,24 @@ documentation-only and is exempt from the design-doc requirement.)
       (unit) + `public.comptcol` table in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
       composite-column VALUES (INSERT/COPY) not exercised — schema-dump fidelity only; non-public-schema
       composite columns uncovered.
+
+      **2026-06-30 (loop #13, design 0110-0001 slice 374): typed table `CREATE TABLE name OF
+      composite_type` round-trip (PRODUCTION fix).** A composite TYPE round-trips (242/243) and a column
+      typed as a composite round-trips (373), but a TYPED TABLE — whose whole column set is *derived* from
+      a composite via `OF type` — could not be created: goopg's CREATE TABLE parser had no `OF` arm
+      (syntax error). PG records `pg_class.reloftype`; pg_dump appends ` OF <type>` and SKIPS every
+      type-derived column (the reloftype attr-loop branch), so the dump is `CREATE TABLE public.typedtab OF
+      public.addr2type;` with NO column list. Wired end-to-end: parser arm → `CreateTableStmt.OfType`
+      (new AST field), `execCreateTable` looks up the composite (`LookupCompositeType`), synthesizes a
+      `ColumnDef` per field (`compositeFieldColumnType` parses the stored ColType) through the normal
+      column-build path, and stamps `catalog.Table.OfTypeOID`; surfaced as `reloftype` in BOTH the virtual
+      `VirtualRows` pg_class (pg_dump-read) and the heap `buildUserPGClassRow` sibling. PG keeps
+      attislocal=true (pg_dump skips via reloftype, not attislocal) so no inheritance plumbing. Columns are
+      real: COPY `(a, b)` + data row `7\tseven` round-trip. Byte-identical vs real pg_dump 18.3 (ref
+      /tmp/du374_pgdata). Tests `TestUserPGClassRowOfType` + `TestCompositeFieldColumnType` (unit) +
+      `public.addr2type`/`public.typedtab` in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
+      per-column `OF type (col WITH OPTIONS …)` form rejected; non-public-schema composite `OF` uncovered;
+      pg_class.reltype stays 0.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

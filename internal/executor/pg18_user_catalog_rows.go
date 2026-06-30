@@ -452,7 +452,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewStringDatum(tbl.Name),                                   // relname (name)
 		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema))), // relnamespace
 		NewIntDatum(0),                                             // reltype (no composite type seeded yet)
-		NewIntDatum(0),                                             // reloftype
+		NewIntDatum(int64(tbl.OfTypeOID)),                          // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 		NewIntDatum(bootstrapSuperuserOID),                         // relowner
 		NewIntDatum(pgHeapAccessMethodOID),                         // relam
 		NewIntDatum(relfilenode),                                   // relfilenode

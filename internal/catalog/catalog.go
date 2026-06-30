@@ -347,6 +347,15 @@ type Table struct {
 	// reltuples / relpages plus per-column pg_statistic data.
 	Stats *TableStats
 
+	// OfTypeOID is the pg_type OID of the composite type a typed table was
+	// declared `OF` (`CREATE TABLE name OF type_name`). Zero for ordinary
+	// tables. Surfaced as pg_class.reloftype so pg_dump re-emits the `OF
+	// type_name` form and suppresses the (type-derived) column list. The
+	// columns themselves are materialized normally (attislocal=true,
+	// matching PG, which skips them on dump via the reloftype check, not
+	// attislocal). DU-002 slice 374.
+	OfTypeOID uint32
+
 	// SmallDimension flags a table whose row count is known to
 	// be ≤ a tiny constant — the canonical TPC-H examples are
 	// `region` (5 rows) and `nation` (25 rows). The planner uses
@@ -4117,6 +4126,10 @@ func (c *InMemory) registerSystemTables() {
 			// client-side). DU-002 slice 331. Sequences (relkind 'S') render with
 			// the sequence privilege set / owner default "rwU" so a GRANT … ON
 			// SEQUENCE round-trips against acldefault('s', owner). DU-002 slice 333.
+			// reloftype: the composite type OID for a typed table (`CREATE TABLE
+			// name OF type`), "0" otherwise. Hoisted to a local so the row literal
+			// keeps its single-token column width (and comment alignment). DU-002 slice 374.
+			relOfType := strconv.Itoa(int(t.OfTypeOID))
 			relacl := c.relaclTextLocked(t.OID)
 			if t.IsSequence {
 				relacl = c.relaclTextLockedSeq(t.OID)
@@ -4126,7 +4139,7 @@ func (c *InMemory) registerSystemTables() {
 				t.Name,                       // 1:  relname
 				strconv.Itoa(int(nsOID)),     // 2:  relnamespace
 				"0",                          // 3:  reltype
-				"0",                          // 4:  reloftype
+				relOfType,                    // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 				"10",                         // 5:  relowner (bootstrap superuser)
 				relam,                        // 6:  relam (heap=2; 0 for sequences)
 				strconv.Itoa(int(t.OID)),     // 7:  relfilenode

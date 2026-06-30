@@ -1625,6 +1625,26 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		return stmt, nil
 	}
 
+	// CREATE TABLE name OF type_name [ ( column_options ) ] — a typed table
+	// whose columns are derived from a composite type. The optional
+	// per-column option/constraint list (`(col WITH OPTIONS …)`) is not yet
+	// supported and is rejected so it is not silently dropped. DU-002 slice 374.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOf {
+		p.advance() // consume OF
+		typeName, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.OfType = &typeName
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			return nil, p.errAtCur("typed-table column option list is not supported")
+		}
+		// Optional trailing clauses (PARTITION BY, WITH, TABLESPACE) follow the
+		// same grammar as a normal CREATE TABLE.
+		p.consumeCreateTableSuffix(stmt)
+		return stmt, nil
+	}
+
 	// CREATE TABLE child PARTITION OF parent FOR VALUES … (M0096-0007)
 	if p.acceptKeyword(KwPartition) {
 		if _, err := p.expectKeyword(KwOf); err != nil {
