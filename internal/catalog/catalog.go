@@ -2151,6 +2151,14 @@ type InMemory struct {
 	// fdwname. DU-002 slice 375.
 	fdws map[string]*ForeignDataWrapper
 
+	// foreignServers tracks foreign servers (CREATE SERVER) with a stable OID so
+	// they round-trip through pg_dump's getForeignServers (pg_foreign_server
+	// virtual view → dumpForeignServer). Each server references its FDW by name;
+	// the srvfdw OID is resolved from fdws at render time. goopg does not execute
+	// foreign servers; only enough metadata is kept for dump fidelity. Key:
+	// srvname. DU-002 slice 376.
+	foreignServers map[string]*ForeignServer
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -6722,7 +6730,36 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 1417,
 	}
-	pgForeignServer.VirtualRows = func() [][]string { return nil }
+	// Surface user-created foreign servers (CREATE SERVER) so they round-trip.
+	// srvfdw resolves to the referenced FDW's stable OID (dumpForeignServer runs
+	// `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` to recover
+	// the wrapper name). srvtype/srvversion are NULL (empty string), so the TYPE/
+	// VERSION clauses are omitted; srvacl/srvoptions are NULL, so dumpACL emits
+	// nothing and the OPTIONS clause is skipped. DU-002 slice 376.
+	pgForeignServer.VirtualRows = func() [][]string {
+		servers := c.ListForeignServers()
+		if len(servers) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(servers))
+		for _, s := range servers {
+			owner := s.Owner
+			if owner == 0 {
+				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(s.OID), 10), // oid
+				s.Name,                                // srvname
+				strconv.FormatUint(uint64(owner), 10), // srvowner
+				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
+				"", // srvtype (NULL)
+				"", // srvversion (NULL)
+				"", // srvacl (NULL)
+				"", // srvoptions (NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
 
 	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
@@ -9410,6 +9447,81 @@ func (c *InMemory) ListForeignDataWrappers() []*ForeignDataWrapper {
 	out := make([]*ForeignDataWrapper, 0, len(c.fdws))
 	for _, f := range c.fdws {
 		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ForeignDataWrapperOID returns the stable OID of the named FDW, or 0 if no such
+// FDW is registered. Used by pg_foreign_server.VirtualRows to populate srvfdw.
+// DU-002 slice 376.
+func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if f, ok := c.fdws[name]; ok {
+		return f.OID
+	}
+	return 0
+}
+
+// ForeignServer is a user-created foreign server (CREATE SERVER). goopg does not
+// execute foreign servers; this records just enough metadata to round-trip the
+// CREATE/DROP through pg_dump (pg_foreign_server virtual view →
+// getForeignServers/dumpForeignServer). DU-002 slice 376.
+type ForeignServer struct {
+	Name    string // srvname
+	OID     uint32 // pg_foreign_server.oid (assigned from the catalog OID counter)
+	Owner   uint32 // srvowner; 0 → defaults to the bootstrap superuser at render time
+	FdwName string // the referenced FDW name; resolved to srvfdw OID at render time
+}
+
+// RegisterForeignServer records a foreign server, allocating a stable OID on
+// first sight. Idempotent: re-registering an existing name returns the existing
+// entry without changing its OID (the FDW association is refreshed). DU-002
+// slice 376.
+func (c *InMemory) RegisterForeignServer(name, fdwName string) *ForeignServer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.foreignServers == nil {
+		c.foreignServers = make(map[string]*ForeignServer)
+	}
+	if s, ok := c.foreignServers[name]; ok {
+		if fdwName != "" {
+			s.FdwName = fdwName
+		}
+		return s
+	}
+	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName}
+	c.foreignServers[name] = s
+	return s
+}
+
+// DropForeignServer removes a foreign server from the registry. Returns true if
+// found. DU-002 slice 376.
+func (c *InMemory) DropForeignServer(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.foreignServers == nil {
+		return false
+	}
+	if _, ok := c.foreignServers[name]; ok {
+		delete(c.foreignServers, name)
+		return true
+	}
+	return false
+}
+
+// ListForeignServers returns all registered foreign servers sorted by name.
+// DU-002 slice 376.
+func (c *InMemory) ListForeignServers() []*ForeignServer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.foreignServers) == 0 {
+		return nil
+	}
+	out := make([]*ForeignServer, 0, len(c.foreignServers))
+	for _, s := range c.foreignServers {
+		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out

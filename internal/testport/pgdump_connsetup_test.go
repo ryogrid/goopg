@@ -4747,6 +4747,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
 		t.Fatalf("create foreign data wrapper: %v", err)
 	}
+	// Slice 376: a FOREIGN SERVER (`CREATE SERVER name FOREIGN DATA WRAPPER fdw`)
+	// must round-trip. pg_dump's getForeignServers reads ALL rows of
+	// pg_foreign_server (srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
+	// acldefault('S', srvowner), and the pg_options_to_table(srvoptions) ARRAY);
+	// dumpForeignServer then recovers the wrapper name via
+	// `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` and emits
+	// `CREATE SERVER <name> FOREIGN DATA WRAPPER <fdwname>;` (TYPE/VERSION/OPTIONS
+	// omitted when absent) followed by `ALTER SERVER <name> OWNER TO postgres;`.
+	// goopg previously parsed CREATE SERVER as a no-op compat object that left the
+	// pg_foreign_server virtual view empty, so the server silently vanished from
+	// the dump. The catalog now keeps a dedicated foreign-server registry (stable
+	// OID per name) that pg_foreign_server surfaces, resolving srvfdw to goopg_fdw's
+	// stable OID (created above, lower OID dumps first). (TYPE/VERSION/OPTIONS and
+	// USER MAPPING round-trip remain deferred — the parser discards options today.)
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -9953,6 +9970,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "CREATE FOREIGN DATA WRAPPER goopg_fdw HANDLER") ||
 			strings.Contains(res.Stdout, "CREATE FOREIGN DATA WRAPPER goopg_fdw VALIDATOR") {
 			t.Errorf("pg_dump emitted a spurious HANDLER/VALIDATOR on the handler-less FDW (slice-375 regproc 0→'-' regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 376: a FOREIGN SERVER must round-trip as the bare
+		// `CREATE SERVER <name> FOREIGN DATA WRAPPER <fdwname>;` form (no TYPE/
+		// VERSION/OPTIONS) followed by its owner ALTER. dumpForeignServer recovers
+		// the wrapper name from pg_foreign_data_wrapper via the srvfdw OID, so this
+		// also verifies the srvfdw→FDW-OID resolution. Verified against real
+		// pg_dump 18.3 (dumpForeignServer + _getObjectDescription SERVER owner ALTER).
+		srvStmt := "CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw;"
+		if !strings.Contains(res.Stdout, srvStmt) {
+			t.Errorf("pg_dump dropped the FOREIGN SERVER (slice-376); missing %q\n  full stdout=%q", srvStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER SERVER goopg_srv OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the SERVER owner ALTER (slice-376)\n  full stdout=%q", res.Stdout)
+		}
+		// A regression that lost the srvfdw→FDW-OID resolution would make
+		// dumpForeignServer's single-row `SELECT fdwname … WHERE oid = srvfdw`
+		// subquery fail (pg_dump aborts) or emit a wrong/empty wrapper name; the
+		// positive assert above pins the exact `FOREIGN DATA WRAPPER goopg_fdw`
+		// suffix. A spurious TYPE/VERSION/OPTIONS clause (NULL columns mis-rendered)
+		// would break the exact-statement match too.
+		if strings.Contains(res.Stdout, "CREATE SERVER goopg_srv TYPE") ||
+			strings.Contains(res.Stdout, "CREATE SERVER goopg_srv VERSION") {
+			t.Errorf("pg_dump emitted a spurious TYPE/VERSION on the bare server (slice-376 NULL srvtype/srvversion regressed)\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

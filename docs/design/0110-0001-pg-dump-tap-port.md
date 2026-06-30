@@ -9176,8 +9176,42 @@ Covered by `TestForeignDataWrapperRegistry` (unit: stable/idempotent OID, drop, 
 clause). Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du_fdw_ref`).
 
 **Deferred (ledger):** `HANDLER`/`VALIDATOR` and `OPTIONS (...)` are discarded by the parser (consumed to `;`), so an FDW with a handler
-or options round-trips without them. FDWs are in-memory only (like roles) — they do not survive a restart. `CREATE SERVER` / `CREATE USER
-MAPPING` remain compat-only and are still not dumped.
+or options round-trips without them. FDWs are in-memory only (like roles) — they do not survive a restart. `CREATE USER MAPPING`
+remains compat-only and is still not dumped (`CREATE SERVER` is now dumped — slice 376).
+
+### Slice 376 — **`CREATE SERVER <name> FOREIGN DATA WRAPPER <fdw>`** round-trip (PRODUCTION fix)
+
+The natural follow-on to slice 375. goopg accepted `CREATE SERVER` (parser already extracts both the server name and its
+`FOREIGN DATA WRAPPER <fdw>` association into a `CompatNoopStmt`) but registered it only as a bare compat object, and the
+`pg_foreign_server` virtual view was hard-wired to return zero rows — so a created server silently vanished from the dump. PostgreSQL
+stores one `pg_foreign_server` row per server; pg_dump's `getForeignServers` reads *all* of them (`srvfdw`, `srvtype`, `srvversion`,
+`srvacl`, `acldefault('S', srvowner)`, and an `array_to_string(… pg_options_to_table(srvoptions) …)` for the options), and
+`dumpForeignServer` recovers the wrapper name via `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` (a single-row
+subquery — so `srvfdw` *must* match a real FDW OID), then emits `CREATE SERVER <name> FOREIGN DATA WRAPPER <fdwname>;` (the
+`TYPE`/`VERSION`/`OPTIONS` clauses only when present) plus the owner `ALTER SERVER <name> OWNER TO <role>;`
+(`_getObjectDescription` decorates `SERVER` like the FDW).
+
+This slice mirrors the slice-375 FDW pattern at the dump-fidelity layer:
+
+- **Catalog** (`internal/catalog/catalog.go`): a dedicated foreign-server registry (`ForeignServer{Name, OID, Owner, FdwName}` keyed by
+  name) mints a *stable* OID at `RegisterForeignServer` time (idempotent re-registration refreshes only the FDW association). A new
+  `ForeignDataWrapperOID(name)` helper resolves the referenced wrapper name to its stable OID. `pg_foreign_server.VirtualRows` now
+  surfaces each registered server with `srvfdw` = the FDW OID, `srvtype=srvversion=srvacl=srvoptions=NULL` (empty string), and
+  `srvowner=10` (bootstrap superuser → `getRoleName` → `postgres`). `DropForeignServer` removes it.
+- **Executor** (`internal/executor/operators_ddl.go`): the `server` `CompatNoopStmt` arm now *additionally* calls
+  `RegisterForeignServer(name, fdwName)` (the existing compat-object + `fdw-server` association registration is unchanged, so the
+  `DROP FOREIGN DATA WRAPPER ... CASCADE` machinery still works); `DROP SERVER` and the FDW-cascade both call `DropForeignServer` to keep
+  the dump-visible registry in sync.
+
+Covered by `TestForeignServerRegistry` (unit: stable/idempotent OID, FDW-OID resolution, drop, exact virtual-row columns) and the
+`goopg_srv` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact `CREATE`/owner-`ALTER` statements, the `FOREIGN DATA WRAPPER
+goopg_fdw` suffix recovered from the srvfdw OID, and the *absence* of a spurious `TYPE`/`VERSION` clause). Verified against real pg_dump
+18.3 (`dumpForeignServer` + `_getObjectDescription` `SERVER` owner ALTER).
+
+**Deferred (ledger):** `TYPE 'type'` / `VERSION 'version'` / `OPTIONS (...)` are discarded by the parser, so a server with any of them
+round-trips without them. Servers are in-memory only (do not survive a restart). A server referencing a *non-registered* FDW yields
+`srvfdw=0`, which would make pg_dump's single-row subquery fail — goopg does not validate the reference (PG rejects it at CREATE time).
+`CREATE USER MAPPING` is still not dumped (`dumpUserMappings` runs after each server).
 
 ## Deferred (002–010) — catalog surface estimate
 

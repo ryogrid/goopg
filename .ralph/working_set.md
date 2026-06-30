@@ -1,41 +1,41 @@
 (idle — nothing in flight)
 
-Loop #14 COMPLETE: M0119-0004 DU-002 slice 375 — `CREATE FOREIGN DATA WRAPPER
-<name>` now round-trips through pg_dump (PRODUCTION fix).
+Loop #15 COMPLETE: M0119-0004 DU-002 slice 376 — `CREATE SERVER <name> FOREIGN
+DATA WRAPPER <fdw>` now round-trips through pg_dump (PRODUCTION fix).
 
-Bug: goopg parsed CREATE FDW as a CompatNoopStmt tracked only in the bare-name
-compat set, and pg_foreign_data_wrapper.VirtualRows was hard-wired to 0 rows, so
-a created FDW silently vanished from the dump. Real pg_dump's
-getForeignDataWrappers reads ALL pg_foreign_data_wrapper rows and
-dumpForeignDataWrapper emits `CREATE FOREIGN DATA WRAPPER <name>;` +
-`ALTER FOREIGN DATA WRAPPER <name> OWNER TO postgres;`.
+Natural follow-on to slice 375 (FDW registry). goopg parsed CREATE SERVER into a
+CompatNoopStmt (server name + FDW association already extracted by the parser)
+but only registered a bare compat object; pg_foreign_server.VirtualRows was
+hard-wired to 0 rows, so a created server vanished from the dump. Real pg_dump's
+getForeignServers reads all pg_foreign_server rows; dumpForeignServer recovers
+the wrapper name via `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid =
+srvfdw` (single-row subquery) and emits `CREATE SERVER <n> FOREIGN DATA WRAPPER
+<fdw>;` + `ALTER SERVER <n> OWNER TO postgres;`.
 
-Fix (3 parts):
-- catalog: dedicated FDW registry (ForeignDataWrapper{Name,OID,Owner} keyed by
-  name; stable OID via new allocOIDLocked); pg_foreign_data_wrapper.VirtualRows
-  surfaces each (fdwhandler/fdwvalidator=0, acl/options NULL, owner=10).
-- executor: RegisterForeignDataWrapper / DropForeignDataWrapper replace the
-  bare compat-object register/drop.
-- executor cast: `<oid>::regproc` now renders InvalidOid(0) as '-' (regprocout)
-  so dumpForeignDataWrapper suppresses the HANDLER/VALIDATOR clause (a bare "0"
-  would have emitted ` HANDLER 0`). General PG-correct, not FDW-specific.
+Fix (mirrors slice-375 FDW pattern):
+- catalog: ForeignServer{Name,OID,Owner,FdwName} registry + RegisterForeignServer
+  /DropForeignServer/ListForeignServers + ForeignDataWrapperOID helper;
+  pg_foreign_server.VirtualRows resolves srvfdw to the FDW's stable OID,
+  srvtype/srvversion/srvacl/srvoptions = NULL, owner = 10.
+- executor: `server` CompatNoopStmt arm ALSO calls RegisterForeignServer (compat
+  + fdw-server association kept for CASCADE); DROP SERVER + FDW-cascade call
+  DropForeignServer.
 
-Files: internal/catalog/catalog.go (registry + VirtualRows + allocOIDLocked),
-internal/catalog/fdw_registry_test.go (new),
-internal/executor/operators_ddl.go (register/drop wiring),
-internal/executor/expr.go (regproc 0→'-'),
-internal/testport/pgdump_connsetup_test.go (goopg_fdw fixture + asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 375), ledger.
+Files: internal/catalog/catalog.go (field+VirtualRows+struct+methods),
+internal/catalog/fdw_registry_test.go (TestForeignServerRegistry, appended),
+internal/executor/operators_ddl.go (3 wiring sites),
+internal/testport/pgdump_connsetup_test.go (goopg_srv fixture + asserts),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 376), ledger.
 
-Gates: TestForeignDataWrapperRegistry + TestPort_PgDumpConnectionSetup PASS
-(byte-identical vs real pg_dump 18.3, ref /tmp/du_fdw_ref); catalog/executor/
-parser suites PASS; build/vet/gofmt(my lines) clean. pgbench smoke = pre-commit
-hook. No TPC-H (metadata-only virtual-catalog change; FDWs absent from TPC-H).
+Gates: TestForeignServerRegistry + TestForeignDataWrapperRegistry +
+TestPort_PgDumpConnectionSetup PASS; catalog/parser suites PASS;
+go build ./... + gofmt(my lines) clean. pgbench smoke = pre-commit hook.
+No TPC-H (metadata-only virtual-catalog change; servers absent from TPC-H).
 
-Deferred (ledger): HANDLER/VALIDATOR + OPTIONS discarded by parser; FDWs
-in-memory only; CREATE SERVER / USER MAPPING still not dumped.
+Deferred (ledger): TYPE/VERSION/OPTIONS discarded by parser; servers in-memory
+only; CREATE USER MAPPING still not dumped; non-registered-FDW reference → srvfdw=0.
 
 Next loop: pick a fresh M0119-0004 pg_dump slice via empirical probe. Candidates
-surfaced this loop but NOT yet done (silently created, not dumped): range types
-(CREATE TYPE AS RANGE — needs pg_range+pg_opclass+multirange, large), aggregates,
-operators, text-search configs, and CREATE COLLATION (parser doesn't even accept).
+NOT yet done: CREATE USER MAPPING (dumpUserMappings, follow-on to this slice),
+range types (CREATE TYPE AS RANGE — large), aggregates, operators, text-search
+configs, CREATE COLLATION (parser doesn't accept).

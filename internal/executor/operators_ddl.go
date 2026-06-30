@@ -12510,6 +12510,8 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 		case "server":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// Drop the dump-visible registry entry too (DU-002 slice 376).
+				im.DropForeignServer(s.Names[0].String())
 				if im.DropCompatObject("server", s.Names[0].String()) {
 					return nil
 				}
@@ -12532,6 +12534,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						for _, serverName := range cascadeServers {
 							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
 							im.DropCompatObject("server", serverName)
+							im.DropForeignServer(serverName) // dump-visible registry (DU-002 slice 376)
 							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
 						}
 					}
@@ -12648,6 +12651,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if s.TableName.Name != "" {
 			im.RegisterCompatObject("fdw-server", s.TableName.String()+":"+s.ObjName.String())
 		}
+		// Also record it in the dedicated foreign-server registry so it
+		// round-trips through pg_dump (pg_foreign_server virtual view →
+		// dumpForeignServer). The registry mints a stable OID and resolves the
+		// referenced FDW name to its srvfdw OID at render time. DU-002 slice 376.
+		im.RegisterForeignServer(s.ObjName.String(), s.TableName.String())
 	case "foreign-data wrapper":
 		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
 		// round-trips through pg_dump (pg_foreign_data_wrapper virtual view →
