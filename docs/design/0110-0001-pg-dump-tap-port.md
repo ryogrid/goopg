@@ -9067,6 +9067,28 @@ byte-identical vs real pg_dump 18.3.
 **Deferred (ledger):** restart persistence (in-memory `pg_description`). Remaining `COMMENT ON` targets still dropped — `RULE`,
 `COLLATION`, `LANGUAGE`, `DATABASE`, `EXTENSION` — each a sibling slice when its object type becomes dumpable.
 
+### Slice 372 — **`COMMENT ON RULE <name> ON <table>`** round-trip (PRODUCTION fix)
+
+PostgreSQL stores a query-rewrite-rule comment in `pg_description` keyed by `(classoid=pg_rewrite=2618, objoid=rule_oid,
+objsubid=0)`, and pg_dump's `dumpRule` (pg_dump.c:19359) — after re-emitting the `CREATE RULE` (and any `ALTER TABLE … ENABLE/DISABLE
+RULE`) — builds the prefix `"RULE %s ON"` and calls `dumpComment(fout, ruleprefix->data, qtabname, …, rinfo->dobj.catId, 0, …)` so a
+dumped schema re-emits `COMMENT ON RULE <name> ON <schema>.<table> IS '...';`. As with the trigger and policy cases, goopg's
+`parseCommentOnTail` had no `RULE` branch, so the statement fell through to the unsupported-default arm and the server silently
+swallowed it — the comment never reached `pg_description` and pg_dump emitted nothing.
+
+This slice adds the missing branch, the bounded sibling of slices 370/371 (`CREATE RULE` already round-trips via slice 324: an
+unconditional/conditional DO-NOTHING rule is modelled as a `catalog.RuleInfo` with its own OID on the owning table, projected into the
+`pg_rewrite` virtual catalog whose `oid` getRules/dumpRule reads as the comment's `catId.oid`). The parser captures `RULE <name> ON
+[schema.]table` (the same `<name> ON <table>` structure as `COMMENT ON TRIGGER/POLICY`): the rule name into `CommentOnStmt.SubName`,
+the ON-table into `ObjName`, `ObjKind="rule"`. `execCommentOn` resolves the rule by name on the named table (`LookupTable` →
+`Table.Rules`) and stores the description via `SetComment(2618, r.OID, 0, desc)`. The `pg_description` path is classoid-agnostic
+(proven for `pg_trigger`=2620 in slice 370 and `pg_policy`=3256 in slice 371), so no catalog-query change was needed. Covered by
+`TestParseCommentOnRule` (parser) and the `r_noins` rule-comment line in `TestPort_PgDumpConnectionSetup`. Verified byte-identical vs
+real pg_dump 18.3.
+
+**Deferred (ledger):** restart persistence (in-memory `pg_description`). Remaining `COMMENT ON` targets still dropped — `COLLATION`,
+`LANGUAGE`, `DATABASE`, `EXTENSION` — each a sibling slice when its object type becomes dumpable.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

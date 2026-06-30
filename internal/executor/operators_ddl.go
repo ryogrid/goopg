@@ -12953,6 +12953,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgStatisticExt = 3381 // pg_statistic_ext
 		oidPgTrigger      = 2620 // pg_trigger
 		oidPgPolicy       = 3256 // pg_policy
+		oidPgRewrite      = 2618 // pg_rewrite: query-rewrite rules
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13078,6 +13079,24 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		for _, pol := range tbl.Policies {
 			if strings.EqualFold(pol.Name, s.SubName) && pol.OID != 0 {
 				im.SetComment(oidPgPolicy, pol.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "rule":
+		// Rules live in pg_rewrite (classoid 2618). pg_dump's dumpRule keys the
+		// comment lookup on the rule's catalogId (tableoid=pg_rewrite=2618) and
+		// objsubid 0, then re-emits `COMMENT ON RULE <name> ON <table> IS '...'`.
+		// goopg models each CREATE RULE as a catalog.RuleInfo (with its own OID)
+		// on the owning table (DU-002 slice 324); resolve the rule by name there.
+		// Without this a COMMENT ON RULE was silently swallowed (parser dropped
+		// it) and never reached pg_description. DU-002 slice 372.
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, r := range tbl.Rules {
+			if strings.EqualFold(r.Name, s.SubName) && r.OID != 0 {
+				im.SetComment(oidPgRewrite, r.OID, 0, s.Description)
 				return nil
 			}
 		}

@@ -142,3 +142,47 @@ func TestParseCommentOnPolicy(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCommentOnRule pins the COMMENT ON RULE <name> ON [schema.]table
+// branch (DU-002 slice 372) — the same `<name> ON <table>` shape as TRIGGER and
+// POLICY. pg_dump's dumpRule re-emits this so a rule comment round-trips.
+func TestParseCommentOnRule(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantSchema string
+		wantTable  string
+		wantRule   string
+	}{
+		{"COMMENT ON RULE r_noop ON foo IS 'c'", "", "foo", "r_noop"},
+		{"COMMENT ON RULE r_noop ON public.foo IS 'c'", "public", "foo", "r_noop"},
+		{"COMMENT ON RULE my_rule ON s.widget IS 'c'", "s", "widget", "my_rule"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "rule" {
+			t.Errorf("%q: ObjKind=%q, want rule", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != tc.wantSchema {
+			t.Errorf("%q: ObjName.Schema=%q, want %q", tc.sql, cs.ObjName.Schema, tc.wantSchema)
+		}
+		if cs.ObjName.Name != tc.wantTable {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantTable)
+		}
+		if cs.SubName != tc.wantRule {
+			t.Errorf("%q: SubName=%q, want %q", tc.sql, cs.SubName, tc.wantRule)
+		}
+	}
+}

@@ -3133,6 +3133,20 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** restart persistence (in-memory
       pg_description); COMMENT ON {RULE,COLLATION,LANGUAGE,DATABASE,EXTENSION} still dropped (sibling
       slices).
+      **2026-06-30 (loop #11, design 0110-0001 slice 372): `COMMENT ON RULE <name> ON <table>`
+      round-trip (PRODUCTION fix).** PG stores a query-rewrite-rule comment in pg_description keyed
+      `(classoid=pg_rewrite=2618, objoid=rule.oid, objsubid=0)`; pg_dump's `dumpRule` (pg_dump.c:19359)
+      builds the prefix `"RULE %s ON"` and calls `dumpComment` so a dump re-emits
+      `COMMENT ON RULE … ON … IS '...';`. `parseCommentOnTail` had no RULE branch → silently swallowed.
+      Added the parser branch (captures `RULE <name> ON [schema.]table`, the same `<name> ON <table>`
+      shape as COMMENT ON TRIGGER/POLICY) + `execCommentOn` `case "rule"`
+      (`LookupTable`→`Table.Rules`→`SetComment(2618, r.OID, 0, desc)`). CREATE RULE already round-trips
+      (slice 324; each rule modelled as `catalog.RuleInfo` with its own OID, projected into the
+      pg_rewrite virtual catalog); pg_description path classoid-agnostic (slices 370/371) — no
+      catalog-query change. Byte-identical vs real pg_dump 18.3. Tests `TestParseCommentOnRule` (parser)
+      + slice-372 `r_noins` rule-comment line in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):**
+      restart persistence (in-memory pg_description); COMMENT ON {COLLATION,LANGUAGE,DATABASE,EXTENSION}
+      still dropped (sibling slices).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

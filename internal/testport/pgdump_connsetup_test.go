@@ -5177,6 +5177,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `COMMENT ON POLICY <name> ON <schema>.<table> IS '...'`. p_simple is the
 		// permissive ALL policy on public.pol_t created above (slice 323).
 		"COMMENT ON POLICY p_simple ON public.pol_t IS 'a policy comment'",
+		// Slice 372: COMMENT ON RULE must survive the dump. Before this slice,
+		// parseCommentOnTail had no RULE branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `RULE <name> ON <table>` (the shape pg_dump itself emits), and
+		// execCommentOn resolves the rule by name on the named table and keys it
+		// under pg_rewrite (classoid 2618, objsubid 0). pg_dump's dumpRule calls
+		// dumpComment with the rule's catalogId (tableoid=2618), finds the
+		// pg_description row, and re-emits
+		// `COMMENT ON RULE <name> ON <schema>.<table> IS '...'`. r_noins is the
+		// unconditional DO-NOTHING ON INSERT rule on public.rule_t (slice 324).
+		"COMMENT ON RULE r_noins ON public.rule_t IS 'a rule comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -7650,6 +7661,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// under pg_policy (classoid 3256). pg_dump's dumpPolicy calls dumpComment
 			// with the policy's catalogId (tableoid=3256) and re-emits the line below.
 			"COMMENT ON POLICY p_simple ON public.pol_t IS 'a policy comment';",
+			// **Slice 372 (asserted):** COMMENT ON RULE must round-trip. It was
+			// silently swallowed (parser had no RULE branch). The parser now
+			// captures `RULE <name> ON <table>` and execCommentOn keys the comment
+			// under pg_rewrite (classoid 2618). pg_dump's dumpRule calls dumpComment
+			// with the rule's catalogId (tableoid=2618) and re-emits the line below.
+			"COMMENT ON RULE r_noins ON public.rule_t IS 'a rule comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {
