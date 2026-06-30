@@ -13999,7 +13999,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType, Args: s.BaseTypeArgs}
-	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
+	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -14014,20 +14014,24 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// Record the DEFAULT expression so buildUserPGTypeRowForDomain can emit
 	// typdefaultbin and pg_dump re-renders `DEFAULT <expr>`. DU-002 slice 92.
 	d.Default = s.Default
-	// Record a generic CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
-	// getDomainConstraints surfaces it and dumpDomain re-emits the inline
-	// `CONSTRAINT <name> CHECK ((<expr>))` clause. DU-002 slice 96.
+	// Record every CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
+	// getDomainConstraints surfaces each and dumpDomain re-emits the inline
+	// `CONSTRAINT <name> CHECK ((<expr>))` clauses, `ORDER BY conname`. A domain
+	// may declare several CHECKs. DU-002 slice 96 (single) / slice 385 (multi).
 	//
-	// A `CHECK (VALUE IN (...))` form is captured separately as CheckInValues
-	// (used at runtime for membership validation). PG deparses it to a
+	// A `CHECK (VALUE IN (...))` form keeps its allowed-value list on the catalog
+	// check (used at runtime for membership validation). PG deparses it to a
 	// ScalarArrayOpExpr — `VALUE = ANY (ARRAY['a'::text, ...])` — so we synthesize
 	// the same text here and store it as the constraint's conbin, making it
 	// round-trip through pg_dump too. DU-002 slice 97.
-	checkExpr := s.CheckExpr
-	if checkExpr == "" && len(s.CheckInValues) > 0 {
-		checkExpr = domainInValuesCheckExpr(s.BaseType, s.CheckInValues, cat)
+	for _, clause := range s.Checks {
+		if len(clause.InValues) > 0 {
+			expr := domainInValuesCheckExpr(s.BaseType, clause.InValues, cat)
+			cat.AddDomainCheck(d, clause.Name, expr, clause.InValues)
+		} else {
+			cat.AddDomainCheck(d, clause.Name, clause.Expr, nil)
+		}
 	}
-	cat.SetDomainCheck(d, s.CheckName, checkExpr)
 	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.

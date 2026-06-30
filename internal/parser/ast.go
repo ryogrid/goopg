@@ -2724,20 +2724,29 @@ type CreateDomainStmt struct {
 	Schema        string
 	BaseType      string  // base type name
 	BaseTypeArgs  []int64 // base-type modifier args: varchar(20)→[20], numeric(10,2)→[10,2]. DU-002 slice 95.
-	NotNull       bool
-	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
-	Default       Expr     // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
-	// CheckExpr holds the raw SQL text of a generic (non-IN) domain CHECK
-	// expression, e.g. `VALUE > 0`. CheckName is the explicit CONSTRAINT name
-	// when one is given, "" for the auto-generated `<domain>_check`. The
-	// `CHECK (VALUE IN (...))` form is kept separately in CheckInValues (its
-	// ANY/ARRAY deparse is not yet rendered). DU-002 slice 96.
-	CheckExpr string
-	CheckName string
+	NotNull      bool
+	Default      Expr // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
+	// Checks holds every CHECK constraint clause in declaration order. PG records
+	// each as a separate pg_constraint row (contype='c') and pg_dump re-emits them
+	// `ORDER BY conname`. A domain may carry several CHECKs, so this replaced the
+	// former single CheckExpr/CheckName/CheckInValues fields. DU-002 slice 385
+	// (multi-CHECK; single-CHECK was slices 96/97).
+	Checks []DomainCheckClause
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }
 func (s *CreateDomainStmt) stmtNode() {}
+
+// DomainCheckClause is one CHECK constraint parsed from a CREATE DOMAIN. Each
+// becomes a separate pg_constraint row. Name is the explicit CONSTRAINT name
+// ("" → auto-generated `<domain>_check`[N]). Exactly one of Expr / InValues is
+// set: Expr is the raw generic predicate text (e.g. `VALUE > 0`); InValues holds
+// the allowed values from the `CHECK (VALUE IN (...))` form. DU-002 slice 385.
+type DomainCheckClause struct {
+	Name     string
+	Expr     string
+	InValues []string
+}
 
 // DropDomainStmt — DROP DOMAIN [IF EXISTS] name [CASCADE|RESTRICT]. M0097-0017.
 type DropDomainStmt struct {

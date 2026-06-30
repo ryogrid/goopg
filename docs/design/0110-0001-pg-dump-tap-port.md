@@ -9452,6 +9452,32 @@ element's first `=` to recover value `a,b`. Covered by the new `TestQuoteArrayEl
 unit pins plus a new end-to-end `goopg_srv_mc` (`OPTIONS (host 'a,b')`) fixture/assertion in `TestPort_PgDumpConnectionSetup`,
 verified byte-identical against real pg_dump 18.3.
 
+### Slice 385 — **multiple CHECK constraints on a CREATE DOMAIN** (PRODUCTION fix)
+
+PostgreSQL lets a domain declare several `CHECK` constraints; each becomes a separate `pg_constraint` row (`contype='c'`,
+`contypid` = the domain's `pg_type` OID). pg_dump's `getDomainConstraints` fetches them `ORDER BY conname` and emits one inline
+`\n\tCONSTRAINT <name> CHECK ((<expr>))` per row. goopg modelled only ONE check per domain — `catalog.Domain` carried scalar
+`CheckExpr`/`CheckName`/`CheckOID` fields and the parser's `CREATE DOMAIN` tail kept only the FIRST `CHECK` clause (the
+`if stmt.CheckExpr == ""` guard silently dropped the rest), so a two-CHECK domain lost a constraint on dump.
+
+- **`parser.CreateDomainStmt`** replaces the scalar `CheckExpr`/`CheckName`/`CheckInValues` fields with `Checks []DomainCheckClause`
+  (`{Name, Expr string; InValues []string}`); `parseCreateDomainTail` now **appends** every `CHECK`/`CONSTRAINT … CHECK` clause.
+- **`catalog.Domain`** replaces the scalar fields with `Checks []DomainCheck` (`{Name, Expr string; OID uint32; InValues []string}`).
+  `SetDomainCheck` (single, overwrite) becomes **`AddDomainCheck`** (append + per-check OID). Unnamed checks auto-disambiguate via
+  PG's `ChooseConstraintName` scheme (`<domain>_check`, then `<domain>_check1`, `_check2`, …); explicit names are kept verbatim and
+  excluded from the auto-numbering. `RegisterDomain` drops its now-unused `checkInValues ...string` variadic.
+- **`buildPgConstraintRows`** (`catalog/catalog.go`) iterates `d.Checks`, emitting one `contype='c'` row per check (the
+  `ORDER BY conname` is applied by the executor over these rows when pg_dump runs the query).
+- **`pg_get_constraintdef`** and the **cast-time IN-values enforcement** (`executor/expr.go`) iterate `d.Checks`, matching on the
+  per-check OID / validating membership against each IN-list check independently.
+- **`execCreateDomain`** loops `s.Checks`, synthesizing the `= ANY (ARRAY[...])` conbin for the IN form and calling `AddDomainCheck`
+  per clause.
+
+Covered by the new `TestAddDomainCheckNaming` catalog unit pin (disambiguation + per-check OID + InValues round-trip) plus new
+`multichk` (two unnamed checks) and `mixchk` (explicit + auto-named) fixtures/assertions in `TestPort_PgDumpConnectionSetup`,
+verified byte-identical against real pg_dump 18.3. Runtime enforcement of *generic* (non-IN) domain CHECK predicates is unchanged
+(still not evaluated at cast time — a pre-existing gap that predates and is orthogonal to this slice).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

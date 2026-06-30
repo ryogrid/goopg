@@ -3250,6 +3250,18 @@ documentation-only and is exempt from the design-doc requirement.)
       **Deferred (ledger):** array-metachar value quoting STILL absent (metachar-free `pipe`/`true` used); ALTER
       FOREIGN DATA WRAPPER OPTIONS, HANDLER/VALIDATOR func refs, reserved-keyword quote_ident gap, in-memory-only all
       carry over. With this slice the FDW/SERVER/USER-MAPPING OPTIONS round-trip is complete.
+      **2026-07-01 (loop #24, design 0110-0001 slice 385): multiple CHECK constraints on a CREATE DOMAIN
+      (PRODUCTION fix).** PG lets a domain declare several CHECKs, each a separate `pg_constraint` row that pg_dump
+      emits inline `ORDER BY conname`. goopg modelled only ONE check (scalar `Domain.CheckExpr/CheckName/CheckOID`);
+      the parser silently dropped every CHECK after the first. Refactored to a slice: `parser.CreateDomainStmt.Checks
+      []DomainCheckClause` (parser now appends each clause); `catalog.Domain.Checks []DomainCheck` with new
+      `AddDomainCheck` (per-check OID + PG `ChooseConstraintName` auto-disambiguation `<domain>_check`/`_check1`/…);
+      `buildPgConstraintRows` + `pg_get_constraintdef` + cast-time IN-values enforcement (`expr.go`) + `execCreateDomain`
+      all iterate the slice; `RegisterDomain` dropped its unused `checkInValues` variadic. Emits `multichk` (two unnamed
+      checks → `multichk_check`/`multichk_check1`) + `mixchk` (explicit `mix_pos` + auto-named `mixchk_check`)
+      byte-identical vs pg_dump 18.3. Tests new `TestAddDomainCheckNaming` (catalog) + DU-002 slice 385 fixtures in
+      `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** runtime enforcement of GENERIC (non-IN) domain CHECK
+      predicates still absent (dumped/round-tripped but not evaluated on cast) — pre-existing gap, now spans all checks.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

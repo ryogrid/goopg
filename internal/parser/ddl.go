@@ -7199,21 +7199,18 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				continue
 			case KwConstraint:
 				// CONSTRAINT name CHECK (…) — capture the explicit constraint name.
+				// Every CHECK clause is appended to stmt.Checks; PG stores each as a
+				// separate pg_constraint row. DU-002 slice 385 (multi-CHECK).
 				p.advance()
 				cname, _ := p.parseIdent() // constraint name
 				// Fall through to CHECK handling below.
 				if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
 					p.advance()
 					if vals := p.tryParseCheckInValues(); vals != nil {
-						if stmt.CheckInValues == nil {
-							stmt.CheckInValues = vals
-							// Preserve the explicit CONSTRAINT name so the
-							// deparsed `= ANY (ARRAY[...])` round-trips with the
-							// right conname through pg_dump. DU-002 slice 97.
-							if stmt.CheckName == "" {
-								stmt.CheckName = cname.Value
-							}
-						}
+						// Preserve the explicit CONSTRAINT name so the deparsed
+						// `= ANY (ARRAY[...])` round-trips with the right conname
+						// through pg_dump. DU-002 slice 97.
+						stmt.Checks = append(stmt.Checks, DomainCheckClause{Name: cname.Value, InValues: vals})
 					} else {
 						// Generic CHECK expression: capture the raw predicate text
 						// (e.g. `VALUE > 0`) so it round-trips through pg_dump via
@@ -7222,28 +7219,21 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 						if err != nil {
 							return nil, err
 						}
-						if stmt.CheckExpr == "" {
-							stmt.CheckExpr = expr
-							stmt.CheckName = cname.Value
-						}
+						stmt.Checks = append(stmt.Checks, DomainCheckClause{Name: cname.Value, Expr: expr})
 					}
 				}
 				continue
 			case KwCheck:
 				p.advance()
 				if vals := p.tryParseCheckInValues(); vals != nil {
-					if stmt.CheckInValues == nil {
-						stmt.CheckInValues = vals
-					}
+					stmt.Checks = append(stmt.Checks, DomainCheckClause{InValues: vals})
 				} else {
 					// Generic CHECK expression (auto-named <domain>_check). DU-002 slice 96.
 					expr, err := p.parseDomainCheckExpr()
 					if err != nil {
 						return nil, err
 					}
-					if stmt.CheckExpr == "" {
-						stmt.CheckExpr = expr
-					}
+					stmt.Checks = append(stmt.Checks, DomainCheckClause{Expr: expr})
 				}
 				continue
 			}

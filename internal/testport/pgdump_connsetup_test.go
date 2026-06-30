@@ -4403,6 +4403,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkfn AS text CHECK (length(VALUE) > 0)"); err != nil {
 		t.Fatalf("create domain dchkfn: %v", err)
 	}
+	// DU-002 slice 385: a domain may declare MULTIPLE CHECK constraints. PG stores
+	// each as a separate pg_constraint row (contype='c', contypid = domain OID) and
+	// pg_dump's getDomainConstraints fetches them `ORDER BY conname`, emitting one
+	// inline `\n\tCONSTRAINT <name> CHECK ((<expr>))` per row. goopg previously
+	// modelled only ONE check per domain (catalog.Domain.CheckExpr/CheckOID), so the
+	// parser silently dropped every CHECK after the first. The model is now a slice
+	// (catalog.Domain.Checks []DomainCheck); the parser appends each clause and the
+	// executor allocates a distinct constraint OID per check. Two UNNAMED checks
+	// exercise PG's ChooseConstraintName disambiguation: the first auto-names
+	// `multichk_check`, the second `multichk_check1`. The mixed domain pairs an
+	// explicit CONSTRAINT name with an unnamed check (auto-named `mixchk_check`).
+	// Positive literals keep clear of the negative-literal-cast gap (slice 364).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.multichk AS integer CHECK (VALUE > 0) CHECK (VALUE < 100)"); err != nil {
+		t.Fatalf("create domain multichk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.mixchk AS integer CONSTRAINT mix_pos CHECK (VALUE > 0) CHECK (VALUE < 50)"); err != nil {
+		t.Fatalf("create domain mixchk: %v", err)
+	}
 	// DU-002 slice 364: a unary minus applied DIRECTLY to a numeric literal — in a
 	// CHECK predicate, a column DEFAULT, an expression-index key, and a domain
 	// CHECK. PG's parser folds `-N` into a negative typed Const (gram.y doNegate)
@@ -4957,7 +4975,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `ALTER TYPE public.multi_comp ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C"`); err != nil {
 		t.Fatalf("alter type multi_comp multi-subcommand: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, dca dchkand, dcf dchkfn, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, dca dchkand, dcf dchkfn, mck multichk, mxck mixchk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -10240,6 +10258,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.dchkfn AS text",
 			"CONSTRAINT dchkfn_check CHECK ((length(VALUE) > 0))",
 			"dcf public.dchkfn",
+			// Slice 385: multiple CHECK constraints on one domain. Both checks
+			// round-trip as separate inline CONSTRAINT clauses. Two unnamed checks
+			// auto-disambiguate to `<domain>_check` / `<domain>_check1` (PG's
+			// ChooseConstraintName); a mixed domain keeps its explicit name beside an
+			// auto-named one. (domainDefs is matched by unordered Contains, so the
+			// per-conname dump ordering is exercised by the real pg_dump, not asserted.)
+			"CREATE DOMAIN public.multichk AS integer",
+			"CONSTRAINT multichk_check CHECK ((VALUE > 0))",
+			"CONSTRAINT multichk_check1 CHECK ((VALUE < 100))",
+			"mck public.multichk",
+			"CREATE DOMAIN public.mixchk AS integer",
+			"CONSTRAINT mix_pos CHECK ((VALUE > 0))",
+			"CONSTRAINT mixchk_check CHECK ((VALUE < 50))",
+			"mxck public.mixchk",
 			// Slice 364: a unary minus on a numeric literal folds to PG's
 			// quoted-value-plus-cast `'-N'::type` Const form in CHECK predicates,
 			// column DEFAULTs, expression-index keys, and domain CHECKs. The cast type

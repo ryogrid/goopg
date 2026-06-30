@@ -681,9 +681,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, err
 		}
 		// Domain CHECK constraint enforcement: VALUE IN (...). M0097-domain-check.
+		// A domain may carry several CHECK (VALUE IN (...)) constraints; each must
+		// admit the value. DU-002 slice 385 (multi-CHECK).
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain && len(dom.CheckInValues) > 0 {
+				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain {
 					// Get the string label of the value being cast.
 					var label string
 					if result.Kind == KindEnum {
@@ -691,18 +693,23 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					} else {
 						label = result.StringValue()
 					}
-					found := false
-					for _, allowed := range dom.CheckInValues {
-						if strings.EqualFold(label, allowed) {
-							found = true
-							break
+					for _, ck := range dom.Checks {
+						if len(ck.InValues) == 0 {
+							continue
 						}
-					}
-					if !found {
-						return Datum{}, &ExecError{
-							Code:    "23514",
-							Pos:     x.Pos(),
-							Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), strings.ToLower(dom.Name)+"_check"),
+						found := false
+						for _, allowed := range ck.InValues {
+							if strings.EqualFold(label, allowed) {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return Datum{}, &ExecError{
+								Code:    "23514",
+								Pos:     x.Pos(),
+								Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
+							}
 						}
 					}
 				}
@@ -7430,13 +7437,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			// cannot reproduce, so it keeps the legacy raw double-paren wrap.
 			// DU-002 slice 96 (single comparison) / slice 363 (compound + function).
 			for _, d := range im.AllDomains() {
-				if d.CheckOID == 0 || d.CheckOID != targetOID {
-					continue
+				for _, ck := range d.Checks {
+					if ck.OID == 0 || ck.OID != targetOID {
+						continue
+					}
+					if len(ck.InValues) > 0 {
+						return NewStringDatum("CHECK ((" + ck.Expr + "))"), nil
+					}
+					return NewStringDatum(renderDomainCheckPredicate(ck.Expr)), nil
 				}
-				if len(d.CheckInValues) > 0 {
-					return NewStringDatum("CHECK ((" + d.CheckExpr + "))"), nil
-				}
-				return NewStringDatum(renderDomainCheckPredicate(d.CheckExpr)), nil
 			}
 		}
 		return NullDatum, nil

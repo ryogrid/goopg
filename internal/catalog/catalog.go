@@ -2385,19 +2385,28 @@ type Domain struct {
 	// BaseIsEnum records that the base type is a user-defined enum, so the
 	// domain inherits the enum's physical layout (4-byte, int-aligned, plain
 	// storage, 'E' category) rather than the text fallback. DU-002 slice 109.
-	BaseIsEnum    bool
-	NotNull       bool
-	CheckInValues []string    // allowed values from CHECK (VALUE IN ...), M0097-domain-check
-	Default       parser.Expr // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
-	// CheckExpr is the raw SQL text of a generic (non-IN) domain CHECK predicate,
-	// e.g. `VALUE > 0`. CheckName is the constraint name (auto-resolved to
-	// `<domain>_check` when the user gave none). CheckOID is the pg_constraint OID
-	// allocated for the check so getDomainConstraints / pg_get_constraintdef can
-	// surface it. All empty/zero when the domain carries no generic CHECK. DU-002
-	// slice 96.
-	CheckExpr string
-	CheckName string
-	CheckOID  uint32
+	BaseIsEnum bool
+	NotNull    bool
+	Default    parser.Expr // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
+	// Checks holds every CHECK constraint on the domain, each a separate
+	// pg_constraint row (contype='c'). A domain may declare several CHECKs, so
+	// this replaced the former single CheckExpr/CheckName/CheckInValues fields.
+	// DU-002 slice 385 (multi-CHECK; single-CHECK was slices 96/97).
+	Checks []DomainCheck
+}
+
+// DomainCheck is one CHECK constraint on a domain. Name is the resolved
+// constraint name (PG's auto-generated `<domain>_check`[N] when unnamed). Expr
+// is the conbin source text rendered by pg_get_constraintdef. OID is the
+// allocated pg_constraint OID. InValues is non-nil for the
+// `CHECK (VALUE IN (...))` form: it drives both the legacy double-paren render
+// (the pre-synthesized ScalarArrayOp deparse in Expr) and the cast-time
+// membership enforcement. DU-002 slice 385.
+type DomainCheck struct {
+	Name     string
+	Expr     string
+	OID      uint32
+	InValues []string
 }
 
 // DefaultBin renders the domain's DEFAULT expression in the pre-formatted
@@ -5408,34 +5417,38 @@ func (c *InMemory) registerSystemTables() {
 		// Emit domain CHECK constraints (contype='c', keyed on contypid = the
 		// domain's pg_type OID rather than conrelid). pg_dump's
 		// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
-		// and renders each via pg_get_constraintdef. DU-002 slice 96.
+		// and renders each via pg_get_constraintdef ORDER BY conname — the ORDER BY
+		// is applied by the executor over these rows, so a domain's multiple CHECKs
+		// each get a row here. DU-002 slice 96 (single) / slice 385 (multi).
 		for _, d := range c.domains {
-			if d.CheckExpr == "" || d.CheckOID == 0 {
-				continue
+			for _, ck := range d.Checks {
+				if ck.Expr == "" || ck.OID == 0 {
+					continue
+				}
+				row := make([]string, 26)
+				row[0] = fmt.Sprintf("%d", ck.OID) // oid
+				row[1] = ck.Name                   // conname
+				row[2] = "2200"                    // connamespace (public)
+				row[3] = "c"                       // contype = check
+				row[4] = "f"                       // condeferrable
+				row[5] = "f"                       // condeferred
+				row[6] = "t"                       // convalidated
+				row[7] = "0"                       // conrelid (none — domain check)
+				row[8] = fmt.Sprintf("%d", d.OID)  // contypid = domain OID
+				row[9] = "0"                       // conindid
+				row[10] = "0"                      // conparentid
+				row[11] = "0"                      // confrelid
+				row[12] = " "                      // confupdtype
+				row[13] = " "                      // confdeltype
+				row[14] = " "                      // confmatchtype
+				row[15] = "t"                      // conislocal
+				row[16] = "0"                      // coninhcount
+				row[17] = "f"                      // connoinherit
+				row[18] = "f"                      // conperiod
+				row[24] = ck.Expr                  // conbin
+				row[25] = "t"                      // conenforced: always true in v0
+				out = append(out, row)
 			}
-			row := make([]string, 26)
-			row[0] = fmt.Sprintf("%d", d.CheckOID) // oid
-			row[1] = d.CheckName                   // conname
-			row[2] = "2200"                        // connamespace (public)
-			row[3] = "c"                           // contype = check
-			row[4] = "f"                           // condeferrable
-			row[5] = "f"                           // condeferred
-			row[6] = "t"                           // convalidated
-			row[7] = "0"                           // conrelid (none — domain check)
-			row[8] = fmt.Sprintf("%d", d.OID)      // contypid = domain OID
-			row[9] = "0"                           // conindid
-			row[10] = "0"                          // conparentid
-			row[11] = "0"                          // confrelid
-			row[12] = " "                          // confupdtype
-			row[13] = " "                          // confdeltype
-			row[14] = " "                          // confmatchtype
-			row[15] = "t"                          // conislocal
-			row[16] = "0"                          // coninhcount
-			row[17] = "f"                          // connoinherit
-			row[18] = "f"                          // conperiod
-			row[24] = d.CheckExpr                  // conbin
-			row[25] = "t"                          // conenforced: always true in v0
-			out = append(out, row)
 		}
 		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
 		for _, idx := range c.indexes {
@@ -11045,7 +11058,7 @@ func (c *InMemory) DropCompositeType(name string) error {
 
 // RegisterDomain creates a new domain type. Returns an error if name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInValues ...string) (*Domain, error) {
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -11057,36 +11070,56 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInV
 	// ArrayOID) so a `d[]` column joins to a real array pg_type row. DU-002
 	// slice 251 (matches RegisterEnum / RegisterCompositeType).
 	d := &Domain{
-		Name:          k,
-		OID:           c.nextOID,
-		ArrayOID:      c.nextOID + 1,
-		Base:          base,
-		NotNull:       notNull,
-		CheckInValues: checkInValues,
+		Name:     k,
+		OID:      c.nextOID,
+		ArrayOID: c.nextOID + 1,
+		Base:     base,
+		NotNull:  notNull,
 	}
 	c.nextOID += 2
 	c.domains[k] = d
 	return d, nil
 }
 
-// SetDomainCheck records a generic CHECK predicate on a domain and allocates a
-// pg_constraint OID for it. The constraint name defaults to PG's generated
-// `<domain>_check` when the caller passes "". No-op when expr is empty. The OID
-// is drawn from the same running counter as every other user object so it stays
-// stable and distinct. DU-002 slice 96.
-func (c *InMemory) SetDomainCheck(d *Domain, name, expr string) {
+// AddDomainCheck appends a CHECK constraint to a domain and allocates its
+// pg_constraint OID. expr is the conbin source text (the deparsed predicate);
+// inValues is non-nil for the `CHECK (VALUE IN (...))` form. No-op when expr is
+// empty. An unnamed check (name == "") gets PG's generated `<domain>_check`,
+// with `<domain>_check1`, `_check2`, … on collision with an already-added check
+// (PG's ChooseConstraintName disambiguation). The OID is drawn from the same
+// running counter as every other user object so it stays stable and distinct.
+// DU-002 slice 96 (single) / slice 385 (multi-CHECK).
+func (c *InMemory) AddDomainCheck(d *Domain, name, expr string, inValues []string) {
 	if d == nil || expr == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	d.CheckExpr = expr
 	if name == "" {
-		name = d.Name + "_check"
+		base := d.Name + "_check"
+		name = base
+		for n := 1; c.domainCheckNameTaken(d, name); n++ {
+			name = fmt.Sprintf("%s%d", base, n)
+		}
 	}
-	d.CheckName = name
-	d.CheckOID = c.nextOID
+	d.Checks = append(d.Checks, DomainCheck{
+		Name:     name,
+		Expr:     expr,
+		OID:      c.nextOID,
+		InValues: inValues,
+	})
 	c.nextOID++
+}
+
+// domainCheckNameTaken reports whether the domain already has a CHECK with the
+// given constraint name. Caller holds c.mu. DU-002 slice 385.
+func (c *InMemory) domainCheckNameTaken(d *Domain, name string) bool {
+	for _, ck := range d.Checks {
+		if ck.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // LookupDomain finds a domain by name (case-insensitive). M0097-0017.
