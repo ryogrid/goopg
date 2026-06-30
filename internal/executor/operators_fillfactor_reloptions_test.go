@@ -2949,3 +2949,61 @@ func TestViewCheckOptionSurfacesInPgClassReloptions(t *testing.T) {
 		t.Errorf("pg_class.reloptions for vco_plain = %q, want \"\" (NULL)", got["vco_plain"])
 	}
 }
+
+// TestViewSecurityBarrierSurfacesInPgClassReloptions verifies that a view's
+// `WITH (security_barrier=<bool>)` storage option surfaces as the
+// `security_barrier=<bool>` pg_class.reloption. Unlike check_option, pg_dump's
+// getTables keeps it in the reloptions array and re-emits it as the
+// `WITH (security_barrier='true')` clause; both true and false must round-trip
+// (false is meaningful), and a plain view carries no reloptions.
+// M0119-0004 (DU-002 slice 366).
+func TestViewSecurityBarrierSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE sbbase (id integer PRIMARY KEY, q integer)`); err != nil {
+		t.Fatalf("CREATE TABLE sbbase: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsb_on WITH (security_barrier=true) AS SELECT id, q FROM sbbase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsb_on: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsb_off WITH (security_barrier=false) AS SELECT id, q FROM sbbase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsb_off: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsb_plain AS SELECT id, q FROM sbbase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsb_plain: %v", err)
+	}
+
+	for name, want := range map[string]bool{"vsb_on": true, "vsb_off": false} {
+		vt, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s view not found", name)
+		}
+		if !vt.SecurityBarrierSet {
+			t.Errorf("%s.SecurityBarrierSet = false, want true", name)
+		}
+		if vt.SecurityBarrier != want {
+			t.Errorf("%s.SecurityBarrier = %v, want %v", name, vt.SecurityBarrier, want)
+		}
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vsb_on" || r[1] == "vsb_off" || r[1] == "vsb_plain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vsb_on"] != "{security_barrier=true}" {
+		t.Errorf("pg_class.reloptions for vsb_on = %q, want %q", got["vsb_on"], "{security_barrier=true}")
+	}
+	if got["vsb_off"] != "{security_barrier=false}" {
+		t.Errorf("pg_class.reloptions for vsb_off = %q, want %q", got["vsb_off"], "{security_barrier=false}")
+	}
+	if got["vsb_plain"] != "" {
+		t.Errorf("pg_class.reloptions for vsb_plain = %q, want \"\" (NULL)", got["vsb_plain"])
+	}
+}

@@ -8932,6 +8932,33 @@ the view qual is not rejected (PG's `rewriteHandler.c` adds the WCO check); this
 clause is captured); `security_barrier`/`security_invoker` likewise stay ignored. (3) restart persistence — `CheckOption`
 is in-memory only (the same shared-catalog runtime-write gap as the other restart-durability slices).
 
+### Slice 366 — **view `WITH (security_barrier=<bool>)`** → `WITH (security_barrier='true')` clause (PRODUCTION fix)
+
+PostgreSQL stores a view's pre-`AS` `WITH (security_barrier=<bool>)` storage option as the `security_barrier=<bool>`
+`pg_class.reloption`. Unlike `check_option`, pg_dump's `getTables` **keeps** it in the reloptions array — the
+`array_remove(array_remove(c.reloptions,'check_option=local'),'check_option=cascaded')` strip only removes `check_option=*`
+— so `dumpTableSchema` (pg_dump.c:16971-16976) re-emits it via `appendReloptionsArray` as a `WITH (...)` clause **after the
+view name and before `AS`**: `CREATE VIEW v WITH (security_barrier='true') AS …`. The value is quoted because
+`appendReloptionsArray` (string_utils.c:1012) single-quotes any reloption value for which `fmtId(value) != value`, and
+`true` is a reserved keyword → `'true'`.
+
+The parser previously accepted-and-ignored the entire pre-`AS` `WITH (...)` option list. It now captures `security_barrier`
+into `CreateViewStmt.SecurityBarrier` (a `*bool`: non-nil when specified; a bare `WITH (security_barrier)` defaults to true;
+identifier / boolean-keyword / string-literal / numeric values all normalize via `parseBoolReloptionValue`, mirroring PG's
+`parse_bool`). `execCreateView` sets `catalog.Table.SecurityBarrier`/`SecurityBarrierSet`, and the pg_class virtual-row
+reloptions builder appends `security_barrier=<bool>` to the relation's reloptions array (placed **before** the `check_option`
+element so a view carrying both surfaces as `{security_barrier=…,check_option=…}`, matching PG's stored order). From there
+the existing `appendReloptionsArray` machinery in the real pg_dump binary formats the `WITH (...)` clause — so **no
+pg_dump-query change** is needed, only catalog plumbing. Both `true` and `false` round-trip (false is meaningful), and a plain
+view emits no reloptions. Verified byte-identical vs real pg_dump 18.3. Fixture `vsecbar` in `TestPort_PgDumpConnectionSetup`
+(slice 366) + unit `TestParseCreateViewSecurityBarrier` (parser) / `TestViewSecurityBarrierSurfacesInPgClassReloptions`
+(executor).
+
+**Deferred (ledger):** (1) `security_barrier` has **no runtime effect** — PG uses it to fence qual evaluation order against
+leaky operators (`subquery_planner`/`security_barrier` RTE flag); goopg captures it for dump fidelity only. (2)
+`security_invoker` and the `WITH (check_option=…)` reloption *form* are still parsed-and-ignored. (3) restart persistence —
+`SecurityBarrier` is in-memory only (the same shared-catalog runtime-write gap as the other restart-durability slices).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

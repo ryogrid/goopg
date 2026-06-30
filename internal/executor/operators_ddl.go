@@ -3907,6 +3907,13 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the
 		// `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (DU-002 slice 365).
 		vt.CheckOption = s.CheckOption
+		// A pre-AS `WITH (security_barrier=<bool>)` storage option surfaces as the
+		// `security_barrier=<bool>` pg_class.reloption, which pg_dump re-emits as
+		// the `WITH (security_barrier='true')` clause. M0119-0004 (DU-002 slice 366).
+		if s.SecurityBarrier != nil {
+			vt.SecurityBarrier = *s.SecurityBarrier
+			vt.SecurityBarrierSet = true
+		}
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
 	// can detect that this view relies on the constraint. M0097-0036.

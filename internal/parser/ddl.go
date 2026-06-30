@@ -1218,22 +1218,39 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	}
 	// Optional WITH (view_option_name [= view_option_value] [, ...]) before AS.
 	// PostgreSQL supports security_invoker, security_barrier, check_option.
-	// goopg v0 accepts and ignores all view options.
+	// goopg captures security_barrier (M0119-0004 slice 366) so it round-trips
+	// as a pg_class.reloption; security_invoker and the reloption form of
+	// check_option are still accepted-and-ignored.
 	if p.acceptKeyword(KwWith) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after WITH in CREATE VIEW")
 		}
 		for !p.acceptSymbol(")") {
 			// option name (identifier)
-			if _, err := p.parseIdent(); err != nil {
+			optName, err := p.parseIdent()
+			if err != nil {
 				return nil, err
 			}
-			// optional = value
+			// optional = value. The value may be an identifier (true/off),
+			// a boolean keyword token (true/false/on), a string literal
+			// (pg_dump re-emits `security_barrier='true'`), or a number — so
+			// capture the raw token text rather than insisting on an ident.
+			optVal, hasVal := "", false
 			if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
 				p.advance()
-				if _, err := p.parseIdent(); err != nil {
-					return nil, err
+				optVal = p.cur().Value
+				p.advance()
+				hasVal = true
+			}
+			// security_barrier surfaces as the `security_barrier=<bool>`
+			// pg_class.reloption. A bare option (no `= value`) defaults to true,
+			// matching PostgreSQL's boolean reloption handling (reloptions.c).
+			if strings.EqualFold(optName.Value, "security_barrier") {
+				b := true
+				if hasVal {
+					b = parseBoolReloptionValue(optVal)
 				}
+				stmt.SecurityBarrier = &b
 			}
 			p.acceptSymbol(",")
 		}
@@ -1285,6 +1302,18 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		stmt.CheckOption = mode
 	}
 	return stmt, nil
+}
+
+// parseBoolReloptionValue maps a boolean reloption value token to a bool,
+// mirroring PostgreSQL's parse_bool (true/on/yes/1 → true; everything else →
+// false). Used for the view `security_barrier` storage option. M0119-0004 slice 366.
+func parseBoolReloptionValue(v string) bool {
+	switch strings.ToLower(v) {
+	case "true", "on", "yes", "1", "t", "y":
+		return true
+	default:
+		return false
+	}
 }
 
 // parseCreateRecursiveViewTail handles CREATE [OR REPLACE] RECURSIVE VIEW name(cols) AS query.

@@ -2672,6 +2672,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create view vchk_local: %v", err)
 	}
 
+	// Slice 366: a VIEW created `WITH (security_barrier=true)` round-trips the
+	// reloption. PostgreSQL stores it as the `security_barrier=true`
+	// pg_class.reloption; unlike check_option, pg_dump's getTables KEEPS it in the
+	// reloptions array (array_remove strips only check_option=*) and re-emits it
+	// via appendReloptionsArray as the `WITH (security_barrier='true')` clause
+	// after the view name (pg_dump.c dumpTableSchema). goopg captures the flag on
+	// catalog.Table.SecurityBarrier and surfaces it through the reloptions cell.
+	// `vsecbar` is on its own view so the assert is isolated from foo_view.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vsecbar WITH (security_barrier=true) AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
+		t.Fatalf("create view vsecbar: %v", err)
+	}
+
 	// Slice 59: a GENERATED ALWAYS AS (expr) STORED column must round-trip with
 	// its generation clause. pg_dump prints `GENERATED ALWAYS AS (%s) STORED`
 	// only when the column carries BOTH pg_attribute.attgenerated='s' AND a
@@ -8734,6 +8746,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// pg_dump strips it from the array and emits it only as the suffix.
 		if strings.Contains(res.Stdout, "WITH (check_option") {
 			t.Errorf("pg_dump leaked check_option into a WITH (...) reloptions clause\n  full stdout=%q", res.Stdout)
+		}
+
+		// **Slice 366 (asserted):** a VIEW `WITH (security_barrier=true)` must
+		// round-trip the reloption. Unlike check_option, pg_dump keeps it in the
+		// reloptions array and emits it as the `WITH (security_barrier='true')`
+		// clause after the view name (appendReloptionsArray quotes the value).
+		if sub := "CREATE VIEW public.vsecbar WITH (security_barrier='true') AS"; !strings.Contains(res.Stdout, sub) {
+			t.Errorf("pg_dump dropped the view security_barrier reloption; missing %q\n  full stdout=%q", sub, res.Stdout)
 		}
 
 		// **Slice 59 (asserted):** a GENERATED ALWAYS AS (expr) STORED column

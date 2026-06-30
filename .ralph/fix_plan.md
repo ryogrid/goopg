@@ -3049,6 +3049,25 @@ documentation-only and is exempt from the design-doc requirement.)
       CHECK OPTION is NOT enforced on INSERT/UPDATE through the view (catalog/dump fidelity
       only); the `WITH (check_option=...)` reloption form before AS + `security_barrier`/
       `security_invoker` stay parsed-and-ignored; restart persistence (in-memory only).
+
+      **2026-06-30 (loop #97, design 0110-0001 slice 366): view `WITH (security_barrier=<bool>)`
+      round-trip.** A view created `WITH (security_barrier=true)` now dumps the
+      `WITH (security_barrier='true')` clause after the view name. PG stores it as the
+      `security_barrier=<bool>` pg_class.reloption; unlike check_option, pg_dump's getTables
+      KEEPS it in the reloptions array (array_remove strips only check_option=*) and
+      dumpTableSchema re-emits it via appendReloptionsArray (value single-quoted because
+      `fmtId('true')!='true'`). Parser captures `security_barrier` into
+      `CreateViewStmt.SecurityBarrier` (`*bool`; bare option → true; values normalize via
+      `parseBoolReloptionValue` mirroring parse_bool); `execCreateView` sets
+      `catalog.Table.SecurityBarrier`/`SecurityBarrierSet`; the pg_class virtual reloptions
+      builder appends `security_barrier=<bool>` before the check_option element. **No
+      pg_dump-query change.** Byte-identical vs real pg_dump 18.3. Tests
+      `TestParseCreateViewSecurityBarrier` (parser) +
+      `TestViewSecurityBarrierSurfacesInPgClassReloptions` (executor) + slice-366 `vsecbar`
+      `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** security_barrier has NO runtime
+      effect (planner qual-fencing not implemented); `security_invoker` + the
+      `WITH (check_option=...)` reloption form stay parsed-and-ignored; restart persistence
+      (in-memory only).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

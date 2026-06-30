@@ -318,6 +318,17 @@ type Table struct {
 	// goopg does not yet ENFORCE the option on INSERT/UPDATE through the view.
 	CheckOption string
 
+	// SecurityBarrier / SecurityBarrierSet capture a view's
+	// `WITH (security_barrier = <bool>)` storage option. PostgreSQL records it
+	// as the `security_barrier=<bool>` pg_class.reloption; unlike check_option,
+	// pg_dump's getTables keeps it in the reloptions array (array_remove strips
+	// only check_option=*) and re-emits it as the `WITH (security_barrier='true')`
+	// clause after the view name (appendReloptionsArray). SecurityBarrierSet
+	// guards whether the option was specified, since false is a meaningful value.
+	// M0119-0004 (DU-002 slice 366).
+	SecurityBarrier    bool
+	SecurityBarrierSet bool
+
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil
 	// as "no statistics yet" and falls back to the legacy
@@ -4013,6 +4024,16 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.VacuumIndexCleanupSet {
 				relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
+			}
+			// A view's `WITH (security_barrier=<bool>)` is stored by PostgreSQL as
+			// the `security_barrier=<bool>` pg_class.reloption. Unlike check_option,
+			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
+			// the `WITH (security_barrier='true')` clause after the view name
+			// (appendReloptionsArray). Placed before check_option so a view carrying
+			// both surfaces as `{security_barrier=...,check_option=...}`, matching
+			// PostgreSQL's stored order. M0119-0004 (slice 366).
+			if t.SecurityBarrierSet {
+				relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
 			}
 			// A view's `WITH [CASCADED|LOCAL] CHECK OPTION` is stored by PostgreSQL
 			// as the `check_option=<mode>` pg_class.reloption. pg_dump's getTables
