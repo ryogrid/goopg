@@ -3317,6 +3317,21 @@ documentation-only and is exempt from the design-doc requirement.)
       'case-sensitive C collation'` fixture/assertion in `TestPort_PgDumpConnectionSetup` (byte-identical vs real pg_dump
       18.3). Deferral row appended (built-in collation comments are a no-op since they report OID 0; in-memory only — same
       pg_collation-heap-persistence gap as slice 389).
+
+      **2026-07-01 (loop #31, design 0110-0001 slice 391): ICU / non-deterministic / FROM collation round-trip** (PRODUCTION
+      fix + virtual-NULL infra). Closes the slice-389 deferral that only the default libc provider was asserted. The remaining
+      `dumpCollation` branches now round-trip: `provider = icu` (collprovider 'i'; locale rides colllocale, collcollate/collctype
+      NULL), `deterministic = false` (collisdeterministic 'f', emitted right after the provider), and `CREATE COLLATION new FROM
+      existing`. Found + fixed two fidelity bugs: (1) `execCreateCollation`'s FROM branch copied provider/locale but **dropped
+      `Deterministic`** (PG `DefineCollation` reads `collform->collisdeterministic`) — now copies `src.Deterministic`; (2) empty
+      `text` virtual cells decoded as `''` not NULL, so `dumpCollation`'s ICU branch emitted a spurious `, rules = ''`. Added a
+      general `catalog.VirtualNull` sentinel that `planner.TypedVirtualCell` maps to a NULL constant before any type parsing
+      (shared by the executor `rematerialiseVirtualRows` sibling); the pg_collation user-row builder emits `VirtualNull` for
+      absent locale/rules columns per provider — matching PG's NULL layout. Tests: extended `TestCreateCollationVirtualRows`
+      (a non-deterministic ICU collation resolved by name reports `Deterministic=false`) + `ci_coll`/`ci_from` fixtures in
+      `TestPort_PgDumpConnectionSetup`, both dumping `(provider = icu, deterministic = false, locale = 'und-u-ks-level2')`
+      byte-identical vs real pg_dump 18.3. Deferral row appended (ICU `rules` still unmodelled; in-memory only; BKI built-in
+      rows still carry `''` not NULL in unused locale columns — harmless, pg_dump skips pinned collations).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

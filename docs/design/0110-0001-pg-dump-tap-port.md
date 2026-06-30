@@ -9584,6 +9584,35 @@ dump now emits the trailing `COMMENT ON COLLATION public.mycoll IS 'case-sensiti
 `FROM existing` form are wired but not yet asserted through pg_dump; the registry is in-memory (no restart persistence,
 `pg_collation` is not heap-backed); `ALTER COLLATION` / collation comments are not handled.
 
+### Slice 391 — **ICU / non-deterministic / FROM collation round-trip** (PRODUCTION fix + virtual-NULL infra)
+
+Slice 389 only asserted the default libc provider (`provider = libc, locale = 'C'`). This slice closes that deferral for
+the remaining `dumpCollation` branches — `provider = icu` (collprovider `'i'`, the locale rides `colllocale` while
+`collcollate`/`collctype` stay NULL), `deterministic = false` (collisdeterministic `'f'`, emitted right after the
+provider), and the `CREATE COLLATION new FROM existing` copy form — and fixes two real fidelity bugs found doing so.
+
+- **FROM dropped the deterministic flag.** `executor.execCreateCollation`'s `FROM existing` branch copied
+  provider/encoding/collate/ctype/locale but **not** `Deterministic`, so a collation derived from a non-deterministic
+  source dumped as deterministic. PG's `DefineCollation` (collationcmds.c) reads `collform->collisdeterministic` in its
+  FROM branch; goopg now copies `src.Deterministic` too.
+- **Empty `text` virtual cells decoded as `''`, not NULL.** `pg_collation` surfaced `collicurules` (and the unused-by-
+  provider `collcollate`/`collctype`/`colllocale`) as `""`. For a `text` column `TypedVirtualCell` routes `""` through the
+  default `StringConst` branch — a non-NULL empty string — so `dumpCollation`'s ICU branch saw a non-NULL `collicurules`
+  and emitted a spurious `, rules = ''` (and warned "invalid collation" on the empty collate/ctype). Only array and
+  `pg_node_tree` columns previously mapped `""`→NULL. Added a general **`catalog.VirtualNull`** sentinel that
+  `TypedVirtualCell` maps to a NULL constant ahead of any type parsing (both the planner and the executor's
+  `rematerialiseVirtualRows` share that one helper, so the sibling decoders stay in sync), and the `pg_collation`
+  user-row builder now emits `VirtualNull` for absent locale/rules columns per provider — exactly PG's NULL layout.
+
+Covered by the extended `TestCreateCollationVirtualRows` (a non-deterministic ICU user collation resolved by name must
+report `Deterministic=false`) plus two `TestPort_PgDumpConnectionSetup` fixtures — an ICU non-deterministic collation
+(`CREATE COLLATION public.ci_coll (provider = icu, deterministic = false, locale = 'und-u-ks-level2')`) and a
+`CREATE COLLATION public.ci_from FROM public.ci_coll` — both asserted to dump as
+`(provider = icu, deterministic = false, locale = 'und-u-ks-level2')`, byte-identical vs real pg_dump 18.3.
+**Deferred** (ledger): ICU `rules` (`collicurules`) are still not modeled (a collation created *with* rules would lose
+them); the registry remains in-memory (no restart persistence; `pg_collation` is not heap-backed); the BKI built-in rows
+still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump skips pinned collations).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

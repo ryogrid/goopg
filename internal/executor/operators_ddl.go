@@ -349,6 +349,10 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 		uc.Collate = src.Collate
 		uc.Ctype = src.Ctype
 		uc.Locale = src.Locale
+		// FROM copies collisdeterministic too (DefineCollation in
+		// collationcmds.c reads collform->collisdeterministic): a collation
+		// derived from a non-deterministic source is itself non-deterministic.
+		uc.Deterministic = src.Deterministic
 	} else {
 		// Provider: default libc ('c') when unspecified.
 		switch s.Provider {

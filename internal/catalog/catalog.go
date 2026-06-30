@@ -2528,6 +2528,15 @@ const (
 // reserved for system catalogs.
 const FirstUserOID uint32 = 16384
 
+// VirtualNull is the sentinel a VirtualRows cell uses to denote SQL NULL for a
+// column type whose empty string is a legitimate non-NULL value (most notably
+// `text`: an empty `collicurules` / `collcollate` must read as NULL, not '').
+// planner.TypedVirtualCell maps this sentinel to a NULL constant before any
+// type-specific parsing. The byte sequence cannot collide with a real catalog
+// value (NUL-delimited marker). Sibling decoders (the executor's
+// rematerialiseVirtualRows) share TypedVirtualCell, so they stay in sync.
+const VirtualNull = "\x00\x00NULL\x00\x00"
+
 // IsSystemRelation reports whether oid belongs to the reserved system-
 // catalog OID range (anything below FirstUserOID). Used by the executor
 // and storage bootstrap to gate behaviour that only makes sense for
@@ -6055,6 +6064,19 @@ func (c *InMemory) registerSystemTables() {
 			if !uc.Deterministic {
 				det = "f"
 			}
+			// Per-provider NULLs: libc carries collcollate/collctype and leaves
+			// colllocale NULL; builtin/icu carry colllocale and leave
+			// collcollate/collctype NULL (matching pg_collation, and what
+			// dumpCollation's per-provider branches expect). An empty text cell
+			// must surface SQL NULL — not '' — or dumpCollation's ICU branch
+			// emits a spurious `rules = ''` and warns "invalid collation". The
+			// VirtualNull sentinel forces a NULL through TypedVirtualCell.
+			nz := func(s string) string {
+				if s == "" {
+					return VirtualNull
+				}
+				return s
+			}
 			rows = append(rows, []string{
 				strconv.FormatUint(uint64(uc.OID), 10),
 				uc.Name,
@@ -6063,11 +6085,11 @@ func (c *InMemory) registerSystemTables() {
 				string(uc.Provider),
 				det,
 				strconv.Itoa(uc.Encoding),
-				uc.Collate,
-				uc.Ctype,
-				uc.Locale,
-				"", // collicurules: not modeled
-				"", // collversion: NULL → recomputed on restore
+				nz(uc.Collate),
+				nz(uc.Ctype),
+				nz(uc.Locale),
+				VirtualNull, // collicurules: ICU rules not modeled → NULL
+				VirtualNull, // collversion: NULL → recomputed on restore
 			})
 		}
 		return rows

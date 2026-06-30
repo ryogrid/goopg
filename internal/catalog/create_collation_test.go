@@ -70,6 +70,21 @@ func TestCreateCollationVirtualRows(t *testing.T) {
 		t.Errorf("CollationAttrsByName(mycoll) = %+v, ok=%v", got, ok)
 	}
 
+	// CollationAttrsByName must preserve a non-deterministic flag so the
+	// executor's `CREATE COLLATION ... FROM existing` path can copy it (slice
+	// 391). A non-deterministic ICU source resolved by name must report
+	// Deterministic=false, not the default true.
+	ndet := &UserCollation{
+		Name: "ci_coll", Owner: 10, Provider: 'i', Encoding: -1,
+		Locale: "und-u-ks-level2", Deterministic: false,
+	}
+	if _, err := c.CreateCollation(ndet, "public", false); err != nil {
+		t.Fatalf("CreateCollation ci_coll: %v", err)
+	}
+	if got, ok := c.CollationAttrsByName("ci_coll"); !ok || got.Deterministic {
+		t.Errorf("CollationAttrsByName(ci_coll).Deterministic = %v, want false (ok=%v)", got.Deterministic, ok)
+	}
+
 	// Duplicate without IF NOT EXISTS errors; with IF NOT EXISTS is a no-op.
 	if _, err := c.CreateCollation(&UserCollation{Name: "mycoll", Provider: 'c'}, "public", false); err == nil {
 		t.Error("duplicate CreateCollation should error")

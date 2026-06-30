@@ -2480,6 +2480,13 @@ func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *ca
 // helper — the two paths are siblings and must stay in sync (a virtual row
 // typed one way at plan time and another at Open would diverge silently).
 func TypedVirtualCell(pos int, value, colType string) Expr {
+	// An explicit NULL sentinel overrides all type-specific parsing: it lets a
+	// VirtualRows builder emit SQL NULL for a column whose empty string is a
+	// real non-NULL value (e.g. a `text` collicurules that must read NULL, not
+	// ''). See catalog.VirtualNull.
+	if value == catalog.VirtualNull {
+		return &NullConst{pos: pos}
+	}
 	switch strings.ToLower(colType) {
 	case "int2", "int4", "int8", "integer", "bigint", "smallint",
 		"oid", "xid", "cid", "regproc", "regprocedure":

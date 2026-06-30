@@ -4922,6 +4922,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation'"); err != nil {
 		t.Fatalf("comment on collation mycoll: %v", err)
 	}
+	// Slice 391: non-default collation forms must round-trip through the
+	// per-provider branches of dumpCollation (pg_dump.c:14930+). An ICU
+	// non-deterministic collation exercises two branches the libc fixture above
+	// does not: `provider = icu` (collprovider 'i', the locale rides colllocale
+	// while collcollate/collctype stay NULL) and `deterministic = false`
+	// (collisdeterministic 'f', emitted right after the provider). goopg does
+	// not order strings with ICU — only the schema-dump round-trip is modeled —
+	// so the locale is stored verbatim and replayed by pg_dump.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_coll (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"); err != nil {
+		t.Fatalf("create collation ci_coll: %v", err)
+	}
+	// Slice 391: `CREATE COLLATION new FROM existing` copies the source's
+	// attributes (DefineCollation's FROM branch in collationcmds.c reads
+	// collform->collisdeterministic etc.), so a collation derived from the
+	// non-deterministic ci_coll must itself dump as `deterministic = false`.
+	// The executor's FROM path previously dropped the deterministic flag.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_from FROM public.ci_coll"); err != nil {
+		t.Fatalf("create collation ci_from: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7980,6 +7999,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// and pg_dump emitted nothing.
 		if !strings.Contains(res.Stdout, "COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation';") {
 			t.Errorf("pg_dump dropped the collation comment; missing COMMENT ON COLLATION public.mycoll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 391 (asserted):** an ICU non-deterministic collation must
+		// round-trip through dumpCollation's `provider = icu` /
+		// `deterministic = false` branches. The locale rides colllocale (NULL
+		// collcollate/collctype), and the deterministic flag is emitted right
+		// after the provider, so the canonical form is
+		// `(provider = icu, deterministic = false, locale = '...')`.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_coll (provider = icu, deterministic = false, locale = 'und-u-ks-level2');") {
+			t.Errorf("pg_dump dropped the ICU non-deterministic collation; missing CREATE COLLATION public.ci_coll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 391 (asserted):** a `CREATE COLLATION ... FROM existing`
+		// collation must inherit the source's deterministic flag. The executor's
+		// FROM path previously copied provider/locale but dropped Deterministic,
+		// so ci_from would have dumped without `deterministic = false`.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_from (provider = icu, deterministic = false, locale = 'und-u-ks-level2');") {
+			t.Errorf("pg_dump dropped the FROM-derived collation's deterministic flag; missing CREATE COLLATION public.ci_from\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
 		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef
