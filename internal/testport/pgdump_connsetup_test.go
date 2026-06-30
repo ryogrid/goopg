@@ -4781,6 +4781,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv"); err != nil {
 		t.Fatalf("create user mapping: %v", err)
 	}
+	// Slice 379: a USER MAPPING created `WITH OPTIONS (name 'value', …)` must
+	// round-trip its options. PostgreSQL stores them in pg_user_mapping.umoptions
+	// (surfaced by the pg_user_mappings view) as a text[] of `name=value` elements;
+	// pg_dump's dumpUserMappings expands them server-side via the same
+	// `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(
+	// option_value) FROM pg_options_to_table(umoptions) ORDER BY option_name),
+	// E',\n    ')` shape and re-emits `… OPTIONS (\n    <opt>,\n    <opt>\n)`
+	// (ORDER BY option_name, so `password` precedes `username`). A second server
+	// keeps this mapping's srvid distinct from the option-less one above so the two
+	// dumps don't collide. goopg captures the OPTIONS clause in the parser, stores
+	// it in the user-mapping registry, and surfaces it as the umoptions array
+	// literal — driving goopg's own pg_options_to_table SRF. Verified against real
+	// pg_dump 18.3. (Non-keyword option names are used so quote_ident is a no-op on
+	// both sides; the reserved-keyword `user` option exposes a latent quote_ident
+	// gap — see the deferral ledger.)
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_um FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create server for um options: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (username 'remote', password 'secret')"); err != nil {
+		t.Fatalf("create user mapping with options: %v", err)
+	}
 	// Slice 378: a FOREIGN SERVER created `WITH OPTIONS (name 'value', …)` must
 	// round-trip its options. PostgreSQL stores them in pg_foreign_server.srvoptions
 	// as a text[] of `name=value` elements; pg_dump's getForeignServers expands them
@@ -10051,6 +10072,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		srvOptStmt := "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    dbname 'mydb',\n    host 'localhost'\n);"
 		if !strings.Contains(res.Stdout, srvOptStmt) {
 			t.Errorf("pg_dump dropped the SERVER OPTIONS (slice-378); missing %q\n  full stdout=%q", srvOptStmt, res.Stdout)
+		}
+		// Slice 379: a USER MAPPING WITH OPTIONS must round-trip the OPTIONS clause.
+		// dumpUserMappings renders the options ORDER BY option_name (password before
+		// username) as a `,\n    `-joined `name 'value'` list inside ` OPTIONS (\n
+		// …\n)`, exercising goopg's pg_options_to_table SRF over the umoptions text[]
+		// literal `{username=remote,password=secret}`. Verified against real pg_dump 18.3.
+		umOptStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (\n    password 'secret',\n    username 'remote'\n);"
+		if !strings.Contains(res.Stdout, umOptStmt) {
+			t.Errorf("pg_dump dropped the USER MAPPING OPTIONS (slice-379); missing %q\n  full stdout=%q", umOptStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

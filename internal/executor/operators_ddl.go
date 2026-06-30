@@ -12676,8 +12676,10 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// dumpUserMappings). ObjName carries the mapped user; TableName carries the
 		// server association. Without this, creating any foreign server makes
 		// pg_dump query the (previously missing) pg_user_mappings view and abort.
-		// DU-002 slice 377.
-		im.RegisterUserMapping(s.ObjName.String(), s.TableName.String())
+		// Options threads the OPTIONS (...) clause so umoptions round-trips
+		// (pg_user_mappings.umoptions → dumpUserMappings). DU-002 slice 377
+		// (options: slice 379).
+		im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options)
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""

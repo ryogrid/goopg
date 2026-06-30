@@ -3215,6 +3215,23 @@ documentation-only and is exempt from the design-doc requirement.)
       fixture. **Deferred (ledger):** FDW (`fdwoptions`) / USER MAPPING (`umoptions`) OPTIONS still discarded;
       option values with array metacharacters not quoted in the text[] literal; `ALTER SERVER … OPTIONS` not
       modelled; servers in-memory only.
+      **2026-06-30 (loop #18, design 0110-0001 slice 379): `CREATE USER MAPPING … OPTIONS (name 'value', …)`
+      round-trip (PRODUCTION fix).** Slice 377 dumped a user mapping but discarded its OPTIONS (`umoptions`
+      always NULL). Reuses the slice-378 machinery wholesale: pg_dump's `dumpUserMappings` expands `umoptions`
+      server-side via the identical `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(
+      option_value) FROM pg_options_to_table(umoptions) ORDER BY option_name), E',\n    ')` shape (options sorted
+      by name → `password` before `username`). Parser: `scanUserMappingForServer` now also returns the OPTIONS
+      list via the shared `scanFDWOptionsList`; CREATE arm stores it in `CompatNoopStmt.Options`, DROP discards
+      it. Catalog: `UserMapping.Options []string`; `RegisterUserMapping(user,server,options)` (idempotent
+      re-register refreshes only when non-empty); `pg_user_mappings` `umoptions` cell renders via the existing
+      `optionsArrayLiteral`. Executor threads `s.Options` into RegisterUserMapping. Emits `CREATE USER MAPPING FOR
+      um_role SERVER goopg_srv_um OPTIONS (\n    password 'secret',\n    username 'remote'\n);` byte-identical vs
+      pg_dump 18.3 (negative control confirms the order assertion is live). Tests extended `TestParseCreateUserMapping`
+      + `umoptions` in `TestUserMappingRegistry` + DU-002 slice 379 fixture. **Discovery (ledger):** goopg's
+      `pgQuoteIdent` does NOT actually guard reserved keywords (comment lies), so a reserved-keyword option name
+      like `user` emits bare `user 'x'` where real pg_dump emits `"user" 'x'` — latent at every quote_ident site;
+      sidestepped here with non-keyword names. **Deferred (ledger):** FDW (`fdwoptions`) OPTIONS still discarded;
+      array-metachar value quoting + in-memory-only limits carry over from slice 378.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

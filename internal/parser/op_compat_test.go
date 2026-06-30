@@ -93,13 +93,24 @@ func TestParseCreateUserMapping(t *testing.T) {
 		t.Errorf("server = %q, want goopg_srv", ns.TableName.Name)
 	}
 
-	// OPTIONS clause is tolerated (and discarded) — the user/server still parse.
+	// OPTIONS clause is captured as "name=value" elements (in clause order) so the
+	// mapping's umoptions round-trip through pg_dump. DU-002 slice 379.
 	stmts, err = Parse("CREATE USER MAPPING FOR um_role SERVER goopg_srv OPTIONS (user 'x', password 'y')")
 	if err != nil {
 		t.Fatalf("Parse error with OPTIONS: %v", err)
 	}
-	if ns, _ := stmts[0].(*CompatNoopStmt); ns == nil || ns.ObjName.Name != "um_role" || ns.TableName.Name != "goopg_srv" {
-		t.Errorf("OPTIONS form mis-parsed: %+v", stmts[0])
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil || ns.ObjName.Name != "um_role" || ns.TableName.Name != "goopg_srv" {
+		t.Fatalf("OPTIONS form mis-parsed: %+v", stmts[0])
+	}
+	wantOpts := []string{"user=x", "password=y"}
+	if len(ns.Options) != len(wantOpts) {
+		t.Fatalf("mapping Options = %+v, want %+v", ns.Options, wantOpts)
+	}
+	for i := range wantOpts {
+		if ns.Options[i] != wantOpts[i] {
+			t.Errorf("mapping Options[%d] = %q, want %q", i, ns.Options[i], wantOpts[i])
+		}
 	}
 
 	// DROP USER MAPPING FOR <user> SERVER <server>: Names = [user, server].

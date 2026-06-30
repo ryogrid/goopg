@@ -6796,10 +6796,11 @@ func (c *InMemory) registerSystemTables() {
 	// Surface user-created user mappings (CREATE USER MAPPING). srvid resolves to
 	// the referenced server's stable OID (the column pg_dump filters on); usename
 	// is the mapped role name (PUBLIC → 'public'); umuser is its role OID (0 for
-	// PUBLIC). umoptions is NULL (empty), so pg_options_to_table(umoptions) yields
-	// 0 rows → array_to_string returns '' → dumpUserMappings omits the OPTIONS
-	// clause and emits the bare `CREATE USER MAPPING FOR <usename> SERVER <srv>;`.
-	// DU-002 slice 377.
+	// PUBLIC). umoptions renders the mapping's OPTIONS as the text[] literal
+	// "{name=value,…}" (or NULL when none), which pg_options_to_table(umoptions)
+	// expands → dumpUserMappings appends `OPTIONS (\n    name 'value',\n    …\n)`;
+	// with no options it emits the bare `CREATE USER MAPPING FOR <usename> SERVER
+	// <srv>;`. DU-002 slice 377 (options: slice 379).
 	pgUserMappings.VirtualRows = func() [][]string {
 		mappings := c.ListUserMappings()
 		if len(mappings) == 0 {
@@ -6820,7 +6821,7 @@ func (c *InMemory) registerSystemTables() {
 				m.SrvName,                              // srvname
 				strconv.FormatUint(uint64(umuser), 10), // umuser
 				usename,                                // usename
-				"",                                     // umoptions (NULL)
+				optionsArrayLiteral(m.Options),         // umoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
 		return out
@@ -9636,6 +9637,12 @@ type UserMapping struct {
 	OID     uint32 // pg_user_mapping.oid (assigned from the catalog OID counter)
 	UmUser  string // the mapped role name; "" / "public" → the PUBLIC pseudo-role
 	SrvName string // the referenced server name; resolved to srvid OID at render time
+	// Options holds the mapping's OPTIONS as "name=value" elements, the on-disk
+	// pg_user_mapping.umoptions text[] representation surfaced by the
+	// pg_user_mappings view. pg_dump's dumpUserMappings expands these via
+	// pg_options_to_table(umoptions); an empty list → NULL → no OPTIONS clause.
+	// DU-002 slice 379.
+	Options []string
 }
 
 // userMappingKey builds the registry key for a (user, server) pair. The user and
@@ -9646,8 +9653,9 @@ func userMappingKey(user, server string) string {
 
 // RegisterUserMapping records a user mapping, allocating a stable OID on first
 // sight. Idempotent: re-registering an existing (user, server) pair returns the
-// existing entry without changing its OID. DU-002 slice 377.
-func (c *InMemory) RegisterUserMapping(user, server string) *UserMapping {
+// existing entry without changing its OID (OPTIONS are refreshed when non-empty).
+// DU-002 slice 377 (options: slice 379).
+func (c *InMemory) RegisterUserMapping(user, server string, options []string) *UserMapping {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userMappings == nil {
@@ -9655,9 +9663,12 @@ func (c *InMemory) RegisterUserMapping(user, server string) *UserMapping {
 	}
 	key := userMappingKey(user, server)
 	if m, ok := c.userMappings[key]; ok {
+		if len(options) > 0 {
+			m.Options = options
+		}
 		return m
 	}
-	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server}
+	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server, Options: options}
 	c.userMappings[key] = m
 	return m
 }

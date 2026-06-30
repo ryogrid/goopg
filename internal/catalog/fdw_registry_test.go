@@ -201,17 +201,19 @@ func TestUserMappingRegistry(t *testing.T) {
 	c.RegisterRole("um_role")
 	roleOID, _ := c.RoleOID("um_role")
 
-	m := c.RegisterUserMapping("um_role", "goopg_srv")
+	m := c.RegisterUserMapping("um_role", "goopg_srv", []string{"user=remote", "password=secret"})
 	if m.OID < FirstUserOID {
 		t.Fatalf("RegisterUserMapping minted OID %d below FirstUserOID %d", m.OID, FirstUserOID)
 	}
-	// Idempotent: same (user, server) returns the same OID.
-	if m2 := c.RegisterUserMapping("um_role", "goopg_srv"); m2.OID != m.OID {
+	// Idempotent: same (user, server) returns the same OID; passing nil options on
+	// re-register does NOT clear the stored options.
+	if m2 := c.RegisterUserMapping("um_role", "goopg_srv", nil); m2.OID != m.OID {
 		t.Fatalf("re-register mapping changed OID: %d → %d", m.OID, m2.OID)
 	}
 
 	// The view row mirrors dumpUserMappings' inputs: srvid resolves to the server
-	// OID, usename is the role name, umuser its OID, umoptions NULL (empty).
+	// OID, usename is the role name, umuser its OID, umoptions the text[] literal
+	// that pg_options_to_table(umoptions) expands.
 	rows := umView.VirtualRows()
 	if len(rows) != 1 {
 		t.Fatalf("pg_user_mappings has %d rows, want 1", len(rows))
@@ -222,7 +224,7 @@ func TestUserMappingRegistry(t *testing.T) {
 		"goopg_srv",                             // srvname
 		strconv.FormatUint(uint64(roleOID), 10), // umuser → role OID
 		"um_role",                               // usename
-		"",                                      // umoptions (NULL)
+		"{user=remote,password=secret}",         // umoptions text[]
 	}
 	if len(rows[0]) != len(want) {
 		t.Fatalf("mapping row width %d, want %d", len(rows[0]), len(want))
@@ -234,7 +236,7 @@ func TestUserMappingRegistry(t *testing.T) {
 	}
 
 	// A PUBLIC mapping renders usename='public' with umuser=0 (ACL_ID_PUBLIC).
-	c.RegisterUserMapping("public", "goopg_srv")
+	c.RegisterUserMapping("public", "goopg_srv", nil)
 	pubRows := umView.VirtualRows()
 	var foundPublic bool
 	for _, r := range pubRows {

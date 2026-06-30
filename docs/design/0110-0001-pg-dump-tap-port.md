@@ -9278,10 +9278,40 @@ association intact), the `opt_srv` assertions in `TestForeignServerRegistry` (re
 `CREATE SERVER … OPTIONS (\n    dbname 'mydb',\n    host 'localhost'\n);`). Verified against real pg_dump 18.3 (`getForeignServers` +
 `dumpForeignServer`), with a negative control confirming the option-order assertion is live.
 
-**Deferred (ledger):** FDW (`fdwoptions`) and USER MAPPING (`umoptions`) OPTIONS are still discarded — only `CREATE SERVER` options round-trip
-this slice. Option **values** containing array metacharacters (comma, brace, space, double-quote, backslash) are not yet quoted in the
+**Deferred (ledger):** FDW (`fdwoptions`) OPTIONS are still discarded — only `CREATE SERVER` (slice 378) and `CREATE USER MAPPING` (slice 379)
+options round-trip. Option **values** containing array metacharacters (comma, brace, space, double-quote, backslash) are not yet quoted in the
 `text[]` literal (`optionsArrayLiteral` uses a plain comma join, matching the existing reloptions renderer), so such a value would corrupt
 `pg_options_to_table` splitting. `ALTER SERVER … OPTIONS (ADD/SET/DROP …)` is not modelled. Servers remain in-memory only.
+
+### Slice 379 — **`CREATE USER MAPPING … OPTIONS (name 'value', …)`** round-trip (PRODUCTION fix)
+
+Slice 377 made a user mapping dumpable but discarded its `OPTIONS` (the `umoptions` cell was always NULL). This slice round-trips them,
+reusing the slice-378 machinery wholesale. PostgreSQL stores mapping options in `pg_user_mapping.umoptions` (surfaced by the
+`pg_user_mappings` view) as a `text[]` of `name=value` elements; pg_dump's `dumpUserMappings` expands them **server-side** via the same
+`array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) FROM pg_options_to_table(umoptions) ORDER BY
+option_name), E',\n    ')` shape, and re-emits ` OPTIONS (\n    %s\n)`. Because the list is `ORDER BY option_name`, `password` precedes
+`username` regardless of `CREATE` order.
+
+- **Parser** (`internal/parser/ddl.go`): `scanUserMappingForServer` now also returns the `OPTIONS` list — it reuses the shared
+  `scanFDWOptionsList` helper (slice 378) when it reaches the `OPTIONS` token instead of skipping it. The `CREATE USER MAPPING` arm stores the
+  list in `CompatNoopStmt.Options`; the `DROP USER MAPPING` caller discards it (`_`).
+- **Catalog** (`internal/catalog/catalog.go`): `UserMapping` gains an `Options []string` field; `RegisterUserMapping(user, server, options)`
+  stores it (re-registration refreshes options only when non-empty, so an idempotent `nil` re-register is non-destructive). The
+  `pg_user_mappings` `VirtualRows` `umoptions` cell renders the options via the existing `optionsArrayLiteral` helper, which goopg's own
+  `pg_options_to_table` SRF then expands back into `(option_name, option_value)` rows.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `user mapping` arm threads `s.Options` into `RegisterUserMapping`.
+
+Covered by the extended `TestParseCreateUserMapping` (parser: `OPTIONS` form → ordered `name=value` slice + user/server intact), the
+`umoptions` assertions in `TestUserMappingRegistry` (registry: `umoptions` renders `{username=remote,password=secret}`; `nil` re-register
+preserves options), and the `goopg_srv_um` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact multi-line
+`CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (\n    password 'secret',\n    username 'remote'\n);`). Verified against real
+pg_dump 18.3 (`dumpUserMappings`), with a negative control confirming the option-order assertion is live.
+
+**Deferred (ledger):** FDW (`fdwoptions`) OPTIONS remain discarded. **Discovery:** goopg's `pgQuoteIdent` does NOT check reserved keywords
+(its comment claims it does, but the implementation only guards on character class / lowercase), so an option named with a reserved keyword
+(e.g. `user`) emits bare `user 'x'` where real pg_dump emits `"user" 'x'` — a latent divergence at every `quote_ident` call site, not just
+this one. This slice sidesteps it with non-keyword option names; the array-metacharacter value-quoting gap and the in-memory-only limitation
+from slice 378 also still apply.
 
 ## Deferred (002–010) — catalog surface estimate
 

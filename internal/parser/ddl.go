@@ -307,9 +307,10 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if !p.acceptIdentKeyword("mapping") {
 			return nil, p.errAtCur("expected MAPPING after CREATE USER")
 		}
-		userName, srvName := p.scanUserMappingForServer()
+		userName, srvName, umOptions := p.scanUserMappingForServer()
 		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "user mapping", ObjName: ObjectName{Name: userName}}
 		ns.TableName = ObjectName{Name: srvName} // reuse TableName for the server association
+		ns.Options = umOptions
 		return ns, nil
 	// CREATE FOREIGN TABLE / CREATE FOREIGN DATA WRAPPER. M0097-0071.
 	// FOREIGN is a reserved keyword so acceptKeyword is required (not acceptIdentKeyword).
@@ -384,12 +385,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 //
 //	[CREATE|DROP] USER MAPPING [IF ...] FOR <user> SERVER <server> [OPTIONS (...)]
 //
-// statement, returning the mapped user name (the token after FOR) and the server
-// name (the token after SERVER), then skipping to the statement terminator. The
-// user may be a role name, PUBLIC, or CURRENT_USER/CURRENT_ROLE/SESSION_USER/USER;
-// goopg keeps only enough to round-trip the mapping through pg_dump, so OPTIONS
-// and the precise user-spec kind are intentionally not modelled. DU-002 slice 377.
-func (p *parser) scanUserMappingForServer() (user, server string) {
+// statement, returning the mapped user name (the token after FOR), the server
+// name (the token after SERVER), and the OPTIONS list as "name=value" elements,
+// then skipping to the statement terminator. The user may be a role name,
+// PUBLIC, or CURRENT_USER/CURRENT_ROLE/SESSION_USER/USER; goopg keeps only enough
+// to round-trip the mapping (including its OPTIONS) through pg_dump, so the
+// precise user-spec kind is intentionally not modelled. DU-002 slice 377 (OPTIONS:
+// slice 379).
+func (p *parser) scanUserMappingForServer() (user, server string, options []string) {
 	for {
 		tok := p.cur()
 		if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -411,9 +414,16 @@ func (p *parser) scanUserMappingForServer() (user, server string) {
 			}
 			continue
 		}
+		// OPTIONS ( name 'value', … ) → umoptions text[] elements so the mapping's
+		// options round-trip through pg_dump (pg_user_mappings.umoptions →
+		// dumpUserMappings). Reuses the shared CREATE-form OPTIONS scanner.
+		if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "options") {
+			options = p.scanFDWOptionsList()
+			continue
+		}
 		p.advance()
 	}
-	return user, server
+	return user, server, options
 }
 
 // scanFDWOptionsList consumes an `OPTIONS ( name 'value' [, …] )` clause,
@@ -3941,7 +3951,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 			}
 			ifExists = true
 		}
-		userName, srvName := p.scanUserMappingForServer()
+		userName, srvName, _ := p.scanUserMappingForServer() // DROP ignores OPTIONS
 		return &DropCompatStmt{pos: t.Pos, ObjType: "user mapping", IfExists: ifExists,
 			Names: []ObjectName{{Name: userName}, {Name: srvName}}}, nil
 	}
