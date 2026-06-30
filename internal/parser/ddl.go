@@ -142,6 +142,11 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// CREATE DOMAIN name [AS] base_type [constraints] — M0097-0017.
 	case p.acceptIdentKeyword("domain"):
 		return p.parseCreateDomain(t.Pos)
+	// CREATE COLLATION [IF NOT EXISTS] name (option = value [, ...])
+	//   | name FROM existing_collation — register in the runtime pg_collation
+	// registry so pg_dump round-trips it. DU-002 (M0119-0004).
+	case p.acceptIdentKeyword("collation"):
+		return p.parseCreateCollationTail(t.Pos)
 	// CREATE CONSTRAINT TRIGGER (CONSTRAINT is a reserved keyword, so match the
 	// keyword token — acceptIdentKeyword never matches it). DU-002 slice 327.
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
@@ -550,6 +555,88 @@ func (p *parser) parseCreateExtensionTail(pos int) (Stmt, error) {
 			return stmt, nil
 		}
 	}
+}
+
+// parseCreateCollationTail parses the tail of
+//
+//	CREATE COLLATION [IF NOT EXISTS] name ( option = value [, ...] )
+//	CREATE COLLATION [IF NOT EXISTS] name FROM existing_collation
+//
+// after the COLLATION keyword. Mirrors gram.y's DefineStmt for OBJECT_COLLATION.
+// Recognised options: LOCALE, LC_COLLATE, LC_CTYPE, PROVIDER, DETERMINISTIC,
+// VERSION, RULES (unknown options are accepted and ignored for forward
+// compatibility). DU-002 (M0119-0004).
+func (p *parser) parseCreateCollationTail(pos int) (Stmt, error) {
+	stmt := &CreateCollationStmt{pos: pos}
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwNot); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Name = name
+	// FROM existing_collation form.
+	if p.acceptKeyword(KwFrom) {
+		from, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.FromName = from
+		return stmt, nil
+	}
+	// Parenthesised option list.
+	if c := p.cur(); !(c.Kind == TokenSymbol && c.Value == "(") {
+		return nil, p.errAtCur("expected ( or FROM in CREATE COLLATION")
+	}
+	p.advance() // consume '('
+	for {
+		if c := p.cur(); c.Kind == TokenSymbol && c.Value == ")" {
+			p.advance()
+			break
+		}
+		kt := p.cur()
+		if kt.Kind != TokenIdent && kt.Kind != TokenKeyword {
+			return nil, p.errAtCur("expected option name in CREATE COLLATION")
+		}
+		key := strings.ToLower(kt.Value)
+		p.advance()
+		if c := p.cur(); (c.Kind == TokenOperator || c.Kind == TokenSymbol) && c.Value == "=" {
+			p.advance()
+		} else {
+			return nil, p.errAtCur("expected = after option name in CREATE COLLATION")
+		}
+		vt := p.cur()
+		if vt.Kind != TokenIdent && vt.Kind != TokenKeyword && vt.Kind != TokenStringLit && vt.Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected value after = in CREATE COLLATION")
+		}
+		val := vt.Value
+		p.advance()
+		switch key {
+		case "locale":
+			stmt.Locale = val
+		case "lc_collate":
+			stmt.LcCollate = val
+		case "lc_ctype":
+			stmt.LcCtype = val
+		case "provider":
+			stmt.Provider = strings.ToLower(val)
+		case "deterministic":
+			stmt.Deterministic = strings.ToLower(val)
+		default:
+			// VERSION, RULES, and any unknown option: accept and ignore.
+		}
+		if c := p.cur(); c.Kind == TokenSymbol && c.Value == "," {
+			p.advance()
+		}
+	}
+	return stmt, nil
 }
 
 // parseCreateTablespaceTail parses the tail of

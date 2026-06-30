@@ -9534,6 +9534,35 @@ IS 'an extension comment'` fixture/assertion in `TestPort_PgDumpConnectionSetup`
 `knownExtensions`), verified against real pg_dump 18.3 — the dump now also emits the `CREATE EXTENSION IF NOT EXISTS amcheck
 WITH SCHEMA public;` line that carries the comment.
 
+### Slice 389 — **`CREATE COLLATION` round-trip** (new object type: parser + catalog + executor)
+
+The COMMENT-ON seam (slices 386–388) is now exhausted for every object type goopg dumps; the next gap is a *new* dumpable
+object. A user collation created via `CREATE COLLATION` lives in `pg_collation` with a user namespace; pg_dump's
+`getCollations` selects every collation but filters the BKI-pinned `pg_catalog` built-ins at dump time, leaving only user
+collations, and `dumpCollation` reconstructs `CREATE COLLATION <schema>.<name> (provider = …, …)` from the catalog columns
+(`collprovider`, `collcollate`, `collctype`, `colllocale`, …). goopg parsed nothing for `CREATE COLLATION` — it was a hard
+parse error, so no collation reached the catalog and pg_dump emitted nothing.
+
+- **`parser.parseCreateCollationTail`** (new) parses `CREATE COLLATION [IF NOT EXISTS] name (option = value …)` and the
+  `name FROM existing` form into a new `CreateCollationStmt`. Recognised options: `LOCALE`, `LC_COLLATE`, `LC_CTYPE`,
+  `PROVIDER`, `DETERMINISTIC` (`VERSION`/`RULES`/unknown accepted-and-ignored). Dispatched from the CREATE switch on the
+  `collation` ident-keyword; the planner wraps it in `DDL` and the server tags it `CREATE COLLATION`.
+- **`catalog.InMemory.CreateCollation`** (new) allocates a user OID (`>= FirstUserOID`), resolves the schema to its
+  namespace OID (`public`=2200), and appends a `UserCollation` to the `userCollations` registry. The virtual `pg_collation`
+  view now appends these rows after the seven built-ins, so `getCollations` discovers them while still skipping the pinned
+  rows. `CollationAttrsByName` (new) resolves the built-in + user attributes for the `FROM existing` form.
+- **`executor.execCreateCollation`** (new) maps the parsed options to catalog columns: the default libc provider stores the
+  locale in `collcollate`/`collctype` (with `LOCALE` setting both, mirroring `DefineCollation` in `collationcmds.c`), while
+  `builtin`/`icu` store it in `colllocale`. For libc with `collcollate == collctype`, `dumpCollation` collapses the pair to a
+  single `locale =` clause.
+
+Covered by `TestParseCreateCollation` (parser), `TestCreateCollationVirtualRows` (catalog), and a
+`CREATE COLLATION public.mycoll (LOCALE = 'C')` fixture in `TestPort_PgDumpConnectionSetup` asserting the dump emits
+`CREATE COLLATION public.mycoll (provider = libc, locale = 'C');` — matching real pg_dump 18.3's `dumpCollation` output.
+**Deferred** (ledger): the collation is dump-only (not used for string ordering); `colllocale`-provider (icu/builtin) and the
+`FROM existing` form are wired but not yet asserted through pg_dump; the registry is in-memory (no restart persistence,
+`pg_collation` is not heap-backed); `ALTER COLLATION` / collation comments are not handled.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

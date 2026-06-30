@@ -1582,6 +1582,31 @@ type CreateExtensionStmt struct {
 func (s *CreateExtensionStmt) Pos() int  { return s.pos }
 func (s *CreateExtensionStmt) stmtNode() {}
 
+// CreateCollationStmt — `CREATE COLLATION [IF NOT EXISTS] name (option = value [, ...])`
+// or `CREATE COLLATION name FROM existing_collation`. goopg records the user
+// collation in the runtime pg_collation registry so pg_dump's getCollations /
+// dumpCollation re-emit `CREATE COLLATION <schema>.<name> (provider = …, …)`.
+// Only the schema-dump round-trip is modeled — the collation is not used for
+// actual string ordering. Mirrors gram.y's DefineStmt for OBJECT_COLLATION.
+// DU-002 (M0119-0004).
+type CreateCollationStmt struct {
+	pos         int
+	Name        ObjectName
+	IfNotExists bool
+	// Option clauses (empty string = unset). LOCALE sets both LcCollate and
+	// LcCtype when they are not given explicitly.
+	Provider      string // "libc" | "icu" | "builtin"; "" → libc default
+	Locale        string
+	LcCollate     string
+	LcCtype       string
+	Deterministic string // "true" | "false" | "" (unset → deterministic)
+	// FROM existing_collation form: copy attributes from an existing collation.
+	FromName ObjectName
+}
+
+func (s *CreateCollationStmt) Pos() int  { return s.pos }
+func (s *CreateCollationStmt) stmtNode() {}
+
 // CreateTablespaceStmt — `CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opts)]`.
 // goopg supports only the developer/regression-test in-place form (empty LOCATION
 // with allow_in_place_tablespaces on), which creates pg_tblspc/<oid> as a real

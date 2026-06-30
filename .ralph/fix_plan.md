@@ -3293,6 +3293,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestParseCommentOnExtension` (parser) + `CREATE EXTENSION amcheck` / `COMMENT ON EXTENSION amcheck IS 'an extension
       comment'` fixture/assert in `TestPort_PgDumpConnectionSetup` (amcheck is goopg's one shipped extension). No new
       deferral.
+      **2026-07-01 (loop #29, design 0110-0001 slice 389): CREATE COLLATION round-trip** (NEW dumpable object — the
+      COMMENT-ON seam is exhausted for every object goopg dumps). A user collation lives in `pg_collation` with a user
+      namespace; pg_dump's `getCollations` filters out the BKI-pinned `pg_catalog` built-ins and `dumpCollation`
+      reconstructs `CREATE COLLATION <schema>.<name> (provider = …, locale = …)` from the catalog columns. goopg had no
+      `CREATE COLLATION` parser at all (hard parse error). Added `parser.parseCreateCollationTail` (new `CreateCollationStmt`;
+      option-list + `FROM existing` forms; LOCALE/LC_COLLATE/LC_CTYPE/PROVIDER/DETERMINISTIC), `catalog.CreateCollation`
+      (allocates a user OID, appends to `userCollations`, surfaced as extra `pg_collation` rows) + `CollationAttrsByName`,
+      and `executor.execCreateCollation` (libc LOCALE → collcollate/collctype; builtin/icu → colllocale). Planner `DDL` wrap +
+      `CREATE COLLATION` command tag. Tests `TestParseCreateCollation`, `TestCreateCollationVirtualRows`, and a
+      `CREATE COLLATION public.mycoll (LOCALE = 'C')` fixture in `TestPort_PgDumpConnectionSetup` asserting
+      `CREATE COLLATION public.mycoll (provider = libc, locale = 'C');`. Deferral row appended (dump-only; icu/builtin +
+      FROM not yet asserted; in-memory only; no ALTER COLLATION / collation comments).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

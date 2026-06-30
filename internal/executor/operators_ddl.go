@@ -91,6 +91,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execTruncate(s)
 	case *parser.AlterTableStmt:
 		return nil, o.execAlterTable(s)
+	case *parser.CreateCollationStmt:
+		return nil, o.execCreateCollation(s)
 	case *parser.CreatePublicationStmt:
 		return nil, o.execCreatePublication(s)
 	case *parser.DropPublicationStmt:
@@ -310,6 +312,83 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 		if rmErr := os.RemoveAll(dir); rmErr != nil {
 			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not remove directory %q: %v", dir, rmErr)}
 		}
+	}
+	return nil
+}
+
+// execCreateCollation registers a CREATE COLLATION in the runtime
+// pg_collation registry so pg_dump's getCollations / dumpCollation round-trip
+// it. goopg does not use the collation for actual string ordering — only the
+// schema-dump round-trip is modeled. The `LOCALE` clause sets both lc_collate
+// and lc_ctype for the default libc provider (mirroring gram.y / DefineCollation
+// in collationcmds.c); the `FROM existing` form copies the source collation's
+// attributes. M0119-0004.
+func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	uc := &catalog.UserCollation{
+		Name:          s.Name.Name,
+		Owner:         10, // postgres superuser
+		Encoding:      -1, // encoding-independent unless a built-in source says otherwise
+		Deterministic: true,
+	}
+	if s.FromName.Name != "" {
+		// CREATE COLLATION new FROM existing — copy the source's attributes.
+		src, found := im.CollationAttrsByName(s.FromName.Name)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q for current database encoding does not exist", s.FromName.Name)}
+		}
+		uc.Provider = src.Provider
+		uc.Encoding = src.Encoding
+		uc.Collate = src.Collate
+		uc.Ctype = src.Ctype
+		uc.Locale = src.Locale
+	} else {
+		// Provider: default libc ('c') when unspecified.
+		switch s.Provider {
+		case "icu":
+			uc.Provider = 'i'
+		case "builtin":
+			uc.Provider = 'b'
+		default:
+			uc.Provider = 'c'
+		}
+		if s.Deterministic == "false" {
+			uc.Deterministic = false
+		}
+		// LOCALE sets both lc_collate and lc_ctype when they are not given
+		// explicitly. For the libc provider, collcollate/collctype carry the
+		// locale and colllocale stays NULL; for builtin/icu, colllocale carries
+		// the locale and collcollate/collctype stay NULL (matching pg_collation
+		// and what dumpCollation expects per provider).
+		collate := s.LcCollate
+		ctype := s.LcCtype
+		if collate == "" {
+			collate = s.Locale
+		}
+		if ctype == "" {
+			ctype = s.Locale
+		}
+		switch uc.Provider {
+		case 'c':
+			uc.Collate = collate
+			uc.Ctype = ctype
+		default: // 'b' builtin, 'i' icu
+			loc := s.Locale
+			if loc == "" {
+				loc = collate
+			}
+			uc.Locale = loc
+		}
+	}
+	if _, err := im.CreateCollation(uc, schema, s.IfNotExists); err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	return nil
 }

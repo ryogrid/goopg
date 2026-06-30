@@ -4902,6 +4902,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE EXTENSION amcheck"); err != nil {
 		t.Fatalf("create extension amcheck: %v", err)
 	}
+	// Slice 389: a user collation (CREATE COLLATION) must round-trip through
+	// pg_dump. goopg records it in the runtime pg_collation registry with a user
+	// namespace (public=2200) and an OID >= 16384, so pg_dump's getCollations
+	// selects it for dump (the BKI-pinned pg_catalog built-ins are skipped) and
+	// dumpCollation re-emits `CREATE COLLATION public.mycoll (provider = libc,
+	// locale = 'C');`. For the default libc provider, LOCALE sets both
+	// collcollate and collctype to 'C' (colllocale stays NULL), and since they
+	// are equal dumpCollation collapses them to a single `locale =` clause.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.mycoll (LOCALE = 'C')"); err != nil {
+		t.Fatalf("create collation mycoll: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7939,6 +7950,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a COMMENT; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 389 (asserted):** a user collation (CREATE COLLATION) must
+		// round-trip. goopg records it in the runtime pg_collation registry with
+		// a user namespace (public=2200) and an OID >= 16384; pg_dump's
+		// getCollations selects it (BKI-pinned pg_catalog built-ins are skipped)
+		// and dumpCollation reconstructs the DDL from collprovider/collcollate/
+		// collctype. For libc with collcollate == collctype, the two collapse to a
+		// single `locale =` clause. Before this slice CREATE COLLATION was a hard
+		// parse error, so no collation reached the catalog and pg_dump emitted
+		// nothing.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.mycoll (provider = libc, locale = 'C');") {
+			t.Errorf("pg_dump dropped the user collation; missing CREATE COLLATION public.mycoll\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
 		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef

@@ -2036,6 +2036,11 @@ type InMemory struct {
 	// user-defined aggregates registered via CREATE AGGREGATE.
 	userAggregates map[string]*UserAggregate
 
+	// userCollations holds collations created via CREATE COLLATION, in
+	// creation order (deterministic pg_dump output). Surfaced as extra rows in
+	// the virtual pg_collation view so pg_dump round-trips them. M0119-0004.
+	userCollations []*UserCollation
+
 	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
@@ -2485,6 +2490,24 @@ type UserAggregate struct {
 	InitCond    string   // initial condition string (may be empty)
 	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
 	Variadic    bool     // true when declared with VARIADIC input arg
+}
+
+// UserCollation records a collation created via CREATE COLLATION so that
+// pg_dump's getCollations / dumpCollation re-emit it. goopg does not use the
+// collation for actual string ordering — only the schema-dump round-trip is
+// modeled. Stored in InMemory.userCollations and surfaced as extra rows in the
+// virtual pg_collation view. DU-002 (M0119-0004).
+type UserCollation struct {
+	OID           uint32
+	Name          string // collation name (bare, no schema)
+	NamespaceOID  uint32 // collnamespace (resolved from the schema)
+	Owner         uint32 // collowner (role OID; 10 = postgres superuser)
+	Provider      byte   // collprovider: 'c' libc, 'i' icu, 'b' builtin, 'd' default
+	Encoding      int    // collencoding: -1 = encoding-independent
+	Collate       string // collcollate (libc lc_collate); "" → NULL
+	Ctype         string // collctype (libc lc_ctype); "" → NULL
+	Locale        string // colllocale (builtin/icu locale); "" → NULL
+	Deterministic bool   // collisdeterministic
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -6012,7 +6035,7 @@ func (c *InMemory) registerSystemTables() {
 		// cols: oid, collname, collnamespace, collowner, collprovider,
 		//       collisdeterministic, collencoding, collcollate, collctype,
 		//       colllocale, collicurules, collversion
-		return [][]string{
+		rows := [][]string{
 			{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
 			{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
 			{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
@@ -6021,6 +6044,33 @@ func (c *InMemory) registerSystemTables() {
 			{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
 			{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
 		}
+		// Append user collations (CREATE COLLATION). These carry a user
+		// namespace (e.g. public=2200) so pg_dump's getCollations selects them
+		// for dump while the BKI-pinned pg_catalog rows above are skipped.
+		// M0119-0004.
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		for _, uc := range c.userCollations {
+			det := "t"
+			if !uc.Deterministic {
+				det = "f"
+			}
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(uc.OID), 10),
+				uc.Name,
+				strconv.FormatUint(uint64(uc.NamespaceOID), 10),
+				strconv.FormatUint(uint64(uc.Owner), 10),
+				string(uc.Provider),
+				det,
+				strconv.Itoa(uc.Encoding),
+				uc.Collate,
+				uc.Ctype,
+				uc.Locale,
+				"", // collicurules: not modeled
+				"", // collversion: NULL → recomputed on restore
+			})
+		}
+		return rows
 	}
 	c.tables["pg_catalog.pg_collation"] = pgCollation
 
@@ -8329,6 +8379,76 @@ func (c *InMemory) ExtensionOID(name string) uint32 {
 		return e.oid
 	}
 	return 0
+}
+
+// CreateCollation records a CREATE COLLATION in the runtime pg_collation
+// registry so pg_dump's getCollations / dumpCollation re-emit it. `schema` is
+// the (already-resolved) schema name the collation lives in; an unknown schema
+// resolves to the public namespace OID. The collation is keyed by its OID and
+// surfaced as an extra virtual pg_collation row. Returns the new OID, or 0 with
+// an error if a same-named collation already exists in the same namespace and
+// ifNotExists is false. M0119-0004.
+func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists bool) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userCollations {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+			if ifNotExists {
+				return existing.OID, nil
+			}
+			return 0, fmt.Errorf("collation %q already exists", uc.Name)
+		}
+	}
+	uc.OID = c.allocOIDLocked()
+	uc.NamespaceOID = nsOID
+	c.userCollations = append(c.userCollations, uc)
+	return uc.OID, nil
+}
+
+// CollationAttrsByName resolves a collation's dump-relevant attributes
+// (provider, collate, ctype, locale, encoding, deterministic) by its bare name,
+// searching the built-in collations and then user-created ones. Used by
+// `CREATE COLLATION new FROM existing` to copy the source's attributes. Returns
+// false if no collation by that name is known. M0119-0004.
+func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
+	// Built-in collations (mirror the 7 BKI rows surfaced in pg_collation):
+	// name → {provider, encoding, collate, ctype, locale}.
+	type bi struct {
+		provider byte
+		encoding int
+		collate  string
+		ctype    string
+		locale   string
+	}
+	builtins := map[string]bi{
+		"default":         {'d', -1, "", "", ""},
+		"c":               {'c', -1, "C", "C", ""},
+		"posix":           {'c', -1, "POSIX", "POSIX", ""},
+		"ucs_basic":       {'b', 6, "", "", "C"},
+		"unicode":         {'i', -1, "", "", "und"},
+		"pg_c_utf8":       {'b', 6, "", "", "C.UTF-8"},
+		"pg_unicode_fast": {'b', 6, "", "", "PG_UNICODE_FAST"},
+	}
+	lc := strings.ToLower(name)
+	if b, ok := builtins[lc]; ok {
+		return &UserCollation{
+			Name: name, Owner: 10, Provider: b.provider, Encoding: b.encoding,
+			Collate: b.collate, Ctype: b.ctype, Locale: b.locale, Deterministic: true,
+		}, true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, uc := range c.userCollations {
+		if strings.EqualFold(uc.Name, name) {
+			cp := *uc
+			return &cp, true
+		}
+	}
+	return nil, false
 }
 
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
