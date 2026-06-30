@@ -2697,6 +2697,19 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("collation"):
+		// COMMENT ON COLLATION [schema.]name IS '...'. Collations live in
+		// pg_collation (classoid 3456); pg_dump's dumpCollation re-emits
+		// `COMMENT ON COLLATION <schema>.<name> IS '...'` keyed on the collation's
+		// catalogId (tableoid=pg_collation=3456) and objsubid 0. A user collation
+		// lives in a user schema, so parse a schema-qualifiable object name.
+		// DU-002 slice 390.
+		cs.ObjKind = "collation"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptIdentKeyword("server"):
 		// COMMENT ON SERVER <name> IS '...'. Foreign servers live in
 		// pg_foreign_server (classoid 1417); pg_dump's dumpForeignServer re-emits

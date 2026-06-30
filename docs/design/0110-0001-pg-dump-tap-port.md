@@ -9559,6 +9559,27 @@ parse error, so no collation reached the catalog and pg_dump emitted nothing.
 Covered by `TestParseCreateCollation` (parser), `TestCreateCollationVirtualRows` (catalog), and a
 `CREATE COLLATION public.mycoll (LOCALE = 'C')` fixture in `TestPort_PgDumpConnectionSetup` asserting the dump emits
 `CREATE COLLATION public.mycoll (provider = libc, locale = 'C');` — matching real pg_dump 18.3's `dumpCollation` output.
+
+### Slice 390 — **COMMENT ON COLLATION round-trip** (parser + executor gap)
+
+Now that a user collation round-trips (slice 389), the natural follow-on is its comment. `dumpCollation` ends with a
+`if (collinfo->dobj.dump & DUMP_COMPONENT_COMMENT) dumpComment(fout, "COLLATION", qcollname, namespace, rolname,
+collinfo->dobj.catId, 0, …)` call (`pg_dump.c:15050`), which finds the `pg_description` row keyed on the collation's
+`catalogId` (`tableoid=pg_collation=3456`, `objsubid=0`) and re-emits `COMMENT ON COLLATION <schema>.<name> IS '...'` after
+the `CREATE COLLATION`. goopg's `parseCommentOnTail` had no `COLLATION` branch, so the statement fell through to the COMMENT
+fallback and was silently swallowed — the comment never reached `pg_description`, and pg_dump emitted nothing.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptIdentKeyword("collation")` arm that sets `ObjKind="collation"` and
+  parses a schema-qualifiable object name (`public.mycoll`). `COLLATION` is an unreserved ident-keyword.
+- **`executor.execCommentOn`** adds a `"collation"` case: it resolves the collation OID via the existing
+  `catalog.InMemory.CollationAttrsByName(name)` (the same `userCollations` registry `getCollations` dumps from) and stores
+  the description under `pg_collation` (classoid 3456, objsubid 0) via `SetComment`. Built-in collations report OID 0 here,
+  so a `COMMENT ON` a built-in is a harmless no-op (pg_dump never dumps built-in collation comments). A new
+  `oidPgCollation = 3456` classoid constant joins the existing block.
+
+Covered by the new `TestParseCommentOnCollation` parser pin plus a `COMMENT ON COLLATION public.mycoll IS
+'case-sensitive C collation'` fixture/assertion in `TestPort_PgDumpConnectionSetup`, verified against real pg_dump 18.3 — the
+dump now emits the trailing `COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation';` line.
 **Deferred** (ledger): the collation is dump-only (not used for string ordering); `colllocale`-provider (icu/builtin) and the
 `FROM existing` form are wired but not yet asserted through pg_dump; the registry is in-memory (no restart persistence,
 `pg_collation` is not heap-backed); `ALTER COLLATION` / collation comments are not handled.

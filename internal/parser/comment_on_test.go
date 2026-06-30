@@ -304,3 +304,45 @@ func TestParseCommentOnExtension(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCommentOnCollation covers COMMENT ON COLLATION [schema.]name.
+// Collations live in pg_collation (classoid 3456); pg_dump's dumpCollation
+// re-emits `COMMENT ON COLLATION <schema>.<name> IS '...'`. COLLATION is an
+// unreserved ident-keyword and a user collation is schema-qualifiable. Before
+// slice 390 the parser had no COLLATION branch and silently swallowed the
+// statement. DU-002 slice 390.
+func TestParseCommentOnCollation(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantSchema string
+		wantName   string
+	}{
+		{"COMMENT ON COLLATION mycoll IS 'a collation comment'", "", "mycoll"},
+		{"COMMENT ON COLLATION public.mycoll IS 'c'", "public", "mycoll"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "collation" {
+			t.Errorf("%q: ObjKind=%q, want collation", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != tc.wantSchema {
+			t.Errorf("%q: ObjName.Schema=%q, want %q", tc.sql, cs.ObjName.Schema, tc.wantSchema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}

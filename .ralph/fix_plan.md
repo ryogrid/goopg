@@ -3305,6 +3305,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `CREATE COLLATION public.mycoll (LOCALE = 'C')` fixture in `TestPort_PgDumpConnectionSetup` asserting
       `CREATE COLLATION public.mycoll (provider = libc, locale = 'C');`. Deferral row appended (dump-only; icu/builtin +
       FROM not yet asserted; in-memory only; no ALTER COLLATION / collation comments).
+
+      **2026-07-01 (loop #30, design 0110-0001 slice 390): COMMENT ON COLLATION round-trip** (follow-on to slice 389).
+      `dumpCollation` ends with a `dumpComment(fout, "COLLATION", …, collinfo->dobj.catId, 0, …)` call (`pg_dump.c:15050`)
+      that re-emits `COMMENT ON COLLATION <schema>.<name> IS '...'` from the `pg_description` row keyed on the collation's
+      `catalogId` (tableoid=pg_collation=3456, objsubid=0). goopg's `parseCommentOnTail` had no `COLLATION` branch, so the
+      statement was silently swallowed and never reached `pg_description`. Added a `case p.acceptIdentKeyword("collation")`
+      arm (schema-qualifiable name → `ObjKind="collation"`) and an `execCommentOn` `"collation"` case that resolves the
+      collation OID via the existing `CollationAttrsByName` registry and stores the comment under classoid 3456
+      (`oidPgCollation`). Tests `TestParseCommentOnCollation` (parser) + a `COMMENT ON COLLATION public.mycoll IS
+      'case-sensitive C collation'` fixture/assertion in `TestPort_PgDumpConnectionSetup` (byte-identical vs real pg_dump
+      18.3). Deferral row appended (built-in collation comments are a no-op since they report OID 0; in-memory only — same
+      pg_collation-heap-persistence gap as slice 389).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

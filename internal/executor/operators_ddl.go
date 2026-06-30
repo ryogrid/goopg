@@ -13137,6 +13137,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgForeignSrv   = 1417 // pg_foreign_server: foreign servers
 		oidPgFdw          = 2328 // pg_foreign_data_wrapper: foreign-data wrappers
 		oidPgExtension    = 3079 // pg_extension: installed extensions
+		oidPgCollation    = 3456 // pg_collation: collations
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13215,6 +13216,21 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgExtension, oid, 0, s.Description)
+	case "collation":
+		// Collations live in pg_collation (classoid 3456). pg_dump's dumpCollation
+		// keys the comment lookup on the collation's catalogId
+		// (tableoid=pg_collation=3456) and objsubid 0, then re-emits
+		// `COMMENT ON COLLATION <schema>.<name> IS '...'`. Resolve the user
+		// collation's OID by name via the same registry getCollations dumps from.
+		// Built-in collations report OID 0 here (pg_dump never dumps their
+		// comments), so a COMMENT ON a built-in is a harmless no-op. Without this a
+		// COMMENT ON COLLATION was silently swallowed (parser dropped it) and never
+		// reached pg_description, so pg_dump could not re-emit it. DU-002 slice 390.
+		uc, ok := im.CollationAttrsByName(s.ObjName.Name)
+		if !ok || uc.OID == 0 {
+			return nil
+		}
+		im.SetComment(oidPgCollation, uc.OID, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {

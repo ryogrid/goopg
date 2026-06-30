@@ -4913,6 +4913,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE COLLATION public.mycoll (LOCALE = 'C')"); err != nil {
 		t.Fatalf("create collation mycoll: %v", err)
 	}
+	// Slice 390: a comment on that user collation must round-trip too. pg_dump's
+	// dumpCollation emits a trailing `COMMENT ON COLLATION public.mycoll IS '...'`
+	// from pg_description keyed on the collation's catalogId (pg_collation=3456)
+	// and objsubid 0. The executor resolves the collation OID via the same
+	// userCollations registry getCollations dumps from. Before this slice the
+	// parser had no COMMENT ON COLLATION branch and silently swallowed it.
+	if err := runSQLSimple(t, c, "COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation'"); err != nil {
+		t.Fatalf("comment on collation mycoll: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7962,6 +7971,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// nothing.
 		if !strings.Contains(res.Stdout, "CREATE COLLATION public.mycoll (provider = libc, locale = 'C');") {
 			t.Errorf("pg_dump dropped the user collation; missing CREATE COLLATION public.mycoll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 390 (asserted):** a comment on that collation must round-trip.
+		// dumpCollation emits a trailing COMMENT ON COLLATION from pg_description
+		// keyed on the collation's catalogId (pg_collation=3456). The executor
+		// resolves the collation OID via the userCollations registry. Before this
+		// slice COMMENT ON COLLATION was a parser drop, so pg_description had no row
+		// and pg_dump emitted nothing.
+		if !strings.Contains(res.Stdout, "COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation';") {
+			t.Errorf("pg_dump dropped the collation comment; missing COMMENT ON COLLATION public.mycoll\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
 		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef
