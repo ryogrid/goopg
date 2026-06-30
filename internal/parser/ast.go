@@ -1811,6 +1811,30 @@ type CompatNoopStmt struct {
 	// (ALTER TABLE ADD PRIMARY KEY setting relhasindex) waits on it. Empty when the
 	// grant targets a non-table object class. Design 0118-0109 (intra-grant-inplace).
 	TableACL string
+	// TypeACL is set for a GRANT/REVOKE … ON TYPE|DOMAIN … statement. Unlike the
+	// table/schema/function object classes — whose catalogs goopg serves
+	// *virtually*, so the server records the ACL change before the executor — the
+	// pg_type catalog is heap-backed (PG18-standby basebackup parity, M0097-0022),
+	// so a USAGE GRANT/REVOKE must re-sync the real pg_type heap row, which needs
+	// an *executor.Context. The parser captures the parsed clause here so the
+	// executor (execCompatNoop) can update the OID-keyed ACL store and re-sync the
+	// heap row. Nil for every other object class. M0119-0004-ACLHEAP.
+	TypeACL *TypeACLChange
+}
+
+// TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …
+// statement so the executor can update the OID-keyed ACL store and re-sync the
+// heap-backed pg_type row. A type's acldefault('T', owner) grants USAGE to BOTH
+// the owner and PUBLIC (structurally identical to the function EXECUTE default),
+// so the executor seeds those implicit entries exactly as recordFunctionGrant
+// does for proacl before applying the grantee change. M0119-0004-ACLHEAP.
+type TypeACLChange struct {
+	Revoke          bool     // true for REVOKE, false for GRANT
+	IsDomain        bool     // ON DOMAIN (vs ON TYPE); both resolve to pg_type
+	Privileges      []string // upper-cased privilege keywords; "ALL" left unexpanded
+	TypeNames       []ObjectName
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool     // GRANT … WITH GRANT OPTION
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

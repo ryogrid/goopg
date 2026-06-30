@@ -275,6 +275,152 @@ func grantNonTableClass(word string) bool {
 	return false
 }
 
+// buildTypeACLChange parses the token run of a GRANT/REVOKE … ON TYPE|DOMAIN …
+// statement into a TypeACLChange. toks is every token after the GRANT/REVOKE
+// keyword with the trailing ';' already excluded. It mirrors the server-side
+// string recorder (grant_ddl.go) — privilege list before ON, type names between
+// the TYPE/DOMAIN keyword and TO|FROM, and the role list after TO|FROM, with a
+// trailing WITH GRANT OPTION / GRANTED BY / CASCADE / RESTRICT clause stripped.
+// Returns nil when any of the three lists is empty (an unparseable form the
+// caller leaves as a successful no-op). M0119-0004-ACLHEAP.
+func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+2 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 2 // skip the ON and the TYPE/DOMAIN keyword
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			// WITH GRANT OPTION — record the flag and end the role list.
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	tac := &TypeACLChange{
+		Revoke:          revoke,
+		IsDomain:        isDomain,
+		Privileges:      splitTokPrivileges(toks[:onIdx]),
+		TypeNames:       splitTokObjectNames(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(tac.Privileges) == 0 || len(tac.TypeNames) == 0 || len(tac.Grantees) == 0 {
+		return nil
+	}
+	return tac
+}
+
+// tokIndexOf returns the index of the first token at or after `from` whose value
+// equals kw (case-insensitive), or -1.
+func tokIndexOf(toks []Token, from int, kw string) int {
+	for i := from; i < len(toks); i++ {
+		if strings.EqualFold(toks[i].Value, kw) {
+			return i
+		}
+	}
+	return -1
+}
+
+// splitTokRuns splits a token slice on top-level "," symbols, dropping empty runs.
+func splitTokRuns(toks []Token) [][]Token {
+	var out [][]Token
+	start := 0
+	for i := 0; i < len(toks); i++ {
+		if toks[i].Kind == TokenSymbol && toks[i].Value == "," {
+			if i > start {
+				out = append(out, toks[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(toks) {
+		out = append(out, toks[start:])
+	}
+	return out
+}
+
+// splitTokPrivileges renders each comma-separated privilege run as an upper-cased
+// keyword string (e.g. "USAGE", "ALL", "ALL PRIVILEGES"); the executor expands
+// ALL / ALL PRIVILEGES to the per-class default set.
+func splitTokPrivileges(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		parts := make([]string, 0, len(run))
+		for _, tk := range run {
+			parts = append(parts, strings.ToUpper(tk.Value))
+		}
+		if p := strings.Join(parts, " "); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// splitTokObjectNames renders each comma-separated object-name run as an
+// ObjectName, honouring a schema-qualified `schema.name`.
+func splitTokObjectNames(toks []Token) []ObjectName {
+	var out []ObjectName
+	for _, run := range splitTokRuns(toks) {
+		out = append(out, objectNameFromTokens(run))
+	}
+	return out
+}
+
+// objectNameFromTokens builds an ObjectName from a single object-name token run,
+// splitting on a "." symbol into schema/name and stripping any quoting.
+func objectNameFromTokens(run []Token) ObjectName {
+	for i, tk := range run {
+		if tk.Kind == TokenSymbol && tk.Value == "." && i > 0 && i+1 < len(run) {
+			return ObjectName{
+				Schema: strings.Trim(run[i-1].Value, `"`),
+				Name:   strings.Trim(run[i+1].Value, `"`),
+			}
+		}
+	}
+	if len(run) > 0 {
+		return ObjectName{Name: strings.Trim(run[len(run)-1].Value, `"`)}
+	}
+	return ObjectName{}
+}
+
+// splitTokRoles renders each comma-separated role run as a single role string,
+// stripping quoting. An unquoted PUBLIC arrives lower-cased from the lexer; the
+// executor/catalog folds it to the reserved PUBLIC pseudo-role case-insensitively.
+func splitTokRoles(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		parts := make([]string, 0, len(run))
+		for _, tk := range run {
+			parts = append(parts, strings.Trim(tk.Value, `"`))
+		}
+		if r := strings.Join(parts, ""); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // errAtCur builds a SyntaxError pinned at the current token. The
 // message echoes the token text, matching upstream's "at or near".
 func (p *parser) errAtCur(msg string) error {
@@ -488,6 +634,12 @@ identLedStatement:
 			// is TABLE, so a bare `ON <ident>` is a table grant.
 			databaseACL := false
 			tableACL := ""
+			// typeClass becomes "type"/"domain" when the object class is ON
+			// TYPE|DOMAIN. Unlike the virtual classes, pg_type is heap-backed, so the
+			// full clause is captured (toks) and parsed into CompatNoopStmt.TypeACL
+			// for the executor to apply (M0119-0004-ACLHEAP).
+			typeClass := ""
+			var toks []Token
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
@@ -500,6 +652,12 @@ identLedStatement:
 					case strings.EqualFold(next.Value, "table"):
 						// `ON TABLE <name>` — the name follows the TABLE keyword.
 						tableACL = grantObjectName(p.peek(2), p.peek(3), p.peek(4))
+					case strings.EqualFold(next.Value, "type"):
+						// `ON TYPE <names>` — heap-backed pg_type ACL (captured below).
+						typeClass = "type"
+					case strings.EqualFold(next.Value, "domain"):
+						// `ON DOMAIN <names>` — also a pg_type row (typtype='d').
+						typeClass = "domain"
 					case grantNonTableClass(next.Value):
 						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
 					default:
@@ -507,9 +665,14 @@ identLedStatement:
 						tableACL = grantObjectName(next, p.peek(2), p.peek(3))
 					}
 				}
+				toks = append(toks, p.cur())
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}, nil
+			ns := &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}
+			if typeClass != "" {
+				ns.TypeACL = buildTypeACLChange(strings.EqualFold(t.Value, "revoke"), typeClass == "domain", toks)
+			}
+			return ns, nil
 		case "comment":
 			p.advance() // consume "comment" token
 			// COMMENT ON {TABLE|INDEX|COLUMN|CONSTRAINT} … IS 'text'|NULL

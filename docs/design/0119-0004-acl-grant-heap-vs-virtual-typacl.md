@@ -141,13 +141,41 @@ building block (no GRANT path calls it yet, so blast radius is nil):
   NULL→materialize, grant-option `*`, REVOKE-FROM-PUBLIC, and owner-side REVOKE
   (leaves `{=U/postgres}` / empties to `{}`).
 
+### Progress — step 1 parser capture landed (loop #85, 2026-06-30)
+
+The AST half of step 1 is **in tree** as a self-contained, behaviour-neutral
+building block (no consumer reads it yet, so blast radius is nil):
+
+- `parser.CompatNoopStmt.TypeACL *TypeACLChange` (`internal/parser/ast.go`) — a new
+  optional field set **only** for `GRANT`/`REVOKE … ON TYPE|DOMAIN …`. The new
+  `TypeACLChange` carries `{Revoke, IsDomain, Privileges, TypeNames, Grantees,
+  WithGrantOption}`. Other object classes leave it nil, so the existing
+  virtual-path recorders (table/schema/function) are untouched.
+- The GRANT/REVOKE scan in `internal/parser/parser.go` gained explicit `ON TYPE` /
+  `ON DOMAIN` cases (placed before the `grantNonTableClass` catch-all, which also
+  matches type/domain) that capture the full token run and parse it via
+  `buildTypeACLChange` + token-split helpers (`tokIndexOf`, `splitTokRuns`,
+  `splitTokPrivileges`, `splitTokObjectNames`, `splitTokRoles`,
+  `objectNameFromTokens`). `DatabaseACL`/`TableACL` capture is unchanged (ON
+  TYPE/DOMAIN was, and still is, never a pg_class ACL change → `TableACL == ""`).
+- Unit tests (`internal/parser/op_grant_typeacl_test.go`): `TestParseGrantTypeACL`
+  (USAGE, ALL, ALL PRIVILEGES, DOMAIN, REVOKE-FROM-PUBLIC, WITH GRANT OPTION,
+  multi-name, multi-grantee, CASCADE/GRANTED-BY stripping) and
+  `TestParseGrantNonTypeLeavesTypeACLNil` (table/schema/sequence/function/database
+  leave `TypeACL` nil). Full `internal/parser` suite green; `go build ./...` clean.
+
+This unblocks the executor wiring: the GRANT details now reach a parsed AST node
+that `execCompatNoop` runs with a full `*executor.Context` in scope.
+
 **Remaining for M0119-0004-ACLHEAP** (the high-blast-radius half — still a dedicated
-full-gate loop): steps 1 (route GRANT/REVOKE on a heap-backed object through
-`dispatchSimpleQueryViaExecutor`), 2b (the executor GRANT op that calls
-`TypeACLText` and re-syncs the `pg_type` heap row via the
-`deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` template), 3 (mirror to the
-postgres DB), and 4 (the DU-002 connsetup slice + `TestE2E_PhysicalReplication` +
-TPC-H Q12/Q13 + pgbench gates).
+full-gate loop): the rest of step 1 (route GRANT/REVOKE on a heap-backed object
+through `dispatchSimpleQueryViaExecutor` — flip the `query.go:69-87` short-circuit
+so an autocommit `GRANT … ON TYPE|DOMAIN` falls through to the executor),
+2b (the `execCompatNoop` branch that, when `s.TypeACL != nil`, updates the
+OID-keyed ACL store like `recordFunctionGrant` but with USAGE and re-syncs the
+`pg_type` heap row via the `deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` +
+`TypeACLText` template), 3 (mirror to the postgres DB), and 4 (the DU-002 connsetup
+slice + `TestE2E_PhysicalReplication` + TPC-H Q12/Q13 + pgbench gates).
 
 Catalog accessors that already exist and de-risk step 2: `LookupEnum`/`LookupEnumByOID`
 (`catalog.go:9803/9816`), `LookupCompositeType`/`...ByOID` (`10097/10108`),

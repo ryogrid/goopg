@@ -3014,6 +3014,19 @@ documentation-only and is exempt from the design-doc requirement.)
       ProcACL goldens. Box stays unchecked: the high-blast-radius half (dispatch
       reroute + heap re-sync + the full gate set) is still a dedicated loop. Design
       doc updated with a "Progress" section.
+      **2026-06-30 (loop #85) — parser-capture building block LANDED (behaviour-neutral,
+      no consumer reads it yet):** `parser.CompatNoopStmt.TypeACL *TypeACLChange`
+      (`{Revoke, IsDomain, Privileges, TypeNames, Grantees, WithGrantOption}`) is set
+      only for `GRANT`/`REVOKE … ON TYPE|DOMAIN …`; the parser's GRANT/REVOKE scan gained
+      explicit `ON TYPE`/`ON DOMAIN` cases + `buildTypeACLChange` token-split helpers.
+      `DatabaseACL`/`TableACL` capture unchanged (ON TYPE/DOMAIN was already a
+      non-table no-op → `TableACL==""`). Unit tests `TestParseGrantTypeACL` (USAGE/ALL/
+      ALL PRIVILEGES/DOMAIN/REVOKE-FROM-PUBLIC/WITH GRANT OPTION/multi-name/multi-grantee/
+      CASCADE+GRANTED-BY stripping) + `TestParseGrantNonTypeLeavesTypeACLNil`; full parser
+      suite green, `go build ./...` clean. This unblocks the executor wiring: GRANT
+      details now reach a parsed AST node `execCompatNoop` runs with a full
+      `*executor.Context`. Box stays unchecked: remaining = `query.go` dispatch reroute
+      + the `execCompatNoop` heap-resync branch + the full gate set.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
