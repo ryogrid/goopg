@@ -2507,6 +2507,7 @@ type UserCollation struct {
 	Collate       string // collcollate (libc lc_collate); "" → NULL
 	Ctype         string // collctype (libc lc_ctype); "" → NULL
 	Locale        string // colllocale (builtin/icu locale); "" → NULL
+	Rules         string // collicurules (ICU tailoring rules, icu only); "" → NULL
 	Deterministic bool   // collisdeterministic
 }
 
@@ -6088,8 +6089,8 @@ func (c *InMemory) registerSystemTables() {
 				nz(uc.Collate),
 				nz(uc.Ctype),
 				nz(uc.Locale),
-				VirtualNull, // collicurules: ICU rules not modeled → NULL
-				VirtualNull, // collversion: NULL → recomputed on restore
+				nz(uc.Rules), // collicurules: ICU tailoring rules; "" → NULL
+				VirtualNull,  // collversion: NULL → recomputed on restore
 			})
 		}
 		return rows

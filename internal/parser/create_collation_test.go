@@ -17,6 +17,7 @@ func TestParseCreateCollation(t *testing.T) {
 		lcCollate     string
 		lcCtype       string
 		deterministic string
+		rules         string
 		from          string
 	}{
 		{sql: "CREATE COLLATION mycoll (LOCALE = 'C')", name: "mycoll", locale: "C"},
@@ -24,6 +25,7 @@ func TestParseCreateCollation(t *testing.T) {
 		{sql: "CREATE COLLATION IF NOT EXISTS mycoll (LOCALE = 'C')", name: "mycoll", ifNotExists: true, locale: "C"},
 		{sql: "CREATE COLLATION german (LC_COLLATE = 'de_DE', LC_CTYPE = 'de_DE')", name: "german", lcCollate: "de_DE", lcCtype: "de_DE"},
 		{sql: "CREATE COLLATION ci (provider = icu, locale = 'und', deterministic = false)", name: "ci", provider: "icu", locale: "und", deterministic: "false"},
+		{sql: "CREATE COLLATION cir (provider = icu, locale = 'und', rules = '&V << w')", name: "cir", provider: "icu", locale: "und", rules: "&V << w"},
 		{sql: "CREATE COLLATION dup FROM \"C\"", name: "dup", from: "C"},
 	}
 	for _, tc := range cases {
@@ -59,6 +61,9 @@ func TestParseCreateCollation(t *testing.T) {
 			}
 			if cc.Deterministic != tc.deterministic {
 				t.Errorf("Deterministic = %q, want %q", cc.Deterministic, tc.deterministic)
+			}
+			if cc.Rules != tc.rules {
+				t.Errorf("Rules = %q, want %q", cc.Rules, tc.rules)
 			}
 			if cc.FromName.Name != tc.from {
 				t.Errorf("FromName = %q, want %q", cc.FromName.Name, tc.from)

@@ -60,6 +60,38 @@ func TestCreateCollationVirtualRows(t *testing.T) {
 	if found[7] != "C" || found[8] != "C" {
 		t.Errorf("collcollate/collctype = %q/%q, want C/C", found[7], found[8])
 	}
+	// A collation with no ICU rules must surface collicurules (index 10) as SQL
+	// NULL (VirtualNull), not '' — otherwise dumpCollation's ICU branch would
+	// emit a spurious `, rules = ''`. Slice 392.
+	if found[10] != VirtualNull {
+		t.Errorf("collicurules = %q, want VirtualNull (no rules)", found[10])
+	}
+
+	// Slice 392: an ICU collation created WITH tailoring rules must surface them
+	// verbatim in collicurules so dumpCollation re-emits `, rules = '...'`.
+	cir := &UserCollation{
+		Name: "cir", Owner: 10, Provider: 'i', Encoding: -1,
+		Locale: "und", Rules: "&V << w <<< W", Deterministic: true,
+	}
+	if _, err := c.CreateCollation(cir, "public", false); err != nil {
+		t.Fatalf("CreateCollation cir: %v", err)
+	}
+	var cirRow []string
+	for _, r := range pgColl.VirtualRows() {
+		if r[1] == "cir" {
+			cirRow = r
+		}
+	}
+	if cirRow == nil {
+		t.Fatal("user collation 'cir' not surfaced in pg_collation")
+	}
+	if cirRow[10] != "&V << w <<< W" {
+		t.Errorf("collicurules = %q, want %q", cirRow[10], "&V << w <<< W")
+	}
+	// The FROM path copies the source's rules too.
+	if got, ok := c.CollationAttrsByName("cir"); !ok || got.Rules != "&V << w <<< W" {
+		t.Errorf("CollationAttrsByName(cir).Rules = %q, ok=%v", got.Rules, ok)
+	}
 
 	// CollationAttrsByName resolves both the built-in and the user collation
 	// (used by CREATE COLLATION ... FROM existing).

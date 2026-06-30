@@ -1,32 +1,35 @@
 (idle — nothing in flight)
 
-Loop #31 COMPLETE: M0119-0004 DU-002 slice 391 — ICU / non-deterministic / FROM
-collation pg_dump round-trip (PRODUCTION fix + virtual-NULL infra). Closes the
-slice-389 deferral (only libc was asserted). Two real bugs fixed:
-  1. execCreateCollation FROM branch dropped Deterministic (PG DefineCollation
-     copies collform->collisdeterministic) → now copies src.Deterministic.
-  2. empty `text` virtual cells decoded as '' not NULL → dumpCollation ICU branch
-     emitted spurious `, rules = ''`. New catalog.VirtualNull sentinel mapped to
-     NullConst at top of planner.TypedVirtualCell (shared by executor
-     rematerialiseVirtualRows sibling); pg_collation user-row builder emits
-     VirtualNull for absent locale/rules columns per provider.
+Loop #32 COMPLETE: M0119-0004 DU-002 slice 392 — ICU collation `rules` round-trip.
+Closes the slice-391 deferral (a) (rules unmodelled). Last unexercised limb of
+dumpCollation's `provider = icu` branch (`if (collicurules) { …, rules = … }`,
+pg_dump.c:14988). Changes:
+  - parser: RULES moved from accept-and-ignore default → `case "rules"`; new
+    CreateCollationStmt.Rules (ast.go + ddl.go).
+  - catalog: UserCollation.Rules surfaced as collicurules via virtual-row
+    builder's `nz(uc.Rules)` (→ VirtualNull when unset; slice-391 NULL infra).
+  - executor: execCreateCollation stores s.Rules for icu provider only; FROM
+    branch copies src.Rules.
 
-Files (commit pending push):
-- internal/executor/operators_ddl.go: FROM copies src.Deterministic.
-- internal/catalog/catalog.go: VirtualNull const + pg_collation user-row nz()/NULL.
-- internal/planner/planner.go: TypedVirtualCell VirtualNull→NullConst guard.
-- internal/catalog/create_collation_test.go: ci_coll non-deterministic assertion.
-- internal/testport/pgdump_connsetup_test.go: ci_coll + ci_from fixtures/asserts.
-- docs/design/0110-0001-pg-dump-tap-port.md: Slice 391 section.
-- .ralph/fix_plan.md slice 391 entry; deferral ledger row appended.
+Files (commit pending):
+- internal/parser/ast.go: CreateCollationStmt.Rules field.
+- internal/parser/ddl.go: `case "rules"` + doc tweak.
+- internal/parser/create_collation_test.go: rules case + assertion.
+- internal/catalog/catalog.go: UserCollation.Rules + nz(uc.Rules) virtual cell.
+- internal/catalog/create_collation_test.go: NULL-when-unset / verbatim / FROM.
+- internal/executor/operators_ddl.go: store/copy Rules.
+- internal/testport/pgdump_connsetup_test.go: ci_rules fixture + assertion.
+- docs/design/0110-0001-pg-dump-tap-port.md: Slice 392 section.
+- .ralph/fix_plan.md slice 392 entry; deferral ledger row appended.
 
-Gates: TestCreateCollationVirtualRows + TestPort_PgDumpConnectionSetup PASS;
-catalog+planner+parser suites PASS; go build clean; gofmt clean on my hunks
-(only pre-existing go1.25/1.26 alignment noise elsewhere); ralph-state-guard OK.
-Pre-commit pgbench smoke runs via hook on commit.
+Gates: TestParseCreateCollation + TestCreateCollationVirtualRows PASS;
+parser+catalog+planner suites PASS; TestPort_PgDumpConnectionSetup PASS (5.3s,
+byte-identical vs real pg_dump 18.3); go build clean; gofmt clean on my hunks
+(only pre-existing go1.25/1.26 alignment noise elsewhere). Pre-commit pgbench
+smoke runs via hook on commit.
 
-Next loop: fresh M0119-0004 pg_dump slice. Candidates: ICU `rules` clause
-(collicurules — parser+executor+virtual row, would re-emit `, rules = '...'`);
-convert the 7 BKI built-in pg_collation rows' empty locale cells to VirtualNull
-for full NULL fidelity; CREATE CONVERSION dump (new object); aggregates
-(pg_proc prokind='a'); or persist user collations to a pg_collation heap.
+Next loop: fresh M0119-0004 pg_dump slice. Candidates: persist user collations
+to a pg_collation heap (restart durability — slices 389–392 gap); CREATE
+CONVERSION dump (new object); aggregates (pg_proc prokind='a'); ALTER COLLATION
+OWNER/RENAME; convert the 7 BKI built-in pg_collation rows' empty locale cells
+to VirtualNull for full NULL fidelity.

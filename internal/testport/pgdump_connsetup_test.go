@@ -4941,6 +4941,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_from FROM public.ci_coll"); err != nil {
 		t.Fatalf("create collation ci_from: %v", err)
 	}
+	// Slice 392: an ICU collation with tailoring `rules` must round-trip through
+	// the last unexercised limb of dumpCollation's `provider = icu` branch — the
+	// `if (collicurules) { appendPQExpBufferStr(q, ", rules = "); ... }` clause
+	// (pg_dump.c:14988). collicurules is `text`, so an absent value must read as
+	// NULL (VirtualNull), not '' — otherwise dumpCollation would emit a spurious
+	// `, rules = ''` on every ICU collation. This collation is deterministic, so
+	// the canonical order is `(provider = icu, locale = '...', rules = '...')`
+	// with no deterministic clause. goopg does not interpret the ICU rules — only
+	// the schema-dump round-trip is modeled — so they are stored verbatim.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_rules (provider = icu, locale = 'und', rules = '&V << w <<< W')"); err != nil {
+		t.Fatalf("create collation ci_rules: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8015,6 +8027,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// so ci_from would have dumped without `deterministic = false`.
 		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_from (provider = icu, deterministic = false, locale = 'und-u-ks-level2');") {
 			t.Errorf("pg_dump dropped the FROM-derived collation's deterministic flag; missing CREATE COLLATION public.ci_from\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 392 (asserted):** an ICU collation with tailoring `rules` must
+		// re-emit the trailing `, rules = '...'` clause. collicurules is `text`,
+		// so a collation with no rules must read NULL (not '') or every ICU
+		// collation would dump a spurious `rules = ''`. ci_rules is deterministic,
+		// so the canonical order is provider, locale, rules (no deterministic).
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_rules (provider = icu, locale = 'und', rules = '&V << w <<< W');") {
+			t.Errorf("pg_dump dropped the ICU collation rules clause; missing CREATE COLLATION public.ci_rules\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
 		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef

@@ -3332,6 +3332,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup`, both dumping `(provider = icu, deterministic = false, locale = 'und-u-ks-level2')`
       byte-identical vs real pg_dump 18.3. Deferral row appended (ICU `rules` still unmodelled; in-memory only; BKI built-in
       rows still carry `''` not NULL in unused locale columns — harmless, pg_dump skips pinned collations).
+
+      **2026-07-01 (loop #32, design 0110-0001 slice 392): ICU collation `rules` round-trip** (closes the slice-391 rules
+      deferral). The last unexercised limb of `dumpCollation`'s `provider = icu` branch — the `if (collicurules) { …, rules =
+      … }` clause (`pg_dump.c:14988`). Parser's `parseCreateCollationTail` moved `RULES` out of the accept-and-ignore default
+      into an explicit `case "rules": stmt.Rules = val` (new `CreateCollationStmt.Rules`); `catalog.UserCollation.Rules` is
+      surfaced as `collicurules` via the virtual-row builder's `nz(uc.Rules)` (→ `VirtualNull` when unset, so a rules-less
+      collation reads NULL and dumps no clause — slice-391 infra); `execCreateCollation` stores `s.Rules` for the icu provider
+      only (PG `DefineCollation` rejects RULES for libc/builtin) and the FROM branch copies `src.Rules`. Tests: extended
+      `TestParseCreateCollation` (rules captured) + `TestCreateCollationVirtualRows` (NULL when unset / verbatim when set / FROM
+      copies) + a `ci_rules` `TestPort_PgDumpConnectionSetup` fixture dumping `(provider = icu, locale = 'und', rules = '&V <<
+      w <<< W')` byte-identical vs real pg_dump 18.3. Deferral row appended (registry still in-memory; BKI built-ins still '' not
+      NULL in unused locale columns — harmless).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

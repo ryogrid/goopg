@@ -564,7 +564,7 @@ func (p *parser) parseCreateExtensionTail(pos int) (Stmt, error) {
 //
 // after the COLLATION keyword. Mirrors gram.y's DefineStmt for OBJECT_COLLATION.
 // Recognised options: LOCALE, LC_COLLATE, LC_CTYPE, PROVIDER, DETERMINISTIC,
-// VERSION, RULES (unknown options are accepted and ignored for forward
+// RULES (VERSION and unknown options are accepted and ignored for forward
 // compatibility). DU-002 (M0119-0004).
 func (p *parser) parseCreateCollationTail(pos int) (Stmt, error) {
 	stmt := &CreateCollationStmt{pos: pos}
@@ -629,8 +629,13 @@ func (p *parser) parseCreateCollationTail(pos int) (Stmt, error) {
 			stmt.Provider = strings.ToLower(val)
 		case "deterministic":
 			stmt.Deterministic = strings.ToLower(val)
+		case "rules":
+			// ICU tailoring rules (provider = icu only). Stored verbatim and
+			// re-emitted by pg_dump's dumpCollation as `rules = '...'`; goopg
+			// does not interpret the rules for actual collation.
+			stmt.Rules = val
 		default:
-			// VERSION, RULES, and any unknown option: accept and ignore.
+			// VERSION and any unknown option: accept and ignore.
 		}
 		if c := p.cur(); c.Kind == TokenSymbol && c.Value == "," {
 			p.advance()

@@ -9613,6 +9613,32 @@ report `Deterministic=false`) plus two `TestPort_PgDumpConnectionSetup` fixtures
 them); the registry remains in-memory (no restart persistence; `pg_collation` is not heap-backed); the BKI built-in rows
 still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump skips pinned collations).
 
+### Slice 392 — **ICU collation `rules` round-trip** (closes the slice-391 rules deferral)
+
+Slice 391 left ICU tailoring `rules` (`pg_collation.collicurules`) unmodeled: a collation created *with* a `rules =`
+clause silently lost them. This slice closes that deferral — the last unexercised limb of `dumpCollation`'s
+`provider = icu` branch, the `if (collicurules) { appendPQExpBufferStr(q, ", rules = "); … }` clause
+(`pg_dump.c:14988`).
+
+- **Parser** (`parseCreateCollationTail`): `RULES` was in the accept-and-ignore `default` arm; it now has an explicit
+  `case "rules": stmt.Rules = val` and a new `CreateCollationStmt.Rules` field.
+- **Catalog** (`UserCollation.Rules`): a new field surfaced as `collicurules` by the `pg_collation` virtual-row builder.
+  The builder now emits `nz(uc.Rules)` (→ `VirtualNull` when unset, exactly as the locale columns do, per slice 391),
+  so a collation *without* rules still reads SQL NULL and dumps no `rules =` clause.
+- **Executor** (`execCreateCollation`): stores `s.Rules` for the icu provider only (PG's `DefineCollation` rejects
+  `RULES` for libc/builtin), and the `FROM existing` branch copies `src.Rules` (mirroring how PG's FROM branch carries
+  over `collicurules`). goopg does not interpret the rules — only the schema-dump round-trip is modeled.
+
+Covered by the extended `TestParseCreateCollation` (a `rules =` clause is captured) and `TestCreateCollationVirtualRows`
+(a collation with no rules surfaces `collicurules`=NULL; one created with rules surfaces them verbatim, and the FROM path
+copies them) plus a `TestPort_PgDumpConnectionSetup` fixture — `CREATE COLLATION public.ci_rules (provider = icu,
+locale = 'und', rules = '&V << w <<< W')` — asserted to dump as
+`(provider = icu, locale = 'und', rules = '&V << w <<< W')` (deterministic, so no `deterministic` clause; canonical order
+provider → locale → rules), byte-identical vs real pg_dump 18.3.
+**Deferred** (ledger): the collation registry remains in-memory (no restart persistence; `pg_collation` is not
+heap-backed); the BKI built-in rows still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump
+skips pinned collations).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

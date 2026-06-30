@@ -1600,6 +1600,7 @@ type CreateCollationStmt struct {
 	LcCollate     string
 	LcCtype       string
 	Deterministic string // "true" | "false" | "" (unset → deterministic)
+	Rules         string // ICU tailoring rules (provider = icu only); "" → unset
 	// FROM existing_collation form: copy attributes from an existing collation.
 	FromName ObjectName
 }

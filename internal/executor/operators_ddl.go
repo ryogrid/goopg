@@ -349,6 +349,7 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 		uc.Collate = src.Collate
 		uc.Ctype = src.Ctype
 		uc.Locale = src.Locale
+		uc.Rules = src.Rules
 		// FROM copies collisdeterministic too (DefineCollation in
 		// collationcmds.c reads collform->collisdeterministic): a collation
 		// derived from a non-deterministic source is itself non-deterministic.
@@ -389,6 +390,14 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 				loc = collate
 			}
 			uc.Locale = loc
+		}
+		// ICU tailoring rules (collicurules) are only valid for the icu
+		// provider (DefineCollation in collationcmds.c rejects RULES for libc/
+		// builtin). goopg does not interpret the rules — only the schema-dump
+		// round-trip is modeled — so store verbatim for re-emission by
+		// dumpCollation's `, rules = '...'` clause.
+		if uc.Provider == 'i' {
+			uc.Rules = s.Rules
 		}
 	}
 	if _, err := im.CreateCollation(uc, schema, s.IfNotExists); err != nil {
