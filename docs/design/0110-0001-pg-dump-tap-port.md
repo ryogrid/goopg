@@ -9514,6 +9514,26 @@ Covered by the new `TestParseCommentOnForeignDataWrapper` parser pin plus a
 `COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'` fixture/assertion in `TestPort_PgDumpConnectionSetup`
 (`goopg_fdw` is the bare FDW from slice 375), verified byte-identical against real pg_dump 18.3.
 
+### Slice 388 — **COMMENT ON EXTENSION round-trip** (parser + executor gap)
+
+The sibling of slices 386/387. An installed extension (`pg_extension`, classoid 3079) can carry a comment. pg_dump's
+`dumpExtension` calls `dumpComment` with the extension's `catalogId` (`tableoid=3079`, `objsubid=0`), finds the
+`pg_description` row, and re-emits `COMMENT ON EXTENSION <name> IS '...'` after the `CREATE EXTENSION` statement. goopg's
+`parseCommentOnTail` had no `EXTENSION` branch, so the statement fell through to the COMMENT fallback and was silently
+swallowed — the comment never reached `pg_description`, and pg_dump could not re-emit it.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptIdentKeyword("extension")` arm that sets `ObjKind="extension"` and
+  parses a bare (schema-less) object name — extensions are top-level objects. `EXTENSION` is an unreserved ident-keyword.
+- **`executor.execCommentOn`** adds an `"extension"` case: it resolves the extension OID via the new
+  `catalog.InMemory.ExtensionOID(name)` (reads the runtime `extensions` registry populated by `CREATE EXTENSION`) and stores
+  the description under `pg_extension` (classoid 3079, objsubid 0) via `SetComment`. A new `oidPgExtension = 3079` classoid
+  constant joins the existing block.
+
+Covered by the new `TestParseCommentOnExtension` parser pin plus a `CREATE EXTENSION amcheck` + `COMMENT ON EXTENSION amcheck
+IS 'an extension comment'` fixture/assertion in `TestPort_PgDumpConnectionSetup` (amcheck is the one extension goopg ships in
+`knownExtensions`), verified against real pg_dump 18.3 — the dump now also emits the `CREATE EXTENSION IF NOT EXISTS amcheck
+WITH SCHEMA public;` line that carries the comment.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

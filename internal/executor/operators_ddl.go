@@ -13057,6 +13057,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgRewrite      = 2618 // pg_rewrite: query-rewrite rules
 		oidPgForeignSrv   = 1417 // pg_foreign_server: foreign servers
 		oidPgFdw          = 2328 // pg_foreign_data_wrapper: foreign-data wrappers
+		oidPgExtension    = 3079 // pg_extension: installed extensions
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13123,6 +13124,18 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgFdw, oid, 0, s.Description)
+	case "extension":
+		// Extensions live in pg_extension (classoid 3079). pg_dump's dumpExtension
+		// keys the comment lookup on the extension's catalogId
+		// (tableoid=pg_extension=3079) and objsubid 0, then re-emits
+		// `COMMENT ON EXTENSION <name> IS '...'`. Without this a COMMENT ON
+		// EXTENSION was silently swallowed (parser dropped it) and never reached
+		// pg_description, so pg_dump could not re-emit it. DU-002 slice 388.
+		oid := im.ExtensionOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgExtension, oid, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {

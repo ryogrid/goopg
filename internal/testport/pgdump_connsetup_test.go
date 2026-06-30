@@ -4894,6 +4894,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'a,b')"); err != nil {
 		t.Fatalf("create server with metachar option: %v", err)
 	}
+	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
+	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
+	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
+	// getExtensions discovers it and dumpExtension re-emits `CREATE EXTENSION IF
+	// NOT EXISTS amcheck WITH SCHEMA public;` plus any extension comment.
+	if err := runSQLSimple(t, c, "CREATE EXTENSION amcheck"); err != nil {
+		t.Fatalf("create extension amcheck: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -5415,6 +5423,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. goopg_fdw is the bare
 		// foreign-data wrapper created in slice 375.
 		"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'",
+		// Slice 388: COMMENT ON EXTENSION must survive the dump. Before this slice,
+		// parseCommentOnTail had no EXTENSION branch, so the server silently
+		// swallowed it and the comment never reached pg_description. The parser now
+		// recognises `EXTENSION <name>` (a top-level, schema-less object), and
+		// execCommentOn resolves the extension by name (catalog ExtensionOID) and
+		// keys it under pg_extension (classoid 3079, objsubid 0). pg_dump's
+		// dumpExtension calls dumpComment with the extension's catalogId
+		// (tableoid=3079), finds the pg_description row, and re-emits
+		// `COMMENT ON EXTENSION <name> IS '...'`. amcheck is installed above.
+		"COMMENT ON EXTENSION amcheck IS 'an extension comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -7909,6 +7927,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// dumpForeignDataWrapper calls dumpComment with the FDW's catalogId
 			// (tableoid=2328) and re-emits the line below.
 			"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment';",
+			// **Slice 388 (asserted):** COMMENT ON EXTENSION must round-trip. It was
+			// silently swallowed (parser had no EXTENSION branch). The parser now
+			// captures `EXTENSION <name>` and execCommentOn keys the comment under
+			// pg_extension (classoid 3079). pg_dump's dumpExtension calls dumpComment
+			// with the extension's catalogId (tableoid=3079) and re-emits the line
+			// below. amcheck is the installed extension (CREATE EXTENSION above).
+			"COMMENT ON EXTENSION amcheck IS 'an extension comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

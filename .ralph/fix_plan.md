@@ -3282,6 +3282,17 @@ documentation-only and is exempt from the design-doc requirement.)
       `oidPgFdw` constant). Tests new `TestParseCommentOnForeignDataWrapper` (parser) +
       `COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'` fixture/assert in `TestPort_PgDumpConnectionSetup`
       (byte-identical vs pg_dump 18.3). No new deferral.
+
+      **2026-07-01 (loop #28, design 0110-0001 slice 388): COMMENT ON EXTENSION round-trip** (sibling of slices
+      386/387). An installed extension (`pg_extension`, classoid 3079) can carry a comment; pg_dump's `dumpExtension`
+      re-emits `COMMENT ON EXTENSION <name> IS '...'` after the `CREATE EXTENSION` line. goopg's `parseCommentOnTail` had
+      no EXTENSION branch, so the statement was silently swallowed and never reached `pg_description`. Added a
+      `case p.acceptIdentKeyword("extension")` arm to `parseCommentOnTail` (`ObjKind="extension"`, bare schema-less name)
+      and an `"extension"` case to `execCommentOn` that resolves the extension OID via the new
+      `catalog.InMemory.ExtensionOID` and stores the comment under classoid 3079 (new `oidPgExtension` constant). Tests new
+      `TestParseCommentOnExtension` (parser) + `CREATE EXTENSION amcheck` / `COMMENT ON EXTENSION amcheck IS 'an extension
+      comment'` fixture/assert in `TestPort_PgDumpConnectionSetup` (amcheck is goopg's one shipped extension). No new
+      deferral.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

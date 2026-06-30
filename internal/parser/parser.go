@@ -2724,6 +2724,17 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("extension"):
+		// COMMENT ON EXTENSION <name> IS '...'. Extensions live in pg_extension
+		// (classoid 3079); pg_dump's dumpExtension re-emits `COMMENT ON EXTENSION
+		// <name> IS '...'`. EXTENSION is an unreserved ident-keyword. An extension
+		// is a top-level object (no schema), so parse a bare name. DU-002 slice 388.
+		cs.ObjKind = "extension"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptKeyword(KwFunction):
 		// COMMENT ON FUNCTION [schema.]name([argtypes]) IS '...'. Functions live
 		// in pg_proc (classoid 1255); pg_dump re-emits `COMMENT ON FUNCTION …`

@@ -264,3 +264,43 @@ func TestParseCommentOnForeignDataWrapper(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCommentOnExtension covers COMMENT ON EXTENSION <name>. Extensions are
+// top-level, schema-less objects (pg_extension, classoid 3079); pg_dump's
+// dumpExtension re-emits `COMMENT ON EXTENSION <name> IS '...'`. EXTENSION is an
+// unreserved ident-keyword. Before slice 388 the parser had no EXTENSION branch
+// and silently swallowed the statement. DU-002 slice 388.
+func TestParseCommentOnExtension(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantName string
+	}{
+		{"COMMENT ON EXTENSION amcheck IS 'an extension comment'", "amcheck"},
+		{"COMMENT ON EXTENSION my_ext IS 'c'", "my_ext"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "extension" {
+			t.Errorf("%q: ObjKind=%q, want extension", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != "" {
+			t.Errorf("%q: ObjName.Schema=%q, want empty (extension is schema-less)", tc.sql, cs.ObjName.Schema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}

@@ -8318,6 +8318,19 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 	return nil
 }
 
+// ExtensionOID returns the runtime pg_extension OID for the named extension, or
+// 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
+// key the pg_description row on the extension's catalog OID (classoid 3079) so
+// pg_dump's dumpExtension can re-emit the comment. DU-002 slice 388.
+func (c *InMemory) ExtensionOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if e, ok := c.extensions[strings.ToLower(name)]; ok {
+		return e.oid
+	}
+	return 0
+}
+
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
 // It returns the two bootstrap tablespaces (pg_default OID 1663, pg_global OID
 // 1664, owned by the bootstrap superuser per pg_tablespace.dat) followed by any
