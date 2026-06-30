@@ -48,11 +48,51 @@ wasted turns).
   `(idle — nothing in flight)` so the next loop starts clean.
 
 ## Deferral Ledger
-If required scope genuinely cannot land this loop, append one line to
-`.ralph/deferral_ledger.md`:
-`| date | task-id | landed | deferred | resume point | why |`
-Never close a task silently with a forward reference; the ledger entry plus an
-unchecked fix_plan item is the only allowed deferral form.
+
+**Why this exists — read this, not just the format below.** Passing a PostgreSQL
+test case is never only about turning a test green. Every test you port and
+every feature you build doubles as a *discovery probe*: it surfaces the internal
+DBMS behavior that goopg must implement to be a faithful PostgreSQL-compatible
+replica. A change that makes the test pass while skipping the real PG semantics
+underneath has only done half the job — the other half is recording what is
+still missing so it is never silently lost.
+
+Therefore this is mandatory, not optional: whenever a task leaves any
+PostgreSQL-existing behavior unimplemented — whether it is
+
+- behavior you deliberately left out of scope to keep the change bounded, OR
+- an unimplemented mechanism that *blocks* the full-fidelity implementation
+  (the reason you could only do a partial/narrow fix), OR
+- a test you made pass with a shortcut that does not match how PostgreSQL
+  actually computes the result,
+
+you MUST append a row to `.ralph/deferral_ledger.md` describing it. Treat
+"I made the test pass but PG really does X, and goopg still does not" as a
+**defer-and-record** event, not a completed task. Cite the upstream PG behavior
+(file/function from `./postgres/`) and a concrete resume point so a later loop
+can finish it.
+
+**Append using the SAME table format already in `.ralph/deferral_ledger.md`** —
+do not invent a new column layout. The table has 7 columns; a new row sets
+`status` to `-`:
+
+| column | what to write |
+|--------|---------------|
+| `status` | `-` for a freshly appended row (M0119 later flips it to `resolved`) |
+| `date` | today's date, `YYYY-MM-DD` |
+| `task-id` | the fix_plan / milestone id you were working |
+| `landed` | what you actually implemented this loop |
+| `deferred` | the PG behavior still unimplemented (the discovery) |
+| `resume point` | concrete file/function + next step to finish it |
+| `why` | why it was deferred / what blocked the full fix |
+
+Example row (match the leading and trailing `|`):
+`| - | 2026-06-30 | M0119-0004 | parser captures GRANT ON TYPE | typacl heap write at COMMIT not yet wired | internal/executor/operators_ddl.go: persist typacl via syncTableToCatalogHeap | server-side GRANT path has no Context to reach the heap |`
+
+The ledger row plus an unchecked `fix_plan.md` item is the only allowed form of
+deferral; never close a task silently with a forward reference. A green test with
+undocumented missing PG semantics is a defect in the loop's bookkeeping, even if
+the test suite is happy.
 
 ## Hard-won Rules (violating these caused multi-day regressions — treat as law)
 1. **Executor/planner/codec changes**: run the pre-commit gates in the practice card
