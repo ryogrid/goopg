@@ -2041,6 +2041,12 @@ type InMemory struct {
 	// the virtual pg_collation view so pg_dump round-trips them. M0119-0004.
 	userCollations []*UserCollation
 
+	// userConversions holds conversions created via CREATE [DEFAULT] CONVERSION,
+	// in creation order (deterministic pg_dump output). Surfaced as rows in the
+	// virtual pg_conversion view so pg_dump's getConversions / dumpConversion
+	// round-trip them. DU-002 slice 399 (M0119-0004).
+	userConversions []*UserConversion
+
 	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
@@ -2517,6 +2523,27 @@ type UserCollation struct {
 	Locale        string // colllocale (builtin/icu locale); "" → NULL
 	Rules         string // collicurules (ICU tailoring rules, icu only); "" → NULL
 	Deterministic bool   // collisdeterministic
+}
+
+// UserConversion records a CREATE [DEFAULT] CONVERSION so pg_dump's
+// getConversions / dumpConversion re-emit it. goopg performs no actual encoding
+// conversion — only the schema-dump round-trip is modeled. Stored in
+// InMemory.userConversions and surfaced as rows in the virtual pg_conversion
+// view. Mirrors PG pg_conversion.h. DU-002 slice 399 (M0119-0004).
+type UserConversion struct {
+	OID          uint32 // pg_conversion.oid (allocated from the catalog OID counter)
+	Name         string // conname (bare, no schema)
+	NamespaceOID uint32 // connamespace (resolved from the schema)
+	Owner        uint32 // conowner (role OID; 10 = postgres superuser)
+	ForEncoding  int32  // conforencoding (pg_enc ID of the source encoding)
+	ToEncoding   int32  // contoencoding (pg_enc ID of the destination encoding)
+	// ProcSchema/ProcName name the conversion function. dumpConversion selects
+	// pg_conversion.conproc (a regproc) raw and emits ` FROM <conproc>`; pg_dump
+	// runs with search_path='' so regproc qualifies the name with its schema —
+	// hence both halves are surfaced and the conproc cell renders `<schema>.<name>`.
+	ProcSchema string
+	ProcName   string
+	Default    bool // condefault (CREATE DEFAULT CONVERSION)
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -6981,12 +7008,13 @@ func (c *InMemory) registerSystemTables() {
 	// conversions; we filter out system-defined conversions at dump-out time").
 	// PG ships ~130 built-in conversions, but every one lives in the pg_catalog
 	// namespace and is filtered out at dump-out time (selectDumpableObject marks
-	// pg_catalog objects DUMP_COMPONENT_NONE). goopg defines no user conversions
-	// (no CREATE CONVERSION), so an empty view (0 rows) is correct — pg_dump finds
-	// nothing dumpable, identical to the built-ins-only PG outcome. Schema matches
-	// PG's pg_conversion (pg_conversion.h): oid, conname name, connamespace oid,
-	// conowner oid, conforencoding int4, contoencoding int4, conproc regproc(oid),
-	// condefault bool. M0110-0001 (DU-002 slice 21).
+	// pg_catalog objects DUMP_COMPONENT_NONE), so only user conversions (CREATE
+	// [DEFAULT] CONVERSION, surfaced via ListUserConversions below) appear as
+	// dumpable rows. Schema matches PG's pg_conversion (pg_conversion.h): oid,
+	// conname name, connamespace oid, conowner oid, conforencoding int4,
+	// contoencoding int4, conproc regproc, condefault bool. conproc is typed
+	// regproc (not oid) because dumpConversion selects it raw and expects the
+	// function name text. M0110-0001 (DU-002 slice 21); user rows DU-002 slice 399.
 	pgConversion := &Table{
 		Schema: "pg_catalog", Name: "pg_conversion", Virtual: true,
 		Columns: []Column{
@@ -6996,12 +7024,48 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "conowner", Type: Type{Name: "oid"}, Ordinal: 3},
 			{Name: "conforencoding", Type: Type{Name: "int4"}, Ordinal: 4},
 			{Name: "contoencoding", Type: Type{Name: "int4"}, Ordinal: 5},
-			{Name: "conproc", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "conproc", Type: Type{Name: "regproc"}, Ordinal: 6},
 			{Name: "condefault", Type: Type{Name: "bool"}, Ordinal: 7},
 		},
 		OID: 2607,
 	}
-	pgConversion.VirtualRows = func() [][]string { return nil }
+	// Surface user-created conversions (CREATE [DEFAULT] CONVERSION) so they
+	// round-trip. getConversions reads every row (built-in conversions live in
+	// pg_catalog and are filtered out at dump-out time, so an empty view stays
+	// correct for the no-user-conversion case); dumpConversion then queries the
+	// per-row detail and emits `CREATE [DEFAULT] CONVERSION <ns>.<name> FOR
+	// '<for>' TO '<to>' FROM <conproc>`. conforencoding/contoencoding are the
+	// pg_enc integer IDs (dumpConversion wraps them in pg_encoding_to_char), and
+	// conproc renders the schema-qualified function name (pg_dump's empty
+	// search_path qualifies the regproc). DU-002 slice 399.
+	pgConversion.VirtualRows = func() [][]string {
+		convs := c.ListUserConversions()
+		if len(convs) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(convs))
+		for _, cv := range convs {
+			condefault := "f"
+			if cv.Default {
+				condefault = "t"
+			}
+			conproc := cv.ProcName
+			if cv.ProcSchema != "" {
+				conproc = cv.ProcSchema + "." + cv.ProcName
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(cv.OID), 10),          // oid
+				cv.Name,                                          // conname
+				strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
+				strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
+				strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
+				strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
+				conproc,                                          // conproc (regproc text)
+				condefault,                                       // condefault
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_conversion"] = pgConversion
 
 	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
@@ -8463,6 +8527,63 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 	uc.NamespaceOID = nsOID
 	c.userCollations = append(c.userCollations, uc)
 	return uc.OID, nil
+}
+
+// CreateConversion records a CREATE [DEFAULT] CONVERSION in the runtime
+// pg_conversion registry so pg_dump's getConversions / dumpConversion re-emit
+// it. `schema` is the (already-resolved) schema name the conversion lives in; an
+// unknown schema resolves to the public namespace OID. The conversion is keyed
+// by its OID and surfaced as an extra virtual pg_conversion row. Returns the new
+// OID, or 0 with an error if a same-named conversion already exists in the same
+// namespace (PG enforces a unique (conname, connamespace)). DU-002 slice 399.
+func (c *InMemory) CreateConversion(uc *UserConversion, schema string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userConversions {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+			return 0, fmt.Errorf("conversion %q already exists", uc.Name)
+		}
+	}
+	uc.OID = c.allocOIDLocked()
+	uc.NamespaceOID = nsOID
+	c.userConversions = append(c.userConversions, uc)
+	return uc.OID, nil
+}
+
+// DropConversion removes the user-created conversion with the given bare name in
+// the given schema from the registry. Returns true if one was found and removed.
+// `schema` resolves like CreateConversion (unknown → public). DU-002 slice 399.
+func (c *InMemory) DropConversion(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, uc := range c.userConversions {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			c.userConversions = append(c.userConversions[:i], c.userConversions[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ListUserConversions returns the user-created conversions in creation order.
+// DU-002 slice 399.
+func (c *InMemory) ListUserConversions() []*UserConversion {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userConversions) == 0 {
+		return nil
+	}
+	out := make([]*UserConversion, len(c.userConversions))
+	copy(out, c.userConversions)
+	return out
 }
 
 // CollationAttrsByName resolves a collation's dump-relevant attributes

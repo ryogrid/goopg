@@ -1912,6 +1912,18 @@ type CompatNoopStmt struct {
 	// findFuncByOid succeeds and re-emits `WITH FUNCTION <ns>.<sig>`. DU-002 slice 397.
 	CastFuncName ObjectName
 	CastFuncArgs []string
+	// ConvForEncoding / ConvToEncoding carry a CREATE [DEFAULT] CONVERSION
+	// statement's source and destination encoding names (the `FOR 'x' TO 'y'`
+	// string literals, e.g. "UTF8", "LATIN1"). ConvFuncName is the conversion
+	// function named by the `FROM funcname` clause. ConvDefault is true for
+	// CREATE DEFAULT CONVERSION. The executor resolves the encoding names to
+	// pg_enc IDs and records them in the catalog conversion registry so pg_dump's
+	// getConversions / dumpConversion re-emit the statement. Empty when the
+	// statement is not a CREATE CONVERSION. DU-002 slice 399.
+	ConvForEncoding string
+	ConvToEncoding  string
+	ConvFuncName    ObjectName
+	ConvDefault     bool
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

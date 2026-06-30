@@ -5049,6 +5049,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)"); err != nil {
 		t.Fatalf("create cast text->integer with function: %v", err)
 	}
+	// Slice 399: a CREATE [DEFAULT] CONVERSION must round-trip. pg_dump's
+	// getConversions reads every pg_conversion row (built-ins live in pg_catalog
+	// and are filtered out at dump-out time, so a no-user-conversion cluster stays
+	// empty), then dumpConversion queries pg_encoding_to_char(conforencoding/
+	// contoencoding) + conproc + condefault and emits `CREATE [DEFAULT] CONVERSION
+	// <ns>.<name> FOR '<for>' TO '<to>' FROM <conproc>;`. goopg previously parsed
+	// CREATE CONVERSION as a name-only no-op (pg_conversion stayed empty), so the
+	// conversion never round-tripped. The parser now captures the FOR/TO encoding
+	// names + FROM function + DEFAULT flag, the executor resolves the encodings to
+	// pg_enc IDs and registers the conversion, and the pg_conversion virtual view
+	// surfaces a dumpable row. goopg does not validate that the conversion
+	// function exists (it has no real encoding-conversion engine), so the
+	// `FROM public.myconv_func` reference is stored as-written and re-emitted
+	// schema-qualified (matching pg_dump's empty-search_path regproc output).
+	// Verified byte-identical vs real pg_dump 18.3 (whose conversion function is a
+	// genuine fmgr-callable; only the dump text is compared here).
+	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func"); err != nil {
+		t.Fatalf("create default conversion: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7810,6 +7829,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// exactly here.
 		if want := "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing WITH FUNCTION cast %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 399 (asserted):** a CREATE [DEFAULT] CONVERSION must round-trip via
+		// getConversions / dumpConversion. dumpConversion renders the FOR/TO encoding
+		// literals through pg_encoding_to_char(conforencoding/contoencoding) and the
+		// conproc regproc (empty search_path → schema-qualified). A regression that
+		// drops the pg_conversion virtual row, the encoding-ID resolution, or the
+		// pg_encoding_to_char builtin re-surfaces exactly here (missing line, or
+		// FOR '' / FROM with the wrong name).
+		if want := "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing DEFAULT CONVERSION %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

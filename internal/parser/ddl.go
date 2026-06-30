@@ -231,18 +231,19 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.ArgTypes = []string{leftArg, rightArg}
 		}
 		return stmt, nil
-	// CREATE CONVERSION name ... — parse name for compat registry, then skip. M0097-0071.
+	// CREATE [DEFAULT] CONVERSION name FOR 'src' TO 'dest' FROM func — register so
+	// it round-trips through pg_dump (pg_conversion view → getConversions /
+	// dumpConversion). The bare-DEFAULT form is dispatched via the DEFAULT arm
+	// below. M0097-0071; full round-trip DU-002 slice 399.
 	case p.acceptIdentKeyword("conversion"):
-		convName, _ := p.parseObjectName()
-		stmt, err := p.parseSkipToSemicolon(t.Pos)
-		if err != nil {
-			return nil, err
+		return p.parseCreateConversionTail(t.Pos, false)
+	// CREATE DEFAULT CONVERSION … — DEFAULT only precedes CONVERSION in CREATE, so
+	// this arm consumes DEFAULT then requires CONVERSION. DU-002 slice 399.
+	case p.acceptKeyword(KwDefault):
+		if !p.acceptIdentKeyword("conversion") {
+			return nil, p.errAtCur("expected CONVERSION after DEFAULT")
 		}
-		if ns, ok := stmt.(*CompatNoopStmt); ok {
-			ns.ObjType = "conversion"
-			ns.ObjName = convName
-		}
-		return stmt, nil
+		return p.parseCreateConversionTail(t.Pos, true)
 	// CREATE TEXT SEARCH DICTIONARY|CONFIGURATION|PARSER|TEMPLATE name — parse name for compat registry. M0097-0071.
 	case p.acceptIdentKeyword("text"):
 		_ = p.acceptIdentKeyword("search") // consume "search"
@@ -1399,6 +1400,58 @@ func (p *parser) parseSkipToSemicolon(pos int) (Stmt, error) {
 		p.advance()
 	}
 	return &CompatNoopStmt{pos: pos, Tag: "CREATE"}, nil
+}
+
+// parseCreateConversionTail parses the body of CREATE [DEFAULT] CONVERSION after
+// the CONVERSION keyword has been consumed:
+//
+//	name FOR 'src_encoding' TO 'dest_encoding' FROM func_name
+//
+// It records the parsed pieces on a CompatNoopStmt so the executor registers the
+// conversion in the catalog conversion registry (pg_dump getConversions /
+// dumpConversion round-trip). isDefault is true for CREATE DEFAULT CONVERSION.
+// DU-002 slice 399.
+func (p *parser) parseCreateConversionTail(pos int, isDefault bool) (Stmt, error) {
+	convName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	if !p.acceptKeyword(KwFor) {
+		return nil, p.errAtCur("expected FOR in CREATE CONVERSION")
+	}
+	forEnc := p.cur()
+	if forEnc.Kind != TokenStringLit {
+		return nil, p.errAtCur("expected source encoding string literal in CREATE CONVERSION")
+	}
+	p.advance()
+	if !p.acceptKeyword(KwTo) {
+		return nil, p.errAtCur("expected TO in CREATE CONVERSION")
+	}
+	toEnc := p.cur()
+	if toEnc.Kind != TokenStringLit {
+		return nil, p.errAtCur("expected destination encoding string literal in CREATE CONVERSION")
+	}
+	p.advance()
+	if !p.acceptKeyword(KwFrom) {
+		return nil, p.errAtCur("expected FROM in CREATE CONVERSION")
+	}
+	funcName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt, err := p.parseSkipToSemicolon(pos)
+	if err != nil {
+		return nil, err
+	}
+	if ns, ok := stmt.(*CompatNoopStmt); ok {
+		ns.ObjType = "conversion"
+		ns.ObjName = convName
+		ns.ConvForEncoding = forEnc.Value
+		ns.ConvToEncoding = toEnc.Value
+		ns.ConvFuncName = funcName
+		ns.ConvDefault = isDefault
+	}
+	return stmt, nil
 }
 
 // parseCreateForeignTableTail parses the tail of CREATE FOREIGN TABLE after the TABLE keyword.

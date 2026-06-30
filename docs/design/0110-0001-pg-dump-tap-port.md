@@ -9823,6 +9823,40 @@ round-trip fixture continues to pass unchanged (its function is exactly `text_as
 `TestValidateCreateCast` (`internal/executor/create_cast_validate_test.go`, 18 accept/reject cases asserting message +
 42P17).
 
+### Slice 399 — **CREATE [DEFAULT] CONVERSION round-trip** (new feature)
+
+`CREATE CONVERSION` was parsed name-only (a `CompatNoopStmt` whose body the parser skipped to the semicolon) and the
+virtual `pg_conversion` view always returned zero rows, so a user conversion never round-tripped. This slice makes the
+full `CREATE [DEFAULT] CONVERSION name FOR 'src' TO 'dest' FROM func` statement re-emit through pg_dump's
+`getConversions` / `dumpConversion` (`postgres/src/bin/pg_dump/pg_dump.c`).
+
+- **Parser** (`internal/parser/ddl.go`): a new `parseCreateConversionTail(pos, isDefault)` parses the
+  `name FOR 'src' TO 'dest' FROM func` body, capturing the two encoding-name string literals, the `FROM` function name,
+  and the `DEFAULT` flag onto new `CompatNoopStmt` fields (`ConvForEncoding`, `ConvToEncoding`, `ConvFuncName`,
+  `ConvDefault`). A new `case p.acceptKeyword(KwDefault)` dispatch arm handles the `CREATE DEFAULT CONVERSION` form
+  (DEFAULT only precedes CONVERSION in `CREATE`).
+- **Catalog** (`internal/catalog/catalog.go`, `internal/catalog/encoding.go`): a `UserConversion` registry
+  (`CreateConversion` / `DropConversion` / `ListUserConversions`) mirrors `UserCollation`. The `pg_conversion`
+  `VirtualRows` now surfaces each registered conversion — `conforencoding`/`contoencoding` are the `pg_enc` integer IDs
+  (resolved by the new `EncodingNameToID`), `conproc` is the schema-qualified function name (typed `regproc`, since
+  `dumpConversion` selects it raw and pg_dump's empty `search_path` qualifies the regproc), and `condefault` reflects the
+  `DEFAULT` flag. The `pg_enc` ID↔name table is duplicated from `internal/initdb/encoding.go` (initdb cannot be imported
+  from catalog without a cycle; the mapping is an immutable PG constant).
+- **Executor** (`internal/executor/expr.go`, `operators_ddl.go`): a new `pg_encoding_to_char(int4)` builtin (which
+  `dumpConversion` calls on the encoding IDs) returns `catalog.EncodingIDToName`; `execCompatNoop`'s new `case "conversion"`
+  resolves the encoding names and registers the conversion (still registering the compat object so `DROP CONVERSION`
+  succeeds), and the DROP path drops the dump-visible registry entry.
+
+`dumpConversion` emits `CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func;` —
+verified byte-identical vs real pg_dump 18.3 (the fixture conversion function is not validated by goopg, which has no
+real fmgr encoding-conversion engine; only the dump text is compared). Coverage: `TestParseCreateConversion`
+(`internal/parser/conversion_test.go`), `TestEncodingIDNameRoundTrip` + `TestPgConversionVirtualRows`
+(`internal/catalog/conversion_test.go`), and slice-399 assertions in `TestPort_PgDumpConnectionSetup`. **Deferred
+(ledger):** full encoding-alias resolution (`EncodingNameToID` recognizes only the 42 canonical names, not the
+`pg_encname_tbl` aliases like `unicode`→UTF8); the conversion function is not resolved/validated against `pg_proc`
+(stored as written, lenient like pre-398 casts); restart persistence (the registry is in-memory only, the recurring
+389–398 shared-catalog runtime-write gap).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

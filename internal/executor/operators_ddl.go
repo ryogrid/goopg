@@ -12602,6 +12602,12 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "conversion", "text search configuration", "text search dictionary",
 			"text search parser", "text search template":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// Drop the dump-visible pg_conversion registry entry too so a
+				// dropped conversion stops round-tripping through pg_dump
+				// (DU-002 slice 399); harmless for the other object types.
+				if objType == "conversion" {
+					im.DropConversion(s.Names[0].Name, s.Names[0].Schema)
+				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
 				}
@@ -12933,8 +12939,35 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				im.RegisterTableRuleKind(s.TableName.Name, s.RuleKind)
 			}
 		}
+	case "conversion":
+		// Register the conversion (CREATE [DEFAULT] CONVERSION name FOR 'src' TO
+		// 'dest' FROM func) so it round-trips through pg_dump (pg_conversion view →
+		// getConversions / dumpConversion). The encoding names resolve to pg_enc
+		// integer IDs (conforencoding/contoencoding); an unknown encoding name
+		// leaves the ID at -1, which pg_encoding_to_char renders as the empty
+		// string — lenient, matching how goopg models these compat objects without
+		// a real encoding-conversion engine. The compat object is still registered
+		// so DROP CONVERSION succeeds. DU-002 slice 399.
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		owner := uint32(10) // bootstrap superuser (postgres)
+		uc := &catalog.UserConversion{
+			Name:        s.ObjName.Name,
+			Owner:       owner,
+			ForEncoding: catalog.EncodingNameToID(s.ConvForEncoding),
+			ToEncoding:  catalog.EncodingNameToID(s.ConvToEncoding),
+			ProcSchema:  s.ConvFuncName.Schema,
+			ProcName:    s.ConvFuncName.Name,
+			Default:     s.ConvDefault,
+		}
+		if _, err := im.CreateConversion(uc, schema); err != nil {
+			return &ExecError{Code: "42710", Message: err.Error()}
+		}
 	default:
-		// conversion, text search dictionary/configuration/parser/template, etc.
+		// text search dictionary/configuration/parser/template, language, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	}
 	return nil

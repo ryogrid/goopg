@@ -9569,6 +9569,19 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(name), nil
 		}
+	case "pg_encoding_to_char":
+		// pg_encoding_to_char(int4) → name: the canonical encoding name for a
+		// pg_enc integer ID, or "" for an out-of-range ID (mirrors
+		// pg_encoding_to_char in encnames.c). pg_dump's dumpConversion calls it on
+		// pg_conversion.conforencoding / contoencoding to render the FOR/TO
+		// encoding-name literals. NULL input → NULL. DU-002 slice 399.
+		if len(x.Args) >= 1 {
+			encArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || encArg.IsNull() {
+				return NullDatum, nil
+			}
+			return NewStringDatum(catalog.EncodingIDToName(int32(encArg.Int))), nil
+		}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
 			v, err := evalExpr(x.Args[0], row, ctx)
