@@ -4953,6 +4953,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_rules (provider = icu, locale = 'und', rules = '&V << w <<< W')"); err != nil {
 		t.Fatalf("create collation ci_rules: %v", err)
 	}
+	// Slice 393: the two remaining unexercised dumpCollation provider branches —
+	// (a) the libc `else` limb where lc_collate != lc_ctype, and (b) the `provider
+	// = builtin` branch (pg_dump.c:14934+). Slices 389–392 only ever drove the
+	// libc collapse path (collcollate == collctype → single `locale =`) and the
+	// icu path; the libc two-clause form and the builtin provider were already
+	// modeled by execCreateCollation/the pg_collation virtual builder but never
+	// round-tripped end-to-end against real pg_dump.
+	//
+	// (a) libc with distinct lc_collate/lc_ctype. dumpCollation's libc branch
+	// (collprovider 'c') warns unless collcollate && collctype are both set and
+	// colllocale/collicurules are NULL, then — because strcmp(collcollate,
+	// collctype) != 0 — emits the `lc_collate = '...', lc_ctype = '...'` pair
+	// instead of the collapsed `locale =`. goopg stores LcCollate/LcCtype verbatim
+	// (collate='C', ctype='POSIX'), leaves colllocale NULL, so real pg_dump renders
+	// `(provider = libc, lc_collate = 'C', lc_ctype = 'POSIX')`.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.libc_diff (LC_COLLATE = 'C', LC_CTYPE = 'POSIX')"); err != nil {
+		t.Fatalf("create collation libc_diff: %v", err)
+	}
+	// (b) PG17+ `provider = builtin` (collprovider 'b'). dumpCollation's builtin
+	// branch warns unless colllocale is set and collcollate/collctype/collicurules
+	// are NULL, then emits `provider = builtin, locale = '...'`. goopg stores the
+	// locale on uc.Locale (colllocale) and leaves collcollate/collctype NULL, so
+	// real pg_dump renders `(provider = builtin, locale = 'C')`. 'C' is one of the
+	// builtin provider's accepted locales (C / C.UTF-8 / PG_UNICODE_FAST).
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C')"); err != nil {
+		t.Fatalf("create collation builtin_coll: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8035,6 +8062,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// so the canonical order is provider, locale, rules (no deterministic).
 		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_rules (provider = icu, locale = 'und', rules = '&V << w <<< W');") {
 			t.Errorf("pg_dump dropped the ICU collation rules clause; missing CREATE COLLATION public.ci_rules\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 393 (asserted):** the libc two-clause form (lc_collate != lc_ctype)
+		// must NOT collapse to a single `locale =`. dumpCollation emits the pair only
+		// when strcmp(collcollate, collctype) != 0, so a regression that stored the
+		// LOCALE on uc.Locale (colllocale) instead of collcollate/collctype — or that
+		// forced collctype = collcollate — would drop the lc_ctype clause here.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.libc_diff (provider = libc, lc_collate = 'C', lc_ctype = 'POSIX');") {
+			t.Errorf("pg_dump dropped the libc lc_collate/lc_ctype pair; missing CREATE COLLATION public.libc_diff\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 393 (asserted):** the `provider = builtin` branch must round-trip.
+		// dumpCollation renders builtin collations as `provider = builtin, locale =
+		// '...'` reading colllocale (collcollate/collctype must be NULL). A regression
+		// that mapped the builtin provider through the libc collate/ctype slots would
+		// either warn ("invalid collation") or emit the wrong clause.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C');") {
+			t.Errorf("pg_dump dropped the builtin-provider collation; missing CREATE COLLATION public.builtin_coll\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
 		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef

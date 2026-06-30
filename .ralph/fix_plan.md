@@ -3344,6 +3344,17 @@ documentation-only and is exempt from the design-doc requirement.)
       copies) + a `ci_rules` `TestPort_PgDumpConnectionSetup` fixture dumping `(provider = icu, locale = 'und', rules = '&V <<
       w <<< W')` byte-identical vs real pg_dump 18.3. Deferral row appended (registry still in-memory; BKI built-ins still '' not
       NULL in unused locale columns — harmless).
+      **2026-07-01 (loop #33, design 0110-0001 slice 393): libc two-clause + builtin provider round-trip** (TEST-ONLY;
+      closes the last two unexercised `dumpCollation` provider limbs, `pg_dump.c:14934+`). Slices 389–392 only drove the libc
+      *collapse* path (`collcollate == collctype` → single `locale =`) and the icu branch; the libc `else` limb (`strcmp(
+      collcollate, collctype) != 0` → `lc_collate = '...', lc_ctype = '...'`) and the PG17+ `provider = builtin` (collprovider
+      'b') branch were already modeled by `execCreateCollation`/the virtual builder but never round-tripped end-to-end. Two new
+      `TestPort_PgDumpConnectionSetup` fixtures — `CREATE COLLATION public.libc_diff (LC_COLLATE='C', LC_CTYPE='POSIX')` →
+      `(provider = libc, lc_collate = 'C', lc_ctype = 'POSIX')` and `CREATE COLLATION public.builtin_coll (provider = builtin,
+      locale = 'C')` → `(provider = builtin, locale = 'C')` — both byte-identical vs real pg_dump 18.3. No production change
+      (the executor/catalog already handled both providers). With this every dumpCollation provider limb goopg can emit (libc
+      collapse, libc two-clause, icu locale/rules/deterministic, builtin) is round-trip-asserted; collation pg_dump fidelity is
+      complete. Deferral row appended (carry-forward only: registry still in-memory; BKI '' vs NULL; dump-only no real ordering).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

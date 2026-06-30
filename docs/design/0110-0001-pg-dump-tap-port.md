@@ -9639,6 +9639,30 @@ provider → locale → rules), byte-identical vs real pg_dump 18.3.
 heap-backed); the BKI built-in rows still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump
 skips pinned collations).
 
+### Slice 393 — **libc two-clause + builtin provider round-trip** (last unexercised `dumpCollation` branches)
+
+Slices 389–392 exercised `dumpCollation`'s libc *collapse* path (`collcollate == collctype` → a single `locale =`
+clause) and the whole `provider = icu` branch, but two provider limbs of `dumpCollation` (`pg_dump.c:14934+`) stayed
+untested end-to-end even though `execCreateCollation` / the `pg_collation` virtual-row builder already modeled them:
+
+- **libc, `lc_collate != lc_ctype`.** The libc branch (`collprovider == 'c'`) emits the collapsed `locale =` form only
+  when `strcmp(collcollate, collctype) == 0`; otherwise it emits the `lc_collate = '...', lc_ctype = '...'` pair. The
+  parser already captured `LC_COLLATE`/`LC_CTYPE` separately (`CreateCollationStmt.LcCollate/LcCtype`) and the executor
+  stored them as `collcollate`/`collctype` with `colllocale` NULL, so `CREATE COLLATION public.libc_diff (LC_COLLATE =
+  'C', LC_CTYPE = 'POSIX')` now round-trips as `(provider = libc, lc_collate = 'C', lc_ctype = 'POSIX')`.
+- **`provider = builtin` (PG17+, `collprovider == 'b'`).** The builtin branch warns unless `colllocale` is set and
+  `collcollate`/`collctype`/`collicurules` are NULL, then emits `provider = builtin, locale = '...'`. The executor's
+  provider switch already mapped `builtin → 'b'` and routed the locale onto `uc.Locale` (colllocale), leaving
+  collcollate/collctype NULL, so `CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C')` round-trips as
+  `(provider = builtin, locale = 'C')` (`C` is one of the builtin provider's accepted locales).
+
+This slice is therefore test-only — two `TestPort_PgDumpConnectionSetup` fixtures plus their assertions, both confirmed
+byte-identical vs real pg_dump 18.3. With it, every `dumpCollation` provider limb that goopg can produce (libc collapse,
+libc two-clause, icu locale/rules/deterministic, builtin) is covered by a round-trip assertion.
+**Deferred** (ledger): the collation registry remains in-memory (no restart persistence; `pg_collation` is not
+heap-backed); the BKI built-in rows still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump
+skips pinned collations).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
