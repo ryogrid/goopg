@@ -167,15 +167,66 @@ building block (no consumer reads it yet, so blast radius is nil):
 This unblocks the executor wiring: the GRANT details now reach a parsed AST node
 that `execCompatNoop` runs with a full `*executor.Context` in scope.
 
+### Progress — step 2 aclitem[] binary codec landed (loop #86, 2026-06-30)
+
+Wiring loop #85's parser capture toward the heap revealed a **previously-unknown
+foundational blocker** that step 2 silently assumed was already solved: the heap
+codec could **not** encode a *non-empty* `aclitem[]`. `pgTypeColumnsPG18`'s
+`typacl` column is `aclitem[]`, and `codec.go`'s `case "aclitem[]"` only handles
+(a) a pre-built `KindBytes` blob (passthrough) or (b) `emptyArrayTypeBytes(1033)`
+— a `NewStringDatum("{=U/postgres,…}")` falls to the empty path and **silently
+drops the ACL**. The generic `encodeArrayValuePG` (`codec_array.go`) has no
+`aclitem` element-type entry either, so it would mis-encode as a `text` array
+(`elemtype 25`, 4-byte-varlena elements) that a PG18 standby / `pg_dump`'s
+`getTypes` cannot parse (it expects `elemtype 1033` + 16-byte fixed `AclItem`
+structs). Because `pg_type` is heap-backed precisely for PG18-standby basebackup
+parity, an internally-round-tripping-but-non-PG-native blob would fail
+`TestE2E_PhysicalReplication` — so the codec must be byte-faithful.
+
+Landed as a self-contained, behaviour-neutral building block (no caller yet →
+nil blast radius):
+
+- `internal/executor/codec_aclitem.go` — the dedicated PG-native `_aclitem`
+  (OID 1034) array codec. `encodeAclItemArrayText(aclText, resolveOID)` parses
+  the canonical aclitemout array text the catalog renderer produces
+  (`{grantee=privs/grantor,…}`) into the on-disk ArrayType varlena: the same
+  24-byte 1-D no-NULL header as `codec_array.go` but `elemtype 1033` and one
+  16-byte `AclItem` per entry (`ai_grantee` Oid + `ai_grantor` Oid + `ai_privs`
+  AclMode `uint64`, low 32 bits = privilege bits / high 32 bits = grant-option
+  bits, per `acl.h` `ACL_GRANT_OPTION_FOR(privs) = privs << 32`). The empty
+  grantee resolves to `ACL_ID_PUBLIC` (0). `decodeAclItemArrayText(blob,
+  resolveName)` inverts it. The codec is **pure** — role name↔OID resolution is
+  injected by the caller (the heap re-sync path will pass the per-role OID
+  registry), so it has no catalog dependency and is unit-testable in isolation.
+  Privilege letters follow `ACL_ALL_RIGHTS_STR = "arwdDxtXUCTcsAm"` (letter at
+  index `i` ⇒ bit `1<<i`), and role-name quoting mirrors PG's `putid`.
+- Tests `internal/executor/codec_aclitem_test.go`: `TestAclModeFromPrivLetters`
+  (priv-letter↔AclMode incl. grant option), a **byte-exact golden** for
+  `{=U/postgres}` (the type-default PUBLIC USAGE entry — 40-byte blob, header +
+  one AclItem), `TestAclItemArrayRoundTrip` (PUBLIC, owner-only, owner+PUBLIC+
+  grantee, grant-option, relacl-style multi-priv, non-owner grantor),
+  `TestAclItemArrayEmpty` (owner-revoke-all → PG-valid empty `_aclitem`), and
+  `TestAclItemArrayQuotedRole` (a quoted role name with an embedded comma is not
+  torn by the top-level splitter). Full `internal/executor` suite green;
+  `go build ./...` clean.
+
+This is the encode/decode primitive every later heap-ACL re-sync (typacl now,
+attacl next) builds on; the GRANT path can now produce a PG-faithful `typacl`
+heap value instead of silently storing an empty/mis-typed array.
+
 **Remaining for M0119-0004-ACLHEAP** (the high-blast-radius half — still a dedicated
 full-gate loop): the rest of step 1 (route GRANT/REVOKE on a heap-backed object
 through `dispatchSimpleQueryViaExecutor` — flip the `query.go:69-87` short-circuit
 so an autocommit `GRANT … ON TYPE|DOMAIN` falls through to the executor),
 2b (the `execCompatNoop` branch that, when `s.TypeACL != nil`, updates the
-OID-keyed ACL store like `recordFunctionGrant` but with USAGE and re-syncs the
-`pg_type` heap row via the `deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` +
-`TypeACLText` template), 3 (mirror to the postgres DB), and 4 (the DU-002 connsetup
-slice + `TestE2E_PhysicalReplication` + TPC-H Q12/Q13 + pgbench gates).
+OID-keyed ACL store like `recordFunctionGrant` but with USAGE, then re-syncs the
+`pg_type` heap row via `deleteTypeFromCatalogHeap` + `writeHeapRowCanonical` with
+`row[31]` = `NewBytesDatum(encodeAclItemArrayText(TypeACLText(oid), …))` — the
+codec passes the blob through `codec.go`'s `aclitem[]` `KindBytes` branch — and
+wires `decodeAclItemArrayText` into the `SELECT … typacl FROM pg_type` read path),
+3 (mirror to the postgres DB), and 4 (the DU-002 connsetup slice +
+`TestE2E_PhysicalReplication` + TPC-H Q12/Q13 + pgbench gates; re-init the data
+dir since the `pg_type` row layout gains a populated `typacl`).
 
 Catalog accessors that already exist and de-risk step 2: `LookupEnum`/`LookupEnumByOID`
 (`catalog.go:9803/9816`), `LookupCompositeType`/`...ByOID` (`10097/10108`),
