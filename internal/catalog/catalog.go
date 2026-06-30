@@ -6759,8 +6759,8 @@ func (c *InMemory) registerSystemTables() {
 				s.Name,                                // srvname
 				strconv.FormatUint(uint64(owner), 10), // srvowner
 				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
-				"",                             // srvtype (NULL)
-				"",                             // srvversion (NULL)
+				s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
+				s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
 				"",                             // srvacl (NULL)
 				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
 			})
@@ -9564,6 +9564,11 @@ type ForeignServer struct {
 	OID     uint32 // pg_foreign_server.oid (assigned from the catalog OID counter)
 	Owner   uint32 // srvowner; 0 → defaults to the bootstrap superuser at render time
 	FdwName string // the referenced FDW name; resolved to srvfdw OID at render time
+	// Type / Version hold the CREATE SERVER TYPE 'x' / VERSION 'y' clauses
+	// (pg_foreign_server.srvtype / srvversion). Empty → SQL NULL, so
+	// dumpForeignServer omits the corresponding TYPE/VERSION clause. DU-002 slice 381.
+	Type    string
+	Version string
 	// Options holds the server's OPTIONS as "name=value" elements, the on-disk
 	// pg_foreign_server.srvoptions text[] representation. pg_dump's
 	// getForeignServers expands these via pg_options_to_table(srvoptions) and
@@ -9574,9 +9579,10 @@ type ForeignServer struct {
 
 // RegisterForeignServer records a foreign server, allocating a stable OID on
 // first sight. Idempotent: re-registering an existing name returns the existing
-// entry without changing its OID (the FDW association and OPTIONS are refreshed
-// when non-empty). DU-002 slice 376 (options: slice 378).
-func (c *InMemory) RegisterForeignServer(name, fdwName string, options []string) *ForeignServer {
+// entry without changing its OID (the FDW association, TYPE/VERSION, and OPTIONS
+// are refreshed when non-empty). DU-002 slice 376 (options: slice 378;
+// type/version: slice 381).
+func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion string, options []string) *ForeignServer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.foreignServers == nil {
@@ -9586,12 +9592,18 @@ func (c *InMemory) RegisterForeignServer(name, fdwName string, options []string)
 		if fdwName != "" {
 			s.FdwName = fdwName
 		}
+		if srvType != "" {
+			s.Type = srvType
+		}
+		if srvVersion != "" {
+			s.Version = srvVersion
+		}
 		if len(options) > 0 {
 			s.Options = options
 		}
 		return s
 	}
-	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Options: options}
+	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options}
 	c.foreignServers[name] = s
 	return s
 }

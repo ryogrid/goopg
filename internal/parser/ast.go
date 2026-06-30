@@ -1864,6 +1864,12 @@ type CompatNoopStmt struct {
 	// re-emits the OPTIONS clause from pg_foreign_server.srvoptions. Nil when the
 	// statement carries no OPTIONS. DU-002 slice 378.
 	Options []string
+	// ServerType / ServerVersion carry the TYPE 'x' / VERSION 'y' clauses of a
+	// CREATE SERVER statement. They round-trip through pg_foreign_server.srvtype /
+	// srvversion so pg_dump's dumpForeignServer re-emits the TYPE/VERSION clauses.
+	// Empty when the clause is absent. DU-002 slice 381.
+	ServerType    string
+	ServerVersion string
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

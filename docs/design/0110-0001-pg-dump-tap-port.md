@@ -9346,6 +9346,32 @@ metachar-free values (`pipe`, `true`). The reserved-keyword `quote_ident` gap (s
 With this slice the FDW/SERVER/USER-MAPPING `OPTIONS` round-trip is complete; the remaining FDW work is `ALTER FOREIGN DATA WRAPPER …
 OPTIONS` (ADD/SET/DROP) and `HANDLER`/`VALIDATOR` function references.
 
+### Slice 381 — **`CREATE SERVER … TYPE 'x' VERSION 'y'`** round-trip (PRODUCTION fix)
+
+Slice 376 made a foreign server dumpable but hard-coded `srvtype`/`srvversion` to NULL, so the optional `TYPE`/`VERSION` clauses were
+dropped. This slice round-trips them. PostgreSQL stores them in `pg_foreign_server.srvtype` / `srvversion` (plain `text` columns); pg_dump's
+`getForeignServers` selects them directly and `dumpForeignServer` re-emits ` TYPE 'x' VERSION 'y'` — each value via `appendStringLiteralAH`
+(client-side string-literal escaping) — between the server name and ` FOREIGN DATA WRAPPER`, ahead of any `OPTIONS` clause. A clause is
+emitted only when its column is non-empty.
+
+- **Parser** (`internal/parser/ddl.go`): the `CREATE SERVER` scan loop now detects `TYPE`/`VERSION` (identifier-or-keyword, case-insensitive)
+  each followed by a string literal, storing them in `CompatNoopStmt.ServerType` / `ServerVersion`. They sit alongside the existing
+  `FOREIGN DATA WRAPPER` / `OPTIONS` detection so any clause order parses.
+- **AST** (`internal/parser/ast.go`): `CompatNoopStmt` gains `ServerType` / `ServerVersion string`.
+- **Catalog** (`internal/catalog/catalog.go`): `ForeignServer` gains `Type` / `Version string`; `RegisterForeignServer(name, fdwName,
+  srvType, srvVersion, options)` stores them (re-registration refreshes each only when non-empty, so an idempotent `nil`/`""` re-register is
+  non-destructive). The `pg_foreign_server` `VirtualRows` `srvtype`/`srvversion` cells now render `s.Type`/`s.Version` (empty → NULL → clause
+  omitted) instead of the previous hard-coded `""`.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `server` arm threads `s.ServerType` / `s.ServerVersion` into
+  `RegisterForeignServer`.
+
+Covered by the new `TestParseCreateServerTypeVersion` (parser: full `TYPE … VERSION … FOREIGN DATA WRAPPER … OPTIONS` shape; `TYPE`-only;
+bare → both empty), the `tv_srv` assertions in `TestForeignServerRegistry` (registry: `srvtype`/`srvversion` render `oracle`/`12.2`; empty
+re-register preserves, non-empty refreshes), and the `goopg_srv_tv` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact
+`CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'remote'\n);`). No new PG behavior
+is deferred — `srvtype`/`srvversion` are opaque text and client-side `appendStringLiteralAH` handles escaping; the in-memory-only limitation
+(servers vanish on restart) still applies. The remaining SERVER work is `ALTER SERVER … OPTIONS`/`VERSION`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

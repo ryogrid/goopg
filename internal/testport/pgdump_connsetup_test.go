@@ -4816,6 +4816,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'localhost', dbname 'mydb')"); err != nil {
 		t.Fatalf("create server with options: %v", err)
 	}
+	// Slice 381: a FOREIGN SERVER created `WITH TYPE 'x' VERSION 'y'` must
+	// round-trip those clauses. PostgreSQL stores them in pg_foreign_server.srvtype
+	// / srvversion (plain text columns); pg_dump's getForeignServers selects them
+	// directly and dumpForeignServer re-emits ` TYPE 'x' VERSION 'y'` (string
+	// literals via appendStringLiteralAH) between the server name and `FOREIGN DATA
+	// WRAPPER`. goopg now captures TYPE/VERSION in the parser and surfaces them in
+	// the foreign-server registry's virtual pg_foreign_server row. The fixture also
+	// carries an OPTIONS clause so the full `CREATE SERVER … TYPE … VERSION …
+	// FOREIGN DATA WRAPPER … OPTIONS (…)` shape is exercised. Verified against real
+	// pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'remote')"); err != nil {
+		t.Fatalf("create server with type/version: %v", err)
+	}
 	// Slice 380: a FOREIGN DATA WRAPPER created `WITH OPTIONS (name 'value', …)`
 	// must round-trip its options. PostgreSQL stores them in
 	// pg_foreign_data_wrapper.fdwoptions as a text[] of `name=value` elements;
@@ -10111,6 +10124,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		fdwOptStmt := "CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (\n    debug 'true',\n    delimiter 'pipe'\n);"
 		if !strings.Contains(res.Stdout, fdwOptStmt) {
 			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER OPTIONS (slice-380); missing %q\n  full stdout=%q", fdwOptStmt, res.Stdout)
+		}
+		// Slice 381: a FOREIGN SERVER created WITH TYPE / VERSION must round-trip
+		// those clauses. dumpForeignServer emits ` TYPE 'x' VERSION 'y'` (string
+		// literals) between the server name and ` FOREIGN DATA WRAPPER`, then the
+		// OPTIONS clause. goopg surfaces srvtype/srvversion from the foreign-server
+		// registry's virtual pg_foreign_server row. Verified against real pg_dump 18.3.
+		srvTVStmt := "CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'remote'\n);"
+		if !strings.Contains(res.Stdout, srvTVStmt) {
+			t.Errorf("pg_dump dropped the SERVER TYPE/VERSION (slice-381); missing %q\n  full stdout=%q", srvTVStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

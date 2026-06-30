@@ -186,6 +186,48 @@ func TestParseCreateServerOptions(t *testing.T) {
 	}
 }
 
+// TestParseCreateServerTypeVersion verifies that CREATE SERVER captures the
+// TYPE 'x' / VERSION 'y' clauses (string literals) so they round-trip through
+// pg_foreign_server.srvtype / srvversion (dumpForeignServer re-emits TYPE/VERSION).
+// DU-002 slice 381.
+func TestParseCreateServerTypeVersion(t *testing.T) {
+	// TYPE and VERSION before FOREIGN DATA WRAPPER, with a trailing OPTIONS clause.
+	stmts, err := Parse("CREATE SERVER s1 TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'h')")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ServerType != "oracle" || ns.ServerVersion != "12.2" {
+		t.Errorf("TYPE/VERSION = %q/%q, want oracle/12.2", ns.ServerType, ns.ServerVersion)
+	}
+	if ns.TableName.Name != "goopg_fdw" {
+		t.Errorf("FDW association lost: %q", ns.TableName.Name)
+	}
+	if len(ns.Options) != 1 || ns.Options[0] != "host=h" {
+		t.Errorf("Options = %+v, want [host=h]", ns.Options)
+	}
+
+	// TYPE only (no VERSION) leaves ServerVersion empty.
+	stmts, err = Parse("CREATE SERVER s2 TYPE 'pgsql' FOREIGN DATA WRAPPER goopg_fdw")
+	if err != nil {
+		t.Fatalf("Parse error (TYPE only): %v", err)
+	}
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil || ns.ServerType != "pgsql" || ns.ServerVersion != "" {
+		t.Errorf("TYPE-only mis-parsed: %+v", ns)
+	}
+
+	// Bare CREATE SERVER leaves both empty.
+	stmts, _ = Parse("CREATE SERVER s3 FOREIGN DATA WRAPPER goopg_fdw")
+	ns, _ = stmts[0].(*CompatNoopStmt)
+	if ns == nil || ns.ServerType != "" || ns.ServerVersion != "" {
+		t.Errorf("bare server should have empty TYPE/VERSION: %+v", ns)
+	}
+}
+
 // TestParseCreateFDWOptions verifies that CREATE FOREIGN DATA WRAPPER captures an
 // OPTIONS (name 'value', …) clause as "name=value" elements (and skips any
 // HANDLER/VALIDATOR clauses preceding it), so the wrapper's options round-trip

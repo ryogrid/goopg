@@ -271,6 +271,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 		// (pg_foreign_server.srvoptions → dumpForeignServer). DU-002 slice 378.
 		var fdwName ObjectName
 		var options []string
+		var serverType, serverVersion string
 		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -282,6 +283,26 @@ func (p *parser) parseCreate() (Stmt, error) {
 				if p.acceptIdentKeyword("data") && p.acceptIdentKeyword("wrapper") {
 					fdwName, _ = p.parseObjectName()
 					continue
+				}
+				continue
+			}
+			// Detect "TYPE 'servertype'" / "VERSION 'serverversion'" — each takes a
+			// string literal and round-trips through pg_foreign_server.srvtype /
+			// srvversion (dumpForeignServer re-emits the TYPE/VERSION clauses).
+			// DU-002 slice 381.
+			if (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) && strings.EqualFold(tok.Value, "type") {
+				p.advance()
+				if v := p.cur(); v.Kind == TokenStringLit {
+					serverType = v.Value
+					p.advance()
+				}
+				continue
+			}
+			if (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) && strings.EqualFold(tok.Value, "version") {
+				p.advance()
+				if v := p.cur(); v.Kind == TokenStringLit {
+					serverVersion = v.Value
+					p.advance()
 				}
 				continue
 			}
@@ -297,6 +318,8 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.TableName = fdwName // reuse TableName field to store FDW association
 		}
 		ns.Options = options
+		ns.ServerType = serverType
+		ns.ServerVersion = serverVersion
 		return ns, nil
 	// CREATE USER MAPPING FOR <user> SERVER <server> [OPTIONS (...)] — register so
 	// it round-trips through pg_dump (pg_user_mappings view → dumpUserMappings).

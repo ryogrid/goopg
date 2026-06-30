@@ -12663,7 +12663,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// round-trips through pg_dump (pg_foreign_server virtual view →
 		// dumpForeignServer). The registry mints a stable OID and resolves the
 		// referenced FDW name to its srvfdw OID at render time. DU-002 slice 376.
-		im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.Options)
+		im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options)
 	case "foreign-data wrapper":
 		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
 		// round-trips through pg_dump (pg_foreign_data_wrapper virtual view →
