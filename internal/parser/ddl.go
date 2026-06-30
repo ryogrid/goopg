@@ -4738,16 +4738,41 @@ func (p *parser) parseCreateTriggerTail(pos int, isConstraint bool) (Stmt, error
 				p.advance()
 				break
 			}
-			if p.cur().Kind == TokenStringLit {
-				stmt.FuncArgs = append(stmt.FuncArgs, p.cur().Value)
+			// PG's TriggerFuncArg (gram.y) stores EVERY argument form as a
+			// string in pg_trigger.tgargs: a string literal verbatim, an
+			// integer via psprintf("%d") (canonicalised, leading zeros
+			// dropped), a float by its lexeme, and a bare identifier/keyword
+			// (ColLabel) by its text. pg_get_triggerdef then re-quotes them
+			// all as `'…'` literals, so capturing the token text here lets
+			// buildTriggerDefString round-trip `f(42, 'x', foo)` →
+			// `f('42', 'x', 'foo')`. DU-002 slice 369.
+			switch tok := p.cur(); tok.Kind {
+			case TokenStringLit, TokenNumericLit, TokenIdent:
+				stmt.FuncArgs = append(stmt.FuncArgs, tok.Value)
 				p.advance()
-			} else {
-				p.advance() // skip non-string args
+			case TokenIntLit:
+				stmt.FuncArgs = append(stmt.FuncArgs, canonicalTriggerIntArg(tok.Value))
+				p.advance()
+			default:
+				p.advance() // skip anything unexpected
 			}
 			p.acceptSymbol(",")
 		}
 	}
 	return stmt, nil
+}
+
+// canonicalTriggerIntArg mirrors PG's TriggerFuncArg integer handling
+// (gram.y: `Iconst { makeString(psprintf("%d", $1)) }`): the integer is parsed
+// and reprinted, so a lexeme like "0042" canonicalises to "42". If the literal
+// does not fit a Go int (PG would reject it long before here), the raw lexeme is
+// kept so no information is lost.
+func canonicalTriggerIntArg(lexeme string) string {
+	n, err := strconv.Atoi(lexeme)
+	if err != nil {
+		return lexeme
+	}
+	return strconv.Itoa(n)
 }
 
 // parseDropRuleTail picks up after DROP RULE.

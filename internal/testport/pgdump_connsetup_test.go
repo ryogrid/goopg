@@ -3157,6 +3157,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_arg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('hello', 'wo''rld')"); err != nil {
 		t.Fatalf("create trigger trg_arg with function args: %v", err)
 	}
+	// Slice 369: a trigger whose EXECUTE FUNCTION carries NON-string arguments —
+	// an integer, a float, and a bare identifier. PG's grammar (gram.y
+	// TriggerFuncArg) stores EVERY argument form as a string in pg_trigger.tgargs:
+	// an Iconst via psprintf("%d") (so "0042" canonicalises to "42"), an FCONST by
+	// its lexeme, and a ColLabel identifier by its text. pg_get_triggerdef then
+	// re-quotes ALL of them as `'…'` literals, so `trig_fn(0042, 3.14, foo)` dumps
+	// as `trig_fn('42', '3.14', 'foo')`. goopg's parser previously SKIPPED these
+	// non-string tokens (dropping the args entirely); it now captures their text
+	// (integers canonicalised) into CreateTriggerStmt.FuncArgs, and the existing
+	// buildTriggerDefString quotes them identically.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_narg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn(0042, 3.14, foo)"); err != nil {
+		t.Fatalf("create trigger trg_narg with non-string function args: %v", err)
+	}
 
 	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
 	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
@@ -7743,6 +7756,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// pg_dump 18.3.
 		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_arg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('hello', 'wo''rld');") {
 			t.Errorf("pg_dump dropped/mangled the trigger function string arguments\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 369 (asserted):** a trigger whose EXECUTE FUNCTION carries
+		// NON-string arguments (integer, float, bare identifier) must round-trip.
+		// PG (gram.y TriggerFuncArg) stores every form as a string in tgargs — an
+		// Iconst via psprintf("%d") (so "0042" → "42"), an FCONST by its lexeme, a
+		// ColLabel by its text — and pg_get_triggerdef re-quotes them all as `'…'`
+		// literals → `trig_fn('42', '3.14', 'foo')`. goopg's parser previously
+		// dropped these tokens; it now captures their text (integers canonicalised)
+		// so buildTriggerDefString emits the identical quoted call. Verified
+		// byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_narg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('42', '3.14', 'foo');") {
+			t.Errorf("pg_dump dropped/mangled the trigger function non-string arguments\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
 		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint

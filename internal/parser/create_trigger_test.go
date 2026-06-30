@@ -85,6 +85,15 @@ func TestParseCreateTriggerFuncArgs(t *testing.T) {
 			sql:      "CREATE TRIGGER t2 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()",
 			wantArgs: nil,
 		},
+		{
+			// PG's TriggerFuncArg stores an Iconst via psprintf("%d") (so the
+			// lexeme "0042" canonicalises), a FCONST by its text, a bare
+			// identifier (ColLabel) by its text, and a string verbatim — all as
+			// strings in tgargs. DU-002 slice 369.
+			name:     "integer, float, identifier, and string args",
+			sql:      "CREATE TRIGGER t3 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f(0042, 3.14, foo, 'bar')",
+			wantArgs: []string{"42", "3.14", "foo", "bar"},
+		},
 	}
 
 	for _, tc := range cases {

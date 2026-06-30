@@ -3096,6 +3096,16 @@ documentation-only and is exempt from the design-doc requirement.)
       (two args, second with embedded quote) + new `TestParseCreateTriggerFuncArgs` (parser);
       `TestBuildTriggerDefString` already pinned the render. **Deferred (ledger):** the parser
       silently SKIPS non-string trigger args (`fn(42)` → arg dropped); PG stores+dumps `'42'`.
+      **2026-06-30 (loop #100, design 0110-0001 slice 369): trigger `EXECUTE FUNCTION fn(0042,3.14,foo)`
+      non-string arguments round-trip — PRODUCTION fix resolving the slice-368 deferral.** PG gram.y
+      `TriggerFuncArg` stores every arg form as a string in `tgargs` (Iconst via `psprintf("%d")` so
+      `0042`→`42`, FCONST by lexeme, ColLabel by text); `pg_get_triggerdef` re-quotes them all →
+      `trig_fn('42', '3.14', 'foo')`. `parseCreateTriggerTail` now captures `TokenIntLit` (canonicalised
+      via new `canonicalTriggerIntArg`), `TokenNumericLit`, `TokenIdent` into `FuncArgs` instead of
+      skipping; `buildTriggerDefString` already quotes every stored arg (no deparse change). Byte-identical
+      vs real pg_dump 18.3 (oracle-verified). Tests slice-369 `trg_narg` `TestPort_PgDumpConnectionSetup`
+      + extended `TestParseCreateTriggerFuncArgs` (int/float/ident/string). **Deferred (ledger):** int
+      canonicalisation covers Go-int range only (PG rejects larger first → fallback unreachable).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

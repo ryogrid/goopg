@@ -9003,7 +9003,27 @@ change.** Verified byte-identical vs real pg_dump 18.3.
 **Deferred (ledger):** the parser **silently skips non-string trigger arguments** (`parseCreateTriggerTail`'s
 `else { p.advance() }` arm) — PG accepts e.g. `EXECUTE FUNCTION fn(42)` and stores `"42"` in tgargs, dumping it back as the
 quoted `'42'`; goopg drops such an arg, so a numeric/identifier trigger argument would not round-trip. (Restart persistence is
-the usual in-memory-catalog gap.)
+the usual in-memory-catalog gap.) — **Resolved by slice 369.**
+
+### Slice 369 — **trigger `EXECUTE FUNCTION f(42, 3.14, foo)` non-string arguments** (PRODUCTION fix)
+
+PG's `TriggerFuncArg` grammar (gram.y:6198) accepts four argument forms and stores **every one of them as a string** in
+`pg_trigger.tgargs`: an `Iconst` integer via `psprintf("%d", $1)` (so the lexeme `0042` canonicalises to `42` and leading zeros
+drop), an `FCONST` float by its lexeme, an `Sconst` string verbatim, and a `ColLabel` bare identifier/keyword by its text.
+`pg_get_triggerdef_worker` then re-quotes **all** stored args as `'…'` literals, so `EXECUTE FUNCTION trig_fn(0042, 3.14, foo)`
+dumps as `EXECUTE FUNCTION trig_fn('42', '3.14', 'foo')`.
+
+goopg's `parseCreateTriggerTail` previously captured only `TokenStringLit` args and `p.advance()`-skipped every other token,
+dropping numeric and identifier arguments entirely (the trigger would dump with a truncated or empty argument list). This slice
+extends the `EXECUTE FUNCTION` arm to also capture `TokenIntLit` (canonicalised through new helper `canonicalTriggerIntArg`,
+mirroring `psprintf("%d")`), `TokenNumericLit`, and `TokenIdent` token text into `CreateTriggerStmt.FuncArgs`. The existing
+`buildTriggerDefString` already re-quotes every stored arg, so no deparse change was needed. Covered by the extended
+`TestParseCreateTriggerFuncArgs` case and the oracle-verified `trg_narg` fixture in `TestPort_PgDumpConnectionSetup`. Verified
+byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** integer canonicalisation only covers values that fit a Go `int` (PG would reject larger literals as
+out-of-range before this point, so the raw-lexeme fallback is unreachable in practice). Restart persistence remains the usual
+in-memory-catalog gap shared by all trigger slices.
 
 ## Deferred (002–010) — catalog surface estimate
 
