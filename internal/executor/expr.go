@@ -500,6 +500,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
 			}
+			// An OID input (oid→regproc) renders via regprocout: InvalidOid (0)
+			// becomes "-", matching PG's regproc.c. pg_dump's getForeignDataWrappers
+			// (and amhandler/opclass getters) cast `<col>::regproc` and compare the
+			// result to "-" to decide whether to emit a HANDLER/VALIDATOR clause; a
+			// bare "0" would spuriously emit one. DU-002 slice 375.
+			if v.Kind == KindInt && v.Int == 0 {
+				return NewStringDatum("-"), nil
+			}
 			return v, nil
 		}
 		if strings.EqualFold(x.TargetType, "regtype") && ctx != nil && ctx.Catalog != nil {

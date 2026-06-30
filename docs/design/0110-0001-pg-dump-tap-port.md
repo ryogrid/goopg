@@ -9146,6 +9146,39 @@ round-tripped data row `7\tseven`). Verified byte-identical vs real pg_dump 18.3
 rejected, not supported. A typed table `OF` a composite in a non-`public` schema isn't covered (composite registry is bare-name).
 `pg_class.reltype` (the table's own rowtype) stays 0, as for every other goopg table.
 
+### Slice 375 — **`CREATE FOREIGN DATA WRAPPER <name>`** round-trip (PRODUCTION fix)
+
+goopg accepted `CREATE FOREIGN DATA WRAPPER` (parsed as a `CompatNoopStmt` so `DROP` could later succeed) but tracked it only in the
+bare-name compat-object set, and the `pg_foreign_data_wrapper` virtual view was hard-wired to return zero rows. So a created FDW
+silently vanished from the dump. PostgreSQL stores one `pg_foreign_data_wrapper` row per FDW; pg_dump's `getForeignDataWrappers` reads
+*all* of them (`fdwhandler::pg_catalog.regproc`, `fdwvalidator::pg_catalog.regproc`, `acldefault('F', fdwowner)`, and an
+`array_to_string(… pg_options_to_table(fdwoptions) …)` for the options), and `dumpForeignDataWrapper` emits
+`CREATE FOREIGN DATA WRAPPER <name>;` (the `HANDLER`/`VALIDATOR`/`OPTIONS` clauses are emitted only when present) plus the owner
+`ALTER FOREIGN DATA WRAPPER <name> OWNER TO <role>;`.
+
+This slice wires the feature at the dump-fidelity layer:
+
+- **Catalog** (`internal/catalog/catalog.go`): a dedicated FDW registry (`ForeignDataWrapper{Name, OID, Owner}` keyed by name) mints a
+  *stable* OID at `RegisterForeignDataWrapper` time (idempotent re-registration; `AllocOID`-backed via a new `allocOIDLocked` helper so
+  the existing `AllocOID` and the registry can share the counter without double-locking). `pg_foreign_data_wrapper.VirtualRows` now
+  surfaces each registered FDW with `fdwhandler=fdwvalidator=0` (no handler), `fdwacl=fdwoptions=NULL` (empty string), and
+  `fdwowner=10` (bootstrap superuser → `getRoleName` → `postgres`). `DropForeignDataWrapper` removes it.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s `foreign-data wrapper` arm calls
+  `RegisterForeignDataWrapper` (replacing the bare compat-object register), and the `DROP FOREIGN DATA WRAPPER` arm calls
+  `DropForeignDataWrapper` (the server-cascade cleanup over `fdw-server` compat entries is unchanged).
+- **Executor cast** (`internal/executor/expr.go`): the `<oid>::regproc` cast now renders `InvalidOid` (0) as `-`, mirroring PG's
+  `regprocout`. pg_dump compares the cast result to `"-"` to decide whether to emit a `HANDLER`/`VALIDATOR` clause, so a bare `"0"`
+  would have spuriously produced ` HANDLER 0`. (The same rule applies to `amhandler`/opclass getters, so this is generally correct, not
+  FDW-specific.)
+
+Covered by `TestForeignDataWrapperRegistry` (unit: stable/idempotent OID, drop, exact virtual-row columns) and the `goopg_fdw` fixture in
+`TestPort_PgDumpConnectionSetup` (asserts the exact `CREATE`/owner-`ALTER` statements and the *absence* of a spurious `HANDLER`/`VALIDATOR`
+clause). Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du_fdw_ref`).
+
+**Deferred (ledger):** `HANDLER`/`VALIDATOR` and `OPTIONS (...)` are discarded by the parser (consumed to `;`), so an FDW with a handler
+or options round-trips without them. FDWs are in-memory only (like roles) — they do not survive a restart. `CREATE SERVER` / `CREATE USER
+MAPPING` remain compat-only and are still not dumped.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

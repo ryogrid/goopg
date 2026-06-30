@@ -12517,7 +12517,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "foreign-data wrapper":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				fdwName := s.Names[0].String()
-				if im.DropCompatObject("foreign-data wrapper", fdwName) {
+				if im.DropForeignDataWrapper(fdwName) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
 						// Find servers registered under this FDW via "fdw-server:fdwname:servername".
@@ -12649,8 +12649,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			im.RegisterCompatObject("fdw-server", s.TableName.String()+":"+s.ObjName.String())
 		}
 	case "foreign-data wrapper":
-		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed.
-		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
+		// round-trips through pg_dump (pg_foreign_data_wrapper virtual view →
+		// dumpForeignDataWrapper). The dedicated registry mints a stable OID so
+		// repeated VirtualRows calls return the same identity. DU-002 slice 375.
+		im.RegisterForeignDataWrapper(s.ObjName.String())
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""

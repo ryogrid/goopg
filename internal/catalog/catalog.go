@@ -2144,6 +2144,13 @@ type InMemory struct {
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
 
+	// fdws tracks foreign-data wrappers (CREATE FOREIGN DATA WRAPPER) with a
+	// stable OID so they round-trip through pg_dump's getForeignDataWrappers
+	// (pg_foreign_data_wrapper virtual view → dumpForeignDataWrapper). goopg does
+	// not execute FDWs; only enough metadata is kept for dump fidelity. Key:
+	// fdwname. DU-002 slice 375.
+	fdws map[string]*ForeignDataWrapper
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -3743,6 +3750,11 @@ func (c *InMemory) AdvanceNextOIDPast(oid uint32) {
 func (c *InMemory) AllocOID() uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.allocOIDLocked()
+}
+
+// allocOIDLocked is AllocOID's body for callers that already hold c.mu.
+func (c *InMemory) allocOIDLocked() uint32 {
 	oid := c.nextOID
 	c.nextOID++
 	return oid
@@ -6652,7 +6664,34 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2328,
 	}
-	pgForeignDataWrapper.VirtualRows = func() [][]string { return nil }
+	// Surface user-created FDWs (CREATE FOREIGN DATA WRAPPER) so they round-trip.
+	// fdwhandler/fdwvalidator are 0 (no handler) — the query's `::regproc` cast
+	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR. fdwacl
+	// and fdwoptions are NULL (empty string), so dumpACL emits nothing and the
+	// OPTIONS clause is skipped. DU-002 slice 375.
+	pgForeignDataWrapper.VirtualRows = func() [][]string {
+		fdws := c.ListForeignDataWrappers()
+		if len(fdws) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(fdws))
+		for _, f := range fdws {
+			owner := f.Owner
+			if owner == 0 {
+				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(f.OID), 10), // oid
+				f.Name,                                // fdwname
+				strconv.FormatUint(uint64(owner), 10), // fdwowner
+				"0",                                   // fdwhandler (regproc 0 → '-')
+				"0",                                   // fdwvalidator (regproc 0 → '-')
+				"",                                    // fdwacl (NULL)
+				"",                                    // fdwoptions (NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
 	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
@@ -9315,6 +9354,64 @@ func (c *InMemory) ListCompatObjects(objType string) []string {
 		out = append(out, name)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// ForeignDataWrapper is a user-created foreign-data wrapper (CREATE FOREIGN DATA
+// WRAPPER). goopg does not execute FDWs; this records just enough metadata to
+// round-trip the CREATE/DROP through pg_dump (pg_foreign_data_wrapper virtual
+// view → getForeignDataWrappers/dumpForeignDataWrapper). DU-002 slice 375.
+type ForeignDataWrapper struct {
+	Name  string // fdwname
+	OID   uint32 // pg_foreign_data_wrapper.oid (assigned from the catalog OID counter)
+	Owner uint32 // fdwowner; 0 → defaults to the bootstrap superuser at render time
+}
+
+// RegisterForeignDataWrapper records an FDW, allocating a stable OID on first
+// sight. Idempotent: re-registering an existing name returns the existing entry
+// without changing its OID. DU-002 slice 375.
+func (c *InMemory) RegisterForeignDataWrapper(name string) *ForeignDataWrapper {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fdws == nil {
+		c.fdws = make(map[string]*ForeignDataWrapper)
+	}
+	if f, ok := c.fdws[name]; ok {
+		return f
+	}
+	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked()}
+	c.fdws[name] = f
+	return f
+}
+
+// DropForeignDataWrapper removes an FDW from the registry. Returns true if found.
+// DU-002 slice 375.
+func (c *InMemory) DropForeignDataWrapper(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fdws == nil {
+		return false
+	}
+	if _, ok := c.fdws[name]; ok {
+		delete(c.fdws, name)
+		return true
+	}
+	return false
+}
+
+// ListForeignDataWrappers returns all registered FDWs sorted by name.
+// DU-002 slice 375.
+func (c *InMemory) ListForeignDataWrappers() []*ForeignDataWrapper {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.fdws) == 0 {
+		return nil
+	}
+	out := make([]*ForeignDataWrapper, 0, len(c.fdws))
+	for _, f := range c.fdws {
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

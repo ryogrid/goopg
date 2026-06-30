@@ -4732,6 +4732,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "INSERT INTO public.typedtab (a, b) VALUES (7, 'seven')"); err != nil {
 		t.Fatalf("insert into typed table: %v", err)
 	}
+	// Slice 375: a FOREIGN DATA WRAPPER (`CREATE FOREIGN DATA WRAPPER name`) must
+	// round-trip. pg_dump's getForeignDataWrappers reads ALL rows of
+	// pg_foreign_data_wrapper, casting fdwhandler/fdwvalidator via `::regproc` and
+	// computing acldefault('F', fdwowner); dumpForeignDataWrapper then emits
+	// `CREATE FOREIGN DATA WRAPPER <name>;` (HANDLER/VALIDATOR/OPTIONS omitted when
+	// absent) followed by the owner ALTER. goopg previously parsed CREATE FOREIGN
+	// DATA WRAPPER as a no-op compat object that left the virtual view empty, so
+	// the FDW silently vanished from the dump. The catalog now keeps a dedicated
+	// FDW registry (stable OID per name) that pg_foreign_data_wrapper surfaces, and
+	// the `<oid>::regproc` cast renders InvalidOid (0) as '-' (regprocout) so the
+	// handler/validator clauses are correctly suppressed. (HANDLER/VALIDATOR and
+	// OPTIONS round-trip remain deferred — the parser discards them today.)
+	if err := runSQLSimple(t, c, "CREATE FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create foreign data wrapper: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -9921,6 +9936,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "7\tseven") {
 			t.Errorf("pg_dump typed-table data row missing (slice-374)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 375: a FOREIGN DATA WRAPPER must round-trip as the bare
+		// `CREATE FOREIGN DATA WRAPPER <name>;` form (no HANDLER/VALIDATOR/OPTIONS)
+		// followed by its owner ALTER. Verified byte-for-byte against real pg_dump
+		// 18.3 (reference /tmp/du_fdw_ref).
+		fdwStmt := "CREATE FOREIGN DATA WRAPPER goopg_fdw;"
+		if !strings.Contains(res.Stdout, fdwStmt) {
+			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER (slice-375); missing %q\n  full stdout=%q", fdwStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER FOREIGN DATA WRAPPER goopg_fdw OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the FDW owner ALTER (slice-375)\n  full stdout=%q", res.Stdout)
+		}
+		// A regression that mis-rendered fdwhandler (regproc 0 → '-') would emit a
+		// spurious ` HANDLER`/` VALIDATOR` clause on the bare wrapper.
+		if strings.Contains(res.Stdout, "CREATE FOREIGN DATA WRAPPER goopg_fdw HANDLER") ||
+			strings.Contains(res.Stdout, "CREATE FOREIGN DATA WRAPPER goopg_fdw VALIDATOR") {
+			t.Errorf("pg_dump emitted a spurious HANDLER/VALIDATOR on the handler-less FDW (slice-375 regproc 0→'-' regressed)\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

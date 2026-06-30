@@ -1,45 +1,41 @@
 (idle — nothing in flight)
 
-Loop #13 COMPLETE: M0119-0004 DU-002 slice 374 — typed table
-`CREATE TABLE name OF composite_type` now round-trips through pg_dump as the
-`OF type` form with NO inline column list (PRODUCTION fix).
+Loop #14 COMPLETE: M0119-0004 DU-002 slice 375 — `CREATE FOREIGN DATA WRAPPER
+<name>` now round-trips through pg_dump (PRODUCTION fix).
 
-Bug: goopg's CREATE TABLE parser had no `OF` arm → syntax error, so a typed
-table could not be created or dumped. PG records pg_class.reloftype; pg_dump's
-dumpTableSchema appends ` OF <type>` and skips every type-derived column (the
-reloftype attr-loop branch), so the dump is `CREATE TABLE public.typedtab OF
-public.addr2type;`.
+Bug: goopg parsed CREATE FDW as a CompatNoopStmt tracked only in the bare-name
+compat set, and pg_foreign_data_wrapper.VirtualRows was hard-wired to 0 rows, so
+a created FDW silently vanished from the dump. Real pg_dump's
+getForeignDataWrappers reads ALL pg_foreign_data_wrapper rows and
+dumpForeignDataWrapper emits `CREATE FOREIGN DATA WRAPPER <name>;` +
+`ALTER FOREIGN DATA WRAPPER <name> OWNER TO postgres;`.
 
-Fix (end-to-end, dump-fidelity): parser arm → CreateTableStmt.OfType (new AST
-*ObjectName). execCreateTable looks up the composite (LookupCompositeType),
-synthesizes a ColumnDef per field (compositeFieldColumnType parses the stored
-ColType token string) through the normal column-build path, and stamps
-catalog.Table.OfTypeOID. Surfaced as pg_class.reloftype in BOTH the virtual
-VirtualRows builder (pg_dump reads this) and the heap buildUserPGClassRow
-sibling. PG keeps attislocal=true on OF-type columns (makeColumnDef default;
-transformOfType does not clear it) — pg_dump skips them via the reloftype check,
-not attislocal — so no inheritance plumbing. Columns are real: COPY (a,b) +
-data row 7\tseven round-trip.
+Fix (3 parts):
+- catalog: dedicated FDW registry (ForeignDataWrapper{Name,OID,Owner} keyed by
+  name; stable OID via new allocOIDLocked); pg_foreign_data_wrapper.VirtualRows
+  surfaces each (fdwhandler/fdwvalidator=0, acl/options NULL, owner=10).
+- executor: RegisterForeignDataWrapper / DropForeignDataWrapper replace the
+  bare compat-object register/drop.
+- executor cast: `<oid>::regproc` now renders InvalidOid(0) as '-' (regprocout)
+  so dumpForeignDataWrapper suppresses the HANDLER/VALIDATOR clause (a bare "0"
+  would have emitted ` HANDLER 0`). General PG-correct, not FDW-specific.
 
-Files:
-- internal/parser/ast.go (CreateTableStmt.OfType)
-- internal/parser/ddl.go (parseCreateTableTail OF arm; rejects (col WITH OPTIONS))
-- internal/catalog/catalog.go (Table.OfTypeOID + virtual pg_class reloftype via relOfType local)
-- internal/executor/operators_ddl.go (execCreateTable OF block + compositeFieldColumnType helper)
-- internal/executor/pg18_user_catalog_rows.go (heap pg_class reloftype sibling)
-- internal/executor/pg18_user_catalog_rows_test.go (TestUserPGClassRowOfType + TestCompositeFieldColumnType)
-- internal/testport/pgdump_connsetup_test.go (public.addr2type/typedtab fixture + asserts)
-- docs/design/0110-0001-pg-dump-tap-port.md (Slice 374)
-- .ralph/fix_plan.md + .ralph/deferral_ledger.md (slice 374)
+Files: internal/catalog/catalog.go (registry + VirtualRows + allocOIDLocked),
+internal/catalog/fdw_registry_test.go (new),
+internal/executor/operators_ddl.go (register/drop wiring),
+internal/executor/expr.go (regproc 0→'-'),
+internal/testport/pgdump_connsetup_test.go (goopg_fdw fixture + asserts),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 375), ledger.
 
-Gates: unit + TestPort_PgDumpConnectionSetup PASS (5.9s, byte-identical vs real
-pg_dump 18.3, ref /tmp/du374_pgdata); parser/catalog/executor suites PASS;
-build/gofmt(my lines)/vet clean; pgbench smoke = pre-commit hook. No TPC-H
-(metadata-only catalog-row builder; typed tables absent from TPC-H schema).
+Gates: TestForeignDataWrapperRegistry + TestPort_PgDumpConnectionSetup PASS
+(byte-identical vs real pg_dump 18.3, ref /tmp/du_fdw_ref); catalog/executor/
+parser suites PASS; build/vet/gofmt(my lines) clean. pgbench smoke = pre-commit
+hook. No TPC-H (metadata-only virtual-catalog change; FDWs absent from TPC-H).
 
-Deferred (ledger): per-column `OF type (col WITH OPTIONS …)` form rejected;
-non-public-schema composite OF uncovered; pg_class.reltype stays 0.
+Deferred (ledger): HANDLER/VALIDATOR + OPTIONS discarded by parser; FDWs
+in-memory only; CREATE SERVER / USER MAPPING still not dumped.
 
-Next loop: pick a fresh M0119-0004 pg_dump slice via empirical probe (throwaway
-zz_probe_test.go dumping a feature-rich schema → diff vs real pg_dump 18.3).
-Coverage is very deep; typed tables was the cleanest remaining divergence found.
+Next loop: pick a fresh M0119-0004 pg_dump slice via empirical probe. Candidates
+surfaced this loop but NOT yet done (silently created, not dumped): range types
+(CREATE TYPE AS RANGE — needs pg_range+pg_opclass+multirange, large), aggregates,
+operators, text-search configs, and CREATE COLLATION (parser doesn't even accept).
