@@ -3590,6 +3590,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant all on grantall_t to grantall_role: %v", err)
 	}
 
+	// Slice 352 (setup): two distinct grantees on one table each round-trip as
+	// their own GRANT line. `GRANT SELECT … TO mg_role_a` then `GRANT INSERT … TO
+	// mg_role_b` materializes relacl as
+	// "{postgres=arwdDxtm/postgres,mg_role_a=r/postgres,mg_role_b=a/postgres}"
+	// (owner default first, then one aclitem per grantee). pg_dump's
+	// buildACLCommands walks the aclitem array and emits a separate
+	// `GRANT <privs> ON TABLE … TO <grantee>;` per non-owner entry, so the dump
+	// carries two GRANT lines — NOT a merged grantee list. goopg's
+	// relaclTextLockedFor renders grantees in sort.Strings order; mg_role_a sorts
+	// before mg_role_b, matching PostgreSQL's grant-order array here, so the relacl
+	// text and both GRANT lines are byte-identical to real pg_dump 18.3 (relacl +
+	// ACL lines captured). The catalog multi-grantee deterministic-sort is already
+	// unit-covered (TestRelaclText two-grantee case); this slice adds the
+	// end-to-end pg_dump round-trip guarding the per-grantee fan-out.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.multigrant_t(id int)"); err != nil {
+		t.Fatalf("create table multigrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE mg_role_a"); err != nil {
+		t.Fatalf("create role mg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE mg_role_b"); err != nil {
+		t.Fatalf("create role mg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.multigrant_t TO mg_role_a"); err != nil {
+		t.Fatalf("grant select on multigrant_t to mg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT INSERT ON TABLE public.multigrant_t TO mg_role_b"); err != nil {
+		t.Fatalf("grant insert on multigrant_t to mg_role_b: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7657,6 +7687,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// instead of collapsing to `ALL`; guard against the SELECT-led explicit form.
 		if notWant := "GRANT INSERT, SELECT"; strings.Contains(res.Stdout, notWant+" ON TABLE public.grantall_t") {
 			t.Errorf("pg_dump failed to collapse the table GRANT ALL to ALL: unexpected explicit list\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 352 (asserted):** two distinct grantees on one table each emit
+		// their own GRANT line. relacl materializes as
+		// "{postgres=arwdDxtm/postgres,mg_role_a=r/postgres,mg_role_b=a/postgres}";
+		// pg_dump's buildACLCommands fans out one `GRANT <privs> … TO <grantee>;`
+		// per non-owner aclitem, so the dump must carry BOTH the SELECT line for
+		// mg_role_a and the INSERT line for mg_role_b. Verified byte-identical to
+		// real pg_dump 18.3.
+		for _, want := range []string{
+			"GRANT SELECT ON TABLE public.multigrant_t TO mg_role_a;",
+			"GRANT INSERT ON TABLE public.multigrant_t TO mg_role_b;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped a per-grantee GRANT line: want %q\n  full stdout=%q", want, res.Stdout)
+			}
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

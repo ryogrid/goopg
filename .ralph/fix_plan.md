@@ -2865,6 +2865,24 @@ documentation-only and is exempt from the design-doc requirement.)
       clean; pgbench smoke = pre-commit. Still open under M0119-0004: column-level
       (`attacl`, heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
       extended-protocol commit-time deferral.
+      **2026-06-30 (loop #77, design 0119-0004-multi-grantee-table-relacl-pgdump, DU-002
+      slice 352):** multi-grantee table round-trip — two distinct grantees on one table
+      each emit their own GRANT line. `GRANT SELECT … TO mg_role_a` then `GRANT INSERT …
+      TO mg_role_b` materializes relacl as
+      `{postgres=arwdDxtm/postgres,mg_role_a=r/postgres,mg_role_b=a/postgres}`; pg_dump's
+      `buildACLCommands` fans out one `GRANT <privs> ON TABLE … TO <grantee>;` per
+      non-owner aclitem, so the dump carries BOTH the SELECT line (mg_role_a) and the
+      INSERT line (mg_role_b) — it does not merge grantees (verified byte-identical vs
+      real pg_dump 18.3, relacl + ACL lines captured). Test-only — NO engine change: each
+      GRANT records independently under the OID-keyed `tableACLs` store and
+      `relaclTextLockedFor` renders grantees in `sort.Strings` order (mg_role_a before
+      mg_role_b, matching PG's grant-order array here). The catalog multi-grantee
+      deterministic-sort is already unit-covered by `TestRelaclText`'s two-grantee case;
+      this slice adds the end-to-end pg_dump round-trip fixture + per-grantee GRANT-line
+      asserts to the cumulative `TestPort_PgDumpConnectionSetup` guard. Gates: connsetup
+      slice 352 PASS; catalog suite PASS; build clean; pgbench smoke = pre-commit. Still
+      open under M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`,
+      `--create`-only) GRANT projection; extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
