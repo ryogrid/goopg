@@ -2589,6 +2589,27 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("policy"):
+		// COMMENT ON POLICY <name> ON [schema.]table IS '...'. Policies live in
+		// pg_policy (classoid 3256); pg_dump's dumpPolicy re-emits
+		// `COMMENT ON POLICY <name> ON <table> IS '...'`. The shape mirrors
+		// COMMENT ON TRIGGER/CONSTRAINT — a bare policy name followed by ON
+		// <table>. DU-002 slice 371.
+		cs.ObjKind = "policy"
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, true, p.errAtCur("expected policy name")
+		}
+		cs.SubName = tok.Value
+		p.advance()
+		if !p.acceptKeyword(KwOn) {
+			return nil, true, p.errAtCur("expected ON after policy name in COMMENT ON POLICY")
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptIdentKeyword("statistics"):
 		// COMMENT ON STATISTICS name IS '...'. M0097-0023.
 		cs.ObjKind = "statistics"

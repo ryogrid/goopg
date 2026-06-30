@@ -12952,6 +12952,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
 		oidPgTrigger      = 2620 // pg_trigger
+		oidPgPolicy       = 3256 // pg_policy
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13060,6 +13061,23 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		for _, trig := range tbl.Triggers {
 			if strings.EqualFold(trig.Name, s.SubName) && trig.OID != 0 {
 				im.SetComment(oidPgTrigger, trig.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "policy":
+		// Policies live in pg_policy (classoid 3256). pg_dump's dumpPolicy keys
+		// the comment lookup on the policy's catalogId (tableoid=pg_policy=3256)
+		// and objsubid 0, then re-emits `COMMENT ON POLICY <name> ON <table>
+		// IS '...'`. Resolve the policy by name on the named table. Without this
+		// a COMMENT ON POLICY was silently swallowed (parser dropped it) and never
+		// reached pg_description. DU-002 slice 371.
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, pol := range tbl.Policies {
+			if strings.EqualFold(pol.Name, s.SubName) && pol.OID != 0 {
+				im.SetComment(oidPgPolicy, pol.OID, 0, s.Description)
 				return nil
 			}
 		}

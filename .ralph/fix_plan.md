@@ -3120,6 +3120,19 @@ documentation-only and is exempt from the design-doc requirement.)
       line in `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** restart persistence (in-memory
       pg_description); COMMENT ON {RULE,POLICY,COLLATION,LANGUAGE,DATABASE,EXTENSION} still dropped (no
       parser branch — sibling slices).
+      **2026-06-30 (loop #10, design 0110-0001 slice 371): `COMMENT ON POLICY <name> ON <table>`
+      round-trip (PRODUCTION fix).** PG stores an RLS-policy comment in pg_description keyed
+      `(classoid=pg_policy=3256, objoid=pol.oid, objsubid=0)`; pg_dump's `dumpPolicy` calls `dumpComment`
+      so a dump re-emits `COMMENT ON POLICY … ON … IS '...';`. `parseCommentOnTail` had no POLICY branch →
+      silently swallowed. Added the parser branch (captures `POLICY <name> ON [schema.]table`, the same
+      `<name> ON <table>` shape as COMMENT ON TRIGGER) + `execCommentOn` `case "policy"`
+      (`LookupTable`→`Table.Policies`→`SetComment(3256, pol.OID, 0, desc)`). CREATE POLICY already
+      round-trips (slices 323/330; pg_policy exposes each policy's oid); pg_description path
+      classoid-agnostic (slice 370) — no catalog-query change. Byte-identical vs real pg_dump 18.3.
+      Tests `TestParseCommentOnPolicy` (parser) + slice-371 `p_simple` policy-comment line in
+      `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** restart persistence (in-memory
+      pg_description); COMMENT ON {RULE,COLLATION,LANGUAGE,DATABASE,EXTENSION} still dropped (sibling
+      slices).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

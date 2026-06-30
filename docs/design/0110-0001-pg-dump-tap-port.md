@@ -9046,6 +9046,27 @@ so no catalog-query change was needed. Covered by `TestParseCommentOnTrigger` (p
 `COLLATION`, `LANGUAGE`, `DATABASE`, `EXTENSION` — remain unported (no parser branch); each is a sibling slice when its object
 type becomes dumpable.
 
+### Slice 371 — **`COMMENT ON POLICY <name> ON <table>`** round-trip (PRODUCTION fix)
+
+PostgreSQL stores a row-level-security policy comment in `pg_description` keyed by `(classoid=pg_policy=3256, objoid=policy_oid,
+objsubid=0)`, and pg_dump's `dumpPolicy` (pg_dump.c) — after re-emitting the `CREATE POLICY` itself — calls `dumpComment(fout,
+"POLICY <name> ON", qtabname, …, polinfo->dobj.catId, 0, …)` so a dumped schema re-emits `COMMENT ON POLICY <name> ON
+<schema>.<table> IS '...';`. As with the trigger case, goopg's `parseCommentOnTail` had no `POLICY` branch, so the statement fell
+through to the unsupported-default arm and the server silently swallowed it — the comment never reached `pg_description` and pg_dump
+emitted nothing.
+
+This slice adds the missing branch, the bounded sibling of slice 370 (`CREATE POLICY` already round-trips via slices 323/330: the
+`pg_policy` virtual catalog exposes each policy's `oid`, which getPolicies/dumpPolicy reads as the comment's `catId.oid`). The
+parser captures `POLICY <name> ON [schema.]table` (the same `<name> ON <table>` structure as `COMMENT ON TRIGGER/CONSTRAINT`): the
+policy name into `CommentOnStmt.SubName`, the ON-table into `ObjName`, `ObjKind="policy"`. `execCommentOn` resolves the policy by
+name on the named table (`LookupTable` → `Table.Policies`) and stores the description via `SetComment(3256, pol.OID, 0, desc)`.
+The `pg_description` path is classoid-agnostic (proven for `pg_trigger`=2620 in slice 370), so no catalog-query change was needed.
+Covered by `TestParseCommentOnPolicy` (parser) and the `p_simple` policy-comment line in `TestPort_PgDumpConnectionSetup`. Verified
+byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** restart persistence (in-memory `pg_description`). Remaining `COMMENT ON` targets still dropped — `RULE`,
+`COLLATION`, `LANGUAGE`, `DATABASE`, `EXTENSION` — each a sibling slice when its object type becomes dumpable.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

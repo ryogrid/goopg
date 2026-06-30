@@ -98,3 +98,47 @@ func TestParseCommentOnTrigger(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCommentOnPolicy covers `COMMENT ON POLICY <name> ON [schema.]table`,
+// the shape pg_dump's dumpPolicy emits. SubName is the policy name; ObjName is
+// the table the policy is attached to. DU-002 slice 371.
+func TestParseCommentOnPolicy(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantSchema string
+		wantTable  string
+		wantPolicy string
+	}{
+		{"COMMENT ON POLICY p_simple ON foo IS 'c'", "", "foo", "p_simple"},
+		{"COMMENT ON POLICY p_simple ON public.foo IS 'c'", "public", "foo", "p_simple"},
+		{"COMMENT ON POLICY my_pol ON s.widget IS 'c'", "s", "widget", "my_pol"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "policy" {
+			t.Errorf("%q: ObjKind=%q, want policy", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != tc.wantSchema {
+			t.Errorf("%q: ObjName.Schema=%q, want %q", tc.sql, cs.ObjName.Schema, tc.wantSchema)
+		}
+		if cs.ObjName.Name != tc.wantTable {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantTable)
+		}
+		if cs.SubName != tc.wantPolicy {
+			t.Errorf("%q: SubName=%q, want %q", tc.sql, cs.SubName, tc.wantPolicy)
+		}
+	}
+}

@@ -5166,6 +5166,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `COMMENT ON TRIGGER <name> ON <schema>.<table> IS '...'`. trg_biu is the
 		// BEFORE INSERT OR UPDATE trigger on public.trig_t created above (slice 319).
 		"COMMENT ON TRIGGER trg_biu ON public.trig_t IS 'a trigger comment'",
+		// Slice 371: COMMENT ON POLICY must survive the dump. Before this slice,
+		// parseCommentOnTail had no POLICY branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `POLICY <name> ON <table>` (the shape pg_dump itself emits), and
+		// execCommentOn resolves the policy by name on the named table and keys it
+		// under pg_policy (classoid 3256, objsubid 0). pg_dump's dumpPolicy calls
+		// dumpComment with the policy's catalogId (tableoid=3256), finds the
+		// pg_description row, and re-emits
+		// `COMMENT ON POLICY <name> ON <schema>.<table> IS '...'`. p_simple is the
+		// permissive ALL policy on public.pol_t created above (slice 323).
+		"COMMENT ON POLICY p_simple ON public.pol_t IS 'a policy comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -7633,6 +7644,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// under pg_trigger (classoid 2620). pg_dump's dumpTrigger calls dumpComment
 			// with the trigger's catalogId (tableoid=2620) and re-emits the line below.
 			"COMMENT ON TRIGGER trg_biu ON public.trig_t IS 'a trigger comment';",
+			// **Slice 371 (asserted):** COMMENT ON POLICY must round-trip. It was
+			// silently swallowed (parser had no POLICY branch). The parser now
+			// captures `POLICY <name> ON <table>` and execCommentOn keys the comment
+			// under pg_policy (classoid 3256). pg_dump's dumpPolicy calls dumpComment
+			// with the policy's catalogId (tableoid=3256) and re-emits the line below.
+			"COMMENT ON POLICY p_simple ON public.pol_t IS 'a policy comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {
