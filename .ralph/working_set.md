@@ -1,35 +1,33 @@
-Loop #37 COMPLETE: M0119-0004 DU-002 slice 397 — a WITH FUNCTION cast
-(`CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)`) now
-round-trips through real pg_dump 18.3. Closes the slice-395 WITH FUNCTION deferral.
+Loop #38 COMPLETE: M0119-0004 DU-002 slice 398 — CREATE CAST argument/return-type
+validation. Closes the slice-397 deferral (c). goopg now rejects malformed
+`CREATE CAST` the way PG's CreateCast (functioncmds.c) does, with SQLSTATE 42P17.
 
-Root cause: slice 395 parsed the WITH FUNCTION form but DISCARDED the function
-reference, leaving pg_cast.castfunc=0; dumpCast's COERCION_METHOD_FUNCTION arm then
-warned "bogus value in pg_cast.castfunc" and emitted no function clause.
+Landed:
+- internal/executor/operators_ddl.go: new free fns `validateCreateCast(s, routine)`
+  + `castTypeOIDMatch(a,b)`; `execCompatNoop` "cast" case now captures the resolved
+  routine (slice-397 Lookup/LookupByName) and calls validateCreateCast before
+  RegisterCast. Rules: WITH FUNCTION → pronargs(OUT-excluded) 1–3, arg0==source,
+  arg1==integer, arg2==boolean, rettype==target, normal-fn (not procedure/window),
+  not setof; same-type allowed only for a 2+-arg length-coercion fn (all methods).
+  Type identity = catalog.TypeNameToOID OID compare (integer/int4, boolean/bool) with
+  case-insensitive name fallback for user/OID-0 types.
+- internal/executor/create_cast_validate_test.go (NEW): TestValidateCreateCast, 18
+  accept/reject cases asserting message substring + 42P17.
+- docs/design/0110-0001-pg-dump-tap-port.md: slice 398 section.
+- .ralph/deferral_ledger.md: slice-398 row (deferrals a–d below).
 
-Three-layer fix (committed): the only requirement is castfunc == the function's
-pg_proc.oid (dumpCast renders the signature from the function's REAL proargtypes via
-format_function_signature, not from the user's typed arg list).
-- internal/parser/ddl.go parseCreateCastTail: method="f" branch now parses
-  `WITH FUNCTION funcname[(argtypes)]` → new CompatNoopStmt.CastFuncName/CastFuncArgs
-  (ast.go). parseObjectName for name + comma'd parseCastTypeName loop for bare args.
-- internal/executor/operators_ddl.go execCompatNoop "cast": for Method=="f" resolves
-  the routine via Routines().Lookup(CastFuncName, argTypes) (explicit args → exact
-  overload, mirrors COMMENT ON FUNCTION slice 147; LookupByName sole-overload fallback
-  when parens omitted), passes routine.OID as new funcOID param to RegisterCast.
-  Routine.OID == pg_proc virtual-view OID, so func/cast cross-ref matches.
-- internal/catalog/catalog.go: RegisterCast gains funcOID uint32 param stored on
-  Cast.FuncOID. pg_cast virtual row already surfaced FuncOID(castfunc)/Method(castmethod).
-- Tests: internal/parser/create_cast_test.go TestParseCreateCastWithFunction (NEW file);
-  slice-397 fixture+assertion in internal/testport/pgdump_connsetup_test.go.
-- docs/design/0110-0001-pg-dump-tap-port.md slice 397; fix_plan + ledger row.
+Gates: go build ./internal/executor PASS; TestValidateCreateCast PASS;
+TestPort_PgDumpConnectionSetup PASS (5.6s, slices 395–397 still green); pgbench
+smoke runs via pre-commit hook on commit. No codec/planner/query-exec path touched.
 
-Gates: TestPort_PgDumpConnectionSetup PASS (6.9s); parser+catalog units PASS; build
-clean. Verified byte-identical against real pg_dump 18.3 live (/tmp/castfn_pg cluster:
-`CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);`). pgbench smoke
-runs via pre-commit hook. No query-exec/codec/planner path touched.
+Deferred (carry-forward): (a) binary-coercibility modeled as identity only (PG's
+IsBinaryCoercibleWithCast accepts coercible-but-not-identical); (b) unresolved WITH
+FUNCTION ref not rejected (PG errors 42883 "function does not exist") — kept lenient;
+(c) WITHOUT-FUNCTION physical-compat checks (typlen/byval/align, composite/array/
+range/enum) + pseudo/domain WARNINGs not ported; (d) ownership/USAGE-ACL + superuser
+checks not ported (DDL has no role-bearing Context).
 
-Next loop: fresh M0119-0004 pg_dump slice. Candidates: cast/collation/type registry
-restart persistence (the recurring 389–397 deferral — WAL-log CREATE CAST + castfunc
-like CREATE SCHEMA in operators_ddl.go schema arm, replay re-resolving func OID);
-CREATE CONVERSION (needs pg_encoding_to_char builtin + conproc regproc resolution,
-harder — conversion funcs are C-language); CreateCast argument/return-type validation.
+Next loop: fresh M0119-0004 pg_dump slice. Candidates: DROP CAST validation/error
+parity; cast/collation/type registry RESTART PERSISTENCE (the recurring 389–398
+deferral — WAL-log CREATE CAST + castfunc like CREATE SCHEMA, replay re-resolving
+func OID); column-level attacl heap re-sync GRANT slice; CREATE CONVERSION.

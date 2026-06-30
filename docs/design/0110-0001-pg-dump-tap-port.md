@@ -9793,6 +9793,36 @@ The `TestPort_PgDumpConnectionSetup` fixture creates `public.text_as_int(text) R
 (live `/tmp/castfn_pg` cluster). Parser coverage: `TestParseCreateCastWithFunction`. The cast/comment registry remains
 in-memory only (no restart persistence) — the same carry-forward deferral as slices 389–396.
 
+### Slice 398 — **CREATE CAST argument/return-type validation** (closes slice-397 deferral (c))
+
+Slices 395–397 registered whatever `CREATE CAST` the parser captured, with **no** validity checking — goopg would
+silently accept a cast whose `WITH FUNCTION` routine has the wrong argument or return type, where real PG raises
+`ERRCODE_INVALID_OBJECT_DEFINITION` (SQLSTATE 42P17). This slice ports the argument/return-type rules from PG's
+`CreateCast` (`postgres/src/backend/commands/functioncmds.c`) so a malformed `CREATE CAST` is rejected the same way.
+
+The validation is enforced in `internal/executor/operators_ddl.go` by a new free function `validateCreateCast(s, routine)`,
+called from `execCompatNoop`'s `case "cast"` immediately before `RegisterCast`. `routine` is the resolved `WITH FUNCTION`
+routine (the slice-397 `Routines().Lookup` / `LookupByName` result) or `nil` for `WITHOUT FUNCTION` / `WITH INOUT` (and
+for a `WITH FUNCTION` reference that did not resolve — that path keeps slice-397's lenient register-anyway behaviour
+rather than introducing a new false-positive). Mirroring `CreateCast`:
+
+- **WITH FUNCTION** (`routine != nil`): input-argument count (`pronargs`, OUT args excluded) must be 1–3; the first
+  argument must match the source type; a second argument (if present) must be `integer`; a third (if present) must be
+  `boolean`; the return type must match the target type; the routine must be a normal function (not a procedure or
+  window) and must not return a set.
+- **Same-type rule (all methods)**: source and target may be identical only for a length-coercion function (≥ 2 input
+  args). So `CREATE CAST (text AS text) WITHOUT FUNCTION` / `WITH INOUT` / single-arg `WITH FUNCTION` are all rejected,
+  while a 2-arg `WITH FUNCTION f(text, integer)` is allowed.
+
+Type identity is compared by a new `castTypeOIDMatch` helper: built-in aliases (`integer`/`int4`, `boolean`/`bool`, …)
+are resolved to OIDs via `catalog.TypeNameToOID` and compared by OID; user/unknown types (OID 0) fall back to a
+case-insensitive name comparison. goopg does **not** model binary-coercibility beyond identity, so a cast whose
+function argument is binary-coercible-but-not-identical to the source (e.g. a domain over the source) is the one
+remaining gap vs PG's `IsBinaryCoercibleWithCast` — recorded as the slice-398 deferral. The slice-397 `text→integer`
+round-trip fixture continues to pass unchanged (its function is exactly `text_as_int(text) RETURNS integer`). Coverage:
+`TestValidateCreateCast` (`internal/executor/create_cast_validate_test.go`, 18 accept/reject cases asserting message +
+42P17).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

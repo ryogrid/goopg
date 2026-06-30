@@ -12657,6 +12657,70 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	return nil
 }
 
+// castTypeOIDMatch reports whether two type-name spellings denote the same type
+// for CREATE CAST validation. Built-in aliases (integer/int4, boolean/bool, …)
+// are compared by OID via catalog.TypeNameToOID; user/unknown types (OID 0) fall
+// back to a case-insensitive name comparison. goopg does not model
+// binary-coercibility beyond identity, so this is an identity test — PG's
+// IsBinaryCoercibleWithCast additionally accepts an existing binary cast (see
+// the slice-398 deferral ledger row).
+func castTypeOIDMatch(a, b string) bool {
+	if oa, ob := catalog.TypeNameToOID(a), catalog.TypeNameToOID(b); oa != 0 && ob != 0 {
+		return oa == ob
+	}
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// validateCreateCast mirrors the argument/return-type rules PostgreSQL enforces
+// in CreateCast (src/backend/commands/functioncmds.c). routine is the resolved
+// WITH FUNCTION routine, or nil for WITHOUT FUNCTION / WITH INOUT (or a WITH
+// FUNCTION reference that did not resolve, which keeps the slice-397 lenient
+// register-anyway behaviour). All errors use SQLSTATE 42P17
+// (invalid_object_definition), matching PG. DU-002 slice 398.
+func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) error {
+	source, target := s.ArgTypes[0], s.ArgTypes[1]
+	nargs := 0
+	if routine != nil {
+		// pronargs counts input arguments only (IN/INOUT/VARIADIC); OUT args and
+		// RETURNS TABLE columns (stored as trailing OUT args) do not count.
+		inArgs := make([]catalog.Type, 0, len(routine.ArgTypes))
+		for i, t := range routine.ArgTypes {
+			if i < len(routine.ArgModes) && routine.ArgModes[i] == "o" {
+				continue
+			}
+			inArgs = append(inArgs, t)
+		}
+		nargs = len(inArgs)
+		if nargs < 1 || nargs > 3 {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must take one to three arguments"}
+		}
+		if !castTypeOIDMatch(source, inArgs[0].Name) {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "argument of cast function must match or be binary-coercible from source data type"}
+		}
+		if nargs > 1 && catalog.TypeNameToOID(inArgs[1].Name) != catalog.OIDInt4 {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "second argument of cast function must be type integer"}
+		}
+		if nargs > 2 && catalog.TypeNameToOID(inArgs[2].Name) != catalog.OIDBool {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "third argument of cast function must be type boolean"}
+		}
+		if !castTypeOIDMatch(routine.ReturnType.Name, target) {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "return data type of cast function must match or be binary-coercible to target data type"}
+		}
+		if routine.IsProcedure || routine.IsWindow {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must be a normal function"}
+		}
+		if routine.ReturnsSet {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must not return a set"}
+		}
+	}
+	// Allow source and target types to be the same only for length-coercion
+	// functions; PG assumes a multi-arg (>= 2) function does length coercion.
+	if castTypeOIDMatch(source, target) && nargs < 2 {
+		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
+	}
+	return nil
+}
+
 // execCompatNoop handles CompatNoopStmt (GRANT/REVOKE/COMMENT/CREATE RULE/etc).
 // If the statement carries ObjType+ObjName, it registers the object in the compat
 // registry so subsequent DROP statements can verify its existence. M0097-drop_if_exists.
@@ -12805,6 +12869,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// castcontext/castmethod. DU-002 slice 395.
 		if len(s.ArgTypes) == 2 {
 			var funcOID uint32
+			var routine *catalog.Routine
 			if s.CastMethod == "f" {
 				// WITH FUNCTION: resolve the referenced function to its pg_proc
 				// OID so pg_cast.castfunc is non-zero and dumpCast's findFuncByOid
@@ -12822,15 +12887,23 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 							argTypes[i] = catalog.Type{Name: strings.ToLower(a)}
 						}
 						if r, ok := rs.Lookup(s.CastFuncName, argTypes); ok && r != nil {
-							funcOID = r.OID
+							routine = r
 						}
 					}
-					if funcOID == 0 {
+					if routine == nil {
 						if overloads := rs.LookupByName(s.CastFuncName); len(overloads) == 1 {
-							funcOID = overloads[0].OID
+							routine = overloads[0]
 						}
 					}
 				}
+				if routine != nil {
+					funcOID = routine.OID
+				}
+			}
+			// Enforce PG's CREATE CAST argument/return-type rules
+			// (functioncmds.c CreateCast) before registering. DU-002 slice 398.
+			if err := validateCreateCast(s, routine); err != nil {
+				return err
 			}
 			im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)
 		}
