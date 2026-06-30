@@ -3620,6 +3620,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant insert on multigrant_t to mg_role_b: %v", err)
 	}
 
+	// Slice 353 (setup): two grantees granted the SAME privilege on one table still
+	// round-trip as two separate GRANT lines — PostgreSQL never merges grantees into
+	// a single `GRANT … TO a, b;`, even when their privilege sets are byte-identical.
+	// This is the most tempting case for a (wrong) grantee-merge optimization, so it
+	// gets its own guard distinct from slice 352's differing-priv pair. `GRANT SELECT
+	// … TO sg_role_a` then `GRANT SELECT … TO sg_role_b` materializes relacl as
+	// "{postgres=arwdDxtm/postgres,sg_role_a=r/postgres,sg_role_b=r/postgres}" (owner
+	// default first, then one aclitem per grantee). pg_dump's buildACLCommands walks
+	// the aclitem array and emits one `GRANT SELECT ON TABLE … TO <grantee>;` per
+	// non-owner entry, so the dump carries two identical-privilege GRANT lines.
+	// relaclTextLockedFor renders grantees in sort.Strings order; sg_role_a sorts
+	// before sg_role_b, matching PostgreSQL's grant-order array here, so the relacl
+	// text and both GRANT lines are byte-identical to real pg_dump 18.3 (relacl + ACL
+	// lines captured against PG 18.3). Test-only — NO engine change.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.samegrant_t(id int)"); err != nil {
+		t.Fatalf("create table samegrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE sg_role_a"); err != nil {
+		t.Fatalf("create role sg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE sg_role_b"); err != nil {
+		t.Fatalf("create role sg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.samegrant_t TO sg_role_a"); err != nil {
+		t.Fatalf("grant select on samegrant_t to sg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.samegrant_t TO sg_role_b"); err != nil {
+		t.Fatalf("grant select on samegrant_t to sg_role_b: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7702,6 +7732,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, want) {
 				t.Errorf("pg_dump dropped a per-grantee GRANT line: want %q\n  full stdout=%q", want, res.Stdout)
 			}
+		}
+		// **Slice 353 (asserted):** two grantees with the SAME privilege set still
+		// emit two separate GRANT lines — PostgreSQL never merges grantees, even when
+		// their privileges are identical. relacl materializes as
+		// "{postgres=arwdDxtm/postgres,sg_role_a=r/postgres,sg_role_b=r/postgres}";
+		// pg_dump's buildACLCommands fans out one `GRANT SELECT … TO <grantee>;` per
+		// non-owner aclitem, so the dump must carry BOTH SELECT lines. Verified
+		// byte-identical to real pg_dump 18.3.
+		for _, want := range []string{
+			"GRANT SELECT ON TABLE public.samegrant_t TO sg_role_a;",
+			"GRANT SELECT ON TABLE public.samegrant_t TO sg_role_b;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped a same-priv per-grantee GRANT line: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// A grantee-merge regression would collapse the two grantees into one
+		// `GRANT SELECT … TO sg_role_a, sg_role_b;` line; PostgreSQL never does this,
+		// so guard against the merged form explicitly.
+		if notWant := "TO sg_role_a, sg_role_b"; strings.Contains(res.Stdout, notWant) {
+			t.Errorf("pg_dump wrongly merged same-priv grantees into one GRANT line: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

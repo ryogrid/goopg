@@ -2883,6 +2883,29 @@ documentation-only and is exempt from the design-doc requirement.)
       slice 352 PASS; catalog suite PASS; build clean; pgbench smoke = pre-commit. Still
       open under M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`,
       `--create`-only) GRANT projection; extended-protocol commit-time deferral.
+
+      **2026-06-30 (loop #78, design 0119-0004-same-priv-multi-grantee-table-relacl-pgdump,
+      DU-002 slice 353):** same-privilege multi-grantee table round-trip — two grantees
+      granted the SAME privilege on one table still emit two separate GRANT lines.
+      `GRANT SELECT … TO sg_role_a` then `GRANT SELECT … TO sg_role_b` materializes relacl
+      as `{postgres=arwdDxtm/postgres,sg_role_a=r/postgres,sg_role_b=r/postgres}`; pg_dump's
+      `buildACLCommands` fans out one `GRANT SELECT ON TABLE … TO <grantee>;` per non-owner
+      aclitem, so the dump carries BOTH SELECT lines — PostgreSQL never merges grantees into
+      `GRANT … TO a, b;` even when their privilege sets are byte-identical (verified
+      byte-identical vs real pg_dump 18.3 — relacl + ACL lines captured against PG 18.3 in
+      `./postgres/local_install`). The same-priv case is the most tempting target for a
+      (wrong) grantee-merge optimization, distinct from slice 352's differing-priv pair, so
+      this slice adds an explicit negative assertion against the merged form
+      (`TO sg_role_a, sg_role_b`). Test-only — NO engine change: each GRANT records
+      independently under the OID-keyed `tableACLs` store (two grantees with the same priv
+      letter occupy distinct map entries) and `relaclTextLockedFor` renders grantees in
+      `sort.Strings` order (sg_role_a before sg_role_b, matching PG's grant-order array
+      here). Adds the fixture + both-grantee asserts + merged-form negative assert to the
+      cumulative `TestPort_PgDumpConnectionSetup` guard. Gates: connsetup slice 353 PASS;
+      catalog suite PASS; build clean; pgbench smoke = pre-commit. Still open under
+      M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`, `--create`-only)
+      / TYPE-DOMAIN (`pg_type.typacl`, currently unmodelled) GRANT projection;
+      extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
