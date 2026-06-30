@@ -3598,10 +3598,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// buildACLCommands walks the aclitem array and emits a separate
 	// `GRANT <privs> ON TABLE … TO <grantee>;` per non-owner entry, so the dump
 	// carries two GRANT lines — NOT a merged grantee list. goopg's
-	// relaclTextLockedFor renders grantees in sort.Strings order; mg_role_a sorts
-	// before mg_role_b, matching PostgreSQL's grant-order array here, so the relacl
+	// relaclTextLockedFor renders grantees in GRANT order (mg_role_a granted before
+	// mg_role_b), matching PostgreSQL's append-on-grant aclitem array, so the relacl
 	// text and both GRANT lines are byte-identical to real pg_dump 18.3 (relacl +
-	// ACL lines captured). The catalog multi-grantee deterministic-sort is already
+	// ACL lines captured). The catalog multi-grantee grant-order rendering is
 	// unit-covered (TestRelaclText two-grantee case); this slice adds the
 	// end-to-end pg_dump round-trip guarding the per-grantee fan-out.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.multigrant_t(id int)"); err != nil {
@@ -3630,8 +3630,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// default first, then one aclitem per grantee). pg_dump's buildACLCommands walks
 	// the aclitem array and emits one `GRANT SELECT ON TABLE … TO <grantee>;` per
 	// non-owner entry, so the dump carries two identical-privilege GRANT lines.
-	// relaclTextLockedFor renders grantees in sort.Strings order; sg_role_a sorts
-	// before sg_role_b, matching PostgreSQL's grant-order array here, so the relacl
+	// relaclTextLockedFor renders grantees in GRANT order (sg_role_a granted before
+	// sg_role_b), matching PostgreSQL's append-on-grant aclitem array, so the relacl
 	// text and both GRANT lines are byte-identical to real pg_dump 18.3 (relacl + ACL
 	// lines captured against PG 18.3). Test-only — NO engine change.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.samegrant_t(id int)"); err != nil {
@@ -3648,6 +3648,37 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.samegrant_t TO sg_role_b"); err != nil {
 		t.Fatalf("grant select on samegrant_t to sg_role_b: %v", err)
+	}
+
+	// Slice 354 (setup): grantee aclitems are ordered by GRANT ORDER, NOT
+	// alphabetically. Every prior multi-grantee slice (352/353) happened to grant
+	// in alphabetical order, masking a divergence: goopg previously rendered relacl
+	// grantees via sort.Strings, while PostgreSQL's aclupdate APPENDS a brand-new
+	// grantee's aclitem to the end of the array (src/backend/utils/adt/acl.c), so
+	// the array preserves grant order. This fixture grants in REVERSE alphabetical
+	// order — `GRANT SELECT … TO og_role_z` then `… TO og_role_a` — which real PG
+	// 18.3 materializes as
+	// "{postgres=arwdDxtm/postgres,og_role_z=r/postgres,og_role_a=r/postgres}"
+	// (z before a — verified against PG 18.3). The old sort.Strings rendering would
+	// have emitted og_role_a before og_role_z, producing pg_dump GRANT lines in the
+	// WRONG order vs real pg_dump. goopg now tracks per-relation grant order
+	// (catalog.tableACLOrder) and renders grantees in that order, so both the relacl
+	// text and the two GRANT lines round-trip byte-identically. This is the slice
+	// that motivated the grant-order fix (engine change in internal/catalog).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ordergrant_t(id int)"); err != nil {
+		t.Fatalf("create table ordergrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE og_role_z"); err != nil {
+		t.Fatalf("create role og_role_z: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE og_role_a"); err != nil {
+		t.Fatalf("create role og_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_z"); err != nil {
+		t.Fatalf("grant select on ordergrant_t to og_role_z: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_a"); err != nil {
+		t.Fatalf("grant select on ordergrant_t to og_role_a: %v", err)
 	}
 
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
@@ -7753,6 +7784,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// so guard against the merged form explicitly.
 		if notWant := "TO sg_role_a, sg_role_b"; strings.Contains(res.Stdout, notWant) {
 			t.Errorf("pg_dump wrongly merged same-priv grantees into one GRANT line: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
+		}
+		// **Slice 354 (asserted):** grantee GRANT lines emit in GRANT ORDER, not
+		// alphabetically. og_role_z was granted before og_role_a, so PostgreSQL's
+		// relacl is "{postgres=arwdDxtm/postgres,og_role_z=r/postgres,og_role_a=r/
+		// postgres}" (z before a) and pg_dump fans the aclitem array out in array
+		// order → the og_role_z GRANT line precedes the og_role_a one. Both lines
+		// must be present AND in z-before-a order; the pre-fix sort.Strings rendering
+		// would have emitted og_role_a first, diverging from real pg_dump 18.3.
+		ogZ := "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_z;"
+		ogA := "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_a;"
+		ogZi := strings.Index(res.Stdout, ogZ)
+		ogAi := strings.Index(res.Stdout, ogA)
+		if ogZi < 0 || ogAi < 0 {
+			t.Errorf("pg_dump dropped a grant-order GRANT line: og_role_z present=%v og_role_a present=%v\n  full stdout=%q", ogZi >= 0, ogAi >= 0, res.Stdout)
+		} else if ogZi > ogAi {
+			t.Errorf("pg_dump emitted grantees out of grant order: og_role_z (granted first) must precede og_role_a, got z@%d a@%d\n  full stdout=%q", ogZi, ogAi, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

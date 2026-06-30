@@ -2008,6 +2008,20 @@ type InMemory struct {
 	// privilege granted". M0118-0008; grant-option DU-002 slice 332.
 	tableACLs map[uint32]map[string]map[string]bool
 
+	// tableACLOrder records, per relOID, the order in which non-owner grantee
+	// roles first appeared in a GRANT — PostgreSQL appends a new grantee's
+	// aclitem to the end of pg_class.relacl (aclupdate in src/backend/utils/adt/
+	// acl.c modifies an existing aclitem in place but appends a brand-new one),
+	// so the array preserves grant order, NOT alphabetical order. relacl
+	// rendering must follow this list rather than sorting role names, or a
+	// reverse-order GRANT (TO z_role before a_role) would emit pg_dump GRANT
+	// lines in the wrong order vs real PostgreSQL. Each role appears at most once
+	// (first-grant position); a re-GRANT to an existing grantee does not move it.
+	// A role is removed when its privilege set is fully revoked. Keyed by the
+	// lower-cased role name to match tableACLs. The owner ("postgres") is omitted
+	// (it is always rendered first, separately). DU-002 slice 354.
+	tableACLOrder map[uint32][]string
+
 	// roleACLDisplay preserves the original-case spelling of a grantee role
 	// name recorded in tableACLs (which is keyed by the lower-cased name so
 	// privilege lookups stay case-insensitive). Key: lower-cased role name →
@@ -2431,6 +2445,7 @@ func NewInMemory() *InMemory {
 		roles:              make(map[string]uint32),
 		tempNamespaces:     make(map[string]uint32),
 		tableACLs:          make(map[uint32]map[string]map[string]bool),
+		tableACLOrder:      make(map[uint32][]string),
 		roleACLDisplay:     make(map[string]string),
 		relACLEmptied:      make(map[uint32]bool),
 		relACLOwnerRevoked: make(map[uint32]bool),
@@ -8448,8 +8463,31 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 	if privs == nil {
 		privs = make(map[string]bool)
 		byRole[role] = privs
+		// First grant to this role on this relation: record its position so
+		// relacl renders grantees in grant order, matching PostgreSQL's append
+		// semantics. The owner is rendered first separately, so it is never
+		// recorded here. DU-002 slice 354.
+		if role != aclOwnerRole {
+			c.tableACLOrder[relOID] = append(c.tableACLOrder[relOID], role)
+		}
 	}
 	privs[priv] = privs[priv] || withGrantOption
+}
+
+// dropTableACLOrderRole removes role from relOID's grant-order list, keeping the
+// remaining grantees in their original order. Caller must hold c.mu. DU-002
+// slice 354.
+func (c *InMemory) dropTableACLOrderRole(relOID uint32, role string) {
+	order := c.tableACLOrder[relOID]
+	for i, r := range order {
+		if r == role {
+			c.tableACLOrder[relOID] = append(order[:i], order[i+1:]...)
+			break
+		}
+	}
+	if len(c.tableACLOrder[relOID]) == 0 {
+		delete(c.tableACLOrder, relOID)
+	}
 }
 
 // RevokeTablePrivilege removes priv for role on relOID. If the role's privilege
@@ -8479,6 +8517,7 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	delete(privs, priv)
 	if len(privs) == 0 {
 		delete(byRole, role)
+		c.dropTableACLOrderRole(relOID, role)
 		if role == aclOwnerRole {
 			// The owner's implicit default aclitem has been fully revoked. Record
 			// this regardless of whether other grantees survive: an object whose
@@ -8503,6 +8542,7 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 			c.relACLEmptied[relOID] = true
 		}
 		delete(c.tableACLs, relOID)
+		delete(c.tableACLOrder, relOID)
 	}
 }
 
@@ -8563,6 +8603,7 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
+	delete(c.tableACLOrder, relOID)
 	delete(c.relACLEmptied, relOID)
 	delete(c.relACLOwnerRevoked, relOID)
 }
@@ -8748,14 +8789,38 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		}
 		items = append(items, "postgres="+ownerLetters+"/postgres")
 	}
+	// Render grantees in grant order (the order roles first appeared in a GRANT),
+	// matching PostgreSQL's append semantics for pg_class.relacl — NOT alphabetical
+	// order. tableACLOrder is the authoritative sequence; fall back to a sorted
+	// snapshot only if the order list is somehow out of sync with byRole (defensive,
+	// e.g. a role present in byRole but missing from the list), so every grantee is
+	// still emitted deterministically. DU-002 slice 354.
 	roles := make([]string, 0, len(byRole))
-	for role := range byRole {
-		if role == aclOwnerRole {
-			continue // already rendered as the leading owner entry
+	seen := make(map[string]bool, len(byRole))
+	for _, role := range c.tableACLOrder[relOID] {
+		if role == aclOwnerRole || seen[role] {
+			continue
 		}
+		if _, ok := byRole[role]; !ok {
+			continue // stale order entry (role fully revoked)
+		}
+		seen[role] = true
 		roles = append(roles, role)
 	}
-	sort.Strings(roles)
+	// Append any grantees present in byRole but missing from the order list
+	// (defensive — should not happen, but never silently drop a grant). They go
+	// in sorted order for determinism.
+	var missing []string
+	for role := range byRole {
+		if role == aclOwnerRole || seen[role] {
+			continue
+		}
+		missing = append(missing, role)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		roles = append(roles, missing...)
+	}
 	for _, role := range roles {
 		privs := byRole[role]
 		if len(privs) == 0 {
@@ -8973,6 +9038,7 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 	}
 	delete(c.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
+	delete(c.tableACLOrder, tbl.OID)
 	return nil
 }
 
@@ -9005,6 +9071,7 @@ func (c *InMemory) DropSessionTempObjects(owner string) int {
 		}
 		delete(c.tables, k)
 		delete(c.tableACLs, tbl.OID)
+		delete(c.tableACLOrder, tbl.OID)
 	}
 	return len(victims)
 }

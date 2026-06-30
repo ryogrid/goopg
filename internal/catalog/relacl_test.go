@@ -49,10 +49,14 @@ func TestRelaclText(t *testing.T) {
 		t.Fatalf("relacl after multi-priv GRANT = %q; want %q", got, want)
 	}
 
-	// A second grantee sorts deterministically after the first; the owner entry
-	// stays at the head.
+	// A second grantee is appended in GRANT order (not alphabetical): PostgreSQL's
+	// aclupdate appends a brand-new grantee's aclitem to the end of relacl, so
+	// grantee_role (granted first) precedes another_role. Verified against real PG
+	// 18.3: GRANT … TO grantee_role then another_role →
+	// {postgres=…,grantee_role=arw/postgres,another_role=d/postgres}. The owner
+	// entry stays at the head. DU-002 slice 354.
 	c.GrantTablePrivilege(relOID, "another_role", "DELETE")
-	want = "{postgres=arwdDxtm/postgres,another_role=d/postgres,grantee_role=arw/postgres}"
+	want = "{postgres=arwdDxtm/postgres,grantee_role=arw/postgres,another_role=d/postgres}"
 	if got := relaclText(c, relOID); got != want {
 		t.Fatalf("relacl with two grantees = %q; want %q", got, want)
 	}
@@ -117,10 +121,12 @@ func TestRelaclTextPublic(t *testing.T) {
 	}
 
 	// A named grantee and PUBLIC coexist; the named role keeps its name and
-	// PUBLIC stays the empty grantee. Sort order places "" (PUBLIC, stored as
-	// "public") after "named_role".
+	// PUBLIC stays the empty grantee. Grantees render in GRANT order, so PUBLIC
+	// (granted first) precedes named_role. Verified against real PG 18.3: GRANT
+	// SELECT TO PUBLIC then GRANT INSERT TO named_role →
+	// {postgres=…,=r/postgres,named_role=a/postgres}. DU-002 slice 354.
 	c.GrantTablePrivilege(relOID, "named_role", "INSERT")
-	want = "{postgres=arwdDxtm/postgres,named_role=a/postgres,=r/postgres}"
+	want = "{postgres=arwdDxtm/postgres,=r/postgres,named_role=a/postgres}"
 	if got := relaclText(c, relOID); got != want {
 		t.Fatalf("relacl with PUBLIC + named grantee = %q; want %q", got, want)
 	}
@@ -606,13 +612,16 @@ func TestProcACLText(t *testing.T) {
 	}
 
 	// GRANT EXECUTE … TO a grantee seeds the implicit PUBLIC default plus the
-	// grantee; the owner entry is rendered from the owner-default string. The
-	// rendered order is owner first, then grantees sorted (grantee_fn before
-	// the empty PUBLIC grantee). pg_dump parses the array as a set, so this is
-	// equivalent to PostgreSQL's "{=X/postgres,postgres=X/postgres,grantee_fn=X/postgres}".
+	// grantee; the owner entry is rendered from the owner-default string. Grantees
+	// render in GRANT order (PUBLIC granted first, then grantee_fn) with the owner
+	// pulled to the head: "{postgres=X/postgres,=X/postgres,grantee_fn=X/postgres}".
+	// Real PG 18.3 stores "{=X/postgres,postgres=X/postgres,grantee_fn=X/postgres}"
+	// (owner/PUBLIC default ordering differs — a pre-existing owner-first rendering
+	// choice), but grantee_fn lands LAST in both, and pg_dump parses the array as a
+	// set so the round-trip is byte-identical. DU-002 slice 354.
 	c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
 	c.GrantTablePrivilege(procOID, "grantee_fn", "EXECUTE")
-	want := "{postgres=X/postgres,grantee_fn=X/postgres,=X/postgres}"
+	want := "{postgres=X/postgres,=X/postgres,grantee_fn=X/postgres}"
 	if got := c.ProcACLText(procOID); got != want {
 		t.Fatalf("proacl after GRANT EXECUTE TO grantee_fn = %q; want %q", got, want)
 	}
@@ -638,9 +647,11 @@ func TestProcACLGrantWithGrantOption(t *testing.T) {
 
 	// Mirror recordFunctionGrant's WITH-GRANT-OPTION sequence: seed the implicit
 	// PUBLIC default plain, then grant the grantee EXECUTE with the grant option.
+	// Grantees render in GRANT order (PUBLIC seeded first, then grantee_fn) with
+	// the owner at the head. DU-002 slice 354.
 	c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
 	c.GrantTablePrivilegeWithGrantOption(procOID, "grantee_fn", "EXECUTE", true)
-	want := "{postgres=X/postgres,grantee_fn=X*/postgres,=X/postgres}"
+	want := "{postgres=X/postgres,=X/postgres,grantee_fn=X*/postgres}"
 	if got := c.ProcACLText(procOID); got != want {
 		t.Fatalf("proacl after GRANT EXECUTE WITH GRANT OPTION = %q; want %q", got, want)
 	}

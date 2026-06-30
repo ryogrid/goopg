@@ -2906,6 +2906,27 @@ documentation-only and is exempt from the design-doc requirement.)
       M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`, `--create`-only)
       / TYPE-DOMAIN (`pg_type.typacl`, currently unmodelled) GRANT projection;
       extended-protocol commit-time deferral.
+
+      **2026-06-30 (loop #79, design 0119-0004-acl-grant-order-relacl, DU-002 slice 354):**
+      ACL grantee GRANT-ORDER preservation — fixes a real divergence the prior multi-grantee
+      slices masked. goopg rendered `relacl` grantees via `sort.Strings` (alphabetical), but
+      PostgreSQL's `aclupdate` (acl.c) APPENDS a brand-new grantee's aclitem to the end, so
+      the array preserves grant order. They coincide only for alphabetical grant sequences
+      (every prior fixture). A reverse-order grant (`GRANT SELECT … TO og_role_z` then
+      `… TO og_role_a`) exposed it: real PG 18.3 = `{postgres=arwdDxtm/postgres,
+      og_role_z=r/postgres,og_role_a=r/postgres}` (z before a — verified vs
+      `./postgres/local_install`), goopg emitted a-first → wrong pg_dump GRANT-line order.
+      Engine change (internal/catalog): new `tableACLOrder map[uint32][]string` tracks
+      per-relation first-grant order of non-owner grantees; grant appends on first
+      appearance, revoke drops on full revoke, all `delete(tableACLs,oid)` teardown sites
+      mirror it, and `relaclTextLockedFor` iterates that list (sorted-append backstop so no
+      grant is ever silently dropped) instead of sorting. One store + one render core ⇒
+      covers relacl/proacl/nspacl uniformly. Four `relacl_test.go` units corrected (they had
+      encoded the old alphabetical order; real-PG verification proved grant-order correct).
+      New DU-002 slice 354 asserts z-before-a GRANT lines (byte-identical vs real pg_dump
+      18.3). Blast radius nil for alphabetical sequences (byte-unchanged). Gates: catalog +
+      executor + initdb suites PASS; connsetup slice 354 PASS; build clean; pgbench smoke =
+      pre-commit.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
