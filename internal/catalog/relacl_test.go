@@ -107,6 +107,50 @@ func TestRelaclTextRegrantAfterRevokeMovesToEnd(t *testing.T) {
 	}
 }
 
+// TestRelaclTextPartialRevokeKeepsSlot pins the complement of slice 355: a
+// PARTIAL revoke (the grantee retains at least one privilege) must keep that
+// grantee's aclitem in its original grant-order slot — it does NOT move to the
+// end. PostgreSQL's aclupdate (src/backend/utils/adt/acl.c) modifies the
+// existing aclitem in place when bits are removed but the entry survives, so its
+// array index is unchanged; only a full revoke (entry deleted) followed by a
+// re-GRANT appends a fresh aclitem at the end. goopg mirrors this: RevokeTable-
+// Privilege only calls dropTableACLOrderRole when the grantee's privilege set
+// becomes empty, so a partial revoke leaves tableACLOrder untouched. Verified
+// against real PG 18.3: GRANT SELECT,INSERT TO pr_a; GRANT SELECT TO pr_b;
+// REVOKE INSERT FROM pr_a → {postgres=arwdDxtm/postgres,pr_a=r/postgres,
+// pr_b=r/postgres} (pr_a stays ahead of pr_b). DU-002 slice 356.
+func TestRelaclTextPartialRevokeKeepsSlot(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16620
+
+	// pr_a granted first with two privileges; pr_b granted second with one.
+	c.GrantTablePrivilege(relOID, "pr_a", "SELECT")
+	c.GrantTablePrivilege(relOID, "pr_a", "INSERT")
+	c.GrantTablePrivilege(relOID, "pr_b", "SELECT")
+	want := "{postgres=arwdDxtm/postgres,pr_a=ar/postgres,pr_b=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl before revoke = %q; want %q", got, want)
+	}
+
+	// Partial revoke of pr_a (drops INSERT 'a', keeps SELECT 'r'): pr_a's aclitem
+	// is modified in place, so pr_a stays ahead of pr_b — it does NOT migrate to
+	// the end as a full-revoke-then-re-grant would (cf. slice 355).
+	c.RevokeTablePrivilege(relOID, "pr_a", "INSERT")
+	want = "{postgres=arwdDxtm/postgres,pr_a=r/postgres,pr_b=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after partial REVOKE INSERT FROM pr_a = %q; want %q (pr_a keeps its slot)", got, want)
+	}
+
+	// Contrast guard: now FULLY revoke pr_a then re-GRANT — pr_a's slot is
+	// released and the re-grant appends at the end, landing pr_a after pr_b.
+	c.RevokeTablePrivilege(relOID, "pr_a", "SELECT")
+	c.GrantTablePrivilege(relOID, "pr_a", "DELETE")
+	want = "{postgres=arwdDxtm/postgres,pr_b=r/postgres,pr_a=d/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after full revoke + re-grant of pr_a = %q; want %q (pr_a moves to end)", got, want)
+	}
+}
+
 // TestRelaclTextGrantOption pins the grant-option (`*`) projection that lets a
 // GRANT … WITH GRANT OPTION round-trip through pg_dump (DU-002 slice 332).
 // aclitemout renders a grant-option privilege as "<letter>*" (e.g. "r*" for

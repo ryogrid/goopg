@@ -2949,6 +2949,25 @@ documentation-only and is exempt from the design-doc requirement.)
       under M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`,
       `--create`-only) / TYPE-DOMAIN (`typacl`, unmodelled) GRANT projection;
       extended-protocol commit-time deferral.
+      **2026-06-30 (loop #82, design 0119-0004-partial-revoke-keeps-slot-relacl, DU-002
+      slice 356):** Partial-REVOKE-keeps-slot — the complement of slice 355. PostgreSQL's
+      `aclupdate` (acl.c) distinguishes a FULL revoke (privilege count hits zero → aclitem
+      DELETED, later GRANT re-appends at end) from a PARTIAL revoke (bits removed but the
+      entry survives → modified IN PLACE, array index unchanged). A grantee that keeps ≥1
+      privilege after REVOKE stays in its original grant-order slot. Verified vs real PG 18.3
+      (`./postgres/local_install`): `GRANT SELECT,INSERT TO pr_a; GRANT SELECT TO pr_b;
+      REVOKE INSERT FROM pr_a` → `{postgres=arwdDxtm/postgres,pr_a=r/postgres,pr_b=r/postgres}`
+      (pr_a stays AHEAD of pr_b). goopg already mirrors this: `RevokeTablePrivilege` calls
+      `dropTableACLOrderRole` ONLY when the grantee's privilege set empties, so a partial
+      revoke leaves `tableACLOrder` untouched. Test-only — NO engine change. Adds
+      `internal/catalog/relacl_test.go` → `TestRelaclTextPartialRevokeKeepsSlot`:
+      partial-revoke-keeps-slot assert + contrast guard (full revoke + re-grant → pr_a appends
+      after pr_b), pinning partial-vs-full paths together. End-to-end pg_dump ordering already
+      covered by the slice 354/355 connsetup fixtures. Zero blast radius. Gates:
+      `go test ./internal/catalog/ -run TestRelacl` PASS; build clean; pgbench smoke =
+      pre-commit. Still open under M0119-0004: column-level (`attacl`, heap re-sync) /
+      database (`datacl`, `--create`-only) / TYPE-DOMAIN (`typacl`, unmodelled) GRANT
+      projection; extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
