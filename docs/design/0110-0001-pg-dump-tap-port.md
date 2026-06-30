@@ -9478,6 +9478,23 @@ Covered by the new `TestAddDomainCheckNaming` catalog unit pin (disambiguation +
 verified byte-identical against real pg_dump 18.3. Runtime enforcement of *generic* (non-IN) domain CHECK predicates is unchanged
 (still not evaluated at cast time — a pre-existing gap that predates and is orthogonal to this slice).
 
+### Slice 386 — **COMMENT ON SERVER round-trip** (parser + executor gap)
+
+A foreign server (`pg_foreign_server`, classoid 1417) can carry a comment. pg_dump's `dumpForeignServer` calls `dumpComment`
+with the server's `catalogId` (`tableoid=1417`, `objsubid=0`), finds the `pg_description` row, and re-emits
+`COMMENT ON SERVER <name> IS '...'`. goopg's `parseCommentOnTail` had no `SERVER` branch, so the statement fell through to the
+COMMENT fallback and was silently swallowed — the comment never reached `pg_description`, and pg_dump could not re-emit it.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptIdentKeyword("server")` arm that sets `ObjKind="server"` and parses a bare
+  (schema-less) object name — foreign servers are top-level objects, mirroring the shape pg_dump itself emits.
+- **`executor.execCommentOn`** adds a `"server"` case: it resolves the server OID via `catalog.InMemory.ForeignServerOID(name)`
+  and stores the description under `pg_foreign_server` (classoid 1417, objsubid 0) via `SetComment`. A new
+  `oidPgForeignSrv = 1417` classoid constant joins the existing block.
+
+Covered by the new `TestParseCommentOnServer` parser pin plus a `COMMENT ON SERVER goopg_srv IS 'a server comment'`
+fixture/assertion in `TestPort_PgDumpConnectionSetup` (`goopg_srv` is the bare foreign server from slice 376), verified
+byte-identical against real pg_dump 18.3.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

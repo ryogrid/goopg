@@ -3262,6 +3262,15 @@ documentation-only and is exempt from the design-doc requirement.)
       byte-identical vs pg_dump 18.3. Tests new `TestAddDomainCheckNaming` (catalog) + DU-002 slice 385 fixtures in
       `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** runtime enforcement of GENERIC (non-IN) domain CHECK
       predicates still absent (dumped/round-tripped but not evaluated on cast) — pre-existing gap, now spans all checks.
+
+      **2026-07-01 (loop #26, design 0110-0001 slice 386): COMMENT ON SERVER round-trip.** A foreign server
+      (`pg_foreign_server`, classoid 1417) can carry a comment; pg_dump's `dumpForeignServer` re-emits
+      `COMMENT ON SERVER <name> IS '...'`. goopg's `parseCommentOnTail` had no SERVER branch, so the statement was
+      silently swallowed and never reached `pg_description`. Added a `server` arm to `parseCommentOnTail` (bare,
+      schema-less name → `ObjKind="server"`) and a `"server"` case to `execCommentOn` that resolves the server OID via
+      `catalog.InMemory.ForeignServerOID` and stores the comment under classoid 1417 (new `oidPgForeignSrv` constant).
+      Tests new `TestParseCommentOnServer` (parser) + `COMMENT ON SERVER goopg_srv IS 'a server comment'` fixture/assert
+      in `TestPort_PgDumpConnectionSetup` (byte-identical vs pg_dump 18.3). No new deferral.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

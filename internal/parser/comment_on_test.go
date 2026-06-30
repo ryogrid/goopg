@@ -186,3 +186,42 @@ func TestParseCommentOnRule(t *testing.T) {
 		}
 	}
 }
+
+// TestParseCommentOnServer covers COMMENT ON SERVER <name>. Foreign servers are
+// top-level, schema-less objects (pg_foreign_server, classoid 1417); pg_dump's
+// dumpForeignServer re-emits `COMMENT ON SERVER <name> IS '...'`. Before slice
+// 386 the parser had no SERVER branch and silently swallowed the statement.
+func TestParseCommentOnServer(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantName string
+	}{
+		{"COMMENT ON SERVER goopg_srv IS 'a server comment'", "goopg_srv"},
+		{"COMMENT ON SERVER my_server IS 'c'", "my_server"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "server" {
+			t.Errorf("%q: ObjKind=%q, want server", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != "" {
+			t.Errorf("%q: ObjName.Schema=%q, want empty (server is schema-less)", tc.sql, cs.ObjName.Schema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}

@@ -5391,6 +5391,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `COMMENT ON RULE <name> ON <schema>.<table> IS '...'`. r_noins is the
 		// unconditional DO-NOTHING ON INSERT rule on public.rule_t (slice 324).
 		"COMMENT ON RULE r_noins ON public.rule_t IS 'a rule comment'",
+		// Slice 386: COMMENT ON SERVER must survive the dump. Before this slice,
+		// parseCommentOnTail had no SERVER branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `SERVER <name>` (a top-level, schema-less object), and execCommentOn
+		// resolves the foreign server by name (catalog ForeignServerOID) and keys it
+		// under pg_foreign_server (classoid 1417, objsubid 0). pg_dump's
+		// dumpForeignServer calls dumpComment with the server's catalogId
+		// (tableoid=1417), finds the pg_description row, and re-emits
+		// `COMMENT ON SERVER <name> IS '...'`. goopg_srv is the bare foreign server
+		// created in slice 376.
+		"COMMENT ON SERVER goopg_srv IS 'a server comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -7870,6 +7881,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// under pg_rewrite (classoid 2618). pg_dump's dumpRule calls dumpComment
 			// with the rule's catalogId (tableoid=2618) and re-emits the line below.
 			"COMMENT ON RULE r_noins ON public.rule_t IS 'a rule comment';",
+			// **Slice 386 (asserted):** COMMENT ON SERVER must round-trip. It was
+			// silently swallowed (parser had no SERVER branch). The parser now
+			// captures `SERVER <name>` and execCommentOn keys the comment under
+			// pg_foreign_server (classoid 1417). pg_dump's dumpForeignServer calls
+			// dumpComment with the server's catalogId (tableoid=1417) and re-emits
+			// the line below.
+			"COMMENT ON SERVER goopg_srv IS 'a server comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

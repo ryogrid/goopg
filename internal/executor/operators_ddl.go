@@ -13055,6 +13055,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgTrigger      = 2620 // pg_trigger
 		oidPgPolicy       = 3256 // pg_policy
 		oidPgRewrite      = 2618 // pg_rewrite: query-rewrite rules
+		oidPgForeignSrv   = 1417 // pg_foreign_server: foreign servers
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -13096,6 +13097,18 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgNamespace, oid, 0, s.Description)
+	case "server":
+		// Foreign servers live in pg_foreign_server (classoid 1417). pg_dump's
+		// dumpForeignServer keys the comment lookup on the server's catalogId
+		// (tableoid=pg_foreign_server=1417) and objsubid 0, then re-emits
+		// `COMMENT ON SERVER <name> IS '...'`. Without this a COMMENT ON SERVER
+		// was silently swallowed (parser dropped it) and never reached
+		// pg_description, so pg_dump could not re-emit it. DU-002 slice 386.
+		oid := im.ForeignServerOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgForeignSrv, oid, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {
