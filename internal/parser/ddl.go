@@ -1317,19 +1317,22 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 				p.acceptSymbol(")")
 			}
 			// opclass_purpose: FOR SEARCH | FOR ORDER BY any_name | empty.
-			// "search"/"order"/"by" family name after ORDER BY are not in
-			// goopg's keyword map for this bare contextual form beyond
-			// order/by (which ARE reserved keywords elsewhere); a sort-family
-			// ordering operator's amopsortfamily is not resolved/stored here
-			// (deferred, see the ledger) — parsed-and-discarded so it doesn't
-			// break subsequent AS-list entries.
+			// "search" after FOR is not in goopg's keyword map (ORDER/BY ARE
+			// reserved keywords elsewhere). FOR ORDER BY's family name is
+			// captured on the member — resolved against the btree access
+			// method at exec time (get_opfamily_oid(BTREE_AM_OID, ...),
+			// opclasscmds.c: the sort family lookup ALWAYS uses btree,
+			// regardless of the containing opclass's own access method).
 			if p.acceptKeyword(KwFor) {
 				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "search") {
 					p.advance()
 				} else {
 					p.acceptKeyword(KwOrder)
 					p.acceptKeyword(KwBy)
-					p.parseObjectName()
+					if famName, ferr := p.parseObjectName(); ferr == nil {
+						member.SortFamilySchema = famName.Schema
+						member.SortFamilyName = famName.Name
+					}
 				}
 			}
 			stmt.Members = append(stmt.Members, member)

@@ -1891,12 +1891,14 @@ func (s *CreateOpClassStmt) stmtNode() {}
 // signature (assignOperTypes/assignProcTypes, opclasscmds.c) — resolved at
 // exec time, not by the parser. DU-002 (M0119-0004) slice 411.
 type OpClassMember struct {
-	IsFunction bool   // true = FUNCTION entry, false = OPERATOR entry
-	Number     int    // strategy number (OPERATOR) or support number (FUNCTION)
-	Schema     string // operator/function name's schema qualifier, "" if unqualified
-	Name       string // operator symbol or function name
-	LeftType   string // explicit lefttype, "" if unspecified
-	RightType  string // explicit righttype, "" if unspecified (or the operator is unary)
+	IsFunction       bool   // true = FUNCTION entry, false = OPERATOR entry
+	Number           int    // strategy number (OPERATOR) or support number (FUNCTION)
+	Schema           string // operator/function name's schema qualifier, "" if unqualified
+	Name             string // operator symbol or function name
+	LeftType         string // explicit lefttype, "" if unspecified
+	RightType        string // explicit righttype, "" if unspecified (or the operator is unary)
+	SortFamilySchema string // OPERATOR ... FOR ORDER BY family's schema qualifier, "" if unqualified or absent
+	SortFamilyName   string // OPERATOR ... FOR ORDER BY family name, "" if this is a FOR SEARCH (or bare) OPERATOR entry
 }
 
 // DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.

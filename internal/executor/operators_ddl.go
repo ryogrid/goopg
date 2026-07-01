@@ -14768,8 +14768,7 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		}
 	}
 	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
-	o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID)
-	return nil
+	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos())
 }
 
 // registerOpClassMembers resolves each OPERATOR/FUNCTION entry in a CREATE
@@ -14781,8 +14780,15 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 // builtin-operator catalog and no comprehensive builtin-function catalog, so
 // an entry naming an unresolvable builtin is silently dropped, same as every
 // entry's pre-slice-411 behavior (deferred, see the ledger). DU-002
-// (M0119-0004) slice 411.
-func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.OpClassMember, schema string, famOID, classOID, methodOID uint32) {
+// (M0119-0004) slice 411. A FOR ORDER BY entry's sort family is ALWAYS
+// resolved against the btree access method regardless of the class's own
+// method (opclasscmds.c: "sortfamilyOid = get_opfamily_oid(BTREE_AM_OID,
+// item->order_family, false)"), erroring 42704 if it doesn't exist — mirrors
+// get_opfamily_oid's own missing_ok=false ereport; a resolved sort family on
+// a non-ordering-capable method (only gist/spgist set amcanorderbyop=true
+// upstream) errors 42P17, mirroring opclasscmds.c's own
+// ERRCODE_INVALID_OBJECT_DEFINITION check. Slice 414.
+func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.OpClassMember, schema string, famOID, classOID, methodOID uint32, methodName string, pos int) error {
 	for _, m := range members {
 		opSchema := m.Schema
 		if opSchema == "" {
@@ -14800,8 +14806,39 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 		if !ok {
 			continue
 		}
-		im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID)
+		var sortFamilyOID uint32
+		if m.SortFamilyName != "" {
+			sortFamSchema := m.SortFamilySchema
+			if sortFamSchema == "" {
+				// Mirrors execCreateOpClass's own FAMILY-clause default —
+				// goopg has no per-session search_path resolution for these
+				// compat registries, only an explicit-schema-or-public
+				// fallback (same simplification as the class's own FAMILY
+				// clause a few lines up in execCreateOpClass).
+				sortFamSchema = "public"
+			}
+			btreeOID := catalog.AccessMethodOIDByName("btree")
+			fam, found := im.LookupUserOperatorFamily(sortFamSchema, m.SortFamilyName, btreeOID)
+			if !found {
+				return &ExecError{Code: "42704", Pos: pos,
+					Message: fmt.Sprintf("operator family %q does not exist for access method \"btree\"", m.SortFamilyName)}
+			}
+			// Only amcanorderbyop access methods accept ordering operators
+			// (opclasscmds.c's per-member validation, called right after the
+			// sortfamily lookup above). goopg has no per-AM capability-flag
+			// table (amcanorderbyop et al.) — gist/spgist are hand-curated as
+			// the only two AMs setting amcanorderbyop=true in the upstream
+			// tree (gist.c/spgutils.c) since every other in-tree AM handler
+			// leaves it at its zero-value default (false).
+			if methodOID != catalog.AccessMethodOIDByName("gist") && methodOID != catalog.AccessMethodOIDByName("spgist") {
+				return &ExecError{Code: "42P17", Pos: pos,
+					Message: fmt.Sprintf("access method %q does not support ordering operators", methodName)}
+			}
+			sortFamilyOID = fam.OID
+		}
+		im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID, sortFamilyOID)
 	}
+	return nil
 }
 
 // resolveOpClassOperator resolves an OPERATOR entry to its operator OID plus

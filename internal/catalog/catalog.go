@@ -7756,16 +7756,24 @@ func (c *InMemory) registerSystemTables() {
 		}
 		out := make([][]string, 0, len(members))
 		for _, m := range members {
+			// amoppurpose: AMOP_ORDER ('o') when the entry has a resolved
+			// sort family, else AMOP_SEARCH ('s') — mirrors opclasscmds.c's
+			// "oppurpose = OidIsValid(op->sortfamily) ? AMOP_ORDER :
+			// AMOP_SEARCH". DU-002 (M0119-0004) slice 414.
+			purpose := "s"
+			if m.SortFamilyOID != 0 {
+				purpose = "o"
+			}
 			out = append(out, []string{
 				strconv.FormatUint(uint64(m.OID), 10),
 				strconv.FormatUint(uint64(m.FamilyOID), 10),
 				strconv.FormatUint(uint64(m.LeftType), 10),
 				strconv.FormatUint(uint64(m.RightType), 10),
 				strconv.FormatUint(uint64(m.Strategy), 10),
-				"s", // amoppurpose: AMOP_SEARCH — FOR ORDER BY not yet resolved (deferred)
+				purpose,
 				strconv.FormatUint(uint64(m.OperOID), 10),
 				strconv.FormatUint(uint64(m.Method), 10),
-				"0", // amopsortfamily: InvalidOid — no ordering-operator support in this slice
+				strconv.FormatUint(uint64(m.SortFamilyOID), 10),
 			})
 		}
 		return out
@@ -9438,6 +9446,24 @@ func (c *InMemory) dependVirtualRows() [][]string {
 			"0",
 			"i", // deptype = INTERNAL
 		})
+		// A FOR ORDER BY entry also gets a NORMAL dependency on its sort
+		// family (opclasscmds.c storeOperators: "A search operator also
+		// needs a dep on the referenced opfamily"). getDependencies rewrites
+		// this into an edge from the owning opfamily to the sort family for
+		// dump ordering; dumpOpclass's own SQL-text rendering reads
+		// amopsortfamily directly and does not need this row. DU-002
+		// (M0119-0004) slice 414.
+		if m.SortFamilyOID != 0 {
+			rows = append(rows, []string{
+				"2602",
+				strconv.FormatUint(uint64(m.OID), 10),
+				"0",
+				"2753", // refclassid = pg_opfamily
+				strconv.FormatUint(uint64(m.SortFamilyOID), 10),
+				"0",
+				"n", // deptype = NORMAL
+			})
+		}
 	}
 	for _, m := range c.amProcMembers {
 		rows = append(rows, []string{
@@ -11397,20 +11423,22 @@ func (c *InMemory) ListUserOperatorClasses() []*UserOperatorClass {
 
 // AmOpMember models one pg_amop row (an OPERATOR entry attributed to an
 // operator class via CREATE OPERATOR CLASS's own AS list). Matches PG's
-// pg_amop (pg_amop.h); AmopPurpose is always AMOP_SEARCH ('s') and
-// SortFamilyOID always 0 in this slice — FOR ORDER BY sort-family ordering
-// operators are parsed-and-discarded (deferred, see the ledger). ClassOID
-// backs the pg_depend INTERNAL ('i') row dumpOpclass's query joins on
-// (refclassid=pg_opclass, refobjid=ClassOID). DU-002 (M0119-0004) slice 411.
+// pg_amop (pg_amop.h). AmopPurpose is derived from SortFamilyOID (AMOP_ORDER
+// 'o' when non-zero, else AMOP_SEARCH 's' — opclasscmds.c: "oppurpose =
+// OidIsValid(op->sortfamily) ? AMOP_ORDER : AMOP_SEARCH"). ClassOID backs the
+// pg_depend INTERNAL ('i') row dumpOpclass's query joins on
+// (refclassid=pg_opclass, refobjid=ClassOID). DU-002 (M0119-0004) slice 411;
+// SortFamilyOID added slice 414 (FOR ORDER BY).
 type AmOpMember struct {
-	OID       uint32 // pg_amop.oid
-	FamilyOID uint32 // pg_amop.amopfamily
-	LeftType  uint32 // pg_amop.amoplefttype
-	RightType uint32 // pg_amop.amoprighttype
-	Strategy  uint32 // pg_amop.amopstrategy
-	OperOID   uint32 // pg_amop.amopopr
-	Method    uint32 // pg_amop.amopmethod
-	ClassOID  uint32 // owning opclass OID, for the pg_depend INTERNAL row
+	OID           uint32 // pg_amop.oid
+	FamilyOID     uint32 // pg_amop.amopfamily
+	LeftType      uint32 // pg_amop.amoplefttype
+	RightType     uint32 // pg_amop.amoprighttype
+	Strategy      uint32 // pg_amop.amopstrategy
+	OperOID       uint32 // pg_amop.amopopr
+	Method        uint32 // pg_amop.amopmethod
+	ClassOID      uint32 // owning opclass OID, for the pg_depend INTERNAL row
+	SortFamilyOID uint32 // pg_amop.amopsortfamily — FOR ORDER BY family, 0 (InvalidOid) for FOR SEARCH
 }
 
 // AmProcMember models one pg_amproc row (a FUNCTION entry attributed to an
@@ -11429,14 +11457,16 @@ type AmProcMember struct {
 
 // RegisterAmOpMember records one pg_amop row, allocating a stable OID.
 // Appended (not keyed/idempotent) since CREATE OPERATOR CLASS has no
-// re-create/replace form. DU-002 (M0119-0004) slice 411.
-func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, strategy, operOID, method uint32) *AmOpMember {
+// re-create/replace form. sortFamilyOID is 0 (InvalidOid) for a plain FOR
+// SEARCH entry, or the resolved FOR ORDER BY family's OID (slice 414).
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, strategy, operOID, method, sortFamilyOID uint32) *AmOpMember {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	m := &AmOpMember{
 		OID: c.allocOIDLocked(), FamilyOID: familyOID, LeftType: leftType,
 		RightType: rightType, Strategy: strategy, OperOID: operOID,
-		Method: method, ClassOID: classOID,
+		Method: method, ClassOID: classOID, SortFamilyOID: sortFamilyOID,
 	}
 	c.amOpMembers = append(c.amOpMembers, m)
 	return m

@@ -757,3 +757,80 @@ not attempted here.
   opclass, or any non-int8 btree class) will need its own curated addition
   until a generated leaf-package index exists. `FOR ORDER BY` sort-family
   resolution remains open and unexercised by any fixture in scope.
+
+## Loop #40 — `FOR ORDER BY` sort-family resolution (DU-002 slice 414)
+
+Closes the loop #37/#39 "FOR ORDER BY sort-family resolution" deferral.
+`parseCreateOpClassTail`'s `opclass_purpose` branch (`internal/parser/ddl.go`)
+now captures `FOR ORDER BY family_name` onto the member
+(`OpClassMember.SortFamilySchema`/`SortFamilyName`, `internal/parser/ast.go`)
+instead of parsing-and-discarding it.
+
+- `catalog.AmOpMember` gains `SortFamilyOID` (`internal/catalog/catalog.go`);
+  `pg_amop.VirtualRows` derives `amoppurpose` from it (`'o'` AMOP_ORDER when
+  non-zero, else `'s'` AMOP_SEARCH — mirrors opclasscmds.c's `oppurpose =
+  OidIsValid(op->sortfamily) ? AMOP_ORDER : AMOP_SEARCH`) and renders the
+  real `amopsortfamily` OID instead of a hardcoded `"0"`. `dependVirtualRows`
+  emits the extra NORMAL pg_depend row on the sort family that
+  `storeOperators` also records ("A search operator also needs a dep on the
+  referenced opfamily").
+- `registerOpClassMembers` (`internal/executor/operators_ddl.go`) resolves a
+  `FOR ORDER BY` entry's family **against the btree access method
+  unconditionally** — confirmed by re-reading `opclasscmds.c`:
+  `sortfamilyOid = get_opfamily_oid(BTREE_AM_OID, item->order_family,
+  false)` is NOT parameterized by the containing class's own method. Missing
+  family errors 42704 (mirrors `get_opfamily_oid`'s own `missing_ok=false`
+  ereport).
+- **Significant discovery from live-diffing PG 18.3 with this exact
+  fixture:** `FOR ORDER BY` is legal on essentially no access method except
+  GiST/SP-GiST. Real PG's `assignOperTypes` checks `amroutine->amcanorderbyop`
+  right after the sortfamily lookup, and only `gist.c`/`spgutils.c` set that
+  flag `true` in the whole in-tree AM-handler set (btree/hash/gin/brin all
+  leave it at the zero-value default `false`). goopg had no such
+  capability-flag concept at all — a plain-btree `FOR ORDER BY` would
+  previously have silently "succeeded" with wrong catalog contents. New
+  check in `registerOpClassMembers` rejects a resolved-sortfamily member
+  whose containing class's method isn't gist(783)/spgist(4000), erroring
+  `42P17` (`ERRCODE_INVALID_OBJECT_DEFINITION`) with PG's own exact message
+  text (`access method "%s" does not support ordering operators`).
+- **Verified byte-identical against a freshly-built, live PG 18.3 instance**
+  (`postgres/local_install`) for both paths:
+  - Accept path: a `USING gist` class, `OPERATOR 1 ... FOR ORDER BY
+    sort_family` — raw `pg_amop` row's `amoppurpose`/`amopsortfamily`/
+    `amoplefttype`/`amoprighttype`/`amopstrategy`/`amopopr`/`amopmethod`
+    columns byte-identical between engines.
+  - Reject path: `USING btree` + `FOR ORDER BY` → identical `ERROR: access
+    method "btree" does not support ordering operators` text on both
+    engines.
+- Tests: `TestParseCreateOperatorClassForOrderBy` (parser);
+  `TestCreateOperatorClassForOrderBySortFamily`/
+  `TestCreateOperatorClassForOrderByUnknownFamilyErrors`/
+  `TestCreateOperatorClassForOrderByRejectsNonOrderingAM` (executor).
+- Gates: `go build ./...`/`go vet` clean; `internal/catalog`+
+  `internal/executor`+`internal/parser`+`internal/planner`+`internal/server`
+  suites PASS; `TestPort_PgDumpConnectionSetup` PASS; live PG 18.3 diff
+  above; gofmt drift confirmed pre-existing via `git stash`; TPC-H spotcheck
+  Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+- **New, larger discovery, deferred (ledger row appended):** real PG's
+  `gistadjustmembers` (the only `amadjustmembers` override in the in-tree AM
+  set) forces EVERY GiST opclass OPERATOR member — not just `FOR ORDER BY`
+  ones — to a *soft* (`DEPENDENCY_AUTO`, deptype `'a'`) dependency on the
+  containing OPFAMILY, never a *hard* (`DEPENDENCY_INTERNAL`, deptype `'i'`)
+  dependency on the OPCLASS. Confirmed via the live PG 18.3 diff: real
+  `pg_depend` shows `refclassid=pg_opfamily` (deptype `'a'`) for both the
+  operator→op_family and operator→sort_family edges, never
+  `refclassid=pg_opclass`. This means `dumpOpclass`'s own OPERATOR query
+  (filters `refclassid = pg_opclass`) can never find a GiST/SP-GiST
+  opclass's AS-list OPERATOR entries in real PG — they're dumped via a
+  separate `ALTER OPERATOR FAMILY ... ADD OPERATOR ...` statement instead
+  (`dumpOpfamily`'s loose-member query, not implemented — loop #34's still-open
+  resume point (a)). goopg's `registerOpClassMembers`/`dependVirtualRows`
+  unconditionally emit the hard opclass-level `'n'`+`'i'` pair for every AM
+  (verified correct for btree in loop #37/#39) — for GiST/SP-GiST this is a
+  confirmed, pre-existing divergence (not new to this loop — it already
+  applied to any GiST/SP-GiST opclass member, `FOR ORDER BY` or not; this
+  loop's diffing is simply what surfaced it, since `FOR ORDER BY` is the one
+  clause that forces a GiST/SP-GiST fixture into existence). See the ledger
+  row for the full resume plan (a per-AM `amadjustmembers`-equivalent policy
+  table, plus the still-separately-scoped `ALTER OPERATOR FAMILY ... ADD`
+  statement).

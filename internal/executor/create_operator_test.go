@@ -795,3 +795,125 @@ func TestDropOperatorClassRemovesMembers(t *testing.T) {
 		t.Fatalf("pg_amop VirtualRows = %v, want empty after DROP OPERATOR CLASS", rows)
 	}
 }
+
+// TestCreateOperatorClassForOrderBySortFamily verifies an OPERATOR ... FOR
+// ORDER BY family entry resolves the sort family (against the btree access
+// method regardless of the class's own method — opclasscmds.c:
+// "get_opfamily_oid(BTREE_AM_OID, item->order_family, false)"), sets
+// amoppurpose to AMOP_ORDER ('o') instead of the default AMOP_SEARCH ('s'),
+// records amopsortfamily as the SORT family's own OID (distinct from the
+// class's own containing family), and adds the extra NORMAL pg_depend row on
+// the sort family (storeOperators, opclasscmds.c: "A search operator also
+// needs a dep on the referenced opfamily"). The class itself must use gist
+// (or spgist) — real PG's amcanorderbyop check (verified live against PG
+// 18.3: plain btree rejects FOR ORDER BY with "access method \"btree\" does
+// not support ordering operators"; gist accepts it). Closes the loop #37/#39
+// ledger rows' "FOR ORDER BY sort-family resolution" deferral. DU-002
+// (M0119-0004) slice 414.
+func TestCreateOperatorClassForOrderBySortFamily(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING gist`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY op_family: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.sort_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY sort_family: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE int4 USING gist FAMILY public.op_family AS
+		OPERATOR 1 ~=~ (int4, int4) FOR ORDER BY public.sort_family`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	famRows := pgOpfamilyVirtualRows(t, im)
+	if len(famRows) != 2 {
+		t.Fatalf("pg_opfamily rows = %d, want 2 (op_family, sort_family)", len(famRows))
+	}
+	gistOID := catalog.AccessMethodOIDByName("gist")
+	btreeOID := catalog.AccessMethodOIDByName("btree")
+	opFam, ok := im.LookupUserOperatorFamily("public", "op_family", gistOID)
+	if !ok {
+		t.Fatal("op_family not registered")
+	}
+	sortFam, ok := im.LookupUserOperatorFamily("public", "sort_family", btreeOID)
+	if !ok {
+		t.Fatal("sort_family not registered")
+	}
+	if opFam.OID == sortFam.OID {
+		t.Fatalf("op_family and sort_family OIDs collided: %d", opFam.OID)
+	}
+
+	amopRows := pgAmopVirtualRows(t, im)
+	if len(amopRows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %d rows, want 1: %v", len(amopRows), amopRows)
+	}
+	// oid, amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr, amopmethod, amopsortfamily
+	amop := amopRows[0]
+	if amop[1] != strconv.FormatUint(uint64(opFam.OID), 10) {
+		t.Errorf("amopfamily = %q, want %q (op_family, NOT sort_family)", amop[1], strconv.FormatUint(uint64(opFam.OID), 10))
+	}
+	if amop[5] != "o" {
+		t.Errorf("amoppurpose = %q, want \"o\" (AMOP_ORDER)", amop[5])
+	}
+	if amop[8] != strconv.FormatUint(uint64(sortFam.OID), 10) {
+		t.Errorf("amopsortfamily = %q, want %q (sort_family's OID)", amop[8], strconv.FormatUint(uint64(sortFam.OID), 10))
+	}
+
+	dependRows := pgDependVirtualRows(t, im)
+	wantKey := "2602|" + amop[0] + "|2753|" + strconv.FormatUint(uint64(sortFam.OID), 10) + "|n"
+	found := false
+	for _, r := range dependRows {
+		if r[0]+"|"+r[1]+"|"+r[3]+"|"+r[4]+"|"+r[6] == wantKey {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("missing expected pg_depend row on the sort family %q; got %v", wantKey, dependRows)
+	}
+}
+
+// TestCreateOperatorClassForOrderByUnknownFamilyErrors mirrors
+// TestCreateOperatorClassUnknownFamily's error shape for the sort-family
+// case: get_opfamily_oid's own missing_ok=false ereport
+// (ERRCODE_UNDEFINED_OBJECT). DU-002 (M0119-0004) slice 414.
+func TestCreateOperatorClassForOrderByUnknownFamilyErrors(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE int4 USING btree AS
+		OPERATOR 1 ~=~ (int4, int4) FOR ORDER BY public.no_such_family`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}
+
+// TestCreateOperatorClassForOrderByRejectsNonOrderingAM verifies a FOR ORDER
+// BY entry on a class whose access method doesn't support ordering
+// operators (amcanorderbyop=false — every in-tree AM except gist/spgist)
+// errors 42P17 (ERRCODE_INVALID_OBJECT_DEFINITION), matching a live PG 18.3
+// diff of `CREATE OPERATOR CLASS ... USING btree AS OPERATOR 1 ... FOR
+// ORDER BY ...`: "access method \"btree\" does not support ordering
+// operators". DU-002 (M0119-0004) slice 414.
+func TestCreateOperatorClassForOrderByRejectsNonOrderingAM(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.sort_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY sort_family: %v", err)
+	}
+	err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE int4 USING btree AS
+		OPERATOR 1 ~=~ (int4, int4) FOR ORDER BY public.sort_family`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42P17" {
+		t.Fatalf("error = %v, want ExecError{Code: 42P17}", err)
+	}
+}

@@ -462,6 +462,38 @@ func TestParseCreateOperatorClassDefaultKeyword(t *testing.T) {
 	}
 }
 
+// TestParseCreateOperatorClassForOrderBy verifies an OPERATOR entry's
+// opclass_purpose "FOR ORDER BY family_name" clause is captured on the
+// member (SortFamilySchema/SortFamilyName) instead of parsed-and-discarded
+// — closes the loop #37/#39 ledger rows' "FOR ORDER BY" deferral. DU-002
+// (M0119-0004) slice 414.
+func TestParseCreateOperatorClassForOrderBy(t *testing.T) {
+	stmts, err := Parse(`CREATE OPERATOR CLASS my_opclass FOR TYPE int4 USING btree AS
+		OPERATOR 1 ~=~ (int4, int4) FOR ORDER BY dump_test.sort_family,
+		OPERATOR 2 = (int4, int4) FOR SEARCH,
+		OPERATOR 3 <> (int4, int4)`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	oc, ok := stmts[0].(*CreateOpClassStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateOpClassStmt, got %T", stmts[0])
+	}
+	if len(oc.Members) != 3 {
+		t.Fatalf("Members = %d, want 3", len(oc.Members))
+	}
+	m0 := oc.Members[0]
+	if m0.SortFamilySchema != "dump_test" || m0.SortFamilyName != "sort_family" {
+		t.Errorf("Members[0] SortFamilySchema/SortFamilyName = %q/%q, want dump_test/sort_family", m0.SortFamilySchema, m0.SortFamilyName)
+	}
+	if m1 := oc.Members[1]; m1.SortFamilyName != "" {
+		t.Errorf("Members[1] (FOR SEARCH) SortFamilyName = %q, want \"\"", m1.SortFamilyName)
+	}
+	if m2 := oc.Members[2]; m2.SortFamilyName != "" {
+		t.Errorf("Members[2] (bare, no opclass_purpose) SortFamilyName = %q, want \"\"", m2.SortFamilyName)
+	}
+}
+
 // TestParseCreateOperatorUnary verifies a LEFTARG-omitted (prefix/unary)
 // CREATE OPERATOR parses with an empty ArgTypes[0], matching PG's grammar
 // (RIGHTARG is always required — postfix operators were removed in PG14).
