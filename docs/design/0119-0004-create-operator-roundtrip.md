@@ -4,7 +4,8 @@
 - **Status:** accepted
 - **Loop:** #30 (slice 406, verifying/landing work started by a prior
   backgrounded loop); #32 (slice 407, COMMUTATOR/NEGATOR/RESTRICT/JOIN/
-  MERGES/HASHES + unary operators)
+  MERGES/HASHES + unary operators); #33 (`ALTER OPERATOR ... SET (...)`,
+  closing the slice-407 ledger follow-up)
 
 ## Problem
 
@@ -150,11 +151,79 @@ only; LEFTARG/RIGHTARG spelled out via `format_type`, e.g. `int` →
   failed `gofmt -l` before this change); TPC-H spotcheck Q12=2/Q13=33 PASS;
   pgbench smoke = pre-commit hook.
 
+## Loop #33: `ALTER OPERATOR name (left_type, right_type) SET (...)`
+
+Closes the slice-407 ledger follow-up: PG's post-creation attribute-edit form
+(`AlterOperator`, `operatorcmds.c`) was previously swallowed as a pure no-op
+by the generic `ALTER VIEW/SCHEMA/COLLATION/.../OPERATOR/...` compat-stub
+loop in `parseAlter` — a user-written `ALTER OPERATOR foo(int,int) SET
+(RESTRICT = ...)` silently did nothing instead of actually changing the
+operator.
+
+- **Parser** (`internal/parser/ddl.go`'s `parseAlter`): a new branch checked
+  *before* the generic stub loop. `ALTER OPERATOR CLASS|FAMILY ...` (a
+  different object type entirely) and any `ALTER OPERATOR name(...)` tail
+  that is not `SET ( ... )` — `OWNER TO`, `SET SCHEMA`, or anything else —
+  fall back to the same consume-and-succeed no-op the stub gave the whole
+  statement before (goopg does not track per-operator ownership/namespace
+  *changes at ALTER time*, only at CREATE via `UserOperator.Owner`/
+  `NamespaceOID`), so nothing that used to parse now errors. Only the
+  `SET ( option = value, ... )` def-list form produces the new
+  `AlterOperatorSetStmt` AST node (`ast.go`), reusing `parseOperatorRefName`
+  for COMMUTATOR/NEGATOR and the same bare/`=value` MERGES/HASHES scanning
+  CREATE OPERATOR already has. LEFTARG/RIGHTARG/FUNCTION/PROCEDURE inside the
+  SET list raise a syntax error (immutable after CREATE, matching
+  `AlterOperator`'s own rejection).
+- **Planner** (`internal/planner/planner.go`): `AlterOperatorSetStmt` added
+  to the DDL-passthrough case list (a statement type the planner didn't know
+  about would otherwise raise `0A000 unsupported statement type`).
+- **Executor** (`internal/executor/operators_ddl.go`): new
+  `execAlterOperatorSet` looks up the existing `UserOperator` (42883 if not
+  found) and mirrors `AlterOperator`'s per-attribute rules exactly:
+  - RESTRICT/JOIN may be changed freely, including cleared via `= NONE`.
+  - COMMUTATOR/NEGATOR/MERGES/HASHES may only be **set** if not already set;
+    restating the identical value is a no-op (allowed), a genuinely
+    different value is rejected (42P13 "operator attribute ... cannot be
+    changed if it has already been set"). Self-negation is rejected the same
+    way CREATE OPERATOR rejects it.
+  - The CREATE OPERATOR case's inline `resolveFn`/`resolveOther` closures
+    (RESTRICT/JOIN function resolution; COMMUTATOR/NEGATOR two-pass
+    forward-reference/shell resolution and back-patching) were extracted
+    into shared `(*ddlOp).resolveOperatorSupportFunc` /
+    `(*ddlOp).resolveOperatorRef` methods so CREATE and ALTER share one
+    resolution path instead of duplicating the logic (a repeat divergence
+    would be exactly the "sibling paths must agree" failure mode this
+    project has hit before).
+- New builtins `eqsel`/`eqjoinsel`/`neqjoinsel` (OIDs 101/105/106) curated in
+  `builtinProcsByName` — PG's own `=` operator's `oprrest`/`oprjoin` — so a
+  RESTRICT=/JOIN= test fixture resolves to a real OID instead of silently 0
+  (same "extend as new fixtures need more builtins" pattern as `int4eq`).
+
+### Scope / limitations
+
+No `pg_dump` TAP fixture exercises this statement — `pg_dump` never emits
+`ALTER OPERATOR ... SET (...)`; every attribute a dump needs is captured by
+the forward-reference shell mechanism already in `CREATE OPERATOR` itself.
+This is real DDL semantics for a user/migration script to type directly, not
+a dump-parity slice. Ownership is not enforced (no `object_ownercheck`
+equivalent — goopg's DDL surface has no real per-session role identity,
+matching every other operator DDL arm).
+
+### Gates
+
+`TestParseAlterOperatorSet`/`TestParseAlterOperatorSetRestrictNone`/
+`TestParseAlterOperatorSetImmutableAttr`/`TestParseAlterOperatorOwnerToIsNoop`
+(parser, `op_compat_test.go`); `TestAlterOperatorSetRestrictJoin`/
+`TestAlterOperatorSetCommutatorNegatorOnceOnly`/
+`TestAlterOperatorSetMergesHashesOnceOnly`/
+`TestAlterOperatorSetMissingOperator` (executor, `create_operator_test.go`).
+`go build ./...` clean; `go vet` parser/catalog/executor/planner clean;
+`internal/parser`+`internal/catalog`+`internal/executor`+`internal/planner`
+suites PASS; `gofmt -l` flags only the same pre-existing files as slice 407
+(verified via `git stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke
+= pre-commit hook.
+
 ## Still open under M0119-0004
 
 `regoper`/`regoperator` OID→name resolution (no column is typed `regoper`
-yet, so no observable gap); `ALTER OPERATOR name (...) SET (RESTRICT = ...,
-JOIN = ...)` to attach RESTRICT/JOIN after the fact (no fixture exercises
-this; `ALTER OPERATOR` support today is limited to the generic `OWNER TO`
-compat path) — see the ledger row appended for slice 407; further pg_dump
-002–010 catalog parity slices.
+yet, so no observable gap); further pg_dump 002–010 catalog parity slices.

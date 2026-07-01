@@ -199,3 +199,135 @@ func pgOperatorVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
 	}
 	return tbl.VirtualRows()
 }
+
+// TestAlterOperatorSetRestrictJoin verifies RESTRICT/JOIN can be changed
+// freely after CREATE (unlike COMMUTATOR/NEGATOR/MERGES/HASHES), including
+// clearing via `= NONE`, mirroring AlterOperator (operatorcmds.c).
+func TestAlterOperatorSetRestrictJoin(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.=== (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	op, ok := im.LookupUserOperator("public", "===", "int4", "int4")
+	if !ok {
+		t.Fatal("=== not registered")
+	}
+	if op.RestrictOID != 0 || op.JoinOID != 0 {
+		t.Fatalf("expected unset RESTRICT/JOIN before ALTER, got %d/%d", op.RestrictOID, op.JoinOID)
+	}
+
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (RESTRICT = eqsel, JOIN = eqjoinsel)`); err != nil {
+		t.Fatalf("ALTER OPERATOR SET: %v", err)
+	}
+	if op.RestrictOID == 0 || op.JoinOID == 0 {
+		t.Fatalf("expected RESTRICT/JOIN set after ALTER, got %d/%d", op.RestrictOID, op.JoinOID)
+	}
+
+	// Changing to a different estimator is allowed (unlike commutator/negator).
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (JOIN = neqjoinsel)`); err != nil {
+		t.Fatalf("ALTER OPERATOR SET (change join): %v", err)
+	}
+
+	// Clearing via NONE.
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (RESTRICT = NONE)`); err != nil {
+		t.Fatalf("ALTER OPERATOR SET (clear restrict): %v", err)
+	}
+	if op.RestrictOID != 0 {
+		t.Errorf("RestrictOID = %d after SET NONE, want 0", op.RestrictOID)
+	}
+}
+
+// TestAlterOperatorSetCommutatorNegatorOnceOnly verifies COMMUTATOR/NEGATOR
+// can be set once via ALTER (with back-patching, mirroring CREATE OPERATOR),
+// a no-op restatement of the same value is allowed, but changing to a
+// different value is rejected — matching AlterOperator's "cannot be changed
+// if it has already been set" behaviour.
+func TestAlterOperatorSetCommutatorNegatorOnceOnly(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.=== (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR ===: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.!== (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR !==: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	eqOp, _ := im.LookupUserOperator("public", "===", "int4", "int4")
+	neOp, _ := im.LookupUserOperator("public", "!==", "int4", "int4")
+
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (NEGATOR = public.!==)`); err != nil {
+		t.Fatalf("ALTER OPERATOR SET NEGATOR: %v", err)
+	}
+	if eqOp.NegatorOID != neOp.OID {
+		t.Errorf("===.NegatorOID = %d, want %d", eqOp.NegatorOID, neOp.OID)
+	}
+	// Back-patched onto the other side.
+	if neOp.NegatorOID != eqOp.OID {
+		t.Errorf("!==.NegatorOID = %d, want back-patched %d", neOp.NegatorOID, eqOp.OID)
+	}
+
+	// No-op restatement of the same negator succeeds.
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (NEGATOR = public.!==)`); err != nil {
+		t.Errorf("restating same NEGATOR should succeed, got: %v", err)
+	}
+
+	// Changing to a different negator is rejected.
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.<<>> (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR <<>>: %v", err)
+	}
+	err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (NEGATOR = public.<<>>)`)
+	if err == nil || !strings.Contains(err.Error(), `cannot be changed if it has already been set`) {
+		t.Fatalf("error = %v, want 'cannot be changed if it has already been set'", err)
+	}
+
+	// Self-negation is always rejected, even via ALTER.
+	err = runDDL(t, ctx, `ALTER OPERATOR public.<<>> (int4, int4) SET (NEGATOR = public.<<>>)`)
+	if err == nil || !strings.Contains(err.Error(), "cannot be its own negator") {
+		t.Fatalf("error = %v, want 'cannot be its own negator'", err)
+	}
+}
+
+// TestAlterOperatorSetMergesHashesOnceOnly mirrors the commutator/negator
+// once-only rule for the MERGES/HASHES flags: turning one on that was off is
+// fine, restating the same value is a no-op, but turning one off that was on
+// is rejected.
+func TestAlterOperatorSetMergesHashesOnceOnly(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.=== (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	op, _ := im.LookupUserOperator("public", "===", "int4", "int4")
+
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (MERGES, HASHES)`); err != nil {
+		t.Fatalf("ALTER OPERATOR SET MERGES,HASHES: %v", err)
+	}
+	if !op.CanMerge || !op.CanHash {
+		t.Fatalf("CanMerge=%v CanHash=%v, want both true", op.CanMerge, op.CanHash)
+	}
+
+	if err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (MERGES = true)`); err != nil {
+		t.Errorf("restating MERGES=true should succeed, got: %v", err)
+	}
+
+	err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (HASHES = false)`)
+	if err == nil || !strings.Contains(err.Error(), `cannot be changed if it has already been set`) {
+		t.Fatalf("error = %v, want 'cannot be changed if it has already been set'", err)
+	}
+}
+
+// TestAlterOperatorSetImmutableAndMissing verifies LEFTARG/RIGHTARG/FUNCTION/
+// PROCEDURE are already rejected at parse time (tested in the parser suite),
+// and that ALTER OPERATOR on a non-existent operator raises 42883.
+func TestAlterOperatorSetMissingOperator(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	err := runDDL(t, ctx, `ALTER OPERATOR public.=== (int4, int4) SET (RESTRICT = eqsel)`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42883" {
+		t.Fatalf("error = %v, want ExecError{Code: 42883}", err)
+	}
+}

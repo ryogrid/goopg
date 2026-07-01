@@ -141,6 +141,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterAggregateOwner(s)
 	case *parser.AlterCollationStmt:
 		return nil, o.execAlterCollation(s)
+	case *parser.AlterOperatorSetStmt:
+		return nil, o.execAlterOperatorSet(s)
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
 	case *parser.CreateExtensionStmt:
@@ -13031,6 +13033,178 @@ func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) erro
 	return nil
 }
 
+// resolveOperatorSupportFunc resolves a CREATE/ALTER OPERATOR RESTRICT=/JOIN=
+// selectivity estimator function reference to a pg_proc OID exactly like the
+// FUNCTION= clause: first the user routine registry, then the hand-curated
+// builtin table for an unqualified/pg_catalog-qualified name. Returns 0 for a
+// zero-value reference (no clause given / explicit NONE) or no match — the
+// caller decides whether that means "leave the estimator unset/cleared" or
+// "function does not exist". M0119-0004 (DU-002).
+func (o *ddlOp) resolveOperatorSupportFunc(ref parser.ObjectName) uint32 {
+	if ref.Name == "" {
+		return 0
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return 0
+	}
+	if rs := im.Routines(); rs != nil {
+		if overloads := rs.LookupByName(ref); len(overloads) == 1 {
+			return overloads[0].OID
+		}
+	}
+	if ref.Schema == "" || strings.EqualFold(ref.Schema, "pg_catalog") {
+		if b, ok := catalog.LookupBuiltinProc(ref.Name); ok {
+			return b.OID
+		}
+	}
+	return 0
+}
+
+// resolveOperatorRef resolves a COMMUTATOR/NEGATOR operand reference during
+// CREATE/ALTER OPERATOR, mirroring PG's get_other_operator/OperatorShellMake
+// (pg_operator.c): the referenced operator may already exist (real or a
+// forward-reference shell), may name the operator being defined/altered
+// itself (selfLink), or else a brand-new shell is minted purely to reserve a
+// stable OID for later back-patching. ownLeft/ownRight are the defining
+// operator's own argument types (used only for the self-link check — the
+// caller passes them already reversed for a COMMUTATOR lookup).
+// M0119-0004 (DU-002).
+func (o *ddlOp) resolveOperatorRef(ref parser.ObjectName, otherLeft, otherRight, ownSchema, ownName, ownLeft, ownRight string, ownNsOID uint32) (oid uint32, selfLink bool) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return 0, false
+	}
+	otherSchema := ref.Schema
+	if otherSchema == "" {
+		otherSchema = ownSchema
+	}
+	if existing, ok := im.LookupUserOperator(otherSchema, ref.Name, otherLeft, otherRight); ok {
+		return existing.OID, false
+	}
+	if strings.EqualFold(otherSchema, ownSchema) && ref.Name == ownName &&
+		otherLeft == ownLeft && otherRight == ownRight {
+		return 0, true
+	}
+	otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema)
+	if otherNsOID == 0 {
+		otherNsOID = ownNsOID
+	}
+	shell := im.EnsureUserOperatorShell(otherSchema, ref.Name, otherLeft, otherRight, otherNsOID)
+	return shell.OID, false
+}
+
+// execAlterOperatorSet handles `ALTER OPERATOR name (left_type, right_type)
+// SET (option = value, ...)` — PG's post-creation attribute-edit form
+// (AlterOperator, operatorcmds.c). Mirrors that function's semantics:
+// RESTRICT/JOIN may be changed freely (or cleared via NONE); COMMUTATOR/
+// NEGATOR/MERGES/HASHES may only be set if not already set (a no-op
+// restatement of the same value is allowed, matching PG's "allow no-op
+// updates" comment). M0119-0004 (DU-002), closes the slice-407 ledger
+// follow-up (`0119-0004-create-operator-roundtrip.md`).
+func (o *ddlOp) execAlterOperatorSet(s *parser.AlterOperatorSetStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	op, found := im.LookupUserOperator(schema, s.Name.Name, s.LeftType, s.RightType)
+	if !found {
+		sig := s.Name.Name + "(" + operatorArgOrNone(s.LeftType) + "," + operatorArgOrNone(s.RightType) + ")"
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator does not exist: %s", sig)}
+	}
+	invalidDef := func(attr string) *ExecError {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator attribute %q cannot be changed if it has already been set", attr)}
+	}
+
+	if s.RestrictSet {
+		if s.Restrict.Name == "" {
+			op.RestrictOID = 0
+		} else {
+			oid := o.resolveOperatorSupportFunc(s.Restrict)
+			if oid == 0 {
+				return &ExecError{Code: "42883", Pos: s.Pos(),
+					Message: fmt.Sprintf("function %s does not exist", s.Restrict.Name)}
+			}
+			op.RestrictOID = oid
+		}
+	}
+	if s.JoinSet {
+		if s.Join.Name == "" {
+			op.JoinOID = 0
+		} else {
+			oid := o.resolveOperatorSupportFunc(s.Join)
+			if oid == 0 {
+				return &ExecError{Code: "42883", Pos: s.Pos(),
+					Message: fmt.Sprintf("function %s does not exist", s.Join.Name)}
+			}
+			op.JoinOID = oid
+		}
+	}
+	if s.CommutatorSet {
+		if s.Commutator.Name == "" {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "invalid COMMUTATOR specification"}
+		}
+		// The commutator has reversed argument types.
+		otherOID, selfLink := o.resolveOperatorRef(s.Commutator, s.RightType, s.LeftType, schema, s.Name.Name, s.LeftType, s.RightType, op.NamespaceOIDOrDefault())
+		if selfLink {
+			otherOID = op.OID
+		}
+		if op.CommutatorOID != 0 && op.CommutatorOID != otherOID {
+			return invalidDef("commutator")
+		}
+		op.CommutatorOID = otherOID
+		if !selfLink {
+			if other := im.LookupUserOperatorByOID(otherOID); other != nil && other.CommutatorOID == 0 {
+				other.CommutatorOID = op.OID
+			}
+		}
+	}
+	if s.NegatorSet {
+		if s.Negator.Name == "" {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "invalid NEGATOR specification"}
+		}
+		otherOID, selfLink := o.resolveOperatorRef(s.Negator, s.LeftType, s.RightType, schema, s.Name.Name, s.LeftType, s.RightType, op.NamespaceOIDOrDefault())
+		if selfLink || otherOID == op.OID {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "operator cannot be its own negator"}
+		}
+		if op.NegatorOID != 0 && op.NegatorOID != otherOID {
+			return invalidDef("negator")
+		}
+		op.NegatorOID = otherOID
+		if other := im.LookupUserOperatorByOID(otherOID); other != nil && other.NegatorOID == 0 {
+			other.NegatorOID = op.OID
+		}
+	}
+	if s.Merges != nil {
+		if op.CanMerge && !*s.Merges {
+			return invalidDef("merges")
+		}
+		op.CanMerge = *s.Merges
+	}
+	if s.Hashes != nil {
+		if op.CanHash && !*s.Hashes {
+			return invalidDef("hashes")
+		}
+		op.CanHash = *s.Hashes
+	}
+	return nil
+}
+
+// operatorArgOrNone renders an empty operator argument type as PG's "NONE"
+// display, matching op_signature_string's own unary-operator formatting.
+func operatorArgOrNone(t string) string {
+	if t == "" {
+		return "NONE"
+	}
+	return t
+}
+
 // execCompatNoop handles CompatNoopStmt (GRANT/REVOKE/COMMENT/CREATE RULE/etc).
 // If the statement carries ObjType+ObjName, it registers the object in the compat
 // registry so subsequent DROP statements can verify its existence. M0097-drop_if_exists.
@@ -13251,24 +13425,8 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 
 			// RESTRICT / JOIN: a bare (possibly schema-qualified) selectivity
 			// estimator function name, resolved exactly like FUNCTION=.
-			resolveFn := func(ref parser.ObjectName) uint32 {
-				if ref.Name == "" {
-					return 0
-				}
-				if rs := im.Routines(); rs != nil {
-					if overloads := rs.LookupByName(ref); len(overloads) == 1 {
-						return overloads[0].OID
-					}
-				}
-				if ref.Schema == "" || strings.EqualFold(ref.Schema, "pg_catalog") {
-					if b, ok := catalog.LookupBuiltinProc(ref.Name); ok {
-						return b.OID
-					}
-				}
-				return 0
-			}
-			op.RestrictOID = resolveFn(s.OpRestrictFuncName)
-			op.JoinOID = resolveFn(s.OpJoinFuncName)
+			op.RestrictOID = o.resolveOperatorSupportFunc(s.OpRestrictFuncName)
+			op.JoinOID = o.resolveOperatorSupportFunc(s.OpJoinFuncName)
 
 			// COMMUTATOR / NEGATOR: two-pass forward-reference resolution
 			// mirroring get_other_operator/OperatorShellMake (pg_operator.c).
@@ -13276,31 +13434,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			// already registered (real or shell), detect self-linkage (the
 			// operator being created is itself the commutator/negator), or
 			// else forward-declare a shell purely to mint a stable OID.
-			resolveOther := func(ref parser.ObjectName, otherLeft, otherRight string) (oid uint32, selfLink bool) {
-				otherSchema := ref.Schema
-				if otherSchema == "" {
-					otherSchema = schema
-				}
-				if existing, ok := im.LookupUserOperator(otherSchema, ref.Name, otherLeft, otherRight); ok {
-					return existing.OID, false
-				}
-				if strings.EqualFold(otherSchema, schema) && ref.Name == s.ObjName.Name &&
-					otherLeft == leftArg && otherRight == rightArg {
-					return 0, true
-				}
-				otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema)
-				if otherNsOID == 0 {
-					otherNsOID = nsOID
-				}
-				shell := im.EnsureUserOperatorShell(otherSchema, ref.Name, otherLeft, otherRight, otherNsOID)
-				return shell.OID, false
-			}
-
 			var commutatorOID uint32
 			selfCommutator := false
 			if hasCommutator {
 				// The commutator has reversed argument types.
-				commutatorOID, selfCommutator = resolveOther(s.OpCommutatorName, rightArg, leftArg)
+				commutatorOID, selfCommutator = o.resolveOperatorRef(s.OpCommutatorName, rightArg, leftArg, schema, s.ObjName.Name, leftArg, rightArg, nsOID)
 				if selfCommutator {
 					commutatorOID = op.OID
 				}
@@ -13308,7 +13446,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			var negatorOID uint32
 			if hasNegator {
 				var selfNegator bool
-				negatorOID, selfNegator = resolveOther(s.OpNegatorName, leftArg, rightArg)
+				negatorOID, selfNegator = o.resolveOperatorRef(s.OpNegatorName, leftArg, rightArg, schema, s.ObjName.Name, leftArg, rightArg, nsOID)
 				if selfNegator || negatorOID == op.OID {
 					return invalidDef("operator cannot be its own negator")
 				}

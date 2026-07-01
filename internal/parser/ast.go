@@ -2011,6 +2011,41 @@ type CompatNoopStmt struct {
 	OpCanHash          bool
 }
 
+// AlterOperatorSetStmt — `ALTER OPERATOR name (left_type, right_type) SET
+// (option = value [, ...])`, PG's post-creation attribute-edit form
+// (AlterOperator, operatorcmds.c). Only RESTRICT/JOIN may be changed freely,
+// including removal via `= NONE`; COMMUTATOR/NEGATOR/MERGES/HASHES may only
+// be set if not already set (a no-op re-statement of the same value is
+// allowed). LEFTARG/RIGHTARG/FUNCTION/PROCEDURE are immutable after CREATE
+// and raise a syntax error if named. M0119-0004 (DU-002), closes the
+// slice-407 ledger follow-up (`0119-0004-create-operator-roundtrip.md`).
+type AlterOperatorSetStmt struct {
+	pos       int
+	Name      ObjectName
+	LeftType  string // "" for NONE/absent (unary operator lookup)
+	RightType string
+	// Restrict/Join carry the RESTRICT=/JOIN= selectivity estimator function
+	// name; *Set distinguishes "clause given" from "not mentioned" — a bare
+	// clause or explicit `= NONE` leaves the ObjectName zero-valued, which the
+	// executor treats as clearing the estimator.
+	Restrict    ObjectName
+	RestrictSet bool
+	Join        ObjectName
+	JoinSet     bool
+	// Commutator/Negator carry the COMMUTATOR=/NEGATOR= operator reference.
+	Commutator    ObjectName
+	CommutatorSet bool
+	Negator       ObjectName
+	NegatorSet    bool
+	// Merges/Hashes carry the bare-or-`=bool` MERGES/HASHES flags; nil = not
+	// mentioned in the SET list.
+	Merges *bool
+	Hashes *bool
+}
+
+func (s *AlterOperatorSetStmt) Pos() int  { return s.pos }
+func (s *AlterOperatorSetStmt) stmtNode() {}
+
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …
 // statement so the executor can update the OID-keyed ACL store and re-sync the
 // heap-backed pg_type row. A type's acldefault('T', owner) grants USAGE to BOTH

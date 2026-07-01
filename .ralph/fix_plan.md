@@ -4042,6 +4042,54 @@ documentation-only and is exempt from the design-doc requirement.)
       unrelated to this fix): `dispatch_extended.go`'s type-formatting
       switch is missing several cases `dispatch.go` has
       (`regclass`/`date`/`time`/`bytea`).
+      **2026-07-01 (loop #33, design 0119-0004-create-operator-roundtrip.md
+      "Loop #33"): `ALTER OPERATOR name (left_type, right_type) SET (...)`
+      LANDED — closes the DU-002 slice 407 ledger follow-up.** `ALTER
+      OPERATOR` previously fell into `parseAlter`'s generic
+      `ALTER VIEW/SCHEMA/COLLATION/.../OPERATOR/...` compat-stub loop and was
+      swallowed as a total no-op — a user-written
+      `ALTER OPERATOR foo(int,int) SET (RESTRICT = ...)` silently did
+      nothing. New branch in `parseAlter` (checked before the generic stub):
+      `ALTER OPERATOR CLASS|FAMILY` and any non-`SET(...)` tail (`OWNER TO`/
+      `SET SCHEMA`/other) still fall back to the prior no-op; only
+      `SET ( option = value, ... )` produces a new `AlterOperatorSetStmt`
+      AST node, reusing `parseOperatorRefName` (COMMUTATOR/NEGATOR) and the
+      existing bare/`=value` MERGES/HASHES scan; LEFTARG/RIGHTARG/FUNCTION/
+      PROCEDURE inside SET raise a syntax error (immutable after CREATE).
+      Added to the planner's DDL-passthrough case list. New
+      `execAlterOperatorSet` (`internal/executor/operators_ddl.go`) mirrors
+      `AlterOperator`'s (`operatorcmds.c`) exact semantics: RESTRICT/JOIN
+      change freely (incl. clearing via `= NONE`); COMMUTATOR/NEGATOR/
+      MERGES/HASHES may only be **set** if not already set (same-value
+      restatement is a no-op, a different value is 42P13, self-negation
+      rejected); not-found is 42883. CREATE OPERATOR's inline RESTRICT/JOIN-
+      resolution and COMMUTATOR/NEGATOR two-pass-resolution closures were
+      extracted into shared `(*ddlOp).resolveOperatorSupportFunc`/
+      `resolveOperatorRef` methods (zero behavior change — full pre-existing
+      CREATE OPERATOR suite passed unchanged) so CREATE and ALTER share one
+      resolution path instead of risking future divergence. New builtins
+      `eqsel`/`eqjoinsel`/`neqjoinsel` (OIDs 101/105/106, PG's own `=`
+      operator's oprrest/oprjoin) curated in `builtinProcsByName` so a
+      RESTRICT=/JOIN= test fixture resolves to a real OID. Tests:
+      `TestParseAlterOperatorSet`/`TestParseAlterOperatorSetRestrictNone`/
+      `TestParseAlterOperatorSetImmutableAttr`/
+      `TestParseAlterOperatorOwnerToIsNoop` (parser);
+      `TestAlterOperatorSetRestrictJoin`/
+      `TestAlterOperatorSetCommutatorNegatorOnceOnly`/
+      `TestAlterOperatorSetMergesHashesOnceOnly`/
+      `TestAlterOperatorSetMissingOperator` (executor). Gates: `go build
+      ./...` clean; `go vet` parser/catalog/executor/planner clean;
+      `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/planner` suites PASS; `TestPort_PgDumpConnectionSetup` PASS
+      (confirms zero pg_dump regression); TPC-H spotcheck Q12=2/Q13=33
+      PASS; pgbench smoke = pre-commit hook. Not exercised by any pg_dump
+      TAP fixture — pg_dump never emits this statement (everything a dump
+      needs is captured by CREATE OPERATOR's own forward-reference shell
+      mechanism); this closes real DDL semantics, not a dump-parity slice.
+      Deferred (ledger row appended, `resolved` status): operator ownership
+      is not enforced (no `object_ownercheck` equivalent, consistent with
+      every other operator DDL arm); `regoper`/`regoperator` OID→name
+      resolution remains open (unchanged, unrelated).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -11044,6 +11044,30 @@ var builtinProcsByName = map[string]BuiltinProc{
 		ArgTypes: []string{"int4", "int4"},
 		Volatile: "i",
 	},
+	// eqsel/eqjoinsel/neqjoinsel are the RESTRICT=/JOIN= selectivity
+	// estimators an ALTER OPERATOR ... SET (RESTRICT=/JOIN=) fixture
+	// references directly by name (mirrors PG's own "=" operator's
+	// oprrest/oprjoin, pg_operator.dat oid 96 -> eqsel/eqjoinsel). Curated
+	// so RESTRICT=/JOIN= can resolve to a real OID, same pattern as int4eq
+	// above. M0119-0004 (DU-002).
+	"eqsel": {
+		OID: 101, Name: "eqsel", Namespace: 11,
+		RetType:  "float8",
+		ArgTypes: []string{"internal", "oid", "internal", "int4"},
+		Volatile: "s",
+	},
+	"eqjoinsel": {
+		OID: 105, Name: "eqjoinsel", Namespace: 11,
+		RetType:  "float8",
+		ArgTypes: []string{"internal", "oid", "internal", "int2", "internal"},
+		Volatile: "s",
+	},
+	"neqjoinsel": {
+		OID: 106, Name: "neqjoinsel", Namespace: 11,
+		RetType:  "float8",
+		ArgTypes: []string{"internal", "oid", "internal", "int2", "internal"},
+		Volatile: "s",
+	},
 }
 
 // LookupBuiltinProc resolves a built-in pg_proc.dat function by name (case-

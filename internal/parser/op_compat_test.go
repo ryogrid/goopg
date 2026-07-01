@@ -360,3 +360,104 @@ func TestParseCreateOperatorUnary(t *testing.T) {
 		t.Errorf("ArgTypes = %v, want [\"\" int4]", ns.ArgTypes)
 	}
 }
+
+// TestParseAlterOperatorSet verifies the ALTER OPERATOR ... SET (...) form
+// (AlterOperator, operatorcmds.c) parses into AlterOperatorSetStmt with all
+// six option kinds, closing the slice-407 ledger follow-up.
+func TestParseAlterOperatorSet(t *testing.T) {
+	sql := `ALTER OPERATOR public.=== (int4, int4) SET (
+        RESTRICT = eqsel, JOIN = eqjoinsel,
+        COMMUTATOR = OPERATOR(public.===),
+        NEGATOR = !==,
+        MERGES, HASHES = false
+    )`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Expected 1 stmt, got %d", len(stmts))
+	}
+	s, ok := stmts[0].(*AlterOperatorSetStmt)
+	if !ok {
+		t.Fatalf("Expected *AlterOperatorSetStmt, got %T", stmts[0])
+	}
+	if s.Name.Schema != "public" || s.Name.Name != "===" {
+		t.Errorf("Name = %+v, want {public ===}", s.Name)
+	}
+	if s.LeftType != "int4" || s.RightType != "int4" {
+		t.Errorf("LeftType/RightType = %q/%q, want int4/int4", s.LeftType, s.RightType)
+	}
+	if !s.RestrictSet || s.Restrict.Name != "eqsel" {
+		t.Errorf("Restrict = set=%v name=%q, want set=true name=eqsel", s.RestrictSet, s.Restrict.Name)
+	}
+	if !s.JoinSet || s.Join.Name != "eqjoinsel" {
+		t.Errorf("Join = set=%v name=%q, want set=true name=eqjoinsel", s.JoinSet, s.Join.Name)
+	}
+	if !s.CommutatorSet || s.Commutator.Schema != "public" || s.Commutator.Name != "===" {
+		t.Errorf("Commutator = set=%v %+v, want set=true {public ===}", s.CommutatorSet, s.Commutator)
+	}
+	if !s.NegatorSet || s.Negator.Name != "!==" {
+		t.Errorf("Negator = set=%v name=%q, want set=true name=!==", s.NegatorSet, s.Negator.Name)
+	}
+	if s.Merges == nil || !*s.Merges {
+		t.Errorf("Merges = %v, want true", s.Merges)
+	}
+	if s.Hashes == nil || *s.Hashes {
+		t.Errorf("Hashes = %v, want false", s.Hashes)
+	}
+}
+
+// TestParseAlterOperatorSetRestrictNone verifies `SET (RESTRICT = NONE)`
+// clears the estimator (RestrictSet true, Restrict zero-valued) and that a
+// unary operator's NONE left-arg parses.
+func TestParseAlterOperatorSetRestrictNone(t *testing.T) {
+	sql := `ALTER OPERATOR @@- (NONE, int4) SET (RESTRICT = NONE)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	s, ok := stmts[0].(*AlterOperatorSetStmt)
+	if !ok {
+		t.Fatalf("Expected *AlterOperatorSetStmt, got %T", stmts[0])
+	}
+	if s.LeftType != "" || s.RightType != "int4" {
+		t.Errorf("LeftType/RightType = %q/%q, want \"\"/int4", s.LeftType, s.RightType)
+	}
+	if !s.RestrictSet || s.Restrict.Name != "" {
+		t.Errorf("Restrict = set=%v name=%q, want set=true name=\"\"", s.RestrictSet, s.Restrict.Name)
+	}
+}
+
+// TestParseAlterOperatorSetImmutableAttr verifies LEFTARG/RIGHTARG/FUNCTION/
+// PROCEDURE raise a syntax error inside ALTER OPERATOR SET (immutable after
+// CREATE, mirroring AlterOperator's own rejection).
+func TestParseAlterOperatorSetImmutableAttr(t *testing.T) {
+	for _, attr := range []string{"leftarg", "rightarg", "function", "procedure"} {
+		sql := `ALTER OPERATOR === (int4, int4) SET (` + attr + ` = int4eq)`
+		if _, err := Parse(sql); err == nil {
+			t.Errorf("attr %q: expected parse error, got none", attr)
+		}
+	}
+}
+
+// TestParseAlterOperatorOwnerToIsNoop verifies ALTER OPERATOR ... OWNER TO
+// still parses as the pre-existing no-op compat stub (goopg does not track
+// per-operator ownership changes at ALTER time), and ALTER OPERATOR
+// CLASS/FAMILY are unaffected by the new SET(...) branch.
+func TestParseAlterOperatorOwnerToIsNoop(t *testing.T) {
+	for _, sql := range []string{
+		`ALTER OPERATOR === (int4, int4) OWNER TO someone`,
+		`ALTER OPERATOR === (int4, int4) SET SCHEMA other`,
+		`ALTER OPERATOR CLASS int4_ops USING btree OWNER TO someone`,
+		`ALTER OPERATOR FAMILY int4_ops USING btree RENAME TO int4_ops2`,
+	} {
+		stmts, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("%q: Parse error: %v", sql, err)
+		}
+		if _, ok := stmts[0].(*AlterTableStmt); !ok {
+			t.Errorf("%q: Expected *AlterTableStmt (no-op stub), got %T", sql, stmts[0])
+		}
+	}
+}

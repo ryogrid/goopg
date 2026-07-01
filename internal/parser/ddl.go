@@ -6132,6 +6132,146 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
+	// ALTER OPERATOR name (left_type, right_type) SET (option = value, ...) —
+	// PG's post-creation attribute-edit form (AlterOperator, operatorcmds.c).
+	// Checked before the generic operator compat-stub loop below (which would
+	// otherwise silently swallow this form as a no-op), mirroring ALTER
+	// COLLATION's dedicated branch above. ALTER OPERATOR CLASS|FAMILY are a
+	// different object type (guarded out below); OWNER TO / SET SCHEMA on a
+	// plain operator, or any other trailing form, fall back to the same
+	// consume-and-succeed no-op the generic stub loop used to give this whole
+	// statement — goopg does not yet track per-operator ownership/namespace
+	// changes at ALTER time (only at CREATE, via UserOperator.Owner/
+	// NamespaceOID) — so only the SET (...) def-list form is modeled here.
+	// M0119-0004 (DU-002), closes the slice-407 ledger follow-up.
+	if p.acceptIdentKeyword("operator") {
+		if tok := p.cur(); tok.Kind == TokenIdent &&
+			(strings.EqualFold(tok.Value, "class") || strings.EqualFold(tok.Value, "family")) {
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &AlterTableStmt{pos: t.Pos}, nil
+		}
+		opName, err := p.parseOperatorName()
+		if err != nil {
+			return nil, err
+		}
+		parseArgType := func() string {
+			if p.acceptIdentKeyword("none") {
+				return ""
+			}
+			tok, err := p.parseIdent()
+			if err != nil {
+				return ""
+			}
+			typeName := tok.Value
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "." {
+				p.advance()
+				if tok2, err2 := p.parseIdent(); err2 == nil {
+					typeName += "." + tok2.Value
+				}
+			}
+			return typeName
+		}
+		var leftType, rightType string
+		if p.acceptSymbol("(") {
+			leftType = parseArgType()
+			if p.acceptSymbol(",") {
+				rightType = parseArgType()
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after operator argument types")
+			}
+		}
+		// Only `SET ( option = value, ... )` — the def-list form — is modeled.
+		// `SET SCHEMA name`, `OWNER TO role`, or any other/unrecognized tail is
+		// consumed as a no-op, preserving the prior stub's always-succeeds
+		// behaviour for those forms.
+		if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet &&
+			p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(") {
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &AlterTableStmt{pos: t.Pos}, nil
+		}
+		p.advance() // SET
+		p.advance() // '('
+		stmt := &AlterOperatorSetStmt{pos: t.Pos, Name: opName, LeftType: leftType, RightType: rightType}
+		for {
+			if p.cur().Kind != TokenIdent && p.cur().Kind != TokenKeyword {
+				return nil, p.errAtCur("expected option name in ALTER OPERATOR SET list")
+			}
+			key := strings.ToLower(p.cur().Value)
+			p.advance()
+			hasVal := false
+			if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+				p.advance()
+				hasVal = true
+			}
+			switch key {
+			case "restrict":
+				stmt.RestrictSet = true
+				if hasVal && !p.acceptIdentKeyword("none") {
+					if fn, ferr := p.parseObjectName(); ferr == nil {
+						stmt.Restrict = fn
+					}
+				}
+			case "join":
+				stmt.JoinSet = true
+				if hasVal && !p.acceptIdentKeyword("none") {
+					if fn, ferr := p.parseObjectName(); ferr == nil {
+						stmt.Join = fn
+					}
+				}
+			case "commutator":
+				stmt.CommutatorSet = true
+				if hasVal {
+					if ref, oerr := p.parseOperatorRefName(); oerr == nil {
+						stmt.Commutator = ref
+					}
+				}
+			case "negator":
+				stmt.NegatorSet = true
+				if hasVal {
+					if ref, oerr := p.parseOperatorRefName(); oerr == nil {
+						stmt.Negator = ref
+					}
+				}
+			case "merges", "hashes":
+				val := true
+				if hasVal {
+					if p.cur().Kind == TokenKeyword && strings.EqualFold(p.cur().Value, "false") {
+						val = false
+					}
+					if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+						p.advance()
+					}
+				}
+				if key == "merges" {
+					stmt.Merges = &val
+				} else {
+					stmt.Hashes = &val
+				}
+			case "leftarg", "rightarg", "function", "procedure":
+				return nil, p.errAtCur("operator attribute \"" + key + "\" cannot be changed")
+			default:
+				return nil, p.errAtCur("operator attribute \"" + key + "\" not recognized")
+			}
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close ALTER OPERATOR SET list")
+		}
+		return stmt, nil
+	}
 	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
 	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of statement.
 	for _, objIdent := range []string{
