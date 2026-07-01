@@ -6159,9 +6159,10 @@ func bootstrapCLog(dataDir string) error {
 		return err
 	}
 	// M0106-0010 batched-44: bootstrap a PG-canonical pg_xact/ SLRU directory
-	// alongside the legacy goopg flat file. A PG18 standby attached via
-	// basebackup reads commit status through SimpleLruReadPage_ReadOnly, which
-	// requires segment files named %04X with at least one BLCKSZ-aligned page.
+	// (since M0117-0006 Part C the sole CLOG store — the legacy goopg flat
+	// file is retired). A PG18 standby attached via basebackup reads commit
+	// status through SimpleLruReadPage_ReadOnly, which requires segment files
+	// named %04X with at least one BLCKSZ-aligned page.
 	// BootstrapTransactionID (1) and FrozenTransactionID (2) are NOT normal
 	// XIDs — TransactionLogFetch short-circuits them to COMMITTED without
 	// consulting the SLRU — so we don't need to stamp their lanes; we just

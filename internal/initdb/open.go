@@ -694,9 +694,9 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	clog.SetCLOGBuffers(opts.TransactionBuffers)
 	// M0106-0010 batched-44: wire the PG-canonical pg_xact/ SLRU mirror so
 	// every commit/abort updates the SLRU segment that the basebackup-shipped
-	// standby reads via SimpleLruReadPage_ReadOnly. EnablePGSLRUMirror also
-	// backfills the SLRU from already-loaded flat-file entries on the recovery
-	// path (in case the SLRU was missing or stale on disk).
+	// standby reads via SimpleLruReadPage_ReadOnly. Since M0117-0006 Part C the
+	// pool created here IS the CLOG store (no flat-file backfill round-trip);
+	// it lazily faults pages in directly from the on-disk SLRU segments.
 	if err := clog.EnablePGSLRUMirror(filepath.Join(abs, "pg_xact")); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()

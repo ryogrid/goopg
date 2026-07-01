@@ -593,9 +593,13 @@ func TestClassifyXID_ClogAbortedFallback(t *testing.T) {
 	m := NewManager()
 	m.SetNextXID(1000) // advance the range so xid 50 is "in-range" (below NextXID)
 
-	clog, err := OpenCLog(filepath.Join(t.TempDir(), "pg_xact"))
+	dir := t.TempDir()
+	clog, err := OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
 	m.SetCLog(clog)
 

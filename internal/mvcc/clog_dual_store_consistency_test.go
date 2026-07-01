@@ -45,16 +45,91 @@ func writeStatuses(t *testing.T, c *CLog, set []xidStatus) {
 	}
 }
 
-// freshFromSLRU reconstructs a CLog purely from the on-disk SLRU mirror — the
-// durable, PG-compatible encoding — with no flat file in play. This is the
-// exact path crash recovery and a PG standby would take.
-func freshFromSLRU(t *testing.T, slruDir string) *CLog {
-	t.Helper()
-	fresh := &CLog{path: filepath.Join(t.TempDir(), "unused")}
-	if err := fresh.loadFromSLRU(slruDir); err != nil {
-		t.Fatalf("loadFromSLRU(%q): %v", slruDir, err)
+// slruSnapshot is an independent, from-scratch decode of the on-disk SLRU
+// segment files — deliberately NOT routing through CLog/clogBufferPool, so a
+// pool decode bug cannot mask itself in these dual-store-equivalence checks.
+// M0117-0006 Part C retired the CLog.loadFromSLRU method these tests used to
+// call directly (it existed only to seed the now-deleted "banks" store); this
+// is its decode logic preserved verbatim as a test-local sibling-path oracle.
+type slruSnapshot map[storage.TransactionID]TxnStatus
+
+// GetStatus mirrors CLog.GetStatus's "no entry ⇒ Unknown" contract.
+func (s slruSnapshot) GetStatus(xid storage.TransactionID) TxnStatus {
+	if st, ok := s[xid]; ok {
+		return st
 	}
-	return fresh
+	return TxnStatusUnknown
+}
+
+// freshFromSLRU independently decodes every committed/aborted/sub-committed
+// lane in every pg_xact/ segment file under slruDir. This is the exact
+// on-disk encoding crash recovery and a PG standby would read.
+func freshFromSLRU(t *testing.T, slruDir string) slruSnapshot {
+	t.Helper()
+	out := make(slruSnapshot)
+	entries, err := os.ReadDir(slruDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return out
+		}
+		t.Fatalf("readdir %q: %v", slruDir, err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || len(name) != 4 {
+			continue
+		}
+		var segNo uint64
+		valid := true
+		for _, ch := range name {
+			segNo <<= 4
+			switch {
+			case ch >= '0' && ch <= '9':
+				segNo |= uint64(ch - '0')
+			case ch >= 'A' && ch <= 'F':
+				segNo |= uint64(ch - 'A' + 10)
+			case ch >= 'a' && ch <= 'f':
+				segNo |= uint64(ch - 'a' + 10)
+			default:
+				valid = false
+			}
+		}
+		if !valid {
+			continue
+		}
+		segData, err := os.ReadFile(filepath.Join(slruDir, name))
+		if err != nil {
+			t.Fatalf("read segment %q: %v", name, err)
+		}
+		baseXID := segNo * uint64(clogXactsPerSegment)
+		for i, b := range segData {
+			if b == 0 {
+				continue
+			}
+			pageInSeg := uint64(i) / uint64(storage.BlockSize)
+			xidInPageBase := (uint64(i) % uint64(storage.BlockSize)) * uint64(clogXactsPerByte)
+			for lane := uint64(0); lane < uint64(clogXactsPerByte); lane++ {
+				rawBits := (b >> (lane * uint64(clogBitsPerXact))) & 0x3
+				var status TxnStatus
+				switch rawBits {
+				case pgClogStatusCommitted:
+					status = TxnStatusCommitted
+				case pgClogStatusAborted:
+					status = TxnStatusAborted
+				case pgClogStatusInProgress:
+					continue
+				case pgClogStatusSubCommitted:
+					status = TxnStatusSubCommitted
+				}
+				xid := baseXID + pageInSeg*uint64(clogXactsPerPage) + xidInPageBase + lane
+				if xid == 0 {
+					continue
+				}
+				out[storage.TransactionID(xid)] = status
+			}
+		}
+	}
+	return out
 }
 
 // TestCLogDualStoreConsistency writes a mix of committed and aborted XIDs that
@@ -138,83 +213,6 @@ func TestCLogDualStoreConsistency(t *testing.T) {
 	}
 	if min := int64(2) * int64(storage.BlockSize); fi.Size() < min {
 		t.Errorf("SLRU segment 0000 size = %d, want >= %d (must span 2 pages)", fi.Size(), min)
-	}
-}
-
-// TestCLogEnableMirrorBackfillBatched pins the EnablePGSLRUMirror backfill path
-// (design 0117-0009): a CLog opened from the flat file with NO SLRU mirror yet
-// holds terminal statuses only in its banks. EnablePGSLRUMirror must project the
-// whole resident set into the pg_xact/ SLRU on first enable. This loop replaced
-// the naive per-XID backfill (one open+fsync+close per XID — minutes on WSL2's
-// slow fsync, which infra-failed the TPC-H spot-check's 60 s readiness window)
-// with the batched range writer (one fsync per segment). The two must be
-// byte-equivalent, so the SLRU-derived view after a backfill must match the
-// banks per-XID across a page boundary and across mixed committed/aborted/
-// sub-committed lanes — the same drift surface the dual-store test guards, but
-// reached via the backfill rather than the live per-commit mirror.
-func TestCLogEnableMirrorBackfillBatched(t *testing.T) {
-	dir := t.TempDir()
-	flatPath := filepath.Join(dir, "pg_xact_flat")
-	slruDir := filepath.Join(dir, "pg_xact")
-
-	// Open WITHOUT enabling the SLRU mirror, then write statuses: with slruDir
-	// empty, mirrorToSLRUUnlocked is a no-op, so these land only in the banks /
-	// flat file — exactly the "loaded from flat file, no mirror yet" state the
-	// backfill exists to project.
-	c, err := OpenCLog(flatPath)
-	if err != nil {
-		t.Fatalf("OpenCLog: %v", err)
-	}
-
-	const pageBoundary = storage.TransactionID(clogXactsPerPage) // 32768
-	set := []xidStatus{
-		{FirstNormalTransactionID, TxnStatusCommitted},
-		{4, TxnStatusAborted}, // adjacent lanes catch wrong bit-shift
-		{5, TxnStatusCommitted},
-		{6, TxnStatusSubCommitted},
-		{7, TxnStatusSubCommitted},
-		{100, TxnStatusAborted},
-		{1000, TxnStatusCommitted},
-		{pageBoundary - 1, TxnStatusCommitted}, // last XID of page 0
-		{pageBoundary, TxnStatusAborted},       // first XID of page 1 (crosses boundary)
-		{pageBoundary + 1, TxnStatusCommitted},
-		{pageBoundary + 2, TxnStatusSubCommitted},
-		{pageBoundary + 1234, TxnStatusAborted},
-	}
-	writeStatuses(t, c, set)
-
-	// No SLRU segment should exist yet (mirror disabled during the writes).
-	if _, err := os.Stat(filepath.Join(slruDir, "0000")); !os.IsNotExist(err) {
-		t.Fatalf("SLRU segment 0000 exists before EnablePGSLRUMirror (err=%v)", err)
-	}
-
-	// Enable the mirror — this triggers the batched backfill under test.
-	if err := c.EnablePGSLRUMirror(slruDir); err != nil {
-		t.Fatalf("EnablePGSLRUMirror: %v", err)
-	}
-
-	// The SLRU-derived view (the durable PG-compatible encoding a standby or
-	// crash recovery reads) must match every backfilled XID.
-	fresh := freshFromSLRU(t, slruDir)
-	for _, s := range set {
-		if got := fresh.GetStatus(s.xid); got != s.want {
-			t.Errorf("after backfill, SLRU-derived GetStatus(%d) = %d, want %d", s.xid, got, s.want)
-		}
-	}
-
-	// A terminal XID NOT in the set must remain Unknown in the mirror (the
-	// backfill must not stamp lanes it was never asked to).
-	if got := fresh.GetStatus(50000); got != TxnStatusUnknown {
-		t.Errorf("unwritten XID 50000 mirrored as %d, want Unknown(%d)", got, TxnStatusUnknown)
-	}
-
-	// Both pages of segment 0000 must be materialised (page 0 + page 1).
-	fi, err := os.Stat(filepath.Join(slruDir, "0000"))
-	if err != nil {
-		t.Fatalf("stat SLRU segment 0000: %v", err)
-	}
-	if minSize := int64(2) * int64(storage.BlockSize); fi.Size() < minSize {
-		t.Errorf("SLRU segment 0000 size = %d, want >= %d (must span 2 pages)", fi.Size(), minSize)
 	}
 }
 

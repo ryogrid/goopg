@@ -1,6 +1,6 @@
 # 0117-0006 — CLOG SLRU buffer pool / 2-bit collapse (gap G6)
 
-Status: **accepted (Part A + Part B landed 2026-06-29; Part C deferred)**
+Status: **accepted (Part A + Part B + Part C landed; Part C landed 2026-07-01, loop #47)**
 Milestone: M0117-0006
 Branch: `m0117-0006-clog-slru-buffer-pool` (off the M0117-0005 tip `5fcdb27b`)
 
@@ -202,10 +202,186 @@ full suites PASS; heterogeneous PG-standby E2E (`TestE2E_StandbyAttachRetainsUps
 populated 6M-row data dir (visibility checks served by the pool); pgbench smoke
 on commit. `gofmt -l` / `go vet ./internal/mvcc/` clean.
 
-### Part C — drop the resident banks + flat file (deferred)
+### Part C — drop the resident banks + flat file (PLAN, this loop)
 
-Remove `clogBank`/`banks`/`flush`/`flushDirtyPagesLocked` once Part B routes all
-access through the pool, completing the 2-bit collapse (16× memory reduction).
+Remove `clogBank`/`banks`/`banksMu` (renamed to `slruDirMu`, its one remaining
+job) and every legacy-store method, completing the 2-bit collapse (16× memory
+reduction: 1 byte/XID resident → the pool's bounded page budget, independent of
+`NextXID`).
+
+**Key finding that simplified this beyond the Part B blueprint's own estimate:**
+every production caller (`GetStatus`/`setStatus`/`InitializeAsCommitted`/
+`MarkUnknownAsAborted`/`HighestKnownXID`/`TruncateCLOG`) already had a complete,
+self-sufficient `if p := c.pool.Load(); p != nil { ... }` branch from Part B —
+none of them read `banks` inside that branch. The **only** thing `banks` still
+did on the production path was serve as a **transient staging buffer** inside
+`EnablePGSLRUMirror`: `loadFromSLRU` copied the SLRU segment bytes into `banks`,
+then `mirrorTerminalRangeBatchedUnlocked` immediately read those same bytes back
+out via `GetStatus` (banks branch, since `pool` didn't exist yet) and wrote them
+right back into the same SLRU segments — a no-op round-trip for any data dir
+that has only ever been touched by a Part-B-or-later binary (no production code
+path writes the legacy flat file once Part B lands — `bootstrapCLog`'s
+`SetCommitted(1)/(2)` are XIDs `< FirstNormalTransactionID` and no-op in the
+pool branch before ever touching a bank or the flat file). So Part C does not
+need a "re-sequence the bootstrap" redesign for that case: it simply
+**deletes** the `loadFromSLRU` call and the backfill loop from
+`EnablePGSLRUMirror` and creates the pool directly. The pool's own lazy
+page-fault-on-read (already exercised by `TestCLOGBufferPoolLRUEviction`/
+`TestCLOGBufferPoolRoundTripAllLanes`) is the sole remaining "load" mechanism.
+**Accepted compatibility cut (confirmed via review, not glossed over):** a data
+dir last touched by a **pre-Part-B** binary could in principle still carry a
+legacy flat file with committed/aborted bytes that were never projected into
+the SLRU (e.g. a crash between the old `flush()` write and the old
+`mirrorGroupToSLRULocked` SLRU write). Under Part C, `OpenCLog` never reads
+`path` at all, so those bytes are silently never recovered — this is a real,
+deliberate cutoff (not merely an on-disk format non-issue as an earlier draft
+of this plan implied), justified only because Part B already stopped writing
+and trusting the flat file, and every gate in this project re-inits the data
+dir across a milestone like this one (Hard-won Rule #3). Any data dir that
+needs to survive this transition must be re-initialized, exactly as Part B's
+own landing already required.
+
+**What is being removed** (`internal/mvcc/clog.go`, `internal/mvcc/clog_groupcommit.go`):
+- Struct: `clogBank` type; `CLog.banks`, `CLog.path`, `CLog.dirtyMu`,
+  `CLog.dirtyPages` fields. `CLog.banksMu` **renamed** to `CLog.slruDirMu` (its
+  one surviving job — guarding the `slruDir` field read by
+  `mirrorToSLRUUnlocked`/`firstRetainedSLRUXID`/`highestSLRUXID`/`SLRUDir`).
+- Methods, entirely: `getOrCreateBank`, `getBank`, `distributeToBanks`,
+  `markFlatDirty`, `flushDirtyPagesLocked`, `flush`, `flushLocked`,
+  `mirrorTerminalRangeBatchedUnlocked` (dead once the `EnablePGSLRUMirror`
+  backfill loop and `MarkUnknownAsAborted`'s legacy branch are both gone — its
+  only two callers), `mirrorGroupToSLRULocked` + `applySegmentLanesLocked`
+  (`clog_groupcommit.go`; dead once `applyGroupBatchLocked`'s legacy branch is
+  gone — its only caller), `loadFromSLRU`.
+- Methods, legacy branch only (kept, pool branch becomes unconditional):
+  `GetStatus`, `setStatus`, `InitializeAsCommitted`, `MarkUnknownAsAborted`,
+  `HighestKnownXID`, `TruncateCLOG` step (5a)/(5b) bank-drop and
+  flat-file-rewrite-on-no-pool.
+- `OpenCLog(path string)` no longer reads the flat file into banks — it is now
+  `return &CLog{}, nil` for a missing/present file alike (the `path` parameter
+  is kept, unused, to avoid a signature change rippling through ~13 call sites
+  across `internal/mvcc` + `internal/initdb`; each callsite comment now notes
+  the legacy flat file this path used to name is never read or written).
+- `IsEmpty()`: needs a rewrite, and **not** with a process-local flag — an
+  earlier draft of this plan proposed a `CLog.everWritten atomic.Bool` set by
+  `setStatus`, but an independent review agent caught that this is a live
+  correctness bug: `open.go:846`'s `if clog.IsEmpty() { clog.InitializeAsCommitted(...) }`
+  upgrade-detection check runs immediately after `EnablePGSLRUMirror`, **before**
+  any in-process `setStatus` call — a process-local flag would read `false`
+  (i.e. "empty") on *every* ordinary restart of a populated cluster, regardless
+  of how much real committed/aborted status already sits durably in `pg_xact/`,
+  wrongly routing every restart into `InitializeAsCommitted` (stamps every
+  Unknown XID Committed) instead of the correct crash-recovery
+  `MarkUnknownAsAborted` sweep in the `else` branch — silently resurrecting
+  crashed/in-progress transactions as visible-and-committed after every
+  restart. `IsEmpty()` must instead answer from **durable, on-disk** truth.
+  Fix: reuse the already-existing `highestSLRUXID()` (scans the on-disk SLRU
+  segments for the highest XID carrying any non-Unknown 2-bit lane, returning 0
+  if none exists) — `IsEmpty()` becomes `return c.highestSLRUXID() == 0` when
+  the pool is live. This needs no new field, reuses machinery already proven by
+  `HighestKnownXID`'s Part B pool branch, and is disk-truth by construction (a
+  restart with real prior status on disk correctly reads non-empty; a truly
+  virgin `pg_xact/` — fresh bootstrap or genuine pre-M0030-0007 upgrade —
+  correctly reads empty). `internal/initdb/open.go`'s upgrade-detection caller
+  is unaffected in behavior — same semantics, disk-truth mechanism instead of
+  a process-local one.
+
+**Test migration (required for this to be safe).** An independent review agent
+exhaustively grepped every `&CLog{}`/`OpenCLog(` call site and found the initial
+~20-function estimate incomplete; the corrected, verified scope:
+
+- **Plain migration** (add `EnablePGSLRUMirror(t.TempDir())` before exercising
+  the CLog, same inputs/outputs expected): the ~20 functions across
+  `internal/mvcc/clog_test.go`, `clog_slru_recovery_test.go`, `manager_test.go`
+  (`TestClassifyXID_ClogAbortedFallback`), `snapshot_clog_fallback_test.go`, and
+  **`internal/initdb/xact_recovery_test.go`'s all four tests**
+  (`TestReplayCLogFromWAL_NativeCommit`/`_NativeAbort`/`_CommitInvalAlsoStamps`/
+  `_MissingWalDir`) — verified these do **not** already route through
+  `initdb.Open`/`bootstrapCLog` (an earlier draft of this plan wrongly assumed
+  they did); they construct a bare `OpenCLog` directly and need the same
+  mirror-enablement migration as the `internal/mvcc` tests.
+  `internal/initdb/pg_xact_slru_test.go`/`pg_catalog_physical_load_test.go` also
+  in this bucket (confirmed by the review).
+- **Reopen-and-compare assertions that need the mirror on BOTH sides**
+  (silent-regression risk, not a compile error — flagged explicitly per the
+  review): `clog_test.go`'s `TestCLogPersistence` and the reopen half of
+  `TestCLogMarkUnknownAsAborted` each open a `CLog`, write status, then open a
+  **second, independent `CLog`** on the same path and assert the status
+  reloads. Today this works because `OpenCLog` reads the legacy flat file into
+  `banks`; once `OpenCLog` stops reading `path` entirely, both the writer and
+  the reopened reader must call `EnablePGSLRUMirror(dir)` against the *same*
+  `dir` so the reload goes through the shared SLRU directory instead — without
+  this, the reopened reader would silently read back `TxnStatusUnknown` and
+  the test would report a wrong (not a compile-time) failure.
+- **Callers of the deleted `loadFromSLRU` directly — need bespoke rewrites, not
+  mechanical migration** (compile-breaking, found by the review, absent from
+  the original draft): a shared helper `freshFromSLRU` (`clog_dual_store_consistency_test.go:51-58`)
+  builds a bare `&CLog{}` and calls `.loadFromSLRU(slruDir)` directly to
+  independently re-decode the on-disk SLRU bytes as a sibling-path equivalence
+  check, used by `TestCLogDualStoreConsistency`, `TestCLogEnableMirrorBackfillBatched`,
+  `TestCLogSubCommittedResolvesViaParent` (`clog_dual_store_consistency_test.go`)
+  and `TestGroupCommitConcurrent` (`clog_groupcommit_test.go:110`); plus
+  `TestCLogMarkUnknownAsAbortedBatchedSLRU` (`clog_test.go:231-295`), which
+  does the same thing inline. **Simply calling `EnablePGSLRUMirror` on the
+  `fresh` CLog does not preserve these tests' intent** — their entire point is
+  an independent decode path that does NOT go through the pool (so pool bugs
+  can't mask themselves). Rewrite each to decode the SLRU segment bytes
+  directly (e.g. a small test-local helper that reads a segment file and
+  unpacks 2-bit lanes, mirroring what `loadFromSLRU` did) rather than routing
+  through `CLog`/the pool at all — keeping these as genuine sibling-path
+  checks instead of deleting the independence the tests were designed to
+  provide.
+- `TestLoadFromSLRU_SegFileNotMultipleOfBlockSize` (misaligned-segment-length
+  case) needs replacing with an equivalent pool-level fault-in assertion (the
+  pool already handles a short file by zero-filling the missing tail, per
+  `clogBufferPool.readPage`/`clog_bufferpool_test.go`'s existing eviction/
+  round-trip coverage — the migrated test should pin the misaligned-length
+  case specifically, the original test's unique contribution).
+- `clog_bufferpool_live_test.go` — audit only; it already exercises the pool
+  directly and is expected to need no change, confirm during implementation.
+
+**On-disk format.** Confirmed no on-disk format is tied to `banks` — it is
+purely an in-memory struct; the durable stores (segment files under `pg_xact/`)
+are untouched byte-for-byte. The fix_plan's "re-init data dir on the
+memory-model change" caution is about safety margin during rollout (a data dir
+touched by a pre-Part-C binary could in principle still have a stale
+`global/pg_xact` flat file lying around from before Part B — now permanently
+ignored), not an actual format break; every gate below runs against a freshly
+initdb'd dir per Hard-won Rule #3 regardless.
+
+**Mandatory gates for this change (highest-blast-radius subsystem — run before
+declaring done, not deferred):** `go build ./...` clean; `go vet ./...` clean;
+`go test -race ./internal/mvcc/... ./internal/wal/...`; `internal/initdb` +
+`internal/server` full suites; heterogeneous PG-standby E2E
+(`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`,
+`TestE2E_ChecksumStreamingGoopgToPG`); crash-recovery replay
+(`internal/initdb/xact_recovery_test.go`, `clog_crash_test.go`); TPC-H
+Q12=2/Q13=33 spot-check on a fresh populated data dir; pgbench smoke at commit
+(pre-commit hook); `gofmt -l` (no new drift beyond the pre-existing go1.25/1.26
+baseline).
+
+**Results (loop #47, 2026-07-01): all PASS.** `go build ./...`/`go vet ./...`
+clean. `go test -race ./internal/mvcc/... ./internal/wal/...` PASS (one
+`internal/wal` timing flake unrelated to this change,
+`TestReserveEmittedAndPublishConcurrentChainAndStripePublishConsistent`, reran
+green in isolation — that package has zero diff here). `internal/initdb`
+(169s) and `internal/server` full suites PASS. `TestE2E_
+StandbyAttachRetainsUpstreamRowsAfterRestart` and
+`TestE2E_ChecksumStreamingGoopgToPG` PASS (the standby test's own liveness
+note about post-restart walreceiver reconnection is a pre-existing, unrelated
+caveat — the CLOG standby-attach invariant itself is verified). Crash-recovery
+replay (`internal/initdb/xact_recovery_test.go`, `clog_crash_test.go`) PASS as
+part of the `internal/initdb` suite run. TPC-H spotcheck on the persistent
+`postgres@postgres` data target: Q12=2 (28.32s), Q13=33 (90.45s), RESULT=PASS.
+`gofmt -l` on every touched file: clean. pgbench smoke runs at commit time via
+the pre-commit hook. A post-implementation review pass also found and fixed
+three stale doc comments left behind by the plan's own edits (two "legacy
+flat file" references in `internal/initdb/{open,initdb}.go`, and the
+`TruncateCLOG`/`SetSubCommitted` doc comments in `clog.go` still describing
+the now-deleted `banks`/flat-file mechanics) plus one now-unused
+`applyGroupBatchLocked(batch)` parameter (the pool flush no longer needs
+per-member data) — all confirmed via `go build`/`go vet`/full re-test after
+the cleanup.
 
 ## Part B implementation blueprint (for the dedicated full-gate session)
 

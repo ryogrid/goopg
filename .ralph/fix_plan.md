@@ -133,7 +133,7 @@ role/database persistence is a real goopg feature gap.
       merge off clean HEAD): wraparound-safe `storage.XIDPrecedes` horizon comparison;
       runtime CLOG-consulting visibility fallback; `pg_subtrans` restore-on-restart;
       `SUB_COMMITTED` (0x03) CLOG lane; incremental flush + group commit.
-- [ ] **M0117-0006 — SLRU buffer pool / 2-bit collapse (gap G6; Effort L).** Part A
+- [x] **M0117-0006 — SLRU buffer pool / 2-bit collapse (gap G6; Effort L).** Part A
       landed (`transaction_buffers` GUC + `clogBufferPool`, NOT wired to the live path —
       blast radius nil). **Part B LANDED 2026-06-29 (loop #11, design `0117-0006-*`
       "Part B — LANDED"):** the pool is now the live in-memory store
@@ -147,15 +147,35 @@ role/database persistence is a real goopg feature gap.
       loops #7–#10 — *"the mandatory gates SKIP in the autonomous WSL2 loop"* — was
       **empirically disproven**: standby-attach + checksum-streaming E2E, `-race`
       mvcc/wal (incl. xlog_replay), and **TPC-H Q12=2/Q13=33 spot-check** all RUN+PASS.
-      Regression `clog_bufferpool_live_test.go`. **Part C (DEFERRED, ledger):** remove
-      the resident `banks` (16× memory reduction) once the no-mirror unit tests are
-      migrated; re-init data dir on the memory-model change. Box stays unchecked until
-      Part C lands. **Follow-up LANDED 2026-06-29 (loop #12):** the
-      `transaction_buffers` GUC value is now threaded into `CLog.SetCLOGBuffers`
-      from `initdb.Open` (new `OpenOptions.TransactionBuffers`, read in `cmd/goopg
-      start` via `intGUC`). Boot default 0 keeps the auto-16 floor (no behaviour
-      change); a non-zero `postgresql.conf` override now sizes the live pool.
-      Regression `TestTransactionBuffersFromGUC` + `TestSetCLOGBuffersSizesPool`.
+      Regression `clog_bufferpool_live_test.go`. **Follow-up LANDED 2026-06-29
+      (loop #12):** the `transaction_buffers` GUC value is now threaded into
+      `CLog.SetCLOGBuffers` from `initdb.Open` (new `OpenOptions.TransactionBuffers`,
+      read in `cmd/goopg start` via `intGUC`). Boot default 0 keeps the auto-16 floor
+      (no behaviour change); a non-zero `postgresql.conf` override now sizes the live
+      pool. Regression `TestTransactionBuffersFromGUC` + `TestSetCLOGBuffersSizesPool`.
+      **Part C LANDED 2026-07-01 (loop #47, design `0117-0006-*` "Part C"):** the
+      resident `banks`/legacy flat-file store is fully removed (16× memory reduction —
+      resident cost is now the pool's bounded page budget, independent of `NextXID`).
+      `clogBank`/`banks`/`path`/`dirtyMu`/`dirtyPages`/`getOrCreateBank`/`getBank`/
+      `distributeToBanks`/`markFlatDirty`/`flushDirtyPagesLocked`/`flush`/`flushLocked`/
+      `mirrorTerminalRangeBatchedUnlocked`/`mirrorGroupToSLRULocked`/
+      `applySegmentLanesLocked`/`loadFromSLRU` all deleted; `banksMu` renamed
+      `slruDirMu`. `OpenCLog` no longer reads its `path` argument; `EnablePGSLRUMirror`
+      creates the pool directly (no flat-file→SLRU backfill round-trip — it was a
+      no-op for any Part-B-or-later data dir). `IsEmpty()` rewritten to a disk-truth
+      check (`highestSLRUXID() == 0`) instead of a process-local flag (a process-local
+      flag would misreport "empty" on every restart of a populated cluster and
+      misroute into the upgrade path — caught by independent review before landing).
+      ~20 test functions across `internal/mvcc` + all 4 `internal/initdb/
+      xact_recovery_test.go` tests migrated to call `EnablePGSLRUMirror`; the 5 direct
+      `loadFromSLRU` callers rewritten with a test-local SLRU-segment decoder to
+      preserve their sibling-path-independence intent. Gates: `-race` mvcc+wal,
+      `internal/initdb`+`internal/server` full suites, standby-attach +
+      checksum-streaming E2E, TPC-H Q12=2/Q13=33 spot-check, `gofmt -l` — all PASS.
+      Ledger row (loop #11 Part-C-deferred row flipped `resolved`, new Part-C-landed
+      row appended) records one accepted, deliberate compatibility cut: a pre-Part-B
+      data dir's never-mirrored flat-file bytes are now silently unrecoverable (not a
+      PG-fidelity gap — PG has no such dual-store distinction).
 - [ ] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
       (per-LSN-group tracking + page-write WAL barrier on the M0117-0006 pool, not live).
       **Part B (DEFERRED):** live `synchronous_commit=off` — wire `flushWAL` to the WAL
@@ -2066,11 +2086,17 @@ documentation-only and is exempt from the design-doc requirement.)
       PROMOTED (M0118-0002 group COMPLETE); the only residual isolation `failed`
       spec is `deadlock-parallel` (infeasible — no parallel-query lock groups), and
       it has no open ledger row of its own.
-- [ ] **M0119-0002 — CLOG store swap, Part B** (source: M0117-0006 / M0117-0007 /
-      M0117-0008; see M0117 section + ledger rows). Live CLOG store swap (pool
-      replaces banks) per the design-0117-0006 Part B blueprint. Highest blast
-      radius (Hard-won Rule #1): dedicated full-gate session (`-race` mvcc+wal,
-      xlog_replay, heterogeneous PG-standby E2E, fresh-server TPC-H Q12/Q13).
+- [ ] **M0119-0002 — CLOG tail, remaining Parts** (source: M0117-0007 / M0117-0008;
+      see M0117 section + ledger rows). **M0117-0006's own live store swap (Part B)
+      and bank/flat-file removal (Part C) are both DONE** (2026-06-29 loop #11 /
+      2026-07-01 loop #47) — this item now tracks only the two still-open siblings:
+      M0117-0007 Part B (live `synchronous_commit=off` — wire `flushWAL` to the WAL
+      writer, thread the commit-record LSN into `setStatusWithLSN`, drop the inline
+      per-commit fsync) and M0117-0008 Part B (on-disk `datfrozenxid` persistence —
+      needs a runtime shared-catalog RelFileNode resolver + `heap_inplace_update`
+      buffer-lock/WAL path). Highest blast radius (Hard-won Rule #1): dedicated
+      full-gate session (`-race` mvcc+wal, xlog_replay, heterogeneous PG-standby
+      E2E, fresh-server TPC-H Q12/Q13) for whichever Part is picked up next.
 - [x] **M0119-0003 — initdb remaining options. RESOLVED by triage 2026-06-29
       (M0119-0001), no separate impl loop needed.** Every listed option already
       landed on this branch — `--encoding` (`internal/initdb/encoding.go`),

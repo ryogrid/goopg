@@ -20,6 +20,9 @@ func TestReplayCLogFromWAL_NativeCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatal(err)
+	}
 	txnMgr := mvcc.NewManager()
 
 	// Write a WAL segment with one commit record for XID=5.
@@ -56,6 +59,9 @@ func TestReplayCLogFromWAL_NativeAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatal(err)
+	}
 	txnMgr := mvcc.NewManager()
 
 	w, err := wal.NewWriter(wal.Config{WALDir: walDir, PageHeaders: false})
@@ -86,6 +92,9 @@ func TestReplayCLogFromWAL_CommitInvalAlsoStamps(t *testing.T) {
 
 	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
 		t.Fatal(err)
 	}
 	txnMgr := mvcc.NewManager()
@@ -119,6 +128,9 @@ func TestReplayCLogFromWAL_MissingWalDir(t *testing.T) {
 	dir := t.TempDir()
 	clog, err := mvcc.OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
 		t.Fatal(err)
 	}
 	txnMgr := mvcc.NewManager()
