@@ -20,10 +20,13 @@ type Publication struct {
 	// and calls getRoleName() on it, which pg_fatal()s with "role with
 	// OID %u does not exist" if the OID doesn't resolve — so an unset
 	// (zero) Owner isn't a cosmetic gap, it makes pg_dump abort outright
-	// on any database containing a publication. CreatePublication always
-	// sets this to the bootstrap superuser OID (10), mirroring the
-	// hardcoded-owner convention used by CREATE CONVERSION/other DDL that
-	// doesn't yet track per-session ownership. DU-002 slice 422.
+	// on any database containing a publication. CreatePublication defaults
+	// this to the bootstrap superuser OID (10); CreatePublicationAsOwner
+	// (called from the executor with the connection's currently-effective
+	// role, DU-002 slice 424) lets a session running under `SET ROLE`/`SET
+	// SESSION AUTHORIZATION` own the publication it creates, mirroring
+	// PostgreSQL's `GetUserId()`-as-owner convention (`CreatePublication`,
+	// publicationcmds.c). DU-002 slice 422.
 	Owner         uint32
 	AllTables     bool
 	PublishInsert bool
@@ -45,9 +48,10 @@ type Subscription struct {
 	// pg_dump's getSubscriptions() (pg_dump.c) always selects this column
 	// and calls getRoleName() on it — same pg_fatal()-on-unresolved-OID
 	// hazard pg_publication.pubowner had (DU-002 slice 422). CreateSubscription
-	// always sets this to the bootstrap superuser OID (10), mirroring
-	// Publication.Owner's hardcoded-owner convention pending real per-session
-	// ownership tracking.
+	// defaults this to the bootstrap superuser OID (10);
+	// CreateSubscriptionAsOwner (called from the executor with the
+	// connection's currently-effective role, DU-002 slice 424) mirrors
+	// Publication.Owner's same real-ownership convention.
 	Owner        uint32
 	Publications []string
 	Enabled      bool
@@ -156,12 +160,21 @@ func DefaultPublicationOptions() PublicationOptions {
 	}
 }
 
-// CreatePublication registers a new publication. tables is the
-// qualified-table-name list (`"schema.name"`); pass nil for
-// FOR ALL TABLES (with opts.AllTables = true) or for an empty
-// FOR TABLE list. Returns ErrPublicationExists when name is
-// taken.
+// CreatePublication registers a new publication owned by the bootstrap
+// superuser. tables is the qualified-table-name list (`"schema.name"`); pass
+// nil for FOR ALL TABLES (with opts.AllTables = true) or for an empty FOR
+// TABLE list. Returns ErrPublicationExists when name is taken. Callers that
+// know the connection's currently-effective role should use
+// CreatePublicationAsOwner instead.
 func (p *PubSub) CreatePublication(name string, tables []string, opts PublicationOptions) (*Publication, error) {
+	return p.CreatePublicationAsOwner(name, tables, opts, 10)
+}
+
+// CreatePublicationAsOwner is CreatePublication with an explicit owner OID —
+// the role that issued CREATE PUBLICATION, mirroring PostgreSQL's
+// GetUserId()-as-owner convention (CreatePublication, publicationcmds.c).
+// DU-002 slice 424.
+func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts PublicationOptions, owner uint32) (*Publication, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.publications[name]; ok {
@@ -170,7 +183,7 @@ func (p *PubSub) CreatePublication(name string, tables []string, opts Publicatio
 	pub := &Publication{
 		Name:          name,
 		OID:           p.nextOID,
-		Owner:         10, // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+		Owner:         owner,
 		AllTables:     opts.AllTables,
 		PublishInsert: opts.PublishInsert,
 		PublishUpdate: opts.PublishUpdate,
@@ -231,9 +244,18 @@ func (p *PubSub) Publications() []*Publication {
 	return out
 }
 
-// CreateSubscription registers a new subscription. slotName
-// defaults to name when empty (matches upstream).
+// CreateSubscription registers a new subscription owned by the bootstrap
+// superuser. slotName defaults to name when empty (matches upstream).
+// Callers that know the connection's currently-effective role should use
+// CreateSubscriptionAsOwner instead.
 func (p *PubSub) CreateSubscription(name, conninfo string, publications []string, slotName string, enabled bool) (*Subscription, error) {
+	return p.CreateSubscriptionAsOwner(name, conninfo, publications, slotName, enabled, 10)
+}
+
+// CreateSubscriptionAsOwner is CreateSubscription with an explicit owner
+// OID — the role that issued CREATE SUBSCRIPTION, mirroring
+// Publication.Owner's same real-ownership convention. DU-002 slice 424.
+func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications []string, slotName string, enabled bool, owner uint32) (*Subscription, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.subscriptions[name]; ok {
@@ -246,7 +268,7 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 		Name:         name,
 		OID:          p.nextOID,
 		Conninfo:     conninfo,
-		Owner:        10, // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+		Owner:        owner,
 		Publications: append([]string(nil), publications...),
 		Enabled:      enabled,
 		SlotName:     slotName,

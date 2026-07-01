@@ -4826,6 +4826,34 @@ documentation-only and is exempt from the design-doc requirement.)
       statement" architectural limitation, not a new gap);
       `Subscription.Owner`/`Publication.Owner` non-bootstrap tracking and the
       `DBOID()`-vs-`FirstUserOID` split remain open.
+      **2026-07-02 (loop #65, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #65"): `Publication.Owner`/`Subscription.Owner` non-bootstrap-role
+      tracking LANDED — DU-002 slice 424.** Closes the loop #60/#63/#64 rows'
+      "non-bootstrap-role tracking" resume point, now that loop #63/#64 give a
+      connection's `SET ROLE`/`SET SESSION AUTHORIZATION` state
+      (`Context.NonSuperuserRole`) somewhere to read from. New
+      `PubSub.CreatePublicationAsOwner`/`CreateSubscriptionAsOwner`
+      (`internal/catalog/pubsub.go`) take an explicit owner OID;
+      `CreatePublication`/`CreateSubscription` become thin `owner=10`
+      wrappers so every other caller keeps the bootstrap-superuser default.
+      New `ddlOp.currentDDLOwnerOID()` (`internal/executor/operators_ddl.go`)
+      resolves `o.ctx.NonSuperuserRole` via `Catalog.RoleOID` (falling back to
+      10 on an unresolvable name, which should not happen since
+      `NonSuperuserRole` is only ever set from a previously-validated role);
+      `execCreatePublication`/`execCreateSubscription` now call the
+      `...AsOwner` variants with it, so `pg_publication.pubowner`/
+      `pg_subscription.subowner` reflect the actual creating role, not always
+      "postgres". Tests: `TestCreatePublicationOwnerDefaultsToBootstrapSuperuser`
+      (pins the pre-existing no-`SET ROLE` behavior),
+      `TestCreatePublicationOwnerTracksEffectiveRole`,
+      `TestCreateSubscriptionOwnerTracksEffectiveRole`
+      (`internal/executor/operators_ddl_pubsub_test.go`). Gates: `go build
+      ./...` clean; `internal/catalog`+`internal/executor`+`internal/server`
+      suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): `ALTER PUBLICATION
+      ... OWNER TO`/`ALTER SUBSCRIPTION ... OWNER TO` still don't exist (owner
+      is fixed at CREATE time only); the `DBOID()`-vs-`FirstUserOID` split
+      (loop #60) remains open, untouched by this loop.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

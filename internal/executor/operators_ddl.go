@@ -500,6 +500,23 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	}
 }
 
+// currentDDLOwnerOID resolves the OID that should own an object created by
+// the current statement: the role currently in effect via SET ROLE / SET
+// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
+// (OID 10) when no such role is active. Mirrors PostgreSQL's
+// GetUserId()-as-owner convention (e.g. CreatePublication, publicationcmds.c).
+// An unresolvable role name (should not happen — NonSuperuserRole is only
+// ever set from a previously-validated role) falls back to the bootstrap
+// superuser rather than minting a bogus owner. DU-002 slice 424.
+func (o *ddlOp) currentDDLOwnerOID() uint32 {
+	if o.ctx.NonSuperuserRole != "" {
+		if oid, ok := o.ctx.Catalog.RoleOID(o.ctx.NonSuperuserRole); ok {
+			return oid
+		}
+	}
+	return 10
+}
+
 // execCreatePublication / execDropPublication / execCreateSubscription
 // / execDropSubscription drive the *catalog.PubSub registry attached
 // via Context.PubSub. The five virtual catalog views
@@ -551,7 +568,7 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 		}
 		tables = append(tables, tbl.QualifiedName())
 	}
-	if _, err := o.ctx.PubSub.CreatePublication(s.Name, tables, opts); err != nil {
+	if _, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID()); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	return nil
@@ -579,7 +596,7 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
 	}
 	slotName := s.With["slot_name"]
-	if _, err := o.ctx.PubSub.CreateSubscription(s.Name, s.Conninfo, s.Publications, slotName, enabled); err != nil {
+	if _, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID()); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
 	if o.ctx.OnSubscriptionChange != nil {

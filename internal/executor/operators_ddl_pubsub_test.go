@@ -98,3 +98,85 @@ func TestCreatePublicationUnknownTableErrors(t *testing.T) {
 		t.Errorf("ExecError.Code = %q, want \"42P01\"", ee.Code)
 	}
 }
+
+// TestCreatePublicationOwnerDefaultsToBootstrapSuperuser: with no SET
+// ROLE/SET SESSION AUTHORIZATION in effect, a freshly created publication is
+// still owned by the bootstrap superuser (OID 10) — the pre-existing
+// behavior, pinned so the loop #65 owner-tracking fix below doesn't regress
+// the common (superuser session) case.
+func TestCreatePublicationOwnerDefaultsToBootstrapSuperuser(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatalf("runDDL: %v", err)
+	}
+	pub, ok := ctx.PubSub.LookupPublication("p")
+	if !ok {
+		t.Fatal("publication p not registered")
+	}
+	if pub.Owner != 10 {
+		t.Errorf("pub.Owner = %d, want 10 (bootstrap superuser)", pub.Owner)
+	}
+}
+
+// TestCreatePublicationOwnerTracksEffectiveRole: a publication created while
+// SET ROLE has switched the session to a non-bootstrap role must be owned
+// by that role's OID, not the hardcoded bootstrap superuser — matching
+// PostgreSQL's GetUserId()-as-owner convention (CreatePublication,
+// publicationcmds.c). DU-002 slice 424 (closes the loop #60/#63/#64 ledger
+// rows' "Publication.Owner non-bootstrap-role tracking" deferral).
+func TestCreatePublicationOwnerTracksEffectiveRole(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("app_owner")
+	roleOID, ok := im.RoleOID("app_owner")
+	if !ok {
+		t.Fatal("app_owner not registered")
+	}
+
+	ctx.NonSuperuserRole = "app_owner"
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatalf("runDDL: %v", err)
+	}
+	pub, ok := ctx.PubSub.LookupPublication("p")
+	if !ok {
+		t.Fatal("publication p not registered")
+	}
+	if pub.Owner != roleOID {
+		t.Errorf("pub.Owner = %d, want %d (app_owner's OID)", pub.Owner, roleOID)
+	}
+}
+
+// TestCreateSubscriptionOwnerTracksEffectiveRole is
+// TestCreatePublicationOwnerTracksEffectiveRole's CREATE SUBSCRIPTION
+// counterpart: pg_subscription.subowner must reflect the effective role too.
+func TestCreateSubscriptionOwnerTracksEffectiveRole(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("sub_owner")
+	roleOID, ok := im.RoleOID("sub_owner")
+	if !ok {
+		t.Fatal("sub_owner not registered")
+	}
+
+	ctx.NonSuperuserRole = "sub_owner"
+	sql := "CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1 WITH (enabled = false)"
+	if err := runDDL(t, ctx, sql); err != nil {
+		t.Fatalf("runDDL: %v", err)
+	}
+	sub, ok := ctx.PubSub.LookupSubscription("s")
+	if !ok {
+		t.Fatal("subscription s not registered")
+	}
+	if sub.Owner != roleOID {
+		t.Errorf("sub.Owner = %d, want %d (sub_owner's OID)", sub.Owner, roleOID)
+	}
+}

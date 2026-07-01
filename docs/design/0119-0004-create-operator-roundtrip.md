@@ -1863,3 +1863,65 @@ in loop #63, same missing case).
   limitation — not a new gap, and outside this loop's scope). Also
   unchanged from loop #60: `Subscription.Owner`/`Publication.Owner`
   non-bootstrap-role tracking and the `DBOID()`-vs-`FirstUserOID` split.
+
+## Loop #65: `Publication.Owner`/`Subscription.Owner` non-bootstrap-role tracking (DU-002 slice 424)
+
+Closes the loop #60/#63/#64 rows' recurring deferral: `CREATE
+PUBLICATION`/`CREATE SUBSCRIPTION` always stamped the bootstrap superuser
+OID (10) as owner, even when the issuing session had switched roles via
+`SET ROLE`/`SET SESSION AUTHORIZATION`. Loop #63/#64 gave a connection's
+effective role somewhere to live (`executor.Context.NonSuperuserRole`,
+kept in sync by both wire protocols); this loop is the first to read it at
+a DDL-execution site rather than just a GUC-reporting one, mirroring
+PostgreSQL's `GetUserId()`-as-owner convention (`CreatePublication`,
+`postgres/src/backend/commands/publicationcmds.c`).
+
+### Fix
+
+- **`internal/catalog/pubsub.go`**: new `PubSub.CreatePublicationAsOwner(name,
+  tables, opts, owner uint32)` / `CreateSubscriptionAsOwner(name, conninfo,
+  publications, slotName, enabled, owner uint32)` — the existing
+  `CreatePublication`/`CreateSubscription` become one-line `owner: 10`
+  wrappers, so every caller that doesn't know about session role state
+  (e.g. any future internal/test caller) keeps the pre-existing
+  bootstrap-superuser-owned behavior unchanged.
+- **`internal/executor/operators_ddl.go`**: new `ddlOp.currentDDLOwnerOID()`
+  helper — returns `o.ctx.Catalog.RoleOID(o.ctx.NonSuperuserRole)` when a
+  non-superuser role is in effect, else 10. An unresolvable role name (should
+  be unreachable — `NonSuperuserRole` is only ever set from a role that
+  already passed validation at `SET ROLE` time) falls back to the bootstrap
+  superuser rather than fabricating a bogus owner OID.
+  `execCreatePublication`/`execCreateSubscription` now call the `...AsOwner`
+  variants with `o.currentDDLOwnerOID()`.
+- No wire-protocol or catalog-view changes needed — `pg_publication.pubowner`/
+  `pg_subscription.subowner` (`internal/initdb/replication_views.go`, from
+  loop #59/#60) already render `pub.Owner`/`sub.Owner`; they just receive a
+  non-bootstrap value now when applicable.
+
+### Tests
+
+`internal/executor/operators_ddl_pubsub_test.go`:
+- `TestCreatePublicationOwnerDefaultsToBootstrapSuperuser` — pins the
+  pre-existing behavior (no `SET ROLE` in effect → owner stays 10), guarding
+  against this loop's change regressing the common superuser-session case.
+- `TestCreatePublicationOwnerTracksEffectiveRole` — with
+  `ctx.NonSuperuserRole` set to a registered non-superuser role, `CREATE
+  PUBLICATION` stamps that role's OID as owner.
+- `TestCreateSubscriptionOwnerTracksEffectiveRole` — same assertion for
+  `CREATE SUBSCRIPTION`.
+
+### Gates
+
+`go build ./...` clean; `internal/catalog`+`internal/executor`+
+`internal/server` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench
+smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+`ALTER PUBLICATION ... OWNER TO`/`ALTER SUBSCRIPTION ... OWNER TO` are still
+unimplemented — a publication/subscription's owner is fixed at CREATE time
+only, with no way to reassign it afterward (PostgreSQL's
+`AlterPublicationOwner`/`AlterSubscriptionOwner`,
+`publicationcmds.c`/`subscriptioncmds.c`, have no goopg counterpart). The
+`DBOID()`-vs-`pg_database.oid`'s `FirstUserOID` split (loop #60) remains
+open, untouched by this loop.
