@@ -10607,14 +10607,47 @@ exactly:
 
 `ALTER AGGREGATE ... OWNER TO` has no equivalent yet — unlike a collation,
 goopg's aggregate DDL surface has no OWNER TO arm at all (only RENAME TO,
-M0097-0035), so there is nothing to WAL-log there. `DROP AGGREGATE` is also
-untouched: it is not wired to actually remove a registered user aggregate at
-all today (`internal/executor/operators_ddl.go`'s "DROP AGGREGATE" handling
-only validates arguments and always reports "does not exist" — a pre-existing
-M0097-regress-era gap, not something this slice's restart-persistence work
-introduced or could sensibly WAL-log against).
+M0097-0035), so there is nothing to WAL-log there.
 
-Tests: `internal/wal/aggregate_ddl_test.go` (Encode/Decode round-trip +
+#### DROP AGGREGATE wiring + restart persistence (loop #57)
+
+`DROP AGGREGATE` was discovered by the follow-up above to be completely
+non-functional: `internal/executor/operators_ddl.go`'s "DROP AGGREGATE" arm
+only validated the argument-type list and always fell through to the
+"does not exist" error path, never touching
+`catalog.InMemory.userAggregates` — a pre-existing M0097-regress-era gap.
+This loop wires it end-to-end, mirroring the CREATE/DROP COLLATION template:
+
+- New `catalog.InMemory.DropUserAggregate` (mirrors `DropCollation`) and its
+  discard-result recovery counterpart `DropUserAggregateDuringRecovery`
+  (`internal/catalog/catalog.go`).
+- `execDropCompat`'s `objType == "aggregate"` arm
+  (`internal/executor/operators_ddl.go`) now calls `DropUserAggregate` by
+  name before falling through to the existing "does not exist"/schema-check
+  logic; on success it WAL-logs and returns. goopg's aggregate registry has
+  no overload resolution (keyed by name only, like
+  `RenameUserAggregate`/`LookupUserAggregateByName`), so a name match drops
+  regardless of the DROP statement's declared `ArgTypes` — consistent with
+  every other aggregate DDL arm's name-only resolution.
+- New `wal.RecordKindDropAggregate` (48) with `Encode`/`DecodeDropAggregate`
+  (`internal/wal/recovery.go`), same no-op physical-redo path as
+  `RecordKindCreateAggregate`.
+- `internal/initdb/aggregate_ddl_recovery.go`'s `replayAggregateDDLRecords`
+  gained a `RecordKindDropAggregate` case calling
+  `DropUserAggregateDuringRecovery`.
+
+Tests: `internal/wal/aggregate_ddl_test.go`
+(`TestEncodeDecodeDropAggregateRoundTrip`,
+`TestDecodeDropAggregateRejectsTruncatedPayload`),
+`internal/initdb/aggregate_ddl_recovery_test.go`
+(`TestAggregateDDLRecoveryReplaysDropAfterCreate` — full second-`Open`
+CREATE-then-DROP replay proof), `internal/executor/storage_ddl_test.go`
+(`TestDDLDropAggregateRemovesUserAggregate` — DROP actually removes the
+aggregate, a second DROP without `IF EXISTS` now correctly raises `42883`,
+and `DROP ... IF EXISTS` on a missing aggregate is a no-op).
+
+Tests (restart-persistence slice, unchanged):
+`internal/wal/aggregate_ddl_test.go` (Encode/Decode round-trip +
 truncated-payload guard) and
 `internal/initdb/aggregate_ddl_recovery_test.go` (`TestAggregateDDLRecoveryReplaysCreate`,
 `TestAggregateDDLRecoveryReplaysRenameAfterCreate`,

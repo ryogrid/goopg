@@ -124,6 +124,49 @@ func TestAggregateDDLRecoveryReplaysRenameAfterCreate(t *testing.T) {
 	}
 }
 
+// TestAggregateDDLRecoveryReplaysDropAfterCreate confirms that a CREATE
+// AGGREGATE followed by a DROP AGGREGATE replays in order, so the
+// post-restart registry no longer has the aggregate at all (loop #56 ledger
+// resume point: DROP AGGREGATE restart persistence).
+func TestAggregateDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40550)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeDropAggregate("newavg")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append drop: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	if agg := findUserAggregate(cat, "newavg"); agg != nil {
+		t.Errorf("after CREATE + DROP replay, \"newavg\" = %+v, want nil (dropped)", agg)
+	}
+}
+
 // TestReplayAggregateDDLRecordsHandlesMissingWalDir verifies the recovery
 // hook is idempotent when invoked against a missing pg_wal directory (brand
 // new initdb).

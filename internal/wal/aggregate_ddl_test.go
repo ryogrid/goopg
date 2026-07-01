@@ -79,3 +79,35 @@ func TestDecodeCreateAggregateRejectsTruncatedPayload(t *testing.T) {
 		}
 	}
 }
+
+// TestEncodeDecodeDropAggregateRoundTrip pins the DROP AGGREGATE WAL record
+// format (loop #56 ledger resume point: DROP AGGREGATE restart persistence).
+func TestEncodeDecodeDropAggregateRoundTrip(t *testing.T) {
+	cases := []string{"newavg", "myvariadicagg", "日本語集約"}
+	for _, name := range cases {
+		raw := EncodeDropAggregate(name)
+		if raw[0] != RecordKindDropAggregate {
+			t.Errorf("%q: kind byte = %d, want %d", name, raw[0], RecordKindDropAggregate)
+			continue
+		}
+		gotName, err := DecodeDropAggregate(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", name, err)
+			continue
+		}
+		if gotName != name {
+			t.Errorf("decoded %q, want %q", gotName, name)
+		}
+	}
+}
+
+// TestDecodeDropAggregateRejectsTruncatedPayload guards against a panic on a
+// corrupt/truncated WAL record.
+func TestDecodeDropAggregateRejectsTruncatedPayload(t *testing.T) {
+	full := EncodeDropAggregate("agg")
+	for n := 0; n < len(full); n++ {
+		if _, err := DecodeDropAggregate(full[:n]); err == nil {
+			t.Errorf("truncated to %d bytes: want error, got nil", n)
+		}
+	}
+}

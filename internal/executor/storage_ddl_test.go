@@ -112,6 +112,49 @@ func TestDDLDropTableRemovesCatalogAndFile(t *testing.T) {
 	}
 }
 
+// TestDDLDropAggregateRemovesUserAggregate confirms DROP AGGREGATE actually
+// removes a registered user aggregate from the catalog (loop #56 ledger
+// resume point: previously this arm only validated arg types and always
+// reported "does not exist", M0097-regress-era gap, never wired to
+// catalog.InMemory.userAggregates at all).
+func TestDDLDropAggregateRemovesUserAggregate(t *testing.T) {
+	ctx, catIface, cleanup := newDDLFixture(t)
+	defer cleanup()
+	cat := catIface.(*catalog.InMemory)
+
+	cat.RegisterUserAggregate(&catalog.UserAggregate{
+		Name:     "newavg",
+		ArgTypes: []string{"int4"},
+		SType:    "_int8",
+		SFunc:    "int4_avg_accum",
+	})
+	if _, ok := cat.LookupUserAggregateByName("newavg"); !ok {
+		t.Fatal("aggregate not registered before DROP")
+	}
+
+	if err := runDDL(t, ctx, "DROP AGGREGATE newavg(int4)"); err != nil {
+		t.Fatalf("DROP AGGREGATE: %v", err)
+	}
+	if _, ok := cat.LookupUserAggregateByName("newavg"); ok {
+		t.Errorf("aggregate still registered after DROP AGGREGATE")
+	}
+
+	// A second DROP AGGREGATE without IF EXISTS must now hit the
+	// "does not exist" error path (the aggregate is really gone).
+	err := runDDL(t, ctx, "DROP AGGREGATE newavg(int4)")
+	if err == nil {
+		t.Fatal("DROP AGGREGATE on an already-dropped aggregate should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42883" {
+		t.Errorf("want 42883, got %v", err)
+	}
+
+	// IF EXISTS on a missing aggregate is a no-op.
+	if err := runDDL(t, ctx, "DROP AGGREGATE IF EXISTS newavg(int4)"); err != nil {
+		t.Errorf("DROP AGGREGATE IF EXISTS on missing aggregate: %v", err)
+	}
+}
+
 func TestDDLCreateTempTableShadowsPermanentTable(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()

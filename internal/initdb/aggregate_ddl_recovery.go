@@ -1,21 +1,23 @@
 package initdb
 
-// CREATE/ALTER AGGREGATE WAL replay (DU-002 restart-persistence follow-up to
-// M0119-0004, slice 405 ledger resume point (c)).
+// CREATE/ALTER/DROP AGGREGATE WAL replay (DU-002 restart-persistence
+// follow-up to M0119-0004, slice 405 ledger resume point (c); DROP added in
+// loop #56's ledger row resume point).
 //
-// Physical WAL replay (`wal.ReplayFromDirWithMgr`) ignores the CREATE/ALTER
-// AGGREGATE record kinds (46 and 47) because goopg has no per-aggregate file
-// namespace — there is no page-level state to reconstruct. The catalog's
-// user-aggregate registry, however, is the in-memory source of truth that
-// backs the pg_aggregate/pg_proc virtual views (pg_dump's getAggregates/
-// dumpAgg) AND the planner's isUserAggregateFunc lookup used at query
-// execution time. This recovery pass walks the WAL once after physical
-// replay finishes, decodes each CREATE/ALTER AGGREGATE record, and applies
-// it to the catalog so the post-restart server agrees with what the
-// pre-crash server told the client. Mirrors replayCastDDLRecords. Unlike a
-// collation/conversion, a user aggregate has no Schema field yet (see the
-// slice 405 ledger row's resume point (a)), so this does not depend on
-// replaySchemaDDLRecords having run first.
+// Physical WAL replay (`wal.ReplayFromDirWithMgr`) ignores the CREATE/ALTER/
+// DROP AGGREGATE record kinds (46, 47, and 48) because goopg has no
+// per-aggregate file namespace — there is no page-level state to
+// reconstruct. The catalog's user-aggregate registry, however, is the
+// in-memory source of truth that backs the pg_aggregate/pg_proc virtual
+// views (pg_dump's getAggregates/dumpAgg) AND the planner's
+// isUserAggregateFunc lookup used at query execution time. This recovery
+// pass walks the WAL once after physical replay finishes, decodes each
+// CREATE/ALTER/DROP AGGREGATE record, and applies it to the catalog so the
+// post-restart server agrees with what the pre-crash server told the
+// client. Mirrors replayCastDDLRecords. Unlike a collation/conversion, a
+// user aggregate has no Schema field yet (see the slice 405 ledger row's
+// resume point (a)), so this does not depend on replaySchemaDDLRecords
+// having run first.
 
 import (
 	"errors"
@@ -31,6 +33,7 @@ import (
 type aggregateRegistryRecovery interface {
 	RegisterUserAggregateDuringRecovery(agg *catalog.UserAggregate)
 	RenameUserAggregateDuringRecovery(oldName, newName string)
+	DropUserAggregateDuringRecovery(name string)
 }
 
 // replayAggregateDDLRecords reads every WAL record under walDir and applies
@@ -97,6 +100,12 @@ func replayAggregateDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode alter-aggregate-rename at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.RenameUserAggregateDuringRecovery(name, newName)
+		case wal.RecordKindDropAggregate:
+			name, derr := wal.DecodeDropAggregate(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode drop-aggregate at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.DropUserAggregateDuringRecovery(name)
 		}
 	}
 	return nil

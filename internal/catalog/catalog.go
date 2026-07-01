@@ -2944,6 +2944,27 @@ func (c *InMemory) RenameUserAggregate(oldName, newName string) bool {
 	return true
 }
 
+// DropUserAggregate removes a user-defined aggregate by name
+// (case-insensitive). Returns true if an aggregate was found and removed.
+// Mirrors DropCollation.
+func (c *InMemory) DropUserAggregate(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	if _, ok := c.userAggregates[key]; !ok {
+		return false
+	}
+	delete(c.userAggregates, key)
+	return true
+}
+
+// DropUserAggregateDuringRecovery is the discard-result recovery
+// counterpart to DropUserAggregate, mirroring
+// DropCollationDuringRecovery/RenameUserAggregateDuringRecovery.
+func (c *InMemory) DropUserAggregateDuringRecovery(name string) {
+	c.DropUserAggregate(name)
+}
+
 // RegisterUserAggregateDuringRecovery is the idempotent version of
 // RegisterUserAggregate used by the WAL-replay driver
 // (internal/initdb/aggregate_ddl_recovery.go). Unlike RegisterUserAggregate

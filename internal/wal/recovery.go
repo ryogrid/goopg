@@ -585,6 +585,13 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
 	RecordKindAlterAggregateRename byte = 47
 
+	// RecordKindDropAggregate records a `DROP AGGREGATE name(args)` event so
+	// the removal survives a restart. Same no-op physical redo path as
+	// RecordKindCreateAggregate. Mirrors RecordKindDropCollation.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropAggregate byte = 48
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1531,6 +1538,36 @@ func DecodeAlterAggregateRename(payload []byte) (name, newName string, err error
 	}
 	newName = string(payload[off : off+newNameLen])
 	return name, newName, nil
+}
+
+// EncodeDropAggregate encodes a DROP AGGREGATE event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #56 ledger resume
+// point). Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeDropAggregate(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropAggregate
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropAggregate decodes a RecordKindDropAggregate payload.
+func DecodeDropAggregate(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-aggregate payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropAggregate {
+		return "", fmt.Errorf("wal: record kind %d is not drop-aggregate", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-aggregate payload truncated (need %d bytes)", 3+nameLen)
+	}
+	name = string(payload[3 : 3+nameLen])
+	return name, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -3315,8 +3352,8 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's collation registry.
 		return false, nil
-	case RecordKindCreateAggregate, RecordKindAlterAggregateRename:
-		// CREATE/ALTER AGGREGATE records (DU-002 restart-persistence
+	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate:
+		// CREATE/ALTER/DROP AGGREGATE records (DU-002 restart-persistence
 		// follow-up, slice 405 resume point (c)) carry only pg_aggregate/
 		// pg_proc metadata; goopg has no per-aggregate file namespace, so
 		// the physical replay path has nothing to do. The recovery driver

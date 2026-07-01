@@ -12590,6 +12590,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
 	if objType == "aggregate" && len(s.Names) > 0 {
 		aggName := s.Names[0]
+		// A registered user aggregate (M0097-0035 CREATE AGGREGATE, DU-002
+		// slice 405) actually drops now instead of always reporting
+		// "does not exist" (loop #56 ledger resume point). goopg's
+		// aggregate registry has no overload resolution (keyed by name
+		// only, like RenameUserAggregate/LookupUserAggregateByName), so a
+		// name match drops regardless of the DROP statement's ArgTypes.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			if im.DropUserAggregate(aggName.Name) {
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAggregate(aggName.Name)); werr != nil {
+						return fmt.Errorf("wal drop-aggregate: %w", werr)
+					}
+				}
+				return nil
+			}
+		}
 		// Schema-qualified with non-existent schema.
 		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema) {
 			if s.IfExists {

@@ -3869,6 +3869,34 @@ documentation-only and is exempt from the design-doc requirement.)
       hook. Deferred (unchanged from slice 405, ledger row appended):
       `pronamespace` hardcoded to `public`; built-in aggregates'
       `aggtransfn`/... still render raw OIDs on direct query.
+      **2026-07-01 (loop #57): DROP AGGREGATE wiring + restart persistence
+      LANDED** — closes the loop #56 row's "DROP AGGREGATE is not wired"
+      deferral. `internal/executor/operators_ddl.go`'s "DROP AGGREGATE" arm
+      previously only validated arg types and always reported "does not
+      exist", never touching `catalog.InMemory.userAggregates` at all (a
+      pre-existing M0097-regress-era gap). Now wired end-to-end mirroring the
+      CREATE/DROP COLLATION template: new `catalog.InMemory.DropUserAggregate`
+      (mirrors `DropCollation`) + `DropUserAggregateDuringRecovery`; the DROP
+      executor arm calls it before falling through to the existing
+      "does not exist" error path and WAL-logs on success (name-only match,
+      no overload resolution — same as every other aggregate DDL arm); new
+      `wal.RecordKindDropAggregate` (48) with `Encode`/`DecodeDropAggregate`,
+      same no-op physical-redo path as CREATE; `aggregate_ddl_recovery.go`
+      gained a DROP replay case. Tests:
+      `TestEncodeDecodeDropAggregateRoundTrip`,
+      `TestDecodeDropAggregateRejectsTruncatedPayload` (wal),
+      `TestAggregateDDLRecoveryReplaysDropAfterCreate` (initdb, full
+      second-`Open` CREATE-then-DROP replay proof),
+      `TestDDLDropAggregateRemovesUserAggregate` (executor — DROP actually
+      removes the aggregate, re-DROP without IF EXISTS now raises 42883,
+      IF EXISTS on missing is a no-op). Design doc updated (`0110-0001-pg-dump-
+      tap-port.md` "DROP AGGREGATE wiring + restart persistence" subsection).
+      Gates: `go build ./...` clean; `internal/wal` + `internal/catalog` +
+      `internal/initdb` + `internal/executor` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33
+      PASS. Deferred (unchanged): `ALTER AGGREGATE ... OWNER TO` still has no
+      DDL arm at all; slice 405 resume points (a) `pronamespace` hardcoded to
+      `public` and (b) built-in-aggregate raw-OID rendering remain open.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
