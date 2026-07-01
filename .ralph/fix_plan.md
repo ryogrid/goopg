@@ -4212,6 +4212,50 @@ documentation-only and is exempt from the design-doc requirement.)
       `dumpOpclass`'s `amopopr::pg_catalog.regoperator` cast) is a second,
       independent gap blocking the exact upstream `op_family`/`op_class`
       fixtures (which reference real builtin cross-type btree operators).
+      **2026-07-01 (loop #37, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #37"): pg_amop/pg_amproc member store LANDED — DU-002 slice 411,
+      closes the slice 408/409 follow-up (member store itself).** Parser's
+      `parseCreateOpClassTail` now captures full `OPERATOR`/`FUNCTION`
+      AS-list entries (`parser.OpClassMember`) via new
+      `parseOperatorRefName`/`parseTypeNameAfterCast` helpers, instead of
+      skip-only parsing. Catalog gains `AmOpMember`/`AmProcMember` +
+      `RegisterAmOpMember`/`RegisterAmProcMember`/`ListAmOpMembers`/
+      `ListAmProcMembers`; `pg_amop`/`pg_amproc.VirtualRows` render the
+      registry; `dependVirtualRows` appends the matching 2 `pg_depend` rows
+      per member (opclass owns operator/function, mirroring PG's
+      `AddSubDependency` from `DefineOpClass`); `DropUserOperatorClass`
+      cascades member cleanup. `execCreateOpClass` resolves each member via
+      new `resolveOpClassOperator`/`resolveOpClassFunction` (custom
+      user-defined operators/functions only — builtins still blocked, see
+      below) and calls `registerOpClassMembers`. Two adjacent bugs fixed
+      while live-diffing against PG 18.3: `::regtype` rendered `InvalidOid`
+      as `"0"` instead of `"-"` (catalog.go + expr.go, both branches); new
+      `regoper`/`regoperator` `CastExpr` support (new
+      `catalog.RegoperatorName`/`LookupUserOperatorByName`, mirroring
+      slice 410's `RegprocedureName` shape — `name(lefttype,righttype)`).
+      Verified byte-identical against a live PG 18.3 instance for a
+      custom-operator/custom-function opclass round trip (`CREATE OPERATOR
+      public.~=~`; `CREATE OPERATOR CLASS ... AS OPERATOR 1 ~=~(int4,int4),
+      FUNCTION 1 btint4cmp(int4,int4)`). Tests: 3 new executor tests in
+      `create_operator_test.go` (member registration, pg_amop/pg_amproc
+      rendering, pg_depend rows). Gates: `go build ./...`/`go vet` clean;
+      `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/server`+`internal/planner`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `gofmt -l` flags only the same
+      pre-existing go1.25/1.26-drift files as loop #36 (verified via `git
+      stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended, still open): `FOR
+      ORDER BY` sort-family clause is parsed and discarded (no sort-family
+      member kind); the builtin-operator-catalog gap (loop #36's finding)
+      still blocks resolving BUILTIN `OPERATOR`/`FUNCTION` references in
+      realistic (non-custom-operator) opclass fixtures — this is now the
+      single largest remaining blocker for the upstream `op_family`/
+      `op_class` fixtures; NEW finding — `regoperator`/`regprocedure` never
+      schema-qualify their rendered name (PG's pg_dump connection always
+      runs with `search_path=''`, forcing `format_operator`/
+      `format_procedure` to always qualify; goopg's renderers don't), a
+      small isolated fix (unconditional `schema.` prefix via an OID→schema
+      lookup) tracked separately from the builtin-catalog work.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
