@@ -1058,6 +1058,48 @@ func TestParseAlterForeignTableAlterColumnOptions(t *testing.T) {
 	}
 }
 
+// TestParseAlterForeignTableSetForeignOptions verifies that
+// `ALTER FOREIGN TABLE ... OPTIONS ([ADD|SET|DROP] name ['value'], …)` (no
+// ALTER COLUMN prefix) parses into an AlterTableSetForeignOptions action
+// carrying the verb-tagged option list, the table-level sibling of
+// AlterTableAlterColumnOptions. Closes the loop #56 deferral-ledger resume
+// point. DU-002 slice 420.
+func TestParseAlterForeignTableSetForeignOptions(t *testing.T) {
+	sql := `ALTER FOREIGN TABLE ONLY t OPTIONS (ADD opt1 'v1', SET opt2 'v2', DROP opt3, bare 'v4')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmts[0])
+	}
+	if at.Name.Name != "t" {
+		t.Errorf("Name=%q, want %q", at.Name.Name, "t")
+	}
+	if len(at.Actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(at.Actions))
+	}
+	act := at.Actions[0]
+	if act.Kind != AlterTableSetForeignOptions {
+		t.Fatalf("Kind=%v, want AlterTableSetForeignOptions", act.Kind)
+	}
+	want := []FDWOptionChange{
+		{Verb: FDWOptionAdd, Name: "opt1", Value: "v1"},
+		{Verb: FDWOptionSet, Name: "opt2", Value: "v2"},
+		{Verb: FDWOptionDrop, Name: "opt3"},
+		{Verb: FDWOptionAdd, Name: "bare", Value: "v4"},
+	}
+	if len(act.FDWOptionChanges) != len(want) {
+		t.Fatalf("FDWOptionChanges=%+v, want %+v", act.FDWOptionChanges, want)
+	}
+	for i, w := range want {
+		if act.FDWOptionChanges[i] != w {
+			t.Errorf("FDWOptionChanges[%d]=%+v, want %+v", i, act.FDWOptionChanges[i], w)
+		}
+	}
+}
+
 // TestParseColumnDefCollation verifies that an inline `COLLATE <name>` clause is
 // captured onto ColumnDef.Collation (bare trailing component, unquoted) so the
 // column round-trips through pg_dump. Covers the quoted form (`"C"`), the

@@ -2535,6 +2535,15 @@ const (
 	// a foreign table's columns — the executor rejects a plain table.
 	// DU-002 slice 419.
 	AlterTableAlterColumnOptions
+	// AlterTableSetForeignOptions — `ALTER FOREIGN TABLE ... OPTIONS
+	// ( [ADD|SET|DROP] name ['value'], … )` — the table-level counterpart of
+	// AlterTableAlterColumnOptions (no ALTER COLUMN prefix). Mirrors PG's
+	// AT_GenericOptions (tablecmds.c ATExecGenericOptions), which merges the
+	// verb-tagged option list onto pg_foreign_table.ftoptions via
+	// transformGenericOptions (foreigncmds.c). FDWOptionChanges carries the
+	// parsed verb list. Only meaningful on a foreign table — the executor
+	// rejects a plain table. DU-002 slice 420.
+	AlterTableSetForeignOptions
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -2663,7 +2672,9 @@ type AlterTableAction struct {
 	RuleEnabledState byte
 	// FDWOptionChanges holds the verb-tagged OPTIONS (...) list for
 	// AlterTableAlterColumnOptions (`ALTER FOREIGN TABLE ... ALTER COLUMN
-	// col OPTIONS (...)`). ColumnName names the target column. DU-002 slice 419.
+	// col OPTIONS (...)`, ColumnName names the target column) and for
+	// AlterTableSetForeignOptions (`ALTER FOREIGN TABLE ... OPTIONS (...)`,
+	// table-level, ColumnName unused). DU-002 slice 419/420.
 	FDWOptionChanges []FDWOptionChange
 }
 

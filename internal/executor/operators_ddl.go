@@ -7219,6 +7219,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
+		case parser.AlterTableSetForeignOptions:
+			// ALTER FOREIGN TABLE ... OPTIONS ( [ADD|SET|DROP] name ['value'], … )
+			// — the table-level counterpart of AlterTableAlterColumnOptions above,
+			// merging onto pg_foreign_table.ftoptions (ATExecGenericOptions ->
+			// transformGenericOptions). Unlike attfdwoptions, pg_foreign_table is
+			// fully virtual (catalog.go's VirtualRows reads catalog.Table.ForeignOptions
+			// live on every scan), so no heap re-sync is needed here. DU-002 slice 420.
+			if tbl.ForeignServerName == "" {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%q is not a foreign table", tbl.Name)}
+			}
+			merged, mergeErr := applyFDWOptionChanges(tbl.ForeignOptions, act.FDWOptionChanges)
+			if mergeErr != nil {
+				return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+			}
+			tbl.ForeignOptions = merged
 		case parser.AlterTableSetDefault:
 			// SET DEFAULT expr — record the parsed DEFAULT on the catalog column
 			// AND rewrite the pg_attribute heap row so pg_dump observes

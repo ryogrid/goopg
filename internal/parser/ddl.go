@@ -6902,6 +6902,20 @@ func (p *parser) parseAlter() (Stmt, error) {
 		stmt.EnableDisableTrigger = isTrigger
 		return stmt, nil
 	}
+	// OPTIONS ( [ADD|SET|DROP] name ['value'], … ) — ALTER FOREIGN TABLE's
+	// table-level generic option list (AT_GenericOptions in real PG), the
+	// counterpart of the ALTER COLUMN ... OPTIONS (...) case below but without
+	// an ALTER COLUMN prefix. Sets pg_foreign_table.ftoptions. The executor
+	// rejects this on a non-foreign table. DU-002 slice 420, closes the
+	// loop #56 deferral-ledger resume point.
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "options") {
+		changes := p.scanAlterFDWOptionsList()
+		stmt.Actions = append(stmt.Actions, AlterTableAction{
+			Kind:             AlterTableSetForeignOptions,
+			FDWOptionChanges: changes,
+		})
+		return stmt, nil
+	}
 	// DROP CONSTRAINT name [RESTRICT|CASCADE] — real action (M0097-0036).
 	// DROP sub-commands (DROP COLUMN, DROP CONSTRAINT) are handled by
 	// parseAlterTableAction() to support comma-separated multi-action ALTER TABLE

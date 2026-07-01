@@ -1322,3 +1322,66 @@ column options would hit.
   `ALTER FOREIGN DATA WRAPPER` remains entirely unparseable. No fixture pipes
   a literal `pg_dump | psql` goopg-to-goopg restore of a foreign table — the
   new executor tests construct the equivalent SQL directly.
+
+## Loop #57 — `ALTER FOREIGN TABLE ... OPTIONS (...)` (table-level, DU-002 slice 420)
+
+Closes the loop #56 resume point: real PG's `AT_GenericOptions` /
+`ATExecGenericOptions` (`tablecmds.c:18663`, read from upstream source this
+loop) is the table-level counterpart of the column-level
+`AT_AlterColumnGenericOptions` case landed in loop #56 — a bare
+`OPTIONS (...)` right after the table name (no `ALTER COLUMN`), merging onto
+`pg_foreign_table.ftoptions` via the exact same `transformGenericOptions`
+helper PG's column-level path calls. Confirmed via `pg_foreign_table`'s
+`VirtualRows` (`internal/catalog/catalog.go`) that this catalog is fully
+virtual — it reads `catalog.Table.ForeignOptions` live on every scan, unlike
+`pg_attribute`'s heap-backed `attfdwoptions`, so unlike the column-level case
+this one needs **no** delete-old-rows + `syncTableToCatalogHeap` re-sync step.
+
+- Parser: `parseAlter` (`internal/parser/ddl.go`) gains a bare `OPTIONS (...)`
+  check as a sibling of the pre-existing `ALTER COLUMN` block, checked right
+  after `OWNER TO`/`RENAME`/`SET LOGGED`/`SET SCHEMA`/row-security/rule
+  handling and before the `DROP CONSTRAINT`/`ALTER COLUMN` fall-through —
+  reuses the existing `scanAlterFDWOptionsList` verb-tagged scanner unchanged
+  (it already starts by consuming the `OPTIONS` token). New
+  `AlterTableActionKind` constant `AlterTableSetForeignOptions`
+  (`internal/parser/ast.go`); reuses the existing `AlterTableAction.
+  FDWOptionChanges` field (doc comment widened to cover both uses).
+- Executor: new `execAlterTable` case for `AlterTableSetForeignOptions`
+  (`internal/executor/operators_ddl.go`), placed immediately after the
+  `AlterTableAlterColumnOptions` case it mirrors: rejects a non-foreign table
+  with 42809 (identical check/message to the column-level case — PG's
+  `ATExecGenericOptions`/`ATSimplePermissions` path resolves the same "is not
+  a foreign table" error for either generic-options form), then merges the
+  change list onto `catalog.Table.ForeignOptions` via the existing
+  `applyFDWOptionChanges` helper (already table-shape-agnostic — a plain
+  `[]string`, no column indirection needed) — same 42710/42704 SQLSTATEs as
+  the column-level case, since both route through one merge helper.
+- Test: `TestParseAlterForeignTableSetForeignOptions`
+  (`internal/parser/ddl_test.go`) mirrors the loop #56 parser test exactly
+  (`ONLY`, `ADD`, `SET`, `DROP`, bare-defaults-to-Add) but asserts
+  `AlterTableSetForeignOptions` with no `ColumnName`.
+  `TestAlterForeignTableSetForeignOptionsRoundtrip` /
+  `TestAlterForeignTableSetForeignOptionsErrors`
+  (`internal/executor/operators_alter_foreign_table_options_test.go`) mirror
+  the loop #56 executor tests, exercising `CREATE SERVER` → `CREATE FOREIGN
+  TABLE ... OPTIONS (...)` → `ALTER FOREIGN TABLE ... OPTIONS (...)`
+  end-to-end (ADD→SET+bare-ADD→DROP sequence, plus 42809/42710/42704).
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/catalog`+`internal/executor` suites PASS (`-count=1`);
+  `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS
+  (see working_set.md for this loop's run); `gofmt -l` clean on every
+  touched/new file (no diff overlaps the new code —
+  [[goopg_gofmt_version_mismatch_no_w]] pre-existing drift only); pgbench
+  smoke = pre-commit hook.
+- Deferred (ledger row appended): pg_dump never actually *emits* this
+  standalone statement for a foreign table it created — `dumpTableSchema`
+  always inlines table-level options directly into the `CREATE FOREIGN TABLE
+  ... SERVER ... OPTIONS (...)` clause (confirmed against the existing
+  `goopg_ftable` fixture in `TestPort_PgDumpConnectionSetup`, which already
+  round-trips `OPTIONS (schema_name 'x1')` inline at CREATE time), unlike the
+  column-level form which PG's own pg_dump deliberately splits into a
+  separate `ALTER ... ALTER COLUMN ... OPTIONS` statement. So this loop adds
+  real ALTER-grammar parity for a user issuing the statement directly
+  (post-creation option changes), but no pg_dump-driven fixture forces it —
+  same caveat the loop #56 resume point already flagged. `ALTER FOREIGN DATA
+  WRAPPER` remains entirely unparseable (unchanged from loop #56).

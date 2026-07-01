@@ -4610,6 +4610,40 @@ documentation-only and is exempt from the design-doc requirement.)
       (a structurally different, TABLE-keyword-less statement) remains
       entirely unparseable; no fixture pipes a literal `pg_dump | psql`
       goopg-to-goopg restore of a foreign table.
+      **2026-07-02 (loop #57, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #57", DU-002 slice 420): table-level `ALTER FOREIGN TABLE ...
+      OPTIONS (...)` parsing+execution LANDED — closes the loop #56 resume
+      point.** New `AlterTableSetForeignOptions` action kind
+      (`internal/parser/ast.go`); `parseAlter` (`internal/parser/ddl.go`)
+      gains a bare `OPTIONS (...)` case (no `ALTER COLUMN` prefix) as a
+      sibling of the existing `ALTER COLUMN ... OPTIONS` block, reusing
+      `scanAlterFDWOptionsList` unchanged. `execAlterTable`'s new case
+      (`internal/executor/operators_ddl.go`) mirrors the column-level case's
+      42809 check, then merges via the existing `applyFDWOptionChanges`
+      helper directly onto `catalog.Table.ForeignOptions` (same 42710/42704
+      SQLSTATEs). Confirmed `pg_foreign_table.VirtualRows`
+      (`internal/catalog/catalog.go`) is fully virtual — reads
+      `ForeignOptions` live on every scan — so unlike the column-level
+      `attfdwoptions` case, no heap delete+resync step is needed. New tests
+      `TestParseAlterForeignTableSetForeignOptions` (parser) +
+      `TestAlterForeignTableSetForeignOptionsRoundtrip`/
+      `TestAlterForeignTableSetForeignOptionsErrors` (executor), mirroring
+      the loop #56 tests one-for-one (ADD→SET+bare-ADD→DROP sequence, all 4
+      SQLSTATEs). Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (`-count=1`); `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; `gofmt -l` clean on every touched/new file (no diff
+      overlaps new code, pre-existing go1.25/1.26 drift only,
+      `goopg_gofmt_version_mismatch_no_w` memory); pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): real pg_dump never
+      actually emits this standalone statement for a foreign table it
+      created (`dumpTableSchema` always inlines table-level options into the
+      `CREATE FOREIGN TABLE ... SERVER ... OPTIONS (...)` clause at creation
+      time — confirmed against the existing `goopg_ftable` fixture); this
+      loop is real ALTER-grammar/executor parity for direct post-creation
+      use, not a pg_dump round-trip gap. `ALTER FOREIGN DATA WRAPPER` remains
+      entirely unparseable; no fixture pipes a literal `pg_dump | psql`
+      goopg-to-goopg restore of a foreign table.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
