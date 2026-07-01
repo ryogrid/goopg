@@ -3964,6 +3964,42 @@ documentation-only and is exempt from the design-doc requirement.)
       Q12/Q13. Deferred (unchanged, ledger row appended): slice 405 resume
       point (b) — `pronamespace` hardcoded to `public` and built-in-aggregate
       raw-OID rendering remain open.
+      **2026-07-01 (loop #60): `UserAggregate.NamespaceOID` LANDED — closes
+      slice 405 resume point (a)** ("`pronamespace` hardcoded to `public`").
+      `catalog.UserAggregate` gains `NamespaceOID`/`NamespaceOIDOrDefault()`
+      (mirrors `Owner`/`OwnerOrDefault()`); `execCreateAggregate` resolves
+      `s.Name.Schema` via `Catalog.SchemaOID` (unknown→public fallback, same
+      as `execCreateCollation`) and sets it before `RegisterUserAggregate`;
+      `pg_proc_view.go`'s aggregate row now renders `NamespaceOIDOrDefault()`
+      instead of the literal `"2200"`. Restart persistence:
+      `wal.Encode/DecodeCreateAggregate` gained a `schema` name field
+      (mirrors `EncodeCreateCollation`); `RegisterUserAggregateDuringRecovery`
+      now takes `schema` and resolves `NamespaceOID` against the catalog's
+      schema registry like `CreateCollationDuringRecovery` does
+      (`replayAggregateDDLRecords` already ran after `replaySchemaDDLRecords`
+      in `open.go`, so no reordering was needed). New tests:
+      `TestEncodeDecodeCreateAggregateRoundTrip` non-public-schema case;
+      `TestAggregateDDLRecoveryReplaysNonPublicSchema` (CREATE SCHEMA +
+      CREATE AGGREGATE WAL replay proof); `TestPort_PgDumpConnectionSetup`
+      fixture `CREATE AGGREGATE s.schemedavg(...)` asserting a
+      schema-qualified dump (`dumpAgg` always schema-qualifies —
+      `pg_dump.c:15492` — so this couldn't hide behind a public-schema
+      default). Design doc updated (new "`UserAggregate.NamespaceOID` —
+      closes slice 405 resume point (a)" subsection in
+      `0110-0001-pg-dump-tap-port.md`). Gates: `go build`/`go vet` clean;
+      `TestPort_PgDumpConnectionSetup` full-suite PASS; `internal/wal`+
+      `internal/initdb` targeted `Aggregate` PASS; `-race -count=1` on
+      `internal/wal`+`internal/mvcc`; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/initdb` suites PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Deferred
+      (unchanged, ledger row appended): slice 405 resume point (b) — built-in
+      aggregates' `aggtransfn`/`aggfinalfn`/... still render raw numeric OIDs
+      on a direct `pg_aggregate`/`pg_proc` query (needs a curated reverse
+      OID→proc-name table); no current fixture reads these columns directly.
+      Also unaffected: `RENAME`/`OWNER TO`/`DROP AGGREGATE` still resolve by
+      bare name only (aggregates are a single global map, not schema-scoped
+      like `userCollations`) — a pre-existing simplification, out of scope
+      here.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -14253,6 +14253,19 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 			agg.SFuncStrict = candidates[0].Strict
 		}
 	}
+	// DU-002 slice 405 resume point (a): resolve the schema-qualified name's
+	// namespace so a non-public-schema aggregate reports the right
+	// pronamespace to pg_dump instead of always claiming "public" (mirrors
+	// execCreateCollation's schema-with-public-fallback resolution).
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	agg.NamespaceOID = nsOID
 	o.ctx.Catalog.RegisterUserAggregate(agg)
 	syncAggregateToCatalogHeap(o.ctx, agg)
 	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
@@ -14262,7 +14275,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	// user-aggregate registry on the next startup. Mirrors CREATE
 	// CAST/TRANSFORM/CONVERSION/COLLATION.
 	if o.ctx.WAL != nil {
-		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAggregate(agg.Name, agg.SType, agg.SFunc, agg.FinalFunc, agg.CombineFunc, agg.InitCond, agg.FinalFuncModify, agg.ArgTypes, agg.OID, agg.SFuncStrict, agg.Variadic)); werr != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAggregate(agg.Name, schema, agg.SType, agg.SFunc, agg.FinalFunc, agg.CombineFunc, agg.InitCond, agg.FinalFuncModify, agg.ArgTypes, agg.OID, agg.SFuncStrict, agg.Variadic)); werr != nil {
 			return fmt.Errorf("wal create-aggregate: %w", werr)
 		}
 	}

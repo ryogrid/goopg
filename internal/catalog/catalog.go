@@ -2518,6 +2518,7 @@ type UserAggregate struct {
 	SFuncStrict     bool     // true if sfunc is STRICT (skips NULL inputs)
 	Variadic        bool     // true when declared with VARIADIC input arg
 	Owner           uint32   // pg_proc.proowner (role OID); 0 means "unset, defaults to bootstrap superuser" — see OwnerOrDefault. M0119-0004.
+	NamespaceOID    uint32   // pg_proc.pronamespace (schema OID); 0 means "unset, defaults to public" — see NamespaceOIDOrDefault. DU-002 slice 405 resume point (a).
 }
 
 // OwnerOrDefault returns agg.Owner, falling back to the bootstrap superuser
@@ -2528,6 +2529,16 @@ func (agg *UserAggregate) OwnerOrDefault() uint32 {
 		return 10
 	}
 	return agg.Owner
+}
+
+// NamespaceOIDOrDefault returns agg.NamespaceOID, falling back to the public
+// schema OID for aggregates registered before the NamespaceOID field existed
+// (e.g. replayed from an older WAL record that has no schema payload).
+func (agg *UserAggregate) NamespaceOIDOrDefault() uint32 {
+	if agg.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return agg.NamespaceOID
 }
 
 // UserCollation records a collation created via CREATE COLLATION so that
@@ -2984,13 +2995,22 @@ func (c *InMemory) DropUserAggregateDuringRecovery(name string) {
 // subsequent allocations do not collide. Re-applying a record for an
 // aggregate that already exists just refreshes its fields. Mirrors
 // RegisterCastDuringRecovery. DU-002 restart-persistence follow-up
-// (M0119-0004, slice 405 ledger resume point (c)).
-func (c *InMemory) RegisterUserAggregateDuringRecovery(agg *UserAggregate) {
+// (M0119-0004, slice 405 ledger resume point (c)). `schema` resolves the
+// aggregate's NamespaceOID the same way CreateCollationDuringRecovery does
+// (unknown/empty → public); this depends on replaySchemaDDLRecords having
+// already restored the schema registry, which the caller
+// (replayAggregateDDLRecords) guarantees by running after it.
+func (c *InMemory) RegisterUserAggregateDuringRecovery(agg *UserAggregate, schema string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.userAggregates == nil {
 		c.userAggregates = make(map[string]*UserAggregate)
 	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	agg.NamespaceOID = nsOID
 	c.userAggregates[strings.ToLower(agg.Name)] = agg
 	if agg.OID >= c.nextOID {
 		c.nextOID = agg.OID + 1

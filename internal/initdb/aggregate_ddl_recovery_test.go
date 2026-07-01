@@ -38,7 +38,7 @@ func TestAggregateDDLRecoveryReplaysCreate(t *testing.T) {
 		t.Fatalf("first Open: %v", err)
 	}
 	const wantOID = uint32(40530)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "public", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create-aggregate: %v", werr)
 	}
@@ -89,7 +89,7 @@ func TestAggregateDDLRecoveryReplaysRenameAfterCreate(t *testing.T) {
 		t.Fatalf("first Open: %v", err)
 	}
 	const wantOID = uint32(40540)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "public", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}
@@ -139,7 +139,7 @@ func TestAggregateDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 		t.Fatalf("first Open: %v", err)
 	}
 	const wantOID = uint32(40550)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "public", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}
@@ -183,7 +183,7 @@ func TestAggregateDDLRecoveryReplaysOwnerAfterCreate(t *testing.T) {
 	}
 	const wantOID = uint32(40560)
 	const wantOwnerOID = uint32(16401)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "public", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}
@@ -228,5 +228,64 @@ func TestReplayAggregateDDLRecordsHandlesMissingWalDir(t *testing.T) {
 	}
 	if len(cat.ListUserAggregates()) != 0 {
 		t.Errorf("no-op replay should not register any aggregate, got %+v", cat.ListUserAggregates())
+	}
+}
+
+// TestAggregateDDLRecoveryReplaysNonPublicSchema confirms the DU-002 slice
+// 405 resume point (a) fix: an aggregate created in a non-public schema
+// keeps its NamespaceOID across a restart (previously UserAggregate had no
+// Schema field at all, so pronamespace always rendered as public regardless
+// of where the aggregate actually lived). Mirrors
+// TestAggregateDDLRecoveryReplaysCreate but with a CREATE SCHEMA record
+// ahead of CREATE AGGREGATE, exercising the "replayAggregateDDLRecords runs
+// after replaySchemaDDLRecords" dependency documented at the top of
+// aggregate_ddl_recovery.go.
+func TestAggregateDDLRecoveryReplaysNonPublicSchema(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantSchemaOID = uint32(40570)
+	const wantOID = uint32(40571)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("aggschema", wantSchemaOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-schema: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("schemedavg", "aggschema", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-aggregate: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat, ok := rt2.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("Catalog is %T, expected *catalog.InMemory", rt2.Catalog)
+	}
+	agg := findUserAggregate(cat, "schemedavg")
+	if agg == nil {
+		t.Fatalf("after WAL replay, aggregate \"schemedavg\" not found; registry = %+v", cat.ListUserAggregates())
+	}
+	if agg.NamespaceOID != wantSchemaOID {
+		t.Errorf("after WAL replay, NamespaceOID = %d, want %d (aggschema's OID)", agg.NamespaceOID, wantSchemaOID)
+	}
+	if got := cat.SchemaOID("aggschema"); got != wantSchemaOID {
+		t.Errorf("aggschema SchemaOID after replay = %d, want %d", got, wantSchemaOID)
 	}
 }

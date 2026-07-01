@@ -5212,6 +5212,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "ALTER AGGREGATE public.newavg(int4) OWNER TO agg_owner_role"); err != nil {
 		t.Fatalf("alter aggregate newavg owner to agg_owner_role: %v", err)
 	}
+	// DU-002 slice 405 resume point (a): an aggregate created in a
+	// non-public schema must round-trip schema-qualified, not silently
+	// default to public. Before this fix UserAggregate had no
+	// Schema/NamespaceOID field at all, so pg_proc_view.go hardcoded
+	// pronamespace=2200 (public) for every user aggregate regardless of
+	// where CREATE AGGREGATE actually put it. Reuses schema "s" (created
+	// earlier in this fixture, slice-2431 area) and the same
+	// builtin-fallback sfunc/finalfunc as newavg to keep the fixture
+	// minimal — this is purely a namespace-resolution probe, not a new
+	// SFUNC/FINALFUNC combination.
+	if err := runSQLSimple(t, c, "CREATE AGGREGATE s.schemedavg ("+
+		"sfunc = int4_avg_accum, basetype = int4, stype = _int8, "+
+		"finalfunc = int8_avg, finalfunc_modify = shareable, initcond1 = '{0,0}')"); err != nil {
+		t.Fatalf("create aggregate s.schemedavg: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8056,6 +8071,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// against a real pg_dump 18.3 run.
 		if want := "ALTER AGGREGATE public.newavg(integer) OWNER TO agg_owner_role;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing ALTER AGGREGATE OWNER TO %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **DU-002 slice 405 resume point (a) (closed, asserted):** an aggregate
+		// created in a non-public schema must round-trip schema-qualified.
+		// dumpAgg (pg_dump.c) always renders `CREATE AGGREGATE %s.%s (...)` with
+		// `fmtId(aggnamespace)` — unconditionally schema-qualified, unlike some
+		// other object kinds that omit the schema when it matches search_path —
+		// so a namespace-resolution bug here cannot hide behind the public
+		// default the way it could for, say, a bare unqualified reference.
+		// Before this fix, pg_proc_view.go hardcoded pronamespace=2200 for
+		// every user aggregate, so this would have wrongly dumped as
+		// `CREATE AGGREGATE public.schemedavg`.
+		if want := "CREATE AGGREGATE s.schemedavg(integer) (\n" +
+			"    SFUNC = int4_avg_accum,\n" +
+			"    STYPE = bigint[],\n" +
+			"    INITCOND = '{0,0}',\n" +
+			"    FINALFUNC = int8_avg,\n" +
+			"    FINALFUNC_MODIFY = SHAREABLE\n" +
+			");"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing non-public-schema CREATE AGGREGATE %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

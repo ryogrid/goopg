@@ -10762,6 +10762,72 @@ Deferred (unchanged, carried forward): `pronamespace` hardcoded to
 `public`; built-in aggregates' `aggtransfn`/`aggfinalfn`/... still render
 raw numeric OIDs on a direct query.
 
+### `UserAggregate.NamespaceOID` — closes slice 405 resume point (a)
+
+`UserAggregate` had no schema field, so `pg_proc_view.go`'s aggregate row
+hardcoded `pronamespace = "2200"` (public) unconditionally — a `CREATE
+AGGREGATE` in any other schema would silently dump under the wrong (public)
+schema qualifier. Fixed by mirroring the `UserCollation.NamespaceOID`
+pattern end to end:
+
+- `catalog.UserAggregate` gains `NamespaceOID uint32` (0 = unresolved) plus
+  a `NamespaceOIDOrDefault()` accessor (falls back to
+  `catalog.PublicNamespaceOID`), mirroring `OwnerOrDefault()`.
+- `execCreateAggregate` (`internal/executor/operators_ddl.go`) resolves
+  `s.Name.Schema` (already captured by the parser's `parseObjectName`, just
+  never read for aggregates) via the existing `Catalog.SchemaOID` — with the
+  same "unknown → public" fallback `execCreateCollation` uses — and sets
+  `agg.NamespaceOID` before `RegisterUserAggregate`.
+- `pg_proc_view.go`'s aggregate row renders `agg.NamespaceOIDOrDefault()`
+  instead of the literal `"2200"`.
+- Restart persistence: `wal.EncodeCreateAggregate`/`DecodeCreateAggregate`
+  gained a `schema` string field (name, not OID — schema OIDs aren't stable
+  across a WAL-replay `RegisterSchemaDuringRecovery` re-allocation), carried
+  right after `name` like `EncodeCreateCollation` does. The recovery driver
+  (`internal/initdb/aggregate_ddl_recovery.go`)'s
+  `RegisterUserAggregateDuringRecovery(agg, schema)` resolves the schema
+  name to a `NamespaceOID` against the (already-restored)
+  `replaySchemaDDLRecords` output, mirroring
+  `CreateCollationDuringRecovery`. `replayAggregateDDLRecords` already ran
+  after `replaySchemaDDLRecords` in `open.go` (no reordering needed — a
+  latent ordering "free lunch" from how the two recovery passes were
+  originally sequenced).
+
+Only `CREATE AGGREGATE`'s schema is tracked — `RENAME`/`OWNER TO`/`DROP`
+still resolve by bare name only (aggregates live in a single global
+`map[string]*UserAggregate` keyed on lower-cased name, not
+schema-scoped like `userCollations`'s slice+`NamespaceOID` lookup). That is
+an existing, separate simplification (goopg has never supported two
+same-named aggregates in different schemas) and is out of scope here — this
+fix only corrects what schema a *single* aggregate reports as living in.
+
+New coverage: `TestEncodeDecodeCreateAggregateRoundTrip` extended with a
+non-public-schema case (`internal/wal/aggregate_ddl_test.go`);
+`TestAggregateDDLRecoveryReplaysNonPublicSchema`
+(`internal/initdb/aggregate_ddl_recovery_test.go`) — CREATE SCHEMA + CREATE
+AGGREGATE WAL records replay across a restart with `NamespaceOID` intact;
+new `TestPort_PgDumpConnectionSetup` fixture — `CREATE AGGREGATE
+s.schemedavg(...)` (schema `s`, created earlier in this fixture for the
+slice-54 cross-namespace guard) dumps as `CREATE AGGREGATE
+s.schemedavg(integer) (...)`, matching `dumpAgg`'s unconditional
+`fmtId(aggnamespace)` qualification (`pg_dump.c:15492` — aggregates are
+*always* schema-qualified in the dump, unlike some other object kinds that
+elide the schema when it matches `search_path`, so this bug could never
+hide behind a public-schema default in a real dump).
+
+Gates: `go build ./...` / `go vet ./...` clean; `TestPort_PgDumpConnectionSetup`
+PASS (full suite); `internal/wal`+`internal/initdb` targeted `Aggregate`
+subsets PASS; `-race -count=1` on `internal/wal`+`internal/mvcc`;
+`internal/catalog`+`internal/executor`+`internal/parser`+`internal/initdb`
+suites PASS; TPC-H spotcheck Q12/Q13; pgbench smoke (pre-commit hook).
+
+Still open under M0119-0004 (unchanged): built-in aggregates'
+`aggtransfn`/`aggfinalfn`/`aggcombinefn`/... still render raw numeric OIDs
+(not names) on a direct `pg_aggregate`/`pg_proc` query — needs a curated
+reverse OID→proc-name table (same shape as `catalog.LookupBuiltinProc`'s
+forward table); no current fixture reads these columns directly, so it
+remains untested and deferred.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

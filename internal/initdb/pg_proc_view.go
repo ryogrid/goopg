@@ -465,7 +465,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", agg.OID),
 				agg.Name,
-				"2200", // pronamespace: public (UserAggregate does not track schema yet)
+				fmt.Sprintf("%d", agg.NamespaceOIDOrDefault()), // pronamespace: schema OID (DU-002 slice 405 resume point (a))
 				"12",   // prolang: internal
 				typeNameToOIDStr(rettype),
 				strings.Join(argOIDs, " "),

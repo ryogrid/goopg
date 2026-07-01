@@ -1388,10 +1388,12 @@ func DecodeAlterCollationOwner(payload []byte) (name, schema string, ownerOID ui
 // EncodeCreateAggregate encodes a CREATE AGGREGATE event (DU-002
 // restart-persistence follow-up to M0119-0004, slice 405 resume point (c)).
 // The OID is carried so recovery re-registers the aggregate identically to
-// the live server. Format documented at the RecordKindCreateAggregate
-// constant.
-func EncodeCreateAggregate(name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool) []byte {
-	strs := []string{name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify}
+// the live server. `schema` carries the aggregate's namespace name (slice
+// 405 resume point (a)) so recovery can re-resolve pronamespace the same
+// way CreateCollation's WAL record does. Format documented at the
+// RecordKindCreateAggregate constant.
+func EncodeCreateAggregate(name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool) []byte {
+	strs := []string{name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify}
 	total := 0
 	for i, s := range strs {
 		if len(s) > 0xFFFF {
@@ -1440,12 +1442,12 @@ func EncodeCreateAggregate(name, sType, sFunc, finalFunc, combineFunc, initCond,
 }
 
 // DecodeCreateAggregate decodes a RecordKindCreateAggregate payload.
-func DecodeCreateAggregate(payload []byte) (name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool, err error) {
+func DecodeCreateAggregate(payload []byte) (name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool, err error) {
 	if len(payload) < 7 {
-		return "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload too short (%d bytes)", len(payload))
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateAggregate {
-		return "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: record kind %d is not create-aggregate", payload[0])
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: record kind %d is not create-aggregate", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	sFuncStrict = payload[5] != 0
@@ -1465,28 +1467,31 @@ func DecodeCreateAggregate(payload []byte) (name, sType, sFunc, finalFunc, combi
 		return s, nil
 	}
 	if name, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if sType, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if sFunc, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if finalFunc, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if combineFunc, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if initCond, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if finalFuncModify, err = readStr(); err != nil {
-		return "", "", "", "", "", "", "", nil, 0, false, false, err
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
 	}
 	if len(payload) < off+2 {
-		return "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+2)
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+2)
 	}
 	argCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
 	off += 2
@@ -1494,11 +1499,11 @@ func DecodeCreateAggregate(payload []byte) (name, sType, sFunc, finalFunc, combi
 	for i := 0; i < argCount; i++ {
 		a, aerr := readStr()
 		if aerr != nil {
-			return "", "", "", "", "", "", "", nil, 0, false, false, aerr
+			return "", "", "", "", "", "", "", "", nil, 0, false, false, aerr
 		}
 		argTypes = append(argTypes, a)
 	}
-	return name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify, argTypes, oid, sFuncStrict, variadic, nil
+	return name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify, argTypes, oid, sFuncStrict, variadic, nil
 }
 
 // EncodeAlterAggregateRename encodes an ALTER AGGREGATE ... RENAME TO event

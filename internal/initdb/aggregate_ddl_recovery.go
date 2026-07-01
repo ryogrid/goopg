@@ -15,10 +15,12 @@ package initdb
 // pass walks the WAL once after physical replay finishes, decodes each
 // CREATE/ALTER/DROP AGGREGATE record, and applies it to the catalog so the
 // post-restart server agrees with what the pre-crash server told the
-// client. Mirrors replayCastDDLRecords. Unlike a collation/conversion, a
-// user aggregate has no Schema field yet (see the slice 405 ledger row's
-// resume point (a)), so this does not depend on replaySchemaDDLRecords
-// having run first.
+// client. Mirrors replayCastDDLRecords. A user aggregate now carries a
+// NamespaceOID (slice 405 resume point (a), closed), resolved from the
+// WAL record's schema name the same way CreateCollationDuringRecovery
+// resolves NamespaceOID — so, like collation/conversion replay, this
+// depends on replaySchemaDDLRecords having already run (guaranteed by the
+// call order in open.go).
 
 import (
 	"errors"
@@ -32,7 +34,7 @@ import (
 // aggregateRegistryRecovery is the catalog-side surface this recovery pass
 // needs. `*catalog.InMemory` satisfies it.
 type aggregateRegistryRecovery interface {
-	RegisterUserAggregateDuringRecovery(agg *catalog.UserAggregate)
+	RegisterUserAggregateDuringRecovery(agg *catalog.UserAggregate, schema string)
 	RenameUserAggregateDuringRecovery(oldName, newName string)
 	DropUserAggregateDuringRecovery(name string)
 	SetUserAggregateOwnerDuringRecovery(name string, ownerOID uint32)
@@ -79,7 +81,7 @@ func replayAggregateDDLRecords(walDir string, cat catalog.Catalog) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateAggregate:
-			name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify, argTypes, oid, sFuncStrict, variadic, derr := wal.DecodeCreateAggregate(rec.Payload)
+			name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify, argTypes, oid, sFuncStrict, variadic, derr := wal.DecodeCreateAggregate(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-aggregate at lsn %d: %w", rec.StartLSN, derr)
 			}
@@ -95,7 +97,7 @@ func replayAggregateDDLRecords(walDir string, cat catalog.Catalog) error {
 				FinalFuncModify: finalFuncModify,
 				SFuncStrict:     sFuncStrict,
 				Variadic:        variadic,
-			})
+			}, schema)
 		case wal.RecordKindAlterAggregateRename:
 			name, newName, derr := wal.DecodeAlterAggregateRename(rec.Payload)
 			if derr != nil {
