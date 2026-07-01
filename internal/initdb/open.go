@@ -1389,6 +1389,21 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: event trigger DDL replay: %w", err)
 	}
 
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
+	// resume point): restore CREATE/DROP/ALTER FUNCTION/PROCEDURE objects
+	// from the WAL. Like event triggers, routines are keyed by a plain
+	// schema name string (no NamespaceOID to resolve), so order relative to
+	// schema replay does not matter. Runs after event trigger replay so a
+	// restored event trigger's evtfoid can (in principle) be cross-checked
+	// against a restored routine, though neither replay path validates the
+	// other today.
+	if err := replayFunctionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: function DDL replay: %w", err)
+	}
+
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
 	if err := registerPgSequencesView(cat); err != nil {

@@ -5435,7 +5435,19 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 		// recreate in the same transaction). DropRoutine is idempotent on a
 		// missing routine; skip rather than abort an in-progress commit.
 		if rs != nil {
-			_ = rs.DropRoutine(d.Routine)
+			if err := rs.DropRoutine(d.Routine); err == nil {
+				// DU-002 restart-persistence follow-up (M0119-0004, loop #71
+				// ledger resume point). This function only runs at actual
+				// COMMIT (operators_tx.go execCommit / dispatch.go's
+				// simple-query TxCommit case) — never at ROLLBACK, which
+				// discards the deferred entries via TakeDeferredRoutineDrops
+				// without ever calling this — so logging here is inherently
+				// rollback-safe, unlike a log-at-statement-time approach
+				// would be for a deferred-to-commit drop.
+				if ctx.WAL != nil {
+					_, _, _ = ctx.WAL.Append(wal.EncodeDropFunction(d.Routine.OID))
+				}
+			}
 		}
 		funcStats.dropFunction(d.Routine.OID)
 	}
@@ -9808,6 +9820,85 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	return nil
 }
 
+// routineToCreateFunctionPayload converts a catalog.Routine into the WAL
+// wire format, shared by CREATE FUNCTION and CREATE PROCEDURE persistence.
+// Dependency-tracking fields (SequenceDeps/RoutineCallOIDs/TableDeps/
+// ColumnDeps) are intentionally NOT carried — see CreateFunctionPayload's
+// doc comment; the recovery driver recomputes them via ExtractRoutineDeps.
+func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayload {
+	args := make([]wal.FunctionArgPayload, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		a := wal.FunctionArgPayload{TypeName: t.Name, TypeArgs: t.Args}
+		if i < len(r.ArgNames) {
+			a.Name = r.ArgNames[i]
+		}
+		if i < len(r.ArgModes) {
+			a.Mode = r.ArgModes[i]
+		}
+		if i < len(r.ArgDefaults) {
+			a.Default = r.ArgDefaults[i]
+		}
+		args[i] = a
+	}
+	return wal.CreateFunctionPayload{
+		OID:             r.OID,
+		Schema:          r.Schema,
+		Name:            r.Name,
+		Args:            args,
+		ReturnTypeName:  r.ReturnType.Name,
+		ReturnTypeArgs:  r.ReturnType.Args,
+		ReturnsSet:      r.ReturnsSet,
+		ReturnsTable:    r.ReturnsTable,
+		Language:        r.Language,
+		Body:            r.Body,
+		Strict:          r.Strict,
+		Volatile:        r.Volatile,
+		Parallel:        r.Parallel,
+		Cost:            r.Cost,
+		Rows:            r.Rows,
+		SecurityDefiner: r.SecurityDefiner,
+		Leakproof:       r.Leakproof,
+		IsProcedure:     r.IsProcedure,
+		IsWindow:        r.IsWindow,
+		BeginAtomic:     r.BeginAtomic,
+		IsReturnForm:    r.IsReturnForm,
+		KindChar:        r.KindChar,
+	}
+}
+
+// walLogCreateRoutine WAL-logs a successful CREATE [OR REPLACE]
+// FUNCTION/PROCEDURE so it survives a restart (DU-002 restart-persistence
+// follow-up to M0119-0004, loop #71 ledger resume point). Mirrors
+// execCreateEventTrigger's WAL.Append call. r is nil-checked defensively
+// (Routines.Create always returns a non-nil routine on success, but a nil
+// WAL is common in embedded/test setups without a live WAL writer).
+func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
+	if o.ctx.WAL == nil || r == nil {
+		return nil
+	}
+	if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateFunction(routineToCreateFunctionPayload(r))); werr != nil {
+		return fmt.Errorf("wal create-function: %w", werr)
+	}
+	return nil
+}
+
+// walLogDropRoutine WAL-logs a routine removal by OID (DU-002
+// restart-persistence follow-up to M0119-0004, loop #71 ledger resume
+// point). Used for DROP FUNCTION's immediate-autocommit and
+// deferred-at-commit removal, and CASCADE-dependent drops. NOT used for
+// DROP PROCEDURE, which mutates immediately but is undoable via
+// AddPendingRoutineDrop/ROLLBACK — see the loop #71 deferral-ledger row for
+// why that path needs its own commit-time hook before it can log safely.
+func (o *ddlOp) walLogDropRoutine(oid uint32) error {
+	if o.ctx.WAL == nil {
+		return nil
+	}
+	if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropFunction(oid)); werr != nil {
+		return fmt.Errorf("wal drop-function: %w", werr)
+	}
+	return nil
+}
+
 // execCreateFunction registers a routine in the catalog's
 // Routines() registry (M0015 Stage A step 3). Body is stored
 // verbatim — the PL/pgSQL parser/interpreter that executes it
@@ -9927,7 +10018,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	// Extract dependency information for information_schema views (SQL functions only).
 	if lang == "sql" {
-		extractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
+		ExtractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
 	}
 	// DROP-then-CREATE of the same signature inside one transaction: a deferred
 	// DROP FUNCTION (M0118-0009 `stats`) leaves the old routine in the registry
@@ -9940,7 +10031,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			funcStats.dropFunction(old.OID)
 		}
 	}
-	if _, err := rs.Create(r, s.OrReplace); err != nil {
+	created, err := rs.Create(r, s.OrReplace)
+	if err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
@@ -9961,6 +10053,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 				Detail:  detail}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	if werr := o.walLogCreateRoutine(created); werr != nil {
+		return werr
 	}
 	return nil
 }
@@ -10436,8 +10531,18 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	// RENAME TO: update the routine name in the registry.
 	if s.RenameTo != "" {
 		for _, r := range routines {
+			oid := r.OID
 			if err := rs.RenameRoutine(r, s.RenameTo); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+			}
+			// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
+			// resume point). No rollback-undo tracking exists for ALTER FUNCTION
+			// RENAME (same as ALTER EVENT TRIGGER RENAME), so logging immediately
+			// at mutation time is safe — matches the established precedent.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionRename(oid, s.RenameTo)); werr != nil {
+					return fmt.Errorf("wal alter-function-rename: %w", werr)
+				}
 			}
 		}
 		return nil
@@ -10458,6 +10563,15 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		}
 		if s.Strict != nil {
 			r.Strict = *s.Strict
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
+		// resume point): log the full post-mutation snapshot of the four
+		// mutable attributes, not just the clause(s) this statement touched —
+		// simpler to replay and always reflects the routine's actual state.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionFlags(r.OID, r.Volatile, r.SecurityDefiner, r.Leakproof, r.Strict)); werr != nil {
+				return fmt.Errorf("wal alter-function-flags: %w", werr)
+			}
 		}
 	}
 	return nil
@@ -10599,7 +10713,8 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		SecurityDefiner: s.SecurityDefiner,
 		Volatile:        "v", // procedures default to volatile
 	}
-	if _, err := rs.Create(r, s.OrReplace); err != nil {
+	created, err := rs.Create(r, s.OrReplace)
+	if err != nil {
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -10610,6 +10725,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 				Detail:  fmt.Sprintf("%q is a function.", s.Name.Name)}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	if werr := o.walLogCreateRoutine(created); werr != nil {
+		return werr
 	}
 	return nil
 }
@@ -10812,13 +10930,21 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if len(allDeps) == 1 {
 			dn := routineCascadeDisplayName(allDeps[0])
 			o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
-			_ = rs.DropRoutine(allDeps[0])
+			if err := rs.DropRoutine(allDeps[0]); err == nil {
+				if werr := o.walLogDropRoutine(allDeps[0].OID); werr != nil {
+					return werr
+				}
+			}
 		} else if len(allDeps) > 1 {
 			detail := make([]string, len(allDeps))
 			for i, r := range allDeps {
 				dn := routineCascadeDisplayName(r)
 				detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
-				_ = rs.DropRoutine(r)
+				if err := rs.DropRoutine(r); err == nil {
+					if werr := o.walLogDropRoutine(r.OID); werr != nil {
+						return werr
+					}
+				}
 			}
 			o.ctx.AddNoticeWithDetail(
 				fmt.Sprintf("drop cascades to %d other objects", len(allDeps)),
@@ -10909,6 +11035,9 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if err == nil {
 			if err = rs.DropRoutine(target); err == nil {
 				funcStats.dropFunction(target.OID)
+				if werr := o.walLogDropRoutine(target.OID); werr != nil {
+					return werr
+				}
 			}
 		}
 	}
@@ -17057,7 +17186,7 @@ func inferSQLFunctionVolatility(body string) string {
 	return "i"
 }
 
-func extractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
+func ExtractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
 	// Panic recovery: extractRoutineDeps is a best-effort feature; never crash the server.
 	defer func() { recover() }() //nolint:errcheck
 	// Skip very long bodies to bound overhead.

@@ -5132,6 +5132,54 @@ documentation-only and is exempt from the design-doc requirement.)
       open on the event-trigger family itself; the broader, unrelated
       `CREATE FUNCTION` WAL/restart persistence gap (loop #71 discovery)
       remains open under its own ledger row.
+- [x] **CREATE/ALTER/DROP FUNCTION + CREATE/ALTER PROCEDURE WAL/restart
+      persistence (M0119-0004, loop #73).** **COMPLETE 2026-07-02:** closes
+      the loop #71 ledger row's own resume point — `catalog.Routines` was a
+      pure in-memory registry with no restart persistence at all, so every
+      user-defined function/procedure vanished on server restart (and any
+      event trigger's `evtfoid` reference could dangle). New WAL record
+      kinds 61-64 (`RecordKindCreateFunction`/`DropFunction`/
+      `AlterFunctionRename`/`AlterFunctionFlags`) with a struct-based
+      `CreateFunctionPayload`/`FunctionArgPayload` Encode/Decode pair (too
+      many fields — full arg list + return type + body + 8 attributes —
+      for a flat positional signature); `Body` gets a 4-byte length prefix
+      since a plpgsql body can exceed 65535 bytes. `DropFunction` carries
+      the resolved OID (not name+signature) so replay sidesteps overload
+      ambiguity. New `catalog.Routines` recovery mutators
+      (`CreateDuringRecovery`/`DropByOIDDuringRecovery`/
+      `RenameByOIDDuringRecovery`/`SetFlagsByOIDDuringRecovery`) + new
+      driver `internal/initdb/function_ddl_recovery.go`, wired into
+      `open.go` after the event-trigger replay. `executor.extractRoutineDeps`
+      exported to `ExtractRoutineDeps` so recovery recomputes SQL-routine
+      dependency data post-replay instead of serializing it. WAL logging
+      covers CREATE FUNCTION/PROCEDURE (+OR REPLACE), ALTER
+      FUNCTION/PROCEDURE/ROUTINE (RENAME TO + the four mutable attributes),
+      and DROP FUNCTION on both its autocommit-immediate and
+      deferred-to-COMMIT paths (the latter logged inside
+      `ApplyDeferredRoutineDrops` itself — the single chokepoint both
+      commit paths funnel through, which never runs on ROLLBACK, making it
+      inherently rollback-safe) plus CASCADE-dependent drops. Verified via
+      a real `goopg stop`/`start` restart cycle (not just unit tests):
+      CREATE FUNCTION (DEFAULT arg + numeric(10,2) typmod) + CREATE
+      FUNCTION IMMUTABLE + CREATE PROCEDURE + DROP FUNCTION all survive one
+      restart with correct absence of the dropped/renamed-away names;
+      ALTER FUNCTION RENAME TO + STRICT SECURITY DEFINER survive with all
+      flags intact; the restored procedure/function both still execute.
+      Tests: `internal/wal/function_ddl_test.go`,
+      `internal/initdb/function_ddl_recovery_test.go` (6 tests). Gates:
+      `go build`/`go vet` clean; `internal/wal`+`internal/catalog`+
+      `internal/executor`+`internal/initdb`+`internal/planner`+
+      `internal/parser`+`internal/server` suites PASS; `TestPort_
+      PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full
+      pre-commit gate incl. pgbench TPC-B smoke (0 failed transactions)
+      PASS. Design doc: `0119-0004-create-operator-roundtrip.md` "Loop
+      #73". Deferred (ledger row appended): `DROP PROCEDURE` has NO WAL
+      persistence — it uses a different, scattered 7-call-site
+      rollback-undo mechanism than `DROP FUNCTION`'s single
+      `ApplyDeferredRoutineDrops` chokepoint, and logging at its immediate
+      mutation point would be unsafe (a rolled-back `DROP PROCEDURE` would
+      still show as dropped post-restart) — needs its own commit-time hook
+      first.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

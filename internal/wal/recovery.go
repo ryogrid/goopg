@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -701,6 +702,47 @@ const (
 	// Format:
 	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
 	RecordKindAlterEventTriggerOwner byte = 60
+
+	// RecordKindCreateFunction records a `CREATE [OR REPLACE] FUNCTION` /
+	// `CREATE [OR REPLACE] PROCEDURE` event so it survives a restart. goopg
+	// has no per-routine on-disk file namespace (catalog.Routines is a pure
+	// in-memory registry, unlike pg_class/pg_attribute-backed objects), so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/function_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each routine with its
+	// original OID. Mirrors RecordKindCreateEventTrigger. DU-002
+	// restart-persistence follow-up (M0119-0004, loop #71 ledger resume
+	// point). CREATE OR REPLACE reuses the OID of the routine it replaces
+	// (Routines.Create's own contract), so a plain re-apply of this record
+	// for an unchanged signature is naturally idempotent. Encoded via the
+	// struct-based EncodeCreateFunction/DecodeCreateFunction pair (too many
+	// fields for a flat positional signature); see CreateFunctionPayload.
+	RecordKindCreateFunction byte = 61
+
+	// RecordKindDropFunction records a `DROP FUNCTION`/`DROP PROCEDURE`
+	// removal (including a CASCADE-dependent drop) by OID, so it survives a
+	// restart. The OID (not name+signature) is carried because DROP
+	// FUNCTION's own overload resolution already happened live — replaying
+	// by OID sidesteps re-resolving a possibly-ambiguous bare name against a
+	// partially-replayed registry. Format:
+	//   kind(1) | oid(4)
+	RecordKindDropFunction byte = 62
+
+	// RecordKindAlterFunctionRename records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE name(args) RENAME TO newname` event. Format:
+	//   kind(1) | oid(4) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterFunctionRename byte = 63
+
+	// RecordKindAlterFunctionFlags records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE` attribute change (VOLATILE/STABLE/IMMUTABLE, SECURITY
+	// DEFINER/INVOKER, LEAKPROOF, STRICT/CALLED ON NULL INPUT) as a full
+	// post-mutation snapshot of the four mutable attributes (not a
+	// which-clause-was-present delta) — simpler to replay and matches how
+	// execAlterFunction itself always leaves all four fields in a concrete
+	// state. Format:
+	//   kind(1) | oid(4) | flags(1: bit0=SecurityDefiner bit1=Leakproof
+	//   bit2=Strict) | volatileLen(2) | volatile(volatileLen bytes)
+	RecordKindAlterFunctionFlags byte = 64
 
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
@@ -2280,6 +2322,389 @@ func DecodeAlterEventTriggerOwner(payload []byte) (name string, ownerOID uint32,
 		return "", 0, fmt.Errorf("wal: alter-event-trigger-owner payload truncated (need %d bytes)", 7+nameLen)
 	}
 	return string(payload[7 : 7+nameLen]), ownerOID, nil
+}
+
+// FunctionArgPayload is one CREATE FUNCTION/PROCEDURE argument, mirroring
+// the parallel ArgNames/ArgTypes/ArgModes/ArgDefaults slices on
+// catalog.Routine. TypeArgs carries a type's numeric modifiers (e.g.
+// numeric(10,2)'s precision/scale) — these do not affect overload
+// resolution (PG's proargtypes is an OID list, not typmods) but do affect
+// pg_dump fidelity, so they are round-tripped like everything else.
+type FunctionArgPayload struct {
+	Name     string
+	TypeName string
+	TypeArgs []int64
+	Mode     string // "i"/"o"/"b"/"v", "" defaults to "i"
+	Default  string
+}
+
+// CreateFunctionPayload carries the metadata needed to fully reconstruct a
+// catalog.Routine during WAL replay. Dependency-tracking fields
+// (SequenceDeps/RoutineCallOIDs/TableDeps/ColumnDeps) are deliberately NOT
+// carried — the recovery driver recomputes them from Body/ArgDefaults via
+// executor.ExtractRoutineDeps after registering, the same way the live
+// CREATE FUNCTION path derives them, rather than serializing derived state.
+type CreateFunctionPayload struct {
+	OID             uint32
+	Schema          string
+	Name            string
+	Args            []FunctionArgPayload
+	ReturnTypeName  string
+	ReturnTypeArgs  []int64
+	ReturnsSet      bool
+	ReturnsTable    bool
+	Language        string
+	Body            string
+	Strict          bool
+	Volatile        string
+	Parallel        string
+	Cost            string
+	Rows            string
+	SecurityDefiner bool
+	Leakproof       bool
+	IsProcedure     bool
+	IsWindow        bool
+	BeginAtomic     bool
+	IsReturnForm    bool
+	KindChar        string
+}
+
+// EncodeCreateFunction encodes a CREATE [OR REPLACE] FUNCTION/PROCEDURE
+// event (DU-002 restart-persistence follow-up to M0119-0004, loop #71
+// ledger resume point). Format documented at the RecordKindCreateFunction
+// constant; uses 2-byte length-prefixed strings throughout except Body,
+// which gets a 4-byte prefix since a plpgsql routine body can plausibly
+// exceed 65535 bytes (unlike every other DU-002 WAL-persisted DDL family's
+// string fields).
+func EncodeCreateFunction(p CreateFunctionPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateFunction)
+	var oidBuf [4]byte
+	binary.LittleEndian.PutUint32(oidBuf[:], p.OID)
+	buf.Write(oidBuf[:])
+	var flags, flags2 byte
+	if p.ReturnsSet {
+		flags |= 1 << 0
+	}
+	if p.ReturnsTable {
+		flags |= 1 << 1
+	}
+	if p.Strict {
+		flags |= 1 << 2
+	}
+	if p.SecurityDefiner {
+		flags |= 1 << 3
+	}
+	if p.Leakproof {
+		flags |= 1 << 4
+	}
+	if p.IsProcedure {
+		flags |= 1 << 5
+	}
+	if p.IsWindow {
+		flags |= 1 << 6
+	}
+	if p.BeginAtomic {
+		flags |= 1 << 7
+	}
+	if p.IsReturnForm {
+		flags2 |= 1 << 0
+	}
+	buf.WriteByte(flags)
+	buf.WriteByte(flags2)
+	writeWALStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeWALStr32 := func(s string) {
+		if uint64(len(s)) > 0xFFFFFFFF {
+			s = s[:0xFFFFFFFF]
+		}
+		var l [4]byte
+		binary.LittleEndian.PutUint32(l[:], uint32(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeI64s := func(a []int64) {
+		var l [2]byte
+		if len(a) > 0xFFFF {
+			a = a[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(l[:], uint16(len(a)))
+		buf.Write(l[:])
+		var v [8]byte
+		for _, x := range a {
+			binary.LittleEndian.PutUint64(v[:], uint64(x))
+			buf.Write(v[:])
+		}
+	}
+	writeWALStr16(p.Schema)
+	writeWALStr16(p.Name)
+	writeWALStr16(p.Language)
+	writeWALStr16(p.Volatile)
+	writeWALStr16(p.Parallel)
+	writeWALStr16(p.Cost)
+	writeWALStr16(p.Rows)
+	writeWALStr16(p.KindChar)
+	writeWALStr32(p.Body)
+	writeWALStr16(p.ReturnTypeName)
+	writeI64s(p.ReturnTypeArgs)
+	var argCount [2]byte
+	args := p.Args
+	if len(args) > 0xFFFF {
+		args = args[:0xFFFF]
+	}
+	binary.LittleEndian.PutUint16(argCount[:], uint16(len(args)))
+	buf.Write(argCount[:])
+	for _, a := range args {
+		writeWALStr16(a.Name)
+		writeWALStr16(a.TypeName)
+		writeI64s(a.TypeArgs)
+		mode := byte(0)
+		if len(a.Mode) > 0 {
+			mode = a.Mode[0]
+		}
+		buf.WriteByte(mode)
+		writeWALStr16(a.Default)
+	}
+	return buf.Bytes()
+}
+
+// DecodeCreateFunction decodes a RecordKindCreateFunction payload.
+func DecodeCreateFunction(payload []byte) (CreateFunctionPayload, error) {
+	var p CreateFunctionPayload
+	if len(payload) < 7 {
+		return p, fmt.Errorf("wal: create-function payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateFunction {
+		return p, fmt.Errorf("wal: record kind %d is not create-function", payload[0])
+	}
+	p.OID = binary.LittleEndian.Uint32(payload[1:5])
+	flags := payload[5]
+	flags2 := payload[6]
+	p.ReturnsSet = flags&(1<<0) != 0
+	p.ReturnsTable = flags&(1<<1) != 0
+	p.Strict = flags&(1<<2) != 0
+	p.SecurityDefiner = flags&(1<<3) != 0
+	p.Leakproof = flags&(1<<4) != 0
+	p.IsProcedure = flags&(1<<5) != 0
+	p.IsWindow = flags&(1<<6) != 0
+	p.BeginAtomic = flags&(1<<7) != 0
+	p.IsReturnForm = flags2&(1<<0) != 0
+	off := 7
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	readStr32 := func() (string, error) {
+		if len(payload) < off+4 {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+4)
+		}
+		l := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	readI64s := func() ([]int64, error) {
+		if len(payload) < off+2 {
+			return nil, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+		}
+		count := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+count*8 {
+			return nil, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+count*8)
+		}
+		out := make([]int64, count)
+		for i := 0; i < count; i++ {
+			out[i] = int64(binary.LittleEndian.Uint64(payload[off : off+8]))
+			off += 8
+		}
+		return out, nil
+	}
+	var err error
+	if p.Schema, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Name, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Language, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Volatile, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Parallel, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Cost, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Rows, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.KindChar, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Body, err = readStr32(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.ReturnTypeName, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.ReturnTypeArgs, err = readI64s(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if len(payload) < off+2 {
+		return CreateFunctionPayload{}, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+	}
+	argCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	p.Args = make([]FunctionArgPayload, 0, argCount)
+	for i := 0; i < argCount; i++ {
+		var a FunctionArgPayload
+		if a.Name, err = readStr16(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		if a.TypeName, err = readStr16(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		if a.TypeArgs, err = readI64s(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		if len(payload) < off+1 {
+			return CreateFunctionPayload{}, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+1)
+		}
+		if payload[off] != 0 {
+			a.Mode = string(payload[off])
+		}
+		off++
+		if a.Default, err = readStr16(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		p.Args = append(p.Args, a)
+	}
+	return p, nil
+}
+
+// EncodeDropFunction encodes a DROP FUNCTION/PROCEDURE removal by OID
+// (DU-002 restart-persistence follow-up to M0119-0004, loop #71 ledger
+// resume point). Format documented at the RecordKindDropFunction constant.
+func EncodeDropFunction(oid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindDropFunction
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	return out
+}
+
+// DecodeDropFunction decodes a RecordKindDropFunction payload.
+func DecodeDropFunction(payload []byte) (oid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: drop-function payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropFunction {
+		return 0, fmt.Errorf("wal: record kind %d is not drop-function", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// EncodeAlterFunctionRename encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// RENAME TO event (DU-002 restart-persistence follow-up to M0119-0004,
+// loop #71 ledger resume point). Format documented at the
+// RecordKindAlterFunctionRename constant.
+func EncodeAlterFunctionRename(oid uint32, newName string) []byte {
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(newName))
+	out[0] = RecordKindAlterFunctionRename
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(newName)))
+	copy(out[7:], newName)
+	return out
+}
+
+// DecodeAlterFunctionRename decodes a RecordKindAlterFunctionRename
+// payload.
+func DecodeAlterFunctionRename(payload []byte) (oid uint32, newName string, err error) {
+	if len(payload) < 7 {
+		return 0, "", fmt.Errorf("wal: alter-function-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionRename {
+		return 0, "", fmt.Errorf("wal: record kind %d is not alter-function-rename", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return 0, "", fmt.Errorf("wal: alter-function-rename payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return oid, string(payload[7 : 7+nameLen]), nil
+}
+
+// EncodeAlterFunctionFlags encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// attribute change as a full post-mutation snapshot of the four mutable
+// attributes (DU-002 restart-persistence follow-up to M0119-0004, loop #71
+// ledger resume point). Format documented at the RecordKindAlterFunctionFlags
+// constant.
+func EncodeAlterFunctionFlags(oid uint32, volatile string, securityDefiner, leakproof, strict bool) []byte {
+	if len(volatile) > 0xFFFF {
+		volatile = volatile[:0xFFFF]
+	}
+	out := make([]byte, 8+len(volatile))
+	out[0] = RecordKindAlterFunctionFlags
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	var flags byte
+	if securityDefiner {
+		flags |= 1 << 0
+	}
+	if leakproof {
+		flags |= 1 << 1
+	}
+	if strict {
+		flags |= 1 << 2
+	}
+	out[5] = flags
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(volatile)))
+	copy(out[8:], volatile)
+	return out
+}
+
+// DecodeAlterFunctionFlags decodes a RecordKindAlterFunctionFlags payload.
+func DecodeAlterFunctionFlags(payload []byte) (oid uint32, volatile string, securityDefiner, leakproof, strict bool, err error) {
+	if len(payload) < 8 {
+		return 0, "", false, false, false, fmt.Errorf("wal: alter-function-flags payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionFlags {
+		return 0, "", false, false, false, fmt.Errorf("wal: record kind %d is not alter-function-flags", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	flags := payload[5]
+	securityDefiner = flags&(1<<0) != 0
+	leakproof = flags&(1<<1) != 0
+	strict = flags&(1<<2) != 0
+	volLen := int(binary.LittleEndian.Uint16(payload[6:8]))
+	if len(payload) < 8+volLen {
+		return 0, "", false, false, false, fmt.Errorf("wal: alter-function-flags payload truncated (need %d bytes)", 8+volLen)
+	}
+	return oid, string(payload[8 : 8+volLen]), securityDefiner, leakproof, strict, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully

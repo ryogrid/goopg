@@ -2580,3 +2580,167 @@ Nothing left open on the `CREATE`/`ALTER`/`DROP EVENT TRIGGER` family
 itself. The broader, pre-existing `CREATE FUNCTION` WAL/restart persistence
 gap (discovered in loop #71, out of scope for the event-trigger thread)
 remains open under its own resume point.
+
+## Loop #73 — CREATE/ALTER/DROP FUNCTION + CREATE/ALTER PROCEDURE WAL/restart persistence
+
+Closes the loop #71 row's own resume point: `catalog.Routines` (function/
+procedure registry) had zero restart persistence, so every user-defined
+routine vanished on server restart — including a routine an event trigger's
+`evtfoid` referenced. Mirrors the event-trigger WAL/restart pattern (loop
+#71) with one structural departure driven by the object's size.
+
+### What landed
+
+Four new WAL record kinds in `internal/wal/recovery.go`:
+`RecordKindCreateFunction` (61), `RecordKindDropFunction` (62),
+`RecordKindAlterFunctionRename` (63), `RecordKindAlterFunctionFlags` (64).
+Unlike every prior DU-002 WAL-persisted DDL family (event triggers,
+aggregates, collations, publications/subscriptions, casts/transforms/
+conversions), `CREATE FUNCTION` has too many fields for a flat positional
+`Encode(a, b, c, ...) []byte` signature — a full parallel arg list (name,
+type incl. numeric typmod, mode, default), a return type, a body, and 8+
+scalar attributes — so `CreateFunctionPayload`/`FunctionArgPayload` are
+struct-based instead, following the `CreateIndexPayload` precedent
+(M0079-0001) rather than the `EncodeCreateAggregate`-style positional one.
+`Body` gets a 4-byte length prefix (every other string field keeps the
+usual 2-byte one) since a plpgsql body can plausibly exceed 65535 bytes —
+the one field in this family where the existing 2-byte convention could
+silently truncate real data. `DropFunction` carries the resolved OID, not
+name+signature: `DROP FUNCTION`'s own overload resolution already ran live
+before the WAL record is written, so replaying by OID sidesteps
+re-resolving a possibly-ambiguous bare name against a registry that may
+only be partially replayed at that point in the WAL scan.
+`AlterFunctionFlags` snapshots the post-mutation state of all four mutable
+attributes (`Volatile`/`SecurityDefiner`/`Leakproof`/`Strict`) rather than
+a which-clause-changed delta — simpler to replay and always matches what
+`execAlterFunction` itself leaves behind (PG's grammar allows combining
+multiple attribute clauses in one `ALTER FUNCTION`, so there's no single
+"the clause" to encode).
+
+`catalog.Routines` gained four recovery mutators
+(`internal/catalog/routines.go`): `CreateDuringRecovery` (idempotent,
+OID-preserving, returns the stored pointer so the caller can populate
+dependency fields on the live object), `DropByOIDDuringRecovery`,
+`RenameByOIDDuringRecovery` (thin wrapper composing `LookupByOID` +
+`RenameRoutine`), `SetFlagsByOIDDuringRecovery`. All scan `byKey` linearly
+by OID — `Routines` has no OID index today (only schema+name+signature and
+schema+name), and adding one for a recovery-only, restart-time-only path
+wasn't justified.
+
+New driver `internal/initdb/function_ddl_recovery.go`
+(`replayFunctionDDLRecords`) mirrors `replayEventTriggerDDLRecords`
+structurally: scan `wal.ReadAll`, filter `wal.IsGoopgNativeRecord`, switch
+on the kind byte. Wired into `open.go` right after the event-trigger
+replay call. Like event triggers, `catalog.Routine.Schema` is a plain
+string (no `NamespaceOID` to resolve against the schema registry), so
+ordering relative to schema replay doesn't matter.
+
+`executor.extractRoutineDeps` was renamed (exported) to `ExtractRoutineDeps`
+via `mcp__serena__rename_symbol` (one call site updated automatically) so
+the recovery driver can call it directly — `internal/initdb` already
+imports `internal/executor` elsewhere, no cycle. For a replayed
+`Language == "sql"` routine, the driver calls `ExtractRoutineDeps` on the
+stored routine after registration, recomputing `SequenceDeps`/
+`RoutineCallOIDs`/`TableDeps`/`ColumnDeps` from `Body`/`ArgDefaults` the
+same way the live `CREATE FUNCTION` path derives them at creation time.
+These four fields are deliberately absent from `CreateFunctionPayload` —
+they're derived state, not source-of-truth state, so serializing them
+would just be a second, driftable copy.
+
+### The DROP FUNCTION transactional-safety analysis (why this loop looked harder than loop #71)
+
+`DROP FUNCTION` has two removal paths plus a CASCADE side-block, and
+naively copying the "log at statement-mutation time" convention every
+prior WAL-persisted DDL family used would have been unsafe for one of
+them:
+
+1. **Autocommit-immediate** (`execDropFunction`'s `else` branch, no
+   explicit transaction active): `rs.DropRoutine` runs immediately with no
+   rollback-undo tracking. Logging here at mutation time is safe — there's
+   nothing to diverge from, matching the event-trigger precedent.
+2. **Deferred-to-COMMIT** (explicit transaction active): the actual
+   removal doesn't happen until `ApplyDeferredRoutineDrops` runs — and
+   that function is called from exactly two places,
+   `operators_tx.go`'s `execCommit` and `dispatch.go`'s simple-query
+   `TxCommit` case, **both only on a real COMMIT**. A `ROLLBACK` instead
+   calls `sess.TakeDeferredRoutineDrops()` directly to discard the pending
+   entries — `ApplyDeferredRoutineDrops` never runs. So logging *inside*
+   `ApplyDeferredRoutineDrops`, right after the (successful)
+   `rs.DropRoutine` call, is inherently rollback-safe: the log call and the
+   durable removal are the same conditional, gated by the same single
+   chokepoint.
+3. **CASCADE-dependent drops** (`execDropFunction`'s
+   `s.Behavior == parser.DropCascade` block, which runs unconditionally
+   before the autocommit-vs-deferred dispatch): these also have no
+   rollback-undo tracking, so logging immediately is safe by the same
+   reasoning as (1).
+
+`DROP PROCEDURE` (`execDropProcedure`) was investigated and explicitly
+**excluded** from this loop: it mutates the registry immediately
+(unconditionally — no explicit-transaction deferral at all, unlike DROP
+FUNCTION) but *is* undoable on ROLLBACK, via a different mechanism
+(`BasicSession.pendingRoutineDrops`/`AddPendingRoutineDrop`, restored via
+`rs.Create(r, true)` at 7 scattered call sites across `dispatch.go`
+(5×)/`server.go` (1×)/`twophase.go` (1×), not the single
+`ApplyDeferredRoutineDrops` chokepoint DROP FUNCTION funnels through).
+Logging at `execDropProcedure`'s immediate-mutation point would reproduce
+scenario (2)'s hazard without its safety net: `BEGIN; DROP PROCEDURE
+p(); ROLLBACK;` correctly leaves `p` callable in the live session, but a
+naive immediate WAL.Append would have already made the drop durable, so a
+post-restart server would show `p` gone. See the loop #73 deferral-ledger
+row for the two resume-point options (a dedicated commit-time hook mirroring
+`ApplyDeferredRoutineDrops`, or unifying `DROP PROCEDURE` onto that same
+mechanism — the latter would also fix a pre-existing, unrelated
+transactional-visibility bug where a concurrent session sees a
+`DROP PROCEDURE`'d name disappear before the dropping transaction commits).
+
+### Live PG-compatible verification
+
+Manual server (`/tmp/goopg-fn-persist-test`, real `psql` from
+`postgres/local_install/bin`, `LD_LIBRARY_PATH` pointed at
+`postgres/local_install/lib` to work around the prebuilt libpq/psql
+version mismatch): `CREATE FUNCTION add_two(a integer, b integer DEFAULT
+1) RETURNS integer LANGUAGE sql AS 'select a + b'`, `CREATE FUNCTION
+const_fn() RETURNS integer LANGUAGE sql IMMUTABLE AS 'select 42'`,
+`CREATE PROCEDURE noop_proc(x integer) LANGUAGE sql AS 'select 1'`,
+`CREATE FUNCTION todrop() ...` + `DROP FUNCTION todrop()`, `ALTER FUNCTION
+const_fn() RENAME TO const_fn_renamed`, `ALTER FUNCTION
+const_fn_renamed() STRICT SECURITY DEFINER`, then `goopg stop` + `goopg
+start` against the same data dir. Post-restart `pg_proc` query confirmed
+`add_two`/`const_fn_renamed`/`noop_proc` present with correct
+`prosrc`/`provolatile`/`prosecdef`/`proleakproof`, `todrop` and the old
+`const_fn` name both correctly absent; `SELECT const_fn_renamed()` and
+`CALL noop_proc(5)` both executed successfully against the recovered
+`Body`.
+
+### Tests
+
+`internal/wal/function_ddl_test.go`: encode/decode round trips for all 4
+kinds, including a numeric(10,2) typmod arg, empty-args/all-flags-set,
+OUT/INOUT/VARIADIC procedure args, and multi-byte UTF-8 schema/name/body;
+wrong-kind and truncated-payload rejection for all 4 decoders.
+`internal/initdb/function_ddl_recovery_test.go`: 6 tests — real
+`Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for a plain
+CREATE (asserting the arg list, numeric typmod, and that a post-replay
+`Create` call allocates an OID past the replayed one), CREATE OR REPLACE
+(a second CREATE record for the same schema.name(sig) overwrites in place,
+preserving the OID, rather than duplicating the registry entry), CREATE +
+DROP, CREATE + RENAME + FLAGS, plus missing-WAL-dir/nil-catalog no-op
+guards.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/wal`+`internal/catalog`+
+`internal/executor`+`internal/initdb`+`internal/planner`+`internal/parser`+
+`internal/server` suites PASS; `TestPort_PgDumpConnectionSetup` PASS (no
+regression); TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
+pgbench TPC-B smoke (0 failed transactions across standard/simple-update/
+select-only) PASS.
+
+### Still deferred
+
+`DROP PROCEDURE` WAL persistence — see the "transactional-safety analysis"
+section above and the loop #73 deferral-ledger row for the resume point.
+Everything else in the `CREATE`/`ALTER`/`DROP FUNCTION` and
+`CREATE`/`ALTER PROCEDURE` surface goopg already supports at the SQL level
+is now WAL-persisted.
