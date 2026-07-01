@@ -409,6 +409,15 @@ type Table struct {
 	// (false for WITH NO DATA, true after first REFRESH). M0097-0013.
 	IsPopulated bool
 
+	// ForeignServerName marks this table as a foreign table (`CREATE FOREIGN
+	// TABLE ... SERVER <name>`), giving it relkind='f'. Empty for an ordinary
+	// table. DU-002 slice 417.
+	ForeignServerName string
+	// ForeignOptions holds the table-level OPTIONS as "name=value" elements —
+	// the pg_foreign_table.ftoptions text[] representation pg_dump's getTables
+	// reads via pg_options_to_table. DU-002 slice 417.
+	ForeignOptions []string
+
 	// ForeignKeys holds FK constraints declared on this table (inline
 	// REFERENCES or ALTER TABLE ADD FOREIGN KEY). M0096-0011.
 	ForeignKeys []ForeignKey
@@ -4200,6 +4209,8 @@ func (c *InMemory) registerSystemTables() {
 				relkind = "m"
 			} else if t.PartitionMethod != "" && t.PartitionParentOID == 0 {
 				relkind = "p"
+			} else if t.ForeignServerName != "" {
+				relkind = "f"
 			}
 			populated := "t"
 			if t.IsMatView && !t.IsPopulated {
@@ -6646,12 +6657,11 @@ func (c *InMemory) registerSystemTables() {
 	pgTablespace.VirtualRows = c.tablespaceVirtualRows
 	c.tables["pg_catalog.pg_tablespace"] = pgTablespace
 
-	// pg_foreign_table — foreign-table catalog (OID 3118). goopg implements no
-	// foreign-data wrappers, so this view is always empty. pg_dump's getTables
+	// pg_foreign_table — foreign-table catalog (OID 3118). pg_dump's getTables
 	// runs a `SELECT ftserver FROM pg_foreign_table WHERE ftrelid = c.oid`
-	// subquery in the relkind='f' branch; with no foreign tables it returns no
-	// rows (the branch is never taken for goopg relations anyway). Schema matches
-	// PG's pg_foreign_table (ftrelid, ftserver, ftoptions). M0110-0001 (DU-002).
+	// subquery in the relkind='f' branch. Schema matches PG's pg_foreign_table
+	// (ftrelid, ftserver, ftoptions). M0110-0001 (DU-002); populated by
+	// CREATE FOREIGN TABLE (DU-002 slice 417).
 	pgForeignTable := &Table{
 		Schema: "pg_catalog", Name: "pg_foreign_table", Virtual: true,
 		Columns: []Column{
@@ -6661,7 +6671,38 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3118,
 	}
-	pgForeignTable.VirtualRows = func() [][]string { return nil }
+	// Surface user-created foreign tables (CREATE FOREIGN TABLE ... SERVER ...)
+	// so they round-trip. ftserver resolves to the referenced server's stable
+	// OID (dumpTableSchema/getTables recover the server name via
+	// `SELECT srvname FROM pg_foreign_server WHERE oid = ftserver`); ftoptions
+	// is NULL (empty string) when no table-level OPTIONS were given, so
+	// dumpTableSchema omits the OPTIONS clause. DU-002 slice 417.
+	pgForeignTable.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		keys := make([]string, 0, len(c.tables))
+		for k := range c.tables {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var out [][]string
+		for _, k := range keys {
+			t := c.tables[k]
+			if t.ForeignServerName == "" {
+				continue
+			}
+			var srvOID uint32
+			if s, ok := c.foreignServers[t.ForeignServerName]; ok {
+				srvOID = s.OID
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(t.OID), 10),  // ftrelid
+				strconv.FormatUint(uint64(srvOID), 10), // ftserver
+				optionsArrayLiteral(t.ForeignOptions),  // ftoptions
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
 
 	// pg_init_privs — initial-privileges catalog (OID 3394). PG records here the

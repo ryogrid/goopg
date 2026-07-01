@@ -1355,6 +1355,14 @@ type CreateTableStmt struct {
 	// Each element is either a column name (for explicit columns) or
 	// "@@LIKE:schema.table" (for LIKE source_table clauses). M0097-0069.
 	BodyOrder []string
+	// ForeignServer holds the SERVER name from
+	// `CREATE FOREIGN TABLE name (cols) SERVER srv [OPTIONS (...)]`. Empty for
+	// an ordinary (non-foreign) table. DU-002 slice 417.
+	ForeignServer string
+	// ForeignOptions holds the table-level OPTIONS as "name=value" elements —
+	// the on-disk pg_foreign_table.ftoptions text[] representation pg_dump's
+	// getTables reads via pg_options_to_table. DU-002 slice 417.
+	ForeignOptions []string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }

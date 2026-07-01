@@ -4896,6 +4896,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'a,b')"); err != nil {
 		t.Fatalf("create server with metachar option: %v", err)
 	}
+	// Slice 417: a FOREIGN TABLE (`CREATE FOREIGN TABLE name (cols) SERVER srv
+	// [OPTIONS (...)]`) must round-trip. pg_dump's getTables selects relkind IN
+	// (..., 'f', ...); for a relkind='f' row it LEFT JOINs
+	// `pg_foreign_table ft ON (ft.ftrelid = c.oid)` to recover ftserver, and
+	// dumpTableSchema emits `CREATE FOREIGN TABLE <name> (\n <cols>\n)\nSERVER
+	// <srvname>\nOPTIONS (\n <opt>\n);` (recovering srvname via
+	// `SELECT srvname FROM pg_foreign_server WHERE oid = ftserver`) instead of
+	// the plain `CREATE TABLE` form. goopg previously discarded the entire
+	// `SERVER ... OPTIONS (...)` suffix in the parser (relkind stayed 'r' and
+	// pg_foreign_table was hardcoded empty), so a foreign table silently dumped
+	// as an ordinary table. The parser now captures ForeignServer/
+	// ForeignOptions on CreateTableStmt (also accepting, and discarding, a
+	// per-column `OPTIONS (...)` clause — pg_attribute.attfdwoptions is not
+	// modelled and no fixture asserts it); the executor validates the SERVER
+	// name (42704 if unknown, mirroring real PG) and sets
+	// catalog.Table.ForeignServerName/ForeignOptions, which drive relkind='f'
+	// and a real pg_foreign_table row. Reuses goopg_srv (created at slice 376)
+	// so no new CREATE SERVER is needed. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE FOREIGN TABLE public.goopg_ftable (c1 int options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name 'x1')"); err != nil {
+		t.Fatalf("create foreign table: %v", err)
+	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
 	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
@@ -10949,6 +10970,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		srvMcStmt := "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'a,b'\n);"
 		if !strings.Contains(res.Stdout, srvMcStmt) {
 			t.Errorf("pg_dump corrupted the metachar OPTION value (slice-384); missing %q\n  full stdout=%q", srvMcStmt, res.Stdout)
+		}
+		// Slice 417: a FOREIGN TABLE must round-trip as
+		// `CREATE FOREIGN TABLE <name> (\n    <col> <type>\n)\nSERVER <srv>\nOPTIONS
+		// (\n    <opt>\n);` — the exact upstream 002_pg_dump.pl
+		// 'CREATE FOREIGN TABLE dump_test.foreign_table SERVER s1' regexp shape,
+		// adapted to the public schema and the goopg_srv/goopg_ftable naming used
+		// throughout this test. The column-level `OPTIONS (column_name 'col1')`
+		// clause is parsed but not surfaced (matches the upstream regexp, which
+		// only checks `c1 integer`, not any per-column option). Verified against
+		// real pg_dump 18.3.
+		foreignTableBlock := "CREATE FOREIGN TABLE public.goopg_ftable (\n    c1 integer\n)\nSERVER goopg_srv\nOPTIONS (\n    schema_name 'x1'\n);"
+		if !strings.Contains(res.Stdout, foreignTableBlock) {
+			t.Errorf("pg_dump dropped the FOREIGN TABLE round-trip (slice-417); missing %q\n  full stdout=%q", foreignTableBlock, res.Stdout)
+		}
+		// A regression that lost relkind='f' (e.g. the SERVER resolution silently
+		// failing) would fall back to dumping this as a plain CREATE TABLE with no
+		// SERVER/OPTIONS suffix.
+		if strings.Contains(res.Stdout, "CREATE TABLE public.goopg_ftable (") {
+			t.Errorf("pg_dump emitted the foreign table as a plain CREATE TABLE (slice-417 relkind='f' regressed)\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

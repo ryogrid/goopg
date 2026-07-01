@@ -2208,9 +2208,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// CREATE FOREIGN TABLE ... SERVER srv — the named server must already
+	// exist (mirrors real PG's DefineRelation → GetForeignServerByName, which
+	// raises 42704 before the relation is even created). Checked here, before
+	// CreateTable, so a bad SERVER name never leaves a half-created relation
+	// behind. DU-002 slice 417.
+	if s.ForeignServer != "" {
+		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "foreign tables are not supported on this catalog"}
+		}
+		if im.ForeignServerOID(s.ForeignServer) == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("server %q does not exist", s.ForeignServer)}
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	if s.ForeignServer != "" {
+		tbl.ForeignServerName = s.ForeignServer
+		tbl.ForeignOptions = s.ForeignOptions
 	}
 	tbl.Unlogged = s.Unlogged
 	tbl.OfTypeOID = ofTypeOID // typed table `OF type` → pg_class.reloftype (DU-002 slice 374)

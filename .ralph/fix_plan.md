@@ -4516,6 +4516,39 @@ documentation-only and is exempt from the design-doc requirement.)
       existing btree opclass fixture is same-type); the builtin-operator
       catalog / `op_class_custom` / ALTER OPERATOR FAMILY DROP
       cascade-semantics gaps remain unchanged from loops #39/#41/#43.
+      **2026-07-02 (loop #54, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #54"): `CREATE FOREIGN TABLE ... SERVER ... OPTIONS (...)`
+      round-trip LANDED — DU-002 slice 417, closes the `pg_foreign_table`
+      gap open since M0110-0001 (view hardcoded to `func() [][]string {
+      return nil }`).** `CreateTableStmt` gains `ForeignServer`/
+      `ForeignOptions` (`internal/parser/ast.go`); `parseCreateForeignTableTail`
+      (`internal/parser/ddl.go`) now captures `SERVER name` and an optional
+      table-level `OPTIONS (...)` (reusing the pre-existing
+      `scanFDWOptionsList` helper `CREATE SERVER`/`CREATE USER MAPPING`
+      already use) instead of skipping to `;`; `parseColumnDef` also
+      accepts-and-discards a per-column `OPTIONS (...)` clause so the
+      column list still parses. `catalog.Table` mirrors both fields
+      (`internal/catalog/catalog.go`); `pg_class`'s relkind derivation gains
+      `t.ForeignServerName != "" → 'f'`; `pg_foreign_table.VirtualRows`
+      (previously hardcoded empty) now scans live tables for a non-empty
+      `ForeignServerName`, resolving `ftserver` via the existing
+      `foreignServers`/`ForeignServerOID` registry and `ftoptions` via the
+      existing `optionsArrayLiteral` helper. `execCreateTable`
+      (`internal/executor/operators_ddl.go`) validates the `SERVER` name
+      against the registry before `CreateTable` (42704 if unknown, mirroring
+      real PG's `DefineRelation` → `GetForeignServerByName`), so a bad name
+      never leaves a half-created relation behind. Verified byte-identical
+      against real pg_dump 18.3 via `TestPort_PgDumpConnectionSetup`
+      (new fixture reuses the pre-existing `goopg_srv` foreign server).
+      Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (`-count=1`); `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Deferred (ledger
+      row appended): per-column `OPTIONS (...)` is parsed but discarded —
+      `pg_attribute.attfdwoptions` is not modelled, so no fixture can assert
+      column-level FDW options yet; real FDW-handler execution (reading from
+      an actual remote source at query time) remains entirely out of scope
+      — goopg's foreign-table support is compat/dump-only.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

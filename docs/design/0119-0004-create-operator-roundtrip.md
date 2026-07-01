@@ -1125,3 +1125,73 @@ include it there at all; it only shows up via `dumpOpfamily`'s separate
   `op_class_custom` range-type ordering fixture remains unexercised; `ALTER
   OPERATOR FAMILY ... DROP`'s class-attributed cascade/restrict semantics
   (loop #43) remain unimplemented.
+
+## Loop #54 — `CREATE FOREIGN TABLE ... SERVER ... OPTIONS (...)` round-trip (DU-002 slice 417)
+
+Closes the pre-existing `pg_foreign_table` gap noted since M0110-0001: the
+view was hardcoded to `func() [][]string { return nil }` and
+`parseCreateForeignTableTail` discarded the entire `SERVER ...
+OPTIONS (...)` suffix, so a `CREATE FOREIGN TABLE` always dumped as a plain
+`CREATE TABLE` (relkind stayed `'r'`, no `pg_foreign_table` row). This is
+independent of the OPERATOR/OPCLASS/OPFAMILY chain above (same DU-002
+umbrella milestone, unrelated object type); the slice counter is shared
+across the whole M0119-0004 catalog-view-parity effort, not per-subsystem.
+
+- Parser: `CreateTableStmt` gains `ForeignServer`/`ForeignOptions`
+  (`internal/parser/ast.go`). `parseCreateForeignTableTail`
+  (`internal/parser/ddl.go`) now captures `SERVER name` (via
+  `p.parseObjectName`) and an optional table-level `OPTIONS (...)` (via the
+  pre-existing `scanFDWOptionsList`, already used by `CREATE SERVER`/`CREATE
+  USER MAPPING`) instead of skipping to `;`. `parseColumnDef` also accepts
+  (and discards) a per-column `OPTIONS (...)` clause — real PG's column-level
+  FDW options land in `pg_attribute.attfdwoptions`, which goopg does not
+  model, and no in-scope fixture asserts it — so the column list of a
+  multi-option foreign table still parses cleanly without silently
+  mis-tokenizing the trailing `OPTIONS (...)` as part of the next column.
+- Catalog: `Table` gains `ForeignServerName`/`ForeignOptions`
+  (`internal/catalog/catalog.go`). `registerSystemTables`'s `pg_class`
+  relkind derivation gains an `else if t.ForeignServerName != ""` branch
+  (`relkind = "f"`), alongside the existing view/matview/partitioned-table
+  branches. `pg_foreign_table.VirtualRows` (previously hardcoded empty) now
+  scans `c.tables`, emitting `(ftrelid, ftserver, ftoptions)` for every table
+  with a non-empty `ForeignServerName` — `ftserver` resolves through the
+  existing `foreignServers` map/`ForeignServerOID` (same registry `CREATE
+  SERVER` populates), `ftoptions` reuses the existing `optionsArrayLiteral`
+  helper (same text-array encoding `pg_foreign_server.srvoptions` already
+  uses).
+- Executor: `execCreateTable` (`internal/executor/operators_ddl.go`) validates
+  `s.ForeignServer` against the catalog's foreign-server registry *before*
+  calling `CreateTable`, raising `42704` (`undefined_object`) if the named
+  server doesn't exist — mirrors real PG's `DefineRelation` calling
+  `GetForeignServerByName(..., false)` ahead of `heap_create_with_catalog`,
+  so a bad `SERVER` name never leaves a half-created relation behind (goopg
+  has no transactional catalog rollback for a partially-created table, so
+  checking first is load-bearing, not just a nicety). On success, stores
+  `ForeignServerName`/`ForeignOptions` onto the new `catalog.Table`.
+- Test: extended `TestPort_PgDumpConnectionSetup`
+  (`internal/testport/pgdump_connsetup_test.go`) — reuses the `goopg_srv`
+  foreign server from the pre-existing slice-376 fixture (no new `CREATE
+  SERVER` needed) to `CREATE FOREIGN TABLE public.goopg_ftable (c1 int
+  options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name
+  'x1')`, then asserts pg_dump emits the exact upstream
+  `002_pg_dump.pl`-shaped block (`CREATE FOREIGN TABLE public.goopg_ftable
+  (\n    c1 integer\n)\nSERVER goopg_srv\nOPTIONS (\n    schema_name
+  'x1'\n);`) plus a negative assertion that no plain `CREATE TABLE
+  public.goopg_ftable (` line leaked out (the regression signature if
+  `relkind` fell back to `'r'`, e.g. from a silently-failed server lookup).
+- **Verified against real `pg_dump` 18.3** via the existing
+  `TestPort_PgDumpConnectionSetup` harness (spawns the real client binary
+  against a live goopg server) — not a hand-rolled string comparison against
+  a mocked catalog.
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/catalog`+`internal/executor` suites PASS (`-count=1`);
+  `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS;
+  pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): the per-column `OPTIONS (...)` clause is
+  parsed and discarded — `pg_attribute.attfdwoptions` is not modelled, so a
+  fixture asserting column-level FDW options would fail today. `CREATE
+  SERVER`'s `srvtype`/`srvversion` and a real FDW-handler execution path
+  (actually reading from a remote source at query time) remain entirely out
+  of scope for goopg's compat-only foreign-table support — `ForeignServer`/
+  `ForeignOptions` exist purely so DDL+`pg_dump` round-trip; no query ever
+  executes against a real remote source.

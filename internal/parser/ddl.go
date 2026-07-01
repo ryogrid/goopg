@@ -1920,16 +1920,39 @@ func (p *parser) parseCreateConversionTail(pos int, isDefault bool) (Stmt, error
 
 // parseCreateForeignTableTail parses the tail of CREATE FOREIGN TABLE after the TABLE keyword.
 // Grammar: name [(colDefs)] SERVER servername [OPTIONS (...)]
-// Returns a CreateTableStmt; the SERVER/OPTIONS suffix is consumed and discarded.
-// Foreign tables are treated as regular tables for storage purposes in goopg v0.
+// Returns a CreateTableStmt with ForeignServer/ForeignOptions populated so
+// pg_dump's getTables (relkind='f') + pg_foreign_table (ftserver/ftoptions)
+// round-trip the `SERVER ... OPTIONS (...)` clause. DU-002 slice 417 — the
+// column-level `OPTIONS (...)` clause (parseColumnDef) is parsed but
+// discarded (pg_attribute.attfdwoptions is not modelled; no fixture in scope
+// asserts it). Foreign tables are treated as regular tables for storage
+// purposes in goopg v0.
 func (p *parser) parseCreateForeignTableTail(pos int) (Stmt, error) {
 	// Reuse the regular CREATE TABLE parser for name + column list.
 	stmt, err := p.parseCreateTableTail(pos, false)
 	if err != nil {
 		return nil, err
 	}
-	// Consume the optional SERVER name and OPTIONS (...) that follow the column list.
-	// Skip everything up to ';' or EOF.
+	ts, _ := stmt.(*CreateTableStmt)
+	// Consume the SERVER name and optional OPTIONS (...) that follow the
+	// column list.
+	if p.acceptIdentKeyword("server") {
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if ts != nil {
+			ts.ForeignServer = name.String()
+		}
+	}
+	if tok := p.cur(); tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "options") {
+		opts := p.scanFDWOptionsList()
+		if ts != nil {
+			ts.ForeignOptions = opts
+		}
+	}
+	// Skip anything else up to ';' or EOF (defensive; the grammar has no
+	// further clauses here).
 	for {
 		tok := p.cur()
 		if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -3652,6 +3675,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		case p.acceptIdentKeyword("compression"):
 			method, _ := p.parseIdent() // consume method name (pglz, lz4, default, etc.)
 			col.Compression = normalizeCompressionMethod(method.Value)
+		// OPTIONS ( name 'value', … ) — per-column FOREIGN TABLE options
+		// (`c1 int OPTIONS (column_name 'col1')`). Consumed so the column list
+		// of a CREATE FOREIGN TABLE parses; not stored (pg_attribute.attfdwoptions
+		// is not modelled and no in-scope fixture asserts it). DU-002 slice 417.
+		case p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "options"):
+			p.scanFDWOptionsList()
 		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			isAlways := p.acceptIdentKeyword("always")
