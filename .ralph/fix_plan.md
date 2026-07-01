@@ -3604,6 +3604,25 @@ documentation-only and is exempt from the design-doc requirement.)
       (Transform → Cast → Conversion → Collation) is now CLOSED.** Still open, independent: ALTER COLLATION
       (OWNER/RENAME/REFRESH VERSION) unhandled; collation ordering/enforcement is still dump-only (goopg never
       uses a collation for actual string comparison); the DROP CAST type-name-synonym key gap (loop #48) remains.
+- [x] **DROP CAST type-name-synonym key fix (closes the loop #48 deferral)**
+      **COMPLETE 2026-07-01:** `RegisterCast`/`DropCast`/`CastByTypes` (`internal/catalog/catalog.go`) keyed the
+      cast registry on the raw lowercased parsed type spelling, so `DROP CAST (real AS text)` failed to find a
+      cast created via `CREATE CAST (float4 AS text) ...` — PG built-in type-name synonyms (`real`/`float4`,
+      `integer`/`int4`, `double precision`/`float8`, …) never cross-resolved. Fixed via a new `castKey`/
+      `castKeyTypeName` pair that resolves each side through `TypeNameToOID` before keying, matching how the
+      `pg_cast` virtual view already renders `castsource`/`casttarget`. Caught and fixed a second, previously
+      latent bug in the same change: `TypeNameToOID` falls back to `OIDText` for any name it doesn't recognize
+      (domains/enums/composites aren't in its builtin switch), so naively keying on its raw result would have
+      collapsed every distinct user-defined-type cast into one shared bucket, letting unrelated casts silently
+      overwrite each other. `castKeyTypeName` detects the fallback case (result is `OIDText` but the input
+      wasn't literally `"text"`) and keys on the lowercased name instead, preserving per-type distinctness for
+      anything `TypeNameToOID` can't resolve. New tests in `internal/catalog/cast_synonym_test.go`:
+      `TestDropCastResolvesTypeNameSynonyms`, `TestDropCastResolvesMultiWordSynonyms`,
+      `TestRegisterCastIdempotentAcrossSynonyms`, `TestCastByTypesDistinctForUnrelatedTypes`,
+      `TestCastByTypesDistinctForUnknownUserDefinedTypes`. Gates: `go build`/`go vet` clean;
+      `-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb`. Catalog-only fix, no WAL format
+      change. Design doc `0110-0001-pg-dump-tap-port.md` new "DROP CAST type-name-synonym key fix" subsection;
+      ledger row appended.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

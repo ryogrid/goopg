@@ -10398,6 +10398,37 @@ Deliberately still open, independent of this backlog: the DROP CAST type-name-sy
 above), and collation ordering/`ALTER COLLATION` (slice-389's deferrals (a)/(b) — goopg still does not use a
 collation for actual string ordering; out of scope, a separate large subsystem).
 
+### DROP CAST type-name-synonym key fix (closes the loop #48 deferral)
+
+`RegisterCast`/`DropCast`/`CastByTypes` (`internal/catalog/catalog.go`) keyed the cast registry on
+`lower(source)\x00lower(target)` — the raw parsed type spelling. Real PG's `pg_cast.castsource`/`casttarget` are
+type OIDs, so `CREATE CAST (float4 AS text) ...` and `DROP CAST (real AS text) ...` name the identical cast
+("real" is a built-in synonym for "float4"), but the raw-spelling key treated them as two different entries — a
+`DROP CAST` using a different-but-equivalent spelling than its `CREATE CAST` always failed with "does not
+exist". Fixed by a new `castKey`/`castKeyTypeName` pair: each side of the key resolves through
+`TypeNameToOID` so `real`/`float4`, `integer`/`int4`, `double precision`/`float8`, etc. collapse to the same
+key, matching how `pg_cast`'s virtual view already renders `castsource`/`casttarget` via the same function.
+
+**A second, previously-latent bug surfaced while fixing this and was fixed in the same change:**
+`TypeNameToOID`'s documented behavior is to fall back to `OIDText` for any name it doesn't recognize as a
+builtin synonym (its "safe fallback" for callers like the codec that must always produce *some* OID). Naively
+keying the cast registry on `TypeNameToOID`'s raw result would have collapsed every distinct user-defined type
+(domain, enum, composite — none of which are in `TypeNameToOID`'s builtin switch) into the same `OIDText`
+bucket, so two unrelated casts each touching a different unknown type (e.g. `CREATE CAST (my_enum AS int4)` and
+`CREATE CAST (my_domain AS int4)`) would silently overwrite each other in the map. `castKeyTypeName` detects
+this case (result is `OIDText` but the input wasn't literally `"text"`) and falls back to the lowercased type
+name itself for that half of the key, preserving per-type distinctness for anything `TypeNameToOID` doesn't
+actually know how to resolve.
+
+Verified by `internal/catalog/cast_synonym_test.go`: `TestDropCastResolvesTypeNameSynonyms` /
+`TestDropCastResolvesMultiWordSynonyms` pin the original synonym-resolution bug fix;
+`TestRegisterCastIdempotentAcrossSynonyms` pins that re-registering under a synonym spelling refreshes the
+existing OID rather than duplicating the entry; `TestCastByTypesDistinctForUnrelatedTypes` /
+`TestCastByTypesDistinctForUnknownUserDefinedTypes` pin that unrelated builtin-type pairs and unrelated
+unknown/user-defined-type pairs each stay distinct registry entries. Gates: `go build`/`go vet` clean;
+`-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb`. This is a catalog-only fix — no WAL
+format change, so no restart-persistence interaction with the four-object backlog above.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

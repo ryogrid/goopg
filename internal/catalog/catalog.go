@@ -8553,7 +8553,7 @@ func (c *InMemory) RegisterCastDuringRecovery(source, target, context, method st
 	if c.casts == nil {
 		c.casts = make(map[string]*Cast)
 	}
-	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	key := castKey(source, target)
 	c.casts[key] = &Cast{OID: oid, SourceType: source, TargetType: target, Context: context, Method: method, FuncOID: funcOID}
 	if oid >= c.nextOID {
 		c.nextOID = oid + 1
@@ -8568,7 +8568,7 @@ func (c *InMemory) DropCastDuringRecovery(source, target string) {
 	if c.casts == nil {
 		return
 	}
-	delete(c.casts, strings.ToLower(source)+"\x00"+strings.ToLower(target))
+	delete(c.casts, castKey(source, target))
 }
 
 // CreateExtension records a CREATE EXTENSION install in the runtime
@@ -10293,6 +10293,34 @@ type Cast struct {
 	Method string
 }
 
+// castKey builds the cast registry's lookup key from a (source, target) type
+// name pair. Real PG's pg_cast.castsource/casttarget are OIDs, not text, so
+// "real" and "float4" (or "integer" and "int4") name the same cast — keying
+// on TypeNameToOID rather than the raw parsed spelling makes CREATE CAST
+// (float4 AS text) and DROP CAST (real AS text) cross-resolve the same entry,
+// matching how the pg_cast virtual view already renders castsource/casttarget
+// (RegisterCast's registerer, ~getFormattedTypeName call site above).
+func castKey(source, target string) string {
+	return castKeyTypeName(source) + "\x00" + castKeyTypeName(target)
+}
+
+// castKeyTypeName canonicalizes a single type name for castKey. TypeNameToOID
+// falls back to OIDText for any name it doesn't recognize as a builtin
+// synonym (its documented "safe fallback"), so naively keying on its result
+// would collapse every distinct user-defined type (domain, enum, composite)
+// into the same OIDText bucket and let unrelated custom-type casts overwrite
+// each other in the registry. Only "text" itself legitimately resolves to
+// OIDText; anything else landing there is the fallback, so keep the
+// lowercased name verbatim to preserve per-type distinctness.
+func castKeyTypeName(name string) string {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	oid := TypeNameToOID(lower)
+	if oid == OIDText && lower != "text" {
+		return lower
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
 // RegisterCast records a user-defined cast, allocating a stable OID on first
 // sight. Idempotent: re-registering the same (source, target) pair refreshes the
 // context/method/funcOID but keeps the OID. funcOID is pg_cast.castfunc — 0 for
@@ -10304,7 +10332,7 @@ func (c *InMemory) RegisterCast(source, target, context, method string, funcOID 
 	if c.casts == nil {
 		c.casts = make(map[string]*Cast)
 	}
-	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	key := castKey(source, target)
 	if cs, ok := c.casts[key]; ok {
 		if context != "" {
 			cs.Context = context
@@ -10328,7 +10356,7 @@ func (c *InMemory) DropCast(source, target string) bool {
 	if c.casts == nil {
 		return false
 	}
-	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	key := castKey(source, target)
 	if _, ok := c.casts[key]; ok {
 		delete(c.casts, key)
 		return true
@@ -10362,7 +10390,7 @@ func (c *InMemory) CastByTypes(source, target string) *Cast {
 	if c.casts == nil {
 		return nil
 	}
-	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	key := castKey(source, target)
 	if cs, ok := c.casts[key]; ok {
 		return cs
 	}
