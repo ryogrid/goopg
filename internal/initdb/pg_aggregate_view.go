@@ -14,6 +14,7 @@ package initdb
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
@@ -38,14 +39,14 @@ func registerPgAggregateView(cat *catalog.InMemory) error {
 				fmt.Sprintf("%d", e.AggFnOID),
 				string(e.AggKind),
 				fmt.Sprintf("%d", e.AggNumDirectArgs),
-				fmt.Sprintf("%d", e.AggTransFn),
-				fmt.Sprintf("%d", e.AggFinalFn),
-				fmt.Sprintf("%d", e.AggCombineFn),
-				fmt.Sprintf("%d", e.AggSerialFn),
-				fmt.Sprintf("%d", e.AggDeserialFn),
-				fmt.Sprintf("%d", e.AggMTransFn),
-				fmt.Sprintf("%d", e.AggMInvTransFn),
-				fmt.Sprintf("%d", e.AggMFinalFn),
+				aggBuiltinFuncName(e.AggTransFn),
+				aggBuiltinFuncName(e.AggFinalFn),
+				aggBuiltinFuncName(e.AggCombineFn),
+				aggBuiltinFuncName(e.AggSerialFn),
+				aggBuiltinFuncName(e.AggDeserialFn),
+				aggBuiltinFuncName(e.AggMTransFn),
+				aggBuiltinFuncName(e.AggMInvTransFn),
+				aggBuiltinFuncName(e.AggMFinalFn),
 				boolToTF(e.AggFinalExtra),
 				boolToTF(e.AggMFinalExtra),
 				string(e.AggFinalModify),
@@ -109,6 +110,52 @@ func aggFuncNameOrDash(name string) string {
 		return "-"
 	}
 	return name
+}
+
+// pgProcOIDNameIndex is a reverse OID→proname lookup over the full 3397-row
+// generated pg_proc.dat (pgProcAllEntries), built lazily and cached: the
+// forward table (catalog.LookupBuiltinProc) only curates the handful of
+// builtins referenced by name in fixtures, but aggBuiltinFuncName needs
+// every built-in aggregate support function's OID resolved (161 distinct
+// transfn/finalfn/combinefn/... references across the BKI pg_aggregate
+// rows), so it is cheaper and more accurate to index the already-generated
+// full table than to hand-curate a second one. DU-002 slice 405 resume (b).
+var (
+	pgProcOIDNameIndexOnce sync.Once
+	pgProcOIDNameIndex     map[uint32]string
+)
+
+func pgProcNameForOID(oid uint32) (string, bool) {
+	pgProcOIDNameIndexOnce.Do(func() {
+		entries := pgProcAllEntries()
+		pgProcOIDNameIndex = make(map[uint32]string, len(entries))
+		for _, e := range entries {
+			pgProcOIDNameIndex[e.OID] = e.Name
+		}
+	})
+	name, ok := pgProcOIDNameIndex[oid]
+	return name, ok
+}
+
+// aggBuiltinFuncName resolves a BKI pg_aggregate row's aggtransfn/aggfinalfn/
+// aggcombinefn/aggserialfn/aggdeserialfn/aggmtransfn/aggminvtransfn/
+// aggmfinalfn OID to its pg_proc.proname, matching how real PostgreSQL's
+// regprocout renders a regproc column on a direct query (e.g. `SELECT
+// aggtransfn FROM pg_aggregate`) -- not just the ::regproc cast path already
+// handled in executor/expr.go. InvalidOid (0, the moving-aggregate columns
+// of a plain non-window aggregate) renders "-", mirroring aggFuncNameOrDash
+// above and PG's regproc.c. Every non-zero OID pg_aggregate.dat references
+// is guaranteed present in pgProcAllEntries (both generated from the same
+// PG18 .dat files); an unresolved OID falls back to its numeric text rather
+// than panicking, a defensive guard rather than an expected path.
+func aggBuiltinFuncName(oid uint32) string {
+	if oid == 0 {
+		return "-"
+	}
+	if name, ok := pgProcNameForOID(oid); ok {
+		return name
+	}
+	return fmt.Sprintf("%d", oid)
 }
 
 // nullableAggText maps an empty agginitval/aggminitval to the catalog.VirtualNull

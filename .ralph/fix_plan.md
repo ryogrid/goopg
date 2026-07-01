@@ -4000,6 +4000,48 @@ documentation-only and is exempt from the design-doc requirement.)
       bare name only (aggregates are a single global map, not schema-scoped
       like `userCollations`) — a pre-existing simplification, out of scope
       here.
+      **2026-07-01 (loop #61): built-in `pg_aggregate` regproc columns now
+      render function names — closes slice 405 resume point (b).**
+      `registerPgAggregateView`'s 161 BKI rows rendered
+      `aggtransfn`/`aggfinalfn`/`aggcombinefn`/`aggserialfn`/`aggdeserialfn`/
+      `aggmtransfn`/`aggminvtransfn`/`aggmfinalfn` as bare numeric OID text;
+      real PG's `regprocout` always renders these as the function name on a
+      direct query (e.g. `SELECT aggtransfn FROM pg_aggregate` →
+      `int8_avg_accum`, not `2746`), matching what user-defined aggregates
+      already did (`aggFuncNameOrDash`). New `pgProcNameForOID`
+      (`internal/initdb/pg_aggregate_view.go`) indexes the already
+      machine-generated `pgProcAllEntries()` (3397-row PG18 `pg_proc.dat`)
+      by OID via a lazy `sync.Once`-cached map — reusing existing generated
+      data instead of hand-curating a second ~161-entry table — wrapped by
+      `aggBuiltinFuncName` (OID 0 → `"-"`, mirrors the existing
+      `aggFuncNameOrDash` convention). No planner change needed:
+      `TypedVirtualCell` already falls a non-numeric `regproc` cell through
+      to `StringConst`. `aggfnoid` (the join key) stays numeric/untouched.
+      New tests (`internal/initdb/pg_aggregate_view_test.go`):
+      `TestAggBuiltinFuncNameInvalidOidRendersDash`,
+      `TestAggBuiltinFuncNameResolvesKnownOID`,
+      `TestPgAggregateBKIRegprocColumnsAllResolveToNames` (guards ALL 161
+      BKI rows' non-zero regproc OIDs resolve to real names, not a numeric
+      fallback), `TestRegisterPgAggregateViewRendersBuiltinFuncNames`
+      (end-to-end `VirtualRows()` check on avg(int8)). Design doc updated
+      (new "Built-in `pg_aggregate` regproc columns render names — closes
+      slice 405 resume point (b)" subsection in
+      `0110-0001-pg-dump-tap-port.md`). Gates: `go build`/`go vet` clean;
+      new tests PASS; `TestPort_PgDumpConnectionSetup` full-suite PASS
+      (unaffected — `dumpAgg` never reads these columns directly);
+      `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/initdb` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS;
+      pgbench smoke = pre-commit hook. Deferred (ledger row appended): goopg
+      still has **no general OID→name resolution for `regproc`-typed
+      columns at query-output time** — `pg_type.typinput`/`typoutput`/...,
+      `pg_operator.oprcode`/`oprrest`/`oprjoin`, `pg_am.amproc` all still
+      render raw OIDs on a direct SELECT (no `case "regproc"` in either
+      `internal/server/dispatch.go`'s or `dispatch_extended.go`'s
+      per-column-type text-formatting switch, unlike the existing
+      `regclass` case in `dispatch.go`). Also newly confirmed (pre-existing,
+      unrelated to this fix): `dispatch_extended.go`'s type-formatting
+      switch is missing several cases `dispatch.go` has
+      (`regclass`/`date`/`time`/`bytea`).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
