@@ -504,10 +504,8 @@ func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn
 		return nil
 	}
 	// Write the 2-bit lane (clear-then-set, PG-faithful) into the resident
-	// page. Durability is driven by the group-commit leader
-	// (applyGroupBatchLocked → pool.flushDirty, one fsync per touched
-	// segment) — the SLRU is the sole durable store. An idempotent lane
-	// (already at this terminal value) skips the group-commit round-trip.
+	// page. An idempotent lane (already at this terminal value) skips the
+	// group-commit round-trip below entirely.
 	changed, err := p.setStatusWithLSN(xid, status, lsn)
 	if err != nil {
 		return err
@@ -515,7 +513,45 @@ func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn
 	if !changed {
 		return nil
 	}
+	if lsn != 0 {
+		// Async commit (M0117-0007 Part B continuation, gap G8 latency
+		// reduction): p.setStatusWithLSN above already marked the page dirty
+		// and raised its async-commit group LSN, which is enough for
+		// GetStatus (in-memory) to observe the new status right away. Skip
+		// the group-commit leader's eager durable write-back
+		// (applyGroupBatchLocked → pool.flushDirty, a synchronous fsync round
+		// trip) that a *synchronous* commit needs to return a durability
+		// guarantee to its caller — an async commit makes no such promise.
+		// The page's actual write-back is deferred to whichever happens
+		// first: a later synchronous commit's group-commit flush (which
+		// drains every currently-dirty page, not just its own), LRU
+		// eviction (pinPageLocked already barrier-guards a dirty victim), or
+		// the checkpointer's FlushAll (see CLog.FlushAll, registered as a
+		// wal.DirtyPageFlusher so a dirty async-committed page is never left
+		// unbounded between checkpoints). This is the change that removes
+		// the fsync round trip from a synchronous_commit=off commit's
+		// critical path.
+		return nil
+	}
 	return c.groupUpdate(xid, status)
+}
+
+// FlushAll writes every dirty resident CLOG page back to its segment file,
+// fsyncing each touched segment. It implements wal.DirtyPageFlusher (Go
+// interfaces are structurally satisfied, so this package need not import
+// wal) and is registered with the checkpointer alongside the heap buffer
+// pool (M0117-0007 Part B continuation) so an async commit's deferred
+// write-back above is bounded by checkpoint_timeout — without this, an
+// all-async workload could leave CLOG pages dirty in memory indefinitely,
+// bounded only by the resident-page eviction budget. A nil pool (called
+// before EnablePGSLRUMirror) is a no-op rather than a panic, mirroring
+// SetFlushWALHook's out-of-order-call contract.
+func (c *CLog) FlushAll() error {
+	p := c.pool.Load()
+	if p == nil {
+		return nil
+	}
+	return p.flushDirty()
 }
 
 // PG SLRU CLOG layout constants. PG18 packs 2 bits per XID into bytes ordered

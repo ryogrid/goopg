@@ -21,12 +21,14 @@ func TestCLogSetFlushWALHookBeforePoolExistsIsNoop(t *testing.T) {
 	c.SetFlushWALHook(func(lsn uint64) error { return nil })
 }
 
-// TestCLogSetCommittedWithLSNFiresBarrierOnFlush proves the whole Part B
-// chain: SetCommittedWithLSN records xid's commit LSN on its CLOG page, and
-// the hook installed via SetFlushWALHook is invoked with that LSN when the
-// page is later durably written back (TruncateCLOG-independent — this is
-// the same group-commit flush every SetCommitted call already goes through).
-func TestCLogSetCommittedWithLSNFiresBarrierOnFlush(t *testing.T) {
+// TestCLogSetCommittedWithLSNDefersFlush pins the M0117-0007 Part B
+// continuation (lazy async-commit write-back): SetCommittedWithLSN records
+// xid's commit LSN on its CLOG page and makes the new status immediately
+// readable in-memory, but — unlike the mechanical-wiring-only behavior this
+// test used to assert — does NOT itself force a durable write-back. The
+// group-commit flush (and hence the flushWAL barrier) only fires on a later
+// event: here, a subsequent FlushAll (the checkpointer's drain call).
+func TestCLogSetCommittedWithLSNDefersFlush(t *testing.T) {
 	dir := t.TempDir()
 	c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
@@ -50,14 +52,42 @@ func TestCLogSetCommittedWithLSNFiresBarrierOnFlush(t *testing.T) {
 		t.Fatalf("SetCommittedWithLSN: %v", err)
 	}
 
+	if flushCalls != 0 {
+		t.Fatalf("flushWAL hook called %d times immediately after SetCommittedWithLSN, want 0 (write-back must be deferred)", flushCalls)
+	}
+	// The status must already be readable in-memory even though the page is
+	// still dirty — GetStatus reads the resident buffer pool, not disk.
+	if got := c.GetStatus(xid); got != TxnStatusCommitted {
+		t.Fatalf("GetStatus(%d) = %v, want Committed", xid, got)
+	}
+
+	// FlushAll (the checkpointer's drain call) is the backstop that bounds
+	// how long the page can stay dirty; it must fire the barrier with the
+	// XID's recorded LSN.
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll: %v", err)
+	}
 	if flushCalls != 1 {
-		t.Fatalf("flushWAL hook called %d times, want 1 (SetCommittedWithLSN's own group-commit flush)", flushCalls)
+		t.Fatalf("flushWAL hook called %d times after FlushAll, want 1", flushCalls)
 	}
 	if flushedTo != lsn {
 		t.Fatalf("flushWAL got LSN %d, want %d", flushedTo, lsn)
 	}
 	if got := c.GetStatus(xid); got != TxnStatusCommitted {
-		t.Fatalf("GetStatus(%d) = %v, want Committed", xid, got)
+		t.Fatalf("GetStatus(%d) = %v, want Committed after flush", xid, got)
+	}
+}
+
+// TestCLogFlushAllBeforePoolExistsIsNoop mirrors
+// TestCLogSetFlushWALHookBeforePoolExistsIsNoop for FlushAll: calling it
+// before EnablePGSLRUMirror has created the pool must not panic.
+func TestCLogFlushAllBeforePoolExistsIsNoop(t *testing.T) {
+	c, err := OpenCLog(filepath.Join(t.TempDir(), "pg_xact_flat"))
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := c.FlushAll(); err != nil {
+		t.Fatalf("FlushAll on a pool-less CLog: %v", err)
 	}
 }
 

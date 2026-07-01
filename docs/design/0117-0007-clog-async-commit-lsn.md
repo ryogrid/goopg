@@ -1,7 +1,9 @@
 # 0117-0007 — CLOG async-commit LSN tracking (gap G8)
 
-Status: **accepted (Part A landed 2026-06-29; Part B landed 2026-07-02 — see
-"Part B" below for the scope actually delivered vs. the remaining latency gap)**
+Status: **landed (Part A 2026-06-29; Part B 2026-07-02, loop #49; Part B /
+COPY commit sites 2026-07-02, loop #50; Part C — lazy write-back +
+checkpoint-driven flush 2026-07-02, loop #51 — see "Part C" for the scope
+that closes the latency gap)**
 Milestone: M0117-0007
 
 ## Problem (gap G8)
@@ -185,25 +187,87 @@ by itself change any query's observed behaviour or performance under
 `synchronous_commit=on` (the default, and every existing gate), and is
 inert-safe under `=off` (correct, not yet faster).
 
-### Still open (Part B continuation, NOT landed this loop)
+### Part C — lazy CLOG write-back + checkpoint-driven flush (LANDED 2026-07-02, loop #51)
 
-- **Lazy CLOG write-back for async commits + checkpoint-driven CLOG flush.**
-  `CLog.setStatusWithLSN`'s call to `c.groupUpdate` would need to become
-  conditional (skip the durable write-back for an async commit, leaving the
-  page dirty), and `CLog`/`clogBufferPool` needs a `FlushAll` (or equivalent)
-  registered with the `wal.Checkpointer` as a second `DirtyPageFlusher`
-  alongside the heap pool, so a checkpoint bounds how long an async-committed
-  CLOG page can stay unflushed. This is the change that actually removes the
-  fsync round trip from a `synchronous_commit=off` commit's critical path.
-  Resume point: `internal/mvcc/clog_groupcommit.go` (`groupUpdate`),
-  `internal/mvcc/clog.go` (add an exported flush entry point alongside
-  `SetFlushWALHook`), `internal/wal/checkpointer.go` (`DirtyPageFlusher`),
-  wiring site `internal/initdb/open.go` (wherever the primary's `Checkpointer`
-  is constructed). Needs the full TPC-H spot-check + crash-recovery / standby
-  E2E gate this design doc already calls for, since it changes when CLOG
-  durability actually happens.
-- ~~**COPY's own commit call sites**~~ — **LANDED 2026-07-02, loop #50**, see
-  the "COPY's own commit call sites" paragraph above. This item is closed.
+This is the change that actually removes the fsync round trip from a
+`synchronous_commit=off` commit's critical path — the item Part B's "Still
+open" section called the real remaining scope.
+
+`CLog.setStatusWithLSN` now short-circuits before calling `c.groupUpdate`
+whenever `lsn != 0` (i.e. the call came from `SetCommittedWithLSN`, the sole
+async-commit caller — every synchronous caller still passes `lsn == 0` and is
+byte-for-byte unaffected). `p.setStatusWithLSN` has already marked the page
+dirty and raised its async-commit group LSN by that point, so `GetStatus`
+observes the new status immediately (it reads the resident buffer pool, not
+disk) — only the durable write-back (the group-commit leader's
+`applyGroupBatchLocked` → `pool.flushDirty`, a synchronous fsync round trip)
+is skipped. The page's actual write-back is deferred to whichever of these
+fires first, exactly as this doc's Part B section anticipated:
+
+1. a later **synchronous** commit's group-commit flush (`flushDirty` drains
+   every currently-dirty page, not just its own — an async-dirtied page
+   rides along for free on the next sync commit in the same process);
+2. **LRU eviction** (`pinPageLocked`'s dirty-victim path already
+   barrier-guards any dirty page, sync or async — no change needed here);
+3. the **checkpointer**, newly wired: `CLog.FlushAll() error` (a thin
+   wrapper over `pool.flushDirty()`, nil-safe before `EnablePGSLRUMirror`
+   like `SetFlushWALHook`) structurally satisfies `wal.DirtyPageFlusher`
+   without `internal/mvcc` importing `internal/wal`. `wal.CheckpointerConfig`
+   gained a `FlushCLOGFn func() error` hook, called in `runCheckpoint`'s
+   flush phase immediately after the primary buffer-pool flush (before the
+   redo LSN is sampled — same phase, so an async commit's CLOG state is
+   captured by the checkpoint exactly as reliably as the heap pool's own
+   dirty pages are). Unlike the best-effort `PostCheckpointFn`/
+   `TruncateCLOGFn` hooks, a `FlushCLOGFn` error **fails the checkpoint** —
+   a checkpoint marker whose redo LSN silently advanced past commits whose
+   CLOG state failed to flush would leave crash recovery unable to
+   reconstruct that state (recovery only replays WAL from the redo LSN
+   onward — see the crash-safety paragraph below). Wired at
+   `internal/initdb/open.go`'s `Checkpointer` construction site:
+   `FlushCLOGFn: clog.FlushAll`.
+
+**Why this is crash-safe.** An async-committed CLOG page can now sit dirty in
+memory for up to `checkpoint_timeout` (previously: until the enclosing commit
+call returned). If the process crashes before any of the three events above
+flush it, the on-disk SLRU page still reads the pre-commit (in-progress)
+lane. This is exactly the same "WAL fsynced, CLOG write not yet complete"
+window `internal/initdb/xact_recovery.go`'s `replayCLogFromWAL` already
+exists to close (its doc comment calls this out explicitly: "CLOG … is a
+write-behind cache whose authoritative state is the WAL"): recovery re-walks
+every WAL record after the last checkpoint's redo LSN and re-stamps
+`clog.SetCommitted`/`SetAborted` for each one, independent of what made it to
+the on-disk SLRU page. Because `FlushCLOGFn` runs in the same phase as (and
+before) the redo LSN is sampled, every commit whose WAL record precedes a
+checkpoint's redo LSN has necessarily already had its CLOG page drained by
+that checkpoint's own `FlushCLOGFn` call — the only commits recovery need
+reconstruct are the ones *after* the redo LSN, which replay always covers.
+This change widens the pre-existing narrow window from a few nanoseconds
+(mid-commit, present since M0117-0005) to up to `checkpoint_timeout`
+(async-only) — it is a wider instance of an already-relied-upon mechanism,
+not a new failure mode. `TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit`
+(`internal/initdb/xact_recovery_test.go`) pins exactly this: an async commit
+via `SetCommittedWithLSN` whose page is never flushed, a fresh `CLog` opened
+against the same on-disk SLRU directory (simulating the crash+restart), and
+`replayCLogFromWAL` reconstructing the status from the matching WAL record.
+
+**Known residual gap (deferred, ledger 2026-07-02):** the checkpoint's redo
+LSN in this codebase is sampled via `vr.WrittenLSN()` *after* the flush phase
+completes (`runCheckpoint`), not captured *before* flushing begins the way
+real PostgreSQL's `CreateCheckPoint` does. A commit landing in the narrow
+window between "FlushCLOGFn's dirty-page scan" and "redo LSN sampled" could
+in principle have its WAL record's LSN fall below the recorded redo point
+while its CLOG page is still dirty — the same theoretical race the heap
+buffer pool's own checkpoint flushing already has today (symmetric, not new).
+Closing it fully needs a redo-pointer-before-flush checkpoint redesign,
+which is out of scope here (a distinct, larger, whole-checkpoint-subsystem
+change, not a CLOG-specific one). See the ledger row for the resume point.
+
+~~**COPY's own commit call sites**~~ — **LANDED 2026-07-02, loop #50**, see
+the "COPY's own commit call sites" paragraph above. This item is closed.
+
+With Part C landed, M0117-0007's fix_plan box can close: every item this
+doc's Part B "Still open" section named — the lazy write-back, the
+checkpoint-driven flush, and the COPY call sites — is now landed.
 
 ## Faithfulness / divergence notes
 
@@ -285,11 +349,46 @@ clean on `internal/server/copy.go` + the new test; `go test -count=1
 -race ./internal/mvcc/... ./internal/wal/...`; TPC-H spot-check
 (`scripts/tpch-spotcheck.sh`) Q12=2/Q13=33 PASS.
 
+**Part C (2026-07-02, loop #51) adds:**
+
+- `internal/mvcc/clog_asynccommit_test.go`'s
+  `TestCLogSetCommittedWithLSNDefersFlush` (replaces the old
+  `TestCLogSetCommittedWithLSNFiresBarrierOnFlush`, whose "the group-commit
+  flush every SetCommitted call already goes through" assertion is exactly
+  the eager behavior Part C removes): `SetCommittedWithLSN` fires the
+  flushWAL barrier **zero** times and leaves `GetStatus` readable; a
+  subsequent `FlushAll()` fires it once with the recorded LSN.
+  `TestCLogFlushAllBeforePoolExistsIsNoop` mirrors the existing
+  `SetFlushWALHook` out-of-order-call contract for the new method.
+- `internal/wal/checkpointer_test.go`'s `TestCheckpointerCallsFlushCLOGFn`
+  (called once per successful checkpoint, mirroring
+  `TestCheckpointerCallsPostCheckpointFn`) and
+  `TestCheckpointerFlushCLOGFnErrorFailsCheckpoint` (unlike
+  `PostCheckpointFn`/`TruncateCLOGFn`, an error here must fail the
+  checkpoint, not be swallowed).
+- `internal/initdb/xact_recovery_test.go`'s
+  `TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit` — the crash-safety
+  proof described above: an unflushed async-committed CLOG page is
+  reconstructed by `replayCLogFromWAL` from the durable WAL record alone.
+
+Part C gate (all PASS): `go build ./...`; `go vet ./...`; `gofmt -l` clean on
+every touched file; `go test -count=1 ./internal/mvcc/... ./internal/wal/...
+./internal/initdb/... ./internal/server/... ./internal/executor/...`; `go
+test -race ./internal/mvcc/... ./internal/wal/...`;
+`TestE2E_PhysicalReplication{,Sync}`,
+`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`,
+`TestE2E_ChecksumStreamingGoopgToPG` (`internal/testport`, `-race`); TPC-H
+spot-check (`scripts/tpch-spotcheck.sh`); pgbench smoke via the pre-commit
+hook.
+
 ## Status / merge
 
 Landed directly on `align-data-structure-with-pg` (Part A: commit `1f1100e8`;
 M0117-0006 Parts A–C: commits through `0ab77d45`; Part B mechanical wiring:
-loop #49; Part B / COPY commit-site follow-up: loop #50). The "Still open"
-section above (lazy CLOG write-back + checkpoint-driven CLOG flush) is the
-actual remaining scope for the fix_plan box to close — not a merge
-formality.
+loop #49; Part B / COPY commit-site follow-up: loop #50; **Part C — lazy
+write-back + checkpoint-driven flush: loop #51**). M0117-0007's fix_plan box
+closes with this loop: every item this doc's Part B "Still open" section
+named is now landed. The one residual item is the narrow
+redo-pointer-sampled-after-flush race noted in Part C above — recorded in the
+ledger as a distinct, whole-checkpoint-subsystem redesign, not specific to
+CLOG.

@@ -1233,6 +1233,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 			return clog.TruncateCLOG(horizon)
 		},
+		// M0117-0007 Part B continuation: bound how long an async commit's
+		// deferred CLOG write-back can stay dirty in memory (see
+		// mvcc.CLog.setStatusWithLSN / FlushAll).
+		FlushCLOGFn: clog.FlushAll,
 	})
 
 	// Surface the M0002 checkpointer counters as the

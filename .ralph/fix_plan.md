@@ -176,7 +176,7 @@ role/database persistence is a real goopg feature gap.
       row appended) records one accepted, deliberate compatibility cut: a pre-Part-B
       data dir's never-mirrored flat-file bytes are now silently unrecoverable (not a
       PG-fidelity gap — PG has no such dual-store distinction).
-- [ ] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
+- [x] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
       (per-LSN-group tracking + page-write WAL barrier on the M0117-0006 pool, not live).
       **Part B LANDED 2026-07-02 (loop #49, design `0117-0007-*` "Part B"):** the
       barrier is now wired to the live WAL writer (`CLog.SetFlushWALHook` ←
@@ -205,8 +205,37 @@ role/database persistence is a real goopg feature gap.
       `COPY FROM STDIN` commits via a new `commitCopyTx` helper +
       `copyInState.asyncCommit`) now honor `synchronous_commit`; regression
       `TestCommitCopyTxRespectsAsyncCommit`. Needs TPC-H + crash/standby E2E —
-      both PASS (TPC-H re-verified 2026-07-02: Q12=2/Q13=33). Design
-      `0117-0007-*`.
+      both PASS (TPC-H re-verified 2026-07-02: Q12=2/Q13=33). **Part C — lazy
+      write-back + checkpoint-driven flush LANDED 2026-07-02 (loop #51),
+      closing the box:** `CLog.setStatusWithLSN` now skips `groupUpdate`'s
+      eager durable write-back whenever `lsn != 0` (async commit; every
+      synchronous caller still passes `lsn == 0`, unaffected), leaving the
+      page dirty; write-back defers to a later sync commit's group flush, LRU
+      eviction, or the new checkpoint-driven `CLog.FlushAll()` (thin
+      `pool.flushDirty()` wrapper, structurally satisfies
+      `wal.DirtyPageFlusher`) wired via a new
+      `wal.CheckpointerConfig.FlushCLOGFn` hook (`internal/initdb/open.go`:
+      `FlushCLOGFn: clog.FlushAll`), invoked in the checkpoint's flush phase
+      before the redo LSN is sampled; unlike `PostCheckpointFn`/
+      `TruncateCLOGFn`, a `FlushCLOGFn` error fails the checkpoint. Crash
+      safety rests on the pre-existing `replayCLogFromWAL` backstop (recovery
+      re-derives CLOG status from post-redo-LSN WAL records regardless of
+      disk state), proven end-to-end by new
+      `TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit`
+      (`internal/initdb`). Regressions: `TestCLogSetCommittedWithLSNDefersFlush`
+      + `TestCLogFlushAllBeforePoolExistsIsNoop` (mvcc),
+      `TestCheckpointerCallsFlushCLOGFn` +
+      `TestCheckpointerFlushCLOGFnErrorFailsCheckpoint` (wal). Gates: build/vet/
+      gofmt clean; `go test -count=1` mvcc+wal+initdb+server+executor PASS;
+      `go test -race` mvcc+wal PASS; `TestE2E_PhysicalReplication{,Sync}` /
+      `TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart` /
+      `TestE2E_ChecksumStreamingGoopgToPG` (`-race`) PASS; TPC-H spot-check
+      Q12=2/Q13=33 PASS. One residual gap deferred to the ledger: the
+      checkpoint's redo LSN is sampled after (not before) the flush phase — a
+      narrow race shared symmetrically with the heap pool's own checkpoint
+      flushing (pre-existing, not CLOG-specific); closing it needs a
+      whole-checkpoint-subsystem redo-pointer redesign, out of scope here.
+      Design `0117-0007-*` "Part C".
 - [ ] **M0117-0008 — datfrozenxid persistence (Effort M).** Part A DONE (dual-store
       consistency for all 4 CLOG status codes, satisfied via the M0117-0004 chain;
       `clog_dual_store_consistency_test.go`). **Part B (DEFERRED, ledger 2026-06-15):**
@@ -2114,18 +2143,17 @@ documentation-only and is exempt from the design-doc requirement.)
 - [ ] **M0119-0002 — CLOG tail, remaining Parts** (source: M0117-0007 / M0117-0008;
       see M0117 section + ledger rows). **M0117-0006's own live store swap (Part B)
       and bank/flat-file removal (Part C) are both DONE** (2026-06-29 loop #11 /
-      2026-07-01 loop #47); **M0117-0007 Part B's mechanical wiring is DONE**
-      (2026-07-02 loop #49 — barrier live, LSN association, GUC threading, all
-      interactive commit call sites; **COPY's own 4 commit sites also DONE
-      2026-07-02 loop #50**) **but its actual latency win is NOT** (CLOG's
-      own eager per-commit `flushDirty` immediately re-triggers the flush regardless;
-      needs a lazy-write-back + checkpoint-driven-CLOG-flush follow-up — see the
-      M0117-0007 entry above and its design doc's "Still open"). This item now
-      tracks that follow-up plus M0117-0008 Part B (on-disk `datfrozenxid` persistence —
-      needs a runtime shared-catalog RelFileNode resolver + `heap_inplace_update`
-      buffer-lock/WAL path). Highest blast radius (Hard-won Rule #1): dedicated
-      full-gate session (`-race` mvcc+wal, xlog_replay, heterogeneous PG-standby
-      E2E, fresh-server TPC-H Q12/Q13) for whichever Part is picked up next.
+      2026-07-01 loop #47); **M0117-0007 is now fully DONE** — Part B's mechanical
+      wiring (2026-07-02 loop #49 — barrier live, LSN association, GUC threading,
+      all interactive commit call sites; COPY's own 4 commit sites, loop #50) AND
+      Part C's actual latency win (2026-07-02 loop #51 — lazy CLOG write-back for
+      async commits + checkpoint-driven `CLog.FlushAll`/`FlushCLOGFn`; see the
+      M0117-0007 entry above and its design doc's "Part C"). This item now tracks
+      only M0117-0008 Part B (on-disk `datfrozenxid` persistence — needs a runtime
+      shared-catalog RelFileNode resolver + `heap_inplace_update` buffer-lock/WAL
+      path). Highest blast radius (Hard-won Rule #1): dedicated full-gate session
+      (`-race` mvcc+wal, xlog_replay, heterogeneous PG-standby E2E, fresh-server
+      TPC-H Q12/Q13) when this Part is picked up.
 - [x] **M0119-0003 — initdb remaining options. RESOLVED by triage 2026-06-29
       (M0119-0001), no separate impl loop needed.** Every listed option already
       landed on this branch — `--encoding` (`internal/initdb/encoding.go`),
