@@ -3708,6 +3708,19 @@ documentation-only and is exempt from the design-doc requirement.)
       Remaining `attacl` (the high-blast-radius half, a dedicated loop): parser `AttrACLChange`
       capture + `execAttrACLChange`/`resyncAttrACLHeapRow` + pg_attribute seqscan `attacl`
       decode hook + DU-002 column-GRANT connsetup slice.
+      **2026-07-01 (loop #52) — COMMENT ON CAST type-name-synonym re-verification
+      CLOSED (test-only, no production change):** closes the last open item from
+      the loop #51 DROP CAST synonym-key fix (`castKey`/`castKeyTypeName` resolving
+      through `TypeNameToOID` before keying `internal/catalog.RegisterCast`/
+      `DropCast`/`CastByTypes`). New `internal/executor/comment_on_cast_synonym_test.go`
+      (`TestCommentOnCastResolvesTypeNameSynonym`) proves `COMMENT ON CAST (real AS
+      text) IS ...` against a cast created as `CREATE CAST (float4 AS text) WITHOUT
+      FUNCTION` resolves via the SAME `catalog.CastByTypes` choke point the
+      `execCompatNoop` `case "cast"` comment handler already calls
+      (`operators_ddl.go` ~13756), so the loop #51 fix covers comment resolution
+      with no further code change needed. Gates: targeted test PASS; `go build
+      ./...` clean; `go vet` executor+catalog clean; full `internal/catalog`+
+      `internal/executor` suites PASS. Deferral ledger row appended (resolved).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -10429,6 +10429,15 @@ unknown/user-defined-type pairs each stay distinct registry entries. Gates: `go 
 `-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb`. This is a catalog-only fix — no WAL
 format change, so no restart-persistence interaction with the four-object backlog above.
 
+**COMMENT ON CAST synonym re-verification (loop #52, test-only):** the fix above left one recorded gap —
+`CommentOnStmt`'s CAST comment handler (`execCompatNoop` `case "cast"`, `operators_ddl.go` ~13756) calls the
+same `catalog.CastByTypes`, so it should inherit the synonym fix automatically, but was not independently
+re-verified. New `internal/executor/comment_on_cast_synonym_test.go`
+(`TestCommentOnCastResolvesTypeNameSynonym`) confirms this directly: `CREATE CAST (float4 AS text) WITHOUT
+FUNCTION` followed by `COMMENT ON CAST (real AS text) IS '...'` stores the description under `pg_cast`
+(classoid 2605) keyed on the same OID `CastByTypes("float4", "text")` returns. No production code changed —
+this closes the re-verification gap as a pure test addition.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
