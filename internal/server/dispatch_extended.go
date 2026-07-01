@@ -138,7 +138,17 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
-		ectx.EndLocalTransaction = sess.EndTransaction
+		ectx.EndLocalTransaction = func() {
+			sess.EndTransaction()
+			// Re-sync is_superuser / the executor-context mirror after
+			// connTx.End() (called by the caller just before this) restores
+			// NonSuperuserRole from a pending SET LOCAL ROLE / SESSION
+			// AUTHORIZATION snapshot (SnapshotLocalRoleIfNeeded). M0119-0004.
+			if connTx != nil {
+				ectx.NonSuperuserRole = connTx.NonSuperuserRole
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
+		}
 	}
 	// Wire session-authorization/role tracking so a SET SESSION AUTHORIZATION
 	// or SET ROLE that reaches the executor (rather than the fast-path
@@ -148,7 +158,8 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// so any such statement here was silently dropped.
 	if connTx != nil {
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
-		ectx.SetSessionAuthorization = func(role string) {
+		ectx.SetSessionAuthorization = func(role string, local bool) {
+			connTx.SnapshotLocalRoleIfNeeded(local)
 			connTx.NonSuperuserRole = role
 			ectx.NonSuperuserRole = role
 			setIsSuperuserGUC(sess, role == "")

@@ -474,7 +474,15 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	// as a GUC name, erroring with "unrecognized configuration parameter").
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":
-		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET LOCAL SESSION AUTHORIZATION")
+		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET LOCAL SESSION AUTHORIZATION", true)
+		return &extendedQueryResult{CommandTag: "SET"}, nil
+	// SET LOCAL ROLE rolename — must be checked before the generic "SET LOCAL "
+	// case below, which would otherwise mis-parse "ROLE rolename" as GUC name
+	// "role" (not a config.Registry variable — SET ROLE is tracked entirely
+	// via connTx.NonSuperuserRole) and fail with "unrecognized configuration
+	// parameter". Mirrors server/query.go's simple-query handling. M0119-0004.
+	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
+		setRoleFastPath(sess, connTx, matchable, "SET LOCAL ROLE", true)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		body := matchable[len("SET LOCAL "):]
@@ -491,23 +499,13 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	// doesn't mis-parse "SESSION AUTHORIZATION name". M0119-0004.
 	case strings.HasPrefix(upper, "SET SESSION AUTHORIZATION "),
 		upper == "SET SESSION AUTHORIZATION":
-		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET SESSION AUTHORIZATION")
+		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET SESSION AUTHORIZATION", false)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	// SET ROLE rolename — track the effective role for privilege checks. Must
 	// be before the generic "SET " case so "ROLE" is not passed to sess.Set as
 	// a GUC name. M0119-0004.
 	case strings.HasPrefix(upper, "SET ROLE "), upper == "SET ROLE":
-		if connTx != nil {
-			role := strings.TrimSpace(matchable[len("SET ROLE"):])
-			role = strings.Trim(role, `"'`)
-			switch strings.ToUpper(role) {
-			case "", "DEFAULT", "NONE", "POSTGRES":
-				connTx.NonSuperuserRole = ""
-			default:
-				connTx.NonSuperuserRole = role
-			}
-			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
-		}
+		setRoleFastPath(sess, connTx, matchable, "SET ROLE", false)
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case strings.HasPrefix(upper, "SET CONSTRAINTS "):
 		// SET CONSTRAINTS is not a GUC. The extended fast path holds only the
@@ -654,14 +652,34 @@ func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, 
 // LOCAL SESSION AUTHORIZATION"); matchable is the ';'-stripped statement
 // text. Mirrors server/query.go's handleQuery SET SESSION AUTHORIZATION
 // cases. M0119-0004.
-func setSessionAuthorizationFastPath(sess *config.SessionRegistry, connTx *connTxState, matchable, prefix string) {
+func setSessionAuthorizationFastPath(sess *config.SessionRegistry, connTx *connTxState, matchable, prefix string, local bool) {
 	if connTx == nil {
 		return
 	}
 	role := strings.TrimSpace(matchable[len(prefix):])
 	role = strings.Trim(role, `"'`)
+	connTx.SnapshotLocalRoleIfNeeded(local)
 	switch strings.ToUpper(role) {
 	case "", "DEFAULT", "RESET", "POSTGRES":
+		connTx.NonSuperuserRole = ""
+	default:
+		connTx.NonSuperuserRole = role
+	}
+	setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+}
+
+// setRoleFastPath is setSessionAuthorizationFastPath's SET ROLE / SET LOCAL
+// ROLE sibling: identical shape, but "NONE" (not "RESET") is SET ROLE's
+// keyword for restoring superuser status. M0119-0004.
+func setRoleFastPath(sess *config.SessionRegistry, connTx *connTxState, matchable, prefix string, local bool) {
+	if connTx == nil {
+		return
+	}
+	role := strings.TrimSpace(matchable[len(prefix):])
+	role = strings.Trim(role, `"'`)
+	connTx.SnapshotLocalRoleIfNeeded(local)
+	switch strings.ToUpper(role) {
+	case "", "DEFAULT", "NONE", "POSTGRES":
 		connTx.NonSuperuserRole = ""
 	default:
 		connTx.NonSuperuserRole = role

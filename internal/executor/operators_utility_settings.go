@@ -50,13 +50,13 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if stmt.Name == "role" {
 			if o.ctx != nil && o.ctx.SetRole != nil {
 				if stmt.Default {
-					o.ctx.SetRole("")
+					o.ctx.SetRole("", stmt.Local)
 				} else {
 					switch strings.ToUpper(stmt.Value) {
 					case "", "NONE", "POSTGRES":
-						o.ctx.SetRole("")
+						o.ctx.SetRole("", stmt.Local)
 					default:
-						o.ctx.SetRole(stmt.Value)
+						o.ctx.SetRole(stmt.Value, stmt.Local)
 					}
 				}
 			}
@@ -67,14 +67,14 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if stmt.Name == "session_authorization" {
 			if o.ctx != nil && o.ctx.SetSessionAuthorization != nil {
 				if stmt.Default {
-					o.ctx.SetSessionAuthorization("")
+					o.ctx.SetSessionAuthorization("", stmt.Local)
 				} else {
 					role := stmt.Value
 					switch strings.ToUpper(role) {
 					case "", "RESET", "POSTGRES":
-						o.ctx.SetSessionAuthorization("")
+						o.ctx.SetSessionAuthorization("", stmt.Local)
 					default:
-						o.ctx.SetSessionAuthorization(role)
+						o.ctx.SetSessionAuthorization(role, stmt.Local)
 					}
 				}
 			}
@@ -113,14 +113,14 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		// "role" — restore superuser status (RESET ROLE). M0119-0004.
 		if stmt.Name == "role" {
 			if o.ctx != nil && o.ctx.SetRole != nil {
-				o.ctx.SetRole("")
+				o.ctx.SetRole("", false)
 			}
 			return nil, EOF
 		}
 		// "session_authorization" — restore superuser status.
 		if stmt.Name == "session_authorization" {
 			if o.ctx != nil && o.ctx.SetSessionAuthorization != nil {
-				o.ctx.SetSessionAuthorization("")
+				o.ctx.SetSessionAuthorization("", false)
 			}
 			return nil, EOF
 		}

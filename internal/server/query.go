@@ -171,8 +171,32 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if connTx != nil {
 			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
 			role = strings.Trim(role, `"'`)
+			connTx.SnapshotLocalRoleIfNeeded(true)
 			switch strings.ToUpper(role) {
 			case "", "DEFAULT", "RESET", "POSTGRES":
+				connTx.NonSuperuserRole = ""
+			default:
+				connTx.NonSuperuserRole = role
+			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+		}
+		if err := w.WriteCommandComplete("SET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// SET LOCAL ROLE rolename — must check before generic "SET LOCAL ", which
+	// would otherwise mis-parse "ROLE rolename" as GUC name "role" and fail
+	// with "unrecognized configuration parameter" ("role" is not a
+	// config.Registry variable — SET ROLE is tracked entirely via
+	// connTx.NonSuperuserRole, not the GUC layer). Mirrors the "SET LOCAL
+	// SESSION AUTHORIZATION" case above.
+	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
+		if connTx != nil {
+			role := strings.TrimSpace(matchable[len("SET LOCAL ROLE"):])
+			role = strings.Trim(role, `"'`)
+			connTx.SnapshotLocalRoleIfNeeded(true)
+			switch strings.ToUpper(role) {
+			case "", "DEFAULT", "NONE", "POSTGRES":
 				connTx.NonSuperuserRole = ""
 			default:
 				connTx.NonSuperuserRole = role

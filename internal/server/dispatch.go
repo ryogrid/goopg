@@ -277,7 +277,8 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Wire session-authorization role tracking so LEAKPROOF privilege checks
 		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
-		ectx.SetSessionAuthorization = func(role string) {
+		ectx.SetSessionAuthorization = func(role string, local bool) {
+			connTx.SnapshotLocalRoleIfNeeded(local)
 			connTx.NonSuperuserRole = role
 			ectx.NonSuperuserRole = role
 			setIsSuperuserGUC(sess, role == "")
@@ -327,7 +328,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
-		ectx.EndLocalTransaction = sess.EndTransaction
+		ectx.EndLocalTransaction = func() {
+			sess.EndTransaction()
+			// Re-sync is_superuser / the executor-context mirror after
+			// connTx.End() (called by the caller just before this) restores
+			// NonSuperuserRole from a pending SET LOCAL ROLE / SESSION
+			// AUTHORIZATION snapshot (SnapshotLocalRoleIfNeeded). M0119-0004.
+			if connTx != nil {
+				ectx.NonSuperuserRole = connTx.NonSuperuserRole
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
+		}
 		// Set PlanCatalog to a search-path-aware wrapper so DDL executor can
 		// use it when calling planner.Plan for internal validation. M0097-0022.
 		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)

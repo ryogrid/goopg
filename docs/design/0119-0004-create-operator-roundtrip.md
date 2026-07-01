@@ -1750,3 +1750,116 @@ Execute/Sync) with the exact same statements surfaced that this path is
   `Publication.Owner` non-bootstrap-role tracking and the
   `DBOID()`-vs-`FirstUserOID` split (both noted in loop #60) remain open —
   untouched by this loop.
+
+## Loop #64: `SET LOCAL ROLE` / `SET LOCAL SESSION AUTHORIZATION` transaction-scoped revert
+
+Closes the loop #63 row's deferral: `SET LOCAL ROLE`/`SET LOCAL SESSION
+AUTHORIZATION` must revert to the pre-transaction role at COMMIT *and*
+ROLLBACK, mirroring PostgreSQL's `GUC_ACTION_LOCAL` stack (`guc.c`) — the
+same "discard the transaction-scoped layer at xact end" fidelity
+`config.SessionRegistry`'s `local` map + `EndTransaction()` already provides
+for ordinary GUCs (see `internal/config/session.go`).
+
+**A more severe bug surfaced during live repro, fixed in the same loop
+(same root cause, same call sites — not scope creep):** `SET LOCAL ROLE
+<name>` sent as its own simple-query message — the common client shape;
+psql and most drivers send one statement per wire message — **raised
+`unrecognized configuration parameter "role"` instead of doing anything.**
+Confirmed live against a real server: `psql -c "SET LOCAL ROLE
+probe_role"` errored; only the rare case of cramming `BEGIN; SET LOCAL
+ROLE …; COMMIT;` into one `-c` string (a single Simple Query wire message
+with an internal `;`, which reroutes to the parser-based executor) avoided
+the bug. Root cause: `server/query.go`'s `handleQuery` fast-path switch had
+a dedicated `"SET LOCAL SESSION AUTHORIZATION "` case but no analogous
+`"SET LOCAL ROLE "` case, so it fell through to the generic `"SET LOCAL "`
+case, which calls `handleSet` → `splitSet("ROLE probe_role")` →
+`sess.Set("role", "probe_role", true)`. `"role"` is not a
+`config.Registry` variable (`session_authorization` is registered;
+`role`/`SET ROLE` is tracked entirely out-of-band via
+`connTx.NonSuperuserRole`), so `Set` returned `unrecognized configuration
+parameter "role"`. The identical gap existed in
+`internal/server/extended.go`'s extended-protocol fast-path switch (added
+in loop #63, same missing case).
+
+### Fix
+
+- **`internal/server/conn_tx.go`**: new `connTxState.LocalRolePriorValue
+  *string` field — non-nil means "the pre-transaction `NonSuperuserRole`
+  value to restore at end-of-transaction, captured by the FIRST LOCAL role
+  change this transaction." New method `SnapshotLocalRoleIfNeeded(local
+  bool)`: no-op unless `local` is true, an explicit transaction is active,
+  and no snapshot has been taken yet this transaction (mirrors PostgreSQL's
+  stack semantics: a second `SET LOCAL` in the same transaction does not
+  move the restore target — it still reverts to the value from *before* the
+  first LOCAL change). `End()` (the shared COMMIT/ROLLBACK teardown, called
+  unconditionally at every commit/rollback site including connection
+  teardown) restores `NonSuperuserRole` from the snapshot and clears the
+  pointer, alongside the existing `PendingEnumValues` etc. resets — so a
+  stale snapshot can never leak into the connection's next transaction even
+  on paths that skip the `EndLocalTransaction` hook (e.g. teardown
+  rollback).
+- **`internal/executor/context.go`**: `SetSessionAuthorization`/`SetRole`
+  gained a `local bool` parameter so the LOCAL flag reaches the server-side
+  closures that own `connTx`.
+- **`internal/executor/operators_utility_settings.go`**: `SetStmt`'s
+  `"role"`/`"session_authorization"` branches now pass `stmt.Local` through;
+  `ResetStmt`'s branches pass `false` (RESET has no LOCAL form in PG's
+  grammar).
+- **`internal/server/dispatch.go` / `dispatch_extended.go`**: the
+  `SetSessionAuthorization`/`SetRole` closures call
+  `connTx.SnapshotLocalRoleIfNeeded(local)` before mutating
+  `connTx.NonSuperuserRole`. `EndLocalTransaction` (previously a bare alias
+  `= sess.EndTransaction`) is now a closure that calls `sess.EndTransaction()`
+  (unchanged, ordinary-GUC local-layer discard) and then re-syncs
+  `ectx.NonSuperuserRole` + the reportable `is_superuser` GUC from
+  `connTx.NonSuperuserRole` — picking up whatever `connTx.End()` (called by
+  the caller immediately before `EndLocalTransaction()` at every call site)
+  just restored. Runs unconditionally on every COMMIT/ROLLBACK (cheap,
+  idempotent when no LOCAL role change occurred this transaction).
+- **`internal/server/query.go`**: new `"SET LOCAL ROLE "` case (mirroring
+  the existing `"SET LOCAL SESSION AUTHORIZATION "` case) fixes the
+  unrecognized-parameter bug for the single-statement simple-query path;
+  both it and the existing `"SET LOCAL SESSION AUTHORIZATION "` case now
+  call `connTx.SnapshotLocalRoleIfNeeded(true)` before mutating
+  `NonSuperuserRole`.
+- **`internal/server/extended.go`**: new `"SET LOCAL ROLE "` case fixes the
+  identical bug in the extended-protocol fast path. `setSessionAuthorizationFastPath`
+  gained a `local bool` parameter (calls `SnapshotLocalRoleIfNeeded`); new
+  sibling helper `setRoleFastPath` (same shape, but `"NONE"` — not
+  `"RESET"` — is `SET ROLE`'s reset keyword) replaces the previously
+  inline, duplicated `"SET ROLE "` case and backs both `"SET ROLE "` and
+  the new `"SET LOCAL ROLE "` case.
+- Verified live end-to-end against a real running server (`psql`, one
+  statement per message — the shape that exposed the bug): `SET LOCAL
+  ROLE` alone no longer errors; inside `BEGIN`/`COMMIT` and
+  `BEGIN`/`ROLLBACK` it correctly reverts `is_superuser` to its
+  pre-transaction value; two chained `SET LOCAL ROLE` calls in one
+  transaction still revert to the pre-transaction value (not the first
+  LOCAL value); a plain (non-LOCAL) `SET ROLE` continues to persist past
+  COMMIT exactly as before (regression-checked, not a behavior change).
+- Tests: `internal/server/conn_tx_local_role_test.go`
+  (`TestConnTxStateSnapshotLocalRoleIfNeeded`,
+  `TestConnTxStateEndRestoresLocalRole` — unit-level, no wire protocol) +
+  `internal/server/set_local_role_test.go`
+  (`TestSimpleProtocolSetLocalRoleAloneDoesNotError`,
+  `TestSimpleProtocolSetLocalRoleRevertsAtCommitAndRollback` — full
+  wire-protocol proof against a storage-backed test server, one statement
+  per `Query` message, matching the exact shape that exposed the bug).
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/server`+
+  `internal/executor` suites PASS; `go test -race -count=1
+  ./internal/wal/... ./internal/mvcc/...` PASS (connTxState touches
+  transaction lifecycle); `TestPort_IsolationTruncateConflict` PASS (no
+  regression to the SET ROLE ownership-check path); `TestPort_
+  PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33; pgbench smoke
+  = pre-commit hook.
+- Deferred (ledger row appended): extended-protocol `BEGIN`/`COMMIT`/
+  `ROLLBACK` are intercepted before reaching the executor and returned as
+  no-op command tags (`dispatch_extended.go`'s `planner.Transaction`
+  branch) — `connTx.active` never becomes true from a purely
+  extended-protocol transaction, so `SET LOCAL ROLE` issued entirely over
+  the extended protocol still has no transaction boundary to revert at
+  (behaves like a plain `SET`, matching the pre-existing, already-documented
+  "extended protocol is auto-commit-per-statement" architectural
+  limitation — not a new gap, and outside this loop's scope). Also
+  unchanged from loop #60: `Subscription.Owner`/`Publication.Owner`
+  non-bootstrap-role tracking and the `DBOID()`-vs-`FirstUserOID` split.

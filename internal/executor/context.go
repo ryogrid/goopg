@@ -443,17 +443,20 @@ type Context struct {
 	// SetSessionAuthorization, when non-nil, updates the per-connection
 	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
 	// parser path (multi-statement batches). The caller (operators_utility_settings)
-	// passes the role name or "" to restore superuser status.
-	SetSessionAuthorization func(role string)
+	// passes the role name (or "" to restore superuser status) and whether the
+	// statement was SET LOCAL — the server snapshots the pre-change role so a
+	// LOCAL change reverts at COMMIT/ROLLBACK (mirrors PostgreSQL's
+	// GUC_ACTION_LOCAL stack, guc.c). M0119-0004.
+	SetSessionAuthorization func(role string, local bool)
 
 	// SetRole, when non-nil, updates the per-connection NonSuperuserRole when
 	// SET ROLE / RESET ROLE is executed via the parser path (multi-statement
 	// simple-query batches and the extended-query protocol). Same contract
-	// as SetSessionAuthorization: the role name, or "" to restore superuser
-	// status. Wired to the same closure as SetSessionAuthorization by the
-	// server (SET ROLE and SET SESSION AUTHORIZATION both flip
-	// connTx.NonSuperuserRole identically). M0119-0004.
-	SetRole func(role string)
+	// as SetSessionAuthorization: the role name (or "" to restore superuser
+	// status) plus the LOCAL flag. Wired to the same closure as
+	// SetSessionAuthorization by the server (SET ROLE and SET SESSION
+	// AUTHORIZATION both flip connTx.NonSuperuserRole identically). M0119-0004.
+	SetRole func(role string, local bool)
 
 	// CancelBackend, when non-nil, signals the backend identified by pid to
 	// cancel its currently-executing query (the engine behind the
