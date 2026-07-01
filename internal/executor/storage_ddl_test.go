@@ -155,6 +155,55 @@ func TestDDLDropAggregateRemovesUserAggregate(t *testing.T) {
 	}
 }
 
+// TestDDLAlterAggregateOwner pins ALTER AGGREGATE ... OWNER TO (M0119-0004,
+// loop #57 ledger follow-up): previously this form silently fell into the
+// "other ALTER AGGREGATE forms: consume as no-op" parser branch and never
+// reached the catalog at all.
+func TestDDLAlterAggregateOwner(t *testing.T) {
+	ctx, catIface, cleanup := newDDLFixture(t)
+	defer cleanup()
+	cat := catIface.(*catalog.InMemory)
+
+	cat.RegisterUserAggregate(&catalog.UserAggregate{
+		Name:     "newavg",
+		ArgTypes: []string{"int4"},
+		SType:    "_int8",
+		SFunc:    "int4_avg_accum",
+	})
+	agg, ok := cat.LookupUserAggregateByName("newavg")
+	if !ok {
+		t.Fatal("aggregate not registered before ALTER")
+	}
+	if got := agg.OwnerOrDefault(); got != 10 {
+		t.Fatalf("default owner = %d, want 10 (bootstrap superuser)", got)
+	}
+
+	cat.RegisterRole("agg_owner")
+	wantOID, ok := cat.RoleOID("agg_owner")
+	if !ok {
+		t.Fatal("agg_owner role not registered")
+	}
+
+	if err := runDDL(t, ctx, "ALTER AGGREGATE newavg(int4) OWNER TO agg_owner"); err != nil {
+		t.Fatalf("ALTER AGGREGATE OWNER TO: %v", err)
+	}
+	if got := agg.OwnerOrDefault(); got != wantOID {
+		t.Errorf("owner after ALTER = %d, want %d", got, wantOID)
+	}
+
+	// Unknown role must raise 42704.
+	err := runDDL(t, ctx, "ALTER AGGREGATE newavg(int4) OWNER TO no_such_role")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("want 42704 for unknown role, got %v", err)
+	}
+
+	// Unknown aggregate must raise 42883.
+	err = runDDL(t, ctx, "ALTER AGGREGATE no_such_agg(int4) OWNER TO agg_owner")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42883" {
+		t.Errorf("want 42883 for unknown aggregate, got %v", err)
+	}
+}
+
 func TestDDLCreateTempTableShadowsPermanentTable(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()

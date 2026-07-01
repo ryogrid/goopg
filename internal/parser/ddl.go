@@ -5704,6 +5704,25 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return &AlterAggregateRenameStmt{pos: t.Pos, OldName: name, NewName: newNameTok.Value}, nil
 		}
+		// Check for OWNER TO new_owner. M0119-0004 (DU-002, loop #57 follow-up).
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			stmt := &AlterAggregateOwnerStmt{pos: t.Pos, Name: name}
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+			// superuser sentinel, mirroring ALTER COLLATION … OWNER TO.
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				stmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				stmt.NewOwner = identText(tok)
+			} else {
+				stmt.NewOwner = "current_user"
+			}
+			return stmt, nil
+		}
 		// Other ALTER AGGREGATE forms: consume as no-op.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {

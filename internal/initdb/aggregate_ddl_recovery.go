@@ -2,10 +2,11 @@ package initdb
 
 // CREATE/ALTER/DROP AGGREGATE WAL replay (DU-002 restart-persistence
 // follow-up to M0119-0004, slice 405 ledger resume point (c); DROP added in
-// loop #56's ledger row resume point).
+// loop #56's ledger row resume point; ALTER ... OWNER TO added in loop #57's
+// ledger row resume point).
 //
 // Physical WAL replay (`wal.ReplayFromDirWithMgr`) ignores the CREATE/ALTER/
-// DROP AGGREGATE record kinds (46, 47, and 48) because goopg has no
+// DROP AGGREGATE record kinds (46, 47, 48, and 49) because goopg has no
 // per-aggregate file namespace — there is no page-level state to
 // reconstruct. The catalog's user-aggregate registry, however, is the
 // in-memory source of truth that backs the pg_aggregate/pg_proc virtual
@@ -34,6 +35,7 @@ type aggregateRegistryRecovery interface {
 	RegisterUserAggregateDuringRecovery(agg *catalog.UserAggregate)
 	RenameUserAggregateDuringRecovery(oldName, newName string)
 	DropUserAggregateDuringRecovery(name string)
+	SetUserAggregateOwnerDuringRecovery(name string, ownerOID uint32)
 }
 
 // replayAggregateDDLRecords reads every WAL record under walDir and applies
@@ -106,6 +108,12 @@ func replayAggregateDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-aggregate at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.DropUserAggregateDuringRecovery(name)
+		case wal.RecordKindAlterAggregateOwner:
+			name, ownerOID, derr := wal.DecodeAlterAggregateOwner(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-aggregate-owner at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetUserAggregateOwnerDuringRecovery(name, ownerOID)
 		}
 	}
 	return nil

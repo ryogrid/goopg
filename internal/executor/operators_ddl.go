@@ -137,6 +137,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateAggregate(s)
 	case *parser.AlterAggregateRenameStmt:
 		return nil, o.execAlterAggregateRename(s)
+	case *parser.AlterAggregateOwnerStmt:
+		return nil, o.execAlterAggregateOwner(s)
 	case *parser.AlterCollationStmt:
 		return nil, o.execAlterCollation(s)
 	case *parser.CreateOpClassStmt:
@@ -14285,6 +14287,39 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 	if o.ctx.WAL != nil {
 		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateRename(oldName, newName)); werr != nil {
 			return fmt.Errorf("wal alter-aggregate-rename: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterAggregateOwner handles ALTER AGGREGATE name(args) OWNER TO
+// newowner. M0119-0004 (DU-002, loop #57 ledger follow-up). Mirrors
+// execAlterCollation's "owner" case; name-only match, no overload
+// resolution, matching every other aggregate DDL arm.
+func (o *ddlOp) execAlterAggregateOwner(s *parser.AlterAggregateOwnerStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER AGGREGATE OWNER TO requires InMemory catalog"}
+	}
+	name := s.Name.Name
+	ownerOID := uint32(10) // bootstrap superuser, mirrors CreateCollation/UserAggregate's default owner
+	if !strings.EqualFold(s.NewOwner, "current_user") {
+		oid, found := im.RoleOID(s.NewOwner)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+		}
+		ownerOID = oid
+	}
+	if !im.SetUserAggregateOwner(name, ownerOID) {
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("aggregate %s does not exist", name)}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004): mirrors
+	// execAlterAggregateRename's WAL emission so the ownership change
+	// survives a restart.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateOwner(name, ownerOID)); werr != nil {
+			return fmt.Errorf("wal alter-aggregate-owner: %w", werr)
 		}
 	}
 	return nil

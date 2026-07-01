@@ -1845,6 +1845,19 @@ type AlterAggregateRenameStmt struct {
 func (s *AlterAggregateRenameStmt) Pos() int  { return s.pos }
 func (s *AlterAggregateRenameStmt) stmtNode() {}
 
+// AlterAggregateOwnerStmt changes a user-defined aggregate's owner. M0119-0004
+// (DU-002, loop #57 ledger follow-up).
+// ALTER AGGREGATE name(argtype_list) OWNER TO { new_owner | CURRENT_ROLE |
+// CURRENT_USER | SESSION_USER }
+type AlterAggregateOwnerStmt struct {
+	pos      int
+	Name     ObjectName
+	NewOwner string // "current_user" sentinel resolves to the invoking role, mirrors AlterCollationStmt
+}
+
+func (s *AlterAggregateOwnerStmt) Pos() int  { return s.pos }
+func (s *AlterAggregateOwnerStmt) stmtNode() {}
+
 // CreateOpClassStmt is a minimal representation of CREATE OPERATOR CLASS used
 // to register custom hash support functions for hash partitioning. M0097-0027.
 // We only capture the FUNCTION 2 (hash extended) entry; everything else is

@@ -111,3 +111,43 @@ func TestDecodeDropAggregateRejectsTruncatedPayload(t *testing.T) {
 		}
 	}
 }
+
+// TestEncodeDecodeAlterAggregateOwnerRoundTrip pins the ALTER AGGREGATE ...
+// OWNER TO WAL record format (loop #57 ledger resume point: ALTER AGGREGATE
+// OWNER TO restart persistence).
+func TestEncodeDecodeAlterAggregateOwnerRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		ownerOID uint32
+	}{
+		{"newavg", 16400},
+		{"日本語集約", 10},
+		{"maxowner", 4294967295},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterAggregateOwner(c.name, c.ownerOID)
+		if raw[0] != RecordKindAlterAggregateOwner {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterAggregateOwner)
+			continue
+		}
+		gotName, gotOwnerOID, err := DecodeAlterAggregateOwner(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotOwnerOID != c.ownerOID {
+			t.Errorf("%q: decoded (%q, %d), want (%q, %d)", c.name, gotName, gotOwnerOID, c.name, c.ownerOID)
+		}
+	}
+}
+
+// TestDecodeAlterAggregateOwnerRejectsTruncatedPayload guards against a
+// panic on a corrupt/truncated WAL record.
+func TestDecodeAlterAggregateOwnerRejectsTruncatedPayload(t *testing.T) {
+	full := EncodeAlterAggregateOwner("agg", 100)
+	for n := 0; n < len(full); n++ {
+		if _, _, err := DecodeAlterAggregateOwner(full[:n]); err == nil {
+			t.Errorf("truncated to %d bytes: want error, got nil", n)
+		}
+	}
+}

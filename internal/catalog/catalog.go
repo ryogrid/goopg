@@ -2517,6 +2517,17 @@ type UserAggregate struct {
 	FinalFuncModify string   // FINALFUNC_MODIFY: "", "read_only", "shareable", "read_write" (DU-002 slice 405)
 	SFuncStrict     bool     // true if sfunc is STRICT (skips NULL inputs)
 	Variadic        bool     // true when declared with VARIADIC input arg
+	Owner           uint32   // pg_proc.proowner (role OID); 0 means "unset, defaults to bootstrap superuser" — see OwnerOrDefault. M0119-0004.
+}
+
+// OwnerOrDefault returns agg.Owner, falling back to the bootstrap superuser
+// OID (10) for aggregates registered before the Owner field existed (e.g.
+// replayed from an older WAL record that has no owner payload).
+func (agg *UserAggregate) OwnerOrDefault() uint32 {
+	if agg.Owner == 0 {
+		return 10
+	}
+	return agg.Owner
 }
 
 // UserCollation records a collation created via CREATE COLLATION so that
@@ -2995,6 +3006,28 @@ func (c *InMemory) RegisterUserAggregateDuringRecovery(agg *UserAggregate) {
 // ledger resume point (c)).
 func (c *InMemory) RenameUserAggregateDuringRecovery(oldName, newName string) {
 	_ = c.RenameUserAggregate(oldName, newName)
+}
+
+// SetUserAggregateOwner changes an existing user-defined aggregate's owner
+// (ALTER AGGREGATE ... OWNER TO). Returns false if name is not found.
+// Mirrors SetCollationOwner. M0119-0004.
+func (c *InMemory) SetUserAggregateOwner(name string, ownerOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	agg, ok := c.userAggregates[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	agg.Owner = ownerOID
+	return true
+}
+
+// SetUserAggregateOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetUserAggregateOwner, mirroring
+// RenameUserAggregateDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004).
+func (c *InMemory) SetUserAggregateOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetUserAggregateOwner(name, ownerOID)
 }
 
 // ListUserAggregates returns every registered user-defined aggregate in

@@ -592,6 +592,14 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes)
 	RecordKindDropAggregate byte = 48
 
+	// RecordKindAlterAggregateOwner records an `ALTER AGGREGATE name(args)
+	// OWNER TO newowner` event so the ownership change survives a restart.
+	// Same no-op physical redo path as RecordKindCreateAggregate. Mirrors
+	// RecordKindAlterCollationOwner.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterAggregateOwner byte = 49
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1568,6 +1576,40 @@ func DecodeDropAggregate(payload []byte) (name string, err error) {
 	}
 	name = string(payload[3 : 3+nameLen])
 	return name, nil
+}
+
+// EncodeAlterAggregateOwner encodes an ALTER AGGREGATE ... OWNER TO event
+// (M0119-0004, loop #57 ledger follow-up). Unlike
+// EncodeAlterCollationOwner, aggregates have no Schema field yet (slice 405
+// ledger resume point (a)), so this format omits the schema component.
+// Format: kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterAggregateOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterAggregateOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterAggregateOwner decodes a RecordKindAlterAggregateOwner payload.
+func DecodeAlterAggregateOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-aggregate-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterAggregateOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-aggregate-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-aggregate-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	name = string(payload[7 : 7+nameLen])
+	return name, ownerOID, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -3352,7 +3394,7 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's collation registry.
 		return false, nil
-	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate:
+	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate, RecordKindAlterAggregateOwner:
 		// CREATE/ALTER/DROP AGGREGATE records (DU-002 restart-persistence
 		// follow-up, slice 405 resume point (c)) carry only pg_aggregate/
 		// pg_proc metadata; goopg has no per-aggregate file namespace, so

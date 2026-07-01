@@ -469,23 +469,23 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"12",   // prolang: internal
 				typeNameToOIDStr(rettype),
 				strings.Join(argOIDs, " "),
-				fmt.Sprintf("%d", len(agg.ArgTypes)), // pronargs
-				"",                                   // proacl: NULL (default privileges)
-				"10",                                 // proowner: bootstrap superuser
-				"aggregate_dummy",                    // prosrc: PG's real aggregate stub name
-				"i",                                  // provolatile
-				"f",                                  // prosecdef
-				"f",                                  // proleakproof
-				"f",                                  // proisstrict: NULL handling lives in the transfn, not the wrapper
-				"a",                                  // prokind: aggregate
-				"f",                                  // proretset
-				"",                                   // probin: NULL
-				"",                                   // proconfig: NULL
-				"1",                                  // procost: internal-language default
-				"0",                                  // prorows
-				"",                                   // protrftypes: NULL
-				"u",                                  // proparallel: PG CREATE AGGREGATE default (unsafe)
-				"-",                                  // prosupport
+				fmt.Sprintf("%d", len(agg.ArgTypes)),    // pronargs
+				"",                                      // proacl: NULL (default privileges)
+				fmt.Sprintf("%d", agg.OwnerOrDefault()), // proowner: ALTER AGGREGATE ... OWNER TO, else bootstrap superuser
+				"aggregate_dummy",                       // prosrc: PG's real aggregate stub name
+				"i",                                     // provolatile
+				"f",                                     // prosecdef
+				"f",                                     // proleakproof
+				"f",                                     // proisstrict: NULL handling lives in the transfn, not the wrapper
+				"a",                                     // prokind: aggregate
+				"f",                                     // proretset
+				"",                                      // probin: NULL
+				"",                                      // proconfig: NULL
+				"1",                                     // procost: internal-language default
+				"0",                                     // prorows
+				"",                                      // protrftypes: NULL
+				"u",                                     // proparallel: PG CREATE AGGREGATE default (unsafe)
+				"-",                                     // prosupport
 			})
 		}
 		return rows

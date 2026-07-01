@@ -3897,6 +3897,54 @@ documentation-only and is exempt from the design-doc requirement.)
       PASS. Deferred (unchanged): `ALTER AGGREGATE ... OWNER TO` still has no
       DDL arm at all; slice 405 resume points (a) `pronamespace` hardcoded to
       `public` and (b) built-in-aggregate raw-OID rendering remain open.
+      **2026-07-01 (loop #58): `ALTER AGGREGATE ... OWNER TO` wiring + restart
+      persistence LANDED** — closes the loop #57 row's "no DDL arm at all"
+      deferral. Previously this form fell into `parser/ddl.go`'s "other ALTER
+      AGGREGATE forms: consume as no-op" branch, parsing to a bare
+      `*AlterTableStmt{}` that silently discarded the target aggregate and new
+      owner. Wired end-to-end mirroring `ALTER COLLATION ... OWNER TO`: new
+      `catalog.UserAggregate.Owner` field + `OwnerOrDefault()` (zero value =
+      bootstrap superuser, so pre-existing/replayed aggregates need no
+      migration); `catalog.InMemory.SetUserAggregateOwner`/
+      `SetUserAggregateOwnerDuringRecovery` (name-only match, not on the
+      `Catalog` interface — same precedent as `SetCollationOwner`); new AST
+      node `parser.AlterAggregateOwnerStmt` + parser `OWNER TO` branch
+      (`CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` → `"current_user"`
+      sentinel); `executor.execAlterAggregateOwner` (42704 unknown role /
+      42883 unknown aggregate) wired into the DDL dispatch switch + planner
+      passthrough; `pg_proc_view.go`'s aggregate `proowner` column now reads
+      `agg.OwnerOrDefault()` instead of the loop #55 hardcoded `"10"` literal;
+      new `wal.RecordKindAlterAggregateOwner` (49) +
+      `Encode`/`DecodeAlterAggregateOwner` (schema-less, unlike
+      `RecordKindAlterCollationOwner` — aggregates still have no `Schema`
+      field) + `aggregate_ddl_recovery.go` replay case. Also fixed, as a
+      byproduct: `internal/server/dispatch.go`'s `ddlTag` had no case for
+      `CreateAggregateStmt`/`AlterAggregateRenameStmt` at all (every aggregate
+      DDL statement's command tag fell through to the generic `"OK"` — a
+      pre-existing, unrelated gap); added `"CREATE AGGREGATE"`/
+      `"ALTER AGGREGATE"` cases since the new `AlterAggregateOwnerStmt` needed
+      one anyway. Tests:
+      `internal/parser/alter_aggregate_owner_test.go`
+      (`TestParseAlterAggregateOwner`, `TestParseAlterAggregateRenameStillWorks`),
+      `internal/executor/storage_ddl_test.go` (`TestDDLAlterAggregateOwner`),
+      `internal/wal/aggregate_ddl_test.go`
+      (`TestEncodeDecodeAlterAggregateOwnerRoundTrip`,
+      `TestDecodeAlterAggregateOwnerRejectsTruncatedPayload`),
+      `internal/initdb/aggregate_ddl_recovery_test.go`
+      (`TestAggregateDDLRecoveryReplaysOwnerAfterCreate` — full second-`Open`
+      CREATE-then-OWNER replay proof, OID preserved). Gates: `go build ./...`
+      clean; `go vet` wal/catalog/executor/initdb/parser/planner/server
+      clean; `go test -race ./internal/wal/... ./internal/mvcc/...` clean;
+      `internal/catalog`+`internal/executor`+`internal/initdb`+
+      `internal/parser`+`internal/planner`+`internal/server` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33
+      PASS. Design doc updated (`0110-0001-pg-dump-tap-port.md` "`ALTER
+      AGGREGATE ... OWNER TO` wiring + restart persistence" subsection).
+      Deferred (unchanged, ledger row appended): slice 405 resume points (a)
+      `pronamespace` hardcoded to `public` and (b) built-in-aggregate raw-OID
+      rendering remain open; no `pg_dump` fixture yet exercises a non-default
+      aggregate owner (untested end-to-end dump round-trip, though the
+      renderer/catalog plumbing is in place).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

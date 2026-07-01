@@ -10605,9 +10605,9 @@ exactly:
   (`internal/executor/operators_ddl.go`) each append the corresponding WAL
   record right after the in-memory catalog mutation.
 
-`ALTER AGGREGATE ... OWNER TO` has no equivalent yet — unlike a collation,
-goopg's aggregate DDL surface has no OWNER TO arm at all (only RENAME TO,
-M0097-0035), so there is nothing to WAL-log there.
+`ALTER AGGREGATE ... OWNER TO` had no equivalent at the time this section was
+written — unlike a collation, goopg's aggregate DDL surface had no OWNER TO
+arm at all (only RENAME TO, M0097-0035). Closed below (loop #58).
 
 #### DROP AGGREGATE wiring + restart persistence (loop #57)
 
@@ -10656,6 +10656,79 @@ WAL-replay proof, mirroring `collation_ddl_recovery_test.go`. Gates: `go build
 ./...` clean; `go vet` wal/catalog/initdb/executor clean; `internal/wal`
 (including `-race`) + `internal/catalog` + `internal/initdb` +
 `internal/executor` suites PASS; `TestPort_PgDumpConnectionSetup` PASS.
+
+#### `ALTER AGGREGATE ... OWNER TO` wiring + restart persistence (loop #58)
+
+Closes the loop #57 note above ("has no equivalent yet"). Previously `ALTER
+AGGREGATE name(args) OWNER TO ...` fell into `parser.ddl.go`'s "other ALTER
+AGGREGATE forms: consume as no-op" branch and parsed to a bare
+`*AlterTableStmt{}` — the target aggregate and new owner were silently
+discarded, mirroring the pre-fix DROP AGGREGATE gap from loop #57's opening
+note (an M0097-regress-era omission, not new breakage). Wired end-to-end,
+mirroring `ALTER COLLATION ... OWNER TO` (`internal/executor/operators_ddl.go`
+`execAlterCollation`'s `"owner"` case):
+
+- New `catalog.UserAggregate.Owner uint32` field (`internal/catalog/catalog.go`)
+  plus an `OwnerOrDefault()` helper that treats the zero value as "unset,
+  defaults to the bootstrap superuser (OID 10)" — every aggregate registered
+  before this loop (including WAL-replayed ones from an older record) reads
+  as owned by the bootstrap superuser without a migration step.
+- `catalog.InMemory.SetUserAggregateOwner(name string, ownerOID uint32) bool`
+  (name-only match, mirrors `RenameUserAggregate`/`SetCollationOwner`) plus
+  its discard-result recovery counterpart
+  `SetUserAggregateOwnerDuringRecovery`. Neither is added to the `Catalog`
+  interface — same precedent as `SetCollationOwner`, which is also only
+  reached via a `*catalog.InMemory` type assertion in the executor.
+- New AST node `parser.AlterAggregateOwnerStmt{Name, NewOwner}`
+  (`internal/parser/ast.go`); the `ALTER AGGREGATE` branch in
+  `parser/ddl.go` gained an `OWNER TO` case ahead of the no-op fallback,
+  resolving `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` to the
+  `"current_user"` sentinel exactly like the `ALTER COLLATION ... OWNER TO`
+  branch already does.
+- `executor.execAlterAggregateOwner` (`internal/executor/operators_ddl.go`):
+  resolves the new owner via `catalog.InMemory.RoleOID` (raising `42704` for
+  an unknown role), calls `SetUserAggregateOwner` (raising `42883` for an
+  unknown aggregate), and WAL-logs on success. Wired into the executor's DDL
+  dispatch switch and the planner's DDL passthrough list
+  (`internal/planner/planner.go`), same as every other ALTER AGGREGATE form.
+- `internal/initdb/pg_proc_view.go`'s aggregate `prokind='a'` row now renders
+  `proowner` via `agg.OwnerOrDefault()` instead of the hardcoded `"10"`
+  literal, so `ALTER AGGREGATE ... OWNER TO` is visible to any direct
+  `pg_proc` query (and, transitively, a future `pg_dump` owner-emission path)
+  — the same pg_proc row loop #55 originally introduced with a hardcoded
+  owner.
+- New `wal.RecordKindAlterAggregateOwner` (49) with
+  `Encode`/`DecodeAlterAggregateOwner` (`internal/wal/recovery.go`), same
+  no-op physical-redo path as `RecordKindCreateAggregate`. Unlike
+  `RecordKindAlterCollationOwner`, this format omits the schema component —
+  aggregates still have no `Schema` field (slice 405 resume point (a),
+  unchanged).
+- `internal/initdb/aggregate_ddl_recovery.go`'s `replayAggregateDDLRecords`
+  gained a `RecordKindAlterAggregateOwner` case calling
+  `SetUserAggregateOwnerDuringRecovery`.
+- `internal/server/dispatch.go`'s `ddlTag` gained `"CREATE AGGREGATE"` and
+  `"ALTER AGGREGATE"` cases (previously every aggregate DDL statement fell
+  through to the generic `"OK"` tag — a pre-existing, unrelated gap fixed
+  here since both new statement types needed a tag entry anyway).
+
+Tests: `internal/parser/alter_aggregate_owner_test.go`
+(`TestParseAlterAggregateOwner`, `TestParseAlterAggregateRenameStillWorks`),
+`internal/executor/storage_ddl_test.go` (`TestDDLAlterAggregateOwner` — owner
+change + 42704 unknown-role + 42883 unknown-aggregate paths),
+`internal/wal/aggregate_ddl_test.go`
+(`TestEncodeDecodeAlterAggregateOwnerRoundTrip`,
+`TestDecodeAlterAggregateOwnerRejectsTruncatedPayload`),
+`internal/initdb/aggregate_ddl_recovery_test.go`
+(`TestAggregateDDLRecoveryReplaysOwnerAfterCreate` — full second-`Open`
+CREATE-then-OWNER replay proof, OID preserved across the ownership change).
+Gates: `go build ./...` clean; `go vet`
+wal/catalog/executor/initdb/parser/planner/server clean; `go test -race`
+`internal/wal`+`internal/mvcc` clean; `internal/catalog`+`internal/executor`+
+`internal/initdb`+`internal/parser`+`internal/planner` suites PASS.
+
+Deferred (unchanged, carried forward from slice 405): `pronamespace`
+hardcoded to `public`; built-in aggregates' `aggtransfn`/`aggfinalfn`/...
+still render raw numeric OIDs (not names) on a direct query.
 
 ## Deferred (002–010) — catalog surface estimate
 

@@ -167,6 +167,57 @@ func TestAggregateDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	}
 }
 
+// TestAggregateDDLRecoveryReplaysOwnerAfterCreate confirms that a CREATE
+// AGGREGATE followed by an ALTER AGGREGATE ... OWNER TO replays in order, so
+// the post-restart registry reports the new owner (loop #57 ledger resume
+// point: ALTER AGGREGATE OWNER TO restart persistence).
+func TestAggregateDDLRecoveryReplaysOwnerAfterCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40560)
+	const wantOwnerOID = uint32(16401)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAggregate("newavg", "_avgstate", "avg_transfn", "avg_finalfn", "", "", "", []string{"int4"}, wantOID, true, false)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterAggregateOwner("newavg", wantOwnerOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append owner: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	agg := findUserAggregate(cat, "newavg")
+	if agg == nil {
+		t.Fatalf("after CREATE + OWNER replay, \"newavg\" not found; registry = %+v", cat.ListUserAggregates())
+	}
+	if agg.OID != wantOID {
+		t.Errorf("after CREATE + OWNER replay, OID = %d, want %d (owner change must keep the original OID)", agg.OID, wantOID)
+	}
+	if got := agg.OwnerOrDefault(); got != wantOwnerOID {
+		t.Errorf("after CREATE + OWNER replay, owner = %d, want %d", got, wantOwnerOID)
+	}
+}
+
 // TestReplayAggregateDDLRecordsHandlesMissingWalDir verifies the recovery
 // hook is idempotent when invoked against a missing pg_wal directory (brand
 // new initdb).
