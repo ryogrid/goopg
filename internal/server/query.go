@@ -19,6 +19,20 @@ const (
 	oidBytea = 17
 )
 
+// setIsSuperuserGUC keeps the reportable "is_superuser" GUC (see
+// isSuperuserRoleName / server.go's startup wiring) in sync whenever
+// SET ROLE / SET SESSION AUTHORIZATION / their RESET counterparts flip
+// connTx.NonSuperuserRole. Without this, a client that ran e.g. `SET
+// ROLE some_role` then re-checked its own privilege level (as some
+// tools do) would see a stale "on" from connection startup.
+func setIsSuperuserGUC(sess *config.SessionRegistry, isSuper bool) {
+	val := "off"
+	if isSuper {
+		val = "on"
+	}
+	_ = sess.SetInternal("is_superuser", val)
+}
+
 // handleQuery implements the simple Query path. v0 recognises:
 //
 //   - SELECT 1                       → single int4 column, value "1"
@@ -163,6 +177,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			default:
 				connTx.NonSuperuserRole = role
 			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -185,6 +200,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			default:
 				connTx.NonSuperuserRole = role
 			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -206,6 +222,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			default:
 				connTx.NonSuperuserRole = role
 			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -225,6 +242,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	case upper == "RESET SESSION AUTHORIZATION":
 		if connTx != nil {
 			connTx.NonSuperuserRole = ""
+			setIsSuperuserGUC(sess, true)
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
@@ -234,6 +252,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	case upper == "RESET ROLE":
 		if connTx != nil {
 			connTx.NonSuperuserRole = ""
+			setIsSuperuserGUC(sess, true)
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err

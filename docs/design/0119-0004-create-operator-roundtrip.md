@@ -1522,3 +1522,123 @@ outright**, not a cosmetic per-object diff.
   non-superuser role, or a subsequent `ALTER PUBLICATION ... OWNER TO`,
   isn't tracked (mirrors the same limitation every other hardcoded-owner
   object in this codebase already has).
+
+## Loop #60 — `CREATE SUBSCRIPTION` round-trip + `is_superuser` GUC (DU-002 slice 423)
+
+Picked up the loop #59 ledger row's resume point (`pg_subscription.subowner`).
+Live repro (`CREATE SUBSCRIPTION sub1 CONNECTION '...' PUBLICATION pub1 WITH
+(connect = false); pg_dump --schema-only`) surfaced that the CREATE
+SUBSCRIPTION was silently absent from every dump — no crash, no warning in
+stdout — which turned out to be **two separate, independently forcing bugs**,
+not one:
+
+1. **`is_superuser` never reflected the connecting role.** Real pg_dump's
+   `getSubscriptions()` (`pg_dump.c:4972-5018`) gates the *entire* function on
+   `is_superuser(fout)`, which reads the `is_superuser` value libpq captured
+   from the startup `ParameterStatus` block — **not** a live `SHOW`. goopg
+   registered `is_superuser` (`internal/config/defaults.go`) with `BootVal:
+   "off"` and never overrode it per-connection, so pg_dump treated *every*
+   connection, including the bootstrap `postgres` superuser, as unprivileged
+   and silently skipped the whole subscription dump (`pg_log_warning` only
+   fires to stderr, and only when a same-session non-superuser probe count is
+   `>0` — it never even runs that probe here because the gate gets checked via
+   the captured ParameterStatus, not a query).
+2. **`pg_subscription.subdbid` never matched any live `pg_database.oid`.**
+   `getSubscriptions()`'s `WHERE s.subdbid = (SELECT oid FROM pg_database
+   WHERE datname = current_database())` needs an exact match or the row is
+   silently excluded (not an error — a fidelity gap, since a fixture could
+   pass its `res.ExitCode == 0` gate while still losing the object). `subdbid`
+   was hardcoded `""`; the obvious fix (`catalog.InMemory.DBOID()`) turned out
+   wrong too — `DBOID()` is the *storage* RelFileNode identity (`base/<oid>/`
+   directory naming, see its doc comment), unrelated to the SQL-visible
+   `pg_database.oid`, which `pgDatabase.VirtualRows`
+   (`internal/catalog/catalog.go`) hardcodes to `catalog.FirstUserOID` (16384)
+   for any non-template live database. Confirmed empirically: a fresh
+   goopg-initialized cluster's `postgres` database showed `pg_database.oid =
+   16384` while `DBOID()` returned `5` — two independently-tracked "database
+   identity" numbers that happen to coincide only for physical-PG-standby
+   scenarios `DBOID()` was actually built for.
+3. Missing PG16/17 `pg_subscription` columns
+   (`subpasswordrequired`/`subrunasowner`/`suborigin`/`subfailover`) — real
+   pg_dump selects these by name for `remoteVersion >= 160000/170000` (PG18.3
+   qualifies for both); an absent column would have been a harder, distinct
+   "column does not exist" query failure once (1) and (2) were fixed, so all
+   three were fixed together rather than discovering the third bug one loop
+   later.
+
+### Fix
+
+- `internal/config/defaults.go`'s `is_superuser` GUC (`ContextInternal`,
+  `FlagReport`) can't be reached by the normal `SessionRegistry.Set()` path
+  (`Context < ContextSuset` is rejected by design — mirrors upstream's
+  `PGC_INTERNAL` `set_config_option()` rejection). Added
+  `SessionRegistry.SetInternal(name, value string)`
+  (`internal/config/session.go`) as the trusted-backend-only bypass for this
+  class of variable (doc comment warns against ever plumbing client input to
+  it) — same shape as `Set()` minus the context gate, still firing the
+  reportable-hook / global-onChange callbacks so `ParameterStatus` propagates.
+- New `isSuperuserRoleName(roleName string) bool`
+  (`internal/server/server.go`) mirrors the existing case-insensitive
+  `"POSTGRES"` special case already used by every `SET ROLE`/`SET SESSION
+  AUTHORIZATION` branch in `query.go` — goopg has no `CREATE ROLE ...
+  SUPERUSER` attribute tracking at all (the whole privilege model is
+  bootstrap-`postgres`-vs-everything-else, see `NonSuperuserRole`), so this
+  reuses that convention rather than inventing a separate one.
+  `serveConn`/`sendStartupReply`'s startup path now calls
+  `sess.SetInternal("is_superuser", "on")` right after the existing
+  `session_authorization` echo, for the connecting `user`.
+- Kept the simple-query (`query.go`) and executor-dispatch (`dispatch.go`)
+  `SET ROLE`/`SET SESSION AUTHORIZATION`/`RESET ROLE`/`RESET SESSION
+  AUTHORIZATION` sites in sync: each site that flips
+  `connTx.NonSuperuserRole` now also calls the new `setIsSuperuserGUC(sess,
+  connTx.NonSuperuserRole == "")` helper (`query.go`) or inlines the
+  equivalent `SetInternal` call in the executor's
+  `ectx.SetSessionAuthorization` closure (`dispatch.go`) — a session that
+  runs `SET ROLE` mid-connection and then re-checks its own privilege level
+  (as some tools do) would otherwise see a stale value from connection
+  startup. `dispatch_extended.go` has no analogous SET-role-tracking site
+  today (the extended-protocol path doesn't implement `SET SESSION
+  AUTHORIZATION` role-tracking at all yet), so there was nothing to mirror
+  there — pre-existing gap, not a regression from this loop.
+- `pg_subscription.VirtualRows`/`Columns`
+  (`internal/initdb/replication_views.go`): `subdbid` now renders
+  `catalog.FirstUserOID` (matching `pgDatabase.VirtualRows`'s convention
+  instead of the unrelated `DBOID()`); `subowner` renders the new
+  `catalog.Subscription.Owner` field (`internal/catalog/pubsub.go`, set to
+  `10` by `CreateSubscription` — same hardcoded-owner convention as
+  `Publication.Owner`, slice 422); four new columns
+  `subpasswordrequired`/`subrunasowner`/`suborigin`/`subfailover` render the
+  upstream `CREATE SUBSCRIPTION` defaults (`t`/`f`/`any`/`f` respectively) —
+  goopg tracks none of these per-subscription, so the *default* is the only
+  value that can ever be correct today.
+- Test: extended `TestPort_PgDumpConnectionSetup` with `CREATE SUBSCRIPTION
+  goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote'
+  PUBLICATION goopg_pub1 WITH (connect = false, slot_name = goopg_sub1)`
+  (`connect = false` keeps this pure catalog registration — goopg's
+  `execCreateSubscription` never dials the conninfo target either way, the
+  apply-launcher wake it triggers is async and out of band) plus two new
+  assertions: the exact `CREATE SUBSCRIPTION ... WITH (connect = false,
+  slot_name = 'goopg_sub1', streaming = off, synchronous_commit = local);`
+  line (verified byte-for-byte against real pg_dump 18.3 — note
+  `dumpSubscription`'s `slot_name` value is a **string literal**
+  (`appendStringLiteralAH`), not an identifier, unlike most other `WITH`
+  options) and `ALTER SUBSCRIPTION goopg_sub1 OWNER TO postgres;`.
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/config`+
+  `internal/catalog`+`internal/executor`+`internal/server`+`internal/initdb`
+  suites PASS; `TestPort_PgDumpConnectionSetup` PASS; manual live repro
+  against `./bin/goopg` + real `psql`/`pg_dump` 18.3 confirmed both the
+  `is_superuser` startup value and the `pg_subscription`/`pg_database` OID
+  match before writing the automated fixture; TPC-H spotcheck Q12=2/Q13=33
+  PASS; pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): `catalog.Subscription.Owner` is always the
+  bootstrap superuser (10), same limitation as `Publication.Owner`.
+  `dispatch_extended.go`'s extended-protocol path has no `SET SESSION
+  AUTHORIZATION`/`SET ROLE` role-tracking at all (pre-existing, not
+  introduced by this loop) — a client using the extended protocol to switch
+  roles mid-session wouldn't get `NonSuperuserRole`/`is_superuser` updated
+  either. `catalog.InMemory.DBOID()` vs. `pg_database.oid`'s
+  `FirstUserOID`-hardcoded value remaining two independently-tracked
+  "database identity" numbers (rather than one) is itself a latent
+  multi-database-support gap — harmless today because goopg is
+  single-live-database in practice, but would misbehave the moment either
+  concept needs to vary per connected database.

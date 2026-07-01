@@ -471,6 +471,18 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 			{Name: "substream", Type: catalog.Type{Name: "text"}},
 			{Name: "subtwophasestate", Type: catalog.Type{Name: "text"}},
 			{Name: "subdisableonerr", Type: catalog.Type{Name: "text"}},
+			// subpasswordrequired/subrunasowner/suborigin/subfailover
+			// (PG16+/17+ additions) are selected by name in real pg_dump's
+			// getSubscriptions() query — an unresolvable column reference
+			// aborts the query outright (same "pg_dump exits nonzero"
+			// hazard subowner had before DU-002 slice 422). goopg tracks
+			// none of these per-subscription yet, so they render the
+			// upstream CREATE SUBSCRIPTION default: password required,
+			// not run-as-owner, origin 'any', failover off.
+			{Name: "subpasswordrequired", Type: catalog.Type{Name: "text"}},
+			{Name: "subrunasowner", Type: catalog.Type{Name: "text"}},
+			{Name: "suborigin", Type: catalog.Type{Name: "text"}},
+			{Name: "subfailover", Type: catalog.Type{Name: "text"}},
 			{Name: "subconninfo", Type: catalog.Type{Name: "text"}},
 			{Name: "subslotname", Type: catalog.Type{Name: "text"}},
 			{Name: "subsynccommit", Type: catalog.Type{Name: "text"}},
@@ -486,14 +498,28 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		for _, sub := range ps.Subscriptions() {
 			out = append(out, []string{
 				fmt.Sprintf("%d", sub.OID),
-				"", // subdbid
+				// subdbid must match pg_database.oid for the live database so
+				// pg_dump's `s.subdbid = (SELECT oid FROM pg_database WHERE
+				// datname = current_database())` filter actually matches a row.
+				// catalog.InMemory.DBOID() is the unrelated *storage* identity
+				// (RelFileNode base/<oid> directory — see its doc comment); the
+				// SQL-visible pg_database.oid for any live non-template database
+				// is unconditionally catalog.FirstUserOID (16384) per the
+				// hardcoded convention pgDatabase.VirtualRows already uses
+				// (internal/catalog/catalog.go), so mirror that here rather than
+				// DBOID().
+				fmt.Sprintf("%d", catalog.FirstUserOID), // subdbid
 				sub.Name,
-				"", // subowner
+				fmt.Sprintf("%d", sub.Owner), // subowner
 				boolText(sub.Enabled),
-				"f", // subbinary
-				"f", // substream
-				"d", // subtwophasestate disabled
-				"f", // subdisableonerr
+				"f",   // subbinary
+				"f",   // substream
+				"d",   // subtwophasestate disabled
+				"f",   // subdisableonerr
+				"t",   // subpasswordrequired (upstream default)
+				"f",   // subrunasowner (upstream default)
+				"any", // suborigin (LOGICALREP_ORIGIN_ANY upstream default)
+				"f",   // subfailover (upstream default)
 				sub.Conninfo,
 				sub.SlotName,
 				"local", // subsynccommit

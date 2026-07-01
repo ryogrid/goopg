@@ -38,6 +38,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -858,6 +859,18 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		// effective value matches.
 		_ = sess.Set("session_authorization", user, false)
 	}
+	// is_superuser is FlagReport (GUC_REPORT upstream): libpq captures it
+	// from the startup ParameterStatus block and pg_dump's is_superuser()
+	// (pg_dump.c) reads that captured value verbatim rather than issuing a
+	// live SHOW — it never re-queries after connecting, so this one-time
+	// startup value is what getSubscriptions()'s superuser gate actually
+	// sees. Before this fix the GUC's BootVal ("off") was never overridden
+	// per-connection, so pg_dump treated every connection — including the
+	// bootstrap "postgres" superuser — as unprivileged and silently skipped
+	// dumping ALL subscriptions (DU-002 slice 423).
+	if isSuperuserRoleName(user) {
+		_ = sess.SetInternal("is_superuser", "on")
+	}
 
 	// Now wire the per-session ParameterStatus emitter so subsequent
 	// SET application_name = 'X' (etc.) auto-emits.
@@ -901,6 +914,17 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 // `false` / `0` / unrecognised values mean "not a replication
 // connection". Mirrors postgres/src/backend/replication/walsender.c
 // (`got_STOPPING`, `EnableReplicationOriginCmd`).
+// isSuperuserRoleName reports whether roleName is the bootstrap
+// superuser. goopg has no CREATE ROLE ... SUPERUSER attribute tracking
+// (the whole privilege model is the bootstrap "postgres" role vs.
+// everything else — see connTxState.NonSuperuserRole and its SET
+// ROLE / SET SESSION AUTHORIZATION call sites in query.go, which use
+// the same case-insensitive "POSTGRES" special case), so this mirrors
+// that convention rather than introducing a separate one.
+func isSuperuserRoleName(roleName string) bool {
+	return strings.EqualFold(strings.TrimSpace(roleName), "postgres")
+}
+
 func isReplicationStartupParam(v string) bool {
 	switch v {
 	case "":

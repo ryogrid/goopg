@@ -142,6 +142,36 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	return nil
 }
 
+// SetInternal writes a ContextInternal variable's session-layer value
+// (e.g. "is_superuser") — the class of GUC_REPORT variable upstream
+// only ever assigns from backend C code, never from a client SET
+// command (real PG's guc_tables.c marks these PGC_INTERNAL, and
+// set_config_option() rejects any SET reaching them the same way
+// Set() rejects Context < ContextSuset here). Callers must be trusted
+// backend code (connection startup, SET ROLE / SET SESSION
+// AUTHORIZATION role-tracking) — never plumb client input to this
+// method directly.
+func (s *SessionRegistry) SetInternal(name, value string) error {
+	v, ok := s.lookupVariable(name)
+	if !ok {
+		return fmt.Errorf("unrecognized configuration parameter %q", name)
+	}
+	canon, err := v.canonicalize(value)
+	if err != nil {
+		return err
+	}
+	key := strings.ToLower(name)
+	s.session[key] = canon
+	delete(s.local, key)
+	if v.Flags&FlagReport != 0 && s.onReportableChange != nil {
+		_, eff, _ := s.Get(name)
+		s.onReportableChange(v.Name, eff)
+	}
+	_, eff, _ := s.Get(name)
+	s.global.invokeOnChange(v.Name, eff)
+	return nil
+}
+
 // Reset drops session and transaction overrides for the named variable
 // so it falls through to the global value.
 func (s *SessionRegistry) Reset(name string) error {

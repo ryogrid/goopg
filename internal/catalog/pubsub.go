@@ -38,9 +38,17 @@ type Publication struct {
 
 // Subscription is one CREATE SUBSCRIPTION's catalog row.
 type Subscription struct {
-	Name         string
-	OID          uint32
-	Conninfo     string
+	Name     string
+	OID      uint32
+	Conninfo string
+	// Owner is the owning role's OID (pg_subscription.subowner). Real
+	// pg_dump's getSubscriptions() (pg_dump.c) always selects this column
+	// and calls getRoleName() on it — same pg_fatal()-on-unresolved-OID
+	// hazard pg_publication.pubowner had (DU-002 slice 422). CreateSubscription
+	// always sets this to the bootstrap superuser OID (10), mirroring
+	// Publication.Owner's hardcoded-owner convention pending real per-session
+	// ownership tracking.
+	Owner        uint32
 	Publications []string
 	Enabled      bool
 	SlotName     string
@@ -238,6 +246,7 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 		Name:         name,
 		OID:          p.nextOID,
 		Conninfo:     conninfo,
+		Owner:        10, // bootstrap superuser (postgres); getRoleName(10) → "postgres"
 		Publications: append([]string(nil), publications...),
 		Enabled:      enabled,
 		SlotName:     slotName,

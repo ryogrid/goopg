@@ -4713,6 +4713,37 @@ documentation-only and is exempt from the design-doc requirement.)
       bootstrap superuser — a non-superuser-created publication or an
       `ALTER PUBLICATION ... OWNER TO` isn't tracked (same limitation every
       other hardcoded-owner object already has).
+      **2026-07-02 (loop #60, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #60"): `CREATE SUBSCRIPTION` round-trip + `is_superuser` GUC
+      LANDED — DU-002 slice 423.** Closed the loop #59 resume point via live
+      repro against real pg_dump 18.3, which surfaced three independently
+      forcing bugs: (1) `is_superuser` never reflected the connecting role —
+      pg_dump's `getSubscriptions()` gates on the startup-captured
+      `ParameterStatus` value, not a live `SHOW`, so the bootstrap `postgres`
+      superuser was silently treated as unprivileged and the whole
+      subscription dump was skipped; fixed via new
+      `SessionRegistry.SetInternal` (`internal/config/session.go`), wired at
+      connection startup (`internal/server/server.go`'s new
+      `isSuperuserRoleName`) and kept in sync at every `SET`/`RESET
+      ROLE`/`SESSION AUTHORIZATION` site (`query.go`+`dispatch.go`'s new
+      `setIsSuperuserGUC`). (2) `pg_subscription.subdbid` never matched any
+      live `pg_database.oid` — fixed by rendering `catalog.FirstUserOID`
+      instead of the unrelated storage-identity `DBOID()`. (3) added the
+      missing PG16/17 `subpasswordrequired`/`subrunasowner`/`suborigin`/
+      `subfailover` columns. New `catalog.Subscription.Owner uint32`
+      (hardcoded bootstrap superuser OID 10, same convention as
+      `Publication.Owner`) renders `subowner`. `TestPort_
+      PgDumpConnectionSetup` extended with a `CREATE SUBSCRIPTION ... WITH
+      (connect = false, ...)` fixture plus exact-text assertions for the
+      `CREATE SUBSCRIPTION`/`ALTER SUBSCRIPTION ... OWNER TO postgres;` dump
+      lines. Gates: `go build ./...` clean; `internal/config`+
+      `internal/catalog`+`internal/server`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33
+      PASS; pgbench smoke = pre-commit hook. Deferred (ledger row appended):
+      `Subscription.Owner` non-bootstrap-role tracking, extended-protocol
+      (`dispatch_extended.go`) has no SET-role-tracking at all, and
+      `DBOID()` vs. `pg_database.oid`'s `FirstUserOID` split remains two
+      independently-tracked database-identity numbers.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

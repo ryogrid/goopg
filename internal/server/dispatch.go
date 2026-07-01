@@ -280,6 +280,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.SetSessionAuthorization = func(role string) {
 			connTx.NonSuperuserRole = role
 			ectx.NonSuperuserRole = role
+			setIsSuperuserGUC(sess, role == "")
 		}
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.

@@ -4942,6 +4942,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES"); err != nil {
 		t.Fatalf("create publication: %v", err)
 	}
+	// Slice 423: CREATE SUBSCRIPTION must round-trip and pg_dump must not
+	// abort. Real pg_dump's getSubscriptions() (only run for a superuser
+	// connection, which this fixture is) selects subowner PLUS the PG16/17
+	// additions subpasswordrequired/subrunasowner/suborigin/subfailover by
+	// name — before this slice pg_subscription had neither the populated
+	// subowner NOR those four columns at all, so the query would either
+	// pg_fatal() on getRoleName("") (the pubowner-shaped bug) or fail
+	// outright with "column s.subpasswordrequired does not exist" (a
+	// distinct, more severe bug: the whole SELECT never even runs).
+	// connect=false keeps this a pure catalog registration — goopg's
+	// execCreateSubscription never dials the conninfo target itself either
+	// way (the apply launcher wake is async and out of band).
+	if err := runSQLSimple(t, c, "CREATE SUBSCRIPTION goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote' PUBLICATION goopg_pub1 WITH (connect = false, slot_name = goopg_sub1)"); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
 	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
@@ -11033,6 +11048,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER PUBLICATION goopg_pub1 OWNER TO postgres;") {
 			t.Errorf("pg_dump dropped the ALTER PUBLICATION OWNER TO (slice-422, pubowner resolution); full stdout=%q", res.Stdout)
+		}
+		// Slice 423: CREATE SUBSCRIPTION must round-trip, and pg_dump must not
+		// abort (either the pubowner-shaped getRoleName() pg_fatal(), or the
+		// distinct "column does not exist" query-shape failure — see the
+		// runSQLSimple call above). subenabled is unconditionally dumped as
+		// `false` by real pg_dump outside binary-upgrade mode, so `WITH (...)`
+		// never carries an `enabled = ...` clause here regardless of the
+		// subscription's actual enabled state.
+		subStmt := "CREATE SUBSCRIPTION goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote' PUBLICATION goopg_pub1 WITH (connect = false, slot_name = 'goopg_sub1', streaming = off, synchronous_commit = local);"
+		if !strings.Contains(res.Stdout, subStmt) {
+			t.Errorf("pg_dump dropped the CREATE SUBSCRIPTION round-trip (slice-423); missing %q\n  full stdout=%q", subStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER SUBSCRIPTION goopg_sub1 OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the ALTER SUBSCRIPTION OWNER TO (slice-423, subowner resolution); full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact
