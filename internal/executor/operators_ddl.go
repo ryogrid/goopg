@@ -749,8 +749,20 @@ func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	if !ok {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE EVENT TRIGGER requires the in-memory catalog"}
 	}
-	if _, err := im.RegisterEventTrigger(s.Name, s.Event, o.currentDDLOwnerOID(), funcOID, s.Tags); err != nil {
+	et, err := im.RegisterEventTrigger(s.Name, s.Event, o.currentDDLOwnerOID(), funcOID, s.Tags)
+	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
+	// resume point): goopg has no per-event-trigger on-disk file namespace,
+	// so record a WAL event the recovery driver
+	// (internal/initdb/event_trigger_ddl_recovery.go) replays into the
+	// eventTriggers registry on the next startup. Mirrors CREATE
+	// PUBLICATION.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateEventTrigger(et.Name, et.Event, et.Tags, et.OID, et.Owner, et.FuncOID)); werr != nil {
+			return fmt.Errorf("wal create-event-trigger: %w", werr)
+		}
 	}
 	return nil
 }
@@ -760,8 +772,9 @@ func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 // CREATE EVENT TRIGGER, this only maintains dump fidelity (evtenabled/
 // evtname/evtowner in the pg_event_trigger virtual view) — goopg never fires
 // event triggers, so ENABLE/DISABLE has no runtime effect beyond the catalog
-// row. No WAL persistence yet (same gap as CREATE/DROP EVENT TRIGGER itself;
-// see the ledger). DU-002 (M0119-0004, loop #69 ledger follow-up).
+// row. Each mutation is WAL-logged (DU-002 restart-persistence follow-up,
+// M0119-0004 loop #70 ledger resume point) so it survives a restart, mirroring
+// ALTER PUBLICATION/SUBSCRIPTION OWNER TO.
 func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -770,22 +783,43 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 	notFoundErr := func(err error) *ExecError {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
+	logEnabled := func(code byte) error {
+		if o.ctx.WAL == nil {
+			return nil
+		}
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerEnabled(s.Name, code)); werr != nil {
+			return fmt.Errorf("wal alter-event-trigger-enabled: %w", werr)
+		}
+		return nil
+	}
 	switch s.Action {
 	case "disable":
 		if err := im.SetEventTriggerEnabled(s.Name, "D"); err != nil {
 			return notFoundErr(err)
 		}
+		if err := logEnabled('D'); err != nil {
+			return err
+		}
 	case "enable":
 		if err := im.SetEventTriggerEnabled(s.Name, "O"); err != nil {
 			return notFoundErr(err)
+		}
+		if err := logEnabled('O'); err != nil {
+			return err
 		}
 	case "enable_replica":
 		if err := im.SetEventTriggerEnabled(s.Name, "R"); err != nil {
 			return notFoundErr(err)
 		}
+		if err := logEnabled('R'); err != nil {
+			return err
+		}
 	case "enable_always":
 		if err := im.SetEventTriggerEnabled(s.Name, "A"); err != nil {
 			return notFoundErr(err)
+		}
+		if err := logEnabled('A'); err != nil {
+			return err
 		}
 	case "rename":
 		if err := im.RenameEventTrigger(s.Name, s.NewName); err != nil {
@@ -794,6 +828,11 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 			}
 			return notFoundErr(err)
 		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerRename(s.Name, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-event-trigger-rename: %w", werr)
+			}
+		}
 	case "owner":
 		ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
 		if err != nil {
@@ -801,6 +840,11 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 		}
 		if err := im.SetEventTriggerOwner(s.Name, ownerOID); err != nil {
 			return notFoundErr(err)
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerOwner(s.Name, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-event-trigger-owner: %w", werr)
+			}
 		}
 	default:
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized ALTER EVENT TRIGGER action %q", s.Action)}
@@ -13202,7 +13246,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// M0119-0004) so a dropped event trigger stops round-tripping
 			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				if im.DropEventTrigger(s.Names[0].String()) {
+				name := s.Names[0].String()
+				if im.DropEventTrigger(name) {
+					// DU-002 restart-persistence follow-up (M0119-0004,
+					// loop #70 ledger resume point): mirrors DROP
+					// PUBLICATION/SUBSCRIPTION.
+					if o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropEventTrigger(name)); werr != nil {
+							return fmt.Errorf("wal drop-event-trigger: %w", werr)
+						}
+					}
 					return nil
 				}
 			}

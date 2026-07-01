@@ -5019,6 +5019,46 @@ documentation-only and is exempt from the design-doc requirement.)
       DROP, and now ALTER) still has no forcing fixture; the loop #69
       `validate_ddl_tags`/superuser-privilege gaps are untouched by this
       loop.
+- [x] **Event trigger CREATE/DROP/ALTER WAL/restart persistence
+      (M0119-0004, loop #71).** **COMPLETE 2026-07-02:** closes the loop #70
+      row's own WAL-persistence resume point (that ledger row is now
+      `resolved`), mirroring the PubSub WAL/restart persistence pattern from
+      loop #68. Five new WAL record kinds (`RecordKindCreateEventTrigger`/
+      `DropEventTrigger`/`AlterEventTriggerEnabled`/`AlterEventTriggerRename`/
+      `AlterEventTriggerOwner`, kinds 56-60, `internal/wal/recovery.go`) each
+      with an `Encode*`/`Decode*` pair; goopg has no per-event-trigger file
+      namespace so `wal.ApplyRecord`'s physical-redo path is a no-op for all
+      five. New post-replay driver `internal/initdb/
+      event_trigger_ddl_recovery.go` (`replayEventTriggerDDLRecords`) applies
+      each record via five new `*DuringRecovery` catalog mutators
+      (`internal/catalog/catalog.go`, OID-preserving, idempotent-overwrite);
+      wired into `internal/initdb/open.go` right after the PubSub replay
+      call. `execCreateEventTrigger`/`execAlterEventTrigger`/
+      `execDropCompat`'s `"event trigger"` case (`internal/executor/
+      operators_ddl.go`) now WAL-log before returning success. Also added
+      `catalog.InMemory.LookupEventTrigger` (deep-copy accessor, mirrors
+      `PubSub.LookupPublication`). Verified via a real `goopg stop`/`start`
+      restart cycle against the same data dir with real `psql`/`pg_dump`
+      (not just unit tests): CREATE+DISABLE survives one restart, RENAME TO+
+      OWNER TO+re-ENABLE survives a second. Tests:
+      `internal/wal/event_trigger_ddl_test.go` (5 record formats,
+      round-trip + truncated/wrong-kind guard),
+      `internal/initdb/event_trigger_ddl_recovery_test.go` (full
+      Init→Open→WAL-append→Close→Open cycles for CREATE, CREATE+DROP,
+      CREATE+DISABLE+RENAME+OWNER chained, plus missing-dir/nil-catalog
+      guards). Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/wal`+`internal/catalog`+`internal/initdb`+
+      `internal/executor`+`internal/planner`+`internal/parser`+
+      `internal/server` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS
+      (`scripts/tpch-spotcheck.sh`); full pre-commit gate incl. pgbench
+      TPC-B smoke PASS (`scripts/ralph-precommit-test.sh`). Design doc:
+      `0119-0004-create-operator-roundtrip.md` "Loop #71". Deferred (ledger
+      row appended): the loop #69 `validate_ddl_tags`/superuser-privilege
+      gaps remain untouched (still tracked open via the loop #69 row);
+      newly discovered while verifying live — `CREATE FUNCTION` itself has
+      no WAL/restart persistence in goopg (a pre-existing, broader gap, not
+      specific to event triggers), so an event trigger's `evtfoid` can
+      dangle post-restart if its backing function was created post-initdb.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

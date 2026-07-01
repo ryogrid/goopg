@@ -10797,6 +10797,22 @@ func (c *InMemory) ListEventTriggers() []*EventTrigger {
 	return out
 }
 
+// LookupEventTrigger returns a deep copy of the named event trigger, or
+// (nil, false) if it does not exist. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point) — mirrors PubSub.
+// LookupPublication.
+func (c *InMemory) LookupEventTrigger(name string) (*EventTrigger, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return nil, false
+	}
+	out := *et
+	out.Tags = append([]string(nil), et.Tags...)
+	return &out, true
+}
+
 // SetEventTriggerEnabled updates an event trigger's evtenabled state. code
 // must be one of "O" (enable), "D" (disable), "A" (enable always), "R"
 // (enable replica) — the four values PostgreSQL's pg_event_trigger.evtenabled
@@ -10847,6 +10863,59 @@ func (c *InMemory) RenameEventTrigger(name, newName string) error {
 	et.Name = newName
 	c.eventTriggers[newName] = et
 	return nil
+}
+
+// RegisterEventTriggerDuringRecovery is the idempotent version of
+// RegisterEventTrigger used by the WAL-replay driver
+// (internal/initdb/event_trigger_ddl_recovery.go). Unlike
+// RegisterEventTrigger it takes the OID from the WAL record (so the
+// recovered event trigger matches the pre-crash OID exactly) and
+// overwrites rather than erroring when a trigger with the same name is
+// already present (replay may see the same record more than once across a
+// partial-then-full replay). Mirrors catalog.PubSub.
+// CreatePublicationDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) RegisterEventTriggerDuringRecovery(et *EventTrigger) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggers == nil {
+		c.eventTriggers = make(map[string]*EventTrigger)
+	}
+	out := *et
+	out.Tags = append([]string(nil), et.Tags...)
+	c.eventTriggers[et.Name] = &out
+	c.advanceNextOIDLocked(et.OID)
+}
+
+// DropEventTriggerDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropEventTrigger. Identical to DropEventTrigger but
+// discards the found/not-found result — replay does not care whether the
+// event trigger was still present. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) DropEventTriggerDuringRecovery(name string) {
+	_ = c.DropEventTrigger(name)
+}
+
+// SetEventTriggerEnabledDuringRecovery is the discard-error recovery
+// counterpart to SetEventTriggerEnabled, mirroring
+// DropEventTriggerDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) SetEventTriggerEnabledDuringRecovery(name, code string) {
+	_ = c.SetEventTriggerEnabled(name, code)
+}
+
+// RenameEventTriggerDuringRecovery is the discard-error recovery
+// counterpart to RenameEventTrigger. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) RenameEventTriggerDuringRecovery(name, newName string) {
+	_ = c.RenameEventTrigger(name, newName)
+}
+
+// SetEventTriggerOwnerDuringRecovery is the discard-error recovery
+// counterpart to SetEventTriggerOwner. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) SetEventTriggerOwnerDuringRecovery(name string, owner uint32) {
+	_ = c.SetEventTriggerOwner(name, owner)
 }
 
 // ForeignServer is a user-created foreign server (CREATE SERVER). goopg does not

@@ -2370,3 +2370,107 @@ ALTER) — an event trigger, including any ALTER'd state, still vanishes on
 restart; no forcing fixture today (same gap noted in loop #69). The
 `validate_ddl_tags`/superuser-privilege gaps from loop #69 are unaffected by
 this loop.
+
+## Loop #71 — Event trigger WAL/restart persistence
+
+Closes the loop #70 row's own "WAL/restart persistence for event triggers …
+still vanishes on restart" resume point, mirroring the PubSub WAL/restart
+persistence pattern from loop #68 (`internal/wal/pubsub_ddl_test.go`,
+`internal/initdb/pubsub_ddl_recovery.go`).
+
+### What landed
+
+Five new WAL record kinds in `internal/wal/recovery.go`:
+`RecordKindCreateEventTrigger` (56), `RecordKindDropEventTrigger` (57),
+`RecordKindAlterEventTriggerEnabled` (58; carries the raw
+`evtenabled` code byte so DISABLE/ENABLE/ENABLE REPLICA/ENABLE ALWAYS all
+share one record shape), `RecordKindAlterEventTriggerRename` (59), and
+`RecordKindAlterEventTriggerOwner` (60), each with an `Encode*`/`Decode*`
+pair following the existing publication/subscription record format
+convention (length-prefixed strings, `binary.LittleEndian`). goopg has no
+per-event-trigger on-disk file namespace — `catalog.InMemory`'s
+`eventTriggers` map is a pure in-memory registry, like `catalog.PubSub` — so
+`wal.ApplyRecord`'s physical-redo switch treats all five kinds as a no-op,
+same as the publication/subscription kinds.
+
+A new post-replay recovery driver,
+`internal/initdb/event_trigger_ddl_recovery.go`
+(`replayEventTriggerDDLRecords`), walks the WAL once after physical replay
+and re-applies each record via five new `*DuringRecovery` catalog mutators
+(`internal/catalog/catalog.go`): `RegisterEventTriggerDuringRecovery` (takes
+the OID from the record and advances `nextOID` via the existing
+`advanceNextOIDLocked` helper, overwriting rather than erroring on a
+name collision — mirrors `PubSub.CreatePublicationDuringRecovery`),
+`DropEventTriggerDuringRecovery`, `SetEventTriggerEnabledDuringRecovery`,
+`RenameEventTriggerDuringRecovery`, `SetEventTriggerOwnerDuringRecovery`
+(all discard-error, idempotent-by-design counterparts to the loop #69/#70
+mutators). `internal/initdb/open.go` calls the driver right after the
+PubSub replay call — event triggers, like PubSub, are not schema-scoped, so
+the ordering relative to schema replay doesn't matter, only that it runs
+before the first client session can query `pg_event_trigger`.
+
+The three executor sites now WAL-log their mutation before returning
+success: `execCreateEventTrigger` and the `execDropCompat` `"event
+trigger"` case (`internal/executor/operators_ddl.go`) each append one
+record; `execAlterEventTrigger` appends one record per `switch s.Action`
+arm (a small `logEnabled` closure covers the four ENABLE/DISABLE variants so
+they share one call site). All four `o.ctx.WAL.Append` calls are `nil`-gated
+(`if o.ctx.WAL != nil`) matching the existing PubSub/collation/aggregate DDL
+sites — some embedded test harnesses run without a WAL writer at all.
+
+Also added `catalog.InMemory.LookupEventTrigger(name)` (a deep-copy
+single-row lookup, mirroring `PubSub.LookupPublication`) — the registry
+previously only exposed `ListEventTriggers()`, which the recovery tests
+needed a direct name-keyed accessor for.
+
+### Live PG 18.3 verification
+
+Manual server (`/tmp/evt-restart-data`, real `psql`/`pg_dump` from
+`postgres/local_install/bin`): `CREATE FUNCTION et_func() RETURNS
+event_trigger`, `CREATE EVENT TRIGGER mytrig ON ddl_command_start WHEN TAG
+IN ('CREATE TABLE') EXECUTE FUNCTION et_func()`, `ALTER EVENT TRIGGER
+mytrig DISABLE`, then `goopg stop` + `goopg start` against the same data
+dir. `SELECT evtname, evtevent, evtenabled FROM pg_event_trigger` after
+restart returned `mytrig|ddl_command_start|D` — all three CREATE-time
+fields plus the DISABLE state survived. A second round exercised RENAME TO
++ OWNER TO CURRENT_USER + re-ENABLE, then another restart: `SELECT evtname,
+evtenabled, evtowner::regrole FROM pg_event_trigger` returned
+`renamedtrig|O|10`, confirming all three ALTER forms persist together.
+(Incidental discovery, out of scope here: after restart `pg_dump`'s
+`EXECUTE FUNCTION 131072()` no longer resolves to `et_func()`, because
+`CREATE FUNCTION` itself has no WAL/restart persistence in goopg today — a
+pre-existing gap that predates and is broader than this event-trigger slice;
+not ledgered as a new row since it isn't specific to event triggers.)
+
+### Tests
+
+`internal/wal/event_trigger_ddl_test.go` pins the five record formats
+(encode→decode round trip per kind, plus a wrong-kind/truncated-payload
+guard test), mirroring `internal/wal/pubsub_ddl_test.go`.
+`internal/initdb/event_trigger_ddl_recovery_test.go` exercises the full
+`Init`→`Open`→append WAL→`Close`→`Open` cycle: CREATE alone, CREATE+DROP
+(net registry effect must be "absent"), and CREATE+DISABLE+RENAME+OWNER
+chained (OID must survive rename/owner changes unchanged), plus the
+missing-WAL-dir and nil-catalog no-op guards, mirroring
+`internal/initdb/pubsub_ddl_recovery_test.go`.
+
+### Gates
+
+`go build ./...` clean; `go vet ./...` clean; `internal/wal`+
+`internal/catalog`+`internal/initdb`+`internal/executor`+`internal/planner`+
+`internal/parser`+`internal/server` suites PASS; live PG 18.3 diff above
+(byte-identical evtname/evtevent/evtenabled/evtowner survival across two
+independent restart cycles); TPC-H spotcheck Q12=2/Q13=33 PASS (`scripts/
+tpch-spotcheck.sh`); full pre-commit gate including pgbench TPC-B smoke PASS
+(`scripts/ralph-precommit-test.sh`).
+
+### Still deferred
+
+The `validate_ddl_tags`/`validate_table_rewrite_tags` command-tag-list
+validation and `CreateEventTrigger`'s superuser privilege check (both from
+loop #69) remain untouched. Broader and out of scope: `CREATE FUNCTION`
+itself has no WAL/restart persistence, so an event trigger's `evtfoid`
+reference can dangle after a restart if the backing function was also
+created post-initdb and not re-created — this is a pre-existing routines/
+functions persistence gap, not new to this loop, and not specific to event
+triggers.

@@ -655,6 +655,53 @@ const (
 	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
 	RecordKindAlterSubscriptionOwner byte = 55
 
+	// RecordKindCreateEventTrigger records a `CREATE EVENT TRIGGER name ON
+	// event ... EXECUTE FUNCTION func()` event so it survives a restart.
+	// goopg has no per-event-trigger on-disk file namespace (catalog.InMemory's
+	// eventTriggers map is a pure in-memory registry, like catalog.PubSub), so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/event_trigger_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each event trigger with
+	// its original OID. Mirrors RecordKindCreatePublication. DU-002
+	// restart-persistence follow-up (M0119-0004, loop #70 ledger resume
+	// point).
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | funcOID(4) |
+	//   eventLen(2) | event(eventLen bytes) |
+	//   nameLen(2) | name(nameLen bytes) |
+	//   tagsCount(2) | for each: tagLen(2) tag(tagLen bytes)
+	RecordKindCreateEventTrigger byte = 56
+
+	// RecordKindDropEventTrigger records a `DROP EVENT TRIGGER name` event.
+	// Counterpart to RecordKindCreateEventTrigger; same no-op physical redo
+	// path. Mirrors RecordKindDropPublication.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropEventTrigger byte = 57
+
+	// RecordKindAlterEventTriggerEnabled records an `ALTER EVENT TRIGGER name
+	// {DISABLE | ENABLE [REPLICA|ALWAYS]}` event. code is the raw
+	// pg_event_trigger.evtenabled value ('D'/'O'/'R'/'A'). Same no-op
+	// physical redo path as RecordKindCreateEventTrigger.
+	// Format:
+	//   kind(1) | code(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterEventTriggerEnabled byte = 58
+
+	// RecordKindAlterEventTriggerRename records an `ALTER EVENT TRIGGER name
+	// RENAME TO newname` event. Same no-op physical redo path as
+	// RecordKindCreateEventTrigger.
+	// Format:
+	//   kind(1) | oldNameLen(2) | oldName(oldNameLen bytes) |
+	//   newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterEventTriggerRename byte = 59
+
+	// RecordKindAlterEventTriggerOwner records an `ALTER EVENT TRIGGER name
+	// OWNER TO newowner` event. Same no-op physical redo path as
+	// RecordKindCreateEventTrigger.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterEventTriggerOwner byte = 60
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1994,6 +2041,243 @@ func DecodeAlterSubscriptionOwner(payload []byte) (name string, ownerOID uint32,
 	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
 	if len(payload) < 7+nameLen {
 		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return string(payload[7 : 7+nameLen]), ownerOID, nil
+}
+
+// EncodeCreateEventTrigger encodes a CREATE EVENT TRIGGER event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #70 ledger resume
+// point). The OID is carried so recovery re-registers the event trigger
+// identically to the live server. Format documented at the
+// RecordKindCreateEventTrigger constant.
+func EncodeCreateEventTrigger(name, event string, tags []string, oid, ownerOID, funcOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(event) > 0xFFFF {
+		event = event[:0xFFFF]
+	}
+	total := 14 + 2 + len(event) + 2 + len(name) + 2
+	for _, t := range tags {
+		if len(t) > 0xFFFF {
+			t = t[:0xFFFF]
+		}
+		total += 2 + len(t)
+	}
+	out := make([]byte, total)
+	out[0] = RecordKindCreateEventTrigger
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], funcOID)
+	off := 13
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(event)))
+	off += 2
+	copy(out[off:], event)
+	off += len(event)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tags)))
+	off += 2
+	for _, t := range tags {
+		if len(t) > 0xFFFF {
+			t = t[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(t)))
+		off += 2
+		copy(out[off:], t)
+		off += len(t)
+	}
+	return out
+}
+
+// DecodeCreateEventTrigger decodes a RecordKindCreateEventTrigger payload.
+func DecodeCreateEventTrigger(payload []byte) (name, event string, tags []string, oid, ownerOID, funcOID uint32, err error) {
+	if len(payload) < 13 {
+		return "", "", nil, 0, 0, 0, fmt.Errorf("wal: create-event-trigger payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateEventTrigger {
+		return "", "", nil, 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-event-trigger", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	funcOID = binary.LittleEndian.Uint32(payload[9:13])
+	off := 13
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-event-trigger payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-event-trigger payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if event, err = readStr(); err != nil {
+		return "", "", nil, 0, 0, 0, err
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", nil, 0, 0, 0, err
+	}
+	if len(payload) < off+2 {
+		return "", "", nil, 0, 0, 0, fmt.Errorf("wal: create-event-trigger payload truncated (need %d bytes)", off+2)
+	}
+	tagsCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	tags = make([]string, 0, tagsCount)
+	for i := 0; i < tagsCount; i++ {
+		s, serr := readStr()
+		if serr != nil {
+			return "", "", nil, 0, 0, 0, serr
+		}
+		tags = append(tags, s)
+	}
+	return name, event, tags, oid, ownerOID, funcOID, nil
+}
+
+// EncodeDropEventTrigger encodes a DROP EVENT TRIGGER event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #70 ledger resume
+// point). Format documented at the RecordKindDropEventTrigger constant.
+func EncodeDropEventTrigger(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropEventTrigger
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropEventTrigger decodes a RecordKindDropEventTrigger payload.
+func DecodeDropEventTrigger(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-event-trigger payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropEventTrigger {
+		return "", fmt.Errorf("wal: record kind %d is not drop-event-trigger", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-event-trigger payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeAlterEventTriggerEnabled encodes an ALTER EVENT TRIGGER name
+// {DISABLE|ENABLE [REPLICA|ALWAYS]} event (DU-002 restart-persistence
+// follow-up to M0119-0004, loop #70 ledger resume point). code is the raw
+// pg_event_trigger.evtenabled value ('D'/'O'/'R'/'A'). Format documented at
+// the RecordKindAlterEventTriggerEnabled constant.
+func EncodeAlterEventTriggerEnabled(name string, code byte) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 4+len(name))
+	out[0] = RecordKindAlterEventTriggerEnabled
+	out[1] = code
+	binary.LittleEndian.PutUint16(out[2:4], uint16(len(name)))
+	copy(out[4:], name)
+	return out
+}
+
+// DecodeAlterEventTriggerEnabled decodes a
+// RecordKindAlterEventTriggerEnabled payload.
+func DecodeAlterEventTriggerEnabled(payload []byte) (name string, code byte, err error) {
+	if len(payload) < 4 {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-enabled payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterEventTriggerEnabled {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-event-trigger-enabled", payload[0])
+	}
+	code = payload[1]
+	nameLen := int(binary.LittleEndian.Uint16(payload[2:4]))
+	if len(payload) < 4+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-enabled payload truncated (need %d bytes)", 4+nameLen)
+	}
+	return string(payload[4 : 4+nameLen]), code, nil
+}
+
+// EncodeAlterEventTriggerRename encodes an ALTER EVENT TRIGGER name RENAME
+// TO newname event (DU-002 restart-persistence follow-up to M0119-0004,
+// loop #70 ledger resume point). Format documented at the
+// RecordKindAlterEventTriggerRename constant.
+func EncodeAlterEventTriggerRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newName))
+	out[0] = RecordKindAlterEventTriggerRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	off := 3 + len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterEventTriggerRename decodes a RecordKindAlterEventTriggerRename
+// payload.
+func DecodeAlterEventTriggerRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 3 {
+		return "", "", fmt.Errorf("wal: alter-event-trigger-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterEventTriggerRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-event-trigger-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-event-trigger-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", fmt.Errorf("wal: alter-event-trigger-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, newName, nil
+}
+
+// EncodeAlterEventTriggerOwner encodes an ALTER EVENT TRIGGER name OWNER TO
+// event (DU-002 restart-persistence follow-up to M0119-0004, loop #70
+// ledger resume point). Format documented at the
+// RecordKindAlterEventTriggerOwner constant.
+func EncodeAlterEventTriggerOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterEventTriggerOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterEventTriggerOwner decodes a RecordKindAlterEventTriggerOwner
+// payload.
+func DecodeAlterEventTriggerOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterEventTriggerOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-event-trigger-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-owner payload truncated (need %d bytes)", 7+nameLen)
 	}
 	return string(payload[7 : 7+nameLen]), ownerOID, nil
 }
@@ -3790,6 +4074,17 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/pubsub_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the PubSub
 		// registry.
+		return false, nil
+	case RecordKindCreateEventTrigger, RecordKindDropEventTrigger, RecordKindAlterEventTriggerEnabled,
+		RecordKindAlterEventTriggerRename, RecordKindAlterEventTriggerOwner:
+		// CREATE/DROP/ALTER EVENT TRIGGER records (DU-002 restart-persistence
+		// follow-up, M0119-0004 loop #70 ledger resume point) carry only
+		// catalog.InMemory's eventTriggers registry metadata; goopg has no
+		// per-event-trigger file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/event_trigger_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// event trigger registry.
 		return false, nil
 	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate, RecordKindAlterAggregateOwner:
 		// CREATE/ALTER/DROP AGGREGATE records (DU-002 restart-persistence
