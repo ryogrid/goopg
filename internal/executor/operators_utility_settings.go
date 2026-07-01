@@ -42,8 +42,24 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if o.ctx == nil {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SET is not supported in this executor context"}
 		}
-		// "role" — no-op: goopg has no role management.
+		// "role" — update non-superuser role tracking for privilege checks
+		// (e.g. TRUNCATE ownership, M0118-0008), mirroring the string-matching
+		// SET ROLE handling in server/query.go for statements that instead
+		// reach the executor (multi-statement simple-query batches, the
+		// extended-query protocol). M0119-0004.
 		if stmt.Name == "role" {
+			if o.ctx != nil && o.ctx.SetRole != nil {
+				if stmt.Default {
+					o.ctx.SetRole("")
+				} else {
+					switch strings.ToUpper(stmt.Value) {
+					case "", "NONE", "POSTGRES":
+						o.ctx.SetRole("")
+					default:
+						o.ctx.SetRole(stmt.Value)
+					}
+				}
+			}
 			return nil, EOF
 		}
 		// "session_authorization" — update non-superuser role tracking for
@@ -94,8 +110,11 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 			}
 			return nil, EOF
 		}
-		// "role" — no-op: goopg has no role management.
+		// "role" — restore superuser status (RESET ROLE). M0119-0004.
 		if stmt.Name == "role" {
+			if o.ctx != nil && o.ctx.SetRole != nil {
+				o.ctx.SetRole("")
+			}
 			return nil, EOF
 		}
 		// "session_authorization" — restore superuser status.

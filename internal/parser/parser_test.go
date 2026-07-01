@@ -223,6 +223,49 @@ func TestParseShowSetReset(t *testing.T) {
 			t.Fatalf("Value=%q", s.Value)
 		}
 	})
+	t.Run("set role name", func(t *testing.T) {
+		// M0119-0004: SET ROLE used to discard the role name entirely
+		// (always parsed as Default=true), so the executor/extended-protocol
+		// paths had no role name to track for privilege checks.
+		stmts, err := Parse("SET ROLE some_role")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Default || s.Name != "role" || s.Value != "some_role" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set role default", func(t *testing.T) {
+		stmts, err := Parse("SET ROLE DEFAULT")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if !s.Default || s.Name != "role" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set role none", func(t *testing.T) {
+		stmts, err := Parse("SET ROLE NONE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Default || s.Name != "role" || s.Value != "none" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("reset role", func(t *testing.T) {
+		stmts, err := Parse("RESET ROLE")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*ResetStmt)
+		if s.All || s.Name != "role" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
 	t.Run("reset", func(t *testing.T) {
 		stmts, err := Parse("RESET work_mem")
 		if err != nil {

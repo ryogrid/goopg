@@ -25,7 +25,7 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string, connTx *connTxState) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		msg, extra := syntaxErrorMsg(err)
@@ -139,6 +139,21 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
 		ectx.EndLocalTransaction = sess.EndTransaction
+	}
+	// Wire session-authorization/role tracking so a SET SESSION AUTHORIZATION
+	// or SET ROLE that reaches the executor (rather than the fast-path
+	// switch in executeExtendedQuery) still updates connTx.NonSuperuserRole
+	// and the reportable is_superuser GUC — same wiring as the simple-query
+	// executor path (dispatch.go). M0119-0004: previously unwired entirely,
+	// so any such statement here was silently dropped.
+	if connTx != nil {
+		ectx.NonSuperuserRole = connTx.NonSuperuserRole
+		ectx.SetSessionAuthorization = func(role string) {
+			connTx.NonSuperuserRole = role
+			ectx.NonSuperuserRole = role
+			setIsSuperuserGUC(sess, role == "")
+		}
+		ectx.SetRole = ectx.SetSessionAuthorization
 	}
 	// Match advisorySessionIDFromContext's preference: the per-connection
 	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so

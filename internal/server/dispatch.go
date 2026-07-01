@@ -282,6 +282,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			ectx.NonSuperuserRole = role
 			setIsSuperuserGUC(sess, role == "")
 		}
+		// SET ROLE / RESET ROLE flip connTx.NonSuperuserRole identically to
+		// SET SESSION AUTHORIZATION, so they share the same closure. M0119-0004.
+		ectx.SetRole = ectx.SetSessionAuthorization
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.
 		if connTx.SeqCurrVals != nil {

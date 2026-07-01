@@ -4744,6 +4744,39 @@ documentation-only and is exempt from the design-doc requirement.)
       (`dispatch_extended.go`) has no SET-role-tracking at all, and
       `DBOID()` vs. `pg_database.oid`'s `FirstUserOID` split remains two
       independently-tracked database-identity numbers.
+      **2026-07-02 (loop #63, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #63"): extended-protocol `SET ROLE`/`SET SESSION AUTHORIZATION`
+      role-tracking LANDED** — closes this row's own extended-protocol
+      resume point. Live-probing Parse/Bind/Execute/Sync found the bug was
+      worse than a silent no-op: `extended.go`'s fast-path switch mis-treated
+      `ROLE`/`SESSION` as a GUC name, erroring `22023 unrecognized
+      configuration parameter "ROLE"` (confirmed RED via a temporary
+      revert). The parser also discarded the `SET ROLE` role name entirely
+      and the shared executor path (`utilitySettingsOp`) treated `SET
+      ROLE`/`RESET ROLE` as unconditional no-ops — the same executor entry
+      point multi-statement simple-query batches use, so this was never
+      extended-protocol-specific. Fixed: parser captures the role name
+      (`internal/parser/parser.go`); new `executor.Context.SetRole`
+      callback (sibling of `SetSessionAuthorization`) wired in both
+      `dispatch.go` and the newly-`connTx`-threaded
+      `dispatch_extended.go`/`extended.go`
+      (`handleExecuteFrame`→`executeExtendedQuery`→
+      `executeExtendedQueryViaExecutor` all gained a `connTx` parameter);
+      `extended.go`'s fast-path switch gained dedicated `SET ROLE`/`SET
+      [LOCAL] SESSION AUTHORIZATION`/`RESET ROLE`/`RESET SESSION
+      AUTHORIZATION` cases mirroring `query.go`'s. New
+      `TestExtendedProtocolSetRoleTracksNonSuperuserRole`
+      (`internal/server`) + parser subtests in `TestParseShowSetReset`.
+      Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+      `internal/executor`+`internal/server` suites PASS;
+      `TestPort_IsolationTruncateConflict` PASS (no regression to the
+      existing simple-query TRUNCATE-ownership spec); `TestPort_
+      PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS;
+      pgbench smoke = pre-commit hook. Deferred (ledger row appended): `SET
+      LOCAL ROLE`/`SET LOCAL SESSION AUTHORIZATION` still don't revert at
+      transaction end (pre-existing limitation, now also true for ROLE by
+      construction); `Subscription.Owner`/`Publication.Owner` non-bootstrap
+      tracking and the `DBOID()`-vs-`FirstUserOID` split remain open.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

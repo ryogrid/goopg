@@ -1642,3 +1642,111 @@ not one:
   multi-database-support gap — harmless today because goopg is
   single-live-database in practice, but would misbehave the moment either
   concept needs to vary per connected database.
+
+## Loop #63 — extended-protocol `SET ROLE`/`SET SESSION AUTHORIZATION` role-tracking
+
+Closes the loop #60 row's "`dispatch_extended.go`'s extended-protocol path
+has no `SET SESSION AUTHORIZATION`/`SET ROLE` role-tracking at all" deferral.
+
+### Investigation
+
+The simple-query protocol tracks `connTx.NonSuperuserRole` (and the
+reportable `is_superuser` GUC) for `SET ROLE`/`SET SESSION AUTHORIZATION`/
+`RESET ROLE`/`RESET SESSION AUTHORIZATION` via string-matching cases in
+`server/query.go`'s `handleQuery` (single statements) that run before the
+parser/executor. Live-probing the extended-query protocol (Parse/Bind/
+Execute/Sync) with the exact same statements surfaced that this path is
+**not** a graceful no-op but an outright failure:
+
+- `extended.go`'s `executeExtendedQuery` has its own string-matching fast
+  path (`SHOW`/`SET`/`RESET`, mirroring `query.go`'s) with **no** cases for
+  `SET ROLE`/`SET SESSION AUTHORIZATION`/`RESET ROLE`/`RESET SESSION
+  AUTHORIZATION`. `SET ROLE some_role` therefore fell into the generic
+  `case strings.HasPrefix(upper, "SET ")` branch, which calls `splitSet` and
+  treats `ROLE`/`SESSION` as a GUC name — `sess.Set("role", "some_role",
+  false)` fails since `"role"` isn't a registered GUC, so the statement
+  errors with `22023 unrecognized configuration parameter "ROLE"` instead of
+  updating privilege state. Confirmed by reverting the fix and re-running
+  the new regression test (RED): `SERROR ... unrecognized configuration
+  parameter "ROLE"`.
+- Even if a statement instead reached the executor path
+  (`executeExtendedQueryViaExecutor` → `utilitySettingsOp`,
+  `internal/executor/operators_utility_settings.go`), `SET ROLE`/`RESET
+  ROLE` were unconditional no-ops (`"role" — no-op: goopg has no role
+  management.`, M0097-0071) — and the parser (`internal/parser/parser.go`)
+  discarded the role name entirely (`_, _ = p.parseIdent()`, forcing
+  `s.Default = true` unconditionally), so even wiring the executor case
+  would have had no role name to act on. This is the SAME executor entry
+  point multi-statement simple-query batches use
+  (`dispatchSimpleQueryViaExecutor`), so `SET ROLE foo; TRUNCATE bar;` in one
+  simple-query message was equally broken — not extended-protocol-specific
+  as the loop #60 row assumed, just never observed because no fixture
+  issues `SET ROLE` as anything but a lone single statement.
+
+### Fix
+
+- **Parser** (`internal/parser/parser.go`, `parseSet`): `SET ROLE rolename`
+  now captures the role name into `s.Value` (or sets `s.Default = true` for
+  the literal `DEFAULT` keyword), instead of discarding it and hardcoding
+  `Default = true`. `NONE`/`POSTGRES`/empty are treated as resets by the
+  *consumer*, not the parser (mirrors how `SET SESSION AUTHORIZATION`
+  already splits parsing from reset-value interpretation).
+- **Executor context** (`internal/executor/context.go`): new
+  `SetRole func(role string)` field, sibling of the pre-existing
+  `SetSessionAuthorization` — same contract (role name, or `""` to restore
+  superuser).
+- **Executor** (`internal/executor/operators_utility_settings.go`):
+  `utilitySettingsOp`'s `SetStmt`/`ResetStmt` `"role"` cases now call
+  `ctx.SetRole` (reset-value detection: `""`/`NONE`/`POSTGRES`) instead of
+  being unconditional no-ops. This fixes the multi-statement simple-query
+  batch gap too, not just extended-protocol.
+- **Simple-query dispatch** (`internal/server/dispatch.go`):
+  `ectx.SetRole = ectx.SetSessionAuthorization` — `SET ROLE` and `SET
+  SESSION AUTHORIZATION` flip `connTx.NonSuperuserRole` identically, so they
+  share one closure.
+- **Extended-protocol fast path** (`internal/server/extended.go`): added
+  `SET SESSION AUTHORIZATION`/`SET LOCAL SESSION AUTHORIZATION`/`SET ROLE`
+  cases to `executeExtendedQuery`'s switch (checked before the generic `SET
+  LOCAL `/`SET ` cases, mirroring `query.go`'s ordering) plus `RESET SESSION
+  AUTHORIZATION`/`RESET ROLE` (before the generic `RESET `/`RESET ALL`
+  cases). New shared helper `setSessionAuthorizationFastPath` factors the
+  role-parsing/reset-detection logic used by both the plain and `LOCAL`
+  forms. `executeExtendedQuery`/`executeExtendedQueryViaExecutor`/
+  `handleExecuteFrame` all gained a `connTx *connTxState` parameter, threaded
+  from `server.go`'s `serveConn` (which already constructs `connTx` per
+  connection — it just wasn't passed to the extended-query call chain).
+- **Extended-protocol executor path** (`internal/server/dispatch_extended.go`):
+  `executeExtendedQueryViaExecutor`'s `ectx` now wires
+  `NonSuperuserRole`/`SetSessionAuthorization`/`SetRole` from `connTx`
+  exactly like `dispatch.go`'s simple-query executor path — so a `SET ROLE`
+  that reaches the executor (rather than the fast-path switch) also updates
+  privilege state, and — as a side effect — object-ownership privilege
+  checks that read `ctx.NonSuperuserRole` (e.g. TRUNCATE ownership,
+  M0118-0008) now work correctly for statements issued via the extended
+  protocol, not just simple-query.
+- Test: `internal/server/extended_set_role_test.go`'s
+  `TestExtendedProtocolSetRoleTracksNonSuperuserRole` drives `SET ROLE` /
+  `RESET ROLE` / `SET SESSION AUTHORIZATION` / `RESET SESSION AUTHORIZATION`
+  through raw Parse/Bind/Execute/Sync frames and asserts `SHOW is_superuser`
+  (over the simple-query protocol) flips off/on identically to the existing
+  simple-query behaviour. Verified RED (via a temporary revert) before the
+  fix: `unrecognized configuration parameter "ROLE"`. `internal/parser/
+  parser_test.go`'s `TestParseShowSetReset` gained `set role name`/`set role
+  default`/`set role none`/`reset role` subtests pinning the parser capture
+  fix.
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/executor`+`internal/server` suites PASS;
+  `TestPort_IsolationTruncateConflict` PASS (confirms the parser/executor
+  `SET ROLE` change doesn't regress the existing simple-query-protocol
+  ownership-check spec); `TestPort_PgDumpConnectionSetup` PASS; TPC-H
+  spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): `SET LOCAL ROLE`/`SET LOCAL SESSION
+  AUTHORIZATION` are parsed with `s.Local` set but neither the executor nor
+  either wire-protocol path gives `LOCAL`'s transaction-scoped-revert
+  semantics any special handling — the role change persists past the
+  transaction boundary exactly like a non-`LOCAL` `SET ROLE` would (a
+  pre-existing limitation for `SESSION AUTHORIZATION`, now also true for
+  `ROLE` by construction, not a new regression). `Subscription.Owner`/
+  `Publication.Owner` non-bootstrap-role tracking and the
+  `DBOID()`-vs-`FirstUserOID` split (both noted in loop #60) remain open —
+  untouched by this loop.

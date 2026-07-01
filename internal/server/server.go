@@ -1364,7 +1364,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 		case protocol.MsgExecute:
 			queryCtx, queryCancel := context.WithCancel(ctx)
 			entry.setQueryCancel(queryCancel)
-			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess)
+			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess, connTx)
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {

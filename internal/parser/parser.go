@@ -1808,16 +1808,21 @@ func (p *parser) parseSet() (Stmt, error) {
 		}
 		// otherwise fall through: SET SESSION TRANSACTION ... handled below
 	}
-	// SET ROLE rolename — accept as no-op. goopg does not implement role-based
-	// access control; SET ROLE is accepted silently. M0097-0071.
+	// SET ROLE rolename — capture the role name (or DEFAULT) in s.Value/
+	// s.Default so the executor can update the session's non-superuser role
+	// tracking (mirrors the SET SESSION AUTHORIZATION handling above).
+	// M0097-0071 originally discarded the role name entirely; M0119-0004
+	// restores it since goopg does enforce SET-ROLE-scoped privilege checks
+	// (e.g. TRUNCATE, M0118-0008) via connTx.NonSuperuserRole.
 	if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "role" {
 		p.advance() // consume "role"
-		// consume the role name (or DEFAULT)
-		if !p.acceptKeyword(KwDefault) {
-			_, _ = p.parseIdent()
-		}
 		s.Name = "role"
-		s.Default = true
+		if p.acceptKeyword(KwDefault) {
+			s.Default = true
+		} else {
+			roleTok, _ := p.parseIdent()
+			s.Value = roleTok.Value
+		}
 		return s, nil
 	}
 	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.

@@ -446,6 +446,15 @@ type Context struct {
 	// passes the role name or "" to restore superuser status.
 	SetSessionAuthorization func(role string)
 
+	// SetRole, when non-nil, updates the per-connection NonSuperuserRole when
+	// SET ROLE / RESET ROLE is executed via the parser path (multi-statement
+	// simple-query batches and the extended-query protocol). Same contract
+	// as SetSessionAuthorization: the role name, or "" to restore superuser
+	// status. Wired to the same closure as SetSessionAuthorization by the
+	// server (SET ROLE and SET SESSION AUTHORIZATION both flip
+	// connTx.NonSuperuserRole identically). M0119-0004.
+	SetRole func(role string)
+
 	// CancelBackend, when non-nil, signals the backend identified by pid to
 	// cancel its currently-executing query (the engine behind the
 	// pg_cancel_backend(pid) SQL function). Returns true if a backend with that
