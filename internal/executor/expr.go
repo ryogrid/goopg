@@ -506,8 +506,27 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			// (and amhandler/opclass getters) cast `<col>::regproc` and compare the
 			// result to "-" to decide whether to emit a HANDLER/VALIDATOR clause; a
 			// bare "0" would spuriously emit one. DU-002 slice 375.
-			if v.Kind == KindInt && v.Int == 0 {
-				return NewStringDatum("-"), nil
+			if v.Kind == KindInt {
+				oid := v.Int
+				if oid == 0 {
+					return NewStringDatum("-"), nil
+				}
+				// A non-zero OID resolves to the function name (built-in via
+				// catalog.RegprocName's generated pg_proc.dat index, or a
+				// CREATE FUNCTION via the live routine registry) — previously
+				// this fell through to `return v, nil`, leaving the cast a
+				// no-op that rendered the raw OID instead of a name at
+				// output time. Falls back to the raw datum (still tagged
+				// regproc/regprocedure for downstream formatting) only if
+				// neither source resolves it.
+				if name, ok := catalog.RegprocName(uint32(oid)); ok {
+					return NewStringDatum(name), nil
+				}
+				if ctx != nil && ctx.Catalog != nil {
+					if r := ctx.Catalog.Routines().LookupByOID(uint32(oid)); r != nil {
+						return NewStringDatum(r.Name), nil
+					}
+				}
 			}
 			return v, nil
 		}

@@ -10793,6 +10793,24 @@ func BuiltinProcs() []BuiltinProc {
 	return out
 }
 
+// RegprocName resolves a pg_proc OID to its proname, matching PostgreSQL's
+// regprocout (src/backend/utils/adt/regproc.c) — the general OID→name
+// lookup a regproc/regprocedure-typed column (e.g. pg_type.typinput,
+// pg_operator.oprcode, pg_am.amproc) or a `<oid>::regproc` cast needs to
+// render a name instead of a raw number. Backed by the generated
+// pgProcNamesByOID (cmd/gen-pg-proc-data -names), a name-only leaf-package
+// copy of the ~3397-row PG18 pg_proc.dat table: this is a superset of
+// BuiltinProcs/LookupBuiltinProc's small hand-curated forward table (which
+// only covers the handful of builtins goopg's own DDL surface references by
+// name). ok=false means oid is not a known built-in — callers that also
+// need user-defined function OIDs (CREATE FUNCTION) fall back to
+// Routines().LookupByOID separately, since a live routine registry isn't
+// reachable from this leaf function.
+func RegprocName(oid uint32) (string, bool) {
+	name, ok := pgProcNamesByOID[oid]
+	return name, ok
+}
+
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>
 // SERVER <server>). goopg does not execute foreign access; this records just
 // enough metadata to round-trip the CREATE/DROP through pg_dump (pg_user_mappings

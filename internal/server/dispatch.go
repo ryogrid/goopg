@@ -2385,6 +2385,27 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			}
 		}
 		return d.AppendValueText(dst)
+	case "regproc", "regprocedure":
+		// OID values with type regproc/regprocedure display as function
+		// names (regprocout), matching a direct SELECT of e.g.
+		// pg_type.typinput/typoutput, pg_operator.oprcode/oprrest/oprjoin,
+		// or pg_am.amproc — previously these all fell through to
+		// AppendValueText and rendered the raw numeric OID. InvalidOid (0)
+		// renders "-" (mirrors the ::regproc CastExpr special-case,
+		// executor/expr.go, and the regclass case above).
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return append(dst, '-')
+			}
+			if name, ok := catalog.RegprocName(oid); ok {
+				return append(dst, name...)
+			}
+			if r := s.cfg.Catalog.Routines().LookupByOID(oid); r != nil {
+				return append(dst, r.Name...)
+			}
+		}
+		return d.AppendValueText(dst)
 	default:
 		return d.AppendValueText(dst)
 	}
