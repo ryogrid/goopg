@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
@@ -217,23 +216,15 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 					cells[i] = nil
 					continue
 				}
-				// float4/float8 columns must render in PostgreSQL's float
-				// output format (shortest round-trip + PG's fixed-vs-scientific
-				// threshold via PGFloatOut). The Datum often carries a
-				// Go-formatted string (e.g. an aggregate sum's "2.18875e+06"),
-				// so AppendValueText alone would emit non-PG text — re-format
-				// through the same helpers the simple-query path uses. Other
-				// types take the M0092-0004 zero-double-alloc AppendValueText
-				// fast path.
+				// Render through the same per-type formatter the
+				// simple-query path uses (appendTypedCellText) so both
+				// wire protocols agree on float/date/time/timetz/bytea/
+				// regclass output, not just AppendValueText's generic
+				// fallback. M0119-0004 (dispatch_extended vs dispatch
+				// type-switch divergence).
 				if i < len(schema) {
-					switch strings.ToLower(schema[i].Type.Name) {
-					case "float4", "real":
-						cells[i] = appendFloatText(nil, d, 32)
-						continue
-					case "float8", "double precision", "double", "float":
-						cells[i] = appendFloat8Text(nil, d)
-						continue
-					}
+					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type)
+					continue
 				}
 				cells[i] = d.AppendValueText(nil)
 			}

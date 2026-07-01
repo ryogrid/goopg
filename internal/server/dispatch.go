@@ -2113,79 +2113,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				start := len(valueBuf)
 				if i < len(schema) {
-					sc := schema[i]
-					switch strings.ToLower(sc.Type.Name) {
-					case "float4", "real":
-						// float4/real uses float32 precision (~7 significant digits).
-						// Use strconv bit=32 so the shortest float32 round-trip representation
-						// is produced (e.g. 4.56789e+15 not 4.567889919082496e+15). M0097-0022.
-						valueBuf = appendFloatText(valueBuf, d, 32)
-					case "float8", "double precision", "double":
-						// float8/float4 values must display in PostgreSQL's output format:
-						// scientific notation for very large/small values, shortest decimal
-						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
-						valueBuf = appendFloat8Text(valueBuf, d)
-					case "char", "bpchar":
-						// bpcharout (PG) uses bcTruelen which trims trailing spaces before
-						// sending over the wire. Input coercion already strips trailing spaces
-						// (codec.go), so just emit the stored value without re-padding.
-						valueBuf = d.AppendValueText(valueBuf)
-					case "date":
-						// Date columns display as YYYY-MM-DD. M0097-0004.
-						if d.Kind == executor.KindTime {
-							valueBuf = d.TimeValue().AppendFormat(valueBuf, "2006-01-02")
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "time":
-						// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
-						if d.Kind == executor.KindTime {
-							valueBuf = appendTimeText(valueBuf, d, sc.Type)
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "timetz":
-						// Timetz displays as HH:MM:SS[.ffffff]±HH[:MM]. M0097-0004.
-						if d.Kind == executor.KindTime {
-							valueBuf = appendTimeText(valueBuf, d, sc.Type)
-							valueBuf = appendTimeTZOffset(valueBuf, d.TimeTZOffsetSecs())
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "bytea":
-						// Bytea values display as \xhexstring (default hex mode). M0097-0035.
-						if d.Kind == executor.KindBytes {
-							valueBuf = append(valueBuf, '\\', 'x')
-							const hexChars = "0123456789abcdef"
-							for _, b := range d.BytesValue() {
-								valueBuf = append(valueBuf, hexChars[b>>4], hexChars[b&0x0f])
-							}
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "regclass":
-						// OID values with type regclass display as relation names. M0097-0023.
-						if d.Kind == executor.KindInt {
-							oid := uint32(d.Int)
-							found := false
-							if im, ok2 := s.cfg.Catalog.(*catalog.InMemory); ok2 {
-								if tbl, ok3 := im.LookupTableByOID(oid); ok3 {
-									valueBuf = append(valueBuf, tbl.Name...)
-									found = true
-								} else if idx, ok3 := im.LookupIndexByOID(oid); ok3 {
-									valueBuf = append(valueBuf, idx.Name...)
-									found = true
-								}
-							}
-							if !found {
-								valueBuf = d.AppendValueText(valueBuf)
-							}
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					default:
-						valueBuf = d.AppendValueText(valueBuf)
-					}
+					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type)
 				} else {
 					valueBuf = d.AppendValueText(valueBuf)
 				}
@@ -2385,6 +2313,81 @@ func rowsAffected(op executor.Operator) int64 {
 		return rc.RowsAffected()
 	}
 	return 0
+}
+
+// appendTypedCellText formats a single result-row cell according to its
+// declared column type, matching PostgreSQL's per-type output function
+// (float4out/float8out/bpcharout/date_out/time_out/timetz_out/byteaout/
+// regclassout). Shared by the simple-query streaming path
+// (dispatchSimpleQueryViaExecutor) and the extended-query materializing path
+// (executeExtendedQueryViaExecutor) so both protocols render a given column
+// type identically — the extended path previously only special-cased
+// float4/float8 and fell back to AppendValueText for everything else,
+// diverging from simple-query on date/time/timetz/bytea/regclass columns.
+func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+	switch strings.ToLower(typ.Name) {
+	case "float4", "real":
+		// float4/real uses float32 precision (~7 significant digits).
+		// Use strconv bit=32 so the shortest float32 round-trip representation
+		// is produced (e.g. 4.56789e+15 not 4.567889919082496e+15). M0097-0022.
+		return appendFloatText(dst, d, 32)
+	case "float8", "double precision", "double":
+		// float8/float4 values must display in PostgreSQL's output format:
+		// scientific notation for very large/small values, shortest decimal
+		// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
+		return appendFloat8Text(dst, d)
+	case "char", "bpchar":
+		// bpcharout (PG) uses bcTruelen which trims trailing spaces before
+		// sending over the wire. Input coercion already strips trailing spaces
+		// (codec.go), so just emit the stored value without re-padding.
+		return d.AppendValueText(dst)
+	case "date":
+		// Date columns display as YYYY-MM-DD. M0097-0004.
+		if d.Kind == executor.KindTime {
+			return d.TimeValue().AppendFormat(dst, "2006-01-02")
+		}
+		return d.AppendValueText(dst)
+	case "time":
+		// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
+		if d.Kind == executor.KindTime {
+			return appendTimeText(dst, d, typ)
+		}
+		return d.AppendValueText(dst)
+	case "timetz":
+		// Timetz displays as HH:MM:SS[.ffffff]±HH[:MM]. M0097-0004.
+		if d.Kind == executor.KindTime {
+			dst = appendTimeText(dst, d, typ)
+			return appendTimeTZOffset(dst, d.TimeTZOffsetSecs())
+		}
+		return d.AppendValueText(dst)
+	case "bytea":
+		// Bytea values display as \xhexstring (default hex mode). M0097-0035.
+		if d.Kind == executor.KindBytes {
+			dst = append(dst, '\\', 'x')
+			const hexChars = "0123456789abcdef"
+			for _, b := range d.BytesValue() {
+				dst = append(dst, hexChars[b>>4], hexChars[b&0x0f])
+			}
+			return dst
+		}
+		return d.AppendValueText(dst)
+	case "regclass":
+		// OID values with type regclass display as relation names. M0097-0023.
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+				if tbl, ok := im.LookupTableByOID(oid); ok {
+					return append(dst, tbl.Name...)
+				}
+				if idx, ok := im.LookupIndexByOID(oid); ok {
+					return append(dst, idx.Name...)
+				}
+			}
+		}
+		return d.AppendValueText(dst)
+	default:
+		return d.AppendValueText(dst)
+	}
 }
 
 // appendFloat8Text formats a datum for wire output as a float8/float4 value.
