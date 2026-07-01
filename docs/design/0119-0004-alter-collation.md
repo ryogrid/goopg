@@ -93,16 +93,21 @@ follows for scope).
    add `*parser.AlterCollationStmt` to the DDL passthrough list and
    `"ALTER COLLATION"` tag, mirroring every sibling ALTER statement.
 
+### Restart persistence (landed in a follow-up loop, not deferred anymore)
+
+RENAME TO / OWNER TO are now WAL-logged: `RecordKindAlterCollationRename`
+(44) / `RecordKindAlterCollationOwner` (45) in `internal/wal/recovery.go`,
+emitted from `execAlterCollation`'s two mutation call sites in
+`operators_ddl.go`, and replayed by two new cases in
+`replayCollationDDLRecords` (`internal/initdb/collation_ddl_recovery.go`)
+via `RenameCollationDuringRecovery`/`SetCollationOwnerDuringRecovery`
+(`catalog.go`, discard-result recovery counterparts mirroring
+`DropCollationDuringRecovery`). This still does **not** extend to `ALTER
+TABLE RENAME`/`OWNER TO`, which remain in-memory-only — that gap is
+unrelated and out of scope here.
+
 ### Explicitly out of scope (ledger follow-up, not silently dropped)
 
-- **Restart persistence.** Unlike CREATE/DROP COLLATION, RENAME/OWNER TO are
-  **not** WAL-logged — this mirrors the pre-existing, already-noted gap that
-  `ALTER TABLE RENAME`/`OWNER TO` are themselves in-memory-only mutations
-  with no WAL record kind (`RenameTable` at `catalog.go:6596`, owner write at
-  `operators_ddl.go:5935`). Adding durability for collation ALTER would
-  require **net-new** `RecordKind` values (44+) with no existing sibling to
-  copy; out of scope for this bounded slice, and no worse than the table
-  case already in production.
 - **pg_dump round-trip of the ALTER itself is not separately tested** beyond
   unit coverage of the registry mutation: pg_dump always dumps a collation's
   **final** state as a single `CREATE COLLATION` (+ `ALTER … OWNER TO` only
@@ -123,8 +128,16 @@ follows for scope).
   `CollationAttrsByName`; owner updates `Owner`; refresh is a no-op notice,
   no error; `IF EXISTS` on an unknown name is a no-op, without it raises
   `42704`).
-- `go build ./...` clean; `go vet` parser/catalog/executor clean; full
-  `internal/parser` + `internal/catalog` + `internal/executor` suites PASS.
+- Restart-persistence follow-up: `TestEncodeDecodeAlterCollationRenameRoundTrip`
+  / `…OwnerRoundTrip` + reject-wrong-kind/truncated-payload guards
+  (`internal/wal/collation_ddl_test.go`); `TestCollationDDLRecoveryReplaysRenameAfterCreate`
+  / `…OwnerAfterCreate` (`internal/initdb/collation_ddl_recovery_test.go`,
+  full close→reopen→replay round trip, OID preserved across rename).
+- `go build ./...` clean; `go vet` parser/catalog/executor/wal/initdb clean;
+  full `internal/parser` + `internal/catalog` + `internal/executor` +
+  `internal/wal` + `internal/initdb` suites PASS; `go test -race
+  ./internal/wal/...` clean (WAL/recovery practice card).
 - Deferral ledger: flip the loop #50 "ALTER COLLATION … still unhandled" row
-  to `resolved` for the RENAME/OWNER/REFRESH scope landed here, and append a
-  new row for the restart-persistence follow-up called out above.
+  to `resolved` for the RENAME/OWNER/REFRESH scope landed here; the
+  restart-persistence follow-up recorded as its own row is now resolved by
+  this change.

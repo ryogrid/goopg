@@ -8753,6 +8753,24 @@ func (c *InMemory) DropCollationDuringRecovery(name, schema string) {
 	c.DropCollation(name, schema)
 }
 
+// RenameCollationDuringRecovery is the discard-result recovery counterpart to
+// RenameCollation, mirroring DropCollationDuringRecovery. A rename record can
+// only be replayed after its collation's CREATE COLLATION record (WAL is
+// scanned in order), so a not-found error here is not expected in practice,
+// but replay must not abort on it — the same "don't care if it was still
+// there" tolerance DropCollationDuringRecovery documents. DU-002
+// restart-persistence follow-up (M0119-0004).
+func (c *InMemory) RenameCollationDuringRecovery(name, schema, newName string) {
+	_ = c.RenameCollation(name, schema, newName)
+}
+
+// SetCollationOwnerDuringRecovery is the discard-result recovery counterpart
+// to SetCollationOwner, mirroring DropCollationDuringRecovery. DU-002
+// restart-persistence follow-up (M0119-0004).
+func (c *InMemory) SetCollationOwnerDuringRecovery(name, schema string, ownerOID uint32) {
+	c.SetCollationOwner(name, schema, ownerOID)
+}
+
 // CreateConversion records a CREATE [DEFAULT] CONVERSION in the runtime
 // pg_conversion registry so pg_dump's getConversions / dumpConversion re-emit
 // it. `schema` is the (already-resolved) schema name the conversion lives in; an

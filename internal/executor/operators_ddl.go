@@ -429,9 +429,12 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 // pg_collation row. REFRESH VERSION has no real collation-versioning engine
 // behind it in goopg, so it mirrors PG's own no-detectable-version branch
 // (e.g. non-glibc libc): always a "version has not changed" NOTICE, no
-// catalog write. Deliberately not WAL-logged — see the design doc for why
-// (mirrors ALTER TABLE RENAME/OWNER TO, which are also in-memory-only today).
-// M0119-0004 (DU-002, loop #50 ledger follow-up).
+// catalog write, so nothing to WAL-log. RENAME TO / OWNER TO DO WAL-log
+// (RecordKindAlterCollationRename/Owner) so the mutation survives a restart —
+// mirrors CREATE/DROP COLLATION's restart-persistence, unlike ALTER TABLE
+// RENAME/OWNER TO which stays in-memory-only today. M0119-0004 (DU-002,
+// loop #50 ledger follow-up; WAL logging added as the loop #50 ledger's
+// resume-point (a)).
 func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -453,6 +456,11 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		if err := im.RenameCollation(s.Name.Name, schema, s.NewName); err != nil {
 			return notFound()
 		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationRename(s.Name.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-collation-rename: %w", werr)
+			}
+		}
 		return nil
 	case "owner":
 		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateCollation's default owner
@@ -465,6 +473,11 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		}
 		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID) {
 			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationOwner(s.Name.Name, schema, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-collation-owner: %w", werr)
+			}
 		}
 		return nil
 	case "refresh":

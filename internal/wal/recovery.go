@@ -534,6 +534,26 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
 	RecordKindDropCollation byte = 43
 
+	// RecordKindAlterCollationRename records an `ALTER COLLATION <name>
+	// RENAME TO <newname>` event so the rename survives a restart. Like
+	// CREATE/DROP COLLATION, goopg has no per-collation file namespace, so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/collation_ddl_recovery.go re-applies the rename to the
+	// catalog's collation registry after physical replay + schema replay.
+	// Mirrors RecordKindCreateCollation. DU-002 restart-persistence
+	// follow-up (M0119-0004, loop #50/executor's execAlterCollation).
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterCollationRename byte = 44
+
+	// RecordKindAlterCollationOwner records an `ALTER COLLATION <name> OWNER
+	// TO <role>` event so the ownership change survives a restart. Same
+	// no-op physical redo path as RecordKindAlterCollationRename.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindAlterCollationOwner byte = 45
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1205,6 +1225,118 @@ func DecodeDropCollation(payload []byte) (name, schema string, err error) {
 	}
 	schema = string(payload[off : off+schemaLen])
 	return name, schema, nil
+}
+
+// EncodeAlterCollationRename encodes an ALTER COLLATION ... RENAME TO event
+// (DU-002 restart-persistence follow-up to M0119-0004). Format: kind(1) |
+// nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeAlterCollationRename(name, schema, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newName))
+	out[0] = RecordKindAlterCollationRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterCollationRename decodes a RecordKindAlterCollationRename payload.
+func DecodeAlterCollationRename(payload []byte) (name, schema, newName string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterCollationRename {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not alter-collation-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, schema, newName, nil
+}
+
+// EncodeAlterCollationOwner encodes an ALTER COLLATION ... OWNER TO event
+// (DU-002 restart-persistence follow-up to M0119-0004). Format: kind(1) |
+// ownerOID(4) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+// schema(schemaLen bytes).
+func EncodeAlterCollationOwner(name, schema string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 9+len(name)+len(schema))
+	out[0] = RecordKindAlterCollationOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	off := 5
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeAlterCollationOwner decodes a RecordKindAlterCollationOwner payload.
+func DecodeAlterCollationOwner(payload []byte) (name, schema string, ownerOID uint32, err error) {
+	if len(payload) < 9 {
+		return "", "", 0, fmt.Errorf("wal: alter-collation-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterCollationOwner {
+		return "", "", 0, fmt.Errorf("wal: record kind %d is not alter-collation-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	nameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+nameLen+2 {
+		return "", "", 0, fmt.Errorf("wal: alter-collation-owner payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", 0, fmt.Errorf("wal: alter-collation-owner payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, ownerOID, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -2980,8 +3112,8 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's conversion registry.
 		return false, nil
-	case RecordKindCreateCollation, RecordKindDropCollation:
-		// CREATE/DROP COLLATION records (DU-002 restart-persistence
+	case RecordKindCreateCollation, RecordKindDropCollation, RecordKindAlterCollationRename, RecordKindAlterCollationOwner:
+		// CREATE/DROP/ALTER COLLATION records (DU-002 restart-persistence
 		// follow-up) carry only pg_collation metadata; goopg has no
 		// per-collation file namespace, so the physical replay path has
 		// nothing to do. The recovery driver in

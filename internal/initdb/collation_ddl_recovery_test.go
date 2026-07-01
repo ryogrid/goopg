@@ -114,6 +114,103 @@ func TestCollationDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	}
 }
 
+// TestCollationDDLRecoveryReplaysRenameAfterCreate confirms the DU-002
+// restart-persistence follow-up (M0119-0004, loop #50 ledger resume point
+// (a)): a CREATE COLLATION followed by an ALTER COLLATION ... RENAME TO
+// replays in order, so the post-restart registry has the collation under its
+// new name (not the original), with its OID preserved.
+func TestCollationDDLRecoveryReplaysRenameAfterCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40510)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateCollation("mycoll", "public", "C", "C", "", "", wantOID, 10, -1, 'c', true)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterCollationRename("mycoll", "public", "renamedcoll")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append rename: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	if uc := findUserCollation(cat, "mycoll", "public"); uc != nil {
+		t.Errorf("after CREATE + RENAME replay, old name \"mycoll\" = %+v, want nil", uc)
+	}
+	uc := findUserCollation(cat, "renamedcoll", "public")
+	if uc == nil {
+		t.Fatalf("after CREATE + RENAME replay, \"renamedcoll\" not found; registry = %+v", cat.ListUserCollations())
+	}
+	if uc.OID != wantOID {
+		t.Errorf("after CREATE + RENAME replay, OID = %d, want %d (renamed collation must keep its original OID)", uc.OID, wantOID)
+	}
+}
+
+// TestCollationDDLRecoveryReplaysOwnerAfterCreate mirrors the rename test for
+// ALTER COLLATION ... OWNER TO.
+func TestCollationDDLRecoveryReplaysOwnerAfterCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40520)
+	const wantOwnerOID = uint32(16401)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateCollation("mycoll", "public", "C", "C", "", "", wantOID, 10, -1, 'c', true)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterCollationOwner("mycoll", "public", wantOwnerOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append owner: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	uc := findUserCollation(cat, "mycoll", "public")
+	if uc == nil {
+		t.Fatalf("after CREATE + OWNER replay, \"mycoll\" not found; registry = %+v", cat.ListUserCollations())
+	}
+	if uc.Owner != wantOwnerOID {
+		t.Errorf("after CREATE + OWNER replay, Owner = %d, want %d", uc.Owner, wantOwnerOID)
+	}
+}
+
 // TestReplayCollationDDLRecordsHandlesMissingWalDir verifies the recovery
 // hook is idempotent when invoked against a missing pg_wal directory (brand
 // new initdb).

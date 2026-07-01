@@ -3747,6 +3747,28 @@ documentation-only and is exempt from the design-doc requirement.)
       to copy). Gates: `go build ./...` clean; `go vet`
       parser/catalog/executor/planner/server clean; those 5 packages' suites
       PASS.
+      **2026-07-01 (loop #54): ALTER COLLATION RENAME TO / OWNER TO restart
+      persistence LANDED** — closes the "(a) not WAL-logged" deferral from the
+      loop directly above. New `RecordKindAlterCollationRename`(44)/
+      `RecordKindAlterCollationOwner`(45) (`internal/wal/recovery.go`,
+      `Encode/DecodeAlterCollationRename`/`…Owner`) emitted from
+      `execAlterCollation`'s two mutation sites (`operators_ddl.go`); replayed
+      by two new cases in `replayCollationDDLRecords`
+      (`internal/initdb/collation_ddl_recovery.go`) via new
+      `RenameCollationDuringRecovery`/`SetCollationOwnerDuringRecovery`
+      (`catalog.go`, mirroring `DropCollationDuringRecovery`); `ApplyRecord`
+      folds both new kinds into the existing no-op-physical-redo case for
+      collation records. Tests:
+      `TestEncodeDecodeAlterCollationRenameRoundTrip`/`…OwnerRoundTrip` + guard
+      tests (`internal/wal/collation_ddl_test.go`);
+      `TestCollationDDLRecoveryReplaysRenameAfterCreate`/`…OwnerAfterCreate`
+      (`internal/initdb/collation_ddl_recovery_test.go`, full
+      close→reopen→replay, OID preserved across rename). Gates: `go build
+      ./...` clean; `go vet` wal/initdb/catalog/executor clean; `go test -race
+      ./internal/wal/...` clean; full `internal/wal`+`internal/initdb`+
+      `internal/catalog`+`internal/executor` suites PASS; TPC-H spotcheck run.
+      Design doc `0119-0004-alter-collation.md` + README index updated.
+      Deferral ledger row appended (resolved).
       **2026-07-01 (loop #53): CAST WITH-FUNCTION arm + `resolveConversionFunc`
       wired to `catalog.LookupBuiltinProc` LANDED** — closes the loop #46
       ledger row's explicit resume point (the trivial CAST/CONVERSION
