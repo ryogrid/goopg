@@ -12515,6 +12515,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				if im.HasOpClass(name.Name) {
 					im.RemoveOpClass(name.Name)
+					// Also drop the pg_opclass row (DU-002, M0119-0004) so a
+					// create-then-drop-then-dump sequence doesn't leave a
+					// ghost row behind. Best-effort: only the "operator
+					// class" arm has a real pg_opclass row to remove.
+					if objType == "operator class" {
+						classSchema := name.Schema
+						if classSchema == "" {
+							classSchema = "public"
+						}
+						im.DropUserOperatorClass(classSchema, name.Name, catalog.AccessMethodOIDByName(method))
+					}
 					return nil
 				}
 			}
@@ -14676,8 +14687,14 @@ func (o *ddlOp) execAlterAggregateOwner(s *parser.AlterAggregateOwnerStmt) error
 }
 
 // execCreateOpClass registers the hash extended support function for an
-// operator class. Only the FUNCTION 2 entry is used; everything else is
-// silently accepted. M0097-0027.
+// operator class (M0097-0027) and, since DU-002 (M0119-0004), populates a
+// real pg_opclass row (method/family/intype/default/keytype) so the class
+// round-trips through pg_dump's getOpclasses/dumpOpclass. OPERATOR/FUNCTION
+// entries in the AS list beyond FUNCTION 2 are still silently accepted and
+// not tied to pg_amop/pg_amproc — a class declaring real members currently
+// dumps with only its STORAGE clause (or PG's own dummy `STORAGE opcintype`
+// filler), which is a documented, separately-scoped follow-up (see the
+// deferral ledger).
 func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -14687,11 +14704,59 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
 	}
 	// Track the schema for DROP SCHEMA CASCADE detail output. M0097-0022.
-	schema := currentWritableSchema(o.ctx)
+	schema := s.Schema
+	if schema == "" {
+		schema = currentWritableSchema(o.ctx)
+	}
 	if schema == "" {
 		schema = "public"
 	}
 	im.RegisterOpClassSchema(s.Name, schema)
+
+	// A class whose USING method couldn't be parsed has nothing usable to
+	// register as a pg_opclass row; the hash-func/schema tracking above still
+	// ran, matching the pre-existing M0097-0027 behavior for such input.
+	if s.Method == "" {
+		return nil
+	}
+	methodOID := catalog.AccessMethodOIDByName(s.Method)
+	if methodOID == 0 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	inTypeOID := catalog.TypeNameToOID(s.ForType)
+
+	var famOID uint32
+	if s.FamilyName != "" {
+		famSchema := s.FamilySchema
+		if famSchema == "" {
+			famSchema = "public"
+		}
+		fam, found := im.LookupUserOperatorFamily(famSchema, s.FamilyName, methodOID)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.FamilyName, s.Method)}
+		}
+		famOID = fam.OID
+	} else {
+		// PG auto-creates an anonymous family (same name/schema as the class)
+		// when FAMILY is omitted (DefineOpClass, opclasscmds.c). Owner 0 lets
+		// RegisterUserOperatorFamily default it, mirroring CREATE OPERATOR
+		// FAMILY's own registration (goopg does not track a per-session
+		// creating role for these compat objects).
+		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0)
+		famOID = fam.OID
+	}
+
+	var keyTypeOID uint32
+	if s.StorageType != "" {
+		keyTypeOID = catalog.TypeNameToOID(s.StorageType)
+	}
+	im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
 	return nil
 }
 

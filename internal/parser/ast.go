@@ -1858,14 +1858,23 @@ type AlterAggregateOwnerStmt struct {
 func (s *AlterAggregateOwnerStmt) Pos() int  { return s.pos }
 func (s *AlterAggregateOwnerStmt) stmtNode() {}
 
-// CreateOpClassStmt is a minimal representation of CREATE OPERATOR CLASS used
-// to register custom hash support functions for hash partitioning. M0097-0027.
-// We only capture the FUNCTION 2 (hash extended) entry; everything else is
-// accepted-and-discarded so the statement doesn't produce a parse error.
+// CreateOpClassStmt models CREATE OPERATOR CLASS name [DEFAULT] FOR TYPE
+// type USING method [FAMILY family_name] AS entry [, entry ...]. Originally
+// captured only the FUNCTION 2 (hash extended) entry for hash partitioning
+// (M0097-0027); DU-002 (M0119-0004) extended it to populate a real
+// pg_opclass row for pg_dump round-tripping. OPERATOR/FUNCTION entries
+// beyond FUNCTION 2 are still accepted-and-discarded — pg_amop/pg_amproc
+// member storage is a separate, larger follow-up (see the deferral ledger).
 type CreateOpClassStmt struct {
 	pos          int
+	Schema       string // schema qualifier, "" = search_path default
 	Name         string // operator class name
+	IsDefault    bool   // DEFAULT keyword present
 	ForType      string // e.g. "int4", "text"
+	Method       string // access method name, e.g. "btree", "hash"
+	FamilySchema string // explicit FAMILY clause schema, "" if unqualified or FAMILY omitted
+	FamilyName   string // explicit FAMILY clause name, "" if the FAMILY clause was omitted (auto-create)
+	StorageType  string // STORAGE entry type name, "" if not specified
 	HashFuncName string // name of the FUNCTION 2 (hash extended) routine
 }
 

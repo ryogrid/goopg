@@ -406,3 +406,107 @@ func TestCreateOperatorFamilyUnknownMethod(t *testing.T) {
 		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
 	}
 }
+
+// pgOpclassVirtualRows fetches the current pg_opclass virtual view rows,
+// mirroring pgOpfamilyVirtualRows above. DU-002 (M0119-0004).
+func pgOpclassVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
+	t.Helper()
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_opclass"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_catalog.pg_opclass virtual table/VirtualRows not found")
+	}
+	return tbl.VirtualRows()
+}
+
+// TestCreateOperatorClassPopulatesOpclassRow verifies CREATE OPERATOR CLASS
+// FOR TYPE t USING method FAMILY family AS STORAGE t2 populates a full
+// pg_opclass row (opcmethod/opcname/opcnamespace/opcowner/opcfamily/
+// opcintype/opcdefault/opckeytype), the DU-002 (M0119-0004) op_class_empty
+// slice: no OPERATOR/FUNCTION members, so no pg_amop/pg_amproc store is
+// needed to round-trip this shape through pg_dump.
+func TestCreateOperatorClassPopulatesOpclassRow(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class_empty FOR TYPE bigint USING btree FAMILY public.op_family AS STORAGE bigint`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	famRows := pgOpfamilyVirtualRows(t, im)
+	if len(famRows) != 1 {
+		t.Fatalf("pg_opfamily VirtualRows = %d rows, want 1: %v", len(famRows), famRows)
+	}
+	famOID := famRows[0][0]
+
+	classRows := pgOpclassVirtualRows(t, im)
+	if len(classRows) != 1 {
+		t.Fatalf("pg_opclass VirtualRows = %d rows, want 1: %v", len(classRows), classRows)
+	}
+	row := classRows[0]
+	// oid, opcmethod, opcname, opcnamespace, opcowner, opcfamily, opcintype, opcdefault, opckeytype
+	if row[1] != "403" { // opcmethod: btree
+		t.Errorf("opcmethod = %q, want 403 (btree)", row[1])
+	}
+	if row[2] != "op_class_empty" { // opcname
+		t.Errorf("opcname = %q, want op_class_empty", row[2])
+	}
+	if row[5] != famOID { // opcfamily must resolve to the explicit FAMILY clause's OID
+		t.Errorf("opcfamily = %q, want %q (public.op_family's OID)", row[5], famOID)
+	}
+	if row[6] != "20" { // opcintype: bigint (int8) OID
+		t.Errorf("opcintype = %q, want 20 (bigint)", row[6])
+	}
+	if row[7] != "f" { // opcdefault: DEFAULT not specified
+		t.Errorf("opcdefault = %q, want f", row[7])
+	}
+	if row[8] != "20" { // opckeytype: STORAGE bigint -> bigint (int8) OID
+		t.Errorf("opckeytype = %q, want 20 (bigint)", row[8])
+	}
+}
+
+// TestCreateOperatorClassAutoCreatesFamily verifies that omitting the
+// explicit FAMILY clause auto-creates an anonymous family sharing the
+// class's own name (PG's DefineOpClass, opclasscmds.c) — opcfamily is
+// NOT NULL, so every opclass needs a valid family even when the user never
+// wrote CREATE OPERATOR FAMILY. DU-002 (M0119-0004).
+func TestCreateOperatorClassAutoCreatesFamily(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class_custom FOR TYPE int4 USING btree AS STORAGE int4`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	famRows := pgOpfamilyVirtualRows(t, im)
+	if len(famRows) != 1 {
+		t.Fatalf("pg_opfamily VirtualRows = %d rows, want 1 (auto-created): %v", len(famRows), famRows)
+	}
+	if famRows[0][2] != "op_class_custom" {
+		t.Errorf("auto-created opfname = %q, want op_class_custom (same name as the class)", famRows[0][2])
+	}
+
+	classRows := pgOpclassVirtualRows(t, im)
+	if len(classRows) != 1 {
+		t.Fatalf("pg_opclass VirtualRows = %d rows, want 1: %v", len(classRows), classRows)
+	}
+	if classRows[0][5] != famRows[0][0] { // opcfamily must point at the auto-created family's OID
+		t.Errorf("opcfamily = %q, want %q (auto-created family OID)", classRows[0][5], famRows[0][0])
+	}
+}
+
+// TestCreateOperatorClassUnknownFamily verifies an explicit FAMILY clause
+// naming a family that was never CREATEd raises 42704, mirroring
+// opfamilycmds.c's own "operator family ... does not exist" check.
+// DU-002 (M0119-0004).
+func TestCreateOperatorClassUnknownFamily(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class_empty FOR TYPE bigint USING btree FAMILY public.no_such_family AS STORAGE bigint`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}

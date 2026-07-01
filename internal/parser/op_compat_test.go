@@ -406,6 +406,62 @@ func TestParseCreateOperatorClassStillWorks(t *testing.T) {
 	}
 }
 
+// TestParseCreateOperatorClassFullShape verifies the DU-002 (M0119-0004)
+// extension captures the schema-qualified name, USING method, an explicit
+// FAMILY clause, and a STORAGE entry — the shape needed to populate a real
+// pg_opclass row (upstream's own `op_class_empty` 002_pg_dump.pl fixture).
+func TestParseCreateOperatorClassFullShape(t *testing.T) {
+	stmts, err := Parse("CREATE OPERATOR CLASS dump_test.op_class_empty FOR TYPE bigint USING btree FAMILY dump_test.op_family AS STORAGE bigint")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	oc, ok := stmts[0].(*CreateOpClassStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateOpClassStmt, got %T", stmts[0])
+	}
+	if oc.Schema != "dump_test" || oc.Name != "op_class_empty" {
+		t.Errorf("Schema/Name = %q/%q, want dump_test/op_class_empty", oc.Schema, oc.Name)
+	}
+	if oc.ForType != "bigint" {
+		t.Errorf("ForType = %q, want bigint", oc.ForType)
+	}
+	if oc.Method != "btree" {
+		t.Errorf("Method = %q, want btree", oc.Method)
+	}
+	if oc.FamilySchema != "dump_test" || oc.FamilyName != "op_family" {
+		t.Errorf("FamilySchema/FamilyName = %q/%q, want dump_test/op_family", oc.FamilySchema, oc.FamilyName)
+	}
+	if oc.StorageType != "bigint" {
+		t.Errorf("StorageType = %q, want bigint", oc.StorageType)
+	}
+	if oc.IsDefault {
+		t.Errorf("IsDefault = true, want false (no DEFAULT keyword)")
+	}
+}
+
+// TestParseCreateOperatorClassDefaultKeyword verifies the DEFAULT keyword
+// and an unqualified (no schema, no FAMILY clause) name parse correctly,
+// exercising the auto-create-family path's parse-side prerequisites.
+func TestParseCreateOperatorClassDefaultKeyword(t *testing.T) {
+	stmts, err := Parse("CREATE OPERATOR CLASS op_class_custom DEFAULT FOR TYPE int4 USING btree AS STORAGE int4")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	oc, ok := stmts[0].(*CreateOpClassStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateOpClassStmt, got %T", stmts[0])
+	}
+	if !oc.IsDefault {
+		t.Errorf("IsDefault = false, want true")
+	}
+	if oc.Schema != "" || oc.Name != "op_class_custom" {
+		t.Errorf("Schema/Name = %q/%q, want \"\"/op_class_custom", oc.Schema, oc.Name)
+	}
+	if oc.FamilyName != "" {
+		t.Errorf("FamilyName = %q, want \"\" (FAMILY clause omitted)", oc.FamilyName)
+	}
+}
+
 // TestParseCreateOperatorUnary verifies a LEFTARG-omitted (prefix/unary)
 // CREATE OPERATOR parses with an empty ArgTypes[0], matching PG's grammar
 // (RIGHTARG is always required — postfix operators were removed in PG14).

@@ -5,7 +5,8 @@
 - **Loop:** #30 (slice 406, verifying/landing work started by a prior
   backgrounded loop); #32 (slice 407, COMMUTATOR/NEGATOR/RESTRICT/JOIN/
   MERGES/HASHES + unary operators); #33 (`ALTER OPERATOR ... SET (...)`,
-  closing the slice-407 ledger follow-up)
+  closing the slice-407 ledger follow-up); #34 (`CREATE OPERATOR FAMILY`,
+  slice 408); #35 (`CREATE OPERATOR CLASS` pg_opclass population, slice 409)
 
 ## Problem
 
@@ -326,10 +327,133 @@ the same pre-existing go1.25/1.26-drift files as loop #33 (verified via
 `git stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit
 hook.
 
+## Loop #35: `CREATE OPERATOR CLASS` populates a real `pg_opclass` row (DU-002 slice 409)
+
+Extends `CREATE OPERATOR CLASS` beyond the M0097-0027 minimal stub (which
+only tracked the `FUNCTION 2` hash-extended support function + a schema
+association for `DROP SCHEMA CASCADE` detail text) to populate a full
+`pg_opclass` row — the loop #34 ledger row's resume point (b), bounded to
+upstream's own `op_class_empty` `002_pg_dump.pl` fixture: `FOR TYPE bigint
+USING btree FAMILY dump_test.op_family AS STORAGE bigint` — a class with a
+`STORAGE` clause but **no** `OPERATOR`/`FUNCTION` members, so `dumpOpclass`'s
+`pg_amop`/`pg_amproc`-via-`pg_depend` member queries (still unmodeled — see
+below) correctly return 0 rows and only the class's own attributes need to
+round-trip.
+
+- **Parser** (`internal/parser/ddl.go`'s `parseCreateOpClassTail`): the name
+  is now parsed via `p.parseObjectName()` (schema-qualified, matching `CREATE
+  OPERATOR FAMILY`'s own parsing — previously a single unqualified token,
+  the pre-existing limitation loop #34 explicitly left alone). `DEFAULT` is
+  now captured (`CreateOpClassStmt.IsDefault`) instead of merely skipped;
+  the access method name after `USING` is now captured
+  (`CreateOpClassStmt.Method`) instead of discarded; a new optional `FAMILY
+  family_name` clause is recognized right after the method (`"family"` is
+  not in goopg's keyword map, so it arrives as a bare `TokenIdent`, matching
+  the existing `"type"`/`"operator"` contextual-keyword pattern in this same
+  function) and captured as `FamilySchema`/`FamilyName`; the `AS`-list
+  scanner gains a `STORAGE type` entry alongside the pre-existing
+  `OPERATOR`/`FUNCTION` recognition, captured as `CreateOpClassStmt.
+  StorageType`. `OPERATOR`/`FUNCTION` entries themselves are still
+  accepted-and-discarded beyond the pre-existing `FUNCTION 2` hash-func
+  capture — see Scope/limitations.
+- **Catalog** (`internal/catalog/catalog.go`): new `UserOperatorClass`
+  struct (`OID`/`Name`/`NamespaceOID`/`Owner`/`Method`/`FamilyOID`/
+  `InTypeOID`/`IsDefault`/`KeyTypeOID`, with `OwnerOrDefault`/
+  `NamespaceOIDOrDefault` mirroring `UserOperatorFamily`'s) +
+  `RegisterUserOperatorClass`/`DropUserOperatorClass`/
+  `ListUserOperatorClasses`, keyed `"<schema>.<name>/<method-oid>"`
+  (mirrors `userOpFamilyKey` — PG scopes opclass-name uniqueness per
+  namespace+access-method too). New `LookupUserOperatorFamily` (by
+  schema/name/method) resolves an explicit `FAMILY` clause.
+  `pg_opclass.VirtualRows` now renders `ListUserOperatorClasses()` instead
+  of the hardcoded `nil`.
+- **Executor** (`internal/executor/operators_ddl.go`, `execCreateOpClass`):
+  resolves the access method via `AccessMethodOIDByName` (`42704` if
+  unrecognized, mirroring `CREATE OPERATOR FAMILY`'s own check), the schema
+  to a namespace OID, and `ForType`/`StorageType` via `catalog.
+  TypeNameToOID`. Family resolution: an explicit `FAMILY` clause must name
+  an already-`CREATE`d family (`LookupUserOperatorFamily`; `42704` if not
+  found, mirroring `opfamilycmds.c`'s "operator family ... does not exist"
+  check); an omitted `FAMILY` clause auto-creates an anonymous family
+  sharing the class's own schema+name (PG's `DefineOpClass`,
+  `opclasscmds.c` — `opcfamily` is `NOT NULL`, so every class needs a valid
+  family even when the user never wrote `CREATE OPERATOR FAMILY`), reusing
+  `RegisterUserOperatorFamily` (idempotent by key, so a second class in the
+  same auto-family reuses the same family row). `DROP OPERATOR CLASS` now
+  also calls `DropUserOperatorClass` alongside the pre-existing
+  `RemoveOpClass` (best-effort — schema defaults to `"public"` if the DROP
+  statement omitted a qualifier, matching this function's existing
+  convention) so a create-then-drop-then-dump sequence doesn't leave a
+  ghost `pg_opclass` row.
+
+### pg_dump mechanics (no goopg "dump" code — real PG's own logic)
+
+`getOpclasses` runs a flat `SELECT tableoid, oid, opcmethod, opcname,
+opcnamespace, opcowner FROM pg_opclass` — no join (the family/intype/
+default/keytype detail is fetched per-class by `dumpOpclass` itself via a
+`LEFT JOIN pg_opfamily`/`pg_namespace` keyed on `opcfamily`, plus
+`opcintype`/`opckeytype` cast to `regtype`). `dumpOpclass` renders `CREATE
+OPERATOR CLASS name\n    [DEFAULT ]FOR TYPE intype USING amname[ FAMILY
+ns.famname] AS\n    `, then a `STORAGE keytype` clause **only if**
+`opckeytype != InvalidOid` (PG's `regtype` output for `InvalidOid` is the
+literal string `"-"`), then the `pg_amop`/`pg_amproc`-via-`pg_depend`
+member queries (both 0 rows for every goopg-created class today), and
+finally — only if nothing was printed after `AS` at all — a dummy `STORAGE
+opcintype` filler so the statement isn't syntactically empty (not
+exercised by this slice, since `op_class_empty` always supplies an explicit
+`STORAGE`). The trailing `ALTER OPERATOR CLASS ... OWNER TO` line comes
+from the same generic archiver owner mechanism as every other object in
+this file — no goopg-side rendering code needed.
+
+### Scope / limitations (deferred — see the ledger)
+
+- `OPERATOR`/`FUNCTION` entries in a class's `AS` list are still not tied to
+  a `pg_amop`/`pg_amproc` member store — a class declaring real members
+  (upstream's `op_class`/`op_class_custom` fixtures) would currently dump
+  with only its `STORAGE`-or-dummy clause, silently dropping every member.
+  This needs the same `pg_amop`/`pg_amproc` + synthetic `pg_depend` member
+  store that `ALTER OPERATOR FAMILY ... ADD` (loop #34's deferral) also
+  needs — the two are naturally one follow-up, since `dumpOpclass` and
+  `dumpOpfamily` both read the identical `pg_amop`/`pg_amproc`-via-
+  `pg_depend` shape, only filtered by a different `refobjid` (class vs
+  family).
+- `op_class_custom` additionally needs a range-type `subtype_opclass`
+  binding (`CREATE TYPE ... AS RANGE (subtype_opclass = ...)`), unrelated
+  to the member-store gap above.
+- Regtype rendering of `KeyTypeOID == 0` (`InvalidOid`, PG's own "no
+  explicit STORAGE" sentinel) as the literal `"-"` is unverified — every
+  fixture this loop added supplies an explicit `STORAGE`, so `KeyTypeOID`
+  is always non-zero. A class *without* `STORAGE` (relying on PG's own
+  dummy-filler path) is untested.
+- Class ownership (`Owner`) defaults to the bootstrap superuser exactly like
+  `UserOperatorFamily.Owner` — no per-session creating-role tracking.
+
+### Gates
+
+`TestParseCreateOperatorClassFullShape`/`TestParseCreateOperatorClassDefaultKeyword`
+(parser, `op_compat_test.go`, alongside the pre-existing
+`TestParseCreateOperatorClassStillWorks` regression guard);
+`TestCreateOperatorClassPopulatesOpclassRow`/
+`TestCreateOperatorClassAutoCreatesFamily`/
+`TestCreateOperatorClassUnknownFamily` (executor, `create_operator_test.go`);
+new DU-002 slice 409 assertion in `TestPort_PgDumpConnectionSetup`
+(`internal/testport/pgdump_connsetup_test.go`) — the exact `CREATE OPERATOR
+CLASS public.op_class_empty\n    FOR TYPE bigint USING btree FAMILY
+public.op_family AS\n    STORAGE bigint;` shape verified byte-for-byte
+against a live, freshly-built PG 18.3 instance (`postgres/local_install`) in
+this loop. `go build ./...` clean; `go vet`
+parser/catalog/executor/planner/testport clean; `internal/parser`+
+`internal/catalog`+`internal/executor`+`internal/planner` suites PASS;
+`gofmt -l` flags only the same pre-existing go1.25/1.26-drift files as loop
+#34 (verified via `git stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench
+smoke = pre-commit hook.
+
 ## Still open under M0119-0004
 
 `regoper`/`regoperator` OID→name resolution (no column is typed `regoper`
-yet, so no observable gap); `ALTER OPERATOR FAMILY ... ADD` (loose
-OPERATOR/FUNCTION members); full `CREATE OPERATOR CLASS` round-trip +
-`op_class_custom` ordering fixture (range-type `subtype_opclass` binding);
-further pg_dump 002–010 catalog parity slices.
+yet, so no observable gap); `ALTER OPERATOR FAMILY ... ADD` and `CREATE
+OPERATOR CLASS`'s own `OPERATOR`/`FUNCTION` member entries (a single
+combined `pg_amop`/`pg_amproc`+`pg_depend` member-store follow-up, per loop
+#35's scope note above); the `op_class_custom` ordering fixture (range-type
+`subtype_opclass` binding); `KeyTypeOID == 0` → `"-"` regtype rendering
+(untested); further pg_dump 002–010 catalog parity slices.

@@ -1222,21 +1222,23 @@ func (p *parser) parseCreateOpFamilyTail(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
-// parseCreateOpClassTail picks up after "CREATE OPERATOR CLASS".
-// Captures just enough to register the FUNCTION 2 (hash extended support func)
-// for use in satisfies_hash_partition. Everything else is accepted and ignored.
-// M0097-0027.
+// parseCreateOpClassTail picks up after "CREATE OPERATOR CLASS". Captures
+// the full class-level shape (schema-qualified name, DEFAULT, FOR TYPE,
+// USING method, optional FAMILY clause, STORAGE entry) so CREATE OPERATOR
+// CLASS can populate a real pg_opclass row (DU-002, M0119-0004); the FUNCTION
+// 2 (hash extended support func) capture from M0097-0027 is preserved.
+// OPERATOR/FUNCTION entries otherwise remain accepted-and-ignored.
 func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 	stmt := &CreateOpClassStmt{pos: pos}
-	// Name.
-	nameTok := p.cur()
-	if nameTok.Kind != TokenIdent && nameTok.Kind != TokenQuotedIdent {
+	// Name (possibly schema-qualified).
+	name, err := p.parseObjectName()
+	if err != nil {
 		return nil, p.errAtCur("expected operator class name")
 	}
-	stmt.Name = nameTok.Value
-	p.advance()
-	// Skip optional DEFAULT (reserved keyword).
-	p.acceptKeyword(KwDefault)
+	stmt.Schema = name.Schema
+	stmt.Name = name.Name
+	// Optional DEFAULT (reserved keyword).
+	stmt.IsDefault = p.acceptKeyword(KwDefault)
 	// FOR TYPE typename.
 	if !p.acceptKeyword(KwFor) {
 		return parseSkipToSemicolonHelper(p, stmt)
@@ -1249,26 +1251,44 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 	}
 	typeObj, _ := p.parseTypeNameAfterCast()
 	stmt.ForType = strings.ToLower(typeObj.String())
-	// USING hash (USING is a reserved keyword).
+	// USING method (USING is a reserved keyword).
 	if !p.acceptKeyword(KwUsing) {
 		return parseSkipToSemicolonHelper(p, stmt)
 	}
-	p.advance() // access method name (e.g. "hash") — consume it
+	if methodTok := p.cur(); methodTok.Kind == TokenIdent || methodTok.Kind == TokenKeyword {
+		stmt.Method = strings.ToLower(methodTok.Value)
+		p.advance()
+	}
+	// Optional FAMILY family_name ("family" is not in goopg's keyword map —
+	// arrives as TokenIdent, mirroring CREATE OPERATOR CLASS's other bare
+	// contextual keywords "type"/"operator"/"storage").
+	if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "family") {
+		p.advance()
+		if famName, ferr := p.parseObjectName(); ferr == nil {
+			stmt.FamilySchema = famName.Schema
+			stmt.FamilyName = famName.Name
+		}
+	}
 	// AS list of entries (AS is a reserved keyword).
 	if !p.acceptKeyword(KwAs) {
 		return parseSkipToSemicolonHelper(p, stmt)
 	}
-	// Scan entries: OPERATOR n op [, FUNCTION n name(args) [, ...]]
+	// Scan entries: (STORAGE type | OPERATOR n op | FUNCTION n name(args))[, ...]
 	for {
 		tok := p.cur()
 		if tok.Kind == TokenEOF {
 			break
 		}
-		// "operator" is not in goopg's keyword map → TokenIdent.
+		// "operator"/"storage" are not in goopg's keyword map → TokenIdent.
 		isOperator := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "operator")
 		// "function" IS in the keyword map as KwCatUnreserved → TokenKeyword.
 		isFunction := tok.Kind == TokenKeyword && tok.Keyword == KwFunction
-		if isOperator {
+		isStorage := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "storage")
+		if isStorage {
+			p.advance() // consume "storage"
+			storageType, _ := p.parseTypeNameAfterCast()
+			stmt.StorageType = strings.ToLower(storageType.String())
+		} else if isOperator {
 			p.advance() // consume "operator"
 			// Skip strategy number.
 			if p.cur().Kind == TokenIntLit {

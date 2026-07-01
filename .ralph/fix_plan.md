@@ -4127,6 +4127,48 @@ documentation-only and is exempt from the design-doc requirement.)
       pre-existing M0097-0027 minimal stub — does not populate `pg_opclass`)
       + the `op_class_custom` ordering fixture (range-type
       `subtype_opclass` binding) remain a separate, larger follow-up.
+      **2026-07-01 (loop #35, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #35"): `CREATE OPERATOR CLASS` populates a real `pg_opclass` row
+      LANDED — DU-002 slice 409, partially closes the loop #34 resume point
+      (b).** Bounded to upstream's own `op_class_empty` fixture (`FOR TYPE
+      bigint USING btree FAMILY dump_test.op_family AS STORAGE bigint` — no
+      OPERATOR/FUNCTION members). `CREATE OPERATOR CLASS` was the pre-existing
+      M0097-0027 minimal stub (tracked only `FUNCTION 2` hash-extended support
+      func + a bare schema association), never touching `pg_opclass` —
+      `getOpclasses` always read 0 rows. Parser: `parseCreateOpClassTail` now
+      parses a schema-qualified name, captures `DEFAULT`/`USING method`
+      (previously discarded), a new optional `FAMILY family_name` clause, and
+      a `STORAGE type` AS-list entry. Catalog: new `UserOperatorClass`
+      (OID/Name/NamespaceOID/Owner/Method/FamilyOID/InTypeOID/IsDefault/
+      KeyTypeOID) + `RegisterUserOperatorClass`/`DropUserOperatorClass`/
+      `ListUserOperatorClasses` (keyed `"<schema>.<name>/<method-oid>"`,
+      mirroring `userOpFamilyKey`); new `LookupUserOperatorFamily` resolves an
+      explicit FAMILY clause; `pg_opclass.VirtualRows` now renders the
+      registry. Executor: `execCreateOpClass` resolves method (42704 if
+      unrecognized)/namespace/intype/storage-type; an explicit FAMILY clause
+      must already exist (42704 if not); an omitted FAMILY clause
+      auto-creates an anonymous family sharing the class's schema+name (PG's
+      `DefineOpClass` — `opcfamily` is NOT NULL); `DROP OPERATOR CLASS` now
+      also calls `DropUserOperatorClass`. Verified byte-identical vs a
+      freshly-built, live PG 18.3 instance run in this loop. Tests:
+      `TestParseCreateOperatorClassFullShape`/
+      `TestParseCreateOperatorClassDefaultKeyword` (parser);
+      `TestCreateOperatorClassPopulatesOpclassRow`/
+      `TestCreateOperatorClassAutoCreatesFamily`/
+      `TestCreateOperatorClassUnknownFamily` (executor); DU-002 slice 409
+      (`TestPort_PgDumpConnectionSetup`). Gates: `go build`/`go vet` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/planner` suites PASS; `gofmt -l` flags only the same
+      pre-existing go1.25/1.26-drift files as loop #34 (verified via `git
+      stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit
+      hook. Deferred (ledger row appended, still open): `OPERATOR`/`FUNCTION`
+      class members are not tied to a `pg_amop`/`pg_amproc` member store —
+      the SAME underlying gap as the still-open `ALTER OPERATOR FAMILY ...
+      ADD` resume point, since `dumpOpclass`/`dumpOpfamily` read the identical
+      `pg_amop`/`pg_amproc`-via-`pg_depend` shape (now a combined follow-up);
+      `op_class_custom` additionally needs a range-type `subtype_opclass`
+      binding; `KeyTypeOID == 0` → `"-"` regtype rendering is unverified (no
+      fixture omits STORAGE yet).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

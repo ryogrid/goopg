@@ -2217,6 +2217,18 @@ type InMemory struct {
 	// DU-002 (M0119-0004).
 	userOperatorFamilies map[string]*UserOperatorFamily
 
+	// userOperatorClasses tracks user-defined operator classes (CREATE
+	// OPERATOR CLASS name [DEFAULT] FOR TYPE type USING method [FAMILY
+	// family] AS ...) with a stable OID so the class's own pg_opclass row
+	// round-trips through pg_dump's getOpclasses (pg_opclass virtual view →
+	// dumpOpclass). Only the class-level attributes (method/family/intype/
+	// default/keytype) are modeled; OPERATOR/FUNCTION entries tied to the
+	// class via pg_amop/pg_amproc + pg_depend are not yet implemented
+	// (deferred — see the ledger). Key: lowercase "<schema>.<name>/<method-
+	// oid>", mirroring userOperatorFamilies (PG scopes opclass-name
+	// uniqueness per namespace+access method too). DU-002 (M0119-0004).
+	userOperatorClasses map[string]*UserOperatorClass
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -6896,10 +6908,12 @@ func (c *InMemory) registerSystemTables() {
 	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
 	// `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM
 	// pg_opclass` — it reads ALL operator classes and filters out system-defined
-	// ones at dump-out time by namespace dumpability. goopg defines no user
-	// operator classes, and the built-ins are in pg_catalog (never dumped), so this
-	// view is correctly empty (0 rows). Schema matches PG's pg_opclass
-	// (pg_opclass.h). M0110-0001 (DU-002 slice 10).
+	// ones at dump-out time by namespace dumpability. A CREATE OPERATOR CLASS
+	// registers a row here (catalog.UserOperatorClass, ListUserOperatorClasses)
+	// so pg_dump's getOpclasses/dumpOpclass re-emit it; with none registered
+	// this view is empty exactly as before. The built-ins are in pg_catalog
+	// (never dumped). Schema matches PG's pg_opclass (pg_opclass.h). M0110-0001
+	// (DU-002 slice 10; CREATE OPERATOR CLASS support added M0119-0004).
 	pgOpclass := &Table{
 		Schema: "pg_catalog", Name: "pg_opclass", Virtual: true,
 		Columns: []Column{
@@ -6915,7 +6929,27 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2616,
 	}
-	pgOpclass.VirtualRows = func() [][]string { return nil }
+	pgOpclass.VirtualRows = func() [][]string {
+		classes := c.ListUserOperatorClasses()
+		if len(classes) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(classes))
+		for _, oc := range classes {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(oc.OID), 10),                     // oid
+				strconv.FormatUint(uint64(oc.Method), 10),                  // opcmethod
+				oc.Name,                                                    // opcname
+				strconv.FormatUint(uint64(oc.NamespaceOIDOrDefault()), 10), // opcnamespace
+				strconv.FormatUint(uint64(oc.OwnerOrDefault()), 10),        // opcowner
+				strconv.FormatUint(uint64(oc.FamilyOID), 10),               // opcfamily
+				strconv.FormatUint(uint64(oc.InTypeOID), 10),               // opcintype
+				boolToPGChar(oc.IsDefault),                                 // opcdefault
+				strconv.FormatUint(uint64(oc.KeyTypeOID), 10),              // opckeytype
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_opclass"] = pgOpclass
 
 	// pg_opfamily — operator-family catalog (OID 2753). pg_dump's getOpfamilies
@@ -11079,10 +11113,137 @@ func (c *InMemory) ListUserOperatorFamilies() []*UserOperatorFamily {
 	return out
 }
 
+// LookupUserOperatorFamily finds a previously-registered operator family by
+// its identity (schema, name, method). Used by CREATE OPERATOR CLASS to
+// resolve an explicit `FAMILY family_name` clause. DU-002 (M0119-0004).
+func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32) (*UserOperatorFamily, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	f, ok := c.userOperatorFamilies[userOpFamilyKey(schema, name, method)]
+	return f, ok
+}
+
+// UserOperatorClass models a user-defined operator class (CREATE OPERATOR
+// CLASS name [DEFAULT] FOR TYPE type USING method [FAMILY family] AS ...)
+// enough to round-trip the class's own pg_opclass row through pg_dump's
+// getOpclasses/dumpOpclass (pg_opclass virtual view). dumpOpclass also emits
+// any OPERATOR/FUNCTION entries tied to the class via pg_amop/pg_amproc +
+// pg_depend — that member store is not yet implemented (deferred, see the
+// ledger), so a class declaring real members currently dumps with only its
+// STORAGE clause (or PG's own dummy `STORAGE opcintype` filler when no
+// STORAGE was given and no members exist), silently dropping the members.
+// DU-002 (M0119-0004).
+type UserOperatorClass struct {
+	OID          uint32 // pg_opclass.oid
+	Name         string
+	NamespaceOID uint32
+	// Owner is pg_opclass.opcowner (0 = unset, defaults to the bootstrap
+	// superuser via OwnerOrDefault — mirrors UserOperatorFamily.Owner: CREATE
+	// OPERATOR CLASS has no OWNER clause of its own, and goopg's DDL surface
+	// does not track a per-session creating role).
+	Owner      uint32
+	Method     uint32 // pg_opclass.opcmethod — a pg_am.oid
+	FamilyOID  uint32 // pg_opclass.opcfamily — always valid; PG auto-creates an anonymous family (same name as the class) when FAMILY is omitted
+	InTypeOID  uint32 // pg_opclass.opcintype
+	IsDefault  bool   // pg_opclass.opcdefault
+	KeyTypeOID uint32 // pg_opclass.opckeytype — 0 (InvalidOid, dumps as "-") when no STORAGE clause was given
+}
+
+// OwnerOrDefault mirrors UserOperatorFamily.OwnerOrDefault. DU-002 (M0119-0004).
+func (oc *UserOperatorClass) OwnerOrDefault() uint32 {
+	if oc.Owner == 0 {
+		return 10
+	}
+	return oc.Owner
+}
+
+// NamespaceOIDOrDefault mirrors UserOperatorFamily.NamespaceOIDOrDefault.
+// DU-002 (M0119-0004).
+func (oc *UserOperatorClass) NamespaceOIDOrDefault() uint32 {
+	if oc.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return oc.NamespaceOID
+}
+
+// userOpClassKey builds the operator-class registry's lookup key, mirroring
+// userOpFamilyKey (PG scopes opclass-name uniqueness per namespace+access
+// method too).
+func userOpClassKey(schema, name string, method uint32) string {
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+}
+
+// RegisterUserOperatorClass records a user-defined operator class, allocating
+// a stable OID on first sight. Idempotent: re-registering the same (schema,
+// name, method) key refreshes the mutable attributes but keeps the OID.
+// DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, owner, method, familyOID, inTypeOID uint32, isDefault bool, keyTypeOID uint32) *UserOperatorClass {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorClasses == nil {
+		c.userOperatorClasses = make(map[string]*UserOperatorClass)
+	}
+	key := userOpClassKey(schema, name, method)
+	if oc, ok := c.userOperatorClasses[key]; ok {
+		if namespaceOID != 0 {
+			oc.NamespaceOID = namespaceOID
+		}
+		if owner != 0 {
+			oc.Owner = owner
+		}
+		oc.FamilyOID = familyOID
+		oc.InTypeOID = inTypeOID
+		oc.IsDefault = isDefault
+		oc.KeyTypeOID = keyTypeOID
+		return oc
+	}
+	oc := &UserOperatorClass{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID, Owner: owner,
+		Method: method, FamilyOID: familyOID, InTypeOID: inTypeOID, IsDefault: isDefault, KeyTypeOID: keyTypeOID,
+	}
+	c.userOperatorClasses[key] = oc
+	return oc
+}
+
+// DropUserOperatorClass removes a user-defined operator class from the
+// registry. Returns true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorClasses == nil {
+		return false
+	}
+	key := userOpClassKey(schema, name, method)
+	if _, ok := c.userOperatorClasses[key]; ok {
+		delete(c.userOperatorClasses, key)
+		return true
+	}
+	return false
+}
+
+// ListUserOperatorClasses returns all registered user operator classes sorted
+// by OID (stable creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListUserOperatorClasses() []*UserOperatorClass {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userOperatorClasses) == 0 {
+		return nil
+	}
+	out := make([]*UserOperatorClass, 0, len(c.userOperatorClasses))
+	for _, oc := range c.userOperatorClasses {
+		out = append(out, oc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // AccessMethodOIDByName maps an access method name to its pg_am.oid, covering
 // the 7 rows pg_am.VirtualRows serves (see the pg_am registration in this
 // file). Returns 0 for an unrecognized method. Used by CREATE OPERATOR FAMILY
-// (and, in future, CREATE OPERATOR CLASS) to resolve the `USING method`
+// and CREATE OPERATOR CLASS to resolve the `USING method`
 // clause to pg_opfamily.opfmethod / pg_opclass.opcmethod. DU-002 (M0119-0004).
 func AccessMethodOIDByName(name string) uint32 {
 	switch strings.ToLower(name) {

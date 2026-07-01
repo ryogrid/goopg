@@ -5258,6 +5258,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE OPERATOR FAMILY public.op_family USING btree"); err != nil {
 		t.Fatalf("create operator family public.op_family: %v", err)
 	}
+	// Slice 409: CREATE OPERATOR CLASS must round-trip via
+	// getOpclasses/dumpOpclass, byte-identical to a real pg_dump 18.3 run.
+	// This is upstream's own `op_class_empty` fixture (002_pg_dump.pl) — a
+	// class with a STORAGE clause but no OPERATOR/FUNCTION members, so
+	// dumpOpclass's pg_amop/pg_amproc member queries (gated on pg_depend,
+	// still unmodeled — see the ledger) correctly return 0 rows and only the
+	// STORAGE clause needs to round-trip. CREATE OPERATOR CLASS was
+	// previously a minimal M0097-0027 stub that only tracked the FUNCTION 2
+	// hash-extended support function + a bare schema association — it never
+	// touched pg_opclass, so getOpclasses always read 0 rows.
+	if err := runSQLSimple(t, c, "CREATE OPERATOR CLASS public.op_class_empty "+
+		"FOR TYPE bigint USING btree FAMILY public.op_family AS STORAGE bigint"); err != nil {
+		t.Fatalf("create operator class public.op_class_empty: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8165,6 +8179,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "ALTER OPERATOR FAMILY public.op_family USING btree ADD") {
 			t.Errorf("pg_dump emitted a spurious ALTER OPERATOR FAMILY ... ADD for an empty family\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 409 (asserted):** CREATE OPERATOR CLASS public.op_class_empty
+		// must round-trip via getOpclasses/dumpOpclass, byte-identical to real
+		// pg_dump 18.3 (matches upstream's own `op_class_empty` 002_pg_dump.pl
+		// fixture verbatim, modulo the schema name). dumpOpclass renders `FOR
+		// TYPE bigint USING btree FAMILY public.op_family AS` then the STORAGE
+		// clause (opckeytype != InvalidOid); no OPERATOR/FUNCTION lines follow
+		// since this class declares no members.
+		if want := "CREATE OPERATOR CLASS public.op_class_empty\n" +
+			"    FOR TYPE bigint USING btree FAMILY public.op_family AS\n" +
+			"    STORAGE bigint;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE OPERATOR CLASS %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation
