@@ -917,3 +917,132 @@ func TestCreateOperatorClassForOrderByRejectsNonOrderingAM(t *testing.T) {
 		t.Fatalf("error = %v, want ExecError{Code: 42P17}", err)
 	}
 }
+
+// TestAlterOperatorFamilyAddRegistersLooseMembers verifies ALTER OPERATOR
+// FAMILY ... ADD registers OPERATOR/FUNCTION entries as "loose" pg_amop/
+// pg_amproc members (ClassOID == 0, no owning opclass) whose pg_depend rows
+// are AUTO ('a') on the operator/function AND AUTO on the family itself
+// (refclassid=pg_opfamily, refobjid=the family's own OID) — the opposite of
+// a CREATE OPERATOR CLASS AS-list member's hard NORMAL+INTERNAL pair.
+// Mirrors opclasscmds.c storeOperators/storeProcedures' isAdd branch
+// ("Historically, ALTER ADD has created soft dependencies"). DU-002
+// (M0119-0004), ALTER OPERATOR FAMILY ADD slice.
+func TestAlterOperatorFamilyAddRegistersLooseMembers(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD
+		OPERATOR 3 ~=~ (int4, int4),
+		FUNCTION 1 (int4, int4) int4eq(int4, int4)`); err != nil {
+		t.Fatalf("ALTER OPERATOR FAMILY ADD: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	famRows := pgOpfamilyVirtualRows(t, im)
+	if len(famRows) != 1 {
+		t.Fatalf("pg_opfamily VirtualRows = %d rows, want 1", len(famRows))
+	}
+	famOID := famRows[0][0]
+
+	amopRows := pgAmopVirtualRows(t, im)
+	if len(amopRows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %d rows, want 1: %v", len(amopRows), amopRows)
+	}
+	amop := amopRows[0]
+	if amop[1] != famOID || amop[4] != "3" {
+		t.Errorf("amopfamily/amopstrategy = %q/%q, want %q/3", amop[1], amop[4], famOID)
+	}
+
+	amprocRows := pgAmprocVirtualRows(t, im)
+	if len(amprocRows) != 1 {
+		t.Fatalf("pg_amproc VirtualRows = %d rows, want 1: %v", len(amprocRows), amprocRows)
+	}
+	amproc := amprocRows[0]
+	if amproc[1] != famOID || amproc[4] != "1" {
+		t.Errorf("amprocfamily/amprocnum = %q/%q, want %q/1", amproc[1], amproc[4], famOID)
+	}
+
+	dependRows := pgDependVirtualRows(t, im)
+	wantAuto := map[string]bool{
+		"2602|" + amop[0] + "|2753|" + famOID + "|a":   false, // amop -> opfamily, AUTO
+		"2603|" + amproc[0] + "|2753|" + famOID + "|a": false, // amproc -> opfamily, AUTO
+	}
+	for _, r := range dependRows {
+		key := r[0] + "|" + r[1] + "|" + r[3] + "|" + r[4] + "|" + r[6]
+		if _, ok := wantAuto[key]; ok {
+			wantAuto[key] = true
+		}
+		// No row should point at pg_opclass (2616) for these loose members.
+		if r[3] == "2616" && (r[0] == "2602" && r[1] == amop[0] || r[0] == "2603" && r[1] == amproc[0]) {
+			t.Errorf("unexpected hard pg_opclass dependency for a loose member: %v", r)
+		}
+	}
+	for k, found := range wantAuto {
+		if !found {
+			t.Errorf("missing expected AUTO pg_depend row %q; got %v", k, dependRows)
+		}
+	}
+}
+
+// TestAlterOperatorFamilyAddRequiresExplicitArgTypes verifies an OPERATOR
+// entry with no (lefttype, righttype) pair raises the exact syntax error
+// opclasscmds.c's AlterOpFamilyAdd itself raises at DDL-execution time
+// ("operator argument types must be specified in ALTER OPERATOR FAMILY") —
+// unlike CREATE OPERATOR CLASS's own AS list, which silently defaults them
+// from the resolved operator's own signature.
+func TestAlterOperatorFamilyAddRequiresExplicitArgTypes(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD OPERATOR 3 ~=~`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42601" {
+		t.Fatalf("error = %v, want ExecError{Code: 42601}", err)
+	}
+}
+
+// TestAlterOperatorFamilyAddDuplicateMemberErrors verifies re-adding the
+// same (family, strategy, lefttype, righttype) triple raises
+// ERRCODE_DUPLICATE_OBJECT (42710), mirroring storeOperators' own isAdd
+// conflict check — a check CREATE OPERATOR CLASS's AS list does not perform.
+func TestAlterOperatorFamilyAddDuplicateMemberErrors(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD OPERATOR 3 ~=~ (int4, int4)`); err != nil {
+		t.Fatalf("first ALTER OPERATOR FAMILY ADD: %v", err)
+	}
+	err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD OPERATOR 3 ~=~ (int4, int4)`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42710" {
+		t.Fatalf("error = %v, want ExecError{Code: 42710}", err)
+	}
+}
+
+// TestAlterOperatorFamilyAddUnknownFamilyErrors verifies ALTER OPERATOR
+// FAMILY on a non-existent family raises 42704, mirroring
+// get_opfamily_oid's own missing_ok=false ereport.
+func TestAlterOperatorFamilyAddUnknownFamilyErrors(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.no_such_family USING btree ADD OPERATOR 1 =(int4, int4)`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}

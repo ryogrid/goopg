@@ -834,3 +834,73 @@ instead of parsing-and-discarding it.
   row for the full resume plan (a per-AM `amadjustmembers`-equivalent policy
   table, plus the still-separately-scoped `ALTER OPERATOR FAMILY ... ADD`
   statement).
+
+## Loop #41 — `ALTER OPERATOR FAMILY ... ADD` loose members (DU-002 slice 415)
+
+Closes the loop #34 row's original resume point (a): `ALTER OPERATOR FAMILY
+name USING method ADD entry [, entry ...]` (opclasscmds.c `AlterOpFamilyAdd`)
+attaches OPERATOR/FUNCTION members directly to an existing family with no
+owning opclass — previously the whole `ALTER OPERATOR FAMILY|CLASS` tail
+(ADD included) fell into `parseAlter`'s generic consume-and-succeed no-op
+stub.
+
+- New parser `parseAlterOpFamilyTail` (`internal/parser/ddl.go`) recognizes
+  the `USING method ADD ...` shape and produces a real `AlterOpFamilyAddStmt`
+  (`internal/parser/ast.go`), reusing `OpClassMember` for entries. The `DROP`
+  form (and any other/unrecognized tail) still falls back to the pre-existing
+  `AlterTableStmt` no-op stub — deferred, ledgered, since removing a member
+  also means undoing its pg_depend rows.
+- Unlike `CREATE OPERATOR CLASS`'s own `AS` list, an `ADD`'d `OPERATOR` entry
+  **requires** an explicit `(lefttype, righttype)` pair — new
+  `OpClassMember.HasExplicitArgTypes` records whether the parenthesized form
+  was present; the omitted case parses fine (PG's grammar allows it) but
+  `execAlterOpFamilyAdd` raises PG's own syntax error text ("operator
+  argument types must be specified in ALTER OPERATOR FAMILY") at DDL-exec
+  time, matching PG's own phase for that check (`opclasscmds.c`, not
+  `gram.y`).
+- New executor `execAlterOpFamilyAdd` (`internal/executor/operators_ddl.go`)
+  resolves the family (42704 if missing, mirrors `get_opfamily_oid`'s own
+  `missing_ok=false`) and calls the existing `registerOpClassMembers` with
+  `classOID=0` (the "loose member" sentinel) and a new `isAdd` flag. `isAdd`
+  also gates a duplicate-member check (42710, mirrors `storeOperators`'/
+  `storeProcedures`' own isAdd conflict check — `CREATE OPERATOR CLASS`'s AS
+  list performs no such check).
+- **Dependency-strength switch** (`dependVirtualRows`,
+  `internal/catalog/catalog.go`): a loose member (`ClassOID == 0`) gets the
+  *soft* dependency shape real PG's `storeOperators`/`storeProcedures` use
+  for `ALTER ADD` — AUTO (`'a'`) on the operator/function itself, and AUTO on
+  the **family** (`refclassid=pg_opfamily`, not `pg_opclass`) — instead of
+  the hard NORMAL+INTERNAL pair a class-attributed member gets. This is
+  exactly the shape `dumpOpfamily`'s own loose-member query (filtered on
+  `refclassid=pg_opfamily`) needs to find and re-emit these members as a
+  follow-up `ALTER OPERATOR FAMILY ... ADD` statement.
+- **Verified byte-identical against a freshly-built, live PG 18.3 instance**
+  (`postgres/local_install`): `CREATE OPERATOR FAMILY public.op_family_loose
+  USING btree` + `ALTER OPERATOR FAMILY public.op_family_loose USING btree
+  ADD OPERATOR 1 < (bigint, bigint), OPERATOR 3 = (bigint, bigint), FUNCTION
+  1 (bigint, bigint) btint8cmp(bigint, bigint)` (the loop #39 curated int8
+  builtin-operator set) dumps identically on both engines, including a real
+  pg_dump formatting quirk — a trailing space before each `OPERATOR` entry's
+  comma (`OPERATOR 1 <(bigint,bigint) ,`) that does not appear after a
+  `FUNCTION` entry.
+- Tests: `TestParseAlterOperatorFamilyAdd`/
+  `TestParseAlterOperatorFamilyAddRequiresArgTypes`/
+  `TestParseAlterOperatorFamilyDropStillNoop` (parser);
+  `TestAlterOperatorFamilyAddRegistersLooseMembers`/
+  `TestAlterOperatorFamilyAddRequiresExplicitArgTypes`/
+  `TestAlterOperatorFamilyAddDuplicateMemberErrors`/
+  `TestAlterOperatorFamilyAddUnknownFamilyErrors` (executor); new DU-002
+  slice 415 fixture + assertions in `TestPort_PgDumpConnectionSetup`
+  (`internal/testport`) using a separate `op_family_loose` family so the
+  slice 408 fixture's "family stays empty" negative assertion is unaffected.
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/executor`+`internal/catalog`+`internal/planner`+`internal/server`
+  suites PASS; `TestPort_PgDumpConnectionSetup` PASS; live PG 18.3 diff
+  above; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+- Still open (unrelated, pre-existing): the `DROP` form of `ALTER OPERATOR
+  FAMILY`; the per-AM `amadjustmembers` dependency-strength policy for
+  gist/spgist opclass members (loop #40's discovery — a materially larger,
+  separately-scoped follow-up); the `op_class_custom` ordering fixture
+  (range-type `subtype_opclass` binding); the builtin-operator catalog
+  remains a 6-row curated slice (int8 5-strategy set + `btint8cmp`, unchanged
+  this loop).

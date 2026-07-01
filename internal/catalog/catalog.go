@@ -9427,32 +9427,58 @@ func (c *InMemory) dependVirtualRows() [][]string {
 	// c.mu.RLock() (this function's own lock) — read c.amOpMembers/
 	// c.amProcMembers directly rather than through the public List* accessors
 	// to avoid a recursive RLock.
+	// A "loose" member — registered via ALTER OPERATOR FAMILY ... ADD rather
+	// than a CREATE OPERATOR CLASS AS list — always has ClassOID == 0
+	// (InvalidOid; every class-attributed member gets a real, non-zero
+	// RegisterUserOperatorClass OID, so 0 is an unambiguous sentinel here).
+	// storeOperators/storeProcedures (opclasscmds.c) downgrade EVERY one of a
+	// loose member's dependencies from hard to soft: the operator/function
+	// reference itself becomes AUTO ('a', not NORMAL 'n'), and the
+	// class-or-family reference becomes an AUTO dependency on the FAMILY
+	// itself (refclassid=pg_opfamily, refobjid=the owning family's own OID —
+	// "Historically, ALTER ADD has created soft dependencies", verbatim
+	// AlterOpFamilyAdd comment) instead of an INTERNAL dependency on a class.
+	// This is what lets dumpOpfamily's own loose-member query
+	// (refclassid=pg_opfamily) find these rows and emit them as a separate
+	// `ALTER OPERATOR FAMILY ... ADD` statement. DU-002 (M0119-0004), ALTER
+	// OPERATOR FAMILY ADD slice.
 	for _, m := range c.amOpMembers {
+		refDeptype := "n"
+		classOrFamilyRefclassid := "2616" // pg_opclass
+		classOrFamilyRefobjid := m.ClassOID
+		classOrFamilyDeptype := "i"
+		if m.ClassOID == 0 {
+			refDeptype = "a"
+			classOrFamilyRefclassid = "2753" // pg_opfamily
+			classOrFamilyRefobjid = m.FamilyOID
+			classOrFamilyDeptype = "a"
+		}
 		rows = append(rows, []string{
 			"2602", // 0: classid    = pg_amop
 			strconv.FormatUint(uint64(m.OID), 10), // 1: objid  = amop entry OID
 			"0",    // 2: objsubid
 			"2617", // 3: refclassid = pg_operator
 			strconv.FormatUint(uint64(m.OperOID), 10), // 4: refobjid = operator OID
-			"0", // 5: refobjsubid
-			"n", // 6: deptype = NORMAL
+			"0",        // 5: refobjsubid
+			refDeptype, // 6: deptype = NORMAL (hard) or AUTO (loose)
 		})
 		rows = append(rows, []string{
 			"2602",
 			strconv.FormatUint(uint64(m.OID), 10),
 			"0",
-			"2616", // refclassid = pg_opclass
-			strconv.FormatUint(uint64(m.ClassOID), 10),
+			classOrFamilyRefclassid,
+			strconv.FormatUint(uint64(classOrFamilyRefobjid), 10),
 			"0",
-			"i", // deptype = INTERNAL
+			classOrFamilyDeptype,
 		})
-		// A FOR ORDER BY entry also gets a NORMAL dependency on its sort
-		// family (opclasscmds.c storeOperators: "A search operator also
-		// needs a dep on the referenced opfamily"). getDependencies rewrites
-		// this into an edge from the owning opfamily to the sort family for
-		// dump ordering; dumpOpclass's own SQL-text rendering reads
-		// amopsortfamily directly and does not need this row. DU-002
-		// (M0119-0004) slice 414.
+		// A FOR ORDER BY entry also gets a dependency on its sort family
+		// (opclasscmds.c storeOperators: "A search operator also needs a dep
+		// on the referenced opfamily") — NORMAL for a hard/class-attributed
+		// member, AUTO for a loose one, same op->ref_is_hard switch as the
+		// two rows above. getDependencies rewrites this into an edge from
+		// the owning opfamily to the sort family for dump ordering;
+		// dumpOpclass's own SQL-text rendering reads amopsortfamily directly
+		// and does not need this row. DU-002 (M0119-0004) slice 414.
 		if m.SortFamilyOID != 0 {
 			rows = append(rows, []string{
 				"2602",
@@ -9461,11 +9487,21 @@ func (c *InMemory) dependVirtualRows() [][]string {
 				"2753", // refclassid = pg_opfamily
 				strconv.FormatUint(uint64(m.SortFamilyOID), 10),
 				"0",
-				"n", // deptype = NORMAL
+				refDeptype,
 			})
 		}
 	}
 	for _, m := range c.amProcMembers {
+		refDeptype := "n"
+		classOrFamilyRefclassid := "2616" // pg_opclass
+		classOrFamilyRefobjid := m.ClassOID
+		classOrFamilyDeptype := "i"
+		if m.ClassOID == 0 {
+			refDeptype = "a"
+			classOrFamilyRefclassid = "2753" // pg_opfamily
+			classOrFamilyRefobjid = m.FamilyOID
+			classOrFamilyDeptype = "a"
+		}
 		rows = append(rows, []string{
 			"2603", // 0: classid    = pg_amproc
 			strconv.FormatUint(uint64(m.OID), 10),
@@ -9473,16 +9509,16 @@ func (c *InMemory) dependVirtualRows() [][]string {
 			"1255", // refclassid = pg_proc
 			strconv.FormatUint(uint64(m.ProcOID), 10),
 			"0",
-			"n",
+			refDeptype,
 		})
 		rows = append(rows, []string{
 			"2603",
 			strconv.FormatUint(uint64(m.OID), 10),
 			"0",
-			"2616", // refclassid = pg_opclass
-			strconv.FormatUint(uint64(m.ClassOID), 10),
+			classOrFamilyRefclassid,
+			strconv.FormatUint(uint64(classOrFamilyRefobjid), 10),
 			"0",
-			"i",
+			classOrFamilyDeptype,
 		})
 	}
 	return rows

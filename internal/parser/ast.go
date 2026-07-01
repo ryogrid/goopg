@@ -1882,6 +1882,27 @@ type CreateOpClassStmt struct {
 func (s *CreateOpClassStmt) Pos() int  { return s.pos }
 func (s *CreateOpClassStmt) stmtNode() {}
 
+// AlterOpFamilyAddStmt models the ADD form of ALTER OPERATOR FAMILY name
+// USING method ADD entry [, entry ...] — the "loose member" statement that
+// attaches OPERATOR/FUNCTION entries directly to an existing operator
+// family without an owning opclass (opclasscmds.c AlterOpFamilyAdd).
+// Members reuse OpClassMember; the grammar's opclass_item production allows
+// a STORAGE entry but AlterOpFamilyAdd itself rejects one with a syntax
+// error ("STORAGE cannot be specified in ALTER OPERATOR FAMILY") — not
+// modeled here since no fixture needs it. The DROP form (ALTER OPERATOR
+// FAMILY ... DROP) is not modeled at all yet and stays a CompatNoopStmt
+// (deferred, see the ledger). DU-002 (M0119-0004).
+type AlterOpFamilyAddStmt struct {
+	pos     int
+	Schema  string // family name's schema qualifier, "" if unqualified
+	Name    string // family name
+	Method  string // access method name, e.g. "btree"
+	Members []OpClassMember
+}
+
+func (s *AlterOpFamilyAddStmt) Pos() int  { return s.pos }
+func (s *AlterOpFamilyAddStmt) stmtNode() {}
+
 // OpClassMember models one OPERATOR or FUNCTION entry in a CREATE OPERATOR
 // CLASS ... AS list (opclasscmds.c's OpFamilyMember, narrowed to what
 // goopg's compat shim can resolve — see execCreateOpClass). LeftType/
@@ -1899,6 +1920,17 @@ type OpClassMember struct {
 	RightType        string // explicit righttype, "" if unspecified (or the operator is unary)
 	SortFamilySchema string // OPERATOR ... FOR ORDER BY family's schema qualifier, "" if unqualified or absent
 	SortFamilyName   string // OPERATOR ... FOR ORDER BY family name, "" if this is a FOR SEARCH (or bare) OPERATOR entry
+	// HasExplicitArgTypes records whether a parenthesized (lefttype[,
+	// righttype]) form followed the OPERATOR entry's name. CREATE OPERATOR
+	// CLASS's own AS list treats an omitted pair as "default from the
+	// resolved operator's own signature" (assignOperTypes); ALTER OPERATOR
+	// FAMILY ... ADD instead requires it and raises a syntax error otherwise
+	// (opclasscmds.c AlterOpFamilyAdd: "operator argument types must be
+	// specified in ALTER OPERATOR FAMILY") — checked at exec time
+	// (execAlterOpFamilyAdd), not by the parser, mirroring PG's own phase
+	// (the check lives in the DDL command handler, not gram.y). DU-002
+	// (M0119-0004).
+	HasExplicitArgTypes bool
 }
 
 // DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.

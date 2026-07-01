@@ -494,6 +494,89 @@ func TestParseCreateOperatorClassForOrderBy(t *testing.T) {
 	}
 }
 
+// TestParseAlterOperatorFamilyAdd verifies the ADD form (loose OPERATOR/
+// FUNCTION members attached directly to a family, opclasscmds.c
+// AlterOpFamilyAdd) parses into a real AlterOpFamilyAddStmt — previously
+// this whole statement (ADD and DROP alike) was a full no-op consumed to
+// ';'. Mirrors the upstream 002_pg_dump.pl `op_family` fixture's own ADD
+// list shape (explicit operand types, a FOR ORDER BY clause, and an
+// explicit FUNCTION arg-type override). DU-002 (M0119-0004).
+func TestParseAlterOperatorFamilyAdd(t *testing.T) {
+	stmts, err := Parse(`ALTER OPERATOR FAMILY dump_test.op_family USING btree ADD
+		OPERATOR 1 < (int4, int4) FOR ORDER BY dump_test.sort_family,
+		OPERATOR 3 = (int4, int4),
+		FUNCTION 1 (int4, int4) btint4cmp(int4, int4)`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	af, ok := stmts[0].(*AlterOpFamilyAddStmt)
+	if !ok {
+		t.Fatalf("Expected *AlterOpFamilyAddStmt, got %T", stmts[0])
+	}
+	if af.Schema != "dump_test" || af.Name != "op_family" {
+		t.Errorf("Schema/Name = %q/%q, want dump_test/op_family", af.Schema, af.Name)
+	}
+	if af.Method != "btree" {
+		t.Errorf("Method = %q, want btree", af.Method)
+	}
+	if len(af.Members) != 3 {
+		t.Fatalf("Members = %d, want 3", len(af.Members))
+	}
+	m0 := af.Members[0]
+	if m0.IsFunction || m0.Number != 1 || m0.Name != "<" || !m0.HasExplicitArgTypes {
+		t.Errorf("Members[0] = %+v, want OPERATOR 1 < with explicit arg types", m0)
+	}
+	if m0.LeftType != "int4" || m0.RightType != "int4" {
+		t.Errorf("Members[0] LeftType/RightType = %q/%q, want int4/int4", m0.LeftType, m0.RightType)
+	}
+	if m0.SortFamilySchema != "dump_test" || m0.SortFamilyName != "sort_family" {
+		t.Errorf("Members[0] SortFamilySchema/SortFamilyName = %q/%q, want dump_test/sort_family", m0.SortFamilySchema, m0.SortFamilyName)
+	}
+	m1 := af.Members[1]
+	if m1.SortFamilyName != "" {
+		t.Errorf("Members[1] SortFamilyName = %q, want \"\" (no FOR ORDER BY)", m1.SortFamilyName)
+	}
+	m2 := af.Members[2]
+	if !m2.IsFunction || m2.Number != 1 || m2.Name != "btint4cmp" || m2.LeftType != "int4" || m2.RightType != "int4" {
+		t.Errorf("Members[2] = %+v, want FUNCTION 1 (int4,int4) btint4cmp", m2)
+	}
+}
+
+// TestParseAlterOperatorFamilyAddRequiresArgTypes verifies an OPERATOR entry
+// with no explicit (lefttype, righttype) parses successfully (the grammar
+// itself allows omitting them — HasExplicitArgTypes just comes back false)
+// since PG raises "operator argument types must be specified in ALTER
+// OPERATOR FAMILY" at DDL-execution time (opclasscmds.c), not during
+// parsing/analysis.
+func TestParseAlterOperatorFamilyAddRequiresArgTypes(t *testing.T) {
+	stmts, err := Parse(`ALTER OPERATOR FAMILY dump_test.op_family USING btree ADD OPERATOR 1 <`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	af, ok := stmts[0].(*AlterOpFamilyAddStmt)
+	if !ok {
+		t.Fatalf("Expected *AlterOpFamilyAddStmt, got %T", stmts[0])
+	}
+	if len(af.Members) != 1 || af.Members[0].HasExplicitArgTypes {
+		t.Errorf("Members = %+v, want one entry with HasExplicitArgTypes=false", af.Members)
+	}
+}
+
+// TestParseAlterOperatorFamilyDropStillNoop verifies the DROP form (not yet
+// modeled — deferred, see the ledger) still parses as the same
+// accepted-and-ignored *AlterTableStmt no-op stub every other ALTER
+// OPERATOR CLASS|FAMILY tail used before this loop (RENAME TO, OWNER TO,
+// etc. — see TestParseAlterOperatorOwnerToIsNoop), not a hard parse error.
+func TestParseAlterOperatorFamilyDropStillNoop(t *testing.T) {
+	stmts, err := Parse(`ALTER OPERATOR FAMILY dump_test.op_family USING btree DROP OPERATOR 1 (int4, int4)`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if _, ok := stmts[0].(*AlterTableStmt); !ok {
+		t.Fatalf("Expected *AlterTableStmt (DROP still deferred), got %T", stmts[0])
+	}
+}
+
 // TestParseCreateOperatorUnary verifies a LEFTARG-omitted (prefix/unary)
 // CREATE OPERATOR parses with an empty ArgTypes[0], matching PG's grammar
 // (RIGHTARG is always required — postfix operators were removed in PG14).

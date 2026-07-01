@@ -1385,6 +1385,132 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
+// parseAlterOpFamilyTail picks up after "ALTER OPERATOR FAMILY". Grammar
+// (opclasscmds.c AlterOpFamilyStmt):
+//
+//	name USING method (ADD opclass_item_list | DROP opclass_drop_list)
+//
+// Only the ADD form is modeled as a real statement (AlterOpFamilyAddStmt),
+// reusing the same OPERATOR/FUNCTION entry grammar as CREATE OPERATOR
+// CLASS's own AS list (opclass_item is shared upstream) except that an
+// OPERATOR entry here REQUIRES an explicit (lefttype, righttype) pair —
+// captured via OpClassMember.HasExplicitArgTypes and checked at exec time
+// (execAlterOpFamilyAdd), matching PG's own phase for that error. The DROP
+// form is accepted-and-ignored (deferred, see the ledger) since removing a
+// member also means undoing its pg_depend rows, a separate follow-up.
+// DU-002 (M0119-0004).
+func (p *parser) parseAlterOpFamilyTail(pos int) (Stmt, error) {
+	// Every non-ADD tail (DROP, RENAME TO, OWNER TO, SET SCHEMA, or any
+	// unrecognized form) keeps the pre-existing *AlterTableStmt no-op stub
+	// shape the whole "ALTER OPERATOR CLASS|FAMILY" branch used before this
+	// function existed (TestParseAlterOperatorOwnerToIsNoop pins this for
+	// RENAME TO) — only ADD becomes a real, executed statement.
+	noop := func() (Stmt, error) { return parseSkipToSemicolonHelper(p, &AlterTableStmt{pos: pos}) }
+	name, err := p.parseObjectName()
+	if err != nil {
+		return noop()
+	}
+	if !p.acceptKeyword(KwUsing) {
+		return noop()
+	}
+	method := ""
+	if methodTok := p.cur(); methodTok.Kind == TokenIdent || methodTok.Kind == TokenKeyword {
+		method = strings.ToLower(methodTok.Value)
+		p.advance()
+	}
+	if !p.acceptKeyword(KwAdd) {
+		// DROP (or any other/unrecognized tail) — deferred, see the ledger.
+		return noop()
+	}
+	stmt := &AlterOpFamilyAddStmt{pos: pos, Schema: name.Schema, Name: name.Name, Method: method}
+	for {
+		tok := p.cur()
+		if tok.Kind == TokenEOF {
+			break
+		}
+		// "operator" is not in goopg's keyword map → TokenIdent; "function" IS
+		// (KwCatUnreserved) → TokenKeyword. Mirrors parseCreateOpClassTail's
+		// own entry-scan loop.
+		isOperator := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "operator")
+		isFunction := tok.Kind == TokenKeyword && tok.Keyword == KwFunction
+		if isOperator {
+			p.advance() // consume "operator"
+			strategyNum := 0
+			if p.cur().Kind == TokenIntLit {
+				strategyNum, _ = strconv.Atoi(p.cur().Value)
+				p.advance()
+			}
+			opRef, operr := p.parseOperatorRefName()
+			if operr != nil {
+				return parseSkipToSemicolonHelper(p, stmt)
+			}
+			member := OpClassMember{Number: strategyNum, Schema: opRef.Schema, Name: opRef.Name}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.advance()
+				lt, _ := p.parseTypeNameAfterCast()
+				member.LeftType = strings.ToLower(lt.String())
+				if p.acceptSymbol(",") {
+					rt, _ := p.parseTypeNameAfterCast()
+					member.RightType = strings.ToLower(rt.String())
+				}
+				p.acceptSymbol(")")
+				member.HasExplicitArgTypes = true
+			}
+			// opclass_purpose: FOR SEARCH | FOR ORDER BY any_name | empty.
+			if p.acceptKeyword(KwFor) {
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "search") {
+					p.advance()
+				} else {
+					p.acceptKeyword(KwOrder)
+					p.acceptKeyword(KwBy)
+					if famName, ferr := p.parseObjectName(); ferr == nil {
+						member.SortFamilySchema = famName.Schema
+						member.SortFamilyName = famName.Name
+					}
+				}
+			}
+			stmt.Members = append(stmt.Members, member)
+		} else if isFunction {
+			p.advance() // consume "function"
+			supportNum := 0
+			if p.cur().Kind == TokenIntLit {
+				supportNum, _ = strconv.Atoi(p.cur().Value)
+				p.advance()
+			}
+			member := OpClassMember{IsFunction: true, Number: supportNum}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.advance()
+				lt, _ := p.parseTypeNameAfterCast()
+				member.LeftType = strings.ToLower(lt.String())
+				if p.acceptSymbol(",") {
+					rt, _ := p.parseTypeNameAfterCast()
+					member.RightType = strings.ToLower(rt.String())
+				}
+				p.acceptSymbol(")")
+			}
+			funcName, ferr := p.parseObjectName()
+			if ferr != nil {
+				return parseSkipToSemicolonHelper(p, stmt)
+			}
+			member.Schema = funcName.Schema
+			member.Name = funcName.Name
+			// Skip the function's own argument-type list.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.skipBalancedParens()
+			}
+			stmt.Members = append(stmt.Members, member)
+		} else {
+			// STORAGE (rejected by AlterOpFamilyAdd itself) or any unexpected
+			// token — tolerantly stop scanning members rather than hard-failing.
+			return parseSkipToSemicolonHelper(p, stmt)
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return stmt, nil
+}
+
 func parseSkipToSemicolonHelper(p *parser, stmt Stmt) (Stmt, error) {
 	for {
 		tok := p.cur()
@@ -6257,8 +6383,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// NamespaceOID) — so only the SET (...) def-list form is modeled here.
 	// M0119-0004 (DU-002), closes the slice-407 ledger follow-up.
 	if p.acceptIdentKeyword("operator") {
-		if tok := p.cur(); tok.Kind == TokenIdent &&
-			(strings.EqualFold(tok.Value, "class") || strings.EqualFold(tok.Value, "family")) {
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "family") {
+			p.advance() // consume "family"
+			return p.parseAlterOpFamilyTail(t.Pos)
+		}
+		if tok := p.cur(); tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "class") {
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break

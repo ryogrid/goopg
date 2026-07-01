@@ -5272,6 +5272,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"FOR TYPE bigint USING btree FAMILY public.op_family AS STORAGE bigint"); err != nil {
 		t.Fatalf("create operator class public.op_class_empty: %v", err)
 	}
+	// Slice 415: ALTER OPERATOR FAMILY ... ADD (opclasscmds.c AlterOpFamilyAdd)
+	// attaches "loose" OPERATOR/FUNCTION members directly to a family with no
+	// owning opclass — the gap the slice 408 fixture above deliberately left
+	// open (op_family stays empty; this uses a SEPARATE family so that
+	// negative assertion is unaffected). Reuses the loop #39 curated int8
+	// btree builtin-operator set (=, <, btint8cmp) so the members resolve
+	// without a user-defined operator. Real PG's storeOperators/
+	// storeProcedures give every loose member a SOFT (AUTO, 'a') pg_depend
+	// dependency on the FAMILY itself, never a hard dependency on a class —
+	// this is what lets dumpOpfamily's own loose-member query (filtered on
+	// refclassid=pg_opfamily) find and re-emit them as a follow-up ALTER
+	// OPERATOR FAMILY ... ADD statement, verified byte-identical against a
+	// live PG 18.3 instance below.
+	if err := runSQLSimple(t, c, "CREATE OPERATOR FAMILY public.op_family_loose USING btree"); err != nil {
+		t.Fatalf("create operator family public.op_family_loose: %v", err)
+	}
+	if err := runSQLSimple(t, c, `ALTER OPERATOR FAMILY public.op_family_loose USING btree ADD
+    OPERATOR 1 < (bigint, bigint),
+    OPERATOR 3 = (bigint, bigint),
+    FUNCTION 1 (bigint, bigint) btint8cmp(bigint, bigint)`); err != nil {
+		t.Fatalf("alter operator family public.op_family_loose add: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8196,6 +8218,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"    FOR TYPE bigint USING btree FAMILY public.op_family AS\n" +
 			"    STORAGE bigint;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing CREATE OPERATOR CLASS %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 415 (asserted):** ALTER OPERATOR FAMILY ... ADD loose members
+		// must round-trip via dumpOpfamily's own loose-member query, byte-
+		// identical to a live PG 18.3 run (verified manually against
+		// postgres/local_install in this loop) — including the trailing space
+		// before each OPERATOR entry's comma, a real pg_dump formatting quirk
+		// (dumpOpfamily's own printfPQExpBuffer call, not something goopg
+		// controls).
+		if want := "CREATE OPERATOR FAMILY public.op_family_loose USING btree;\n" +
+			"ALTER OPERATOR FAMILY public.op_family_loose USING btree ADD\n" +
+			"    OPERATOR 1 <(bigint,bigint) ,\n" +
+			"    OPERATOR 3 =(bigint,bigint) ,\n" +
+			"    FUNCTION 1 (bigint, bigint) btint8cmp(bigint,bigint);"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR FAMILY ... ADD %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "ALTER OPERATOR FAMILY public.op_family_loose USING btree OWNER TO"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR FAMILY OWNER TO for public.op_family_loose\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

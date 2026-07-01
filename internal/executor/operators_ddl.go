@@ -145,6 +145,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterOperatorSet(s)
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
+	case *parser.AlterOpFamilyAddStmt:
+		return nil, o.execAlterOpFamilyAdd(s)
 	case *parser.CreateExtensionStmt:
 		return nil, o.execCreateExtension(s)
 	case *parser.CreateTablespaceStmt:
@@ -14768,7 +14770,45 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		}
 	}
 	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
-	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos())
+	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos(), false, "")
+}
+
+// execAlterOpFamilyAdd implements ALTER OPERATOR FAMILY name USING method
+// ADD entry [, entry ...] — opclasscmds.c's AlterOpFamilyAdd. Unlike CREATE
+// OPERATOR CLASS's own AS list, every member here is a "loose" member with
+// no owning opclass: registerOpClassMembers is called with classOID=0,
+// which dependVirtualRows (internal/catalog/catalog.go) reads as the signal
+// to emit the AUTO ('a') dependency on the family itself rather than the
+// INTERNAL ('i') dependency on a class — "Historically, ALTER ADD has
+// created soft dependencies" (opclasscmds.c AlterOpFamilyAdd, verbatim
+// comment). Requires superuser (mirrors "must be superuser to alter an
+// operator family", ERRCODE_INSUFFICIENT_PRIVILEGE) — goopg's
+// NonSuperuserRole is only set by the compat SET ROLE/SET SESSION
+// AUTHORIZATION path (see AlterOperatorSetStmt's own Leakproof check for the
+// same pattern). DU-002 (M0119-0004).
+func (o *ddlOp) execAlterOpFamilyAdd(s *parser.AlterOpFamilyAddStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "must be superuser to alter an operator family"}
+	}
+	methodOID := catalog.AccessMethodOIDByName(s.Method)
+	if methodOID == 0 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
+	}
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	if !found {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
+	}
+	return o.registerOpClassMembers(im, s.Members, schema, fam.OID, 0, methodOID, s.Method, s.Pos(), true, fam.Name)
 }
 
 // registerOpClassMembers resolves each OPERATOR/FUNCTION entry in a CREATE
@@ -14787,8 +14827,16 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 // get_opfamily_oid's own missing_ok=false ereport; a resolved sort family on
 // a non-ordering-capable method (only gist/spgist set amcanorderbyop=true
 // upstream) errors 42P17, mirroring opclasscmds.c's own
-// ERRCODE_INVALID_OBJECT_DEFINITION check. Slice 414.
-func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.OpClassMember, schema string, famOID, classOID, methodOID uint32, methodName string, pos int) error {
+// ERRCODE_INVALID_OBJECT_DEFINITION check. Slice 414. isAdd distinguishes
+// the ALTER OPERATOR FAMILY ... ADD caller (execAlterOpFamilyAdd) from
+// CREATE OPERATOR CLASS's own AS list, mirroring storeOperators/
+// storeProcedures' own isAdd parameter: an OPERATOR entry must carry
+// explicit operand types ("operator argument types must be specified in
+// ALTER OPERATOR FAMILY" — a syntax error, not silently defaulted) and a
+// duplicate (family, strategy/support number, lefttype, righttype) is
+// rejected instead of silently re-registered. DU-002 (M0119-0004),
+// ALTER OPERATOR FAMILY ADD slice.
+func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.OpClassMember, schema string, famOID, classOID, methodOID uint32, methodName string, pos int, isAdd bool, familyDisplayName string) error {
 	for _, m := range members {
 		opSchema := m.Schema
 		if opSchema == "" {
@@ -14799,12 +14847,34 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 			if !ok {
 				continue
 			}
+			if isAdd {
+				for _, existing := range im.ListAmProcMembers() {
+					if existing.FamilyOID == famOID && existing.ProcNum == uint32(m.Number) &&
+						existing.LeftType == leftOID && existing.RightType == rightOID {
+						return &ExecError{Code: "42710", Pos: pos,
+							Message: fmt.Sprintf("function %d(%s,%s) already exists in operator family %q", m.Number, m.LeftType, m.RightType, familyDisplayName)}
+					}
+				}
+			}
 			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID)
 			continue
+		}
+		if isAdd && !m.HasExplicitArgTypes {
+			return &ExecError{Code: "42601", Pos: pos,
+				Message: "operator argument types must be specified in ALTER OPERATOR FAMILY"}
 		}
 		operOID, leftOID, rightOID, ok := resolveOpClassOperator(im, opSchema, m)
 		if !ok {
 			continue
+		}
+		if isAdd {
+			for _, existing := range im.ListAmOpMembers() {
+				if existing.FamilyOID == famOID && existing.Strategy == uint32(m.Number) &&
+					existing.LeftType == leftOID && existing.RightType == rightOID {
+					return &ExecError{Code: "42710", Pos: pos,
+						Message: fmt.Sprintf("operator %d(%s,%s) already exists in operator family %q", m.Number, m.LeftType, m.RightType, familyDisplayName)}
+				}
+			}
 		}
 		var sortFamilyOID uint32
 		if m.SortFamilyName != "" {
