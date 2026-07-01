@@ -2474,3 +2474,109 @@ reference can dangle after a restart if the backing function was also
 created post-initdb and not re-created — this is a pre-existing routines/
 functions persistence gap, not new to this loop, and not specific to event
 triggers.
+
+## Loop #72 — DDL-command-tag validation + superuser enforcement (closes the loop #69 row)
+
+Closes the loop #69 row's other two deferrals — `validate_ddl_tags`/
+`validate_table_rewrite_tags` command-tag membership checking, and
+`CreateEventTrigger`'s superuser privilege check — the only remaining open
+thread on the `CREATE`/`ALTER`/`DROP EVENT TRIGGER` family before it moves to
+strictly-additive follow-ups (e.g. the broader `CREATE FUNCTION` persistence
+gap, tracked separately).
+
+### What landed
+
+**Command-tag table.** `internal/executor/cmdtag_table.go` is a
+mechanically-generated (Python one-liner over
+`postgres/src/include/tcop/cmdtaglist.h`, not hand-transcribed) Go map of
+all 192 real PostgreSQL command tags to their `event_trigger_ok`/
+`table_rewrite_ok` flags (`postgres/src/backend/tcop/cmdtag.c`'s
+`tag_behavior[]`), keyed upper-case. `validateDDLTags`/
+`validateTableRewriteTags` do a case-insensitive lookup (mirrors
+`GetCommandTagEnum`'s `pg_strcasecmp` bsearch) and mirror PG's two distinct
+error shapes exactly:
+
+- `validate_ddl_tags` (ddl_command_start/ddl_command_end/sql_drop): an
+  unrecognized tag is `42601` (`filter value "%s" not recognized for filter
+  variable "tag"`); a recognized-but-disallowed tag (e.g. `VACUUM`, which PG
+  never fires event triggers for) is `0A000` (`event triggers are not
+  supported for %s`).
+- `validate_table_rewrite_tags` (table_rewrite): PG's C implementation has
+  **no** `CMDTAG_UNKNOWN` special case here (unlike `validate_ddl_tags`), so
+  an unrecognized tag and a known-but-non-rewrite tag (e.g. `CREATE TABLE`,
+  which is `event_trigger_ok` but not `table_rewrite_ok`) both fall through
+  to the same `0A000` — goopg's `validateTableRewriteTags` reproduces this
+  by not distinguishing "absent from the map" from "present with
+  `tableRewriteOK: false`" (a bare map lookup returning the zero value
+  covers both).
+
+Wired into `execCreateEventTrigger` right after the existing event-name/
+filter-variable/login-tag checks, keyed on `s.Event` the same way PG's
+`CreateEventTrigger` dispatches to the two validators.
+
+**Superuser enforcement.** Two checks, both using the existing
+`Context.NonSuperuserRole` compat mechanism (the same one `ALTER OPERATOR
+FAMILY ADD`/`AlterOperatorSetStmt`'s leakproof check already uses — goopg
+tracks no per-role `rolsuper` attribute; only OID 10, the bootstrap
+superuser, is ever superuser):
+
+- `execCreateEventTrigger`: `NonSuperuserRole != ""` → `42501`
+  (`permission denied to create event trigger "%s"`), checked first, before
+  event-name validation — matches `CreateEventTrigger`'s own ordering
+  (superuser check precedes everything else in the C function).
+- `execAlterEventTrigger`'s `"owner"` case: the *resolved new owner OID*
+  must be 10 (the only OID goopg's role model ever calls a superuser) → 42501
+  (`permission denied to change owner of event trigger "%s"`). This mirrors
+  `AlterEventTriggerOwner_internal`'s `superuser_arg(newOwnerId)` check,
+  which is about the **target** role's superuser-ness, not the caller's — a
+  session run *as* the bootstrap superuser can still be rejected if it tries
+  to hand ownership to a non-superuser role.
+
+`TestAlterEventTriggerOwnerTo` previously asserted `OWNER TO alice`
+(non-superuser) succeeded — that assertion encoded a real PG semantic gap,
+not a goopg feature to preserve, so it was rewritten to only exercise the
+`CURRENT_USER` (→ OID 10) success case; the alice-target rejection moved to
+its own new test.
+
+### Live PG 18.3 verification
+
+Fresh `initdb`+`pg_ctl` instance (not goopg;
+`postgres/local_install/bin/{initdb,pg_ctl,psql}`,
+`LD_LIBRARY_PATH=postgres/local_install/lib` to work around a libpq/psql
+build-version mismatch in the prebuilt tree). Confirmed all four shapes
+before writing any goopg code:
+
+| SQL | Result |
+|-----|--------|
+| `WHEN TAG IN ('BOGUS TAG')` on `ddl_command_start` | `42601: filter value "BOGUS TAG" not recognized for filter variable "tag"` |
+| `WHEN TAG IN ('VACUUM')` on `ddl_command_start` | `0A000: event triggers are not supported for VACUUM` |
+| `WHEN TAG IN ('BOGUS TAG')` on `table_rewrite` | `0A000: event triggers are not supported for BOGUS TAG` (not 42601) |
+| `WHEN TAG IN ('CREATE TABLE')` on `table_rewrite` | `0A000: event triggers are not supported for CREATE TABLE` |
+| `WHEN TAG IN ('ALTER TABLE')` on `table_rewrite` | succeeds |
+| `WHEN TAG IN ('create table')` (lower-case) | succeeds — case-insensitive |
+| `CREATE EVENT TRIGGER ...` as a non-superuser login role | `42501: permission denied to create event trigger "..."` |
+| `ALTER EVENT TRIGGER ... OWNER TO <non-superuser role>` | `42501: permission denied to change owner of event trigger "..."` |
+
+### Tests
+
+`internal/executor/operators_ddl_event_trigger_test.go`:
+`TestCreateEventTriggerNonSuperuserErrors` (42501 on CREATE as a
+`NonSuperuserRole` session), `TestCreateEventTriggerTagValidation`
+(table-driven, all 8 rows above plus the `sql_drop`-shares-the-ddl-table
+case), `TestAlterEventTriggerOwnerToNonSuperuserErrors` (42501 on `OWNER TO
+alice`, registry left unchanged). `TestAlterEventTriggerOwnerTo` narrowed to
+just the `CURRENT_USER` case (see above).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/planner`+`internal/executor`+`internal/wal`+`internal/initdb`+
+`internal/server` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full
+pre-commit gate incl. pgbench TPC-B smoke PASS.
+
+### Still deferred
+
+Nothing left open on the `CREATE`/`ALTER`/`DROP EVENT TRIGGER` family
+itself. The broader, pre-existing `CREATE FUNCTION` WAL/restart persistence
+gap (discovered in loop #71, out of scope for the event-trigger thread)
+remains open under its own resume point.

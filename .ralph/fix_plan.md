@@ -5097,6 +5097,42 @@ documentation-only and is exempt from the design-doc requirement.)
       PgDumpConnectionSetup` + TPC-H Q12=2/Q13=33 all PASS; pgbench smoke =
       pre-commit hook.
 
+- [x] **Event trigger DDL-tag validation + superuser enforcement
+      (M0119-0004, loop #72).** **COMPLETE 2026-07-02:** closes the loop #69
+      ledger row's other two deferrals — `validate_ddl_tags`/
+      `validate_table_rewrite_tags` command-tag membership checking and
+      `CreateEventTrigger`'s superuser privilege check — the last open
+      thread on the `CREATE`/`ALTER`/`DROP EVENT TRIGGER` family; that
+      ledger row is now `resolved`. New `internal/executor/cmdtag_table.go`
+      is a mechanically-generated (not hand-transcribed) Go map of all 192
+      real PostgreSQL command tags to their `event_trigger_ok`/
+      `table_rewrite_ok` flags (from `postgres/src/include/tcop/
+      cmdtaglist.h`); `validateDDLTags`/`validateTableRewriteTags` reproduce
+      PG's two distinct error shapes (42601 unrecognized vs. 0A000
+      recognized-but-disallowed; table_rewrite has no unknown-tag special
+      case, unlike ddl tags) verified against a real PG 18.3 instance.
+      Superuser enforcement via the existing `Context.NonSuperuserRole`
+      mechanism: `execCreateEventTrigger` now 42501s a non-superuser CREATE
+      (checked first, matching PG's own ordering); `execAlterEventTrigger`'s
+      `"owner"` case now 42501s when the resolved new-owner OID isn't 10
+      (goopg's role model never marks a `CREATE ROLE`'d role superuser),
+      mirroring `AlterEventTriggerOwner_internal`'s target-superuser check —
+      `TestAlterEventTriggerOwnerTo`'s prior `OWNER TO alice` success
+      assertion encoded a real PG gap, not intended behavior, so it was
+      narrowed and the rejection got its own new test. Tests:
+      `TestCreateEventTriggerNonSuperuserErrors`,
+      `TestCreateEventTriggerTagValidation` (8 cases),
+      `TestAlterEventTriggerOwnerToNonSuperuserErrors`. Gates: `go build
+      ./...` clean; `internal/parser`+`internal/catalog`+
+      `internal/planner`+`internal/executor`+`internal/wal`+
+      `internal/initdb`+`internal/server` suites PASS; `TestPort_
+      PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full
+      pre-commit gate incl. pgbench TPC-B smoke PASS. Design doc:
+      `0119-0004-create-operator-roundtrip.md` "Loop #72". Nothing left
+      open on the event-trigger family itself; the broader, unrelated
+      `CREATE FUNCTION` WAL/restart persistence gap (loop #71 discovery)
+      remains open under its own ledger row.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

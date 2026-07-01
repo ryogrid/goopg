@@ -725,11 +725,14 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 // pg_event_trigger registry so it round-trips through pg_dump
 // (getEventTriggers/dumpEventTrigger). goopg never fires event triggers — the
 // semantic validation below mirrors PostgreSQL's CreateEventTrigger
-// (postgres/src/backend/commands/event_trigger.c) only to the extent needed
-// for dump fidelity; goopg does not model the full DDL-command-tag list
-// (validate_ddl_tags/validate_table_rewrite_tags) or the superuser privilege
-// check, both recorded as deferred (see the ledger).
+// (postgres/src/backend/commands/event_trigger.c), including the ordering
+// (superuser check first, then event name, then WHEN-clause validation) and
+// the full DDL-command-tag list (validate_ddl_tags/validate_table_rewrite_tags,
+// commandTagBehavior in cmdtag_table.go).
 func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create event trigger %q", s.Name)}
+	}
 	switch s.Event {
 	case "ddl_command_start", "ddl_command_end", "sql_drop", "login", "table_rewrite":
 	default:
@@ -740,6 +743,16 @@ func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	}
 	if len(s.Tags) > 0 && s.Event == "login" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tag filtering is not supported for login event triggers"}
+	}
+	switch s.Event {
+	case "ddl_command_start", "ddl_command_end", "sql_drop":
+		if err := validateDDLTags(s.Tags, s.Pos()); err != nil {
+			return err
+		}
+	case "table_rewrite":
+		if err := validateTableRewriteTags(s.Tags, s.Pos()); err != nil {
+			return err
+		}
 	}
 	funcOID, ok := resolveEventTriggerFunc(o.ctx.Catalog, s.FuncName)
 	if !ok {
@@ -837,6 +850,13 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 		ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
 		if err != nil {
 			return err
+		}
+		// AlterEventTriggerOwner_internal (event_trigger.c): the new owner
+		// must itself be a superuser. goopg's role model tracks no per-role
+		// rolsuper attribute — OID 10 (bootstrap superuser) is the only
+		// superuser — so this is the closest faithful approximation.
+		if ownerOID != 10 {
+			return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to change owner of event trigger %q", s.Name)}
 		}
 		if err := im.SetEventTriggerOwner(s.Name, ownerOID); err != nil {
 			return notFoundErr(err)
