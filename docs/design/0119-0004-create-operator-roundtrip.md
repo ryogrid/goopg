@@ -1463,3 +1463,62 @@ confirm the exact production before implementing.
   `pg_dump | psql` restore replay for ANY foreign-data-wrapper-family object
   (FDW, SERVER, FOREIGN TABLE, or USER MAPPING) — if one surfaces, that is
   the next concrete resume point for this whole DU-002 slice family.
+
+## Loop #59 — `pg_publication.pubowner` populated (DU-002 slice 422)
+
+The FDW-family thread (loops #54-58) ran dry: no fixture forces the two
+remaining follow-ups (HANDLER/VALIDATOR functions, an FDW-family restore
+replay), so this loop scoped a research pass to find the next divergence
+instead. Live repro against real pg_dump 18.3 (`CREATE PUBLICATION pub1;`
+then `pg_dump --schema-only`) surfaced: `pg_dump: error: role with OID 0 does
+not exist` — **any dump of a database containing a publication crashed pg_dump
+outright**, not a cosmetic per-object diff.
+
+- Root cause: `pg_publication.VirtualRows`
+  (`internal/initdb/replication_views.go`) hardcoded `pubowner` to `""` with
+  the comment "roles aren't OID-stable yet"; `catalog.Publication`
+  (`internal/catalog/pubsub.go`) had no owner field at all. Real pg_dump's
+  `getPublications()` (`postgres/src/bin/pg_dump/pg_dump.c:4446-4495`)
+  unconditionally selects `pubowner` and calls `getRoleName()` on it, which
+  `pg_fatal()`s (`pg_dump.c:10531`) the instant the OID string doesn't parse
+  to a known role — `atooid("")` is 0, and OID 0 is never a real role.
+- Fix: `catalog.Publication` gains an `Owner uint32` field.
+  `PubSub.CreatePublication` (`internal/catalog/pubsub.go`) now sets it to
+  `10` (bootstrap superuser, "postgres") — the same hardcoded-owner
+  convention already used by `CREATE CONVERSION` and `CREATE AGGREGATE`'s
+  zero-value fallback (`OwnerOrDefault`) pending real per-session ownership
+  tracking for DDL objects; no session/role-name plumbing existed at this
+  call site to do better, and none of the sibling hardcoded-owner call sites
+  do either. `pg_publication.VirtualRows` renders `fmt.Sprintf("%d",
+  pub.Owner)` instead of `""` — `getRoleName`'s `atooid()` parses a decimal
+  OID string, matching every other numeric-OID virtual column in this file.
+- Test: extended `TestPort_PgDumpConnectionSetup`
+  (`internal/testport/pgdump_connsetup_test.go`) with `CREATE PUBLICATION
+  goopg_pub1 FOR ALL TABLES` in the setup phase and two new assertions —
+  `CREATE PUBLICATION goopg_pub1 FOR ALL TABLES WITH (publish = 'insert,
+  update, delete');` (goopg's `DefaultPublicationOptions` leaves `truncate`
+  off, M0008-out-of-scope, so it's correctly absent from the WITH-list) and
+  `ALTER PUBLICATION goopg_pub1 OWNER TO postgres;` (the archiver's generic
+  owner-stamping path, `pg_backup_archiver.c` `_printTocEntry` /
+  `_getObjectDescription`, confirmed it supports the `"PUBLICATION"` desc).
+  The surrounding `res.ExitCode == 0` gate is itself part of the regression
+  guard — before this fix pg_dump exited nonzero and the whole assertion
+  block never ran.
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog`+
+  `internal/initdb`+`internal/executor` suites PASS; `TestPort_PgDump
+  ConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; `gofmt -l` shows
+  only pre-existing go1.25-vs-go1.26.3 struct-alignment drift on an unrelated
+  `var (...)` block in `pubsub.go`, none overlapping this loop's new fields
+  ([[goopg_gofmt_version_mismatch_no_w]]); pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): `pg_subscription.subowner`
+  (`internal/initdb/replication_views.go`) has the exact same gap — hardcoded
+  `""`, and real pg_dump's `getSubscriptions()` calls the same
+  `getRoleName()` on it — but no fixture in this test currently issues
+  `CREATE SUBSCRIPTION` (it requires a connection-string target and goopg's
+  subscription DDL semantics differ enough from publication's that it's a
+  separate, not-obviously-one-line investigation), so it's out of this
+  loop's bounded scope. `catalog.Publication.Owner` is also always the
+  bootstrap superuser (10) — a real `CREATE PUBLICATION` issued by a
+  non-superuser role, or a subsequent `ALTER PUBLICATION ... OWNER TO`,
+  isn't tracked (mirrors the same limitation every other hardcoded-owner
+  object in this codebase already has).

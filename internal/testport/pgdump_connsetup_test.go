@@ -4921,6 +4921,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE FOREIGN TABLE public.goopg_ftable (c1 int options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name 'x1')"); err != nil {
 		t.Fatalf("create foreign table: %v", err)
 	}
+	// Slice 422: CREATE PUBLICATION must survive the dump. Before this slice,
+	// `pg_publication.pubowner` (internal/initdb/replication_views.go) was
+	// hardcoded to the empty string ("roles aren't OID-stable yet"). Real
+	// pg_dump's getPublications() always selects pubowner and calls
+	// getRoleName() on it, which pg_fatal()s with "role with OID %u does not
+	// exist" the instant it can't parse a valid OID — so this wasn't a
+	// cosmetic gap, it made pg_dump ABORT ENTIRELY (nonzero exit, nothing
+	// dumped) for any database containing a publication, regardless of what
+	// else the fixture covered. catalog.Publication now carries an Owner
+	// field, set to the bootstrap superuser OID (10) by CreatePublication —
+	// the same hardcoded-owner convention CREATE CONVERSION/other DDL already
+	// use pending real per-session ownership tracking — and the
+	// pg_publication view renders it instead of "". Verified against real
+	// pg_dump 18.3: it emits `CREATE PUBLICATION goopg_pub1 FOR ALL TABLES
+	// WITH (publish = 'insert, update, delete');` (goopg's
+	// DefaultPublicationOptions leaves `truncate` off — M0008-out-of-scope,
+	// so it's correctly absent from the WITH-list) plus an `ALTER PUBLICATION
+	// ... OWNER TO postgres;` follow-up, both asserted below.
+	if err := runSQLSimple(t, c, "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES"); err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
 	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
@@ -10999,6 +11020,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		attFDWOptionsStmt := "ALTER FOREIGN TABLE ONLY public.goopg_ftable ALTER COLUMN c1 OPTIONS (\n    column_name 'col1'\n);"
 		if !strings.Contains(res.Stdout, attFDWOptionsStmt) {
 			t.Errorf("pg_dump dropped the per-column FDW OPTIONS round-trip (slice-418); missing %q\n  full stdout=%q", attFDWOptionsStmt, res.Stdout)
+		}
+		// Slice 422: CREATE PUBLICATION must round-trip, and pg_dump must not
+		// abort. Before this slice pg_publication.pubowner was always "" and
+		// pg_dump's getRoleName() pg_fatal()'d on it — a regression here would
+		// make pg_dump exit nonzero and this whole `res.ExitCode == 0` block
+		// would never even run, so the surrounding exit-0 gate is itself part
+		// of the regression guard.
+		pubStmt := "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES WITH (publish = 'insert, update, delete');"
+		if !strings.Contains(res.Stdout, pubStmt) {
+			t.Errorf("pg_dump dropped the CREATE PUBLICATION round-trip (slice-422); missing %q\n  full stdout=%q", pubStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER PUBLICATION goopg_pub1 OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the ALTER PUBLICATION OWNER TO (slice-422, pubowner resolution); full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

@@ -13,8 +13,18 @@ import (
 // surprises. See
 // docs/design/0008-0003-publication-subscription-ddl.md.
 type Publication struct {
-	Name          string
-	OID           uint32
+	Name string
+	OID  uint32
+	// Owner is the owning role's OID (pg_publication.pubowner). Real
+	// pg_dump's getPublications() (pg_dump.c) always selects this column
+	// and calls getRoleName() on it, which pg_fatal()s with "role with
+	// OID %u does not exist" if the OID doesn't resolve — so an unset
+	// (zero) Owner isn't a cosmetic gap, it makes pg_dump abort outright
+	// on any database containing a publication. CreatePublication always
+	// sets this to the bootstrap superuser OID (10), mirroring the
+	// hardcoded-owner convention used by CREATE CONVERSION/other DDL that
+	// doesn't yet track per-session ownership. DU-002 slice 422.
+	Owner         uint32
 	AllTables     bool
 	PublishInsert bool
 	PublishUpdate bool
@@ -152,6 +162,7 @@ func (p *PubSub) CreatePublication(name string, tables []string, opts Publicatio
 	pub := &Publication{
 		Name:          name,
 		OID:           p.nextOID,
+		Owner:         10, // bootstrap superuser (postgres); getRoleName(10) → "postgres"
 		AllTables:     opts.AllTables,
 		PublishInsert: opts.PublishInsert,
 		PublishUpdate: opts.PublishUpdate,

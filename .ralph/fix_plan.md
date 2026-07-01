@@ -4680,6 +4680,39 @@ documentation-only and is exempt from the design-doc requirement.)
       tracks no FDW handler/validator functions at all, unchanged); no
       fixture exercises a goopg-to-goopg `pg_dump | psql` restore replay for
       any FDW-family object (FDW, SERVER, FOREIGN TABLE, USER MAPPING).
+      **2026-07-02 (loop #59, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #59"): `pg_publication.pubowner` populated LANDED — DU-002 slice
+      422.** The FDW-family thread ran dry (no forcing fixture for the
+      remaining follow-ups), so this loop researched the next divergence:
+      real pg_dump 18.3 `pg_fatal()`s outright ("role with OID 0 does not
+      exist") on ANY database containing a publication, because
+      `pg_publication.VirtualRows` (`internal/initdb/replication_views.go`)
+      hardcoded `pubowner` to `""` and `catalog.Publication`
+      (`internal/catalog/pubsub.go`) had no owner field — not a cosmetic
+      diff, a total dump abort. New `Publication.Owner uint32`, set to the
+      bootstrap superuser OID (10) by `PubSub.CreatePublication` (same
+      hardcoded-owner convention as `CREATE CONVERSION`/`CREATE AGGREGATE`'s
+      `OwnerOrDefault` fallback, pending real per-session ownership
+      tracking); the view renders `fmt.Sprintf("%d", pub.Owner)` instead of
+      `""`. `TestPort_PgDumpConnectionSetup` extended with `CREATE
+      PUBLICATION goopg_pub1 FOR ALL TABLES` plus assertions for `CREATE
+      PUBLICATION goopg_pub1 FOR ALL TABLES WITH (publish = 'insert, update,
+      delete');` and `ALTER PUBLICATION goopg_pub1 OWNER TO postgres;`
+      (verified against real pg_dump 18.3 semantics: `_getObjectDescription`
+      supports the `"PUBLICATION"` desc, so the archiver's generic
+      owner-stamping path fires). Gates: `go build ./...`/`go vet ./...`
+      clean; `internal/catalog`+`internal/initdb`+`internal/executor` suites
+      PASS; `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; `gofmt -l` clean on new fields (pre-existing
+      go1.25-vs-go1.26.3 drift on an unrelated `var (...)` block in
+      `pubsub.go` only, [[goopg_gofmt_version_mismatch_no_w]]); pgbench
+      smoke = pre-commit hook. Deferred (ledger row appended):
+      `pg_subscription.subowner` has the identical gap (hardcoded `""`,
+      same `getRoleName()` crash risk) but no fixture yet issues `CREATE
+      SUBSCRIPTION`; also, `catalog.Publication.Owner` is always the
+      bootstrap superuser — a non-superuser-created publication or an
+      `ALTER PUBLICATION ... OWNER TO` isn't tracked (same limitation every
+      other hardcoded-owner object already has).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

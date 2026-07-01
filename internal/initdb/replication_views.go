@@ -365,7 +365,7 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			out = append(out, []string{
 				fmt.Sprintf("%d", pub.OID),
 				pub.Name,
-				"", // pubowner: roles aren't OID-stable yet
+				fmt.Sprintf("%d", pub.Owner), // pubowner
 				boolText(pub.AllTables),
 				boolText(pub.PublishInsert),
 				boolText(pub.PublishUpdate),
