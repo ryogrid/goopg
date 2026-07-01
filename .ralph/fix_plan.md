@@ -24,9 +24,11 @@ Priority banner below or a dependency forces another order**.
 ## Current Priority (per 2026-06-20 directive)
 
 Work order: **M0117 → M0118**, then resume **M0110** (paused), with **M0095**
-parked. **M0118 is currently in progress.** M0117's remaining sub-tasks are all
-deferred Effort-L parts (need dedicated full-gate sessions — see each entry +
-the deferral ledger).
+parked. **M0118 is now fully complete (0001–0009 all `[x]`, closed 2026-07-01
+loop #44 — see M0118-0004).** M0117's remaining sub-tasks are all deferred
+Effort-L parts (need dedicated full-gate sessions — see each entry + the
+deferral ledger). **M0110 is next up** (its M0119-0004/0005/0006/0007 spinoffs
+are the active, in-progress form of that work).
 
 Policy for **M0117 & M0118**: fix blockers in place; do NOT defer unless
 genuinely compelling (then record a ledger row). Commit + push at every clean,
@@ -405,7 +407,7 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       byte-match PG 18.3 (single `go test` over the family `ok` in ~83 s, strict),
       no engine change. **All 20 M0118-0003 row-lock specs are now strict — none can
       regress silently.**
-- [ ] **M0118-0004** — Deadlock detection: deadlock-{hard,simple,soft,soft-2,parallel},
+- [x] **M0118-0004** — Deadlock detection: deadlock-{hard,simple,soft,soft-2,parallel},
       multixact-no-deadlock. **Done so far:** `deadlock-simple` (slice 16, design
       0118-0004) + `deadlock-hard` (general timeout-driven multi-object detector,
       `deadlock_timeout` GUC + per-session lockmgr timeout + firing-backend victim +
@@ -497,6 +499,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       regenerated. **Still deferred:** UPDATE/DELETE conflict-wait-on-a-conflicting-
       locker (independent slice, ledger'd).
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
+      **2026-07-01 (loop #44, doc-only, no design doc): CLOSED — every spec named
+      in this item's own title is resolved.** `deadlock-{hard,simple,soft,soft-2}`
+      + `multixact-no-deadlock` + `tuplelock-upgrade-no-deadlock` all `pass`
+      (CSV-verified above). `deadlock-parallel` stays `failed` in
+      `postgres-oracle-target-inventory.csv` — infeasible without a parallel-query
+      lock-group abstraction goopg does not have; already tracked with no
+      actionable backlog under **M0119-0008** (2026-06-29 triage), so it carries
+      no ledger row of its own here either. The one loose end this item's own
+      narrative left open — "UPDATE/DELETE conflict-wait-on-a-conflicting-locker"
+      (the producer only *preserves* a non-conflicting locker into a
+      `{updater+survivors}` MultiXactId; it never makes the writer *wait* on a
+      still-active *conflicting* one) — does not block any spec's pass/fail today
+      (pre-existing behaviour, no regression per the 0118-0012 ledger row), so it
+      is promoted to its own open ledger row (**M0119-0009**, appended this loop)
+      rather than continuing to gate this checkbox. M0118 is now fully complete
+      (0001–0009 all `[x]`); per the Current Priority banner, next milestone up is
+      M0110.
 - [x] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity. **PARTIAL (2026-06-22, design 0118-0023):** five
