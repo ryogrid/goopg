@@ -4899,6 +4899,60 @@ documentation-only and is exempt from the design-doc requirement.)
       Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Still open
       (unchanged): PubSub restart persistence; the `DBOID()`-vs-`FirstUserOID`
       split (loop #60).
+      **2026-07-02 (loop #68, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #68"): `PubSub` WAL/restart persistence LANDED.** Closes the
+      loop #67 row's own "PubSub restart persistence" resume point. New WAL
+      record kinds 50-55 (`RecordKindCreatePublication`/`DropPublication`/
+      `AlterPublicationOwner`/`CreateSubscription`/`DropSubscription`/
+      `AlterSubscriptionOwner`, `internal/wal/recovery.go`) with matching
+      `Encode.../Decode...` pairs, mirroring `EncodeCreateCollation`'s
+      length-prefixed-string format (publication's `Tables`/subscription's
+      `Publications` list use the same 2-byte-count-then-length-prefixed-
+      strings shape `EncodeCreateAggregate` uses for `argTypes`). Physical
+      redo is a no-op for all six (goopg has no per-publication/subscription
+      file namespace) — a new `internal/initdb/pubsub_ddl_recovery.go`
+      (`replayPubSubDDLRecords`) scans the WAL after physical replay and
+      reapplies each record to `catalog.PubSub` via 6 new recovery mutators
+      (`Create{Publication,Subscription}DuringRecovery`,
+      `Drop{Publication,Subscription}DuringRecovery`,
+      `Set{Publication,Subscription}OwnerDuringRecovery`,
+      `internal/catalog/pubsub.go`) that overwrite-by-name (PubSub is
+      already name-keyed, unlike collation's OID-keyed-slice) and bump
+      `nextOID` past the recovered OID. Unlike the collation/aggregate
+      recovery drivers, `replayPubSubDDLRecords` takes the concrete
+      `*catalog.PubSub` directly instead of `catalog.Catalog` +
+      interface-assertion — PubSub has exactly one implementation, so the
+      indirection those drivers need (multiple `Catalog` implementations in
+      tests) doesn't apply here. Wired in `internal/initdb/open.go`
+      immediately after `pubsub := catalog.NewPubSub()` (before the view
+      registrations); no ordering dependency on schema replay since PubSub
+      isn't schema-scoped. `internal/executor/operators_ddl.go`'s
+      `execCreatePublication`/`execCreateSubscription` now capture the
+      previously-discarded `*Publication`/`*Subscription` return value and
+      WAL-append the create record when `o.ctx.WAL != nil`;
+      `execDropPublication`/`execDropSubscription`/
+      `execAlterPublicationOwner`/`execAlterSubscriptionOwner` append their
+      matching record after a successful catalog mutation (skipped on the
+      `IF EXISTS` not-found no-op path, matching every other DROP's
+      WAL-skip-on-noop convention). Tests: `internal/wal/pubsub_ddl_test.go`
+      (`TestEncodeDecode{Create,Drop}{Publication,Subscription}RoundTrip` +
+      2 `AlterOwner` round-trip tests + a combined wrong-kind/truncated-
+      payload guard across all 6 kinds) and
+      `internal/initdb/pubsub_ddl_recovery_test.go` (8 tests: real
+      `Init`→`Open`→`WAL.Append`→`Close`→re-`Open` round trips for
+      CREATE/CREATE+DROP/CREATE+ALTER-OWNER on both publication and
+      subscription, plus the missing-WAL-dir/nil-PubSub no-op guards).
+      Gates: `go build ./...` clean; `go test -race -count=1
+      ./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+      `internal/catalog`+`internal/initdb`+`internal/executor`+
+      `internal/parser`+`internal/planner`+`internal/server` suites PASS;
+      `TestE2E_PhysicalReplication` PASS; `TestPort_PgDumpConnectionSetup`
+      PASS (no regression to the DU-002 connsetup slice); TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Box stays
+      unchecked: the `DBOID()`-vs-`FirstUserOID` split (loop #60) remains
+      open; `SubscriptionRel` (tablesync state) rows still have no WAL
+      persistence (no forcing fixture — runtime apply-worker state, not a
+      `pg_dump`-visible catalog row).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

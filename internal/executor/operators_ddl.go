@@ -572,8 +572,19 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 		}
 		tables = append(tables, tbl.QualifiedName())
 	}
-	if _, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID()); err != nil {
+	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID())
+	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #67 ledger
+	// resume point): goopg has no per-publication on-disk file namespace,
+	// so record a WAL event the recovery driver
+	// (internal/initdb/pubsub_ddl_recovery.go) replays into the PubSub
+	// registry on the next startup. Mirrors CREATE COLLATION.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreatePublication(pub.Name, pub.Tables, pub.OID, pub.Owner, pub.AllTables, pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete)); werr != nil {
+			return fmt.Errorf("wal create-publication: %w", werr)
+		}
 	}
 	return nil
 }
@@ -588,6 +599,11 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropPublication(s.Name)); werr != nil {
+			return fmt.Errorf("wal drop-publication: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -600,8 +616,14 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
 	}
 	slotName := s.With["slot_name"]
-	if _, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID()); err != nil {
+	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID())
+	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSubscription(sub.Name, sub.Conninfo, sub.SlotName, sub.Publications, sub.OID, sub.Owner, sub.Enabled)); werr != nil {
+			return fmt.Errorf("wal create-subscription: %w", werr)
+		}
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -618,6 +640,11 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSubscription(s.Name)); werr != nil {
+			return fmt.Errorf("wal drop-subscription: %w", werr)
+		}
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -647,8 +674,8 @@ func (o *ddlOp) resolveNewOwnerOID(newOwner string, pos int) (uint32, error) {
 // M0119-0004 (DU-002, loop #65 ledger follow-up: closes the loop #60/#63/#64/
 // #65 rows' "ALTER PUBLICATION/SUBSCRIPTION ... OWNER TO are still
 // unimplemented" resume point). Like CREATE/DROP PUBLICATION, the ownership
-// change is in-memory-only — PubSub has no WAL/restart persistence yet (a
-// pre-existing, separately-tracked gap; see the ledger).
+// change is now WAL-logged (loop #67 ledger resume point) so it survives a
+// restart.
 func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) error {
 	if o.ctx.PubSub == nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
@@ -659,6 +686,11 @@ func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) e
 	}
 	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterPublicationOwner(s.Name, ownerOID)); werr != nil {
+			return fmt.Errorf("wal alter-publication-owner: %w", werr)
+		}
 	}
 	return nil
 }
@@ -676,6 +708,11 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 	}
 	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSubscriptionOwner(s.Name, ownerOID)); werr != nil {
+			return fmt.Errorf("wal alter-subscription-owner: %w", werr)
+		}
 	}
 	return nil
 }

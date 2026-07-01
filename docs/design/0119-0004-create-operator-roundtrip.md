@@ -2023,3 +2023,113 @@ publication/subscription (and now its `OWNER TO` change) vanishes on
 restart, same pre-existing gap `CREATE`/`DROP PUBLICATION`/`SUBSCRIPTION`
 have always had; this loop doesn't reopen it, just inherits it. The
 `DBOID()`-vs-`FirstUserOID` split (loop #60) remains open, untouched.
+
+## Loop #68: `PubSub` WAL/restart persistence (CREATE/DROP/ALTER OWNER TO)
+
+Closes the loop #67 row's own deferral: `catalog.PubSub` had zero WAL/restart
+persistence, so every `CREATE PUBLICATION`/`CREATE SUBSCRIPTION` (and any
+subsequent `DROP`/`ALTER ... OWNER TO`) vanished on the next server restart.
+Mirrors the CREATE/DROP/ALTER COLLATION restart-persistence pattern (loop
+#48/#50): a new WAL record family per DDL verb + a post-physical-replay
+recovery driver that re-applies each record to the in-memory registry.
+
+### Why PubSub gets its own recovery driver, not an interface
+
+Every other DU-002 restart-persistence driver (`collation_ddl_recovery.go`,
+`aggregate_ddl_recovery.go`, ...) takes `cat catalog.Catalog` and type-asserts
+to a small interface (`collationRegistryRecovery`, ...), because `catalog.Catalog`
+is an interface with more than one implementation in tests. `catalog.PubSub`
+has exactly one implementation — it's a concrete struct
+(`internal/executor/context.go`'s `Context.PubSub *catalog.PubSub`), not part
+of the `Catalog` interface at all — so `replayPubSubDDLRecords` in the new
+`internal/initdb/pubsub_ddl_recovery.go` takes `*catalog.PubSub` directly and
+calls its new `...DuringRecovery` methods without an interface indirection.
+
+### New WAL record kinds (50-55)
+
+`internal/wal/recovery.go`: `RecordKindCreatePublication` (50),
+`RecordKindDropPublication` (51), `RecordKindAlterPublicationOwner` (52),
+`RecordKindCreateSubscription` (53), `RecordKindDropSubscription` (54),
+`RecordKindAlterSubscriptionOwner` (55) — the next free byte values after
+`RecordKindAlterAggregateOwner` (49). Like collation/aggregate, these have no
+per-object on-disk file namespace, so `applyRecord`'s physical redo path is a
+no-op (`return false, nil`) for all six; only the recovery driver interprets
+them. `EncodeCreatePublication`/`DecodeCreatePublication` carry the OID,
+owner OID, the four `Publication` boolean flags packed into one byte, the
+name, and the qualified-table-name list (2-byte count + length-prefixed
+strings, same shape `EncodeCreateAggregate` uses for `argTypes`).
+`EncodeCreateSubscription`/`DecodeCreateSubscription` mirror this for
+`Subscription` (conninfo, slot name, enabled flag, publications list).
+`EncodeDropPublication`/`EncodeAlterPublicationOwner` and their subscription
+counterparts are single-name (+ ownerOID for the OWNER TO case) records,
+copied verbatim from `EncodeDropCollation`/`EncodeAlterCollationOwner`'s
+shape.
+
+### Recovery mutators (`internal/catalog/pubsub.go`)
+
+`CreatePublicationDuringRecovery`/`CreateSubscriptionDuringRecovery` take the
+full `*Publication`/`*Subscription` struct decoded from the WAL record
+(preserving the pre-crash OID) and unconditionally overwrite the map entry
+keyed by name, bumping `nextOID` past the recovered OID so a subsequent
+`CREATE` after restart doesn't collide. Unlike collation's
+OID-keyed-slice overwrite-by-OID logic, `PubSub.publications`/`subscriptions`
+are already keyed by name, so overwriting by name is sufficient — a replay
+that sees the same CREATE record twice (partial-then-full replay) just
+re-writes the identical entry. `Drop...DuringRecovery`/
+`Set...OwnerDuringRecovery` are thin discard-result wrappers around the
+existing `DropPublication`/`SetPublicationOwner` (and subscription
+counterparts), mirroring `DropCollationDuringRecovery`'s
+"replay doesn't care whether the object was still present" tolerance.
+
+### Wiring
+
+- **`internal/executor/operators_ddl.go`**: `execCreatePublication`/
+  `execCreateSubscription` now capture the `*Publication`/`*Subscription`
+  the `...AsOwner` call returns (previously discarded) and, when
+  `o.ctx.WAL != nil`, append the matching `Encode...` record.
+  `execDropPublication`/`execDropSubscription` append their drop record
+  after a successful `PubSub.Drop...` call (skipped on the `IF EXISTS`
+  not-found path, matching every other DROP's WAL-skip-on-noop convention).
+  `execAlterPublicationOwner`/`execAlterSubscriptionOwner` append their owner
+  record after a successful `PubSub.Set...Owner` call — this closes the
+  loop #65/#67 comments' explicit "ownership change is in-memory-only"
+  caveat, now stale and updated in place.
+- **`internal/initdb/open.go`**: `replayPubSubDDLRecords(filepath.Join(abs,
+  "pg_wal"), pubsub)` runs immediately after `pubsub := catalog.NewPubSub()`
+  and before `registerPublicationViews`/`registerSubscriptionViews` wire the
+  virtual-view accessors against it. `PubSub` is not schema-scoped (keyed by
+  name only, like a cast/transform, not like collation/conversion's
+  namespace-OID key), so — unlike the collation/conversion/aggregate
+  replay calls above it in `Open` — this one has no ordering dependency on
+  `replaySchemaDDLRecords`.
+
+### Tests
+
+- **`internal/wal/pubsub_ddl_test.go`**: `TestEncodeDecode{Create,Drop}{Publication,Subscription}RoundTrip`
+  + the two `AlterOwner` round-trip tests + `TestDecodePubSubRejectsWrongKindAndTruncatedPayload`
+  (wrong-kind-byte and truncated-payload guards across all six record kinds),
+  mirroring `collation_ddl_test.go`'s structure.
+- **`internal/initdb/pubsub_ddl_recovery_test.go`**: full `Init`→`Open`→
+  `WAL.Append`→`Close`→re-`Open` round trips (real data dir, real WAL
+  flush+replay, no mocking) for CREATE PUBLICATION, CREATE+DROP PUBLICATION
+  (drop cancels create), CREATE+ALTER-OWNER PUBLICATION (OID survives the
+  owner change), and the three subscription analogues, plus
+  `TestReplayPubSubDDLRecordsHandlesMissingWalDir`/`...NilPubSub` for the
+  fresh-initdb / embedded-test-setup no-op paths. Mirrors
+  `collation_ddl_recovery_test.go`'s structure exactly.
+
+### Gates
+
+`go build ./...` clean; `go test -race -count=1 ./internal/wal/...
+./internal/mvcc/...` PASS (WAL-format-adjacent change); `internal/wal`+
+`internal/catalog`+`internal/initdb`+`internal/executor`+`internal/parser`+
+`internal/planner`+`internal/server` suites PASS; TPC-H spotcheck
+Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+
+### Still open (unchanged)
+
+The `DBOID()`-vs-`FirstUserOID` split (loop #60 row) remains open, untouched
+by this loop. `SubscriptionRel` (tablesync state) rows still have no WAL
+persistence either — out of scope for this slice (no pg_dump TAP fixture
+exercises tablesync state across a restart; it's runtime apply-worker state,
+not a `pg_dump`-visible catalog row).

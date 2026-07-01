@@ -240,6 +240,43 @@ func (p *PubSub) LookupPublication(name string) (*Publication, bool) {
 	return &out, true
 }
 
+// CreatePublicationDuringRecovery is the idempotent version of
+// CreatePublicationAsOwner used by the WAL-replay driver
+// (internal/initdb/pubsub_ddl_recovery.go). Unlike CreatePublicationAsOwner
+// it takes the OID from the WAL record (so the recovered publication
+// matches the pre-crash OID exactly) and overwrites rather than erroring
+// when a publication with the same name is already present (replay may see
+// the same record more than once across a partial-then-full replay).
+// Mirrors catalog.InMemory.CreateCollationDuringRecovery. DU-002
+// restart-persistence follow-up (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) CreatePublicationDuringRecovery(pub *Publication) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	p.publications[pub.Name] = &out
+	if pub.OID >= p.nextOID {
+		p.nextOID = pub.OID + 1
+	}
+}
+
+// DropPublicationDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropPublication. Identical to DropPublication but
+// discards the found/not-found result — replay does not care whether the
+// publication was still present. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) DropPublicationDuringRecovery(name string) {
+	_ = p.DropPublication(name)
+}
+
+// SetPublicationOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetPublicationOwner, mirroring
+// DropPublicationDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) SetPublicationOwnerDuringRecovery(name string, owner uint32) {
+	_ = p.SetPublicationOwner(name, owner)
+}
+
 // Publications returns every publication in name order. Each
 // entry is a deep copy.
 func (p *PubSub) Publications() []*Publication {
@@ -337,6 +374,39 @@ func (p *PubSub) LookupSubscription(name string) (*Subscription, bool) {
 	out := *sub
 	out.Publications = append([]string(nil), sub.Publications...)
 	return &out, true
+}
+
+// CreateSubscriptionDuringRecovery is the idempotent version of
+// CreateSubscriptionAsOwner used by the WAL-replay driver
+// (internal/initdb/pubsub_ddl_recovery.go). Mirrors
+// CreatePublicationDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) CreateSubscriptionDuringRecovery(sub *Subscription) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := *sub
+	out.Publications = append([]string(nil), sub.Publications...)
+	p.subscriptions[sub.Name] = &out
+	if sub.OID >= p.nextOID {
+		p.nextOID = sub.OID + 1
+	}
+}
+
+// DropSubscriptionDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropSubscription. Mirrors
+// DropPublicationDuringRecovery — also clears any tablesync rows for the
+// name, matching DropSubscription. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) DropSubscriptionDuringRecovery(name string) {
+	_ = p.DropSubscription(name)
+}
+
+// SetSubscriptionOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetSubscriptionOwner, mirroring
+// SetPublicationOwnerDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) SetSubscriptionOwnerDuringRecovery(name string, owner uint32) {
+	_ = p.SetSubscriptionOwner(name, owner)
 }
 
 // Subscriptions returns every subscription in name order. Each
