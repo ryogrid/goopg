@@ -7176,6 +7176,49 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableAlterColumnOptions:
+			// ALTER FOREIGN TABLE ... ALTER COLUMN col OPTIONS ( [ADD|SET|DROP]
+			// name ['value'], … ) — merge the verb-tagged option list onto
+			// pg_attribute.attfdwoptions, mirroring PG's
+			// ATExecAlterColumnGenericOptions -> transformGenericOptions
+			// (commands/foreigncmds.c): ADD/bare errors 42710 if the option
+			// already exists, SET/DROP each error 42704 if it does not. Only
+			// meaningful on a foreign table (relkind='f'); a plain table errors
+			// 42809, mirroring real PG's "... is not a foreign table". Like the
+			// sibling attoptions/attfdwoptions cases above, the in-memory
+			// mutation alone is invisible to pg_dump until flushed through the
+			// same delete-old-rows + re-sync path. DU-002 slice 419.
+			if tbl.ForeignServerName == "" {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%q is not a foreign table", tbl.Name)}
+			}
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					merged, mergeErr := applyFDWOptionChanges(tbl.Columns[i].FDWOptions, act.FDWOptionChanges)
+					if mergeErr != nil {
+						return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+					}
+					tbl.Columns[i].FDWOptions = merged
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableSetDefault:
 			// SET DEFAULT expr — record the parsed DEFAULT on the catalog column
 			// AND rewrite the pg_attribute heap row so pg_dump observes
@@ -10944,6 +10987,57 @@ func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
 		}
 	}
 	return catalog.PGCatalogNamespaceOID
+}
+
+// fdwOptionMergeError carries the SQLSTATE for a failed ADD/SET/DROP merge in
+// applyFDWOptionChanges, so the caller can wrap it in an *ExecError with the
+// statement's position.
+type fdwOptionMergeError struct {
+	code    string
+	message string
+}
+
+func (e *fdwOptionMergeError) Error() string { return e.message }
+
+// applyFDWOptionChanges merges a verb-tagged ALTER FOREIGN TABLE ... ALTER
+// COLUMN ... OPTIONS (...) change list onto an existing "name=value"
+// pg_attribute.attfdwoptions option slice, mirroring PostgreSQL's
+// transformGenericOptions (commands/foreigncmds.c): ADD (and the bare/
+// unspecified form, already normalized to Add by the parser) errors 42710
+// duplicate_object if the option already exists; SET and DROP each error
+// 42704 undefined_object if it does not. DU-002 slice 419.
+func applyFDWOptionChanges(existing []string, changes []parser.FDWOptionChange) ([]string, *fdwOptionMergeError) {
+	result := append([]string(nil), existing...)
+	indexOf := func(name string) int {
+		prefix := name + "="
+		for i, kv := range result {
+			if kv == name || strings.HasPrefix(kv, prefix) {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, ch := range changes {
+		idx := indexOf(ch.Name)
+		switch ch.Verb {
+		case parser.FDWOptionDrop:
+			if idx < 0 {
+				return nil, &fdwOptionMergeError{code: "42704", message: fmt.Sprintf("option %q not found", ch.Name)}
+			}
+			result = append(result[:idx], result[idx+1:]...)
+		case parser.FDWOptionSet:
+			if idx < 0 {
+				return nil, &fdwOptionMergeError{code: "42704", message: fmt.Sprintf("option %q not found", ch.Name)}
+			}
+			result[idx] = ch.Name + "=" + ch.Value
+		default: // parser.FDWOptionAdd
+			if idx >= 0 {
+				return nil, &fdwOptionMergeError{code: "42710", message: fmt.Sprintf("option %q provided more than once", ch.Name)}
+			}
+			result = append(result, ch.Name+"="+ch.Value)
+		}
+	}
+	return result, nil
 }
 
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per

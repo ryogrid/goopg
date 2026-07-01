@@ -1010,6 +1010,54 @@ func TestParseColumnDefFDWOptions(t *testing.T) {
 	}
 }
 
+// TestParseAlterForeignTableAlterColumnOptions verifies that
+// `ALTER FOREIGN TABLE ... ALTER COLUMN col OPTIONS ([ADD|SET|DROP] name
+// ['value'], …)` parses into an AlterTableAlterColumnOptions action carrying
+// the verb-tagged option list (a bare `name 'value'` defaults to Add,
+// matching PG's DEFELEM_UNSPEC-as-ADD rule). Closes the loop #55
+// deferral-ledger resume point: pg_dump now *emits* this statement (the
+// attfdwoptions round-trip, DU-002 slice 418) but goopg previously could not
+// parse it back (no FOREIGN lookahead before the ALTER TABLE dispatch).
+// DU-002 slice 419.
+func TestParseAlterForeignTableAlterColumnOptions(t *testing.T) {
+	sql := `ALTER FOREIGN TABLE ONLY t ALTER COLUMN c OPTIONS (ADD opt1 'v1', SET opt2 'v2', DROP opt3, bare 'v4')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmts[0])
+	}
+	if at.Name.Name != "t" {
+		t.Errorf("Name=%q, want %q", at.Name.Name, "t")
+	}
+	if len(at.Actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(at.Actions))
+	}
+	act := at.Actions[0]
+	if act.Kind != AlterTableAlterColumnOptions {
+		t.Fatalf("Kind=%v, want AlterTableAlterColumnOptions", act.Kind)
+	}
+	if act.ColumnName != "c" {
+		t.Errorf("ColumnName=%q, want %q", act.ColumnName, "c")
+	}
+	want := []FDWOptionChange{
+		{Verb: FDWOptionAdd, Name: "opt1", Value: "v1"},
+		{Verb: FDWOptionSet, Name: "opt2", Value: "v2"},
+		{Verb: FDWOptionDrop, Name: "opt3"},
+		{Verb: FDWOptionAdd, Name: "bare", Value: "v4"},
+	}
+	if len(act.FDWOptionChanges) != len(want) {
+		t.Fatalf("FDWOptionChanges=%+v, want %+v", act.FDWOptionChanges, want)
+	}
+	for i, w := range want {
+		if act.FDWOptionChanges[i] != w {
+			t.Errorf("FDWOptionChanges[%d]=%+v, want %+v", i, act.FDWOptionChanges[i], w)
+		}
+	}
+}
+
 // TestParseColumnDefCollation verifies that an inline `COLLATE <name>` clause is
 // captured onto ColumnDef.Collation (bare trailing component, unquoted) so the
 // column round-trips through pg_dump. Covers the quoted form (`"C"`), the

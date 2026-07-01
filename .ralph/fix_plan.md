@@ -4574,6 +4574,42 @@ documentation-only and is exempt from the design-doc requirement.)
       `FOREIGN` lookahead before `ALTER TABLE` dispatch) — a goopg-to-goopg
       restore replay of a foreign table with column options would fail; no
       fixture in scope exercises that path yet.
+      **2026-07-02 (loop #56, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #56", DU-002 slice 419): `ALTER FOREIGN TABLE ... ALTER COLUMN
+      col OPTIONS ([ADD|SET|DROP] name ['value'], …)` parsing+execution
+      LANDED — closes the loop #55 resume point.** `parseAlter`
+      (`internal/parser/ddl.go`) gains a `FOREIGN` lookahead (consumed only
+      when `TABLE` follows) right before the `KwTable` expect, so
+      `ALTER FOREIGN TABLE` now shares the plain `ALTER TABLE` grammar
+      (IF EXISTS/ONLY/name/ALTER COLUMN); the existing `ALTER COLUMN` block
+      gained an `OPTIONS (...)` case using a new `scanAlterFDWOptionsList`
+      (verb-tagged sibling of `scanFDWOptionsList`; bare `name 'value'`
+      defaults to Add) producing `[]parser.FDWOptionChange` on a new
+      `AlterTableAlterColumnOptions` action kind. `execAlterTable`'s new case
+      (`internal/executor/operators_ddl.go`) gates on
+      `tbl.ForeignServerName != ""` (42809 otherwise), locates the column
+      (42703 if absent), and merges via new `applyFDWOptionChanges` onto
+      `catalog.Column.FDWOptions` exactly like PG's `transformGenericOptions`
+      (`postgres/src/backend/commands/foreigncmds.c:120-206`, read directly
+      from the upstream source this loop): ADD/bare errors 42710 if the
+      option already exists, SET/DROP each error 42704 if it does not; then
+      re-syncs pg_attribute via the same `syncTableToCatalogHeap` path
+      `AlterTableSetCompression` uses. New tests
+      `TestParseAlterForeignTableAlterColumnOptions` (parser) +
+      `TestAlterForeignTableAlterColumnOptionsRoundtrip`/
+      `TestAlterForeignTableAlterColumnOptionsErrors` (executor, full
+      CREATE SERVER → CREATE FOREIGN TABLE → ALTER FOREIGN TABLE ADD/SET/DROP
+      sequence plus all 4 SQLSTATEs). Gates: `go build`/`go vet` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (`-count=1`); `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; `gofmt -l` clean on every touched/new file; pgbench
+      smoke = pre-commit hook. Deferred (ledger row appended): table-level
+      `ALTER FOREIGN TABLE <t> OPTIONS (...)` (PG's `AT_GenericOptions`,
+      setting `pg_foreign_table.ftoptions` — distinct from the per-column
+      form landed here) remains unmodeled; `ALTER FOREIGN DATA WRAPPER`
+      (a structurally different, TABLE-keyword-less statement) remains
+      entirely unparseable; no fixture pipes a literal `pg_dump | psql`
+      goopg-to-goopg restore of a foreign table.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

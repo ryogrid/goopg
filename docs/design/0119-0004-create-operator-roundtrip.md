@@ -1249,3 +1249,76 @@ always returned zero rows.
   exercises a goopg-to-goopg restore, so this was out of this loop's scope;
   `CREATE SERVER`'s `srvtype`/`srvversion` and real FDW-handler execution
   remain out of scope as noted at loop #54.
+
+## Loop #56 — `ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS (...)` parsing+execution (DU-002 slice 419)
+
+Closes the loop #55 resume point: pg_dump now *emits*
+`ALTER FOREIGN TABLE ONLY <t> ALTER COLUMN <c> OPTIONS (...)` (slice 418), but
+`parseAlter` dispatched straight to `p.expectKeyword(KwTable)` with no
+`FOREIGN` lookahead, so goopg could not parse its own pg_dump output back —
+the same failure a goopg-to-goopg schema restore of a foreign table with
+column options would hit.
+
+- Parser: `parseAlter` (`internal/parser/ddl.go`) gains a `FOREIGN` lookahead
+  right before the `KwTable` expect, consumed only when `TABLE` follows —
+  `ALTER FOREIGN DATA WRAPPER` (a structurally different, `TABLE`-keyword-less
+  statement, already unmodeled) falls through unchanged to raise its
+  pre-existing syntax error. Consuming `FOREIGN` here lets the rest of the
+  function — `IF EXISTS`/`ONLY`/name/`ALTER COLUMN` — apply exactly as it
+  does for a plain `ALTER TABLE`, so no new statement type or duplicate
+  grammar was needed.
+- Parser: the existing `ALTER COLUMN` block gained an `OPTIONS (...)` case
+  (checked immediately after the column-name capture, before the `SET`/`TYPE`/
+  `DROP` arms — PG's grammar has no leading `SET` for this form:
+  `ALTER opt_column ColId alter_generic_options`, gram.y). It calls a new
+  `scanAlterFDWOptionsList` (`internal/parser/ddl.go`), a verb-tagged sibling
+  of `scanFDWOptionsList`: each entry is tagged `FDWOptionAdd`/`FDWOptionSet`/
+  `FDWOptionDrop` from an optional `ADD`/`SET`/`DROP` keyword prefix, with a
+  bare `name 'value'` defaulting to Add (mirrors PG's `DEFELEM_UNSPEC`-as-ADD
+  rule in `alter_generic_option_elem`, gram.y). `DROP` takes no value, matching
+  `DROP generic_option_name` (no `generic_option_arg`). New AST types
+  `FDWOptionVerb`/`FDWOptionChange` and `AlterTableActionKind` constant
+  `AlterTableAlterColumnOptions` (`internal/parser/ast.go`); `AlterTableAction`
+  gains `FDWOptionChanges []FDWOptionChange`.
+- Executor: new `execAlterTable` case for `AlterTableAlterColumnOptions`
+  (`internal/executor/operators_ddl.go`) mirrors PG's
+  `ATExecAlterColumnGenericOptions` (`tablecmds.c:15954`): rejects a non-foreign
+  table with 42809 (`tbl.ForeignServerName == ""`, PG's "... is not a foreign
+  table"), rejects an unknown column with 42703, then merges the change list
+  onto `catalog.Column.FDWOptions` via a new `applyFDWOptionChanges` helper —
+  a direct port of PG's `transformGenericOptions`
+  (`postgres/src/backend/commands/foreigncmds.c:120-206`, read from the actual
+  upstream source this loop, not from memory): `ADD`/bare errors 42710
+  duplicate_object ("option \"%s\" provided more than once") if the option
+  already exists; `SET`/`DROP` each error 42704 undefined_object ("option
+  \"%s\" not found") if it does not; `SET` replaces the existing entry in
+  place, `DROP` removes it, `ADD`/bare appends. Like the sibling
+  `AlterTableSetCompression`/`AlterTableAlterColumnSet` cases, the in-memory
+  mutation alone is invisible to pg_dump until flushed through the same
+  delete-old-rows + `syncTableToCatalogHeap` re-sync path, which the new case
+  follows identically.
+- Test: `TestParseAlterForeignTableAlterColumnOptions`
+  (`internal/parser/ddl_test.go`) — a single statement with `ONLY`, `ADD`,
+  `SET`, `DROP`, and a bare (defaults-to-Add) entry, asserting the full
+  verb-tagged `FDWOptionChanges` slice. `TestAlterForeignTableAlterColumnOptionsRoundtrip`
+  and `TestAlterForeignTableAlterColumnOptionsErrors`
+  (`internal/executor/operators_alter_foreign_table_options_test.go`) exercise
+  the full `CREATE SERVER` → `CREATE FOREIGN TABLE` → `ALTER FOREIGN TABLE`
+  sequence end-to-end via `newDDLFixture`/`runDDL` (the same harness
+  `operators_alter_set_reloptions_test.go` uses for table-level reloptions),
+  covering an ADD→SET+bare-ADD→DROP sequence and all four SQLSTATEs (42809,
+  42703, 42710, 42704).
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/catalog`+`internal/executor` suites PASS (`-count=1`);
+  `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS;
+  `gofmt -l` clean on every touched/new file (no diff overlaps the new code —
+  the tool still flags the pre-existing go1.25-vs-go1.26.3 struct-comment
+  alignment mismatch on unrelated lines, [[goopg_gofmt_version_mismatch_no_w]]);
+  pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): table-level `ALTER FOREIGN TABLE <t>
+  OPTIONS (...)` (no `ALTER COLUMN` — PG's `AT_GenericOptions`/
+  `ATExecGenericOptions`, setting `pg_foreign_table.ftoptions`) remains
+  unmodeled; only the column-level form was in this loop's bounded scope.
+  `ALTER FOREIGN DATA WRAPPER` remains entirely unparseable. No fixture pipes
+  a literal `pg_dump | psql` goopg-to-goopg restore of a foreign table — the
+  new executor tests construct the equivalent SQL directly.

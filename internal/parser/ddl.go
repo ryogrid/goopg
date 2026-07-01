@@ -586,6 +586,58 @@ func (p *parser) scanFDWOptionsList() []string {
 	return opts
 }
 
+// scanAlterFDWOptionsList parses the verb-tagged option list of
+//
+//	OPTIONS ( [ADD|SET|DROP] name ['value'], … )
+//
+// used by `ALTER FOREIGN TABLE ... ALTER COLUMN col OPTIONS (...)` (PG's
+// alter_generic_option_elem, gram.y). Unlike scanFDWOptionsList (the flat
+// CREATE-time form), each entry here carries an explicit verb; a bare
+// `name 'value'` (no ADD/SET/DROP prefix) defaults to Add, matching PG's
+// DEFELEM_UNSPEC-treated-as-ADD rule. DROP takes no value. Assumes the
+// cursor sits on the OPTIONS token. DU-002 slice 419.
+func (p *parser) scanAlterFDWOptionsList() []FDWOptionChange {
+	p.advance() // consume OPTIONS
+	if c := p.cur(); c.Kind != TokenSymbol || c.Value != "(" {
+		return nil
+	}
+	p.advance() // consume '('
+	var changes []FDWOptionChange
+	for {
+		c := p.cur()
+		if c.Kind == TokenEOF || (c.Kind == TokenSymbol && c.Value == ")") {
+			break
+		}
+		if c.Kind == TokenSymbol && c.Value == "," {
+			p.advance()
+			continue
+		}
+		verb := FDWOptionAdd
+		switch {
+		case p.acceptKeyword(KwAdd):
+			verb = FDWOptionAdd
+		case p.acceptKeyword(KwSet):
+			verb = FDWOptionSet
+		case p.acceptKeyword(KwDrop):
+			verb = FDWOptionDrop
+		}
+		name := p.cur().Value
+		p.advance()
+		value := ""
+		if verb != FDWOptionDrop {
+			if v := p.cur(); v.Kind == TokenStringLit {
+				value = v.Value
+				p.advance()
+			}
+		}
+		changes = append(changes, FDWOptionChange{Verb: verb, Name: name, Value: value})
+	}
+	if c := p.cur(); c.Kind == TokenSymbol && c.Value == ")" {
+		p.advance()
+	}
+	return changes
+}
+
 // parseCreateExtensionTail parses the tail of
 //
 //	CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s] [VERSION v] [CASCADE]
@@ -6612,6 +6664,17 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return &AlterTableStmt{pos: t.Pos}, nil
 		}
 	}
+	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
+	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply
+	// consumed here so the rest of this function (including the ALTER
+	// COLUMN ... OPTIONS (...) case, DU-002 slice 419) applies unchanged.
+	// Only consumed when TABLE follows: ALTER FOREIGN DATA WRAPPER is a
+	// distinct, unmodeled statement and must fall through to the KwTable
+	// expect below to raise its (pre-existing) syntax error.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwTable {
+		p.advance() // consume FOREIGN
+	}
 	// ALTER TABLE [IF EXISTS] [ONLY] name …
 	if _, err := p.expectKeyword(KwTable); err != nil {
 		return nil, err
@@ -6854,6 +6917,19 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
 			colName = p.cur().Value
 			p.advance()
+		}
+		// OPTIONS ( [ADD|SET|DROP] name ['value'], … ) — ALTER FOREIGN TABLE's
+		// per-column generic option list (AT_AlterColumnGenericOptions in real
+		// PG). The executor rejects this on a non-foreign table. DU-002 slice
+		// 419, closes the loop #55 deferral-ledger resume point.
+		if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "options") {
+			changes := p.scanAlterFDWOptionsList()
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				Kind:             AlterTableAlterColumnOptions,
+				ColumnName:       colName,
+				FDWOptionChanges: changes,
+			})
+			return stmt, nil
 		}
 		// Check for SET (options) or SET STORAGE pattern.
 		if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {

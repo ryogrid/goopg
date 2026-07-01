@@ -2526,7 +2526,36 @@ const (
 	// ev_enabled is not 'O' (pg_dump.c). RuleName names the target rule and
 	// RuleEnabledState carries the ev_enabled char. DU-002 slice 325.
 	AlterTableEnableDisableRule
+	// AlterTableAlterColumnOptions — `ALTER FOREIGN TABLE ... ALTER COLUMN
+	// col OPTIONS ( [ADD|SET|DROP] name ['value'], … )`. Mirrors PG's
+	// AT_AlterColumnGenericOptions (tablecmds.c ATExecAlterColumnGenericOptions),
+	// which merges the verb-tagged option list onto pg_attribute.attfdwoptions
+	// via transformGenericOptions (foreigncmds.c). FDWOptionChanges carries the
+	// parsed verb list; ColumnName names the target column. Only meaningful on
+	// a foreign table's columns — the executor rejects a plain table.
+	// DU-002 slice 419.
+	AlterTableAlterColumnOptions
 )
+
+// FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
+// list with the action PostgreSQL's DefElemAction assigns it (gram.y's
+// alter_generic_option_elem): a bare `name 'value'` defaults to Add.
+type FDWOptionVerb byte
+
+const (
+	FDWOptionAdd  FDWOptionVerb = 'a'
+	FDWOptionSet  FDWOptionVerb = 's'
+	FDWOptionDrop FDWOptionVerb = 'd'
+)
+
+// FDWOptionChange is one verb-tagged entry of an ALTER FOREIGN TABLE ALTER
+// COLUMN OPTIONS (...) clause. Value is empty for FDWOptionDrop, which takes
+// no value in PG's grammar (`DROP generic_option_name`).
+type FDWOptionChange struct {
+	Verb  FDWOptionVerb
+	Name  string
+	Value string
+}
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
 // ADD [CONSTRAINT name] PRIMARY KEY (cols) shape pgbench emits, the
@@ -2632,6 +2661,10 @@ type AlterTableAction struct {
 	// AlterTableEnableDisableRule: 'O' (ENABLE / origin), 'D' (DISABLE),
 	// 'R' (ENABLE REPLICA), 'A' (ENABLE ALWAYS). DU-002 slice 325.
 	RuleEnabledState byte
+	// FDWOptionChanges holds the verb-tagged OPTIONS (...) list for
+	// AlterTableAlterColumnOptions (`ALTER FOREIGN TABLE ... ALTER COLUMN
+	// col OPTIONS (...)`). ColumnName names the target column. DU-002 slice 419.
+	FDWOptionChanges []FDWOptionChange
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
