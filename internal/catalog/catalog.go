@@ -10296,6 +10296,64 @@ func LanguageNameToOID(name string) uint32 {
 	return 0
 }
 
+// BuiltinProc is a minimal, hand-curated pg_proc.dat entry for a built-in
+// PostgreSQL function that goopg's own DDL surface can reference by name —
+// e.g. a CREATE CAST/CONVERSION/TRANSFORM WITH FUNCTION clause naming a
+// built-in I/O or internal function such as int4recv. It is NOT the full
+// ~3397-row PG18 catalog (that generated table lives in internal/initdb's
+// pg_proc_seed_data.go, seeded into the on-disk heap for PG-standby
+// consumption); internal/executor cannot import internal/initdb because
+// initdb already imports executor, so the reverse import would cycle (see
+// the "Version constants must live in leaf config pkg" precedent). Both
+// internal/initdb's SQL-queryable pg_proc view and internal/executor's
+// WITH-FUNCTION resolution read this single leaf-package table so the two
+// never diverge (see "Sibling code paths must stay in sync").
+type BuiltinProc struct {
+	OID       uint32
+	Name      string
+	Namespace uint32 // pronamespace OID; every entry so far is pg_catalog (11)
+	RetType   string // catalog type name (matches Type.Name / TypeNameToOID)
+	ArgTypes  []string
+	Volatile  string // provolatile: "i"/"s"/"v"
+}
+
+// builtinProcsByName holds only the functions goopg's DU-002 pg_dump test
+// fixtures actually reference so far; extend as new CAST/CONVERSION/
+// TRANSFORM fixtures need more builtins. OID/rettype/argtypes/provolatile
+// are taken from postgres/src/include/catalog/pg_proc.dat (provolatile
+// defaults to 'i' — BKI_DEFAULT(i) in pg_proc.h — when the .dat entry omits
+// it, which both entries below do).
+var builtinProcsByName = map[string]BuiltinProc{
+	"int4recv": {
+		OID: 2406, Name: "int4recv", Namespace: 11,
+		RetType: "int4", ArgTypes: []string{"internal"}, Volatile: "i",
+	},
+	"prsd_lextype": {
+		OID: 3721, Name: "prsd_lextype", Namespace: 11,
+		RetType: "internal", ArgTypes: []string{"internal"}, Volatile: "i",
+	},
+}
+
+// LookupBuiltinProc resolves a built-in pg_proc.dat function by name (case-
+// insensitive, unqualified — every entry lives in pg_catalog). Returns
+// false if name is not in the hand-curated set above.
+func LookupBuiltinProc(name string) (BuiltinProc, bool) {
+	p, ok := builtinProcsByName[strings.ToLower(name)]
+	return p, ok
+}
+
+// BuiltinProcs returns all hand-curated built-in pg_proc rows in OID order,
+// for callers (e.g. internal/initdb's pg_proc virtual view) that need to
+// enumerate the full set rather than look up a single name.
+func BuiltinProcs() []BuiltinProc {
+	out := make([]BuiltinProc, 0, len(builtinProcsByName))
+	for _, p := range builtinProcsByName {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>
 // SERVER <server>). goopg does not execute foreign access; this records just
 // enough metadata to round-trip the CREATE/DROP through pg_dump (pg_user_mappings

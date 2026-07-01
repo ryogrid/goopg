@@ -1,44 +1,66 @@
 (idle — nothing in flight)
 
-Loop #43 COMPLETE (pending commit): M0119-0004 DU-002 slice 402 — CREATE
-CONVERSION FROM-function existence/return-type validation (closes the
-slice-399/400/401 deferral (b)-remainder). New executor helper
-resolveConversionFunc (operators_ddl.go) mirrors PG's LookupFuncName(...,
-{int4,int4,cstring,internal,int4,bool}, false) + get_func_rettype != INT4OID:
-scans im.Routines().LookupByName overloads for the fixed 6-arg signature
-(int4/int4/cstring/internal/int4/bool via catalog.TypeNameToOID for the
-int4/bool slots, literal match for cstring/internal pseudotypes); no match ->
-42883 "function <name>(integer, integer, cstring, internal, integer,
-boolean) does not exist"; wrong return type -> 42P17 "encoding conversion
-function <name> must return type integer". execCompatNoop case "conversion"
-calls it after the encoding checks (PG's order), before registering.
-TestPort_PgDumpConnectionSetup setup now CREATE FUNCTIONs myconv_func /
-aliasconv_func (LANGUAGE c stub, real 6-arg signature) before the CREATE
-[DEFAULT] CONVERSION statements that reference them, plus two new negative
-cases (missing function -> 42883, wrong return type -> 42P17). Tests:
-TestResolveConversionFunc (executor, 7 cases) + slice-402 assertions in
-TestPort_PgDumpConnectionSetup. Gates: executor/catalog/parser unit suites
-PASS; TestPort_PgDumpConnectionSetup PASS (5.05s); TPC-H spotcheck Q12=2/
-Q13=33 PASS; make ralph-state-guard OK; pgbench smoke = pre-commit hook.
-Not yet committed — about to `git add` the 3 source files + deferral ledger
-and commit (NOT .ralph/progress.json or the postgres/ submodule artifacts,
-those are unrelated driver/build noise).
+Loop #46 COMPLETE and committed (pending push): M0119-0004 DU-002 slice 404
+follow-up — closed the "expose builtin pg_proc rows queryably" resume point
+from loop #45, using shape (b) (catalog-level lookup, not a full 3397-row
+port). New `catalog.BuiltinProc`/`LookupBuiltinProc`/`BuiltinProcs()`
+(internal/catalog/catalog.go, leaf package both initdb and executor already
+import cycle-free) hand-curates int4recv (OID 2406) + prsd_lextype (OID
+3721) from real pg_proc.dat values. Wired into (1) `resolveTransformFunc`
+(internal/executor/operators_ddl.go) as a fallback after user-routine
+lookup, validated via new `validateBuiltinTransformFunc`; (2)
+`registerPgProcView`'s VirtualRows (internal/initdb/pg_proc_view.go),
+appended AFTER user routines so existing `rows[len(builtinProcs):]` test
+slicing stays correct — only exact-count assertions needed
+`+= len(catalog.BuiltinProcs())`. A SECOND independent gap surfaced and was
+fixed: `formatTypeOID` (internal/executor/expr.go) had no case for OID 2281
+(`internal` pseudo-type) — pg_dump's server-side `format_type('2281'::oid,
+NULL)` catalog query rendered `(???)` instead of `(internal)`; fixed with
+`case 2281: return "internal"` (matches the existing `record`/2249
+precedent). The `'CREATE TRANSFORM FOR int'` DU-002 connsetup fixture
+(exact upstream 002_pg_dump.pl SQL) is now wired into
+TestPort_PgDumpConnectionSetup and asserts byte-identical vs real pg_dump
+18.3 — verified live on a running server AND via the Go test.
 
-Remaining open conproc fidelity gap (recorded in ledger, NOT this loop's
-scope): conproc still renders from UserConversion.ProcSchema/ProcName text
-captured at CREATE time, not a FuncOID->pg_proc cross-ref (unlike
-pg_cast.castfunc, slice 397) — a later RENAME/DROP CASCADE on the function
-wouldn't propagate. EXECUTE ACL check and runtime OidFunctionCall6 probe
-also still unimplemented (probe needs an encoding-conversion engine, out of
-scope for goopg).
+Tests added: TestLookupBuiltinProc/TestBuiltinProcs (catalog, new file
+builtin_proc_test.go), TestPgProcViewBuiltinTransformFuncs (initdb), 5 new
+TestResolveTransformFunc subtests (curated-builtin resolve/reject/
+schema-qualification), TestFormatTypeOIDInternalPseudoType (executor, new
+file format_type_pseudo_test.go). Also fixed 3 pre-existing pg_proc_view_test.go
+assertions whose row-count/index math assumed only `len(builtinProcs)` rows
+existed (TestPgProcViewEmptyByDefault/RendersRoutine/Ordering) and rewrote
+TestPgProcViewProparallel's blanket "every row is u" assertion (now
+correctly split: legacy stubs/user routines = u, new curated builtins = s
+per pg_proc.h's real BKI_DEFAULT(s)).
 
-Next loop candidates (M0119-0004 pg_dump slices):
-- conproc OID cross-ref (UserConversion.FuncOID + pg_conversion view resolves
-  via routine registry by OID like findFuncByOid) — cosmetic-only under
-  current semantics, low priority.
-- cast/conversion/collation registry RESTART PERSISTENCE (recurring deferral
-  c): WAL-log CreateConversion + replay like CREATE SCHEMA.
-- CREATE TRANSFORM round-trip.
-- Re-scan deferral_ledger.md for other open "| - |" rows (M0119-0004 has many
-  accumulated CHECK-predicate / domain / literal-cast type-blind deferrals
-  from slices 360-363 era) for the next bounded slice.
+Gates this loop: full catalog/executor/initdb/parser suites PASS; go vet
+clean; gofmt -d confirms none of my new code needs reformatting (pre-existing
+go1.25-vs-1.26 noise only, untouched); TPC-H spotcheck Q12=2/Q13=33 PASS;
+TestPort_PgDumpConnectionSetup (whole ~10k-line suite) PASS; a broader
+`go test ./internal/...` sweep was kicked off at loop-end to catch any
+unrelated regression (check /tmp/claude-*/tasks/b2i422p8b.output or rerun
+if resuming mid-check) — check this FIRST if resuming. pgbench smoke runs at
+commit time via the pre-commit hook (not run separately this loop yet).
+make ralph-state-guard: self-repaired a stale status/progress marker (same
+recurring pattern as loops #44/#45), OK after repair.
+
+Design doc updated: docs/design/0110-0001-pg-dump-tap-port.md, new
+"Slice 404 follow-up" subsection right after the original Slice 404 section.
+Ledger: slice-404 row flipped to `resolved`; new slice-404-follow-up row
+appended with the remaining CAST/CONVERSION wiring + restart-persistence
+deferrals. fix_plan.md: appended a loop #46 note under the M0119-0004
+CREATE TRANSFORM item.
+
+Next loop candidates (M0119-0004 pg_dump slices, DU-002):
+- Trivial follow-up (now unblocked): wire CAST's WITH FUNCTION arm
+  (operators_ddl.go ~line 12977) and resolveConversionFunc (~line 12735) to
+  also try catalog.LookupBuiltinProc as a fallback, IF a future fixture ever
+  references a builtin function through either path (none does yet — don't
+  do this speculatively without a forcing fixture).
+- Restart-persistence sweep: WAL-log CreateConversion/CreateCast/
+  CreateCollation/CreateTransform + replay on startup like CREATE SCHEMA —
+  closes the recurring (c)/(b) deferral shared by slices 389-404.
+- Re-scan deferral_ledger.md for other open "| - |" rows for a bounded
+  slice if the above two are too large for one loop.
+- Whichever is picked: update fix_plan.md AND the design doc in the SAME
+  loop (this loop did both — keep it up).

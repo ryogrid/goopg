@@ -3463,6 +3463,28 @@ documentation-only and is exempt from the design-doc requirement.)
       has the full resume point: expose builtin pg_proc rows queryably (leaf-package name→metadata table, or a
       catalog-level `LookupBuiltinProcByName` backed by whatever serves the live `pg_proc` view) so all three
       WITH-FUNCTION-on-builtin call sites can resolve consistently.
+      **2026-07-01 (loop #46) — builtin pg_proc exposure LANDED; slice 404 now fully closed (connsetup
+      fixture wired + byte-identical).** Closed the slice-404 resume point with shape (b): new
+      `catalog.BuiltinProc`/`LookupBuiltinProc`/`BuiltinProcs()` (`internal/catalog/catalog.go`) hand-curates
+      `int4recv`/`prsd_lextype` (the two functions the CREATE TRANSFORM fixture needs) from real
+      `pg_proc.dat` values; `internal/catalog` is a leaf package both `internal/initdb` and
+      `internal/executor` already import cycle-free. `resolveTransformFunc` now falls back to this table
+      (validated via a new `validateBuiltinTransformFunc` running the same `check_transform_function` rules)
+      when no user routine matches, and `pg_proc_view.go`'s `registerPgProcView` appends the same rows to the
+      SQL-queryable view (after user routines, so existing `rows[len(builtinProcs):]` test slicing is
+      unaffected). A second gap surfaced mid-loop: `formatTypeOID` (`internal/executor/expr.go`) had no case
+      for OID 2281 (`internal` pseudo-type), so pg_dump's server-side `format_type` catalog query rendered
+      `(???)` instead of `(internal)` in the WITH FUNCTION clause — fixed with a one-line case, matching the
+      existing `record` (2249) pseudo-type precedent. The `'CREATE TRANSFORM FOR int'` DU-002 connsetup
+      fixture (exact upstream `002_pg_dump.pl` SQL) is now wired into `TestPort_PgDumpConnectionSetup` and
+      byte-identical vs real pg_dump 18.3. Tests: `TestLookupBuiltinProc`/`TestBuiltinProcs` (catalog),
+      `TestPgProcViewBuiltinTransformFuncs` (initdb), 5 new `TestResolveTransformFunc` subtests,
+      `TestFormatTypeOIDInternalPseudoType` (executor). Gates: full catalog/executor/initdb/parser suites +
+      `go vet` clean; TPC-H spotcheck Q12=2/Q13=33 PASS; the whole `TestPort_PgDumpConnectionSetup` suite
+      PASS; pgbench smoke = pre-commit. Deliberately still deferred (ledger slice-404-follow-up row): CAST's
+      WITH FUNCTION (397) / CONVERSION's FROM function (402) don't yet call `LookupBuiltinProc` (no fixture
+      forces it yet, trivial follow-up); restart persistence stays in-memory only (recurring gap since 389);
+      the curated table stays intentionally narrow (2 entries, not a full `pg_proc.dat` port).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

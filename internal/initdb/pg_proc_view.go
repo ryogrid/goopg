@@ -403,6 +403,47 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"-",      // prosupport: regproc InvalidOid renders '-' (no support function)
 			})
 		}
+		// Append the hand-curated built-in pg_proc table (catalog.BuiltinProcs),
+		// after user-defined routines so existing rows[len(builtinProcs):] slices
+		// in this package's tests still land on the same user-routine rows. This
+		// lets pg_dump's own catalog queries — e.g. getFuncs()'s pg_transform/
+		// pg_cast EXISTS-join, which findFuncByOid then resolves client-side into
+		// a namespace-qualified function signature — see functions like
+		// int4recv/prsd_lextype that a CREATE CAST/CONVERSION/TRANSFORM WITH
+		// FUNCTION clause references. Field defaults (provolatile aside, which the
+		// table carries explicitly) follow pg_proc.h's BKI_DEFAULT: proisstrict=t,
+		// prokind=f, proretset=f, proparallel=s, procost=1, prorows=0.
+		for _, b := range catalog.BuiltinProcs() {
+			argOIDs := make([]string, len(b.ArgTypes))
+			for i, t := range b.ArgTypes {
+				argOIDs[i] = typeNameToOIDStr(t)
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", b.OID),
+				b.Name,
+				fmt.Sprintf("%d", b.Namespace),
+				"12", // prolang: internal
+				typeNameToOIDStr(b.RetType),
+				strings.Join(argOIDs, " "),
+				fmt.Sprintf("%d", len(b.ArgTypes)), // pronargs
+				"",                                 // proacl: NULL (default privileges)
+				"10",                               // proowner: bootstrap superuser
+				b.Name,
+				b.Volatile,
+				"f", // prosecdef
+				"f", // proleakproof
+				"t", // proisstrict: BKI_DEFAULT(t)
+				"f", // prokind: function
+				"f", // proretset
+				"",  // probin: NULL (internal funcs have no on-disk binary path)
+				"",  // proconfig: NULL (no per-function GUC SET clauses)
+				"1", // procost: internal-language default
+				"0", // prorows
+				"",  // protrftypes: NULL
+				"s", // proparallel: BKI_DEFAULT(s)
+				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
+			})
+		}
 		return rows
 	}
 	return cat.RegisterVirtualTable(tbl)

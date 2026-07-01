@@ -5135,6 +5135,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			t.Errorf("%q: error = %T (%v), want *pq.Error", neg.sql, err, err)
 		}
 	}
+	// Slice 404 (connsetup): CREATE TRANSFORM FOR int LANGUAGE sql, exercising
+	// resolveTransformFunc's builtin fallback (catalog.LookupBuiltinProc) added
+	// this loop. Both WITH FUNCTION references (prsd_lextype/int4recv) are
+	// PG built-ins, not user-created routines — before this loop goopg's live
+	// pg_proc exposed no built-in function by name/OID at all, so trffromsql/
+	// trftosql stayed 0 and dumpTransform would have warned + emitted an empty
+	// `()`. This is the exact upstream TAP fixture from
+	// postgres/src/bin/pg_dump/t/002_pg_dump.pl ('CREATE TRANSFORM FOR int').
+	if err := runSQLSimple(t, c, "CREATE TRANSFORM FOR int LANGUAGE sql "+
+		"(FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))"); err != nil {
+		t.Fatalf("create transform for int: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7913,6 +7925,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// dump would read FOR '' TO '' instead.
 		if want := "CREATE CONVERSION public.aliasconv FOR 'SJIS' TO 'UTF8' FROM public.aliasconv_func;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing alias CONVERSION %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 404 (asserted):** CREATE TRANSFORM FOR int must round-trip via
+		// getTransforms / dumpTransform. Both WITH FUNCTION references resolve
+		// through the new catalog.LookupBuiltinProc fallback (int4recv/
+		// prsd_lextype are PG built-ins, not user routines) to non-zero
+		// trffromsql/trftosql, and goopg's live pg_proc view now surfaces those
+		// two built-in rows so findFuncByOid's client-side lookup succeeds.
+		// Byte-identical to real pg_dump 18.3's rendering of the upstream
+		// 002_pg_dump.pl 'CREATE TRANSFORM FOR int' fixture (schema-qualified
+		// pg_catalog.<func>, integer/sql spelled out in full).
+		if want := "CREATE TRANSFORM FOR integer LANGUAGE sql (FROM SQL WITH FUNCTION pg_catalog.prsd_lextype(internal), TO SQL WITH FUNCTION pg_catalog.int4recv(internal));"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE TRANSFORM %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

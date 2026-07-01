@@ -13149,8 +13149,16 @@ func resolveTransformFunc(rs *catalog.Routines, fn parser.ObjectName, args []str
 		}
 	}
 	if routine == nil {
-		// Not a user-created routine (built-in, or genuinely missing) — leave
-		// unresolved rather than erroring; see the doc comment above.
+		// Not a user-created routine. Fall back to the hand-curated built-in
+		// pg_proc table (catalog.LookupBuiltinProc) before giving up — DU-002's
+		// CREATE TRANSFORM fixture references int4recv/prsd_lextype, which are
+		// real pg_proc.dat entries goopg's SQL-queryable pg_proc view now also
+		// exposes (internal/initdb/pg_proc_view.go), so the two paths agree.
+		if b, ok := catalog.LookupBuiltinProc(fn.Name); ok && (fn.Schema == "" || strings.EqualFold(fn.Schema, "pg_catalog")) {
+			return validateBuiltinTransformFunc(b, isFromSQL, transformType)
+		}
+		// Genuinely unresolvable (built-in with no curated entry, or missing) —
+		// leave unresolved rather than erroring; see the doc comment above.
 		return 0, nil
 	}
 	if isFromSQL {
@@ -13183,6 +13191,33 @@ func resolveTransformFunc(rs *catalog.Routines, fn parser.ObjectName, args []str
 		return 0, &ExecError{Code: "42P17", Message: "first argument of transform function must be type internal"}
 	}
 	return routine.OID, nil
+}
+
+// validateBuiltinTransformFunc applies the same check_transform_function
+// rules (functioncmds.c) as resolveTransformFunc's user-routine path, but
+// against a catalog.BuiltinProc. Built-ins are hand-curated (see
+// catalog.LookupBuiltinProc), so provolatile/prokind/proretset are already
+// known-correct; this still runs the same signature checks a real CREATE
+// TRANSFORM would, so a future addition to the table that doesn't fit a
+// transform's rules fails loudly instead of silently mis-registering.
+func validateBuiltinTransformFunc(b catalog.BuiltinProc, isFromSQL bool, transformType string) (uint32, error) {
+	if isFromSQL {
+		if !strings.EqualFold(b.RetType, "internal") {
+			return 0, &ExecError{Code: "42P17", Message: "return data type of FROM SQL function must be internal"}
+		}
+	} else if catalog.TypeNameToOID(b.RetType) != catalog.TypeNameToOID(transformType) {
+		return 0, &ExecError{Code: "42P17", Message: "return data type of TO SQL function must be the transform data type"}
+	}
+	if b.Volatile == "v" {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must not be volatile"}
+	}
+	if len(b.ArgTypes) != 1 {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must take one argument"}
+	}
+	if !strings.EqualFold(b.ArgTypes[0], "internal") {
+		return 0, &ExecError{Code: "42P17", Message: "first argument of transform function must be type internal"}
+	}
+	return b.OID, nil
 }
 
 // typeACLAllPrivs is the expansion of GRANT ALL [PRIVILEGES] ON a TYPE/DOMAIN:

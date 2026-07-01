@@ -10044,6 +10044,61 @@ change to a heavily-relied-on catalog view with real regression risk across the 
 for a single bounded loop, and orthogonal to this slice's actual deliverable (a new, independently-tested object
 family's parse/registry/validation skeleton). Full deferral-ledger row: slice 404.
 
+### Slice 404 follow-up — builtin `pg_proc` exposure, shape (b) chosen, TRANSFORM fixture now wired
+
+Closed the resume point above with shape (b) — a single leaf-package source of truth, not a wholesale exposure of
+all ~3397 `pg_proc.dat` rows. New `catalog.BuiltinProc`/`catalog.LookupBuiltinProc`/`catalog.BuiltinProcs()`
+(`internal/catalog/catalog.go`, next to `LanguageNameToOID`) hand-curates **only** the functions goopg's own DU-002
+fixtures reference so far (`int4recv` OID 2406, `prsd_lextype` OID 3721 — both from
+`postgres/src/include/catalog/pg_proc.dat`, `provolatile` defaulting to `i` per `pg_proc.h`'s `BKI_DEFAULT(i)` since
+neither `.dat` entry sets it explicitly). `internal/catalog` is a leaf package neither `internal/initdb` nor
+`internal/executor` needs to reverse-import (verified via `go list -deps`: `catalog` imports neither; both of the
+other two import `catalog`), so this table is reachable from both sides without the import-cycle problem shape (a)
+would have hit.
+
+Two call sites now read it:
+
+1. **Executor (`resolveTransformFunc`, `internal/executor/operators_ddl.go`):** when no user-created routine
+   matches, falls back to `catalog.LookupBuiltinProc(fn.Name)` (unqualified or explicitly `pg_catalog`-qualified
+   only — `public.int4recv` does *not* match the builtin), then runs the identical `check_transform_function`
+   signature checks (`validateBuiltinTransformFunc`) against the curated entry before returning its real OID. A
+   schema-qualified reference to any *other* schema stays unresolved (OID 0, no error) — the pre-existing lenient
+   behavior for genuinely-unknown names is preserved, just narrowed to not falsely match a same-named user object in
+   the wrong schema.
+2. **`pg_proc` SQL-queryable view (`internal/initdb/pg_proc_view.go`, `registerPgProcView`):** `catalog.BuiltinProcs()`
+   rows are appended to `VirtualRows()` **after** the user-defined-routine loop (not spliced in before it), so every
+   existing test in `pg_proc_view_test.go` that slices `rows[len(builtinProcs):]` to reach the user-routine rows
+   keeps working unchanged — only the total row count grew, which the affected exact-count assertions now add
+   `len(catalog.BuiltinProcs())` to. Field defaults for the new rows follow `pg_proc.h`'s real `BKI_DEFAULT`s
+   (`proisstrict=t`, `prokind=f`, `proretset=f`, `proparallel=s`, `procost=1`, `prorows=0`) rather than reusing the
+   legacy 16-stub loop's simplified `u`/`f` defaults, since these are genuine PG builtins and pg_dump's own
+   `getFuncs` query reads these columns directly.
+
+**A second, independent gap surfaced and was fixed in the same loop:** even with `trffromsql`/`trftosql` resolved
+to non-zero OIDs and `pg_proc` exposing the rows, `dumpTransform`'s `format_function_signature` still rendered
+`WITH FUNCTION pg_catalog.int4recv(???)` instead of `...(internal)`. Root cause: pg_dump's
+`getFormattedTypeName` calls `SELECT pg_catalog.format_type('2281'::oid, NULL)` server-side for any type OID not
+already in its client-side `TypeInfo` cache (the "internal" pseudo-type, OID 2281, is not a dumpable object so it
+was never cached), and goopg's `formatTypeOID` (`internal/executor/expr.go`) — a hardcoded per-OID switch, not a
+real `pg_type` scan — had no `case 2281`, so it fell through to the same `"???"` fallback string PG's own
+`format_type.c` uses for a genuinely-unresolvable OID. Fixed with a one-line `case 2281: return "internal"`,
+matching the existing pseudo-type precedent (`case 2249: return "record"`).
+
+**DU-002 connsetup fixture now wired and asserted byte-identical:** `internal/testport/pgdump_connsetup_test.go`
+runs the exact upstream `postgres/src/bin/pg_dump/t/002_pg_dump.pl` `'CREATE TRANSFORM FOR int'` SQL as setup, and
+asserts pg_dump's output contains `CREATE TRANSFORM FOR integer LANGUAGE sql (FROM SQL WITH FUNCTION
+pg_catalog.prsd_lextype(internal), TO SQL WITH FUNCTION pg_catalog.int4recv(internal));` — confirmed against real
+pg_dump 18.3 via `TestPort_PgDumpConnectionSetup` (full suite, not just this assertion).
+
+**Still deferred (unchanged from the slice-404 note above):** CAST's `WITH FUNCTION` (slice 397) and CONVERSION's
+`FROM` function (slice 402) do not yet call `catalog.LookupBuiltinProc` — their existing fixtures only reference
+user-created functions, so nothing forces the wiring yet, but the shared table is now available for whichever
+future slice needs it ([[pattern_sibling_paths_must_agree]]). Restart persistence remains in-memory only
+(unchanged, tracked since slice 389). The curated table itself is intentionally narrow — extend
+`builtinProcsByName` only as new fixtures reference additional builtins, following the `pg_proc.dat`
+OID/rettype/argtypes/provolatile values (see `postgres/src/include/catalog/pg_proc.h`'s `BKI_DEFAULT`s for any
+field a `.dat` entry omits).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

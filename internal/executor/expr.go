@@ -11811,6 +11811,16 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "numeric"
 	case 2249:
 		return "record"
+	case 2281:
+		// internal: pseudo-type for fmgr-internal-only arguments/results (e.g.
+		// trigger, index_am_handler, and — the case this closes — the sole
+		// arg/rettype of a CREATE TRANSFORM WITH FUNCTION clause naming a
+		// built-in like int4recv/prsd_lextype). No typmod, bare name, exactly
+		// like every other pseudo-type case here (2249 record). Real PG
+		// resolves it via the genuine pg_type row (typname='internal');
+		// goopg's format_type has no backing pg_type scan, so it needs an
+		// explicit case like every other OID above.
+		return "internal"
 	case 2950:
 		return "uuid"
 	case 2951:

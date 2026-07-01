@@ -21,10 +21,12 @@ func TestPgProcViewEmptyByDefault(t *testing.T) {
 		t.Fatal("pg_proc not registered")
 	}
 	rows := tbl.VirtualRows()
-	// Built-in stubs are always present; without user-defined routines we
-	// should see exactly len(builtinProcs) rows.
-	if len(rows) != len(builtinProcs) {
-		t.Errorf("rows = %d, want %d (only built-in stubs)", len(rows), len(builtinProcs))
+	// Built-in stubs + the hand-curated catalog.BuiltinProcs() table are
+	// always present; without user-defined routines we should see exactly
+	// their combined row count.
+	wantLen := len(builtinProcs) + len(catalog.BuiltinProcs())
+	if len(rows) != wantLen {
+		t.Errorf("rows = %d, want %d (only built-in stubs)", len(rows), wantLen)
 	}
 }
 
@@ -49,13 +51,14 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
 	rows := tbl.VirtualRows()
-	// Built-in stubs + 1 user routine.
-	wantLen := len(builtinProcs) + 1
+	// Built-in stubs + 1 user routine + the hand-curated catalog.BuiltinProcs()
+	// table (appended after user routines).
+	wantLen := len(builtinProcs) + 1 + len(catalog.BuiltinProcs())
 	if len(rows) != wantLen {
 		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
-	// User routine is appended after built-ins.
-	row := rows[len(rows)-1]
+	// User routine is appended after built-ins, before catalog.BuiltinProcs().
+	row := rows[len(builtinProcs)]
 	// Columns: oid, proname, pronamespace, prolang, prorettype,
 	//          proargtypes, pronargs, proacl, proowner, prosrc.
 	if row[1] != "add" {
@@ -389,9 +392,19 @@ func TestPgProcViewProparallel(t *testing.T) {
 	rows := tbl.VirtualRows()
 	// proparallel is the last column (index 21), appended after protrftypes (20).
 	const proparallel = 21
-	for i := range rows {
-		if rows[i][proparallel] != "u" {
-			t.Errorf("row %q proparallel = %q, want u (unsafe)", rows[i][1], rows[i][proparallel])
+	// Legacy builtin stubs + user routines default to "u" (unsafe, PG's CREATE
+	// FUNCTION default). The hand-curated catalog.BuiltinProcs() table (appended
+	// after user routines) instead carries PG's real pg_proc.h BKI_DEFAULT(s)
+	// for genuine built-ins, so it is excluded from this loop and checked below.
+	legacyRows := rows[:len(builtinProcs)+1]
+	for i := range legacyRows {
+		if legacyRows[i][proparallel] != "u" {
+			t.Errorf("row %q proparallel = %q, want u (unsafe)", legacyRows[i][1], legacyRows[i][proparallel])
+		}
+	}
+	for _, row := range rows[len(builtinProcs)+1:] {
+		if row[proparallel] != "s" {
+			t.Errorf("built-in %q proparallel = %q, want s (safe, BKI_DEFAULT)", row[1], row[proparallel])
 		}
 	}
 }
@@ -514,18 +527,59 @@ func TestPgProcViewOrdering(t *testing.T) {
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
 	rows := tbl.VirtualRows()
-	// Built-in stubs + 3 user routines.
-	wantLen := len(builtinProcs) + 3
+	// Built-in stubs + 3 user routines + the hand-curated catalog.BuiltinProcs()
+	// table (appended after user routines).
+	wantLen := len(builtinProcs) + 3 + len(catalog.BuiltinProcs())
 	if len(rows) != wantLen {
 		t.Fatalf("rows = %d, want %d", len(rows), wantLen)
 	}
 	// Insertion order: zeta, alpha, mu — OIDs assigned in that
-	// order — user view rows are appended after built-ins in insertion order.
+	// order — user view rows are appended after built-ins in insertion order,
+	// before catalog.BuiltinProcs().
 	wantNames := []string{"zeta", "alpha", "mu"}
-	userRows := rows[len(builtinProcs):]
+	userRows := rows[len(builtinProcs) : len(builtinProcs)+3]
 	for i, want := range wantNames {
 		if userRows[i][1] != want {
 			t.Errorf("row %d proname = %q, want %q", i, userRows[i][1], want)
 		}
+	}
+}
+
+// TestPgProcViewBuiltinTransformFuncs pins that the hand-curated
+// catalog.BuiltinProcs() table surfaces int4recv/prsd_lextype through the
+// SQL-queryable pg_proc view — the two builtin functions DU-002's
+// `CREATE TRANSFORM FOR int` fixture references via WITH FUNCTION. Before
+// this, goopg's live pg_proc exposed no builtin function by name/OID at
+// all (only ~16 hand-picked stubs + user routines), so pg_dump's own
+// getFuncs() catalog query — which findFuncByOid then resolves
+// client-side into the namespace-qualified DDL text — could not see them.
+func TestPgProcViewBuiltinTransformFuncs(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	byName := make(map[string][]string, len(rows))
+	for _, r := range rows {
+		byName[r[1]] = r
+	}
+	// Columns: oid(0), proname(1), pronamespace(2), prolang(3), prorettype(4),
+	// proargtypes(5), pronargs(6), provolatile(10).
+	int4recv, ok := byName["int4recv"]
+	if !ok {
+		t.Fatal("pg_proc missing int4recv")
+	}
+	if int4recv[0] != "2406" || int4recv[2] != "11" || int4recv[4] != "23" ||
+		int4recv[5] != "2281" || int4recv[6] != "1" || int4recv[10] != "i" {
+		t.Errorf("int4recv row = %v, want oid=2406 ns=11 rettype=23(int4) argtypes=2281(internal) nargs=1 volatile=i", int4recv)
+	}
+	prsdLextype, ok := byName["prsd_lextype"]
+	if !ok {
+		t.Fatal("pg_proc missing prsd_lextype")
+	}
+	if prsdLextype[0] != "3721" || prsdLextype[2] != "11" || prsdLextype[4] != "2281" ||
+		prsdLextype[5] != "2281" || prsdLextype[6] != "1" || prsdLextype[10] != "i" {
+		t.Errorf("prsd_lextype row = %v, want oid=3721 ns=11 rettype=2281(internal) argtypes=2281(internal) nargs=1 volatile=i", prsdLextype)
 	}
 }

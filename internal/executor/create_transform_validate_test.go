@@ -100,14 +100,64 @@ func TestResolveTransformFunc(t *testing.T) {
 	})
 
 	t.Run("unresolved builtin is lenient", func(t *testing.T) {
-		rs := catalog.NewRoutines() // empty — "int4recv" is a builtin, not user-created
-		oid, err := resolveTransformFunc(rs, parser.ObjectName{Name: "int4recv"}, []string{"internal"}, false, "int")
+		rs := catalog.NewRoutines() // empty — "not_a_real_builtin" isn't user-created or curated
+		oid, err := resolveTransformFunc(rs, parser.ObjectName{Name: "not_a_real_builtin"}, []string{"internal"}, false, "int")
 		if err != nil {
 			t.Fatalf("unresolved builtin should not error, got: %v", err)
 		}
 		if oid != 0 {
 			t.Errorf("unresolved builtin OID = %d, want 0", oid)
 		}
+	})
+
+	t.Run("curated builtin int4recv resolves TO SQL", func(t *testing.T) {
+		rs := catalog.NewRoutines() // empty — int4recv comes from catalog.LookupBuiltinProc
+		oid, err := resolveTransformFunc(rs, parser.ObjectName{Name: "int4recv"}, []string{"internal"}, false, "int")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if oid != 2406 {
+			t.Errorf("resolved OID = %d, want 2406 (int4recv)", oid)
+		}
+	})
+
+	t.Run("curated builtin prsd_lextype resolves FROM SQL", func(t *testing.T) {
+		rs := catalog.NewRoutines() // empty — prsd_lextype comes from catalog.LookupBuiltinProc
+		oid, err := resolveTransformFunc(rs, parser.ObjectName{Name: "prsd_lextype"}, []string{"internal"}, true, "int")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if oid != 3721 {
+			t.Errorf("resolved OID = %d, want 3721 (prsd_lextype)", oid)
+		}
+	})
+
+	t.Run("curated builtin schema-qualified pg_catalog resolves", func(t *testing.T) {
+		rs := catalog.NewRoutines()
+		oid, err := resolveTransformFunc(rs, parser.ObjectName{Schema: "pg_catalog", Name: "int4recv"}, []string{"internal"}, false, "int")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if oid != 2406 {
+			t.Errorf("resolved OID = %d, want 2406 (int4recv)", oid)
+		}
+	})
+
+	t.Run("curated builtin other schema-qualified stays unresolved", func(t *testing.T) {
+		rs := catalog.NewRoutines()
+		oid, err := resolveTransformFunc(rs, parser.ObjectName{Schema: "public", Name: "int4recv"}, []string{"internal"}, false, "int")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if oid != 0 {
+			t.Errorf("resolved OID = %d, want 0 (public.int4recv is not the builtin)", oid)
+		}
+	})
+
+	t.Run("curated builtin wrong TO SQL return type rejected", func(t *testing.T) {
+		rs := catalog.NewRoutines()
+		_, err := resolveTransformFunc(rs, parser.ObjectName{Name: "int4recv"}, []string{"internal"}, false, "text")
+		assertTransformErr(t, err, "return data type of TO SQL function must be the transform data type")
 	})
 }
 
