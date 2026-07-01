@@ -11738,9 +11738,19 @@ func pgArgTypeDisplayAlias(name string) string {
 // resolves to neither source; the caller falls back to the raw OID, matching
 // format_procedure's own numeric fallback for an unknown OID.
 func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
+	_, sig, ok := RegprocedureNameAndSchema(oid, routines)
+	return sig, ok
+}
+
+// RegprocedureNameAndSchema is RegprocedureName plus the resolved schema, for
+// a caller that needs to decide whether to schema-qualify the name (a
+// builtin always resolves to "pg_catalog"; a CREATE FUNCTION-defined routine
+// resolves to its declared schema, defaulting to "public" like every other
+// unset-namespace field in this file). DU-002 (M0119-0004) slice 412.
+func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig string, ok bool) {
 	if argNames, ok := pgProcArgTypeNamesByOID[oid]; ok {
 		if name, nameOK := pgProcNamesByOID[oid]; nameOK {
-			return formatProcedureSignature(name, argNames), true
+			return "pg_catalog", formatProcedureSignature(name, argNames), true
 		}
 	}
 	if routines != nil {
@@ -11752,10 +11762,14 @@ func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
 				}
 				argNames = append(argNames, t.Name)
 			}
-			return formatProcedureSignature(r.Name, argNames), true
+			schema := r.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			return schema, formatProcedureSignature(r.Name, argNames), true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 func formatProcedureSignature(name string, argTypeNames []string) string {
@@ -11769,15 +11783,23 @@ func formatProcedureSignature(name string, argTypeNames []string) string {
 // RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,
 // righttype)" regoperator rendering (format_operator, regproc.c) — "NONE"
 // for a missing (unary) side. Only user-defined operators are resolvable
-// (goopg has no builtin-operator catalog — deferred, see the ledger); a
-// schema qualifier is never added (mirrors RegprocedureName's own
-// unqualified-name simplification). dumpOpclass/dumpOpfamily cast
-// amopopr::pg_catalog.regoperator for a class/family's own OPERATOR entries.
-// DU-002 (M0119-0004) slice 411.
+// (goopg has no builtin-operator catalog — deferred, see the ledger).
+// dumpOpclass/dumpOpfamily cast amopopr::pg_catalog.regoperator for a
+// class/family's own OPERATOR entries. DU-002 (M0119-0004) slice 411.
 func (c *InMemory) RegoperatorName(oid uint32) (string, bool) {
+	_, sig, ok := c.RegoperatorNameAndSchema(oid)
+	return sig, ok
+}
+
+// RegoperatorNameAndSchema is RegoperatorName plus the operator's resolved
+// schema, for a caller that needs to decide whether to schema-qualify the
+// name (falls back to "public" when the operator's namespace is unset,
+// mirroring UserOperator.NamespaceOIDOrDefault). DU-002 (M0119-0004) slice
+// 412.
+func (c *InMemory) RegoperatorNameAndSchema(oid uint32) (schema, sig string, ok bool) {
 	op := c.LookupUserOperatorByOID(oid)
 	if op == nil {
-		return "", false
+		return "", "", false
 	}
 	left, right := "NONE", "NONE"
 	if op.LeftType != "" {
@@ -11786,7 +11808,20 @@ func (c *InMemory) RegoperatorName(oid uint32) (string, bool) {
 	if op.RightType != "" {
 		right = pgArgTypeDisplayAlias(op.RightType)
 	}
-	return op.Name + "(" + left + "," + right + ")", true
+	nsOID := op.NamespaceOIDOrDefault()
+	if nsOID == PublicNamespaceOID {
+		// SchemaNameForOID is ambiguous here: pg_toast shares public's OID in
+		// this simplified model (NewInMemory's schemas map), and an operator
+		// is never created in pg_toast, so resolve the common case directly
+		// rather than risking a nondeterministic map-iteration pick.
+		schema = "public"
+	} else {
+		schema = c.SchemaNameForOID(nsOID)
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	return schema, op.Name + "(" + left + "," + right + ")", true
 }
 
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>

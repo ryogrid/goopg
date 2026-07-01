@@ -4256,6 +4256,41 @@ documentation-only and is exempt from the design-doc requirement.)
       `format_procedure` to always qualify; goopg's renderers don't), a
       small isolated fix (unconditional `schema.` prefix via an OID→schema
       lookup) tracked separately from the builtin-catalog work.
+      **2026-07-01 (loop #38, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #38"): the schema-qualification gap LANDED — DU-002 slice 412,
+      closes the loop #37 finding above.** Re-reading PG's
+      `format_operator_extended`/`format_procedure_extended` (`regproc.c`)
+      before implementing found that loop #37's proposed "unconditionally
+      qualify" fix was wrong in one case: `pg_catalog` is always implicitly
+      searched regardless of `search_path`'s content, so a builtin
+      FUNCTION/OPERATOR reference (e.g. `dumpOpclass`'s own `btint4cmp`)
+      must stay bare even under pg_dump's `search_path=''`. New
+      `catalog.RegprocedureNameAndSchema`/
+      `(*InMemory).RegoperatorNameAndSchema` resolve each object's schema
+      (`pg_catalog` for a builtin; the routine's/operator's declared
+      namespace, default `public`, for a user-defined one — with a
+      `PublicNamespaceOID` special-case, since `NewInMemory`'s `schemas` map
+      aliases both `public` and `pg_toast` to OID 2200 and a generic
+      `SchemaNameForOID` reverse lookup nondeterministically picks either);
+      new `executor.regObjectSchemaVisible` mirrors the real visibility rule
+      and gates qualification in both `regprocedure`/`regoperator`
+      `CastExpr` branches (`internal/executor/expr.go`), reusing the
+      pre-existing `searchPathSchemas` effective-search-path resolver.
+      Verified byte-identical against a live PG 18.3 instance: the loop #37
+      fixture now dumps `OPERATOR 1 public.~=~(integer,integer)` (qualified)
+      alongside `FUNCTION 1 (integer, integer) btint4cmp(integer,integer)`
+      (bare). Tests: `TestRegprocedureRegoperatorSchemaQualification`
+      (executor). Gates: `go build ./...`/`go vet` clean;
+      `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/server`+`internal/planner` suites PASS (repeated runs to
+      confirm a map-iteration flake this loop found and fixed is gone);
+      `TestPort_PgDumpConnectionSetup` PASS; `gofmt -l` flags only
+      pre-existing go1.25/1.26 comment-smart-quote drift outside this loop's
+      edited line ranges; live PG 18.3 diff above; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Deferred (ledger
+      row appended, unchanged): `FOR ORDER BY` sort-family resolution; the
+      builtin-operator catalog, now the single largest remaining blocker
+      for a realistic upstream `op_family`/`op_class` fixture.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

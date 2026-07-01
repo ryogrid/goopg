@@ -525,7 +525,10 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if ctx != nil && ctx.Catalog != nil {
 						routines = ctx.Catalog.Routines()
 					}
-					if sig, ok := catalog.RegprocedureName(uint32(oid), routines); ok {
+					if schema, sig, ok := catalog.RegprocedureNameAndSchema(uint32(oid), routines); ok {
+						if !regObjectSchemaVisible(ctx, schema) {
+							return NewStringDatum(schema + "." + sig), nil
+						}
 						return NewStringDatum(sig), nil
 					}
 					return v, nil
@@ -568,7 +571,10 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				if ctx != nil && ctx.Catalog != nil {
 					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 						if strings.EqualFold(x.TargetType, "regoperator") {
-							if sig, found := im.RegoperatorName(uint32(oid)); found {
+							if schema, sig, found := im.RegoperatorNameAndSchema(uint32(oid)); found {
+								if !regObjectSchemaVisible(ctx, schema) {
+									return NewStringDatum(schema + "." + sig), nil
+								}
 								return NewStringDatum(sig), nil
 							}
 						} else if op := im.LookupUserOperatorByOID(uint32(oid)); op != nil {
@@ -11503,6 +11509,28 @@ func searchPathSchemas(ctx *Context) []string {
 		}
 	}
 	return out
+}
+
+// regObjectSchemaVisible reports whether schema is visible for reg*-cast
+// qualification purposes (format_operator/format_procedure's own
+// OperatorIsVisible/ProcedureIsVisible check, regproc.c): pg_catalog is
+// always implicitly searched regardless of search_path content, and every
+// other schema must appear in the session's effective search_path. pg_dump
+// always connects with search_path='' (ALWAYS_SECURE_SEARCH_PATH_SQL), so
+// this is what makes dumpOpclass/dumpOpfamily's own
+// amopopr::pg_catalog.regoperator / amproc::pg_catalog.regprocedure casts
+// come back schema-qualified for a user-defined operator/function but bare
+// for a builtin one. DU-002 (M0119-0004) slice 412.
+func regObjectSchemaVisible(ctx *Context, schema string) bool {
+	if schema == "" || schema == "pg_catalog" {
+		return true
+	}
+	for _, s := range searchPathSchemas(ctx) {
+		if s == schema {
+			return true
+		}
+	}
+	return false
 }
 
 func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {

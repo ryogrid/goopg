@@ -6,7 +6,9 @@
   backgrounded loop); #32 (slice 407, COMMUTATOR/NEGATOR/RESTRICT/JOIN/
   MERGES/HASHES + unary operators); #33 (`ALTER OPERATOR ... SET (...)`,
   closing the slice-407 ledger follow-up); #34 (`CREATE OPERATOR FAMILY`,
-  slice 408); #35 (`CREATE OPERATOR CLASS` pg_opclass population, slice 409)
+  slice 408); #35 (`CREATE OPERATOR CLASS` pg_opclass population, slice 409);
+  #37 (pg_amop/pg_amproc member store, slice 411); #38
+  (`regoperator`/`regprocedure` schema-qualification, slice 412)
 
 ## Problem
 
@@ -581,3 +583,85 @@ store landed**, scoped to user-defined operators/functions as planned above.
   `TestPort_PgDumpConnectionSetup` PASS (no pg_dump regression); live PG
   18.3 diff above; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke =
   pre-commit hook.
+
+## Loop #38 — `regoperator`/`regprocedure` schema-qualification (DU-002 slice 412)
+
+Closes the loop #37 row's deferral (c): `RegoperatorName`/`RegprocedureName`
+never schema-qualified, but pg_dump's connection always runs `search_path=''`
+(`ALWAYS_SECURE_SEARCH_PATH_SQL`, `postgres/src/include/common/connect.h`,
+applied in `setup_connection` at `pg_dump.c:1379`), so `format_operator`/
+`format_procedure`'s own visibility check (`OperatorIsVisible`/
+`ProcedureIsVisible`, `regproc.c`) never finds an unqualified reference
+visible for that session — every non-`pg_catalog` object comes back
+schema-qualified.
+
+**Deviation from loop #37's proposed resume point.** That row suggested the
+"simplest correct fix" was to make both renderers *unconditionally* prepend
+`schema.`, reasoning that pg_dump's search_path is always empty so nothing is
+ever visible. Re-reading `format_operator_extended`/`format_procedure_extended`
+(`regproc.c`) before implementing surfaced a case that plan would have gotten
+wrong: PG's own doc-stated rule is that **`pg_catalog` is always implicitly
+searched regardless of `search_path`'s content** (functions.sgml, "the system
+catalog schema is always searched, whether it is mentioned in the path or
+not"). A builtin function/operator therefore stays *unqualified* in a real
+pg_dump output even though `search_path=''` — e.g. `dumpOpclass`'s own
+`FUNCTION 1 btint4cmp(int4, int4)` entry (a builtin) renders as
+`btint4cmp(integer,integer)`, not `pg_catalog.btint4cmp(integer,integer)`.
+Unconditional qualification would have force-qualified builtins too, which
+is a real (if narrow) accuracy regression the byte-diff below would not have
+caught on its own (the fixture's only FUNCTION entry happens to be builtin,
+so this loop's live-diff exercises exactly that case).
+
+- New `catalog.RegprocedureNameAndSchema`/`(*InMemory).RegoperatorNameAndSchema`
+  (returning `(schema, sig, ok)` alongside the existing bare-name functions,
+  which now delegate to them) resolve the object's schema: `"pg_catalog"` for
+  a builtin `regprocedure` (matches `pgProcArgTypeNamesByOID`'s builtin
+  branch), the `CREATE FUNCTION` routine's declared `Schema` (default
+  `"public"`) for a user-defined one, and the operator's `NamespaceOID`
+  (default `"public"`) for `regoperator` — with a special case for
+  `PublicNamespaceOID` (2200), since `NewInMemory`'s `schemas` map aliases
+  both `"public"` and `"pg_toast"` to that same OID (a pre-existing
+  simplified-model quirk) and a plain `SchemaNameForOID` reverse lookup would
+  nondeterministically pick either name depending on Go's randomized map
+  iteration order — caught by an intermittent test failure
+  (`pg_toast.~=~(integer,integer)` instead of `public.~=~(...)`) when the
+  full `internal/executor` suite ran rather than the new test in isolation.
+- New `executor.regObjectSchemaVisible(ctx, schema)` mirrors
+  `OperatorIsVisible`/`ProcedureIsVisible`'s actual rule: `pg_catalog` (or an
+  empty schema) is always visible; every other schema must appear in
+  `searchPathSchemas(ctx)` (the session's already-existing effective
+  search_path resolver, reused as-is — `currentSchemaFromSearchPath`'s own
+  helper). Wired into both `regprocedure`/`regoperator` `CastExpr` branches
+  in `internal/executor/expr.go`: schema-qualify only when
+  `!regObjectSchemaVisible(ctx, schema)`.
+- `appendTypedCellText`'s direct-column-typed `regprocedure` rendering
+  (`internal/server/dispatch.go`) is intentionally left unchanged: it has no
+  per-session context to consult (`s.cfg.Catalog` is server-global, not
+  connection-scoped), and `dumpOpclass`/`dumpOpfamily` never reach it anyway
+  — both always cast explicitly (`amproc::pg_catalog.regprocedure`,
+  confirmed by grepping `pg_dump.c`), which routes through the `CastExpr`
+  path above, not the raw-column-type renderer.
+- **Verified against a freshly-built, live PG 18.3 instance**
+  (`postgres/local_install`) in this loop: the exact loop #37 fixture
+  (`CREATE OPERATOR public.~=~ ...; CREATE OPERATOR CLASS public.op_class
+  ... AS OPERATOR 1 ~=~ (int4, int4), FUNCTION 1 btint4cmp(int4, int4);`)
+  now dumps byte-identical on both engines — `OPERATOR 1
+  public.~=~(integer,integer)` (qualified, user-defined) alongside
+  `FUNCTION 1 (integer, integer) btint4cmp(integer,integer)` (bare,
+  builtin), closing the last known gap loop #37 left open.
+- Tests: `TestRegprocedureRegoperatorSchemaQualification` (executor,
+  new `regoperator_schema_qualify_test.go`) — pins bare rendering under the
+  default `"$user", public` search_path, qualified rendering under
+  `search_path=''` for a user-defined function/operator, and bare rendering
+  for a builtin function under *both*. Gates: `go build ./...`/`go vet`
+  clean; `internal/catalog`+`internal/executor`+`internal/parser`+
+  `internal/server`+`internal/planner` suites PASS (run repeatedly to
+  confirm the map-iteration flake above is gone); `TestPort_PgDumpConnectionSetup`
+  PASS; `gofmt -l` flags only pre-existing go1.25/1.26 comment-smart-quote
+  drift on the touched files (confirmed the diff hunks don't overlap this
+  loop's edited line ranges); live PG 18.3 diff above; TPC-H spotcheck
+  Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+- Deferred (unchanged, ledger rows carried forward): `FOR ORDER BY`
+  sort-family resolution (loop #37 (a)); the builtin-operator catalog (loop
+  #36/#37 (b)) remains the single largest blocker for a realistic
+  `op_family`/`op_class` fixture.
