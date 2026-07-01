@@ -1,64 +1,82 @@
-Task: M0117-0007 — COPY commit-site follow-up (Effort S, flagged in loop #49's
-design-doc "Still open" list). COMPLETE and committed/pushed this loop (#50).
-fix_plan's M0117-0007 box stays `[ ]` (open) — this closed only the COPY-wiring
-gap; the real remaining scope (latency reduction) is unchanged and still open.
+Task: M0117-0007 Part C — lazy CLOG write-back for async commits +
+checkpoint-driven flush (gap G8's latency win; the item the loop #49/#50
+"Still open" section called the real remaining scope). COMPLETE and
+committed/pushed this loop (#51), commit cda0cbe3. fix_plan's M0117-0007 box
+is now `[x]` — fully closed.
 
-Files: internal/server/copy.go (`copyInState` +`asyncCommit bool` field;
-+`commitCopyTx(mgr,tx,asyncCommit)` helper; `dispatchCopyViaExecutor` gained a
-`sess *config.SessionRegistry` param, computes `asyncCommit :=
-sessionAsyncCommit(sess)`, sets `ectx.AsyncCommit`, `CopyTo`/file-`CopyFrom`
-branches now call `ectx.CommitTransaction(tx)` instead of
-`s.cfg.TxnMgr.Commit(tx)`; `copyInState{}` construction site stores
-`asyncCommit`; `handleCopyInFrame`'s 2 `st.mgr.Commit(st.tx)` call sites →
-`commitCopyTx(st.mgr, st.tx, st.asyncCommit)`; `handleQueryOrCopy`'s call site
-passes `sess` through); internal/server/copy_async_commit_test.go (NEW —
-`TestCommitCopyTxRespectsAsyncCommit`, mirrors
-`TestContextCommitTransactionRespectsAsyncCommit`'s waitLocalFlush-sequence
-assertion for the new helper); docs/design/0117-0007-clog-async-commit-lsn.md
-(new "COPY's own commit call sites (LANDED 2026-07-02, loop #50)" paragraph;
-"Still open" COPY bullet struck through/closed; Testing + Status/merge
-sections updated); docs/design/README.md (0117-0007 row updated); .ralph/
-fix_plan.md (M0117-0007 + M0119-0002 entries updated — box stays unchecked,
-only the COPY sub-item is marked done); .ralph/deferral_ledger.md (new row
-appended cross-referencing the loop #49 row; item (1) — the checkpoint/
-lazy-write-back latency gap — explicitly called out as still fully open and
-unaffected by this loop).
+Files: internal/mvcc/clog.go (`setStatusWithLSN` now short-circuits before
+`c.groupUpdate` whenever `lsn != 0` i.e. async commit — leaves the page dirty
+instead of forcing the synchronous group-commit flush; new `CLog.FlushAll()
+error` thin wrapper over `pool.flushDirty()`, nil-safe pre-EnablePGSLRUMirror,
+structurally satisfies `wal.DirtyPageFlusher` with no import); internal/wal/
+checkpointer.go (`CheckpointerConfig.FlushCLOGFn func() error` new field,
+called in `runCheckpoint`'s flush phase right after the primary
+`c.flushDirty(pacer)` and BEFORE the redo LSN is sampled; unlike
+PostCheckpointFn/TruncateCLOGFn its error FAILS the checkpoint); internal/
+initdb/open.go (wires `FlushCLOGFn: clog.FlushAll` into the CheckpointerConfig
+literal); internal/mvcc/clog_asynccommit_test.go (rewrote
+`TestCLogSetCommittedWithLSNFiresBarrierOnFlush` → `...DefersFlush`: now
+asserts SetCommittedWithLSN alone fires the barrier 0 times, and a subsequent
+FlushAll() fires it once; new `TestCLogFlushAllBeforePoolExistsIsNoop`);
+internal/wal/checkpointer_test.go (new `TestCheckpointerCallsFlushCLOGFn` +
+`TestCheckpointerFlushCLOGFnErrorFailsCheckpoint`); internal/initdb/
+xact_recovery_test.go (new `TestReplayCLogFromWAL_RecoversUnflushedAsyncCommit`
+— proves the crash-safety invariant: an async-committed CLOG page that's
+NEVER flushed is reconstructed after a simulated crash+restart purely from
+the durable WAL record via the existing `replayCLogFromWAL` backstop);
+docs/design/0117-0007-clog-async-commit-lsn.md (new "Part C" section incl. a
+crash-safety proof paragraph + a documented residual race, status line and
+Testing/Status-merge sections updated); docs/design/README.md (0117-0007 row
+rewritten for Parts A-C); .ralph/fix_plan.md (M0117-0007 box checked `[x]`,
+Part C paragraph appended; M0119-0002 entry updated — CLOG-tail latency
+follow-up now DONE, only M0117-0008 Part B remains under that umbrella);
+.ralph/deferral_ledger.md (new row: residual redo-pointer-sampled-after-flush
+race in internal/wal/checkpointer.go's runCheckpoint, symmetric with the heap
+pool's own checkpoint flushing, NOT CLOG-specific — deferred as a distinct
+whole-checkpoint-subsystem redesign).
 
-Key symbols: server.commitCopyTx, server.copyInState.asyncCommit,
-server.dispatchCopyViaExecutor(..., sess), executor.Context.CommitTransaction
-(the pattern this mirrors), server.sessionAsyncCommit (unchanged, reused).
+Key symbols: mvcc.CLog.setStatusWithLSN, mvcc.CLog.FlushAll,
+wal.CheckpointerConfig.FlushCLOGFn, wal.Checkpointer.runCheckpoint,
+initdb.xactStampAndAdvance/replayCLogFromWAL (the crash-recovery backstop
+this change now leans on more heavily).
 
-Findings: `runInlineCopy`/`runInlineCopyFromStdin` (the multi-statement-batch
-COPY path used by psql's `\;`-joined commands) needed NO change — they already
-share the batch's `ectx`, which already had `AsyncCommit` set and is committed
-once by the dispatch loop via `ectx.CommitTransaction` (confirmed by reading
-dispatch.go's multi-statement commit call sites before touching anything).
-Only the single-COPY path (`dispatchCopyViaExecutor` + `handleCopyInFrame`,
-reached from `handleQueryOrCopy`'s non-multi-statement branch) had raw
-`TxnMgr.Commit`/`mgr.Commit` calls bypassing the session's synchronous_commit
-setting. This item is now fully closed — the M0117-0007 "Still open" list has
-exactly ONE remaining entry (the checkpoint-integration / lazy-CLOG-write-back
-latency work), no other loose threads.
+Findings: the only caller that ever passes lsn != 0 into setStatusWithLSN is
+SetCommittedWithLSN (async commit path in open.go's xactMarker hook); every
+sync caller (SetCommitted, aborts, subcommits) passes lsn == 0 and is
+byte-for-byte unaffected by this change. GetStatus reads the resident buffer
+pool directly (not disk), so in-memory status visibility is unaffected by
+deferring the durable write-back. flushDirty() already drains ALL dirty
+pages (not just the caller's own), so a later sync commit's groupUpdate
+"rescues" any earlier async-dirtied pages for free — no correctness gap
+there. Confirmed via a dedicated crash-simulation test that
+replayCLogFromWAL (the pre-existing "CLOG is a write-behind cache, WAL is
+authoritative" backstop, itself pre-existing infrastructure) fully covers
+the crash-safety requirement this change now depends on more heavily; this
+is a WIDER instance of an already-relied-upon narrow race (previously a few
+nanoseconds mid-commit since M0117-0005, now up to checkpoint_timeout for
+async-only workloads), not a new failure mode.
 
-Next step: the one remaining follow-up for M0117-0007's fix_plan box to close
-is the Effort-L checkpoint-integration item — needs a dedicated full-gate
-session: (a) `CLog.setStatusWithLSN`'s call to `groupUpdate` becomes
-conditional (skip durable write-back for an async commit, leave page dirty);
-(b) `CLog`/`clogBufferPool` gains a `FlushAll`-style entry point implementing
-`wal.DirtyPageFlusher`, registered with `wal.Checkpointer` alongside the heap
-pool, wired at `internal/initdb/open.go`'s Checkpointer construction site.
-Resume point fully detailed in the design doc's "Still open" section and the
-loop #49 ledger row. M0117-0008 Part B (datfrozenxid persistence) remains the
-other M0119-0002 sibling, independent of this. M0119-0004's dump-ordering /
-btree-hash amadjustmembers / builtin-operator-catalog items are unrelated,
-independently resumable alternatives if CLOG work is not picked up next.
+Next step: M0117-0007 is fully closed — no further work needed on that
+milestone. Two independently-resumable options for next loop: (a)
+M0117-0008 Part B (on-disk datfrozenxid persistence — needs a runtime
+shared-catalog RelFileNode resolver + heap_inplace_update buffer-lock/WAL
+path, 5-step plan already in design `0117-0008-*`); (b) the deferred
+redo-pointer-sampled-after-flush checkpoint race just ledgered above (its
+own dedicated design pass + full recovery/standby E2E gate — explicitly
+NOT a CLOG-scoped follow-up, touches heap-page durability/retention/standby
+attach too); (c) M0119-0004's remaining pg_dump/ACL items are unrelated,
+independently resumable alternatives if neither (a) nor (b) is picked up.
 
-Gates run this loop: go build ./... clean; go vet ./... clean; gofmt -l clean
-on all touched files; go test -count=1 ./internal/server/... ./internal/mvcc/...
-./internal/executor/... PASS; go test -race ./internal/mvcc/... ./internal/wal/...
-PASS; scripts/tpch-spotcheck.sh RESULT=PASS (Q12=2 rows/27.52s, Q13=33
-rows/88.92s); make ralph-state-guard OK (self-repaired the usual stale
-"completed" progress marker vs "running" status); pgbench smoke ran and PASSED
-via the pre-commit hook at commit time (188-245 TPS across the 3 builtin
-transaction types, 0 failed). Committed 68529194, pushed to
-align-data-structure-with-pg.
+Gates run this loop: go build ./... clean; go vet ./... clean; gofmt -l
+clean on all touched files; go test -count=1 ./internal/mvcc/...
+./internal/wal/... ./internal/initdb/... ./internal/server/...
+./internal/executor/... PASS (including the 2 new packages' new tests); go
+test -race ./internal/mvcc/... ./internal/wal/... PASS; go test -race -run
+"TestE2E_PhysicalReplication|TestE2E_ChecksumStreamingGoopgToPG|
+TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart" ./internal/testport/...
+PASS; scripts/tpch-spotcheck.sh RESULT=PASS (Q12=2 rows/27.35s, Q13=33
+rows/89.32s); make ralph-state-guard OK (self-repaired the usual stale
+"completed" progress marker vs "running" status); pgbench smoke ran and
+PASSED via the pre-commit hook at commit time (183-14000 TPS across the 3
+builtin transaction types depending on workload, 0 failed). Committed
+cda0cbe3, pushed to align-data-structure-with-pg.
