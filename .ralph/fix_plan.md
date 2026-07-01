@@ -197,10 +197,16 @@ role/database persistence is a real goopg feature gap.
       the page dirty) PLUS a checkpoint-driven CLOG flush (`CLog`/
       `clogBufferPool` implements no `wal.DirtyPageFlusher`, so nothing bounds
       how long a would-be-deferred dirty page stays unflushed) — a separate,
-      larger, checkpoint-subsystem-touching follow-up. COPY's own commit sites
-      (`internal/server/copy.go`, 4 sites) also stay unwired (always
-      synchronous) — narrower, self-contained, ledgered. Needs TPC-H + crash/
-      standby E2E — both PASS. Design `0117-0007-*`.
+      larger, checkpoint-subsystem-touching follow-up (the only remaining item
+      before this box can close). **COPY's own commit sites LANDED 2026-07-02
+      (loop #50):** all 4 sites in `internal/server/copy.go`
+      (`dispatchCopyViaExecutor`'s `CopyTo`/file-`CopyFrom` via
+      `ectx.CommitTransaction`, `handleCopyInFrame`'s two streaming
+      `COPY FROM STDIN` commits via a new `commitCopyTx` helper +
+      `copyInState.asyncCommit`) now honor `synchronous_commit`; regression
+      `TestCommitCopyTxRespectsAsyncCommit`. Needs TPC-H + crash/standby E2E —
+      both PASS (TPC-H re-verified 2026-07-02: Q12=2/Q13=33). Design
+      `0117-0007-*`.
 - [ ] **M0117-0008 — datfrozenxid persistence (Effort M).** Part A DONE (dual-store
       consistency for all 4 CLOG status codes, satisfied via the M0117-0004 chain;
       `clog_dual_store_consistency_test.go`). **Part B (DEFERRED, ledger 2026-06-15):**
@@ -2110,7 +2116,8 @@ documentation-only and is exempt from the design-doc requirement.)
       and bank/flat-file removal (Part C) are both DONE** (2026-06-29 loop #11 /
       2026-07-01 loop #47); **M0117-0007 Part B's mechanical wiring is DONE**
       (2026-07-02 loop #49 — barrier live, LSN association, GUC threading, all
-      interactive commit call sites) **but its actual latency win is NOT** (CLOG's
+      interactive commit call sites; **COPY's own 4 commit sites also DONE
+      2026-07-02 loop #50**) **but its actual latency win is NOT** (CLOG's
       own eager per-commit `flushDirty` immediately re-triggers the flush regardless;
       needs a lazy-write-back + checkpoint-driven-CLOG-flush follow-up — see the
       M0117-0007 entry above and its design doc's "Still open"). This item now

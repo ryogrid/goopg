@@ -117,9 +117,26 @@ one new `Context.CommitTransaction(tx)` method (`operators_tx.go`'s explicit
 COMMIT, both `dispatch.go` autocommit branches including the PL/pgSQL commit
 chain, `dispatch_extended.go`'s extended-protocol autocommit — 2PC's
 `COMMIT PREPARED` reuses these same paths via `executeOneSimpleStmt`, so it is
-covered without a separate call site). COPY's own commit call sites
-(`internal/server/copy.go`, 4 sites) are **not** wired — see "Still open"
-below.
+covered without a separate call site).
+
+**COPY's own commit call sites (LANDED 2026-07-02, loop #50).** The 4
+commit sites in `internal/server/copy.go` flagged as a follow-up in the
+previous "Still open" section are now wired: `dispatchCopyViaExecutor`
+computes `asyncCommit := sessionAsyncCommit(sess)` (a new `sess
+*config.SessionRegistry` parameter, threaded from `handleQueryOrCopy` which
+already had it), sets `ectx.AsyncCommit`, and its `CopyTo` / file-based
+`CopyFrom` branches now call `ectx.CommitTransaction(tx)` instead of calling
+`s.cfg.TxnMgr.Commit(tx)` directly. The two `copyInState`-based streaming
+`COPY FROM STDIN` commits (in `handleCopyInFrame`, reached from a later wire
+frame with no `ectx` in scope) go through a new package-level
+`commitCopyTx(mgr, tx, asyncCommit)` helper — the same
+`if asyncCommit { CommitAsync } else { Commit }` shape as
+`Context.CommitTransaction` — keyed off a new `copyInState.asyncCommit bool`
+field snapshotted at construction time. `runInlineCopy`/
+`runInlineCopyFromStdin` (the multi-statement-batch COPY path) were already
+covered before this loop: they share the batch's `ectx`, which already had
+`AsyncCommit` set and is committed once by the dispatch loop via
+`ectx.CommitTransaction`.
 
 **Why this alone does not yet reduce commit latency (read before assuming
 `synchronous_commit=off` is fast in goopg).** M0117-0005's group-commit design
@@ -185,19 +202,8 @@ inert-safe under `=off` (correct, not yet faster).
   is constructed). Needs the full TPC-H spot-check + crash-recovery / standby
   E2E gate this design doc already calls for, since it changes when CLOG
   durability actually happens.
-- **COPY's own commit call sites** (`internal/server/copy.go`: `runCopyToStream`
-  wrapper's commit, the file-based `COPY FROM` commit, and the two
-  `copyInState`-based streaming `COPY FROM STDIN` commits) still always call
-  the synchronous `TxnMgr.Commit` regardless of the session's
-  `synchronous_commit` setting. The two `ectx`-scoped sites are a trivial
-  follow-up (`ectx.CommitTransaction(tx)`, once `ectx.AsyncCommit` is also set
-  there — it currently isn't, since `runInlineCopy*` don't read
-  `synchronous_commit` at all); the two `copyInState`-based sites need a small
-  `asyncCommit bool` field threaded onto that struct at construction time
-  (`runInlineCopyFromStdin`, which does have `ectx` in scope). Left
-  unwired since COPY is a bulk-load path where synchronous behaviour is a
-  conservative, safe default, not a correctness concern — but it is a real,
-  narrow gap in `synchronous_commit` consistency across commit call sites.
+- ~~**COPY's own commit call sites**~~ — **LANDED 2026-07-02, loop #50**, see
+  the "COPY's own commit call sites" paragraph above. This item is closed.
 
 ## Faithfulness / divergence notes
 
@@ -263,9 +269,27 @@ every touched file; `go test -count=1 ./internal/mvcc/... ./internal/executor/..
 (`scripts/tpch-spotcheck.sh`) Q12=2/Q13=33 PASS; pgbench smoke via the
 pre-commit hook.
 
+**Part B / COPY follow-up (2026-07-02, loop #50) adds:**
+
+- `internal/server/copy_async_commit_test.go`'s
+  `TestCommitCopyTxRespectsAsyncCommit` — pins the same
+  waitLocalFlush-sequence contract as
+  `TestContextCommitTransactionRespectsAsyncCommit`, but for the new
+  package-level `commitCopyTx` helper (`asyncCommit=false` → `waitLocalFlush=
+  true` via `Commit`; `asyncCommit=true` → `waitLocalFlush=false` via
+  `CommitAsync`).
+
+COPY follow-up gate (all PASS): `go build ./...`; `go vet ./...`; `gofmt -l`
+clean on `internal/server/copy.go` + the new test; `go test -count=1
+./internal/server/... ./internal/mvcc/... ./internal/executor/...`; `go test
+-race ./internal/mvcc/... ./internal/wal/...`; TPC-H spot-check
+(`scripts/tpch-spotcheck.sh`) Q12=2/Q13=33 PASS.
+
 ## Status / merge
 
 Landed directly on `align-data-structure-with-pg` (Part A: commit `1f1100e8`;
-M0117-0006 Parts A–C: commits through `0ab77d45`; Part B: this loop). The
-"Still open" section above is the actual remaining scope — not a merge
+M0117-0006 Parts A–C: commits through `0ab77d45`; Part B mechanical wiring:
+loop #49; Part B / COPY commit-site follow-up: loop #50). The "Still open"
+section above (lazy CLOG write-back + checkpoint-driven CLOG flush) is the
+actual remaining scope for the fix_plan box to close — not a merge
 formality.

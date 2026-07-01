@@ -30,10 +30,22 @@ type copyInState struct {
 	partialRow bool
 
 	// Executor path.
-	fromExec *executor.CopyFromExecutor
-	lineBuf  []byte
-	tx       mvcc.Transaction
-	mgr      *mvcc.Manager
+	fromExec    *executor.CopyFromExecutor
+	lineBuf     []byte
+	tx          mvcc.Transaction
+	mgr         *mvcc.Manager
+	asyncCommit bool
+}
+
+// commitCopyTx commits tx through mgr, honoring the session-effective
+// synchronous_commit GUC the same way executor.Context.CommitTransaction
+// does for every other live commit call site. M0117-0007 Part B follow-up:
+// COPY's own commit sites were previously always synchronous.
+func commitCopyTx(mgr *mvcc.Manager, tx mvcc.Transaction, asyncCommit bool) error {
+	if asyncCommit {
+		return mgr.CommitAsync(tx)
+	}
+	return mgr.Commit(tx)
 }
 
 func (s *Server) handleQueryOrCopy(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, payload []byte, connTx *connTxState, prepStmts *preparedStatements) (*copyInState, error) {
@@ -65,7 +77,7 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, r *protocol.FrameReader,
 	// (42P01, 42703, 42601, 0A000); the wire layer just forwards
 	// them.
 	if s.cfg.hasStorage() {
-		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable, connTx)
+		st, err := s.dispatchCopyViaExecutor(ctx, w, matchable, connTx, sess)
 		if err != nil {
 			return nil, err
 		}
@@ -99,7 +111,7 @@ func (s *Server) handleQueryOrCopy(ctx context.Context, r *protocol.FrameReader,
 // transaction state (may be nil); its ProcNum is forwarded to the
 // COPY-internal transaction so it does not collide with the
 // connection's own ProcArray slot.
-func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string, connTx *connTxState) (*copyInState, error) {
+func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameWriter, sql string, connTx *connTxState, sess *config.SessionRegistry) (*copyInState, error) {
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// Render parser syntax errors the same way the main simple-query
@@ -175,6 +187,8 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	ectx.Tx = tx
 	ectx.Snap = snap
 	ectx.LogCanonical = s.cfg.LogCanonical
+	asyncCommit := sessionAsyncCommit(sess)
+	ectx.AsyncCommit = asyncCommit
 
 	switch plan.Direction {
 	case planner.CopyTo:
@@ -190,7 +204,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 		}
 		// Commit BEFORE CommandComplete so COPY (DML … RETURNING)
 		// writes are durable/visible by the time the client proceeds.
-		if cErr := s.cfg.TxnMgr.Commit(tx); cErr != nil {
+		if cErr := ectx.CommitTransaction(tx); cErr != nil {
 			if wErr := s.writeQueryError(w, sqlstate.SystemError, cErr.Error()); wErr != nil {
 				return nil, wErr
 			}
@@ -214,7 +228,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 				}
 				return nil, nil
 			}
-			_ = s.cfg.TxnMgr.Commit(tx)
+			_ = ectx.CommitTransaction(tx)
 			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", count)); err != nil {
 				return nil, err
 			}
@@ -240,9 +254,10 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 			return nil, err
 		}
 		return &copyInState{
-			fromExec: from,
-			tx:       tx,
-			mgr:      s.cfg.TxnMgr,
+			fromExec:    from,
+			tx:          tx,
+			mgr:         s.cfg.TxnMgr,
+			asyncCommit: asyncCommit,
 		}, nil
 	}
 	_ = s.cfg.TxnMgr.Rollback(tx)
@@ -494,7 +509,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 					// Trailer found inside CopyData — treat as CopyDone.
 					rows := st.fromExec.RowsInserted()
 					if st.mgr != nil {
-						_ = st.mgr.Commit(st.tx)
+						_ = commitCopyTx(st.mgr, st.tx, st.asyncCommit)
 					}
 					if cerr := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); cerr != nil {
 						return true, cerr
@@ -559,7 +574,7 @@ func (s *Server) handleCopyInFrame(w *protocol.FrameWriter, st *copyInState, f p
 			}
 			rows := st.fromExec.RowsInserted()
 			if st.mgr != nil {
-				_ = st.mgr.Commit(st.tx)
+				_ = commitCopyTx(st.mgr, st.tx, st.asyncCommit)
 			}
 			if err := w.WriteCommandComplete(fmt.Sprintf("COPY %d", rows)); err != nil {
 				return true, err
