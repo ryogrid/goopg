@@ -476,3 +476,108 @@ user-defined ones). The member store itself should be scoped to
 user-defined operators/functions first (fully resolvable today) with the
 builtin-operator-catalog gap ledgered separately, per the 2026-07-01 slice
 410 deferral-ledger row.
+
+**2026-07-01 (loop #37, slice 411): the pg_amop/pg_amproc + pg_depend member
+store landed**, scoped to user-defined operators/functions as planned above.
+
+- Parser: `CreateOpClassStmt.Members []OpClassMember` — `parseCreateOpClassTail`
+  (`internal/parser/ddl.go`) now captures every `OPERATOR`/`FUNCTION` AS-list
+  entry (strategy/support number, operator/function name, explicit operand/
+  arg types when given) instead of discarding everything but `FUNCTION 2`.
+  Reused the existing `parseOperatorRefName` helper (built for CREATE
+  OPERATOR's own COMMUTATOR/NEGATOR clauses, slice 407) for the
+  `OPERATOR(schema.op)`-qualified-or-bare operator-name grammar. `opclass_purpose`
+  (`FOR SEARCH` / `FOR ORDER BY family_name`) is parsed-and-discarded — the
+  referenced sort opfamily is not resolved/stored (amopsortfamily stays 0,
+  amoppurpose always `'s'`); this is a new, narrow deferral (no fixture in
+  scope needs an ordering operator).
+- Catalog: new `AmOpMember`/`AmProcMember` (append-only slices on `InMemory`,
+  `RegisterAmOpMember`/`RegisterAmProcMember`/`ListAmOpMembers`/
+  `ListAmProcMembers`); `pg_amop`/`pg_amproc`'s `VirtualRows` now render them
+  (previously hardcoded `nil`); `dependVirtualRows` emits the two pg_depend
+  rows per member that `dumpOpclass`'s own query needs (`classid=pg_amop/
+  pg_amproc → refclassid=pg_operator/pg_proc`, `deptype='n'`; `→
+  refclassid=pg_opclass`, `deptype='i'`) mirroring `storeOperators`/
+  `storeProcedures` (`opclasscmds.c`) for a class-attributed ("hard")
+  reference — confirmed against `getDependencies`' own SQL that `'i'` rows
+  are correctly excluded from its generic pg_amop→pg_opfamily dependency
+  rewrite (would otherwise be a self-dependency). `DropUserOperatorClass` now
+  cascades member cleanup by `ClassOID` so a create-then-drop-then-dump
+  sequence leaves no ghost rows.
+- Executor: `execCreateOpClass` resolves each member via
+  `resolveOpClassOperator`/`resolveOpClassFunction`
+  (`internal/executor/operators_ddl.go`) — `LookupUserOperator`/new
+  `LookupUserOperatorByName` (schema+name only, lowest-OID tiebreak, used
+  when the AS-list entry has no explicit operand types) for OPERATOR
+  entries; `Routines().LookupByName` then `catalog.LookupBuiltinProc` for
+  FUNCTION entries. An entry naming an unresolvable builtin operator is
+  silently dropped — same as every entry's behavior before this loop, now
+  correctly scoped to just the unresolvable subset instead of everything.
+  Unspecified lefttype/righttype default from the resolved operator's own
+  `oprleft`/`oprright` or the resolved function's own first-arg type
+  (mirroring `assignOperTypes`/`assignProcTypes`, `opclasscmds.c`).
+- **Two adjacent bugs found and fixed via live-PG diff (not part of the
+  member-store feature itself, but directly exposed by it):**
+  1. `::regtype` of `InvalidOid` (0) rendered the literal `"0"` instead of
+     PG's `"-"` (`regtypeout`, `regproc.c`) — a class with real members and
+     no `STORAGE` clause dumped a spurious `STORAGE 0` line (the same
+     `KeyTypeOID == 0` gap this doc's slice-409 section flagged as
+     "unverified" is now CONFIRMED and fixed). Guard added to both the
+     `KindString`-numeric-parse and `KindInt` branches of the `regtype`
+     `CastExpr` in `internal/executor/expr.go`, mirroring the existing
+     `regclass` InvalidOid guard next to it.
+  2. `::regoperator`/`::regoper` had no resolution at all (recognized as a
+     type name, zero `CastExpr` handling) — `dumpOpclass`'s
+     `amopopr::pg_catalog.regoperator` cast rendered a bare numeric OID.
+     New `catalog.(*InMemory).RegoperatorName` (mirrors `RegprocedureName`,
+     `format_operator`/`regoperatorout` shape `name(lefttype,righttype)`,
+     `"NONE"` for a missing/unary side) wired into a new `regoper`/
+     `regoperator` `CastExpr` branch; `InvalidOid` renders as the literal
+     `"0"` (regoperatorout/regoperout's own sentinel — NOT `"-"` like
+     regproc/regtype, confirmed from `postgres/src/backend/utils/adt/
+     regproc.c`).
+  3. Added `btint4cmp` (pg_proc.dat oid 351) to the hand-curated
+     `builtinProcsByName` set so a `FUNCTION 1` opclass entry can reference a
+     semantically valid (integer-returning) btree comparator — real PG's
+     `opclasscmds.c` rejects a boolean-returning proc for strategy 1 with
+     "ordering comparison functions must return integer", caught via the
+     live-PG diff below.
+- **Verified end-to-end against a freshly-built, live PG 18.3 instance**
+  (`postgres/local_install`) in this loop:
+  `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG =
+  int4); CREATE OPERATOR FAMILY public.op_family USING btree; CREATE
+  OPERATOR CLASS public.op_class FOR TYPE int4 USING btree FAMILY
+  public.op_family AS OPERATOR 1 ~=~ (int4, int4), FUNCTION 1
+  btint4cmp(int4, int4);` dumps byte-identical on both engines EXCEPT one
+  known, deferred gap (below): PG prefixes the OPERATOR entry's operator
+  name with its schema (`public.~=~(integer,integer)`), goopg does not
+  (`~=~(integer,integer)`).
+- **New deferral (confirmed via the live-PG diff above, not previously
+  tracked): `RegoperatorName`/`RegprocedureName` (slice 410) never
+  schema-qualify.** Root cause: `pg_dump`'s connection ALWAYS runs with
+  `search_path=''` (`ALWAYS_SECURE_SEARCH_PATH_SQL`,
+  `postgres/src/include/common/connect.h`, applied at `connectdb.c:228`), so
+  `format_operator`/`format_procedure`'s own visibility check
+  (`OperatorIsVisible`/`FunctionIsVisible`) NEVER finds an unqualified name
+  visible for pg_dump's session specifically — every reference is
+  force-qualified, even for an object in `public`. goopg tracks no
+  search_path/visibility model at all, so both renderers always emit an
+  unqualified name. This is a real, confirmed gap (not merely a theoretical
+  edge case) but a proper fix needs schema/search_path visibility
+  infrastructure that doesn't exist yet — out of scope for this slice.
+  Resume point: add an `InMemory` OID→schema-name lookup (no such helper
+  exists today; `allSchemasLocked()` returns `{oid, name}` pairs internally
+  but isn't exported) and, since pg_dump's connection is provably ALWAYS
+  unqualified-nothing-visible, the simplest correct fix is to make
+  `RegoperatorName`/`RegprocedureName` unconditionally prepend
+  `schema.` — no visibility-check logic needed, because pg_dump's own
+  connection never has anything visible. Apply to both renderers together
+  (same architectural cause, `internal/catalog/catalog.go`).
+- Tests: `TestCreateOperatorClassMembersPopulateAmopAmproc`,
+  `TestCreateOperatorClassMemberUnresolvableBuiltinDropped`,
+  `TestDropOperatorClassRemovesMembers` (executor,
+  `create_operator_test.go`). Gates: `go build ./...`/`go vet` clean;
+  `internal/parser`+`internal/catalog`+`internal/executor` suites PASS;
+  `TestPort_PgDumpConnectionSetup` PASS (no pg_dump regression); live PG
+  18.3 diff above; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke =
+  pre-commit hook.

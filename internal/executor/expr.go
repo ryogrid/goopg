@@ -549,6 +549,36 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			}
 			return v, nil
 		}
+		if strings.EqualFold(x.TargetType, "regoper") || strings.EqualFold(x.TargetType, "regoperator") {
+			// An OID input renders via regoperout/regoperatorout: InvalidOid
+			// (0) becomes the literal "0" (unlike regproc/regtype's "-" —
+			// regproc.c's regoperout/regoperatorout both special-case
+			// InvalidOid to "0"). regoperator additionally renders the
+			// (lefttype,righttype) pair ("NONE" for a missing/unary side,
+			// format_operator) so dumpOpclass/dumpOpfamily's
+			// amopopr::pg_catalog.regoperator cast resolves to a real name
+			// instead of a bare OID. Only user-defined operators are
+			// resolvable (goopg has no builtin-operator catalog — deferred,
+			// see the ledger). DU-002 (M0119-0004) slice 411.
+			if v.Kind == KindInt {
+				oid := v.Int
+				if oid == 0 {
+					return NewStringDatum("0"), nil
+				}
+				if ctx != nil && ctx.Catalog != nil {
+					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+						if strings.EqualFold(x.TargetType, "regoperator") {
+							if sig, found := im.RegoperatorName(uint32(oid)); found {
+								return NewStringDatum(sig), nil
+							}
+						} else if op := im.LookupUserOperatorByOID(uint32(oid)); op != nil {
+							return NewStringDatum(op.Name), nil
+						}
+					}
+				}
+			}
+			return v, nil
+		}
 		if strings.EqualFold(x.TargetType, "regtype") && ctx != nil && ctx.Catalog != nil {
 			switch v.Kind {
 			case KindString:
@@ -577,8 +607,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				if typName == "" {
 					return NewStringDatum("{}"), nil
 				}
-				// Try as an OID integer string (e.g. "16" → "boolean")
+				// Try as an OID integer string (e.g. "16" → "boolean").
+				// InvalidOid (0) renders as "-", matching PG's regtypeout
+				// (src/backend/utils/adt/regproc.c) — e.g. pg_opclass.opckeytype
+				// is 0 when no STORAGE clause was given.
 				if oid, parseErr := strconv.ParseInt(typName, 10, 64); parseErr == nil {
+					if oid == 0 {
+						return NewStringDatum("-"), nil
+					}
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
@@ -593,7 +629,10 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// Built-in type name → return itself
 				return v, nil
 			case KindInt:
-				// OID integer → type name
+				// OID integer → type name; InvalidOid (0) renders as "-" (see above).
+				if v.Int == 0 {
+					return NewStringDatum("-"), nil
+				}
 				if name := oidToBuiltinTypeName(uint32(v.Int)); name != "" {
 					return NewStringDatum(name), nil
 				}

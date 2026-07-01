@@ -1290,40 +1290,88 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 			stmt.StorageType = strings.ToLower(storageType.String())
 		} else if isOperator {
 			p.advance() // consume "operator"
-			// Skip strategy number.
+			strategyNum := 0
 			if p.cur().Kind == TokenIntLit {
+				strategyNum, _ = strconv.Atoi(p.cur().Value)
 				p.advance()
 			}
-			// Skip operator name (may be =, <>, OPERATOR(...), or bare ident).
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				p.skipBalancedParens() // OPERATOR(schema.op) qualified form
-			} else if p.cur().Kind == TokenOperator {
-				p.advance() // simple operator like =, <, >, <=
-			} else if p.cur().Kind == TokenIdent {
-				p.advance() // bare identifier operator
+			// Operator name (may be a qualified OPERATOR(schema.op) form, a
+			// bare/schema-qualified symbol, or a named operator).
+			opRef, operr := p.parseOperatorRefName()
+			if operr != nil {
+				return parseSkipToSemicolonHelper(p, stmt)
 			}
-			// Skip optional operand type list: (type, type).
+			member := OpClassMember{Number: strategyNum, Schema: opRef.Schema, Name: opRef.Name}
+			// Grammar: OPERATOR num any_operator opclass_purpose (no operand
+			// types — resolved from the operator itself at exec time) OR
+			// OPERATOR num operator_with_argtypes opclass_purpose, where
+			// operator_with_argtypes appends an explicit (lefttype, righttype).
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				p.skipBalancedParens()
+				p.advance()
+				lt, _ := p.parseTypeNameAfterCast()
+				member.LeftType = strings.ToLower(lt.String())
+				if p.acceptSymbol(",") {
+					rt, _ := p.parseTypeNameAfterCast()
+					member.RightType = strings.ToLower(rt.String())
+				}
+				p.acceptSymbol(")")
 			}
+			// opclass_purpose: FOR SEARCH | FOR ORDER BY any_name | empty.
+			// "search"/"order"/"by" family name after ORDER BY are not in
+			// goopg's keyword map for this bare contextual form beyond
+			// order/by (which ARE reserved keywords elsewhere); a sort-family
+			// ordering operator's amopsortfamily is not resolved/stored here
+			// (deferred, see the ledger) — parsed-and-discarded so it doesn't
+			// break subsequent AS-list entries.
+			if p.acceptKeyword(KwFor) {
+				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "search") {
+					p.advance()
+				} else {
+					p.acceptKeyword(KwOrder)
+					p.acceptKeyword(KwBy)
+					p.parseObjectName()
+				}
+			}
+			stmt.Members = append(stmt.Members, member)
 		} else if isFunction {
 			p.advance() // consume "function"
-			numTok := p.cur()
-			if numTok.Kind == TokenIntLit {
+			supportNum := 0
+			if p.cur().Kind == TokenIntLit {
+				supportNum, _ = strconv.Atoi(p.cur().Value)
 				p.advance()
+			}
+			member := OpClassMember{IsFunction: true, Number: supportNum}
+			// Grammar: FUNCTION num '(' type_list ')' function_with_argtypes
+			// puts an explicit (lefttype, righttype) BEFORE the function
+			// name (distinct from the function's OWN argument-type list,
+			// which follows the name); FUNCTION num function_with_argtypes
+			// (no leading parens) leaves both unspecified — resolved from
+			// the function's own signature at exec time.
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				p.advance()
+				lt, _ := p.parseTypeNameAfterCast()
+				member.LeftType = strings.ToLower(lt.String())
+				if p.acceptSymbol(",") {
+					rt, _ := p.parseTypeNameAfterCast()
+					member.RightType = strings.ToLower(rt.String())
+				}
+				p.acceptSymbol(")")
 			}
 			funcName, err := p.parseObjectName()
 			if err != nil {
 				return parseSkipToSemicolonHelper(p, stmt)
 			}
-			// Skip argument list.
+			member.Schema = funcName.Schema
+			member.Name = funcName.Name
+			// Skip the function's own argument-type list.
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 				p.skipBalancedParens()
 			}
 			// FUNCTION 2 is the hash extended support function.
-			if numTok.Value == "2" {
+			if supportNum == 2 {
 				stmt.HashFuncName = strings.ToLower(funcName.String())
 			}
+			stmt.Members = append(stmt.Members, member)
 		} else {
 			break
 		}

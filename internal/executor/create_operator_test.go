@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -508,5 +509,174 @@ func TestCreateOperatorClassUnknownFamily(t *testing.T) {
 	ee, ok := err.(*ExecError)
 	if !ok || ee.Code != "42704" {
 		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}
+
+func pgAmopVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
+	t.Helper()
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_amop"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_catalog.pg_amop virtual table/VirtualRows not found")
+	}
+	return tbl.VirtualRows()
+}
+
+func pgAmprocVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
+	t.Helper()
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_amproc"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_catalog.pg_amproc virtual table/VirtualRows not found")
+	}
+	return tbl.VirtualRows()
+}
+
+func pgDependVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
+	t.Helper()
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_depend"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_catalog.pg_depend virtual table/VirtualRows not found")
+	}
+	return tbl.VirtualRows()
+}
+
+// TestCreateOperatorClassMembersPopulateAmopAmproc verifies a CREATE
+// OPERATOR CLASS AS-list OPERATOR/FUNCTION entry naming a resolvable
+// (user-defined operator / curated-builtin function) reference populates a
+// real pg_amop/pg_amproc row plus the two pg_depend rows dumpOpclass's own
+// query needs (classid=pg_amop/pg_amproc → refclassid=pg_operator/pg_proc,
+// deptype NORMAL; classid=pg_amop/pg_amproc → refclassid=pg_opclass,
+// deptype INTERNAL), closing the slice-409 ledger row's member-store resume
+// point. DU-002 (M0119-0004) slice 411.
+func TestCreateOperatorClassMembersPopulateAmopAmproc(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE int4 USING btree FAMILY public.op_family AS
+		OPERATOR 1 ~=~ (int4, int4),
+		FUNCTION 1 int4eq(int4, int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	famRows := pgOpfamilyVirtualRows(t, im)
+	classRows := pgOpclassVirtualRows(t, im)
+	if len(famRows) != 1 || len(classRows) != 1 {
+		t.Fatalf("fam/class rows = %d/%d, want 1/1", len(famRows), len(classRows))
+	}
+	famOID, classOID := famRows[0][0], classRows[0][0]
+
+	op, ok := im.LookupUserOperator("public", "~=~", "int4", "int4")
+	if !ok {
+		t.Fatal("~=~ not registered")
+	}
+
+	amopRows := pgAmopVirtualRows(t, im)
+	if len(amopRows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %d rows, want 1: %v", len(amopRows), amopRows)
+	}
+	// oid, amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr, amopmethod, amopsortfamily
+	amop := amopRows[0]
+	if amop[1] != famOID {
+		t.Errorf("amopfamily = %q, want %q", amop[1], famOID)
+	}
+	if amop[2] != "23" || amop[3] != "23" { // int4 OID
+		t.Errorf("amoplefttype/amoprighttype = %q/%q, want 23/23", amop[2], amop[3])
+	}
+	if amop[4] != "1" {
+		t.Errorf("amopstrategy = %q, want 1", amop[4])
+	}
+	if amop[5] != "s" {
+		t.Errorf("amoppurpose = %q, want s", amop[5])
+	}
+	if amop[6] != strconv.FormatUint(uint64(op.OID), 10) {
+		t.Errorf("amopopr = %q, want %q (~=~'s OID)", amop[6], strconv.FormatUint(uint64(op.OID), 10))
+	}
+	if amop[7] != "403" { // btree
+		t.Errorf("amopmethod = %q, want 403 (btree)", amop[7])
+	}
+
+	amprocRows := pgAmprocVirtualRows(t, im)
+	if len(amprocRows) != 1 {
+		t.Fatalf("pg_amproc VirtualRows = %d rows, want 1: %v", len(amprocRows), amprocRows)
+	}
+	// oid, amprocfamily, amproclefttype, amprocrighttype, amprocnum, amproc
+	amproc := amprocRows[0]
+	if amproc[1] != famOID {
+		t.Errorf("amprocfamily = %q, want %q", amproc[1], famOID)
+	}
+	if amproc[4] != "1" {
+		t.Errorf("amprocnum = %q, want 1", amproc[4])
+	}
+	if amproc[5] != "65" { // int4eq's curated builtin OID
+		t.Errorf("amproc = %q, want 65 (int4eq)", amproc[5])
+	}
+
+	// pg_depend: amop → operator (NORMAL) + amop → opclass (INTERNAL);
+	// amproc → proc (NORMAL) + amproc → opclass (INTERNAL). DU-002 slice 411.
+	dependRows := pgDependVirtualRows(t, im)
+	want := map[string]bool{
+		"2602|" + amop[0] + "|2617|" + strconv.FormatUint(uint64(op.OID), 10) + "|n": false,
+		"2602|" + amop[0] + "|2616|" + classOID + "|i":                               false,
+		"2603|" + amproc[0] + "|1255|65|n":                                           false,
+		"2603|" + amproc[0] + "|2616|" + classOID + "|i":                             false,
+	}
+	for _, r := range dependRows {
+		key := r[0] + "|" + r[1] + "|" + r[3] + "|" + r[4] + "|" + r[6]
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+	}
+	for k, found := range want {
+		if !found {
+			t.Errorf("missing expected pg_depend row %q; got %v", k, dependRows)
+		}
+	}
+}
+
+// TestCreateOperatorClassMemberUnresolvableBuiltinDropped documents the
+// slice-411 scope boundary: an OPERATOR entry naming a builtin operator
+// (goopg has no builtin-operator catalog — deferred, see the ledger) is
+// silently dropped rather than raising an error, matching the pre-slice-411
+// behavior for every AS-list entry. DU-002 (M0119-0004) slice 411.
+func TestCreateOperatorClassMemberUnresolvableBuiltinDropped(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE int4 USING btree AS OPERATOR 1 =`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
+		t.Fatalf("pg_amop VirtualRows = %v, want empty (unresolvable builtin operator)", rows)
+	}
+}
+
+// TestDropOperatorClassRemovesMembers verifies DROP OPERATOR CLASS cascades
+// to remove its pg_amop/pg_amproc member rows, so a create-then-drop-then-
+// dump sequence doesn't leave ghost members behind (mirrors the existing
+// pg_opclass-row cleanup this DROP path already did). DU-002 (M0119-0004)
+// slice 411.
+func TestDropOperatorClassRemovesMembers(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE int4 USING btree AS OPERATOR 1 ~=~ (int4, int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %v, want 1 row before DROP", rows)
+	}
+	if err := runDDL(t, ctx, `DROP OPERATOR CLASS public.op_class USING btree`); err != nil {
+		t.Fatalf("DROP OPERATOR CLASS: %v", err)
+	}
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
+		t.Fatalf("pg_amop VirtualRows = %v, want empty after DROP OPERATOR CLASS", rows)
 	}
 }

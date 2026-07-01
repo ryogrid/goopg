@@ -2229,6 +2229,18 @@ type InMemory struct {
 	// uniqueness per namespace+access method too). DU-002 (M0119-0004).
 	userOperatorClasses map[string]*UserOperatorClass
 
+	// amOpMembers / amProcMembers back pg_amop/pg_amproc: one entry per
+	// resolved OPERATOR/FUNCTION entry in a CREATE OPERATOR CLASS ... AS
+	// list. Only user-defined operators/functions are resolvable today
+	// (goopg has no builtin-operator catalog for regoper-style name lookup;
+	// FUNCTION support procs additionally check the small hand-curated
+	// LookupBuiltinProc set) — an entry naming an unresolvable builtin is
+	// silently dropped, same as the pre-slice-411 behavior for every entry
+	// (deferred, see the ledger). Appended, not keyed: CREATE OPERATOR CLASS
+	// has no re-create/replace form. DU-002 (M0119-0004) slice 411.
+	amOpMembers   []*AmOpMember
+	amProcMembers []*AmProcMember
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -7712,12 +7724,16 @@ func (c *InMemory) registerSystemTables() {
 	// pg_amop — access-method operator catalog (OID 2602). After getBlobs,
 	// pg_dump's getDependencies issues a pg_depend UNION that joins both pg_amop
 	// and pg_amproc to resolve operator-family member dependencies (so they are
-	// not dumped as standalone objects). goopg has no user-defined operator
-	// classes/families feeding this dump path, so an empty view (0 rows) is
-	// correct, identical to a stock PG cluster with no user opclasses. Schema
-	// matches PG's pg_amop (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
+	// not dumped as standalone objects); dumpOpclass/dumpOpfamily also query
+	// this view directly for a class/family's own OPERATOR entries. A CREATE
+	// OPERATOR CLASS AS-list OPERATOR entry naming a resolvable (user-defined)
+	// operator registers a row here (catalog.AmOpMember, RegisterAmOpMember);
+	// an unresolvable builtin-operator reference is silently dropped (goopg has
+	// no builtin-operator catalog — deferred, see the ledger). Schema matches
+	// PG's pg_amop (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
 	// amoprighttype oid, amopstrategy int2, amoppurpose "char", amopopr oid,
-	// amopmethod oid, amopsortfamily oid. M0110-0001 (DU-002 slice 30).
+	// amopmethod oid, amopsortfamily oid. M0110-0001 (DU-002 slice 30; member
+	// store added slice 411).
 	pgAmop := &Table{
 		Schema: "pg_catalog", Name: "pg_amop", Virtual: true,
 		Columns: []Column{
@@ -7733,15 +7749,38 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2602,
 	}
-	pgAmop.VirtualRows = func() [][]string { return nil }
+	pgAmop.VirtualRows = func() [][]string {
+		members := c.ListAmOpMembers()
+		if len(members) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(members))
+		for _, m := range members {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),
+				strconv.FormatUint(uint64(m.FamilyOID), 10),
+				strconv.FormatUint(uint64(m.LeftType), 10),
+				strconv.FormatUint(uint64(m.RightType), 10),
+				strconv.FormatUint(uint64(m.Strategy), 10),
+				"s", // amoppurpose: AMOP_SEARCH — FOR ORDER BY not yet resolved (deferred)
+				strconv.FormatUint(uint64(m.OperOID), 10),
+				strconv.FormatUint(uint64(m.Method), 10),
+				"0", // amopsortfamily: InvalidOid — no ordering-operator support in this slice
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_amop"] = pgAmop
 
 	// pg_amproc — access-method support-procedure catalog (OID 2603). Joined
 	// alongside pg_amop in the same getDependencies pg_depend UNION (see pg_amop
-	// above). goopg has no user-defined operator classes/families, so an empty
-	// view (0 rows) is correct. Schema matches PG's pg_amproc (pg_amproc.h):
-	// oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum
-	// int2, amproc regproc. M0110-0001 (DU-002 slice 30).
+	// above), and by dumpOpclass/dumpOpfamily for a class/family's own FUNCTION
+	// entries. A CREATE OPERATOR CLASS AS-list FUNCTION entry naming a
+	// resolvable function registers a row here (catalog.AmProcMember,
+	// RegisterAmProcMember). Schema matches PG's pg_amproc (pg_amproc.h): oid,
+	// amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum
+	// int2, amproc regproc. M0110-0001 (DU-002 slice 30; member store added
+	// slice 411).
 	pgAmproc := &Table{
 		Schema: "pg_catalog", Name: "pg_amproc", Virtual: true,
 		Columns: []Column{
@@ -7754,7 +7793,24 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2603,
 	}
-	pgAmproc.VirtualRows = func() [][]string { return nil }
+	pgAmproc.VirtualRows = func() [][]string {
+		members := c.ListAmProcMembers()
+		if len(members) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(members))
+		for _, m := range members {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),
+				strconv.FormatUint(uint64(m.FamilyOID), 10),
+				strconv.FormatUint(uint64(m.LeftType), 10),
+				strconv.FormatUint(uint64(m.RightType), 10),
+				strconv.FormatUint(uint64(m.ProcNum), 10),
+				strconv.FormatUint(uint64(m.ProcOID), 10),
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_amproc"] = pgAmproc
 
 	// pg_seclabels — system view exposing security labels (a join over the
@@ -9348,6 +9404,59 @@ func (c *InMemory) dependVirtualRows() [][]string {
 			strconv.FormatUint(uint64(ad.seqOID), 10), // 4: refobjid = sequence OID
 			"0", // 5: refobjsubid
 			"n", // 6: deptype   = NORMAL
+		})
+	}
+
+	// CREATE OPERATOR CLASS AS-list members: each pg_amop/pg_amproc row gets
+	// two pg_depend rows, mirroring storeOperators/storeProcedures
+	// (opclasscmds.c) for a class-attributed ("hard") reference — a NORMAL
+	// ('n') dependency on the operator/function itself, and an INTERNAL ('i')
+	// dependency on the owning opclass (refclassid=pg_opclass). dumpOpclass's
+	// own query filters on refclassid=pg_opclass directly, and getDependencies
+	// explicitly excludes 'i' rows from its pg_amop/pg_amproc→pg_opfamily
+	// rewrite (both would turn into useless self-dependencies) — 'i' here
+	// matches upstream exactly. DU-002 (M0119-0004) slice 411. Called under
+	// c.mu.RLock() (this function's own lock) — read c.amOpMembers/
+	// c.amProcMembers directly rather than through the public List* accessors
+	// to avoid a recursive RLock.
+	for _, m := range c.amOpMembers {
+		rows = append(rows, []string{
+			"2602", // 0: classid    = pg_amop
+			strconv.FormatUint(uint64(m.OID), 10), // 1: objid  = amop entry OID
+			"0",    // 2: objsubid
+			"2617", // 3: refclassid = pg_operator
+			strconv.FormatUint(uint64(m.OperOID), 10), // 4: refobjid = operator OID
+			"0", // 5: refobjsubid
+			"n", // 6: deptype = NORMAL
+		})
+		rows = append(rows, []string{
+			"2602",
+			strconv.FormatUint(uint64(m.OID), 10),
+			"0",
+			"2616", // refclassid = pg_opclass
+			strconv.FormatUint(uint64(m.ClassOID), 10),
+			"0",
+			"i", // deptype = INTERNAL
+		})
+	}
+	for _, m := range c.amProcMembers {
+		rows = append(rows, []string{
+			"2603", // 0: classid    = pg_amproc
+			strconv.FormatUint(uint64(m.OID), 10),
+			"0",
+			"1255", // refclassid = pg_proc
+			strconv.FormatUint(uint64(m.ProcOID), 10),
+			"0",
+			"n",
+		})
+		rows = append(rows, []string{
+			"2603",
+			strconv.FormatUint(uint64(m.OID), 10),
+			"0",
+			"2616", // refclassid = pg_opclass
+			strconv.FormatUint(uint64(m.ClassOID), 10),
+			"0",
+			"i",
 		})
 	}
 	return rows
@@ -10979,6 +11088,35 @@ func (c *InMemory) LookupUserOperatorByOID(oid uint32) *UserOperator {
 	return nil
 }
 
+// LookupUserOperatorByName finds a registered operator by name alone,
+// ignoring schema and left/right type — for a CREATE OPERATOR CLASS AS-list
+// OPERATOR entry with no explicit operand-type list. Real PG resolves such
+// an entry via a search-path operator lookup that errors on ambiguity;
+// goopg's compat-scope callers instead deterministically pick the
+// lowest-OID match, since this DDL surface only ever creates one operator
+// per symbol in practice. Returns the real operator, never a shell
+// (FuncOID==0) one. DU-002 (M0119-0004) slice 411.
+func (c *InMemory) LookupUserOperatorByName(name string) (*UserOperator, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var best *UserOperator
+	for _, op := range c.userOperators {
+		if op.FuncOID == 0 {
+			continue // shell operator, not yet defined
+		}
+		if !strings.EqualFold(op.Name, name) {
+			continue
+		}
+		if best == nil || op.OID < best.OID {
+			best = op
+		}
+	}
+	if best == nil {
+		return nil, false
+	}
+	return best, true
+}
+
 // EnsureUserOperatorShell returns the existing operator registered under
 // (schema, name, leftType, rightType) — real or shell — creating a shell
 // (FuncOID==0) placeholder with a stable OID if none exists yet. Mirrors
@@ -11209,7 +11347,8 @@ func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, 
 }
 
 // DropUserOperatorClass removes a user-defined operator class from the
-// registry. Returns true if one was found and removed. DU-002 (M0119-0004).
+// registry, along with any pg_amop/pg_amproc member rows attributed to it
+// (slice 411). Returns true if one was found and removed. DU-002 (M0119-0004).
 func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -11217,11 +11356,27 @@ func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) boo
 		return false
 	}
 	key := userOpClassKey(schema, name, method)
-	if _, ok := c.userOperatorClasses[key]; ok {
-		delete(c.userOperatorClasses, key)
-		return true
+	oc, ok := c.userOperatorClasses[key]
+	if !ok {
+		return false
 	}
-	return false
+	delete(c.userOperatorClasses, key)
+	classOID := oc.OID
+	kept := c.amOpMembers[:0]
+	for _, m := range c.amOpMembers {
+		if m.ClassOID != classOID {
+			kept = append(kept, m)
+		}
+	}
+	c.amOpMembers = kept
+	keptP := c.amProcMembers[:0]
+	for _, m := range c.amProcMembers {
+		if m.ClassOID != classOID {
+			keptP = append(keptP, m)
+		}
+	}
+	c.amProcMembers = keptP
+	return true
 }
 
 // ListUserOperatorClasses returns all registered user operator classes sorted
@@ -11237,6 +11392,92 @@ func (c *InMemory) ListUserOperatorClasses() []*UserOperatorClass {
 		out = append(out, oc)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// AmOpMember models one pg_amop row (an OPERATOR entry attributed to an
+// operator class via CREATE OPERATOR CLASS's own AS list). Matches PG's
+// pg_amop (pg_amop.h); AmopPurpose is always AMOP_SEARCH ('s') and
+// SortFamilyOID always 0 in this slice — FOR ORDER BY sort-family ordering
+// operators are parsed-and-discarded (deferred, see the ledger). ClassOID
+// backs the pg_depend INTERNAL ('i') row dumpOpclass's query joins on
+// (refclassid=pg_opclass, refobjid=ClassOID). DU-002 (M0119-0004) slice 411.
+type AmOpMember struct {
+	OID       uint32 // pg_amop.oid
+	FamilyOID uint32 // pg_amop.amopfamily
+	LeftType  uint32 // pg_amop.amoplefttype
+	RightType uint32 // pg_amop.amoprighttype
+	Strategy  uint32 // pg_amop.amopstrategy
+	OperOID   uint32 // pg_amop.amopopr
+	Method    uint32 // pg_amop.amopmethod
+	ClassOID  uint32 // owning opclass OID, for the pg_depend INTERNAL row
+}
+
+// AmProcMember models one pg_amproc row (a FUNCTION entry attributed to an
+// operator class via CREATE OPERATOR CLASS's own AS list). Matches PG's
+// pg_amproc (pg_amproc.h). ClassOID mirrors AmOpMember.ClassOID. DU-002
+// (M0119-0004) slice 411.
+type AmProcMember struct {
+	OID       uint32 // pg_amproc.oid
+	FamilyOID uint32 // pg_amproc.amprocfamily
+	LeftType  uint32 // pg_amproc.amproclefttype
+	RightType uint32 // pg_amproc.amprocrighttype
+	ProcNum   uint32 // pg_amproc.amprocnum
+	ProcOID   uint32 // pg_amproc.amproc
+	ClassOID  uint32 // owning opclass OID, for the pg_depend INTERNAL row
+}
+
+// RegisterAmOpMember records one pg_amop row, allocating a stable OID.
+// Appended (not keyed/idempotent) since CREATE OPERATOR CLASS has no
+// re-create/replace form. DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, strategy, operOID, method uint32) *AmOpMember {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := &AmOpMember{
+		OID: c.allocOIDLocked(), FamilyOID: familyOID, LeftType: leftType,
+		RightType: rightType, Strategy: strategy, OperOID: operOID,
+		Method: method, ClassOID: classOID,
+	}
+	c.amOpMembers = append(c.amOpMembers, m)
+	return m
+}
+
+// RegisterAmProcMember records one pg_amproc row, allocating a stable OID.
+// Mirrors RegisterAmOpMember. DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType, procNum, procOID uint32) *AmProcMember {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := &AmProcMember{
+		OID: c.allocOIDLocked(), FamilyOID: familyOID, LeftType: leftType,
+		RightType: rightType, ProcNum: procNum, ProcOID: procOID, ClassOID: classOID,
+	}
+	c.amProcMembers = append(c.amProcMembers, m)
+	return m
+}
+
+// ListAmOpMembers returns all registered pg_amop rows in creation order.
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) ListAmOpMembers() []*AmOpMember {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.amOpMembers) == 0 {
+		return nil
+	}
+	out := make([]*AmOpMember, len(c.amOpMembers))
+	copy(out, c.amOpMembers)
+	return out
+}
+
+// ListAmProcMembers returns all registered pg_amproc rows in creation order.
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) ListAmProcMembers() []*AmProcMember {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.amProcMembers) == 0 {
+		return nil
+	}
+	out := make([]*AmProcMember, len(c.amProcMembers))
+	copy(out, c.amProcMembers)
 	return out
 }
 
@@ -11364,6 +11605,19 @@ var builtinProcsByName = map[string]BuiltinProc{
 	"int4eq": {
 		OID: 65, Name: "int4eq", Namespace: 11,
 		RetType:  "bool",
+		ArgTypes: []string{"int4", "int4"},
+		Volatile: "i",
+	},
+	// btint4cmp is int4's real btree "support function 1" (three-way
+	// less-equal-greater compare, pg_proc.dat oid 351) — a CREATE OPERATOR
+	// CLASS ... AS FUNCTION 1 entry referencing it exercises the pg_amproc
+	// member store against a semantically valid (int4-returning) btree
+	// comparator, matching real PG's own opclasscmds.c validation ("ordering
+	// comparison functions must return integer"). M0119-0004 (DU-002) slice
+	// 411.
+	"btint4cmp": {
+		OID: 351, Name: "btint4cmp", Namespace: 11,
+		RetType:  "int4",
 		ArgTypes: []string{"int4", "int4"},
 		Volatile: "i",
 	},
@@ -11510,6 +11764,29 @@ func formatProcedureSignature(name string, argTypeNames []string) string {
 		args[i] = pgArgTypeDisplayAlias(a)
 	}
 	return name + "(" + strings.Join(args, ",") + ")"
+}
+
+// RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,
+// righttype)" regoperator rendering (format_operator, regproc.c) — "NONE"
+// for a missing (unary) side. Only user-defined operators are resolvable
+// (goopg has no builtin-operator catalog — deferred, see the ledger); a
+// schema qualifier is never added (mirrors RegprocedureName's own
+// unqualified-name simplification). dumpOpclass/dumpOpfamily cast
+// amopopr::pg_catalog.regoperator for a class/family's own OPERATOR entries.
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegoperatorName(oid uint32) (string, bool) {
+	op := c.LookupUserOperatorByOID(oid)
+	if op == nil {
+		return "", false
+	}
+	left, right := "NONE", "NONE"
+	if op.LeftType != "" {
+		left = pgArgTypeDisplayAlias(op.LeftType)
+	}
+	if op.RightType != "" {
+		right = pgArgTypeDisplayAlias(op.RightType)
+	}
+	return op.Name + "(" + left + "," + right + ")", true
 }
 
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>

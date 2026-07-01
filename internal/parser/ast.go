@@ -1862,9 +1862,9 @@ func (s *AlterAggregateOwnerStmt) stmtNode() {}
 // type USING method [FAMILY family_name] AS entry [, entry ...]. Originally
 // captured only the FUNCTION 2 (hash extended) entry for hash partitioning
 // (M0097-0027); DU-002 (M0119-0004) extended it to populate a real
-// pg_opclass row for pg_dump round-tripping. OPERATOR/FUNCTION entries
-// beyond FUNCTION 2 are still accepted-and-discarded — pg_amop/pg_amproc
-// member storage is a separate, larger follow-up (see the deferral ledger).
+// pg_opclass row for pg_dump round-tripping, and then (slice 411) to capture
+// every OPERATOR/FUNCTION entry as an OpClassMember feeding the
+// pg_amop/pg_amproc + pg_depend member store.
 type CreateOpClassStmt struct {
 	pos          int
 	Schema       string // schema qualifier, "" = search_path default
@@ -1876,10 +1876,28 @@ type CreateOpClassStmt struct {
 	FamilyName   string // explicit FAMILY clause name, "" if the FAMILY clause was omitted (auto-create)
 	StorageType  string // STORAGE entry type name, "" if not specified
 	HashFuncName string // name of the FUNCTION 2 (hash extended) routine
+	Members      []OpClassMember // every OPERATOR/FUNCTION entry, including FUNCTION 2
 }
 
 func (s *CreateOpClassStmt) Pos() int  { return s.pos }
 func (s *CreateOpClassStmt) stmtNode() {}
+
+// OpClassMember models one OPERATOR or FUNCTION entry in a CREATE OPERATOR
+// CLASS ... AS list (opclasscmds.c's OpFamilyMember, narrowed to what
+// goopg's compat shim can resolve — see execCreateOpClass). LeftType/
+// RightType are the explicit operand/arg types the grammar allows
+// (operator_with_argtypes / FUNCTION num '(' type_list ')'); both empty
+// means PG would default them from the resolved operator/function's own
+// signature (assignOperTypes/assignProcTypes, opclasscmds.c) — resolved at
+// exec time, not by the parser. DU-002 (M0119-0004) slice 411.
+type OpClassMember struct {
+	IsFunction bool   // true = FUNCTION entry, false = OPERATOR entry
+	Number     int    // strategy number (OPERATOR) or support number (FUNCTION)
+	Schema     string // operator/function name's schema qualifier, "" if unqualified
+	Name       string // operator symbol or function name
+	LeftType   string // explicit lefttype, "" if unspecified
+	RightType  string // explicit righttype, "" if unspecified (or the operator is unary)
+}
 
 // DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.
 type DoStmt struct {

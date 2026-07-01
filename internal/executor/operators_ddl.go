@@ -14756,8 +14756,109 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 	if s.StorageType != "" {
 		keyTypeOID = catalog.TypeNameToOID(s.StorageType)
 	}
-	im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID)
 	return nil
+}
+
+// registerOpClassMembers resolves each OPERATOR/FUNCTION entry in a CREATE
+// OPERATOR CLASS ... AS list to a real pg_amop/pg_amproc row, attributed to
+// the class via ClassOID (the pg_depend INTERNAL row dumpOpclass's query
+// needs). Only user-defined operators (LookupUserOperator/
+// LookupUserOperatorByName) and functions (user routines, or the small
+// hand-curated LookupBuiltinProc set) are resolvable — goopg has no
+// builtin-operator catalog and no comprehensive builtin-function catalog, so
+// an entry naming an unresolvable builtin is silently dropped, same as every
+// entry's pre-slice-411 behavior (deferred, see the ledger). DU-002
+// (M0119-0004) slice 411.
+func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.OpClassMember, schema string, famOID, classOID, methodOID uint32) {
+	for _, m := range members {
+		opSchema := m.Schema
+		if opSchema == "" {
+			opSchema = schema
+		}
+		if m.IsFunction {
+			procOID, leftOID, rightOID, ok := resolveOpClassFunction(im, opSchema, m)
+			if !ok {
+				continue
+			}
+			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID)
+			continue
+		}
+		operOID, leftOID, rightOID, ok := resolveOpClassOperator(im, opSchema, m)
+		if !ok {
+			continue
+		}
+		im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID)
+	}
+}
+
+// resolveOpClassOperator resolves an OPERATOR entry to its operator OID plus
+// the lefttype/righttype OIDs to record (the entry's own explicit operand
+// types when given, else the resolved operator's own oprleft/oprright —
+// mirroring assignOperTypes, opclasscmds.c). DU-002 (M0119-0004) slice 411.
+func resolveOpClassOperator(im *catalog.InMemory, schema string, m parser.OpClassMember) (operOID, leftOID, rightOID uint32, ok bool) {
+	if m.LeftType != "" {
+		op, found := im.LookupUserOperator(schema, m.Name, m.LeftType, m.RightType)
+		if !found {
+			return 0, 0, 0, false
+		}
+		return op.OID, catalog.TypeNameToOID(m.LeftType), catalog.TypeNameToOID(m.RightType), true
+	}
+	op, found := im.LookupUserOperatorByName(m.Name)
+	if !found {
+		return 0, 0, 0, false
+	}
+	return op.OID, catalog.TypeNameToOID(op.LeftType), catalog.TypeNameToOID(op.RightType), true
+}
+
+// resolveOpClassFunction resolves a FUNCTION entry to its function OID plus
+// the lefttype/righttype OIDs to record (the entry's own explicit arg types
+// when given, else the resolved function's own first argument type —
+// mirroring assignProcTypes, opclasscmds.c). User routines are tried first,
+// then the hand-curated builtin set; an unqualified name searches every
+// schema (Routines.LookupByName's own behavior for name.Schema == "").
+// Ambiguous unqualified matches deterministically pick the lowest-OID
+// routine, mirroring resolveOpClassOperator/LookupUserOperatorByName. DU-002
+// (M0119-0004) slice 411.
+func resolveOpClassFunction(im *catalog.InMemory, schema string, m parser.OpClassMember) (procOID, leftOID, rightOID uint32, ok bool) {
+	candidates := im.Routines().LookupByName(parser.ObjectName{Schema: schema, Name: m.Name})
+	var chosen *catalog.Routine
+	if m.LeftType != "" {
+		for _, r := range candidates {
+			if len(r.ArgTypes) > 0 && strings.EqualFold(r.ArgTypes[0].Name, m.LeftType) {
+				chosen = r
+				break
+			}
+		}
+	} else {
+		for _, r := range candidates {
+			if chosen == nil || r.OID < chosen.OID {
+				chosen = r
+			}
+		}
+	}
+	if chosen != nil {
+		leftT, rightT := m.LeftType, m.RightType
+		if leftT == "" && len(chosen.ArgTypes) > 0 {
+			leftT = chosen.ArgTypes[0].Name
+		}
+		if rightT == "" && len(chosen.ArgTypes) > 0 {
+			rightT = chosen.ArgTypes[0].Name
+		}
+		return chosen.OID, catalog.TypeNameToOID(leftT), catalog.TypeNameToOID(rightT), true
+	}
+	if bp, found := catalog.LookupBuiltinProc(m.Name); found {
+		leftT, rightT := m.LeftType, m.RightType
+		if leftT == "" && len(bp.ArgTypes) > 0 {
+			leftT = bp.ArgTypes[0]
+		}
+		if rightT == "" && len(bp.ArgTypes) > 0 {
+			rightT = bp.ArgTypes[0]
+		}
+		return bp.OID, catalog.TypeNameToOID(leftT), catalog.TypeNameToOID(rightT), true
+	}
+	return 0, 0, 0, false
 }
 
 // knownBuiltinAggFinalFuncs is the set of PostgreSQL built-in function names
