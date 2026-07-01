@@ -2277,7 +2277,7 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE STATISTICS"
 	case *parser.AlterStatisticsStmt:
 		return "ALTER STATISTICS"
-	case *parser.AlterOpFamilyAddStmt:
+	case *parser.AlterOpFamilyAddStmt, *parser.AlterOpFamilyDropStmt:
 		return "ALTER OPERATOR FAMILY"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.

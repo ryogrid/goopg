@@ -1390,21 +1390,19 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 //
 //	name USING method (ADD opclass_item_list | DROP opclass_drop_list)
 //
-// Only the ADD form is modeled as a real statement (AlterOpFamilyAddStmt),
-// reusing the same OPERATOR/FUNCTION entry grammar as CREATE OPERATOR
-// CLASS's own AS list (opclass_item is shared upstream) except that an
-// OPERATOR entry here REQUIRES an explicit (lefttype, righttype) pair —
-// captured via OpClassMember.HasExplicitArgTypes and checked at exec time
+// The ADD form is modeled as AlterOpFamilyAddStmt, reusing the same
+// OPERATOR/FUNCTION entry grammar as CREATE OPERATOR CLASS's own AS list
+// (opclass_item is shared upstream) except that an OPERATOR entry here
+// REQUIRES an explicit (lefttype, righttype) pair — captured via
+// OpClassMember.HasExplicitArgTypes and checked at exec time
 // (execAlterOpFamilyAdd), matching PG's own phase for that error. The DROP
-// form is accepted-and-ignored (deferred, see the ledger) since removing a
-// member also means undoing its pg_depend rows, a separate follow-up.
+// form is modeled as AlterOpFamilyDropStmt: its opclass_drop production
+// (gram.y) is narrower than opclass_item — a mandatory Iconst strategy/
+// support number and a mandatory parenthesized type list, no operator/
+// function name. Any other tail (RENAME TO, OWNER TO, SET SCHEMA, or any
+// unrecognized form) keeps the pre-existing *AlterTableStmt no-op stub.
 // DU-002 (M0119-0004).
 func (p *parser) parseAlterOpFamilyTail(pos int) (Stmt, error) {
-	// Every non-ADD tail (DROP, RENAME TO, OWNER TO, SET SCHEMA, or any
-	// unrecognized form) keeps the pre-existing *AlterTableStmt no-op stub
-	// shape the whole "ALTER OPERATOR CLASS|FAMILY" branch used before this
-	// function existed (TestParseAlterOperatorOwnerToIsNoop pins this for
-	// RENAME TO) — only ADD becomes a real, executed statement.
 	noop := func() (Stmt, error) { return parseSkipToSemicolonHelper(p, &AlterTableStmt{pos: pos}) }
 	name, err := p.parseObjectName()
 	if err != nil {
@@ -1418,8 +1416,11 @@ func (p *parser) parseAlterOpFamilyTail(pos int) (Stmt, error) {
 		method = strings.ToLower(methodTok.Value)
 		p.advance()
 	}
+	if p.acceptKeyword(KwDrop) {
+		return p.parseAlterOpFamilyDropTail(pos, name, method)
+	}
 	if !p.acceptKeyword(KwAdd) {
-		// DROP (or any other/unrecognized tail) — deferred, see the ledger.
+		// RENAME TO / OWNER TO / SET SCHEMA / any unrecognized tail — noop.
 		return noop()
 	}
 	stmt := &AlterOpFamilyAddStmt{pos: pos, Schema: name.Schema, Name: name.Name, Method: method}
@@ -1504,6 +1505,57 @@ func (p *parser) parseAlterOpFamilyTail(pos int) (Stmt, error) {
 			// token — tolerantly stop scanning members rather than hard-failing.
 			return parseSkipToSemicolonHelper(p, stmt)
 		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return stmt, nil
+}
+
+// parseAlterOpFamilyDropTail parses the DROP form's opclass_drop_list
+// (gram.y opclass_drop): a comma-separated list of
+//
+//	OPERATOR strategy_number '(' type [',' type] ')'
+//	FUNCTION support_number '(' type [',' type] ')'
+//
+// Unlike opclass_item (the ADD form), the number is mandatory (no default)
+// and there is no operator/function name — the member is identified purely
+// by (family, strategy-or-procnum, lefttype, righttype), resolved at exec
+// time (execAlterOpFamilyDrop). DU-002 (M0119-0004).
+func (p *parser) parseAlterOpFamilyDropTail(pos int, name ObjectName, method string) (Stmt, error) {
+	stmt := &AlterOpFamilyDropStmt{pos: pos, Schema: name.Schema, Name: name.Name, Method: method}
+	for {
+		tok := p.cur()
+		isOperator := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "operator")
+		isFunction := tok.Kind == TokenKeyword && tok.Keyword == KwFunction
+		if !isOperator && !isFunction {
+			return parseSkipToSemicolonHelper(p, stmt)
+		}
+		p.advance() // consume "operator" / "function"
+		member := OpClassMember{IsFunction: isFunction}
+		if p.cur().Kind == TokenIntLit {
+			member.Number, _ = strconv.Atoi(p.cur().Value)
+			p.advance()
+		}
+		if !p.acceptSymbol("(") {
+			return parseSkipToSemicolonHelper(p, stmt)
+		}
+		lt, lterr := p.parseTypeNameAfterCast()
+		if lterr != nil {
+			return parseSkipToSemicolonHelper(p, stmt)
+		}
+		member.LeftType = strings.ToLower(lt.String())
+		member.RightType = member.LeftType // opclass_drop defaults righttype = lefttype (processTypesSpec)
+		if p.acceptSymbol(",") {
+			rt, rterr := p.parseTypeNameAfterCast()
+			if rterr != nil {
+				return parseSkipToSemicolonHelper(p, stmt)
+			}
+			member.RightType = strings.ToLower(rt.String())
+		}
+		p.acceptSymbol(")")
+		member.HasExplicitArgTypes = true
+		stmt.Members = append(stmt.Members, member)
 		if !p.acceptSymbol(",") {
 			break
 		}

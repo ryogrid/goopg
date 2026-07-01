@@ -1889,9 +1889,7 @@ func (s *CreateOpClassStmt) stmtNode() {}
 // Members reuse OpClassMember; the grammar's opclass_item production allows
 // a STORAGE entry but AlterOpFamilyAdd itself rejects one with a syntax
 // error ("STORAGE cannot be specified in ALTER OPERATOR FAMILY") — not
-// modeled here since no fixture needs it. The DROP form (ALTER OPERATOR
-// FAMILY ... DROP) is not modeled at all yet and stays a CompatNoopStmt
-// (deferred, see the ledger). DU-002 (M0119-0004).
+// modeled here since no fixture needs it. DU-002 (M0119-0004).
 type AlterOpFamilyAddStmt struct {
 	pos     int
 	Schema  string // family name's schema qualifier, "" if unqualified
@@ -1902,6 +1900,27 @@ type AlterOpFamilyAddStmt struct {
 
 func (s *AlterOpFamilyAddStmt) Pos() int  { return s.pos }
 func (s *AlterOpFamilyAddStmt) stmtNode() {}
+
+// AlterOpFamilyDropStmt models the DROP form of ALTER OPERATOR FAMILY name
+// USING method DROP entry [, entry ...] — removes a loose OPERATOR/FUNCTION
+// entry from an existing operator family (opclasscmds.c AlterOpFamilyDrop).
+// Unlike the ADD form's opclass_item grammar, opclass_drop requires a bare
+// mandatory strategy/support NUMBER plus a mandatory parenthesized
+// (lefttype[, righttype]) pair — no operator/function name at all, since the
+// member is identified purely by its (family, strategy-or-procnum, lefttype,
+// righttype) key (gram.y opclass_drop). Members reuse OpClassMember, leaving
+// Name/Schema/HasExplicitArgTypes/SortFamily* at their zero values. DU-002
+// (M0119-0004).
+type AlterOpFamilyDropStmt struct {
+	pos     int
+	Schema  string // family name's schema qualifier, "" if unqualified
+	Name    string // family name
+	Method  string // access method name, e.g. "btree"
+	Members []OpClassMember
+}
+
+func (s *AlterOpFamilyDropStmt) Pos() int  { return s.pos }
+func (s *AlterOpFamilyDropStmt) stmtNode() {}
 
 // OpClassMember models one OPERATOR or FUNCTION entry in a CREATE OPERATOR
 // CLASS ... AS list (opclasscmds.c's OpFamilyMember, narrowed to what

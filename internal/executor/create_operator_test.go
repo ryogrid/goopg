@@ -1046,3 +1046,79 @@ func TestAlterOperatorFamilyAddUnknownFamilyErrors(t *testing.T) {
 		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
 	}
 }
+
+// TestAlterOperatorFamilyDropRemovesLooseMember verifies ALTER OPERATOR
+// FAMILY ... DROP removes the matching pg_amop/pg_amproc row (identified
+// purely by family+strategy/procnum+lefttype+righttype, no operator/
+// function name in the DROP syntax) and, since dependVirtualRows recomputes
+// pg_depend live from the same catalog slices RemoveAmOpMember/
+// RemoveAmProcMember mutate, its AUTO pg_depend rows disappear along with
+// it. Mirrors opclasscmds.c dropOperators/dropProcedures. DU-002
+// (M0119-0004), ALTER OPERATOR FAMILY DROP slice.
+func TestAlterOperatorFamilyDropRemovesLooseMember(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD
+		OPERATOR 3 ~=~ (int4, int4),
+		FUNCTION 1 (int4, int4) int4eq(int4, int4)`); err != nil {
+		t.Fatalf("ALTER OPERATOR FAMILY ADD: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	if len(pgAmopVirtualRows(t, im)) != 1 || len(pgAmprocVirtualRows(t, im)) != 1 {
+		t.Fatalf("setup: expected 1 amop + 1 amproc row before DROP")
+	}
+
+	if err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree DROP
+		OPERATOR 3 (int4, int4),
+		FUNCTION 1 (int4, int4)`); err != nil {
+		t.Fatalf("ALTER OPERATOR FAMILY DROP: %v", err)
+	}
+
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
+		t.Errorf("pg_amop VirtualRows = %v, want none after DROP", rows)
+	}
+	if rows := pgAmprocVirtualRows(t, im); len(rows) != 0 {
+		t.Errorf("pg_amproc VirtualRows = %v, want none after DROP", rows)
+	}
+	for _, r := range pgDependVirtualRows(t, im) {
+		if r[0] == "2602" || r[0] == "2603" {
+			t.Errorf("dangling pg_amop/pg_amproc pg_depend row after DROP: %v", r)
+		}
+	}
+}
+
+// TestAlterOperatorFamilyDropMissingMemberErrors verifies dropping a
+// (strategy, lefttype, righttype) triple that isn't a member of the family
+// raises 42704, mirroring dropOperators'/dropProcedures' own
+// !OidIsValid(amopid/amprocid) ereport.
+func TestAlterOperatorFamilyDropMissingMemberErrors(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree DROP OPERATOR 1 (int4, int4)`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}
+
+// TestAlterOperatorFamilyDropUnknownFamilyErrors verifies ALTER OPERATOR
+// FAMILY ... DROP on a non-existent family raises 42704, mirroring
+// get_opfamily_oid's own missing_ok=false ereport (same lookup ADD shares).
+func TestAlterOperatorFamilyDropUnknownFamilyErrors(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.no_such_family USING btree DROP OPERATOR 1 (int4, int4)`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}

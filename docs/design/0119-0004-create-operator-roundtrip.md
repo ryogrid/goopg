@@ -904,3 +904,74 @@ stub.
   (range-type `subtype_opclass` binding); the builtin-operator catalog
   remains a 6-row curated slice (int8 5-strategy set + `btint8cmp`, unchanged
   this loop).
+
+## Loop #43 — `ALTER OPERATOR FAMILY ... DROP` (DU-002 slice 416)
+
+Closes the loop #41 row's resume point (1): the `DROP` form of `ALTER
+OPERATOR FAMILY`, direct sibling of loop #41's `ADD` form.
+
+- New parser `AlterOpFamilyDropStmt` (`internal/parser/ast.go`) +
+  `parseAlterOpFamilyDropTail` (`internal/parser/ddl.go`), reached from
+  `parseAlterOpFamilyTail` when the tail is `DROP` rather than `ADD`. The
+  grammar is narrower than `ADD`'s `opclass_item` (`gram.y opclass_drop`):
+  each entry is `OPERATOR strategynum '(' type [',' type] ')'` or `FUNCTION
+  supportnum '(' type [',' type] ')'` — the strategy/support number and the
+  parenthesized type list are both **mandatory**, and there is no
+  operator/function name at all (`processTypesSpec`'s single-type shorthand
+  defaults `righttype = lefttype`, reused via `OpClassMember.LeftType`/
+  `RightType`). Reuses `OpClassMember` (as `ADD` does), leaving
+  `Name`/`Schema`/`SortFamily*` at their zero values since `DROP` has none of
+  those.
+- New executor `execAlterOpFamilyDrop` (`internal/executor/operators_ddl.go`)
+  resolves the family (42704 if missing, same `LookupUserOperatorFamily` call
+  `execAlterOpFamilyAdd` uses) and, for each entry, resolves `LeftType`/
+  `RightType` to OIDs via `catalog.TypeNameToOID` and calls new
+  `catalog.RemoveAmOpMember`/`RemoveAmProcMember` keyed on
+  `(familyOID, leftType, rightType, strategy-or-procnum)` — the same
+  4-column key PG's `dropOperators`/`dropProcedures` look up via
+  `GetSysCacheOid4(AMOPSTRATEGY/AMPROCNUM, ...)`. A missing member raises
+  42704 (`undefined_object`), text-shaped after `dropOperators`'/
+  `dropProcedures`' own `ereport` (mirrors the existing duplicate-member
+  message's convention of using the raw parsed type-name string, not
+  `format_type_be` output, and the family's own bare name rather than a
+  schema-qualified one — same simplification `execAlterOpFamilyAdd`'s 42710
+  message already uses, not a new gap).
+- **No new pg_depend plumbing needed**: `dependVirtualRows` computes every
+  pg_amop/pg_amproc dependency row live from `c.amOpMembers`/
+  `c.amProcMembers` on each read (loop #41), so removing an entry from either
+  slice makes its pg_depend rows disappear automatically — `RemoveAmOpMember`/
+  `RemoveAmProcMember` only need to delete the catalog row itself.
+- **Verified against a freshly-built, live PG 18.3 instance**
+  (`postgres/local_install`, ad hoc `dump_test.op_family_loose` family from
+  loop #41's own fixture SQL): `ALTER OPERATOR FAMILY ... DROP OPERATOR 1
+  (bigint, bigint), FUNCTION 1 (bigint, bigint)` removes exactly those two
+  rows from `pg_amop`/`pg_amproc` on real PG; a repeat `DROP` of the same
+  entry raises `operator 1(bigint,bigint) does not exist in operator family
+  "dump_test.op_family_loose"` (42704); `DROP OPERATOR 3 (bigint)` (single
+  type) correctly matches the `(bigint,bigint)` row via the
+  righttype-defaults-to-lefttype shorthand. goopg's behavior and error text
+  shape match (module the pre-existing unqualified-family-name
+  simplification noted above).
+- Tests: `TestParseAlterOperatorFamilyDrop`/
+  `TestParseAlterOperatorFamilyDropRequiresParens` (parser, replacing the
+  stale loop #41 `TestParseAlterOperatorFamilyDropStillNoop` no-op-stub
+  pin — DROP is a real statement now); `TestAlterOperatorFamilyDropRemovesLooseMember`/
+  `TestAlterOperatorFamilyDropMissingMemberErrors`/
+  `TestAlterOperatorFamilyDropUnknownFamilyErrors` (executor).
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/executor`+`internal/catalog`+`internal/planner`+`internal/server`
+  suites PASS; `TestPort_PgDumpConnectionSetup` PASS (loop #41's ADD fixture
+  unaffected — DROP has no fixture of its own since pg_dump itself never
+  emits this form, it only appears in hand-written DDL); live PG 18.3 diff
+  above; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook;
+  `gofmt -l` flags only the same pre-existing go1.25/1.26-drift files as
+  every prior loop in this chain (verified via `git stash`).
+- Deferred (ledger row appended): dropping a **class-attributed** (hard,
+  `ClassOID != 0`) member is not specially handled — goopg removes the row
+  unconditionally like a loose member, whereas real PG's `performDeletion`
+  would see the member's `INTERNAL` dependency on its owning opclass and
+  either cascade-drop the whole opclass or raise a restrict error depending
+  on drop mode. No fixture in scope exercises this (pg_dump-driven round
+  trips never issue `ALTER OPERATOR FAMILY ... DROP` at all); the per-AM
+  `amadjustmembers` policy and the builtin-operator-catalog gap remain open
+  and unchanged from loop #41.

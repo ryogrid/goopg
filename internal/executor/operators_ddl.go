@@ -147,6 +147,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateOpClass(s)
 	case *parser.AlterOpFamilyAddStmt:
 		return nil, o.execAlterOpFamilyAdd(s)
+	case *parser.AlterOpFamilyDropStmt:
+		return nil, o.execAlterOpFamilyDrop(s)
 	case *parser.CreateExtensionStmt:
 		return nil, o.execCreateExtension(s)
 	case *parser.CreateTablespaceStmt:
@@ -14809,6 +14811,55 @@ func (o *ddlOp) execAlterOpFamilyAdd(s *parser.AlterOpFamilyAddStmt) error {
 			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
 	}
 	return o.registerOpClassMembers(im, s.Members, schema, fam.OID, 0, methodOID, s.Method, s.Pos(), true, fam.Name)
+}
+
+// execAlterOpFamilyDrop implements ALTER OPERATOR FAMILY name USING method
+// DROP entry [, entry ...] (opclasscmds.c AlterOpFamilyDrop). Each entry is
+// resolved purely by (family, strategy-or-procnum, lefttype, righttype) —
+// unlike the ADD form there is no operator/function name to look up. A
+// missing member raises 42704 (undefined_object), matching dropOperators'/
+// dropProcedures' own ereport text shape. Removing the catalog row also
+// removes its pg_depend rows, since dependVirtualRows recomputes them live
+// from the same c.amOpMembers/c.amProcMembers slices RemoveAmOpMember/
+// RemoveAmProcMember mutate. DU-002 (M0119-0004).
+func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "must be superuser to alter an operator family"}
+	}
+	methodOID := catalog.AccessMethodOIDByName(s.Method)
+	if methodOID == 0 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
+	}
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	if !found {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
+	}
+	for _, m := range s.Members {
+		leftOID := catalog.TypeNameToOID(m.LeftType)
+		rightOID := catalog.TypeNameToOID(m.RightType)
+		if m.IsFunction {
+			if !im.RemoveAmProcMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf("function %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
+			}
+			continue
+		}
+		if !im.RemoveAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("operator %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
+		}
+	}
+	return nil
 }
 
 // registerOpClassMembers resolves each OPERATOR/FUNCTION entry in a CREATE

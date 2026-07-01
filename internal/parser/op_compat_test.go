@@ -562,18 +562,57 @@ func TestParseAlterOperatorFamilyAddRequiresArgTypes(t *testing.T) {
 	}
 }
 
-// TestParseAlterOperatorFamilyDropStillNoop verifies the DROP form (not yet
-// modeled — deferred, see the ledger) still parses as the same
-// accepted-and-ignored *AlterTableStmt no-op stub every other ALTER
-// OPERATOR CLASS|FAMILY tail used before this loop (RENAME TO, OWNER TO,
-// etc. — see TestParseAlterOperatorOwnerToIsNoop), not a hard parse error.
-func TestParseAlterOperatorFamilyDropStillNoop(t *testing.T) {
-	stmts, err := Parse(`ALTER OPERATOR FAMILY dump_test.op_family USING btree DROP OPERATOR 1 (int4, int4)`)
+// TestParseAlterOperatorFamilyDrop verifies the DROP form (opclasscmds.c
+// AlterOpFamilyDrop) parses into a real AlterOpFamilyDropStmt — the
+// opclass_drop grammar (gram.y) is narrower than the ADD form's
+// opclass_item: a mandatory strategy/support number and a mandatory
+// parenthesized type list, no operator/function name.
+func TestParseAlterOperatorFamilyDrop(t *testing.T) {
+	stmts, err := Parse(`ALTER OPERATOR FAMILY dump_test.op_family_loose USING btree DROP
+		OPERATOR 1 (int8),
+		FUNCTION 1 (int8, int8)`)
 	if err != nil {
 		t.Fatalf("Parse error: %v", err)
 	}
-	if _, ok := stmts[0].(*AlterTableStmt); !ok {
-		t.Fatalf("Expected *AlterTableStmt (DROP still deferred), got %T", stmts[0])
+	af, ok := stmts[0].(*AlterOpFamilyDropStmt)
+	if !ok {
+		t.Fatalf("Expected *AlterOpFamilyDropStmt, got %T", stmts[0])
+	}
+	if af.Schema != "dump_test" || af.Name != "op_family_loose" {
+		t.Errorf("Schema/Name = %q/%q, want dump_test/op_family_loose", af.Schema, af.Name)
+	}
+	if af.Method != "btree" {
+		t.Errorf("Method = %q, want btree", af.Method)
+	}
+	if len(af.Members) != 2 {
+		t.Fatalf("Members = %d, want 2", len(af.Members))
+	}
+	m0 := af.Members[0]
+	if m0.IsFunction || m0.Number != 1 || m0.LeftType != "int8" || m0.RightType != "int8" {
+		t.Errorf("Members[0] = %+v, want OPERATOR 1 (int8) with righttype defaulted to int8", m0)
+	}
+	m1 := af.Members[1]
+	if !m1.IsFunction || m1.Number != 1 || m1.LeftType != "int8" || m1.RightType != "int8" {
+		t.Errorf("Members[1] = %+v, want FUNCTION 1 (int8,int8)", m1)
+	}
+}
+
+// TestParseAlterOperatorFamilyDropRequiresParens verifies a malformed DROP
+// tail (missing the mandatory type-list parens) tolerantly falls back to the
+// accepted-and-ignored no-op stub rather than a hard parse error, matching
+// every other unrecognized ALTER OPERATOR CLASS|FAMILY tail (RENAME TO,
+// OWNER TO, etc. — see TestParseAlterOperatorOwnerToIsNoop).
+func TestParseAlterOperatorFamilyDropRequiresParens(t *testing.T) {
+	stmts, err := Parse(`ALTER OPERATOR FAMILY dump_test.op_family_loose USING btree DROP OPERATOR 1`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	af, ok := stmts[0].(*AlterOpFamilyDropStmt)
+	if !ok {
+		t.Fatalf("Expected *AlterOpFamilyDropStmt, got %T", stmts[0])
+	}
+	if len(af.Members) != 0 {
+		t.Errorf("Members = %+v, want none (missing parens stops the scan)", af.Members)
 	}
 }
 

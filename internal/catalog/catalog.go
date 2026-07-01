@@ -11547,6 +11547,43 @@ func (c *InMemory) ListAmProcMembers() []*AmProcMember {
 	return out
 }
 
+// RemoveAmOpMember deletes the pg_amop row keyed by (familyOID, leftType,
+// rightType, strategy) — the same (amopfamily, amoplefttype, amoprighttype,
+// amopstrategy) unique index PG's dropOperators looks up via
+// GetSysCacheOid4(AMOPSTRATEGY, ...) (opclasscmds.c). Reports whether a
+// matching row was found and removed; the caller raises 42704 (undefined
+// object) on false, matching dropOperators' own ereport. Removing the row
+// also removes its pg_depend edges, since dependVirtualRows recomputes them
+// live from c.amOpMembers on every read. ALTER OPERATOR FAMILY ... DROP,
+// DU-002 (M0119-0004).
+func (c *InMemory) RemoveAmOpMember(familyOID, leftType, rightType, strategy uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, m := range c.amOpMembers {
+		if m.FamilyOID == familyOID && m.LeftType == leftType && m.RightType == rightType && m.Strategy == strategy {
+			c.amOpMembers = append(c.amOpMembers[:i], c.amOpMembers[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveAmProcMember deletes the pg_amproc row keyed by (familyOID,
+// leftType, rightType, procNum) — mirrors RemoveAmOpMember for
+// dropProcedures' AMPROCNUM lookup. ALTER OPERATOR FAMILY ... DROP, DU-002
+// (M0119-0004).
+func (c *InMemory) RemoveAmProcMember(familyOID, leftType, rightType, procNum uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, m := range c.amProcMembers {
+		if m.FamilyOID == familyOID && m.LeftType == leftType && m.RightType == rightType && m.ProcNum == procNum {
+			c.amProcMembers = append(c.amProcMembers[:i], c.amProcMembers[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // AccessMethodOIDByName maps an access method name to its pg_am.oid, covering
 // the 7 rows pg_am.VirtualRows serves (see the pg_am registration in this
 // file). Returns 0 for an unrecognized method. Used by CREATE OPERATOR FAMILY
