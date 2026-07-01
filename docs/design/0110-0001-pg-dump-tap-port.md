@@ -10322,6 +10322,82 @@ PASS; pgbench smoke via the pre-commit hook.
 identical treatment (bytes 42/43 next free). The DROP CAST type-name-synonym key gap noted in the CAST
 subsection above is still open too, independent of this loop.
 
+### CREATE/DROP COLLATION restart persistence (WAL replay) — fourth and last object of the slice-389 backlog to close, plus a genuine DROP COLLATION functionality gap fixed along the way
+
+Repeats the CREATE CAST/TRANSFORM/CONVERSION template for `catalog.UserCollation`, the last item in the
+deliberately-deferred restart-persistence list (slice-389's deferral (c)/(d)). Before this loop the codebase had
+**no `DropCollation` catalog method and no `case "collation"` in `execDropCompat`'s dispatch at all** — `DROP
+COLLATION <name>` on an existing user collation unconditionally fell through to the generic "does not exist"
+error path (`internal/executor/operators_ddl.go`'s `execDropCompat`, the fallthrough at the end of the function),
+and `DROP COLLATION IF EXISTS <name>` unconditionally emitted a "does not exist, skipping" notice without ever
+touching the registry. This was a real functional gap (slice-389's deferral (d): "`DROP COLLATION` ... not
+handled"), not just a restart-persistence gap — so this loop implements DROP COLLATION itself, then adds restart
+persistence for both CREATE and DROP in the same pass (the pattern was going to need a dedicated
+`objType == "collation"` block regardless, so there was no smaller bounded slice available).
+
+**`UserCollation` is schema-scoped** (like Conversion, unlike Cast/Transform), so replay of its WAL records must
+run *after* `replaySchemaDDLRecords` has repopulated the schema-name→OID map — `replayCollationDDLRecords` is
+wired last in the CREATE/DROP DDL-replay sequence in `internal/initdb/open.go`, immediately after
+`replayConversionDDLRecords`.
+
+**New catalog methods** (`internal/catalog/catalog.go`, next to `CreateCollation`): `DropCollation(name, schema
+string) bool` (removes the matching entry from `userCollations`, mirrors `DropConversion` exactly — including the
+"unknown schema resolves to public" fallback, so a built-in collation, which is never registered in
+`userCollations`, always reports not-found); `CreateCollationDuringRecovery`/`DropCollationDuringRecovery`, the
+idempotent OID-carrying counterparts used by the WAL-replay driver (mirror
+`CreateConversionDuringRecovery`/`DropConversionDuringRecovery`). Also added `ListUserCollations()` (mirrors
+`ListUserConversions`) since no accessor for the registry snapshot existed yet — needed by the new tests.
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateCollation` (42) and
+`RecordKindDropCollation` (43), the next free bytes after `RecordKindDropConversion` (41), confirming the byte
+budget the CONVERSION subsection reserved. `EncodeCreateCollation`/`DecodeCreateCollation` carry `oid | ownerOID
+| encoding(int32) | provider(1) | deterministicFlag(1) | name | schema | collate | ctype | locale | rules` — a
+15-byte fixed header (vs. Conversion's 22) followed by *six* length-prefixed strings (vs. Conversion's four),
+reflecting `UserCollation`'s libc/ICU/builtin provider fields (`collate`/`ctype` for libc, `locale` for
+builtin/icu, `rules` for ICU tailoring) all needing to round-trip regardless of which provider is in play — the
+provider byte alone doesn't tell the decoder which strings are populated, so all six always get carried (blank
+strings encode as zero-length). `EncodeDropCollation`/`DecodeDropCollation` carry just the (name, schema) key,
+identical in shape to `EncodeDropConversion`. This loop's `EncodeCreateCollation` used a small string-array loop
+(`strs := []string{name, schema, collate, ctype, locale, rules}`) instead of six hand-unrolled `PutUint16`+`copy`
+blocks — a direct response to the fact that every prior object in this series (Cast, Transform, Conversion) hit a
+hand-derived fixed-header/string-count byte-offset bug; looping over the string slice for the length-sum and the
+write pass eliminates the arithmetic by construction. The round-trip test passed on the first run (no byte bug
+this time — the loop-based encoder is the reason).
+
+**New recovery driver** (`internal/initdb/collation_ddl_recovery.go`, new file mirroring
+`conversion_ddl_recovery.go`): `replayCollationDDLRecords` walks the WAL after physical replay completes (guarded
+by `wal.IsGoopgNativeRecord`, same M0106-0011 collision guard the other three drivers already carry — no
+regression this time since the guard was written generically), decodes each CREATE/DROP COLLATION record, and
+applies it via the new recovery hooks.
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): `execCreateCollation` now calls
+`o.ctx.WAL.Append(wal.EncodeCreateCollation(...))` right after a successful `im.CreateCollation(...)`, gated on
+`uc.OID != 0` — `CreateCollation`'s `ifNotExists`-hit-existing path returns the existing OID without mutating the
+caller's `uc.OID`, so this check skips the WAL write for a no-op `IF NOT EXISTS` hit (Cast/Transform/Conversion
+don't need this gate since none of their `Create*` methods have an `ifNotExists` parameter). A new dedicated
+`if objType == "collation"` block in `execDropCompat`, placed before the generic IF-EXISTS fallthrough (same
+placement as the `"transform"` block) so `IF EXISTS` correctly probes the registry instead of unconditionally
+no-oping, loops over `s.Names` (unlike Cast/Transform, which take single-value fields, Collation's
+`DropCompatStmt.Names` is a real list, so `DROP COLLATION a, b;` drops both), calls `im.DropCollation(...)`, and
+on success appends `wal.EncodeDropCollation(...)`.
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateCollationRoundTrip`/`...DropCollationRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal/collation_ddl_test.go`),
+`TestCollationDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/
+`TestReplayCollationDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open
+cycle), `TestDropCollation` (`internal/catalog/create_collation_test.go` — pins the actual functionality fix:
+drop-then-relookup via `CollationAttrsByName`, cross-schema non-match with a *registered* second schema, a
+built-in collation never matching). (2) gates: `go build ./...` clean; `go vet` clean on touched packages;
+`-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb` PASS (full recovery suite);
+`TestE2E_PhysicalReplication`/`TestE2E_PhysicalReplicationSync` PASS (WAL/MVCC practice card's recovery-path
+gate); TPC-H spotcheck Q12=2/Q13=33 PASS; `internal/executor` full package PASS; pgbench smoke runs via the
+pre-commit hook on commit.
+
+**Closes the slice-389 four-object restart-persistence backlog** (Transform → Cast → Conversion → Collation).
+Deliberately still open, independent of this backlog: the DROP CAST type-name-synonym key gap (CAST subsection
+above), and collation ordering/`ALTER COLLATION` (slice-389's deferrals (a)/(b) — goopg still does not use a
+collation for actual string ordering; out of scope, a separate large subsystem).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

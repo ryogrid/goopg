@@ -3574,6 +3574,36 @@ documentation-only and is exempt from the design-doc requirement.)
       "CREATE CONVERSION restart persistence" subsection (full bug narrative); ledger row appended. Collation
       restart persistence is the last item in the four-object queue, bytes 42/43 next-free — the
       `wal.IsGoopgNativeRecord` guard is already generalized so that loop needs no further WAL-scan fix.
+      **2026-07-01 (loop #50) — CREATE/DROP COLLATION restart persistence LANDED (fourth and LAST of the
+      slice-389 "in-memory only" backlog — CLOSES the backlog), plus a genuine DROP COLLATION functionality
+      gap fixed.** Discovered mid-loop that DROP COLLATION had no implementation at all — no `catalog.DropCollation`
+      method existed and `execDropCompat` had no `case "collation"`, so `DROP COLLATION <name>` on an EXISTING
+      user collation always raised "does not exist" and `IF EXISTS` always no-op'd without touching the registry
+      (slice-389's own recorded deferral (d)). Implemented DROP COLLATION itself first (new `DropCollation`/
+      `ListUserCollations` catalog methods; a dedicated `objType == "collation"` block in `execDropCompat`,
+      placed before the generic IF-EXISTS fallthrough, looping over `s.Names`), then restart persistence on top
+      following the loop #47-49 template: `RecordKindCreateCollation`(42)/`RecordKindDropCollation`(43) +
+      `Encode/DecodeCreateCollation`/`Encode/DecodeDropCollation` (`internal/wal/recovery.go` — 15-byte fixed
+      header + 6 length-prefixed strings, since `UserCollation`'s libc/ICU/builtin provider fields don't share
+      one string set); `CreateCollationDuringRecovery`/`DropCollationDuringRecovery` catalog hooks; new
+      `internal/initdb/collation_ddl_recovery.go` wired into `open.go` after `replayConversionDDLRecords`
+      (collation is schema-scoped like conversion); WAL emission in `execCreateCollation` (gated on
+      `uc.OID != 0` so an `IF NOT EXISTS` hit that didn't mutate the registry doesn't spuriously WAL) and in the
+      new collation-drop block, both using the already-generalized `wal.IsGoopgNativeRecord` guard (no further
+      WAL-scan fix needed). Used a string-slice loop in the encoder instead of hand-unrolling 6
+      PutUint16+copy blocks — deliberate response to 3-for-3 prior hand-derived byte-offset bugs in this series
+      (Cast/Transform/Conversion); `TestEncodeDecodeCreateCollationRoundTrip` passed on the first run. Verified:
+      new unit tests (`internal/wal/collation_ddl_test.go`, `internal/initdb/collation_ddl_recovery_test.go`,
+      `TestDropCollation` in `internal/catalog/create_collation_test.go` pinning the actual functionality fix);
+      `go build`/`go vet` clean; `-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb` PASS
+      (full recovery suite, 252s); `TestE2E_PhysicalReplication`/`...Sync` PASS; `internal/executor` full suite
+      PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook; `make ralph-state-guard` OK
+      (self-repaired a stale status/progress marker, same pattern as prior loops). Design doc
+      `0110-0001-pg-dump-tap-port.md` new "CREATE/DROP COLLATION restart persistence" subsection (full
+      narrative); ledger row appended. **The slice-389 four-object restart-persistence backlog
+      (Transform → Cast → Conversion → Collation) is now CLOSED.** Still open, independent: ALTER COLLATION
+      (OWNER/RENAME/REFRESH VERSION) unhandled; collation ordering/enforcement is still dump-only (goopg never
+      uses a collation for actual string comparison); the DROP CAST type-name-synonym key gap (loop #48) remains.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

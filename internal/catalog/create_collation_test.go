@@ -125,3 +125,58 @@ func TestCreateCollationVirtualRows(t *testing.T) {
 		t.Errorf("CreateCollation IF NOT EXISTS on existing: %v", err)
 	}
 }
+
+// TestDropCollation verifies DropCollation removes a user-created collation
+// from the registry (and its pg_collation virtual row) and reports
+// found/not-found correctly. Before M0119-0004's DROP COLLATION slice, no
+// DropCollation method existed at all, so `DROP COLLATION <name>` on an
+// existing user collation always reported "does not exist" — this pins the
+// fix.
+func TestDropCollation(t *testing.T) {
+	c := NewInMemory()
+	uc := &UserCollation{
+		Name: "mycoll", Owner: 10, Provider: 'c', Encoding: -1,
+		Collate: "C", Ctype: "C", Deterministic: true,
+	}
+	if _, err := c.CreateCollation(uc, "public", false); err != nil {
+		t.Fatalf("CreateCollation: %v", err)
+	}
+
+	// A different (schema, name) pair must not match. Register a real second
+	// schema — an unregistered schema name resolves to public (same fallback
+	// as CreateCollation), which would falsely match.
+	c.RegisterSchema("other_schema")
+	if c.DropCollation("mycoll", "other_schema") {
+		t.Error("DropCollation matched across a different schema")
+	}
+	if c.DropCollation("nonexistent", "public") {
+		t.Error("DropCollation reported found for a name that was never created")
+	}
+
+	if !c.DropCollation("mycoll", "public") {
+		t.Fatal("DropCollation(mycoll, public) = false, want true")
+	}
+	if _, ok := c.CollationAttrsByName("mycoll"); ok {
+		t.Error("mycoll still resolvable via CollationAttrsByName after DropCollation")
+	}
+	// A second drop of the same name is a no-op reporting not-found (mirrors
+	// DropConversion/DropCast/DropTransform).
+	if c.DropCollation("mycoll", "public") {
+		t.Error("DropCollation on an already-dropped collation reported true")
+	}
+
+	// The virtual pg_collation view drops back to only the 7 built-ins.
+	pgColl, ok := c.LookupTable(parser.ObjectName{Name: "pg_collation"})
+	if !ok {
+		t.Fatal("pg_collation view missing")
+	}
+	if rows := pgColl.VirtualRows(); len(rows) != 7 {
+		t.Errorf("pg_collation rows after drop = %d, want 7 (builtins only)", len(rows))
+	}
+
+	// A built-in collation is never in userCollations, so DropCollation on one
+	// always reports not-found (PG likewise refuses to drop a pinned row).
+	if c.DropCollation("C", "public") {
+		t.Error("DropCollation on a built-in collation reported true")
+	}
+}

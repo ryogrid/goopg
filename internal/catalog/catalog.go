@@ -8640,6 +8640,68 @@ func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists
 	return uc.OID, nil
 }
 
+// DropCollation removes the user-created collation with the given bare name in
+// the given schema from the registry. Returns true if one was found and
+// removed. `schema` resolves like CreateCollation (unknown → public). Built-in
+// collations are never registered in userCollations, so a DROP COLLATION on
+// one of them always returns false (mirrors PG, which also refuses to drop a
+// pinned pg_collation row). M0119-0004.
+func (c *InMemory) DropCollation(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			c.userCollations = append(c.userCollations[:i], c.userCollations[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// CreateCollationDuringRecovery is the idempotent version of CreateCollation
+// used by the WAL-replay driver (internal/initdb/collation_ddl_recovery.go).
+// Unlike CreateCollation it takes the OID from the WAL record (so the
+// recovered collation matches the pre-crash OID exactly) and overwrites
+// rather than erroring when an entry with the same OID is already present
+// (replay may see the same record more than once across a partial-then-full
+// replay). Mirrors CreateConversionDuringRecovery. DU-002 restart-persistence
+// follow-up.
+func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	uc.NamespaceOID = nsOID
+	for i, existing := range c.userCollations {
+		if existing.OID == uc.OID {
+			c.userCollations[i] = uc
+			if uc.OID >= c.nextOID {
+				c.nextOID = uc.OID + 1
+			}
+			return
+		}
+	}
+	c.userCollations = append(c.userCollations, uc)
+	if uc.OID >= c.nextOID {
+		c.nextOID = uc.OID + 1
+	}
+}
+
+// DropCollationDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropCollation. Identical to DropCollation but discards
+// the found/not-found result — replay does not care whether the collation was
+// still present (a subsequent CREATE with the same name after a DROP is a
+// valid sequence to replay in order). DU-002 restart-persistence follow-up.
+func (c *InMemory) DropCollationDuringRecovery(name, schema string) {
+	c.DropCollation(name, schema)
+}
+
 // CreateConversion records a CREATE [DEFAULT] CONVERSION in the runtime
 // pg_conversion registry so pg_dump's getConversions / dumpConversion re-emit
 // it. `schema` is the (already-resolved) schema name the conversion lives in; an
@@ -8798,6 +8860,19 @@ func (c *InMemory) UserCollationOIDByName(name string) uint32 {
 		}
 	}
 	return 0
+}
+
+// ListUserCollations returns the user-created collations in creation order.
+// Mirrors ListUserConversions. M0119-0004.
+func (c *InMemory) ListUserCollations() []*UserCollation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userCollations) == 0 {
+		return nil
+	}
+	out := make([]*UserCollation, len(c.userCollations))
+	copy(out, c.userCollations)
+	return out
 }
 
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.

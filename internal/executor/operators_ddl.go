@@ -403,6 +403,19 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 	if _, err := im.CreateCollation(uc, schema, s.IfNotExists); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
+	// per-collation on-disk file namespace, so record a WAL event the
+	// recovery driver (internal/initdb/collation_ddl_recovery.go) replays
+	// into the collation registry on the next startup. Mirrors CREATE
+	// CAST/TRANSFORM/CONVERSION. uc.OID is only set when CreateCollation
+	// actually inserted a new entry (the IF NOT EXISTS "already exists"
+	// path returns the existing OID without touching uc.OID), so this skips
+	// the WAL write for a no-op IF NOT EXISTS hit.
+	if o.ctx.WAL != nil && uc.OID != 0 {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCollation(uc.Name, schema, uc.Collate, uc.Ctype, uc.Locale, uc.Rules, uc.OID, uc.Owner, int32(uc.Encoding), uc.Provider, uc.Deterministic)); werr != nil {
+			return fmt.Errorf("wal create-collation: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -12335,6 +12348,45 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+	}
+
+	// DROP COLLATION [IF EXISTS] name [, ...] — remove from the runtime
+	// pg_collation registry (CREATE COLLATION, M0119-0004) so the drop is
+	// reflected in pg_dump. Must run before the generic IF EXISTS fallthrough
+	// below so IF EXISTS correctly checks existence instead of unconditionally
+	// no-oping. Built-in collations are never registered in the user
+	// registry, so DropCollation always reports "not found" for them (PG
+	// likewise refuses to drop a pinned pg_collation row, though with a
+	// different error). PG error: "collation %q does not exist"
+	// (ERRCODE_UNDEFINED_OBJECT). DU-002 restart-persistence follow-up.
+	if objType == "collation" {
+		im, imOK := o.ctx.Catalog.(*catalog.InMemory)
+		for _, name := range s.Names {
+			if o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
+			schema := name.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			if imOK && im.DropCollation(name.Name, schema) {
+				// DU-002 restart-persistence follow-up: mirror the DROP
+				// CAST/TRANSFORM/CONVERSION WAL emission so the drop
+				// survives a restart too.
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCollation(name.Name, schema)); werr != nil {
+						return fmt.Errorf("wal drop-collation: %w", werr)
+					}
+				}
+				continue
+			}
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("collation %q does not exist, skipping", name.Name))
+				continue
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q does not exist", name.Name)}
+		}
+		return nil
 	}
 
 	// DROP OPERATOR CLASS/FAMILY name USING method — M0097-0071.

@@ -505,6 +505,35 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
 	RecordKindDropConversion byte = 41
 
+	// RecordKindCreateCollation records a `CREATE COLLATION <name> (...)`
+	// event so the catalog's in-memory collation registry
+	// (catalog.InMemory.userCollations, which backs the pg_collation virtual
+	// view) survives a restart. Like CREATE CAST/TRANSFORM/CONVERSION,
+	// CREATE COLLATION is a catalog-only side effect with no per-object
+	// on-disk file namespace, so the physical redo path is a no-op
+	// (applyRecord returns (false, nil)); the recovery driver in
+	// internal/initdb/collation_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each collation with its
+	// original OID. Like a conversion, a collation is schema-scoped, so
+	// replay of this record must happen after schema replay
+	// (replaySchemaDDLRecords) has repopulated the schema OID map. Mirrors
+	// RecordKindCreateConversion (M0119-0004). DU-002 restart-persistence
+	// follow-up.
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | encoding(4) | provider(1) | deterministicFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   collateLen(2) | collate(collateLen bytes) | ctypeLen(2) | ctype(ctypeLen bytes) |
+	//   localeLen(2) | locale(localeLen bytes) | rulesLen(2) | rules(rulesLen bytes)
+	RecordKindCreateCollation byte = 42
+
+	// RecordKindDropCollation records a `DROP COLLATION <name>` event.
+	// Counterpart to RecordKindCreateCollation; the recovery driver removes
+	// the (schema, name) pair from the catalog instead of adding it. The
+	// OID/provider/locale fields are not needed on drop.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindDropCollation byte = 43
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1039,6 +1068,140 @@ func DecodeDropConversion(payload []byte) (name, schema string, err error) {
 	off += 2
 	if len(payload) < off+schemaLen {
 		return "", "", fmt.Errorf("wal: drop-conversion payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, nil
+}
+
+// EncodeCreateCollation encodes a CREATE COLLATION event (DU-002
+// restart-persistence follow-up to M0119-0004). The OID is carried so
+// recovery re-registers the collation identically to the live server.
+// encoding is a pg_enc ID (-1 = encoding-independent), wire-encoded as
+// signed int32 to match catalog.UserCollation's field type exactly.
+// Format: kind(1) | oid(4) | ownerOID(4) | encoding(4) | provider(1) |
+// deterministicFlag(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+// schema(schemaLen bytes) | collateLen(2) | collate(collateLen bytes) |
+// ctypeLen(2) | ctype(ctypeLen bytes) | localeLen(2) | locale(localeLen bytes) |
+// rulesLen(2) | rules(rulesLen bytes).
+func EncodeCreateCollation(name, schema, collate, ctype, locale, rules string, oid, ownerOID uint32, encoding int32, provider byte, deterministic bool) []byte {
+	strs := []string{name, schema, collate, ctype, locale, rules}
+	total := 0
+	for i, s := range strs {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+			strs[i] = s
+		}
+		total += 2 + len(s)
+	}
+	// 15-byte fixed header + 6 length-prefixed strings (2-byte length each).
+	out := make([]byte, 15+total)
+	out[0] = RecordKindCreateCollation
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], uint32(encoding))
+	out[13] = provider
+	if deterministic {
+		out[14] = 1
+	}
+	off := 15
+	for _, s := range strs {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:], s)
+		off += len(s)
+	}
+	return out
+}
+
+// DecodeCreateCollation decodes a RecordKindCreateCollation payload.
+func DecodeCreateCollation(payload []byte) (name, schema, collate, ctype, locale, rules string, oid, ownerOID uint32, encoding int32, provider byte, deterministic bool, err error) {
+	if len(payload) < 15 {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, fmt.Errorf("wal: create-collation payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateCollation {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-collation", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	encoding = int32(binary.LittleEndian.Uint32(payload[9:13]))
+	provider = payload[13]
+	deterministic = payload[14] != 0
+	off := 15
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-collation payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-collation payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if collate, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if ctype, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if locale, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if rules, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	return name, schema, collate, ctype, locale, rules, oid, ownerOID, encoding, provider, deterministic, nil
+}
+
+// EncodeDropCollation encodes a DROP COLLATION event (DU-002
+// restart-persistence follow-up to M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeDropCollation(name, schema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(schema))
+	out[0] = RecordKindDropCollation
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeDropCollation decodes a RecordKindDropCollation payload.
+func DecodeDropCollation(payload []byte) (name, schema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-collation payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropCollation {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-collation", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: drop-collation payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", fmt.Errorf("wal: drop-collation payload truncated (need %d bytes)", off+schemaLen)
 	}
 	schema = string(payload[off : off+schemaLen])
 	return name, schema, nil
@@ -2816,6 +2979,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/conversion_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's conversion registry.
+		return false, nil
+	case RecordKindCreateCollation, RecordKindDropCollation:
+		// CREATE/DROP COLLATION records (DU-002 restart-persistence
+		// follow-up) carry only pg_collation metadata; goopg has no
+		// per-collation file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/collation_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's collation registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
