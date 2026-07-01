@@ -554,6 +554,37 @@ const (
 	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
 	RecordKindAlterCollationOwner byte = 45
 
+	// RecordKindCreateAggregate records a `CREATE AGGREGATE <name> (...)`
+	// event so the catalog's in-memory aggregate registry
+	// (catalog.InMemory.userAggregates, which backs the pg_aggregate/pg_proc
+	// virtual views and the planner's isUserAggregateFunc lookup) survives a
+	// restart. Like CREATE CAST/TRANSFORM/CONVERSION/COLLATION, CREATE
+	// AGGREGATE is a catalog-only side effect with no per-object on-disk file
+	// namespace, so the physical redo path is a no-op (applyRecord returns
+	// (false, nil)); the recovery driver in
+	// internal/initdb/aggregate_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each aggregate with its
+	// original OID. Unlike a collation/conversion, a user aggregate has no
+	// Schema field yet (catalog.UserAggregate — see the DU-002 slice 405
+	// ledger row's resume point (a)), so replay does not depend on schema
+	// replay having run first. DU-002 restart-persistence follow-up
+	// (M0119-0004, slice 405 ledger resume point (c)).
+	// Format:
+	//   kind(1) | oid(4) | sfuncStrictFlag(1) | variadicFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) | sTypeLen(2) | sType(sTypeLen bytes) |
+	//   sFuncLen(2) | sFunc(sFuncLen bytes) | finalFuncLen(2) | finalFunc(finalFuncLen bytes) |
+	//   combineFuncLen(2) | combineFunc(combineFuncLen bytes) | initCondLen(2) | initCond(initCondLen bytes) |
+	//   finalFuncModifyLen(2) | finalFuncModify(finalFuncModifyLen bytes) |
+	//   argTypesCount(2) | for each: argTypeLen(2) argType(argTypeLen bytes)
+	RecordKindCreateAggregate byte = 46
+
+	// RecordKindAlterAggregateRename records an `ALTER AGGREGATE name(args)
+	// RENAME TO newname` event so the rename survives a restart. Same no-op
+	// physical redo path as RecordKindCreateAggregate.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterAggregateRename byte = 47
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1337,6 +1368,169 @@ func DecodeAlterCollationOwner(payload []byte) (name, schema string, ownerOID ui
 	}
 	schema = string(payload[off : off+schemaLen])
 	return name, schema, ownerOID, nil
+}
+
+// EncodeCreateAggregate encodes a CREATE AGGREGATE event (DU-002
+// restart-persistence follow-up to M0119-0004, slice 405 resume point (c)).
+// The OID is carried so recovery re-registers the aggregate identically to
+// the live server. Format documented at the RecordKindCreateAggregate
+// constant.
+func EncodeCreateAggregate(name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool) []byte {
+	strs := []string{name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify}
+	total := 0
+	for i, s := range strs {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+			strs[i] = s
+		}
+		total += 2 + len(s)
+	}
+	total += 2
+	for _, a := range argTypes {
+		if len(a) > 0xFFFF {
+			a = a[:0xFFFF]
+		}
+		total += 2 + len(a)
+	}
+	// 7-byte fixed header (kind + oid + 2 flag bytes) + 7 length-prefixed
+	// strings (2-byte length each) + arg-type count + arg-type strings.
+	out := make([]byte, 7+total)
+	out[0] = RecordKindCreateAggregate
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	if sFuncStrict {
+		out[5] = 1
+	}
+	if variadic {
+		out[6] = 1
+	}
+	off := 7
+	for _, s := range strs {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:], s)
+		off += len(s)
+	}
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(argTypes)))
+	off += 2
+	for _, a := range argTypes {
+		if len(a) > 0xFFFF {
+			a = a[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(a)))
+		off += 2
+		copy(out[off:], a)
+		off += len(a)
+	}
+	return out
+}
+
+// DecodeCreateAggregate decodes a RecordKindCreateAggregate payload.
+func DecodeCreateAggregate(payload []byte) (name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool, err error) {
+	if len(payload) < 7 {
+		return "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateAggregate {
+		return "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: record kind %d is not create-aggregate", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	sFuncStrict = payload[5] != 0
+	variadic = payload[6] != 0
+	off := 7
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if sType, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if sFunc, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if finalFunc, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if combineFunc, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if initCond, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if finalFuncModify, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+2)
+	}
+	argCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	argTypes = make([]string, 0, argCount)
+	for i := 0; i < argCount; i++ {
+		a, aerr := readStr()
+		if aerr != nil {
+			return "", "", "", "", "", "", "", nil, 0, false, false, aerr
+		}
+		argTypes = append(argTypes, a)
+	}
+	return name, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify, argTypes, oid, sFuncStrict, variadic, nil
+}
+
+// EncodeAlterAggregateRename encodes an ALTER AGGREGATE ... RENAME TO event
+// (DU-002 restart-persistence follow-up to M0119-0004, slice 405 resume
+// point (c)). Format: kind(1) | nameLen(2) | name(nameLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeAlterAggregateRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newName))
+	out[0] = RecordKindAlterAggregateRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterAggregateRename decodes a RecordKindAlterAggregateRename payload.
+func DecodeAlterAggregateRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: alter-aggregate-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterAggregateRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-aggregate-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-aggregate-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", fmt.Errorf("wal: alter-aggregate-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, newName, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -3120,6 +3314,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/collation_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's collation registry.
+		return false, nil
+	case RecordKindCreateAggregate, RecordKindAlterAggregateRename:
+		// CREATE/ALTER AGGREGATE records (DU-002 restart-persistence
+		// follow-up, slice 405 resume point (c)) carry only pg_aggregate/
+		// pg_proc metadata; goopg has no per-aggregate file namespace, so
+		// the physical replay path has nothing to do. The recovery driver
+		// in internal/initdb/aggregate_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's user-aggregate registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog

@@ -960,6 +960,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: collation DDL replay: %w", err)
 	}
+	// DU-002 restart-persistence follow-up (slice 405 ledger resume point
+	// (c)): restore CREATE/ALTER AGGREGATE objects (pg_aggregate/pg_proc)
+	// from the WAL the same way. Unlike collation/conversion, a user
+	// aggregate has no Schema field yet, so order relative to schema replay
+	// does not matter.
+	if err := replayAggregateDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: aggregate DDL replay: %w", err)
+	}
 
 	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
 	// If the JSON snapshot is present and valid, populate the catalog directly

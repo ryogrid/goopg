@@ -3837,6 +3837,38 @@ documentation-only and is exempt from the design-doc requirement.)
       overload resolution) — see ledger row for the `map[string][]BuiltinProc`
       generalization resume point, not attempted since no current fixture
       needs a second overload of any curated name.
+      **2026-07-01 (loop #56): CREATE/ALTER AGGREGATE restart persistence
+      LANDED** — closes the slice-405 row's "restart persistence" deferral
+      above, following the same "round-trip lands first, restart persistence
+      follows separately" split already used for
+      TRANSFORM/CAST/CONVERSION/COLLATION. New `wal.RecordKindCreateAggregate`
+      (46) / `RecordKindAlterAggregateRename` (47) + `Encode`/`Decode` pairs
+      (`internal/wal/recovery.go`); `catalog.InMemory.RegisterUserAggregateDuringRecovery`/
+      `RenameUserAggregateDuringRecovery` (OID-preserving, `nextOID`-advancing,
+      mirrors `RegisterCastDuringRecovery`); new
+      `internal/initdb/aggregate_ddl_recovery.go` (`replayAggregateDDLRecords`)
+      wired into `Open` right after `replayCollationDDLRecords`; `execCreateAggregate`/
+      `execAlterAggregateRename` (`internal/executor/operators_ddl.go`) each
+      append the corresponding WAL record. `ALTER AGGREGATE OWNER TO` has no
+      wiring to persist because goopg's aggregate DDL surface never grew an
+      OWNER TO arm (only RENAME TO, M0097-0035); `DROP AGGREGATE` is
+      untouched — confirmed it is not wired to actually remove a registered
+      user aggregate at all today (`operators_ddl.go`'s DROP AGGREGATE arm
+      only validates args and always reports "does not exist", a pre-existing
+      M0097-regress-era gap, unrelated to this slice). Tests:
+      `internal/wal/aggregate_ddl_test.go` (Encode/Decode round-trip +
+      truncated-payload guard), `internal/initdb/aggregate_ddl_recovery_test.go`
+      (3 tests: create-replay, rename-after-create-replay, missing-wal-dir
+      no-op) — full second-`Open` WAL-replay proof mirroring
+      `collation_ddl_recovery_test.go`. Design doc updated (new "Slice 405
+      follow-up" section in `0110-0001-pg-dump-tap-port.md`). Gates: `go build
+      ./...` clean; `go vet` wal/catalog/initdb/executor clean; `internal/wal`
+      (including `-race` on wal+mvcc) + `internal/catalog` + `internal/initdb`
+      + `internal/executor` suites PASS; `TestPort_PgDumpConnectionSetup`
+      PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit
+      hook. Deferred (unchanged from slice 405, ledger row appended):
+      `pronamespace` hardcoded to `public`; built-in aggregates'
+      `aggtransfn`/... still render raw OIDs on direct query.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

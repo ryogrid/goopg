@@ -2944,6 +2944,38 @@ func (c *InMemory) RenameUserAggregate(oldName, newName string) bool {
 	return true
 }
 
+// RegisterUserAggregateDuringRecovery is the idempotent version of
+// RegisterUserAggregate used by the WAL-replay driver
+// (internal/initdb/aggregate_ddl_recovery.go). Unlike RegisterUserAggregate
+// it takes the OID from the WAL record (so the recovered registry matches
+// what the pre-crash server assigned) and advances nextOID past it so
+// subsequent allocations do not collide. Re-applying a record for an
+// aggregate that already exists just refreshes its fields. Mirrors
+// RegisterCastDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, slice 405 ledger resume point (c)).
+func (c *InMemory) RegisterUserAggregateDuringRecovery(agg *UserAggregate) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userAggregates == nil {
+		c.userAggregates = make(map[string]*UserAggregate)
+	}
+	c.userAggregates[strings.ToLower(agg.Name)] = agg
+	if agg.OID >= c.nextOID {
+		c.nextOID = agg.OID + 1
+	}
+}
+
+// RenameUserAggregateDuringRecovery is the discard-result recovery
+// counterpart to RenameUserAggregate, mirroring
+// RenameCollationDuringRecovery. A rename record can only be replayed after
+// its aggregate's CREATE AGGREGATE record (WAL is scanned in order), so a
+// not-found error here is not expected in practice, but replay must not
+// abort on it. DU-002 restart-persistence follow-up (M0119-0004, slice 405
+// ledger resume point (c)).
+func (c *InMemory) RenameUserAggregateDuringRecovery(oldName, newName string) {
+	_ = c.RenameUserAggregate(oldName, newName)
+}
+
 // ListUserAggregates returns every registered user-defined aggregate in
 // OID order (deterministic for pg_proc/pg_aggregate VirtualRows output).
 func (c *InMemory) ListUserAggregates() []*UserAggregate {

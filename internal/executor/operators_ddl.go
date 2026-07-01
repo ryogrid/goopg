@@ -14237,6 +14237,17 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	o.ctx.Catalog.RegisterUserAggregate(agg)
 	syncAggregateToCatalogHeap(o.ctx, agg)
+	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
+	// resume point (c)): goopg has no per-aggregate on-disk file namespace,
+	// so record a WAL event the recovery driver
+	// (internal/initdb/aggregate_ddl_recovery.go) replays into the
+	// user-aggregate registry on the next startup. Mirrors CREATE
+	// CAST/TRANSFORM/CONVERSION/COLLATION.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAggregate(agg.Name, agg.SType, agg.SFunc, agg.FinalFunc, agg.CombineFunc, agg.InitCond, agg.FinalFuncModify, agg.ArgTypes, agg.OID, agg.SFuncStrict, agg.Variadic)); werr != nil {
+			return fmt.Errorf("wal create-aggregate: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -14251,6 +14262,14 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 	if !im.RenameUserAggregate(oldName, newName) {
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("aggregate %s does not exist", oldName)}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
+	// resume point (c)): mirrors execCreateAggregate's WAL emission so the
+	// rename survives a restart.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateRename(oldName, newName)); werr != nil {
+			return fmt.Errorf("wal alter-aggregate-rename: %w", werr)
+		}
 	}
 	return nil
 }

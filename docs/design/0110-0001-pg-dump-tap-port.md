@@ -10576,6 +10576,54 @@ Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
   (same "CREATE X round-trip lands first, restart persistence follows
   separately" split already used for TRANSFORM/CAST/CONVERSION/COLLATION).
 
+### Slice 405 follow-up — CREATE/ALTER AGGREGATE restart persistence
+
+Closes the "restart persistence" deferral from the Slice 405 row above.
+`CREATE AGGREGATE` and `ALTER AGGREGATE ... RENAME TO` are now WAL-logged,
+mirroring the CREATE/DROP/ALTER COLLATION template (`docs/design/0119-0004-alter-collation.md`)
+exactly:
+
+- New `wal.RecordKindCreateAggregate` (46) / `wal.RecordKindAlterAggregateRename`
+  (47), with `Encode`/`DecodeCreateAggregate` and
+  `Encode`/`DecodeAlterAggregateRename` (`internal/wal/recovery.go`). Both are
+  no-op in the physical redo path (`applyRecord` returns `(false, nil)`) —
+  goopg has no per-aggregate on-disk file namespace, same rationale as every
+  other DU-002 catalog-only object family.
+- `catalog.InMemory.RegisterUserAggregateDuringRecovery` /
+  `RenameUserAggregateDuringRecovery` — the idempotent, OID-preserving
+  recovery counterparts to `RegisterUserAggregate`/`RenameUserAggregate`
+  (mirrors `RegisterCastDuringRecovery`); `RegisterUserAggregateDuringRecovery`
+  advances `nextOID` past the recovered OID so live allocations after restart
+  never collide with it.
+- New `internal/initdb/aggregate_ddl_recovery.go`
+  (`replayAggregateDDLRecords`), wired into `Open` right after
+  `replayCollationDDLRecords` (`internal/initdb/open.go`). Unlike
+  collation/conversion, a user aggregate has no `Schema` field yet (resume
+  point (a) above), so this replay does not depend on schema replay having
+  run first — order relative to `replaySchemaDDLRecords` does not matter.
+- `execCreateAggregate` / `execAlterAggregateRename`
+  (`internal/executor/operators_ddl.go`) each append the corresponding WAL
+  record right after the in-memory catalog mutation.
+
+`ALTER AGGREGATE ... OWNER TO` has no equivalent yet — unlike a collation,
+goopg's aggregate DDL surface has no OWNER TO arm at all (only RENAME TO,
+M0097-0035), so there is nothing to WAL-log there. `DROP AGGREGATE` is also
+untouched: it is not wired to actually remove a registered user aggregate at
+all today (`internal/executor/operators_ddl.go`'s "DROP AGGREGATE" handling
+only validates arguments and always reports "does not exist" — a pre-existing
+M0097-regress-era gap, not something this slice's restart-persistence work
+introduced or could sensibly WAL-log against).
+
+Tests: `internal/wal/aggregate_ddl_test.go` (Encode/Decode round-trip +
+truncated-payload guard) and
+`internal/initdb/aggregate_ddl_recovery_test.go` (`TestAggregateDDLRecoveryReplaysCreate`,
+`TestAggregateDDLRecoveryReplaysRenameAfterCreate`,
+`TestReplayAggregateDDLRecordsHandlesMissingWalDir`) — full second-`Open`
+WAL-replay proof, mirroring `collation_ddl_recovery_test.go`. Gates: `go build
+./...` clean; `go vet` wal/catalog/initdb/executor clean; `internal/wal`
+(including `-race`) + `internal/catalog` + `internal/initdb` +
+`internal/executor` suites PASS; `TestPort_PgDumpConnectionSetup` PASS.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
