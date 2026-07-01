@@ -3541,11 +3541,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
-		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate:
-			// All three record types are emitted with full-page images
+		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate, xlogHeapInplace:
+			// All four record types are emitted with full-page images
 			// (HasImage+ImageApply on every referenced block). Restore each
 			// block from its FPI; tuple-level main-data parsing is not needed
 			// because the FPI already captures the post-mutation page state.
+			// xlogHeapInplace (M0117-0008 Part B) carries the same
+			// datfrozenxid-advanced pg_database page PgCanonicalHeapInplace
+			// wrote on the primary.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 				return false, err
 			}

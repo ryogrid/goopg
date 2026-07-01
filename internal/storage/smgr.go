@@ -394,7 +394,7 @@ func (m *Manager) Exists(rel RelFileNode) bool {
 // can build the upstream-verbatim `could not open file "%s"` message when a
 // fork is found missing (the pg_amcheck heap file-removal corruption scenario).
 func (m *Manager) RelPath(rel RelFileNode) string {
-	base := "base/" + fmt.Sprint(rel.DBOid)
+	base := sharedOrPerDBRelDir(rel.DBOid)
 	switch rel.Fork {
 	case MainFork:
 		return base + "/" + fmt.Sprint(rel.RelOid)
@@ -521,8 +521,21 @@ func (m *Manager) relFile(rel RelFileNode) (*relFile, error) {
 	return f, nil
 }
 
+// sharedOrPerDBRelDir returns the "base/<dbOid>" (or, for the shared-catalog
+// sentinel dbOid==0, "global") directory a RelFileNode's DBOid resolves to.
+// DBOid 0 is never a live database OID (catalog.DefaultDBOid == 1; no
+// pg_database row is ever assigned OID 0), so it is free to mean "this is a
+// cluster-wide shared catalog" (pg_database, pg_authid, ...) mirroring
+// PostgreSQL's relpath() global/ tablespace path. M0117-0008 Part B.
+func sharedOrPerDBRelDir(dbOid uint32) string {
+	if dbOid == 0 {
+		return "global"
+	}
+	return "base/" + fmt.Sprint(dbOid)
+}
+
 func (m *Manager) relPath(rel RelFileNode) string {
-	base := filepath.Join(m.cfg.DataDir, "base", fmt.Sprint(rel.DBOid))
+	base := filepath.Join(m.cfg.DataDir, sharedOrPerDBRelDir(rel.DBOid))
 	switch rel.Fork {
 	case MainFork:
 		return filepath.Join(base, fmt.Sprint(rel.RelOid))

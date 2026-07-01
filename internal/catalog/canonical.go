@@ -28,6 +28,7 @@ const (
 const (
 	canonicalInfoHeapInsert  uint8 = 0x00 // XLOG_HEAP_INSERT
 	canonicalInfoHeapDelete  uint8 = 0x10 // XLOG_HEAP_DELETE
+	canonicalInfoHeapInplace uint8 = 0x70 // XLOG_HEAP_INPLACE
 	canonicalInfoBtreeInsert uint8 = 0x00 // XLOG_BTREE_INSERT_LEAF
 )
 
@@ -100,6 +101,55 @@ func BuildCanonicalHeapInsertPayload(
 	// mainData[2] = 0 (flags)
 	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
 	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapInsert, xid, body)
+}
+
+// PgCanonicalHeapInplace encodes a PG-canonical XLOG_HEAP_INPLACE WAL record
+// (with a full-page image) and emits it via logFn. Mirrors
+// PgCanonicalHeapInsert's FPI approach: a standby (or crash recovery) simply
+// restores the page rather than re-deriving the overwritten tuple bytes.
+// Used by the runtime pg_database.datfrozenxid in-place update (VACUUM end,
+// vac_update_datfrozenxid; M0117-0008 Part B) — the one in-place (not
+// append-a-new-version) heap tuple write goopg performs at runtime.
+//
+// Parameters:
+//   - rel: catalog relation's physical file node (DBOid, RelOid, Fork)
+//   - blk: heap block number containing the updated tuple
+//   - page: full 8192-byte page snapshot after the in-place overwrite
+//   - offnum: 1-based line-pointer slot of the updated tuple
+//   - xid: transaction ID of the backend performing the update
+//   - logFn: callback to write the encoded payload to the WAL stream
+func PgCanonicalHeapInplace(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	offnum uint16,
+	xid uint32,
+	logFn LogCanonicalFunc,
+) (uint64, error) {
+	if logFn == nil {
+		return 0, nil
+	}
+	payload := BuildCanonicalHeapInplacePayload(rel, blk, page, offnum, xid)
+	return logFn(payload)
+}
+
+// BuildCanonicalHeapInplacePayload builds the full canonical payload for
+// PgCanonicalHeapInplace. Exposed for unit testing. Real PG's xl_heap_inplace
+// main data also carries dbId/tsId/relcacheInitFileInval/shared-inval
+// messages (heapam_xlog.h) used to invalidate other backends' caches; goopg's
+// FPI-restore replay needs none of that; the offnum is carried for parity
+// with BuildCanonicalHeapInsertPayload's layout.
+func BuildCanonicalHeapInplacePayload(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	offnum uint16,
+	xid uint32,
+) []byte {
+	var mainData [2]byte
+	binary.LittleEndian.PutUint16(mainData[0:2], offnum)
+	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
+	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapInplace, xid, body)
 }
 
 // PgCanonicalBtreeInsert encodes a PG-canonical XLOG_BTREE_INSERT_LEAF WAL

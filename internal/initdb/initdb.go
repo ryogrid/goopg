@@ -1624,26 +1624,10 @@ func bootstrapPostgresDatabase(dataDir string, encodingID int32, locale localeSe
 	//  16  daticurules      text          (PG18 ADDITION)
 	//  17  datcollversion   text          (BKI_DEFAULT(_null_))
 	//  18  datacl           aclitem[]
-	cols := []catalog.Column{
-		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
-		{Name: "datname", Type: catalog.Type{Name: "name"}, Ordinal: 1},
-		{Name: "datdba", Type: catalog.Type{Name: "oid"}, Ordinal: 2},
-		{Name: "encoding", Type: catalog.Type{Name: "int4"}, Ordinal: 3},
-		{Name: "datlocprovider", Type: catalog.Type{Name: "char"}, Ordinal: 4},
-		{Name: "datistemplate", Type: catalog.Type{Name: "bool"}, Ordinal: 5},
-		{Name: "datallowconn", Type: catalog.Type{Name: "bool"}, Ordinal: 6},
-		{Name: "dathasloginevt", Type: catalog.Type{Name: "bool"}, Ordinal: 7},
-		{Name: "datconnlimit", Type: catalog.Type{Name: "int4"}, Ordinal: 8},
-		{Name: "datfrozenxid", Type: catalog.Type{Name: "xid"}, Ordinal: 9},
-		{Name: "datminmxid", Type: catalog.Type{Name: "xid"}, Ordinal: 10},
-		{Name: "dattablespace", Type: catalog.Type{Name: "oid"}, Ordinal: 11},
-		{Name: "datcollate", Type: catalog.Type{Name: "text"}, Ordinal: 12},
-		{Name: "datctype", Type: catalog.Type{Name: "text"}, Ordinal: 13},
-		{Name: "datlocale", Type: catalog.Type{Name: "text"}, Ordinal: 14},
-		{Name: "daticurules", Type: catalog.Type{Name: "text"}, Ordinal: 15},
-		{Name: "datcollversion", Type: catalog.Type{Name: "text"}, Ordinal: 16},
-		{Name: "datacl", Type: catalog.Type{Name: "aclitem[]"}, Ordinal: 17},
-	}
+	// Column list lives in catalog.PgDatabaseColumnsPG18 (shared with the
+	// runtime datfrozenxid persistence path, M0117-0008 Part B) so the two
+	// encode/decode call sites can never drift out of sync.
+	cols := catalog.PgDatabaseColumnsPG18()
 	// Locale columns come from the resolved --locale-provider / --locale /
 	// --lc-* options (resolveLocale). The default (no options) reproduces a
 	// fresh `initdb --locale=C` under the libc provider: datlocprovider='c',

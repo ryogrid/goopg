@@ -178,6 +178,15 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 			analyzeInheritanceWait(o.ctx, parent)
 		}
 	}
+
+	// Advance pg_database.datfrozenxid on disk to the freshly recomputed
+	// cluster horizon (vac_update_datfrozenxid; M0117-0008 Part B). Runs
+	// unconditionally — like PG, whose VACOPT_VACUUM call site is
+	// unconditional regardless of an explicit target list — but a failure
+	// here must never fail the client's VACUUM: goopg's own CLOG truncation
+	// already reads the horizon from catalog.InMemory.DatFrozenXID()
+	// directly, so this step is pure external (standby/tooling) parity.
+	_ = persistDatFrozenXID(o.ctx)
 	return nil, EOF
 }
 

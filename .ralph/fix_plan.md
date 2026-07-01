@@ -236,14 +236,24 @@ role/database persistence is a real goopg feature gap.
       flushing (pre-existing, not CLOG-specific); closing it needs a
       whole-checkpoint-subsystem redo-pointer redesign, out of scope here.
       Design `0117-0007-*` "Part C".
-- [ ] **M0117-0008 — datfrozenxid persistence (Effort M).** Part A DONE (dual-store
-      consistency for all 4 CLOG status codes, satisfied via the M0117-0004 chain;
-      `clog_dual_store_consistency_test.go`). **Part B (DEFERRED, ledger 2026-06-15):**
-      on-disk in-place `pg_database.datfrozenxid` at VACUUM end — goopg has no runtime
-      shared-catalog RelFileNode resolver (pg_database is shared at `global/1262`), and a
-      faithful `heap_inplace_update` needs buffer-lock + WAL + a PG-standby-attach E2E.
-      Purely external (standby/tooling) parity — goopg's own CLOG truncation reads
-      in-memory `cat.DatFrozenXID()` directly. 5-step plan in design `0117-0008-*`.
+- [x] **M0117-0008 — datfrozenxid persistence (Effort M). FULLY DONE 2026-07-02
+      (loop #52).** Part A DONE (dual-store consistency for all 4 CLOG status codes,
+      via the M0117-0004 chain; `clog_dual_store_consistency_test.go`). **Part B
+      LANDED:** `vacuumOp.Next` calls the new `persistDatFrozenXID`
+      (`internal/executor/operators_vacuum_datfrozenxid.go`) unconditionally at VACUUM
+      end, advancing the on-disk `pg_database.datfrozenxid` tuple in place
+      (`storage.PageReplaceItemRaw`) and WAL-logging it via a new
+      `catalog.PgCanonicalHeapInplace` (`XLOG_HEAP_INPLACE`, FPI-based). Also fixed a
+      wider gap the design doc's original scoping missed: `storage.Manager` had no
+      `global/` shared-tablespace path concept at all (every `RelFileNode` resolved to
+      `base/<DBOid>/...`); `DBOid==0` is now the shared-catalog sentinel
+      (`sharedOrPerDBRelDir` in `internal/storage/smgr.go`). New
+      `catalog.SharedCatalogRelFileNode`/`PgDatabaseColumnsPG18` unify initdb's
+      bootstrap-time pg_database encode with the runtime decode/re-encode so the two
+      can never drift. Verified against a live `goopg init`-bootstrapped data dir over
+      the wire (datfrozenxid 3→4 after `VACUUM`, untouched template rows unchanged).
+      Full gate (race mvcc/wal/storage/catalog, standby-attach + replication E2E,
+      TPC-H Q12/Q13 spot-check) PASS. Design `0117-0008-*` "Part B — LANDED".
 
 ## M0118 — Upstream Isolation Spec Suite Pass-Through (filed 2026-06-20)
 
@@ -2140,20 +2150,14 @@ documentation-only and is exempt from the design-doc requirement.)
       PROMOTED (M0118-0002 group COMPLETE); the only residual isolation `failed`
       spec is `deadlock-parallel` (infeasible — no parallel-query lock groups), and
       it has no open ledger row of its own.
-- [ ] **M0119-0002 — CLOG tail, remaining Parts** (source: M0117-0007 / M0117-0008;
-      see M0117 section + ledger rows). **M0117-0006's own live store swap (Part B)
-      and bank/flat-file removal (Part C) are both DONE** (2026-06-29 loop #11 /
-      2026-07-01 loop #47); **M0117-0007 is now fully DONE** — Part B's mechanical
-      wiring (2026-07-02 loop #49 — barrier live, LSN association, GUC threading,
-      all interactive commit call sites; COPY's own 4 commit sites, loop #50) AND
-      Part C's actual latency win (2026-07-02 loop #51 — lazy CLOG write-back for
-      async commits + checkpoint-driven `CLog.FlushAll`/`FlushCLOGFn`; see the
-      M0117-0007 entry above and its design doc's "Part C"). This item now tracks
-      only M0117-0008 Part B (on-disk `datfrozenxid` persistence — needs a runtime
-      shared-catalog RelFileNode resolver + `heap_inplace_update` buffer-lock/WAL
-      path). Highest blast radius (Hard-won Rule #1): dedicated full-gate session
-      (`-race` mvcc+wal, xlog_replay, heterogeneous PG-standby E2E, fresh-server
-      TPC-H Q12/Q13) when this Part is picked up.
+- [x] **M0119-0002 — CLOG tail, remaining Parts. FULLY CLOSED 2026-07-02 (loop #52).**
+      (source: M0117-0007 / M0117-0008; see M0117 section + ledger rows).
+      `M0117-0006`'s live store swap (Part B) and bank/flat-file removal (Part C) were
+      DONE 2026-06-29/2026-07-01; `M0117-0007` (async-commit LSN tracking, all 3
+      parts) was completed 2026-07-02 (loops #49-51); `M0117-0008` Part B (on-disk
+      `datfrozenxid` persistence) — the last item this umbrella tracked — landed this
+      loop (#52; see the M0117-0008 entry above). No open sub-items remain under this
+      umbrella.
 - [x] **M0119-0003 — initdb remaining options. RESOLVED by triage 2026-06-29
       (M0119-0001), no separate impl loop needed.** Every listed option already
       landed on this branch — `--encoding` (`internal/initdb/encoding.go`),
