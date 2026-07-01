@@ -3485,6 +3485,38 @@ documentation-only and is exempt from the design-doc requirement.)
       WITH FUNCTION (397) / CONVERSION's FROM function (402) don't yet call `LookupBuiltinProc` (no fixture
       forces it yet, trivial follow-up); restart persistence stays in-memory only (recurring gap since 389);
       the curated table stays intentionally narrow (2 entries, not a full `pg_proc.dat` port).
+      **2026-07-01 (loop #47) — CREATE/DROP TRANSFORM restart persistence LANDED (first of the slice-389
+      "in-memory only" backlog to close, WAL/MVCC practice card gates run).** goopg's `catalog.InMemory.transforms`
+      map (and its siblings `casts`/`conversions`/`collations`) had no on-disk representation, so any of these
+      objects vanished on restart — a recurring deferral since slice 389. Closed for TRANSFORM only, as a template
+      for the other three: new WAL record kinds `RecordKindCreateTransform`(36)/`RecordKindDropTransform`(37) +
+      `Encode/DecodeCreateTransform`/`Encode/DecodeDropTransform` (`internal/wal/recovery.go`, mirrors
+      `RecordKindCreateSchema`/`DropSchema` M0110-0003 exactly — physical replay is a no-op, goopg has no
+      per-transform on-disk page state); new `RegisterTransformDuringRecovery`/`DropTransformDuringRecovery`
+      idempotent catalog hooks (`internal/catalog/catalog.go`); new recovery driver
+      `internal/initdb/transform_ddl_recovery.go` (`replayTransformDDLRecords`, mirrors `schema_ddl_recovery.go`),
+      wired into `internal/initdb/open.go` right after the existing schema replay call; executor
+      (`internal/executor/operators_ddl.go`) emits the WAL record at both the CREATE `case "transform"` arm and the
+      DROP `objType == "transform"` arm, mirroring the CREATE/DROP SCHEMA call sites. A real bug — not just a
+      hypothetical — was caught by the round-trip unit test: the first `EncodeCreateTransform` under-allocated the
+      output buffer by 2 bytes (missed the `langLen` field in the size expression), silently corrupting the lang
+      field; `TestEncodeDecodeCreateTransformRoundTrip` failed immediately and pinpointed it. Verified two ways:
+      (1) new unit tests `TestEncodeDecodeCreate/DropTransformRoundTrip` + reject-wrong-kind/truncated
+      (`internal/wal`), `TestTransformDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/
+      `TestReplayTransformDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full Init→Open→WAL.Append→Close→
+      re-Open cycle); (2) live manual restart test — built a throwaway binary, ran the exact upstream
+      `'CREATE TRANSFORM FOR int'` fixture SQL via real `psql`, `kill`ed the server (not graceful), restarted
+      against the same data dir, confirmed `pg_transform` still showed the row with the same OIDs, then
+      `DROP TRANSFORM`, a third restart, confirmed `pg_transform` was empty again. Gates: `go build`/`go vet`
+      clean; `-race` on `internal/wal`+`internal/catalog` (WAL/MVCC practice card); full
+      wal/catalog/initdb/executor/parser suites PASS; `TestPort_PgDumpConnectionSetup` (whole suite, confirms this
+      purely-durability change didn't disturb the connsetup fixture) PASS; `TestE2E_PhysicalReplication` PASS
+      (WAL/MVCC practice card recovery-path gate); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit.
+      Design doc `0110-0001-pg-dump-tap-port.md` new "CREATE TRANSFORM restart persistence" subsection; ledger
+      row appended (this closes part of the slice-389/396/399/404 restart-persistence deferral chain — cast/
+      conversion/collation still open, template now exists at bytes 38/39 next-free). Deliberately bounded to ONE
+      object kind per the "ONE task per loop" rule — the identical pattern for Cast/Conversion/Collation is each
+      its own dedicated loop.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

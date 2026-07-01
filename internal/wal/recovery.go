@@ -432,6 +432,29 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes)
 	RecordKindDropSchema byte = 35
 
+	// RecordKindCreateTransform records a `CREATE TRANSFORM FOR <type>
+	// LANGUAGE <lang> ...` event so the catalog's in-memory transform
+	// registry (catalog.InMemory.transforms, which backs the pg_transform
+	// virtual view) survives a restart. Like CREATE SCHEMA, CREATE TRANSFORM
+	// is a catalog-only side effect with no per-object on-disk file
+	// namespace, so the physical redo path is a no-op (applyRecord returns
+	// (false, nil)); the recovery driver in
+	// internal/initdb/transform_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each transform with its
+	// original OID. Mirrors RecordKindCreateSchema (M0110-0003). DU-002
+	// (M0119-0004) restart-persistence follow-up.
+	// Format:
+	//   kind(1) | oid(4) | fromFuncOID(4) | toFuncOID(4) | typeLen(2) | type(typeLen bytes) | langLen(2) | lang(langLen bytes)
+	RecordKindCreateTransform byte = 36
+
+	// RecordKindDropTransform records a `DROP TRANSFORM FOR <type> LANGUAGE
+	// <lang>` event. Counterpart to RecordKindCreateTransform; the recovery
+	// driver removes the (type, lang) pair from the catalog instead of
+	// adding it. The OID/function OIDs are not needed on drop.
+	// Format:
+	//   kind(1) | typeLen(2) | type(typeLen bytes) | langLen(2) | lang(langLen bytes)
+	RecordKindDropTransform byte = 37
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -611,6 +634,106 @@ func DecodeDropSchema(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-schema payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateTransform encodes a CREATE TRANSFORM event (M0119-0004 restart
+// persistence). The OID and resolved from/to function OIDs are carried so
+// recovery re-registers the transform identically to the live server.
+// Format: kind(1) | oid(4) | fromFuncOID(4) | toFuncOID(4) | typeLen(2) |
+// type(typeLen bytes) | langLen(2) | lang(langLen bytes).
+func EncodeCreateTransform(typeName, lang string, oid, fromFuncOID, toFuncOID uint32) []byte {
+	if len(typeName) > 0xFFFF {
+		typeName = typeName[:0xFFFF]
+	}
+	if len(lang) > 0xFFFF {
+		lang = lang[:0xFFFF]
+	}
+	out := make([]byte, 17+len(typeName)+len(lang))
+	out[0] = RecordKindCreateTransform
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], fromFuncOID)
+	binary.LittleEndian.PutUint32(out[9:13], toFuncOID)
+	binary.LittleEndian.PutUint16(out[13:15], uint16(len(typeName)))
+	off := 15
+	copy(out[off:], typeName)
+	off += len(typeName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(lang)))
+	off += 2
+	copy(out[off:], lang)
+	return out
+}
+
+// DecodeCreateTransform decodes a RecordKindCreateTransform payload.
+func DecodeCreateTransform(payload []byte) (typeName, lang string, oid, fromFuncOID, toFuncOID uint32, err error) {
+	if len(payload) < 15 {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-transform payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateTransform {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-transform", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	fromFuncOID = binary.LittleEndian.Uint32(payload[5:9])
+	toFuncOID = binary.LittleEndian.Uint32(payload[9:13])
+	typeLen := int(binary.LittleEndian.Uint16(payload[13:15]))
+	off := 15
+	if len(payload) < off+typeLen+2 {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-transform payload truncated (need %d bytes)", off+typeLen+2)
+	}
+	typeName = string(payload[off : off+typeLen])
+	off += typeLen
+	langLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+langLen {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-transform payload truncated (need %d bytes)", off+langLen)
+	}
+	lang = string(payload[off : off+langLen])
+	return typeName, lang, oid, fromFuncOID, toFuncOID, nil
+}
+
+// EncodeDropTransform encodes a DROP TRANSFORM event (M0119-0004 restart
+// persistence). Format: kind(1) | typeLen(2) | type(typeLen bytes) |
+// langLen(2) | lang(langLen bytes).
+func EncodeDropTransform(typeName, lang string) []byte {
+	if len(typeName) > 0xFFFF {
+		typeName = typeName[:0xFFFF]
+	}
+	if len(lang) > 0xFFFF {
+		lang = lang[:0xFFFF]
+	}
+	out := make([]byte, 5+len(typeName)+len(lang))
+	out[0] = RecordKindDropTransform
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(typeName)))
+	off := 3
+	copy(out[off:], typeName)
+	off += len(typeName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(lang)))
+	off += 2
+	copy(out[off:], lang)
+	return out
+}
+
+// DecodeDropTransform decodes a RecordKindDropTransform payload.
+func DecodeDropTransform(payload []byte) (typeName, lang string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-transform payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTransform {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-transform", payload[0])
+	}
+	typeLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+typeLen+2 {
+		return "", "", fmt.Errorf("wal: drop-transform payload truncated (need %d bytes)", off+typeLen+2)
+	}
+	typeName = string(payload[off : off+typeLen])
+	off += typeLen
+	langLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+langLen {
+		return "", "", fmt.Errorf("wal: drop-transform payload truncated (need %d bytes)", off+langLen)
+	}
+	lang = string(payload[off : off+langLen])
+	return typeName, lang, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -2341,6 +2464,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// driver in internal/initdb/schema_ddl_recovery.go scans the WAL
 		// for these records after physical replay and re-applies them to
 		// the catalog's schema registry.
+		return false, nil
+	case RecordKindCreateTransform, RecordKindDropTransform:
+		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)
+		// carry only pg_transform metadata; goopg has no per-transform file
+		// namespace, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/transform_ddl_recovery.go scans
+		// the WAL for these records after physical replay and re-applies
+		// them to the catalog's transform registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog

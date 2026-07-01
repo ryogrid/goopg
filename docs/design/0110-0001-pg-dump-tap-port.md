@@ -10099,6 +10099,78 @@ future slice needs it ([[pattern_sibling_paths_must_agree]]). Restart persistenc
 OID/rettype/argtypes/provolatile values (see `postgres/src/include/catalog/pg_proc.h`'s `BKI_DEFAULT`s for any
 field a `.dat` entry omits).
 
+### CREATE TRANSFORM restart persistence (WAL replay) — first object of the slice-389 backlog to close
+
+The recurring "restart persistence remains in-memory only" note above (tracked across slices 389–404: cast,
+conversion, transform, collation) is a real gap, not decoration — `catalog.InMemory.transforms` (and its siblings
+`casts`/`conversions`/`collations`) live entirely in a Go map with no on-disk representation, so any of these
+objects vanishes the moment the process restarts, silently diverging from real PostgreSQL's heap-backed
+`pg_transform`/`pg_cast`/`pg_conversion`/`pg_collation`. This slice closes the gap for **CREATE/DROP TRANSFORM
+only** — the most recently landed and simplest of the four (a 5-field struct, no nested arg-type lists) — as a
+template for the remaining three, per the "two catalog-DDL durability mechanisms" precedent: goopg has no
+per-transform on-disk file namespace (unlike `CREATE TABLE`'s pg_class heap-append path), so this follows the
+*other* durability mechanism — a goopg-private WAL record plus a startup replay pass — exactly like
+`CREATE/DROP SCHEMA` (M0110-0003).
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateTransform` (36) and
+`RecordKindDropTransform` (37), the next free bytes after `RecordKindDropSchema` (35). `EncodeCreateTransform`/
+`DecodeCreateTransform` carry `oid | fromFuncOID | toFuncOID | type name | lang name` (need the resolved function
+OIDs, unlike schema's bare name+OID, since re-resolving `int4recv`/`prsd_lextype` by name at replay time would
+require re-running the full builtin/user-routine resolution logic in the WAL replay path — carrying the already-
+resolved OIDs is simpler and matches what `catalog.Transform` actually stores). `EncodeDropTransform`/
+`DecodeDropTransform` carry just the (type, lang) key, mirroring `EncodeDropSchema`. The physical-replay dispatch
+switch (`internal/wal/recovery.go` around the `RecordKindCreateSchema, RecordKindDropSchema` case) gained an
+identical no-op case for the two new kinds — goopg has no per-transform on-disk page state, so physical redo has
+nothing to do; only the catalog-level recovery pass (below) matters.
+
+**New catalog recovery hooks** (`internal/catalog/catalog.go`): `RegisterTransformDuringRecovery`/
+`DropTransformDuringRecovery`, the idempotent WAL-replay counterparts of `RegisterTransform`/`DropTransform` —
+they take the OID from the WAL record (so the recovered registry matches what the pre-crash server assigned)
+and advance `nextOID` past it, mirroring `RegisterSchemaDuringRecovery` exactly.
+
+**New recovery driver** (`internal/initdb/transform_ddl_recovery.go`, new file mirroring
+`schema_ddl_recovery.go`): `replayTransformDDLRecords` walks the WAL after physical replay completes, decodes
+each CREATE/DROP TRANSFORM record, and applies it via the new recovery hooks. Wired into `internal/initdb/open.go`
+right after the existing `replaySchemaDDLRecords` call (order between the two does not matter — transforms are
+keyed by (type, lang), not by schema OID).
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): the `case "transform"` CREATE arm now calls
+`o.ctx.WAL.Append(wal.EncodeCreateTransform(...))` right after `im.RegisterTransform(...)`, and the `objType ==
+"transform"` DROP arm calls `o.ctx.WAL.Append(wal.EncodeDropTransform(...))` right after a successful
+`im.DropTransform(...)` — both mirror the CREATE/DROP SCHEMA call sites verbatim.
+
+**A real bug caught by the round-trip unit test, not by inspection:** the first `EncodeCreateTransform`
+implementation under-allocated the output buffer by 2 bytes (missed the `langLen` field's own 2 bytes in the
+`make([]byte, ...)` size expression), so `PutUint16` for `langLen` and the subsequent `copy` for the lang bytes
+wrote to the same offset, silently corrupting the lang field for any non-trivial input. `TestEncodeDecodeCreate
+TransformRoundTrip` (`internal/wal/transform_ddl_test.go`) failed immediately with a truncated-payload decode
+error, confirming the value of round-tripping through the actual Encode/Decode pair rather than trusting the
+byte-offset arithmetic by eye — consistent with the WAL/MVCC practice card's "concurrency/format bugs do not
+reproduce by inspection" guidance (here: a raw byte-layout bug, same category of easy-to-miss-by-inspection error).
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateTransformRoundTrip`/`...DropTransformRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal`), `TestTransformDDLRecoveryReplaysCreate`/
+`...ReplaysDropAfterCreate`/`TestReplayTransformDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full
+Init→Open→WAL.Append→Close→re-Open cycle against a real on-disk data directory). (2) live manual end-to-end: built
+a throwaway binary, `initdb`'d a fresh data dir, started the server, ran the exact upstream fixture SQL (`CREATE
+TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION
+int4recv(internal))`) via real `psql`, confirmed `pg_transform` showed `trftype=23 trflang=14 trffromsql=3721
+trftosql=2406`, killed the server (not graceful `make stop` — a plain `kill`, closer to a crash), restarted it
+against the same data dir, and confirmed the row was still there with the same OIDs — then `DROP TRANSFORM`, a
+third restart, and confirmed `pg_transform` was empty again. Gates: `go build ./...` clean; `go vet` clean on
+touched packages; `-race` on `internal/wal`+`internal/catalog` (WAL/MVCC practice card); full
+`internal/wal`/`internal/catalog`/`internal/initdb`/`internal/executor`/`internal/parser` suites PASS;
+`TestPort_PgDumpConnectionSetup` (whole suite) PASS — the CREATE TRANSFORM connsetup assertion added in the prior
+loop is unaffected by this purely-durability change; `TestE2E_PhysicalReplication` PASS (WAL/MVCC practice card's
+recovery-path gate); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke via the pre-commit hook.
+
+**Deliberately still open (ledger row, scoped as a template for the next loop, not attempted here to keep this
+loop bounded to ONE object kind):** the identical WAL-record + recovery-driver + executor-wiring pattern is not
+yet applied to `catalog.Cast`/`catalog.UserConversion`/the collation registry — each still needs its own
+`RecordKindCreate*`/`RecordKindDrop*` byte pair, `Encode*`/`Decode*` functions, `*DuringRecovery` catalog hooks,
+and a dedicated `internal/initdb/{cast,conversion,collation}_ddl_recovery.go` file, following this loop's Transform
+work as the concrete template (bytes 38/39 next free for whichever object is picked next).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

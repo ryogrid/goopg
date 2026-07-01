@@ -8508,6 +8508,38 @@ func (c *InMemory) UnregisterSchemaDuringRecovery(name string) {
 	delete(c.schemas, strings.ToLower(name))
 }
 
+// RegisterTransformDuringRecovery is the idempotent version of
+// RegisterTransform used by the WAL-replay driver
+// (internal/initdb/transform_ddl_recovery.go). Unlike RegisterTransform it
+// takes the OID from the WAL record (so the recovered registry matches what
+// the pre-crash server assigned) and advances nextOID past it so subsequent
+// allocations do not collide. Re-applying a record for a transform that
+// already exists just refreshes its fields. Mirrors
+// RegisterSchemaDuringRecovery. DU-002 (M0119-0004) restart persistence.
+func (c *InMemory) RegisterTransformDuringRecovery(typeName, lang string, oid, fromFuncOID, toFuncOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		c.transforms = make(map[string]*Transform)
+	}
+	key := strings.ToLower(typeName) + "\x00" + strings.ToLower(lang)
+	c.transforms[key] = &Transform{OID: oid, TypeName: typeName, Lang: lang, FromFuncOID: fromFuncOID, ToFuncOID: toFuncOID}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// DropTransformDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropTransform. DU-002 (M0119-0004) restart persistence.
+func (c *InMemory) DropTransformDuringRecovery(typeName, lang string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		return
+	}
+	delete(c.transforms, strings.ToLower(typeName)+"\x00"+strings.ToLower(lang))
+}
+
 // CreateExtension records a CREATE EXTENSION install in the runtime
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.

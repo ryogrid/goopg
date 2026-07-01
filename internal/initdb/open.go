@@ -918,6 +918,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
 	}
+	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
+	// objects (pg_transform) from the WAL the same way. Order relative to
+	// schema replay does not matter — transforms are keyed by (type name,
+	// language), not by schema OID.
+	if err := replayTransformDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: transform DDL replay: %w", err)
+	}
 
 	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
 	// If the JSON snapshot is present and valid, populate the catalog directly
