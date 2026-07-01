@@ -9879,6 +9879,83 @@ byte-identical vs real pg_dump 18.3. Coverage: alias cases in `TestEncodingIDNam
 resolved/validated against `pg_proc` (slice-399 deferral (b), still open); restart persistence
 (in-memory registry, the recurring shared-catalog runtime-write gap).
 
+### Slice 401 — **CREATE CONVERSION encoding-name validation** (closes the encoding-name half of slice-399 deferral (b))
+
+Slices 399–400 registered any `CREATE CONVERSION` whose `FOR`/`TO` literals resolved to a known
+encoding name, with no further checking — real PG's `CreateConversionCommand`
+(`postgres/src/backend/commands/conversioncmds.c`) rejects an unrecognized encoding name
+(`ERRCODE_UNDEFINED_OBJECT`, SQLSTATE 42704) and a conversion to/from `SQL_ASCII`
+(`ERRCODE_INVALID_OBJECT_DEFINITION`, SQLSTATE 42P17 — `pg_do_encoding_conversion` hard-wires
+`SQL_ASCII` fast paths, so such a conversion function could never run).
+
+- **Executor** (`internal/executor/operators_ddl.go`): a new `validateCreateConversionEncodings(forName, toName)`
+  resolves both names via `EncodingNameToID` and applies PG's checks in order: unknown source → 42704
+  `source encoding "X" does not exist`; unknown destination → 42704 `destination encoding "X" does not exist`;
+  either resolved to `SQL_ASCII` (pg_enc ID 0) → 42P17 `encoding conversion to or from "SQL_ASCII" is not supported`.
+  `execCompatNoop`'s `case "conversion"` calls it before `RegisterCompatObject`/`CreateConversion` and reuses the
+  resolved IDs (no double `EncodingNameToID` call).
+
+Valid conversions (canonical names and aliases) are unaffected. Coverage: `TestValidateCreateConversionEncodings`
+(executor unit, 7 cases including the unknown-beats-SQL_ASCII precedence order) plus slice-401 negative assertions
+(42704/42P17) in `TestPort_PgDumpConnectionSetup`. **Still deferred (ledger):** the FROM-function is not
+resolved/validated against `pg_proc` (slice-399 deferral (b)-remainder); restart persistence (recurring gap).
+
+### Slice 402 — **CONVERSION FROM-function existence/return-type validation** (closes the slice-399/400/401 deferral (b)-remainder)
+
+The last functionally-significant half of PG's `CreateConversionCommand` checks was still open: the `FROM` function
+must resolve to a real routine with the fixed signature `(int4, int4, cstring, internal, int4, bool) -> int4`
+(`LookupFuncName` + `get_func_rettype != INT4OID`).
+
+- **Executor** (`internal/executor/operators_ddl.go`): a new `resolveConversionFunc(rs, funcName)` scans
+  `Routines().LookupByName(funcName)`'s overloads for one whose IN-argument signature matches the fixed six-argument
+  signature (`catalog.TypeNameToOID` for the `int4`/`bool` slots; case-insensitive literal match for the `cstring`/
+  `internal` pseudotype slots, which `TypeNameToOID` has no entries for). No match → `ERRCODE_UNDEFINED_FUNCTION`
+  (42883) `function <name>(integer, integer, cstring, internal, integer, boolean) does not exist` (PG's fixed
+  required-signature error text, not whatever overloads actually exist); a match with a non-`int4` return type →
+  `ERRCODE_INVALID_OBJECT_DEFINITION` (42P17) `encoding conversion function <name> must return type integer`.
+  `execCompatNoop`'s `case "conversion"` calls it after the slice-401 encoding checks (matching PG's check order)
+  before registering.
+
+Because the slice 399–401 test fixtures (`myconv_func`, `aliasconv_func`) were bare unregistered names, the
+`TestPort_PgDumpConnectionSetup` setup now `CREATE FUNCTION`s them first (`LANGUAGE c` stubs — never invoked, since
+goopg has no encoding-conversion engine and only checks the signature/return type) with the matching real
+`(int4,int4,cstring,internal,int4,bool)->int4` argument list. `conproc` dump output is unchanged for these fixtures
+(still the as-written schema-qualified text). Coverage: `TestResolveConversionFunc` (executor unit, 7 cases including
+OUT-arg exclusion and overload-set disambiguation) plus slice-402 negative assertions (42883/42P17) in
+`TestPort_PgDumpConnectionSetup`. **Still deferred (ledger):** `conproc` is rendered from `UserConversion.ProcSchema`/
+`ProcName` text captured at CREATE time, not a `FuncOID`→`pg_proc` cross-reference (unlike `pg_cast.castfunc`, slice
+397); the EXECUTE ACL check and the runtime `OidFunctionCall6` empty-input probe are not implemented; restart
+persistence (recurring gap).
+
+### Slice 403 — **conproc FuncOID→pg_proc cross-reference** (closes the slice-402 conproc deferral)
+
+`pg_conversion.conproc` is typed `regproc` in real PostgreSQL — an OID reference to `pg_proc`, not a captured name.
+Slices 399–402 stored `ProcSchema`/`ProcName` text at `CREATE CONVERSION` time and rendered it verbatim, so a later
+`ALTER FUNCTION ... RENAME` on the conversion function would silently go stale in the dump — a real (if narrow)
+fidelity gap, not merely cosmetic naming.
+
+- **Catalog** (`internal/catalog/catalog.go`): `UserConversion` gains `FuncOID uint32` (`pg_conversion.conproc`'s
+  underlying `pg_proc` OID; 0 = unresolved, kept lenient for callers — e.g. existing unit tests — that build a
+  `UserConversion` directly without a routine registry). The `pg_conversion` `VirtualRows` provider now prefers a live
+  `Routines().LookupByOID(cv.FuncOID)` lookup for `conproc`, falling back to the as-written `ProcSchema`/`ProcName`
+  text only when `FuncOID` is 0 or the OID no longer resolves. This mirrors how `pg_cast.castfunc` (slice 397) tracks
+  the function by OID rather than by captured name.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s `case "conversion"` already resolves the
+  FROM function via `resolveConversionFunc` for validation (slice 402) — it now also carries the returned routine's
+  `OID` into `UserConversion.FuncOID` when constructing the registry entry, at zero extra resolution cost.
+
+Since `resolveConversionFunc` requires a successful resolution before `CreateConversion` is even called, every
+conversion created going forward has a non-zero, valid `FuncOID`; the fallback path exists only for direct
+`UserConversion` construction outside the executor (unit tests). Coverage: `TestPgConversionVirtualRowsFuncOID`
+(`internal/catalog/conversion_test.go`) — asserts `conproc` resolves through `FuncOID` (not the deliberately-stale
+`ProcSchema`/`ProcName` text used in the fixture), that a `RenameRoutine` on the function updates the next
+`VirtualRows()` read without touching the conversion, and that `FuncOID == 0` still falls back to the as-written text.
+The existing `TestPgConversionVirtualRows` and the slice 399–402 `TestPort_PgDumpConnectionSetup` assertions are
+unaffected (fixture function names are never renamed, so dump output stays byte-identical). **Still deferred
+(ledger):** the EXECUTE ACL check and the runtime `OidFunctionCall6` empty-input probe (both need machinery goopg
+does not have — a routine-EXECUTE-ACL model and an encoding-conversion engine, respectively); restart persistence
+(recurring shared-catalog runtime-write gap, tracked since slice 389).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

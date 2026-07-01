@@ -3414,6 +3414,34 @@ documentation-only and is exempt from the design-doc requirement.)
       FUNCTION public.text_as_int(text)` (text→integer has no built-in cast per pg_cast.dat) →
       `CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);` byte-identical vs real pg_dump 18.3 (live
       /tmp/castfn_pg); parser coverage `TestParseCreateCastWithFunction`. In-memory only (no restart persistence).
+      **2026-07-01 (loop #38, slice 398): CREATE CAST argument/return-type validation** (closes the slice-397 deferral
+      (c)) — `validateCreateCast`/`castTypeOIDMatch` in `internal/executor/operators_ddl.go` port PG's CreateCast
+      argument/return-type rules (42P17 on mismatch); `TestValidateCreateCast` (18 cases). Full detail + remaining
+      deferrals (binary-coercibility, unresolved-function leniency, permission checks) in the ledger (slice-398 row).
+      **2026-07-01 (loop #39, slice 399): CREATE [DEFAULT] CONVERSION round-trip** — new object family. Parser
+      `parseCreateConversionTail`, catalog `UserConversion` registry + populated `pg_conversion` VirtualRows, new
+      `pg_encoding_to_char(int4)` builtin. Byte-identical vs pg_dump 18.3. Ledger (slice-399 row) tracks the three
+      opened deferrals: (a) encoding-alias resolution, (b) FROM-function pg_proc validation, (c) restart persistence.
+      **2026-07-01 (loop #40, slice 400): CONVERSION encoding-alias resolution** (closes slice-399 (a)) —
+      `catalog/encoding.go` `pgConvEncAliases` mirrors `pg_encname_tbl`; `unicode`→UTF8 etc. now resolve.
+      **2026-07-01 (loop #42, slice 401): CREATE CONVERSION encoding-name validation** (closes slice-399 (b)'s
+      encoding half) — `validateCreateConversionEncodings` raises 42704 (unknown encoding) / 42P17 (SQL_ASCII).
+      **2026-07-01 (loop #43, slice 402): CONVERSION FROM-function existence/return-type validation** (closes the
+      slice-399/400/401 deferral (b)-remainder) — `resolveConversionFunc` mirrors `LookupFuncName(...,
+      {int4,int4,cstring,internal,int4,bool}, false)` + `get_func_rettype != INT4OID`; 42883/42P17 on mismatch.
+      `TestResolveConversionFunc` (7 cases). Opened: conproc is still as-written text, not a FuncOID→pg_proc
+      cross-reference (unlike `pg_cast.castfunc`).
+      **2026-07-01 (loop #44, slice 403): conproc FuncOID→pg_proc cross-reference** (closes the slice-402 deferral) —
+      `catalog.UserConversion.FuncOID` is now set from the routine `resolveConversionFunc` resolves at CREATE time;
+      `pg_conversion`'s `VirtualRows` renders `conproc` via a live `Routines().LookupByOID(FuncOID)` lookup (falling
+      back to the as-written `ProcSchema`/`ProcName` text only when `FuncOID` is unset), mirroring how `pg_cast.castfunc`
+      (slice 397) tracks the function rather than capturing a name snapshot — a later `ALTER FUNCTION ... RENAME` on
+      the conversion function now propagates to the dump. Tests: `TestPgConversionVirtualRowsFuncOID` (catalog,
+      resolves via OID / tracks rename / falls back when unresolved); existing `TestPgConversionVirtualRows` and the
+      slice-399..402 `TestPort_PgDumpConnectionSetup` assertions unaffected (function names unchanged so output is
+      byte-identical). Full detail in the ledger (slice-403 row). Still open under M0119-0004: the EXECUTE ACL check,
+      the runtime `OidFunctionCall6` probe (needs an encoding-conversion engine), and restart persistence (recurring
+      shared-catalog runtime-write gap).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

@@ -2541,9 +2541,22 @@ type UserConversion struct {
 	// pg_conversion.conproc (a regproc) raw and emits ` FROM <conproc>`; pg_dump
 	// runs with search_path='' so regproc qualifies the name with its schema —
 	// hence both halves are surfaced and the conproc cell renders `<schema>.<name>`.
+	// They are the as-written fallback; FuncOID (below) is the authoritative
+	// source once resolved.
 	ProcSchema string
 	ProcName   string
-	Default    bool // condefault (CREATE DEFAULT CONVERSION)
+	// FuncOID is pg_conversion.conproc's underlying pg_proc OID — set from the
+	// routine resolveConversionFunc (executor) matched against the fixed
+	// (int4,int4,cstring,internal,int4,bool)->int4 signature at CREATE time. 0
+	// means unresolved (kept lenient for tests that register a UserConversion
+	// directly without a routine registry); the pg_conversion VirtualRows
+	// provider falls back to ProcSchema/ProcName text in that case. A non-zero
+	// FuncOID makes conproc track a later RENAME/ALTER on the function, like
+	// pg_cast.castfunc (slice 397) — unlike the as-written text, which would go
+	// stale. DU-002 slice 403 (closes the slice-402 conproc-OID-cross-ref
+	// deferral).
+	FuncOID uint32
+	Default bool // condefault (CREATE DEFAULT CONVERSION)
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -7052,6 +7065,18 @@ func (c *InMemory) registerSystemTables() {
 			conproc := cv.ProcName
 			if cv.ProcSchema != "" {
 				conproc = cv.ProcSchema + "." + cv.ProcName
+			}
+			// Prefer a live FuncOID->pg_proc lookup over the as-written text so a
+			// RENAME on the conversion function after CREATE CONVERSION still
+			// dumps correctly (mirrors regproc output semantics; conproc is a
+			// real OID reference in PG, not captured text). DU-002 slice 403.
+			if cv.FuncOID != 0 && c.routines != nil {
+				if r := c.routines.LookupByOID(cv.FuncOID); r != nil {
+					conproc = r.Name
+					if r.Schema != "" {
+						conproc = r.Schema + "." + r.Name
+					}
+				}
 			}
 			out = append(out, []string{
 				strconv.FormatUint(uint64(cv.OID), 10),          // oid

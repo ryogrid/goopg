@@ -13038,7 +13038,8 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if rs == nil {
 			return &ExecError{Code: "XX000", Message: "CREATE CONVERSION requires routine registry"}
 		}
-		if _, ferr := resolveConversionFunc(rs, s.ConvFuncName); ferr != nil {
+		convFunc, ferr := resolveConversionFunc(rs, s.ConvFuncName)
+		if ferr != nil {
 			return ferr
 		}
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
@@ -13054,6 +13055,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			ToEncoding:  toEnc,
 			ProcSchema:  s.ConvFuncName.Schema,
 			ProcName:    s.ConvFuncName.Name,
+			FuncOID:     convFunc.OID,
 			Default:     s.ConvDefault,
 		}
 		if _, err := im.CreateConversion(uc, schema); err != nil {

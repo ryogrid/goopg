@@ -125,3 +125,67 @@ func TestPgConversionVirtualRows(t *testing.T) {
 		t.Errorf("after drop, rows = %d, want 0", len(rows))
 	}
 }
+
+// TestPgConversionVirtualRowsFuncOID verifies that conproc resolves through a
+// live FuncOID->pg_proc lookup (mirroring regproc's real OID-reference
+// semantics) rather than the as-written ProcSchema/ProcName text — so a
+// RENAME on the conversion function after CREATE CONVERSION still dumps the
+// current name. DU-002 slice 403 (closes the slice-402 conproc-OID-cross-ref
+// deferral).
+func TestPgConversionVirtualRowsFuncOID(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterSchema("public")
+	routine, err := c.Routines().Create(&Routine{
+		Schema: "public",
+		Name:   "myconv_func",
+	}, false)
+	if err != nil {
+		t.Fatalf("Routines().Create: %v", err)
+	}
+	uc := &UserConversion{
+		Name:        "myconv",
+		Owner:       10,
+		ForEncoding: EncodingNameToID("UTF8"),
+		ToEncoding:  EncodingNameToID("LATIN1"),
+		// Deliberately stale ProcSchema/ProcName text: FuncOID must win.
+		ProcSchema: "public",
+		ProcName:   "stale_name_should_not_appear",
+		FuncOID:    routine.OID,
+	}
+	if _, err := c.CreateConversion(uc, "public"); err != nil {
+		t.Fatalf("CreateConversion: %v", err)
+	}
+	tbl := c.tables["pg_catalog.pg_conversion"]
+	row := tbl.VirtualRows()[0]
+	if row[6] != "public.myconv_func" {
+		t.Errorf("conproc = %q, want public.myconv_func (resolved via FuncOID)", row[6])
+	}
+
+	// A RENAME on the function propagates without touching the conversion.
+	if err := c.Routines().RenameRoutine(routine, "myconv_func_renamed"); err != nil {
+		t.Fatalf("RenameRoutine: %v", err)
+	}
+	row = tbl.VirtualRows()[0]
+	if row[6] != "public.myconv_func_renamed" {
+		t.Errorf("conproc after rename = %q, want public.myconv_func_renamed", row[6])
+	}
+
+	// FuncOID == 0 (e.g. a UserConversion built without a routine registry)
+	// falls back to the as-written ProcSchema/ProcName text.
+	c.DropConversion("myconv", "public")
+	uc2 := &UserConversion{
+		Name:        "myconv2",
+		Owner:       10,
+		ForEncoding: EncodingNameToID("UTF8"),
+		ToEncoding:  EncodingNameToID("LATIN1"),
+		ProcSchema:  "public",
+		ProcName:    "unresolved_func",
+	}
+	if _, err := c.CreateConversion(uc2, "public"); err != nil {
+		t.Fatalf("CreateConversion: %v", err)
+	}
+	row = tbl.VirtualRows()[0]
+	if row[6] != "public.unresolved_func" {
+		t.Errorf("conproc fallback = %q, want public.unresolved_func", row[6])
+	}
+}
