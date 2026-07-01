@@ -4953,6 +4953,38 @@ documentation-only and is exempt from the design-doc requirement.)
       open; `SubscriptionRel` (tablesync state) rows still have no WAL
       persistence (no forcing fixture — runtime apply-worker state, not a
       `pg_dump`-visible catalog row).
+- [x] **CREATE/DROP EVENT TRIGGER round-trip (M0119-0004, loop #69).**
+      **COMPLETE 2026-07-02:** `pg_event_trigger` was a scaffolded-but-
+      always-empty virtual view — CREATE EVENT TRIGGER had never been
+      parsed at all. New `catalog.EventTrigger` registry (mirrors
+      `ForeignDataWrapper`) + parser `CreateEventTriggerStmt` (`CREATE
+      EVENT TRIGGER name ON event [WHEN TAG IN (...)] EXECUTE FUNCTION
+      fn()`) + `execCreateEventTrigger` (event-name/filter-variable/
+      login-tag validation, niladic function resolution); `DROP EVENT
+      TRIGGER` reuses `DropCompatStmt`'s new `"event trigger"` case
+      (fixing a pre-existing, previously-unreachable dead parse path
+      where bare `"event"` never consumed the following `TRIGGER`
+      keyword token). Also fixed, found via a live PG 18.3 diff against a
+      genuinely separate freshly-`initdb`'d instance: the plain `regproc`
+      OID→name `CastExpr` branch (`internal/executor/expr.go`, distinct
+      from the already-fixed `regprocedure`/`regoperator` branches) never
+      schema-qualified a user-defined function — `evtfoid::regproc`
+      dumped `et_func()` instead of PG's `public.et_func()`; fixed via
+      the same `regObjectSchemaVisible` gate the sibling branches use.
+      Verified byte-identical against real pg_dump 18.3 for the full
+      `CREATE FUNCTION ... RETURNS event_trigger; CREATE EVENT TRIGGER
+      ... WHEN TAG IN (...) EXECUTE FUNCTION ...` fixture. Tests:
+      `internal/parser/event_trigger_test.go`,
+      `internal/executor/operators_ddl_event_trigger_test.go`. Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/parser`+
+      `internal/catalog`+`internal/planner`+`internal/executor`+
+      `internal/server` suites PASS; `TestPort_PgDumpConnectionSetup`
+      PASS (no regression from the `regproc` fix); TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Deferred
+      (ledger row appended): `ALTER EVENT TRIGGER`
+      (ENABLE/DISABLE/RENAME/OWNER TO), full DDL-command-tag-list
+      validation, superuser privilege enforcement, WAL/restart
+      persistence — none have a forcing fixture today.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -2133,3 +2133,146 @@ by this loop. `SubscriptionRel` (tablesync state) rows still have no WAL
 persistence either — out of scope for this slice (no pg_dump TAP fixture
 exercises tablesync state across a restart; it's runtime apply-worker state,
 not a `pg_dump`-visible catalog row).
+
+## Loop #69: `CREATE`/`DROP EVENT TRIGGER` round-trip
+
+Closes a fresh gap found by re-scanning the connsetup fixture's object-type
+coverage for anything the pg_dump surface exercises but goopg had never
+implemented: `pg_event_trigger` (`internal/catalog/catalog.go`) was a
+scaffolded-but-always-empty virtual view (`VirtualRows = func() [][]string {
+return nil }`) with a comment explicitly noting "goopg defines no event
+triggers (no CREATE EVENT TRIGGER)" — i.e. the statement had never been
+parsed at all, not merely a dump-fidelity gap.
+
+### Scope
+
+DDL only (`CREATE`/`DROP EVENT TRIGGER`); `ALTER EVENT TRIGGER`
+(ENABLE/DISABLE/RENAME/OWNER TO) is out of scope for this loop (see
+"Deferred" below) — mirrors how CREATE PUBLICATION/SUBSCRIPTION shipped many
+loops before ALTER ... OWNER TO (loop #67) and WAL persistence (loop #68)
+followed. goopg never fires event triggers (no DDL hook invokes `evtfoid`);
+this is dump-fidelity only, matching the FDW/publication/subscription family.
+
+### Grammar (postgres/src/backend/parser/gram.y `CreateEventTrigStmt`)
+
+```
+CREATE EVENT TRIGGER name ON event
+  [WHEN filtervar IN (value [, ...]) [AND filtervar IN (value [, ...])]]
+  EXECUTE {FUNCTION|PROCEDURE} funcname()
+```
+
+"EVENT" is unreserved and was not registered as a lexer keyword at all
+(goopg's existing `DROP ... event ...` compat-stub entry only ever matched
+the bare ident "event", never "event trigger" as two words — see the bug
+below); it is matched via `p.acceptIdentKeyword("event")` like
+"collation"/"transform", then `KwTrigger` (already registered,
+`KwCatUnreserved`) is consumed explicitly.
+
+### A pre-existing dead/broken path, found while wiring this
+
+`DROP EVENT TRIGGER` already had an entry in the ident-based `DropCompatStmt`
+stub loop (`"event"` in the object-type list, `internal/parser/ddl.go`) —
+but with no continuation handling for the second word, unlike
+"materialized"/"access". Since `TRIGGER` is a `KwCatUnreserved` keyword
+token, `parseIdent()` (used by the name-list parser) would have silently
+accepted it AS the object name, then choked on the real name as an
+unexpected trailing token. This was unreachable/untested dead code before
+this loop (CREATE EVENT TRIGGER never existed, so nothing could construct a
+droppable event trigger), not a live regression. Fixed alongside the new
+CREATE support — mirrors the "access method" continuation exactly, except
+`KwTrigger` is `expectKeyword`'d (keyword-typed) rather than
+`acceptIdentKeyword`'d (ident-typed).
+
+### Catalog
+
+New `catalog.EventTrigger` (`Name`, `OID`, `Event`, `Owner`, `FuncOID`,
+`Enabled` — always `"O"`, `Tags`) + `RegisterEventTrigger` (42710 on a
+duplicate name) / `DropEventTrigger` / `ListEventTriggers` (ordered by OID,
+matching pg_dump's `getEventTriggers ... ORDER BY e.oid`) on `InMemory`,
+mirroring `ForeignDataWrapper`'s registry shape one-for-one.
+`pg_event_trigger.VirtualRows` now renders real rows instead of the
+hardcoded `nil`; `evtfoid` renders as a bare OID — the `::regproc` cast in
+pg_dump's own `getEventTriggers` query resolves it to a name (see the
+regproc fix below).
+
+### Executor
+
+`execCreateEventTrigger` (`internal/executor/operators_ddl.go`) validates the
+event name against PostgreSQL's fixed 5-value set
+(`ddl_command_start`/`ddl_command_end`/`sql_drop`/`login`/`table_rewrite`,
+42601 otherwise), the WHEN filter variable (only `"tag"` is recognised,
+42601 otherwise), and the login-event tag-filtering restriction (`0A000`),
+then resolves the trigger function via new `resolveEventTriggerFunc`
+(mirrors `CreateEventTrigger`'s `LookupFuncName(stmt->funcname, 0, NULL,
+false)` — a niladic user routine first via `Routines().LookupByName`, which
+already searches every schema when unqualified, then the hand-curated
+builtin `pg_proc` set) before calling `RegisterEventTrigger`. `DROP EVENT
+TRIGGER` reuses the generic `DropCompatStmt` path: a new `"event trigger"`
+case in `execDropCompat` calls `DropEventTrigger` (same pattern as
+`"server"`/`"foreign-data wrapper"`). Planner: `*parser.CreateEventTriggerStmt`
+added to the `DDL` case list (`DROP EVENT TRIGGER` already routed via the
+pre-existing `DropCompatStmt` case).
+
+### Real bug found and fixed via live-PG diff: plain `regproc` never
+schema-qualified a user-defined function
+
+Verified end-to-end against a freshly-`initdb`'d, live PG 18.3 instance
+(distinct from goopg, both queried via the real `pg_dump`/`psql` binaries
+under `postgres/local_install`) with the identical fixture (`CREATE FUNCTION
+public.et_func() RETURNS event_trigger ...; CREATE EVENT TRIGGER et1 ON
+ddl_command_start WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE') EXECUTE
+FUNCTION et_func();`). Real PG's dump line was `EXECUTE FUNCTION
+public.et_func();`; goopg's was `EXECUTE FUNCTION et_func();` — a real,
+observable divergence, not the loop #36/#38 `regoperator`/`regprocedure`
+gap (already fixed) but its previously-unaudited sibling: the plain
+`regproc` OID→name `CastExpr` branch (`internal/executor/expr.go`, distinct
+code path from the `regprocedure` branch a few lines below it) resolved a
+user-defined routine via `ctx.Catalog.Routines().LookupByOID` and returned
+`r.Name` bare, with no `regObjectSchemaVisible` check at all. Fixed by
+applying the exact same check the `regprocedure`/`regoperator` branches
+already use: `regObjectSchemaVisible(ctx, r.Schema)` gates whether
+`r.Schema + "." + r.Name` or bare `r.Name` is returned. Re-verified against
+the same live PG 18.3 instance after the fix — dump lines are now
+byte-identical (`EXECUTE FUNCTION public.et_func();` on both sides); the
+only remaining diff was the pre-existing, unrelated `\restrict` token +
+public-schema COMMENT/ACL lines that appear on any goopg-vs-fresh-initdb
+comparison (bootstrap catalog differences, not this feature). This fix's
+blast radius is every other `<oid>::regproc` cast on a user-defined
+(non-builtin) function OID in the codebase — a strict fidelity
+improvement, not a behavior change for any builtin (still bare, unaffected)
+or any case where the routine happens to be schema-visible already.
+
+### Tests
+
+Parser: `internal/parser/event_trigger_test.go`
+(`TestParseCreateEventTriggerSimple`, `...WhenTag`,
+`...UnrecognizedFilterVar`, `TestParseDropEventTrigger`). Executor:
+`internal/executor/operators_ddl_event_trigger_test.go`
+(`TestCreateEventTriggerRegistersRow`,
+`...DuplicateNameErrors`, `...UnknownFunctionErrors`,
+`...UnrecognizedEventErrors`, `TestDropEventTriggerRemovesRow`).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/planner`+`internal/executor`+`internal/server` suites PASS
+(`-count=1`); `TestPort_PgDumpConnectionSetup` PASS (no regression from the
+`regproc` schema-qualification fix); live PG 18.3 diff above (byte-identical
+`EXECUTE FUNCTION public.et_func();`); TPC-H spotcheck Q12=2/Q13=33 PASS;
+pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+`ALTER EVENT TRIGGER` (ENABLE/DISABLE/RENAME TO/OWNER TO) is entirely
+unimplemented — every event trigger stays `evtenabled='O'` and owned by the
+DDL-time role for its lifetime; real PG's `AlterEventTrigStmt`/`RENAME
+TO`/`OWNER TO` forms (`event_trigger.c`) have no goopg counterpart. Also
+deferred: the full `validate_ddl_tags`/`validate_table_rewrite_tags`
+command-tag-list validation (goopg accepts any WHEN TAG value verbatim, no
+membership check against PostgreSQL's real DDL command-tag enumeration) and
+the `CreateEventTrigger` superuser privilege check (goopg does not gate this
+DDL on role privilege, consistent with how the rest of this compat-only DDL
+family — CREATE FOREIGN DATA WRAPPER, CREATE SERVER, etc. — does not enforce
+its own real-PG superuser requirement either). No WAL/restart persistence
+either (same gap CREATE PUBLICATION/SUBSCRIPTION had before loop #68) — an
+event trigger vanishes on restart today.

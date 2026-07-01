@@ -2185,6 +2185,13 @@ type InMemory struct {
 	// fdwname. DU-002 slice 375.
 	fdws map[string]*ForeignDataWrapper
 
+	// eventTriggers tracks event triggers (CREATE EVENT TRIGGER) with a stable
+	// OID so they round-trip through pg_dump's getEventTriggers
+	// (pg_event_trigger virtual view → dumpEventTrigger). goopg does not fire
+	// event triggers; only enough metadata is kept for dump fidelity. Key:
+	// evtname. DU-002 (M0119-0004).
+	eventTriggers map[string]*EventTrigger
+
 	// foreignServers tracks foreign servers (CREATE SERVER) with a stable OID so
 	// they round-trip through pg_dump's getForeignServers (pg_foreign_server
 	// virtual view → dumpForeignServer). Each server references its FDW by name;
@@ -7468,14 +7475,12 @@ func (c *InMemory) registerSystemTables() {
 	//   array_to_string(array(select quote_literal(x) from unnest(evttags) as
 	//   t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname FROM
 	//   pg_event_trigger e ORDER BY e.oid
-	// (pg_dump.c getEventTriggers). goopg defines no event triggers (no CREATE
-	// EVENT TRIGGER), so an empty view (0 rows) is correct — pg_dump finds
-	// nothing dumpable, identical to a stock PG cluster with no user event
-	// triggers. With 0 rows the unnest(evttags)/array_to_string projection is
-	// never evaluated, so the empty text[] column is fine. Schema matches PG's
-	// pg_event_trigger (pg_event_trigger.h): oid, evtname name, evtevent name,
-	// evtowner oid, evtfoid oid, evtenabled "char", evttags text[].
-	// M0110-0001 (DU-002 slice 23).
+	// (pg_dump.c getEventTriggers). goopg does not fire event triggers — this
+	// only round-trips CREATE/DROP EVENT TRIGGER through pg_dump (schema
+	// fidelity only). Schema matches PG's pg_event_trigger
+	// (pg_event_trigger.h): oid, evtname name, evtevent name, evtowner oid,
+	// evtfoid oid, evtenabled "char", evttags text[]. M0110-0001 (DU-002 slice
+	// 23; populated DU-002 (M0119-0004)).
 	pgEventTrigger := &Table{
 		Schema: "pg_catalog", Name: "pg_event_trigger", Virtual: true,
 		Columns: []Column{
@@ -7489,7 +7494,36 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3466,
 	}
-	pgEventTrigger.VirtualRows = func() [][]string { return nil }
+	// Surface user-created event triggers (CREATE EVENT TRIGGER) so they
+	// round-trip. evtfoid renders as a plain OID; the `::regproc` cast in
+	// pg_dump's own query (above) resolves it to a name. DU-002 (M0119-0004).
+	pgEventTrigger.VirtualRows = func() [][]string {
+		ets := c.ListEventTriggers()
+		if len(ets) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(ets))
+		for _, et := range ets {
+			owner := et.Owner
+			if owner == 0 {
+				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+			}
+			tags := ""
+			if len(et.Tags) > 0 {
+				tags = arrayTextLiteral(et.Tags)
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(et.OID), 10),     // oid
+				et.Name,                                    // evtname
+				et.Event,                                   // evtevent
+				strconv.FormatUint(uint64(owner), 10),      // evtowner
+				strconv.FormatUint(uint64(et.FuncOID), 10), // evtfoid
+				et.Enabled,                                 // evtenabled
+				tags,                                       // evttags text[] ("{...}" or "" for NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
 
 	// pg_partitioned_table — partition-key catalog (OID 3350). After
@@ -10675,6 +10709,83 @@ func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, b
 	defer c.mu.RUnlock()
 	f, ok := c.fdws[name]
 	return f, ok
+}
+
+// EventTrigger is a user-created event trigger (CREATE EVENT TRIGGER). goopg
+// never fires event triggers (no DDL hook invokes evtfoid); this records just
+// enough metadata to round-trip the CREATE/DROP through pg_dump
+// (pg_event_trigger virtual view → getEventTriggers/dumpEventTrigger).
+// DU-002 (M0119-0004).
+type EventTrigger struct {
+	Name    string // evtname
+	OID     uint32 // pg_event_trigger.oid (assigned from the catalog OID counter)
+	Event   string // evtevent: ddl_command_start, ddl_command_end, sql_drop, table_rewrite, login
+	Owner   uint32 // evtowner; 0 → defaults to the bootstrap superuser at render time
+	FuncOID uint32 // evtfoid, resolved at CREATE time (must exist — no deferred/dangling reference)
+	// Enabled mirrors pg_event_trigger.evtenabled: 'O' (origin, the CREATE-time
+	// default), 'D' disabled, 'A' always, 'R' replica. ALTER EVENT TRIGGER
+	// ENABLE/DISABLE is not modelled yet (DU-002 follow-up; see ledger) — every
+	// event trigger stays 'O' for its lifetime today.
+	Enabled string
+	// Tags holds the WHEN TAG IN (...) filter values verbatim (unquoted); nil
+	// if the CREATE had no WHEN clause. dumpEventTrigger re-quotes each one.
+	Tags []string
+}
+
+// RegisterEventTrigger records an event trigger, allocating a stable OID.
+// Returns an error if a trigger with this name already exists (PG: 42710
+// duplicate_object, "event trigger %q already exists"). DU-002 (M0119-0004).
+func (c *InMemory) RegisterEventTrigger(name, event string, owner, funcOID uint32, tags []string) (*EventTrigger, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggers == nil {
+		c.eventTriggers = make(map[string]*EventTrigger)
+	}
+	if _, exists := c.eventTriggers[name]; exists {
+		return nil, fmt.Errorf("event trigger %q already exists", name)
+	}
+	et := &EventTrigger{
+		Name:    name,
+		OID:     c.allocOIDLocked(),
+		Event:   event,
+		Owner:   owner,
+		FuncOID: funcOID,
+		Enabled: "O",
+		Tags:    tags,
+	}
+	c.eventTriggers[name] = et
+	return et, nil
+}
+
+// DropEventTrigger removes an event trigger from the registry. Returns true
+// if found. DU-002 (M0119-0004).
+func (c *InMemory) DropEventTrigger(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggers == nil {
+		return false
+	}
+	if _, ok := c.eventTriggers[name]; ok {
+		delete(c.eventTriggers, name)
+		return true
+	}
+	return false
+}
+
+// ListEventTriggers returns all registered event triggers ordered by OID,
+// matching pg_dump's getEventTriggers "ORDER BY e.oid". DU-002 (M0119-0004).
+func (c *InMemory) ListEventTriggers() []*EventTrigger {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.eventTriggers) == 0 {
+		return nil
+	}
+	out := make([]*EventTrigger, 0, len(c.eventTriggers))
+	for _, et := range c.eventTriggers {
+		out = append(out, et)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
 }
 
 // ForeignServer is a user-created foreign server (CREATE SERVER). goopg does not

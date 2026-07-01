@@ -114,6 +114,18 @@ func (p *parser) parseCreate() (Stmt, error) {
 		}
 		p.advance()
 		return p.parseCreateSubscriptionTail(t.Pos)
+	// CREATE EVENT TRIGGER name ON event [WHEN ...] EXECUTE FUNCTION fn() —
+	// register in the runtime pg_event_trigger registry so pg_dump round-trips
+	// it. DU-002 (M0119-0004). "EVENT" is unreserved and unregistered as a
+	// keyword, so it is matched via the ident path like "collation"/"transform".
+	case p.acceptIdentKeyword("event"):
+		if unlogged || orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED / OR REPLACE not valid for CREATE EVENT TRIGGER"}
+		}
+		if _, err := p.expectKeyword(KwTrigger); err != nil {
+			return nil, err
+		}
+		return p.parseCreateEventTriggerTail(t.Pos)
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFunction:
 		if unlogged {
 			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE FUNCTION"}
@@ -2093,6 +2105,84 @@ func (p *parser) parseCreateSubscriptionTail(pos int) (Stmt, error) {
 			return nil, err
 		}
 		stmt.With = opts
+	}
+	return stmt, nil
+}
+
+// parseCreateEventTriggerTail picks up after CREATE EVENT TRIGGER.
+// Grammar (postgres/src/backend/parser/gram.y CreateEventTrigStmt):
+//
+//	name ON event
+//	  [WHEN filtervar IN (value [, ...]) [AND filtervar IN (value [, ...])]]
+//	  EXECUTE {FUNCTION|PROCEDURE} funcname()
+//
+// Only one filter variable is meaningful upstream ("tag"); a second, distinct
+// filter variable is still captured (as FilterVar, last-write-wins) so
+// execCreateEventTrigger can raise PostgreSQL's own "unrecognized filter
+// variable" error at exec time rather than silently dropping it here.
+func (p *parser) parseCreateEventTriggerTail(pos int) (Stmt, error) {
+	stmt := &CreateEventTriggerStmt{pos: pos}
+	name, err := p.parseIdent()
+	if err != nil {
+		return nil, p.errAtCur("expected event trigger name after CREATE EVENT TRIGGER")
+	}
+	stmt.Name = name.Value
+	if !p.acceptKeyword(KwOn) {
+		return nil, p.errAtCur("expected ON after event trigger name")
+	}
+	event, err := p.parseIdent()
+	if err != nil {
+		return nil, p.errAtCur("expected event name after ON")
+	}
+	stmt.Event = event.Value
+	if p.acceptKeyword(KwWhen) {
+		for {
+			filterVar, err := p.parseIdent()
+			if err != nil {
+				return nil, p.errAtCur("expected filter variable in WHEN clause")
+			}
+			if !p.acceptKeyword(KwIn) {
+				return nil, p.errAtCur("expected IN after filter variable")
+			}
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '(' after IN")
+			}
+			stmt.FilterVar = filterVar.Value
+			for {
+				if p.cur().Kind != TokenStringLit {
+					return nil, p.errAtCur("expected string literal in filter value list")
+				}
+				if strings.EqualFold(filterVar.Value, "tag") {
+					stmt.Tags = append(stmt.Tags, p.cur().Value)
+				}
+				p.advance()
+				if p.acceptSymbol(",") {
+					continue
+				}
+				break
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' to close filter value list")
+			}
+			if !p.acceptKeyword(KwAnd) {
+				break
+			}
+		}
+	}
+	if !p.acceptKeyword(KwExecute) {
+		return nil, p.errAtCur("expected EXECUTE in CREATE EVENT TRIGGER")
+	}
+	_ = p.acceptKeyword(KwFunction) || p.acceptKeyword(KwProcedure)
+	funcName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.FuncName = funcName
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after function name")
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("event trigger functions take no arguments")
 	}
 	return stmt, nil
 }
@@ -5120,6 +5210,15 @@ func (p *parser) parseDrop() (Stmt, error) {
 			if objType == "access" {
 				_ = p.acceptIdentKeyword("method")
 				resolvedType = "access method"
+			}
+			// "event trigger" is two words; TRIGGER is a keyword token, not
+			// ident (unlike "materialized"/"access"'s continuations, which
+			// are ident-typed). DU-002 (M0119-0004).
+			if objType == "event" {
+				if _, err := p.expectKeyword(KwTrigger); err != nil {
+					return nil, err
+				}
+				resolvedType = "event trigger"
 			}
 			ifExists, names, behavior, err := p.parseDropTail()
 			if err != nil {

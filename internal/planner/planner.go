@@ -153,7 +153,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateCollationStmt, *parser.AlterCollationStmt,
 		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt,
 		*parser.CreateOpClassStmt, *parser.AlterOperatorSetStmt, *parser.AlterOpFamilyAddStmt,
-		*parser.AlterOpFamilyDropStmt:
+		*parser.AlterOpFamilyDropStmt,
+		*parser.CreateEventTriggerStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,

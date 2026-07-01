@@ -546,6 +546,18 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 				if ctx != nil && ctx.Catalog != nil {
 					if r := ctx.Catalog.Routines().LookupByOID(uint32(oid)); r != nil {
+						// Schema-qualify exactly like the regprocedure/
+						// regoperator branches below: pg_dump's own connection
+						// always runs with search_path='', so
+						// ProcedureIsVisible never finds an unqualified
+						// user-defined function visible. Confirmed via a live
+						// PG 18.3 diff for pg_event_trigger.evtfoid::regproc
+						// (dumpEventTrigger emits `public.et_func()`, not
+						// `et_func()`, for a public-schema trigger function).
+						// DU-002 (M0119-0004).
+						if !regObjectSchemaVisible(ctx, r.Schema) {
+							return NewStringDatum(r.Schema + "." + r.Name), nil
+						}
 						return NewStringDatum(r.Name), nil
 					}
 				}

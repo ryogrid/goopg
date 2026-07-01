@@ -2368,6 +2368,29 @@ type AlterSubscriptionOwnerStmt struct {
 func (s *AlterSubscriptionOwnerStmt) Pos() int  { return s.pos }
 func (s *AlterSubscriptionOwnerStmt) stmtNode() {}
 
+// CreateEventTriggerStmt — `CREATE EVENT TRIGGER name ON event
+//
+//	[WHEN filtervar IN (value [, ...]) [AND filtervar IN (value [, ...])]]
+//	EXECUTE {FUNCTION|PROCEDURE} funcname()`.
+//
+// goopg never fires event triggers (no DDL hook invokes evtfoid) — this only
+// round-trips the DDL through pg_dump (pg_event_trigger virtual view →
+// getEventTriggers/dumpEventTrigger). DU-002 (M0119-0004). DROP EVENT TRIGGER
+// reuses the generic DropCompatStmt (see execDropCompat's "event trigger" case).
+type CreateEventTriggerStmt struct {
+	pos   int
+	Name  string
+	Event string
+	// FilterVar is the WHEN clause's filter-variable name ("tag" is the only
+	// one PostgreSQL recognises today); "" if there is no WHEN clause.
+	FilterVar string
+	Tags      []string // WHEN <FilterVar> IN (...) values, unquoted
+	FuncName  ObjectName
+}
+
+func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }
+func (s *CreateEventTriggerStmt) stmtNode() {}
+
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
 	pos             int

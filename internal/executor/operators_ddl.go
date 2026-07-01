@@ -105,6 +105,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterPublicationOwner(s)
 	case *parser.AlterSubscriptionOwnerStmt:
 		return nil, o.execAlterSubscriptionOwner(s)
+	case *parser.CreateEventTriggerStmt:
+		return nil, o.execCreateEventTrigger(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -715,6 +717,59 @@ func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt)
 		}
 	}
 	return nil
+}
+
+// execCreateEventTrigger registers a CREATE EVENT TRIGGER in the runtime
+// pg_event_trigger registry so it round-trips through pg_dump
+// (getEventTriggers/dumpEventTrigger). goopg never fires event triggers — the
+// semantic validation below mirrors PostgreSQL's CreateEventTrigger
+// (postgres/src/backend/commands/event_trigger.c) only to the extent needed
+// for dump fidelity; goopg does not model the full DDL-command-tag list
+// (validate_ddl_tags/validate_table_rewrite_tags) or the superuser privilege
+// check, both recorded as deferred (see the ledger).
+func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
+	switch s.Event {
+	case "ddl_command_start", "ddl_command_end", "sql_drop", "login", "table_rewrite":
+	default:
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized event name %q", s.Event)}
+	}
+	if s.FilterVar != "" && s.FilterVar != "tag" {
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized filter variable %q", s.FilterVar)}
+	}
+	if len(s.Tags) > 0 && s.Event == "login" {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tag filtering is not supported for login event triggers"}
+	}
+	funcOID, ok := resolveEventTriggerFunc(o.ctx.Catalog, s.FuncName)
+	if !ok {
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("function %s() does not exist", s.FuncName.String())}
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE EVENT TRIGGER requires the in-memory catalog"}
+	}
+	if _, err := im.RegisterEventTrigger(s.Name, s.Event, o.currentDDLOwnerOID(), funcOID, s.Tags); err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// resolveEventTriggerFunc looks up a niladic (0-argument) function by name,
+// mirroring CreateEventTrigger's `LookupFuncName(stmt->funcname, 0, NULL,
+// false)` — a user-defined routine is tried first (LookupByName already
+// searches every schema when name.Schema is empty), then the hand-curated
+// builtin pg_proc set.
+func resolveEventTriggerFunc(cat catalog.Catalog, name parser.ObjectName) (uint32, bool) {
+	if rs := cat.Routines(); rs != nil {
+		for _, r := range rs.LookupByName(name) {
+			if len(r.ArgTypes) == 0 {
+				return r.OID, true
+			}
+		}
+	}
+	if bp, found := catalog.LookupBuiltinProc(name.Name); found && len(bp.ArgTypes) == 0 {
+		return bp.OID, true
+	}
+	return 0, false
 }
 
 // qualifiedTableName renders an ObjectName as "schema.name" or
@@ -13084,6 +13139,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// Drop the dump-visible registry entry too (DU-002 slice 376).
 				im.DropForeignServer(s.Names[0].String())
 				if im.DropCompatObject("server", s.Names[0].String()) {
+					return nil
+				}
+			}
+		case "event trigger":
+			// Drop the dump-visible pg_event_trigger registry entry (DU-002,
+			// M0119-0004) so a dropped event trigger stops round-tripping
+			// through pg_dump.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if im.DropEventTrigger(s.Names[0].String()) {
 					return nil
 				}
 			}
