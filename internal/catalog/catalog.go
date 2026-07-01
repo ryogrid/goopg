@@ -9447,7 +9447,12 @@ func (c *InMemory) dependVirtualRows() [][]string {
 		classOrFamilyRefclassid := "2616" // pg_opclass
 		classOrFamilyRefobjid := m.ClassOID
 		classOrFamilyDeptype := "i"
-		if m.ClassOID == 0 {
+		// gistadjustmembers/spgadjustmembers force EVERY OPERATOR member
+		// (not just loose ALTER-ADD'd ones) to a soft family-level
+		// dependency for these two AMs, regardless of class-attribution —
+		// see amForcesSoftOperatorDependency's doc comment. DU-002
+		// (M0119-0004).
+		if m.ClassOID == 0 || amForcesSoftOperatorDependency(m.Method) {
 			refDeptype = "a"
 			classOrFamilyRefclassid = "2753" // pg_opfamily
 			classOrFamilyRefobjid = m.FamilyOID
@@ -9496,7 +9501,12 @@ func (c *InMemory) dependVirtualRows() [][]string {
 		classOrFamilyRefclassid := "2616" // pg_opclass
 		classOrFamilyRefobjid := m.ClassOID
 		classOrFamilyDeptype := "i"
-		if m.ClassOID == 0 {
+		// A class-attributed FUNCTION member on a GiST/SP-GiST opclass is
+		// only hard-on-class when its amprocnum is one of the AM's
+		// *required* support procs; every optional one is forced soft on
+		// the family, mirroring gistadjustmembers/spgadjustmembers's
+		// function loop. DU-002 (M0119-0004).
+		if m.ClassOID == 0 || amForcesSoftFunctionDependency(m.Method, m.ProcNum) {
 			refDeptype = "a"
 			classOrFamilyRefclassid = "2753" // pg_opfamily
 			classOrFamilyRefobjid = m.FamilyOID
@@ -11489,6 +11499,10 @@ type AmProcMember struct {
 	ProcNum   uint32 // pg_amproc.amprocnum
 	ProcOID   uint32 // pg_amproc.amproc
 	ClassOID  uint32 // owning opclass OID, for the pg_depend INTERNAL row
+	Method    uint32 // pg_amproc.amprocfamily's owning pg_am.oid — needed by
+	// amForcesSoftFunctionDependency to look up the AM's amadjustmembers
+	// required-support-proc policy without a family-OID indirection. Added
+	// DU-002 (M0119-0004) alongside AmOpMember.Method (slice 411).
 }
 
 // RegisterAmOpMember records one pg_amop row, allocating a stable OID.
@@ -11510,12 +11524,13 @@ func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, 
 
 // RegisterAmProcMember records one pg_amproc row, allocating a stable OID.
 // Mirrors RegisterAmOpMember. DU-002 (M0119-0004) slice 411.
-func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType, procNum, procOID uint32) *AmProcMember {
+func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType, procNum, procOID, method uint32) *AmProcMember {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	m := &AmProcMember{
 		OID: c.allocOIDLocked(), FamilyOID: familyOID, LeftType: leftType,
 		RightType: rightType, ProcNum: procNum, ProcOID: procOID, ClassOID: classOID,
+		Method: method,
 	}
 	c.amProcMembers = append(c.amProcMembers, m)
 	return m
@@ -11580,6 +11595,66 @@ func (c *InMemory) RemoveAmProcMember(familyOID, leftType, rightType, procNum ui
 			c.amProcMembers = append(c.amProcMembers[:i], c.amProcMembers[i+1:]...)
 			return true
 		}
+	}
+	return false
+}
+
+// amGISTMethodOID / amSPGistMethodOID are pg_am.oid for "gist"/"spgist"
+// (see AccessMethodOIDByName below) — the only two in-tree access methods
+// whose amadjustmembers override (gistvalidate.c gistadjustmembers,
+// spgvalidate.c spgadjustmembers) forces dependency softness independent of
+// class-attribution. Hoisted as constants since amForcesSoftOperatorDependency/
+// amForcesSoftFunctionDependency are called per-member from dependVirtualRows.
+const (
+	amGISTMethodOID   = 783
+	amSPGistMethodOID = 4000
+)
+
+// gistRequiredSupportProcs / spgistRequiredSupportProcs list the amprocnum
+// values gistadjustmembers/spgadjustmembers keep as "required" (hard,
+// class-level when class-attributed) — GIST_CONSISTENT/UNION/PENALTY/
+// PICKSPLIT/EQUAL_PROC (gist.h) and SPGIST_CONFIG/CHOOSE/PICKSPLIT/
+// INNER_CONSISTENT/LEAF_CONSISTENT_PROC (spgist.h) respectively. Every other
+// support-function number for these two AMs (COMPRESS/DECOMPRESS/DISTANCE/
+// FETCH/OPTIONS/SORTSUPPORT/TRANSLATE_CMPTYPE for GiST, COMPRESS/OPTIONS for
+// SP-GiST) is "optional" and gets forced to a soft family-level dependency
+// even when class-attributed.
+var gistRequiredSupportProcs = map[uint32]bool{1: true, 2: true, 5: true, 6: true, 7: true}
+var spgistRequiredSupportProcs = map[uint32]bool{1: true, 2: true, 3: true, 4: true, 5: true}
+
+// amForcesSoftOperatorDependency reports whether methodOID's amadjustmembers
+// override forces every OPERATOR member's opclass/opfamily dependency to be
+// soft (AUTO, targeting the opfamily) even when the member is
+// class-attributed (ClassOID != 0) — "Operator members of a GiST/SP-GiST
+// opfamily should never have hard dependencies, since their connection to
+// the opfamily depends only on what the support functions think, and that
+// can be altered... For consistency, we make all soft dependencies point to
+// the opfamily" (gistvalidate.c gistadjustmembers, spgvalidate.c
+// spgadjustmembers, verbatim comment). Every other in-tree AM
+// (btree/hash/gin/brin) leaves goopg's pre-existing class-attributed-is-hard
+// default unchanged. A loose member (ClassOID == 0, ALTER OPERATOR FAMILY
+// ... ADD) is already unconditionally soft regardless of AM — this only
+// changes the CLASS-attributed case. DU-002 (M0119-0004).
+func amForcesSoftOperatorDependency(methodOID uint32) bool {
+	return methodOID == amGISTMethodOID || methodOID == amSPGistMethodOID
+}
+
+// amForcesSoftFunctionDependency reports whether a class-attributed FUNCTION
+// member with the given amprocnum is "optional" for methodOID's AM and
+// therefore gets forced to a soft family-level dependency instead of the
+// pre-existing hard-on-class default (gistadjustmembers/spgadjustmembers's
+// function loop: the AM's required-support-proc subset keeps the hard
+// dependency, every other proc number is forced soft). Returns false (no
+// override) for any AM other than GiST/SP-GiST, or for a required proc
+// number on those two. Only meaningful for a class-attributed member — a
+// loose member is already unconditionally soft (see
+// amForcesSoftOperatorDependency's doc comment). DU-002 (M0119-0004).
+func amForcesSoftFunctionDependency(methodOID, procNum uint32) bool {
+	switch methodOID {
+	case amGISTMethodOID:
+		return !gistRequiredSupportProcs[procNum]
+	case amSPGistMethodOID:
+		return !spgistRequiredSupportProcs[procNum]
 	}
 	return false
 }

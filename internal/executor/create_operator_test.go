@@ -862,8 +862,14 @@ func TestCreateOperatorClassForOrderBySortFamily(t *testing.T) {
 		t.Errorf("amopsortfamily = %q, want %q (sort_family's OID)", amop[8], strconv.FormatUint(uint64(sortFam.OID), 10))
 	}
 
+	// AUTO ('a'), not NORMAL ('n'): gistadjustmembers (gistvalidate.c) forces
+	// EVERY operator member of a GiST opfamily to a soft dependency
+	// regardless of class-attribution — corrected alongside the
+	// amForcesSoftOperatorDependency fix (DU-002 (M0119-0004)); this
+	// assertion previously (incorrectly) expected "n", matching goopg's
+	// pre-fix class-attributed-is-always-hard default.
 	dependRows := pgDependVirtualRows(t, im)
-	wantKey := "2602|" + amop[0] + "|2753|" + strconv.FormatUint(uint64(sortFam.OID), 10) + "|n"
+	wantKey := "2602|" + amop[0] + "|2753|" + strconv.FormatUint(uint64(sortFam.OID), 10) + "|a"
 	found := false
 	for _, r := range dependRows {
 		if r[0]+"|"+r[1]+"|"+r[3]+"|"+r[4]+"|"+r[6] == wantKey {
@@ -915,6 +921,98 @@ func TestCreateOperatorClassForOrderByRejectsNonOrderingAM(t *testing.T) {
 	ee, ok := err.(*ExecError)
 	if !ok || ee.Code != "42P17" {
 		t.Fatalf("error = %v, want ExecError{Code: 42P17}", err)
+	}
+}
+
+// TestCreateOperatorClassGistMembersGetSoftDependencies verifies the
+// gistadjustmembers policy (gistvalidate.c): on a `USING gist` opclass, a
+// class-attributed OPERATOR member's dependency is ALWAYS soft (AUTO on the
+// opfamily), and a class-attributed FUNCTION member's dependency is soft
+// UNLESS its amprocnum is one of GiST's required support procs
+// (GIST_CONSISTENT/UNION/PENALTY/PICKSPLIT/EQUAL_PROC — here amprocnum 1 vs
+// the optional amprocnum 3 / GIST_COMPRESS_PROC), even though the member is
+// class-attributed like btree's own hard-by-default case (see
+// TestCreateOperatorClassMembersPopulateAmopAmproc). Closes the loop #40
+// ledger row's "per-AM amadjustmembers dependency-strength policy" resume
+// point. DU-002 (M0119-0004).
+func TestCreateOperatorClassGistMembersGetSoftDependencies(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.gist_family USING gist`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.gist_class FOR TYPE int4 USING gist FAMILY public.gist_family AS
+		OPERATOR 1 ~=~ (int4, int4),
+		FUNCTION 1 int4eq(int4, int4),
+		FUNCTION 3 int4eq(int4, int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	classRows := pgOpclassVirtualRows(t, im)
+	if len(classRows) != 1 {
+		t.Fatalf("pg_opclass rows = %d, want 1", len(classRows))
+	}
+	classOID := classRows[0][0]
+	gistFam, ok := im.LookupUserOperatorFamily("public", "gist_family", catalog.AccessMethodOIDByName("gist"))
+	if !ok {
+		t.Fatal("gist_family not registered")
+	}
+	famOID := strconv.FormatUint(uint64(gistFam.OID), 10)
+
+	amopRows := pgAmopVirtualRows(t, im)
+	if len(amopRows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %d rows, want 1: %v", len(amopRows), amopRows)
+	}
+	amop := amopRows[0]
+
+	amprocRows := pgAmprocVirtualRows(t, im)
+	if len(amprocRows) != 2 {
+		t.Fatalf("pg_amproc VirtualRows = %d rows, want 2: %v", len(amprocRows), amprocRows)
+	}
+	var requiredProc, optionalProc []string
+	for _, r := range amprocRows {
+		if r[4] == "1" {
+			requiredProc = r
+		} else if r[4] == "3" {
+			optionalProc = r
+		}
+	}
+	if requiredProc == nil || optionalProc == nil {
+		t.Fatalf("expected amprocnum 1 and 3 rows, got %v", amprocRows)
+	}
+
+	dependRows := pgDependVirtualRows(t, im)
+	want := map[string]bool{
+		// OPERATOR member: always soft, even class-attributed.
+		"2602|" + amop[0] + "|2753|" + famOID + "|a": false,
+		// FUNCTION 1 (required support proc): still hard-on-class.
+		"2603|" + requiredProc[0] + "|2616|" + classOID + "|i": false,
+		// FUNCTION 3 (optional support proc): forced soft-on-family.
+		"2603|" + optionalProc[0] + "|2753|" + famOID + "|a": false,
+	}
+	for _, r := range dependRows {
+		key := r[0] + "|" + r[1] + "|" + r[3] + "|" + r[4] + "|" + r[6]
+		if _, ok := want[key]; ok {
+			want[key] = true
+		}
+	}
+	for k, found := range want {
+		if !found {
+			t.Errorf("missing expected pg_depend row %q; got %v", k, dependRows)
+		}
+	}
+	// The class-or-family edge for the required FUNCTION 1 member must NOT
+	// also carry an AUTO/opfamily row (it should be hard-on-class only).
+	badKey := "2603|" + requiredProc[0] + "|2753|" + famOID + "|a"
+	for _, r := range dependRows {
+		key := r[0] + "|" + r[1] + "|" + r[3] + "|" + r[4] + "|" + r[6]
+		if key == badKey {
+			t.Errorf("required FUNCTION 1 unexpectedly got a soft family dependency: %v", r)
+		}
 	}
 }
 

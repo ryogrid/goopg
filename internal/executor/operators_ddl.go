@@ -14907,7 +14907,7 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 					}
 				}
 			}
-			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID)
+			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
 			continue
 		}
 		if isAdd && !m.HasExplicitArgTypes {

@@ -4368,6 +4368,67 @@ documentation-only and is exempt from the design-doc requirement.)
       different builtin operator needs its own curated addition until a
       generated leaf-package index exists; `FOR ORDER BY` sort-family
       resolution remains open and unexercised by any fixture in scope.
+      **2026-07-01 (loop #45, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #45"): per-AM `amadjustmembers` dependency-strength policy for
+      GiST/SP-GiST LANDED — closes the loop #40 ledger row's own resume
+      point, flagged in the loop #44 working-set carry as the largest
+      remaining structural gap for a real GiST/SP-GiST opclass to round-trip
+      through pg_dump.** `dependVirtualRows` (`internal/catalog/catalog.go`)
+      previously decided every `AmOpMember`/`AmProcMember`'s pg_depend
+      hardness purely from `ClassOID == 0` (loose vs class-attributed), with
+      no per-AM distinction — real PG's `gistadjustmembers`/
+      `spgadjustmembers` (`gistvalidate.c`/`spgvalidate.c`) force EVERY
+      OPERATOR member of a GiST/SP-GiST opfamily to a soft/family-level
+      dependency regardless of class-attribution, and force every *optional*
+      FUNCTION member (outside the AM's own required-support-proc set) soft
+      too. New `amForcesSoftOperatorDependency`/`amForcesSoftFunctionDependency`
+      + `gistRequiredSupportProcs`/`spgistRequiredSupportProcs` tables
+      (`internal/catalog/catalog.go`, values read off `gist.h`/`spgist.h`);
+      `AmProcMember` gains a `Method` field (mirroring `AmOpMember.Method`)
+      so the FUNCTION-side check has the owning AM without a family-OID
+      indirection; `dependVirtualRows`'s two member loops extend their
+      existing `ClassOID == 0` soft-dependency guard with an `||
+      amForcesSoft*Dependency(...)` clause — no other code changed since
+      everything downstream already branched on the same three-variable
+      dependency-shape state introduced in slice 411/415. **Regression
+      correction, not just addition:** this flips
+      `TestCreateOperatorClassForOrderBySortFamily` (loop #40)'s stale `"n"`
+      (NORMAL) assertion for a `USING gist` FOR-ORDER-BY member's sort-family
+      pg_depend row to the real-PG-correct `"a"` (AUTO) — that test's
+      pre-fix expectation was always wrong per `DefineOpClass` calling
+      `amadjustmembers` unconditionally before `storeOperators`, just never
+      exercised end-to-end until now. New
+      `TestCreateOperatorClassGistMembersGetSoftDependencies` (executor)
+      proves the 3-way split (OPERATOR always soft; required FUNCTION hard;
+      optional FUNCTION soft) plus a negative assertion. **Live PG 18.3
+      end-to-end proof** (two side-by-side servers — goopg on
+      `tmp/perf-optimize` port 5533, a genuinely fresh `initdb`-created real
+      PostgreSQL 18.3 on port 5534 — identical DDL, same real `pg_dump`
+      binary against both): `CREATE OPERATOR CLASS ... AS FUNCTION 1
+      (integer, integer) int4eq(integer,integer);` (only the required
+      FUNCTION 1 inline) plus `ALTER OPERATOR FAMILY ... USING gist ADD
+      OPERATOR 1 public.~=~(integer,integer) , FUNCTION 3 (integer, integer)
+      int4eq(integer,integer);` byte-identical on both engines (only the
+      cross-object dump *ordering* differs, a pre-existing, unrelated,
+      separately-scoped gap). Notably the OPERATOR/optional-FUNCTION
+      round-trip needed **zero new dump-side code** — real pg_dump's
+      `dumpOpfamily` query is unconditional on how a pg_depend row was
+      created, so correcting the row's `refclassid` alone made it visible
+      via the loop #41 `ALTER OPERATOR FAMILY ADD` machinery. Gates: `go
+      build ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/planner`+`internal/server` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS (unaffected — no automated
+      fixture in that suite exercises a gist/spgist opclass); live PG 18.3
+      diff above; TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke =
+      pre-commit hook; `gofmt -l` flags only the same pre-existing
+      go1.25/1.26-drift files as every prior loop in this chain (verified
+      via `git stash`). Design doc + ledger row appended. Deferred: dump
+      object-ordering (goopg has no dependency-graph topological sort at
+      all, unrelated to opclasses specifically); btree/hash's own
+      `amadjustmembers` cross-type-driven rule (no fixture forces it — every
+      existing btree opclass fixture is same-type); the builtin-operator
+      catalog / `op_class_custom` / ALTER OPERATOR FAMILY DROP
+      cascade-semantics gaps remain unchanged from loops #39/#41/#43.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

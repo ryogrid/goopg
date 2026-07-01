@@ -975,3 +975,153 @@ OPERATOR FAMILY`, direct sibling of loop #41's `ADD` form.
   trips never issue `ALTER OPERATOR FAMILY ... DROP` at all); the per-AM
   `amadjustmembers` policy and the builtin-operator-catalog gap remain open
   and unchanged from loop #41.
+
+## Loop #45 — per-AM `amadjustmembers` dependency-strength policy (gist/spgist)
+
+Closes the loop #40 ledger row's own resume point: "port `gistadjustmembers`'s
+policy ... for `USING gist`/`USING spgist` opclasses, OPERATOR members always
+get a soft/family-level dependency ... and only a hand-curated subset of
+FUNCTION members ... keep the hard opclass-level dependency" — flagged in the
+loop #44 working-set carry as "the largest structural gap ... needed for any
+real GiST/SP-GiST opclass to round-trip through pg_dump."
+
+### The bug
+
+`dependVirtualRows` (`internal/catalog/catalog.go`) decided every
+`AmOpMember`/`AmProcMember`'s pg_depend hardness purely from `ClassOID == 0`
+(loose ALTER-ADD'd member → soft/AUTO on the opfamily; class-attributed member
+→ hard/INTERNAL on the opclass), with no per-access-method distinction. Real
+PG's `DefineOpClass`/`AlterOpFamilyAdd` (`opclasscmds.c`) call the AM's own
+`amadjustmembers` routine (`amRoutine->amadjustmembers`) right before
+`storeOperators`/`storeProcedures`, and GiST/SP-GiST are the two in-tree AMs
+whose override (`gistvalidate.c gistadjustmembers`, `spgvalidate.c
+spgadjustmembers`) forces every OPERATOR member's dependency to soft/family
+**regardless of class-attribution** ("Operator members of a GiST opfamily
+should never have hard dependencies, since their connection to the opfamily
+depends only on what the support functions think, and that can be altered"),
+and forces every **optional** FUNCTION member (anything not in the AM's own
+required-support-proc list) to soft/family too, while the AM's required
+support procs stay hard-on-class. goopg's blanket "class-attributed is always
+hard" rule missed this entirely — a `USING gist`/`USING spgist`
+`CREATE OPERATOR CLASS ... AS OPERATOR ...` member always rendered
+`refclassid=pg_opclass`/`INTERNAL`, which is what real PG's `dumpOpclass`
+query (`pg_dump.c`, `JOIN pg_depend ... WHERE refclassid = pg_opclass`) needs
+to include the member in the class's own inline `AS` list — but real PG,
+having marked the same member `refclassid=pg_opfamily`/`AUTO`, does **not**
+include it there at all; it only shows up via `dumpOpfamily`'s separate
+"loose member" query (`WHERE refclassid = pg_opfamily`), rendered as an
+`ALTER OPERATOR FAMILY ... ADD` statement. Confirmed by re-reading
+`opclasscmds.c` `DefineOpClass`/`AlterOpFamilyAdd` (both call
+`amroutine->amadjustmembers` unconditionally before storing) and
+`gistvalidate.c`/`spgvalidate.c`'s own verbatim comments.
+
+### The fix
+
+- `AmProcMember` (`internal/catalog/catalog.go`) gains a `Method uint32`
+  field (mirroring `AmOpMember.Method`, already present since slice 411) so
+  `dependVirtualRows` can look up the owning AM per FUNCTION row without a
+  family-OID indirection; `RegisterAmProcMember` takes a new `method`
+  parameter, threaded from `registerOpClassMembers`'s existing `methodOID`
+  local (`internal/executor/operators_ddl.go`) — its one call site already
+  had the value in scope.
+- Two small per-AM policy tables plus two predicate functions, all in
+  `internal/catalog/catalog.go`, right after `RemoveAmProcMember`:
+  - `amGISTMethodOID`(783)/`amSPGistMethodOID`(4000) constants (mirroring
+    `AccessMethodOIDByName`'s own OID values).
+  - `gistRequiredSupportProcs`/`spgistRequiredSupportProcs`: the amprocnum
+    sets `gistadjustmembers`/`spgadjustmembers` keep hard
+    (`GIST_CONSISTENT/UNION/PENALTY/PICKSPLIT/EQUAL_PROC` = {1,2,5,6,7};
+    `SPGIST_CONFIG/CHOOSE/PICKSPLIT/INNER_CONSISTENT/LEAF_CONSISTENT_PROC` =
+    {1,2,3,4,5} — both read directly off `gist.h`/`spgist.h`).
+  - `amForcesSoftOperatorDependency(methodOID)`: true for gist/spgist,
+    unconditionally (matches the function loop's unconditional
+    `op->ref_is_hard = false` for every operator).
+  - `amForcesSoftFunctionDependency(methodOID, procNum)`: true for gist/spgist
+    when `procNum` is **not** in the AM's required set; false for every other
+    AM (preserving btree/hash/gin/brin's existing hard-on-class default,
+    unexamined — no fixture in scope exercises a non-gist/spgist class-
+    attributed optional-function case, and PG's own btree/hash
+    `amadjustmembers` implement a materially different, cross-type-driven
+    rule that is out of this bounded slice's scope — see "Still open" below).
+- `dependVirtualRows`'s two member loops (amOpMembers/amProcMembers) extend
+  their existing `if m.ClassOID == 0 { ...soft... }` guard to
+  `if m.ClassOID == 0 || amForcesSoft{Operator,Function}Dependency(...)`.
+  Everything downstream (the operator/function-ref deptype, the
+  class-or-family refclassid/refobjid/deptype, the sort-family row) already
+  branched on the same three-variable state (`refDeptype`,
+  `classOrFamilyRefclassid`/`Refobjid`/`Deptype`) introduced in slice
+  411/415, so no other code changed.
+
+### Verification
+
+- **Regression correction, not just addition**: this fix flips
+  `TestCreateOperatorClassForOrderBySortFamily` (loop #40, slice 414) — a
+  `USING gist` class's `FOR ORDER BY` OPERATOR member is class-attributed
+  (`ClassOID != 0`), so the pre-fix code asserted its sort-family pg_depend
+  row as `NORMAL` ('n'). That was always wrong per real PG (confirmed by
+  `DefineOpClass` calling `amadjustmembers` unconditionally, before
+  `storeOperators` — see the "The bug" section); corrected to `AUTO` ('a')
+  with a comment explaining why, rather than silently left stale.
+- New `TestCreateOperatorClassGistMembersGetSoftDependencies`
+  (`internal/executor/create_operator_test.go`): a `USING gist` class with
+  one OPERATOR member, one required FUNCTION (amprocnum 1), one optional
+  FUNCTION (amprocnum 3) — asserts the OPERATOR's dependency is soft/family
+  (even class-attributed), the required FUNCTION's is hard/class, and the
+  optional FUNCTION's is soft/family, plus a negative assertion that the
+  required FUNCTION does NOT also carry a soft/family row.
+- **Live PG 18.3 end-to-end proof** (not just a pg_depend row shape check):
+  built two side-by-side servers — goopg (`tmp/perf-optimize`, port 5533)
+  and a genuinely fresh `initdb`-created real PostgreSQL 18.3
+  (`postgres/local_install`, port 5534) — ran the identical DDL (`CREATE
+  OPERATOR ~=~`, `CREATE OPERATOR FAMILY ... USING gist`, `CREATE OPERATOR
+  CLASS ... USING gist FAMILY ... AS OPERATOR 1 ..., FUNCTION 1 ..., FUNCTION
+  3 ...`) against both, then ran the **same real `pg_dump` binary** against
+  each. Output content is byte-identical on the load-bearing lines (only
+  object-dump *ordering* differs — pg_dump's own topological sort, a
+  pre-existing, unrelated, separately-scoped gap — see "Still open" below):
+  - `CREATE OPERATOR CLASS ... AS FUNCTION 1 (integer, integer)
+    int4eq(integer,integer);` — **only** the required FUNCTION 1 stays in
+    the class's own inline AS-list on BOTH engines.
+  - `ALTER OPERATOR FAMILY public.gist_family USING gist ADD OPERATOR 1
+    public.~=~(integer,integer) , FUNCTION 3 (integer, integer)
+    int4eq(integer,integer);` — the OPERATOR and the optional FUNCTION 3
+    both round-trip through the *existing* `execAlterOpFamilyAdd` (slice 415)
+    machinery automatically, with **no new dump-side code**: real pg_dump's
+    `dumpOpfamily` query (`WHERE refclassid = pg_opfamily AND amopfamily =
+    ...`) is unconditional on how a row was created — it only reads
+    pg_depend content, so correcting the pg_depend row's `refclassid` was
+    sufficient to make this fixture's OPERATOR/optional-FUNCTION visible via
+    the loose-member path this milestone had already built.
+- Gates: `go build ./...`/`go vet` on `internal/catalog`+`internal/executor`
+  clean; targeted `TestCreateOperatorClass*`/`TestAlterOperatorFamily*` PASS;
+  full `internal/catalog`+`internal/executor`+`internal/parser`+
+  `internal/planner`+`internal/server` suites PASS;
+  `TestPort_PgDumpConnectionSetup` PASS (no automated fixture in that suite
+  exercises a gist/spgist opclass yet — the loop #39/#40 gist verification
+  was always a manual live-PG diff, not a permanent fixture — so this fix
+  has zero interaction with the existing regression corpus); live PG 18.3
+  end-to-end diff above; TPC-H spotcheck + pgbench smoke (pre-commit hook).
+
+### Still open (unrelated, pre-existing, NOT this loop's scope)
+
+- **Dump *ordering***: goopg's real-pg_dump output orders `CREATE OPERATOR
+  CLASS` before `CREATE OPERATOR FAMILY`/`ALTER OPERATOR FAMILY ADD`; real PG
+  orders the family/ALTER pair before the class. Both are internally valid
+  (an `ALTER OPERATOR FAMILY` targeting an already-dumped family doesn't need
+  the class to exist first), and pg_dump's own object-ordering is a
+  dependency-graph topological sort goopg does not replicate — a separate,
+  materially larger gap (goopg's dump path has no general
+  dependency-ordering pass at all, per the M0119-0004 catalog-view-parity
+  umbrella), not specific to opclasses.
+- **btree/hash's own `amadjustmembers`** (`nbtvalidate.c`/`hashvalidate.c`)
+  implement a different, cross-type-driven rule — a same-type operator/
+  required-proc ties to the opclass (hard) only if one exists, an explicit
+  cross-type one is always loose/soft regardless of class-attribution. goopg
+  keeps its pre-existing "class-attributed is always hard" default for these
+  two AMs unconditionally (no cross-type distinction at all). No fixture in
+  scope forces this (every existing btree opclass fixture is same-type);
+  ledgered as a distinct, smaller follow-up if one ever does.
+- The builtin-operator catalog remains the loop #39 6-row curated slice; the
+  `op_class_custom` range-type ordering fixture remains unexercised; `ALTER
+  OPERATOR FAMILY ... DROP`'s class-attributed cascade/restrict semantics
+  (loop #43) remain unimplemented.
