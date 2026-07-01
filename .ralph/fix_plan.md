@@ -3721,6 +3721,32 @@ documentation-only and is exempt from the design-doc requirement.)
       with no further code change needed. Gates: targeted test PASS; `go build
       ./...` clean; `go vet` executor+catalog clean; full `internal/catalog`+
       `internal/executor` suites PASS. Deferral ledger row appended (resolved).
+      **2026-07-01 (this loop, design `0119-0004-alter-collation.md`): `ALTER
+      COLLATION RENAME TO / OWNER TO / REFRESH VERSION` LANDED** — closes the
+      loop #50 row's "ALTER COLLATION ... still unhandled" item. The
+      `collation` keyword was entirely absent from `parseAlter()`'s if-chain,
+      so all three forms previously failed to parse. New `AlterCollationStmt`
+      AST node (`Action` one of `rename`/`owner`/`refresh`; an unmodelled
+      trailing form like `SET SCHEMA` parses to a no-op, mirroring
+      `AlterStatisticsStmt`); parser branch modeled on
+      `AlterAggregateRenameStmt`'s RENAME TO shape + the existing `ALTER TABLE
+      … OWNER TO` role-name parsing; catalog `RenameCollation`/
+      `SetCollationOwner` mutators beside `CreateCollation`/`DropCollation`;
+      executor `execAlterCollation` (dispatch + planner passthrough + `ddlTag`
+      wired) resolving the target via `CollationAttrsByName`/`RoleOID`,
+      raising `42704` when unknown without `IF EXISTS`. `REFRESH VERSION`
+      mirrors PG's own no-detectable-version branch (`collationcmds.c:423-503`
+      when `get_collation_actual_version()` returns NULL): always a
+      `"version has not changed"` NOTICE, no catalog write — goopg's registry
+      has no real ICU/glibc binding to version. Tests
+      `TestParseAlterCollationRename`/`…Owner`/`…RefreshVersion` (parser) +
+      `TestAlterCollationRenameOwnerRefresh` (executor). Deliberately **not**
+      WAL-logged (mirrors the pre-existing, also-unlogged `ALTER TABLE
+      RENAME`/`OWNER TO`) — ledger row appended for the restart-persistence
+      follow-up (needs net-new `RecordKind` values, no existing ALTER sibling
+      to copy). Gates: `go build ./...` clean; `go vet`
+      parser/catalog/executor/planner/server clean; those 5 packages' suites
+      PASS.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -1608,6 +1608,28 @@ type CreateCollationStmt struct {
 func (s *CreateCollationStmt) Pos() int  { return s.pos }
 func (s *CreateCollationStmt) stmtNode() {}
 
+// AlterCollationStmt — `ALTER COLLATION [IF EXISTS] name RENAME TO newname`,
+// `... OWNER TO {newowner | CURRENT_USER | SESSION_USER | CURRENT_ROLE}`, or
+// `... REFRESH VERSION`. Action is one of "rename"/"owner"/"refresh"; any
+// other trailing form (e.g. SET SCHEMA) parses with Action == "" and is a
+// no-op, mirroring AlterStatisticsStmt's unmodelled-form handling so the
+// statement never fails to parse. goopg's collation registry has no real
+// ICU/glibc binding to version, so REFRESH VERSION always reports "version
+// has not changed" (the same NOTICE PG emits when get_collation_actual_version
+// can't detect a version, e.g. non-glibc libc) and performs no catalog write.
+// M0119-0004 (DU-002, loop #50 ledger follow-up).
+type AlterCollationStmt struct {
+	pos      int
+	Name     ObjectName
+	IfExists bool
+	Action   string // "rename" | "owner" | "refresh" | "" (unmodelled, no-op)
+	NewName  string // for Action == "rename"
+	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+}
+
+func (s *AlterCollationStmt) Pos() int  { return s.pos }
+func (s *AlterCollationStmt) stmtNode() {}
+
 // CreateTablespaceStmt — `CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opts)]`.
 // goopg supports only the developer/regression-test in-place form (empty LOCATION
 // with allow_in_place_tablespaces on), which creates pg_tblspc/<oid> as a real

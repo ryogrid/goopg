@@ -5711,6 +5711,62 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
+	// ALTER COLLATION [IF EXISTS] name RENAME TO newname | OWNER TO role |
+	// REFRESH VERSION. M0119-0004 (DU-002, loop #50 ledger follow-up).
+	if p.acceptIdentKeyword("collation") {
+		stmt := &AlterCollationStmt{pos: t.Pos}
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			stmt.IfExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Name = name
+		switch {
+		case p.acceptIdentKeyword("rename"):
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = "rename"
+			stmt.NewName = identText(newNameTok)
+		case p.acceptIdentKeyword("owner"):
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			stmt.Action = "owner"
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+			// superuser sentinel, mirroring ALTER TABLE … OWNER TO.
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				stmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				stmt.NewOwner = identText(tok)
+			} else {
+				stmt.NewOwner = "current_user"
+			}
+		case p.acceptIdentKeyword("refresh"):
+			_ = p.acceptIdentKeyword("version")
+			stmt.Action = "refresh"
+		default:
+			// Unmodelled form (e.g. SET SCHEMA) — consume as a no-op.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+		}
+		return stmt, nil
+	}
 	// ALTER INDEX name ALTER COLUMN col SET (options) — emit the action so
 	// the executor can raise the appropriate error. M0097-0023.
 	if p.acceptKeyword(KwIndex) {

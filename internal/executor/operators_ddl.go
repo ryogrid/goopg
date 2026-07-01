@@ -137,6 +137,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateAggregate(s)
 	case *parser.AlterAggregateRenameStmt:
 		return nil, o.execAlterAggregateRename(s)
+	case *parser.AlterCollationStmt:
+		return nil, o.execAlterCollation(s)
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
 	case *parser.CreateExtensionStmt:
@@ -417,6 +419,64 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 		}
 	}
 	return nil
+}
+
+// execAlterCollation handles ALTER COLLATION [IF EXISTS] name RENAME TO
+// newname | OWNER TO role | REFRESH VERSION. Only user-created collations
+// (the userCollations registry CREATE COLLATION populates) can be targeted —
+// a built-in collation is never registered there, so it always reports "does
+// not exist" here, mirroring DROP COLLATION's refusal to touch a pinned
+// pg_collation row. REFRESH VERSION has no real collation-versioning engine
+// behind it in goopg, so it mirrors PG's own no-detectable-version branch
+// (e.g. non-glibc libc): always a "version has not changed" NOTICE, no
+// catalog write. Deliberately not WAL-logged — see the design doc for why
+// (mirrors ALTER TABLE RENAME/OWNER TO, which are also in-memory-only today).
+// M0119-0004 (DU-002, loop #50 ledger follow-up).
+func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	notFound := func() error {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("collation %q does not exist, skipping", s.Name.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q does not exist", s.Name.Name)}
+	}
+	switch s.Action {
+	case "rename":
+		if err := im.RenameCollation(s.Name.Name, schema, s.NewName); err != nil {
+			return notFound()
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateCollation's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID) {
+			return notFound()
+		}
+		return nil
+	case "refresh":
+		if _, found := im.CollationAttrsByName(s.Name.Name); !found {
+			return notFound()
+		}
+		o.ctx.AddNotice(fmt.Sprintf("version has not changed for collation %q", s.Name.Name))
+		return nil
+	default:
+		// Unmodelled ALTER COLLATION form (e.g. SET SCHEMA) — no-op.
+		return nil
+	}
 }
 
 // execCreatePublication / execDropPublication / execCreateSubscription

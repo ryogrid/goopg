@@ -8662,6 +8662,57 @@ func (c *InMemory) DropCollation(name, schema string) bool {
 	return false
 }
 
+// RenameCollation renames a user-created collation with the given bare name
+// in the given schema to newName. Returns an error if the source collation
+// does not exist (not found in userCollations — built-in collations are never
+// registered there, mirroring DropCollation's refusal to touch them) or a
+// collation named newName already exists in the same namespace. `schema`
+// resolves like CreateCollation (unknown → public). M0119-0004 (DU-002,
+// loop #50 ledger follow-up).
+func (c *InMemory) RenameCollation(name, schema, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserCollation
+	for _, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			target = uc
+			continue
+		}
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, newName) {
+			return fmt.Errorf("collation %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("collation %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetCollationOwner sets the owning role OID of a user-created collation with
+// the given bare name in the given schema. Returns false if no such collation
+// is registered (mirrors RenameCollation/DropCollation). M0119-0004 (DU-002,
+// loop #50 ledger follow-up).
+func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.Owner = ownerOID
+			return true
+		}
+	}
+	return false
+}
+
 // CreateCollationDuringRecovery is the idempotent version of CreateCollation
 // used by the WAL-replay driver (internal/initdb/collation_ddl_recovery.go).
 // Unlike CreateCollation it takes the OID from the WAL record (so the
