@@ -10171,6 +10171,70 @@ yet applied to `catalog.Cast`/`catalog.UserConversion`/the collation registry �
 and a dedicated `internal/initdb/{cast,conversion,collation}_ddl_recovery.go` file, following this loop's Transform
 work as the concrete template (bytes 38/39 next free for whichever object is picked next).
 
+### CREATE CAST restart persistence (WAL replay) — second object of the slice-389 backlog to close
+
+Repeats the CREATE TRANSFORM template above for `catalog.Cast` (the next item in the deliberately-deferred list),
+confirming the pattern generalizes to a struct with more fields (5: `SourceType`, `TargetType`, `FuncOID`,
+`Context`, `Method`, vs. Transform's 4) and two single-character enum fields instead of a second name string.
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateCast` (38) and `RecordKindDropCast` (39),
+the next free bytes after `RecordKindDropTransform` (37). `EncodeCreateCast`/`DecodeCreateCast` carry
+`oid | funcOID | context(1 byte) | method(1 byte) | source name | target name` — `context`/`method` are each a
+single PG catalog char (`'e'`/`'a'`/`'i'` and `'b'`/`'i'`/`'f'`) so they are wire-encoded as a single raw byte
+each rather than a length-prefixed string, unlike the two type names. `EncodeDropCast`/`DecodeDropCast` carry
+just the (source, target) key, mirroring `EncodeDropTransform`. The physical-replay dispatch switch gained an
+identical no-op case for the two new kinds (goopg has no per-cast on-disk page state).
+
+**New catalog recovery hooks** (`internal/catalog/catalog.go`): `RegisterCastDuringRecovery`/
+`DropCastDuringRecovery`, the idempotent WAL-replay counterparts of `RegisterCast`/`DropCast` — same OID-carry +
+`nextOID` advance pattern as `RegisterTransformDuringRecovery`.
+
+**New recovery driver** (`internal/initdb/cast_ddl_recovery.go`, new file mirroring
+`transform_ddl_recovery.go`): `replayCastDDLRecords` walks the WAL after physical replay completes, decodes each
+CREATE/DROP CAST record, and applies it via the new recovery hooks. Wired into `internal/initdb/open.go` right
+after the existing `replayTransformDDLRecords` call.
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): the `case "cast"` CREATE arm now captures the
+`*catalog.Cast` returned by `im.RegisterCast(...)` and calls `o.ctx.WAL.Append(wal.EncodeCreateCast(...))` right
+after; the `objType == "cast"` DROP arm calls `o.ctx.WAL.Append(wal.EncodeDropCast(...))` right after a successful
+`im.DropCast(...)` — both mirror the CREATE/DROP TRANSFORM call sites verbatim.
+
+**A real bug caught by the round-trip unit test again, not by inspection:** the first `EncodeCreateCast`
+implementation under-allocated the output buffer by 1 byte (`make([]byte, 14+len(source)+len(target))` when the
+header is 15 bytes: `kind(1) + oid(4) + funcOID(4) + context(1) + method(1) + sourceLen(2)` = 13, plus
+`targetLen(2)` = 15 total fixed bytes before the two names). `TestEncodeDecodeCreateCastRoundTrip`
+(`internal/wal/cast_ddl_test.go`) failed immediately with a truncated-payload decode error on every case — same
+category of easy-to-miss-by-inspection byte-offset error as the transform slice, reinforcing that this class of
+bug recurs whenever a new record format is hand-derived rather than generated, and that the round-trip test is
+the load-bearing guard against it, not eyeballing the arithmetic.
+
+**A genuine pre-existing gap surfaced during manual verification (not caused by this change, out of scope to
+fix here):** `DROP CAST (real AS text)` returns `cast from type real to type text does not exist` even though the
+cast was created via `CREATE CAST (float4 AS text) ...` — `DropCast`'s lookup key is
+`strings.ToLower(source)+"\x00"+strings.ToLower(target)` using the *raw parsed type spelling*, not the resolved
+canonical type name, so PG's built-in type-name synonyms (`real`/`float4`, `int`/`integer`, etc.) do not
+cross-resolve. `DROP CAST (float4 AS text)` (the exact spelling used at CREATE time) succeeds and persists
+correctly across restart. This is a pre-existing gap in slice 395's `RegisterCast`/`DropCast` key scheme, not
+something this WAL-persistence loop introduced or is scoped to fix; recorded in the deferral ledger.
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateCastRoundTrip`/`...DropCastRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal/cast_ddl_test.go`),
+`TestCastDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/`TestReplayCastDDLRecordsHandlesMissingWalDir`
+(`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open cycle against a real on-disk data directory).
+(2) live manual end-to-end: built the binary, `initdb`'d a fresh data dir, started the server on the isolated
+perf-optimize port (5533), ran `CREATE CAST (int4 AS float8) WITHOUT FUNCTION`, `CREATE CAST (float4 AS text)
+WITH INOUT AS ASSIGNMENT`, and a `WITH FUNCTION ... AS ASSIGNMENT` cast via real `psql`, confirmed all three
+showed correct `castsource`/`casttarget`/`castfunc`/`castcontext`/`castmethod` in `pg_cast`, restarted the server
+(graceful `goopg stop` + relaunch against the same data dir) and confirmed all three casts were still present
+with identical values; then `DROP CAST (float4 AS text)`, a second restart, and confirmed only the other two
+remained. Gates: `go build ./...` clean; `go vet ./...` clean; `-race -count=1` on
+`internal/wal`+`internal/catalog`+`internal/initdb`+`internal/executor` PASS; `TestE2E_PhysicalReplication` PASS
+(WAL/MVCC practice card's recovery-path gate); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke via the
+pre-commit hook.
+
+**Deliberately still open (ledger row, next in the template queue):** `catalog.UserConversion` and the collation
+registry still need the identical treatment (bytes 40/41 next free).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

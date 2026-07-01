@@ -12298,6 +12298,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		// it from the registry so it stops round-tripping through pg_dump. An
 		// unregistered cast falls through to the PG-style "does not exist" error.
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.DropCast(fromType, toType) {
+			// DU-002 restart-persistence follow-up: mirror the DROP
+			// TRANSFORM WAL emission so the drop survives a restart too.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCast(fromType, toType)); werr != nil {
+					return fmt.Errorf("wal drop-cast: %w", werr)
+				}
+			}
 			return nil
 		}
 		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
@@ -13006,7 +13013,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if err := validateCreateCast(s, routine); err != nil {
 				return err
 			}
-			im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)
+			cs := im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)
+			// DU-002 restart-persistence follow-up: goopg's CREATE CAST is a
+			// catalog-only side effect with no per-cast file namespace, so
+			// record a WAL event the recovery driver
+			// (internal/initdb/cast_ddl_recovery.go) replays into the cast
+			// registry on the next startup. Mirrors CREATE TRANSFORM
+			// (M0119-0004).
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCast(cs.SourceType, cs.TargetType, cs.Context, cs.Method, cs.OID, cs.FuncOID)); werr != nil {
+					return fmt.Errorf("wal create-cast: %w", werr)
+				}
+			}
 		}
 	case "schema":
 		// Register user-created schema so schema-qualified queries resolve correctly.

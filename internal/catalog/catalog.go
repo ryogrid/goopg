@@ -8540,6 +8540,37 @@ func (c *InMemory) DropTransformDuringRecovery(typeName, lang string) {
 	delete(c.transforms, strings.ToLower(typeName)+"\x00"+strings.ToLower(lang))
 }
 
+// RegisterCastDuringRecovery is the idempotent version of RegisterCast used
+// by the WAL-replay driver (internal/initdb/cast_ddl_recovery.go). Unlike
+// RegisterCast it takes the OID from the WAL record (so the recovered
+// registry matches what the pre-crash server assigned) and advances nextOID
+// past it so subsequent allocations do not collide. Re-applying a record for
+// a cast that already exists just refreshes its fields. Mirrors
+// RegisterTransformDuringRecovery. DU-002 restart-persistence follow-up.
+func (c *InMemory) RegisterCastDuringRecovery(source, target, context, method string, oid, funcOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		c.casts = make(map[string]*Cast)
+	}
+	key := strings.ToLower(source) + "\x00" + strings.ToLower(target)
+	c.casts[key] = &Cast{OID: oid, SourceType: source, TargetType: target, Context: context, Method: method, FuncOID: funcOID}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// DropCastDuringRecovery is the idempotent counterpart used for replaying
+// RecordKindDropCast. DU-002 restart-persistence follow-up.
+func (c *InMemory) DropCastDuringRecovery(source, target string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		return
+	}
+	delete(c.casts, strings.ToLower(source)+"\x00"+strings.ToLower(target))
+}
+
 // CreateExtension records a CREATE EXTENSION install in the runtime
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.

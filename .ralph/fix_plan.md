@@ -3517,6 +3517,33 @@ documentation-only and is exempt from the design-doc requirement.)
       conversion/collation still open, template now exists at bytes 38/39 next-free). Deliberately bounded to ONE
       object kind per the "ONE task per loop" rule — the identical pattern for Cast/Conversion/Collation is each
       its own dedicated loop.
+      **2026-07-01 (loop #48) — CREATE/DROP CAST restart persistence LANDED (second of the slice-389 "in-memory
+      only" backlog to close).** Repeats loop #47's exact template for `catalog.Cast`: new WAL record kinds
+      `RecordKindCreateCast`(38)/`RecordKindDropCast`(39) + `Encode/DecodeCreateCast`/`Encode/DecodeDropCast`
+      (`internal/wal/recovery.go`, mirrors `RecordKindCreateTransform`/`DropTransform` exactly — physical replay
+      is a no-op); new `RegisterCastDuringRecovery`/`DropCastDuringRecovery` idempotent catalog hooks
+      (`internal/catalog/catalog.go`); new recovery driver `internal/initdb/cast_ddl_recovery.go`
+      (`replayCastDDLRecords`, mirrors `transform_ddl_recovery.go`), wired into `internal/initdb/open.go` right
+      after the transform replay call; executor (`internal/executor/operators_ddl.go`) captures the `*catalog.Cast`
+      returned by `RegisterCast` and emits the WAL record at the CREATE `case "cast"` arm and the DROP
+      `objType == "cast"` arm. A real bug — again caught by the round-trip unit test, not inspection — the first
+      `EncodeCreateCast` under-allocated the output buffer by 1 byte; `TestEncodeDecodeCreateCastRoundTrip` failed
+      immediately and pinpointed it. Verified two ways: (1) new unit tests
+      `TestEncodeDecodeCreate/DropCastRoundTrip` + reject-wrong-kind/truncated (`internal/wal`),
+      `TestCastDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/`TestReplayCastDDLRecordsHandlesMissingWalDir`
+      (`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open cycle); (2) live manual restart test on the
+      isolated perf-optimize port (5533) — `CREATE CAST (int4 AS float8) WITHOUT FUNCTION` +
+      `CREATE CAST (float4 AS text) WITH INOUT AS ASSIGNMENT` + a `WITH FUNCTION ... AS ASSIGNMENT` cast via real
+      `psql`, graceful restart confirmed all three persisted with correct castsource/casttarget/castfunc/
+      castcontext/castmethod, then `DROP CAST`, a second restart, confirmed only the other two remained. Gates:
+      `go build`/`go vet` clean; `-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb`+
+      `internal/executor` PASS; `TestE2E_PhysicalReplication` PASS (WAL/MVCC practice card recovery-path gate);
+      TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit. Design doc `0110-0001-pg-dump-tap-port.md`
+      new "CREATE CAST restart persistence" subsection; ledger row appended. A genuine pre-existing gap surfaced
+      during manual verification (NOT this loop's scope, recorded not fixed): `DropCast`'s lookup key uses the raw
+      parsed type spelling, not a canonical name, so `DROP CAST (real AS text)` fails to find a cast created via
+      `CREATE CAST (float4 AS text) ...` — PG type-name synonyms don't cross-resolve in the slice-395 key scheme.
+      Conversion/collation restart persistence still open, template now exists at bytes 40/41 next-free.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`
