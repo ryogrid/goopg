@@ -151,3 +151,48 @@ func TestResolveConversionFunc(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveConversionFuncBuiltinFallback exercises the fallback to
+// catalog.LookupBuiltinProc when the FROM function is not a user-created
+// routine (mirrors resolveTransformFunc's identical fallback). PG's real
+// encoding-conversion functions (e.g. iso8859_1_to_utf8, the FROM function in
+// upstream pg_dump's `002_pg_dump.pl` "CREATE CONVERSION dump_test.test_conversion"
+// fixture) are pg_catalog builtins with no user-routine registry entry.
+func TestResolveConversionFuncBuiltinFallback(t *testing.T) {
+	rs := catalog.NewRoutines()
+
+	t.Run("unqualified builtin resolves", func(t *testing.T) {
+		r, err := resolveConversionFunc(rs, parser.ObjectName{Name: "iso8859_1_to_utf8"})
+		if err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+		if r == nil || r.OID != 4374 {
+			t.Fatalf("resolved routine = %+v, want OID 4374", r)
+		}
+	})
+	t.Run("pg_catalog-qualified builtin resolves", func(t *testing.T) {
+		r, err := resolveConversionFunc(rs, parser.ObjectName{Schema: "pg_catalog", Name: "iso8859_1_to_utf8"})
+		if err != nil {
+			t.Fatalf("expected success, got error: %v", err)
+		}
+		if r == nil || r.OID != 4374 {
+			t.Fatalf("resolved routine = %+v, want OID 4374", r)
+		}
+	})
+	t.Run("other-schema-qualified builtin stays unresolved", func(t *testing.T) {
+		_, err := resolveConversionFunc(rs, parser.ObjectName{Schema: "public", Name: "iso8859_1_to_utf8"})
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "42883" {
+			t.Fatalf("expected 42883, got %v", err)
+		}
+	})
+	t.Run("curated builtin with wrong signature stays unresolved", func(t *testing.T) {
+		// int4recv is a real curated builtin but takes a single `internal`
+		// argument, not the 6-arg conversion signature — must not match.
+		_, err := resolveConversionFunc(rs, parser.ObjectName{Name: "int4recv"})
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "42883" {
+			t.Fatalf("expected 42883, got %v", err)
+		}
+	})
+}

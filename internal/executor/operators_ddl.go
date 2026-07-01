@@ -12890,12 +12890,37 @@ func resolveConversionFunc(rs *catalog.Routines, funcName parser.ObjectName) (*c
 		}
 	}
 	if candidate == nil {
+		// Not a user-created routine. Fall back to the hand-curated built-in
+		// pg_proc table (catalog.LookupBuiltinProc) before giving up — mirrors
+		// resolveTransformFunc's identical fallback (DU-002 slice 404 follow-up).
+		// PG's real encoding-conversion functions (e.g. iso8859_1_to_utf8) are
+		// builtins with no user-routine registry entry.
+		if funcName.Schema == "" || strings.EqualFold(funcName.Schema, "pg_catalog") {
+			if b, ok := catalog.LookupBuiltinProc(funcName.Name); ok && builtinProcMatchesConversionSig(b) {
+				return &catalog.Routine{OID: b.OID, Name: b.Name, ReturnType: catalog.Type{Name: b.RetType}}, nil
+			}
+		}
 		return nil, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s does not exist", requiredSig)}
 	}
 	if catalog.TypeNameToOID(candidate.ReturnType.Name) != catalog.OIDInt4 {
 		return nil, &ExecError{Code: "42P17", Message: fmt.Sprintf("encoding conversion function %s must return type integer", funcName.String())}
 	}
 	return candidate, nil
+}
+
+// builtinProcMatchesConversionSig reports whether b's signature matches the
+// fixed (int4, int4, cstring, internal, int4, bool) -> int4 shape PG requires
+// of an encoding-conversion function (LookupFuncName in conversioncmds.c).
+func builtinProcMatchesConversionSig(b catalog.BuiltinProc) bool {
+	if catalog.TypeNameToOID(b.RetType) != catalog.OIDInt4 || len(b.ArgTypes) != 6 {
+		return false
+	}
+	return catalog.TypeNameToOID(b.ArgTypes[0]) == catalog.OIDInt4 &&
+		catalog.TypeNameToOID(b.ArgTypes[1]) == catalog.OIDInt4 &&
+		strings.EqualFold(b.ArgTypes[2], "cstring") &&
+		strings.EqualFold(b.ArgTypes[3], "internal") &&
+		catalog.TypeNameToOID(b.ArgTypes[4]) == catalog.OIDInt4 &&
+		catalog.TypeNameToOID(b.ArgTypes[5]) == catalog.OIDBool
 }
 
 // validateCreateCast mirrors the argument/return-type rules PostgreSQL enforces
@@ -13120,6 +13145,22 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 					if routine == nil {
 						if overloads := rs.LookupByName(s.CastFuncName); len(overloads) == 1 {
 							routine = overloads[0]
+						}
+					}
+					if routine == nil && (s.CastFuncName.Schema == "" || strings.EqualFold(s.CastFuncName.Schema, "pg_catalog")) {
+						// Not a user-created routine. Fall back to the hand-curated
+						// built-in pg_proc table (catalog.LookupBuiltinProc) before
+						// giving up — mirrors resolveTransformFunc's identical
+						// fallback (DU-002 slice 404 follow-up). Synthesized as a
+						// *catalog.Routine so validateCreateCast below runs its full
+						// argument/return-type checks against the builtin's real
+						// signature instead of skipping them.
+						if b, ok := catalog.LookupBuiltinProc(s.CastFuncName.Name); ok {
+							argTypes := make([]catalog.Type, len(b.ArgTypes))
+							for i, a := range b.ArgTypes {
+								argTypes[i] = catalog.Type{Name: a}
+							}
+							routine = &catalog.Routine{OID: b.OID, Name: b.Name, ArgTypes: argTypes, ReturnType: catalog.Type{Name: b.RetType}, Volatile: b.Volatile}
 						}
 					}
 				}

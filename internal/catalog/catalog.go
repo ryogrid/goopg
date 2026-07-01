@@ -10590,6 +10590,23 @@ var builtinProcsByName = map[string]BuiltinProc{
 		OID: 3721, Name: "prsd_lextype", Namespace: 11,
 		RetType: "internal", ArgTypes: []string{"internal"}, Volatile: "i",
 	},
+	"iso8859_1_to_utf8": {
+		OID: 4374, Name: "iso8859_1_to_utf8", Namespace: 11,
+		RetType:  "int4",
+		ArgTypes: []string{"int4", "int4", "cstring", "internal", "int4", "bool"},
+		Volatile: "i",
+	},
+	// age(timestamptz) is one of four overloaded pg_proc.dat "age" entries
+	// (OIDs 1181/1199/1386/2058/2059); only the single-arg timestamptz->interval
+	// form (OID 1386, the DU-002 "CREATE CAST FOR timestamptz" fixture's WITH
+	// FUNCTION reference) is curated since LookupBuiltinProc has no overload
+	// resolution (name-only) and no other fixture references "age" yet.
+	"age": {
+		OID: 1386, Name: "age", Namespace: 11,
+		RetType:  "interval",
+		ArgTypes: []string{"timestamptz"},
+		Volatile: "s",
+	},
 }
 
 // LookupBuiltinProc resolves a built-in pg_proc.dat function by name (case-

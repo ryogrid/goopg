@@ -5051,6 +5051,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)"); err != nil {
 		t.Fatalf("create cast text->integer with function: %v", err)
 	}
+	// DU-002 slice 404 follow-up (CAST builtin-fallback wiring): a WITH FUNCTION
+	// cast referencing a PG built-in (not user-created) routine must also
+	// round-trip. dumpCast's COERCION_METHOD_FUNCTION arm ALWAYS schema-qualifies
+	// the function ("format_function_signature won't qualify it" per pg_dump.c),
+	// so the built-in age(timestamptz) — exposed via the same
+	// catalog.LookupBuiltinProc fallback resolveTransformFunc already used
+	// (DU-002 slice 404) — renders `WITH FUNCTION pg_catalog.age(...)`. This is
+	// the exact upstream TAP fixture from postgres/src/bin/pg_dump/t/002_pg_dump.pl
+	// ('CREATE CAST FOR timestamptz'). Before this loop the CAST WITH-FUNCTION arm
+	// had no built-in fallback, so age(timestamptz) failed to resolve and
+	// castfunc stayed 0 (`CREATE CAST ... WITH FUNCTION age(...)` — see
+	// dumpCast's "bogus value in pg_cast.castfunc" warning).
+	if err := runSQLSimple(t, c, "CREATE CAST (timestamptz AS interval) WITH FUNCTION age(timestamptz) AS ASSIGNMENT"); err != nil {
+		t.Fatalf("create cast timestamptz->interval with builtin function: %v", err)
+	}
 	// Slice 399/401: a CREATE [DEFAULT] CONVERSION must round-trip. pg_dump's
 	// getConversions reads every pg_conversion row (built-ins live in pg_catalog
 	// and are filtered out at dump-out time, so a no-user-conversion cluster stays
@@ -5134,6 +5149,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} else {
 			t.Errorf("%q: error = %T (%v), want *pq.Error", neg.sql, err, err)
 		}
+	}
+	// DU-002 slice 404 follow-up (CONVERSION builtin-fallback wiring): a
+	// CONVERSION whose FROM function is a real PG encoding-conversion built-in
+	// (not user-created) must also round-trip. This is the exact upstream TAP
+	// fixture from postgres/src/bin/pg_dump/t/002_pg_dump.pl ('CREATE CONVERSION
+	// dump_test.test_conversion'; goopg's harness uses the public schema like
+	// every other fixture in this test, not the upstream dump_test schema).
+	// Unlike CAST, dumpConversion's query selects conproc directly off
+	// pg_conversion (no pg_proc join), so it renders whatever conproc text the
+	// server returns — since the builtin's FuncOID (4374) is never a user
+	// routine, pg_conversion's VirtualRows falls back to the as-written,
+	// unqualified `iso8859_1_to_utf8` text, which happens to match real PG's
+	// (search_path-relative) regproc output for a pg_catalog function exactly.
+	// Before this loop resolveConversionFunc had no built-in fallback, so this
+	// CREATE CONVERSION failed outright with 42883 "function ...
+	// iso8859_1_to_utf8(...) does not exist".
+	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8"); err != nil {
+		t.Fatalf("create default conversion from builtin function: %v", err)
 	}
 	// Slice 404 (connsetup): CREATE TRANSFORM FOR int LANGUAGE sql, exercising
 	// resolveTransformFunc's builtin fallback (catalog.LookupBuiltinProc) added
@@ -7909,6 +7942,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if want := "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing WITH FUNCTION cast %q\n  full stdout=%q", want, res.Stdout)
 		}
+		// **DU-002 slice 404 follow-up (asserted):** a WITH FUNCTION cast
+		// referencing a PG built-in (age(timestamptz), not a user routine) must
+		// also round-trip, resolving via the new catalog.LookupBuiltinProc
+		// fallback in the CAST WITH-FUNCTION arm. Byte-identical to real pg_dump
+		// 18.3's rendering of the upstream 002_pg_dump.pl 'CREATE CAST FOR
+		// timestamptz' fixture (schema-qualified pg_catalog.age, "timestamp with
+		// time zone" spelled out in full). A regression that drops the built-in
+		// fallback leaves castfunc at 0 and dumpCast warns + emits a bare
+		// `WITH FUNCTION` — caught exactly here.
+		if want := "CREATE CAST (timestamp with time zone AS interval) WITH FUNCTION pg_catalog.age(timestamp with time zone) AS ASSIGNMENT;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing built-in WITH FUNCTION cast %q\n  full stdout=%q", want, res.Stdout)
+		}
 		// **Slice 399 (asserted):** a CREATE [DEFAULT] CONVERSION must round-trip via
 		// getConversions / dumpConversion. dumpConversion renders the FOR/TO encoding
 		// literals through pg_encoding_to_char(conforencoding/contoencoding) and the
@@ -7925,6 +7970,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// dump would read FOR '' TO '' instead.
 		if want := "CREATE CONVERSION public.aliasconv FOR 'SJIS' TO 'UTF8' FROM public.aliasconv_func;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing alias CONVERSION %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **DU-002 slice 404 follow-up (asserted):** a CONVERSION whose FROM
+		// function is a real PG encoding-conversion built-in (iso8859_1_to_utf8,
+		// not a user routine) must also round-trip, resolving via the new
+		// catalog.LookupBuiltinProc fallback in resolveConversionFunc. Unlike
+		// CAST, conproc is unqualified here (dumpConversion selects it raw off
+		// pg_conversion, no pg_proc join) — matching real PG's regproc output for
+		// a pg_catalog function. Byte-identical to real pg_dump 18.3's rendering
+		// of the upstream 002_pg_dump.pl 'CREATE CONVERSION dump_test.test_conversion'
+		// fixture (adapted to the public schema like every other fixture here).
+		if want := "CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing built-in CONVERSION %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 404 (asserted):** CREATE TRANSFORM FOR int must round-trip via
 		// getTransforms / dumpTransform. Both WITH FUNCTION references resolve

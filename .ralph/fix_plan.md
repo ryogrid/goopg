@@ -3747,6 +3747,30 @@ documentation-only and is exempt from the design-doc requirement.)
       to copy). Gates: `go build ./...` clean; `go vet`
       parser/catalog/executor/planner/server clean; those 5 packages' suites
       PASS.
+      **2026-07-01 (loop #53): CAST WITH-FUNCTION arm + `resolveConversionFunc`
+      wired to `catalog.LookupBuiltinProc` LANDED** — closes the loop #46
+      ledger row's explicit resume point (the trivial CAST/CONVERSION
+      follow-up to the TRANSFORM builtin-fallback wiring). Two curated
+      builtins added (`age` OID 1386 timestamptz->interval;
+      `iso8859_1_to_utf8` OID 4374, the 6-arg encoding-conversion signature).
+      `resolveConversionFunc` falls back to the curated table (mirrors
+      `resolveTransformFunc`'s identical guard); the CAST WITH-FUNCTION arm
+      synthesizes a `*catalog.Routine` from the builtin so `validateCreateCast`
+      still runs its full signature checks. Discovered and closed two
+      previously-unported upstream DU-002 fixtures in the same loop —
+      `'CREATE CAST FOR timestamptz'` (`age(timestamptz)`) and `'CREATE
+      CONVERSION dump_test.test_conversion'` (`iso8859_1_to_utf8`) — now wired
+      into `TestPort_PgDumpConnectionSetup`, byte-identical vs real pg_dump
+      18.3. Tests: `TestResolveConversionFuncBuiltinFallback`,
+      `TestCreateCastWithFunctionResolvesBuiltin`/
+      `...RejectsBuiltinSignatureMismatch`, 2 new connsetup assertions. Gates:
+      `go build ./...` clean; `go vet` catalog/executor/initdb/testport clean;
+      `internal/catalog`+`internal/executor`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpConnectionSetup` (full suite) PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS. Deferred: the curated table is still name-only (no
+      overload resolution) — see ledger row for the `map[string][]BuiltinProc`
+      generalization resume point, not attempted since no current fixture
+      needs a second overload of any curated name.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
