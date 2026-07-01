@@ -1307,6 +1307,16 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_aggregate: CREATE AGGREGATE introspection (DU-002 slice 405).
+	// Registering here (like pg_proc above) makes the view present from the
+	// first session, both for the 161 built-in aggregates and any later
+	// CREATE AGGREGATE.
+	if err := registerPgAggregateView(cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 	// Publication / subscription registry + their five virtual
 	// catalog views (pg_publication, pg_publication_rel,
 	// pg_publication_tables, pg_subscription, pg_subscription_rel).

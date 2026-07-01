@@ -5180,6 +5180,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"(FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))"); err != nil {
 		t.Fatalf("create transform for int: %v", err)
 	}
+	// Slice 405: CREATE AGGREGATE must round-trip via getAggregates/dumpAgg.
+	// This is the exact upstream TAP fixture from
+	// postgres/src/bin/pg_dump/t/002_pg_dump.pl ('CREATE AGGREGATE
+	// dump_test.newavg'; public-schema-adapted like every other fixture in
+	// this test). SFUNC/FINALFUNC (int4_avg_accum/int8_avg) are the same
+	// builtin-fallback functions PG's own avg(int4) uses internally — curated
+	// in catalog.LookupBuiltinProc (mirrors the slice 404 TRANSFORM/CAST/
+	// CONVERSION builtin-fallback pattern). Before this loop `pg_aggregate`
+	// was not even a SQL-queryable relation (no Table registered for it at
+	// all, built-in aggregates included), which made dumpAgg's own
+	// `FROM pg_aggregate a, pg_proc p WHERE a.aggfnoid = p.oid` query
+	// impossible for ANY aggregate — see internal/initdb/pg_aggregate_view.go.
+	if err := runSQLSimple(t, c, "CREATE AGGREGATE public.newavg ("+
+		"sfunc = int4_avg_accum, basetype = int4, stype = _int8, "+
+		"finalfunc = int8_avg, finalfunc_modify = shareable, initcond1 = '{0,0}')"); err != nil {
+		t.Fatalf("create aggregate newavg: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -7994,6 +8011,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// pg_catalog.<func>, integer/sql spelled out in full).
 		if want := "CREATE TRANSFORM FOR integer LANGUAGE sql (FROM SQL WITH FUNCTION pg_catalog.prsd_lextype(internal), TO SQL WITH FUNCTION pg_catalog.int4recv(internal));"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing CREATE TRANSFORM %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 405 (asserted):** CREATE AGGREGATE public.newavg must round-trip
+		// via getAggregates/dumpAgg, byte-identical to real pg_dump 18.3's
+		// rendering of the upstream 002_pg_dump.pl 'CREATE AGGREGATE
+		// dump_test.newavg' fixture (public-schema-adapted). Exercises: pg_proc
+		// exposing a prokind='a' row for the aggregate (registerPgProcView),
+		// pg_aggregate becoming SQL-queryable at all (registerPgAggregateView),
+		// the regproc/oid cross-type comparison analyzer fix (isComparable) that
+		// dumpAgg's own `a.aggfnoid = p.oid` join depends on, and
+		// pg_get_function_arguments resolving a non-Routine aggregate OID.
+		if want := "CREATE AGGREGATE public.newavg(integer) (\n" +
+			"    SFUNC = int4_avg_accum,\n" +
+			"    STYPE = bigint[],\n" +
+			"    INITCOND = '{0,0}',\n" +
+			"    FINALFUNC = int8_avg,\n" +
+			"    FINALFUNC_MODIFY = SHAREABLE\n" +
+			");"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE AGGREGATE %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

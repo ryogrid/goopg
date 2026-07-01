@@ -7953,10 +7953,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExpr(x.Args[0], row, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
-				if rs := ctx.Catalog.Routines(); rs != nil {
-					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r, true)), nil
-					}
+				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
+					return NewStringDatum(buildFunctionArguments(r, true)), nil
 				}
 			}
 		}
@@ -7971,10 +7969,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExpr(x.Args[0], row, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
-				if rs := ctx.Catalog.Routines(); rs != nil {
-					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r, false)), nil
-					}
+				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
+					return NewStringDatum(buildFunctionArguments(r, false)), nil
 				}
 			}
 		}
@@ -12292,6 +12288,32 @@ func parseTZHourMin(s string) (h, m int, ok bool) {
 // passes true (so trailing input args carry their ` DEFAULT <expr>` clause),
 // while pg_get_function_identity_arguments passes false (defaults omitted, since
 // they are not part of the function's ALTER/DROP identity).
+// routineOrAggregateArgs resolves oid to a *catalog.Routine for
+// pg_get_function_arguments/pg_get_function_identity_arguments. A CREATE
+// AGGREGATE registers its identity in catalog.UserAggregate, not
+// catalog.Routines — synthesize a throwaway Routine carrying just its
+// argument types (no names/modes/defaults, matching a simple aggregate's
+// unnamed-parameter signature, e.g. `newavg(integer)`) so the shared
+// arg-list renderer works for both routines and aggregates. DU-002 slice 405.
+func routineOrAggregateArgs(cat catalog.Catalog, oid uint32) *catalog.Routine {
+	if rs := cat.Routines(); rs != nil {
+		if r := rs.LookupByOID(oid); r != nil {
+			return r
+		}
+	}
+	for _, agg := range cat.ListUserAggregates() {
+		if agg.OID != oid {
+			continue
+		}
+		argTypes := make([]catalog.Type, len(agg.ArgTypes))
+		for i, t := range agg.ArgTypes {
+			argTypes[i] = catalog.Type{Name: t}
+		}
+		return &catalog.Routine{ArgTypes: argTypes}
+	}
+	return nil
+}
+
 func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	if len(r.ArgTypes) == 0 {
 		return ""

@@ -10704,6 +10704,26 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 // `SELECT 1 FROM pg_type WHERE oid = enumtypid` return the expected rows.
 // Mirrors to DBOid=5 (postgres db) so the seqScan (which reads from the
 // session's DBOID) finds the row. M0097-0022 (enum → pg_type parity).
+// syncAggregateToCatalogHeap writes the pg_aggregate row for a CREATE
+// AGGREGATE (OID 2600), keyed by aggfnoid = agg.OID (the aggregate's own
+// pg_proc identity). pg_proc itself is a Virtual view (registerPgProcView
+// enumerates cat.ListUserAggregates() directly; no heap write needed there —
+// see internal/initdb/pg_proc_view.go). DU-002 slice 405.
+func syncAggregateToCatalogHeap(ctx *Context, agg *catalog.UserAggregate) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	aggRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AggregateRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, aggRel, pgAggregateColumnsPG18(), buildUserPGAggregateRow(ctx, agg)); err != nil {
+		return
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AggregateRelationId)
+}
+
 func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
@@ -14195,13 +14215,14 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	// Register in the catalog so the planner and executor can find it.
 	agg := &catalog.UserAggregate{
-		Name:        strings.ToLower(s.Name.Name),
-		SType:       s.SType,
-		SFunc:       s.SFunc,
-		FinalFunc:   s.FinalFunc,
-		CombineFunc: s.CombineFunc,
-		InitCond:    s.InitCond,
-		Variadic:    s.Variadic,
+		Name:            strings.ToLower(s.Name.Name),
+		SType:           s.SType,
+		SFunc:           s.SFunc,
+		FinalFunc:       s.FinalFunc,
+		CombineFunc:     s.CombineFunc,
+		InitCond:        s.InitCond,
+		FinalFuncModify: s.FinalFuncModify,
+		Variadic:        s.Variadic,
 	}
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}
@@ -14215,6 +14236,7 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 		}
 	}
 	o.ctx.Catalog.RegisterUserAggregate(agg)
+	syncAggregateToCatalogHeap(o.ctx, agg)
 	return nil
 }
 

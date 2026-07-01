@@ -3769,6 +3769,50 @@ documentation-only and is exempt from the design-doc requirement.)
       `internal/catalog`+`internal/executor` suites PASS; TPC-H spotcheck run.
       Design doc `0119-0004-alter-collation.md` + README index updated.
       Deferral ledger row appended (resolved).
+      **2026-07-01 (loop #55, design `0110-0001-pg-dump-tap-port.md` slice
+      405): `CREATE AGGREGATE` round-trip LANDED — new object family,
+      `pg_aggregate` made SQL-queryable for the first time.** Ports the
+      upstream `'CREATE AGGREGATE dump_test.newavg'` fixture
+      (public-schema-adapted). Two previously-hidden, aggregate-agnostic
+      blockers surfaced and were fixed generally: (1) `pg_aggregate` was not
+      SQL-queryable AT ALL — not even the 161 built-in aggregates goopg has
+      shipped since M0106-0010 — because the heap file
+      (`bootstrapPgAggregateTuples`) was only ever wired for PG18-standby byte
+      fidelity, never registered as a `catalog.Table`; fixed by a new
+      `registerPgAggregateView` Virtual table
+      (`internal/initdb/pg_aggregate_view.go`, mirroring `pg_index`'s existing
+      heap-write-plus-Virtual-read split) combining the 161 BKI rows with
+      `cat.ListUserAggregates()`. (2) `regproc`/`oid` cross-type comparison was
+      unimplemented in the analyzer, so `pg_dump`'s own `dumpAgg` prepared
+      query (`a.aggfnoid = p.oid`) raised 42804; fixed by a new `isOIDFamily`
+      helper in `internal/analyzer/analyzer.go`'s `isComparable` covering the
+      whole oid-alias family (regproc/regclass/regtype/...), which real
+      PostgreSQL treats as binary-coercible with `oid`. Also landed:
+      `parser.CreateAggregateStmt.FinalFuncModify` (previously silently
+      discarded); `catalog.UserAggregate.OID` + `ListUserAggregates()`;
+      `pg_proc` now emits a `prokind='a'` row per aggregate
+      (`registerPgProcView`); `executor.routineOrAggregateArgs` fallback so
+      `pg_get_function_arguments` works for a non-Routine aggregate OID (was
+      silently returning `""`, hence a `newavg()` empty-signature symptom);
+      two curated builtins (`int4_avg_accum` OID 1963, `int8_avg` OID 1964 —
+      the exact functions PG's own `avg(int4)` uses internally); a live
+      `pg_aggregate` heap-row write (`executor.buildUserPGAggregateRow`) for
+      PG18-standby fidelity, independent of the Virtual SQL-read path.
+      Verified against a real running server + real pg_dump 18.3
+      byte-identical, AND that the aggregate actually executes at runtime
+      (`SELECT newavg(a) FROM t`), not just dump-fidelity. Tests: slice-405
+      fixture/assertion in `TestPort_PgDumpConnectionSetup`. Gates: `go build
+      ./...` clean; `go vet` analyzer/catalog/executor/initdb/parser/testport
+      clean; `internal/analyzer`+`internal/catalog`+`internal/executor`+
+      `internal/initdb`+`internal/parser`+`internal/planner`+`internal/server`
+      suites PASS; full `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Design doc updated
+      (new "Slice 405" section). Deferred (ledger row appended): `pronamespace`
+      hardcoded to `public` (`UserAggregate` has no `Schema` field); the 161
+      built-in aggregates' `aggtransfn`/`aggfinalfn`/... still render raw
+      numeric OIDs (not names) on a direct query (irrelevant to `pg_dump`,
+      which never dumps pinned objects); restart persistence (not WAL-logged —
+      same "round-trip lands first" split as TRANSFORM/CAST/CONVERSION/COLLATION).
       **2026-07-01 (loop #53): CAST WITH-FUNCTION arm + `resolveConversionFunc`
       wired to `catalog.LookupBuiltinProc` LANDED** — closes the loop #46
       ledger row's explicit resume point (the trivial CAST/CONVERSION

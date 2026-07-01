@@ -1818,16 +1818,17 @@ type DropCompatStmt struct {
 // validate that the basetype (input type) is specified.  Full aggregate
 // implementation is out of scope; we just reject missing basetype. M0097-regress.
 type CreateAggregateStmt struct {
-	pos         int
-	Name        ObjectName
-	HasBaseType bool
-	BaseType    string // e.g. "int4"
-	Variadic    bool   // true when declared with VARIADIC arg (variadic agg)
-	SType       string // state type (e.g. "int4")
-	SFunc       string // state transition function name
-	FinalFunc   string // final function name
-	CombineFunc string // combine function name (for parallel aggregation)
-	InitCond    string // initial condition string (e.g. "0" or "{0,0}")
+	pos             int
+	Name            ObjectName
+	HasBaseType     bool
+	BaseType        string // e.g. "int4"
+	Variadic        bool   // true when declared with VARIADIC arg (variadic agg)
+	SType           string // state type (e.g. "int4")
+	SFunc           string // state transition function name
+	FinalFunc       string // final function name
+	CombineFunc     string // combine function name (for parallel aggregation)
+	InitCond        string // initial condition string (e.g. "0" or "{0,0}")
+	FinalFuncModify string // FINALFUNC_MODIFY: "read_only"/"shareable"/"read_write" (lower-cased, "" if unspecified)
 }
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }

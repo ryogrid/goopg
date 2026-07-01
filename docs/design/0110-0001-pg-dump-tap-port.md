@@ -10438,6 +10438,144 @@ FUNCTION` followed by `COMMENT ON CAST (real AS text) IS '...'` stores the descr
 (classoid 2605) keyed on the same OID `CastByTypes("float4", "text")` returns. No production code changed —
 this closes the re-verification gap as a pure test addition.
 
+### Slice 405 — **`CREATE AGGREGATE` round-trip** (new object family; `pg_aggregate` made SQL-queryable for the first time)
+
+Ports the upstream `'CREATE AGGREGATE dump_test.newavg'` fixture
+(`postgres/src/bin/pg_dump/t/002_pg_dump.pl`, public-schema-adapted like every
+other fixture in this test): a two-clause aggregate (`SFUNC =
+int4_avg_accum, BASETYPE = int4, STYPE = _int8, FINALFUNC = int8_avg,
+FINALFUNC_MODIFY = shareable, INITCOND1 = '{0,0}'`) must dump byte-identical
+to real PostgreSQL 18.3's `dumpAgg`.
+
+**Landed:**
+
+- `parser.CreateAggregateStmt.FinalFuncModify` — the grammar already parsed
+  every other `CREATE AGGREGATE` option but silently discarded
+  `FINALFUNC_MODIFY` (`parseAggregateOptions`'s ignore-list). Now captured
+  and threaded through `catalog.UserAggregate.FinalFuncModify`.
+- `catalog.UserAggregate.OID` — aggregates previously had no identity OID at
+  all; `RegisterUserAggregate` now allocates one via `allocOIDLocked` (same
+  counter every other user object uses) on first registration.
+- `catalog.ListUserAggregates()` — a new `Catalog` interface method (mirrors
+  `ListUserCollations`) so both the executor (heap write) and initdb (Virtual
+  view) can enumerate the registry.
+- **`pg_proc` now emits a `prokind='a'` row per aggregate**
+  (`internal/initdb/pg_proc_view.go`'s `registerPgProcView`, appended after
+  the existing `catalog.BuiltinProcs()` loop so no existing row-index
+  assumption shifts). `prorettype` follows PG's `DefineAggregate`: the
+  finalfunc's return type when one is given, else the state type.
+- **`pg_aggregate` is now a SQL-queryable relation at all** — this was the
+  real, previously-hidden blocker (see "Discovery" below).
+  `internal/initdb/pg_aggregate_view.go`'s `registerPgAggregateView`
+  registers it `Virtual: true` (mirrors `pg_index`'s existing
+  heap-write-for-standby-fidelity-plus-Virtual-for-SQL split), combining the
+  161 built-in (BKI) rows (`pgAggregateInitialEntries`, already used for the
+  initdb heap bootstrap) with every `cat.ListUserAggregates()` entry.
+- `internal/analyzer/analyzer.go`'s `isComparable` — a second, previously-hidden
+  blocker (see "Discovery" below): the whole `oid`↔"reg*" family (regproc,
+  regclass, regtype, ...) is binary-coercible in real PostgreSQL (same on-disk
+  representation, different I/O function only), so `a.aggfnoid = p.oid`
+  type-checks without a cast — but goopg's `isComparable` only recognized
+  bare `oid`, not the "reg*" aliases. New `isOIDFamily` helper covers the
+  whole family for both the oid↔numeric and oid↔text-backed comparability
+  branches.
+- `executor.routineOrAggregateArgs` (`internal/executor/expr.go`) —
+  `pg_get_function_arguments`/`pg_get_function_identity_arguments` only ever
+  consulted `Routines().LookupByOID`; an aggregate isn't a `catalog.Routine`,
+  so `pg_get_function_arguments(<aggregate oid>)` silently returned `""`
+  (dumpAgg's `newavg()` empty-signature symptom below). The fallback
+  synthesizes a throwaway `*catalog.Routine{ArgTypes: ...}` from
+  `UserAggregate.ArgTypes` — sufficient for the shared `buildFunctionArguments`
+  renderer to produce a bare unnamed-parameter list (`(integer)`), matching a
+  simple aggregate's signature.
+- Two curated builtins added to `catalog.builtinProcsByName`:
+  `int4_avg_accum` (OID 1963) / `int8_avg` (OID 1964) — the exact
+  transition/final functions PG's own `avg(int4)` uses internally, and the
+  ones the upstream fixture references by name.
+- `executor.buildUserPGAggregateRow` / `pgAggregateColumnsPG18`
+  (`internal/executor/pg18_user_catalog_rows.go`) — a live `pg_aggregate`
+  heap-row write via the existing `writeHeapRowCanonical` +
+  `mirrorCatalogRelToPostgresDB` template (same shape as
+  `syncEnumTypeToCatalogHeap`), for PG18-standby byte-level fidelity — kept
+  independent of the Virtual SQL-read path above (same split as `pg_index`).
+
+**Discovery (why this was a bigger fix than "wire the parser field"):**
+Two pre-existing, previously-unexercised gaps blocked this from the very
+first manual test, neither specific to aggregates:
+
+1. **`pg_aggregate` was never SQL-queryable at all**, even for the 161
+   built-in aggregates goopg has shipped since M0106-0010 — `SELECT * FROM
+   pg_aggregate` raised `relation "pg_aggregate" does not exist` on a
+   completely stock cluster. The heap file (`bootstrapPgAggregateTuples`,
+   `base/{1,5}/2600`) has existed since M0106-0010 for PG18-standby byte
+   fidelity, but — unlike `pg_type`/`pg_attribute`, which really are
+   heap-scanned by goopg's own SQL engine — nothing ever registered a
+   `catalog.Table` for it, heap-backed or Virtual. `pg_dump`'s own `dumpAgg`
+   prepared query (`FROM pg_aggregate a, pg_proc p WHERE a.aggfnoid =
+   p.oid`) was therefore unreachable for every aggregate, built-in or
+   user-defined, on every prior goopg release.
+2. **`regproc`/`oid` cross-type comparison was unimplemented** — real
+   PostgreSQL's `pg_aggregate.aggfnoid = pg_proc.oid` (dumpAgg's literal
+   join predicate) relies on `regproc` and `oid` sharing an operator family;
+   goopg's analyzer rejected it outright (`42804 operator = has incompatible
+   operand types "regproc" and "oid"`). This wasn't specific to aggregates
+   either — any future regproc↔oid join (e.g. a hypothetical
+   `pg_conversion.conproc = pg_proc.oid`) would have hit the same wall.
+
+Both are now general-purpose fixes, not aggregate-specific workarounds.
+
+**A third, aggregate-specific rendering gap:** `pg_aggregate.aggtransfn` /
+`aggfinalfn` / `aggcombinefn` are typed `regproc`, and `dumpAgg` reads their
+*text* value directly (no `::regtype`-style cast) expecting the function
+*name* — but goopg has no generic OID→name resolution at plain-column-output
+time (only `::regproc`/`::regtype` *cast expressions* resolve names, and
+`::regproc` on an OID input is currently a passthrough, not `regprocout`).
+Followed the pre-existing `pg_conversion.conproc` precedent instead of
+building a general regproc-output resolver: the Virtual row stores the
+already-known **name text** directly (`aggFuncNameOrDash`, `"-"` for unset —
+matching `regprocout(InvalidOid)`), not a resolved-from-OID number. The
+`aggminvtransfn`/`aggmtransfn`/`aggmfinalfn`/`aggserialfn`/`aggdeserialfn`
+moving-aggregate columns (not modeled — goopg parses but discards
+MSFUNC/MINVFUNC/...) render `"-"` for the same reason.
+
+**A fourth gap, `text`-column NULL-vs-empty-string:** `agginitval`/
+`aggminitval` are `text`, the exact case `catalog.VirtualNull`'s doc comment
+already flags as needing the sentinel (a bare `""` is a legitimate non-NULL
+`text` value elsewhere). Missed on the first pass — the fixture briefly
+dumped a spurious `MINITCOND = ''` clause (real PG omits the whole
+`MINITCOND` clause when NULL) until `nullableAggText` routed through
+`catalog.VirtualNull` instead of a bare `""`.
+
+Verified against a real running server + real `pg_dump` 18.3, not just the
+byte-diff assertion: `SELECT newavg(a) FROM t` (a functioning runtime
+aggregate, not just dump text) returns the correct average. Tests: the new
+slice-405 fixture/assertion in `TestPort_PgDumpConnectionSetup`. Gates: `go
+build ./...` clean; `go vet` analyzer/catalog/executor/initdb/parser/testport
+clean; `internal/analyzer`+`internal/catalog`+`internal/executor`+
+`internal/initdb`+`internal/parser`+`internal/planner`+`internal/server`
+suites PASS; full `TestPort_PgDumpConnectionSetup` PASS; TPC-H spot-check
+Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+
+**Deferred** (ledger row appended):
+
+- `pronamespace` hardcoded to `public` (2200) — `catalog.UserAggregate` has
+  no `Schema` field, so a schema-qualified `CREATE AGGREGATE
+  otherschema.foo(...)` silently registers as if it were `public.foo`. Not
+  exercised by the upstream fixture (which this test always public-schema-adapts).
+- The 161 **built-in** BKI rows' `aggtransfn`/`aggfinalfn`/... still render
+  raw numeric OIDs (not names) when queried directly — irrelevant to
+  `pg_dump` (which never dumps pinned/built-in objects) but a real gap for
+  someone directly querying `pg_aggregate` and expecting PG-shaped
+  `regprocout` text for a built-in aggregate.
+- **Restart persistence**: `CREATE AGGREGATE` is not WAL-logged.
+  `syncAggregateToCatalogHeap` writes a real heap row (useful for a PG18
+  standby reading raw bytes), but goopg's own `catalog.userAggregates`
+  in-memory registry — which both `pg_proc`'s Virtual view and the aggregate's
+  actual runtime evaluation depend on — is not rehydrated from that heap row
+  on restart, so a user-defined aggregate is lost across a goopg restart
+  (same "CREATE X round-trip lands first, restart persistence follows
+  separately" split already used for TRANSFORM/CAST/CONVERSION/COLLATION).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

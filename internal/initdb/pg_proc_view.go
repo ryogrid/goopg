@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 )
 
 // typeNameToOIDStr maps a Go/SQL type name to its PostgreSQL OID string.
@@ -442,6 +443,49 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",  // protrftypes: NULL
 				"s", // proparallel: BKI_DEFAULT(s)
 				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
+			})
+		}
+		// Append user-defined aggregates (CREATE AGGREGATE) as prokind='a' pg_proc
+		// rows, so pg_dump's getAggregates() (`pg_proc p WHERE p.prokind = 'a'`)
+		// discovers them. The matching pg_aggregate row is a live heap write
+		// (syncAggregateToCatalogHeap, executor/operators_ddl.go) rather than a
+		// VirtualRows entry — pg_aggregate is heap-backed (161 BKI rows written at
+		// initdb), unlike pg_proc which is entirely virtual. DU-002 slice 405.
+		for _, agg := range cat.ListUserAggregates() {
+			argOIDs := make([]string, len(agg.ArgTypes))
+			for i, t := range agg.ArgTypes {
+				argOIDs[i] = typeNameToOIDStr(t)
+			}
+			// prorettype: PG's DefineAggregate uses the finalfunc's return type
+			// when one is given, else the state type (transtype).
+			rettype := agg.SType
+			if _, ft := executor.ResolveAggFuncOIDAndRetType(cat, agg.FinalFunc); ft != "" {
+				rettype = ft
+			}
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", agg.OID),
+				agg.Name,
+				"2200", // pronamespace: public (UserAggregate does not track schema yet)
+				"12",   // prolang: internal
+				typeNameToOIDStr(rettype),
+				strings.Join(argOIDs, " "),
+				fmt.Sprintf("%d", len(agg.ArgTypes)), // pronargs
+				"",                                   // proacl: NULL (default privileges)
+				"10",                                 // proowner: bootstrap superuser
+				"aggregate_dummy",                    // prosrc: PG's real aggregate stub name
+				"i",                                  // provolatile
+				"f",                                  // prosecdef
+				"f",                                  // proleakproof
+				"f",                                  // proisstrict: NULL handling lives in the transfn, not the wrapper
+				"a",                                  // prokind: aggregate
+				"f",                                  // proretset
+				"",                                   // probin: NULL
+				"",                                   // proconfig: NULL
+				"1",                                  // procost: internal-language default
+				"0",                                  // prorows
+				"",                                   // protrftypes: NULL
+				"u",                                  // proparallel: PG CREATE AGGREGATE default (unsafe)
+				"-",                                  // prosupport
 			})
 		}
 		return rows

@@ -1866,6 +1866,9 @@ type Catalog interface {
 	// RenameUserAggregate renames an existing user-defined aggregate.
 	// Returns false if the old name is not found.
 	RenameUserAggregate(oldName, newName string) bool
+	// ListUserAggregates returns every registered user-defined aggregate, for
+	// pg_proc/pg_aggregate introspection (pg_dump CREATE AGGREGATE round-trip).
+	ListUserAggregates() []*UserAggregate
 	// LookupCompositeTypeFields returns the ordered field list for a composite
 	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
 	// type has no field metadata. M0097-composite.
@@ -2503,15 +2506,17 @@ type CompositeType struct {
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
 // It is stored in InMemory.userAggregates and looked up by lower-case name.
 type UserAggregate struct {
-	Name        string   // lower-case aggregate name
-	ArgTypes    []string // base argument type names (may be empty for zero-arg like count(*))
-	SType       string   // state type name
-	SFunc       string   // state transition function name
-	FinalFunc   string   // final function name (may be empty)
-	CombineFunc string   // combine function name for parallel agg (may be empty)
-	InitCond    string   // initial condition string (may be empty)
-	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
-	Variadic    bool     // true when declared with VARIADIC input arg
+	OID             uint32   // pg_proc.oid / pg_aggregate.aggfnoid (assigned on first RegisterUserAggregate)
+	Name            string   // lower-case aggregate name
+	ArgTypes        []string // base argument type names (may be empty for zero-arg like count(*))
+	SType           string   // state type name
+	SFunc           string   // state transition function name
+	FinalFunc       string   // final function name (may be empty)
+	CombineFunc     string   // combine function name for parallel agg (may be empty)
+	InitCond        string   // initial condition string (may be empty)
+	FinalFuncModify string   // FINALFUNC_MODIFY: "", "read_only", "shareable", "read_write" (DU-002 slice 405)
+	SFuncStrict     bool     // true if sfunc is STRICT (skips NULL inputs)
+	Variadic        bool     // true when declared with VARIADIC input arg
 }
 
 // UserCollation records a collation created via CREATE COLLATION so that
@@ -2578,6 +2583,7 @@ const (
 	RelationRelationId  uint32 = 1259 // pg_class
 	IndexRelationId     uint32 = 2610 // pg_index
 	StatisticRelationId uint32 = 2619 // pg_statistic
+	AggregateRelationId uint32 = 2600 // pg_aggregate
 )
 
 // FirstUserOID is the first OID handed out for user-created tables.
@@ -2908,6 +2914,9 @@ func (c *InMemory) AllComments() []CommentRow {
 func (c *InMemory) RegisterUserAggregate(agg *UserAggregate) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if agg.OID == 0 {
+		agg.OID = c.allocOIDLocked()
+	}
 	c.userAggregates[strings.ToLower(agg.Name)] = agg
 }
 
@@ -2933,6 +2942,19 @@ func (c *InMemory) RenameUserAggregate(oldName, newName string) bool {
 	agg.Name = newName
 	c.userAggregates[strings.ToLower(newName)] = agg
 	return true
+}
+
+// ListUserAggregates returns every registered user-defined aggregate in
+// OID order (deterministic for pg_proc/pg_aggregate VirtualRows output).
+func (c *InMemory) ListUserAggregates() []*UserAggregate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*UserAggregate, 0, len(c.userAggregates))
+	for _, agg := range c.userAggregates {
+		out = append(out, agg)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
 }
 
 // SetDBOID overrides the database OID used for RelFileNode generation.
@@ -10624,6 +10646,24 @@ var builtinProcsByName = map[string]BuiltinProc{
 		RetType:  "interval",
 		ArgTypes: []string{"timestamptz"},
 		Volatile: "s",
+	},
+	// int4_avg_accum/int8_avg are the state-transition/final functions a
+	// CREATE AGGREGATE fixture references directly by name (e.g. DU-002
+	// slice 405's "newavg" mirrors PG's own avg(int4) plumbing:
+	// SFUNC=int4_avg_accum, FINALFUNC=int8_avg). Curated so the aggregate's
+	// pg_proc/pg_aggregate rows can resolve SFUNC/FINALFUNC to a real OID
+	// (mirroring pg_cast.castfunc/pg_conversion.conproc's FuncOID pattern).
+	"int4_avg_accum": {
+		OID: 1963, Name: "int4_avg_accum", Namespace: 11,
+		RetType:  "int8[]",
+		ArgTypes: []string{"int8[]", "int4"},
+		Volatile: "i",
+	},
+	"int8_avg": {
+		OID: 1964, Name: "int8_avg", Namespace: 11,
+		RetType:  "numeric",
+		ArgTypes: []string{"int8[]"},
+		Volatile: "i",
 	},
 }
 

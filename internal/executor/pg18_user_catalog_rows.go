@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // pgClassColumnsPG18 mirrors initdb.pgClassColDefs — the canonical PG18
@@ -1887,5 +1888,134 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NullDatum,                                      // typdefaultbin (NULL)
 		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// pgAggregateColumnsPG18 mirrors internal/initdb's pgAggregateColDefs — the
+// canonical PG18 pg_aggregate row layout (22 columns, matching
+// FormData_pg_aggregate in postgres/src/include/catalog/pg_aggregate.h).
+// Duplicated here (executor cannot import internal/initdb — import cycle,
+// see pgTypeColumnsPG18 above) so CREATE AGGREGATE can write a live heap row.
+// DU-002 slice 405.
+func pgAggregateColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "aggfnoid", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggkind", Type: catalog.Type{Name: "char"}},
+		{Name: "aggnumdirectargs", Type: catalog.Type{Name: "int2"}},
+		{Name: "aggtransfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggfinalfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggcombinefn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggserialfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggdeserialfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggmtransfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggminvtransfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggmfinalfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggfinalextra", Type: catalog.Type{Name: "bool"}},
+		{Name: "aggmfinalextra", Type: catalog.Type{Name: "bool"}},
+		{Name: "aggfinalmodify", Type: catalog.Type{Name: "char"}},
+		{Name: "aggmfinalmodify", Type: catalog.Type{Name: "char"}},
+		{Name: "aggsortop", Type: catalog.Type{Name: "oid"}},
+		{Name: "aggtranstype", Type: catalog.Type{Name: "oid"}},
+		{Name: "aggtransspace", Type: catalog.Type{Name: "int4"}},
+		{Name: "aggmtranstype", Type: catalog.Type{Name: "oid"}},
+		{Name: "aggmtransspace", Type: catalog.Type{Name: "int4"}},
+		{Name: "agginitval", Type: catalog.Type{Name: "text"}},
+		{Name: "aggminitval", Type: catalog.Type{Name: "text"}},
+	}
+}
+
+// aggregateTypeOID resolves a CREATE AGGREGATE BASETYPE/STYPE name to a
+// pg_type OID, handling the underscore-prefixed internal array spelling
+// (`_int8`) as well as the SQL `int8[]` spelling — both are accepted by the
+// grammar (see parseAggregateOptions). Falls back to catalog.TypeNameToOID's
+// scalar table for a plain type name. DU-002 slice 405.
+func AggregateTypeOID(name string) uint32 {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if base, ok := strings.CutPrefix(name, "_"); ok {
+		if arr := catalog.ArrayOIDForBase(catalog.TypeNameToOID(base)); arr != 0 {
+			return arr
+		}
+	}
+	if base, ok := strings.CutSuffix(name, "[]"); ok {
+		if arr := catalog.ArrayOIDForBase(catalog.TypeNameToOID(base)); arr != 0 {
+			return arr
+		}
+	}
+	return catalog.TypeNameToOID(name)
+}
+
+// resolveAggFuncOIDAndRetType resolves a CREATE AGGREGATE function-name
+// reference (SFUNC/FINALFUNC/COMBINEFUNC) to a pg_proc OID and its declared
+// return type name: goopg's user-defined routine registry first, then the
+// curated builtin table (mirrors pg_cast.castfunc / pg_conversion.conproc's
+// FuncOID resolution, catalog.LookupBuiltinProc). Returns (0, "") when
+// unresolved -- the caller stores InvalidOid, which regprocout renders "-".
+// DU-002 slice 405.
+func ResolveAggFuncOIDAndRetType(cat catalog.Catalog, name string) (uint32, string) {
+	if name == "" {
+		return 0, ""
+	}
+	if rs := cat.Routines(); rs != nil {
+		if candidates := rs.LookupByName(parser.ObjectName{Name: name}); len(candidates) > 0 {
+			return candidates[0].OID, candidates[0].ReturnType.Name
+		}
+	}
+	if bp, ok := catalog.LookupBuiltinProc(name); ok {
+		return bp.OID, bp.RetType
+	}
+	return 0, ""
+}
+
+// aggFinalModifyChar maps a parsed FINALFUNC_MODIFY token to the
+// pg_aggregate.aggfinalmodify char PostgreSQL stores (AGGMODIFY_* in
+// postgres/src/include/catalog/pg_aggregate.h). Unspecified defaults to
+// AGGMODIFY_READ_ONLY ('r'), PG's default for a normal (non-ordered-set)
+// aggregate (DefineAggregate's defaultfinalmodify).
+func AggFinalModifyChar(s string) string {
+	switch strings.ToLower(s) {
+	case "read_write":
+		return "w"
+	case "shareable":
+		return "s"
+	default:
+		return "r"
+	}
+}
+
+// buildUserPGAggregateRow builds the pg_aggregate heap row for a CREATE
+// AGGREGATE. aggkind is always 'n' (normal) and the moving-aggregate
+// (MSFUNC/MINVFUNC/...) columns are always zero/default -- goopg parses but
+// discards those clauses (parseAggregateOptions). DU-002 slice 405.
+func buildUserPGAggregateRow(ctx *Context, agg *catalog.UserAggregate) Row {
+	transFnOID, _ := ResolveAggFuncOIDAndRetType(ctx.Catalog, agg.SFunc)
+	finalFnOID, _ := ResolveAggFuncOIDAndRetType(ctx.Catalog, agg.FinalFunc)
+	combineFnOID, _ := ResolveAggFuncOIDAndRetType(ctx.Catalog, agg.CombineFunc)
+	initCond := NullDatum
+	if agg.InitCond != "" {
+		initCond = NewStringDatum(agg.InitCond)
+	}
+	return Row{
+		NewIntDatum(int64(agg.OID)),      // aggfnoid
+		NewStringDatum("n"),              // aggkind
+		NewIntDatum(0),                   // aggnumdirectargs
+		NewIntDatum(int64(transFnOID)),   // aggtransfn
+		NewIntDatum(int64(finalFnOID)),   // aggfinalfn
+		NewIntDatum(int64(combineFnOID)), // aggcombinefn
+		NewIntDatum(0),                   // aggserialfn
+		NewIntDatum(0),                   // aggdeserialfn
+		NewIntDatum(0),                   // aggmtransfn
+		NewIntDatum(0),                   // aggminvtransfn
+		NewIntDatum(0),                   // aggmfinalfn
+		NewBoolDatum(false),              // aggfinalextra
+		NewBoolDatum(false),              // aggmfinalextra
+		NewStringDatum(AggFinalModifyChar(agg.FinalFuncModify)), // aggfinalmodify
+		NewStringDatum("r"), // aggmfinalmodify (moving-aggregate not modeled)
+		NewIntDatum(0),      // aggsortop
+		NewIntDatum(int64(AggregateTypeOID(agg.SType))), // aggtranstype
+		NewIntDatum(0), // aggtransspace
+		NewIntDatum(0), // aggmtranstype
+		NewIntDatum(0), // aggmtransspace
+		initCond,       // agginitval
+		NullDatum,      // aggminitval
 	}
 }
