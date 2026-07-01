@@ -14755,6 +14755,17 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 	var keyTypeOID uint32
 	if s.StorageType != "" {
 		keyTypeOID = catalog.TypeNameToOID(s.StorageType)
+		// A STORAGE clause matching the class's own FOR TYPE is redundant —
+		// PG resets it to InvalidOid (opclasscmds.c DefineOpClass:
+		// "if (storageoid == typeoid) storageoid = InvalidOid"), which
+		// dumpOpclass then renders as "-" and omits the STORAGE clause
+		// entirely on re-dump. Found via a live-PG-18.3 diff against the
+		// upstream `op_class` fixture (`AS STORAGE bigint, OPERATOR 1 ...`
+		// FOR TYPE bigint — the STORAGE line does not reappear in pg_dump's
+		// own output). M0119-0004 (DU-002) slice 413.
+		if keyTypeOID == inTypeOID {
+			keyTypeOID = 0
+		}
 	}
 	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
 	o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID)
@@ -14799,11 +14810,16 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 // mirroring assignOperTypes, opclasscmds.c). DU-002 (M0119-0004) slice 411.
 func resolveOpClassOperator(im *catalog.InMemory, schema string, m parser.OpClassMember) (operOID, leftOID, rightOID uint32, ok bool) {
 	if m.LeftType != "" {
-		op, found := im.LookupUserOperator(schema, m.Name, m.LeftType, m.RightType)
-		if !found {
-			return 0, 0, 0, false
+		if op, found := im.LookupUserOperator(schema, m.Name, m.LeftType, m.RightType); found {
+			return op.OID, catalog.TypeNameToOID(m.LeftType), catalog.TypeNameToOID(m.RightType), true
 		}
-		return op.OID, catalog.TypeNameToOID(m.LeftType), catalog.TypeNameToOID(m.RightType), true
+		// Not a user-defined operator — try the small hand-curated builtin
+		// set (goopg has no full builtin-operator catalog — see the
+		// ledger). M0119-0004 (DU-002) slice 413.
+		if bop, found := catalog.LookupBuiltinOperator(m.Name, m.LeftType, m.RightType); found {
+			return bop.OID, catalog.TypeNameToOID(m.LeftType), catalog.TypeNameToOID(m.RightType), true
+		}
+		return 0, 0, 0, false
 	}
 	op, found := im.LookupUserOperatorByName(m.Name)
 	if !found {

@@ -579,6 +579,8 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 							}
 						} else if op := im.LookupUserOperatorByOID(uint32(oid)); op != nil {
 							return NewStringDatum(op.Name), nil
+						} else if bop, found := catalog.LookupBuiltinOperatorByOID(uint32(oid)); found {
+							return NewStringDatum(bop.Name), nil
 						}
 					}
 				}

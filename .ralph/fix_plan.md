@@ -4291,6 +4291,64 @@ documentation-only and is exempt from the design-doc requirement.)
       row appended, unchanged): `FOR ORDER BY` sort-family resolution; the
       builtin-operator catalog, now the single largest remaining blocker
       for a realistic upstream `op_family`/`op_class` fixture.
+      **2026-07-01 (loop #39, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #39"): a curated builtin-operator catalog LANDED — DU-002 slice
+      413, closes the loop #37/#38 "builtin-operator catalog" finding for
+      the exact upstream `op_class` fixture.** New `catalog.BuiltinOperator`
+      + `builtinOperatorsByKey`/`builtinOperatorsByOID` +
+      `LookupBuiltinOperator`/`LookupBuiltinOperatorByOID`
+      (`internal/catalog/catalog.go`, mirroring `builtinProcsByName`'s
+      hand-curated-not-full-port pattern — the full 799-row
+      `pg_operator.dat` data already exists via
+      `internal/initdb/pg_operator_seed_data.go`/`cmd/gen-pg-operator-data`
+      for the PG18-standby heap-fidelity bootstrap, but that package can't
+      be imported from `internal/catalog`/`internal/executor`, mirroring
+      the pre-existing `pg_proc` heap-bootstrap-vs-leaf-name-index split).
+      Curated: the 5 int8 btree comparison strategies (`pg_operator.dat`
+      oids 410/412/413/414/415) plus `btint8cmp` (oid 842, added to
+      `builtinProcsByName`) — exactly what the upstream `op_class` fixture's
+      `OPERATOR`/`FUNCTION 1` entries need. `resolveOpClassOperator`'s typed
+      branch (`internal/executor/operators_ddl.go`) and
+      `catalog.RegoperatorNameAndSchema` + the bare-name `regoper` CastExpr
+      (`internal/executor/expr.go`) gain a builtin fallback, mirroring
+      `resolveOpClassFunction`'s pre-existing `LookupBuiltinProc` fallback.
+      **A second, independent bug found via the live-PG-18.3 diff (not part
+      of the builtin-catalog feature, but directly exposed while verifying
+      it):** `execCreateOpClass`'s `keyTypeOID` never reset to `InvalidOid`
+      when `STORAGE` names the same type as the class's own `FOR TYPE` —
+      real PG does (`opclasscmds.c` `DefineOpClass`: `if (storageoid ==
+      typeoid) storageoid = InvalidOid`) — so a members-bearing class
+      declaring a redundant `STORAGE` clause (like `op_class`'s own
+      `AS STORAGE bigint, OPERATOR 1 ...`) spuriously dumped a leading
+      `STORAGE bigint ,` line real PG's `dumpOpclass` never prints. Fixed;
+      `op_class_empty` (no members) is unaffected on observable output
+      because pg_dump's own client-side "dummy STORAGE clause" fallback
+      re-adds the same text through a different branch when the AS-list
+      would otherwise render empty. `TestCreateOperatorClassPopulatesOpclassRow`'s
+      stale `opckeytype` assertion (previously pinning the un-reset value)
+      corrected to `0`, with a comment explaining why. Verified against a
+      freshly-built, live PG 18.3 instance: the exact upstream
+      `op_class`/`op_class_empty` fixture pair (schema renamed to `public`)
+      dumps byte-identical on both engines, including the upstream test's
+      own documented omission of `btint8sortsupport`/`btequalimage`
+      (deliberately not curated, so `resolveOpClassFunction` silently drops
+      them — same mechanism as every other unresolvable builtin). Tests:
+      `TestLookupBuiltinOperator`/`TestLookupBuiltinOperatorByOID`/
+      `TestRegoperatorNameAndSchemaBuiltinFallback`
+      (`internal/catalog/builtin_operator_test.go`);
+      `TestCreateOperatorClassMembersResolveBuiltinOperators` (executor,
+      `create_operator_test.go`, ports the upstream fixture verbatim).
+      Gates: `go build ./...`/`go vet` clean;
+      `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/server`+`internal/planner` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; live PG 18.3 diff above; TPC-H
+      spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+      Deferred (ledger row appended, narrowed in scope): the
+      builtin-operator catalog is still only a 5-row curated slice, not a
+      full `pg_operator.dat` port — the next fixture referencing a
+      different builtin operator needs its own curated addition until a
+      generated leaf-package index exists; `FOR ORDER BY` sort-family
+      resolution remains open and unexercised by any fixture in scope.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

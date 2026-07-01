@@ -463,8 +463,16 @@ func TestCreateOperatorClassPopulatesOpclassRow(t *testing.T) {
 	if row[7] != "f" { // opcdefault: DEFAULT not specified
 		t.Errorf("opcdefault = %q, want f", row[7])
 	}
-	if row[8] != "20" { // opckeytype: STORAGE bigint -> bigint (int8) OID
-		t.Errorf("opckeytype = %q, want 20 (bigint)", row[8])
+	// opckeytype: a STORAGE clause matching the class's own FOR TYPE is
+	// redundant and PG resets it to InvalidOid (opclasscmds.c DefineOpClass
+	// "if (storageoid == typeoid) storageoid = InvalidOid") — confirmed via
+	// a live-PG-18.3 diff (M0119-0004 (DU-002) slice 413): pg_dump's own
+	// "dummy STORAGE clause" client-side fallback (pg_dump.c, fired when
+	// the AS-list would otherwise be empty) re-adds "STORAGE bigint;" to
+	// the regenerated DDL text even though the catalog row itself is 0, so
+	// this doesn't change op_class_empty's dump output.
+	if row[8] != "0" {
+		t.Errorf("opckeytype = %q, want 0 (InvalidOid: STORAGE bigint == FOR TYPE bigint)", row[8])
 	}
 }
 
@@ -653,6 +661,113 @@ func TestCreateOperatorClassMemberUnresolvableBuiltinDropped(t *testing.T) {
 	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
 		t.Fatalf("pg_amop VirtualRows = %v, want empty (unresolvable builtin operator)", rows)
 	}
+}
+
+// TestCreateOperatorClassMembersResolveBuiltinOperators ports the upstream
+// pg_dump TAP fixture (postgres/src/bin/pg_dump/t/002_pg_dump.pl
+// 'CREATE OPERATOR CLASS dump_test.op_class') verbatim (schema renamed to
+// public): a bigint btree opclass whose AS-list OPERATOR entries name real
+// built-in operators (<, <=, =, >=, > over int8), not user-defined ones.
+// This is the case TestCreateOperatorClassMemberUnresolvableBuiltinDropped
+// documents as out of scope for slice 411 — now resolvable via the curated
+// builtin-operator catalog (catalog.LookupBuiltinOperator). FUNCTION 2
+// btint8sortsupport(internal) / FUNCTION 4 btequalimage(oid) are
+// deliberately NOT curated in builtinProcsByName, so those two members stay
+// silently dropped — matching real PG's own dump output for this exact
+// fixture, which likewise omits them ("it's correct that btint8sortsupport
+// and btequalimage are NOT included here (they're optional support
+// functions)", pg_dump.c t/002_pg_dump.pl). M0119-0004 (DU-002) slice 413.
+func TestCreateOperatorClassMembersResolveBuiltinOperators(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR CLASS public.op_class FOR TYPE bigint USING btree FAMILY public.op_family AS
+		STORAGE bigint,
+		OPERATOR 1 <(bigint,bigint),
+		OPERATOR 2 <=(bigint,bigint),
+		OPERATOR 3 =(bigint,bigint),
+		OPERATOR 4 >=(bigint,bigint),
+		OPERATOR 5 >(bigint,bigint),
+		FUNCTION 1 btint8cmp(bigint,bigint),
+		FUNCTION 2 btint8sortsupport(internal),
+		FUNCTION 4 btequalimage(oid)`); err != nil {
+		t.Fatalf("CREATE OPERATOR CLASS: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	famRows := pgOpfamilyVirtualRows(t, im)
+	if len(famRows) != 1 {
+		t.Fatalf("pg_opfamily VirtualRows = %d rows, want 1", len(famRows))
+	}
+	famOID := famRows[0][0]
+
+	amopRows := pgAmopVirtualRows(t, im)
+	if len(amopRows) != 5 {
+		t.Fatalf("pg_amop VirtualRows = %d rows, want 5 (< <= = >= >): %v", len(amopRows), amopRows)
+	}
+	wantByStrategy := map[string]struct{ oid, name string }{
+		"1": {"412", "<"}, "2": {"414", "<="}, "3": {"410", "="},
+		"4": {"415", ">="}, "5": {"413", ">"},
+	}
+	for _, row := range amopRows {
+		// oid, amopfamily, amoplefttype, amoprighttype, amopstrategy, amoppurpose, amopopr, amopmethod, amopsortfamily
+		want, ok := wantByStrategy[row[4]]
+		if !ok {
+			t.Fatalf("unexpected amopstrategy %q in row %v", row[4], row)
+		}
+		if row[1] != famOID {
+			t.Errorf("amopfamily = %q, want %q", row[1], famOID)
+		}
+		if row[2] != "20" || row[3] != "20" { // int8 (bigint) OID
+			t.Errorf("amoplefttype/amoprighttype = %q/%q, want 20/20", row[2], row[3])
+		}
+		if row[6] != want.oid {
+			t.Errorf("amopopr for strategy %s = %q, want %q (builtin %q)", row[4], row[6], want.oid, want.name)
+		}
+		if row[7] != "403" { // btree
+			t.Errorf("amopmethod = %q, want 403 (btree)", row[7])
+		}
+		if bop, found := catalog.LookupBuiltinOperatorByOID(mustParseUint(t, row[6])); !found || bop.Name != want.name {
+			t.Errorf("LookupBuiltinOperatorByOID(%s) = %+v/%v, want name %q", row[6], bop, found, want.name)
+		}
+	}
+
+	// Only FUNCTION 1 (btint8cmp) resolves — FUNCTION 2/4 name builtins not
+	// in the curated set, so they're silently dropped (matching real PG's
+	// own dump output for this exact fixture, see doc comment above).
+	amprocRows := pgAmprocVirtualRows(t, im)
+	if len(amprocRows) != 1 {
+		t.Fatalf("pg_amproc VirtualRows = %d rows, want 1 (FUNCTION 1 only): %v", len(amprocRows), amprocRows)
+	}
+	amproc := amprocRows[0]
+	if amproc[4] != "1" {
+		t.Errorf("amprocnum = %q, want 1", amproc[4])
+	}
+	if amproc[5] != "842" { // btint8cmp's curated builtin OID
+		t.Errorf("amproc = %q, want 842 (btint8cmp)", amproc[5])
+	}
+
+	// regoperator rendering (dumpOpclass's amopopr::pg_catalog.regoperator
+	// cast): a builtin operator resolves via RegoperatorNameAndSchema's new
+	// builtin fallback and is schema "pg_catalog" (never qualified in
+	// output, since pg_catalog is always implicitly searched — mirrors the
+	// bare "btint4cmp(integer,integer)" case in
+	// TestRegprocedureRegoperatorSchemaQualification).
+	schema, sig, ok := im.RegoperatorNameAndSchema(412)
+	if !ok || schema != "pg_catalog" || sig != "<(bigint,bigint)" {
+		t.Errorf("RegoperatorNameAndSchema(412) = (%q,%q,%v), want (pg_catalog,\"<(bigint,bigint)\",true)", schema, sig, ok)
+	}
+}
+
+func mustParseUint(t *testing.T, s string) uint32 {
+	t.Helper()
+	n, err := strconv.ParseUint(s, 10, 32)
+	if err != nil {
+		t.Fatalf("ParseUint(%q): %v", s, err)
+	}
+	return uint32(n)
 }
 
 // TestDropOperatorClassRemovesMembers verifies DROP OPERATOR CLASS cascades

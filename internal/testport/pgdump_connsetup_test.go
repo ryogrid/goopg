@@ -8185,8 +8185,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// pg_dump 18.3 (matches upstream's own `op_class_empty` 002_pg_dump.pl
 		// fixture verbatim, modulo the schema name). dumpOpclass renders `FOR
 		// TYPE bigint USING btree FAMILY public.op_family AS` then the STORAGE
-		// clause (opckeytype != InvalidOid); no OPERATOR/FUNCTION lines follow
-		// since this class declares no members.
+		// clause — opckeytype is actually InvalidOid here (a STORAGE clause
+		// matching the class's own FOR TYPE is a no-op, reset server-side per
+		// opclasscmds.c DefineOpClass — M0119-0004 slice 413), so this line
+		// comes from pg_dump's own client-side "dummy STORAGE clause" fallback
+		// (fired whenever the AS-list would otherwise render empty, since
+		// `... AS ;` isn't valid SQL), not the keytype branch; no OPERATOR/
+		// FUNCTION lines follow since this class declares no members.
 		if want := "CREATE OPERATOR CLASS public.op_class_empty\n" +
 			"    FOR TYPE bigint USING btree FAMILY public.op_family AS\n" +
 			"    STORAGE bigint;"; !strings.Contains(res.Stdout, want) {

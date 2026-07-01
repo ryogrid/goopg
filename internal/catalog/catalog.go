@@ -11645,6 +11645,17 @@ var builtinProcsByName = map[string]BuiltinProc{
 		ArgTypes: []string{"internal", "oid", "internal", "int2", "internal"},
 		Volatile: "s",
 	},
+	// btint8cmp is int8's real btree "support function 1" (three-way
+	// less-equal-greater compare, pg_proc.dat oid 842), the FUNCTION 1
+	// member of the upstream `op_class` pg_dump fixture (bigint comparison
+	// opclass) — mirrors btint4cmp's curation rationale above. M0119-0004
+	// (DU-002) slice 413.
+	"btint8cmp": {
+		OID: 842, Name: "btint8cmp", Namespace: 11,
+		RetType:  "int4",
+		ArgTypes: []string{"int8", "int8"},
+		Volatile: "i",
+	},
 }
 
 // LookupBuiltinProc resolves a built-in pg_proc.dat function by name (case-
@@ -11653,6 +11664,80 @@ var builtinProcsByName = map[string]BuiltinProc{
 func LookupBuiltinProc(name string) (BuiltinProc, bool) {
 	p, ok := builtinProcsByName[strings.ToLower(name)]
 	return p, ok
+}
+
+// BuiltinOperator holds a hand-curated built-in pg_operator.dat row — the
+// operator analogue of BuiltinProc. Only the handful of built-in operators
+// goopg's DU-002 pg_dump test fixtures actually reference are curated here
+// (not a full port of pg_operator.dat's ~799 rows — see the ledger); extend
+// as new CREATE OPERATOR CLASS/FAMILY fixtures reference more. OID/lefttype/
+// righttype/oprcode are taken from postgres/src/include/catalog/pg_operator.dat.
+// M0119-0004 (DU-002) slice 413.
+type BuiltinOperator struct {
+	OID       uint32
+	Name      string
+	Namespace uint32 // oprnamespace; every entry so far is pg_catalog (11)
+	Kind      byte   // oprkind: 'b' binary, 'l' left-unary (prefix); every entry so far is 'b'
+	LeftType  string // catalog type name (matches Type.Name / TypeNameToOID)
+	RightType string
+}
+
+// builtinOperatorKey builds the (name, lefttype OID, righttype OID) lookup
+// key for builtinOperatorsByKey. Keying on resolved type OIDs (not the raw
+// type-name spelling) makes lookup synonym-proof — a CREATE OPERATOR CLASS
+// AS-list entry may spell the same type differently than pg_operator.dat
+// does (e.g. "bigint" vs "int8").
+func builtinOperatorKey(name string, leftOID, rightOID uint32) string {
+	return name + "/" + strconv.FormatUint(uint64(leftOID), 10) + "/" + strconv.FormatUint(uint64(rightOID), 10)
+}
+
+// builtinOperatorsByKey holds the curated built-in operator set (see
+// BuiltinOperator's doc comment). Currently just the 5 int8 btree comparison
+// strategies the upstream `op_class` pg_dump fixture's OPERATOR entries need
+// (pg_operator.dat oids 410/412/413/414/415).
+var builtinOperatorsByKey = map[string]BuiltinOperator{
+	builtinOperatorKey("=", OIDInt8, OIDInt8):  {OID: 410, Name: "=", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey("<", OIDInt8, OIDInt8):  {OID: 412, Name: "<", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey(">", OIDInt8, OIDInt8):  {OID: 413, Name: ">", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey("<=", OIDInt8, OIDInt8): {OID: 414, Name: "<=", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey(">=", OIDInt8, OIDInt8): {OID: 415, Name: ">=", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+}
+
+// builtinOperatorsByOID is the OID-keyed reverse index of
+// builtinOperatorsByKey, built once at init for regoper/regoperator OID→name
+// rendering (RegoperatorNameAndSchema, and the bare-name regoper CastExpr in
+// internal/executor/expr.go).
+var builtinOperatorsByOID = func() map[uint32]BuiltinOperator {
+	out := make(map[uint32]BuiltinOperator, len(builtinOperatorsByKey))
+	for _, op := range builtinOperatorsByKey {
+		out[op.OID] = op
+	}
+	return out
+}()
+
+// LookupBuiltinOperator resolves a built-in pg_operator.dat row by name plus
+// explicit (lefttype, righttype) — the shape a CREATE OPERATOR CLASS AS-list
+// OPERATOR entry with explicit operand types provides (resolveOpClassOperator,
+// internal/executor/operators_ddl.go). leftType/rightType are resolved via
+// TypeNameToOID before keying, so a caller's raw type-name spelling (e.g.
+// "bigint") matches an entry keyed on pg_operator.dat's own spelling ("int8").
+func LookupBuiltinOperator(name, leftType, rightType string) (BuiltinOperator, bool) {
+	var leftOID, rightOID uint32
+	if leftType != "" {
+		leftOID = TypeNameToOID(leftType)
+	}
+	if rightType != "" {
+		rightOID = TypeNameToOID(rightType)
+	}
+	op, ok := builtinOperatorsByKey[builtinOperatorKey(name, leftOID, rightOID)]
+	return op, ok
+}
+
+// LookupBuiltinOperatorByOID resolves a built-in operator OID to its curated
+// row — the OID→name direction regoper/regoperator rendering needs.
+func LookupBuiltinOperatorByOID(oid uint32) (BuiltinOperator, bool) {
+	op, ok := builtinOperatorsByOID[oid]
+	return op, ok
 }
 
 // BuiltinProcs returns all hand-curated built-in pg_proc rows in OID order,
@@ -11799,6 +11884,19 @@ func (c *InMemory) RegoperatorName(oid uint32) (string, bool) {
 func (c *InMemory) RegoperatorNameAndSchema(oid uint32) (schema, sig string, ok bool) {
 	op := c.LookupUserOperatorByOID(oid)
 	if op == nil {
+		// Not a user-defined operator — try the small hand-curated builtin
+		// set (LookupBuiltinOperatorByOID) before giving up. M0119-0004
+		// (DU-002) slice 413.
+		if bop, found := LookupBuiltinOperatorByOID(oid); found {
+			left, right := "NONE", "NONE"
+			if bop.LeftType != "" {
+				left = pgArgTypeDisplayAlias(bop.LeftType)
+			}
+			if bop.RightType != "" {
+				right = pgArgTypeDisplayAlias(bop.RightType)
+			}
+			return "pg_catalog", bop.Name + "(" + left + "," + right + ")", true
+		}
 		return "", "", false
 	}
 	left, right := "NONE", "NONE"
