@@ -1,69 +1,57 @@
 (idle — nothing in flight)
 
-Loop #43 landed and committed clean:
-M0119-0004 DU-002 slice 416 — `ALTER OPERATOR FAMILY name USING method DROP
-entry [, entry ...]`. Closes the loop #41 ledger row's resume point (1),
-direct sibling of loop #41's ADD form.
+Loop #44 landed and committed clean (doc-only, no design doc needed —
+mirrors the M0119-0001/0119-0003/0119-0008 triage-closure pattern):
 
-What landed:
-- Parser: `AlterOpFamilyDropStmt` (internal/parser/ast.go) +
-  `parseAlterOpFamilyDropTail` (internal/parser/ddl.go), reached from
-  `parseAlterOpFamilyTail` when the tail keyword is DROP rather than ADD.
-  Models PG's narrower `opclass_drop` grammar: mandatory strategy/support
-  number + mandatory parenthesized type list, no operator/function name
-  (single-type shorthand defaults righttype=lefttype, matching
-  processTypesSpec). Reuses OpClassMember.
-- Executor: `execAlterOpFamilyDrop` (internal/executor/operators_ddl.go)
-  resolves the family (42704 if missing) then removes each matching
-  pg_amop/pg_amproc row via new `catalog.RemoveAmOpMember`/
-  `RemoveAmProcMember` (internal/catalog/catalog.go), keyed
-  (familyOID, leftType, rightType, strategy-or-procnum) — mirrors PG's
-  GetSysCacheOid4(AMOPSTRATEGY/AMPROCNUM) lookup. Missing member -> 42704.
-- No new pg_depend plumbing needed: dependVirtualRows (loop #41) already
-  recomputes pg_amop/pg_amproc dependency rows live from
-  c.amOpMembers/c.amProcMembers, so removing a catalog row auto-removes its
-  dependency rows.
-- Wired into server/dispatch.go (command tag) and internal/planner/planner.go
-  (DDL passthrough case list) alongside AlterOpFamilyAddStmt.
-- Verified against a freshly-built, live PG 18.3 instance
-  (postgres/local_install, started manually on /tmp/ruletest_pgdata port
-  5540): DROP removes exactly the targeted rows; repeat-DROP raises
-  identically-shaped 42704; single-type shorthand matches the (t,t) row.
-  Stopped the server after verification.
-- Tests: TestParseAlterOperatorFamilyDrop/…DropRequiresParens (parser,
-  replacing the stale loop #41 …DropStillNoop no-op pin);
-  TestAlterOperatorFamilyDropRemovesLooseMember/…DropMissingMemberErrors/
-  …DropUnknownFamilyErrors (executor).
-- Gates all green: build/vet clean; parser+executor+catalog+planner+server
-  suites PASS; TestPort_PgDumpConnectionSetup PASS (DROP has no pg_dump
-  fixture of its own — pg_dump never emits this form); TPC-H spotcheck
-  Q12=2/Q13=33 PASS; gofmt drift confirmed pre-existing via git stash
-  (same 3 files as every prior loop in this chain).
-- Design doc updated (docs/design/0119-0004-create-operator-roundtrip.md,
-  "Loop #43" section) + README.md index entry appended (inside the
-  giant accumulating 0119-0004bk row) + deferral ledger row appended.
+Closed **M0118-0004** (deadlock detection) in fix_plan.md — the entire
+M0118 milestone (0001-0009) is now `[x]`. All specs named in 0118-0004's
+own title were already passing (deadlock-{hard,simple,soft,soft-2},
+multixact-no-deadlock, tuplelock-upgrade-no-deadlock); deadlock-parallel
+stays infeasible (no parallel-query lock-group abstraction) and is
+already tracked with zero actionable backlog under M0119-0008. The one
+loose end left dangling in 0118-0004's own prose — "UPDATE/DELETE
+conflict-wait on a conflicting lock-only locker" (goopg's producer only
+*preserves* non-conflicting lockers into a MultiXactId; it never makes
+the writer *wait* on a still-active *conflicting* one, unlike PG's
+heap_update/heap_delete MultiXactIdWait) — was promoted to its own open
+deferral-ledger row (**M0119-0009**, appended, status `-`) instead of
+staying buried under a now-closed checkbox. No isolation spec in scope
+currently fails because of that gap (pre-existing, no regression), so it
+is backlog, not a blocker.
 
-Deferred (ledgered, NOT fixed — no exercising fixture): dropping a
-CLASS-attributed (hard, ClassOID != 0) member removes the row
-unconditionally instead of mirroring PG's performDeletion INTERNAL-
-dependency cascade/restrict onto the owning opclass. Low priority — pg_dump
-never issues this DDL form at all.
+Updated the "Current Priority" banner: M0117 → M0118 (now DONE) → next up
+is **M0110** (M0119-0004/0005/0006/0007 are its active spinoff form).
 
-Next candidates (backlog, per the deferral ledger's open rows):
-(1) Per-AM amadjustmembers dependency-strength policy (gist/spgist soft
-deps for CLASS-attributed members) — needed for any real GiST/SP-GiST
-opclass to round-trip through pg_dump; unblocks the op_class_custom
-ordering fixture (range-type subtype_opclass binding). Larger/dedicated
-scope, flagged repeatedly across loops #40/#41.
-(2) Extend the builtin-operator catalog incrementally as new fixtures need
-different builtin operators (still just the loop #39 6-row int8 slice).
-(3) CREATE OPERATOR FAMILY's simple-query command tag renders bare CREATE
-instead of CREATE OPERATOR FAMILY (cosmetic, ledgered loop #41).
-(4) M0119-0005/0006/0007 (pg_waldump/pg_amcheck/pg_basebackup server
-tiers). (5) M0119-0002 (CLOG store swap Part B) — flagged highest blast
-radius, needs dedicated full-gate session.
+Gates run: `make ralph-state-guard` (auto-repaired a transient
+running/completed timestamp mismatch, then OK); pre-commit pgbench smoke
+hook PASS (TPC-B/-N/-S, 0 failed, all three workloads) — mandatory on
+every commit regardless of file type per Hard-won Rule #3. No code
+changed, so no unit/race/TPC-H spotcheck gates were applicable. Pushed to
+origin/align-data-structure-with-pg (68ea3934).
 
-Recommendation for next loop: (2) is the smallest/most mechanical filler if
-no fixture forces (1); (1) is the largest structural gap in this design-doc
-chain and deserves a dedicated session (thread an amoid-keyed policy table
-into registerOpClassMembers/dependVirtualRows).
+Next candidates (per M0110 being newly "up"; also see the still-open
+M0119-0004 backlog from loop #43's carry, which remains valid):
+(1) M0119-0004 DU-002: per-AM amadjustmembers dependency-strength policy
+(gist/spgist soft deps for CLASS-attributed opclass members) — largest
+structural gap in the create-operator-roundtrip design doc chain, needed
+for any real GiST/SP-GiST opclass to round-trip through pg_dump.
+(2) M0119-0004 DU-002: extend the builtin-operator catalog incrementally
+only when a new fixture needs a different builtin operator (still just
+the loop #39 6-row int8 slice) — smallest filler, but don't do it
+speculatively without a forcing fixture.
+(3) M0119-0009 (new, this loop): UPDATE/DELETE conflict-wait on a
+conflicting lock-only locker — needs a purpose-built isolation fixture
+(none exists upstream) plus the full row-lock/multixact/-race + pgbench
+gate suite; highest blast radius of the three, do in a dedicated session.
+(4) M0119-0002 (CLOG store swap Part B) — flagged repeatedly as highest
+blast radius in this codebase; needs its own dedicated full-gate session
+(-race mvcc+wal, xlog_replay, heterogeneous PG-standby E2E, fresh-server
+TPC-H Q12/Q13).
+(5) M0119-0005/0006/0007 (pg_waldump/pg_amcheck/pg_basebackup server
+tiers) — still open, lower priority per the Current Priority banner.
+
+Recommendation for next loop: pick up M0110's live form — continue
+M0119-0004 DU-002 slices (candidate 1 is the biggest structural gap;
+candidate 2 only if a concrete fixture forces it). If none of those look
+tractable in one loop, M0119-0009 is a well-scoped, independently
+resumable slice with its own ledger row and resume point.
