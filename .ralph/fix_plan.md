@@ -4549,6 +4549,31 @@ documentation-only and is exempt from the design-doc requirement.)
       column-level FDW options yet; real FDW-handler execution (reading from
       an actual remote source at query time) remains entirely out of scope
       — goopg's foreign-table support is compat/dump-only.
+      **2026-07-02 (loop #55, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #55", DU-002 slice 418): per-column `OPTIONS (...)` round-trip
+      LANDED — closes the loop #54 resume point.** `ColumnDef.FDWOptions`
+      (`internal/parser/ast.go`) is now captured by `parseColumnDef`'s
+      `OPTIONS (...)` case instead of being discarded, threaded through both
+      CREATE TABLE column-construction sites in `operators_ddl.go` onto a new
+      `catalog.Column.FDWOptions []string` (mirrors the pre-existing
+      `Options`/attoptions field). `buildUserPGAttributeRow`
+      (`internal/executor/pg18_user_catalog_rows.go`) renders it into the
+      attfdwoptions text-array literal (was hardcoded `NullDatum`). Verified
+      against real pg_dump 18.3 via the extended `TestPort_PgDumpConnectionSetup`
+      fixture — the pre-existing `goopg_ftable` column `c1 int OPTIONS
+      (column_name 'col1')` now makes pg_dump emit the trailing `ALTER FOREIGN
+      TABLE ONLY public.goopg_ftable ALTER COLUMN c1 OPTIONS (\n    column_name
+      'col1'\n);` statement (positively asserted). New tests
+      `TestParseColumnDefFDWOptions` + `TestUserPGAttributeFDWOptionsOverride`.
+      Gates: `go build`/`go vet` clean; `internal/parser`+`internal/catalog`+
+      `internal/executor` suites PASS (`-count=1`); `TestPort_PgDumpConnectionSetup`
+      PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; `gofmt -l` clean; pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): the `ALTER FOREIGN TABLE
+      ONLY <t> ALTER COLUMN <c> OPTIONS (...)` statement this loop makes pg_dump
+      newly *emit* is not itself parseable by goopg (`parseAlter` has no
+      `FOREIGN` lookahead before `ALTER TABLE` dispatch) — a goopg-to-goopg
+      restore replay of a foreign table with column options would fail; no
+      fixture in scope exercises that path yet.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

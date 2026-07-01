@@ -194,6 +194,16 @@ type Column struct {
 	// does not actually collate; recorded purely for pg_dump round-trip
 	// fidelity. DU-002 slice 188.
 	Collation string
+	// FDWOptions holds per-column foreign-table options set via a
+	// `CREATE FOREIGN TABLE (col type OPTIONS (name 'value', …))` clause,
+	// each normalized to PG's stored `name=value` form (matching Options'
+	// attoptions convention). nil/empty means none — PG stores
+	// pg_attribute.attfdwoptions=NULL and pg_dump emits no per-column OPTIONS
+	// clause. A non-empty list is rendered into the attfdwoptions text-array
+	// literal so pg_dump re-emits `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN
+	// ... OPTIONS (...)`. Only meaningful on a foreign table's columns.
+	// DU-002 slice 418.
+	FDWOptions []string
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.

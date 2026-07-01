@@ -774,6 +774,16 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if len(col.Options) > 0 {
 		attOptionsDatum = NewStringDatum("{" + strings.Join(col.Options, ",") + "}")
 	}
+	// Per-column foreign-table options (`CREATE FOREIGN TABLE (col type
+	// OPTIONS (name 'value', …))`) are stored in pg_attribute.attfdwoptions
+	// as a text[] array — same encoding as attoptions above. pg_dump's
+	// getTableAttrs expands it via pg_options_to_table(attfdwoptions) and
+	// dumpTableSchema emits `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN ...
+	// OPTIONS (...)` whenever it is non-empty. DU-002 slice 418.
+	attFDWOptionsDatum := NullDatum
+	if len(col.FDWOptions) > 0 {
+		attFDWOptionsDatum = NewStringDatum("{" + strings.Join(col.FDWOptions, ",") + "}")
+	}
 	// A per-column explicit collation (`COLLATE <name>`) shadows the type's
 	// typcollation in pg_attribute.attcollation. pg_dump's getTableAttrs query
 	// reports attcollation only when `a.attcollation <> t.typcollation`, and
@@ -851,7 +861,7 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
 		attaclDatum,        // attacl (NULL default; _aclitem blob after a column GRANT)
 		attOptionsDatum,    // attoptions (NULL default; text[] literal when set)
-		NullDatum,          // attfdwoptions
+		attFDWOptionsDatum, // attfdwoptions (NULL default; text[] literal when set)
 		NullDatum,          // attmissingval
 		attStatTargetDatum, // attstattarget (NULL default; integer override)
 	}

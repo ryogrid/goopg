@@ -1195,3 +1195,57 @@ across the whole M0119-0004 catalog-view-parity effort, not per-subsystem.
   of scope for goopg's compat-only foreign-table support — `ForeignServer`/
   `ForeignOptions` exist purely so DDL+`pg_dump` round-trip; no query ever
   executes against a real remote source.
+
+## Loop #55 — per-column `OPTIONS (...)` round-trip (`pg_attribute.attfdwoptions`, DU-002 slice 418)
+
+Closes the loop #54 resume point: the `goopg_ftable` fixture already declared
+`c1 int OPTIONS (column_name 'col1')`, but `parseColumnDef`'s `OPTIONS (...)`
+case called `p.scanFDWOptionsList()` purely to consume the tokens and
+discarded the result, so `pg_attribute.attfdwoptions` stayed NULL and
+pg_dump's per-column FDW-options query (`pg_options_to_table(attfdwoptions)`)
+always returned zero rows.
+
+- Parser: `ColumnDef` gains `FDWOptions []string` (`internal/parser/ast.go`);
+  `parseColumnDef`'s `OPTIONS` case (`internal/parser/ddl.go`) now assigns
+  `col.FDWOptions = p.scanFDWOptionsList()` instead of discarding it. The
+  helper already normalizes to the on-disk `"name=value"` element form (used
+  identically by `CREATE SERVER`/`CREATE USER MAPPING`/table-level
+  `ForeignOptions`), so no new encoding logic was needed.
+- Catalog: `Column` gains `FDWOptions []string` (`internal/catalog/catalog.go`),
+  documented as the attfdwoptions analogue of the pre-existing `Options`
+  (attoptions) field.
+- Executor: both CREATE TABLE column-construction sites in
+  `internal/executor/operators_ddl.go` (the `addCol` closure used by the
+  `BodyOrder` loop, and the no-`BodyOrder` fallback loop) now copy
+  `c.FDWOptions` onto the new `catalog.Column` field — mirroring how
+  `Compression`/`Collation` are threaded at the same two sites.
+- pg_attribute row builder: `buildUserPGAttributeRow`
+  (`internal/executor/pg18_user_catalog_rows.go`) renders `col.FDWOptions`
+  into the attfdwoptions text-array literal (`"{name=value,...}"`) using the
+  same `strings.Join` pattern as the existing `attOptionsDatum` — was
+  hardcoded `NullDatum`.
+- Test: extended `TestPort_PgDumpConnectionSetup`
+  (`internal/testport/pgdump_connsetup_test.go`) with a positive assertion
+  that pg_dump emits `ALTER FOREIGN TABLE ONLY public.goopg_ftable ALTER
+  COLUMN c1 OPTIONS (\n    column_name 'col1'\n);` (pg_dump.c's distinct
+  "per-column fdw options" block, separate from the table-level
+  `SERVER ... OPTIONS (...)` clause already covered by slice 417). New unit
+  tests `TestParseColumnDefFDWOptions` (parser: FDWOptions capture + a sibling
+  column with no OPTIONS clause stays empty) and
+  `TestUserPGAttributeFDWOptionsOverride` (executor: NULL / one option / two
+  options row-builder encoding, mirrors `TestUserPGAttributeOptionsOverride`).
+- **Verified against real `pg_dump` 18.3** via `TestPort_PgDumpConnectionSetup`
+  (spawns the real client binary against a live goopg server).
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/catalog`+`internal/executor` suites PASS (`-count=1`);
+  `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS;
+  `gofmt -l` clean on every touched file; pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): the `ALTER FOREIGN TABLE ONLY <t> ALTER
+  COLUMN <c> OPTIONS (...)` statement this loop makes pg_dump newly *emit* is
+  not itself parseable by goopg — `parseAlter` dispatches straight to
+  `p.expectKeyword(KwTable)` with no `FOREIGN` lookahead, so a schema-only
+  restore replay of a foreign table with column options against goopg itself
+  would fail with a syntax error. No fixture in the current inventory
+  exercises a goopg-to-goopg restore, so this was out of this loop's scope;
+  `CREATE SERVER`'s `srvtype`/`srvversion` and real FDW-handler execution
+  remain out of scope as noted at loop #54.

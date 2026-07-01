@@ -4907,13 +4907,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// `SERVER ... OPTIONS (...)` suffix in the parser (relkind stayed 'r' and
 	// pg_foreign_table was hardcoded empty), so a foreign table silently dumped
 	// as an ordinary table. The parser now captures ForeignServer/
-	// ForeignOptions on CreateTableStmt (also accepting, and discarding, a
-	// per-column `OPTIONS (...)` clause — pg_attribute.attfdwoptions is not
-	// modelled and no fixture asserts it); the executor validates the SERVER
+	// ForeignOptions on CreateTableStmt; the executor validates the SERVER
 	// name (42704 if unknown, mirroring real PG) and sets
 	// catalog.Table.ForeignServerName/ForeignOptions, which drive relkind='f'
 	// and a real pg_foreign_table row. Reuses goopg_srv (created at slice 376)
-	// so no new CREATE SERVER is needed. Verified against real pg_dump 18.3.
+	// so no new CREATE SERVER is needed.
+	// Slice 418: the column's own `OPTIONS (column_name 'col1')` clause is now
+	// also captured (ColumnDef.FDWOptions -> catalog.Column.FDWOptions ->
+	// pg_attribute.attfdwoptions), so pg_dump's per-column FDW-options query
+	// (`pg_options_to_table(attfdwoptions)`) recovers it and dumpTableSchema
+	// emits a trailing `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN c1 OPTIONS
+	// (...)` statement — asserted below. Verified against real pg_dump 18.3.
 	if err := runSQLSimple(t, c, "CREATE FOREIGN TABLE public.goopg_ftable (c1 int options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name 'x1')"); err != nil {
 		t.Fatalf("create foreign table: %v", err)
 	}
@@ -10976,10 +10980,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// (\n    <opt>\n);` — the exact upstream 002_pg_dump.pl
 		// 'CREATE FOREIGN TABLE dump_test.foreign_table SERVER s1' regexp shape,
 		// adapted to the public schema and the goopg_srv/goopg_ftable naming used
-		// throughout this test. The column-level `OPTIONS (column_name 'col1')`
-		// clause is parsed but not surfaced (matches the upstream regexp, which
-		// only checks `c1 integer`, not any per-column option). Verified against
-		// real pg_dump 18.3.
+		// throughout this test.
 		foreignTableBlock := "CREATE FOREIGN TABLE public.goopg_ftable (\n    c1 integer\n)\nSERVER goopg_srv\nOPTIONS (\n    schema_name 'x1'\n);"
 		if !strings.Contains(res.Stdout, foreignTableBlock) {
 			t.Errorf("pg_dump dropped the FOREIGN TABLE round-trip (slice-417); missing %q\n  full stdout=%q", foreignTableBlock, res.Stdout)
@@ -10989,6 +10990,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// SERVER/OPTIONS suffix.
 		if strings.Contains(res.Stdout, "CREATE TABLE public.goopg_ftable (") {
 			t.Errorf("pg_dump emitted the foreign table as a plain CREATE TABLE (slice-417 relkind='f' regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 418: the column-level `OPTIONS (column_name 'col1')` clause
+		// (pg_attribute.attfdwoptions) must round-trip as a separate trailing
+		// `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN c1 OPTIONS (...)`
+		// statement (pg_dump.c dumpTableSchema's "per-column fdw options"
+		// block — distinct from the table-level SERVER/OPTIONS clause above).
+		attFDWOptionsStmt := "ALTER FOREIGN TABLE ONLY public.goopg_ftable ALTER COLUMN c1 OPTIONS (\n    column_name 'col1'\n);"
+		if !strings.Contains(res.Stdout, attFDWOptionsStmt) {
+			t.Errorf("pg_dump dropped the per-column FDW OPTIONS round-trip (slice-418); missing %q\n  full stdout=%q", attFDWOptionsStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

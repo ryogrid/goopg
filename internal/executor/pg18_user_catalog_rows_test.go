@@ -708,6 +708,33 @@ func TestUserPGAttributeOptionsOverride(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeFDWOptionsOverride pins per-column FOREIGN TABLE
+// options (`CREATE FOREIGN TABLE (col type OPTIONS (name 'value', …))`) —
+// pg_attribute.attfdwoptions. DU-002 slice 418.
+func TestUserPGAttributeFDWOptionsOverride(t *testing.T) {
+	const attfdwoptionsIdx = 22 // attfdwoptions position in the user pg_attribute row
+	tbl := &catalog.Table{Name: "t", OID: 99005}
+
+	// No FDW options: attfdwoptions is NULL.
+	base := buildUserPGAttributeRow(nil, tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0})
+	if !base[attfdwoptionsIdx].IsNull() {
+		t.Fatalf("column without FDW options: attfdwoptions=%v want NULL", base[attfdwoptionsIdx])
+	}
+
+	// A single option renders as a one-element text-array literal.
+	one := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0, FDWOptions: []string{"column_name=col1"}}
+	if got := buildUserPGAttributeRow(nil, tbl, one)[attfdwoptionsIdx]; got.StringValue() != "{column_name=col1}" {
+		t.Errorf("one FDW option: attfdwoptions=%q want %q", got.StringValue(), "{column_name=col1}")
+	}
+
+	// Multiple options render as a comma-joined text-array literal.
+	multi := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0,
+		FDWOptions: []string{"column_name=col1", "other_opt=val2"}}
+	if got := buildUserPGAttributeRow(nil, tbl, multi)[attfdwoptionsIdx]; got.StringValue() != "{column_name=col1,other_opt=val2}" {
+		t.Errorf("multi FDW option: attfdwoptions=%q want %q", got.StringValue(), "{column_name=col1,other_opt=val2}")
+	}
+}
+
 // TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
 // 88). A column whose declared type is a user-defined enum must report
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text

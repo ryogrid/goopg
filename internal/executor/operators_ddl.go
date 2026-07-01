@@ -980,6 +980,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				IdentityCycle:     c.IdentityCycle,
 				Compression:       c.Compression,
 				Collation:         c.Collation,
+				FDWOptions:        c.FDWOptions,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -1170,6 +1171,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				DefaultExpr:      c.DefaultExpr,
 				Compression:      c.Compression,
 				Collation:        c.Collation,
+				FDWOptions:       c.FDWOptions,
 			})
 		}
 	}

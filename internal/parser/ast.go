@@ -1178,6 +1178,15 @@ type ColumnDef struct {
 	// clause. goopg does not actually collate; this is recorded purely for
 	// pg_dump round-trip fidelity. DU-002 slice 188.
 	Collation string
+	// FDWOptions holds the raw `name value` pairs from a per-column
+	// `OPTIONS ( name 'value', … )` clause on a CREATE FOREIGN TABLE column
+	// (`c1 int OPTIONS (column_name 'col1')`), each normalized to
+	// "name=value" (matching scanFDWOptionsList's existing table/server-level
+	// output format). Threaded onto catalog.Column.FDWOptions so the
+	// synthesized pg_attribute row reports attfdwoptions and pg_dump re-emits
+	// `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN ... OPTIONS (...)`. Empty for
+	// every non-foreign-table column. DU-002 slice 418.
+	FDWOptions []string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }

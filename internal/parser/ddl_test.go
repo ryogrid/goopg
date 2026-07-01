@@ -978,6 +978,38 @@ func TestParseColumnDefCompression(t *testing.T) {
 	}
 }
 
+// TestParseColumnDefFDWOptions verifies that a per-column `OPTIONS (name
+// 'value', …)` clause on a CREATE FOREIGN TABLE column is captured onto
+// ColumnDef.FDWOptions (normalized "name=value" pairs, matching
+// scanFDWOptionsList's table/server-level output), and that the surrounding
+// SERVER/table-level OPTIONS clause still parses. DU-002 slice 418.
+func TestParseColumnDefFDWOptions(t *testing.T) {
+	sql := `CREATE FOREIGN TABLE t (a int OPTIONS (column_name 'col1'), b text) SERVER srv OPTIONS (schema_name 'x1')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if ct.ForeignServer != "srv" {
+		t.Errorf("ForeignServer=%q, want %q", ct.ForeignServer, "srv")
+	}
+	if got, want := ct.ForeignOptions, []string{"schema_name=x1"}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("ForeignOptions=%v, want %v", got, want)
+	}
+	if len(ct.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(ct.Columns))
+	}
+	if got, want := ct.Columns[0].FDWOptions, []string{"column_name=col1"}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("col[0].FDWOptions=%v, want %v", got, want)
+	}
+	if len(ct.Columns[1].FDWOptions) != 0 {
+		t.Errorf("col[1].FDWOptions=%v, want empty (no OPTIONS clause on b)", ct.Columns[1].FDWOptions)
+	}
+}
+
 // TestParseColumnDefCollation verifies that an inline `COLLATE <name>` clause is
 // captured onto ColumnDef.Collation (bare trailing component, unquoted) so the
 // column round-trips through pg_dump. Covers the quoted form (`"C"`), the

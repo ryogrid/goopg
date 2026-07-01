@@ -1923,10 +1923,9 @@ func (p *parser) parseCreateConversionTail(pos int, isDefault bool) (Stmt, error
 // Returns a CreateTableStmt with ForeignServer/ForeignOptions populated so
 // pg_dump's getTables (relkind='f') + pg_foreign_table (ftserver/ftoptions)
 // round-trip the `SERVER ... OPTIONS (...)` clause. DU-002 slice 417 — the
-// column-level `OPTIONS (...)` clause (parseColumnDef) is parsed but
-// discarded (pg_attribute.attfdwoptions is not modelled; no fixture in scope
-// asserts it). Foreign tables are treated as regular tables for storage
-// purposes in goopg v0.
+// column-level `OPTIONS (...)` clause (parseColumnDef) is captured onto
+// ColumnDef.FDWOptions (DU-002 slice 418). Foreign tables are treated as
+// regular tables for storage purposes in goopg v0.
 func (p *parser) parseCreateForeignTableTail(pos int) (Stmt, error) {
 	// Reuse the regular CREATE TABLE parser for name + column list.
 	stmt, err := p.parseCreateTableTail(pos, false)
@@ -3676,11 +3675,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			method, _ := p.parseIdent() // consume method name (pglz, lz4, default, etc.)
 			col.Compression = normalizeCompressionMethod(method.Value)
 		// OPTIONS ( name 'value', … ) — per-column FOREIGN TABLE options
-		// (`c1 int OPTIONS (column_name 'col1')`). Consumed so the column list
-		// of a CREATE FOREIGN TABLE parses; not stored (pg_attribute.attfdwoptions
-		// is not modelled and no in-scope fixture asserts it). DU-002 slice 417.
+		// (`c1 int OPTIONS (column_name 'col1')`). Captured onto
+		// catalog.Column.FDWOptions so pg_attribute.attfdwoptions round-trips
+		// through pg_dump (`ALTER FOREIGN TABLE ... ALTER COLUMN ... OPTIONS`).
+		// DU-002 slice 418.
 		case p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "options"):
-			p.scanFDWOptionsList()
+			col.FDWOptions = p.scanFDWOptionsList()
 		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			isAlways := p.acceptIdentKeyword("always")
