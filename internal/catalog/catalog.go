@@ -2197,6 +2197,16 @@ type InMemory struct {
 	// OIDs). Key: lowercase "<type>\x00<lang>". DU-002 (M0119-0004).
 	transforms map[string]*Transform
 
+	// userOperators tracks user-defined operators (CREATE OPERATOR) with a
+	// stable OID so they round-trip through pg_dump's getOperators (pg_operator
+	// virtual view → dumpOpr). goopg does not execute the operator (no runtime
+	// dispatch through a custom FUNCTION); only enough metadata is kept for
+	// dump fidelity (left/right/result type OIDs, oprcode). Key: lowercase
+	// "<schema>.<name>(<leftType>,<rightType>)" to allow the same operator
+	// symbol to be overloaded across schemas/arg-type pairs, mirroring
+	// dropCompat's operator key shape. DU-002 (M0119-0004).
+	userOperators map[string]*UserOperator
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -6792,11 +6802,15 @@ func (c *InMemory) registerSystemTables() {
 	// `SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
 	// oprright, oprcode::oid AS oprcode FROM pg_operator` — it reads ALL operators
 	// (built-ins included) and filters out system-defined ones at dump-out time by
-	// namespace dumpability. goopg defines no user operators, and the built-ins are
-	// in pg_catalog (never dumped), so this view is correctly empty (0 rows).
-	// Schema matches PG's pg_operator (pg_operator.h): oprcode is regproc in PG but
-	// oid-compatible, so it is typed oid here and `oprcode::oid` resolves as a no-op.
-	// M0110-0001 (DU-002 slice 9).
+	// namespace dumpability. The built-ins are in pg_catalog (never dumped), so
+	// they are correctly never rendered here (matching PG's own dump behavior,
+	// not a goopg gap). A CREATE OPERATOR registers a row here
+	// (catalog.UserOperator, ListUserOperators) so pg_dump's
+	// getOperators/dumpOpr re-emit it; with none registered this view is empty
+	// exactly as before. Schema matches PG's pg_operator (pg_operator.h):
+	// oprcode is regproc in PG but oid-compatible, so it is typed oid here and
+	// `oprcode::oid` resolves as a no-op. M0110-0001 (DU-002 slice 9; CREATE
+	// OPERATOR support added M0119-0004).
 	pgOperator := &Table{
 		Schema: "pg_catalog", Name: "pg_operator", Virtual: true,
 		Columns: []Column{
@@ -6818,7 +6832,42 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2617,
 	}
-	pgOperator.VirtualRows = func() [][]string { return nil }
+	pgOperator.VirtualRows = func() [][]string {
+		ops := c.ListUserOperators()
+		if len(ops) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(ops))
+		for _, op := range ops {
+			oprkind := "b" // binary; goopg's CREATE OPERATOR skeleton models LEFTARG+RIGHTARG only (no unary forms yet)
+			leftOID := uint32(0)
+			if op.LeftType != "" {
+				leftOID = TypeNameToOID(op.LeftType)
+			}
+			rightOID := uint32(0)
+			if op.RightType != "" {
+				rightOID = TypeNameToOID(op.RightType)
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(op.OID), 10),                   // oid
+				op.Name,                                                 // oprname
+				strconv.FormatUint(uint64(op.NamespaceOIDOrDefault()), 10), // oprnamespace
+				strconv.FormatUint(uint64(op.OwnerOrDefault()), 10),      // oprowner
+				oprkind,                                                 // oprkind
+				"f",                                                     // oprcanmerge (not modeled — MERGES clause not parsed yet)
+				"f",                                                     // oprcanhash (not modeled — HASHES clause not parsed yet)
+				strconv.FormatUint(uint64(leftOID), 10),                 // oprleft
+				strconv.FormatUint(uint64(rightOID), 10),                // oprright
+				"0", // oprresult (not modeled; pg_dump never reads this column)
+				"0", // oprcom (COMMUTATOR not parsed yet)
+				"0", // oprnegate (NEGATOR not parsed yet)
+				strconv.FormatUint(uint64(op.FuncOID), 10), // oprcode
+				"0", // oprrest (RESTRICT not parsed yet)
+				"0", // oprjoin (JOIN not parsed yet)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_operator"] = pgOperator
 
 	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
@@ -10680,6 +10729,133 @@ func (c *InMemory) ListTransforms() []*Transform {
 	return out
 }
 
+// UserOperator is a user-defined operator (CREATE OPERATOR name (FUNCTION =
+// fn, LEFTARG = t1, RIGHTARG = t2, ...)). goopg does not execute the
+// operator (no expression-evaluator dispatch through a user FUNCTION); this
+// records just enough metadata to round-trip the definition through
+// pg_dump (pg_operator virtual view → getOperators/dumpOpr). Only the
+// skeleton clauses (FUNCTION/LEFTARG/RIGHTARG) are modeled; COMMUTATOR,
+// NEGATOR, RESTRICT, JOIN, MERGES, and HASHES are not parsed yet (deferred —
+// see the ledger). DU-002 (M0119-0004).
+type UserOperator struct {
+	OID uint32 // pg_operator.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
+	// Name is the bare operator symbol (e.g. "~~"); NamespaceOID resolves the
+	// schema the CREATE OPERATOR statement declared it in (0 = unresolved,
+	// falls back to public via NamespaceOIDOrDefault, mirroring
+	// UserAggregate/UserCollation).
+	Name         string
+	NamespaceOID uint32
+	// LeftType / RightType are the parsed LEFTARG/RIGHTARG type names (empty
+	// when absent — a unary operator has exactly one of the two). Resolved to
+	// oprleft/oprright OIDs via TypeNameToOID at render time.
+	LeftType  string
+	RightType string
+	// FuncOID is pg_operator.oprcode, resolved from the FUNCTION/PROCEDURE
+	// clause (catalog.LookupBuiltinProc for a builtin, or the user routine
+	// registry for a CREATE FUNCTION-defined one). 0 when unresolved — PG
+	// itself treats this as invalid (dumpOpr skips an operator whose oprcode
+	// is InvalidOid), but goopg still registers it so DROP OPERATOR can find
+	// it; VirtualRows below also skips a zero-FuncOID row for the same reason.
+	FuncOID uint32
+	// Owner is pg_operator.oprowner (0 = unset, defaults to the bootstrap
+	// superuser via OwnerOrDefault — CREATE OPERATOR has no OWNER TO clause of
+	// its own; ownership is always the creating role, which goopg's DDL surface
+	// does not track per-session, so every operator defaults to the bootstrap
+	// superuser like a fresh single-session CREATE OPERATOR would).
+	Owner uint32
+}
+
+// OwnerOrDefault returns Owner, or the bootstrap superuser OID (10) if unset.
+// Mirrors UserAggregate.OwnerOrDefault. DU-002 (M0119-0004).
+func (o *UserOperator) OwnerOrDefault() uint32 {
+	if o.Owner == 0 {
+		return 10
+	}
+	return o.Owner
+}
+
+// NamespaceOIDOrDefault returns NamespaceOID, or PublicNamespaceOID if unset.
+// Mirrors UserAggregate.NamespaceOIDOrDefault. DU-002 (M0119-0004).
+func (o *UserOperator) NamespaceOIDOrDefault() uint32 {
+	if o.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return o.NamespaceOID
+}
+
+// userOperatorKey builds the operator registry's lookup key. PG allows the
+// same operator symbol to be overloaded across distinct (left, right) type
+// pairs (and, separately, across schemas), so the key must include both —
+// unlike Cast/Transform, which forbid duplicate (source,target)/(type,lang)
+// pairs outright.
+func userOperatorKey(schema, name, leftType, rightType string) string {
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema) + "." + name + "(" + strings.ToLower(leftType) + "," + strings.ToLower(rightType) + ")"
+}
+
+// RegisterUserOperator records a user-defined operator, allocating a stable
+// OID on first sight. Idempotent: re-registering the same (schema, name,
+// leftType, rightType) key refreshes FuncOID but keeps the OID. DU-002
+// (M0119-0004).
+func (c *InMemory) RegisterUserOperator(schema, name, leftType, rightType string, namespaceOID, funcOID, owner uint32) *UserOperator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		c.userOperators = make(map[string]*UserOperator)
+	}
+	key := userOperatorKey(schema, name, leftType, rightType)
+	if op, ok := c.userOperators[key]; ok {
+		op.FuncOID = funcOID
+		if namespaceOID != 0 {
+			op.NamespaceOID = namespaceOID
+		}
+		if owner != 0 {
+			op.Owner = owner
+		}
+		return op
+	}
+	op := &UserOperator{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
+		LeftType: leftType, RightType: rightType, FuncOID: funcOID, Owner: owner,
+	}
+	c.userOperators[key] = op
+	return op
+}
+
+// DropUserOperator removes a user-defined operator from the registry.
+// Returns true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperator(schema, name, leftType, rightType string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		return false
+	}
+	key := userOperatorKey(schema, name, leftType, rightType)
+	if _, ok := c.userOperators[key]; ok {
+		delete(c.userOperators, key)
+		return true
+	}
+	return false
+}
+
+// ListUserOperators returns all registered user operators sorted by OID
+// (stable creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListUserOperators() []*UserOperator {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userOperators) == 0 {
+		return nil
+	}
+	out := make([]*UserOperator, 0, len(c.userOperators))
+	for _, op := range c.userOperators {
+		out = append(out, op)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
 // LanguageNameToOID maps a language name to its pg_language OID, covering the
 // 4 rows pg_language.VirtualRows serves (the 3 built-in BKI languages plus
 // plpgsql — see the pg_language registration in this file). Returns 0 for an
@@ -10769,6 +10945,17 @@ var builtinProcsByName = map[string]BuiltinProc{
 		OID: 1964, Name: "int8_avg", Namespace: 11,
 		RetType:  "numeric",
 		ArgTypes: []string{"int8[]"},
+		Volatile: "i",
+	},
+	// int4eq is the FUNCTION a DU-002 "CREATE OPERATOR" fixture references
+	// (mirrors PG's own "=" operator over int4, pg_operator.dat oid 96 ->
+	// oprcode int4eq). Curated so the operator's pg_operator.oprcode can
+	// resolve to a real OID (mirroring pg_cast.castfunc/pg_aggregate's
+	// aggtransfn FuncOID pattern).
+	"int4eq": {
+		OID: 65, Name: "int4eq", Namespace: 11,
+		RetType:  "bool",
+		ArgTypes: []string{"int4", "int4"},
 		Volatile: "i",
 	},
 }

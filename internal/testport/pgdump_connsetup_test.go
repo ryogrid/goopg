@@ -5227,6 +5227,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"finalfunc = int8_avg, finalfunc_modify = shareable, initcond1 = '{0,0}')"); err != nil {
 		t.Fatalf("create aggregate s.schemedavg: %v", err)
 	}
+	// Slice 406: CREATE OPERATOR must round-trip via getOperators/dumpOpr.
+	// CREATE OPERATOR was previously a name-registration-only compat no-op
+	// (internal/executor/operators_ddl.go's "operator" case only fed the
+	// generic DROP-OPERATOR-lookup registry, never catalog.pg_operator) —
+	// pg_operator's virtual view was unconditionally empty by construction
+	// (DU-002 slice 9's original rationale: "goopg defines no user
+	// operators"), which was only true because CREATE OPERATOR could never
+	// actually populate it. This is the exact upstream TAP fixture's simplest
+	// case (postgres/src/bin/pg_dump/t/002_pg_dump.pl 'CREATE OPERATOR CLASS
+	// dump_test.op_class_custom', operator half only — the OPERATOR CLASS half
+	// is a separate, larger deferral, see the ledger). FUNCTION resolves
+	// through the same catalog.LookupBuiltinProc builtin fallback slice 404/405
+	// established (int4eq newly curated this loop).
+	if err := runSQLSimple(t, c, "CREATE OPERATOR public.~~ (FUNCTION = int4eq, LEFTARG = int, RIGHTARG = int)"); err != nil {
+		t.Fatalf("create operator public.~~: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8090,6 +8106,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"    FINALFUNC_MODIFY = SHAREABLE\n" +
 			");"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing non-public-schema CREATE AGGREGATE %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 406 (asserted):** CREATE OPERATOR public.~~ must round-trip via
+		// getOperators/dumpOpr, byte-identical to a real pg_dump 18.3 run (verified
+		// against a live PG18 instance: `CREATE OPERATOR public.~~ (FUNCTION =
+		// int4eq, LEFTARG = int, RIGHTARG = int);` dumps exactly this shape,
+		// including the trailing `ALTER OPERATOR ... OWNER TO` line — dumpOpr's
+		// FUNCTION clause uses convertRegProcReference, which truncates the
+		// regprocedure text at the first unquoted '(' so only the bare function
+		// name (no arg-type list) appears, and LEFTARG/RIGHTARG spell out
+		// `int` -> `integer` via format_type). Before this loop CREATE OPERATOR
+		// was a name-registration-only compat no-op that never touched
+		// pg_operator, so pg_dump's getOperators query always returned 0 rows —
+		// this is the first user-defined operator this test ever creates.
+		if want := "CREATE OPERATOR public.~~ (\n" +
+			"    FUNCTION = int4eq,\n" +
+			"    LEFTARG = integer,\n" +
+			"    RIGHTARG = integer\n" +
+			");"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE OPERATOR %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "ALTER OPERATOR public.~~ (integer, integer) OWNER TO"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR OWNER TO for public.~~\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

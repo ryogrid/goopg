@@ -176,11 +176,15 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if p.acceptIdentKeyword("class") {
 			return p.parseCreateOpClassTail(t.Pos)
 		}
-		// CREATE OPERATOR name (leftarg=T, rightarg=T, ...) — parse name + arg types for compat
-		// registry so DROP OPERATOR can find it later. M0097-regress.
+		// CREATE OPERATOR name (leftarg=T, rightarg=T, function=fn, ...) — parse
+		// name + arg types (for the DROP OPERATOR compat registry, M0097-regress)
+		// plus the FUNCTION/PROCEDURE clause (so the operator round-trips through
+		// pg_dump's getOperators/dumpOpr; the two names are synonyms in PG's
+		// operatorcmds.c). DU-002 (M0119-0004).
 		opName, _ := p.parseOperatorName()
-		// Extract leftarg and rightarg from the parenthesised option list.
+		// Extract leftarg/rightarg/function from the parenthesised option list.
 		var leftArg, rightArg string
+		var opFunc ObjectName
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance() // consume '('
 			depth := 1
@@ -203,12 +207,21 @@ func (p *parser) parseCreate() (Stmt, error) {
 						continue
 					}
 				}
-				// Look for "leftarg = type" or "rightarg = type" key-value pairs.
+				// Look for "key = value" pairs (leftarg/rightarg/function/procedure/...).
 				if depth == 1 && (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) {
 					key := strings.ToLower(tok.Value)
 					p.advance()
 					if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
 						p.advance()
+						if key == "function" || key == "procedure" {
+							// A (possibly schema-qualified) function name — no
+							// parenthesised arg-type list in this grammar position
+							// (PG infers the signature from LEFTARG/RIGHTARG).
+							if fn, ferr := p.parseObjectName(); ferr == nil {
+								opFunc = fn
+							}
+							continue
+						}
 						// Collect type name (may be multi-word like "double precision").
 						var typeParts []string
 						for p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
@@ -235,6 +248,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.ObjType = "operator"
 			ns.ObjName = ObjectName{Name: opName.Name, Schema: opName.Schema}
 			ns.ArgTypes = []string{leftArg, rightArg}
+			ns.OpFuncName = opFunc
 		}
 		return stmt, nil
 	// CREATE [DEFAULT] CONVERSION name FOR 'src' TO 'dest' FROM func — register so

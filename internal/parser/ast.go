@@ -1979,6 +1979,18 @@ type CompatNoopStmt struct {
 	TransformFromArgs []string
 	TransformToFunc   ObjectName
 	TransformToArgs   []string
+	// OpFuncName carries a CREATE OPERATOR statement's `FUNCTION = funcname` (or
+	// `PROCEDURE = funcname`, an accepted synonym — operatorcmds.c treats them
+	// identically) clause. Unlike CAST/TRANSFORM's WITH FUNCTION, PG's
+	// operator_def_arg grammar allows only a bare (optionally schema-qualified)
+	// name here — no parenthesised arg-type list — since the function's
+	// signature is inferred from LEFTARG/RIGHTARG, not declared explicitly. The
+	// executor resolves it to a pg_proc OID (catalog.LookupBuiltinProc /
+	// Routines()) and records it as pg_operator.oprcode so pg_dump's
+	// getOperators/dumpOpr re-emit `FUNCTION = <name>`. Zero value (empty Name)
+	// when the statement is not a CREATE OPERATOR or the FUNCTION clause could
+	// not be parsed. DU-002 (M0119-0004).
+	OpFuncName ObjectName
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

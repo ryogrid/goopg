@@ -12770,6 +12770,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 			key := opName + "(" + leftCanon + "," + rightCanon + ")"
 			if im.DropCompatObject("operator", key) {
+				schema := opNameObj.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				// Also remove the dedicated operator registry entry so pg_dump
+				// no longer re-emits it (mirrors DropCast/DropTransform).
+				im.DropUserOperator(schema, opName, leftType, rightType)
 				return nil
 			}
 		}
@@ -13165,6 +13172,36 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		key := s.ObjName.Name + "(" + leftCanon + "," + rightCanon + ")"
 		im.RegisterCompatObject("operator", key)
+		// Also record it in the dedicated operator registry (catalog.UserOperator)
+		// so it round-trips through pg_dump (pg_operator virtual view →
+		// getOperators/dumpOpr). Only the skeleton clauses this loop models
+		// (FUNCTION/LEFTARG/RIGHTARG) are captured; COMMUTATOR/NEGATOR/MERGES/
+		// HASHES/RESTRICT/JOIN are deferred (see the ledger). DU-002 (M0119-0004).
+		if s.OpFuncName.Name != "" {
+			var funcOID uint32
+			if rs := im.Routines(); rs != nil {
+				if overloads := rs.LookupByName(s.OpFuncName); len(overloads) == 1 {
+					funcOID = overloads[0].OID
+				}
+			}
+			if funcOID == 0 && (s.OpFuncName.Schema == "" || strings.EqualFold(s.OpFuncName.Schema, "pg_catalog")) {
+				// Not a user-created routine. Fall back to the hand-curated
+				// built-in pg_proc table, mirroring resolveTransformFunc's and
+				// CREATE CAST's identical fallback.
+				if b, ok := catalog.LookupBuiltinProc(s.OpFuncName.Name); ok {
+					funcOID = b.OID
+				}
+			}
+			schema := s.ObjName.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			if nsOID == 0 {
+				nsOID = o.ctx.Catalog.SchemaOID("public")
+			}
+			im.RegisterUserOperator(schema, s.ObjName.Name, leftArg, rightArg, nsOID, funcOID, 0)
+		}
 	case "cast":
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
 		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).
