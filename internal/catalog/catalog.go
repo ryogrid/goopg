@@ -6839,7 +6839,20 @@ func (c *InMemory) registerSystemTables() {
 		}
 		out := make([][]string, 0, len(ops))
 		for _, op := range ops {
-			oprkind := "b" // binary; goopg's CREATE OPERATOR skeleton models LEFTARG+RIGHTARG only (no unary forms yet)
+			// A shell operator (FuncOID==0) forward-declared purely to mint an
+			// OID for another operator's COMMUTATOR/NEGATOR clause is not yet
+			// a complete definition. Real PG's dumpOpr explicitly skips these
+			// ("some operators are invalid because they were the result of
+			// user defining operators before commutators exist",
+			// pg_dump.c) via `if (!OidIsValid(oprinfo->oprcode)) return;` —
+			// mirrored here.
+			if op.FuncOID == 0 {
+				continue
+			}
+			oprkind := "b"
+			if op.LeftType == "" {
+				oprkind = "l" // prefix/unary: RIGHTARG present, LEFTARG absent (PG14+ has no postfix "r" form)
+			}
 			leftOID := uint32(0)
 			if op.LeftType != "" {
 				leftOID = TypeNameToOID(op.LeftType)
@@ -6849,21 +6862,21 @@ func (c *InMemory) registerSystemTables() {
 				rightOID = TypeNameToOID(op.RightType)
 			}
 			out = append(out, []string{
-				strconv.FormatUint(uint64(op.OID), 10),                   // oid
-				op.Name,                                                 // oprname
+				strconv.FormatUint(uint64(op.OID), 10),                     // oid
+				op.Name,                                                   // oprname
 				strconv.FormatUint(uint64(op.NamespaceOIDOrDefault()), 10), // oprnamespace
-				strconv.FormatUint(uint64(op.OwnerOrDefault()), 10),      // oprowner
-				oprkind,                                                 // oprkind
-				"f",                                                     // oprcanmerge (not modeled — MERGES clause not parsed yet)
-				"f",                                                     // oprcanhash (not modeled — HASHES clause not parsed yet)
-				strconv.FormatUint(uint64(leftOID), 10),                 // oprleft
-				strconv.FormatUint(uint64(rightOID), 10),                // oprright
+				strconv.FormatUint(uint64(op.OwnerOrDefault()), 10),        // oprowner
+				oprkind,                                  // oprkind
+				boolToPGChar(op.CanMerge),                // oprcanmerge
+				boolToPGChar(op.CanHash),                 // oprcanhash
+				strconv.FormatUint(uint64(leftOID), 10),  // oprleft
+				strconv.FormatUint(uint64(rightOID), 10), // oprright
 				"0", // oprresult (not modeled; pg_dump never reads this column)
-				"0", // oprcom (COMMUTATOR not parsed yet)
-				"0", // oprnegate (NEGATOR not parsed yet)
-				strconv.FormatUint(uint64(op.FuncOID), 10), // oprcode
-				"0", // oprrest (RESTRICT not parsed yet)
-				"0", // oprjoin (JOIN not parsed yet)
+				strconv.FormatUint(uint64(op.CommutatorOID), 10), // oprcom
+				strconv.FormatUint(uint64(op.NegatorOID), 10),    // oprnegate
+				strconv.FormatUint(uint64(op.FuncOID), 10),       // oprcode
+				strconv.FormatUint(uint64(op.RestrictOID), 10),   // oprrest
+				strconv.FormatUint(uint64(op.JoinOID), 10),       // oprjoin
 			})
 		}
 		return out
@@ -10733,10 +10746,9 @@ func (c *InMemory) ListTransforms() []*Transform {
 // fn, LEFTARG = t1, RIGHTARG = t2, ...)). goopg does not execute the
 // operator (no expression-evaluator dispatch through a user FUNCTION); this
 // records just enough metadata to round-trip the definition through
-// pg_dump (pg_operator virtual view → getOperators/dumpOpr). Only the
-// skeleton clauses (FUNCTION/LEFTARG/RIGHTARG) are modeled; COMMUTATOR,
-// NEGATOR, RESTRICT, JOIN, MERGES, and HASHES are not parsed yet (deferred —
-// see the ledger). DU-002 (M0119-0004).
+// pg_dump (pg_operator virtual view → getOperators/dumpOpr), including the
+// COMMUTATOR/NEGATOR/RESTRICT/JOIN/MERGES/HASHES clauses and unary (prefix,
+// LeftType=="") operators. DU-002 slice 407.
 type UserOperator struct {
 	OID uint32 // pg_operator.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
 	// Name is the bare operator symbol (e.g. "~~"); NamespaceOID resolves the
@@ -10756,6 +10768,9 @@ type UserOperator struct {
 	// itself treats this as invalid (dumpOpr skips an operator whose oprcode
 	// is InvalidOid), but goopg still registers it so DROP OPERATOR can find
 	// it; VirtualRows below also skips a zero-FuncOID row for the same reason.
+	// A zero FuncOID also occurs transiently for a COMMUTATOR/NEGATOR shell
+	// operator (OperatorShellMake, pg_operator.c) before its own CREATE
+	// OPERATOR statement fills it in.
 	FuncOID uint32
 	// Owner is pg_operator.oprowner (0 = unset, defaults to the bootstrap
 	// superuser via OwnerOrDefault — CREATE OPERATOR has no OWNER TO clause of
@@ -10763,6 +10778,22 @@ type UserOperator struct {
 	// does not track per-session, so every operator defaults to the bootstrap
 	// superuser like a fresh single-session CREATE OPERATOR would).
 	Owner uint32
+	// CommutatorOID / NegatorOID are pg_operator.oprcom / oprnegate — the
+	// OIDs of this operator's COMMUTATOR / NEGATOR, resolved (and, if
+	// necessary, forward-declared as a shell operator) by the executor's
+	// two-pass scheme mirroring PG's get_other_operator/OperatorShellMake/
+	// OperatorUpd (pg_operator.c). 0 = none.
+	CommutatorOID uint32
+	NegatorOID    uint32
+	// RestrictOID / JoinOID are pg_operator.oprrest / oprjoin — the resolved
+	// pg_proc OIDs of the RESTRICT = / JOIN = selectivity estimator
+	// functions. 0 = none.
+	RestrictOID uint32
+	JoinOID     uint32
+	// CanMerge / CanHash are pg_operator.oprcanmerge / oprcanhash — the bare
+	// MERGES / HASHES flags.
+	CanMerge bool
+	CanHash  bool
 }
 
 // OwnerOrDefault returns Owner, or the bootstrap superuser OID (10) if unset.
@@ -10854,6 +10885,61 @@ func (c *InMemory) ListUserOperators() []*UserOperator {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// LookupUserOperator finds a previously-registered operator by its identity
+// key (schema, name, leftType, rightType), returning both real operators and
+// shell operators created via EnsureUserOperatorShell (a shell is just a
+// UserOperator with FuncOID==0). Used by the CREATE OPERATOR executor to
+// resolve COMMUTATOR/NEGATOR references (PG's OperatorLookup, pg_operator.c).
+// DU-002 slice 407.
+func (c *InMemory) LookupUserOperator(schema, name, leftType, rightType string) (*UserOperator, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	op, ok := c.userOperators[userOperatorKey(schema, name, leftType, rightType)]
+	return op, ok
+}
+
+// LookupUserOperatorByOID finds a previously-registered operator by its OID.
+// Used to back-patch a COMMUTATOR/NEGATOR's own oprcom/oprnegate to point
+// back at the operator that just referenced it (PG's OperatorUpd,
+// pg_operator.c). Linear scan: the registry only ever holds the handful of
+// user-defined operators a session creates. DU-002 slice 407.
+func (c *InMemory) LookupUserOperatorByOID(oid uint32) *UserOperator {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, op := range c.userOperators {
+		if op.OID == oid {
+			return op
+		}
+	}
+	return nil
+}
+
+// EnsureUserOperatorShell returns the existing operator registered under
+// (schema, name, leftType, rightType) — real or shell — creating a shell
+// (FuncOID==0) placeholder with a stable OID if none exists yet. Mirrors
+// PG's OperatorShellMake (pg_operator.c): a COMMUTATOR/NEGATOR clause may
+// forward-reference an operator that does not exist yet, so a minimal row
+// is inserted purely to mint an OID; the operator's own later CREATE
+// OPERATOR statement fills it in (RegisterUserOperator is idempotent by the
+// same key, so it naturally reuses the shell's OID). DU-002 slice 407.
+func (c *InMemory) EnsureUserOperatorShell(schema, name, leftType, rightType string, namespaceOID uint32) *UserOperator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		c.userOperators = make(map[string]*UserOperator)
+	}
+	key := userOperatorKey(schema, name, leftType, rightType)
+	if op, ok := c.userOperators[key]; ok {
+		return op
+	}
+	op := &UserOperator{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
+		LeftType: leftType, RightType: rightType,
+	}
+	c.userOperators[key] = op
+	return op
 }
 
 // LanguageNameToOID maps a language name to its pg_language OID, covering the

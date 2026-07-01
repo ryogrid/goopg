@@ -13174,14 +13174,23 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		im.RegisterCompatObject("operator", key)
 		// Also record it in the dedicated operator registry (catalog.UserOperator)
 		// so it round-trips through pg_dump (pg_operator virtual view →
-		// getOperators/dumpOpr). Only the skeleton clauses this loop models
-		// (FUNCTION/LEFTARG/RIGHTARG) are captured; COMMUTATOR/NEGATOR/MERGES/
-		// HASHES/RESTRICT/JOIN are deferred (see the ledger). DU-002 (M0119-0004).
+		// getOperators/dumpOpr): FUNCTION/LEFTARG/RIGHTARG, COMMUTATOR/NEGATOR
+		// (two-pass shell resolution, PG's get_other_operator/OperatorShellMake/
+		// OperatorUpd), RESTRICT/JOIN, and MERGES/HASHES. A missing RIGHTARG
+		// (postfix operator) is rejected — PG14+ removed postfix operator
+		// support outright (DefineOperator, operatorcmds.c). DU-002 slice 407.
 		if s.OpFuncName.Name != "" {
+			if rightArg == "" {
+				return &ExecError{Code: "42P13", Pos: s.Pos(),
+					Message: "operator right argument type must be specified",
+					Hint:    "Postfix operators are not supported."}
+			}
 			var funcOID uint32
+			var funcRetType string
 			if rs := im.Routines(); rs != nil {
 				if overloads := rs.LookupByName(s.OpFuncName); len(overloads) == 1 {
 					funcOID = overloads[0].OID
+					funcRetType = overloads[0].ReturnType.Name
 				}
 			}
 			if funcOID == 0 && (s.OpFuncName.Schema == "" || strings.EqualFold(s.OpFuncName.Schema, "pg_catalog")) {
@@ -13190,6 +13199,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				// CREATE CAST's identical fallback.
 				if b, ok := catalog.LookupBuiltinProc(s.OpFuncName.Name); ok {
 					funcOID = b.OID
+					funcRetType = b.RetType
 				}
 			}
 			schema := s.ObjName.Schema
@@ -13200,7 +13210,135 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if nsOID == 0 {
 				nsOID = o.ctx.Catalog.SchemaOID("public")
 			}
-			im.RegisterUserOperator(schema, s.ObjName.Name, leftArg, rightArg, nsOID, funcOID, 0)
+
+			// OperatorValidateParams (operatorcmds.c): commutator/join
+			// selectivity/merge/hash require a binary operator; negator/
+			// restriction selectivity/join selectivity/merge/hash require a
+			// boolean-returning function.
+			isBinary := leftArg != "" && rightArg != ""
+			returnsBool := strings.EqualFold(funcRetType, "bool") || strings.EqualFold(funcRetType, "boolean")
+			hasCommutator := s.OpCommutatorName.Name != ""
+			hasNegator := s.OpNegatorName.Name != ""
+			hasRestrict := s.OpRestrictFuncName.Name != ""
+			hasJoin := s.OpJoinFuncName.Name != ""
+			invalidDef := func(msg string) *ExecError {
+				return &ExecError{Code: "42P13", Pos: s.Pos(), Message: msg}
+			}
+			switch {
+			case !isBinary && hasCommutator:
+				return invalidDef("only binary operators can have commutators")
+			case !isBinary && hasJoin:
+				return invalidDef("only binary operators can have join selectivity")
+			case !isBinary && s.OpCanMerge:
+				return invalidDef("only binary operators can merge join")
+			case !isBinary && s.OpCanHash:
+				return invalidDef("only binary operators can hash")
+			case !returnsBool && hasNegator:
+				return invalidDef("only boolean operators can have negators")
+			case !returnsBool && hasRestrict:
+				return invalidDef("only boolean operators can have restriction selectivity")
+			case !returnsBool && hasJoin:
+				return invalidDef("only boolean operators can have join selectivity")
+			case !returnsBool && s.OpCanMerge:
+				return invalidDef("only boolean operators can merge join")
+			case !returnsBool && s.OpCanHash:
+				return invalidDef("only boolean operators can hash")
+			}
+
+			op := im.RegisterUserOperator(schema, s.ObjName.Name, leftArg, rightArg, nsOID, funcOID, 0)
+			op.CanMerge = s.OpCanMerge
+			op.CanHash = s.OpCanHash
+
+			// RESTRICT / JOIN: a bare (possibly schema-qualified) selectivity
+			// estimator function name, resolved exactly like FUNCTION=.
+			resolveFn := func(ref parser.ObjectName) uint32 {
+				if ref.Name == "" {
+					return 0
+				}
+				if rs := im.Routines(); rs != nil {
+					if overloads := rs.LookupByName(ref); len(overloads) == 1 {
+						return overloads[0].OID
+					}
+				}
+				if ref.Schema == "" || strings.EqualFold(ref.Schema, "pg_catalog") {
+					if b, ok := catalog.LookupBuiltinProc(ref.Name); ok {
+						return b.OID
+					}
+				}
+				return 0
+			}
+			op.RestrictOID = resolveFn(s.OpRestrictFuncName)
+			op.JoinOID = resolveFn(s.OpJoinFuncName)
+
+			// COMMUTATOR / NEGATOR: two-pass forward-reference resolution
+			// mirroring get_other_operator/OperatorShellMake (pg_operator.c).
+			// The referenced operator may not exist yet — resolve it if
+			// already registered (real or shell), detect self-linkage (the
+			// operator being created is itself the commutator/negator), or
+			// else forward-declare a shell purely to mint a stable OID.
+			resolveOther := func(ref parser.ObjectName, otherLeft, otherRight string) (oid uint32, selfLink bool) {
+				otherSchema := ref.Schema
+				if otherSchema == "" {
+					otherSchema = schema
+				}
+				if existing, ok := im.LookupUserOperator(otherSchema, ref.Name, otherLeft, otherRight); ok {
+					return existing.OID, false
+				}
+				if strings.EqualFold(otherSchema, schema) && ref.Name == s.ObjName.Name &&
+					otherLeft == leftArg && otherRight == rightArg {
+					return 0, true
+				}
+				otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema)
+				if otherNsOID == 0 {
+					otherNsOID = nsOID
+				}
+				shell := im.EnsureUserOperatorShell(otherSchema, ref.Name, otherLeft, otherRight, otherNsOID)
+				return shell.OID, false
+			}
+
+			var commutatorOID uint32
+			selfCommutator := false
+			if hasCommutator {
+				// The commutator has reversed argument types.
+				commutatorOID, selfCommutator = resolveOther(s.OpCommutatorName, rightArg, leftArg)
+				if selfCommutator {
+					commutatorOID = op.OID
+				}
+			}
+			var negatorOID uint32
+			if hasNegator {
+				var selfNegator bool
+				negatorOID, selfNegator = resolveOther(s.OpNegatorName, leftArg, rightArg)
+				if selfNegator || negatorOID == op.OID {
+					return invalidDef("operator cannot be its own negator")
+				}
+			}
+			// Only overwrite when the clause was actually restated: a later
+			// CREATE OPERATOR statement that merely fills in a shell (no
+			// COMMUTATOR/NEGATOR clause of its own) must not clobber a link
+			// already back-patched onto it by the other side.
+			if hasCommutator {
+				op.CommutatorOID = commutatorOID
+			}
+			if hasNegator {
+				op.NegatorOID = negatorOID
+			}
+
+			// Back-patch: if the referenced commutator/negator already exists
+			// (real or shell) and doesn't already point somewhere else, make
+			// it point back at this operator (OperatorUpd). This lets a pair
+			// of operators be defined in either order without restating the
+			// link on both sides.
+			if hasCommutator && !selfCommutator {
+				if other := im.LookupUserOperatorByOID(commutatorOID); other != nil && other.CommutatorOID == 0 {
+					other.CommutatorOID = op.OID
+				}
+			}
+			if hasNegator {
+				if other := im.LookupUserOperatorByOID(negatorOID); other != nil && other.NegatorOID == 0 {
+					other.NegatorOID = op.OID
+				}
+			}
 		}
 	case "cast":
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it

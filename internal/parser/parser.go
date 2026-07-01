@@ -1658,6 +1658,42 @@ func (p *parser) parseOperatorName() (ObjectName, error) {
 	return ObjectName{}, p.errSyntaxAtCur()
 }
 
+// parseOperatorRefName parses an operator reference as used in a CREATE
+// OPERATOR statement's COMMUTATOR = / NEGATOR = clause. PG's own pg_dump
+// always emits the schema-qualified `OPERATOR(schema.op)` form (dumpOpr's
+// getFormattedOperatorName, pg_dump.c), but hand-written SQL may also use a
+// bare (optionally schema-qualified) operator symbol, so both are accepted
+// here — the latter simply falls through to parseOperatorName. DU-002
+// slice 407.
+func (p *parser) parseOperatorRefName() (ObjectName, error) {
+	if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "operator") &&
+		p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+		p.advance() // OPERATOR
+		p.advance() // (
+		schema := ""
+		if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "." {
+			schema = identText(p.cur())
+			p.advance() // schema name
+			p.advance() // .
+		}
+		pos := p.cur().Pos
+		opName := ""
+		for p.cur().Kind == TokenOperator {
+			opName += p.cur().Value
+			p.advance()
+		}
+		if opName == "" && p.cur().Kind != TokenSymbol {
+			opName = p.cur().Value
+			p.advance()
+		}
+		if opName == "" || !p.acceptSymbol(")") {
+			return ObjectName{}, p.errSyntaxAtCur()
+		}
+		return ObjectName{pos: pos, Schema: schema, Name: opName}, nil
+	}
+	return p.parseOperatorName()
+}
+
 // parseObjectName parses [schema.]name where each part is an
 // identifier (possibly quoted).
 func (p *parser) parseObjectName() (ObjectName, error) {

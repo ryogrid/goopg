@@ -1991,6 +1991,24 @@ type CompatNoopStmt struct {
 	// when the statement is not a CREATE OPERATOR or the FUNCTION clause could
 	// not be parsed. DU-002 (M0119-0004).
 	OpFuncName ObjectName
+	// OpCommutatorName / OpNegatorName carry a CREATE OPERATOR statement's
+	// COMMUTATOR = / NEGATOR = clauses: a reference to another operator,
+	// either a bare (optionally schema-qualified) operator symbol or
+	// pg_dump's emitted `OPERATOR(schema.op)` form. OpRestrictFuncName /
+	// OpJoinFuncName carry the RESTRICT = / JOIN = clauses — a bare
+	// (optionally schema-qualified) function name, mirroring OpFuncName.
+	// OpCanMerge / OpCanHash carry the bare MERGES / HASHES flags. Zero
+	// value (empty Name / false) when the corresponding clause is absent.
+	// The executor resolves the operator references via a two-pass
+	// forward-reference scheme mirroring PG's OperatorShellMake/OperatorUpd
+	// (pg_operator.c) since COMMUTATOR/NEGATOR may name an operator that
+	// does not exist yet. DU-002 slice 407.
+	OpCommutatorName   ObjectName
+	OpNegatorName      ObjectName
+	OpRestrictFuncName ObjectName
+	OpJoinFuncName     ObjectName
+	OpCanMerge         bool
+	OpCanHash          bool
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

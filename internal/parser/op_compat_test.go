@@ -299,3 +299,64 @@ func TestParseCreateRuleTableName(t *testing.T) {
 		t.Errorf("TableName.Name = %q, want %q", ns.TableName.Name, "test_exists")
 	}
 }
+
+// TestParseCreateOperatorExtendedClauses verifies the DU-002 slice 407
+// extension of the CREATE OPERATOR key-value scanner: COMMUTATOR/NEGATOR
+// (both the bare-symbol and pg_dump-emitted OPERATOR(schema.op) forms),
+// RESTRICT/JOIN function references, and the bare MERGES/HASHES flags.
+func TestParseCreateOperatorExtendedClauses(t *testing.T) {
+	sql := `CREATE OPERATOR public.=== (
+        FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4,
+        COMMUTATOR = OPERATOR(public.===),
+        NEGATOR = !==,
+        RESTRICT = eqsel, JOIN = eqjoinsel,
+        MERGES, HASHES
+    )`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Expected 1 stmt, got %d", len(stmts))
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.OpCommutatorName.Schema != "public" || ns.OpCommutatorName.Name != "===" {
+		t.Errorf("OpCommutatorName = %+v, want {public ===}", ns.OpCommutatorName)
+	}
+	if ns.OpNegatorName.Name != "!==" {
+		t.Errorf("OpNegatorName = %+v, want {!==}", ns.OpNegatorName)
+	}
+	if ns.OpRestrictFuncName.Name != "eqsel" {
+		t.Errorf("OpRestrictFuncName = %+v, want {eqsel}", ns.OpRestrictFuncName)
+	}
+	if ns.OpJoinFuncName.Name != "eqjoinsel" {
+		t.Errorf("OpJoinFuncName = %+v, want {eqjoinsel}", ns.OpJoinFuncName)
+	}
+	if !ns.OpCanMerge {
+		t.Error("OpCanMerge = false, want true")
+	}
+	if !ns.OpCanHash {
+		t.Error("OpCanHash = false, want true")
+	}
+}
+
+// TestParseCreateOperatorUnary verifies a LEFTARG-omitted (prefix/unary)
+// CREATE OPERATOR parses with an empty ArgTypes[0], matching PG's grammar
+// (RIGHTARG is always required — postfix operators were removed in PG14).
+func TestParseCreateOperatorUnary(t *testing.T) {
+	sql := `CREATE OPERATOR @@- (FUNCTION = int4um, RIGHTARG = int4)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if len(ns.ArgTypes) != 2 || ns.ArgTypes[0] != "" || ns.ArgTypes[1] != "int4" {
+		t.Errorf("ArgTypes = %v, want [\"\" int4]", ns.ArgTypes)
+	}
+}

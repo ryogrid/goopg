@@ -182,9 +182,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 		// pg_dump's getOperators/dumpOpr; the two names are synonyms in PG's
 		// operatorcmds.c). DU-002 (M0119-0004).
 		opName, _ := p.parseOperatorName()
-		// Extract leftarg/rightarg/function from the parenthesised option list.
+		// Extract leftarg/rightarg/function/commutator/negator/restrict/join/
+		// merges/hashes from the parenthesised option list. DU-002 slice 407
+		// extends the original FUNCTION/LEFTARG/RIGHTARG-only skeleton.
 		var leftArg, rightArg string
-		var opFunc ObjectName
+		var opFunc, commutatorOp, negatorOp, restrictFunc, joinFunc ObjectName
+		var canMerge, canHash bool
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance() // consume '('
 			depth := 1
@@ -207,32 +210,68 @@ func (p *parser) parseCreate() (Stmt, error) {
 						continue
 					}
 				}
-				// Look for "key = value" pairs (leftarg/rightarg/function/procedure/...).
+				// Look for "key = value" pairs (leftarg/rightarg/function/procedure/...)
+				// or the bare MERGES/HASHES flags (no "= value" at all).
 				if depth == 1 && (tok.Kind == TokenIdent || tok.Kind == TokenKeyword) {
 					key := strings.ToLower(tok.Value)
 					p.advance()
+					if key == "merges" || key == "hashes" {
+						val := true
+						if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+							p.advance()
+							if p.cur().Kind == TokenKeyword && strings.EqualFold(p.cur().Value, "false") {
+								val = false
+							}
+							if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+								p.advance()
+							}
+						}
+						if key == "merges" {
+							canMerge = val
+						} else {
+							canHash = val
+						}
+						continue
+					}
 					if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
 						p.advance()
-						if key == "function" || key == "procedure" {
+						switch key {
+						case "function", "procedure":
 							// A (possibly schema-qualified) function name — no
 							// parenthesised arg-type list in this grammar position
 							// (PG infers the signature from LEFTARG/RIGHTARG).
 							if fn, ferr := p.parseObjectName(); ferr == nil {
 								opFunc = fn
 							}
-							continue
-						}
-						// Collect type name (may be multi-word like "double precision").
-						var typeParts []string
-						for p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
-							typeParts = append(typeParts, p.cur().Value)
-							p.advance()
-						}
-						typeName := strings.Join(typeParts, " ")
-						if key == "leftarg" {
-							leftArg = typeName
-						} else if key == "rightarg" {
-							rightArg = typeName
+						case "restrict":
+							if fn, ferr := p.parseObjectName(); ferr == nil {
+								restrictFunc = fn
+							}
+						case "join":
+							if fn, ferr := p.parseObjectName(); ferr == nil {
+								joinFunc = fn
+							}
+						case "commutator":
+							if ref, oerr := p.parseOperatorRefName(); oerr == nil {
+								commutatorOp = ref
+							}
+						case "negator":
+							if ref, oerr := p.parseOperatorRefName(); oerr == nil {
+								negatorOp = ref
+							}
+						default:
+							// Collect type name (may be multi-word like "double precision").
+							var typeParts []string
+							for p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+								typeParts = append(typeParts, p.cur().Value)
+								p.advance()
+							}
+							typeName := strings.Join(typeParts, " ")
+							if key == "leftarg" {
+								leftArg = typeName
+							} else if key == "rightarg" {
+								rightArg = typeName
+							}
 						}
 					}
 					continue
@@ -249,6 +288,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.ObjName = ObjectName{Name: opName.Name, Schema: opName.Schema}
 			ns.ArgTypes = []string{leftArg, rightArg}
 			ns.OpFuncName = opFunc
+			ns.OpCommutatorName = commutatorOp
+			ns.OpNegatorName = negatorOp
+			ns.OpRestrictFuncName = restrictFunc
+			ns.OpJoinFuncName = joinFunc
+			ns.OpCanMerge = canMerge
+			ns.OpCanHash = canHash
 		}
 		return stmt, nil
 	// CREATE [DEFAULT] CONVERSION name FOR 'src' TO 'dest' FROM func — register so

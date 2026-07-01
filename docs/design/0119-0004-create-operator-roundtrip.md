@@ -1,8 +1,10 @@
-# CREATE OPERATOR round-trip in pg_dump (DU-002 slice 406)
+# CREATE OPERATOR round-trip in pg_dump (DU-002 slice 406/407)
 
 - **Milestone/Spec:** M0119-0004 (pg_dump 002–010 TAP / DU-002 catalog-view parity battery)
 - **Status:** accepted
-- **Loop:** #30 (verifying/landing work started by a prior backgrounded loop)
+- **Loop:** #30 (slice 406, verifying/landing work started by a prior
+  backgrounded loop); #32 (slice 407, COMMUTATOR/NEGATOR/RESTRICT/JOIN/
+  MERGES/HASHES + unary operators)
 
 ## Problem
 
@@ -52,13 +54,60 @@ dump/restore.
 
 ## Scope / limitations
 
-Only the skeleton clauses (FUNCTION/PROCEDURE, LEFTARG, RIGHTARG) are parsed
-and modeled. `COMMUTATOR`, `NEGATOR`, `RESTRICT`, `JOIN`, `MERGES`, `HASHES`,
-and unary (prefix) operators are not — a `CREATE OPERATOR` using any of those
-clauses round-trips its FUNCTION/LEFTARG/RIGHTARG only, silently dropping the
-rest. goopg does not execute the operator itself (no expression-evaluator
-dispatch through a user FUNCTION for a custom operator symbol) — this is
-dump-fidelity only, matching the trigger-roundtrip precedent.
+Only the skeleton clauses (FUNCTION/PROCEDURE, LEFTARG, RIGHTARG) were parsed
+and modeled in slice 406. goopg does not execute the operator itself (no
+expression-evaluator dispatch through a user FUNCTION for a custom operator
+symbol) — this is dump-fidelity only, matching the trigger-roundtrip
+precedent.
+
+## Slice 407: COMMUTATOR/NEGATOR/RESTRICT/JOIN/MERGES/HASHES + unary operators
+
+Extends slice 406's skeleton to the remaining `CREATE OPERATOR` clauses and
+unary (prefix) operator forms, closing the gap the slice-406 ledger row
+recorded.
+
+- **Parser** (`internal/parser/ddl.go`, `parser.go`): the key-value scanner
+  gains `restrict`/`join` (bare, optionally schema-qualified function name —
+  same grammar shape as `function`), `commutator`/`negator` (an operator
+  reference via new `parseOperatorRefName`, which accepts both a bare
+  operator symbol and pg_dump's emitted `OPERATOR(schema.op)` form —
+  `getFormattedOperatorName`, pg_dump.c), and the bare `merges`/`hashes`
+  flags (no `=` value, though `= true`/`= false` is also tolerated). LEFTARG
+  is now optional — an absent LEFTARG models a unary (prefix) operator
+  (`ArgTypes[0] == ""`); RIGHTARG is still required (PG14+ removed postfix
+  operators outright). New fields on `CompatNoopStmt`: `OpCommutatorName`,
+  `OpNegatorName`, `OpRestrictFuncName`, `OpJoinFuncName`, `OpCanMerge`,
+  `OpCanHash`.
+- **Catalog** (`internal/catalog/catalog.go`): `UserOperator` gains
+  `CommutatorOID`/`NegatorOID`/`RestrictOID`/`JoinOID`/`CanMerge`/`CanHash`.
+  New `LookupUserOperator` (by identity key), `LookupUserOperatorByOID`, and
+  `EnsureUserOperatorShell` — the last mirrors PG's `OperatorShellMake`
+  (`pg_operator.c`): a `COMMUTATOR`/`NEGATOR` clause may forward-reference an
+  operator that doesn't exist yet, so a placeholder row (`FuncOID == 0`) is
+  inserted purely to mint a stable OID; the operator's own later `CREATE
+  OPERATOR` statement fills it in for free, since `RegisterUserOperator` is
+  idempotent by the same `(schema,name,leftType,rightType)` key and therefore
+  reuses the shell's OID. `pg_operator.VirtualRows` now renders
+  `oprcanmerge`/`oprcanhash` from the new fields, `oprcom`/`oprnegate`/
+  `oprrest`/`oprjoin` from the resolved OIDs, `oprkind='l'` when `LeftType==
+  ""` (unary), and skips any row whose `FuncOID==0` — an unfilled shell,
+  mirroring `dumpOpr`'s own `if (!OidIsValid(oprinfo->oprcode)) return;`.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s
+  `"operator"` case rejects a missing RIGHTARG (postfix — 42P13, "Postfix
+  operators are not supported."), resolves RESTRICT/JOIN exactly like
+  FUNCTION, and resolves COMMUTATOR/NEGATOR via a two-pass forward-reference
+  scheme mirroring PG's `get_other_operator`/`OperatorShellMake`/
+  `OperatorUpd` (`pg_operator.c`): look up an existing (real or shell)
+  operator by identity first, detect self-linkage (an operator naming
+  itself, valid for a symmetric COMMUTATOR like `=` but always rejected for
+  NEGATOR — "operator cannot be its own negator"), else forward-declare a
+  shell. After linking this operator, it back-patches the other side's own
+  `CommutatorOID`/`NegatorOID` if not already set, so a pair of operators can
+  be defined in either order while only one statement restates the link.
+  Also ports PG's `OperatorValidateParams` (`operatorcmds.c`) attribute
+  gating: COMMUTATOR/JOIN/MERGES/HASHES require a binary operator (both
+  LEFTARG and RIGHTARG); NEGATOR/RESTRICT/JOIN/MERGES/HASHES require a
+  boolean-returning FUNCTION (all 42P13).
 
 ## Blast radius
 
@@ -86,13 +135,26 @@ only; LEFTARG/RIGHTARG spelled out via `format_type`, e.g. `int` →
   `ALTER OPERATOR public.~~ (integer, integer) OWNER TO` line (the latter is
   pg_dump's own generic owner-emission machinery reading `oprowner` — no
   goopg-side rendering code needed), verified vs real pg_dump 18.3.
+- **Slice 407** (new tests, no existing fixture exercises these clauses):
+  `TestParseCreateOperatorExtendedClauses`/`TestParseCreateOperatorUnary`
+  (parser); `TestCreateOperatorCommutatorNegatorBackPatch`/
+  `TestCreateOperatorSelfCommutator`/`TestCreateOperatorSelfNegatorRejected`/
+  `TestCreateOperatorUnaryAndValidation` (executor, `create_operator_test.go`)
+  cover the two-pass shell resolution (including reuse of a shell's OID on
+  fill-in and shell-exclusion from `pg_operator.VirtualRows` until filled),
+  self-commutator, self-negator rejection, unary/prefix operators, postfix
+  rejection, and the binary/boolean attribute-gating rules.
 - `internal/catalog` + `internal/executor` + `internal/parser` suites PASS;
-  `go build ./...` / `go vet ./...` clean; TPC-H spotcheck Q12=2/Q13=33 PASS;
+  `go build ./...` clean; `gofmt -l` reports pre-existing go1.25/1.26 drift
+  only (verified against `git show HEAD:<file>` — every touched file already
+  failed `gofmt -l` before this change); TPC-H spotcheck Q12=2/Q13=33 PASS;
   pgbench smoke = pre-commit hook.
 
 ## Still open under M0119-0004
 
-COMMUTATOR/NEGATOR/RESTRICT/JOIN/MERGES/HASHES clauses; unary (prefix)
-operator forms; `regoper`/`regoperator` OID→name resolution (no column is
-typed `regoper` yet, so no observable gap); further pg_dump 002–010 catalog
-parity slices.
+`regoper`/`regoperator` OID→name resolution (no column is typed `regoper`
+yet, so no observable gap); `ALTER OPERATOR name (...) SET (RESTRICT = ...,
+JOIN = ...)` to attach RESTRICT/JOIN after the fact (no fixture exercises
+this; `ALTER OPERATOR` support today is limited to the generic `OWNER TO`
+compat path) — see the ledger row appended for slice 407; further pg_dump
+002–010 catalog parity slices.
