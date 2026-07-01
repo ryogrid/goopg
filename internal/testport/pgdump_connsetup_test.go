@@ -5197,6 +5197,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"finalfunc = int8_avg, finalfunc_modify = shareable, initcond1 = '{0,0}')"); err != nil {
 		t.Fatalf("create aggregate newavg: %v", err)
 	}
+	// Slice 405 follow-up (loop #58 ledger resume point (a)): ALTER AGGREGATE
+	// ... OWNER TO must round-trip through a real pg_dump 18.3 run. dumpAgg
+	// (pg_dump.c) reads the owner from pg_proc.proowner for the aggregate's
+	// aggfnoid; pg_backup_archiver.c's _getObjectDescription/_printTocEntry
+	// then emit `ALTER AGGREGATE <sig> OWNER TO <role>;` whenever the owner
+	// isn't the bootstrap superuser (mirrors the ALTER STATISTICS/ALTER TABLE
+	// OWNER TO assertions elsewhere in this file). This exercises
+	// pg_proc_view.go's aggregate proowner projection (OwnerOrDefault) end to
+	// end, not just via unit test.
+	if err := runSQLSimple(t, c, "CREATE ROLE agg_owner_role"); err != nil {
+		t.Fatalf("create role agg_owner_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER AGGREGATE public.newavg(int4) OWNER TO agg_owner_role"); err != nil {
+		t.Fatalf("alter aggregate newavg owner to agg_owner_role: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8029,6 +8044,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"    FINALFUNC_MODIFY = SHAREABLE\n" +
 			");"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing CREATE AGGREGATE %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 405 follow-up (asserted, loop #58 ledger resume point (a)):**
+		// ALTER AGGREGATE ... OWNER TO must round-trip. dumpAgg reads the owner
+		// from pg_proc.proowner for the aggregate's aggfnoid; _getObjectDescription
+		// treats AGGREGATE like FUNCTION/OPERATOR (strips "DROP " off the DROP
+		// statement to build the ALTER target), so the emitted line is
+		// `ALTER AGGREGATE public.newavg(integer) OWNER TO agg_owner_role;`.
+		// Before this fixture, pg_proc_view.go's `proowner` projection for a
+		// user aggregate (OwnerOrDefault) was only unit-tested, never proven
+		// against a real pg_dump 18.3 run.
+		if want := "ALTER AGGREGATE public.newavg(integer) OWNER TO agg_owner_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER AGGREGATE OWNER TO %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

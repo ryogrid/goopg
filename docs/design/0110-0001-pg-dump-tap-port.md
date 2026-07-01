@@ -10730,6 +10730,38 @@ Deferred (unchanged, carried forward from slice 405): `pronamespace`
 hardcoded to `public`; built-in aggregates' `aggtransfn`/`aggfinalfn`/...
 still render raw numeric OIDs (not names) on a direct query.
 
+### `ALTER AGGREGATE ... OWNER TO` pg_dump fixture (closes the loop #58 ledger row's resume point (a))
+
+The ownership wiring above landed with unit/WAL/recovery coverage only — no
+`TestPort_PgDumpConnectionSetup` fixture had exercised it through a real
+`pg_dump` 18.3 run. Added: `CREATE ROLE agg_owner_role` +
+`ALTER AGGREGATE public.newavg(int4) OWNER TO agg_owner_role` to the setup
+SQL (`internal/testport/pgdump_connsetup_test.go`), plus an assertion that
+`res.Stdout` contains `ALTER AGGREGATE public.newavg(integer) OWNER TO
+agg_owner_role;`.
+
+This required no new engine code — `execAlterAggregateOwner` (name-only
+match) and `pg_proc_view.go`'s `proowner` projection (`OwnerOrDefault()`)
+were already wired from loop #58. `pg_dump`'s `dumpAgg` (`pg_dump.c`) reads
+the aggregate's owner from `pg_proc.proowner` for its `aggfnoid`;
+`_getObjectDescription` (`pg_backup_archiver.c`) treats `AGGREGATE` like
+`FUNCTION`/`OPERATOR` — it builds the `ALTER ... OWNER TO` target by
+stripping the leading `"DROP "` off the object's `DROP` statement text
+(`DROP AGGREGATE public.newavg(integer);` → `AGGREGATE
+public.newavg(integer)`), then `_printTocEntry` emits `ALTER %s OWNER TO
+%s;`. The fixture is a pure verification step confirming the existing
+plumbing produces byte-identical output against the real binary, not just a
+unit-test double.
+
+Gates: `TestPort_PgDumpConnectionSetup` PASS (full suite, this fixture
+included); `go build ./...` clean; `go vet ./internal/testport/...` clean;
+`internal/catalog`+`internal/executor`+`internal/parser` suites PASS; TPC-H
+spotcheck Q12/Q13.
+
+Deferred (unchanged, carried forward): `pronamespace` hardcoded to
+`public`; built-in aggregates' `aggtransfn`/`aggfinalfn`/... still render
+raw numeric OIDs on a direct query.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

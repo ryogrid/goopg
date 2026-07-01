@@ -3945,6 +3945,25 @@ documentation-only and is exempt from the design-doc requirement.)
       rendering remain open; no `pg_dump` fixture yet exercises a non-default
       aggregate owner (untested end-to-end dump round-trip, though the
       renderer/catalog plumbing is in place).
+      **2026-07-01 (loop #59): `ALTER AGGREGATE ... OWNER TO` pg_dump fixture
+      LANDED** — closes the loop #58 row's resume point (a) ("no `pg_dump`
+      fixture yet exercises a non-default aggregate owner"). New setup SQL in
+      `TestPort_PgDumpConnectionSetup` (`CREATE ROLE agg_owner_role` +
+      `ALTER AGGREGATE public.newavg(int4) OWNER TO agg_owner_role`) plus an
+      assertion that a real pg_dump 18.3 run emits `ALTER AGGREGATE
+      public.newavg(integer) OWNER TO agg_owner_role;` — byte-identical,
+      confirming `dumpAgg`'s `pg_proc.proowner` read + `_getObjectDescription`'s
+      AGGREGATE-as-FUNCTION/OPERATOR OWNER-TO-target derivation
+      (`pg_backup_archiver.c`) against the loop #58 `execAlterAggregateOwner`/
+      `pg_proc_view.go` `OwnerOrDefault()` wiring — no new engine code needed,
+      pure verification. Design doc updated (new "`ALTER AGGREGATE ... OWNER
+      TO` pg_dump fixture" subsection in `0110-0001-pg-dump-tap-port.md`).
+      Gates: `go build ./...` clean; `go vet ./internal/testport/...` clean;
+      `TestPort_PgDumpConnectionSetup` PASS; `internal/catalog`+
+      `internal/executor`+`internal/parser` suites PASS; TPC-H spotcheck
+      Q12/Q13. Deferred (unchanged, ledger row appended): slice 405 resume
+      point (b) — `pronamespace` hardcoded to `public` and built-in-aggregate
+      raw-OID rendering remain open.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
