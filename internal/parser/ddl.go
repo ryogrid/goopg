@@ -161,6 +161,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 	//   runtime pg_cast registry so pg_dump round-trips it. DU-002 slice 395.
 	case p.acceptIdentKeyword("cast"):
 		return p.parseCreateCastTail(t.Pos)
+	// CREATE [OR REPLACE] TRANSFORM FOR type LANGUAGE lang ( FROM SQL WITH
+	//   FUNCTION fn[(args)] [, TO SQL WITH FUNCTION fn[(args)]] | ... ) —
+	//   register in the runtime pg_transform registry so pg_dump round-trips
+	//   it. DU-002 (M0119-0004).
+	case p.acceptIdentKeyword("transform"):
+		return p.parseCreateTransformTail(t.Pos)
 	// CREATE AGGREGATE name (sfunc=F, basetype=T, stype=S [, ...]) — validate basetype.
 	// M0097-regress.
 	case p.acceptIdentKeyword("aggregate"):
@@ -717,15 +723,33 @@ func (p *parser) parseCreateTablespaceTail(pos int) (Stmt, error) {
 // AS keyword, a comma, or a closing/opening paren. CREATE CAST type names carry
 // no typmod, so the scan never has to balance parens. DU-002 slice 395.
 func (p *parser) parseCastTypeName() string {
+	return p.parseSimpleTypeName(KwAs)
+}
+
+// parseSimpleTypeName reads a (possibly schema-qualified, possibly multi-word)
+// type name, stopping at any of the given stop keywords, a comma, or a
+// closing/opening paren. Shared by CREATE/DROP CAST (stops at AS) and
+// CREATE/DROP TRANSFORM (stops at LANGUAGE) — neither carries a typmod, so
+// the scan never has to balance parens. DU-002 (slice 395; TRANSFORM
+// M0119-0004).
+func (p *parser) parseSimpleTypeName(stopKeywords ...Keyword) string {
 	var parts []string
 	for {
 		tok := p.cur()
 		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
 			break
 		}
-		// AS separates source from target / introduces ASSIGNMENT|IMPLICIT; never
-		// part of a type name.
-		if tok.Kind == TokenKeyword && tok.Keyword == KwAs {
+		// A stop keyword separates the type name from what follows (e.g. AS
+		// introduces the cast target / ASSIGNMENT|IMPLICIT, LANGUAGE introduces
+		// a CREATE TRANSFORM's language name); never part of a type name.
+		stop := false
+		for _, kw := range stopKeywords {
+			if tok.Kind == TokenKeyword && tok.Keyword == kw {
+				stop = true
+				break
+			}
+		}
+		if stop {
 			break
 		}
 		word := tok.Value
@@ -818,6 +842,95 @@ func (p *parser) parseCreateCastTail(pos int) (Stmt, error) {
 	}
 	ns.CastContext = context
 
+	return parseSkipToSemicolonHelper(p, ns)
+}
+
+// parseCreateTransformTail picks up after "CREATE [OR REPLACE] TRANSFORM". It
+// parses
+//
+//	FOR type_name LANGUAGE lang_name (
+//	    { FROM SQL WITH FUNCTION fn[(argtypes)]
+//	        [ , TO SQL WITH FUNCTION fn[(argtypes)] ]
+//	    | TO SQL WITH FUNCTION fn[(argtypes)]
+//	        [ , FROM SQL WITH FUNCTION fn[(argtypes)] ]
+//	    }
+//	)
+//
+// (PostgreSQL's transform_element_list: either half alone, or both in either
+// order) and records the type/language/from-function/to-function on a
+// CompatNoopStmt so the executor registers the transform and pg_dump round-
+// trips it (pg_transform virtual view → getTransforms/dumpTransform). "SQL" is
+// an unreserved ident (no dedicated keyword token), matched via
+// acceptIdentKeyword. DU-002 (M0119-0004).
+func (p *parser) parseCreateTransformTail(pos int) (Stmt, error) {
+	ns := &CompatNoopStmt{pos: pos, Tag: "CREATE TRANSFORM", ObjType: "transform"}
+	if !p.acceptKeyword(KwFor) {
+		return nil, p.errAtCur("expected FOR in CREATE TRANSFORM")
+	}
+	ns.TransformType = p.parseSimpleTypeName(KwLanguage)
+	if !p.acceptKeyword(KwLanguage) {
+		return nil, p.errAtCur("expected LANGUAGE in CREATE TRANSFORM")
+	}
+	lang, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	ns.TransformLang = lang.Value
+	if !p.acceptSymbol("(") {
+		return nil, p.errSyntaxAtCur()
+	}
+	// At most 2 elements (FROM SQL and/or TO SQL, either order); each iteration
+	// requires a leading FROM/TO or the element list is done.
+elements:
+	for elem := 0; elem < 2; elem++ {
+		var isFrom bool
+		switch {
+		case p.acceptKeyword(KwFrom):
+			isFrom = true
+		case p.acceptKeyword(KwTo):
+			isFrom = false
+		default:
+			break elements
+		}
+		if !p.acceptIdentKeyword("sql") {
+			return nil, p.errAtCur("expected SQL after FROM/TO in CREATE TRANSFORM")
+		}
+		if !p.acceptKeyword(KwWith) {
+			return nil, p.errAtCur("expected WITH in CREATE TRANSFORM")
+		}
+		if !p.acceptKeyword(KwFunction) {
+			return nil, p.errAtCur("expected FUNCTION in CREATE TRANSFORM")
+		}
+		fn, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		var args []string
+		if p.acceptSymbol("(") {
+			for !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") && p.cur().Kind != TokenEOF {
+				if at := p.parseCastTypeName(); at != "" {
+					args = append(args, at)
+				}
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+			_ = p.acceptSymbol(")")
+		}
+		if isFrom {
+			ns.TransformFromFunc = fn
+			ns.TransformFromArgs = args
+		} else {
+			ns.TransformToFunc = fn
+			ns.TransformToArgs = args
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errSyntaxAtCur()
+	}
 	return parseSkipToSemicolonHelper(p, ns)
 }
 
@@ -4516,12 +4629,51 @@ func (p *parser) parseDrop() (Stmt, error) {
 			CastTypes: []string{fromType, toType},
 		}, nil
 	}
+	// DROP TRANSFORM [IF EXISTS] FOR type LANGUAGE lang [CASCADE|RESTRICT] —
+	// "transform" is an ident keyword; the identity is a (type, language) pair,
+	// not a name, so it cannot use the generic ident-based stub loop below (that
+	// loop's parseDropTail expects a comma-separated name list). DU-002
+	// (M0119-0004).
+	if p.acceptIdentKeyword("transform") {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		if !p.acceptKeyword(KwFor) {
+			return nil, p.errAtCur("expected FOR in DROP TRANSFORM")
+		}
+		typeName := p.parseSimpleTypeName(KwLanguage)
+		if !p.acceptKeyword(KwLanguage) {
+			return nil, p.errAtCur("expected LANGUAGE in DROP TRANSFORM")
+		}
+		lang, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		behavior := DropDefault
+		switch {
+		case p.acceptKeyword(KwCascade):
+			behavior = DropCascade
+		case p.acceptKeyword(KwRestrict):
+		}
+		return &DropCompatStmt{
+			pos:           t.Pos,
+			ObjType:       "transform",
+			IfExists:      ifExists,
+			Behavior:      behavior,
+			TransformType: typeName,
+			TransformLang: lang.Value,
+		}, nil
+	}
 	// Handle ident-based DROP targets as compatibility stubs. M0097-0008.
 	for _, objType := range []string{
 		"sequence", "schema",
 		"collation",
 		"materialized", "extension", "server",
-		"language", "access", "event", "transform",
+		"language", "access", "event",
 		"group", "role", "user",
 		"conversion", // M0097-0071
 	} {

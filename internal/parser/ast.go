@@ -1786,6 +1786,10 @@ type DropCompatStmt struct {
 	UsingMethod string
 	// CastTypes holds [fromType, toType] for DROP CAST (fromType AS toType). M0097-0071.
 	CastTypes []string
+	// TransformType / TransformLang hold the `FOR <type> LANGUAGE <lang>` pair
+	// for DROP TRANSFORM. DU-002 (M0119-0004).
+	TransformType string
+	TransformLang string
 }
 
 // CreateAggregateStmt is a minimal representation of CREATE AGGREGATE used to
@@ -1924,6 +1928,21 @@ type CompatNoopStmt struct {
 	ConvToEncoding  string
 	ConvFuncName    ObjectName
 	ConvDefault     bool
+	// TransformType / TransformLang carry a CREATE TRANSFORM statement's
+	// `FOR <type>` and `LANGUAGE <lang>` clauses. TransformFromFunc /
+	// TransformFromArgs and TransformToFunc / TransformToArgs carry the `FROM
+	// SQL WITH FUNCTION fn[(argtypes)]` / `TO SQL WITH FUNCTION fn[(argtypes)]`
+	// clauses (Name empty when that half is absent — PG allows either or both,
+	// in either order). The executor resolves the function names to pg_proc
+	// OIDs and records the transform in the catalog registry so pg_dump's
+	// getTransforms / dumpTransform re-emit the statement. Empty when the
+	// statement is not a CREATE TRANSFORM. DU-002 (M0119-0004).
+	TransformType     string
+	TransformLang     string
+	TransformFromFunc ObjectName
+	TransformFromArgs []string
+	TransformToFunc   ObjectName
+	TransformToArgs   []string
 }
 
 // TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …

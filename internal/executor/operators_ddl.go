@@ -12308,6 +12308,21 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
 	}
 
+	// DROP TRANSFORM FOR type LANGUAGE lang — PG error: "transform for type X
+	// language Y does not exist". DU-002 (M0119-0004).
+	if objType == "transform" {
+		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		if ok && im.DropTransform(s.TransformType, s.TransformLang) {
+			return nil
+		}
+		msg := fmt.Sprintf("transform for type %s language %q does not exist", s.TransformType, s.TransformLang)
+		if s.IfExists {
+			o.ctx.AddNotice(msg + ", skipping")
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+	}
+
 	// DROP OPERATOR CLASS/FAMILY name USING method — M0097-0071.
 	// PG validates the access method first; if unknown, always errors (even with IF EXISTS).
 	// Known access methods: btree, hash, gist, gin, spgist, brin, heap.
@@ -13061,11 +13076,113 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateConversion(uc, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
+	case "transform":
+		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang
+		// (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] | ...)) so it
+		// round-trips through pg_dump (pg_transform view →
+		// getTransforms/dumpTransform). DU-002 (M0119-0004).
+		if catalog.LanguageNameToOID(s.TransformLang) == 0 {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("language %q does not exist", s.TransformLang)}
+		}
+		if im.TransformExists(s.TransformType, s.TransformLang) {
+			return &ExecError{Code: "42710", Message: fmt.Sprintf("transform for type %s language %q already exists", s.TransformType, s.TransformLang)}
+		}
+		rs := im.Routines()
+		var fromFuncOID, toFuncOID uint32
+		if s.TransformFromFunc.Name != "" {
+			oid, ferr := resolveTransformFunc(rs, s.TransformFromFunc, s.TransformFromArgs, true, s.TransformType)
+			if ferr != nil {
+				return ferr
+			}
+			fromFuncOID = oid
+		}
+		if s.TransformToFunc.Name != "" {
+			oid, ferr := resolveTransformFunc(rs, s.TransformToFunc, s.TransformToArgs, false, s.TransformType)
+			if ferr != nil {
+				return ferr
+			}
+			toFuncOID = oid
+		}
+		im.RegisterTransform(s.TransformType, s.TransformLang, fromFuncOID, toFuncOID)
 	default:
 		// text search dictionary/configuration/parser/template, language, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	}
 	return nil
+}
+
+// resolveTransformFunc resolves a CREATE TRANSFORM `FROM SQL WITH FUNCTION` /
+// `TO SQL WITH FUNCTION` clause's referenced function to its pg_proc OID and
+// validates it against PostgreSQL's CreateTransform + check_transform_function
+// (functioncmds.c): the role-specific return-type check (FROM SQL must return
+// `internal`; TO SQL must return the transform's declared type) runs first,
+// then not volatile, a normal function (not procedure/window), not SETOF, and
+// exactly one argument of type `internal`. Resolution mirrors CREATE CAST's
+// WITH FUNCTION handling (slice 397): the explicit arg-type list keys the
+// right overload, a bare `fn` (no args) falls back to the sole overload.
+//
+// Only USER-created (CREATE FUNCTION) routines are covered — goopg's routine
+// registry (catalog.Routines) does not include built-in functions (e.g.
+// int4recv, prsd_lextype), so a reference to a builtin resolves to OID 0
+// without error, exactly like CREATE CAST's WITH FUNCTION does for a builtin
+// (RegisterCast's funcOID stays 0 in the same situation). This is a systemic
+// gap — goopg's server-side pg_proc catalog does not expose builtin functions
+// at all (confirmed empirically: `SELECT * FROM pg_proc WHERE proname =
+// 'int4recv'` returns 0 rows) — see the deferral ledger for the resume point.
+func resolveTransformFunc(rs *catalog.Routines, fn parser.ObjectName, args []string, isFromSQL bool, transformType string) (uint32, error) {
+	if rs == nil {
+		return 0, nil
+	}
+	var routine *catalog.Routine
+	if len(args) > 0 {
+		argTypes := make([]catalog.Type, len(args))
+		for i, a := range args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a)}
+		}
+		if r, ok := rs.Lookup(fn, argTypes); ok && r != nil {
+			routine = r
+		}
+	}
+	if routine == nil {
+		if overloads := rs.LookupByName(fn); len(overloads) == 1 {
+			routine = overloads[0]
+		}
+	}
+	if routine == nil {
+		// Not a user-created routine (built-in, or genuinely missing) — leave
+		// unresolved rather than erroring; see the doc comment above.
+		return 0, nil
+	}
+	if isFromSQL {
+		if !strings.EqualFold(routine.ReturnType.Name, "internal") {
+			return 0, &ExecError{Code: "42P17", Message: "return data type of FROM SQL function must be internal"}
+		}
+	} else if catalog.TypeNameToOID(routine.ReturnType.Name) != catalog.TypeNameToOID(transformType) {
+		return 0, &ExecError{Code: "42P17", Message: "return data type of TO SQL function must be the transform data type"}
+	}
+	if routine.Volatile == "v" {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must not be volatile"}
+	}
+	if routine.IsProcedure || routine.IsWindow {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must be a normal function"}
+	}
+	if routine.ReturnsSet {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must not return a set"}
+	}
+	inArgs := make([]catalog.Type, 0, len(routine.ArgTypes))
+	for i, t := range routine.ArgTypes {
+		if i < len(routine.ArgModes) && routine.ArgModes[i] == "o" {
+			continue
+		}
+		inArgs = append(inArgs, t)
+	}
+	if len(inArgs) != 1 {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must take one argument"}
+	}
+	if !strings.EqualFold(inArgs[0].Name, "internal") {
+		return 0, &ExecError{Code: "42P17", Message: "first argument of transform function must be type internal"}
+	}
+	return routine.OID, nil
 }
 
 // typeACLAllPrivs is the expansion of GRANT ALL [PRIVILEGES] ON a TYPE/DOMAIN:

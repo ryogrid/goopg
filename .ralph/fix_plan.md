@@ -3442,6 +3442,27 @@ documentation-only and is exempt from the design-doc requirement.)
       byte-identical). Full detail in the ledger (slice-403 row). Still open under M0119-0004: the EXECUTE ACL check,
       the runtime `OidFunctionCall6` probe (needs an encoding-conversion engine), and restart persistence (recurring
       shared-catalog runtime-write gap).
+      **2026-07-01 (loop #45, slice 404): CREATE/DROP TRANSFORM skeleton** — new object family. Parser
+      `parseCreateTransformTail` (`FOR type LANGUAGE lang (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] |
+      ...)`, either half alone or both in either order) + a dedicated `DROP TRANSFORM FOR type LANGUAGE lang` case
+      (previously mis-routed through the generic ident-based DROP stub list, which cannot parse `FOR ... LANGUAGE
+      ...`). Shared `parseSimpleTypeName(stopKeywords...)` generalizes `parseCastTypeName`. Catalog `Transform`
+      registry (`RegisterTransform`/`TransformExists`/`DropTransform`/`ListTransforms`) + `LanguageNameToOID` +
+      populated `pg_transform.VirtualRows`. Executor `resolveTransformFunc` ports PG's `CreateTransform` +
+      `check_transform_function` rules (return-type role check, not volatile/procedure/SETOF, exactly one `internal`
+      arg), reusing CAST's WITH-FUNCTION lookup style. Tests: parser (`TestParseCreateTransform`/
+      `TestParseDropTransform`), catalog (`TestLanguageNameToOID`/`TestTransformRegistry`/
+      `TestPgTransformVirtualRows`), executor (`TestResolveTransformFunc`, 10 cases). Live smoke-tested against the
+      exact PG 18.3 TAP fixture SQL — registers/drops correctly, all error paths (unknown language, duplicate,
+      not-found) fire the right SQLSTATE. **NOT yet wired into the DU-002 connsetup fixture**: discovered (via 2
+      Explore-agent passes + a live empirical check) that goopg's server-side `pg_proc` catalog exposes NO builtin
+      functions at all (`SELECT * FROM pg_proc WHERE proname='int4recv'` → 0 rows), so the fixture's builtin
+      `prsd_lextype`/`int4recv` references can't resolve to non-zero `trffromsql`/`trftosql` — this is a
+      **pre-existing, previously-undocumented gap that already silently affects CAST's WITH FUNCTION (slice 397) and
+      CONVERSION's FROM-function (slice 402) too**, just never exercised by their fixtures. Ledger (slice-404 row)
+      has the full resume point: expose builtin pg_proc rows queryably (leaf-package name→metadata table, or a
+      catalog-level `LookupBuiltinProcByName` backed by whatever serves the live `pg_proc` view) so all three
+      WITH-FUNCTION-on-builtin call sites can resolve consistently.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

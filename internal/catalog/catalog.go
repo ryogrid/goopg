@@ -2186,6 +2186,14 @@ type InMemory struct {
 	// DU-002 slice 395.
 	casts map[string]*Cast
 
+	// transforms tracks user-defined transforms (CREATE TRANSFORM) with a
+	// stable OID so they round-trip through pg_dump's getTransforms
+	// (pg_transform virtual view → dumpTransform). goopg does not execute the
+	// transform machinery (PL-language argument marshaling); only enough
+	// metadata is kept for dump fidelity (type/language OIDs, from/to function
+	// OIDs). Key: lowercase "<type>\x00<lang>". DU-002 (M0119-0004).
+	transforms map[string]*Transform
+
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
 	tableRuleKinds map[string]string
@@ -6560,14 +6568,13 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_cast"] = pgCast
 
-	// pg_transform — transform catalog (OID 3576). goopg implements no
-	// language-transform objects, so this view is empty. pg_dump's getFuncs runs
-	// `EXISTS (SELECT 1 FROM pg_transform WHERE pg_transform.oid > <g_last_builtin_oid>
-	// AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))`; with
-	// no rows the subquery is always false. Schema matches PG's pg_transform (oid,
-	// trftype, trflang, trffromsql, trftosql); trffromsql/trftosql are typed oid
-	// (PG uses regproc, which is oid-compatible) so the `p.oid = …` comparisons
-	// resolve. M0110-0001 (DU-002).
+	// pg_transform — transform catalog (OID 3576). Schema matches PG's
+	// pg_transform (oid, trftype, trflang, trffromsql, trftosql); trffromsql/
+	// trftosql are typed oid (PG uses regproc, which is oid-compatible). A
+	// CREATE TRANSFORM registers a row here (catalog.Transform, ListTransforms)
+	// so pg_dump's getTransforms/dumpTransform re-emit it; with none registered
+	// this view is empty exactly as before. M0110-0001 (DU-002); CREATE
+	// TRANSFORM support added M0119-0004.
 	pgTransform := &Table{
 		Schema: "pg_catalog", Name: "pg_transform", Virtual: true,
 		Columns: []Column{
@@ -6579,7 +6586,23 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3576,
 	}
-	pgTransform.VirtualRows = func() [][]string { return nil }
+	pgTransform.VirtualRows = func() [][]string {
+		transforms := c.ListTransforms()
+		if len(transforms) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(transforms))
+		for _, tf := range transforms {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(tf.OID), 10),                    // oid
+				strconv.FormatUint(uint64(TypeNameToOID(tf.TypeName)), 10), // trftype
+				strconv.FormatUint(uint64(LanguageNameToOID(tf.Lang)), 10), // trflang
+				strconv.FormatUint(uint64(tf.FromFuncOID), 10),            // trffromsql (0 unless resolved)
+				strconv.FormatUint(uint64(tf.ToFuncOID), 10),              // trftosql (0 unless resolved)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_transform"] = pgTransform
 
 	// pg_language — procedural-language catalog (OID 2612). pg_dump's getProcLangs
@@ -10165,6 +10188,112 @@ func (c *InMemory) CastByTypes(source, target string) *Cast {
 		return cs
 	}
 	return nil
+}
+
+// Transform is a user-defined transform (CREATE TRANSFORM FOR type LANGUAGE
+// lang (FROM SQL WITH FUNCTION ... , TO SQL WITH FUNCTION ...)). goopg does
+// not execute the transform machinery (PL-language argument marshaling);
+// this records just enough metadata to round-trip the definition through
+// pg_dump (pg_transform virtual view → getTransforms/dumpTransform). DU-002
+// (M0119-0004).
+type Transform struct {
+	OID      uint32 // pg_transform.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
+	TypeName string // the parsed FOR type name; resolved to trftype OID via TypeNameToOID at render time
+	Lang     string // the parsed LANGUAGE name; resolved to trflang OID via LanguageNameToOID at render time
+	// FromFuncOID / ToFuncOID are pg_transform.trffromsql / trftosql. 0 when
+	// that half is absent (PG allows either or both alone) or when the
+	// referenced function could not be resolved to a pg_proc OID — goopg's
+	// user routine registry (catalog.Routines) does not cover built-in
+	// functions, a gap shared with CREATE CAST's WITH FUNCTION resolution
+	// (RegisterCast's funcOID parameter has the same limitation).
+	FromFuncOID uint32
+	ToFuncOID   uint32
+}
+
+// RegisterTransform records a user-defined transform, allocating a stable OID
+// on first sight. Idempotent: re-registering the same (type, lang) pair
+// refreshes the from/to function OIDs but keeps the OID. DU-002 (M0119-0004).
+func (c *InMemory) RegisterTransform(typeName, lang string, fromFuncOID, toFuncOID uint32) *Transform {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		c.transforms = make(map[string]*Transform)
+	}
+	key := strings.ToLower(typeName) + "\x00" + strings.ToLower(lang)
+	if tf, ok := c.transforms[key]; ok {
+		tf.FromFuncOID = fromFuncOID
+		tf.ToFuncOID = toFuncOID
+		return tf
+	}
+	tf := &Transform{OID: c.allocOIDLocked(), TypeName: typeName, Lang: lang, FromFuncOID: fromFuncOID, ToFuncOID: toFuncOID}
+	c.transforms[key] = tf
+	return tf
+}
+
+// TransformExists reports whether a transform for (type, lang) is already
+// registered — used to enforce PG's "transform for type %s language %s
+// already exists" duplicate-object error when CREATE TRANSFORM (without OR
+// REPLACE) targets an existing pair. DU-002 (M0119-0004).
+func (c *InMemory) TransformExists(typeName, lang string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.transforms == nil {
+		return false
+	}
+	_, ok := c.transforms[strings.ToLower(typeName)+"\x00"+strings.ToLower(lang)]
+	return ok
+}
+
+// DropTransform removes a user-defined transform from the registry. Returns
+// true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropTransform(typeName, lang string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		return false
+	}
+	key := strings.ToLower(typeName) + "\x00" + strings.ToLower(lang)
+	if _, ok := c.transforms[key]; ok {
+		delete(c.transforms, key)
+		return true
+	}
+	return false
+}
+
+// ListTransforms returns all registered user transforms sorted by OID (stable
+// creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListTransforms() []*Transform {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.transforms) == 0 {
+		return nil
+	}
+	out := make([]*Transform, 0, len(c.transforms))
+	for _, tf := range c.transforms {
+		out = append(out, tf)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// LanguageNameToOID maps a language name to its pg_language OID, covering the
+// 4 rows pg_language.VirtualRows serves (the 3 built-in BKI languages plus
+// plpgsql — see the pg_language registration in this file). Returns 0 for an
+// unknown/user-defined language (goopg installs no user procedural
+// languages). Used by CREATE TRANSFORM to resolve pg_transform.trflang.
+// DU-002 (M0119-0004).
+func LanguageNameToOID(name string) uint32 {
+	switch strings.ToLower(name) {
+	case "internal":
+		return 12
+	case "c":
+		return 13
+	case "sql":
+		return 14
+	case "plpgsql":
+		return 13627
+	}
+	return 0
 }
 
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>

@@ -9956,6 +9956,94 @@ unaffected (fixture function names are never renamed, so dump output stays byte-
 does not have — a routine-EXECUTE-ACL model and an encoding-conversion engine, respectively); restart persistence
 (recurring shared-catalog runtime-write gap, tracked since slice 389).
 
+### Slice 404 — **CREATE/DROP TRANSFORM round-trip skeleton** (new object family)
+
+`CREATE TRANSFORM FOR type LANGUAGE lang (FROM SQL WITH FUNCTION ... , TO SQL WITH FUNCTION ...)` is the last
+untouched pg_dump object family covered by the pg_cast/pg_conversion precedent — it shares the same "register
+metadata, don't execute the machinery" shape. PG's grammar (`gram.y` `CreateTransformStmt`/`transform_element_list`)
+allows either the FROM SQL half or the TO SQL half alone, or both in either order.
+
+- **Parser** (`internal/parser/ddl.go`): `parseCreateTransformTail` parses `FOR type LANGUAGE lang ( ... )`, looping
+  over up to two `{FROM|TO} SQL WITH FUNCTION fn[(argtypes)]` elements (a `elements:`-labeled loop, since a bare
+  `switch` `default: break` only breaks the switch, not the loop — a real Go footgun worth flagging for future
+  slices reusing this shape). A `DROP TRANSFORM [IF EXISTS] FOR type LANGUAGE lang [CASCADE|RESTRICT]` case was added
+  as a dedicated branch, ahead of the generic ident-based DROP stub list — "transform" previously sat in that list,
+  but its `parseObjectList`-based `parseDropTail` cannot parse a `FOR type LANGUAGE lang` clause (it expects a
+  comma-separated name list), so DROP TRANSFORM would have broken on first real use even though nothing exercised it
+  before CREATE TRANSFORM existed. New `parseSimpleTypeName(stopKeywords ...Keyword)` generalizes the CAST-only
+  `parseCastTypeName` (which now delegates to it with `KwAs`) so TRANSFORM's type-name scan can stop at `LANGUAGE`
+  instead — reusing the un-generalized function silently swallowed `LANGUAGE sql` into the type name in early
+  iterations of this slice (caught by the parser unit test, not by inspection).
+- **Catalog** (`internal/catalog/catalog.go`): `Transform{OID, TypeName, Lang, FromFuncOID, ToFuncOID}` registered
+  via `RegisterTransform`/`TransformExists`/`DropTransform`/`ListTransforms`, keyed like `Cast`
+  (`"<type>\x00<lang>"`, case-insensitive). New `LanguageNameToOID` maps the 4 rows `pg_language.VirtualRows` already
+  serves (`internal`=12, `c`=13, `sql`=14, `plpgsql`=13627) — the same hardcoded set, not a new source of truth.
+  `pg_transform.VirtualRows` (previously always empty) now renders registered transforms; an unresolved
+  `FromFuncOID`/`ToFuncOID` renders as literal `"0"`, matching `pg_cast.castfunc`'s existing convention for the same
+  situation (WITHOUT FUNCTION cast).
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s `case "transform"` validates the language
+  resolves (42704 `language "X" does not exist`) and the (type, lang) pair isn't a duplicate (42710 `transform for
+  type X language "Y" already exists`), then resolves each present FROM/TO SQL function via new
+  `resolveTransformFunc`, porting PostgreSQL's `CreateTransform` + `check_transform_function`
+  (`postgres/src/backend/commands/functioncmds.c`) validation order exactly: the role-specific return-type check
+  first (FROM SQL must return `internal`; TO SQL must return the transform's declared type — both 42P17), then not
+  volatile, a normal function (not procedure/window), not SETOF, and exactly one argument of type `internal` (all
+  42P17). Resolution reuses CAST's WITH-FUNCTION lookup style (`rs.Lookup` with the explicit arg-type list, else
+  `rs.LookupByName` single-overload fallback) — deliberately, since built-in functions and the leniency behavior for
+  them need to stay consistent across both slices (see the deferral below). `execDropCompat` gained a `transform`
+  case removing the registry entry or raising 42704 with PG's exact message.
+
+**Coverage:** `TestParseCreateTransform`/`TestParseDropTransform` (`internal/parser`) — reversed FROM/TO order,
+either-half-alone forms, IF EXISTS/CASCADE/RESTRICT. `TestLanguageNameToOID`/`TestTransformRegistry`/
+`TestPgTransformVirtualRows` (`internal/catalog`) — idempotent re-registration, case-insensitive keys, the
+literal-`"0"` rendering convention. `TestResolveTransformFunc` (`internal/executor`, 10 subtests) — every
+`check_transform_function` rule plus the two return-type roles plus the builtin-lenient path. All PASS; full
+parser/catalog/executor suites, TPC-H Q12/Q13 spotcheck, and the pgbench pre-commit smoke also PASS.
+
+**Live-verified against the exact upstream TAP fixture** (`postgres/src/bin/pg_dump/t/002_pg_dump.pl`'s
+`'CREATE TRANSFORM FOR int'` case, `CREATE TRANSFORM FOR int LANGUAGE SQL (FROM SQL WITH FUNCTION
+prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))`) on a live goopg server: the statement registers a
+row (`trftype=23`, `trflang=14`), `DROP TRANSFORM FOR int LANGUAGE sql` reverses it cleanly, and the
+language-not-exist / duplicate-transform / transform-not-found error paths all fire with the documented SQLSTATE.
+
+**Deferred — NOT wired into the DU-002 `TestPort_PgDumpConnectionSetup` connsetup fixture yet, and this is a
+systemic discovery, not a narrow one.** The fixture's FROM/TO functions (`prsd_lextype`, `int4recv`) are PostgreSQL
+*builtins*, not user-created functions. Two Explore-agent research passes plus a direct live empirical check
+(`SELECT oid, proname FROM pg_proc WHERE proname IN ('int4recv','prsd_lextype')` against a running goopg server →
+**0 rows**) established that goopg's server-side `pg_proc` catalog does not expose ANY builtin function at all:
+`catalog.Routines()` holds exclusively user-`CREATE FUNCTION` routines (OID space starts at `1<<17`), and
+`internal/initdb/pg_proc_seed_data.go`'s ~3397-entry builtin table — the data PG dump's own `getFuncs` EXISTS-join
+against `pg_cast`/`pg_transform` requires to be live-queryable — never reaches a SQL-queryable form; `pg_proc`'s
+virtual/heap view surfaces only a ~16-entry synthetic builtin stub list (`internal/initdb/pg_proc_view.go`'s
+`builtinProcs`), unrelated to `int4recv`/`prsd_lextype`. Consequences:
+
+1. `resolveTransformFunc` cannot resolve either function, so `trffromsql`/`trftosql` stay `0`; real pg_dump's
+   `dumpTransform` treats a `0` OID as "absent" and would emit `CREATE TRANSFORM FOR integer LANGUAGE sql ();` — not
+   the fixture's full form — so this slice cannot pass a byte-identical connsetup assertion yet.
+2. **This gap is not new to CREATE TRANSFORM.** It already silently affects CREATE CAST's `WITH FUNCTION` clause
+   (slice 397, `execCompatNoop` case `"cast"`, `internal/executor/operators_ddl.go` around line 12962) and CREATE
+   CONVERSION's `FROM` function (slice 402, `resolveConversionFunc`) whenever either references a builtin —
+   `RegisterCast`'s `funcOID` parameter has the exact same "stays 0 for an unresolvable name" behavior. It simply
+   never surfaced before because every prior CAST/CONVERSION test fixture happened to reference a user-created
+   function. CREATE TRANSFORM is the first slice whose canonical PG test fixture forces the builtin case.
+3. Restart persistence is still in-memory only (recurring shared-catalog runtime-write gap, tracked since slice 389).
+
+**Resume point:** expose builtin `pg_proc` rows queryably server-side, then wire all three WITH-FUNCTION-on-builtin
+call sites (CAST, CONVERSION, TRANSFORM) to the same resolution path so they stay consistent
+([[pattern_sibling_paths_must_agree]]). Two viable shapes, either acceptable:
+(a) relocate a `name → (OID, rettype, argtypes, volatile, prokind)` builtin-function table to a new leaf package
+that both `internal/initdb` and `internal/executor`/`internal/catalog` can import without a cycle — the same fix
+shape as the "Version constants must live in leaf config pkg" precedent
+([[goopg_version_constants_leaf_config_import_cycle]]); or
+(b) add a catalog-level `LookupBuiltinProcByName` backed by whatever data structure actually answers a live
+`SELECT * FROM pg_proc WHERE proname = ...` query today, so the executor's internal resolution and the SQL-facing
+catalog are provably the same source of truth. Once either lands, add the `'CREATE TRANSFORM FOR int'` DU-002
+connsetup fixture (currently absent from `internal/testport`) and verify byte-identical against real pg_dump 18.3.
+This is deliberately NOT attempted in this slice: exposing builtin `pg_proc` rows is a foundational, cross-cutting
+change to a heavily-relied-on catalog view with real regression risk across the whole PG-compat surface — too large
+for a single bounded loop, and orthogonal to this slice's actual deliverable (a new, independently-tested object
+family's parse/registry/validation skeleton). Full deferral-ledger row: slice 404.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
