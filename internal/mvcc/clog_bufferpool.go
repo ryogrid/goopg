@@ -403,6 +403,16 @@ func (p *clogBufferPool) flushWALBeforeWriteLocked(lsn uint64) error {
 	return p.flushWAL(lsn)
 }
 
+// SetFlushWALHook installs (or clears, with fn == nil) the async-commit
+// write barrier described on the flushWAL field. Safe to call at any time;
+// it takes effect on the next dirty-page write-back (eviction or
+// flushDirty). M0117-0007 Part B.
+func (p *clogBufferPool) SetFlushWALHook(fn func(lsn uint64) error) {
+	p.mu.Lock()
+	p.flushWAL = fn
+	p.mu.Unlock()
+}
+
 // flushDirty writes every dirty resident page back to its segment file and
 // fsyncs each touched segment exactly once (not once per page), matching the
 // group-commit "one fsync per segment" goal (M0117-0005). Pages stay resident

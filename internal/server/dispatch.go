@@ -394,6 +394,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
@@ -448,7 +449,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PLpgSQLCommitChain = func(rollback bool) error {
 			if rollback {
 				_ = s.cfg.TxnMgr.Rollback(tx)
-			} else if cerr := s.cfg.TxnMgr.Commit(tx); cerr != nil {
+			} else if cerr := ectx.CommitTransaction(tx); cerr != nil {
 				return cerr
 			}
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -909,7 +910,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		reg.UpdateState(connTx.ProcNum, "idle", "")
 	}
 	if autoCommit {
-		if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		if err := ectx.CommitTransaction(tx); err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -984,6 +985,27 @@ func sessionSyncCommitMode(sess *config.SessionRegistry) wal.SyncRepMode {
 		return wal.SyncRepRemoteFlush
 	}
 	return wal.ParseSyncCommitLevel(strings.ToLower(strings.TrimSpace(eff)))
+}
+
+// sessionAsyncCommit reports whether the session-effective
+// `synchronous_commit` GUC is literally "off" — the only level that also
+// skips the LOCAL WAL flush before returning to the client. Every other
+// level (including "local", which sessionSyncCommitMode collapses together
+// with "off" into SyncRepOff for the *remote*-wait decision) still requires
+// the local flush. M0117-0007 Part B.
+func sessionAsyncCommit(sess *config.SessionRegistry) bool {
+	if sess == nil {
+		return false
+	}
+	_, eff, ok := sess.Get("synchronous_commit")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(eff)) {
+	case "off", "false", "0", "no":
+		return true
+	}
+	return false
 }
 
 func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
@@ -1959,7 +1981,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					// COMMIT (the simple-query path bypasses execCommit).
 					executor.ApplyDeferredRoutineDrops(ctx, sess)
 				}
-				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
+				if err := ctx.CommitTransaction(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
 					if ctx.EndLocalTransaction != nil {

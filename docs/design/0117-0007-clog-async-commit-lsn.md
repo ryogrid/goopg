@@ -1,8 +1,8 @@
 # 0117-0007 — CLOG async-commit LSN tracking (gap G8)
 
-Status: **accepted (Part A landed; Part B deferred)**
+Status: **accepted (Part A landed 2026-06-29; Part B landed 2026-07-02 — see
+"Part B" below for the scope actually delivered vs. the remaining latency gap)**
 Milestone: M0117-0007
-Branch: `m0117-0007-clog-async-commit-lsn` (off the M0117-0006 tip `318f38c8`)
 
 ## Problem (gap G8)
 
@@ -96,18 +96,108 @@ isolation (where the TPC-H Q12/Q13 spot-check and standby-visibility E2E SKIP).
    hook is wired to `wal.Writer.FlushUpTo` by the CLog layer when the pool goes
    live (Part B); injection keeps `mvcc` free of a `wal` import.
 
-### Part B — live `synchronous_commit=off` activation (DEFERRED)
+### Part B — live `synchronous_commit=off` activation (LANDED 2026-07-02)
 
-Wire `flushWAL` to the live WAL writer, thread the commit-record LSN from the
-commit path into `setStatusWithLSN`, and add a real async-commit path that skips
-the inline per-commit WAL fsync (relying on the page-write barrier instead).
-This changes the live durability path and must land with the full TPC-H Q12/Q13
-spot-check + crash-recovery / standby E2E — unavailable under the worktree
-isolation this milestone uses to dodge the foreign M0100-0010 WIP. Deferred with
-M0117-0006 Part B (the live pool swap), since the barrier only fires once the
-pool is the live store. Resume point: set the hook in the CLog constructor that
-owns the pool, pass the commit LSN through `groupUpdate`/`setStatus`, and gate
-the inline fsync on `synchronous_commit`.
+**What landed.** `internal/initdb/open.go`'s `EnablePGSLRUMirror` call site now
+wires `clog.SetFlushWALHook(walWriter.FlushUpTo)` immediately after the pool is
+created — the Part A barrier, previously never connected to a live WAL writer
+(dead code outside its own unit tests), is now live and exercised on every
+dirty-page write-back. `mvcc.Manager` gained a `CommitAsync` alongside `Commit`
+(`finish` takes a new `waitLocalFlush bool`, forwarded to the `xactMarker` hook,
+whose signature grew the same parameter); the hook in `open.go` skips the
+inline `walWriter.FlushUpTo(endLSN)` when `waitLocalFlush` is false and calls
+the new `CLog.SetCommittedWithLSN(xid, endLSN)` (→ `setStatusWithLSN`) instead
+of `SetCommitted`, associating the commit LSN with the XID's CLOG page. A new
+`executor.Context.AsyncCommit` (true only for the literal GUC value `"off"` —
+`SyncCommitMode`/`SyncRepOff` intentionally collapses `"off"` and `"local"`
+together for the *remote*-wait decision, which is not the distinction needed
+here) is read by a new `sessionAsyncCommit` helper (`internal/server/
+dispatch.go`) and threaded through every live interactive commit call site via
+one new `Context.CommitTransaction(tx)` method (`operators_tx.go`'s explicit
+COMMIT, both `dispatch.go` autocommit branches including the PL/pgSQL commit
+chain, `dispatch_extended.go`'s extended-protocol autocommit — 2PC's
+`COMMIT PREPARED` reuses these same paths via `executeOneSimpleStmt`, so it is
+covered without a separate call site). COPY's own commit call sites
+(`internal/server/copy.go`, 4 sites) are **not** wired — see "Still open"
+below.
+
+**Why this alone does not yet reduce commit latency (read before assuming
+`synchronous_commit=off` is fast in goopg).** M0117-0005's group-commit design
+calls `CLog.groupUpdate` → `pool.flushDirty()` **synchronously, on every single
+commit** (batched across concurrent committers, but never deferred past the
+triggering commit) — unlike real PG, whose CLOG SLRU page stays dirty in
+shared memory until eviction or the next checkpoint. Because `flushDirty`
+itself invokes the write barrier (`flushWALBeforeWriteLocked`) before writing
+a dirty page, and `SetCommittedWithLSN` gives that barrier a valid (non-zero)
+LSN, the barrier fires **immediately, inside the same commit call**, forcing
+exactly the same `walWriter.FlushUpTo` that the (now-skipped) inline call
+would have made. So today, skipping the explicit flush and relying on the
+barrier are latency-equivalent: the client still waits for the same fsync
+round trip before the commit call returns. (For a *synchronous* commit,
+`SetCommittedWithLSN` is deliberately **not** used — see below — precisely to
+avoid adding a second, redundant `FlushUpTo` round trip on top of the existing
+explicit one.)
+
+Making `synchronous_commit=off` actually cut latency requires a further,
+distinctly-scoped change: an async commit's `groupUpdate` call must be able to
+mark its CLOG page dirty **without** forcing `flushDirty` right away, leaving
+the write-back (and hence the barrier) to a *later* event — a subsequent
+synchronous commit's group flush (which flushes every currently-dirty page,
+not just its own), LRU eviction (`pinPageLocked`'s eviction path already
+barrier-guards any dirty victim, sync or async), or a checkpoint. The last of
+these is the blocker: goopg's checkpointer (`internal/wal/checkpointer.go`,
+`DirtyPageFlusher` interface, `FlushAll() error`) currently flushes only the
+heap buffer pool (`*storage.Pool`) — `CLog`/`clogBufferPool` implements no
+such interface and is never registered with a `Checkpointer`. Without a
+checkpoint-driven CLOG flush, an all-async workload could leave CLOG pages
+dirty in memory indefinitely (bounded only by the resident-page eviction
+budget), which — unlike a crash (where WAL replay legitimately reconstructs
+CLOG state from scratch, the accepted PG async-commit risk) — would make a
+*clean* shutdown/restart cycle rely on a potentially large WAL replay to
+recover CLOG state that a checkpoint should have bounded. That is a distinct,
+larger change (touching the checkpoint subsystem, not just CLOG+WAL) and is
+the real remaining item — see "Still open".
+
+Landed regardless, and correct/necessary independent of the latency question:
+the write barrier is real infrastructure (previously entirely dark in
+production), the LSN association is real and tested, and `synchronous_commit`
+is read for the local-flush decision for the first time anywhere in the
+commit path (previously read only for the remote sync-rep wait). This is the
+prerequisite plumbing the checkpoint-integration follow-up needs; it does not
+by itself change any query's observed behaviour or performance under
+`synchronous_commit=on` (the default, and every existing gate), and is
+inert-safe under `=off` (correct, not yet faster).
+
+### Still open (Part B continuation, NOT landed this loop)
+
+- **Lazy CLOG write-back for async commits + checkpoint-driven CLOG flush.**
+  `CLog.setStatusWithLSN`'s call to `c.groupUpdate` would need to become
+  conditional (skip the durable write-back for an async commit, leaving the
+  page dirty), and `CLog`/`clogBufferPool` needs a `FlushAll` (or equivalent)
+  registered with the `wal.Checkpointer` as a second `DirtyPageFlusher`
+  alongside the heap pool, so a checkpoint bounds how long an async-committed
+  CLOG page can stay unflushed. This is the change that actually removes the
+  fsync round trip from a `synchronous_commit=off` commit's critical path.
+  Resume point: `internal/mvcc/clog_groupcommit.go` (`groupUpdate`),
+  `internal/mvcc/clog.go` (add an exported flush entry point alongside
+  `SetFlushWALHook`), `internal/wal/checkpointer.go` (`DirtyPageFlusher`),
+  wiring site `internal/initdb/open.go` (wherever the primary's `Checkpointer`
+  is constructed). Needs the full TPC-H spot-check + crash-recovery / standby
+  E2E gate this design doc already calls for, since it changes when CLOG
+  durability actually happens.
+- **COPY's own commit call sites** (`internal/server/copy.go`: `runCopyToStream`
+  wrapper's commit, the file-based `COPY FROM` commit, and the two
+  `copyInState`-based streaming `COPY FROM STDIN` commits) still always call
+  the synchronous `TxnMgr.Commit` regardless of the session's
+  `synchronous_commit` setting. The two `ectx`-scoped sites are a trivial
+  follow-up (`ectx.CommitTransaction(tx)`, once `ectx.AsyncCommit` is also set
+  there — it currently isn't, since `runInlineCopy*` don't read
+  `synchronous_commit` at all); the two `copyInState`-based sites need a small
+  `asyncCommit bool` field threaded onto that struct at construction time
+  (`runInlineCopyFromStdin`, which does have `ectx` in scope). Left
+  unwired since COPY is a bulk-load path where synchronous behaviour is a
+  conservative, safe default, not a correctness concern — but it is a real,
+  narrow gap in `synchronous_commit` consistency across commit call sites.
 
 ## Faithfulness / divergence notes
 
@@ -141,14 +231,41 @@ the inline fsync on `synchronous_commit`.
   page bytes hit disk, for both `flushDirty` and eviction-driven
   `writePageToDisk`. nil hook ⇒ never called (default-off).
 
-Gate: `go build ./...`; `go test -race ./internal/mvcc/...`; `go test
+Part A gate: `go build ./...`; `go test -race ./internal/mvcc/...`; `go test
 ./internal/config/... ./internal/initdb/... ./internal/server/...`;
-`TestE2E_PhysicalReplication{,Sync}`; gofmt/vet. TPC-H spot-check SKIPs under
-worktree isolation (no live CLOG path changed — the pool and its LSN tracking
-have no live caller yet).
+`TestE2E_PhysicalReplication{,Sync}`; gofmt/vet.
+
+**Part B (2026-07-02, loop #49) adds:**
+
+- `internal/mvcc/clog_asynccommit_test.go` —
+  `TestCLogSetFlushWALHookBeforePoolExistsIsNoop` (out-of-order call safety),
+  `TestCLogSetCommittedWithLSNFiresBarrierOnFlush` (the full CLog-level chain:
+  `SetCommittedWithLSN` → barrier fires with the right LSN → status readable),
+  `TestCLogSetCommittedNoLSNNeverFiresBarrier` (the sync-commit invariant: a
+  plain `SetCommitted` must never trigger the barrier, so a synchronous commit
+  never pays a second `FlushUpTo` round trip).
+- `internal/mvcc/manager_test.go`'s `TestCommitAsyncPassesWaitLocalFlushFalse`
+  (only `CommitAsync` passes `waitLocalFlush=false`; `Commit`/`Rollback` pass
+  `true`).
+- `internal/executor/commit_async_test.go`'s
+  `TestContextCommitTransactionRespectsAsyncCommit` (`Context.CommitTransaction`
+  dispatches to `CommitAsync`/`Commit` per `AsyncCommit`).
+- `internal/server/sync_commit_test.go`'s `TestSessionAsyncCommit` (`"off"` and
+  its boolean-ish spellings ⇒ true; `"local"` ⇒ false, distinct from
+  `sessionSyncCommitMode`'s off/local collapse for the remote-wait decision).
+
+Part B gate (all PASS): `go build ./...`; `go vet ./...`; `gofmt -l` clean on
+every touched file; `go test -count=1 ./internal/mvcc/... ./internal/executor/...
+./internal/server/... ./internal/initdb/...`; `go test -race
+./internal/mvcc/... ./internal/wal/...`; `TestE2E_PhysicalReplication{,Sync}`,
+`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`,
+`TestE2E_ChecksumStreamingGoopgToPG` (`internal/testport`); TPC-H spot-check
+(`scripts/tpch-spotcheck.sh`) Q12=2/Q13=33 PASS; pgbench smoke via the
+pre-commit hook.
 
 ## Status / merge
 
-Stacked off `m0117-0006` (`318f38c8`); PENDING HUMAN MERGE of the chain
-`m0117-0001 → -0002 → -0003 → -0004 → -0005 → -0006 → -0007`. Part B activation
-lands in the dedicated full-gate session that wires M0117-0006 Part B.
+Landed directly on `align-data-structure-with-pg` (Part A: commit `1f1100e8`;
+M0117-0006 Parts A–C: commits through `0ab77d45`; Part B: this loop). The
+"Still open" section above is the actual remaining scope — not a merge
+formality.

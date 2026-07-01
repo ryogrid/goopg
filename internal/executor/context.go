@@ -327,6 +327,15 @@ type Context struct {
 	// M0102-0005.
 	SyncCommitMode wal.SyncRepMode
 
+	// AsyncCommit is true only when the session-effective
+	// `synchronous_commit` GUC is literally "off" — the one level that also
+	// skips waiting for the LOCAL WAL flush (SyncCommitMode/SyncRepOff above
+	// collapses "off" and "local" together, since both skip the *remote*
+	// wait; "local" still requires the local flush, so it is NOT distinct
+	// here). CommitTransaction below is the single call site that reads
+	// this. M0117-0007 Part B.
+	AsyncCommit bool
+
 	// OnSubscriptionChange is invoked after a successful
 	// CREATE / DROP SUBSCRIPTION (and, when it lands, ALTER
 	// SUBSCRIPTION). The server wires this to ApplyLauncher.Wake so
@@ -494,6 +503,19 @@ func (c *Context) backendPID() string {
 		}
 	}
 	return c.ActivityPID
+}
+
+// CommitTransaction commits tx through TxnMgr, choosing the synchronous or
+// async-commit path per AsyncCommit (the session-effective
+// `synchronous_commit` GUC). Every live commit call site should route
+// through this method rather than calling TxnMgr.Commit directly, so a
+// session's synchronous_commit setting is honoured consistently.
+// M0117-0007 Part B.
+func (c *Context) CommitTransaction(tx mvcc.Transaction) error {
+	if c.AsyncCommit {
+		return c.TxnMgr.CommitAsync(tx)
+	}
+	return c.TxnMgr.Commit(tx)
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.

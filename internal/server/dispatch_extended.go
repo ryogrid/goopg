@@ -154,6 +154,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
@@ -235,7 +236,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	if err := op.Close(); err != nil {
 		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 	}
-	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+	if err := ectx.CommitTransaction(tx); err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 	}
 	executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)

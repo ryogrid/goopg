@@ -178,10 +178,29 @@ role/database persistence is a real goopg feature gap.
       PG-fidelity gap — PG has no such dual-store distinction).
 - [ ] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
       (per-LSN-group tracking + page-write WAL barrier on the M0117-0006 pool, not live).
-      **Part B (DEFERRED):** live `synchronous_commit=off` — wire `flushWAL` to the WAL
-      writer, thread the commit-record LSN into `setStatusWithLSN`, drop the inline
-      per-commit fsync. Defers WITH M0117-0006 Part B (the barrier only fires once the
-      pool is the live store). Needs TPC-H + crash/standby E2E. Design `0117-0007-*`.
+      **Part B LANDED 2026-07-02 (loop #49, design `0117-0007-*` "Part B"):** the
+      barrier is now wired to the live WAL writer (`CLog.SetFlushWALHook` ←
+      `walWriter.FlushUpTo`, called from `initdb.Open`), `mvcc.Manager` gained
+      `CommitAsync` (threads a new `waitLocalFlush bool` through `finish`/the
+      `xactMarker` hook), the hook skips its inline `FlushUpTo` and calls the new
+      `CLog.SetCommittedWithLSN` instead of `SetCommitted` when `waitLocalFlush`
+      is false, and `synchronous_commit` is read for the local-flush decision for
+      the first time via a new `executor.Context.AsyncCommit` +
+      `Context.CommitTransaction` (wired at every live interactive commit call
+      site: explicit COMMIT, simple/extended-protocol autocommit, PL/pgSQL commit
+      chain; 2PC's COMMIT PREPARED reuses these). **Remaining (deferred, ledger
+      2026-07-02): this does NOT yet reduce commit latency** — `groupUpdate`
+      still flushes the CLOG page synchronously on every commit (M0117-0005's
+      eager per-commit design), so the barrier fires immediately regardless of
+      `waitLocalFlush`, same as before. Genuinely cutting latency needs
+      `groupUpdate` to skip the durable write-back for an async commit (leaving
+      the page dirty) PLUS a checkpoint-driven CLOG flush (`CLog`/
+      `clogBufferPool` implements no `wal.DirtyPageFlusher`, so nothing bounds
+      how long a would-be-deferred dirty page stays unflushed) — a separate,
+      larger, checkpoint-subsystem-touching follow-up. COPY's own commit sites
+      (`internal/server/copy.go`, 4 sites) also stay unwired (always
+      synchronous) — narrower, self-contained, ledgered. Needs TPC-H + crash/
+      standby E2E — both PASS. Design `0117-0007-*`.
 - [ ] **M0117-0008 — datfrozenxid persistence (Effort M).** Part A DONE (dual-store
       consistency for all 4 CLOG status codes, satisfied via the M0117-0004 chain;
       `clog_dual_store_consistency_test.go`). **Part B (DEFERRED, ledger 2026-06-15):**
@@ -2089,10 +2108,13 @@ documentation-only and is exempt from the design-doc requirement.)
 - [ ] **M0119-0002 — CLOG tail, remaining Parts** (source: M0117-0007 / M0117-0008;
       see M0117 section + ledger rows). **M0117-0006's own live store swap (Part B)
       and bank/flat-file removal (Part C) are both DONE** (2026-06-29 loop #11 /
-      2026-07-01 loop #47) — this item now tracks only the two still-open siblings:
-      M0117-0007 Part B (live `synchronous_commit=off` — wire `flushWAL` to the WAL
-      writer, thread the commit-record LSN into `setStatusWithLSN`, drop the inline
-      per-commit fsync) and M0117-0008 Part B (on-disk `datfrozenxid` persistence —
+      2026-07-01 loop #47); **M0117-0007 Part B's mechanical wiring is DONE**
+      (2026-07-02 loop #49 — barrier live, LSN association, GUC threading, all
+      interactive commit call sites) **but its actual latency win is NOT** (CLOG's
+      own eager per-commit `flushDirty` immediately re-triggers the flush regardless;
+      needs a lazy-write-back + checkpoint-driven-CLOG-flush follow-up — see the
+      M0117-0007 entry above and its design doc's "Still open"). This item now
+      tracks that follow-up plus M0117-0008 Part B (on-disk `datfrozenxid` persistence —
       needs a runtime shared-catalog RelFileNode resolver + `heap_inplace_update`
       buffer-lock/WAL path). Highest blast radius (Hard-won Rule #1): dedicated
       full-gate session (`-race` mvcc+wal, xlog_replay, heterogeneous PG-standby

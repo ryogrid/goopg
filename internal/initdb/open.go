@@ -703,6 +703,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: enable pg_xact slru mirror: %w", err)
 	}
+	// M0117-0007 Part B: wire the CLOG SLRU buffer pool's async-commit write
+	// barrier (M0117-0007 Part A, previously never connected to a live WAL
+	// writer) to walWriter.FlushUpTo. From here on, any dirty CLOG page
+	// write-back (group-commit flush or LRU eviction) flushes the WAL up to
+	// that page's highest associated commit-record LSN first — the invariant
+	// synchronous_commit=off relies on instead of an inline per-commit fsync.
+	clog.SetFlushWALHook(walWriter.FlushUpTo)
 	// M0117-0003: wire the persistent pg_subtrans SLRU so subtransaction
 	// parentage survives a restart (gap G5 read path). EnablePersistence opens
 	// the bootstrapped pg_subtrans/ directory (created by initdb) for write-through
@@ -725,7 +732,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
 	}
 	txnMgr.SetSubxactMap(subxactMap)
-	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
+	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker, waitLocalFlush bool) error {
 		var payload []byte
 		switch kind {
 		case mvcc.XactCommit:
@@ -798,7 +805,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// disk before returning to the client so the transaction is durable
 		// across a server crash. Mirrors upstream's synchronous_commit = on
 		// default. Aborts are not flushed (they're discarded on replay).
-		if kind == mvcc.XactCommit {
+		// M0117-0007 Part B: skipped when waitLocalFlush is false
+		// (synchronous_commit=off) — durability is instead guaranteed by the
+		// CLOG async-commit write barrier below (SetCommittedWithLSN
+		// associates endLSN with this XID's CLOG page, and
+		// flushWALBeforeWriteLocked flushes the WAL up to it the moment that
+		// page is written back to disk, whenever that happens).
+		if kind == mvcc.XactCommit && waitLocalFlush {
 			if werr := walWriter.FlushUpTo(endLSN); werr != nil {
 				// ErrLSNNotWritten can surface when the WAL buffer
 				// position accounting has a transient race (the WAL
@@ -814,10 +827,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 		}
 		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
-		// WAL XactCommit record is the primary durability mechanism.
+		// WAL XactCommit record is the primary durability mechanism (or, for
+		// an async commit, the CLOG write barrier — see above).
 		switch kind {
 		case mvcc.XactCommit:
-			_ = clog.SetCommitted(xid)
+			if waitLocalFlush {
+				_ = clog.SetCommitted(xid)
+			} else {
+				_ = clog.SetCommittedWithLSN(xid, endLSN)
+			}
 		case mvcc.XactAbort:
 			_ = clog.SetAborted(xid)
 		}

@@ -186,6 +186,16 @@ func (c *CLog) SetCommitted(xid storage.TransactionID) error {
 	return c.setStatus(xid, TxnStatusCommitted)
 }
 
+// SetCommittedWithLSN marks xid as committed and associates it with the
+// commit record's LSN, so the async-commit write barrier
+// (flushWALBeforeWriteLocked) flushes the WAL up to at least lsn before
+// this XID's CLOG page can reach disk (M0117-0007 Part B; PG's
+// TransactionIdAsyncCommitTree). Used by the synchronous_commit=off path in
+// place of SetCommitted, which associates no LSN (lsn=0 is a barrier no-op).
+func (c *CLog) SetCommittedWithLSN(xid storage.TransactionID, lsn uint64) error {
+	return c.setStatusWithLSN(xid, TxnStatusCommitted, lsn)
+}
+
 // SetAborted marks xid as aborted and persists the change to disk.
 func (c *CLog) SetAborted(xid storage.TransactionID) error {
 	return c.setStatus(xid, TxnStatusAborted)
@@ -470,12 +480,23 @@ func parseSLRUSegName(name string) (int64, bool) {
 	return segNo, true
 }
 
-// setStatus updates data[xid] = status and rewrites the file. When a PG SLRU
-// directory has been wired (see EnablePGSLRUMirror), the matching 2-bit lane
-// of <slruDir>/<segno>:<page>:<byte> is also updated so a PG standby reading
-// the basebackup-shipped pg_xact/ via SimpleLruReadPage_ReadOnly observes the
-// correct status. M0106-0010 batched-44.
+// setStatus updates data[xid] = status and rewrites the file, with no
+// async-commit LSN association. Equivalent to setStatusWithLSN(xid, status, 0).
 func (c *CLog) setStatus(xid storage.TransactionID, status TxnStatus) error {
+	return c.setStatusWithLSN(xid, status, 0)
+}
+
+// setStatusWithLSN updates data[xid] = status and rewrites the file. When a
+// PG SLRU directory has been wired (see EnablePGSLRUMirror), the matching
+// 2-bit lane of <slruDir>/<segno>:<page>:<byte> is also updated so a PG
+// standby reading the basebackup-shipped pg_xact/ via
+// SimpleLruReadPage_ReadOnly observes the correct status. M0106-0010
+// batched-44. lsn != 0 additionally raises the XID's CLOG page's
+// async-commit group LSN (M0117-0007 Part B) so the write barrier flushes
+// the WAL before that page can reach disk; lsn == 0 (goopg's
+// InvalidXLogRecPtr) is a no-op on the group array, matching PG's recovery
+// branch.
+func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn uint64) error {
 	p := c.pool.Load()
 	// Bootstrap/frozen XIDs keep their pg_xact/0000 lanes zero (PG's
 	// TransactionLogFetch never writes them) so basebackup byte-equality holds.
@@ -487,7 +508,7 @@ func (c *CLog) setStatus(xid storage.TransactionID, status TxnStatus) error {
 	// (applyGroupBatchLocked → pool.flushDirty, one fsync per touched
 	// segment) — the SLRU is the sole durable store. An idempotent lane
 	// (already at this terminal value) skips the group-commit round-trip.
-	changed, err := p.setStatus(xid, status)
+	changed, err := p.setStatusWithLSN(xid, status, lsn)
 	if err != nil {
 		return err
 	}
@@ -560,6 +581,19 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 // EnablePGSLRUMirror; it is a no-op once the pool has been created.
 func (c *CLog) SetCLOGBuffers(n int) {
 	c.clogBuffers = n
+}
+
+// SetFlushWALHook wires the CLOG buffer pool's async-commit write barrier
+// (M0117-0007 Part A) to fn, invoked with a dirty page's max group LSN
+// immediately before that page is written back to disk. Must be called
+// after EnablePGSLRUMirror (which creates the pool); a nil pool (called out
+// of order) is a no-op rather than a panic. fn is typically
+// wal.Writer.FlushUpTo — injected as a plain closure so this package stays
+// free of a wal import.
+func (c *CLog) SetFlushWALHook(fn func(lsn uint64) error) {
+	if p := c.pool.Load(); p != nil {
+		p.SetFlushWALHook(fn)
+	}
 }
 
 // HighestKnownXID returns the highest XID that has a committed or aborted

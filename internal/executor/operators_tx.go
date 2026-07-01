@@ -189,7 +189,7 @@ func (o *transactionOp) execCommit() error {
 		// to other sessions until now).
 		ApplyDeferredRoutineDrops(o.ctx, sess)
 	}
-	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
+	if err := o.ctx.CommitTransaction(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	o.clearPgClassRowMarks(tx)
