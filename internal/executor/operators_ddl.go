@@ -9884,11 +9884,9 @@ func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
 
 // walLogDropRoutine WAL-logs a routine removal by OID (DU-002
 // restart-persistence follow-up to M0119-0004, loop #71 ledger resume
-// point). Used for DROP FUNCTION's immediate-autocommit and
-// deferred-at-commit removal, and CASCADE-dependent drops. NOT used for
-// DROP PROCEDURE, which mutates immediately but is undoable via
-// AddPendingRoutineDrop/ROLLBACK — see the loop #71 deferral-ledger row for
-// why that path needs its own commit-time hook before it can log safely.
+// point). Used for DROP FUNCTION's and DROP PROCEDURE's immediate-autocommit
+// removal, CASCADE-dependent drops, and (via ApplyDeferredRoutineDrops)
+// either statement's deferred-at-commit removal.
 func (o *ddlOp) walLogDropRoutine(oid uint32) error {
 	if o.ctx.WAL == nil {
 		return nil
@@ -10809,7 +10807,25 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		return &ExecError{Code: "42809", Pos: s.Pos(),
 			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr)}
 	}
-	// Now drop using the specific routine we already identified.
+	// Inside an explicit transaction, defer the registry removal to COMMIT —
+	// unifying onto the same DeferredRoutineDrop/ApplyDeferredRoutineDrops
+	// mechanism DROP FUNCTION already uses (M0118-0009 `stats`). This closes
+	// the loop #73 deferral-ledger gap: DROP PROCEDURE previously mutated the
+	// registry immediately with its own rollback-undo tracking, which had no
+	// safe commit-time WAL hook and let a concurrent session see the drop
+	// before the dropping transaction even committed. Now the procedure stays
+	// resolvable/callable until COMMIT, exactly like DROP FUNCTION, and the
+	// removal is WAL-logged exactly once at that single chokepoint (which
+	// never runs on ROLLBACK).
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
+		bsess.AddDeferredRoutineDrop(DeferredRoutineDrop{
+			Routine:        found,
+			SavepointDepth: bsess.SavepointDepth(),
+		})
+		return nil
+	}
+	// Autocommit: remove immediately and WAL-log (mirrors execDropFunction's
+	// autocommit path).
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -10819,9 +10835,8 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		err = rs.DropRoutine(found)
 	}
 	if err == nil {
-		// Record the drop for potential rollback on ROLLBACK.
-		if sess, ok := o.ctx.Session.(*BasicSession); ok {
-			sess.AddPendingRoutineDrop(found)
+		if werr := o.walLogDropRoutine(found.OID); werr != nil {
+			return werr
 		}
 		return nil
 	}

@@ -5180,6 +5180,49 @@ documentation-only and is exempt from the design-doc requirement.)
       mutation point would be unsafe (a rolled-back `DROP PROCEDURE` would
       still show as dropped post-restart) — needs its own commit-time hook
       first.
+- [x] **DROP PROCEDURE WAL/restart persistence (M0119-0004, loop #74).**
+      **COMPLETE 2026-07-02:** closes the loop #73 ledger row's own resume
+      point via option (b) — unified `DROP PROCEDURE` onto the exact
+      `DeferredRoutineDrop`/`ApplyDeferredRoutineDrops` mechanism `DROP
+      FUNCTION` already uses, instead of a parallel commit-time hook.
+      `execDropProcedure` already resolved the target routine before
+      mutating anything, so only its final drop step changed: inside an
+      explicit transaction it now calls `bsess.AddDeferredRoutineDrop(...)`
+      (identical to `execDropFunction`'s branch — procedure stays
+      resolvable/callable until COMMIT) instead of an immediate
+      `DropRoutine` + `AddPendingRoutineDrop`; autocommit still drops
+      immediately but now also calls `walLogDropRoutine` (previously
+      DROP-FUNCTION-only). `ApplyDeferredRoutineDrops` and the WAL replay
+      driver needed zero code changes — both are already OID-keyed and
+      kind-agnostic between function and procedure. This closes two gaps
+      in one motion, as anticipated: the missing WAL persistence, and a
+      pre-existing transactional-visibility bug where a concurrent session
+      saw a `DROP PROCEDURE`'d name vanish before the dropping transaction
+      committed. The now-fully-dead `BasicSession.pendingRoutineDrops`/
+      `AddPendingRoutineDrop`/`TakePendingRoutineDrops` mechanism (its only
+      caller) was deleted outright across all 7 call sites
+      (`operators_tx.go`, `dispatch.go` ×5, `server.go`, `twophase.go`)
+      rather than left as dead code — safe because a deferred drop's
+      ROLLBACK needs no restore action, and every site already calls
+      `EndExplicitTransaction`, which unconditionally resets
+      `deferRoutineDrops = nil`. Tests:
+      `TestExecDropProcedureRemovesEntry`/
+      `TestExecDropProcedureDeferredToCommit`/
+      `TestExecDropProcedureRollbackLeavesEntry`
+      (`internal/executor/operators_function_test.go`). Verified via a
+      real `goopg stop`/`start` restart cycle: an explicit-transaction
+      DROP PROCEDURE + ROLLBACK stays callable, the same DROP + COMMIT is
+      gone, an autocommit DROP PROCEDURE is gone, all stay absent
+      post-restart, and an undropped procedure survives the same restart.
+      Gates: `go build`/`go vet` clean; `internal/executor`+
+      `internal/server`+`internal/wal`+`internal/catalog`+
+      `internal/initdb`+`internal/parser`+`internal/planner` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33
+      PASS; full pre-commit gate incl. pgbench TPC-B smoke (0 failed
+      transactions) PASS. Design doc:
+      `0119-0004-create-operator-roundtrip.md` "Loop #74". The
+      `CREATE`/`ALTER`/`DROP FUNCTION`/`PROCEDURE` surface is now entirely
+      WAL-persisted; the loop #73 ledger row is resolved.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

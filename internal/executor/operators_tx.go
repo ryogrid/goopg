@@ -215,9 +215,8 @@ func (o *transactionOp) execCommit() error {
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()
 	}
-	// Clear pending routine drops and truncate undos — they're committed.
+	// Clear pending truncate/sequence undos — they're committed.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
-		sess.TakePendingRoutineDrops()
 		sess.TakePendingTruncates()
 		sess.TakePendingSeqRestores()
 	}
@@ -239,15 +238,7 @@ func (o *transactionOp) execRollback() error {
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
 		// Undo DDL creates, TRUNCATE page snapshots, and RESTART IDENTITY.
 		ProcessRollbackUndos(o.ctx, sess)
-		// Restore any routines that were dropped in this transaction.
-		for _, r := range sess.TakePendingRoutineDrops() {
-			if rs := o.ctx.Catalog.Routines(); rs != nil {
-				// orReplace=true: if the key somehow exists (e.g. a concurrent
-				// create raced in), overwrite it so the drop is fully reversed.
-				_, _ = rs.Create(r, true)
-			}
-		}
-		// M0118-0009 (`stats`): discard DROP FUNCTION drops deferred to COMMIT —
+		// M0118-0009 (`stats`): discard DROP FUNCTION/PROCEDURE drops deferred to COMMIT —
 		// the routines were never removed from the registry (kept visible until
 		// commit), so ROLLBACK only needs to drop the deferred entries.
 		sess.TakeDeferredRoutineDrops()

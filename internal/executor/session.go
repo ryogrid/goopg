@@ -172,7 +172,6 @@ type BasicSession struct {
 	tx                  mvcc.Transaction
 	snap                mvcc.Snapshot
 	pendingDDL          []DDLUndoEntry             // DDL creates pending rollback
-	pendingRoutineDrops []*catalog.Routine         // routines dropped in current tx, for rollback
 	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
 	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
 	savepointDDLDrops   []DDLDropUndoEntry         // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
@@ -660,18 +659,6 @@ func (s *BasicSession) TakePendingDDLCreates() []DDLUndoEntry {
 	p := append([]DDLUndoEntry(nil), s.pendingDDL...)
 	s.pendingDDL = nil
 	return p
-}
-
-// AddPendingRoutineDrop records a routine drop for potential rollback.
-func (s *BasicSession) AddPendingRoutineDrop(r *catalog.Routine) {
-	s.pendingRoutineDrops = append(s.pendingRoutineDrops, r)
-}
-
-// TakePendingRoutineDrops returns and clears the pending routine drops.
-func (s *BasicSession) TakePendingRoutineDrops() []*catalog.Routine {
-	drops := s.pendingRoutineDrops
-	s.pendingRoutineDrops = nil
-	return drops
 }
 
 // RecordTruncate saves the before-image of a table (heap + indexes) so

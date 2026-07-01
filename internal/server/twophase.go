@@ -218,13 +218,6 @@ func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, ctx *executor.C
 // is fully torn down (no prepared marker is set) so a subsequent COMMIT/ROLLBACK
 // PREPARED of this gid reports "does not exist", exactly as upstream. M0118-0009.
 func (s *Server) abortForPrepareSSIFailure(w *protocol.FrameWriter, ctx *executor.Context, connTx *connTxState, explicitTx mvcc.Transaction, ssiErr error) error {
-	if sess := connTx.Session(); sess != nil {
-		if rs := s.cfg.Catalog.Routines(); rs != nil {
-			for _, r := range sess.TakePendingRoutineDrops() {
-				_, _ = rs.Create(r, true)
-			}
-		}
-	}
 	_ = s.cfg.TxnMgr.Rollback(explicitTx)
 	// M0118-0009 (`stats`, rung 7): discard the failed transaction's staged
 	// relation-stat counters via abort math (this path bypasses execRollback).

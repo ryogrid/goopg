@@ -2737,10 +2737,109 @@ regression); TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
 pgbench TPC-B smoke (0 failed transactions across standard/simple-update/
 select-only) PASS.
 
-### Still deferred
+### Still deferred (as of loop #73)
 
 `DROP PROCEDURE` WAL persistence — see the "transactional-safety analysis"
 section above and the loop #73 deferral-ledger row for the resume point.
 Everything else in the `CREATE`/`ALTER`/`DROP FUNCTION` and
 `CREATE`/`ALTER PROCEDURE` surface goopg already supports at the SQL level
 is now WAL-persisted.
+
+## Loop #74 — `DROP PROCEDURE` WAL/restart persistence (closes the loop #73 row)
+
+Closes the loop #73 deferral-ledger row by taking **option (b)**: unify
+`DROP PROCEDURE`'s transactional model onto the exact `DeferredRoutineDrop`/
+`ApplyDeferredRoutineDrops` mechanism `DROP FUNCTION` already uses, instead
+of building `DROP PROCEDURE` its own parallel commit-time hook. This closes
+two gaps in one motion, as the loop #73 row anticipated: the missing WAL
+persistence, *and* a pre-existing transactional-visibility bug where a
+concurrent session saw a `DROP PROCEDURE`'d name disappear immediately,
+before the dropping transaction even committed (goopg's shared `Routines`
+registry has no per-session MVCC — visibility comes entirely from *when*
+the mutation happens).
+
+### Change
+
+`execDropProcedure` (`internal/executor/operators_ddl.go`) already resolved
+the target routine (`found`) via `LookupByName`/`LookupDropCandidates`
+*before* mutating anything (existence/ambiguity/kind checks), so no new
+resolution logic was needed — only the final drop step changed:
+
+- **Inside an explicit transaction**: instead of an immediate
+  `rs.DropByName`/`rs.DropRoutine` + `AddPendingRoutineDrop` (its own
+  rollback-undo list), it now calls `bsess.AddDeferredRoutineDrop(...)` —
+  the identical call `execDropFunction`'s explicit-transaction branch makes.
+  The procedure stays in the registry, resolvable and callable, until
+  `ApplyDeferredRoutineDrops` runs at real COMMIT.
+- **Autocommit**: drops immediately as before, but now also calls
+  `walLogDropRoutine(found.OID)` (previously used only by `DROP FUNCTION`
+  and CASCADE-dependent drops) — whose doc comment was updated to no longer
+  say "NOT used for DROP PROCEDURE".
+
+`ApplyDeferredRoutineDrops` needed no change at all: it already WAL-logs via
+`wal.EncodeDropFunction(d.Routine.OID)` (OID-keyed, kind-agnostic) and calls
+`funcStats.dropFunction` — both apply identically to a dropped procedure.
+Likewise the WAL replay driver (`internal/initdb/function_ddl_recovery.go`,
+`RecordKindDropFunction` case → `Routines.DropByOIDDuringRecovery`) is
+already kind-agnostic by OID, so no replay-side change was needed either —
+only its header comment, which previously stated DROP PROCEDURE was "NOT
+persisted yet".
+
+### Retiring the old rollback-undo mechanism
+
+`BasicSession.pendingRoutineDrops`/`AddPendingRoutineDrop`/
+`TakePendingRoutineDrops` existed for exactly one purpose — undoing
+`execDropProcedure`'s immediate mutation on ROLLBACK — across 7 call sites
+(`operators_tx.go` execCommit clear-only + execRollback restore-loop,
+`dispatch.go` ×5 restore-loops/clear, `server.go` rollbackOpenTxnOnTeardown
+teardown-restore, `twophase.go` abortForPrepareSSIFailure restore). Once
+`execDropProcedure` stopped calling `AddPendingRoutineDrop`, this mechanism
+became permanently dead (the list is always empty), so it was deleted
+outright — including the 7 restore-loop bodies — rather than left as
+misleading dead code. This is safe because ROLLBACK-time cleanup for a
+*deferred* drop (procedure or function) needs no restore action at all: the
+registry was never mutated, so there is nothing to recreate. The existing
+`sess.EndExplicitTransaction()` call already present at the end of every one
+of those 7 sites resets `deferRoutineDrops = nil` unconditionally (it always
+did, for `DROP FUNCTION`'s sake) — so no *new* discard call needed to be
+added anywhere; deleting the now-dead restore loops was the entire diff at
+each site. `operators_tx.go`'s execRollback additionally still has its own
+explicit `sess.TakeDeferredRoutineDrops()` discard (pre-existing, kept
+as-is) belt-and-braces ahead of `EndExplicitTransaction`.
+
+### Tests
+
+`internal/executor/operators_function_test.go`: `TestExecDropProcedureRemovesEntry`
+(autocommit happy path, mirrors the DROP FUNCTION twin);
+`TestExecDropProcedureDeferredToCommit` (inside an explicit transaction, the
+procedure remains resolvable/callable until `ApplyDeferredRoutineDrops`
+removes it); `TestExecDropProcedureRollbackLeavesEntry` (discarding via
+`TakeDeferredRoutineDrops` + `EndExplicitTransaction`, mirroring ROLLBACK,
+never touches the registry).
+
+### Live PG-compatible verification
+
+Manual server (`tmp/loop74-verify`, real `psql`): `CREATE PROCEDURE p1` +
+`CALL p1(1)` OK; `BEGIN; DROP PROCEDURE p1(int); ROLLBACK;` then
+`CALL p1(2)` still succeeds (deferred drop correctly undone); `BEGIN; DROP
+PROCEDURE p1(int); COMMIT;` then `pg_proc` confirms `p1` gone;
+autocommit `CREATE PROCEDURE p2` + `DROP PROCEDURE p2(int)` also gone. A
+`goopg stop`/`start` restart cycle over the same data dir confirmed all
+three (`p1`, `p2`, and a third autocommit-created-then-dropped `p3`) stay
+absent post-restart (no resurrection), while an undropped `CREATE PROCEDURE
+keep_me` survives the same restart and still executes via `CALL`.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/executor`+`internal/server`+
+`internal/wal`+`internal/catalog`+`internal/initdb`+`internal/parser`+
+`internal/planner` suites PASS; `TestPort_PgDumpConnectionSetup` PASS (no
+regression); TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
+pgbench TPC-B smoke (0 failed transactions across standard/simple-update/
+select-only) PASS.
+
+### Now fully closed
+
+The `CREATE`/`ALTER`/`DROP FUNCTION` and `CREATE`/`ALTER`/`DROP PROCEDURE`
+surface goopg supports at the SQL level is entirely WAL-persisted; the
+loop #73 deferral-ledger row is resolved.

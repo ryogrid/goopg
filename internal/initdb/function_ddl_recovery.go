@@ -21,16 +21,13 @@ package initdb
 // NamespaceOID to resolve), so this does not depend on schema replay
 // having run first.
 //
-// Scope (see the loop #71 deferral-ledger row for what's NOT covered):
-// CREATE/OR REPLACE FUNCTION, CREATE/OR REPLACE PROCEDURE, ALTER
+// Scope: CREATE/OR REPLACE FUNCTION, CREATE/OR REPLACE PROCEDURE, ALTER
 // FUNCTION/PROCEDURE/ROUTINE (RENAME TO and the four mutable attributes),
-// and DROP FUNCTION (both the autocommit-immediate and the
-// deferred-to-COMMIT removal paths, plus CASCADE-dependent drops). DROP
-// PROCEDURE is deliberately NOT persisted yet — it mutates the registry
-// immediately but is undoable via ROLLBACK through a different mechanism
-// (BasicSession.pendingRoutineDrops) than DROP FUNCTION's
-// deferred-until-COMMIT design, and logging it safely needs its own
-// commit-time hook first (see the ledger row for the resume point).
+// and DROP FUNCTION *and* DROP PROCEDURE (both the autocommit-immediate and
+// the deferred-to-COMMIT removal paths, plus CASCADE-dependent drops) — DROP
+// PROCEDURE was unified onto DROP FUNCTION's deferred-until-COMMIT
+// transactional model (loop #74), so both share the same
+// ApplyDeferredRoutineDrops WAL-logging chokepoint.
 
 import (
 	"errors"

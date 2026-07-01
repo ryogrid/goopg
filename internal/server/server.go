@@ -1095,9 +1095,11 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // another ReadyForQuery so the client can keep going.
 // rollbackOpenTxnOnTeardown aborts an explicit transaction that is still open
 // when the connection's dispatch loop exits. It mirrors the dispatch
-// `planner.TxRollback` path (restore pending routine drops, roll back the
-// TxnMgr transaction, undo in-transaction enum DDL, clear per-connection
-// state). The critical effect is `TxnMgr.Rollback`, which clears the XID from
+// `planner.TxRollback` path (roll back the TxnMgr transaction, undo
+// in-transaction enum DDL, clear per-connection state — any DROP
+// FUNCTION/PROCEDURE deferred to COMMIT is discarded by `connTx.End()`'s
+// `EndExplicitTransaction`). The critical effect is `TxnMgr.Rollback`, which
+// clears the XID from
 // the ProcArray and broadcasts `commitCond` — releasing every backend blocked
 // in WaitForXID on this transaction's XID. A no-op when no explicit
 // transaction is active (auto-commit statements finish their own per-statement
@@ -1105,13 +1107,6 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Logger) {
 	if connTx == nil || !connTx.InExplicit() || s.cfg.TxnMgr == nil {
 		return
-	}
-	if sess := connTx.Session(); sess != nil && s.cfg.Catalog != nil {
-		if rs := s.cfg.Catalog.Routines(); rs != nil {
-			for _, r := range sess.TakePendingRoutineDrops() {
-				_, _ = rs.Create(r, true)
-			}
-		}
 	}
 	_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 	if s.cfg.Catalog != nil {
