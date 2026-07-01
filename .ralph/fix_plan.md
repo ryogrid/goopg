@@ -4447,6 +4447,25 @@ documentation-only and is exempt from the design-doc requirement.)
       goopg today (needs a parallel-query worker lock-group abstraction goopg has
       no subsystem for) and carries no open ledger row of its own. Nothing
       actionable until parallel query lands.
+- [x] **M0119-0009 — UPDATE/DELETE conflict-wait-on-a-conflicting-locker**
+      (source: M0118-0004 loop #44 closure note; see ledger row). **2026-07-01
+      (loop #46, design 0119-0009): sibling-path wiring LANDED.**
+      `waitForConflictingRowLock` (M0118-0003) was already wired at the three
+      canonical write sites (`updateViaIndex`, `updateOp.Next` seqscan,
+      `deleteOp.Next`) but never at 5 sibling sites sharing the same
+      `stampUpdaterXmaxNonHOT` producer: `updateWithFrom`, `deleteWithUsing`,
+      `mergeApplyUpdate`/`mergeApplyDelete`, `upsertOp.applyUpdate`. Wired all
+      5. Confirmed RED→GREEN for the two MERGE sites (genuine gaps, no other
+      blocking mechanism); the other three turned out already protected by
+      pre-existing mechanisms discovered mid-loop (upsert's arbiter-conflict
+      scan; `scanMatching`'s older M0021-era lockmgr block for the
+      FROM/USING sites) — this loop's fix there closes the narrower
+      scan-then-stamp race window instead. Full detail + deferred residuals
+      (NND arbiter path, `scanMatching`'s non-conflict-aware block) in the
+      design doc. Gates: race batch + full executor suite + `-race`
+      mvcc/multixact/wal + catalog/planner/server + `TestPort_
+      PgDumpConnectionSetup` + TPC-H Q12=2/Q13=33 all PASS; pgbench smoke =
+      pre-commit hook.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

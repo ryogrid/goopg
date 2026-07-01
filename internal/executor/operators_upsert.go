@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -998,6 +999,19 @@ func (o *upsertOp) trackWrittenPtr(ptr storage.ItemPointer) {
 // arbiter key encoding). When they are the same — no partition column
 // remapping needed — pass the same slice for both. M0097-0028.
 func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, updatedParent Row) error {
+	// Honour a row lock propagated forward onto this live version before
+	// writing (M0118-0003 write-path wait, wired here for ON CONFLICT DO
+	// UPDATE sibling-path parity — M0119-0009; applyUpdate previously
+	// dropped a still-active conflicting locker via the plain stamp
+	// instead of waiting for it, unlike the plain UPDATE path). reqStatus
+	// mirrors the exact boolean the stamp call below already uses.
+	reqStatus := multixact.StatusNoKeyUpdate
+	if o.onConflictUpdateTouchesKeyColumn() {
+		reqStatus = multixact.StatusUpdate
+	}
+	if err := waitForConflictingRowLock(o.ctx, rel, oldPtr.Block, oldPtr.Offset, reqStatus, o.plan.Pos()); err != nil {
+		return err
+	}
 	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
 	// real delete stamp (not InvalidTransactionID). Without this, the old
 	// tuple's xmax=0 would make it appear still-live to subsequent scans.

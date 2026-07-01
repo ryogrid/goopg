@@ -5,6 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -856,6 +857,17 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 
+	// Honour a row lock propagated forward onto this live version before
+	// writing (M0118-0003 write-path wait, wired here for MERGE UPDATE
+	// sibling-path parity — M0119-0009; mergeApplyUpdate previously
+	// dropped a still-active conflicting locker via the plain stamp
+	// instead of waiting for it, unlike the plain UPDATE path). MERGE
+	// UPDATE is always StatusUpdate (keysUpdated=true, mirroring the stamp
+	// call below).
+	if err := waitForConflictingRowLock(ctx, rel, blk, slot, multixact.StatusUpdate, pos); err != nil {
+		return err
+	}
+
 	// Fire BEFORE UPDATE trigger with the confirmed live row values. M0100-0005.
 	if tbl != nil && len(tbl.Triggers) > 0 {
 		retRow, ok, err := fireTriggers(ctx, tbl, "before", "update", tgtRow, newRow)
@@ -974,6 +986,15 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
+
+	// Honour a row lock propagated forward onto this live version before
+	// writing (M0118-0003 write-path wait, wired here for MERGE DELETE
+	// sibling-path parity — M0119-0009; same gap as mergeApplyUpdate
+	// above). DELETE is always StatusUpdate — conflicts with every lock
+	// strength.
+	if err := waitForConflictingRowLock(ctx, rel, blk, slot, multixact.StatusUpdate, pos); err != nil {
+		return err
+	}
 
 	// Fire BEFORE DELETE trigger with the confirmed live row values.
 	if tbl != nil && len(tbl.Triggers) > 0 {

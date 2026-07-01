@@ -5464,6 +5464,12 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	// pu.rel    = relation where the new row is written (destination; may differ on cross-partition move).
 	// pu.tgtCols = columns of the destination relation. M0097-0078, M0100-0010.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	// Classify once so the write-path wait (below) matches how a locker
+	// decoded it, mirroring updateViaIndex/updateOp.Next (M0119-0009).
+	updReqStatusFrom := multixact.StatusNoKeyUpdate
+	if !hotEligible {
+		updReqStatusFrom = multixact.StatusUpdate
+	}
 	fksToRecheckFrom := o.childFKsToRecheck()
 	seen := make(map[[2]uint64]bool)
 	for _, pu := range pending {
@@ -5484,6 +5490,16 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			continue // already updated by an earlier FROM match
 		}
 		seen[key] = true
+
+		// Honour a row lock propagated forward onto this live version by
+		// heap_lock_updated_tuple before writing: wait for every still-active
+		// foreign holder whose strength conflicts with this UPDATE (M0118-0003
+		// write-path wait, wired here for UPDATE...FROM sibling-path parity —
+		// M0119-0009; the plain updateViaIndex/updateOp.Next paths already had
+		// this, updateWithFrom did not).
+		if err := waitForConflictingRowLock(o.ctx, puSrcRel, pu.blk, pu.slot, updReqStatusFrom, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 
 		// Fire BEFORE UPDATE triggers.
 		if len(o.plan.Table.Triggers) > 0 {
@@ -5848,6 +5864,15 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if vRel == (storage.RelFileNode{}) {
 			vRel = rel
 		}
+		// Honour a row lock propagated forward onto this live version before
+		// writing (M0118-0003 write-path wait, wired here for DELETE...USING
+		// sibling-path parity — M0119-0009; the plain deleteOp.Next path
+		// already had this, deleteWithUsing did not). DELETE is always
+		// StatusUpdate — conflicts with every lock strength.
+		if err := waitForConflictingRowLock(o.ctx, vRel, v.blk, v.slot, multixact.StatusUpdate, o.plan.Pos()); err != nil {
+			return nil, err
+		}
+
 		// Fire BEFORE DELETE triggers and enforce FK constraints.
 		if len(tbl.Triggers) > 0 {
 			_, ok, err := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
