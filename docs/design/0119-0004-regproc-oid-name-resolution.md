@@ -114,6 +114,66 @@ neither (`internal/catalog` only pulls in `internal/parser`,
   (`foo(integer,text)`); goopg's `regprocedure` case renders the bare name
   like `regproc` does, since no current fixture exercises an overloaded
   `regprocedure` value on a direct query — flagged, not fixed, here.
+  **Closed 2026-07-01 (loop #36), see below.**
+
+## Follow-up: regprocedure argument-type-list rendering (2026-07-01, loop #36)
+
+While scoping the CREATE OPERATOR CLASS/`ALTER OPERATOR FAMILY ... ADD`
+`pg_amop`/`pg_amproc` member-store follow-up (deferred by DU-002 slice
+408/409, see `0119-0004-create-operator-roundtrip.md`), found that
+`dumpOpclass`/`dumpOpfamily` (`pg_dump.c`) cast the function-OID column
+specifically: `amproc::pg_catalog.regprocedure`, not `::regproc`. PG's
+`format_procedure`/`regprocedureout` (`regproc.c`) render
+`name(argtype1,argtype2,...)` — the argument-type list disambiguates
+overloaded names — which the "Scope / non-goals" section above explicitly
+left unfixed. Since a member-store implementation would depend on this
+rendering being correct regardless of whether the referenced function is
+builtin or user-defined, this gap was closed first, standalone:
+
+1. **Generator** (`cmd/gen-pg-proc-data/main.go`): `-names` mode now also
+   emits `pgProcArgTypeNamesByOID map[uint32][]string` — the raw
+   `proargtypes` typname tokens (verbatim pg_type.dat spelling, INPUT args
+   only — `proargtypes` itself never includes OUT-only params) for every
+   entry that has the key present. New `parseArgTypeNames` (parallel to the
+   existing OID-resolving `parseArgTypes`, but keeping the raw name tokens
+   instead of resolving through `typeMap`) feeds it.
+2. **`internal/catalog.RegprocedureName(oid uint32, routines *Routines) (string, bool)`**
+   (`catalog.go`, next to `RegprocName`): builtin path via the new generated
+   index; user-routine path via `routines.LookupByOID` + `Routine.ArgTypes`,
+   skipping any `ArgModes[i] == "o"` (OUT) parameter. Both paths funnel
+   through `formatProcedureSignature`, which applies `pgArgTypeDisplayAlias`
+   (int4->integer, bool->boolean, bpchar->character, ... — the same handful
+   of base-type spelling differences `executor.pgFormatTypeName` already
+   encodes; duplicated here rather than imported, since `internal/executor`
+   imports `internal/catalog` and not the reverse).
+3. **`internal/executor/expr.go`**: the `::regprocedure` `CastExpr` OID-input
+   branch now calls `catalog.RegprocedureName` instead of sharing `regproc`'s
+   bare-name resolution; `::regproc` itself is unchanged.
+4. **`internal/server/dispatch.go`**: `appendTypedCellText`'s combined
+   `case "regproc", "regprocedure"` split into two cases so regprocedure
+   gets its own `catalog.RegprocedureName` call; `regproc` unchanged.
+
+Example: `43::regprocedure::text` (43 = `int4out(int4)`) now renders
+`"int4out(integer)"`, not the bare `"int4out"` `::regproc` still renders.
+Two pre-existing tests asserted the old (incomplete) bare-name behavior for
+`regprocedure` specifically and were updated to the corrected expectation:
+`TestRegprocOIDCastResolvesName` (executor), `TestAppendTypedCellTextRegprocRendersName`
+(server).
+
+### Still open
+
+- `regoper`/`regoperator` remain unaddressed (see original scope note above)
+  — and are now confirmed to be the harder half of the same problem: unlike
+  `regproc`/`regprocedure`, there is no builtin-operator catalog *at all* in
+  goopg (`pg_operator`'s `VirtualRows` renders only `ListUserOperators()`),
+  so resolving a BUILTIN operator OID has no data source to resolve against
+  yet. This blocks `dumpOpclass`'s `amopopr::pg_catalog.regoperator` cast and,
+  transitively, byte-exact porting of upstream's `op_family`/`op_class`
+  `002_pg_dump.pl` fixtures (which use real builtin cross-type btree
+  operators). See the deferral ledger (2026-07-01, M0119-0004 slice 410 row).
+- The `pg_amop`/`pg_amproc` + synthetic `pg_depend` member store this was
+  scoped out of remains unimplemented — this doc only removed one of its two
+  prerequisites.
 
 ## Gates
 

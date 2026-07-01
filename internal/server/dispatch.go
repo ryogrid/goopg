@@ -2385,9 +2385,9 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			}
 		}
 		return d.AppendValueText(dst)
-	case "regproc", "regprocedure":
-		// OID values with type regproc/regprocedure display as function
-		// names (regprocout), matching a direct SELECT of e.g.
+	case "regproc":
+		// OID values with type regproc display as function names
+		// (regprocout), matching a direct SELECT of e.g.
 		// pg_type.typinput/typoutput, pg_operator.oprcode/oprrest/oprjoin,
 		// or pg_am.amproc — previously these all fell through to
 		// AppendValueText and rendered the raw numeric OID. InvalidOid (0)
@@ -2403,6 +2403,25 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			}
 			if r := s.cfg.Catalog.Routines().LookupByOID(oid); r != nil {
 				return append(dst, r.Name...)
+			}
+		}
+		return d.AppendValueText(dst)
+	case "regprocedure":
+		// regprocedure additionally renders the INPUT argument-type list
+		// ("name(argtype1,argtype2)", format_procedure/regprocedureout) —
+		// see catalog.RegprocedureName and its executor/expr.go CastExpr
+		// counterpart. DU-002 (M0119-0004).
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return append(dst, '-')
+			}
+			var routines *catalog.Routines
+			if s.cfg.Catalog != nil {
+				routines = s.cfg.Catalog.Routines()
+			}
+			if sig, ok := catalog.RegprocedureName(oid, routines); ok {
+				return append(dst, sig...)
 			}
 		}
 		return d.AppendValueText(dst)

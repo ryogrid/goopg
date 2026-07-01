@@ -24,8 +24,10 @@ func TestRegprocOIDCastResolvesName(t *testing.T) {
 	if got := runQuery(t, ctx, `SELECT 43::regproc::text`)[0][0].StringValue(); got != "int4out" {
 		t.Errorf("43::regproc::text = %q, want %q", got, "int4out")
 	}
-	if got := runQuery(t, ctx, `SELECT 43::regprocedure::text`)[0][0].StringValue(); got != "int4out" {
-		t.Errorf("43::regprocedure::text = %q, want %q", got, "int4out")
+	// regprocedure additionally renders the INPUT argument-type list
+	// (format_procedure/regprocedureout): int4out(int4) -> "int4out(integer)".
+	if got := runQuery(t, ctx, `SELECT 43::regprocedure::text`)[0][0].StringValue(); got != "int4out(integer)" {
+		t.Errorf("43::regprocedure::text = %q, want %q", got, "int4out(integer)")
 	}
 
 	if err := runDDL(t, ctx, `CREATE FUNCTION my_regproc_udf() RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
@@ -40,5 +42,15 @@ func TestRegprocOIDCastResolvesName(t *testing.T) {
 	q := fmt.Sprintf(`SELECT %d::regproc::text`, udfOID)
 	if got := runQuery(t, ctx, q)[0][0].StringValue(); got != "my_regproc_udf" {
 		t.Errorf("<user-defined-oid>::regproc::text = %q, want %q", got, "my_regproc_udf")
+	}
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION my_regprocedure_udf(a int4, b text) RETURNS int4 LANGUAGE sql AS $$ SELECT 1 $$`); err != nil {
+		t.Fatalf("create function: %v", err)
+	}
+	udfRows := runQuery(t, ctx, `SELECT 'my_regprocedure_udf'::regproc`)
+	udfArgsOID := udfRows[0][0].Int
+	q2 := fmt.Sprintf(`SELECT %d::regprocedure::text`, udfArgsOID)
+	if got := runQuery(t, ctx, q2)[0][0].StringValue(); got != "my_regprocedure_udf(integer,text)" {
+		t.Errorf("<user-defined-oid>::regprocedure::text = %q, want %q", got, "my_regprocedure_udf(integer,text)")
 	}
 }

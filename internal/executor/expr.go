@@ -489,6 +489,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// `::regtype` resolves a type name to its OID (string→oid).
 		// `::regproc` resolves a function name to its OID (string→oid).
 		if strings.EqualFold(x.TargetType, "regproc") || strings.EqualFold(x.TargetType, "regprocedure") {
+			isProcedure := strings.EqualFold(x.TargetType, "regprocedure")
 			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 				funcName := strings.TrimSpace(v.StringValue())
 				// SQL identifiers are case-folded to lowercase when parsed; match that.
@@ -501,15 +502,33 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
 			}
-			// An OID input (oid→regproc) renders via regprocout: InvalidOid (0)
-			// becomes "-", matching PG's regproc.c. pg_dump's getForeignDataWrappers
-			// (and amhandler/opclass getters) cast `<col>::regproc` and compare the
-			// result to "-" to decide whether to emit a HANDLER/VALIDATOR clause; a
-			// bare "0" would spuriously emit one. DU-002 slice 375.
+			// An OID input (oid→regproc/regprocedure) renders via
+			// regprocout/regprocedureout: InvalidOid (0) becomes "-", matching
+			// PG's regproc.c. pg_dump's getForeignDataWrappers (and
+			// amhandler/opclass getters) cast `<col>::regproc` and compare the
+			// result to "-" to decide whether to emit a HANDLER/VALIDATOR
+			// clause; a bare "0" would spuriously emit one. DU-002 slice 375.
 			if v.Kind == KindInt {
 				oid := v.Int
 				if oid == 0 {
 					return NewStringDatum("-"), nil
+				}
+				// regprocedure additionally renders the INPUT argument-type
+				// list ("name(argtype1,argtype2)", format_procedure) so an
+				// overloaded name is disambiguated — pg_dump relies on this
+				// for pg_amproc/pg_cast/pg_transform function-OID columns.
+				// DU-002 (M0119-0004), combined follow-up to the deferred
+				// pg_amop/pg_amproc member store (backlog item regarding
+				// regoper/regoperator/regprocedure resolution).
+				if isProcedure {
+					var routines *catalog.Routines
+					if ctx != nil && ctx.Catalog != nil {
+						routines = ctx.Catalog.Routines()
+					}
+					if sig, ok := catalog.RegprocedureName(uint32(oid), routines); ok {
+						return NewStringDatum(sig), nil
+					}
+					return v, nil
 				}
 				// A non-zero OID resolves to the function name (built-in via
 				// catalog.RegprocName's generated pg_proc.dat index, or a
@@ -517,8 +536,8 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// this fell through to `return v, nil`, leaving the cast a
 				// no-op that rendered the raw OID instead of a name at
 				// output time. Falls back to the raw datum (still tagged
-				// regproc/regprocedure for downstream formatting) only if
-				// neither source resolves it.
+				// regproc for downstream formatting) only if neither source
+				// resolves it.
 				if name, ok := catalog.RegprocName(uint32(oid)); ok {
 					return NewStringDatum(name), nil
 				}

@@ -11431,6 +11431,87 @@ func RegprocName(oid uint32) (string, bool) {
 	return name, ok
 }
 
+// pgArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
+// typname, or a user Routine's stored Type.Name) to PG's format_type_be
+// display alias — the handful of base types whose internal name differs from
+// its SQL display spelling (int4 -> integer, bool -> boolean, etc). Mirrors
+// executor's pgFormatTypeName; duplicated here (not imported) because
+// internal/executor imports internal/catalog, not the reverse. Types with no
+// alias (composite/domain/array names, "text", "uuid", ...) pass through
+// unchanged.
+func pgArgTypeDisplayAlias(name string) string {
+	switch strings.ToLower(name) {
+	case "int4", "int":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "bool":
+		return "boolean"
+	case "bpchar":
+		return "character"
+	case "varchar":
+		return "character varying"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "time":
+		return "time without time zone"
+	case "decimal":
+		return "numeric"
+	}
+	return name
+}
+
+// RegprocedureName resolves a pg_proc OID to PG's regprocedure display form
+// `name(argtype1,argtype2)` — format_procedure/regprocedureout (regproc.c),
+// which (unlike regproc's bare name) also renders the INPUT argument-type
+// list so an overloaded name is disambiguated. pg_dump relies on this: e.g.
+// dumpOpclass/dumpOpfamily cast a pg_amproc.amproc OID to ::regprocedure.
+// Tries the generated pg_proc.dat OID index first (built-ins), then the live
+// routine registry (routines may be nil if the caller has none to hand — the
+// InMemory carries its own via Routines()). OUT-only routine parameters are
+// skipped (pg_proc.proargtypes itself only ever lists IN/INOUT/VARIADIC
+// args, so a built-in row never needs this filter). ok=false means oid
+// resolves to neither source; the caller falls back to the raw OID, matching
+// format_procedure's own numeric fallback for an unknown OID.
+func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
+	if argNames, ok := pgProcArgTypeNamesByOID[oid]; ok {
+		if name, nameOK := pgProcNamesByOID[oid]; nameOK {
+			return formatProcedureSignature(name, argNames), true
+		}
+	}
+	if routines != nil {
+		if r := routines.LookupByOID(oid); r != nil {
+			var argNames []string
+			for i, t := range r.ArgTypes {
+				if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+					continue
+				}
+				argNames = append(argNames, t.Name)
+			}
+			return formatProcedureSignature(r.Name, argNames), true
+		}
+	}
+	return "", false
+}
+
+func formatProcedureSignature(name string, argTypeNames []string) string {
+	args := make([]string, len(argTypeNames))
+	for i, a := range argTypeNames {
+		args[i] = pgArgTypeDisplayAlias(a)
+	}
+	return name + "(" + strings.Join(args, ",") + ")"
+}
+
 // UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>
 // SERVER <server>). goopg does not execute foreign access; this records just
 // enough metadata to round-trip the CREATE/DROP through pg_dump (pg_user_mappings

@@ -4169,6 +4169,49 @@ documentation-only and is exempt from the design-doc requirement.)
       `op_class_custom` additionally needs a range-type `subtype_opclass`
       binding; `KeyTypeOID == 0` → `"-"` regtype rendering is unverified (no
       fixture omits STORAGE yet).
+      **2026-07-01 (loop #36): `::regprocedure` output-formatting prerequisite
+      LANDED — DU-002 slice 410, one prerequisite of the slice 408/409
+      pg_amop/pg_amproc member-store follow-up (member store itself still
+      NOT implemented).** While scoping that follow-up, found `dumpOpclass`/
+      `dumpOpfamily` cast `pg_amproc.amproc::pg_catalog.regprocedure`, and
+      goopg's `::regprocedure` cast (`executor/expr.go`) and direct
+      regprocedure-typed column rendering (`server/dispatch.go`
+      `appendTypedCellText`) both rendered the SAME bare name as `::regproc`
+      — missing PG's `format_procedure`/`regprocedureout` argument-type-list
+      suffix (`name(argtype1,argtype2)`), which would have made any FUNCTION
+      member's dumped signature wrong regardless of member-store completion.
+      Fixed via new `catalog.RegprocedureName` (builtin via a newly generated
+      `pgProcArgTypeNamesByOID` OID->raw-argtype-name leaf index —
+      `cmd/gen-pg-proc-data -names` extended to also parse+emit
+      `proargtypes`'s typname tokens verbatim — or a CREATE FUNCTION via the
+      live `Routines` registry, filtering OUT-mode params) +
+      `pgArgTypeDisplayAlias` (int4->integer, bool->boolean, etc., mirroring
+      `format_type_be`'s base-type display aliases; duplicated from
+      executor's `pgFormatTypeName` since catalog cannot import executor).
+      Wired at both sibling call sites so they stay in sync. Tests:
+      `TestRegprocedureName` (catalog, builtin + user-routine + OUT-param
+      filtering); updated `TestRegprocOIDCastResolvesName` and
+      `TestAppendTypedCellTextRegprocRendersName` (previously pinned the
+      bare-name no-op as correct; now pin the full signature — e.g.
+      `43::regprocedure::text` = `"int4out(integer)"` not `"int4out"`).
+      Gates: `go build ./...` clean; `go vet` catalog/executor/server/cmd
+      clean; `internal/catalog`+`internal/executor`+`internal/server` suites
+      PASS; `gofmt -l` flags only the same pre-existing go1.25/1.26-drift
+      files as loop #35 (verified via `git stash`) plus the freshly
+      regenerated `pg_proc_names_generated.go` (gofmt -w'd once, safe since
+      the whole file is machine-generated output being replaced, not
+      hand-edited unrelated code); `TestPort_PgDumpConnectionSetup` PASS (zero
+      pg_dump regression — no table declares a regprocedure-typed column with
+      actual row data in that fixture); TPC-H spotcheck Q12=2/Q13=33 PASS;
+      pgbench smoke = pre-commit hook. Deferred (ledger row appended, still
+      open): the pg_amop/pg_amproc + pg_depend member store itself (slice
+      408/409's actual follow-up) remains unimplemented; a SEPARATE, larger
+      prerequisite also surfaced — goopg has no builtin-operator catalog at
+      all (`pg_operator` VirtualRows renders only user-defined operators), so
+      `regoper`/`regoperator` resolution for a BUILTIN operator (needed by
+      `dumpOpclass`'s `amopopr::pg_catalog.regoperator` cast) is a second,
+      independent gap blocking the exact upstream `op_family`/`op_class`
+      fixtures (which reference real builtin cross-type btree operators).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

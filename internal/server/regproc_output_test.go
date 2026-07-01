@@ -17,7 +17,9 @@ import (
 // (AppendValueText), rendering the bare number instead of PG's regprocout
 // function-name text. InvalidOid (0) renders "-", mirroring the existing
 // `::regproc` CastExpr special-case (executor/expr.go) and the regclass
-// case in this same switch.
+// case in this same switch. regprocedure additionally renders the
+// argument-type list (format_procedure/regprocedureout), added in a later
+// loop — see catalog.RegprocedureName.
 func TestAppendTypedCellTextRegprocRendersName(t *testing.T) {
 	cat := catalog.NewInMemory()
 	userFunc, err := cat.Routines().Create(&catalog.Routine{
@@ -54,11 +56,11 @@ func TestAppendTypedCellTextRegprocRendersName(t *testing.T) {
 		})
 	}
 
-	// regprocedure shares the same rendering (PG's regprocedureout also
-	// resolves to the bare proname for goopg's non-overloaded lookup).
+	// regprocedure additionally renders the INPUT argument-type list
+	// (format_procedure/regprocedureout): int4out(int4) -> "int4out(integer)".
 	regProcedureType := catalog.Type{Name: "regprocedure"}
-	if got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(43), regProcedureType)); got != "int4out" {
-		t.Errorf("appendTypedCellText(oid=43, regprocedure) = %q, want %q", got, "int4out")
+	if got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(43), regProcedureType)); got != "int4out(integer)" {
+		t.Errorf("appendTypedCellText(oid=43, regprocedure) = %q, want %q", got, "int4out(integer)")
 	}
 
 	// An OID unresolvable by either source falls back to the raw numeric

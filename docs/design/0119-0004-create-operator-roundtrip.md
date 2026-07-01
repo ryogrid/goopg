@@ -451,9 +451,28 @@ smoke = pre-commit hook.
 ## Still open under M0119-0004
 
 `regoper`/`regoperator` OID→name resolution (no column is typed `regoper`
-yet, so no observable gap); `ALTER OPERATOR FAMILY ... ADD` and `CREATE
-OPERATOR CLASS`'s own `OPERATOR`/`FUNCTION` member entries (a single
-combined `pg_amop`/`pg_amproc`+`pg_depend` member-store follow-up, per loop
-#35's scope note above); the `op_class_custom` ordering fixture (range-type
-`subtype_opclass` binding); `KeyTypeOID == 0` → `"-"` regtype rendering
-(untested); further pg_dump 002–010 catalog parity slices.
+yet, so no observable gap — and, per loop #36's investigation below, blocked
+on a builtin-operator catalog that doesn't exist at all); `ALTER OPERATOR
+FAMILY ... ADD` and `CREATE OPERATOR CLASS`'s own `OPERATOR`/`FUNCTION`
+member entries (a single combined `pg_amop`/`pg_amproc`+`pg_depend`
+member-store follow-up, per loop #35's scope note above); the
+`op_class_custom` ordering fixture (range-type `subtype_opclass` binding);
+`KeyTypeOID == 0` → `"-"` regtype rendering (untested); further pg_dump
+002–010 catalog parity slices.
+
+**2026-07-01 (loop #36):** while scoping the member-store follow-up above,
+found and closed one of its two prerequisites — see
+`0119-0004-regproc-oid-name-resolution.md`'s "Follow-up: regprocedure
+argument-type-list rendering" section. `dumpOpclass`/`dumpOpfamily` cast
+`pg_amproc.amproc::pg_catalog.regprocedure`, which goopg previously rendered
+identically to `::regproc` (bare name, no argument-type list) — now fixed.
+The SECOND prerequisite, confirmed still fully open: goopg has no
+builtin-operator catalog at all (`pg_operator`'s `VirtualRows` renders only
+user-defined operators), so `regoper`/`regoperator` resolution for a BUILTIN
+operator has no data source — this blocks `amopopr::pg_catalog.regoperator`
+and, transitively, byte-exact upstream `op_family`/`op_class` fixture
+porting (which reference real builtin cross-type btree operators, not just
+user-defined ones). The member store itself should be scoped to
+user-defined operators/functions first (fully resolvable today) with the
+builtin-operator-catalog gap ledgered separately, per the 2026-07-01 slice
+410 deferral-ledger row.

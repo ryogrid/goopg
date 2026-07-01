@@ -8,11 +8,11 @@
 //
 //	go run cmd/gen-pg-proc-data/main.go > internal/initdb/pg_proc_seed_data.go
 //
-// With -names, it instead emits a name-only OID→proname reverse index
-// (package catalog) for regproc/regprocedure output rendering — a leaf-
-// package copy of the same generated source, since internal/executor and
-// internal/server cannot import internal/initdb (import cycle: initdb
-// already imports executor):
+// With -names, it instead emits a name-only OID→proname reverse index plus an
+// OID→argument-type-names index (package catalog) for regproc/regprocedure
+// output rendering — a leaf-package copy of the same generated source, since
+// internal/executor and internal/server cannot import internal/initdb (import
+// cycle: initdb already imports executor):
 //
 //	go run cmd/gen-pg-proc-data/main.go -names > internal/catalog/pg_proc_names_generated.go
 package main
@@ -116,19 +116,20 @@ func parseKV(block string) map[string]string {
 }
 
 type procEntry struct {
-	OID         uint32
-	Name        string
-	RetType     uint32
-	ArgTypes    []uint32 // nil means absent (→ use default [2281] for AM handlers)
-	Volatile    byte     // 0 means absent (default 'v')
-	Parallel    byte     // 0 means absent (default 's')
-	RetSet      bool
-	NotStrict   bool // inverse of proisstrict; absent → strict (false)
-	Lang        uint32
-	HandlerName string
-	AllArgTypes []uint32
-	ArgModes    []byte
-	ArgNames    []string
+	OID          uint32
+	Name         string
+	RetType      uint32
+	ArgTypes     []uint32 // nil means absent (→ use default [2281] for AM handlers)
+	ArgTypeNames []string // raw proargtypes typname tokens (INPUT args only), nil if the key was absent
+	Volatile     byte     // 0 means absent (default 'v')
+	Parallel     byte     // 0 means absent (default 's')
+	RetSet       bool
+	NotStrict    bool // inverse of proisstrict; absent → strict (false)
+	Lang         uint32
+	HandlerName  string
+	AllArgTypes  []uint32
+	ArgModes     []byte
+	ArgNames     []string
 }
 
 func resolveType(name string, typeMap map[string]uint32) uint32 {
@@ -153,6 +154,19 @@ func parseArgTypes(raw string, typeMap map[string]uint32) []uint32 {
 		out = append(out, resolveType(p, typeMap))
 	}
 	return out
+}
+
+// parseArgTypeNames splits a raw proargtypes field into its raw typname
+// tokens, without resolving them to OIDs — this preserves the exact typname
+// spelling pg_type.dat uses (e.g. "int4", not the display alias "integer"),
+// which RegprocedureName's display-alias table (catalog.pgArgTypeDisplayAlias)
+// then converts at render time, mirroring format_type_be.
+func parseArgTypeNames(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []string{}
+	}
+	return strings.Fields(raw)
 }
 
 func parseArrayField(raw string) []string {
@@ -249,6 +263,13 @@ func parseProcDat(path string, typeMap map[string]uint32) ([]procEntry, error) {
 			argTypes = nil
 		}
 
+		// argTypeNames: same presence rule as argTypes, but keeping the raw
+		// typname tokens (see parseArgTypeNames doc comment).
+		var argTypeNames []string
+		if raw, present := m["proargtypes"]; present {
+			argTypeNames = parseArgTypeNames(raw)
+		}
+
 		// provolatile: absent = 'v'
 		var vol byte
 		if v, ok := m["provolatile"]; ok && len(v) > 0 {
@@ -300,19 +321,20 @@ func parseProcDat(path string, typeMap map[string]uint32) ([]procEntry, error) {
 		}
 
 		entries = append(entries, procEntry{
-			OID:         oid,
-			Name:        name,
-			RetType:     retType,
-			ArgTypes:    argTypes,
-			Volatile:    vol,
-			Parallel:    parallel,
-			RetSet:      retSet,
-			NotStrict:   notStrict,
-			Lang:        lang,
-			HandlerName: handlerName,
-			AllArgTypes: allArgTypes,
-			ArgModes:    argModes,
-			ArgNames:    argNames,
+			OID:          oid,
+			Name:         name,
+			RetType:      retType,
+			ArgTypes:     argTypes,
+			ArgTypeNames: argTypeNames,
+			Volatile:     vol,
+			Parallel:     parallel,
+			RetSet:       retSet,
+			NotStrict:    notStrict,
+			Lang:         lang,
+			HandlerName:  handlerName,
+			AllArgTypes:  allArgTypes,
+			ArgModes:     argModes,
+			ArgNames:     argNames,
 		})
 	}
 
@@ -378,6 +400,19 @@ func emitNamesOnly(entries []procEntry) {
 	fmt.Printf("var pgProcNamesByOID = map[uint32]string{\n")
 	for _, e := range entries {
 		fmt.Printf("\t%d: %q,\n", e.OID, e.Name)
+	}
+	fmt.Printf("}\n\n")
+
+	fmt.Printf("// pgProcArgTypeNamesByOID is a generated reverse index of every PG18\n")
+	fmt.Printf("// pg_proc.dat OID -> raw proargtypes typname list (INPUT args only, in the\n")
+	fmt.Printf("// exact pg_type.dat spelling), backing RegprocedureName's \"name(argtypes)\"\n")
+	fmt.Printf("// rendering. Same leaf-package-copy rationale as pgProcNamesByOID above.\n")
+	fmt.Printf("var pgProcArgTypeNamesByOID = map[uint32][]string{\n")
+	for _, e := range entries {
+		if e.ArgTypeNames == nil {
+			continue
+		}
+		fmt.Printf("\t%d: %s,\n", e.OID, goStringSlice(e.ArgTypeNames))
 	}
 	fmt.Printf("}\n")
 }
