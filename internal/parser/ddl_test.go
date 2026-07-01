@@ -1100,6 +1100,62 @@ func TestParseAlterForeignTableSetForeignOptions(t *testing.T) {
 	}
 }
 
+// TestParseAlterForeignDataWrapperOptions verifies that
+// `ALTER FOREIGN DATA WRAPPER name [HANDLER h|NO HANDLER] [VALIDATOR h|NO
+// VALIDATOR] OPTIONS ([ADD|SET|DROP] name ['value'], …)` — a structurally
+// distinct statement from ALTER [FOREIGN] TABLE (no TABLE keyword) — parses
+// into a CompatNoopStmt carrying the verb-tagged option list, and that a bare
+// HANDLER/VALIDATOR-only form (no OPTIONS) also parses without error. Closes
+// the loop #57 deferral-ledger resume point ("ALTER FOREIGN DATA WRAPPER
+// remains entirely unparseable"). DU-002 slice 421.
+func TestParseAlterForeignDataWrapperOptions(t *testing.T) {
+	sql := `ALTER FOREIGN DATA WRAPPER fdw1 NO HANDLER VALIDATOR myvalidator OPTIONS (ADD opt1 'v1', SET opt2 'v2', DROP opt3, bare 'v4')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	cn, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if cn.Tag != "ALTER" {
+		t.Errorf("Tag=%q, want %q", cn.Tag, "ALTER")
+	}
+	if cn.ObjType != "foreign-data wrapper" {
+		t.Errorf("ObjType=%q, want %q", cn.ObjType, "foreign-data wrapper")
+	}
+	if cn.ObjName.Name != "fdw1" {
+		t.Errorf("ObjName=%q, want %q", cn.ObjName.Name, "fdw1")
+	}
+	want := []FDWOptionChange{
+		{Verb: FDWOptionAdd, Name: "opt1", Value: "v1"},
+		{Verb: FDWOptionSet, Name: "opt2", Value: "v2"},
+		{Verb: FDWOptionDrop, Name: "opt3"},
+		{Verb: FDWOptionAdd, Name: "bare", Value: "v4"},
+	}
+	if len(cn.FDWOptionChanges) != len(want) {
+		t.Fatalf("FDWOptionChanges=%+v, want %+v", cn.FDWOptionChanges, want)
+	}
+	for i, w := range want {
+		if cn.FDWOptionChanges[i] != w {
+			t.Errorf("FDWOptionChanges[%d]=%+v, want %+v", i, cn.FDWOptionChanges[i], w)
+		}
+	}
+
+	// HANDLER/VALIDATOR-only form (no OPTIONS clause) must also parse cleanly.
+	stmts2, err := Parse(`ALTER FOREIGN DATA WRAPPER fdw1 HANDLER fdw1_handler`)
+	if err != nil {
+		t.Fatalf("Parse (handler-only): %v", err)
+	}
+	cn2, ok := stmts2[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("expected *CompatNoopStmt, got %T", stmts2[0])
+	}
+	if cn2.ObjName.Name != "fdw1" || len(cn2.FDWOptionChanges) != 0 {
+		t.Errorf("got ObjName=%q FDWOptionChanges=%+v, want ObjName=fdw1 empty changes", cn2.ObjName.Name, cn2.FDWOptionChanges)
+	}
+}
+
 // TestParseColumnDefCollation verifies that an inline `COLLATE <name>` clause is
 // captured onto ColumnDef.Collation (bare trailing component, unquoted) so the
 // column round-trips through pg_dump. Covers the quoted form (`"C"`), the

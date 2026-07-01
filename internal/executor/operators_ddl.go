@@ -13443,6 +13443,26 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	if !ok {
 		return nil
 	}
+	// ALTER FOREIGN DATA WRAPPER name OPTIONS (...) — merges onto the existing
+	// fdw's pg_foreign_data_wrapper.fdwoptions via the same verb-tagged
+	// ADD/SET/DROP mechanism as ALTER FOREIGN TABLE ... OPTIONS (...)
+	// (applyFDWOptionChanges), rather than the flat replace
+	// RegisterForeignDataWrapper performs for CREATE. Unlike CREATE, the
+	// target FDW must already exist. DU-002 slice 421.
+	if s.Tag == "ALTER" && s.ObjType == "foreign-data wrapper" {
+		fdwName := s.ObjName.String()
+		fdw, found := im.LookupForeignDataWrapper(fdwName)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", fdwName)}
+		}
+		merged, mergeErr := applyFDWOptionChanges(fdw.Options, s.FDWOptionChanges)
+		if mergeErr != nil {
+			return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+		}
+		fdw.Options = merged
+		return nil
+	}
 	switch s.ObjType {
 	case "server":
 		// Register server so DROP SERVER can succeed.

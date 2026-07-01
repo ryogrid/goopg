@@ -1385,3 +1385,81 @@ this one needs **no** delete-old-rows + `syncTableToCatalogHeap` re-sync step.
   (post-creation option changes), but no pg_dump-driven fixture forces it —
   same caveat the loop #56 resume point already flagged. `ALTER FOREIGN DATA
   WRAPPER` remains entirely unparseable (unchanged from loop #56).
+
+## Loop #58 — `ALTER FOREIGN DATA WRAPPER name OPTIONS (...)` parsing+execution
+
+Closes the loop #57 resume point's first item: `ALTER FOREIGN DATA WRAPPER`
+was "entirely unparseable" because it is a structurally distinct statement
+from `ALTER [FOREIGN] TABLE` — PG's grammar (`gram.y`, `AlterFdwStmt`) has no
+`TABLE` keyword and no relation-action list; it is `ALTER FOREIGN DATA
+WRAPPER name [HANDLER handler_name|NO HANDLER] [VALIDATOR handler_name|NO
+VALIDATOR]... [OPTIONS ( alter_generic_option_list )]`. Read upstream
+`postgres/src/backend/parser/gram.y:5481-5499` (`AlterFdwStmt`) this loop to
+confirm the exact production before implementing.
+
+- Parser: `parseAlter` (`internal/parser/ddl.go`) gains a new branch
+  recognising `FOREIGN` followed by the bare identifier `data` (not the
+  `TABLE` keyword) — inserted *before* the pre-existing `ALTER FOREIGN TABLE`
+  FOREIGN-consuming check, since that check only fires when `TABLE` follows
+  and would otherwise let `ALTER FOREIGN DATA ...` fall through to
+  `expectKeyword(KwTable)` and raise a raw syntax error (the loop #57
+  ledger row's exact complaint). Mirrors `CREATE FOREIGN DATA WRAPPER`'s
+  existing parse loop (`internal/parser/ddl.go` `CREATE` case): any token
+  that is not the `OPTIONS` ident is skipped (so `HANDLER`/`NO HANDLER`/
+  `VALIDATOR`/`NO VALIDATOR` and their function-name operands are silently
+  discarded — goopg tracks no functions, same rationale CREATE's comment
+  already gives), but unlike CREATE's flat `scanFDWOptionsList`, the `OPTIONS`
+  clause here is scanned with the *verb-tagged* `scanAlterFDWOptionsList`
+  (the same scanner `ALTER FOREIGN TABLE ... OPTIONS (...)` uses), because
+  ALTER merges onto existing `fdwoptions` (PG's `transformGenericOptions`)
+  rather than replacing them. Returns a `*CompatNoopStmt{Tag: "ALTER",
+  ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}`
+  — a new `FDWOptionChanges []FDWOptionChange` field added to
+  `CompatNoopStmt` (`internal/parser/ast.go`) alongside the pre-existing flat
+  `Options []string` field CREATE uses, since ALTER's semantics differ enough
+  that reusing `Options` would conflate "replace" with "merge".
+- Catalog: new `(*InMemory).LookupForeignDataWrapper(name) (*ForeignDataWrapper,
+  bool)` (`internal/catalog/catalog.go`) — a read-only lookup, distinct from
+  the pre-existing `RegisterForeignDataWrapper` (create-or-fetch, used only by
+  CREATE) because ALTER on a nonexistent FDW must error rather than silently
+  create one.
+- Executor: `execCompatNoop` (`internal/executor/operators_ddl.go`) gains an
+  `s.Tag == "ALTER" && s.ObjType == "foreign-data wrapper"` branch, checked
+  *before* the pre-existing unconditional `switch s.ObjType` block (which
+  only ever runs for CREATE-tagged statements today, since ALTER is the first
+  statement to reuse the `"foreign-data wrapper"` ObjType with a non-CREATE
+  Tag): looks up the FDW via `LookupForeignDataWrapper`, 42704
+  undefined_object if absent, else merges `s.FDWOptionChanges` onto
+  `fdw.Options` via the existing `applyFDWOptionChanges` helper (same
+  42710/42704 SQLSTATEs the ALTER FOREIGN TABLE OPTIONS cases already use for
+  ADD-duplicate / SET-or-DROP-missing).
+- Tests: `TestParseAlterForeignDataWrapperOptions`
+  (`internal/parser/ddl_test.go`) — verb-tagged ADD/SET/DROP/bare parsing,
+  plus a HANDLER-only form (no OPTIONS clause) parsing without error.
+  `TestAlterForeignDataWrapperOptionsRoundtrip` /
+  `TestAlterForeignDataWrapperOptionsErrors`
+  (`internal/executor/operators_alter_foreign_data_wrapper_test.go`) mirror
+  the ALTER FOREIGN TABLE OPTIONS executor tests one-for-one: `CREATE FOREIGN
+  DATA WRAPPER ... OPTIONS (...)` → ADD → SET+bare-ADD → DROP sequence, plus
+  the 42704 (nonexistent FDW)/42710/42704 error pins.
+- Gates: `go build ./...`/`go vet ./...` clean; `internal/parser`+
+  `internal/catalog`+`internal/executor` suites PASS (`-count=1`);
+  `TestPort_PgDumpConnectionSetup` PASS; TPC-H spotcheck Q12=2/Q13=33 PASS;
+  `gofmt -l` shows only pre-existing go1.25-vs-go1.26.3 struct-alignment
+  drift, none overlapping this loop's new code
+  ([[goopg_gofmt_version_mismatch_no_w]]); pgbench smoke = pre-commit hook.
+- Deferred (ledger row appended): real PG's `pg_dump` never emits a
+  standalone `ALTER FOREIGN DATA WRAPPER ... OPTIONS (...)` either — like the
+  table-level foreign-table case, `dumpForeignDataWrapper` inlines the
+  `OPTIONS (...)` clause directly into the `CREATE FOREIGN DATA WRAPPER`
+  statement it emits (confirmed: no existing fixture pipes a `pg_dump | psql`
+  goopg-to-goopg restore of an FDW, and `dumpForeignDataWrapper`'s only
+  emitted form is the CREATE-time one). So this loop is real ALTER-grammar/
+  executor parity for a user issuing the statement directly post-creation,
+  not a pg_dump round-trip gap. The `HANDLER`/`VALIDATOR` clauses remain
+  parsed-and-discarded (goopg tracks no pg_proc-backed FDW handler/validator
+  functions at all — same limitation CREATE FOREIGN DATA WRAPPER already has,
+  unchanged by this loop). No fixture yet exercises a goopg-to-goopg
+  `pg_dump | psql` restore replay for ANY foreign-data-wrapper-family object
+  (FDW, SERVER, FOREIGN TABLE, or USER MAPPING) — if one surfaces, that is
+  the next concrete resume point for this whole DU-002 slice family.

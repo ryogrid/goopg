@@ -4644,6 +4644,42 @@ documentation-only and is exempt from the design-doc requirement.)
       use, not a pg_dump round-trip gap. `ALTER FOREIGN DATA WRAPPER` remains
       entirely unparseable; no fixture pipes a literal `pg_dump | psql`
       goopg-to-goopg restore of a foreign table.
+      **2026-07-02 (loop #58, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #58"): `ALTER FOREIGN DATA WRAPPER name [HANDLER h|NO HANDLER]
+      [VALIDATOR h|NO VALIDATOR] [OPTIONS (...)]` parsing+execution LANDED —
+      closes the loop #57 resume point ("`ALTER FOREIGN DATA WRAPPER` remains
+      entirely unparseable").** A structurally distinct statement from
+      `ALTER [FOREIGN] TABLE` (PG's `AlterFdwStmt`, `gram.y:5481-5499`, read
+      from upstream source this loop: no `TABLE` keyword, no relation-action
+      list). `parseAlter` (`internal/parser/ddl.go`) gains a new branch,
+      checked BEFORE the pre-existing FOREIGN-TABLE lookahead, recognising
+      `FOREIGN` followed by the bare ident `data`; mirrors `CREATE FOREIGN
+      DATA WRAPPER`'s skip-and-scan-for-OPTIONS loop (HANDLER/VALIDATOR
+      parsed-and-discarded) but scans `OPTIONS` with the verb-tagged
+      `scanAlterFDWOptionsList` (ALTER merges, unlike CREATE's flat replace).
+      New `CompatNoopStmt.FDWOptionChanges` field (`internal/parser/ast.go`);
+      new `Tag: "ALTER"` branch in `execCompatNoop`
+      (`internal/executor/operators_ddl.go`), checked before the pre-existing
+      CREATE-only `switch s.ObjType`; new read-only
+      `(*catalog.InMemory).LookupForeignDataWrapper` (42704 if the FDW
+      doesn't exist — ALTER must not silently create one, unlike
+      `RegisterForeignDataWrapper`); merges via the existing
+      `applyFDWOptionChanges` helper (same 42710/42704 SQLSTATEs). New tests
+      `TestParseAlterForeignDataWrapperOptions` (parser) +
+      `TestAlterForeignDataWrapperOptionsRoundtrip`/
+      `TestAlterForeignDataWrapperOptionsErrors` (executor), mirroring the
+      loop #57 tests one-for-one. Gates: `go build ./...`/`go vet ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor` suites
+      PASS (`-count=1`); `TestPort_PgDumpConnectionSetup` PASS; TPC-H
+      spotcheck Q12=2/Q13=33 PASS; `gofmt -l` clean on every touched/new file
+      (`goopg_gofmt_version_mismatch_no_w` memory — pre-existing drift only);
+      pgbench smoke = pre-commit hook. Deferred (ledger row appended): real
+      pg_dump never emits this standalone statement either
+      (`dumpForeignDataWrapper` inlines OPTIONS into the CREATE-time
+      statement); `HANDLER`/`VALIDATOR` remain parsed-and-discarded (goopg
+      tracks no FDW handler/validator functions at all, unchanged); no
+      fixture exercises a goopg-to-goopg `pg_dump | psql` restore replay for
+      any FDW-family object (FDW, SERVER, FOREIGN TABLE, USER MAPPING).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

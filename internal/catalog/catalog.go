@@ -10665,6 +10665,18 @@ func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
 	return 0
 }
 
+// LookupForeignDataWrapper returns the named FDW's registry entry, or
+// (nil, false) if no such FDW is registered. Unlike RegisterForeignDataWrapper
+// (which creates-or-fetches), this is a read-only lookup — used by
+// ALTER FOREIGN DATA WRAPPER, which must error 42704 undefined_object on a
+// nonexistent name rather than silently creating one. DU-002 slice 421.
+func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	f, ok := c.fdws[name]
+	return f, ok
+}
+
 // ForeignServer is a user-created foreign server (CREATE SERVER). goopg does not
 // execute foreign servers; this records just enough metadata to round-trip the
 // CREATE/DROP through pg_dump (pg_foreign_server virtual view →

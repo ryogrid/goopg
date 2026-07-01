@@ -6664,13 +6664,45 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return &AlterTableStmt{pos: t.Pos}, nil
 		}
 	}
+	// ALTER FOREIGN DATA WRAPPER name [HANDLER h|NO HANDLER] [VALIDATOR h|NO
+	// VALIDATOR] [OPTIONS ([ADD|SET|DROP] name ['value'], …)] — a structurally
+	// distinct statement from ALTER [FOREIGN] TABLE (no TABLE keyword, no
+	// relation actions), so it must be recognised BEFORE the FOREIGN-TABLE
+	// check below consumes FOREIGN expecting TABLE to follow. Mirrors CREATE
+	// FOREIGN DATA WRAPPER's parsing (skips HANDLER/VALIDATOR func references —
+	// goopg tracks no funcs — DU-002 slice 380) but captures the OPTIONS
+	// clause as a verb-tagged change list (ADD/SET/DROP), not a flat replace,
+	// since ALTER merges onto the existing fdwoptions (transformGenericOptions,
+	// gram.y AlterFdwStmt) rather than recreating it. DU-002 slice 421.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "data") {
+		p.advance() // consume FOREIGN
+		p.advance() // consume DATA
+		_ = p.acceptIdentKeyword("wrapper")
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		var changes []FDWOptionChange
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				break
+			}
+			if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "options") {
+				changes = p.scanAlterFDWOptionsList()
+				continue
+			}
+			p.advance()
+		}
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
+	}
 	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
 	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply
 	// consumed here so the rest of this function (including the ALTER
 	// COLUMN ... OPTIONS (...) case, DU-002 slice 419) applies unchanged.
-	// Only consumed when TABLE follows: ALTER FOREIGN DATA WRAPPER is a
-	// distinct, unmodeled statement and must fall through to the KwTable
-	// expect below to raise its (pre-existing) syntax error.
+	// Only consumed when TABLE follows: ALTER FOREIGN DATA WRAPPER is handled
+	// above and never reaches here.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign &&
 		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwTable {
 		p.advance() // consume FOREIGN

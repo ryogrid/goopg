@@ -2027,6 +2027,14 @@ type CompatNoopStmt struct {
 	// re-emits the OPTIONS clause from pg_foreign_server.srvoptions. Nil when the
 	// statement carries no OPTIONS. DU-002 slice 378.
 	Options []string
+	// FDWOptionChanges carries a verb-tagged `ALTER FOREIGN DATA WRAPPER name
+	// OPTIONS ([ADD|SET|DROP] name ['value'], …)` clause (Tag == "ALTER",
+	// ObjType == "foreign-data wrapper"). Unlike the flat CREATE-time Options
+	// above, ALTER merges onto the existing pg_foreign_data_wrapper.fdwoptions
+	// via applyFDWOptionChanges, mirroring the identical ALTER FOREIGN TABLE
+	// ... OPTIONS (...) mechanism. Nil for every other CompatNoopStmt use.
+	// DU-002 slice 421.
+	FDWOptionChanges []FDWOptionChange
 	// ServerType / ServerVersion carry the TYPE 'x' / VERSION 'y' clauses of a
 	// CREATE SERVER statement. They round-trip through pg_foreign_server.srvtype /
 	// srvversion so pg_dump's dumpForeignServer re-emits the TYPE/VERSION clauses.
