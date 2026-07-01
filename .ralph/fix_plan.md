@@ -3544,6 +3544,36 @@ documentation-only and is exempt from the design-doc requirement.)
       parsed type spelling, not a canonical name, so `DROP CAST (real AS text)` fails to find a cast created via
       `CREATE CAST (float4 AS text) ...` — PG type-name synonyms don't cross-resolve in the slice-395 key scheme.
       Conversion/collation restart persistence still open, template now exists at bytes 40/41 next-free.
+      **2026-07-01 (loop #49) — CREATE/DROP CONVERSION restart persistence LANDED (third of the slice-389
+      "in-memory only" backlog to close), plus a real cross-cutting WAL-scan bug found and fixed.** Repeats the
+      loop #47/#48 template for `catalog.UserConversion` (schema-scoped, unlike Cast/Transform, so replay runs
+      after `replaySchemaDDLRecords` in `internal/initdb/open.go`): new `RecordKindCreateConversion`(40)/
+      `RecordKindDropConversion`(41) + `Encode/DecodeCreateConversion`/`Encode/DecodeDropConversion`
+      (`internal/wal/recovery.go`); new `CreateConversionDuringRecovery`/`DropConversionDuringRecovery` catalog
+      hooks (`internal/catalog/catalog.go` — the latter a thin wrapper, since `DropConversion` was already
+      replay-safe); new `internal/initdb/conversion_ddl_recovery.go` (`replayConversionDDLRecords`); executor
+      WAL emission at the CREATE `case "conversion"` arm and the DROP fallthrough's `case "conversion"` arm
+      (`internal/executor/operators_ddl.go`). Third-in-a-row hand-derived byte-offset bug (`EncodeCreateConversion`
+      under-allocated by 8 bytes — forgot the four 2-byte length prefixes), caught immediately by
+      `TestEncodeDecodeCreateConversionRoundTrip`. **Second, more serious bug found while landing this — NOT
+      conversion-specific, shared by all four DDL-recovery drivers (schema/transform/cast/conversion):** all four
+      blindly switched on `rec.Payload[0]` without checking whether `rec` was a PG-native/canonical XLogRecord
+      (`rec.XLog != nil`, e.g. an `XLOG_CHECKPOINT_SHUTDOWN` written by `Init`) whose `MainData` has no goopg kind
+      tag at all — a checkpoint's raw `redo` LSN low byte coincidentally matched `RecordKindCreateConversion`(40)
+      and made `TestConversionDDLRecoveryReplaysCreate` fail on a bare Init+Open with zero conversions ever
+      appended. Same collision class `wal.ApplyRecord` already guards against for physical replay (M0106-0011
+      comment), just never guarded in the catalog-only scanners. Fixed uniformly via new exported
+      `wal.IsGoopgNativeRecord(r Record) bool` (`internal/wal/recovery.go`, next to `ApplyRecord`) wired into all
+      four `replay*DDLRecords` loops — confirmed load-bearing (not defensive-only) by first trying the naive
+      `rec.XLog != nil` skip, which broke all four `...ReplaysCreate` tests (the legitimate CREATE records are
+      *also* canonical-framed in this WAL format; only the `Rmid==RmgrXLog && Info==0xF0` check correctly
+      distinguishes goopg-native from real-PG-native). Verified: unit tests (`internal/wal/conversion_ddl_test.go`
+      + full re-run of schema/cast/transform recovery test families); `go build`/`go vet` clean; `-race -count=1`
+      on `internal/wal`+`internal/catalog`+`internal/initdb` PASS; `TestE2E_PhysicalReplication`/
+      `...Sync` PASS; TPC-H spotcheck; pgbench smoke = pre-commit. Design doc `0110-0001-pg-dump-tap-port.md` new
+      "CREATE CONVERSION restart persistence" subsection (full bug narrative); ledger row appended. Collation
+      restart persistence is the last item in the four-object queue, bytes 42/43 next-free — the
+      `wal.IsGoopgNativeRecord` guard is already generalized so that loop needs no further WAL-scan fix.
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`

@@ -938,6 +938,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: cast DDL replay: %w", err)
 	}
+	// DU-002 restart-persistence follow-up: restore CREATE/DROP CONVERSION
+	// objects (pg_conversion) from the WAL the same way. Unlike
+	// transforms/casts, a conversion is schema-scoped (keyed by namespace
+	// OID + name), so this must run after replaySchemaDDLRecords above has
+	// repopulated the schema OID map.
+	if err := replayConversionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: conversion DDL replay: %w", err)
+	}
 
 	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
 	// If the JSON snapshot is present and valid, populate the catalog directly

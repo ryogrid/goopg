@@ -12635,7 +12635,14 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				// dropped conversion stops round-tripping through pg_dump
 				// (DU-002 slice 399); harmless for the other object types.
 				if objType == "conversion" {
-					im.DropConversion(s.Names[0].Name, s.Names[0].Schema)
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+						// DU-002 restart-persistence follow-up: mirror the
+						// DROP CAST/TRANSFORM WAL emission so the drop
+						// survives a restart too.
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropConversion(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
+							return fmt.Errorf("wal drop-conversion: %w", werr)
+						}
+					}
 				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
@@ -13100,6 +13107,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		if _, err := im.CreateConversion(uc, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
+		// per-conversion on-disk file namespace, so record a WAL event the
+		// recovery driver (internal/initdb/conversion_ddl_recovery.go)
+		// replays into the conversion registry on the next startup. Mirrors
+		// CREATE CAST/TRANSFORM.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateConversion(uc.Name, schema, uc.ProcSchema, uc.ProcName, uc.OID, uc.Owner, uc.FuncOID, uc.ForEncoding, uc.ToEncoding, uc.Default)); werr != nil {
+				return fmt.Errorf("wal create-conversion: %w", werr)
+			}
 		}
 	case "transform":
 		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang

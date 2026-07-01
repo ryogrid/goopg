@@ -8684,6 +8684,47 @@ func (c *InMemory) DropConversion(name, schema string) bool {
 	return false
 }
 
+// CreateConversionDuringRecovery is the idempotent version of CreateConversion
+// used by the WAL-replay driver (internal/initdb/conversion_ddl_recovery.go).
+// Unlike CreateConversion it takes the OID from the WAL record (so the
+// recovered conversion matches the pre-crash OID exactly) and overwrites
+// rather than erroring when an entry with the same OID is already present
+// (replay may see the same record more than once across a partial-then-full
+// replay). Mirrors RegisterCastDuringRecovery / RegisterTransformDuringRecovery.
+// DU-002 restart-persistence follow-up.
+func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	uc.NamespaceOID = nsOID
+	for i, existing := range c.userConversions {
+		if existing.OID == uc.OID {
+			c.userConversions[i] = uc
+			if uc.OID >= c.nextOID {
+				c.nextOID = uc.OID + 1
+			}
+			return
+		}
+	}
+	c.userConversions = append(c.userConversions, uc)
+	if uc.OID >= c.nextOID {
+		c.nextOID = uc.OID + 1
+	}
+}
+
+// DropConversionDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropConversion. Identical to DropConversion but
+// discards the found/not-found result — replay does not care whether the
+// conversion was still present (a subsequent CREATE with the same name after
+// a DROP is a valid sequence to replay in order). DU-002 restart-persistence
+// follow-up.
+func (c *InMemory) DropConversionDuringRecovery(name, schema string) {
+	c.DropConversion(name, schema)
+}
+
 // ListUserConversions returns the user-created conversions in creation order.
 // DU-002 slice 399.
 func (c *InMemory) ListUserConversions() []*UserConversion {

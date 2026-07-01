@@ -56,7 +56,15 @@ func replayTransformDDLRecords(walDir string, cat catalog.Catalog) error {
 	}
 
 	for _, rec := range records {
-		if len(rec.Payload) == 0 {
+		if len(rec.Payload) == 0 || !wal.IsGoopgNativeRecord(rec) {
+			// wal.IsGoopgNativeRecord rules out a PG-native/canonical
+			// XLogRecord (e.g. a checkpoint written via the real rmgr/info
+			// path for standby compatibility) whose MainData is raw PG
+			// struct bytes with no goopg kind-byte tag at Payload[0].
+			// Scanning it against the small custom RecordKind constants below
+			// risks a coincidental false-positive byte match (M0106-0011) —
+			// e.g. a checkpoint's redo LSN low byte landing on a real
+			// RecordKind value — so skip these records entirely.
 			continue
 		}
 		switch rec.Payload[0] {

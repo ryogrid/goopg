@@ -10235,6 +10235,93 @@ pre-commit hook.
 **Deliberately still open (ledger row, next in the template queue):** `catalog.UserConversion` and the collation
 registry still need the identical treatment (bytes 40/41 next free).
 
+### CREATE CONVERSION restart persistence (WAL replay) — third object of the slice-389 backlog to close, plus a real cross-cutting WAL-scan bug found and fixed
+
+Repeats the CREATE CAST/TRANSFORM template for `catalog.UserConversion` (the next item in the deliberately-deferred
+list). `UserConversion` is schema-scoped (unlike Cast/Transform, which are keyed by name pairs with no namespace),
+so replay of its WAL records must run *after* `replaySchemaDDLRecords` has repopulated the schema-name→OID map —
+the wiring in `internal/initdb/open.go` places `replayConversionDDLRecords` last in the CREATE/DROP DDL-replay
+sequence for exactly this reason.
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateConversion` (40) and
+`RecordKindDropConversion` (41), the next free bytes after `RecordKindDropCast` (39). `EncodeCreateConversion`/
+`DecodeCreateConversion` carry `oid | ownerOID | funcOID | forEncoding(int32) | toEncoding(int32) |
+defaultFlag(1) | name | schema | procSchema | procName` — five fields more than Cast, reflecting
+`UserConversion`'s larger field set (owner, two encodings, the as-written proc-name fallback pair, and the
+`DEFAULT` flag). `EncodeDropConversion`/`DecodeDropConversion` carry just the (name, schema) key.
+
+**New catalog recovery hooks** (`internal/catalog/catalog.go`): `CreateConversionDuringRecovery` (idempotent,
+OID-carrying counterpart of `CreateConversion` — replaces-by-OID instead of erroring on a duplicate, since replay
+can legitimately re-apply a record) and `DropConversionDuringRecovery` (a thin wrapper around the existing
+`DropConversion`, which was already replay-safe — it returns a bool the driver doesn't need rather than erroring).
+
+**New recovery driver** (`internal/initdb/conversion_ddl_recovery.go`, new file mirroring
+`cast_ddl_recovery.go`): `replayConversionDDLRecords` walks the WAL after physical replay completes, decodes each
+CREATE/DROP CONVERSION record, and applies it via the new recovery hooks.
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): the `case "conversion"` CREATE arm now calls
+`o.ctx.WAL.Append(wal.EncodeCreateConversion(...))` right after a successful `im.CreateConversion(...)`; the
+generic DROP fallthrough's `case "conversion"` arm (shared with text-search object types) calls
+`o.ctx.WAL.Append(wal.EncodeDropConversion(...))` right after a successful `im.DropConversion(...)`.
+
+**Byte-offset bug caught by the round-trip unit test again:** the first `EncodeCreateConversion` under-allocated
+the output buffer by 8 bytes — `make([]byte, 22+len(name)+len(schema)+len(procSchema)+len(procName))` accounted
+for the 22-byte fixed header but forgot the four 2-byte length prefixes the four variable-length fields also need
+(`22+8+...`). Same category as the Cast (1-byte) and Transform bugs before it — three for three, now a confirmed
+recurring failure mode for hand-derived wire formats in this codebase, not a one-off.
+
+**A second, more serious bug found — NOT a hand-derived-arithmetic mistake, a genuine gap shared by all four
+DDL-recovery drivers (schema/transform/cast/conversion):** `TestConversionDDLRecoveryReplaysCreate` failed with
+`decode create-conversion at lsn ...: wal: create-conversion payload truncated (need 4129 bytes)` on a data
+directory that had *never had a conversion appended to it* — the failure happened on the bare `Init`+`Open`
+before the test's own `WAL.Append` call. Root cause: `internal/initdb.Init` writes a real
+`XLOG_CHECKPOINT_SHUTDOWN` record (a PG-native/canonical XLogRecord, `Record.XLog != nil`, classified with
+`Rmid=RmgrXLog, Info=0x00`) whose `MainData` is raw `CheckPoint` struct bytes with **no goopg kind-byte tag at
+all** — the struct's first field is an 8-byte `redo` `XLogRecPtr`. In this run its low byte happened to be `0x28`
+(40 decimal) — exactly `RecordKindCreateConversion`'s newly-assigned value — so the naive
+`switch rec.Payload[0] { case wal.RecordKindCreateConversion: ... }` scan matched a checkpoint record and tried
+to `DecodeCreateConversion` its garbage bytes. This is the *exact* collision class `wal.ApplyRecord` already
+guards against for the physical-replay path (see the `M0106-0011` comment at `internal/wal/recovery.go` ~2626 —
+"an 88-byte XLOG_CHECKPOINT_SHUTDOWN whose redo-LSN low byte happened to collide with a goopg native
+RecordKind") — but the four catalog-only DDL-recovery scanners (`schema_ddl_recovery.go`, `transform_ddl_recovery.go`,
+`cast_ddl_recovery.go`, and this loop's new `conversion_ddl_recovery.go`) never had the guard, because none of
+their kind bytes (34–39) had coincidentally collided with a checkpoint's raw bytes *in the specific test
+scenarios exercised so far* — this was latent, not new, and would eventually have bitten schema/transform/cast
+too as WAL content grew and checkpoint redo-LSNs cycled through more byte values.
+
+**Fix, applied to all four drivers in this loop (sibling paths must change together):** added an exported helper,
+`wal.IsGoopgNativeRecord(r wal.Record) bool` (`internal/wal/recovery.go`, next to `ApplyRecord`), that returns
+`true` for records with `r.XLog == nil` (legacy/non-canonical framing — always trustworthy) and for canonical
+records that classify as `RmgrXLog` + the goopg-native sentinel info byte (`0xF0`); it returns `false` for any
+other canonical record (checkpoints and any other PG-native operation), signalling the byte-collision hazard.
+Each of the four recovery loops now guards with
+`if len(rec.Payload) == 0 || !wal.IsGoopgNativeRecord(rec) { continue }` before switching on `rec.Payload[0]`.
+Verified the fix is load-bearing, not defensive-only: temporarily applying just the schema-recovery-style
+`rec.XLog != nil` skip (a stricter, wrong first attempt) made `TestCastDDLRecoveryReplaysCreate`,
+`TestConversionDDLRecoveryReplaysCreate`, `TestSchemaDDLRecoveryReplaysCreate`, and
+`TestTransformDDLRecoveryReplaysCreate` all fail — because the *legitimate* CREATE records the tests append are
+themselves canonical (`XLog != nil`, classified `RmgrXLog`+`0xF0`) in this WAL format; only the Rmid/Info check
+correctly distinguishes "goopg-native record wrapped in canonical framing" from "real PG-native record". The
+corresponding `...ReplaysDropAfterCreate` tests passed even with that wrong first attempt, which is itself a
+finding: a drop-after-create-only assertion can't distinguish "replay correctly cancelled the two records" from
+"replay silently skipped everything" — both leave the registry empty. `TestConversionDDLRecoveryReplaysCreate`
+(a create-only positive assertion) is what actually caught the bug; kept in the suite for exactly this reason.
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateConversionRoundTrip`/`...DropConversionRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal/conversion_ddl_test.go`),
+`TestConversionDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/
+`TestReplayConversionDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open
+cycle), plus a full re-run of the sibling `TestSchemaDDLRecoveryReplaysCreate`/`TestCastDDLRecoveryReplaysCreate`/
+`TestTransformDDLRecoveryReplaysCreate` families to confirm the `IsGoopgNativeRecord` fix didn't regress them.
+(2) gates: `go build ./...` clean; `go vet ./...` clean; `-race -count=1` on
+`internal/wal`+`internal/catalog`+`internal/initdb` PASS; `TestE2E_PhysicalReplication`/
+`TestE2E_PhysicalReplicationSync` PASS (WAL/MVCC practice card's recovery-path gate); TPC-H spotcheck Q12/Q13
+PASS; pgbench smoke via the pre-commit hook.
+
+**Deliberately still open (ledger row, next in the template queue):** the collation registry still needs the
+identical treatment (bytes 42/43 next free). The DROP CAST type-name-synonym key gap noted in the CAST
+subsection above is still open too, independent of this loop.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

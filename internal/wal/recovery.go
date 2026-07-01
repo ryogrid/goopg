@@ -477,6 +477,34 @@ const (
 	//   kind(1) | sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes)
 	RecordKindDropCast byte = 39
 
+	// RecordKindCreateConversion records a `CREATE [DEFAULT] CONVERSION
+	// <name> FOR <src> TO <dest> FROM <func>` event so the catalog's
+	// in-memory conversion registry (catalog.InMemory.userConversions, which
+	// backs the pg_conversion virtual view) survives a restart. Like CREATE
+	// CAST/TRANSFORM, CREATE CONVERSION is a catalog-only side effect with no
+	// per-object on-disk file namespace, so the physical redo path is a
+	// no-op (applyRecord returns (false, nil)); the recovery driver in
+	// internal/initdb/conversion_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each conversion with
+	// its original OID. Unlike casts/transforms, a conversion is
+	// schema-scoped, so replay of this record must happen after schema
+	// replay (replaySchemaDDLRecords) has repopulated the schema OID map.
+	// Mirrors RecordKindCreateCast (M0119-0004). DU-002 restart-persistence
+	// follow-up.
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | funcOID(4) | forEncoding(4) | toEncoding(4) | defaultFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   procSchemaLen(2) | procSchema(procSchemaLen bytes) | procNameLen(2) | procName(procNameLen bytes)
+	RecordKindCreateConversion byte = 40
+
+	// RecordKindDropConversion records a `DROP CONVERSION <name>` event.
+	// Counterpart to RecordKindCreateConversion; the recovery driver removes
+	// the (schema, name) pair from the catalog instead of adding it. The
+	// OID/encodings/function are not needed on drop.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindDropConversion byte = 41
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -872,6 +900,148 @@ func DecodeDropCast(payload []byte) (source, target string, err error) {
 	}
 	target = string(payload[off : off+targetLen])
 	return source, target, nil
+}
+
+// EncodeCreateConversion encodes a CREATE [DEFAULT] CONVERSION event (DU-002
+// restart-persistence follow-up to M0119-0004). The OID and resolved function
+// OID are carried so recovery re-registers the conversion identically to the
+// live server. forEncoding/toEncoding are pg_enc IDs, which are small
+// non-negative values in practice but wire-encoded as signed int32 to match
+// catalog.UserConversion's field types exactly.
+// Format: kind(1) | oid(4) | ownerOID(4) | funcOID(4) | forEncoding(4) |
+// toEncoding(4) | defaultFlag(1) | nameLen(2) | name(nameLen bytes) |
+// schemaLen(2) | schema(schemaLen bytes) | procSchemaLen(2) |
+// procSchema(procSchemaLen bytes) | procNameLen(2) | procName(procNameLen bytes).
+func EncodeCreateConversion(name, schema, procSchema, procName string, oid, ownerOID, funcOID uint32, forEncoding, toEncoding int32, isDefault bool) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(procSchema) > 0xFFFF {
+		procSchema = procSchema[:0xFFFF]
+	}
+	if len(procName) > 0xFFFF {
+		procName = procName[:0xFFFF]
+	}
+	// 22-byte fixed header + 4 length-prefixed strings (2-byte length each).
+	out := make([]byte, 22+8+len(name)+len(schema)+len(procSchema)+len(procName))
+	out[0] = RecordKindCreateConversion
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], funcOID)
+	binary.LittleEndian.PutUint32(out[13:17], uint32(forEncoding))
+	binary.LittleEndian.PutUint32(out[17:21], uint32(toEncoding))
+	if isDefault {
+		out[21] = 1
+	}
+	off := 22
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(procSchema)))
+	off += 2
+	copy(out[off:], procSchema)
+	off += len(procSchema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(procName)))
+	off += 2
+	copy(out[off:], procName)
+	return out
+}
+
+// DecodeCreateConversion decodes a RecordKindCreateConversion payload.
+func DecodeCreateConversion(payload []byte) (name, schema, procSchema, procName string, oid, ownerOID, funcOID uint32, forEncoding, toEncoding int32, isDefault bool, err error) {
+	if len(payload) < 22 {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, fmt.Errorf("wal: create-conversion payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateConversion {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-conversion", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	funcOID = binary.LittleEndian.Uint32(payload[9:13])
+	forEncoding = int32(binary.LittleEndian.Uint32(payload[13:17]))
+	toEncoding = int32(binary.LittleEndian.Uint32(payload[17:21]))
+	isDefault = payload[21] != 0
+	off := 22
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-conversion payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-conversion payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	if procSchema, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	if procName, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	return name, schema, procSchema, procName, oid, ownerOID, funcOID, forEncoding, toEncoding, isDefault, nil
+}
+
+// EncodeDropConversion encodes a DROP CONVERSION event (DU-002
+// restart-persistence follow-up to M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeDropConversion(name, schema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(schema))
+	out[0] = RecordKindDropConversion
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeDropConversion decodes a RecordKindDropConversion payload.
+func DecodeDropConversion(payload []byte) (name, schema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-conversion payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropConversion {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-conversion", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: drop-conversion payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", fmt.Errorf("wal: drop-conversion payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -2435,6 +2605,25 @@ func ExportedReplayStart(records []Record) (int, uint64) {
 	return replayStart(records)
 }
 
+// IsGoopgNativeRecord reports whether r.Payload[0] is a trustworthy goopg
+// RecordKind tag byte that a caller may safely switch on. A record with a
+// non-nil XLog that did NOT classify as RmgrXLog+xlogInfoDefault is a
+// structurally real PG-native record (e.g. an XLOG_CHECKPOINT_SHUTDOWN) whose
+// MainData is raw PG struct bytes with no goopg kind tag at all — Payload[0]
+// in that case is arbitrary data (e.g. a checkpoint's redo-LSN low byte) that
+// can coincidentally collide with a real RecordKind constant, exactly the
+// M0106-0011 collision ApplyRecord below guards against. The catalog-only
+// DDL-recovery scanners (internal/initdb/*_ddl_recovery.go — schema,
+// transform, cast, conversion, ...) share this same hazard because they
+// walk the same `wal.ReadAll` records and switch on Payload[0]; they must
+// call this before trusting the byte. DU-002 restart-persistence follow-up.
+func IsGoopgNativeRecord(r Record) bool {
+	if r.XLog == nil {
+		return true
+	}
+	return r.XLog.Header.Rmid == RmgrXLog && r.XLog.Header.Info == xlogInfoDefault
+}
+
 // ApplyRecord applies a single decoded WAL record to storage. It is
 // the per-record kernel shared by `ReplayRecords` (crash recovery
 // from a slice already trimmed to the last checkpoint) and
@@ -2618,6 +2807,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// driver in internal/initdb/cast_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's cast registry.
+		return false, nil
+	case RecordKindCreateConversion, RecordKindDropConversion:
+		// CREATE/DROP CONVERSION records (DU-002 restart-persistence
+		// follow-up) carry only pg_conversion metadata; goopg has no
+		// per-conversion file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/conversion_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's conversion registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
