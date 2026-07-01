@@ -4090,6 +4090,43 @@ documentation-only and is exempt from the design-doc requirement.)
       is not enforced (no `object_ownercheck` equivalent, consistent with
       every other operator DDL arm); `regoper`/`regoperator` OID→name
       resolution remains open (unchanged, unrelated).
+      **2026-07-01 (loop #34, design `0119-0004-create-operator-roundtrip.md`
+      "Loop #34"): `CREATE OPERATOR FAMILY name USING method` LANDED —
+      DU-002 slice 408, a new object family.** `CREATE OPERATOR FAMILY` had
+      no parse path at all before this loop (`pg_opfamily.VirtualRows` was
+      hardcoded `nil`), so pg_dump's `getOpfamilies` always read 0 rows.
+      Matches upstream's own bare `002_pg_dump.pl` `op_family` fixture — PG's
+      grammar has no `AS` clause here (unlike CREATE OPERATOR CLASS); the
+      family starts empty, members added later via a separate `ALTER
+      OPERATOR FAMILY ... ADD` (not implemented — deferred). New parser
+      `parseCreateOpFamilyTail` (`[schema.]name USING method`) stashes the
+      method on `CompatNoopStmt.OpFamilyMethod`; new catalog
+      `UserOperatorFamily` + `RegisterUserOperatorFamily`/
+      `DropUserOperatorFamily`/`ListUserOperatorFamilies` (keyed
+      `"<schema>.<name>/<method-oid>"`, since PG scopes opfamily uniqueness
+      per namespace+access-method) + `AccessMethodOIDByName`;
+      `pg_opfamily.VirtualRows` now renders the registry; new
+      `execCompatNoop` `case "operator family":` resolves method (42704 if
+      unrecognized) + namespace and registers. No planner change needed.
+      Tests: `TestParseCreateOperatorFamily`/
+      `TestParseCreateOperatorFamilyUnqualified`/
+      `TestParseCreateOperatorClassStillWorks` (parser);
+      `TestCreateOperatorFamily`/`TestCreateOperatorFamilyIdempotent`/
+      `TestCreateOperatorFamilyUnknownMethod` (executor); new DU-002 slice
+      408 assertions in `TestPort_PgDumpConnectionSetup` (byte-identical
+      CREATE + OWNER TO vs live PG 18.3, plus a negative check that no
+      spurious `ALTER OPERATOR FAMILY ... ADD` line appears for an empty
+      family). Gates: `go build ./...` clean; `go vet`
+      parser/catalog/executor/planner clean; `internal/parser`+
+      `internal/catalog`+`internal/executor`+`internal/planner` suites PASS;
+      `gofmt -l` flags only the same pre-existing go1.25/1.26-drift files as
+      loop #33 (verified via `git stash`); TPC-H spotcheck Q12=2/Q13=33
+      PASS; pgbench smoke = pre-commit hook. Deferred (ledger row appended):
+      `ALTER OPERATOR FAMILY ... ADD` (loose OPERATOR/FUNCTION members) not
+      implemented; full `CREATE OPERATOR CLASS` round-trip (still the
+      pre-existing M0097-0027 minimal stub — does not populate `pg_opclass`)
+      + the `op_class_custom` ordering fixture (range-type
+      `subtype_opclass` binding) remain a separate, larger follow-up.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

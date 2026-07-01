@@ -223,7 +223,113 @@ suites PASS; `gofmt -l` flags only the same pre-existing files as slice 407
 (verified via `git stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke
 = pre-commit hook.
 
+## Loop #34: `CREATE OPERATOR FAMILY name USING method` (DU-002 slice 408)
+
+New object family — until this loop `CREATE OPERATOR FAMILY` had **no parse
+path at all** (only `ALTER OPERATOR FAMILY ... OWNER TO` fell into the
+generic `ALTER VIEW/SCHEMA/COLLATION/.../OPERATOR CLASS|FAMILY/...`
+compat-stub no-op in `parseAlter`), so `pg_opfamily`'s virtual view was
+unconditionally empty by construction and pg_dump's `getOpfamilies` always
+read 0 rows. This is upstream's own bare `002_pg_dump.pl` fixture
+(`'CREATE OPERATOR FAMILY dump_test.op_family'`) — unlike `CREATE OPERATOR
+CLASS`, PG's `CREATE OPERATOR FAMILY` grammar has **no `AS` clause**: the
+family starts empty; `OPERATOR`/`FUNCTION` members are added later via a
+separate `ALTER OPERATOR FAMILY ... ADD` statement (`CreateOpFamily`,
+`opfamilycmds.c`).
+
+- **Parser** (`internal/parser/ddl.go`'s `parseCreate`, `"operator"` case):
+  a new `p.acceptIdentKeyword("family")` branch checked right after the
+  pre-existing `CLASS` branch (before falling into the bare `CREATE
+  OPERATOR` symbol-name parse). New `parseCreateOpFamilyTail` parses
+  `[schema.]name USING method` via `p.parseObjectName()` (unlike
+  `CreateOpClassStmt.Name`, which only ever captured a single unqualified
+  token — a pre-existing, out-of-scope limitation left alone) and stashes
+  the method name on a new `CompatNoopStmt.OpFamilyMethod string` field,
+  reusing the same "parse into `CompatNoopStmt`, decorate with
+  `ObjType`/`ObjName`" pattern every other compat-registry DDL statement in
+  this file already follows (`CREATE OPERATOR`, `CREATE CAST`, `CREATE
+  CONVERSION`, ...).
+- **Catalog** (`internal/catalog/catalog.go`): new `UserOperatorFamily`
+  struct (`OID`/`Name`/`NamespaceOID`/`Method`/`Owner`, with
+  `OwnerOrDefault`/`NamespaceOIDOrDefault` mirroring `UserOperator`'s) +
+  `RegisterUserOperatorFamily`/`DropUserOperatorFamily`/
+  `ListUserOperatorFamilies`, keyed on `"<schema>.<name>/<method-oid>"` (PG
+  scopes opfamily-name uniqueness per namespace *and* access method, so the
+  key includes the method OID, not just schema+name). `pg_opfamily`'s
+  `VirtualRows` now renders `ListUserOperatorFamilies()` instead of the
+  hardcoded `nil`. New package-level `AccessMethodOIDByName` resolves
+  `btree`/`hash`/`gist`/`gin`/`spgist`/`brin`/`heap` to their `pg_am.oid`
+  (the same 7 rows `pg_am.VirtualRows` already serves) — a small helper
+  mirroring the existing `LanguageNameToOID`.
+- **Executor** (`internal/executor/operators_ddl.go`, `execCompatNoop`): a
+  new `case "operator family":` resolves the method name via
+  `catalog.AccessMethodOIDByName` (raising `42704 "access method %q does not
+  exist"` for an unrecognized one — PG's own `get_index_am_oid(amname,
+  false)` check in `CreateOpFamily` — rather than silently registering a
+  method-OID-0 family) and the schema to a namespace OID exactly like the
+  `"operator"` case, then calls `RegisterUserOperatorFamily`.
+- **Planner**: no change needed — `CompatNoopStmt` was already in the
+  DDL-passthrough case list from `CREATE OPERATOR`'s own landing.
+
+### pg_dump mechanics (no goopg "dump" code — real PG's own logic)
+
+`getOpfamilies` runs a flat `SELECT tableoid, oid, opfmethod, opfname,
+opfnamespace, opfowner FROM pg_opfamily` — no join. `dumpOpfamily` then
+issues two *separate* queries per family: `pg_amop`/`pg_amproc` joined
+against `pg_depend` filtered to `refclassid = pg_opfamily AND refobjid =
+<this family's oid>`. Since goopg registers no `pg_amop`/`pg_amproc`/
+`pg_depend` rows for a user family (no `ALTER OPERATOR FAMILY ... ADD`
+support yet), both queries return 0 rows for every family goopg creates, so
+`dumpOpfamily`'s `ALTER OPERATOR FAMILY ... ADD ...;` block is correctly
+never emitted — only the unconditional `CREATE OPERATOR FAMILY %s USING
+%s;` line. The `ALTER OPERATOR FAMILY ... OWNER TO` line comes from the
+archiver's generic per-TOC-entry owner mechanism (`_getObjectDescription`
+building `"OPERATOR FAMILY name USING method"` from the `DROP` statement
+text), the same mechanism slice 406's `CREATE OPERATOR` assertion already
+depends on — no additional goopg-side code needed.
+
+### Scope / limitations (deferred — see the ledger)
+
+- `ALTER OPERATOR FAMILY ... ADD (OPERATOR/FUNCTION entries)` is not
+  implemented — a family can be created but never populated with loose
+  members. No current fixture needs it (upstream's `op_family` fixture is
+  the bare/empty form; the fuller `op_class`/`op_class_custom` fixtures
+  bundle their operators directly into `CREATE OPERATOR CLASS ... AS ...`,
+  which is a separate, still-minimal stub — see below).
+- `CREATE OPERATOR CLASS` itself remains the pre-existing minimal stub from
+  M0097-0027 (`execCreateOpClass` only tracks the `FUNCTION 2` hash-extended
+  support function and a schema association for `DROP SCHEMA CASCADE`
+  detail text) — it does **not** populate `pg_opclass`, and its parser
+  (`parseCreateOpClassTail`) only recognizes `OPERATOR`/`FUNCTION` entries
+  in the `AS` list (not e.g. a bare `STORAGE type` entry). Full `CREATE
+  OPERATOR CLASS` round-trip (and the `op_class_custom` ordering fixture
+  that combines a custom operator + opclass + range-type `subtype_opclass`
+  reference) is a materially larger follow-up, tracked separately.
+- Family ownership (`Owner`) defaults to the bootstrap superuser exactly
+  like `UserOperator.Owner` — goopg's DDL surface has no per-session
+  creating-role tracking for this statement family.
+
+### Gates
+
+`TestParseCreateOperatorFamily`/`TestParseCreateOperatorFamilyUnqualified`/
+`TestParseCreateOperatorClassStillWorks` (parser, `op_compat_test.go`);
+`TestCreateOperatorFamily`/`TestCreateOperatorFamilyIdempotent`/
+`TestCreateOperatorFamilyUnknownMethod` (executor, `create_operator_test.go`);
+new DU-002 slice 408 assertions in `TestPort_PgDumpConnectionSetup`
+(`internal/testport/pgdump_connsetup_test.go`) — byte-identical CREATE +
+OWNER TO lines verified against a live PG 18.3 instance, plus a negative
+assertion that no spurious `ALTER OPERATOR FAMILY ... ADD` line appears for
+an empty family. `go build ./...` clean; `go vet`
+parser/catalog/executor/planner clean; `internal/parser`+`internal/catalog`+
+`internal/executor`+`internal/planner` suites PASS; `gofmt -l` flags only
+the same pre-existing go1.25/1.26-drift files as loop #33 (verified via
+`git stash`); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit
+hook.
+
 ## Still open under M0119-0004
 
 `regoper`/`regoperator` OID→name resolution (no column is typed `regoper`
-yet, so no observable gap); further pg_dump 002–010 catalog parity slices.
+yet, so no observable gap); `ALTER OPERATOR FAMILY ... ADD` (loose
+OPERATOR/FUNCTION members); full `CREATE OPERATOR CLASS` round-trip +
+`op_class_custom` ordering fixture (range-type `subtype_opclass` binding);
+further pg_dump 002–010 catalog parity slices.

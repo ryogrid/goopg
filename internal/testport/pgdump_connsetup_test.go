@@ -5243,6 +5243,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE OPERATOR public.~~ (FUNCTION = int4eq, LEFTARG = int, RIGHTARG = int)"); err != nil {
 		t.Fatalf("create operator public.~~: %v", err)
 	}
+	// Slice 408: CREATE OPERATOR FAMILY must round-trip via
+	// getOpfamilies/dumpOpfamily, byte-identical to a real pg_dump 18.3 run.
+	// Unlike CREATE OPERATOR, CREATE OPERATOR FAMILY was a total parse gap
+	// before this loop (ALTER OPERATOR FAMILY had a generic OWNER-TO compat
+	// stub, but CREATE OPERATOR FAMILY fell into no branch at all and errored
+	// as "unsupported statement"). This is upstream's own bare
+	// `CREATE OPERATOR FAMILY dump_test.op_family USING btree;` fixture
+	// (postgres/src/bin/pg_dump/t/002_pg_dump.pl) — the family starts empty
+	// (no AS clause in PG's grammar); OPERATOR/FUNCTION members added via
+	// ALTER OPERATOR FAMILY ... ADD are a separate, larger deferral (see the
+	// ledger; CREATE OPERATOR CLASS itself is a pre-existing minimal stub
+	// that does not populate pg_opfamily/pg_opclass either).
+	if err := runSQLSimple(t, c, "CREATE OPERATOR FAMILY public.op_family USING btree"); err != nil {
+		t.Fatalf("create operator family public.op_family: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -8128,6 +8143,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if want := "ALTER OPERATOR public.~~ (integer, integer) OWNER TO"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump missing ALTER OPERATOR OWNER TO for public.~~\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 408 (asserted):** CREATE OPERATOR FAMILY public.op_family must
+		// round-trip via getOpfamilies/dumpOpfamily, byte-identical to real
+		// pg_dump 18.3 (verified against a live PG18 instance and matches
+		// upstream's own `002_pg_dump.pl` bare-family fixture verbatim, modulo
+		// the schema name). dumpOpfamily emits the fixed `CREATE OPERATOR
+		// FAMILY %s USING %s;` shape unconditionally, then an `ALTER ... ADD`
+		// clause ONLY when pg_amop/pg_amproc carry loose members tied to this
+		// family via pg_depend — an empty family (this one; goopg does not yet
+		// implement ALTER OPERATOR FAMILY ... ADD) has neither, so no ALTER ...
+		// ADD line should appear. The generic archiver-level OWNER TO mechanism
+		// (same one that produced the CREATE OPERATOR assertion above) derives
+		// the object description from the DROP statement text, so it reads
+		// "OPERATOR FAMILY public.op_family USING btree", not just the bare name.
+		if want := "CREATE OPERATOR FAMILY public.op_family USING btree;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE OPERATOR FAMILY %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "ALTER OPERATOR FAMILY public.op_family USING btree OWNER TO"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR FAMILY OWNER TO for public.op_family\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "ALTER OPERATOR FAMILY public.op_family USING btree ADD") {
+			t.Errorf("pg_dump emitted a spurious ALTER OPERATOR FAMILY ... ADD for an empty family\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation

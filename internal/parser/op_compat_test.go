@@ -343,6 +343,69 @@ func TestParseCreateOperatorExtendedClauses(t *testing.T) {
 	}
 }
 
+// TestParseCreateOperatorFamily verifies CREATE OPERATOR FAMILY name USING
+// method captures ObjType/ObjName/OpFamilyMethod (DU-002 slice 408). Unlike
+// CREATE OPERATOR CLASS, the grammar has no AS clause.
+func TestParseCreateOperatorFamily(t *testing.T) {
+	stmts, err := Parse("CREATE OPERATOR FAMILY myschema.op_family USING btree")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("Expected 1 stmt, got %d", len(stmts))
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ObjType != "operator family" {
+		t.Errorf("ObjType = %q, want %q", ns.ObjType, "operator family")
+	}
+	if ns.ObjName.Schema != "myschema" || ns.ObjName.Name != "op_family" {
+		t.Errorf("ObjName = %+v, want {myschema op_family}", ns.ObjName)
+	}
+	if ns.OpFamilyMethod != "btree" {
+		t.Errorf("OpFamilyMethod = %q, want %q", ns.OpFamilyMethod, "btree")
+	}
+}
+
+// TestParseCreateOperatorFamilyUnqualified verifies a bare (unqualified)
+// family name parses with an empty Schema, mirroring the other CREATE
+// OPERATOR FAMILY test. DU-002 slice 408.
+func TestParseCreateOperatorFamilyUnqualified(t *testing.T) {
+	stmts, err := Parse("CREATE OPERATOR FAMILY op_family USING gist;")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("Expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if ns.ObjName.Schema != "" || ns.ObjName.Name != "op_family" {
+		t.Errorf("ObjName = %+v, want {\"\" op_family}", ns.ObjName)
+	}
+	if ns.OpFamilyMethod != "gist" {
+		t.Errorf("OpFamilyMethod = %q, want %q", ns.OpFamilyMethod, "gist")
+	}
+}
+
+// TestParseCreateOperatorClassStillWorks guards against the new "family"
+// branch shadowing the pre-existing CREATE OPERATOR CLASS parse path.
+// DU-002 slice 408.
+func TestParseCreateOperatorClassStillWorks(t *testing.T) {
+	stmts, err := Parse("CREATE OPERATOR CLASS my_opclass FOR TYPE int4 USING hash AS FUNCTION 2 my_hash_func(int4)")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	oc, ok := stmts[0].(*CreateOpClassStmt)
+	if !ok {
+		t.Fatalf("Expected *CreateOpClassStmt, got %T", stmts[0])
+	}
+	if oc.Name != "my_opclass" {
+		t.Errorf("Name = %q, want %q", oc.Name, "my_opclass")
+	}
+}
+
 // TestParseCreateOperatorUnary verifies a LEFTARG-omitted (prefix/unary)
 // CREATE OPERATOR parses with an empty ArgTypes[0], matching PG's grammar
 // (RIGHTARG is always required — postfix operators were removed in PG14).

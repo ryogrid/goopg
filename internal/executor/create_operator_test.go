@@ -331,3 +331,78 @@ func TestAlterOperatorSetMissingOperator(t *testing.T) {
 		t.Fatalf("error = %v, want ExecError{Code: 42883}", err)
 	}
 }
+
+// pgOpfamilyVirtualRows invokes pg_opfamily's VirtualRows function through
+// the catalog table registry, mirroring how pg_dump's getOpfamilies reads it.
+func pgOpfamilyVirtualRows(t *testing.T, im *catalog.InMemory) [][]string {
+	t.Helper()
+	tbl, ok := im.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_opfamily"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_catalog.pg_opfamily virtual table/VirtualRows not found")
+	}
+	return tbl.VirtualRows()
+}
+
+// TestCreateOperatorFamily verifies CREATE OPERATOR FAMILY registers a
+// catalog.UserOperatorFamily resolving the USING method to its pg_am OID and
+// the schema to its namespace OID, and that it surfaces through
+// pg_opfamily.VirtualRows (pg_dump's getOpfamilies/dumpOpfamily). DU-002
+// slice 408.
+func TestCreateOperatorFamily(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	rows := pgOpfamilyVirtualRows(t, im)
+	if len(rows) != 1 {
+		t.Fatalf("VirtualRows = %d rows, want 1: %v", len(rows), rows)
+	}
+	row := rows[0]
+	if row[1] != "403" { // opfmethod: btree
+		t.Errorf("opfmethod = %q, want 403 (btree)", row[1])
+	}
+	if row[2] != "op_family" { // opfname
+		t.Errorf("opfname = %q, want op_family", row[2])
+	}
+}
+
+// TestCreateOperatorFamilyIdempotent verifies re-registering the same
+// (schema, name, method) reuses the same OID (mirrors RegisterUserOperator's
+// idempotency), so re-running the CREATE (e.g. IF NOT EXISTS-style retries at
+// a higher layer) does not mint a second pg_opfamily row. DU-002 slice 408.
+func TestCreateOperatorFamilyIdempotent(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("first CREATE OPERATOR FAMILY: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	first := im.ListUserOperatorFamilies()[0]
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("second CREATE OPERATOR FAMILY: %v", err)
+	}
+	fams := im.ListUserOperatorFamilies()
+	if len(fams) != 1 {
+		t.Fatalf("ListUserOperatorFamilies = %d entries, want 1: %v", len(fams), fams)
+	}
+	if fams[0].OID != first.OID {
+		t.Errorf("OID changed across idempotent re-CREATE: %d -> %d", first.OID, fams[0].OID)
+	}
+}
+
+// TestCreateOperatorFamilyUnknownMethod verifies an unrecognized USING method
+// raises 42704 "access method ... does not exist", mirroring PG's
+// get_index_am_oid(amname, false) check in CreateOpFamily (opfamilycmds.c).
+// DU-002 slice 408.
+func TestCreateOperatorFamilyUnknownMethod(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING bogus_am`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("error = %v, want ExecError{Code: 42704}", err)
+	}
+}

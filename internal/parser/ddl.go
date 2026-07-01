@@ -176,6 +176,15 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if p.acceptIdentKeyword("class") {
 			return p.parseCreateOpClassTail(t.Pos)
 		}
+		// CREATE OPERATOR FAMILY name USING method — register in the runtime
+		// pg_opfamily registry so it round-trips through pg_dump
+		// (getOpfamilies/dumpOpfamily). Unlike CREATE OPERATOR CLASS, the
+		// grammar has no AS clause: members are added later via a separate
+		// ALTER OPERATOR FAMILY ... ADD statement (opfamilycmds.c
+		// CreateOpFamily). DU-002 (M0119-0004).
+		if p.acceptIdentKeyword("family") {
+			return p.parseCreateOpFamilyTail(t.Pos)
+		}
 		// CREATE OPERATOR name (leftarg=T, rightarg=T, function=fn, ...) — parse
 		// name + arg types (for the DROP OPERATOR compat registry, M0097-regress)
 		// plus the FUNCTION/PROCEDURE clause (so the operator round-trips through
@@ -1179,6 +1188,38 @@ func (p *parser) parseAggregateOptions(stmt *CreateAggregateStmt) error {
 		p.advance() // consume ")"
 	}
 	return nil
+}
+
+// parseCreateOpFamilyTail picks up after "CREATE OPERATOR FAMILY". Grammar:
+//
+//	name USING index_method
+//
+// the entire statement — PG has no AS clause here (unlike CREATE OPERATOR
+// CLASS); members are added later via ALTER OPERATOR FAMILY ... ADD.
+// DU-002 (M0119-0004).
+func (p *parser) parseCreateOpFamilyTail(pos int) (Stmt, error) {
+	name, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	var method string
+	if p.acceptKeyword(KwUsing) {
+		methodTok := p.cur()
+		if methodTok.Kind == TokenIdent || methodTok.Kind == TokenKeyword {
+			method = strings.ToLower(methodTok.Value)
+			p.advance()
+		}
+	}
+	stmt, err := p.parseSkipToSemicolon(pos)
+	if err != nil {
+		return nil, err
+	}
+	if ns, ok := stmt.(*CompatNoopStmt); ok {
+		ns.ObjType = "operator family"
+		ns.ObjName = name
+		ns.OpFamilyMethod = method
+	}
+	return stmt, nil
 }
 
 // parseCreateOpClassTail picks up after "CREATE OPERATOR CLASS".

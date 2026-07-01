@@ -13478,6 +13478,30 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				}
 			}
 		}
+	case "operator family":
+		// Register the user-defined operator family (CREATE OPERATOR FAMILY
+		// name USING method) so it round-trips through pg_dump (pg_opfamily
+		// virtual view → getOpfamilies/dumpOpfamily). The family starts empty
+		// — PG's grammar has no AS clause here; members are added later via
+		// ALTER OPERATOR FAMILY ... ADD, which goopg does not yet implement
+		// (deferred, see the ledger). An unrecognized access method name
+		// resolves to method OID 0, which real PG rejects with
+		// "access method %s does not exist" (42704) — mirrored here rather
+		// than silently registering a bogus family. DU-002 slice 408.
+		methodOID := catalog.AccessMethodOIDByName(s.OpFamilyMethod)
+		if methodOID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("access method %q does not exist", s.OpFamilyMethod)}
+		}
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		nsOID := o.ctx.Catalog.SchemaOID(schema)
+		if nsOID == 0 {
+			nsOID = o.ctx.Catalog.SchemaOID("public")
+		}
+		im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
 	case "cast":
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
 		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).

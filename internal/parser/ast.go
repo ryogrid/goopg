@@ -2009,6 +2009,13 @@ type CompatNoopStmt struct {
 	OpJoinFuncName     ObjectName
 	OpCanMerge         bool
 	OpCanHash          bool
+	// OpFamilyMethod carries a CREATE OPERATOR FAMILY statement's `USING
+	// index_method` clause (e.g. "btree"). The executor resolves it to a
+	// pg_am OID (catalog.AccessMethodOIDByName) and records the family in the
+	// catalog operator-family registry so pg_dump's getOpfamilies/
+	// dumpOpfamily re-emit `CREATE OPERATOR FAMILY name USING method;`. Empty
+	// when the statement is not a CREATE OPERATOR FAMILY. DU-002 (M0119-0004).
+	OpFamilyMethod string
 }
 
 // AlterOperatorSetStmt — `ALTER OPERATOR name (left_type, right_type) SET
