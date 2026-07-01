@@ -107,6 +107,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterSubscriptionOwner(s)
 	case *parser.CreateEventTriggerStmt:
 		return nil, o.execCreateEventTrigger(s)
+	case *parser.AlterEventTriggerStmt:
+		return nil, o.execAlterEventTrigger(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -749,6 +751,59 @@ func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
 	}
 	if _, err := im.RegisterEventTrigger(s.Name, s.Event, o.currentDDLOwnerOID(), funcOID, s.Tags); err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// execAlterEventTrigger handles ALTER EVENT TRIGGER name {DISABLE |
+// ENABLE [REPLICA|ALWAYS] | RENAME TO newname | OWNER TO newowner}. Like
+// CREATE EVENT TRIGGER, this only maintains dump fidelity (evtenabled/
+// evtname/evtowner in the pg_event_trigger virtual view) — goopg never fires
+// event triggers, so ENABLE/DISABLE has no runtime effect beyond the catalog
+// row. No WAL persistence yet (same gap as CREATE/DROP EVENT TRIGGER itself;
+// see the ledger). DU-002 (M0119-0004, loop #69 ledger follow-up).
+func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER EVENT TRIGGER requires the in-memory catalog"}
+	}
+	notFoundErr := func(err error) *ExecError {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	switch s.Action {
+	case "disable":
+		if err := im.SetEventTriggerEnabled(s.Name, "D"); err != nil {
+			return notFoundErr(err)
+		}
+	case "enable":
+		if err := im.SetEventTriggerEnabled(s.Name, "O"); err != nil {
+			return notFoundErr(err)
+		}
+	case "enable_replica":
+		if err := im.SetEventTriggerEnabled(s.Name, "R"); err != nil {
+			return notFoundErr(err)
+		}
+	case "enable_always":
+		if err := im.SetEventTriggerEnabled(s.Name, "A"); err != nil {
+			return notFoundErr(err)
+		}
+	case "rename":
+		if err := im.RenameEventTrigger(s.Name, s.NewName); err != nil {
+			if errors.Is(err, catalog.ErrEventTriggerAlreadyExists) {
+				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+			}
+			return notFoundErr(err)
+		}
+	case "owner":
+		ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
+		if err != nil {
+			return err
+		}
+		if err := im.SetEventTriggerOwner(s.Name, ownerOID); err != nil {
+			return notFoundErr(err)
+		}
+	default:
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized ALTER EVENT TRIGGER action %q", s.Action)}
 	}
 	return nil
 }

@@ -6798,6 +6798,62 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
+	// ALTER EVENT TRIGGER name {DISABLE | ENABLE [REPLICA|ALWAYS] | RENAME TO
+	// newname | OWNER TO newowner} — the only ALTER EVENT TRIGGER forms goopg
+	// models. "event" is an ident-keyword (like DROP EVENT TRIGGER's), TRIGGER
+	// is a registered keyword token, so this is handled explicitly rather than
+	// falling into the generic ident-based compat-stub loop below. DU-002
+	// (M0119-0004, loop #69 ledger follow-up).
+	if p.acceptIdentKeyword("event") {
+		if _, err := p.expectKeyword(KwTrigger); err != nil {
+			return nil, err
+		}
+		if p.cur().Kind != TokenIdent {
+			return nil, p.errAtCur("expected event trigger name")
+		}
+		name := p.cur().Value
+		p.advance()
+		switch {
+		case p.acceptIdentKeyword("disable"):
+			return &AlterEventTriggerStmt{pos: t.Pos, Name: name, Action: "disable"}, nil
+		case p.acceptIdentKeyword("enable"):
+			switch {
+			case p.acceptIdentKeyword("replica"):
+				return &AlterEventTriggerStmt{pos: t.Pos, Name: name, Action: "enable_replica"}, nil
+			case p.acceptIdentKeyword("always"):
+				return &AlterEventTriggerStmt{pos: t.Pos, Name: name, Action: "enable_always"}, nil
+			default:
+				return &AlterEventTriggerStmt{pos: t.Pos, Name: name, Action: "enable"}, nil
+			}
+		case p.acceptIdentKeyword("rename"):
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newName, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterEventTriggerStmt{pos: t.Pos, Name: name, Action: "rename", NewName: identText(newName)}, nil
+		case p.acceptIdentKeyword("owner"):
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			var newOwner string
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+			// superuser sentinel, mirroring ALTER PUBLICATION/SUBSCRIPTION OWNER TO.
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				newOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				newOwner = identText(tok)
+			} else {
+				newOwner = "current_user"
+			}
+			return &AlterEventTriggerStmt{pos: t.Pos, Name: name, Action: "owner", NewOwner: newOwner}, nil
+		}
+		return nil, p.errAtCur("expected DISABLE, ENABLE, RENAME TO, or OWNER TO in ALTER EVENT TRIGGER")
+	}
 	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
 	// SYSTEM — compatibility stubs. Consume until end of statement.
 	for _, objIdent := range []string{

@@ -10723,18 +10723,27 @@ type EventTrigger struct {
 	Owner   uint32 // evtowner; 0 → defaults to the bootstrap superuser at render time
 	FuncOID uint32 // evtfoid, resolved at CREATE time (must exist — no deferred/dangling reference)
 	// Enabled mirrors pg_event_trigger.evtenabled: 'O' (origin, the CREATE-time
-	// default), 'D' disabled, 'A' always, 'R' replica. ALTER EVENT TRIGGER
-	// ENABLE/DISABLE is not modelled yet (DU-002 follow-up; see ledger) — every
-	// event trigger stays 'O' for its lifetime today.
+	// default), 'D' disabled, 'A' always, 'R' replica. Mutated by ALTER EVENT
+	// TRIGGER ENABLE/DISABLE (DU-002, M0119-0004 loop #69 ledger follow-up).
 	Enabled string
 	// Tags holds the WHEN TAG IN (...) filter values verbatim (unquoted); nil
 	// if the CREATE had no WHEN clause. dumpEventTrigger re-quotes each one.
 	Tags []string
 }
 
+// ErrEventTriggerNotFound / ErrEventTriggerAlreadyExists are returned by the
+// EventTrigger registry mutators (Register/Rename/SetEventTrigger*) so
+// callers can map to PostgreSQL's 42704 undefined_object / 42710
+// duplicate_object respectively. DU-002 (M0119-0004, loop #69 ledger
+// follow-up).
+var (
+	ErrEventTriggerNotFound      = errors.New("event trigger does not exist")
+	ErrEventTriggerAlreadyExists = errors.New("event trigger already exists")
+)
+
 // RegisterEventTrigger records an event trigger, allocating a stable OID.
-// Returns an error if a trigger with this name already exists (PG: 42710
-// duplicate_object, "event trigger %q already exists"). DU-002 (M0119-0004).
+// Returns ErrEventTriggerAlreadyExists if a trigger with this name already
+// exists. DU-002 (M0119-0004).
 func (c *InMemory) RegisterEventTrigger(name, event string, owner, funcOID uint32, tags []string) (*EventTrigger, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -10742,7 +10751,7 @@ func (c *InMemory) RegisterEventTrigger(name, event string, owner, funcOID uint3
 		c.eventTriggers = make(map[string]*EventTrigger)
 	}
 	if _, exists := c.eventTriggers[name]; exists {
-		return nil, fmt.Errorf("event trigger %q already exists", name)
+		return nil, fmt.Errorf("event trigger %q already exists: %w", name, ErrEventTriggerAlreadyExists)
 	}
 	et := &EventTrigger{
 		Name:    name,
@@ -10786,6 +10795,58 @@ func (c *InMemory) ListEventTriggers() []*EventTrigger {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// SetEventTriggerEnabled updates an event trigger's evtenabled state. code
+// must be one of "O" (enable), "D" (disable), "A" (enable always), "R"
+// (enable replica) — the four values PostgreSQL's pg_event_trigger.evtenabled
+// column takes. Backs ALTER EVENT TRIGGER name {ENABLE|DISABLE}. Returns an
+// error if name is unknown (42704 undefined_object at the call site). DU-002
+// (M0119-0004, loop #69 ledger follow-up).
+func (c *InMemory) SetEventTriggerEnabled(name, code string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return fmt.Errorf("event trigger %q does not exist: %w", name, ErrEventTriggerNotFound)
+	}
+	et.Enabled = code
+	return nil
+}
+
+// SetEventTriggerOwner updates an event trigger's owner OID. Backs ALTER
+// EVENT TRIGGER name OWNER TO newowner. DU-002 (M0119-0004, loop #69 ledger
+// follow-up).
+func (c *InMemory) SetEventTriggerOwner(name string, owner uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return fmt.Errorf("event trigger %q does not exist: %w", name, ErrEventTriggerNotFound)
+	}
+	et.Owner = owner
+	return nil
+}
+
+// RenameEventTrigger renames an event trigger, re-keying the registry map.
+// Backs ALTER EVENT TRIGGER name RENAME TO newname. Returns an error if name
+// is unknown or newname is already taken (42710 duplicate_object at the call
+// site, mirroring RegisterEventTrigger). DU-002 (M0119-0004, loop #69 ledger
+// follow-up).
+func (c *InMemory) RenameEventTrigger(name, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return fmt.Errorf("event trigger %q does not exist: %w", name, ErrEventTriggerNotFound)
+	}
+	if _, exists := c.eventTriggers[newName]; exists {
+		return fmt.Errorf("event trigger %q already exists: %w", newName, ErrEventTriggerAlreadyExists)
+	}
+	delete(c.eventTriggers, name)
+	et.Name = newName
+	c.eventTriggers[newName] = et
+	return nil
 }
 
 // ForeignServer is a user-created foreign server (CREATE SERVER). goopg does not

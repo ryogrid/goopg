@@ -2391,6 +2391,29 @@ type CreateEventTriggerStmt struct {
 func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }
 func (s *CreateEventTriggerStmt) stmtNode() {}
 
+// AlterEventTriggerStmt — one of:
+//
+//	ALTER EVENT TRIGGER name DISABLE
+//	ALTER EVENT TRIGGER name ENABLE [REPLICA|ALWAYS]
+//	ALTER EVENT TRIGGER name RENAME TO new_name
+//	ALTER EVENT TRIGGER name OWNER TO { new_owner | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
+//
+// mirroring AlterPublicationOwnerStmt/AlterSubscriptionOwnerStmt's scope: the
+// only ALTER EVENT TRIGGER forms goopg models. DU-002 (M0119-0004, loop #69
+// ledger follow-up).
+type AlterEventTriggerStmt struct {
+	pos  int
+	Name string
+	// Action selects which field below is populated: "enable", "enable_replica",
+	// "enable_always", "disable", "rename", "owner".
+	Action   string
+	NewName  string // Action == "rename"
+	NewOwner string // Action == "owner"; "current_user" sentinel mirrors AlterPublicationOwnerStmt
+}
+
+func (s *AlterEventTriggerStmt) Pos() int  { return s.pos }
+func (s *AlterEventTriggerStmt) stmtNode() {}
+
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
 	pos             int

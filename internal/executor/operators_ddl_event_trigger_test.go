@@ -123,3 +123,126 @@ func TestDropEventTriggerRemovesRow(t *testing.T) {
 		t.Errorf("ListEventTriggers=%v want empty after DROP", got)
 	}
 }
+
+// TestAlterEventTriggerEnableDisable pins evtenabled mutation through
+// ALTER EVENT TRIGGER {DISABLE|ENABLE [REPLICA|ALWAYS]}. DU-002 (M0119-0004,
+// loop #69 ledger follow-up).
+func TestAlterEventTriggerEnableDisable(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start EXECUTE FUNCTION et_func()`); err != nil {
+		t.Fatalf("CREATE EVENT TRIGGER: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	cases := []struct {
+		sql  string
+		want string
+	}{
+		{"ALTER EVENT TRIGGER et1 DISABLE", "D"},
+		{"ALTER EVENT TRIGGER et1 ENABLE REPLICA", "R"},
+		{"ALTER EVENT TRIGGER et1 ENABLE ALWAYS", "A"},
+		{"ALTER EVENT TRIGGER et1 ENABLE", "O"},
+	}
+	for _, c := range cases {
+		if err := runDDL(t, ctx, c.sql); err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		ets := im.ListEventTriggers()
+		if len(ets) != 1 || ets[0].Enabled != c.want {
+			t.Errorf("%s: Enabled=%v want %q", c.sql, ets, c.want)
+		}
+	}
+}
+
+// TestAlterEventTriggerRenameTo pins the registry re-key ALTER EVENT
+// TRIGGER RENAME TO performs.
+func TestAlterEventTriggerRenameTo(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start EXECUTE FUNCTION et_func()`); err != nil {
+		t.Fatalf("CREATE EVENT TRIGGER: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER EVENT TRIGGER et1 RENAME TO et2`); err != nil {
+		t.Fatalf("ALTER EVENT TRIGGER RENAME TO: %v", err)
+	}
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	ets := im.ListEventTriggers()
+	if len(ets) != 1 || ets[0].Name != "et2" {
+		t.Fatalf("ets=%+v want a single et2", ets)
+	}
+
+	// Renaming to an already-taken name errors 42710, mirroring
+	// RegisterEventTrigger's own duplicate check.
+	if err := runDDL(t, ctx, `CREATE EVENT TRIGGER et3 ON ddl_command_end EXECUTE FUNCTION et_func()`); err != nil {
+		t.Fatalf("CREATE EVENT TRIGGER et3: %v", err)
+	}
+	err := runDDL(t, ctx, `ALTER EVENT TRIGGER et2 RENAME TO et3`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42710" {
+		t.Errorf("Code=%q want 42710", ee.Code)
+	}
+}
+
+// TestAlterEventTriggerOwnerTo pins evtowner mutation, including the
+// CURRENT_USER sentinel resolving to the bootstrap superuser OID (10).
+func TestAlterEventTriggerOwnerTo(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION et_func() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN END $$`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE EVENT TRIGGER et1 ON ddl_command_start EXECUTE FUNCTION et_func()`); err != nil {
+		t.Fatalf("CREATE EVENT TRIGGER: %v", err)
+	}
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("alice")
+	aliceOID, found := im.RoleOID("alice")
+	if !found {
+		t.Fatal("alice role OID not found")
+	}
+
+	if err := runDDL(t, ctx, `ALTER EVENT TRIGGER et1 OWNER TO alice`); err != nil {
+		t.Fatalf("ALTER EVENT TRIGGER OWNER TO alice: %v", err)
+	}
+	if ets := im.ListEventTriggers(); len(ets) != 1 || ets[0].Owner != aliceOID {
+		t.Fatalf("ets=%+v want Owner=%d", ets, aliceOID)
+	}
+
+	if err := runDDL(t, ctx, `ALTER EVENT TRIGGER et1 OWNER TO CURRENT_USER`); err != nil {
+		t.Fatalf("ALTER EVENT TRIGGER OWNER TO CURRENT_USER: %v", err)
+	}
+	if ets := im.ListEventTriggers(); len(ets) != 1 || ets[0].Owner != 10 {
+		t.Fatalf("ets=%+v want Owner=10 (bootstrap superuser)", ets)
+	}
+}
+
+// TestAlterEventTriggerUnknownNameErrors pins the 42704 undefined_object
+// PostgreSQL raises for ALTER EVENT TRIGGER on a nonexistent name.
+func TestAlterEventTriggerUnknownNameErrors(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	err := runDDL(t, ctx, `ALTER EVENT TRIGGER nosuchtrigger DISABLE`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42704" {
+		t.Errorf("Code=%q want 42704", ee.Code)
+	}
+}

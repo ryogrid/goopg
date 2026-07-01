@@ -4985,6 +4985,40 @@ documentation-only and is exempt from the design-doc requirement.)
       (ENABLE/DISABLE/RENAME/OWNER TO), full DDL-command-tag-list
       validation, superuser privilege enforcement, WAL/restart
       persistence — none have a forcing fixture today.
+- [x] **`ALTER EVENT TRIGGER` round-trip (M0119-0004, loop #70).**
+      **COMPLETE 2026-07-02:** closes the loop #69 row's own `ALTER EVENT
+      TRIGGER` deferral for the 4 forms PostgreSQL's `event_trigger.c`
+      supports: `DISABLE`, `ENABLE [REPLICA|ALWAYS]`, `RENAME TO`, `OWNER
+      TO` (incl. `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE`). New parser
+      `AlterEventTriggerStmt` + `parseAlter()` `"event"`+`TRIGGER` branch;
+      new `catalog.InMemory.SetEventTriggerEnabled`/`SetEventTriggerOwner`/
+      `RenameEventTrigger` mutators + `ErrEventTriggerNotFound`/
+      `ErrEventTriggerAlreadyExists` sentinels; new
+      `execAlterEventTrigger` (mirrors `execAlterPublicationOwner`); planner
+      DDL allow-list extended (the `0A000 unsupported statement type` gap
+      hit first in testing — a new `Stmt` type needs its own planner case).
+      No pg_dump-side change needed: `pg_event_trigger.evtenabled`/
+      `evtname`/`evtowner` already rendered from the mutated struct (loop
+      #69), and real pg_dump's own `dumpEventTrigger` already emits the
+      trailing `ALTER EVENT TRIGGER ... {DISABLE|ENABLE ALWAYS|ENABLE
+      REPLICA}` line into the same archive entry whenever `evtenabled !=
+      'O'`. Verified byte-identical against a real, separately-`initdb`'d
+      PG 18.3 instance (`postgres/local_install/bin/{psql,pg_dump}`) for
+      all 4 forms, including that returning to `ENABLE` (evtenabled='O')
+      correctly *omits* the trailing ALTER line. Tests:
+      `TestParseAlterEventTrigger` (parser, table-driven, 6 forms +
+      2 owner sentinels), `TestAlterEventTriggerEnableDisable`/
+      `...RenameTo`/`...OwnerTo`/`...UnknownNameErrors` (executor). Gates:
+      `go build ./...` clean; `internal/parser`+`internal/catalog`+
+      `internal/planner`+`internal/executor`+`internal/server` suites
+      PASS; `TestPort_PgDumpConnectionSetup` PASS (no regression); live PG
+      18.3 diff (byte-identical); TPC-H spotcheck Q12=2/Q13=33 PASS;
+      pgbench smoke = pre-commit hook. Design doc: `0119-0004-create-
+      operator-roundtrip.md` "Loop #70". Deferred (ledger row appended):
+      WAL/restart persistence for the whole event-trigger feature (CREATE,
+      DROP, and now ALTER) still has no forcing fixture; the loop #69
+      `validate_ddl_tags`/superuser-privilege gaps are untouched by this
+      loop.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

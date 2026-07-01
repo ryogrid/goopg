@@ -2276,3 +2276,97 @@ family — CREATE FOREIGN DATA WRAPPER, CREATE SERVER, etc. — does not enforce
 its own real-PG superuser requirement either). No WAL/restart persistence
 either (same gap CREATE PUBLICATION/SUBSCRIPTION had before loop #68) — an
 event trigger vanishes on restart today.
+
+## Loop #70 — `ALTER EVENT TRIGGER` (ENABLE/DISABLE/RENAME TO/OWNER TO)
+
+Closes the loop #69 row's own "`ALTER EVENT TRIGGER` is entirely
+unimplemented" resume point, mirroring the `ALTER PUBLICATION`/`ALTER
+SUBSCRIPTION ... OWNER TO` pattern from loop #67.
+
+### What landed
+
+New parser `AlterEventTriggerStmt` (`internal/parser/ast.go`) with an
+`Action` enum (`"disable" | "enable" | "enable_replica" | "enable_always" |
+"rename" | "owner"`) plus `NewName`/`NewOwner`. `parseAlter()`
+(`internal/parser/ddl.go`) gets a new `"event"` + `KwTrigger` branch — parsed
+explicitly (not via the generic ident-based compat-stub loop, since `event
+trigger` is two tokens, same as the existing DROP EVENT TRIGGER case) — for:
+
+```
+ALTER EVENT TRIGGER name DISABLE
+ALTER EVENT TRIGGER name ENABLE [REPLICA|ALWAYS]
+ALTER EVENT TRIGGER name RENAME TO new_name
+ALTER EVENT TRIGGER name OWNER TO {new_owner|CURRENT_ROLE|CURRENT_USER|SESSION_USER}
+```
+
+`catalog.InMemory` gets three new registry mutators mirroring
+`RegisterEventTrigger`: `SetEventTriggerEnabled(name, code)` (code is one of
+PG's four `evtenabled` values, `"O"/"D"/"A"/"R"`), `SetEventTriggerOwner(name,
+ownerOID)`, `RenameEventTrigger(name, newName)` (re-keys the
+`map[string]*EventTrigger`). New sentinel errors `ErrEventTriggerNotFound` /
+`ErrEventTriggerAlreadyExists` let `execAlterEventTrigger`
+(`internal/executor/operators_ddl.go`) distinguish 42704 undefined_object
+(unknown trigger name) from 42710 duplicate_object (RENAME TO an already-taken
+name), reusing `resolveNewOwnerOID` for the `CURRENT_USER` sentinel. The
+planner's `*parser.CreateEventTriggerStmt` DDL case
+(`internal/planner/planner.go`) picks up `*parser.AlterEventTriggerStmt`
+alongside it — this was the first failure mode hit in testing (`0A000:
+unsupported statement type`), since a new `Stmt` type needs an explicit planner
+allow-list entry before the executor ever sees it.
+
+Since the pg_event_trigger virtual view (`internal/catalog/catalog.go`)
+already renders `evtenabled`/`evtname`/`evtowner` straight from the
+`EventTrigger` struct (added in loop #69), no view-rendering change was
+needed — real pg_dump 18.3's own `dumpEventTrigger` does the rest: it appends
+`\nALTER EVENT TRIGGER %s {DISABLE|ENABLE|ENABLE ALWAYS|ENABLE REPLICA};\n` to
+the *same* archive entry's create-statement buffer whenever `evtenabled !=
+'O'` (pg_dump.c `dumpEventTrigger`), so no separate "ALTER EVENT TRIGGER
+ENABLE TO restore state" TOC entry exists.
+
+### Live PG 18.3 verification
+
+Manual server (`/tmp/goopg_evttrig_manual`, real `pg_dump`/`psql` from
+`postgres/local_install/bin`, not goopg's own client) round-tripped
+`CREATE FUNCTION ... RETURNS event_trigger` → `CREATE EVENT TRIGGER et1 ...`
+→ `ALTER EVENT TRIGGER et1 DISABLE` → `ALTER EVENT TRIGGER et1 RENAME TO
+et1_renamed` → `ALTER EVENT TRIGGER et1_renamed OWNER TO CURRENT_USER`,
+confirming via `SELECT ... FROM pg_event_trigger` that `evtname`/`evtenabled`/
+`evtowner` all updated. `pg_dump --no-owner --schema-only` then emitted:
+
+```sql
+CREATE EVENT TRIGGER et1_renamed ON ddl_command_start
+   EXECUTE FUNCTION public.et_func();
+
+ALTER EVENT TRIGGER et1_renamed DISABLE;
+```
+
+— byte-identical to PG 18.3's `dumpEventTrigger` format. Cycling through
+`ENABLE ALWAYS` / `ENABLE REPLICA` / plain `ENABLE` confirmed each renders
+correctly and that returning to the `'O'` (origin/default) state correctly
+*omits* the trailing `ALTER EVENT TRIGGER` line (the `evtenabled != 'O'`
+gate).
+
+### Tests
+
+Parser: `internal/parser/event_trigger_test.go`
+(`TestParseAlterEventTrigger`, table-driven over all 6 forms including both
+`CURRENT_USER`/`session_user` owner sentinels). Executor:
+`internal/executor/operators_ddl_event_trigger_test.go`
+(`TestAlterEventTriggerEnableDisable`, `...RenameTo` — including the 42710
+duplicate-name path — `...OwnerTo`, `...UnknownNameErrors`).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/planner`+`internal/executor`+`internal/server` suites PASS;
+`TestPort_PgDumpConnectionSetup` PASS (no regression); live PG 18.3 diff
+above (byte-identical); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke =
+pre-commit hook.
+
+### Still deferred
+
+WAL/restart persistence for event triggers as a whole (CREATE, DROP, and now
+ALTER) — an event trigger, including any ALTER'd state, still vanishes on
+restart; no forcing fixture today (same gap noted in loop #69). The
+`validate_ddl_tags`/superuser-privilege gaps from loop #69 are unaffected by
+this loop.

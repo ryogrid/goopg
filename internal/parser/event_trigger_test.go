@@ -94,3 +94,54 @@ func TestParseCreateEventTriggerUnrecognizedFilterVar(t *testing.T) {
 		t.Errorf("Tags=%v want empty (only the \"tag\" filter var populates Tags)", et.Tags)
 	}
 }
+
+// TestParseAlterEventTrigger pins every ALTER EVENT TRIGGER form goopg
+// models: DISABLE, ENABLE [REPLICA|ALWAYS], RENAME TO, OWNER TO (including
+// the CURRENT_USER/SESSION_USER/CURRENT_ROLE sentinel). DU-002 (M0119-0004,
+// loop #69 ledger follow-up).
+func TestParseAlterEventTrigger(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantAction string
+		wantName   string
+		wantExtra  string // NewName for rename, NewOwner for owner
+	}{
+		{"ALTER EVENT TRIGGER et1 DISABLE", "disable", "et1", ""},
+		{"ALTER EVENT TRIGGER et1 ENABLE", "enable", "et1", ""},
+		{"ALTER EVENT TRIGGER et1 ENABLE REPLICA", "enable_replica", "et1", ""},
+		{"ALTER EVENT TRIGGER et1 ENABLE ALWAYS", "enable_always", "et1", ""},
+		{"ALTER EVENT TRIGGER et1 RENAME TO et2", "rename", "et1", "et2"},
+		{"ALTER EVENT TRIGGER et1 OWNER TO alice", "owner", "et1", "alice"},
+		{"ALTER EVENT TRIGGER et1 OWNER TO CURRENT_USER", "owner", "et1", "current_user"},
+		{"ALTER EVENT TRIGGER et1 OWNER TO session_user", "owner", "et1", "current_user"},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		if len(stmts) != 1 {
+			t.Fatalf("%s: len=%d want 1", c.sql, len(stmts))
+		}
+		aet, ok := stmts[0].(*AlterEventTriggerStmt)
+		if !ok {
+			t.Fatalf("%s: type=%T want *AlterEventTriggerStmt", c.sql, stmts[0])
+		}
+		if aet.Name != c.wantName {
+			t.Errorf("%s: Name=%q want %q", c.sql, aet.Name, c.wantName)
+		}
+		if aet.Action != c.wantAction {
+			t.Errorf("%s: Action=%q want %q", c.sql, aet.Action, c.wantAction)
+		}
+		switch c.wantAction {
+		case "rename":
+			if aet.NewName != c.wantExtra {
+				t.Errorf("%s: NewName=%q want %q", c.sql, aet.NewName, c.wantExtra)
+			}
+		case "owner":
+			if aet.NewOwner != c.wantExtra {
+				t.Errorf("%s: NewOwner=%q want %q", c.sql, aet.NewOwner, c.wantExtra)
+			}
+		}
+	}
+}
