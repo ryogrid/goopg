@@ -101,6 +101,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateSubscription(s)
 	case *parser.DropSubscriptionStmt:
 		return nil, o.execDropSubscription(s)
+	case *parser.AlterPublicationOwnerStmt:
+		return nil, o.execAlterPublicationOwner(s)
+	case *parser.AlterSubscriptionOwnerStmt:
+		return nil, o.execAlterSubscriptionOwner(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -617,6 +621,61 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
+	}
+	return nil
+}
+
+// resolveNewOwnerOID resolves an ALTER ... OWNER TO target to a role OID,
+// honouring the "current_user" sentinel (CURRENT_USER/SESSION_USER/
+// CURRENT_ROLE) parsers emit for AlterPublicationOwnerStmt/
+// AlterSubscriptionOwnerStmt (and, elsewhere, AlterCollationStmt/
+// AlterAggregateOwnerStmt), by resolving it to the bootstrap superuser —
+// mirrors execAlterCollation/execAlterAggregateOwner's inline duplicate of
+// this same lookup. M0119-0004 (DU-002, loop #65 ledger follow-up).
+func (o *ddlOp) resolveNewOwnerOID(newOwner string, pos int) (uint32, error) {
+	if strings.EqualFold(newOwner, "current_user") {
+		return 10, nil
+	}
+	oid, found := o.ctx.Catalog.RoleOID(newOwner)
+	if !found {
+		return 0, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("role %q does not exist", newOwner)}
+	}
+	return oid, nil
+}
+
+// execAlterPublicationOwner handles ALTER PUBLICATION name OWNER TO newowner.
+// M0119-0004 (DU-002, loop #65 ledger follow-up: closes the loop #60/#63/#64/
+// #65 rows' "ALTER PUBLICATION/SUBSCRIPTION ... OWNER TO are still
+// unimplemented" resume point). Like CREATE/DROP PUBLICATION, the ownership
+// change is in-memory-only — PubSub has no WAL/restart persistence yet (a
+// pre-existing, separately-tracked gap; see the ledger).
+func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
+	if err != nil {
+		return err
+	}
+	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	return nil
+}
+
+// execAlterSubscriptionOwner handles ALTER SUBSCRIPTION name OWNER TO
+// newowner. M0119-0004 (DU-002, loop #65 ledger follow-up); see
+// execAlterPublicationOwner.
+func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
+	if err != nil {
+		return err
+	}
+	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
 	}
 	return nil
 }

@@ -6646,12 +6646,65 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / PUBLICATION /
-	// SUBSCRIPTION / SYSTEM — compatibility stubs. Consume until end of statement.
+	// ALTER PUBLICATION/SUBSCRIPTION name OWNER TO ... — the only ALTER
+	// PUBLICATION/SUBSCRIPTION form goopg models; every other tail (RENAME TO,
+	// SET, ADD/DROP/SET TABLE, SKIP, ...) drains to the statement end as a
+	// no-op, matching the generic compatibility-stub loop below. Publication/
+	// subscription names are unqualified idents (CreatePublicationStmt.Name/
+	// CreateSubscriptionStmt.Name), unlike the schema-qualified ObjectName
+	// ALTER COLLATION/AGGREGATE use, so this is handled as its own case
+	// instead of falling into that generic loop. M0119-0004 (DU-002, loop #65
+	// ledger follow-up).
+	for _, pubSubKind := range []Keyword{KwPublication, KwSubscription} {
+		// "publication"/"subscription" are registered keywords (used by
+		// CREATE SUBSCRIPTION's PUBLICATION clause), so they arrive as
+		// TokenKeyword, not TokenIdent — acceptIdentKeyword (which requires
+		// TokenIdent) can never match them; that's what made this whole
+		// case unreachable before this fix (loop #65 ledger follow-up).
+		if !p.acceptKeyword(pubSubKind) {
+			continue
+		}
+		if p.cur().Kind != TokenIdent {
+			return nil, p.errAtCur("expected " + string(pubSubKind) + " name")
+		}
+		name := p.cur().Value
+		p.advance()
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			var newOwner string
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+			// superuser sentinel, mirroring ALTER COLLATION … OWNER TO.
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				newOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				newOwner = identText(tok)
+			} else {
+				newOwner = "current_user"
+			}
+			if pubSubKind == KwPublication {
+				return &AlterPublicationOwnerStmt{pos: t.Pos, Name: name, NewOwner: newOwner}, nil
+			}
+			return &AlterSubscriptionOwnerStmt{pos: t.Pos, Name: name, NewOwner: newOwner}, nil
+		}
+		// Other ALTER PUBLICATION/SUBSCRIPTION forms: consume as no-op.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
+	// SYSTEM — compatibility stubs. Consume until end of statement.
 	for _, objIdent := range []string{
 		"schema", "view",
 		"collation", "domain", "extension", "language",
-		"operator", "publication", "subscription", "system",
+		"operator", "system",
 	} {
 		if p.acceptIdentKeyword(objIdent) {
 			// consume until ';' or EOF

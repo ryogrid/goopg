@@ -4854,6 +4854,51 @@ documentation-only and is exempt from the design-doc requirement.)
       ... OWNER TO`/`ALTER SUBSCRIPTION ... OWNER TO` still don't exist (owner
       is fixed at CREATE time only); the `DBOID()`-vs-`FirstUserOID` split
       (loop #60) remains open, untouched by this loop.
+      **2026-07-02 (loop #67): `ALTER PUBLICATION`/`ALTER SUBSCRIPTION ... OWNER
+      TO` LANDED — DU-002 slice 425.** Closes the loop #65 row's own resume
+      point. New parser nodes `AlterPublicationOwnerStmt`/
+      `AlterSubscriptionOwnerStmt` (`internal/parser/ast.go`) with dedicated
+      parsing in `parseAlter` (`internal/parser/ddl.go`), mirroring
+      `AlterCollationStmt`'s "owner" case (name, `OWNER TO {role|CURRENT_USER|
+      SESSION_USER|CURRENT_ROLE}`; any other tail — RENAME TO, SET, ADD/DROP
+      TABLE, REFRESH PUBLICATION — drains to the statement end as the
+      pre-existing no-op). Found and fixed a **pre-existing, independently
+      dead parse path** while wiring this: the old generic compatibility-stub
+      loop listed `"publication"`/`"subscription"` alongside `"schema"`/
+      `"collation"`/etc, but matched them via `acceptIdentKeyword` (requires
+      `TokenKind == TokenIdent`) — both words are registered *keywords*
+      (`KwPublication`/`KwSubscription`, needed by `CREATE SUBSCRIPTION ...
+      PUBLICATION p`), so `TokenKind == TokenKeyword` and that branch could
+      never match; `ALTER PUBLICATION`/`ALTER SUBSCRIPTION` of any form
+      actually fell through to the ALTER-TABLE default and errored
+      (`expected keyword table`), not the silent no-op the comment claimed.
+      The new dedicated case uses `p.acceptKeyword(KwPublication/
+      KwSubscription)` instead. New catalog mutators
+      `PubSub.SetPublicationOwner`/`SetSubscriptionOwner`
+      (`internal/catalog/pubsub.go`, `ErrPublication/SubscriptionNotFound` on
+      an unknown name) + executor `execAlterPublicationOwner`/
+      `execAlterSubscriptionOwner` + shared `resolveNewOwnerOID` helper
+      (`internal/executor/operators_ddl.go`) resolving the "current_user"
+      sentinel to the bootstrap superuser OID (10) or a real role via
+      `Catalog.RoleOID` (42704 on an unresolvable name). Planner `Plan()`
+      needed the two new statement types added to the existing pub/sub `case`
+      arm (`internal/planner/planner.go`) — omitting this surfaces as `0A000
+      unsupported statement type`, not a parse error, since planning is a
+      separate dispatch from parsing. Like CREATE/DROP PUBLICATION/
+      SUBSCRIPTION, the change is in-memory-only (PubSub has no WAL/restart
+      persistence at all yet — pre-existing, separately-tracked gap, not
+      reopened by this loop). Tests: `TestParseAlterPublicationOwner`/
+      `TestParseAlterSubscriptionOwner`/`TestParseAlterPublicationOtherFormsStillNoop`
+      (`internal/parser/alter_pubsub_owner_test.go`);
+      `TestAlterPublicationOwnerTo`/`TestAlterPublicationOwnerToUnknownRoleErrors`/
+      `TestAlterPublicationOwnerToUnknownPublicationErrors`/
+      `TestAlterSubscriptionOwnerTo`
+      (`internal/executor/operators_ddl_pubsub_test.go`). Gates: `go build
+      ./...` clean; `internal/parser`+`internal/catalog`+`internal/planner`+
+      `internal/executor`+`internal/server` suites PASS; TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Still open
+      (unchanged): PubSub restart persistence; the `DBOID()`-vs-`FirstUserOID`
+      split (loop #60).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

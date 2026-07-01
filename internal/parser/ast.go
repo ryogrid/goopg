@@ -2341,6 +2341,33 @@ type DropSubscriptionStmt struct {
 func (s *DropSubscriptionStmt) Pos() int  { return s.pos }
 func (s *DropSubscriptionStmt) stmtNode() {}
 
+// AlterPublicationOwnerStmt — `ALTER PUBLICATION name OWNER TO { new_owner |
+// CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER PUBLICATION
+// form goopg models (RENAME TO / SET / ADD|DROP|SET TABLE fall through to the
+// generic compatibility no-op). M0119-0004 (DU-002, loop #65 ledger
+// follow-up).
+type AlterPublicationOwnerStmt struct {
+	pos      int
+	Name     string
+	NewOwner string // "current_user" sentinel resolves to the invoking role, mirrors AlterCollationStmt
+}
+
+func (s *AlterPublicationOwnerStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationOwnerStmt) stmtNode() {}
+
+// AlterSubscriptionOwnerStmt — `ALTER SUBSCRIPTION name OWNER TO { new_owner |
+// CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER SUBSCRIPTION
+// form goopg models (RENAME TO / SET / SKIP fall through to the generic
+// compatibility no-op). M0119-0004 (DU-002, loop #65 ledger follow-up).
+type AlterSubscriptionOwnerStmt struct {
+	pos      int
+	Name     string
+	NewOwner string // "current_user" sentinel resolves to the invoking role, mirrors AlterCollationStmt
+}
+
+func (s *AlterSubscriptionOwnerStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionOwnerStmt) stmtNode() {}
+
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
 	pos             int

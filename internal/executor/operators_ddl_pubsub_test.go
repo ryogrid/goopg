@@ -180,3 +180,107 @@ func TestCreateSubscriptionOwnerTracksEffectiveRole(t *testing.T) {
 		t.Errorf("sub.Owner = %d, want %d (sub_owner's OID)", sub.Owner, roleOID)
 	}
 }
+
+// TestAlterPublicationOwnerTo covers the loop #65 ledger row's "ALTER
+// PUBLICATION ... OWNER TO" resume point: a publication's owner can be
+// reassigned after CREATE, matching PostgreSQL's AlterPublicationOwner
+// (publicationcmds.c).
+func TestAlterPublicationOwnerTo(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("new_owner")
+	roleOID, ok := im.RoleOID("new_owner")
+	if !ok {
+		t.Fatal("new_owner not registered")
+	}
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatalf("runDDL create: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER PUBLICATION p OWNER TO new_owner"); err != nil {
+		t.Fatalf("runDDL alter owner: %v", err)
+	}
+	pub, ok := ctx.PubSub.LookupPublication("p")
+	if !ok {
+		t.Fatal("publication p not registered")
+	}
+	if pub.Owner != roleOID {
+		t.Errorf("pub.Owner = %d, want %d (new_owner's OID)", pub.Owner, roleOID)
+	}
+}
+
+// TestAlterPublicationOwnerToUnknownRoleErrors: reassigning to a role that
+// doesn't exist must fail with 42704, not silently mint a dangling OID.
+func TestAlterPublicationOwnerToUnknownRoleErrors(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	if err := runDDL(t, ctx, "CREATE PUBLICATION p FOR TABLE items"); err != nil {
+		t.Fatalf("runDDL create: %v", err)
+	}
+	err := runDDL(t, ctx, "ALTER PUBLICATION p OWNER TO nosuchrole")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42704" {
+		t.Errorf("ExecError.Code = %q, want \"42704\"", ee.Code)
+	}
+}
+
+// TestAlterPublicationOwnerToUnknownPublicationErrors: ALTER PUBLICATION on
+// a name that was never CREATEd must fail rather than silently no-op.
+func TestAlterPublicationOwnerToUnknownPublicationErrors(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	err := runDDL(t, ctx, "ALTER PUBLICATION nosuchpub OWNER TO current_user")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42704" {
+		t.Errorf("ExecError.Code = %q, want \"42704\"", ee.Code)
+	}
+}
+
+// TestAlterSubscriptionOwnerTo is TestAlterPublicationOwnerTo's ALTER
+// SUBSCRIPTION counterpart.
+func TestAlterSubscriptionOwnerTo(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.PubSub = catalog.NewPubSub()
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	im.RegisterRole("new_sub_owner")
+	roleOID, ok := im.RoleOID("new_sub_owner")
+	if !ok {
+		t.Fatal("new_sub_owner not registered")
+	}
+
+	sql := "CREATE SUBSCRIPTION s CONNECTION 'host=remote dbname=app' PUBLICATION p1 WITH (enabled = false)"
+	if err := runDDL(t, ctx, sql); err != nil {
+		t.Fatalf("runDDL create: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER SUBSCRIPTION s OWNER TO new_sub_owner"); err != nil {
+		t.Fatalf("runDDL alter owner: %v", err)
+	}
+	sub, ok := ctx.PubSub.LookupSubscription("s")
+	if !ok {
+		t.Fatal("subscription s not registered")
+	}
+	if sub.Owner != roleOID {
+		t.Errorf("sub.Owner = %d, want %d (new_sub_owner's OID)", sub.Owner, roleOID)
+	}
+}

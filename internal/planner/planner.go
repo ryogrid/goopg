@@ -157,7 +157,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
-		*parser.CreateSubscriptionStmt, *parser.DropSubscriptionStmt:
+		*parser.CreateSubscriptionStmt, *parser.DropSubscriptionStmt,
+		*parser.AlterPublicationOwnerStmt, *parser.AlterSubscriptionOwnerStmt:
 		// M0008 logical-replication DDL flows through DDL too;
 		// the executor's DDL operator handles them by mutating
 		// the runtime's *catalog.PubSub registry. See

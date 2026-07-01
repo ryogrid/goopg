@@ -199,6 +199,21 @@ func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts Pub
 	return &out, nil
 }
 
+// SetPublicationOwner updates a publication's owner OID. Returns
+// ErrPublicationNotFound when name is unknown. Backs ALTER PUBLICATION name
+// OWNER TO newowner. DU-002 slice 425 (M0119-0004, loop #65 ledger
+// follow-up).
+func (p *PubSub) SetPublicationOwner(name string, owner uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[name]
+	if !ok {
+		return ErrPublicationNotFound
+	}
+	pub.Owner = owner
+	return nil
+}
+
 // DropPublication removes a publication. Returns
 // ErrPublicationNotFound when name is unknown.
 func (p *PubSub) DropPublication(name string) error {
@@ -278,6 +293,21 @@ func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications [
 	out := *sub
 	out.Publications = append([]string(nil), sub.Publications...)
 	return &out, nil
+}
+
+// SetSubscriptionOwner updates a subscription's owner OID. Returns
+// ErrSubscriptionNotFound when name is unknown. Backs ALTER SUBSCRIPTION name
+// OWNER TO newowner. DU-002 slice 425 (M0119-0004, loop #65 ledger
+// follow-up).
+func (p *PubSub) SetSubscriptionOwner(name string, owner uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[name]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Owner = owner
+	return nil
 }
 
 // DropSubscription removes a subscription. Returns

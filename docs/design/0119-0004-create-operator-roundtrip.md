@@ -1925,3 +1925,101 @@ only, with no way to reassign it afterward (PostgreSQL's
 `publicationcmds.c`/`subscriptioncmds.c`, have no goopg counterpart). The
 `DBOID()`-vs-`pg_database.oid`'s `FirstUserOID` split (loop #60) remains
 open, untouched by this loop.
+
+## Loop #67: `ALTER PUBLICATION`/`ALTER SUBSCRIPTION ... OWNER TO` (DU-002 slice 425)
+
+Closes the loop #65 row's own deferral: a publication/subscription's owner
+was fixed at `CREATE` time only, with no way to reassign it afterward.
+Mirrors PostgreSQL's `AlterPublicationOwner`/`AlterSubscriptionOwner`
+(`publicationcmds.c`/`subscriptioncmds.c`), scoped to the `OWNER TO` action —
+the only one goopg models for these two object types (same scoping
+`AlterCollationStmt`/`AlterAggregateOwnerStmt` use: RENAME TO, SET, and the
+various `ADD`/`DROP` table-list forms stay no-ops).
+
+### A pre-existing dead parse path, found while wiring this
+
+Before this loop, `parseAlter`'s generic ALTER compatibility-stub loop
+listed `"publication"`/`"subscription"` in its ident set alongside
+`"schema"`/`"collation"`/`"domain"`/etc, matched via
+`p.acceptIdentKeyword(objIdent)`. `acceptIdentKeyword` only matches
+`TokenKind == TokenIdent`. But `"publication"`/`"subscription"` are
+registered *keywords* (`KwPublication`/`KwSubscription` — needed by `CREATE
+SUBSCRIPTION ... PUBLICATION p [, p2 ...]`'s own grammar), so they lex as
+`TokenKeyword`, never `TokenIdent`. That branch could therefore never match:
+`ALTER PUBLICATION`/`ALTER SUBSCRIPTION`, in *any* form (not just `OWNER
+TO`), fell through every other check in `parseAlter` down to the ALTER-TABLE
+default and errored with `expected keyword table` — not the silent no-op
+the surrounding comment claimed. This was invisible until now because no
+test exercised `ALTER PUBLICATION`/`ALTER SUBSCRIPTION` at all.
+
+### Fix
+
+- **`internal/parser/ast.go`**: new `AlterPublicationOwnerStmt` /
+  `AlterSubscriptionOwnerStmt` — `{Name string; NewOwner string}`, `NewOwner`
+  using the same `"current_user"` sentinel `AlterCollationStmt`/
+  `AlterAggregateOwnerStmt` use for `CURRENT_USER`/`SESSION_USER`/
+  `CURRENT_ROLE`. `Name` is a plain string (not the schema-qualified
+  `ObjectName` collation/aggregate use) — publications/subscriptions are
+  unqualified, matching `CreatePublicationStmt.Name`/
+  `CreateSubscriptionStmt.Name`.
+- **`internal/parser/ddl.go`** (`parseAlter`): new dedicated case, inserted
+  before the generic compatibility-stub loop (which had its now-dead
+  `"publication"`/`"subscription"` entries removed). Uses
+  `p.acceptKeyword(KwPublication)`/`p.acceptKeyword(KwSubscription)` instead
+  of the broken `acceptIdentKeyword`. Parses `name`, then either `OWNER TO
+  ...` (builds the new stmt) or drains to the statement end as a no-op
+  (RENAME TO / SET / ADD|DROP|SET TABLE / REFRESH PUBLICATION / ...),
+  matching the generic stub's prior behavior for every non-OWNER form.
+- **`internal/catalog/pubsub.go`**: new `PubSub.SetPublicationOwner(name
+  string, owner uint32) error` / `SetSubscriptionOwner(...)` — returns
+  `ErrPublicationNotFound`/`ErrSubscriptionNotFound` for an unknown name,
+  otherwise updates `Owner` in place under the existing `mu` lock.
+- **`internal/executor/operators_ddl.go`**: new `ddlOp.resolveNewOwnerOID`
+  helper — the `"current_user"` → 10 / else `Catalog.RoleOID` lookup
+  (42704 on an unresolvable name) that `execAlterCollation`/
+  `execAlterAggregateOwner` each duplicate inline; `execAlterPublicationOwner`
+  / `execAlterSubscriptionOwner` call it and then
+  `PubSub.SetPublicationOwner`/`SetSubscriptionOwner`, surfacing a
+  not-found error as 42704 (undefined_object).
+- **`internal/planner/planner.go`**: the existing pub/sub `case` arm (which
+  already routes `CreatePublicationStmt`/`DropPublicationStmt`/
+  `CreateSubscriptionStmt`/`DropSubscriptionStmt` to a `DDL` plan node)
+  extended with the two new statement types. Parsing and planning are
+  separate dispatches — a statement that parses fine but isn't in this
+  `case` list surfaces as `0A000 unsupported statement type` at `Plan()`
+  time, which is exactly what happened on the first test run before this
+  edit.
+- No wire-protocol or catalog-view change: `pg_publication.pubowner`/
+  `pg_subscription.subowner` already render `pub.Owner`/`sub.Owner` live.
+  Like `CREATE`/`DROP PUBLICATION`/`SUBSCRIPTION`, the mutation is
+  in-memory-only — `PubSub` has no WAL/restart persistence at all yet (see
+  Deferred below).
+
+### Tests
+
+- **`internal/parser/alter_pubsub_owner_test.go`**: `TestParseAlterPublicationOwner`
+  (name + `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE`/literal-role
+  variants), `TestParseAlterSubscriptionOwner`, and
+  `TestParseAlterPublicationOtherFormsStillNoop` — pins that RENAME TO / ADD
+  TABLE / SET / REFRESH PUBLICATION still parse as the pre-existing
+  `AlterTableStmt{}` no-op, guarding against the new OWNER TO case
+  accidentally swallowing other forms.
+- **`internal/executor/operators_ddl_pubsub_test.go`**: `TestAlterPublicationOwnerTo`
+  / `TestAlterSubscriptionOwnerTo` (owner actually changes),
+  `TestAlterPublicationOwnerToUnknownRoleErrors` (42704 on a role that
+  doesn't exist), `TestAlterPublicationOwnerToUnknownPublicationErrors`
+  (42704 on a publication that was never CREATEd).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/planner`+`internal/executor`+`internal/server` suites PASS; TPC-H
+spotcheck Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+`PubSub` (`catalog.PubSub`) still has zero WAL/restart persistence — every
+publication/subscription (and now its `OWNER TO` change) vanishes on
+restart, same pre-existing gap `CREATE`/`DROP PUBLICATION`/`SUBSCRIPTION`
+have always had; this loop doesn't reopen it, just inherits it. The
+`DBOID()`-vs-`FirstUserOID` split (loop #60) remains open, untouched.
