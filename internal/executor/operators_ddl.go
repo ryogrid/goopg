@@ -109,6 +109,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateEventTrigger(s)
 	case *parser.AlterEventTriggerStmt:
 		return nil, o.execAlterEventTrigger(s)
+	case *parser.CreateAccessMethodStmt:
+		return nil, o.execCreateAccessMethod(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -870,6 +872,67 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized ALTER EVENT TRIGGER action %q", s.Action)}
 	}
 	return nil
+}
+
+// execCreateAccessMethod registers a CREATE ACCESS METHOD in the runtime
+// pg_am registry so it round-trips through pg_dump (getAccessMethods/
+// dumpAccessMethod). goopg has no pluggable table/index storage engine and
+// never invokes a user-defined AM's handler — this only maintains dump
+// fidelity, mirroring CreateAccessMethod's own validation order
+// (postgres/src/backend/commands/amcmds.c): superuser check, then
+// duplicate-name check, then handler resolution.
+func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create access method %q", s.Name)}
+	}
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires routine registry"}
+	}
+	handlerOID, err := resolveAccessMethodHandlerFunc(rs, s.HandlerName, s.AMType)
+	if err != nil {
+		return err
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires the in-memory catalog"}
+	}
+	if _, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID); err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// resolveAccessMethodHandlerFunc mirrors lookup_am_handler_func
+// (postgres/src/backend/commands/amcmds.c): the handler must be a routine
+// taking exactly one argument of type "internal" (LookupFuncName(handler_name,
+// 1, {INTERNALOID}, false)) whose return type matches amType ("i" →
+// index_am_handler, "t" → table_am_handler). A missing/mismatched signature
+// reports 42883 undefined_function with PG's own fixed-signature text; a
+// resolved routine with the wrong return type reports 42809
+// wrong_object_type.
+func resolveAccessMethodHandlerFunc(rs *catalog.Routines, funcName parser.ObjectName, amType string) (uint32, error) {
+	expectedRet := "index_am_handler"
+	if amType == "t" {
+		expectedRet = "table_am_handler"
+	}
+	for _, r := range rs.LookupByName(funcName) {
+		inArgs := make([]catalog.Type, 0, len(r.ArgTypes))
+		for i, t := range r.ArgTypes {
+			if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+				continue
+			}
+			inArgs = append(inArgs, t)
+		}
+		if len(inArgs) != 1 || !strings.EqualFold(inArgs[0].Name, "internal") {
+			continue
+		}
+		if !strings.EqualFold(r.ReturnType.Name, expectedRet) {
+			return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type %s", funcName.String(), expectedRet)}
+		}
+		return r.OID, nil
+	}
+	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(internal) does not exist", funcName.String())}
 }
 
 // resolveEventTriggerFunc looks up a niladic (0-argument) function by name,
@@ -13556,6 +13619,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 							return fmt.Errorf("wal drop-event-trigger: %w", werr)
 						}
 					}
+					return nil
+				}
+			}
+		case "access method":
+			// Drop the dump-visible pg_am registry entry (DU-002,
+			// M0119-0004) so a dropped access method stops round-tripping
+			// through pg_dump. No WAL persistence yet (see the CREATE ACCESS
+			// METHOD ledger row) — mirrors CREATE's current gap.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if im.DropAccessMethod(s.Names[0].String()) {
 					return nil
 				}
 			}

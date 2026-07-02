@@ -126,6 +126,20 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		return p.parseCreateEventTriggerTail(t.Pos)
+	// CREATE ACCESS METHOD name TYPE {INDEX|TABLE} HANDLER handler_name —
+	// register in the runtime pg_am registry so pg_dump round-trips it
+	// (getAccessMethods/dumpAccessMethod). DU-002 (M0119-0004). "ACCESS" is
+	// unreserved and unregistered as a keyword, matched via the ident path
+	// like "event"/"collation"; DROP ACCESS METHOD already parses generically
+	// (internal/parser/ddl.go's ident-DROP-target list).
+	case p.acceptIdentKeyword("access"):
+		if unlogged || orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED / OR REPLACE not valid for CREATE ACCESS METHOD"}
+		}
+		if !p.acceptIdentKeyword("method") {
+			return nil, p.errAtCur("expected METHOD after ACCESS")
+		}
+		return p.parseCreateAccessMethodTail(t.Pos)
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFunction:
 		if unlogged {
 			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE FUNCTION"}
@@ -2184,6 +2198,45 @@ func (p *parser) parseCreateEventTriggerTail(pos int) (Stmt, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("event trigger functions take no arguments")
 	}
+	return stmt, nil
+}
+
+// parseCreateAccessMethodTail picks up after CREATE ACCESS METHOD.
+// Grammar (postgres/src/backend/parser/gram.y CreateAmStmt):
+//
+//	name TYPE_P {INDEX | TABLE} HANDLER handler_name
+//
+// handler_name is a plain (possibly schema-qualified) function name with no
+// parenthesized arg list — PostgreSQL resolves it via LookupFuncName against
+// the fixed one-argument-of-type-internal handler signature (amcmds.c
+// lookup_am_handler_func), mirrored by resolveAccessMethodHandlerFunc in the
+// executor.
+func (p *parser) parseCreateAccessMethodTail(pos int) (Stmt, error) {
+	stmt := &CreateAccessMethodStmt{pos: pos}
+	name, err := p.parseIdent()
+	if err != nil {
+		return nil, p.errAtCur("expected access method name after CREATE ACCESS METHOD")
+	}
+	stmt.Name = name.Value
+	if !p.acceptIdentKeyword("type") {
+		return nil, p.errAtCur("expected TYPE in CREATE ACCESS METHOD")
+	}
+	switch {
+	case p.acceptKeyword(KwIndex):
+		stmt.AMType = "i"
+	case p.acceptKeyword(KwTable):
+		stmt.AMType = "t"
+	default:
+		return nil, p.errAtCur("expected INDEX or TABLE in CREATE ACCESS METHOD")
+	}
+	if !p.acceptIdentKeyword("handler") {
+		return nil, p.errAtCur("expected HANDLER in CREATE ACCESS METHOD")
+	}
+	handlerName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.HandlerName = handlerName
 	return stmt, nil
 }
 

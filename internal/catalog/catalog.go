@@ -2197,6 +2197,13 @@ type InMemory struct {
 	// fdwname. DU-002 slice 375.
 	fdws map[string]*ForeignDataWrapper
 
+	// accessMethods tracks user-defined access methods (CREATE ACCESS METHOD)
+	// with a stable OID so they round-trip through pg_dump's getAccessMethods
+	// (pg_am virtual view → dumpAccessMethod). goopg never invokes a
+	// user-defined AM (no pluggable storage engine); only enough metadata is
+	// kept for dump fidelity. Key: amname. DU-002 (M0119-0004).
+	accessMethods map[string]*AccessMethod
+
 	// eventTriggers tracks event triggers (CREATE EVENT TRIGGER) with a stable
 	// OID so they round-trip through pg_dump's getEventTriggers
 	// (pg_event_trigger virtual view → dumpEventTrigger). goopg does not fire
@@ -6636,7 +6643,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2601,
 	}
 	pgAm.VirtualRows = func() [][]string {
-		return [][]string{
+		rows := [][]string{
 			{"2", "heap", "3", "t"},
 			{"403", "btree", "330", "i"},
 			{"405", "hash", "331", "i"},
@@ -6645,6 +6652,19 @@ func (c *InMemory) registerSystemTables() {
 			{"4000", "spgist", "334", "i"},
 			{"3580", "brin", "335", "i"},
 		}
+		// Surface user-created access methods (CREATE ACCESS METHOD) so they
+		// round-trip through pg_dump's getAccessMethods (only oid >=
+		// FirstNormalObjectId rows are dumpable — the 7 built-ins above are
+		// filtered out there, not here). DU-002 (M0119-0004).
+		for _, am := range c.ListAccessMethods() {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(am.OID), 10),
+				am.Name,
+				strconv.FormatUint(uint64(am.HandlerOID), 10),
+				am.AMType,
+			})
+		}
+		return rows
 	}
 	c.tables["pg_catalog.pg_am"] = pgAm
 
@@ -10815,6 +10835,71 @@ func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, b
 	defer c.mu.RUnlock()
 	f, ok := c.fdws[name]
 	return f, ok
+}
+
+// AccessMethod is a user-created access method (CREATE ACCESS METHOD). goopg
+// never invokes a user-defined AM (no pluggable table/index storage engine);
+// this records just enough metadata to round-trip the CREATE through pg_dump
+// (pg_am virtual view → getAccessMethods/dumpAccessMethod). DU-002
+// (M0119-0004).
+type AccessMethod struct {
+	Name       string // amname
+	OID        uint32 // pg_am.oid (assigned from the catalog OID counter)
+	AMType     string // pg_am.amtype: "i" (INDEX) or "t" (TABLE)
+	HandlerOID uint32 // pg_am.amhandler — FK to pg_proc
+}
+
+// RegisterAccessMethod records a user-defined access method. Returns an error
+// if the name collides with a built-in AM (pg_am's static 7 rows) or an
+// already-registered user AM — mirrors PostgreSQL's own duplicate-name check
+// in CreateAccessMethod (amcmds.c), which errors before this ever reaches the
+// catalog. DU-002 (M0119-0004).
+func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32) (*AccessMethod, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if AccessMethodOIDByName(name) != 0 {
+		return nil, fmt.Errorf("access method %q already exists", name)
+	}
+	if c.accessMethods == nil {
+		c.accessMethods = make(map[string]*AccessMethod)
+	}
+	if _, ok := c.accessMethods[name]; ok {
+		return nil, fmt.Errorf("access method %q already exists", name)
+	}
+	am := &AccessMethod{Name: name, OID: c.allocOIDLocked(), AMType: amType, HandlerOID: handlerOID}
+	c.accessMethods[name] = am
+	return am, nil
+}
+
+// DropAccessMethod removes a user-defined access method from the registry.
+// Returns true if found. DU-002 (M0119-0004).
+func (c *InMemory) DropAccessMethod(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accessMethods == nil {
+		return false
+	}
+	if _, ok := c.accessMethods[name]; ok {
+		delete(c.accessMethods, name)
+		return true
+	}
+	return false
+}
+
+// ListAccessMethods returns all registered user-defined access methods
+// sorted by name. DU-002 (M0119-0004).
+func (c *InMemory) ListAccessMethods() []*AccessMethod {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.accessMethods) == 0 {
+		return nil
+	}
+	out := make([]*AccessMethod, 0, len(c.accessMethods))
+	for _, am := range c.accessMethods {
+		out = append(out, am)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // EventTrigger is a user-created event trigger (CREATE EVENT TRIGGER). goopg

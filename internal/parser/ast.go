@@ -2391,6 +2391,24 @@ type CreateEventTriggerStmt struct {
 func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }
 func (s *CreateEventTriggerStmt) stmtNode() {}
 
+// CreateAccessMethodStmt — `CREATE ACCESS METHOD name TYPE {INDEX|TABLE}
+// HANDLER handler_name`.
+//
+// goopg never invokes a user-defined access method (no pluggable table/index
+// storage engine) — this only round-trips the DDL through pg_dump
+// (pg_am virtual view → getAccessMethods/dumpAccessMethod). DU-002
+// (M0119-0004). DROP ACCESS METHOD reuses the generic DropCompatStmt (see
+// execDropCompat's "access method" case).
+type CreateAccessMethodStmt struct {
+	pos         int
+	Name        string
+	AMType      string // "i" (INDEX) or "t" (TABLE) — pg_am.amtype
+	HandlerName ObjectName
+}
+
+func (s *CreateAccessMethodStmt) Pos() int  { return s.pos }
+func (s *CreateAccessMethodStmt) stmtNode() {}
+
 // AlterEventTriggerStmt — one of:
 //
 //	ALTER EVENT TRIGGER name DISABLE

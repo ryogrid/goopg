@@ -5298,6 +5298,64 @@ documentation-only and is exempt from the design-doc requirement.)
       discovered from the WordPress workload; no further TOAST durability
       deferrals remain open in the ledger as of this loop.
 
+- [x] **`CREATE ACCESS METHOD` round-trip in pg_dump (M0119-0004, DU-002
+      slice 426, interactive session).** **COMPLETE 2026-07-02:** `CREATE
+      ACCESS METHOD name TYPE {INDEX|TABLE} HANDLER handler_name` was a
+      bare parse error (no parse path existed at all), and
+      `pg_am.VirtualRows` only ever emitted the 7 built-in AM rows, so
+      pg_dump's `getAccessMethods()` always read 0 dumpable rows.
+      goopg has no pluggable table/index storage engine and never invokes
+      a user-defined AM's handler — this is dump-fidelity only, same scope
+      as the existing CREATE OPERATOR/OPERATOR CLASS compat-registration
+      slices. Parser: new `CreateAccessMethodStmt` AST node +
+      `parseCreateAccessMethodTail` (mirrors `gram.y`'s `CreateAmStmt`);
+      `DROP ACCESS METHOD` already parsed generically via the ident-DROP-
+      target list (M0097-0071). Catalog: new `AccessMethod{Name, OID,
+      AMType, HandlerOID}` registry (`RegisterAccessMethod`/
+      `DropAccessMethod`/`ListAccessMethods`, keyed by amname, mirrors the
+      `ForeignDataWrapper`/`EventTrigger` compat-registry shape);
+      `pg_am.VirtualRows` appends user AM rows after the 7 built-ins (no
+      oid-range filtering needed — pg_dump's own `selectDumpableAccessMethod`
+      does that client-side). Executor: `execCreateAccessMethod` mirrors
+      `CreateAccessMethod`'s validation order (superuser 42501 → handler
+      resolution → duplicate-name 42710, including a built-in-name
+      collision via `catalog.AccessMethodOIDByName`);
+      `resolveAccessMethodHandlerFunc` mirrors `lookup_am_handler_func`
+      (`amcmds.c`) — the handler must resolve to a routine with exactly
+      one argument of type `internal`, returning the AM-type-matching
+      pseudo-type (`index_am_handler`/`table_am_handler`; 42883 if
+      unresolved, 42809 if wrong return type); `execDropCompat`'s existing
+      `"access method"` case now also calls `DropAccessMethod`. New
+      pseudo-type OIDs 325 (`index_am_handler`)/269 (`table_am_handler`)
+      in `typeNameToOIDStr` let a `CREATE FUNCTION ... RETURNS
+      index_am_handler` handler stub resolve a `prorettype` at all. Tests:
+      `TestParseCreateAccessMethod`/`TestParseCreateAccessMethodErrors`/
+      `TestParseDropAccessMethod` (`internal/parser/access_method_test.go`),
+      `TestCreateAccessMethodRegistersRow`/`TestCreateAccessMethodTableType`/
+      `TestCreateAccessMethodUnknownFunctionErrors`/
+      `TestCreateAccessMethodWrongReturnTypeErrors`/
+      `TestCreateAccessMethodDuplicateNameErrors`/
+      `TestDropAccessMethodRemovesRow`
+      (`internal/executor/operators_ddl_access_method_test.go`), plus
+      slice 426 in `TestPort_PgDumpConnectionSetup` (real `LANGUAGE c`
+      handler stub + `CREATE ACCESS METHOD` verified byte-identical vs
+      live PG 18.3, plus a built-in-AM-not-dumped regression guard).
+      Gates: `go build`/`go vet` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor`+`internal/planner`+
+      `internal/initdb` suites PASS; `TestPort_PgDumpConnectionSetup`
+      PASS (7.5s); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      pre-commit gate incl. pgbench TPC-B/simple-update/select-only smoke
+      (0 failed transactions across 5181+6815+398183 transactions) PASS.
+      Design doc: `docs/design/0119-0004-access-method-roundtrip.md`.
+      Deferred (ledger row appended): no WAL/restart persistence yet — the
+      `accessMethods` registry is a plain in-process map, so a `CREATE`/
+      `DROP ACCESS METHOD` vanishes on server restart (a dump taken before
+      a restart still round-trips correctly; only the live registry itself
+      is non-durable). Resume point: add a WAL record + startup replay
+      following the exact pattern already landed for sibling compat
+      registries (event triggers loop #71, functions/procedures loops
+      #73/74).
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

@@ -4957,6 +4957,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SUBSCRIPTION goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote' PUBLICATION goopg_pub1 WITH (connect = false, slot_name = goopg_sub1)"); err != nil {
 		t.Fatalf("create subscription: %v", err)
 	}
+	// Slice 426: CREATE ACCESS METHOD must round-trip. pg_dump's
+	// getAccessMethods() selects every pg_am row with oid >=
+	// FirstNormalObjectId (the 7 built-ins below that threshold are filtered
+	// out client-side by selectDumpableAccessMethod) and resolves amhandler
+	// via `::pg_catalog.regproc`; dumpAccessMethod re-emits `CREATE ACCESS
+	// METHOD <name> TYPE {INDEX|TABLE} HANDLER <handler>;`. Before this slice
+	// "CREATE ACCESS METHOD" was a bare parse error (no parseCreateAccessMethod
+	// path existed at all) and pg_am.VirtualRows served only the 7 built-in
+	// rows. The HANDLER function must resolve via PostgreSQL's own fixed
+	// lookup_am_handler_func signature — exactly one argument of type
+	// "internal", returning the AM-type-matching pseudo-type
+	// (index_am_handler/table_am_handler) — so a real (LANGUAGE C stub, never
+	// invoked — goopg has no pluggable storage engine, mirroring the
+	// CREATE CONVERSION FROM-function precedent) handler function is created
+	// first.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.goopg_am_handler(internal) RETURNS index_am_handler LANGUAGE c AS 'goopg_am_handler'"); err != nil {
+		t.Fatalf("create function goopg_am_handler: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ACCESS METHOD goopg_am TYPE INDEX HANDLER goopg_am_handler"); err != nil {
+		t.Fatalf("create access method: %v", err)
+	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
 	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
@@ -11062,6 +11083,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER SUBSCRIPTION goopg_sub1 OWNER TO postgres;") {
 			t.Errorf("pg_dump dropped the ALTER SUBSCRIPTION OWNER TO (slice-423, subowner resolution); full stdout=%q", res.Stdout)
+		}
+		// Slice 426: CREATE ACCESS METHOD must round-trip, resolving amhandler
+		// to the schema-qualified handler function name (pg_dump connects with
+		// search_path='' so a regproc cast always schema-qualifies). Verified
+		// byte-identical against dumpAccessMethod's own emit logic
+		// (postgres/src/bin/pg_dump/pg_dump.c) — "CREATE ACCESS METHOD %s TYPE
+		// {INDEX|TABLE} HANDLER %s;\n" with a single trailing space before
+		// HANDLER when amtype renders "TYPE INDEX " / "TYPE TABLE ".
+		amStmt := "CREATE ACCESS METHOD goopg_am TYPE INDEX HANDLER public.goopg_am_handler;"
+		if !strings.Contains(res.Stdout, amStmt) {
+			t.Errorf("pg_dump dropped the CREATE ACCESS METHOD round-trip (slice-426); missing %q\n  full stdout=%q", amStmt, res.Stdout)
+		}
+		// The 7 built-in access methods (heap/btree/hash/gist/gin/spgist/brin)
+		// must stay filtered out (selectDumpableAccessMethod's oid <=
+		// g_last_builtin_oid gate) — a regression here would spuriously dump
+		// them too.
+		if strings.Contains(res.Stdout, "CREATE ACCESS METHOD btree") ||
+			strings.Contains(res.Stdout, "CREATE ACCESS METHOD heap") {
+			t.Errorf("pg_dump spuriously dumped a built-in access method (slice-426 oid-threshold filter regressed); full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact
