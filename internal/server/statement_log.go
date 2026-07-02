@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -146,7 +147,8 @@ func (s *Server) logStatement(proto string, sql string, sess *config.SessionRegi
 	if lvl != logStmtAll && !lvl.shouldLog(leadingKeyword(sql)) {
 		return false
 	}
-	attrs := []any{"proto", proto, "statement", strings.TrimSpace(sql)}
+	attrs := s.prefixAttr(sess, connTx)
+	attrs = append(attrs, "proto", proto, "statement", strings.TrimSpace(sql))
 	if connTx != nil && connTx.InExplicit() {
 		if tx := connTx.Tx(); tx.XID != 0 {
 			attrs = append(attrs, "xid", uint64(tx.XID))
@@ -208,7 +210,8 @@ func (s *Server) logDuration(start time.Time, wasLogged bool, proto string, sql 
 	if !exceedsLogMinDuration(elapsedMs, threshold) {
 		return
 	}
-	attrs := []any{"proto", proto, "duration_ms", elapsedMs}
+	attrs := s.prefixAttr(sess, connTx)
+	attrs = append(attrs, "proto", proto, "duration_ms", elapsedMs)
 	if !wasLogged {
 		attrs = append(attrs, "statement", strings.TrimSpace(sql))
 	}
@@ -218,4 +221,165 @@ func (s *Server) logDuration(start time.Time, wasLogged bool, proto string, sql 
 		}
 	}
 	s.cfg.Logger.Info("duration", attrs...)
+}
+
+// logLineFields carries the per-log-call data available to expand a
+// log_line_prefix format string against the statement/duration log lines.
+// Zero values render as PostgreSQL's own "[unknown]" placeholder for
+// string fields (elog.c's log_status_format, e.g. the %u/%d/%a cases with a
+// NULL/empty MyProcPort field) or the PG-equivalent numeric zero (%p / %x)
+// otherwise.
+type logLineFields struct {
+	Time     time.Time
+	PID      uint32
+	User     string
+	Database string
+	AppName  string
+	Xid      uint64
+}
+
+// formatLogLinePrefix expands a log_line_prefix-style format string
+// (mirrors postgres/src/backend/utils/error/elog.c:log_status_format)
+// against f, supporting the subset of %-escapes goopg's per-statement
+// logger has real data for: %m (timestamp), %p (pid), %u (user), %d
+// (database), %a (application name), %x (top-level transaction id), and
+// %%. Numeric padding (e.g. `%-10p`) is honoured exactly like PG's
+// process_log_prefix_padding — negative width left-justifies. Any other
+// escape (%l, %c, %e, %r, %h, %i, %t, %n, %s, %v, %P, %b, %L, %Q, or an
+// unrecognised letter) requires context goopg's structured logger doesn't
+// carry at this call site (backend type, remote host, per-process log line
+// counter, ...) and is dropped, matching PG's own "format error - ignore
+// it" default case for an unrecognised specifier.
+func formatLogLinePrefix(format string, f logLineFields) string {
+	if format == "" {
+		return ""
+	}
+	var b strings.Builder
+	for i := 0; i < len(format); i++ {
+		c := format[i]
+		if c != '%' {
+			b.WriteByte(c)
+			continue
+		}
+		i++
+		if i >= len(format) {
+			break // format error - ignore it (elog.c)
+		}
+		if format[i] == '%' {
+			b.WriteByte('%')
+			continue
+		}
+		start := i
+		if format[i] == '-' {
+			i++
+		}
+		for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+			i++
+		}
+		padding := 0
+		if i > start {
+			// A lone '-' with no digits (format[start:i] == "-") fails to
+			// parse and padding stays 0, matching PG's
+			// process_log_prefix_padding treating it as "no padding".
+			padding, _ = strconv.Atoi(format[start:i])
+		}
+		if i >= len(format) {
+			break
+		}
+		val, ok := expandLogLineVerb(format[i], f)
+		if !ok {
+			continue
+		}
+		if padding != 0 {
+			fmt.Fprintf(&b, "%*s", padding, val)
+		} else {
+			b.WriteString(val)
+		}
+	}
+	return b.String()
+}
+
+// expandLogLineVerb resolves one %-escape letter to its value. ok is false
+// for an escape goopg has no data for, which formatLogLinePrefix drops
+// silently (PG's default case).
+func expandLogLineVerb(verb byte, f logLineFields) (string, bool) {
+	switch verb {
+	case 'm':
+		t := f.Time
+		if t.IsZero() {
+			t = time.Now()
+		}
+		return t.Format("2006-01-02 15:04:05.000 MST"), true
+	case 'p':
+		return strconv.FormatUint(uint64(f.PID), 10), true
+	case 'u':
+		if f.User == "" {
+			return "[unknown]", true
+		}
+		return f.User, true
+	case 'd':
+		if f.Database == "" {
+			return "[unknown]", true
+		}
+		return f.Database, true
+	case 'a':
+		if f.AppName == "" {
+			return "[unknown]", true
+		}
+		return f.AppName, true
+	case 'x':
+		return strconv.FormatUint(f.Xid, 10), true
+	default:
+		return "", false
+	}
+}
+
+// logLinePrefix renders the `log_line_prefix` GUC (ContextSigHup — like
+// PostgreSQL, config-file only, never client-SET-able) against this call's
+// connection/session context. Returns "" when the GUC value is empty
+// (PostgreSQL's own "no prefix" default), so callers can skip attaching a
+// prefix attribute entirely. sess/connTx may be nil (defensive; not
+// expected on the live call sites).
+func (s *Server) logLinePrefix(sess *config.SessionRegistry, connTx *connTxState) string {
+	if s.cfg.Registry == nil {
+		return ""
+	}
+	v, ok := s.cfg.Registry.Get("log_line_prefix")
+	if !ok || v.Value == "" {
+		return ""
+	}
+	f := logLineFields{Time: time.Now()}
+	if connTx != nil {
+		f.PID = connTx.BackendPID
+		f.Database = connTx.DBName
+		if connTx.InExplicit() {
+			if tx := connTx.Tx(); tx.XID != 0 {
+				f.Xid = uint64(tx.XID)
+			}
+		}
+	}
+	if sess != nil {
+		// session_authorization is the closest goopg equivalent of PG's
+		// MyProcPort->user_name; unlike PG it can drift after `SET SESSION
+		// AUTHORIZATION`, which is an acceptable approximation for a log
+		// correlation aid rather than an audit trail.
+		if _, eff, ok := sess.Get("session_authorization"); ok {
+			f.User = eff
+		}
+		if _, eff, ok := sess.Get("application_name"); ok {
+			f.AppName = eff
+		}
+	}
+	return formatLogLinePrefix(v.Value, f)
+}
+
+// prefixAttr returns the leading slog attrs for a statement/duration log
+// record: a "prefix" key-value pair when log_line_prefix expands to
+// something, or an empty (zero-alloc-friendly) slice otherwise. Callers
+// append their own attrs to the returned slice.
+func (s *Server) prefixAttr(sess *config.SessionRegistry, connTx *connTxState) []any {
+	if prefix := s.logLinePrefix(sess, connTx); prefix != "" {
+		return []any{"prefix", prefix}
+	}
+	return nil
 }

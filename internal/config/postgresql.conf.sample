@@ -210,6 +210,10 @@
 #log_statement = 'none'                 # none | ddl | mod | all
 #log_min_duration_statement = -1        # -1 disables; otherwise ms threshold
 
+# - What To Log -
+
+#log_line_prefix = '%m [%p] '           # supported escapes: %m %p %u %d %a %x %%
+
 # - Process Title / I/O Timing -
 
 #track_activities = on                  # collect info in pg_stat_activity

@@ -155,15 +155,74 @@ Tests (`internal/server/statement_log_test.go`): `TestSessionLogMinDurationState
 asserts the actual emitted record — bare vs combined line, disabled, and
 below-threshold cases), `TestLogStatementReturnsWasLogged`.
 
+## Follow-up: `log_line_prefix` GUC (loop #42)
+
+**LANDED (partial subset).** `log_line_prefix` is registered
+(`internal/config/defaults.go`) as `ContextSigHup` with `BootVal` `"%m [%p] "`,
+matching upstream `guc_tables.c` exactly: like real PostgreSQL it is
+config-file-only (a client `SET log_line_prefix = ...` is rejected, since
+`ContextSigHup` is below the `SET`-allowed threshold), so it is picked up
+through `postgresql.conf`/`-c log_line_prefix=...` via the existing
+`ParseConfigFile`/`ApplyConfigEntries` path (`cmd/goopg/main.go`), not through
+any new env var.
+
+`formatLogLinePrefix(format, logLineFields)` (`internal/server/statement_log.go`)
+expands the format string against a small field struct, mirroring
+`postgres/src/backend/utils/error/elog.c`'s `log_status_format`. It supports
+the subset of `%`-escapes goopg's per-statement logger has real data for at
+its two call sites:
+
+- `%m` — timestamp (`time.Now()`, `"2006-01-02 15:04:05.000 MST"`).
+- `%p` — backend PID (`connTx.BackendPID`).
+- `%u` — user (`sess.Get("session_authorization")`; approximates PG's
+  connection-frozen `MyProcPort->user_name` — this drifts after `SET SESSION
+  AUTHORIZATION`, an accepted simplification for a log-correlation aid).
+- `%d` — database (`connTx.DBName`).
+- `%a` — application name (`sess.Get("application_name")`).
+- `%x` — top-level transaction id (`connTx.Tx().XID`, `0` when none assigned,
+  matching `GetTopTransactionIdIfAny`).
+- `%%` — literal `%`.
+- Numeric padding (`%-10p`-style) is honoured, including PG's negative-width
+  left-justify convention.
+
+Every other escape (`%l`, `%c`, `%e`, `%r`, `%h`, `%i`, `%t`, `%n`, `%s`, `%v`,
+`%P`, `%b`, `%L`, `%Q`, or any unrecognised letter) is dropped — goopg's
+structured logger has no backend-type/remote-host/per-process-line-counter
+context at these call sites, and PG itself silently ignores an unrecognised
+specifier (`elog.c`'s `default: /* format error - ignore it */`).
+
+`(*Server).logLinePrefix(sess, connTx)` reads the registry's current
+`log_line_prefix` value and formats it; `(*Server).prefixAttr(...)` wraps
+that as a leading `"prefix"` slog attr, or an empty slice when the GUC
+expands to `""` (PG's own "no prefix" default). Both `logStatement` and
+`logDuration` (`internal/server/statement_log.go`) prepend this attr.
+
+Tests: `TestFormatLogLinePrefix` (the pure formatter — every supported
+escape, padding, unknown-field placeholders, unrecognised-escape drop,
+trailing `%`), `TestServerLogLinePrefix` (registry-driven attr attach/omit
+through `logStatement`).
+
 ## Out of scope / deferred
 
-- Log-line prefix (`log_line_prefix`) and a `logging_collector`/`log_directory`
-  file sink remain unimplemented GUC stubs.
+- `log_line_prefix`'s remaining escapes (`%l` line number, `%c` session id,
+  `%e` SQL state, `%r`/`%h` remote host, `%i` ps display, `%t`/`%n`/`%s`
+  timestamps, `%v` vxid, `%P` parallel leader pid, `%b` backend type, `%L`
+  local host, `%Q` query id) are not expanded — they need per-connection
+  state (remote address, backend type, a per-process log-line counter, ...)
+  goopg's statement/duration logger doesn't carry today.
+- `log_line_prefix` is wired only into the two `root-0023` statement/duration
+  log lines, not goopg's other `slog` output (connection lifecycle, WAL,
+  checkpoints, ...) — real PostgreSQL applies it to every server log line.
+- A `logging_collector`/`log_directory` file sink remains unimplemented.
 
 ## PostgreSQL references
 
 - `postgres/src/backend/tcop/postgres.c` — `check_log_statement`,
   `check_log_duration`, `exec_simple_query` (logs before parse),
   `exec_execute_message` (`LOG: execute …`).
-- `postgres/official_docs_in_md/` — `log_statement` and
-  `log_min_duration_statement` GUC semantics.
+- `postgres/src/backend/utils/error/elog.c` — `log_status_format` (the
+  `log_line_prefix` `%`-escape expander).
+- `postgres/src/backend/utils/misc/guc_tables.c` — `log_line_prefix`'s
+  `PGC_SIGHUP` context and `"%m [%p] "` `BootVal`.
+- `postgres/official_docs_in_md/` — `log_statement`,
+  `log_min_duration_statement`, and `log_line_prefix` GUC semantics.

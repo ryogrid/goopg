@@ -6109,6 +6109,39 @@ documentation-only and is exempt from the design-doc requirement.)
       this slice: `log_line_prefix`, `logging_collector`/`log_directory` remain
       unimplemented GUC stubs.
 
+- [x] **`log_line_prefix` GUC wiring — partial subset (root-0023 follow-up,
+      loop #42).** **COMPLETE 2026-07-03:** registers `log_line_prefix`
+      (`internal/config/defaults.go`) as `ContextSigHup`/`BootVal` `"%m [%p] "`,
+      matching upstream `guc_tables.c` exactly (config-file-only, not
+      client-`SET`-able, unlike the `ContextSuset` `log_statement`/
+      `log_min_duration_statement` siblings above — picked up via the existing
+      `postgresql.conf`/`-c` `ParseConfigFile`/`ApplyConfigEntries` path, no new
+      env var). `formatLogLinePrefix(format, logLineFields)`
+      (`internal/server/statement_log.go`) mirrors `elog.c`'s
+      `log_status_format`, expanding the `%m`/`%p`/`%u`/`%d`/`%a`/`%x`/`%%`
+      subset (with numeric/negative padding) goopg's statement/duration logger
+      has real data for at its two call sites; any other escape is dropped,
+      matching PG's own unrecognised-specifier "ignore it" default.
+      `(*Server).logLinePrefix`/`prefixAttr` read the registry's current value
+      and attach it as a leading `"prefix"` slog attr on both `logStatement`
+      and `logDuration`, omitted when the GUC expands to `""` (PG's "no
+      prefix"). Tests: `TestFormatLogLinePrefix` (every supported escape,
+      padding, unknown-field placeholders, unrecognised-escape drop, trailing
+      `%`), `TestServerLogLinePrefix` (registry-driven attach/omit through
+      `logStatement`) (`internal/server/statement_log_test.go`). Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/server`+`internal/config`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. `postgresql.conf.sample` gained the commented default
+      (required by `TestSampleConfigCoversRegistry`). Design doc:
+      `docs/design/root-0023-statement-query-logging.md` new "Follow-up:
+      `log_line_prefix` GUC (loop #42)" section; `docs/design/README.md`
+      root-0023 row updated; deferral ledger row appended. Still open: the
+      remaining `log_line_prefix` escapes (`%l`/`%c`/`%e`/`%r`/`%h`/`%i`/`%t`/
+      `%n`/`%s`/`%v`/`%P`/`%b`/`%L`/`%Q` — need per-connection remote-host/
+      backend-type/line-counter state goopg doesn't track at these call
+      sites), applying the prefix to goopg's other `slog` output (only the two
+      root-0023 lines are wired), and `logging_collector`/`log_directory`.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

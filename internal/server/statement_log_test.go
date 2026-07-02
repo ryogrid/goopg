@@ -278,3 +278,77 @@ func TestLogStatementReturnsWasLogged(t *testing.T) {
 		t.Errorf("log_statement=all: wasLogged = %v, want true", got)
 	}
 }
+
+func TestFormatLogLinePrefix(t *testing.T) {
+	fixedTime := time.Date(2026, 7, 3, 8, 19, 45, 123_000_000, time.UTC)
+	base := logLineFields{Time: fixedTime, PID: 4242, User: "wp_user", Database: "wordpress", AppName: "wp4pg", Xid: 99}
+
+	tests := []struct {
+		name   string
+		format string
+		f      logLineFields
+		want   string
+	}{
+		{"empty format", "", base, ""},
+		{"default PG bootval", "%m [%p] ", base, "2026-07-03 08:19:45.123 UTC [4242] "},
+		{"literal percent", "100%% done", base, "100% done"},
+		{"user and database", "%u@%d> ", base, "wp_user@wordpress> "},
+		{"application name", "[%a]", base, "[wp4pg]"},
+		{"xid", "tx=%x", base, "tx=99"},
+		{"xid zero", "tx=%x", logLineFields{}, "tx=0"},
+		{"unknown user/database/appname", "%u %d %a", logLineFields{}, "[unknown] [unknown] [unknown]"},
+		{"unrecognised escape dropped", "a%zb", base, "ab"},
+		{"trailing percent dropped", "abc%", base, "abc"},
+		{"positive padding right-justifies", "[%10p]", base, "[      4242]"},
+		{"negative padding left-justifies", "[%-10p]", base, "[4242      ]"},
+		{"literal text only", "no escapes here", base, "no escapes here"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatLogLinePrefix(tt.format, tt.f); got != tt.want {
+				t.Errorf("formatLogLinePrefix(%q) = %q, want %q", tt.format, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestServerLogLinePrefix verifies logStatement attaches a "prefix"
+// attribute expanded from the registry's log_line_prefix value against the
+// call's connTx/session context, that a custom prefix format is honoured,
+// and that it is omitted entirely when the GUC is set to empty
+// (PostgreSQL's own "no prefix" behaviour). The GUC's own BootVal ("%m
+// [%p] ", mirroring upstream) means a fresh registry already attaches one.
+func TestServerLogLinePrefix(t *testing.T) {
+	logger, records := newCapturingLogger()
+	reg := config.BuildDefaultRegistry()
+	s := &Server{cfg: Config{Logger: logger, Registry: reg}, logStmtLevel: logStmtAll}
+	sess := config.NewSessionRegistry(reg)
+	connTx := &connTxState{DBName: "wordpress", BackendPID: 777}
+
+	if err := reg.Set("log_line_prefix", "[%p %d] ", config.SourceConfigFile); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	*records = nil
+	s.logStatement("simple", "SELECT 1", sess, connTx)
+	if len(*records) != 1 {
+		t.Fatalf("got %d records, want 1", len(*records))
+	}
+	if got, want := (*records)[0].attrs["prefix"], "[777 wordpress] "; got != want {
+		t.Errorf("prefix attr = %v, want %q", got, want)
+	}
+
+	// log_line_prefix is not a ContextSigHup default a client can SET, but a
+	// config-file value of "" (upstream's own "no prefix" spelling) must
+	// suppress the attr entirely rather than attaching an empty string.
+	if err := reg.Set("log_line_prefix", "", config.SourceConfigFile); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	*records = nil
+	s.logStatement("simple", "SELECT 1", sess, connTx)
+	if len(*records) != 1 {
+		t.Fatalf("got %d records, want 1", len(*records))
+	}
+	if _, ok := (*records)[0].attrs["prefix"]; ok {
+		t.Errorf("empty log_line_prefix: unexpectedly attached a prefix attr: %+v", (*records)[0])
+	}
+}
