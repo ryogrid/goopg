@@ -5544,6 +5544,49 @@ documentation-only and is exempt from the design-doc requirement.)
       extended-protocol commit-time deferral (M0119-0004-ACLHEAP) remains
       open.
 
+- [x] **`ALTER DATABASE ... SET`/`RESET`/`RESET ALL` (`pg_db_role_setting.setconfig`)
+      round-trip in pg_dump (M0119-0004-ACLHEAP follow-up, loop #17).**
+      **COMPLETE 2026-07-02:** closes the loop #16 datacl-half row's own
+      "`ALTER DATABASE ... SET` remains unimplemented" residual. goopg's
+      parser has no `ALTER DATABASE` grammar at all, so `SET`/`RESET`/
+      `RESET ALL` are intercepted at the wire-protocol dispatch layer
+      (`parseAlterDatabaseConfig`, `internal/server/database_ddl.go`, mirrors
+      the existing CREATE/DROP DATABASE string-prefix bypass) rather than
+      teaching `parseAlter` a new statement shape; every other `ALTER
+      DATABASE` sub-form (`CONNECTION LIMIT`, `RENAME TO`, `OWNER TO`, ...)
+      stays unrecognised and keeps falling through to the pre-existing
+      `compatNoopCommandTag` no-op. New `catalog.InMemory.dbRoleSettings`
+      store (`SetDatabaseConfig`/`ResetDatabaseConfig`/
+      `ResetAllDatabaseConfig`/`DatabaseConfigEntries`, in-place upsert by
+      case-insensitive GUC name) backs the previously permanently-empty
+      `pg_db_role_setting.VirtualRows`. Keying gotcha caught by the pg_dump
+      round-trip test, not assumed: the store must key by
+      `catalog.FirstUserOID` (16384, the SQL-visible placeholder oid
+      `pg_database` displays), NOT `catalog.InMemory.DBOID()` (the real
+      on-disk oid `datacl`'s heap resync uses) — `dumpDatabaseConfig` issues
+      a separate query cross-referencing the oid a prior `pg_database` query
+      already read, unlike `datacl` which is read in the same row/query.
+      Three new WAL kinds (73-75) + `internal/initdb/database_config_recovery.go`
+      give it restart persistence. Tests: `internal/catalog/database_test.go`
+      (5 new); `internal/server/database_ddl_test.go` `TestParseAlterDatabaseConfig`
+      (7 positive + 6 negative); `internal/wal/database_config_ddl_test.go`;
+      `internal/initdb/database_config_recovery_test.go`;
+      `internal/testport/pgdump_database_config_test.go`
+      `TestPort_PgDumpDatabaseConfigSet` (byte-identical vs real pg_dump 18.3
+      `--create`). Gates: `go build`/`go vet` clean; `internal/catalog`+
+      `internal/server`+`internal/wal`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpDatabaseConfigSet`/`TestPort_PgDumpDatabaseGrantACL`/
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-database-config-set-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bt` added; deferral ledger row
+      appended. Still open: extended-protocol path has no equivalent hook
+      (standing M0119-0004-ACLHEAP gap); `ALTER ROLE ... SET`/`ALTER ROLE ...
+      IN DATABASE ... SET` (`setrole != 0`) entirely unimplemented; `SET TIME
+      ZONE`/`SET SESSION AUTHORIZATION`/`SET ... FROM CURRENT` special forms
+      unrecognised (fall through to the no-op); multi-database scope
+      unchanged from `datacl`.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
