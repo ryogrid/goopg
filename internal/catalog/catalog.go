@@ -4977,8 +4977,8 @@ func (c *InMemory) registerSystemTables() {
 		Columns: []Column{
 			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
 			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
-			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "datdba", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "encoding", Type: Type{Name: "int4"}, Ordinal: 3},
 			// Additional columns for vacuumdb --all (M0095-0004).
 			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 4},
 			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 5},
@@ -4994,6 +4994,27 @@ func (c *InMemory) registerSystemTables() {
 			// pg_database` resolve the column instead of erroring 42703. M0117-0008.
 			{Name: "datfrozenxid", Type: Type{Name: "xid"}, Ordinal: 7},
 			{Name: "datminmxid", Type: Type{Name: "xid"}, Ordinal: 8},
+			// dattablespace / datcollate / datctype / datlocprovider / datlocale /
+			// daticurules / datcollversion / datacl: added so pg_dump's
+			// getDatabases query (dumpDatabase, only issued under -C/--create —
+			// dopt.outputCreateDB) resolves instead of erroring 42703 on
+			// datcollate. Values mirror what a fresh `initdb --locale=C` libc
+			// cluster's real bootstrapPostgresDatabase heap row carries
+			// (internal/initdb/initdb.go); goopg v0 does not track per-database
+			// locale/tablespace overrides, so every row reports the bootstrap
+			// default. M0119-0004-ACLHEAP (datacl half).
+			{Name: "dattablespace", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "datcollate", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "datctype", Type: Type{Name: "text"}, Ordinal: 11},
+			{Name: "datlocprovider", Type: Type{Name: "char"}, Ordinal: 12},
+			{Name: "datlocale", Type: Type{Name: "text"}, Ordinal: 13},
+			{Name: "daticurules", Type: Type{Name: "text"}, Ordinal: 14},
+			{Name: "datcollversion", Type: Type{Name: "text"}, Ordinal: 15},
+			// datacl: the GRANT/REVOKE … ON DATABASE … projection (this slice).
+			// NULL (VirtualNull) until a GRANT is recorded, matching
+			// acldefault('d', datdba) so pg_dump emits no ACL commands for an
+			// ungranted database.
+			{Name: "datacl", Type: Type{Name: "aclitem[]"}, Ordinal: 16},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -5031,6 +5052,25 @@ func (c *InMemory) registerSystemTables() {
 			case "template0":
 				oid, datallowconn, datistemplate = "4", "false", "true"
 			}
+			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
+			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's
+			// well-known postgres database OID 5) — NOT by this row's displayed
+			// "oid" placeholder above. execDatabaseACLChange / resyncDatabaseACLHeapRow
+			// key the ACL store and the physical heap resync under c.DBOID() (the
+			// heap resync MUST match the real on-disk tuple's oid column), so this
+			// lookup mirrors that key rather than the legacy 16384
+			// firstNormalObjectOID placeholder other subsystems (e.g. CREATE
+			// SUBSCRIPTION's subdbid) already depend on for "the" connected
+			// database — changing the displayed oid to match broke pg_dump's
+			// subscription round-trip (subdbid join no longer matched). Only the
+			// live "postgres" row can carry a granted ACL (execDatabaseACLChange's
+			// v0 single-database scope), so every other row is unconditionally NULL.
+			datacl := VirtualNull
+			if n == "postgres" {
+				if aclText := c.DatabaseACLText(c.DBOID()); aclText != "" {
+					datacl = aclText
+				}
+			}
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
@@ -5041,6 +5081,14 @@ func (c *InMemory) registerSystemTables() {
 				datistemplate, // datistemplate: true for template0/template1
 				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
 				"1",           // datminmxid: FirstMultiXactId bootstrap floor
+				"1663",        // dattablespace: pg_default (goopg v0 has no per-DB tablespace override)
+				"C",           // datcollate: fresh `initdb --locale=C` bootstrap value
+				"C",           // datctype: fresh `initdb --locale=C` bootstrap value
+				"c",           // datlocprovider: 'c' = libc (bootstrap default provider)
+				VirtualNull,   // datlocale: NULL under the libc provider
+				VirtualNull,   // daticurules: NULL (no ICU rules)
+				VirtualNull,   // datcollversion: NULL (recomputed on restore, mirrors pg_collation)
+				datacl,        // datacl: GRANT/REVOKE … ON DATABASE … projection (M0119-0004-ACLHEAP)
 			})
 		}
 		return out
@@ -7995,6 +8043,47 @@ func (c *InMemory) registerSystemTables() {
 	pgSeclabels.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
 
+	// pg_shseclabel — the raw shared (cluster-wide) security-label catalog
+	// (pg_shseclabel.h, SharedSecLabelRelationId 3592). dumpDatabase's
+	// dumpSecLabel helper (pg_dump --create only) queries this base table
+	// directly for the connected database's row rather than going through the
+	// pg_seclabels view above (SELECT provider, label FROM pg_shseclabel WHERE
+	// classoid = 'pg_database'::regclass AND objoid = <dboid>). goopg supports
+	// no SECURITY LABEL, so an empty table (0 rows) is correct — identical to a
+	// stock cluster with no shared security labels applied. M0119-0004-ACLHEAP
+	// (datacl half).
+	pgShseclabel := &Table{
+		Schema: "pg_catalog", Name: "pg_shseclabel", Virtual: true,
+		Columns: []Column{
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "provider", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "label", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 3592,
+	}
+	pgShseclabel.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_shseclabel"] = pgShseclabel
+
+	// pg_db_role_setting — per-database/per-role GUC override catalog
+	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabase (--create
+	// only) queries `SELECT unnest(setconfig) FROM pg_db_role_setting WHERE
+	// setrole = 0 AND setdatabase = <dboid>` to render `ALTER DATABASE ... SET
+	// ...` clauses. goopg has no `ALTER DATABASE ... SET` writer yet, so an
+	// empty table (0 rows) is correct — identical to a fresh cluster with no
+	// database-level GUC overrides. M0119-0004-ACLHEAP (datacl half).
+	pgDbRoleSetting := &Table{
+		Schema: "pg_catalog", Name: "pg_db_role_setting", Virtual: true,
+		Columns: []Column{
+			{Name: "setdatabase", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "setrole", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "setconfig", Type: Type{Name: "text[]"}, Ordinal: 2},
+		},
+		OID: 2964,
+	}
+	pgDbRoleSetting.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
+
 	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per
 	// sequence relation). After getTables, pg_dump's getSequences issues:
 	//   SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
@@ -10480,6 +10569,44 @@ func (c *InMemory) ForeignDataWrapperACLText(fdwOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString)
+}
+
+// databaseACLPrivOrder lists the database (pg_database) privileges in
+// PostgreSQL's canonical aclitemout bit order: CREATE('C'), TEMPORARY('T'),
+// CONNECT('c') (ACL_ALL_RIGHTS_DATABASE, acl.h). pg_dump's getDatabases diffs
+// datacl against acldefault('d', datdba) client-side in buildACLCommands, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_database.datacl. M0119-0004-ACLHEAP (datacl half).
+var databaseACLPrivOrder = []aclPrivLetter{
+	{"CREATE", 'C'},
+	{"TEMPORARY", 'T'},
+	{"CONNECT", 'c'},
+}
+
+// ownerDatabaseACLString is the privilege-letter string for the owner's full
+// set of database privileges, i.e. "CTc". Unlike a type/function (whose
+// world default equals the owner default), a database's world_default is
+// ACL_CREATE_TEMP | ACL_CONNECT — PUBLIC gets TEMPORARY+CONNECT but NOT
+// CREATE — so the DATABASE GRANT recorder seeds PUBLIC's reduced default
+// explicitly rather than reusing this owner string. M0119-0004-ACLHEAP
+// (datacl half).
+const ownerDatabaseACLString = "CTc"
+
+// DatabaseACLText renders the materialized pg_database.datacl text for the
+// database identified by dbOID, or "" (SQL NULL) when no privileges have been
+// granted away. Databases share the OID-keyed ACL store with relations,
+// schemas, routines, types, and foreign objects (goopg mints database OIDs
+// from a disjoint range at initdb, so there is no collision). pg_dump's
+// getDatabases diffs datacl against acldefault('d', datdba) client-side in
+// buildACLCommands, so projecting the correct aclitem[] text is the renderer
+// half of the `GRANT … ON DATABASE …` round-trip; the GRANT path must
+// additionally re-sync this text into the heap-backed pg_database row
+// (M0119-0004-ACLHEAP, pg_database is a SHARED catalog — a single relfilenode,
+// not duplicated per connected database like pg_type/pg_attribute).
+func (c *InMemory) DatabaseACLText(dbOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(dbOID, databaseACLPrivOrder, ownerDatabaseACLString)
 }
 
 // attrACLKey identifies one table column for column-level (pg_attribute.attacl)

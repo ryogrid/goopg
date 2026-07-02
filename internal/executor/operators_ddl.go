@@ -14110,6 +14110,15 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return err
 		}
 	}
+	// A GRANT/REVOKE … ON DATABASE … changes pg_database.datacl, also
+	// heap-backed (a SHARED cluster-wide catalog). query.go's isHeapACLObject
+	// excludes it from the server's virtual-ACL fast path so it reaches the
+	// executor here. M0119-0004-ACLHEAP (datacl half).
+	if s.DatabaseACLChange != nil {
+		if err := o.execDatabaseACLChange(s.DatabaseACLChange); err != nil {
+			return err
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}

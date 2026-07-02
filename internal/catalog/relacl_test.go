@@ -1199,3 +1199,64 @@ func TestAttrACLGranteeNameRendering(t *testing.T) {
 		}
 	})
 }
+
+// TestDatabaseACLText pins the pg_database.datacl projection that the
+// GRANT-on-DATABASE round-trip needs (M0119-0004-ACLHEAP, datacl half). A
+// database's acldefault('d', owner) is "{postgres=CTc/postgres,=Tc/postgres}"
+// — the owner holds CREATE+TEMPORARY+CONNECT but PUBLIC holds only
+// TEMPORARY+CONNECT (PG withholds CREATE from the PUBLIC default) — the one
+// DATABASE-specific asymmetry vs a type/function's uniform owner==PUBLIC
+// default (TestTypeACLText). pg_dump's getDatabases diffs the materialized
+// datacl against acldefault('d', datdba) and re-emits the GRANT for the new
+// grantee only. Unlike proacl this text must additionally be written back
+// into the heap-backed pg_database row by the GRANT path (a SHARED catalog,
+// unlike per-database pg_type); this test pins only the renderer half.
+func TestDatabaseACLText(t *testing.T) {
+	c := NewInMemory()
+	const dbOID = 16700 // a database OID distinct from the routine/relation tests
+
+	// No grants → NULL datacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.DatabaseACLText(dbOID); got != "" {
+		t.Fatalf("datacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT CREATE … TO a grantee seeds the implicit PUBLIC TEMPORARY+CONNECT
+	// default plus the grantee's CREATE; the owner entry is rendered from the
+	// owner-default string "CTc". Grantees render in GRANT order (PUBLIC
+	// granted first, then grantee_db) with the owner pulled to the head,
+	// mirroring the typacl projection.
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
+	c.GrantTablePrivilege(dbOID, "grantee_db", "CREATE")
+	want := "{postgres=CTc/postgres,=Tc/postgres,grantee_db=C/postgres}"
+	if got := c.DatabaseACLText(dbOID); got != want {
+		t.Fatalf("datacl after GRANT CREATE TO grantee_db = %q; want %q", got, want)
+	}
+
+	// A non-database keyword renders nothing for that grantee
+	// (relaclTextLockedFor skips letters outside databaseACLPrivOrder).
+	c.GrantTablePrivilege(dbOID, "noise_role", "SELECT")
+	if got := c.DatabaseACLText(dbOID); got != want {
+		t.Fatalf("datacl must ignore a non-database privilege: got %q; want %q", got, want)
+	}
+}
+
+// TestDatabaseACLRevokeFromOwner pins the owner-side database REVOKE. A
+// database's acldefault('d', owner) grants the FULL CTc set to the owner but
+// only the reduced Tc set to PUBLIC — the asymmetric-default counterpart of
+// TestTypeACLRevokeFromOwner. Revoking just the owner's CREATE leaves the
+// owner's remaining TEMPORARY+CONNECT explicit, alongside PUBLIC's untouched
+// implicit default.
+func TestDatabaseACLRevokeFromOwner(t *testing.T) {
+	c := NewInMemory()
+	const dbOID = 16701
+
+	c.MaterializeOwnerACL(dbOID, "postgres", []string{"CREATE", "TEMPORARY", "CONNECT"})
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
+	c.RevokeTablePrivilege(dbOID, "postgres", "CREATE")
+	want := "{postgres=Tc/postgres,=Tc/postgres}"
+	if got := c.DatabaseACLText(dbOID); got != want {
+		t.Fatalf("datacl after REVOKE CREATE FROM postgres = %q; want %q", got, want)
+	}
+}

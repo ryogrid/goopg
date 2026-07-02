@@ -331,6 +331,58 @@ func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 	return tac
 }
 
+// buildDatabaseACLChange parses the token run of a GRANT/REVOKE … ON DATABASE …
+// statement into a DatabaseACLChange, mirroring buildTypeACLChange's shape.
+// toks is every token after the GRANT/REVOKE keyword with the trailing ';'
+// excluded. Returns nil when any required list is empty (an unparseable form
+// the caller leaves as the pre-existing xmax-only no-op).
+// M0119-0004-ACLHEAP (datacl half).
+func buildDatabaseACLChange(revoke bool, toks []Token) *DatabaseACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+2 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 2 // skip the ON and the DATABASE keyword
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	dac := &DatabaseACLChange{
+		Revoke:          revoke,
+		Privileges:      splitTokPrivileges(toks[:onIdx]),
+		DatabaseNames:   splitTokRoles(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(dac.Privileges) == 0 || len(dac.DatabaseNames) == 0 || len(dac.Grantees) == 0 {
+		return nil
+	}
+	return dac
+}
+
 // grantHasColumnList reports whether the GRANT/REVOKE token run carries a
 // parenthesised column list BEFORE the ON keyword — the signature of a
 // column-level grant (`GRANT SELECT (a, b) ON TABLE t …`). A function grant's
@@ -830,6 +882,15 @@ identLedStatement:
 			ns := &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}
 			if typeClass != "" {
 				ns.TypeACL = buildTypeACLChange(strings.EqualFold(t.Value, "revoke"), typeClass == "domain", toks)
+			} else if databaseACL {
+				// `GRANT/REVOKE … ON DATABASE …` also changes pg_database.datacl,
+				// heap-backed exactly like pg_type.typacl — capture the full clause
+				// so execDatabaseACLChange can apply it. DatabaseACL (bool) above is
+				// left set unconditionally: it independently drives the
+				// intra-grant-inplace xmax lock-wait mechanism (design 0118-0098),
+				// which is unrelated to whether the clause parsed cleanly here.
+				// M0119-0004-ACLHEAP (datacl half).
+				ns.DatabaseACLChange = buildDatabaseACLChange(strings.EqualFold(t.Value, "revoke"), toks)
 			} else if grantHasColumnList(toks) {
 				// A column-level GRANT/REVOKE targets pg_attribute.attacl (heap-backed),
 				// not the whole-relation pg_class.relacl. Capture the parsed clause for

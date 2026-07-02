@@ -83,7 +83,18 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// row; execCompatNoop updates the OID-keyed ACL store and rewrites the
 	// pg_type row. Exclude it from the server GRANT/REVOKE fast path so it falls
 	// through. M0119-0004-ACLHEAP.
-	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ")
+	// `GRANT/REVOKE … ON DATABASE …` changes pg_database.datacl, also heap-backed
+	// (a SHARED cluster-wide catalog), so it must run through the executor
+	// alongside TYPE/DOMAIN rather than the server's own ACL fast path below
+	// (which only records the virtually-served relation/schema/function ACLs).
+	// "database" is already excluded from that fast path's actual recording via
+	// nonTableGrantObjects (grant_ddl.go), but without this the fast path still
+	// short-circuits with an empty no-op "GRANT"/"REVOKE" completion before the
+	// executor ever sees the statement, so execDatabaseACLChange never ran for a
+	// single-statement autocommit GRANT ON DATABASE. M0119-0004-ACLHEAP (datacl
+	// half).
+	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ") ||
+		strings.Contains(upper, " ON DATABASE ")
 	// A column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON [TABLE] <name> …` —
 	// changes pg_attribute.attacl, which is heap-backed like pg_type.typacl, so it
 	// too must run through the executor (where an *executor.Context re-syncs the heap

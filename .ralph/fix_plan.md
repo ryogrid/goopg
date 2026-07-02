@@ -5503,6 +5503,47 @@ documentation-only and is exempt from the design-doc requirement.)
       heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
       extended-protocol commit-time deferral (M0119-0004-ACLHEAP).
 
+- [x] **DATABASE GRANT (`pg_database.datacl`) round-trip in pg_dump
+      (M0119-0004-ACLHEAP, datacl half, loop #16).** **COMPLETE 2026-07-02:**
+      closes the last object class left open under M0119-0004-ACLHEAP (loop
+      #89's ledger row had marked `datacl` "PERMANENTLY DEFERRED" — its ACL
+      section is only emitted by pg_dump under `-C`/`--create`, and no test
+      harness had ever exercised `--create`). Landed the typacl/srvacl/
+      fdwacl-template GRANT/REVOKE parser capture + executor writer
+      (`internal/executor/operators_ddl_database_acl.go`) + `DatabaseACLText`
+      catalog renderer + heap-decode hook, AND built the first `pg_dump
+      --create` test harness (`TestPort_PgDumpDatabaseGrantACL`), which
+      exposed that goopg's SQL-visible `pg_database` virtual catalog was
+      missing 8 columns pg_dump's `--create` query needs (`datcollate`/
+      `datctype`/`datlocprovider`/`datlocale`/`daticurules`/`datcollversion`/
+      `dattablespace`/`datacl`) and that two catalogs it queries directly
+      (`pg_shseclabel`, `pg_db_role_setting`) were never registered — both now
+      correctly-empty virtual tables. Added `shobj_description` builtin. A
+      mid-loop regression (changing the displayed `postgres` row's oid to
+      match the ACL-store key broke `TestPort_PgDumpConnectionSetup`'s CREATE
+      SUBSCRIPTION round-trip via `subdbid`) was caught by stash-comparing
+      against the pre-change tree and fixed by decoupling the display-oid
+      from the internal `c.DBOID()`-keyed ACL lookup. Tests:
+      `TestParseGrantDatabaseACL`/`TestParseGrantNonDatabaseLeavesDatabaseACLChangeNil`
+      (`internal/parser`); `TestDatabaseACLText`/`TestDatabaseACLRevokeFromOwner`
+      (`internal/catalog`); `TestPort_PgDumpDatabaseGrantACL`
+      (`internal/testport`, byte-identical vs real pg_dump 18.3 `--create`).
+      Gates: `go build`/`go vet` clean; `internal/catalog`+`internal/parser`+
+      `internal/executor`+`internal/planner`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS (regression-checked);
+      `TestPort_IsolationIntraGrantInplaceDb` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-database-grant-datacl-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bs` added. With typacl/attacl/
+      relacl/nspacl/proacl/srvacl/fdwacl/datacl all landed,
+      M0119-0004-ACLHEAP's object-class coverage is complete. Still open
+      (deferral ledger row appended): `datacl` only round-trips for the single
+      live-connected database (no true multi-database support); `ALTER
+      DATABASE ... SET`/`SECURITY LABEL` remain unimplemented (now
+      correctly-empty catalogs, not missing-relation errors);
+      extended-protocol commit-time deferral (M0119-0004-ACLHEAP) remains
+      open.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

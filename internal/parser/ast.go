@@ -2021,6 +2021,15 @@ type CompatNoopStmt struct {
 	// so the executor (execCompatNoop → execAttrACLChange) can apply it. Nil for a
 	// table-level (whole-relation) GRANT. M0119-0004-ACLHEAP (attacl half).
 	AttrACL *AttrACLChange
+	// DatabaseACLChange is set for a GRANT/REVOKE … ON DATABASE … statement whose
+	// clause was fully parsed (privileges/names/grantees). Unlike DatabaseACL
+	// (bool, above — used purely for the intra-grant-inplace xmax lock-wait
+	// mechanism), this carries enough detail for the executor
+	// (execCompatNoop → execDatabaseACLChange) to update the OID-keyed ACL store
+	// and re-sync the heap-backed pg_database.datacl row. Nil when the clause
+	// could not be parsed (rare malformed input — falls back to the xmax-only
+	// no-op). M0119-0004-ACLHEAP (datacl half).
+	DatabaseACLChange *DatabaseACLChange
 	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
 	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
 	// executor stores them in the catalog's foreign-server registry so pg_dump
@@ -2169,6 +2178,24 @@ type TypeACLChange struct {
 	IsDomain        bool     // ON DOMAIN (vs ON TYPE); both resolve to pg_type
 	Privileges      []string // upper-cased privilege keywords; "ALL" left unexpanded
 	TypeNames       []ObjectName
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+}
+
+// DatabaseACLChange carries the parsed pieces of a GRANT/REVOKE … ON DATABASE …
+// statement so the executor can update the OID-keyed ACL store and re-sync the
+// heap-backed pg_database.datacl row. pg_database is a SHARED (cluster-wide)
+// catalog — a single relfilenode, not duplicated per connected database like
+// pg_type/pg_attribute — so the executor targets it directly with no
+// mirror-to-postgres-DB step. A database's acldefault('d', owner) grants
+// CREATE+TEMPORARY+CONNECT to the owner but only TEMPORARY+CONNECT to PUBLIC
+// (PG withholds CREATE from the PUBLIC default — the one DATABASE-specific
+// asymmetry vs TYPE/FUNCTION's uniform owner==PUBLIC default).
+// M0119-0004-ACLHEAP (datacl half).
+type DatabaseACLChange struct {
+	Revoke          bool     // true for REVOKE, false for GRANT
+	Privileges      []string // upper-cased privilege keywords; "ALL" left unexpanded
+	DatabaseNames   []string
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
 }

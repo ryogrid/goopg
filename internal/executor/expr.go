@@ -7708,6 +7708,51 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "shobj_description":
+		// shobj_description(object_oid, catalog_name) → text
+		// Returns the description for a SHARED (cluster-wide) database object
+		// from pg_shdescription, keyed by (classoid, objoid) rather than
+		// obj_description's per-database pg_description (classoid, objoid,
+		// objsubid). pg_dump's dumpDatabase (--create only) calls
+		// `shobj_description(oid, 'pg_database')` to render `COMMENT ON
+		// DATABASE`. goopg has no COMMENT ON DATABASE/ROLE/TABLESPACE writer
+		// yet, so GetComment always misses and this returns NULL — matching a
+		// freshly bootstrapped cluster with no shared comments recorded.
+		// M0119-0004-ACLHEAP (datacl half).
+		if len(x.Args) >= 2 {
+			oidDatum, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			catArg, err := evalExpr(x.Args[1], row, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			var objOID uint32
+			switch oidDatum.Kind {
+			case KindInt:
+				objOID = uint32(oidDatum.Int)
+			case KindString:
+				n, _ := strconv.ParseUint(oidDatum.StringValue(), 10, 32)
+				objOID = uint32(n)
+			}
+			var classoid uint32
+			switch catArg.StringValue() {
+			case "pg_database":
+				classoid = catalog.PgDatabaseRelationOID // 1262
+			case "pg_authid":
+				classoid = 1260
+			case "pg_tablespace":
+				classoid = 1213
+			}
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok && objOID != 0 && classoid != 0 {
+				if desc, found := im.GetComment(classoid, objOID, 0); found {
+					return NewStringDatum(desc), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
 	case "pg_relation_filenode":
 		// pg_relation_filenode(relation regclass) → oid
 		// Returns the filenode for a relation. For temporary tables returns NULL.
