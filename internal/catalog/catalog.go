@@ -2010,6 +2010,13 @@ type InMemory struct {
 	// format matches dbRoleSettings (ordered "name=value" strings).
 	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
 	roleSettings map[roleSettingKey][]string
+	// roleMembers holds `GRANT <role> TO <role>` role-membership rows
+	// (pg_auth_members). Keyed by (RoleOID, MemberOID) — PG allows only one
+	// membership row per (roleid, member) pair; a re-GRANT updates the
+	// existing row's grantor/admin_option in place rather than duplicating it
+	// (mirrors AddRoleMems' ON CONFLICT DO UPDATE, user.c). GRANT/REVOKE ROLE
+	// membership (M0119-0004-ACLHEAP).
+	roleMembers map[roleMembershipKey]*RoleMembership
 
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
@@ -2787,6 +2794,7 @@ func NewInMemory() *InMemory {
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
+		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
 		toastRenames:           make(map[uint32]string),
@@ -4087,6 +4095,128 @@ func (c *InMemory) AllRoleConfigRows() []RoleConfigRow {
 		return rows[i].DBOid < rows[j].DBOid
 	})
 	return rows
+}
+
+// roleMembershipKey identifies one pg_auth_members row: RoleOID is the role
+// being granted (roleid), MemberOID is the role receiving membership
+// (member). See InMemory.roleMembers' doc comment.
+type roleMembershipKey struct {
+	RoleOID   uint32
+	MemberOID uint32
+}
+
+// RoleMembership is one pg_auth_members row, returned by
+// RoleMembershipEntries in deterministic (RoleOID, MemberOID) order.
+// M0119-0004-ACLHEAP.
+type RoleMembership struct {
+	OID         uint32
+	RoleOID     uint32
+	MemberOID   uint32
+	GrantorOID  uint32
+	AdminOption bool
+}
+
+// GrantRoleMembership upserts a `GRANT <role> TO <member>` row: a fresh OID
+// is minted the first time (RoleOID, MemberOID) is seen; re-granting keeps
+// the existing OID and only updates GrantorOID (to the new grantor) and
+// AdminOption (a plain re-grant never *downgrades* an existing WITH ADMIN
+// OPTION, mirroring AddRoleMems' ON CONFLICT DO UPDATE SET admin_option =
+// (admin_option OR EXCLUDED.admin_option), user.c). Returns the row's OID.
+// M0119-0004-ACLHEAP.
+func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, adminOption bool) uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}
+	if existing, ok := c.roleMembers[key]; ok {
+		existing.GrantorOID = grantorOid
+		if adminOption {
+			existing.AdminOption = true
+		}
+		return existing.OID
+	}
+	oid := c.allocOIDLocked()
+	c.roleMembers[key] = &RoleMembership{
+		OID: oid, RoleOID: roleOid, MemberOID: memberOid,
+		GrantorOID: grantorOid, AdminOption: adminOption,
+	}
+	return oid
+}
+
+// RevokeRoleMembership removes or downgrades a `REVOKE <role> FROM <member>`
+// row. When adminOptionOnly is true (REVOKE ADMIN OPTION FOR ...) only the
+// admin_option flag is cleared and the membership row survives, matching
+// PG's DelRoleMems(admin_opt_only=true). Otherwise the row is deleted
+// entirely. Reports whether a row existed (REVOKE of a non-existent
+// membership is a silent no-op, matching this codebase's other ACL
+// REVOKE paths). M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, adminOptionOnly bool) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}
+	existing, ok := c.roleMembers[key]
+	if !ok {
+		return false
+	}
+	if adminOptionOnly {
+		existing.AdminOption = false
+		return true
+	}
+	delete(c.roleMembers, key)
+	return true
+}
+
+// RoleMembershipEntries returns every recorded pg_auth_members row, sorted
+// by (RoleOID, MemberOID) for deterministic virtual-row output.
+// M0119-0004-ACLHEAP.
+func (c *InMemory) RoleMembershipEntries() []RoleMembership {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.roleMembers) == 0 {
+		return nil
+	}
+	out := make([]RoleMembership, 0, len(c.roleMembers))
+	for _, m := range c.roleMembers {
+		out = append(out, *m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RoleOID != out[j].RoleOID {
+			return out[i].RoleOID < out[j].RoleOID
+		}
+		return out[i].MemberOID < out[j].MemberOID
+	})
+	return out
+}
+
+// RoleIsMemberOf reports whether memberOid is, directly or transitively, a
+// member of roleOid via the recorded pg_auth_members rows (a self-check,
+// memberOid == roleOid, always reports true). Mirrors
+// is_member_of_role_nosuper's traversal (user.c) — ignoring superuser
+// bypass, which does not apply to membership-loop detection. GRANT ROLE
+// uses this to reject a membership that would create a cycle (`role "x" is
+// a member of role "y"`, ERRCODE_INVALID_GRANT_OPERATION). M0119-0004-ACLHEAP.
+func (c *InMemory) RoleIsMemberOf(memberOid, roleOid uint32) bool {
+	if memberOid == roleOid {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key := range c.roleMembers {
+			if key.MemberOID != cur || seen[key.RoleOID] {
+				continue
+			}
+			if key.RoleOID == roleOid {
+				return true
+			}
+			seen[key.RoleOID] = true
+			queue = append(queue, key.RoleOID)
+		}
+	}
+	return false
 }
 
 // RegisterIndexDuringRecovery is the idempotent version of
@@ -5419,12 +5549,14 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_authid"] = pgAuthid
 
-	// pg_auth_members — role membership (`GRANT <role> TO <role>`).
-	// Correctly-empty: goopg's parser/executor has no `GRANT role TO role`
-	// support at all yet (a distinct capability from privilege GRANT — see
-	// deferral ledger), so no membership row can ever exist today. Registered
-	// so pg_dumpall's dumpRoleMembership query resolves instead of failing
-	// with "relation does not exist" (M0119-0004-ACLHEAP follow-up).
+	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
+	// from the roleMembers registry GRANT/REVOKE ROLE maintains
+	// (RoleMembershipEntries). inherit_option/set_option are not modelled
+	// (goopg has no per-grant INHERIT/SET clause parsing) and always report
+	// PG's default (t/f) regardless of what a real GRANT ... WITH clause
+	// requested. Registered so pg_dumpall's dumpRoleMembership query
+	// resolves instead of failing with "relation does not exist"
+	// (M0119-0004-ACLHEAP follow-up).
 	pgAuthMembers := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_auth_members",
@@ -5440,7 +5572,29 @@ func (c *InMemory) registerSystemTables() {
 		OID:     1261, // upstream's AuthMemRelationId
 		Virtual: true,
 	}
-	pgAuthMembers.VirtualRows = func() [][]string { return nil }
+	pgAuthMembers.VirtualRows = func() [][]string {
+		entries := c.RoleMembershipEntries()
+		if len(entries) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(entries))
+		for _, m := range entries {
+			adminOption := "f"
+			if m.AdminOption {
+				adminOption = "t"
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),
+				strconv.FormatUint(uint64(m.RoleOID), 10),
+				strconv.FormatUint(uint64(m.MemberOID), 10),
+				strconv.FormatUint(uint64(m.GrantorOID), 10),
+				adminOption,
+				"t", // inherit_option: PG default (INHERIT), not modelled per-grant
+				"f", // set_option: PG default (NOSET pre-PG16 semantics), not modelled
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_auth_members"] = pgAuthMembers
 
 	// pg_parameter_acl — GUC-level ACLs (`GRANT SET ON PARAMETER ...`).
@@ -10386,12 +10540,25 @@ func (c *InMemory) AllRoleStates() []RoleStateSnapshot {
 }
 
 // UnregisterRole removes a role from the registry. Called from DROP ROLE.
+// Also drops any pg_auth_members rows referencing the role's OID on either
+// side (roleid or member) — PG cascades membership removal automatically
+// when a role is dropped (DropRole, user.c), unlike an ordinary DROP
+// RESTRICT. M0119-0004-ACLHEAP.
 func (c *InMemory) UnregisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := strings.ToLower(name)
+	oid, hadOID := c.roles[key]
 	delete(c.roles, key)
 	delete(c.roleAttrs, key)
+	if !hadOID {
+		return
+	}
+	for mk := range c.roleMembers {
+		if mk.RoleOID == oid || mk.MemberOID == oid {
+			delete(c.roleMembers, mk)
+		}
+	}
 }
 
 // RenameRole re-keys a registered role's registry entry (the roles map and

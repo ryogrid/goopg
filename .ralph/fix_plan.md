@@ -5683,6 +5683,53 @@ documentation-only and is exempt from the design-doc requirement.)
       M0119-0004-ACLHEAP items (extended-protocol gap, multi-database
       scope, `SET TIME ZONE`/etc.) unchanged.
 
+- [x] **`GRANT`/`REVOKE` role membership (`pg_auth_members`) round-trip in
+      pg_dumpall (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:**
+      closes the prior row's own "`GRANT <role> TO <role>` role membership —
+      new parser grammar + `pg_auth_members` real storage" residual. Parser's
+      shared GRANT/REVOKE token loop now tracks `sawOn bool` (role membership
+      has no `ON <object>` clause, the discriminator vs. every other
+      variant); `buildRoleMembershipChange` captures
+      `CompatNoopStmt.RoleMembership`. Server's virtual-ACL fast path
+      (`query.go`) now excludes any GRANT/REVOKE with no `" ON "` substring
+      so it reaches the executor. New `execRoleMembershipChange`
+      (`internal/executor/operators_ddl_role_membership.go`) resolves
+      role/grantee names via `RoleOID` (unresolvable name incl. PUBLIC →
+      42704, matching real PG), rejects a membership cycle incl. self-grant
+      via new `catalog.InMemory.RoleIsMemberOf` (0LP01), and drives new
+      `GrantRoleMembership`/`RevokeRoleMembership` on a
+      `roleMembers map[roleMembershipKey]*RoleMembership` registry (mirrors
+      `roleSettings`'s shape; re-grant upserts in place, admin_option never
+      downgrades). `pg_auth_members.VirtualRows` now projects the live
+      registry; `UnregisterRole` cascades membership-row removal. Two new
+      WAL kinds (79/80) + `internal/initdb/role_membership_recovery.go`
+      replay AFTER role DDL replay (not alongside `roleSettings`'s replay)
+      since `GrantRoleMembership` mints a fresh OID at replay time and an
+      earlier position risked colliding with a role OID loaded afterward.
+      Tests: `internal/parser/op_grant_rolemembership_test.go`;
+      `internal/catalog/role_membership_test.go`;
+      `internal/wal/role_membership_ddl_test.go`;
+      `internal/initdb/role_membership_recovery_test.go`;
+      `internal/testport/pgdumpall_role_membership_test.go`
+      `TestPort_PgDumpallRoleMembership` (byte-identical vs real pg_dumpall
+      18.3, incl. the `WITH ADMIN OPTION, INHERIT TRUE, SET FALSE GRANTED BY
+      postgres` clause and a revoked membership's correct absence). Gates:
+      `go build ./...`/`go vet` clean; `internal/parser`+`internal/catalog`+
+      `internal/wal`+`internal/initdb`+`internal/executor`+`internal/server`
+      suites PASS; `TestPort_PgDumpallRoleMembership`/
+      `TestPort_PgDumpallGlobalsOnly`/`TestPort_PgDumpRoleConfigSet`/
+      `TestPort_PgDumpDatabaseConfigSet` PASS; `scripts/tpch-spotcheck.sh`
+      PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-grant-role-membership.md`;
+      `docs/design/README.md` row `0119-0004bw` added; deferral ledger row
+      appended. Still open: `WITH INHERIT`/`WITH SET` clauses unparsed
+      (always report PG defaults); grantor-chain (member-grantor loop)
+      circularity check unimplemented (only role-member-loop is checked);
+      `GRANT ... ON PARAMETER` unimplemented; `roleSettings`/
+      `dbRoleSettings` not purged on DROP ROLE (pre-existing sibling gap,
+      unrelated to this slice); standing M0119-0004-ACLHEAP items
+      (extended-protocol gap, multi-database scope) unchanged.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

@@ -913,6 +913,27 @@ const (
 	//   kind(1) | roleOid(4) | dbOid(4)
 	RecordKindAlterRoleResetAllConfig byte = 78
 
+	// RecordKindGrantRoleMembership records a `GRANT <role> TO <member>
+	// [WITH ADMIN OPTION]` event so the pg_auth_members row survives a
+	// restart (M0119-0004-ACLHEAP, GRANT/REVOKE ROLE membership). goopg has
+	// no per-role file namespace, so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/role_membership_recovery.go scans
+	// the WAL for these records after physical replay and re-applies them to
+	// catalog.InMemory's roleMembers registry via GrantRoleMembership (which
+	// mints a fresh OID at replay time — pg_auth_members.oid is not dumped
+	// by pg_dump/pg_dumpall, so OID stability across a restart is not
+	// required).
+	// Format:
+	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | adminOption(1)
+	RecordKindGrantRoleMembership byte = 79
+
+	// RecordKindRevokeRoleMembership records a `REVOKE [ADMIN OPTION FOR]
+	// <role> FROM <member>` event. Same no-op physical redo path as
+	// RecordKindGrantRoleMembership.
+	// Format:
+	//   kind(1) | roleOid(4) | memberOid(4) | adminOptionOnly(1)
+	RecordKindRevokeRoleMembership byte = 80
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1525,6 +1546,64 @@ func DecodeAlterRoleResetAllConfig(payload []byte) (roleOid, dbOid uint32, err e
 		return 0, 0, fmt.Errorf("wal: record kind %d is not alter-role-reset-all-config", payload[0])
 	}
 	return binary.LittleEndian.Uint32(payload[1:5]), binary.LittleEndian.Uint32(payload[5:9]), nil
+}
+
+// EncodeGrantRoleMembership encodes a `GRANT <role> TO <member> [WITH ADMIN
+// OPTION]` event.
+// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | adminOption(1).
+func EncodeGrantRoleMembership(roleOid, memberOid, grantorOid uint32, adminOption bool) []byte {
+	out := make([]byte, 14)
+	out[0] = RecordKindGrantRoleMembership
+	binary.LittleEndian.PutUint32(out[1:5], roleOid)
+	binary.LittleEndian.PutUint32(out[5:9], memberOid)
+	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
+	if adminOption {
+		out[13] = 1
+	}
+	return out
+}
+
+// DecodeGrantRoleMembership decodes a RecordKindGrantRoleMembership payload.
+func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, adminOption bool, err error) {
+	if len(payload) < 14 {
+		return 0, 0, 0, false, fmt.Errorf("wal: grant-role-membership payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindGrantRoleMembership {
+		return 0, 0, 0, false, fmt.Errorf("wal: record kind %d is not grant-role-membership", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	memberOid = binary.LittleEndian.Uint32(payload[5:9])
+	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
+	adminOption = payload[13] != 0
+	return roleOid, memberOid, grantorOid, adminOption, nil
+}
+
+// EncodeRevokeRoleMembership encodes a `REVOKE [ADMIN OPTION FOR] <role>
+// FROM <member>` event.
+// Format: kind(1) | roleOid(4) | memberOid(4) | adminOptionOnly(1).
+func EncodeRevokeRoleMembership(roleOid, memberOid uint32, adminOptionOnly bool) []byte {
+	out := make([]byte, 10)
+	out[0] = RecordKindRevokeRoleMembership
+	binary.LittleEndian.PutUint32(out[1:5], roleOid)
+	binary.LittleEndian.PutUint32(out[5:9], memberOid)
+	if adminOptionOnly {
+		out[9] = 1
+	}
+	return out
+}
+
+// DecodeRevokeRoleMembership decodes a RecordKindRevokeRoleMembership payload.
+func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid uint32, adminOptionOnly bool, err error) {
+	if len(payload) < 10 {
+		return 0, 0, false, fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRevokeRoleMembership {
+		return 0, 0, false, fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	memberOid = binary.LittleEndian.Uint32(payload[5:9])
+	adminOptionOnly = payload[9] != 0
+	return roleOid, memberOid, adminOptionOnly, nil
 }
 
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a

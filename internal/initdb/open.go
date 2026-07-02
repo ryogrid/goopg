@@ -1172,6 +1172,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: role DDL replay: %w", err)
 	}
 
+	// M0119-0004-ACLHEAP (GRANT/REVOKE ROLE membership): replay GRANT/REVOKE
+	// ROLE WAL records into pg_auth_members. Must run AFTER
+	// LoadRolesFromAuthidHeap/replayRoleDDLRecords immediately above: those
+	// calls load role OIDs preserved from before the crash (RegisterRoleWithOID)
+	// and can advance the catalog's nextOID counter well past its
+	// pre-replay value, so running this pass first (which mints a FRESH OID
+	// per membership row via GrantRoleMembership -> AllocOID, since
+	// pg_auth_members.oid is not dumped by pg_dump/pg_dumpall and so has no
+	// stability requirement of its own) risks a numeric OID collision with a
+	// role OID loaded afterward.
+	if err := replayRoleMembershipRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: role membership replay: %w", err)
+	}
+
 	// M0106-0013: stamp the clog from WAL commit/abort records and advance
 	// txnMgr.NextXID past any XIDs recorded in WAL but not yet in the
 	// SLRU/flat-file (the narrow window between WAL fsync and clog writes).

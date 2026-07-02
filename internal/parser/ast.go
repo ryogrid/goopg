@@ -2030,6 +2030,13 @@ type CompatNoopStmt struct {
 	// could not be parsed (rare malformed input — falls back to the xmax-only
 	// no-op). M0119-0004-ACLHEAP (datacl half).
 	DatabaseACLChange *DatabaseACLChange
+	// RoleMembership is set for a `GRANT <role> TO <role>`/`REVOKE ... FROM
+	// <role>` role-membership statement (pg_auth_members). Unlike every other
+	// GRANT/REVOKE variant above, role membership has no `ON <object>` clause
+	// at all — that absence is the parser's discriminator for routing here
+	// instead of building DatabaseACL/TableACL/TypeACL/AttrACL. Nil for every
+	// object-privilege GRANT/REVOKE. M0119-0004-ACLHEAP.
+	RoleMembership *RoleMembershipChange
 	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
 	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
 	// executor stores them in the catalog's foreign-server registry so pg_dump
@@ -2198,6 +2205,23 @@ type DatabaseACLChange struct {
 	DatabaseNames   []string
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+}
+
+// RoleMembershipChange carries the parsed pieces of a `GRANT <role>[, ...]
+// TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
+// [ADMIN OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED BY <role>]
+// [CASCADE|RESTRICT]` statement, so the executor can update the
+// (roleOID, memberOID)-keyed pg_auth_members registry. M0119-0004-ACLHEAP.
+type RoleMembershipChange struct {
+	Revoke bool // true for REVOKE, false for GRANT
+	// AdminOptionOnly is REVOKE's `ADMIN OPTION FOR` prefix: only the
+	// admin_option flag is cleared, the membership row itself survives.
+	AdminOptionOnly bool
+	// WithAdminOption is GRANT's trailing `WITH ADMIN OPTION`.
+	WithAdminOption bool
+	Roles           []string // the role(s) being granted/revoked
+	Grantees        []string // the member role(s) receiving/losing membership
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
 
 // ColumnPrivilege pairs a single column-grantable privilege keyword with the

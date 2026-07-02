@@ -113,6 +113,17 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			isHeapACLObject = true
 		}
 	}
+	// GRANT/REVOKE role membership (`GRANT <role> TO <role>`) has no `ON
+	// <object>` clause at all — the discriminator vs. every privilege-GRANT
+	// variant above, which all require one. It changes pg_auth_members, which
+	// the server's virtual-ACL fast path below does not model
+	// (tryRecordTableGrant/tryRecordTableRevoke, grant_ddl.go, both bail
+	// immediately on a missing " on "), so it must run through the executor
+	// (execCompatNoop → execRoleMembershipChange) where the parser's
+	// RoleMembershipChange is available. M0119-0004-ACLHEAP.
+	if !strings.Contains(upper, " ON ") {
+		isHeapACLObject = true
+	}
 
 	// A single-statement, autocommit table-level GRANT is recorded in the
 	// catalog ACL store so SET ROLE + a privileged command (e.g. TRUNCATE) is

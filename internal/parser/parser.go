@@ -383,6 +383,76 @@ func buildDatabaseACLChange(revoke bool, toks []Token) *DatabaseACLChange {
 	return dac
 }
 
+// buildRoleMembershipChange parses the token run of a `GRANT <role>[, ...]
+// TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
+// [ADMIN OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED BY <role>]
+// [CASCADE|RESTRICT]` statement into a RoleMembershipChange. toks is every
+// token after the GRANT/REVOKE keyword with the trailing ';' excluded. The
+// caller only reaches this builder when no "on" token appeared anywhere in
+// the statement — every privilege-GRANT variant requires one, so its absence
+// is the discriminator. Returns nil when either role list is empty (an
+// unparseable form the caller leaves as a successful no-op).
+// M0119-0004-ACLHEAP.
+func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange {
+	start := 0
+	adminOptionOnly := false
+	if revoke && len(toks) >= 3 &&
+		strings.EqualFold(toks[0].Value, "admin") &&
+		strings.EqualFold(toks[1].Value, "option") &&
+		strings.EqualFold(toks[2].Value, "for") {
+		adminOptionOnly = true
+		start = 3
+	}
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, start, sep)
+	if sepIdx < 0 || sepIdx <= start {
+		return nil
+	}
+	granteeStart := sepIdx + 1
+	granteeEnd := len(toks)
+	withAdminOption := false
+	grantedBy := ""
+	for i := granteeStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			// WITH ADMIN OPTION — record the flag and end the grantee list.
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "admin") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withAdminOption = true
+			}
+			granteeEnd = i
+		case "granted":
+			// GRANTED BY <role> — record the explicit grantor and end the
+			// grantee list.
+			if i+2 < len(toks) && strings.EqualFold(toks[i+1].Value, "by") {
+				grantedBy = strings.Trim(toks[i+2].Value, `"`)
+			}
+			granteeEnd = i
+		case "cascade", "restrict":
+			granteeEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	rmc := &RoleMembershipChange{
+		Revoke:          revoke,
+		AdminOptionOnly: adminOptionOnly,
+		WithAdminOption: withAdminOption,
+		Roles:           splitTokRoles(toks[start:sepIdx]),
+		Grantees:        splitTokRoles(toks[granteeStart:granteeEnd]),
+		GrantedBy:       grantedBy,
+	}
+	if len(rmc.Roles) == 0 || len(rmc.Grantees) == 0 {
+		return nil
+	}
+	return rmc
+}
+
 // grantHasColumnList reports whether the GRANT/REVOKE token run carries a
 // parenthesised column list BEFORE the ON keyword — the signature of a
 // column-level grant (`GRANT SELECT (a, b) ON TABLE t …`). A function grant's
@@ -850,12 +920,18 @@ identLedStatement:
 			// full clause is captured (toks) and parsed into CompatNoopStmt.TypeACL
 			// for the executor to apply (M0119-0004-ACLHEAP).
 			typeClass := ""
+			// sawOn is true the moment ANY "on" token appears anywhere in the
+			// statement -- the discriminator between every privilege-GRANT variant
+			// above (which all require an ON <object> clause) and role membership
+			// (GRANT <role> TO <role>, which never has one). M0119-0004-ACLHEAP.
+			sawOn := false
 			var toks []Token
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
 				if strings.EqualFold(p.cur().Value, "on") {
+					sawOn = true
 					next := p.peek(1)
 					switch {
 					case strings.EqualFold(next.Value, "database"):
@@ -900,6 +976,14 @@ identLedStatement:
 					ns.AttrACL = aac
 					ns.TableACL = ""
 				}
+			} else if !sawOn {
+				// No `ON <object>` clause anywhere in the statement — the
+				// role-membership form (`GRANT <role> TO <role>`/`REVOKE ...
+				// FROM <role>`), a distinct capability from every
+				// object-privilege GRANT/REVOKE above. Unparseable input (e.g.
+				// PG's `GRANT <role> TO PUBLIC`, always rejected by PG itself)
+				// falls back to the pre-existing no-op. M0119-0004-ACLHEAP.
+				ns.RoleMembership = buildRoleMembershipChange(strings.EqualFold(t.Value, "revoke"), toks)
 			}
 			return ns, nil
 		case "comment":

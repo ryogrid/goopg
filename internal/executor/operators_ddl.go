@@ -14119,6 +14119,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return err
 		}
 	}
+	// A `GRANT <role> TO <role>`/`REVOKE ... FROM <role>` role-membership
+	// statement changes pg_auth_members, which is virtual and sourced
+	// entirely from the roleMembers registry (no heap row to re-sync). The
+	// server excludes this form (no `ON <object>` clause) from its own
+	// virtual-ACL fast path (query.go) so it reaches the executor here.
+	// M0119-0004-ACLHEAP.
+	if s.RoleMembership != nil {
+		if err := o.execRoleMembershipChange(s.RoleMembership); err != nil {
+			return err
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}
