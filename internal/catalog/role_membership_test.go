@@ -5,12 +5,12 @@ import "testing"
 func boolPtr(b bool) *bool { return &b }
 
 // TestGrantRoleMembershipUpsertsInPlace verifies GrantRoleMembership mints a
-// fresh OID for a new (roleOid, memberOid) pair and re-grants keep the same
-// OID while updating grantor and admin_option: an unspecified (nil) WITH
-// ADMIN clause never touches an existing row's admin_option (a plain
-// re-grant never downgrades or upgrades it), but an explicit WITH ADMIN
-// FALSE/TRUE always applies, matching PG's GRANT_ROLE_SPECIFIED_ADMIN
-// bitmask semantics. M0119-0004-ACLHEAP.
+// fresh OID for a new (roleOid, memberOid, grantorOid) triple and a re-grant
+// BY THE SAME GRANTOR keeps the same OID while updating admin_option: an
+// unspecified (nil) WITH ADMIN clause never touches an existing row's
+// admin_option (a plain re-grant never downgrades or upgrades it), but an
+// explicit WITH ADMIN FALSE/TRUE always applies, matching PG's
+// GRANT_ROLE_SPECIFIED_ADMIN bitmask semantics. M0119-0004-ACLHEAP.
 func TestGrantRoleMembershipUpsertsInPlace(t *testing.T) {
 	c := NewInMemory()
 	oid1 := c.GrantRoleMembership(100, 200, 10, nil, nil, nil)
@@ -22,9 +22,9 @@ func TestGrantRoleMembershipUpsertsInPlace(t *testing.T) {
 		t.Fatalf("unexpected entries after first grant: %+v", entries)
 	}
 
-	// Re-grant with a different grantor and WITH ADMIN OPTION: OID stays the
-	// same, grantor updates, admin_option upgrades to true.
-	oid2 := c.GrantRoleMembership(100, 200, 20, boolPtr(true), nil, nil)
+	// Re-grant BY THE SAME GRANTOR (10) WITH ADMIN OPTION: OID stays the
+	// same, admin_option upgrades to true.
+	oid2 := c.GrantRoleMembership(100, 200, 10, boolPtr(true), nil, nil)
 	if oid2 != oid1 {
 		t.Errorf("re-grant minted a new OID: %d != %d", oid2, oid1)
 	}
@@ -32,28 +32,47 @@ func TestGrantRoleMembershipUpsertsInPlace(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 entry, got %d", len(entries))
 	}
-	if entries[0].GrantorOID != 20 || !entries[0].AdminOption {
-		t.Errorf("re-grant did not update grantor/admin_option: %+v", entries[0])
+	if entries[0].GrantorOID != 10 || !entries[0].AdminOption {
+		t.Errorf("re-grant did not update admin_option: %+v", entries[0])
 	}
 
-	// A further plain re-grant (no WITH clause at all — nil admin) must NOT
-	// downgrade admin_option back to false.
-	c.GrantRoleMembership(100, 200, 30, nil, nil, nil)
+	// A further plain re-grant BY THE SAME GRANTOR (no WITH clause at all —
+	// nil admin) must NOT downgrade admin_option back to false.
+	c.GrantRoleMembership(100, 200, 10, nil, nil, nil)
 	entries = c.RoleMembershipEntries()
-	if !entries[0].AdminOption {
-		t.Errorf("plain re-grant downgraded admin_option: %+v", entries[0])
-	}
-	if entries[0].GrantorOID != 30 {
-		t.Errorf("plain re-grant did not update grantor: %+v", entries[0])
+	if len(entries) != 1 || !entries[0].AdminOption {
+		t.Errorf("plain re-grant downgraded admin_option: %+v", entries)
 	}
 
 	// An explicit WITH ADMIN FALSE, unlike an unspecified clause, DOES
 	// downgrade — PG allows an explicit request to override the current
 	// value in either direction (GrantRole, user.c).
-	c.GrantRoleMembership(100, 200, 30, boolPtr(false), nil, nil)
+	c.GrantRoleMembership(100, 200, 10, boolPtr(false), nil, nil)
 	entries = c.RoleMembershipEntries()
-	if entries[0].AdminOption {
-		t.Errorf("explicit WITH ADMIN FALSE did not downgrade admin_option: %+v", entries[0])
+	if len(entries) != 1 || entries[0].AdminOption {
+		t.Errorf("explicit WITH ADMIN FALSE did not downgrade admin_option: %+v", entries)
+	}
+
+	// A DIFFERENT grantor granting the SAME (role, member) pair mints an
+	// independent second row — real PG's (roleid, member, grantor) unique
+	// index (pg_auth_members_role_member_index) allows exactly this.
+	oid3 := c.GrantRoleMembership(100, 200, 20, boolPtr(true), nil, nil)
+	if oid3 == oid1 {
+		t.Errorf("a different grantor must mint a new OID, not reuse %d", oid1)
+	}
+	entries = c.RoleMembershipEntries()
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 independent grantor rows, got %d: %+v", len(entries), entries)
+	}
+	byGrantor := map[uint32]RoleMembership{}
+	for _, e := range entries {
+		byGrantor[e.GrantorOID] = e
+	}
+	if byGrantor[10].AdminOption {
+		t.Errorf("grantor 10's row must be untouched by grantor 20's grant: %+v", byGrantor[10])
+	}
+	if !byGrantor[20].AdminOption {
+		t.Errorf("grantor 20's new row must carry its own WITH ADMIN OPTION: %+v", byGrantor[20])
 	}
 }
 
@@ -88,15 +107,17 @@ func TestGrantRoleMembershipInheritSetDefaults(t *testing.T) {
 		t.Errorf("explicit WITH INHERIT FALSE, SET FALSE not applied: %+v", row)
 	}
 
-	// A later re-grant with an unspecified INHERIT/SET leaves them untouched.
-	c.GrantRoleMembership(300, 400, 20, nil, nil, nil)
-	for _, e := range c.RoleMembershipEntries() {
+	// A later re-grant BY THE SAME GRANTOR with an unspecified INHERIT/SET
+	// leaves them untouched (and stays the same row, not a new grantor row).
+	c.GrantRoleMembership(300, 400, 10, nil, nil, nil)
+	entries = c.RoleMembershipEntries()
+	if len(entries) != 2 {
+		t.Fatalf("same-grantor re-grant must not mint a new row, got %d entries: %+v", len(entries), entries)
+	}
+	for _, e := range entries {
 		if e.RoleOID == 300 && e.MemberOID == 400 {
 			if e.InheritOption || e.SetOption {
 				t.Errorf("unspecified re-grant touched inherit/set: %+v", e)
-			}
-			if e.GrantorOID != 20 {
-				t.Errorf("re-grant did not update grantor: %+v", e)
 			}
 		}
 	}
@@ -109,7 +130,7 @@ func TestRevokeRoleMembership(t *testing.T) {
 	c := NewInMemory()
 	c.GrantRoleMembership(100, 200, 10, boolPtr(true), nil, nil)
 
-	if !c.RevokeRoleMembership(100, 200, "admin") {
+	if !c.RevokeRoleMembership(100, 200, 10, "admin") {
 		t.Fatalf("RevokeRoleMembership(admin) reported no existing row")
 	}
 	entries := c.RoleMembershipEntries()
@@ -120,10 +141,10 @@ func TestRevokeRoleMembership(t *testing.T) {
 		t.Fatalf("admin-option-only revoke must not touch inherit/set: %+v", entries)
 	}
 
-	if !c.RevokeRoleMembership(100, 200, "inherit") {
+	if !c.RevokeRoleMembership(100, 200, 10, "inherit") {
 		t.Fatalf("RevokeRoleMembership(inherit) reported no existing row")
 	}
-	if !c.RevokeRoleMembership(100, 200, "set") {
+	if !c.RevokeRoleMembership(100, 200, 10, "set") {
 		t.Fatalf("RevokeRoleMembership(set) reported no existing row")
 	}
 	entries = c.RoleMembershipEntries()
@@ -131,7 +152,7 @@ func TestRevokeRoleMembership(t *testing.T) {
 		t.Fatalf("inherit/set-option-only revokes should keep the row with both flags false: %+v", entries)
 	}
 
-	if !c.RevokeRoleMembership(100, 200, "") {
+	if !c.RevokeRoleMembership(100, 200, 10, "") {
 		t.Fatalf("full RevokeRoleMembership reported no existing row")
 	}
 	if entries := c.RoleMembershipEntries(); len(entries) != 0 {
@@ -140,8 +161,32 @@ func TestRevokeRoleMembership(t *testing.T) {
 
 	// Revoking a non-existent membership is a silent no-op (matches this
 	// codebase's other ACL REVOKE paths).
-	if c.RevokeRoleMembership(999, 999, "") {
+	if c.RevokeRoleMembership(999, 999, 999, "") {
 		t.Errorf("RevokeRoleMembership on a non-existent row reported success")
+	}
+}
+
+// TestRevokeRoleMembershipTargetsOnlyItsOwnGrantorRow verifies that REVOKE
+// only ever touches the ONE (roleOid, memberOid, grantorOid) row it names —
+// an independent row granted by a DIFFERENT grantor on the same (role,
+// member) pair survives untouched, matching real PG's (roleid, member,
+// grantor) unique index (a REVOKE naming the wrong grantor is a no-op, same
+// as revoking a membership that was never granted at all).
+func TestRevokeRoleMembershipTargetsOnlyItsOwnGrantorRow(t *testing.T) {
+	c := NewInMemory()
+	c.GrantRoleMembership(100, 200, 10, nil, nil, nil)
+	c.GrantRoleMembership(100, 200, 20, nil, nil, nil)
+
+	if !c.RevokeRoleMembership(100, 200, 10, "") {
+		t.Fatalf("revoking grantor 10's row reported no existing row")
+	}
+	entries := c.RoleMembershipEntries()
+	if len(entries) != 1 || entries[0].GrantorOID != 20 {
+		t.Fatalf("grantor 20's independent row must survive: %+v", entries)
+	}
+
+	if c.RevokeRoleMembership(100, 200, 10, "") {
+		t.Errorf("re-revoking the already-removed grantor-10 row must be a no-op")
 	}
 }
 
@@ -269,7 +314,7 @@ func TestRevokeRoleMembershipCascadeSetNoAdminOptionNeverCascades(t *testing.T) 
 	// without admin, but exercises the walk) roleX to 800.
 	c.GrantRoleMembership(roleX, 800, 700, nil, nil, nil)
 
-	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, false)
+	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, 10, false)
 	if deps != nil || blocked {
 		t.Errorf("revoking a non-admin row must never cascade or block: deps=%v blocked=%v", deps, blocked)
 	}
@@ -284,7 +329,7 @@ func TestRevokeRoleMembershipCascadeSetBlocksWithoutCascade(t *testing.T) {
 	c.GrantRoleMembership(roleX, 700, 10, boolPtr(true), nil, nil) // 700 has ADMIN on X
 	c.GrantRoleMembership(roleX, 800, 700, nil, nil, nil)          // 700 granted X to 800
 
-	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, false)
+	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, 10, false)
 	if !blocked {
 		t.Errorf("RESTRICT with a dependent grant must report blocked=true")
 	}
@@ -305,7 +350,7 @@ func TestRevokeRoleMembershipCascadeSetWalksTransitiveChain(t *testing.T) {
 	c.GrantRoleMembership(roleX, 900, 800, nil, nil, nil)           // 900: no admin, granted by 800 -> chain stops past here
 	c.GrantRoleMembership(roleX, 950, 10, boolPtr(true), nil, nil)  // unrelated sibling, granted by 10 directly
 
-	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, true)
+	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, 10, true)
 	if blocked {
 		t.Fatalf("CASCADE must never report blocked")
 	}
@@ -314,10 +359,10 @@ func TestRevokeRoleMembershipCascadeSetWalksTransitiveChain(t *testing.T) {
 		t.Fatalf("deps = %v, want members %v", deps, want)
 	}
 	for _, d := range deps {
-		if !want[d] {
-			t.Errorf("unexpected dependent member %d in cascade set: %v", d, deps)
+		if !want[d.MemberOID] {
+			t.Errorf("unexpected dependent member %d in cascade set: %v", d.MemberOID, deps)
 		}
-		delete(want, d)
+		delete(want, d.MemberOID)
 	}
 	if len(want) != 0 {
 		t.Errorf("cascade set missing expected members: %v", want)

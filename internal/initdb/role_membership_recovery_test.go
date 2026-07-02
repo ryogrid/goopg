@@ -58,6 +58,58 @@ func TestRoleMembershipRecoveryReplaysGrant(t *testing.T) {
 	}
 }
 
+// TestRoleMembershipRecoveryReplaysMultiGrantorRows confirms two independent
+// grantors granting the same (role, member) pair both survive a restart as
+// separate rows, and a REVOKE naming one grantor only removes that grantor's
+// row — real PG's (roleid, member, grantor) unique index
+// (pg_auth_members_role_member_index). M0119-0004-ACLHEAP follow-up.
+func TestRoleMembershipRecoveryReplaysMultiGrantorRows(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const roleOid, memberOid = 16385, 16386
+	const grantorA, grantorB = 10, 20
+	appends := [][]byte{
+		wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorA, nil, nil, nil),
+		wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorB, nil, nil, nil),
+		wal.EncodeRevokeRoleMembership(roleOid, memberOid, grantorA, ""),
+	}
+	for _, payload := range appends {
+		if _, _, werr := rt1.WAL.Append(payload); werr != nil {
+			_ = rt1.Close()
+			t.Fatalf("WAL.Append: %v", werr)
+		}
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	got := cat.RoleMembershipEntries()
+	if len(got) != 1 {
+		t.Fatalf("after grantA+grantB+revokeA replay, entries = %+v, want 1 (grantor B's row)", got)
+	}
+	if got[0].GrantorOID != grantorB {
+		t.Errorf("surviving entry = %+v, want grantor=%d", got[0], grantorB)
+	}
+}
+
 // TestRoleMembershipRecoveryReplaysGrantThenRevoke confirms a REVOKE record
 // following a GRANT removes the row, and a subsequent REVOKE ADMIN OPTION
 // FOR-only record (revokeOption="admin") merely clears the flag rather than
@@ -78,8 +130,8 @@ func TestRoleMembershipRecoveryReplaysGrantThenRevoke(t *testing.T) {
 	appends := [][]byte{
 		wal.EncodeGrantRoleMembership(roleOid1, memberOid1, 10, &adminFalse, nil, nil),
 		wal.EncodeGrantRoleMembership(roleOid2, memberOid2, 10, &adminTrue, nil, nil),
-		wal.EncodeRevokeRoleMembership(roleOid1, memberOid1, ""),
-		wal.EncodeRevokeRoleMembership(roleOid2, memberOid2, "admin"),
+		wal.EncodeRevokeRoleMembership(roleOid1, memberOid1, 10, ""),
+		wal.EncodeRevokeRoleMembership(roleOid2, memberOid2, 10, "admin"),
 	}
 	for _, payload := range appends {
 		if _, _, werr := rt1.WAL.Append(payload); werr != nil {

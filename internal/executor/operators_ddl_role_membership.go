@@ -32,6 +32,23 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 		}
 		return oid, nil
 	}
+	// The grantor row a bare REVOKE (no GRANTED BY) targets is, in real PG,
+	// whatever check_role_grantor(is_grant=false) infers for the current
+	// session (usually the current user, falling back to an inherited/
+	// superuser path this codebase does not model — see the deferral
+	// ledger). goopg's simplified session model reuses the SAME resolution
+	// GRANT already applies: the effective DDL-owner role, or an explicit
+	// GRANTED BY override. Shared across both branches below so REVOKE only
+	// ever touches the specific (role, member, grantor) row that grantor
+	// actually owns, leaving any OTHER grantor's independent row on the same
+	// (role, member) pair untouched — real PG's (roleid, member, grantor)
+	// unique index. M0119-0004-ACLHEAP.
+	grantorOid := o.currentDDLOwnerOID()
+	if rc.GrantedBy != "" {
+		if oid, err := resolveRole(rc.GrantedBy); err == nil {
+			grantorOid = oid
+		}
+	}
 	if rc.Revoke {
 		for _, roleName := range rc.Roles {
 			roleOid, err := resolveRole(roleName)
@@ -48,31 +65,25 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 				// using the ADMIN OPTION being taken away; INHERIT/SET
 				// OPTION FOR never cascade (plan_single_revoke, user.c).
 				if rc.RevokeOption == "" || rc.RevokeOption == "admin" {
-					deps, blocked := im.RevokeRoleMembershipCascadeSet(roleOid, memberOid, rc.Cascade)
+					deps, blocked := im.RevokeRoleMembershipCascadeSet(roleOid, memberOid, grantorOid, rc.Cascade)
 					if blocked {
 						return &ExecError{Code: "2BP01", Message: "dependent privileges exist",
 							Hint: "Use CASCADE to revoke them too."}
 					}
 					for _, dep := range deps {
-						im.RevokeRoleMembership(roleOid, dep, "")
+						im.RevokeRoleMembership(roleOid, dep.MemberOID, dep.GrantorOID, "")
 						if o.ctx.WAL != nil {
-							_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, dep, ""))
+							_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, dep.MemberOID, dep.GrantorOID, ""))
 						}
 					}
 				}
-				im.RevokeRoleMembership(roleOid, memberOid, rc.RevokeOption)
+				im.RevokeRoleMembership(roleOid, memberOid, grantorOid, rc.RevokeOption)
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, memberOid, rc.RevokeOption))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, memberOid, grantorOid, rc.RevokeOption))
 				}
 			}
 		}
 		return nil
-	}
-	grantorOid := o.currentDDLOwnerOID()
-	if rc.GrantedBy != "" {
-		if oid, err := resolveRole(rc.GrantedBy); err == nil {
-			grantorOid = oid
-		}
 	}
 	for _, roleName := range rc.Roles {
 		roleOid, err := resolveRole(roleName)

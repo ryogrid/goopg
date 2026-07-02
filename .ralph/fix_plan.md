@@ -5826,6 +5826,81 @@ documentation-only and is exempt from the design-doc requirement.)
       recursive/cascade dependent-privilege walk (both unrelated to this
       slice) remain open, unchanged from prior rows.
 
+- [x] **`REVOKE ROLE` CASCADE/RESTRICT dependent-privilege walk
+      (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:** closes the
+      "REVOKE's recursive/cascade dependent-privilege walk" residual carried
+      by every M0119-0004-ACLHEAP row since the REVOKE-OPTION-FOR
+      generalization row. `CASCADE`/`RESTRICT` were parsed and trimmed but
+      never read by the executor; new `parser.RoleMembershipChange.Cascade
+      bool` is now populated by `buildRoleMembershipChange`, also fixing a
+      latent ordering bug where `GRANTED BY <role>` unconditionally
+      terminated the option scan so a trailing `CASCADE` after `GRANTED BY`
+      was never reached. New
+      `catalog.InMemory.RevokeRoleMembershipCascadeSet` is a read-only
+      simulation of `plan_recursive_revoke` (`user.c`); `RESTRICT`/the
+      unwritten default with dependents raises `2BP01` (hint "Use CASCADE to
+      revoke them too."), `CASCADE` applies the full transitive chain first.
+      Tests: `TestParseGrantRoleMembership` new cases;
+      `TestRevokeRoleMembershipCascadeSet{NoAdminOptionNeverCascades,
+      BlocksWithoutCascade,WalksTransitiveChain}`. Live end-to-end `psql`
+      smoke confirmed both the block and the cascade path. Gates: `go build
+      ./...`/`go vet` clean; full suite PASS; `scripts/tpch-spotcheck.sh`
+      PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-revoke-role-cascade.md`; `docs/design/README.md`
+      row `0119-0004cb` added; deferral ledger row appended. Still open:
+      multi-grantor `roleMembers` keying and `GRANT ... ON PARAMETER`
+      GUC-name validation, unchanged from prior rows.
+
+- [x] **`pg_auth_members` multi-grantor rows (M0119-0004-ACLHEAP
+      follow-up).** **COMPLETE 2026-07-03:** closes the "goopg's
+      `roleMembers` map is keyed by `(RoleOID, MemberOID)` only" residual
+      carried by every M0119-0004-ACLHEAP row since the original role-
+      membership slice. `roleMembershipKey` (`internal/catalog/catalog.go`)
+      gained a `GrantorOID` field, matching real PG's `(roleid, member,
+      grantor)` unique index (`pg_auth_members_role_member_index`).
+      `GrantRoleMembership` now mints an independent row for a DIFFERENT
+      grantor granting the same `(role, member)` pair instead of silently
+      overwriting the existing row's grantor (a real, demonstrable
+      divergence from PG the old model had); a re-grant BY THE SAME grantor
+      still upserts in place. `RevokeRoleMembership` gained a `grantorOid`
+      parameter and only ever touches the one row identified by the full
+      triple, leaving any other grantor's row untouched.
+      `RevokeRoleMembershipCascadeSet` gained the same parameter and now
+      returns `[]DependentRoleMembership{MemberOID, GrantorOID}` (was
+      `[]uint32`) so cascade dependents are revoked at their own specific
+      grantor — this also makes `plan_recursive_revoke`'s "would the member
+      still hold admin via ANOTHER untouched row" escape hatch reachable for
+      the first time. `UnregisterRole` (DROP ROLE) now also purges rows
+      where the dropped role is the grantor (pre-existing gap fixed
+      incidentally). `execRoleMembershipChange`
+      (`internal/executor/operators_ddl_role_membership.go`) now resolves
+      `grantorOid` once, shared by GRANT and REVOKE — REVOKE previously
+      silently ignored `rc.GrantedBy` entirely.
+      `EncodeRevokeRoleMembership`/`DecodeRevokeRoleMembership`
+      (`internal/wal/recovery.go`) gained a `grantorOid` field (14-byte
+      payload, up from 10) so a grantor-scoped REVOKE replays the correct
+      row after a restart. Tests: `TestGrantRoleMembershipUpsertsInPlace`
+      rewritten for same-grantor-upserts-in-place vs.
+      different-grantor-mints-independent-row; new
+      `TestRevokeRoleMembershipTargetsOnlyItsOwnGrantorRow`; cascade tests
+      updated for the new parameter/return type
+      (`internal/catalog/role_membership_test.go`); WAL round-trip tests
+      updated (`internal/wal/role_membership_ddl_test.go`); new
+      `TestRoleMembershipRecoveryReplaysMultiGrantorRows`
+      (`internal/initdb/role_membership_recovery_test.go`). Gates: `go build
+      ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb`+`internal/parser`+`internal/server`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-membership-multi-grantor.md`;
+      `docs/design/README.md` row `0119-0004cc` added; deferral ledger row
+      appended. Still open: `check_role_grantor`'s inherited-privilege/
+      superuser fallback for a bare REVOKE's implicit grantor (goopg always
+      uses the effective DDL-owner role); `check_role_membership_
+      authorization`'s ADMIN-OPTION-required permission check (any DDL-owner
+      role can currently GRANT/REVOKE any role membership); `GRANT ... ON
+      PARAMETER` GUC-name validation (unrelated to this slice) remain open.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

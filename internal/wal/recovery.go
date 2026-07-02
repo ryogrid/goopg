@@ -1629,35 +1629,41 @@ var revokeRoleMembershipOptionByte = map[string]byte{"": 0, "admin": 1, "inherit
 var revokeRoleMembershipOptionName = []string{"", "admin", "inherit", "set"}
 
 // EncodeRevokeRoleMembership encodes a `REVOKE [{ADMIN|INHERIT|SET} OPTION
-// FOR] <role> FROM <member>` event. revokeOption is "" for a plain REVOKE or
-// one of "admin"/"inherit"/"set" for the OPTION FOR prefix (see
-// catalog.InMemory.RevokeRoleMembership).
-// Format: kind(1) | roleOid(4) | memberOid(4) | revokeOption(1).
-func EncodeRevokeRoleMembership(roleOid, memberOid uint32, revokeOption string) []byte {
-	out := make([]byte, 10)
+// FOR] <role> FROM <member> [GRANTED BY <grantor>]` event. grantorOid
+// identifies the single (role, member, grantor) row this revoke targets —
+// real PG's (roleid, member, grantor) unique index allows independent rows
+// from different grantors on the same (role, member) pair, so the grantor
+// must be persisted to replay the correct row on recovery. revokeOption is
+// "" for a plain REVOKE or one of "admin"/"inherit"/"set" for the OPTION FOR
+// prefix (see catalog.InMemory.RevokeRoleMembership).
+// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | revokeOption(1).
+func EncodeRevokeRoleMembership(roleOid, memberOid, grantorOid uint32, revokeOption string) []byte {
+	out := make([]byte, 14)
 	out[0] = RecordKindRevokeRoleMembership
 	binary.LittleEndian.PutUint32(out[1:5], roleOid)
 	binary.LittleEndian.PutUint32(out[5:9], memberOid)
-	out[9] = revokeRoleMembershipOptionByte[revokeOption]
+	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
+	out[13] = revokeRoleMembershipOptionByte[revokeOption]
 	return out
 }
 
 // DecodeRevokeRoleMembership decodes a RecordKindRevokeRoleMembership payload.
-func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid uint32, revokeOption string, err error) {
-	if len(payload) < 10 {
-		return 0, 0, "", fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
+func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, revokeOption string, err error) {
+	if len(payload) < 14 {
+		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindRevokeRoleMembership {
-		return 0, 0, "", fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
+		return 0, 0, 0, "", fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
 	}
 	roleOid = binary.LittleEndian.Uint32(payload[1:5])
 	memberOid = binary.LittleEndian.Uint32(payload[5:9])
-	optByte := payload[9]
+	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
+	optByte := payload[13]
 	if int(optByte) >= len(revokeRoleMembershipOptionName) {
-		return 0, 0, "", fmt.Errorf("wal: revoke-role-membership unknown option byte %d", optByte)
+		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership unknown option byte %d", optByte)
 	}
 	revokeOption = revokeRoleMembershipOptionName[optByte]
-	return roleOid, memberOid, revokeOption, nil
+	return roleOid, memberOid, grantorOid, revokeOption, nil
 }
 
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a

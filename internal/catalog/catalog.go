@@ -4120,10 +4120,15 @@ func (c *InMemory) AllRoleConfigRows() []RoleConfigRow {
 
 // roleMembershipKey identifies one pg_auth_members row: RoleOID is the role
 // being granted (roleid), MemberOID is the role receiving membership
-// (member). See InMemory.roleMembers' doc comment.
+// (member), GrantorOID is who granted it (grantor). Real PG's unique index
+// is the (roleid, member, grantor) triple (pg_auth_members_role_member_index,
+// pg_auth_members.h) — the SAME (role, member) pair can hold one independent
+// row per distinct grantor, e.g. two different admins each granting the same
+// role to the same member. See InMemory.roleMembers' doc comment.
 type roleMembershipKey struct {
-	RoleOID   uint32
-	MemberOID uint32
+	RoleOID    uint32
+	MemberOID  uint32
+	GrantorOID uint32
 }
 
 // RoleMembership is one pg_auth_members row, returned by
@@ -4140,9 +4145,12 @@ type RoleMembership struct {
 }
 
 // GrantRoleMembership upserts a `GRANT <role> TO <member> [WITH { ADMIN |
-// INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]` row: a fresh OID is
-// minted the first time (RoleOID, MemberOID) is seen; re-granting keeps the
-// existing OID and always updates GrantorOID to the new grantor.
+// INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]] [GRANTED BY <grantor>]`
+// row: a fresh OID is minted the first time (RoleOID, MemberOID, GrantorOID)
+// is seen — a DIFFERENT grantor granting the same (role, member) pair mints
+// its own independent row, matching real PG's (roleid, member, grantor)
+// unique index (AddRoleMems' SearchSysCache3, user.c) — re-granting BY THE
+// SAME grantor keeps the existing OID and only updates the option flags.
 //
 // admin/inherit/set are tri-state: nil means that option was not named in
 // this statement (PG's GRANT_ROLE_SPECIFIED_* bitmask unset, GrantRole in
@@ -4158,9 +4166,8 @@ type RoleMembership struct {
 func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}
+	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}
 	if existing, ok := c.roleMembers[key]; ok {
-		existing.GrantorOID = grantorOid
 		if admin != nil {
 			existing.AdminOption = *admin
 		}
@@ -4183,20 +4190,23 @@ func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, ad
 	return oid
 }
 
-// RevokeRoleMembership removes or downgrades a `REVOKE <role> FROM <member>`
-// row. revokeOption is "" for a plain REVOKE (the row is deleted entirely)
-// or one of "admin"/"inherit"/"set" for REVOKE's `{ADMIN|INHERIT|SET} OPTION
-// FOR` prefix, in which case only that single flag is cleared and the
-// membership row survives — matching PG's DelRoleMems/plan_single_revoke
-// (RRG_REMOVE_ADMIN_OPTION / RRG_REMOVE_INHERIT_OPTION / RRG_REMOVE_SET_OPTION,
-// user.c; only ADMIN's removal can cascade to dependent grants, which this
-// codebase does not yet model — see the deferral ledger). Reports whether a
-// row existed (REVOKE of a non-existent membership is a silent no-op,
-// matching this codebase's other ACL REVOKE paths). M0119-0004-ACLHEAP.
-func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, revokeOption string) bool {
+// RevokeRoleMembership removes or downgrades the ONE `REVOKE <role> FROM
+// <member> [GRANTED BY <grantor>]` row identified by (roleOid, memberOid,
+// grantorOid) — real PG's plan_single_revoke/DelRoleMems (user.c) only ever
+// touches the specific grantor-scoped tuple check_role_grantor resolved,
+// leaving any OTHER grantor's independent row on the same (role, member)
+// pair untouched. revokeOption is "" for a plain REVOKE (the row is deleted
+// entirely) or one of "admin"/"inherit"/"set" for REVOKE's
+// `{ADMIN|INHERIT|SET} OPTION FOR` prefix, in which case only that single
+// flag is cleared and the membership row survives — matching PG's
+// DelRoleMems/plan_single_revoke (RRG_REMOVE_ADMIN_OPTION /
+// RRG_REMOVE_INHERIT_OPTION / RRG_REMOVE_SET_OPTION, user.c). Reports
+// whether a row existed (REVOKE of a non-existent membership is a silent
+// no-op, matching this codebase's other ACL REVOKE paths). M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembership(roleOid, memberOid, grantorOid uint32, revokeOption string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}
+	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}
 	existing, ok := c.roleMembers[key]
 	if !ok {
 		return false
@@ -4225,24 +4235,26 @@ func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, revokeOption 
 // admin_option is already false); in that case (or when no row exists) this
 // returns (nil, false) and the caller applies a plain, non-cascading revoke.
 //
-// When a cascade is possible: dependentMembers lists every member (mirrors
-// PG's per-row full delete, RRG_DELETE_GRANT) that must ALSO be revoked of
-// roleOid — every row transitively granted by memberOid, where the walk
-// continues past a dependent row only if THAT row's own AdminOption is also
-// true (it could itself have re-granted further). If cascade is false
-// (RESTRICT, including REVOKE's unwritten default) and any dependents were
-// found, blocked is true and the caller must raise
+// When a cascade is possible: dependentMembers lists every dependent row
+// (mirrors PG's per-row full delete, RRG_DELETE_GRANT) that must ALSO be
+// revoked — every row transitively granted BY memberOid (regardless of which
+// role granted memberOid ITS membership; only the specific (roleOid,
+// memberOid, grantorOid) row at the top of the walk is scoped by grantor),
+// where the walk continues past a dependent row only if THAT row's own
+// AdminOption is also true (it could itself have re-granted further). If
+// cascade is false (RESTRICT, including REVOKE's unwritten default) and any
+// dependents were found, blocked is true and the caller must raise
 // ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST ("2BP01") — "dependent privileges
-// exist" / hint "Use CASCADE to revoke them too." — and apply nothing;
-// goopg's single-grantor-per-(role,member) row model (see the deferral
-// ledger's multi-grantor note) means plan_recursive_revoke's "would the
-// member still have admin via ANOTHER untouched row" escape hatch can never
-// apply here — every implicated row is that member's only row.
-// M0119-0004-ACLHEAP.
-func (c *InMemory) RevokeRoleMembershipCascadeSet(roleOid, memberOid uint32, cascade bool) (dependentMembers []uint32, blocked bool) {
+// exist" / hint "Use CASCADE to revoke them too." — and apply nothing. Each
+// DependentRoleMembership pins the exact (member, grantor) row to revoke —
+// real PG's "would the member still have admin via ANOTHER untouched row"
+// escape hatch (plan_recursive_revoke) is naturally modeled since a member
+// can now hold independent rows from multiple grantors and only the one
+// implicated by this walk is torn down. M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembershipCascadeSet(roleOid, memberOid, grantorOid uint32, cascade bool) (dependentMembers []DependentRoleMembership, blocked bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	existing, ok := c.roleMembers[roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}]
+	existing, ok := c.roleMembers[roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}]
 	if !ok || !existing.AdminOption {
 		return nil, false
 	}
@@ -4254,11 +4266,20 @@ func (c *InMemory) RevokeRoleMembershipCascadeSet(roleOid, memberOid uint32, cas
 	if !cascade {
 		return nil, true
 	}
-	dependentMembers = make([]uint32, len(keys))
+	dependentMembers = make([]DependentRoleMembership, len(keys))
 	for i, k := range keys {
-		dependentMembers[i] = k.MemberOID
+		dependentMembers[i] = DependentRoleMembership{MemberOID: k.MemberOID, GrantorOID: k.GrantorOID}
 	}
 	return dependentMembers, false
+}
+
+// DependentRoleMembership identifies one pg_auth_members row
+// RevokeRoleMembershipCascadeSet found downstream of a cascading REVOKE —
+// enough to target the exact row via RevokeRoleMembership(roleOid,
+// MemberOID, GrantorOID, ""). M0119-0004-ACLHEAP.
+type DependentRoleMembership struct {
+	MemberOID  uint32
+	GrantorOID uint32
 }
 
 // collectRoleMembershipCascadeKeysLocked appends every roleOid row granted
@@ -4282,8 +4303,9 @@ func (c *InMemory) collectRoleMembershipCascadeKeysLocked(roleOid, grantorMember
 }
 
 // RoleMembershipEntries returns every recorded pg_auth_members row, sorted
-// by (RoleOID, MemberOID) for deterministic virtual-row output.
-// M0119-0004-ACLHEAP.
+// by (RoleOID, MemberOID, GrantorOID) for deterministic virtual-row output —
+// the same (RoleOID, MemberOID) pair may now legitimately appear more than
+// once, one row per distinct grantor. M0119-0004-ACLHEAP.
 func (c *InMemory) RoleMembershipEntries() []RoleMembership {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -4298,7 +4320,10 @@ func (c *InMemory) RoleMembershipEntries() []RoleMembership {
 		if out[i].RoleOID != out[j].RoleOID {
 			return out[i].RoleOID < out[j].RoleOID
 		}
-		return out[i].MemberOID < out[j].MemberOID
+		if out[i].MemberOID != out[j].MemberOID {
+			return out[i].MemberOID < out[j].MemberOID
+		}
+		return out[i].GrantorOID < out[j].GrantorOID
 	})
 	return out
 }
@@ -10787,7 +10812,7 @@ func (c *InMemory) UnregisterRole(name string) {
 		return
 	}
 	for mk := range c.roleMembers {
-		if mk.RoleOID == oid || mk.MemberOID == oid {
+		if mk.RoleOID == oid || mk.MemberOID == oid || mk.GrantorOID == oid {
 			delete(c.roleMembers, mk)
 		}
 	}
