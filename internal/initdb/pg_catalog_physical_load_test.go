@@ -75,6 +75,9 @@ func TestLoadUserTablesFromPhysicalPGCatalogTuples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dataDir, "pg_xact")); err != nil {
+		t.Fatal(err)
+	}
 	if err := loadUserTablesFromHeap(mgr, cat, clog); err != nil {
 		t.Fatal(err)
 	}

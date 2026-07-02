@@ -1,9 +1,9 @@
 # 0117-0008 — Persist `datfrozenxid` in the on-disk `pg_database` tuple
 
-Status: accepted (Part A; Part B deferred)
+Status: accepted (Part A + Part B landed 2026-07-02)
 Milestone: M0117-0008 (CLOG ↔ PostgreSQL alignment; gap G-followup; P2)
 Author: Ralph
-Date: 2026-06-15
+Date: 2026-06-15 (Part B: 2026-07-02)
 
 ## Problem
 
@@ -144,6 +144,98 @@ Mirror `vac_update_datfrozenxid` + `heap_inplace_update`:
   parity check; cf. `feedback_m0106_continuous_pg_compat`).
 - TPC-H Q12/Q13 spot-check (executor path touched).
 
+### Part B — On-disk `pg_database.datfrozenxid` persistence — **LANDED 2026-07-02**
+
+Implemented the 5-step plan above almost verbatim, with one architectural correction
+discovered mid-implementation: **step 1's premise was incomplete.** It's not only that
+`catalog` lacked a shared-catalog `RelFileNode` resolver — `storage.Manager`'s path
+builder (`relPath`/`RelPath`) had **no concept of a shared (`global/`) tablespace at
+all**; every `RelFileNode` unconditionally resolved to `base/<DBOid>/<RelOid>`, so a
+naive `RelFileNode{DBOid:0, RelOid:1262}` would have opened `base/0/1262` — silently
+wrong, not merely unresolved. Fixed by making `DBOid == 0` goopg's sentinel for "shared
+catalog" in `storage.Manager.relPath`/`RelPath` (a new `sharedOrPerDBRelDir` helper);
+`DBOid == 0` is safe to repurpose because no live database is ever assigned OID 0
+(`catalog.DefaultDBOid == 1`; the live default resolves to `"postgres"`'s OID 5 via
+`detectCatalogDBOID` at startup) — grepping the tree confirmed zero existing
+`RelFileNode{DBOid: 0, ...}` construction sites before this change.
+
+**What landed, mapped to the 5-step plan:**
+
+1. **Shared-catalog resolver** — `catalog.SharedCatalogRelFileNode(oid)` (new file
+   `internal/catalog/pg_database_schema.go`) plus the storage-layer `global/` path fix
+   above. The same file also hoists `bootstrapPostgresDatabase`'s previously-inline
+   18-column `cols` literal into an exported `catalog.PgDatabaseColumnsPG18()` so
+   initdb's bootstrap-time encode and the runtime persistence path's decode/encode
+   share one schema definition and can never drift silently
+   (`pattern_sibling_paths_must_agree`) — `internal/initdb/initdb.go`'s
+   `bootstrapPostgresDatabase` now calls it instead of duplicating the column list.
+2. **Locate the live tuple** — `internal/executor/operators_vacuum_datfrozenxid.go`'s
+   `updatePgDatabaseTupleOnPage` scans `global/1262`'s page(s) for the row whose raw
+   `oid` (offset 0, always fixed/non-nullable — same check as initdb's own
+   `detectCatalogDBOID`/`decodePGDatabasePhysicalRow`) matches
+   `catalog.InMemory.DBOID()`, gated on liveness (`Xmin` valid, `Xmax` invalid — the
+   same test `decodePGDatabasePhysicalRow` uses). **Simplification vs. the original
+   plan:** rather than hand-deriving `datfrozenxid`'s fixed byte offset from PG's
+   struct-alignment rules, the implementation fully decodes the tuple via the existing
+   `DecodeRowIntoMctxPGTuple` (the same header-driven PG-physical decoder ANALYZE and
+   every heap-scan caller already use), mutates the one `Datum`, and re-encodes the
+   whole row via `EncodeRowPG`. Since no other column's value or width changes, the
+   re-encoded payload is byte-identical except for the mutated field — this sidesteps
+   any hand-computed-offset bug class entirely rather than trading one micro-optimization
+   for a durability-adjacent correctness risk.
+3. **In-place overwrite** — `storage.PageReplaceItemRaw` (a pre-existing,
+   already-tested primitive: same-length in-place line-pointer payload replacement)
+   under the page's exclusive content lock (`Slot.Lock`/`Unlock`, held for the
+   scan-locate-mutate-log-dirty window on each candidate page). The dirty-guard
+   mirrors `vac_update_datfrozenxid`: skip the write when the on-disk value is already
+   at-or-past the new horizon (`!storage.XIDPrecedes(current, horizon)`).
+4. **WAL-log it** — a new `catalog.PgCanonicalHeapInplace`/
+   `BuildCanonicalHeapInplacePayload` pair (`internal/catalog/canonical.go`), mirroring
+   `PgCanonicalHeapInsert`'s full-page-image (FPI) strategy 1:1 rather than
+   hand-encoding real PG's `xl_heap_inplace` shared-inval-message payload — a standby
+   restores the whole post-overwrite page, so no tuple-level main-data parsing is
+   needed on replay. Uses `XLOG_HEAP_INPLACE`'s real opcode (`0x70`); replay dispatch
+   (`internal/wal/recovery.go`'s `replayDecodedXLogRecord`, `RmgrHeap` case) now
+   recognizes `xlogHeapInplace` alongside `xlogHeapDelete/Update/HotUpdate` and applies
+   the FPI identically (`replayDecodedXLogHeapFPIBlocks`) — this is new dispatch
+   surface, not a reuse of the INSERT opcode, so a real PG standby's own
+   `XLOG_HEAP_INPLACE` decoder (if one ever inspects goopg's WAL) sees the correct
+   opcode rather than a misleading `XLOG_HEAP_INSERT`.
+5. **Hook at VACUUM end** — `vacuumOp.Next` calls `persistDatFrozenXID` once,
+   unconditionally (matching upstream: `vacuum.c`'s call site is gated only on
+   `VACOPT_VACUUM`, which every `VacuumStmt`-backed `vacuumOp` invocation has — plain
+   `ANALYZE` is a *different* statement/operator, `analyzeOp`, so this never fires for
+   analyze-only), guarded with `_ = persistDatFrozenXID(...)` so a failure can never
+   abort the client's VACUUM.
+
+**Scope not carried over from real PG** (acceptable per the "purely external parity"
+framing established when Part B was deferred): no `LockDatabaseFrozenIds`-equivalent
+heavyweight lock is taken (the page's own content lock is sufficient for physical-write
+atomicity on `pg_database`'s single v0 page; the pre-existing `intra-grant-inplace-db`
+GRANT-conflict simulation, `waitForDatabaseACLChange`, is unaffected and unchanged), no
+`datminmxid` advancement (goopg has no per-database multixact-freeze horizon to
+advance — same gap noted by design `0118-0096`), and v0's single-live-database scope
+(only the row matching `catalog.InMemory.DBOID()` is ever touched).
+
+**Verification.** Beyond the two dedicated test files
+(`internal/executor/operators_vacuum_datfrozenxid_test.go`:
+`TestPersistDatFrozenXIDAdvances` proves the advance + idempotent no-write-when-not-ahead
+dirty-guard; `TestPersistDatFrozenXIDEmitsCanonicalWAL` proves the WAL record shape) and
+storage/WAL-level coverage (`internal/storage/shared_catalog_relpath_test.go`,
+`internal/wal/canonical_heap_roundtrip_test.go`'s
+`TestCanonicalHeapInplaceWALRoundTrip` — builds the payload, appends it to a real WAL
+segment, decodes it back, and replays it onto a *fresh* `storage.Manager` to confirm the
+mutated bytes land at `global/1262`, not `base/0/1262`), this was verified against a
+**live, non-synthetic, `goopg init`-bootstrapped data directory**: `CREATE TABLE` +
+`INSERT`, `SET vacuum_freeze_min_age = 1; VACUUM <table>;` over the wire via `psql`,
+clean server shutdown (fsync), then decoding `global/1262` directly (bypassing SQL
+entirely, since `SELECT datfrozenxid FROM pg_database` is served by the *virtual*
+catalog / `InMemory.DatFrozenXID()` per design `0118-0096` — not this on-disk tuple, by
+design) confirmed the `postgres` row's on-disk `datfrozenxid` advanced from the initdb
+bootstrap value `3` to `4`, while `template0`/`template1` (never targeted) stayed at
+their bootstrap values — proving the write is scoped to the correct row, not a
+blanket rewrite.
+
 ## PostgreSQL references
 
 - `postgres/src/backend/commands/vacuum.c` — `vac_update_datfrozenxid`,
@@ -151,10 +243,12 @@ Mirror `vac_update_datfrozenxid` + `heap_inplace_update`:
 - `postgres/src/backend/access/heap/heapam.c` — `heap_inplace_update` (fixed-width,
   WAL-logged, no new row version).
 - `postgres/src/include/catalog/pg_database.h` — column layout (mirrored at
-  `internal/initdb/initdb.go:1607-1646`).
+  `internal/initdb/initdb.go`'s `bootstrapPostgresDatabase`, now sourced from
+  `catalog.PgDatabaseColumnsPG18`).
+- `postgres/src/include/access/heapam_xlog.h` — `XLOG_HEAP_INPLACE` (`0x70`),
+  `xl_heap_inplace`.
 
 ## Decision
 
-Land Part A as already-complete (chain M0117-0004) and this design doc. Defer Part B
-(on-disk in-place persistence) to a dedicated full-gate session per the deferral ledger.
-M0117-0008 stays unchecked in the fix_plan until Part B lands.
+Part A (chain M0117-0004) and Part B (this loop, 2026-07-02) are both landed.
+M0117-0008 is now fully closed in the fix_plan.

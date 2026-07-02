@@ -112,6 +112,98 @@ func TestDDLDropTableRemovesCatalogAndFile(t *testing.T) {
 	}
 }
 
+// TestDDLDropAggregateRemovesUserAggregate confirms DROP AGGREGATE actually
+// removes a registered user aggregate from the catalog (loop #56 ledger
+// resume point: previously this arm only validated arg types and always
+// reported "does not exist", M0097-regress-era gap, never wired to
+// catalog.InMemory.userAggregates at all).
+func TestDDLDropAggregateRemovesUserAggregate(t *testing.T) {
+	ctx, catIface, cleanup := newDDLFixture(t)
+	defer cleanup()
+	cat := catIface.(*catalog.InMemory)
+
+	cat.RegisterUserAggregate(&catalog.UserAggregate{
+		Name:     "newavg",
+		ArgTypes: []string{"int4"},
+		SType:    "_int8",
+		SFunc:    "int4_avg_accum",
+	})
+	if _, ok := cat.LookupUserAggregateByName("newavg"); !ok {
+		t.Fatal("aggregate not registered before DROP")
+	}
+
+	if err := runDDL(t, ctx, "DROP AGGREGATE newavg(int4)"); err != nil {
+		t.Fatalf("DROP AGGREGATE: %v", err)
+	}
+	if _, ok := cat.LookupUserAggregateByName("newavg"); ok {
+		t.Errorf("aggregate still registered after DROP AGGREGATE")
+	}
+
+	// A second DROP AGGREGATE without IF EXISTS must now hit the
+	// "does not exist" error path (the aggregate is really gone).
+	err := runDDL(t, ctx, "DROP AGGREGATE newavg(int4)")
+	if err == nil {
+		t.Fatal("DROP AGGREGATE on an already-dropped aggregate should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42883" {
+		t.Errorf("want 42883, got %v", err)
+	}
+
+	// IF EXISTS on a missing aggregate is a no-op.
+	if err := runDDL(t, ctx, "DROP AGGREGATE IF EXISTS newavg(int4)"); err != nil {
+		t.Errorf("DROP AGGREGATE IF EXISTS on missing aggregate: %v", err)
+	}
+}
+
+// TestDDLAlterAggregateOwner pins ALTER AGGREGATE ... OWNER TO (M0119-0004,
+// loop #57 ledger follow-up): previously this form silently fell into the
+// "other ALTER AGGREGATE forms: consume as no-op" parser branch and never
+// reached the catalog at all.
+func TestDDLAlterAggregateOwner(t *testing.T) {
+	ctx, catIface, cleanup := newDDLFixture(t)
+	defer cleanup()
+	cat := catIface.(*catalog.InMemory)
+
+	cat.RegisterUserAggregate(&catalog.UserAggregate{
+		Name:     "newavg",
+		ArgTypes: []string{"int4"},
+		SType:    "_int8",
+		SFunc:    "int4_avg_accum",
+	})
+	agg, ok := cat.LookupUserAggregateByName("newavg")
+	if !ok {
+		t.Fatal("aggregate not registered before ALTER")
+	}
+	if got := agg.OwnerOrDefault(); got != 10 {
+		t.Fatalf("default owner = %d, want 10 (bootstrap superuser)", got)
+	}
+
+	cat.RegisterRole("agg_owner")
+	wantOID, ok := cat.RoleOID("agg_owner")
+	if !ok {
+		t.Fatal("agg_owner role not registered")
+	}
+
+	if err := runDDL(t, ctx, "ALTER AGGREGATE newavg(int4) OWNER TO agg_owner"); err != nil {
+		t.Fatalf("ALTER AGGREGATE OWNER TO: %v", err)
+	}
+	if got := agg.OwnerOrDefault(); got != wantOID {
+		t.Errorf("owner after ALTER = %d, want %d", got, wantOID)
+	}
+
+	// Unknown role must raise 42704.
+	err := runDDL(t, ctx, "ALTER AGGREGATE newavg(int4) OWNER TO no_such_role")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("want 42704 for unknown role, got %v", err)
+	}
+
+	// Unknown aggregate must raise 42883.
+	err = runDDL(t, ctx, "ALTER AGGREGATE no_such_agg(int4) OWNER TO agg_owner")
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42883" {
+		t.Errorf("want 42883 for unknown aggregate, got %v", err)
+	}
+}
+
 func TestDDLCreateTempTableShadowsPermanentTable(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -470,6 +562,424 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 		_ = mgr.Close()
 	}
 	return ctx, cat, cleanup
+}
+
+// TestDDLAlterTableClusterOnRoundTrip pins the restore side of the clustered-
+// index round-trip (DU-002 slice 321): pg_dump emits `ALTER TABLE <t> CLUSTER ON
+// <idx>` for a clustered table, so goopg must accept that exact clause to restore
+// its own dumps. The statement marks the named index's catalog.Index.IsClustered
+// (pg_index.indisclustered) and clears the flag on every other index of the
+// table, mirroring mark_index_clustered (cluster.c) — the same effect as
+// `CLUSTER <t> USING <idx>` (slice 320). `SET WITHOUT CLUSTER` then clears the
+// selection on every index.
+func TestDDLAlterTableClusterOnRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int PRIMARY KEY, b int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_b_idx ON t (b)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	clusteredName := func() string {
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if idx.IsClustered {
+				return idx.Name
+			}
+		}
+		return ""
+	}
+
+	// Initially no index is clustered.
+	if got := clusteredName(); got != "" {
+		t.Fatalf("before CLUSTER ON: clustered index = %q, want none", got)
+	}
+
+	// ALTER TABLE t CLUSTER ON t_b_idx — the dump-emitted restore form.
+	if err := runDDL(t, ctx, "ALTER TABLE t CLUSTER ON t_b_idx"); err != nil {
+		t.Fatalf("ALTER TABLE CLUSTER ON: %v", err)
+	}
+	if got := clusteredName(); got != "t_b_idx" {
+		t.Errorf("after CLUSTER ON t_b_idx: clustered index = %q, want t_b_idx", got)
+	}
+
+	// Re-pointing to the PK index must clear the flag on t_b_idx (exactly one
+	// index is ever clustered, mark_index_clustered).
+	if err := runDDL(t, ctx, "ALTER TABLE t CLUSTER ON t_pkey"); err != nil {
+		t.Fatalf("ALTER TABLE CLUSTER ON t_pkey: %v", err)
+	}
+	if got := clusteredName(); got != "t_pkey" {
+		t.Errorf("after CLUSTER ON t_pkey: clustered index = %q, want t_pkey", got)
+	}
+
+	// CLUSTER ON an unknown index → 42704.
+	err := runDDL(t, ctx, "ALTER TABLE t CLUSTER ON nope")
+	if err == nil {
+		t.Fatal("CLUSTER ON nope: expected error, got nil")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("CLUSTER ON nope: err = %v, want SQLSTATE 42704", err)
+	}
+
+	// SET WITHOUT CLUSTER clears the selection entirely.
+	if err := runDDL(t, ctx, "ALTER TABLE t SET WITHOUT CLUSTER"); err != nil {
+		t.Fatalf("ALTER TABLE SET WITHOUT CLUSTER: %v", err)
+	}
+	if got := clusteredName(); got != "" {
+		t.Errorf("after SET WITHOUT CLUSTER: clustered index = %q, want none", got)
+	}
+}
+
+// TestDDLAlterTableRowSecurityRoundTrip pins DU-002 slice 322: ENABLE/DISABLE
+// ROW LEVEL SECURITY toggles catalog.Table.RowSecurity (pg_class.relrowsecurity)
+// and [NO] FORCE ROW LEVEL SECURITY toggles ForceRowSecurity
+// (relforcerowsecurity). goopg enforces no RLS — these are recorded purely so
+// pg_dump can re-emit the clauses. The two flags are independent.
+func TestDDLAlterTableRowSecurityRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	if tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Fatalf("fresh table: RowSecurity=%v ForceRowSecurity=%v, want both false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("ENABLE ROW LEVEL SECURITY: %v", err)
+	}
+	if !tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Errorf("after ENABLE: RowSecurity=%v ForceRowSecurity=%v, want true/false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t FORCE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("FORCE ROW LEVEL SECURITY: %v", err)
+	}
+	if !tbl.RowSecurity || !tbl.ForceRowSecurity {
+		t.Errorf("after FORCE: RowSecurity=%v ForceRowSecurity=%v, want true/true", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t NO FORCE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("NO FORCE ROW LEVEL SECURITY: %v", err)
+	}
+	if !tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Errorf("after NO FORCE: RowSecurity=%v ForceRowSecurity=%v, want true/false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t DISABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("DISABLE ROW LEVEL SECURITY: %v", err)
+	}
+	if tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Errorf("after DISABLE: RowSecurity=%v ForceRowSecurity=%v, want both false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+}
+
+// TestDDLCreatePolicyRoundTrip pins that CREATE POLICY records a row-security
+// policy on its table and that the pg_policy virtual catalog projects it in the
+// shape pg_dump's getPolicies reads: polcmd, polpermissive, polroles ({0} for
+// PUBLIC), and the fully-parenthesized polqual / polwithcheck pg_get_expr
+// renders. goopg does NOT enforce RLS — this is dump fidelity only. DU-002
+// slice 323.
+func TestDDLCreatePolicyRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	if err := runDDL(t, ctx, "CREATE POLICY p_simple ON t USING (a > 0)"); err != nil {
+		t.Fatalf("CREATE POLICY p_simple: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE POLICY p_restr ON t AS RESTRICTIVE FOR SELECT USING (a > 5)"); err != nil {
+		t.Fatalf("CREATE POLICY p_restr: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE POLICY p_check ON t FOR INSERT WITH CHECK (a < 100)"); err != nil {
+		t.Fatalf("CREATE POLICY p_check: %v", err)
+	}
+	if len(tbl.Policies) != 3 {
+		t.Fatalf("got %d policies, want 3", len(tbl.Policies))
+	}
+
+	// Project through the virtual catalog and key the rows by polname.
+	pgPolicy, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_policy"})
+	if !ok {
+		t.Fatal("pg_policy not in catalog")
+	}
+	rows := map[string][]string{}
+	for _, r := range pgPolicy.VirtualRows() {
+		rows[r[1]] = r // r[1] = polname
+	}
+	if len(rows) != 3 {
+		t.Fatalf("pg_policy projected %d rows, want 3", len(rows))
+	}
+
+	// columns: oid, polname, polrelid, polcmd, polpermissive, polroles, polqual, polwithcheck
+	check := func(name string, cmd, perm, roles, qual, withcheck string) {
+		t.Helper()
+		r := rows[name]
+		if r == nil {
+			t.Fatalf("policy %q missing from pg_policy", name)
+		}
+		if r[3] != cmd {
+			t.Errorf("%s polcmd = %q, want %q", name, r[3], cmd)
+		}
+		if r[4] != perm {
+			t.Errorf("%s polpermissive = %q, want %q", name, r[4], perm)
+		}
+		if r[5] != roles {
+			t.Errorf("%s polroles = %q, want %q", name, r[5], roles)
+		}
+		if r[6] != qual {
+			t.Errorf("%s polqual = %q, want %q", name, r[6], qual)
+		}
+		if r[7] != withcheck {
+			t.Errorf("%s polwithcheck = %q, want %q", name, r[7], withcheck)
+		}
+	}
+	// pg_get_expr is a pass-through in goopg; polqual stores the fully
+	// parenthesized form so pg_dump emits `USING ((a > 0))`.
+	check("p_simple", "*", "t", "{0}", "(a > 0)", "")
+	check("p_restr", "r", "f", "{0}", "(a > 5)", "")
+	check("p_check", "a", "t", "{0}", "", "(a < 100)")
+
+	// DROP POLICY removes it.
+	if err := runDDL(t, ctx, "DROP POLICY p_restr ON t"); err != nil {
+		t.Fatalf("DROP POLICY p_restr: %v", err)
+	}
+	if len(tbl.Policies) != 2 {
+		t.Fatalf("after DROP: got %d policies, want 2", len(tbl.Policies))
+	}
+	// Named-role TO clause is not yet supported (no per-role OID registry).
+	if err := runDDL(t, ctx, "CREATE POLICY p_role ON t TO alice USING (a > 0)"); err == nil {
+		t.Errorf("CREATE POLICY ... TO alice should error (named roles unsupported)")
+	}
+}
+
+// TestDDLCreateRuleRoundTrip verifies an unconditional DO-NOTHING CREATE RULE
+// is recorded on its table, projected into pg_rewrite, reconstructed by
+// pg_get_ruledef byte-identically to real PG, and removed by DROP RULE. DU-002
+// slice 324.
+func TestDDLCreateRuleRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	if err := runDDL(t, ctx, "CREATE RULE r_noins AS ON INSERT TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_noins: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_also AS ON UPDATE TO t DO ALSO NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_also: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_del AS ON DELETE TO t DO NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_del: %v", err)
+	}
+	if len(tbl.Rules) != 3 {
+		t.Fatalf("got %d rules, want 3", len(tbl.Rules))
+	}
+
+	// Duplicate rule name on the same table is a 42710 error.
+	if err := runDDL(t, ctx, "CREATE RULE r_noins AS ON INSERT TO t DO INSTEAD NOTHING"); err == nil {
+		t.Errorf("duplicate CREATE RULE r_noins should error")
+	}
+
+	// Project through pg_rewrite and key rows by rulename.
+	pgRewrite, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_rewrite"})
+	if !ok {
+		t.Fatal("pg_rewrite not in catalog")
+	}
+	rows := map[string][]string{}
+	for _, r := range pgRewrite.VirtualRows() {
+		rows[r[1]] = r // r[1] = rulename
+	}
+	if len(rows) != 3 {
+		t.Fatalf("pg_rewrite projected %d rows, want 3", len(rows))
+	}
+	// columns: oid, rulename, ev_class, ev_type, ev_enabled, is_instead, ev_qual, ev_action
+	check := func(name, evType, isInstead string) {
+		t.Helper()
+		r := rows[name]
+		if r == nil {
+			t.Fatalf("rule %q missing from pg_rewrite", name)
+		}
+		if r[3] != evType {
+			t.Errorf("%s ev_type = %q, want %q", name, r[3], evType)
+		}
+		if r[4] != "O" {
+			t.Errorf("%s ev_enabled = %q, want %q", name, r[4], "O")
+		}
+		if r[5] != isInstead {
+			t.Errorf("%s is_instead = %q, want %q", name, r[5], isInstead)
+		}
+	}
+	check("r_noins", "3", "t") // INSERT, INSTEAD
+	check("r_also", "2", "f")  // UPDATE, ALSO
+	check("r_del", "4", "f")   // DELETE, plain DO NOTHING
+
+	// pg_get_ruledef reconstruction is byte-identical to PG 18.3.
+	want := map[string]string{
+		"r_noins": "CREATE RULE r_noins AS\n    ON INSERT TO public.t DO INSTEAD NOTHING;",
+		"r_also":  "CREATE RULE r_also AS\n    ON UPDATE TO public.t DO NOTHING;",
+		"r_del":   "CREATE RULE r_del AS\n    ON DELETE TO public.t DO NOTHING;",
+	}
+	for _, r := range tbl.Rules {
+		got := buildRuleDefString(tbl, r)
+		if got != want[r.Name] {
+			t.Errorf("pg_get_ruledef(%s) =\n%q\nwant\n%q", r.Name, got, want[r.Name])
+		}
+	}
+
+	// DROP RULE removes it from both the compat registry and the dumped set.
+	if err := runDDL(t, ctx, "DROP RULE r_also ON t"); err != nil {
+		t.Fatalf("DROP RULE r_also: %v", err)
+	}
+	if len(tbl.Rules) != 2 {
+		t.Fatalf("after DROP: got %d rules, want 2", len(tbl.Rules))
+	}
+}
+
+// TestDDLCreateRuleConditionalRoundTrip verifies a conditional DO-NOTHING
+// CREATE RULE (`WHERE (qual) DO INSTEAD NOTHING`) records its deparsed qual and
+// pg_get_ruledef reconstructs the WHERE clause byte-identically to real PG 18.3
+// (captured from a live PG cluster). DU-002 slice 359.
+func TestDDLCreateRuleConditionalRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE rcond (a int, b int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "rcond"})
+	if !ok {
+		t.Fatal("table rcond not in catalog")
+	}
+
+	// Parenthesized qual (UPDATE) and no-paren qual (DELETE); both must deparse to
+	// the canonical single-paren WHERE form.
+	if err := runDDL(t, ctx, "CREATE RULE rcond_upd AS ON UPDATE TO rcond WHERE (old.a <> new.a) DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE rcond_upd: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE rcond_del AS ON DELETE TO rcond WHERE old.b > 0 DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE rcond_del: %v", err)
+	}
+
+	want := map[string]string{
+		"rcond_upd": "CREATE RULE rcond_upd AS\n    ON UPDATE TO public.rcond\n   WHERE (old.a <> new.a) DO INSTEAD NOTHING;",
+		"rcond_del": "CREATE RULE rcond_del AS\n    ON DELETE TO public.rcond\n   WHERE (old.b > 0) DO INSTEAD NOTHING;",
+	}
+	if len(tbl.Rules) != 2 {
+		t.Fatalf("got %d rules, want 2", len(tbl.Rules))
+	}
+	for _, r := range tbl.Rules {
+		if r.Qual == "" {
+			t.Errorf("rule %s has empty Qual", r.Name)
+		}
+		got := buildRuleDefString(tbl, r)
+		if got != want[r.Name] {
+			t.Errorf("pg_get_ruledef(%s) =\n%q\nwant\n%q", r.Name, got, want[r.Name])
+		}
+	}
+}
+
+// TestDDLAlterTableRuleEnabledState verifies `ALTER TABLE … {ENABLE|DISABLE}
+// [REPLICA|ALWAYS] RULE name` sets pg_rewrite.ev_enabled for the named rule
+// (origin 'O', disabled 'D', replica 'R', always 'A') so pg_dump's dumpRule
+// re-emits the ALTER TABLE clause, and that an unknown rule name errors 42704.
+// DU-002 slice 325.
+func TestDDLAlterTableRuleEnabledState(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_ins AS ON INSERT TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_ins: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_upd AS ON UPDATE TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_upd: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_del AS ON DELETE TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_del: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "t"})
+
+	// A freshly created rule is ev_enabled 'O' (EvEnabled maps the zero value).
+	for _, r := range tbl.Rules {
+		if r.EvEnabled() != 'O' {
+			t.Errorf("fresh rule %s EvEnabled=%q want 'O'", r.Name, r.EvEnabled())
+		}
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t DISABLE RULE r_ins"); err != nil {
+		t.Fatalf("DISABLE RULE r_ins: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE REPLICA RULE r_upd"); err != nil {
+		t.Fatalf("ENABLE REPLICA RULE r_upd: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE ALWAYS RULE r_del"); err != nil {
+		t.Fatalf("ENABLE ALWAYS RULE r_del: %v", err)
+	}
+
+	// pg_rewrite.ev_enabled (column index 4) reflects the new states live.
+	pgRewrite, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_rewrite"})
+	enabled := map[string]string{}
+	for _, r := range pgRewrite.VirtualRows() {
+		enabled[r[1]] = r[4]
+	}
+	if enabled["r_ins"] != "D" {
+		t.Errorf("r_ins ev_enabled=%q want D", enabled["r_ins"])
+	}
+	if enabled["r_upd"] != "R" {
+		t.Errorf("r_upd ev_enabled=%q want R", enabled["r_upd"])
+	}
+	if enabled["r_del"] != "A" {
+		t.Errorf("r_del ev_enabled=%q want A", enabled["r_del"])
+	}
+
+	// ENABLE RULE restores 'O' (origin).
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE RULE r_ins"); err != nil {
+		t.Fatalf("ENABLE RULE r_ins: %v", err)
+	}
+	enabled = map[string]string{}
+	for _, r := range pgRewrite.VirtualRows() {
+		enabled[r[1]] = r[4]
+	}
+	if enabled["r_ins"] != "O" {
+		t.Errorf("r_ins ev_enabled after ENABLE=%q want O", enabled["r_ins"])
+	}
+
+	// Unknown rule name → 42704.
+	err := runDDL(t, ctx, "ALTER TABLE t DISABLE RULE no_such_rule")
+	if err == nil {
+		t.Fatal("DISABLE RULE no_such_rule should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("DISABLE RULE no_such_rule err=%v want ExecError 42704", err)
+	}
 }
 
 // TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL

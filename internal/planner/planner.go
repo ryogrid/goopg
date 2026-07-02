@@ -135,25 +135,31 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateFunctionStmt, *parser.DropFunctionStmt, *parser.AlterFunctionStmt,
 		*parser.CreateProcedureStmt, *parser.DropProcedureStmt,
 		*parser.CreateTriggerStmt, *parser.DropTriggerStmt,
-		*parser.DropRuleStmt,
+		*parser.CreatePolicyStmt, *parser.DropPolicyStmt,
+		*parser.CreateRuleStmt, *parser.DropRuleStmt,
 		*parser.DropCompatStmt,
 		*parser.CreateSequenceStmt, *parser.AlterSequenceStmt,
 		*parser.CreateMatViewStmt, *parser.RefreshMatViewStmt,
 		*parser.CompatNoopStmt,
 		*parser.CommentOnStmt,
 		*parser.CreateStatisticsStmt,
+		*parser.AlterStatisticsStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
 		*parser.CreateAggregateStmt,
-		*parser.AlterAggregateRenameStmt,
+		*parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt,
 		*parser.CreateExtensionStmt,
+		*parser.CreateCollationStmt, *parser.AlterCollationStmt,
 		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt,
-		*parser.CreateOpClassStmt:
+		*parser.CreateOpClassStmt, *parser.AlterOperatorSetStmt, *parser.AlterOpFamilyAddStmt,
+		*parser.AlterOpFamilyDropStmt,
+		*parser.CreateEventTriggerStmt, *parser.AlterEventTriggerStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
-		*parser.CreateSubscriptionStmt, *parser.DropSubscriptionStmt:
+		*parser.CreateSubscriptionStmt, *parser.DropSubscriptionStmt,
+		*parser.AlterPublicationOwnerStmt, *parser.AlterSubscriptionOwnerStmt:
 		// M0008 logical-replication DDL flows through DDL too;
 		// the executor's DDL operator handles them by mutating
 		// the runtime's *catalog.PubSub registry. See
@@ -180,7 +186,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
 		*parser.ReindexStmt, *parser.ClusterStmt,
-		*parser.SetTransactionStmt,
+		*parser.SetTransactionStmt, *parser.SetConstraintsStmt,
 		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt,
 		*parser.DiscardStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil
@@ -2477,6 +2483,13 @@ func buildInheritanceRemapProject(pos int, childScan *SeqScan, parent, child *ca
 // helper — the two paths are siblings and must stay in sync (a virtual row
 // typed one way at plan time and another at Open would diverge silently).
 func TypedVirtualCell(pos int, value, colType string) Expr {
+	// An explicit NULL sentinel overrides all type-specific parsing: it lets a
+	// VirtualRows builder emit SQL NULL for a column whose empty string is a
+	// real non-NULL value (e.g. a `text` collicurules that must read NULL, not
+	// ''). See catalog.VirtualNull.
+	if value == catalog.VirtualNull {
+		return &NullConst{pos: pos}
+	}
 	switch strings.ToLower(colType) {
 	case "int2", "int4", "int8", "integer", "bigint", "smallint",
 		"oid", "xid", "cid", "regproc", "regprocedure":

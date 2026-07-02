@@ -843,7 +843,19 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	case *parser.NumericConst:
 		return catalog.Type{Name: "numeric"}, nil
 	case *parser.StringConst:
-		return catalog.Type{Name: "text"}, nil
+		// A bare string literal has no type of its own — PostgreSQL types it
+		// as the `unknown` pseudo-type (UNKNOWNOID) and resolves it against the
+		// context (the other operand of a comparison, the target column of an
+		// assignment, a function's parameter type). Mirror that here instead of
+		// hard-typing it as `text`, so e.g. `bigint_col = '1'` type-checks: the
+		// `unknown` short-circuits in isComparable / isAssignable let the literal
+		// coerce to the concrete side, and the runtime (promoteCrossKind /
+		// tryParseStringAs) parses the string into that type. Genuine `text`
+		// columns stay `text`, so real mismatches like `text_col = 1` still error.
+		// Upstream: postgres/src/backend/parser/parse_coerce.c (coerce_type of
+		// UNKNOWNOID) and parse_oper.c (oper_select_candidate). Matches the
+		// existing NullConst/ParamRef/CastExpr cases, which already return unknown.
+		return catalog.Type{Name: "unknown"}, nil
 	case *parser.TypedStringLit:
 		return catalog.Type{Name: x.Type}, nil
 	case *parser.IntervalLit:
@@ -2370,9 +2382,27 @@ func isComparable(left, right catalog.Type) bool {
 	}
 	// uuid, name, oid and other text-backed types are comparable with text/varchar. M0097-0003.
 	// tid is also text-backed (string representation "(block,offset)"); ctid = '(0,1)' must work. M0097-0062.
-	isTextBacked := func(t catalog.Type) bool {
+	// isOIDFamily covers oid and its "reg*" aliases (regproc, regclass,
+	// regtype, ...): PostgreSQL stores them with the same on-disk
+	// representation (just a different I/O function), so e.g.
+	// `pg_aggregate.aggfnoid = pg_proc.oid` (aggfnoid is regproc) type-checks
+	// without an explicit cast — pg_dump's own dumpAgg prepared query relies
+	// on exactly this join. DU-002 slice 405.
+	isOIDFamily := func(t catalog.Type) bool {
 		switch strings.ToLower(t.Name) {
-		case "uuid", "name", "oid", "oidvector", "int2vector", "pg_lsn", "tid":
+		case "oid", "regproc", "regprocedure", "regoper", "regoperator", "regclass",
+			"regtype", "regconfig", "regdictionary", "regnamespace", "regrole",
+			"regcollation":
+			return true
+		}
+		return false
+	}
+	isTextBacked := func(t catalog.Type) bool {
+		if isOIDFamily(t) {
+			return true
+		}
+		switch strings.ToLower(t.Name) {
+		case "uuid", "name", "oidvector", "int2vector", "pg_lsn", "tid":
 			return true
 		}
 		return false
@@ -2381,10 +2411,10 @@ func isComparable(left, right catalog.Type) bool {
 		return true
 	}
 	// oid ↔ integer: PostgreSQL has implicit oid↔int4 casts. M0097-0003.
-	if strings.EqualFold(left.Name, "oid") && isNumericTypeName(right.Name) {
+	if isOIDFamily(left) && isNumericTypeName(right.Name) {
 		return true
 	}
-	if isNumericTypeName(left.Name) && strings.EqualFold(right.Name, "oid") {
+	if isNumericTypeName(left.Name) && isOIDFamily(right) {
 		return true
 	}
 	// User-defined types (enum, domain, composite) ↔ string: allow comparison

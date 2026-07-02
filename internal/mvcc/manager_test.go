@@ -205,7 +205,7 @@ func TestXactMarkerLoggerCalledOnCommit(t *testing.T) {
 		kind XactMarker
 	}
 	var calls []call
-	m.SetXactMarkerLogger(func(xid storage.TransactionID, kind XactMarker) error {
+	m.SetXactMarkerLogger(func(xid storage.TransactionID, kind XactMarker, _ bool) error {
 		calls = append(calls, call{xid, kind})
 		return nil
 	})
@@ -238,7 +238,7 @@ func TestXactMarkerLoggerCalledOnRollback(t *testing.T) {
 	m := NewManager()
 	var got XactMarker
 	gotSet := false
-	m.SetXactMarkerLogger(func(xid storage.TransactionID, kind XactMarker) error {
+	m.SetXactMarkerLogger(func(xid storage.TransactionID, kind XactMarker, _ bool) error {
 		got = kind
 		gotSet = true
 		return nil
@@ -258,6 +258,51 @@ func TestXactMarkerLoggerCalledOnRollback(t *testing.T) {
 	}
 	if got != XactAbort {
 		t.Errorf("kind=%v want XactAbort", got)
+	}
+}
+
+// TestCommitAsyncPassesWaitLocalFlushFalse pins the M0117-0007 Part B
+// contract: Commit and Rollback invoke the xactMarker hook with
+// waitLocalFlush=true (the pre-existing, always-synchronous behaviour);
+// CommitAsync is the only entry point that passes false, telling the hook it
+// may return without waiting for its own local WAL flush.
+func TestCommitAsyncPassesWaitLocalFlushFalse(t *testing.T) {
+	m := NewManager()
+	var got []bool
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker, waitLocalFlush bool) error {
+		got = append(got, waitLocalFlush)
+		return nil
+	})
+
+	beginAndAssign := func() Transaction {
+		tx, err := m.Begin(IsolationReadCommitted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		xid, err := m.AssignXID(tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx.XID = xid
+		return tx
+	}
+
+	tx1 := beginAndAssign()
+	if err := m.Commit(tx1); err != nil {
+		t.Fatal(err)
+	}
+	tx2 := beginAndAssign()
+	if err := m.CommitAsync(tx2); err != nil {
+		t.Fatal(err)
+	}
+	tx3 := beginAndAssign()
+	if err := m.Rollback(tx3); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []bool{true, false, true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("waitLocalFlush sequence=%v want=%v (Commit, CommitAsync, Rollback)", got, want)
 	}
 }
 
@@ -297,7 +342,7 @@ func TestBegin_DoesNotAssignXID(t *testing.T) {
 func TestCommit_ReadOnlyDoesNotInvokeXactMarker(t *testing.T) {
 	m := NewManager()
 	calls := 0
-	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker) error {
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker, _ bool) error {
 		calls++
 		return nil
 	})
@@ -315,7 +360,7 @@ func TestCommit_ReadOnlyDoesNotInvokeXactMarker(t *testing.T) {
 func TestRollback_ReadOnlyDoesNotInvokeXactMarker(t *testing.T) {
 	m := NewManager()
 	calls := 0
-	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker) error {
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker, _ bool) error {
 		calls++
 		return nil
 	})
@@ -502,7 +547,7 @@ func TestActiveSet_HandlesNotXIDsKey(t *testing.T) {
 func TestXactMarkerLoggerErrorAbortsCommit(t *testing.T) {
 	m := NewManager()
 	wantErr := errors.New("wal: out of disk")
-	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker) error {
+	m.SetXactMarkerLogger(func(_ storage.TransactionID, _ XactMarker, _ bool) error {
 		return wantErr
 	})
 	tx, _ := m.Begin(IsolationReadCommitted)
@@ -593,9 +638,13 @@ func TestClassifyXID_ClogAbortedFallback(t *testing.T) {
 	m := NewManager()
 	m.SetNextXID(1000) // advance the range so xid 50 is "in-range" (below NextXID)
 
-	clog, err := OpenCLog(filepath.Join(t.TempDir(), "pg_xact"))
+	dir := t.TempDir()
+	clog, err := OpenCLog(filepath.Join(dir, "pg_xact"))
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := clog.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
 	m.SetCLog(clog)
 

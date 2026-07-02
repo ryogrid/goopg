@@ -34,43 +34,21 @@ const (
 	TxnStatusSubCommitted TxnStatus = 3
 )
 
-// xidsPerBank is the number of XIDs managed by a single clogBank. 128K XIDs
-// per bank gives fine-grained locking: concurrent commits on different banks
-// never contend on the same mutex.
-const xidsPerBank = 128 * 1024
-
-// clogFlatPageSize is the granularity of an incremental flat-file flush
-// (M0117-0005). The flat file is one byte per XID, so a flat page covers this
-// many consecutive XIDs starting at file offset page*clogFlatPageSize. Chosen
-// equal to the storage block size (8192); xidsPerBank is an exact multiple of
-// it (128*1024 / 8192 = 16 pages per bank) so a flat page never straddles two
-// banks — page p lives in bank p/(xidsPerBank/clogFlatPageSize) at intra-bank
-// offset (p%…)*clogFlatPageSize.
-const clogFlatPageSize = 8192
-
-// clogBank holds the per-bank lock and XID status bytes.
-type clogBank struct {
-	mu   sync.RWMutex
-	data []byte // len == xidsPerBank slots; grown on first write
-}
-
-// CLog is a flat-file persistent commit log that maps transaction IDs to their
-// terminal status. One byte per XID; stored at <DataDir>/global/pg_xact.
+// CLog is the commit log: it maps transaction IDs to their terminal status,
+// backed by the PG-canonical `pg_xact/` SLRU segment files under
+// <DataDir>/pg_xact (2 bits/XID, paged in/out via clogBufferPool).
 //
-// Thread-safe: GetStatus and setStatus contend only on the relevant bank's
-// mutex. Concurrent commits hitting different XID banks proceed in parallel.
-// banksMu is held (write) only when the banks slice itself must grow.
+// Thread-safe: GetStatus/setStatus contend only on the pool's internal lock
+// (clog_bufferpool.go). slruDirMu guards only the slruDir field itself.
 type CLog struct {
-	path    string
-	banks   []*clogBank  // indexed by xid/xidsPerBank; grows on demand
-	banksMu sync.RWMutex // protects banks slice growth only
-	slruDir string       // optional: PG-canonical pg_xact/ SLRU directory; empty = mirror disabled
+	slruDirMu sync.RWMutex
+	slruDir   string // PG-canonical pg_xact/ SLRU directory; set once by EnablePGSLRUMirror
 
 	// oldestClogXid is the lowest XID whose status is still retained. Below it,
 	// status has been truncated away and callers MUST treat the XID as
 	// committed/frozen (it is older than every relfrozenxid). Mirrors PG's
 	// TransamVariables->oldestClogXid. Guarded by oldestMu so it can be read
-	// without taking banksMu. Zero means "no truncation has occurred".
+	// without taking slruDirMu. Zero means "no truncation has occurred".
 	oldestMu      sync.RWMutex
 	oldestClogXid storage.TransactionID
 
@@ -81,42 +59,30 @@ type CLog struct {
 
 	// --- M0117-0005: incremental flush + group commit (gap G7) ---
 
-	// flushMu is the single serialisation point for durable writes (the flat
-	// file and the SLRU). The group-commit leader (clog_groupcommit.go) holds
-	// it while applying a batch; the whole-file flush() callers
-	// (InitializeAsCommitted / MarkUnknownAsAborted / TruncateCLOG) hold it so a
-	// full rewrite never interleaves with an incremental page write.
+	// flushMu is the single serialisation point for durable writes to the SLRU.
+	// The group-commit leader (clog_groupcommit.go) holds it while applying a
+	// batch; EnablePGSLRUMirror holds it while promoting the pool so a
+	// concurrent leader cannot interleave with the promotion.
 	flushMu sync.Mutex
-
-	// dirtyMu guards dirtyPages.
-	dirtyMu sync.Mutex
-	// dirtyPages is the set of flat-file pages (clogFlatPageSize units) whose
-	// bytes changed since the last durable flush. setStatus records the touched
-	// page here; the group-commit leader replays ONLY these pages with WriteAt
-	// instead of rewriting the whole file. Lazily created (nil-safe for the
-	// direct &CLog{} construction used by tests).
-	dirtyPages map[int64]struct{}
 
 	// groupHead is the head of the lock-free group-commit stack (Treiber stack),
 	// mirroring PG's ProcGlobal->clogGroupFirst. Zero value (nil) means the
 	// group is empty. See clog_groupcommit.go.
 	groupHead atomic.Pointer[clogGroupNode]
 
-	// --- M0117-0006 Part B: SLRU buffer pool as the live in-memory store ---
+	// --- M0117-0006: SLRU buffer pool is the sole in-memory store (Part B/C) ---
 
-	// pool, when non-nil, is the bounded LRU page cache (clog_bufferpool.go)
-	// that REPLACES the fully-resident per-XID banks as the in-memory CLOG store
-	// on the production path. It is created by EnablePGSLRUMirror (which always
-	// runs in production) AFTER the one-time flat-file→SLRU backfill, so it
-	// faults pages from a complete pg_xact/ directory. When nil — the &CLog{}
-	// unit-test path with no SLRU mirror — the banks remain the store. GetStatus,
-	// setStatus and the bulk callers (InitializeAsCommitted / MarkUnknownAsAborted
-	// / HighestKnownXID / TruncateCLOG) route through the pool iff it is set, so
-	// the two stores never coexist as the live truth (the M0117-0004 dual-store
-	// hazard: there is no second store to disagree, so the pool's PG-faithful
-	// clear-then-set lane update is correct). Part C removes the banks entirely.
-	// atomic.Pointer so the startup store and concurrent commit-path loads are
-	// race-free (the pointer is set once, before the server accepts connections).
+	// pool is the bounded LRU page cache (clog_bufferpool.go) that IS the CLOG
+	// store: GetStatus/setStatus and the bulk callers (InitializeAsCommitted /
+	// MarkUnknownAsAborted / HighestKnownXID / TruncateCLOG / IsEmpty) all route
+	// through it. Created by EnablePGSLRUMirror, which MUST run before any of
+	// those methods are called (production always does this immediately after
+	// OpenCLog; see initdb.Open / initdb.bootstrapCLog). M0117-0006 Part C
+	// removed the legacy fully-resident per-XID "banks" store this pool used to
+	// coexist with — there is exactly one live store now, so there is no
+	// dual-store hazard (M0117-0004) to reconcile. atomic.Pointer so the
+	// startup store and concurrent commit-path loads are race-free (the pointer
+	// is set once, before the server accepts connections).
 	pool atomic.Pointer[clogBufferPool]
 
 	// clogBuffers is the resident-page budget for pool (the transaction_buffers
@@ -177,158 +143,57 @@ func CLOGPagePrecedes(page1, page2 int64) bool {
 		txnPrecedes(xid1, xid2+clogXactsPerPage-1)
 }
 
-// bankIdx returns the bank index for xid.
-func bankIdx(xid storage.TransactionID) int {
-	return int(xid) / xidsPerBank
-}
-
-// byteIdx returns the byte offset within its bank for xid.
-func byteIdx(xid storage.TransactionID) int {
-	return int(xid) % xidsPerBank
-}
-
-// getOrCreateBank returns the bank for the given index, creating it (and any
-// intermediate banks) if needed. Acquires banksMu.Lock() only when the slice
-// must grow.
-func (c *CLog) getOrCreateBank(idx int) *clogBank {
-	c.banksMu.RLock()
-	if idx < len(c.banks) && c.banks[idx] != nil {
-		b := c.banks[idx]
-		c.banksMu.RUnlock()
-		return b
-	}
-	c.banksMu.RUnlock()
-
-	c.banksMu.Lock()
-	defer c.banksMu.Unlock()
-	// Grow slice to hold idx.
-	for len(c.banks) <= idx {
-		c.banks = append(c.banks, nil)
-	}
-	if c.banks[idx] == nil {
-		c.banks[idx] = &clogBank{}
-	}
-	return c.banks[idx]
-}
-
-// getBank returns the bank for the given index if it exists, or nil. Does not
-// create a new bank. Used for read-only lookups.
-func (c *CLog) getBank(idx int) *clogBank {
-	c.banksMu.RLock()
-	defer c.banksMu.RUnlock()
-	if idx < len(c.banks) {
-		return c.banks[idx]
-	}
-	return nil
-}
-
-// OpenCLog opens (or creates) the commit log at path. If the file exists its
-// contents are loaded; if not, an empty in-memory CLog is returned. The clog
-// file is created on the first SetCommitted / SetAborted call.
+// OpenCLog constructs a CLog. path is accepted for call-site compatibility
+// with the pre-M0117-0006-Part-C signature but is no longer read: the legacy
+// flat-file store is retired, and the SLRU buffer pool created by the
+// mandatory follow-up EnablePGSLRUMirror call is now the only in-memory/
+// durable store (see clog.go's CLog doc comment and the pg_xact/ SLRU
+// directory it manages).
 func OpenCLog(path string) (*CLog, error) {
-	c := &CLog{path: path}
-	raw, err := os.ReadFile(path)
-	if err == nil {
-		// Distribute loaded bytes to banks by XID range.
-		c.distributeToBanks(raw)
-		return c, nil
-	}
-	if os.IsNotExist(err) {
-		return c, nil // fresh clog — file created on first write
-	}
-	return nil, fmt.Errorf("clog: read %q: %w", path, err)
+	return &CLog{}, nil
 }
 
-// distributeToBanks populates banks from a flat byte slice (as read from disk).
-// Each byte at index i represents XID i.
-func (c *CLog) distributeToBanks(raw []byte) {
-	if len(raw) == 0 {
-		return
-	}
-	// Calculate how many banks are needed.
-	lastXID := len(raw) - 1
-	maxBankIdx := lastXID / xidsPerBank
-
-	c.banksMu.Lock()
-	for len(c.banks) <= maxBankIdx {
-		c.banks = append(c.banks, nil)
-	}
-	c.banksMu.Unlock()
-
-	for bi := 0; bi <= maxBankIdx; bi++ {
-		start := bi * xidsPerBank
-		end := start + xidsPerBank
-		if end > len(raw) {
-			end = len(raw)
-		}
-		chunk := make([]byte, end-start)
-		copy(chunk, raw[start:end])
-
-		c.banksMu.Lock()
-		if c.banks[bi] == nil {
-			c.banks[bi] = &clogBank{}
-		}
-		c.banks[bi].data = chunk
-		c.banksMu.Unlock()
-	}
-}
-
-// IsEmpty reports whether the clog has no entries yet (file was absent or the
-// on-disk data is zero-length). Used by Open to detect the upgrade case.
+// IsEmpty reports whether the clog has no committed/aborted entries yet on
+// disk — used by initdb.Open to detect the pre-M0030-0007 upgrade case. This
+// MUST be a disk-truth check, not a process-local flag: it is called once at
+// startup, immediately after EnablePGSLRUMirror and before any in-process
+// SetCommitted/SetAborted call, so a flag reset by every process restart would
+// misreport "empty" on every restart of a populated cluster and misroute into
+// the upgrade path (InitializeAsCommitted, which stamps every Unknown XID
+// Committed) instead of the correct crash-recovery MarkUnknownAsAborted sweep
+// — silently resurrecting crashed/in-progress transactions as committed.
+// highestSLRUXID already scans the on-disk SLRU segments for the highest XID
+// carrying a non-Unknown lane, returning 0 iff none exists anywhere on disk.
 func (c *CLog) IsEmpty() bool {
-	c.banksMu.RLock()
-	nBanks := len(c.banks)
-	c.banksMu.RUnlock()
-	if nBanks == 0 {
-		return true
-	}
-	// Check if any bank has data.
-	for bi := 0; bi < nBanks; bi++ {
-		b := c.getBank(bi)
-		if b == nil {
-			continue
-		}
-		b.mu.RLock()
-		n := len(b.data)
-		b.mu.RUnlock()
-		if n > 0 {
-			return false
-		}
-	}
-	return true
+	return c.highestSLRUXID() == 0
 }
 
 // GetStatus returns the recorded status for xid. Returns TxnStatusUnknown if
 // xid has no entry (transaction never finished or XID is out of range).
 func (c *CLog) GetStatus(xid storage.TransactionID) TxnStatus {
-	if p := c.pool.Load(); p != nil {
-		// M0117-0006 Part B: the buffer pool is the live store. An unwritten lane
-		// faults in as all-zero (= in-progress = Unknown), reproducing the legacy
-		// "byte past the grown bank ⇒ Unknown" behaviour; callers still
-		// short-circuit xid < OldestClogXid()/FirstNormalTransactionID upstream.
-		st, err := p.getStatus(xid)
-		if err != nil {
-			return TxnStatusUnknown
-		}
-		return st
-	}
-	bi := bankIdx(xid)
-	byt := byteIdx(xid)
-	b := c.getBank(bi)
-	if b == nil {
+	// The buffer pool is the sole live store (M0117-0006 Part C); an unwritten
+	// lane faults in as all-zero (= in-progress = Unknown). Callers still
+	// short-circuit xid < OldestClogXid()/FirstNormalTransactionID upstream.
+	st, err := c.pool.Load().getStatus(xid)
+	if err != nil {
 		return TxnStatusUnknown
 	}
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	if byt >= len(b.data) {
-		return TxnStatusUnknown
-	}
-	return TxnStatus(b.data[byt])
+	return st
 }
 
 // SetCommitted marks xid as committed and persists the change to disk.
 func (c *CLog) SetCommitted(xid storage.TransactionID) error {
 	return c.setStatus(xid, TxnStatusCommitted)
+}
+
+// SetCommittedWithLSN marks xid as committed and associates it with the
+// commit record's LSN, so the async-commit write barrier
+// (flushWALBeforeWriteLocked) flushes the WAL up to at least lsn before
+// this XID's CLOG page can reach disk (M0117-0007 Part B; PG's
+// TransactionIdAsyncCommitTree). Used by the synchronous_commit=off path in
+// place of SetCommitted, which associates no LSN (lsn=0 is a barrier no-op).
+func (c *CLog) SetCommittedWithLSN(xid storage.TransactionID, lsn uint64) error {
+	return c.setStatusWithLSN(xid, TxnStatusCommitted, lsn)
 }
 
 // SetAborted marks xid as aborted and persists the change to disk.
@@ -337,8 +202,8 @@ func (c *CLog) SetAborted(xid storage.TransactionID) error {
 }
 
 // SetSubCommitted records xid as a sub-committed subtransaction (PG's
-// TRANSACTION_STATUS_SUB_COMMITTED, 0x03) in both the flat file and the SLRU
-// mirror. Caller contract: xid is a subtransaction that has committed while
+// TRANSACTION_STATUS_SUB_COMMITTED, 0x03) in the SLRU pool. Caller contract:
+// xid is a subtransaction that has committed while
 // its parent top-level XID is still in progress — the caller is responsible
 // for checking that condition; this method only records the lane. Resolve a
 // sub-committed XID's true commit fate with DidCommit (which consults the
@@ -399,48 +264,29 @@ func (c *CLog) InitializeAsCommitted(highXID storage.TransactionID) error {
 	if highXID == 0 {
 		return nil
 	}
-	if p := c.pool.Load(); p != nil {
-		// M0117-0006 Part B: stamp [FirstNormalTransactionID, highXID) committed
-		// where currently in-progress, through the pool (the single live store).
-		// Bootstrap/frozen lanes stay zero. One flushDirty at the end batches the
-		// fsync per touched segment.
-		dirty := false
-		for i := int(FirstNormalTransactionID); i < int(highXID); i++ {
-			xid := storage.TransactionID(i)
-			st, err := p.getStatus(xid)
-			if err != nil {
+	p := c.pool.Load()
+	// Stamp [FirstNormalTransactionID, highXID) committed where currently
+	// in-progress, through the pool (the sole live store). Bootstrap/frozen
+	// lanes stay zero. One flushDirty at the end batches the fsync per touched
+	// segment.
+	dirty := false
+	for i := int(FirstNormalTransactionID); i < int(highXID); i++ {
+		xid := storage.TransactionID(i)
+		st, err := p.getStatus(xid)
+		if err != nil {
+			return err
+		}
+		if st == TxnStatusUnknown {
+			if _, err := p.setStatus(xid, TxnStatusCommitted); err != nil {
 				return err
 			}
-			if st == TxnStatusUnknown {
-				if _, err := p.setStatus(xid, TxnStatusCommitted); err != nil {
-					return err
-				}
-				dirty = true
-			}
+			dirty = true
 		}
-		if !dirty {
-			return nil
-		}
-		return p.flushDirty()
 	}
-	top := int(highXID)
-	// Mark [1, top) as committed per bank, preserving any entries already set.
-	for i := 1; i < top; i++ {
-		xid := storage.TransactionID(i)
-		bi := bankIdx(xid)
-		byt := byteIdx(xid)
-		b := c.getOrCreateBank(bi)
-		b.mu.Lock()
-		// Grow bank data if needed.
-		for len(b.data) <= byt {
-			b.data = append(b.data, byte(TxnStatusUnknown))
-		}
-		if b.data[byt] == byte(TxnStatusUnknown) {
-			b.data[byt] = byte(TxnStatusCommitted)
-		}
-		b.mu.Unlock()
+	if !dirty {
+		return nil
 	}
-	return c.flush()
+	return p.flushDirty()
 }
 
 // MarkUnknownAsAborted marks every XID in the range [1, highXID) whose current
@@ -462,83 +308,42 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 	if highXID == 0 {
 		return nil
 	}
-	if p := c.pool.Load(); p != nil {
-		// M0117-0006 Part B: sweep through the pool (the single live store).
-		// Floor at the lowest XID still covered by an on-disk SLRU segment (see
-		// the legacy-path rationale below) and never below FirstNormalTransactionID
-		// so bootstrap/frozen lanes stay zero.
-		low := int(FirstNormalTransactionID)
-		if floor := c.firstRetainedSLRUXID(); int(floor) > low {
-			low = int(floor)
-		}
-		dirty := false
-		for i := low; i < int(highXID); i++ {
-			xid := storage.TransactionID(i)
-			st, err := p.getStatus(xid)
-			if err != nil {
-				return err
-			}
-			if st == TxnStatusUnknown {
-				if _, err := p.setStatus(xid, TxnStatusAborted); err != nil {
-					return err
-				}
-				dirty = true
-			}
-		}
-		if !dirty {
-			return nil
-		}
-		return p.flushDirty()
-	}
-	top := int(highXID)
-	// Floor the sweep at the lowest XID still covered by an on-disk pg_xact/
-	// SLRU segment. After a prior TruncateCLOG, segment files entirely below the
-	// truncation horizon were unlinked, so XIDs below the lowest surviving
-	// segment have been frozen/truncated (presumed committed) — re-stamping them
-	// Aborted here would both recreate the deleted segments full of Aborted lanes
-	// (undoing truncation, breaking basebackup byte-equality) and could make the
-	// direct GetStatus-based heap-load filter reject legitimately retained
-	// tuples. Leaving them Unknown is strictly safer: snapshot visibility treats
-	// them committed via xid < Xmin, and the heap-load filter rejects only an
-	// explicit Aborted. When no truncation has occurred (segment 0 present, or
-	// the mirror is disabled) the floor is FirstNormalTransactionID and behavior
-	// is unchanged. (Review fix M1.)
-	low := 1
-	if floor := c.firstRetainedSLRUXID(); floor > FirstNormalTransactionID {
+	// Sweep through the pool (the sole live store). Floor at the lowest XID
+	// still covered by an on-disk SLRU segment — after a prior TruncateCLOG,
+	// segment files entirely below the truncation horizon were unlinked, so
+	// XIDs below the lowest surviving segment have been frozen/truncated
+	// (presumed committed); re-stamping them Aborted here would recreate the
+	// deleted segments full of Aborted lanes (undoing truncation, breaking
+	// basebackup byte-equality) and could make the direct GetStatus-based
+	// heap-load filter reject legitimately retained tuples. Leaving them
+	// Unknown is strictly safer: snapshot visibility treats them committed via
+	// xid < Xmin, and the heap-load filter rejects only an explicit Aborted.
+	// When no truncation has occurred the floor is FirstNormalTransactionID and
+	// behavior is unchanged (never below it, so bootstrap/frozen lanes stay
+	// zero). (Review fix M1.)
+	p := c.pool.Load()
+	low := int(FirstNormalTransactionID)
+	if floor := c.firstRetainedSLRUXID(); int(floor) > low {
 		low = int(floor)
 	}
 	dirty := false
-	for i := low; i < top; i++ {
+	for i := low; i < int(highXID); i++ {
 		xid := storage.TransactionID(i)
-		bi := bankIdx(xid)
-		byt := byteIdx(xid)
-		b := c.getOrCreateBank(bi)
-		b.mu.Lock()
-		// Grow bank data if needed; newly-appended slots default to Unknown
-		// and will be stamped Aborted (crashed-in-progress xids).
-		for len(b.data) <= byt {
-			b.data = append(b.data, byte(TxnStatusUnknown))
+		st, err := p.getStatus(xid)
+		if err != nil {
+			return err
 		}
-		if b.data[byt] == byte(TxnStatusUnknown) {
-			b.data[byt] = byte(TxnStatusAborted)
+		if st == TxnStatusUnknown {
+			if _, err := p.setStatus(xid, TxnStatusAborted); err != nil {
+				return err
+			}
 			dirty = true
 		}
-		b.mu.Unlock()
 	}
 	if !dirty {
 		return nil
 	}
-	// Project the stamped range into the SLRU mirror with ONE fsync per
-	// segment file rather than one per XID. The naive per-XID path
-	// (mirrorToSLRUUnlocked, which fsyncs on every call) made startup look
-	// hung after pg_resetwal --next-transaction-id advances NextXID far past
-	// the bootstrap pg_xact segment: the implicit-abort sweep then stamps up
-	// to ~1M XIDs and would issue ~1M fsyncs. Batching collapses that to one
-	// fsync per ~1M-XID segment. M0110-0004 (RW-002 (a)).
-	if err := c.mirrorTerminalRangeBatchedUnlocked(storage.TransactionID(low), highXID); err != nil {
-		return err
-	}
-	return c.flush()
+	return p.flushDirty()
 }
 
 // firstRetainedSLRUXID returns the lowest XID still covered by an on-disk
@@ -549,9 +354,9 @@ func (c *CLog) MarkUnknownAsAborted(highXID storage.TransactionID) error {
 // so callers can avoid resurrecting truncated XIDs. Used by MarkUnknownAsAborted
 // (review fix M1).
 func (c *CLog) firstRetainedSLRUXID() storage.TransactionID {
-	c.banksMu.RLock()
+	c.slruDirMu.RLock()
 	dir := c.slruDir
-	c.banksMu.RUnlock()
+	c.slruDirMu.RUnlock()
 	if dir == "" {
 		return FirstNormalTransactionID
 	}
@@ -602,9 +407,9 @@ func (c *CLog) firstRetainedSLRUXID() storage.TransactionID {
 // descending order and each from its tail, so the first terminal lane found is
 // the maximum.
 func (c *CLog) highestSLRUXID() storage.TransactionID {
-	c.banksMu.RLock()
+	c.slruDirMu.RLock()
 	dir := c.slruDir
-	c.banksMu.RUnlock()
+	c.slruDirMu.RUnlock()
 	if dir == "" {
 		return 0
 	}
@@ -675,299 +480,78 @@ func parseSLRUSegName(name string) (int64, bool) {
 	return segNo, true
 }
 
-// mirrorTerminalRangeBatchedUnlocked writes the SLRU 2-bit lanes for every
-// committed/aborted XID in [FirstNormalTransactionID, hi) into the pg_xact/
-// segment files, performing a single fsync per segment file instead of one
-// per XID (the cost that made MarkUnknownAsAborted pathologically slow after a
-// pg_resetwal NextXID jump). OR semantics mirror PG's
-// TransactionIdSetStatusBit; existing file content is read first so any
-// committed bits already mirrored are preserved, and re-ORing an already-set
-// lane is idempotent. No-op when the SLRU mirror is disabled. The caller must
-// hold no bank locks (GetStatus reacquires them per slot).
-func (c *CLog) mirrorTerminalRangeBatchedUnlocked(loXID, hi storage.TransactionID) error {
-	c.banksMu.RLock()
-	dir := c.slruDir
-	c.banksMu.RUnlock()
-	if dir == "" || hi <= FirstNormalTransactionID {
-		return nil
-	}
-	floor := uint64(FirstNormalTransactionID)
-	if uint64(loXID) > floor {
-		floor = uint64(loXID)
-	}
-	// Start at the segment holding the floor so segments unlinked by a prior
-	// TruncateCLOG are not recreated by the O_CREATE open below (review fix M1).
-	firstSeg := floor / clogXactsPerSegment
-	lastSeg := (uint64(hi) - 1) / clogXactsPerSegment
-	for seg := firstSeg; seg <= lastSeg; seg++ {
-		segStart := seg * clogXactsPerSegment
-		segEnd := segStart + clogXactsPerSegment
-		lo := segStart
-		if lo < floor {
-			lo = floor
-		}
-		hiX := segEnd
-		if hiX > uint64(hi) {
-			hiX = uint64(hi)
-		}
-		if lo >= hiX {
-			continue
-		}
-		// Page span needed to hold the highest touched XID in this segment.
-		topXidInSeg := (hiX - 1) % clogXactsPerSegment
-		topPage := topXidInSeg / clogXactsPerPage
-		needSize := int64(topPage+1) * int64(storage.BlockSize)
-
-		segPath := filepath.Join(dir, fmt.Sprintf("%04X", seg))
-		f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0600)
-		if err != nil {
-			return fmt.Errorf("clog slru: open %q: %w", segPath, err)
-		}
-		fi, err := f.Stat()
-		if err != nil {
-			f.Close()
-			return fmt.Errorf("clog slru: stat %q: %w", segPath, err)
-		}
-		bufSize := needSize
-		if fi.Size() > bufSize {
-			bufSize = fi.Size()
-		}
-		buf := make([]byte, bufSize)
-		if fi.Size() > 0 {
-			if _, err := f.ReadAt(buf[:fi.Size()], 0); err != nil && !errors.Is(err, io.EOF) {
-				f.Close()
-				return fmt.Errorf("clog slru: read %q: %w", segPath, err)
-			}
-		}
-		for xid := lo; xid < hiX; xid++ {
-			var bits byte
-			switch c.GetStatus(storage.TransactionID(xid)) {
-			case TxnStatusCommitted:
-				bits = pgClogStatusCommitted
-			case TxnStatusAborted:
-				bits = pgClogStatusAborted
-			case TxnStatusSubCommitted:
-				bits = pgClogStatusSubCommitted
-			default:
-				continue
-			}
-			xidInSeg := xid % clogXactsPerSegment
-			pageInSeg := xidInSeg / clogXactsPerPage
-			xidInPage := xidInSeg % clogXactsPerPage
-			byteOffset := int(pageInSeg)*storage.BlockSize + int(xidInPage/clogXactsPerByte)
-			bShift := uint((xidInPage % clogXactsPerByte) * clogBitsPerXact)
-			buf[byteOffset] |= bits << bShift
-		}
-		if _, err := f.WriteAt(buf, 0); err != nil {
-			f.Close()
-			return fmt.Errorf("clog slru: write %q: %w", segPath, err)
-		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			return fmt.Errorf("clog slru: sync %q: %w", segPath, err)
-		}
-		f.Close()
-	}
-	return nil
+// setStatus updates data[xid] = status and rewrites the file, with no
+// async-commit LSN association. Equivalent to setStatusWithLSN(xid, status, 0).
+func (c *CLog) setStatus(xid storage.TransactionID, status TxnStatus) error {
+	return c.setStatusWithLSN(xid, status, 0)
 }
 
-// setStatus updates data[xid] = status and rewrites the file. When a PG SLRU
-// directory has been wired (see EnablePGSLRUMirror), the matching 2-bit lane
-// of <slruDir>/<segno>:<page>:<byte> is also updated so a PG standby reading
-// the basebackup-shipped pg_xact/ via SimpleLruReadPage_ReadOnly observes the
-// correct status. M0106-0010 batched-44.
-func (c *CLog) setStatus(xid storage.TransactionID, status TxnStatus) error {
-	if p := c.pool.Load(); p != nil {
-		// M0117-0006 Part B: the pool is the live store. Bootstrap/frozen XIDs
-		// keep their pg_xact/0000 lanes zero (PG's TransactionLogFetch never
-		// writes them) so basebackup byte-equality holds — mirror that here as
-		// mirrorGroupToSLRULocked did on the legacy path.
-		if xid < FirstNormalTransactionID {
-			return nil
-		}
-		// Write the 2-bit lane (clear-then-set, PG-faithful) into the resident
-		// page. Durability is driven by the group-commit leader
-		// (applyGroupBatchLocked → pool.flushDirty, one fsync per touched
-		// segment). No banks / flat-file write: the SLRU is the single durable
-		// store. An idempotent lane (already at this terminal value) skips the
-		// group-commit round-trip exactly as the legacy fast path did.
-		changed, err := p.setStatus(xid, status)
-		if err != nil {
-			return err
-		}
-		if !changed {
-			return nil
-		}
-		return c.groupUpdate(xid, status)
+// setStatusWithLSN updates data[xid] = status and rewrites the file. When a
+// PG SLRU directory has been wired (see EnablePGSLRUMirror), the matching
+// 2-bit lane of <slruDir>/<segno>:<page>:<byte> is also updated so a PG
+// standby reading the basebackup-shipped pg_xact/ via
+// SimpleLruReadPage_ReadOnly observes the correct status. M0106-0010
+// batched-44. lsn != 0 additionally raises the XID's CLOG page's
+// async-commit group LSN (M0117-0007 Part B) so the write barrier flushes
+// the WAL before that page can reach disk; lsn == 0 (goopg's
+// InvalidXLogRecPtr) is a no-op on the group array, matching PG's recovery
+// branch.
+func (c *CLog) setStatusWithLSN(xid storage.TransactionID, status TxnStatus, lsn uint64) error {
+	p := c.pool.Load()
+	// Bootstrap/frozen XIDs keep their pg_xact/0000 lanes zero (PG's
+	// TransactionLogFetch never writes them) so basebackup byte-equality holds.
+	if xid < FirstNormalTransactionID {
+		return nil
 	}
-	bi := bankIdx(xid)
-	byt := byteIdx(xid)
-	b := c.getOrCreateBank(bi)
-
-	b.mu.Lock()
-	// Grow buffer to accommodate xid.
-	for len(b.data) <= byt {
-		b.data = append(b.data, byte(TxnStatusUnknown))
+	// Write the 2-bit lane (clear-then-set, PG-faithful) into the resident
+	// page. An idempotent lane (already at this terminal value) skips the
+	// group-commit round-trip below entirely.
+	changed, err := p.setStatusWithLSN(xid, status, lsn)
+	if err != nil {
+		return err
 	}
-	if TxnStatus(b.data[byt]) == status {
-		b.mu.Unlock()
-		return nil // idempotent — no write needed
+	if !changed {
+		return nil
 	}
-	b.data[byt] = byte(status)
-	b.mu.Unlock()
-
-	// Record the touched flat-file page so the durable write replays only the
-	// changed page(s), not the whole file (M0117-0005 Part A).
-	c.markFlatDirty(xid)
-
-	// Route the durable write (incremental flat page + SLRU fsync) through the
-	// group-commit layer so concurrent committers share one batched flush
-	// (M0117-0005 Part B, mirroring PG TransactionGroupUpdateXidStatus).
+	if lsn != 0 {
+		// Async commit (M0117-0007 Part B continuation, gap G8 latency
+		// reduction): p.setStatusWithLSN above already marked the page dirty
+		// and raised its async-commit group LSN, which is enough for
+		// GetStatus (in-memory) to observe the new status right away. Skip
+		// the group-commit leader's eager durable write-back
+		// (applyGroupBatchLocked → pool.flushDirty, a synchronous fsync round
+		// trip) that a *synchronous* commit needs to return a durability
+		// guarantee to its caller — an async commit makes no such promise.
+		// The page's actual write-back is deferred to whichever happens
+		// first: a later synchronous commit's group-commit flush (which
+		// drains every currently-dirty page, not just its own), LRU
+		// eviction (pinPageLocked already barrier-guards a dirty victim), or
+		// the checkpointer's FlushAll (see CLog.FlushAll, registered as a
+		// wal.DirtyPageFlusher so a dirty async-committed page is never left
+		// unbounded between checkpoints). This is the change that removes
+		// the fsync round trip from a synchronous_commit=off commit's
+		// critical path.
+		return nil
+	}
 	return c.groupUpdate(xid, status)
 }
 
-// markFlatDirty records that the flat-file page holding xid has changed and
-// must be re-written on the next durable flush (M0117-0005).
-func (c *CLog) markFlatDirty(xid storage.TransactionID) {
-	page := int64(xid) / clogFlatPageSize
-	c.dirtyMu.Lock()
-	if c.dirtyPages == nil {
-		c.dirtyPages = make(map[int64]struct{})
-	}
-	c.dirtyPages[page] = struct{}{}
-	c.dirtyMu.Unlock()
-}
-
-// flushDirtyPagesLocked writes only the flat-file pages recorded by
-// markFlatDirty back to disk, then clears the dirty set. Each dirty page is
-// assembled from its bank's bytes and written with WriteAt at offset
-// page*clogFlatPageSize (extending the file with a zero gap if needed — zero ==
-// TxnStatusUnknown, harmless). Like the legacy whole-file flush(), the flat
-// file is NOT fsynced: the fsynced pg_xact/ SLRU is the durable source of truth
-// and MarkUnknownAsAborted repairs the flat cache after a crash. The caller
-// MUST hold flushMu so a concurrent whole-file flush() cannot interleave.
-// M0117-0005.
-func (c *CLog) flushDirtyPagesLocked() error {
-	c.dirtyMu.Lock()
-	if len(c.dirtyPages) == 0 {
-		c.dirtyMu.Unlock()
+// FlushAll writes every dirty resident CLOG page back to its segment file,
+// fsyncing each touched segment. It implements wal.DirtyPageFlusher (Go
+// interfaces are structurally satisfied, so this package need not import
+// wal) and is registered with the checkpointer alongside the heap buffer
+// pool (M0117-0007 Part B continuation) so an async commit's deferred
+// write-back above is bounded by checkpoint_timeout — without this, an
+// all-async workload could leave CLOG pages dirty in memory indefinitely,
+// bounded only by the resident-page eviction budget. A nil pool (called
+// before EnablePGSLRUMirror) is a no-op rather than a panic, mirroring
+// SetFlushWALHook's out-of-order-call contract.
+func (c *CLog) FlushAll() error {
+	p := c.pool.Load()
+	if p == nil {
 		return nil
 	}
-	pages := make([]int64, 0, len(c.dirtyPages))
-	for p := range c.dirtyPages {
-		pages = append(pages, p)
-	}
-	c.dirtyPages = make(map[int64]struct{})
-	c.dirtyMu.Unlock()
-
-	f, err := os.OpenFile(c.path, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return fmt.Errorf("clog: open %q: %w", c.path, err)
-	}
-	defer f.Close()
-
-	const pagesPerBank = xidsPerBank / clogFlatPageSize
-	buf := make([]byte, clogFlatPageSize)
-	for _, page := range pages {
-		// Assemble the page from its owning bank (a flat page never straddles
-		// two banks — see clogFlatPageSize).
-		for i := range buf {
-			buf[i] = 0
-		}
-		bi := int(page) / pagesPerBank
-		within := (int(page) % pagesPerBank) * clogFlatPageSize
-		if b := c.getBank(bi); b != nil {
-			b.mu.RLock()
-			if within < len(b.data) {
-				end := within + clogFlatPageSize
-				if end > len(b.data) {
-					end = len(b.data)
-				}
-				copy(buf, b.data[within:end])
-			}
-			b.mu.RUnlock()
-		}
-		if _, err := f.WriteAt(buf, page*clogFlatPageSize); err != nil {
-			return fmt.Errorf("clog: write page %d to %q: %w", page, c.path, err)
-		}
-	}
-	return nil
-}
-
-// flush collects all bank data into a single flat slice and writes it to the
-// clog file. Acquires banksMu.RLock() and per-bank mu.RLock() to read data.
-//
-// This is the whole-file rewrite, retained for the bulk/relayout callers
-// (InitializeAsCommitted, MarkUnknownAsAborted, TruncateCLOG); the per-commit
-// hot path uses incremental page writes via the group-commit layer instead
-// (M0117-0005). flush() takes flushMu so a full rewrite never interleaves with
-// an incremental page write, and clears the dirty-page set because the full
-// rewrite supersedes every pending page.
-func (c *CLog) flush() error {
-	c.flushMu.Lock()
-	defer c.flushMu.Unlock()
-	return c.flushLocked()
-}
-
-// flushLocked is flush() without acquiring flushMu; the caller must already
-// hold it (the group-commit leader does, when it needs a full rewrite).
-func (c *CLog) flushLocked() error {
-	c.dirtyMu.Lock()
-	c.dirtyPages = nil // superseded by the whole-file rewrite below
-	c.dirtyMu.Unlock()
-
-	c.banksMu.RLock()
-	nBanks := len(c.banks)
-	c.banksMu.RUnlock()
-
-	if nBanks == 0 {
-		return os.WriteFile(c.path, nil, 0600)
-	}
-
-	// Find the last bank that has data to determine total byte count.
-	lastUsedBank := -1
-	lastUsedLen := 0
-	for bi := nBanks - 1; bi >= 0; bi-- {
-		b := c.getBank(bi)
-		if b == nil {
-			continue
-		}
-		b.mu.RLock()
-		n := len(b.data)
-		b.mu.RUnlock()
-		if n > 0 {
-			lastUsedBank = bi
-			lastUsedLen = n
-			break
-		}
-	}
-	if lastUsedBank < 0 {
-		return os.WriteFile(c.path, nil, 0600)
-	}
-
-	totalLen := lastUsedBank*xidsPerBank + lastUsedLen
-	out := make([]byte, totalLen)
-
-	for bi := 0; bi <= lastUsedBank; bi++ {
-		b := c.getBank(bi)
-		if b == nil {
-			// Absent bank → all-Unknown slots; already zero in out.
-			continue
-		}
-		b.mu.RLock()
-		start := bi * xidsPerBank
-		// Cap copyLen to what fits in out: the last bank may have grown
-		// between the scan above (which set lastUsedLen) and this copy, so
-		// start+len(b.data) might exceed len(out). Limit defensively.
-		copyLen := len(b.data)
-		if start+copyLen > len(out) {
-			copyLen = len(out) - start
-		}
-		copy(out[start:start+copyLen], b.data[:copyLen])
-		b.mu.RUnlock()
-	}
-
-	return os.WriteFile(c.path, out, 0600)
+	return p.flushDirty()
 }
 
 // PG SLRU CLOG layout constants. PG18 packs 2 bits per XID into bytes ordered
@@ -1009,55 +593,18 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 		return fmt.Errorf("clog slru: stat %q: %w", seg0, err)
 	}
 
-	// Set slruDir before loading so mirrorToSLRUUnlocked can see it.
-	// Use banksMu as a convenient global lock for this field assignment.
-	c.banksMu.Lock()
+	// Set slruDir before creating the pool so mirrorToSLRUUnlocked (still used
+	// by the sibling-path equivalence test) can see it.
+	c.slruDirMu.Lock()
 	c.slruDir = dir
-	c.banksMu.Unlock()
+	c.slruDirMu.Unlock()
 
-	// M0106-0013: load committed/aborted entries from the on-disk SLRU
-	// files into the banks BEFORE the backfill below. The SLRU is fsynced on
-	// every commit (mirrorToSLRUUnlocked calls f.Sync()), making it the most
-	// durable source of truth after a crash. The flat-file (loaded by
-	// OpenCLog) is written without fsync and may be stale or truncated
-	// (os.WriteFile uses O_TRUNC; a crash between truncate and write leaves
-	// a zero-length file). By loading SLRU first, crash-recovery sees the
-	// correct committed/aborted status even when the flat-file is missing.
-	if err := c.loadFromSLRU(dir); err != nil {
-		return err
-	}
-
-	// Backfill any in-memory committed/aborted entries so an opened clog
-	// (which loaded data from the flat file but had no SLRU mirror) is
-	// projected to the SLRU on first enable. Use the batched range writer
-	// (ONE fsync per segment) rather than the naive per-XID mirror: on a
-	// well-aged cluster the banks hold ~NextXID terminal entries, so the old
-	// per-XID path issued ~NextXID open+fsync+close cycles here — on WSL2's
-	// slow fsync that made startup take many minutes and infra-failed the
-	// TPC-H spot-check's 60 s readiness window (it is purely a re-projection
-	// of in-memory state, so a crash mid-backfill simply re-backfills next
-	// start — no per-XID durability barrier is required). The batched writer
-	// reads each XID's real status via GetStatus and ORs into the existing
-	// segment bytes, so it is byte-identical to the per-XID path it replaces.
-	// See design 0117-0009 and memory tpch_spotcheck_slru_backfill_startup_hang.
-	c.banksMu.RLock()
-	nBanks := len(c.banks)
-	c.banksMu.RUnlock()
-	if nBanks > 0 {
-		hi := storage.TransactionID(uint64(nBanks) * uint64(xidsPerBank))
-		if err := c.mirrorTerminalRangeBatchedUnlocked(FirstNormalTransactionID, hi); err != nil {
-			return err
-		}
-	}
-
-	// M0117-0006 Part B: promote the bounded SLRU buffer pool to the live
-	// in-memory store. Created LAST — after loadFromSLRU + the backfill above —
-	// so it faults pages from a pg_xact/ directory in which every terminal bank
-	// entry (including flat-file-only ones) has already been projected; the pool
-	// therefore observes the same status set the legacy banks did. From here on
-	// GetStatus / setStatus and the bulk callers route through the pool, and the
-	// resident banks are vestigial (dropped in Part C). flushMu serialises the
-	// promotion against any in-flight group-commit leader.
+	// M0117-0006 Part C: the pool IS the store from the start — no legacy
+	// banks/flat-file staging step or backfill round-trip. It lazily faults
+	// pages in directly from dir on first read (already exercised by
+	// TestCLOGBufferPoolLRUEviction/RoundTripAllLanes), so there is no separate
+	// load step to run before it exists. flushMu serialises the promotion
+	// against any in-flight group-commit leader.
 	c.flushMu.Lock()
 	c.pool.Store(newCLOGBufferPool(dir, EffectiveCLOGBuffers(c.clogBuffers, 0)))
 	c.flushMu.Unlock()
@@ -1072,104 +619,17 @@ func (c *CLog) SetCLOGBuffers(n int) {
 	c.clogBuffers = n
 }
 
-// loadFromSLRU reads committed/aborted entries from existing SLRU segment
-// files under dir and merges them into the banks. Called by EnablePGSLRUMirror
-// before the backfill pass so the on-disk SLRU state (fsynced at every commit)
-// wins over a potentially stale flat-file. Best-effort: segment files that
-// cannot be read are skipped rather than returning an error — a missing or
-// corrupt segment means the affected XIDs remain as Unknown and are handled by
-// MarkUnknownAsAborted.
-func (c *CLog) loadFromSLRU(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("clog slru: readdir %q: %w", dir, err)
+// SetFlushWALHook wires the CLOG buffer pool's async-commit write barrier
+// (M0117-0007 Part A) to fn, invoked with a dirty page's max group LSN
+// immediately before that page is written back to disk. Must be called
+// after EnablePGSLRUMirror (which creates the pool); a nil pool (called out
+// of order) is a no-op rather than a panic. fn is typically
+// wal.Writer.FlushUpTo — injected as a plain closure so this package stays
+// free of a wal import.
+func (c *CLog) SetFlushWALHook(fn func(lsn uint64) error) {
+	if p := c.pool.Load(); p != nil {
+		p.SetFlushWALHook(fn)
 	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || len(name) != 4 {
-			continue
-		}
-		// Parse 4-hex-digit segment number (e.g. "0000", "0001").
-		var segNo uint64
-		valid := true
-		for _, ch := range name {
-			segNo <<= 4
-			switch {
-			case ch >= '0' && ch <= '9':
-				segNo |= uint64(ch - '0')
-			case ch >= 'A' && ch <= 'F':
-				segNo |= uint64(ch - 'A' + 10)
-			case ch >= 'a' && ch <= 'f':
-				segNo |= uint64(ch - 'a' + 10)
-			default:
-				valid = false
-			}
-		}
-		if !valid {
-			continue
-		}
-		segData, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			continue // best-effort
-		}
-		// Decode each byte: 2 bits per XID, 4 XIDs per byte.
-		// XID at (segNo, byteIdx, lane):
-		//   pageInSeg  = byteIdx / BlockSize
-		//   xidInPage  = (byteIdx % BlockSize) * clogXactsPerByte + lane
-		//   XID        = segNo*clogXactsPerSegment + pageInSeg*clogXactsPerPage + xidInPage
-		baseXID := segNo * uint64(clogXactsPerSegment)
-		for i, b := range segData {
-			if b == 0 {
-				continue
-			}
-			pageInSeg := uint64(i) / uint64(storage.BlockSize)
-			xidInPageBase := (uint64(i) % uint64(storage.BlockSize)) * uint64(clogXactsPerByte)
-			for lane := uint64(0); lane < uint64(clogXactsPerByte); lane++ {
-				rawBits := (b >> (lane * uint64(clogBitsPerXact))) & 0x3
-				var status TxnStatus
-				switch rawBits {
-				case pgClogStatusCommitted:
-					status = TxnStatusCommitted
-				case pgClogStatusAborted:
-					status = TxnStatusAborted
-				case pgClogStatusInProgress:
-					continue
-				case pgClogStatusSubCommitted:
-					// 0x03 = PG's TRANSACTION_STATUS_SUB_COMMITTED: a
-					// subtransaction committed while its parent was still in
-					// progress. Decode it back as SubCommitted (M0117-0004);
-					// its true commit fate is resolved against the parent link
-					// by DidCommit. (Historically goopg conflated 0x03 with
-					// Committed as an OR-artifact of MarkUnknownAsAborted ORing
-					// the aborted bit onto a committed lane — that case
-					// resolves identically: DidCommit treats a SubCommitted XID
-					// whose parent is committed/unknown as committed, absent a
-					// definite parent abort.)
-					status = TxnStatusSubCommitted
-				}
-				xid := baseXID + pageInSeg*uint64(clogXactsPerPage) + xidInPageBase + lane
-				if xid == 0 || xid > uint64(^storage.TransactionID(0)) {
-					continue
-				}
-				txid := storage.TransactionID(xid)
-				bi := bankIdx(txid)
-				byt := byteIdx(txid)
-				bank := c.getOrCreateBank(bi)
-				bank.mu.Lock()
-				for len(bank.data) <= byt {
-					bank.data = append(bank.data, byte(TxnStatusUnknown))
-				}
-				// SLRU is the authoritative source (fsynced); overwrite
-				// whatever the flat-file had for this slot.
-				bank.data[byt] = byte(status)
-				bank.mu.Unlock()
-			}
-		}
-	}
-	return nil
 }
 
 // HighestKnownXID returns the highest XID that has a committed or aborted
@@ -1177,44 +637,14 @@ func (c *CLog) loadFromSLRU(dir string) error {
 // startup to advance txnMgr.NextXID past all previously committed XIDs so
 // new snapshots have a high enough Xmax to see pre-crash rows. (M0106-0013)
 func (c *CLog) HighestKnownXID() storage.TransactionID {
-	if c.pool.Load() != nil {
-		// M0117-0006 Part B: the banks are vestigial; scan the authoritative
-		// on-disk SLRU segments for the highest XID carrying a terminal lane.
-		return c.highestSLRUXID()
-	}
-	c.banksMu.RLock()
-	nBanks := len(c.banks)
-	c.banksMu.RUnlock()
-
-	for bi := nBanks - 1; bi >= 0; bi-- {
-		b := c.getBank(bi)
-		if b == nil {
-			continue
-		}
-		b.mu.RLock()
-		// For bank 0, XID 0 is invalid — stop at byt=1.
-		// For all other banks, byt=0 maps to a valid non-zero XID.
-		minByt := 0
-		if bi == 0 {
-			minByt = 1
-		}
-		for byt := len(b.data) - 1; byt >= minByt; byt-- {
-			if TxnStatus(b.data[byt]) != TxnStatusUnknown {
-				xid := storage.TransactionID(bi*xidsPerBank + byt)
-				b.mu.RUnlock()
-				return xid
-			}
-		}
-		b.mu.RUnlock()
-	}
-	return 0
+	return c.highestSLRUXID()
 }
 
 // SLRUDir returns the PG-canonical pg_xact/ directory, or "" if the mirror is
 // disabled. Intended for tests.
 func (c *CLog) SLRUDir() string {
-	c.banksMu.RLock()
-	defer c.banksMu.RUnlock()
+	c.slruDirMu.RLock()
+	defer c.slruDirMu.RUnlock()
 	return c.slruDir
 }
 
@@ -1225,9 +655,9 @@ func (c *CLog) SLRUDir() string {
 // Extends the segment file in BLCKSZ-page units so SimpleLruReadPage_ReadOnly
 // sees a complete page.
 func (c *CLog) mirrorToSLRUUnlocked(xid storage.TransactionID, status TxnStatus) error {
-	c.banksMu.RLock()
+	c.slruDirMu.RLock()
 	dir := c.slruDir
-	c.banksMu.RUnlock()
+	c.slruDirMu.RUnlock()
 
 	if dir == "" {
 		return nil
@@ -1290,8 +720,8 @@ func (c *CLog) mirrorToSLRUUnlocked(xid storage.TransactionID, status TxnStatus)
 }
 
 // TruncateCLOG removes CLOG status for every XID strictly older than the SLRU
-// page containing oldestXid: the in-memory banks, the flat-file prefix, AND
-// the pg_xact/ SLRU segment files that lie entirely below the cutoff page are
+// page containing oldestXid: the pg_xact/ SLRU segment files (and any resident
+// pool pages caching them) that lie entirely below the cutoff page are
 // dropped. The partial page containing oldestXid and everything newer are
 // retained. Idempotent and wraparound-aware (page comparison uses
 // CLOGPagePrecedes). Safe to call repeatedly with the same or an older XID.
@@ -1304,16 +734,14 @@ func (c *CLog) mirrorToSLRUUnlocked(xid storage.TransactionID, status TxnStatus)
 //     status lookups never read a truncated-away slot;
 //  4. emit the CLOG_TRUNCATE WAL record (so the record is durable ahead of the
 //     physical removal and a standby learns the new valid xid);
-//  5. remove the segment files / banks / flat-file prefix.
+//  5. remove the segment files (and drop any resident pool pages they backed).
 //
-// Truncation base note: goopg keeps the flat file and banks XID-indexed (no
-// rebasing). Removing a whole bank (setting it to nil) makes GetStatus return
+// Truncation base note: goopg keeps the SLRU XID-indexed (no rebasing).
+// Removing a segment file entirely below the cutoff makes GetStatus fault-in
 // TxnStatusUnknown for those XIDs; visibility code MUST short-circuit any XID
 // below OldestClogXid() as committed/frozen before consulting GetStatus. We
-// only drop banks that are ENTIRELY below the cutoff XID, never the bank that
-// straddles it, so retained XIDs keep their exact bytes. flush() then writes a
-// flat file whose leading (dropped-bank) region is all-zero — byte-compatible
-// with the prior layout for every retained XID.
+// only drop segments ENTIRELY below the cutoff XID, never the segment that
+// straddles it, so retained XIDs keep their exact bytes.
 func (c *CLog) TruncateCLOG(oldestXid storage.TransactionID) error {
 	if oldestXid < FirstNormalTransactionID {
 		return nil // never truncate the bootstrap/frozen range
@@ -1346,43 +774,19 @@ func (c *CLog) TruncateCLOG(oldestXid storage.TransactionID) error {
 		}
 	}
 
-	// (5a) Drop in-memory banks entirely below the cutoff XID. The first XID of
-	// the cutoff page is the lowest XID we must retain; any bank whose highest
-	// XID is below it can be released. We keep the straddling bank intact.
-	firstRetainedXid := storage.TransactionID(uint64(cutoffPage) * uint64(clogXactsPerPage))
-	dropBelowBank := int(firstRetainedXid) / xidsPerBank // bank fully retained from here up
-	c.banksMu.Lock()
-	for bi := 0; bi < dropBelowBank && bi < len(c.banks); bi++ {
-		c.banks[bi] = nil
-	}
-	c.banksMu.Unlock()
-
-	// (5b) Rewrite the flat file (leading region for dropped banks becomes
-	// all-zero, equivalent to TxnStatusUnknown — never consulted for those XIDs).
-	// M0117-0006 Part B: with the pool as the live store the flat file is
-	// vestigial (recovery loads from the SLRU), and the banks are stale, so
-	// rewriting it from them would persist misleading bytes — skip it.
-	if c.pool.Load() == nil {
-		if err := c.flush(); err != nil {
-			return fmt.Errorf("clog: flush after truncate: %w", err)
-		}
-	}
-
-	// (5c) Remove SLRU segment files whose entire page range precedes the
+	// (5a) Remove SLRU segment files whose entire page range precedes the
 	// cutoff page. A segment holds slruPagesPerSegment pages; its last page is
 	// removable iff CLOGPagePrecedes(lastPageOfSeg, cutoffPage).
 	if err := c.truncateSLRUSegments(cutoffPage); err != nil {
 		return fmt.Errorf("clog: truncate slru segments: %w", err)
 	}
 
-	// (5d) M0117-0006 Part B: drop any resident pool pages that the segment
-	// removal above just unlinked, WITHOUT writing them back (their backing file
-	// is gone). A re-read below the OldestClogXid floor cannot legitimately occur
-	// (callers short-circuit), but a stale resident page would otherwise mask the
-	// truncation. No-op when the pool is not the live store.
-	if p := c.pool.Load(); p != nil {
-		p.invalidateBelow(cutoffPage)
-	}
+	// (5b) Drop any resident pool pages that the segment removal above just
+	// unlinked, WITHOUT writing them back (their backing file is gone). A
+	// re-read below the OldestClogXid floor cannot legitimately occur (callers
+	// short-circuit), but a stale resident page would otherwise mask the
+	// truncation.
+	c.pool.Load().invalidateBelow(cutoffPage)
 	return nil
 }
 
@@ -1392,9 +796,9 @@ func (c *CLog) TruncateCLOG(oldestXid storage.TransactionID) error {
 // the SLRU mirror is disabled. Mirrors the file-removal half of PG's
 // SimpleLruTruncate / SlruScanDirCbDeleteCutoff.
 func (c *CLog) truncateSLRUSegments(cutoffPage int64) error {
-	c.banksMu.RLock()
+	c.slruDirMu.RLock()
 	dir := c.slruDir
-	c.banksMu.RUnlock()
+	c.slruDirMu.RUnlock()
 	if dir == "" {
 		return nil
 	}

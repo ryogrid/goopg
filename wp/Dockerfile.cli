@@ -1,0 +1,13 @@
+# wp-cli image with PostgreSQL support, used to install WordPress
+# non-interactively and to seed sample posts.
+#
+# The WordPress files (including the PG4WP db.php drop-in) come from the shared
+# `wp_html` volume that the `wordpress` service populates, so we only need to
+# add the PHP `pgsql` extension here. The base image is Alpine-based.
+FROM wordpress:cli-php8.3
+
+USER root
+RUN set -eux; \
+    apk add --no-cache libpq-dev; \
+    docker-php-ext-install pgsql
+USER www-data

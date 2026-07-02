@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/sqlkeywords"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -131,6 +132,15 @@ type Column struct {
 	IdentityAlways bool
 	// IdentityStart is the START WITH value from the sequence options (0 = use default=1).
 	IdentityStart int64
+	// IdentityIncrement/Min/Max/Cache hold the remaining identity sequence options
+	// (nil = type/PG default); IdentityCycle records CYCLE. Threaded to the backing
+	// sequence so pg_dump's ADD GENERATED ... AS IDENTITY (...) round-trips the
+	// non-default INCREMENT BY / MINVALUE / MAXVALUE / CACHE / CYCLE. DU-002.
+	IdentityIncrement *int64
+	IdentityMin       *int64
+	IdentityMax       *int64
+	IdentityCache     *int64
+	IdentityCycle     bool
 	// Dropped is true for columns removed via ALTER TABLE DROP COLUMN.
 	// The column's heap slot (Ordinal) is retained for tuple compatibility;
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.
@@ -184,6 +194,16 @@ type Column struct {
 	// does not actually collate; recorded purely for pg_dump round-trip
 	// fidelity. DU-002 slice 188.
 	Collation string
+	// FDWOptions holds per-column foreign-table options set via a
+	// `CREATE FOREIGN TABLE (col type OPTIONS (name 'value', …))` clause,
+	// each normalized to PG's stored `name=value` form (matching Options'
+	// attoptions convention). nil/empty means none — PG stores
+	// pg_attribute.attfdwoptions=NULL and pg_dump emits no per-column OPTIONS
+	// clause. A non-empty list is rendered into the attfdwoptions text-array
+	// literal so pg_dump re-emits `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN
+	// ... OPTIONS (...)`. Only meaningful on a foreign table's columns.
+	// DU-002 slice 418.
+	FDWOptions []string
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.
@@ -195,6 +215,7 @@ type NamedCheckConstraint struct {
 	NoInherit bool   // PG18: CHECK NO INHERIT — not propagated to child tables
 	IsLocal   bool   // conislocal: true if locally defined (not purely inherited)
 	InhCount  int    // coninhcount: number of direct parents this was inherited from
+	NotValid  bool   // convalidated='f': added NOT VALID, existing rows not checked yet
 }
 
 // NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
@@ -225,6 +246,19 @@ func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isL
 // the common unnamed case stays invisible in the catalog). M0097-0023.
 func (t *Table) AddCheck(name, expr string, oid uint32) {
 	t.AddCheckWithNoInherit(name, expr, oid, false)
+}
+
+// AddCheckWithNotValid is AddCheck for a CHECK added with NOT VALID
+// (pg_constraint.convalidated='f'): existing rows were not scanned, so the
+// constraint is enforced only for new writes until VALIDATE CONSTRAINT runs.
+// PG's pg_get_constraintdef_worker appends a trailing ` NOT VALID` for such a
+// constraint, and pg_dump dumps it as a separate ALTER TABLE ADD CONSTRAINT so
+// possibly-violating data loads before the constraint. DU-002 slice 308.
+func (t *Table) AddCheckWithNotValid(name, expr string, oid uint32, notValid bool) {
+	t.CheckConstraints = append(t.CheckConstraints, expr)
+	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
+		Name: name, Expr: expr, OID: oid, IsLocal: true, NotValid: notValid,
+	})
 }
 
 // AddCheckWithNoInherit is AddCheck for a CHECK that may carry NO INHERIT
@@ -287,12 +321,51 @@ type Table struct {
 	// performed — a known fidelity gap tracked in the pg_dump TAP port.
 	ViewDef string
 
+	// CheckOption captures a view's `WITH [CASCADED|LOCAL] CHECK OPTION` clause:
+	// "cascaded", "local", or "" (no clause). PostgreSQL records it as the
+	// `check_option=<mode>` pg_class.reloption; pg_dump's getTables strips that
+	// element from the reloptions array and instead re-emits the
+	// `WITH <MODE> CHECK OPTION` view-definition suffix. M0119-0004 (DU-002 slice 365).
+	// goopg does not yet ENFORCE the option on INSERT/UPDATE through the view.
+	CheckOption string
+
+	// SecurityBarrier / SecurityBarrierSet capture a view's
+	// `WITH (security_barrier = <bool>)` storage option. PostgreSQL records it
+	// as the `security_barrier=<bool>` pg_class.reloption; unlike check_option,
+	// pg_dump's getTables keeps it in the reloptions array (array_remove strips
+	// only check_option=*) and re-emits it as the `WITH (security_barrier='true')`
+	// clause after the view name (appendReloptionsArray). SecurityBarrierSet
+	// guards whether the option was specified, since false is a meaningful value.
+	// M0119-0004 (DU-002 slice 366).
+	SecurityBarrier    bool
+	SecurityBarrierSet bool
+
+	// SecurityInvoker / SecurityInvokerSet capture a view's
+	// `WITH (security_invoker = <bool>)` storage option. PostgreSQL records it
+	// as the `security_invoker=<bool>` pg_class.reloption; like security_barrier,
+	// pg_dump's getTables keeps it in the reloptions array (array_remove strips
+	// only check_option=*) and re-emits it as the `WITH (security_invoker='true')`
+	// clause after the view name (appendReloptionsArray). SecurityInvokerSet
+	// guards whether the option was specified, since false is a meaningful value.
+	// M0119-0004 (DU-002 slice 367).
+	SecurityInvoker    bool
+	SecurityInvokerSet bool
+
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil
 	// as "no statistics yet" and falls back to the legacy
 	// rules-only join order. Mirrors upstream's pg_class
 	// reltuples / relpages plus per-column pg_statistic data.
 	Stats *TableStats
+
+	// OfTypeOID is the pg_type OID of the composite type a typed table was
+	// declared `OF` (`CREATE TABLE name OF type_name`). Zero for ordinary
+	// tables. Surfaced as pg_class.reloftype so pg_dump re-emits the `OF
+	// type_name` form and suppresses the (type-derived) column list. The
+	// columns themselves are materialized normally (attislocal=true,
+	// matching PG, which skips them on dump via the reloftype check, not
+	// attislocal). DU-002 slice 374.
+	OfTypeOID uint32
 
 	// SmallDimension flags a table whose row count is known to
 	// be ≤ a tiny constant — the canonical TPC-H examples are
@@ -345,6 +418,15 @@ type Table struct {
 	// IsPopulated tracks whether REFRESH MATERIALIZED VIEW has been run
 	// (false for WITH NO DATA, true after first REFRESH). M0097-0013.
 	IsPopulated bool
+
+	// ForeignServerName marks this table as a foreign table (`CREATE FOREIGN
+	// TABLE ... SERVER <name>`), giving it relkind='f'. Empty for an ordinary
+	// table. DU-002 slice 417.
+	ForeignServerName string
+	// ForeignOptions holds the table-level OPTIONS as "name=value" elements —
+	// the pg_foreign_table.ftoptions text[] representation pg_dump's getTables
+	// reads via pg_options_to_table. DU-002 slice 417.
+	ForeignOptions []string
 
 	// ForeignKeys holds FK constraints declared on this table (inline
 	// REFERENCES or ALTER TABLE ADD FOREIGN KEY). M0096-0011.
@@ -401,6 +483,42 @@ type Table struct {
 	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
 	Unlogged bool
 	Temp     bool
+
+	// ReplicaIdentity is the single-char pg_class.relreplident code set by
+	// `ALTER TABLE ... REPLICA IDENTITY {DEFAULT|FULL|NOTHING|USING INDEX idx}`:
+	// 'd' (DEFAULT, the implicit value), 'f' (FULL), 'n' (NOTHING), 'i' (USING
+	// INDEX). Empty is treated as 'd'. pg_dump emits an `ALTER TABLE ONLY ...
+	// REPLICA IDENTITY ...` clause whenever this is not 'd' (pg_dump.c
+	// dumpTableSchema). goopg has no logical replication, so this is round-trip
+	// fidelity only. Use ReplIdentOrDefault to resolve the effective code.
+	// DU-002 slice 305.
+	ReplicaIdentity string
+
+	// RowSecurity mirrors pg_class.relrowsecurity: true once `ALTER TABLE ...
+	// ENABLE ROW LEVEL SECURITY` has run (reset by DISABLE). pg_dump emits an
+	// `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;` clause whenever this is set
+	// (pg_dump.c getPolicies represents an RLS-enabled table with a null-polname
+	// PolicyInfo). goopg enforces no row-level security — this is round-trip
+	// schema fidelity only. DU-002 slice 322.
+	RowSecurity bool
+	// ForceRowSecurity mirrors pg_class.relforcerowsecurity: true once `ALTER
+	// TABLE ... FORCE ROW LEVEL SECURITY` has run (reset by NO FORCE). pg_dump
+	// emits an `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;` clause whenever
+	// this is set (pg_dump.c dumpTableSchema). Round-trip fidelity only. DU-002
+	// slice 322.
+	ForceRowSecurity bool
+
+	// Policies holds the row-level security policies declared on this table via
+	// CREATE POLICY. goopg does NOT enforce RLS; the policies are recorded so
+	// they round-trip through pg_dump (the pg_policy virtual catalog →
+	// dumpPolicy). DU-002 slice 323.
+	Policies []PolicyInfo
+
+	// Rules holds the unconditional DO-NOTHING query-rewrite rules declared on
+	// this table via CREATE RULE. goopg does NOT implement the rewrite system;
+	// the rules are recorded so they round-trip through pg_dump (the pg_rewrite
+	// virtual catalog → pg_get_ruledef → dumpRule). DU-002 slice 324.
+	Rules []RuleInfo
 
 	// TempOwner identifies the session that owns this temporary relation. In
 	// PostgreSQL every backend has its own temp namespace (pg_temp_N); a temp
@@ -852,6 +970,26 @@ func tableNeedsToastRelation(t *Table) bool {
 // virtual builder emits a relkind='t' TOAST row (and relkind='i' TOAST-index
 // row, slice 3) for exactly this set; toastBearingTables enumerates the same
 // set for the pg_index builder so the two catalogs never diverge.
+// ReplIdentOrDefault resolves a table's effective pg_class.relreplident code,
+// mapping an unset (empty) ReplicaIdentity to PG's implicit default 'd'
+// (REPLICA_IDENTITY_DEFAULT). DU-002 slice 305.
+func ReplIdentOrDefault(replIdent string) string {
+	if replIdent == "" {
+		return "d"
+	}
+	return replIdent
+}
+
+// boolToPGChar renders a Go bool as PostgreSQL's textual boolean catalog
+// representation ('t'/'f'), matching how the virtual-catalog rows encode bool
+// columns such as pg_class.relrowsecurity. DU-002 slice 322.
+func boolToPGChar(b bool) string {
+	if b {
+		return "t"
+	}
+	return "f"
+}
+
 func tableHasToastRelation(t *Table) bool {
 	if len(t.ToastReloptions) > 0 {
 		return true
@@ -1076,14 +1214,157 @@ const (
 // Trigger describes one row-level or statement-level trigger on a table.
 // M0096-0012.
 type Trigger struct {
-	Name       string
+	Name string
+	// OID is the trigger's pg_trigger.oid, assigned from the catalog OID
+	// counter at CREATE TRIGGER time. pg_dump's getTriggers selects
+	// pg_get_triggerdef(t.oid, false), so a zero OID means the trigger is
+	// invisible to pg_dump (predates OID tracking). DU-002 slice 319.
+	OID        uint32
 	TableOID   uint32
 	Timing     TriggerTiming
 	Events     []string // "insert", "update", "delete", "truncate"
-	ForEachRow bool
-	FuncName   string // function/procedure name (unschemed)
-	FuncSchema string
-	Args       []string // trigger function arguments (TG_ARGV)
+	// UpdateColumns is the optional `UPDATE OF col1, col2` column list of a
+	// column-specific UPDATE trigger; empty for every other form. pg_dump's
+	// pg_get_triggerdef appends ` OF <cols>` right after the UPDATE event and
+	// pg_trigger.tgattr carries the column attnums. DU-002 slice 326.
+	UpdateColumns []string
+	// IsConstraint marks a CREATE CONSTRAINT TRIGGER. pg_get_triggerdef emits
+	// `CREATE CONSTRAINT TRIGGER` (instead of `CREATE TRIGGER`) and a
+	// `[NOT ]DEFERRABLE INITIALLY {IMMEDIATE|DEFERRED}` clause after the ON-table
+	// name. ConstraintOID is the pg_constraint OID PG implicitly creates for the
+	// trigger (contype 't'); it feeds pg_trigger.tgconstraint so the trigger is
+	// recognised as a constraint trigger. goopg does NOT enforce constraint-
+	// trigger semantics — this is dump fidelity only. DU-002 slice 327.
+	IsConstraint  bool
+	Deferrable    bool
+	InitDeferred  bool
+	ConstraintOID uint32
+	// OldTransitionTable / NewTransitionTable are the REFERENCING clause's
+	// `OLD TABLE AS <name>` / `NEW TABLE AS <name>` transition-relation names.
+	// pg_dump's pg_get_triggerdef emits `REFERENCING OLD TABLE AS … NEW TABLE
+	// AS …` between the ON-table name and FOR EACH ROW; pg_trigger.tgoldtable /
+	// tgnewtable carry the names. goopg records them for dump fidelity only — the
+	// transition tables are not materialised. DU-002 slice 328.
+	OldTransitionTable string
+	NewTransitionTable string
+	// WhenExpr is the parsed `WHEN (condition)` qualification (an OLD/NEW-aware
+	// boolean expression), nil when absent. pg_dump's pg_get_triggerdef re-emits
+	// `WHEN (…)` between FOR EACH and EXECUTE FUNCTION; PG stores it as a node tree
+	// in pg_trigger.tgqual. goopg keeps the parsed expression for dump fidelity
+	// only — the condition is not evaluated at trigger-firing time. DU-002 slice 329.
+	WhenExpr           parser.Expr
+	ForEachRow         bool
+	FuncName           string // function/procedure name (unschemed)
+	FuncSchema         string
+	Args               []string // trigger function arguments (TG_ARGV)
+}
+
+// triggerUpdateColAttrs renders a column-specific UPDATE trigger's column list
+// as pg_trigger.tgattr, a space-separated int2vector of 1-based attnums (the
+// same text form pg_index.indkey uses). An unresolved column name is skipped;
+// an empty/absent list yields "". DU-002 slice 326.
+func triggerUpdateColAttrs(tbl *Table, cols []string) string {
+	if tbl == nil || len(cols) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(cols))
+	for _, name := range cols {
+		for _, col := range tbl.Columns {
+			if col.Name == name {
+				parts = append(parts, strconv.Itoa(col.Ordinal+1))
+				break
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// PolicyInfo describes one row-level security policy created with CREATE POLICY.
+// goopg does NOT enforce row-level security; the policy is recorded purely so it
+// round-trips through pg_dump (the pg_policy virtual catalog → dumpPolicy). The
+// field set mirrors the pg_policy columns pg_dump's getPolicies reads. DU-002
+// slice 323.
+type PolicyInfo struct {
+	// Name is pg_policy.polname; OID is pg_policy.oid (assigned from the catalog
+	// OID counter at CREATE POLICY time — a zero OID means the policy predates
+	// catalog tracking and is invisible to pg_dump).
+	Name string
+	OID  uint32
+	// Command is pg_policy.polcmd: '*' (ALL), 'r' (SELECT), 'a' (INSERT),
+	// 'w' (UPDATE), or 'd' (DELETE).
+	Command byte
+	// Permissive is pg_policy.polpermissive: true for AS PERMISSIVE (the
+	// default), false for AS RESTRICTIVE (pg_dump emits ` AS RESTRICTIVE`).
+	Permissive bool
+	// Roles is pg_policy.polroles: the role OIDs the policy applies to. The
+	// special value {0} means PUBLIC (pg_dump omits the TO clause). goopg has no
+	// per-role OID registry yet, so only PUBLIC ({0}) round-trips today; named
+	// roles are deferred to a follow-up slice.
+	Roles []uint32
+	// Using / WithCheck are the parsed USING / WITH CHECK expressions (nil when
+	// absent). They are rendered to pg_policy.polqual / polwithcheck via
+	// formatExprForAttrdef (the catalog-side pg_get_expr deparser), which fully
+	// parenthesizes every node like PG's pg_get_expr, so dumpPolicy re-emits
+	// ` USING ((expr))` / ` WITH CHECK ((expr))` byte-identically to real pg_dump.
+	Using     parser.Expr
+	WithCheck parser.Expr
+}
+
+// RuleInfo describes one unconditional DO-NOTHING query-rewrite rule created
+// with CREATE RULE. goopg does NOT implement the rewrite system; the rule is
+// recorded purely so it round-trips through pg_dump (the pg_rewrite virtual
+// catalog → pg_get_ruledef → dumpRule). The field set mirrors the pg_rewrite
+// columns pg_dump's getRules reads. DU-002 slice 324.
+type RuleInfo struct {
+	// Name is pg_rewrite.rulename; OID is pg_rewrite.oid (assigned from the
+	// catalog OID counter at CREATE RULE time — a zero OID means the rule
+	// predates catalog tracking and is invisible to pg_dump).
+	Name string
+	OID  uint32
+	// Event is the firing event: "INSERT", "UPDATE" or "DELETE". pg_rewrite
+	// stores it as ev_type '3'/'2'/'4' (ON SELECT '1' view rules are not
+	// modelled here).
+	Event string
+	// Instead is pg_rewrite.is_instead: true for DO INSTEAD NOTHING, false for
+	// DO [ALSO] NOTHING.
+	Instead bool
+	// Qual is the deparsed WHERE qualification of a conditional DO-NOTHING rule,
+	// already rendered to the canonical pg_get_ruledef form (e.g.
+	// "(old.a <> new.a)", parens included). Empty for an unconditional rule.
+	// pg_rewrite stores it as ev_qual; goopg keeps the deparsed text since the
+	// rewrite system is not executed. DU-002 slice 359.
+	Qual string
+	// Enabled is pg_rewrite.ev_enabled set by `ALTER TABLE … {ENABLE|DISABLE}
+	// [REPLICA|ALWAYS] RULE`: 'O' (origin — the default), 'D' (disabled),
+	// 'R' (replica), 'A' (always). A zero value is treated as 'O'. pg_dump's
+	// dumpRule emits an `ALTER TABLE … {ENABLE ALWAYS|ENABLE REPLICA|DISABLE}
+	// RULE <name>;` whenever ev_enabled is not 'O'. DU-002 slice 325.
+	Enabled byte
+}
+
+// EvEnabled returns the rule's pg_rewrite.ev_enabled char, mapping a zero value
+// to the 'O' (origin) default. DU-002 slice 325.
+func (r RuleInfo) EvEnabled() byte {
+	if r.Enabled == 0 {
+		return 'O'
+	}
+	return r.Enabled
+}
+
+// EvType maps the rule's firing event to its pg_rewrite.ev_type "char" code
+// (rewriteDefine.h: SELECT='1', UPDATE='2', INSERT='3', DELETE='4').
+func (r RuleInfo) EvType() string {
+	switch strings.ToUpper(r.Event) {
+	case "SELECT":
+		return "1"
+	case "UPDATE":
+		return "2"
+	case "INSERT":
+		return "3"
+	case "DELETE":
+		return "4"
+	}
+	return ""
 }
 
 // ForeignKey describes one referential integrity constraint stored on a
@@ -1100,12 +1381,21 @@ type ForeignKey struct {
 	RefColumns        []string // referenced columns (empty = use parent PK)
 	OnDelete          parser.FKAction
 	OnUpdate          parser.FKAction
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of Columns — PG15 pg_constraint.confdelsetcols. Empty means the
+	// whole key. pg_get_constraintdef appends ` (col, …)` after the ON DELETE
+	// clause (ruleutils.c:2376). DU-002 slice 311.
+	OnDeleteSetCols   []string
 	Deferrable        bool
 	InitiallyDeferred bool
 	// NotValid is true when the constraint was added with NOT VALID — existing
 	// rows were not checked, so pg_constraint.convalidated is 'f' until a
 	// VALIDATE CONSTRAINT runs. M0118-0008 (alter-table-1/2).
 	NotValid bool
+	// MatchFull is true for a `MATCH FULL` foreign key — pg_constraint.confmatchtype
+	// is 'f' and pg_get_constraintdef emits ` MATCH FULL`. MATCH SIMPLE (the
+	// default) leaves it false (confmatchtype='s'). DU-002 slice 309.
+	MatchFull bool
 }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
@@ -1303,6 +1593,18 @@ type Index struct {
 	// slice 56.
 	ColDescending []bool
 	ColNullsFirst []bool
+	// ColOpClasses captures the per-key-column explicit operator class name
+	// (parallel to Columns), e.g. "text_pattern_ops". It mirrors pg_index.indclass
+	// so BuildIndexDef (pg_get_indexdef) can re-emit a non-default operator class
+	// after the column. An empty entry (or empty slice) means the column uses its
+	// type's default operator class. DU-002 slice 312.
+	ColOpClasses []string
+	// ColCollations captures the per-key-column explicit collation name (parallel
+	// to Columns), e.g. "C". It mirrors pg_index.indcollation so BuildIndexDef
+	// (pg_get_indexdef) can re-emit a non-default COLLATE clause after the column
+	// and before the opclass. An empty entry (or empty slice) means the column
+	// uses its type's default collation. DU-002 slice 313.
+	ColCollations []string
 	IsConstraint  bool   // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 	IsExclusion   bool   // true when index backs an EXCLUDE USING constraint
 	ExclusionOp   string // per-column exclusion operator (e.g. "=")
@@ -1370,6 +1672,25 @@ type Index struct {
 	// `CREATE INDEX … WITH (autosummarize='on')`. goopg has no BRIN
 	// summarization, so this is advisory catalog/dump-only. DU-002 slice 223.
 	AutoSummarize *bool
+	// IsReplicaIdentity mirrors pg_index.indisreplident: true when this index
+	// was selected as the table's replica identity via `ALTER TABLE …
+	// REPLICA IDENTITY USING INDEX <idx>` (the table's relreplident becomes
+	// 'i'). pg_dump emits the `ALTER TABLE ONLY <t> REPLICA IDENTITY USING
+	// INDEX <idx>` clause at index-dump time keyed on this flag (pg_dump.c
+	// dumpIndex, NOT at table-dump time). At most one index per table carries
+	// it (relation_mark_replica_identity clears the others). goopg has no
+	// logical replication, so this is round-trip dump fidelity only.
+	// DU-002 slice 306.
+	IsReplicaIdentity bool
+	// IsClustered mirrors pg_index.indisclustered: true when this index was
+	// selected as the table's clustering index via `CLUSTER <t> USING <idx>`
+	// (or `ALTER TABLE <t> CLUSTER ON <idx>`). At most one index per table
+	// carries it (mark_index_clustered clears the others). pg_dump emits a
+	// trailing `ALTER TABLE <t> CLUSTER ON <idx>;` after the index's
+	// CREATE INDEX / ADD CONSTRAINT at index-dump time keyed on this flag
+	// (pg_dump.c dumpIndex / dumpConstraint). goopg performs no physical
+	// heap reorder, so this is round-trip dump fidelity only. DU-002 slice 320.
+	IsClustered bool
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -1484,13 +1805,63 @@ type Catalog interface {
 	RegisterRole(name string)
 	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
 	UnregisterRole(name string)
+	// RoleOID returns the OID minted for a registered role (or 10 for the seeded
+	// `postgres` superuser); the bool is false for an unknown role. DU-002 slice 330.
+	RoleOID(name string) (uint32, bool)
 	// GrantTablePrivilege records that role may exercise priv on the relation
 	// identified by relOID. priv is an upper-cased keyword ("TRUNCATE", …); role
 	// is matched case-insensitively. Minimal ACL store for the *-conflict
 	// isolation specs. M0118-0008 (design 0118-0039).
 	GrantTablePrivilege(relOID uint32, role, priv string)
+	// GrantTablePrivilegeWithGrantOption is GrantTablePrivilege plus a grant-
+	// option flag: when withGrantOption is true the privilege is recorded as
+	// GRANT … WITH GRANT OPTION, so the materialized relacl renders the privilege
+	// letter with a trailing `*` and pg_dump re-emits the WITH GRANT OPTION
+	// clause. DU-002 slice 332.
+	GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool)
+	// RevokeTablePrivilege removes a single privilege (priv, upper-cased keyword)
+	// for role on relOID from the ACL store. When the role's privilege set
+	// becomes empty its entry is dropped entirely, so the materialized relacl no
+	// longer lists that grantee — matching PostgreSQL, which removes an aclitem
+	// once its mask is empty and lets the relacl fall back to the owner default.
+	// A revoke of a privilege the role never held is a no-op. DU-002 slice 338.
+	RevokeTablePrivilege(relOID uint32, role, priv string)
+	// MaterializeOwnerACL records an explicit owner aclitem for relOID holding
+	// exactly ownerPrivs (the owner's full default privilege set for the object
+	// type), but only when no explicit owner entry exists yet. PostgreSQL leaves
+	// relacl NULL while the owner holds its implicit default privileges; the
+	// first owner-side REVOKE materializes the owner's default set so the
+	// remaining privileges can be stored explicitly. Calling this before a
+	// RevokeTablePrivilege against the owner therefore yields the PG-accurate
+	// materialized relacl (owner default minus the revoked bits) instead of a
+	// NULL fallback. A no-op once an owner entry exists. DU-002 slice 340.
+	MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
+	// ProcACLText renders the materialized pg_proc.proacl text for a routine OID,
+	// or "" when proacl is still NULL (no GRANT/REVOKE recorded). The function
+	// REVOKE recorder uses the NULL result to decide whether to expand the
+	// implicit acldefault('f', …) on the first mutation. DU-002 slice 347.
+	ProcACLText(procOID uint32) string
+	// TypeACLText renders the materialized pg_type.typacl text for a type/domain
+	// OID, or "" when typacl is still NULL (no GRANT/REVOKE recorded). A type's
+	// acldefault('T', owner) grants USAGE to BOTH the owner and PUBLIC, exactly
+	// like a function's EXECUTE default, so the projection is identical to
+	// ProcACLText with the USAGE privilege. Unlike proacl, pg_type is heap-backed
+	// (M0097-0022), so the GRANT path must re-sync this text into the heap row;
+	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
+	TypeACLText(typeOID uint32) string
+	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
+	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
+	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
+	// materialized attacl text for a column, or "" when it is still NULL. Unlike
+	// relacl/typacl/proacl a column has an empty acldefault, so attacl carries no
+	// owner/PUBLIC default entry and returns to NULL once the last column
+	// privilege is revoked. M0119-0004-ACLHEAP (attacl half).
+	GrantColumnPrivilege(relOID uint32, attNum int16, role, priv string)
+	GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool)
+	RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv string)
+	AttrACLText(relOID uint32, attNum int16) string
 	// DropTableACL forgets all privileges recorded for relOID (called when the
 	// relation is dropped so a recycled OID does not inherit stale grants).
 	DropTableACL(relOID uint32)
@@ -1514,6 +1885,9 @@ type Catalog interface {
 	// RenameUserAggregate renames an existing user-defined aggregate.
 	// Returns false if the old name is not found.
 	RenameUserAggregate(oldName, newName string) bool
+	// ListUserAggregates returns every registered user-defined aggregate, for
+	// pg_proc/pg_aggregate introspection (pg_dump CREATE AGGREGATE round-trip).
+	ListUserAggregates() []*UserAggregate
 	// LookupCompositeTypeFields returns the ordered field list for a composite
 	// type registered via RegisterCompositeTypeWithFields. Returns nil if the
 	// type has no field metadata. M0097-composite.
@@ -1684,6 +2058,17 @@ type InMemory struct {
 	// user-defined aggregates registered via CREATE AGGREGATE.
 	userAggregates map[string]*UserAggregate
 
+	// userCollations holds collations created via CREATE COLLATION, in
+	// creation order (deterministic pg_dump output). Surfaced as extra rows in
+	// the virtual pg_collation view so pg_dump round-trips them. M0119-0004.
+	userCollations []*UserCollation
+
+	// userConversions holds conversions created via CREATE [DEFAULT] CONVERSION,
+	// in creation order (deterministic pg_dump output). Surfaced as rows in the
+	// virtual pg_conversion view so pg_dump's getConversions / dumpConversion
+	// round-trip them. DU-002 slice 399 (M0119-0004).
+	userConversions []*UserConversion
+
 	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
@@ -1702,22 +2087,197 @@ type InMemory struct {
 	// (DropTempNamespace). M0118-0009 (temp-schema-cleanup, design 0118-0091).
 	tempNamespaces map[string]uint32
 
-	// roles tracks user-created roles (CREATE ROLE / CREATE USER). Used by
-	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
-	// M0097-drop_if_exists.
-	roles map[string]struct{}
+	// roles tracks user-created roles (CREATE ROLE / CREATE USER), mapping the
+	// lower-cased role name to the OID minted for it at registration time. Used
+	// by DROP ROLE IF EXISTS to produce proper "does not exist" notices, and by
+	// pg_roles / CREATE POLICY ... TO <role> so named-role policies round-trip
+	// through pg_dump (the OID lands in pg_policy.polroles and pg_dump's
+	// getPolicies resolves it back to the name via pg_roles). M0097-drop_if_exists;
+	// per-role OID registry added DU-002 slice 330.
+	roles map[string]uint32
+
+	// roleAttrs is the attribute/credential sidecar for `roles`, keyed by the
+	// same lower-cased role name. Carries what pg_authid carries for a live
+	// PostgreSQL role: LOGIN/SUPERUSER flags and the stored password verifier
+	// (SCRAM-SHA-256 by default, mirroring rolpassword — upstream
+	// postgres/src/backend/libpq/crypt.c encrypt_password). Populated by the
+	// server-side CREATE/ALTER ROLE handler and by WAL replay
+	// (internal/initdb/role_ddl_recovery.go) so roles survive a restart;
+	// cmd/goopg seeds the auth UserStore from it after Open. Entries are
+	// optional — a role registered without attributes reads back zero-valued
+	// (no credential, LOGIN defaulting per registration path). root-0021.
+	roleAttrs map[string]*RoleAttrs
 
 	// tableACLs records per-relation privileges granted to non-owner roles, the
 	// minimal ACL store the *-conflict isolation specs need (currently only
 	// TRUNCATE — truncate-conflict, design 0118-0039). Keyed relOID →
-	// lower-cased role name → set of upper-cased privilege keywords
-	// ("TRUNCATE", "SELECT", …). The owning superuser bypasses this map
-	// entirely; an empty/absent entry means "no privilege granted". M0118-0008.
-	tableACLs map[uint32]map[string]map[string]struct{}
+	// lower-cased role name → upper-cased privilege keyword ("TRUNCATE",
+	// "SELECT", …) → grant-option flag (true = GRANT … WITH GRANT OPTION, so
+	// aclitemout renders the privilege letter with a trailing `*`). The owning
+	// superuser bypasses this map entirely; an empty/absent entry means "no
+	// privilege granted". M0118-0008; grant-option DU-002 slice 332.
+	tableACLs map[uint32]map[string]map[string]bool
+
+	// tableACLOrder records, per relOID, the order in which non-owner grantee
+	// roles first appeared in a GRANT — PostgreSQL appends a new grantee's
+	// aclitem to the end of pg_class.relacl (aclupdate in src/backend/utils/adt/
+	// acl.c modifies an existing aclitem in place but appends a brand-new one),
+	// so the array preserves grant order, NOT alphabetical order. relacl
+	// rendering must follow this list rather than sorting role names, or a
+	// reverse-order GRANT (TO z_role before a_role) would emit pg_dump GRANT
+	// lines in the wrong order vs real PostgreSQL. Each role appears at most once
+	// (first-grant position); a re-GRANT to an existing grantee does not move it.
+	// A role is removed when its privilege set is fully revoked. Keyed by the
+	// lower-cased role name to match tableACLs. The owner ("postgres") is omitted
+	// (it is always rendered first, separately). DU-002 slice 354.
+	tableACLOrder map[uint32][]string
+
+	// roleACLDisplay preserves the original-case spelling of a grantee role
+	// name recorded in tableACLs (which is keyed by the lower-cased name so
+	// privilege lookups stay case-insensitive). Key: lower-cased role name →
+	// the exact case it was spelled in the GRANT. PostgreSQL role names are
+	// case-significant when double-quoted (CREATE ROLE "MixedCase"), and
+	// aclitemout renders the role's true name in pg_class.relacl, so pg_dump's
+	// getid/fmtId re-emit GRANT … TO "MixedCase". Without this, the lower-cased
+	// store would render `mixedcase` and pg_dump would emit TO mixedcase (a
+	// different, nonexistent role). DU-002 slice 337.
+	roleACLDisplay map[string]string
+
+	// relACLEmptied records relations whose ACL was explicitly materialized to an
+	// empty aclitem array {} — the state PostgreSQL leaves pg_class.relacl in after
+	// a `REVOKE ALL ON TABLE t FROM <owner>` (the owner's implicit default
+	// privileges are stripped, leaving a non-NULL but empty array). This is
+	// distinct from NULL (no GRANT ever recorded): pg_dump's buildACLCommands
+	// emits a bare `REVOKE ALL … FROM <owner>;` for {} but nothing for NULL. A
+	// later GRANT or owner re-materialize clears the flag. Key: relOID → present.
+	// DU-002 slice 341.
+	relACLEmptied map[uint32]bool
+
+	// relACLOwnerRevoked records relations whose owner's implicit default aclitem
+	// was explicitly revoked, regardless of whether other grantees survive. This
+	// is the broader signal relACLEmptied is a special case of: relACLEmptied
+	// fires only when the owner revoke also empties the array, but an object whose
+	// acldefault grants a *non-owner* implicit privilege (a function's PUBLIC
+	// EXECUTE) leaves a surviving aclitem after the owner is revoked
+	// (`REVOKE EXECUTE ON FUNCTION f FROM <owner>` → {=X/owner}). In that case
+	// relaclTextLockedFor must still suppress the leading owner entry (the owner is
+	// absent from the array) even though it is non-empty. An owner-side GRANT
+	// re-materializes the owner and clears the flag. Key: relOID → present.
+	// DU-002 slice 347.
+	relACLOwnerRevoked map[uint32]bool
+
+	// attrACLs records column-level (pg_attribute.attacl) privileges granted to
+	// non-owner roles, keyed by (relOID, attnum) → lower-cased role name →
+	// upper-cased privilege keyword ("SELECT"/"INSERT"/"UPDATE"/"REFERENCES") →
+	// grant-option flag. Unlike relacl/typacl/proacl, a column has an EMPTY
+	// acldefault ('c': columns grant no implicit privilege to the owner or
+	// PUBLIC), so attacl stays NULL until the first column GRANT and returns to
+	// NULL once every column privilege is revoked — there is no owner or PUBLIC
+	// default entry to materialize, so the relACLEmptied/relACLOwnerRevoked
+	// machinery the table/type/function stores need does not apply here. This is
+	// why column ACLs live in their own composite-keyed store rather than the
+	// OID-keyed tableACLs map. M0119-0004-ACLHEAP (attacl half).
+	attrACLs map[attrACLKey]map[string]map[string]bool
+
+	// attrACLOrder records, per column, the order in which grantee roles first
+	// appeared in a column GRANT, so attacl preserves grant order (PostgreSQL
+	// appends a new grantee's aclitem to the end of the array) rather than
+	// alphabetical order — the column analogue of tableACLOrder. A role is removed
+	// when its column privilege set is fully revoked. M0119-0004-ACLHEAP.
+	attrACLOrder map[attrACLKey][]string
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
+
+	// fdws tracks foreign-data wrappers (CREATE FOREIGN DATA WRAPPER) with a
+	// stable OID so they round-trip through pg_dump's getForeignDataWrappers
+	// (pg_foreign_data_wrapper virtual view → dumpForeignDataWrapper). goopg does
+	// not execute FDWs; only enough metadata is kept for dump fidelity. Key:
+	// fdwname. DU-002 slice 375.
+	fdws map[string]*ForeignDataWrapper
+
+	// eventTriggers tracks event triggers (CREATE EVENT TRIGGER) with a stable
+	// OID so they round-trip through pg_dump's getEventTriggers
+	// (pg_event_trigger virtual view → dumpEventTrigger). goopg does not fire
+	// event triggers; only enough metadata is kept for dump fidelity. Key:
+	// evtname. DU-002 (M0119-0004).
+	eventTriggers map[string]*EventTrigger
+
+	// foreignServers tracks foreign servers (CREATE SERVER) with a stable OID so
+	// they round-trip through pg_dump's getForeignServers (pg_foreign_server
+	// virtual view → dumpForeignServer). Each server references its FDW by name;
+	// the srvfdw OID is resolved from fdws at render time. goopg does not execute
+	// foreign servers; only enough metadata is kept for dump fidelity. Key:
+	// srvname. DU-002 slice 376.
+	foreignServers map[string]*ForeignServer
+
+	// userMappings tracks user mappings (CREATE USER MAPPING FOR <user> SERVER
+	// <server>) with a stable OID so they round-trip through pg_dump's
+	// dumpUserMappings (pg_user_mappings virtual view, queried per foreign server).
+	// goopg does not execute foreign access; only enough metadata is kept for dump
+	// fidelity. Key: lowercase "<user>\x00<server>". DU-002 slice 377.
+	userMappings map[string]*UserMapping
+
+	// casts tracks user-defined casts (CREATE CAST) with a stable OID so they
+	// round-trip through pg_dump's getCasts (pg_cast virtual view → dumpCast).
+	// goopg does not perform user casts; only enough metadata is kept for dump
+	// fidelity (source/target type OIDs, castcontext, castmethod; castfunc stays 0
+	// for WITHOUT FUNCTION / WITH INOUT). Key: lowercase "<source>\x00<target>".
+	// DU-002 slice 395.
+	casts map[string]*Cast
+
+	// transforms tracks user-defined transforms (CREATE TRANSFORM) with a
+	// stable OID so they round-trip through pg_dump's getTransforms
+	// (pg_transform virtual view → dumpTransform). goopg does not execute the
+	// transform machinery (PL-language argument marshaling); only enough
+	// metadata is kept for dump fidelity (type/language OIDs, from/to function
+	// OIDs). Key: lowercase "<type>\x00<lang>". DU-002 (M0119-0004).
+	transforms map[string]*Transform
+
+	// userOperators tracks user-defined operators (CREATE OPERATOR) with a
+	// stable OID so they round-trip through pg_dump's getOperators (pg_operator
+	// virtual view → dumpOpr). goopg does not execute the operator (no runtime
+	// dispatch through a custom FUNCTION); only enough metadata is kept for
+	// dump fidelity (left/right/result type OIDs, oprcode). Key: lowercase
+	// "<schema>.<name>(<leftType>,<rightType>)" to allow the same operator
+	// symbol to be overloaded across schemas/arg-type pairs, mirroring
+	// dropCompat's operator key shape. DU-002 (M0119-0004).
+	userOperators map[string]*UserOperator
+
+	// userOperatorFamilies tracks user-defined operator families (CREATE
+	// OPERATOR FAMILY name USING method) with a stable OID so they round-trip
+	// through pg_dump's getOpfamilies (pg_opfamily virtual view → dumpOpfamily).
+	// The family starts empty (PG's CREATE OPERATOR FAMILY grammar has no AS
+	// clause); ALTER OPERATOR FAMILY ... ADD to populate it is not yet
+	// implemented (deferred). Key: lowercase "<schema>.<name>/<method-oid>" —
+	// PG allows the same family name to be reused across access methods.
+	// DU-002 (M0119-0004).
+	userOperatorFamilies map[string]*UserOperatorFamily
+
+	// userOperatorClasses tracks user-defined operator classes (CREATE
+	// OPERATOR CLASS name [DEFAULT] FOR TYPE type USING method [FAMILY
+	// family] AS ...) with a stable OID so the class's own pg_opclass row
+	// round-trips through pg_dump's getOpclasses (pg_opclass virtual view →
+	// dumpOpclass). Only the class-level attributes (method/family/intype/
+	// default/keytype) are modeled; OPERATOR/FUNCTION entries tied to the
+	// class via pg_amop/pg_amproc + pg_depend are not yet implemented
+	// (deferred — see the ledger). Key: lowercase "<schema>.<name>/<method-
+	// oid>", mirroring userOperatorFamilies (PG scopes opclass-name
+	// uniqueness per namespace+access method too). DU-002 (M0119-0004).
+	userOperatorClasses map[string]*UserOperatorClass
+
+	// amOpMembers / amProcMembers back pg_amop/pg_amproc: one entry per
+	// resolved OPERATOR/FUNCTION entry in a CREATE OPERATOR CLASS ... AS
+	// list. Only user-defined operators/functions are resolvable today
+	// (goopg has no builtin-operator catalog for regoper-style name lookup;
+	// FUNCTION support procs additionally check the small hand-curated
+	// LookupBuiltinProc set) — an entry naming an unresolvable builtin is
+	// silently dropped, same as the pre-slice-411 behavior for every entry
+	// (deferred, see the ledger). Appended, not keyed: CREATE OPERATOR CLASS
+	// has no re-create/replace form. DU-002 (M0119-0004) slice 411.
+	amOpMembers   []*AmOpMember
+	amProcMembers []*AmProcMember
 
 	// tableRuleKinds tracks the most-recently-registered rule kind per table.
 	// Key: lowercase table name; value: rule kind string used by planCopy. M0097-0140.
@@ -1848,6 +2408,31 @@ type StatisticsObject struct {
 	Schema   string // schema name (empty = public)
 	OID      uint32
 	TableOID uint32 // stxrelid — the table the statistics are defined on
+	// Kinds holds the explicitly-requested statistics kinds (lowercased:
+	// "ndistinct"/"dependencies"/"mcv"). Empty means the default (all kinds).
+	// pg_get_statisticsobjdef re-emits a kinds clause only when not all are
+	// enabled and the object spans more than one column. DU-002 slice 314.
+	Kinds []string
+	// Columns holds the simple column names from the ON list, in order. Used by
+	// pg_get_statisticsobjdef to reconstruct the ON clause. DU-002 slice 314.
+	Columns []string
+	// Exprs holds the deparsed expression targets from the ON list, each already
+	// rendered in its final SQL form (a non-function expression is parenthesized,
+	// e.g. "(a + b)"; a bare function call stays unparenthesized, e.g. "lower(a)")
+	// to mirror ruleutils.c pg_get_statisticsobj_worker. pg_get_statisticsobjdef
+	// appends these after the simple columns. DU-002 slice 316.
+	Exprs []string
+	// HasExpr reports the ON list contained an expression target. When it is set
+	// but Exprs is empty the expression could not be captured (e.g. a parse
+	// fallback), so the dump path declines to reconstruct the object. DU-002
+	// slices 314/316.
+	HasExpr bool
+	// StatTarget is the per-object statistics target set via
+	// `ALTER STATISTICS ... SET STATISTICS n` (pg_statistic_ext.stxstattarget).
+	// nil means unset — PG stores stxstattarget=NULL (the default), for which
+	// pg_dump emits no ALTER. A non-nil value >= 0 round-trips as an
+	// `ALTER STATISTICS ... SET STATISTICS <n>` after the CREATE. DU-002 slice 317.
+	StatTarget *int
 }
 
 // qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
@@ -1912,19 +2497,28 @@ type Domain struct {
 	// BaseIsEnum records that the base type is a user-defined enum, so the
 	// domain inherits the enum's physical layout (4-byte, int-aligned, plain
 	// storage, 'E' category) rather than the text fallback. DU-002 slice 109.
-	BaseIsEnum    bool
-	NotNull       bool
-	CheckInValues []string    // allowed values from CHECK (VALUE IN ...), M0097-domain-check
-	Default       parser.Expr // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
-	// CheckExpr is the raw SQL text of a generic (non-IN) domain CHECK predicate,
-	// e.g. `VALUE > 0`. CheckName is the constraint name (auto-resolved to
-	// `<domain>_check` when the user gave none). CheckOID is the pg_constraint OID
-	// allocated for the check so getDomainConstraints / pg_get_constraintdef can
-	// surface it. All empty/zero when the domain carries no generic CHECK. DU-002
-	// slice 96.
-	CheckExpr string
-	CheckName string
-	CheckOID  uint32
+	BaseIsEnum bool
+	NotNull    bool
+	Default    parser.Expr // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
+	// Checks holds every CHECK constraint on the domain, each a separate
+	// pg_constraint row (contype='c'). A domain may declare several CHECKs, so
+	// this replaced the former single CheckExpr/CheckName/CheckInValues fields.
+	// DU-002 slice 385 (multi-CHECK; single-CHECK was slices 96/97).
+	Checks []DomainCheck
+}
+
+// DomainCheck is one CHECK constraint on a domain. Name is the resolved
+// constraint name (PG's auto-generated `<domain>_check`[N] when unnamed). Expr
+// is the conbin source text rendered by pg_get_constraintdef. OID is the
+// allocated pg_constraint OID. InValues is non-nil for the
+// `CHECK (VALUE IN (...))` form: it drives both the legacy double-paren render
+// (the pre-synthesized ScalarArrayOp deparse in Expr) and the cast-time
+// membership enforcement. DU-002 slice 385.
+type DomainCheck struct {
+	Name     string
+	Expr     string
+	OID      uint32
+	InValues []string
 }
 
 // DefaultBin renders the domain's DEFAULT expression in the pre-formatted
@@ -1994,15 +2588,92 @@ type CompositeType struct {
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
 // It is stored in InMemory.userAggregates and looked up by lower-case name.
 type UserAggregate struct {
-	Name        string   // lower-case aggregate name
-	ArgTypes    []string // base argument type names (may be empty for zero-arg like count(*))
-	SType       string   // state type name
-	SFunc       string   // state transition function name
-	FinalFunc   string   // final function name (may be empty)
-	CombineFunc string   // combine function name for parallel agg (may be empty)
-	InitCond    string   // initial condition string (may be empty)
-	SFuncStrict bool     // true if sfunc is STRICT (skips NULL inputs)
-	Variadic    bool     // true when declared with VARIADIC input arg
+	OID             uint32   // pg_proc.oid / pg_aggregate.aggfnoid (assigned on first RegisterUserAggregate)
+	Name            string   // lower-case aggregate name
+	ArgTypes        []string // base argument type names (may be empty for zero-arg like count(*))
+	SType           string   // state type name
+	SFunc           string   // state transition function name
+	FinalFunc       string   // final function name (may be empty)
+	CombineFunc     string   // combine function name for parallel agg (may be empty)
+	InitCond        string   // initial condition string (may be empty)
+	FinalFuncModify string   // FINALFUNC_MODIFY: "", "read_only", "shareable", "read_write" (DU-002 slice 405)
+	SFuncStrict     bool     // true if sfunc is STRICT (skips NULL inputs)
+	Variadic        bool     // true when declared with VARIADIC input arg
+	Owner           uint32   // pg_proc.proowner (role OID); 0 means "unset, defaults to bootstrap superuser" — see OwnerOrDefault. M0119-0004.
+	NamespaceOID    uint32   // pg_proc.pronamespace (schema OID); 0 means "unset, defaults to public" — see NamespaceOIDOrDefault. DU-002 slice 405 resume point (a).
+}
+
+// OwnerOrDefault returns agg.Owner, falling back to the bootstrap superuser
+// OID (10) for aggregates registered before the Owner field existed (e.g.
+// replayed from an older WAL record that has no owner payload).
+func (agg *UserAggregate) OwnerOrDefault() uint32 {
+	if agg.Owner == 0 {
+		return 10
+	}
+	return agg.Owner
+}
+
+// NamespaceOIDOrDefault returns agg.NamespaceOID, falling back to the public
+// schema OID for aggregates registered before the NamespaceOID field existed
+// (e.g. replayed from an older WAL record that has no schema payload).
+func (agg *UserAggregate) NamespaceOIDOrDefault() uint32 {
+	if agg.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return agg.NamespaceOID
+}
+
+// UserCollation records a collation created via CREATE COLLATION so that
+// pg_dump's getCollations / dumpCollation re-emit it. goopg does not use the
+// collation for actual string ordering — only the schema-dump round-trip is
+// modeled. Stored in InMemory.userCollations and surfaced as extra rows in the
+// virtual pg_collation view. DU-002 (M0119-0004).
+type UserCollation struct {
+	OID           uint32
+	Name          string // collation name (bare, no schema)
+	NamespaceOID  uint32 // collnamespace (resolved from the schema)
+	Owner         uint32 // collowner (role OID; 10 = postgres superuser)
+	Provider      byte   // collprovider: 'c' libc, 'i' icu, 'b' builtin, 'd' default
+	Encoding      int    // collencoding: -1 = encoding-independent
+	Collate       string // collcollate (libc lc_collate); "" → NULL
+	Ctype         string // collctype (libc lc_ctype); "" → NULL
+	Locale        string // colllocale (builtin/icu locale); "" → NULL
+	Rules         string // collicurules (ICU tailoring rules, icu only); "" → NULL
+	Deterministic bool   // collisdeterministic
+}
+
+// UserConversion records a CREATE [DEFAULT] CONVERSION so pg_dump's
+// getConversions / dumpConversion re-emit it. goopg performs no actual encoding
+// conversion — only the schema-dump round-trip is modeled. Stored in
+// InMemory.userConversions and surfaced as rows in the virtual pg_conversion
+// view. Mirrors PG pg_conversion.h. DU-002 slice 399 (M0119-0004).
+type UserConversion struct {
+	OID          uint32 // pg_conversion.oid (allocated from the catalog OID counter)
+	Name         string // conname (bare, no schema)
+	NamespaceOID uint32 // connamespace (resolved from the schema)
+	Owner        uint32 // conowner (role OID; 10 = postgres superuser)
+	ForEncoding  int32  // conforencoding (pg_enc ID of the source encoding)
+	ToEncoding   int32  // contoencoding (pg_enc ID of the destination encoding)
+	// ProcSchema/ProcName name the conversion function. dumpConversion selects
+	// pg_conversion.conproc (a regproc) raw and emits ` FROM <conproc>`; pg_dump
+	// runs with search_path='' so regproc qualifies the name with its schema —
+	// hence both halves are surfaced and the conproc cell renders `<schema>.<name>`.
+	// They are the as-written fallback; FuncOID (below) is the authoritative
+	// source once resolved.
+	ProcSchema string
+	ProcName   string
+	// FuncOID is pg_conversion.conproc's underlying pg_proc OID — set from the
+	// routine resolveConversionFunc (executor) matched against the fixed
+	// (int4,int4,cstring,internal,int4,bool)->int4 signature at CREATE time. 0
+	// means unresolved (kept lenient for tests that register a UserConversion
+	// directly without a routine registry); the pg_conversion VirtualRows
+	// provider falls back to ProcSchema/ProcName text in that case. A non-zero
+	// FuncOID makes conproc track a later RENAME/ALTER on the function, like
+	// pg_cast.castfunc (slice 397) — unlike the as-written text, which would go
+	// stale. DU-002 slice 403 (closes the slice-402 conproc-OID-cross-ref
+	// deferral).
+	FuncOID uint32
+	Default bool // condefault (CREATE DEFAULT CONVERSION)
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -2016,12 +2687,22 @@ const (
 	RelationRelationId  uint32 = 1259 // pg_class
 	IndexRelationId     uint32 = 2610 // pg_index
 	StatisticRelationId uint32 = 2619 // pg_statistic
+	AggregateRelationId uint32 = 2600 // pg_aggregate
 )
 
 // FirstUserOID is the first OID handed out for user-created tables.
 // 16384 is upstream's `FirstNormalObjectId` — anything below is
 // reserved for system catalogs.
 const FirstUserOID uint32 = 16384
+
+// VirtualNull is the sentinel a VirtualRows cell uses to denote SQL NULL for a
+// column type whose empty string is a legitimate non-NULL value (most notably
+// `text`: an empty `collicurules` / `collcollate` must read as NULL, not '').
+// planner.TypedVirtualCell maps this sentinel to a NULL constant before any
+// type-specific parsing. The byte sequence cannot collide with a real catalog
+// value (NUL-delimited marker). Sibling decoders (the executor's
+// rematerialiseVirtualRows) share TypedVirtualCell, so they stay in sync.
+const VirtualNull = "\x00\x00NULL\x00\x00"
 
 // IsSystemRelation reports whether oid belongs to the reserved system-
 // catalog OID range (anything below FirstUserOID). Used by the executor
@@ -2076,13 +2757,20 @@ func NewInMemory() *InMemory {
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
-		roles:          make(map[string]struct{}),
-		tempNamespaces: make(map[string]uint32),
-		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
-		comments:       make(map[commentKey]string),
-		statisticsObjs: make(map[string]*StatisticsObject),
-		extensions:     make(map[string]*extensionRow),
-		tablespaces:    make(map[string]*tablespaceRow),
+		roles:              make(map[string]uint32),
+		roleAttrs:          make(map[string]*RoleAttrs),
+		tempNamespaces:     make(map[string]uint32),
+		tableACLs:          make(map[uint32]map[string]map[string]bool),
+		tableACLOrder:      make(map[uint32][]string),
+		roleACLDisplay:     make(map[string]string),
+		relACLEmptied:      make(map[uint32]bool),
+		relACLOwnerRevoked: make(map[uint32]bool),
+		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
+		attrACLOrder:       make(map[attrACLKey][]string),
+		comments:           make(map[commentKey]string),
+		statisticsObjs:     make(map[string]*StatisticsObject),
+		extensions:         make(map[string]*extensionRow),
+		tablespaces:        make(map[string]*tablespaceRow),
 	}
 	c.registerSystemTables()
 	return c
@@ -2092,10 +2780,17 @@ func NewInMemory() *InMemory {
 // If a statistics object with the same schema-qualified name already exists it
 // is overwritten. M0097-0023.
 func (c *InMemory) RegisterStatistics(schema, name string, tableOID uint32) *StatisticsObject {
+	return c.RegisterStatisticsFull(schema, name, tableOID, nil, nil, nil, false)
+}
+
+// RegisterStatisticsFull registers a statistics object carrying its kinds, simple
+// column list, and deparsed expression targets so pg_get_statisticsobjdef can
+// reconstruct the DDL. DU-002 slices 314/316.
+func (c *InMemory) RegisterStatisticsFull(schema, name string, tableOID uint32, kinds, columns, exprs []string, hasExpr bool) *StatisticsObject {
 	if schema == "" {
 		schema = "public"
 	}
-	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID, Kinds: kinds, Columns: columns, Exprs: exprs, HasExpr: hasExpr}
 	key := obj.qualifiedKey()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2122,6 +2817,29 @@ func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
 	return obj, ok
 }
 
+
+// SetStatisticsTarget records the statistics target for the named extended
+// statistics object (ALTER STATISTICS ... SET STATISTICS n). A nil target
+// resets it to the default (PG stores stxstattarget=NULL). Returns false if no
+// such object exists. DU-002 slice 317.
+func (c *InMemory) SetStatisticsTarget(name string, target *int) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	obj.StatTarget = target
+	return true
+}
+
 // AllStatistics returns a snapshot of all registered statistics objects. M0097-0023.
 func (c *InMemory) AllStatistics() []*StatisticsObject {
 	c.mu.RLock()
@@ -2131,6 +2849,127 @@ func (c *InMemory) AllStatistics() []*StatisticsObject {
 		out = append(out, obj)
 	}
 	return out
+}
+
+// StatisticsByOID finds a statistics object by its pg_statistic_ext OID. DU-002 slice 314.
+func (c *InMemory) StatisticsByOID(oid uint32) (*StatisticsObject, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, obj := range c.statisticsObjs {
+		if obj.OID == oid {
+			return obj, true
+		}
+	}
+	return nil, false
+}
+
+// BuildStatisticsObjDef reconstructs the CREATE STATISTICS DDL for an extended
+// statistics object, mirroring ruleutils.c pg_get_statisticsobj_worker. pg_dump's
+// dumpStatisticsExt calls pg_get_statisticsobjdef(oid) and emits the result
+// verbatim (plus a trailing semicolon). The kinds clause is suppressed when all
+// three kinds are enabled (the default) or when the object spans a single column;
+// the FROM relation is schema-qualified to match pg_dump's empty search_path.
+// Returns "" when the object carries an expression target (not reconstructable by
+// this simple-column path). DU-002 slice 314.
+func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
+	// Decline only when the ON list had an expression target that could not be
+	// captured (HasExpr set but no deparsed Exprs) — reconstructing it would drop
+	// the expression and silently corrupt the object on restore. DU-002 slice 316.
+	if obj == nil || (obj.HasExpr && len(obj.Exprs) == 0) {
+		return ""
+	}
+	schema := obj.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	var sb strings.Builder
+	sb.WriteString("CREATE STATISTICS ")
+	sb.WriteString(quoteCollationIdent(schema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteCollationIdent(obj.Name))
+
+	// Decode requested kinds. An empty Kinds means the default (all enabled).
+	ndistinct, dependencies, mcv := false, false, false
+	if len(obj.Kinds) == 0 {
+		ndistinct, dependencies, mcv = true, true, true
+	} else {
+		for _, k := range obj.Kinds {
+			switch strings.ToLower(k) {
+			case "ndistinct":
+				ndistinct = true
+			case "dependencies":
+				dependencies = true
+			case "mcv":
+				mcv = true
+			}
+		}
+	}
+	allEnabled := ndistinct && dependencies && mcv
+	// ncolumns counts both simple columns and expression targets, matching PG's
+	// pg_get_statisticsobj_worker (stxkeys.dim1 + list_length(exprs)).
+	ncolumns := len(obj.Columns) + len(obj.Exprs)
+	// Emit the kinds clause only when some kind is disabled and the object spans
+	// more than one column (a single-column object is an expression-stats object
+	// in PG, where the clause is omitted).
+	if !allEnabled && ncolumns > 1 {
+		sb.WriteString(" (")
+		gotone := false
+		if ndistinct {
+			sb.WriteString("ndistinct")
+			gotone = true
+		}
+		if dependencies {
+			if gotone {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("dependencies")
+			gotone = true
+		}
+		if mcv {
+			if gotone {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("mcv")
+		}
+		sb.WriteByte(')')
+	}
+
+	sb.WriteString(" ON ")
+	// PG emits all simple columns first (in stxkeys order) then all expression
+	// targets, regardless of their original ON-list order; colno spans both lists
+	// for comma separation. Mirrors pg_get_statisticsobj_worker (ruleutils.c).
+	colno := 0
+	for _, col := range obj.Columns {
+		if colno > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(quoteCollationIdent(col))
+		colno++
+	}
+	for _, e := range obj.Exprs {
+		if colno > 0 {
+			sb.WriteString(", ")
+		}
+		// e is already rendered in its final form (parenthesized when not a bare
+		// function call) by the executor's deparser.
+		sb.WriteString(e)
+		colno++
+	}
+
+	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so
+	// generate_relation_name always qualifies).
+	sb.WriteString(" FROM ")
+	relSchema, relName := schema, ""
+	if tbl, ok := c.LookupTableByOID(obj.TableOID); ok {
+		relName = tbl.Name
+		if tbl.Schema != "" {
+			relSchema = tbl.Schema
+		}
+	}
+	sb.WriteString(quoteCollationIdent(relSchema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteCollationIdent(relName))
+	return sb.String()
 }
 
 // SetComment stores a description for an object in pg_description.
@@ -2180,6 +3019,9 @@ func (c *InMemory) AllComments() []CommentRow {
 func (c *InMemory) RegisterUserAggregate(agg *UserAggregate) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if agg.OID == 0 {
+		agg.OID = c.allocOIDLocked()
+	}
 	c.userAggregates[strings.ToLower(agg.Name)] = agg
 }
 
@@ -2205,6 +3047,103 @@ func (c *InMemory) RenameUserAggregate(oldName, newName string) bool {
 	agg.Name = newName
 	c.userAggregates[strings.ToLower(newName)] = agg
 	return true
+}
+
+// DropUserAggregate removes a user-defined aggregate by name
+// (case-insensitive). Returns true if an aggregate was found and removed.
+// Mirrors DropCollation.
+func (c *InMemory) DropUserAggregate(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	if _, ok := c.userAggregates[key]; !ok {
+		return false
+	}
+	delete(c.userAggregates, key)
+	return true
+}
+
+// DropUserAggregateDuringRecovery is the discard-result recovery
+// counterpart to DropUserAggregate, mirroring
+// DropCollationDuringRecovery/RenameUserAggregateDuringRecovery.
+func (c *InMemory) DropUserAggregateDuringRecovery(name string) {
+	c.DropUserAggregate(name)
+}
+
+// RegisterUserAggregateDuringRecovery is the idempotent version of
+// RegisterUserAggregate used by the WAL-replay driver
+// (internal/initdb/aggregate_ddl_recovery.go). Unlike RegisterUserAggregate
+// it takes the OID from the WAL record (so the recovered registry matches
+// what the pre-crash server assigned) and advances nextOID past it so
+// subsequent allocations do not collide. Re-applying a record for an
+// aggregate that already exists just refreshes its fields. Mirrors
+// RegisterCastDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, slice 405 ledger resume point (c)). `schema` resolves the
+// aggregate's NamespaceOID the same way CreateCollationDuringRecovery does
+// (unknown/empty → public); this depends on replaySchemaDDLRecords having
+// already restored the schema registry, which the caller
+// (replayAggregateDDLRecords) guarantees by running after it.
+func (c *InMemory) RegisterUserAggregateDuringRecovery(agg *UserAggregate, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userAggregates == nil {
+		c.userAggregates = make(map[string]*UserAggregate)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	agg.NamespaceOID = nsOID
+	c.userAggregates[strings.ToLower(agg.Name)] = agg
+	if agg.OID >= c.nextOID {
+		c.nextOID = agg.OID + 1
+	}
+}
+
+// RenameUserAggregateDuringRecovery is the discard-result recovery
+// counterpart to RenameUserAggregate, mirroring
+// RenameCollationDuringRecovery. A rename record can only be replayed after
+// its aggregate's CREATE AGGREGATE record (WAL is scanned in order), so a
+// not-found error here is not expected in practice, but replay must not
+// abort on it. DU-002 restart-persistence follow-up (M0119-0004, slice 405
+// ledger resume point (c)).
+func (c *InMemory) RenameUserAggregateDuringRecovery(oldName, newName string) {
+	_ = c.RenameUserAggregate(oldName, newName)
+}
+
+// SetUserAggregateOwner changes an existing user-defined aggregate's owner
+// (ALTER AGGREGATE ... OWNER TO). Returns false if name is not found.
+// Mirrors SetCollationOwner. M0119-0004.
+func (c *InMemory) SetUserAggregateOwner(name string, ownerOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	agg, ok := c.userAggregates[strings.ToLower(name)]
+	if !ok {
+		return false
+	}
+	agg.Owner = ownerOID
+	return true
+}
+
+// SetUserAggregateOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetUserAggregateOwner, mirroring
+// RenameUserAggregateDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004).
+func (c *InMemory) SetUserAggregateOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetUserAggregateOwner(name, ownerOID)
+}
+
+// ListUserAggregates returns every registered user-defined aggregate in
+// OID order (deterministic for pg_proc/pg_aggregate VirtualRows output).
+func (c *InMemory) ListUserAggregates() []*UserAggregate {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*UserAggregate, 0, len(c.userAggregates))
+	for _, agg := range c.userAggregates {
+		out = append(out, agg)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
 }
 
 // SetDBOID overrides the database OID used for RelFileNode generation.
@@ -3136,6 +4075,11 @@ func (c *InMemory) AdvanceNextOIDPast(oid uint32) {
 func (c *InMemory) AllocOID() uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.allocOIDLocked()
+}
+
+// allocOIDLocked is AllocOID's body for callers that already hold c.mu.
+func (c *InMemory) allocOIDLocked() uint32 {
 	oid := c.nextOID
 	c.nextOID++
 	return oid
@@ -3295,6 +4239,8 @@ func (c *InMemory) registerSystemTables() {
 				relkind = "m"
 			} else if t.PartitionMethod != "" && t.PartitionParentOID == 0 {
 				relkind = "p"
+			} else if t.ForeignServerName != "" {
+				relkind = "f"
 			}
 			populated := "t"
 			if t.IsMatView && !t.IsPopulated {
@@ -3438,9 +4384,36 @@ func (c *InMemory) registerSystemTables() {
 			if t.VacuumIndexCleanupSet {
 				relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
 			}
+			// A view's `WITH (security_barrier=<bool>)` is stored by PostgreSQL as
+			// the `security_barrier=<bool>` pg_class.reloption. Unlike check_option,
+			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
+			// the `WITH (security_barrier='true')` clause after the view name
+			// (appendReloptionsArray). Placed before check_option so a view carrying
+			// both surfaces as `{security_barrier=...,check_option=...}`, matching
+			// PostgreSQL's stored order. M0119-0004 (slice 366).
+			if t.SecurityBarrierSet {
+				relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
+			}
+			// A view's `WITH (security_invoker=<bool>)` is stored by PostgreSQL as
+			// the `security_invoker=<bool>` pg_class.reloption. Like security_barrier,
+			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
+			// the `WITH (security_invoker='true')` clause after the view name
+			// (appendReloptionsArray). Placed after security_barrier and before
+			// check_option so a view carrying several options surfaces in PG's stored
+			// WITH-clause order. M0119-0004 (slice 367).
+			if t.SecurityInvokerSet {
+				relopts = append(relopts, "security_invoker="+strconv.FormatBool(t.SecurityInvoker))
+			}
+			// A view's `WITH [CASCADED|LOCAL] CHECK OPTION` is stored by PostgreSQL
+			// as the `check_option=<mode>` pg_class.reloption. pg_dump's getTables
+			// then strips it from the reloptions array (array_remove) and re-emits
+			// it as the `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (slice 365).
+			if t.CheckOption != "" {
+				relopts = append(relopts, "check_option="+t.CheckOption)
+			}
 			reloptions := ""
 			if len(relopts) > 0 {
-				reloptions = "{" + strings.Join(relopts, ",") + "}"
+				reloptions = arrayTextLiteral(relopts)
 			}
 			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
 			// table / materialized view with at least one toastable (varlena)
@@ -3477,12 +4450,35 @@ func (c *InMemory) registerSystemTables() {
 				relpages = strconv.Itoa(t.Stats.Pages)
 				reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
 			}
+			replIdent := ReplIdentOrDefault(t.ReplicaIdentity) // relreplident (DU-002 slice 305)
+			// relhastriggers gates pg_dump's getTriggers: a table whose
+			// relhastriggers='f' is excluded from the tbloids array, so pg_dump
+			// never probes pg_trigger for it and the trigger is silently dropped.
+			// Project 't' whenever the table owns at least one trigger. DU-002 slice 319.
+			relHasTriggers := "f"
+			if len(t.Triggers) > 0 {
+				relHasTriggers = "t"
+			}
+			// relacl — NULL until a GRANT records non-owner privileges, then the
+			// materialized aclitem[] (owner full + each grantee). pg_dump's
+			// getTables reads this directly and re-emits GRANTs (buildACLCommands,
+			// client-side). DU-002 slice 331. Sequences (relkind 'S') render with
+			// the sequence privilege set / owner default "rwU" so a GRANT … ON
+			// SEQUENCE round-trips against acldefault('s', owner). DU-002 slice 333.
+			// reloftype: the composite type OID for a typed table (`CREATE TABLE
+			// name OF type`), "0" otherwise. Hoisted to a local so the row literal
+			// keeps its single-token column width (and comment alignment). DU-002 slice 374.
+			relOfType := strconv.Itoa(int(t.OfTypeOID))
+			relacl := c.relaclTextLocked(t.OID)
+			if t.IsSequence {
+				relacl = c.relaclTextLockedSeq(t.OID)
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
 				strconv.Itoa(int(nsOID)),     // 2:  relnamespace
 				"0",                          // 3:  reltype
-				"0",                          // 4:  reloftype
+				relOfType,                    // 4:  reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 				"10",                         // 5:  relowner (bootstrap superuser)
 				relam,                        // 6:  relam (heap=2; 0 for sequences)
 				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
@@ -3499,22 +4495,22 @@ func (c *InMemory) registerSystemTables() {
 				strconv.Itoa(len(t.Columns)), // 18: relnatts
 				strconv.Itoa(relchecks),      // 19: relchecks
 				"f",                          // 20: relhasrules
-				"f",                          // 21: relhastriggers
+				relHasTriggers,               // 21: relhastriggers
 				func() string {
 					if len(c.partitionChildren[t.OID]) > 0 {
 						return "t"
 					}
 					return "f"
 				}(), // 22: relhassubclass
-				"f",         // 23: relrowsecurity
-				"f",         // 24: relforcerowsecurity
-				populated,   // 25: relispopulated
-				"d",         // 26: relreplident
+				boolToPGChar(t.RowSecurity),      // 23: relrowsecurity (DU-002 slice 322)
+				boolToPGChar(t.ForceRowSecurity), // 24: relforcerowsecurity (DU-002 slice 322)
+				populated,                        // 25: relispopulated
+				replIdent,                        // 26: relreplident
 				isPartition, // 27: relispartition
 				"0",         // 28: relrewrite
 				"0",         // 29: relfrozenxid
 				"1",         // 30: relminmxid
-				"",          // 31: relacl (NULL)
+				relacl,      // 31: relacl (NULL until a table GRANT, slice 331)
 				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
 				partBound,   // 33: relpartbound
 			})
@@ -3532,7 +4528,7 @@ func (c *InMemory) registerSystemTables() {
 				// reloptions is NULL unless the table set explicit toast.* params.
 				toastReloptions := ""
 				if len(t.ToastReloptions) > 0 {
-					toastReloptions = "{" + strings.Join(t.ToastReloptions, ",") + "}"
+					toastReloptions = arrayTextLiteral(t.ToastReloptions)
 				}
 				out = append(out, []string{
 					strconv.Itoa(toastOID), // 0:  oid
@@ -3673,7 +4669,7 @@ func (c *InMemory) registerSystemTables() {
 				for i, kv := range opts {
 					parts[i] = kv[0] + "=" + kv[1]
 				}
-				idxReloptions = "{" + strings.Join(parts, ",") + "}"
+				idxReloptions = arrayTextLiteral(parts)
 			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
@@ -3840,10 +4836,10 @@ func (c *InMemory) registerSystemTables() {
 				continue // skip internal alias
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(s.oid)), // oid
-				s.name,                   // nspname
-				"10",                     // nspowner
-				"",                       // nspacl
+				strconv.Itoa(int(s.oid)),  // oid
+				s.name,                    // nspname
+				"10",                      // nspowner
+				c.NamespaceACLText(s.oid), // nspacl (NULL until a schema GRANT, slice 335)
 			})
 		}
 		return out
@@ -4056,7 +5052,35 @@ func (c *InMemory) registerSystemTables() {
 	pgRoles.VirtualRows = func() [][]string {
 		// OID 10 = BOOTSTRAP_SUPERUSERID (postgres superuser),
 		// per postgres/src/include/catalog/pg_authid.dat.
-		return [][]string{{"10", "postgres", "t", "t"}}
+		out := [][]string{{"10", "postgres", "t", "t"}}
+		// User-created roles (CREATE ROLE / CREATE USER) follow, each with the
+		// OID minted at registration time, sorted by name for deterministic
+		// output. pg_dump's getPolicies resolves pg_policy.polroles OIDs back to
+		// names through this view, so named-role policies round-trip. DU-002
+		// slice 330.
+		c.mu.RLock()
+		names := make([]string, 0, len(c.roles))
+		for name := range c.roles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			// Report the recorded attributes (root-0021); a role with no
+			// sidecar entry keeps the historical 'f'/'t' defaults so
+			// pre-existing pg_dump policy-role resolution is unchanged.
+			rolsuper, rolcanlogin := "f", "t"
+			if a := c.roleAttrs[name]; a != nil {
+				if a.Superuser {
+					rolsuper = "t"
+				}
+				if !a.CanLogin {
+					rolcanlogin = "f"
+				}
+			}
+			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, rolsuper, rolcanlogin})
+		}
+		c.mu.RUnlock()
+		return out
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
 
@@ -4672,7 +5696,11 @@ func (c *InMemory) registerSystemTables() {
 				row[3] = "c"                        // contype = check
 				row[4] = "f"                        // condeferrable
 				row[5] = "f"                        // condeferred
-				row[6] = "t"                        // convalidated
+				if nc.NotValid {
+					row[6] = "f" // convalidated — added NOT VALID, not yet validated
+				} else {
+					row[6] = "t" // convalidated
+				}
 				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
 				row[8] = "0"                        // contypid
 				row[9] = "0"                        // conindid
@@ -4701,34 +5729,38 @@ func (c *InMemory) registerSystemTables() {
 		// Emit domain CHECK constraints (contype='c', keyed on contypid = the
 		// domain's pg_type OID rather than conrelid). pg_dump's
 		// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
-		// and renders each via pg_get_constraintdef. DU-002 slice 96.
+		// and renders each via pg_get_constraintdef ORDER BY conname — the ORDER BY
+		// is applied by the executor over these rows, so a domain's multiple CHECKs
+		// each get a row here. DU-002 slice 96 (single) / slice 385 (multi).
 		for _, d := range c.domains {
-			if d.CheckExpr == "" || d.CheckOID == 0 {
-				continue
+			for _, ck := range d.Checks {
+				if ck.Expr == "" || ck.OID == 0 {
+					continue
+				}
+				row := make([]string, 26)
+				row[0] = fmt.Sprintf("%d", ck.OID) // oid
+				row[1] = ck.Name                   // conname
+				row[2] = "2200"                    // connamespace (public)
+				row[3] = "c"                       // contype = check
+				row[4] = "f"                       // condeferrable
+				row[5] = "f"                       // condeferred
+				row[6] = "t"                       // convalidated
+				row[7] = "0"                       // conrelid (none — domain check)
+				row[8] = fmt.Sprintf("%d", d.OID)  // contypid = domain OID
+				row[9] = "0"                       // conindid
+				row[10] = "0"                      // conparentid
+				row[11] = "0"                      // confrelid
+				row[12] = " "                      // confupdtype
+				row[13] = " "                      // confdeltype
+				row[14] = " "                      // confmatchtype
+				row[15] = "t"                      // conislocal
+				row[16] = "0"                      // coninhcount
+				row[17] = "f"                      // connoinherit
+				row[18] = "f"                      // conperiod
+				row[24] = ck.Expr                  // conbin
+				row[25] = "t"                      // conenforced: always true in v0
+				out = append(out, row)
 			}
-			row := make([]string, 26)
-			row[0] = fmt.Sprintf("%d", d.CheckOID) // oid
-			row[1] = d.CheckName                   // conname
-			row[2] = "2200"                        // connamespace (public)
-			row[3] = "c"                           // contype = check
-			row[4] = "f"                           // condeferrable
-			row[5] = "f"                           // condeferred
-			row[6] = "t"                           // convalidated
-			row[7] = "0"                           // conrelid (none — domain check)
-			row[8] = fmt.Sprintf("%d", d.OID)      // contypid = domain OID
-			row[9] = "0"                           // conindid
-			row[10] = "0"                          // conparentid
-			row[11] = "0"                          // confrelid
-			row[12] = " "                          // confupdtype
-			row[13] = " "                          // confdeltype
-			row[14] = " "                          // confmatchtype
-			row[15] = "t"                          // conislocal
-			row[16] = "0"                          // coninhcount
-			row[17] = "f"                          // connoinherit
-			row[18] = "f"                          // conperiod
-			row[24] = d.CheckExpr                  // conbin
-			row[25] = "t"                          // conenforced: always true in v0
-			out = append(out, row)
 		}
 		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
 		for _, idx := range c.indexes {
@@ -4880,6 +5912,16 @@ func (c *InMemory) registerSystemTables() {
 						confkey = append(confkey, fmt.Sprintf("%d", ord))
 					}
 				}
+				// confdelsetcols (PG15): attnums of the columns an ON DELETE SET
+				// NULL|DEFAULT is restricted to. NULL when the action covers the
+				// whole key, matching PG (decompile_column_index_array emits the
+				// ` (col, …)` suffix only when this is non-null). DU-002 slice 311.
+				var confdelsetcols []string
+				for _, cn := range fk.OnDeleteSetCols {
+					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+						confdelsetcols = append(confdelsetcols, fmt.Sprintf("%d", ord))
+					}
+				}
 				row := make([]string, 26)
 				row[0] = fmt.Sprintf("%d", fk.OID) // oid
 				row[1] = fk.Name                   // conname
@@ -4907,13 +5949,20 @@ func (c *InMemory) registerSystemTables() {
 				row[11] = fmt.Sprintf("%d", confrelid)
 				row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
 				row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
-				row[14] = "s"                               // confmatchtype = MATCH SIMPLE
+				if fk.MatchFull {
+					row[14] = "f" // confmatchtype = MATCH FULL
+				} else {
+					row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
+				}
 				row[15] = "t"                               // conislocal
 				row[16] = "0"                               // coninhcount
 				row[17] = "f"                               // connoinherit
 				row[18] = "f"                               // conperiod
 				row[19] = "{" + strings.Join(conkey, ",") + "}"
 				row[20] = "{" + strings.Join(confkey, ",") + "}"
+				if len(confdelsetcols) > 0 {
+					row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
+				}
 				row[25] = "t" // conenforced
 				out = append(out, row)
 			}
@@ -5123,12 +6172,12 @@ func (c *InMemory) registerSystemTables() {
 				boolStr(idx.Primary),             // indisprimary
 				boolStr(idx.IsExclusion),         // indisexclusion
 				"t",                              // indimmediate
-				"f",                              // indisclustered
+				boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
 				"t",                              // indisvalid
 				"f",                              // indcheckxmin
 				"t",                              // indisready
 				"t",                              // indislive
-				"f",                              // indisreplident
+				boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
 				indkey,                           // indkey
 				buildZeroVec(nkeyatts),           // indcollation
 				indclass,                         // indclass
@@ -5218,7 +6267,19 @@ func (c *InMemory) registerSystemTables() {
 			row[2] = obj.Name                        // stxname
 			row[3] = nsOID                           // stxnamespace
 			row[4] = "10"                            // stxowner (bootstrap superuser)
-			row[5] = "-1"                            // stxstattarget (default)
+			// stxstattarget: PG18 stores NULL for the default (BKI_FORCE_NULL),
+			// which pg_dump's getExtendedStatistics maps to -1 → no ALTER. The
+			// string-based virtual-row machinery has no int NULL sentinel (an
+			// empty int4 cell parses as 0, which would spuriously dump
+			// `SET STATISTICS 0`), so the unset default is projected as the
+			// pg_dump-equivalent -1. A non-nil StatTarget (from ALTER STATISTICS
+			// ... SET STATISTICS n) projects its value so pg_dump re-emits the
+			// `ALTER STATISTICS ... SET STATISTICS <n>`. DU-002 slice 317.
+			if obj.StatTarget != nil {
+				row[5] = fmt.Sprintf("%d", *obj.StatTarget) // stxstattarget
+			} else {
+				row[5] = "-1" // default (pg_dump-equivalent of NULL → no ALTER)
+			}
 			row[6] = ""                              // stxkeys
 			row[7] = ""                              // stxexprs
 			row[8] = ""                              // stxkind
@@ -5263,7 +6324,7 @@ func (c *InMemory) registerSystemTables() {
 		// cols: oid, collname, collnamespace, collowner, collprovider,
 		//       collisdeterministic, collencoding, collcollate, collctype,
 		//       colllocale, collicurules, collversion
-		return [][]string{
+		rows := [][]string{
 			{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
 			{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
 			{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
@@ -5272,12 +6333,57 @@ func (c *InMemory) registerSystemTables() {
 			{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
 			{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
 		}
+		// Append user collations (CREATE COLLATION). These carry a user
+		// namespace (e.g. public=2200) so pg_dump's getCollations selects them
+		// for dump while the BKI-pinned pg_catalog rows above are skipped.
+		// M0119-0004.
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		for _, uc := range c.userCollations {
+			det := "t"
+			if !uc.Deterministic {
+				det = "f"
+			}
+			// Per-provider NULLs: libc carries collcollate/collctype and leaves
+			// colllocale NULL; builtin/icu carry colllocale and leave
+			// collcollate/collctype NULL (matching pg_collation, and what
+			// dumpCollation's per-provider branches expect). An empty text cell
+			// must surface SQL NULL — not '' — or dumpCollation's ICU branch
+			// emits a spurious `rules = ''` and warns "invalid collation". The
+			// VirtualNull sentinel forces a NULL through TypedVirtualCell.
+			nz := func(s string) string {
+				if s == "" {
+					return VirtualNull
+				}
+				return s
+			}
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(uc.OID), 10),
+				uc.Name,
+				strconv.FormatUint(uint64(uc.NamespaceOID), 10),
+				strconv.FormatUint(uint64(uc.Owner), 10),
+				string(uc.Provider),
+				det,
+				strconv.Itoa(uc.Encoding),
+				nz(uc.Collate),
+				nz(uc.Ctype),
+				nz(uc.Locale),
+				nz(uc.Rules), // collicurules: ICU tailoring rules; "" → NULL
+				VirtualNull,  // collversion: NULL → recomputed on restore
+			})
+		}
+		return rows
 	}
 	c.tables["pg_catalog.pg_collation"] = pgCollation
 
-	// pg_policy — stores row-level security policies (OID 3256).
-	// Row-level security is not implemented in goopg v0; this stub lets psql
-	// \d+ meta-queries succeed instead of erroring. M0097-0023.
+	// pg_policy — stores row-level security policies (OID 3256). goopg does NOT
+	// enforce RLS, but a policy created via CREATE POLICY is recorded on its
+	// table (catalog.Table.Policies) and projected here so pg_dump's getPolicies
+	// reads it and dumpPolicy re-emits the CREATE POLICY (DU-002 slice 323).
+	// polqual / polwithcheck are pg_node_tree in real PG; declaring them so here
+	// gives the correct NULL semantics for a policy with no USING / WITH CHECK
+	// (an empty cell decodes to SQL NULL — see planner.TypedVirtualCell — and
+	// pg_get_expr(NULL,…) returns NULL, so dumpPolicy omits the clause).
 	pgPolicy := &Table{
 		Schema: "pg_catalog", Name: "pg_policy", Virtual: true,
 		Columns: []Column{
@@ -5287,12 +6393,69 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "polcmd", Type: Type{Name: "char"}, Ordinal: 3},
 			{Name: "polpermissive", Type: Type{Name: "bool"}, Ordinal: 4},
 			{Name: "polroles", Type: Type{Name: "oid[]"}, Ordinal: 5},
-			{Name: "polqual", Type: Type{Name: "text"}, Ordinal: 6},
-			{Name: "polwithcheck", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "polqual", Type: Type{Name: "pg_node_tree"}, Ordinal: 6},
+			{Name: "polwithcheck", Type: Type{Name: "pg_node_tree"}, Ordinal: 7},
 		},
 		OID: 3256,
 	}
-	pgPolicy.VirtualRows = func() [][]string { return nil }
+	pgPolicy.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
+				continue
+			}
+			for _, pol := range tbl.Policies {
+				if pol.OID == 0 {
+					continue // predates OID tracking → invisible to pg_dump
+				}
+				// polroles: format the OID array as a PostgreSQL array literal.
+				// {0} is the PUBLIC sentinel; getPolicies maps it to a NULL TO
+				// clause via `CASE WHEN polroles = '{0}' THEN NULL …`.
+				roles := pol.Roles
+				if len(roles) == 0 {
+					roles = []uint32{0}
+				}
+				parts := make([]string, len(roles))
+				for i, r := range roles {
+					parts[i] = fmt.Sprintf("%d", r)
+				}
+				polroles := "{" + strings.Join(parts, ",") + "}"
+				// polqual / polwithcheck: render the parsed expression with the
+				// catalog-side pg_get_expr deparser, which fully parenthesizes
+				// every node so pg_dump emits `USING ((expr))` / `WITH CHECK
+				// ((expr))`. An absent expression stays "" (→ SQL NULL → pg_dump
+				// omits the clause).
+				var polqual, polwithcheck string
+				if pol.Using != nil {
+					polqual = formatExprForAttrdef(pol.Using)
+				}
+				if pol.WithCheck != nil {
+					polwithcheck = formatExprForAttrdef(pol.WithCheck)
+				}
+				cmd := pol.Command
+				if cmd == 0 {
+					cmd = '*'
+				}
+				permissive := "t"
+				if !pol.Permissive {
+					permissive = "f"
+				}
+				out = append(out, []string{
+					fmt.Sprintf("%d", pol.OID), // oid
+					pol.Name,                   // polname
+					fmt.Sprintf("%d", tbl.OID), // polrelid
+					string(cmd),                // polcmd
+					permissive,                 // polpermissive
+					polroles,                   // polroles
+					polqual,                    // polqual
+					polwithcheck,               // polwithcheck
+				})
+			}
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_policy"] = pgPolicy
 
 	// pg_wait_events — needs at least one row per type.
@@ -5534,12 +6697,11 @@ func (c *InMemory) registerSystemTables() {
 	pgTablespace.VirtualRows = c.tablespaceVirtualRows
 	c.tables["pg_catalog.pg_tablespace"] = pgTablespace
 
-	// pg_foreign_table — foreign-table catalog (OID 3118). goopg implements no
-	// foreign-data wrappers, so this view is always empty. pg_dump's getTables
+	// pg_foreign_table — foreign-table catalog (OID 3118). pg_dump's getTables
 	// runs a `SELECT ftserver FROM pg_foreign_table WHERE ftrelid = c.oid`
-	// subquery in the relkind='f' branch; with no foreign tables it returns no
-	// rows (the branch is never taken for goopg relations anyway). Schema matches
-	// PG's pg_foreign_table (ftrelid, ftserver, ftoptions). M0110-0001 (DU-002).
+	// subquery in the relkind='f' branch. Schema matches PG's pg_foreign_table
+	// (ftrelid, ftserver, ftoptions). M0110-0001 (DU-002); populated by
+	// CREATE FOREIGN TABLE (DU-002 slice 417).
 	pgForeignTable := &Table{
 		Schema: "pg_catalog", Name: "pg_foreign_table", Virtual: true,
 		Columns: []Column{
@@ -5549,7 +6711,38 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3118,
 	}
-	pgForeignTable.VirtualRows = func() [][]string { return nil }
+	// Surface user-created foreign tables (CREATE FOREIGN TABLE ... SERVER ...)
+	// so they round-trip. ftserver resolves to the referenced server's stable
+	// OID (dumpTableSchema/getTables recover the server name via
+	// `SELECT srvname FROM pg_foreign_server WHERE oid = ftserver`); ftoptions
+	// is NULL (empty string) when no table-level OPTIONS were given, so
+	// dumpTableSchema omits the OPTIONS clause. DU-002 slice 417.
+	pgForeignTable.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		keys := make([]string, 0, len(c.tables))
+		for k := range c.tables {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var out [][]string
+		for _, k := range keys {
+			t := c.tables[k]
+			if t.ForeignServerName == "" {
+				continue
+			}
+			var srvOID uint32
+			if s, ok := c.foreignServers[t.ForeignServerName]; ok {
+				srvOID = s.OID
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(t.OID), 10),  // ftrelid
+				strconv.FormatUint(uint64(srvOID), 10), // ftserver
+				optionsArrayLiteral(t.ForeignOptions),  // ftoptions
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
 
 	// pg_init_privs — initial-privileges catalog (OID 3394). PG records here the
@@ -5600,17 +6793,41 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2605,
 	}
-	pgCast.VirtualRows = func() [][]string { return nil }
+	// Surface user-defined casts (CREATE CAST) so they round-trip. getCasts reads
+	// every row (built-in casts are excluded by OID at dump-out time, so an empty
+	// view stays correct for the no-user-cast case); dumpCast renders the source/
+	// target via getFormattedTypeName(castsource/casttarget) — hence the type names
+	// resolve to their canonical pg_type OIDs, which goopg already surfaces in
+	// pg_type. castfunc=0 (WITHOUT FUNCTION / WITH INOUT) skips findFuncByOid; a
+	// WITH FUNCTION cast carries the resolved pg_proc OID so dumpCast re-emits the
+	// `WITH FUNCTION <ns>.<signature>` clause. DU-002 slices 395, 397.
+	pgCast.VirtualRows = func() [][]string {
+		casts := c.ListCasts()
+		if len(casts) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(casts))
+		for _, cs := range casts {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(cs.OID), 10),                // oid
+				strconv.FormatUint(uint64(TypeNameToOID(cs.SourceType)), 10), // castsource
+				strconv.FormatUint(uint64(TypeNameToOID(cs.TargetType)), 10), // casttarget
+				strconv.FormatUint(uint64(cs.FuncOID), 10),            // castfunc (0 unless WITH FUNCTION)
+				cs.Context,                                            // castcontext
+				cs.Method,                                             // castmethod
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_cast"] = pgCast
 
-	// pg_transform — transform catalog (OID 3576). goopg implements no
-	// language-transform objects, so this view is empty. pg_dump's getFuncs runs
-	// `EXISTS (SELECT 1 FROM pg_transform WHERE pg_transform.oid > <g_last_builtin_oid>
-	// AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))`; with
-	// no rows the subquery is always false. Schema matches PG's pg_transform (oid,
-	// trftype, trflang, trffromsql, trftosql); trffromsql/trftosql are typed oid
-	// (PG uses regproc, which is oid-compatible) so the `p.oid = …` comparisons
-	// resolve. M0110-0001 (DU-002).
+	// pg_transform — transform catalog (OID 3576). Schema matches PG's
+	// pg_transform (oid, trftype, trflang, trffromsql, trftosql); trffromsql/
+	// trftosql are typed oid (PG uses regproc, which is oid-compatible). A
+	// CREATE TRANSFORM registers a row here (catalog.Transform, ListTransforms)
+	// so pg_dump's getTransforms/dumpTransform re-emit it; with none registered
+	// this view is empty exactly as before. M0110-0001 (DU-002); CREATE
+	// TRANSFORM support added M0119-0004.
 	pgTransform := &Table{
 		Schema: "pg_catalog", Name: "pg_transform", Virtual: true,
 		Columns: []Column{
@@ -5622,7 +6839,23 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3576,
 	}
-	pgTransform.VirtualRows = func() [][]string { return nil }
+	pgTransform.VirtualRows = func() [][]string {
+		transforms := c.ListTransforms()
+		if len(transforms) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(transforms))
+		for _, tf := range transforms {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(tf.OID), 10),                    // oid
+				strconv.FormatUint(uint64(TypeNameToOID(tf.TypeName)), 10), // trftype
+				strconv.FormatUint(uint64(LanguageNameToOID(tf.Lang)), 10), // trflang
+				strconv.FormatUint(uint64(tf.FromFuncOID), 10),            // trffromsql (0 unless resolved)
+				strconv.FormatUint(uint64(tf.ToFuncOID), 10),              // trftosql (0 unless resolved)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_transform"] = pgTransform
 
 	// pg_language — procedural-language catalog (OID 2612). pg_dump's getProcLangs
@@ -5684,11 +6917,15 @@ func (c *InMemory) registerSystemTables() {
 	// `SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
 	// oprright, oprcode::oid AS oprcode FROM pg_operator` — it reads ALL operators
 	// (built-ins included) and filters out system-defined ones at dump-out time by
-	// namespace dumpability. goopg defines no user operators, and the built-ins are
-	// in pg_catalog (never dumped), so this view is correctly empty (0 rows).
-	// Schema matches PG's pg_operator (pg_operator.h): oprcode is regproc in PG but
-	// oid-compatible, so it is typed oid here and `oprcode::oid` resolves as a no-op.
-	// M0110-0001 (DU-002 slice 9).
+	// namespace dumpability. The built-ins are in pg_catalog (never dumped), so
+	// they are correctly never rendered here (matching PG's own dump behavior,
+	// not a goopg gap). A CREATE OPERATOR registers a row here
+	// (catalog.UserOperator, ListUserOperators) so pg_dump's
+	// getOperators/dumpOpr re-emit it; with none registered this view is empty
+	// exactly as before. Schema matches PG's pg_operator (pg_operator.h):
+	// oprcode is regproc in PG but oid-compatible, so it is typed oid here and
+	// `oprcode::oid` resolves as a no-op. M0110-0001 (DU-002 slice 9; CREATE
+	// OPERATOR support added M0119-0004).
 	pgOperator := &Table{
 		Schema: "pg_catalog", Name: "pg_operator", Virtual: true,
 		Columns: []Column{
@@ -5710,16 +6947,66 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2617,
 	}
-	pgOperator.VirtualRows = func() [][]string { return nil }
+	pgOperator.VirtualRows = func() [][]string {
+		ops := c.ListUserOperators()
+		if len(ops) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(ops))
+		for _, op := range ops {
+			// A shell operator (FuncOID==0) forward-declared purely to mint an
+			// OID for another operator's COMMUTATOR/NEGATOR clause is not yet
+			// a complete definition. Real PG's dumpOpr explicitly skips these
+			// ("some operators are invalid because they were the result of
+			// user defining operators before commutators exist",
+			// pg_dump.c) via `if (!OidIsValid(oprinfo->oprcode)) return;` —
+			// mirrored here.
+			if op.FuncOID == 0 {
+				continue
+			}
+			oprkind := "b"
+			if op.LeftType == "" {
+				oprkind = "l" // prefix/unary: RIGHTARG present, LEFTARG absent (PG14+ has no postfix "r" form)
+			}
+			leftOID := uint32(0)
+			if op.LeftType != "" {
+				leftOID = TypeNameToOID(op.LeftType)
+			}
+			rightOID := uint32(0)
+			if op.RightType != "" {
+				rightOID = TypeNameToOID(op.RightType)
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(op.OID), 10),                     // oid
+				op.Name,                                                   // oprname
+				strconv.FormatUint(uint64(op.NamespaceOIDOrDefault()), 10), // oprnamespace
+				strconv.FormatUint(uint64(op.OwnerOrDefault()), 10),        // oprowner
+				oprkind,                                  // oprkind
+				boolToPGChar(op.CanMerge),                // oprcanmerge
+				boolToPGChar(op.CanHash),                 // oprcanhash
+				strconv.FormatUint(uint64(leftOID), 10),  // oprleft
+				strconv.FormatUint(uint64(rightOID), 10), // oprright
+				"0", // oprresult (not modeled; pg_dump never reads this column)
+				strconv.FormatUint(uint64(op.CommutatorOID), 10), // oprcom
+				strconv.FormatUint(uint64(op.NegatorOID), 10),    // oprnegate
+				strconv.FormatUint(uint64(op.FuncOID), 10),       // oprcode
+				strconv.FormatUint(uint64(op.RestrictOID), 10),   // oprrest
+				strconv.FormatUint(uint64(op.JoinOID), 10),       // oprjoin
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_operator"] = pgOperator
 
 	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
 	// `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM
 	// pg_opclass` — it reads ALL operator classes and filters out system-defined
-	// ones at dump-out time by namespace dumpability. goopg defines no user
-	// operator classes, and the built-ins are in pg_catalog (never dumped), so this
-	// view is correctly empty (0 rows). Schema matches PG's pg_opclass
-	// (pg_opclass.h). M0110-0001 (DU-002 slice 10).
+	// ones at dump-out time by namespace dumpability. A CREATE OPERATOR CLASS
+	// registers a row here (catalog.UserOperatorClass, ListUserOperatorClasses)
+	// so pg_dump's getOpclasses/dumpOpclass re-emit it; with none registered
+	// this view is empty exactly as before. The built-ins are in pg_catalog
+	// (never dumped). Schema matches PG's pg_opclass (pg_opclass.h). M0110-0001
+	// (DU-002 slice 10; CREATE OPERATOR CLASS support added M0119-0004).
 	pgOpclass := &Table{
 		Schema: "pg_catalog", Name: "pg_opclass", Virtual: true,
 		Columns: []Column{
@@ -5735,16 +7022,39 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2616,
 	}
-	pgOpclass.VirtualRows = func() [][]string { return nil }
+	pgOpclass.VirtualRows = func() [][]string {
+		classes := c.ListUserOperatorClasses()
+		if len(classes) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(classes))
+		for _, oc := range classes {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(oc.OID), 10),                     // oid
+				strconv.FormatUint(uint64(oc.Method), 10),                  // opcmethod
+				oc.Name,                                                    // opcname
+				strconv.FormatUint(uint64(oc.NamespaceOIDOrDefault()), 10), // opcnamespace
+				strconv.FormatUint(uint64(oc.OwnerOrDefault()), 10),        // opcowner
+				strconv.FormatUint(uint64(oc.FamilyOID), 10),               // opcfamily
+				strconv.FormatUint(uint64(oc.InTypeOID), 10),               // opcintype
+				boolToPGChar(oc.IsDefault),                                 // opcdefault
+				strconv.FormatUint(uint64(oc.KeyTypeOID), 10),              // opckeytype
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_opclass"] = pgOpclass
 
 	// pg_opfamily — operator-family catalog (OID 2753). pg_dump's getOpfamilies
 	// runs `SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM
 	// pg_opfamily` — it reads ALL operator families and filters out system-defined
-	// ones at dump-out time by namespace dumpability. goopg defines no user
-	// operator families, and the built-ins are in pg_catalog (never dumped), so
-	// this view is correctly empty (0 rows). Schema matches PG's pg_opfamily
-	// (pg_opfamily.h). M0110-0001 (DU-002 slice 11).
+	// ones at dump-out time by namespace dumpability. A CREATE OPERATOR FAMILY
+	// registers a row here (catalog.UserOperatorFamily, ListUserOperatorFamilies)
+	// so pg_dump's getOpfamilies/dumpOpfamily re-emit it; with none registered
+	// this view is empty exactly as before. The built-ins are in pg_catalog
+	// (never dumped). Schema matches PG's pg_opfamily (pg_opfamily.h).
+	// M0110-0001 (DU-002 slice 11; CREATE OPERATOR FAMILY support added
+	// M0119-0004 slice 408).
 	pgOpfamily := &Table{
 		Schema: "pg_catalog", Name: "pg_opfamily", Virtual: true,
 		Columns: []Column{
@@ -5756,7 +7066,23 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2753,
 	}
-	pgOpfamily.VirtualRows = func() [][]string { return nil }
+	pgOpfamily.VirtualRows = func() [][]string {
+		fams := c.ListUserOperatorFamilies()
+		if len(fams) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(fams))
+		for _, f := range fams {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(f.OID), 10),                     // oid
+				strconv.FormatUint(uint64(f.Method), 10),                  // opfmethod
+				f.Name,                                                    // opfname
+				strconv.FormatUint(uint64(f.NamespaceOIDOrDefault()), 10), // opfnamespace
+				strconv.FormatUint(uint64(f.OwnerOrDefault()), 10),        // opfowner
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_opfamily"] = pgOpfamily
 
 	// pg_ts_parser — text-search parser catalog (OID 3601). pg_dump's
@@ -5882,7 +7208,34 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2328,
 	}
-	pgForeignDataWrapper.VirtualRows = func() [][]string { return nil }
+	// Surface user-created FDWs (CREATE FOREIGN DATA WRAPPER) so they round-trip.
+	// fdwhandler/fdwvalidator are 0 (no handler) — the query's `::regproc` cast
+	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR. fdwacl
+	// and fdwoptions are NULL (empty string), so dumpACL emits nothing and the
+	// OPTIONS clause is skipped. DU-002 slice 375.
+	pgForeignDataWrapper.VirtualRows = func() [][]string {
+		fdws := c.ListForeignDataWrappers()
+		if len(fdws) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(fdws))
+		for _, f := range fdws {
+			owner := f.Owner
+			if owner == 0 {
+				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(f.OID), 10), // oid
+				f.Name,                                // fdwname
+				strconv.FormatUint(uint64(owner), 10), // fdwowner
+				"0",                                   // fdwhandler (regproc 0 → '-')
+				"0",                                   // fdwvalidator (regproc 0 → '-')
+				"",                                    // fdwacl (NULL)
+				optionsArrayLiteral(f.Options),        // fdwoptions text[] ("{name=value,…}" or "" for NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
 	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
@@ -5913,8 +7266,96 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 1417,
 	}
-	pgForeignServer.VirtualRows = func() [][]string { return nil }
+	// Surface user-created foreign servers (CREATE SERVER) so they round-trip.
+	// srvfdw resolves to the referenced FDW's stable OID (dumpForeignServer runs
+	// `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` to recover
+	// the wrapper name). srvtype/srvversion are NULL (empty string), so the TYPE/
+	// VERSION clauses are omitted; srvacl/srvoptions are NULL, so dumpACL emits
+	// nothing and the OPTIONS clause is skipped. DU-002 slice 376.
+	pgForeignServer.VirtualRows = func() [][]string {
+		servers := c.ListForeignServers()
+		if len(servers) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(servers))
+		for _, s := range servers {
+			owner := s.Owner
+			if owner == 0 {
+				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(s.OID), 10), // oid
+				s.Name,                                // srvname
+				strconv.FormatUint(uint64(owner), 10), // srvowner
+				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
+				s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
+				s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
+				"",                             // srvacl (NULL)
+				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
+
+	// pg_user_mappings — the publicly-readable view over pg_user_mapping JOIN
+	// pg_foreign_server (system_views.sql). For every foreign server, pg_dump's
+	// dumpForeignServer runs dumpUserMappings, which queries
+	//   SELECT usename, array_to_string(ARRAY(SELECT quote_ident(option_name) ||
+	//   ' ' || quote_literal(option_value) FROM pg_options_to_table(umoptions)
+	//   ORDER BY option_name), E',\n    ') AS umoptions FROM pg_user_mappings
+	//   WHERE srvid = '<oid>' ORDER BY usename
+	// Once any CREATE SERVER exists (slice 376), this query runs for real, so the
+	// view MUST exist or pg_dump aborts with `relation "pg_user_mappings" does not
+	// exist` (exit 1, empty dump). goopg models it as a virtual relation surfacing
+	// the user-mapping registry. Schema mirrors the system view's output columns:
+	// umid oid, srvid oid, srvname name, umuser oid, usename name, umoptions text[].
+	// DU-002 slice 377.
+	pgUserMappings := &Table{
+		Schema: "pg_catalog", Name: "pg_user_mappings", Virtual: true,
+		Columns: []Column{
+			{Name: "umid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "srvid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "srvname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "umuser", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "usename", Type: Type{Name: "name"}, Ordinal: 4},
+			{Name: "umoptions", Type: Type{Name: "text[]"}, Ordinal: 5},
+		},
+	}
+	// Surface user-created user mappings (CREATE USER MAPPING). srvid resolves to
+	// the referenced server's stable OID (the column pg_dump filters on); usename
+	// is the mapped role name (PUBLIC → 'public'); umuser is its role OID (0 for
+	// PUBLIC). umoptions renders the mapping's OPTIONS as the text[] literal
+	// "{name=value,…}" (or NULL when none), which pg_options_to_table(umoptions)
+	// expands → dumpUserMappings appends `OPTIONS (\n    name 'value',\n    …\n)`;
+	// with no options it emits the bare `CREATE USER MAPPING FOR <usename> SERVER
+	// <srv>;`. DU-002 slice 377 (options: slice 379).
+	pgUserMappings.VirtualRows = func() [][]string {
+		mappings := c.ListUserMappings()
+		if len(mappings) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(mappings))
+		for _, m := range mappings {
+			usename := m.UmUser
+			umuser := uint32(0) // ACL_ID_PUBLIC
+			if usename == "" || strings.EqualFold(usename, "public") {
+				usename = "public"
+			} else if oid, ok := c.RoleOID(m.UmUser); ok {
+				umuser = oid
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),                         // umid
+				strconv.FormatUint(uint64(c.ForeignServerOID(m.SrvName)), 10), // srvid
+				m.SrvName,                              // srvname
+				strconv.FormatUint(uint64(umuser), 10), // umuser
+				usename,                                // usename
+				optionsArrayLiteral(m.Options),         // umoptions text[] ("{name=value,…}" or "" for NULL)
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_user_mappings"] = pgUserMappings
 
 	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
 	// pg_dump's getUserMappings short-circuits (no foreign servers → no catalog
@@ -5949,12 +7390,13 @@ func (c *InMemory) registerSystemTables() {
 	// conversions; we filter out system-defined conversions at dump-out time").
 	// PG ships ~130 built-in conversions, but every one lives in the pg_catalog
 	// namespace and is filtered out at dump-out time (selectDumpableObject marks
-	// pg_catalog objects DUMP_COMPONENT_NONE). goopg defines no user conversions
-	// (no CREATE CONVERSION), so an empty view (0 rows) is correct — pg_dump finds
-	// nothing dumpable, identical to the built-ins-only PG outcome. Schema matches
-	// PG's pg_conversion (pg_conversion.h): oid, conname name, connamespace oid,
-	// conowner oid, conforencoding int4, contoencoding int4, conproc regproc(oid),
-	// condefault bool. M0110-0001 (DU-002 slice 21).
+	// pg_catalog objects DUMP_COMPONENT_NONE), so only user conversions (CREATE
+	// [DEFAULT] CONVERSION, surfaced via ListUserConversions below) appear as
+	// dumpable rows. Schema matches PG's pg_conversion (pg_conversion.h): oid,
+	// conname name, connamespace oid, conowner oid, conforencoding int4,
+	// contoencoding int4, conproc regproc, condefault bool. conproc is typed
+	// regproc (not oid) because dumpConversion selects it raw and expects the
+	// function name text. M0110-0001 (DU-002 slice 21); user rows DU-002 slice 399.
 	pgConversion := &Table{
 		Schema: "pg_catalog", Name: "pg_conversion", Virtual: true,
 		Columns: []Column{
@@ -5964,12 +7406,60 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "conowner", Type: Type{Name: "oid"}, Ordinal: 3},
 			{Name: "conforencoding", Type: Type{Name: "int4"}, Ordinal: 4},
 			{Name: "contoencoding", Type: Type{Name: "int4"}, Ordinal: 5},
-			{Name: "conproc", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "conproc", Type: Type{Name: "regproc"}, Ordinal: 6},
 			{Name: "condefault", Type: Type{Name: "bool"}, Ordinal: 7},
 		},
 		OID: 2607,
 	}
-	pgConversion.VirtualRows = func() [][]string { return nil }
+	// Surface user-created conversions (CREATE [DEFAULT] CONVERSION) so they
+	// round-trip. getConversions reads every row (built-in conversions live in
+	// pg_catalog and are filtered out at dump-out time, so an empty view stays
+	// correct for the no-user-conversion case); dumpConversion then queries the
+	// per-row detail and emits `CREATE [DEFAULT] CONVERSION <ns>.<name> FOR
+	// '<for>' TO '<to>' FROM <conproc>`. conforencoding/contoencoding are the
+	// pg_enc integer IDs (dumpConversion wraps them in pg_encoding_to_char), and
+	// conproc renders the schema-qualified function name (pg_dump's empty
+	// search_path qualifies the regproc). DU-002 slice 399.
+	pgConversion.VirtualRows = func() [][]string {
+		convs := c.ListUserConversions()
+		if len(convs) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(convs))
+		for _, cv := range convs {
+			condefault := "f"
+			if cv.Default {
+				condefault = "t"
+			}
+			conproc := cv.ProcName
+			if cv.ProcSchema != "" {
+				conproc = cv.ProcSchema + "." + cv.ProcName
+			}
+			// Prefer a live FuncOID->pg_proc lookup over the as-written text so a
+			// RENAME on the conversion function after CREATE CONVERSION still
+			// dumps correctly (mirrors regproc output semantics; conproc is a
+			// real OID reference in PG, not captured text). DU-002 slice 403.
+			if cv.FuncOID != 0 && c.routines != nil {
+				if r := c.routines.LookupByOID(cv.FuncOID); r != nil {
+					conproc = r.Name
+					if r.Schema != "" {
+						conproc = r.Schema + "." + r.Name
+					}
+				}
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(cv.OID), 10),          // oid
+				cv.Name,                                          // conname
+				strconv.FormatUint(uint64(cv.NamespaceOID), 10), // connamespace
+				strconv.FormatUint(uint64(cv.Owner), 10),        // conowner
+				strconv.FormatInt(int64(cv.ForEncoding), 10),    // conforencoding
+				strconv.FormatInt(int64(cv.ToEncoding), 10),     // contoencoding
+				conproc,                                          // conproc (regproc text)
+				condefault,                                       // condefault
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_conversion"] = pgConversion
 
 	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
@@ -6008,14 +7498,12 @@ func (c *InMemory) registerSystemTables() {
 	//   array_to_string(array(select quote_literal(x) from unnest(evttags) as
 	//   t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname FROM
 	//   pg_event_trigger e ORDER BY e.oid
-	// (pg_dump.c getEventTriggers). goopg defines no event triggers (no CREATE
-	// EVENT TRIGGER), so an empty view (0 rows) is correct — pg_dump finds
-	// nothing dumpable, identical to a stock PG cluster with no user event
-	// triggers. With 0 rows the unnest(evttags)/array_to_string projection is
-	// never evaluated, so the empty text[] column is fine. Schema matches PG's
-	// pg_event_trigger (pg_event_trigger.h): oid, evtname name, evtevent name,
-	// evtowner oid, evtfoid oid, evtenabled "char", evttags text[].
-	// M0110-0001 (DU-002 slice 23).
+	// (pg_dump.c getEventTriggers). goopg does not fire event triggers — this
+	// only round-trips CREATE/DROP EVENT TRIGGER through pg_dump (schema
+	// fidelity only). Schema matches PG's pg_event_trigger
+	// (pg_event_trigger.h): oid, evtname name, evtevent name, evtowner oid,
+	// evtfoid oid, evtenabled "char", evttags text[]. M0110-0001 (DU-002 slice
+	// 23; populated DU-002 (M0119-0004)).
 	pgEventTrigger := &Table{
 		Schema: "pg_catalog", Name: "pg_event_trigger", Virtual: true,
 		Columns: []Column{
@@ -6029,7 +7517,36 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3466,
 	}
-	pgEventTrigger.VirtualRows = func() [][]string { return nil }
+	// Surface user-created event triggers (CREATE EVENT TRIGGER) so they
+	// round-trip. evtfoid renders as a plain OID; the `::regproc` cast in
+	// pg_dump's own query (above) resolves it to a name. DU-002 (M0119-0004).
+	pgEventTrigger.VirtualRows = func() [][]string {
+		ets := c.ListEventTriggers()
+		if len(ets) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(ets))
+		for _, et := range ets {
+			owner := et.Owner
+			if owner == 0 {
+				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
+			}
+			tags := ""
+			if len(et.Tags) > 0 {
+				tags = arrayTextLiteral(et.Tags)
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(et.OID), 10),     // oid
+				et.Name,                                    // evtname
+				et.Event,                                   // evtevent
+				strconv.FormatUint(uint64(owner), 10),      // evtowner
+				strconv.FormatUint(uint64(et.FuncOID), 10), // evtfoid
+				et.Enabled,                                 // evtenabled
+				tags,                                       // evttags text[] ("{...}" or "" for NULL)
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
 
 	// pg_partitioned_table — partition-key catalog (OID 3350). After
@@ -6076,9 +7593,16 @@ func (c *InMemory) registerSystemTables() {
 	//   pg_catalog.pg_trigger u ON (u.oid = t.tgparentid) WHERE ((NOT
 	//   t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled != u.tgenabled)
 	//   ORDER BY t.tgrelid, t.tgname
-	// goopg has no user-defined triggers, so an empty view (0 rows) is correct,
-	// identical to a stock PG cluster with none. The unnest('{}') source is
-	// empty so the JOIN and pg_get_triggerdef are never evaluated. Schema
+	// DU-002 slice 319 wires VirtualRows to project goopg's user-defined
+	// triggers (catalog.Table.Triggers) so a plain CREATE TRIGGER round-trips
+	// through pg_dump. Each row carries the trigger oid/tgrelid/tgname plus the
+	// PG tgtype bitmask, tgfoid (resolved from the routine registry),
+	// tgenabled='O', tgisinternal='f', and tgparentid=0; pg_get_triggerdef(oid)
+	// (expr.go) reconstructs the CREATE TRIGGER statement that pg_dump emits
+	// verbatim. The unnest('{oids}') source carries the real table OIDs, the
+	// self-JOIN finds no parent (tgparentid=0 ≠ any oid) so the LEFT JOIN keeps
+	// the row, and the WHERE's first disjunct (NOT tgisinternal AND
+	// tgparentid=0) admits it. Schema
 	// matches PG's pg_trigger (pg_trigger.h): tgrelid oid, tgparentid oid,
 	// tgname name, tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool,
 	// tgconstrrelid oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool,
@@ -6110,7 +7634,105 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2620,
 	}
-	pgTrigger.VirtualRows = func() [][]string { return nil }
+	pgTrigger.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
+				continue
+			}
+			for _, trig := range tbl.Triggers {
+				if trig.OID == 0 {
+					continue // predates OID tracking → invisible to pg_dump
+				}
+				// tgtype bitmask (pg_trigger.h): ROW=1, BEFORE=2, INSERT=4,
+				// DELETE=8, UPDATE=16, TRUNCATE=32, INSTEAD=64. AFTER is the
+				// absence of the BEFORE and INSTEAD bits.
+				var tgtype int
+				if trig.ForEachRow {
+					tgtype |= 1 << 0
+				}
+				switch trig.Timing {
+				case TriggerBefore:
+					tgtype |= 1 << 1
+				case TriggerInsteadOf:
+					tgtype |= 1 << 6
+				}
+				for _, ev := range trig.Events {
+					switch strings.ToLower(ev) {
+					case "insert":
+						tgtype |= 1 << 2
+					case "delete":
+						tgtype |= 1 << 3
+					case "update":
+						tgtype |= 1 << 4
+					case "truncate":
+						tgtype |= 1 << 5
+					}
+				}
+				// tgfoid: resolve the trigger function's OID from the routine
+				// registry. pg_dump's getTriggers does not read tgfoid (it calls
+				// pg_get_triggerdef), so 0 (unresolved) is harmless, but project
+				// the real OID for catalog faithfulness.
+				var tgfoid uint32
+				fnSchema := trig.FuncSchema
+				if fnSchema == "" {
+					fnSchema = "public"
+				}
+				if c.routines != nil {
+					for _, r := range c.routines.LookupByName(parser.ObjectName{Schema: trig.FuncSchema, Name: trig.FuncName}) {
+						tgfoid = r.OID
+						break
+					}
+				}
+				row := make([]string, 19)
+				row[0] = fmt.Sprintf("%d", trig.OID)     // oid
+				row[1] = fmt.Sprintf("%d", trig.TableOID) // tgrelid
+				row[2] = "0"                              // tgparentid
+				row[3] = trig.Name                        // tgname
+				row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
+				row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
+				row[6] = "O"                              // tgenabled (origin/enabled)
+				row[7] = "f"                              // tgisinternal
+				row[8] = "0"                              // tgconstrrelid
+				row[9] = "0"                              // tgconstrindid
+				// tgconstraint / tgdeferrable / tginitdeferred — a CREATE CONSTRAINT
+				// TRIGGER carries a non-zero tgconstraint (the implicit pg_constraint
+				// OID) so pg_get_triggerdef emits `CREATE CONSTRAINT TRIGGER` plus the
+				// deferrability clause. DU-002 slice 327.
+				tgconstraint := "0"
+				tgdeferrable := "f"
+				tginitdeferred := "f"
+				if trig.IsConstraint {
+					tgconstraint = fmt.Sprintf("%d", trig.ConstraintOID)
+					if trig.Deferrable {
+						tgdeferrable = "t"
+					}
+					if trig.InitDeferred {
+						tginitdeferred = "t"
+					}
+				}
+				row[10] = tgconstraint   // tgconstraint
+				row[11] = tgdeferrable   // tgdeferrable
+				row[12] = tginitdeferred // tginitdeferred
+				row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
+				// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
+				// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
+				// empty for every non-column-specific trigger. DU-002 slice 326.
+				row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
+				row[15] = ""                              // tgargs (bytea; def built from catalog.Trigger.Args)
+				row[16] = ""                              // tgqual (pg_node_tree; WHEN unsupported)
+				// tgoldtable / tgnewtable — the REFERENCING transition-table names
+				// (`OLD TABLE AS …` / `NEW TABLE AS …`), empty when absent. DU-002
+				// slice 328.
+				row[17] = trig.OldTransitionTable        // tgoldtable (name)
+				row[18] = trig.NewTransitionTable        // tgnewtable (name)
+				out = append(out, row)
+			}
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_trigger"] = pgTrigger
 
 	// pg_rewrite — rewrite-rule catalog (OID 2618). After getTriggers, pg_dump's
@@ -6140,7 +7762,50 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2618,
 	}
-	pgRewrite.VirtualRows = func() [][]string { return nil }
+	// A CREATE RULE … [WHERE qual] DO [INSTEAD] NOTHING rule is recorded on its
+	// table (catalog.Table.Rules) and projected here so pg_dump's getRules reads
+	// it and dumpRule re-emits the CREATE RULE (via pg_get_ruledef, reconstructed
+	// from the same RuleInfo, including the conditional WHERE — DU-002 slice 359).
+	// getRules selects only oid/rulename/ev_class/ev_type/is_instead/ev_enabled,
+	// so ev_qual/ev_action stay empty (→ SQL NULL) even for a conditional rule;
+	// the rule text (with its WHERE) comes from the executor's pg_get_ruledef
+	// handler, not from these columns. View _RETURN rules (ev_type '1') are still
+	// absent — goopg has no stored user views feeding this dump path. DU-002
+	// slice 324.
+	pgRewrite.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
+				continue
+			}
+			for _, r := range tbl.Rules {
+				if r.OID == 0 {
+					continue // predates OID tracking → invisible to pg_dump
+				}
+				evType := r.EvType()
+				if evType == "" {
+					continue
+				}
+				isInstead := "f"
+				if r.Instead {
+					isInstead = "t"
+				}
+				out = append(out, []string{
+					fmt.Sprintf("%d", r.OID),   // oid
+					r.Name,                     // rulename
+					fmt.Sprintf("%d", tbl.OID), // ev_class
+					evType,                     // ev_type
+					string(r.EvEnabled()),      // ev_enabled ('O' default; ALTER TABLE … RULE sets D/R/A)
+					isInstead,                  // is_instead
+					"",                         // ev_qual  (NULL — unconditional rule)
+					"",                         // ev_action (NULL — DO NOTHING)
+				})
+			}
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
 
 	// pg_largeobject_metadata — large-object ownership/ACL catalog (OID 2995).
@@ -6167,12 +7832,16 @@ func (c *InMemory) registerSystemTables() {
 	// pg_amop — access-method operator catalog (OID 2602). After getBlobs,
 	// pg_dump's getDependencies issues a pg_depend UNION that joins both pg_amop
 	// and pg_amproc to resolve operator-family member dependencies (so they are
-	// not dumped as standalone objects). goopg has no user-defined operator
-	// classes/families feeding this dump path, so an empty view (0 rows) is
-	// correct, identical to a stock PG cluster with no user opclasses. Schema
-	// matches PG's pg_amop (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
+	// not dumped as standalone objects); dumpOpclass/dumpOpfamily also query
+	// this view directly for a class/family's own OPERATOR entries. A CREATE
+	// OPERATOR CLASS AS-list OPERATOR entry naming a resolvable (user-defined)
+	// operator registers a row here (catalog.AmOpMember, RegisterAmOpMember);
+	// an unresolvable builtin-operator reference is silently dropped (goopg has
+	// no builtin-operator catalog — deferred, see the ledger). Schema matches
+	// PG's pg_amop (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
 	// amoprighttype oid, amopstrategy int2, amoppurpose "char", amopopr oid,
-	// amopmethod oid, amopsortfamily oid. M0110-0001 (DU-002 slice 30).
+	// amopmethod oid, amopsortfamily oid. M0110-0001 (DU-002 slice 30; member
+	// store added slice 411).
 	pgAmop := &Table{
 		Schema: "pg_catalog", Name: "pg_amop", Virtual: true,
 		Columns: []Column{
@@ -6188,15 +7857,46 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2602,
 	}
-	pgAmop.VirtualRows = func() [][]string { return nil }
+	pgAmop.VirtualRows = func() [][]string {
+		members := c.ListAmOpMembers()
+		if len(members) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(members))
+		for _, m := range members {
+			// amoppurpose: AMOP_ORDER ('o') when the entry has a resolved
+			// sort family, else AMOP_SEARCH ('s') — mirrors opclasscmds.c's
+			// "oppurpose = OidIsValid(op->sortfamily) ? AMOP_ORDER :
+			// AMOP_SEARCH". DU-002 (M0119-0004) slice 414.
+			purpose := "s"
+			if m.SortFamilyOID != 0 {
+				purpose = "o"
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),
+				strconv.FormatUint(uint64(m.FamilyOID), 10),
+				strconv.FormatUint(uint64(m.LeftType), 10),
+				strconv.FormatUint(uint64(m.RightType), 10),
+				strconv.FormatUint(uint64(m.Strategy), 10),
+				purpose,
+				strconv.FormatUint(uint64(m.OperOID), 10),
+				strconv.FormatUint(uint64(m.Method), 10),
+				strconv.FormatUint(uint64(m.SortFamilyOID), 10),
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_amop"] = pgAmop
 
 	// pg_amproc — access-method support-procedure catalog (OID 2603). Joined
 	// alongside pg_amop in the same getDependencies pg_depend UNION (see pg_amop
-	// above). goopg has no user-defined operator classes/families, so an empty
-	// view (0 rows) is correct. Schema matches PG's pg_amproc (pg_amproc.h):
-	// oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum
-	// int2, amproc regproc. M0110-0001 (DU-002 slice 30).
+	// above), and by dumpOpclass/dumpOpfamily for a class/family's own FUNCTION
+	// entries. A CREATE OPERATOR CLASS AS-list FUNCTION entry naming a
+	// resolvable function registers a row here (catalog.AmProcMember,
+	// RegisterAmProcMember). Schema matches PG's pg_amproc (pg_amproc.h): oid,
+	// amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum
+	// int2, amproc regproc. M0110-0001 (DU-002 slice 30; member store added
+	// slice 411).
 	pgAmproc := &Table{
 		Schema: "pg_catalog", Name: "pg_amproc", Virtual: true,
 		Columns: []Column{
@@ -6209,7 +7909,24 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2603,
 	}
-	pgAmproc.VirtualRows = func() [][]string { return nil }
+	pgAmproc.VirtualRows = func() [][]string {
+		members := c.ListAmProcMembers()
+		if len(members) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(members))
+		for _, m := range members {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),
+				strconv.FormatUint(uint64(m.FamilyOID), 10),
+				strconv.FormatUint(uint64(m.LeftType), 10),
+				strconv.FormatUint(uint64(m.RightType), 10),
+				strconv.FormatUint(uint64(m.ProcNum), 10),
+				strconv.FormatUint(uint64(m.ProcOID), 10),
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_amproc"] = pgAmproc
 
 	// pg_seclabels — system view exposing security labels (a join over the
@@ -7216,6 +8933,69 @@ func (c *InMemory) UnregisterSchemaDuringRecovery(name string) {
 	delete(c.schemas, strings.ToLower(name))
 }
 
+// RegisterTransformDuringRecovery is the idempotent version of
+// RegisterTransform used by the WAL-replay driver
+// (internal/initdb/transform_ddl_recovery.go). Unlike RegisterTransform it
+// takes the OID from the WAL record (so the recovered registry matches what
+// the pre-crash server assigned) and advances nextOID past it so subsequent
+// allocations do not collide. Re-applying a record for a transform that
+// already exists just refreshes its fields. Mirrors
+// RegisterSchemaDuringRecovery. DU-002 (M0119-0004) restart persistence.
+func (c *InMemory) RegisterTransformDuringRecovery(typeName, lang string, oid, fromFuncOID, toFuncOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		c.transforms = make(map[string]*Transform)
+	}
+	key := strings.ToLower(typeName) + "\x00" + strings.ToLower(lang)
+	c.transforms[key] = &Transform{OID: oid, TypeName: typeName, Lang: lang, FromFuncOID: fromFuncOID, ToFuncOID: toFuncOID}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// DropTransformDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropTransform. DU-002 (M0119-0004) restart persistence.
+func (c *InMemory) DropTransformDuringRecovery(typeName, lang string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		return
+	}
+	delete(c.transforms, strings.ToLower(typeName)+"\x00"+strings.ToLower(lang))
+}
+
+// RegisterCastDuringRecovery is the idempotent version of RegisterCast used
+// by the WAL-replay driver (internal/initdb/cast_ddl_recovery.go). Unlike
+// RegisterCast it takes the OID from the WAL record (so the recovered
+// registry matches what the pre-crash server assigned) and advances nextOID
+// past it so subsequent allocations do not collide. Re-applying a record for
+// a cast that already exists just refreshes its fields. Mirrors
+// RegisterTransformDuringRecovery. DU-002 restart-persistence follow-up.
+func (c *InMemory) RegisterCastDuringRecovery(source, target, context, method string, oid, funcOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		c.casts = make(map[string]*Cast)
+	}
+	key := castKey(source, target)
+	c.casts[key] = &Cast{OID: oid, SourceType: source, TargetType: target, Context: context, Method: method, FuncOID: funcOID}
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// DropCastDuringRecovery is the idempotent counterpart used for replaying
+// RecordKindDropCast. DU-002 restart-persistence follow-up.
+func (c *InMemory) DropCastDuringRecovery(source, target string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		return
+	}
+	delete(c.casts, castKey(source, target))
+}
+
 // CreateExtension records a CREATE EXTENSION install in the runtime
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.
@@ -7242,6 +9022,351 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 		database: database,
 	}
 	return nil
+}
+
+// ExtensionOID returns the runtime pg_extension OID for the named extension, or
+// 0 if no extension by that name is installed. Used by COMMENT ON EXTENSION to
+// key the pg_description row on the extension's catalog OID (classoid 3079) so
+// pg_dump's dumpExtension can re-emit the comment. DU-002 slice 388.
+func (c *InMemory) ExtensionOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if e, ok := c.extensions[strings.ToLower(name)]; ok {
+		return e.oid
+	}
+	return 0
+}
+
+// CreateCollation records a CREATE COLLATION in the runtime pg_collation
+// registry so pg_dump's getCollations / dumpCollation re-emit it. `schema` is
+// the (already-resolved) schema name the collation lives in; an unknown schema
+// resolves to the public namespace OID. The collation is keyed by its OID and
+// surfaced as an extra virtual pg_collation row. Returns the new OID, or 0 with
+// an error if a same-named collation already exists in the same namespace and
+// ifNotExists is false. M0119-0004.
+func (c *InMemory) CreateCollation(uc *UserCollation, schema string, ifNotExists bool) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userCollations {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+			if ifNotExists {
+				return existing.OID, nil
+			}
+			return 0, fmt.Errorf("collation %q already exists", uc.Name)
+		}
+	}
+	uc.OID = c.allocOIDLocked()
+	uc.NamespaceOID = nsOID
+	c.userCollations = append(c.userCollations, uc)
+	return uc.OID, nil
+}
+
+// DropCollation removes the user-created collation with the given bare name in
+// the given schema from the registry. Returns true if one was found and
+// removed. `schema` resolves like CreateCollation (unknown → public). Built-in
+// collations are never registered in userCollations, so a DROP COLLATION on
+// one of them always returns false (mirrors PG, which also refuses to drop a
+// pinned pg_collation row). M0119-0004.
+func (c *InMemory) DropCollation(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			c.userCollations = append(c.userCollations[:i], c.userCollations[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// RenameCollation renames a user-created collation with the given bare name
+// in the given schema to newName. Returns an error if the source collation
+// does not exist (not found in userCollations — built-in collations are never
+// registered there, mirroring DropCollation's refusal to touch them) or a
+// collation named newName already exists in the same namespace. `schema`
+// resolves like CreateCollation (unknown → public). M0119-0004 (DU-002,
+// loop #50 ledger follow-up).
+func (c *InMemory) RenameCollation(name, schema, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserCollation
+	for _, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			target = uc
+			continue
+		}
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, newName) {
+			return fmt.Errorf("collation %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("collation %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetCollationOwner sets the owning role OID of a user-created collation with
+// the given bare name in the given schema. Returns false if no such collation
+// is registered (mirrors RenameCollation/DropCollation). M0119-0004 (DU-002,
+// loop #50 ledger follow-up).
+func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.Owner = ownerOID
+			return true
+		}
+	}
+	return false
+}
+
+// CreateCollationDuringRecovery is the idempotent version of CreateCollation
+// used by the WAL-replay driver (internal/initdb/collation_ddl_recovery.go).
+// Unlike CreateCollation it takes the OID from the WAL record (so the
+// recovered collation matches the pre-crash OID exactly) and overwrites
+// rather than erroring when an entry with the same OID is already present
+// (replay may see the same record more than once across a partial-then-full
+// replay). Mirrors CreateConversionDuringRecovery. DU-002 restart-persistence
+// follow-up.
+func (c *InMemory) CreateCollationDuringRecovery(uc *UserCollation, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	uc.NamespaceOID = nsOID
+	for i, existing := range c.userCollations {
+		if existing.OID == uc.OID {
+			c.userCollations[i] = uc
+			if uc.OID >= c.nextOID {
+				c.nextOID = uc.OID + 1
+			}
+			return
+		}
+	}
+	c.userCollations = append(c.userCollations, uc)
+	if uc.OID >= c.nextOID {
+		c.nextOID = uc.OID + 1
+	}
+}
+
+// DropCollationDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropCollation. Identical to DropCollation but discards
+// the found/not-found result — replay does not care whether the collation was
+// still present (a subsequent CREATE with the same name after a DROP is a
+// valid sequence to replay in order). DU-002 restart-persistence follow-up.
+func (c *InMemory) DropCollationDuringRecovery(name, schema string) {
+	c.DropCollation(name, schema)
+}
+
+// RenameCollationDuringRecovery is the discard-result recovery counterpart to
+// RenameCollation, mirroring DropCollationDuringRecovery. A rename record can
+// only be replayed after its collation's CREATE COLLATION record (WAL is
+// scanned in order), so a not-found error here is not expected in practice,
+// but replay must not abort on it — the same "don't care if it was still
+// there" tolerance DropCollationDuringRecovery documents. DU-002
+// restart-persistence follow-up (M0119-0004).
+func (c *InMemory) RenameCollationDuringRecovery(name, schema, newName string) {
+	_ = c.RenameCollation(name, schema, newName)
+}
+
+// SetCollationOwnerDuringRecovery is the discard-result recovery counterpart
+// to SetCollationOwner, mirroring DropCollationDuringRecovery. DU-002
+// restart-persistence follow-up (M0119-0004).
+func (c *InMemory) SetCollationOwnerDuringRecovery(name, schema string, ownerOID uint32) {
+	c.SetCollationOwner(name, schema, ownerOID)
+}
+
+// CreateConversion records a CREATE [DEFAULT] CONVERSION in the runtime
+// pg_conversion registry so pg_dump's getConversions / dumpConversion re-emit
+// it. `schema` is the (already-resolved) schema name the conversion lives in; an
+// unknown schema resolves to the public namespace OID. The conversion is keyed
+// by its OID and surfaced as an extra virtual pg_conversion row. Returns the new
+// OID, or 0 with an error if a same-named conversion already exists in the same
+// namespace (PG enforces a unique (conname, connamespace)). DU-002 slice 399.
+func (c *InMemory) CreateConversion(uc *UserConversion, schema string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userConversions {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+			return 0, fmt.Errorf("conversion %q already exists", uc.Name)
+		}
+	}
+	uc.OID = c.allocOIDLocked()
+	uc.NamespaceOID = nsOID
+	c.userConversions = append(c.userConversions, uc)
+	return uc.OID, nil
+}
+
+// DropConversion removes the user-created conversion with the given bare name in
+// the given schema from the registry. Returns true if one was found and removed.
+// `schema` resolves like CreateConversion (unknown → public). DU-002 slice 399.
+func (c *InMemory) DropConversion(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, uc := range c.userConversions {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			c.userConversions = append(c.userConversions[:i], c.userConversions[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// CreateConversionDuringRecovery is the idempotent version of CreateConversion
+// used by the WAL-replay driver (internal/initdb/conversion_ddl_recovery.go).
+// Unlike CreateConversion it takes the OID from the WAL record (so the
+// recovered conversion matches the pre-crash OID exactly) and overwrites
+// rather than erroring when an entry with the same OID is already present
+// (replay may see the same record more than once across a partial-then-full
+// replay). Mirrors RegisterCastDuringRecovery / RegisterTransformDuringRecovery.
+// DU-002 restart-persistence follow-up.
+func (c *InMemory) CreateConversionDuringRecovery(uc *UserConversion, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	uc.NamespaceOID = nsOID
+	for i, existing := range c.userConversions {
+		if existing.OID == uc.OID {
+			c.userConversions[i] = uc
+			if uc.OID >= c.nextOID {
+				c.nextOID = uc.OID + 1
+			}
+			return
+		}
+	}
+	c.userConversions = append(c.userConversions, uc)
+	if uc.OID >= c.nextOID {
+		c.nextOID = uc.OID + 1
+	}
+}
+
+// DropConversionDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropConversion. Identical to DropConversion but
+// discards the found/not-found result — replay does not care whether the
+// conversion was still present (a subsequent CREATE with the same name after
+// a DROP is a valid sequence to replay in order). DU-002 restart-persistence
+// follow-up.
+func (c *InMemory) DropConversionDuringRecovery(name, schema string) {
+	c.DropConversion(name, schema)
+}
+
+// ListUserConversions returns the user-created conversions in creation order.
+// DU-002 slice 399.
+func (c *InMemory) ListUserConversions() []*UserConversion {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userConversions) == 0 {
+		return nil
+	}
+	out := make([]*UserConversion, len(c.userConversions))
+	copy(out, c.userConversions)
+	return out
+}
+
+// CollationAttrsByName resolves a collation's dump-relevant attributes
+// (provider, collate, ctype, locale, encoding, deterministic) by its bare name,
+// searching the built-in collations and then user-created ones. Used by
+// `CREATE COLLATION new FROM existing` to copy the source's attributes. Returns
+// false if no collation by that name is known. M0119-0004.
+func (c *InMemory) CollationAttrsByName(name string) (*UserCollation, bool) {
+	// Built-in collations (mirror the 7 BKI rows surfaced in pg_collation):
+	// name → {provider, encoding, collate, ctype, locale}.
+	type bi struct {
+		provider byte
+		encoding int
+		collate  string
+		ctype    string
+		locale   string
+	}
+	builtins := map[string]bi{
+		"default":         {'d', -1, "", "", ""},
+		"c":               {'c', -1, "C", "C", ""},
+		"posix":           {'c', -1, "POSIX", "POSIX", ""},
+		"ucs_basic":       {'b', 6, "", "", "C"},
+		"unicode":         {'i', -1, "", "", "und"},
+		"pg_c_utf8":       {'b', 6, "", "", "C.UTF-8"},
+		"pg_unicode_fast": {'b', 6, "", "", "PG_UNICODE_FAST"},
+	}
+	lc := strings.ToLower(name)
+	if b, ok := builtins[lc]; ok {
+		return &UserCollation{
+			Name: name, Owner: 10, Provider: b.provider, Encoding: b.encoding,
+			Collate: b.collate, Ctype: b.ctype, Locale: b.locale, Deterministic: true,
+		}, true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, uc := range c.userCollations {
+		if strings.EqualFold(uc.Name, name) {
+			cp := *uc
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
+// UserCollationOIDByName resolves a user-created collation's OID by its bare
+// name (case-insensitive). The attcollation surfacing for a table column /
+// composite field uses it to shadow the column type's typcollation when the
+// column was declared `COLLATE <usercoll>`, so pg_dump's getTableAttrs reports
+// `attcollation <> typcollation` and re-emits the inline COLLATE clause
+// (schema-qualified via findCollationByOid → fmtQualifiedDumpable). Returns 0
+// when no user collation by that name exists — built-in collations are resolved
+// separately (collationNameToOID in the executor), so the caller only falls back
+// here for a non-built-in name. M0119-0004 (DU-002 slice 394).
+func (c *InMemory) UserCollationOIDByName(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, uc := range c.userCollations {
+		if strings.EqualFold(uc.Name, name) {
+			return uc.OID
+		}
+	}
+	return 0
+}
+
+// ListUserCollations returns the user-created collations in creation order.
+// Mirrors ListUserConversions. M0119-0004.
+func (c *InMemory) ListUserCollations() []*UserCollation {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userCollations) == 0 {
+		return nil
+	}
+	out := make([]*UserCollation, len(c.userCollations))
+	copy(out, c.userCollations)
+	return out
 }
 
 // tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
@@ -7395,6 +9520,123 @@ func (c *InMemory) dependVirtualRows() [][]string {
 			strconv.FormatUint(uint64(ad.seqOID), 10), // 4: refobjid = sequence OID
 			"0", // 5: refobjsubid
 			"n", // 6: deptype   = NORMAL
+		})
+	}
+
+	// CREATE OPERATOR CLASS AS-list members: each pg_amop/pg_amproc row gets
+	// two pg_depend rows, mirroring storeOperators/storeProcedures
+	// (opclasscmds.c) for a class-attributed ("hard") reference — a NORMAL
+	// ('n') dependency on the operator/function itself, and an INTERNAL ('i')
+	// dependency on the owning opclass (refclassid=pg_opclass). dumpOpclass's
+	// own query filters on refclassid=pg_opclass directly, and getDependencies
+	// explicitly excludes 'i' rows from its pg_amop/pg_amproc→pg_opfamily
+	// rewrite (both would turn into useless self-dependencies) — 'i' here
+	// matches upstream exactly. DU-002 (M0119-0004) slice 411. Called under
+	// c.mu.RLock() (this function's own lock) — read c.amOpMembers/
+	// c.amProcMembers directly rather than through the public List* accessors
+	// to avoid a recursive RLock.
+	// A "loose" member — registered via ALTER OPERATOR FAMILY ... ADD rather
+	// than a CREATE OPERATOR CLASS AS list — always has ClassOID == 0
+	// (InvalidOid; every class-attributed member gets a real, non-zero
+	// RegisterUserOperatorClass OID, so 0 is an unambiguous sentinel here).
+	// storeOperators/storeProcedures (opclasscmds.c) downgrade EVERY one of a
+	// loose member's dependencies from hard to soft: the operator/function
+	// reference itself becomes AUTO ('a', not NORMAL 'n'), and the
+	// class-or-family reference becomes an AUTO dependency on the FAMILY
+	// itself (refclassid=pg_opfamily, refobjid=the owning family's own OID —
+	// "Historically, ALTER ADD has created soft dependencies", verbatim
+	// AlterOpFamilyAdd comment) instead of an INTERNAL dependency on a class.
+	// This is what lets dumpOpfamily's own loose-member query
+	// (refclassid=pg_opfamily) find these rows and emit them as a separate
+	// `ALTER OPERATOR FAMILY ... ADD` statement. DU-002 (M0119-0004), ALTER
+	// OPERATOR FAMILY ADD slice.
+	for _, m := range c.amOpMembers {
+		refDeptype := "n"
+		classOrFamilyRefclassid := "2616" // pg_opclass
+		classOrFamilyRefobjid := m.ClassOID
+		classOrFamilyDeptype := "i"
+		// gistadjustmembers/spgadjustmembers force EVERY OPERATOR member
+		// (not just loose ALTER-ADD'd ones) to a soft family-level
+		// dependency for these two AMs, regardless of class-attribution —
+		// see amForcesSoftOperatorDependency's doc comment. DU-002
+		// (M0119-0004).
+		if m.ClassOID == 0 || amForcesSoftOperatorDependency(m.Method) {
+			refDeptype = "a"
+			classOrFamilyRefclassid = "2753" // pg_opfamily
+			classOrFamilyRefobjid = m.FamilyOID
+			classOrFamilyDeptype = "a"
+		}
+		rows = append(rows, []string{
+			"2602", // 0: classid    = pg_amop
+			strconv.FormatUint(uint64(m.OID), 10), // 1: objid  = amop entry OID
+			"0",    // 2: objsubid
+			"2617", // 3: refclassid = pg_operator
+			strconv.FormatUint(uint64(m.OperOID), 10), // 4: refobjid = operator OID
+			"0",        // 5: refobjsubid
+			refDeptype, // 6: deptype = NORMAL (hard) or AUTO (loose)
+		})
+		rows = append(rows, []string{
+			"2602",
+			strconv.FormatUint(uint64(m.OID), 10),
+			"0",
+			classOrFamilyRefclassid,
+			strconv.FormatUint(uint64(classOrFamilyRefobjid), 10),
+			"0",
+			classOrFamilyDeptype,
+		})
+		// A FOR ORDER BY entry also gets a dependency on its sort family
+		// (opclasscmds.c storeOperators: "A search operator also needs a dep
+		// on the referenced opfamily") — NORMAL for a hard/class-attributed
+		// member, AUTO for a loose one, same op->ref_is_hard switch as the
+		// two rows above. getDependencies rewrites this into an edge from
+		// the owning opfamily to the sort family for dump ordering;
+		// dumpOpclass's own SQL-text rendering reads amopsortfamily directly
+		// and does not need this row. DU-002 (M0119-0004) slice 414.
+		if m.SortFamilyOID != 0 {
+			rows = append(rows, []string{
+				"2602",
+				strconv.FormatUint(uint64(m.OID), 10),
+				"0",
+				"2753", // refclassid = pg_opfamily
+				strconv.FormatUint(uint64(m.SortFamilyOID), 10),
+				"0",
+				refDeptype,
+			})
+		}
+	}
+	for _, m := range c.amProcMembers {
+		refDeptype := "n"
+		classOrFamilyRefclassid := "2616" // pg_opclass
+		classOrFamilyRefobjid := m.ClassOID
+		classOrFamilyDeptype := "i"
+		// A class-attributed FUNCTION member on a GiST/SP-GiST opclass is
+		// only hard-on-class when its amprocnum is one of the AM's
+		// *required* support procs; every optional one is forced soft on
+		// the family, mirroring gistadjustmembers/spgadjustmembers's
+		// function loop. DU-002 (M0119-0004).
+		if m.ClassOID == 0 || amForcesSoftFunctionDependency(m.Method, m.ProcNum) {
+			refDeptype = "a"
+			classOrFamilyRefclassid = "2753" // pg_opfamily
+			classOrFamilyRefobjid = m.FamilyOID
+			classOrFamilyDeptype = "a"
+		}
+		rows = append(rows, []string{
+			"2603", // 0: classid    = pg_amproc
+			strconv.FormatUint(uint64(m.OID), 10),
+			"0",
+			"1255", // refclassid = pg_proc
+			strconv.FormatUint(uint64(m.ProcOID), 10),
+			"0",
+			refDeptype,
+		})
+		rows = append(rows, []string{
+			"2603",
+			strconv.FormatUint(uint64(m.OID), 10),
+			"0",
+			classOrFamilyRefclassid,
+			strconv.FormatUint(uint64(classOrFamilyRefobjid), 10),
+			"0",
+			classOrFamilyDeptype,
 		})
 	}
 	return rows
@@ -7577,24 +9819,240 @@ func (c *InMemory) RoleExists(name string) bool {
 	return ok
 }
 
-// RegisterRole records a user-created role. Called from CREATE ROLE/USER.
+// RegisterRole records a user-created role. Called from CREATE ROLE/USER. A
+// fresh OID is minted from the running catalog counter the first time a name is
+// seen; re-registering an existing name keeps its OID stable so a policy's
+// pg_policy.polroles entry stays valid across the session.
 func (c *InMemory) RegisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.roles[strings.ToLower(name)] = struct{}{}
+	key := strings.ToLower(name)
+	if _, ok := c.roles[key]; ok {
+		return
+	}
+	c.roles[key] = c.nextOID
+	c.nextOID++
+}
+
+// RoleAttrs carries a registered role's pg_authid-shaped attributes: the
+// LOGIN/SUPERUSER flags and the stored password credential. CredType matches
+// the RecordKindRoleState WAL encoding (0=none, 1=plaintext, 2=md5,
+// 3=scram-sha-256); Secret is the stored verifier in the same shape as
+// pg_authid.rolpassword (SCRAM-SHA-256$… by default). root-0021.
+type RoleAttrs struct {
+	CanLogin  bool
+	Superuser bool
+	CredType  byte
+	Secret    string
+}
+
+// RegisterRoleWithOID registers a role preserving a known OID — used by the
+// pg_authid heap loader and WAL replay so role OIDs stay stable across
+// restarts (pg_policy.polroles and the pg_authid heap reference them).
+// nextOID is bumped past the given OID so later mints never collide.
+func (c *InMemory) RegisterRoleWithOID(name string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	c.roles[key] = oid
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// SetRoleAttrs records (or replaces) the attribute/credential sidecar entry
+// for an already-registered role. A no-op for unregistered names so callers
+// can apply parse results unconditionally after RegisterRole. The bootstrap
+// superuser "postgres" is special-cased: it is never in the roles map (its
+// OID 10 is implicit) but its rolpassword verifier — written by initdb's
+// --pwfile handling into the pg_authid heap — must be recallable so the auth
+// UserStore can authenticate it after a restart. root-0021.
+func (c *InMemory) SetRoleAttrs(name string, attrs RoleAttrs) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	if _, ok := c.roles[key]; !ok && key != "postgres" {
+		return
+	}
+	a := attrs
+	c.roleAttrs[key] = &a
+}
+
+// LookupRoleAttrs returns the attribute sidecar entry for a role. ok is false
+// when the role is unregistered or has no recorded attributes.
+func (c *InMemory) LookupRoleAttrs(name string) (RoleAttrs, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	a, ok := c.roleAttrs[strings.ToLower(name)]
+	if !ok || a == nil {
+		return RoleAttrs{}, false
+	}
+	return *a, true
+}
+
+// RoleStateSnapshot is one registered role's full registry state, returned by
+// AllRoleStates for WAL logging and UserStore seeding.
+type RoleStateSnapshot struct {
+	Name  string
+	OID   uint32
+	Attrs RoleAttrs
+}
+
+// AllRoleStates returns every user-registered role (the bootstrap superuser
+// `postgres` is not stored in the map) with its attributes, sorted by name.
+func (c *InMemory) AllRoleStates() []RoleStateSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]RoleStateSnapshot, 0, len(c.roles))
+	for name, oid := range c.roles {
+		s := RoleStateSnapshot{Name: name, OID: oid}
+		if a := c.roleAttrs[name]; a != nil {
+			s.Attrs = *a
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 // UnregisterRole removes a role from the registry. Called from DROP ROLE.
 func (c *InMemory) UnregisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.roles, strings.ToLower(name))
+	key := strings.ToLower(name)
+	delete(c.roles, key)
+	delete(c.roleAttrs, key)
+}
+
+// RoleOID returns the OID minted for a registered role, resolving the seeded
+// bootstrap superuser (`postgres`, OID 10 = BOOTSTRAP_SUPERUSERID) which is not
+// stored in the user-role map. The bool is false for an unknown role. Used by
+// CREATE POLICY ... TO <role> to record role OIDs in pg_policy.polroles.
+// DU-002 slice 330.
+func (c *InMemory) RoleOID(name string) (uint32, bool) {
+	key := strings.ToLower(name)
+	if key == "postgres" {
+		return 10, true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oid, ok := c.roles[key]
+	return oid, ok
+}
+
+// RoleNameForOID is the reverse of RoleOID: it resolves a role OID back to the
+// name aclitemout / pg_dump prints. OID 0 (ACL_ID_PUBLIC) renders as the empty
+// string (the PUBLIC pseudo-role); OID 10 (BOOTSTRAP_SUPERUSERID) is "postgres";
+// a registered user role resolves to its case-preserved spelling (the same
+// override the relacl renderer uses); an unknown OID falls back to its numeric
+// form, matching PostgreSQL's rendering of a since-dropped role. Used by the
+// pg_type typacl heap-decode path so a goopg-served `SELECT typacl FROM pg_type`
+// returns role NAMES, not OIDs (M0119-0004-ACLHEAP).
+func (c *InMemory) RoleNameForOID(oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	if oid == 10 {
+		return "postgres"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, roid := range c.roles {
+		if roid == oid {
+			if disp, ok := c.roleACLDisplay[name]; ok {
+				return disp
+			}
+			return name
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
 }
 
 // GrantTablePrivilege records that role may exercise priv on relOID. See the
 // Catalog interface doc. Role names are stored lower-cased and privilege
 // keywords upper-cased so lookups are case-insensitive. M0118-0008.
 func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
+	c.GrantTablePrivilegeWithGrantOption(relOID, role, priv, false)
+}
+
+// GrantTablePrivilegeWithGrantOption records priv for role on relOID, tracking
+// whether it was granted WITH GRANT OPTION. The grant-option flag is OR-ed in:
+// once a privilege carries the option a later plain GRANT does not clear it
+// (matching PostgreSQL, which retains the grant option until REVOKE GRANT
+// OPTION FOR). See the Catalog interface doc. DU-002 slice 332.
+func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool) {
+	display := strings.TrimSpace(role)
+	role = strings.ToLower(display)
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Remember the exact case the grantee was spelled with so relacl renders
+	// the role's true name (PostgreSQL role names are case-significant when
+	// double-quoted). Only record a non-identity spelling; the common
+	// all-lowercase case needs no override. DU-002 slice 337.
+	if display != role {
+		c.roleACLDisplay[role] = display
+	}
+	// A GRANT to the owner re-materializes an explicit owner aclitem, so the
+	// owner is no longer the zero-privilege (absent) entry an earlier owner-side
+	// REVOKE ALL produced — clear the emptied flag. A GRANT to a *grantee*,
+	// however, leaves the owner at zero: PostgreSQL keeps relacl as
+	// `{grantee=…/postgres}` with NO owner entry, and pg_dump must still emit the
+	// owner's `REVOKE ALL …`. So only clear the flag for an owner-side GRANT;
+	// otherwise the owner stays absent and coexists with the grantee. DU-002
+	// slices 341 / 344.
+	if role == aclOwnerRole {
+		delete(c.relACLEmptied, relOID)
+		delete(c.relACLOwnerRevoked, relOID)
+	}
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		byRole = make(map[string]map[string]bool)
+		c.tableACLs[relOID] = byRole
+	}
+	privs := byRole[role]
+	if privs == nil {
+		privs = make(map[string]bool)
+		byRole[role] = privs
+		// First grant to this role on this relation: record its position so
+		// relacl renders grantees in grant order, matching PostgreSQL's append
+		// semantics. The owner is rendered first separately, so it is never
+		// recorded here. DU-002 slice 354.
+		if role != aclOwnerRole {
+			c.tableACLOrder[relOID] = append(c.tableACLOrder[relOID], role)
+		}
+	}
+	privs[priv] = privs[priv] || withGrantOption
+}
+
+// dropTableACLOrderRole removes role from relOID's grant-order list, keeping the
+// remaining grantees in their original order. Caller must hold c.mu. DU-002
+// slice 354.
+func (c *InMemory) dropTableACLOrderRole(relOID uint32, role string) {
+	order := c.tableACLOrder[relOID]
+	for i, r := range order {
+		if r == role {
+			c.tableACLOrder[relOID] = append(order[:i], order[i+1:]...)
+			break
+		}
+	}
+	if len(c.tableACLOrder[relOID]) == 0 {
+		delete(c.tableACLOrder, relOID)
+	}
+}
+
+// RevokeTablePrivilege removes priv for role on relOID. If the role's privilege
+// set becomes empty its entry is dropped (so relaclTextLockedFor no longer
+// emits that grantee), and if the relation has no grantees left the whole entry
+// is removed (relacl returns to NULL, matching acldefault → pg_dump emits
+// nothing). A revoke of a privilege never held is a no-op. The grantee's
+// display-case override is intentionally retained: it is keyed by lower-cased
+// role and consulted only when that role still appears in some relacl, so a
+// stale entry is harmless and a later re-GRANT reuses it. DU-002 slice 338.
+func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	role = strings.ToLower(strings.TrimSpace(role))
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
@@ -7604,15 +10062,160 @@ func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
 	defer c.mu.Unlock()
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
-		byRole = make(map[string]map[string]struct{})
-		c.tableACLs[relOID] = byRole
+		return
 	}
 	privs := byRole[role]
 	if privs == nil {
-		privs = make(map[string]struct{})
-		byRole[role] = privs
+		return
 	}
-	privs[priv] = struct{}{}
+	delete(privs, priv)
+	if len(privs) == 0 {
+		delete(byRole, role)
+		c.dropTableACLOrderRole(relOID, role)
+		if role == aclOwnerRole {
+			// The owner's implicit default aclitem has been fully revoked. Record
+			// this regardless of whether other grantees survive: an object whose
+			// acldefault grants a non-owner implicit privilege (a function's PUBLIC
+			// EXECUTE) leaves a surviving aclitem (`{=X/owner}`) after the owner
+			// revoke, and relaclTextLockedFor must still suppress the leading owner
+			// entry there. relACLEmptied (set below) is the narrower case where the
+			// owner revoke also empties the array. DU-002 slice 347.
+			c.relACLOwnerRevoked[relOID] = true
+		}
+	}
+	if len(byRole) == 0 {
+		// If the relation's last remaining aclitem was the owner's own entry, the
+		// owner has just revoked all of its implicit default privileges
+		// (REVOKE ALL … FROM owner). PostgreSQL leaves relacl as a non-NULL empty
+		// array {} in that case (distinct from NULL); record the emptied state so
+		// relaclTextLockedFor renders "{}" and pg_dump re-emits the bare
+		// `REVOKE ALL …`. A trailing grantee revoke (slice 338) instead returns
+		// relacl to NULL, which is what dropping the entry without this flag does.
+		// DU-002 slice 341.
+		if role == aclOwnerRole {
+			c.relACLEmptied[relOID] = true
+		}
+		delete(c.tableACLs, relOID)
+		delete(c.tableACLOrder, relOID)
+	}
+}
+
+// GrantColumnPrivilege records that role may exercise the column-level priv
+// ("SELECT"/"INSERT"/"UPDATE"/"REFERENCES", upper-cased) on column attNum of
+// the relation relOID. role is matched case-insensitively; "PUBLIC" is the
+// pseudo-role. The column analogue of GrantTablePrivilege. M0119-0004-ACLHEAP.
+func (c *InMemory) GrantColumnPrivilege(relOID uint32, attNum int16, role, priv string) {
+	c.GrantColumnPrivilegeWithGrantOption(relOID, attNum, role, priv, false)
+}
+
+// GrantColumnPrivilegeWithGrantOption is GrantColumnPrivilege plus a grant-
+// option flag, OR-ed in exactly as GrantTablePrivilegeWithGrantOption does (a
+// later plain GRANT does not clear a previously set option). M0119-0004-ACLHEAP.
+func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool) {
+	display := strings.TrimSpace(role)
+	role = strings.ToLower(display)
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Preserve the grantee's original-case spelling so attacl renders the role's
+	// true name (shared with the relacl store; DU-002 slice 337).
+	if display != role {
+		c.roleACLDisplay[role] = display
+	}
+	key := attrACLKey{relOID: relOID, attNum: attNum}
+	byRole := c.attrACLs[key]
+	if byRole == nil {
+		byRole = make(map[string]map[string]bool)
+		c.attrACLs[key] = byRole
+	}
+	privs := byRole[role]
+	if privs == nil {
+		privs = make(map[string]bool)
+		byRole[role] = privs
+		c.attrACLOrder[key] = append(c.attrACLOrder[key], role)
+	}
+	privs[priv] = privs[priv] || withGrantOption
+}
+
+// RevokeColumnPrivilege removes a single column-level priv for role on column
+// attNum of relOID. When the role's column privilege set becomes empty its entry
+// is dropped (so AttrACLText no longer lists it); when the column has no
+// grantees left the whole entry is removed and attacl returns to NULL (a column
+// has no owner default to fall back to). A revoke of a privilege never held is a
+// no-op. The column analogue of RevokeTablePrivilege. M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv string) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := attrACLKey{relOID: relOID, attNum: attNum}
+	byRole := c.attrACLs[key]
+	if byRole == nil {
+		return
+	}
+	privs := byRole[role]
+	if privs == nil {
+		return
+	}
+	delete(privs, priv)
+	if len(privs) == 0 {
+		delete(byRole, role)
+		if order := c.attrACLOrder[key]; len(order) > 0 {
+			for i, r := range order {
+				if r == role {
+					c.attrACLOrder[key] = append(order[:i], order[i+1:]...)
+					break
+				}
+			}
+			if len(c.attrACLOrder[key]) == 0 {
+				delete(c.attrACLOrder, key)
+			}
+		}
+	}
+	if len(byRole) == 0 {
+		delete(c.attrACLs, key)
+		delete(c.attrACLOrder, key)
+	}
+}
+
+// MaterializeOwnerACL records an explicit owner aclitem for relOID holding
+// exactly ownerPrivs, but only if no explicit owner entry exists yet. See the
+// Catalog interface doc. The owner privileges are stored without the grant
+// option (PostgreSQL prints the owner's self-grant with no "*" markers), so a
+// subsequent RevokeTablePrivilege against the owner renders the remaining
+// privileges as a plain letter string. DU-002 slice 340.
+func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string) {
+	owner = strings.ToLower(strings.TrimSpace(owner))
+	if owner == "" || len(ownerPrivs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
+		return // owner already revoked its implicit default; do not resurrect it
+	}
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		byRole = make(map[string]map[string]bool)
+		c.tableACLs[relOID] = byRole
+	}
+	if _, ok := byRole[owner]; ok {
+		return // owner entry already materialized; do not clobber a prior revoke
+	}
+	privs := make(map[string]bool, len(ownerPrivs))
+	for _, p := range ownerPrivs {
+		p = strings.ToUpper(strings.TrimSpace(p))
+		if p != "" {
+			privs[p] = false
+		}
+	}
+	byRole[owner] = privs
 }
 
 // HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
@@ -7638,6 +10241,438 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
+	delete(c.tableACLOrder, relOID)
+	delete(c.relACLEmptied, relOID)
+	delete(c.relACLOwnerRevoked, relOID)
+}
+
+// aclPrivLetter pairs a privilege keyword (as stored upper-cased in tableACLs)
+// with the single letter aclitemout prints for it.
+type aclPrivLetter struct {
+	keyword string
+	letter  byte
+}
+
+// tableACLPrivOrder lists the table privileges in PostgreSQL's canonical
+// aclitemout order for relkind 'r' (the bit order in src/include/utils/acl.h).
+// Rendering grantee privilege sets in this order matches the aclitem[] text
+// PostgreSQL stores in pg_class.relacl, so pg_dump's client-side
+// buildACLCommands re-emits GRANTs byte-identically.
+var tableACLPrivOrder = []aclPrivLetter{
+	{"INSERT", 'a'},
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+	{"DELETE", 'd'},
+	{"TRUNCATE", 'D'},
+	{"REFERENCES", 'x'},
+	{"TRIGGER", 't'},
+	{"MAINTAIN", 'm'},
+}
+
+// sequenceACLPrivOrder lists the sequence privileges (USAGE/SELECT/UPDATE) in
+// the same canonical aclitemout bit order: SELECT('r'), UPDATE('w'), USAGE('U').
+// pg_dump diffs a sequence's relacl against acldefault('s', owner) and re-emits
+// `GRANT … ON SEQUENCE …` for the grantee. DU-002 slice 333.
+var sequenceACLPrivOrder = []aclPrivLetter{
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+	{"USAGE", 'U'},
+}
+
+// ownerTableACLString is the privilege-letter string for the owner's full set
+// of table privileges (every bit in tableACLPrivOrder), i.e. "arwdDxtm". It
+// matches acldefault('r', owner), the baseline pg_dump diffs relacl against, so
+// the owner's own entry produces no GRANT/REVOKE on round-trip.
+const ownerTableACLString = "arwdDxtm"
+
+// ownerSequenceACLString is the owner's full set of sequence privileges, i.e.
+// "rwU". It matches acldefault('s', owner) so the owner's own entry produces no
+// GRANT/REVOKE on round-trip. DU-002 slice 333.
+const ownerSequenceACLString = "rwU"
+
+// publicPseudoRole is the lower-cased name goopg records a GRANT … TO PUBLIC
+// under (PostgreSQL reserves PUBLIC, so no real role can carry this name). It is
+// rendered as the empty grantee in the materialized aclitem[]. DU-002 slice 334.
+const publicPseudoRole = "public"
+
+// schemaACLPrivOrder lists the schema (namespace) privileges in PostgreSQL's
+// canonical aclitemout bit order, taken from ACL_ALL_RIGHTS_STR ("arwdDxtXUCTc…"):
+// USAGE('U') precedes CREATE('C'). pg_dump diffs a namespace's nspacl against
+// acldefault('n', owner) client-side and re-emits `GRANT … ON SCHEMA …`, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_namespace.nspacl. DU-002 slice 335.
+var schemaACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+	{"CREATE", 'C'},
+}
+
+// ownerSchemaACLString is the privilege-letter string for the owner's full set
+// of schema privileges, i.e. "UC". It matches acldefault('n', owner)
+// (ACL_ALL_RIGHTS_SCHEMA = USAGE|CREATE; schemas grant PUBLIC nothing by
+// default) so the owner's own entry produces no GRANT/REVOKE on round-trip.
+// DU-002 slice 335.
+const ownerSchemaACLString = "UC"
+
+// functionACLPrivOrder lists the function (pg_proc) privileges in PostgreSQL's
+// canonical aclitemout order. A function has a single privilege, EXECUTE('X').
+// pg_dump's getFuncs diffs a routine's proacl against acldefault('f', proowner)
+// client-side in buildACLCommands and re-emits `GRANT … ON FUNCTION …`, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_proc.proacl. DU-002 slice 345.
+var functionACLPrivOrder = []aclPrivLetter{
+	{"EXECUTE", 'X'},
+}
+
+// ownerFunctionACLString is the privilege-letter string for the owner's full
+// set of function privileges, i.e. "X". The owner half of acldefault('f',
+// owner) is "postgres=X/postgres"; the other half is the implicit PUBLIC
+// EXECUTE grant ("=X/postgres"), which the function GRANT recorder seeds
+// explicitly so a materialized proacl reproduces both default entries. DU-002
+// slice 345.
+const ownerFunctionACLString = "X"
+
+// typeACLPrivOrder lists the type/domain (pg_type) privileges in PostgreSQL's
+// canonical aclitemout order. A type has a single privilege, USAGE('U').
+// pg_dump's getTypes diffs a type's typacl against acldefault('T', typowner)
+// client-side in buildACLCommands and re-emits `GRANT … ON TYPE …`, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_type.typacl. M0119-0004-ACLHEAP.
+var typeACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+}
+
+// ownerTypeACLString is the privilege-letter string for the owner's full set of
+// type privileges, i.e. "U". The owner half of acldefault('T', owner) is
+// "postgres=U/postgres"; the other half is the implicit PUBLIC USAGE grant
+// ("=U/postgres"), which the type GRANT recorder seeds explicitly so a
+// materialized typacl reproduces both default entries — structurally identical
+// to the function EXECUTE default (ownerFunctionACLString). M0119-0004-ACLHEAP.
+const ownerTypeACLString = "U"
+
+// attrACLKey identifies one table column for column-level (pg_attribute.attacl)
+// privilege tracking: the owning relation's OID plus the column's 1-based
+// attribute number. Real table OIDs routinely exceed 2^16, so a packed
+// (relOID<<16 | attnum) uint32 would overflow — a struct key is used instead.
+// M0119-0004-ACLHEAP (attacl half).
+type attrACLKey struct {
+	relOID uint32
+	attNum int16
+}
+
+// attrACLPrivOrder lists the column (pg_attribute.attacl) privileges in
+// PostgreSQL's canonical aclitemout bit order. Column-level GRANT supports only
+// the subset INSERT(a)/SELECT(r)/UPDATE(w)/REFERENCES(x) — the remaining table
+// privilege letters (DELETE/TRUNCATE/TRIGGER/MAINTAIN) never appear in attacl.
+// Unlike a table/type/function there is NO owner-default privilege string: a
+// column's acldefault('c', owner) is empty, so attacl renders grantees only
+// (AttrACLText). M0119-0004-ACLHEAP.
+var attrACLPrivOrder = []aclPrivLetter{
+	{"INSERT", 'a'},
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+	{"REFERENCES", 'x'},
+}
+
+// relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
+// array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
+// for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
+// privileges have been granted away. PostgreSQL leaves relacl NULL until the
+// first GRANT, at which point it materializes the array with the owner's full
+// default privileges first (grantor = owner), followed by each grantee's
+// entry. goopg has the single bootstrap superuser "postgres" (OID 10) as every
+// table's owner and grantor, so the owner entry and each grantor are
+// "postgres". Grantee roles are emitted in a stable (sorted) order so the
+// projection is deterministic. Caller must hold c.mu (read or write).
+//
+// DU-002 slice 331 (GRANT/ACL relacl round-trip in pg_dump). pg_dump's
+// getTables selects c.relacl directly and parses the aclitem[] text
+// client-side in buildACLCommands (src/bin/pg_dump/dumputils.c) — no
+// server-side aclexplode/aclitemout is involved — so projecting the correct
+// text is sufficient for the round-trip.
+func (c *InMemory) relaclTextLocked(relOID uint32) string {
+	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString)
+}
+
+// relaclTextLockedSeq is relaclTextLocked for a sequence (relkind 'S'): it
+// renders with the sequence privilege order (USAGE/SELECT/UPDATE) and the
+// sequence owner-default string "rwU", which is what pg_dump diffs against via
+// acldefault('s', owner). DU-002 slice 333. Caller must hold c.mu.
+func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
+	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString)
+}
+
+// NamespaceACLText renders the materialized pg_namespace.nspacl text for the
+// schema identified by schemaOID, or "" (SQL NULL) when no privileges have been
+// granted away. Schemas share the OID-keyed ACL store with relations (goopg
+// mints schema OIDs from the same nextOID counter, so there is no collision),
+// and pg_dump diffs nspacl against acldefault('n', owner) client-side in
+// buildACLCommands, so projecting the correct aclitem[] text is sufficient for
+// the `GRANT … ON SCHEMA …` round-trip. DU-002 slice 335.
+func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString)
+}
+
+// ProcACLText renders the materialized pg_proc.proacl text for the routine
+// identified by procOID, or "" (SQL NULL) when no privileges have been granted
+// away. Routines share the OID-keyed ACL store with relations and schemas
+// (goopg mints routine OIDs from a disjoint range, so there is no collision).
+// A function's acldefault is "{=X/postgres,postgres=X/postgres}" — owner AND
+// PUBLIC both hold EXECUTE — so the function GRANT recorder seeds the PUBLIC
+// entry explicitly and the owner entry is supplied here by ownerFunctionACLString
+// (the owner branch of relaclTextLockedFor). pg_dump's getFuncs diffs proacl
+// against acldefault('f', proowner) client-side in buildACLCommands, so
+// projecting the correct aclitem[] text is sufficient for the
+// `GRANT … ON FUNCTION …` round-trip. DU-002 slice 345.
+func (c *InMemory) ProcACLText(procOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString)
+}
+
+// TypeACLText renders the materialized pg_type.typacl text for the type/domain
+// identified by typeOID, or "" (SQL NULL) when no privileges have been granted
+// away. Types share the OID-keyed ACL store with relations, schemas, and
+// routines (goopg mints type OIDs from a disjoint range, so there is no
+// collision). A type's acldefault('T', owner) is "{=U/owner,owner=U/owner}" —
+// owner AND PUBLIC both hold USAGE — so the type GRANT recorder seeds the PUBLIC
+// entry explicitly and the owner entry is supplied here by ownerTypeACLString
+// (the owner branch of relaclTextLockedFor), exactly as ProcACLText does for the
+// function EXECUTE default. pg_dump's getTypes diffs typacl against
+// acldefault('T', typowner) client-side in buildACLCommands, so projecting the
+// correct aclitem[] text is the renderer half of the `GRANT … ON TYPE …`
+// round-trip; the GRANT path must additionally re-sync this text into the
+// heap-backed pg_type row (M0119-0004-ACLHEAP, see design 0119-0004).
+func (c *InMemory) TypeACLText(typeOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(typeOID, typeACLPrivOrder, ownerTypeACLString)
+}
+
+// AttrACLText renders the materialized pg_attribute.attacl text for the column
+// identified by (relOID, attNum), or "" (SQL NULL) when no column-level
+// privilege has been granted away. Unlike relacl/typacl/proacl, a column's
+// acldefault('c', owner) is EMPTY — the owner and PUBLIC hold no implicit
+// column privilege — so attacl has no leading owner aclitem and no implicit
+// PUBLIC entry: it renders the grantees only, in grant order, and returns to
+// NULL once the last column privilege is revoked. This is the column analogue of
+// TypeACLText; pg_dump's getTableAttrs selects attacl directly and diffs it
+// against the empty default client-side in buildACLCommands, re-emitting
+// `GRANT <priv>(<col>) ON TABLE … TO …`, so projecting the correct aclitem[]
+// text is the renderer half of the column-GRANT round-trip (the GRANT path must
+// additionally re-sync this text into the heap-backed pg_attribute row).
+// M0119-0004-ACLHEAP (attacl half).
+func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	key := attrACLKey{relOID: relOID, attNum: attNum}
+	byRole := c.attrACLs[key]
+	if len(byRole) == 0 {
+		return "" // NULL attacl — empty acldefault, so pg_dump emits no column GRANT
+	}
+	// Render grantees in grant order (the order roles first appeared in a column
+	// GRANT), matching PostgreSQL's append semantics for the aclitem[] array. Fall
+	// back to a sorted snapshot only for any role present in byRole but missing
+	// from the order list (defensive — never silently drop a grant).
+	roles := make([]string, 0, len(byRole))
+	seen := make(map[string]bool, len(byRole))
+	for _, role := range c.attrACLOrder[key] {
+		if seen[role] {
+			continue
+		}
+		if _, ok := byRole[role]; !ok {
+			continue // stale order entry (role fully revoked)
+		}
+		seen[role] = true
+		roles = append(roles, role)
+	}
+	var missing []string
+	for role := range byRole {
+		if seen[role] {
+			continue
+		}
+		missing = append(missing, role)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		roles = append(roles, missing...)
+	}
+	var items []string
+	for _, role := range roles {
+		letters := renderACLLetters(byRole[role], attrACLPrivOrder)
+		if letters == "" {
+			continue // role holds only non-column privileges
+		}
+		// PUBLIC renders as an empty grantee ("=<privs>/postgres"); a mixed-case
+		// role restores its original spelling; an unsafe name is double-quoted —
+		// identical to relaclTextLockedFor's grantee handling.
+		grantee := role
+		if grantee == publicPseudoRole {
+			grantee = ""
+		} else if disp, ok := c.roleACLDisplay[role]; ok {
+			grantee = disp
+		}
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+	}
+	return "{" + strings.Join(items, ",") + "}"
+}
+
+// relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it
+// renders the materialized aclitem[] for relOID using the given privilege order
+// and owner-default privilege-letter string. Caller must hold c.mu.
+func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string) string {
+	byRole := c.tableACLs[relOID]
+	if len(byRole) == 0 {
+		if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
+			// Owner revoked all of its implicit default privileges
+			// (REVOKE ALL … FROM owner): PostgreSQL stores a non-NULL empty
+			// aclitem array {} and pg_dump emits a bare `REVOKE ALL …`. DU-002
+			// slice 341. relACLOwnerRevoked also covers revoking every grantee
+			// of a multi-default object (function owner + PUBLIC) in one
+			// statement, which empties the array with a non-owner last revoke
+			// so relACLEmptied stays unset. DU-002 slice 347.
+			return "{}"
+		}
+		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
+	}
+	// The owner aclitem is normally listed first. PostgreSQL leaves relacl NULL
+	// while the owner holds its implicit default set, rendering "postgres=<full>"
+	// once any grant materializes the array. An owner-side REVOKE materializes an
+	// explicit owner entry with a reduced privilege set (DU-002 slice 340); when
+	// present, render the owner's actual remaining privileges instead of the
+	// constant default, and skip the owner in the grantee loop below.
+	//
+	// When the owner has been zeroed by a full REVOKE ALL (relACLEmptied set) and
+	// a later GRANT to a grantee re-materialized the array, the owner is absent
+	// entirely: PostgreSQL stores `{grantee=…/postgres}` with no owner entry, and
+	// pg_dump diffs that against acldefault to re-emit the owner's `REVOKE ALL …`.
+	// Suppress the leading owner entry in that case. DU-002 slice 344.
+	var items []string
+	if !c.relACLEmptied[relOID] && !c.relACLOwnerRevoked[relOID] {
+		ownerLetters := ownerString
+		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
+			ownerLetters = renderACLLetters(ownerPrivs, privOrder)
+		}
+		items = append(items, "postgres="+ownerLetters+"/postgres")
+	}
+	// Render grantees in grant order (the order roles first appeared in a GRANT),
+	// matching PostgreSQL's append semantics for pg_class.relacl — NOT alphabetical
+	// order. tableACLOrder is the authoritative sequence; fall back to a sorted
+	// snapshot only if the order list is somehow out of sync with byRole (defensive,
+	// e.g. a role present in byRole but missing from the list), so every grantee is
+	// still emitted deterministically. DU-002 slice 354.
+	roles := make([]string, 0, len(byRole))
+	seen := make(map[string]bool, len(byRole))
+	for _, role := range c.tableACLOrder[relOID] {
+		if role == aclOwnerRole || seen[role] {
+			continue
+		}
+		if _, ok := byRole[role]; !ok {
+			continue // stale order entry (role fully revoked)
+		}
+		seen[role] = true
+		roles = append(roles, role)
+	}
+	// Append any grantees present in byRole but missing from the order list
+	// (defensive — should not happen, but never silently drop a grant). They go
+	// in sorted order for determinism.
+	var missing []string
+	for role := range byRole {
+		if role == aclOwnerRole || seen[role] {
+			continue
+		}
+		missing = append(missing, role)
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		roles = append(roles, missing...)
+	}
+	for _, role := range roles {
+		privs := byRole[role]
+		if len(privs) == 0 {
+			continue
+		}
+		letters := renderACLLetters(privs, privOrder)
+		if letters == "" {
+			continue
+		}
+		// PUBLIC is a pseudo-role: PostgreSQL stores its grant with an empty
+		// grantee in the aclitem ("=<privs>/postgres"), and pg_dump's
+		// buildACLCommands renders an empty grantee as the keyword PUBLIC.
+		// goopg records the grant under the reserved role name "public" (no real
+		// role may be named that), so map it back to the empty grantee here.
+		// DU-002 slice 334.
+		grantee := role
+		if grantee == publicPseudoRole {
+			grantee = ""
+		} else if disp, ok := c.roleACLDisplay[role]; ok {
+			// Restore the original-case spelling so a quoted mixed-case role
+			// renders its true name in the aclitem (PostgreSQL stores the
+			// role's actual name, not a case-folded one). DU-002 slice 337.
+			grantee = disp
+		}
+		// A grantee name with characters outside [A-Za-z0-9_] (e.g. a hyphen, a
+		// space, or a multibyte char) must be double-quoted in the aclitem text,
+		// exactly as PostgreSQL's aclitemout/putid renders it, or pg_dump's getid
+		// parser stops at the first unsafe char and mis-reads the grantee. The
+		// empty PUBLIC grantee and the all-alnum common case are returned
+		// unchanged. DU-002 slice 336.
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+	}
+	return "{" + strings.Join(items, ",") + "}"
+}
+
+// aclOwnerRole is the lower-cased name of the object owner in goopg's single
+// bootstrap-superuser model. The owner aclitem is always listed first in a
+// materialized relacl/nspacl and, absent an explicit owner-side REVOKE, renders
+// the owner's full default privilege set. DU-002 slice 340.
+const aclOwnerRole = "postgres"
+
+// renderACLLetters renders a privilege set as the aclitemout letter string in
+// the given canonical bit order, appending "*" after each privilege held WITH
+// GRANT OPTION (DU-002 slice 332). Privileges absent from privOrder are skipped.
+func renderACLLetters(privs map[string]bool, privOrder []aclPrivLetter) string {
+	var letters strings.Builder
+	for _, p := range privOrder {
+		if withGrantOpt, ok := privs[p.keyword]; ok {
+			letters.WriteByte(p.letter)
+			if withGrantOpt {
+				letters.WriteByte('*')
+			}
+		}
+	}
+	return letters.String()
+}
+
+// aclQuoteName reproduces PostgreSQL's putid (src/backend/utils/adt/acl.c): a
+// role name used inside an aclitem is double-quoted when any byte is not
+// "safe", where is_safe_acl_char(c, false) admits only ASCII alphanumerics and
+// underscore (a high-bit/multibyte byte is unsafe on output). An internal
+// double quote is doubled. The empty string (the PUBLIC pseudo-grantee) and an
+// all-safe name are returned verbatim. DU-002 slice 336.
+func aclQuoteName(s string) string {
+	safe := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			b.WriteByte('"')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
@@ -7687,6 +10722,1872 @@ func (c *InMemory) ListCompatObjects(objType string) []string {
 		out = append(out, name)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// ForeignDataWrapper is a user-created foreign-data wrapper (CREATE FOREIGN DATA
+// WRAPPER). goopg does not execute FDWs; this records just enough metadata to
+// round-trip the CREATE/DROP through pg_dump (pg_foreign_data_wrapper virtual
+// view → getForeignDataWrappers/dumpForeignDataWrapper). DU-002 slice 375.
+type ForeignDataWrapper struct {
+	Name  string // fdwname
+	OID   uint32 // pg_foreign_data_wrapper.oid (assigned from the catalog OID counter)
+	Owner uint32 // fdwowner; 0 → defaults to the bootstrap superuser at render time
+	// Options holds the wrapper's OPTIONS as "name=value" elements, the on-disk
+	// pg_foreign_data_wrapper.fdwoptions text[] representation. pg_dump's
+	// getForeignDataWrappers expands these via pg_options_to_table(fdwoptions) and
+	// dumpForeignDataWrapper re-emits an `OPTIONS (name 'value', …)` clause.
+	// Nil/empty → no OPTIONS clause. DU-002 slice 380.
+	Options []string
+}
+
+// RegisterForeignDataWrapper records an FDW, allocating a stable OID on first
+// sight. Idempotent: re-registering an existing name returns the existing entry
+// without changing its OID (the OPTIONS are refreshed when non-empty).
+// DU-002 slice 375 (options: slice 380).
+func (c *InMemory) RegisterForeignDataWrapper(name string, options []string) *ForeignDataWrapper {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fdws == nil {
+		c.fdws = make(map[string]*ForeignDataWrapper)
+	}
+	if f, ok := c.fdws[name]; ok {
+		if len(options) > 0 {
+			f.Options = options
+		}
+		return f
+	}
+	f := &ForeignDataWrapper{Name: name, OID: c.allocOIDLocked(), Options: options}
+	c.fdws[name] = f
+	return f
+}
+
+// DropForeignDataWrapper removes an FDW from the registry. Returns true if found.
+// DU-002 slice 375.
+func (c *InMemory) DropForeignDataWrapper(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fdws == nil {
+		return false
+	}
+	if _, ok := c.fdws[name]; ok {
+		delete(c.fdws, name)
+		return true
+	}
+	return false
+}
+
+// ListForeignDataWrappers returns all registered FDWs sorted by name.
+// DU-002 slice 375.
+func (c *InMemory) ListForeignDataWrappers() []*ForeignDataWrapper {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.fdws) == 0 {
+		return nil
+	}
+	out := make([]*ForeignDataWrapper, 0, len(c.fdws))
+	for _, f := range c.fdws {
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ForeignDataWrapperOID returns the stable OID of the named FDW, or 0 if no such
+// FDW is registered. Used by pg_foreign_server.VirtualRows to populate srvfdw.
+// DU-002 slice 376.
+func (c *InMemory) ForeignDataWrapperOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if f, ok := c.fdws[name]; ok {
+		return f.OID
+	}
+	return 0
+}
+
+// LookupForeignDataWrapper returns the named FDW's registry entry, or
+// (nil, false) if no such FDW is registered. Unlike RegisterForeignDataWrapper
+// (which creates-or-fetches), this is a read-only lookup — used by
+// ALTER FOREIGN DATA WRAPPER, which must error 42704 undefined_object on a
+// nonexistent name rather than silently creating one. DU-002 slice 421.
+func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	f, ok := c.fdws[name]
+	return f, ok
+}
+
+// EventTrigger is a user-created event trigger (CREATE EVENT TRIGGER). goopg
+// never fires event triggers (no DDL hook invokes evtfoid); this records just
+// enough metadata to round-trip the CREATE/DROP through pg_dump
+// (pg_event_trigger virtual view → getEventTriggers/dumpEventTrigger).
+// DU-002 (M0119-0004).
+type EventTrigger struct {
+	Name    string // evtname
+	OID     uint32 // pg_event_trigger.oid (assigned from the catalog OID counter)
+	Event   string // evtevent: ddl_command_start, ddl_command_end, sql_drop, table_rewrite, login
+	Owner   uint32 // evtowner; 0 → defaults to the bootstrap superuser at render time
+	FuncOID uint32 // evtfoid, resolved at CREATE time (must exist — no deferred/dangling reference)
+	// Enabled mirrors pg_event_trigger.evtenabled: 'O' (origin, the CREATE-time
+	// default), 'D' disabled, 'A' always, 'R' replica. Mutated by ALTER EVENT
+	// TRIGGER ENABLE/DISABLE (DU-002, M0119-0004 loop #69 ledger follow-up).
+	Enabled string
+	// Tags holds the WHEN TAG IN (...) filter values verbatim (unquoted); nil
+	// if the CREATE had no WHEN clause. dumpEventTrigger re-quotes each one.
+	Tags []string
+}
+
+// ErrEventTriggerNotFound / ErrEventTriggerAlreadyExists are returned by the
+// EventTrigger registry mutators (Register/Rename/SetEventTrigger*) so
+// callers can map to PostgreSQL's 42704 undefined_object / 42710
+// duplicate_object respectively. DU-002 (M0119-0004, loop #69 ledger
+// follow-up).
+var (
+	ErrEventTriggerNotFound      = errors.New("event trigger does not exist")
+	ErrEventTriggerAlreadyExists = errors.New("event trigger already exists")
+)
+
+// RegisterEventTrigger records an event trigger, allocating a stable OID.
+// Returns ErrEventTriggerAlreadyExists if a trigger with this name already
+// exists. DU-002 (M0119-0004).
+func (c *InMemory) RegisterEventTrigger(name, event string, owner, funcOID uint32, tags []string) (*EventTrigger, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggers == nil {
+		c.eventTriggers = make(map[string]*EventTrigger)
+	}
+	if _, exists := c.eventTriggers[name]; exists {
+		return nil, fmt.Errorf("event trigger %q already exists: %w", name, ErrEventTriggerAlreadyExists)
+	}
+	et := &EventTrigger{
+		Name:    name,
+		OID:     c.allocOIDLocked(),
+		Event:   event,
+		Owner:   owner,
+		FuncOID: funcOID,
+		Enabled: "O",
+		Tags:    tags,
+	}
+	c.eventTriggers[name] = et
+	return et, nil
+}
+
+// DropEventTrigger removes an event trigger from the registry. Returns true
+// if found. DU-002 (M0119-0004).
+func (c *InMemory) DropEventTrigger(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggers == nil {
+		return false
+	}
+	if _, ok := c.eventTriggers[name]; ok {
+		delete(c.eventTriggers, name)
+		return true
+	}
+	return false
+}
+
+// ListEventTriggers returns all registered event triggers ordered by OID,
+// matching pg_dump's getEventTriggers "ORDER BY e.oid". DU-002 (M0119-0004).
+func (c *InMemory) ListEventTriggers() []*EventTrigger {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.eventTriggers) == 0 {
+		return nil
+	}
+	out := make([]*EventTrigger, 0, len(c.eventTriggers))
+	for _, et := range c.eventTriggers {
+		out = append(out, et)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// LookupEventTrigger returns a deep copy of the named event trigger, or
+// (nil, false) if it does not exist. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point) — mirrors PubSub.
+// LookupPublication.
+func (c *InMemory) LookupEventTrigger(name string) (*EventTrigger, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return nil, false
+	}
+	out := *et
+	out.Tags = append([]string(nil), et.Tags...)
+	return &out, true
+}
+
+// SetEventTriggerEnabled updates an event trigger's evtenabled state. code
+// must be one of "O" (enable), "D" (disable), "A" (enable always), "R"
+// (enable replica) — the four values PostgreSQL's pg_event_trigger.evtenabled
+// column takes. Backs ALTER EVENT TRIGGER name {ENABLE|DISABLE}. Returns an
+// error if name is unknown (42704 undefined_object at the call site). DU-002
+// (M0119-0004, loop #69 ledger follow-up).
+func (c *InMemory) SetEventTriggerEnabled(name, code string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return fmt.Errorf("event trigger %q does not exist: %w", name, ErrEventTriggerNotFound)
+	}
+	et.Enabled = code
+	return nil
+}
+
+// SetEventTriggerOwner updates an event trigger's owner OID. Backs ALTER
+// EVENT TRIGGER name OWNER TO newowner. DU-002 (M0119-0004, loop #69 ledger
+// follow-up).
+func (c *InMemory) SetEventTriggerOwner(name string, owner uint32) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return fmt.Errorf("event trigger %q does not exist: %w", name, ErrEventTriggerNotFound)
+	}
+	et.Owner = owner
+	return nil
+}
+
+// RenameEventTrigger renames an event trigger, re-keying the registry map.
+// Backs ALTER EVENT TRIGGER name RENAME TO newname. Returns an error if name
+// is unknown or newname is already taken (42710 duplicate_object at the call
+// site, mirroring RegisterEventTrigger). DU-002 (M0119-0004, loop #69 ledger
+// follow-up).
+func (c *InMemory) RenameEventTrigger(name, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.eventTriggers[name]
+	if !ok {
+		return fmt.Errorf("event trigger %q does not exist: %w", name, ErrEventTriggerNotFound)
+	}
+	if _, exists := c.eventTriggers[newName]; exists {
+		return fmt.Errorf("event trigger %q already exists: %w", newName, ErrEventTriggerAlreadyExists)
+	}
+	delete(c.eventTriggers, name)
+	et.Name = newName
+	c.eventTriggers[newName] = et
+	return nil
+}
+
+// RegisterEventTriggerDuringRecovery is the idempotent version of
+// RegisterEventTrigger used by the WAL-replay driver
+// (internal/initdb/event_trigger_ddl_recovery.go). Unlike
+// RegisterEventTrigger it takes the OID from the WAL record (so the
+// recovered event trigger matches the pre-crash OID exactly) and
+// overwrites rather than erroring when a trigger with the same name is
+// already present (replay may see the same record more than once across a
+// partial-then-full replay). Mirrors catalog.PubSub.
+// CreatePublicationDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) RegisterEventTriggerDuringRecovery(et *EventTrigger) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.eventTriggers == nil {
+		c.eventTriggers = make(map[string]*EventTrigger)
+	}
+	out := *et
+	out.Tags = append([]string(nil), et.Tags...)
+	c.eventTriggers[et.Name] = &out
+	c.advanceNextOIDLocked(et.OID)
+}
+
+// DropEventTriggerDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropEventTrigger. Identical to DropEventTrigger but
+// discards the found/not-found result — replay does not care whether the
+// event trigger was still present. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) DropEventTriggerDuringRecovery(name string) {
+	_ = c.DropEventTrigger(name)
+}
+
+// SetEventTriggerEnabledDuringRecovery is the discard-error recovery
+// counterpart to SetEventTriggerEnabled, mirroring
+// DropEventTriggerDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) SetEventTriggerEnabledDuringRecovery(name, code string) {
+	_ = c.SetEventTriggerEnabled(name, code)
+}
+
+// RenameEventTriggerDuringRecovery is the discard-error recovery
+// counterpart to RenameEventTrigger. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) RenameEventTriggerDuringRecovery(name, newName string) {
+	_ = c.RenameEventTrigger(name, newName)
+}
+
+// SetEventTriggerOwnerDuringRecovery is the discard-error recovery
+// counterpart to SetEventTriggerOwner. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #70 ledger resume point).
+func (c *InMemory) SetEventTriggerOwnerDuringRecovery(name string, owner uint32) {
+	_ = c.SetEventTriggerOwner(name, owner)
+}
+
+// ForeignServer is a user-created foreign server (CREATE SERVER). goopg does not
+// execute foreign servers; this records just enough metadata to round-trip the
+// CREATE/DROP through pg_dump (pg_foreign_server virtual view →
+// getForeignServers/dumpForeignServer). DU-002 slice 376.
+// quoteArrayElement renders a single text[] element using PostgreSQL's array_out
+// quoting rules (array_out / ARRAY_QUOTE in src/backend/utils/adt/arrayfuncs.c).
+// An element is wrapped in double quotes — with embedded `"` and `\` backslash-
+// escaped — when it is empty, equals the word NULL case-insensitively, or
+// contains a double-quote, backslash, brace, the element delimiter (comma for
+// text[]), or ASCII whitespace; otherwise it is emitted bare. Without this an
+// option value carrying array metacharacters (e.g. host 'a,b' → element
+// `host=a,b`) would be split on its embedded comma when pg_dump re-parses the
+// srvoptions/fdwoptions/umoptions text[] via pg_options_to_table, corrupting the
+// round-trip. DU-002 slice 384.
+func quoteArrayElement(s string) string {
+	needquote := s == "" || strings.EqualFold(s, "NULL")
+	if !needquote {
+		for i := 0; i < len(s); i++ {
+			switch s[i] {
+			case '"', '\\', '{', '}', ',', ' ', '\t', '\n', '\r', '\v', '\f':
+				needquote = true
+			}
+			if needquote {
+				break
+			}
+		}
+	}
+	if !needquote {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' || s[i] == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// arrayTextLiteral renders elements as a PostgreSQL text[] external literal
+// ("{elem,elem,…}"), quoting each element per array_out's rules (see
+// quoteArrayElement). Callers must guard the empty case themselves.
+func arrayTextLiteral(parts []string) string {
+	quoted := make([]string, len(parts))
+	for i, p := range parts {
+		quoted[i] = quoteArrayElement(p)
+	}
+	return "{" + strings.Join(quoted, ",") + "}"
+}
+
+// optionsArrayLiteral renders a list of "name=value" option elements as the
+// PostgreSQL text[] external literal (e.g. {host=localhost,dbname=mydb}) that
+// pg_dump's pg_options_to_table(srvoptions) SRF expands back into one
+// (option_name, option_value) row per element. An empty list yields "" (SQL
+// NULL, so no OPTIONS clause is emitted). Each element is quoted per PG's
+// array_out rules (quoteArrayElement), so option values containing array
+// metacharacters (comma, brace, space, quote, backslash) round-trip intact.
+// DU-002 slice 378 (metachar quoting: slice 384).
+func optionsArrayLiteral(opts []string) string {
+	if len(opts) == 0 {
+		return ""
+	}
+	return arrayTextLiteral(opts)
+}
+
+type ForeignServer struct {
+	Name    string // srvname
+	OID     uint32 // pg_foreign_server.oid (assigned from the catalog OID counter)
+	Owner   uint32 // srvowner; 0 → defaults to the bootstrap superuser at render time
+	FdwName string // the referenced FDW name; resolved to srvfdw OID at render time
+	// Type / Version hold the CREATE SERVER TYPE 'x' / VERSION 'y' clauses
+	// (pg_foreign_server.srvtype / srvversion). Empty → SQL NULL, so
+	// dumpForeignServer omits the corresponding TYPE/VERSION clause. DU-002 slice 381.
+	Type    string
+	Version string
+	// Options holds the server's OPTIONS as "name=value" elements, the on-disk
+	// pg_foreign_server.srvoptions text[] representation. pg_dump's
+	// getForeignServers expands these via pg_options_to_table(srvoptions) and
+	// dumpForeignServer re-emits an `OPTIONS (name 'value', …)` clause. Nil/empty
+	// → no OPTIONS clause. DU-002 slice 378.
+	Options []string
+}
+
+// RegisterForeignServer records a foreign server, allocating a stable OID on
+// first sight. Idempotent: re-registering an existing name returns the existing
+// entry without changing its OID (the FDW association, TYPE/VERSION, and OPTIONS
+// are refreshed when non-empty). DU-002 slice 376 (options: slice 378;
+// type/version: slice 381).
+func (c *InMemory) RegisterForeignServer(name, fdwName, srvType, srvVersion string, options []string) *ForeignServer {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.foreignServers == nil {
+		c.foreignServers = make(map[string]*ForeignServer)
+	}
+	if s, ok := c.foreignServers[name]; ok {
+		if fdwName != "" {
+			s.FdwName = fdwName
+		}
+		if srvType != "" {
+			s.Type = srvType
+		}
+		if srvVersion != "" {
+			s.Version = srvVersion
+		}
+		if len(options) > 0 {
+			s.Options = options
+		}
+		return s
+	}
+	s := &ForeignServer{Name: name, OID: c.allocOIDLocked(), FdwName: fdwName, Type: srvType, Version: srvVersion, Options: options}
+	c.foreignServers[name] = s
+	return s
+}
+
+// DropForeignServer removes a foreign server from the registry. Returns true if
+// found. DU-002 slice 376.
+func (c *InMemory) DropForeignServer(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.foreignServers == nil {
+		return false
+	}
+	if _, ok := c.foreignServers[name]; ok {
+		delete(c.foreignServers, name)
+		return true
+	}
+	return false
+}
+
+// ListForeignServers returns all registered foreign servers sorted by name.
+// DU-002 slice 376.
+func (c *InMemory) ListForeignServers() []*ForeignServer {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.foreignServers) == 0 {
+		return nil
+	}
+	out := make([]*ForeignServer, 0, len(c.foreignServers))
+	for _, s := range c.foreignServers {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ForeignServerOID returns the stable OID of the named foreign server, or 0 if
+// no such server is registered. Used by pg_user_mappings.VirtualRows to populate
+// srvid (the column pg_dump's dumpUserMappings filters on). DU-002 slice 377.
+func (c *InMemory) ForeignServerOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if s, ok := c.foreignServers[name]; ok {
+		return s.OID
+	}
+	return 0
+}
+
+// Cast is a user-defined cast (CREATE CAST (source AS target) …). goopg does not
+// actually perform user casts; this records just enough metadata to round-trip
+// the definition through pg_dump (pg_cast virtual view → getCasts/dumpCast).
+// DU-002 slice 395.
+type Cast struct {
+	OID        uint32 // pg_cast.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
+	SourceType string // the parsed source type name; resolved to castsource OID via TypeNameToOID at render time
+	TargetType string // the parsed target type name; resolved to casttarget OID at render time
+	// FuncOID is pg_cast.castfunc. 0 for WITHOUT FUNCTION (binary-coercible) and
+	// WITH INOUT casts — the only forms this slice models. WITH FUNCTION casts
+	// reference a pg_proc OID and are deferred (dumpCast's findFuncByOid would need
+	// a matching pg_proc row).
+	FuncOID uint32
+	// Context is pg_cast.castcontext: 'e' explicit (default), 'a' assignment, 'i'
+	// implicit. dumpCast emits ` AS ASSIGNMENT` / ` AS IMPLICIT` for 'a' / 'i'.
+	Context string
+	// Method is pg_cast.castmethod: 'b' binary (WITHOUT FUNCTION), 'i' INOUT
+	// (WITH INOUT), 'f' function (WITH FUNCTION). dumpCast renders the matching
+	// `WITHOUT FUNCTION` / `WITH INOUT` / `WITH FUNCTION …` clause.
+	Method string
+}
+
+// castKey builds the cast registry's lookup key from a (source, target) type
+// name pair. Real PG's pg_cast.castsource/casttarget are OIDs, not text, so
+// "real" and "float4" (or "integer" and "int4") name the same cast — keying
+// on TypeNameToOID rather than the raw parsed spelling makes CREATE CAST
+// (float4 AS text) and DROP CAST (real AS text) cross-resolve the same entry,
+// matching how the pg_cast virtual view already renders castsource/casttarget
+// (RegisterCast's registerer, ~getFormattedTypeName call site above).
+func castKey(source, target string) string {
+	return castKeyTypeName(source) + "\x00" + castKeyTypeName(target)
+}
+
+// castKeyTypeName canonicalizes a single type name for castKey. TypeNameToOID
+// falls back to OIDText for any name it doesn't recognize as a builtin
+// synonym (its documented "safe fallback"), so naively keying on its result
+// would collapse every distinct user-defined type (domain, enum, composite)
+// into the same OIDText bucket and let unrelated custom-type casts overwrite
+// each other in the registry. Only "text" itself legitimately resolves to
+// OIDText; anything else landing there is the fallback, so keep the
+// lowercased name verbatim to preserve per-type distinctness.
+func castKeyTypeName(name string) string {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	oid := TypeNameToOID(lower)
+	if oid == OIDText && lower != "text" {
+		return lower
+	}
+	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// RegisterCast records a user-defined cast, allocating a stable OID on first
+// sight. Idempotent: re-registering the same (source, target) pair refreshes the
+// context/method/funcOID but keeps the OID. funcOID is pg_cast.castfunc — 0 for
+// WITHOUT FUNCTION / WITH INOUT, or the resolved pg_proc OID for WITH FUNCTION
+// casts (DU-002 slice 397). DU-002 slice 395.
+func (c *InMemory) RegisterCast(source, target, context, method string, funcOID uint32) *Cast {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		c.casts = make(map[string]*Cast)
+	}
+	key := castKey(source, target)
+	if cs, ok := c.casts[key]; ok {
+		if context != "" {
+			cs.Context = context
+		}
+		if method != "" {
+			cs.Method = method
+		}
+		cs.FuncOID = funcOID
+		return cs
+	}
+	cs := &Cast{OID: c.allocOIDLocked(), SourceType: source, TargetType: target, Context: context, Method: method, FuncOID: funcOID}
+	c.casts[key] = cs
+	return cs
+}
+
+// DropCast removes a user-defined cast from the registry. Returns true if found.
+// DU-002 slice 395.
+func (c *InMemory) DropCast(source, target string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.casts == nil {
+		return false
+	}
+	key := castKey(source, target)
+	if _, ok := c.casts[key]; ok {
+		delete(c.casts, key)
+		return true
+	}
+	return false
+}
+
+// ListCasts returns all registered user casts sorted by OID (stable creation
+// order). DU-002 slice 395.
+func (c *InMemory) ListCasts() []*Cast {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.casts) == 0 {
+		return nil
+	}
+	out := make([]*Cast, 0, len(c.casts))
+	for _, cs := range c.casts {
+		out = append(out, cs)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// CastByTypes returns the user-defined cast registered for the given source and
+// target type names (case-insensitive, same key as RegisterCast/DropCast), or
+// nil if none exists. Used by COMMENT ON CAST to resolve the cast's OID so the
+// comment is stored under pg_cast (classoid 2605). DU-002 slice 396.
+func (c *InMemory) CastByTypes(source, target string) *Cast {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.casts == nil {
+		return nil
+	}
+	key := castKey(source, target)
+	if cs, ok := c.casts[key]; ok {
+		return cs
+	}
+	return nil
+}
+
+// Transform is a user-defined transform (CREATE TRANSFORM FOR type LANGUAGE
+// lang (FROM SQL WITH FUNCTION ... , TO SQL WITH FUNCTION ...)). goopg does
+// not execute the transform machinery (PL-language argument marshaling);
+// this records just enough metadata to round-trip the definition through
+// pg_dump (pg_transform virtual view → getTransforms/dumpTransform). DU-002
+// (M0119-0004).
+type Transform struct {
+	OID      uint32 // pg_transform.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
+	TypeName string // the parsed FOR type name; resolved to trftype OID via TypeNameToOID at render time
+	Lang     string // the parsed LANGUAGE name; resolved to trflang OID via LanguageNameToOID at render time
+	// FromFuncOID / ToFuncOID are pg_transform.trffromsql / trftosql. 0 when
+	// that half is absent (PG allows either or both alone) or when the
+	// referenced function could not be resolved to a pg_proc OID — goopg's
+	// user routine registry (catalog.Routines) does not cover built-in
+	// functions, a gap shared with CREATE CAST's WITH FUNCTION resolution
+	// (RegisterCast's funcOID parameter has the same limitation).
+	FromFuncOID uint32
+	ToFuncOID   uint32
+}
+
+// RegisterTransform records a user-defined transform, allocating a stable OID
+// on first sight. Idempotent: re-registering the same (type, lang) pair
+// refreshes the from/to function OIDs but keeps the OID. DU-002 (M0119-0004).
+func (c *InMemory) RegisterTransform(typeName, lang string, fromFuncOID, toFuncOID uint32) *Transform {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		c.transforms = make(map[string]*Transform)
+	}
+	key := strings.ToLower(typeName) + "\x00" + strings.ToLower(lang)
+	if tf, ok := c.transforms[key]; ok {
+		tf.FromFuncOID = fromFuncOID
+		tf.ToFuncOID = toFuncOID
+		return tf
+	}
+	tf := &Transform{OID: c.allocOIDLocked(), TypeName: typeName, Lang: lang, FromFuncOID: fromFuncOID, ToFuncOID: toFuncOID}
+	c.transforms[key] = tf
+	return tf
+}
+
+// TransformExists reports whether a transform for (type, lang) is already
+// registered — used to enforce PG's "transform for type %s language %s
+// already exists" duplicate-object error when CREATE TRANSFORM (without OR
+// REPLACE) targets an existing pair. DU-002 (M0119-0004).
+func (c *InMemory) TransformExists(typeName, lang string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.transforms == nil {
+		return false
+	}
+	_, ok := c.transforms[strings.ToLower(typeName)+"\x00"+strings.ToLower(lang)]
+	return ok
+}
+
+// DropTransform removes a user-defined transform from the registry. Returns
+// true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropTransform(typeName, lang string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.transforms == nil {
+		return false
+	}
+	key := strings.ToLower(typeName) + "\x00" + strings.ToLower(lang)
+	if _, ok := c.transforms[key]; ok {
+		delete(c.transforms, key)
+		return true
+	}
+	return false
+}
+
+// ListTransforms returns all registered user transforms sorted by OID (stable
+// creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListTransforms() []*Transform {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.transforms) == 0 {
+		return nil
+	}
+	out := make([]*Transform, 0, len(c.transforms))
+	for _, tf := range c.transforms {
+		out = append(out, tf)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// UserOperator is a user-defined operator (CREATE OPERATOR name (FUNCTION =
+// fn, LEFTARG = t1, RIGHTARG = t2, ...)). goopg does not execute the
+// operator (no expression-evaluator dispatch through a user FUNCTION); this
+// records just enough metadata to round-trip the definition through
+// pg_dump (pg_operator virtual view → getOperators/dumpOpr), including the
+// COMMUTATOR/NEGATOR/RESTRICT/JOIN/MERGES/HASHES clauses and unary (prefix,
+// LeftType=="") operators. DU-002 slice 407.
+type UserOperator struct {
+	OID uint32 // pg_operator.oid (assigned from the catalog OID counter; > last builtin so pg_dump dumps it)
+	// Name is the bare operator symbol (e.g. "~~"); NamespaceOID resolves the
+	// schema the CREATE OPERATOR statement declared it in (0 = unresolved,
+	// falls back to public via NamespaceOIDOrDefault, mirroring
+	// UserAggregate/UserCollation).
+	Name         string
+	NamespaceOID uint32
+	// LeftType / RightType are the parsed LEFTARG/RIGHTARG type names (empty
+	// when absent — a unary operator has exactly one of the two). Resolved to
+	// oprleft/oprright OIDs via TypeNameToOID at render time.
+	LeftType  string
+	RightType string
+	// FuncOID is pg_operator.oprcode, resolved from the FUNCTION/PROCEDURE
+	// clause (catalog.LookupBuiltinProc for a builtin, or the user routine
+	// registry for a CREATE FUNCTION-defined one). 0 when unresolved — PG
+	// itself treats this as invalid (dumpOpr skips an operator whose oprcode
+	// is InvalidOid), but goopg still registers it so DROP OPERATOR can find
+	// it; VirtualRows below also skips a zero-FuncOID row for the same reason.
+	// A zero FuncOID also occurs transiently for a COMMUTATOR/NEGATOR shell
+	// operator (OperatorShellMake, pg_operator.c) before its own CREATE
+	// OPERATOR statement fills it in.
+	FuncOID uint32
+	// Owner is pg_operator.oprowner (0 = unset, defaults to the bootstrap
+	// superuser via OwnerOrDefault — CREATE OPERATOR has no OWNER TO clause of
+	// its own; ownership is always the creating role, which goopg's DDL surface
+	// does not track per-session, so every operator defaults to the bootstrap
+	// superuser like a fresh single-session CREATE OPERATOR would).
+	Owner uint32
+	// CommutatorOID / NegatorOID are pg_operator.oprcom / oprnegate — the
+	// OIDs of this operator's COMMUTATOR / NEGATOR, resolved (and, if
+	// necessary, forward-declared as a shell operator) by the executor's
+	// two-pass scheme mirroring PG's get_other_operator/OperatorShellMake/
+	// OperatorUpd (pg_operator.c). 0 = none.
+	CommutatorOID uint32
+	NegatorOID    uint32
+	// RestrictOID / JoinOID are pg_operator.oprrest / oprjoin — the resolved
+	// pg_proc OIDs of the RESTRICT = / JOIN = selectivity estimator
+	// functions. 0 = none.
+	RestrictOID uint32
+	JoinOID     uint32
+	// CanMerge / CanHash are pg_operator.oprcanmerge / oprcanhash — the bare
+	// MERGES / HASHES flags.
+	CanMerge bool
+	CanHash  bool
+}
+
+// OwnerOrDefault returns Owner, or the bootstrap superuser OID (10) if unset.
+// Mirrors UserAggregate.OwnerOrDefault. DU-002 (M0119-0004).
+func (o *UserOperator) OwnerOrDefault() uint32 {
+	if o.Owner == 0 {
+		return 10
+	}
+	return o.Owner
+}
+
+// NamespaceOIDOrDefault returns NamespaceOID, or PublicNamespaceOID if unset.
+// Mirrors UserAggregate.NamespaceOIDOrDefault. DU-002 (M0119-0004).
+func (o *UserOperator) NamespaceOIDOrDefault() uint32 {
+	if o.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return o.NamespaceOID
+}
+
+// userOperatorKey builds the operator registry's lookup key. PG allows the
+// same operator symbol to be overloaded across distinct (left, right) type
+// pairs (and, separately, across schemas), so the key must include both —
+// unlike Cast/Transform, which forbid duplicate (source,target)/(type,lang)
+// pairs outright.
+func userOperatorKey(schema, name, leftType, rightType string) string {
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema) + "." + name + "(" + strings.ToLower(leftType) + "," + strings.ToLower(rightType) + ")"
+}
+
+// RegisterUserOperator records a user-defined operator, allocating a stable
+// OID on first sight. Idempotent: re-registering the same (schema, name,
+// leftType, rightType) key refreshes FuncOID but keeps the OID. DU-002
+// (M0119-0004).
+func (c *InMemory) RegisterUserOperator(schema, name, leftType, rightType string, namespaceOID, funcOID, owner uint32) *UserOperator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		c.userOperators = make(map[string]*UserOperator)
+	}
+	key := userOperatorKey(schema, name, leftType, rightType)
+	if op, ok := c.userOperators[key]; ok {
+		op.FuncOID = funcOID
+		if namespaceOID != 0 {
+			op.NamespaceOID = namespaceOID
+		}
+		if owner != 0 {
+			op.Owner = owner
+		}
+		return op
+	}
+	op := &UserOperator{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
+		LeftType: leftType, RightType: rightType, FuncOID: funcOID, Owner: owner,
+	}
+	c.userOperators[key] = op
+	return op
+}
+
+// DropUserOperator removes a user-defined operator from the registry.
+// Returns true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperator(schema, name, leftType, rightType string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		return false
+	}
+	key := userOperatorKey(schema, name, leftType, rightType)
+	if _, ok := c.userOperators[key]; ok {
+		delete(c.userOperators, key)
+		return true
+	}
+	return false
+}
+
+// ListUserOperators returns all registered user operators sorted by OID
+// (stable creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListUserOperators() []*UserOperator {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userOperators) == 0 {
+		return nil
+	}
+	out := make([]*UserOperator, 0, len(c.userOperators))
+	for _, op := range c.userOperators {
+		out = append(out, op)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// LookupUserOperator finds a previously-registered operator by its identity
+// key (schema, name, leftType, rightType), returning both real operators and
+// shell operators created via EnsureUserOperatorShell (a shell is just a
+// UserOperator with FuncOID==0). Used by the CREATE OPERATOR executor to
+// resolve COMMUTATOR/NEGATOR references (PG's OperatorLookup, pg_operator.c).
+// DU-002 slice 407.
+func (c *InMemory) LookupUserOperator(schema, name, leftType, rightType string) (*UserOperator, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	op, ok := c.userOperators[userOperatorKey(schema, name, leftType, rightType)]
+	return op, ok
+}
+
+// LookupUserOperatorByOID finds a previously-registered operator by its OID.
+// Used to back-patch a COMMUTATOR/NEGATOR's own oprcom/oprnegate to point
+// back at the operator that just referenced it (PG's OperatorUpd,
+// pg_operator.c). Linear scan: the registry only ever holds the handful of
+// user-defined operators a session creates. DU-002 slice 407.
+func (c *InMemory) LookupUserOperatorByOID(oid uint32) *UserOperator {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, op := range c.userOperators {
+		if op.OID == oid {
+			return op
+		}
+	}
+	return nil
+}
+
+// LookupUserOperatorByName finds a registered operator by name alone,
+// ignoring schema and left/right type — for a CREATE OPERATOR CLASS AS-list
+// OPERATOR entry with no explicit operand-type list. Real PG resolves such
+// an entry via a search-path operator lookup that errors on ambiguity;
+// goopg's compat-scope callers instead deterministically pick the
+// lowest-OID match, since this DDL surface only ever creates one operator
+// per symbol in practice. Returns the real operator, never a shell
+// (FuncOID==0) one. DU-002 (M0119-0004) slice 411.
+func (c *InMemory) LookupUserOperatorByName(name string) (*UserOperator, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var best *UserOperator
+	for _, op := range c.userOperators {
+		if op.FuncOID == 0 {
+			continue // shell operator, not yet defined
+		}
+		if !strings.EqualFold(op.Name, name) {
+			continue
+		}
+		if best == nil || op.OID < best.OID {
+			best = op
+		}
+	}
+	if best == nil {
+		return nil, false
+	}
+	return best, true
+}
+
+// EnsureUserOperatorShell returns the existing operator registered under
+// (schema, name, leftType, rightType) — real or shell — creating a shell
+// (FuncOID==0) placeholder with a stable OID if none exists yet. Mirrors
+// PG's OperatorShellMake (pg_operator.c): a COMMUTATOR/NEGATOR clause may
+// forward-reference an operator that does not exist yet, so a minimal row
+// is inserted purely to mint an OID; the operator's own later CREATE
+// OPERATOR statement fills it in (RegisterUserOperator is idempotent by the
+// same key, so it naturally reuses the shell's OID). DU-002 slice 407.
+func (c *InMemory) EnsureUserOperatorShell(schema, name, leftType, rightType string, namespaceOID uint32) *UserOperator {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		c.userOperators = make(map[string]*UserOperator)
+	}
+	key := userOperatorKey(schema, name, leftType, rightType)
+	if op, ok := c.userOperators[key]; ok {
+		return op
+	}
+	op := &UserOperator{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
+		LeftType: leftType, RightType: rightType,
+	}
+	c.userOperators[key] = op
+	return op
+}
+
+// UserOperatorFamily models a user-defined operator family (CREATE OPERATOR
+// FAMILY name USING method) enough to round-trip through pg_dump's
+// getOpfamilies/dumpOpfamily (pg_opfamily virtual view). Unlike CREATE
+// OPERATOR CLASS, PG's CREATE OPERATOR FAMILY grammar has no AS clause — the
+// family starts empty; OPERATOR/FUNCTION members are added later via a
+// separate ALTER OPERATOR FAMILY ... ADD statement (opfamilycmds.c
+// CreateOpFamily), which goopg does not yet implement — see the ledger.
+// DU-002 (M0119-0004).
+type UserOperatorFamily struct {
+	OID          uint32 // pg_opfamily.oid
+	Name         string
+	NamespaceOID uint32
+	Method       uint32 // pg_opfamily.opfmethod — a pg_am.oid, resolved via AccessMethodOIDByName
+	// Owner is pg_opfamily.opfowner (0 = unset, defaults to the bootstrap
+	// superuser via OwnerOrDefault — mirrors UserOperator.Owner: CREATE
+	// OPERATOR FAMILY has no OWNER clause of its own, and goopg's DDL surface
+	// does not track a per-session creating role).
+	Owner uint32
+}
+
+// OwnerOrDefault mirrors UserOperator.OwnerOrDefault. DU-002 (M0119-0004).
+func (f *UserOperatorFamily) OwnerOrDefault() uint32 {
+	if f.Owner == 0 {
+		return 10
+	}
+	return f.Owner
+}
+
+// NamespaceOIDOrDefault mirrors UserOperator.NamespaceOIDOrDefault.
+// DU-002 (M0119-0004).
+func (f *UserOperatorFamily) NamespaceOIDOrDefault() uint32 {
+	if f.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return f.NamespaceOID
+}
+
+// userOpFamilyKey builds the operator-family registry's lookup key. PG scopes
+// opfamily-name uniqueness per (namespace, access method), so the same family
+// name may be reused across access methods (the key includes the method OID,
+// not just schema+name).
+func userOpFamilyKey(schema, name string, method uint32) string {
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+}
+
+// RegisterUserOperatorFamily records a user-defined operator family,
+// allocating a stable OID on first sight. Idempotent: re-registering the same
+// (schema, name, method) key refreshes namespace/owner but keeps the OID.
+// DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID, method, owner uint32) *UserOperatorFamily {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorFamilies == nil {
+		c.userOperatorFamilies = make(map[string]*UserOperatorFamily)
+	}
+	key := userOpFamilyKey(schema, name, method)
+	if f, ok := c.userOperatorFamilies[key]; ok {
+		if namespaceOID != 0 {
+			f.NamespaceOID = namespaceOID
+		}
+		if owner != 0 {
+			f.Owner = owner
+		}
+		return f
+	}
+	f := &UserOperatorFamily{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID,
+		Method: method, Owner: owner,
+	}
+	c.userOperatorFamilies[key] = f
+	return f
+}
+
+// DropUserOperatorFamily removes a user-defined operator family from the
+// registry. Returns true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorFamilies == nil {
+		return false
+	}
+	key := userOpFamilyKey(schema, name, method)
+	if _, ok := c.userOperatorFamilies[key]; ok {
+		delete(c.userOperatorFamilies, key)
+		return true
+	}
+	return false
+}
+
+// ListUserOperatorFamilies returns all registered user operator families
+// sorted by OID (stable creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListUserOperatorFamilies() []*UserOperatorFamily {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userOperatorFamilies) == 0 {
+		return nil
+	}
+	out := make([]*UserOperatorFamily, 0, len(c.userOperatorFamilies))
+	for _, f := range c.userOperatorFamilies {
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// LookupUserOperatorFamily finds a previously-registered operator family by
+// its identity (schema, name, method). Used by CREATE OPERATOR CLASS to
+// resolve an explicit `FAMILY family_name` clause. DU-002 (M0119-0004).
+func (c *InMemory) LookupUserOperatorFamily(schema, name string, method uint32) (*UserOperatorFamily, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	f, ok := c.userOperatorFamilies[userOpFamilyKey(schema, name, method)]
+	return f, ok
+}
+
+// UserOperatorClass models a user-defined operator class (CREATE OPERATOR
+// CLASS name [DEFAULT] FOR TYPE type USING method [FAMILY family] AS ...)
+// enough to round-trip the class's own pg_opclass row through pg_dump's
+// getOpclasses/dumpOpclass (pg_opclass virtual view). dumpOpclass also emits
+// any OPERATOR/FUNCTION entries tied to the class via pg_amop/pg_amproc +
+// pg_depend — that member store is not yet implemented (deferred, see the
+// ledger), so a class declaring real members currently dumps with only its
+// STORAGE clause (or PG's own dummy `STORAGE opcintype` filler when no
+// STORAGE was given and no members exist), silently dropping the members.
+// DU-002 (M0119-0004).
+type UserOperatorClass struct {
+	OID          uint32 // pg_opclass.oid
+	Name         string
+	NamespaceOID uint32
+	// Owner is pg_opclass.opcowner (0 = unset, defaults to the bootstrap
+	// superuser via OwnerOrDefault — mirrors UserOperatorFamily.Owner: CREATE
+	// OPERATOR CLASS has no OWNER clause of its own, and goopg's DDL surface
+	// does not track a per-session creating role).
+	Owner      uint32
+	Method     uint32 // pg_opclass.opcmethod — a pg_am.oid
+	FamilyOID  uint32 // pg_opclass.opcfamily — always valid; PG auto-creates an anonymous family (same name as the class) when FAMILY is omitted
+	InTypeOID  uint32 // pg_opclass.opcintype
+	IsDefault  bool   // pg_opclass.opcdefault
+	KeyTypeOID uint32 // pg_opclass.opckeytype — 0 (InvalidOid, dumps as "-") when no STORAGE clause was given
+}
+
+// OwnerOrDefault mirrors UserOperatorFamily.OwnerOrDefault. DU-002 (M0119-0004).
+func (oc *UserOperatorClass) OwnerOrDefault() uint32 {
+	if oc.Owner == 0 {
+		return 10
+	}
+	return oc.Owner
+}
+
+// NamespaceOIDOrDefault mirrors UserOperatorFamily.NamespaceOIDOrDefault.
+// DU-002 (M0119-0004).
+func (oc *UserOperatorClass) NamespaceOIDOrDefault() uint32 {
+	if oc.NamespaceOID == 0 {
+		return PublicNamespaceOID
+	}
+	return oc.NamespaceOID
+}
+
+// userOpClassKey builds the operator-class registry's lookup key, mirroring
+// userOpFamilyKey (PG scopes opclass-name uniqueness per namespace+access
+// method too).
+func userOpClassKey(schema, name string, method uint32) string {
+	if schema == "" {
+		schema = "public"
+	}
+	return strings.ToLower(schema) + "." + strings.ToLower(name) + "/" + strconv.FormatUint(uint64(method), 10)
+}
+
+// RegisterUserOperatorClass records a user-defined operator class, allocating
+// a stable OID on first sight. Idempotent: re-registering the same (schema,
+// name, method) key refreshes the mutable attributes but keeps the OID.
+// DU-002 (M0119-0004).
+func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, owner, method, familyOID, inTypeOID uint32, isDefault bool, keyTypeOID uint32) *UserOperatorClass {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorClasses == nil {
+		c.userOperatorClasses = make(map[string]*UserOperatorClass)
+	}
+	key := userOpClassKey(schema, name, method)
+	if oc, ok := c.userOperatorClasses[key]; ok {
+		if namespaceOID != 0 {
+			oc.NamespaceOID = namespaceOID
+		}
+		if owner != 0 {
+			oc.Owner = owner
+		}
+		oc.FamilyOID = familyOID
+		oc.InTypeOID = inTypeOID
+		oc.IsDefault = isDefault
+		oc.KeyTypeOID = keyTypeOID
+		return oc
+	}
+	oc := &UserOperatorClass{
+		OID: c.allocOIDLocked(), Name: name, NamespaceOID: namespaceOID, Owner: owner,
+		Method: method, FamilyOID: familyOID, InTypeOID: inTypeOID, IsDefault: isDefault, KeyTypeOID: keyTypeOID,
+	}
+	c.userOperatorClasses[key] = oc
+	return oc
+}
+
+// DropUserOperatorClass removes a user-defined operator class from the
+// registry, along with any pg_amop/pg_amproc member rows attributed to it
+// (slice 411). Returns true if one was found and removed. DU-002 (M0119-0004).
+func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorClasses == nil {
+		return false
+	}
+	key := userOpClassKey(schema, name, method)
+	oc, ok := c.userOperatorClasses[key]
+	if !ok {
+		return false
+	}
+	delete(c.userOperatorClasses, key)
+	classOID := oc.OID
+	kept := c.amOpMembers[:0]
+	for _, m := range c.amOpMembers {
+		if m.ClassOID != classOID {
+			kept = append(kept, m)
+		}
+	}
+	c.amOpMembers = kept
+	keptP := c.amProcMembers[:0]
+	for _, m := range c.amProcMembers {
+		if m.ClassOID != classOID {
+			keptP = append(keptP, m)
+		}
+	}
+	c.amProcMembers = keptP
+	return true
+}
+
+// ListUserOperatorClasses returns all registered user operator classes sorted
+// by OID (stable creation order). DU-002 (M0119-0004).
+func (c *InMemory) ListUserOperatorClasses() []*UserOperatorClass {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userOperatorClasses) == 0 {
+		return nil
+	}
+	out := make([]*UserOperatorClass, 0, len(c.userOperatorClasses))
+	for _, oc := range c.userOperatorClasses {
+		out = append(out, oc)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// AmOpMember models one pg_amop row (an OPERATOR entry attributed to an
+// operator class via CREATE OPERATOR CLASS's own AS list). Matches PG's
+// pg_amop (pg_amop.h). AmopPurpose is derived from SortFamilyOID (AMOP_ORDER
+// 'o' when non-zero, else AMOP_SEARCH 's' — opclasscmds.c: "oppurpose =
+// OidIsValid(op->sortfamily) ? AMOP_ORDER : AMOP_SEARCH"). ClassOID backs the
+// pg_depend INTERNAL ('i') row dumpOpclass's query joins on
+// (refclassid=pg_opclass, refobjid=ClassOID). DU-002 (M0119-0004) slice 411;
+// SortFamilyOID added slice 414 (FOR ORDER BY).
+type AmOpMember struct {
+	OID           uint32 // pg_amop.oid
+	FamilyOID     uint32 // pg_amop.amopfamily
+	LeftType      uint32 // pg_amop.amoplefttype
+	RightType     uint32 // pg_amop.amoprighttype
+	Strategy      uint32 // pg_amop.amopstrategy
+	OperOID       uint32 // pg_amop.amopopr
+	Method        uint32 // pg_amop.amopmethod
+	ClassOID      uint32 // owning opclass OID, for the pg_depend INTERNAL row
+	SortFamilyOID uint32 // pg_amop.amopsortfamily — FOR ORDER BY family, 0 (InvalidOid) for FOR SEARCH
+}
+
+// AmProcMember models one pg_amproc row (a FUNCTION entry attributed to an
+// operator class via CREATE OPERATOR CLASS's own AS list). Matches PG's
+// pg_amproc (pg_amproc.h). ClassOID mirrors AmOpMember.ClassOID. DU-002
+// (M0119-0004) slice 411.
+type AmProcMember struct {
+	OID       uint32 // pg_amproc.oid
+	FamilyOID uint32 // pg_amproc.amprocfamily
+	LeftType  uint32 // pg_amproc.amproclefttype
+	RightType uint32 // pg_amproc.amprocrighttype
+	ProcNum   uint32 // pg_amproc.amprocnum
+	ProcOID   uint32 // pg_amproc.amproc
+	ClassOID  uint32 // owning opclass OID, for the pg_depend INTERNAL row
+	Method    uint32 // pg_amproc.amprocfamily's owning pg_am.oid — needed by
+	// amForcesSoftFunctionDependency to look up the AM's amadjustmembers
+	// required-support-proc policy without a family-OID indirection. Added
+	// DU-002 (M0119-0004) alongside AmOpMember.Method (slice 411).
+}
+
+// RegisterAmOpMember records one pg_amop row, allocating a stable OID.
+// Appended (not keyed/idempotent) since CREATE OPERATOR CLASS has no
+// re-create/replace form. sortFamilyOID is 0 (InvalidOid) for a plain FOR
+// SEARCH entry, or the resolved FOR ORDER BY family's OID (slice 414).
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, strategy, operOID, method, sortFamilyOID uint32) *AmOpMember {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := &AmOpMember{
+		OID: c.allocOIDLocked(), FamilyOID: familyOID, LeftType: leftType,
+		RightType: rightType, Strategy: strategy, OperOID: operOID,
+		Method: method, ClassOID: classOID, SortFamilyOID: sortFamilyOID,
+	}
+	c.amOpMembers = append(c.amOpMembers, m)
+	return m
+}
+
+// RegisterAmProcMember records one pg_amproc row, allocating a stable OID.
+// Mirrors RegisterAmOpMember. DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType, procNum, procOID, method uint32) *AmProcMember {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := &AmProcMember{
+		OID: c.allocOIDLocked(), FamilyOID: familyOID, LeftType: leftType,
+		RightType: rightType, ProcNum: procNum, ProcOID: procOID, ClassOID: classOID,
+		Method: method,
+	}
+	c.amProcMembers = append(c.amProcMembers, m)
+	return m
+}
+
+// ListAmOpMembers returns all registered pg_amop rows in creation order.
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) ListAmOpMembers() []*AmOpMember {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.amOpMembers) == 0 {
+		return nil
+	}
+	out := make([]*AmOpMember, len(c.amOpMembers))
+	copy(out, c.amOpMembers)
+	return out
+}
+
+// ListAmProcMembers returns all registered pg_amproc rows in creation order.
+// DU-002 (M0119-0004) slice 411.
+func (c *InMemory) ListAmProcMembers() []*AmProcMember {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.amProcMembers) == 0 {
+		return nil
+	}
+	out := make([]*AmProcMember, len(c.amProcMembers))
+	copy(out, c.amProcMembers)
+	return out
+}
+
+// RemoveAmOpMember deletes the pg_amop row keyed by (familyOID, leftType,
+// rightType, strategy) — the same (amopfamily, amoplefttype, amoprighttype,
+// amopstrategy) unique index PG's dropOperators looks up via
+// GetSysCacheOid4(AMOPSTRATEGY, ...) (opclasscmds.c). Reports whether a
+// matching row was found and removed; the caller raises 42704 (undefined
+// object) on false, matching dropOperators' own ereport. Removing the row
+// also removes its pg_depend edges, since dependVirtualRows recomputes them
+// live from c.amOpMembers on every read. ALTER OPERATOR FAMILY ... DROP,
+// DU-002 (M0119-0004).
+func (c *InMemory) RemoveAmOpMember(familyOID, leftType, rightType, strategy uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, m := range c.amOpMembers {
+		if m.FamilyOID == familyOID && m.LeftType == leftType && m.RightType == rightType && m.Strategy == strategy {
+			c.amOpMembers = append(c.amOpMembers[:i], c.amOpMembers[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// RemoveAmProcMember deletes the pg_amproc row keyed by (familyOID,
+// leftType, rightType, procNum) — mirrors RemoveAmOpMember for
+// dropProcedures' AMPROCNUM lookup. ALTER OPERATOR FAMILY ... DROP, DU-002
+// (M0119-0004).
+func (c *InMemory) RemoveAmProcMember(familyOID, leftType, rightType, procNum uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, m := range c.amProcMembers {
+		if m.FamilyOID == familyOID && m.LeftType == leftType && m.RightType == rightType && m.ProcNum == procNum {
+			c.amProcMembers = append(c.amProcMembers[:i], c.amProcMembers[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// amGISTMethodOID / amSPGistMethodOID are pg_am.oid for "gist"/"spgist"
+// (see AccessMethodOIDByName below) — the only two in-tree access methods
+// whose amadjustmembers override (gistvalidate.c gistadjustmembers,
+// spgvalidate.c spgadjustmembers) forces dependency softness independent of
+// class-attribution. Hoisted as constants since amForcesSoftOperatorDependency/
+// amForcesSoftFunctionDependency are called per-member from dependVirtualRows.
+const (
+	amGISTMethodOID   = 783
+	amSPGistMethodOID = 4000
+)
+
+// gistRequiredSupportProcs / spgistRequiredSupportProcs list the amprocnum
+// values gistadjustmembers/spgadjustmembers keep as "required" (hard,
+// class-level when class-attributed) — GIST_CONSISTENT/UNION/PENALTY/
+// PICKSPLIT/EQUAL_PROC (gist.h) and SPGIST_CONFIG/CHOOSE/PICKSPLIT/
+// INNER_CONSISTENT/LEAF_CONSISTENT_PROC (spgist.h) respectively. Every other
+// support-function number for these two AMs (COMPRESS/DECOMPRESS/DISTANCE/
+// FETCH/OPTIONS/SORTSUPPORT/TRANSLATE_CMPTYPE for GiST, COMPRESS/OPTIONS for
+// SP-GiST) is "optional" and gets forced to a soft family-level dependency
+// even when class-attributed.
+var gistRequiredSupportProcs = map[uint32]bool{1: true, 2: true, 5: true, 6: true, 7: true}
+var spgistRequiredSupportProcs = map[uint32]bool{1: true, 2: true, 3: true, 4: true, 5: true}
+
+// amForcesSoftOperatorDependency reports whether methodOID's amadjustmembers
+// override forces every OPERATOR member's opclass/opfamily dependency to be
+// soft (AUTO, targeting the opfamily) even when the member is
+// class-attributed (ClassOID != 0) — "Operator members of a GiST/SP-GiST
+// opfamily should never have hard dependencies, since their connection to
+// the opfamily depends only on what the support functions think, and that
+// can be altered... For consistency, we make all soft dependencies point to
+// the opfamily" (gistvalidate.c gistadjustmembers, spgvalidate.c
+// spgadjustmembers, verbatim comment). Every other in-tree AM
+// (btree/hash/gin/brin) leaves goopg's pre-existing class-attributed-is-hard
+// default unchanged. A loose member (ClassOID == 0, ALTER OPERATOR FAMILY
+// ... ADD) is already unconditionally soft regardless of AM — this only
+// changes the CLASS-attributed case. DU-002 (M0119-0004).
+func amForcesSoftOperatorDependency(methodOID uint32) bool {
+	return methodOID == amGISTMethodOID || methodOID == amSPGistMethodOID
+}
+
+// amForcesSoftFunctionDependency reports whether a class-attributed FUNCTION
+// member with the given amprocnum is "optional" for methodOID's AM and
+// therefore gets forced to a soft family-level dependency instead of the
+// pre-existing hard-on-class default (gistadjustmembers/spgadjustmembers's
+// function loop: the AM's required-support-proc subset keeps the hard
+// dependency, every other proc number is forced soft). Returns false (no
+// override) for any AM other than GiST/SP-GiST, or for a required proc
+// number on those two. Only meaningful for a class-attributed member — a
+// loose member is already unconditionally soft (see
+// amForcesSoftOperatorDependency's doc comment). DU-002 (M0119-0004).
+func amForcesSoftFunctionDependency(methodOID, procNum uint32) bool {
+	switch methodOID {
+	case amGISTMethodOID:
+		return !gistRequiredSupportProcs[procNum]
+	case amSPGistMethodOID:
+		return !spgistRequiredSupportProcs[procNum]
+	}
+	return false
+}
+
+// AccessMethodOIDByName maps an access method name to its pg_am.oid, covering
+// the 7 rows pg_am.VirtualRows serves (see the pg_am registration in this
+// file). Returns 0 for an unrecognized method. Used by CREATE OPERATOR FAMILY
+// and CREATE OPERATOR CLASS to resolve the `USING method`
+// clause to pg_opfamily.opfmethod / pg_opclass.opcmethod. DU-002 (M0119-0004).
+func AccessMethodOIDByName(name string) uint32 {
+	switch strings.ToLower(name) {
+	case "heap":
+		return 2
+	case "btree":
+		return 403
+	case "hash":
+		return 405
+	case "gist":
+		return 783
+	case "gin":
+		return 2742
+	case "spgist":
+		return 4000
+	case "brin":
+		return 3580
+	}
+	return 0
+}
+
+// LanguageNameToOID maps a language name to its pg_language OID, covering the
+// 4 rows pg_language.VirtualRows serves (the 3 built-in BKI languages plus
+// plpgsql — see the pg_language registration in this file). Returns 0 for an
+// unknown/user-defined language (goopg installs no user procedural
+// languages). Used by CREATE TRANSFORM to resolve pg_transform.trflang.
+// DU-002 (M0119-0004).
+func LanguageNameToOID(name string) uint32 {
+	switch strings.ToLower(name) {
+	case "internal":
+		return 12
+	case "c":
+		return 13
+	case "sql":
+		return 14
+	case "plpgsql":
+		return 13627
+	}
+	return 0
+}
+
+// BuiltinProc is a minimal, hand-curated pg_proc.dat entry for a built-in
+// PostgreSQL function that goopg's own DDL surface can reference by name —
+// e.g. a CREATE CAST/CONVERSION/TRANSFORM WITH FUNCTION clause naming a
+// built-in I/O or internal function such as int4recv. It is NOT the full
+// ~3397-row PG18 catalog (that generated table lives in internal/initdb's
+// pg_proc_seed_data.go, seeded into the on-disk heap for PG-standby
+// consumption); internal/executor cannot import internal/initdb because
+// initdb already imports executor, so the reverse import would cycle (see
+// the "Version constants must live in leaf config pkg" precedent). Both
+// internal/initdb's SQL-queryable pg_proc view and internal/executor's
+// WITH-FUNCTION resolution read this single leaf-package table so the two
+// never diverge (see "Sibling code paths must stay in sync").
+type BuiltinProc struct {
+	OID       uint32
+	Name      string
+	Namespace uint32 // pronamespace OID; every entry so far is pg_catalog (11)
+	RetType   string // catalog type name (matches Type.Name / TypeNameToOID)
+	ArgTypes  []string
+	Volatile  string // provolatile: "i"/"s"/"v"
+}
+
+// builtinProcsByName holds only the functions goopg's DU-002 pg_dump test
+// fixtures actually reference so far; extend as new CAST/CONVERSION/
+// TRANSFORM fixtures need more builtins. OID/rettype/argtypes/provolatile
+// are taken from postgres/src/include/catalog/pg_proc.dat (provolatile
+// defaults to 'i' — BKI_DEFAULT(i) in pg_proc.h — when the .dat entry omits
+// it, which both entries below do).
+var builtinProcsByName = map[string]BuiltinProc{
+	"int4recv": {
+		OID: 2406, Name: "int4recv", Namespace: 11,
+		RetType: "int4", ArgTypes: []string{"internal"}, Volatile: "i",
+	},
+	"prsd_lextype": {
+		OID: 3721, Name: "prsd_lextype", Namespace: 11,
+		RetType: "internal", ArgTypes: []string{"internal"}, Volatile: "i",
+	},
+	"iso8859_1_to_utf8": {
+		OID: 4374, Name: "iso8859_1_to_utf8", Namespace: 11,
+		RetType:  "int4",
+		ArgTypes: []string{"int4", "int4", "cstring", "internal", "int4", "bool"},
+		Volatile: "i",
+	},
+	// age(timestamptz) is one of four overloaded pg_proc.dat "age" entries
+	// (OIDs 1181/1199/1386/2058/2059); only the single-arg timestamptz->interval
+	// form (OID 1386, the DU-002 "CREATE CAST FOR timestamptz" fixture's WITH
+	// FUNCTION reference) is curated since LookupBuiltinProc has no overload
+	// resolution (name-only) and no other fixture references "age" yet.
+	"age": {
+		OID: 1386, Name: "age", Namespace: 11,
+		RetType:  "interval",
+		ArgTypes: []string{"timestamptz"},
+		Volatile: "s",
+	},
+	// int4_avg_accum/int8_avg are the state-transition/final functions a
+	// CREATE AGGREGATE fixture references directly by name (e.g. DU-002
+	// slice 405's "newavg" mirrors PG's own avg(int4) plumbing:
+	// SFUNC=int4_avg_accum, FINALFUNC=int8_avg). Curated so the aggregate's
+	// pg_proc/pg_aggregate rows can resolve SFUNC/FINALFUNC to a real OID
+	// (mirroring pg_cast.castfunc/pg_conversion.conproc's FuncOID pattern).
+	"int4_avg_accum": {
+		OID: 1963, Name: "int4_avg_accum", Namespace: 11,
+		RetType:  "int8[]",
+		ArgTypes: []string{"int8[]", "int4"},
+		Volatile: "i",
+	},
+	"int8_avg": {
+		OID: 1964, Name: "int8_avg", Namespace: 11,
+		RetType:  "numeric",
+		ArgTypes: []string{"int8[]"},
+		Volatile: "i",
+	},
+	// int4eq is the FUNCTION a DU-002 "CREATE OPERATOR" fixture references
+	// (mirrors PG's own "=" operator over int4, pg_operator.dat oid 96 ->
+	// oprcode int4eq). Curated so the operator's pg_operator.oprcode can
+	// resolve to a real OID (mirroring pg_cast.castfunc/pg_aggregate's
+	// aggtransfn FuncOID pattern).
+	"int4eq": {
+		OID: 65, Name: "int4eq", Namespace: 11,
+		RetType:  "bool",
+		ArgTypes: []string{"int4", "int4"},
+		Volatile: "i",
+	},
+	// btint4cmp is int4's real btree "support function 1" (three-way
+	// less-equal-greater compare, pg_proc.dat oid 351) — a CREATE OPERATOR
+	// CLASS ... AS FUNCTION 1 entry referencing it exercises the pg_amproc
+	// member store against a semantically valid (int4-returning) btree
+	// comparator, matching real PG's own opclasscmds.c validation ("ordering
+	// comparison functions must return integer"). M0119-0004 (DU-002) slice
+	// 411.
+	"btint4cmp": {
+		OID: 351, Name: "btint4cmp", Namespace: 11,
+		RetType:  "int4",
+		ArgTypes: []string{"int4", "int4"},
+		Volatile: "i",
+	},
+	// eqsel/eqjoinsel/neqjoinsel are the RESTRICT=/JOIN= selectivity
+	// estimators an ALTER OPERATOR ... SET (RESTRICT=/JOIN=) fixture
+	// references directly by name (mirrors PG's own "=" operator's
+	// oprrest/oprjoin, pg_operator.dat oid 96 -> eqsel/eqjoinsel). Curated
+	// so RESTRICT=/JOIN= can resolve to a real OID, same pattern as int4eq
+	// above. M0119-0004 (DU-002).
+	"eqsel": {
+		OID: 101, Name: "eqsel", Namespace: 11,
+		RetType:  "float8",
+		ArgTypes: []string{"internal", "oid", "internal", "int4"},
+		Volatile: "s",
+	},
+	"eqjoinsel": {
+		OID: 105, Name: "eqjoinsel", Namespace: 11,
+		RetType:  "float8",
+		ArgTypes: []string{"internal", "oid", "internal", "int2", "internal"},
+		Volatile: "s",
+	},
+	"neqjoinsel": {
+		OID: 106, Name: "neqjoinsel", Namespace: 11,
+		RetType:  "float8",
+		ArgTypes: []string{"internal", "oid", "internal", "int2", "internal"},
+		Volatile: "s",
+	},
+	// btint8cmp is int8's real btree "support function 1" (three-way
+	// less-equal-greater compare, pg_proc.dat oid 842), the FUNCTION 1
+	// member of the upstream `op_class` pg_dump fixture (bigint comparison
+	// opclass) — mirrors btint4cmp's curation rationale above. M0119-0004
+	// (DU-002) slice 413.
+	"btint8cmp": {
+		OID: 842, Name: "btint8cmp", Namespace: 11,
+		RetType:  "int4",
+		ArgTypes: []string{"int8", "int8"},
+		Volatile: "i",
+	},
+}
+
+// LookupBuiltinProc resolves a built-in pg_proc.dat function by name (case-
+// insensitive, unqualified — every entry lives in pg_catalog). Returns
+// false if name is not in the hand-curated set above.
+func LookupBuiltinProc(name string) (BuiltinProc, bool) {
+	p, ok := builtinProcsByName[strings.ToLower(name)]
+	return p, ok
+}
+
+// BuiltinOperator holds a hand-curated built-in pg_operator.dat row — the
+// operator analogue of BuiltinProc. Only the handful of built-in operators
+// goopg's DU-002 pg_dump test fixtures actually reference are curated here
+// (not a full port of pg_operator.dat's ~799 rows — see the ledger); extend
+// as new CREATE OPERATOR CLASS/FAMILY fixtures reference more. OID/lefttype/
+// righttype/oprcode are taken from postgres/src/include/catalog/pg_operator.dat.
+// M0119-0004 (DU-002) slice 413.
+type BuiltinOperator struct {
+	OID       uint32
+	Name      string
+	Namespace uint32 // oprnamespace; every entry so far is pg_catalog (11)
+	Kind      byte   // oprkind: 'b' binary, 'l' left-unary (prefix); every entry so far is 'b'
+	LeftType  string // catalog type name (matches Type.Name / TypeNameToOID)
+	RightType string
+}
+
+// builtinOperatorKey builds the (name, lefttype OID, righttype OID) lookup
+// key for builtinOperatorsByKey. Keying on resolved type OIDs (not the raw
+// type-name spelling) makes lookup synonym-proof — a CREATE OPERATOR CLASS
+// AS-list entry may spell the same type differently than pg_operator.dat
+// does (e.g. "bigint" vs "int8").
+func builtinOperatorKey(name string, leftOID, rightOID uint32) string {
+	return name + "/" + strconv.FormatUint(uint64(leftOID), 10) + "/" + strconv.FormatUint(uint64(rightOID), 10)
+}
+
+// builtinOperatorsByKey holds the curated built-in operator set (see
+// BuiltinOperator's doc comment). Currently just the 5 int8 btree comparison
+// strategies the upstream `op_class` pg_dump fixture's OPERATOR entries need
+// (pg_operator.dat oids 410/412/413/414/415).
+var builtinOperatorsByKey = map[string]BuiltinOperator{
+	builtinOperatorKey("=", OIDInt8, OIDInt8):  {OID: 410, Name: "=", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey("<", OIDInt8, OIDInt8):  {OID: 412, Name: "<", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey(">", OIDInt8, OIDInt8):  {OID: 413, Name: ">", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey("<=", OIDInt8, OIDInt8): {OID: 414, Name: "<=", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+	builtinOperatorKey(">=", OIDInt8, OIDInt8): {OID: 415, Name: ">=", Namespace: 11, Kind: 'b', LeftType: "int8", RightType: "int8"},
+}
+
+// builtinOperatorsByOID is the OID-keyed reverse index of
+// builtinOperatorsByKey, built once at init for regoper/regoperator OID→name
+// rendering (RegoperatorNameAndSchema, and the bare-name regoper CastExpr in
+// internal/executor/expr.go).
+var builtinOperatorsByOID = func() map[uint32]BuiltinOperator {
+	out := make(map[uint32]BuiltinOperator, len(builtinOperatorsByKey))
+	for _, op := range builtinOperatorsByKey {
+		out[op.OID] = op
+	}
+	return out
+}()
+
+// LookupBuiltinOperator resolves a built-in pg_operator.dat row by name plus
+// explicit (lefttype, righttype) — the shape a CREATE OPERATOR CLASS AS-list
+// OPERATOR entry with explicit operand types provides (resolveOpClassOperator,
+// internal/executor/operators_ddl.go). leftType/rightType are resolved via
+// TypeNameToOID before keying, so a caller's raw type-name spelling (e.g.
+// "bigint") matches an entry keyed on pg_operator.dat's own spelling ("int8").
+func LookupBuiltinOperator(name, leftType, rightType string) (BuiltinOperator, bool) {
+	var leftOID, rightOID uint32
+	if leftType != "" {
+		leftOID = TypeNameToOID(leftType)
+	}
+	if rightType != "" {
+		rightOID = TypeNameToOID(rightType)
+	}
+	op, ok := builtinOperatorsByKey[builtinOperatorKey(name, leftOID, rightOID)]
+	return op, ok
+}
+
+// LookupBuiltinOperatorByOID resolves a built-in operator OID to its curated
+// row — the OID→name direction regoper/regoperator rendering needs.
+func LookupBuiltinOperatorByOID(oid uint32) (BuiltinOperator, bool) {
+	op, ok := builtinOperatorsByOID[oid]
+	return op, ok
+}
+
+// BuiltinProcs returns all hand-curated built-in pg_proc rows in OID order,
+// for callers (e.g. internal/initdb's pg_proc virtual view) that need to
+// enumerate the full set rather than look up a single name.
+func BuiltinProcs() []BuiltinProc {
+	out := make([]BuiltinProc, 0, len(builtinProcsByName))
+	for _, p := range builtinProcsByName {
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
+	return out
+}
+
+// RegprocName resolves a pg_proc OID to its proname, matching PostgreSQL's
+// regprocout (src/backend/utils/adt/regproc.c) — the general OID→name
+// lookup a regproc/regprocedure-typed column (e.g. pg_type.typinput,
+// pg_operator.oprcode, pg_am.amproc) or a `<oid>::regproc` cast needs to
+// render a name instead of a raw number. Backed by the generated
+// pgProcNamesByOID (cmd/gen-pg-proc-data -names), a name-only leaf-package
+// copy of the ~3397-row PG18 pg_proc.dat table: this is a superset of
+// BuiltinProcs/LookupBuiltinProc's small hand-curated forward table (which
+// only covers the handful of builtins goopg's own DDL surface references by
+// name). ok=false means oid is not a known built-in — callers that also
+// need user-defined function OIDs (CREATE FUNCTION) fall back to
+// Routines().LookupByOID separately, since a live routine registry isn't
+// reachable from this leaf function.
+func RegprocName(oid uint32) (string, bool) {
+	name, ok := pgProcNamesByOID[oid]
+	return name, ok
+}
+
+// pgArgTypeDisplayAlias converts an internal base-type spelling (a pg_type.dat
+// typname, or a user Routine's stored Type.Name) to PG's format_type_be
+// display alias — the handful of base types whose internal name differs from
+// its SQL display spelling (int4 -> integer, bool -> boolean, etc). Mirrors
+// executor's pgFormatTypeName; duplicated here (not imported) because
+// internal/executor imports internal/catalog, not the reverse. Types with no
+// alias (composite/domain/array names, "text", "uuid", ...) pass through
+// unchanged.
+func pgArgTypeDisplayAlias(name string) string {
+	switch strings.ToLower(name) {
+	case "int4", "int":
+		return "integer"
+	case "int2":
+		return "smallint"
+	case "int8":
+		return "bigint"
+	case "float4":
+		return "real"
+	case "float8":
+		return "double precision"
+	case "bool":
+		return "boolean"
+	case "bpchar":
+		return "character"
+	case "varchar":
+		return "character varying"
+	case "timestamptz":
+		return "timestamp with time zone"
+	case "timestamp":
+		return "timestamp without time zone"
+	case "timetz":
+		return "time with time zone"
+	case "time":
+		return "time without time zone"
+	case "decimal":
+		return "numeric"
+	}
+	return name
+}
+
+// RegprocedureName resolves a pg_proc OID to PG's regprocedure display form
+// `name(argtype1,argtype2)` — format_procedure/regprocedureout (regproc.c),
+// which (unlike regproc's bare name) also renders the INPUT argument-type
+// list so an overloaded name is disambiguated. pg_dump relies on this: e.g.
+// dumpOpclass/dumpOpfamily cast a pg_amproc.amproc OID to ::regprocedure.
+// Tries the generated pg_proc.dat OID index first (built-ins), then the live
+// routine registry (routines may be nil if the caller has none to hand — the
+// InMemory carries its own via Routines()). OUT-only routine parameters are
+// skipped (pg_proc.proargtypes itself only ever lists IN/INOUT/VARIADIC
+// args, so a built-in row never needs this filter). ok=false means oid
+// resolves to neither source; the caller falls back to the raw OID, matching
+// format_procedure's own numeric fallback for an unknown OID.
+func RegprocedureName(oid uint32, routines *Routines) (string, bool) {
+	_, sig, ok := RegprocedureNameAndSchema(oid, routines)
+	return sig, ok
+}
+
+// RegprocedureNameAndSchema is RegprocedureName plus the resolved schema, for
+// a caller that needs to decide whether to schema-qualify the name (a
+// builtin always resolves to "pg_catalog"; a CREATE FUNCTION-defined routine
+// resolves to its declared schema, defaulting to "public" like every other
+// unset-namespace field in this file). DU-002 (M0119-0004) slice 412.
+func RegprocedureNameAndSchema(oid uint32, routines *Routines) (schema, sig string, ok bool) {
+	if argNames, ok := pgProcArgTypeNamesByOID[oid]; ok {
+		if name, nameOK := pgProcNamesByOID[oid]; nameOK {
+			return "pg_catalog", formatProcedureSignature(name, argNames), true
+		}
+	}
+	if routines != nil {
+		if r := routines.LookupByOID(oid); r != nil {
+			var argNames []string
+			for i, t := range r.ArgTypes {
+				if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+					continue
+				}
+				argNames = append(argNames, t.Name)
+			}
+			schema := r.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			return schema, formatProcedureSignature(r.Name, argNames), true
+		}
+	}
+	return "", "", false
+}
+
+func formatProcedureSignature(name string, argTypeNames []string) string {
+	args := make([]string, len(argTypeNames))
+	for i, a := range argTypeNames {
+		args[i] = pgArgTypeDisplayAlias(a)
+	}
+	return name + "(" + strings.Join(args, ",") + ")"
+}
+
+// RegoperatorName resolves an operator OID to PG's "opr_name(lefttype,
+// righttype)" regoperator rendering (format_operator, regproc.c) — "NONE"
+// for a missing (unary) side. Only user-defined operators are resolvable
+// (goopg has no builtin-operator catalog — deferred, see the ledger).
+// dumpOpclass/dumpOpfamily cast amopopr::pg_catalog.regoperator for a
+// class/family's own OPERATOR entries. DU-002 (M0119-0004) slice 411.
+func (c *InMemory) RegoperatorName(oid uint32) (string, bool) {
+	_, sig, ok := c.RegoperatorNameAndSchema(oid)
+	return sig, ok
+}
+
+// RegoperatorNameAndSchema is RegoperatorName plus the operator's resolved
+// schema, for a caller that needs to decide whether to schema-qualify the
+// name (falls back to "public" when the operator's namespace is unset,
+// mirroring UserOperator.NamespaceOIDOrDefault). DU-002 (M0119-0004) slice
+// 412.
+func (c *InMemory) RegoperatorNameAndSchema(oid uint32) (schema, sig string, ok bool) {
+	op := c.LookupUserOperatorByOID(oid)
+	if op == nil {
+		// Not a user-defined operator — try the small hand-curated builtin
+		// set (LookupBuiltinOperatorByOID) before giving up. M0119-0004
+		// (DU-002) slice 413.
+		if bop, found := LookupBuiltinOperatorByOID(oid); found {
+			left, right := "NONE", "NONE"
+			if bop.LeftType != "" {
+				left = pgArgTypeDisplayAlias(bop.LeftType)
+			}
+			if bop.RightType != "" {
+				right = pgArgTypeDisplayAlias(bop.RightType)
+			}
+			return "pg_catalog", bop.Name + "(" + left + "," + right + ")", true
+		}
+		return "", "", false
+	}
+	left, right := "NONE", "NONE"
+	if op.LeftType != "" {
+		left = pgArgTypeDisplayAlias(op.LeftType)
+	}
+	if op.RightType != "" {
+		right = pgArgTypeDisplayAlias(op.RightType)
+	}
+	nsOID := op.NamespaceOIDOrDefault()
+	if nsOID == PublicNamespaceOID {
+		// SchemaNameForOID is ambiguous here: pg_toast shares public's OID in
+		// this simplified model (NewInMemory's schemas map), and an operator
+		// is never created in pg_toast, so resolve the common case directly
+		// rather than risking a nondeterministic map-iteration pick.
+		schema = "public"
+	} else {
+		schema = c.SchemaNameForOID(nsOID)
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	return schema, op.Name + "(" + left + "," + right + ")", true
+}
+
+// UserMapping is a user-created user mapping (CREATE USER MAPPING FOR <user>
+// SERVER <server>). goopg does not execute foreign access; this records just
+// enough metadata to round-trip the CREATE/DROP through pg_dump (pg_user_mappings
+// virtual view → dumpUserMappings). DU-002 slice 377.
+type UserMapping struct {
+	OID     uint32 // pg_user_mapping.oid (assigned from the catalog OID counter)
+	UmUser  string // the mapped role name; "" / "public" → the PUBLIC pseudo-role
+	SrvName string // the referenced server name; resolved to srvid OID at render time
+	// Options holds the mapping's OPTIONS as "name=value" elements, the on-disk
+	// pg_user_mapping.umoptions text[] representation surfaced by the
+	// pg_user_mappings view. pg_dump's dumpUserMappings expands these via
+	// pg_options_to_table(umoptions); an empty list → NULL → no OPTIONS clause.
+	// DU-002 slice 379.
+	Options []string
+}
+
+// userMappingKey builds the registry key for a (user, server) pair. The user and
+// server names are matched case-insensitively (goopg lowercases unquoted idents).
+func userMappingKey(user, server string) string {
+	return strings.ToLower(user) + "\x00" + strings.ToLower(server)
+}
+
+// RegisterUserMapping records a user mapping, allocating a stable OID on first
+// sight. Idempotent: re-registering an existing (user, server) pair returns the
+// existing entry without changing its OID (OPTIONS are refreshed when non-empty).
+// DU-002 slice 377 (options: slice 379).
+func (c *InMemory) RegisterUserMapping(user, server string, options []string) *UserMapping {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userMappings == nil {
+		c.userMappings = make(map[string]*UserMapping)
+	}
+	key := userMappingKey(user, server)
+	if m, ok := c.userMappings[key]; ok {
+		if len(options) > 0 {
+			m.Options = options
+		}
+		return m
+	}
+	m := &UserMapping{OID: c.allocOIDLocked(), UmUser: user, SrvName: server, Options: options}
+	c.userMappings[key] = m
+	return m
+}
+
+// DropUserMapping removes a user mapping from the registry. Returns true if found.
+// DU-002 slice 377.
+func (c *InMemory) DropUserMapping(user, server string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userMappings == nil {
+		return false
+	}
+	key := userMappingKey(user, server)
+	if _, ok := c.userMappings[key]; ok {
+		delete(c.userMappings, key)
+		return true
+	}
+	return false
+}
+
+// ListUserMappings returns all registered user mappings sorted by server name
+// then user name (deterministic dump order). DU-002 slice 377.
+func (c *InMemory) ListUserMappings() []*UserMapping {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userMappings) == 0 {
+		return nil
+	}
+	out := make([]*UserMapping, 0, len(c.userMappings))
+	for _, m := range c.userMappings {
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].SrvName != out[j].SrvName {
+			return out[i].SrvName < out[j].SrvName
+		}
+		return out[i].UmUser < out[j].UmUser
+	})
 	return out
 }
 
@@ -7770,6 +12671,7 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 	}
 	delete(c.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
+	delete(c.tableACLOrder, tbl.OID)
 	return nil
 }
 
@@ -7802,6 +12704,7 @@ func (c *InMemory) DropSessionTempObjects(owner string) int {
 		}
 		delete(c.tables, k)
 		delete(c.tableACLs, tbl.OID)
+		delete(c.tableACLOrder, tbl.OID)
 	}
 	return len(victims)
 }
@@ -7866,6 +12769,64 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 
 // BuildIndexDef reconstructs the CREATE INDEX DDL string for an index.
 // Used by pg_indexes.indexdef and pg_get_indexdef(). M0097-0023.
+// quoteCollationIdent renders a collation name the way ruleutils.c
+// generate_collation_name → quote_identifier does: a name is left bare only when
+// it would re-parse as itself (starts with a lowercase letter or underscore and
+// contains only lowercase letters, digits, and underscores); otherwise it is
+// double-quoted with embedded quotes doubled. So "C"/"POSIX" become "C"/"POSIX"
+// (quoted, uppercase) while "ucs_basic" stays bare — matching pg_dump's COLLATE
+// output. Reserved-word quoting is not reproduced (collation names are rarely
+// reserved words); the common collations are covered exactly.
+func quoteCollationIdent(s string) string {
+	if s == "" {
+		return `""`
+	}
+	safe := true
+	for i, c := range s {
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || c == '_') {
+				safe = false
+				break
+			}
+		} else if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			safe = false
+			break
+		}
+	}
+	// Mirror PostgreSQL quote_identifier(): a char-class-safe, all-lowercase
+	// identifier must still be quoted when it is a non-UNRESERVED keyword, so a
+	// collation named e.g. "select" renders as "select" in pg_get_indexdef.
+	if safe && sqlkeywords.IsReservedForQuoting(s) {
+		safe = false
+	}
+	if safe {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// indexKeyIsBareFuncCall reports whether an index key expression is a plain
+// function call, mirroring PG's pg_get_indexdef_worker parenthesization test
+// (`IsA(indexkey, FuncExpr) && ((FuncExpr *) indexkey)->funcformat ==
+// COERCE_EXPLICIT_CALL`, ruleutils.c). Such keys are emitted WITHOUT the
+// surrounding parens the worker otherwise adds to every expression column.
+// A no-paren SQL value function (CURRENT_TIMESTAMP, CURRENT_USER, …) deparses
+// to a bare keyword rather than a COERCE_EXPLICIT_CALL FuncExpr, so it is
+// excluded and keeps the parens. DU-002 slice 360.
+func indexKeyIsBareFuncCall(e *parser.Expr) bool {
+	if e == nil {
+		return false
+	}
+	fc, ok := (*e).(*parser.FuncCall)
+	if !ok {
+		return false
+	}
+	if len(fc.Args) == 0 && fc.Name.Schema == "" && parser.IsNoParenFuncName(strings.ToLower(fc.Name.Name)) {
+		return false
+	}
+	return true
+}
+
 func BuildIndexDef(idx *Index) string {
 	var sb strings.Builder
 	sb.WriteString("CREATE ")
@@ -7888,6 +12849,17 @@ func BuildIndexDef(idx *Index) string {
 	if method == "" {
 		method = "btree"
 	}
+	// goopg has no native hash access method: a `CREATE INDEX … USING hash`
+	// is built on the B-tree substrate, so catalog.Index.Method stays "btree"
+	// (it routes through createBTreeIndex) while DeclaredHash remembers the
+	// declared method (design 0118-0099). pg_get_indexdef_worker (ruleutils.c)
+	// prints `USING %s` from pg_am.amname, so real pg_dump 18.3 emits
+	// `USING hash (col)`; surface the declared method here so the dump
+	// round-trips byte-identically instead of the substrate's `USING btree`.
+	// DU-002 slice 361.
+	if idx.DeclaredHash {
+		method = "hash"
+	}
 	sb.WriteString(" USING ")
 	sb.WriteString(method)
 	sb.WriteString(" (")
@@ -7902,14 +12874,49 @@ func BuildIndexDef(idx *Index) string {
 				exprStr = idx.ColExprStrings[i]
 			}
 			if exprStr != "" {
-				sb.WriteByte('(')
-				sb.WriteString(exprStr)
-				sb.WriteByte(')')
+				// PG's pg_get_indexdef_worker (ruleutils.c) wraps an expression
+				// key column in parens UNLESS it is a bare function call
+				// (IsA(indexkey, FuncExpr) && funcformat == COERCE_EXPLICIT_CALL):
+				// `lower(name)` dumps WITHOUT the extra parens, while a non-function
+				// expression such as `((qty + id) * mgr_id)` keeps the wrapping
+				// parens. Mirror that by skipping the wrap when the parsed key AST
+				// is a plain function call. DU-002 slice 360.
+				var keyAST *parser.Expr
+				if i < len(idx.ColExprs) {
+					keyAST = idx.ColExprs[i]
+				}
+				if indexKeyIsBareFuncCall(keyAST) {
+					sb.WriteString(exprStr)
+				} else {
+					sb.WriteByte('(')
+					sb.WriteString(exprStr)
+					sb.WriteByte(')')
+				}
 			} else {
 				sb.WriteString("(expr)")
 			}
 		} else {
 			sb.WriteString(col)
+		}
+		// Non-default per-column collation, e.g. ` COLLATE "C"`. ruleutils.c
+		// pg_get_indexdef_worker emits it after the column/expression and before
+		// the operator class, via generate_collation_name (which quotes the
+		// collname as an identifier), suppressing the type's default collation.
+		// goopg records only an explicitly-written collation, so a non-empty entry
+		// is by construction non-default. DU-002 slice 313.
+		if i < len(idx.ColCollations) && idx.ColCollations[i] != "" {
+			sb.WriteString(" COLLATE ")
+			sb.WriteString(quoteCollationIdent(idx.ColCollations[i]))
+		}
+		// Non-default per-column operator class, e.g. ` text_pattern_ops`.
+		// ruleutils.c get_opclass_name emits it after the column/expression (and
+		// after any COLLATE clause) and before the ASC/DESC ordering, suppressing
+		// the type's default opclass. goopg records only an explicitly-written
+		// opclass, so a non-empty entry is by construction non-default. DU-002
+		// slice 312.
+		if i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
+			sb.WriteByte(' ')
+			sb.WriteString(idx.ColOpClasses[i])
 		}
 		// Per-column ASC/DESC + NULLS ordering, mirroring ruleutils.c
 		// pg_get_indexdef_worker: DESC defaults to NULLS FIRST (print NULLS LAST
@@ -8847,7 +13854,7 @@ func (c *InMemory) DropCompositeType(name string) error {
 
 // RegisterDomain creates a new domain type. Returns an error if name already
 // exists. M0097-0017.
-func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInValues ...string) (*Domain, error) {
+func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain, error) {
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -8859,36 +13866,56 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInV
 	// ArrayOID) so a `d[]` column joins to a real array pg_type row. DU-002
 	// slice 251 (matches RegisterEnum / RegisterCompositeType).
 	d := &Domain{
-		Name:          k,
-		OID:           c.nextOID,
-		ArrayOID:      c.nextOID + 1,
-		Base:          base,
-		NotNull:       notNull,
-		CheckInValues: checkInValues,
+		Name:     k,
+		OID:      c.nextOID,
+		ArrayOID: c.nextOID + 1,
+		Base:     base,
+		NotNull:  notNull,
 	}
 	c.nextOID += 2
 	c.domains[k] = d
 	return d, nil
 }
 
-// SetDomainCheck records a generic CHECK predicate on a domain and allocates a
-// pg_constraint OID for it. The constraint name defaults to PG's generated
-// `<domain>_check` when the caller passes "". No-op when expr is empty. The OID
-// is drawn from the same running counter as every other user object so it stays
-// stable and distinct. DU-002 slice 96.
-func (c *InMemory) SetDomainCheck(d *Domain, name, expr string) {
+// AddDomainCheck appends a CHECK constraint to a domain and allocates its
+// pg_constraint OID. expr is the conbin source text (the deparsed predicate);
+// inValues is non-nil for the `CHECK (VALUE IN (...))` form. No-op when expr is
+// empty. An unnamed check (name == "") gets PG's generated `<domain>_check`,
+// with `<domain>_check1`, `_check2`, … on collision with an already-added check
+// (PG's ChooseConstraintName disambiguation). The OID is drawn from the same
+// running counter as every other user object so it stays stable and distinct.
+// DU-002 slice 96 (single) / slice 385 (multi-CHECK).
+func (c *InMemory) AddDomainCheck(d *Domain, name, expr string, inValues []string) {
 	if d == nil || expr == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	d.CheckExpr = expr
 	if name == "" {
-		name = d.Name + "_check"
+		base := d.Name + "_check"
+		name = base
+		for n := 1; c.domainCheckNameTaken(d, name); n++ {
+			name = fmt.Sprintf("%s%d", base, n)
+		}
 	}
-	d.CheckName = name
-	d.CheckOID = c.nextOID
+	d.Checks = append(d.Checks, DomainCheck{
+		Name:     name,
+		Expr:     expr,
+		OID:      c.nextOID,
+		InValues: inValues,
+	})
 	c.nextOID++
+}
+
+// domainCheckNameTaken reports whether the domain already has a CHECK with the
+// given constraint name. Caller holds c.mu. DU-002 slice 385.
+func (c *InMemory) domainCheckNameTaken(d *Domain, name string) bool {
+	for _, ck := range d.Checks {
+		if ck.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // LookupDomain finds a domain by name (case-insensitive). M0097-0017.
@@ -9095,11 +14122,26 @@ func binaryOpSymbol(op parser.OpCode) string {
 
 // formatExprForAttrdef converts a parsed default expression to a display string
 // for pg_attrdef.adbin. Used by pg_get_expr to display column defaults in \d.
+// FormatExprForAttrdef deparses a column DEFAULT / CHECK / generated-column
+// expression to SQL text, the same rendering pg_attrdef's adbin display uses.
+// Exported for the column-defaults WAL persistence (RecordKindColumnDefaults):
+// syncTableToCatalogHeap serializes each DefaultExpr with it and startup
+// replay round-trips the text through parser.ParseExpr. root-0020 follow-up.
+func FormatExprForAttrdef(e parser.Expr) string { return formatExprForAttrdef(e) }
+
 func formatExprForAttrdef(e parser.Expr) string {
 	if e == nil {
 		return ""
 	}
 	switch v := e.(type) {
+	case *parser.ColumnRef:
+		// A bare column reference. PG's pg_get_expr deparses a column ref inside a
+		// single-relation context (CHECK predicate, policy USING/WITH CHECK,
+		// generated-column expression) as just the unqualified column name. A
+		// table/schema qualifier is dropped because the expression is already
+		// scoped to one relation. DU-002 slice 323. (Previously absent: a column
+		// ref fell through to fmt.Sprintf("%v"), emitting a Go pointer string.)
+		return v.Column
 	case *parser.IntegerConst:
 		return fmt.Sprintf("%d", v.Value)
 	case *parser.NumericConst:
@@ -9159,19 +14201,19 @@ func formatExprForAttrdef(e parser.Expr) string {
 		// a `DEFAULT -…` fell through to fmt.Sprintf("%v") and corrupted the dump
 		// with a Go pointer string (DU-002 slice 302). PG's parser folds a unary
 		// minus applied DIRECTLY to a numeric literal into a negative typed Const
-		// (gram.y doNegate), deparsed by pg_get_expr as `'-N'::type`; goopg is
-		// type-blind here so it emits the re-parseable `-N` for that case (matching
-		// the `'-N'::type` cast needs the column type — deferred). For a unary minus
-		// on a COMPOUND operand (an OpExpr PG does NOT fold), get_rule_expr deparses
-		// `(- (operand))`. Mirror the executor twin executor.defaultExprToSQL.
+		// (gram.y doNegate), deparsed by get_const_expr as the quoted-value-plus-cast
+		// `'-N'::type` so it re-parses as one constant. parser.NegatedLiteralSQL
+		// reproduces that exact form (and PG's literal-type resolution); it returns
+		// "" for a non-literal operand. For a unary minus on a COMPOUND operand (an
+		// OpExpr PG does NOT fold), get_rule_expr deparses `(- (operand))`. Mirror the
+		// executor twin executor.defaultExprToSQL. DU-002 slice 364 (resolves the
+		// slice 302/360(a)/362(b)/363 deferred `'-N'::type` gap).
 		switch v.Op {
 		case parser.OpUnaryNeg:
-			switch v.Operand.(type) {
-			case *parser.IntegerConst, *parser.NumericConst:
-				return "-" + formatExprForAttrdef(v.Operand)
-			default:
-				return "(- " + formatExprForAttrdef(v.Operand) + ")"
+			if neg := parser.NegatedLiteralSQL(v.Operand); neg != "" {
+				return neg
 			}
+			return "(- " + formatExprForAttrdef(v.Operand) + ")"
 		case parser.OpNot:
 			return "NOT " + formatExprForAttrdef(v.Operand)
 		}

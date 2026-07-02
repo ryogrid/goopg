@@ -13,8 +13,21 @@ import (
 // surprises. See
 // docs/design/0008-0003-publication-subscription-ddl.md.
 type Publication struct {
-	Name          string
-	OID           uint32
+	Name string
+	OID  uint32
+	// Owner is the owning role's OID (pg_publication.pubowner). Real
+	// pg_dump's getPublications() (pg_dump.c) always selects this column
+	// and calls getRoleName() on it, which pg_fatal()s with "role with
+	// OID %u does not exist" if the OID doesn't resolve — so an unset
+	// (zero) Owner isn't a cosmetic gap, it makes pg_dump abort outright
+	// on any database containing a publication. CreatePublication defaults
+	// this to the bootstrap superuser OID (10); CreatePublicationAsOwner
+	// (called from the executor with the connection's currently-effective
+	// role, DU-002 slice 424) lets a session running under `SET ROLE`/`SET
+	// SESSION AUTHORIZATION` own the publication it creates, mirroring
+	// PostgreSQL's `GetUserId()`-as-owner convention (`CreatePublication`,
+	// publicationcmds.c). DU-002 slice 422.
+	Owner         uint32
 	AllTables     bool
 	PublishInsert bool
 	PublishUpdate bool
@@ -28,9 +41,18 @@ type Publication struct {
 
 // Subscription is one CREATE SUBSCRIPTION's catalog row.
 type Subscription struct {
-	Name         string
-	OID          uint32
-	Conninfo     string
+	Name     string
+	OID      uint32
+	Conninfo string
+	// Owner is the owning role's OID (pg_subscription.subowner). Real
+	// pg_dump's getSubscriptions() (pg_dump.c) always selects this column
+	// and calls getRoleName() on it — same pg_fatal()-on-unresolved-OID
+	// hazard pg_publication.pubowner had (DU-002 slice 422). CreateSubscription
+	// defaults this to the bootstrap superuser OID (10);
+	// CreateSubscriptionAsOwner (called from the executor with the
+	// connection's currently-effective role, DU-002 slice 424) mirrors
+	// Publication.Owner's same real-ownership convention.
+	Owner        uint32
 	Publications []string
 	Enabled      bool
 	SlotName     string
@@ -138,12 +160,21 @@ func DefaultPublicationOptions() PublicationOptions {
 	}
 }
 
-// CreatePublication registers a new publication. tables is the
-// qualified-table-name list (`"schema.name"`); pass nil for
-// FOR ALL TABLES (with opts.AllTables = true) or for an empty
-// FOR TABLE list. Returns ErrPublicationExists when name is
-// taken.
+// CreatePublication registers a new publication owned by the bootstrap
+// superuser. tables is the qualified-table-name list (`"schema.name"`); pass
+// nil for FOR ALL TABLES (with opts.AllTables = true) or for an empty FOR
+// TABLE list. Returns ErrPublicationExists when name is taken. Callers that
+// know the connection's currently-effective role should use
+// CreatePublicationAsOwner instead.
 func (p *PubSub) CreatePublication(name string, tables []string, opts PublicationOptions) (*Publication, error) {
+	return p.CreatePublicationAsOwner(name, tables, opts, 10)
+}
+
+// CreatePublicationAsOwner is CreatePublication with an explicit owner OID —
+// the role that issued CREATE PUBLICATION, mirroring PostgreSQL's
+// GetUserId()-as-owner convention (CreatePublication, publicationcmds.c).
+// DU-002 slice 424.
+func (p *PubSub) CreatePublicationAsOwner(name string, tables []string, opts PublicationOptions, owner uint32) (*Publication, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.publications[name]; ok {
@@ -152,6 +183,7 @@ func (p *PubSub) CreatePublication(name string, tables []string, opts Publicatio
 	pub := &Publication{
 		Name:          name,
 		OID:           p.nextOID,
+		Owner:         owner,
 		AllTables:     opts.AllTables,
 		PublishInsert: opts.PublishInsert,
 		PublishUpdate: opts.PublishUpdate,
@@ -165,6 +197,21 @@ func (p *PubSub) CreatePublication(name string, tables []string, opts Publicatio
 	out := *pub
 	out.Tables = append([]string(nil), pub.Tables...)
 	return &out, nil
+}
+
+// SetPublicationOwner updates a publication's owner OID. Returns
+// ErrPublicationNotFound when name is unknown. Backs ALTER PUBLICATION name
+// OWNER TO newowner. DU-002 slice 425 (M0119-0004, loop #65 ledger
+// follow-up).
+func (p *PubSub) SetPublicationOwner(name string, owner uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pub, ok := p.publications[name]
+	if !ok {
+		return ErrPublicationNotFound
+	}
+	pub.Owner = owner
+	return nil
 }
 
 // DropPublication removes a publication. Returns
@@ -193,6 +240,43 @@ func (p *PubSub) LookupPublication(name string) (*Publication, bool) {
 	return &out, true
 }
 
+// CreatePublicationDuringRecovery is the idempotent version of
+// CreatePublicationAsOwner used by the WAL-replay driver
+// (internal/initdb/pubsub_ddl_recovery.go). Unlike CreatePublicationAsOwner
+// it takes the OID from the WAL record (so the recovered publication
+// matches the pre-crash OID exactly) and overwrites rather than erroring
+// when a publication with the same name is already present (replay may see
+// the same record more than once across a partial-then-full replay).
+// Mirrors catalog.InMemory.CreateCollationDuringRecovery. DU-002
+// restart-persistence follow-up (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) CreatePublicationDuringRecovery(pub *Publication) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := *pub
+	out.Tables = append([]string(nil), pub.Tables...)
+	p.publications[pub.Name] = &out
+	if pub.OID >= p.nextOID {
+		p.nextOID = pub.OID + 1
+	}
+}
+
+// DropPublicationDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropPublication. Identical to DropPublication but
+// discards the found/not-found result — replay does not care whether the
+// publication was still present. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) DropPublicationDuringRecovery(name string) {
+	_ = p.DropPublication(name)
+}
+
+// SetPublicationOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetPublicationOwner, mirroring
+// DropPublicationDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) SetPublicationOwnerDuringRecovery(name string, owner uint32) {
+	_ = p.SetPublicationOwner(name, owner)
+}
+
 // Publications returns every publication in name order. Each
 // entry is a deep copy.
 func (p *PubSub) Publications() []*Publication {
@@ -212,9 +296,18 @@ func (p *PubSub) Publications() []*Publication {
 	return out
 }
 
-// CreateSubscription registers a new subscription. slotName
-// defaults to name when empty (matches upstream).
+// CreateSubscription registers a new subscription owned by the bootstrap
+// superuser. slotName defaults to name when empty (matches upstream).
+// Callers that know the connection's currently-effective role should use
+// CreateSubscriptionAsOwner instead.
 func (p *PubSub) CreateSubscription(name, conninfo string, publications []string, slotName string, enabled bool) (*Subscription, error) {
+	return p.CreateSubscriptionAsOwner(name, conninfo, publications, slotName, enabled, 10)
+}
+
+// CreateSubscriptionAsOwner is CreateSubscription with an explicit owner
+// OID — the role that issued CREATE SUBSCRIPTION, mirroring
+// Publication.Owner's same real-ownership convention. DU-002 slice 424.
+func (p *PubSub) CreateSubscriptionAsOwner(name, conninfo string, publications []string, slotName string, enabled bool, owner uint32) (*Subscription, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.subscriptions[name]; ok {
@@ -227,6 +320,7 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 		Name:         name,
 		OID:          p.nextOID,
 		Conninfo:     conninfo,
+		Owner:        owner,
 		Publications: append([]string(nil), publications...),
 		Enabled:      enabled,
 		SlotName:     slotName,
@@ -236,6 +330,21 @@ func (p *PubSub) CreateSubscription(name, conninfo string, publications []string
 	out := *sub
 	out.Publications = append([]string(nil), sub.Publications...)
 	return &out, nil
+}
+
+// SetSubscriptionOwner updates a subscription's owner OID. Returns
+// ErrSubscriptionNotFound when name is unknown. Backs ALTER SUBSCRIPTION name
+// OWNER TO newowner. DU-002 slice 425 (M0119-0004, loop #65 ledger
+// follow-up).
+func (p *PubSub) SetSubscriptionOwner(name string, owner uint32) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sub, ok := p.subscriptions[name]
+	if !ok {
+		return ErrSubscriptionNotFound
+	}
+	sub.Owner = owner
+	return nil
 }
 
 // DropSubscription removes a subscription. Returns
@@ -265,6 +374,39 @@ func (p *PubSub) LookupSubscription(name string) (*Subscription, bool) {
 	out := *sub
 	out.Publications = append([]string(nil), sub.Publications...)
 	return &out, true
+}
+
+// CreateSubscriptionDuringRecovery is the idempotent version of
+// CreateSubscriptionAsOwner used by the WAL-replay driver
+// (internal/initdb/pubsub_ddl_recovery.go). Mirrors
+// CreatePublicationDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) CreateSubscriptionDuringRecovery(sub *Subscription) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := *sub
+	out.Publications = append([]string(nil), sub.Publications...)
+	p.subscriptions[sub.Name] = &out
+	if sub.OID >= p.nextOID {
+		p.nextOID = sub.OID + 1
+	}
+}
+
+// DropSubscriptionDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropSubscription. Mirrors
+// DropPublicationDuringRecovery — also clears any tablesync rows for the
+// name, matching DropSubscription. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) DropSubscriptionDuringRecovery(name string) {
+	_ = p.DropSubscription(name)
+}
+
+// SetSubscriptionOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetSubscriptionOwner, mirroring
+// SetPublicationOwnerDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, loop #67 ledger resume point).
+func (p *PubSub) SetSubscriptionOwnerDuringRecovery(name string, owner uint32) {
+	_ = p.SetSubscriptionOwner(name, owner)
 }
 
 // Subscriptions returns every subscription in name order. Each

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -171,7 +172,6 @@ type BasicSession struct {
 	tx                  mvcc.Transaction
 	snap                mvcc.Snapshot
 	pendingDDL          []DDLUndoEntry             // DDL creates pending rollback
-	pendingRoutineDrops []*catalog.Routine         // routines dropped in current tx, for rollback
 	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
 	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
 	savepointDDLDrops   []DDLDropUndoEntry         // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
@@ -185,6 +185,10 @@ type BasicSession struct {
 	txFailed            bool                       // in_failed_sql_transaction (25P02)
 	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
 	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
+	deferredUniqChecks  []DeferredUniqueCheck      // INITIALLY DEFERRED UNIQUE/PK checks (0119-0004)
+	deferredExclChecks  []DeferredExclusionCheck   // INITIALLY DEFERRED EXCLUDE checks (0119-0004)
+	constraintsAllMode  int8                       // SET CONSTRAINTS ALL: 0 unset, 1 DEFERRED, 2 IMMEDIATE (0119-0004)
+	constraintDeferral  map[string]bool            // SET CONSTRAINTS <name>: per-constraint override (0119-0004)
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
 	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
 }
@@ -273,6 +277,12 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.currentSubXid = 0
 	s.txFailed = false
 	s.deferredFKChecks = nil
+	s.deferredUniqChecks = nil
+	s.deferredExclChecks = nil
+	// SET CONSTRAINTS settings last only for the current transaction (PG
+	// AfterTriggerEndXact resets the deferral state at every txn boundary). 0119-0004.
+	s.constraintsAllMode = 0
+	s.constraintDeferral = nil
 	s.activeQueryTables = nil
 	// Discard the per-transaction cumulative-stats snapshot — PG's AtEOXact_PgStat
 	// drops the stats snapshot at every transaction boundary so the next
@@ -315,6 +325,266 @@ func (s *BasicSession) TakeDeferredFKChecks() []DeferredFKCheck {
 	out := s.deferredFKChecks
 	s.deferredFKChecks = nil
 	return out
+}
+
+// SetConstraintsAll records `SET CONSTRAINTS ALL { DEFERRED | IMMEDIATE }` for
+// the current transaction. ALL supersedes any prior per-constraint overrides.
+// 0119-0004.
+func (s *BasicSession) SetConstraintsAll(deferred bool) {
+	if deferred {
+		s.constraintsAllMode = 1
+	} else {
+		s.constraintsAllMode = 2
+	}
+	s.constraintDeferral = nil
+}
+
+// SetConstraintsNamed records `SET CONSTRAINTS name [, ...] { DEFERRED |
+// IMMEDIATE }`. A per-name setting overrides the ALL mode for that constraint.
+// 0119-0004.
+func (s *BasicSession) SetConstraintsNamed(names []string, deferred bool) {
+	if s.constraintDeferral == nil {
+		s.constraintDeferral = make(map[string]bool)
+	}
+	for _, n := range names {
+		s.constraintDeferral[n] = deferred
+	}
+}
+
+// constraintDeferredByName resolves whether a DEFERRABLE constraint's check
+// should be deferred to COMMIT, honouring any in-effect SET CONSTRAINTS override
+// and the constraint's declared INITIALLY {DEFERRED|IMMEDIATE} default. A
+// per-name override wins over an ALL setting, which wins over the declared
+// default. The deferral state is constraint-kind-agnostic (PG's
+// AfterTriggerSetState applies equally to FK, UNIQUE and EXCLUDE constraints),
+// so FK and UNIQUE callers share it. 0119-0004.
+func (s *BasicSession) constraintDeferredByName(name string, initiallyDeferred bool) bool {
+	if name != "" && s.constraintDeferral != nil {
+		if v, ok := s.constraintDeferral[name]; ok {
+			return v
+		}
+	}
+	switch s.constraintsAllMode {
+	case 1:
+		return true
+	case 2:
+		return false
+	}
+	return initiallyDeferred
+}
+
+// FKConstraintDeferred reports whether a foreign-key constraint's check should
+// be deferred to COMMIT. Callers must have already established the constraint is
+// DEFERRABLE. 0119-0004.
+func (s *BasicSession) FKConstraintDeferred(name string, initiallyDeferred bool) bool {
+	return s.constraintDeferredByName(name, initiallyDeferred)
+}
+
+// UniqueConstraintDeferred reports whether a UNIQUE / PRIMARY KEY constraint's
+// uniqueness check should be deferred to COMMIT. Callers must have already
+// established the constraint is DEFERRABLE. 0119-0004 (deferred-unique).
+func (s *BasicSession) UniqueConstraintDeferred(name string, initiallyDeferred bool) bool {
+	return s.constraintDeferredByName(name, initiallyDeferred)
+}
+
+// ExclusionConstraintDeferred reports whether an EXCLUDE constraint's check
+// should be deferred to COMMIT. Callers must have already established the
+// constraint is DEFERRABLE. 0119-0004 (deferred-exclusion).
+func (s *BasicSession) ExclusionConstraintDeferred(name string, initiallyDeferred bool) bool {
+	return s.constraintDeferredByName(name, initiallyDeferred)
+}
+
+// ConstraintsOverrideActive reports whether a SET CONSTRAINTS override is in
+// effect for the current transaction (ALL mode set or any per-name override).
+// The simple-query COMMIT path uses this to decide whether to run the deferred
+// FK checks it would otherwise leave to the (bypassed) executor commit path:
+// commit-time enforcement is activated for SET CONSTRAINTS-controlled
+// deferrals, while a plain INITIALLY DEFERRED constraint keeps its existing
+// behaviour (whose concurrent/partitioned-parent snapshot semantics —
+// fk-snapshot — are a separate, pre-existing gap). 0119-0004.
+func (s *BasicSession) ConstraintsOverrideActive() bool {
+	return s.constraintsAllMode != 0 || len(s.constraintDeferral) > 0
+}
+
+// DeferredUniqueCheck records one UNIQUE / PRIMARY KEY constraint violation to
+// be re-verified at COMMIT time (a DEFERRABLE constraint deferred by INITIALLY
+// DEFERRED or by an in-effect SET CONSTRAINTS … DEFERRED). The encoded btree
+// Key identifies the candidate key whose uniqueness must hold once the
+// transaction's final row state is visible; Detail is the pre-rendered "Key
+// (...)=(...) already exists." text for the 23505 raised at COMMIT. 0119-0004.
+type DeferredUniqueCheck struct {
+	TableName string
+	IndexName string // == the UNIQUE/PK constraint name (SET CONSTRAINTS match key)
+	Key       []byte
+	// NNDKeyCols, when non-nil, marks a NULLS NOT DISTINCT check whose candidate
+	// has one or more NULL key columns: such a row has no btree Key (Key is nil),
+	// so the COMMIT recheck is a heap scan over the recorded NULL pattern instead
+	// of a btree RangeScan. nil for an ordinary (btree-keyed) deferred check.
+	// Design 0119-0004-deferred-unique-nnd.
+	NNDKeyCols []DeferredNNDKeyCol
+	Detail     string
+}
+
+// DeferredNNDKeyCol is one index key column's candidate value, captured at DML
+// time so a NULLS NOT DISTINCT deferred check can re-scan the heap at COMMIT
+// without holding live catalog/Row pointers across statements. Null records that
+// the candidate was NULL for this column; Key is the column's encoded btree key
+// when non-NULL (nil when Null). 0119-0004-deferred-unique-nnd.
+type DeferredNNDKeyCol struct {
+	ColName string
+	Null    bool
+	Key     []byte
+}
+
+// AddDeferredUniqueCheck queues a UNIQUE/PK constraint key to be re-verified at
+// COMMIT time. Deduplicates on (IndexName, Key, NNDKeyCols): one re-probe per
+// distinct candidate suffices — two distinct NULL patterns on the same NND index
+// (e.g. (null,1) and (null,2)) queue separately. 0119-0004.
+func (s *BasicSession) AddDeferredUniqueCheck(check DeferredUniqueCheck) {
+	for _, existing := range s.deferredUniqChecks {
+		if existing.IndexName == check.IndexName && bytes.Equal(existing.Key, check.Key) &&
+			sameNNDKeyCols(existing.NNDKeyCols, check.NNDKeyCols) {
+			return
+		}
+	}
+	s.deferredUniqChecks = append(s.deferredUniqChecks, check)
+}
+
+// sameNNDKeyCols reports whether two NND candidate NULL-pattern descriptors are
+// identical (same columns, NULL flags, and encoded non-NULL key bytes). Used to
+// dedup deferred NND unique checks. 0119-0004-deferred-unique-nnd.
+func sameNNDKeyCols(a, b []DeferredNNDKeyCol) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ColName != b[i].ColName || a[i].Null != b[i].Null || !bytes.Equal(a[i].Key, b[i].Key) {
+			return false
+		}
+	}
+	return true
+}
+
+// TakeDeferredUniqueChecks returns and clears the queued deferred UNIQUE/PK
+// checks. Called before TxnMgr.Commit on both commit paths. 0119-0004.
+func (s *BasicSession) TakeDeferredUniqueChecks() []DeferredUniqueCheck {
+	out := s.deferredUniqChecks
+	s.deferredUniqChecks = nil
+	return out
+}
+
+// TakeDeferredUniqueChecksMatching removes and returns the queued deferred
+// UNIQUE/PK checks made immediate by a `SET CONSTRAINTS … IMMEDIATE`, mirroring
+// TakeDeferredFKChecksMatching. The rest stay queued for COMMIT. 0119-0004.
+func (s *BasicSession) TakeDeferredUniqueChecksMatching(all bool, names []string) []DeferredUniqueCheck {
+	if all {
+		out := s.deferredUniqChecks
+		s.deferredUniqChecks = nil
+		return out
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var taken, kept []DeferredUniqueCheck
+	for _, c := range s.deferredUniqChecks {
+		if c.IndexName != "" && want[c.IndexName] {
+			taken = append(taken, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.deferredUniqChecks = kept
+	return taken
+}
+
+// DeferredExclusionCheck records one EXCLUDE constraint candidate to be
+// re-verified at COMMIT time (a DEFERRABLE constraint deferred by INITIALLY
+// DEFERRED or by an in-effect SET CONSTRAINTS … DEFERRED). For a `WITH =`
+// (btree) exclusion the encoded Key identifies the candidate key; for a
+// `USING gist … WITH &&` overlap exclusion BoxStr holds the candidate box text.
+// Detail is the pre-rendered "Key (...)=(...) conflicts with existing key
+// (...)=(...)." text for the 23P01 raised at COMMIT (built at recheck time for
+// the &&/overlap case, where the conflicting box is only known then). 0119-0004.
+type DeferredExclusionCheck struct {
+	TableName   string
+	IndexName   string // == the EXCLUDE constraint name (SET CONSTRAINTS match key)
+	ExclusionOp string // "=" (btree) or "&&" (gist overlap)
+	Key         []byte // encoded btree key for ExclusionOp == "="
+	BoxStr      string // candidate box text for ExclusionOp == "&&"
+	Detail      string
+}
+
+// AddDeferredExclusionCheck queues an EXCLUDE constraint candidate to be
+// re-verified at COMMIT time. Deduplicates on (IndexName, Key, BoxStr): one
+// re-probe per distinct candidate suffices. 0119-0004.
+func (s *BasicSession) AddDeferredExclusionCheck(check DeferredExclusionCheck) {
+	for _, existing := range s.deferredExclChecks {
+		if existing.IndexName == check.IndexName &&
+			bytes.Equal(existing.Key, check.Key) && existing.BoxStr == check.BoxStr {
+			return
+		}
+	}
+	s.deferredExclChecks = append(s.deferredExclChecks, check)
+}
+
+// TakeDeferredExclusionChecks returns and clears the queued deferred EXCLUDE
+// checks. Called before TxnMgr.Commit on both commit paths. 0119-0004.
+func (s *BasicSession) TakeDeferredExclusionChecks() []DeferredExclusionCheck {
+	out := s.deferredExclChecks
+	s.deferredExclChecks = nil
+	return out
+}
+
+// TakeDeferredExclusionChecksMatching removes and returns the queued deferred
+// EXCLUDE checks made immediate by a `SET CONSTRAINTS … IMMEDIATE`, mirroring
+// TakeDeferredUniqueChecksMatching. The rest stay queued for COMMIT. 0119-0004.
+func (s *BasicSession) TakeDeferredExclusionChecksMatching(all bool, names []string) []DeferredExclusionCheck {
+	if all {
+		out := s.deferredExclChecks
+		s.deferredExclChecks = nil
+		return out
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var taken, kept []DeferredExclusionCheck
+	for _, c := range s.deferredExclChecks {
+		if c.IndexName != "" && want[c.IndexName] {
+			taken = append(taken, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.deferredExclChecks = kept
+	return taken
+}
+
+// TakeDeferredFKChecksMatching removes and returns the queued deferred FK
+// checks affected by a `SET CONSTRAINTS … IMMEDIATE` so they can be run now.
+// When all is true every queued check is taken; otherwise only those whose FK
+// constraint name is in names. The rest stay queued for COMMIT. 0119-0004.
+func (s *BasicSession) TakeDeferredFKChecksMatching(all bool, names []string) []DeferredFKCheck {
+	if all {
+		out := s.deferredFKChecks
+		s.deferredFKChecks = nil
+		return out
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var taken, kept []DeferredFKCheck
+	for _, c := range s.deferredFKChecks {
+		if c.FK.Name != "" && want[c.FK.Name] {
+			taken = append(taken, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.deferredFKChecks = kept
+	return taken
 }
 
 // EffectiveWriterXID returns the XID to stamp on new heap tuples.
@@ -389,18 +659,6 @@ func (s *BasicSession) TakePendingDDLCreates() []DDLUndoEntry {
 	p := append([]DDLUndoEntry(nil), s.pendingDDL...)
 	s.pendingDDL = nil
 	return p
-}
-
-// AddPendingRoutineDrop records a routine drop for potential rollback.
-func (s *BasicSession) AddPendingRoutineDrop(r *catalog.Routine) {
-	s.pendingRoutineDrops = append(s.pendingRoutineDrops, r)
-}
-
-// TakePendingRoutineDrops returns and clears the pending routine drops.
-func (s *BasicSession) TakePendingRoutineDrops() []*catalog.Routine {
-	drops := s.pendingRoutineDrops
-	s.pendingRoutineDrops = nil
-	return drops
 }
 
 // RecordTruncate saves the before-image of a table (heap + indexes) so

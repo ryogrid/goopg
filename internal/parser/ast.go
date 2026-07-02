@@ -330,14 +330,69 @@ type CreateTriggerStmt struct {
 	Table      ObjectName
 	Timing     TriggerTiming
 	Events     []string // "insert", "update", "delete", "truncate"
-	ForEachRow bool     // true = ROW, false = STATEMENT
-	FuncName   ObjectName
-	FuncArgs   []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
+	// UpdateColumns is the optional column list of an `UPDATE OF col1, col2`
+	// trigger (a column-specific UPDATE trigger). Empty for every other form.
+	// DU-002 slice 326.
+	UpdateColumns []string
+	// IsConstraint marks a `CREATE CONSTRAINT TRIGGER`. Such triggers always fire
+	// AFTER, FOR EACH ROW, and carry a deferrability spec. Deferrable /
+	// InitDeferred capture `[NOT] DEFERRABLE [INITIALLY {IMMEDIATE|DEFERRED}]`
+	// (default: NOT DEFERRABLE INITIALLY IMMEDIATE). DU-002 slice 327.
+	IsConstraint bool
+	Deferrable   bool
+	InitDeferred bool
+	// OldTransitionTable / NewTransitionTable capture the REFERENCING clause's
+	// `OLD TABLE AS <name>` / `NEW TABLE AS <name>` transition-relation names
+	// (an AFTER trigger's statement-level row sets). Empty when absent. PG stores
+	// these in pg_trigger.tgoldtable / tgnewtable and pg_get_triggerdef emits
+	// `REFERENCING OLD TABLE AS … NEW TABLE AS …` between the ON-table name and
+	// FOR EACH ROW. goopg records them for dump fidelity only (the transition
+	// tables are not materialised for trigger execution). DU-002 slice 328.
+	OldTransitionTable string
+	NewTransitionTable string
+	ForEachRow         bool // true = ROW, false = STATEMENT
+	// WhenExpr is the parsed `WHEN (condition)` qualification — a boolean
+	// expression evaluated before the trigger fires, typically comparing
+	// OLD.<col>/NEW.<col> values. nil when absent. PG stores it as a serialized
+	// node tree in pg_trigger.tgqual and pg_get_triggerdef re-emits `WHEN (…)`
+	// between FOR EACH and EXECUTE FUNCTION with the OLD/NEW qualifiers preserved
+	// (lowercased). goopg records it for dump fidelity (the condition is not yet
+	// evaluated at trigger-firing time). DU-002 slice 329.
+	WhenExpr     Expr
+	FuncName     ObjectName
+	FuncArgs     []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.
 }
 
 func (s *CreateTriggerStmt) Pos() int  { return s.pos }
 func (s *CreateTriggerStmt) stmtNode() {}
+
+// CreateRuleStmt — `CREATE RULE name AS ON {INSERT|UPDATE|DELETE} TO table
+// DO [ALSO|INSTEAD] NOTHING`. goopg does NOT implement the query-rewrite system;
+// this node is produced ONLY for the unconditional DO-NOTHING form (no WHERE
+// qualification, no action command) so that such a rule round-trips through
+// pg_dump (pg_rewrite → pg_get_ruledef → dumpRule). Every other CREATE RULE
+// form (action commands, conditional WHERE, ON SELECT view rules) still parses
+// to a CompatNoopStmt, exactly as before. DU-002 slice 324.
+type CreateRuleStmt struct {
+	pos     int
+	Name    string
+	Event   string // "INSERT" | "UPDATE" | "DELETE"
+	Table   ObjectName
+	Instead bool // DO INSTEAD NOTHING (true) vs DO [ALSO] NOTHING (false)
+	// Qual is the optional WHERE qualification of a conditional DO-NOTHING rule
+	// (`ON UPDATE TO t WHERE (old.a <> new.a) DO INSTEAD NOTHING`), captured as a
+	// real expression AST so pg_get_ruledef can deparse it byte-identically to
+	// PostgreSQL. nil for the unconditional form. DU-002 slice 359.
+	Qual Expr
+	// RuleKind carries the COPY-DML rule-kind string the CompatNoop path would
+	// have recorded (e.g. "DO INSTEAD NOTHING", "DO ALSO"), so execCreateRule can
+	// register it identically via RegisterTableRuleKind.
+	RuleKind string
+}
+
+func (s *CreateRuleStmt) Pos() int  { return s.pos }
+func (s *CreateRuleStmt) stmtNode() {}
 
 // DropRuleStmt — `DROP RULE [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
 // Rules are not implemented; the executor emits "rule does not exist" always.
@@ -362,6 +417,37 @@ type DropTriggerStmt struct {
 
 func (s *DropTriggerStmt) Pos() int  { return s.pos }
 func (s *DropTriggerStmt) stmtNode() {}
+
+// CreatePolicyStmt — `CREATE POLICY name ON table [AS {PERMISSIVE|RESTRICTIVE}]
+// [FOR {ALL|SELECT|INSERT|UPDATE|DELETE}] [TO role [, ...]] [USING (expr)]
+// [WITH CHECK (expr)]`. Row-level security is NOT enforced by goopg's executor
+// (it has no RLS engine); CREATE POLICY exists so a row-security policy
+// round-trips through pg_dump (pg_policy → dumpPolicy). DU-002 slice 323.
+type CreatePolicyStmt struct {
+	pos        int
+	Name       string
+	Table      ObjectName
+	Permissive bool     // AS PERMISSIVE (default true) vs AS RESTRICTIVE
+	Command    string   // "all" | "select" | "insert" | "update" | "delete"
+	Roles      []string // TO role list; empty or contains "public" ⇒ PUBLIC
+	Using      Expr     // USING (expr); nil if absent
+	WithCheck  Expr     // WITH CHECK (expr); nil if absent
+}
+
+func (s *CreatePolicyStmt) Pos() int  { return s.pos }
+func (s *CreatePolicyStmt) stmtNode() {}
+
+// DropPolicyStmt — `DROP POLICY [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+// DU-002 slice 323.
+type DropPolicyStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	IfExists bool
+}
+
+func (s *DropPolicyStmt) Pos() int  { return s.pos }
+func (s *DropPolicyStmt) stmtNode() {}
 
 // ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
 // M0095-0008: no-op executor stub.  When a table name is provided the
@@ -464,6 +550,20 @@ type SetStmt struct {
 
 func (s *SetStmt) Pos() int  { return s.pos }
 func (s *SetStmt) stmtNode() {}
+
+// SetConstraintsStmt — `SET CONSTRAINTS { ALL | name [, ...] }
+// { DEFERRED | IMMEDIATE }`. Controls the check timing of DEFERRABLE
+// constraints for the current transaction. Deferred=true → DEFERRED. When All
+// is true Names is empty. 0119-0004 (M0119-0004).
+type SetConstraintsStmt struct {
+	pos      int
+	All      bool
+	Names    []string
+	Deferred bool
+}
+
+func (s *SetConstraintsStmt) Pos() int  { return s.pos }
+func (s *SetConstraintsStmt) stmtNode() {}
 
 // ResetStmt — `RESET name | RESET ALL`.
 type ResetStmt struct {
@@ -1012,6 +1112,17 @@ type ColumnDef struct {
 	// IdentityStart is the START WITH value from the sequence options clause, or 0
 	// to use the type-default start (1 for ascending sequences). M0097-0024.
 	IdentityStart int64
+	// IdentityIncrement/Min/Max/Cache hold the remaining sequence options from an
+	// identity column's `(sequence_options)` clause (nil = not given → type/PG
+	// default). IdentityCycle records the CYCLE flag. These thread to the backing
+	// sequence so pg_dump's `ADD GENERATED ... AS IDENTITY (...)` round-trips the
+	// non-default options (INCREMENT BY, MINVALUE, MAXVALUE, CACHE, CYCLE), not
+	// just START WITH. DU-002 (pg_dump 002–010).
+	IdentityIncrement *int64
+	IdentityMin       *int64
+	IdentityMax       *int64
+	IdentityCache     *int64
+	IdentityCycle     bool
 
 	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
 	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.
@@ -1024,8 +1135,17 @@ type ColumnDef struct {
 	RefColumns          []string // empty = use parent PK
 	OnDelete            FKAction
 	OnUpdate            FKAction
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of the FK's referencing columns (PG15 confdelsetcols). Empty = all
+	// columns. DU-002 slice 311.
+	OnDeleteSetCols     []string
 	FKDeferrable        bool
 	FKInitiallyDeferred bool
+	// FKMatchFull is true for an inline `REFERENCES … MATCH FULL` clause. MATCH
+	// SIMPLE (the default) and the unimplemented MATCH PARTIAL leave it false.
+	// Threaded into catalog.ForeignKey so pg_constraint.confmatchtype='f' and
+	// pg_get_constraintdef re-emit ` MATCH FULL`. DU-002 slice 309.
+	FKMatchFull bool
 
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
@@ -1058,6 +1178,15 @@ type ColumnDef struct {
 	// clause. goopg does not actually collate; this is recorded purely for
 	// pg_dump round-trip fidelity. DU-002 slice 188.
 	Collation string
+	// FDWOptions holds the raw `name value` pairs from a per-column
+	// `OPTIONS ( name 'value', … )` clause on a CREATE FOREIGN TABLE column
+	// (`c1 int OPTIONS (column_name 'col1')`), each normalized to
+	// "name=value" (matching scanFDWOptionsList's existing table/server-level
+	// output format). Threaded onto catalog.Column.FDWOptions so the
+	// synthesized pg_attribute row reports attfdwoptions and pg_dump re-emits
+	// `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN ... OPTIONS (...)`. Empty for
+	// every non-foreign-table column. DU-002 slice 418.
+	FDWOptions []string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -1087,6 +1216,13 @@ type TableConstraintDef struct {
 	// implemented (constraints are enforced per-row). DU-002 slice 140.
 	Deferrable        bool
 	InitiallyDeferred bool
+	// ExclusionWhere is the optional `WHERE (predicate)` of a partial EXCLUDE
+	// constraint (`EXCLUDE USING method (col WITH op) WHERE (pred)`, PG partial
+	// exclusion). nil when absent. Threads onto the backing index's
+	// catalog.Index.Predicate/PredicateString so pg_get_constraintdef /
+	// pg_dump re-emit ` WHERE (pred)` (pg_get_indexdef_worker, ruleutils.c:1564)
+	// and the restored constraint stays partial. DU-002 slice 310.
+	ExclusionWhere Expr
 }
 
 // TableForeignKeyDef describes a table-level FOREIGN KEY constraint, e.g.
@@ -1100,8 +1236,14 @@ type TableForeignKeyDef struct {
 	RefColumns        []string   // referenced columns; empty = referenced table's PK
 	OnDelete          FKAction   // referential action for ON DELETE (default NO ACTION)
 	OnUpdate          FKAction   // referential action for ON UPDATE (default NO ACTION)
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of Columns (PG15 confdelsetcols); empty = all columns. DU-002 slice 311.
+	OnDeleteSetCols   []string
 	Deferrable        bool
 	InitiallyDeferred bool
+	// MatchFull is true for `… MATCH FULL`; MATCH SIMPLE (default) leaves it
+	// false. Threaded into catalog.ForeignKey for confmatchtype round-trip. DU-002 slice 309.
+	MatchFull bool
 }
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
@@ -1135,6 +1277,11 @@ type CreateTableStmt struct {
 	// M0096-0009 will use these; for now the field is populated so the
 	// syntax is accepted and the executor can create the child table.
 	Inherits []ObjectName
+	// OfType is non-nil for a typed table `CREATE TABLE name OF type_name`.
+	// The table's columns are derived from the named composite type and
+	// pg_class.reloftype is set to the type's OID, so pg_dump re-emits the
+	// `OF type_name` form (suppressing the column list). DU-002 slice 374.
+	OfType *ObjectName
 	// ColumnAliases holds the optional column-name list from
 	// `CREATE TABLE name (col1, col2, …) AS SELECT …`. When non-nil its
 	// length must not exceed the number of columns the SELECT returns; alias
@@ -1217,6 +1364,14 @@ type CreateTableStmt struct {
 	// Each element is either a column name (for explicit columns) or
 	// "@@LIKE:schema.table" (for LIKE source_table clauses). M0097-0069.
 	BodyOrder []string
+	// ForeignServer holds the SERVER name from
+	// `CREATE FOREIGN TABLE name (cols) SERVER srv [OPTIONS (...)]`. Empty for
+	// an ordinary (non-foreign) table. DU-002 slice 417.
+	ForeignServer string
+	// ForeignOptions holds the table-level OPTIONS as "name=value" elements —
+	// the on-disk pg_foreign_table.ftoptions text[] representation pg_dump's
+	// getTables reads via pg_options_to_table. DU-002 slice 417.
+	ForeignOptions []string
 }
 
 func (s *CreateTableStmt) Pos() int  { return s.pos }
@@ -1379,6 +1534,16 @@ type CreateIndexStmt struct {
 type IndexColOrder struct {
 	Descending bool
 	NullsFirst bool
+	// OpClass is the explicit per-column operator class name (e.g.
+	// "text_pattern_ops"), empty when the column uses its type's default
+	// operator class. Mirrors pg_index.indclass so pg_get_indexdef can re-emit a
+	// non-default opclass after the column (ruleutils.c get_opclass_name).
+	OpClass string
+	// Collation is the explicit per-column collation name (e.g. "C"), empty when
+	// the column uses its type's default collation. Mirrors pg_index.indcollation
+	// so pg_get_indexdef can re-emit a non-default COLLATE clause after the
+	// column and before the opclass (ruleutils.c, generate_collation_name).
+	Collation string
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1433,6 +1598,54 @@ type CreateExtensionStmt struct {
 
 func (s *CreateExtensionStmt) Pos() int  { return s.pos }
 func (s *CreateExtensionStmt) stmtNode() {}
+
+// CreateCollationStmt — `CREATE COLLATION [IF NOT EXISTS] name (option = value [, ...])`
+// or `CREATE COLLATION name FROM existing_collation`. goopg records the user
+// collation in the runtime pg_collation registry so pg_dump's getCollations /
+// dumpCollation re-emit `CREATE COLLATION <schema>.<name> (provider = …, …)`.
+// Only the schema-dump round-trip is modeled — the collation is not used for
+// actual string ordering. Mirrors gram.y's DefineStmt for OBJECT_COLLATION.
+// DU-002 (M0119-0004).
+type CreateCollationStmt struct {
+	pos         int
+	Name        ObjectName
+	IfNotExists bool
+	// Option clauses (empty string = unset). LOCALE sets both LcCollate and
+	// LcCtype when they are not given explicitly.
+	Provider      string // "libc" | "icu" | "builtin"; "" → libc default
+	Locale        string
+	LcCollate     string
+	LcCtype       string
+	Deterministic string // "true" | "false" | "" (unset → deterministic)
+	Rules         string // ICU tailoring rules (provider = icu only); "" → unset
+	// FROM existing_collation form: copy attributes from an existing collation.
+	FromName ObjectName
+}
+
+func (s *CreateCollationStmt) Pos() int  { return s.pos }
+func (s *CreateCollationStmt) stmtNode() {}
+
+// AlterCollationStmt — `ALTER COLLATION [IF EXISTS] name RENAME TO newname`,
+// `... OWNER TO {newowner | CURRENT_USER | SESSION_USER | CURRENT_ROLE}`, or
+// `... REFRESH VERSION`. Action is one of "rename"/"owner"/"refresh"; any
+// other trailing form (e.g. SET SCHEMA) parses with Action == "" and is a
+// no-op, mirroring AlterStatisticsStmt's unmodelled-form handling so the
+// statement never fails to parse. goopg's collation registry has no real
+// ICU/glibc binding to version, so REFRESH VERSION always reports "version
+// has not changed" (the same NOTICE PG emits when get_collation_actual_version
+// can't detect a version, e.g. non-glibc libc) and performs no catalog write.
+// M0119-0004 (DU-002, loop #50 ledger follow-up).
+type AlterCollationStmt struct {
+	pos      int
+	Name     ObjectName
+	IfExists bool
+	Action   string // "rename" | "owner" | "refresh" | "" (unmodelled, no-op)
+	NewName  string // for Action == "rename"
+	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+}
+
+func (s *AlterCollationStmt) Pos() int  { return s.pos }
+func (s *AlterCollationStmt) stmtNode() {}
 
 // CreateTablespaceStmt — `CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opts)]`.
 // goopg supports only the developer/regression-test in-place form (empty LOCATION
@@ -1527,6 +1740,26 @@ type CreateViewStmt struct {
 	// pg_get_viewdef can echo it for pg_dump. Empty if the source text was
 	// unavailable to the parser.
 	RawDef string
+	// CheckOption captures the trailing `WITH [CASCADED|LOCAL] CHECK OPTION`
+	// clause: "cascaded" (the default when the qualifier is omitted), "local",
+	// or "" when no CHECK OPTION clause was given. PostgreSQL stores this as the
+	// `check_option=<mode>` pg_class.reloption, which pg_dump re-emits as the
+	// `WITH <MODE> CHECK OPTION` view-definition suffix. M0119-0004 DU-002 slice 365.
+	CheckOption string
+	// SecurityBarrier captures a pre-AS `WITH (security_barrier = <bool>)` view
+	// storage option: non-nil when the option was specified, pointing at the
+	// parsed boolean. PostgreSQL stores it as the `security_barrier=<bool>`
+	// pg_class.reloption; unlike check_option, pg_dump's getTables keeps it in
+	// the reloptions array and re-emits it as the `WITH (security_barrier='true')`
+	// clause after the view name. M0119-0004 DU-002 slice 366.
+	SecurityBarrier *bool
+	// SecurityInvoker captures a pre-AS `WITH (security_invoker = <bool>)` view
+	// storage option: non-nil when the option was specified, pointing at the
+	// parsed boolean. PostgreSQL stores it as the `security_invoker=<bool>`
+	// pg_class.reloption; like security_barrier, pg_dump's getTables keeps it in
+	// the reloptions array and re-emits it as the `WITH (security_invoker='true')`
+	// clause after the view name. M0119-0004 DU-002 slice 367.
+	SecurityInvoker *bool
 }
 
 func (s *CreateViewStmt) Pos() int  { return s.pos }
@@ -1592,22 +1825,27 @@ type DropCompatStmt struct {
 	UsingMethod string
 	// CastTypes holds [fromType, toType] for DROP CAST (fromType AS toType). M0097-0071.
 	CastTypes []string
+	// TransformType / TransformLang hold the `FOR <type> LANGUAGE <lang>` pair
+	// for DROP TRANSFORM. DU-002 (M0119-0004).
+	TransformType string
+	TransformLang string
 }
 
 // CreateAggregateStmt is a minimal representation of CREATE AGGREGATE used to
 // validate that the basetype (input type) is specified.  Full aggregate
 // implementation is out of scope; we just reject missing basetype. M0097-regress.
 type CreateAggregateStmt struct {
-	pos         int
-	Name        ObjectName
-	HasBaseType bool
-	BaseType    string // e.g. "int4"
-	Variadic    bool   // true when declared with VARIADIC arg (variadic agg)
-	SType       string // state type (e.g. "int4")
-	SFunc       string // state transition function name
-	FinalFunc   string // final function name
-	CombineFunc string // combine function name (for parallel aggregation)
-	InitCond    string // initial condition string (e.g. "0" or "{0,0}")
+	pos             int
+	Name            ObjectName
+	HasBaseType     bool
+	BaseType        string // e.g. "int4"
+	Variadic        bool   // true when declared with VARIADIC arg (variadic agg)
+	SType           string // state type (e.g. "int4")
+	SFunc           string // state transition function name
+	FinalFunc       string // final function name
+	CombineFunc     string // combine function name (for parallel aggregation)
+	InitCond        string // initial condition string (e.g. "0" or "{0,0}")
+	FinalFuncModify string // FINALFUNC_MODIFY: "read_only"/"shareable"/"read_write" (lower-cased, "" if unspecified)
 }
 
 func (s *CreateAggregateStmt) Pos() int  { return s.pos }
@@ -1624,19 +1862,112 @@ type AlterAggregateRenameStmt struct {
 func (s *AlterAggregateRenameStmt) Pos() int  { return s.pos }
 func (s *AlterAggregateRenameStmt) stmtNode() {}
 
-// CreateOpClassStmt is a minimal representation of CREATE OPERATOR CLASS used
-// to register custom hash support functions for hash partitioning. M0097-0027.
-// We only capture the FUNCTION 2 (hash extended) entry; everything else is
-// accepted-and-discarded so the statement doesn't produce a parse error.
+// AlterAggregateOwnerStmt changes a user-defined aggregate's owner. M0119-0004
+// (DU-002, loop #57 ledger follow-up).
+// ALTER AGGREGATE name(argtype_list) OWNER TO { new_owner | CURRENT_ROLE |
+// CURRENT_USER | SESSION_USER }
+type AlterAggregateOwnerStmt struct {
+	pos      int
+	Name     ObjectName
+	NewOwner string // "current_user" sentinel resolves to the invoking role, mirrors AlterCollationStmt
+}
+
+func (s *AlterAggregateOwnerStmt) Pos() int  { return s.pos }
+func (s *AlterAggregateOwnerStmt) stmtNode() {}
+
+// CreateOpClassStmt models CREATE OPERATOR CLASS name [DEFAULT] FOR TYPE
+// type USING method [FAMILY family_name] AS entry [, entry ...]. Originally
+// captured only the FUNCTION 2 (hash extended) entry for hash partitioning
+// (M0097-0027); DU-002 (M0119-0004) extended it to populate a real
+// pg_opclass row for pg_dump round-tripping, and then (slice 411) to capture
+// every OPERATOR/FUNCTION entry as an OpClassMember feeding the
+// pg_amop/pg_amproc + pg_depend member store.
 type CreateOpClassStmt struct {
 	pos          int
+	Schema       string // schema qualifier, "" = search_path default
 	Name         string // operator class name
+	IsDefault    bool   // DEFAULT keyword present
 	ForType      string // e.g. "int4", "text"
+	Method       string // access method name, e.g. "btree", "hash"
+	FamilySchema string // explicit FAMILY clause schema, "" if unqualified or FAMILY omitted
+	FamilyName   string // explicit FAMILY clause name, "" if the FAMILY clause was omitted (auto-create)
+	StorageType  string // STORAGE entry type name, "" if not specified
 	HashFuncName string // name of the FUNCTION 2 (hash extended) routine
+	Members      []OpClassMember // every OPERATOR/FUNCTION entry, including FUNCTION 2
 }
 
 func (s *CreateOpClassStmt) Pos() int  { return s.pos }
 func (s *CreateOpClassStmt) stmtNode() {}
+
+// AlterOpFamilyAddStmt models the ADD form of ALTER OPERATOR FAMILY name
+// USING method ADD entry [, entry ...] — the "loose member" statement that
+// attaches OPERATOR/FUNCTION entries directly to an existing operator
+// family without an owning opclass (opclasscmds.c AlterOpFamilyAdd).
+// Members reuse OpClassMember; the grammar's opclass_item production allows
+// a STORAGE entry but AlterOpFamilyAdd itself rejects one with a syntax
+// error ("STORAGE cannot be specified in ALTER OPERATOR FAMILY") — not
+// modeled here since no fixture needs it. DU-002 (M0119-0004).
+type AlterOpFamilyAddStmt struct {
+	pos     int
+	Schema  string // family name's schema qualifier, "" if unqualified
+	Name    string // family name
+	Method  string // access method name, e.g. "btree"
+	Members []OpClassMember
+}
+
+func (s *AlterOpFamilyAddStmt) Pos() int  { return s.pos }
+func (s *AlterOpFamilyAddStmt) stmtNode() {}
+
+// AlterOpFamilyDropStmt models the DROP form of ALTER OPERATOR FAMILY name
+// USING method DROP entry [, entry ...] — removes a loose OPERATOR/FUNCTION
+// entry from an existing operator family (opclasscmds.c AlterOpFamilyDrop).
+// Unlike the ADD form's opclass_item grammar, opclass_drop requires a bare
+// mandatory strategy/support NUMBER plus a mandatory parenthesized
+// (lefttype[, righttype]) pair — no operator/function name at all, since the
+// member is identified purely by its (family, strategy-or-procnum, lefttype,
+// righttype) key (gram.y opclass_drop). Members reuse OpClassMember, leaving
+// Name/Schema/HasExplicitArgTypes/SortFamily* at their zero values. DU-002
+// (M0119-0004).
+type AlterOpFamilyDropStmt struct {
+	pos     int
+	Schema  string // family name's schema qualifier, "" if unqualified
+	Name    string // family name
+	Method  string // access method name, e.g. "btree"
+	Members []OpClassMember
+}
+
+func (s *AlterOpFamilyDropStmt) Pos() int  { return s.pos }
+func (s *AlterOpFamilyDropStmt) stmtNode() {}
+
+// OpClassMember models one OPERATOR or FUNCTION entry in a CREATE OPERATOR
+// CLASS ... AS list (opclasscmds.c's OpFamilyMember, narrowed to what
+// goopg's compat shim can resolve — see execCreateOpClass). LeftType/
+// RightType are the explicit operand/arg types the grammar allows
+// (operator_with_argtypes / FUNCTION num '(' type_list ')'); both empty
+// means PG would default them from the resolved operator/function's own
+// signature (assignOperTypes/assignProcTypes, opclasscmds.c) — resolved at
+// exec time, not by the parser. DU-002 (M0119-0004) slice 411.
+type OpClassMember struct {
+	IsFunction       bool   // true = FUNCTION entry, false = OPERATOR entry
+	Number           int    // strategy number (OPERATOR) or support number (FUNCTION)
+	Schema           string // operator/function name's schema qualifier, "" if unqualified
+	Name             string // operator symbol or function name
+	LeftType         string // explicit lefttype, "" if unspecified
+	RightType        string // explicit righttype, "" if unspecified (or the operator is unary)
+	SortFamilySchema string // OPERATOR ... FOR ORDER BY family's schema qualifier, "" if unqualified or absent
+	SortFamilyName   string // OPERATOR ... FOR ORDER BY family name, "" if this is a FOR SEARCH (or bare) OPERATOR entry
+	// HasExplicitArgTypes records whether a parenthesized (lefttype[,
+	// righttype]) form followed the OPERATOR entry's name. CREATE OPERATOR
+	// CLASS's own AS list treats an omitted pair as "default from the
+	// resolved operator's own signature" (assignOperTypes); ALTER OPERATOR
+	// FAMILY ... ADD instead requires it and raises a syntax error otherwise
+	// (opclasscmds.c AlterOpFamilyAdd: "operator argument types must be
+	// specified in ALTER OPERATOR FAMILY") — checked at exec time
+	// (execAlterOpFamilyAdd), not by the parser, mirroring PG's own phase
+	// (the check lives in the DDL command handler, not gram.y). DU-002
+	// (M0119-0004).
+	HasExplicitArgTypes bool
+}
 
 // DoStmt represents DO $$ body $$ — an anonymous PL/pgSQL block. M0097-0003.
 type DoStmt struct {
@@ -1673,6 +2004,200 @@ type CompatNoopStmt struct {
 	// (ALTER TABLE ADD PRIMARY KEY setting relhasindex) waits on it. Empty when the
 	// grant targets a non-table object class. Design 0118-0109 (intra-grant-inplace).
 	TableACL string
+	// TypeACL is set for a GRANT/REVOKE … ON TYPE|DOMAIN … statement. Unlike the
+	// table/schema/function object classes — whose catalogs goopg serves
+	// *virtually*, so the server records the ACL change before the executor — the
+	// pg_type catalog is heap-backed (PG18-standby basebackup parity, M0097-0022),
+	// so a USAGE GRANT/REVOKE must re-sync the real pg_type heap row, which needs
+	// an *executor.Context. The parser captures the parsed clause here so the
+	// executor (execCompatNoop) can update the OID-keyed ACL store and re-sync the
+	// heap row. Nil for every other object class. M0119-0004-ACLHEAP.
+	TypeACL *TypeACLChange
+	// AttrACL is set for a column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON
+	// [TABLE] <name> …`. Column privileges live in pg_attribute.attacl, which is
+	// heap-backed exactly like pg_type.typacl, so the change must update the
+	// OID+attnum-keyed ACL store AND re-sync the real pg_attribute heap row — work
+	// that needs an *executor.Context. The parser captures the parsed clause here
+	// so the executor (execCompatNoop → execAttrACLChange) can apply it. Nil for a
+	// table-level (whole-relation) GRANT. M0119-0004-ACLHEAP (attacl half).
+	AttrACL *AttrACLChange
+	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
+	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
+	// executor stores them in the catalog's foreign-server registry so pg_dump
+	// re-emits the OPTIONS clause from pg_foreign_server.srvoptions. Nil when the
+	// statement carries no OPTIONS. DU-002 slice 378.
+	Options []string
+	// FDWOptionChanges carries a verb-tagged `ALTER FOREIGN DATA WRAPPER name
+	// OPTIONS ([ADD|SET|DROP] name ['value'], …)` clause (Tag == "ALTER",
+	// ObjType == "foreign-data wrapper"). Unlike the flat CREATE-time Options
+	// above, ALTER merges onto the existing pg_foreign_data_wrapper.fdwoptions
+	// via applyFDWOptionChanges, mirroring the identical ALTER FOREIGN TABLE
+	// ... OPTIONS (...) mechanism. Nil for every other CompatNoopStmt use.
+	// DU-002 slice 421.
+	FDWOptionChanges []FDWOptionChange
+	// ServerType / ServerVersion carry the TYPE 'x' / VERSION 'y' clauses of a
+	// CREATE SERVER statement. They round-trip through pg_foreign_server.srvtype /
+	// srvversion so pg_dump's dumpForeignServer re-emits the TYPE/VERSION clauses.
+	// Empty when the clause is absent. DU-002 slice 381.
+	ServerType    string
+	ServerVersion string
+	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
+	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
+	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
+	// "f" function (WITH FUNCTION). The executor records them in the catalog cast
+	// registry so pg_dump's getCasts/dumpCast re-emit the CREATE CAST. Empty when
+	// the statement is not a CREATE CAST. DU-002 slice 395.
+	CastContext string
+	CastMethod  string
+	// CastFuncName / CastFuncArgs carry a `WITH FUNCTION fn[(argtypes)]` clause's
+	// referenced function name and explicit argument-type list (empty when the
+	// cast is WITHOUT FUNCTION / WITH INOUT, or when the function form omits the
+	// parenthesised arg list). The executor resolves these to the function's
+	// pg_proc OID and stores it as pg_cast.castfunc so dumpCast's
+	// findFuncByOid succeeds and re-emits `WITH FUNCTION <ns>.<sig>`. DU-002 slice 397.
+	CastFuncName ObjectName
+	CastFuncArgs []string
+	// ConvForEncoding / ConvToEncoding carry a CREATE [DEFAULT] CONVERSION
+	// statement's source and destination encoding names (the `FOR 'x' TO 'y'`
+	// string literals, e.g. "UTF8", "LATIN1"). ConvFuncName is the conversion
+	// function named by the `FROM funcname` clause. ConvDefault is true for
+	// CREATE DEFAULT CONVERSION. The executor resolves the encoding names to
+	// pg_enc IDs and records them in the catalog conversion registry so pg_dump's
+	// getConversions / dumpConversion re-emit the statement. Empty when the
+	// statement is not a CREATE CONVERSION. DU-002 slice 399.
+	ConvForEncoding string
+	ConvToEncoding  string
+	ConvFuncName    ObjectName
+	ConvDefault     bool
+	// TransformType / TransformLang carry a CREATE TRANSFORM statement's
+	// `FOR <type>` and `LANGUAGE <lang>` clauses. TransformFromFunc /
+	// TransformFromArgs and TransformToFunc / TransformToArgs carry the `FROM
+	// SQL WITH FUNCTION fn[(argtypes)]` / `TO SQL WITH FUNCTION fn[(argtypes)]`
+	// clauses (Name empty when that half is absent — PG allows either or both,
+	// in either order). The executor resolves the function names to pg_proc
+	// OIDs and records the transform in the catalog registry so pg_dump's
+	// getTransforms / dumpTransform re-emit the statement. Empty when the
+	// statement is not a CREATE TRANSFORM. DU-002 (M0119-0004).
+	TransformType     string
+	TransformLang     string
+	TransformFromFunc ObjectName
+	TransformFromArgs []string
+	TransformToFunc   ObjectName
+	TransformToArgs   []string
+	// OpFuncName carries a CREATE OPERATOR statement's `FUNCTION = funcname` (or
+	// `PROCEDURE = funcname`, an accepted synonym — operatorcmds.c treats them
+	// identically) clause. Unlike CAST/TRANSFORM's WITH FUNCTION, PG's
+	// operator_def_arg grammar allows only a bare (optionally schema-qualified)
+	// name here — no parenthesised arg-type list — since the function's
+	// signature is inferred from LEFTARG/RIGHTARG, not declared explicitly. The
+	// executor resolves it to a pg_proc OID (catalog.LookupBuiltinProc /
+	// Routines()) and records it as pg_operator.oprcode so pg_dump's
+	// getOperators/dumpOpr re-emit `FUNCTION = <name>`. Zero value (empty Name)
+	// when the statement is not a CREATE OPERATOR or the FUNCTION clause could
+	// not be parsed. DU-002 (M0119-0004).
+	OpFuncName ObjectName
+	// OpCommutatorName / OpNegatorName carry a CREATE OPERATOR statement's
+	// COMMUTATOR = / NEGATOR = clauses: a reference to another operator,
+	// either a bare (optionally schema-qualified) operator symbol or
+	// pg_dump's emitted `OPERATOR(schema.op)` form. OpRestrictFuncName /
+	// OpJoinFuncName carry the RESTRICT = / JOIN = clauses — a bare
+	// (optionally schema-qualified) function name, mirroring OpFuncName.
+	// OpCanMerge / OpCanHash carry the bare MERGES / HASHES flags. Zero
+	// value (empty Name / false) when the corresponding clause is absent.
+	// The executor resolves the operator references via a two-pass
+	// forward-reference scheme mirroring PG's OperatorShellMake/OperatorUpd
+	// (pg_operator.c) since COMMUTATOR/NEGATOR may name an operator that
+	// does not exist yet. DU-002 slice 407.
+	OpCommutatorName   ObjectName
+	OpNegatorName      ObjectName
+	OpRestrictFuncName ObjectName
+	OpJoinFuncName     ObjectName
+	OpCanMerge         bool
+	OpCanHash          bool
+	// OpFamilyMethod carries a CREATE OPERATOR FAMILY statement's `USING
+	// index_method` clause (e.g. "btree"). The executor resolves it to a
+	// pg_am OID (catalog.AccessMethodOIDByName) and records the family in the
+	// catalog operator-family registry so pg_dump's getOpfamilies/
+	// dumpOpfamily re-emit `CREATE OPERATOR FAMILY name USING method;`. Empty
+	// when the statement is not a CREATE OPERATOR FAMILY. DU-002 (M0119-0004).
+	OpFamilyMethod string
+}
+
+// AlterOperatorSetStmt — `ALTER OPERATOR name (left_type, right_type) SET
+// (option = value [, ...])`, PG's post-creation attribute-edit form
+// (AlterOperator, operatorcmds.c). Only RESTRICT/JOIN may be changed freely,
+// including removal via `= NONE`; COMMUTATOR/NEGATOR/MERGES/HASHES may only
+// be set if not already set (a no-op re-statement of the same value is
+// allowed). LEFTARG/RIGHTARG/FUNCTION/PROCEDURE are immutable after CREATE
+// and raise a syntax error if named. M0119-0004 (DU-002), closes the
+// slice-407 ledger follow-up (`0119-0004-create-operator-roundtrip.md`).
+type AlterOperatorSetStmt struct {
+	pos       int
+	Name      ObjectName
+	LeftType  string // "" for NONE/absent (unary operator lookup)
+	RightType string
+	// Restrict/Join carry the RESTRICT=/JOIN= selectivity estimator function
+	// name; *Set distinguishes "clause given" from "not mentioned" — a bare
+	// clause or explicit `= NONE` leaves the ObjectName zero-valued, which the
+	// executor treats as clearing the estimator.
+	Restrict    ObjectName
+	RestrictSet bool
+	Join        ObjectName
+	JoinSet     bool
+	// Commutator/Negator carry the COMMUTATOR=/NEGATOR= operator reference.
+	Commutator    ObjectName
+	CommutatorSet bool
+	Negator       ObjectName
+	NegatorSet    bool
+	// Merges/Hashes carry the bare-or-`=bool` MERGES/HASHES flags; nil = not
+	// mentioned in the SET list.
+	Merges *bool
+	Hashes *bool
+}
+
+func (s *AlterOperatorSetStmt) Pos() int  { return s.pos }
+func (s *AlterOperatorSetStmt) stmtNode() {}
+
+// TypeACLChange carries the parsed pieces of a GRANT/REVOKE … ON TYPE|DOMAIN …
+// statement so the executor can update the OID-keyed ACL store and re-sync the
+// heap-backed pg_type row. A type's acldefault('T', owner) grants USAGE to BOTH
+// the owner and PUBLIC (structurally identical to the function EXECUTE default),
+// so the executor seeds those implicit entries exactly as recordFunctionGrant
+// does for proacl before applying the grantee change. M0119-0004-ACLHEAP.
+type TypeACLChange struct {
+	Revoke          bool     // true for REVOKE, false for GRANT
+	IsDomain        bool     // ON DOMAIN (vs ON TYPE); both resolve to pg_type
+	Privileges      []string // upper-cased privilege keywords; "ALL" left unexpanded
+	TypeNames       []ObjectName
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+}
+
+// ColumnPrivilege pairs a single column-grantable privilege keyword with the
+// parenthesised column list it applies to, e.g. `SELECT (a, b)`. PostgreSQL's
+// column-grant grammar attaches an independent column list to each privilege
+// (`GRANT SELECT (a), UPDATE (b) ON …`), so a column GRANT carries a slice of
+// these. The privilege is upper-cased; "ALL"/"ALL PRIVILEGES" is left
+// unexpanded for the executor to fan out to INSERT/SELECT/UPDATE/REFERENCES.
+// M0119-0004-ACLHEAP (attacl half).
+type ColumnPrivilege struct {
+	Privilege string   // "SELECT" | "INSERT" | "UPDATE" | "REFERENCES" | "ALL" | "ALL PRIVILEGES"
+	Columns   []string // unquoted column names the privilege applies to
+}
+
+// AttrACLChange carries the parsed pieces of a column-level GRANT/REVOKE —
+// `GRANT <priv>(<cols>) ON [TABLE] <name> TO <roles>` — so the executor can
+// update the (relOID, attnum)-keyed column ACL store and re-sync the heap-backed
+// pg_attribute.attacl. Unlike a type, a column has NO acldefault('c', owner)
+// entry, so attacl is NULL until the first column GRANT and returns to NULL once
+// the last privilege is revoked (no implicit owner/PUBLIC seeding).
+// M0119-0004-ACLHEAP (attacl half).
+type AttrACLChange struct {
+	Revoke          bool              // true for REVOKE, false for GRANT
+	Privileges      []ColumnPrivilege // per-privilege column lists (≥1)
+	TableNames      []ObjectName      // relation(s) after ON [TABLE]
+	Grantees        []string          // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool              // GRANT … WITH GRANT OPTION
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }
@@ -1691,6 +2216,8 @@ type CommentOnStmt struct {
 	ObjName     ObjectName    // table/index name, or table for constraint/column, or routine name for function
 	SubName     string        // column name (ObjKind=column) or constraint name (ObjKind=constraint)
 	Args        []FunctionArg // routine argument signature (ObjKind=function); nil for all other kinds
+	CastSource  string        // cast source type (ObjKind=cast); resolved to castsource OID at exec time
+	CastTarget  string        // cast target type (ObjKind=cast); resolved to casttarget OID at exec time
 	Description string        // comment text; empty string = IS NULL (delete comment)
 }
 
@@ -1703,10 +2230,49 @@ type CreateStatisticsStmt struct {
 	Name        ObjectName // statistics object name (possibly schema-qualified)
 	FromTable   ObjectName // the table the statistics are defined on
 	IfNotExists bool
+	// Kinds holds the explicitly-requested statistics kinds from the optional
+	// `(ndistinct, dependencies, mcv)` clause, lowercased. Empty means the
+	// default (all kinds), matching PG which stores all three when unspecified.
+	// pg_get_statisticsobjdef re-emits the clause only when not all kinds are
+	// enabled. DU-002 slice 314.
+	Kinds []string
+	// Columns holds the simple column names from the `ON a, b` list. DU-002 slice 314.
+	Columns []string
+	// Exprs holds the parsed expression targets from the ON list (`ON (a + b)`),
+	// in order. The executor deparses them for pg_get_statisticsobjdef so an
+	// expression-statistics object round-trips through pg_dump. DU-002 slice 316.
+	Exprs []Expr
+	// HasExpr reports that the ON list contained a non-simple-column target (an
+	// expression). When set but Exprs is empty the expression could not be parsed
+	// (tolerant fallback), so the dump path declines to reconstruct the object.
+	HasExpr bool
 }
 
 func (s *CreateStatisticsStmt) Pos() int  { return s.pos }
 func (s *CreateStatisticsStmt) stmtNode() {}
+
+// AlterStatisticsStmt represents `ALTER STATISTICS name SET STATISTICS n`. The
+// statistics target governs the sample size used for the extended-statistics
+// object; PG stores it in pg_statistic_ext.stxstattarget. Only the SET
+// STATISTICS form is modelled — other ALTER STATISTICS forms (RENAME / OWNER TO
+// / SET SCHEMA) parse to this node with HasTarget=false and are no-ops. The
+// value round-trips through pg_dump (dumpStatisticsExt emits the ALTER whenever
+// stxstattarget >= 0). DU-002 slice 317.
+type AlterStatisticsStmt struct {
+	pos      int
+	Name     ObjectName // statistics object name (possibly schema-qualified)
+	IfExists bool
+	// Target is the new statistics target. A negative value (-1) resets the
+	// object to the default (PG stores stxstattarget=NULL). Only meaningful when
+	// HasTarget is set.
+	Target int
+	// HasTarget reports the statement carried a SET STATISTICS clause (vs an
+	// unmodelled ALTER STATISTICS form parsed as a no-op).
+	HasTarget bool
+}
+
+func (s *AlterStatisticsStmt) Pos() int  { return s.pos }
+func (s *AlterStatisticsStmt) stmtNode() {}
 
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
@@ -1774,6 +2340,79 @@ type DropSubscriptionStmt struct {
 
 func (s *DropSubscriptionStmt) Pos() int  { return s.pos }
 func (s *DropSubscriptionStmt) stmtNode() {}
+
+// AlterPublicationOwnerStmt — `ALTER PUBLICATION name OWNER TO { new_owner |
+// CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER PUBLICATION
+// form goopg models (RENAME TO / SET / ADD|DROP|SET TABLE fall through to the
+// generic compatibility no-op). M0119-0004 (DU-002, loop #65 ledger
+// follow-up).
+type AlterPublicationOwnerStmt struct {
+	pos      int
+	Name     string
+	NewOwner string // "current_user" sentinel resolves to the invoking role, mirrors AlterCollationStmt
+}
+
+func (s *AlterPublicationOwnerStmt) Pos() int  { return s.pos }
+func (s *AlterPublicationOwnerStmt) stmtNode() {}
+
+// AlterSubscriptionOwnerStmt — `ALTER SUBSCRIPTION name OWNER TO { new_owner |
+// CURRENT_ROLE | CURRENT_USER | SESSION_USER }`. The only ALTER SUBSCRIPTION
+// form goopg models (RENAME TO / SET / SKIP fall through to the generic
+// compatibility no-op). M0119-0004 (DU-002, loop #65 ledger follow-up).
+type AlterSubscriptionOwnerStmt struct {
+	pos      int
+	Name     string
+	NewOwner string // "current_user" sentinel resolves to the invoking role, mirrors AlterCollationStmt
+}
+
+func (s *AlterSubscriptionOwnerStmt) Pos() int  { return s.pos }
+func (s *AlterSubscriptionOwnerStmt) stmtNode() {}
+
+// CreateEventTriggerStmt — `CREATE EVENT TRIGGER name ON event
+//
+//	[WHEN filtervar IN (value [, ...]) [AND filtervar IN (value [, ...])]]
+//	EXECUTE {FUNCTION|PROCEDURE} funcname()`.
+//
+// goopg never fires event triggers (no DDL hook invokes evtfoid) — this only
+// round-trips the DDL through pg_dump (pg_event_trigger virtual view →
+// getEventTriggers/dumpEventTrigger). DU-002 (M0119-0004). DROP EVENT TRIGGER
+// reuses the generic DropCompatStmt (see execDropCompat's "event trigger" case).
+type CreateEventTriggerStmt struct {
+	pos   int
+	Name  string
+	Event string
+	// FilterVar is the WHEN clause's filter-variable name ("tag" is the only
+	// one PostgreSQL recognises today); "" if there is no WHEN clause.
+	FilterVar string
+	Tags      []string // WHEN <FilterVar> IN (...) values, unquoted
+	FuncName  ObjectName
+}
+
+func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }
+func (s *CreateEventTriggerStmt) stmtNode() {}
+
+// AlterEventTriggerStmt — one of:
+//
+//	ALTER EVENT TRIGGER name DISABLE
+//	ALTER EVENT TRIGGER name ENABLE [REPLICA|ALWAYS]
+//	ALTER EVENT TRIGGER name RENAME TO new_name
+//	ALTER EVENT TRIGGER name OWNER TO { new_owner | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
+//
+// mirroring AlterPublicationOwnerStmt/AlterSubscriptionOwnerStmt's scope: the
+// only ALTER EVENT TRIGGER forms goopg models. DU-002 (M0119-0004, loop #69
+// ledger follow-up).
+type AlterEventTriggerStmt struct {
+	pos  int
+	Name string
+	// Action selects which field below is populated: "enable", "enable_replica",
+	// "enable_always", "disable", "rename", "owner".
+	Action   string
+	NewName  string // Action == "rename"
+	NewOwner string // Action == "owner"; "current_user" sentinel mirrors AlterPublicationOwnerStmt
+}
+
+func (s *AlterEventTriggerStmt) Pos() int  { return s.pos }
+func (s *AlterEventTriggerStmt) stmtNode() {}
 
 // TruncateStmt — `TRUNCATE [TABLE] name [, …] [CASCADE|RESTRICT]`.
 type TruncateStmt struct {
@@ -1919,7 +2558,94 @@ const (
 	// so it does not conflict with concurrent reads or writes. ConstraintName
 	// holds the constraint name. M0118-0008 (alter-table-1 isolation spec).
 	AlterTableValidateConstraint
+	// AlterTableReplicaIdentity — `REPLICA IDENTITY { DEFAULT | FULL | NOTHING |
+	// USING INDEX name }`. Records the table's replica-identity mode on
+	// catalog.Table.ReplicaIdentity so pg_class.relreplident round-trips through
+	// pg_dump (which emits `ALTER TABLE ONLY ... REPLICA IDENTITY {FULL|NOTHING}`
+	// when relreplident != 'd', pg_dump.c dumpTableSchema). goopg has no logical
+	// replication — this is dump-fidelity only, like SET STORAGE/COMPRESSION.
+	// ReplicaIdentityMode holds the single-char code ('d'/'f'/'n'/'i');
+	// ReplicaIdentityIndex holds the index name for the USING INDEX form.
+	// DU-002 slice 305.
+	AlterTableReplicaIdentity
+	// AlterTableClusterOn — `CLUSTER ON index_name`. Marks the named index as
+	// the table's clustering index (pg_index.indisclustered), clearing the flag
+	// on every other index (mark_index_clustered, cluster.c). This is the exact
+	// form pg_dump EMITS for a clustered table (`ALTER TABLE <t> CLUSTER ON
+	// <idx>`, pg_dump.c dumpIndex/dumpConstraint), so goopg must accept it to
+	// restore its own dumps. The plain `CLUSTER <t> USING <idx>` statement form
+	// (ClusterStmt) records the same selection. ClusterIndexName holds the index
+	// name. DU-002 slice 321.
+	AlterTableClusterOn
+	// AlterTableSetWithoutCluster — `SET WITHOUT CLUSTER`. Clears the table's
+	// clustering selection: every index's pg_index.indisclustered is reset to
+	// false (tablecmds.c ATExecSetWithoutCluster). DU-002 slice 321.
+	AlterTableSetWithoutCluster
+	// AlterTableEnableRowSecurity — `ENABLE ROW LEVEL SECURITY`. Sets
+	// pg_class.relrowsecurity true (tablecmds.c ATExecEnableRowSecurity). pg_dump
+	// emits `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;` for any table whose
+	// relrowsecurity is set (pg_dump.c getPolicies represents an RLS-enabled table
+	// by a PolicyInfo with a null polname). DU-002 slice 322.
+	AlterTableEnableRowSecurity
+	// AlterTableDisableRowSecurity — `DISABLE ROW LEVEL SECURITY`. Resets
+	// pg_class.relrowsecurity to false. The inverse of ENABLE. DU-002 slice 322.
+	AlterTableDisableRowSecurity
+	// AlterTableForceRowSecurity — `FORCE ROW LEVEL SECURITY`. Sets
+	// pg_class.relforcerowsecurity true, making RLS policies apply to the table
+	// owner too. pg_dump emits `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;`
+	// whenever relforcerowsecurity is set (pg_dump.c dumpTableSchema). DU-002 slice 322.
+	AlterTableForceRowSecurity
+	// AlterTableNoForceRowSecurity — `NO FORCE ROW LEVEL SECURITY`. Resets
+	// pg_class.relforcerowsecurity to false. The inverse of FORCE. DU-002 slice 322.
+	AlterTableNoForceRowSecurity
+	// AlterTableEnableDisableRule — `{ENABLE | DISABLE} [REPLICA | ALWAYS] RULE
+	// name`. Sets pg_rewrite.ev_enabled for the named rule (ATExecEnableDisableRule,
+	// tablecmds.c): ENABLE→'O' (origin), DISABLE→'D', ENABLE REPLICA→'R', ENABLE
+	// ALWAYS→'A'. goopg implements no query rewrite, so this only records the flag
+	// for schema fidelity: pg_dump's dumpRule re-emits `ALTER TABLE <t>
+	// {ENABLE ALWAYS|ENABLE REPLICA|DISABLE} RULE <name>;` for any rule whose
+	// ev_enabled is not 'O' (pg_dump.c). RuleName names the target rule and
+	// RuleEnabledState carries the ev_enabled char. DU-002 slice 325.
+	AlterTableEnableDisableRule
+	// AlterTableAlterColumnOptions — `ALTER FOREIGN TABLE ... ALTER COLUMN
+	// col OPTIONS ( [ADD|SET|DROP] name ['value'], … )`. Mirrors PG's
+	// AT_AlterColumnGenericOptions (tablecmds.c ATExecAlterColumnGenericOptions),
+	// which merges the verb-tagged option list onto pg_attribute.attfdwoptions
+	// via transformGenericOptions (foreigncmds.c). FDWOptionChanges carries the
+	// parsed verb list; ColumnName names the target column. Only meaningful on
+	// a foreign table's columns — the executor rejects a plain table.
+	// DU-002 slice 419.
+	AlterTableAlterColumnOptions
+	// AlterTableSetForeignOptions — `ALTER FOREIGN TABLE ... OPTIONS
+	// ( [ADD|SET|DROP] name ['value'], … )` — the table-level counterpart of
+	// AlterTableAlterColumnOptions (no ALTER COLUMN prefix). Mirrors PG's
+	// AT_GenericOptions (tablecmds.c ATExecGenericOptions), which merges the
+	// verb-tagged option list onto pg_foreign_table.ftoptions via
+	// transformGenericOptions (foreigncmds.c). FDWOptionChanges carries the
+	// parsed verb list. Only meaningful on a foreign table — the executor
+	// rejects a plain table. DU-002 slice 420.
+	AlterTableSetForeignOptions
 )
+
+// FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
+// list with the action PostgreSQL's DefElemAction assigns it (gram.y's
+// alter_generic_option_elem): a bare `name 'value'` defaults to Add.
+type FDWOptionVerb byte
+
+const (
+	FDWOptionAdd  FDWOptionVerb = 'a'
+	FDWOptionSet  FDWOptionVerb = 's'
+	FDWOptionDrop FDWOptionVerb = 'd'
+)
+
+// FDWOptionChange is one verb-tagged entry of an ALTER FOREIGN TABLE ALTER
+// COLUMN OPTIONS (...) clause. Value is empty for FDWOptionDrop, which takes
+// no value in PG's grammar (`DROP generic_option_name`).
+type FDWOptionChange struct {
+	Verb  FDWOptionVerb
+	Name  string
+	Value string
+}
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
 // ADD [CONSTRAINT name] PRIMARY KEY (cols) shape pgbench emits, the
@@ -1940,7 +2666,11 @@ type AlterTableAction struct {
 	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
 	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
-	NotValid   bool     // true if `NOT VALID` (skip validation of existing rows)
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of Columns (PG15 confdelsetcols); empty = all columns. DU-002 slice 311.
+	OnDeleteSetCols []string
+	NotValid        bool // true if `NOT VALID` (skip validation of existing rows)
+	MatchFull       bool // true if `MATCH FULL`; MATCH SIMPLE (default) leaves it false. DU-002 slice 309.
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.
@@ -1975,6 +2705,15 @@ type AlterTableAction struct {
 	// CompressionType is the TOAST compression method for AlterTableSetCompression.
 	// Values: "pglz", "lz4". DU-002 slice 183.
 	CompressionType string
+	// ReplicaIdentityMode is the single-char relreplident code for
+	// AlterTableReplicaIdentity: 'd' (DEFAULT), 'f' (FULL), 'n' (NOTHING),
+	// 'i' (USING INDEX). ReplicaIdentityIndex names the index for the 'i' form.
+	// DU-002 slice 305.
+	ReplicaIdentityMode  string
+	ReplicaIdentityIndex string
+	// ClusterIndexName is the index named in `CLUSTER ON index_name` for
+	// AlterTableClusterOn. DU-002 slice 321.
+	ClusterIndexName string
 	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
@@ -2004,6 +2743,20 @@ type AlterTableAction struct {
 	// detach semantics can branch on it. The executor currently performs a
 	// synchronous detach regardless. M0118-0008.
 	DetachConcurrently bool
+
+	// RuleName is the target rule name for AlterTableEnableDisableRule
+	// (`{ENABLE|DISABLE} [REPLICA|ALWAYS] RULE name`). DU-002 slice 325.
+	RuleName string
+	// RuleEnabledState is the pg_rewrite.ev_enabled char set by
+	// AlterTableEnableDisableRule: 'O' (ENABLE / origin), 'D' (DISABLE),
+	// 'R' (ENABLE REPLICA), 'A' (ENABLE ALWAYS). DU-002 slice 325.
+	RuleEnabledState byte
+	// FDWOptionChanges holds the verb-tagged OPTIONS (...) list for
+	// AlterTableAlterColumnOptions (`ALTER FOREIGN TABLE ... ALTER COLUMN
+	// col OPTIONS (...)`, ColumnName names the target column) and for
+	// AlterTableSetForeignOptions (`ALTER FOREIGN TABLE ... OPTIONS (...)`,
+	// table-level, ColumnName unused). DU-002 slice 419/420.
+	FDWOptionChanges []FDWOptionChange
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
@@ -2376,20 +3129,29 @@ type CreateDomainStmt struct {
 	Schema        string
 	BaseType      string  // base type name
 	BaseTypeArgs  []int64 // base-type modifier args: varchar(20)→[20], numeric(10,2)→[10,2]. DU-002 slice 95.
-	NotNull       bool
-	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
-	Default       Expr     // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
-	// CheckExpr holds the raw SQL text of a generic (non-IN) domain CHECK
-	// expression, e.g. `VALUE > 0`. CheckName is the explicit CONSTRAINT name
-	// when one is given, "" for the auto-generated `<domain>_check`. The
-	// `CHECK (VALUE IN (...))` form is kept separately in CheckInValues (its
-	// ANY/ARRAY deparse is not yet rendered). DU-002 slice 96.
-	CheckExpr string
-	CheckName string
+	NotNull      bool
+	Default      Expr // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
+	// Checks holds every CHECK constraint clause in declaration order. PG records
+	// each as a separate pg_constraint row (contype='c') and pg_dump re-emits them
+	// `ORDER BY conname`. A domain may carry several CHECKs, so this replaced the
+	// former single CheckExpr/CheckName/CheckInValues fields. DU-002 slice 385
+	// (multi-CHECK; single-CHECK was slices 96/97).
+	Checks []DomainCheckClause
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }
 func (s *CreateDomainStmt) stmtNode() {}
+
+// DomainCheckClause is one CHECK constraint parsed from a CREATE DOMAIN. Each
+// becomes a separate pg_constraint row. Name is the explicit CONSTRAINT name
+// ("" → auto-generated `<domain>_check`[N]). Exactly one of Expr / InValues is
+// set: Expr is the raw generic predicate text (e.g. `VALUE > 0`); InValues holds
+// the allowed values from the `CHECK (VALUE IN (...))` form. DU-002 slice 385.
+type DomainCheckClause struct {
+	Name     string
+	Expr     string
+	InValues []string
+}
 
 // DropDomainStmt — DROP DOMAIN [IF EXISTS] name [CASCADE|RESTRICT]. M0097-0017.
 type DropDomainStmt struct {

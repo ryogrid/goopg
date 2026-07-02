@@ -291,22 +291,23 @@ func TestPgSubscriptionViewRendersRows(t *testing.T) {
 	}
 	row := rows[0]
 	// oid, subdbid, subname, subowner, subenabled, subbinary,
-	// substream, subtwophasestate, subdisableonerr, subconninfo,
-	// subslotname, subsynccommit, subpublications.
+	// substream, subtwophasestate, subdisableonerr, subpasswordrequired,
+	// subrunasowner, suborigin, subfailover, subconninfo, subslotname,
+	// subsynccommit, subpublications.
 	if row[2] != "s1" {
 		t.Errorf("subname=%q want s1", row[2])
 	}
 	if row[4] != "t" {
 		t.Errorf("subenabled=%q want t", row[4])
 	}
-	if row[9] != "host=remote dbname=app" {
-		t.Errorf("subconninfo=%q", row[9])
+	if row[13] != "host=remote dbname=app" {
+		t.Errorf("subconninfo=%q", row[13])
 	}
-	if row[10] != "s1" {
-		t.Errorf("subslotname=%q want s1 (default to name)", row[10])
+	if row[14] != "s1" {
+		t.Errorf("subslotname=%q want s1 (default to name)", row[14])
 	}
-	if row[12] != "{p1}" {
-		t.Errorf("subpublications=%q want {p1}", row[12])
+	if row[16] != "{p1}" {
+		t.Errorf("subpublications=%q want {p1}", row[16])
 	}
 }
 

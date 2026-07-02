@@ -100,7 +100,13 @@ stays `defer`. Tracked in the deferral ledger; next slice.
 Also still deferred (no behaviour change this slice): making the UPDATE / DELETE
 **conflict-wait** multixact-aware so a *conflicting* lock-only locker is waited
 for rather than dropped by the plain stamp (today an unwaited conflicting locker
-is dropped — the pre-existing behaviour).
+is dropped — the pre-existing behaviour). **Update (2026-07-01, [[0119-0009]]):**
+this was largely already true by the time it was written — `waitForConflictingRowLock`
+(M0118-0003) covers `updateViaIndex`/`updateOp.Next`/`deleteOp.Next` — but it was
+never wired at the sibling sites listed above (§3): `updateWithFrom`,
+`deleteWithUsing`, `mergeApplyUpdate`/`mergeApplyDelete`, `upsertOp.applyUpdate`.
+Closed in [[0119-0009]]; see that doc for the residual gaps (NND arbiter path,
+`scanMatching`'s non-conflict-aware block).
 
 ## Verification
 

@@ -799,6 +799,69 @@ type seqScanOp struct {
 	// enumTypes[i] is non-nil when cols[i] is a user-defined enum type.
 	// Used to convert KindString heap datums to KindEnum for correct ORDER BY. M0097-enum.
 	enumTypes []*catalog.EnumType
+
+	// typeACLCat / typeACLColIdx / typeACLOidIdx drive the pg_type.typacl
+	// heap-decode override (M0119-0004-ACLHEAP). pg_type is heap-backed for
+	// PG18-standby basebackup parity, and a USAGE GRANT/REVOKE stores typacl as
+	// a PG-native _aclitem binary blob (decoded to KindBytes by
+	// decodePhysicalPGValueMctx). When scanning pg_type this hook renders that
+	// blob to canonical aclitemout text — resolving grantee/grantor OIDs back to
+	// role names via the catalog — so a goopg-served `SELECT typacl FROM pg_type`
+	// (pg_dump's getTypes) reads the same text pg_class.relacl projects virtually.
+	// typeACLColIdx is -1 for every non-pg_type scan (the common case → no-op).
+	typeACLCat    *catalog.InMemory
+	typeACLColIdx int
+	typeACLOidIdx int
+
+	// attrACLCat / attrACLColIdx drive the pg_attribute.attacl heap-decode override
+	// (M0119-0004-ACLHEAP, attacl half) — the column analogue of the typacl hook
+	// above. A column GRANT/REVOKE stores attacl as a PG-native _aclitem binary blob
+	// (KindBytes); when scanning pg_attribute this hook renders it to canonical
+	// aclitemout text so pg_dump's getTableAttrs reads the granted column ACL.
+	// attrACLColIdx is -1 for every non-pg_attribute scan (the common case → no-op).
+	attrACLCat    *catalog.InMemory
+	attrACLColIdx int
+}
+
+// renderHeapACLColumnInto renders a heap-backed ACL column — pg_type.typacl or
+// pg_attribute.attacl, stored as a PG-native _aclitem blob (KindBytes) — to
+// canonical aclitemout text in place. The seqScanOp.Next() hot path renders these
+// inline with a pre-resolved column index; this shared variant covers the
+// index-scan path so pg_dump reads the same text regardless of which plan a
+// catalog query picks (getTypes seq-scans pg_type; getColumnACLs index-scans
+// pg_attribute by attrelid). A no-op for non-catalog tables, a non-InMemory
+// catalog, and a NULL ACL column. M0119-0004-ACLHEAP.
+func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []catalog.Column, row Row) {
+	if tbl == nil {
+		return
+	}
+	var aclName string
+	switch tbl.OID {
+	case catalog.TypeRelationId:
+		aclName = "typacl"
+	case catalog.AttributeRelationId:
+		aclName = "attacl"
+	default:
+		return
+	}
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	for i := range cols {
+		if i >= len(row) {
+			return
+		}
+		if cols[i].Name != aclName {
+			continue
+		}
+		if d := row[i]; d.Kind == KindBytes {
+			if txt, err := decodeAclItemArrayText(d.BytesValue(), im.RoleNameForOID); err == nil {
+				row[i] = NewStringDatum(txt)
+			}
+		}
+		return
+	}
 }
 
 // seqScanLookahead is the number of blocks ahead of the current
@@ -970,6 +1033,45 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		for i, col := range o.cols {
 			if et, isEnum := im.LookupEnum(col.Type.Name); isEnum {
 				o.enumTypes[i] = et
+			}
+		}
+	}
+	// M0119-0004-ACLHEAP: arm the pg_type.typacl heap-decode override only when
+	// scanning the heap-backed pg_type catalog. Resolved once here (column
+	// positions are stable) so Next() does a single bool/index check per row.
+	o.typeACLColIdx = -1
+	o.typeACLOidIdx = -1
+	if o.tbl != nil && o.tbl.OID == catalog.TypeRelationId {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for i, col := range o.cols {
+				switch col.Name {
+				case "typacl":
+					o.typeACLColIdx = i
+				case "oid":
+					o.typeACLOidIdx = i
+				}
+			}
+			if o.typeACLColIdx >= 0 && o.typeACLOidIdx >= 0 {
+				o.typeACLCat = im
+			}
+		}
+	}
+	// M0119-0004-ACLHEAP (attacl half): arm the pg_attribute.attacl heap-decode
+	// override only when scanning the heap-backed pg_attribute catalog. Resolved
+	// once here (column positions are stable) so Next() does a single bool/index
+	// check per row. The blob is written by a column GRANT/REVOKE (execAttrACLChange
+	// → resyncAttrACLHeapRow) and rendered back to canonical aclitemout text here.
+	o.attrACLColIdx = -1
+	if o.tbl != nil && o.tbl.OID == catalog.AttributeRelationId {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for i, col := range o.cols {
+				if col.Name == "attacl" {
+					o.attrACLColIdx = i
+					break
+				}
+			}
+			if o.attrACLColIdx >= 0 {
+				o.attrACLCat = im
 			}
 		}
 	}
@@ -1424,6 +1526,30 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			if o.pinned != nil {
 				o.pinned.RUnlock()
 			}
+			// M0119-0004-ACLHEAP: render the heap-backed pg_type.typacl blob
+			// (KindBytes _aclitem ArrayType, written by a USAGE GRANT/REVOKE)
+			// to canonical aclitemout text, resolving grantee/grantor OIDs back
+			// to role names via the catalog. row was deep-copied by
+			// cloneRowOwned above, so this post-RUnlock mutation is safe. Dormant
+			// for an unpopulated (NULL) typacl and every non-pg_type scan (-1).
+			if o.typeACLColIdx >= 0 && o.typeACLColIdx < len(row) {
+				if d := row[o.typeACLColIdx]; d.Kind == KindBytes {
+					if txt, derr := decodeAclItemArrayText(d.BytesValue(), o.typeACLCat.RoleNameForOID); derr == nil {
+						row[o.typeACLColIdx] = NewStringDatum(txt)
+					}
+				}
+			}
+			// M0119-0004-ACLHEAP (attacl half): the sibling pg_attribute.attacl
+			// render — same KindBytes _aclitem decode, written by a column
+			// GRANT/REVOKE. Dormant for a NULL attacl and every non-pg_attribute
+			// scan (-1).
+			if o.attrACLColIdx >= 0 && o.attrACLColIdx < len(row) {
+				if d := row[o.attrACLColIdx]; d.Kind == KindBytes {
+					if txt, derr := decodeAclItemArrayText(d.BytesValue(), o.attrACLCat.RoleNameForOID); derr == nil {
+						row[o.attrACLColIdx] = NewStringDatum(txt)
+					}
+				}
+			}
 			// M0115-0004: write HeapXminCommitted to the on-page infomask.
 			// Acquire WLock briefly; o.pinned pin prevents eviction between
 			// RUnlock and Lock. The write is not WAL-logged (re-derived on
@@ -1654,35 +1780,8 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// in the INSERT), call nextval on the implicit sequence. An explicit NULL
 		// (column in INSERT target list but value is NULL) must NOT trigger
 		// auto-generation — it falls through to the NOT NULL check below.
-		for i, col := range cols {
-			// Skip: already has a value, or was explicitly supplied (even as NULL).
-			if !row[i].IsNull() || !insertMissing[i] {
-				continue
-			}
-			seqName := ""
-			switch strings.ToLower(col.Type.Name) {
-			case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
-				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-				// If the standard tablename_colname_seq was renamed, look up by ownership.
-				if LookupSequence(seqName) == nil {
-					if owned := FindSequenceOwnedBy(strings.ToLower(o.plan.Table.Name) + "." + strings.ToLower(col.Name)); owned != "" {
-						seqName = owned
-					}
-				}
-			default:
-				if col.IdentityColumn {
-					seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-				}
-			}
-			if seqName == "" {
-				continue
-			}
-			seqArgs := []Datum{NewStringDatum(seqName)}
-			v, err := evalNextval(seqArgs, o.ctx)
-			if err == nil && !v.IsNull() {
-				row[i] = v
-			}
-		}
+		// Shared with the upsert (INSERT ... ON CONFLICT) sibling path (root-0020).
+		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, cols, row, insertMissing)
 
 		// Integer range enforcement: coerce explicitly-provided int values to
 		// the column's declared type (catches smallint/int4 out-of-range and
@@ -5338,6 +5437,12 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	// pu.rel    = relation where the new row is written (destination; may differ on cross-partition move).
 	// pu.tgtCols = columns of the destination relation. M0097-0078, M0100-0010.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	// Classify once so the write-path wait (below) matches how a locker
+	// decoded it, mirroring updateViaIndex/updateOp.Next (M0119-0009).
+	updReqStatusFrom := multixact.StatusNoKeyUpdate
+	if !hotEligible {
+		updReqStatusFrom = multixact.StatusUpdate
+	}
 	fksToRecheckFrom := o.childFKsToRecheck()
 	seen := make(map[[2]uint64]bool)
 	for _, pu := range pending {
@@ -5358,6 +5463,16 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			continue // already updated by an earlier FROM match
 		}
 		seen[key] = true
+
+		// Honour a row lock propagated forward onto this live version by
+		// heap_lock_updated_tuple before writing: wait for every still-active
+		// foreign holder whose strength conflicts with this UPDATE (M0118-0003
+		// write-path wait, wired here for UPDATE...FROM sibling-path parity —
+		// M0119-0009; the plain updateViaIndex/updateOp.Next paths already had
+		// this, updateWithFrom did not).
+		if err := waitForConflictingRowLock(o.ctx, puSrcRel, pu.blk, pu.slot, updReqStatusFrom, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 
 		// Fire BEFORE UPDATE triggers.
 		if len(o.plan.Table.Triggers) > 0 {
@@ -5722,6 +5837,15 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if vRel == (storage.RelFileNode{}) {
 			vRel = rel
 		}
+		// Honour a row lock propagated forward onto this live version before
+		// writing (M0118-0003 write-path wait, wired here for DELETE...USING
+		// sibling-path parity — M0119-0009; the plain deleteOp.Next path
+		// already had this, deleteWithUsing did not). DELETE is always
+		// StatusUpdate — conflicts with every lock strength.
+		if err := waitForConflictingRowLock(o.ctx, vRel, v.blk, v.slot, multixact.StatusUpdate, o.plan.Pos()); err != nil {
+			return nil, err
+		}
+
 		// Fire BEFORE DELETE triggers and enforce FK constraints.
 		if len(tbl.Triggers) > 0 {
 			_, ok, err := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
@@ -6325,18 +6449,36 @@ func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
 // callers only consume the boolean. Mirrors the heap-scan pattern of
 // checkGistOverlapExclusion. Design 0119-0004.
 func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row, rel storage.RelFileNode) (storage.ItemPointer, bool) {
-	// Resolve, per index key column: the candidate NULL-ness / encoded key and
-	// the tbl.Columns ordinal used to read the decoded existing row.
-	type nndKeyCol struct {
-		tblOrd   int
-		col      *catalog.Column
-		candNull bool
-		candKey  []byte // encoded candidate key (nil when candNull)
+	keyCols, ok := resolveNNDKeyColsFromRow(tbl, idx, cols, row)
+	if !ok {
+		return storage.ItemPointer{}, false
 	}
+	// Immediate check: the candidate row is not yet inserted, so the FIRST live
+	// matching tuple is the duplicate (stopAt=1).
+	count, ptr := scanNNDLiveMatches(ctx, tbl, rel, keyCols, 1)
+	return ptr, count >= 1
+}
+
+// nndKeyCol is one resolved index key column for a NULLS NOT DISTINCT heap scan:
+// the candidate's NULL-ness / encoded key plus the tbl.Columns ordinal used to
+// read the decoded existing row. 0119-0004 (lifted to package scope for the
+// deferred recheck path, 0119-0004-deferred-unique-nnd).
+type nndKeyCol struct {
+	tblOrd   int
+	col      *catalog.Column
+	candNull bool
+	candKey  []byte // encoded candidate key (nil when candNull)
+}
+
+// resolveNNDKeyColsFromRow builds the per-key-column descriptors for an NND heap
+// scan from a live candidate Row + its column layout. Returns ok=false on a
+// structural problem (expression key column, missing column, encode failure) so
+// the caller falls back to skipping the NND check. 0119-0004-deferred-unique-nnd.
+func resolveNNDKeyColsFromRow(tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row) ([]nndKeyCol, bool) {
 	keyCols := make([]nndKeyCol, 0, len(idx.Columns))
 	for _, idxColName := range idx.Columns {
 		if idxColName == "" {
-			return storage.ItemPointer{}, false // expression NND index — out of scope
+			return nil, false // expression NND index — out of scope
 		}
 		var candVal Datum
 		foundCand := false
@@ -6347,33 +6489,48 @@ func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *cat
 				break
 			}
 		}
-		tblOrd := -1
-		var col *catalog.Column
-		for j := range tbl.Columns {
-			if strings.EqualFold(tbl.Columns[j].Name, idxColName) {
-				tblOrd = j
-				col = &tbl.Columns[j]
-				break
-			}
-		}
+		tblOrd, col := nndTableColumn(tbl, idxColName)
 		if !foundCand || tblOrd < 0 || col == nil {
-			return storage.ItemPointer{}, false
+			return nil, false
 		}
 		kc := nndKeyCol{tblOrd: tblOrd, col: col, candNull: candVal.IsNull()}
 		if !kc.candNull {
 			enc, eerr := encodeBTreeKeyForColumn(candVal, col, 0)
 			if eerr != nil {
-				return storage.ItemPointer{}, false
+				return nil, false
 			}
 			kc.candKey = enc
 		}
 		keyCols = append(keyCols, kc)
 	}
+	return keyCols, true
+}
 
+// nndTableColumn resolves an index key column name to its tbl.Columns ordinal
+// and *catalog.Column (case-insensitive), or (-1, nil) if absent.
+func nndTableColumn(tbl *catalog.Table, name string) (int, *catalog.Column) {
+	for j := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[j].Name, name) {
+			return j, &tbl.Columns[j]
+		}
+	}
+	return -1, nil
+}
+
+// scanNNDLiveMatches seq-scans rel and counts live heap tuples whose index key
+// columns match keyCols' NULL pattern + non-NULL encoded key bytes (NULL equals
+// NULL, a non-NULL column compares byte-equal under its index encoding). It stops
+// early once the count reaches stopAt. Returns the count and the first match's
+// ItemPointer. Shared by the immediate NND check (stopAt=1: any match is a dup)
+// and the deferred-at-COMMIT recheck (stopAt=2: the candidate row is itself one
+// match, so ≥2 is the violation). 0119-0004-deferred-unique-nnd.
+func scanNNDLiveMatches(ctx *Context, tbl *catalog.Table, rel storage.RelFileNode, keyCols []nndKeyCol, stopAt int) (int, storage.ItemPointer) {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
-		return storage.ItemPointer{}, false
+		return 0, storage.ItemPointer{}
 	}
+	matches := 0
+	var first storage.ItemPointer
 	decRow := make(Row, len(tbl.Columns))
 	for b := storage.BlockNumber(0); b < nBlocks; b++ {
 		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: b})
@@ -6430,16 +6587,21 @@ func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *cat
 				}
 			}
 			if match {
-				ptr := storage.ItemPointer{Block: b, Offset: slotIdx}
-				s.RUnlock()
-				ctx.Pool.Unpin(s)
-				return ptr, true
+				if matches == 0 {
+					first = storage.ItemPointer{Block: b, Offset: slotIdx}
+				}
+				matches++
+				if matches >= stopAt {
+					s.RUnlock()
+					ctx.Pool.Unpin(s)
+					return matches, first
+				}
 			}
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 	}
-	return storage.ItemPointer{}, false
+	return matches, first
 }
 
 // checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT
@@ -6485,6 +6647,14 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			// non-NND index and every non-NULL reason for a nil key (expression
 			// column, arity mismatch) keeps the existing skip. Design 0119-0004.
 			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, row) {
+				// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED):
+				// queue the NULL-pattern recheck for COMMIT instead of raising now,
+				// so a transient NULL duplicate is tolerated mid-transaction.
+				// 0119-0004-deferred-unique-nnd.
+				if uniqueCheckDeferred(ctx, idx) {
+					queueDeferredNNDUniqueCheck(ctx, tbl, idx, cols, row)
+					continue
+				}
 				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, row, rel); found {
 					return &ExecError{
 						Code:    "23505",
@@ -6494,6 +6664,13 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 					}
 				}
 			}
+			continue
+		}
+		// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED): queue the
+		// uniqueness re-probe for COMMIT instead of raising now. A transient
+		// duplicate is allowed mid-transaction. 0119-0004.
+		if uniqueCheckDeferred(ctx, idx) {
+			queueDeferredUniqueCheck(ctx, tbl, idx, cols, row, key)
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, row)
@@ -6583,6 +6760,13 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 			// it — a no-key-change NULL→NULL UPDATE never self-conflicts.
 			// Design 0119-0004.
 			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, newRow) {
+				// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED):
+				// queue the NULL-pattern recheck for COMMIT instead of raising now.
+				// 0119-0004-deferred-unique-nnd.
+				if uniqueCheckDeferred(ctx, idx) {
+					queueDeferredNNDUniqueCheck(ctx, tbl, idx, cols, newRow)
+					continue
+				}
 				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, newRow, rel); found {
 					return &ExecError{
 						Code:    "23505",
@@ -6592,6 +6776,12 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 					}
 				}
 			}
+			continue
+		}
+		// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED): queue the
+		// uniqueness re-probe for COMMIT instead of raising now. 0119-0004.
+		if uniqueCheckDeferred(ctx, idx) {
+			queueDeferredUniqueCheck(ctx, tbl, idx, cols, newRow, key)
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, newRow)
@@ -6613,6 +6803,13 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 	rel := ctx.Catalog.RelFileNode(tbl)
 	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
 		if !idx.IsExclusion {
+			continue
+		}
+		// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED): queue the
+		// candidate for a COMMIT-time re-probe instead of raising now, so a
+		// transient conflict resolved before COMMIT is allowed. 0119-0004.
+		if excludeCheckDeferred(ctx, idx) {
+			queueDeferredExclusionCheck(ctx, tbl, idx, cols, row)
 			continue
 		}
 		switch idx.ExclusionOp {

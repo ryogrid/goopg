@@ -208,6 +208,110 @@ func (rs *Routines) Create(r *Routine, orReplace bool) (*Routine, error) {
 	return &clone, nil
 }
 
+// CreateDuringRecovery is the idempotent version of Create used by the
+// WAL-replay driver (internal/initdb/function_ddl_recovery.go). Unlike
+// Create it takes the OID from the WAL record (so the recovered registry
+// matches what the pre-crash server assigned) and advances nextOID past it
+// so subsequent allocations do not collide. Re-applying a record for a
+// signature that already exists (idempotent replay, or a CREATE OR REPLACE
+// record following its own earlier CREATE) just overwrites it in place
+// without duplicating the byName index entry. Mirrors
+// RegisterUserAggregateDuringRecovery. Returns the stored routine pointer
+// (not r itself — Create's own clone-on-write contract) so the caller can
+// populate dependency-tracking fields on the object actually in the
+// registry. DU-002 restart-persistence follow-up (M0119-0004, loop #71
+// ledger resume point).
+func (rs *Routines) CreateDuringRecovery(r *Routine) *Routine {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	schema := r.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	clone := *r
+	clone.Schema = schema
+	clone.Language = strings.ToLower(clone.Language)
+	k := routineKey(schema, clone.Name, clone.Signature())
+	if _, exists := rs.byKey[k]; !exists {
+		nk := nameKey(schema, clone.Name)
+		rs.byName[nk] = append(rs.byName[nk], k)
+	}
+	rs.byKey[k] = &clone
+	if clone.OID >= rs.nextOID {
+		rs.nextOID = clone.OID + 1
+	}
+	return &clone
+}
+
+// DropByOIDDuringRecovery is the idempotent counterpart to
+// CreateDuringRecovery used for replaying a DROP FUNCTION/PROCEDURE record.
+// A missing OID (already-dropped, or a not-yet-applicable ordering) is a
+// silent no-op — recovery must not abort on it. DU-002 restart-persistence
+// follow-up (M0119-0004, loop #71 ledger resume point).
+func (rs *Routines) DropByOIDDuringRecovery(oid uint32) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for k, r := range rs.byKey {
+		if r.OID != oid {
+			continue
+		}
+		delete(rs.byKey, k)
+		nk := nameKey(r.Schema, r.Name)
+		keys := rs.byName[nk]
+		for i, kk := range keys {
+			if kk == k {
+				rs.byName[nk] = append(keys[:i], keys[i+1:]...)
+				break
+			}
+		}
+		if len(rs.byName[nk]) == 0 {
+			delete(rs.byName, nk)
+		}
+		return
+	}
+}
+
+// RenameByOIDDuringRecovery is the discard-result recovery counterpart to
+// RenameRoutine used for replaying an ALTER FUNCTION ... RENAME TO record.
+// A rename record can only be replayed after its routine's CREATE record
+// (WAL is scanned in order), so a not-found OID is not expected in
+// practice, but replay must not abort on it. DU-002 restart-persistence
+// follow-up (M0119-0004, loop #71 ledger resume point).
+func (rs *Routines) RenameByOIDDuringRecovery(oid uint32, newName string) {
+	rs.mu.RLock()
+	var r *Routine
+	for _, cand := range rs.byKey {
+		if cand.OID == oid {
+			r = cand
+			break
+		}
+	}
+	rs.mu.RUnlock()
+	if r != nil {
+		_ = rs.RenameRoutine(r, newName)
+	}
+}
+
+// SetFlagsByOIDDuringRecovery is the recovery counterpart used for
+// replaying an ALTER FUNCTION/PROCEDURE/ROUTINE attribute-change record —
+// the four mutable fields are overwritten unconditionally with the
+// post-mutation snapshot the WAL record carries. A missing OID is a silent
+// no-op, mirroring RenameByOIDDuringRecovery. DU-002 restart-persistence
+// follow-up (M0119-0004, loop #71 ledger resume point).
+func (rs *Routines) SetFlagsByOIDDuringRecovery(oid uint32, volatile string, securityDefiner, leakproof, strict bool) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, r := range rs.byKey {
+		if r.OID == oid {
+			r.Volatile = volatile
+			r.SecurityDefiner = securityDefiner
+			r.Leakproof = leakproof
+			r.Strict = strict
+			return
+		}
+	}
+}
+
 // Lookup returns the routine matching schema+name+argtypes, or
 // false. Stage A uses exact type-name match — the upstream coercion
 // rules arrive when the type system grows up.

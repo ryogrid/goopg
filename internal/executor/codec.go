@@ -1239,6 +1239,24 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("decode numeric %q: %w", text, err)
 		}
 		return newNumeric(m, int(s)), n, nil
+	case "aclitem[]", "_aclitem":
+		// A heap-backed catalog stores an ACL column (pg_type.typacl —
+		// M0119-0004-ACLHEAP) as a PG-native _aclitem ArrayType varlena whose
+		// 16-byte AclItem elements carry role/grantor OIDs, NOT text. The shared
+		// `default` varlena branch below would hand back the raw bytes as a
+		// KindString, which is meaningless to a SELECT. Return the FULL varlena
+		// (including its 4-byte length header) as KindBytes so the pg_type scan
+		// hook can render it as canonical aclitemout text via
+		// decodeAclItemArrayText with role-name resolution from the catalog
+		// (decodePhysicalPGValueMctx has no catalog handle of its own). Until a
+		// type GRANT/REVOKE populates typacl this branch is dormant — every
+		// existing pg_type row bakes typacl NULL, and pg_class.relacl is served
+		// from the virtual builder, never decoded here.
+		_, n, err := decodePhysicalPGVarlena(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
+		}
+		return NewBytesDatum(append([]byte(nil), data[:n]...)), n, nil
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch

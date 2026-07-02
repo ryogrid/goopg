@@ -156,9 +156,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			norm := normalizeCompatSQL(sql)
 			var tag string
-			if strings.HasPrefix(norm, "create ") {
+			switch {
+			case strings.HasPrefix(norm, "create "):
 				tag = "CREATE ROLE"
-			} else {
+			case strings.HasPrefix(norm, "alter "):
+				tag = "ALTER ROLE"
+			default:
 				tag = "DROP ROLE"
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -277,10 +280,15 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Wire session-authorization role tracking so LEAKPROOF privilege checks
 		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
-		ectx.SetSessionAuthorization = func(role string) {
+		ectx.SetSessionAuthorization = func(role string, local bool) {
+			connTx.SnapshotLocalRoleIfNeeded(local)
 			connTx.NonSuperuserRole = role
 			ectx.NonSuperuserRole = role
+			setIsSuperuserGUC(sess, role == "")
 		}
+		// SET ROLE / RESET ROLE flip connTx.NonSuperuserRole identically to
+		// SET SESSION AUTHORIZATION, so they share the same closure. M0119-0004.
+		ectx.SetRole = ectx.SetSessionAuthorization
 		// Wire per-connection sequence session state (currval/lastval) so
 		// values persist across statements within the same connection. M0097-0042.
 		if connTx.SeqCurrVals != nil {
@@ -323,7 +331,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
-		ectx.EndLocalTransaction = sess.EndTransaction
+		ectx.EndLocalTransaction = func() {
+			sess.EndTransaction()
+			// Re-sync is_superuser / the executor-context mirror after
+			// connTx.End() (called by the caller just before this) restores
+			// NonSuperuserRole from a pending SET LOCAL ROLE / SESSION
+			// AUTHORIZATION snapshot (SnapshotLocalRoleIfNeeded). M0119-0004.
+			if connTx != nil {
+				ectx.NonSuperuserRole = connTx.NonSuperuserRole
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
+		}
 		// Set PlanCatalog to a search-path-aware wrapper so DDL executor can
 		// use it when calling planner.Plan for internal validation. M0097-0022.
 		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)
@@ -394,10 +412,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
 	ectx.DataDir = s.cfg.DataDir
+	// Keep the connection-time role set + auth UserStore in sync when the
+	// executor's execDropCompat role arm drops a role (DROP ROLE parses as a
+	// generic DropStmt, bypassing tryHandleRoleDDL). root-0021.
+	ectx.OnRoleDropped = func(name string) {
+		_ = s.unregisterRole(name, true)
+		s.removeRoleCredential(name)
+	}
 	ectx.Promote = s.cfg.Promote
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
@@ -448,7 +474,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PLpgSQLCommitChain = func(rollback bool) error {
 			if rollback {
 				_ = s.cfg.TxnMgr.Rollback(tx)
-			} else if cerr := s.cfg.TxnMgr.Commit(tx); cerr != nil {
+			} else if cerr := ectx.CommitTransaction(tx); cerr != nil {
 				return cerr
 			}
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -909,7 +935,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		reg.UpdateState(connTx.ProcNum, "idle", "")
 	}
 	if autoCommit {
-		if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+		if err := ectx.CommitTransaction(tx); err != nil {
 			return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -984,6 +1010,27 @@ func sessionSyncCommitMode(sess *config.SessionRegistry) wal.SyncRepMode {
 		return wal.SyncRepRemoteFlush
 	}
 	return wal.ParseSyncCommitLevel(strings.ToLower(strings.TrimSpace(eff)))
+}
+
+// sessionAsyncCommit reports whether the session-effective
+// `synchronous_commit` GUC is literally "off" — the only level that also
+// skips the LOCAL WAL flush before returning to the client. Every other
+// level (including "local", which sessionSyncCommitMode collapses together
+// with "off" into SyncRepOff for the *remote*-wait decision) still requires
+// the local flush. M0117-0007 Part B.
+func sessionAsyncCommit(sess *config.SessionRegistry) bool {
+	if sess == nil {
+		return false
+	}
+	_, eff, ok := sess.Get("synchronous_commit")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(eff)) {
+	case "off", "false", "0", "no":
+		return true
+	}
+	return false
 }
 
 func sessionOpportunisticPrune(sess *config.SessionRegistry) bool {
@@ -1239,8 +1286,6 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "DROP DATABASE", true
 	case strings.HasPrefix(norm, "drop user "), strings.HasPrefix(norm, "drop role "):
 		return "DROP ROLE", true
-	case strings.HasPrefix(norm, "set constraints "):
-		return "SET CONSTRAINTS", true
 	case strings.HasPrefix(norm, "comment on "):
 		return "COMMENT", true
 	case strings.HasPrefix(norm, "security label "):
@@ -1822,14 +1867,6 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// a WARNING and ROLLBACK instead of committing. M0100-0005.
 				if connTx.IsFailed() {
 					// COMMIT in a failed transaction block → ROLLBACK (PG semantics).
-					// Restore routines dropped in this transaction.
-					if sess := connTx.Session(); sess != nil {
-						if rs := s.cfg.Catalog.Routines(); rs != nil {
-							for _, r := range sess.TakePendingRoutineDrops() {
-								_, _ = rs.Create(r, true)
-							}
-						}
-					}
 					_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
@@ -1843,6 +1880,57 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
+				// Run FK constraint checks deferred to COMMIT (DEFERRABLE
+				// INITIALLY DEFERRED, or made deferred by SET CONSTRAINTS …
+				// DEFERRED). The simple-query dispatch bypasses
+				// transactionOp.execCommit, so the checks queued on the session
+				// during INSERT/UPDATE/DELETE must be run here BEFORE
+				// TxnMgr.Commit; a violation aborts the transaction with 23503,
+				// exactly as PG raises a deferred constraint violation at COMMIT.
+				// RunDeferredFKChecks runs them under a fresh "latest" snapshot
+				// (mvcc.Manager.FreshSnapshot) so a concurrently-committed parent
+				// row satisfies the check even under REPEATABLE READ — matching
+				// PG's deferred-RI snapshot semantics (fk-snapshot). 0119-0004.
+				if sess := connTx.Session(); sess != nil {
+					// Deferred FK checks first, then deferred UNIQUE/PK checks
+					// (0119-0004 deferred-unique). Both run under a fresh "latest"
+					// snapshot and roll the transaction back on a violation — FK with
+					// 23503, UNIQUE with 23505. The ExecError's own Code drives the
+					// SQLSTATE below, so a single rollback block serves both.
+					deferErr := executor.RunDeferredFKChecks(ctx, sess)
+					if deferErr == nil {
+						deferErr = executor.RunDeferredUniqueChecks(ctx, sess)
+					}
+					if deferErr == nil {
+						// Deferred EXCLUDE constraint checks (23P01). 0119-0004
+						// (deferred-exclusion). Same fresh-snapshot + rollback block.
+						deferErr = executor.RunDeferredExclusionChecks(ctx, sess)
+					}
+					if deferErr != nil {
+						_ = s.cfg.TxnMgr.Rollback(explicitTx)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+						connTx.End()
+						if ctx.EndLocalTransaction != nil {
+							ctx.EndLocalTransaction()
+						}
+						ctx.PendingEnumValues = nil
+						ctx.PendingEnumRenames = nil
+						ctx.PendingCreatedEnums = nil
+						ctx.PendingCreatedComposites = nil
+						code := sqlstate.ForeignKeyViolation
+						var fields []protocol.ErrorField
+						if ee, ok := deferErr.(*executor.ExecError); ok {
+							if ee.Code != "" {
+								code = sqlstate.Code(ee.Code)
+							}
+							if ee.Detail != "" {
+								fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: ee.Detail})
+							}
+							return s.writeQueryError(w, code, ee.Message, fields...)
+						}
+						return s.writeQueryError(w, code, deferErr.Error())
+					}
+				}
 				// M0104-0008: SSI pre-commit dangerous-structure check.
 				// The executor's transactionOp.execCommit invokes this for
 				// COMMIT routed through the executor; the simple-query
@@ -1853,14 +1941,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// detected. Returns nil for RC/RR / write-less SERIALIZABLE.
 				if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
 					if ssiErr := s.cfg.TxnMgr.PreCommitCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
-						// SSI failure: rollback and restore dropped routines.
-						if sess := connTx.Session(); sess != nil {
-							if rs := s.cfg.Catalog.Routines(); rs != nil {
-								for _, r := range sess.TakePendingRoutineDrops() {
-									_, _ = rs.Create(r, true)
-								}
-							}
-						}
+						// SSI failure: rollback.
 						_ = s.cfg.TxnMgr.Rollback(explicitTx)
 						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 						connTx.End()
@@ -1905,7 +1986,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					// COMMIT (the simple-query path bypasses execCommit).
 					executor.ApplyDeferredRoutineDrops(ctx, sess)
 				}
-				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
+				if err := ctx.CommitTransaction(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
 					if ctx.EndLocalTransaction != nil {
@@ -1916,10 +1997,6 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingCreatedEnums = nil
 					ctx.PendingCreatedComposites = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
-				}
-				// Clear pending routine drops — committed, no restoration needed.
-				if sess := connTx.Session(); sess != nil {
-					sess.TakePendingRoutineDrops()
 				}
 				// Publish NOTIFYs buffered by this explicit transaction now that it
 				// has committed — BEFORE connTx.End() discards the buffer. Delivery
@@ -1953,12 +2030,6 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// before TxnMgr.Rollback so catalog lookups still work.
 				if sess := connTx.Session(); sess != nil {
 					executor.ProcessRollbackUndos(ctx, sess)
-					// Restore any routines dropped in this transaction.
-					if rs := s.cfg.Catalog.Routines(); rs != nil {
-						for _, r := range sess.TakePendingRoutineDrops() {
-							_, _ = rs.Create(r, true)
-						}
-					}
 				}
 				_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 				undoEnumDDLForRollback(connTx, s.cfg.Catalog)
@@ -2059,79 +2130,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				start := len(valueBuf)
 				if i < len(schema) {
-					sc := schema[i]
-					switch strings.ToLower(sc.Type.Name) {
-					case "float4", "real":
-						// float4/real uses float32 precision (~7 significant digits).
-						// Use strconv bit=32 so the shortest float32 round-trip representation
-						// is produced (e.g. 4.56789e+15 not 4.567889919082496e+15). M0097-0022.
-						valueBuf = appendFloatText(valueBuf, d, 32)
-					case "float8", "double precision", "double":
-						// float8/float4 values must display in PostgreSQL's output format:
-						// scientific notation for very large/small values, shortest decimal
-						// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
-						valueBuf = appendFloat8Text(valueBuf, d)
-					case "char", "bpchar":
-						// bpcharout (PG) uses bcTruelen which trims trailing spaces before
-						// sending over the wire. Input coercion already strips trailing spaces
-						// (codec.go), so just emit the stored value without re-padding.
-						valueBuf = d.AppendValueText(valueBuf)
-					case "date":
-						// Date columns display as YYYY-MM-DD. M0097-0004.
-						if d.Kind == executor.KindTime {
-							valueBuf = d.TimeValue().AppendFormat(valueBuf, "2006-01-02")
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "time":
-						// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
-						if d.Kind == executor.KindTime {
-							valueBuf = appendTimeText(valueBuf, d, sc.Type)
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "timetz":
-						// Timetz displays as HH:MM:SS[.ffffff]±HH[:MM]. M0097-0004.
-						if d.Kind == executor.KindTime {
-							valueBuf = appendTimeText(valueBuf, d, sc.Type)
-							valueBuf = appendTimeTZOffset(valueBuf, d.TimeTZOffsetSecs())
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "bytea":
-						// Bytea values display as \xhexstring (default hex mode). M0097-0035.
-						if d.Kind == executor.KindBytes {
-							valueBuf = append(valueBuf, '\\', 'x')
-							const hexChars = "0123456789abcdef"
-							for _, b := range d.BytesValue() {
-								valueBuf = append(valueBuf, hexChars[b>>4], hexChars[b&0x0f])
-							}
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					case "regclass":
-						// OID values with type regclass display as relation names. M0097-0023.
-						if d.Kind == executor.KindInt {
-							oid := uint32(d.Int)
-							found := false
-							if im, ok2 := s.cfg.Catalog.(*catalog.InMemory); ok2 {
-								if tbl, ok3 := im.LookupTableByOID(oid); ok3 {
-									valueBuf = append(valueBuf, tbl.Name...)
-									found = true
-								} else if idx, ok3 := im.LookupIndexByOID(oid); ok3 {
-									valueBuf = append(valueBuf, idx.Name...)
-									found = true
-								}
-							}
-							if !found {
-								valueBuf = d.AppendValueText(valueBuf)
-							}
-						} else {
-							valueBuf = d.AppendValueText(valueBuf)
-						}
-					default:
-						valueBuf = d.AppendValueText(valueBuf)
-					}
+					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type)
 				} else {
 					valueBuf = d.AppendValueText(valueBuf)
 				}
@@ -2279,10 +2278,24 @@ func ddlTag(stmt parser.Stmt) string {
 		return "DROP DOMAIN"
 	case *parser.CreateExtensionStmt:
 		return "CREATE EXTENSION"
+	case *parser.CreateCollationStmt:
+		return "CREATE COLLATION"
+	case *parser.AlterCollationStmt:
+		return "ALTER COLLATION"
+	case *parser.CreateAggregateStmt:
+		return "CREATE AGGREGATE"
+	case *parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt:
+		return "ALTER AGGREGATE"
 	case *parser.CreateTablespaceStmt:
 		return "CREATE TABLESPACE"
 	case *parser.DropTablespaceStmt:
 		return "DROP TABLESPACE"
+	case *parser.CreateStatisticsStmt:
+		return "CREATE STATISTICS"
+	case *parser.AlterStatisticsStmt:
+		return "ALTER STATISTICS"
+	case *parser.AlterOpFamilyAddStmt, *parser.AlterOpFamilyDropStmt:
+		return "ALTER OPERATOR FAMILY"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {
@@ -2304,6 +2317,8 @@ func utilityTag(stmt parser.Stmt) string {
 		return "SHOW"
 	case *parser.SetStmt:
 		return "SET"
+	case *parser.SetConstraintsStmt:
+		return "SET CONSTRAINTS"
 	case *parser.ResetStmt:
 		return "RESET"
 	case *parser.DiscardStmt:
@@ -2317,6 +2332,121 @@ func rowsAffected(op executor.Operator) int64 {
 		return rc.RowsAffected()
 	}
 	return 0
+}
+
+// appendTypedCellText formats a single result-row cell according to its
+// declared column type, matching PostgreSQL's per-type output function
+// (float4out/float8out/bpcharout/date_out/time_out/timetz_out/byteaout/
+// regclassout). Shared by the simple-query streaming path
+// (dispatchSimpleQueryViaExecutor) and the extended-query materializing path
+// (executeExtendedQueryViaExecutor) so both protocols render a given column
+// type identically — the extended path previously only special-cased
+// float4/float8 and fell back to AppendValueText for everything else,
+// diverging from simple-query on date/time/timetz/bytea/regclass columns.
+func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+	switch strings.ToLower(typ.Name) {
+	case "float4", "real":
+		// float4/real uses float32 precision (~7 significant digits).
+		// Use strconv bit=32 so the shortest float32 round-trip representation
+		// is produced (e.g. 4.56789e+15 not 4.567889919082496e+15). M0097-0022.
+		return appendFloatText(dst, d, 32)
+	case "float8", "double precision", "double":
+		// float8/float4 values must display in PostgreSQL's output format:
+		// scientific notation for very large/small values, shortest decimal
+		// for normal ones. Convert KindNumeric to float64 and use %g. M0097-0003.
+		return appendFloat8Text(dst, d)
+	case "char", "bpchar":
+		// bpcharout (PG) uses bcTruelen which trims trailing spaces before
+		// sending over the wire. Input coercion already strips trailing spaces
+		// (codec.go), so just emit the stored value without re-padding.
+		return d.AppendValueText(dst)
+	case "date":
+		// Date columns display as YYYY-MM-DD. M0097-0004.
+		if d.Kind == executor.KindTime {
+			return d.TimeValue().AppendFormat(dst, "2006-01-02")
+		}
+		return d.AppendValueText(dst)
+	case "time":
+		// Time columns display as HH:MM:SS[.ffffff] with column precision. M0097-0004.
+		if d.Kind == executor.KindTime {
+			return appendTimeText(dst, d, typ)
+		}
+		return d.AppendValueText(dst)
+	case "timetz":
+		// Timetz displays as HH:MM:SS[.ffffff]±HH[:MM]. M0097-0004.
+		if d.Kind == executor.KindTime {
+			dst = appendTimeText(dst, d, typ)
+			return appendTimeTZOffset(dst, d.TimeTZOffsetSecs())
+		}
+		return d.AppendValueText(dst)
+	case "bytea":
+		// Bytea values display as \xhexstring (default hex mode). M0097-0035.
+		if d.Kind == executor.KindBytes {
+			dst = append(dst, '\\', 'x')
+			const hexChars = "0123456789abcdef"
+			for _, b := range d.BytesValue() {
+				dst = append(dst, hexChars[b>>4], hexChars[b&0x0f])
+			}
+			return dst
+		}
+		return d.AppendValueText(dst)
+	case "regclass":
+		// OID values with type regclass display as relation names. M0097-0023.
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+				if tbl, ok := im.LookupTableByOID(oid); ok {
+					return append(dst, tbl.Name...)
+				}
+				if idx, ok := im.LookupIndexByOID(oid); ok {
+					return append(dst, idx.Name...)
+				}
+			}
+		}
+		return d.AppendValueText(dst)
+	case "regproc":
+		// OID values with type regproc display as function names
+		// (regprocout), matching a direct SELECT of e.g.
+		// pg_type.typinput/typoutput, pg_operator.oprcode/oprrest/oprjoin,
+		// or pg_am.amproc — previously these all fell through to
+		// AppendValueText and rendered the raw numeric OID. InvalidOid (0)
+		// renders "-" (mirrors the ::regproc CastExpr special-case,
+		// executor/expr.go, and the regclass case above).
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return append(dst, '-')
+			}
+			if name, ok := catalog.RegprocName(oid); ok {
+				return append(dst, name...)
+			}
+			if r := s.cfg.Catalog.Routines().LookupByOID(oid); r != nil {
+				return append(dst, r.Name...)
+			}
+		}
+		return d.AppendValueText(dst)
+	case "regprocedure":
+		// regprocedure additionally renders the INPUT argument-type list
+		// ("name(argtype1,argtype2)", format_procedure/regprocedureout) —
+		// see catalog.RegprocedureName and its executor/expr.go CastExpr
+		// counterpart. DU-002 (M0119-0004).
+		if d.Kind == executor.KindInt {
+			oid := uint32(d.Int)
+			if oid == 0 {
+				return append(dst, '-')
+			}
+			var routines *catalog.Routines
+			if s.cfg.Catalog != nil {
+				routines = s.cfg.Catalog.Routines()
+			}
+			if sig, ok := catalog.RegprocedureName(oid, routines); ok {
+				return append(dst, sig...)
+			}
+		}
+		return d.AppendValueText(dst)
+	default:
+		return d.AppendValueText(dst)
+	}
 }
 
 // appendFloat8Text formats a datum for wire output as a float8/float4 value.

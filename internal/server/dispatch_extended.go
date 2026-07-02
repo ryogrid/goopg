@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
@@ -26,7 +25,7 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string, connTx *connTxState) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		msg, extra := syntaxErrorMsg(err)
@@ -139,7 +138,33 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction
-		ectx.EndLocalTransaction = sess.EndTransaction
+		ectx.EndLocalTransaction = func() {
+			sess.EndTransaction()
+			// Re-sync is_superuser / the executor-context mirror after
+			// connTx.End() (called by the caller just before this) restores
+			// NonSuperuserRole from a pending SET LOCAL ROLE / SESSION
+			// AUTHORIZATION snapshot (SnapshotLocalRoleIfNeeded). M0119-0004.
+			if connTx != nil {
+				ectx.NonSuperuserRole = connTx.NonSuperuserRole
+				setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+			}
+		}
+	}
+	// Wire session-authorization/role tracking so a SET SESSION AUTHORIZATION
+	// or SET ROLE that reaches the executor (rather than the fast-path
+	// switch in executeExtendedQuery) still updates connTx.NonSuperuserRole
+	// and the reportable is_superuser GUC — same wiring as the simple-query
+	// executor path (dispatch.go). M0119-0004: previously unwired entirely,
+	// so any such statement here was silently dropped.
+	if connTx != nil {
+		ectx.NonSuperuserRole = connTx.NonSuperuserRole
+		ectx.SetSessionAuthorization = func(role string, local bool) {
+			connTx.SnapshotLocalRoleIfNeeded(local)
+			connTx.NonSuperuserRole = role
+			ectx.NonSuperuserRole = role
+			setIsSuperuserGUC(sess, role == "")
+		}
+		ectx.SetRole = ectx.SetSessionAuthorization
 	}
 	// Match advisorySessionIDFromContext's preference: the per-connection
 	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
@@ -155,6 +180,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.LogCanonical = s.cfg.LogCanonical
 	ectx.SyncRep = s.cfg.SyncRep
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
+	ectx.AsyncCommit = sessionAsyncCommit(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
@@ -217,23 +243,15 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 					cells[i] = nil
 					continue
 				}
-				// float4/float8 columns must render in PostgreSQL's float
-				// output format (shortest round-trip + PG's fixed-vs-scientific
-				// threshold via PGFloatOut). The Datum often carries a
-				// Go-formatted string (e.g. an aggregate sum's "2.18875e+06"),
-				// so AppendValueText alone would emit non-PG text — re-format
-				// through the same helpers the simple-query path uses. Other
-				// types take the M0092-0004 zero-double-alloc AppendValueText
-				// fast path.
+				// Render through the same per-type formatter the
+				// simple-query path uses (appendTypedCellText) so both
+				// wire protocols agree on float/date/time/timetz/bytea/
+				// regclass output, not just AppendValueText's generic
+				// fallback. M0119-0004 (dispatch_extended vs dispatch
+				// type-switch divergence).
 				if i < len(schema) {
-					switch strings.ToLower(schema[i].Type.Name) {
-					case "float4", "real":
-						cells[i] = appendFloatText(nil, d, 32)
-						continue
-					case "float8", "double precision", "double", "float":
-						cells[i] = appendFloat8Text(nil, d)
-						continue
-					}
+					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type)
+					continue
 				}
 				cells[i] = d.AppendValueText(nil)
 			}
@@ -244,7 +262,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	if err := op.Close(); err != nil {
 		return nil, &extendedQueryError{Code: execErrCode(err), Message: execErrMsg(err)}
 	}
-	if err := s.cfg.TxnMgr.Commit(tx); err != nil {
+	if err := ectx.CommitTransaction(tx); err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
 	}
 	executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)

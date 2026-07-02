@@ -233,6 +233,145 @@ func TestParseAlterTableSetCompression(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableClusterOn covers `ALTER TABLE t CLUSTER ON idx` and
+// `ALTER TABLE t SET WITHOUT CLUSTER` (DU-002 slice 321). The CLUSTER ON form is
+// exactly what pg_dump emits for a clustered table, so goopg must accept it to
+// restore its own dumps; SET WITHOUT CLUSTER clears the selection.
+func TestParseAlterTableClusterOn(t *testing.T) {
+	// CLUSTER ON idx — index name captured.
+	stmts, err := Parse("ALTER TABLE t CLUSTER ON t_b_idx")
+	if err != nil {
+		t.Fatalf("Parse CLUSTER ON: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableClusterOn {
+		t.Fatalf("CLUSTER ON: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ClusterIndexName != "t_b_idx" {
+		t.Errorf("CLUSTER ON: ClusterIndexName=%q want %q", at.Actions[0].ClusterIndexName, "t_b_idx")
+	}
+
+	// SET WITHOUT CLUSTER — no index, distinct kind.
+	stmts, err = Parse("ALTER TABLE t SET WITHOUT CLUSTER")
+	if err != nil {
+		t.Fatalf("Parse SET WITHOUT CLUSTER: %v", err)
+	}
+	at, ok = stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetWithoutCluster {
+		t.Fatalf("SET WITHOUT CLUSTER: actions=%+v", at.Actions)
+	}
+
+	// SET (reloptions) must still parse as a reloptions action, not be shadowed
+	// by the SET WITHOUT CLUSTER branch.
+	stmts, err = Parse("ALTER TABLE t SET (fillfactor = 70)")
+	if err != nil {
+		t.Fatalf("Parse SET (reloptions): %v", err)
+	}
+	at, _ = stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetReloptions {
+		t.Fatalf("SET (reloptions): actions=%+v", at.Actions)
+	}
+}
+
+// TestParseAlterTableRowSecurity covers `ALTER TABLE ... {ENABLE|DISABLE} ROW
+// LEVEL SECURITY` and `... [NO] FORCE ROW LEVEL SECURITY` (DU-002 slice 322).
+// Each must record a distinct action; ENABLE/DISABLE TRIGGER must still fall to
+// the no-op trigger arm (EnableDisableTrigger), not be captured as an action.
+func TestParseAlterTableRowSecurity(t *testing.T) {
+	cases := []struct {
+		sql  string
+		kind AlterTableActionKind
+	}{
+		{"ALTER TABLE t ENABLE ROW LEVEL SECURITY", AlterTableEnableRowSecurity},
+		{"ALTER TABLE t DISABLE ROW LEVEL SECURITY", AlterTableDisableRowSecurity},
+		{"ALTER TABLE t FORCE ROW LEVEL SECURITY", AlterTableForceRowSecurity},
+		{"ALTER TABLE t NO FORCE ROW LEVEL SECURITY", AlterTableNoForceRowSecurity},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse %q: %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%q: got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != tc.kind {
+			t.Fatalf("%q: actions=%+v want kind=%d", tc.sql, at.Actions, tc.kind)
+		}
+	}
+
+	// ENABLE TRIGGER must still be the no-op trigger arm, not an RLS action.
+	stmts, err := Parse("ALTER TABLE t ENABLE TRIGGER trg")
+	if err != nil {
+		t.Fatalf("Parse ENABLE TRIGGER: %v", err)
+	}
+	at, _ := stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 0 {
+		t.Fatalf("ENABLE TRIGGER: expected no actions, got %+v", at.Actions)
+	}
+	if !at.EnableDisableTrigger {
+		t.Errorf("ENABLE TRIGGER: EnableDisableTrigger not set")
+	}
+}
+
+// TestParseAlterTableEnableDisableRule covers `ALTER TABLE … {ENABLE|DISABLE}
+// [REPLICA|ALWAYS] RULE name` (DU-002 slice 325). Each form records a single
+// AlterTableEnableDisableRule action carrying the target rule name and the
+// pg_rewrite.ev_enabled char. ENABLE/DISABLE TRIGGER must still fall to the
+// no-op trigger arm, not be captured as a rule action.
+func TestParseAlterTableEnableDisableRule(t *testing.T) {
+	cases := []struct {
+		sql   string
+		name  string
+		state byte
+	}{
+		{"ALTER TABLE t ENABLE RULE r", "r", 'O'},
+		{"ALTER TABLE t DISABLE RULE r", "r", 'D'},
+		{"ALTER TABLE t ENABLE REPLICA RULE r", "r", 'R'},
+		{"ALTER TABLE t ENABLE ALWAYS RULE r", "r", 'A'},
+		{`ALTER TABLE t DISABLE RULE "MyRule"`, "MyRule", 'D'},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse %q: %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%q: got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableEnableDisableRule {
+			t.Fatalf("%q: actions=%+v want one AlterTableEnableDisableRule", tc.sql, at.Actions)
+		}
+		if at.Actions[0].RuleName != tc.name {
+			t.Errorf("%q: RuleName=%q want %q", tc.sql, at.Actions[0].RuleName, tc.name)
+		}
+		if at.Actions[0].RuleEnabledState != tc.state {
+			t.Errorf("%q: RuleEnabledState=%q want %q", tc.sql, at.Actions[0].RuleEnabledState, tc.state)
+		}
+	}
+
+	// DISABLE TRIGGER must still be the no-op trigger arm, not a rule action.
+	stmts, err := Parse("ALTER TABLE t DISABLE TRIGGER trg")
+	if err != nil {
+		t.Fatalf("Parse DISABLE TRIGGER: %v", err)
+	}
+	at, _ := stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 0 {
+		t.Fatalf("DISABLE TRIGGER: expected no actions, got %+v", at.Actions)
+	}
+	if !at.EnableDisableTrigger {
+		t.Errorf("DISABLE TRIGGER: EnableDisableTrigger not set")
+	}
+}
+
 // TestParseAlterTableSetDropDefault covers `ALTER TABLE ... ALTER COLUMN c SET
 // DEFAULT <expr>` and `... DROP DEFAULT` (DU-002 slice 269). SET DEFAULT records
 // the parsed expression on DefaultExpr; DROP DEFAULT records the column with a
@@ -480,6 +619,48 @@ func TestParseAlterTableSetStatistics(t *testing.T) {
 	}
 }
 
+
+// TestParseAlterStatisticsSetStatistics pins parsing of
+// `ALTER STATISTICS name SET STATISTICS n` into an AlterStatisticsStmt carrying
+// the target (DU-002 slice 317). -1 resets to the default.
+func TestParseAlterStatisticsSetStatistics(t *testing.T) {
+	for _, tc := range []struct {
+		sql        string
+		wantName   string
+		wantSchema string
+		wantTarget int
+		wantHas    bool
+	}{
+		{"ALTER STATISTICS s SET STATISTICS 100", "s", "", 100, true},
+		{"ALTER STATISTICS s SET STATISTICS 0", "s", "", 0, true},
+		{"ALTER STATISTICS s SET STATISTICS -1", "s", "", -1, true}, // reset
+		{"ALTER STATISTICS public.s SET STATISTICS 250", "s", "public", 250, true},
+		{"ALTER STATISTICS IF EXISTS s SET STATISTICS 5", "s", "", 5, true},
+		{"ALTER STATISTICS s RENAME TO s2", "s", "", 0, false}, // no-op form
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		as, ok := stmts[0].(*AlterStatisticsStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if as.Name.Name != tc.wantName {
+			t.Errorf("Parse(%q): Name=%q want %q", tc.sql, as.Name.Name, tc.wantName)
+		}
+		if as.Name.Schema != tc.wantSchema {
+			t.Errorf("Parse(%q): Schema=%q want %q", tc.sql, as.Name.Schema, tc.wantSchema)
+		}
+		if as.HasTarget != tc.wantHas {
+			t.Errorf("Parse(%q): HasTarget=%v want %v", tc.sql, as.HasTarget, tc.wantHas)
+		}
+		if tc.wantHas && as.Target != tc.wantTarget {
+			t.Errorf("Parse(%q): Target=%d want %d", tc.sql, as.Target, tc.wantTarget)
+		}
+	}
+}
+
 // TestParseAlterTableSetColumnOptions verifies the per-column attribute-option
 // list (`ALTER COLUMN c SET (opt=value, …)`) is captured and normalized to PG's
 // stored `name=value` form for pg_attribute.attoptions round-trip. DU-002 slice 185.
@@ -556,6 +737,45 @@ func TestParseAlterTableDetachPartition(t *testing.T) {
 		}
 		if act.DetachConcurrently != tc.wantConcurr {
 			t.Errorf("Parse(%q): concurrently=%v want %v", tc.sql, act.DetachConcurrently, tc.wantConcurr)
+		}
+	}
+}
+
+// TestParseAlterTableReplicaIdentity covers the REPLICA IDENTITY action in all
+// four forms (DEFAULT / FULL / NOTHING / USING INDEX name). The mode is stored
+// as the single-char relreplident code on ReplicaIdentityMode; the USING INDEX
+// form additionally captures the index name on ReplicaIdentityIndex. The parsed
+// action drives catalog.Table.ReplicaIdentity so pg_class.relreplident
+// round-trips through pg_dump. DU-002 slice 305.
+func TestParseAlterTableReplicaIdentity(t *testing.T) {
+	cases := []struct {
+		sql       string
+		wantMode  string
+		wantIndex string
+	}{
+		{"ALTER TABLE t REPLICA IDENTITY DEFAULT", "d", ""},
+		{"ALTER TABLE t REPLICA IDENTITY FULL", "f", ""},
+		{"ALTER TABLE t REPLICA IDENTITY NOTHING", "n", ""},
+		{"ALTER TABLE t REPLICA IDENTITY USING INDEX t_pkey", "i", "t_pkey"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableReplicaIdentity {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.ReplicaIdentityMode != tc.wantMode {
+			t.Errorf("Parse(%q): mode=%q want %q", tc.sql, act.ReplicaIdentityMode, tc.wantMode)
+		}
+		if act.ReplicaIdentityIndex != tc.wantIndex {
+			t.Errorf("Parse(%q): index=%q want %q", tc.sql, act.ReplicaIdentityIndex, tc.wantIndex)
 		}
 	}
 }

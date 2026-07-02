@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -195,6 +196,22 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			inserted[tgtIdx] = src[srcIdx]
 		}
+		// Parity with the plain-insert path (operators_storage.go): fill
+		// DEFAULT expressions and auto-generate SERIAL/IDENTITY values for
+		// target columns the INSERT did not provide, BEFORE arbiter probing
+		// and partition routing — upstream's ON CONFLICT insertion is a
+		// normal ExecInsert, so defaults/serials apply identically. This
+		// sibling path previously skipped both, leaving NULL bigserial ids
+		// on every `INSERT ... ON CONFLICT`-inserted row (root-0020).
+		upsertMissing := make([]bool, len(parentCols))
+		for i := range upsertMissing {
+			upsertMissing[i] = true
+		}
+		for _, tgtIdx := range o.plan.ColumnIndex {
+			upsertMissing[tgtIdx] = false
+		}
+		applyDefaultsForMissing(parentCols, inserted, upsertMissing)
+		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, parentCols, inserted, upsertMissing)
 		// Clear the speculative-insert index-key cache so a later source row
 		// that conflicts directly (no speculative insert) cannot wrongly reuse
 		// a prior row's keys. applyInsert repopulates it. M0100-0006b.
@@ -998,6 +1015,19 @@ func (o *upsertOp) trackWrittenPtr(ptr storage.ItemPointer) {
 // arbiter key encoding). When they are the same — no partition column
 // remapping needed — pass the same slice for both. M0097-0028.
 func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, oldPtr storage.ItemPointer, updatedLeaf Row, updatedParent Row) error {
+	// Honour a row lock propagated forward onto this live version before
+	// writing (M0118-0003 write-path wait, wired here for ON CONFLICT DO
+	// UPDATE sibling-path parity — M0119-0009; applyUpdate previously
+	// dropped a still-active conflicting locker via the plain stamp
+	// instead of waiting for it, unlike the plain UPDATE path). reqStatus
+	// mirrors the exact boolean the stamp call below already uses.
+	reqStatus := multixact.StatusNoKeyUpdate
+	if o.onConflictUpdateTouchesKeyColumn() {
+		reqStatus = multixact.StatusUpdate
+	}
+	if err := waitForConflictingRowLock(o.ctx, rel, oldPtr.Block, oldPtr.Offset, reqStatus, o.plan.Pos()); err != nil {
+		return err
+	}
 	// Materialise the XID BEFORE stamping xmax so the old tuple gets a
 	// real delete stamp (not InvalidTransactionID). Without this, the old
 	// tuple's xmax=0 would make it appear still-live to subsequent scans.

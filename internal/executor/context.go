@@ -327,6 +327,15 @@ type Context struct {
 	// M0102-0005.
 	SyncCommitMode wal.SyncRepMode
 
+	// AsyncCommit is true only when the session-effective
+	// `synchronous_commit` GUC is literally "off" — the one level that also
+	// skips waiting for the LOCAL WAL flush (SyncCommitMode/SyncRepOff above
+	// collapses "off" and "local" together, since both skip the *remote*
+	// wait; "local" still requires the local flush, so it is NOT distinct
+	// here). CommitTransaction below is the single call site that reads
+	// this. M0117-0007 Part B.
+	AsyncCommit bool
+
 	// OnSubscriptionChange is invoked after a successful
 	// CREATE / DROP SUBSCRIPTION (and, when it lands, ALTER
 	// SUBSCRIPTION). The server wires this to ApplyLauncher.Wake so
@@ -342,6 +351,15 @@ type Context struct {
 	// relcache-init-file invalidation (tests that don't set up a full
 	// cluster). M0106-0010 batched-31.
 	DataDir string
+
+	// OnRoleDropped, when non-nil, notifies the server layer that DROP
+	// ROLE/USER/GROUP removed a role, so the connection-time role set and
+	// the auth UserStore stay in sync with the catalog registry. DROP ROLE
+	// parses as a generic DropStmt and lands in execDropCompat's role arm —
+	// unlike CREATE/ALTER ROLE, which only the server-side intercept sees —
+	// so without this hook the two role-DDL paths silently diverge
+	// (root-0021; the recurring sibling-path trap). Set by dispatch.
+	OnRoleDropped func(name string)
 
 	// LogCanonical, when non-nil, emits a PG-canonical WAL record (XLOG_HEAP_INSERT,
 	// XLOG_BTREE_INSERT_LEAF, …) so a vanilla PG18 standby can replay catalog DDL
@@ -434,8 +452,20 @@ type Context struct {
 	// SetSessionAuthorization, when non-nil, updates the per-connection
 	// NonSuperuserRole when SET SESSION AUTHORIZATION is executed via the
 	// parser path (multi-statement batches). The caller (operators_utility_settings)
-	// passes the role name or "" to restore superuser status.
-	SetSessionAuthorization func(role string)
+	// passes the role name (or "" to restore superuser status) and whether the
+	// statement was SET LOCAL — the server snapshots the pre-change role so a
+	// LOCAL change reverts at COMMIT/ROLLBACK (mirrors PostgreSQL's
+	// GUC_ACTION_LOCAL stack, guc.c). M0119-0004.
+	SetSessionAuthorization func(role string, local bool)
+
+	// SetRole, when non-nil, updates the per-connection NonSuperuserRole when
+	// SET ROLE / RESET ROLE is executed via the parser path (multi-statement
+	// simple-query batches and the extended-query protocol). Same contract
+	// as SetSessionAuthorization: the role name (or "" to restore superuser
+	// status) plus the LOCAL flag. Wired to the same closure as
+	// SetSessionAuthorization by the server (SET ROLE and SET SESSION
+	// AUTHORIZATION both flip connTx.NonSuperuserRole identically). M0119-0004.
+	SetRole func(role string, local bool)
 
 	// CancelBackend, when non-nil, signals the backend identified by pid to
 	// cancel its currently-executing query (the engine behind the
@@ -494,6 +524,19 @@ func (c *Context) backendPID() string {
 		}
 	}
 	return c.ActivityPID
+}
+
+// CommitTransaction commits tx through TxnMgr, choosing the synchronous or
+// async-commit path per AsyncCommit (the session-effective
+// `synchronous_commit` GUC). Every live commit call site should route
+// through this method rather than calling TxnMgr.Commit directly, so a
+// session's synchronous_commit setting is honoured consistently.
+// M0117-0007 Part B.
+func (c *Context) CommitTransaction(tx mvcc.Transaction) error {
+	if c.AsyncCommit {
+		return c.TxnMgr.CommitAsync(tx)
+	}
+	return c.TxnMgr.Commit(tx)
 }
 
 // SettingValue is one effective session setting exposed to SHOW ALL.

@@ -708,6 +708,33 @@ func TestUserPGAttributeOptionsOverride(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeFDWOptionsOverride pins per-column FOREIGN TABLE
+// options (`CREATE FOREIGN TABLE (col type OPTIONS (name 'value', …))`) —
+// pg_attribute.attfdwoptions. DU-002 slice 418.
+func TestUserPGAttributeFDWOptionsOverride(t *testing.T) {
+	const attfdwoptionsIdx = 22 // attfdwoptions position in the user pg_attribute row
+	tbl := &catalog.Table{Name: "t", OID: 99005}
+
+	// No FDW options: attfdwoptions is NULL.
+	base := buildUserPGAttributeRow(nil, tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0})
+	if !base[attfdwoptionsIdx].IsNull() {
+		t.Fatalf("column without FDW options: attfdwoptions=%v want NULL", base[attfdwoptionsIdx])
+	}
+
+	// A single option renders as a one-element text-array literal.
+	one := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0, FDWOptions: []string{"column_name=col1"}}
+	if got := buildUserPGAttributeRow(nil, tbl, one)[attfdwoptionsIdx]; got.StringValue() != "{column_name=col1}" {
+		t.Errorf("one FDW option: attfdwoptions=%q want %q", got.StringValue(), "{column_name=col1}")
+	}
+
+	// Multiple options render as a comma-joined text-array literal.
+	multi := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0,
+		FDWOptions: []string{"column_name=col1", "other_opt=val2"}}
+	if got := buildUserPGAttributeRow(nil, tbl, multi)[attfdwoptionsIdx]; got.StringValue() != "{column_name=col1,other_opt=val2}" {
+		t.Errorf("multi FDW option: attfdwoptions=%q want %q", got.StringValue(), "{column_name=col1,other_opt=val2}")
+	}
+}
+
 // TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
 // 88). A column whose declared type is a user-defined enum must report
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text
@@ -1662,6 +1689,93 @@ func TestUserPGAttributeDomainArrayColumn(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeColumn verifies that a TABLE column whose declared
+// type is a user-defined COMPOSITE type (`c addr`) re-resolves to the composite's
+// pg_type OID with the composite's varlena/double-aligned/extended layout, and
+// that an array column (`addr[]`) resolves to the auto-generated array OID with
+// attndims=1. Without this, buildUserPGAttributeRow left atttypid at the text
+// fallback and pg_dump rendered the column as `text` / `text[]` — an unrestorable
+// dump. The table-column analogue of the composite-FIELD path. DU-002 slice 373.
+func TestUserPGAttributeCompositeColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	ct := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
+		{Name: "street", ColType: "text"},
+		{Name: "zip", ColType: "int"},
+	})
+	if ct == nil || ct.OID == 0 || ct.ArrayOID != ct.OID+1 {
+		t.Fatalf("RegisterCompositeTypeWithFields OID alloc: %+v", ct)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "comptcol", OID: 16500}
+
+	// Scalar composite column: atttypid = composite OID, varlena/double-aligned/
+	// extended-storage/non-by-value layout (mirrors buildUserPGTypeRowForComposite).
+	scalar := catalog.Column{Name: "c", Type: catalog.Type{Name: "addr"}, Ordinal: 0}
+	srow := buildUserPGAttributeRow(cat, tbl, scalar)
+	if got := uint32(srow[atttypidIdx].Int); got != ct.OID {
+		t.Errorf("composite column: atttypid=%d want %d (composite OID)", got, ct.OID)
+	}
+	if got := srow[attndimsIdx].Int; got != 0 {
+		t.Errorf("composite column: attndims=%d want 0", got)
+	}
+	if got := srow[attlenIdx].Int; got != -1 {
+		t.Errorf("composite column: attlen=%d want -1", got)
+	}
+	if got := srow[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("composite column: attbyval=%v want false", got)
+	}
+	if got := srow[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("composite column: attalign=%q want \"d\"", got)
+	}
+	if got := srow[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("composite column: attstorage=%q want \"x\"", got)
+	}
+
+	// Array composite column: atttypid = array OID, attndims=1, varlena-array layout.
+	arr := catalog.Column{Name: "carr", Type: catalog.Type{Name: "addr", IsArray: true}, Ordinal: 1}
+	arow := buildUserPGAttributeRow(cat, tbl, arr)
+	if got := uint32(arow[atttypidIdx].Int); got != ct.ArrayOID {
+		t.Errorf("composite-array column: atttypid=%d want %d (composite ArrayOID)", got, ct.ArrayOID)
+	}
+	if got := arow[attndimsIdx].Int; got != 1 {
+		t.Errorf("composite-array column: attndims=%d want 1", got)
+	}
+	if got := arow[attlenIdx].Int; got != -1 {
+		t.Errorf("composite-array column: attlen=%d want -1", got)
+	}
+	if got := arow[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("composite-array column: attalign=%q want \"d\"", got)
+	}
+	if got := arow[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("composite-array column: attstorage=%q want \"x\"", got)
+	}
+
+	// LookupCompositeTypeByOID / ByArrayOID are the inverses format_type uses to
+	// render the column type back to its schema-qualified composite name.
+	if got, ok := cat.LookupCompositeTypeByOID(ct.OID); !ok || got.Name != "addr" {
+		t.Errorf("LookupCompositeTypeByOID(%d)=%v,%v want addr,true", ct.OID, got, ok)
+	}
+	if got, ok := cat.LookupCompositeTypeByArrayOID(ct.ArrayOID); !ok || got.Name != "addr" {
+		t.Errorf("LookupCompositeTypeByArrayOID(%d)=%v,%v want addr,true", ct.ArrayOID, got, ok)
+	}
+
+	// nil catalog (unit fixture without a registry): no re-resolution, the scalar
+	// column folds to the built-in text OID and the array to text[].
+	if got := uint32(buildUserPGAttributeRow(nil, tbl, scalar)[atttypidIdx].Int); got != uint32(catalog.OIDText) {
+		t.Errorf("nil-catalog composite column: atttypid=%d want %d (text)", got, catalog.OIDText)
+	}
+	if got := uint32(buildUserPGAttributeRow(nil, tbl, arr)[atttypidIdx].Int); got != catalog.ArrayOIDForBase(catalog.OIDText) {
+		t.Errorf("nil-catalog composite-array column: atttypid=%d want %d (text[])", got, catalog.ArrayOIDForBase(catalog.OIDText))
+	}
+}
+
 // TestUserPGAttributeTypmod pins the atttypmod computation for typmod-bearing
 // columns and the matching format_type round-trip (DU-002 slice 48). Before
 // this, buildUserPGAttributeRow hardcoded atttypmod=-1, so pg_dump rendered
@@ -1754,5 +1868,162 @@ func TestAttGeneratedForStorageStrategy(t *testing.T) {
 				t.Errorf("attGeneratedFor(%s) = %q, want %q", tc.name, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestUserPGClassRowReplicaIdentity verifies buildUserPGClassRow emits the
+// correct pg_class.relreplident code: PG's implicit default 'd' when the table
+// carries no override (NOT the legacy 'n', which made pg_dump emit a spurious
+// `ALTER TABLE ONLY ... REPLICA IDENTITY NOTHING;` for EVERY dumped table), and
+// the stored single-char code for an explicit `ALTER TABLE ... REPLICA IDENTITY
+// {FULL|NOTHING}`. DU-002 slice 305.
+func TestUserPGClassRowReplicaIdentity(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	idx := -1
+	for i, c := range cols {
+		if c.Name == "relreplident" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("relreplident column not found in pgClassColumnsPG18")
+	}
+	cases := []struct {
+		name     string
+		stored   string
+		wantCode string
+	}{
+		{"unset-default", "", "d"},
+		{"explicit-default", "d", "d"},
+		{"full", "f", "f"},
+		{"nothing", "n", "n"},
+	}
+	for _, tc := range cases {
+		tbl := &catalog.Table{
+			Schema:          "public",
+			Name:            "ri_tbl",
+			OID:             16500,
+			ReplicaIdentity: tc.stored,
+			Columns: []catalog.Column{
+				{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0},
+			},
+		}
+		row := buildUserPGClassRow(nil, tbl)
+		if got := string(row[idx].Buf); got != tc.wantCode {
+			t.Errorf("%s: relreplident = %q, want %q", tc.name, got, tc.wantCode)
+		}
+	}
+}
+
+// TestUserPGClassRowOfType verifies buildUserPGClassRow projects a typed table's
+// catalog.Table.OfTypeOID to pg_class.reloftype. pg_dump's dumpTableSchema keys
+// the `CREATE TABLE name OF type` form off reloftype, so a regression that
+// hard-wired it to 0 would silently demote a typed table to an ordinary one
+// (re-emitting the type-derived columns inline). DU-002 slice 374.
+func TestUserPGClassRowOfType(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	idx := -1
+	for i, c := range cols {
+		if c.Name == "reloftype" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("reloftype column not found in pgClassColumnsPG18")
+	}
+	cases := []struct {
+		name string
+		oid  uint32
+		want int64
+	}{
+		{"ordinary-table", 0, 0},
+		{"typed-table", 16742, 16742},
+	}
+	for _, tc := range cases {
+		tbl := &catalog.Table{
+			Schema:    "public",
+			Name:      "of_tbl",
+			OID:       16700,
+			OfTypeOID: tc.oid,
+			Columns: []catalog.Column{
+				{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+				{Name: "b", Type: catalog.Type{Name: "text"}, Ordinal: 1},
+			},
+		}
+		row := buildUserPGClassRow(nil, tbl)
+		if got := row[idx].Int; got != tc.want {
+			t.Errorf("%s: reloftype = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestCompositeFieldColumnType verifies the ColType→parser.ColumnType conversion
+// used to synthesize a typed table's columns from its composite type's fields.
+// DU-002 slice 374.
+func TestCompositeFieldColumnType(t *testing.T) {
+	cases := []struct {
+		in        string
+		wantName  string
+		wantArgs  []int64
+		wantArray bool
+	}{
+		{"integer", "integer", nil, false},
+		{"text", "text", nil, false},
+		{"numeric ( 10 , 2 )", "numeric", []int64{10, 2}, false},
+		{"double precision", "double precision", nil, false},
+		{"text [ ]", "text", nil, true},
+		{"numeric ( 10 , 2 ) [ ]", "numeric", []int64{10, 2}, true},
+	}
+	for _, tc := range cases {
+		got := compositeFieldColumnType(tc.in)
+		if got.Name != tc.wantName || got.IsArray != tc.wantArray {
+			t.Errorf("compositeFieldColumnType(%q) = {Name:%q IsArray:%v}, want {Name:%q IsArray:%v}",
+				tc.in, got.Name, got.IsArray, tc.wantName, tc.wantArray)
+		}
+		if len(got.Args) != len(tc.wantArgs) {
+			t.Errorf("compositeFieldColumnType(%q) Args = %v, want %v", tc.in, got.Args, tc.wantArgs)
+			continue
+		}
+		for i := range got.Args {
+			if got.Args[i] != tc.wantArgs[i] {
+				t.Errorf("compositeFieldColumnType(%q) Args = %v, want %v", tc.in, got.Args, tc.wantArgs)
+				break
+			}
+		}
+	}
+}
+
+// TestUserPGIndexRowReplicaIdentity verifies buildUserPGIndexRow projects the
+// index's IsReplicaIdentity flag to pg_index.indisreplident. pg_dump reads this
+// to emit `ALTER TABLE ONLY <t> REPLICA IDENTITY USING INDEX <idx>` at
+// index-dump time, so a regression that hard-wired it false (as the legacy
+// builder did) would silently drop the USING INDEX clause. DU-002 slice 306.
+func TestUserPGIndexRowReplicaIdentity(t *testing.T) {
+	cols := pgIndexColumnsPG18()
+	col := -1
+	for i, c := range cols {
+		if c.Name == "indisreplident" {
+			col = i
+			break
+		}
+	}
+	if col < 0 {
+		t.Fatal("indisreplident column not found in pgIndexColumnsPG18")
+	}
+	tbl := &catalog.Table{
+		Schema: "public", Name: "ri_index", OID: 16600,
+		Columns: []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0}},
+	}
+	for _, want := range []bool{false, true} {
+		idx := &catalog.Index{
+			Schema: "public", Name: "ri_uidx", Table: tbl, OID: 16601,
+			Columns: []string{"id"}, Unique: true, IsReplicaIdentity: want,
+		}
+		row := buildUserPGIndexRow(idx)
+		if got := row[col].BoolValue(); got != want {
+			t.Errorf("IsReplicaIdentity=%v: indisreplident = %v, want %v", want, got, want)
+		}
 	}
 }

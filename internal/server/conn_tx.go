@@ -112,6 +112,15 @@ type connTxState struct {
 	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
 	// RESET SESSION AUTHORIZATION or SET SESSION AUTHORIZATION DEFAULT/postgres.
 	NonSuperuserRole string
+	// LocalRolePriorValue, when non-nil, is the NonSuperuserRole value
+	// captured just before the first SET LOCAL ROLE / SET LOCAL SESSION
+	// AUTHORIZATION within the current explicit transaction. End() restores
+	// it at COMMIT or ROLLBACK and clears the pointer, mirroring
+	// PostgreSQL's GUC_ACTION_LOCAL stack (guc.c) at the same flat,
+	// non-nested fidelity config.SessionRegistry's local layer already
+	// provides for ordinary GUCs (see SessionRegistry.EndTransaction).
+	// Populated via SnapshotLocalRoleIfNeeded. M0119-0004.
+	LocalRolePriorValue *string
 	// AdvisoryID is the stable per-connection advisory-lock owner identity (the
 	// SessionRegistry). It is assigned once at connection start in
 	// runPostStartupLoop and matches advisorySessionIDFromContext's preferred
@@ -360,6 +369,25 @@ func (c *connTxState) Begin(tx mvcc.Transaction) {
 	c.mu.Unlock()
 }
 
+// SnapshotLocalRoleIfNeeded captures NonSuperuserRole's current value the
+// first time a SET LOCAL ROLE / SET LOCAL SESSION AUTHORIZATION occurs
+// within the active explicit transaction, so End() can restore it at COMMIT
+// or ROLLBACK. A no-op when local is false, no explicit transaction is
+// active, or a snapshot was already taken this transaction (only the
+// pre-transaction value — captured by the FIRST local change — is ever
+// restored, matching PostgreSQL's stack-based revert: later SET/SET LOCAL
+// calls in the same transaction do not move the restore target). SET LOCAL
+// outside a transaction block behaves like a plain SET for the rest of the
+// current auto-commit statement (nothing to revert to), matching upstream
+// and config.SessionRegistry.Set's identical comment for ordinary GUCs.
+func (c *connTxState) SnapshotLocalRoleIfNeeded(local bool) {
+	if !local || !c.active || c.LocalRolePriorValue != nil {
+		return
+	}
+	prior := c.NonSuperuserRole
+	c.LocalRolePriorValue = &prior
+}
+
 // InExplicit reports whether an explicit transaction is currently active.
 func (c *connTxState) InExplicit() bool {
 	c.mu.Lock()
@@ -422,6 +450,16 @@ func (c *connTxState) End() {
 	c.PendingEnumRenames = nil
 	c.PendingCreatedEnums = nil
 	c.PendingCreatedComposites = nil
+	// Restore a pending SET LOCAL ROLE / SET LOCAL SESSION AUTHORIZATION to
+	// its pre-transaction value on both COMMIT and ROLLBACK — see
+	// SnapshotLocalRoleIfNeeded. Mirrors PendingEnumValues et al.: cleared
+	// unconditionally here (not only via EndLocalTransaction) so a stale
+	// snapshot can never leak into the connection's next transaction even on
+	// paths that skip EndLocalTransaction (e.g. connection teardown).
+	if c.LocalRolePriorValue != nil {
+		c.NonSuperuserRole = *c.LocalRolePriorValue
+		c.LocalRolePriorValue = nil
+	}
 	// Discard any NOTIFYs not yet published. On COMMIT the publish happens
 	// before End() is called; reaching here with a non-empty buffer means
 	// ROLLBACK (or commit-cleanup after publish), where the notifications must

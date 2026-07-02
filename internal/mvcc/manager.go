@@ -89,7 +89,12 @@ type Manager struct {
 	clog *CLog
 
 	xactMarkerMu sync.RWMutex
-	xactMarker   func(storage.TransactionID, XactMarker) error
+	// The bool parameter is waitLocalFlush: true (every existing caller —
+	// Commit/Rollback) requires the hook to durably flush the commit WAL
+	// record before returning; false (CommitAsync, synchronous_commit=off)
+	// lets the hook return without waiting for that flush, relying on the
+	// CLOG async-commit write barrier (M0117-0007) instead. M0117-0007 Part B.
+	xactMarker func(storage.TransactionID, XactMarker, bool) error
 
 	// onTxnEnd is called after every transaction commit or abort, once the
 	// XID slot has been cleared and commitCond has been broadcast. Use case:
@@ -342,6 +347,26 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 	return newXID, nil
 }
 
+// FreshSnapshot captures a brand-new "latest" MVCC snapshot reflecting every
+// transaction committed up to this instant, independent of any transaction's
+// isolation level or pinned statement snapshot.
+//
+// This mirrors PostgreSQL's deferred referential-integrity machinery: a
+// constraint trigger queued INITIALLY DEFERRED fires at COMMIT under a freshly
+// pushed snapshot (RI_FKey_check / ri_PerformCheck push GetLatestSnapshot before
+// running the check SPI query), NOT the firing statement's snapshot. Without
+// this a REPEATABLE READ transaction's pinned snapshot would fail to see a
+// concurrently-committed parent row that satisfies the constraint, raising a
+// spurious 23503 at COMMIT (see the fk-snapshot isolation spec, where s2's RR
+// snapshot cannot see s1's just-committed fk_parted_pk row but the deferred
+// check must still pass). Used only by the deferred FK check at COMMIT; the
+// snapshot still classifies the committing transaction's own XID as in-progress,
+// so own-write visibility continues to flow through the currentXID self-check in
+// TupleVisibleSubxact. 0119-0004 (deferred-ri-fresh-snapshot).
+func (m *Manager) FreshSnapshot() Snapshot {
+	return m.captureSnapshot()
+}
+
 // SnapshotFor returns the statement snapshot for tx.
 //
 // READ COMMITTED gets a fresh snapshot on every call.
@@ -424,7 +449,19 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 // XactCommit record, no fsync, no clog write) — mirroring PG's
 // RecordTransactionCommit fast-path for txns with no XID.
 func (m *Manager) Commit(tx Transaction) error {
-	return m.finish(tx, XactCommit)
+	return m.finish(tx, XactCommit, true)
+}
+
+// CommitAsync commits tx without waiting for the local WAL flush to
+// complete (PostgreSQL's synchronous_commit=off). Durability is still
+// guaranteed: the commit-record LSN is recorded against the XID's CLOG page
+// (xactMarker's hook calls CLog.SetCommittedWithLSN instead of SetCommitted)
+// and the async-commit write barrier flushes the WAL up to that LSN the
+// moment the page is written back to disk, so a claimed commit can never
+// reach disk without its WAL backing it — the transaction is simply not
+// held up waiting for that flush to happen now. M0117-0007 Part B.
+func (m *Manager) CommitAsync(tx Transaction) error {
+	return m.finish(tx, XactCommit, false)
 }
 
 // Rollback marks tx aborted and removes it from the active set.
@@ -433,7 +470,7 @@ func (m *Manager) Commit(tx Transaction) error {
 // the transaction in-progress; the caller is expected to retry
 // or escalate.
 func (m *Manager) Rollback(tx Transaction) error {
-	return m.finish(tx, XactAbort)
+	return m.finish(tx, XactAbort, true)
 }
 
 // DetachToDedicatedSlot relocates tx off its originating backend's proc slot
@@ -595,7 +632,7 @@ func (m *Manager) OldestXminForProc(procNum int32) storage.TransactionID {
 	return result
 }
 
-func (m *Manager) finish(tx Transaction, kind XactMarker) error {
+func (m *Manager) finish(tx Transaction, kind XactMarker, waitLocalFlush bool) error {
 	procNum := int32(tx.Handle) - 1
 	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
 		return ErrUnknownTransaction
@@ -636,7 +673,7 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 		hook := m.xactMarker
 		m.xactMarkerMu.RUnlock()
 		if hook != nil {
-			if err := hook(xid, kind); err != nil {
+			if err := hook(xid, kind, waitLocalFlush); err != nil {
 				return fmt.Errorf("mvcc: xact-marker hook (xid=%d, kind=%v): %w", xid, kind, err)
 			}
 		}
@@ -1171,8 +1208,10 @@ func (k XactMarker) String() string {
 // classifier sees commit/abort markers in the WAL stream.
 //
 // Pass nil to clear a previously installed hook. Tests that care
-// only about MVCC mechanics typically leave it unset.
-func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker) error) {
+// only about MVCC mechanics typically leave it unset. The third
+// parameter (waitLocalFlush) is true for Commit/Rollback and false for
+// CommitAsync (M0117-0007 Part B); see the xactMarker field doc.
+func (m *Manager) SetXactMarkerLogger(fn func(storage.TransactionID, XactMarker, bool) error) {
 	m.xactMarkerMu.Lock()
 	defer m.xactMarkerMu.Unlock()
 	m.xactMarker = fn

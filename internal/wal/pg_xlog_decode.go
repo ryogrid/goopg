@@ -16,6 +16,7 @@ const (
 	xlogHeapDelete          uint8 = 0x10 // XLOG_HEAP_DELETE
 	xlogHeapUpdate          uint8 = 0x20 // XLOG_HEAP_UPDATE
 	xlogHeapHotUpdate       uint8 = 0x40 // XLOG_HEAP_HOT_UPDATE
+	xlogHeapInplace         uint8 = 0x70 // XLOG_HEAP_INPLACE
 	xlogHeapOpMask          uint8 = 0x70
 	xlogHeapInit            uint8 = 0x80
 	xlogXactCommit          uint8 = 0x00

@@ -91,6 +91,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execTruncate(s)
 	case *parser.AlterTableStmt:
 		return nil, o.execAlterTable(s)
+	case *parser.CreateCollationStmt:
+		return nil, o.execCreateCollation(s)
 	case *parser.CreatePublicationStmt:
 		return nil, o.execCreatePublication(s)
 	case *parser.DropPublicationStmt:
@@ -99,6 +101,14 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateSubscription(s)
 	case *parser.DropSubscriptionStmt:
 		return nil, o.execDropSubscription(s)
+	case *parser.AlterPublicationOwnerStmt:
+		return nil, o.execAlterPublicationOwner(s)
+	case *parser.AlterSubscriptionOwnerStmt:
+		return nil, o.execAlterSubscriptionOwner(s)
+	case *parser.CreateEventTriggerStmt:
+		return nil, o.execCreateEventTrigger(s)
+	case *parser.AlterEventTriggerStmt:
+		return nil, o.execAlterEventTrigger(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -111,6 +121,12 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropProcedure(s)
 	case *parser.CreateTriggerStmt:
 		return nil, o.execCreateTrigger(s)
+	case *parser.CreatePolicyStmt:
+		return nil, o.execCreatePolicy(s)
+	case *parser.DropPolicyStmt:
+		return nil, o.execDropPolicy(s)
+	case *parser.CreateRuleStmt:
+		return nil, o.execCreateRule(s)
 	case *parser.DropRuleStmt:
 		return nil, o.execDropRule(s)
 	case *parser.DropTriggerStmt:
@@ -129,8 +145,18 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateAggregate(s)
 	case *parser.AlterAggregateRenameStmt:
 		return nil, o.execAlterAggregateRename(s)
+	case *parser.AlterAggregateOwnerStmt:
+		return nil, o.execAlterAggregateOwner(s)
+	case *parser.AlterCollationStmt:
+		return nil, o.execAlterCollation(s)
+	case *parser.AlterOperatorSetStmt:
+		return nil, o.execAlterOperatorSet(s)
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
+	case *parser.AlterOpFamilyAddStmt:
+		return nil, o.execAlterOpFamilyAdd(s)
+	case *parser.AlterOpFamilyDropStmt:
+		return nil, o.execAlterOpFamilyDrop(s)
 	case *parser.CreateExtensionStmt:
 		return nil, o.execCreateExtension(s)
 	case *parser.CreateTablespaceStmt:
@@ -143,6 +169,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCommentOn(s)
 	case *parser.CreateStatisticsStmt:
 		return nil, o.execCreateStatistics(s)
+	case *parser.AlterStatisticsStmt:
+		return nil, o.execAlterStatistics(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -306,6 +334,197 @@ func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
 	return nil
 }
 
+// execCreateCollation registers a CREATE COLLATION in the runtime
+// pg_collation registry so pg_dump's getCollations / dumpCollation round-trip
+// it. goopg does not use the collation for actual string ordering — only the
+// schema-dump round-trip is modeled. The `LOCALE` clause sets both lc_collate
+// and lc_ctype for the default libc provider (mirroring gram.y / DefineCollation
+// in collationcmds.c); the `FROM existing` form copies the source collation's
+// attributes. M0119-0004.
+func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	uc := &catalog.UserCollation{
+		Name:          s.Name.Name,
+		Owner:         10, // postgres superuser
+		Encoding:      -1, // encoding-independent unless a built-in source says otherwise
+		Deterministic: true,
+	}
+	if s.FromName.Name != "" {
+		// CREATE COLLATION new FROM existing — copy the source's attributes.
+		src, found := im.CollationAttrsByName(s.FromName.Name)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q for current database encoding does not exist", s.FromName.Name)}
+		}
+		uc.Provider = src.Provider
+		uc.Encoding = src.Encoding
+		uc.Collate = src.Collate
+		uc.Ctype = src.Ctype
+		uc.Locale = src.Locale
+		uc.Rules = src.Rules
+		// FROM copies collisdeterministic too (DefineCollation in
+		// collationcmds.c reads collform->collisdeterministic): a collation
+		// derived from a non-deterministic source is itself non-deterministic.
+		uc.Deterministic = src.Deterministic
+	} else {
+		// Provider: default libc ('c') when unspecified.
+		switch s.Provider {
+		case "icu":
+			uc.Provider = 'i'
+		case "builtin":
+			uc.Provider = 'b'
+		default:
+			uc.Provider = 'c'
+		}
+		if s.Deterministic == "false" {
+			uc.Deterministic = false
+		}
+		// LOCALE sets both lc_collate and lc_ctype when they are not given
+		// explicitly. For the libc provider, collcollate/collctype carry the
+		// locale and colllocale stays NULL; for builtin/icu, colllocale carries
+		// the locale and collcollate/collctype stay NULL (matching pg_collation
+		// and what dumpCollation expects per provider).
+		collate := s.LcCollate
+		ctype := s.LcCtype
+		if collate == "" {
+			collate = s.Locale
+		}
+		if ctype == "" {
+			ctype = s.Locale
+		}
+		switch uc.Provider {
+		case 'c':
+			uc.Collate = collate
+			uc.Ctype = ctype
+		default: // 'b' builtin, 'i' icu
+			loc := s.Locale
+			if loc == "" {
+				loc = collate
+			}
+			uc.Locale = loc
+		}
+		// ICU tailoring rules (collicurules) are only valid for the icu
+		// provider (DefineCollation in collationcmds.c rejects RULES for libc/
+		// builtin). goopg does not interpret the rules — only the schema-dump
+		// round-trip is modeled — so store verbatim for re-emission by
+		// dumpCollation's `, rules = '...'` clause.
+		if uc.Provider == 'i' {
+			uc.Rules = s.Rules
+		}
+	}
+	if _, err := im.CreateCollation(uc, schema, s.IfNotExists); err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
+	// per-collation on-disk file namespace, so record a WAL event the
+	// recovery driver (internal/initdb/collation_ddl_recovery.go) replays
+	// into the collation registry on the next startup. Mirrors CREATE
+	// CAST/TRANSFORM/CONVERSION. uc.OID is only set when CreateCollation
+	// actually inserted a new entry (the IF NOT EXISTS "already exists"
+	// path returns the existing OID without touching uc.OID), so this skips
+	// the WAL write for a no-op IF NOT EXISTS hit.
+	if o.ctx.WAL != nil && uc.OID != 0 {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCollation(uc.Name, schema, uc.Collate, uc.Ctype, uc.Locale, uc.Rules, uc.OID, uc.Owner, int32(uc.Encoding), uc.Provider, uc.Deterministic)); werr != nil {
+			return fmt.Errorf("wal create-collation: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterCollation handles ALTER COLLATION [IF EXISTS] name RENAME TO
+// newname | OWNER TO role | REFRESH VERSION. Only user-created collations
+// (the userCollations registry CREATE COLLATION populates) can be targeted —
+// a built-in collation is never registered there, so it always reports "does
+// not exist" here, mirroring DROP COLLATION's refusal to touch a pinned
+// pg_collation row. REFRESH VERSION has no real collation-versioning engine
+// behind it in goopg, so it mirrors PG's own no-detectable-version branch
+// (e.g. non-glibc libc): always a "version has not changed" NOTICE, no
+// catalog write, so nothing to WAL-log. RENAME TO / OWNER TO DO WAL-log
+// (RecordKindAlterCollationRename/Owner) so the mutation survives a restart —
+// mirrors CREATE/DROP COLLATION's restart-persistence, unlike ALTER TABLE
+// RENAME/OWNER TO which stays in-memory-only today. M0119-0004 (DU-002,
+// loop #50 ledger follow-up; WAL logging added as the loop #50 ledger's
+// resume-point (a)).
+func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	notFound := func() error {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("collation %q does not exist, skipping", s.Name.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q does not exist", s.Name.Name)}
+	}
+	switch s.Action {
+	case "rename":
+		if err := im.RenameCollation(s.Name.Name, schema, s.NewName); err != nil {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationRename(s.Name.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-collation-rename: %w", werr)
+			}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateCollation's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetCollationOwner(s.Name.Name, schema, ownerOID) {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationOwner(s.Name.Name, schema, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-collation-owner: %w", werr)
+			}
+		}
+		return nil
+	case "refresh":
+		if _, found := im.CollationAttrsByName(s.Name.Name); !found {
+			return notFound()
+		}
+		o.ctx.AddNotice(fmt.Sprintf("version has not changed for collation %q", s.Name.Name))
+		return nil
+	default:
+		// Unmodelled ALTER COLLATION form (e.g. SET SCHEMA) — no-op.
+		return nil
+	}
+}
+
+// currentDDLOwnerOID resolves the OID that should own an object created by
+// the current statement: the role currently in effect via SET ROLE / SET
+// SESSION AUTHORIZATION (o.ctx.NonSuperuserRole), or the bootstrap superuser
+// (OID 10) when no such role is active. Mirrors PostgreSQL's
+// GetUserId()-as-owner convention (e.g. CreatePublication, publicationcmds.c).
+// An unresolvable role name (should not happen — NonSuperuserRole is only
+// ever set from a previously-validated role) falls back to the bootstrap
+// superuser rather than minting a bogus owner. DU-002 slice 424.
+func (o *ddlOp) currentDDLOwnerOID() uint32 {
+	if o.ctx.NonSuperuserRole != "" {
+		if oid, ok := o.ctx.Catalog.RoleOID(o.ctx.NonSuperuserRole); ok {
+			return oid
+		}
+	}
+	return 10
+}
+
 // execCreatePublication / execDropPublication / execCreateSubscription
 // / execDropSubscription drive the *catalog.PubSub registry attached
 // via Context.PubSub. The five virtual catalog views
@@ -357,8 +576,19 @@ func (o *ddlOp) execCreatePublication(s *parser.CreatePublicationStmt) error {
 		}
 		tables = append(tables, tbl.QualifiedName())
 	}
-	if _, err := o.ctx.PubSub.CreatePublication(s.Name, tables, opts); err != nil {
+	pub, err := o.ctx.PubSub.CreatePublicationAsOwner(s.Name, tables, opts, o.currentDDLOwnerOID())
+	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #67 ledger
+	// resume point): goopg has no per-publication on-disk file namespace,
+	// so record a WAL event the recovery driver
+	// (internal/initdb/pubsub_ddl_recovery.go) replays into the PubSub
+	// registry on the next startup. Mirrors CREATE COLLATION.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreatePublication(pub.Name, pub.Tables, pub.OID, pub.Owner, pub.AllTables, pub.PublishInsert, pub.PublishUpdate, pub.PublishDelete)); werr != nil {
+			return fmt.Errorf("wal create-publication: %w", werr)
+		}
 	}
 	return nil
 }
@@ -373,6 +603,11 @@ func (o *ddlOp) execDropPublication(s *parser.DropPublicationStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropPublication(s.Name)); werr != nil {
+			return fmt.Errorf("wal drop-publication: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -385,8 +620,14 @@ func (o *ddlOp) execCreateSubscription(s *parser.CreateSubscriptionStmt) error {
 		enabled = v == "true" || v == "on" || v == "yes" || v == "1"
 	}
 	slotName := s.With["slot_name"]
-	if _, err := o.ctx.PubSub.CreateSubscription(s.Name, s.Conninfo, s.Publications, slotName, enabled); err != nil {
+	sub, err := o.ctx.PubSub.CreateSubscriptionAsOwner(s.Name, s.Conninfo, s.Publications, slotName, enabled, o.currentDDLOwnerOID())
+	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSubscription(sub.Name, sub.Conninfo, sub.SlotName, sub.Publications, sub.OID, sub.Owner, sub.Enabled)); werr != nil {
+			return fmt.Errorf("wal create-subscription: %w", werr)
+		}
 	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
@@ -404,10 +645,250 @@ func (o *ddlOp) execDropSubscription(s *parser.DropSubscriptionStmt) error {
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSubscription(s.Name)); werr != nil {
+			return fmt.Errorf("wal drop-subscription: %w", werr)
+		}
+	}
 	if o.ctx.OnSubscriptionChange != nil {
 		o.ctx.OnSubscriptionChange()
 	}
 	return nil
+}
+
+// resolveNewOwnerOID resolves an ALTER ... OWNER TO target to a role OID,
+// honouring the "current_user" sentinel (CURRENT_USER/SESSION_USER/
+// CURRENT_ROLE) parsers emit for AlterPublicationOwnerStmt/
+// AlterSubscriptionOwnerStmt (and, elsewhere, AlterCollationStmt/
+// AlterAggregateOwnerStmt), by resolving it to the bootstrap superuser —
+// mirrors execAlterCollation/execAlterAggregateOwner's inline duplicate of
+// this same lookup. M0119-0004 (DU-002, loop #65 ledger follow-up).
+func (o *ddlOp) resolveNewOwnerOID(newOwner string, pos int) (uint32, error) {
+	if strings.EqualFold(newOwner, "current_user") {
+		return 10, nil
+	}
+	oid, found := o.ctx.Catalog.RoleOID(newOwner)
+	if !found {
+		return 0, &ExecError{Code: "42704", Pos: pos, Message: fmt.Sprintf("role %q does not exist", newOwner)}
+	}
+	return oid, nil
+}
+
+// execAlterPublicationOwner handles ALTER PUBLICATION name OWNER TO newowner.
+// M0119-0004 (DU-002, loop #65 ledger follow-up: closes the loop #60/#63/#64/
+// #65 rows' "ALTER PUBLICATION/SUBSCRIPTION ... OWNER TO are still
+// unimplemented" resume point). Like CREATE/DROP PUBLICATION, the ownership
+// change is now WAL-logged (loop #67 ledger resume point) so it survives a
+// restart.
+func (o *ddlOp) execAlterPublicationOwner(s *parser.AlterPublicationOwnerStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER PUBLICATION requires PubSub registry in Context"}
+	}
+	ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
+	if err != nil {
+		return err
+	}
+	if serr := o.ctx.PubSub.SetPublicationOwner(s.Name, ownerOID); serr != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterPublicationOwner(s.Name, ownerOID)); werr != nil {
+			return fmt.Errorf("wal alter-publication-owner: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterSubscriptionOwner handles ALTER SUBSCRIPTION name OWNER TO
+// newowner. M0119-0004 (DU-002, loop #65 ledger follow-up); see
+// execAlterPublicationOwner.
+func (o *ddlOp) execAlterSubscriptionOwner(s *parser.AlterSubscriptionOwnerStmt) error {
+	if o.ctx.PubSub == nil {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER SUBSCRIPTION requires PubSub registry in Context"}
+	}
+	ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
+	if err != nil {
+		return err
+	}
+	if serr := o.ctx.PubSub.SetSubscriptionOwner(s.Name, ownerOID); serr != nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: serr.Error()}
+	}
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSubscriptionOwner(s.Name, ownerOID)); werr != nil {
+			return fmt.Errorf("wal alter-subscription-owner: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execCreateEventTrigger registers a CREATE EVENT TRIGGER in the runtime
+// pg_event_trigger registry so it round-trips through pg_dump
+// (getEventTriggers/dumpEventTrigger). goopg never fires event triggers — the
+// semantic validation below mirrors PostgreSQL's CreateEventTrigger
+// (postgres/src/backend/commands/event_trigger.c), including the ordering
+// (superuser check first, then event name, then WHEN-clause validation) and
+// the full DDL-command-tag list (validate_ddl_tags/validate_table_rewrite_tags,
+// commandTagBehavior in cmdtag_table.go).
+func (o *ddlOp) execCreateEventTrigger(s *parser.CreateEventTriggerStmt) error {
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create event trigger %q", s.Name)}
+	}
+	switch s.Event {
+	case "ddl_command_start", "ddl_command_end", "sql_drop", "login", "table_rewrite":
+	default:
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized event name %q", s.Event)}
+	}
+	if s.FilterVar != "" && s.FilterVar != "tag" {
+		return &ExecError{Code: "42601", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized filter variable %q", s.FilterVar)}
+	}
+	if len(s.Tags) > 0 && s.Event == "login" {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "tag filtering is not supported for login event triggers"}
+	}
+	switch s.Event {
+	case "ddl_command_start", "ddl_command_end", "sql_drop":
+		if err := validateDDLTags(s.Tags, s.Pos()); err != nil {
+			return err
+		}
+	case "table_rewrite":
+		if err := validateTableRewriteTags(s.Tags, s.Pos()); err != nil {
+			return err
+		}
+	}
+	funcOID, ok := resolveEventTriggerFunc(o.ctx.Catalog, s.FuncName)
+	if !ok {
+		return &ExecError{Code: "42883", Pos: s.Pos(), Message: fmt.Sprintf("function %s() does not exist", s.FuncName.String())}
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE EVENT TRIGGER requires the in-memory catalog"}
+	}
+	et, err := im.RegisterEventTrigger(s.Name, s.Event, o.currentDDLOwnerOID(), funcOID, s.Tags)
+	if err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
+	// resume point): goopg has no per-event-trigger on-disk file namespace,
+	// so record a WAL event the recovery driver
+	// (internal/initdb/event_trigger_ddl_recovery.go) replays into the
+	// eventTriggers registry on the next startup. Mirrors CREATE
+	// PUBLICATION.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateEventTrigger(et.Name, et.Event, et.Tags, et.OID, et.Owner, et.FuncOID)); werr != nil {
+			return fmt.Errorf("wal create-event-trigger: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterEventTrigger handles ALTER EVENT TRIGGER name {DISABLE |
+// ENABLE [REPLICA|ALWAYS] | RENAME TO newname | OWNER TO newowner}. Like
+// CREATE EVENT TRIGGER, this only maintains dump fidelity (evtenabled/
+// evtname/evtowner in the pg_event_trigger virtual view) — goopg never fires
+// event triggers, so ENABLE/DISABLE has no runtime effect beyond the catalog
+// row. Each mutation is WAL-logged (DU-002 restart-persistence follow-up,
+// M0119-0004 loop #70 ledger resume point) so it survives a restart, mirroring
+// ALTER PUBLICATION/SUBSCRIPTION OWNER TO.
+func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER EVENT TRIGGER requires the in-memory catalog"}
+	}
+	notFoundErr := func(err error) *ExecError {
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+	}
+	logEnabled := func(code byte) error {
+		if o.ctx.WAL == nil {
+			return nil
+		}
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerEnabled(s.Name, code)); werr != nil {
+			return fmt.Errorf("wal alter-event-trigger-enabled: %w", werr)
+		}
+		return nil
+	}
+	switch s.Action {
+	case "disable":
+		if err := im.SetEventTriggerEnabled(s.Name, "D"); err != nil {
+			return notFoundErr(err)
+		}
+		if err := logEnabled('D'); err != nil {
+			return err
+		}
+	case "enable":
+		if err := im.SetEventTriggerEnabled(s.Name, "O"); err != nil {
+			return notFoundErr(err)
+		}
+		if err := logEnabled('O'); err != nil {
+			return err
+		}
+	case "enable_replica":
+		if err := im.SetEventTriggerEnabled(s.Name, "R"); err != nil {
+			return notFoundErr(err)
+		}
+		if err := logEnabled('R'); err != nil {
+			return err
+		}
+	case "enable_always":
+		if err := im.SetEventTriggerEnabled(s.Name, "A"); err != nil {
+			return notFoundErr(err)
+		}
+		if err := logEnabled('A'); err != nil {
+			return err
+		}
+	case "rename":
+		if err := im.RenameEventTrigger(s.Name, s.NewName); err != nil {
+			if errors.Is(err, catalog.ErrEventTriggerAlreadyExists) {
+				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+			}
+			return notFoundErr(err)
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerRename(s.Name, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-event-trigger-rename: %w", werr)
+			}
+		}
+	case "owner":
+		ownerOID, err := o.resolveNewOwnerOID(s.NewOwner, s.Pos())
+		if err != nil {
+			return err
+		}
+		// AlterEventTriggerOwner_internal (event_trigger.c): the new owner
+		// must itself be a superuser. goopg's role model tracks no per-role
+		// rolsuper attribute — OID 10 (bootstrap superuser) is the only
+		// superuser — so this is the closest faithful approximation.
+		if ownerOID != 10 {
+			return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to change owner of event trigger %q", s.Name)}
+		}
+		if err := im.SetEventTriggerOwner(s.Name, ownerOID); err != nil {
+			return notFoundErr(err)
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterEventTriggerOwner(s.Name, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-event-trigger-owner: %w", werr)
+			}
+		}
+	default:
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized ALTER EVENT TRIGGER action %q", s.Action)}
+	}
+	return nil
+}
+
+// resolveEventTriggerFunc looks up a niladic (0-argument) function by name,
+// mirroring CreateEventTrigger's `LookupFuncName(stmt->funcname, 0, NULL,
+// false)` — a user-defined routine is tried first (LookupByName already
+// searches every schema when name.Schema is empty), then the hand-curated
+// builtin pg_proc set.
+func resolveEventTriggerFunc(cat catalog.Catalog, name parser.ObjectName) (uint32, bool) {
+	if rs := cat.Routines(); rs != nil {
+		for _, r := range rs.LookupByName(name) {
+			if len(r.ArgTypes) == 0 {
+				return r.OID, true
+			}
+		}
+	}
+	if bp, found := catalog.LookupBuiltinProc(name.Name); found && len(bp.ArgTypes) == 0 {
+		return bp.OID, true
+	}
+	return 0, false
 }
 
 // qualifiedTableName renders an ObjectName as "schema.name" or
@@ -492,6 +973,42 @@ func (o *ddlOp) execDoBlock(s *parser.DoStmt) error {
 	return nil
 }
 
+// compositeFieldColumnType converts a composite type field's column-type string
+// (as stored in catalog.CompositeField.ColType — parser tokens joined by spaces,
+// e.g. "integer", "numeric ( 10 , 2 )", "text [ ]") into the parser.ColumnType a
+// synthesized typed-table column carries. It mirrors the splitting in
+// parseCompositeFieldType (array suffix, then optional typmod args), collapsing
+// the multi-word base name to the single-spaced form column-type resolution
+// recognizes. DU-002 slice 374.
+func compositeFieldColumnType(colType string) parser.ColumnType {
+	str := strings.TrimSpace(colType)
+	isArray := false
+	if i := strings.IndexByte(str, '['); i >= 0 {
+		isArray = true
+		str = strings.TrimSpace(str[:i])
+	}
+	base := str
+	var args []int64
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		inner := base[i+1:]
+		base = strings.TrimSpace(base[:i])
+		if j := strings.IndexByte(inner, ')'); j >= 0 {
+			inner = inner[:j]
+		}
+		for _, part := range strings.Split(inner, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if n, err := strconv.ParseInt(part, 10, 64); err == nil {
+				args = append(args, n)
+			}
+		}
+	}
+	base = strings.Join(strings.Fields(base), " ")
+	return parser.ColumnType{Name: base, Args: args, IsArray: isArray}
+}
+
 func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Temporary tables may only be created in the temp schema (pg_temp),
 	// not in a permanent schema like public.
@@ -559,6 +1076,38 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// The data is populated by the SELECT execution.
 	if s.SelectSource != nil {
 		return o.execCreateTableAs(s)
+	}
+
+	// CREATE TABLE name OF type_name — a typed table whose columns are derived
+	// from a composite type. We synthesize a ColumnDef per composite field and
+	// feed them through the normal column-build path (so domain/enum/array field
+	// types resolve identically to an explicit column). pg_class.reloftype is set
+	// to the composite type's OID after the table is created, so pg_dump re-emits
+	// the `OF type_name` form and suppresses the type-derived column list. PG keeps
+	// attislocal=true on these columns (makeColumnDef default; transformOfType does
+	// not clear it), and pg_dump skips them on dump via the reloftype check rather
+	// than attislocal — so no inheritance plumbing is needed. DU-002 slice 374.
+	var ofTypeOID uint32
+	if s.OfType != nil {
+		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "typed tables are not supported on this catalog"}
+		}
+		ct := im.LookupCompositeType(s.OfType.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.OfType.String())}
+		}
+		ofTypeOID = ct.OID
+		derived := make([]parser.ColumnDef, 0, len(ct.Fields))
+		for _, f := range ct.Fields {
+			derived = append(derived, parser.ColumnDef{
+				Name:      f.Name,
+				Type:      compositeFieldColumnType(f.ColType),
+				Collation: f.Collation,
+			})
+		}
+		s.Columns = derived
 	}
 
 	// Build the column list, merging inherited columns first (M0096-0009).
@@ -700,19 +1249,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				serialTyp == "bigserial" || serialTyp == "serial8" ||
 				serialTyp == "smallserial" || serialTyp == "serial2"
 			cols = append(cols, catalog.Column{
-				Name:             c.Name,
-				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
-				DeclaredTypeName: declaredTypeName,
-				NotNull:          c.NotNull || c.IdentityColumn || isSerialCol,
-				GeneratedExpr:    c.GeneratedExpr,
-				GeneratedAlways:  c.GeneratedAlways,
-				GeneratedVirtual: c.GeneratedVirtual,
-				DefaultExpr:      c.DefaultExpr,
-				IdentityColumn:   c.IdentityColumn,
-				IdentityAlways:   c.IdentityAlways,
-				IdentityStart:    c.IdentityStart,
-				Compression:      c.Compression,
-				Collation:        c.Collation,
+				Name:              c.Name,
+				Type:              catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
+				DeclaredTypeName:  declaredTypeName,
+				NotNull:           c.NotNull || c.IdentityColumn || isSerialCol,
+				GeneratedExpr:     c.GeneratedExpr,
+				GeneratedAlways:   c.GeneratedAlways,
+				GeneratedVirtual:  c.GeneratedVirtual,
+				DefaultExpr:       c.DefaultExpr,
+				IdentityColumn:    c.IdentityColumn,
+				IdentityAlways:    c.IdentityAlways,
+				IdentityStart:     c.IdentityStart,
+				IdentityIncrement: c.IdentityIncrement,
+				IdentityMin:       c.IdentityMin,
+				IdentityMax:       c.IdentityMax,
+				IdentityCache:     c.IdentityCache,
+				IdentityCycle:     c.IdentityCycle,
+				Compression:       c.Compression,
+				Collation:         c.Collation,
+				FDWOptions:        c.FDWOptions,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -903,6 +1458,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				DefaultExpr:      c.DefaultExpr,
 				Compression:      c.Compression,
 				Collation:        c.Collation,
+				FDWOptions:       c.FDWOptions,
 			})
 		}
 	}
@@ -1941,11 +2497,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// CREATE FOREIGN TABLE ... SERVER srv — the named server must already
+	// exist (mirrors real PG's DefineRelation → GetForeignServerByName, which
+	// raises 42704 before the relation is even created). Checked here, before
+	// CreateTable, so a bad SERVER name never leaves a half-created relation
+	// behind. DU-002 slice 417.
+	if s.ForeignServer != "" {
+		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "foreign tables are not supported on this catalog"}
+		}
+		if im.ForeignServerOID(s.ForeignServer) == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("server %q does not exist", s.ForeignServer)}
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
+	if s.ForeignServer != "" {
+		tbl.ForeignServerName = s.ForeignServer
+		tbl.ForeignOptions = s.ForeignOptions
+	}
 	tbl.Unlogged = s.Unlogged
+	tbl.OfTypeOID = ofTypeOID // typed table `OF type` → pg_class.reloftype (DU-002 slice 374)
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
@@ -2036,8 +2612,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				RefColumns:        c.RefColumns,
 				OnDelete:          c.OnDelete,
 				OnUpdate:          c.OnUpdate,
+				OnDeleteSetCols:   append([]string(nil), c.OnDeleteSetCols...),
 				Deferrable:        c.FKDeferrable,
 				InitiallyDeferred: c.FKInitiallyDeferred,
+				MatchFull:         c.FKMatchFull,
 			}
 			// Check type compatibility between referencing and referenced column.
 			if err := checkFKColumnTypeCompatibility(o.ctx, tbl, fk, c.Type.Name, s.Pos()); err != nil {
@@ -2069,8 +2647,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			RefColumns:        append([]string(nil), tfk.RefColumns...),
 			OnDelete:          tfk.OnDelete,
 			OnUpdate:          tfk.OnUpdate,
+			OnDeleteSetCols:   append([]string(nil), tfk.OnDeleteSetCols...),
 			Deferrable:        tfk.Deferrable,
 			InitiallyDeferred: tfk.InitiallyDeferred,
+			MatchFull:         tfk.MatchFull,
 		}
 		tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 	}
@@ -2106,7 +2686,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.IdentityStart != 0 {
 			seqStart = c.IdentityStart
 		}
-		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
+		// Honour the remaining identity sequence options (INCREMENT BY / MINVALUE /
+		// MAXVALUE / CACHE / CYCLE) so pg_dump's ADD GENERATED ... AS IDENTITY (...)
+		// round-trips the non-default values, not just START WITH. nil → type/PG
+		// default (serial columns never set these). DU-002 (pg_dump 002–010).
+		seqIncrement := int64(1)
+		if c.IdentityIncrement != nil {
+			seqIncrement = *c.IdentityIncrement
+		}
+		if c.IdentityMin != nil {
+			seqMin = *c.IdentityMin
+		}
+		if c.IdentityMax != nil {
+			seqMax = *c.IdentityMax
+		}
+		RegisterSequence(seqName, seqStart, seqIncrement, seqMin, seqMax, c.IdentityCycle)
+		if c.IdentityCache != nil {
+			SetSequenceCache(seqName, *c.IdentityCache)
+		}
 		// Set the data type so information_schema.sequences shows the correct type
 		// AND pg_dump computes the right default min/max. The base-integer aliases
 		// (int2/smallint, int8/bigint) only reach here for IDENTITY columns (serial
@@ -2136,6 +2733,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.IdentityColumn || isSerial {
 			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
 		}
+		// Restart persistence: mark which column this implicit sequence backs
+		// (the serial spelling / identity kind — replay restores the column's
+		// catalog markers, which pg_attribute cannot carry because it stores
+		// the PG-canonical base integer atttypid), then WAL-log the full
+		// sequence state. See RecordKindSequenceState (wal/recovery.go).
+		var identKind byte
+		if c.IdentityColumn {
+			identKind = 1
+			if c.IdentityAlways {
+				identKind = 2
+			}
+		}
+		spelling := ""
+		if isSerial {
+			spelling = colTypeLow
+		}
+		SetSequenceColumnMarker(seqName, spelling, identKind)
+		WALLogSequenceState(o.ctx, seqName)
 	}
 
 	// If PARTITION BY, annotate the table with partition metadata
@@ -2190,6 +2805,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
 					idx.Deferrable = nc.Deferrable
 					idx.InitiallyDeferred = nc.InitiallyDeferred
+					// Partial EXCLUDE WHERE predicate rides the backing index so the
+					// deparse re-emits ` WHERE (pred)`. DU-002 slice 310.
+					applyExclusionPredicate(idx, nc.ExclusionWhere)
 				}
 			} else {
 				// Other exclusion operators: stub catalog entry; no enforcement in v0.
@@ -2365,6 +2983,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
 				idx.Deferrable = ec.Deferrable
 				idx.InitiallyDeferred = ec.InitiallyDeferred
+				// Partial EXCLUDE WHERE predicate rides the backing index. DU-002 slice 310.
+				applyExclusionPredicate(idx, ec.ExclusionWhere)
 			}
 		} else {
 			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
@@ -3505,20 +4125,18 @@ func defaultExprToSQL(e parser.Expr) string {
 			// fmt.Sprintf("%v") and dumped a Go pointer string (DU-002 slice 302).
 			// PG's parser folds a unary minus applied DIRECTLY to a numeric literal
 			// into a negative typed Const at parse time (gram.y doNegate), which
-			// pg_get_expr deparses as `'-N'::type`. goopg is type-blind in this
-			// renderer, so for a bare numeric operand it emits the re-parseable
-			// `-N` (semantically identical; byte-differs from PG's `'-N'::type` —
-			// matching that cast form needs column/argument type and is deferred).
-			// For a unary minus on a COMPOUND operand (an OpExpr PG does NOT fold),
-			// get_rule_expr deparses `(- (operand))`; the recursion parenthesizes
-			// the operand, so mirror that exact form. Keep in sync with the catalog
-			// twin catalog.formatExprForAttrdef.
-			switch v.Operand.(type) {
-			case *parser.IntegerConst, *parser.NumericConst:
-				return "-" + defaultExprToSQL(v.Operand)
-			default:
-				return "(- " + defaultExprToSQL(v.Operand) + ")"
+			// get_const_expr deparses as the quoted-value-plus-cast `'-N'::type` so
+			// it re-parses as one constant. parser.NegatedLiteralSQL reproduces that
+			// exact form (and PG's literal-type resolution); it returns "" for a
+			// non-literal operand. For a unary minus on a COMPOUND operand (an OpExpr
+			// PG does NOT fold), get_rule_expr deparses `(- (operand))`; the recursion
+			// parenthesizes the operand, so mirror that exact form. Keep in sync with
+			// the catalog twin catalog.formatExprForAttrdef. DU-002 slice 364
+			// (resolves the slice 302/360(a)/362(b)/363 deferred `'-N'::type` gap).
+			if neg := parser.NegatedLiteralSQL(v.Operand); neg != "" {
+				return neg
 			}
+			return "(- " + defaultExprToSQL(v.Operand) + ")"
 		case parser.OpNot:
 			return "NOT " + defaultExprToSQL(v.Operand)
 		}
@@ -3622,6 +4240,122 @@ func defaultExprToSQL(e parser.Expr) string {
 		return defaultExprToSQL(v.Left) + op + defaultExprToSQL(v.Right)
 	}
 	return fmt.Sprintf("%v", e)
+}
+
+// renderCheckPredicate produces the `CHECK (<expr>)` text for a table-level CHECK
+// constraint, mirroring pg_get_constraintdef_worker (ruleutils.c). PostgreSQL
+// re-deparses the stored constraint node (pg_constraint.conbin) via get_rule_expr,
+// which fully parenthesizes every sub-expression: a compound predicate like
+// `a > 0 AND b > 0` dumps as `CHECK (((a > 0) AND (b > 0)))` and a function call
+// like `length(name) > 0` as `CHECK ((length(name) > 0))`. goopg stores the CHECK
+// body as token-reconstructed raw text (parser.parseCheckExpr), so the legacy
+// `CHECK ((<raw>))` wrap only matched PG for a single bare comparison; anything
+// compound (AND/OR) or carrying a function call diverged on PG's per-node
+// parenthesization (and on the spaces the token join inserts around parentheses).
+// Re-parse the raw text and deparse it through defaultExprToSQL — the same
+// fully-parenthesizing renderer the index-predicate, expression-index and
+// partition-key paths use — which reproduces PG's bytes for every expression form
+// it handles; the single outer paren layer is supplied by the `CHECK (%s)` wrapper
+// because defaultExprToSQL already parenthesizes the top-level OpExpr/BoolExpr (so
+// a single comparison still renders the byte-identical `CHECK ((a < b))`). Guard
+// with a re-parse round-trip: if the raw text fails to parse, or the deparsed form
+// is not itself re-parseable (defaultExprToSQL hit a node it cannot render and fell
+// through to its Go-value fallback), keep the legacy double-paren raw wrap so we
+// never emit non-SQL garbage. DU-002 slice 362.
+func renderCheckPredicate(rawExpr string) string {
+	if e, err := parser.ParseExpr(rawExpr); err == nil {
+		if deparsed := defaultExprToSQL(e); deparsed != "" {
+			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				return "CHECK (" + deparsed + ")"
+			}
+		}
+	}
+	return "CHECK ((" + rawExpr + "))"
+}
+
+// renderDomainCheckPredicate is renderCheckPredicate's domain twin: it produces
+// the `CHECK (<expr>)` text for a *generic* (non-IN) domain CHECK constraint,
+// mirroring pg_get_constraintdef_worker over a CoerceToDomainValue-bearing node.
+// It re-parses the stored raw text and deparses it through defaultExprToSQL — the
+// same fully-parenthesizing renderer the table-CHECK path uses — so a compound
+// domain predicate like `VALUE > 0 AND VALUE < 100` dumps `CHECK (((VALUE > 0)
+// AND (VALUE < 100)))` and a function call like `length(VALUE) > 0` dumps
+// `CHECK ((length(VALUE) > 0))`, matching real pg_dump 18.3 instead of goopg's
+// legacy token-text wrap `CHECK ((<raw>))`.
+//
+// The one wrinkle versus the table path: PG deparses the domain value placeholder
+// as the uppercase keyword `VALUE` (get_rule_expr T_CoerceToDomainValue), but
+// goopg stores it as a plain identifier and the lexer case-folds it to `value` on
+// re-parse. In a domain CHECK the ONLY column reference is the value placeholder
+// (there is no table to name a real column), so upcaseDomainValuePlaceholder
+// rewrites every bare `value` ColumnRef in the re-parsed tree back to `VALUE`
+// before deparsing. The same re-parse round-trip guard as renderCheckPredicate
+// falls back to the raw wrap if the text fails to parse or the deparse is not
+// itself re-parseable, so we never emit non-SQL garbage.
+//
+// Callers must NOT route a `CHECK (VALUE IN (...))` domain through here: that form
+// is stored as a pre-synthesized, byte-exact ScalarArrayOp deparse
+// (domainInValuesCheckExpr) that defaultExprToSQL cannot reproduce; the dump site
+// keeps its legacy wrap for that case. DU-002 slice 363.
+func renderDomainCheckPredicate(rawExpr string) string {
+	if e, err := parser.ParseExpr(rawExpr); err == nil {
+		upcaseDomainValuePlaceholder(e)
+		if deparsed := defaultExprToSQL(e); deparsed != "" {
+			if _, err2 := parser.ParseExpr(deparsed); err2 == nil {
+				return "CHECK (" + deparsed + ")"
+			}
+		}
+	}
+	return "CHECK ((" + rawExpr + "))"
+}
+
+// upcaseDomainValuePlaceholder walks a freshly-parsed domain CHECK expression and
+// rewrites every bare (unqualified) `value` ColumnRef to the uppercase keyword
+// `VALUE` in place, so defaultExprToSQL (which renders a ColumnRef verbatim)
+// reproduces PG's CoerceToDomainValue deparse. The tree is a throwaway from
+// parser.ParseExpr, so in-place mutation is safe. The recursion covers exactly the
+// container node types defaultExprToSQL renders; nodes it cannot render are left
+// untouched and the renderDomainCheckPredicate round-trip guard rejects them.
+func upcaseDomainValuePlaceholder(e parser.Expr) {
+	switch v := e.(type) {
+	case *parser.ColumnRef:
+		if v.Schema == "" && v.Table == "" && strings.EqualFold(v.Column, "value") {
+			v.Column = "VALUE"
+		}
+	case *parser.BinaryOp:
+		upcaseDomainValuePlaceholder(v.Left)
+		upcaseDomainValuePlaceholder(v.Right)
+	case *parser.UnaryOp:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.FuncCall:
+		for _, a := range v.Args {
+			upcaseDomainValuePlaceholder(a)
+		}
+	case *parser.CastExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.IsNullExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.IsBoolExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+	case *parser.IsDistinctFromExpr:
+		upcaseDomainValuePlaceholder(v.Left)
+		upcaseDomainValuePlaceholder(v.Right)
+	case *parser.CaseExpr:
+		upcaseDomainValuePlaceholder(v.Operand)
+		for _, w := range v.Whens {
+			upcaseDomainValuePlaceholder(w.When)
+			upcaseDomainValuePlaceholder(w.Then)
+		}
+		upcaseDomainValuePlaceholder(v.Else)
+	case *parser.RowExpr:
+		for _, el := range v.Elems {
+			upcaseDomainValuePlaceholder(el)
+		}
+	case *parser.ArrayConstructorExpr:
+		for _, el := range v.Elements {
+			upcaseDomainValuePlaceholder(el)
+		}
+	}
 }
 
 // execCreateView registers a view in the catalog. Column
@@ -3750,6 +4484,24 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// Preserve the raw view body so pg_get_viewdef can echo it for pg_dump.
 	if vt != nil {
 		vt.ViewDef = s.RawDef
+		// A `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
+		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the
+		// `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (DU-002 slice 365).
+		vt.CheckOption = s.CheckOption
+		// A pre-AS `WITH (security_barrier=<bool>)` storage option surfaces as the
+		// `security_barrier=<bool>` pg_class.reloption, which pg_dump re-emits as
+		// the `WITH (security_barrier='true')` clause. M0119-0004 (DU-002 slice 366).
+		if s.SecurityBarrier != nil {
+			vt.SecurityBarrier = *s.SecurityBarrier
+			vt.SecurityBarrierSet = true
+		}
+		// A pre-AS `WITH (security_invoker=<bool>)` storage option surfaces as the
+		// `security_invoker=<bool>` pg_class.reloption, which pg_dump re-emits as
+		// the `WITH (security_invoker='true')` clause. M0119-0004 (DU-002 slice 367).
+		if s.SecurityInvoker != nil {
+			vt.SecurityInvoker = *s.SecurityInvoker
+			vt.SecurityInvokerSet = true
+		}
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
 	// can detect that this view relies on the constraint. M0097-0036.
@@ -4584,7 +5336,13 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	// Drop sequences that are owned by columns of this table (created via
 	// ALTER SEQUENCE ... OWNED BY table.col, or SERIAL column defaults).
-	DropSequencesOwnedByTable(tbl.Name)
+	// Restart persistence: log a removal record for every implicit sequence
+	// the table owned, so replay does not resurrect them after the DROP TABLE.
+	for _, seqName := range DropSequencesOwnedByTable(tbl.Name) {
+		if o.ctx.WAL != nil {
+			_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(seqName))
+		}
+	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
 	if o.ctx.TempTableShadows != nil {
 		key := strings.ToLower(name.Name)
@@ -4701,7 +5459,19 @@ func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
 		// recreate in the same transaction). DropRoutine is idempotent on a
 		// missing routine; skip rather than abort an in-progress commit.
 		if rs != nil {
-			_ = rs.DropRoutine(d.Routine)
+			if err := rs.DropRoutine(d.Routine); err == nil {
+				// DU-002 restart-persistence follow-up (M0119-0004, loop #71
+				// ledger resume point). This function only runs at actual
+				// COMMIT (operators_tx.go execCommit / dispatch.go's
+				// simple-query TxCommit case) — never at ROLLBACK, which
+				// discards the deferred entries via TakeDeferredRoutineDrops
+				// without ever calling this — so logging here is inherently
+				// rollback-safe, unlike a log-at-statement-time approach
+				// would be for a deferred-to-commit drop.
+				if ctx.WAL != nil {
+					_, _, _ = ctx.WAL.Append(wal.EncodeDropFunction(d.Routine.OID))
+				}
+			}
 		}
 		funcStats.dropFunction(d.Routine.OID)
 	}
@@ -4865,7 +5635,9 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// at least one column is non-default so a plain index keeps empty slices and
 	// dumps byte-identically. DU-002 slice 56.
 	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
+	hasOpClass := indexHasOpClass(s.ColOrders)
+	hasCollation := indexHasCollation(s.ColOrders)
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
@@ -4890,6 +5662,26 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				}
 				idx.ColDescending = desc
 				idx.ColNullsFirst = nullsFirst
+			}
+			// Non-default per-column operator class (pg_index.indclass) so
+			// pg_get_indexdef / pg_dump re-emit ` text_pattern_ops` after the
+			// column. DU-002 slice 312.
+			if hasOpClass {
+				opc := make([]string, len(s.ColOrders))
+				for i, ord := range s.ColOrders {
+					opc[i] = ord.OpClass
+				}
+				idx.ColOpClasses = opc
+			}
+			// Non-default per-column collation (pg_index.indcollation) so
+			// pg_get_indexdef / pg_dump re-emit ` COLLATE "C"` after the column.
+			// DU-002 slice 313.
+			if hasCollation {
+				coll := make([]string, len(s.ColOrders))
+				for i, ord := range s.ColOrders {
+					coll[i] = ord.Collation
+				}
+				idx.ColCollations = coll
 			}
 		}
 	}
@@ -5009,6 +5801,28 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 func indexHasNonDefaultOrder(orders []parser.IndexColOrder) bool {
 	for _, o := range orders {
 		if o.Descending || o.NullsFirst {
+			return true
+		}
+	}
+	return false
+}
+
+// indexHasCollation reports whether any key column carries an explicit (non-default)
+// collation, so the catalog records pg_index.indcollation for pg_get_indexdef.
+func indexHasCollation(orders []parser.IndexColOrder) bool {
+	for _, o := range orders {
+		if o.Collation != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// indexHasOpClass reports whether any key column carries an explicit (non-default)
+// operator class, so the catalog records pg_index.indclass for pg_get_indexdef.
+func indexHasOpClass(orders []parser.IndexColOrder) bool {
+	for _, o := range orders {
+		if o.OpClass != "" {
 			return true
 		}
 	}
@@ -5608,6 +6422,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				oldName := s.Name.Name
 				newName := act.NewName
 				if RenameSequence(oldName, newName) || RenameSequence("public."+oldName, newName) {
+					// Restart persistence: retire the old name and log the
+					// renamed sequence's state under the new one.
+					if o.ctx.WAL != nil {
+						_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldName))))
+					}
+					WALLogSequenceState(o.ctx, newName)
 					return nil
 				}
 			}
@@ -5706,15 +6526,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				fkName = tbl.Name + "_" + firstCol + "_fkey"
 			}
 			fk := catalog.ForeignKey{
-				Name:       fkName,
-				OID:        o.allocConstraintOID(fkName),
-				Columns:    append([]string(nil), act.Columns...),
-				RefTable:   act.RefTable.Name,
-				RefColumns: append([]string(nil), act.RefColumns...),
-				OnDelete:   act.OnDelete,
-				OnUpdate:   act.OnUpdate,
-				Deferrable: act.Deferrable,
-				NotValid:   act.NotValid,
+				Name:            fkName,
+				OID:             o.allocConstraintOID(fkName),
+				Columns:         append([]string(nil), act.Columns...),
+				RefTable:        act.RefTable.Name,
+				RefColumns:      append([]string(nil), act.RefColumns...),
+				OnDelete:        act.OnDelete,
+				OnUpdate:        act.OnUpdate,
+				OnDeleteSetCols: append([]string(nil), act.OnDeleteSetCols...),
+				Deferrable:      act.Deferrable,
+				NotValid:        act.NotValid,
+				MatchFull:       act.MatchFull,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableValidateConstraint:
@@ -5764,7 +6586,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
-				tbl.AddCheck(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName))
+				tbl.AddCheckWithNotValid(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid)
 				// Propagate to partition children: merge if child already has the
 				// same constraint (locally defined), otherwise inherit it. M0097-0023.
 				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {
@@ -6218,6 +7040,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if !RenameSequence(oldFull, newFull) {
 					RenameSequence(oldBare, newFull)
 				}
+				// Restart persistence: retire the old name and log the renamed
+				// sequence's state under the new one (both name forms — the
+				// registry may hold either the bare or qualified key).
+				if o.ctx.WAL != nil {
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare))))
+				}
+				WALLogSequenceState(o.ctx, newFull)
 				// Regenerate the VirtualRows closure to reference the new registry key.
 				capturedNewFull := newFull
 				tbl.VirtualRows = func() [][]string {
@@ -6498,6 +7328,141 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableReplicaIdentity:
+			// REPLICA IDENTITY { DEFAULT | FULL | NOTHING | USING INDEX idx } —
+			// record the table's relreplident on the catalog AND rewrite the
+			// pg_class heap row so pg_dump observes it. pg_dump emits an
+			// `ALTER TABLE ONLY ... REPLICA IDENTITY {FULL|NOTHING}` clause
+			// whenever relreplident != 'd' (pg_dump.c dumpTableSchema). Like SET
+			// STORAGE (slice 182) the live in-memory virtual pg_class already
+			// reflects the field, but pg_dump reads the pg_class HEAP populated at
+			// CREATE TABLE, so the new value must be flushed through the same
+			// delete-old-rows + re-sync path or the stale heap row keeps reporting
+			// 'd' and the clause is silently dropped. goopg has no logical
+			// replication — dump-fidelity only. The USING INDEX ('i') form
+			// additionally marks the chosen index's pg_index.indisreplident:
+			// pg_dump emits the `ALTER TABLE ONLY <t> REPLICA IDENTITY USING INDEX
+			// <idx>` clause at INDEX-dump time keyed on that flag (pg_dump.c
+			// dumpIndex), and relation_mark_replica_identity (tablecmds.c) clears
+			// the flag on every other index of the table. DU-002 slices 305/306.
+			mode := act.ReplicaIdentityMode
+			if mode == "" {
+				mode = "d"
+			}
+			var chosenIdx *catalog.Index
+			if mode == "i" {
+				idx, verr := resolveReplicaIdentityIndex(o.ctx, tbl, act.ReplicaIdentityIndex, s.Pos())
+				if verr != nil {
+					return verr
+				}
+				chosenIdx = idx
+			}
+			// Update the per-index indisreplident flags — set on the chosen index,
+			// clear on all others — and re-sync the pg_index heap row of any index
+			// whose flag actually changed (mirrors relation_mark_replica_identity's
+			// dirty-only update).
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+				want := idx == chosenIdx
+				if idx.IsReplicaIdentity != want {
+					idx.IsReplicaIdentity = want
+					if err := resyncIndexHeapRow(o.ctx, idx); err != nil {
+						return err
+					}
+				}
+			}
+			if tbl.ReplicaIdentity != mode {
+				tbl.ReplicaIdentity = mode
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
+		case parser.AlterTableClusterOn:
+			// CLUSTER ON index_name — mark the named index as the table's
+			// clustering index (pg_index.indisclustered), clearing the flag on
+			// every other index. This is the exact clause pg_dump EMITS for a
+			// clustered table, so accepting it lets goopg restore its own dumps.
+			// Shares markTableClusterIndex with `CLUSTER <t> USING <idx>` (slice
+			// 320). Dump-fidelity only — no physical heap reorder. DU-002 slice 321.
+			if err := markTableClusterIndex(o.ctx, tbl, act.ClusterIndexName, s.Pos()); err != nil {
+				return err
+			}
+		case parser.AlterTableSetWithoutCluster:
+			// SET WITHOUT CLUSTER — clear the table's clustering selection on
+			// every index (pg_index.indisclustered → false). DU-002 slice 321.
+			if err := clearTableClusterIndex(o.ctx, tbl); err != nil {
+				return err
+			}
+		case parser.AlterTableEnableRowSecurity, parser.AlterTableDisableRowSecurity,
+			parser.AlterTableForceRowSecurity, parser.AlterTableNoForceRowSecurity:
+			// {ENABLE|DISABLE} ROW LEVEL SECURITY → pg_class.relrowsecurity;
+			// {FORCE|NO FORCE} ROW LEVEL SECURITY → pg_class.relforcerowsecurity.
+			// goopg enforces no row-level security, so these only record the flag
+			// for schema fidelity: pg_dump re-emits `ALTER TABLE <t> ENABLE ROW
+			// LEVEL SECURITY;` (getPolicies, keyed on relrowsecurity) and
+			// `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;` (dumpTableSchema,
+			// keyed on relforcerowsecurity). Like REPLICA IDENTITY (slice 305) the
+			// live virtual pg_class reflects the field immediately, but pg_dump
+			// reads the pg_class HEAP populated at CREATE TABLE, so the new value
+			// must be flushed through the delete-old-rows + re-sync path or the
+			// stale heap row keeps reporting 'f' and the clause is dropped. DU-002
+			// slice 322.
+			newRowSec := tbl.RowSecurity
+			newForceRowSec := tbl.ForceRowSecurity
+			switch act.Kind {
+			case parser.AlterTableEnableRowSecurity:
+				newRowSec = true
+			case parser.AlterTableDisableRowSecurity:
+				newRowSec = false
+			case parser.AlterTableForceRowSecurity:
+				newForceRowSec = true
+			case parser.AlterTableNoForceRowSecurity:
+				newForceRowSec = false
+			}
+			if newRowSec != tbl.RowSecurity || newForceRowSec != tbl.ForceRowSecurity {
+				tbl.RowSecurity = newRowSec
+				tbl.ForceRowSecurity = newForceRowSec
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
+		case parser.AlterTableEnableDisableRule:
+			// {ENABLE|DISABLE} [REPLICA|ALWAYS] RULE name → pg_rewrite.ev_enabled
+			// for the named rule (ATExecEnableDisableRule, tablecmds.c). goopg
+			// implements no query rewrite, so this only records the flag for schema
+			// fidelity: pg_dump's dumpRule re-emits `ALTER TABLE <t> {ENABLE
+			// ALWAYS|ENABLE REPLICA|DISABLE} RULE <name>;` for any rule whose
+			// ev_enabled is not 'O'. pg_rewrite is a fully virtual catalog built live
+			// from tbl.Rules (unlike the heap-backed pg_class RLS flags above), so
+			// mutating the RuleInfo in place is immediately visible to pg_dump — no
+			// heap re-sync required. DU-002 slice 325.
+			found := false
+			for i := range tbl.Rules {
+				if tbl.Rules[i].Name == act.RuleName {
+					tbl.Rules[i].Enabled = act.RuleEnabledState
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf("rule %q for relation %q does not exist", act.RuleName, tbl.Name)}
+			}
 		case parser.AlterTableSetReloptions:
 			// SET (param = value, …) — merge table-level storage parameters into the
 			// relation's reloptions. pg_class.reloptions is rendered from the live
@@ -6548,6 +7513,65 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableAlterColumnOptions:
+			// ALTER FOREIGN TABLE ... ALTER COLUMN col OPTIONS ( [ADD|SET|DROP]
+			// name ['value'], … ) — merge the verb-tagged option list onto
+			// pg_attribute.attfdwoptions, mirroring PG's
+			// ATExecAlterColumnGenericOptions -> transformGenericOptions
+			// (commands/foreigncmds.c): ADD/bare errors 42710 if the option
+			// already exists, SET/DROP each error 42704 if it does not. Only
+			// meaningful on a foreign table (relkind='f'); a plain table errors
+			// 42809, mirroring real PG's "... is not a foreign table". Like the
+			// sibling attoptions/attfdwoptions cases above, the in-memory
+			// mutation alone is invisible to pg_dump until flushed through the
+			// same delete-old-rows + re-sync path. DU-002 slice 419.
+			if tbl.ForeignServerName == "" {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%q is not a foreign table", tbl.Name)}
+			}
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					merged, mergeErr := applyFDWOptionChanges(tbl.Columns[i].FDWOptions, act.FDWOptionChanges)
+					if mergeErr != nil {
+						return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+					}
+					tbl.Columns[i].FDWOptions = merged
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableSetForeignOptions:
+			// ALTER FOREIGN TABLE ... OPTIONS ( [ADD|SET|DROP] name ['value'], … )
+			// — the table-level counterpart of AlterTableAlterColumnOptions above,
+			// merging onto pg_foreign_table.ftoptions (ATExecGenericOptions ->
+			// transformGenericOptions). Unlike attfdwoptions, pg_foreign_table is
+			// fully virtual (catalog.go's VirtualRows reads catalog.Table.ForeignOptions
+			// live on every scan), so no heap re-sync is needed here. DU-002 slice 420.
+			if tbl.ForeignServerName == "" {
+				return &ExecError{Code: "42809", Pos: s.Pos(),
+					Message: fmt.Sprintf("%q is not a foreign table", tbl.Name)}
+			}
+			merged, mergeErr := applyFDWOptionChanges(tbl.ForeignOptions, act.FDWOptionChanges)
+			if mergeErr != nil {
+				return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+			}
+			tbl.ForeignOptions = merged
 		case parser.AlterTableSetDefault:
 			// SET DEFAULT expr — record the parsed DEFAULT on the catalog column
 			// AND rewrite the pg_attribute heap row so pg_dump observes
@@ -7577,6 +8601,20 @@ func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 	}
 }
 
+// applyExclusionPredicate stores a partial-EXCLUDE `WHERE (pred)` on the backing
+// index so pg_get_constraintdef / pg_dump re-emit ` WHERE (pred)` (mirroring
+// pg_get_indexdef_worker, ruleutils.c:1564) and the restored constraint stays
+// partial. Dump-fidelity only — goopg does not yet filter exclusion enforcement
+// by the predicate (exclusion semantics are minimal in v0). DU-002 slice 310.
+func applyExclusionPredicate(idx *catalog.Index, pred parser.Expr) {
+	if idx == nil || pred == nil {
+		return
+	}
+	idx.HasPredicate = true
+	idx.Predicate = pred
+	idx.PredicateString = defaultExprToSQL(pred)
+}
+
 // createExclusionIndexStub registers an EXCLUDE USING constraint in the catalog
 // without type-validation or B-tree building. Exclusion semantics are not
 // enforced in v0; the stub exists so pg_constraint and pg_index queries return
@@ -7600,6 +8638,9 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	// / pg_constraint re-emit the clause on dump (no enforcement in v0). DU-002 slice 143.
 	idx.Deferrable = ec.Deferrable
 	idx.InitiallyDeferred = ec.InitiallyDeferred
+	// Partial EXCLUDE WHERE predicate rides the stub index so pg_get_constraintdef
+	// re-emits ` WHERE (pred)` on dump (no enforcement in v0). DU-002 slice 310.
+	applyExclusionPredicate(idx, ec.ExclusionWhere)
 	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}
@@ -8150,6 +9191,36 @@ func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *Exec
 // 42804 — the analyzer should have caught it but the runtime guard
 // makes the failure mode crisp.
 func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
+	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
+	// KindString even for an int/numeric/timestamp column, because bare string
+	// literals are typed `unknown` and resolved against the column (PG's
+	// UNKNOWNOID, parse_coerce.c). Parse it into the column's runtime kind so
+	// the probe encodes symmetrically with the backfilled rows. Backfill values
+	// come pre-decoded with the correct kind, so this branch never rewrites
+	// stored-row datums. Malformed input surfaces PG's 22P02.
+	if v.Kind == KindString {
+		switch {
+		case isInt4Type(col.Type.Name), isInt8Type(col.Type.Name):
+			if v = tryParseStringAs(KindInt, v.StringValue()); v.Kind != KindInt {
+				typ := "bigint"
+				if isInt4Type(col.Type.Name) {
+					typ = "integer"
+				}
+				return nil, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type %s: %q", typ, v.StringValue())}
+			}
+		case isNumericType(col.Type.Name):
+			if v = tryParseStringAs(KindNumeric, v.StringValue()); v.Kind != KindNumeric {
+				return nil, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", v.StringValue())}
+			}
+		case isTimestampType(col.Type.Name) || isTimestamptzType(col.Type.Name) || isDateType(col.Type.Name):
+			// Leave unparseable strings as-is; the kind checks below produce
+			// the existing 42804 for a genuinely non-coercible probe.
+			v = tryParseStringAs(KindTime, v.StringValue())
+		}
+	}
 	switch {
 	case isInt4Type(col.Type.Name):
 		const minInt32 = -1 << 31
@@ -8628,7 +9699,11 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr})
 						}
 					}
-					ResetSequence(seqName)
+					if ResetSequence(seqName) {
+						// Restart persistence: the reset counter must survive a
+						// restart too. See RecordKindSequenceState.
+						WALLogSequenceState(o.ctx, seqName)
+					}
 				}
 			}
 		}
@@ -8817,6 +9892,83 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	return nil
 }
 
+// routineToCreateFunctionPayload converts a catalog.Routine into the WAL
+// wire format, shared by CREATE FUNCTION and CREATE PROCEDURE persistence.
+// Dependency-tracking fields (SequenceDeps/RoutineCallOIDs/TableDeps/
+// ColumnDeps) are intentionally NOT carried — see CreateFunctionPayload's
+// doc comment; the recovery driver recomputes them via ExtractRoutineDeps.
+func routineToCreateFunctionPayload(r *catalog.Routine) wal.CreateFunctionPayload {
+	args := make([]wal.FunctionArgPayload, len(r.ArgTypes))
+	for i, t := range r.ArgTypes {
+		a := wal.FunctionArgPayload{TypeName: t.Name, TypeArgs: t.Args}
+		if i < len(r.ArgNames) {
+			a.Name = r.ArgNames[i]
+		}
+		if i < len(r.ArgModes) {
+			a.Mode = r.ArgModes[i]
+		}
+		if i < len(r.ArgDefaults) {
+			a.Default = r.ArgDefaults[i]
+		}
+		args[i] = a
+	}
+	return wal.CreateFunctionPayload{
+		OID:             r.OID,
+		Schema:          r.Schema,
+		Name:            r.Name,
+		Args:            args,
+		ReturnTypeName:  r.ReturnType.Name,
+		ReturnTypeArgs:  r.ReturnType.Args,
+		ReturnsSet:      r.ReturnsSet,
+		ReturnsTable:    r.ReturnsTable,
+		Language:        r.Language,
+		Body:            r.Body,
+		Strict:          r.Strict,
+		Volatile:        r.Volatile,
+		Parallel:        r.Parallel,
+		Cost:            r.Cost,
+		Rows:            r.Rows,
+		SecurityDefiner: r.SecurityDefiner,
+		Leakproof:       r.Leakproof,
+		IsProcedure:     r.IsProcedure,
+		IsWindow:        r.IsWindow,
+		BeginAtomic:     r.BeginAtomic,
+		IsReturnForm:    r.IsReturnForm,
+		KindChar:        r.KindChar,
+	}
+}
+
+// walLogCreateRoutine WAL-logs a successful CREATE [OR REPLACE]
+// FUNCTION/PROCEDURE so it survives a restart (DU-002 restart-persistence
+// follow-up to M0119-0004, loop #71 ledger resume point). Mirrors
+// execCreateEventTrigger's WAL.Append call. r is nil-checked defensively
+// (Routines.Create always returns a non-nil routine on success, but a nil
+// WAL is common in embedded/test setups without a live WAL writer).
+func (o *ddlOp) walLogCreateRoutine(r *catalog.Routine) error {
+	if o.ctx.WAL == nil || r == nil {
+		return nil
+	}
+	if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateFunction(routineToCreateFunctionPayload(r))); werr != nil {
+		return fmt.Errorf("wal create-function: %w", werr)
+	}
+	return nil
+}
+
+// walLogDropRoutine WAL-logs a routine removal by OID (DU-002
+// restart-persistence follow-up to M0119-0004, loop #71 ledger resume
+// point). Used for DROP FUNCTION's and DROP PROCEDURE's immediate-autocommit
+// removal, CASCADE-dependent drops, and (via ApplyDeferredRoutineDrops)
+// either statement's deferred-at-commit removal.
+func (o *ddlOp) walLogDropRoutine(oid uint32) error {
+	if o.ctx.WAL == nil {
+		return nil
+	}
+	if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropFunction(oid)); werr != nil {
+		return fmt.Errorf("wal drop-function: %w", werr)
+	}
+	return nil
+}
+
 // execCreateFunction registers a routine in the catalog's
 // Routines() registry (M0015 Stage A step 3). Body is stored
 // verbatim — the PL/pgSQL parser/interpreter that executes it
@@ -8936,7 +10088,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	}
 	// Extract dependency information for information_schema views (SQL functions only).
 	if lang == "sql" {
-		extractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
+		ExtractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
 	}
 	// DROP-then-CREATE of the same signature inside one transaction: a deferred
 	// DROP FUNCTION (M0118-0009 `stats`) leaves the old routine in the registry
@@ -8949,7 +10101,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			funcStats.dropFunction(old.OID)
 		}
 	}
-	if _, err := rs.Create(r, s.OrReplace); err != nil {
+	created, err := rs.Create(r, s.OrReplace)
+	if err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
@@ -8970,6 +10123,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 				Detail:  detail}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	if werr := o.walLogCreateRoutine(created); werr != nil {
+		return werr
 	}
 	return nil
 }
@@ -9445,8 +10601,18 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 	// RENAME TO: update the routine name in the registry.
 	if s.RenameTo != "" {
 		for _, r := range routines {
+			oid := r.OID
 			if err := rs.RenameRoutine(r, s.RenameTo); err != nil {
 				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+			}
+			// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
+			// resume point). No rollback-undo tracking exists for ALTER FUNCTION
+			// RENAME (same as ALTER EVENT TRIGGER RENAME), so logging immediately
+			// at mutation time is safe — matches the established precedent.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionRename(oid, s.RenameTo)); werr != nil {
+					return fmt.Errorf("wal alter-function-rename: %w", werr)
+				}
 			}
 		}
 		return nil
@@ -9467,6 +10633,15 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 		}
 		if s.Strict != nil {
 			r.Strict = *s.Strict
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
+		// resume point): log the full post-mutation snapshot of the four
+		// mutable attributes, not just the clause(s) this statement touched —
+		// simpler to replay and always reflects the routine's actual state.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionFlags(r.OID, r.Volatile, r.SecurityDefiner, r.Leakproof, r.Strict)); werr != nil {
+				return fmt.Errorf("wal alter-function-flags: %w", werr)
+			}
 		}
 	}
 	return nil
@@ -9608,7 +10783,8 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 		SecurityDefiner: s.SecurityDefiner,
 		Volatile:        "v", // procedures default to volatile
 	}
-	if _, err := rs.Create(r, s.OrReplace); err != nil {
+	created, err := rs.Create(r, s.OrReplace)
+	if err != nil {
 		if errors.Is(err, catalog.ErrRoutineExists) {
 			return &ExecError{Code: "42723", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -9619,6 +10795,9 @@ func (o *ddlOp) execCreateProcedure(s *parser.CreateProcedureStmt) error {
 				Detail:  fmt.Sprintf("%q is a function.", s.Name.Name)}
 		}
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+	}
+	if werr := o.walLogCreateRoutine(created); werr != nil {
+		return werr
 	}
 	return nil
 }
@@ -9700,7 +10879,25 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		return &ExecError{Code: "42809", Pos: s.Pos(),
 			Message: fmt.Sprintf("%s%s is not a procedure", s.Name.Name, argListStr)}
 	}
-	// Now drop using the specific routine we already identified.
+	// Inside an explicit transaction, defer the registry removal to COMMIT —
+	// unifying onto the same DeferredRoutineDrop/ApplyDeferredRoutineDrops
+	// mechanism DROP FUNCTION already uses (M0118-0009 `stats`). This closes
+	// the loop #73 deferral-ledger gap: DROP PROCEDURE previously mutated the
+	// registry immediately with its own rollback-undo tracking, which had no
+	// safe commit-time WAL hook and let a concurrent session see the drop
+	// before the dropping transaction even committed. Now the procedure stays
+	// resolvable/callable until COMMIT, exactly like DROP FUNCTION, and the
+	// removal is WAL-logged exactly once at that single chokepoint (which
+	// never runs on ROLLBACK).
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
+		bsess.AddDeferredRoutineDrop(DeferredRoutineDrop{
+			Routine:        found,
+			SavepointDepth: bsess.SavepointDepth(),
+		})
+		return nil
+	}
+	// Autocommit: remove immediately and WAL-log (mirrors execDropFunction's
+	// autocommit path).
 	var err error
 	if s.Args == nil {
 		err = rs.DropByName(s.Name)
@@ -9710,9 +10907,8 @@ func (o *ddlOp) execDropProcedure(s *parser.DropProcedureStmt) error {
 		err = rs.DropRoutine(found)
 	}
 	if err == nil {
-		// Record the drop for potential rollback on ROLLBACK.
-		if sess, ok := o.ctx.Session.(*BasicSession); ok {
-			sess.AddPendingRoutineDrop(found)
+		if werr := o.walLogDropRoutine(found.OID); werr != nil {
+			return werr
 		}
 		return nil
 	}
@@ -9821,13 +11017,21 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if len(allDeps) == 1 {
 			dn := routineCascadeDisplayName(allDeps[0])
 			o.ctx.AddNotice(fmt.Sprintf("drop cascades to function %s", dn))
-			_ = rs.DropRoutine(allDeps[0])
+			if err := rs.DropRoutine(allDeps[0]); err == nil {
+				if werr := o.walLogDropRoutine(allDeps[0].OID); werr != nil {
+					return werr
+				}
+			}
 		} else if len(allDeps) > 1 {
 			detail := make([]string, len(allDeps))
 			for i, r := range allDeps {
 				dn := routineCascadeDisplayName(r)
 				detail[i] = fmt.Sprintf("drop cascades to function %s", dn)
-				_ = rs.DropRoutine(r)
+				if err := rs.DropRoutine(r); err == nil {
+					if werr := o.walLogDropRoutine(r.OID); werr != nil {
+						return werr
+					}
+				}
 			}
 			o.ctx.AddNoticeWithDetail(
 				fmt.Sprintf("drop cascades to %d other objects", len(allDeps)),
@@ -9918,6 +11122,9 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		if err == nil {
 			if err = rs.DropRoutine(target); err == nil {
 				funcStats.dropFunction(target.OID)
+				if werr := o.walLogDropRoutine(target.OID); werr != nil {
+					return werr
+				}
 			}
 		}
 	}
@@ -10088,6 +11295,26 @@ func deleteCatalogRowsForOID(ctx *Context, dbOid uint32, relOID uint32, xmax sto
 // `SELECT 1 FROM pg_type WHERE oid = enumtypid` return the expected rows.
 // Mirrors to DBOid=5 (postgres db) so the seqScan (which reads from the
 // session's DBOID) finds the row. M0097-0022 (enum → pg_type parity).
+// syncAggregateToCatalogHeap writes the pg_aggregate row for a CREATE
+// AGGREGATE (OID 2600), keyed by aggfnoid = agg.OID (the aggregate's own
+// pg_proc identity). pg_proc itself is a Virtual view (registerPgProcView
+// enumerates cat.ListUserAggregates() directly; no heap write needed there —
+// see internal/initdb/pg_proc_view.go). DU-002 slice 405.
+func syncAggregateToCatalogHeap(ctx *Context, agg *catalog.UserAggregate) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	aggRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AggregateRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, aggRel, pgAggregateColumnsPG18(), buildUserPGAggregateRow(ctx, agg)); err != nil {
+		return
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AggregateRelationId)
+}
+
 func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if !catalogHeapSyncAvailable(ctx) {
 		return
@@ -10281,6 +11508,57 @@ func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
 	return catalog.PGCatalogNamespaceOID
 }
 
+// fdwOptionMergeError carries the SQLSTATE for a failed ADD/SET/DROP merge in
+// applyFDWOptionChanges, so the caller can wrap it in an *ExecError with the
+// statement's position.
+type fdwOptionMergeError struct {
+	code    string
+	message string
+}
+
+func (e *fdwOptionMergeError) Error() string { return e.message }
+
+// applyFDWOptionChanges merges a verb-tagged ALTER FOREIGN TABLE ... ALTER
+// COLUMN ... OPTIONS (...) change list onto an existing "name=value"
+// pg_attribute.attfdwoptions option slice, mirroring PostgreSQL's
+// transformGenericOptions (commands/foreigncmds.c): ADD (and the bare/
+// unspecified form, already normalized to Add by the parser) errors 42710
+// duplicate_object if the option already exists; SET and DROP each error
+// 42704 undefined_object if it does not. DU-002 slice 419.
+func applyFDWOptionChanges(existing []string, changes []parser.FDWOptionChange) ([]string, *fdwOptionMergeError) {
+	result := append([]string(nil), existing...)
+	indexOf := func(name string) int {
+		prefix := name + "="
+		for i, kv := range result {
+			if kv == name || strings.HasPrefix(kv, prefix) {
+				return i
+			}
+		}
+		return -1
+	}
+	for _, ch := range changes {
+		idx := indexOf(ch.Name)
+		switch ch.Verb {
+		case parser.FDWOptionDrop:
+			if idx < 0 {
+				return nil, &fdwOptionMergeError{code: "42704", message: fmt.Sprintf("option %q not found", ch.Name)}
+			}
+			result = append(result[:idx], result[idx+1:]...)
+		case parser.FDWOptionSet:
+			if idx < 0 {
+				return nil, &fdwOptionMergeError{code: "42704", message: fmt.Sprintf("option %q not found", ch.Name)}
+			}
+			result[idx] = ch.Name + "=" + ch.Value
+		default: // parser.FDWOptionAdd
+			if idx >= 0 {
+				return nil, &fdwOptionMergeError{code: "42710", message: fmt.Sprintf("option %q provided more than once", ch.Name)}
+			}
+			result = append(result, ch.Name+"="+ch.Value)
+		}
+	}
+	return result, nil
+}
+
 // syncTableToCatalogHeap writes one pg_class row and one pg_attribute row per
 // column for tbl. Called by execCreateTable after in-memory catalog is updated.
 //
@@ -10324,6 +11602,31 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
+	// Column DEFAULT persistence (root-0020 follow-up): the reloaded catalog
+	// cannot reconstruct DefaultExpr ASTs from pg_attribute (only atthasdef
+	// survives; no runtime pg_attrdef rows), so snapshot every defaulted
+	// column's expression as SQL text in one WAL record per table. Replay
+	// (internal/initdb/column_defaults_recovery.go) re-parses them after
+	// loadUserTablesFromHeap. Emitting here — the single funnel every
+	// table-persisting DDL path passes through — keeps create/alter in sync.
+	if ctx.WAL != nil {
+		var defs []wal.ColumnDefaultEntry
+		for _, col := range tbl.Columns {
+			if col.Dropped || col.DefaultExpr == nil {
+				continue
+			}
+			if exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr); exprSQL != "" {
+				defs = append(defs, wal.ColumnDefaultEntry{Name: col.Name, Expr: exprSQL})
+			}
+		}
+		if len(defs) > 0 {
+			_, _, _ = ctx.WAL.Append(wal.EncodeColumnDefaults(wal.ColumnDefaultsPayload{
+				TableOID: tbl.OID,
+				Defaults: defs,
+			}))
+		}
+	}
+
 	// Signal that this transaction wrote to nailed catalog relations (pg_class
 	// and pg_attribute). The xact-marker hook in open.go reads this flag at
 	// commit time to emit RecordKindXactCommitInval and unlink both
@@ -10342,6 +11645,99 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
 	}
 
+	return nil
+}
+
+// resolveReplicaIdentityIndex locates the index named by `REPLICA IDENTITY
+// USING INDEX <idx>` on tbl and validates it is suitable, mirroring PG's
+// ATExecReplicaIdentity / check_replica_identity (tablecmds.c): the index must
+// exist on the table, be UNIQUE, IMMEDIATE (not DEFERRABLE INITIALLY DEFERRED),
+// non-expression, non-partial, and every key column must be NOT NULL. The
+// SQLSTATE codes and messages match PG 18.3. Returns the *catalog.Index pointer
+// from IndexesOnTable so the caller can compare it by identity against the same
+// list. DU-002 slice 306.
+func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName string, pos int) (*catalog.Index, *ExecError) {
+	var idx *catalog.Index
+	for _, candidate := range ctx.Catalog.IndexesOnTable(tbl) {
+		if strings.EqualFold(candidate.Name, indexName) {
+			idx = candidate
+			break
+		}
+	}
+	if idx == nil {
+		return nil, &ExecError{Code: "42704", Pos: pos,
+			Message: fmt.Sprintf("index %q for table %q does not exist", indexName, tbl.Name)}
+	}
+	if !idx.Unique {
+		return nil, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("cannot use non-unique index %q as replica identity", idx.Name)}
+	}
+	if idx.InitiallyDeferred {
+		return nil, &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("cannot use non-immediate index %q as replica identity", idx.Name)}
+	}
+	for _, col := range idx.Columns {
+		if col == "" { // expression key column (Columns[i]=="" => ColExprs[i] set)
+			return nil, &ExecError{Code: "0A000", Pos: pos,
+				Message: fmt.Sprintf("cannot use expression index %q as replica identity", idx.Name)}
+		}
+	}
+	if idx.HasPredicate {
+		return nil, &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("cannot use partial index %q as replica identity", idx.Name)}
+	}
+	// Every key column must be NOT NULL (a nullable identity column would make
+	// the row's identity ambiguous). INCLUDE columns are not key columns and
+	// are not checked.
+	for _, colName := range idx.Columns {
+		for ci := range tbl.Columns {
+			if tbl.Columns[ci].Name == colName {
+				if !tbl.Columns[ci].NotNull {
+					return nil, &ExecError{Code: "42809", Pos: pos,
+						Message: fmt.Sprintf("index %q cannot be used as replica identity because column %q is nullable", idx.Name, colName)}
+				}
+				break
+			}
+		}
+	}
+	return idx, nil
+}
+
+// resyncIndexHeapRow rewrites the pg_index HEAP row for a single index from its
+// current catalog.Index state (buildUserPGIndexRow). pg_dump reads the pg_index
+// heap, not the live virtual catalog, so any per-index flag mutation done after
+// CREATE INDEX (replica-identity selection, clustering selection) must be
+// flushed through this path or the stale heap row keeps reporting the old value
+// and the corresponding ALTER TABLE clause is silently dropped from the dump.
+func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range catalogDBOids(ctx) {
+			indexRel := storage.RelFileNode{
+				DBOid:  dbOid,
+				RelOid: catalog.IndexRelationId,
+				Fork:   storage.MainFork,
+			}
+			stampCatalogRows(ctx, indexRel, xmax, func(data []byte) bool {
+				row, derr := catalog.DecodePGIndexPhysicalRow(data)
+				return derr == nil && row.IndexRelid == idx.OID
+			})
+		}
+	}
+	pgIndexRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.IndexRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(idx)); err != nil {
+		return fmt.Errorf("pg_index replica-identity resync: %w", err)
+	}
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
 	return nil
 }
 
@@ -10455,14 +11851,29 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		return err
 	}
 	trig := catalog.Trigger{
-		Name:       s.Name,
-		TableOID:   tbl.OID,
-		Timing:     catalog.TriggerTiming(s.Timing),
-		Events:     append([]string(nil), s.Events...),
-		ForEachRow: s.ForEachRow,
-		FuncName:   s.FuncName.Name,
-		FuncSchema: s.FuncName.Schema,
-		Args:       append([]string(nil), s.FuncArgs...),
+		Name:               s.Name,
+		OID:                o.ctx.Catalog.AllocOID(),
+		TableOID:           tbl.OID,
+		Timing:             catalog.TriggerTiming(s.Timing),
+		Events:             append([]string(nil), s.Events...),
+		UpdateColumns:      append([]string(nil), s.UpdateColumns...),
+		IsConstraint:       s.IsConstraint,
+		Deferrable:         s.Deferrable,
+		InitDeferred:       s.InitDeferred,
+		OldTransitionTable: s.OldTransitionTable,
+		NewTransitionTable: s.NewTransitionTable,
+		WhenExpr:           s.WhenExpr,
+		ForEachRow:         s.ForEachRow,
+		FuncName:           s.FuncName.Name,
+		FuncSchema:         s.FuncName.Schema,
+		Args:               append([]string(nil), s.FuncArgs...),
+	}
+	// A CONSTRAINT TRIGGER carries an implicit pg_constraint row (contype 't');
+	// allocate its OID so pg_trigger.tgconstraint is non-zero and
+	// pg_get_triggerdef recognises the trigger as a constraint trigger. DU-002
+	// slice 327.
+	if s.IsConstraint {
+		trig.ConstraintOID = o.ctx.Catalog.AllocOID()
 	}
 	// Remove any existing trigger with the same name on this table.
 	filtered := tbl.Triggers[:0]
@@ -10472,6 +11883,151 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		}
 	}
 	tbl.Triggers = append(filtered, trig)
+	return nil
+}
+
+// execCreatePolicy records a row-level security policy on its table so it
+// round-trips through pg_dump (pg_policy → dumpPolicy). goopg does NOT enforce
+// row-level security — this is schema fidelity only, mirroring the RLS ENABLE
+// flag landed in DU-002 slice 322. DU-002 slice 323.
+func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	// A duplicate policy name on the same table is an error (PG: 42710).
+	for _, p := range tbl.Policies {
+		if p.Name == s.Name {
+			return &ExecError{Code: "42710", Pos: s.Pos(),
+				Message: fmt.Sprintf("policy %q for table %q already exists", s.Name, tbl.Name)}
+		}
+	}
+	// polcmd char (pg_policy.polcmd): '*' ALL, 'r' SELECT, 'a' INSERT,
+	// 'w' UPDATE, 'd' DELETE.
+	var cmd byte
+	switch s.Command {
+	case "select":
+		cmd = 'r'
+	case "insert":
+		cmd = 'a'
+	case "update":
+		cmd = 'w'
+	case "delete":
+		cmd = 'd'
+	default:
+		cmd = '*'
+	}
+	// polroles: with no TO clause (or TO PUBLIC) the policy applies to PUBLIC,
+	// stored as the {0} sentinel that pg_dump maps to a NULL (omitted) TO clause.
+	// Named roles resolve to their per-role OIDs (DU-002 slice 330): pg_dump's
+	// getPolicies turns the polroles OID array back into `TO <name>` via the
+	// pg_roles view. A PUBLIC element anywhere collapses the whole list to {0},
+	// matching PG (PUBLIC subsumes every named grantee).
+	var roles []uint32
+	public := len(s.Roles) == 0
+	for _, r := range s.Roles {
+		if strings.EqualFold(r, "public") {
+			public = true
+			continue
+		}
+		oid, ok := o.ctx.Catalog.RoleOID(r)
+		if !ok {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("role %q does not exist", r)}
+		}
+		roles = append(roles, oid)
+	}
+	if public || len(roles) == 0 {
+		roles = []uint32{0}
+	}
+	pol := catalog.PolicyInfo{
+		Name:       s.Name,
+		OID:        o.ctx.Catalog.AllocOID(),
+		Command:    cmd,
+		Permissive: s.Permissive,
+		Roles:      roles,
+		Using:      s.Using,
+		WithCheck:  s.WithCheck,
+	}
+	tbl.Policies = append(tbl.Policies, pol)
+	return nil
+}
+
+// execDropPolicy removes a row-level security policy from its table. DU-002
+// slice 323.
+func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	filtered := tbl.Policies[:0]
+	found := false
+	for _, p := range tbl.Policies {
+		if p.Name == s.Name {
+			found = true
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	tbl.Policies = filtered
+	if !found {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("policy %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("policy %q for table %q does not exist", s.Name, s.Table.Name)}
+	}
+	return nil
+}
+
+// execCreateRule records an unconditional DO-NOTHING query-rewrite rule on its
+// table so it round-trips through pg_dump (pg_rewrite → pg_get_ruledef →
+// dumpRule). goopg does NOT implement the rewrite system — this is schema
+// fidelity only; the rule has no runtime effect beyond the COPY-DML rule-kind
+// bookkeeping the CompatNoop path also performed. DU-002 slice 324.
+func (o *ddlOp) execCreateRule(s *parser.CreateRuleStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	// A duplicate rule name on the same table is an error (PG: 42710).
+	for _, r := range tbl.Rules {
+		if r.Name == s.Name {
+			return &ExecError{Code: "42710", Pos: s.Pos(),
+				Message: fmt.Sprintf("rule %q for relation %q already exists", s.Name, tbl.Name)}
+		}
+	}
+	// DU-002 slice 359: deparse a conditional rule's WHERE qualification via the
+	// same defaultExprToSQL renderer the trigger WHEN and index-predicate paths
+	// use, so pg_dump round-trips it byte-identically. defaultExprToSQL already
+	// fully parenthesizes a top-level OpExpr (`old.a <> new.a` → `(old.a <>
+	// new.a)`), matching pg_get_ruledef's single-paren WHERE form — do NOT add
+	// another layer (that is the same convention pg_get_indexdef's WHERE uses).
+	var qual string
+	if s.Qual != nil {
+		qual = defaultExprToSQL(s.Qual)
+	}
+	tbl.Rules = append(tbl.Rules, catalog.RuleInfo{
+		Name:    s.Name,
+		OID:     o.ctx.Catalog.AllocOID(),
+		Event:   s.Event,
+		Instead: s.Instead,
+		Qual:    qual,
+	})
+	// Preserve the historical CompatNoop bookkeeping so DROP RULE existence
+	// checks and COPY-DML rule-kind handling behave exactly as before this slice
+	// modelled the DO-NOTHING form as a first-class statement.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		im.RegisterCompatObject("rule", s.Name+"@"+s.Table.String())
+		if s.RuleKind != "" {
+			im.RegisterTableRuleKind(s.Table.Name, s.RuleKind)
+		}
+	}
 	return nil
 }
 
@@ -10552,6 +12108,18 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		if im.DropCompatObject("rule", key) {
 			// Also remove the table rule kind so future COPY DML sees no rule. M0097-0140.
 			im.UnregisterTableRules(s.Table.Name)
+			// Drop any modelled DO-NOTHING RuleInfo so it stops being dumped via
+			// pg_rewrite → pg_get_ruledef. DU-002 slice 324.
+			if tbl, ok := o.ctx.Catalog.LookupTable(s.Table); ok && tbl != nil {
+				filtered := tbl.Rules[:0]
+				for _, r := range tbl.Rules {
+					if r.Name == s.Name {
+						continue
+					}
+					filtered = append(filtered, r)
+				}
+				tbl.Rules = filtered
+			}
 			return nil
 		}
 	}
@@ -10699,6 +12267,9 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
 	o.createSeqCatalogTable(s.Name, name)
+	// Restart persistence: WAL-log the full sequence definition (no-op for
+	// TEMPORARY sequences — session-scoped). See RecordKindSequenceState.
+	WALLogSequenceState(o.ctx, name)
 	return nil
 }
 
@@ -10711,7 +12282,15 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
 func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
-	if _, ok := o.ctx.Catalog.(*catalog.InMemory); !ok {
+	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name)
+}
+
+// CreateSequenceCatalogRelation is the ddlOp-independent core of
+// createSeqCatalogTable, shared with startup replay
+// (internal/initdb/sequence_ddl_recovery.go) so a WAL-restored sequence is
+// discoverable via SELECT * FROM seq / pg_class after a restart too.
+func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.ObjectName, name string) {
+	if _, ok := cat.(*catalog.InMemory); !ok {
 		return
 	}
 	seqCols := []catalog.Column{
@@ -10719,7 +12298,7 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string)
 		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
 		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
 	}
-	seqTbl, err2 := o.ctx.Catalog.CreateTable(seqObjName, seqCols)
+	seqTbl, err2 := cat.CreateTable(seqObjName, seqCols)
 	if err2 != nil {
 		return
 	}
@@ -10746,12 +12325,16 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string)
 // validateSeqOwnedBy checks OWNED BY table.column before the sequence is
 // registered/updated. Returns an error matching PostgreSQL's messages. M0097-0068.
 func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
-	dot := strings.Index(ownedBy, ".")
-	if dot < 0 {
+	// The column is the LAST dotted component; everything before it is the
+	// (optionally schema-qualified) table. A first-dot split misreads
+	// "schema.table.column" as table="schema", col="table.column" and wrongly
+	// rejects a valid 3-part OWNED BY. Mirrors InMemory.dependVirtualRows.
+	lastDot := strings.LastIndex(ownedBy, ".")
+	if lastDot < 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option"}
 	}
-	tblPart := ownedBy[:dot]
-	colPart := ownedBy[dot+1:]
+	tblPart := ownedBy[:lastDot]
+	colPart := ownedBy[lastDot+1:]
 
 	// Look up the table in the catalog.
 	tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: tblPart})
@@ -10920,6 +12503,9 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	} else if s.ClearOwnedBy {
 		SetSequenceOwnedBy(name, "")
 	}
+	// Restart persistence: WAL-log the post-ALTER definition + counter so the
+	// altered state survives restart. See RecordKindSequenceState.
+	WALLogSequenceState(o.ctx, name)
 	return nil
 }
 
@@ -11404,8 +12990,26 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	}
 
 	// DROP USER / DROP ROLE / DROP GROUP — check catalog role registry.
-	// M0097-drop_if_exists.
+	// M0097-drop_if_exists. Persistence (root-0021): DROP ROLE parses as a
+	// generic DropStmt and lands HERE (unlike CREATE/ALTER ROLE, which only
+	// the server-side intercept sees), so this arm must mirror the same
+	// pg_authid-model persistence — WAL drop record (crash tail) + heap file
+	// rewrite (durable base) — plus the OnRoleDropped hook so the server's
+	// connection-time role set and auth UserStore stay in sync.
 	if objType == "user" || objType == "role" || objType == "group" {
+		persistDrop := func(roleName string) {
+			if o.ctx.WAL != nil {
+				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropRole(roleName))
+			}
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.DataDir != "" {
+				if err := SyncPgAuthidFile(o.ctx.DataDir, im); err != nil {
+					o.ctx.AddNotice(fmt.Sprintf("pg_authid heap sync failed: %v", err))
+				}
+			}
+			if o.ctx.OnRoleDropped != nil {
+				o.ctx.OnRoleDropped(roleName)
+			}
+		}
 		for _, name := range s.Names {
 			roleName := strings.ToLower(name.Name)
 			exists := o.ctx.Catalog.RoleExists(roleName)
@@ -11414,6 +13018,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					o.ctx.AddNotice(fmt.Sprintf("role %q does not exist, skipping", name.Name))
 				} else {
 					o.ctx.Catalog.UnregisterRole(roleName)
+					persistDrop(roleName)
 				}
 			} else {
 				if !exists {
@@ -11421,6 +13026,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						Message: fmt.Sprintf("role %q does not exist", name.Name)}
 				}
 				o.ctx.Catalog.UnregisterRole(roleName)
+				persistDrop(roleName)
 			}
 		}
 		return nil
@@ -11495,12 +13101,86 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if toCanon == "" {
 			toCanon = toType
 		}
+		// If goopg registered this user cast (CREATE CAST, DU-002 slice 395), drop
+		// it from the registry so it stops round-tripping through pg_dump. An
+		// unregistered cast falls through to the PG-style "does not exist" error.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && im.DropCast(fromType, toType) {
+			// DU-002 restart-persistence follow-up: mirror the DROP
+			// TRANSFORM WAL emission so the drop survives a restart too.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCast(fromType, toType)); werr != nil {
+					return fmt.Errorf("wal drop-cast: %w", werr)
+				}
+			}
+			return nil
+		}
 		msg := fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)
 		if s.IfExists {
 			o.ctx.AddNotice(msg + ", skipping")
 			return nil
 		}
 		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+	}
+
+	// DROP TRANSFORM FOR type LANGUAGE lang — PG error: "transform for type X
+	// language Y does not exist". DU-002 (M0119-0004).
+	if objType == "transform" {
+		im, ok := o.ctx.Catalog.(*catalog.InMemory)
+		if ok && im.DropTransform(s.TransformType, s.TransformLang) {
+			// DU-002 (M0119-0004) restart persistence: mirror the DROP
+			// SCHEMA WAL emission so the drop survives a restart too.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTransform(s.TransformType, s.TransformLang)); werr != nil {
+					return fmt.Errorf("wal drop-transform: %w", werr)
+				}
+			}
+			return nil
+		}
+		msg := fmt.Sprintf("transform for type %s language %q does not exist", s.TransformType, s.TransformLang)
+		if s.IfExists {
+			o.ctx.AddNotice(msg + ", skipping")
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: msg}
+	}
+
+	// DROP COLLATION [IF EXISTS] name [, ...] — remove from the runtime
+	// pg_collation registry (CREATE COLLATION, M0119-0004) so the drop is
+	// reflected in pg_dump. Must run before the generic IF EXISTS fallthrough
+	// below so IF EXISTS correctly checks existence instead of unconditionally
+	// no-oping. Built-in collations are never registered in the user
+	// registry, so DropCollation always reports "not found" for them (PG
+	// likewise refuses to drop a pinned pg_collation row, though with a
+	// different error). PG error: "collation %q does not exist"
+	// (ERRCODE_UNDEFINED_OBJECT). DU-002 restart-persistence follow-up.
+	if objType == "collation" {
+		im, imOK := o.ctx.Catalog.(*catalog.InMemory)
+		for _, name := range s.Names {
+			if o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
+			schema := name.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			if imOK && im.DropCollation(name.Name, schema) {
+				// DU-002 restart-persistence follow-up: mirror the DROP
+				// CAST/TRANSFORM/CONVERSION WAL emission so the drop
+				// survives a restart too.
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropCollation(name.Name, schema)); werr != nil {
+						return fmt.Errorf("wal drop-collation: %w", werr)
+					}
+				}
+				continue
+			}
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("collation %q does not exist, skipping", name.Name))
+				continue
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("collation %q does not exist", name.Name)}
+		}
+		return nil
 	}
 
 	// DROP OPERATOR CLASS/FAMILY name USING method — M0097-0071.
@@ -11532,6 +13212,17 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				if im.HasOpClass(name.Name) {
 					im.RemoveOpClass(name.Name)
+					// Also drop the pg_opclass row (DU-002, M0119-0004) so a
+					// create-then-drop-then-dump sequence doesn't leave a
+					// ghost row behind. Best-effort: only the "operator
+					// class" arm has a real pg_opclass row to remove.
+					if objType == "operator class" {
+						classSchema := name.Schema
+						if classSchema == "" {
+							classSchema = "public"
+						}
+						im.DropUserOperatorClass(classSchema, name.Name, catalog.AccessMethodOIDByName(method))
+					}
 					return nil
 				}
 			}
@@ -11592,6 +13283,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Message: fmt.Sprintf("sequence %q does not exist", name.String()),
 				}
 			}
+			// Restart persistence: record the removal so startup replay does
+			// not resurrect the sequence. See RecordKindDropSequence.
+			if o.ctx.WAL != nil {
+				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String()))))
+			}
 			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
 			_ = o.ctx.Catalog.DropTable(name)
 		}
@@ -11611,6 +13307,22 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 	// PG format: "aggregate name(canonicaltype) does not exist". M0097-regress.
 	if objType == "aggregate" && len(s.Names) > 0 {
 		aggName := s.Names[0]
+		// A registered user aggregate (M0097-0035 CREATE AGGREGATE, DU-002
+		// slice 405) actually drops now instead of always reporting
+		// "does not exist" (loop #56 ledger resume point). goopg's
+		// aggregate registry has no overload resolution (keyed by name
+		// only, like RenameUserAggregate/LookupUserAggregateByName), so a
+		// name match drops regardless of the DROP statement's ArgTypes.
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			if im.DropUserAggregate(aggName.Name) {
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAggregate(aggName.Name)); werr != nil {
+						return fmt.Errorf("wal drop-aggregate: %w", werr)
+					}
+				}
+				return nil
+			}
+		}
 		// Schema-qualified with non-existent schema.
 		if aggName.Schema != "" && !o.ctx.Catalog.SchemaExists(aggName.Schema) {
 			if s.IfExists {
@@ -11773,6 +13485,13 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 			key := opName + "(" + leftCanon + "," + rightCanon + ")"
 			if im.DropCompatObject("operator", key) {
+				schema := opNameObj.Schema
+				if schema == "" {
+					schema = "public"
+				}
+				// Also remove the dedicated operator registry entry so pg_dump
+				// no longer re-emits it (mirrors DropCast/DropTransform).
+				im.DropUserOperator(schema, opName, leftType, rightType)
 				return nil
 			}
 		}
@@ -11797,20 +13516,61 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "conversion", "text search configuration", "text search dictionary",
 			"text search parser", "text search template":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// Drop the dump-visible pg_conversion registry entry too so a
+				// dropped conversion stops round-tripping through pg_dump
+				// (DU-002 slice 399); harmless for the other object types.
+				if objType == "conversion" {
+					if im.DropConversion(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+						// DU-002 restart-persistence follow-up: mirror the
+						// DROP CAST/TRANSFORM WAL emission so the drop
+						// survives a restart too.
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropConversion(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
+							return fmt.Errorf("wal drop-conversion: %w", werr)
+						}
+					}
+				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
 				}
 			}
 		case "server":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// Drop the dump-visible registry entry too (DU-002 slice 376).
+				im.DropForeignServer(s.Names[0].String())
 				if im.DropCompatObject("server", s.Names[0].String()) {
+					return nil
+				}
+			}
+		case "event trigger":
+			// Drop the dump-visible pg_event_trigger registry entry (DU-002,
+			// M0119-0004) so a dropped event trigger stops round-tripping
+			// through pg_dump.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				name := s.Names[0].String()
+				if im.DropEventTrigger(name) {
+					// DU-002 restart-persistence follow-up (M0119-0004,
+					// loop #70 ledger resume point): mirrors DROP
+					// PUBLICATION/SUBSCRIPTION.
+					if o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropEventTrigger(name)); werr != nil {
+							return fmt.Errorf("wal drop-event-trigger: %w", werr)
+						}
+					}
+					return nil
+				}
+			}
+		case "user mapping":
+			// DROP USER MAPPING FOR <user> SERVER <server>: Names = [user, server].
+			// Remove the dump-visible registry entry (DU-002 slice 377).
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && len(s.Names) >= 2 {
+				if im.DropUserMapping(s.Names[0].String(), s.Names[1].String()) {
 					return nil
 				}
 			}
 		case "foreign-data wrapper":
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				fdwName := s.Names[0].String()
-				if im.DropCompatObject("foreign-data wrapper", fdwName) {
+				if im.DropForeignDataWrapper(fdwName) {
 					// CASCADE: drop all servers associated with this FDW.
 					if s.Behavior == parser.DropCascade {
 						// Find servers registered under this FDW via "fdw-server:fdwname:servername".
@@ -11825,6 +13585,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						for _, serverName := range cascadeServers {
 							im.DropCompatObject("fdw-server", fdwName+":"+serverName)
 							im.DropCompatObject("server", serverName)
+							im.DropForeignServer(serverName) // dump-visible registry (DU-002 slice 376)
 							o.ctx.AddNotice(fmt.Sprintf("drop cascades to server %s", serverName))
 						}
 					}
@@ -11839,6 +13600,340 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		}
 	}
 	return nil
+}
+
+// castTypeOIDMatch reports whether two type-name spellings denote the same type
+// for CREATE CAST validation. Built-in aliases (integer/int4, boolean/bool, …)
+// are compared by OID via catalog.TypeNameToOID; user/unknown types (OID 0) fall
+// back to a case-insensitive name comparison. goopg does not model
+// binary-coercibility beyond identity, so this is an identity test — PG's
+// IsBinaryCoercibleWithCast additionally accepts an existing binary cast (see
+// the slice-398 deferral ledger row).
+func castTypeOIDMatch(a, b string) bool {
+	if oa, ob := catalog.TypeNameToOID(a), catalog.TypeNameToOID(b); oa != 0 && ob != 0 {
+		return oa == ob
+	}
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
+
+// validateCreateConversionEncodings mirrors the encoding-name checks PostgreSQL
+// performs in CreateConversionCommand (src/backend/commands/conversioncmds.c):
+// the source and destination encoding names must resolve (pg_char_to_encoding),
+// and SQL_ASCII (pg_enc ID 0, PG_SQL_ASCII) may not be either endpoint. It
+// returns the resolved pg_enc IDs and a ready-to-return *ExecError on failure.
+// An unknown encoding is ERRCODE_UNDEFINED_OBJECT (42704); SQL_ASCII is
+// ERRCODE_INVALID_OBJECT_DEFINITION (42P17). The FROM-function existence /
+// return-type / runtime-probe checks stay deferred (no encoding-conversion
+// engine in goopg). DU-002 slice 401.
+func validateCreateConversionEncodings(forName, toName string) (forEnc, toEnc int32, err error) {
+	forEnc = catalog.EncodingNameToID(forName)
+	if forEnc < 0 {
+		return 0, 0, &ExecError{Code: "42704", Message: fmt.Sprintf("source encoding %q does not exist", forName)}
+	}
+	toEnc = catalog.EncodingNameToID(toName)
+	if toEnc < 0 {
+		return 0, 0, &ExecError{Code: "42704", Message: fmt.Sprintf("destination encoding %q does not exist", toName)}
+	}
+	if forEnc == 0 || toEnc == 0 { // PG_SQL_ASCII == 0
+		return 0, 0, &ExecError{Code: "42P17", Message: `encoding conversion to or from "SQL_ASCII" is not supported`}
+	}
+	return forEnc, toEnc, nil
+}
+
+// resolveConversionFunc mirrors the FROM-function checks PostgreSQL performs in
+// CreateConversionCommand (conversioncmds.c) after the encoding-name checks
+// (validateCreateConversionEncodings) pass: LookupFuncName requires an exact
+// overload matching the fixed conversion-function signature
+// (int4, int4, cstring, internal, int4, bool), and get_func_rettype requires
+// that overload to return int4. PG reports a missing/mismatched signature as
+// ERRCODE_UNDEFINED_FUNCTION (42883) "function %s(integer, integer, cstring,
+// internal, integer, boolean) does not exist" (the fixed required signature,
+// regardless of what overloads actually exist) and a wrong return type as
+// ERRCODE_INVALID_OBJECT_DEFINITION (42P17) "encoding conversion function %s
+// must return type integer". DU-002 slice 401 deferral (b)-remainder.
+//
+// The runtime OidFunctionCall6 empty-input probe and the ACL_EXECUTE check
+// stay deferred: goopg has no encoding-conversion engine to actually invoke
+// the function against, and DDL slices run as the bootstrap superuser so an
+// EXECUTE-revoked-from-owner scenario cannot occur here.
+func resolveConversionFunc(rs *catalog.Routines, funcName parser.ObjectName) (*catalog.Routine, error) {
+	requiredSig := fmt.Sprintf("%s(integer, integer, cstring, internal, integer, boolean)", funcName.String())
+	var candidate *catalog.Routine
+	for _, r := range rs.LookupByName(funcName) {
+		inArgs := make([]catalog.Type, 0, len(r.ArgTypes))
+		for i, t := range r.ArgTypes {
+			if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+				continue
+			}
+			inArgs = append(inArgs, t)
+		}
+		if len(inArgs) != 6 {
+			continue
+		}
+		if catalog.TypeNameToOID(inArgs[0].Name) == catalog.OIDInt4 &&
+			catalog.TypeNameToOID(inArgs[1].Name) == catalog.OIDInt4 &&
+			strings.EqualFold(inArgs[2].Name, "cstring") &&
+			strings.EqualFold(inArgs[3].Name, "internal") &&
+			catalog.TypeNameToOID(inArgs[4].Name) == catalog.OIDInt4 &&
+			catalog.TypeNameToOID(inArgs[5].Name) == catalog.OIDBool {
+			candidate = r
+			break
+		}
+	}
+	if candidate == nil {
+		// Not a user-created routine. Fall back to the hand-curated built-in
+		// pg_proc table (catalog.LookupBuiltinProc) before giving up — mirrors
+		// resolveTransformFunc's identical fallback (DU-002 slice 404 follow-up).
+		// PG's real encoding-conversion functions (e.g. iso8859_1_to_utf8) are
+		// builtins with no user-routine registry entry.
+		if funcName.Schema == "" || strings.EqualFold(funcName.Schema, "pg_catalog") {
+			if b, ok := catalog.LookupBuiltinProc(funcName.Name); ok && builtinProcMatchesConversionSig(b) {
+				return &catalog.Routine{OID: b.OID, Name: b.Name, ReturnType: catalog.Type{Name: b.RetType}}, nil
+			}
+		}
+		return nil, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s does not exist", requiredSig)}
+	}
+	if catalog.TypeNameToOID(candidate.ReturnType.Name) != catalog.OIDInt4 {
+		return nil, &ExecError{Code: "42P17", Message: fmt.Sprintf("encoding conversion function %s must return type integer", funcName.String())}
+	}
+	return candidate, nil
+}
+
+// builtinProcMatchesConversionSig reports whether b's signature matches the
+// fixed (int4, int4, cstring, internal, int4, bool) -> int4 shape PG requires
+// of an encoding-conversion function (LookupFuncName in conversioncmds.c).
+func builtinProcMatchesConversionSig(b catalog.BuiltinProc) bool {
+	if catalog.TypeNameToOID(b.RetType) != catalog.OIDInt4 || len(b.ArgTypes) != 6 {
+		return false
+	}
+	return catalog.TypeNameToOID(b.ArgTypes[0]) == catalog.OIDInt4 &&
+		catalog.TypeNameToOID(b.ArgTypes[1]) == catalog.OIDInt4 &&
+		strings.EqualFold(b.ArgTypes[2], "cstring") &&
+		strings.EqualFold(b.ArgTypes[3], "internal") &&
+		catalog.TypeNameToOID(b.ArgTypes[4]) == catalog.OIDInt4 &&
+		catalog.TypeNameToOID(b.ArgTypes[5]) == catalog.OIDBool
+}
+
+// validateCreateCast mirrors the argument/return-type rules PostgreSQL enforces
+// in CreateCast (src/backend/commands/functioncmds.c). routine is the resolved
+// WITH FUNCTION routine, or nil for WITHOUT FUNCTION / WITH INOUT (or a WITH
+// FUNCTION reference that did not resolve, which keeps the slice-397 lenient
+// register-anyway behaviour). All errors use SQLSTATE 42P17
+// (invalid_object_definition), matching PG. DU-002 slice 398.
+func validateCreateCast(s *parser.CompatNoopStmt, routine *catalog.Routine) error {
+	source, target := s.ArgTypes[0], s.ArgTypes[1]
+	nargs := 0
+	if routine != nil {
+		// pronargs counts input arguments only (IN/INOUT/VARIADIC); OUT args and
+		// RETURNS TABLE columns (stored as trailing OUT args) do not count.
+		inArgs := make([]catalog.Type, 0, len(routine.ArgTypes))
+		for i, t := range routine.ArgTypes {
+			if i < len(routine.ArgModes) && routine.ArgModes[i] == "o" {
+				continue
+			}
+			inArgs = append(inArgs, t)
+		}
+		nargs = len(inArgs)
+		if nargs < 1 || nargs > 3 {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must take one to three arguments"}
+		}
+		if !castTypeOIDMatch(source, inArgs[0].Name) {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "argument of cast function must match or be binary-coercible from source data type"}
+		}
+		if nargs > 1 && catalog.TypeNameToOID(inArgs[1].Name) != catalog.OIDInt4 {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "second argument of cast function must be type integer"}
+		}
+		if nargs > 2 && catalog.TypeNameToOID(inArgs[2].Name) != catalog.OIDBool {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "third argument of cast function must be type boolean"}
+		}
+		if !castTypeOIDMatch(routine.ReturnType.Name, target) {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "return data type of cast function must match or be binary-coercible to target data type"}
+		}
+		if routine.IsProcedure || routine.IsWindow {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must be a normal function"}
+		}
+		if routine.ReturnsSet {
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "cast function must not return a set"}
+		}
+	}
+	// Allow source and target types to be the same only for length-coercion
+	// functions; PG assumes a multi-arg (>= 2) function does length coercion.
+	if castTypeOIDMatch(source, target) && nargs < 2 {
+		return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "source data type and target data type are the same"}
+	}
+	return nil
+}
+
+// resolveOperatorSupportFunc resolves a CREATE/ALTER OPERATOR RESTRICT=/JOIN=
+// selectivity estimator function reference to a pg_proc OID exactly like the
+// FUNCTION= clause: first the user routine registry, then the hand-curated
+// builtin table for an unqualified/pg_catalog-qualified name. Returns 0 for a
+// zero-value reference (no clause given / explicit NONE) or no match — the
+// caller decides whether that means "leave the estimator unset/cleared" or
+// "function does not exist". M0119-0004 (DU-002).
+func (o *ddlOp) resolveOperatorSupportFunc(ref parser.ObjectName) uint32 {
+	if ref.Name == "" {
+		return 0
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return 0
+	}
+	if rs := im.Routines(); rs != nil {
+		if overloads := rs.LookupByName(ref); len(overloads) == 1 {
+			return overloads[0].OID
+		}
+	}
+	if ref.Schema == "" || strings.EqualFold(ref.Schema, "pg_catalog") {
+		if b, ok := catalog.LookupBuiltinProc(ref.Name); ok {
+			return b.OID
+		}
+	}
+	return 0
+}
+
+// resolveOperatorRef resolves a COMMUTATOR/NEGATOR operand reference during
+// CREATE/ALTER OPERATOR, mirroring PG's get_other_operator/OperatorShellMake
+// (pg_operator.c): the referenced operator may already exist (real or a
+// forward-reference shell), may name the operator being defined/altered
+// itself (selfLink), or else a brand-new shell is minted purely to reserve a
+// stable OID for later back-patching. ownLeft/ownRight are the defining
+// operator's own argument types (used only for the self-link check — the
+// caller passes them already reversed for a COMMUTATOR lookup).
+// M0119-0004 (DU-002).
+func (o *ddlOp) resolveOperatorRef(ref parser.ObjectName, otherLeft, otherRight, ownSchema, ownName, ownLeft, ownRight string, ownNsOID uint32) (oid uint32, selfLink bool) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return 0, false
+	}
+	otherSchema := ref.Schema
+	if otherSchema == "" {
+		otherSchema = ownSchema
+	}
+	if existing, ok := im.LookupUserOperator(otherSchema, ref.Name, otherLeft, otherRight); ok {
+		return existing.OID, false
+	}
+	if strings.EqualFold(otherSchema, ownSchema) && ref.Name == ownName &&
+		otherLeft == ownLeft && otherRight == ownRight {
+		return 0, true
+	}
+	otherNsOID := o.ctx.Catalog.SchemaOID(otherSchema)
+	if otherNsOID == 0 {
+		otherNsOID = ownNsOID
+	}
+	shell := im.EnsureUserOperatorShell(otherSchema, ref.Name, otherLeft, otherRight, otherNsOID)
+	return shell.OID, false
+}
+
+// execAlterOperatorSet handles `ALTER OPERATOR name (left_type, right_type)
+// SET (option = value, ...)` — PG's post-creation attribute-edit form
+// (AlterOperator, operatorcmds.c). Mirrors that function's semantics:
+// RESTRICT/JOIN may be changed freely (or cleared via NONE); COMMUTATOR/
+// NEGATOR/MERGES/HASHES may only be set if not already set (a no-op
+// restatement of the same value is allowed, matching PG's "allow no-op
+// updates" comment). M0119-0004 (DU-002), closes the slice-407 ledger
+// follow-up (`0119-0004-create-operator-roundtrip.md`).
+func (o *ddlOp) execAlterOperatorSet(s *parser.AlterOperatorSetStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	op, found := im.LookupUserOperator(schema, s.Name.Name, s.LeftType, s.RightType)
+	if !found {
+		sig := s.Name.Name + "(" + operatorArgOrNone(s.LeftType) + "," + operatorArgOrNone(s.RightType) + ")"
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator does not exist: %s", sig)}
+	}
+	invalidDef := func(attr string) *ExecError {
+		return &ExecError{Code: "42P13", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator attribute %q cannot be changed if it has already been set", attr)}
+	}
+
+	if s.RestrictSet {
+		if s.Restrict.Name == "" {
+			op.RestrictOID = 0
+		} else {
+			oid := o.resolveOperatorSupportFunc(s.Restrict)
+			if oid == 0 {
+				return &ExecError{Code: "42883", Pos: s.Pos(),
+					Message: fmt.Sprintf("function %s does not exist", s.Restrict.Name)}
+			}
+			op.RestrictOID = oid
+		}
+	}
+	if s.JoinSet {
+		if s.Join.Name == "" {
+			op.JoinOID = 0
+		} else {
+			oid := o.resolveOperatorSupportFunc(s.Join)
+			if oid == 0 {
+				return &ExecError{Code: "42883", Pos: s.Pos(),
+					Message: fmt.Sprintf("function %s does not exist", s.Join.Name)}
+			}
+			op.JoinOID = oid
+		}
+	}
+	if s.CommutatorSet {
+		if s.Commutator.Name == "" {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "invalid COMMUTATOR specification"}
+		}
+		// The commutator has reversed argument types.
+		otherOID, selfLink := o.resolveOperatorRef(s.Commutator, s.RightType, s.LeftType, schema, s.Name.Name, s.LeftType, s.RightType, op.NamespaceOIDOrDefault())
+		if selfLink {
+			otherOID = op.OID
+		}
+		if op.CommutatorOID != 0 && op.CommutatorOID != otherOID {
+			return invalidDef("commutator")
+		}
+		op.CommutatorOID = otherOID
+		if !selfLink {
+			if other := im.LookupUserOperatorByOID(otherOID); other != nil && other.CommutatorOID == 0 {
+				other.CommutatorOID = op.OID
+			}
+		}
+	}
+	if s.NegatorSet {
+		if s.Negator.Name == "" {
+			return &ExecError{Code: "42601", Pos: s.Pos(), Message: "invalid NEGATOR specification"}
+		}
+		otherOID, selfLink := o.resolveOperatorRef(s.Negator, s.LeftType, s.RightType, schema, s.Name.Name, s.LeftType, s.RightType, op.NamespaceOIDOrDefault())
+		if selfLink || otherOID == op.OID {
+			return &ExecError{Code: "42P13", Pos: s.Pos(), Message: "operator cannot be its own negator"}
+		}
+		if op.NegatorOID != 0 && op.NegatorOID != otherOID {
+			return invalidDef("negator")
+		}
+		op.NegatorOID = otherOID
+		if other := im.LookupUserOperatorByOID(otherOID); other != nil && other.NegatorOID == 0 {
+			other.NegatorOID = op.OID
+		}
+	}
+	if s.Merges != nil {
+		if op.CanMerge && !*s.Merges {
+			return invalidDef("merges")
+		}
+		op.CanMerge = *s.Merges
+	}
+	if s.Hashes != nil {
+		if op.CanHash && !*s.Hashes {
+			return invalidDef("hashes")
+		}
+		op.CanHash = *s.Hashes
+	}
+	return nil
+}
+
+// operatorArgOrNone renders an empty operator argument type as PG's "NONE"
+// display, matching op_signature_string's own unary-operator formatting.
+func operatorArgOrNone(t string) string {
+	if t == "" {
+		return "NONE"
+	}
+	return t
 }
 
 // execCompatNoop handles CompatNoopStmt (GRANT/REVOKE/COMMENT/CREATE RULE/etc).
@@ -11903,11 +13998,54 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			}
 		}
 	}
+	// A GRANT/REVOKE … ON TYPE|DOMAIN … changes pg_type.typacl. Unlike
+	// table/schema/function ACLs (whose catalogs goopg serves virtually, so the
+	// server short-circuit records them), pg_type is heap-backed for PG18-standby
+	// basebackup parity (M0097-0022), so the change must update the OID-keyed ACL
+	// store AND re-sync the real pg_type heap row — which needs the *executor.Context
+	// in scope here. The parser routed this statement to the executor (query.go
+	// excludes ON TYPE/DOMAIN from the server GRANT fast path). M0119-0004-ACLHEAP.
+	if s.TypeACL != nil {
+		if err := o.execTypeACLChange(s.TypeACL); err != nil {
+			return err
+		}
+	}
+	// A column-level GRANT/REVOKE — `GRANT <priv>(<col>) ON [TABLE] <name> …` —
+	// changes pg_attribute.attacl, which is heap-backed exactly like pg_type.typacl,
+	// so it must update the (relOID, attnum)-keyed column ACL store AND re-sync the
+	// affected pg_attribute heap rows. The server excludes a parenthesised-column
+	// GRANT from its fast path (isHeapACLObject in query.go) so it reaches the
+	// executor here with an *executor.Context in scope. M0119-0004-ACLHEAP.
+	if s.AttrACL != nil {
+		if err := o.execAttrACLChange(s.AttrACL); err != nil {
+			return err
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
+		return nil
+	}
+	// ALTER FOREIGN DATA WRAPPER name OPTIONS (...) — merges onto the existing
+	// fdw's pg_foreign_data_wrapper.fdwoptions via the same verb-tagged
+	// ADD/SET/DROP mechanism as ALTER FOREIGN TABLE ... OPTIONS (...)
+	// (applyFDWOptionChanges), rather than the flat replace
+	// RegisterForeignDataWrapper performs for CREATE. Unlike CREATE, the
+	// target FDW must already exist. DU-002 slice 421.
+	if s.Tag == "ALTER" && s.ObjType == "foreign-data wrapper" {
+		fdwName := s.ObjName.String()
+		fdw, found := im.LookupForeignDataWrapper(fdwName)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", fdwName)}
+		}
+		merged, mergeErr := applyFDWOptionChanges(fdw.Options, s.FDWOptionChanges)
+		if mergeErr != nil {
+			return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
+		}
+		fdw.Options = merged
 		return nil
 	}
 	switch s.ObjType {
@@ -11918,9 +14056,30 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if s.TableName.Name != "" {
 			im.RegisterCompatObject("fdw-server", s.TableName.String()+":"+s.ObjName.String())
 		}
+		// Also record it in the dedicated foreign-server registry so it
+		// round-trips through pg_dump (pg_foreign_server virtual view →
+		// dumpForeignServer). The registry mints a stable OID and resolves the
+		// referenced FDW name to its srvfdw OID at render time. DU-002 slice 376.
+		im.RegisterForeignServer(s.ObjName.String(), s.TableName.String(), s.ServerType, s.ServerVersion, s.Options)
 	case "foreign-data wrapper":
-		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed.
-		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		// Register FDW so DROP FOREIGN DATA WRAPPER can succeed AND so it
+		// round-trips through pg_dump (pg_foreign_data_wrapper virtual view →
+		// dumpForeignDataWrapper). The dedicated registry mints a stable OID so
+		// repeated VirtualRows calls return the same identity. Options threads
+		// the OPTIONS (...) clause so fdwoptions round-trips
+		// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper).
+		// DU-002 slice 375 (options: slice 380).
+		im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+	case "user mapping":
+		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
+		// so it round-trips through pg_dump (pg_user_mappings virtual view →
+		// dumpUserMappings). ObjName carries the mapped user; TableName carries the
+		// server association. Without this, creating any foreign server makes
+		// pg_dump query the (previously missing) pg_user_mappings view and abort.
+		// Options threads the OPTIONS (...) clause so umoptions round-trips
+		// (pg_user_mappings.umoptions → dumpUserMappings). DU-002 slice 377
+		// (options: slice 379).
+		im.RegisterUserMapping(s.ObjName.String(), s.TableName.String(), s.Options)
 	case "operator":
 		// Build the compat key as opName(leftCanon,rightCanon) to match DROP OPERATOR lookup.
 		leftArg, rightArg := "", ""
@@ -11938,6 +14097,234 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		}
 		key := s.ObjName.Name + "(" + leftCanon + "," + rightCanon + ")"
 		im.RegisterCompatObject("operator", key)
+		// Also record it in the dedicated operator registry (catalog.UserOperator)
+		// so it round-trips through pg_dump (pg_operator virtual view →
+		// getOperators/dumpOpr): FUNCTION/LEFTARG/RIGHTARG, COMMUTATOR/NEGATOR
+		// (two-pass shell resolution, PG's get_other_operator/OperatorShellMake/
+		// OperatorUpd), RESTRICT/JOIN, and MERGES/HASHES. A missing RIGHTARG
+		// (postfix operator) is rejected — PG14+ removed postfix operator
+		// support outright (DefineOperator, operatorcmds.c). DU-002 slice 407.
+		if s.OpFuncName.Name != "" {
+			if rightArg == "" {
+				return &ExecError{Code: "42P13", Pos: s.Pos(),
+					Message: "operator right argument type must be specified",
+					Hint:    "Postfix operators are not supported."}
+			}
+			var funcOID uint32
+			var funcRetType string
+			if rs := im.Routines(); rs != nil {
+				if overloads := rs.LookupByName(s.OpFuncName); len(overloads) == 1 {
+					funcOID = overloads[0].OID
+					funcRetType = overloads[0].ReturnType.Name
+				}
+			}
+			if funcOID == 0 && (s.OpFuncName.Schema == "" || strings.EqualFold(s.OpFuncName.Schema, "pg_catalog")) {
+				// Not a user-created routine. Fall back to the hand-curated
+				// built-in pg_proc table, mirroring resolveTransformFunc's and
+				// CREATE CAST's identical fallback.
+				if b, ok := catalog.LookupBuiltinProc(s.OpFuncName.Name); ok {
+					funcOID = b.OID
+					funcRetType = b.RetType
+				}
+			}
+			schema := s.ObjName.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			nsOID := o.ctx.Catalog.SchemaOID(schema)
+			if nsOID == 0 {
+				nsOID = o.ctx.Catalog.SchemaOID("public")
+			}
+
+			// OperatorValidateParams (operatorcmds.c): commutator/join
+			// selectivity/merge/hash require a binary operator; negator/
+			// restriction selectivity/join selectivity/merge/hash require a
+			// boolean-returning function.
+			isBinary := leftArg != "" && rightArg != ""
+			returnsBool := strings.EqualFold(funcRetType, "bool") || strings.EqualFold(funcRetType, "boolean")
+			hasCommutator := s.OpCommutatorName.Name != ""
+			hasNegator := s.OpNegatorName.Name != ""
+			hasRestrict := s.OpRestrictFuncName.Name != ""
+			hasJoin := s.OpJoinFuncName.Name != ""
+			invalidDef := func(msg string) *ExecError {
+				return &ExecError{Code: "42P13", Pos: s.Pos(), Message: msg}
+			}
+			switch {
+			case !isBinary && hasCommutator:
+				return invalidDef("only binary operators can have commutators")
+			case !isBinary && hasJoin:
+				return invalidDef("only binary operators can have join selectivity")
+			case !isBinary && s.OpCanMerge:
+				return invalidDef("only binary operators can merge join")
+			case !isBinary && s.OpCanHash:
+				return invalidDef("only binary operators can hash")
+			case !returnsBool && hasNegator:
+				return invalidDef("only boolean operators can have negators")
+			case !returnsBool && hasRestrict:
+				return invalidDef("only boolean operators can have restriction selectivity")
+			case !returnsBool && hasJoin:
+				return invalidDef("only boolean operators can have join selectivity")
+			case !returnsBool && s.OpCanMerge:
+				return invalidDef("only boolean operators can merge join")
+			case !returnsBool && s.OpCanHash:
+				return invalidDef("only boolean operators can hash")
+			}
+
+			op := im.RegisterUserOperator(schema, s.ObjName.Name, leftArg, rightArg, nsOID, funcOID, 0)
+			op.CanMerge = s.OpCanMerge
+			op.CanHash = s.OpCanHash
+
+			// RESTRICT / JOIN: a bare (possibly schema-qualified) selectivity
+			// estimator function name, resolved exactly like FUNCTION=.
+			op.RestrictOID = o.resolveOperatorSupportFunc(s.OpRestrictFuncName)
+			op.JoinOID = o.resolveOperatorSupportFunc(s.OpJoinFuncName)
+
+			// COMMUTATOR / NEGATOR: two-pass forward-reference resolution
+			// mirroring get_other_operator/OperatorShellMake (pg_operator.c).
+			// The referenced operator may not exist yet — resolve it if
+			// already registered (real or shell), detect self-linkage (the
+			// operator being created is itself the commutator/negator), or
+			// else forward-declare a shell purely to mint a stable OID.
+			var commutatorOID uint32
+			selfCommutator := false
+			if hasCommutator {
+				// The commutator has reversed argument types.
+				commutatorOID, selfCommutator = o.resolveOperatorRef(s.OpCommutatorName, rightArg, leftArg, schema, s.ObjName.Name, leftArg, rightArg, nsOID)
+				if selfCommutator {
+					commutatorOID = op.OID
+				}
+			}
+			var negatorOID uint32
+			if hasNegator {
+				var selfNegator bool
+				negatorOID, selfNegator = o.resolveOperatorRef(s.OpNegatorName, leftArg, rightArg, schema, s.ObjName.Name, leftArg, rightArg, nsOID)
+				if selfNegator || negatorOID == op.OID {
+					return invalidDef("operator cannot be its own negator")
+				}
+			}
+			// Only overwrite when the clause was actually restated: a later
+			// CREATE OPERATOR statement that merely fills in a shell (no
+			// COMMUTATOR/NEGATOR clause of its own) must not clobber a link
+			// already back-patched onto it by the other side.
+			if hasCommutator {
+				op.CommutatorOID = commutatorOID
+			}
+			if hasNegator {
+				op.NegatorOID = negatorOID
+			}
+
+			// Back-patch: if the referenced commutator/negator already exists
+			// (real or shell) and doesn't already point somewhere else, make
+			// it point back at this operator (OperatorUpd). This lets a pair
+			// of operators be defined in either order without restating the
+			// link on both sides.
+			if hasCommutator && !selfCommutator {
+				if other := im.LookupUserOperatorByOID(commutatorOID); other != nil && other.CommutatorOID == 0 {
+					other.CommutatorOID = op.OID
+				}
+			}
+			if hasNegator {
+				if other := im.LookupUserOperatorByOID(negatorOID); other != nil && other.NegatorOID == 0 {
+					other.NegatorOID = op.OID
+				}
+			}
+		}
+	case "operator family":
+		// Register the user-defined operator family (CREATE OPERATOR FAMILY
+		// name USING method) so it round-trips through pg_dump (pg_opfamily
+		// virtual view → getOpfamilies/dumpOpfamily). The family starts empty
+		// — PG's grammar has no AS clause here; members are added later via
+		// ALTER OPERATOR FAMILY ... ADD, which goopg does not yet implement
+		// (deferred, see the ledger). An unrecognized access method name
+		// resolves to method OID 0, which real PG rejects with
+		// "access method %s does not exist" (42704) — mirrored here rather
+		// than silently registering a bogus family. DU-002 slice 408.
+		methodOID := catalog.AccessMethodOIDByName(s.OpFamilyMethod)
+		if methodOID == 0 {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("access method %q does not exist", s.OpFamilyMethod)}
+		}
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		nsOID := o.ctx.Catalog.SchemaOID(schema)
+		if nsOID == 0 {
+			nsOID = o.ctx.Catalog.SchemaOID("public")
+		}
+		im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+	case "cast":
+		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
+		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).
+		// ArgTypes carries [source, target]; CastContext/CastMethod carry
+		// castcontext/castmethod. DU-002 slice 395.
+		if len(s.ArgTypes) == 2 {
+			var funcOID uint32
+			var routine *catalog.Routine
+			if s.CastMethod == "f" {
+				// WITH FUNCTION: resolve the referenced function to its pg_proc
+				// OID so pg_cast.castfunc is non-zero and dumpCast's findFuncByOid
+				// re-emits `WITH FUNCTION <ns>.<signature>`. The OID is the
+				// routine's OID, identical to the one goopg's pg_proc virtual view
+				// assigns the function, so the dump's func/cast cross-reference
+				// matches. Resolution mirrors COMMENT ON FUNCTION (slice 147): the
+				// explicit arg-type list keys the right overload; a bare
+				// `WITH FUNCTION fn` (no args) falls back to the sole overload.
+				// DU-002 slice 397.
+				if rs := im.Routines(); rs != nil && s.CastFuncName.Name != "" {
+					if len(s.CastFuncArgs) > 0 {
+						argTypes := make([]catalog.Type, len(s.CastFuncArgs))
+						for i, a := range s.CastFuncArgs {
+							argTypes[i] = catalog.Type{Name: strings.ToLower(a)}
+						}
+						if r, ok := rs.Lookup(s.CastFuncName, argTypes); ok && r != nil {
+							routine = r
+						}
+					}
+					if routine == nil {
+						if overloads := rs.LookupByName(s.CastFuncName); len(overloads) == 1 {
+							routine = overloads[0]
+						}
+					}
+					if routine == nil && (s.CastFuncName.Schema == "" || strings.EqualFold(s.CastFuncName.Schema, "pg_catalog")) {
+						// Not a user-created routine. Fall back to the hand-curated
+						// built-in pg_proc table (catalog.LookupBuiltinProc) before
+						// giving up — mirrors resolveTransformFunc's identical
+						// fallback (DU-002 slice 404 follow-up). Synthesized as a
+						// *catalog.Routine so validateCreateCast below runs its full
+						// argument/return-type checks against the builtin's real
+						// signature instead of skipping them.
+						if b, ok := catalog.LookupBuiltinProc(s.CastFuncName.Name); ok {
+							argTypes := make([]catalog.Type, len(b.ArgTypes))
+							for i, a := range b.ArgTypes {
+								argTypes[i] = catalog.Type{Name: a}
+							}
+							routine = &catalog.Routine{OID: b.OID, Name: b.Name, ArgTypes: argTypes, ReturnType: catalog.Type{Name: b.RetType}, Volatile: b.Volatile}
+						}
+					}
+				}
+				if routine != nil {
+					funcOID = routine.OID
+				}
+			}
+			// Enforce PG's CREATE CAST argument/return-type rules
+			// (functioncmds.c CreateCast) before registering. DU-002 slice 398.
+			if err := validateCreateCast(s, routine); err != nil {
+				return err
+			}
+			cs := im.RegisterCast(s.ArgTypes[0], s.ArgTypes[1], s.CastContext, s.CastMethod, funcOID)
+			// DU-002 restart-persistence follow-up: goopg's CREATE CAST is a
+			// catalog-only side effect with no per-cast file namespace, so
+			// record a WAL event the recovery driver
+			// (internal/initdb/cast_ddl_recovery.go) replays into the cast
+			// registry on the next startup. Mirrors CREATE TRANSFORM
+			// (M0119-0004).
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateCast(cs.SourceType, cs.TargetType, cs.Context, cs.Method, cs.OID, cs.FuncOID)); werr != nil {
+					return fmt.Errorf("wal create-cast: %w", werr)
+				}
+			}
+		}
 	case "schema":
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if s.ObjName.Name != "" {
@@ -11964,11 +14351,521 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				im.RegisterTableRuleKind(s.TableName.Name, s.RuleKind)
 			}
 		}
+	case "conversion":
+		// Register the conversion (CREATE [DEFAULT] CONVERSION name FOR 'src' TO
+		// 'dest' FROM func) so it round-trips through pg_dump (pg_conversion view →
+		// getConversions / dumpConversion). DU-002 slice 399.
+		//
+		// Before registering, validate exactly as PG's CreateConversionCommand
+		// (conversioncmds.c) does, in order: (1) the encoding names — an unknown
+		// source or destination encoding is ERRCODE_UNDEFINED_OBJECT (42704), and a
+		// conversion to or from SQL_ASCII (pg_enc ID 0, PG_SQL_ASCII) is
+		// ERRCODE_INVALID_OBJECT_DEFINITION (42P17) — PG forbids it because
+		// pg_do_encoding_conversion has hard-wired SQL_ASCII fast paths, so such a
+		// conversion function could never be used (DU-002 slice 401, encoding half);
+		// then (2) the FROM function — it must resolve to a routine with the fixed
+		// signature (int4, int4, cstring, internal, int4, bool) -> int4
+		// (resolveConversionFunc), mirroring LookupFuncName + get_func_rettype
+		// (slice 401, function half, closes the slice-399 deferral (b) remainder).
+		// The runtime OidFunctionCall6 probe and EXECUTE ACL check stay deferred —
+		// see resolveConversionFunc's doc comment.
+		forEnc, toEnc, cerr := validateCreateConversionEncodings(s.ConvForEncoding, s.ConvToEncoding)
+		if cerr != nil {
+			return cerr
+		}
+		rs := im.Routines()
+		if rs == nil {
+			return &ExecError{Code: "XX000", Message: "CREATE CONVERSION requires routine registry"}
+		}
+		convFunc, ferr := resolveConversionFunc(rs, s.ConvFuncName)
+		if ferr != nil {
+			return ferr
+		}
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		owner := uint32(10) // bootstrap superuser (postgres)
+		uc := &catalog.UserConversion{
+			Name:        s.ObjName.Name,
+			Owner:       owner,
+			ForEncoding: forEnc,
+			ToEncoding:  toEnc,
+			ProcSchema:  s.ConvFuncName.Schema,
+			ProcName:    s.ConvFuncName.Name,
+			FuncOID:     convFunc.OID,
+			Default:     s.ConvDefault,
+		}
+		if _, err := im.CreateConversion(uc, schema); err != nil {
+			return &ExecError{Code: "42710", Message: err.Error()}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): goopg has no
+		// per-conversion on-disk file namespace, so record a WAL event the
+		// recovery driver (internal/initdb/conversion_ddl_recovery.go)
+		// replays into the conversion registry on the next startup. Mirrors
+		// CREATE CAST/TRANSFORM.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateConversion(uc.Name, schema, uc.ProcSchema, uc.ProcName, uc.OID, uc.Owner, uc.FuncOID, uc.ForEncoding, uc.ToEncoding, uc.Default)); werr != nil {
+				return fmt.Errorf("wal create-conversion: %w", werr)
+			}
+		}
+	case "transform":
+		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang
+		// (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] | ...)) so it
+		// round-trips through pg_dump (pg_transform view →
+		// getTransforms/dumpTransform). DU-002 (M0119-0004).
+		if catalog.LanguageNameToOID(s.TransformLang) == 0 {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("language %q does not exist", s.TransformLang)}
+		}
+		if im.TransformExists(s.TransformType, s.TransformLang) {
+			return &ExecError{Code: "42710", Message: fmt.Sprintf("transform for type %s language %q already exists", s.TransformType, s.TransformLang)}
+		}
+		rs := im.Routines()
+		var fromFuncOID, toFuncOID uint32
+		if s.TransformFromFunc.Name != "" {
+			oid, ferr := resolveTransformFunc(rs, s.TransformFromFunc, s.TransformFromArgs, true, s.TransformType)
+			if ferr != nil {
+				return ferr
+			}
+			fromFuncOID = oid
+		}
+		if s.TransformToFunc.Name != "" {
+			oid, ferr := resolveTransformFunc(rs, s.TransformToFunc, s.TransformToArgs, false, s.TransformType)
+			if ferr != nil {
+				return ferr
+			}
+			toFuncOID = oid
+		}
+		tf := im.RegisterTransform(s.TransformType, s.TransformLang, fromFuncOID, toFuncOID)
+		// DU-002 (M0119-0004) restart persistence: goopg has no per-transform
+		// on-disk file namespace, so record a WAL event the recovery driver
+		// (internal/initdb/transform_ddl_recovery.go) replays into the
+		// transform registry on the next startup. Mirrors CREATE SCHEMA
+		// (M0110-0003).
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTransform(tf.TypeName, tf.Lang, tf.OID, tf.FromFuncOID, tf.ToFuncOID)); werr != nil {
+				return fmt.Errorf("wal create-transform: %w", werr)
+			}
+		}
 	default:
-		// conversion, text search dictionary/configuration/parser/template, etc.
+		// text search dictionary/configuration/parser/template, language, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 	}
 	return nil
+}
+
+// resolveTransformFunc resolves a CREATE TRANSFORM `FROM SQL WITH FUNCTION` /
+// `TO SQL WITH FUNCTION` clause's referenced function to its pg_proc OID and
+// validates it against PostgreSQL's CreateTransform + check_transform_function
+// (functioncmds.c): the role-specific return-type check (FROM SQL must return
+// `internal`; TO SQL must return the transform's declared type) runs first,
+// then not volatile, a normal function (not procedure/window), not SETOF, and
+// exactly one argument of type `internal`. Resolution mirrors CREATE CAST's
+// WITH FUNCTION handling (slice 397): the explicit arg-type list keys the
+// right overload, a bare `fn` (no args) falls back to the sole overload.
+//
+// Only USER-created (CREATE FUNCTION) routines are covered — goopg's routine
+// registry (catalog.Routines) does not include built-in functions (e.g.
+// int4recv, prsd_lextype), so a reference to a builtin resolves to OID 0
+// without error, exactly like CREATE CAST's WITH FUNCTION does for a builtin
+// (RegisterCast's funcOID stays 0 in the same situation). This is a systemic
+// gap — goopg's server-side pg_proc catalog does not expose builtin functions
+// at all (confirmed empirically: `SELECT * FROM pg_proc WHERE proname =
+// 'int4recv'` returns 0 rows) — see the deferral ledger for the resume point.
+func resolveTransformFunc(rs *catalog.Routines, fn parser.ObjectName, args []string, isFromSQL bool, transformType string) (uint32, error) {
+	if rs == nil {
+		return 0, nil
+	}
+	var routine *catalog.Routine
+	if len(args) > 0 {
+		argTypes := make([]catalog.Type, len(args))
+		for i, a := range args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a)}
+		}
+		if r, ok := rs.Lookup(fn, argTypes); ok && r != nil {
+			routine = r
+		}
+	}
+	if routine == nil {
+		if overloads := rs.LookupByName(fn); len(overloads) == 1 {
+			routine = overloads[0]
+		}
+	}
+	if routine == nil {
+		// Not a user-created routine. Fall back to the hand-curated built-in
+		// pg_proc table (catalog.LookupBuiltinProc) before giving up — DU-002's
+		// CREATE TRANSFORM fixture references int4recv/prsd_lextype, which are
+		// real pg_proc.dat entries goopg's SQL-queryable pg_proc view now also
+		// exposes (internal/initdb/pg_proc_view.go), so the two paths agree.
+		if b, ok := catalog.LookupBuiltinProc(fn.Name); ok && (fn.Schema == "" || strings.EqualFold(fn.Schema, "pg_catalog")) {
+			return validateBuiltinTransformFunc(b, isFromSQL, transformType)
+		}
+		// Genuinely unresolvable (built-in with no curated entry, or missing) —
+		// leave unresolved rather than erroring; see the doc comment above.
+		return 0, nil
+	}
+	if isFromSQL {
+		if !strings.EqualFold(routine.ReturnType.Name, "internal") {
+			return 0, &ExecError{Code: "42P17", Message: "return data type of FROM SQL function must be internal"}
+		}
+	} else if catalog.TypeNameToOID(routine.ReturnType.Name) != catalog.TypeNameToOID(transformType) {
+		return 0, &ExecError{Code: "42P17", Message: "return data type of TO SQL function must be the transform data type"}
+	}
+	if routine.Volatile == "v" {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must not be volatile"}
+	}
+	if routine.IsProcedure || routine.IsWindow {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must be a normal function"}
+	}
+	if routine.ReturnsSet {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must not return a set"}
+	}
+	inArgs := make([]catalog.Type, 0, len(routine.ArgTypes))
+	for i, t := range routine.ArgTypes {
+		if i < len(routine.ArgModes) && routine.ArgModes[i] == "o" {
+			continue
+		}
+		inArgs = append(inArgs, t)
+	}
+	if len(inArgs) != 1 {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must take one argument"}
+	}
+	if !strings.EqualFold(inArgs[0].Name, "internal") {
+		return 0, &ExecError{Code: "42P17", Message: "first argument of transform function must be type internal"}
+	}
+	return routine.OID, nil
+}
+
+// validateBuiltinTransformFunc applies the same check_transform_function
+// rules (functioncmds.c) as resolveTransformFunc's user-routine path, but
+// against a catalog.BuiltinProc. Built-ins are hand-curated (see
+// catalog.LookupBuiltinProc), so provolatile/prokind/proretset are already
+// known-correct; this still runs the same signature checks a real CREATE
+// TRANSFORM would, so a future addition to the table that doesn't fit a
+// transform's rules fails loudly instead of silently mis-registering.
+func validateBuiltinTransformFunc(b catalog.BuiltinProc, isFromSQL bool, transformType string) (uint32, error) {
+	if isFromSQL {
+		if !strings.EqualFold(b.RetType, "internal") {
+			return 0, &ExecError{Code: "42P17", Message: "return data type of FROM SQL function must be internal"}
+		}
+	} else if catalog.TypeNameToOID(b.RetType) != catalog.TypeNameToOID(transformType) {
+		return 0, &ExecError{Code: "42P17", Message: "return data type of TO SQL function must be the transform data type"}
+	}
+	if b.Volatile == "v" {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must not be volatile"}
+	}
+	if len(b.ArgTypes) != 1 {
+		return 0, &ExecError{Code: "42P17", Message: "transform function must take one argument"}
+	}
+	if !strings.EqualFold(b.ArgTypes[0], "internal") {
+		return 0, &ExecError{Code: "42P17", Message: "first argument of transform function must be type internal"}
+	}
+	return b.OID, nil
+}
+
+// typeACLAllPrivs is the expansion of GRANT ALL [PRIVILEGES] ON a TYPE/DOMAIN:
+// USAGE is the only grantable type privilege, so any ALL / USAGE / unrecognised
+// privilege keyword on a type collapses to USAGE (matching acldefault('T', …)).
+var typeACLAllPrivs = []string{"USAGE"}
+
+// userTypeKind selects which pg_type row builder re-syncs a user type's heap row.
+type userTypeKind int
+
+const (
+	typeKindNone userTypeKind = iota
+	typeKindEnum
+	typeKindDomain
+	typeKindComposite
+)
+
+// resolveUserTypeOID maps a user TYPE/DOMAIN name to its pg_type OID and the row
+// builder kind, searching the enum, domain, and composite registries in turn. A
+// name that resolves to none of them returns (0, typeKindNone) so a GRANT on an
+// unknown / built-in type is a successful no-op. M0119-0004-ACLHEAP.
+func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind) {
+	if et, ok := im.LookupEnum(name); ok && et != nil {
+		return et.OID, typeKindEnum
+	}
+	if d, ok := im.LookupDomain(name); ok && d != nil {
+		return d.OID, typeKindDomain
+	}
+	if ct := im.LookupCompositeType(name); ct != nil {
+		return ct.OID, typeKindComposite
+	}
+	return 0, typeKindNone
+}
+
+// execTypeACLChange applies a GRANT/REVOKE … ON TYPE|DOMAIN … to the OID-keyed
+// ACL store and re-syncs the heap-backed pg_type.typacl. A type's only grantable
+// privilege is USAGE, and acldefault('T', owner) grants USAGE to BOTH the owner
+// and PUBLIC (structurally identical to the function EXECUTE default), so the
+// store update mirrors recordFunctionGrant / recordFunctionRevoke verbatim with
+// USAGE. Unknown type names are a successful no-op. M0119-0004-ACLHEAP.
+func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, tn := range tc.TypeNames {
+		oid, kind := resolveUserTypeOID(im, tn.Name)
+		if oid == 0 {
+			continue
+		}
+		if tc.Revoke {
+			// A type's acldefault grants USAGE to owner + PUBLIC; PG materializes
+			// that array on the first GRANT/REVOKE. Seed both implicit entries
+			// while typacl is still NULL so an owner-side REVOKE leaves the
+			// surviving entry explicit (mirrors recordFunctionRevoke for proacl).
+			if im.TypeACLText(oid) == "" {
+				im.MaterializeOwnerACL(oid, "postgres", typeACLAllPrivs)
+				im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
+			}
+			for _, role := range tc.Grantees {
+				im.RevokeTablePrivilege(oid, role, "USAGE")
+			}
+		} else {
+			// Seed the implicit PUBLIC USAGE that acldefault('T', …) carries so the
+			// materialized typacl matches PG's array; the owner entry is supplied
+			// by the renderer's owner branch (TypeACLText / relaclTextLockedFor).
+			im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
+			for _, role := range tc.Grantees {
+				im.GrantTablePrivilegeWithGrantOption(oid, role, "USAGE", tc.WithGrantOption)
+			}
+		}
+		if err := o.resyncTypeACLHeapRow(im, oid, kind); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resyncTypeACLHeapRow rewrites the heap-backed pg_type row for a user type so
+// its typacl column carries the projected ACL as a PG-native _aclitem ArrayType
+// (read by a PG18 standby / basebackup). It mirrors the delete-old + insert-new +
+// mirror-to-postgres-DB template syncEnumTypeToCatalogHeap and deleteTypeFromCatalogHeap
+// already use for CREATE/DROP TYPE. A no-op when the catalog heap relfiles are
+// absent (in-memory test fixture): goopg's own reads project typacl from the ACL
+// store via the seqscan hook, so the heap write is purely standby parity.
+// M0119-0004-ACLHEAP (design 0119-0004).
+func (o *ddlOp) resyncTypeACLHeapRow(im *catalog.InMemory, oid uint32, kind userTypeKind) error {
+	ctx := o.ctx
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	var row Row
+	switch kind {
+	case typeKindEnum:
+		et, ok := im.LookupEnumByOID(oid)
+		if !ok || et == nil {
+			return nil
+		}
+		row = buildUserPGTypeRowForEnum(et)
+	case typeKindDomain:
+		d, ok := im.LookupDomainByOID(oid)
+		if !ok || d == nil {
+			return nil
+		}
+		row = buildUserPGTypeRowForDomain(d)
+	case typeKindComposite:
+		ct, ok := im.LookupCompositeTypeByOID(oid)
+		if !ok || ct == nil {
+			return nil
+		}
+		row = buildUserPGTypeRowForComposite(ct)
+	default:
+		return nil
+	}
+	// Fill typacl (the final pg_type column) from the projected ACL text. PG
+	// keeps typacl NULL until the array is non-empty; an owner-side REVOKE ALL
+	// yields the non-NULL empty array "{}" (encoded as an empty _aclitem).
+	aclText := im.TypeACLText(oid)
+	typaclIdx := len(row) - 1
+	if aclText == "" {
+		row[typaclIdx] = NullDatum
+	} else {
+		blob, err := encodeAclItemArrayText(aclText, func(roleName string) uint32 {
+			if roid, ok := im.RoleOID(roleName); ok {
+				return roid
+			}
+			return 0
+		})
+		if err != nil {
+			return err
+		}
+		row[typaclIdx] = NewBytesDatum(blob)
+	}
+	// Stamp the stale row's xmax with this txn's writer XID, append the rebuilt
+	// row, and mirror to the postgres DB (the session reads from DBOid=5).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	deleteTypeFromCatalogHeap(ctx, catalog.DefaultDBOid, oid, ctx.Tx.XID)
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), row); err != nil {
+		return err
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	return nil
+}
+
+// attrACLAllPrivs is the expansion of GRANT ALL [PRIVILEGES] (cols) ON a TABLE:
+// the column-grantable privilege subset, in PostgreSQL's canonical attacl bit
+// order (INSERT/SELECT/UPDATE/REFERENCES). DELETE/TRUNCATE/TRIGGER/MAINTAIN are
+// table-only and never appear in attacl. M0119-0004-ACLHEAP (attacl half).
+var attrACLAllPrivs = []string{"INSERT", "SELECT", "UPDATE", "REFERENCES"}
+
+// expandColumnPrivs maps a parsed column-privilege keyword to the concrete
+// privilege set it grants. "ALL"/"ALL PRIVILEGES" fans out to the full
+// column-grantable subset; any single recognised keyword passes through; an
+// unrecognised keyword yields nil (a no-op grant). M0119-0004-ACLHEAP.
+func expandColumnPrivs(priv string) []string {
+	switch strings.ToUpper(strings.TrimSpace(priv)) {
+	case "ALL", "ALL PRIVILEGES":
+		return attrACLAllPrivs
+	case "INSERT", "SELECT", "UPDATE", "REFERENCES":
+		return []string{strings.ToUpper(priv)}
+	default:
+		return nil
+	}
+}
+
+// columnAttNum resolves a column name (case-insensitive) to its 1-based
+// pg_attribute.attnum on tbl, or 0 when the column does not exist. attnum is
+// Ordinal+1 (the same mapping buildUserPGAttributeRow writes). M0119-0004-ACLHEAP.
+func columnAttNum(tbl *catalog.Table, colName string) int16 {
+	for _, c := range tbl.Columns {
+		if strings.EqualFold(c.Name, colName) {
+			return int16(c.Ordinal + 1)
+		}
+	}
+	return 0
+}
+
+// execAttrACLChange applies a column-level GRANT/REVOKE to the (relOID, attnum)-
+// keyed column ACL store and re-syncs the heap-backed pg_attribute.attacl for each
+// touched column. A column has no acldefault('c', owner) entry, so — unlike
+// execTypeACLChange — there is no implicit owner/PUBLIC seeding: a plain GRANT
+// adds exactly the granted grantee→priv entries and a REVOKE removes exactly
+// them, with attacl returning to NULL once the last column privilege is revoked.
+// Unknown table/column names are a successful no-op. M0119-0004-ACLHEAP.
+func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, tn := range ac.TableNames {
+		tbl, ok := im.LookupTable(tn)
+		if !ok || tbl == nil {
+			continue
+		}
+		touched := make(map[int16]bool)
+		for _, cp := range ac.Privileges {
+			privs := expandColumnPrivs(cp.Privilege)
+			if len(privs) == 0 {
+				continue
+			}
+			for _, colName := range cp.Columns {
+				attNum := columnAttNum(tbl, colName)
+				if attNum == 0 {
+					continue
+				}
+				touched[attNum] = true
+				for _, role := range ac.Grantees {
+					for _, priv := range privs {
+						if ac.Revoke {
+							im.RevokeColumnPrivilege(tbl.OID, attNum, role, priv)
+						} else {
+							im.GrantColumnPrivilegeWithGrantOption(tbl.OID, attNum, role, priv, ac.WithGrantOption)
+						}
+					}
+				}
+			}
+		}
+		for attNum := range touched {
+			col, ok := columnByAttNum(tbl, attNum)
+			if !ok {
+				continue
+			}
+			if err := o.resyncAttrACLHeapRow(im, tbl, col, attNum); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// columnByAttNum returns the catalog column at the given 1-based attnum on tbl.
+// M0119-0004-ACLHEAP.
+func columnByAttNum(tbl *catalog.Table, attNum int16) (catalog.Column, bool) {
+	for _, c := range tbl.Columns {
+		if int16(c.Ordinal+1) == attNum {
+			return c, true
+		}
+	}
+	return catalog.Column{}, false
+}
+
+// resyncAttrACLHeapRow rewrites the heap-backed pg_attribute row for one column so
+// its attacl column carries the projected ACL as a PG-native _aclitem ArrayType
+// (read by a PG18 standby / basebackup and by goopg's own pg_attribute seqscan
+// decode hook). It mirrors resyncTypeACLHeapRow: stamp the stale row's xmax with
+// this txn's writer XID (deleteAttributeFromCatalogHeap), append the rebuilt row
+// (buildUserPGAttributeRow now fills attacl from the store), and mirror to the
+// postgres DB. A no-op when the catalog heap relfiles are absent (in-memory test
+// fixture). M0119-0004-ACLHEAP (attacl half).
+func (o *ddlOp) resyncAttrACLHeapRow(im *catalog.InMemory, tbl *catalog.Table, col catalog.Column, attNum int16) error {
+	ctx := o.ctx
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		return err
+	}
+	deleteAttributeFromCatalogHeap(ctx, catalog.DefaultDBOid, tbl.OID, attNum, ctx.Tx.XID)
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	row := buildUserPGAttributeRow(im, tbl, col)
+	attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), row)
+	if err != nil {
+		return err
+	}
+	// Re-index the rebuilt row so a pg_attribute (attrelid, attnum) index lookup
+	// finds the new tuple, matching syncTableToCatalogHeap's index maintenance.
+	if err := insertPgAttributeRelidAttnumIndexEntry(ctx, tbl.OID, attNum, attrTID); err != nil {
+		return err
+	}
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AttributeRelationId)
+	return nil
+}
+
+// deleteAttributeFromCatalogHeap stamps xmax on the single live pg_attribute row
+// for (relOID, attNum), making the stale tuple invisible before the re-synced row
+// is appended. The column analogue of deleteTypeFromCatalogHeap, narrowed to one
+// column by matching both attrelid and attnum. M0119-0004-ACLHEAP (attacl half).
+func deleteAttributeFromCatalogHeap(ctx *Context, dbOid, relOID uint32, attNum int16, xmax storage.TransactionID) {
+	attrRel := storage.RelFileNode{
+		DBOid:  dbOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	stampCatalogRows(ctx, attrRel, xmax, func(data []byte) bool {
+		row, err := catalog.DecodePGAttributeRow(data)
+		if err != nil {
+			row, err = catalog.DecodePGAttributePhysicalRow(data)
+		}
+		return err == nil && row.AttRelID == relOID && row.AttNum == int32(attNum)
+	})
 }
 
 // execCommentOn stores a description for a TABLE, INDEX, COLUMN, or CONSTRAINT
@@ -11986,6 +14883,14 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgConstraint   = 2606 // pg_constraint
 		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
+		oidPgTrigger      = 2620 // pg_trigger
+		oidPgPolicy       = 3256 // pg_policy
+		oidPgRewrite      = 2618 // pg_rewrite: query-rewrite rules
+		oidPgForeignSrv   = 1417 // pg_foreign_server: foreign servers
+		oidPgFdw          = 2328 // pg_foreign_data_wrapper: foreign-data wrappers
+		oidPgExtension    = 3079 // pg_extension: installed extensions
+		oidPgCollation    = 3456 // pg_collation: collations
+		oidPgCast         = 2605 // pg_cast: casts
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -12027,6 +14932,72 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgNamespace, oid, 0, s.Description)
+	case "server":
+		// Foreign servers live in pg_foreign_server (classoid 1417). pg_dump's
+		// dumpForeignServer keys the comment lookup on the server's catalogId
+		// (tableoid=pg_foreign_server=1417) and objsubid 0, then re-emits
+		// `COMMENT ON SERVER <name> IS '...'`. Without this a COMMENT ON SERVER
+		// was silently swallowed (parser dropped it) and never reached
+		// pg_description, so pg_dump could not re-emit it. DU-002 slice 386.
+		oid := im.ForeignServerOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgForeignSrv, oid, 0, s.Description)
+	case "foreign data wrapper":
+		// Foreign-data wrappers live in pg_foreign_data_wrapper (classoid 2328).
+		// pg_dump's dumpForeignDataWrapper keys the comment lookup on the FDW's
+		// catalogId (tableoid=pg_foreign_data_wrapper=2328) and objsubid 0, then
+		// re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. Without this
+		// a COMMENT ON FOREIGN DATA WRAPPER was silently swallowed (parser dropped
+		// it) and never reached pg_description, so pg_dump could not re-emit it.
+		// DU-002 slice 387.
+		oid := im.ForeignDataWrapperOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgFdw, oid, 0, s.Description)
+	case "extension":
+		// Extensions live in pg_extension (classoid 3079). pg_dump's dumpExtension
+		// keys the comment lookup on the extension's catalogId
+		// (tableoid=pg_extension=3079) and objsubid 0, then re-emits
+		// `COMMENT ON EXTENSION <name> IS '...'`. Without this a COMMENT ON
+		// EXTENSION was silently swallowed (parser dropped it) and never reached
+		// pg_description, so pg_dump could not re-emit it. DU-002 slice 388.
+		oid := im.ExtensionOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgExtension, oid, 0, s.Description)
+	case "collation":
+		// Collations live in pg_collation (classoid 3456). pg_dump's dumpCollation
+		// keys the comment lookup on the collation's catalogId
+		// (tableoid=pg_collation=3456) and objsubid 0, then re-emits
+		// `COMMENT ON COLLATION <schema>.<name> IS '...'`. Resolve the user
+		// collation's OID by name via the same registry getCollations dumps from.
+		// Built-in collations report OID 0 here (pg_dump never dumps their
+		// comments), so a COMMENT ON a built-in is a harmless no-op. Without this a
+		// COMMENT ON COLLATION was silently swallowed (parser dropped it) and never
+		// reached pg_description, so pg_dump could not re-emit it. DU-002 slice 390.
+		uc, ok := im.CollationAttrsByName(s.ObjName.Name)
+		if !ok || uc.OID == 0 {
+			return nil
+		}
+		im.SetComment(oidPgCollation, uc.OID, 0, s.Description)
+	case "cast":
+		// Casts live in pg_cast (classoid 2605). pg_dump's dumpCast keys the
+		// comment lookup on the cast's catalogId (tableoid=pg_cast=2605) and
+		// objsubid 0, then re-emits `COMMENT ON CAST (<source> AS <target>)
+		// IS '...'`. Resolve the user cast's OID by its (source, target) type
+		// pair via the same registry getCasts dumps from. A COMMENT on a cast
+		// goopg never registered (e.g. a built-in coercion) is a harmless no-op.
+		// Without this a COMMENT ON CAST was silently swallowed (parser dropped
+		// it) and never reached pg_description. DU-002 slice 396.
+		cst := im.CastByTypes(s.CastSource, s.CastTarget)
+		if cst == nil || cst.OID == 0 {
+			return nil
+		}
+		im.SetComment(oidPgCast, cst.OID, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {
@@ -12080,6 +15051,58 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+	case "trigger":
+		// Triggers live in pg_trigger (classoid 2620). pg_dump's dumpTrigger keys
+		// the comment lookup on the trigger's catalogId.tableoid (pg_trigger =
+		// 2620) and objsubid 0, then re-emits `COMMENT ON TRIGGER <name> ON
+		// <table> IS '...'`. Resolve the trigger by name on the named table.
+		// Without this a COMMENT ON TRIGGER was silently swallowed (parser dropped
+		// it) and never reached pg_description. DU-002 slice 370.
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, trig := range tbl.Triggers {
+			if strings.EqualFold(trig.Name, s.SubName) && trig.OID != 0 {
+				im.SetComment(oidPgTrigger, trig.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "policy":
+		// Policies live in pg_policy (classoid 3256). pg_dump's dumpPolicy keys
+		// the comment lookup on the policy's catalogId (tableoid=pg_policy=3256)
+		// and objsubid 0, then re-emits `COMMENT ON POLICY <name> ON <table>
+		// IS '...'`. Resolve the policy by name on the named table. Without this
+		// a COMMENT ON POLICY was silently swallowed (parser dropped it) and never
+		// reached pg_description. DU-002 slice 371.
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, pol := range tbl.Policies {
+			if strings.EqualFold(pol.Name, s.SubName) && pol.OID != 0 {
+				im.SetComment(oidPgPolicy, pol.OID, 0, s.Description)
+				return nil
+			}
+		}
+	case "rule":
+		// Rules live in pg_rewrite (classoid 2618). pg_dump's dumpRule keys the
+		// comment lookup on the rule's catalogId (tableoid=pg_rewrite=2618) and
+		// objsubid 0, then re-emits `COMMENT ON RULE <name> ON <table> IS '...'`.
+		// goopg models each CREATE RULE as a catalog.RuleInfo (with its own OID)
+		// on the owning table (DU-002 slice 324); resolve the rule by name there.
+		// Without this a COMMENT ON RULE was silently swallowed (parser dropped
+		// it) and never reached pg_description. DU-002 slice 372.
+		tbl, ok := im.LookupTable(s.ObjName)
+		if !ok {
+			return nil
+		}
+		for _, r := range tbl.Rules {
+			if strings.EqualFold(r.Name, s.SubName) && r.OID != 0 {
+				im.SetComment(oidPgRewrite, r.OID, 0, s.Description)
+				return nil
+			}
+		}
 	case "statistics":
 		stat, ok := im.LookupStatistics(s.ObjName.Name)
 		if !ok {
@@ -12130,7 +15153,44 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 			schema = "public"
 		}
 	}
-	im.RegisterStatistics(schema, s.Name.Name, tableOID)
+	// Deparse any expression targets to their final SQL form. defaultExprToSQL
+	// already fully parenthesizes binary ops (`a + b` → `(a + b)`) and leaves a
+	// bare function call unparenthesized (`lower(a)` → `lower(a)`), which matches
+	// exactly what ruleutils.c pg_get_statisticsobj_worker emits for each
+	// expression element. DU-002 slice 316.
+	var exprs []string
+	for _, e := range s.Exprs {
+		exprs = append(exprs, defaultExprToSQL(e))
+	}
+	im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
+	return nil
+}
+
+// execAlterStatistics applies `ALTER STATISTICS ... SET STATISTICS n` to an
+// extended-statistics object. The target is recorded on the catalog object
+// (pg_statistic_ext.stxstattarget) purely for pg_dump round-trip fidelity —
+// goopg does not sample extended statistics at this granularity. A negative
+// target (-1) resets to the default (NULL); pg_dump then emits no ALTER. Forms
+// other than SET STATISTICS (RENAME / OWNER TO / SET SCHEMA) parse to a node
+// with HasTarget=false and are no-ops. DU-002 slice 317.
+func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
+	if !s.HasTarget {
+		return nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	name := s.Name.Name
+	if s.Name.Schema != "" {
+		name = s.Name.Schema + "." + s.Name.Name
+	}
+	var target *int
+	if s.Target >= 0 {
+		v := s.Target
+		target = &v
+	}
+	im.SetStatisticsTarget(name, target)
 	return nil
 }
 
@@ -12261,13 +15321,14 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 	}
 	// Register in the catalog so the planner and executor can find it.
 	agg := &catalog.UserAggregate{
-		Name:        strings.ToLower(s.Name.Name),
-		SType:       s.SType,
-		SFunc:       s.SFunc,
-		FinalFunc:   s.FinalFunc,
-		CombineFunc: s.CombineFunc,
-		InitCond:    s.InitCond,
-		Variadic:    s.Variadic,
+		Name:            strings.ToLower(s.Name.Name),
+		SType:           s.SType,
+		SFunc:           s.SFunc,
+		FinalFunc:       s.FinalFunc,
+		CombineFunc:     s.CombineFunc,
+		InitCond:        s.InitCond,
+		FinalFuncModify: s.FinalFuncModify,
+		Variadic:        s.Variadic,
 	}
 	if s.HasBaseType && s.BaseType != "" && s.BaseType != "*" && s.BaseType != "any" {
 		agg.ArgTypes = []string{s.BaseType}
@@ -12280,7 +15341,32 @@ func (o *ddlOp) execCreateAggregate(s *parser.CreateAggregateStmt) error {
 			agg.SFuncStrict = candidates[0].Strict
 		}
 	}
+	// DU-002 slice 405 resume point (a): resolve the schema-qualified name's
+	// namespace so a non-public-schema aggregate reports the right
+	// pronamespace to pg_dump instead of always claiming "public" (mirrors
+	// execCreateCollation's schema-with-public-fallback resolution).
+	schema := s.Name.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	agg.NamespaceOID = nsOID
 	o.ctx.Catalog.RegisterUserAggregate(agg)
+	syncAggregateToCatalogHeap(o.ctx, agg)
+	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
+	// resume point (c)): goopg has no per-aggregate on-disk file namespace,
+	// so record a WAL event the recovery driver
+	// (internal/initdb/aggregate_ddl_recovery.go) replays into the
+	// user-aggregate registry on the next startup. Mirrors CREATE
+	// CAST/TRANSFORM/CONVERSION/COLLATION.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAggregate(agg.Name, schema, agg.SType, agg.SFunc, agg.FinalFunc, agg.CombineFunc, agg.InitCond, agg.FinalFuncModify, agg.ArgTypes, agg.OID, agg.SFuncStrict, agg.Variadic)); werr != nil {
+			return fmt.Errorf("wal create-aggregate: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -12296,12 +15382,59 @@ func (o *ddlOp) execAlterAggregateRename(s *parser.AlterAggregateRenameStmt) err
 		return &ExecError{Code: "42883", Pos: s.Pos(),
 			Message: fmt.Sprintf("aggregate %s does not exist", oldName)}
 	}
+	// DU-002 restart-persistence follow-up (M0119-0004, slice 405 ledger
+	// resume point (c)): mirrors execCreateAggregate's WAL emission so the
+	// rename survives a restart.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateRename(oldName, newName)); werr != nil {
+			return fmt.Errorf("wal alter-aggregate-rename: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterAggregateOwner handles ALTER AGGREGATE name(args) OWNER TO
+// newowner. M0119-0004 (DU-002, loop #57 ledger follow-up). Mirrors
+// execAlterCollation's "owner" case; name-only match, no overload
+// resolution, matching every other aggregate DDL arm.
+func (o *ddlOp) execAlterAggregateOwner(s *parser.AlterAggregateOwnerStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER AGGREGATE OWNER TO requires InMemory catalog"}
+	}
+	name := s.Name.Name
+	ownerOID := uint32(10) // bootstrap superuser, mirrors CreateCollation/UserAggregate's default owner
+	if !strings.EqualFold(s.NewOwner, "current_user") {
+		oid, found := im.RoleOID(s.NewOwner)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+		}
+		ownerOID = oid
+	}
+	if !im.SetUserAggregateOwner(name, ownerOID) {
+		return &ExecError{Code: "42883", Pos: s.Pos(),
+			Message: fmt.Sprintf("aggregate %s does not exist", name)}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004): mirrors
+	// execAlterAggregateRename's WAL emission so the ownership change
+	// survives a restart.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterAggregateOwner(name, ownerOID)); werr != nil {
+			return fmt.Errorf("wal alter-aggregate-owner: %w", werr)
+		}
+	}
 	return nil
 }
 
 // execCreateOpClass registers the hash extended support function for an
-// operator class. Only the FUNCTION 2 entry is used; everything else is
-// silently accepted. M0097-0027.
+// operator class (M0097-0027) and, since DU-002 (M0119-0004), populates a
+// real pg_opclass row (method/family/intype/default/keytype) so the class
+// round-trips through pg_dump's getOpclasses/dumpOpclass. OPERATOR/FUNCTION
+// entries in the AS list beyond FUNCTION 2 are still silently accepted and
+// not tied to pg_amop/pg_amproc — a class declaring real members currently
+// dumps with only its STORAGE clause (or PG's own dummy `STORAGE opcintype`
+// filler), which is a documented, separately-scoped follow-up (see the
+// deferral ledger).
 func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -12311,12 +15444,331 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		im.RegisterOpClassHashFunc(s.Name, s.HashFuncName)
 	}
 	// Track the schema for DROP SCHEMA CASCADE detail output. M0097-0022.
-	schema := currentWritableSchema(o.ctx)
+	schema := s.Schema
+	if schema == "" {
+		schema = currentWritableSchema(o.ctx)
+	}
 	if schema == "" {
 		schema = "public"
 	}
 	im.RegisterOpClassSchema(s.Name, schema)
+
+	// A class whose USING method couldn't be parsed has nothing usable to
+	// register as a pg_opclass row; the hash-func/schema tracking above still
+	// ran, matching the pre-existing M0097-0027 behavior for such input.
+	if s.Method == "" {
+		return nil
+	}
+	methodOID := catalog.AccessMethodOIDByName(s.Method)
+	if methodOID == 0 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
+	}
+	nsOID := o.ctx.Catalog.SchemaOID(schema)
+	if nsOID == 0 {
+		nsOID = o.ctx.Catalog.SchemaOID("public")
+	}
+	inTypeOID := catalog.TypeNameToOID(s.ForType)
+
+	var famOID uint32
+	if s.FamilyName != "" {
+		famSchema := s.FamilySchema
+		if famSchema == "" {
+			famSchema = "public"
+		}
+		fam, found := im.LookupUserOperatorFamily(famSchema, s.FamilyName, methodOID)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.FamilyName, s.Method)}
+		}
+		famOID = fam.OID
+	} else {
+		// PG auto-creates an anonymous family (same name/schema as the class)
+		// when FAMILY is omitted (DefineOpClass, opclasscmds.c). Owner 0 lets
+		// RegisterUserOperatorFamily default it, mirroring CREATE OPERATOR
+		// FAMILY's own registration (goopg does not track a per-session
+		// creating role for these compat objects).
+		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0)
+		famOID = fam.OID
+	}
+
+	var keyTypeOID uint32
+	if s.StorageType != "" {
+		keyTypeOID = catalog.TypeNameToOID(s.StorageType)
+		// A STORAGE clause matching the class's own FOR TYPE is redundant —
+		// PG resets it to InvalidOid (opclasscmds.c DefineOpClass:
+		// "if (storageoid == typeoid) storageoid = InvalidOid"), which
+		// dumpOpclass then renders as "-" and omits the STORAGE clause
+		// entirely on re-dump. Found via a live-PG-18.3 diff against the
+		// upstream `op_class` fixture (`AS STORAGE bigint, OPERATOR 1 ...`
+		// FOR TYPE bigint — the STORAGE line does not reappear in pg_dump's
+		// own output). M0119-0004 (DU-002) slice 413.
+		if keyTypeOID == inTypeOID {
+			keyTypeOID = 0
+		}
+	}
+	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos(), false, "")
+}
+
+// execAlterOpFamilyAdd implements ALTER OPERATOR FAMILY name USING method
+// ADD entry [, entry ...] — opclasscmds.c's AlterOpFamilyAdd. Unlike CREATE
+// OPERATOR CLASS's own AS list, every member here is a "loose" member with
+// no owning opclass: registerOpClassMembers is called with classOID=0,
+// which dependVirtualRows (internal/catalog/catalog.go) reads as the signal
+// to emit the AUTO ('a') dependency on the family itself rather than the
+// INTERNAL ('i') dependency on a class — "Historically, ALTER ADD has
+// created soft dependencies" (opclasscmds.c AlterOpFamilyAdd, verbatim
+// comment). Requires superuser (mirrors "must be superuser to alter an
+// operator family", ERRCODE_INSUFFICIENT_PRIVILEGE) — goopg's
+// NonSuperuserRole is only set by the compat SET ROLE/SET SESSION
+// AUTHORIZATION path (see AlterOperatorSetStmt's own Leakproof check for the
+// same pattern). DU-002 (M0119-0004).
+func (o *ddlOp) execAlterOpFamilyAdd(s *parser.AlterOpFamilyAddStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "must be superuser to alter an operator family"}
+	}
+	methodOID := catalog.AccessMethodOIDByName(s.Method)
+	if methodOID == 0 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
+	}
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	if !found {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
+	}
+	return o.registerOpClassMembers(im, s.Members, schema, fam.OID, 0, methodOID, s.Method, s.Pos(), true, fam.Name)
+}
+
+// execAlterOpFamilyDrop implements ALTER OPERATOR FAMILY name USING method
+// DROP entry [, entry ...] (opclasscmds.c AlterOpFamilyDrop). Each entry is
+// resolved purely by (family, strategy-or-procnum, lefttype, righttype) —
+// unlike the ADD form there is no operator/function name to look up. A
+// missing member raises 42704 (undefined_object), matching dropOperators'/
+// dropProcedures' own ereport text shape. Removing the catalog row also
+// removes its pg_depend rows, since dependVirtualRows recomputes them live
+// from the same c.amOpMembers/c.amProcMembers slices RemoveAmOpMember/
+// RemoveAmProcMember mutate. DU-002 (M0119-0004).
+func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: "must be superuser to alter an operator family"}
+	}
+	methodOID := catalog.AccessMethodOIDByName(s.Method)
+	if methodOID == 0 {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("access method %q does not exist", s.Method)}
+	}
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	fam, found := im.LookupUserOperatorFamily(schema, s.Name, methodOID)
+	if !found {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("operator family %q does not exist for access method %q", s.Name, s.Method)}
+	}
+	for _, m := range s.Members {
+		leftOID := catalog.TypeNameToOID(m.LeftType)
+		rightOID := catalog.TypeNameToOID(m.RightType)
+		if m.IsFunction {
+			if !im.RemoveAmProcMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf("function %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
+			}
+			continue
+		}
+		if !im.RemoveAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("operator %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
+		}
+	}
 	return nil
+}
+
+// registerOpClassMembers resolves each OPERATOR/FUNCTION entry in a CREATE
+// OPERATOR CLASS ... AS list to a real pg_amop/pg_amproc row, attributed to
+// the class via ClassOID (the pg_depend INTERNAL row dumpOpclass's query
+// needs). Only user-defined operators (LookupUserOperator/
+// LookupUserOperatorByName) and functions (user routines, or the small
+// hand-curated LookupBuiltinProc set) are resolvable — goopg has no
+// builtin-operator catalog and no comprehensive builtin-function catalog, so
+// an entry naming an unresolvable builtin is silently dropped, same as every
+// entry's pre-slice-411 behavior (deferred, see the ledger). DU-002
+// (M0119-0004) slice 411. A FOR ORDER BY entry's sort family is ALWAYS
+// resolved against the btree access method regardless of the class's own
+// method (opclasscmds.c: "sortfamilyOid = get_opfamily_oid(BTREE_AM_OID,
+// item->order_family, false)"), erroring 42704 if it doesn't exist — mirrors
+// get_opfamily_oid's own missing_ok=false ereport; a resolved sort family on
+// a non-ordering-capable method (only gist/spgist set amcanorderbyop=true
+// upstream) errors 42P17, mirroring opclasscmds.c's own
+// ERRCODE_INVALID_OBJECT_DEFINITION check. Slice 414. isAdd distinguishes
+// the ALTER OPERATOR FAMILY ... ADD caller (execAlterOpFamilyAdd) from
+// CREATE OPERATOR CLASS's own AS list, mirroring storeOperators/
+// storeProcedures' own isAdd parameter: an OPERATOR entry must carry
+// explicit operand types ("operator argument types must be specified in
+// ALTER OPERATOR FAMILY" — a syntax error, not silently defaulted) and a
+// duplicate (family, strategy/support number, lefttype, righttype) is
+// rejected instead of silently re-registered. DU-002 (M0119-0004),
+// ALTER OPERATOR FAMILY ADD slice.
+func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.OpClassMember, schema string, famOID, classOID, methodOID uint32, methodName string, pos int, isAdd bool, familyDisplayName string) error {
+	for _, m := range members {
+		opSchema := m.Schema
+		if opSchema == "" {
+			opSchema = schema
+		}
+		if m.IsFunction {
+			procOID, leftOID, rightOID, ok := resolveOpClassFunction(im, opSchema, m)
+			if !ok {
+				continue
+			}
+			if isAdd {
+				for _, existing := range im.ListAmProcMembers() {
+					if existing.FamilyOID == famOID && existing.ProcNum == uint32(m.Number) &&
+						existing.LeftType == leftOID && existing.RightType == rightOID {
+						return &ExecError{Code: "42710", Pos: pos,
+							Message: fmt.Sprintf("function %d(%s,%s) already exists in operator family %q", m.Number, m.LeftType, m.RightType, familyDisplayName)}
+					}
+				}
+			}
+			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
+			continue
+		}
+		if isAdd && !m.HasExplicitArgTypes {
+			return &ExecError{Code: "42601", Pos: pos,
+				Message: "operator argument types must be specified in ALTER OPERATOR FAMILY"}
+		}
+		operOID, leftOID, rightOID, ok := resolveOpClassOperator(im, opSchema, m)
+		if !ok {
+			continue
+		}
+		if isAdd {
+			for _, existing := range im.ListAmOpMembers() {
+				if existing.FamilyOID == famOID && existing.Strategy == uint32(m.Number) &&
+					existing.LeftType == leftOID && existing.RightType == rightOID {
+					return &ExecError{Code: "42710", Pos: pos,
+						Message: fmt.Sprintf("operator %d(%s,%s) already exists in operator family %q", m.Number, m.LeftType, m.RightType, familyDisplayName)}
+				}
+			}
+		}
+		var sortFamilyOID uint32
+		if m.SortFamilyName != "" {
+			sortFamSchema := m.SortFamilySchema
+			if sortFamSchema == "" {
+				// Mirrors execCreateOpClass's own FAMILY-clause default —
+				// goopg has no per-session search_path resolution for these
+				// compat registries, only an explicit-schema-or-public
+				// fallback (same simplification as the class's own FAMILY
+				// clause a few lines up in execCreateOpClass).
+				sortFamSchema = "public"
+			}
+			btreeOID := catalog.AccessMethodOIDByName("btree")
+			fam, found := im.LookupUserOperatorFamily(sortFamSchema, m.SortFamilyName, btreeOID)
+			if !found {
+				return &ExecError{Code: "42704", Pos: pos,
+					Message: fmt.Sprintf("operator family %q does not exist for access method \"btree\"", m.SortFamilyName)}
+			}
+			// Only amcanorderbyop access methods accept ordering operators
+			// (opclasscmds.c's per-member validation, called right after the
+			// sortfamily lookup above). goopg has no per-AM capability-flag
+			// table (amcanorderbyop et al.) — gist/spgist are hand-curated as
+			// the only two AMs setting amcanorderbyop=true in the upstream
+			// tree (gist.c/spgutils.c) since every other in-tree AM handler
+			// leaves it at its zero-value default (false).
+			if methodOID != catalog.AccessMethodOIDByName("gist") && methodOID != catalog.AccessMethodOIDByName("spgist") {
+				return &ExecError{Code: "42P17", Pos: pos,
+					Message: fmt.Sprintf("access method %q does not support ordering operators", methodName)}
+			}
+			sortFamilyOID = fam.OID
+		}
+		im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID, sortFamilyOID)
+	}
+	return nil
+}
+
+// resolveOpClassOperator resolves an OPERATOR entry to its operator OID plus
+// the lefttype/righttype OIDs to record (the entry's own explicit operand
+// types when given, else the resolved operator's own oprleft/oprright —
+// mirroring assignOperTypes, opclasscmds.c). DU-002 (M0119-0004) slice 411.
+func resolveOpClassOperator(im *catalog.InMemory, schema string, m parser.OpClassMember) (operOID, leftOID, rightOID uint32, ok bool) {
+	if m.LeftType != "" {
+		if op, found := im.LookupUserOperator(schema, m.Name, m.LeftType, m.RightType); found {
+			return op.OID, catalog.TypeNameToOID(m.LeftType), catalog.TypeNameToOID(m.RightType), true
+		}
+		// Not a user-defined operator — try the small hand-curated builtin
+		// set (goopg has no full builtin-operator catalog — see the
+		// ledger). M0119-0004 (DU-002) slice 413.
+		if bop, found := catalog.LookupBuiltinOperator(m.Name, m.LeftType, m.RightType); found {
+			return bop.OID, catalog.TypeNameToOID(m.LeftType), catalog.TypeNameToOID(m.RightType), true
+		}
+		return 0, 0, 0, false
+	}
+	op, found := im.LookupUserOperatorByName(m.Name)
+	if !found {
+		return 0, 0, 0, false
+	}
+	return op.OID, catalog.TypeNameToOID(op.LeftType), catalog.TypeNameToOID(op.RightType), true
+}
+
+// resolveOpClassFunction resolves a FUNCTION entry to its function OID plus
+// the lefttype/righttype OIDs to record (the entry's own explicit arg types
+// when given, else the resolved function's own first argument type —
+// mirroring assignProcTypes, opclasscmds.c). User routines are tried first,
+// then the hand-curated builtin set; an unqualified name searches every
+// schema (Routines.LookupByName's own behavior for name.Schema == "").
+// Ambiguous unqualified matches deterministically pick the lowest-OID
+// routine, mirroring resolveOpClassOperator/LookupUserOperatorByName. DU-002
+// (M0119-0004) slice 411.
+func resolveOpClassFunction(im *catalog.InMemory, schema string, m parser.OpClassMember) (procOID, leftOID, rightOID uint32, ok bool) {
+	candidates := im.Routines().LookupByName(parser.ObjectName{Schema: schema, Name: m.Name})
+	var chosen *catalog.Routine
+	if m.LeftType != "" {
+		for _, r := range candidates {
+			if len(r.ArgTypes) > 0 && strings.EqualFold(r.ArgTypes[0].Name, m.LeftType) {
+				chosen = r
+				break
+			}
+		}
+	} else {
+		for _, r := range candidates {
+			if chosen == nil || r.OID < chosen.OID {
+				chosen = r
+			}
+		}
+	}
+	if chosen != nil {
+		leftT, rightT := m.LeftType, m.RightType
+		if leftT == "" && len(chosen.ArgTypes) > 0 {
+			leftT = chosen.ArgTypes[0].Name
+		}
+		if rightT == "" && len(chosen.ArgTypes) > 0 {
+			rightT = chosen.ArgTypes[0].Name
+		}
+		return chosen.OID, catalog.TypeNameToOID(leftT), catalog.TypeNameToOID(rightT), true
+	}
+	if bp, found := catalog.LookupBuiltinProc(m.Name); found {
+		leftT, rightT := m.LeftType, m.RightType
+		if leftT == "" && len(bp.ArgTypes) > 0 {
+			leftT = bp.ArgTypes[0]
+		}
+		if rightT == "" && len(bp.ArgTypes) > 0 {
+			rightT = bp.ArgTypes[0]
+		}
+		return bp.OID, catalog.TypeNameToOID(leftT), catalog.TypeNameToOID(rightT), true
+	}
+	return 0, 0, 0, false
 }
 
 // knownBuiltinAggFinalFuncs is the set of PostgreSQL built-in function names
@@ -12841,7 +16293,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType, Args: s.BaseTypeArgs}
-	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
+	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
@@ -12856,20 +16308,24 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// Record the DEFAULT expression so buildUserPGTypeRowForDomain can emit
 	// typdefaultbin and pg_dump re-renders `DEFAULT <expr>`. DU-002 slice 92.
 	d.Default = s.Default
-	// Record a generic CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
-	// getDomainConstraints surfaces it and dumpDomain re-emits the inline
-	// `CONSTRAINT <name> CHECK ((<expr>))` clause. DU-002 slice 96.
+	// Record every CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
+	// getDomainConstraints surfaces each and dumpDomain re-emits the inline
+	// `CONSTRAINT <name> CHECK ((<expr>))` clauses, `ORDER BY conname`. A domain
+	// may declare several CHECKs. DU-002 slice 96 (single) / slice 385 (multi).
 	//
-	// A `CHECK (VALUE IN (...))` form is captured separately as CheckInValues
-	// (used at runtime for membership validation). PG deparses it to a
+	// A `CHECK (VALUE IN (...))` form keeps its allowed-value list on the catalog
+	// check (used at runtime for membership validation). PG deparses it to a
 	// ScalarArrayOpExpr — `VALUE = ANY (ARRAY['a'::text, ...])` — so we synthesize
 	// the same text here and store it as the constraint's conbin, making it
 	// round-trip through pg_dump too. DU-002 slice 97.
-	checkExpr := s.CheckExpr
-	if checkExpr == "" && len(s.CheckInValues) > 0 {
-		checkExpr = domainInValuesCheckExpr(s.BaseType, s.CheckInValues, cat)
+	for _, clause := range s.Checks {
+		if len(clause.InValues) > 0 {
+			expr := domainInValuesCheckExpr(s.BaseType, clause.InValues, cat)
+			cat.AddDomainCheck(d, clause.Name, expr, clause.InValues)
+		} else {
+			cat.AddDomainCheck(d, clause.Name, clause.Expr, nil)
+		}
 	}
-	cat.SetDomainCheck(d, s.CheckName, checkExpr)
 	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
@@ -13881,7 +17337,7 @@ func inferSQLFunctionVolatility(body string) string {
 	return "i"
 }
 
-func extractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
+func ExtractRoutineDeps(body string, argDefaults []string, schema string, r *catalog.Routine, cat catalog.Catalog) {
 	// Panic recovery: extractRoutineDeps is a best-effort feature; never crash the server.
 	defer func() { recover() }() //nolint:errcheck
 	// Skip very long bodies to bound overhead.

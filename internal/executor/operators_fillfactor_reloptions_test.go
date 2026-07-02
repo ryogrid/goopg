@@ -2894,3 +2894,174 @@ func TestToastVacuumIndexCleanupInvalidRejected(t *testing.T) {
 		t.Errorf("toast.vacuum_index_cleanup=OFF: unexpected error %v", err)
 	}
 }
+
+// TestViewCheckOptionSurfacesInPgClassReloptions verifies that a view's
+// `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
+// `check_option=<mode>` pg_class.reloption — the form pg_dump's getTables
+// reads (it strips that element via array_remove and re-emits the
+// `WITH <MODE> CHECK OPTION` view suffix). A bare `WITH CHECK OPTION`
+// defaults to cascaded; an explicit `WITH LOCAL CHECK OPTION` records local;
+// a plain view carries no reloptions. M0119-0004 (DU-002 slice 365).
+func TestViewCheckOptionSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE cobase (id integer PRIMARY KEY, q integer)`); err != nil {
+		t.Fatalf("CREATE TABLE cobase: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vco_def AS SELECT id, q FROM cobase WHERE q > 0 WITH CHECK OPTION`); err != nil {
+		t.Fatalf("CREATE VIEW vco_def: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vco_local AS SELECT id, q FROM cobase WHERE q > 0 WITH LOCAL CHECK OPTION`); err != nil {
+		t.Fatalf("CREATE VIEW vco_local: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vco_plain AS SELECT id, q FROM cobase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vco_plain: %v", err)
+	}
+
+	for name, want := range map[string]string{"vco_def": "cascaded", "vco_local": "local", "vco_plain": ""} {
+		vt, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s view not found", name)
+		}
+		if vt.CheckOption != want {
+			t.Errorf("%s.CheckOption = %q, want %q", name, vt.CheckOption, want)
+		}
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vco_def" || r[1] == "vco_local" || r[1] == "vco_plain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vco_def"] != "{check_option=cascaded}" {
+		t.Errorf("pg_class.reloptions for vco_def = %q, want %q", got["vco_def"], "{check_option=cascaded}")
+	}
+	if got["vco_local"] != "{check_option=local}" {
+		t.Errorf("pg_class.reloptions for vco_local = %q, want %q", got["vco_local"], "{check_option=local}")
+	}
+	if got["vco_plain"] != "" {
+		t.Errorf("pg_class.reloptions for vco_plain = %q, want \"\" (NULL)", got["vco_plain"])
+	}
+}
+
+// TestViewSecurityBarrierSurfacesInPgClassReloptions verifies that a view's
+// `WITH (security_barrier=<bool>)` storage option surfaces as the
+// `security_barrier=<bool>` pg_class.reloption. Unlike check_option, pg_dump's
+// getTables keeps it in the reloptions array and re-emits it as the
+// `WITH (security_barrier='true')` clause; both true and false must round-trip
+// (false is meaningful), and a plain view carries no reloptions.
+// M0119-0004 (DU-002 slice 366).
+func TestViewSecurityBarrierSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE sbbase (id integer PRIMARY KEY, q integer)`); err != nil {
+		t.Fatalf("CREATE TABLE sbbase: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsb_on WITH (security_barrier=true) AS SELECT id, q FROM sbbase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsb_on: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsb_off WITH (security_barrier=false) AS SELECT id, q FROM sbbase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsb_off: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsb_plain AS SELECT id, q FROM sbbase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsb_plain: %v", err)
+	}
+
+	for name, want := range map[string]bool{"vsb_on": true, "vsb_off": false} {
+		vt, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s view not found", name)
+		}
+		if !vt.SecurityBarrierSet {
+			t.Errorf("%s.SecurityBarrierSet = false, want true", name)
+		}
+		if vt.SecurityBarrier != want {
+			t.Errorf("%s.SecurityBarrier = %v, want %v", name, vt.SecurityBarrier, want)
+		}
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vsb_on" || r[1] == "vsb_off" || r[1] == "vsb_plain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vsb_on"] != "{security_barrier=true}" {
+		t.Errorf("pg_class.reloptions for vsb_on = %q, want %q", got["vsb_on"], "{security_barrier=true}")
+	}
+	if got["vsb_off"] != "{security_barrier=false}" {
+		t.Errorf("pg_class.reloptions for vsb_off = %q, want %q", got["vsb_off"], "{security_barrier=false}")
+	}
+	if got["vsb_plain"] != "" {
+		t.Errorf("pg_class.reloptions for vsb_plain = %q, want \"\" (NULL)", got["vsb_plain"])
+	}
+}
+
+// TestViewSecurityInvokerSurfacesInPgClassReloptions verifies that a view's
+// `WITH (security_invoker=<bool>)` storage option surfaces as the
+// `security_invoker=<bool>` pg_class.reloption. Like security_barrier, pg_dump's
+// getTables keeps it in the reloptions array and re-emits it as the
+// `WITH (security_invoker='true')` clause; both true and false must round-trip
+// (false is meaningful), and a plain view carries no reloptions.
+// M0119-0004 (DU-002 slice 367).
+func TestViewSecurityInvokerSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE sibase (id integer PRIMARY KEY, q integer)`); err != nil {
+		t.Fatalf("CREATE TABLE sibase: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsi_on WITH (security_invoker=true) AS SELECT id, q FROM sibase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsi_on: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsi_off WITH (security_invoker=false) AS SELECT id, q FROM sibase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsi_off: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE VIEW vsi_plain AS SELECT id, q FROM sibase WHERE q > 0`); err != nil {
+		t.Fatalf("CREATE VIEW vsi_plain: %v", err)
+	}
+
+	for name, want := range map[string]bool{"vsi_on": true, "vsi_off": false} {
+		vt, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s view not found", name)
+		}
+		if !vt.SecurityInvokerSet {
+			t.Errorf("%s.SecurityInvokerSet = false, want true", name)
+		}
+		if vt.SecurityInvoker != want {
+			t.Errorf("%s.SecurityInvoker = %v, want %v", name, vt.SecurityInvoker, want)
+		}
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vsi_on" || r[1] == "vsi_off" || r[1] == "vsi_plain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vsi_on"] != "{security_invoker=true}" {
+		t.Errorf("pg_class.reloptions for vsi_on = %q, want %q", got["vsi_on"], "{security_invoker=true}")
+	}
+	if got["vsi_off"] != "{security_invoker=false}" {
+		t.Errorf("pg_class.reloptions for vsi_off = %q, want %q", got["vsi_off"], "{security_invoker=false}")
+	}
+	if got["vsi_plain"] != "" {
+		t.Errorf("pg_class.reloptions for vsi_plain = %q, want \"\" (NULL)", got["vsi_plain"])
+	}
+}

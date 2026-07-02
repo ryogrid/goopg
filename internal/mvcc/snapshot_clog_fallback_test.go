@@ -7,12 +7,18 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
-// newTestCLog opens a fresh CLog under a temp dir for fallback tests.
+// newTestCLog opens a fresh CLog under a temp dir for fallback tests, with the
+// SLRU buffer pool enabled — M0117-0006 Part C made the pool the sole CLog
+// store, so every test must enable it before exercising Get/Set.
 func newTestCLog(t *testing.T) *CLog {
 	t.Helper()
-	c, err := OpenCLog(filepath.Join(t.TempDir(), "pg_xact_flat"))
+	dir := t.TempDir()
+	c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
 	if err != nil {
 		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := c.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact_slru")); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
 	return c
 }

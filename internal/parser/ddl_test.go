@@ -168,12 +168,12 @@ func TestParseCreateIndexColOrders(t *testing.T) {
 		in   string
 		want []IndexColOrder
 	}{
-		{"CREATE INDEX i ON t (a)", []IndexColOrder{{false, false}}},
-		{"CREATE INDEX i ON t (a DESC)", []IndexColOrder{{true, true}}},
-		{"CREATE INDEX i ON t (a ASC)", []IndexColOrder{{false, false}}},
-		{"CREATE INDEX i ON t (a DESC NULLS LAST)", []IndexColOrder{{true, false}}},
-		{"CREATE INDEX i ON t (a NULLS FIRST)", []IndexColOrder{{false, true}}},
-		{"CREATE INDEX i ON t (a DESC, b NULLS FIRST)", []IndexColOrder{{true, true}, {false, true}}},
+		{"CREATE INDEX i ON t (a)", []IndexColOrder{{Descending: false, NullsFirst: false}}},
+		{"CREATE INDEX i ON t (a DESC)", []IndexColOrder{{Descending: true, NullsFirst: true}}},
+		{"CREATE INDEX i ON t (a ASC)", []IndexColOrder{{Descending: false, NullsFirst: false}}},
+		{"CREATE INDEX i ON t (a DESC NULLS LAST)", []IndexColOrder{{Descending: true, NullsFirst: false}}},
+		{"CREATE INDEX i ON t (a NULLS FIRST)", []IndexColOrder{{Descending: false, NullsFirst: true}}},
+		{"CREATE INDEX i ON t (a DESC, b NULLS FIRST)", []IndexColOrder{{Descending: true, NullsFirst: true}, {Descending: false, NullsFirst: true}}},
 	}
 	for _, c := range cases {
 		stmts, err := Parse(c.in)
@@ -187,6 +187,72 @@ func TestParseCreateIndexColOrders(t *testing.T) {
 		for i, w := range c.want {
 			if ci.ColOrders[i] != w {
 				t.Errorf("Parse(%q): ColOrders[%d]=%+v want %+v", c.in, i, ci.ColOrders[i], w)
+			}
+		}
+	}
+}
+
+// TestParseCreateIndexColOpClass pins the per-column operator-class capture
+// (DU-002 slice 312). goopg previously parsed and discarded the opclass name, so
+// `CREATE INDEX ON t (a text_pattern_ops)` dumped as a plain `(a)` — silently
+// widening the index to the column type's default opclass on restore. The opclass
+// must land on ColOrders[i].OpClass; it also coexists with COLLATE and ASC/DESC.
+func TestParseCreateIndexColOpClass(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string // per-column OpClass
+	}{
+		{"CREATE INDEX i ON t (a)", []string{""}},
+		{"CREATE INDEX i ON t (a text_pattern_ops)", []string{"text_pattern_ops"}},
+		{"CREATE INDEX i ON t (a text_pattern_ops DESC)", []string{"text_pattern_ops"}},
+		{`CREATE INDEX i ON t (a COLLATE "C" text_pattern_ops)`, []string{"text_pattern_ops"}},
+		{"CREATE INDEX i ON t (a, b varchar_pattern_ops)", []string{"", "varchar_pattern_ops"}},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if len(ci.ColOrders) != len(c.want) {
+			t.Fatalf("Parse(%q): ColOrders=%+v want %d cols", c.in, ci.ColOrders, len(c.want))
+		}
+		for i, w := range c.want {
+			if ci.ColOrders[i].OpClass != w {
+				t.Errorf("Parse(%q): ColOrders[%d].OpClass=%q want %q", c.in, i, ci.ColOrders[i].OpClass, w)
+			}
+		}
+	}
+}
+
+// TestParseCreateIndexColCollation pins the per-column COLLATE capture
+// (DU-002 slice 313). The collation name lands on ColOrders[i].Collation (bare
+// last component, matching pg_collation.collname), coexisting with an opclass and
+// ASC/DESC. A plain column records "".
+func TestParseCreateIndexColCollation(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string // per-column Collation
+	}{
+		{"CREATE INDEX i ON t (a)", []string{""}},
+		{`CREATE INDEX i ON t (a COLLATE "C")`, []string{"C"}},
+		{`CREATE INDEX i ON t (a COLLATE "C" DESC)`, []string{"C"}},
+		{`CREATE INDEX i ON t (a COLLATE "C" text_pattern_ops)`, []string{"C"}},
+		{`CREATE INDEX i ON t (a COLLATE pg_catalog."C")`, []string{"C"}},
+		{`CREATE INDEX i ON t (a, b COLLATE "C")`, []string{"", "C"}},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if len(ci.ColOrders) != len(c.want) {
+			t.Fatalf("Parse(%q): ColOrders=%+v want %d cols", c.in, ci.ColOrders, len(c.want))
+		}
+		for i, w := range c.want {
+			if ci.ColOrders[i].Collation != w {
+				t.Errorf("Parse(%q): ColOrders[%d].Collation=%q want %q", c.in, i, ci.ColOrders[i].Collation, w)
 			}
 		}
 	}
@@ -909,6 +975,184 @@ func TestParseColumnDefCompression(t *testing.T) {
 	}
 	if !ct.Columns[1].NotNull {
 		t.Errorf("col[1].NotNull=false, want true")
+	}
+}
+
+// TestParseColumnDefFDWOptions verifies that a per-column `OPTIONS (name
+// 'value', …)` clause on a CREATE FOREIGN TABLE column is captured onto
+// ColumnDef.FDWOptions (normalized "name=value" pairs, matching
+// scanFDWOptionsList's table/server-level output), and that the surrounding
+// SERVER/table-level OPTIONS clause still parses. DU-002 slice 418.
+func TestParseColumnDefFDWOptions(t *testing.T) {
+	sql := `CREATE FOREIGN TABLE t (a int OPTIONS (column_name 'col1'), b text) SERVER srv OPTIONS (schema_name 'x1')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if ct.ForeignServer != "srv" {
+		t.Errorf("ForeignServer=%q, want %q", ct.ForeignServer, "srv")
+	}
+	if got, want := ct.ForeignOptions, []string{"schema_name=x1"}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("ForeignOptions=%v, want %v", got, want)
+	}
+	if len(ct.Columns) != 2 {
+		t.Fatalf("expected 2 columns, got %d", len(ct.Columns))
+	}
+	if got, want := ct.Columns[0].FDWOptions, []string{"column_name=col1"}; len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("col[0].FDWOptions=%v, want %v", got, want)
+	}
+	if len(ct.Columns[1].FDWOptions) != 0 {
+		t.Errorf("col[1].FDWOptions=%v, want empty (no OPTIONS clause on b)", ct.Columns[1].FDWOptions)
+	}
+}
+
+// TestParseAlterForeignTableAlterColumnOptions verifies that
+// `ALTER FOREIGN TABLE ... ALTER COLUMN col OPTIONS ([ADD|SET|DROP] name
+// ['value'], …)` parses into an AlterTableAlterColumnOptions action carrying
+// the verb-tagged option list (a bare `name 'value'` defaults to Add,
+// matching PG's DEFELEM_UNSPEC-as-ADD rule). Closes the loop #55
+// deferral-ledger resume point: pg_dump now *emits* this statement (the
+// attfdwoptions round-trip, DU-002 slice 418) but goopg previously could not
+// parse it back (no FOREIGN lookahead before the ALTER TABLE dispatch).
+// DU-002 slice 419.
+func TestParseAlterForeignTableAlterColumnOptions(t *testing.T) {
+	sql := `ALTER FOREIGN TABLE ONLY t ALTER COLUMN c OPTIONS (ADD opt1 'v1', SET opt2 'v2', DROP opt3, bare 'v4')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmts[0])
+	}
+	if at.Name.Name != "t" {
+		t.Errorf("Name=%q, want %q", at.Name.Name, "t")
+	}
+	if len(at.Actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(at.Actions))
+	}
+	act := at.Actions[0]
+	if act.Kind != AlterTableAlterColumnOptions {
+		t.Fatalf("Kind=%v, want AlterTableAlterColumnOptions", act.Kind)
+	}
+	if act.ColumnName != "c" {
+		t.Errorf("ColumnName=%q, want %q", act.ColumnName, "c")
+	}
+	want := []FDWOptionChange{
+		{Verb: FDWOptionAdd, Name: "opt1", Value: "v1"},
+		{Verb: FDWOptionSet, Name: "opt2", Value: "v2"},
+		{Verb: FDWOptionDrop, Name: "opt3"},
+		{Verb: FDWOptionAdd, Name: "bare", Value: "v4"},
+	}
+	if len(act.FDWOptionChanges) != len(want) {
+		t.Fatalf("FDWOptionChanges=%+v, want %+v", act.FDWOptionChanges, want)
+	}
+	for i, w := range want {
+		if act.FDWOptionChanges[i] != w {
+			t.Errorf("FDWOptionChanges[%d]=%+v, want %+v", i, act.FDWOptionChanges[i], w)
+		}
+	}
+}
+
+// TestParseAlterForeignTableSetForeignOptions verifies that
+// `ALTER FOREIGN TABLE ... OPTIONS ([ADD|SET|DROP] name ['value'], …)` (no
+// ALTER COLUMN prefix) parses into an AlterTableSetForeignOptions action
+// carrying the verb-tagged option list, the table-level sibling of
+// AlterTableAlterColumnOptions. Closes the loop #56 deferral-ledger resume
+// point. DU-002 slice 420.
+func TestParseAlterForeignTableSetForeignOptions(t *testing.T) {
+	sql := `ALTER FOREIGN TABLE ONLY t OPTIONS (ADD opt1 'v1', SET opt2 'v2', DROP opt3, bare 'v4')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmts[0])
+	}
+	if at.Name.Name != "t" {
+		t.Errorf("Name=%q, want %q", at.Name.Name, "t")
+	}
+	if len(at.Actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(at.Actions))
+	}
+	act := at.Actions[0]
+	if act.Kind != AlterTableSetForeignOptions {
+		t.Fatalf("Kind=%v, want AlterTableSetForeignOptions", act.Kind)
+	}
+	want := []FDWOptionChange{
+		{Verb: FDWOptionAdd, Name: "opt1", Value: "v1"},
+		{Verb: FDWOptionSet, Name: "opt2", Value: "v2"},
+		{Verb: FDWOptionDrop, Name: "opt3"},
+		{Verb: FDWOptionAdd, Name: "bare", Value: "v4"},
+	}
+	if len(act.FDWOptionChanges) != len(want) {
+		t.Fatalf("FDWOptionChanges=%+v, want %+v", act.FDWOptionChanges, want)
+	}
+	for i, w := range want {
+		if act.FDWOptionChanges[i] != w {
+			t.Errorf("FDWOptionChanges[%d]=%+v, want %+v", i, act.FDWOptionChanges[i], w)
+		}
+	}
+}
+
+// TestParseAlterForeignDataWrapperOptions verifies that
+// `ALTER FOREIGN DATA WRAPPER name [HANDLER h|NO HANDLER] [VALIDATOR h|NO
+// VALIDATOR] OPTIONS ([ADD|SET|DROP] name ['value'], …)` — a structurally
+// distinct statement from ALTER [FOREIGN] TABLE (no TABLE keyword) — parses
+// into a CompatNoopStmt carrying the verb-tagged option list, and that a bare
+// HANDLER/VALIDATOR-only form (no OPTIONS) also parses without error. Closes
+// the loop #57 deferral-ledger resume point ("ALTER FOREIGN DATA WRAPPER
+// remains entirely unparseable"). DU-002 slice 421.
+func TestParseAlterForeignDataWrapperOptions(t *testing.T) {
+	sql := `ALTER FOREIGN DATA WRAPPER fdw1 NO HANDLER VALIDATOR myvalidator OPTIONS (ADD opt1 'v1', SET opt2 'v2', DROP opt3, bare 'v4')`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	cn, ok := stmts[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("expected *CompatNoopStmt, got %T", stmts[0])
+	}
+	if cn.Tag != "ALTER" {
+		t.Errorf("Tag=%q, want %q", cn.Tag, "ALTER")
+	}
+	if cn.ObjType != "foreign-data wrapper" {
+		t.Errorf("ObjType=%q, want %q", cn.ObjType, "foreign-data wrapper")
+	}
+	if cn.ObjName.Name != "fdw1" {
+		t.Errorf("ObjName=%q, want %q", cn.ObjName.Name, "fdw1")
+	}
+	want := []FDWOptionChange{
+		{Verb: FDWOptionAdd, Name: "opt1", Value: "v1"},
+		{Verb: FDWOptionSet, Name: "opt2", Value: "v2"},
+		{Verb: FDWOptionDrop, Name: "opt3"},
+		{Verb: FDWOptionAdd, Name: "bare", Value: "v4"},
+	}
+	if len(cn.FDWOptionChanges) != len(want) {
+		t.Fatalf("FDWOptionChanges=%+v, want %+v", cn.FDWOptionChanges, want)
+	}
+	for i, w := range want {
+		if cn.FDWOptionChanges[i] != w {
+			t.Errorf("FDWOptionChanges[%d]=%+v, want %+v", i, cn.FDWOptionChanges[i], w)
+		}
+	}
+
+	// HANDLER/VALIDATOR-only form (no OPTIONS clause) must also parse cleanly.
+	stmts2, err := Parse(`ALTER FOREIGN DATA WRAPPER fdw1 HANDLER fdw1_handler`)
+	if err != nil {
+		t.Fatalf("Parse (handler-only): %v", err)
+	}
+	cn2, ok := stmts2[0].(*CompatNoopStmt)
+	if !ok {
+		t.Fatalf("expected *CompatNoopStmt, got %T", stmts2[0])
+	}
+	if cn2.ObjName.Name != "fdw1" || len(cn2.FDWOptionChanges) != 0 {
+		t.Errorf("got ObjName=%q FDWOptionChanges=%+v, want ObjName=fdw1 empty changes", cn2.ObjName.Name, cn2.FDWOptionChanges)
 	}
 }
 

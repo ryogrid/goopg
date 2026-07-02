@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -179,5 +180,116 @@ func TestExecDropFunctionAmbiguousBareName(t *testing.T) {
 	ee, ok := err.(*ExecError)
 	if !ok || ee.Code != "42725" {
 		t.Fatalf("got err=%v, want ExecError SQLSTATE 42725", err)
+	}
+}
+
+// TestExecDropProcedureRemovesEntry pins the standard autocommit happy path
+// for DROP PROCEDURE, mirroring TestExecDropFunctionRemovesEntry.
+func TestExecDropProcedureRemovesEntry(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE PROCEDURE p(int) LANGUAGE plpgsql AS $$ BEGIN END $$`,
+		cat); err != nil {
+		t.Fatal(err)
+	}
+	if err := runRoutineDDL(t, `DROP PROCEDURE p(int)`, cat); err != nil {
+		t.Fatalf("DROP PROCEDURE: %v", err)
+	}
+	if _, ok := cat.Routines().Lookup(
+		parser.ObjectName{Name: "p"}, []catalog.Type{{Name: "int"}}); ok {
+		t.Error("Lookup after DROP must miss")
+	}
+}
+
+// runRoutineDDLInSession runs a single DDL statement against ctx/sess (an
+// explicit-transaction-aware session already wired into ctx), without
+// draining/committing anything — the caller inspects/applies the deferred
+// state itself. Distinct from runRoutineDDL, which always builds a fresh
+// no-Session Context (autocommit).
+func runRoutineDDLInSession(t *testing.T, ctx *Context, sql string, cat catalog.Catalog) error {
+	t.Helper()
+	plan := planOne(t, sql, cat)
+	op, err := Build(plan)
+	if err != nil {
+		return err
+	}
+	if err := op.Open(ctx); err != nil {
+		return err
+	}
+	defer op.Close()
+	for {
+		_, err := op.Next()
+		if err == EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// TestExecDropProcedureDeferredToCommit pins the loop #74 unification: DROP
+// PROCEDURE inside an explicit transaction defers its registry removal to
+// COMMIT exactly like DROP FUNCTION (M0118-0009 `stats`) — the procedure
+// stays resolvable until ApplyDeferredRoutineDrops runs, which is the single
+// chokepoint that also WAL-logs the removal (never invoked on ROLLBACK).
+func TestExecDropProcedureDeferredToCommit(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE PROCEDURE p(int) LANGUAGE plpgsql AS $$ BEGIN END $$`,
+		cat); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := NewBasicSession()
+	sess.BeginExplicitTransaction(mvcc.Transaction{}, mvcc.Snapshot{})
+	ctx := NewContext()
+	ctx.Catalog = cat
+	ctx.Session = sess
+
+	if err := runRoutineDDLInSession(t, ctx, `DROP PROCEDURE p(int)`, cat); err != nil {
+		t.Fatalf("DROP PROCEDURE (deferred): %v", err)
+	}
+
+	if _, ok := cat.Routines().Lookup(parser.ObjectName{Name: "p"}, []catalog.Type{{Name: "int"}}); !ok {
+		t.Fatal("procedure must remain resolvable/callable until COMMIT")
+	}
+
+	ApplyDeferredRoutineDrops(ctx, sess)
+	if _, ok := cat.Routines().Lookup(parser.ObjectName{Name: "p"}, []catalog.Type{{Name: "int"}}); ok {
+		t.Fatal("procedure must be removed after ApplyDeferredRoutineDrops (COMMIT)")
+	}
+}
+
+// TestExecDropProcedureRollbackLeavesEntry confirms the ROLLBACK side of the
+// same unification: discarding the deferred entry (TakeDeferredRoutineDrops,
+// as done by operators_tx.go execRollback / dispatch.go's simple-query
+// TxRollback / EndExplicitTransaction) never touches the registry, so the
+// procedure survives — unlike the pre-loop-#74 immediate-mutation design,
+// which needed a separate rollback-undo (AddPendingRoutineDrop/Create) to
+// achieve the same outcome.
+func TestExecDropProcedureRollbackLeavesEntry(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := runRoutineDDL(t,
+		`CREATE PROCEDURE p(int) LANGUAGE plpgsql AS $$ BEGIN END $$`,
+		cat); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := NewBasicSession()
+	sess.BeginExplicitTransaction(mvcc.Transaction{}, mvcc.Snapshot{})
+	ctx := NewContext()
+	ctx.Catalog = cat
+	ctx.Session = sess
+
+	if err := runRoutineDDLInSession(t, ctx, `DROP PROCEDURE p(int)`, cat); err != nil {
+		t.Fatalf("DROP PROCEDURE (deferred): %v", err)
+	}
+
+	sess.TakeDeferredRoutineDrops() // ROLLBACK: discard without applying
+	sess.EndExplicitTransaction()
+
+	if _, ok := cat.Routines().Lookup(parser.ObjectName{Name: "p"}, []catalog.Type{{Name: "int"}}); !ok {
+		t.Fatal("procedure must survive ROLLBACK — the registry was never mutated")
 	}
 }

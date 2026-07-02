@@ -19,6 +19,20 @@ const (
 	oidBytea = 17
 )
 
+// setIsSuperuserGUC keeps the reportable "is_superuser" GUC (see
+// isSuperuserRoleName / server.go's startup wiring) in sync whenever
+// SET ROLE / SET SESSION AUTHORIZATION / their RESET counterparts flip
+// connTx.NonSuperuserRole. Without this, a client that ran e.g. `SET
+// ROLE some_role` then re-checked its own privilege level (as some
+// tools do) would see a stale "on" from connection startup.
+func setIsSuperuserGUC(sess *config.SessionRegistry, isSuper bool) {
+	val := "off"
+	if isSuper {
+		val = "on"
+	}
+	_ = sess.SetInternal("is_superuser", val)
+}
+
 // handleQuery implements the simple Query path. v0 recognises:
 //
 //   - SELECT 1                       → single int4 column, value "1"
@@ -61,14 +75,47 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 
 	upper := strings.ToUpper(matchable)
 
+	// A GRANT/REVOKE … ON TYPE|DOMAIN … changes pg_type.typacl, which is
+	// heap-backed (PG18-standby basebackup parity, M0097-0022) — unlike the
+	// table/sequence/schema/function ACLs the server records virtually below. It
+	// must run through the executor (dispatchSimpleQueryViaExecutor at the foot of
+	// this function), where an *executor.Context is in scope to re-sync the heap
+	// row; execCompatNoop updates the OID-keyed ACL store and rewrites the
+	// pg_type row. Exclude it from the server GRANT/REVOKE fast path so it falls
+	// through. M0119-0004-ACLHEAP.
+	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ")
+	// A column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON [TABLE] <name> …` —
+	// changes pg_attribute.attacl, which is heap-backed like pg_type.typacl, so it
+	// too must run through the executor (where an *executor.Context re-syncs the heap
+	// row). Its signature is a parenthesised column list BEFORE the ON keyword (a
+	// function GRANT's parens follow ON), so a '(' earlier than " ON " marks it.
+	// M0119-0004-ACLHEAP (attacl half).
+	if onPos := strings.Index(upper, " ON "); onPos > 0 {
+		if lp := strings.IndexByte(upper, '('); lp >= 0 && lp < onPos {
+			isHeapACLObject = true
+		}
+	}
+
 	// A single-statement, autocommit table-level GRANT is recorded in the
 	// catalog ACL store so SET ROLE + a privileged command (e.g. TRUNCATE) is
 	// enforced (truncate-conflict isolation spec, M0118-0008). Inside an
 	// explicit transaction we fall through to the executor's no-op path so
 	// transaction state and the protocol response are handled normally.
-	if strings.HasPrefix(upper, "GRANT ") && (connTx == nil || !connTx.InExplicit()) {
+	if strings.HasPrefix(upper, "GRANT ") && !isHeapACLObject && (connTx == nil || !connTx.InExplicit()) {
 		s.tryRecordTableGrant(matchable)
 		if err := w.WriteCommandComplete("GRANT"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	}
+
+	// A single-statement, autocommit REVOKE is recorded symmetrically so the
+	// materialized relacl drops the revoked privileges and pg_dump re-emits only
+	// what remains (DU-002 slice 338). Like GRANT it is left to the executor's
+	// no-op path inside an explicit transaction.
+	if strings.HasPrefix(upper, "REVOKE ") && !isHeapACLObject && (connTx == nil || !connTx.InExplicit()) {
+		s.tryRecordTableRevoke(matchable)
+		if err := w.WriteCommandComplete("REVOKE"); err != nil {
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
@@ -104,18 +151,57 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE } controls
+	// runtime constraint deferral, NOT a GUC — route through the parser-based
+	// executor (which builds a SetConstraintsStmt and updates the executor
+	// session's deferral state) before the generic "SET " GUC case, which would
+	// otherwise mis-read "CONSTRAINTS" as a configuration parameter. 0119-0004.
+	case strings.HasPrefix(upper, "SET CONSTRAINTS "):
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
+		// No storage backend (bare protocol server): accept as a no-op.
+		if err := w.WriteCommandComplete("SET CONSTRAINTS"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":
 		if connTx != nil {
 			role := strings.TrimSpace(matchable[len("SET LOCAL SESSION AUTHORIZATION"):])
 			role = strings.Trim(role, `"'`)
+			connTx.SnapshotLocalRoleIfNeeded(true)
 			switch strings.ToUpper(role) {
 			case "", "DEFAULT", "RESET", "POSTGRES":
 				connTx.NonSuperuserRole = ""
 			default:
 				connTx.NonSuperuserRole = role
 			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+		}
+		if err := w.WriteCommandComplete("SET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// SET LOCAL ROLE rolename — must check before generic "SET LOCAL ", which
+	// would otherwise mis-parse "ROLE rolename" as GUC name "role" and fail
+	// with "unrecognized configuration parameter" ("role" is not a
+	// config.Registry variable — SET ROLE is tracked entirely via
+	// connTx.NonSuperuserRole, not the GUC layer). Mirrors the "SET LOCAL
+	// SESSION AUTHORIZATION" case above.
+	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
+		if connTx != nil {
+			role := strings.TrimSpace(matchable[len("SET LOCAL ROLE"):])
+			role = strings.Trim(role, `"'`)
+			connTx.SnapshotLocalRoleIfNeeded(true)
+			switch strings.ToUpper(role) {
+			case "", "DEFAULT", "NONE", "POSTGRES":
+				connTx.NonSuperuserRole = ""
+			default:
+				connTx.NonSuperuserRole = role
+			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -138,6 +224,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			default:
 				connTx.NonSuperuserRole = role
 			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -159,6 +246,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			default:
 				connTx.NonSuperuserRole = role
 			}
+			setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
@@ -178,6 +266,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	case upper == "RESET SESSION AUTHORIZATION":
 		if connTx != nil {
 			connTx.NonSuperuserRole = ""
+			setIsSuperuserGUC(sess, true)
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
@@ -187,6 +276,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	case upper == "RESET ROLE":
 		if connTx != nil {
 			connTx.NonSuperuserRole = ""
+			setIsSuperuserGUC(sess, true)
 		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err

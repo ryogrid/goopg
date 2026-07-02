@@ -694,15 +694,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	clog.SetCLOGBuffers(opts.TransactionBuffers)
 	// M0106-0010 batched-44: wire the PG-canonical pg_xact/ SLRU mirror so
 	// every commit/abort updates the SLRU segment that the basebackup-shipped
-	// standby reads via SimpleLruReadPage_ReadOnly. EnablePGSLRUMirror also
-	// backfills the SLRU from already-loaded flat-file entries on the recovery
-	// path (in case the SLRU was missing or stale on disk).
+	// standby reads via SimpleLruReadPage_ReadOnly. Since M0117-0006 Part C the
+	// pool created here IS the CLOG store (no flat-file backfill round-trip);
+	// it lazily faults pages in directly from the on-disk SLRU segments.
 	if err := clog.EnablePGSLRUMirror(filepath.Join(abs, "pg_xact")); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: enable pg_xact slru mirror: %w", err)
 	}
+	// M0117-0007 Part B: wire the CLOG SLRU buffer pool's async-commit write
+	// barrier (M0117-0007 Part A, previously never connected to a live WAL
+	// writer) to walWriter.FlushUpTo. From here on, any dirty CLOG page
+	// write-back (group-commit flush or LRU eviction) flushes the WAL up to
+	// that page's highest associated commit-record LSN first — the invariant
+	// synchronous_commit=off relies on instead of an inline per-commit fsync.
+	clog.SetFlushWALHook(walWriter.FlushUpTo)
 	// M0117-0003: wire the persistent pg_subtrans SLRU so subtransaction
 	// parentage survives a restart (gap G5 read path). EnablePersistence opens
 	// the bootstrapped pg_subtrans/ directory (created by initdb) for write-through
@@ -725,7 +732,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
 	}
 	txnMgr.SetSubxactMap(subxactMap)
-	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
+	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker, waitLocalFlush bool) error {
 		var payload []byte
 		switch kind {
 		case mvcc.XactCommit:
@@ -798,7 +805,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		// disk before returning to the client so the transaction is durable
 		// across a server crash. Mirrors upstream's synchronous_commit = on
 		// default. Aborts are not flushed (they're discarded on replay).
-		if kind == mvcc.XactCommit {
+		// M0117-0007 Part B: skipped when waitLocalFlush is false
+		// (synchronous_commit=off) — durability is instead guaranteed by the
+		// CLOG async-commit write barrier below (SetCommittedWithLSN
+		// associates endLSN with this XID's CLOG page, and
+		// flushWALBeforeWriteLocked flushes the WAL up to it the moment that
+		// page is written back to disk, whenever that happens).
+		if kind == mvcc.XactCommit && waitLocalFlush {
 			if werr := walWriter.FlushUpTo(endLSN); werr != nil {
 				// ErrLSNNotWritten can surface when the WAL buffer
 				// position accounting has a transient race (the WAL
@@ -814,10 +827,15 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 		}
 		// Persist commit/abort status in clog (M0030-0007). Non-fatal: the
-		// WAL XactCommit record is the primary durability mechanism.
+		// WAL XactCommit record is the primary durability mechanism (or, for
+		// an async commit, the CLOG write barrier — see above).
 		switch kind {
 		case mvcc.XactCommit:
-			_ = clog.SetCommitted(xid)
+			if waitLocalFlush {
+				_ = clog.SetCommitted(xid)
+			} else {
+				_ = clog.SetCommittedWithLSN(xid, endLSN)
+			}
 		case mvcc.XactAbort:
 			_ = clog.SetAborted(xid)
 		}
@@ -918,6 +936,59 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
 	}
+	// DU-002 (M0119-0004) restart persistence: restore CREATE/DROP TRANSFORM
+	// objects (pg_transform) from the WAL the same way. Order relative to
+	// schema replay does not matter — transforms are keyed by (type name,
+	// language), not by schema OID.
+	if err := replayTransformDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: transform DDL replay: %w", err)
+	}
+	// DU-002 restart-persistence follow-up: restore CREATE/DROP CAST objects
+	// (pg_cast) from the WAL the same way. Order relative to transform/schema
+	// replay does not matter — casts are keyed by (source type, target
+	// type), not by schema OID.
+	if err := replayCastDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: cast DDL replay: %w", err)
+	}
+	// DU-002 restart-persistence follow-up: restore CREATE/DROP CONVERSION
+	// objects (pg_conversion) from the WAL the same way. Unlike
+	// transforms/casts, a conversion is schema-scoped (keyed by namespace
+	// OID + name), so this must run after replaySchemaDDLRecords above has
+	// repopulated the schema OID map.
+	if err := replayConversionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: conversion DDL replay: %w", err)
+	}
+	// DU-002 restart-persistence follow-up: restore CREATE/DROP COLLATION
+	// objects (pg_collation) from the WAL the same way. Like a conversion, a
+	// collation is schema-scoped (keyed by namespace OID + name), so this
+	// must run after replaySchemaDDLRecords above has repopulated the schema
+	// OID map.
+	if err := replayCollationDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: collation DDL replay: %w", err)
+	}
+	// DU-002 restart-persistence follow-up (slice 405 ledger resume point
+	// (c)): restore CREATE/ALTER AGGREGATE objects (pg_aggregate/pg_proc)
+	// from the WAL the same way. Unlike collation/conversion, a user
+	// aggregate has no Schema field yet, so order relative to schema replay
+	// does not matter.
+	if err := replayAggregateDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: aggregate DDL replay: %w", err)
+	}
 
 	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
 	// If the JSON snapshot is present and valid, populate the catalog directly
@@ -1011,6 +1082,48 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
+	}
+
+	// Sequence / SERIAL restart persistence: re-register sequences from
+	// RecordKindSequenceState WAL records and restore the owning columns'
+	// serial/identity catalog markers. Must run AFTER loadUserTablesFromHeap
+	// (the owning tables have to be registered so the column markers can be
+	// applied) — the heap-reloaded serial columns read back as their base
+	// integer type because pg_attribute stores the PG-canonical atttypid.
+	// See internal/initdb/sequence_ddl_recovery.go.
+	if err := replaySequenceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
+	}
+
+	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
+	// expression snapshots emitted by syncTableToCatalogHeap onto the
+	// heap-reloaded columns (DefaultExpr is an in-memory AST pg_attribute
+	// cannot carry). Must run AFTER loadUserTablesFromHeap.
+	if err := replayColumnDefaultsRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: column-defaults replay: %w", err)
+	}
+
+	// Role/auth restart persistence (root-0021): load the durable BASE from
+	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
+	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
+	// then replay any newer role WAL records ON TOP (the crash tail).
+	if err := LoadRolesFromAuthidHeap(abs, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_authid load: %w", err)
+	}
+	if err := replayRoleDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: role DDL replay: %w", err)
 	}
 
 	// M0106-0013: stamp the clog from WAL commit/abort records and advance
@@ -1162,6 +1275,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 			return clog.TruncateCLOG(horizon)
 		},
+		// M0117-0007 Part B continuation: bound how long an async commit's
+		// deferred CLOG write-back can stay dirty in memory (see
+		// mvcc.CLog.setStatusWithLSN / FlushAll).
+		FlushCLOGFn: clog.FlushAll,
 	})
 
 	// Surface the M0002 checkpointer counters as the
@@ -1265,11 +1382,31 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, err
 	}
+	// pg_aggregate: CREATE AGGREGATE introspection (DU-002 slice 405).
+	// Registering here (like pg_proc above) makes the view present from the
+	// first session, both for the 161 built-in aggregates and any later
+	// CREATE AGGREGATE.
+	if err := registerPgAggregateView(cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, err
+	}
 	// Publication / subscription registry + their five virtual
 	// catalog views (pg_publication, pg_publication_rel,
 	// pg_publication_tables, pg_subscription, pg_subscription_rel).
 	// See docs/design/0008-0003-publication-subscription-ddl.md.
 	pubsub := catalog.NewPubSub()
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #67 ledger
+	// resume point): restore CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION
+	// objects from the WAL. PubSub is not schema-scoped, so order relative
+	// to schema replay above does not matter.
+	if err := replayPubSubDDLRecords(filepath.Join(abs, "pg_wal"), pubsub); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pubsub DDL replay: %w", err)
+	}
 	if err := registerPublicationViews(cat, pubsub); err != nil {
 		_ = pool.Close()
 		_ = walWriter.Close()
@@ -1281,6 +1418,32 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, err
+	}
+
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #70 ledger
+	// resume point): restore CREATE/DROP/ALTER EVENT TRIGGER objects from
+	// the WAL. Like PubSub, event triggers are not schema-scoped, so order
+	// relative to schema replay above does not matter.
+	if err := replayEventTriggerDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: event trigger DDL replay: %w", err)
+	}
+
+	// DU-002 restart-persistence follow-up (M0119-0004, loop #71 ledger
+	// resume point): restore CREATE/DROP/ALTER FUNCTION/PROCEDURE objects
+	// from the WAL. Like event triggers, routines are keyed by a plain
+	// schema name string (no NamespaceOID to resolve), so order relative to
+	// schema replay does not matter. Runs after event trigger replay so a
+	// restored event trigger's evtfoid can (in principle) be cross-checked
+	// against a restored routine, though neither replay path validates the
+	// other today.
+	if err := replayFunctionDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: function DDL replay: %w", err)
 	}
 
 	// pg_sequences: virtual catalog view listing all registered sequences.

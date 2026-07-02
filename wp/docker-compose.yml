@@ -1,0 +1,58 @@
+# WordPress (on PostgreSQL via PG4WP) talking to a goopg server running on the
+# host. goopg listens on 0.0.0.0:5544; containers reach it through the Docker
+# host-gateway alias `host.docker.internal`.
+#
+# Connection target: database `postgres`, user `postgres`, trust auth (goopg v0
+# only enforces trust/reject, so the password is ignored). We use the built-in
+# `postgres` database because goopg's CREATE DATABASE/ROLE are in-memory only
+# and do not survive a restart, whereas table data in `postgres` persists.
+
+services:
+  wordpress:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: goopg-wordpress:latest
+    container_name: goopg-wordpress
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      # GOOPG_DB_HOST is written to wp/.env by setup.sh as "<host-ip>:5544".
+      # goopg runs on the host and listens on all interfaces; containers reach
+      # it via the host's LAN IP (host.docker.internal is not available with
+      # native Docker Engine in WSL2).
+      WORDPRESS_DB_HOST: "${GOOPG_DB_HOST:?run setup.sh to generate wp/.env}"
+      WORDPRESS_DB_NAME: "postgres"
+      WORDPRESS_DB_USER: "postgres"
+      WORDPRESS_DB_PASSWORD: "postgres"   # ignored by goopg trust auth
+      # PG4WP defaults DB_DRIVER to 'pgsql'; set explicitly for clarity.
+      WORDPRESS_CONFIG_EXTRA: |
+        define('DB_DRIVER', 'pgsql');
+    volumes:
+      - wp_html:/var/www/html
+
+  # On-demand wp-cli (install + seed). Not started by `up`; invoked via
+  # `docker compose run --rm wpcli ...`. Runs as uid 33 to match the Debian
+  # www-data owner of the files created by the `wordpress` container.
+  wpcli:
+    build:
+      context: .
+      dockerfile: Dockerfile.cli
+    image: goopg-wp-cli:latest
+    profiles: ["tools"]
+    user: "33:33"
+    # wp-config.php resolves DB_HOST/NAME/USER/PASSWORD via getenv_docker() at
+    # runtime, so wp-cli needs the same env as the wordpress service (otherwise
+    # DB_HOST falls back to the stock default 'mysql').
+    environment:
+      WORDPRESS_DB_HOST: "${GOOPG_DB_HOST:?run setup.sh to generate wp/.env}"
+      WORDPRESS_DB_NAME: "postgres"
+      WORDPRESS_DB_USER: "postgres"
+      WORDPRESS_DB_PASSWORD: "postgres"
+    volumes:
+      - wp_html:/var/www/html
+      - ./seed:/seed:ro
+
+volumes:
+  wp_html:

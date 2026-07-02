@@ -26,6 +26,7 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/sqlkeywords"
 )
 
 // sessionPRNG is the per-process random-number generator used by random(),
@@ -488,6 +489,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		// `::regtype` resolves a type name to its OID (string→oid).
 		// `::regproc` resolves a function name to its OID (string→oid).
 		if strings.EqualFold(x.TargetType, "regproc") || strings.EqualFold(x.TargetType, "regprocedure") {
+			isProcedure := strings.EqualFold(x.TargetType, "regprocedure")
 			if v.Kind == KindString && ctx != nil && ctx.Catalog != nil {
 				funcName := strings.TrimSpace(v.StringValue())
 				// SQL identifiers are case-folded to lowercase when parsed; match that.
@@ -499,6 +501,101 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					}
 				}
 				return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(), Message: fmt.Sprintf("function %q does not exist", funcName)}
+			}
+			// An OID input (oid→regproc/regprocedure) renders via
+			// regprocout/regprocedureout: InvalidOid (0) becomes "-", matching
+			// PG's regproc.c. pg_dump's getForeignDataWrappers (and
+			// amhandler/opclass getters) cast `<col>::regproc` and compare the
+			// result to "-" to decide whether to emit a HANDLER/VALIDATOR
+			// clause; a bare "0" would spuriously emit one. DU-002 slice 375.
+			if v.Kind == KindInt {
+				oid := v.Int
+				if oid == 0 {
+					return NewStringDatum("-"), nil
+				}
+				// regprocedure additionally renders the INPUT argument-type
+				// list ("name(argtype1,argtype2)", format_procedure) so an
+				// overloaded name is disambiguated — pg_dump relies on this
+				// for pg_amproc/pg_cast/pg_transform function-OID columns.
+				// DU-002 (M0119-0004), combined follow-up to the deferred
+				// pg_amop/pg_amproc member store (backlog item regarding
+				// regoper/regoperator/regprocedure resolution).
+				if isProcedure {
+					var routines *catalog.Routines
+					if ctx != nil && ctx.Catalog != nil {
+						routines = ctx.Catalog.Routines()
+					}
+					if schema, sig, ok := catalog.RegprocedureNameAndSchema(uint32(oid), routines); ok {
+						if !regObjectSchemaVisible(ctx, schema) {
+							return NewStringDatum(schema + "." + sig), nil
+						}
+						return NewStringDatum(sig), nil
+					}
+					return v, nil
+				}
+				// A non-zero OID resolves to the function name (built-in via
+				// catalog.RegprocName's generated pg_proc.dat index, or a
+				// CREATE FUNCTION via the live routine registry) — previously
+				// this fell through to `return v, nil`, leaving the cast a
+				// no-op that rendered the raw OID instead of a name at
+				// output time. Falls back to the raw datum (still tagged
+				// regproc for downstream formatting) only if neither source
+				// resolves it.
+				if name, ok := catalog.RegprocName(uint32(oid)); ok {
+					return NewStringDatum(name), nil
+				}
+				if ctx != nil && ctx.Catalog != nil {
+					if r := ctx.Catalog.Routines().LookupByOID(uint32(oid)); r != nil {
+						// Schema-qualify exactly like the regprocedure/
+						// regoperator branches below: pg_dump's own connection
+						// always runs with search_path='', so
+						// ProcedureIsVisible never finds an unqualified
+						// user-defined function visible. Confirmed via a live
+						// PG 18.3 diff for pg_event_trigger.evtfoid::regproc
+						// (dumpEventTrigger emits `public.et_func()`, not
+						// `et_func()`, for a public-schema trigger function).
+						// DU-002 (M0119-0004).
+						if !regObjectSchemaVisible(ctx, r.Schema) {
+							return NewStringDatum(r.Schema + "." + r.Name), nil
+						}
+						return NewStringDatum(r.Name), nil
+					}
+				}
+			}
+			return v, nil
+		}
+		if strings.EqualFold(x.TargetType, "regoper") || strings.EqualFold(x.TargetType, "regoperator") {
+			// An OID input renders via regoperout/regoperatorout: InvalidOid
+			// (0) becomes the literal "0" (unlike regproc/regtype's "-" —
+			// regproc.c's regoperout/regoperatorout both special-case
+			// InvalidOid to "0"). regoperator additionally renders the
+			// (lefttype,righttype) pair ("NONE" for a missing/unary side,
+			// format_operator) so dumpOpclass/dumpOpfamily's
+			// amopopr::pg_catalog.regoperator cast resolves to a real name
+			// instead of a bare OID. Only user-defined operators are
+			// resolvable (goopg has no builtin-operator catalog — deferred,
+			// see the ledger). DU-002 (M0119-0004) slice 411.
+			if v.Kind == KindInt {
+				oid := v.Int
+				if oid == 0 {
+					return NewStringDatum("0"), nil
+				}
+				if ctx != nil && ctx.Catalog != nil {
+					if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+						if strings.EqualFold(x.TargetType, "regoperator") {
+							if schema, sig, found := im.RegoperatorNameAndSchema(uint32(oid)); found {
+								if !regObjectSchemaVisible(ctx, schema) {
+									return NewStringDatum(schema + "." + sig), nil
+								}
+								return NewStringDatum(sig), nil
+							}
+						} else if op := im.LookupUserOperatorByOID(uint32(oid)); op != nil {
+							return NewStringDatum(op.Name), nil
+						} else if bop, found := catalog.LookupBuiltinOperatorByOID(uint32(oid)); found {
+							return NewStringDatum(bop.Name), nil
+						}
+					}
+				}
 			}
 			return v, nil
 		}
@@ -530,8 +627,14 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				if typName == "" {
 					return NewStringDatum("{}"), nil
 				}
-				// Try as an OID integer string (e.g. "16" → "boolean")
+				// Try as an OID integer string (e.g. "16" → "boolean").
+				// InvalidOid (0) renders as "-", matching PG's regtypeout
+				// (src/backend/utils/adt/regproc.c) — e.g. pg_opclass.opckeytype
+				// is 0 when no STORAGE clause was given.
 				if oid, parseErr := strconv.ParseInt(typName, 10, 64); parseErr == nil {
+					if oid == 0 {
+						return NewStringDatum("-"), nil
+					}
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
@@ -546,7 +649,10 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// Built-in type name → return itself
 				return v, nil
 			case KindInt:
-				// OID integer → type name
+				// OID integer → type name; InvalidOid (0) renders as "-" (see above).
+				if v.Int == 0 {
+					return NewStringDatum("-"), nil
+				}
 				if name := oidToBuiltinTypeName(uint32(v.Int)); name != "" {
 					return NewStringDatum(name), nil
 				}
@@ -672,9 +778,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 			return Datum{}, err
 		}
 		// Domain CHECK constraint enforcement: VALUE IN (...). M0097-domain-check.
+		// A domain may carry several CHECK (VALUE IN (...)) constraints; each must
+		// admit the value. DU-002 slice 385 (multi-CHECK).
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain && len(dom.CheckInValues) > 0 {
+				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain {
 					// Get the string label of the value being cast.
 					var label string
 					if result.Kind == KindEnum {
@@ -682,18 +790,23 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					} else {
 						label = result.StringValue()
 					}
-					found := false
-					for _, allowed := range dom.CheckInValues {
-						if strings.EqualFold(label, allowed) {
-							found = true
-							break
+					for _, ck := range dom.Checks {
+						if len(ck.InValues) == 0 {
+							continue
 						}
-					}
-					if !found {
-						return Datum{}, &ExecError{
-							Code:    "23514",
-							Pos:     x.Pos(),
-							Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), strings.ToLower(dom.Name)+"_check"),
+						found := false
+						for _, allowed := range ck.InValues {
+							if strings.EqualFold(label, allowed) {
+								found = true
+								break
+							}
+						}
+						if !found {
+							return Datum{}, &ExecError{
+								Code:    "23514",
+								Pos:     x.Pos(),
+								Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
+							}
 						}
 					}
 				}
@@ -4495,6 +4608,15 @@ func buildConstraintDefString(idx *catalog.Index) string {
 		if len(idx.IncludeColumns) > 0 {
 			def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 		}
+		// Partial EXCLUDE WHERE predicate — pg_get_constraintdef renders the
+		// exclusion def via pg_get_indexdef_worker, which appends ` WHERE (%s)`
+		// (ruleutils.c:1564) after the operator/INCLUDE list and BEFORE the
+		// DEFERRABLE clauses that the shared tail adds. PredicateString already
+		// carries the fully-parenthesized predicate (defaultExprToSQL), matching
+		// PG's `WHERE (pred)`. DU-002 slice 310.
+		if idx.PredicateString != "" {
+			def += " WHERE " + idx.PredicateString
+		}
 		// DEFERRABLE [INITIALLY DEFERRED] — ruleutils.c appends ` DEFERRABLE` for a
 		// deferrable EXCLUDE constraint (after the WHERE predicate, which goopg does
 		// not yet emit) and ` INITIALLY DEFERRED` when initially deferred (INITIALLY
@@ -4544,7 +4666,8 @@ func buildConstraintDefString(idx *catalog.Index) string {
 // runs with search_path=” so the referenced relation is fully schema-qualified
 // (`REFERENCES public.foo(id)`). Referential actions other than NO ACTION and a
 // DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
-// does. DU-002 slice 51.
+// does. A trailing ` NOT VALID` is appended for an unvalidated FK
+// (convalidated='f'). DU-002 slices 51, 307.
 func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) string {
 	var refTbl *catalog.Table
 	for _, t := range im.AllTables() {
@@ -4576,17 +4699,40 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 	}
 	def := "FOREIGN KEY (" + strings.Join(fk.Columns, ", ") + ") REFERENCES " +
 		refSchema + "." + refName + "(" + strings.Join(refCols, ", ") + ")"
+	// MATCH FULL is emitted between the REFERENCES column list and the ON
+	// UPDATE/DELETE clauses, mirroring pg_get_constraintdef_worker
+	// (ruleutils.c). MATCH SIMPLE (the default, confmatchtype='s') and the
+	// unimplemented MATCH PARTIAL produce no clause. DU-002 slice 309.
+	if fk.MatchFull {
+		def += " MATCH FULL"
+	}
 	if act := fkActionClause(fk.OnUpdate); act != "" {
 		def += " ON UPDATE " + act
 	}
 	if act := fkActionClause(fk.OnDelete); act != "" {
 		def += " ON DELETE " + act
+		// PG15 confdelsetcols: an `ON DELETE SET NULL|DEFAULT` restricted to a
+		// column subset appends ` (col, …)` after the action keyword
+		// (ruleutils.c:2376, decompile_column_index_array). Only SET NULL / SET
+		// DEFAULT can carry it. DU-002 slice 311.
+		if len(fk.OnDeleteSetCols) > 0 &&
+			(fk.OnDelete == parser.FKActionSetNull || fk.OnDelete == parser.FKActionSetDefault) {
+			def += " (" + strings.Join(fk.OnDeleteSetCols, ", ") + ")"
+		}
 	}
 	if fk.Deferrable {
 		def += " DEFERRABLE"
 		if fk.InitiallyDeferred {
 			def += " INITIALLY DEFERRED"
 		}
+	}
+	// A NOT-VALID FK (pg_constraint.convalidated='f') carries a trailing
+	// ` NOT VALID` in pg_get_constraintdef, appended after the DEFERRABLE
+	// clauses — the shared tail of pg_get_constraintdef_worker (ruleutils.c:2604).
+	// pg_dump re-emits this verbatim so the restored FK is likewise unvalidated.
+	// DU-002 slice 307.
+	if fk.NotValid {
+		def += " NOT VALID"
 	}
 	return def
 }
@@ -4606,6 +4752,205 @@ func fkActionClause(a parser.FKAction) string {
 	default:
 		return ""
 	}
+}
+
+// buildTriggerDefString reconstructs the CREATE TRIGGER statement for a
+// row-/statement-level trigger, mirroring ruleutils.c
+// pg_get_triggerdef_worker. pg_dump's getTriggers selects
+// pg_get_triggerdef(t.oid, false) and emits the result verbatim (plus a
+// trailing semicolon), so the spacing must match PG exactly:
+//
+//	CREATE TRIGGER <name> {BEFORE|AFTER|INSTEAD OF} <ev>[ OR <ev>…]
+//	    ON <schema>.<table> FOR EACH {ROW|STATEMENT}
+//	    EXECUTE FUNCTION <schema>.<func>(<'arg'>…)
+//
+// Events are emitted in PG's fixed order (INSERT, DELETE, UPDATE, TRUNCATE)
+// regardless of the order they were declared. The target table and trigger
+// function are schema-qualified because pg_dump runs with search_path=''.
+// A column-specific `UPDATE OF col1, col2` list is reconstructed after the
+// UPDATE event (DU-002 slice 326). A CONSTRAINT TRIGGER emits `CREATE CONSTRAINT
+// TRIGGER` plus a `[NOT ]DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE}` clause after
+// the ON-table name (DU-002 slice 327). goopg's parser does not yet capture WHEN
+// or REFERENCING transition-table clauses, so neither is emitted.
+// DU-002 slice 319.
+func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
+	var b strings.Builder
+	// A CONSTRAINT TRIGGER deparses as `CREATE CONSTRAINT TRIGGER` (ruleutils.c
+	// pg_get_triggerdef_worker, gated on a valid tgconstraint). DU-002 slice 327.
+	if trig.IsConstraint {
+		b.WriteString("CREATE CONSTRAINT TRIGGER ")
+	} else {
+		b.WriteString("CREATE TRIGGER ")
+	}
+	b.WriteString(trig.Name)
+	b.WriteByte(' ')
+	switch trig.Timing {
+	case catalog.TriggerBefore:
+		b.WriteString("BEFORE")
+	case catalog.TriggerInsteadOf:
+		b.WriteString("INSTEAD OF")
+	default:
+		b.WriteString("AFTER")
+	}
+	has := make(map[string]bool, len(trig.Events))
+	for _, ev := range trig.Events {
+		has[strings.ToLower(ev)] = true
+	}
+	first := true
+	emit := func(kw string) {
+		if first {
+			b.WriteByte(' ')
+			b.WriteString(kw)
+			first = false
+		} else {
+			b.WriteString(" OR ")
+			b.WriteString(kw)
+		}
+	}
+	if has["insert"] {
+		emit("INSERT")
+	}
+	if has["delete"] {
+		emit("DELETE")
+	}
+	if has["update"] {
+		emit("UPDATE")
+		// A column-specific UPDATE trigger appends ` OF col1, col2` right after
+		// the UPDATE event (ruleutils.c pg_get_triggerdef_worker). Column names
+		// are quoted only when required. DU-002 slice 326.
+		if len(trig.UpdateColumns) > 0 {
+			b.WriteString(" OF ")
+			for i, col := range trig.UpdateColumns {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(pgQuoteIdent(col))
+			}
+		}
+	}
+	if has["truncate"] {
+		emit("TRUNCATE")
+	}
+	schema := tbl.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	b.WriteString(" ON ")
+	b.WriteString(schema)
+	b.WriteByte('.')
+	b.WriteString(tbl.Name)
+	b.WriteByte(' ')
+	// A constraint trigger emits its deferrability right after the ON-table name
+	// (ruleutils.c pg_get_triggerdef_worker): `[NOT ]DEFERRABLE INITIALLY
+	// {DEFERRED|IMMEDIATE} `. PG always spells out the full clause even for the
+	// NOT DEFERRABLE INITIALLY IMMEDIATE default. DU-002 slice 327.
+	if trig.IsConstraint {
+		if !trig.Deferrable {
+			b.WriteString("NOT ")
+		}
+		b.WriteString("DEFERRABLE INITIALLY ")
+		if trig.InitDeferred {
+			b.WriteString("DEFERRED ")
+		} else {
+			b.WriteString("IMMEDIATE ")
+		}
+	}
+	// REFERENCING transition tables (ruleutils.c pg_get_triggerdef_worker): the
+	// OLD/NEW statement-level row sets, emitted between the deferrability clause
+	// and FOR EACH ROW as `REFERENCING OLD TABLE AS <o> NEW TABLE AS <n> `.
+	// Either or both names may be present. DU-002 slice 328.
+	if trig.OldTransitionTable != "" || trig.NewTransitionTable != "" {
+		b.WriteString("REFERENCING ")
+		if trig.OldTransitionTable != "" {
+			b.WriteString("OLD TABLE AS ")
+			b.WriteString(pgQuoteIdent(trig.OldTransitionTable))
+			b.WriteByte(' ')
+		}
+		if trig.NewTransitionTable != "" {
+			b.WriteString("NEW TABLE AS ")
+			b.WriteString(pgQuoteIdent(trig.NewTransitionTable))
+			b.WriteByte(' ')
+		}
+	}
+	if trig.ForEachRow {
+		b.WriteString("FOR EACH ROW ")
+	} else {
+		b.WriteString("FOR EACH STATEMENT ")
+	}
+	// A WHEN qualification deparses right after FOR EACH and before EXECUTE
+	// FUNCTION (ruleutils.c pg_get_triggerdef_worker): `WHEN (<condition>) `. PG
+	// builds OLD/NEW range-table entries so the condition's column references
+	// render with lowercased `old.`/`new.` qualifiers; goopg's parser already
+	// lowercases the unquoted qualifier onto the *ColumnRef, and defaultExprToSQL
+	// preserves it (unlike the bare-column catalog.formatExprForAttrdef twin).
+	// get_rule_expr (prettyFlags=0) fully parenthesizes the boolean OpExpr, so a
+	// comparison renders as `(new.b <> old.b)` and the WHEN wrapper adds the outer
+	// pair → `WHEN ((new.b <> old.b))`. DU-002 slice 329.
+	if trig.WhenExpr != nil {
+		b.WriteString("WHEN (")
+		b.WriteString(defaultExprToSQL(trig.WhenExpr))
+		b.WriteString(") ")
+	}
+	fnSchema := trig.FuncSchema
+	if fnSchema == "" {
+		fnSchema = "public"
+	}
+	b.WriteString("EXECUTE FUNCTION ")
+	b.WriteString(fnSchema)
+	b.WriteByte('.')
+	b.WriteString(trig.FuncName)
+	b.WriteByte('(')
+	for i, a := range trig.Args {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('\'')
+		b.WriteString(strings.ReplaceAll(a, "'", "''"))
+		b.WriteByte('\'')
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
+// buildRuleDefString reconstructs the CREATE RULE statement for a DO-NOTHING
+// rewrite rule, byte-identical to PostgreSQL's single-argument pg_get_ruledef
+// (PRETTYFLAG_INDENT) which pg_dump's dumpRule emits verbatim. Both the
+// unconditional form (DU-002 slice 324) and the conditional `WHERE (qual)` form
+// (DU-002 slice 359) are modelled; an action command is never deparsed (see
+// catalog.RuleInfo). PG's pretty-printer lays a conditional rule out as:
+//
+//	CREATE RULE r AS
+//	    ON UPDATE TO public.t
+//	   WHERE (old.a <> new.a) DO INSTEAD NOTHING;
+//
+// i.e. the WHERE clause goes on its own line with a 3-space indent and the DO
+// action trails it on the SAME line; the unconditional form keeps DO on the
+// `ON … TO …` line. The qual text is already the canonical parenthesized form
+// stored by execCreateRule.
+func buildRuleDefString(tbl *catalog.Table, r catalog.RuleInfo) string {
+	schema := tbl.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	var b strings.Builder
+	b.WriteString("CREATE RULE ")
+	b.WriteString(r.Name)
+	b.WriteString(" AS\n    ON ")
+	b.WriteString(strings.ToUpper(r.Event))
+	b.WriteString(" TO ")
+	b.WriteString(schema)
+	b.WriteByte('.')
+	b.WriteString(tbl.Name)
+	if r.Qual != "" {
+		b.WriteString("\n   WHERE ")
+		b.WriteString(r.Qual)
+	}
+	b.WriteString(" DO ")
+	if r.Instead {
+		b.WriteString("INSTEAD ")
+	}
+	b.WriteString("NOTHING;")
+	return b.String()
 }
 
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
@@ -7014,6 +7359,107 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "pg_get_statisticsobjdef":
+		// pg_get_statisticsobjdef(oid) → text — reconstructs CREATE STATISTICS DDL.
+		// pg_dump's dumpStatisticsExt emits the result verbatim (plus a semicolon).
+		// DU-002 slice 314.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if obj, ok := im.StatisticsByOID(targetOID); ok {
+				def := im.BuildStatisticsObjDef(obj)
+				if def == "" {
+					return NullDatum, nil
+				}
+				return NewStringDatum(def), nil
+			}
+		}
+		return NullDatum, nil
+
+	case "pg_get_ruledef", "pg_get_ruledef_ext":
+		// pg_get_ruledef(oid [, pretty bool]) → text — reconstructs the CREATE
+		// RULE statement. pg_dump's dumpRule selects pg_get_ruledef(r.oid) and
+		// emits the result verbatim with a trailing newline. Only unconditional
+		// DO-NOTHING rules are modelled (catalog.RuleInfo); they live in their
+		// owning table's Rules slice (no central rule registry), so scan all
+		// tables for the OID. DU-002 slice 324.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				if tbl.Virtual || tbl.OID == 0 {
+					continue
+				}
+				for _, r := range tbl.Rules {
+					if r.OID == 0 || r.OID != targetOID {
+						continue
+					}
+					return NewStringDatum(buildRuleDefString(tbl, r)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
+	case "pg_get_triggerdef":
+		// pg_get_triggerdef(oid [, pretty bool]) → text — reconstructs the
+		// CREATE TRIGGER statement. pg_dump's getTriggers selects
+		// pg_get_triggerdef(t.oid, false) and emits the result verbatim with a
+		// trailing semicolon. The trigger lives in its owning table's Triggers
+		// slice (no central trigger registry), so scan all tables for the OID.
+		// DU-002 slice 319.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				if tbl.Virtual || tbl.OID == 0 {
+					continue
+				}
+				for _, trig := range tbl.Triggers {
+					if trig.OID == 0 || trig.OID != targetOID {
+						continue
+					}
+					return NewStringDatum(buildTriggerDefString(tbl, trig)), nil
+				}
+			}
+		}
+		return NullDatum, nil
+
 	case "pg_get_constraintdef":
 		// pg_get_constraintdef(oid [, pretty bool]) → text
 		// Reconstructs the constraint definition DDL. M0097-0023.
@@ -7051,9 +7497,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if nc.OID == 0 || nc.OID != targetOID {
 						continue
 					}
-					def := "CHECK ((" + nc.Expr + "))"
+					def := renderCheckPredicate(nc.Expr)
 					if nc.NoInherit {
 						def += " NO INHERIT"
+					}
+					// pg_get_constraintdef_worker appends the shared ` NOT VALID`
+					// tail for convalidated='f'; pg_dump then emits the CHECK as a
+					// separate ALTER TABLE ADD CONSTRAINT. DU-002 slice 308.
+					if nc.NotValid {
+						def += " NOT VALID"
 					}
 					return NewStringDatum(def), nil
 				}
@@ -7072,14 +7524,25 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
 			// getDomainConstraints renders each via pg_get_constraintdef and
-			// dumpDomain emits `CONSTRAINT <name> <def>`; the deparser wraps the
-			// predicate in an extra paren layer (CHECK ((expr))), mirroring the
-			// table-CHECK path above. DU-002 slice 96.
+			// dumpDomain emits `CONSTRAINT <name> <def>`; the deparser fully
+			// parenthesizes every sub-node, so a compound/function-call predicate
+			// dumps `CHECK (((VALUE > 0) AND (VALUE < 100)))` /
+			// `CHECK ((length(VALUE) > 0))` — reproduced by renderDomainCheckPredicate
+			// (the domain twin of the table-CHECK renderer), which also upcases the
+			// `VALUE` placeholder. A `CHECK (VALUE IN (...))` form is stored as a
+			// pre-synthesized, byte-exact ScalarArrayOp deparse that defaultExprToSQL
+			// cannot reproduce, so it keeps the legacy raw double-paren wrap.
+			// DU-002 slice 96 (single comparison) / slice 363 (compound + function).
 			for _, d := range im.AllDomains() {
-				if d.CheckOID == 0 || d.CheckOID != targetOID {
-					continue
+				for _, ck := range d.Checks {
+					if ck.OID == 0 || ck.OID != targetOID {
+						continue
+					}
+					if len(ck.InValues) > 0 {
+						return NewStringDatum("CHECK ((" + ck.Expr + "))"), nil
+					}
+					return NewStringDatum(renderDomainCheckPredicate(ck.Expr)), nil
 				}
-				return NewStringDatum("CHECK ((" + d.CheckExpr + "))"), nil
 			}
 		}
 		return NullDatum, nil
@@ -7587,10 +8050,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExpr(x.Args[0], row, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
-				if rs := ctx.Catalog.Routines(); rs != nil {
-					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r, true)), nil
-					}
+				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
+					return NewStringDatum(buildFunctionArguments(r, true)), nil
 				}
 			}
 		}
@@ -7605,10 +8066,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExpr(x.Args[0], row, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
-				if rs := ctx.Catalog.Routines(); rs != nil {
-					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r, false)), nil
-					}
+				if r := routineOrAggregateArgs(ctx.Catalog, uint32(oidArg.Int)); r != nil {
+					return NewStringDatum(buildFunctionArguments(r, false)), nil
 				}
 			}
 		}
@@ -8053,8 +8512,13 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			escaped := strings.ReplaceAll(s.StringValue(), "\"", "\"\"")
-			return NewStringDatum("\"" + escaped + "\""), nil
+			// PG's quote_ident only adds double quotes when the identifier
+			// would not survive a re-parse unquoted (uppercase, special chars,
+			// leading digit, empty); a plain lowercase identifier is returned
+			// bare. pgQuoteIdent applies that rule — unconditional quoting here
+			// over-quoted e.g. role names in pg_dump's getPolicies TO-clause
+			// resolution. DU-002 slice 330.
+			return NewStringDatum(pgQuoteIdent(s.StringValue())), nil
 		}
 	case "regexp_replace":
 		// regexp_replace(text, pattern, replacement [, flags]) M0097-0011.
@@ -9197,6 +9661,19 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				}
 			}
 			return NewStringDatum(name), nil
+		}
+	case "pg_encoding_to_char":
+		// pg_encoding_to_char(int4) → name: the canonical encoding name for a
+		// pg_enc integer ID, or "" for an out-of-range ID (mirrors
+		// pg_encoding_to_char in encnames.c). pg_dump's dumpConversion calls it on
+		// pg_conversion.conforencoding / contoencoding to render the FOR/TO
+		// encoding-name literals. NULL input → NULL. DU-002 slice 399.
+		if len(x.Args) >= 1 {
+			encArg, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil || encArg.IsNull() {
+				return NullDatum, nil
+			}
+			return NewStringDatum(catalog.EncodingIDToName(int32(encArg.Int))), nil
 		}
 	case "pg_column_size":
 		if len(x.Args) == 1 {
@@ -10573,6 +11050,12 @@ func quoteViewIdent(s string) string {
 			}
 		}
 	}
+	// Mirror PostgreSQL quote_identifier(): a char-class-safe, all-lowercase
+	// identifier must still be quoted when it is a non-UNRESERVED keyword, so a
+	// view column alias named e.g. "select" round-trips as "select".
+	if simple && sqlkeywords.IsReservedForQuoting(s) {
+		simple = false
+	}
 	if simple {
 		return s
 	}
@@ -10847,6 +11330,12 @@ func pgQuoteIdent(s string) string {
 			}
 		}
 	}
+	// Mirror PostgreSQL quote_identifier(): even a char-class-safe, all-lowercase
+	// identifier must be quoted when it is a non-UNRESERVED keyword, so that e.g.
+	// quote_ident('user') yields "user" and quote_ident('select') yields "select".
+	if safe && sqlkeywords.IsReservedForQuoting(s) {
+		safe = false
+	}
 	if safe {
 		return s
 	}
@@ -11034,6 +11523,28 @@ func searchPathSchemas(ctx *Context) []string {
 		}
 	}
 	return out
+}
+
+// regObjectSchemaVisible reports whether schema is visible for reg*-cast
+// qualification purposes (format_operator/format_procedure's own
+// OperatorIsVisible/ProcedureIsVisible check, regproc.c): pg_catalog is
+// always implicitly searched regardless of search_path content, and every
+// other schema must appear in the session's effective search_path. pg_dump
+// always connects with search_path='' (ALWAYS_SECURE_SEARCH_PATH_SQL), so
+// this is what makes dumpOpclass/dumpOpfamily's own
+// amopopr::pg_catalog.regoperator / amproc::pg_catalog.regprocedure casts
+// come back schema-qualified for a user-defined operator/function but bare
+// for a builtin one. DU-002 (M0119-0004) slice 412.
+func regObjectSchemaVisible(ctx *Context, schema string) bool {
+	if schema == "" || schema == "pg_catalog" {
+		return true
+	}
+	for _, s := range searchPathSchemas(ctx) {
+		if s == schema {
+			return true
+		}
+	}
+	return false
 }
 
 func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
@@ -11415,6 +11926,16 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "numeric"
 	case 2249:
 		return "record"
+	case 2281:
+		// internal: pseudo-type for fmgr-internal-only arguments/results (e.g.
+		// trigger, index_am_handler, and — the case this closes — the sole
+		// arg/rettype of a CREATE TRANSFORM WITH FUNCTION clause naming a
+		// built-in like int4recv/prsd_lextype). No typmod, bare name, exactly
+		// like every other pseudo-type case here (2249 record). Real PG
+		// resolves it via the genuine pg_type row (typname='internal');
+		// goopg's format_type has no backing pg_type scan, so it needs an
+		// explicit case like every other OID above.
+		return "internal"
 	case 2950:
 		return "uuid"
 	case 2951:
@@ -11886,6 +12407,32 @@ func parseTZHourMin(s string) (h, m int, ok bool) {
 // passes true (so trailing input args carry their ` DEFAULT <expr>` clause),
 // while pg_get_function_identity_arguments passes false (defaults omitted, since
 // they are not part of the function's ALTER/DROP identity).
+// routineOrAggregateArgs resolves oid to a *catalog.Routine for
+// pg_get_function_arguments/pg_get_function_identity_arguments. A CREATE
+// AGGREGATE registers its identity in catalog.UserAggregate, not
+// catalog.Routines — synthesize a throwaway Routine carrying just its
+// argument types (no names/modes/defaults, matching a simple aggregate's
+// unnamed-parameter signature, e.g. `newavg(integer)`) so the shared
+// arg-list renderer works for both routines and aggregates. DU-002 slice 405.
+func routineOrAggregateArgs(cat catalog.Catalog, oid uint32) *catalog.Routine {
+	if rs := cat.Routines(); rs != nil {
+		if r := rs.LookupByOID(oid); r != nil {
+			return r
+		}
+	}
+	for _, agg := range cat.ListUserAggregates() {
+		if agg.OID != oid {
+			continue
+		}
+		argTypes := make([]catalog.Type, len(agg.ArgTypes))
+		for i, t := range agg.ArgTypes {
+			argTypes[i] = catalog.Type{Name: t}
+		}
+		return &catalog.Routine{ArgTypes: argTypes}
+	}
+	return nil
+}
+
 func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	if len(r.ArgTypes) == 0 {
 		return ""

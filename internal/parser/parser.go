@@ -275,6 +275,311 @@ func grantNonTableClass(word string) bool {
 	return false
 }
 
+// buildTypeACLChange parses the token run of a GRANT/REVOKE … ON TYPE|DOMAIN …
+// statement into a TypeACLChange. toks is every token after the GRANT/REVOKE
+// keyword with the trailing ';' already excluded. It mirrors the server-side
+// string recorder (grant_ddl.go) — privilege list before ON, type names between
+// the TYPE/DOMAIN keyword and TO|FROM, and the role list after TO|FROM, with a
+// trailing WITH GRANT OPTION / GRANTED BY / CASCADE / RESTRICT clause stripped.
+// Returns nil when any of the three lists is empty (an unparseable form the
+// caller leaves as a successful no-op). M0119-0004-ACLHEAP.
+func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+2 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 2 // skip the ON and the TYPE/DOMAIN keyword
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			// WITH GRANT OPTION — record the flag and end the role list.
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	tac := &TypeACLChange{
+		Revoke:          revoke,
+		IsDomain:        isDomain,
+		Privileges:      splitTokPrivileges(toks[:onIdx]),
+		TypeNames:       splitTokObjectNames(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(tac.Privileges) == 0 || len(tac.TypeNames) == 0 || len(tac.Grantees) == 0 {
+		return nil
+	}
+	return tac
+}
+
+// grantHasColumnList reports whether the GRANT/REVOKE token run carries a
+// parenthesised column list BEFORE the ON keyword — the signature of a
+// column-level grant (`GRANT SELECT (a, b) ON TABLE t …`). A function grant's
+// parentheses follow ON (`GRANT EXECUTE ON FUNCTION f(int) …`), so depth/position
+// matters. toks is every token after the GRANT/REVOKE keyword. M0119-0004-ACLHEAP.
+func grantHasColumnList(toks []Token) bool {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 {
+		onIdx = len(toks)
+	}
+	for i := 0; i < onIdx; i++ {
+		if toks[i].Kind == TokenSymbol && toks[i].Value == "(" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildAttrACLChange parses the token run of a column-level GRANT/REVOKE —
+// `GRANT <priv>(<cols>) ON [TABLE] <names> TO|FROM <roles> [WITH GRANT OPTION]` —
+// into an AttrACLChange. toks is every token after the GRANT/REVOKE keyword with
+// the trailing ';' excluded. Returns nil when any required list is empty (an
+// unparseable form the caller leaves as a successful no-op). M0119-0004-ACLHEAP.
+func buildAttrACLChange(revoke bool, toks []Token) *AttrACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 {
+		return nil
+	}
+	nameStart := onIdx + 1
+	if nameStart < len(toks) && strings.EqualFold(toks[nameStart].Value, "table") {
+		nameStart++ // skip the optional TABLE keyword
+	}
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	aac := &AttrACLChange{
+		Revoke:          revoke,
+		Privileges:      splitTokColumnPrivileges(toks[:onIdx]),
+		TableNames:      splitTokObjectNames(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(aac.Privileges) == 0 || len(aac.TableNames) == 0 || len(aac.Grantees) == 0 {
+		return nil
+	}
+	return aac
+}
+
+// splitTokRunsParenAware splits a token slice on top-level (paren-depth-0) ","
+// symbols, dropping empty runs. Unlike splitTokRuns it ignores commas nested
+// inside parentheses, so `SELECT (a, b), UPDATE (c)` splits into two privilege
+// runs rather than four. M0119-0004-ACLHEAP.
+func splitTokRunsParenAware(toks []Token) [][]Token {
+	var out [][]Token
+	start := 0
+	depth := 0
+	for i := 0; i < len(toks); i++ {
+		if toks[i].Kind == TokenSymbol {
+			switch toks[i].Value {
+			case "(":
+				depth++
+			case ")":
+				if depth > 0 {
+					depth--
+				}
+			case ",":
+				if depth == 0 {
+					if i > start {
+						out = append(out, toks[start:i])
+					}
+					start = i + 1
+				}
+			}
+		}
+	}
+	if start < len(toks) {
+		out = append(out, toks[start:])
+	}
+	return out
+}
+
+// splitTokColumnPrivileges parses the privilege section of a column GRANT
+// (everything before ON) into a slice of ColumnPrivilege. Each top-level run is
+// `PRIV ( col [, col …] )`; a run with no column list is skipped (a whole-table
+// privilege never reaches this column path). M0119-0004-ACLHEAP.
+func splitTokColumnPrivileges(toks []Token) []ColumnPrivilege {
+	var out []ColumnPrivilege
+	for _, run := range splitTokRunsParenAware(toks) {
+		lp := -1
+		for i, tk := range run {
+			if tk.Kind == TokenSymbol && tk.Value == "(" {
+				lp = i
+				break
+			}
+		}
+		if lp <= 0 {
+			continue // no privilege keyword or no column list
+		}
+		privParts := make([]string, 0, lp)
+		for _, tk := range run[:lp] {
+			privParts = append(privParts, strings.ToUpper(tk.Value))
+		}
+		priv := strings.Join(privParts, " ")
+		rp := len(run)
+		for i := lp + 1; i < len(run); i++ {
+			if run[i].Kind == TokenSymbol && run[i].Value == ")" {
+				rp = i
+				break
+			}
+		}
+		cols := splitTokColumnNames(run[lp+1 : rp])
+		if priv == "" || len(cols) == 0 {
+			continue
+		}
+		out = append(out, ColumnPrivilege{Privilege: priv, Columns: cols})
+	}
+	return out
+}
+
+// splitTokColumnNames renders each comma-separated column-name run inside a
+// column list as an unquoted identifier. M0119-0004-ACLHEAP.
+func splitTokColumnNames(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		if len(run) == 0 {
+			continue
+		}
+		name := strings.Trim(run[len(run)-1].Value, `"`)
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// tokIndexOf returns the index of the first token at or after `from` whose value
+// equals kw (case-insensitive), or -1.
+func tokIndexOf(toks []Token, from int, kw string) int {
+	for i := from; i < len(toks); i++ {
+		if strings.EqualFold(toks[i].Value, kw) {
+			return i
+		}
+	}
+	return -1
+}
+
+// splitTokRuns splits a token slice on top-level "," symbols, dropping empty runs.
+func splitTokRuns(toks []Token) [][]Token {
+	var out [][]Token
+	start := 0
+	for i := 0; i < len(toks); i++ {
+		if toks[i].Kind == TokenSymbol && toks[i].Value == "," {
+			if i > start {
+				out = append(out, toks[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(toks) {
+		out = append(out, toks[start:])
+	}
+	return out
+}
+
+// splitTokPrivileges renders each comma-separated privilege run as an upper-cased
+// keyword string (e.g. "USAGE", "ALL", "ALL PRIVILEGES"); the executor expands
+// ALL / ALL PRIVILEGES to the per-class default set.
+func splitTokPrivileges(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		parts := make([]string, 0, len(run))
+		for _, tk := range run {
+			parts = append(parts, strings.ToUpper(tk.Value))
+		}
+		if p := strings.Join(parts, " "); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// splitTokObjectNames renders each comma-separated object-name run as an
+// ObjectName, honouring a schema-qualified `schema.name`.
+func splitTokObjectNames(toks []Token) []ObjectName {
+	var out []ObjectName
+	for _, run := range splitTokRuns(toks) {
+		out = append(out, objectNameFromTokens(run))
+	}
+	return out
+}
+
+// objectNameFromTokens builds an ObjectName from a single object-name token run,
+// splitting on a "." symbol into schema/name and stripping any quoting.
+func objectNameFromTokens(run []Token) ObjectName {
+	for i, tk := range run {
+		if tk.Kind == TokenSymbol && tk.Value == "." && i > 0 && i+1 < len(run) {
+			return ObjectName{
+				Schema: strings.Trim(run[i-1].Value, `"`),
+				Name:   strings.Trim(run[i+1].Value, `"`),
+			}
+		}
+	}
+	if len(run) > 0 {
+		return ObjectName{Name: strings.Trim(run[len(run)-1].Value, `"`)}
+	}
+	return ObjectName{}
+}
+
+// splitTokRoles renders each comma-separated role run as a single role string,
+// stripping quoting. An unquoted PUBLIC arrives lower-cased from the lexer; the
+// executor/catalog folds it to the reserved PUBLIC pseudo-role case-insensitively.
+func splitTokRoles(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		parts := make([]string, 0, len(run))
+		for _, tk := range run {
+			parts = append(parts, strings.Trim(tk.Value, `"`))
+		}
+		if r := strings.Join(parts, ""); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // errAtCur builds a SyntaxError pinned at the current token. The
 // message echoes the token text, matching upstream's "at or near".
 func (p *parser) errAtCur(msg string) error {
@@ -488,6 +793,12 @@ identLedStatement:
 			// is TABLE, so a bare `ON <ident>` is a table grant.
 			databaseACL := false
 			tableACL := ""
+			// typeClass becomes "type"/"domain" when the object class is ON
+			// TYPE|DOMAIN. Unlike the virtual classes, pg_type is heap-backed, so the
+			// full clause is captured (toks) and parsed into CompatNoopStmt.TypeACL
+			// for the executor to apply (M0119-0004-ACLHEAP).
+			typeClass := ""
+			var toks []Token
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
@@ -500,6 +811,12 @@ identLedStatement:
 					case strings.EqualFold(next.Value, "table"):
 						// `ON TABLE <name>` — the name follows the TABLE keyword.
 						tableACL = grantObjectName(p.peek(2), p.peek(3), p.peek(4))
+					case strings.EqualFold(next.Value, "type"):
+						// `ON TYPE <names>` — heap-backed pg_type ACL (captured below).
+						typeClass = "type"
+					case strings.EqualFold(next.Value, "domain"):
+						// `ON DOMAIN <names>` — also a pg_type row (typtype='d').
+						typeClass = "domain"
 					case grantNonTableClass(next.Value):
 						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
 					default:
@@ -507,9 +824,23 @@ identLedStatement:
 						tableACL = grantObjectName(next, p.peek(2), p.peek(3))
 					}
 				}
+				toks = append(toks, p.cur())
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}, nil
+			ns := &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}
+			if typeClass != "" {
+				ns.TypeACL = buildTypeACLChange(strings.EqualFold(t.Value, "revoke"), typeClass == "domain", toks)
+			} else if grantHasColumnList(toks) {
+				// A column-level GRANT/REVOKE targets pg_attribute.attacl (heap-backed),
+				// not the whole-relation pg_class.relacl. Capture the parsed clause for
+				// execAttrACLChange and clear TableACL so the relacl-xmax serialization
+				// machinery (intra-grant-inplace) does not fire for a column grant.
+				if aac := buildAttrACLChange(strings.EqualFold(t.Value, "revoke"), toks); aac != nil {
+					ns.AttrACL = aac
+					ns.TableACL = ""
+				}
+			}
+			return ns, nil
 		case "comment":
 			p.advance() // consume "comment" token
 			// COMMENT ON {TABLE|INDEX|COLUMN|CONSTRAINT} … IS 'text'|NULL
@@ -1327,6 +1658,42 @@ func (p *parser) parseOperatorName() (ObjectName, error) {
 	return ObjectName{}, p.errSyntaxAtCur()
 }
 
+// parseOperatorRefName parses an operator reference as used in a CREATE
+// OPERATOR statement's COMMUTATOR = / NEGATOR = clause. PG's own pg_dump
+// always emits the schema-qualified `OPERATOR(schema.op)` form (dumpOpr's
+// getFormattedOperatorName, pg_dump.c), but hand-written SQL may also use a
+// bare (optionally schema-qualified) operator symbol, so both are accepted
+// here — the latter simply falls through to parseOperatorName. DU-002
+// slice 407.
+func (p *parser) parseOperatorRefName() (ObjectName, error) {
+	if t := p.cur(); t.Kind == TokenIdent && strings.EqualFold(t.Value, "operator") &&
+		p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+		p.advance() // OPERATOR
+		p.advance() // (
+		schema := ""
+		if p.cur().Kind == TokenIdent && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "." {
+			schema = identText(p.cur())
+			p.advance() // schema name
+			p.advance() // .
+		}
+		pos := p.cur().Pos
+		opName := ""
+		for p.cur().Kind == TokenOperator {
+			opName += p.cur().Value
+			p.advance()
+		}
+		if opName == "" && p.cur().Kind != TokenSymbol {
+			opName = p.cur().Value
+			p.advance()
+		}
+		if opName == "" || !p.acceptSymbol(")") {
+			return ObjectName{}, p.errSyntaxAtCur()
+		}
+		return ObjectName{pos: pos, Schema: schema, Name: opName}, nil
+	}
+	return p.parseOperatorName()
+}
+
 // parseObjectName parses [schema.]name where each part is an
 // identifier (possibly quoted).
 func (p *parser) parseObjectName() (ObjectName, error) {
@@ -1441,16 +1808,21 @@ func (p *parser) parseSet() (Stmt, error) {
 		}
 		// otherwise fall through: SET SESSION TRANSACTION ... handled below
 	}
-	// SET ROLE rolename — accept as no-op. goopg does not implement role-based
-	// access control; SET ROLE is accepted silently. M0097-0071.
+	// SET ROLE rolename — capture the role name (or DEFAULT) in s.Value/
+	// s.Default so the executor can update the session's non-superuser role
+	// tracking (mirrors the SET SESSION AUTHORIZATION handling above).
+	// M0097-0071 originally discarded the role name entirely; M0119-0004
+	// restores it since goopg does enforce SET-ROLE-scoped privilege checks
+	// (e.g. TRUNCATE, M0118-0008) via connTx.NonSuperuserRole.
 	if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "role" {
 		p.advance() // consume "role"
-		// consume the role name (or DEFAULT)
-		if !p.acceptKeyword(KwDefault) {
-			_, _ = p.parseIdent()
-		}
 		s.Name = "role"
-		s.Default = true
+		if p.acceptKeyword(KwDefault) {
+			s.Default = true
+		} else {
+			roleTok, _ := p.parseIdent()
+			s.Value = roleTok.Value
+		}
 		return s, nil
 	}
 	// SET [LOCAL] TRANSACTION <mode> — intercept before generic GUC path.
@@ -1482,6 +1854,36 @@ func (p *parser) parseSet() (Stmt, error) {
 		}
 	setTxDone:
 		return st, nil
+	}
+	// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }.
+	// "constraints", "deferred" and "immediate" are unreserved keyword idents
+	// (matched with acceptIdentKeyword, the same way the INITIALLY DEFERRED
+	// constraint trailer is parsed); ALL is the reserved KwAll. 0119-0004.
+	if p.acceptIdentKeyword("constraints") {
+		sc := &SetConstraintsStmt{pos: t.Pos}
+		if p.acceptKeyword(KwAll) {
+			sc.All = true
+		} else {
+			for {
+				nm, err := p.parseQualifiedConstraintName()
+				if err != nil {
+					return nil, err
+				}
+				sc.Names = append(sc.Names, nm)
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+		}
+		switch {
+		case p.acceptIdentKeyword("deferred"):
+			sc.Deferred = true
+		case p.acceptIdentKeyword("immediate"):
+			sc.Deferred = false
+		default:
+			return nil, p.errAtCur("expected DEFERRED or IMMEDIATE after SET CONSTRAINTS")
+		}
+		return sc, nil
 	}
 	name, err := p.parseGUCName()
 	if err != nil {
@@ -1939,6 +2341,26 @@ func (p *parser) parseGUCName() (string, error) {
 	return name, nil
 }
 
+// parseQualifiedConstraintName parses one constraint name for SET CONSTRAINTS.
+// PG accepts a schema-qualified name (schema.constraint); goopg matches the
+// queued deferred checks by the bare constraint name, so any leading schema
+// qualifier is parsed and discarded (the final component is returned). 0119-0004.
+func (p *parser) parseQualifiedConstraintName() (string, error) {
+	tok, err := p.parseIdent()
+	if err != nil {
+		return "", err
+	}
+	name := identText(tok)
+	for p.acceptSymbol(".") {
+		next, err := p.parseIdent()
+		if err != nil {
+			return "", err
+		}
+		name = identText(next)
+	}
+	return name, nil
+}
+
 // parseSetValue accepts an int literal, string literal, or identifier.
 // Multiple comma-separated values are concatenated with commas (rare
 // in pgbench but accepted upstream for things like
@@ -2187,6 +2609,69 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptKeyword(KwTrigger):
+		// COMMENT ON TRIGGER <name> ON [schema.]table IS '...'. Triggers live in
+		// pg_trigger (classoid 2620); pg_dump's dumpTrigger re-emits
+		// `COMMENT ON TRIGGER <name> ON <table> IS '...'`. The shape mirrors
+		// COMMENT ON CONSTRAINT — a bare trigger name followed by ON <table>.
+		// DU-002 slice 370.
+		cs.ObjKind = "trigger"
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, true, p.errAtCur("expected trigger name")
+		}
+		cs.SubName = tok.Value
+		p.advance()
+		if !p.acceptKeyword(KwOn) {
+			return nil, true, p.errAtCur("expected ON after trigger name in COMMENT ON TRIGGER")
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("policy"):
+		// COMMENT ON POLICY <name> ON [schema.]table IS '...'. Policies live in
+		// pg_policy (classoid 3256); pg_dump's dumpPolicy re-emits
+		// `COMMENT ON POLICY <name> ON <table> IS '...'`. The shape mirrors
+		// COMMENT ON TRIGGER/CONSTRAINT — a bare policy name followed by ON
+		// <table>. DU-002 slice 371.
+		cs.ObjKind = "policy"
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, true, p.errAtCur("expected policy name")
+		}
+		cs.SubName = tok.Value
+		p.advance()
+		if !p.acceptKeyword(KwOn) {
+			return nil, true, p.errAtCur("expected ON after policy name in COMMENT ON POLICY")
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("rule"):
+		// COMMENT ON RULE <name> ON [schema.]table IS '...'. Rules live in
+		// pg_rewrite (classoid 2618); pg_dump's dumpRule re-emits
+		// `COMMENT ON RULE <name> ON <table> IS '...'`. The shape mirrors
+		// COMMENT ON TRIGGER/POLICY — a bare rule name followed by ON <table>.
+		// DU-002 slice 372.
+		cs.ObjKind = "rule"
+		tok := p.cur()
+		if tok.Kind != TokenIdent && tok.Kind != TokenKeyword {
+			return nil, true, p.errAtCur("expected rule name")
+		}
+		cs.SubName = tok.Value
+		p.advance()
+		if !p.acceptKeyword(KwOn) {
+			return nil, true, p.errAtCur("expected ON after rule name in COMMENT ON RULE")
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptIdentKeyword("statistics"):
 		// COMMENT ON STATISTICS name IS '...'. M0097-0023.
 		cs.ObjKind = "statistics"
@@ -2253,6 +2738,75 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("collation"):
+		// COMMENT ON COLLATION [schema.]name IS '...'. Collations live in
+		// pg_collation (classoid 3456); pg_dump's dumpCollation re-emits
+		// `COMMENT ON COLLATION <schema>.<name> IS '...'` keyed on the collation's
+		// catalogId (tableoid=pg_collation=3456) and objsubid 0. A user collation
+		// lives in a user schema, so parse a schema-qualifiable object name.
+		// DU-002 slice 390.
+		cs.ObjKind = "collation"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("server"):
+		// COMMENT ON SERVER <name> IS '...'. Foreign servers live in
+		// pg_foreign_server (classoid 1417); pg_dump's dumpForeignServer re-emits
+		// `COMMENT ON SERVER <name> IS '...'`. A foreign server is a top-level
+		// object (no schema), so parse a bare name. DU-002 slice 386.
+		cs.ObjKind = "server"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptKeyword(KwForeign):
+		// COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'. Foreign-data wrappers
+		// live in pg_foreign_data_wrapper (classoid 2328); pg_dump's
+		// dumpForeignDataWrapper re-emits `COMMENT ON FOREIGN DATA WRAPPER <name>
+		// IS '...'`. FOREIGN is a reserved keyword (KwForeign); DATA and WRAPPER
+		// are unreserved ident-keywords. An FDW is a top-level object (no schema),
+		// so parse a bare name. DU-002 slice 387.
+		if !p.acceptIdentKeyword("data") || !p.acceptIdentKeyword("wrapper") {
+			return nil, true, p.errAtCur("expected DATA WRAPPER after FOREIGN in COMMENT ON")
+		}
+		cs.ObjKind = "foreign data wrapper"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("extension"):
+		// COMMENT ON EXTENSION <name> IS '...'. Extensions live in pg_extension
+		// (classoid 3079); pg_dump's dumpExtension re-emits `COMMENT ON EXTENSION
+		// <name> IS '...'`. EXTENSION is an unreserved ident-keyword. An extension
+		// is a top-level object (no schema), so parse a bare name. DU-002 slice 388.
+		cs.ObjKind = "extension"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("cast"):
+		// COMMENT ON CAST (source AS target) IS '...'. Casts live in pg_cast
+		// (classoid 2605); pg_dump's dumpCast keys the comment lookup on the cast's
+		// catalogId (tableoid=pg_cast=2605) and objsubid 0, then re-emits
+		// `COMMENT ON CAST (<source> AS <target>) IS '...'`. The identity is the
+		// (source, target) type pair, not a name — parse `(src AS tgt)` with the
+		// same helper CREATE/DROP CAST uses. "cast" is an unreserved ident-keyword.
+		// DU-002 slice 396 (follows the CREATE CAST object family, slice 395).
+		cs.ObjKind = "cast"
+		if !p.acceptSymbol("(") {
+			return nil, true, p.errAtCur("expected ( after CAST in COMMENT ON")
+		}
+		cs.CastSource = p.parseCastTypeName()
+		_ = p.acceptKeyword(KwAs)
+		cs.CastTarget = p.parseCastTypeName()
+		if !p.acceptSymbol(")") {
+			return nil, true, p.errAtCur("expected ) after cast types in COMMENT ON CAST")
+		}
 	case p.acceptKeyword(KwFunction):
 		// COMMENT ON FUNCTION [schema.]name([argtypes]) IS '...'. Functions live
 		// in pg_proc (classoid 1255); pg_dump re-emits `COMMENT ON FUNCTION …`

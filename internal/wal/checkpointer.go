@@ -135,6 +135,23 @@ type CheckpointerConfig struct {
 	// are logged as warnings and do not fail the checkpoint. G1.
 	TruncateCLOGFn func() error
 
+	// FlushCLOGFn, when non-nil, is called during the dirty-page flush phase
+	// of every checkpoint (timed, volume-triggered, or on-demand) — in the
+	// same phase as, and before, the primary buffer-pool flush's redo LSN is
+	// sampled — to drain the CLOG buffer pool's dirty pages. This bounds how
+	// long an async commit's deferred CLOG write-back
+	// (mvcc.CLog.setStatusWithLSN, M0117-0007 Part B continuation) can stay
+	// unflushed: without it, a CLOG page dirtied by synchronous_commit=off
+	// commits would rely solely on a later synchronous commit's group flush
+	// or LRU eviction, unbounded on an all-async workload. Wired to
+	// mvcc.CLog.FlushAll. Unlike PostCheckpointFn/TruncateCLOGFn, an error
+	// here fails the checkpoint (same treatment as the primary flush): a
+	// checkpoint whose redo LSN advances past commits whose CLOG state
+	// failed to flush would leave crash recovery unable to reconstruct that
+	// state (recovery only replays WAL from the checkpoint's redo LSN
+	// onward).
+	FlushCLOGFn func() error
+
 	// PGCompatCheckpoints, when true, writes an 88-byte PG18 CheckPoint
 	// struct (EncodeCheckpointCompat) so PG standbys can parse the
 	// record. When false (default), the legacy 1-byte RecordKindCheckpoint
@@ -386,6 +403,15 @@ func (c *Checkpointer) runCheckpoint(ctx context.Context, spread, shutdown bool)
 	flushStart := time.Now()
 	if err := c.flushDirty(pacer); err != nil {
 		return fmt.Errorf("flush dirty pages: %w", err)
+	}
+	// M0117-0007 Part B continuation: drain the CLOG buffer pool's dirty
+	// pages in the same phase as the primary flush above, before the redo
+	// LSN below is sampled — see FlushCLOGFn's doc comment for why an error
+	// here fails the checkpoint rather than being logged and swallowed.
+	if c.cfg.FlushCLOGFn != nil {
+		if err := c.cfg.FlushCLOGFn(); err != nil {
+			return fmt.Errorf("flush clog dirty pages: %w", err)
+		}
 	}
 	// M0089-0001: after pwrite'ing every dirty page, fdatasync the
 	// data files so the bytes are durable before we advance the

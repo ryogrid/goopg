@@ -382,6 +382,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/goopg/goopg/internal/testutil/cluster"
 	"github.com/goopg/goopg/internal/testutil/util"
 )
@@ -669,6 +671,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// named form. Fix threads the per-constraint flag through the named path.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.chk3 (z integer, CONSTRAINT chk3_pos CHECK (z > 0) NO INHERIT)"); err != nil {
 		t.Fatalf("create table chk3: %v", err)
+	}
+	// Slice 362: a COMPOUND or function-call table-level CHECK predicate must
+	// round-trip with PostgreSQL's per-node parenthesization, not goopg's legacy
+	// token-text wrap. goopg stores a CHECK body as token-reconstructed raw text
+	// (parser.parseCheckExpr); the dump path wrapped it as `CHECK ((<raw>))`, which
+	// is byte-correct ONLY for a single bare comparison. For a boolean combination
+	// PG re-deparses each operand with its own parens (`a > 0 AND b > 0` →
+	// `CHECK (((a > 0) AND (b > 0)))`), and a function call must lose the spaces the
+	// token join inserts around parentheses (`length(name) > 0` →
+	// `CHECK ((length(name) > 0))`). renderCheckPredicate (operators_ddl.go) now
+	// re-parses the raw text and deparses it through defaultExprToSQL — the same
+	// fully-parenthesizing renderer the index-predicate / expression-index /
+	// partition-key paths use — reproducing PG's bytes; the single outer paren layer
+	// comes from the `CHECK (%s)` wrapper (defaultExprToSQL already parenthesizes the
+	// top-level OpExpr/BoolExpr). The single-comparison slices 127–129 are unchanged
+	// (`a < b` still deparses to `(a < b)` → `CHECK ((a < b))`). Auto-naming already
+	// matches PG (autoCheckName counts distinct columns via ParseExpr): the
+	// two-column `chkand`/`chkor` get the table-only name, the one-column `chkfn` the
+	// column-qualified name. Each on its own table so existing CHECK asserts are
+	// untouched. Verified byte-identical to real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chkand (a integer, b integer, CHECK (a > 0 AND b > 0))"); err != nil {
+		t.Fatalf("create table chkand: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chkor (a integer, b integer, CHECK (a < 0 OR b > 10))"); err != nil {
+		t.Fatalf("create table chkor: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chkfn (name text, CHECK (length(name) > 0))"); err != nil {
+		t.Fatalf("create table chkfn: %v", err)
 	}
 
 	// Slice 54: a non-empty reloptions (`WITH (fillfactor=70)`) must surface in
@@ -2480,6 +2510,39 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))"); err != nil {
 		t.Fatalf("create nested-arithmetic expression index: %v", err)
 	}
+	// Slice 360: a BARE FUNCTION-CALL expression-index key (`lower(name)`,
+	// `lpad(name, 5)`) must dump WITHOUT the extra wrapping parens that slice 299's
+	// arithmetic key carries. PG's pg_get_indexdef_worker (ruleutils.c) parenthesizes
+	// an expression key column with `(%s)` UNLESS the top node is a bare function
+	// call (`IsA(indexkey, FuncExpr) && funcformat == COERCE_EXPLICIT_CALL`), in
+	// which case it prints the deparsed call as-is. Real pg_dump 18.3 emits
+	// `USING btree (lower(name))` / `(lpad(name, 5))` — one paren level — whereas the
+	// nested-arithmetic key (slice 299) keeps `((((qty + id) * mgr_id)))`. Before this
+	// slice goopg's catalog.BuildIndexDef unconditionally wrapped every expression
+	// key, so a function-call index dumped the byte-divergent `((lower(name)))` /
+	// `((lpad(name, 5)))` (one extra paren pair) — semantically harmless but not a
+	// byte-identical round-trip. The fix (catalog.indexKeyIsBareFuncCall, keyed on
+	// the parsed ColExprs AST) suppresses the wrap for a plain FuncCall while
+	// preserving it for every other expression shape. Verified byte-identical vs
+	// real pg_dump 18.3 (reference /tmp/du_ref_pg).
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_lower_idx ON public.foo (lower(name))"); err != nil {
+		t.Fatalf("create lower() expression index: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_lpad_idx ON public.foo (lpad(name, 5))"); err != nil {
+		t.Fatalf("create lpad() expression index: %v", err)
+	}
+	// Slice 361: a `CREATE INDEX … USING hash` index must dump `USING hash`, not
+	// the B-tree substrate's `USING btree`. goopg has no native hash access
+	// method, so a hash index routes through createBTreeIndex (catalog.Index
+	// .Method stays "btree") and only DeclaredHash remembers the declared method
+	// (design 0118-0099). pg_get_indexdef_worker (ruleutils.c) prints `USING %s`
+	// from pg_am.amname, so real pg_dump 18.3 emits `USING hash (qty)` (verified
+	// byte-identical against a throwaway PG 18.3 cluster). Before this slice
+	// BuildIndexDef rendered the stored "btree", emitting the divergent
+	// `USING btree (qty)`. The fix surfaces idx.DeclaredHash in BuildIndexDef.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_qty_hash_idx ON public.foo USING hash (qty)"); err != nil {
+		t.Fatalf("create hash index: %v", err)
+	}
 	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
 		t.Fatalf("create DESC index: %v", err)
@@ -2590,6 +2653,50 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// silent fidelity loss. applyViewColumnAliases now splices the names in.
 	if err := runSQLSimple(t, c, "CREATE VIEW public.foo_rview (col_a, col_b) AS SELECT id, name FROM public.foo"); err != nil {
 		t.Fatalf("create view foo_rview: %v", err)
+	}
+
+	// Slice 365: a VIEW created `WITH [CASCADED|LOCAL] CHECK OPTION` round-trips
+	// the clause. PostgreSQL stores the option as the `check_option=<mode>`
+	// pg_class.reloption; pg_dump's getTables strips that element from the
+	// reloptions array (array_remove, already handled, DU-002 slice 5) and instead
+	// re-emits the `\n  WITH <MODE> CHECK OPTION` suffix after the view body
+	// (pg_dump.c dumpTableSchema). goopg captures the mode on
+	// catalog.Table.CheckOption and surfaces it through the reloptions cell so the
+	// pg_dump checkoption CASE (`'check_option=cascaded' = ANY (c.reloptions)`)
+	// derives CASCADED/LOCAL. goopg does not yet ENFORCE the option on
+	// INSERT/UPDATE through the view — catalog/dump fidelity only. `vchk` carries
+	// the bare (→ CASCADED) form, `vchk_local` the LOCAL form, both on their own
+	// view so the asserts are isolated from foo_view.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vchk AS SELECT id, name FROM public.foo WHERE qty > 0 WITH CHECK OPTION"); err != nil {
+		t.Fatalf("create view vchk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vchk_local AS SELECT id, name FROM public.foo WHERE qty > 0 WITH LOCAL CHECK OPTION"); err != nil {
+		t.Fatalf("create view vchk_local: %v", err)
+	}
+
+	// Slice 366: a VIEW created `WITH (security_barrier=true)` round-trips the
+	// reloption. PostgreSQL stores it as the `security_barrier=true`
+	// pg_class.reloption; unlike check_option, pg_dump's getTables KEEPS it in the
+	// reloptions array (array_remove strips only check_option=*) and re-emits it
+	// via appendReloptionsArray as the `WITH (security_barrier='true')` clause
+	// after the view name (pg_dump.c dumpTableSchema). goopg captures the flag on
+	// catalog.Table.SecurityBarrier and surfaces it through the reloptions cell.
+	// `vsecbar` is on its own view so the assert is isolated from foo_view.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vsecbar WITH (security_barrier=true) AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
+		t.Fatalf("create view vsecbar: %v", err)
+	}
+
+	// Slice 367: a VIEW created `WITH (security_invoker=true)` round-trips the
+	// reloption, the sibling of security_barrier. PostgreSQL stores it as the
+	// `security_invoker=true` pg_class.reloption; like security_barrier, pg_dump's
+	// getTables KEEPS it in the reloptions array (array_remove strips only
+	// check_option=*) and re-emits it via appendReloptionsArray as the
+	// `WITH (security_invoker='true')` clause after the view name (pg_dump.c
+	// dumpTableSchema). goopg captures the flag on catalog.Table.SecurityInvoker
+	// and surfaces it through the reloptions cell. `vsecinv` is on its own view so
+	// the assert is isolated.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.vsecinv WITH (security_invoker=true) AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
+		t.Fatalf("create view vsecinv: %v", err)
 	}
 
 	// Slice 59: a GENERATED ALWAYS AS (expr) STORED column must round-trip with
@@ -2711,6 +2818,1152 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.owned_seq OWNED BY owner_tbl.id"); err != nil {
 		t.Fatalf("create sequence owned_seq: %v", err)
 	}
+	// Slice 304: the SCHEMA-QUALIFIED 3-part OWNED BY form. Slice 118 above writes
+	// the unqualified `OWNED BY owner_tbl.id`; the equally-valid PG form
+	// `OWNED BY public.owner_tbl.id` (schema.table.column — exactly what pg_dump
+	// itself re-emits) previously errored at validateSeqOwnedBy with
+	// `sequence cannot be owned by relation "public"`: the owner string was split
+	// on the FIRST dot, so table="public" / column="owner_tbl.id". The column is
+	// the LAST dotted component (now split via strings.LastIndex, mirroring
+	// InMemory.dependVirtualRows), so the table resolves to public.owner_tbl. The
+	// dump must round-trip this byte-identically to the unqualified case.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label"); err != nil {
+		t.Fatalf("create sequence qowned_seq (schema-qualified OWNED BY): %v", err)
+	}
+
+	// Slice 305: a table's REPLICA IDENTITY must round-trip. pg_dump emits an
+	// `ALTER TABLE ONLY <t> REPLICA IDENTITY {FULL|NOTHING}` clause whenever
+	// pg_class.relreplident != 'd' (REPLICA_IDENTITY_DEFAULT) for a regular,
+	// partitioned, or matview relation (pg_dump.c:17781). goopg HARDCODED
+	// relreplident to 'n' (REPLICA_IDENTITY_NOTHING) in the heap pg_class row
+	// builder pg_dump reads (buildUserPGClassRow), so EVERY dumped table got a
+	// spurious `... REPLICA IDENTITY NOTHING;` — a silent, pervasive divergence
+	// from real pg_dump (which emits nothing for a default-identity table). The
+	// fix defaults relreplident to 'd' and threads an actual
+	// `ALTER TABLE ... REPLICA IDENTITY {DEFAULT|FULL|NOTHING}` through the
+	// parser → catalog.Table.ReplicaIdentity → heap re-sync, so a non-default
+	// setting round-trips and a default table emits nothing. goopg has no
+	// logical replication; this is dump-fidelity only (like SET STORAGE). The
+	// USING INDEX form is covered by slice 306 below.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_full (id integer PRIMARY KEY, payload text)"); err != nil {
+		t.Fatalf("create table ri_full: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_full REPLICA IDENTITY FULL"); err != nil {
+		t.Fatalf("alter table ri_full replica identity full: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_nothing (id integer PRIMARY KEY, payload text)"); err != nil {
+		t.Fatalf("create table ri_nothing: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_nothing REPLICA IDENTITY NOTHING"); err != nil {
+		t.Fatalf("alter table ri_nothing replica identity nothing: %v", err)
+	}
+
+	// Slice 306: REPLICA IDENTITY USING INDEX must round-trip. Unlike the
+	// FULL/NOTHING forms (which pg_dump emits at TABLE-dump time when
+	// relreplident != 'd'), pg_dump emits the USING INDEX clause at INDEX-dump
+	// time, keyed on pg_index.indisreplident for the chosen index (pg_dump.c
+	// dumpIndex:18186) — `ALTER TABLE ONLY public.ri_index REPLICA IDENTITY
+	// USING INDEX ri_uidx;`. goopg previously rejected the USING INDEX form with
+	// 0A000; it now (a) validates the index per PG's check_replica_identity
+	// (unique, immediate, non-expression, non-partial, NOT NULL key columns),
+	// (b) sets the table's relreplident to 'i', and (c) marks the chosen index's
+	// indisreplident (clearing any prior one) in BOTH the virtual pg_index
+	// builder pg_dump reads and the pg_index heap row (restart durability). The
+	// referenced index must be on a NOT NULL column and UNIQUE.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_index (id integer NOT NULL, payload text)"); err != nil {
+		t.Fatalf("create table ri_index: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE UNIQUE INDEX ri_uidx ON public.ri_index (id)"); err != nil {
+		t.Fatalf("create unique index ri_uidx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_index REPLICA IDENTITY USING INDEX ri_uidx"); err != nil {
+		t.Fatalf("alter table ri_index replica identity using index: %v", err)
+	}
+
+	// Slice 307: a FOREIGN KEY added with NOT VALID must round-trip. PG records
+	// the unvalidated state in pg_constraint.convalidated='f', and
+	// pg_get_constraintdef_worker (ruleutils.c:2604) appends a trailing
+	// ` NOT VALID` to the constraint definition AFTER the DEFERRABLE clauses —
+	// the shared tail common to every constraint type. pg_dump's getConstraints
+	// renders the FK via pg_get_constraintdef, so the dumped
+	// `ALTER TABLE ONLY ... ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id)
+	// REFERENCES public.nv_ref(id) NOT VALID;` carries the suffix and the restored
+	// FK is likewise unvalidated. goopg already tracks catalog.ForeignKey.NotValid
+	// (set at ALTER TABLE ADD CONSTRAINT ... NOT VALID time) and projects
+	// convalidated='f' in the pg_constraint virtual builder; the gap was purely
+	// buildForeignKeyDefString never emitting the ` NOT VALID` tail, so the dump
+	// silently re-validated the constraint (a restore would then enforce it on
+	// existing rows that NOT VALID was meant to grandfather). Dump-fidelity only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nv_ref (id integer PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table nv_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nv_child (id integer, ref_id integer)"); err != nil {
+		t.Fatalf("create table nv_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nv_child ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id) REFERENCES public.nv_ref (id) NOT VALID"); err != nil {
+		t.Fatalf("alter table nv_child add fk not valid: %v", err)
+	}
+
+	// Slice 308: a CHECK constraint added with NOT VALID must round-trip with the
+	// same ` NOT VALID` tail. ` NOT VALID` is the SHARED final clause of
+	// pg_get_constraintdef_worker (ruleutils.c:2604), common to FK *and* CHECK;
+	// slice 307 wired the FK path, this wires CHECK. pg_dump reads convalidated
+	// for contype='c' rows and sets separate=!validated (pg_dump.c:9757), so an
+	// unvalidated CHECK is emitted AFTER data as a standalone
+	// `ALTER TABLE public.nvc_tbl\n    ADD CONSTRAINT nvc_chk CHECK ((val > 0)) NOT VALID;`
+	// rather than inline in CREATE TABLE — exactly so possibly-violating rows load
+	// first. goopg now carries catalog.NamedCheckConstraint.NotValid (set at
+	// ALTER TABLE ADD CONSTRAINT ... CHECK ... NOT VALID time), projects
+	// convalidated='f', and appends the ` NOT VALID` tail in pg_get_constraintdef's
+	// CHECK branch. Dump-fidelity only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nvc_tbl (id integer, val integer)"); err != nil {
+		t.Fatalf("create table nvc_tbl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nvc_tbl ADD CONSTRAINT nvc_chk CHECK (val > 0) NOT VALID"); err != nil {
+		t.Fatalf("alter table nvc_tbl add check not valid: %v", err)
+	}
+
+	// Slice 309: a FOREIGN KEY declared with MATCH FULL must round-trip the match
+	// type. PG records pg_constraint.confmatchtype='f' (vs 's' for the MATCH
+	// SIMPLE default), and pg_get_constraintdef_worker (ruleutils.c) emits a
+	// ` MATCH FULL` clause BETWEEN the REFERENCES column list and the ON
+	// UPDATE/DELETE clauses. pg_dump's getConstraints renders the FK via
+	// pg_get_constraintdef, so the dumped
+	// `ALTER TABLE ONLY ... ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b)
+	// REFERENCES public.mf_ref(a, b) MATCH FULL;` carries the clause and the
+	// restored FK keeps MATCH FULL's all-or-nothing NULL semantics. The gap was
+	// twofold: the parser silently dropped the MATCH clause (it was never part of
+	// the FK grammar) and buildForeignKeyDefString never emitted ` MATCH FULL`,
+	// so a MATCH FULL FK silently degraded to MATCH SIMPLE on restore. goopg now
+	// parses MATCH FULL|PARTIAL|SIMPLE in all three FK forms, carries
+	// catalog.ForeignKey.MatchFull, projects confmatchtype='f', and re-emits the
+	// clause. Dump-fidelity only (goopg does not yet enforce FK matching). A
+	// multi-column FK exercises MATCH FULL's intended use (mixed-NULL keys).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mf_ref (a integer, b integer, PRIMARY KEY (a, b))"); err != nil {
+		t.Fatalf("create table mf_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mf_child (a integer, b integer)"); err != nil {
+		t.Fatalf("create table mf_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.mf_child ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b) REFERENCES public.mf_ref (a, b) MATCH FULL"); err != nil {
+		t.Fatalf("alter table mf_child add fk match full: %v", err)
+	}
+
+	// Slice 310: a PARTIAL EXCLUDE constraint (`EXCLUDE USING btree (a WITH =)
+	// WHERE (b > 0)`) must round-trip its WHERE predicate. PG renders the
+	// exclusion def via pg_get_indexdef_worker, which appends ` WHERE (%s)`
+	// (ruleutils.c:1564) after the operator/INCLUDE list and BEFORE the
+	// DEFERRABLE tail, so pg_get_constraintdef emits
+	// `EXCLUDE USING btree (a WITH =) WHERE (b > 0)` and pg_dump re-emits it as
+	// `ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);`.
+	// The gap was at parse time: parseExcludeConstraint never consumed a trailing
+	// WHERE, so the predicate was silently dropped and a partial exclusion
+	// degraded on restore into one applying to EVERY row (a semantic change, not
+	// just a cosmetic one). goopg now parses the WHERE expression into
+	// TableConstraintDef.ExclusionWhere, threads it onto the backing index's
+	// PredicateString (defaultExprToSQL — fully parenthesized like PG), and the
+	// EXCLUDE branch of buildConstraintDefString appends ` WHERE (pred)` before
+	// DEFERRABLE. btree-equality EXCLUDE so goopg backs it with a real index
+	// (matching slice 143's form).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pex (a integer, b integer, CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0))"); err != nil {
+		t.Fatalf("create table pex with partial exclude: %v", err)
+	}
+
+	// Slice 311: a FOREIGN KEY whose `ON DELETE SET NULL` is restricted to a
+	// column subset (PG15 confdelsetcols) must round-trip the column list.
+	// pg_get_constraintdef (ruleutils.c:2376) appends ` (col, …)` after the
+	// `ON DELETE SET NULL` keyword via decompile_column_index_array when
+	// pg_constraint.confdelsetcols is non-null, so pg_dump emits
+	// `... ON DELETE SET NULL (b);`. The gap was at parse time: parseFKAction
+	// consumed `SET NULL`/`SET DEFAULT` but never the trailing column list, so a
+	// restricted action silently degraded into a whole-key SET NULL on restore
+	// (a SEMANTIC change — the other FK columns would also be nulled). goopg now
+	// parses the list into {Column,Table,AlterTable}…OnDeleteSetCols, threads it
+	// onto catalog.ForeignKey, projects pg_constraint.confdelsetcols (attnum
+	// array), and buildForeignKeyDefString re-emits ` (cols)` after the ON DELETE
+	// clause. A two-column referencing key makes the restriction observable
+	// (only sfk_b is nulled). The referenced table needs a UNIQUE/PK on (id).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.sfk_ref (id integer PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table sfk_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.sfk_child (a integer, b integer)"); err != nil {
+		t.Fatalf("create table sfk_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.sfk_child ADD CONSTRAINT sfk_child_fk FOREIGN KEY (b) REFERENCES public.sfk_ref (id) ON DELETE SET NULL (b)"); err != nil {
+		t.Fatalf("alter table sfk_child add fk on delete set null (b): %v", err)
+	}
+
+	// Slice 312: a CREATE INDEX with a non-default per-column operator class
+	// (`text_pattern_ops`) must round-trip the opclass. pg_get_indexdef_worker
+	// (ruleutils.c get_opclass_name) emits the opclass after the column — and
+	// after any COLLATE — and before ASC/DESC, suppressing only the type's default
+	// opclass. The gap was at parse time: parseIndexColumnList consumed the bare
+	// opclass ident but DISCARDED it, and catalog.Index had no per-column opclass
+	// field, so `CREATE INDEX … (a text_pattern_ops)` dumped as a plain `(a)` —
+	// silently widening the index back to the default opclass on restore (a
+	// semantic change: text_pattern_ops drives LIKE/prefix-range scans, the
+	// default text_ops does not). goopg now threads the opclass onto
+	// IndexColOrder.OpClass → catalog.Index.ColOpClasses → BuildIndexDef. A
+	// second key column with a default opclass confirms only the explicit one is
+	// emitted.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.opcidx (a text, b text)"); err != nil {
+		t.Fatalf("create table opcidx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX opcidx_pat ON public.opcidx (a text_pattern_ops, b)"); err != nil {
+		t.Fatalf("create index opcidx_pat with opclass: %v", err)
+	}
+
+	// Slice 313: a CREATE INDEX with a non-default per-column COLLATE must
+	// round-trip the collation. pg_get_indexdef_worker (ruleutils.c) emits the
+	// collation after the column/expression and BEFORE the operator class (via
+	// generate_collation_name, which quotes the collname as an identifier),
+	// suppressing the type's default collation. The gap was the sibling of slice
+	// 312: parseIndexColumnList consumed the COLLATE name but DISCARDED it, and
+	// catalog.Index had no per-column collation field, so `CREATE INDEX … (a
+	// COLLATE "C")` dumped as a plain `(a)` — silently widening the index back to
+	// the default collation on restore. goopg now threads the collation onto
+	// IndexColOrder.Collation → catalog.Index.ColCollations → BuildIndexDef. A
+	// second key column with the default collation confirms only the explicit one
+	// is emitted.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.collidx (a text, b text)"); err != nil {
+		t.Fatalf("create table collidx: %v", err)
+	}
+	if err := runSQLSimple(t, c, `CREATE INDEX collidx_c ON public.collidx (a COLLATE "C", b)`); err != nil {
+		t.Fatalf("create index collidx_c with collation: %v", err)
+	}
+
+	// Slice 314: a CREATE STATISTICS extended-statistics object must round-trip.
+	// pg_dump's dumpStatisticsExt selects pg_get_statisticsobjdef(oid) and emits
+	// the result verbatim (plus a semicolon). Before this slice goopg's parser
+	// discarded the kinds clause AND the ON column list (only name + FROM table
+	// were captured), and pg_get_statisticsobjdef was unimplemented — so the
+	// statistics object was silently dropped from the dump. ruleutils.c
+	// pg_get_statisticsobj_worker suppresses the kinds clause when all three kinds
+	// (ndistinct/dependencies/mcv) are enabled (the default), so a plain
+	// `CREATE STATISTICS … ON a, b FROM t` dumps with no kinds clause; an explicit
+	// single-kind object dumps `(ndistinct)`. goopg now threads Kinds/Columns onto
+	// catalog.StatisticsObject → BuildStatisticsObjDef. Both forms are exercised.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.statext_t (a integer, b integer, c integer)"); err != nil {
+		t.Fatalf("create table statext_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_all ON a, b FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_all: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_nd (ndistinct) ON b, c FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_nd: %v", err)
+	}
+	// Slice 316: expression extended-statistics objects must also round-trip.
+	// PG's grammar requires expression elements to be parenthesized; ruleutils.c
+	// pg_get_statisticsobj_worker emits all simple columns first, then each
+	// expression (parenthesized unless it is a bare function call), and suppresses
+	// the kinds clause when the object spans a single target. Before this slice
+	// goopg flagged HasExpr and BuildStatisticsObjDef declined, silently dropping
+	// the object. goopg now parses the ON-list expression into an AST and the
+	// executor deparses it (defaultExprToSQL already parenthesizes binary ops and
+	// leaves bare function calls unwrapped, matching ruleutils.c). `statext_expr`
+	// (single expression → no kinds clause); `statext_mix` (column + expression).
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_expr ON (a + b) FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_expr: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_mix ON a, (b + c) FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_mix: %v", err)
+	}
+	// Slice 317: a non-default extended-statistics target must round-trip. pg_dump
+	// (getExtendedStatistics + dumpStatisticsExt) reads pg_statistic_ext.stxstattarget
+	// and emits `ALTER STATISTICS … SET STATISTICS <n>` after the CREATE whenever
+	// stxstattarget >= 0; the default (PG18 stores NULL → -1) emits nothing. goopg
+	// records the target on catalog.StatisticsObject.StatTarget via
+	// `ALTER STATISTICS … SET STATISTICS n`; the pg_statistic_ext virtual row now
+	// projects it (NULL when unset). `statext_nd` gets a target of 250 (must
+	// re-emit); `statext_all` stays default (must NOT emit an ALTER).
+	if err := runSQLSimple(t, c, "ALTER STATISTICS public.statext_nd SET STATISTICS 250"); err != nil {
+		t.Fatalf("alter statistics statext_nd set statistics: %v", err)
+	}
+
+	// Slice 319: a CREATE TRIGGER must round-trip through pg_dump. pg_dump's
+	// getTriggers selects pg_get_triggerdef(t.oid, false) and dumpTrigger emits
+	// the result verbatim (plus a trailing semicolon). Before this slice goopg's
+	// pg_trigger view hardcoded zero rows (VirtualRows → nil) AND
+	// pg_get_triggerdef was unimplemented, so a user trigger was silently dropped
+	// from the dump. goopg now assigns each trigger an OID at CREATE TRIGGER time,
+	// projects it through pg_trigger, and reconstructs the statement via
+	// pg_get_triggerdef. Two triggers exercise both timings/levels and the OR-ed
+	// event list: a BEFORE INSERT OR UPDATE row-level trigger and an AFTER DELETE
+	// statement-level trigger, both on public.trig_t.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.trig_t (a integer, b integer)"); err != nil {
+		t.Fatalf("create table trig_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"); err != nil {
+		t.Fatalf("create trigger function trig_fn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_biu BEFORE INSERT OR UPDATE ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_biu: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_ad: %v", err)
+	}
+	// Slice 326: a column-specific `UPDATE OF a, b` trigger. pg_get_triggerdef
+	// appends ` OF <cols>` right after the UPDATE event; before this slice the
+	// parser tripped on the `OF` keyword and the clause was dropped. Combine it
+	// with INSERT to exercise the OR-ed event list with the OF clause attached.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_uof BEFORE INSERT OR UPDATE OF a, b ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_uof: %v", err)
+	}
+	// Slice 327: a CONSTRAINT TRIGGER. pg_get_triggerdef emits `CREATE CONSTRAINT
+	// TRIGGER` plus the `[NOT ]DEFERRABLE INITIALLY {IMMEDIATE|DEFERRED}` clause
+	// after the ON-table name. trg_cdef takes the default (NOT DEFERRABLE
+	// INITIALLY IMMEDIATE); trg_cdfr is explicitly DEFERRABLE INITIALLY DEFERRED.
+	// Constraint triggers are always AFTER / FOR EACH ROW (enforced by PG).
+	if err := runSQLSimple(t, c, "CREATE CONSTRAINT TRIGGER trg_cdef AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create constraint trigger trg_cdef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CONSTRAINT TRIGGER trg_cdfr AFTER UPDATE ON public.trig_t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create constraint trigger trg_cdfr: %v", err)
+	}
+	// Slice 328: a REFERENCING transition-table trigger. pg_get_triggerdef emits
+	// `REFERENCING OLD TABLE AS … NEW TABLE AS …` between the ON-table name and
+	// FOR EACH ROW (transition tables are an AFTER, statement-level feature).
+	// trg_ref carries both OLD and NEW; trg_refn carries NEW only.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_ref AFTER UPDATE ON public.trig_t REFERENCING OLD TABLE AS ot NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_refn AFTER INSERT ON public.trig_t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_refn: %v", err)
+	}
+
+	// Slice 329: a row-level trigger with a `WHEN (condition)` qualification.
+	// pg_get_triggerdef re-emits `WHEN (…)` between FOR EACH ROW and EXECUTE
+	// FUNCTION, building OLD/NEW range-table entries so the condition's column
+	// references render with lowercased `old.`/`new.` qualifiers and the boolean
+	// OpExpr is fully parenthesized (→ `WHEN ((new.b <> old.b))`). Before this
+	// slice the parser skipped the WHEN body entirely, so the condition was lost
+	// on dump. trg_when compares NEW vs OLD across an UPDATE; trg_whna tests a
+	// single NEW column against a constant (no top-level OpExpr-on-OpExpr nesting).
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_when BEFORE UPDATE ON public.trig_t FOR EACH ROW WHEN (NEW.b <> OLD.b) EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_when: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_whna BEFORE INSERT ON public.trig_t FOR EACH ROW WHEN (NEW.a > 0) EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_whna: %v", err)
+	}
+	// Slice 368: a trigger whose EXECUTE FUNCTION carries STRING arguments
+	// (TG_ARGV). pg_get_triggerdef (ruleutils.c pg_get_triggerdef_worker:462-486)
+	// renders `EXECUTE FUNCTION public.trig_fn(` then each tgargs entry
+	// comma-separated (`, `) and single-quoted via simple_quote_literal (embedded
+	// single-quotes doubled). goopg's parser already collected the string-literal
+	// args into CreateTriggerStmt.FuncArgs, execCreateTrigger threads them to
+	// catalog.Trigger.Args, and buildTriggerDefString re-emits them with identical
+	// `', '` separation and `''`-doubled quoting. trg_arg passes two args, the
+	// second carrying an embedded single quote to exercise the simple_quote_literal
+	// escaping path. NO production change — the whole parse→catalog→deparse path
+	// already existed but had no oracle-verified fixture pinning the rendered form.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_arg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('hello', 'wo''rld')"); err != nil {
+		t.Fatalf("create trigger trg_arg with function args: %v", err)
+	}
+	// Slice 369: a trigger whose EXECUTE FUNCTION carries NON-string arguments —
+	// an integer, a float, and a bare identifier. PG's grammar (gram.y
+	// TriggerFuncArg) stores EVERY argument form as a string in pg_trigger.tgargs:
+	// an Iconst via psprintf("%d") (so "0042" canonicalises to "42"), an FCONST by
+	// its lexeme, and a ColLabel identifier by its text. pg_get_triggerdef then
+	// re-quotes ALL of them as `'…'` literals, so `trig_fn(0042, 3.14, foo)` dumps
+	// as `trig_fn('42', '3.14', 'foo')`. goopg's parser previously SKIPPED these
+	// non-string tokens (dropping the args entirely); it now captures their text
+	// (integers canonicalised) into CreateTriggerStmt.FuncArgs, and the existing
+	// buildTriggerDefString quotes them identically.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_narg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn(0042, 3.14, foo)"); err != nil {
+		t.Fatalf("create trigger trg_narg with non-string function args: %v", err)
+	}
+
+	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
+	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
+	// append a trailing `ALTER TABLE <t> CLUSTER ON <idx>;` after the index's
+	// CREATE INDEX / ADD CONSTRAINT when the flag is set (pg_dump.c:18141 /
+	// :18483). Before this slice goopg's pg_index view hardcoded
+	// indisclustered='f' and CLUSTER was a pure no-op, so the clustering
+	// selection was silently dropped from the dump. goopg now records the
+	// selection on the chosen index (catalog.Index.IsClustered), clears it on
+	// the table's other indexes, and re-syncs the pg_index heap row pg_dump
+	// reads. Two surfaces are exercised: a plain secondary index marked via
+	// `CLUSTER <t> USING <idx>` (dumpIndex path) and a PRIMARY KEY constraint
+	// index marked the same way (dumpConstraint path).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.clus_t (a integer PRIMARY KEY, b integer)"); err != nil {
+		t.Fatalf("create table clus_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX clus_t_b_idx ON public.clus_t (b)"); err != nil {
+		t.Fatalf("create index clus_t_b_idx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CLUSTER public.clus_t USING clus_t_b_idx"); err != nil {
+		t.Fatalf("cluster clus_t using clus_t_b_idx: %v", err)
+	}
+	// A second table clustered on its PRIMARY KEY index exercises the
+	// dumpConstraint CLUSTER-ON branch (constraint-backed index, not a plain
+	// CREATE INDEX). PG names the PK index <table>_pkey.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.clus_pk (a integer PRIMARY KEY, b integer)"); err != nil {
+		t.Fatalf("create table clus_pk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CLUSTER public.clus_pk USING clus_pk_pkey"); err != nil {
+		t.Fatalf("cluster clus_pk using clus_pk_pkey: %v", err)
+	}
+
+	// Slice 322: ROW LEVEL SECURITY must round-trip through pg_dump. pg_dump's
+	// getPolicies probes pg_class.relrowsecurity and represents an RLS-enabled
+	// table with a null-polname PolicyInfo, which dumpPolicy emits as
+	// `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;` (pg_dump.c). dumpTableSchema
+	// separately emits `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;` from
+	// relforcerowsecurity. Before this slice goopg hardcoded both pg_class
+	// columns to 'f' and silently consumed the ENABLE clause as a trigger no-op,
+	// so the RLS state was dropped from the dump (and goopg could not restore its
+	// own output). goopg now records catalog.Table.RowSecurity /
+	// ForceRowSecurity, projects them through both pg_class builders, and re-syncs
+	// the pg_class heap row pg_dump reads. goopg enforces no row-level security —
+	// dump-fidelity only. `rls_t` carries both flags; the two are independent.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.rls_t (a integer)"); err != nil {
+		t.Fatalf("create table rls_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rls_t ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("enable row level security on rls_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rls_t FORCE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("force row level security on rls_t: %v", err)
+	}
+
+	// Slice 323: CREATE POLICY must round-trip through pg_dump. pg_dump's
+	// getPolicies reads pg_policy (polname, polcmd, polpermissive, polroles,
+	// pg_get_expr(polqual/polwithcheck)) and dumpPolicy re-emits the CREATE
+	// POLICY (pg_dump.c). Before this slice CREATE POLICY was a hard parse error
+	// and pg_policy was an empty stub, so a policy was silently lost on
+	// dump/restore. goopg now records catalog.Table.Policies and projects them
+	// through the pg_policy virtual catalog; polqual/polwithcheck render via the
+	// catalog-side pg_get_expr deparser (fully parenthesized), so pg_dump emits
+	// `USING ((expr))` / `WITH CHECK ((expr))` byte-identically. goopg enforces
+	// no RLS — dump fidelity only. `pol_t` carries one policy per command form
+	// (PERMISSIVE FOR ALL, RESTRICTIVE FOR SELECT, FOR INSERT WITH CHECK). All
+	// policies are TO PUBLIC ({0}); named-role policies are a follow-up slice.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pol_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table pol_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pol_t ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("enable row level security on pol_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_simple ON public.pol_t USING (a > 0)"); err != nil {
+		t.Fatalf("create policy p_simple: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_restr ON public.pol_t AS RESTRICTIVE FOR SELECT USING (a > 5)"); err != nil {
+		t.Fatalf("create policy p_restr: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_check ON public.pol_t FOR INSERT WITH CHECK (a < 100)"); err != nil {
+		t.Fatalf("create policy p_check: %v", err)
+	}
+
+	// Slice 330: a named-role policy (`CREATE POLICY ... TO <role>`) must
+	// round-trip through pg_dump. Before this slice goopg had no per-role OID
+	// registry, so polroles could only hold the {0} PUBLIC sentinel and CREATE
+	// POLICY rejected any named role. Now CREATE ROLE mints a per-role OID
+	// (catalog.RegisterRole), pg_roles exposes it, and execCreatePolicy records
+	// the role's OID in pg_policy.polroles. pg_dump's getPolicies resolves the
+	// OID array back to the name via
+	// `array_to_string(ARRAY(SELECT quote_ident(rolname) FROM pg_roles
+	// WHERE oid = ANY(polroles)), ', ')`, so dumpPolicy emits ` TO pol_role`
+	// before the USING clause (pg_dump.c order: ON … [AS][FOR][TO][USING]).
+	// goopg enforces no RLS — dump fidelity only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pol_rt (a integer)"); err != nil {
+		t.Fatalf("create table pol_rt: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pol_rt ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("enable row level security on pol_rt: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE pol_role"); err != nil {
+		t.Fatalf("create role pol_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_role ON public.pol_rt FOR SELECT TO pol_role USING (a > 0)"); err != nil {
+		t.Fatalf("create policy p_role: %v", err)
+	}
+
+	// Slice 331: a table-level GRANT must round-trip through pg_dump. pg_dump's
+	// getTables selects `c.relacl` directly and `acldefault('r', relowner)` as
+	// the baseline, then buildACLCommands (src/bin/pg_dump/dumputils.c) parses
+	// the aclitem[] text CLIENT-SIDE and emits the GRANT/REVOKE diff — no
+	// server-side aclexplode/aclitemout is involved. Before this slice goopg
+	// always projected relacl as NULL even after a GRANT, so the privilege was
+	// silently lost on dump/restore. goopg already records table grants in its
+	// catalog ACL store (Catalog.GrantTablePrivilege, server/grant_ddl.go); now
+	// the pg_class virtual builder renders that store as the materialized
+	// aclitem[] (owner full default first, grantor=postgres, then each grantee),
+	// matching what PostgreSQL stores once the first GRANT materializes relacl.
+	// pg_dump diffs it against acldefault('r', 10) so the owner entry cancels and
+	// only the grantee's `GRANT SELECT ON TABLE public.grant_t TO grantee_role;`
+	// is emitted.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_t (a integer)"); err != nil {
+		t.Fatalf("create table grant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE grantee_role"); err != nil {
+		t.Fatalf("create role grantee_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.grant_t TO grantee_role"); err != nil {
+		t.Fatalf("grant select on grant_t: %v", err)
+	}
+
+	// Slice 332: a GRANT … WITH GRANT OPTION must round-trip. aclitemout renders
+	// a grant-option privilege as "<letter>*" (here "r*" for SELECT WITH GRANT
+	// OPTION), and pg_dump's buildACLCommands splits grant-option privileges into
+	// a separate `GRANT … WITH GRANT OPTION;` (privswgo branch, dumputils.c).
+	// goopg now records the option flag in its catalog ACL store and renders the
+	// trailing `*` in pg_class.relacl, so the WITH GRANT OPTION clause survives.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_g (a integer)"); err != nil {
+		t.Fatalf("create table grant_g: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE grantee2_role"); err != nil {
+		t.Fatalf("create role grantee2_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.grant_g TO grantee2_role WITH GRANT OPTION"); err != nil {
+		t.Fatalf("grant select with grant option on grant_g: %v", err)
+	}
+
+	// Slice 333: a GRANT … ON SEQUENCE must round-trip through pg_dump. pg_dump's
+	// getTables selects relacl for sequences (relkind 'S') too and computes the
+	// baseline as acldefault('s', relowner) → "{postgres=rwU/postgres}" (USAGE/
+	// SELECT/UPDATE), and dumpTableSchema passes objtype "SEQUENCE" to dumpACL so
+	// the diff is re-emitted as `GRANT … ON SEQUENCE …`. Before this slice goopg's
+	// grant_ddl recorder bailed on ON SEQUENCE (no-op) and the sequence's relacl
+	// stayed NULL, silently dropping the privilege. goopg now records sequence
+	// grants in the shared relation ACL store and the pg_class virtual builder
+	// renders a sequence's relacl with the sequence privilege order / owner
+	// default "rwU".
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.grant_seq"); err != nil {
+		t.Fatalf("create sequence grant_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE seq_role"); err != nil {
+		t.Fatalf("create role seq_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role"); err != nil {
+		t.Fatalf("grant usage on grant_seq: %v", err)
+	}
+
+	// Slice 334: a GRANT … TO PUBLIC must round-trip through pg_dump. PostgreSQL
+	// stores a grant to the PUBLIC pseudo-role with an EMPTY grantee in the
+	// aclitem (relacl entry "=r/postgres"), and pg_dump's buildACLCommands
+	// (dumputils.c) renders an empty grantee as the keyword PUBLIC, emitting
+	// `GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;`. goopg records the
+	// grant under the reserved role name "public" (no real role may carry that
+	// name); the pg_class relacl projection maps it back to the empty grantee so
+	// pg_dump re-emits the TO PUBLIC clause.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_pub (a integer)"); err != nil {
+		t.Fatalf("create table grant_pub: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.grant_pub TO PUBLIC"); err != nil {
+		t.Fatalf("grant select on grant_pub to public: %v", err)
+	}
+
+	// Slice 335: a GRANT … ON SCHEMA must round-trip through pg_dump. pg_dump's
+	// getNamespaces reads `n.nspacl` from pg_namespace, diffs it against
+	// acldefault('n', nspowner) = "{postgres=UC/postgres}" client-side in
+	// buildACLCommands, and dumpACL (objtype "SCHEMA") re-emits the diff as
+	// `GRANT … ON SCHEMA …`. Before this slice goopg projected nspacl as a
+	// constant NULL even after a GRANT (the grant_ddl recorder bailed on ON
+	// SCHEMA), so the privilege was silently lost on dump/restore. goopg now
+	// records the schema grant in the OID-keyed ACL store (schemas share it with
+	// relations) and renders nspacl with the schema privilege order (USAGE 'U' <
+	// CREATE 'C') / owner-default "UC". A dedicated schema keeps the grant
+	// isolated from the `s` schema asserted elsewhere.
+	if err := runSQLSimple(t, c, "CREATE SCHEMA grant_sch"); err != nil {
+		t.Fatalf("create schema grant_sch: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE schema_role"); err != nil {
+		t.Fatalf("create role schema_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON SCHEMA grant_sch TO schema_role"); err != nil {
+		t.Fatalf("grant usage on schema grant_sch: %v", err)
+	}
+
+	// Slice 336: a GRANT to a role whose name needs quoting must round-trip. PG's
+	// aclitemout (putid) double-quotes a grantee name containing any character
+	// outside [A-Za-z0-9_] (here a hyphen) in pg_class.relacl, and pg_dump's getid
+	// parser relies on those quotes to read the whole name; buildACLCommands then
+	// re-emits the GRANT through fmtId (also quoted). goopg previously rendered the
+	// grantee raw ("weird-role=r/postgres"), which pg_dump would mis-parse at the
+	// hyphen. (A reserved-keyword name like "user" needs no aclitem quoting — it is
+	// all-alnum, so putid leaves it bare and pg_dump's fmtId adds the quotes
+	// client-side; that case already round-trips.)
+	if err := runSQLSimple(t, c, `CREATE ROLE "weird-role"`); err != nil {
+		t.Fatalf("create role weird-role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_q (a integer)"); err != nil {
+		t.Fatalf("create table grant_q: %v", err)
+	}
+	if err := runSQLSimple(t, c, `GRANT SELECT ON TABLE public.grant_q TO "weird-role"`); err != nil {
+		t.Fatalf("grant select on grant_q to weird-role: %v", err)
+	}
+
+	// Slice 337: a GRANT to a role whose name is case-significant (double-quoted
+	// mixed case) must round-trip. PostgreSQL role names are case-significant
+	// when double-quoted, and aclitemout renders the role's TRUE name in
+	// pg_class.relacl. A mixed-case name like "MixedCase" is all-alnum, so putid
+	// leaves it bare in the aclitem (MixedCase=r/postgres), but pg_dump's
+	// getid/fmtId re-quote it client-side → GRANT … TO "MixedCase". goopg's ACL
+	// store keys privileges by the lower-cased name (case-insensitive lookups),
+	// so without preserving the original spelling it would render `mixedcase`
+	// and pg_dump would emit TO mixedcase (a different, nonexistent role).
+	if err := runSQLSimple(t, c, `CREATE ROLE "MixedCase"`); err != nil {
+		t.Fatalf("create role MixedCase: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_mc (a integer)"); err != nil {
+		t.Fatalf("create table grant_mc: %v", err)
+	}
+	if err := runSQLSimple(t, c, `GRANT SELECT ON TABLE public.grant_mc TO "MixedCase"`); err != nil {
+		t.Fatalf("grant select on grant_mc to MixedCase: %v", err)
+	}
+
+	// Slice 338: a GRANT followed by a partial REVOKE must round-trip. PostgreSQL
+	// REVOKE clears the named bits from the grantee's aclitem mask: GRANT SELECT,
+	// INSERT then REVOKE INSERT leaves pg_class.relacl as `grantee=r/postgres`
+	// (the lone SELECT), and pg_dump's buildACLCommands diffs that against
+	// acldefault and re-emits only `GRANT SELECT ON TABLE public.revoke_t TO
+	// revoke_role;` — NOT the revoked INSERT. goopg previously treated REVOKE as a
+	// pure no-op, so the relacl still carried INSERT and the dump over-emitted
+	// `GRANT INSERT, SELECT`. The REVOKE recorder (tryRecordTableRevoke) now
+	// removes the bit so the materialized relacl reflects only what remains.
+	if err := runSQLSimple(t, c, "CREATE ROLE revoke_role"); err != nil {
+		t.Fatalf("create role revoke_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.revoke_t (a integer)"); err != nil {
+		t.Fatalf("create table revoke_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT, INSERT ON TABLE public.revoke_t TO revoke_role"); err != nil {
+		t.Fatalf("grant select,insert on revoke_t to revoke_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE INSERT ON TABLE public.revoke_t FROM revoke_role"); err != nil {
+		t.Fatalf("revoke insert on revoke_t from revoke_role: %v", err)
+	}
+
+	// Slice 339: a schema GRANT followed by a partial REVOKE must round-trip. This
+	// is the nspacl analogue of slice 338: GRANT USAGE, CREATE ON SCHEMA then
+	// REVOKE CREATE leaves pg_namespace.nspacl as `revoke_sch_role=U/postgres` (the
+	// lone USAGE), and pg_dump's buildACLCommands diffs that against
+	// acldefault('n', owner) = "{postgres=UC/postgres}" and re-emits only `GRANT
+	// USAGE ON SCHEMA revoke_sch TO revoke_sch_role;` — NOT the revoked CREATE.
+	// goopg's REVOKE recorder (tryRecordTableRevoke) previously bailed on ON SCHEMA
+	// (only table/sequence relacl was modelled), so the revoked CREATE survived in
+	// nspacl and the dump over-emitted `GRANT CREATE, USAGE`. The recorder now
+	// routes ON SCHEMA to recordSchemaRevoke, the mirror of recordSchemaGrant, so
+	// the materialized nspacl reflects only what remains. A dedicated schema keeps
+	// the revoke isolated from grant_sch (slice 335) and the `s` schema.
+	if err := runSQLSimple(t, c, "CREATE SCHEMA revoke_sch"); err != nil {
+		t.Fatalf("create schema revoke_sch: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE revoke_sch_role"); err != nil {
+		t.Fatalf("create role revoke_sch_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE, CREATE ON SCHEMA revoke_sch TO revoke_sch_role"); err != nil {
+		t.Fatalf("grant usage,create on schema revoke_sch to revoke_sch_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE CREATE ON SCHEMA revoke_sch FROM revoke_sch_role"); err != nil {
+		t.Fatalf("revoke create on schema revoke_sch from revoke_sch_role: %v", err)
+	}
+
+	// Slice 340: an owner-side REVOKE-of-default must round-trip. PostgreSQL leaves
+	// pg_class.relacl NULL while the owner holds its implicit default privileges;
+	// the first `REVOKE <priv> ON TABLE t FROM postgres` materializes relacl as the
+	// owner's full default set minus the revoked bits. `REVOKE TRIGGER ON TABLE
+	// ownrev_t FROM postgres` yields relacl `{postgres=arwdDxm/postgres}` (the full
+	// "arwdDxtm" minus 't'), and pg_dump's buildACLCommands diffs that against
+	// acldefault('r', 10) and re-emits the transform as
+	// `REVOKE ALL … FROM postgres;` + `GRANT <remaining> … TO postgres;` (verified
+	// byte-identical to real pg_dump 18.3). Before this slice goopg's REVOKE recorder
+	// only modelled non-owner grantees, so an owner revoke was silently dropped and
+	// relacl stayed NULL → pg_dump emitted nothing, losing the privilege change on
+	// restore. The recorder now materializes the owner's default ACL via
+	// Catalog.MaterializeOwnerACL before removing the revoked bits.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ownrev_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table ownrev_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE TRIGGER ON TABLE public.ownrev_t FROM postgres"); err != nil {
+		t.Fatalf("revoke trigger on ownrev_t from postgres: %v", err)
+	}
+
+	// Slice 341: a full owner-side REVOKE ALL must round-trip as the empty aclitem
+	// array. `REVOKE ALL ON TABLE ownrevall_t FROM postgres` strips the owner's
+	// implicit default privileges, leaving relacl = `{}` (a non-NULL but empty
+	// array, distinct from the NULL of a never-granted table). pg_dump's
+	// buildACLCommands diffs {} against acldefault('r', 10) and emits a bare
+	// `REVOKE ALL … FROM postgres;` with no re-GRANT (verified byte-identical to
+	// real pg_dump 18.3). Before this slice the owner REVOKE ALL reverted relacl
+	// to NULL (the owner entry was dropped entirely) so pg_dump emitted nothing,
+	// silently restoring the owner's default privileges on restore. goopg now
+	// records the emptied state (catalog.relACLEmptied) so relacl projects "{}".
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ownrevall_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table ownrevall_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON TABLE public.ownrevall_t FROM postgres"); err != nil {
+		t.Fatalf("revoke all on ownrevall_t from postgres: %v", err)
+	}
+
+	// Slice 342: a full owner-side REVOKE ALL ON SCHEMA must round-trip as the
+	// empty nspacl array — the namespace analogue of slice 341. `REVOKE ALL ON
+	// SCHEMA ownrevall_sch FROM postgres` strips the owner's implicit default
+	// schema privileges (USAGE, CREATE), leaving pg_namespace.nspacl = `{}` (a
+	// non-NULL but empty array, distinct from the NULL of a never-granted schema).
+	// pg_dump's buildACLCommands diffs {} against acldefault('n', 10) =
+	// "{postgres=UC/postgres}" and emits a bare `REVOKE ALL ON SCHEMA … FROM
+	// postgres;` with no re-GRANT. Before this slice the schema REVOKE recorder
+	// (recordSchemaRevoke) only modelled grantees, so an owner-side revoke was
+	// silently dropped and nspacl stayed NULL → pg_dump emitted nothing, restoring
+	// the owner's default schema privileges. recordSchemaRevoke now materializes
+	// the owner's default schema ACL via Catalog.MaterializeOwnerACL before
+	// removing the revoked bits (the type-agnostic relACLEmptied path shared with
+	// slice 341).
+	if err := runSQLSimple(t, c, "CREATE SCHEMA ownrevall_sch"); err != nil {
+		t.Fatalf("create schema ownrevall_sch: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON SCHEMA ownrevall_sch FROM postgres"); err != nil {
+		t.Fatalf("revoke all on schema ownrevall_sch from postgres: %v", err)
+	}
+
+	// Slice 343: a full owner-side REVOKE ALL ON SEQUENCE must round-trip as the
+	// empty relacl array — the sequence analogue of slice 341 (table) and slice 342
+	// (schema). `REVOKE ALL ON SEQUENCE ownrevall_seq FROM postgres` strips the
+	// owner's implicit default sequence privileges (USAGE, SELECT, UPDATE), leaving
+	// pg_class.relacl = `{}` (a non-NULL but empty array, distinct from the NULL of
+	// a never-granted sequence). pg_dump's buildACLCommands diffs {} against
+	// acldefault('s', 10) = "{postgres=rwU/postgres}" and (objtype "SEQUENCE")
+	// emits a bare `REVOKE ALL ON SEQUENCE public.ownrevall_seq FROM postgres;`
+	// with NO re-GRANT (verified byte-identical to real pg_dump 18.3 above). The
+	// server path needs NO new code: recordTableRevoke already passes
+	// allSequencePrivileges to Catalog.MaterializeOwnerACL for an owner-side
+	// `REVOKE … ON SEQUENCE … FROM postgres`, and the empty-array (relACLEmptied)
+	// state plus its relaclTextLockedSeq rendering are object-type-agnostic. This
+	// slice pins that end-to-end round-trip as a regression guard.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.ownrevall_seq"); err != nil {
+		t.Fatalf("create sequence ownrevall_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON SEQUENCE public.ownrevall_seq FROM postgres"); err != nil {
+		t.Fatalf("revoke all on sequence ownrevall_seq from postgres: %v", err)
+	}
+
+	// Slice 344: owner-zero coexisting with a grantee. After a full owner-side
+	// `REVOKE ALL ON TABLE ownerzero_t FROM postgres` empties relacl to {}, a
+	// `GRANT SELECT … TO bob` re-materializes the array but the owner stays at
+	// zero (absent): PostgreSQL stores `{bob=r/postgres}` with NO owner entry.
+	// pg_dump's buildACLCommands diffs that against acldefault('r', 10) =
+	// "{postgres=arwdDxtm/postgres}" and emits BOTH the owner's
+	// `REVOKE ALL ON TABLE public.ownerzero_t FROM postgres;` AND
+	// `GRANT SELECT ON TABLE public.ownerzero_t TO bob;`. goopg previously
+	// re-inserted the owner's full default via the owner-default fallback
+	// ({postgres=arwdDxtm/postgres,bob=r/postgres}), dropping the owner REVOKE on
+	// round-trip and silently restoring the owner default on restore. The fix is
+	// catalog-only: a GRANT to a non-owner no longer clears relACLEmptied, and
+	// relaclTextLockedFor suppresses the leading owner entry when the owner is
+	// zeroed. This pins the end-to-end round-trip as a regression guard.
+	if err := runSQLSimple(t, c, "CREATE ROLE bob NOLOGIN"); err != nil {
+		t.Fatalf("create role bob: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ownerzero_t (a integer)"); err != nil {
+		t.Fatalf("create table ownerzero_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON TABLE public.ownerzero_t FROM postgres"); err != nil {
+		t.Fatalf("revoke all on ownerzero_t from postgres: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.ownerzero_t TO bob"); err != nil {
+		t.Fatalf("grant select on ownerzero_t to bob: %v", err)
+	}
+
+	// Slice 345: a function-level GRANT must round-trip through pg_dump from
+	// pg_proc.proacl, the routine analogue of the table relacl slices (331+).
+	// PostgreSQL's acldefault for a function grants EXECUTE to BOTH the owner and
+	// PUBLIC, so `GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee`
+	// materializes proacl as "{=X/postgres,postgres=X/postgres,func_grantee=X/postgres}".
+	// pg_dump's getFuncs reads proacl, diffs it against acldefault('f', 10), and
+	// buildACLCommands emits `GRANT ALL ON FUNCTION public.grantfn(integer) TO
+	// func_grantee;` (EXECUTE is the sole function privilege, so the grantee's
+	// full set renders as ALL). Before this slice goopg left proacl NULL for every
+	// routine, so the function GRANT was silently dropped from the dump.
+	if err := runSQLSimple(t, c, "CREATE ROLE func_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role func_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.grantfn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function grantfn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee"); err != nil {
+		t.Fatalf("grant execute on grantfn to func_grantee: %v", err)
+	}
+
+	// Slice 346: a function-level REVOKE … FROM PUBLIC must round-trip through
+	// pg_dump from pg_proc.proacl, the routine REVOKE analogue of the table REVOKE
+	// slices (338+). A function's implicit default proacl grants EXECUTE to BOTH
+	// the owner and PUBLIC, so `REVOKE EXECUTE ON FUNCTION public.revokefn(integer)
+	// FROM PUBLIC` materializes proacl as "{postgres=X/postgres}" (owner only;
+	// PUBLIC's implicit EXECUTE removed). pg_dump's getFuncs diffs it against
+	// acldefault('f', 10) and emits `REVOKE ALL ON FUNCTION public.revokefn(integer)
+	// FROM PUBLIC;`. Before this slice goopg treated the function REVOKE as a pure
+	// no-op, leaving proacl NULL, so the dump silently re-granted PUBLIC's default
+	// EXECUTE on restore.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.revokefn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function revokefn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE EXECUTE ON FUNCTION public.revokefn(integer) FROM PUBLIC"); err != nil {
+		t.Fatalf("revoke execute on revokefn from public: %v", err)
+	}
+
+	// Slice 347: the owner-side function REVOKE, the counterpart of slice 346's
+	// PUBLIC-side one. A function's acldefault('f', 10) grants EXECUTE to BOTH the
+	// owner and PUBLIC, so `REVOKE EXECUTE ON FUNCTION public.ownrevfn(integer)
+	// FROM postgres` materializes proacl as "{=X/postgres}" — PUBLIC's implicit
+	// EXECUTE survives, the owner's is removed (distinct from a table/sequence,
+	// whose default grants only the owner, so an owner REVOKE ALL empties to {}).
+	// pg_dump's getFuncs diffs {=X/postgres} against acldefault('f', 10) and emits
+	// `REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM postgres;` (verified
+	// byte-identical to pg_dump 18.3). Before this slice goopg dropped the owner to
+	// {} or NULL — re-granting the owner's default EXECUTE on restore and losing
+	// PUBLIC's — because the function REVOKE recorder never materialized PUBLIC's
+	// implicit default and the renderer re-added the absent owner.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.ownrevfn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function ownrevfn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE EXECUTE ON FUNCTION public.ownrevfn(integer) FROM postgres"); err != nil {
+		t.Fatalf("revoke execute on ownrevfn from postgres: %v", err)
+	}
+
+	// Slice 348: a function-level GRANT … WITH GRANT OPTION must round-trip
+	// through pg_dump from pg_proc.proacl, the routine analogue of the table
+	// grant-option slice 332. `GRANT EXECUTE ON FUNCTION public.gofn(integer) TO
+	// gofn_grantee WITH GRANT OPTION` materializes proacl as
+	// "{=X/postgres,postgres=X/postgres,gofn_grantee=X*/postgres}" — the grantee's
+	// EXECUTE carries the grant-option `*`. pg_dump's getFuncs diffs it against
+	// acldefault('f', 10) and buildACLCommands routes the grant-option privilege
+	// to its privswgo branch, emitting `GRANT ALL ON FUNCTION public.gofn(integer)
+	// TO gofn_grantee WITH GRANT OPTION;` (EXECUTE is the sole function privilege,
+	// so the grantee's full set renders as ALL; verified byte-identical to real
+	// pg_dump 18.3). Before this slice goopg recorded the function grantee with a
+	// plain GrantTablePrivilege, dropping the grant-option flag, so the restored
+	// grant silently lost WITH GRANT OPTION.
+	if err := runSQLSimple(t, c, "CREATE ROLE gofn_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role gofn_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.gofn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function gofn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT EXECUTE ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION"); err != nil {
+		t.Fatalf("grant execute on gofn to gofn_grantee with grant option: %v", err)
+	}
+
+	// Slice 349: a sequence-level GRANT … WITH GRANT OPTION must round-trip through
+	// pg_dump from the sequence's pg_class.relacl, the sequence analogue of the
+	// table grant-option slice 332 and the function grant-option slice 348. Unlike
+	// a function (whose sole privilege EXECUTE collapses to ALL), a sequence has
+	// three distinct privileges (USAGE/SELECT/UPDATE), so a single USAGE grant
+	// stays USAGE rather than rendering as ALL. `GRANT USAGE ON SEQUENCE
+	// public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION` materializes relacl as
+	// "{postgres=rwU/postgres,seq_wgo_role=U*/postgres}" — the grantee's USAGE
+	// carries the grant-option `*`. pg_dump's getTables diffs it against
+	// acldefault('s', 10) = "{postgres=rwU/postgres}" and buildACLCommands routes
+	// the grant-option USAGE to its privswgo branch, emitting `GRANT USAGE ON
+	// SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION;` (verified
+	// byte-identical to real pg_dump 18.3). The grant-option `*` projection in the
+	// relacl renderer and the privswgo split are object-type-agnostic, so the
+	// sequence path needs no new engine work beyond slice 333's recorder plumbing
+	// (which already threads WITH GRANT OPTION through the shared relation ACL
+	// store). Before grant-option threading goopg dropped the flag, emitting a
+	// plain `GRANT USAGE …;`.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.gowgo_seq"); err != nil {
+		t.Fatalf("create sequence gowgo_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE seq_wgo_role"); err != nil {
+		t.Fatalf("create role seq_wgo_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION"); err != nil {
+		t.Fatalf("grant usage on gowgo_seq to seq_wgo_role with grant option: %v", err)
+	}
+
+	// Slice 357 (M0119-0004-ACLHEAP): a TYPE-level GRANT must round-trip through
+	// pg_dump from pg_type.typacl. Unlike relacl/proacl/nspacl — whose catalogs
+	// goopg serves *virtually* (the server records the GRANT in the ACL store and
+	// the virtual builder re-projects it) — pg_type is heap-backed for PG18-standby
+	// basebackup parity (M0097-0022), so a `GRANT USAGE ON TYPE … TO role` must run
+	// through the executor (query.go excludes ON TYPE from the server fast path),
+	// which updates the OID-keyed ACL store AND re-syncs the pg_type heap row's
+	// typacl to a PG-native _aclitem ArrayType. A type's acldefault('T', owner)
+	// grants USAGE to BOTH the owner and PUBLIC, so the GRANT materializes typacl as
+	// "{postgres=U/postgres,=U/postgres,typg_grantee=U/postgres}". pg_dump's getTypes
+	// reads typacl, diffs it against acldefault('T', 10), and buildACLCommands emits
+	// `GRANT ALL ON TYPE public.gtype TO typg_grantee;` (USAGE is the sole type
+	// privilege, so the grantee's full set renders as ALL — like a function's
+	// EXECUTE). Before this milestone goopg baked typacl NULL on every pg_type row
+	// and bailed on every TYPE GRANT, so it was silently dropped from the dump.
+	if err := runSQLSimple(t, c, "CREATE TYPE public.gtype AS ENUM ('lo', 'hi')"); err != nil {
+		t.Fatalf("create type gtype: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE typg_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role typg_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON TYPE public.gtype TO typg_grantee"); err != nil {
+		t.Fatalf("grant usage on type gtype to typg_grantee: %v", err)
+	}
+
+	// Slice 358 (M0119-0004-ACLHEAP, attacl half): a column-level GRANT must
+	// round-trip from the heap-backed pg_attribute.attacl — the column analogue of
+	// the TYPE grant (slice 357). `GRANT SELECT (cola) ON TABLE public.gcoltbl TO
+	// colgrantee` runs through the executor (query.go excludes a parenthesised-column
+	// GRANT from the server fast path), which updates the (relOID, attnum)-keyed
+	// column ACL store and re-syncs the pg_attribute heap row's attacl to a PG-native
+	// _aclitem array "{colgrantee=r/postgres}". A column has no acldefault('c', owner),
+	// so attacl stays NULL until this GRANT. pg_dump's getColumnACLs reads attacl back
+	// (decoded to canonical aclitemout text by the seqscan hook) and emits
+	// `GRANT SELECT(cola) ON TABLE public.gcoltbl TO colgrantee;`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.gcoltbl (cola int, colb int)"); err != nil {
+		t.Fatalf("create table gcoltbl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE colgrantee NOLOGIN"); err != nil {
+		t.Fatalf("create role colgrantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT (cola) ON TABLE public.gcoltbl TO colgrantee"); err != nil {
+		t.Fatalf("grant select(cola) on gcoltbl to colgrantee: %v", err)
+	}
+
+	// Slice 350: a sequence GRANT followed by a partial REVOKE must round-trip,
+	// the sequence analogue of the table partial-REVOKE slice 338 and the schema
+	// partial-REVOKE slice 339. A sequence exposes three privileges
+	// (USAGE/SELECT/UPDATE), so `GRANT USAGE, SELECT ON SEQUENCE` then `REVOKE
+	// SELECT` clears only the SELECT bit, leaving pg_class.relacl as
+	// "{postgres=rwU/postgres,seqrev_role=U/postgres}" (the lone USAGE). pg_dump's
+	// getTables diffs that against acldefault('s', 10) = "{postgres=rwU/postgres}"
+	// and re-emits only `GRANT USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;`
+	// — NOT the revoked SELECT. Verified byte-identical to real pg_dump 18.3. The
+	// shared REVOKE recorder (tryRecordTableRevoke) already removes the bit from
+	// the sequence's relacl (sequences share the relation ACL store with tables),
+	// so this slice adds only a fixture + assert guarding against a regression
+	// that would let the revoked SELECT survive and over-emit `GRANT SELECT, USAGE`.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.seqrev_seq"); err != nil {
+		t.Fatalf("create sequence seqrev_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE seqrev_role"); err != nil {
+		t.Fatalf("create role seqrev_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE, SELECT ON SEQUENCE public.seqrev_seq TO seqrev_role"); err != nil {
+		t.Fatalf("grant usage,select on seqrev_seq to seqrev_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE SELECT ON SEQUENCE public.seqrev_seq FROM seqrev_role"); err != nil {
+		t.Fatalf("revoke select on seqrev_seq from seqrev_role: %v", err)
+	}
+
+	// Slice 351 (setup): a table GRANT ALL collapses to the `ALL` keyword on
+	// round-trip. `GRANT ALL ON TABLE public.grantall_t TO grantall_role` gives the
+	// grantee every table privilege, so pg_class.relacl materializes as
+	// "{postgres=arwdDxtm/postgres,grantall_role=arwdDxtm/postgres}" (all eight
+	// letters, owner default unchanged). pg_dump's getTables diffs the grantee's
+	// full set against acldefault('r', 10) and, recognising it equals
+	// ACL_ALL_RIGHTS_RELATION, re-emits the single `GRANT ALL ON TABLE
+	// public.grantall_t TO grantall_role;` — the `ALL` collapse, not an eight-way
+	// privilege list. This is the table analogue of the function GRANT ALL (slice
+	// 345) and sequence (slice 333) collapses, completing the GRANT ALL coverage
+	// for the most-used object class. Verified byte-identical to real pg_dump 18.3
+	// (relacl + ACL line captured above). The shared grant recorder expands ALL to
+	// allTablePrivileges and renderACLLetters emits "arwdDxtm", so this slice adds
+	// only a fixture + assert guarding against a regression that would drop a
+	// privilege bit (then pg_dump would list the survivors explicitly instead of
+	// `ALL`).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grantall_t(id int)"); err != nil {
+		t.Fatalf("create table grantall_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE grantall_role"); err != nil {
+		t.Fatalf("create role grantall_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT ALL ON TABLE public.grantall_t TO grantall_role"); err != nil {
+		t.Fatalf("grant all on grantall_t to grantall_role: %v", err)
+	}
+
+	// Slice 352 (setup): two distinct grantees on one table each round-trip as
+	// their own GRANT line. `GRANT SELECT … TO mg_role_a` then `GRANT INSERT … TO
+	// mg_role_b` materializes relacl as
+	// "{postgres=arwdDxtm/postgres,mg_role_a=r/postgres,mg_role_b=a/postgres}"
+	// (owner default first, then one aclitem per grantee). pg_dump's
+	// buildACLCommands walks the aclitem array and emits a separate
+	// `GRANT <privs> ON TABLE … TO <grantee>;` per non-owner entry, so the dump
+	// carries two GRANT lines — NOT a merged grantee list. goopg's
+	// relaclTextLockedFor renders grantees in GRANT order (mg_role_a granted before
+	// mg_role_b), matching PostgreSQL's append-on-grant aclitem array, so the relacl
+	// text and both GRANT lines are byte-identical to real pg_dump 18.3 (relacl +
+	// ACL lines captured). The catalog multi-grantee grant-order rendering is
+	// unit-covered (TestRelaclText two-grantee case); this slice adds the
+	// end-to-end pg_dump round-trip guarding the per-grantee fan-out.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.multigrant_t(id int)"); err != nil {
+		t.Fatalf("create table multigrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE mg_role_a"); err != nil {
+		t.Fatalf("create role mg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE mg_role_b"); err != nil {
+		t.Fatalf("create role mg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.multigrant_t TO mg_role_a"); err != nil {
+		t.Fatalf("grant select on multigrant_t to mg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT INSERT ON TABLE public.multigrant_t TO mg_role_b"); err != nil {
+		t.Fatalf("grant insert on multigrant_t to mg_role_b: %v", err)
+	}
+
+	// Slice 353 (setup): two grantees granted the SAME privilege on one table still
+	// round-trip as two separate GRANT lines — PostgreSQL never merges grantees into
+	// a single `GRANT … TO a, b;`, even when their privilege sets are byte-identical.
+	// This is the most tempting case for a (wrong) grantee-merge optimization, so it
+	// gets its own guard distinct from slice 352's differing-priv pair. `GRANT SELECT
+	// … TO sg_role_a` then `GRANT SELECT … TO sg_role_b` materializes relacl as
+	// "{postgres=arwdDxtm/postgres,sg_role_a=r/postgres,sg_role_b=r/postgres}" (owner
+	// default first, then one aclitem per grantee). pg_dump's buildACLCommands walks
+	// the aclitem array and emits one `GRANT SELECT ON TABLE … TO <grantee>;` per
+	// non-owner entry, so the dump carries two identical-privilege GRANT lines.
+	// relaclTextLockedFor renders grantees in GRANT order (sg_role_a granted before
+	// sg_role_b), matching PostgreSQL's append-on-grant aclitem array, so the relacl
+	// text and both GRANT lines are byte-identical to real pg_dump 18.3 (relacl + ACL
+	// lines captured against PG 18.3). Test-only — NO engine change.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.samegrant_t(id int)"); err != nil {
+		t.Fatalf("create table samegrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE sg_role_a"); err != nil {
+		t.Fatalf("create role sg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE sg_role_b"); err != nil {
+		t.Fatalf("create role sg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.samegrant_t TO sg_role_a"); err != nil {
+		t.Fatalf("grant select on samegrant_t to sg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.samegrant_t TO sg_role_b"); err != nil {
+		t.Fatalf("grant select on samegrant_t to sg_role_b: %v", err)
+	}
+
+	// Slice 354 (setup): grantee aclitems are ordered by GRANT ORDER, NOT
+	// alphabetically. Every prior multi-grantee slice (352/353) happened to grant
+	// in alphabetical order, masking a divergence: goopg previously rendered relacl
+	// grantees via sort.Strings, while PostgreSQL's aclupdate APPENDS a brand-new
+	// grantee's aclitem to the end of the array (src/backend/utils/adt/acl.c), so
+	// the array preserves grant order. This fixture grants in REVERSE alphabetical
+	// order — `GRANT SELECT … TO og_role_z` then `… TO og_role_a` — which real PG
+	// 18.3 materializes as
+	// "{postgres=arwdDxtm/postgres,og_role_z=r/postgres,og_role_a=r/postgres}"
+	// (z before a — verified against PG 18.3). The old sort.Strings rendering would
+	// have emitted og_role_a before og_role_z, producing pg_dump GRANT lines in the
+	// WRONG order vs real pg_dump. goopg now tracks per-relation grant order
+	// (catalog.tableACLOrder) and renders grantees in that order, so both the relacl
+	// text and the two GRANT lines round-trip byte-identically. This is the slice
+	// that motivated the grant-order fix (engine change in internal/catalog).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ordergrant_t(id int)"); err != nil {
+		t.Fatalf("create table ordergrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE og_role_z"); err != nil {
+		t.Fatalf("create role og_role_z: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE og_role_a"); err != nil {
+		t.Fatalf("create role og_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_z"); err != nil {
+		t.Fatalf("grant select on ordergrant_t to og_role_z: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_a"); err != nil {
+		t.Fatalf("grant select on ordergrant_t to og_role_a: %v", err)
+	}
+
+	// Slice 355: REVOKE-then-re-GRANT moves a grantee to the END of the relacl
+	// array. PostgreSQL's aclupdate (src/backend/utils/adt/acl.c) DELETES a
+	// fully-revoked grantee's aclitem; a later GRANT to that same grantee APPENDS
+	// a fresh aclitem at the end of the array — it does NOT restore the grantee's
+	// original slot. So granting SELECT to rg_role_a, then rg_role_b, then
+	// REVOKEing rg_role_a's only privilege (SELECT), then re-GRANTing INSERT to
+	// rg_role_a, materializes relacl as
+	// "{postgres=arwdDxtm/postgres,rg_role_b=r/postgres,rg_role_a=a/postgres}"
+	// (b before a, even though a was granted first AND sorts first — verified
+	// against PG 18.3 in ./postgres/local_install). This exercises the grant-order
+	// teardown + re-append path landed in slice 354 (catalog.dropTableACLOrderRole
+	// removes a on the full revoke, then the next GRANT re-appends it at the end);
+	// the pre-fix sort.Strings rendering — and any naive teardown that preserved
+	// a's original position — would both emit a before b, diverging from pg_dump.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.regrant_t(id int)"); err != nil {
+		t.Fatalf("create table regrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE rg_role_a"); err != nil {
+		t.Fatalf("create role rg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE rg_role_b"); err != nil {
+		t.Fatalf("create role rg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.regrant_t TO rg_role_a"); err != nil {
+		t.Fatalf("grant select on regrant_t to rg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.regrant_t TO rg_role_b"); err != nil {
+		t.Fatalf("grant select on regrant_t to rg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE SELECT ON TABLE public.regrant_t FROM rg_role_a"); err != nil {
+		t.Fatalf("revoke select on regrant_t from rg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT INSERT ON TABLE public.regrant_t TO rg_role_a"); err != nil {
+		t.Fatalf("grant insert on regrant_t to rg_role_a: %v", err)
+	}
+
+	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
+	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
+	// is_instead, ev_enabled) and dumpRule re-emits the rule from
+	// pg_get_ruledef(oid) verbatim (pg_dump.c). Before this slice CREATE RULE was
+	// a parse no-op and pg_rewrite was an empty stub, so a DO-NOTHING rule was
+	// silently lost on dump/restore. goopg now records catalog.Table.Rules,
+	// projects them through pg_rewrite, and reconstructs the CREATE RULE in its
+	// pg_get_ruledef handler byte-identically to PG's PRETTYFLAG_INDENT form.
+	// goopg does NOT implement the rewrite system — dump fidelity only. `rule_t`
+	// carries one rule per (event, instead/also) form. Conditional WHERE and
+	// action-command rules are a follow-up slice.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.rule_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table rule_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE r_noins AS ON INSERT TO public.rule_t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("create rule r_noins: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE r_noupd AS ON UPDATE TO public.rule_t DO ALSO NOTHING"); err != nil {
+		t.Fatalf("create rule r_noupd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE r_nodel AS ON DELETE TO public.rule_t DO NOTHING"); err != nil {
+		t.Fatalf("create rule r_nodel: %v", err)
+	}
+
+	// Slice 325: a rule whose pg_rewrite.ev_enabled is not 'O' must round-trip the
+	// `ALTER TABLE … {ENABLE ALWAYS|ENABLE REPLICA|DISABLE} RULE` clause. pg_dump's
+	// dumpRule reads ev_enabled (getRules) and, for any non-'O' rule, emits the
+	// ALTER TABLE *in addition to* the CREATE RULE (pg_dump.c). Before this slice
+	// ALTER TABLE … RULE was a parse no-op and pg_rewrite hard-coded ev_enabled='O',
+	// so a disabled/replica/always rule restored as plain-enabled. goopg now records
+	// catalog.RuleInfo.Enabled and ATExecEnableDisableRule mutates it (pg_rewrite is
+	// virtual, so the change is immediately visible to pg_dump). goopg implements no
+	// rewrite system — dump fidelity only. Disable r_noupd, set r_nodel ENABLE
+	// ALWAYS; r_noins stays origin ('O', no ALTER TABLE emitted).
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rule_t DISABLE RULE r_noupd"); err != nil {
+		t.Fatalf("disable rule r_noupd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rule_t ENABLE ALWAYS RULE r_nodel"); err != nil {
+		t.Fatalf("enable always rule r_nodel: %v", err)
+	}
+
+	// Slice 359: a CONDITIONAL DO-NOTHING CREATE RULE (`WHERE (qual) DO INSTEAD
+	// NOTHING`) must round-trip through pg_dump — the follow-up slice 324 deferred.
+	// pg_get_ruledef's PRETTYFLAG_INDENT layout puts the WHERE clause on its own
+	// line with a 3-space indent and trails the DO action on that line:
+	//   CREATE RULE r AS
+	//       ON UPDATE TO public.rcond
+	//      WHERE (old.a <> new.a) DO INSTEAD NOTHING;
+	// (verified byte-identical vs real pg_dump 18.3, reference /tmp/du359_ref).
+	// Before this slice goopg captured only the unconditional form (slice 324);
+	// a conditional rule fell through to the CompatNoopStmt path and was silently
+	// dropped on dump. goopg now parses the WHERE qual into an expression AST
+	// (parser.CreateRuleStmt.Qual), deparses it via defaultExprToSQL (the same
+	// renderer the trigger WHEN + index-predicate paths use → single-paren
+	// `(old.a <> new.a)`), stores it on catalog.RuleInfo.Qual, and emits it from
+	// the pg_get_ruledef handler. goopg implements no rewrite system — dump
+	// fidelity only. `rcond` carries both a parenthesized (UPDATE) and a
+	// no-paren (DELETE) source qual; both must normalize to the canonical form.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.rcond (a integer, b integer)"); err != nil {
+		t.Fatalf("create table rcond: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE rcond_upd AS ON UPDATE TO public.rcond WHERE (old.a <> new.a) DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("create rule rcond_upd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE rcond_del AS ON DELETE TO public.rcond WHERE old.b > 0 DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("create rule rcond_del: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -2852,6 +4105,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// pg_dump 18.3 (/tmp/du123_pgdata).
 	if err := runSQLSimple(t, c, "CREATE TABLE public.mix (id integer GENERATED ALWAYS AS IDENTITY, n serial, note text)"); err != nil {
 		t.Fatalf("create table mix: %v", err)
+	}
+
+	// Slice 303: an IDENTITY column declared WITH a non-default `(sequence_options)`
+	// clause must round-trip EVERY option through the backing sequence, not just
+	// START WITH. pg_dump reads the identity sequence's definition from pg_sequence
+	// (seqstart/seqincrement/seqmin/seqmax/seqcache/seqcycle) and renders it inside
+	// the `ADD GENERATED ... AS IDENTITY (...)` block. goopg's identity parser
+	// previously captured ONLY START WITH (scanning the parenthesised clause for the
+	// `start` keyword) and hard-coded the backing sequence to `increment=1,
+	// cycle=false, cache=1, type-default min/max` — so `INCREMENT BY 5`, `MINVALUE`,
+	// `MAXVALUE`, `CACHE n`, and `CYCLE` were SILENTLY DROPPED and the column
+	// restored with the wrong step/bounds. The parser now parses the full sequence-
+	// option grammar (mirroring CREATE SEQUENCE: parseCreateSequenceTail) into new
+	// ColumnDef.Identity{Increment,Min,Max,Cache,Cycle} fields, the executor threads
+	// them to RegisterSequence + SetSequenceCache, and the existing slice-120 dump
+	// path re-emits them. `idrich` exercises ALL options together
+	// (ascending, fully-bounded, CYCLE); `idbd` exercises `BY DEFAULT` with an
+	// explicit increment and the explicit `NO MINVALUE / NO MAXVALUE` (which must
+	// keep the type defaults → `NO MINVALUE / NO MAXVALUE` in the dump, not a
+	// spurious bound). Verified byte-identical to real pg_dump 18.3. Each carries it
+	// on its own table so the heavily-asserted tables are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idrich (id integer GENERATED ALWAYS AS IDENTITY "+
+		"(START WITH 100 INCREMENT BY 5 MINVALUE 10 MAXVALUE 9999 CACHE 7 CYCLE), x text)"); err != nil {
+		t.Fatalf("create table idrich: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idbd (id bigint GENERATED BY DEFAULT AS IDENTITY "+
+		"(INCREMENT BY 2 NO MINVALUE NO MAXVALUE), y text)"); err != nil {
+		t.Fatalf("create table idbd: %v", err)
 	}
 
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
@@ -3103,6 +4384,68 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.named_chk AS integer CONSTRAINT must_be_pos CHECK (VALUE > 0)"); err != nil {
 		t.Fatalf("create domain named_chk: %v", err)
+	}
+	// DU-002 slice 363: a COMPOUND (`VALUE > 0 AND VALUE < 100`) or FUNCTION-CALL
+	// (`length(VALUE) > 0`) generic domain CHECK. Like the table-CHECK twin
+	// (slice 362), PG's pg_get_constraintdef re-deparses the stored node with
+	// get_rule_expr, fully parenthesizing every sub-node and deparsing the value
+	// placeholder as the uppercase keyword VALUE: `CHECK (((VALUE > 0) AND (VALUE
+	// < 100)))` and `CHECK ((length(VALUE) > 0))`. goopg previously emitted its
+	// token-reconstructed raw text wrapped once (`CHECK ((VALUE > 0 AND VALUE <
+	// 100))`), which diverged on the per-operand parens and the call-paren spacing.
+	// renderDomainCheckPredicate now re-parses + deparses through the same
+	// fully-parenthesizing renderer the table path uses, upcasing the placeholder.
+	// Verified byte-identical against a throwaway real PG 18.3 cluster. The
+	// single-comparison posqty/named_chk above stay byte-unchanged. (A negative
+	// literal like `VALUE < -5` would dump `'-5'::integer` — the type-blind
+	// literal-cast gap, deferred — so the compound case uses positive literals.)
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkand AS integer CHECK (VALUE > 0 AND VALUE < 100)"); err != nil {
+		t.Fatalf("create domain dchkand: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkfn AS text CHECK (length(VALUE) > 0)"); err != nil {
+		t.Fatalf("create domain dchkfn: %v", err)
+	}
+	// DU-002 slice 385: a domain may declare MULTIPLE CHECK constraints. PG stores
+	// each as a separate pg_constraint row (contype='c', contypid = domain OID) and
+	// pg_dump's getDomainConstraints fetches them `ORDER BY conname`, emitting one
+	// inline `\n\tCONSTRAINT <name> CHECK ((<expr>))` per row. goopg previously
+	// modelled only ONE check per domain (catalog.Domain.CheckExpr/CheckOID), so the
+	// parser silently dropped every CHECK after the first. The model is now a slice
+	// (catalog.Domain.Checks []DomainCheck); the parser appends each clause and the
+	// executor allocates a distinct constraint OID per check. Two UNNAMED checks
+	// exercise PG's ChooseConstraintName disambiguation: the first auto-names
+	// `multichk_check`, the second `multichk_check1`. The mixed domain pairs an
+	// explicit CONSTRAINT name with an unnamed check (auto-named `mixchk_check`).
+	// Positive literals keep clear of the negative-literal-cast gap (slice 364).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.multichk AS integer CHECK (VALUE > 0) CHECK (VALUE < 100)"); err != nil {
+		t.Fatalf("create domain multichk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.mixchk AS integer CONSTRAINT mix_pos CHECK (VALUE > 0) CHECK (VALUE < 50)"); err != nil {
+		t.Fatalf("create domain mixchk: %v", err)
+	}
+	// DU-002 slice 364: a unary minus applied DIRECTLY to a numeric literal — in a
+	// CHECK predicate, a column DEFAULT, an expression-index key, and a domain
+	// CHECK. PG's parser folds `-N` into a negative typed Const (gram.y doNegate)
+	// that ruleutils.c get_const_expr deparses as the quoted-value-plus-cast
+	// `'-N'::type` so it re-parses as ONE constant (not a constant-plus-operator):
+	// an integer literal whose negation fits int4 → `::integer`, a wider one →
+	// `::bigint`, a decimal → `::numeric`. The cast type is the LITERAL's own type,
+	// NOT the column type — a bigint column's `<> -100` still dumps `'-100'::integer`,
+	// and a bigint `DEFAULT -9000000000` dumps `'-9000000000'::bigint`. goopg
+	// previously emitted the re-parseable bare `-N` (slice 302 — semantically equal
+	// but byte-diverging), the deferred gap behind slices 302/360(a)/362(b)/363.
+	// parser.NegatedLiteralSQL now reproduces PG's exact form in BOTH deparse twins
+	// (catalog.formatExprForAttrdef + executor.defaultExprToSQL). Verified
+	// byte-identical against a throwaway real PG 18.3 cluster. negdef above keeps the
+	// COMPOUND `(- (1 + 2))` cases (PG does not fold those).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkneg AS integer CHECK (VALUE < -5)"); err != nil {
+		t.Fatalf("create domain dchkneg: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.neglit (a integer CHECK (a < -5), b numeric CHECK (b > -3.5), c bigint CHECK (c <> -100), d integer DEFAULT -7, e bigint DEFAULT -9000000000)"); err != nil {
+		t.Fatalf("create table neglit with negative-literal check/default: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX neglit_ix ON public.neglit ((a + -7))"); err != nil {
+		t.Fatalf("create index neglit_ix on negative-literal expression: %v", err)
 	}
 	// DU-002 slice 97: a `CHECK (VALUE IN (...))` over a text domain. goopg captures
 	// the membership list in CheckInValues (runtime validation) but previously emitted
@@ -3368,6 +4711,650 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TYPE public.dom_arr_comp AS (label text, zips zipcode[])"); err != nil {
 		t.Fatalf("create type dom_arr_comp: %v", err)
 	}
+	// Slice 373: a TABLE COLUMN whose declared type is a user-defined COMPOSITE
+	// type (`c public.addr`) — the table-column analogue of slice 249's nested
+	// composite FIELD. A composite name is not a built-in, so the CREATE TABLE
+	// column path folds it to the text fallback (TypeNameToOID/ResolveColumnType);
+	// buildUserPGAttributeRow had no composite branch, so pg_attribute.atttypid
+	// stayed text and pg_dump's getTableAttrs → format_type(atttypid, atttypmod)
+	// rendered the column as `text` (and `text[]` for an array column), producing
+	// an UNRESTORABLE dump that silently dropped the composite typing. The builder
+	// now re-resolves the bare composite name to its pg_type OID (scalar) or its
+	// auto-generated array OID (`addr[]`), with the composite's varlena/double-
+	// aligned/extended layout, so the column round-trips as `public.addr` /
+	// `public.addr[]`. public.addr was created above (lower OID dumps first).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.comptcol (c public.addr, carr public.addr[], lbl text)"); err != nil {
+		t.Fatalf("create table comptcol: %v", err)
+	}
+	// Slice 374: a TYPED TABLE `CREATE TABLE name OF composite_type` — the table's
+	// columns are derived from the composite type's fields rather than written in a
+	// column list. PG records pg_class.reloftype = the type's OID; pg_dump's
+	// dumpTableSchema appends ` OF public.addr2type` after the table name and SKIPS
+	// every type-derived column (the `reloftype && !print_default && !print_notnull`
+	// branch), so the CREATE TABLE carries NO parenthesized column list at all —
+	// `CREATE TABLE public.typedtab OF public.addr2type;`. goopg previously rejected
+	// the `OF` form at the parser (syntax error), so a typed table could not be
+	// created, let alone dumped. The parser now accepts it, the executor materializes
+	// the type's fields as ordinary columns (attislocal=true, matching PG's
+	// transformOfType) and stamps catalog.Table.OfTypeOID, and both pg_class builders
+	// (virtual + heap) surface it as reloftype. format_type resolves the reloftype OID
+	// to the qualified composite name (slices 249/250). The COPY column list (a, b)
+	// and a round-tripped data row confirm the columns are real (not dump-only
+	// metadata). A dedicated `addr2type`/`typedtab` pair keeps the comptcol asserts
+	// untouched. (Per-column WITH OPTIONS / non-public composite types remain
+	// deferred — dump-fidelity layer only.)
+	if err := runSQLSimple(t, c, "CREATE TYPE public.addr2type AS (a integer, b text)"); err != nil {
+		t.Fatalf("create type addr2type: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.typedtab OF public.addr2type"); err != nil {
+		t.Fatalf("create typed table: %v", err)
+	}
+	if err := runSQLSimple(t, c, "INSERT INTO public.typedtab (a, b) VALUES (7, 'seven')"); err != nil {
+		t.Fatalf("insert into typed table: %v", err)
+	}
+	// Slice 375: a FOREIGN DATA WRAPPER (`CREATE FOREIGN DATA WRAPPER name`) must
+	// round-trip. pg_dump's getForeignDataWrappers reads ALL rows of
+	// pg_foreign_data_wrapper, casting fdwhandler/fdwvalidator via `::regproc` and
+	// computing acldefault('F', fdwowner); dumpForeignDataWrapper then emits
+	// `CREATE FOREIGN DATA WRAPPER <name>;` (HANDLER/VALIDATOR/OPTIONS omitted when
+	// absent) followed by the owner ALTER. goopg previously parsed CREATE FOREIGN
+	// DATA WRAPPER as a no-op compat object that left the virtual view empty, so
+	// the FDW silently vanished from the dump. The catalog now keeps a dedicated
+	// FDW registry (stable OID per name) that pg_foreign_data_wrapper surfaces, and
+	// the `<oid>::regproc` cast renders InvalidOid (0) as '-' (regprocout) so the
+	// handler/validator clauses are correctly suppressed. (HANDLER/VALIDATOR and
+	// OPTIONS round-trip remain deferred — the parser discards them today.)
+	if err := runSQLSimple(t, c, "CREATE FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create foreign data wrapper: %v", err)
+	}
+	// Slice 376: a FOREIGN SERVER (`CREATE SERVER name FOREIGN DATA WRAPPER fdw`)
+	// must round-trip. pg_dump's getForeignServers reads ALL rows of
+	// pg_foreign_server (srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
+	// acldefault('S', srvowner), and the pg_options_to_table(srvoptions) ARRAY);
+	// dumpForeignServer then recovers the wrapper name via
+	// `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` and emits
+	// `CREATE SERVER <name> FOREIGN DATA WRAPPER <fdwname>;` (TYPE/VERSION/OPTIONS
+	// omitted when absent) followed by `ALTER SERVER <name> OWNER TO postgres;`.
+	// goopg previously parsed CREATE SERVER as a no-op compat object that left the
+	// pg_foreign_server virtual view empty, so the server silently vanished from
+	// the dump. The catalog now keeps a dedicated foreign-server registry (stable
+	// OID per name) that pg_foreign_server surfaces, resolving srvfdw to goopg_fdw's
+	// stable OID (created above, lower OID dumps first). (TYPE/VERSION/OPTIONS and
+	// USER MAPPING round-trip remain deferred — the parser discards options today.)
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create server: %v", err)
+	}
+	// Slice 377: a USER MAPPING (`CREATE USER MAPPING FOR <user> SERVER <srv>`)
+	// must round-trip — AND, critically, this is the slice that REPAIRS the whole
+	// exit-0 pipeline: once any CREATE SERVER exists (slice 376), pg_dump's
+	// dumpForeignServer calls dumpUserMappings, which queries the pg_user_mappings
+	// view. goopg had no such view, so pg_dump aborted with
+	// `relation "pg_user_mappings" does not exist` (exit 1, empty dump) — silently
+	// skipping every positive assertion below. goopg now models pg_user_mappings as
+	// a virtual relation over a dedicated user-mapping registry; dumpUserMappings
+	// reads `usename`/`umoptions WHERE srvid='<oid>'` and emits the bare
+	// `CREATE USER MAPPING FOR <usename> SERVER <srv>;` (no OPTIONS — deferred). The
+	// mapped role must exist first so umuser resolves to a real OID.
+	if err := runSQLSimple(t, c, "CREATE ROLE um_role"); err != nil {
+		t.Fatalf("create role um_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv"); err != nil {
+		t.Fatalf("create user mapping: %v", err)
+	}
+	// Slice 379: a USER MAPPING created `WITH OPTIONS (name 'value', …)` must
+	// round-trip its options. PostgreSQL stores them in pg_user_mapping.umoptions
+	// (surfaced by the pg_user_mappings view) as a text[] of `name=value` elements;
+	// pg_dump's dumpUserMappings expands them server-side via the same
+	// `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||quote_literal(
+	// option_value) FROM pg_options_to_table(umoptions) ORDER BY option_name),
+	// E',\n    ')` shape and re-emits `… OPTIONS (\n    <opt>,\n    <opt>\n)`
+	// (ORDER BY option_name, so `password` precedes `username`). A second server
+	// keeps this mapping's srvid distinct from the option-less one above so the two
+	// dumps don't collide. goopg captures the OPTIONS clause in the parser, stores
+	// it in the user-mapping registry, and surfaces it as the umoptions array
+	// literal — driving goopg's own pg_options_to_table SRF. Verified against real
+	// pg_dump 18.3. (Non-keyword option names are used here so quote_ident is a
+	// no-op on both sides; the reserved-keyword `user` option name is exercised
+	// separately by slice 382, which now round-trips correctly.)
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_um FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create server for um options: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (username 'remote', password 'secret')"); err != nil {
+		t.Fatalf("create user mapping with options: %v", err)
+	}
+	// Slice 382: an OPTION NAME that is a reserved SQL keyword (`user`) must be
+	// double-quoted on the way out. pg_dump expands umoptions server-side with
+	// `quote_ident(option_name)`, and PostgreSQL's quote_identifier() quotes every
+	// keyword whose category is not UNRESERVED_KEYWORD — so `user` emits as the
+	// quoted `"user"`, never the bare keyword. This closes the latent quote_ident
+	// gap flagged by slice 379 (goopg's pgQuoteIdent had no reserved-word check
+	// despite its comment claiming one; now mirrors ruleutils.c via
+	// pgReservedQuoteKeywords). A dedicated server keeps this mapping's srvid
+	// distinct. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_kw FOREIGN DATA WRAPPER goopg_fdw"); err != nil {
+		t.Fatalf("create server for keyword-option um: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (user 'remote')"); err != nil {
+		t.Fatalf("create user mapping with keyword option: %v", err)
+	}
+	// Slice 378: a FOREIGN SERVER created `WITH OPTIONS (name 'value', …)` must
+	// round-trip its options. PostgreSQL stores them in pg_foreign_server.srvoptions
+	// as a text[] of `name=value` elements; pg_dump's getForeignServers expands them
+	// server-side via `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||
+	// quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY
+	// option_name), E',\n    ')`, and dumpForeignServer re-emits
+	// `… OPTIONS (\n    <opt>,\n    <opt>\n)`. Options are emitted ORDER BY
+	// option_name (so dbname precedes host regardless of CREATE order). goopg now
+	// captures the OPTIONS clause in the parser, stores it in the foreign-server
+	// registry, and surfaces it as the srvoptions array literal — driving goopg's
+	// own pg_options_to_table SRF. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'localhost', dbname 'mydb')"); err != nil {
+		t.Fatalf("create server with options: %v", err)
+	}
+	// Slice 381: a FOREIGN SERVER created `WITH TYPE 'x' VERSION 'y'` must
+	// round-trip those clauses. PostgreSQL stores them in pg_foreign_server.srvtype
+	// / srvversion (plain text columns); pg_dump's getForeignServers selects them
+	// directly and dumpForeignServer re-emits ` TYPE 'x' VERSION 'y'` (string
+	// literals via appendStringLiteralAH) between the server name and `FOREIGN DATA
+	// WRAPPER`. goopg now captures TYPE/VERSION in the parser and surfaces them in
+	// the foreign-server registry's virtual pg_foreign_server row. The fixture also
+	// carries an OPTIONS clause so the full `CREATE SERVER … TYPE … VERSION …
+	// FOREIGN DATA WRAPPER … OPTIONS (…)` shape is exercised. Verified against real
+	// pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'remote')"); err != nil {
+		t.Fatalf("create server with type/version: %v", err)
+	}
+	// Slice 380: a FOREIGN DATA WRAPPER created `WITH OPTIONS (name 'value', …)`
+	// must round-trip its options. PostgreSQL stores them in
+	// pg_foreign_data_wrapper.fdwoptions as a text[] of `name=value` elements;
+	// pg_dump's getForeignDataWrappers expands them server-side via
+	// `array_to_string(ARRAY(SELECT quote_ident(option_name)||' '||
+	// quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+	// option_name), E',\n    ')`, and dumpForeignDataWrapper re-emits
+	// `CREATE FOREIGN DATA WRAPPER <name> OPTIONS (\n    <opt>,\n    <opt>\n);`.
+	// Options are emitted ORDER BY option_name (so debug precedes delimiter
+	// regardless of CREATE order). goopg now captures the OPTIONS clause in the
+	// parser, stores it in the FDW registry, and surfaces it as the fdwoptions
+	// array literal — driving goopg's own pg_options_to_table SRF. A dedicated
+	// wrapper (goopg_fdw stays bare so the slice-375 no-OPTIONS assertion holds).
+	// CREATE order (delimiter, debug) differs from option_name order (debug,
+	// delimiter) so the ORDER BY is exercised. Metachar-free values keep the
+	// text[] literal unambiguous (array-metachar quoting is deferred — see the
+	// ledger). Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (delimiter 'pipe', debug 'true')"); err != nil {
+		t.Fatalf("create fdw with options: %v", err)
+	}
+	// Slice 384: an OPTIONS value containing an array metacharacter (here a comma)
+	// must round-trip. PostgreSQL stores srvoptions as a text[] of `name=value`
+	// elements rendered with array_out, which double-quotes any element carrying a
+	// comma/brace/space/quote/backslash — `{"host=a,b"}` — so pg_dump's
+	// pg_options_to_table(srvoptions) re-splits the element on its first `=` and
+	// recovers value `a,b` intact. Before slice 384 goopg comma-joined the literal
+	// bare (`{host=a,b}`), so the SRF split on the embedded comma and corrupted the
+	// option list. goopg now quotes each element per array_out (quoteArrayElement),
+	// so the value survives. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'a,b')"); err != nil {
+		t.Fatalf("create server with metachar option: %v", err)
+	}
+	// Slice 417: a FOREIGN TABLE (`CREATE FOREIGN TABLE name (cols) SERVER srv
+	// [OPTIONS (...)]`) must round-trip. pg_dump's getTables selects relkind IN
+	// (..., 'f', ...); for a relkind='f' row it LEFT JOINs
+	// `pg_foreign_table ft ON (ft.ftrelid = c.oid)` to recover ftserver, and
+	// dumpTableSchema emits `CREATE FOREIGN TABLE <name> (\n <cols>\n)\nSERVER
+	// <srvname>\nOPTIONS (\n <opt>\n);` (recovering srvname via
+	// `SELECT srvname FROM pg_foreign_server WHERE oid = ftserver`) instead of
+	// the plain `CREATE TABLE` form. goopg previously discarded the entire
+	// `SERVER ... OPTIONS (...)` suffix in the parser (relkind stayed 'r' and
+	// pg_foreign_table was hardcoded empty), so a foreign table silently dumped
+	// as an ordinary table. The parser now captures ForeignServer/
+	// ForeignOptions on CreateTableStmt; the executor validates the SERVER
+	// name (42704 if unknown, mirroring real PG) and sets
+	// catalog.Table.ForeignServerName/ForeignOptions, which drive relkind='f'
+	// and a real pg_foreign_table row. Reuses goopg_srv (created at slice 376)
+	// so no new CREATE SERVER is needed.
+	// Slice 418: the column's own `OPTIONS (column_name 'col1')` clause is now
+	// also captured (ColumnDef.FDWOptions -> catalog.Column.FDWOptions ->
+	// pg_attribute.attfdwoptions), so pg_dump's per-column FDW-options query
+	// (`pg_options_to_table(attfdwoptions)`) recovers it and dumpTableSchema
+	// emits a trailing `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN c1 OPTIONS
+	// (...)` statement — asserted below. Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE FOREIGN TABLE public.goopg_ftable (c1 int options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name 'x1')"); err != nil {
+		t.Fatalf("create foreign table: %v", err)
+	}
+	// Slice 422: CREATE PUBLICATION must survive the dump. Before this slice,
+	// `pg_publication.pubowner` (internal/initdb/replication_views.go) was
+	// hardcoded to the empty string ("roles aren't OID-stable yet"). Real
+	// pg_dump's getPublications() always selects pubowner and calls
+	// getRoleName() on it, which pg_fatal()s with "role with OID %u does not
+	// exist" the instant it can't parse a valid OID — so this wasn't a
+	// cosmetic gap, it made pg_dump ABORT ENTIRELY (nonzero exit, nothing
+	// dumped) for any database containing a publication, regardless of what
+	// else the fixture covered. catalog.Publication now carries an Owner
+	// field, set to the bootstrap superuser OID (10) by CreatePublication —
+	// the same hardcoded-owner convention CREATE CONVERSION/other DDL already
+	// use pending real per-session ownership tracking — and the
+	// pg_publication view renders it instead of "". Verified against real
+	// pg_dump 18.3: it emits `CREATE PUBLICATION goopg_pub1 FOR ALL TABLES
+	// WITH (publish = 'insert, update, delete');` (goopg's
+	// DefaultPublicationOptions leaves `truncate` off — M0008-out-of-scope,
+	// so it's correctly absent from the WITH-list) plus an `ALTER PUBLICATION
+	// ... OWNER TO postgres;` follow-up, both asserted below.
+	if err := runSQLSimple(t, c, "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES"); err != nil {
+		t.Fatalf("create publication: %v", err)
+	}
+	// Slice 423: CREATE SUBSCRIPTION must round-trip and pg_dump must not
+	// abort. Real pg_dump's getSubscriptions() (only run for a superuser
+	// connection, which this fixture is) selects subowner PLUS the PG16/17
+	// additions subpasswordrequired/subrunasowner/suborigin/subfailover by
+	// name — before this slice pg_subscription had neither the populated
+	// subowner NOR those four columns at all, so the query would either
+	// pg_fatal() on getRoleName("") (the pubowner-shaped bug) or fail
+	// outright with "column s.subpasswordrequired does not exist" (a
+	// distinct, more severe bug: the whole SELECT never even runs).
+	// connect=false keeps this a pure catalog registration — goopg's
+	// execCreateSubscription never dials the conninfo target itself either
+	// way (the apply launcher wake is async and out of band).
+	if err := runSQLSimple(t, c, "CREATE SUBSCRIPTION goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote' PUBLICATION goopg_pub1 WITH (connect = false, slot_name = goopg_sub1)"); err != nil {
+		t.Fatalf("create subscription: %v", err)
+	}
+	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
+	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
+	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
+	// getExtensions discovers it and dumpExtension re-emits `CREATE EXTENSION IF
+	// NOT EXISTS amcheck WITH SCHEMA public;` plus any extension comment.
+	if err := runSQLSimple(t, c, "CREATE EXTENSION amcheck"); err != nil {
+		t.Fatalf("create extension amcheck: %v", err)
+	}
+	// Slice 389: a user collation (CREATE COLLATION) must round-trip through
+	// pg_dump. goopg records it in the runtime pg_collation registry with a user
+	// namespace (public=2200) and an OID >= 16384, so pg_dump's getCollations
+	// selects it for dump (the BKI-pinned pg_catalog built-ins are skipped) and
+	// dumpCollation re-emits `CREATE COLLATION public.mycoll (provider = libc,
+	// locale = 'C');`. For the default libc provider, LOCALE sets both
+	// collcollate and collctype to 'C' (colllocale stays NULL), and since they
+	// are equal dumpCollation collapses them to a single `locale =` clause.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.mycoll (LOCALE = 'C')"); err != nil {
+		t.Fatalf("create collation mycoll: %v", err)
+	}
+	// Slice 390: a comment on that user collation must round-trip too. pg_dump's
+	// dumpCollation emits a trailing `COMMENT ON COLLATION public.mycoll IS '...'`
+	// from pg_description keyed on the collation's catalogId (pg_collation=3456)
+	// and objsubid 0. The executor resolves the collation OID via the same
+	// userCollations registry getCollations dumps from. Before this slice the
+	// parser had no COMMENT ON COLLATION branch and silently swallowed it.
+	if err := runSQLSimple(t, c, "COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation'"); err != nil {
+		t.Fatalf("comment on collation mycoll: %v", err)
+	}
+	// Slice 391: non-default collation forms must round-trip through the
+	// per-provider branches of dumpCollation (pg_dump.c:14930+). An ICU
+	// non-deterministic collation exercises two branches the libc fixture above
+	// does not: `provider = icu` (collprovider 'i', the locale rides colllocale
+	// while collcollate/collctype stay NULL) and `deterministic = false`
+	// (collisdeterministic 'f', emitted right after the provider). goopg does
+	// not order strings with ICU — only the schema-dump round-trip is modeled —
+	// so the locale is stored verbatim and replayed by pg_dump.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_coll (provider = icu, locale = 'und-u-ks-level2', deterministic = false)"); err != nil {
+		t.Fatalf("create collation ci_coll: %v", err)
+	}
+	// Slice 391: `CREATE COLLATION new FROM existing` copies the source's
+	// attributes (DefineCollation's FROM branch in collationcmds.c reads
+	// collform->collisdeterministic etc.), so a collation derived from the
+	// non-deterministic ci_coll must itself dump as `deterministic = false`.
+	// The executor's FROM path previously dropped the deterministic flag.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_from FROM public.ci_coll"); err != nil {
+		t.Fatalf("create collation ci_from: %v", err)
+	}
+	// Slice 392: an ICU collation with tailoring `rules` must round-trip through
+	// the last unexercised limb of dumpCollation's `provider = icu` branch — the
+	// `if (collicurules) { appendPQExpBufferStr(q, ", rules = "); ... }` clause
+	// (pg_dump.c:14988). collicurules is `text`, so an absent value must read as
+	// NULL (VirtualNull), not '' — otherwise dumpCollation would emit a spurious
+	// `, rules = ''` on every ICU collation. This collation is deterministic, so
+	// the canonical order is `(provider = icu, locale = '...', rules = '...')`
+	// with no deterministic clause. goopg does not interpret the ICU rules — only
+	// the schema-dump round-trip is modeled — so they are stored verbatim.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.ci_rules (provider = icu, locale = 'und', rules = '&V << w <<< W')"); err != nil {
+		t.Fatalf("create collation ci_rules: %v", err)
+	}
+	// Slice 393: the two remaining unexercised dumpCollation provider branches —
+	// (a) the libc `else` limb where lc_collate != lc_ctype, and (b) the `provider
+	// = builtin` branch (pg_dump.c:14934+). Slices 389–392 only ever drove the
+	// libc collapse path (collcollate == collctype → single `locale =`) and the
+	// icu path; the libc two-clause form and the builtin provider were already
+	// modeled by execCreateCollation/the pg_collation virtual builder but never
+	// round-tripped end-to-end against real pg_dump.
+	//
+	// (a) libc with distinct lc_collate/lc_ctype. dumpCollation's libc branch
+	// (collprovider 'c') warns unless collcollate && collctype are both set and
+	// colllocale/collicurules are NULL, then — because strcmp(collcollate,
+	// collctype) != 0 — emits the `lc_collate = '...', lc_ctype = '...'` pair
+	// instead of the collapsed `locale =`. goopg stores LcCollate/LcCtype verbatim
+	// (collate='C', ctype='POSIX'), leaves colllocale NULL, so real pg_dump renders
+	// `(provider = libc, lc_collate = 'C', lc_ctype = 'POSIX')`.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.libc_diff (LC_COLLATE = 'C', LC_CTYPE = 'POSIX')"); err != nil {
+		t.Fatalf("create collation libc_diff: %v", err)
+	}
+	// (b) PG17+ `provider = builtin` (collprovider 'b'). dumpCollation's builtin
+	// branch warns unless colllocale is set and collcollate/collctype/collicurules
+	// are NULL, then emits `provider = builtin, locale = '...'`. goopg stores the
+	// locale on uc.Locale (colllocale) and leaves collcollate/collctype NULL, so
+	// real pg_dump renders `(provider = builtin, locale = 'C')`. 'C' is one of the
+	// builtin provider's accepted locales (C / C.UTF-8 / PG_UNICODE_FAST).
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C')"); err != nil {
+		t.Fatalf("create collation builtin_coll: %v", err)
+	}
+	// Slice 394: a table column declared `COLLATE <user-collation>` must round-trip.
+	// Slices 389–393 made a user collation itself dump (CREATE COLLATION), and slice
+	// 188 made a column collated with a BUILT-IN collation dump (`COLLATE
+	// pg_catalog."C"`), but a column referencing a CREATE COLLATION collation was
+	// silently dropped: the attcollation surfacing only resolved built-in collation
+	// names (collationNameToOID) to an OID, so a user-collation name fell through to
+	// the type default (typcollation), getTableAttrs saw no difference, and pg_dump
+	// emitted no COLLATE clause. The executor now falls back to the user-collation
+	// registry (catalog.UserCollationOIDByName) for a non-built-in name, so the
+	// shadowed attcollation OID lets pg_dump's findCollationByOid →
+	// fmtQualifiedDumpable re-emit the schema-qualified `COLLATE public.usercoll`.
+	// The uncollated `b` keeps the type default and must stay clause-free.
+	if err := runSQLSimple(t, c, "CREATE COLLATION public.usercoll (LOCALE = 'C')"); err != nil {
+		t.Fatalf("create collation usercoll: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.usercollcol (a text COLLATE public.usercoll, b text)"); err != nil {
+		t.Fatalf("create table usercollcol: %v", err)
+	}
+	// Slice 395: a user-defined CAST (`CREATE CAST (src AS tgt) WITHOUT FUNCTION`)
+	// must round-trip. pg_dump's getCasts reads ALL pg_cast rows (built-in casts
+	// are excluded by OID at dump-out time, so a no-user-cast cluster stays empty),
+	// then dumpCast renders `CREATE CAST (<src> AS <tgt>) WITHOUT FUNCTION[ AS
+	// ASSIGNMENT|IMPLICIT];`, recovering the type names via
+	// getFormattedTypeName(castsource/casttarget). goopg previously parsed CREATE
+	// CAST as an outright error (no dispatch case), so the catalog never saw it.
+	// The parser now records source/target + castcontext/castmethod on a
+	// CompatNoopStmt, the executor registers it in the catalog cast registry, and
+	// the pg_cast virtual view surfaces a dumpable row whose castsource/casttarget
+	// resolve to the canonical built-in pg_type OIDs (text=25, bytea=17). castfunc
+	// stays 0 (WITHOUT FUNCTION), so dumpCast skips findFuncByOid. The two casts
+	// exercise the default explicit context (no AS clause) and AS ASSIGNMENT.
+	// Verified byte-identical vs real pg_dump 18.3 (reference /tmp/castpg). WITH
+	// FUNCTION casts are deferred (need a pg_proc row for findFuncByOid).
+	if err := runSQLSimple(t, c, "CREATE CAST (text AS bytea) WITHOUT FUNCTION"); err != nil {
+		t.Fatalf("create cast text->bytea: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT"); err != nil {
+		t.Fatalf("create cast bytea->text: %v", err)
+	}
+	// Slice 396: a COMMENT on a user-defined CAST must round-trip. pg_dump's
+	// dumpCast emits a trailing `COMMENT ON CAST (<src> AS <tgt>) IS '...';` when
+	// the cast's catalogId (classoid=pg_cast=2605, objsubid 0) carries a
+	// pg_description row. goopg's parser previously had no COMMENT ON CAST branch
+	// and silently swallowed it (the comment never reached pg_description). The
+	// parser now captures the (source, target) type pair into
+	// CastSource/CastTarget, the executor resolves the cast's OID via
+	// catalog.CastByTypes and stores the comment under pg_cast, and the
+	// pg_description virtual view surfaces it so dumpCast re-emits the COMMENT.
+	// Verified byte-identical vs real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea'"); err != nil {
+		t.Fatalf("comment on cast text->bytea: %v", err)
+	}
+	// Slice 397: a WITH FUNCTION cast must round-trip. pg_dump's dumpCast
+	// COERCION_METHOD_FUNCTION arm calls findFuncByOid(castfunc) and renders
+	// `WITH FUNCTION <ns>.<signature>` via format_function_signature (which
+	// reads the function's real pg_proc.proargtypes). goopg previously parsed
+	// the WITH FUNCTION form but discarded the function reference (castfunc
+	// stayed 0), so dumpCast warned "bogus value in pg_cast.castfunc". The parser
+	// now captures the function name + arg types, and the executor resolves them
+	// to the routine's pg_proc OID (identical to the OID goopg's pg_proc virtual
+	// view assigns the function), so castfunc is non-zero and the func/cast
+	// cross-reference matches. text->integer has no built-in cast in PG (pg_cast.dat),
+	// so the user cast is unambiguous. Verified byte-identical vs real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.text_as_int(text) RETURNS integer LANGUAGE sql AS $$ SELECT length($1) $$"); err != nil {
+		t.Fatalf("create function text_as_int: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)"); err != nil {
+		t.Fatalf("create cast text->integer with function: %v", err)
+	}
+	// DU-002 slice 404 follow-up (CAST builtin-fallback wiring): a WITH FUNCTION
+	// cast referencing a PG built-in (not user-created) routine must also
+	// round-trip. dumpCast's COERCION_METHOD_FUNCTION arm ALWAYS schema-qualifies
+	// the function ("format_function_signature won't qualify it" per pg_dump.c),
+	// so the built-in age(timestamptz) — exposed via the same
+	// catalog.LookupBuiltinProc fallback resolveTransformFunc already used
+	// (DU-002 slice 404) — renders `WITH FUNCTION pg_catalog.age(...)`. This is
+	// the exact upstream TAP fixture from postgres/src/bin/pg_dump/t/002_pg_dump.pl
+	// ('CREATE CAST FOR timestamptz'). Before this loop the CAST WITH-FUNCTION arm
+	// had no built-in fallback, so age(timestamptz) failed to resolve and
+	// castfunc stayed 0 (`CREATE CAST ... WITH FUNCTION age(...)` — see
+	// dumpCast's "bogus value in pg_cast.castfunc" warning).
+	if err := runSQLSimple(t, c, "CREATE CAST (timestamptz AS interval) WITH FUNCTION age(timestamptz) AS ASSIGNMENT"); err != nil {
+		t.Fatalf("create cast timestamptz->interval with builtin function: %v", err)
+	}
+	// Slice 399/401: a CREATE [DEFAULT] CONVERSION must round-trip. pg_dump's
+	// getConversions reads every pg_conversion row (built-ins live in pg_catalog
+	// and are filtered out at dump-out time, so a no-user-conversion cluster stays
+	// empty), then dumpConversion queries pg_encoding_to_char(conforencoding/
+	// contoencoding) + conproc + condefault and emits `CREATE [DEFAULT] CONVERSION
+	// <ns>.<name> FOR '<for>' TO '<to>' FROM <conproc>;`. goopg previously parsed
+	// CREATE CONVERSION as a name-only no-op (pg_conversion stayed empty), so the
+	// conversion never round-tripped. The parser now captures the FOR/TO encoding
+	// names + FROM function + DEFAULT flag, the executor resolves the encodings to
+	// pg_enc IDs and registers the conversion, and the pg_conversion virtual view
+	// surfaces a dumpable row. The `FROM public.myconv_func` reference is stored
+	// as-written and re-emitted schema-qualified (matching pg_dump's
+	// empty-search_path regproc output). Verified byte-identical vs real pg_dump
+	// 18.3 (whose conversion function is a genuine fmgr-callable; only the dump
+	// text is compared here).
+	//
+	// Slice 401 (function half): CreateConversionCommand requires the FROM
+	// function to resolve to the fixed signature
+	// (int4, int4, cstring, internal, int4, bool) -> int4 (LookupFuncName +
+	// get_func_rettype), so myconv_func/aliasconv_func must be real catalog
+	// functions, not bare names — a LANGUAGE C stub body is never invoked (goopg
+	// has no encoding-conversion engine), only its signature/return type matter.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.myconv_func(integer, integer, cstring, internal, integer, boolean) RETURNS integer LANGUAGE c AS 'myconv_func'"); err != nil {
+		t.Fatalf("create function myconv_func: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func"); err != nil {
+		t.Fatalf("create default conversion: %v", err)
+	}
+	// Slice 400: the FOR/TO names accept the full pg_encname_tbl alias set, not
+	// just the 42 canonical pg_enc2name names — `pg_char_to_encoding` resolves
+	// "unicode"→UTF8 and "mskanji"→SJIS. The stored conforencoding/contoencoding
+	// IDs are canonical, so dumpConversion's pg_encoding_to_char re-emits the
+	// canonical 'SJIS'/'UTF8', proving the alias resolved (a bare -1 would dump
+	// FOR '' instead). Closes slice-399 deferral (a).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.aliasconv_func(integer, integer, cstring, internal, integer, boolean) RETURNS integer LANGUAGE c AS 'aliasconv_func'"); err != nil {
+		t.Fatalf("create function aliasconv_func: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CONVERSION public.aliasconv FOR 'mskanji' TO 'unicode' FROM public.aliasconv_func"); err != nil {
+		t.Fatalf("create conversion with encoding aliases: %v", err)
+	}
+	// Slice 401 (encoding half): CREATE CONVERSION validates the FOR/TO encoding
+	// names exactly as PG's CreateConversionCommand (conversioncmds.c): an unknown
+	// encoding is ERRCODE_UNDEFINED_OBJECT (42704) and SQL_ASCII as either
+	// endpoint is ERRCODE_INVALID_OBJECT_DEFINITION (42P17). The encoding checks
+	// run before the FROM-function lookup (matching PG's check order), so these
+	// negative cases reach 42704/42P17 even though `public.f` does not exist.
+	// These rows must NOT register — the conversions above are the only dumpable
+	// pg_conversion rows.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.badretconv_func(integer, integer, cstring, internal, integer, boolean) RETURNS boolean LANGUAGE c AS 'badretconv_func'"); err != nil {
+		t.Fatalf("create function badretconv_func: %v", err)
+	}
+	for _, neg := range []struct{ sql, code, msg string }{
+		{"CREATE CONVERSION public.badenc FOR 'NOSUCHENC' TO 'UTF8' FROM public.f",
+			"42704", `source encoding "NOSUCHENC" does not exist`},
+		{"CREATE CONVERSION public.badenc FOR 'UTF8' TO 'BOGUS' FROM public.f",
+			"42704", `destination encoding "BOGUS" does not exist`},
+		{"CREATE CONVERSION public.badenc FOR 'SQL_ASCII' TO 'UTF8' FROM public.f",
+			"42P17", `encoding conversion to or from "SQL_ASCII" is not supported`},
+		// Slice 401 (function half): a non-existent FROM function is rejected with
+		// 42883 reporting the FIXED required signature (not whatever overloads
+		// happen to exist), matching LookupFuncName's error.
+		{"CREATE CONVERSION public.badfunc FOR 'LATIN1' TO 'UTF8' FROM public.nosuchconvfunc",
+			"42883", `function public.nosuchconvfunc(integer, integer, cstring, internal, integer, boolean) does not exist`},
+		// Slice 401 (function half): a FROM function with the right signature but
+		// the wrong return type (boolean, not integer) is rejected with 42P17,
+		// matching get_func_rettype's check.
+		{"CREATE CONVERSION public.badretconv FOR 'LATIN1' TO 'UTF8' FROM public.badretconv_func",
+			"42P17", `encoding conversion function public.badretconv_func must return type integer`},
+	} {
+		err := runSQLSimple(t, c, neg.sql)
+		if err == nil {
+			t.Fatalf("expected error for %q, got nil", neg.sql)
+		}
+		if pe, ok := err.(*pq.Error); ok {
+			if string(pe.Code) != neg.code {
+				t.Errorf("%q: SQLSTATE = %s, want %s (msg=%s)", neg.sql, pe.Code, neg.code, pe.Message)
+			}
+			if !strings.Contains(pe.Message, neg.msg) {
+				t.Errorf("%q: message %q does not contain %q", neg.sql, pe.Message, neg.msg)
+			}
+		} else {
+			t.Errorf("%q: error = %T (%v), want *pq.Error", neg.sql, err, err)
+		}
+	}
+	// DU-002 slice 404 follow-up (CONVERSION builtin-fallback wiring): a
+	// CONVERSION whose FROM function is a real PG encoding-conversion built-in
+	// (not user-created) must also round-trip. This is the exact upstream TAP
+	// fixture from postgres/src/bin/pg_dump/t/002_pg_dump.pl ('CREATE CONVERSION
+	// dump_test.test_conversion'; goopg's harness uses the public schema like
+	// every other fixture in this test, not the upstream dump_test schema).
+	// Unlike CAST, dumpConversion's query selects conproc directly off
+	// pg_conversion (no pg_proc join), so it renders whatever conproc text the
+	// server returns — since the builtin's FuncOID (4374) is never a user
+	// routine, pg_conversion's VirtualRows falls back to the as-written,
+	// unqualified `iso8859_1_to_utf8` text, which happens to match real PG's
+	// (search_path-relative) regproc output for a pg_catalog function exactly.
+	// Before this loop resolveConversionFunc had no built-in fallback, so this
+	// CREATE CONVERSION failed outright with 42883 "function ...
+	// iso8859_1_to_utf8(...) does not exist".
+	if err := runSQLSimple(t, c, "CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8"); err != nil {
+		t.Fatalf("create default conversion from builtin function: %v", err)
+	}
+	// Slice 404 (connsetup): CREATE TRANSFORM FOR int LANGUAGE sql, exercising
+	// resolveTransformFunc's builtin fallback (catalog.LookupBuiltinProc) added
+	// this loop. Both WITH FUNCTION references (prsd_lextype/int4recv) are
+	// PG built-ins, not user-created routines — before this loop goopg's live
+	// pg_proc exposed no built-in function by name/OID at all, so trffromsql/
+	// trftosql stayed 0 and dumpTransform would have warned + emitted an empty
+	// `()`. This is the exact upstream TAP fixture from
+	// postgres/src/bin/pg_dump/t/002_pg_dump.pl ('CREATE TRANSFORM FOR int').
+	if err := runSQLSimple(t, c, "CREATE TRANSFORM FOR int LANGUAGE sql "+
+		"(FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))"); err != nil {
+		t.Fatalf("create transform for int: %v", err)
+	}
+	// Slice 405: CREATE AGGREGATE must round-trip via getAggregates/dumpAgg.
+	// This is the exact upstream TAP fixture from
+	// postgres/src/bin/pg_dump/t/002_pg_dump.pl ('CREATE AGGREGATE
+	// dump_test.newavg'; public-schema-adapted like every other fixture in
+	// this test). SFUNC/FINALFUNC (int4_avg_accum/int8_avg) are the same
+	// builtin-fallback functions PG's own avg(int4) uses internally — curated
+	// in catalog.LookupBuiltinProc (mirrors the slice 404 TRANSFORM/CAST/
+	// CONVERSION builtin-fallback pattern). Before this loop `pg_aggregate`
+	// was not even a SQL-queryable relation (no Table registered for it at
+	// all, built-in aggregates included), which made dumpAgg's own
+	// `FROM pg_aggregate a, pg_proc p WHERE a.aggfnoid = p.oid` query
+	// impossible for ANY aggregate — see internal/initdb/pg_aggregate_view.go.
+	if err := runSQLSimple(t, c, "CREATE AGGREGATE public.newavg ("+
+		"sfunc = int4_avg_accum, basetype = int4, stype = _int8, "+
+		"finalfunc = int8_avg, finalfunc_modify = shareable, initcond1 = '{0,0}')"); err != nil {
+		t.Fatalf("create aggregate newavg: %v", err)
+	}
+	// Slice 405 follow-up (loop #58 ledger resume point (a)): ALTER AGGREGATE
+	// ... OWNER TO must round-trip through a real pg_dump 18.3 run. dumpAgg
+	// (pg_dump.c) reads the owner from pg_proc.proowner for the aggregate's
+	// aggfnoid; pg_backup_archiver.c's _getObjectDescription/_printTocEntry
+	// then emit `ALTER AGGREGATE <sig> OWNER TO <role>;` whenever the owner
+	// isn't the bootstrap superuser (mirrors the ALTER STATISTICS/ALTER TABLE
+	// OWNER TO assertions elsewhere in this file). This exercises
+	// pg_proc_view.go's aggregate proowner projection (OwnerOrDefault) end to
+	// end, not just via unit test.
+	if err := runSQLSimple(t, c, "CREATE ROLE agg_owner_role"); err != nil {
+		t.Fatalf("create role agg_owner_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER AGGREGATE public.newavg(int4) OWNER TO agg_owner_role"); err != nil {
+		t.Fatalf("alter aggregate newavg owner to agg_owner_role: %v", err)
+	}
+	// DU-002 slice 405 resume point (a): an aggregate created in a
+	// non-public schema must round-trip schema-qualified, not silently
+	// default to public. Before this fix UserAggregate had no
+	// Schema/NamespaceOID field at all, so pg_proc_view.go hardcoded
+	// pronamespace=2200 (public) for every user aggregate regardless of
+	// where CREATE AGGREGATE actually put it. Reuses schema "s" (created
+	// earlier in this fixture, slice-2431 area) and the same
+	// builtin-fallback sfunc/finalfunc as newavg to keep the fixture
+	// minimal — this is purely a namespace-resolution probe, not a new
+	// SFUNC/FINALFUNC combination.
+	if err := runSQLSimple(t, c, "CREATE AGGREGATE s.schemedavg ("+
+		"sfunc = int4_avg_accum, basetype = int4, stype = _int8, "+
+		"finalfunc = int8_avg, finalfunc_modify = shareable, initcond1 = '{0,0}')"); err != nil {
+		t.Fatalf("create aggregate s.schemedavg: %v", err)
+	}
+	// Slice 406: CREATE OPERATOR must round-trip via getOperators/dumpOpr.
+	// CREATE OPERATOR was previously a name-registration-only compat no-op
+	// (internal/executor/operators_ddl.go's "operator" case only fed the
+	// generic DROP-OPERATOR-lookup registry, never catalog.pg_operator) —
+	// pg_operator's virtual view was unconditionally empty by construction
+	// (DU-002 slice 9's original rationale: "goopg defines no user
+	// operators"), which was only true because CREATE OPERATOR could never
+	// actually populate it. This is the exact upstream TAP fixture's simplest
+	// case (postgres/src/bin/pg_dump/t/002_pg_dump.pl 'CREATE OPERATOR CLASS
+	// dump_test.op_class_custom', operator half only — the OPERATOR CLASS half
+	// is a separate, larger deferral, see the ledger). FUNCTION resolves
+	// through the same catalog.LookupBuiltinProc builtin fallback slice 404/405
+	// established (int4eq newly curated this loop).
+	if err := runSQLSimple(t, c, "CREATE OPERATOR public.~~ (FUNCTION = int4eq, LEFTARG = int, RIGHTARG = int)"); err != nil {
+		t.Fatalf("create operator public.~~: %v", err)
+	}
+	// Slice 408: CREATE OPERATOR FAMILY must round-trip via
+	// getOpfamilies/dumpOpfamily, byte-identical to a real pg_dump 18.3 run.
+	// Unlike CREATE OPERATOR, CREATE OPERATOR FAMILY was a total parse gap
+	// before this loop (ALTER OPERATOR FAMILY had a generic OWNER-TO compat
+	// stub, but CREATE OPERATOR FAMILY fell into no branch at all and errored
+	// as "unsupported statement"). This is upstream's own bare
+	// `CREATE OPERATOR FAMILY dump_test.op_family USING btree;` fixture
+	// (postgres/src/bin/pg_dump/t/002_pg_dump.pl) — the family starts empty
+	// (no AS clause in PG's grammar); OPERATOR/FUNCTION members added via
+	// ALTER OPERATOR FAMILY ... ADD are a separate, larger deferral (see the
+	// ledger; CREATE OPERATOR CLASS itself is a pre-existing minimal stub
+	// that does not populate pg_opfamily/pg_opclass either).
+	if err := runSQLSimple(t, c, "CREATE OPERATOR FAMILY public.op_family USING btree"); err != nil {
+		t.Fatalf("create operator family public.op_family: %v", err)
+	}
+	// Slice 409: CREATE OPERATOR CLASS must round-trip via
+	// getOpclasses/dumpOpclass, byte-identical to a real pg_dump 18.3 run.
+	// This is upstream's own `op_class_empty` fixture (002_pg_dump.pl) — a
+	// class with a STORAGE clause but no OPERATOR/FUNCTION members, so
+	// dumpOpclass's pg_amop/pg_amproc member queries (gated on pg_depend,
+	// still unmodeled — see the ledger) correctly return 0 rows and only the
+	// STORAGE clause needs to round-trip. CREATE OPERATOR CLASS was
+	// previously a minimal M0097-0027 stub that only tracked the FUNCTION 2
+	// hash-extended support function + a bare schema association — it never
+	// touched pg_opclass, so getOpclasses always read 0 rows.
+	if err := runSQLSimple(t, c, "CREATE OPERATOR CLASS public.op_class_empty "+
+		"FOR TYPE bigint USING btree FAMILY public.op_family AS STORAGE bigint"); err != nil {
+		t.Fatalf("create operator class public.op_class_empty: %v", err)
+	}
+	// Slice 415: ALTER OPERATOR FAMILY ... ADD (opclasscmds.c AlterOpFamilyAdd)
+	// attaches "loose" OPERATOR/FUNCTION members directly to a family with no
+	// owning opclass — the gap the slice 408 fixture above deliberately left
+	// open (op_family stays empty; this uses a SEPARATE family so that
+	// negative assertion is unaffected). Reuses the loop #39 curated int8
+	// btree builtin-operator set (=, <, btint8cmp) so the members resolve
+	// without a user-defined operator. Real PG's storeOperators/
+	// storeProcedures give every loose member a SOFT (AUTO, 'a') pg_depend
+	// dependency on the FAMILY itself, never a hard dependency on a class —
+	// this is what lets dumpOpfamily's own loose-member query (filtered on
+	// refclassid=pg_opfamily) find and re-emit them as a follow-up ALTER
+	// OPERATOR FAMILY ... ADD statement, verified byte-identical against a
+	// live PG 18.3 instance below.
+	if err := runSQLSimple(t, c, "CREATE OPERATOR FAMILY public.op_family_loose USING btree"); err != nil {
+		t.Fatalf("create operator family public.op_family_loose: %v", err)
+	}
+	if err := runSQLSimple(t, c, `ALTER OPERATOR FAMILY public.op_family_loose USING btree ADD
+    OPERATOR 1 < (bigint, bigint),
+    OPERATOR 3 = (bigint, bigint),
+    FUNCTION 1 (bigint, bigint) btint8cmp(bigint, bigint)`); err != nil {
+		t.Fatalf("alter operator family public.op_family_loose add: %v", err)
+	}
 	// Slice 257: a composite field with an explicit per-field COLLATE must round
 	// through pg_dump. The field's pg_attribute.attcollation shadows the type
 	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
@@ -3449,7 +5436,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `ALTER TYPE public.multi_comp ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C"`); err != nil {
 		t.Fatalf("alter type multi_comp multi-subcommand: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, dca dchkand, dcf dchkfn, mck multichk, mxck mixchk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -3822,6 +5809,83 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// recognises FUNCTION + its argument signature, and execCommentOn resolves
 		// the routine OID (Routines().Lookup) and keys it under pg_proc (1255).
 		"COMMENT ON FUNCTION public.add_one(integer) IS 'a function comment'",
+		// Slice 315: COMMENT ON STATISTICS must survive the dump now that the
+		// extended-statistics object itself round-trips (slice 314). goopg already
+		// parsed COMMENT ON STATISTICS (parser.go) and execCommentOn keys it under
+		// pg_statistic_ext (classoid 3381, via LookupStatistics) — but with no
+		// dumpable statistics object before slice 314 the collectComments path was
+		// never reachable, so this was untested. pg_dump's dumpStatisticsExt calls
+		// dumpComment for the stats object, which finds the pg_description row
+		// (classoid=3381, objoid=stxoid) and re-emits
+		// `COMMENT ON STATISTICS <nsp>.<name> IS '...'`.
+		"COMMENT ON STATISTICS public.statext_all IS 'a statistics comment'",
+		// Slice 370: COMMENT ON TRIGGER must survive the dump. Before this slice,
+		// parseCommentOnTail had no TRIGGER branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `TRIGGER <name> ON <table>` (the shape pg_dump itself emits), and
+		// execCommentOn resolves the trigger by name on the named table and keys it
+		// under pg_trigger (classoid 2620, objsubid 0). pg_dump's dumpTrigger calls
+		// dumpComment with the trigger's catalogId (tableoid=2620), finds the
+		// pg_description row, and re-emits
+		// `COMMENT ON TRIGGER <name> ON <schema>.<table> IS '...'`. trg_biu is the
+		// BEFORE INSERT OR UPDATE trigger on public.trig_t created above (slice 319).
+		"COMMENT ON TRIGGER trg_biu ON public.trig_t IS 'a trigger comment'",
+		// Slice 371: COMMENT ON POLICY must survive the dump. Before this slice,
+		// parseCommentOnTail had no POLICY branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `POLICY <name> ON <table>` (the shape pg_dump itself emits), and
+		// execCommentOn resolves the policy by name on the named table and keys it
+		// under pg_policy (classoid 3256, objsubid 0). pg_dump's dumpPolicy calls
+		// dumpComment with the policy's catalogId (tableoid=3256), finds the
+		// pg_description row, and re-emits
+		// `COMMENT ON POLICY <name> ON <schema>.<table> IS '...'`. p_simple is the
+		// permissive ALL policy on public.pol_t created above (slice 323).
+		"COMMENT ON POLICY p_simple ON public.pol_t IS 'a policy comment'",
+		// Slice 372: COMMENT ON RULE must survive the dump. Before this slice,
+		// parseCommentOnTail had no RULE branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `RULE <name> ON <table>` (the shape pg_dump itself emits), and
+		// execCommentOn resolves the rule by name on the named table and keys it
+		// under pg_rewrite (classoid 2618, objsubid 0). pg_dump's dumpRule calls
+		// dumpComment with the rule's catalogId (tableoid=2618), finds the
+		// pg_description row, and re-emits
+		// `COMMENT ON RULE <name> ON <schema>.<table> IS '...'`. r_noins is the
+		// unconditional DO-NOTHING ON INSERT rule on public.rule_t (slice 324).
+		"COMMENT ON RULE r_noins ON public.rule_t IS 'a rule comment'",
+		// Slice 386: COMMENT ON SERVER must survive the dump. Before this slice,
+		// parseCommentOnTail had no SERVER branch, so the server silently swallowed
+		// it and the comment never reached pg_description. The parser now recognises
+		// `SERVER <name>` (a top-level, schema-less object), and execCommentOn
+		// resolves the foreign server by name (catalog ForeignServerOID) and keys it
+		// under pg_foreign_server (classoid 1417, objsubid 0). pg_dump's
+		// dumpForeignServer calls dumpComment with the server's catalogId
+		// (tableoid=1417), finds the pg_description row, and re-emits
+		// `COMMENT ON SERVER <name> IS '...'`. goopg_srv is the bare foreign server
+		// created in slice 376.
+		"COMMENT ON SERVER goopg_srv IS 'a server comment'",
+		// Slice 387: COMMENT ON FOREIGN DATA WRAPPER must survive the dump, the
+		// sibling of COMMENT ON SERVER. Before this slice, parseCommentOnTail had
+		// no FOREIGN DATA WRAPPER branch, so the statement was silently swallowed
+		// and the comment never reached pg_description. The parser now recognises
+		// `FOREIGN DATA WRAPPER <name>` (FOREIGN is a reserved keyword, DATA/WRAPPER
+		// are ident-keywords; a top-level, schema-less object), and execCommentOn
+		// resolves the FDW by name (catalog ForeignDataWrapperOID) and keys it under
+		// pg_foreign_data_wrapper (classoid 2328, objsubid 0). pg_dump's
+		// dumpForeignDataWrapper calls dumpComment with the FDW's catalogId
+		// (tableoid=2328), finds the pg_description row, and re-emits
+		// `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. goopg_fdw is the bare
+		// foreign-data wrapper created in slice 375.
+		"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'",
+		// Slice 388: COMMENT ON EXTENSION must survive the dump. Before this slice,
+		// parseCommentOnTail had no EXTENSION branch, so the server silently
+		// swallowed it and the comment never reached pg_description. The parser now
+		// recognises `EXTENSION <name>` (a top-level, schema-less object), and
+		// execCommentOn resolves the extension by name (catalog ExtensionOID) and
+		// keys it under pg_extension (classoid 3079, objsubid 0). pg_dump's
+		// dumpExtension calls dumpComment with the extension's catalogId
+		// (tableoid=3079), finds the pg_description row, and re-emits
+		// `COMMENT ON EXTENSION <name> IS '...'`. amcheck is installed above.
+		"COMMENT ON EXTENSION amcheck IS 'an extension comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -6001,6 +8065,238 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "d text COLLATE") {
 			t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (collcol.d)\n  full stdout=%q", res.Stdout)
 		}
+		// **Slice 394 (asserted):** a column collated with a USER collation. Unlike
+		// the built-in case (pg_catalog."C"), a CREATE COLLATION collation in public
+		// dumps schema-qualified as `COLLATE public.usercoll`. Before the fix the
+		// attcollation surfacing resolved only built-in names, so usercollcol.a fell
+		// back to the type default and the clause vanished. The negative check is
+		// scoped to the usercollcol block because another table (collcol.b) legitimately
+		// carries `b text COLLATE pg_catalog."POSIX"`.
+		if idx := strings.Index(res.Stdout, "CREATE TABLE public.usercollcol ("); idx < 0 {
+			t.Errorf("pg_dump dropped the usercollcol table entirely\n  full stdout=%q", res.Stdout)
+		} else {
+			block := res.Stdout[idx:]
+			if end := strings.Index(block, ");"); end >= 0 {
+				block = block[:end]
+			}
+			if !strings.Contains(block, "a text COLLATE public.usercoll") {
+				t.Errorf("pg_dump dropped a column's user-collation COLLATE clause; missing %q\n  usercollcol block=%q", "a text COLLATE public.usercoll", block)
+			}
+			if strings.Contains(block, "b text COLLATE") {
+				t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (usercollcol.b)\n  usercollcol block=%q", block)
+			}
+		}
+		// **Slice 395 (asserted):** user-defined casts (CREATE CAST … WITHOUT
+		// FUNCTION) must round-trip via getCasts → dumpCast. The explicit-context
+		// cast renders with no AS clause; the assignment cast appends AS ASSIGNMENT.
+		// Both byte-identical to real pg_dump 18.3. A regression that dropped the
+		// pg_cast registry surfacing (or mis-resolved the type OIDs) re-surfaces
+		// exactly here.
+		for _, want := range []string{
+			"CREATE CAST (text AS bytea) WITHOUT FUNCTION;",
+			"CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump missing user cast %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// **Slice 396 (asserted):** a COMMENT on a user-defined cast must round-trip
+		// via dumpCast's trailing COMMENT ON CAST. The comment text reaches
+		// pg_description keyed on (classoid=pg_cast=2605, objoid=cast.oid); a
+		// regression that dropped the pg_cast comment storage or the COMMENT ON CAST
+		// parser branch re-surfaces exactly here.
+		if want := "COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea';"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing cast comment %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 397 (asserted):** a WITH FUNCTION cast must round-trip via
+		// dumpCast's COERCION_METHOD_FUNCTION arm. The clause names the function
+		// schema-qualified with its real signature (format_function_signature).
+		// A regression that dropped the castfunc resolution (castfunc back to 0)
+		// makes dumpCast warn and emit a bare `WITH FUNCTION` with no name — caught
+		// exactly here.
+		if want := "CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing WITH FUNCTION cast %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **DU-002 slice 404 follow-up (asserted):** a WITH FUNCTION cast
+		// referencing a PG built-in (age(timestamptz), not a user routine) must
+		// also round-trip, resolving via the new catalog.LookupBuiltinProc
+		// fallback in the CAST WITH-FUNCTION arm. Byte-identical to real pg_dump
+		// 18.3's rendering of the upstream 002_pg_dump.pl 'CREATE CAST FOR
+		// timestamptz' fixture (schema-qualified pg_catalog.age, "timestamp with
+		// time zone" spelled out in full). A regression that drops the built-in
+		// fallback leaves castfunc at 0 and dumpCast warns + emits a bare
+		// `WITH FUNCTION` — caught exactly here.
+		if want := "CREATE CAST (timestamp with time zone AS interval) WITH FUNCTION pg_catalog.age(timestamp with time zone) AS ASSIGNMENT;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing built-in WITH FUNCTION cast %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 399 (asserted):** a CREATE [DEFAULT] CONVERSION must round-trip via
+		// getConversions / dumpConversion. dumpConversion renders the FOR/TO encoding
+		// literals through pg_encoding_to_char(conforencoding/contoencoding) and the
+		// conproc regproc (empty search_path → schema-qualified). A regression that
+		// drops the pg_conversion virtual row, the encoding-ID resolution, or the
+		// pg_encoding_to_char builtin re-surfaces exactly here (missing line, or
+		// FOR '' / FROM with the wrong name).
+		if want := "CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing DEFAULT CONVERSION %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 400 (asserted):** a CONVERSION created with non-canonical encoding
+		// aliases ('mskanji'→SJIS, 'unicode'→UTF8 via pg_encname_tbl) must dump the
+		// canonical names. If alias resolution regressed, the IDs would be -1 and the
+		// dump would read FOR '' TO '' instead.
+		if want := "CREATE CONVERSION public.aliasconv FOR 'SJIS' TO 'UTF8' FROM public.aliasconv_func;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing alias CONVERSION %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **DU-002 slice 404 follow-up (asserted):** a CONVERSION whose FROM
+		// function is a real PG encoding-conversion built-in (iso8859_1_to_utf8,
+		// not a user routine) must also round-trip, resolving via the new
+		// catalog.LookupBuiltinProc fallback in resolveConversionFunc. Unlike
+		// CAST, conproc is unqualified here (dumpConversion selects it raw off
+		// pg_conversion, no pg_proc join) — matching real PG's regproc output for
+		// a pg_catalog function. Byte-identical to real pg_dump 18.3's rendering
+		// of the upstream 002_pg_dump.pl 'CREATE CONVERSION dump_test.test_conversion'
+		// fixture (adapted to the public schema like every other fixture here).
+		if want := "CREATE DEFAULT CONVERSION public.isoconv FOR 'LATIN1' TO 'UTF8' FROM iso8859_1_to_utf8;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing built-in CONVERSION %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 404 (asserted):** CREATE TRANSFORM FOR int must round-trip via
+		// getTransforms / dumpTransform. Both WITH FUNCTION references resolve
+		// through the new catalog.LookupBuiltinProc fallback (int4recv/
+		// prsd_lextype are PG built-ins, not user routines) to non-zero
+		// trffromsql/trftosql, and goopg's live pg_proc view now surfaces those
+		// two built-in rows so findFuncByOid's client-side lookup succeeds.
+		// Byte-identical to real pg_dump 18.3's rendering of the upstream
+		// 002_pg_dump.pl 'CREATE TRANSFORM FOR int' fixture (schema-qualified
+		// pg_catalog.<func>, integer/sql spelled out in full).
+		if want := "CREATE TRANSFORM FOR integer LANGUAGE sql (FROM SQL WITH FUNCTION pg_catalog.prsd_lextype(internal), TO SQL WITH FUNCTION pg_catalog.int4recv(internal));"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE TRANSFORM %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 405 (asserted):** CREATE AGGREGATE public.newavg must round-trip
+		// via getAggregates/dumpAgg, byte-identical to real pg_dump 18.3's
+		// rendering of the upstream 002_pg_dump.pl 'CREATE AGGREGATE
+		// dump_test.newavg' fixture (public-schema-adapted). Exercises: pg_proc
+		// exposing a prokind='a' row for the aggregate (registerPgProcView),
+		// pg_aggregate becoming SQL-queryable at all (registerPgAggregateView),
+		// the regproc/oid cross-type comparison analyzer fix (isComparable) that
+		// dumpAgg's own `a.aggfnoid = p.oid` join depends on, and
+		// pg_get_function_arguments resolving a non-Routine aggregate OID.
+		if want := "CREATE AGGREGATE public.newavg(integer) (\n" +
+			"    SFUNC = int4_avg_accum,\n" +
+			"    STYPE = bigint[],\n" +
+			"    INITCOND = '{0,0}',\n" +
+			"    FINALFUNC = int8_avg,\n" +
+			"    FINALFUNC_MODIFY = SHAREABLE\n" +
+			");"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE AGGREGATE %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 405 follow-up (asserted, loop #58 ledger resume point (a)):**
+		// ALTER AGGREGATE ... OWNER TO must round-trip. dumpAgg reads the owner
+		// from pg_proc.proowner for the aggregate's aggfnoid; _getObjectDescription
+		// treats AGGREGATE like FUNCTION/OPERATOR (strips "DROP " off the DROP
+		// statement to build the ALTER target), so the emitted line is
+		// `ALTER AGGREGATE public.newavg(integer) OWNER TO agg_owner_role;`.
+		// Before this fixture, pg_proc_view.go's `proowner` projection for a
+		// user aggregate (OwnerOrDefault) was only unit-tested, never proven
+		// against a real pg_dump 18.3 run.
+		if want := "ALTER AGGREGATE public.newavg(integer) OWNER TO agg_owner_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER AGGREGATE OWNER TO %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **DU-002 slice 405 resume point (a) (closed, asserted):** an aggregate
+		// created in a non-public schema must round-trip schema-qualified.
+		// dumpAgg (pg_dump.c) always renders `CREATE AGGREGATE %s.%s (...)` with
+		// `fmtId(aggnamespace)` — unconditionally schema-qualified, unlike some
+		// other object kinds that omit the schema when it matches search_path —
+		// so a namespace-resolution bug here cannot hide behind the public
+		// default the way it could for, say, a bare unqualified reference.
+		// Before this fix, pg_proc_view.go hardcoded pronamespace=2200 for
+		// every user aggregate, so this would have wrongly dumped as
+		// `CREATE AGGREGATE public.schemedavg`.
+		if want := "CREATE AGGREGATE s.schemedavg(integer) (\n" +
+			"    SFUNC = int4_avg_accum,\n" +
+			"    STYPE = bigint[],\n" +
+			"    INITCOND = '{0,0}',\n" +
+			"    FINALFUNC = int8_avg,\n" +
+			"    FINALFUNC_MODIFY = SHAREABLE\n" +
+			");"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing non-public-schema CREATE AGGREGATE %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 406 (asserted):** CREATE OPERATOR public.~~ must round-trip via
+		// getOperators/dumpOpr, byte-identical to a real pg_dump 18.3 run (verified
+		// against a live PG18 instance: `CREATE OPERATOR public.~~ (FUNCTION =
+		// int4eq, LEFTARG = int, RIGHTARG = int);` dumps exactly this shape,
+		// including the trailing `ALTER OPERATOR ... OWNER TO` line — dumpOpr's
+		// FUNCTION clause uses convertRegProcReference, which truncates the
+		// regprocedure text at the first unquoted '(' so only the bare function
+		// name (no arg-type list) appears, and LEFTARG/RIGHTARG spell out
+		// `int` -> `integer` via format_type). Before this loop CREATE OPERATOR
+		// was a name-registration-only compat no-op that never touched
+		// pg_operator, so pg_dump's getOperators query always returned 0 rows —
+		// this is the first user-defined operator this test ever creates.
+		if want := "CREATE OPERATOR public.~~ (\n" +
+			"    FUNCTION = int4eq,\n" +
+			"    LEFTARG = integer,\n" +
+			"    RIGHTARG = integer\n" +
+			");"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE OPERATOR %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "ALTER OPERATOR public.~~ (integer, integer) OWNER TO"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR OWNER TO for public.~~\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 408 (asserted):** CREATE OPERATOR FAMILY public.op_family must
+		// round-trip via getOpfamilies/dumpOpfamily, byte-identical to real
+		// pg_dump 18.3 (verified against a live PG18 instance and matches
+		// upstream's own `002_pg_dump.pl` bare-family fixture verbatim, modulo
+		// the schema name). dumpOpfamily emits the fixed `CREATE OPERATOR
+		// FAMILY %s USING %s;` shape unconditionally, then an `ALTER ... ADD`
+		// clause ONLY when pg_amop/pg_amproc carry loose members tied to this
+		// family via pg_depend — an empty family (this one; goopg does not yet
+		// implement ALTER OPERATOR FAMILY ... ADD) has neither, so no ALTER ...
+		// ADD line should appear. The generic archiver-level OWNER TO mechanism
+		// (same one that produced the CREATE OPERATOR assertion above) derives
+		// the object description from the DROP statement text, so it reads
+		// "OPERATOR FAMILY public.op_family USING btree", not just the bare name.
+		if want := "CREATE OPERATOR FAMILY public.op_family USING btree;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE OPERATOR FAMILY %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "ALTER OPERATOR FAMILY public.op_family USING btree OWNER TO"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR FAMILY OWNER TO for public.op_family\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "ALTER OPERATOR FAMILY public.op_family USING btree ADD") {
+			t.Errorf("pg_dump emitted a spurious ALTER OPERATOR FAMILY ... ADD for an empty family\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 409 (asserted):** CREATE OPERATOR CLASS public.op_class_empty
+		// must round-trip via getOpclasses/dumpOpclass, byte-identical to real
+		// pg_dump 18.3 (matches upstream's own `op_class_empty` 002_pg_dump.pl
+		// fixture verbatim, modulo the schema name). dumpOpclass renders `FOR
+		// TYPE bigint USING btree FAMILY public.op_family AS` then the STORAGE
+		// clause — opckeytype is actually InvalidOid here (a STORAGE clause
+		// matching the class's own FOR TYPE is a no-op, reset server-side per
+		// opclasscmds.c DefineOpClass — M0119-0004 slice 413), so this line
+		// comes from pg_dump's own client-side "dummy STORAGE clause" fallback
+		// (fired whenever the AS-list would otherwise render empty, since
+		// `... AS ;` isn't valid SQL), not the keytype branch; no OPERATOR/
+		// FUNCTION lines follow since this class declares no members.
+		if want := "CREATE OPERATOR CLASS public.op_class_empty\n" +
+			"    FOR TYPE bigint USING btree FAMILY public.op_family AS\n" +
+			"    STORAGE bigint;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing CREATE OPERATOR CLASS %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 415 (asserted):** ALTER OPERATOR FAMILY ... ADD loose members
+		// must round-trip via dumpOpfamily's own loose-member query, byte-
+		// identical to a live PG 18.3 run (verified manually against
+		// postgres/local_install in this loop) — including the trailing space
+		// before each OPERATOR entry's comma, a real pg_dump formatting quirk
+		// (dumpOpfamily's own printfPQExpBuffer call, not something goopg
+		// controls).
+		if want := "CREATE OPERATOR FAMILY public.op_family_loose USING btree;\n" +
+			"ALTER OPERATOR FAMILY public.op_family_loose USING btree ADD\n" +
+			"    OPERATOR 1 <(bigint,bigint) ,\n" +
+			"    OPERATOR 3 =(bigint,bigint) ,\n" +
+			"    FUNCTION 1 (bigint, bigint) btint8cmp(bigint,bigint);"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR FAMILY ... ADD %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "ALTER OPERATOR FAMILY public.op_family_loose USING btree OWNER TO"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump missing ALTER OPERATOR FAMILY OWNER TO for public.op_family_loose\n  full stdout=%q", res.Stdout)
+		}
 		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
 		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation
 		// (950/100/100); once the heap typcollation for these array OIDs matches the
@@ -6153,6 +8449,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// its user-given name AND re-emit the ` NO INHERIT` suffix; the
 			// PartitionCheckConstraint per-constraint flag was previously absent.
 			"CONSTRAINT chk3_pos CHECK ((z > 0)) NO INHERIT",
+			// **Slice 362:** a compound/function-call table-level CHECK round-trips
+			// with PG's per-node parenthesization. `a > 0 AND b > 0` deparses each
+			// operand with its own parens; `length(name) > 0` drops the spaces the
+			// token reconstruction inserts around the call's parens. The legacy
+			// `CHECK ((<raw>))` wrap produced `CHECK ((a > 0 AND b > 0))` and
+			// `CHECK ((length ( name ) > 0))` — both byte-divergences from real pg_dump.
+			"CONSTRAINT chkand_check CHECK (((a > 0) AND (b > 0)))",
+			"CONSTRAINT chkor_check CHECK (((a < 0) OR (b > 10)))",
+			"CONSTRAINT chkfn_name_check CHECK ((length(name) > 0))",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
@@ -6201,6 +8506,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// before `);`), silently changing its inheritance semantics on restore.
 		if strings.Contains(res.Stdout, "CONSTRAINT chk2_y_check CHECK ((y > 0))\n") {
 			t.Errorf("pg_dump dropped NO INHERIT from an anonymous CHECK\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 362 negative guards: the legacy token-text wrap would emit the
+		// un-parenthesized compound predicate and the space-padded function call;
+		// either is a byte-divergence that would re-parse with different precedence.
+		for _, neg := range []string{
+			"CHECK ((a > 0 AND b > 0))",
+			"CHECK ((a < 0 OR b > 10))",
+			"length ( name )",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted the legacy token-text CHECK wrap: %q\n  full stdout=%q", neg, res.Stdout)
+			}
 		}
 		// Slice 129 negative guard: dropping the per-constraint flag on the named
 		// path would render chk3_pos as a plain inheritable CHECK (terminated by a
@@ -6256,10 +8573,722 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// the signature via pg_get_function_identity_arguments and emits the
 			// comment keyed off pg_description (classoid=pg_proc).
 			"COMMENT ON FUNCTION public.add_one(integer) IS 'a function comment';",
+			// **Slice 315 (asserted):** COMMENT ON STATISTICS must round-trip. The
+			// extended-statistics object only became dumpable in slice 314, so the
+			// dumpStatisticsExt→dumpComment path that re-emits this line was never
+			// exercised before. pg_dump keys it off pg_description (classoid=3381,
+			// pg_statistic_ext) and renders the schema-qualified object name.
+			"COMMENT ON STATISTICS public.statext_all IS 'a statistics comment';",
+			// **Slice 370 (asserted):** COMMENT ON TRIGGER must round-trip. It was
+			// silently swallowed (parser had no TRIGGER branch). The parser now
+			// captures `TRIGGER <name> ON <table>` and execCommentOn keys the comment
+			// under pg_trigger (classoid 2620). pg_dump's dumpTrigger calls dumpComment
+			// with the trigger's catalogId (tableoid=2620) and re-emits the line below.
+			"COMMENT ON TRIGGER trg_biu ON public.trig_t IS 'a trigger comment';",
+			// **Slice 371 (asserted):** COMMENT ON POLICY must round-trip. It was
+			// silently swallowed (parser had no POLICY branch). The parser now
+			// captures `POLICY <name> ON <table>` and execCommentOn keys the comment
+			// under pg_policy (classoid 3256). pg_dump's dumpPolicy calls dumpComment
+			// with the policy's catalogId (tableoid=3256) and re-emits the line below.
+			"COMMENT ON POLICY p_simple ON public.pol_t IS 'a policy comment';",
+			// **Slice 372 (asserted):** COMMENT ON RULE must round-trip. It was
+			// silently swallowed (parser had no RULE branch). The parser now
+			// captures `RULE <name> ON <table>` and execCommentOn keys the comment
+			// under pg_rewrite (classoid 2618). pg_dump's dumpRule calls dumpComment
+			// with the rule's catalogId (tableoid=2618) and re-emits the line below.
+			"COMMENT ON RULE r_noins ON public.rule_t IS 'a rule comment';",
+			// **Slice 386 (asserted):** COMMENT ON SERVER must round-trip. It was
+			// silently swallowed (parser had no SERVER branch). The parser now
+			// captures `SERVER <name>` and execCommentOn keys the comment under
+			// pg_foreign_server (classoid 1417). pg_dump's dumpForeignServer calls
+			// dumpComment with the server's catalogId (tableoid=1417) and re-emits
+			// the line below.
+			"COMMENT ON SERVER goopg_srv IS 'a server comment';",
+			// **Slice 387 (asserted):** COMMENT ON FOREIGN DATA WRAPPER must
+			// round-trip, the sibling of COMMENT ON SERVER. It was silently
+			// swallowed (parser had no FOREIGN DATA WRAPPER branch). The parser now
+			// captures `FOREIGN DATA WRAPPER <name>` and execCommentOn keys the
+			// comment under pg_foreign_data_wrapper (classoid 2328). pg_dump's
+			// dumpForeignDataWrapper calls dumpComment with the FDW's catalogId
+			// (tableoid=2328) and re-emits the line below.
+			"COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment';",
+			// **Slice 388 (asserted):** COMMENT ON EXTENSION must round-trip. It was
+			// silently swallowed (parser had no EXTENSION branch). The parser now
+			// captures `EXTENSION <name>` and execCommentOn keys the comment under
+			// pg_extension (classoid 3079). pg_dump's dumpExtension calls dumpComment
+			// with the extension's catalogId (tableoid=3079) and re-emits the line
+			// below. amcheck is the installed extension (CREATE EXTENSION above).
+			"COMMENT ON EXTENSION amcheck IS 'an extension comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a COMMENT; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 389 (asserted):** a user collation (CREATE COLLATION) must
+		// round-trip. goopg records it in the runtime pg_collation registry with
+		// a user namespace (public=2200) and an OID >= 16384; pg_dump's
+		// getCollations selects it (BKI-pinned pg_catalog built-ins are skipped)
+		// and dumpCollation reconstructs the DDL from collprovider/collcollate/
+		// collctype. For libc with collcollate == collctype, the two collapse to a
+		// single `locale =` clause. Before this slice CREATE COLLATION was a hard
+		// parse error, so no collation reached the catalog and pg_dump emitted
+		// nothing.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.mycoll (provider = libc, locale = 'C');") {
+			t.Errorf("pg_dump dropped the user collation; missing CREATE COLLATION public.mycoll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 390 (asserted):** a comment on that collation must round-trip.
+		// dumpCollation emits a trailing COMMENT ON COLLATION from pg_description
+		// keyed on the collation's catalogId (pg_collation=3456). The executor
+		// resolves the collation OID via the userCollations registry. Before this
+		// slice COMMENT ON COLLATION was a parser drop, so pg_description had no row
+		// and pg_dump emitted nothing.
+		if !strings.Contains(res.Stdout, "COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation';") {
+			t.Errorf("pg_dump dropped the collation comment; missing COMMENT ON COLLATION public.mycoll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 391 (asserted):** an ICU non-deterministic collation must
+		// round-trip through dumpCollation's `provider = icu` /
+		// `deterministic = false` branches. The locale rides colllocale (NULL
+		// collcollate/collctype), and the deterministic flag is emitted right
+		// after the provider, so the canonical form is
+		// `(provider = icu, deterministic = false, locale = '...')`.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_coll (provider = icu, deterministic = false, locale = 'und-u-ks-level2');") {
+			t.Errorf("pg_dump dropped the ICU non-deterministic collation; missing CREATE COLLATION public.ci_coll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 391 (asserted):** a `CREATE COLLATION ... FROM existing`
+		// collation must inherit the source's deterministic flag. The executor's
+		// FROM path previously copied provider/locale but dropped Deterministic,
+		// so ci_from would have dumped without `deterministic = false`.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_from (provider = icu, deterministic = false, locale = 'und-u-ks-level2');") {
+			t.Errorf("pg_dump dropped the FROM-derived collation's deterministic flag; missing CREATE COLLATION public.ci_from\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 392 (asserted):** an ICU collation with tailoring `rules` must
+		// re-emit the trailing `, rules = '...'` clause. collicurules is `text`,
+		// so a collation with no rules must read NULL (not '') or every ICU
+		// collation would dump a spurious `rules = ''`. ci_rules is deterministic,
+		// so the canonical order is provider, locale, rules (no deterministic).
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.ci_rules (provider = icu, locale = 'und', rules = '&V << w <<< W');") {
+			t.Errorf("pg_dump dropped the ICU collation rules clause; missing CREATE COLLATION public.ci_rules\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 393 (asserted):** the libc two-clause form (lc_collate != lc_ctype)
+		// must NOT collapse to a single `locale =`. dumpCollation emits the pair only
+		// when strcmp(collcollate, collctype) != 0, so a regression that stored the
+		// LOCALE on uc.Locale (colllocale) instead of collcollate/collctype — or that
+		// forced collctype = collcollate — would drop the lc_ctype clause here.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.libc_diff (provider = libc, lc_collate = 'C', lc_ctype = 'POSIX');") {
+			t.Errorf("pg_dump dropped the libc lc_collate/lc_ctype pair; missing CREATE COLLATION public.libc_diff\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 393 (asserted):** the `provider = builtin` branch must round-trip.
+		// dumpCollation renders builtin collations as `provider = builtin, locale =
+		// '...'` reading colllocale (collcollate/collctype must be NULL). A regression
+		// that mapped the builtin provider through the libc collate/ctype slots would
+		// either warn ("invalid collation") or emit the wrong clause.
+		if !strings.Contains(res.Stdout, "CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C');") {
+			t.Errorf("pg_dump dropped the builtin-provider collation; missing CREATE COLLATION public.builtin_coll\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
+		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef
+		// path and created the two objects in the fixture, but never asserted the
+		// emitted DDL through pg_dump. dumpStatisticsExt runs
+		// pg_get_statisticsobjdef(oid) and emits the result verbatim + ';'. A
+		// default object (all three kinds, >1 column) emits no kinds clause; an
+		// explicit single-kind object emits `(ndistinct)`. Both forms are guarded
+		// here so a regression in BuildStatisticsObjDef (kinds suppression, column
+		// list, or schema qualification) is caught.
+		statExtDDL := []string{
+			"CREATE STATISTICS public.statext_all ON a, b FROM public.statext_t;",
+			"CREATE STATISTICS public.statext_nd (ndistinct) ON b, c FROM public.statext_t;",
+			// **Slice 316 (asserted):** expression extended-statistics objects must
+			// round-trip. A single-expression object suppresses the kinds clause
+			// (it must be expression stats); a column+expression object lists the
+			// column first then the parenthesized expression. Mirrors ruleutils.c
+			// pg_get_statisticsobj_worker. Before slice 316 BuildStatisticsObjDef
+			// declined on HasExpr, so pg_dump dropped these objects entirely.
+			"CREATE STATISTICS public.statext_expr ON (a + b) FROM public.statext_t;",
+			"CREATE STATISTICS public.statext_mix ON a, (b + c) FROM public.statext_t;",
+		}
+		for _, sub := range statExtDDL {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a CREATE STATISTICS object; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 317 (asserted):** a non-default extended-statistics target must
+		// re-emit as `ALTER STATISTICS … SET STATISTICS <n>` after the CREATE
+		// (pg_dump dumpStatisticsExt; fires when stxstattarget >= 0). `statext_nd`
+		// was set to 250.
+		if !strings.Contains(res.Stdout, "ALTER STATISTICS public.statext_nd SET STATISTICS 250;") {
+			t.Errorf("pg_dump dropped the ALTER STATISTICS … SET STATISTICS target\n  full stdout=%q", res.Stdout)
+		}
+		// The default-target objects must NOT emit an ALTER STATISTICS line.
+		if strings.Contains(res.Stdout, "ALTER STATISTICS public.statext_all SET STATISTICS") {
+			t.Errorf("pg_dump emitted a spurious ALTER STATISTICS for a default-target object\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 318 (asserted):** every extended-statistics object must round-trip
+		// its ownership as `ALTER STATISTICS <nsp>.<name> OWNER TO <role>;`. pg_dump
+		// builds the STATISTICS archive entry with `.owner = getRoleName(stxowner)`
+		// (pg_dump.c dumpStatisticsExt); the archiver's _printTocEntry then renders
+		// the OWNER TO line because "STATISTICS" is in _getObjectDescription's
+		// ALTER-able object list (pg_backup_archiver.c:3799). This exercises the
+		// goopg-specific pg_statistic_ext.stxowner projection (=10, the bootstrap
+		// superuser) end-to-end: if that cell regressed to NULL or a dangling OID,
+		// getRoleName would fail and the OWNER TO line would vanish (or pg_dump would
+		// error). Slices 314–317 dumped the CREATE/COMMENT/SET STATISTICS but never
+		// asserted ownership. The role name matches the table OWNER TO above, so the
+		// prefix is asserted (as with `ALTER TABLE public.foo OWNER TO`).
+		for _, stxName := range []string{"statext_all", "statext_nd", "statext_expr", "statext_mix"} {
+			want := "ALTER STATISTICS public." + stxName + " OWNER TO "
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped statistics ownership; missing %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// **Slice 319 (asserted):** a CREATE TRIGGER must round-trip. pg_dump's
+		// getTriggers selects pg_get_triggerdef(t.oid, false) and dumpTrigger emits
+		// the string verbatim with a trailing semicolon. Before this slice goopg's
+		// pg_trigger view returned zero rows and pg_get_triggerdef was unimplemented,
+		// so the trigger was silently dropped. The reconstruction mirrors ruleutils.c
+		// pg_get_triggerdef_worker: timing keyword, OR-joined events in PG's fixed
+		// order (INSERT, DELETE, UPDATE, TRUNCATE), schema-qualified table (pg_dump
+		// runs search_path=''), FOR EACH ROW/STATEMENT, and EXECUTE FUNCTION with the
+		// schema-qualified function. Assert the exact statements for both triggers.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_biu BEFORE INSERT OR UPDATE ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the BEFORE INSERT OR UPDATE row-level trigger\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the AFTER DELETE statement-level trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 326 (asserted):** a column-specific `UPDATE OF a, b` trigger must
+		// round-trip. pg_get_triggerdef_worker appends ` OF <cols>` immediately
+		// after the UPDATE event (the OR-ed events stay in PG's fixed INSERT,
+		// DELETE, UPDATE order). Before this slice goopg's parser tripped on the
+		// `OF` keyword and the column list was dropped, so the dumped trigger fired
+		// on every column. Verified byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_uof BEFORE INSERT OR UPDATE OF a, b ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the column-specific UPDATE OF trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 327 (asserted):** a CONSTRAINT TRIGGER must round-trip. pg_dump's
+		// getTriggers emits pg_get_triggerdef, which (ruleutils.c
+		// pg_get_triggerdef_worker, gated on a valid tgconstraint) renders
+		// `CREATE CONSTRAINT TRIGGER` plus the `[NOT ]DEFERRABLE INITIALLY
+		// {IMMEDIATE|DEFERRED}` clause between the ON-table name and FOR EACH ROW.
+		// Before this slice the parser's CONSTRAINT branch was dead (it matched via
+		// acceptIdentKeyword, but CONSTRAINT is a reserved keyword token) so
+		// `CREATE CONSTRAINT TRIGGER` failed to parse outright. Verified
+		// byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE CONSTRAINT TRIGGER trg_cdef AFTER INSERT ON public.trig_t NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the NOT DEFERRABLE constraint trigger\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE CONSTRAINT TRIGGER trg_cdfr AFTER UPDATE ON public.trig_t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the DEFERRABLE INITIALLY DEFERRED constraint trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 328 (asserted):** a REFERENCING transition-table trigger must
+		// round-trip. pg_get_triggerdef (ruleutils.c pg_get_triggerdef_worker)
+		// reads pg_trigger.tgoldtable/tgnewtable and renders `REFERENCING OLD
+		// TABLE AS … NEW TABLE AS …` (OLD before NEW) between the ON-table name
+		// and FOR EACH ROW. Before this slice goopg's parser had no REFERENCING
+		// branch, so such a trigger failed to parse. Verified byte-identical to
+		// real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_ref AFTER UPDATE ON public.trig_t REFERENCING OLD TABLE AS ot NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the REFERENCING OLD/NEW transition-table trigger\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_refn AFTER INSERT ON public.trig_t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the REFERENCING NEW-only transition-table trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 329 (asserted):** a trigger with a `WHEN (condition)` must
+		// round-trip. pg_get_triggerdef (ruleutils.c pg_get_triggerdef_worker)
+		// reads pg_trigger.tgqual and renders `WHEN (…)` between FOR EACH ROW and
+		// EXECUTE FUNCTION, building OLD/NEW range-table entries so the column
+		// references deparse with lowercased `old.`/`new.` qualifiers and the
+		// boolean OpExpr is fully parenthesized (prettyFlags=0) → the comparison
+		// renders `WHEN ((new.b <> old.b))`. Before this slice goopg's parser
+		// skipped the WHEN body, so the condition was silently lost. Verified
+		// byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_when BEFORE UPDATE ON public.trig_t FOR EACH ROW WHEN ((new.b <> old.b)) EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the WHEN-condition trigger (NEW vs OLD)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_whna BEFORE INSERT ON public.trig_t FOR EACH ROW WHEN ((new.a > 0)) EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the WHEN-condition trigger (NEW vs constant)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 368 (asserted):** a trigger whose EXECUTE FUNCTION carries STRING
+		// arguments (TG_ARGV) must round-trip. pg_get_triggerdef (ruleutils.c
+		// pg_get_triggerdef_worker:462-486) renders the call with each tgargs entry
+		// comma-separated (`, `) and single-quoted via simple_quote_literal (embedded
+		// single-quotes doubled → `wo''rld`). goopg's parser collected the args into
+		// CreateTriggerStmt.FuncArgs, execCreateTrigger threaded them to
+		// catalog.Trigger.Args, and buildTriggerDefString re-emitted them with the
+		// same separation/escaping — this slice pins the rendered form (including an
+		// embedded-quote arg) with an oracle fixture. Verified byte-identical to real
+		// pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_arg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('hello', 'wo''rld');") {
+			t.Errorf("pg_dump dropped/mangled the trigger function string arguments\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 369 (asserted):** a trigger whose EXECUTE FUNCTION carries
+		// NON-string arguments (integer, float, bare identifier) must round-trip.
+		// PG (gram.y TriggerFuncArg) stores every form as a string in tgargs — an
+		// Iconst via psprintf("%d") (so "0042" → "42"), an FCONST by its lexeme, a
+		// ColLabel by its text — and pg_get_triggerdef re-quotes them all as `'…'`
+		// literals → `trig_fn('42', '3.14', 'foo')`. goopg's parser previously
+		// dropped these tokens; it now captures their text (integers canonicalised)
+		// so buildTriggerDefString emits the identical quoted call. Verified
+		// byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_narg AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn('42', '3.14', 'foo');") {
+			t.Errorf("pg_dump dropped/mangled the trigger function non-string arguments\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
+		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint
+		// append `ALTER TABLE <t> CLUSTER ON <idx>;` (index name unqualified)
+		// after the index's CREATE INDEX / ADD CONSTRAINT when the flag is set
+		// (pg_dump.c:18141 / :18483). Before this slice goopg hardcoded
+		// indisclustered='f' and CLUSTER was a no-op, so the clustering selection
+		// was silently dropped. goopg now records IsClustered on the chosen index
+		// and re-syncs the pg_index heap row. Assert both the plain-index
+		// (dumpIndex) and PRIMARY KEY constraint-index (dumpConstraint) surfaces.
+		if !strings.Contains(res.Stdout, "ALTER TABLE public.clus_t CLUSTER ON clus_t_b_idx;") {
+			t.Errorf("pg_dump dropped the CLUSTER ON for the plain secondary index\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE public.clus_pk CLUSTER ON clus_pk_pkey;") {
+			t.Errorf("pg_dump dropped the CLUSTER ON for the PRIMARY KEY constraint index\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 322 (asserted):** ROW LEVEL SECURITY must round-trip. pg_dump's
+		// getPolicies reads pg_class.relrowsecurity and emits `ALTER TABLE <t>
+		// ENABLE ROW LEVEL SECURITY;` (via a null-polname PolicyInfo); dumpTableSchema
+		// reads relforcerowsecurity and emits `ALTER TABLE ONLY <t> FORCE ROW LEVEL
+		// SECURITY;`. Before this slice goopg hardcoded both pg_class columns to 'f'
+		// and consumed the ENABLE clause as a trigger no-op, dropping the RLS state.
+		if !strings.Contains(res.Stdout, "ALTER TABLE public.rls_t ENABLE ROW LEVEL SECURITY;") {
+			t.Errorf("pg_dump dropped ENABLE ROW LEVEL SECURITY for rls_t\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.rls_t FORCE ROW LEVEL SECURITY;") {
+			t.Errorf("pg_dump dropped FORCE ROW LEVEL SECURITY for rls_t\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 323 (asserted):** CREATE POLICY must round-trip. pg_dump's
+		// getPolicies reads pg_policy and dumpPolicy re-emits the CREATE POLICY,
+		// wrapping the (already fully-parenthesized) pg_get_expr output in one
+		// more paren layer: `USING ((expr))` / `WITH CHECK ((expr))`. RESTRICTIVE
+		// emits ` AS RESTRICTIVE`; FOR SELECT/INSERT emit ` FOR SELECT`/` FOR
+		// INSERT`. All three policies are TO PUBLIC ({0}) so no TO clause is
+		// emitted. Verified byte-identical to real pg_dump 18.3.
+		for _, want := range []string{
+			"CREATE POLICY p_simple ON public.pol_t USING ((a > 0));",
+			"CREATE POLICY p_restr ON public.pol_t AS RESTRICTIVE FOR SELECT USING ((a > 5));",
+			"CREATE POLICY p_check ON public.pol_t FOR INSERT WITH CHECK ((a < 100));",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped or mis-rendered policy: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// **Slice 330 (asserted):** a named-role policy round-trips its TO clause.
+		// pg_dump's getPolicies resolves the polroles OID array back to the role
+		// name via the pg_roles view, and dumpPolicy emits ` TO pol_role` between
+		// the FOR clause and USING. Verified byte-identical to real pg_dump 18.3.
+		if want := "CREATE POLICY p_role ON public.pol_rt FOR SELECT TO pol_role USING ((a > 0));"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered named-role policy: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 331 (asserted):** a table-level GRANT round-trips. pg_dump reads
+		// the materialized pg_class.relacl, diffs it against acldefault('r', 10)
+		// (the owner's own entry cancels), and buildACLCommands emits a single
+		// `GRANT <priv> ON TABLE <nsp>.<name> TO <grantee>;`. Verified
+		// byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.grant_t TO grantee_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered table GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 332 (asserted):** a GRANT … WITH GRANT OPTION round-trips. The
+		// grantee's relacl entry carries "r*" (grant option), which pg_dump's
+		// buildACLCommands routes through the privswgo branch into a dedicated
+		// `GRANT … WITH GRANT OPTION;`. Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.grant_g TO grantee2_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 333 (asserted):** a GRANT … ON SEQUENCE round-trips. pg_dump
+		// reads the sequence's relacl, diffs it against acldefault('s', 10) =
+		// "{postgres=rwU/postgres}", and dumpACL (objtype "SEQUENCE") emits a
+		// single `GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role;`. Verified
+		// byte-identical to real pg_dump 18.3.
+		if want := "GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered sequence GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 334 (asserted):** a GRANT … TO PUBLIC round-trips. PostgreSQL
+		// stores the grant with an empty grantee in relacl ("=r/postgres"), and
+		// pg_dump's buildACLCommands renders the empty grantee as the keyword
+		// PUBLIC, emitting `GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;`.
+		// Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered GRANT TO PUBLIC: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 335 (asserted):** a GRANT … ON SCHEMA round-trips. pg_dump reads
+		// pg_namespace.nspacl, diffs it against acldefault('n', 10) =
+		// "{postgres=UC/postgres}", and dumpACL (objtype "SCHEMA") emits a single
+		// `GRANT USAGE ON SCHEMA grant_sch TO schema_role;`. Verified byte-identical
+		// to real pg_dump 18.3.
+		if want := "GRANT USAGE ON SCHEMA grant_sch TO schema_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered schema GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 336 (asserted):** a GRANT to a role whose name needs quoting
+		// round-trips. PG's aclitemout double-quotes the hyphenated grantee in
+		// relacl ("weird-role"=r/postgres); pg_dump parses the quoted name and
+		// re-emits it via fmtId (also quoted). goopg previously rendered the
+		// grantee raw, which pg_dump would mis-parse at the hyphen. Verified
+		// byte-identical to real pg_dump 18.3.
+		if want := `GRANT SELECT ON TABLE public.grant_q TO "weird-role";`; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered quoted-role GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 337 (asserted):** a GRANT to a case-significant (double-quoted
+		// mixed-case) role round-trips. PG stores the role's true case in relacl
+		// (MixedCase=r/postgres, bare because all-alnum); pg_dump re-quotes it via
+		// fmtId → TO "MixedCase". goopg lower-cases the ACL store key but now
+		// preserves the original spelling for rendering. Verified byte-identical
+		// to real pg_dump 18.3.
+		if want := `GRANT SELECT ON TABLE public.grant_mc TO "MixedCase";`; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered mixed-case-role GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 338 (asserted):** a GRANT … then partial REVOKE round-trips.
+		// GRANT SELECT, INSERT then REVOKE INSERT leaves relacl as
+		// revoke_role=r/postgres, so pg_dump re-emits only the surviving SELECT
+		// grant — NOT the revoked INSERT. goopg's REVOKE recorder now clears the
+		// privilege bit; previously REVOKE was a no-op and the dump over-emitted
+		// the INSERT. Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.revoke_t TO revoke_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the surviving SELECT grant after REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if bad := "INSERT ON TABLE public.revoke_t TO revoke_role"; strings.Contains(res.Stdout, bad) {
+			t.Errorf("pg_dump re-emitted the REVOKEd INSERT grant: unexpected %q\n  full stdout=%q", bad, res.Stdout)
+		}
+		// **Slice 339 (asserted):** a schema GRANT … then partial REVOKE round-trips
+		// (the nspacl analogue of slice 338). GRANT USAGE, CREATE ON SCHEMA then
+		// REVOKE CREATE leaves nspacl as revoke_sch_role=U/postgres, so pg_dump
+		// re-emits only the surviving USAGE grant — NOT the revoked CREATE. goopg's
+		// REVOKE recorder now routes ON SCHEMA to recordSchemaRevoke and clears the
+		// privilege bit; previously the schema REVOKE was a no-op and the dump
+		// over-emitted CREATE. Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT USAGE ON SCHEMA revoke_sch TO revoke_sch_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the surviving USAGE grant after schema REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if bad := "CREATE ON SCHEMA revoke_sch TO revoke_sch_role"; strings.Contains(res.Stdout, bad) {
+			t.Errorf("pg_dump re-emitted the REVOKEd CREATE schema grant: unexpected %q\n  full stdout=%q", bad, res.Stdout)
+		}
+		// **Slice 340 (asserted):** an owner-side REVOKE-of-default round-trips.
+		// `REVOKE TRIGGER ON TABLE ownrev_t FROM postgres` materializes relacl as
+		// `{postgres=arwdDxm/postgres}` (the owner default minus 't'), which
+		// pg_dump's buildACLCommands renders as a `REVOKE ALL … FROM postgres;`
+		// followed by a `GRANT <remaining> … TO postgres;` whose privilege list
+		// omits TRIGGER. Both lines (and the exact privilege list) are asserted
+		// byte-identical to real pg_dump 18.3. Before this slice the owner revoke
+		// was a no-op (relacl stayed NULL) so neither line was emitted.
+		if want := "REVOKE ALL ON TABLE public.ownrev_t FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "GRANT SELECT,INSERT,REFERENCES,DELETE,TRUNCATE,MAINTAIN,UPDATE ON TABLE public.ownrev_t TO postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped/mis-rendered the owner re-GRANT after revoke: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// The revoked TRIGGER must NOT reappear in the owner re-GRANT.
+		if strings.Contains(res.Stdout, "TRIGGER ON TABLE public.ownrev_t TO postgres") {
+			t.Errorf("pg_dump re-granted the REVOKEd TRIGGER to the owner\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 341 (asserted):** a full owner-side REVOKE ALL round-trips as the
+		// empty aclitem array. `REVOKE ALL ON TABLE ownrevall_t FROM postgres`
+		// leaves relacl = `{}`, which pg_dump renders as a bare
+		// `REVOKE ALL … FROM postgres;` with NO re-GRANT (the owner retains
+		// nothing). Asserted byte-identical to real pg_dump 18.3. Before this slice
+		// the owner REVOKE ALL reverted relacl to NULL so pg_dump emitted nothing.
+		if want := "REVOKE ALL ON TABLE public.ownrevall_t FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side REVOKE ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// No GRANT … ownrevall_t … TO postgres must follow (the owner holds no
+		// privileges after REVOKE ALL).
+		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ownrevall_t TO postgres") {
+			t.Errorf("pg_dump re-granted privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 342 (asserted):** a full owner-side REVOKE ALL ON SCHEMA round-trips
+		// as the empty nspacl array (the namespace analogue of slice 341). `REVOKE ALL
+		// ON SCHEMA ownrevall_sch FROM postgres` leaves nspacl = `{}`, which pg_dump
+		// renders as a bare `REVOKE ALL ON SCHEMA … FROM postgres;` with NO re-GRANT.
+		// Before this slice the owner schema REVOKE ALL was a no-op (nspacl stayed
+		// NULL) so pg_dump emitted nothing.
+		if want := "REVOKE ALL ON SCHEMA ownrevall_sch FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side schema REVOKE ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// No GRANT … ON SCHEMA ownrevall_sch … TO postgres must follow (the owner
+		// holds no schema privileges after REVOKE ALL).
+		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ON SCHEMA ownrevall_sch TO postgres") {
+			t.Errorf("pg_dump re-granted schema privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 343 (asserted):** a full owner-side REVOKE ALL ON SEQUENCE round-trips
+		// as the empty relacl array (the sequence analogue of slices 341/342). `REVOKE
+		// ALL ON SEQUENCE ownrevall_seq FROM postgres` leaves relacl = `{}`, which
+		// pg_dump renders as a bare `REVOKE ALL ON SEQUENCE … FROM postgres;` with NO
+		// re-GRANT. Asserted byte-identical to real pg_dump 18.3. The server already
+		// wired this (recordTableRevoke passes allSequencePrivileges to
+		// MaterializeOwnerACL), so this guards against a regression that would revert
+		// the sequence relacl to NULL and silently restore the owner's default privs.
+		if want := "REVOKE ALL ON SEQUENCE public.ownrevall_seq FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side sequence REVOKE ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// No GRANT … ownrevall_seq … TO postgres must follow (the owner holds no
+		// sequence privileges after REVOKE ALL).
+		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ON SEQUENCE public.ownrevall_seq TO postgres") {
+			t.Errorf("pg_dump re-granted sequence privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 344 (asserted):** owner-zero coexisting with a grantee. After
+		// `REVOKE ALL ON TABLE ownerzero_t FROM postgres` then
+		// `GRANT SELECT … TO bob`, PostgreSQL stores relacl = `{bob=r/postgres}`
+		// (owner absent). pg_dump must emit BOTH the owner's REVOKE ALL and the
+		// grantee GRANT. Before this slice goopg's owner-default fallback rendered
+		// `{postgres=arwdDxtm/postgres,bob=r/postgres}`, so pg_dump saw the owner
+		// holding its full default and dropped the REVOKE ALL — silently restoring
+		// the owner privileges on restore.
+		if want := "REVOKE ALL ON TABLE public.ownerzero_t FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner REVOKE ALL when a grantee coexists: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "GRANT SELECT ON TABLE public.ownerzero_t TO bob;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the grantee GRANT alongside the owner REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// The owner must NOT be re-granted any privilege on ownerzero_t (it holds
+		// zero after REVOKE ALL; only bob has SELECT).
+		if strings.Contains(res.Stdout, "ownerzero_t TO postgres") {
+			t.Errorf("pg_dump re-granted privileges to the zeroed owner of ownerzero_t\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 345 (asserted):** a function-level GRANT round-trips from
+		// pg_proc.proacl (the routine analogue of slice 331's table relacl).
+		// `GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee`
+		// materializes proacl as "{=X/postgres,postgres=X/postgres,func_grantee=X/postgres}";
+		// pg_dump's getFuncs diffs it against acldefault('f', 10) and emits a single
+		// `GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;` (EXECUTE
+		// is the only function privilege, so the grantee's full set renders ALL).
+		// Verified byte-identical to real pg_dump 18.3. Before this slice goopg left
+		// every routine's proacl NULL, so the function GRANT was dropped.
+		if want := "GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the function GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 346 (asserted):** a function-level REVOKE … FROM PUBLIC round-trips
+		// from pg_proc.proacl (the routine analogue of the table REVOKE slices 338+).
+		// `REVOKE EXECUTE ON FUNCTION public.revokefn(integer) FROM PUBLIC` materializes
+		// proacl as "{postgres=X/postgres}"; pg_dump's getFuncs diffs it against
+		// acldefault('f', 10) = "{=X/postgres,postgres=X/postgres}" and emits a single
+		// `REVOKE ALL ON FUNCTION public.revokefn(integer) FROM PUBLIC;`. Verified
+		// byte-identical to real pg_dump 18.3. Before this slice goopg treated the
+		// function REVOKE as a no-op (proacl NULL), silently restoring PUBLIC's
+		// default EXECUTE on restore.
+		if want := "REVOKE ALL ON FUNCTION public.revokefn(integer) FROM PUBLIC;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the function REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 347 (asserted):** the owner-side function REVOKE, counterpart of
+		// slice 346. `REVOKE EXECUTE ON FUNCTION public.ownrevfn(integer) FROM
+		// postgres` materializes proacl as "{=X/postgres}" (PUBLIC's implicit
+		// EXECUTE survives, the owner's is removed); pg_dump's getFuncs diffs it
+		// against acldefault('f', 10) and emits a single `REVOKE ALL ON FUNCTION
+		// public.ownrevfn(integer) FROM postgres;`. Verified byte-identical to real
+		// pg_dump 18.3. The dump must NOT also emit a `… FROM PUBLIC;` line (PUBLIC
+		// retains its default) — that would mean goopg emptied proacl to {}.
+		if want := "REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the owner-side function REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if notWant := "REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM PUBLIC;"; strings.Contains(res.Stdout, notWant) {
+			t.Errorf("pg_dump wrongly revoked PUBLIC's surviving default EXECUTE on ownrevfn: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
+		}
+		// **Slice 348 (asserted):** a function GRANT … WITH GRANT OPTION round-trips.
+		// `GRANT EXECUTE ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT
+		// OPTION` materializes proacl as "{=X/postgres,postgres=X/postgres,
+		// gofn_grantee=X*/postgres}"; pg_dump's buildACLCommands routes the
+		// grant-option EXECUTE to its privswgo branch and emits a single `GRANT ALL
+		// ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION;`
+		// (EXECUTE is the sole function privilege, so the grantee's full set renders
+		// as ALL). Verified byte-identical to real pg_dump 18.3. Before this slice
+		// goopg dropped the grant-option flag, emitting a plain `GRANT ALL …;`.
+		if want := "GRANT ALL ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the function WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 349 (asserted):** a sequence GRANT … WITH GRANT OPTION round-trips.
+		// `GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION`
+		// materializes relacl as "{postgres=rwU/postgres,seq_wgo_role=U*/postgres}";
+		// pg_dump's buildACLCommands routes the grant-option USAGE to its privswgo
+		// branch and emits a single `GRANT USAGE ON SEQUENCE public.gowgo_seq TO
+		// seq_wgo_role WITH GRANT OPTION;`. Unlike the function case (slice 348) the
+		// privilege stays USAGE — sequences expose three privileges so a single one
+		// does not collapse to ALL. Verified byte-identical to real pg_dump 18.3.
+		// Before grant-option threading goopg dropped the flag, emitting a plain
+		// `GRANT USAGE …;`.
+		if want := "GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the sequence WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 357 (asserted, M0119-0004-ACLHEAP):** a TYPE-level GRANT round-trips
+		// from the heap-backed pg_type.typacl — the new capability this milestone adds.
+		// `GRANT USAGE ON TYPE public.gtype TO typg_grantee` runs through the executor
+		// (not the server virtual-ACL fast path), which updates the OID-keyed ACL store
+		// and re-syncs the pg_type heap row's typacl to a PG-native _aclitem array
+		// "{postgres=U/postgres,=U/postgres,typg_grantee=U/postgres}". pg_dump's getTypes
+		// reads typacl back (decoded to canonical aclitemout text by the seqscan hook),
+		// diffs it against acldefault('T', 10) = "{=U/postgres,postgres=U/postgres}", and
+		// buildACLCommands emits a single `GRANT ALL ON TYPE public.gtype TO typg_grantee;`
+		// (USAGE is the sole type privilege, so the grantee's full set renders ALL, like a
+		// function's EXECUTE). Verified against real pg_dump 18.3. Before this milestone
+		// goopg baked typacl NULL on every pg_type row and bailed on TYPE GRANT, dropping
+		// it from the dump.
+		if want := "GRANT ALL ON TYPE public.gtype TO typg_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the TYPE GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 358 (asserted, M0119-0004-ACLHEAP attacl half):** a column-level
+		// GRANT round-trips from the heap-backed pg_attribute.attacl — the column
+		// analogue of slice 357. `GRANT SELECT (cola) ON TABLE public.gcoltbl TO
+		// colgrantee` runs through the executor (not the server virtual fast path),
+		// which updates the (relOID, attnum)-keyed column ACL store and re-syncs the
+		// pg_attribute heap row's attacl to "{colgrantee=r/postgres}". pg_dump's
+		// getAdditionalACLs finds the non-NULL attacl, getColumnACLs reads it back
+		// (decoded by the seqscan hook), and buildACLCommands emits the column GRANT
+		// with the privilege keyword carrying the column name in parentheses
+		// (AddAcl → "SELECT(cola)"). Verified against real pg_dump 18.3. Before this
+		// milestone goopg baked attacl NULL on every pg_attribute row, dropping every
+		// column GRANT from the dump.
+		if want := "GRANT SELECT(cola) ON TABLE public.gcoltbl TO colgrantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the column GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 350 (asserted):** a sequence GRANT followed by a partial REVOKE
+		// round-trips (the sequence analogue of slices 338/339). `GRANT USAGE, SELECT
+		// ON SEQUENCE … TO seqrev_role` then `REVOKE SELECT …` leaves relacl =
+		// "{postgres=rwU/postgres,seqrev_role=U/postgres}"; pg_dump diffs that against
+		// acldefault('s', 10) and re-emits only `GRANT USAGE ON SEQUENCE
+		// public.seqrev_seq TO seqrev_role;` — NOT the revoked SELECT. Verified
+		// byte-identical to real pg_dump 18.3. A regression that left SELECT in the
+		// relacl would over-emit `GRANT SELECT, USAGE …`.
+		if want := "GRANT USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the sequence partial REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// The revoked SELECT must NOT reappear (relacl must carry only USAGE for the
+		// grantee). pg_dump would render a surviving SELECT as `GRANT SELECT, USAGE`.
+		if notWant := "GRANT SELECT, USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;"; strings.Contains(res.Stdout, notWant) {
+			t.Errorf("pg_dump over-emitted the revoked SELECT on seqrev_seq: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
+		}
+		// **Slice 351 (asserted):** a table GRANT ALL collapses to the `ALL` keyword.
+		// `GRANT ALL ON TABLE public.grantall_t TO grantall_role` materializes relacl
+		// as "{postgres=arwdDxtm/postgres,grantall_role=arwdDxtm/postgres}" (the
+		// grantee holds every table privilege). pg_dump's buildACLCommands recognises
+		// the grantee's full set equals ACL_ALL_RIGHTS_RELATION and re-emits the
+		// single `GRANT ALL ON TABLE public.grantall_t TO grantall_role;` rather than
+		// an eight-way list. The table analogue of the function (slice 345) and
+		// sequence (slice 333) GRANT ALL collapses. Verified byte-identical to real
+		// pg_dump 18.3.
+		if want := "GRANT ALL ON TABLE public.grantall_t TO grantall_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the table GRANT ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// A regression that dropped a privilege bit from the grantee's relacl would
+		// make pg_dump list the survivors explicitly (e.g. `GRANT INSERT, SELECT, …`)
+		// instead of collapsing to `ALL`; guard against the SELECT-led explicit form.
+		if notWant := "GRANT INSERT, SELECT"; strings.Contains(res.Stdout, notWant+" ON TABLE public.grantall_t") {
+			t.Errorf("pg_dump failed to collapse the table GRANT ALL to ALL: unexpected explicit list\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 352 (asserted):** two distinct grantees on one table each emit
+		// their own GRANT line. relacl materializes as
+		// "{postgres=arwdDxtm/postgres,mg_role_a=r/postgres,mg_role_b=a/postgres}";
+		// pg_dump's buildACLCommands fans out one `GRANT <privs> … TO <grantee>;`
+		// per non-owner aclitem, so the dump must carry BOTH the SELECT line for
+		// mg_role_a and the INSERT line for mg_role_b. Verified byte-identical to
+		// real pg_dump 18.3.
+		for _, want := range []string{
+			"GRANT SELECT ON TABLE public.multigrant_t TO mg_role_a;",
+			"GRANT INSERT ON TABLE public.multigrant_t TO mg_role_b;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped a per-grantee GRANT line: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// **Slice 353 (asserted):** two grantees with the SAME privilege set still
+		// emit two separate GRANT lines — PostgreSQL never merges grantees, even when
+		// their privileges are identical. relacl materializes as
+		// "{postgres=arwdDxtm/postgres,sg_role_a=r/postgres,sg_role_b=r/postgres}";
+		// pg_dump's buildACLCommands fans out one `GRANT SELECT … TO <grantee>;` per
+		// non-owner aclitem, so the dump must carry BOTH SELECT lines. Verified
+		// byte-identical to real pg_dump 18.3.
+		for _, want := range []string{
+			"GRANT SELECT ON TABLE public.samegrant_t TO sg_role_a;",
+			"GRANT SELECT ON TABLE public.samegrant_t TO sg_role_b;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped a same-priv per-grantee GRANT line: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// A grantee-merge regression would collapse the two grantees into one
+		// `GRANT SELECT … TO sg_role_a, sg_role_b;` line; PostgreSQL never does this,
+		// so guard against the merged form explicitly.
+		if notWant := "TO sg_role_a, sg_role_b"; strings.Contains(res.Stdout, notWant) {
+			t.Errorf("pg_dump wrongly merged same-priv grantees into one GRANT line: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
+		}
+		// **Slice 354 (asserted):** grantee GRANT lines emit in GRANT ORDER, not
+		// alphabetically. og_role_z was granted before og_role_a, so PostgreSQL's
+		// relacl is "{postgres=arwdDxtm/postgres,og_role_z=r/postgres,og_role_a=r/
+		// postgres}" (z before a) and pg_dump fans the aclitem array out in array
+		// order → the og_role_z GRANT line precedes the og_role_a one. Both lines
+		// must be present AND in z-before-a order; the pre-fix sort.Strings rendering
+		// would have emitted og_role_a first, diverging from real pg_dump 18.3.
+		ogZ := "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_z;"
+		ogA := "GRANT SELECT ON TABLE public.ordergrant_t TO og_role_a;"
+		ogZi := strings.Index(res.Stdout, ogZ)
+		ogAi := strings.Index(res.Stdout, ogA)
+		if ogZi < 0 || ogAi < 0 {
+			t.Errorf("pg_dump dropped a grant-order GRANT line: og_role_z present=%v og_role_a present=%v\n  full stdout=%q", ogZi >= 0, ogAi >= 0, res.Stdout)
+		} else if ogZi > ogAi {
+			t.Errorf("pg_dump emitted grantees out of grant order: og_role_z (granted first) must precede og_role_a, got z@%d a@%d\n  full stdout=%q", ogZi, ogAi, res.Stdout)
+		}
+		// **Slice 355 (asserted):** REVOKE-then-re-GRANT moves a grantee to the END
+		// of the relacl array. rg_role_a was granted SELECT first, then rg_role_b,
+		// then rg_role_a's SELECT was REVOKEd (deleting its aclitem) and INSERT
+		// re-GRANTed (appending a fresh aclitem at the end). So relacl is
+		// "{postgres=arwdDxtm/postgres,rg_role_b=r/postgres,rg_role_a=a/postgres}"
+		// and pg_dump fans the array out in order → the rg_role_b SELECT line
+		// precedes the rg_role_a INSERT line (b before a, the reverse of both
+		// alphabetical and original grant order). Both lines must be present AND in
+		// b-before-a order.
+		rgB := "GRANT SELECT ON TABLE public.regrant_t TO rg_role_b;"
+		rgA := "GRANT INSERT ON TABLE public.regrant_t TO rg_role_a;"
+		rgBi := strings.Index(res.Stdout, rgB)
+		rgAi := strings.Index(res.Stdout, rgA)
+		if rgBi < 0 || rgAi < 0 {
+			t.Errorf("pg_dump dropped a re-grant-order GRANT line: rg_role_b present=%v rg_role_a present=%v\n  full stdout=%q", rgBi >= 0, rgAi >= 0, res.Stdout)
+		} else if rgBi > rgAi {
+			t.Errorf("pg_dump emitted re-granted grantee out of order: rg_role_b (still-held SELECT) must precede rg_role_a (revoked+re-granted INSERT), got b@%d a@%d\n  full stdout=%q", rgBi, rgAi, res.Stdout)
+		}
+		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
+		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints
+		// pg_get_ruledef(oid) verbatim; the single-arg pg_get_ruledef uses
+		// PRETTYFLAG_INDENT, so the event line is broken onto a new line indented
+		// four spaces (`CREATE RULE r AS\n    ON <EVENT> TO public.rule_t DO
+		// [INSTEAD ]NOTHING;`). DO ALSO NOTHING and plain DO NOTHING both render
+		// without the INSTEAD keyword. Verified byte-identical to real pg_dump 18.3.
+		for _, want := range []string{
+			"CREATE RULE r_noins AS\n    ON INSERT TO public.rule_t DO INSTEAD NOTHING;",
+			"CREATE RULE r_noupd AS\n    ON UPDATE TO public.rule_t DO NOTHING;",
+			"CREATE RULE r_nodel AS\n    ON DELETE TO public.rule_t DO NOTHING;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped or mis-rendered rule: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// **Slice 325 (asserted):** a rule whose pg_rewrite.ev_enabled is not 'O'
+		// round-trips an `ALTER TABLE … RULE` clause emitted by dumpRule in addition
+		// to the CREATE RULE. r_noupd was DISABLEd ('D') and r_nodel set ENABLE
+		// ALWAYS ('A'); each yields the exact clause below. Verified byte-identical to
+		// real pg_dump 18.3.
+		for _, want := range []string{
+			"ALTER TABLE public.rule_t DISABLE RULE r_noupd;",
+			"ALTER TABLE public.rule_t ENABLE ALWAYS RULE r_nodel;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped ALTER TABLE … RULE clause: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// r_noins stays origin ('O'); dumpRule emits NO ALTER TABLE … RULE for it.
+		if strings.Contains(res.Stdout, "RULE r_noins;") {
+			t.Errorf("pg_dump emitted a spurious ALTER TABLE … RULE r_noins (rule is origin-enabled)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 359 (asserted):** a CONDITIONAL DO-NOTHING CREATE RULE must
+		// round-trip its WHERE clause. pg_get_ruledef's PRETTYFLAG_INDENT layout
+		// puts WHERE on its own line (3-space indent) and trails DO INSTEAD NOTHING
+		// on that line; the qual is the single-paren `(old.x <> new.x)` form
+		// regardless of whether the source had outer parens. Verified byte-identical
+		// to real pg_dump 18.3 (reference /tmp/du359_ref).
+		for _, want := range []string{
+			"CREATE RULE rcond_upd AS\n    ON UPDATE TO public.rcond\n   WHERE (old.a <> new.a) DO INSTEAD NOTHING;",
+			"CREATE RULE rcond_del AS\n    ON DELETE TO public.rcond\n   WHERE (old.b > 0) DO INSTEAD NOTHING;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped or mis-rendered conditional rule: want %q\n  full stdout=%q", want, res.Stdout)
 			}
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
@@ -6640,6 +9669,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// to real pg_dump 18.3. Locks in slice 298's defaultExprToSQL BinaryOp
 			// parenthesization in the index-key-expression deparse context.
 			"CREATE INDEX foo_calc_expr_idx ON public.foo USING btree ((((qty + id) * mgr_id)));",
+			// Slice 360: a bare function-call key dumps WITHOUT the extra wrapping
+			// parens (pg_get_indexdef_worker prints a COERCE_EXPLICIT_CALL FuncExpr
+			// as-is); one paren level only, NOT the double-paren the arithmetic key
+			// above carries. Byte-identical to real pg_dump 18.3.
+			"CREATE INDEX foo_lower_idx ON public.foo USING btree (lower(name));",
+			"CREATE INDEX foo_lpad_idx ON public.foo USING btree (lpad(name, 5));",
+			// Slice 361: a `USING hash` index must dump `USING hash`, not the
+			// B-tree substrate's `USING btree`. goopg builds a hash index on the
+			// B-tree substrate (catalog.Index.Method stays "btree"; only
+			// DeclaredHash records the declared method), and BuildIndexDef now
+			// surfaces DeclaredHash so pg_get_indexdef_worker's `USING %s`
+			// (pg_am.amname) round-trips byte-identically to real pg_dump 18.3.
+			"CREATE INDEX foo_qty_hash_idx ON public.foo USING hash (qty);",
 			// DESC with a non-default NULLS LAST override
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
@@ -6812,6 +9854,45 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped renamed view columns; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
+		// **Slice 365 (asserted):** a VIEW `WITH [CASCADED|LOCAL] CHECK OPTION`
+		// must round-trip the clause as the `\n  WITH <MODE> CHECK OPTION` suffix
+		// after the view body (pg_dump.c dumpTableSchema). goopg surfaces the mode
+		// as the `check_option=<mode>` reloption; pg_dump's getTables derives
+		// CASCADED/LOCAL from it and strips it from the array, so the clause must
+		// appear as the suffix and NOT inside a `WITH (...)` storage-option list.
+		checkOptDefs := []string{
+			"CREATE VIEW public.vchk AS",
+			"  WITH CASCADED CHECK OPTION;",
+			"CREATE VIEW public.vchk_local AS",
+			"  WITH LOCAL CHECK OPTION;",
+		}
+		for _, sub := range checkOptDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a view CHECK OPTION clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The check_option must NOT leak into a `WITH (...)` reloptions clause —
+		// pg_dump strips it from the array and emits it only as the suffix.
+		if strings.Contains(res.Stdout, "WITH (check_option") {
+			t.Errorf("pg_dump leaked check_option into a WITH (...) reloptions clause\n  full stdout=%q", res.Stdout)
+		}
+
+		// **Slice 366 (asserted):** a VIEW `WITH (security_barrier=true)` must
+		// round-trip the reloption. Unlike check_option, pg_dump keeps it in the
+		// reloptions array and emits it as the `WITH (security_barrier='true')`
+		// clause after the view name (appendReloptionsArray quotes the value).
+		if sub := "CREATE VIEW public.vsecbar WITH (security_barrier='true') AS"; !strings.Contains(res.Stdout, sub) {
+			t.Errorf("pg_dump dropped the view security_barrier reloption; missing %q\n  full stdout=%q", sub, res.Stdout)
+		}
+
+		// **Slice 367 (asserted):** a VIEW `WITH (security_invoker=true)` must
+		// round-trip the reloption, the sibling of security_barrier. pg_dump keeps
+		// it in the reloptions array and emits it as the `WITH (security_invoker='true')`
+		// clause after the view name (appendReloptionsArray quotes the value).
+		if sub := "CREATE VIEW public.vsecinv WITH (security_invoker='true') AS"; !strings.Contains(res.Stdout, sub) {
+			t.Errorf("pg_dump dropped the view security_invoker reloption; missing %q\n  full stdout=%q", sub, res.Stdout)
+		}
+
 		// **Slice 59 (asserted):** a GENERATED ALWAYS AS (expr) STORED column
 		// must round-trip with its generation clause. atthasdef now reports true
 		// for generated columns and pg_attrdef emits a row whose adbin is the raw
@@ -7011,6 +10092,105 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped an OWNED BY sequence/owner; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
+		// **Slice 304 (asserted):** the schema-qualified 3-part OWNED BY
+		// (`public.owner_tbl.label`) must round-trip identically to the unqualified
+		// slice-118 form. Before the LastIndex split fix the CREATE SEQUENCE itself
+		// errored (`sequence cannot be owned by relation "public"`), so this string
+		// never appeared. pg_dump always re-qualifies, so the dumped form is the
+		// canonical `ALTER SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label;`.
+		if !strings.Contains(res.Stdout, "ALTER SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label;") {
+			t.Errorf("pg_dump dropped the schema-qualified OWNED BY sequence; missing the qowned_seq OWNED BY line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 305 (asserted):** REPLICA IDENTITY round-trip. A FULL/NOTHING
+		// override must surface as the exact `ALTER TABLE ONLY ... REPLICA
+		// IDENTITY ...` clause pg_dump emits when relreplident != 'd'.
+		for _, sub := range []string{
+			"ALTER TABLE ONLY public.ri_full REPLICA IDENTITY FULL;",
+			"ALTER TABLE ONLY public.ri_nothing REPLICA IDENTITY NOTHING;",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a REPLICA IDENTITY override; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// A default-identity table (relreplident='d', the implicit value) must
+		// emit NO REPLICA IDENTITY clause. The legacy hardcoded 'n' produced a
+		// spurious `ALTER TABLE ONLY public.foo REPLICA IDENTITY NOTHING;` for
+		// EVERY dumped table — the core divergence this slice corrects. `foo`,
+		// `bar`, and the partitioned `part` carry no override, so none may appear.
+		for _, neg := range []string{
+			"ALTER TABLE ONLY public.foo REPLICA IDENTITY",
+			"ALTER TABLE ONLY public.bar REPLICA IDENTITY",
+			"ALTER TABLE ONLY public.part REPLICA IDENTITY",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted a spurious REPLICA IDENTITY for a default-identity table: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// **Slice 306 (asserted):** REPLICA IDENTITY USING INDEX round-trip.
+		// pg_dump emits this at index-dump time keyed on the index's
+		// pg_index.indisreplident — the index name is unqualified in this
+		// syntax (pg_dump.c dumpIndex:18186). The clause must name ri_uidx.
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.ri_index REPLICA IDENTITY USING INDEX ri_uidx;") {
+			t.Errorf("pg_dump dropped the REPLICA IDENTITY USING INDEX clause; missing the ri_index/ri_uidx line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 307 (asserted):** a NOT-VALID FOREIGN KEY round-trips with the
+		// trailing ` NOT VALID` that pg_get_constraintdef appends for
+		// convalidated='f' (ruleutils.c:2604). A regression that dropped the
+		// suffix would silently re-validate the constraint on restore.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id) REFERENCES public.nv_ref(id) NOT VALID;") {
+			t.Errorf("pg_dump dropped the NOT VALID suffix on an unvalidated FK; missing the nv_child_fk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 308 (asserted):** a NOT-VALID CHECK constraint round-trips with
+		// the same ` NOT VALID` tail. pg_dump emits an unvalidated CHECK as a
+		// separate ALTER TABLE ADD CONSTRAINT (separate=!validated, pg_dump.c:9757)
+		// so possibly-violating data loads first. A regression dropping the suffix
+		// would silently re-validate the constraint on restore.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT nvc_chk CHECK ((val > 0)) NOT VALID;") {
+			t.Errorf("pg_dump dropped the NOT VALID suffix on an unvalidated CHECK; missing the nvc_chk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 309 (asserted):** a MATCH FULL FOREIGN KEY round-trips the match
+		// type. pg_get_constraintdef emits ` MATCH FULL` between the REFERENCES
+		// column list and the (absent here) ON UPDATE/DELETE clauses for
+		// confmatchtype='f' (ruleutils.c). A regression dropping the clause would
+		// silently downgrade the restored FK to MATCH SIMPLE, changing mixed-NULL
+		// key semantics.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b) REFERENCES public.mf_ref(a, b) MATCH FULL;") {
+			t.Errorf("pg_dump dropped the MATCH FULL clause on an FK; missing the mf_child_fk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 310 (asserted):** a PARTIAL EXCLUDE constraint round-trips its
+		// WHERE predicate. pg_get_constraintdef (via pg_get_indexdef_worker) emits
+		// ` WHERE (b > 0)` after the operator list and before DEFERRABLE
+		// (ruleutils.c:1564). A regression dropping the clause would silently
+		// promote the partial exclusion to one applying to every row on restore.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);") {
+			t.Errorf("pg_dump dropped the WHERE predicate on a partial EXCLUDE; missing the pex_excl line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 311 (asserted):** a FOREIGN KEY with `ON DELETE SET NULL`
+		// restricted to a column subset round-trips the column list (PG15
+		// confdelsetcols). pg_get_constraintdef appends ` (b)` after the ON DELETE
+		// SET NULL keyword (ruleutils.c:2376). A regression dropping the list would
+		// silently widen the action to the whole key on restore — a semantic change.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT sfk_child_fk FOREIGN KEY (b) REFERENCES public.sfk_ref(id) ON DELETE SET NULL (b);") {
+			t.Errorf("pg_dump dropped the ON DELETE SET NULL column list; missing the sfk_child_fk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 312 (asserted):** a CREATE INDEX with a non-default per-column
+		// operator class round-trips the opclass. pg_get_indexdef_worker emits
+		// ` text_pattern_ops` after the column (get_opclass_name, ruleutils.c) and
+		// suppresses the default opclass on the sibling column `b`. A regression
+		// dropping the opclass would silently widen the index to the default
+		// opclass on restore — a semantic change (text_pattern_ops vs text_ops).
+		if !strings.Contains(res.Stdout, "CREATE INDEX opcidx_pat ON public.opcidx USING btree (a text_pattern_ops, b);") {
+			t.Errorf("pg_dump dropped the index column operator class; missing the opcidx_pat line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 313 (asserted):** a CREATE INDEX with a non-default per-column
+		// COLLATE round-trips the collation. pg_get_indexdef_worker emits
+		// ` COLLATE "C"` after the column and before the operator class
+		// (generate_collation_name, ruleutils.c) and suppresses the default
+		// collation on the sibling column `b`. A regression dropping the collation
+		// would silently widen the index back to the default collation on restore.
+		if !strings.Contains(res.Stdout, `CREATE INDEX collidx_c ON public.collidx USING btree (a COLLATE "C", b);`) {
+			t.Errorf("pg_dump dropped the index column collation; missing the collidx_c line\n  full stdout=%q", res.Stdout)
+		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain
 		// `INCREMENT BY -1` sequence keeps NO MINVALUE/NO MAXVALUE (its seqmin=
@@ -7148,6 +10328,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump emitted a spurious standalone/OWNED BY form for an identity sequence: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// **Slice 303 (asserted):** an IDENTITY column declared with a non-default
+		// `(sequence_options)` clause must round-trip EVERY captured option
+		// (INCREMENT BY, MINVALUE, MAXVALUE, CACHE, CYCLE), not just START WITH. The
+		// whole `ADD GENERATED ... AS IDENTITY (...)` block is pinned byte-for-byte
+		// against real pg_dump 18.3. `idrich` proves the fully-bounded ascending +
+		// CYCLE case; `idbd` proves `BY DEFAULT` with an explicit increment keeps the
+		// type-default `NO MINVALUE / NO MAXVALUE` (no spurious bound) and the default
+		// CACHE 1. Before this slice the backing sequence was hard-coded to
+		// increment=1/cache=1/no-cycle/type-min-max, so each emitted line below would
+		// have diverged.
+		identityOptDefs := []string{
+			"ALTER TABLE public.idrich ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (\n    SEQUENCE NAME public.idrich_id_seq\n    START WITH 100\n    INCREMENT BY 5\n    MINVALUE 10\n    MAXVALUE 9999\n    CACHE 7\n    CYCLE\n);",
+			"ALTER TABLE public.idbd ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (\n    SEQUENCE NAME public.idbd_id_seq\n    START WITH 1\n    INCREMENT BY 2\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1\n);",
+		}
+		for _, sub := range identityOptDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a non-default identity sequence option; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		// **Slice 121 (asserted):** a SERIAL / BIGSERIAL column round-trips as a
@@ -7657,6 +10856,213 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "zips text[]") {
 			t.Errorf("pg_dump rendered the domain-array composite field as text[] (slice-252 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
+		// Slice 373: a TABLE COLUMN typed as a user-defined composite (and its
+		// array) must round-trip as the schema-qualified composite name. Assert
+		// the exact contiguous CREATE TABLE body so a regression that re-folds the
+		// column type to text / text[] (the pre-fix behaviour) fails here.
+		comptColBlock := "CREATE TABLE public.comptcol (\n    c public.addr,\n    carr public.addr[],\n    lbl text\n);"
+		if !strings.Contains(res.Stdout, comptColBlock) {
+			t.Errorf("pg_dump mangled the composite-typed TABLE column round-trip (slice-373); missing contiguous block %q\n  full stdout=%q", comptColBlock, res.Stdout)
+		}
+		// The composite column must NOT degrade to the text fallback (the bug this
+		// slice fixed): neither the scalar nor the array column may render as text.
+		if strings.Contains(res.Stdout, "    c text,") && strings.Contains(res.Stdout, "comptcol") {
+			t.Errorf("pg_dump rendered the composite TABLE column as text (slice-373 atttypid resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "    carr text[],") {
+			t.Errorf("pg_dump rendered the composite-array TABLE column as text[] (slice-373 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 374: a TYPED TABLE (`CREATE TABLE name OF composite_type`) must dump
+		// as the `OF type` form with NO column list (every column is type-derived and
+		// suppressed by pg_dump's reloftype check). The exact statement is verified
+		// byte-for-byte against real pg_dump 18.3 (reference /tmp/du374_pgdata).
+		typedTabStmt := "CREATE TABLE public.typedtab OF public.addr2type;"
+		if !strings.Contains(res.Stdout, typedTabStmt) {
+			t.Errorf("pg_dump dropped the typed-table OF form (slice-374); missing %q\n  full stdout=%q", typedTabStmt, res.Stdout)
+		}
+		// A regression that lost reloftype would re-emit the columns inline as a
+		// normal table (`CREATE TABLE public.typedtab (` with a parenthesized list);
+		// the OF form carries no '(' so this exact prefix must be absent.
+		if strings.Contains(res.Stdout, "CREATE TABLE public.typedtab (") {
+			t.Errorf("pg_dump emitted the typed table with an inline column list (slice-374 reloftype regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// The type-derived columns are real: the COPY column list names them in
+		// order and the inserted row round-trips through the data section.
+		if !strings.Contains(res.Stdout, "COPY public.typedtab (a, b) FROM stdin;") {
+			t.Errorf("pg_dump typed-table COPY column list regressed (slice-374)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "7\tseven") {
+			t.Errorf("pg_dump typed-table data row missing (slice-374)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 375: a FOREIGN DATA WRAPPER must round-trip as the bare
+		// `CREATE FOREIGN DATA WRAPPER <name>;` form (no HANDLER/VALIDATOR/OPTIONS)
+		// followed by its owner ALTER. Verified byte-for-byte against real pg_dump
+		// 18.3 (reference /tmp/du_fdw_ref).
+		fdwStmt := "CREATE FOREIGN DATA WRAPPER goopg_fdw;"
+		if !strings.Contains(res.Stdout, fdwStmt) {
+			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER (slice-375); missing %q\n  full stdout=%q", fdwStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER FOREIGN DATA WRAPPER goopg_fdw OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the FDW owner ALTER (slice-375)\n  full stdout=%q", res.Stdout)
+		}
+		// A regression that mis-rendered fdwhandler (regproc 0 → '-') would emit a
+		// spurious ` HANDLER`/` VALIDATOR` clause on the bare wrapper.
+		if strings.Contains(res.Stdout, "CREATE FOREIGN DATA WRAPPER goopg_fdw HANDLER") ||
+			strings.Contains(res.Stdout, "CREATE FOREIGN DATA WRAPPER goopg_fdw VALIDATOR") {
+			t.Errorf("pg_dump emitted a spurious HANDLER/VALIDATOR on the handler-less FDW (slice-375 regproc 0→'-' regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 376: a FOREIGN SERVER must round-trip as the bare
+		// `CREATE SERVER <name> FOREIGN DATA WRAPPER <fdwname>;` form (no TYPE/
+		// VERSION/OPTIONS) followed by its owner ALTER. dumpForeignServer recovers
+		// the wrapper name from pg_foreign_data_wrapper via the srvfdw OID, so this
+		// also verifies the srvfdw→FDW-OID resolution. Verified against real
+		// pg_dump 18.3 (dumpForeignServer + _getObjectDescription SERVER owner ALTER).
+		srvStmt := "CREATE SERVER goopg_srv FOREIGN DATA WRAPPER goopg_fdw;"
+		if !strings.Contains(res.Stdout, srvStmt) {
+			t.Errorf("pg_dump dropped the FOREIGN SERVER (slice-376); missing %q\n  full stdout=%q", srvStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER SERVER goopg_srv OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the SERVER owner ALTER (slice-376)\n  full stdout=%q", res.Stdout)
+		}
+		// A regression that lost the srvfdw→FDW-OID resolution would make
+		// dumpForeignServer's single-row `SELECT fdwname … WHERE oid = srvfdw`
+		// subquery fail (pg_dump aborts) or emit a wrong/empty wrapper name; the
+		// positive assert above pins the exact `FOREIGN DATA WRAPPER goopg_fdw`
+		// suffix. A spurious TYPE/VERSION/OPTIONS clause (NULL columns mis-rendered)
+		// would break the exact-statement match too.
+		if strings.Contains(res.Stdout, "CREATE SERVER goopg_srv TYPE") ||
+			strings.Contains(res.Stdout, "CREATE SERVER goopg_srv VERSION") {
+			t.Errorf("pg_dump emitted a spurious TYPE/VERSION on the bare server (slice-376 NULL srvtype/srvversion regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 377: a USER MAPPING must round-trip as the bare
+		// `CREATE USER MAPPING FOR <user> SERVER <srv>;` form (no OPTIONS — deferred).
+		// dumpUserMappings reads usename from the pg_user_mappings view (filtered by
+		// srvid) and the server name from the server's catalog entry. This assertion
+		// ALSO proves the exit-0 repair: before this slice the pg_user_mappings query
+		// failed (relation does not exist) and the whole dump aborted, so reaching
+		// this branch at all means the view now resolves. Verified against real
+		// pg_dump 18.3 (dumpUserMappings).
+		umStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv;"
+		if !strings.Contains(res.Stdout, umStmt) {
+			t.Errorf("pg_dump dropped the USER MAPPING (slice-377); missing %q\n  full stdout=%q", umStmt, res.Stdout)
+		}
+		// umoptions is NULL, so pg_options_to_table yields no rows and dumpUserMappings
+		// must omit the OPTIONS clause — a spurious empty `OPTIONS (` would mean the
+		// NULL→empty-array projection regressed.
+		if strings.Contains(res.Stdout, "CREATE USER MAPPING FOR um_role SERVER goopg_srv OPTIONS") {
+			t.Errorf("pg_dump emitted a spurious OPTIONS clause on the option-less user mapping (slice-377)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 378: a FOREIGN SERVER WITH OPTIONS must round-trip the OPTIONS clause.
+		// pg_dump renders the options ORDER BY option_name (dbname before host) as a
+		// `,\n    `-joined `name 'value'` list inside ` OPTIONS (\n    …\n)`. This
+		// exercises goopg's own pg_options_to_table SRF over the srvoptions text[]
+		// literal `{host=localhost,dbname=mydb}`. Verified against real pg_dump 18.3.
+		srvOptStmt := "CREATE SERVER goopg_srv_opt FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    dbname 'mydb',\n    host 'localhost'\n);"
+		if !strings.Contains(res.Stdout, srvOptStmt) {
+			t.Errorf("pg_dump dropped the SERVER OPTIONS (slice-378); missing %q\n  full stdout=%q", srvOptStmt, res.Stdout)
+		}
+		// Slice 379: a USER MAPPING WITH OPTIONS must round-trip the OPTIONS clause.
+		// dumpUserMappings renders the options ORDER BY option_name (password before
+		// username) as a `,\n    `-joined `name 'value'` list inside ` OPTIONS (\n
+		// …\n)`, exercising goopg's pg_options_to_table SRF over the umoptions text[]
+		// literal `{username=remote,password=secret}`. Verified against real pg_dump 18.3.
+		umOptStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (\n    password 'secret',\n    username 'remote'\n);"
+		if !strings.Contains(res.Stdout, umOptStmt) {
+			t.Errorf("pg_dump dropped the USER MAPPING OPTIONS (slice-379); missing %q\n  full stdout=%q", umOptStmt, res.Stdout)
+		}
+		// Slice 380: a FOREIGN DATA WRAPPER WITH OPTIONS must round-trip the OPTIONS
+		// clause. dumpForeignDataWrapper renders the options ORDER BY option_name
+		// (debug before delimiter, regardless of CREATE order) as a `,\n    `-joined
+		// `name 'value'` list inside ` OPTIONS (\n    …\n)`, exercising goopg's
+		// pg_options_to_table SRF over the fdwoptions text[] literal
+		// `{delimiter=pipe,debug=true}`. Verified against real pg_dump 18.3.
+		fdwOptStmt := "CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (\n    debug 'true',\n    delimiter 'pipe'\n);"
+		if !strings.Contains(res.Stdout, fdwOptStmt) {
+			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER OPTIONS (slice-380); missing %q\n  full stdout=%q", fdwOptStmt, res.Stdout)
+		}
+		// Slice 381: a FOREIGN SERVER created WITH TYPE / VERSION must round-trip
+		// those clauses. dumpForeignServer emits ` TYPE 'x' VERSION 'y'` (string
+		// literals) between the server name and ` FOREIGN DATA WRAPPER`, then the
+		// OPTIONS clause. goopg surfaces srvtype/srvversion from the foreign-server
+		// registry's virtual pg_foreign_server row. Verified against real pg_dump 18.3.
+		srvTVStmt := "CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'remote'\n);"
+		if !strings.Contains(res.Stdout, srvTVStmt) {
+			t.Errorf("pg_dump dropped the SERVER TYPE/VERSION (slice-381); missing %q\n  full stdout=%q", srvTVStmt, res.Stdout)
+		}
+		// Slice 382: a reserved-keyword OPTION NAME must round-trip double-quoted.
+		// quote_ident('user') = "user" (RESERVED_KEYWORD), so dumpUserMappings emits
+		// the option as `"user" 'remote'`, not the bare `user 'remote'`. The bare
+		// form is what goopg produced before pgQuoteIdent gained its keyword check;
+		// this pins the fix end-to-end through pg_dump. Verified against real
+		// pg_dump 18.3.
+		umKwStmt := "CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (\n    \"user\" 'remote'\n);"
+		if !strings.Contains(res.Stdout, umKwStmt) {
+			t.Errorf("pg_dump mis-quoted the reserved-keyword option name (slice-382); missing %q\n  full stdout=%q", umKwStmt, res.Stdout)
+		}
+		// Slice 384: an OPTIONS value containing an array metacharacter must
+		// round-trip. goopg stores `host=a,b` as the array_out-quoted srvoptions
+		// element `{"host=a,b"}`; pg_dump's pg_options_to_table re-splits it on the
+		// element's first `=` and recovers value `a,b`, so dumpForeignServer emits
+		// `host 'a,b'`. Before slice 384 goopg comma-joined the literal bare
+		// (`{host=a,b}`), so the SRF split on the embedded comma and produced a
+		// corrupt two-row option list (`host 'a'` plus a bogus nameless option).
+		// Verified against real pg_dump 18.3.
+		srvMcStmt := "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'a,b'\n);"
+		if !strings.Contains(res.Stdout, srvMcStmt) {
+			t.Errorf("pg_dump corrupted the metachar OPTION value (slice-384); missing %q\n  full stdout=%q", srvMcStmt, res.Stdout)
+		}
+		// Slice 417: a FOREIGN TABLE must round-trip as
+		// `CREATE FOREIGN TABLE <name> (\n    <col> <type>\n)\nSERVER <srv>\nOPTIONS
+		// (\n    <opt>\n);` — the exact upstream 002_pg_dump.pl
+		// 'CREATE FOREIGN TABLE dump_test.foreign_table SERVER s1' regexp shape,
+		// adapted to the public schema and the goopg_srv/goopg_ftable naming used
+		// throughout this test.
+		foreignTableBlock := "CREATE FOREIGN TABLE public.goopg_ftable (\n    c1 integer\n)\nSERVER goopg_srv\nOPTIONS (\n    schema_name 'x1'\n);"
+		if !strings.Contains(res.Stdout, foreignTableBlock) {
+			t.Errorf("pg_dump dropped the FOREIGN TABLE round-trip (slice-417); missing %q\n  full stdout=%q", foreignTableBlock, res.Stdout)
+		}
+		// A regression that lost relkind='f' (e.g. the SERVER resolution silently
+		// failing) would fall back to dumping this as a plain CREATE TABLE with no
+		// SERVER/OPTIONS suffix.
+		if strings.Contains(res.Stdout, "CREATE TABLE public.goopg_ftable (") {
+			t.Errorf("pg_dump emitted the foreign table as a plain CREATE TABLE (slice-417 relkind='f' regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 418: the column-level `OPTIONS (column_name 'col1')` clause
+		// (pg_attribute.attfdwoptions) must round-trip as a separate trailing
+		// `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN c1 OPTIONS (...)`
+		// statement (pg_dump.c dumpTableSchema's "per-column fdw options"
+		// block — distinct from the table-level SERVER/OPTIONS clause above).
+		attFDWOptionsStmt := "ALTER FOREIGN TABLE ONLY public.goopg_ftable ALTER COLUMN c1 OPTIONS (\n    column_name 'col1'\n);"
+		if !strings.Contains(res.Stdout, attFDWOptionsStmt) {
+			t.Errorf("pg_dump dropped the per-column FDW OPTIONS round-trip (slice-418); missing %q\n  full stdout=%q", attFDWOptionsStmt, res.Stdout)
+		}
+		// Slice 422: CREATE PUBLICATION must round-trip, and pg_dump must not
+		// abort. Before this slice pg_publication.pubowner was always "" and
+		// pg_dump's getRoleName() pg_fatal()'d on it — a regression here would
+		// make pg_dump exit nonzero and this whole `res.ExitCode == 0` block
+		// would never even run, so the surrounding exit-0 gate is itself part
+		// of the regression guard.
+		pubStmt := "CREATE PUBLICATION goopg_pub1 FOR ALL TABLES WITH (publish = 'insert, update, delete');"
+		if !strings.Contains(res.Stdout, pubStmt) {
+			t.Errorf("pg_dump dropped the CREATE PUBLICATION round-trip (slice-422); missing %q\n  full stdout=%q", pubStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER PUBLICATION goopg_pub1 OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the ALTER PUBLICATION OWNER TO (slice-422, pubowner resolution); full stdout=%q", res.Stdout)
+		}
+		// Slice 423: CREATE SUBSCRIPTION must round-trip, and pg_dump must not
+		// abort (either the pubowner-shaped getRoleName() pg_fatal(), or the
+		// distinct "column does not exist" query-shape failure — see the
+		// runSQLSimple call above). subenabled is unconditionally dumped as
+		// `false` by real pg_dump outside binary-upgrade mode, so `WITH (...)`
+		// never carries an `enabled = ...` clause here regardless of the
+		// subscription's actual enabled state.
+		subStmt := "CREATE SUBSCRIPTION goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote' PUBLICATION goopg_pub1 WITH (connect = false, slot_name = 'goopg_sub1', streaming = off, synchronous_commit = local);"
+		if !strings.Contains(res.Stdout, subStmt) {
+			t.Errorf("pg_dump dropped the CREATE SUBSCRIPTION round-trip (slice-423); missing %q\n  full stdout=%q", subStmt, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER SUBSCRIPTION goopg_sub1 OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the ALTER SUBSCRIPTION OWNER TO (slice-423, subowner resolution); full stdout=%q", res.Stdout)
+		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact
 		// `\tb text,` form (tab-prefixed, comma-suffixed) — a leaked override would
@@ -7705,6 +11111,42 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.named_chk AS integer",
 			"CONSTRAINT must_be_pos CHECK ((VALUE > 0))",
 			"nc public.named_chk",
+			// Slice 363: compound + function-call generic domain CHECKs gain PG's
+			// per-operand parens and call-paren spacing; the value placeholder stays
+			// uppercase across every nested ColumnRef. Byte-identical to real PG 18.3.
+			"CREATE DOMAIN public.dchkand AS integer",
+			"CONSTRAINT dchkand_check CHECK (((VALUE > 0) AND (VALUE < 100)))",
+			"dca public.dchkand",
+			"CREATE DOMAIN public.dchkfn AS text",
+			"CONSTRAINT dchkfn_check CHECK ((length(VALUE) > 0))",
+			"dcf public.dchkfn",
+			// Slice 385: multiple CHECK constraints on one domain. Both checks
+			// round-trip as separate inline CONSTRAINT clauses. Two unnamed checks
+			// auto-disambiguate to `<domain>_check` / `<domain>_check1` (PG's
+			// ChooseConstraintName); a mixed domain keeps its explicit name beside an
+			// auto-named one. (domainDefs is matched by unordered Contains, so the
+			// per-conname dump ordering is exercised by the real pg_dump, not asserted.)
+			"CREATE DOMAIN public.multichk AS integer",
+			"CONSTRAINT multichk_check CHECK ((VALUE > 0))",
+			"CONSTRAINT multichk_check1 CHECK ((VALUE < 100))",
+			"mck public.multichk",
+			"CREATE DOMAIN public.mixchk AS integer",
+			"CONSTRAINT mix_pos CHECK ((VALUE > 0))",
+			"CONSTRAINT mixchk_check CHECK ((VALUE < 50))",
+			"mxck public.mixchk",
+			// Slice 364: a unary minus on a numeric literal folds to PG's
+			// quoted-value-plus-cast `'-N'::type` Const form in CHECK predicates,
+			// column DEFAULTs, expression-index keys, and domain CHECKs. The cast type
+			// is the LITERAL's own type (a bigint column's `<> -100` → `'-100'::integer`;
+			// `DEFAULT -9000000000` → `'-9000000000'::bigint`). Byte-identical to real PG.
+			"CREATE DOMAIN public.dchkneg AS integer",
+			"CONSTRAINT dchkneg_check CHECK ((VALUE < '-5'::integer))",
+			"CONSTRAINT neglit_a_check CHECK ((a < '-5'::integer))",
+			"CONSTRAINT neglit_b_check CHECK ((b > '-3.5'::numeric))",
+			"CONSTRAINT neglit_c_check CHECK ((c <> '-100'::integer))",
+			"d integer DEFAULT '-7'::integer",
+			"e bigint DEFAULT '-9000000000'::bigint",
+			"CREATE INDEX neglit_ix ON public.neglit USING btree (((a + '-7'::integer)))",
 			// Slice 97: a `CHECK (VALUE IN (...))` over a text domain deparses to a
 			// ScalarArrayOpExpr — byte-identical to real pg_dump 18.3.
 			"CREATE DOMAIN public.colr AS text",

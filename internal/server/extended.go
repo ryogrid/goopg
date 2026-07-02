@@ -290,7 +290,7 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 	}
 }
 
-func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry) (*extendedMessageError, error) {
+func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, payload []byte, w *protocol.FrameWriter, sess *config.SessionRegistry, connTx *connTxState) (*extendedMessageError, error) {
 	pr := payloadReader{buf: payload}
 	portalName, err := pr.readCString()
 	if err != nil {
@@ -314,7 +314,7 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	}
 
 	if portal.Result == nil {
-		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum, state.DBName)
+		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum, state.DBName, connTx)
 		if qerr != nil {
 			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
 		}
@@ -403,7 +403,7 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	}
 }
 
-func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string, connTx *connTxState) (*extendedQueryResult, *extendedQueryError) {
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
@@ -467,6 +467,23 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 			Rows:       [][][]byte{{[]byte(eff)}},
 			CommandTag: "SHOW",
 		}, nil
+	// SET LOCAL SESSION AUTHORIZATION name — must be checked before the
+	// generic "SET LOCAL " case below, mirroring server/query.go's
+	// simple-query handling (M0119-0004: the extended-protocol fast path
+	// previously fell through to the generic case and mis-treated "SESSION"
+	// as a GUC name, erroring with "unrecognized configuration parameter").
+	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
+		upper == "SET LOCAL SESSION AUTHORIZATION":
+		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET LOCAL SESSION AUTHORIZATION", true)
+		return &extendedQueryResult{CommandTag: "SET"}, nil
+	// SET LOCAL ROLE rolename — must be checked before the generic "SET LOCAL "
+	// case below, which would otherwise mis-parse "ROLE rolename" as GUC name
+	// "role" (not a config.Registry variable — SET ROLE is tracked entirely
+	// via connTx.NonSuperuserRole) and fail with "unrecognized configuration
+	// parameter". Mirrors server/query.go's simple-query handling. M0119-0004.
+	case strings.HasPrefix(upper, "SET LOCAL ROLE "), upper == "SET LOCAL ROLE":
+		setRoleFastPath(sess, connTx, matchable, "SET LOCAL ROLE", true)
+		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case strings.HasPrefix(upper, "SET LOCAL "):
 		body := matchable[len("SET LOCAL "):]
 		name, value, ok := splitSet(body)
@@ -477,6 +494,27 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 			return nil, &extendedQueryError{Code: sqlstate.InvalidParameterValue, Message: err.Error()}
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
+	// SET SESSION AUTHORIZATION name — track non-superuser role for privilege
+	// checks. Must be checked before the generic "SET " case so splitSet
+	// doesn't mis-parse "SESSION AUTHORIZATION name". M0119-0004.
+	case strings.HasPrefix(upper, "SET SESSION AUTHORIZATION "),
+		upper == "SET SESSION AUTHORIZATION":
+		setSessionAuthorizationFastPath(sess, connTx, matchable, "SET SESSION AUTHORIZATION", false)
+		return &extendedQueryResult{CommandTag: "SET"}, nil
+	// SET ROLE rolename — track the effective role for privilege checks. Must
+	// be before the generic "SET " case so "ROLE" is not passed to sess.Set as
+	// a GUC name. M0119-0004.
+	case strings.HasPrefix(upper, "SET ROLE "), upper == "SET ROLE":
+		setRoleFastPath(sess, connTx, matchable, "SET ROLE", false)
+		return &extendedQueryResult{CommandTag: "SET"}, nil
+	case strings.HasPrefix(upper, "SET CONSTRAINTS "):
+		// SET CONSTRAINTS is not a GUC. The extended fast path holds only the
+		// GUC SessionRegistry, not the executor BasicSession where FK-deferral
+		// state lives, so accept it here as a correctly-tagged no-op rather than
+		// mis-parsing it as a configuration parameter. Runtime deferral via
+		// SET CONSTRAINTS is supported on the simple-query protocol (the path
+		// psql and the isolation harness use). 0119-0004.
+		return &extendedQueryResult{CommandTag: "SET CONSTRAINTS"}, nil
 	case strings.HasPrefix(upper, "SET "):
 		body := matchable[len("SET "):]
 		name, value, ok := splitSet(body)
@@ -489,6 +527,15 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 		return &extendedQueryResult{CommandTag: "SET"}, nil
 	case upper == "RESET ALL":
 		sess.ResetAll()
+		return &extendedQueryResult{CommandTag: "RESET"}, nil
+	// RESET SESSION AUTHORIZATION / RESET ROLE — restore the bootstrap
+	// superuser's full privileges. Must be checked before the generic
+	// "RESET " case. M0119-0004.
+	case upper == "RESET SESSION AUTHORIZATION", upper == "RESET ROLE":
+		if connTx != nil {
+			connTx.NonSuperuserRole = ""
+			setIsSuperuserGUC(sess, true)
+		}
 		return &extendedQueryResult{CommandTag: "RESET"}, nil
 	case strings.HasPrefix(upper, "RESET "):
 		name := strings.TrimSpace(matchable[len("RESET "):])
@@ -505,7 +552,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 		}
 	}
 	if s.cfg.hasStorage() {
-		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params, procNum, dbName)
+		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params, procNum, dbName, connTx)
 	}
 
 	if len(params) > 0 {
@@ -596,6 +643,48 @@ func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, 
 		}
 	}
 	return fields, true
+}
+
+// setSessionAuthorizationFastPath applies a `SET [LOCAL] SESSION
+// AUTHORIZATION name` statement's role change to connTx/sess, shared by the
+// extended-query protocol's SET fast path (executeExtendedQuery). prefix is
+// the exact keyword sequence to strip ("SET SESSION AUTHORIZATION" or "SET
+// LOCAL SESSION AUTHORIZATION"); matchable is the ';'-stripped statement
+// text. Mirrors server/query.go's handleQuery SET SESSION AUTHORIZATION
+// cases. M0119-0004.
+func setSessionAuthorizationFastPath(sess *config.SessionRegistry, connTx *connTxState, matchable, prefix string, local bool) {
+	if connTx == nil {
+		return
+	}
+	role := strings.TrimSpace(matchable[len(prefix):])
+	role = strings.Trim(role, `"'`)
+	connTx.SnapshotLocalRoleIfNeeded(local)
+	switch strings.ToUpper(role) {
+	case "", "DEFAULT", "RESET", "POSTGRES":
+		connTx.NonSuperuserRole = ""
+	default:
+		connTx.NonSuperuserRole = role
+	}
+	setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
+}
+
+// setRoleFastPath is setSessionAuthorizationFastPath's SET ROLE / SET LOCAL
+// ROLE sibling: identical shape, but "NONE" (not "RESET") is SET ROLE's
+// keyword for restoring superuser status. M0119-0004.
+func setRoleFastPath(sess *config.SessionRegistry, connTx *connTxState, matchable, prefix string, local bool) {
+	if connTx == nil {
+		return
+	}
+	role := strings.TrimSpace(matchable[len(prefix):])
+	role = strings.Trim(role, `"'`)
+	connTx.SnapshotLocalRoleIfNeeded(local)
+	switch strings.ToUpper(role) {
+	case "", "DEFAULT", "NONE", "POSTGRES":
+		connTx.NonSuperuserRole = ""
+	default:
+		connTx.NonSuperuserRole = role
+	}
+	setIsSuperuserGUC(sess, connTx.NonSuperuserRole == "")
 }
 
 func normalizeSimpleQuery(query string) (trimmed string, matchable string, upper string, empty bool) {

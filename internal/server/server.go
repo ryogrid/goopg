@@ -38,6 +38,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -348,6 +349,14 @@ func New(cfg Config) *Server {
 		roles:         map[string]struct{}{"postgres": {}},
 		notify:        newNotifyHub(),
 		preparedXacts: newPreparedXactStore(),
+	}
+	// Seed the connection-time role set from the catalog role registry, which
+	// initdb.Open restored from the pg_authid heap + role WAL records
+	// (root-0021) — so roles created before a restart keep authenticating.
+	if im, ok := cfg.Catalog.(*catalog.InMemory); ok && im != nil {
+		for _, rs := range im.AllRoleStates() {
+			s.roles[rs.Name] = struct{}{}
+		}
 	}
 	s.nextPID.Store(0)
 	// Initialize plan cache when storage handles are present (M0098-0005).
@@ -858,6 +867,18 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		// effective value matches.
 		_ = sess.Set("session_authorization", user, false)
 	}
+	// is_superuser is FlagReport (GUC_REPORT upstream): libpq captures it
+	// from the startup ParameterStatus block and pg_dump's is_superuser()
+	// (pg_dump.c) reads that captured value verbatim rather than issuing a
+	// live SHOW — it never re-queries after connecting, so this one-time
+	// startup value is what getSubscriptions()'s superuser gate actually
+	// sees. Before this fix the GUC's BootVal ("off") was never overridden
+	// per-connection, so pg_dump treated every connection — including the
+	// bootstrap "postgres" superuser — as unprivileged and silently skipped
+	// dumping ALL subscriptions (DU-002 slice 423).
+	if isSuperuserRoleName(user) {
+		_ = sess.SetInternal("is_superuser", "on")
+	}
 
 	// Now wire the per-session ParameterStatus emitter so subsequent
 	// SET application_name = 'X' (etc.) auto-emits.
@@ -901,6 +922,17 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 // `false` / `0` / unrecognised values mean "not a replication
 // connection". Mirrors postgres/src/backend/replication/walsender.c
 // (`got_STOPPING`, `EnableReplicationOriginCmd`).
+// isSuperuserRoleName reports whether roleName is the bootstrap
+// superuser. goopg has no CREATE ROLE ... SUPERUSER attribute tracking
+// (the whole privilege model is the bootstrap "postgres" role vs.
+// everything else — see connTxState.NonSuperuserRole and its SET
+// ROLE / SET SESSION AUTHORIZATION call sites in query.go, which use
+// the same case-insensitive "POSTGRES" special case), so this mirrors
+// that convention rather than introducing a separate one.
+func isSuperuserRoleName(roleName string) bool {
+	return strings.EqualFold(strings.TrimSpace(roleName), "postgres")
+}
+
 func isReplicationStartupParam(v string) bool {
 	switch v {
 	case "":
@@ -1071,9 +1103,11 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 // another ReadyForQuery so the client can keep going.
 // rollbackOpenTxnOnTeardown aborts an explicit transaction that is still open
 // when the connection's dispatch loop exits. It mirrors the dispatch
-// `planner.TxRollback` path (restore pending routine drops, roll back the
-// TxnMgr transaction, undo in-transaction enum DDL, clear per-connection
-// state). The critical effect is `TxnMgr.Rollback`, which clears the XID from
+// `planner.TxRollback` path (roll back the TxnMgr transaction, undo
+// in-transaction enum DDL, clear per-connection state — any DROP
+// FUNCTION/PROCEDURE deferred to COMMIT is discarded by `connTx.End()`'s
+// `EndExplicitTransaction`). The critical effect is `TxnMgr.Rollback`, which
+// clears the XID from
 // the ProcArray and broadcasts `commitCond` — releasing every backend blocked
 // in WaitForXID on this transaction's XID. A no-op when no explicit
 // transaction is active (auto-commit statements finish their own per-statement
@@ -1081,13 +1115,6 @@ func (s *Server) sendStartupReply(w *protocol.FrameWriter, sess *config.SessionR
 func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Logger) {
 	if connTx == nil || !connTx.InExplicit() || s.cfg.TxnMgr == nil {
 		return
-	}
-	if sess := connTx.Session(); sess != nil && s.cfg.Catalog != nil {
-		if rs := s.cfg.Catalog.Routines(); rs != nil {
-			for _, r := range sess.TakePendingRoutineDrops() {
-				_, _ = rs.Create(r, true)
-			}
-		}
 	}
 	_ = s.cfg.TxnMgr.Rollback(connTx.Tx())
 	if s.cfg.Catalog != nil {
@@ -1340,7 +1367,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 		case protocol.MsgExecute:
 			queryCtx, queryCancel := context.WithCancel(ctx)
 			entry.setQueryCancel(queryCancel)
-			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess)
+			em, err := s.handleExecuteFrame(queryCtx, extended, f.Payload, w, sess, connTx)
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {

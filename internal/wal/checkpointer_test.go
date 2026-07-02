@@ -765,6 +765,67 @@ func TestCheckpointerPostCheckpointFnErrorIsNonFatal(t *testing.T) {
 	}
 }
 
+// TestCheckpointerCallsFlushCLOGFn verifies that runCheckpoint invokes
+// FlushCLOGFn once per successful checkpoint, in the flush phase (i.e. it
+// does not need the primary flusher to be dirty). M0117-0007 Part B
+// continuation.
+func TestCheckpointerCallsFlushCLOGFn(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	var callCount int
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		FlushCLOGFn: func() error {
+			callCount++
+			return nil
+		},
+	})
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
+		t.Fatalf("runCheckpoint: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("FlushCLOGFn called %d times, want 1", callCount)
+	}
+
+	if err := cp.runCheckpoint(context.Background(), false, false); err != nil {
+		t.Fatalf("second runCheckpoint: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("after second checkpoint: FlushCLOGFn called %d times total, want 2", callCount)
+	}
+}
+
+// TestCheckpointerFlushCLOGFnErrorFailsCheckpoint verifies that, unlike the
+// best-effort PostCheckpointFn/TruncateCLOGFn hooks, a FlushCLOGFn error
+// propagates and fails the checkpoint — a checkpoint whose redo LSN
+// advances past commits whose CLOG state failed to flush would leave crash
+// recovery unable to reconstruct that state.
+func TestCheckpointerFlushCLOGFnErrorFailsCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 4096,
+		PageHeaders: true, TimelineID: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	cp := NewCheckpointer(&fakeFlusher{}, w, CheckpointerConfig{
+		FlushCLOGFn: func() error {
+			return fmt.Errorf("simulated clog flush failure")
+		},
+	})
+	if err := cp.runCheckpoint(context.Background(), false, false); err == nil {
+		t.Fatal("runCheckpoint returned nil, want a propagated FlushCLOGFn error")
+	}
+}
+
 func waitSignals(t *testing.T, ch <-chan struct{}, n int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.After(timeout)

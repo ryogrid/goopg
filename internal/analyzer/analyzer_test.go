@@ -99,7 +99,12 @@ func TestAnalyzeTypeErrors(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts WHERE aid", "42804")
 	expectAnalyzeCode(t, cat, "SELECT aid || abalance FROM pgbench_accounts", "42883")
-	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts LIMIT 'x'", "42804")
+	// A bare string literal is now typed `unknown` (like PG's UNKNOWNOID), so
+	// `LIMIT 'x'` no longer fails at analysis — it defers to runtime, which
+	// rejects a non-integer LIMIT with 42804 (operators.go limitOp.Open),
+	// consistent with how string-literal-into-int is deferred (M0097-0003).
+	// A concrete non-integer type (bool) is still caught at analysis:
+	expectAnalyzeCode(t, cat, "SELECT aid FROM pgbench_accounts LIMIT true", "42804")
 }
 
 func TestAnalyzeDMLTypeAndReturningErrors(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // pgClassColumnsPG18 mirrors initdb.pgClassColDefs — the canonical PG18
@@ -90,7 +91,7 @@ func pgAttributeColumnsPG18() []catalog.Column {
 		{Name: "attislocal", Type: catalog.Type{Name: "bool"}},
 		{Name: "attinhcount", Type: catalog.Type{Name: "int2"}},
 		{Name: "attcollation", Type: catalog.Type{Name: "oid"}},
-		{Name: "attacl", Type: catalog.Type{Name: "text"}},
+		{Name: "attacl", Type: catalog.Type{Name: "aclitem[]"}},
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
@@ -446,12 +447,13 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	if isPartition && len(tbl.PartitionBounds) > 0 {
 		relpartbound = catalog.FormatPartitionBound(tbl.PartitionBounds[0])
 	}
+	replIdent := catalog.ReplIdentOrDefault(tbl.ReplicaIdentity) // 'd' default; FULL/NOTHING via ALTER, DU-002 slice 305
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
 		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema))), // relnamespace
 		NewIntDatum(0),                                             // reltype (no composite type seeded yet)
-		NewIntDatum(0),                                             // reloftype
+		NewIntDatum(int64(tbl.OfTypeOID)),                          // reloftype (typed table `OF type`; 0 otherwise, DU-002 slice 374)
 		NewIntDatum(bootstrapSuperuserOID),                         // relowner
 		NewIntDatum(pgHeapAccessMethodOID),                         // relam
 		NewIntDatum(relfilenode),                                   // relfilenode
@@ -470,10 +472,10 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewBoolDatum(false),                                        // relhasrules
 		NewBoolDatum(false),                                        // relhastriggers
 		NewBoolDatum(false),                                        // relhassubclass
-		NewBoolDatum(false),                                        // relrowsecurity
-		NewBoolDatum(false),                                        // relforcerowsecurity
+		NewBoolDatum(tbl.RowSecurity),                              // relrowsecurity (DU-002 slice 322)
+		NewBoolDatum(tbl.ForceRowSecurity),                         // relforcerowsecurity (DU-002 slice 322)
 		NewBoolDatum(true),                                         // relispopulated
-		NewStringDatum("n"),                                        // relreplident (REPLICA_IDENTITY_DEFAULT)
+		NewStringDatum(replIdent),                                  // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
 		NewBoolDatum(isPartition),                                  // relispartition
 		NewIntDatum(0),                                             // relrewrite
 		NewIntDatum(minFrozenXID),                                  // relfrozenxid
@@ -623,6 +625,30 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 		}
 	}
+	// A column whose declared type is a user-defined COMPOSITE type (`CREATE TYPE
+	// x AS (...)`) likewise resolves to the text fallback above (TypeNameToOID and
+	// ResolveColumnType both preserve the bare composite name, which is not a
+	// built-in). Re-resolve it to the composite's dynamically-allocated pg_type
+	// OID so pg_attribute.atttypid points at the composite and pg_dump's
+	// format_type(atttypid, atttypmod) renders the column as the schema-qualified
+	// composite name (LookupCompositeTypeByOID, expr.go) rather than `text`. The
+	// parser splits a schema-qualified type (`public.compt`) into Schema+Name, so
+	// col.Type.Name is the bare name the composite registry is keyed on. A
+	// `compt[]` column resolves to the composite's auto-generated array OID. Guard
+	// on no enum match so the two user-type branches stay mutually exclusive.
+	// DU-002 slice 373.
+	compositeOID := uint32(0)
+	compositeArrayOID := uint32(0)
+	if cat != nil && typOID == catalog.OIDText && enumOID == 0 && enumArrayOID == 0 {
+		if ct := cat.LookupCompositeType(col.Type.Name); ct != nil {
+			if col.Type.IsArray {
+				compositeArrayOID = ct.ArrayOID
+			} else {
+				typOID = ct.OID
+				compositeOID = ct.OID
+			}
+		}
+	}
 	// A column whose declared type is a user-defined DOMAIN is stored with its
 	// type name already resolved to the BASE type (catalog.ResolveColumnType at
 	// CREATE TABLE), with the original domain name preserved in DeclaredTypeName.
@@ -663,6 +689,10 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			// Domain array OIDs are dynamic too. DU-002 slice 251.
 			typOID = domainArrayOID
 			attndims = 1
+		case compositeArrayOID != 0:
+			// Composite array OIDs are dynamic too. DU-002 slice 373.
+			typOID = compositeArrayOID
+			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
 				typOID = aoid
@@ -691,6 +721,16 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	case domainBaseOID != 0:
 		// A domain inherits its base type's physical layout. DU-002 slice 90.
 		attrs = userTypeAttrsForOID(domainBaseOID)
+	case compositeOID != 0:
+		// A composite type is a varlena, double-aligned, extended-storage,
+		// non-collatable value (mirrors buildUserPGTypeRowForComposite). The
+		// dynamic composite OID can't be cased by userTypeAttrsForOID. DU-002
+		// slice 373.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case compositeArrayOID != 0:
+		// A composite's array type shares the composite element's layout
+		// (mirrors buildUserPGTypeRowForCompositeArray). DU-002 slice 373.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	// A per-column storage override (ALTER COLUMN ... SET STORAGE) shadows the
 	// type's default storage in pg_attribute.attstorage. pg_dump compares
@@ -734,6 +774,16 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if len(col.Options) > 0 {
 		attOptionsDatum = NewStringDatum("{" + strings.Join(col.Options, ",") + "}")
 	}
+	// Per-column foreign-table options (`CREATE FOREIGN TABLE (col type
+	// OPTIONS (name 'value', …))`) are stored in pg_attribute.attfdwoptions
+	// as a text[] array — same encoding as attoptions above. pg_dump's
+	// getTableAttrs expands it via pg_options_to_table(attfdwoptions) and
+	// dumpTableSchema emits `ALTER FOREIGN TABLE ONLY ... ALTER COLUMN ...
+	// OPTIONS (...)` whenever it is non-empty. DU-002 slice 418.
+	attFDWOptionsDatum := NullDatum
+	if len(col.FDWOptions) > 0 {
+		attFDWOptionsDatum = NewStringDatum("{" + strings.Join(col.FDWOptions, ",") + "}")
+	}
 	// A per-column explicit collation (`COLLATE <name>`) shadows the type's
 	// typcollation in pg_attribute.attcollation. pg_dump's getTableAttrs query
 	// reports attcollation only when `a.attcollation <> t.typcollation`, and
@@ -747,6 +797,35 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if col.Collation != "" && attrs.TypCollation != 0 {
 		if oid := collationNameToOID(col.Collation); oid != 0 {
 			attCollationOID = oid
+		} else if im, ok := cat.(*catalog.InMemory); ok {
+			// Not a built-in collation name — resolve a CREATE COLLATION (user)
+			// collation's OID so a column declared `COLLATE <usercoll>` shadows the
+			// type default and pg_dump re-emits `COLLATE <schema>.<name>`. DU-002 slice 394.
+			if oid := im.UserCollationOIDByName(col.Collation); oid != 0 {
+				attCollationOID = oid
+			}
+		}
+	}
+	// attacl carries the column's materialized pg_attribute.attacl as a PG-native
+	// _aclitem ArrayType blob (KindBytes), populated from the (relOID, attnum)-keyed
+	// column ACL store. A column has no acldefault('c', owner), so attacl stays NULL
+	// until the first column GRANT and returns to NULL once the last privilege is
+	// revoked. Filling it here (rather than only in resyncAttrACLHeapRow) keeps the
+	// heap consistent across every rebuild — a later unrelated re-sync preserves the
+	// grant instead of wiping it. The pg_attribute seqscan decode hook
+	// (operators_storage.go) renders the blob back to canonical aclitemout text on
+	// read. cat==nil (unit fixtures) leaves attacl NULL. M0119-0004-ACLHEAP.
+	attaclDatum := NullDatum
+	if im, ok := cat.(*catalog.InMemory); ok {
+		if txt := im.AttrACLText(tbl.OID, int16(col.Ordinal+1)); txt != "" {
+			if blob, err := encodeAclItemArrayText(txt, func(roleName string) uint32 {
+				if roid, ok := im.RoleOID(roleName); ok {
+					return roid
+				}
+				return 0
+			}); err == nil {
+				attaclDatum = NewBytesDatum(blob)
+			}
 		}
 	}
 	return Row{
@@ -780,9 +859,9 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// EncodeRowPG to skip the column and the bitmap helper to clear
 		// its bit. attstattarget (last) is NULL by default but carries the
 		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
-		NullDatum,          // attacl
+		attaclDatum,        // attacl (NULL default; _aclitem blob after a column GRANT)
 		attOptionsDatum,    // attoptions (NULL default; text[] literal when set)
-		NullDatum,          // attfdwoptions
+		attFDWOptionsDatum, // attfdwoptions (NULL default; text[] literal when set)
 		NullDatum,          // attmissingval
 		attStatTargetDatum, // attstattarget (NULL default; integer override)
 	}
@@ -921,12 +1000,12 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		NewBoolDatum(idx.Primary),                 // indisprimary
 		NewBoolDatum(false),                       // indisexclusion
 		NewBoolDatum(true),                        // indimmediate
-		NewBoolDatum(false),                       // indisclustered
+		NewBoolDatum(idx.IsClustered),             // indisclustered (DU-002 slice 320)
 		NewBoolDatum(true),                        // indisvalid
 		NewBoolDatum(false),                       // indcheckxmin
 		NewBoolDatum(true),                        // indisready
 		NewBoolDatum(true),                        // indislive
-		NewBoolDatum(false),                       // indisreplident
+		NewBoolDatum(idx.IsReplicaIdentity),       // indisreplident (DU-002 slice 306)
 		NewBytesDatum(pgInt2VectorBytes(attnums)), // indkey
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indcollation
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indclass
@@ -1645,6 +1724,13 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 	if field.Collation != "" && attrs.TypCollation != 0 {
 		if oid := collationNameToOID(field.Collation); oid != 0 {
 			attCollationOID = oid
+		} else if im, ok := cat.(*catalog.InMemory); ok {
+			// User (CREATE COLLATION) collation on a composite field — same fallback
+			// as the table-column path so dumpCompositeType re-emits the COLLATE
+			// clause. DU-002 slice 394.
+			if oid := im.UserCollationOIDByName(field.Collation); oid != 0 {
+				attCollationOID = oid
+			}
 		}
 	}
 	return Row{
@@ -1812,5 +1898,134 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NullDatum,                                      // typdefaultbin (NULL)
 		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// pgAggregateColumnsPG18 mirrors internal/initdb's pgAggregateColDefs — the
+// canonical PG18 pg_aggregate row layout (22 columns, matching
+// FormData_pg_aggregate in postgres/src/include/catalog/pg_aggregate.h).
+// Duplicated here (executor cannot import internal/initdb — import cycle,
+// see pgTypeColumnsPG18 above) so CREATE AGGREGATE can write a live heap row.
+// DU-002 slice 405.
+func pgAggregateColumnsPG18() []catalog.Column {
+	return []catalog.Column{
+		{Name: "aggfnoid", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggkind", Type: catalog.Type{Name: "char"}},
+		{Name: "aggnumdirectargs", Type: catalog.Type{Name: "int2"}},
+		{Name: "aggtransfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggfinalfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggcombinefn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggserialfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggdeserialfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggmtransfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggminvtransfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggmfinalfn", Type: catalog.Type{Name: "regproc"}},
+		{Name: "aggfinalextra", Type: catalog.Type{Name: "bool"}},
+		{Name: "aggmfinalextra", Type: catalog.Type{Name: "bool"}},
+		{Name: "aggfinalmodify", Type: catalog.Type{Name: "char"}},
+		{Name: "aggmfinalmodify", Type: catalog.Type{Name: "char"}},
+		{Name: "aggsortop", Type: catalog.Type{Name: "oid"}},
+		{Name: "aggtranstype", Type: catalog.Type{Name: "oid"}},
+		{Name: "aggtransspace", Type: catalog.Type{Name: "int4"}},
+		{Name: "aggmtranstype", Type: catalog.Type{Name: "oid"}},
+		{Name: "aggmtransspace", Type: catalog.Type{Name: "int4"}},
+		{Name: "agginitval", Type: catalog.Type{Name: "text"}},
+		{Name: "aggminitval", Type: catalog.Type{Name: "text"}},
+	}
+}
+
+// aggregateTypeOID resolves a CREATE AGGREGATE BASETYPE/STYPE name to a
+// pg_type OID, handling the underscore-prefixed internal array spelling
+// (`_int8`) as well as the SQL `int8[]` spelling — both are accepted by the
+// grammar (see parseAggregateOptions). Falls back to catalog.TypeNameToOID's
+// scalar table for a plain type name. DU-002 slice 405.
+func AggregateTypeOID(name string) uint32 {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if base, ok := strings.CutPrefix(name, "_"); ok {
+		if arr := catalog.ArrayOIDForBase(catalog.TypeNameToOID(base)); arr != 0 {
+			return arr
+		}
+	}
+	if base, ok := strings.CutSuffix(name, "[]"); ok {
+		if arr := catalog.ArrayOIDForBase(catalog.TypeNameToOID(base)); arr != 0 {
+			return arr
+		}
+	}
+	return catalog.TypeNameToOID(name)
+}
+
+// resolveAggFuncOIDAndRetType resolves a CREATE AGGREGATE function-name
+// reference (SFUNC/FINALFUNC/COMBINEFUNC) to a pg_proc OID and its declared
+// return type name: goopg's user-defined routine registry first, then the
+// curated builtin table (mirrors pg_cast.castfunc / pg_conversion.conproc's
+// FuncOID resolution, catalog.LookupBuiltinProc). Returns (0, "") when
+// unresolved -- the caller stores InvalidOid, which regprocout renders "-".
+// DU-002 slice 405.
+func ResolveAggFuncOIDAndRetType(cat catalog.Catalog, name string) (uint32, string) {
+	if name == "" {
+		return 0, ""
+	}
+	if rs := cat.Routines(); rs != nil {
+		if candidates := rs.LookupByName(parser.ObjectName{Name: name}); len(candidates) > 0 {
+			return candidates[0].OID, candidates[0].ReturnType.Name
+		}
+	}
+	if bp, ok := catalog.LookupBuiltinProc(name); ok {
+		return bp.OID, bp.RetType
+	}
+	return 0, ""
+}
+
+// aggFinalModifyChar maps a parsed FINALFUNC_MODIFY token to the
+// pg_aggregate.aggfinalmodify char PostgreSQL stores (AGGMODIFY_* in
+// postgres/src/include/catalog/pg_aggregate.h). Unspecified defaults to
+// AGGMODIFY_READ_ONLY ('r'), PG's default for a normal (non-ordered-set)
+// aggregate (DefineAggregate's defaultfinalmodify).
+func AggFinalModifyChar(s string) string {
+	switch strings.ToLower(s) {
+	case "read_write":
+		return "w"
+	case "shareable":
+		return "s"
+	default:
+		return "r"
+	}
+}
+
+// buildUserPGAggregateRow builds the pg_aggregate heap row for a CREATE
+// AGGREGATE. aggkind is always 'n' (normal) and the moving-aggregate
+// (MSFUNC/MINVFUNC/...) columns are always zero/default -- goopg parses but
+// discards those clauses (parseAggregateOptions). DU-002 slice 405.
+func buildUserPGAggregateRow(ctx *Context, agg *catalog.UserAggregate) Row {
+	transFnOID, _ := ResolveAggFuncOIDAndRetType(ctx.Catalog, agg.SFunc)
+	finalFnOID, _ := ResolveAggFuncOIDAndRetType(ctx.Catalog, agg.FinalFunc)
+	combineFnOID, _ := ResolveAggFuncOIDAndRetType(ctx.Catalog, agg.CombineFunc)
+	initCond := NullDatum
+	if agg.InitCond != "" {
+		initCond = NewStringDatum(agg.InitCond)
+	}
+	return Row{
+		NewIntDatum(int64(agg.OID)),      // aggfnoid
+		NewStringDatum("n"),              // aggkind
+		NewIntDatum(0),                   // aggnumdirectargs
+		NewIntDatum(int64(transFnOID)),   // aggtransfn
+		NewIntDatum(int64(finalFnOID)),   // aggfinalfn
+		NewIntDatum(int64(combineFnOID)), // aggcombinefn
+		NewIntDatum(0),                   // aggserialfn
+		NewIntDatum(0),                   // aggdeserialfn
+		NewIntDatum(0),                   // aggmtransfn
+		NewIntDatum(0),                   // aggminvtransfn
+		NewIntDatum(0),                   // aggmfinalfn
+		NewBoolDatum(false),              // aggfinalextra
+		NewBoolDatum(false),              // aggmfinalextra
+		NewStringDatum(AggFinalModifyChar(agg.FinalFuncModify)), // aggfinalmodify
+		NewStringDatum("r"), // aggmfinalmodify (moving-aggregate not modeled)
+		NewIntDatum(0),      // aggsortop
+		NewIntDatum(int64(AggregateTypeOID(agg.SType))), // aggtranstype
+		NewIntDatum(0), // aggtransspace
+		NewIntDatum(0), // aggmtranstype
+		NewIntDatum(0), // aggmtransspace
+		initCond,       // agginitval
+		NullDatum,      // aggminitval
 	}
 }

@@ -8771,6 +8771,2141 @@ guard that the pre-fix `DEFAULT &{` Go-pointer corruption does **not** appear.
 > renderer); `OpUnaryPos` (`+x`) / `OpBitNot` (`~x`) unary-default arms (still fall through to `fmt.Sprintf` garbage); or
 > a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
+### Slice 360 — **bare function-call expression-index key** `lower(name)` → `USING btree (lower(name))` (PRODUCTION fix)
+
+A counterpart to slice 299's arithmetic key, on the parenthesization decision PG's `pg_get_indexdef_worker`
+(`ruleutils.c`) makes *before* the deparsed key text: every expression key column is wrapped in `(%s)` **unless** its
+top node is a bare function call (`IsA(indexkey, FuncExpr) && ((FuncExpr *) indexkey)->funcformat ==
+COERCE_EXPLICIT_CALL`), which prints as-is. So real pg_dump 18.3 emits `USING btree (lower(name))` /
+`(lpad(name, 5))` (one paren level) but keeps `((((qty + id) * mgr_id)))` for the arithmetic key.
+
+goopg's `catalog.BuildIndexDef` previously wrapped **every** expression key unconditionally, dumping the
+byte-divergent `((lower(name)))`. The fix adds `catalog.indexKeyIsBareFuncCall`, keyed on the parsed
+`catalog.Index.ColExprs[i]` AST (a `*parser.FuncCall` that is not a no-paren SQL value function), and suppresses the
+wrap only for that shape — every other expression (arithmetic, cast, CASE, …) keeps its parens. Byte-verified against
+real pg_dump 18.3 (`/tmp/du_ref_pg`); fixtures `foo_lower_idx` + `foo_lpad_idx` in `TestPort_PgDumpConnectionSetup`.
+
+> **Deferred (ledgered):** (a) a typed string-literal **cast inside a function-arg** — PG dumps
+> `upper((name || '_x'::text))` (the `'_x'` literal carries its `::text` type), but goopg's type-blind
+> `defaultExprToSQL` renders `'_x'` (and an operator arg without the inner parens); needs operand-type threading like
+> slice 302's `'-N'::type`. (b) **restart persistence** — `ColExprs`/`ColExprStrings` are in-memory only and
+> `pg_index.indexprs` is dumped NULL, so a function-call index would not round-trip after a server restart (the
+> renderer falls back to the wrap when the AST is absent). Both unchanged by this slice.
+
+### Slice 361 — **`USING hash` index** `CREATE INDEX … USING hash (qty)` → `USING hash (qty)` (PRODUCTION fix)
+
+goopg has no native hash access method: a `CREATE INDEX … USING hash` is routed through `createBTreeIndex` and built on
+the B-tree substrate (`internal/executor/operators_ddl.go`, `declaredHash := method == "hash"; method = "btree"`). The
+catalog row keeps `Method = "btree"` (so `pg_am`/`pg_index` and the SSI bucket-grain predicate-lock path stay coherent),
+and only `catalog.Index.DeclaredHash` remembers the declared method (design `0118-0099`).
+
+PG's `pg_get_indexdef_worker` (`ruleutils.c`) prints `USING %s` from `pg_am.amname`, so a hash index's `amname='hash'`
+makes real pg_dump 18.3 emit `CREATE INDEX foo_qty_hash_idx ON public.foo USING hash (qty);` (verified byte-identical
+against a throwaway PG 18.3 cluster). Before this slice goopg's `catalog.BuildIndexDef` rendered the stored `btree`,
+emitting the divergent `USING btree (qty)` — a silent loss of the index's access method on restore (the restored index
+would be a real B-tree, not a hash index).
+
+The fix surfaces `DeclaredHash` in `BuildIndexDef`: when set, the `USING` method is rendered as `hash` regardless of the
+substrate's stored `btree`. Byte-verified against real pg_dump 18.3; fixture `foo_qty_hash_idx` in
+`TestPort_PgDumpConnectionSetup` (slice 361) + unit `TestBuildIndexDefDeclaredHash` (catalog pkg, pins the hash render
+plus a contrast plain-btree case).
+
+> **Deferred (ledgered):** **restart persistence** — `DeclaredHash` is in-memory only (set on the live
+> `catalog.Index` after the build), so after a server restart a re-loaded hash index would dump `USING btree` again. The
+> connsetup harness dumps in the same session as the CREATE, so this slice round-trips; durable `pg_am`/`pg_index`
+> access-method persistence is the same shared-catalog runtime-write gap that blocks the other restart-durability slices.
+
+### Slice 362 — **compound / function-call table CHECK** `CHECK (a > 0 AND b > 0)` → `CHECK (((a > 0) AND (b > 0)))` (PRODUCTION fix)
+
+goopg stores a CHECK constraint body as token-reconstructed raw text (`parser.parseCheckExpr` joins the lexed tokens with
+single spaces and re-quotes string literals). The dump path — the `pg_get_constraintdef` branch over a table's
+`NamedChecks` in `internal/executor/expr.go` — wrapped that raw text as `CHECK ((<raw>))`. That double-paren wrap is
+byte-correct **only** for a single bare comparison (`a < b` → `CHECK ((a < b))`, matching slices 127–129), because
+PostgreSQL's `pg_get_constraintdef_worker` re-deparses the stored node (`pg_constraint.conbin`) with `get_rule_expr`,
+which fully parenthesizes **every** sub-expression:
+
+- `CHECK (a > 0 AND b > 0)` → `CHECK (((a > 0) AND (b > 0)))` — each boolean operand carries its own parens;
+- `CHECK (a < 0 OR b > 10)` → `CHECK (((a < 0) OR (b > 10)))`;
+- `CHECK (length(name) > 0)` → `CHECK ((length(name) > 0))` — no padding spaces around the call's parentheses (the token
+  join would have emitted `length ( name )`).
+
+All three forms were verified byte-identical against a throwaway PG 18.3 cluster. Before this slice the legacy wrap
+emitted `CHECK ((a > 0 AND b > 0))` / `CHECK ((length ( name ) > 0))` — divergences that re-parse with different operator
+precedence on restore.
+
+The fix is `renderCheckPredicate` (`internal/executor/operators_ddl.go`): re-parse the raw text with `parser.ParseExpr`
+and deparse it through `defaultExprToSQL` — the same fully-parenthesizing renderer the index-predicate, expression-index
+and partition-key paths already use — then wrap once as `CHECK (%s)` (the single outer paren layer is supplied here
+because `defaultExprToSQL` already parenthesizes the top-level OpExpr/BoolExpr). A re-parse round-trip guards the change:
+if the raw text fails to parse, or the deparsed string is not itself re-parseable (the renderer hit a node it cannot
+render and fell through to its Go-value fallback), the legacy `CHECK ((<raw>))` wrap is kept so the dump never emits
+non-SQL garbage. Auto-naming already matched PG (`autoCheckName` counts distinct columns via `ParseExpr`, mirroring
+`pull_var_clause`): the two-column `chkand`/`chkor` get the table-only `<table>_check` name, the one-column `chkfn` the
+column-qualified `chkfn_name_check`. Fixtures `chkand`/`chkor`/`chkfn` in `TestPort_PgDumpConnectionSetup` (slice 362) +
+unit `TestRenderCheckPredicate`/`TestRenderCheckPredicateFallback` (executor pkg).
+
+> **Deferred (ledgered):** **domain CHECK predicates** (`pg_get_constraintdef` over `AllDomains()`, same file) still use
+> the legacy `CHECK ((<raw>))` wrap and would diverge identically for a compound/function-call domain CHECK; they were
+> left out of scope because the domain path also carries the elaborate `VALUE IN (...)` ScalarArrayOp renderer and the
+> `VALUE` keyword, so converting it needs its own slice. **Type-blind literal casts** inside a CHECK (the same gap as the
+> expression-index slice 360(a): `name || '_x'` dumps `'_x'` not `'_x'::text`) remain — `defaultExprToSQL` has no operand
+> type in scope, so a CHECK carrying an unknown-type literal in an operator argument would still byte-diverge and is kept
+> on the legacy fallback by the re-parse guard.
+
+### Slice 363 — **compound / function-call domain CHECK** `CHECK (VALUE > 0 AND VALUE < 100)` → `CHECK (((VALUE > 0) AND (VALUE < 100)))` (PRODUCTION fix)
+
+The domain twin of slice 362, closing deferred-(a) above. A *generic* (non-IN) domain CHECK is stored as token-reconstructed
+raw text (`parser.parseDomainCheckExpr`, which already upcases the value placeholder to `VALUE`); the dump path — the
+`pg_get_constraintdef` branch over `AllDomains()` in `internal/executor/expr.go` — wrapped it as `CHECK ((<raw>))`. As with
+the table path, that double-paren wrap is byte-correct only for a single bare comparison (`VALUE > 0` → `CHECK ((VALUE > 0))`,
+matching slice 96). PostgreSQL re-deparses the stored node via `get_rule_expr` (over a `CoerceToDomainValue` placeholder),
+fully parenthesizing every sub-node:
+
+- `CHECK (VALUE > 0 AND VALUE < 100)` → `CHECK (((VALUE > 0) AND (VALUE < 100)))`;
+- `CHECK (length(VALUE) > 0)` → `CHECK ((length(VALUE) > 0))` — no padding spaces around the call's parentheses.
+
+Both forms were verified byte-identical against a throwaway PG 18.3 cluster. The fix is `renderDomainCheckPredicate`
+(`internal/executor/operators_ddl.go`), the domain twin of `renderCheckPredicate`: re-parse the raw text and deparse it
+through `defaultExprToSQL`, then wrap once as `CHECK (%s)`, with the same re-parse round-trip guard. The one wrinkle versus
+the table path: PG deparses the domain value placeholder as the uppercase keyword `VALUE`, but goopg's lexer case-folds it
+to `value` on re-parse. In a domain CHECK the only column reference *is* the placeholder (there is no table to name a real
+column), so `upcaseDomainValuePlaceholder` walks the freshly-parsed tree and rewrites every bare `value` ColumnRef back to
+`VALUE` before deparsing. The dump site routes only generic CHECKs through the new renderer; a `CHECK (VALUE IN (...))` form
+(`len(d.CheckInValues) > 0`) keeps the legacy raw wrap because it is stored as a pre-synthesized, byte-exact ScalarArrayOp
+deparse (`domainInValuesCheckExpr`) that `defaultExprToSQL` cannot reproduce. Fixtures `dchkand`/`dchkfn` in
+`TestPort_PgDumpConnectionSetup` (slice 363) + unit `TestRenderDomainCheckPredicate` (executor pkg).
+
+> **Deferred (ledgered) — RESOLVED in slice 364:** the **negative-literal cast** inside a domain CHECK (`VALUE < -5` dumps
+> `'-5'::integer`, not the bare `-5`) was the same gap as the slice-360(a)/slice-362 typed-literal-cast limitation. Slice 364
+> closes it without the operand-type threading once thought necessary — see below.
+
+### Slice 364 — **negative numeric literal** `-5` → `'-5'::integer` (PRODUCTION fix — both twins)
+
+PG's parser folds a unary minus applied **directly** to a numeric literal into a negative typed `Const` (gram.y `doNegate`);
+`ruleutils.c get_const_expr` then prints any constant whose output text leads with `-` as the **quoted value plus an explicit
+`::type` cast** — `'-5'::integer` — so the dump re-parses as a single constant rather than a constant-plus-operator
+(`get_const_expr` notes `(-nnn)` would be ambiguous for `INT_MIN`). The earlier deferral assumed matching this needed the
+*column/argument* type threaded into the deparser. The empirical finding that unblocked the slice: **the cast type is the
+literal's own type, not the column type.** A `bigint` column's `CHECK (c <> -100)` still dumps `'-100'::integer`, and the type
+is resolved purely from the (negated) literal magnitude exactly as PG's `make_const` does:
+
+- a literal whose negation fits `int4` → `'-N'::integer` (note `DEFAULT -2147483648` = `INT_MIN` → `::integer`, but
+  `-2147483649` → `::bigint`, so the boundary is `magnitude <= 1<<31`);
+- a wider integer literal → `'-N'::bigint`;
+- a decimal/scientific literal → `'-N'::numeric`.
+
+The fix is `parser.NegatedLiteralSQL(operand)` (one shared helper in `internal/parser/expr.go`, since both deparse twins
+import `parser` and the const node types live there — avoids the prior copy-paste drift). It returns the folded `'-N'::type`
+string for a bare `IntegerConst`/`NumericConst` operand and `""` otherwise; both twins (`executor.defaultExprToSQL`,
+`catalog.formatExprForAttrdef`) call it in their `OpUnaryNeg` arm and fall back to the compound `(- (operand))` form
+get_rule_expr uses for a non-folded negation (the slice-302 `negdef.nb`/`nc` cases stay byte-unchanged). This single helper
+fixes the `'-N'::type` form everywhere the two renderers feed: CHECK predicates (table + domain), column DEFAULTs,
+expression-index keys, partition-key expressions, and function-argument defaults. Verified byte-identical against a throwaway
+PG 18.3 cluster across all of those contexts. Fixtures `dchkneg`/`neglit`/`neglit_ix` in `TestPort_PgDumpConnectionSetup`
+(slice 364) + unit `TestDefaultExprToSQLBinaryParen` (executor) / `TestFormatExprForAttrdefExpr` (catalog), both updated from
+the old bare `-1` to `'-1'::integer`.
+
+### Slice 365 — **view `WITH [CASCADED|LOCAL] CHECK OPTION`** → `\n  WITH <MODE> CHECK OPTION;` suffix (PRODUCTION fix)
+
+PostgreSQL stores a view's `WITH [CASCADED|LOCAL] CHECK OPTION` clause as the `check_option=<mode>` `pg_class.reloption`
+(`DefineRelation`/`view.c`). pg_dump's `getTables` reads it in two halves (pg_dump.c:7158-7165): the reloptions column
+**strips** the marker — `array_remove(array_remove(c.reloptions,'check_option=local'),'check_option=cascaded')` — so it is not
+re-emitted inside a `WITH (...)` storage-option list, and a separate `checkoption` CASE column derives
+`'CASCADED'`/`'LOCAL'` from the same array. `dumpTableSchema` (pg_dump.c:16982) then appends
+`\n  WITH <MODE> CHECK OPTION` **after** the view body (the body itself comes from `createViewAsClause`/`pg_get_viewdef`,
+trailing `;` stripped).
+
+The parser already accepted-and-ignored the trailing clause; it now captures the mode into `CreateViewStmt.CheckOption`
+("cascaded" is the default when the qualifier is omitted, matching PG's grammar). `execCreateView` stores it on
+`catalog.Table.CheckOption`, and the pg_class virtual-row reloptions builder (`catalog.go`) appends `check_option=<mode>`
+to the relation's reloptions array when it is set. From there the whole flow is already-exercised goopg machinery: the
+`array_remove` strip (DU-002 slice 5, `TestArrayRemove*`) keeps the marker out of the WITH-clause, and the `= ANY(reloptions)`
+CASE column derives the mode — so **no pg_dump-query change** is needed, only the catalog plumbing. A bare
+`WITH CHECK OPTION` dumps `\n  WITH CASCADED CHECK OPTION;`, an explicit `WITH LOCAL CHECK OPTION` dumps
+`\n  WITH LOCAL CHECK OPTION;`, and a plain view emits no suffix. Verified byte-identical vs real pg_dump 18.3. Fixtures
+`vchk`/`vchk_local` in `TestPort_PgDumpConnectionSetup` (slice 365) + unit `TestParseCreateViewCheckOption` (parser) /
+`TestViewCheckOptionSurfacesInPgClassReloptions` (executor).
+
+**Deferred (ledger):** (1) goopg does not yet **enforce** the CHECK OPTION — an INSERT/UPDATE through the view that violates
+the view qual is not rejected (PG's `rewriteHandler.c` adds the WCO check); this slice is catalog/dump fidelity only.
+(2) the `WITH (check_option=...)` reloption **form** placed *before* `AS` is still parsed-and-ignored (only the trailing
+clause is captured); `security_barrier`/`security_invoker` likewise stay ignored. (3) restart persistence — `CheckOption`
+is in-memory only (the same shared-catalog runtime-write gap as the other restart-durability slices).
+
+### Slice 366 — **view `WITH (security_barrier=<bool>)`** → `WITH (security_barrier='true')` clause (PRODUCTION fix)
+
+PostgreSQL stores a view's pre-`AS` `WITH (security_barrier=<bool>)` storage option as the `security_barrier=<bool>`
+`pg_class.reloption`. Unlike `check_option`, pg_dump's `getTables` **keeps** it in the reloptions array — the
+`array_remove(array_remove(c.reloptions,'check_option=local'),'check_option=cascaded')` strip only removes `check_option=*`
+— so `dumpTableSchema` (pg_dump.c:16971-16976) re-emits it via `appendReloptionsArray` as a `WITH (...)` clause **after the
+view name and before `AS`**: `CREATE VIEW v WITH (security_barrier='true') AS …`. The value is quoted because
+`appendReloptionsArray` (string_utils.c:1012) single-quotes any reloption value for which `fmtId(value) != value`, and
+`true` is a reserved keyword → `'true'`.
+
+The parser previously accepted-and-ignored the entire pre-`AS` `WITH (...)` option list. It now captures `security_barrier`
+into `CreateViewStmt.SecurityBarrier` (a `*bool`: non-nil when specified; a bare `WITH (security_barrier)` defaults to true;
+identifier / boolean-keyword / string-literal / numeric values all normalize via `parseBoolReloptionValue`, mirroring PG's
+`parse_bool`). `execCreateView` sets `catalog.Table.SecurityBarrier`/`SecurityBarrierSet`, and the pg_class virtual-row
+reloptions builder appends `security_barrier=<bool>` to the relation's reloptions array (placed **before** the `check_option`
+element so a view carrying both surfaces as `{security_barrier=…,check_option=…}`, matching PG's stored order). From there
+the existing `appendReloptionsArray` machinery in the real pg_dump binary formats the `WITH (...)` clause — so **no
+pg_dump-query change** is needed, only catalog plumbing. Both `true` and `false` round-trip (false is meaningful), and a plain
+view emits no reloptions. Verified byte-identical vs real pg_dump 18.3. Fixture `vsecbar` in `TestPort_PgDumpConnectionSetup`
+(slice 366) + unit `TestParseCreateViewSecurityBarrier` (parser) / `TestViewSecurityBarrierSurfacesInPgClassReloptions`
+(executor).
+
+**Deferred (ledger):** (1) `security_barrier` has **no runtime effect** — PG uses it to fence qual evaluation order against
+leaky operators (`subquery_planner`/`security_barrier` RTE flag); goopg captures it for dump fidelity only. (2)
+`security_invoker` and the `WITH (check_option=…)` reloption *form* are still parsed-and-ignored. (3) restart persistence —
+`SecurityBarrier` is in-memory only (the same shared-catalog runtime-write gap as the other restart-durability slices).
+
+### Slice 367 — **view `WITH (security_invoker=<bool>)`** → `WITH (security_invoker='true')` clause (PRODUCTION fix)
+
+The sibling of slice 366. PostgreSQL stores a view's pre-`AS` `WITH (security_invoker=<bool>)` storage option as the
+`security_invoker=<bool>` pg_class.reloption (`view_reloptions`, reloptions.c). Like `security_barrier`, pg_dump's `getTables`
+KEEPS it in the reloptions array (`array_remove` strips only `check_option=*`) and `dumpTableSchema` re-emits it via
+`appendReloptionsArray` as the **`WITH (security_invoker='true')` clause after the view name and before `AS`**. The value is
+single-quoted because `fmtId('true')!='true'`.
+
+The parser captures `security_invoker` into `CreateViewStmt.SecurityInvoker` (a `*bool`: non-nil when specified; a bare
+`WITH (security_invoker)` defaults to true; identifier / boolean-keyword / string-literal / numeric values all normalize via
+`parseBoolReloptionValue`, mirroring PG's `parse_bool`). `execCreateView` sets
+`catalog.Table.SecurityInvoker`/`SecurityInvokerSet`, and the pg_class virtual-row reloptions builder appends
+`security_invoker=<bool>` to the relation's reloptions array (placed **after** `security_barrier` and **before** the
+`check_option` element, matching PG's stored WITH-clause order). From there the existing `appendReloptionsArray` machinery in
+the real pg_dump binary formats the `WITH (...)` clause — so **no pg_dump-query change** is needed, only catalog plumbing.
+Both `true` and `false` round-trip (false is meaningful), and a plain view emits no reloptions. Verified byte-identical vs
+real pg_dump 18.3. Fixture `vsecinv` in `TestPort_PgDumpConnectionSetup` (slice 367) + unit
+`TestParseCreateViewSecurityInvoker` (parser) / `TestViewSecurityInvokerSurfacesInPgClassReloptions` (executor).
+
+**Deferred (ledger):** (1) `security_invoker` has **no runtime effect** — PG uses it to run the view's underlying query under
+the *invoking* user's permissions rather than the view owner's (ACL check in `rewriteRuleAction`/`fireRIRrules`); goopg
+captures it for dump fidelity only. (2) the `WITH (check_option=…)` reloption *form* is still parsed-and-ignored. (3) restart
+persistence — `SecurityInvoker` is in-memory only (the same shared-catalog runtime-write gap as the other
+restart-durability slices).
+
+### Slice 368 — **trigger `EXECUTE FUNCTION f('a', 'b')` string arguments (TG_ARGV)** (oracle fixture only)
+
+A `CREATE TRIGGER … EXECUTE FUNCTION fn('arg1', 'arg2')` stores its arguments in `pg_trigger.tgargs` (a bytea of
+null-terminated strings); `pg_get_triggerdef_worker` (ruleutils.c:462-486) re-renders them after the function name as a
+comma-separated (`, `) list, each single-quoted via `simple_quote_literal` (embedded single-quotes doubled). pg_dump's
+`dumpTrigger` emits the result verbatim.
+
+goopg's CREATE TRIGGER path already supported this end-to-end: the parser collects the string-literal arguments into
+`CreateTriggerStmt.FuncArgs` (`parseCreateTriggerTail`'s `EXECUTE FUNCTION` arm), `execCreateTrigger` threads them to
+`catalog.Trigger.Args`, and `buildTriggerDefString` (executor `expr.go`) re-emits them with identical `', '` separation and
+`''`-doubled quoting (the lexer already collapses `''`→`'` on the way in, so the stored value is unescaped and re-escaping is
+symmetric). The unit `TestBuildTriggerDefString` already pinned the rendered form (`'a', 'b''c'`) — this slice adds the
+**missing oracle-verified end-to-end fixture** `trg_arg` in `TestPort_PgDumpConnectionSetup` (two args, the second carrying an
+embedded single quote) plus a parser-level `TestParseCreateTriggerFuncArgs` pinning the `FuncArgs` capture. **No production
+change.** Verified byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** the parser **silently skips non-string trigger arguments** (`parseCreateTriggerTail`'s
+`else { p.advance() }` arm) — PG accepts e.g. `EXECUTE FUNCTION fn(42)` and stores `"42"` in tgargs, dumping it back as the
+quoted `'42'`; goopg drops such an arg, so a numeric/identifier trigger argument would not round-trip. (Restart persistence is
+the usual in-memory-catalog gap.) — **Resolved by slice 369.**
+
+### Slice 369 — **trigger `EXECUTE FUNCTION f(42, 3.14, foo)` non-string arguments** (PRODUCTION fix)
+
+PG's `TriggerFuncArg` grammar (gram.y:6198) accepts four argument forms and stores **every one of them as a string** in
+`pg_trigger.tgargs`: an `Iconst` integer via `psprintf("%d", $1)` (so the lexeme `0042` canonicalises to `42` and leading zeros
+drop), an `FCONST` float by its lexeme, an `Sconst` string verbatim, and a `ColLabel` bare identifier/keyword by its text.
+`pg_get_triggerdef_worker` then re-quotes **all** stored args as `'…'` literals, so `EXECUTE FUNCTION trig_fn(0042, 3.14, foo)`
+dumps as `EXECUTE FUNCTION trig_fn('42', '3.14', 'foo')`.
+
+goopg's `parseCreateTriggerTail` previously captured only `TokenStringLit` args and `p.advance()`-skipped every other token,
+dropping numeric and identifier arguments entirely (the trigger would dump with a truncated or empty argument list). This slice
+extends the `EXECUTE FUNCTION` arm to also capture `TokenIntLit` (canonicalised through new helper `canonicalTriggerIntArg`,
+mirroring `psprintf("%d")`), `TokenNumericLit`, and `TokenIdent` token text into `CreateTriggerStmt.FuncArgs`. The existing
+`buildTriggerDefString` already re-quotes every stored arg, so no deparse change was needed. Covered by the extended
+`TestParseCreateTriggerFuncArgs` case and the oracle-verified `trg_narg` fixture in `TestPort_PgDumpConnectionSetup`. Verified
+byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** integer canonicalisation only covers values that fit a Go `int` (PG would reject larger literals as
+out-of-range before this point, so the raw-lexeme fallback is unreachable in practice). Restart persistence remains the usual
+in-memory-catalog gap shared by all trigger slices.
+
+### Slice 370 — **`COMMENT ON TRIGGER <name> ON <table>`** round-trip (PRODUCTION fix)
+
+PostgreSQL stores a trigger comment in `pg_description` keyed by `(classoid=pg_trigger=2620, objoid=trigger_oid, objsubid=0)`,
+and pg_dump's `dumpTrigger` (pg_dump.c:19251) calls `dumpComment(fout, "TRIGGER <name> ON", qtabname, …, tginfo->dobj.catId, 0,
+…)` so a dumped schema re-emits `COMMENT ON TRIGGER <name> ON <schema>.<table> IS '...';`. goopg's `parseCommentOnTail` had no
+`TRIGGER` branch, so the statement fell through to the unsupported-default arm and the server silently swallowed it — the comment
+never reached `pg_description` and pg_dump emitted nothing.
+
+This slice adds the missing branch. The parser captures `TRIGGER <name> ON [schema.]table` (the exact shape pg_dump emits, the
+same `<name> ON <table>` structure as `COMMENT ON CONSTRAINT`): the trigger name into `CommentOnStmt.SubName`, the ON-table into
+`ObjName`, `ObjKind="trigger"`. `execCommentOn` resolves the trigger by name on the named table (`LookupTable` →
+`Table.Triggers`) and stores the description via `SetComment(2620, trig.OID, 0, desc)`. The pg_trigger relation already surfaces
+each user trigger with `oid`/`tableoid=2620` (slice 319), and pg_dump's `collectComments` reads the keyed `pg_description` row,
+so no catalog-query change was needed. Covered by `TestParseCommentOnTrigger` (parser) and the `trg_biu` trigger-comment line in
+`TestPort_PgDumpConnectionSetup`. Verified byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** restart persistence remains the usual in-memory-catalog gap (the comment lives in the runtime
+`pg_description` store, not an on-disk catalog). Other `COMMENT ON` targets PG supports but goopg still drops — `RULE`, `POLICY`,
+`COLLATION`, `LANGUAGE`, `DATABASE`, `EXTENSION` — remain unported (no parser branch); each is a sibling slice when its object
+type becomes dumpable.
+
+### Slice 371 — **`COMMENT ON POLICY <name> ON <table>`** round-trip (PRODUCTION fix)
+
+PostgreSQL stores a row-level-security policy comment in `pg_description` keyed by `(classoid=pg_policy=3256, objoid=policy_oid,
+objsubid=0)`, and pg_dump's `dumpPolicy` (pg_dump.c) — after re-emitting the `CREATE POLICY` itself — calls `dumpComment(fout,
+"POLICY <name> ON", qtabname, …, polinfo->dobj.catId, 0, …)` so a dumped schema re-emits `COMMENT ON POLICY <name> ON
+<schema>.<table> IS '...';`. As with the trigger case, goopg's `parseCommentOnTail` had no `POLICY` branch, so the statement fell
+through to the unsupported-default arm and the server silently swallowed it — the comment never reached `pg_description` and pg_dump
+emitted nothing.
+
+This slice adds the missing branch, the bounded sibling of slice 370 (`CREATE POLICY` already round-trips via slices 323/330: the
+`pg_policy` virtual catalog exposes each policy's `oid`, which getPolicies/dumpPolicy reads as the comment's `catId.oid`). The
+parser captures `POLICY <name> ON [schema.]table` (the same `<name> ON <table>` structure as `COMMENT ON TRIGGER/CONSTRAINT`): the
+policy name into `CommentOnStmt.SubName`, the ON-table into `ObjName`, `ObjKind="policy"`. `execCommentOn` resolves the policy by
+name on the named table (`LookupTable` → `Table.Policies`) and stores the description via `SetComment(3256, pol.OID, 0, desc)`.
+The `pg_description` path is classoid-agnostic (proven for `pg_trigger`=2620 in slice 370), so no catalog-query change was needed.
+Covered by `TestParseCommentOnPolicy` (parser) and the `p_simple` policy-comment line in `TestPort_PgDumpConnectionSetup`. Verified
+byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** restart persistence (in-memory `pg_description`). Remaining `COMMENT ON` targets still dropped — `RULE`,
+`COLLATION`, `LANGUAGE`, `DATABASE`, `EXTENSION` — each a sibling slice when its object type becomes dumpable.
+
+### Slice 372 — **`COMMENT ON RULE <name> ON <table>`** round-trip (PRODUCTION fix)
+
+PostgreSQL stores a query-rewrite-rule comment in `pg_description` keyed by `(classoid=pg_rewrite=2618, objoid=rule_oid,
+objsubid=0)`, and pg_dump's `dumpRule` (pg_dump.c:19359) — after re-emitting the `CREATE RULE` (and any `ALTER TABLE … ENABLE/DISABLE
+RULE`) — builds the prefix `"RULE %s ON"` and calls `dumpComment(fout, ruleprefix->data, qtabname, …, rinfo->dobj.catId, 0, …)` so a
+dumped schema re-emits `COMMENT ON RULE <name> ON <schema>.<table> IS '...';`. As with the trigger and policy cases, goopg's
+`parseCommentOnTail` had no `RULE` branch, so the statement fell through to the unsupported-default arm and the server silently
+swallowed it — the comment never reached `pg_description` and pg_dump emitted nothing.
+
+This slice adds the missing branch, the bounded sibling of slices 370/371 (`CREATE RULE` already round-trips via slice 324: an
+unconditional/conditional DO-NOTHING rule is modelled as a `catalog.RuleInfo` with its own OID on the owning table, projected into the
+`pg_rewrite` virtual catalog whose `oid` getRules/dumpRule reads as the comment's `catId.oid`). The parser captures `RULE <name> ON
+[schema.]table` (the same `<name> ON <table>` structure as `COMMENT ON TRIGGER/POLICY`): the rule name into `CommentOnStmt.SubName`,
+the ON-table into `ObjName`, `ObjKind="rule"`. `execCommentOn` resolves the rule by name on the named table (`LookupTable` →
+`Table.Rules`) and stores the description via `SetComment(2618, r.OID, 0, desc)`. The `pg_description` path is classoid-agnostic
+(proven for `pg_trigger`=2620 in slice 370 and `pg_policy`=3256 in slice 371), so no catalog-query change was needed. Covered by
+`TestParseCommentOnRule` (parser) and the `r_noins` rule-comment line in `TestPort_PgDumpConnectionSetup`. Verified byte-identical vs
+real pg_dump 18.3.
+
+**Deferred (ledger):** restart persistence (in-memory `pg_description`). Remaining `COMMENT ON` targets still dropped — `COLLATION`,
+`LANGUAGE`, `DATABASE`, `EXTENSION` — each a sibling slice when its object type becomes dumpable.
+
+### Slice 373 — **TABLE column typed as a user-defined COMPOSITE type** round-trip (PRODUCTION fix)
+
+A composite type itself round-trips (slices 242/243), and a composite *field* whose declared type is another composite/enum/domain
+resolves to the schema-qualified name (slices 248–252). But a **table column** whose declared type is a composite (`c public.addr`)
+did **not**: a composite name is not a built-in, so the `CREATE TABLE` column path folds it to the text fallback
+(`catalog.TypeNameToOID` knows only built-ins; `InMemory.ResolveColumnType` preserves the bare composite name unchanged because it is
+not a domain). `buildUserPGAttributeRow` (the single source of every table-column `pg_attribute` heap row) had an enum branch (slice 88)
+and a domain branch (slice 90) over the text fallback, but **no composite branch** — so `pg_attribute.atttypid` stayed text (OID 25) and
+pg_dump's `getTableAttrs` → `format_type(atttypid, atttypmod)` rendered the column as `text` (and `text[]` for an array column). The
+dump was *unrestorable*: it silently dropped the composite typing.
+
+This slice adds the composite branch, the table-column analogue of slice 249's nested-composite FIELD. Mirroring the enum/domain
+branches: when the column folded to the text OID and matched no enum, `cat.LookupCompositeType(col.Type.Name)` re-resolves the bare name
+(the parser splits a schema-qualified `public.addr` into `Schema`+`Name`, so `Type.Name` is the bare key the composite registry uses) to
+the composite's dynamically-allocated pg_type OID — the scalar OID for `c addr`, or the auto-generated array OID (`ct.ArrayOID`,
+`attndims=1`) for `c addr[]`. The physical layout follows `buildUserPGTypeRowForComposite`: varlena (`attlen=-1`), `attbyval=false`,
+`attalign='d'` (double, like RECORD), `attstorage='x'` (extended). `format_type` already resolves a composite OID / array OID back to
+its schema-qualified name (slices 249/250 via `LookupCompositeTypeByOID` / `…ByArrayOID`), so no other site changed. Covered by
+`TestUserPGAttributeCompositeColumn` (unit: scalar + array atttypid/layout + nil-catalog fallback) and the `public.comptcol` table in
+`TestPort_PgDumpConnectionSetup` (`c public.addr`, `carr public.addr[]`). Verified byte-identical vs real pg_dump 18.3.
+
+**Deferred (ledger):** composite-column *values* (INSERT/COPY of a literal `(a,b)` row) are not exercised — this slice is schema-dump
+fidelity only. A composite column in a non-`public` schema isn't covered (composite types are registered by bare name).
+
+### Slice 374 — **typed table `CREATE TABLE name OF composite_type`** round-trip (PRODUCTION fix)
+
+A composite type round-trips (slices 242/243) and a table *column* typed as a composite round-trips (slice 373), but a **typed table** —
+one whose entire column set is *derived* from a composite type via `CREATE TABLE name OF type` — could not be created at all: goopg's
+`CREATE TABLE` parser had no `OF` arm, so the statement raised a syntax error before reaching the executor. PostgreSQL records
+`pg_class.reloftype = <type OID>` for such a table; pg_dump's `dumpTableSchema` appends ` OF <format_type(reloftype)>` after the table
+name and then **skips every type-derived column** (the `OidIsValid(reloftype) && !print_default && !print_notnull` branch in the attr
+loop), so the `CREATE TABLE` carries *no parenthesized column list at all* — just `CREATE TABLE public.typedtab OF public.addr2type;`.
+
+This slice wires the feature end-to-end at the dump-fidelity layer:
+
+- **Parser** (`internal/parser/ddl.go`): after the table name, an `OF type_name` arm records `CreateTableStmt.OfType` (a new
+  `*ObjectName` AST field) and consumes the standard trailing suffix clauses. A per-column `( … WITH OPTIONS … )` list is explicitly
+  rejected (not silently dropped) — deferred.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCreateTable` looks up the composite type
+  (`InMemory.LookupCompositeType`), synthesizes one `parser.ColumnDef` per field (`compositeFieldColumnType` converts the stored
+  `ColType` token string into `{Name, Args, IsArray}`, mirroring `parseCompositeFieldType`), and feeds them through the normal
+  column-build path so a field typed as a domain/enum/array resolves identically to an explicit column. PG keeps `attislocal=true` on
+  these columns (`makeColumnDef` default; `transformOfType` does not clear it) and pg_dump skips them via the *reloftype* test, not
+  `attislocal`, so **no inheritance plumbing is needed**. The composite's pg_type OID is stamped onto `catalog.Table.OfTypeOID`.
+- **Catalog** (`internal/catalog/catalog.go`): the new `Table.OfTypeOID` field is surfaced as `pg_class.reloftype` in *both* the virtual
+  `VirtualRows` builder (the one pg_dump reads) and — as the maintained sibling — the heap `buildUserPGClassRow`
+  (`internal/executor/pg18_user_catalog_rows.go`). `format_type` already resolves the OID to the qualified composite name (slices
+  249/250).
+
+Covered by `TestUserPGClassRowOfType` + `TestCompositeFieldColumnType` (unit) and the `public.addr2type`/`public.typedtab` pair in
+`TestPort_PgDumpConnectionSetup` (asserts the exact `OF` statement, the *absence* of an inline column list, the `COPY (a, b)` list, and a
+round-tripped data row `7\tseven`). Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du374_pgdata`).
+
+**Deferred (ledger):** the per-column option/constraint form `CREATE TABLE name OF type (col WITH OPTIONS DEFAULT …, CONSTRAINT …)` is
+rejected, not supported. A typed table `OF` a composite in a non-`public` schema isn't covered (composite registry is bare-name).
+`pg_class.reltype` (the table's own rowtype) stays 0, as for every other goopg table.
+
+### Slice 375 — **`CREATE FOREIGN DATA WRAPPER <name>`** round-trip (PRODUCTION fix)
+
+goopg accepted `CREATE FOREIGN DATA WRAPPER` (parsed as a `CompatNoopStmt` so `DROP` could later succeed) but tracked it only in the
+bare-name compat-object set, and the `pg_foreign_data_wrapper` virtual view was hard-wired to return zero rows. So a created FDW
+silently vanished from the dump. PostgreSQL stores one `pg_foreign_data_wrapper` row per FDW; pg_dump's `getForeignDataWrappers` reads
+*all* of them (`fdwhandler::pg_catalog.regproc`, `fdwvalidator::pg_catalog.regproc`, `acldefault('F', fdwowner)`, and an
+`array_to_string(… pg_options_to_table(fdwoptions) …)` for the options), and `dumpForeignDataWrapper` emits
+`CREATE FOREIGN DATA WRAPPER <name>;` (the `HANDLER`/`VALIDATOR`/`OPTIONS` clauses are emitted only when present) plus the owner
+`ALTER FOREIGN DATA WRAPPER <name> OWNER TO <role>;`.
+
+This slice wires the feature at the dump-fidelity layer:
+
+- **Catalog** (`internal/catalog/catalog.go`): a dedicated FDW registry (`ForeignDataWrapper{Name, OID, Owner}` keyed by name) mints a
+  *stable* OID at `RegisterForeignDataWrapper` time (idempotent re-registration; `AllocOID`-backed via a new `allocOIDLocked` helper so
+  the existing `AllocOID` and the registry can share the counter without double-locking). `pg_foreign_data_wrapper.VirtualRows` now
+  surfaces each registered FDW with `fdwhandler=fdwvalidator=0` (no handler), `fdwacl=fdwoptions=NULL` (empty string), and
+  `fdwowner=10` (bootstrap superuser → `getRoleName` → `postgres`). `DropForeignDataWrapper` removes it.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s `foreign-data wrapper` arm calls
+  `RegisterForeignDataWrapper` (replacing the bare compat-object register), and the `DROP FOREIGN DATA WRAPPER` arm calls
+  `DropForeignDataWrapper` (the server-cascade cleanup over `fdw-server` compat entries is unchanged).
+- **Executor cast** (`internal/executor/expr.go`): the `<oid>::regproc` cast now renders `InvalidOid` (0) as `-`, mirroring PG's
+  `regprocout`. pg_dump compares the cast result to `"-"` to decide whether to emit a `HANDLER`/`VALIDATOR` clause, so a bare `"0"`
+  would have spuriously produced ` HANDLER 0`. (The same rule applies to `amhandler`/opclass getters, so this is generally correct, not
+  FDW-specific.)
+
+Covered by `TestForeignDataWrapperRegistry` (unit: stable/idempotent OID, drop, exact virtual-row columns) and the `goopg_fdw` fixture in
+`TestPort_PgDumpConnectionSetup` (asserts the exact `CREATE`/owner-`ALTER` statements and the *absence* of a spurious `HANDLER`/`VALIDATOR`
+clause). Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du_fdw_ref`).
+
+**Deferred (ledger):** `HANDLER`/`VALIDATOR` and `OPTIONS (...)` are discarded by the parser (consumed to `;`), so an FDW with a handler
+or options round-trips without them. FDWs are in-memory only (like roles) — they do not survive a restart. `CREATE USER MAPPING`
+remains compat-only and is still not dumped (`CREATE SERVER` is now dumped — slice 376).
+
+### Slice 376 — **`CREATE SERVER <name> FOREIGN DATA WRAPPER <fdw>`** round-trip (PRODUCTION fix)
+
+The natural follow-on to slice 375. goopg accepted `CREATE SERVER` (parser already extracts both the server name and its
+`FOREIGN DATA WRAPPER <fdw>` association into a `CompatNoopStmt`) but registered it only as a bare compat object, and the
+`pg_foreign_server` virtual view was hard-wired to return zero rows — so a created server silently vanished from the dump. PostgreSQL
+stores one `pg_foreign_server` row per server; pg_dump's `getForeignServers` reads *all* of them (`srvfdw`, `srvtype`, `srvversion`,
+`srvacl`, `acldefault('S', srvowner)`, and an `array_to_string(… pg_options_to_table(srvoptions) …)` for the options), and
+`dumpForeignServer` recovers the wrapper name via `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` (a single-row
+subquery — so `srvfdw` *must* match a real FDW OID), then emits `CREATE SERVER <name> FOREIGN DATA WRAPPER <fdwname>;` (the
+`TYPE`/`VERSION`/`OPTIONS` clauses only when present) plus the owner `ALTER SERVER <name> OWNER TO <role>;`
+(`_getObjectDescription` decorates `SERVER` like the FDW).
+
+This slice mirrors the slice-375 FDW pattern at the dump-fidelity layer:
+
+- **Catalog** (`internal/catalog/catalog.go`): a dedicated foreign-server registry (`ForeignServer{Name, OID, Owner, FdwName}` keyed by
+  name) mints a *stable* OID at `RegisterForeignServer` time (idempotent re-registration refreshes only the FDW association). A new
+  `ForeignDataWrapperOID(name)` helper resolves the referenced wrapper name to its stable OID. `pg_foreign_server.VirtualRows` now
+  surfaces each registered server with `srvfdw` = the FDW OID, `srvtype=srvversion=srvacl=srvoptions=NULL` (empty string), and
+  `srvowner=10` (bootstrap superuser → `getRoleName` → `postgres`). `DropForeignServer` removes it.
+- **Executor** (`internal/executor/operators_ddl.go`): the `server` `CompatNoopStmt` arm now *additionally* calls
+  `RegisterForeignServer(name, fdwName)` (the existing compat-object + `fdw-server` association registration is unchanged, so the
+  `DROP FOREIGN DATA WRAPPER ... CASCADE` machinery still works); `DROP SERVER` and the FDW-cascade both call `DropForeignServer` to keep
+  the dump-visible registry in sync.
+
+Covered by `TestForeignServerRegistry` (unit: stable/idempotent OID, FDW-OID resolution, drop, exact virtual-row columns) and the
+`goopg_srv` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact `CREATE`/owner-`ALTER` statements, the `FOREIGN DATA WRAPPER
+goopg_fdw` suffix recovered from the srvfdw OID, and the *absence* of a spurious `TYPE`/`VERSION` clause). Verified against real pg_dump
+18.3 (`dumpForeignServer` + `_getObjectDescription` `SERVER` owner ALTER).
+
+**Deferred (ledger):** `TYPE 'type'` / `VERSION 'version'` / `OPTIONS (...)` are discarded by the parser, so a server with any of them
+round-trips without them. Servers are in-memory only (do not survive a restart). A server referencing a *non-registered* FDW yields
+`srvfdw=0`, which would make pg_dump's single-row subquery fail — goopg does not validate the reference (PG rejects it at CREATE time).
+`CREATE USER MAPPING` is still not dumped (`dumpUserMappings` runs after each server).
+
+### Slice 377 — **`CREATE USER MAPPING FOR <user> SERVER <srv>`** round-trip + **exit-0 pipeline repair** (PRODUCTION fix)
+
+The direct follow-on to slice 376 — and, more urgently, the repair for a regression slice 376 introduced. Once *any* foreign server
+exists, pg_dump's `dumpForeignServer` always calls `dumpUserMappings` (servers unconditionally get `DUMP_COMPONENT_USERMAP`), which runs
+`SELECT usename, array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) FROM
+pg_options_to_table(umoptions) ORDER BY option_name), E',\n    ') AS umoptions FROM pg_user_mappings WHERE srvid = '<oid>' ORDER BY
+usename` against the **`pg_user_mappings`** view (system_views.sql: `pg_user_mapping JOIN pg_foreign_server`). goopg had no such view, so
+the moment slice 376 made a server dumpable, this query failed with `relation "pg_user_mappings" does not exist` → pg_dump aborted with
+`exit=1` and an **empty dump**. Because `TestPort_PgDumpConnectionSetup` only runs its positive assertions inside `if res.ExitCode == 0`,
+*every* slice's round-trip assertion (including slice 376's own) was silently skipped — the suite was green while verifying nothing.
+
+This slice both restores exit 0 and round-trips the mapping:
+
+- **Catalog** (`internal/catalog/catalog.go`): a `pg_user_mappings` virtual relation (columns `umid, srvid, srvname, umuser, usename,
+  umoptions` — the system view's output shape) backed by a dedicated user-mapping registry (`UserMapping{OID, UmUser, SrvName}` keyed by
+  lowercase `"<user>\x00<server>"`). `RegisterUserMapping` mints a stable OID (idempotent); `ForeignServerOID(name)` resolves the server
+  to the `srvid` pg_dump filters on; `umuser` resolves via `RoleOID` (`PUBLIC` → usename `'public'`, umuser `0`). `umoptions` is NULL
+  (empty), so `pg_options_to_table(NULL)` returns 0 rows → `array_to_string` is `''` → `dumpUserMappings` omits the `OPTIONS` clause and
+  emits the bare `CREATE USER MAPPING FOR <usename> SERVER <srv>;`.
+- **Parser** (`internal/parser/ddl.go`): a `CREATE USER MAPPING FOR <user> SERVER <server> [OPTIONS (...)]` arm produces a
+  `CompatNoopStmt{ObjType:"user mapping"}` (user in `ObjName`, server in `TableName`); a `DROP USER MAPPING [IF EXISTS] FOR <user> SERVER
+  <server>` arm produces a `DropCompatStmt{ObjType:"user mapping", Names:[user, server]}`. Both are caught **before** the generic `user`
+  role/compat stubs (which would otherwise treat `MAPPING` as a role name). A plain `CREATE USER <role>` still returns a parse error so the
+  server-layer role-DDL intercept handles it unchanged. `scanUserMappingForServer` loosely extracts the `FOR`/`SERVER` operands and skips
+  `OPTIONS`.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `user mapping` arm calls `RegisterUserMapping`; the
+  `DropCompatStmt` `user mapping` arm calls `DropUserMapping`.
+
+Covered by `TestUserMappingRegistry` (unit: view exists + empty by default, stable/idempotent OID, srvid/umuser resolution, PUBLIC row,
+drop), `TestParseCreateUserMapping` (CREATE/DROP/OPTIONS/IF-EXISTS parse + the plain-`CREATE USER` fall-through), and the `um_role`/`goopg_srv`
+fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact `CREATE USER MAPPING …;` statement, the absence of a spurious `OPTIONS`
+clause, **and** — by reaching the `ExitCode==0` branch at all — that the whole dump pipeline is restored). Verified against real pg_dump
+18.3 (`dumpUserMappings`).
+
+**Deferred (ledger):** mapping `OPTIONS (user '…', password '…')` are discarded by the parser (`umoptions` always NULL). Mappings are
+in-memory only. The user-spec kind (CURRENT_USER/SESSION_USER/etc.) is not distinguished — only the literal token is kept, so a
+non-`public` pseudo-user that is not a registered role renders with `umuser=0`. `pg_user_mapping` (the heap catalog, OID 1418) is not
+populated; the view is registry-backed for dump fidelity only.
+
+### Slice 378 — **`CREATE SERVER … OPTIONS (name 'value', …)`** round-trip (PRODUCTION fix)
+
+Slice 376 made a foreign server dumpable but discarded its `OPTIONS` (the `srvoptions` cell was always NULL). This slice round-trips the
+options. PostgreSQL stores server options in `pg_foreign_server.srvoptions` as a `text[]` of `name=value` elements; pg_dump's
+`getForeignServers` expands them **server-side** via `array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY option_name), E',\n    ') AS srvoptions`, and
+`dumpForeignServer` re-emits ` OPTIONS (\n    %s\n)`. Because the option list is `ORDER BY option_name`, `dbname` precedes `host`
+regardless of the `CREATE` order.
+
+- **Parser** (`internal/parser/ddl.go`): the `CREATE SERVER` arm now detects an `OPTIONS (...)` clause via the new `scanFDWOptionsList`
+  helper, which consumes `OPTIONS ( name 'value' [, …] )` and returns each pair as a `"name=value"` string (the on-disk `srvoptions`
+  element form). The list is stored in the new `CompatNoopStmt.Options` field; the `FOREIGN DATA WRAPPER` association is still captured in
+  parallel. The CREATE form has no `ADD/SET/DROP` action verbs (those belong to `ALTER SERVER`).
+- **Catalog** (`internal/catalog/catalog.go`): `ForeignServer` gains an `Options []string` field; `RegisterForeignServer(name, fdw,
+  options)` stores it (re-registration refreshes options only when non-empty, so an idempotent re-register with `nil` is non-destructive).
+  The `pg_foreign_server` `VirtualRows` `srvoptions` cell renders the options as the PostgreSQL `text[]` external literal
+  (`{name=value,…}`) via the new `optionsArrayLiteral` helper (mirrors the reloptions `"{" + join(",") + "}"` rendering). goopg's own
+  `pg_options_to_table` SRF then expands that literal back into `(option_name, option_value)` rows when pg_dump runs its query.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `server` arm threads `s.Options` into `RegisterForeignServer`.
+
+Covered by `TestParseCreateServerOptions` (parser: bare server → nil Options; `OPTIONS` form → ordered `name=value` slice + FDW
+association intact), the `opt_srv` assertions in `TestForeignServerRegistry` (registry: `srvoptions` renders `{host=localhost,dbname=mydb}`;
+`nil` re-register preserves options), and the `goopg_srv_opt` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact multi-line
+`CREATE SERVER … OPTIONS (\n    dbname 'mydb',\n    host 'localhost'\n);`). Verified against real pg_dump 18.3 (`getForeignServers` +
+`dumpForeignServer`), with a negative control confirming the option-order assertion is live.
+
+**Deferred (ledger):** FDW (`fdwoptions`) OPTIONS are still discarded — only `CREATE SERVER` (slice 378) and `CREATE USER MAPPING` (slice 379)
+options round-trip. Option **values** containing array metacharacters (comma, brace, space, double-quote, backslash) are not yet quoted in the
+`text[]` literal (`optionsArrayLiteral` uses a plain comma join, matching the existing reloptions renderer), so such a value would corrupt
+`pg_options_to_table` splitting. `ALTER SERVER … OPTIONS (ADD/SET/DROP …)` is not modelled. Servers remain in-memory only.
+
+### Slice 379 — **`CREATE USER MAPPING … OPTIONS (name 'value', …)`** round-trip (PRODUCTION fix)
+
+Slice 377 made a user mapping dumpable but discarded its `OPTIONS` (the `umoptions` cell was always NULL). This slice round-trips them,
+reusing the slice-378 machinery wholesale. PostgreSQL stores mapping options in `pg_user_mapping.umoptions` (surfaced by the
+`pg_user_mappings` view) as a `text[]` of `name=value` elements; pg_dump's `dumpUserMappings` expands them **server-side** via the same
+`array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) FROM pg_options_to_table(umoptions) ORDER BY
+option_name), E',\n    ')` shape, and re-emits ` OPTIONS (\n    %s\n)`. Because the list is `ORDER BY option_name`, `password` precedes
+`username` regardless of `CREATE` order.
+
+- **Parser** (`internal/parser/ddl.go`): `scanUserMappingForServer` now also returns the `OPTIONS` list — it reuses the shared
+  `scanFDWOptionsList` helper (slice 378) when it reaches the `OPTIONS` token instead of skipping it. The `CREATE USER MAPPING` arm stores the
+  list in `CompatNoopStmt.Options`; the `DROP USER MAPPING` caller discards it (`_`).
+- **Catalog** (`internal/catalog/catalog.go`): `UserMapping` gains an `Options []string` field; `RegisterUserMapping(user, server, options)`
+  stores it (re-registration refreshes options only when non-empty, so an idempotent `nil` re-register is non-destructive). The
+  `pg_user_mappings` `VirtualRows` `umoptions` cell renders the options via the existing `optionsArrayLiteral` helper, which goopg's own
+  `pg_options_to_table` SRF then expands back into `(option_name, option_value)` rows.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `user mapping` arm threads `s.Options` into `RegisterUserMapping`.
+
+Covered by the extended `TestParseCreateUserMapping` (parser: `OPTIONS` form → ordered `name=value` slice + user/server intact), the
+`umoptions` assertions in `TestUserMappingRegistry` (registry: `umoptions` renders `{username=remote,password=secret}`; `nil` re-register
+preserves options), and the `goopg_srv_um` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact multi-line
+`CREATE USER MAPPING FOR um_role SERVER goopg_srv_um OPTIONS (\n    password 'secret',\n    username 'remote'\n);`). Verified against real
+pg_dump 18.3 (`dumpUserMappings`), with a negative control confirming the option-order assertion is live.
+
+**Deferred (ledger):** FDW (`fdwoptions`) OPTIONS remain discarded. **Discovery:** goopg's `pgQuoteIdent` does NOT check reserved keywords
+(its comment claims it does, but the implementation only guards on character class / lowercase), so an option named with a reserved keyword
+(e.g. `user`) emits bare `user 'x'` where real pg_dump emits `"user" 'x'` — a latent divergence at every `quote_ident` call site, not just
+this one. This slice sidesteps it with non-keyword option names; the array-metacharacter value-quoting gap and the in-memory-only limitation
+from slice 378 also still apply.
+
+### Slice 380 — **`CREATE FOREIGN DATA WRAPPER … OPTIONS (name 'value', …)`** round-trip (PRODUCTION fix)
+
+Slice 375 made a foreign-data wrapper dumpable but discarded its `OPTIONS` (the `fdwoptions` cell was always NULL). This slice round-trips
+them, completing the FDW/SERVER/MAPPING `OPTIONS` trilogy (slices 378/379/380 all reuse the same `scanFDWOptionsList` +
+`optionsArrayLiteral` machinery). PostgreSQL stores wrapper options in `pg_foreign_data_wrapper.fdwoptions` as a `text[]` of `name=value`
+elements; pg_dump's `getForeignDataWrappers` expands them **server-side** via
+`array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' || quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+option_name), E',\n    ')`, and `dumpForeignDataWrapper` re-emits `CREATE FOREIGN DATA WRAPPER <name> OPTIONS (\n    %s\n);`. Because the
+list is `ORDER BY option_name`, `debug` precedes `delimiter` regardless of `CREATE` order.
+
+- **Parser** (`internal/parser/ddl.go`): the `CREATE FOREIGN DATA WRAPPER` arm previously skipped its whole tail to the semicolon. It now
+  scans for the `OPTIONS` token and consumes the clause via the shared `scanFDWOptionsList` helper (storing the `name=value` list in
+  `CompatNoopStmt.Options`); any `HANDLER`/`VALIDATOR` func clauses preceding `OPTIONS` are still skipped (goopg tracks no funcs).
+- **Catalog** (`internal/catalog/catalog.go`): `ForeignDataWrapper` gains an `Options []string` field; `RegisterForeignDataWrapper(name,
+  options)` stores it (re-registration refreshes options only when non-empty, so an idempotent `nil` re-register is non-destructive). The
+  `pg_foreign_data_wrapper` `VirtualRows` `fdwoptions` cell renders the options via the existing `optionsArrayLiteral` helper, which goopg's
+  own `pg_options_to_table` SRF then expands back into `(option_name, option_value)` rows.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `foreign-data wrapper` arm threads `s.Options` into
+  `RegisterForeignDataWrapper`.
+
+Covered by the new `TestParseCreateFDWOptions` (parser: `OPTIONS` form → ordered `name=value` slice, with a preceding `NO HANDLER` clause
+skipped, and the bare form → `nil`), the `fdwoptions` assertions in `TestForeignDataWrapperRegistry` (registry: `fdwoptions` renders
+`{debug=true}`; `nil` re-register preserves options), and the `goopg_fdw_opt` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact
+multi-line `CREATE FOREIGN DATA WRAPPER goopg_fdw_opt OPTIONS (\n    debug 'true',\n    delimiter 'pipe'\n);`; the existing `goopg_fdw` stays
+bare so the slice-375 no-OPTIONS assertion still holds). Verified against real pg_dump 18.3 (`dumpForeignDataWrapper`), with a negative
+control confirming the `fdwoptions` assertion is live.
+
+**Deferred (ledger):** option VALUES containing array metacharacters (comma/brace/space/double-quote/backslash) are still not quoted in the
+`optionsArrayLiteral` text[] literal (plain comma join), so such a value corrupts `pg_options_to_table` splitting — the fixture uses
+metachar-free values (`pipe`, `true`). The reserved-keyword `quote_ident` gap (slice 379) and the in-memory-only limitation also still apply.
+With this slice the FDW/SERVER/USER-MAPPING `OPTIONS` round-trip is complete; the remaining FDW work is `ALTER FOREIGN DATA WRAPPER …
+OPTIONS` (ADD/SET/DROP) and `HANDLER`/`VALIDATOR` function references.
+
+### Slice 381 — **`CREATE SERVER … TYPE 'x' VERSION 'y'`** round-trip (PRODUCTION fix)
+
+Slice 376 made a foreign server dumpable but hard-coded `srvtype`/`srvversion` to NULL, so the optional `TYPE`/`VERSION` clauses were
+dropped. This slice round-trips them. PostgreSQL stores them in `pg_foreign_server.srvtype` / `srvversion` (plain `text` columns); pg_dump's
+`getForeignServers` selects them directly and `dumpForeignServer` re-emits ` TYPE 'x' VERSION 'y'` — each value via `appendStringLiteralAH`
+(client-side string-literal escaping) — between the server name and ` FOREIGN DATA WRAPPER`, ahead of any `OPTIONS` clause. A clause is
+emitted only when its column is non-empty.
+
+- **Parser** (`internal/parser/ddl.go`): the `CREATE SERVER` scan loop now detects `TYPE`/`VERSION` (identifier-or-keyword, case-insensitive)
+  each followed by a string literal, storing them in `CompatNoopStmt.ServerType` / `ServerVersion`. They sit alongside the existing
+  `FOREIGN DATA WRAPPER` / `OPTIONS` detection so any clause order parses.
+- **AST** (`internal/parser/ast.go`): `CompatNoopStmt` gains `ServerType` / `ServerVersion string`.
+- **Catalog** (`internal/catalog/catalog.go`): `ForeignServer` gains `Type` / `Version string`; `RegisterForeignServer(name, fdwName,
+  srvType, srvVersion, options)` stores them (re-registration refreshes each only when non-empty, so an idempotent `nil`/`""` re-register is
+  non-destructive). The `pg_foreign_server` `VirtualRows` `srvtype`/`srvversion` cells now render `s.Type`/`s.Version` (empty → NULL → clause
+  omitted) instead of the previous hard-coded `""`.
+- **Executor** (`internal/executor/operators_ddl.go`): the `execCompatNoop` `server` arm threads `s.ServerType` / `s.ServerVersion` into
+  `RegisterForeignServer`.
+
+Covered by the new `TestParseCreateServerTypeVersion` (parser: full `TYPE … VERSION … FOREIGN DATA WRAPPER … OPTIONS` shape; `TYPE`-only;
+bare → both empty), the `tv_srv` assertions in `TestForeignServerRegistry` (registry: `srvtype`/`srvversion` render `oracle`/`12.2`; empty
+re-register preserves, non-empty refreshes), and the `goopg_srv_tv` fixture in `TestPort_PgDumpConnectionSetup` (asserts the exact
+`CREATE SERVER goopg_srv_tv TYPE 'oracle' VERSION '12.2' FOREIGN DATA WRAPPER goopg_fdw OPTIONS (\n    host 'remote'\n);`). No new PG behavior
+is deferred — `srvtype`/`srvversion` are opaque text and client-side `appendStringLiteralAH` handles escaping; the in-memory-only limitation
+(servers vanish on restart) still applies. The remaining SERVER work is `ALTER SERVER … OPTIONS`/`VERSION`.
+
+### Slice 382 — **`quote_ident` reserved-keyword quoting** (cross-cutting builtin fix)
+
+The latent gap surfaced by slice 379: `pgQuoteIdent` (`internal/executor/expr.go` — the server-side `quote_ident` builtin, `%I` in
+`format()`, and the column-list / trigger-transition-table identifier rendering that backs several `pg_get_*def` paths) claimed in its comment
+to skip reserved words but performed **no keyword check**. So `quote_ident('user')` returned the bare `user` where PostgreSQL returns the
+quoted `"user"` — a divergence at every `quote_ident` call site (pg_dump's `getPolicies` TO-clause, `getForeignServers`, `dumpUserMappings`, …).
+
+PostgreSQL's `quote_identifier()` (`src/backend/utils/adt/ruleutils.c`), after confirming the identifier is bare-safe (all-lowercase, valid
+char class), does:
+
+```c
+int kwnum = ScanKeywordLookup(ident, &ScanKeywords);
+if (kwnum >= 0 && ScanKeywordCategories[kwnum] != UNRESERVED_KEYWORD)
+    safe = false;   /* keyword → must quote */
+```
+
+i.e. it quotes **every** keyword except the UNRESERVED ones.
+
+- **New** `internal/executor/quote_ident_keywords.go`: `pgReservedQuoteKeywords`, the set of the 164 `kwlist.h` (PG 18.3) entries whose
+  category is not `UNRESERVED_KEYWORD` (RESERVED / TYPE_FUNC_NAME / COL_NAME). Stored lowercase; `pgQuoteIdent` only consults it after the
+  all-lowercase check, so no case folding is needed. UNRESERVED keywords (`name`, `type`, `version`, `value`, `option`, …) are deliberately
+  absent — they need no quoting, matching PG.
+- **`pgQuoteIdent`** (`internal/executor/expr.go`): after the char-class loop, a char-class-safe identifier that is in
+  `pgReservedQuoteKeywords` is marked unsafe → double-quoted. Because `%I`, the `quote_ident` builtin, trigger transition-table names, and
+  column lists all funnel through `pgQuoteIdent`, the fix lands at all of them at once.
+
+Covered by the new `TestPgQuoteIdentReservedKeywords` (unit: `user`/`select`/`table`/`authorization`/`between`/`values`/`freeze` → quoted;
+`name`/`type`/`version`/`username`/`foo_bar` → bare; char-class/case/empty/embedded-quote rules unchanged) and by DU-002 **slice 382** in
+`TestPort_PgDumpConnectionSetup`: `CREATE USER MAPPING FOR um_role SERVER goopg_srv_kw OPTIONS (user 'remote')` now dumps as the quoted
+`"user" 'remote'` byte-identical vs pg_dump 18.3 (the slice-379 keyword caveat is now resolved end-to-end).
+
+**Sibling quoters (resolved in slice 383, below):** two other identifier-quoters originally lacked the keyword check —
+`quoteViewIdent` (`expr.go`, `pg_get_viewdef` alias rendering) and `quoteCollationIdent` (`internal/catalog/catalog.go`,
+`pg_get_indexdef` / `COLLATE` rendering). They are fixed in slice 383.
+
+### Slice 383 — **sibling identifier-quoter reserved-keyword fix** (leaf-package lift)
+
+Closes the two sibling quoters deferred at the end of slice 382. The keyword check had to reach two packages — `executor`
+(`pgQuoteIdent`, `quoteViewIdent`) and `catalog` (`quoteCollationIdent`) — but `catalog` cannot import `executor` (import cycle).
+The fix lifts the shared set into a leaf package:
+
+- **New** `internal/sqlkeywords` (leaf package, **no goopg-internal imports**): holds the 164-entry `kwlist.h` reserved-quote set
+  (moved verbatim out of the now-deleted `internal/executor/quote_ident_keywords.go`) and exposes
+  `func IsReservedForQuoting(s string) bool`. Both `executor` and `catalog` import it, resolving the package-placement decision
+  recorded in the slice-382 deferral.
+- **`pgQuoteIdent`** (`executor/expr.go`) now delegates its keyword test to `sqlkeywords.IsReservedForQuoting` — behaviour identical
+  (verified by the unchanged `TestPgQuoteIdentReservedKeywords` and `TestPort_PgDumpConnectionSetup`).
+- **`quoteViewIdent`** (`executor/expr.go`) and **`quoteCollationIdent`** (`catalog/catalog.go`) gain the same
+  `IsReservedForQuoting` check after their char-class loop, so a view column alias or a collation named e.g. `select` now renders
+  `"select"` instead of the bare keyword. `quoteCollationIdent`'s comment that conceded "reserved-word quoting is not reproduced"
+  is removed.
+
+Covered by the new `TestIsReservedForQuoting` (leaf pkg), `TestQuoteViewIdentReservedKeywords` and
+`TestQuoteCollationIdentReservedKeywords` (per-quoter unit pins), plus a new "reserved-keyword alias gets quoted" case in
+`TestApplyViewColumnAliases` that proves the wiring through the real `pg_get_viewdef` alias-splicing callsite. All three identifier
+quoters now share one authoritative keyword set. (An external-binary pg_dump fixture exercising a keyword-named view alias / collation
+remains a low-value follow-up, recorded in the ledger.)
+
+### Slice 384 — **array-metachar OPTIONS value quoting** (cross-cutting renderer fix)
+
+Closes the array-metacharacter quoting deferral carried since slices 378–380. PostgreSQL stores foreign
+`srvoptions`/`fdwoptions`/`umoptions` as a `text[]` of `name=value` elements rendered by `array_out`, which double-quotes any
+element containing a comma, brace, ASCII whitespace, double-quote, or backslash (and the empty string / the word `NULL`,
+case-insensitively), backslash-escaping embedded `"`/`\`. goopg previously comma-joined the literal bare
+(`{host=a,b}`), so a value carrying a metacharacter (`host 'a,b'`) split on its embedded comma when pg_dump re-parsed it via
+`pg_options_to_table`, yielding a corrupt option list.
+
+- **New `quoteArrayElement(s string) string`** (`catalog/catalog.go`) reproduces `array_out`'s element-quoting rules
+  (`src/backend/utils/adt/arrayfuncs.c`).
+- **New `arrayTextLiteral(parts []string) string`** wraps the elements as `{…}`, quoting each via `quoteArrayElement`.
+- **`optionsArrayLiteral`** now delegates to `arrayTextLiteral`, so `{host=localhost,dbname=mydb}` stays byte-identical
+  (metachar-free elements emit bare) while `host 'a,b'` renders `{"host=a,b"}` and round-trips intact.
+- The three `pg_class.reloptions` renderers (table/toast/index) also route through `arrayTextLiteral` for one authoritative
+  quoter; their values are numeric/bool/enum-word so the output is unchanged, but the path is now metachar-safe.
+
+goopg's existing `parseTextArray` already unquotes `"host=a,b"` → `host=a,b`, which `pg_options_to_table` then splits on the
+element's first `=` to recover value `a,b`. Covered by the new `TestQuoteArrayElement` and `TestOptionsArrayLiteralMetachar`
+unit pins plus a new end-to-end `goopg_srv_mc` (`OPTIONS (host 'a,b')`) fixture/assertion in `TestPort_PgDumpConnectionSetup`,
+verified byte-identical against real pg_dump 18.3.
+
+### Slice 385 — **multiple CHECK constraints on a CREATE DOMAIN** (PRODUCTION fix)
+
+PostgreSQL lets a domain declare several `CHECK` constraints; each becomes a separate `pg_constraint` row (`contype='c'`,
+`contypid` = the domain's `pg_type` OID). pg_dump's `getDomainConstraints` fetches them `ORDER BY conname` and emits one inline
+`\n\tCONSTRAINT <name> CHECK ((<expr>))` per row. goopg modelled only ONE check per domain — `catalog.Domain` carried scalar
+`CheckExpr`/`CheckName`/`CheckOID` fields and the parser's `CREATE DOMAIN` tail kept only the FIRST `CHECK` clause (the
+`if stmt.CheckExpr == ""` guard silently dropped the rest), so a two-CHECK domain lost a constraint on dump.
+
+- **`parser.CreateDomainStmt`** replaces the scalar `CheckExpr`/`CheckName`/`CheckInValues` fields with `Checks []DomainCheckClause`
+  (`{Name, Expr string; InValues []string}`); `parseCreateDomainTail` now **appends** every `CHECK`/`CONSTRAINT … CHECK` clause.
+- **`catalog.Domain`** replaces the scalar fields with `Checks []DomainCheck` (`{Name, Expr string; OID uint32; InValues []string}`).
+  `SetDomainCheck` (single, overwrite) becomes **`AddDomainCheck`** (append + per-check OID). Unnamed checks auto-disambiguate via
+  PG's `ChooseConstraintName` scheme (`<domain>_check`, then `<domain>_check1`, `_check2`, …); explicit names are kept verbatim and
+  excluded from the auto-numbering. `RegisterDomain` drops its now-unused `checkInValues ...string` variadic.
+- **`buildPgConstraintRows`** (`catalog/catalog.go`) iterates `d.Checks`, emitting one `contype='c'` row per check (the
+  `ORDER BY conname` is applied by the executor over these rows when pg_dump runs the query).
+- **`pg_get_constraintdef`** and the **cast-time IN-values enforcement** (`executor/expr.go`) iterate `d.Checks`, matching on the
+  per-check OID / validating membership against each IN-list check independently.
+- **`execCreateDomain`** loops `s.Checks`, synthesizing the `= ANY (ARRAY[...])` conbin for the IN form and calling `AddDomainCheck`
+  per clause.
+
+Covered by the new `TestAddDomainCheckNaming` catalog unit pin (disambiguation + per-check OID + InValues round-trip) plus new
+`multichk` (two unnamed checks) and `mixchk` (explicit + auto-named) fixtures/assertions in `TestPort_PgDumpConnectionSetup`,
+verified byte-identical against real pg_dump 18.3. Runtime enforcement of *generic* (non-IN) domain CHECK predicates is unchanged
+(still not evaluated at cast time — a pre-existing gap that predates and is orthogonal to this slice).
+
+### Slice 386 — **COMMENT ON SERVER round-trip** (parser + executor gap)
+
+A foreign server (`pg_foreign_server`, classoid 1417) can carry a comment. pg_dump's `dumpForeignServer` calls `dumpComment`
+with the server's `catalogId` (`tableoid=1417`, `objsubid=0`), finds the `pg_description` row, and re-emits
+`COMMENT ON SERVER <name> IS '...'`. goopg's `parseCommentOnTail` had no `SERVER` branch, so the statement fell through to the
+COMMENT fallback and was silently swallowed — the comment never reached `pg_description`, and pg_dump could not re-emit it.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptIdentKeyword("server")` arm that sets `ObjKind="server"` and parses a bare
+  (schema-less) object name — foreign servers are top-level objects, mirroring the shape pg_dump itself emits.
+- **`executor.execCommentOn`** adds a `"server"` case: it resolves the server OID via `catalog.InMemory.ForeignServerOID(name)`
+  and stores the description under `pg_foreign_server` (classoid 1417, objsubid 0) via `SetComment`. A new
+  `oidPgForeignSrv = 1417` classoid constant joins the existing block.
+
+Covered by the new `TestParseCommentOnServer` parser pin plus a `COMMENT ON SERVER goopg_srv IS 'a server comment'`
+fixture/assertion in `TestPort_PgDumpConnectionSetup` (`goopg_srv` is the bare foreign server from slice 376), verified
+byte-identical against real pg_dump 18.3.
+
+### Slice 387 — **COMMENT ON FOREIGN DATA WRAPPER round-trip** (parser + executor gap)
+
+The sibling of slice 386. A foreign-data wrapper (`pg_foreign_data_wrapper`, classoid 2328) can carry a comment. pg_dump's
+`dumpForeignDataWrapper` calls `dumpComment` with the FDW's `catalogId` (`tableoid=2328`, `objsubid=0`), finds the
+`pg_description` row, and re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. goopg's `parseCommentOnTail` had no
+`FOREIGN DATA WRAPPER` branch, so the statement fell through to the COMMENT fallback and was silently swallowed — the comment
+never reached `pg_description`, and pg_dump could not re-emit it.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptKeyword(KwForeign)` arm that consumes the `DATA WRAPPER` ident-keyword
+  pair (errors if absent), sets `ObjKind="foreign data wrapper"`, and parses a bare (schema-less) object name — FDWs are
+  top-level objects. `FOREIGN` is a reserved keyword (`KwForeign`); `DATA`/`WRAPPER` are unreserved ident-keywords.
+- **`executor.execCommentOn`** adds a `"foreign data wrapper"` case: it resolves the FDW OID via
+  `catalog.InMemory.ForeignDataWrapperOID(name)` and stores the description under `pg_foreign_data_wrapper` (classoid 2328,
+  objsubid 0) via `SetComment`. A new `oidPgFdw = 2328` classoid constant joins the existing block.
+
+Covered by the new `TestParseCommentOnForeignDataWrapper` parser pin plus a
+`COMMENT ON FOREIGN DATA WRAPPER goopg_fdw IS 'a fdw comment'` fixture/assertion in `TestPort_PgDumpConnectionSetup`
+(`goopg_fdw` is the bare FDW from slice 375), verified byte-identical against real pg_dump 18.3.
+
+### Slice 388 — **COMMENT ON EXTENSION round-trip** (parser + executor gap)
+
+The sibling of slices 386/387. An installed extension (`pg_extension`, classoid 3079) can carry a comment. pg_dump's
+`dumpExtension` calls `dumpComment` with the extension's `catalogId` (`tableoid=3079`, `objsubid=0`), finds the
+`pg_description` row, and re-emits `COMMENT ON EXTENSION <name> IS '...'` after the `CREATE EXTENSION` statement. goopg's
+`parseCommentOnTail` had no `EXTENSION` branch, so the statement fell through to the COMMENT fallback and was silently
+swallowed — the comment never reached `pg_description`, and pg_dump could not re-emit it.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptIdentKeyword("extension")` arm that sets `ObjKind="extension"` and
+  parses a bare (schema-less) object name — extensions are top-level objects. `EXTENSION` is an unreserved ident-keyword.
+- **`executor.execCommentOn`** adds an `"extension"` case: it resolves the extension OID via the new
+  `catalog.InMemory.ExtensionOID(name)` (reads the runtime `extensions` registry populated by `CREATE EXTENSION`) and stores
+  the description under `pg_extension` (classoid 3079, objsubid 0) via `SetComment`. A new `oidPgExtension = 3079` classoid
+  constant joins the existing block.
+
+Covered by the new `TestParseCommentOnExtension` parser pin plus a `CREATE EXTENSION amcheck` + `COMMENT ON EXTENSION amcheck
+IS 'an extension comment'` fixture/assertion in `TestPort_PgDumpConnectionSetup` (amcheck is the one extension goopg ships in
+`knownExtensions`), verified against real pg_dump 18.3 — the dump now also emits the `CREATE EXTENSION IF NOT EXISTS amcheck
+WITH SCHEMA public;` line that carries the comment.
+
+### Slice 389 — **`CREATE COLLATION` round-trip** (new object type: parser + catalog + executor)
+
+The COMMENT-ON seam (slices 386–388) is now exhausted for every object type goopg dumps; the next gap is a *new* dumpable
+object. A user collation created via `CREATE COLLATION` lives in `pg_collation` with a user namespace; pg_dump's
+`getCollations` selects every collation but filters the BKI-pinned `pg_catalog` built-ins at dump time, leaving only user
+collations, and `dumpCollation` reconstructs `CREATE COLLATION <schema>.<name> (provider = …, …)` from the catalog columns
+(`collprovider`, `collcollate`, `collctype`, `colllocale`, …). goopg parsed nothing for `CREATE COLLATION` — it was a hard
+parse error, so no collation reached the catalog and pg_dump emitted nothing.
+
+- **`parser.parseCreateCollationTail`** (new) parses `CREATE COLLATION [IF NOT EXISTS] name (option = value …)` and the
+  `name FROM existing` form into a new `CreateCollationStmt`. Recognised options: `LOCALE`, `LC_COLLATE`, `LC_CTYPE`,
+  `PROVIDER`, `DETERMINISTIC` (`VERSION`/`RULES`/unknown accepted-and-ignored). Dispatched from the CREATE switch on the
+  `collation` ident-keyword; the planner wraps it in `DDL` and the server tags it `CREATE COLLATION`.
+- **`catalog.InMemory.CreateCollation`** (new) allocates a user OID (`>= FirstUserOID`), resolves the schema to its
+  namespace OID (`public`=2200), and appends a `UserCollation` to the `userCollations` registry. The virtual `pg_collation`
+  view now appends these rows after the seven built-ins, so `getCollations` discovers them while still skipping the pinned
+  rows. `CollationAttrsByName` (new) resolves the built-in + user attributes for the `FROM existing` form.
+- **`executor.execCreateCollation`** (new) maps the parsed options to catalog columns: the default libc provider stores the
+  locale in `collcollate`/`collctype` (with `LOCALE` setting both, mirroring `DefineCollation` in `collationcmds.c`), while
+  `builtin`/`icu` store it in `colllocale`. For libc with `collcollate == collctype`, `dumpCollation` collapses the pair to a
+  single `locale =` clause.
+
+Covered by `TestParseCreateCollation` (parser), `TestCreateCollationVirtualRows` (catalog), and a
+`CREATE COLLATION public.mycoll (LOCALE = 'C')` fixture in `TestPort_PgDumpConnectionSetup` asserting the dump emits
+`CREATE COLLATION public.mycoll (provider = libc, locale = 'C');` — matching real pg_dump 18.3's `dumpCollation` output.
+
+### Slice 390 — **COMMENT ON COLLATION round-trip** (parser + executor gap)
+
+Now that a user collation round-trips (slice 389), the natural follow-on is its comment. `dumpCollation` ends with a
+`if (collinfo->dobj.dump & DUMP_COMPONENT_COMMENT) dumpComment(fout, "COLLATION", qcollname, namespace, rolname,
+collinfo->dobj.catId, 0, …)` call (`pg_dump.c:15050`), which finds the `pg_description` row keyed on the collation's
+`catalogId` (`tableoid=pg_collation=3456`, `objsubid=0`) and re-emits `COMMENT ON COLLATION <schema>.<name> IS '...'` after
+the `CREATE COLLATION`. goopg's `parseCommentOnTail` had no `COLLATION` branch, so the statement fell through to the COMMENT
+fallback and was silently swallowed — the comment never reached `pg_description`, and pg_dump emitted nothing.
+
+- **`parser.parseCommentOnTail`** adds a `case p.acceptIdentKeyword("collation")` arm that sets `ObjKind="collation"` and
+  parses a schema-qualifiable object name (`public.mycoll`). `COLLATION` is an unreserved ident-keyword.
+- **`executor.execCommentOn`** adds a `"collation"` case: it resolves the collation OID via the existing
+  `catalog.InMemory.CollationAttrsByName(name)` (the same `userCollations` registry `getCollations` dumps from) and stores
+  the description under `pg_collation` (classoid 3456, objsubid 0) via `SetComment`. Built-in collations report OID 0 here,
+  so a `COMMENT ON` a built-in is a harmless no-op (pg_dump never dumps built-in collation comments). A new
+  `oidPgCollation = 3456` classoid constant joins the existing block.
+
+Covered by the new `TestParseCommentOnCollation` parser pin plus a `COMMENT ON COLLATION public.mycoll IS
+'case-sensitive C collation'` fixture/assertion in `TestPort_PgDumpConnectionSetup`, verified against real pg_dump 18.3 — the
+dump now emits the trailing `COMMENT ON COLLATION public.mycoll IS 'case-sensitive C collation';` line.
+**Deferred** (ledger): the collation is dump-only (not used for string ordering); `colllocale`-provider (icu/builtin) and the
+`FROM existing` form are wired but not yet asserted through pg_dump; the registry is in-memory (no restart persistence,
+`pg_collation` is not heap-backed); `ALTER COLLATION` / collation comments are not handled.
+
+### Slice 391 — **ICU / non-deterministic / FROM collation round-trip** (PRODUCTION fix + virtual-NULL infra)
+
+Slice 389 only asserted the default libc provider (`provider = libc, locale = 'C'`). This slice closes that deferral for
+the remaining `dumpCollation` branches — `provider = icu` (collprovider `'i'`, the locale rides `colllocale` while
+`collcollate`/`collctype` stay NULL), `deterministic = false` (collisdeterministic `'f'`, emitted right after the
+provider), and the `CREATE COLLATION new FROM existing` copy form — and fixes two real fidelity bugs found doing so.
+
+- **FROM dropped the deterministic flag.** `executor.execCreateCollation`'s `FROM existing` branch copied
+  provider/encoding/collate/ctype/locale but **not** `Deterministic`, so a collation derived from a non-deterministic
+  source dumped as deterministic. PG's `DefineCollation` (collationcmds.c) reads `collform->collisdeterministic` in its
+  FROM branch; goopg now copies `src.Deterministic` too.
+- **Empty `text` virtual cells decoded as `''`, not NULL.** `pg_collation` surfaced `collicurules` (and the unused-by-
+  provider `collcollate`/`collctype`/`colllocale`) as `""`. For a `text` column `TypedVirtualCell` routes `""` through the
+  default `StringConst` branch — a non-NULL empty string — so `dumpCollation`'s ICU branch saw a non-NULL `collicurules`
+  and emitted a spurious `, rules = ''` (and warned "invalid collation" on the empty collate/ctype). Only array and
+  `pg_node_tree` columns previously mapped `""`→NULL. Added a general **`catalog.VirtualNull`** sentinel that
+  `TypedVirtualCell` maps to a NULL constant ahead of any type parsing (both the planner and the executor's
+  `rematerialiseVirtualRows` share that one helper, so the sibling decoders stay in sync), and the `pg_collation`
+  user-row builder now emits `VirtualNull` for absent locale/rules columns per provider — exactly PG's NULL layout.
+
+Covered by the extended `TestCreateCollationVirtualRows` (a non-deterministic ICU user collation resolved by name must
+report `Deterministic=false`) plus two `TestPort_PgDumpConnectionSetup` fixtures — an ICU non-deterministic collation
+(`CREATE COLLATION public.ci_coll (provider = icu, deterministic = false, locale = 'und-u-ks-level2')`) and a
+`CREATE COLLATION public.ci_from FROM public.ci_coll` — both asserted to dump as
+`(provider = icu, deterministic = false, locale = 'und-u-ks-level2')`, byte-identical vs real pg_dump 18.3.
+**Deferred** (ledger): ICU `rules` (`collicurules`) are still not modeled (a collation created *with* rules would lose
+them); the registry remains in-memory (no restart persistence; `pg_collation` is not heap-backed); the BKI built-in rows
+still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump skips pinned collations).
+
+### Slice 392 — **ICU collation `rules` round-trip** (closes the slice-391 rules deferral)
+
+Slice 391 left ICU tailoring `rules` (`pg_collation.collicurules`) unmodeled: a collation created *with* a `rules =`
+clause silently lost them. This slice closes that deferral — the last unexercised limb of `dumpCollation`'s
+`provider = icu` branch, the `if (collicurules) { appendPQExpBufferStr(q, ", rules = "); … }` clause
+(`pg_dump.c:14988`).
+
+- **Parser** (`parseCreateCollationTail`): `RULES` was in the accept-and-ignore `default` arm; it now has an explicit
+  `case "rules": stmt.Rules = val` and a new `CreateCollationStmt.Rules` field.
+- **Catalog** (`UserCollation.Rules`): a new field surfaced as `collicurules` by the `pg_collation` virtual-row builder.
+  The builder now emits `nz(uc.Rules)` (→ `VirtualNull` when unset, exactly as the locale columns do, per slice 391),
+  so a collation *without* rules still reads SQL NULL and dumps no `rules =` clause.
+- **Executor** (`execCreateCollation`): stores `s.Rules` for the icu provider only (PG's `DefineCollation` rejects
+  `RULES` for libc/builtin), and the `FROM existing` branch copies `src.Rules` (mirroring how PG's FROM branch carries
+  over `collicurules`). goopg does not interpret the rules — only the schema-dump round-trip is modeled.
+
+Covered by the extended `TestParseCreateCollation` (a `rules =` clause is captured) and `TestCreateCollationVirtualRows`
+(a collation with no rules surfaces `collicurules`=NULL; one created with rules surfaces them verbatim, and the FROM path
+copies them) plus a `TestPort_PgDumpConnectionSetup` fixture — `CREATE COLLATION public.ci_rules (provider = icu,
+locale = 'und', rules = '&V << w <<< W')` — asserted to dump as
+`(provider = icu, locale = 'und', rules = '&V << w <<< W')` (deterministic, so no `deterministic` clause; canonical order
+provider → locale → rules), byte-identical vs real pg_dump 18.3.
+**Deferred** (ledger): the collation registry remains in-memory (no restart persistence; `pg_collation` is not
+heap-backed); the BKI built-in rows still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump
+skips pinned collations).
+
+### Slice 393 — **libc two-clause + builtin provider round-trip** (last unexercised `dumpCollation` branches)
+
+Slices 389–392 exercised `dumpCollation`'s libc *collapse* path (`collcollate == collctype` → a single `locale =`
+clause) and the whole `provider = icu` branch, but two provider limbs of `dumpCollation` (`pg_dump.c:14934+`) stayed
+untested end-to-end even though `execCreateCollation` / the `pg_collation` virtual-row builder already modeled them:
+
+- **libc, `lc_collate != lc_ctype`.** The libc branch (`collprovider == 'c'`) emits the collapsed `locale =` form only
+  when `strcmp(collcollate, collctype) == 0`; otherwise it emits the `lc_collate = '...', lc_ctype = '...'` pair. The
+  parser already captured `LC_COLLATE`/`LC_CTYPE` separately (`CreateCollationStmt.LcCollate/LcCtype`) and the executor
+  stored them as `collcollate`/`collctype` with `colllocale` NULL, so `CREATE COLLATION public.libc_diff (LC_COLLATE =
+  'C', LC_CTYPE = 'POSIX')` now round-trips as `(provider = libc, lc_collate = 'C', lc_ctype = 'POSIX')`.
+- **`provider = builtin` (PG17+, `collprovider == 'b'`).** The builtin branch warns unless `colllocale` is set and
+  `collcollate`/`collctype`/`collicurules` are NULL, then emits `provider = builtin, locale = '...'`. The executor's
+  provider switch already mapped `builtin → 'b'` and routed the locale onto `uc.Locale` (colllocale), leaving
+  collcollate/collctype NULL, so `CREATE COLLATION public.builtin_coll (provider = builtin, locale = 'C')` round-trips as
+  `(provider = builtin, locale = 'C')` (`C` is one of the builtin provider's accepted locales).
+
+This slice is therefore test-only — two `TestPort_PgDumpConnectionSetup` fixtures plus their assertions, both confirmed
+byte-identical vs real pg_dump 18.3. With it, every `dumpCollation` provider limb that goopg can produce (libc collapse,
+libc two-clause, icu locale/rules/deterministic, builtin) is covered by a round-trip assertion.
+**Deferred** (ledger): the collation registry remains in-memory (no restart persistence; `pg_collation` is not
+heap-backed); the BKI built-in rows still carry `''` rather than NULL in their unused locale columns (harmless — pg_dump
+skips pinned collations).
+
+### Slice 394 — **a column collated with a USER collation** (`COLLATE public.usercoll`)
+
+Slices 389–393 made a user collation itself round-trip (`CREATE COLLATION`), and slice 188 made a column collated with a
+*built-in* collation round-trip (`a text COLLATE pg_catalog."C"`). The composition — a table column (or composite field)
+declared `COLLATE <user-collation>` — was still silently dropped from the dump. pg_dump's `getTableAttrs` reports a
+column's `attcollation` only when `a.attcollation <> t.typcollation`, then `dumpTableSchema` re-emits the inline COLLATE
+clause via `findCollationByOid` → `fmtQualifiedDumpable` (which schema-qualifies a non-`pg_catalog` collation, so a public
+user collation dumps as `COLLATE public.usercoll`, unlike the `pg_catalog."C"` built-in form).
+
+The gap was in goopg's attcollation surfacing: `buildUserPGAttributeRow` / `buildUserPGAttributeRowForCompositeField`
+resolved the declared collation name to an OID only through `collationNameToOID`, which knows just the seven built-in
+collations and returns 0 for everything else. A user-collation name therefore fell through to the type default
+(`typcollation`), `getTableAttrs` saw no difference, and pg_dump emitted no clause. Both sites now fall back to the
+user-collation registry — `catalog.InMemory.UserCollationOIDByName(name)` (a bare-name, case-insensitive search of
+`userCollations`) — when `collationNameToOID` returns 0, so the shadowed `attcollation` OID is the real user-collation OID
+whose `pg_collation` row pg_dump already reads (slices 389+). The COLLATE rendering, schema-qualification, and the
+`attcollation <> typcollation` suppression test are entirely pg_dump-client-side and unchanged; goopg only supplies the
+correct OID.
+
+This slice is a one-line-each executor fallback at the two sibling attcollation sites plus the catalog helper, with one
+`TestPort_PgDumpConnectionSetup` fixture (`CREATE COLLATION public.usercoll (LOCALE = 'C')` +
+`CREATE TABLE public.usercollcol (a text COLLATE public.usercoll, b text)`) confirmed byte-identical vs real pg_dump 18.3;
+the negative assertion is scoped to the `usercollcol` block because another fixture (`collcol.b`) legitimately carries a
+built-in `COLLATE pg_catalog."POSIX"`.
+
+**Deferred** (ledger): the user collation is resolved by bare name only — two user collations of the same name in
+different schemas are not disambiguated by the column's schema (acceptable for the common single-schema case; goopg does
+not actually collate, so this is dump-OID fidelity only). The in-memory-registry / no-restart-persistence deferral from
+slices 389–393 still applies.
+
+### Slice 395 — **a user-defined CAST** (`CREATE CAST (text AS bytea) WITHOUT FUNCTION`)
+
+A new object family. pg_dump's `getCasts` reads **all** `pg_cast` rows (built-in casts are excluded at dump-out time by
+`selectDumpableCast`, which marks a cast `DUMP_COMPONENT_NONE` when its OID `<= g_last_builtin_oid`), then `dumpCast`
+renders `CREATE CAST (<src> AS <tgt>) WITHOUT FUNCTION[ AS ASSIGNMENT|IMPLICIT];`. The source/target type names are
+recovered client-side via `getFormattedTypeName(castsource/casttarget)`, so goopg only has to surface the right
+`pg_cast` row with the canonical built-in type OIDs; the `castfunc=0` path (WITHOUT FUNCTION / WITH INOUT) skips
+`findFuncByOid`.
+
+Before this slice goopg had **no** CREATE CAST dispatch case at all — `parseCreate` fell through to its
+`expected TABLE, INDEX, …` error, so the statement was rejected outright and never reached the catalog. The fix spans the
+three usual layers:
+
+- **parser** (`internal/parser/ddl.go`): a new `case p.acceptIdentKeyword("cast")` → `parseCreateCastTail`, which parses
+  `(source AS target) { WITHOUT FUNCTION | WITH INOUT | WITH FUNCTION … } [AS ASSIGNMENT | AS IMPLICIT]` and records the
+  source/target type names (`ArgTypes`), `castmethod` (`CastMethod`: `b`/`i`/`f`) and `castcontext` (`CastContext`:
+  `e`/`a`/`i`) on a `CompatNoopStmt`. A small `parseCastTypeName` helper reads a (schema-qualified, multi-word) type name,
+  stopping at `AS`/`)`/`,`.
+- **executor** (`internal/executor/operators_ddl.go`): a new `case "cast"` in `execCompatNoop` calls
+  `catalog.InMemory.RegisterCast(source, target, context, method)` for the binary/INOUT forms (`castfunc=0`); WITH FUNCTION
+  is skipped (its `castfunc` would need a real `pg_proc` row). `DROP CAST` now calls `DropCast` before falling through to
+  the PG-style "does not exist" error.
+- **catalog** (`internal/catalog/catalog.go`): a `Cast` registry (`RegisterCast`/`DropCast`/`ListCasts`, keyed on
+  `lower(source)\x00lower(target)` with a stable OID from `allocOIDLocked`), and the `pg_cast` virtual view now surfaces
+  each registered cast, resolving the type names to `castsource`/`casttarget` OIDs via `TypeNameToOID` (text=25, bytea=17).
+
+The `TestPort_PgDumpConnectionSetup` fixture creates `CREATE CAST (text AS bytea) WITHOUT FUNCTION` (explicit context, no
+AS clause) and `CREATE CAST (bytea AS text) WITHOUT FUNCTION AS ASSIGNMENT`, asserting both render byte-identically vs
+real pg_dump 18.3 (reference `/tmp/castpg`).
+
+**Deferred** (ledger): WITH FUNCTION casts are parsed but not dumped (`castfunc` stays 0 — a faithful dump needs a
+`pg_proc` row so `dumpCast`'s `findFuncByOid` resolves the function and `format_function_signature` renders it). Only
+binary-coercible built-in type pairs are reachable (composite/enum/array/domain are rejected by PG's `CreateCast` for
+WITHOUT FUNCTION, and goopg cannot create base types), and `TypeNameToOID` resolves bare/built-in names only — a
+schema-qualified user type would fall back to `text`. The cast registry is in-memory (no restart persistence), matching
+the collation/foreign-server registries.
+
+### Slice 396 — **COMMENT ON CAST round-trip** (follow-on to slice 395)
+
+With the CREATE CAST object family in place, a comment on a cast must also round-trip. `dumpCast` appends a trailing
+`COMMENT ON CAST (<src> AS <tgt>) IS '...';` whenever the cast's `dobj` carries `DUMP_COMPONENT_COMMENT` — i.e. when
+`collectComments` found a `pg_description` row keyed on the cast's `catalogId` (`classoid = pg_cast = 2605`,
+`objsubid 0`). The comment-object identity is the **type pair** `(source AS target)`, not a name (`dumpComment(fout,
+"CAST", castargs, …)` where `castargs == "(text AS bytea)"`).
+
+Before this slice goopg's COMMENT-ON parser had no CAST branch — it fell through and silently swallowed the statement,
+so the comment never reached `pg_description` and pg_dump could not re-emit it. Three small layers, mirroring slice 390
+(COMMENT ON COLLATION):
+
+- **parser** (`internal/parser/parser.go`): a new `case p.acceptIdentKeyword("cast")` in the COMMENT-ON dispatch parses
+  `(source AS target)` via the existing `parseCastTypeName` helper, capturing the pair into new
+  `CommentOnStmt.CastSource`/`CastTarget` fields (`ast.go`). `cast` is an unreserved ident-keyword.
+- **executor** (`internal/executor/operators_ddl.go`): a new `case "cast"` in the COMMENT handler resolves the cast's
+  OID via `catalog.InMemory.CastByTypes(source, target)` (the same `lower(src)\x00lower(tgt)` key as
+  `RegisterCast`/`DropCast`) and stores the description under `pg_cast` (classoid 2605) with
+  `SetComment(2605, cast.OID, 0, desc)`. A COMMENT on a cast goopg never registered (e.g. a built-in coercion, OID 0) is
+  a harmless no-op.
+- **catalog** (`internal/catalog/catalog.go`): a new `CastByTypes` lookup; the existing generic `pg_description`
+  virtual view (which walks `AllComments`) then surfaces the row automatically — no view-specific change.
+
+The `TestPort_PgDumpConnectionSetup` fixture adds `COMMENT ON CAST (text AS bytea) IS 'binary-coercible text to bytea'`
+and asserts the trailing `COMMENT ON CAST (text AS bytea) IS '...';` appears, verified byte-identical vs real pg_dump
+18.3. Parser coverage: `TestParseCommentOnCast`. Like the cast registry itself, the comment is in-memory only (no
+restart persistence).
+
+### Slice 397 — **WITH FUNCTION cast round-trip** (closes the slice-395 WITH FUNCTION deferral)
+
+Slice 395 registered binary (`WITHOUT FUNCTION`) and `WITH INOUT` casts but left `castfunc = 0` and deferred the
+`WITH FUNCTION` form, because `dumpCast`'s `COERCION_METHOD_FUNCTION` arm calls `findFuncByOid(cast->castfunc)` and
+`pg_fatal`s (or, with a 0 OID, warns "bogus value in pg_cast.castfunc") unless the cast references a real `pg_proc`
+row. With user functions already round-tripping (slices 147+), the missing piece was wiring the parsed function
+reference through to a resolved OID.
+
+`dumpCast` renders the clause as `WITH FUNCTION %s.%s` where the namespace is `fmtId(funcInfo->dobj.namespace…)` and the
+signature is `format_function_signature(fout, funcInfo, true)` — i.e. `funcname(argtype, …)` built from the function's
+**actual** `pg_proc.proargtypes`, not from whatever arg list the user typed. So the only requirement is that
+`pg_cast.castfunc` equal the function's `pg_proc.oid`.
+
+Three layers:
+
+- **parser** (`internal/parser/ddl.go` `parseCreateCastTail`): the `method = "f"` branch now parses
+  `WITH FUNCTION funcname [ (argtype [, …]) ]` — `parseObjectName` for the (schema-qualifiable) function name and a
+  comma-separated `parseCastTypeName` loop for the optional bare arg-type list — into new
+  `CompatNoopStmt.CastFuncName`/`CastFuncArgs` (`ast.go`). PG's cast grammar permits only bare types here (no arg names).
+- **executor** (`internal/executor/operators_ddl.go` `execCompatNoop` `case "cast"`): for `Method == "f"` it resolves
+  the routine via `Routines().Lookup(CastFuncName, argTypes)` (explicit arg list → exact overload, mirroring
+  COMMENT ON FUNCTION / slice 147) with a `LookupByName` sole-overload fallback when the parens are omitted, and passes
+  the routine's `OID` as the new `funcOID` parameter to `RegisterCast`. That OID is identical to the one goopg's
+  `pg_proc` virtual view assigns the function (both are `Routine.OID`), so the dump's func/cast cross-reference matches.
+- **catalog** (`internal/catalog/catalog.go`): `RegisterCast` gains a `funcOID uint32` parameter stored on
+  `Cast.FuncOID`; the `pg_cast` virtual row already surfaced `cs.FuncOID` as `castfunc` and `cs.Method` as `castmethod`,
+  so no view change was needed.
+
+The `TestPort_PgDumpConnectionSetup` fixture creates `public.text_as_int(text) RETURNS integer` and
+`CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text)` (text→integer has no built-in cast per
+`pg_cast.dat`, so the user cast is unambiguous) and asserts
+`CREATE CAST (text AS integer) WITH FUNCTION public.text_as_int(text);` — verified byte-identical vs real pg_dump 18.3
+(live `/tmp/castfn_pg` cluster). Parser coverage: `TestParseCreateCastWithFunction`. The cast/comment registry remains
+in-memory only (no restart persistence) — the same carry-forward deferral as slices 389–396.
+
+### Slice 398 — **CREATE CAST argument/return-type validation** (closes slice-397 deferral (c))
+
+Slices 395–397 registered whatever `CREATE CAST` the parser captured, with **no** validity checking — goopg would
+silently accept a cast whose `WITH FUNCTION` routine has the wrong argument or return type, where real PG raises
+`ERRCODE_INVALID_OBJECT_DEFINITION` (SQLSTATE 42P17). This slice ports the argument/return-type rules from PG's
+`CreateCast` (`postgres/src/backend/commands/functioncmds.c`) so a malformed `CREATE CAST` is rejected the same way.
+
+The validation is enforced in `internal/executor/operators_ddl.go` by a new free function `validateCreateCast(s, routine)`,
+called from `execCompatNoop`'s `case "cast"` immediately before `RegisterCast`. `routine` is the resolved `WITH FUNCTION`
+routine (the slice-397 `Routines().Lookup` / `LookupByName` result) or `nil` for `WITHOUT FUNCTION` / `WITH INOUT` (and
+for a `WITH FUNCTION` reference that did not resolve — that path keeps slice-397's lenient register-anyway behaviour
+rather than introducing a new false-positive). Mirroring `CreateCast`:
+
+- **WITH FUNCTION** (`routine != nil`): input-argument count (`pronargs`, OUT args excluded) must be 1–3; the first
+  argument must match the source type; a second argument (if present) must be `integer`; a third (if present) must be
+  `boolean`; the return type must match the target type; the routine must be a normal function (not a procedure or
+  window) and must not return a set.
+- **Same-type rule (all methods)**: source and target may be identical only for a length-coercion function (≥ 2 input
+  args). So `CREATE CAST (text AS text) WITHOUT FUNCTION` / `WITH INOUT` / single-arg `WITH FUNCTION` are all rejected,
+  while a 2-arg `WITH FUNCTION f(text, integer)` is allowed.
+
+Type identity is compared by a new `castTypeOIDMatch` helper: built-in aliases (`integer`/`int4`, `boolean`/`bool`, …)
+are resolved to OIDs via `catalog.TypeNameToOID` and compared by OID; user/unknown types (OID 0) fall back to a
+case-insensitive name comparison. goopg does **not** model binary-coercibility beyond identity, so a cast whose
+function argument is binary-coercible-but-not-identical to the source (e.g. a domain over the source) is the one
+remaining gap vs PG's `IsBinaryCoercibleWithCast` — recorded as the slice-398 deferral. The slice-397 `text→integer`
+round-trip fixture continues to pass unchanged (its function is exactly `text_as_int(text) RETURNS integer`). Coverage:
+`TestValidateCreateCast` (`internal/executor/create_cast_validate_test.go`, 18 accept/reject cases asserting message +
+42P17).
+
+### Slice 399 — **CREATE [DEFAULT] CONVERSION round-trip** (new feature)
+
+`CREATE CONVERSION` was parsed name-only (a `CompatNoopStmt` whose body the parser skipped to the semicolon) and the
+virtual `pg_conversion` view always returned zero rows, so a user conversion never round-tripped. This slice makes the
+full `CREATE [DEFAULT] CONVERSION name FOR 'src' TO 'dest' FROM func` statement re-emit through pg_dump's
+`getConversions` / `dumpConversion` (`postgres/src/bin/pg_dump/pg_dump.c`).
+
+- **Parser** (`internal/parser/ddl.go`): a new `parseCreateConversionTail(pos, isDefault)` parses the
+  `name FOR 'src' TO 'dest' FROM func` body, capturing the two encoding-name string literals, the `FROM` function name,
+  and the `DEFAULT` flag onto new `CompatNoopStmt` fields (`ConvForEncoding`, `ConvToEncoding`, `ConvFuncName`,
+  `ConvDefault`). A new `case p.acceptKeyword(KwDefault)` dispatch arm handles the `CREATE DEFAULT CONVERSION` form
+  (DEFAULT only precedes CONVERSION in `CREATE`).
+- **Catalog** (`internal/catalog/catalog.go`, `internal/catalog/encoding.go`): a `UserConversion` registry
+  (`CreateConversion` / `DropConversion` / `ListUserConversions`) mirrors `UserCollation`. The `pg_conversion`
+  `VirtualRows` now surfaces each registered conversion — `conforencoding`/`contoencoding` are the `pg_enc` integer IDs
+  (resolved by the new `EncodingNameToID`), `conproc` is the schema-qualified function name (typed `regproc`, since
+  `dumpConversion` selects it raw and pg_dump's empty `search_path` qualifies the regproc), and `condefault` reflects the
+  `DEFAULT` flag. The `pg_enc` ID↔name table is duplicated from `internal/initdb/encoding.go` (initdb cannot be imported
+  from catalog without a cycle; the mapping is an immutable PG constant).
+- **Executor** (`internal/executor/expr.go`, `operators_ddl.go`): a new `pg_encoding_to_char(int4)` builtin (which
+  `dumpConversion` calls on the encoding IDs) returns `catalog.EncodingIDToName`; `execCompatNoop`'s new `case "conversion"`
+  resolves the encoding names and registers the conversion (still registering the compat object so `DROP CONVERSION`
+  succeeds), and the DROP path drops the dump-visible registry entry.
+
+`dumpConversion` emits `CREATE DEFAULT CONVERSION public.myconv FOR 'LATIN1' TO 'UTF8' FROM public.myconv_func;` —
+verified byte-identical vs real pg_dump 18.3 (the fixture conversion function is not validated by goopg, which has no
+real fmgr encoding-conversion engine; only the dump text is compared). Coverage: `TestParseCreateConversion`
+(`internal/parser/conversion_test.go`), `TestEncodingIDNameRoundTrip` + `TestPgConversionVirtualRows`
+(`internal/catalog/conversion_test.go`), and slice-399 assertions in `TestPort_PgDumpConnectionSetup`. **Deferred
+(ledger):** full encoding-alias resolution (`EncodingNameToID` recognizes only the 42 canonical names, not the
+`pg_encname_tbl` aliases like `unicode`→UTF8); the conversion function is not resolved/validated against `pg_proc`
+(stored as written, lenient like pre-398 casts); restart persistence (the registry is in-memory only, the recurring
+389–398 shared-catalog runtime-write gap).
+
+### Slice 400 — **CONVERSION encoding-alias resolution** (closes slice-399 deferral (a))
+
+Slice 399's `EncodingNameToID` recognized only the 42 canonical `pg_enc2name` names, so
+`CREATE CONVERSION … FOR 'unicode' TO 'mskanji' …` resolved both encodings to `-1` and dumped
+`FOR '' TO ''` — a silent divergence from PostgreSQL, whose `CREATE CONVERSION` accepts the full
+`pg_encname_tbl` alias set via `pg_char_to_encoding` (`postgres/src/common/encnames.c`).
+
+- **Catalog** (`internal/catalog/encoding.go`): a new `pgConvEncAliases` map (cleaned alias →
+  canonical `pg_enc` name) mirrors `pg_encname_tbl`. `EncodingNameToID` now tries the canonical
+  `pg_enc2name` names first (fast path), then falls back to the alias map — so `unicode`→UTF8,
+  `windows1252`→WIN1252, `mskanji`→SJIS, `iso-8859-1`→LATIN1, the `_dirty_` aliases `koi8`→KOI8R /
+  `win`→WIN1251, etc. resolve exactly as `pg_char_to_encoding` does. `clean_encoding_name`
+  (lowercase + strip punctuation) keys both sides, so case and separators are irrelevant.
+
+Because the resolved IDs are canonical, `dumpConversion`'s `pg_encoding_to_char` re-emits the
+canonical names: a conversion declared with aliases dumps `FOR 'SJIS' TO 'UTF8'`. Verified
+byte-identical vs real pg_dump 18.3. Coverage: alias cases in `TestEncodingIDNameRoundTrip`
+(`internal/catalog/conversion_test.go`) and a slice-400 alias-conversion assertion in
+`TestPort_PgDumpConnectionSetup`. **Still deferred (ledger):** the conversion function is not
+resolved/validated against `pg_proc` (slice-399 deferral (b), still open); restart persistence
+(in-memory registry, the recurring shared-catalog runtime-write gap).
+
+### Slice 401 — **CREATE CONVERSION encoding-name validation** (closes the encoding-name half of slice-399 deferral (b))
+
+Slices 399–400 registered any `CREATE CONVERSION` whose `FOR`/`TO` literals resolved to a known
+encoding name, with no further checking — real PG's `CreateConversionCommand`
+(`postgres/src/backend/commands/conversioncmds.c`) rejects an unrecognized encoding name
+(`ERRCODE_UNDEFINED_OBJECT`, SQLSTATE 42704) and a conversion to/from `SQL_ASCII`
+(`ERRCODE_INVALID_OBJECT_DEFINITION`, SQLSTATE 42P17 — `pg_do_encoding_conversion` hard-wires
+`SQL_ASCII` fast paths, so such a conversion function could never run).
+
+- **Executor** (`internal/executor/operators_ddl.go`): a new `validateCreateConversionEncodings(forName, toName)`
+  resolves both names via `EncodingNameToID` and applies PG's checks in order: unknown source → 42704
+  `source encoding "X" does not exist`; unknown destination → 42704 `destination encoding "X" does not exist`;
+  either resolved to `SQL_ASCII` (pg_enc ID 0) → 42P17 `encoding conversion to or from "SQL_ASCII" is not supported`.
+  `execCompatNoop`'s `case "conversion"` calls it before `RegisterCompatObject`/`CreateConversion` and reuses the
+  resolved IDs (no double `EncodingNameToID` call).
+
+Valid conversions (canonical names and aliases) are unaffected. Coverage: `TestValidateCreateConversionEncodings`
+(executor unit, 7 cases including the unknown-beats-SQL_ASCII precedence order) plus slice-401 negative assertions
+(42704/42P17) in `TestPort_PgDumpConnectionSetup`. **Still deferred (ledger):** the FROM-function is not
+resolved/validated against `pg_proc` (slice-399 deferral (b)-remainder); restart persistence (recurring gap).
+
+### Slice 402 — **CONVERSION FROM-function existence/return-type validation** (closes the slice-399/400/401 deferral (b)-remainder)
+
+The last functionally-significant half of PG's `CreateConversionCommand` checks was still open: the `FROM` function
+must resolve to a real routine with the fixed signature `(int4, int4, cstring, internal, int4, bool) -> int4`
+(`LookupFuncName` + `get_func_rettype != INT4OID`).
+
+- **Executor** (`internal/executor/operators_ddl.go`): a new `resolveConversionFunc(rs, funcName)` scans
+  `Routines().LookupByName(funcName)`'s overloads for one whose IN-argument signature matches the fixed six-argument
+  signature (`catalog.TypeNameToOID` for the `int4`/`bool` slots; case-insensitive literal match for the `cstring`/
+  `internal` pseudotype slots, which `TypeNameToOID` has no entries for). No match → `ERRCODE_UNDEFINED_FUNCTION`
+  (42883) `function <name>(integer, integer, cstring, internal, integer, boolean) does not exist` (PG's fixed
+  required-signature error text, not whatever overloads actually exist); a match with a non-`int4` return type →
+  `ERRCODE_INVALID_OBJECT_DEFINITION` (42P17) `encoding conversion function <name> must return type integer`.
+  `execCompatNoop`'s `case "conversion"` calls it after the slice-401 encoding checks (matching PG's check order)
+  before registering.
+
+Because the slice 399–401 test fixtures (`myconv_func`, `aliasconv_func`) were bare unregistered names, the
+`TestPort_PgDumpConnectionSetup` setup now `CREATE FUNCTION`s them first (`LANGUAGE c` stubs — never invoked, since
+goopg has no encoding-conversion engine and only checks the signature/return type) with the matching real
+`(int4,int4,cstring,internal,int4,bool)->int4` argument list. `conproc` dump output is unchanged for these fixtures
+(still the as-written schema-qualified text). Coverage: `TestResolveConversionFunc` (executor unit, 7 cases including
+OUT-arg exclusion and overload-set disambiguation) plus slice-402 negative assertions (42883/42P17) in
+`TestPort_PgDumpConnectionSetup`. **Still deferred (ledger):** `conproc` is rendered from `UserConversion.ProcSchema`/
+`ProcName` text captured at CREATE time, not a `FuncOID`→`pg_proc` cross-reference (unlike `pg_cast.castfunc`, slice
+397); the EXECUTE ACL check and the runtime `OidFunctionCall6` empty-input probe are not implemented; restart
+persistence (recurring gap).
+
+### Slice 403 — **conproc FuncOID→pg_proc cross-reference** (closes the slice-402 conproc deferral)
+
+`pg_conversion.conproc` is typed `regproc` in real PostgreSQL — an OID reference to `pg_proc`, not a captured name.
+Slices 399–402 stored `ProcSchema`/`ProcName` text at `CREATE CONVERSION` time and rendered it verbatim, so a later
+`ALTER FUNCTION ... RENAME` on the conversion function would silently go stale in the dump — a real (if narrow)
+fidelity gap, not merely cosmetic naming.
+
+- **Catalog** (`internal/catalog/catalog.go`): `UserConversion` gains `FuncOID uint32` (`pg_conversion.conproc`'s
+  underlying `pg_proc` OID; 0 = unresolved, kept lenient for callers — e.g. existing unit tests — that build a
+  `UserConversion` directly without a routine registry). The `pg_conversion` `VirtualRows` provider now prefers a live
+  `Routines().LookupByOID(cv.FuncOID)` lookup for `conproc`, falling back to the as-written `ProcSchema`/`ProcName`
+  text only when `FuncOID` is 0 or the OID no longer resolves. This mirrors how `pg_cast.castfunc` (slice 397) tracks
+  the function by OID rather than by captured name.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s `case "conversion"` already resolves the
+  FROM function via `resolveConversionFunc` for validation (slice 402) — it now also carries the returned routine's
+  `OID` into `UserConversion.FuncOID` when constructing the registry entry, at zero extra resolution cost.
+
+Since `resolveConversionFunc` requires a successful resolution before `CreateConversion` is even called, every
+conversion created going forward has a non-zero, valid `FuncOID`; the fallback path exists only for direct
+`UserConversion` construction outside the executor (unit tests). Coverage: `TestPgConversionVirtualRowsFuncOID`
+(`internal/catalog/conversion_test.go`) — asserts `conproc` resolves through `FuncOID` (not the deliberately-stale
+`ProcSchema`/`ProcName` text used in the fixture), that a `RenameRoutine` on the function updates the next
+`VirtualRows()` read without touching the conversion, and that `FuncOID == 0` still falls back to the as-written text.
+The existing `TestPgConversionVirtualRows` and the slice 399–402 `TestPort_PgDumpConnectionSetup` assertions are
+unaffected (fixture function names are never renamed, so dump output stays byte-identical). **Still deferred
+(ledger):** the EXECUTE ACL check and the runtime `OidFunctionCall6` empty-input probe (both need machinery goopg
+does not have — a routine-EXECUTE-ACL model and an encoding-conversion engine, respectively); restart persistence
+(recurring shared-catalog runtime-write gap, tracked since slice 389).
+
+### Slice 404 — **CREATE/DROP TRANSFORM round-trip skeleton** (new object family)
+
+`CREATE TRANSFORM FOR type LANGUAGE lang (FROM SQL WITH FUNCTION ... , TO SQL WITH FUNCTION ...)` is the last
+untouched pg_dump object family covered by the pg_cast/pg_conversion precedent — it shares the same "register
+metadata, don't execute the machinery" shape. PG's grammar (`gram.y` `CreateTransformStmt`/`transform_element_list`)
+allows either the FROM SQL half or the TO SQL half alone, or both in either order.
+
+- **Parser** (`internal/parser/ddl.go`): `parseCreateTransformTail` parses `FOR type LANGUAGE lang ( ... )`, looping
+  over up to two `{FROM|TO} SQL WITH FUNCTION fn[(argtypes)]` elements (a `elements:`-labeled loop, since a bare
+  `switch` `default: break` only breaks the switch, not the loop — a real Go footgun worth flagging for future
+  slices reusing this shape). A `DROP TRANSFORM [IF EXISTS] FOR type LANGUAGE lang [CASCADE|RESTRICT]` case was added
+  as a dedicated branch, ahead of the generic ident-based DROP stub list — "transform" previously sat in that list,
+  but its `parseObjectList`-based `parseDropTail` cannot parse a `FOR type LANGUAGE lang` clause (it expects a
+  comma-separated name list), so DROP TRANSFORM would have broken on first real use even though nothing exercised it
+  before CREATE TRANSFORM existed. New `parseSimpleTypeName(stopKeywords ...Keyword)` generalizes the CAST-only
+  `parseCastTypeName` (which now delegates to it with `KwAs`) so TRANSFORM's type-name scan can stop at `LANGUAGE`
+  instead — reusing the un-generalized function silently swallowed `LANGUAGE sql` into the type name in early
+  iterations of this slice (caught by the parser unit test, not by inspection).
+- **Catalog** (`internal/catalog/catalog.go`): `Transform{OID, TypeName, Lang, FromFuncOID, ToFuncOID}` registered
+  via `RegisterTransform`/`TransformExists`/`DropTransform`/`ListTransforms`, keyed like `Cast`
+  (`"<type>\x00<lang>"`, case-insensitive). New `LanguageNameToOID` maps the 4 rows `pg_language.VirtualRows` already
+  serves (`internal`=12, `c`=13, `sql`=14, `plpgsql`=13627) — the same hardcoded set, not a new source of truth.
+  `pg_transform.VirtualRows` (previously always empty) now renders registered transforms; an unresolved
+  `FromFuncOID`/`ToFuncOID` renders as literal `"0"`, matching `pg_cast.castfunc`'s existing convention for the same
+  situation (WITHOUT FUNCTION cast).
+- **Executor** (`internal/executor/operators_ddl.go`): `execCompatNoop`'s `case "transform"` validates the language
+  resolves (42704 `language "X" does not exist`) and the (type, lang) pair isn't a duplicate (42710 `transform for
+  type X language "Y" already exists`), then resolves each present FROM/TO SQL function via new
+  `resolveTransformFunc`, porting PostgreSQL's `CreateTransform` + `check_transform_function`
+  (`postgres/src/backend/commands/functioncmds.c`) validation order exactly: the role-specific return-type check
+  first (FROM SQL must return `internal`; TO SQL must return the transform's declared type — both 42P17), then not
+  volatile, a normal function (not procedure/window), not SETOF, and exactly one argument of type `internal` (all
+  42P17). Resolution reuses CAST's WITH-FUNCTION lookup style (`rs.Lookup` with the explicit arg-type list, else
+  `rs.LookupByName` single-overload fallback) — deliberately, since built-in functions and the leniency behavior for
+  them need to stay consistent across both slices (see the deferral below). `execDropCompat` gained a `transform`
+  case removing the registry entry or raising 42704 with PG's exact message.
+
+**Coverage:** `TestParseCreateTransform`/`TestParseDropTransform` (`internal/parser`) — reversed FROM/TO order,
+either-half-alone forms, IF EXISTS/CASCADE/RESTRICT. `TestLanguageNameToOID`/`TestTransformRegistry`/
+`TestPgTransformVirtualRows` (`internal/catalog`) — idempotent re-registration, case-insensitive keys, the
+literal-`"0"` rendering convention. `TestResolveTransformFunc` (`internal/executor`, 10 subtests) — every
+`check_transform_function` rule plus the two return-type roles plus the builtin-lenient path. All PASS; full
+parser/catalog/executor suites, TPC-H Q12/Q13 spotcheck, and the pgbench pre-commit smoke also PASS.
+
+**Live-verified against the exact upstream TAP fixture** (`postgres/src/bin/pg_dump/t/002_pg_dump.pl`'s
+`'CREATE TRANSFORM FOR int'` case, `CREATE TRANSFORM FOR int LANGUAGE SQL (FROM SQL WITH FUNCTION
+prsd_lextype(internal), TO SQL WITH FUNCTION int4recv(internal))`) on a live goopg server: the statement registers a
+row (`trftype=23`, `trflang=14`), `DROP TRANSFORM FOR int LANGUAGE sql` reverses it cleanly, and the
+language-not-exist / duplicate-transform / transform-not-found error paths all fire with the documented SQLSTATE.
+
+**Deferred — NOT wired into the DU-002 `TestPort_PgDumpConnectionSetup` connsetup fixture yet, and this is a
+systemic discovery, not a narrow one.** The fixture's FROM/TO functions (`prsd_lextype`, `int4recv`) are PostgreSQL
+*builtins*, not user-created functions. Two Explore-agent research passes plus a direct live empirical check
+(`SELECT oid, proname FROM pg_proc WHERE proname IN ('int4recv','prsd_lextype')` against a running goopg server →
+**0 rows**) established that goopg's server-side `pg_proc` catalog does not expose ANY builtin function at all:
+`catalog.Routines()` holds exclusively user-`CREATE FUNCTION` routines (OID space starts at `1<<17`), and
+`internal/initdb/pg_proc_seed_data.go`'s ~3397-entry builtin table — the data PG dump's own `getFuncs` EXISTS-join
+against `pg_cast`/`pg_transform` requires to be live-queryable — never reaches a SQL-queryable form; `pg_proc`'s
+virtual/heap view surfaces only a ~16-entry synthetic builtin stub list (`internal/initdb/pg_proc_view.go`'s
+`builtinProcs`), unrelated to `int4recv`/`prsd_lextype`. Consequences:
+
+1. `resolveTransformFunc` cannot resolve either function, so `trffromsql`/`trftosql` stay `0`; real pg_dump's
+   `dumpTransform` treats a `0` OID as "absent" and would emit `CREATE TRANSFORM FOR integer LANGUAGE sql ();` — not
+   the fixture's full form — so this slice cannot pass a byte-identical connsetup assertion yet.
+2. **This gap is not new to CREATE TRANSFORM.** It already silently affects CREATE CAST's `WITH FUNCTION` clause
+   (slice 397, `execCompatNoop` case `"cast"`, `internal/executor/operators_ddl.go` around line 12962) and CREATE
+   CONVERSION's `FROM` function (slice 402, `resolveConversionFunc`) whenever either references a builtin —
+   `RegisterCast`'s `funcOID` parameter has the exact same "stays 0 for an unresolvable name" behavior. It simply
+   never surfaced before because every prior CAST/CONVERSION test fixture happened to reference a user-created
+   function. CREATE TRANSFORM is the first slice whose canonical PG test fixture forces the builtin case.
+3. Restart persistence is still in-memory only (recurring shared-catalog runtime-write gap, tracked since slice 389).
+
+**Resume point:** expose builtin `pg_proc` rows queryably server-side, then wire all three WITH-FUNCTION-on-builtin
+call sites (CAST, CONVERSION, TRANSFORM) to the same resolution path so they stay consistent
+([[pattern_sibling_paths_must_agree]]). Two viable shapes, either acceptable:
+(a) relocate a `name → (OID, rettype, argtypes, volatile, prokind)` builtin-function table to a new leaf package
+that both `internal/initdb` and `internal/executor`/`internal/catalog` can import without a cycle — the same fix
+shape as the "Version constants must live in leaf config pkg" precedent
+([[goopg_version_constants_leaf_config_import_cycle]]); or
+(b) add a catalog-level `LookupBuiltinProcByName` backed by whatever data structure actually answers a live
+`SELECT * FROM pg_proc WHERE proname = ...` query today, so the executor's internal resolution and the SQL-facing
+catalog are provably the same source of truth. Once either lands, add the `'CREATE TRANSFORM FOR int'` DU-002
+connsetup fixture (currently absent from `internal/testport`) and verify byte-identical against real pg_dump 18.3.
+This is deliberately NOT attempted in this slice: exposing builtin `pg_proc` rows is a foundational, cross-cutting
+change to a heavily-relied-on catalog view with real regression risk across the whole PG-compat surface — too large
+for a single bounded loop, and orthogonal to this slice's actual deliverable (a new, independently-tested object
+family's parse/registry/validation skeleton). Full deferral-ledger row: slice 404.
+
+### Slice 404 follow-up — builtin `pg_proc` exposure, shape (b) chosen, TRANSFORM fixture now wired
+
+Closed the resume point above with shape (b) — a single leaf-package source of truth, not a wholesale exposure of
+all ~3397 `pg_proc.dat` rows. New `catalog.BuiltinProc`/`catalog.LookupBuiltinProc`/`catalog.BuiltinProcs()`
+(`internal/catalog/catalog.go`, next to `LanguageNameToOID`) hand-curates **only** the functions goopg's own DU-002
+fixtures reference so far (`int4recv` OID 2406, `prsd_lextype` OID 3721 — both from
+`postgres/src/include/catalog/pg_proc.dat`, `provolatile` defaulting to `i` per `pg_proc.h`'s `BKI_DEFAULT(i)` since
+neither `.dat` entry sets it explicitly). `internal/catalog` is a leaf package neither `internal/initdb` nor
+`internal/executor` needs to reverse-import (verified via `go list -deps`: `catalog` imports neither; both of the
+other two import `catalog`), so this table is reachable from both sides without the import-cycle problem shape (a)
+would have hit.
+
+Two call sites now read it:
+
+1. **Executor (`resolveTransformFunc`, `internal/executor/operators_ddl.go`):** when no user-created routine
+   matches, falls back to `catalog.LookupBuiltinProc(fn.Name)` (unqualified or explicitly `pg_catalog`-qualified
+   only — `public.int4recv` does *not* match the builtin), then runs the identical `check_transform_function`
+   signature checks (`validateBuiltinTransformFunc`) against the curated entry before returning its real OID. A
+   schema-qualified reference to any *other* schema stays unresolved (OID 0, no error) — the pre-existing lenient
+   behavior for genuinely-unknown names is preserved, just narrowed to not falsely match a same-named user object in
+   the wrong schema.
+2. **`pg_proc` SQL-queryable view (`internal/initdb/pg_proc_view.go`, `registerPgProcView`):** `catalog.BuiltinProcs()`
+   rows are appended to `VirtualRows()` **after** the user-defined-routine loop (not spliced in before it), so every
+   existing test in `pg_proc_view_test.go` that slices `rows[len(builtinProcs):]` to reach the user-routine rows
+   keeps working unchanged — only the total row count grew, which the affected exact-count assertions now add
+   `len(catalog.BuiltinProcs())` to. Field defaults for the new rows follow `pg_proc.h`'s real `BKI_DEFAULT`s
+   (`proisstrict=t`, `prokind=f`, `proretset=f`, `proparallel=s`, `procost=1`, `prorows=0`) rather than reusing the
+   legacy 16-stub loop's simplified `u`/`f` defaults, since these are genuine PG builtins and pg_dump's own
+   `getFuncs` query reads these columns directly.
+
+**A second, independent gap surfaced and was fixed in the same loop:** even with `trffromsql`/`trftosql` resolved
+to non-zero OIDs and `pg_proc` exposing the rows, `dumpTransform`'s `format_function_signature` still rendered
+`WITH FUNCTION pg_catalog.int4recv(???)` instead of `...(internal)`. Root cause: pg_dump's
+`getFormattedTypeName` calls `SELECT pg_catalog.format_type('2281'::oid, NULL)` server-side for any type OID not
+already in its client-side `TypeInfo` cache (the "internal" pseudo-type, OID 2281, is not a dumpable object so it
+was never cached), and goopg's `formatTypeOID` (`internal/executor/expr.go`) — a hardcoded per-OID switch, not a
+real `pg_type` scan — had no `case 2281`, so it fell through to the same `"???"` fallback string PG's own
+`format_type.c` uses for a genuinely-unresolvable OID. Fixed with a one-line `case 2281: return "internal"`,
+matching the existing pseudo-type precedent (`case 2249: return "record"`).
+
+**DU-002 connsetup fixture now wired and asserted byte-identical:** `internal/testport/pgdump_connsetup_test.go`
+runs the exact upstream `postgres/src/bin/pg_dump/t/002_pg_dump.pl` `'CREATE TRANSFORM FOR int'` SQL as setup, and
+asserts pg_dump's output contains `CREATE TRANSFORM FOR integer LANGUAGE sql (FROM SQL WITH FUNCTION
+pg_catalog.prsd_lextype(internal), TO SQL WITH FUNCTION pg_catalog.int4recv(internal));` — confirmed against real
+pg_dump 18.3 via `TestPort_PgDumpConnectionSetup` (full suite, not just this assertion).
+
+**Still deferred (unchanged from the slice-404 note above):** CAST's `WITH FUNCTION` (slice 397) and CONVERSION's
+`FROM` function (slice 402) do not yet call `catalog.LookupBuiltinProc` — their existing fixtures only reference
+user-created functions, so nothing forces the wiring yet, but the shared table is now available for whichever
+future slice needs it ([[pattern_sibling_paths_must_agree]]). Restart persistence remains in-memory only
+(unchanged, tracked since slice 389). The curated table itself is intentionally narrow — extend
+`builtinProcsByName` only as new fixtures reference additional builtins, following the `pg_proc.dat`
+OID/rettype/argtypes/provolatile values (see `postgres/src/include/catalog/pg_proc.h`'s `BKI_DEFAULT`s for any
+field a `.dat` entry omits).
+
+### CREATE TRANSFORM restart persistence (WAL replay) — first object of the slice-389 backlog to close
+
+The recurring "restart persistence remains in-memory only" note above (tracked across slices 389–404: cast,
+conversion, transform, collation) is a real gap, not decoration — `catalog.InMemory.transforms` (and its siblings
+`casts`/`conversions`/`collations`) live entirely in a Go map with no on-disk representation, so any of these
+objects vanishes the moment the process restarts, silently diverging from real PostgreSQL's heap-backed
+`pg_transform`/`pg_cast`/`pg_conversion`/`pg_collation`. This slice closes the gap for **CREATE/DROP TRANSFORM
+only** — the most recently landed and simplest of the four (a 5-field struct, no nested arg-type lists) — as a
+template for the remaining three, per the "two catalog-DDL durability mechanisms" precedent: goopg has no
+per-transform on-disk file namespace (unlike `CREATE TABLE`'s pg_class heap-append path), so this follows the
+*other* durability mechanism — a goopg-private WAL record plus a startup replay pass — exactly like
+`CREATE/DROP SCHEMA` (M0110-0003).
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateTransform` (36) and
+`RecordKindDropTransform` (37), the next free bytes after `RecordKindDropSchema` (35). `EncodeCreateTransform`/
+`DecodeCreateTransform` carry `oid | fromFuncOID | toFuncOID | type name | lang name` (need the resolved function
+OIDs, unlike schema's bare name+OID, since re-resolving `int4recv`/`prsd_lextype` by name at replay time would
+require re-running the full builtin/user-routine resolution logic in the WAL replay path — carrying the already-
+resolved OIDs is simpler and matches what `catalog.Transform` actually stores). `EncodeDropTransform`/
+`DecodeDropTransform` carry just the (type, lang) key, mirroring `EncodeDropSchema`. The physical-replay dispatch
+switch (`internal/wal/recovery.go` around the `RecordKindCreateSchema, RecordKindDropSchema` case) gained an
+identical no-op case for the two new kinds — goopg has no per-transform on-disk page state, so physical redo has
+nothing to do; only the catalog-level recovery pass (below) matters.
+
+**New catalog recovery hooks** (`internal/catalog/catalog.go`): `RegisterTransformDuringRecovery`/
+`DropTransformDuringRecovery`, the idempotent WAL-replay counterparts of `RegisterTransform`/`DropTransform` —
+they take the OID from the WAL record (so the recovered registry matches what the pre-crash server assigned)
+and advance `nextOID` past it, mirroring `RegisterSchemaDuringRecovery` exactly.
+
+**New recovery driver** (`internal/initdb/transform_ddl_recovery.go`, new file mirroring
+`schema_ddl_recovery.go`): `replayTransformDDLRecords` walks the WAL after physical replay completes, decodes
+each CREATE/DROP TRANSFORM record, and applies it via the new recovery hooks. Wired into `internal/initdb/open.go`
+right after the existing `replaySchemaDDLRecords` call (order between the two does not matter — transforms are
+keyed by (type, lang), not by schema OID).
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): the `case "transform"` CREATE arm now calls
+`o.ctx.WAL.Append(wal.EncodeCreateTransform(...))` right after `im.RegisterTransform(...)`, and the `objType ==
+"transform"` DROP arm calls `o.ctx.WAL.Append(wal.EncodeDropTransform(...))` right after a successful
+`im.DropTransform(...)` — both mirror the CREATE/DROP SCHEMA call sites verbatim.
+
+**A real bug caught by the round-trip unit test, not by inspection:** the first `EncodeCreateTransform`
+implementation under-allocated the output buffer by 2 bytes (missed the `langLen` field's own 2 bytes in the
+`make([]byte, ...)` size expression), so `PutUint16` for `langLen` and the subsequent `copy` for the lang bytes
+wrote to the same offset, silently corrupting the lang field for any non-trivial input. `TestEncodeDecodeCreate
+TransformRoundTrip` (`internal/wal/transform_ddl_test.go`) failed immediately with a truncated-payload decode
+error, confirming the value of round-tripping through the actual Encode/Decode pair rather than trusting the
+byte-offset arithmetic by eye — consistent with the WAL/MVCC practice card's "concurrency/format bugs do not
+reproduce by inspection" guidance (here: a raw byte-layout bug, same category of easy-to-miss-by-inspection error).
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateTransformRoundTrip`/`...DropTransformRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal`), `TestTransformDDLRecoveryReplaysCreate`/
+`...ReplaysDropAfterCreate`/`TestReplayTransformDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full
+Init→Open→WAL.Append→Close→re-Open cycle against a real on-disk data directory). (2) live manual end-to-end: built
+a throwaway binary, `initdb`'d a fresh data dir, started the server, ran the exact upstream fixture SQL (`CREATE
+TRANSFORM FOR int LANGUAGE sql (FROM SQL WITH FUNCTION prsd_lextype(internal), TO SQL WITH FUNCTION
+int4recv(internal))`) via real `psql`, confirmed `pg_transform` showed `trftype=23 trflang=14 trffromsql=3721
+trftosql=2406`, killed the server (not graceful `make stop` — a plain `kill`, closer to a crash), restarted it
+against the same data dir, and confirmed the row was still there with the same OIDs — then `DROP TRANSFORM`, a
+third restart, and confirmed `pg_transform` was empty again. Gates: `go build ./...` clean; `go vet` clean on
+touched packages; `-race` on `internal/wal`+`internal/catalog` (WAL/MVCC practice card); full
+`internal/wal`/`internal/catalog`/`internal/initdb`/`internal/executor`/`internal/parser` suites PASS;
+`TestPort_PgDumpConnectionSetup` (whole suite) PASS — the CREATE TRANSFORM connsetup assertion added in the prior
+loop is unaffected by this purely-durability change; `TestE2E_PhysicalReplication` PASS (WAL/MVCC practice card's
+recovery-path gate); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke via the pre-commit hook.
+
+**Deliberately still open (ledger row, scoped as a template for the next loop, not attempted here to keep this
+loop bounded to ONE object kind):** the identical WAL-record + recovery-driver + executor-wiring pattern is not
+yet applied to `catalog.Cast`/`catalog.UserConversion`/the collation registry — each still needs its own
+`RecordKindCreate*`/`RecordKindDrop*` byte pair, `Encode*`/`Decode*` functions, `*DuringRecovery` catalog hooks,
+and a dedicated `internal/initdb/{cast,conversion,collation}_ddl_recovery.go` file, following this loop's Transform
+work as the concrete template (bytes 38/39 next free for whichever object is picked next).
+
+### CREATE CAST restart persistence (WAL replay) — second object of the slice-389 backlog to close
+
+Repeats the CREATE TRANSFORM template above for `catalog.Cast` (the next item in the deliberately-deferred list),
+confirming the pattern generalizes to a struct with more fields (5: `SourceType`, `TargetType`, `FuncOID`,
+`Context`, `Method`, vs. Transform's 4) and two single-character enum fields instead of a second name string.
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateCast` (38) and `RecordKindDropCast` (39),
+the next free bytes after `RecordKindDropTransform` (37). `EncodeCreateCast`/`DecodeCreateCast` carry
+`oid | funcOID | context(1 byte) | method(1 byte) | source name | target name` — `context`/`method` are each a
+single PG catalog char (`'e'`/`'a'`/`'i'` and `'b'`/`'i'`/`'f'`) so they are wire-encoded as a single raw byte
+each rather than a length-prefixed string, unlike the two type names. `EncodeDropCast`/`DecodeDropCast` carry
+just the (source, target) key, mirroring `EncodeDropTransform`. The physical-replay dispatch switch gained an
+identical no-op case for the two new kinds (goopg has no per-cast on-disk page state).
+
+**New catalog recovery hooks** (`internal/catalog/catalog.go`): `RegisterCastDuringRecovery`/
+`DropCastDuringRecovery`, the idempotent WAL-replay counterparts of `RegisterCast`/`DropCast` — same OID-carry +
+`nextOID` advance pattern as `RegisterTransformDuringRecovery`.
+
+**New recovery driver** (`internal/initdb/cast_ddl_recovery.go`, new file mirroring
+`transform_ddl_recovery.go`): `replayCastDDLRecords` walks the WAL after physical replay completes, decodes each
+CREATE/DROP CAST record, and applies it via the new recovery hooks. Wired into `internal/initdb/open.go` right
+after the existing `replayTransformDDLRecords` call.
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): the `case "cast"` CREATE arm now captures the
+`*catalog.Cast` returned by `im.RegisterCast(...)` and calls `o.ctx.WAL.Append(wal.EncodeCreateCast(...))` right
+after; the `objType == "cast"` DROP arm calls `o.ctx.WAL.Append(wal.EncodeDropCast(...))` right after a successful
+`im.DropCast(...)` — both mirror the CREATE/DROP TRANSFORM call sites verbatim.
+
+**A real bug caught by the round-trip unit test again, not by inspection:** the first `EncodeCreateCast`
+implementation under-allocated the output buffer by 1 byte (`make([]byte, 14+len(source)+len(target))` when the
+header is 15 bytes: `kind(1) + oid(4) + funcOID(4) + context(1) + method(1) + sourceLen(2)` = 13, plus
+`targetLen(2)` = 15 total fixed bytes before the two names). `TestEncodeDecodeCreateCastRoundTrip`
+(`internal/wal/cast_ddl_test.go`) failed immediately with a truncated-payload decode error on every case — same
+category of easy-to-miss-by-inspection byte-offset error as the transform slice, reinforcing that this class of
+bug recurs whenever a new record format is hand-derived rather than generated, and that the round-trip test is
+the load-bearing guard against it, not eyeballing the arithmetic.
+
+**A genuine pre-existing gap surfaced during manual verification (not caused by this change, out of scope to
+fix here):** `DROP CAST (real AS text)` returns `cast from type real to type text does not exist` even though the
+cast was created via `CREATE CAST (float4 AS text) ...` — `DropCast`'s lookup key is
+`strings.ToLower(source)+"\x00"+strings.ToLower(target)` using the *raw parsed type spelling*, not the resolved
+canonical type name, so PG's built-in type-name synonyms (`real`/`float4`, `int`/`integer`, etc.) do not
+cross-resolve. `DROP CAST (float4 AS text)` (the exact spelling used at CREATE time) succeeds and persists
+correctly across restart. This is a pre-existing gap in slice 395's `RegisterCast`/`DropCast` key scheme, not
+something this WAL-persistence loop introduced or is scoped to fix; recorded in the deferral ledger.
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateCastRoundTrip`/`...DropCastRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal/cast_ddl_test.go`),
+`TestCastDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/`TestReplayCastDDLRecordsHandlesMissingWalDir`
+(`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open cycle against a real on-disk data directory).
+(2) live manual end-to-end: built the binary, `initdb`'d a fresh data dir, started the server on the isolated
+perf-optimize port (5533), ran `CREATE CAST (int4 AS float8) WITHOUT FUNCTION`, `CREATE CAST (float4 AS text)
+WITH INOUT AS ASSIGNMENT`, and a `WITH FUNCTION ... AS ASSIGNMENT` cast via real `psql`, confirmed all three
+showed correct `castsource`/`casttarget`/`castfunc`/`castcontext`/`castmethod` in `pg_cast`, restarted the server
+(graceful `goopg stop` + relaunch against the same data dir) and confirmed all three casts were still present
+with identical values; then `DROP CAST (float4 AS text)`, a second restart, and confirmed only the other two
+remained. Gates: `go build ./...` clean; `go vet ./...` clean; `-race -count=1` on
+`internal/wal`+`internal/catalog`+`internal/initdb`+`internal/executor` PASS; `TestE2E_PhysicalReplication` PASS
+(WAL/MVCC practice card's recovery-path gate); TPC-H spotcheck Q12=2/Q13=33 PASS; pgbench smoke via the
+pre-commit hook.
+
+**Deliberately still open (ledger row, next in the template queue):** `catalog.UserConversion` and the collation
+registry still need the identical treatment (bytes 40/41 next free).
+
+### CREATE CONVERSION restart persistence (WAL replay) — third object of the slice-389 backlog to close, plus a real cross-cutting WAL-scan bug found and fixed
+
+Repeats the CREATE CAST/TRANSFORM template for `catalog.UserConversion` (the next item in the deliberately-deferred
+list). `UserConversion` is schema-scoped (unlike Cast/Transform, which are keyed by name pairs with no namespace),
+so replay of its WAL records must run *after* `replaySchemaDDLRecords` has repopulated the schema-name→OID map —
+the wiring in `internal/initdb/open.go` places `replayConversionDDLRecords` last in the CREATE/DROP DDL-replay
+sequence for exactly this reason.
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateConversion` (40) and
+`RecordKindDropConversion` (41), the next free bytes after `RecordKindDropCast` (39). `EncodeCreateConversion`/
+`DecodeCreateConversion` carry `oid | ownerOID | funcOID | forEncoding(int32) | toEncoding(int32) |
+defaultFlag(1) | name | schema | procSchema | procName` — five fields more than Cast, reflecting
+`UserConversion`'s larger field set (owner, two encodings, the as-written proc-name fallback pair, and the
+`DEFAULT` flag). `EncodeDropConversion`/`DecodeDropConversion` carry just the (name, schema) key.
+
+**New catalog recovery hooks** (`internal/catalog/catalog.go`): `CreateConversionDuringRecovery` (idempotent,
+OID-carrying counterpart of `CreateConversion` — replaces-by-OID instead of erroring on a duplicate, since replay
+can legitimately re-apply a record) and `DropConversionDuringRecovery` (a thin wrapper around the existing
+`DropConversion`, which was already replay-safe — it returns a bool the driver doesn't need rather than erroring).
+
+**New recovery driver** (`internal/initdb/conversion_ddl_recovery.go`, new file mirroring
+`cast_ddl_recovery.go`): `replayConversionDDLRecords` walks the WAL after physical replay completes, decodes each
+CREATE/DROP CONVERSION record, and applies it via the new recovery hooks.
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): the `case "conversion"` CREATE arm now calls
+`o.ctx.WAL.Append(wal.EncodeCreateConversion(...))` right after a successful `im.CreateConversion(...)`; the
+generic DROP fallthrough's `case "conversion"` arm (shared with text-search object types) calls
+`o.ctx.WAL.Append(wal.EncodeDropConversion(...))` right after a successful `im.DropConversion(...)`.
+
+**Byte-offset bug caught by the round-trip unit test again:** the first `EncodeCreateConversion` under-allocated
+the output buffer by 8 bytes — `make([]byte, 22+len(name)+len(schema)+len(procSchema)+len(procName))` accounted
+for the 22-byte fixed header but forgot the four 2-byte length prefixes the four variable-length fields also need
+(`22+8+...`). Same category as the Cast (1-byte) and Transform bugs before it — three for three, now a confirmed
+recurring failure mode for hand-derived wire formats in this codebase, not a one-off.
+
+**A second, more serious bug found — NOT a hand-derived-arithmetic mistake, a genuine gap shared by all four
+DDL-recovery drivers (schema/transform/cast/conversion):** `TestConversionDDLRecoveryReplaysCreate` failed with
+`decode create-conversion at lsn ...: wal: create-conversion payload truncated (need 4129 bytes)` on a data
+directory that had *never had a conversion appended to it* — the failure happened on the bare `Init`+`Open`
+before the test's own `WAL.Append` call. Root cause: `internal/initdb.Init` writes a real
+`XLOG_CHECKPOINT_SHUTDOWN` record (a PG-native/canonical XLogRecord, `Record.XLog != nil`, classified with
+`Rmid=RmgrXLog, Info=0x00`) whose `MainData` is raw `CheckPoint` struct bytes with **no goopg kind-byte tag at
+all** — the struct's first field is an 8-byte `redo` `XLogRecPtr`. In this run its low byte happened to be `0x28`
+(40 decimal) — exactly `RecordKindCreateConversion`'s newly-assigned value — so the naive
+`switch rec.Payload[0] { case wal.RecordKindCreateConversion: ... }` scan matched a checkpoint record and tried
+to `DecodeCreateConversion` its garbage bytes. This is the *exact* collision class `wal.ApplyRecord` already
+guards against for the physical-replay path (see the `M0106-0011` comment at `internal/wal/recovery.go` ~2626 —
+"an 88-byte XLOG_CHECKPOINT_SHUTDOWN whose redo-LSN low byte happened to collide with a goopg native
+RecordKind") — but the four catalog-only DDL-recovery scanners (`schema_ddl_recovery.go`, `transform_ddl_recovery.go`,
+`cast_ddl_recovery.go`, and this loop's new `conversion_ddl_recovery.go`) never had the guard, because none of
+their kind bytes (34–39) had coincidentally collided with a checkpoint's raw bytes *in the specific test
+scenarios exercised so far* — this was latent, not new, and would eventually have bitten schema/transform/cast
+too as WAL content grew and checkpoint redo-LSNs cycled through more byte values.
+
+**Fix, applied to all four drivers in this loop (sibling paths must change together):** added an exported helper,
+`wal.IsGoopgNativeRecord(r wal.Record) bool` (`internal/wal/recovery.go`, next to `ApplyRecord`), that returns
+`true` for records with `r.XLog == nil` (legacy/non-canonical framing — always trustworthy) and for canonical
+records that classify as `RmgrXLog` + the goopg-native sentinel info byte (`0xF0`); it returns `false` for any
+other canonical record (checkpoints and any other PG-native operation), signalling the byte-collision hazard.
+Each of the four recovery loops now guards with
+`if len(rec.Payload) == 0 || !wal.IsGoopgNativeRecord(rec) { continue }` before switching on `rec.Payload[0]`.
+Verified the fix is load-bearing, not defensive-only: temporarily applying just the schema-recovery-style
+`rec.XLog != nil` skip (a stricter, wrong first attempt) made `TestCastDDLRecoveryReplaysCreate`,
+`TestConversionDDLRecoveryReplaysCreate`, `TestSchemaDDLRecoveryReplaysCreate`, and
+`TestTransformDDLRecoveryReplaysCreate` all fail — because the *legitimate* CREATE records the tests append are
+themselves canonical (`XLog != nil`, classified `RmgrXLog`+`0xF0`) in this WAL format; only the Rmid/Info check
+correctly distinguishes "goopg-native record wrapped in canonical framing" from "real PG-native record". The
+corresponding `...ReplaysDropAfterCreate` tests passed even with that wrong first attempt, which is itself a
+finding: a drop-after-create-only assertion can't distinguish "replay correctly cancelled the two records" from
+"replay silently skipped everything" — both leave the registry empty. `TestConversionDDLRecoveryReplaysCreate`
+(a create-only positive assertion) is what actually caught the bug; kept in the suite for exactly this reason.
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateConversionRoundTrip`/`...DropConversionRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal/conversion_ddl_test.go`),
+`TestConversionDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/
+`TestReplayConversionDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open
+cycle), plus a full re-run of the sibling `TestSchemaDDLRecoveryReplaysCreate`/`TestCastDDLRecoveryReplaysCreate`/
+`TestTransformDDLRecoveryReplaysCreate` families to confirm the `IsGoopgNativeRecord` fix didn't regress them.
+(2) gates: `go build ./...` clean; `go vet ./...` clean; `-race -count=1` on
+`internal/wal`+`internal/catalog`+`internal/initdb` PASS; `TestE2E_PhysicalReplication`/
+`TestE2E_PhysicalReplicationSync` PASS (WAL/MVCC practice card's recovery-path gate); TPC-H spotcheck Q12/Q13
+PASS; pgbench smoke via the pre-commit hook.
+
+**Deliberately still open (ledger row, next in the template queue):** the collation registry still needs the
+identical treatment (bytes 42/43 next free). The DROP CAST type-name-synonym key gap noted in the CAST
+subsection above is still open too, independent of this loop.
+
+### CREATE/DROP COLLATION restart persistence (WAL replay) — fourth and last object of the slice-389 backlog to close, plus a genuine DROP COLLATION functionality gap fixed along the way
+
+Repeats the CREATE CAST/TRANSFORM/CONVERSION template for `catalog.UserCollation`, the last item in the
+deliberately-deferred restart-persistence list (slice-389's deferral (c)/(d)). Before this loop the codebase had
+**no `DropCollation` catalog method and no `case "collation"` in `execDropCompat`'s dispatch at all** — `DROP
+COLLATION <name>` on an existing user collation unconditionally fell through to the generic "does not exist"
+error path (`internal/executor/operators_ddl.go`'s `execDropCompat`, the fallthrough at the end of the function),
+and `DROP COLLATION IF EXISTS <name>` unconditionally emitted a "does not exist, skipping" notice without ever
+touching the registry. This was a real functional gap (slice-389's deferral (d): "`DROP COLLATION` ... not
+handled"), not just a restart-persistence gap — so this loop implements DROP COLLATION itself, then adds restart
+persistence for both CREATE and DROP in the same pass (the pattern was going to need a dedicated
+`objType == "collation"` block regardless, so there was no smaller bounded slice available).
+
+**`UserCollation` is schema-scoped** (like Conversion, unlike Cast/Transform), so replay of its WAL records must
+run *after* `replaySchemaDDLRecords` has repopulated the schema-name→OID map — `replayCollationDDLRecords` is
+wired last in the CREATE/DROP DDL-replay sequence in `internal/initdb/open.go`, immediately after
+`replayConversionDDLRecords`.
+
+**New catalog methods** (`internal/catalog/catalog.go`, next to `CreateCollation`): `DropCollation(name, schema
+string) bool` (removes the matching entry from `userCollations`, mirrors `DropConversion` exactly — including the
+"unknown schema resolves to public" fallback, so a built-in collation, which is never registered in
+`userCollations`, always reports not-found); `CreateCollationDuringRecovery`/`DropCollationDuringRecovery`, the
+idempotent OID-carrying counterparts used by the WAL-replay driver (mirror
+`CreateConversionDuringRecovery`/`DropConversionDuringRecovery`). Also added `ListUserCollations()` (mirrors
+`ListUserConversions`) since no accessor for the registry snapshot existed yet — needed by the new tests.
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateCollation` (42) and
+`RecordKindDropCollation` (43), the next free bytes after `RecordKindDropConversion` (41), confirming the byte
+budget the CONVERSION subsection reserved. `EncodeCreateCollation`/`DecodeCreateCollation` carry `oid | ownerOID
+| encoding(int32) | provider(1) | deterministicFlag(1) | name | schema | collate | ctype | locale | rules` — a
+15-byte fixed header (vs. Conversion's 22) followed by *six* length-prefixed strings (vs. Conversion's four),
+reflecting `UserCollation`'s libc/ICU/builtin provider fields (`collate`/`ctype` for libc, `locale` for
+builtin/icu, `rules` for ICU tailoring) all needing to round-trip regardless of which provider is in play — the
+provider byte alone doesn't tell the decoder which strings are populated, so all six always get carried (blank
+strings encode as zero-length). `EncodeDropCollation`/`DecodeDropCollation` carry just the (name, schema) key,
+identical in shape to `EncodeDropConversion`. This loop's `EncodeCreateCollation` used a small string-array loop
+(`strs := []string{name, schema, collate, ctype, locale, rules}`) instead of six hand-unrolled `PutUint16`+`copy`
+blocks — a direct response to the fact that every prior object in this series (Cast, Transform, Conversion) hit a
+hand-derived fixed-header/string-count byte-offset bug; looping over the string slice for the length-sum and the
+write pass eliminates the arithmetic by construction. The round-trip test passed on the first run (no byte bug
+this time — the loop-based encoder is the reason).
+
+**New recovery driver** (`internal/initdb/collation_ddl_recovery.go`, new file mirroring
+`conversion_ddl_recovery.go`): `replayCollationDDLRecords` walks the WAL after physical replay completes (guarded
+by `wal.IsGoopgNativeRecord`, same M0106-0011 collision guard the other three drivers already carry — no
+regression this time since the guard was written generically), decodes each CREATE/DROP COLLATION record, and
+applies it via the new recovery hooks.
+
+**Executor wiring** (`internal/executor/operators_ddl.go`): `execCreateCollation` now calls
+`o.ctx.WAL.Append(wal.EncodeCreateCollation(...))` right after a successful `im.CreateCollation(...)`, gated on
+`uc.OID != 0` — `CreateCollation`'s `ifNotExists`-hit-existing path returns the existing OID without mutating the
+caller's `uc.OID`, so this check skips the WAL write for a no-op `IF NOT EXISTS` hit (Cast/Transform/Conversion
+don't need this gate since none of their `Create*` methods have an `ifNotExists` parameter). A new dedicated
+`if objType == "collation"` block in `execDropCompat`, placed before the generic IF-EXISTS fallthrough (same
+placement as the `"transform"` block) so `IF EXISTS` correctly probes the registry instead of unconditionally
+no-oping, loops over `s.Names` (unlike Cast/Transform, which take single-value fields, Collation's
+`DropCompatStmt.Names` is a real list, so `DROP COLLATION a, b;` drops both), calls `im.DropCollation(...)`, and
+on success appends `wal.EncodeDropCollation(...)`.
+
+**Verified two ways:** (1) unit tests — `TestEncodeDecodeCreateCollationRoundTrip`/`...DropCollationRoundTrip`/
+`...RejectsWrongKind`/`...RejectsTruncatedPayload` (`internal/wal/collation_ddl_test.go`),
+`TestCollationDDLRecoveryReplaysCreate`/`...ReplaysDropAfterCreate`/
+`TestReplayCollationDDLRecordsHandlesMissingWalDir` (`internal/initdb`, full Init→Open→WAL.Append→Close→re-Open
+cycle), `TestDropCollation` (`internal/catalog/create_collation_test.go` — pins the actual functionality fix:
+drop-then-relookup via `CollationAttrsByName`, cross-schema non-match with a *registered* second schema, a
+built-in collation never matching). (2) gates: `go build ./...` clean; `go vet` clean on touched packages;
+`-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb` PASS (full recovery suite);
+`TestE2E_PhysicalReplication`/`TestE2E_PhysicalReplicationSync` PASS (WAL/MVCC practice card's recovery-path
+gate); TPC-H spotcheck Q12=2/Q13=33 PASS; `internal/executor` full package PASS; pgbench smoke runs via the
+pre-commit hook on commit.
+
+**Closes the slice-389 four-object restart-persistence backlog** (Transform → Cast → Conversion → Collation).
+Deliberately still open, independent of this backlog: the DROP CAST type-name-synonym key gap (CAST subsection
+above), and collation ordering/`ALTER COLLATION` (slice-389's deferrals (a)/(b) — goopg still does not use a
+collation for actual string ordering; out of scope, a separate large subsystem).
+
+### DROP CAST type-name-synonym key fix (closes the loop #48 deferral)
+
+`RegisterCast`/`DropCast`/`CastByTypes` (`internal/catalog/catalog.go`) keyed the cast registry on
+`lower(source)\x00lower(target)` — the raw parsed type spelling. Real PG's `pg_cast.castsource`/`casttarget` are
+type OIDs, so `CREATE CAST (float4 AS text) ...` and `DROP CAST (real AS text) ...` name the identical cast
+("real" is a built-in synonym for "float4"), but the raw-spelling key treated them as two different entries — a
+`DROP CAST` using a different-but-equivalent spelling than its `CREATE CAST` always failed with "does not
+exist". Fixed by a new `castKey`/`castKeyTypeName` pair: each side of the key resolves through
+`TypeNameToOID` so `real`/`float4`, `integer`/`int4`, `double precision`/`float8`, etc. collapse to the same
+key, matching how `pg_cast`'s virtual view already renders `castsource`/`casttarget` via the same function.
+
+**A second, previously-latent bug surfaced while fixing this and was fixed in the same change:**
+`TypeNameToOID`'s documented behavior is to fall back to `OIDText` for any name it doesn't recognize as a
+builtin synonym (its "safe fallback" for callers like the codec that must always produce *some* OID). Naively
+keying the cast registry on `TypeNameToOID`'s raw result would have collapsed every distinct user-defined type
+(domain, enum, composite — none of which are in `TypeNameToOID`'s builtin switch) into the same `OIDText`
+bucket, so two unrelated casts each touching a different unknown type (e.g. `CREATE CAST (my_enum AS int4)` and
+`CREATE CAST (my_domain AS int4)`) would silently overwrite each other in the map. `castKeyTypeName` detects
+this case (result is `OIDText` but the input wasn't literally `"text"`) and falls back to the lowercased type
+name itself for that half of the key, preserving per-type distinctness for anything `TypeNameToOID` doesn't
+actually know how to resolve.
+
+Verified by `internal/catalog/cast_synonym_test.go`: `TestDropCastResolvesTypeNameSynonyms` /
+`TestDropCastResolvesMultiWordSynonyms` pin the original synonym-resolution bug fix;
+`TestRegisterCastIdempotentAcrossSynonyms` pins that re-registering under a synonym spelling refreshes the
+existing OID rather than duplicating the entry; `TestCastByTypesDistinctForUnrelatedTypes` /
+`TestCastByTypesDistinctForUnknownUserDefinedTypes` pin that unrelated builtin-type pairs and unrelated
+unknown/user-defined-type pairs each stay distinct registry entries. Gates: `go build`/`go vet` clean;
+`-race -count=1` on `internal/wal`+`internal/catalog`+`internal/initdb`. This is a catalog-only fix — no WAL
+format change, so no restart-persistence interaction with the four-object backlog above.
+
+**COMMENT ON CAST synonym re-verification (loop #52, test-only):** the fix above left one recorded gap —
+`CommentOnStmt`'s CAST comment handler (`execCompatNoop` `case "cast"`, `operators_ddl.go` ~13756) calls the
+same `catalog.CastByTypes`, so it should inherit the synonym fix automatically, but was not independently
+re-verified. New `internal/executor/comment_on_cast_synonym_test.go`
+(`TestCommentOnCastResolvesTypeNameSynonym`) confirms this directly: `CREATE CAST (float4 AS text) WITHOUT
+FUNCTION` followed by `COMMENT ON CAST (real AS text) IS '...'` stores the description under `pg_cast`
+(classoid 2605) keyed on the same OID `CastByTypes("float4", "text")` returns. No production code changed —
+this closes the re-verification gap as a pure test addition.
+
+### Slice 405 — **`CREATE AGGREGATE` round-trip** (new object family; `pg_aggregate` made SQL-queryable for the first time)
+
+Ports the upstream `'CREATE AGGREGATE dump_test.newavg'` fixture
+(`postgres/src/bin/pg_dump/t/002_pg_dump.pl`, public-schema-adapted like every
+other fixture in this test): a two-clause aggregate (`SFUNC =
+int4_avg_accum, BASETYPE = int4, STYPE = _int8, FINALFUNC = int8_avg,
+FINALFUNC_MODIFY = shareable, INITCOND1 = '{0,0}'`) must dump byte-identical
+to real PostgreSQL 18.3's `dumpAgg`.
+
+**Landed:**
+
+- `parser.CreateAggregateStmt.FinalFuncModify` — the grammar already parsed
+  every other `CREATE AGGREGATE` option but silently discarded
+  `FINALFUNC_MODIFY` (`parseAggregateOptions`'s ignore-list). Now captured
+  and threaded through `catalog.UserAggregate.FinalFuncModify`.
+- `catalog.UserAggregate.OID` — aggregates previously had no identity OID at
+  all; `RegisterUserAggregate` now allocates one via `allocOIDLocked` (same
+  counter every other user object uses) on first registration.
+- `catalog.ListUserAggregates()` — a new `Catalog` interface method (mirrors
+  `ListUserCollations`) so both the executor (heap write) and initdb (Virtual
+  view) can enumerate the registry.
+- **`pg_proc` now emits a `prokind='a'` row per aggregate**
+  (`internal/initdb/pg_proc_view.go`'s `registerPgProcView`, appended after
+  the existing `catalog.BuiltinProcs()` loop so no existing row-index
+  assumption shifts). `prorettype` follows PG's `DefineAggregate`: the
+  finalfunc's return type when one is given, else the state type.
+- **`pg_aggregate` is now a SQL-queryable relation at all** — this was the
+  real, previously-hidden blocker (see "Discovery" below).
+  `internal/initdb/pg_aggregate_view.go`'s `registerPgAggregateView`
+  registers it `Virtual: true` (mirrors `pg_index`'s existing
+  heap-write-for-standby-fidelity-plus-Virtual-for-SQL split), combining the
+  161 built-in (BKI) rows (`pgAggregateInitialEntries`, already used for the
+  initdb heap bootstrap) with every `cat.ListUserAggregates()` entry.
+- `internal/analyzer/analyzer.go`'s `isComparable` — a second, previously-hidden
+  blocker (see "Discovery" below): the whole `oid`↔"reg*" family (regproc,
+  regclass, regtype, ...) is binary-coercible in real PostgreSQL (same on-disk
+  representation, different I/O function only), so `a.aggfnoid = p.oid`
+  type-checks without a cast — but goopg's `isComparable` only recognized
+  bare `oid`, not the "reg*" aliases. New `isOIDFamily` helper covers the
+  whole family for both the oid↔numeric and oid↔text-backed comparability
+  branches.
+- `executor.routineOrAggregateArgs` (`internal/executor/expr.go`) —
+  `pg_get_function_arguments`/`pg_get_function_identity_arguments` only ever
+  consulted `Routines().LookupByOID`; an aggregate isn't a `catalog.Routine`,
+  so `pg_get_function_arguments(<aggregate oid>)` silently returned `""`
+  (dumpAgg's `newavg()` empty-signature symptom below). The fallback
+  synthesizes a throwaway `*catalog.Routine{ArgTypes: ...}` from
+  `UserAggregate.ArgTypes` — sufficient for the shared `buildFunctionArguments`
+  renderer to produce a bare unnamed-parameter list (`(integer)`), matching a
+  simple aggregate's signature.
+- Two curated builtins added to `catalog.builtinProcsByName`:
+  `int4_avg_accum` (OID 1963) / `int8_avg` (OID 1964) — the exact
+  transition/final functions PG's own `avg(int4)` uses internally, and the
+  ones the upstream fixture references by name.
+- `executor.buildUserPGAggregateRow` / `pgAggregateColumnsPG18`
+  (`internal/executor/pg18_user_catalog_rows.go`) — a live `pg_aggregate`
+  heap-row write via the existing `writeHeapRowCanonical` +
+  `mirrorCatalogRelToPostgresDB` template (same shape as
+  `syncEnumTypeToCatalogHeap`), for PG18-standby byte-level fidelity — kept
+  independent of the Virtual SQL-read path above (same split as `pg_index`).
+
+**Discovery (why this was a bigger fix than "wire the parser field"):**
+Two pre-existing, previously-unexercised gaps blocked this from the very
+first manual test, neither specific to aggregates:
+
+1. **`pg_aggregate` was never SQL-queryable at all**, even for the 161
+   built-in aggregates goopg has shipped since M0106-0010 — `SELECT * FROM
+   pg_aggregate` raised `relation "pg_aggregate" does not exist` on a
+   completely stock cluster. The heap file (`bootstrapPgAggregateTuples`,
+   `base/{1,5}/2600`) has existed since M0106-0010 for PG18-standby byte
+   fidelity, but — unlike `pg_type`/`pg_attribute`, which really are
+   heap-scanned by goopg's own SQL engine — nothing ever registered a
+   `catalog.Table` for it, heap-backed or Virtual. `pg_dump`'s own `dumpAgg`
+   prepared query (`FROM pg_aggregate a, pg_proc p WHERE a.aggfnoid =
+   p.oid`) was therefore unreachable for every aggregate, built-in or
+   user-defined, on every prior goopg release.
+2. **`regproc`/`oid` cross-type comparison was unimplemented** — real
+   PostgreSQL's `pg_aggregate.aggfnoid = pg_proc.oid` (dumpAgg's literal
+   join predicate) relies on `regproc` and `oid` sharing an operator family;
+   goopg's analyzer rejected it outright (`42804 operator = has incompatible
+   operand types "regproc" and "oid"`). This wasn't specific to aggregates
+   either — any future regproc↔oid join (e.g. a hypothetical
+   `pg_conversion.conproc = pg_proc.oid`) would have hit the same wall.
+
+Both are now general-purpose fixes, not aggregate-specific workarounds.
+
+**A third, aggregate-specific rendering gap:** `pg_aggregate.aggtransfn` /
+`aggfinalfn` / `aggcombinefn` are typed `regproc`, and `dumpAgg` reads their
+*text* value directly (no `::regtype`-style cast) expecting the function
+*name* — but goopg has no generic OID→name resolution at plain-column-output
+time (only `::regproc`/`::regtype` *cast expressions* resolve names, and
+`::regproc` on an OID input is currently a passthrough, not `regprocout`).
+Followed the pre-existing `pg_conversion.conproc` precedent instead of
+building a general regproc-output resolver: the Virtual row stores the
+already-known **name text** directly (`aggFuncNameOrDash`, `"-"` for unset —
+matching `regprocout(InvalidOid)`), not a resolved-from-OID number. The
+`aggminvtransfn`/`aggmtransfn`/`aggmfinalfn`/`aggserialfn`/`aggdeserialfn`
+moving-aggregate columns (not modeled — goopg parses but discards
+MSFUNC/MINVFUNC/...) render `"-"` for the same reason.
+
+**A fourth gap, `text`-column NULL-vs-empty-string:** `agginitval`/
+`aggminitval` are `text`, the exact case `catalog.VirtualNull`'s doc comment
+already flags as needing the sentinel (a bare `""` is a legitimate non-NULL
+`text` value elsewhere). Missed on the first pass — the fixture briefly
+dumped a spurious `MINITCOND = ''` clause (real PG omits the whole
+`MINITCOND` clause when NULL) until `nullableAggText` routed through
+`catalog.VirtualNull` instead of a bare `""`.
+
+Verified against a real running server + real `pg_dump` 18.3, not just the
+byte-diff assertion: `SELECT newavg(a) FROM t` (a functioning runtime
+aggregate, not just dump text) returns the correct average. Tests: the new
+slice-405 fixture/assertion in `TestPort_PgDumpConnectionSetup`. Gates: `go
+build ./...` clean; `go vet` analyzer/catalog/executor/initdb/parser/testport
+clean; `internal/analyzer`+`internal/catalog`+`internal/executor`+
+`internal/initdb`+`internal/parser`+`internal/planner`+`internal/server`
+suites PASS; full `TestPort_PgDumpConnectionSetup` PASS; TPC-H spot-check
+Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook.
+
+**Deferred** (ledger row appended):
+
+- `pronamespace` hardcoded to `public` (2200) — `catalog.UserAggregate` has
+  no `Schema` field, so a schema-qualified `CREATE AGGREGATE
+  otherschema.foo(...)` silently registers as if it were `public.foo`. Not
+  exercised by the upstream fixture (which this test always public-schema-adapts).
+- The 161 **built-in** BKI rows' `aggtransfn`/`aggfinalfn`/... still render
+  raw numeric OIDs (not names) when queried directly — irrelevant to
+  `pg_dump` (which never dumps pinned/built-in objects) but a real gap for
+  someone directly querying `pg_aggregate` and expecting PG-shaped
+  `regprocout` text for a built-in aggregate.
+- **Restart persistence**: `CREATE AGGREGATE` is not WAL-logged.
+  `syncAggregateToCatalogHeap` writes a real heap row (useful for a PG18
+  standby reading raw bytes), but goopg's own `catalog.userAggregates`
+  in-memory registry — which both `pg_proc`'s Virtual view and the aggregate's
+  actual runtime evaluation depend on — is not rehydrated from that heap row
+  on restart, so a user-defined aggregate is lost across a goopg restart
+  (same "CREATE X round-trip lands first, restart persistence follows
+  separately" split already used for TRANSFORM/CAST/CONVERSION/COLLATION).
+
+### Slice 405 follow-up — CREATE/ALTER AGGREGATE restart persistence
+
+Closes the "restart persistence" deferral from the Slice 405 row above.
+`CREATE AGGREGATE` and `ALTER AGGREGATE ... RENAME TO` are now WAL-logged,
+mirroring the CREATE/DROP/ALTER COLLATION template (`docs/design/0119-0004-alter-collation.md`)
+exactly:
+
+- New `wal.RecordKindCreateAggregate` (46) / `wal.RecordKindAlterAggregateRename`
+  (47), with `Encode`/`DecodeCreateAggregate` and
+  `Encode`/`DecodeAlterAggregateRename` (`internal/wal/recovery.go`). Both are
+  no-op in the physical redo path (`applyRecord` returns `(false, nil)`) —
+  goopg has no per-aggregate on-disk file namespace, same rationale as every
+  other DU-002 catalog-only object family.
+- `catalog.InMemory.RegisterUserAggregateDuringRecovery` /
+  `RenameUserAggregateDuringRecovery` — the idempotent, OID-preserving
+  recovery counterparts to `RegisterUserAggregate`/`RenameUserAggregate`
+  (mirrors `RegisterCastDuringRecovery`); `RegisterUserAggregateDuringRecovery`
+  advances `nextOID` past the recovered OID so live allocations after restart
+  never collide with it.
+- New `internal/initdb/aggregate_ddl_recovery.go`
+  (`replayAggregateDDLRecords`), wired into `Open` right after
+  `replayCollationDDLRecords` (`internal/initdb/open.go`). Unlike
+  collation/conversion, a user aggregate has no `Schema` field yet (resume
+  point (a) above), so this replay does not depend on schema replay having
+  run first — order relative to `replaySchemaDDLRecords` does not matter.
+- `execCreateAggregate` / `execAlterAggregateRename`
+  (`internal/executor/operators_ddl.go`) each append the corresponding WAL
+  record right after the in-memory catalog mutation.
+
+`ALTER AGGREGATE ... OWNER TO` had no equivalent at the time this section was
+written — unlike a collation, goopg's aggregate DDL surface had no OWNER TO
+arm at all (only RENAME TO, M0097-0035). Closed below (loop #58).
+
+#### DROP AGGREGATE wiring + restart persistence (loop #57)
+
+`DROP AGGREGATE` was discovered by the follow-up above to be completely
+non-functional: `internal/executor/operators_ddl.go`'s "DROP AGGREGATE" arm
+only validated the argument-type list and always fell through to the
+"does not exist" error path, never touching
+`catalog.InMemory.userAggregates` — a pre-existing M0097-regress-era gap.
+This loop wires it end-to-end, mirroring the CREATE/DROP COLLATION template:
+
+- New `catalog.InMemory.DropUserAggregate` (mirrors `DropCollation`) and its
+  discard-result recovery counterpart `DropUserAggregateDuringRecovery`
+  (`internal/catalog/catalog.go`).
+- `execDropCompat`'s `objType == "aggregate"` arm
+  (`internal/executor/operators_ddl.go`) now calls `DropUserAggregate` by
+  name before falling through to the existing "does not exist"/schema-check
+  logic; on success it WAL-logs and returns. goopg's aggregate registry has
+  no overload resolution (keyed by name only, like
+  `RenameUserAggregate`/`LookupUserAggregateByName`), so a name match drops
+  regardless of the DROP statement's declared `ArgTypes` — consistent with
+  every other aggregate DDL arm's name-only resolution.
+- New `wal.RecordKindDropAggregate` (48) with `Encode`/`DecodeDropAggregate`
+  (`internal/wal/recovery.go`), same no-op physical-redo path as
+  `RecordKindCreateAggregate`.
+- `internal/initdb/aggregate_ddl_recovery.go`'s `replayAggregateDDLRecords`
+  gained a `RecordKindDropAggregate` case calling
+  `DropUserAggregateDuringRecovery`.
+
+Tests: `internal/wal/aggregate_ddl_test.go`
+(`TestEncodeDecodeDropAggregateRoundTrip`,
+`TestDecodeDropAggregateRejectsTruncatedPayload`),
+`internal/initdb/aggregate_ddl_recovery_test.go`
+(`TestAggregateDDLRecoveryReplaysDropAfterCreate` — full second-`Open`
+CREATE-then-DROP replay proof), `internal/executor/storage_ddl_test.go`
+(`TestDDLDropAggregateRemovesUserAggregate` — DROP actually removes the
+aggregate, a second DROP without `IF EXISTS` now correctly raises `42883`,
+and `DROP ... IF EXISTS` on a missing aggregate is a no-op).
+
+Tests (restart-persistence slice, unchanged):
+`internal/wal/aggregate_ddl_test.go` (Encode/Decode round-trip +
+truncated-payload guard) and
+`internal/initdb/aggregate_ddl_recovery_test.go` (`TestAggregateDDLRecoveryReplaysCreate`,
+`TestAggregateDDLRecoveryReplaysRenameAfterCreate`,
+`TestReplayAggregateDDLRecordsHandlesMissingWalDir`) — full second-`Open`
+WAL-replay proof, mirroring `collation_ddl_recovery_test.go`. Gates: `go build
+./...` clean; `go vet` wal/catalog/initdb/executor clean; `internal/wal`
+(including `-race`) + `internal/catalog` + `internal/initdb` +
+`internal/executor` suites PASS; `TestPort_PgDumpConnectionSetup` PASS.
+
+#### `ALTER AGGREGATE ... OWNER TO` wiring + restart persistence (loop #58)
+
+Closes the loop #57 note above ("has no equivalent yet"). Previously `ALTER
+AGGREGATE name(args) OWNER TO ...` fell into `parser.ddl.go`'s "other ALTER
+AGGREGATE forms: consume as no-op" branch and parsed to a bare
+`*AlterTableStmt{}` — the target aggregate and new owner were silently
+discarded, mirroring the pre-fix DROP AGGREGATE gap from loop #57's opening
+note (an M0097-regress-era omission, not new breakage). Wired end-to-end,
+mirroring `ALTER COLLATION ... OWNER TO` (`internal/executor/operators_ddl.go`
+`execAlterCollation`'s `"owner"` case):
+
+- New `catalog.UserAggregate.Owner uint32` field (`internal/catalog/catalog.go`)
+  plus an `OwnerOrDefault()` helper that treats the zero value as "unset,
+  defaults to the bootstrap superuser (OID 10)" — every aggregate registered
+  before this loop (including WAL-replayed ones from an older record) reads
+  as owned by the bootstrap superuser without a migration step.
+- `catalog.InMemory.SetUserAggregateOwner(name string, ownerOID uint32) bool`
+  (name-only match, mirrors `RenameUserAggregate`/`SetCollationOwner`) plus
+  its discard-result recovery counterpart
+  `SetUserAggregateOwnerDuringRecovery`. Neither is added to the `Catalog`
+  interface — same precedent as `SetCollationOwner`, which is also only
+  reached via a `*catalog.InMemory` type assertion in the executor.
+- New AST node `parser.AlterAggregateOwnerStmt{Name, NewOwner}`
+  (`internal/parser/ast.go`); the `ALTER AGGREGATE` branch in
+  `parser/ddl.go` gained an `OWNER TO` case ahead of the no-op fallback,
+  resolving `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` to the
+  `"current_user"` sentinel exactly like the `ALTER COLLATION ... OWNER TO`
+  branch already does.
+- `executor.execAlterAggregateOwner` (`internal/executor/operators_ddl.go`):
+  resolves the new owner via `catalog.InMemory.RoleOID` (raising `42704` for
+  an unknown role), calls `SetUserAggregateOwner` (raising `42883` for an
+  unknown aggregate), and WAL-logs on success. Wired into the executor's DDL
+  dispatch switch and the planner's DDL passthrough list
+  (`internal/planner/planner.go`), same as every other ALTER AGGREGATE form.
+- `internal/initdb/pg_proc_view.go`'s aggregate `prokind='a'` row now renders
+  `proowner` via `agg.OwnerOrDefault()` instead of the hardcoded `"10"`
+  literal, so `ALTER AGGREGATE ... OWNER TO` is visible to any direct
+  `pg_proc` query (and, transitively, a future `pg_dump` owner-emission path)
+  — the same pg_proc row loop #55 originally introduced with a hardcoded
+  owner.
+- New `wal.RecordKindAlterAggregateOwner` (49) with
+  `Encode`/`DecodeAlterAggregateOwner` (`internal/wal/recovery.go`), same
+  no-op physical-redo path as `RecordKindCreateAggregate`. Unlike
+  `RecordKindAlterCollationOwner`, this format omits the schema component —
+  aggregates still have no `Schema` field (slice 405 resume point (a),
+  unchanged).
+- `internal/initdb/aggregate_ddl_recovery.go`'s `replayAggregateDDLRecords`
+  gained a `RecordKindAlterAggregateOwner` case calling
+  `SetUserAggregateOwnerDuringRecovery`.
+- `internal/server/dispatch.go`'s `ddlTag` gained `"CREATE AGGREGATE"` and
+  `"ALTER AGGREGATE"` cases (previously every aggregate DDL statement fell
+  through to the generic `"OK"` tag — a pre-existing, unrelated gap fixed
+  here since both new statement types needed a tag entry anyway).
+
+Tests: `internal/parser/alter_aggregate_owner_test.go`
+(`TestParseAlterAggregateOwner`, `TestParseAlterAggregateRenameStillWorks`),
+`internal/executor/storage_ddl_test.go` (`TestDDLAlterAggregateOwner` — owner
+change + 42704 unknown-role + 42883 unknown-aggregate paths),
+`internal/wal/aggregate_ddl_test.go`
+(`TestEncodeDecodeAlterAggregateOwnerRoundTrip`,
+`TestDecodeAlterAggregateOwnerRejectsTruncatedPayload`),
+`internal/initdb/aggregate_ddl_recovery_test.go`
+(`TestAggregateDDLRecoveryReplaysOwnerAfterCreate` — full second-`Open`
+CREATE-then-OWNER replay proof, OID preserved across the ownership change).
+Gates: `go build ./...` clean; `go vet`
+wal/catalog/executor/initdb/parser/planner/server clean; `go test -race`
+`internal/wal`+`internal/mvcc` clean; `internal/catalog`+`internal/executor`+
+`internal/initdb`+`internal/parser`+`internal/planner` suites PASS.
+
+Deferred (unchanged, carried forward from slice 405): `pronamespace`
+hardcoded to `public`; built-in aggregates' `aggtransfn`/`aggfinalfn`/...
+still render raw numeric OIDs (not names) on a direct query.
+
+### `ALTER AGGREGATE ... OWNER TO` pg_dump fixture (closes the loop #58 ledger row's resume point (a))
+
+The ownership wiring above landed with unit/WAL/recovery coverage only — no
+`TestPort_PgDumpConnectionSetup` fixture had exercised it through a real
+`pg_dump` 18.3 run. Added: `CREATE ROLE agg_owner_role` +
+`ALTER AGGREGATE public.newavg(int4) OWNER TO agg_owner_role` to the setup
+SQL (`internal/testport/pgdump_connsetup_test.go`), plus an assertion that
+`res.Stdout` contains `ALTER AGGREGATE public.newavg(integer) OWNER TO
+agg_owner_role;`.
+
+This required no new engine code — `execAlterAggregateOwner` (name-only
+match) and `pg_proc_view.go`'s `proowner` projection (`OwnerOrDefault()`)
+were already wired from loop #58. `pg_dump`'s `dumpAgg` (`pg_dump.c`) reads
+the aggregate's owner from `pg_proc.proowner` for its `aggfnoid`;
+`_getObjectDescription` (`pg_backup_archiver.c`) treats `AGGREGATE` like
+`FUNCTION`/`OPERATOR` — it builds the `ALTER ... OWNER TO` target by
+stripping the leading `"DROP "` off the object's `DROP` statement text
+(`DROP AGGREGATE public.newavg(integer);` → `AGGREGATE
+public.newavg(integer)`), then `_printTocEntry` emits `ALTER %s OWNER TO
+%s;`. The fixture is a pure verification step confirming the existing
+plumbing produces byte-identical output against the real binary, not just a
+unit-test double.
+
+Gates: `TestPort_PgDumpConnectionSetup` PASS (full suite, this fixture
+included); `go build ./...` clean; `go vet ./internal/testport/...` clean;
+`internal/catalog`+`internal/executor`+`internal/parser` suites PASS; TPC-H
+spotcheck Q12/Q13.
+
+Deferred (unchanged, carried forward): `pronamespace` hardcoded to
+`public`; built-in aggregates' `aggtransfn`/`aggfinalfn`/... still render
+raw numeric OIDs on a direct query.
+
+### `UserAggregate.NamespaceOID` — closes slice 405 resume point (a)
+
+`UserAggregate` had no schema field, so `pg_proc_view.go`'s aggregate row
+hardcoded `pronamespace = "2200"` (public) unconditionally — a `CREATE
+AGGREGATE` in any other schema would silently dump under the wrong (public)
+schema qualifier. Fixed by mirroring the `UserCollation.NamespaceOID`
+pattern end to end:
+
+- `catalog.UserAggregate` gains `NamespaceOID uint32` (0 = unresolved) plus
+  a `NamespaceOIDOrDefault()` accessor (falls back to
+  `catalog.PublicNamespaceOID`), mirroring `OwnerOrDefault()`.
+- `execCreateAggregate` (`internal/executor/operators_ddl.go`) resolves
+  `s.Name.Schema` (already captured by the parser's `parseObjectName`, just
+  never read for aggregates) via the existing `Catalog.SchemaOID` — with the
+  same "unknown → public" fallback `execCreateCollation` uses — and sets
+  `agg.NamespaceOID` before `RegisterUserAggregate`.
+- `pg_proc_view.go`'s aggregate row renders `agg.NamespaceOIDOrDefault()`
+  instead of the literal `"2200"`.
+- Restart persistence: `wal.EncodeCreateAggregate`/`DecodeCreateAggregate`
+  gained a `schema` string field (name, not OID — schema OIDs aren't stable
+  across a WAL-replay `RegisterSchemaDuringRecovery` re-allocation), carried
+  right after `name` like `EncodeCreateCollation` does. The recovery driver
+  (`internal/initdb/aggregate_ddl_recovery.go`)'s
+  `RegisterUserAggregateDuringRecovery(agg, schema)` resolves the schema
+  name to a `NamespaceOID` against the (already-restored)
+  `replaySchemaDDLRecords` output, mirroring
+  `CreateCollationDuringRecovery`. `replayAggregateDDLRecords` already ran
+  after `replaySchemaDDLRecords` in `open.go` (no reordering needed — a
+  latent ordering "free lunch" from how the two recovery passes were
+  originally sequenced).
+
+Only `CREATE AGGREGATE`'s schema is tracked — `RENAME`/`OWNER TO`/`DROP`
+still resolve by bare name only (aggregates live in a single global
+`map[string]*UserAggregate` keyed on lower-cased name, not
+schema-scoped like `userCollations`'s slice+`NamespaceOID` lookup). That is
+an existing, separate simplification (goopg has never supported two
+same-named aggregates in different schemas) and is out of scope here — this
+fix only corrects what schema a *single* aggregate reports as living in.
+
+New coverage: `TestEncodeDecodeCreateAggregateRoundTrip` extended with a
+non-public-schema case (`internal/wal/aggregate_ddl_test.go`);
+`TestAggregateDDLRecoveryReplaysNonPublicSchema`
+(`internal/initdb/aggregate_ddl_recovery_test.go`) — CREATE SCHEMA + CREATE
+AGGREGATE WAL records replay across a restart with `NamespaceOID` intact;
+new `TestPort_PgDumpConnectionSetup` fixture — `CREATE AGGREGATE
+s.schemedavg(...)` (schema `s`, created earlier in this fixture for the
+slice-54 cross-namespace guard) dumps as `CREATE AGGREGATE
+s.schemedavg(integer) (...)`, matching `dumpAgg`'s unconditional
+`fmtId(aggnamespace)` qualification (`pg_dump.c:15492` — aggregates are
+*always* schema-qualified in the dump, unlike some other object kinds that
+elide the schema when it matches `search_path`, so this bug could never
+hide behind a public-schema default in a real dump).
+
+Gates: `go build ./...` / `go vet ./...` clean; `TestPort_PgDumpConnectionSetup`
+PASS (full suite); `internal/wal`+`internal/initdb` targeted `Aggregate`
+subsets PASS; `-race -count=1` on `internal/wal`+`internal/mvcc`;
+`internal/catalog`+`internal/executor`+`internal/parser`+`internal/initdb`
+suites PASS; TPC-H spotcheck Q12/Q13; pgbench smoke (pre-commit hook).
+
+Still open under M0119-0004 (unchanged): built-in aggregates'
+`aggtransfn`/`aggfinalfn`/`aggcombinefn`/... still render raw numeric OIDs
+(not names) on a direct `pg_aggregate`/`pg_proc` query — needs a curated
+reverse OID→proc-name table (same shape as `catalog.LookupBuiltinProc`'s
+forward table); no current fixture reads these columns directly, so it
+remains untested and deferred.
+
+### Built-in `pg_aggregate` regproc columns render names — closes slice 405 resume point (b)
+
+`registerPgAggregateView`'s `VirtualRows` builder (`internal/initdb/pg_aggregate_view.go`)
+rendered the 161 BKI (built-in) aggregate rows' `aggtransfn`/`aggfinalfn`/
+`aggcombinefn`/`aggserialfn`/`aggdeserialfn`/`aggmtransfn`/`aggminvtransfn`/
+`aggmfinalfn` columns as bare `fmt.Sprintf("%d", oid)` numeric text. Real
+PostgreSQL always applies the `regproc` output function (`regprocout`) when
+rendering these columns for any direct query — e.g. `SELECT aggtransfn FROM
+pg_aggregate` returns `int8_avg_accum`, never `2746` — regardless of whether
+the query casts `::regproc` explicitly. User-defined aggregates (`CREATE
+AGGREGATE`) already got this right (`aggFuncNameOrDash` stores the resolved
+function name directly at row-build time, since goopg's `Routines()`
+registry only knows user-created routines by name); only the 161 curated
+BKI rows were left numeric, because resolving a *built-in* function OID to
+a name had no existing table to draw from — `catalog.LookupBuiltinProc`'s
+`builtinProcsByName` is hand-curated to just the handful of names fixtures
+reference directly (6 entries at the time), nowhere near the ~161 distinct
+support-function OIDs `pg_aggregate.dat` references.
+
+Rather than hand-curate a second table, the fix indexes the *already
+machine-generated* `pgProcAllEntries()` (all 3397 rows of PG18's real
+`pg_proc.dat`, `internal/initdb/pg_proc_seed_data.go`, generated by
+`cmd/gen-pg-proc-data`) by OID: `pgProcNameForOID(oid) (string, bool)`
+builds a `map[uint32]string` lazily (`sync.Once`) from `pgProcAllEntries()`
+the first time it's called and serves every subsequent lookup from the
+cached map. `aggBuiltinFuncName(oid uint32) string` wraps it with PG's
+`regprocout` InvalidOid convention (`0` → `"-"`, mirroring
+`aggFuncNameOrDash`'s existing `""` → `"-"` handling for user aggregates)
+and a defensive (never expected to trigger — both tables are generated from
+the same upstream `.dat` files) numeric-text fallback for an unresolved
+non-zero OID. `TypedVirtualCell` (`internal/planner/planner.go`) already
+falls a non-numeric `regproc`-typed cell through to its default
+`StringConst` branch when `strconv.ParseInt` fails, so no planner change was
+needed — this is exactly the same code path a user-aggregate's already-named
+cell exercises today. `aggfnoid` (the join key against `pg_proc.oid`) is
+deliberately left untouched/numeric.
+
+This closes the specific gap the loop #60 ledger row scoped out: goopg still
+has **no general OID→name resolution for `regproc`-typed columns at
+query-output time** (confirmed absent for `pg_type.typinput`/`typoutput`,
+`pg_operator.oprcode`/`oprrest`/`oprjoin`, `pg_am.amproc` — all still render
+raw OIDs on a direct SELECT; there is no `case "regproc"` in either
+`internal/server/dispatch.go`'s or `dispatch_extended.go`'s per-column-type
+text-formatting switch, unlike the existing `regclass` branch in
+`dispatch.go` which resolves OID→relation name). This fix intentionally
+does not build that general mechanism — it only closes the one BKI-row gap
+the prior ledger row scoped, using the same "store the resolved name as the
+virtual cell's string value" convention the codebase already uses for
+`pg_conversion.conproc` and user-defined `pg_aggregate` rows, rather than
+inventing generic regproc-output plumbing.
+
+New coverage (`internal/initdb/pg_aggregate_view_test.go`):
+`TestAggBuiltinFuncNameInvalidOidRendersDash`;
+`TestAggBuiltinFuncNameResolvesKnownOID` (avg(int8)'s transfn/finalfn/
+combinefn OIDs); `TestPgAggregateBKIRegprocColumnsAllResolveToNames` (every
+non-zero regproc OID across all 161 BKI rows resolves to a name, not a
+numeric-fallback string); `TestRegisterPgAggregateViewRendersBuiltinFuncNames`
+(end-to-end `registerPgAggregateView` + `VirtualRows()` on aggfnoid=2100).
+
+Gates: `go build ./...` / `go vet ./...` clean; new tests PASS;
+`TestPort_PgDumpConnectionSetup` full-suite PASS (unaffected — `dumpAgg`
+never reads these columns directly, per the prior ledger row); `internal/catalog`
++`internal/executor`+`internal/parser`+`internal/initdb` suites PASS; TPC-H
+spotcheck Q12/Q13; pgbench smoke (pre-commit hook).
+
+Still open under M0119-0004: the general `regproc`-typed column OID→name
+resolution gap above (`pg_type`/`pg_operator`/`pg_am` columns) is a
+separate, larger deferral — no fixture currently exercises it either, and
+fixing it generically would mean adding `regproc`/`regprocedure` cases to
+both `dispatch.go` and `dispatch_extended.go`'s text-formatting switches
+(the latter is already missing several cases `dispatch.go` has, e.g.
+`regclass`/`date`/`bytea` — a pre-existing simple-vs-extended-protocol
+divergence, not caused by this change) backed by a full builtin-proc
+OID→name index. `pgProcNameForOID` in this change is scoped to
+`internal/initdb` (where `pgProcAllEntries()` lives); promoting it to a
+general resolver would need it (or an equivalent) reachable from
+`internal/server`/`internal/executor`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

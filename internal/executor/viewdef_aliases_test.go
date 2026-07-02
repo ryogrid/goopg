@@ -49,6 +49,12 @@ func TestApplyViewColumnAliases(t *testing.T) {
 			want:    `SELECT id AS "Mixed Case" FROM t`,
 		},
 		{
+			name:    "reserved-keyword alias gets quoted",
+			rawDef:  "SELECT id FROM t",
+			aliases: []string{"select"},
+			want:    `SELECT id AS "select" FROM t`,
+		},
+		{
 			name:    "count mismatch bails to raw",
 			rawDef:  "SELECT id, name, qty FROM t",
 			aliases: []string{"a", "b"},

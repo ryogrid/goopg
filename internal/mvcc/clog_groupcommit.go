@@ -1,13 +1,6 @@
 package mvcc
 
 import (
-	"errors"
-	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"slices"
-
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -90,7 +83,7 @@ func (c *CLog) runLeader(self *clogGroupNode) error {
 		batch = append(batch, n)
 	}
 
-	err := c.applyGroupBatchLocked(batch)
+	err := c.applyGroupBatchLocked()
 
 	c.flushMu.Unlock()
 
@@ -104,140 +97,15 @@ func (c *CLog) runLeader(self *clogGroupNode) error {
 	return err
 }
 
-// applyGroupBatchLocked performs the two batched durable writes for a group.
-// The caller holds flushMu. M0117-0005.
-func (c *CLog) applyGroupBatchLocked(batch []*clogGroupNode) error {
-	// M0117-0006 Part B: when the buffer pool is the live store, each batch
-	// member's 2-bit lane was already written by setStatus (p.setStatus). One
-	// flushDirty writes every dirty resident page back with one fsync per touched
-	// segment — replacing BOTH the legacy flat-file page flush AND the
-	// bank→SLRU mirror, since the pool IS the SLRU store.
-	if p := c.pool.Load(); p != nil {
-		return p.flushDirty()
-	}
-	// 1. Flat file: replay only the dirty pages (the batch's setStatus calls
-	//    already recorded them via markFlatDirty).
-	if err := c.flushDirtyPagesLocked(); err != nil {
-		return err
-	}
-	// 2. SLRU mirror: one fsync per touched segment instead of one per XID.
-	return c.mirrorGroupToSLRULocked(batch)
-}
-
-// mirrorGroupToSLRULocked writes the 2-bit SLRU lanes for every XID in the
-// batch, grouping by pg_xact/ segment so each segment file is opened, OR-updated
-// and fsynced exactly once (vs the per-XID fsync of mirrorToSLRUUnlocked). OR
-// lane semantics mirror PG's TransactionIdSetStatusBit (a lane only ever
-// advances toward a terminal state). No-op when the SLRU mirror is disabled.
-// The caller holds flushMu.
-func (c *CLog) mirrorGroupToSLRULocked(batch []*clogGroupNode) error {
-	c.banksMu.RLock()
-	dir := c.slruDir
-	c.banksMu.RUnlock()
-	if dir == "" {
-		return nil
-	}
-
-	// Bucket the batch's lane bits by segment. PG's TransactionLogFetch
-	// short-circuits XIDs below FirstNormalTransactionID as committed without
-	// touching the SLRU; we mirror that so basebackup byte-equality holds.
-	type segUpdate struct {
-		segNo uint64
-		bits  map[int64]byte // byteOffset within segment → OR-mask
-	}
-	segs := make(map[uint64]*segUpdate)
-	for _, n := range batch {
-		if n.xid < FirstNormalTransactionID {
-			continue
-		}
-		var bits byte
-		switch n.status {
-		case TxnStatusCommitted:
-			bits = pgClogStatusCommitted
-		case TxnStatusAborted:
-			bits = pgClogStatusAborted
-		case TxnStatusSubCommitted:
-			bits = pgClogStatusSubCommitted
-		default:
-			continue
-		}
-		segNo := uint64(n.xid) / clogXactsPerSegment
-		xidInSeg := uint64(n.xid) % clogXactsPerSegment
-		pageInSeg := xidInSeg / clogXactsPerPage
-		xidInPage := xidInSeg % clogXactsPerPage
-		byteOffset := int64(pageInSeg)*int64(storage.BlockSize) + int64(xidInPage/clogXactsPerByte)
-		bShift := uint((xidInPage % clogXactsPerByte) * clogBitsPerXact)
-
-		su := segs[segNo]
-		if su == nil {
-			su = &segUpdate{segNo: segNo, bits: make(map[int64]byte)}
-			segs[segNo] = su
-		}
-		su.bits[byteOffset] |= bits << bShift
-	}
-	if len(segs) == 0 {
-		return nil
-	}
-
-	// Apply segments in ascending order for deterministic I/O.
-	order := make([]uint64, 0, len(segs))
-	for s := range segs {
-		order = append(order, s)
-	}
-	slices.Sort(order)
-
-	for _, segNo := range order {
-		su := segs[segNo]
-		if err := c.applySegmentLanesLocked(dir, su.segNo, su.bits); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// applySegmentLanesLocked opens one pg_xact/ segment file, ORs the given
-// byteOffset→mask updates into it (extending in BLCKSZ-page units so a reader
-// always sees complete pages), and fsyncs once. Caller holds flushMu.
-func (c *CLog) applySegmentLanesLocked(dir string, segNo uint64, masks map[int64]byte) error {
-	if len(masks) == 0 {
-		return nil
-	}
-	// Highest byte offset we touch determines the minimum page-aligned size.
-	var maxOff int64 = -1
-	for off := range masks {
-		if off > maxOff {
-			maxOff = off
-		}
-	}
-	maxPage := maxOff / int64(storage.BlockSize)
-	minSize := (maxPage + 1) * int64(storage.BlockSize)
-
-	segPath := filepath.Join(dir, fmt.Sprintf("%04X", segNo))
-	f, err := os.OpenFile(segPath, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		return fmt.Errorf("clog slru: open %q: %w", segPath, err)
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		return fmt.Errorf("clog slru: stat %q: %w", segPath, err)
-	}
-	bufSize := minSize
-	if fi.Size() > bufSize {
-		bufSize = fi.Size()
-	}
-	buf := make([]byte, bufSize)
-	if fi.Size() > 0 {
-		if _, err := f.ReadAt(buf[:fi.Size()], 0); err != nil && !errors.Is(err, io.EOF) {
-			return fmt.Errorf("clog slru: read %q: %w", segPath, err)
-		}
-	}
-	for off, mask := range masks {
-		buf[off] |= mask
-	}
-	if _, err := f.WriteAt(buf, 0); err != nil {
-		return fmt.Errorf("clog slru: write %q: %w", segPath, err)
-	}
-	return f.Sync()
+// applyGroupBatchLocked performs the group's durable write. Every batch
+// member's lane was already written by setStatus before the group formed, so
+// this needs no per-member data — it just flushes the pool's dirty pages. The
+// caller holds flushMu. M0117-0005; M0117-0006 Part C removed the legacy
+// flat-file + bank→SLRU mirror alternative once the buffer pool became the
+// only store.
+func (c *CLog) applyGroupBatchLocked() error {
+	// Each batch member's 2-bit lane was already written by setStatus
+	// (p.setStatus). One flushDirty writes every dirty resident page back with
+	// one fsync per touched segment.
+	return c.pool.Load().flushDirty()
 }

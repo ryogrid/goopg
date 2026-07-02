@@ -494,6 +494,12 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 			}
 			row = detoasted
 		}
+		// M0119-0004-ACLHEAP: render a heap-backed ACL column (pg_type.typacl /
+		// pg_attribute.attacl) from its _aclitem blob to canonical aclitemout text.
+		// pg_dump's getColumnACLs reaches pg_attribute by an attrelid index scan, so
+		// the seqScanOp inline hook is not enough — render here too (no-op off the
+		// catalogs / for a NULL ACL).
+		renderHeapACLColumnInto(o.ctx.Catalog, o.plan.Table, o.plan.Table.Columns, row)
 		// Record the actual (HOT-resolved) live slot for
 		// currentTID() — lockRowsOp stamps the live version.
 		o.lastTID = storage.ItemPointer{Block: ptr.Block, Offset: actualSlot}

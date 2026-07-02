@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -432,6 +433,401 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes)
 	RecordKindDropSchema byte = 35
 
+	// RecordKindCreateTransform records a `CREATE TRANSFORM FOR <type>
+	// LANGUAGE <lang> ...` event so the catalog's in-memory transform
+	// registry (catalog.InMemory.transforms, which backs the pg_transform
+	// virtual view) survives a restart. Like CREATE SCHEMA, CREATE TRANSFORM
+	// is a catalog-only side effect with no per-object on-disk file
+	// namespace, so the physical redo path is a no-op (applyRecord returns
+	// (false, nil)); the recovery driver in
+	// internal/initdb/transform_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each transform with its
+	// original OID. Mirrors RecordKindCreateSchema (M0110-0003). DU-002
+	// (M0119-0004) restart-persistence follow-up.
+	// Format:
+	//   kind(1) | oid(4) | fromFuncOID(4) | toFuncOID(4) | typeLen(2) | type(typeLen bytes) | langLen(2) | lang(langLen bytes)
+	RecordKindCreateTransform byte = 36
+
+	// RecordKindDropTransform records a `DROP TRANSFORM FOR <type> LANGUAGE
+	// <lang>` event. Counterpart to RecordKindCreateTransform; the recovery
+	// driver removes the (type, lang) pair from the catalog instead of
+	// adding it. The OID/function OIDs are not needed on drop.
+	// Format:
+	//   kind(1) | typeLen(2) | type(typeLen bytes) | langLen(2) | lang(langLen bytes)
+	RecordKindDropTransform byte = 37
+
+	// RecordKindCreateCast records a `CREATE CAST (source AS target) ...`
+	// event so the catalog's in-memory cast registry (catalog.InMemory.casts,
+	// which backs the pg_cast virtual view) survives a restart. Like CREATE
+	// TRANSFORM, CREATE CAST is a catalog-only side effect with no
+	// per-object on-disk file namespace, so the physical redo path is a
+	// no-op (applyRecord returns (false, nil)); the recovery driver in
+	// internal/initdb/cast_ddl_recovery.go scans the WAL for these records
+	// after physical replay and re-registers each cast with its original
+	// OID. Mirrors RecordKindCreateTransform (M0119-0004). DU-002
+	// restart-persistence follow-up.
+	// Format:
+	//   kind(1) | oid(4) | funcOID(4) | context(1) | method(1) | sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes)
+	RecordKindCreateCast byte = 38
+
+	// RecordKindDropCast records a `DROP CAST (source AS target)` event.
+	// Counterpart to RecordKindCreateCast; the recovery driver removes the
+	// (source, target) pair from the catalog instead of adding it. The
+	// OID/funcOID/context/method are not needed on drop.
+	// Format:
+	//   kind(1) | sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes)
+	RecordKindDropCast byte = 39
+
+	// RecordKindCreateConversion records a `CREATE [DEFAULT] CONVERSION
+	// <name> FOR <src> TO <dest> FROM <func>` event so the catalog's
+	// in-memory conversion registry (catalog.InMemory.userConversions, which
+	// backs the pg_conversion virtual view) survives a restart. Like CREATE
+	// CAST/TRANSFORM, CREATE CONVERSION is a catalog-only side effect with no
+	// per-object on-disk file namespace, so the physical redo path is a
+	// no-op (applyRecord returns (false, nil)); the recovery driver in
+	// internal/initdb/conversion_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each conversion with
+	// its original OID. Unlike casts/transforms, a conversion is
+	// schema-scoped, so replay of this record must happen after schema
+	// replay (replaySchemaDDLRecords) has repopulated the schema OID map.
+	// Mirrors RecordKindCreateCast (M0119-0004). DU-002 restart-persistence
+	// follow-up.
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | funcOID(4) | forEncoding(4) | toEncoding(4) | defaultFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   procSchemaLen(2) | procSchema(procSchemaLen bytes) | procNameLen(2) | procName(procNameLen bytes)
+	RecordKindCreateConversion byte = 40
+
+	// RecordKindDropConversion records a `DROP CONVERSION <name>` event.
+	// Counterpart to RecordKindCreateConversion; the recovery driver removes
+	// the (schema, name) pair from the catalog instead of adding it. The
+	// OID/encodings/function are not needed on drop.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindDropConversion byte = 41
+
+	// RecordKindCreateCollation records a `CREATE COLLATION <name> (...)`
+	// event so the catalog's in-memory collation registry
+	// (catalog.InMemory.userCollations, which backs the pg_collation virtual
+	// view) survives a restart. Like CREATE CAST/TRANSFORM/CONVERSION,
+	// CREATE COLLATION is a catalog-only side effect with no per-object
+	// on-disk file namespace, so the physical redo path is a no-op
+	// (applyRecord returns (false, nil)); the recovery driver in
+	// internal/initdb/collation_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each collation with its
+	// original OID. Like a conversion, a collation is schema-scoped, so
+	// replay of this record must happen after schema replay
+	// (replaySchemaDDLRecords) has repopulated the schema OID map. Mirrors
+	// RecordKindCreateConversion (M0119-0004). DU-002 restart-persistence
+	// follow-up.
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | encoding(4) | provider(1) | deterministicFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   collateLen(2) | collate(collateLen bytes) | ctypeLen(2) | ctype(ctypeLen bytes) |
+	//   localeLen(2) | locale(localeLen bytes) | rulesLen(2) | rules(rulesLen bytes)
+	RecordKindCreateCollation byte = 42
+
+	// RecordKindDropCollation records a `DROP COLLATION <name>` event.
+	// Counterpart to RecordKindCreateCollation; the recovery driver removes
+	// the (schema, name) pair from the catalog instead of adding it. The
+	// OID/provider/locale fields are not needed on drop.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindDropCollation byte = 43
+
+	// RecordKindAlterCollationRename records an `ALTER COLLATION <name>
+	// RENAME TO <newname>` event so the rename survives a restart. Like
+	// CREATE/DROP COLLATION, goopg has no per-collation file namespace, so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/collation_ddl_recovery.go re-applies the rename to the
+	// catalog's collation registry after physical replay + schema replay.
+	// Mirrors RecordKindCreateCollation. DU-002 restart-persistence
+	// follow-up (M0119-0004, loop #50/executor's execAlterCollation).
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterCollationRename byte = 44
+
+	// RecordKindAlterCollationOwner records an `ALTER COLLATION <name> OWNER
+	// TO <role>` event so the ownership change survives a restart. Same
+	// no-op physical redo path as RecordKindAlterCollationRename.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindAlterCollationOwner byte = 45
+
+	// RecordKindCreateAggregate records a `CREATE AGGREGATE <name> (...)`
+	// event so the catalog's in-memory aggregate registry
+	// (catalog.InMemory.userAggregates, which backs the pg_aggregate/pg_proc
+	// virtual views and the planner's isUserAggregateFunc lookup) survives a
+	// restart. Like CREATE CAST/TRANSFORM/CONVERSION/COLLATION, CREATE
+	// AGGREGATE is a catalog-only side effect with no per-object on-disk file
+	// namespace, so the physical redo path is a no-op (applyRecord returns
+	// (false, nil)); the recovery driver in
+	// internal/initdb/aggregate_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each aggregate with its
+	// original OID. Unlike a collation/conversion, a user aggregate has no
+	// Schema field yet (catalog.UserAggregate — see the DU-002 slice 405
+	// ledger row's resume point (a)), so replay does not depend on schema
+	// replay having run first. DU-002 restart-persistence follow-up
+	// (M0119-0004, slice 405 ledger resume point (c)).
+	// Format:
+	//   kind(1) | oid(4) | sfuncStrictFlag(1) | variadicFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) | sTypeLen(2) | sType(sTypeLen bytes) |
+	//   sFuncLen(2) | sFunc(sFuncLen bytes) | finalFuncLen(2) | finalFunc(finalFuncLen bytes) |
+	//   combineFuncLen(2) | combineFunc(combineFuncLen bytes) | initCondLen(2) | initCond(initCondLen bytes) |
+	//   finalFuncModifyLen(2) | finalFuncModify(finalFuncModifyLen bytes) |
+	//   argTypesCount(2) | for each: argTypeLen(2) argType(argTypeLen bytes)
+	RecordKindCreateAggregate byte = 46
+
+	// RecordKindAlterAggregateRename records an `ALTER AGGREGATE name(args)
+	// RENAME TO newname` event so the rename survives a restart. Same no-op
+	// physical redo path as RecordKindCreateAggregate.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterAggregateRename byte = 47
+
+	// RecordKindDropAggregate records a `DROP AGGREGATE name(args)` event so
+	// the removal survives a restart. Same no-op physical redo path as
+	// RecordKindCreateAggregate. Mirrors RecordKindDropCollation.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropAggregate byte = 48
+
+	// RecordKindAlterAggregateOwner records an `ALTER AGGREGATE name(args)
+	// OWNER TO newowner` event so the ownership change survives a restart.
+	// Same no-op physical redo path as RecordKindCreateAggregate. Mirrors
+	// RecordKindAlterCollationOwner.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterAggregateOwner byte = 49
+
+	// RecordKindCreatePublication records a `CREATE PUBLICATION name ...`
+	// event so it survives a restart. goopg has no per-publication on-disk
+	// file namespace (catalog.PubSub is a pure in-memory registry, unlike
+	// pg_class/pg_attribute-backed objects), so the physical redo path is a
+	// no-op; the recovery driver in internal/initdb/pubsub_ddl_recovery.go
+	// scans the WAL for these records after physical replay and
+	// re-registers each publication with its original OID/owner. Mirrors
+	// RecordKindCreateCollation. DU-002 restart-persistence follow-up
+	// (M0119-0004, loop #67 ledger resume point).
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) |
+	//   flags(1: bit0=AllTables bit1=PublishInsert bit2=PublishUpdate bit3=PublishDelete) |
+	//   nameLen(2) | name(nameLen bytes) |
+	//   tablesCount(2) | for each: tableLen(2) table(tableLen bytes)
+	RecordKindCreatePublication byte = 50
+
+	// RecordKindDropPublication records a `DROP PUBLICATION name` event.
+	// Counterpart to RecordKindCreatePublication; same no-op physical redo
+	// path. Mirrors RecordKindDropCollation.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropPublication byte = 51
+
+	// RecordKindAlterPublicationOwner records an `ALTER PUBLICATION name
+	// OWNER TO newowner` event. Same no-op physical redo path as
+	// RecordKindCreatePublication. Mirrors RecordKindAlterCollationOwner.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterPublicationOwner byte = 52
+
+	// RecordKindCreateSubscription records a `CREATE SUBSCRIPTION name ...`
+	// event so it survives a restart. Same rationale/no-op physical redo
+	// path as RecordKindCreatePublication.
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | enabledFlag(1) |
+	//   nameLen(2) | name(nameLen bytes) |
+	//   conninfoLen(2) | conninfo(conninfoLen bytes) |
+	//   slotNameLen(2) | slotName(slotNameLen bytes) |
+	//   pubCount(2) | for each: pubLen(2) pub(pubLen bytes)
+	RecordKindCreateSubscription byte = 53
+
+	// RecordKindDropSubscription records a `DROP SUBSCRIPTION name` event.
+	// Counterpart to RecordKindCreateSubscription; same no-op physical redo
+	// path.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropSubscription byte = 54
+
+	// RecordKindAlterSubscriptionOwner records an `ALTER SUBSCRIPTION name
+	// OWNER TO newowner` event. Same no-op physical redo path as
+	// RecordKindCreateSubscription.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterSubscriptionOwner byte = 55
+
+	// RecordKindCreateEventTrigger records a `CREATE EVENT TRIGGER name ON
+	// event ... EXECUTE FUNCTION func()` event so it survives a restart.
+	// goopg has no per-event-trigger on-disk file namespace (catalog.InMemory's
+	// eventTriggers map is a pure in-memory registry, like catalog.PubSub), so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/event_trigger_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each event trigger with
+	// its original OID. Mirrors RecordKindCreatePublication. DU-002
+	// restart-persistence follow-up (M0119-0004, loop #70 ledger resume
+	// point).
+	// Format:
+	//   kind(1) | oid(4) | ownerOID(4) | funcOID(4) |
+	//   eventLen(2) | event(eventLen bytes) |
+	//   nameLen(2) | name(nameLen bytes) |
+	//   tagsCount(2) | for each: tagLen(2) tag(tagLen bytes)
+	RecordKindCreateEventTrigger byte = 56
+
+	// RecordKindDropEventTrigger records a `DROP EVENT TRIGGER name` event.
+	// Counterpart to RecordKindCreateEventTrigger; same no-op physical redo
+	// path. Mirrors RecordKindDropPublication.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropEventTrigger byte = 57
+
+	// RecordKindAlterEventTriggerEnabled records an `ALTER EVENT TRIGGER name
+	// {DISABLE | ENABLE [REPLICA|ALWAYS]}` event. code is the raw
+	// pg_event_trigger.evtenabled value ('D'/'O'/'R'/'A'). Same no-op
+	// physical redo path as RecordKindCreateEventTrigger.
+	// Format:
+	//   kind(1) | code(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterEventTriggerEnabled byte = 58
+
+	// RecordKindAlterEventTriggerRename records an `ALTER EVENT TRIGGER name
+	// RENAME TO newname` event. Same no-op physical redo path as
+	// RecordKindCreateEventTrigger.
+	// Format:
+	//   kind(1) | oldNameLen(2) | oldName(oldNameLen bytes) |
+	//   newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterEventTriggerRename byte = 59
+
+	// RecordKindAlterEventTriggerOwner records an `ALTER EVENT TRIGGER name
+	// OWNER TO newowner` event. Same no-op physical redo path as
+	// RecordKindCreateEventTrigger.
+	// Format:
+	//   kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterEventTriggerOwner byte = 60
+
+	// RecordKindCreateFunction records a `CREATE [OR REPLACE] FUNCTION` /
+	// `CREATE [OR REPLACE] PROCEDURE` event so it survives a restart. goopg
+	// has no per-routine on-disk file namespace (catalog.Routines is a pure
+	// in-memory registry, unlike pg_class/pg_attribute-backed objects), so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/function_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each routine with its
+	// original OID. Mirrors RecordKindCreateEventTrigger. DU-002
+	// restart-persistence follow-up (M0119-0004, loop #71 ledger resume
+	// point). CREATE OR REPLACE reuses the OID of the routine it replaces
+	// (Routines.Create's own contract), so a plain re-apply of this record
+	// for an unchanged signature is naturally idempotent. Encoded via the
+	// struct-based EncodeCreateFunction/DecodeCreateFunction pair (too many
+	// fields for a flat positional signature); see CreateFunctionPayload.
+	RecordKindCreateFunction byte = 61
+
+	// RecordKindDropFunction records a `DROP FUNCTION`/`DROP PROCEDURE`
+	// removal (including a CASCADE-dependent drop) by OID, so it survives a
+	// restart. The OID (not name+signature) is carried because DROP
+	// FUNCTION's own overload resolution already happened live — replaying
+	// by OID sidesteps re-resolving a possibly-ambiguous bare name against a
+	// partially-replayed registry. Format:
+	//   kind(1) | oid(4)
+	RecordKindDropFunction byte = 62
+
+	// RecordKindAlterFunctionRename records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE name(args) RENAME TO newname` event. Format:
+	//   kind(1) | oid(4) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterFunctionRename byte = 63
+
+	// RecordKindAlterFunctionFlags records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE` attribute change (VOLATILE/STABLE/IMMUTABLE, SECURITY
+	// DEFINER/INVOKER, LEAKPROOF, STRICT/CALLED ON NULL INPUT) as a full
+	// post-mutation snapshot of the four mutable attributes (not a
+	// which-clause-was-present delta) — simpler to replay and matches how
+	// execAlterFunction itself always leaves all four fields in a concrete
+	// state. Format:
+	//   kind(1) | oid(4) | flags(1: bit0=SecurityDefiner bit1=Leakproof
+	//   bit2=Strict) | volatileLen(2) | volatile(volatileLen bytes)
+	RecordKindAlterFunctionFlags byte = 64
+
+	// RecordKindSequenceState records the FULL state of one sequence
+	// (definition + current counter) so sequences — including the implicit
+	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
+	// sequence registry is in-memory only (executor seqRegistry), and the
+	// pg_attribute heap stores a serial column's atttypid as the base integer
+	// type (PG-canonical, readable by a real PG18 standby), so without this
+	// record both the sequence and the column's serial-ness vanished on
+	// restart and auto-increment INSERTs failed (surfaced by WordPress:
+	// wp_usermeta.umeta_id NOT NULL violations after the first restart).
+	//
+	// The record is emitted (a) whenever a sequence is registered or altered
+	// (CREATE TABLE with SERIAL/IDENTITY, CREATE/ALTER SEQUENCE, setval,
+	// TRUNCATE ... RESTART IDENTITY), and (b) periodically from nextval —
+	// every 32nd fetch it logs the state with Current advanced 32 values
+	// AHEAD of the fetched value, mirroring upstream's SEQ_LOG_VALS
+	// pre-logging (postgres/src/backend/commands/sequence.c, xl_seq_rec):
+	// replaying the pre-logged horizon never repeats a handed-out value, at
+	// the cost of a gap of at most 32 values after a crash — exactly PG's
+	// documented behavior. The periodic re-emit also makes actively-used
+	// sequences self-healing against checkpoint-driven WAL segment pruning
+	// (the same latent limitation the whole logical-DDL record family has).
+	//
+	// Replay is last-record-wins (replaySequenceDDLRecords): each record
+	// fully re-registers the sequence, so create/alter/setval/advance all
+	// share this one kind. Format:
+	//   kind(1) | flags(1: bit0=cycle bit1=called) | identityKind(1:
+	//   0=none 1=BY DEFAULT 2=ALWAYS) | start(8) | increment(8) | min(8) |
+	//   max(8) | cache(8) | current(8) | nameLen(2)+name |
+	//   dataTypeLen(2)+dataType | ownedByLen(2)+ownedBy |
+	//   colSpellingLen(2)+colSpelling
+	// ownedBy is "table.column" for implicit serial/identity sequences (and
+	// explicit OWNED BY); colSpelling is the serial spelling ("bigserial",
+	// "serial", ...) when the sequence backs a SERIAL column, so replay can
+	// restore the column's catalog type (the auto-increment path keys on it).
+	RecordKindSequenceState byte = 65
+
+	// RecordKindDropSequence records a sequence removal (DROP SEQUENCE, or
+	// DROP TABLE cascading to the implicit sequences it owns) so replay does
+	// not resurrect it. Format: kind(1) | nameLen(2) | name.
+	RecordKindDropSequence byte = 66
+
+	// RecordKindRoleState records the FULL state of one role (name +
+	// attribute flags + password verifier) so CREATE/ALTER ROLE survive a
+	// restart, like PostgreSQL's pg_authid (which goopg only bootstraps at
+	// initdb — runtime role DDL was in-memory-only before this record).
+	// Passwords are stored as verifiers, never plaintext-by-default: the
+	// server-side handler turns `PASSWORD 'x'` into an upstream-format
+	// SCRAM-SHA-256 verifier (auth.NewSCRAMSecret, mirroring PG's
+	// encrypt_password in postgres/src/backend/libpq/crypt.c) before the
+	// record is emitted, so the WAL carries the same secret shape as
+	// pg_authid.rolpassword. Emitted on CREATE ROLE/USER/GROUP and ALTER
+	// ROLE/USER; replay is last-record-wins so both share this one kind.
+	// The WAL records are the crash-recovery TAIL only: the durable base
+	// store is the pg_authid heap file (global/1260), rewritten atomically
+	// on every role DDL (initdb.SyncPgAuthidFile) exactly like PostgreSQL's
+	// pg_authid heap is the durable store and its WAL records the tail.
+	// Startup loads the heap first, then replays these records on top.
+	// Format:
+	//   kind(1) | flags(1: bit0=canLogin bit1=superuser) | credType(1:
+	//   0=none 1=plaintext 2=md5 3=scram-sha-256) | oid(4) |
+	//   nameLen(2)+name | secretLen(2)+secret
+	RecordKindRoleState byte = 67
+
+	// RecordKindDropRole records a role removal (DROP ROLE/USER/GROUP) so
+	// replay does not resurrect it. Format: kind(1) | nameLen(2) | name.
+	RecordKindDropRole byte = 68
+
+	// RecordKindColumnDefaults records a table's column DEFAULT expressions
+	// (as SQL text) so they survive a restart. catalog.Column.DefaultExpr is
+	// an in-memory parser AST that loadUserTablesFromHeap cannot reconstruct
+	// — pg_attribute carries only atthasdef and goopg writes no pg_attrdef
+	// heap rows at runtime — so before this record an INSERT omitting a
+	// defaulted column inserted NULL after a restart (WordPress:
+	// `wp_posts.comment_count bigint NOT NULL DEFAULT 0` raised a NOT NULL
+	// violation on every post-restart post creation). Emitted from
+	// syncTableToCatalogHeap (the single funnel every table-persisting DDL
+	// path goes through), one record per table carrying ALL its defaulted
+	// columns; replay is last-record-wins and re-parses each expression via
+	// parser.ParseExpr. Upstream analog: pg_attrdef
+	// (postgres/src/backend/catalog/heap.c StoreAttrDefault). Format:
+	//   kind(1) | tableOID(4) | count(2) | count × (nameLen(2)+name |
+	//   exprLen(2)+exprSQL)
+	RecordKindColumnDefaults byte = 69
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -553,6 +949,324 @@ func DecodeDropDatabase(payload []byte) (name string, err error) {
 	return string(payload[3 : 3+nameLen]), nil
 }
 
+// SequenceStatePayload is the decoded form of a RecordKindSequenceState
+// record: one sequence's full definition plus its current counter. See the
+// RecordKindSequenceState constant for the on-disk format and the emit
+// policy (create/alter/setval snapshots + every-32-nextval pre-logging,
+// mirroring upstream SEQ_LOG_VALS in postgres/src/backend/commands/sequence.c).
+type SequenceStatePayload struct {
+	Name         string
+	Start        int64
+	Increment    int64
+	Min          int64
+	Max          int64
+	Cache        int64
+	Current      int64 // raw counter: next nextval returns Current+Increment
+	Cycle        bool
+	Called       bool
+	DataType     string // "smallint" | "integer" | "bigint"
+	OwnedBy      string // "table.column" for implicit/OWNED BY sequences, else ""
+	ColSpelling  string // serial spelling ("bigserial", ...) when backing a SERIAL column
+	IdentityKind byte   // 0=none, 1=GENERATED BY DEFAULT, 2=GENERATED ALWAYS
+}
+
+// EncodeSequenceState encodes a RecordKindSequenceState record.
+func EncodeSequenceState(p SequenceStatePayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindSequenceState)
+	var flags byte
+	if p.Cycle {
+		flags |= 1 << 0
+	}
+	if p.Called {
+		flags |= 1 << 1
+	}
+	buf.WriteByte(flags)
+	buf.WriteByte(p.IdentityKind)
+	var i64 [8]byte
+	for _, v := range []int64{p.Start, p.Increment, p.Min, p.Max, p.Cache, p.Current} {
+		binary.LittleEndian.PutUint64(i64[:], uint64(v))
+		buf.Write(i64[:])
+	}
+	writeStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeStr16(p.Name)
+	writeStr16(p.DataType)
+	writeStr16(p.OwnedBy)
+	writeStr16(p.ColSpelling)
+	return buf.Bytes()
+}
+
+// DecodeSequenceState decodes a RecordKindSequenceState payload.
+func DecodeSequenceState(payload []byte) (SequenceStatePayload, error) {
+	var p SequenceStatePayload
+	const fixed = 1 + 1 + 1 + 6*8 // kind + flags + identityKind + six int64s
+	if len(payload) < fixed {
+		return p, fmt.Errorf("wal: sequence-state payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindSequenceState {
+		return p, fmt.Errorf("wal: record kind %d is not sequence-state", payload[0])
+	}
+	flags := payload[1]
+	p.Cycle = flags&(1<<0) != 0
+	p.Called = flags&(1<<1) != 0
+	p.IdentityKind = payload[2]
+	off := 3
+	for _, dst := range []*int64{&p.Start, &p.Increment, &p.Min, &p.Max, &p.Cache, &p.Current} {
+		*dst = int64(binary.LittleEndian.Uint64(payload[off : off+8]))
+		off += 8
+	}
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: sequence-state payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: sequence-state string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	var err error
+	if p.Name, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.DataType, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.OwnedBy, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.ColSpelling, err = readStr16(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// RoleStatePayload is the decoded form of a RecordKindRoleState record: one
+// role's name, OID, attribute flags, and stored credential. See the
+// RecordKindRoleState constant for the on-disk format and emit policy.
+type RoleStatePayload struct {
+	Name      string
+	OID       uint32 // registry OID — kept stable across restarts
+	CanLogin  bool
+	Superuser bool
+	CredType  byte   // 0=none, 1=plaintext, 2=md5, 3=scram-sha-256
+	Secret    string // stored verifier (or plaintext for CredType 1)
+}
+
+// EncodeRoleState encodes a RecordKindRoleState record.
+func EncodeRoleState(p RoleStatePayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindRoleState)
+	var flags byte
+	if p.CanLogin {
+		flags |= 1 << 0
+	}
+	if p.Superuser {
+		flags |= 1 << 1
+	}
+	buf.WriteByte(flags)
+	buf.WriteByte(p.CredType)
+	var oid [4]byte
+	binary.LittleEndian.PutUint32(oid[:], p.OID)
+	buf.Write(oid[:])
+	writeStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeStr16(p.Name)
+	writeStr16(p.Secret)
+	return buf.Bytes()
+}
+
+// DecodeRoleState decodes a RecordKindRoleState payload.
+func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
+	var p RoleStatePayload
+	if len(payload) < 7 {
+		return p, fmt.Errorf("wal: role-state payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRoleState {
+		return p, fmt.Errorf("wal: record kind %d is not role-state", payload[0])
+	}
+	flags := payload[1]
+	p.CanLogin = flags&(1<<0) != 0
+	p.Superuser = flags&(1<<1) != 0
+	p.CredType = payload[2]
+	p.OID = binary.LittleEndian.Uint32(payload[3:7])
+	off := 7
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: role-state payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: role-state string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	var err error
+	if p.Name, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.Secret, err = readStr16(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// EncodeDropRole encodes a RecordKindDropRole record.
+// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name.
+func EncodeDropRole(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropRole
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropRole decodes a RecordKindDropRole payload.
+func DecodeDropRole(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-role payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropRole {
+		return "", fmt.Errorf("wal: record kind %d is not drop-role", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-role payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
+// RecordKindColumnDefaults record.
+type ColumnDefaultEntry struct {
+	Name string
+	Expr string // DEFAULT expression as SQL text (parser.ParseExpr round-trips it)
+}
+
+// ColumnDefaultsPayload is the decoded form of a RecordKindColumnDefaults
+// record: every defaulted column of one table. See the constant for the emit
+// policy (per-table snapshot from syncTableToCatalogHeap, last-record-wins).
+type ColumnDefaultsPayload struct {
+	TableOID uint32
+	Defaults []ColumnDefaultEntry
+}
+
+// EncodeColumnDefaults encodes a RecordKindColumnDefaults record.
+func EncodeColumnDefaults(p ColumnDefaultsPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindColumnDefaults)
+	var b4 [4]byte
+	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
+	buf.Write(b4[:])
+	var b2 [2]byte
+	binary.LittleEndian.PutUint16(b2[:], uint16(len(p.Defaults)))
+	buf.Write(b2[:])
+	writeStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(b2[:], uint16(len(s)))
+		buf.Write(b2[:])
+		buf.WriteString(s)
+	}
+	for _, d := range p.Defaults {
+		writeStr16(d.Name)
+		writeStr16(d.Expr)
+	}
+	return buf.Bytes()
+}
+
+// DecodeColumnDefaults decodes a RecordKindColumnDefaults payload.
+func DecodeColumnDefaults(payload []byte) (ColumnDefaultsPayload, error) {
+	var p ColumnDefaultsPayload
+	if len(payload) < 7 {
+		return p, fmt.Errorf("wal: column-defaults payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindColumnDefaults {
+		return p, fmt.Errorf("wal: record kind %d is not column-defaults", payload[0])
+	}
+	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	off := 7
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: column-defaults payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: column-defaults string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	for i := 0; i < count; i++ {
+		var d ColumnDefaultEntry
+		var err error
+		if d.Name, err = readStr16(); err != nil {
+			return p, err
+		}
+		if d.Expr, err = readStr16(); err != nil {
+			return p, err
+		}
+		p.Defaults = append(p.Defaults, d)
+	}
+	return p, nil
+}
+
+// EncodeDropSequence encodes a RecordKindDropSequence record.
+// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name.
+func EncodeDropSequence(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropSequence
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropSequence decodes a RecordKindDropSequence payload.
+func DecodeDropSequence(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-sequence payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropSequence {
+		return "", fmt.Errorf("wal: record kind %d is not drop-sequence", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-sequence payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
 // EncodeCreateSchema encodes a CREATE SCHEMA event (M0110-0003 schema
 // durability). The OID is carried so recovery re-registers the schema with
 // the same identifier the live server assigned.
@@ -611,6 +1325,1788 @@ func DecodeDropSchema(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-schema payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateTransform encodes a CREATE TRANSFORM event (M0119-0004 restart
+// persistence). The OID and resolved from/to function OIDs are carried so
+// recovery re-registers the transform identically to the live server.
+// Format: kind(1) | oid(4) | fromFuncOID(4) | toFuncOID(4) | typeLen(2) |
+// type(typeLen bytes) | langLen(2) | lang(langLen bytes).
+func EncodeCreateTransform(typeName, lang string, oid, fromFuncOID, toFuncOID uint32) []byte {
+	if len(typeName) > 0xFFFF {
+		typeName = typeName[:0xFFFF]
+	}
+	if len(lang) > 0xFFFF {
+		lang = lang[:0xFFFF]
+	}
+	out := make([]byte, 17+len(typeName)+len(lang))
+	out[0] = RecordKindCreateTransform
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], fromFuncOID)
+	binary.LittleEndian.PutUint32(out[9:13], toFuncOID)
+	binary.LittleEndian.PutUint16(out[13:15], uint16(len(typeName)))
+	off := 15
+	copy(out[off:], typeName)
+	off += len(typeName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(lang)))
+	off += 2
+	copy(out[off:], lang)
+	return out
+}
+
+// DecodeCreateTransform decodes a RecordKindCreateTransform payload.
+func DecodeCreateTransform(payload []byte) (typeName, lang string, oid, fromFuncOID, toFuncOID uint32, err error) {
+	if len(payload) < 15 {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-transform payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateTransform {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-transform", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	fromFuncOID = binary.LittleEndian.Uint32(payload[5:9])
+	toFuncOID = binary.LittleEndian.Uint32(payload[9:13])
+	typeLen := int(binary.LittleEndian.Uint16(payload[13:15]))
+	off := 15
+	if len(payload) < off+typeLen+2 {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-transform payload truncated (need %d bytes)", off+typeLen+2)
+	}
+	typeName = string(payload[off : off+typeLen])
+	off += typeLen
+	langLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+langLen {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-transform payload truncated (need %d bytes)", off+langLen)
+	}
+	lang = string(payload[off : off+langLen])
+	return typeName, lang, oid, fromFuncOID, toFuncOID, nil
+}
+
+// EncodeDropTransform encodes a DROP TRANSFORM event (M0119-0004 restart
+// persistence). Format: kind(1) | typeLen(2) | type(typeLen bytes) |
+// langLen(2) | lang(langLen bytes).
+func EncodeDropTransform(typeName, lang string) []byte {
+	if len(typeName) > 0xFFFF {
+		typeName = typeName[:0xFFFF]
+	}
+	if len(lang) > 0xFFFF {
+		lang = lang[:0xFFFF]
+	}
+	out := make([]byte, 5+len(typeName)+len(lang))
+	out[0] = RecordKindDropTransform
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(typeName)))
+	off := 3
+	copy(out[off:], typeName)
+	off += len(typeName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(lang)))
+	off += 2
+	copy(out[off:], lang)
+	return out
+}
+
+// DecodeDropTransform decodes a RecordKindDropTransform payload.
+func DecodeDropTransform(payload []byte) (typeName, lang string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-transform payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTransform {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-transform", payload[0])
+	}
+	typeLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+typeLen+2 {
+		return "", "", fmt.Errorf("wal: drop-transform payload truncated (need %d bytes)", off+typeLen+2)
+	}
+	typeName = string(payload[off : off+typeLen])
+	off += typeLen
+	langLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+langLen {
+		return "", "", fmt.Errorf("wal: drop-transform payload truncated (need %d bytes)", off+langLen)
+	}
+	lang = string(payload[off : off+langLen])
+	return typeName, lang, nil
+}
+
+// EncodeCreateCast encodes a CREATE CAST event (DU-002 restart-persistence
+// follow-up to M0119-0004). The OID and resolved function OID are carried so
+// recovery re-registers the cast identically to the live server. context and
+// method are each a single PG catalog char ('e'/'a'/'i' and 'b'/'i'/'f'
+// respectively) but are wire-encoded as length-prefixed strings for symmetry
+// with the rest of the record and to tolerate an empty value defensively.
+// Format: kind(1) | oid(4) | funcOID(4) | context(1) | method(1) |
+// sourceLen(2) | source(sourceLen bytes) | targetLen(2) | target(targetLen bytes).
+func EncodeCreateCast(source, target, context, method string, oid, funcOID uint32) []byte {
+	if len(source) > 0xFFFF {
+		source = source[:0xFFFF]
+	}
+	if len(target) > 0xFFFF {
+		target = target[:0xFFFF]
+	}
+	var contextByte, methodByte byte
+	if len(context) > 0 {
+		contextByte = context[0]
+	}
+	if len(method) > 0 {
+		methodByte = method[0]
+	}
+	out := make([]byte, 15+len(source)+len(target))
+	out[0] = RecordKindCreateCast
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], funcOID)
+	out[9] = contextByte
+	out[10] = methodByte
+	binary.LittleEndian.PutUint16(out[11:13], uint16(len(source)))
+	off := 13
+	copy(out[off:], source)
+	off += len(source)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(target)))
+	off += 2
+	copy(out[off:], target)
+	return out
+}
+
+// DecodeCreateCast decodes a RecordKindCreateCast payload.
+func DecodeCreateCast(payload []byte) (source, target, context, method string, oid, funcOID uint32, err error) {
+	if len(payload) < 13 {
+		return "", "", "", "", 0, 0, fmt.Errorf("wal: create-cast payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateCast {
+		return "", "", "", "", 0, 0, fmt.Errorf("wal: record kind %d is not create-cast", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	funcOID = binary.LittleEndian.Uint32(payload[5:9])
+	if payload[9] != 0 {
+		context = string([]byte{payload[9]})
+	}
+	if payload[10] != 0 {
+		method = string([]byte{payload[10]})
+	}
+	sourceLen := int(binary.LittleEndian.Uint16(payload[11:13]))
+	off := 13
+	if len(payload) < off+sourceLen+2 {
+		return "", "", "", "", 0, 0, fmt.Errorf("wal: create-cast payload truncated (need %d bytes)", off+sourceLen+2)
+	}
+	source = string(payload[off : off+sourceLen])
+	off += sourceLen
+	targetLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+targetLen {
+		return "", "", "", "", 0, 0, fmt.Errorf("wal: create-cast payload truncated (need %d bytes)", off+targetLen)
+	}
+	target = string(payload[off : off+targetLen])
+	return source, target, context, method, oid, funcOID, nil
+}
+
+// EncodeDropCast encodes a DROP CAST event (DU-002 restart-persistence
+// follow-up to M0119-0004). Format: kind(1) | sourceLen(2) |
+// source(sourceLen bytes) | targetLen(2) | target(targetLen bytes).
+func EncodeDropCast(source, target string) []byte {
+	if len(source) > 0xFFFF {
+		source = source[:0xFFFF]
+	}
+	if len(target) > 0xFFFF {
+		target = target[:0xFFFF]
+	}
+	out := make([]byte, 5+len(source)+len(target))
+	out[0] = RecordKindDropCast
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(source)))
+	off := 3
+	copy(out[off:], source)
+	off += len(source)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(target)))
+	off += 2
+	copy(out[off:], target)
+	return out
+}
+
+// DecodeDropCast decodes a RecordKindDropCast payload.
+func DecodeDropCast(payload []byte) (source, target string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-cast payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropCast {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-cast", payload[0])
+	}
+	sourceLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+sourceLen+2 {
+		return "", "", fmt.Errorf("wal: drop-cast payload truncated (need %d bytes)", off+sourceLen+2)
+	}
+	source = string(payload[off : off+sourceLen])
+	off += sourceLen
+	targetLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+targetLen {
+		return "", "", fmt.Errorf("wal: drop-cast payload truncated (need %d bytes)", off+targetLen)
+	}
+	target = string(payload[off : off+targetLen])
+	return source, target, nil
+}
+
+// EncodeCreateConversion encodes a CREATE [DEFAULT] CONVERSION event (DU-002
+// restart-persistence follow-up to M0119-0004). The OID and resolved function
+// OID are carried so recovery re-registers the conversion identically to the
+// live server. forEncoding/toEncoding are pg_enc IDs, which are small
+// non-negative values in practice but wire-encoded as signed int32 to match
+// catalog.UserConversion's field types exactly.
+// Format: kind(1) | oid(4) | ownerOID(4) | funcOID(4) | forEncoding(4) |
+// toEncoding(4) | defaultFlag(1) | nameLen(2) | name(nameLen bytes) |
+// schemaLen(2) | schema(schemaLen bytes) | procSchemaLen(2) |
+// procSchema(procSchemaLen bytes) | procNameLen(2) | procName(procNameLen bytes).
+func EncodeCreateConversion(name, schema, procSchema, procName string, oid, ownerOID, funcOID uint32, forEncoding, toEncoding int32, isDefault bool) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(procSchema) > 0xFFFF {
+		procSchema = procSchema[:0xFFFF]
+	}
+	if len(procName) > 0xFFFF {
+		procName = procName[:0xFFFF]
+	}
+	// 22-byte fixed header + 4 length-prefixed strings (2-byte length each).
+	out := make([]byte, 22+8+len(name)+len(schema)+len(procSchema)+len(procName))
+	out[0] = RecordKindCreateConversion
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], funcOID)
+	binary.LittleEndian.PutUint32(out[13:17], uint32(forEncoding))
+	binary.LittleEndian.PutUint32(out[17:21], uint32(toEncoding))
+	if isDefault {
+		out[21] = 1
+	}
+	off := 22
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(procSchema)))
+	off += 2
+	copy(out[off:], procSchema)
+	off += len(procSchema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(procName)))
+	off += 2
+	copy(out[off:], procName)
+	return out
+}
+
+// DecodeCreateConversion decodes a RecordKindCreateConversion payload.
+func DecodeCreateConversion(payload []byte) (name, schema, procSchema, procName string, oid, ownerOID, funcOID uint32, forEncoding, toEncoding int32, isDefault bool, err error) {
+	if len(payload) < 22 {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, fmt.Errorf("wal: create-conversion payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateConversion {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-conversion", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	funcOID = binary.LittleEndian.Uint32(payload[9:13])
+	forEncoding = int32(binary.LittleEndian.Uint32(payload[13:17]))
+	toEncoding = int32(binary.LittleEndian.Uint32(payload[17:21]))
+	isDefault = payload[21] != 0
+	off := 22
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-conversion payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-conversion payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	if procSchema, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	if procName, err = readStr(); err != nil {
+		return "", "", "", "", 0, 0, 0, 0, 0, false, err
+	}
+	return name, schema, procSchema, procName, oid, ownerOID, funcOID, forEncoding, toEncoding, isDefault, nil
+}
+
+// EncodeDropConversion encodes a DROP CONVERSION event (DU-002
+// restart-persistence follow-up to M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeDropConversion(name, schema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(schema))
+	out[0] = RecordKindDropConversion
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeDropConversion decodes a RecordKindDropConversion payload.
+func DecodeDropConversion(payload []byte) (name, schema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-conversion payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropConversion {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-conversion", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: drop-conversion payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", fmt.Errorf("wal: drop-conversion payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, nil
+}
+
+// EncodeCreateCollation encodes a CREATE COLLATION event (DU-002
+// restart-persistence follow-up to M0119-0004). The OID is carried so
+// recovery re-registers the collation identically to the live server.
+// encoding is a pg_enc ID (-1 = encoding-independent), wire-encoded as
+// signed int32 to match catalog.UserCollation's field type exactly.
+// Format: kind(1) | oid(4) | ownerOID(4) | encoding(4) | provider(1) |
+// deterministicFlag(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+// schema(schemaLen bytes) | collateLen(2) | collate(collateLen bytes) |
+// ctypeLen(2) | ctype(ctypeLen bytes) | localeLen(2) | locale(localeLen bytes) |
+// rulesLen(2) | rules(rulesLen bytes).
+func EncodeCreateCollation(name, schema, collate, ctype, locale, rules string, oid, ownerOID uint32, encoding int32, provider byte, deterministic bool) []byte {
+	strs := []string{name, schema, collate, ctype, locale, rules}
+	total := 0
+	for i, s := range strs {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+			strs[i] = s
+		}
+		total += 2 + len(s)
+	}
+	// 15-byte fixed header + 6 length-prefixed strings (2-byte length each).
+	out := make([]byte, 15+total)
+	out[0] = RecordKindCreateCollation
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], uint32(encoding))
+	out[13] = provider
+	if deterministic {
+		out[14] = 1
+	}
+	off := 15
+	for _, s := range strs {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:], s)
+		off += len(s)
+	}
+	return out
+}
+
+// DecodeCreateCollation decodes a RecordKindCreateCollation payload.
+func DecodeCreateCollation(payload []byte) (name, schema, collate, ctype, locale, rules string, oid, ownerOID uint32, encoding int32, provider byte, deterministic bool, err error) {
+	if len(payload) < 15 {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, fmt.Errorf("wal: create-collation payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateCollation {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-collation", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	encoding = int32(binary.LittleEndian.Uint32(payload[9:13]))
+	provider = payload[13]
+	deterministic = payload[14] != 0
+	off := 15
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-collation payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-collation payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if collate, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if ctype, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if locale, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	if rules, err = readStr(); err != nil {
+		return "", "", "", "", "", "", 0, 0, 0, 0, false, err
+	}
+	return name, schema, collate, ctype, locale, rules, oid, ownerOID, encoding, provider, deterministic, nil
+}
+
+// EncodeDropCollation encodes a DROP COLLATION event (DU-002
+// restart-persistence follow-up to M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeDropCollation(name, schema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(schema))
+	out[0] = RecordKindDropCollation
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeDropCollation decodes a RecordKindDropCollation payload.
+func DecodeDropCollation(payload []byte) (name, schema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-collation payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropCollation {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-collation", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: drop-collation payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", fmt.Errorf("wal: drop-collation payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, nil
+}
+
+// EncodeAlterCollationRename encodes an ALTER COLLATION ... RENAME TO event
+// (DU-002 restart-persistence follow-up to M0119-0004). Format: kind(1) |
+// nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeAlterCollationRename(name, schema, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newName))
+	out[0] = RecordKindAlterCollationRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterCollationRename decodes a RecordKindAlterCollationRename payload.
+func DecodeAlterCollationRename(payload []byte) (name, schema, newName string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterCollationRename {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not alter-collation-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", "", fmt.Errorf("wal: alter-collation-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, schema, newName, nil
+}
+
+// EncodeAlterCollationOwner encodes an ALTER COLLATION ... OWNER TO event
+// (DU-002 restart-persistence follow-up to M0119-0004). Format: kind(1) |
+// ownerOID(4) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+// schema(schemaLen bytes).
+func EncodeAlterCollationOwner(name, schema string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 9+len(name)+len(schema))
+	out[0] = RecordKindAlterCollationOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	off := 5
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeAlterCollationOwner decodes a RecordKindAlterCollationOwner payload.
+func DecodeAlterCollationOwner(payload []byte) (name, schema string, ownerOID uint32, err error) {
+	if len(payload) < 9 {
+		return "", "", 0, fmt.Errorf("wal: alter-collation-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterCollationOwner {
+		return "", "", 0, fmt.Errorf("wal: record kind %d is not alter-collation-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	nameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+nameLen+2 {
+		return "", "", 0, fmt.Errorf("wal: alter-collation-owner payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", 0, fmt.Errorf("wal: alter-collation-owner payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, ownerOID, nil
+}
+
+// EncodeCreateAggregate encodes a CREATE AGGREGATE event (DU-002
+// restart-persistence follow-up to M0119-0004, slice 405 resume point (c)).
+// The OID is carried so recovery re-registers the aggregate identically to
+// the live server. `schema` carries the aggregate's namespace name (slice
+// 405 resume point (a)) so recovery can re-resolve pronamespace the same
+// way CreateCollation's WAL record does. Format documented at the
+// RecordKindCreateAggregate constant.
+func EncodeCreateAggregate(name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool) []byte {
+	strs := []string{name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify}
+	total := 0
+	for i, s := range strs {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+			strs[i] = s
+		}
+		total += 2 + len(s)
+	}
+	total += 2
+	for _, a := range argTypes {
+		if len(a) > 0xFFFF {
+			a = a[:0xFFFF]
+		}
+		total += 2 + len(a)
+	}
+	// 7-byte fixed header (kind + oid + 2 flag bytes) + 7 length-prefixed
+	// strings (2-byte length each) + arg-type count + arg-type strings.
+	out := make([]byte, 7+total)
+	out[0] = RecordKindCreateAggregate
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	if sFuncStrict {
+		out[5] = 1
+	}
+	if variadic {
+		out[6] = 1
+	}
+	off := 7
+	for _, s := range strs {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:], s)
+		off += len(s)
+	}
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(argTypes)))
+	off += 2
+	for _, a := range argTypes {
+		if len(a) > 0xFFFF {
+			a = a[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(a)))
+		off += 2
+		copy(out[off:], a)
+		off += len(a)
+	}
+	return out
+}
+
+// DecodeCreateAggregate decodes a RecordKindCreateAggregate payload.
+func DecodeCreateAggregate(payload []byte) (name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify string, argTypes []string, oid uint32, sFuncStrict, variadic bool, err error) {
+	if len(payload) < 7 {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateAggregate {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: record kind %d is not create-aggregate", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	sFuncStrict = payload[5] != 0
+	variadic = payload[6] != 0
+	off := 7
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if sType, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if sFunc, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if finalFunc, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if combineFunc, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if initCond, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if finalFuncModify, err = readStr(); err != nil {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", "", "", "", "", "", nil, 0, false, false, fmt.Errorf("wal: create-aggregate payload truncated (need %d bytes)", off+2)
+	}
+	argCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	argTypes = make([]string, 0, argCount)
+	for i := 0; i < argCount; i++ {
+		a, aerr := readStr()
+		if aerr != nil {
+			return "", "", "", "", "", "", "", "", nil, 0, false, false, aerr
+		}
+		argTypes = append(argTypes, a)
+	}
+	return name, schema, sType, sFunc, finalFunc, combineFunc, initCond, finalFuncModify, argTypes, oid, sFuncStrict, variadic, nil
+}
+
+// EncodeAlterAggregateRename encodes an ALTER AGGREGATE ... RENAME TO event
+// (DU-002 restart-persistence follow-up to M0119-0004, slice 405 resume
+// point (c)). Format: kind(1) | nameLen(2) | name(nameLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeAlterAggregateRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newName))
+	out[0] = RecordKindAlterAggregateRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterAggregateRename decodes a RecordKindAlterAggregateRename payload.
+func DecodeAlterAggregateRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: alter-aggregate-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterAggregateRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-aggregate-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-aggregate-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", fmt.Errorf("wal: alter-aggregate-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, newName, nil
+}
+
+// EncodeDropAggregate encodes a DROP AGGREGATE event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #56 ledger resume
+// point). Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeDropAggregate(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropAggregate
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropAggregate decodes a RecordKindDropAggregate payload.
+func DecodeDropAggregate(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-aggregate payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropAggregate {
+		return "", fmt.Errorf("wal: record kind %d is not drop-aggregate", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-aggregate payload truncated (need %d bytes)", 3+nameLen)
+	}
+	name = string(payload[3 : 3+nameLen])
+	return name, nil
+}
+
+// EncodeAlterAggregateOwner encodes an ALTER AGGREGATE ... OWNER TO event
+// (M0119-0004, loop #57 ledger follow-up). Unlike
+// EncodeAlterCollationOwner, aggregates have no Schema field yet (slice 405
+// ledger resume point (a)), so this format omits the schema component.
+// Format: kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterAggregateOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterAggregateOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterAggregateOwner decodes a RecordKindAlterAggregateOwner payload.
+func DecodeAlterAggregateOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-aggregate-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterAggregateOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-aggregate-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-aggregate-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	name = string(payload[7 : 7+nameLen])
+	return name, ownerOID, nil
+}
+
+// publicationFlags packs the four Publication boolean fields into a single
+// byte for EncodeCreatePublication (bit0=AllTables, bit1=PublishInsert,
+// bit2=PublishUpdate, bit3=PublishDelete).
+func publicationFlags(allTables, publishInsert, publishUpdate, publishDelete bool) byte {
+	var f byte
+	if allTables {
+		f |= 1 << 0
+	}
+	if publishInsert {
+		f |= 1 << 1
+	}
+	if publishUpdate {
+		f |= 1 << 2
+	}
+	if publishDelete {
+		f |= 1 << 3
+	}
+	return f
+}
+
+// EncodeCreatePublication encodes a CREATE PUBLICATION event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
+// point). The OID is carried so recovery re-registers the publication
+// identically to the live server. Format documented at the
+// RecordKindCreatePublication constant.
+func EncodeCreatePublication(name string, tables []string, oid, ownerOID uint32, allTables, publishInsert, publishUpdate, publishDelete bool) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	total := 10 + 2 + len(name) + 2
+	for _, t := range tables {
+		if len(t) > 0xFFFF {
+			t = t[:0xFFFF]
+		}
+		total += 2 + len(t)
+	}
+	out := make([]byte, total)
+	out[0] = RecordKindCreatePublication
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	out[9] = publicationFlags(allTables, publishInsert, publishUpdate, publishDelete)
+	off := 10
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tables)))
+	off += 2
+	for _, t := range tables {
+		if len(t) > 0xFFFF {
+			t = t[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(t)))
+		off += 2
+		copy(out[off:], t)
+		off += len(t)
+	}
+	return out
+}
+
+// DecodeCreatePublication decodes a RecordKindCreatePublication payload.
+func DecodeCreatePublication(payload []byte) (name string, tables []string, oid, ownerOID uint32, allTables, publishInsert, publishUpdate, publishDelete bool, err error) {
+	if len(payload) < 10 {
+		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreatePublication {
+		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: record kind %d is not create-publication", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	flags := payload[9]
+	allTables = flags&(1<<0) != 0
+	publishInsert = flags&(1<<1) != 0
+	publishUpdate = flags&(1<<2) != 0
+	publishDelete = flags&(1<<3) != 0
+	off := 10
+	if len(payload) < off+2 {
+		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+2)
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+nameLen+2 {
+		return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	tablesCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	tables = make([]string, 0, tablesCount)
+	for i := 0; i < tablesCount; i++ {
+		if len(payload) < off+2 {
+			return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", nil, 0, 0, false, false, false, false, fmt.Errorf("wal: create-publication payload truncated (need %d bytes)", off+l)
+		}
+		tables = append(tables, string(payload[off:off+l]))
+		off += l
+	}
+	return name, tables, oid, ownerOID, allTables, publishInsert, publishUpdate, publishDelete, nil
+}
+
+// EncodeDropPublication encodes a DROP PUBLICATION event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
+// point). Format documented at the RecordKindDropPublication constant.
+func EncodeDropPublication(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropPublication
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropPublication decodes a RecordKindDropPublication payload.
+func DecodeDropPublication(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-publication payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropPublication {
+		return "", fmt.Errorf("wal: record kind %d is not drop-publication", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-publication payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeAlterPublicationOwner encodes an ALTER PUBLICATION ... OWNER TO
+// event (DU-002 restart-persistence follow-up to M0119-0004, loop #67
+// ledger resume point). Format documented at the
+// RecordKindAlterPublicationOwner constant.
+func EncodeAlterPublicationOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterPublicationOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterPublicationOwner decodes a RecordKindAlterPublicationOwner
+// payload.
+func DecodeAlterPublicationOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-publication-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterPublicationOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-publication-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-publication-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return string(payload[7 : 7+nameLen]), ownerOID, nil
+}
+
+// EncodeCreateSubscription encodes a CREATE SUBSCRIPTION event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
+// point). The OID is carried so recovery re-registers the subscription
+// identically to the live server. Format documented at the
+// RecordKindCreateSubscription constant.
+func EncodeCreateSubscription(name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool) []byte {
+	strs := []string{name, conninfo, slotName}
+	for i, s := range strs {
+		if len(s) > 0xFFFF {
+			strs[i] = s[:0xFFFF]
+		}
+	}
+	name, conninfo, slotName = strs[0], strs[1], strs[2]
+	total := 10 + 2 + len(name) + 2 + len(conninfo) + 2 + len(slotName) + 2
+	for _, p := range publications {
+		if len(p) > 0xFFFF {
+			p = p[:0xFFFF]
+		}
+		total += 2 + len(p)
+	}
+	out := make([]byte, total)
+	out[0] = RecordKindCreateSubscription
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	if enabled {
+		out[9] = 1
+	}
+	off := 10
+	writeStr := func(s string) {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(s)))
+		off += 2
+		copy(out[off:], s)
+		off += len(s)
+	}
+	writeStr(name)
+	writeStr(conninfo)
+	writeStr(slotName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(publications)))
+	off += 2
+	for _, p := range publications {
+		if len(p) > 0xFFFF {
+			p = p[:0xFFFF]
+		}
+		writeStr(p)
+	}
+	return out
+}
+
+// DecodeCreateSubscription decodes a RecordKindCreateSubscription payload.
+func DecodeCreateSubscription(payload []byte) (name, conninfo, slotName string, publications []string, oid, ownerOID uint32, enabled bool, err error) {
+	if len(payload) < 10 {
+		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: create-subscription payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateSubscription {
+		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: record kind %d is not create-subscription", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	enabled = payload[9] != 0
+	off := 10
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", nil, 0, 0, false, err
+	}
+	if conninfo, err = readStr(); err != nil {
+		return "", "", "", nil, 0, 0, false, err
+	}
+	if slotName, err = readStr(); err != nil {
+		return "", "", "", nil, 0, 0, false, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", nil, 0, 0, false, fmt.Errorf("wal: create-subscription payload truncated (need %d bytes)", off+2)
+	}
+	pubCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	publications = make([]string, 0, pubCount)
+	for i := 0; i < pubCount; i++ {
+		s, serr := readStr()
+		if serr != nil {
+			return "", "", "", nil, 0, 0, false, serr
+		}
+		publications = append(publications, s)
+	}
+	return name, conninfo, slotName, publications, oid, ownerOID, enabled, nil
+}
+
+// EncodeDropSubscription encodes a DROP SUBSCRIPTION event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #67 ledger resume
+// point). Format documented at the RecordKindDropSubscription constant.
+func EncodeDropSubscription(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropSubscription
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropSubscription decodes a RecordKindDropSubscription payload.
+func DecodeDropSubscription(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-subscription payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropSubscription {
+		return "", fmt.Errorf("wal: record kind %d is not drop-subscription", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-subscription payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeAlterSubscriptionOwner encodes an ALTER SUBSCRIPTION ... OWNER TO
+// event (DU-002 restart-persistence follow-up to M0119-0004, loop #67
+// ledger resume point). Format documented at the
+// RecordKindAlterSubscriptionOwner constant.
+func EncodeAlterSubscriptionOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterSubscriptionOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterSubscriptionOwner decodes a RecordKindAlterSubscriptionOwner
+// payload.
+func DecodeAlterSubscriptionOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterSubscriptionOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-subscription-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-subscription-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return string(payload[7 : 7+nameLen]), ownerOID, nil
+}
+
+// EncodeCreateEventTrigger encodes a CREATE EVENT TRIGGER event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #70 ledger resume
+// point). The OID is carried so recovery re-registers the event trigger
+// identically to the live server. Format documented at the
+// RecordKindCreateEventTrigger constant.
+func EncodeCreateEventTrigger(name, event string, tags []string, oid, ownerOID, funcOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(event) > 0xFFFF {
+		event = event[:0xFFFF]
+	}
+	total := 14 + 2 + len(event) + 2 + len(name) + 2
+	for _, t := range tags {
+		if len(t) > 0xFFFF {
+			t = t[:0xFFFF]
+		}
+		total += 2 + len(t)
+	}
+	out := make([]byte, total)
+	out[0] = RecordKindCreateEventTrigger
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], funcOID)
+	off := 13
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(event)))
+	off += 2
+	copy(out[off:], event)
+	off += len(event)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tags)))
+	off += 2
+	for _, t := range tags {
+		if len(t) > 0xFFFF {
+			t = t[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(t)))
+		off += 2
+		copy(out[off:], t)
+		off += len(t)
+	}
+	return out
+}
+
+// DecodeCreateEventTrigger decodes a RecordKindCreateEventTrigger payload.
+func DecodeCreateEventTrigger(payload []byte) (name, event string, tags []string, oid, ownerOID, funcOID uint32, err error) {
+	if len(payload) < 13 {
+		return "", "", nil, 0, 0, 0, fmt.Errorf("wal: create-event-trigger payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateEventTrigger {
+		return "", "", nil, 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-event-trigger", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	funcOID = binary.LittleEndian.Uint32(payload[9:13])
+	off := 13
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-event-trigger payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-event-trigger payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if event, err = readStr(); err != nil {
+		return "", "", nil, 0, 0, 0, err
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", nil, 0, 0, 0, err
+	}
+	if len(payload) < off+2 {
+		return "", "", nil, 0, 0, 0, fmt.Errorf("wal: create-event-trigger payload truncated (need %d bytes)", off+2)
+	}
+	tagsCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	tags = make([]string, 0, tagsCount)
+	for i := 0; i < tagsCount; i++ {
+		s, serr := readStr()
+		if serr != nil {
+			return "", "", nil, 0, 0, 0, serr
+		}
+		tags = append(tags, s)
+	}
+	return name, event, tags, oid, ownerOID, funcOID, nil
+}
+
+// EncodeDropEventTrigger encodes a DROP EVENT TRIGGER event (DU-002
+// restart-persistence follow-up to M0119-0004, loop #70 ledger resume
+// point). Format documented at the RecordKindDropEventTrigger constant.
+func EncodeDropEventTrigger(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropEventTrigger
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropEventTrigger decodes a RecordKindDropEventTrigger payload.
+func DecodeDropEventTrigger(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-event-trigger payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropEventTrigger {
+		return "", fmt.Errorf("wal: record kind %d is not drop-event-trigger", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-event-trigger payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeAlterEventTriggerEnabled encodes an ALTER EVENT TRIGGER name
+// {DISABLE|ENABLE [REPLICA|ALWAYS]} event (DU-002 restart-persistence
+// follow-up to M0119-0004, loop #70 ledger resume point). code is the raw
+// pg_event_trigger.evtenabled value ('D'/'O'/'R'/'A'). Format documented at
+// the RecordKindAlterEventTriggerEnabled constant.
+func EncodeAlterEventTriggerEnabled(name string, code byte) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 4+len(name))
+	out[0] = RecordKindAlterEventTriggerEnabled
+	out[1] = code
+	binary.LittleEndian.PutUint16(out[2:4], uint16(len(name)))
+	copy(out[4:], name)
+	return out
+}
+
+// DecodeAlterEventTriggerEnabled decodes a
+// RecordKindAlterEventTriggerEnabled payload.
+func DecodeAlterEventTriggerEnabled(payload []byte) (name string, code byte, err error) {
+	if len(payload) < 4 {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-enabled payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterEventTriggerEnabled {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-event-trigger-enabled", payload[0])
+	}
+	code = payload[1]
+	nameLen := int(binary.LittleEndian.Uint16(payload[2:4]))
+	if len(payload) < 4+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-enabled payload truncated (need %d bytes)", 4+nameLen)
+	}
+	return string(payload[4 : 4+nameLen]), code, nil
+}
+
+// EncodeAlterEventTriggerRename encodes an ALTER EVENT TRIGGER name RENAME
+// TO newname event (DU-002 restart-persistence follow-up to M0119-0004,
+// loop #70 ledger resume point). Format documented at the
+// RecordKindAlterEventTriggerRename constant.
+func EncodeAlterEventTriggerRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newName))
+	out[0] = RecordKindAlterEventTriggerRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	off := 3 + len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterEventTriggerRename decodes a RecordKindAlterEventTriggerRename
+// payload.
+func DecodeAlterEventTriggerRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 3 {
+		return "", "", fmt.Errorf("wal: alter-event-trigger-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterEventTriggerRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-event-trigger-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-event-trigger-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", fmt.Errorf("wal: alter-event-trigger-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, newName, nil
+}
+
+// EncodeAlterEventTriggerOwner encodes an ALTER EVENT TRIGGER name OWNER TO
+// event (DU-002 restart-persistence follow-up to M0119-0004, loop #70
+// ledger resume point). Format documented at the
+// RecordKindAlterEventTriggerOwner constant.
+func EncodeAlterEventTriggerOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterEventTriggerOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterEventTriggerOwner decodes a RecordKindAlterEventTriggerOwner
+// payload.
+func DecodeAlterEventTriggerOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterEventTriggerOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-event-trigger-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-event-trigger-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return string(payload[7 : 7+nameLen]), ownerOID, nil
+}
+
+// FunctionArgPayload is one CREATE FUNCTION/PROCEDURE argument, mirroring
+// the parallel ArgNames/ArgTypes/ArgModes/ArgDefaults slices on
+// catalog.Routine. TypeArgs carries a type's numeric modifiers (e.g.
+// numeric(10,2)'s precision/scale) — these do not affect overload
+// resolution (PG's proargtypes is an OID list, not typmods) but do affect
+// pg_dump fidelity, so they are round-tripped like everything else.
+type FunctionArgPayload struct {
+	Name     string
+	TypeName string
+	TypeArgs []int64
+	Mode     string // "i"/"o"/"b"/"v", "" defaults to "i"
+	Default  string
+}
+
+// CreateFunctionPayload carries the metadata needed to fully reconstruct a
+// catalog.Routine during WAL replay. Dependency-tracking fields
+// (SequenceDeps/RoutineCallOIDs/TableDeps/ColumnDeps) are deliberately NOT
+// carried — the recovery driver recomputes them from Body/ArgDefaults via
+// executor.ExtractRoutineDeps after registering, the same way the live
+// CREATE FUNCTION path derives them, rather than serializing derived state.
+type CreateFunctionPayload struct {
+	OID             uint32
+	Schema          string
+	Name            string
+	Args            []FunctionArgPayload
+	ReturnTypeName  string
+	ReturnTypeArgs  []int64
+	ReturnsSet      bool
+	ReturnsTable    bool
+	Language        string
+	Body            string
+	Strict          bool
+	Volatile        string
+	Parallel        string
+	Cost            string
+	Rows            string
+	SecurityDefiner bool
+	Leakproof       bool
+	IsProcedure     bool
+	IsWindow        bool
+	BeginAtomic     bool
+	IsReturnForm    bool
+	KindChar        string
+}
+
+// EncodeCreateFunction encodes a CREATE [OR REPLACE] FUNCTION/PROCEDURE
+// event (DU-002 restart-persistence follow-up to M0119-0004, loop #71
+// ledger resume point). Format documented at the RecordKindCreateFunction
+// constant; uses 2-byte length-prefixed strings throughout except Body,
+// which gets a 4-byte prefix since a plpgsql routine body can plausibly
+// exceed 65535 bytes (unlike every other DU-002 WAL-persisted DDL family's
+// string fields).
+func EncodeCreateFunction(p CreateFunctionPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateFunction)
+	var oidBuf [4]byte
+	binary.LittleEndian.PutUint32(oidBuf[:], p.OID)
+	buf.Write(oidBuf[:])
+	var flags, flags2 byte
+	if p.ReturnsSet {
+		flags |= 1 << 0
+	}
+	if p.ReturnsTable {
+		flags |= 1 << 1
+	}
+	if p.Strict {
+		flags |= 1 << 2
+	}
+	if p.SecurityDefiner {
+		flags |= 1 << 3
+	}
+	if p.Leakproof {
+		flags |= 1 << 4
+	}
+	if p.IsProcedure {
+		flags |= 1 << 5
+	}
+	if p.IsWindow {
+		flags |= 1 << 6
+	}
+	if p.BeginAtomic {
+		flags |= 1 << 7
+	}
+	if p.IsReturnForm {
+		flags2 |= 1 << 0
+	}
+	buf.WriteByte(flags)
+	buf.WriteByte(flags2)
+	writeWALStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeWALStr32 := func(s string) {
+		if uint64(len(s)) > 0xFFFFFFFF {
+			s = s[:0xFFFFFFFF]
+		}
+		var l [4]byte
+		binary.LittleEndian.PutUint32(l[:], uint32(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeI64s := func(a []int64) {
+		var l [2]byte
+		if len(a) > 0xFFFF {
+			a = a[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(l[:], uint16(len(a)))
+		buf.Write(l[:])
+		var v [8]byte
+		for _, x := range a {
+			binary.LittleEndian.PutUint64(v[:], uint64(x))
+			buf.Write(v[:])
+		}
+	}
+	writeWALStr16(p.Schema)
+	writeWALStr16(p.Name)
+	writeWALStr16(p.Language)
+	writeWALStr16(p.Volatile)
+	writeWALStr16(p.Parallel)
+	writeWALStr16(p.Cost)
+	writeWALStr16(p.Rows)
+	writeWALStr16(p.KindChar)
+	writeWALStr32(p.Body)
+	writeWALStr16(p.ReturnTypeName)
+	writeI64s(p.ReturnTypeArgs)
+	var argCount [2]byte
+	args := p.Args
+	if len(args) > 0xFFFF {
+		args = args[:0xFFFF]
+	}
+	binary.LittleEndian.PutUint16(argCount[:], uint16(len(args)))
+	buf.Write(argCount[:])
+	for _, a := range args {
+		writeWALStr16(a.Name)
+		writeWALStr16(a.TypeName)
+		writeI64s(a.TypeArgs)
+		mode := byte(0)
+		if len(a.Mode) > 0 {
+			mode = a.Mode[0]
+		}
+		buf.WriteByte(mode)
+		writeWALStr16(a.Default)
+	}
+	return buf.Bytes()
+}
+
+// DecodeCreateFunction decodes a RecordKindCreateFunction payload.
+func DecodeCreateFunction(payload []byte) (CreateFunctionPayload, error) {
+	var p CreateFunctionPayload
+	if len(payload) < 7 {
+		return p, fmt.Errorf("wal: create-function payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateFunction {
+		return p, fmt.Errorf("wal: record kind %d is not create-function", payload[0])
+	}
+	p.OID = binary.LittleEndian.Uint32(payload[1:5])
+	flags := payload[5]
+	flags2 := payload[6]
+	p.ReturnsSet = flags&(1<<0) != 0
+	p.ReturnsTable = flags&(1<<1) != 0
+	p.Strict = flags&(1<<2) != 0
+	p.SecurityDefiner = flags&(1<<3) != 0
+	p.Leakproof = flags&(1<<4) != 0
+	p.IsProcedure = flags&(1<<5) != 0
+	p.IsWindow = flags&(1<<6) != 0
+	p.BeginAtomic = flags&(1<<7) != 0
+	p.IsReturnForm = flags2&(1<<0) != 0
+	off := 7
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	readStr32 := func() (string, error) {
+		if len(payload) < off+4 {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+4)
+		}
+		l := int(binary.LittleEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	readI64s := func() ([]int64, error) {
+		if len(payload) < off+2 {
+			return nil, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+		}
+		count := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+count*8 {
+			return nil, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+count*8)
+		}
+		out := make([]int64, count)
+		for i := 0; i < count; i++ {
+			out[i] = int64(binary.LittleEndian.Uint64(payload[off : off+8]))
+			off += 8
+		}
+		return out, nil
+	}
+	var err error
+	if p.Schema, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Name, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Language, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Volatile, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Parallel, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Cost, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Rows, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.KindChar, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.Body, err = readStr32(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.ReturnTypeName, err = readStr16(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if p.ReturnTypeArgs, err = readI64s(); err != nil {
+		return CreateFunctionPayload{}, err
+	}
+	if len(payload) < off+2 {
+		return CreateFunctionPayload{}, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+2)
+	}
+	argCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	p.Args = make([]FunctionArgPayload, 0, argCount)
+	for i := 0; i < argCount; i++ {
+		var a FunctionArgPayload
+		if a.Name, err = readStr16(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		if a.TypeName, err = readStr16(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		if a.TypeArgs, err = readI64s(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		if len(payload) < off+1 {
+			return CreateFunctionPayload{}, fmt.Errorf("wal: create-function payload truncated (need %d bytes)", off+1)
+		}
+		if payload[off] != 0 {
+			a.Mode = string(payload[off])
+		}
+		off++
+		if a.Default, err = readStr16(); err != nil {
+			return CreateFunctionPayload{}, err
+		}
+		p.Args = append(p.Args, a)
+	}
+	return p, nil
+}
+
+// EncodeDropFunction encodes a DROP FUNCTION/PROCEDURE removal by OID
+// (DU-002 restart-persistence follow-up to M0119-0004, loop #71 ledger
+// resume point). Format documented at the RecordKindDropFunction constant.
+func EncodeDropFunction(oid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindDropFunction
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	return out
+}
+
+// DecodeDropFunction decodes a RecordKindDropFunction payload.
+func DecodeDropFunction(payload []byte) (oid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: drop-function payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropFunction {
+		return 0, fmt.Errorf("wal: record kind %d is not drop-function", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// EncodeAlterFunctionRename encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// RENAME TO event (DU-002 restart-persistence follow-up to M0119-0004,
+// loop #71 ledger resume point). Format documented at the
+// RecordKindAlterFunctionRename constant.
+func EncodeAlterFunctionRename(oid uint32, newName string) []byte {
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(newName))
+	out[0] = RecordKindAlterFunctionRename
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(newName)))
+	copy(out[7:], newName)
+	return out
+}
+
+// DecodeAlterFunctionRename decodes a RecordKindAlterFunctionRename
+// payload.
+func DecodeAlterFunctionRename(payload []byte) (oid uint32, newName string, err error) {
+	if len(payload) < 7 {
+		return 0, "", fmt.Errorf("wal: alter-function-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionRename {
+		return 0, "", fmt.Errorf("wal: record kind %d is not alter-function-rename", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return 0, "", fmt.Errorf("wal: alter-function-rename payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return oid, string(payload[7 : 7+nameLen]), nil
+}
+
+// EncodeAlterFunctionFlags encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// attribute change as a full post-mutation snapshot of the four mutable
+// attributes (DU-002 restart-persistence follow-up to M0119-0004, loop #71
+// ledger resume point). Format documented at the RecordKindAlterFunctionFlags
+// constant.
+func EncodeAlterFunctionFlags(oid uint32, volatile string, securityDefiner, leakproof, strict bool) []byte {
+	if len(volatile) > 0xFFFF {
+		volatile = volatile[:0xFFFF]
+	}
+	out := make([]byte, 8+len(volatile))
+	out[0] = RecordKindAlterFunctionFlags
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	var flags byte
+	if securityDefiner {
+		flags |= 1 << 0
+	}
+	if leakproof {
+		flags |= 1 << 1
+	}
+	if strict {
+		flags |= 1 << 2
+	}
+	out[5] = flags
+	binary.LittleEndian.PutUint16(out[6:8], uint16(len(volatile)))
+	copy(out[8:], volatile)
+	return out
+}
+
+// DecodeAlterFunctionFlags decodes a RecordKindAlterFunctionFlags payload.
+func DecodeAlterFunctionFlags(payload []byte) (oid uint32, volatile string, securityDefiner, leakproof, strict bool, err error) {
+	if len(payload) < 8 {
+		return 0, "", false, false, false, fmt.Errorf("wal: alter-function-flags payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionFlags {
+		return 0, "", false, false, false, fmt.Errorf("wal: record kind %d is not alter-function-flags", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	flags := payload[5]
+	securityDefiner = flags&(1<<0) != 0
+	leakproof = flags&(1<<1) != 0
+	strict = flags&(1<<2) != 0
+	volLen := int(binary.LittleEndian.Uint16(payload[6:8]))
+	if len(payload) < 8+volLen {
+		return 0, "", false, false, false, fmt.Errorf("wal: alter-function-flags payload truncated (need %d bytes)", 8+volLen)
+	}
+	return oid, string(payload[8 : 8+volLen]), securityDefiner, leakproof, strict, nil
 }
 
 // CreateIndexPayload carries the metadata needed to fully
@@ -2174,6 +4670,25 @@ func ExportedReplayStart(records []Record) (int, uint64) {
 	return replayStart(records)
 }
 
+// IsGoopgNativeRecord reports whether r.Payload[0] is a trustworthy goopg
+// RecordKind tag byte that a caller may safely switch on. A record with a
+// non-nil XLog that did NOT classify as RmgrXLog+xlogInfoDefault is a
+// structurally real PG-native record (e.g. an XLOG_CHECKPOINT_SHUTDOWN) whose
+// MainData is raw PG struct bytes with no goopg kind tag at all — Payload[0]
+// in that case is arbitrary data (e.g. a checkpoint's redo-LSN low byte) that
+// can coincidentally collide with a real RecordKind constant, exactly the
+// M0106-0011 collision ApplyRecord below guards against. The catalog-only
+// DDL-recovery scanners (internal/initdb/*_ddl_recovery.go — schema,
+// transform, cast, conversion, ...) share this same hazard because they
+// walk the same `wal.ReadAll` records and switch on Payload[0]; they must
+// call this before trusting the byte. DU-002 restart-persistence follow-up.
+func IsGoopgNativeRecord(r Record) bool {
+	if r.XLog == nil {
+		return true
+	}
+	return r.XLog.Header.Rmid == RmgrXLog && r.XLog.Header.Info == xlogInfoDefault
+}
+
 // ApplyRecord applies a single decoded WAL record to storage. It is
 // the per-record kernel shared by `ReplayRecords` (crash recovery
 // from a slice already trimmed to the last checkpoint) and
@@ -2342,6 +4857,98 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// for these records after physical replay and re-applies them to
 		// the catalog's schema registry.
 		return false, nil
+	case RecordKindCreateTransform, RecordKindDropTransform:
+		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)
+		// carry only pg_transform metadata; goopg has no per-transform file
+		// namespace, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/transform_ddl_recovery.go scans
+		// the WAL for these records after physical replay and re-applies
+		// them to the catalog's transform registry.
+		return false, nil
+	case RecordKindCreateCast, RecordKindDropCast:
+		// CREATE/DROP CAST records (DU-002 restart-persistence follow-up)
+		// carry only pg_cast metadata; goopg has no per-cast file namespace,
+		// so the physical replay path has nothing to do. The recovery
+		// driver in internal/initdb/cast_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's cast registry.
+		return false, nil
+	case RecordKindSequenceState, RecordKindDropSequence:
+		// Sequence state / removal records (SERIAL restart persistence)
+		// carry only the executor's in-memory sequence registry state; a
+		// sequence has no physical relation file in goopg, so the physical
+		// replay path has nothing to do. The recovery driver in
+		// internal/initdb/sequence_ddl_recovery.go scans the WAL for these
+		// records after physical replay (and after loadUserTablesFromHeap)
+		// and re-applies them to the sequence registry + the owning
+		// column's serial/identity catalog markers.
+		return false, nil
+	case RecordKindRoleState, RecordKindDropRole:
+		// Role state / removal records (CREATE/ALTER/DROP ROLE restart
+		// persistence) carry only the in-memory role registry state +
+		// credential; runtime role DDL never writes the pg_authid heap
+		// (initdb-only, like all on-disk shared catalogs), so the physical
+		// replay path has nothing to do. The recovery driver in
+		// internal/initdb/role_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the catalog
+		// role registry; cmd/goopg seeds the auth UserStore from it.
+		return false, nil
+	case RecordKindColumnDefaults:
+		// Column DEFAULT snapshots (root-0020 follow-up) carry only the
+		// in-memory catalog's DefaultExpr ASTs as SQL text; no physical
+		// page state. The recovery driver in
+		// internal/initdb/column_defaults_recovery.go re-parses them after
+		// loadUserTablesFromHeap.
+		return false, nil
+	case RecordKindCreateConversion, RecordKindDropConversion:
+		// CREATE/DROP CONVERSION records (DU-002 restart-persistence
+		// follow-up) carry only pg_conversion metadata; goopg has no
+		// per-conversion file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/conversion_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's conversion registry.
+		return false, nil
+	case RecordKindCreateCollation, RecordKindDropCollation, RecordKindAlterCollationRename, RecordKindAlterCollationOwner:
+		// CREATE/DROP/ALTER COLLATION records (DU-002 restart-persistence
+		// follow-up) carry only pg_collation metadata; goopg has no
+		// per-collation file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/collation_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's collation registry.
+		return false, nil
+	case RecordKindCreatePublication, RecordKindDropPublication, RecordKindAlterPublicationOwner,
+		RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
+		// CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION records (DU-002
+		// restart-persistence follow-up, M0119-0004 loop #67 ledger resume
+		// point) carry only catalog.PubSub metadata; goopg has no
+		// per-publication/subscription file namespace, so the physical
+		// replay path has nothing to do. The recovery driver in
+		// internal/initdb/pubsub_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the PubSub
+		// registry.
+		return false, nil
+	case RecordKindCreateEventTrigger, RecordKindDropEventTrigger, RecordKindAlterEventTriggerEnabled,
+		RecordKindAlterEventTriggerRename, RecordKindAlterEventTriggerOwner:
+		// CREATE/DROP/ALTER EVENT TRIGGER records (DU-002 restart-persistence
+		// follow-up, M0119-0004 loop #70 ledger resume point) carry only
+		// catalog.InMemory's eventTriggers registry metadata; goopg has no
+		// per-event-trigger file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/event_trigger_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// event trigger registry.
+		return false, nil
+	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate, RecordKindAlterAggregateOwner:
+		// CREATE/ALTER/DROP AGGREGATE records (DU-002 restart-persistence
+		// follow-up, slice 405 resume point (c)) carry only pg_aggregate/
+		// pg_proc metadata; goopg has no per-aggregate file namespace, so
+		// the physical replay path has nothing to do. The recovery driver
+		// in internal/initdb/aggregate_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// catalog's user-aggregate registry.
+		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
 		// metadata that goopg's heap representation cannot fully
@@ -2475,11 +5082,14 @@ func replayDecodedXLogRecord(mgr *storage.Manager, r Record) (bool, error) {
 				return false, err
 			}
 			return true, nil
-		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate:
-			// All three record types are emitted with full-page images
+		case xlogHeapDelete, xlogHeapUpdate, xlogHeapHotUpdate, xlogHeapInplace:
+			// All four record types are emitted with full-page images
 			// (HasImage+ImageApply on every referenced block). Restore each
 			// block from its FPI; tuple-level main-data parsing is not needed
 			// because the FPI already captures the post-mutation page state.
+			// xlogHeapInplace (M0117-0008 Part B) carries the same
+			// datfrozenxid-advanced pg_database page PgCanonicalHeapInplace
+			// wrote on the primary.
 			if err := replayDecodedXLogHeapFPIBlocks(mgr, r, xlog); err != nil {
 				return false, err
 			}

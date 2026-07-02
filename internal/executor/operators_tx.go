@@ -135,6 +135,24 @@ func (o *transactionOp) execCommit() error {
 				return err
 			}
 		}
+		// Deferred UNIQUE/PK constraint checks (DEFERRABLE INITIALLY DEFERRED, or
+		// made deferred by SET CONSTRAINTS … DEFERRED). 0119-0004 (deferred-unique).
+		if err := RunDeferredUniqueChecks(o.ctx, sess); err != nil {
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			o.ctx.Session.EndExplicitTransaction()
+			undoEnumDDLFromContext(o.ctx)
+			o.clearCtxTransaction()
+			return err
+		}
+		// Deferred EXCLUDE constraint checks (DEFERRABLE INITIALLY DEFERRED, or
+		// made deferred by SET CONSTRAINTS … DEFERRED). 0119-0004 (deferred-exclusion).
+		if err := RunDeferredExclusionChecks(o.ctx, sess); err != nil {
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			o.ctx.Session.EndExplicitTransaction()
+			undoEnumDDLFromContext(o.ctx)
+			o.clearCtxTransaction()
+			return err
+		}
 	}
 	// M0104-0007: SSI pre-commit dangerous-structure check for SERIALIZABLE.
 	// Runs BEFORE TxnMgr.Commit so a detected rw-cycle can be translated to
@@ -171,7 +189,7 @@ func (o *transactionOp) execCommit() error {
 		// to other sessions until now).
 		ApplyDeferredRoutineDrops(o.ctx, sess)
 	}
-	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
+	if err := o.ctx.CommitTransaction(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	o.clearPgClassRowMarks(tx)
@@ -197,9 +215,8 @@ func (o *transactionOp) execCommit() error {
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()
 	}
-	// Clear pending routine drops and truncate undos — they're committed.
+	// Clear pending truncate/sequence undos — they're committed.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
-		sess.TakePendingRoutineDrops()
 		sess.TakePendingTruncates()
 		sess.TakePendingSeqRestores()
 	}
@@ -221,15 +238,7 @@ func (o *transactionOp) execRollback() error {
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
 		// Undo DDL creates, TRUNCATE page snapshots, and RESTART IDENTITY.
 		ProcessRollbackUndos(o.ctx, sess)
-		// Restore any routines that were dropped in this transaction.
-		for _, r := range sess.TakePendingRoutineDrops() {
-			if rs := o.ctx.Catalog.Routines(); rs != nil {
-				// orReplace=true: if the key somehow exists (e.g. a concurrent
-				// create raced in), overwrite it so the drop is fully reversed.
-				_, _ = rs.Create(r, true)
-			}
-		}
-		// M0118-0009 (`stats`): discard DROP FUNCTION drops deferred to COMMIT —
+		// M0118-0009 (`stats`): discard DROP FUNCTION/PROCEDURE drops deferred to COMMIT —
 		// the routines were never removed from the registry (kept visible until
 		// commit), so ROLLBACK only needs to drop the deferred entries.
 		sess.TakeDeferredRoutineDrops()
@@ -565,6 +574,68 @@ func (o *setTransactionOp) Next() (TupleSlot, error) {
 	}
 	if serr := o.ctx.Session.SetIsolationLevel(level); serr != nil {
 		return nil, &ExecError{Code: "0A000", Message: serr.Error()}
+	}
+	return nil, EOF
+}
+
+// setConstraintsOp applies a SET CONSTRAINTS { ALL | name [, ...] }
+// { DEFERRED | IMMEDIATE } statement: it records the deferral override on the
+// session and, for an IMMEDIATE request, runs any already-queued deferred FK
+// checks the change makes immediate right away (so a violation raises at this
+// statement, as PG does). 0119-0004.
+type setConstraintsOp struct {
+	stmt *parser.SetConstraintsStmt
+	ctx  *Context
+	done bool
+}
+
+func newSetConstraintsOp(s *parser.SetConstraintsStmt) *setConstraintsOp {
+	return &setConstraintsOp{stmt: s}
+}
+
+func (o *setConstraintsOp) Schema() planner.Schema  { return nil }
+func (o *setConstraintsOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
+func (o *setConstraintsOp) Close() error            { return nil }
+
+func (o *setConstraintsOp) Next() (TupleSlot, error) {
+	if o.done {
+		return nil, EOF
+	}
+	o.done = true
+	if o.ctx == nil || o.ctx.Session == nil {
+		return nil, EOF
+	}
+	sess, ok := o.ctx.Session.(*BasicSession)
+	if !ok {
+		return nil, EOF
+	}
+	// Outside an explicit transaction block the surrounding single-statement
+	// transaction ends immediately, so the override has no lasting effect — PG
+	// treats this as a near no-op. Record nothing to avoid leaking state across
+	// autocommit statements.
+	if !sess.InExplicitTransaction() {
+		return nil, EOF
+	}
+	if o.stmt.All {
+		sess.SetConstraintsAll(o.stmt.Deferred)
+	} else {
+		sess.SetConstraintsNamed(o.stmt.Names, o.stmt.Deferred)
+	}
+	// IMMEDIATE: run any pending deferred FK + UNIQUE checks the change makes
+	// immediate right away, so a violation raises at this statement (PG semantics).
+	if !o.stmt.Deferred {
+		checks := sess.TakeDeferredFKChecksMatching(o.stmt.All, o.stmt.Names)
+		if err := runAllDeferredFKChecks(o.ctx, checks); err != nil {
+			return nil, err
+		}
+		uChecks := sess.TakeDeferredUniqueChecksMatching(o.stmt.All, o.stmt.Names)
+		if err := runAllDeferredUniqueChecks(o.ctx, uChecks); err != nil {
+			return nil, err
+		}
+		xChecks := sess.TakeDeferredExclusionChecksMatching(o.stmt.All, o.stmt.Names)
+		if err := runAllDeferredExclusionChecks(o.ctx, xChecks); err != nil {
+			return nil, err
+		}
 	}
 	return nil, EOF
 }
