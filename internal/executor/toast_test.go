@@ -219,6 +219,129 @@ func TestDetoastValueRejectsImplausibleTotalLength(t *testing.T) {
 	}
 }
 
+// TestToastOIDCounterCollisionAcrossRestart reproduces the WordPress
+// wp_options neighbor-row corruption (deferral ledger 2026-07-02): the
+// executor's toastOIDCounter is process-local and always starts at 0, but
+// a table's TOAST relation survives a restart on disk. Without reseeding
+// the counter from existing TOAST content at startup, the next TOASTed
+// value written after a restart reissues chunk_id 1 (colliding with an
+// earlier value's still-resident chunk_id 1 in the same TOAST relation)
+// and DetoastValue's oid-only scan (toast.go) splices the two unrelated
+// values' chunks together, corrupting both. This test simulates the
+// restart boundary (counter reset) and verifies that reseeding via
+// SeedToastOIDCounter — exactly as internal/initdb/open.go now does once
+// at startup — prevents the collision.
+func TestToastOIDCounterCollisionAcrossRestart(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE opts (id int, v text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "opts"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+
+	// valueA mirrors the reported wp_user_roles size; valueB mirrors the
+	// reported oversized theme-patterns transient.
+	valueA := strings.Repeat("A", 3992)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
+		{Kind: KindInt, Int: 1}, NewStringDatum(valueA),
+	}); err != nil {
+		t.Fatalf("insert A (pre-restart): %v", err)
+	}
+
+	// Simulate a goopg process restart: the in-memory counter resets to 0,
+	// exactly as it would on a fresh process start, but valueA's TOAST
+	// chunks and its inline pointer (in row id=1) survive on disk.
+	toastOIDCounter.Store(0)
+
+	// The startup reseed a real restart now performs (internal/initdb/
+	// open.go, after loadUserTablesFromHeap): scan every table's TOAST
+	// relation and advance the counter past the highest chunk_id found.
+	if err := SeedToastOIDCounter(ctx.Pool, []storage.RelFileNode{rel}); err != nil {
+		t.Fatalf("SeedToastOIDCounter: %v", err)
+	}
+
+	valueB := strings.Repeat("B", 30000)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
+		{Kind: KindInt, Int: 2}, NewStringDatum(valueB),
+	}); err != nil {
+		t.Fatalf("insert B (post-restart): %v", err)
+	}
+
+	rows := runQuery(t, ctx, "SELECT id, v FROM opts ORDER BY id")
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if got := rows[0][1].StringValue(); got != valueA {
+		t.Errorf("row id=1 (pre-restart value) corrupted by post-restart TOAST OID collision: got %d bytes, want %d bytes of 'A'",
+			len(got), len(valueA))
+	}
+	if got := rows[1][1].StringValue(); got != valueB {
+		t.Errorf("row id=2 (post-restart value) corrupted: got %d bytes, want %d bytes of 'B'", len(got), len(valueB))
+	}
+}
+
+// TestMaxToastChunkIDInRelNoFile verifies the Pool.Exists short-circuit:
+// a table that never TOASTed a value has no on-disk TOAST relation file,
+// and MaxToastChunkIDInRel must not create one via a stray NBlocks/Pin
+// call (see goopg_smgr_ocreate_recreates_removed_files).
+func TestMaxToastChunkIDInRelNoFile(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	toastRel := storage.RelFileNode{DBOid: 1, RelOid: 999_000_000, Fork: storage.MainFork}
+	max, found, err := MaxToastChunkIDInRel(ctx.Pool, toastRel)
+	if err != nil {
+		t.Fatalf("MaxToastChunkIDInRel: %v", err)
+	}
+	if found {
+		t.Errorf("expected found=false for a never-created TOAST relation, got max=%d", max)
+	}
+	if ctx.Pool.Exists(toastRel) {
+		t.Errorf("MaxToastChunkIDInRel must not create the TOAST relation file as a side effect")
+	}
+}
+
+// TestSeedToastOIDCounterAdvancesPastExisting is a focused unit test for
+// the seeding helper itself (independent of the restart-simulation
+// end-to-end test above): after writing a TOASTed value with a known oid,
+// resetting the counter, and reseeding, the very next assigned oid must
+// exceed every oid physically present in the TOAST relation.
+func TestSeedToastOIDCounterAdvancesPastExisting(t *testing.T) {
+	ctx, cleanup := newToastFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE seed_test (id int, v text)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "seed_test"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{
+		{Kind: KindInt, Int: 1}, NewStringDatum(strings.Repeat("Z", ToastThreshold+1)),
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	toastRel := ToastRelFor(rel)
+	wantMax, found, err := MaxToastChunkIDInRel(ctx.Pool, toastRel)
+	if err != nil {
+		t.Fatalf("MaxToastChunkIDInRel: %v", err)
+	}
+	if !found || wantMax == 0 {
+		t.Fatalf("expected a non-zero max chunk_id, got found=%v max=%d", found, wantMax)
+	}
+
+	toastOIDCounter.Store(0)
+	if err := SeedToastOIDCounter(ctx.Pool, []storage.RelFileNode{rel}); err != nil {
+		t.Fatalf("SeedToastOIDCounter: %v", err)
+	}
+	if next := toastNextOID(); next <= wantMax {
+		t.Errorf("next assigned oid %d does not exceed existing max %d", next, wantMax)
+	}
+}
+
 // TestToastRelFor verifies the TOAST relation OID derivation.
 func TestToastRelFor(t *testing.T) {
 	rel := storage.RelFileNode{DBOid: 1, RelOid: 16384, Fork: storage.MainFork}

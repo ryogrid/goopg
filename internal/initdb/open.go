@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -1026,6 +1027,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	for _, tbl := range cat.AllTables() {
 		if tbl.OID >= catalog.FirstUserOID {
 			cat.AdvanceNextOIDPast(tbl.OID)
+		}
+	}
+
+	// TOAST OID counter restart persistence (root-0022 follow-up): the
+	// executor's toastOIDCounter is process-local and always starts at 0,
+	// but the TOAST relations it writes chunk_id rows into survive a
+	// restart on disk. Without reseeding, the first TOAST write after
+	// every restart would reissue chunk_id 1, colliding with whatever
+	// chunk_id 1 already resides in the same table's TOAST relation from
+	// before the restart and corrupting detoast reassembly for BOTH
+	// values (deferral ledger 2026-07-02, WordPress wp_options neighbor-row
+	// corruption). Runs unconditionally (even on the M0114 cache-hit path)
+	// since the counter always resets on process start regardless of how
+	// the catalog was loaded. Skips any table whose TOAST relation has no
+	// on-disk file yet (cheap Pool.Exists check inside).
+	{
+		mainRels := make([]storage.RelFileNode, 0, len(cat.AllTables()))
+		for _, tbl := range cat.AllTables() {
+			mainRels = append(mainRels, cat.RelFileNode(tbl))
+		}
+		if err := executor.SeedToastOIDCounter(pool, mainRels); err != nil {
+			slog.Warn("TOAST OID counter reseed failed", "err", err)
 		}
 	}
 

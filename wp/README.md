@@ -126,22 +126,29 @@ because goopg's `CREATE DATABASE` / `CREATE ROLE` are in-memory-only in v0 and d
 ## Known limitations
 
 Most of the gaps this setup originally surfaced have since been **fixed in
-goopg** (see `docs/design/root-0019` … `root-0021`): unknown-literal coercion
+goopg** (see `docs/design/root-0019` … `root-0022`): unknown-literal coercion
 (`WHERE ID = '1'`), sequence/SERIAL restart persistence, column DEFAULT
-restart persistence, upsert serial/DEFAULT parity, and persistent roles/auth.
-The full stack now works: public blog, **wp-admin dashboard**, post creation,
-and restart durability for schema, ids, defaults, and roles.
+restart persistence, upsert serial/DEFAULT parity, persistent roles/auth, and
+TOAST chunk_id restart durability (the oversized-option neighbor-row
+corruption below). The full stack now works: public blog, **wp-admin
+dashboard**, post creation, and restart durability for schema, ids, defaults,
+roles, and large (TOASTed) option values across restarts.
 
-Remaining known issues:
+Formerly-observed issue, now fixed (root-0022):
 
-- **Oversized-option page corruption after restart (open goopg bug).** goopg
-  has no TOAST; WordPress stores a few >8KB option values (theme-patterns /
-  block-CSS transients, up to ~30KB). After heavy admin traffic followed by a
-  goopg restart, a *neighboring* small row (`wp_user_roles`) has twice been
-  observed reading back with foreign bytes, which fatals WordPress
-  (`array_keys(): Argument #1 must be of type array`). Tracked in
-  `.ralph/deferral_ledger.md` with the evidence and repro plan. **Repair**,
-  should it happen:
+- **Oversized-option page corruption after restart.** WordPress stores a few
+  >8KB option values (theme-patterns / block-CSS transients, up to ~30KB) as
+  TOASTed values. The TOAST chunk-id counter reset to 0 on every goopg
+  restart while the TOAST relation itself survived on disk, so the first
+  TOASTed value written after a restart could reuse a `chunk_id` still held
+  by a pre-restart value in the same table, corrupting both on detoast — this
+  is what caused a *neighboring* small row (`wp_user_roles`) to read back
+  with foreign bytes and fatal WordPress
+  (`array_keys(): Argument #1 must be of type array`). Root-caused and fixed
+  by seeding the counter from existing TOAST content at startup; see
+  `docs/design/root-0022-toast-oid-restart-durability.md` and
+  `.ralph/deferral_ledger.md`. If a data directory created *before* this fix
+  still shows the symptom, repair it once with:
 
   ```bash
   psql -h 127.0.0.1 -p 5544 -U postgres -d postgres <<'SQL'
@@ -152,6 +159,8 @@ Remaining known issues:
   docker compose run --rm wpcli wp eval \
     'require_once(ABSPATH . "wp-admin/includes/schema.php"); populate_roles();'
   ```
+
+Remaining known issues:
 
 - **WordPress update checks are disabled** via a mu-plugin
   (`mu-plugins/disable-update-checks.php`): `wp_version_check()`'s

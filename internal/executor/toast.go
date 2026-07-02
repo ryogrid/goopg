@@ -29,14 +29,110 @@ const (
 )
 
 // toastOIDCounter is a process-global counter for assigning unique OIDs
-// to TOAST values. Not persisted; on restart the counter resets and old
-// TOAST tables are abandoned (the main heap is dropped simultaneously in
-// practice). An atomic int64 avoids the serialisation overhead of a mutex
-// for the common concurrent-insert workload.
+// to TOAST values. It is not itself persisted — it resets to 0 on every
+// process start — but the main heap (and therefore live TOAST pointers
+// referencing values written before the restart) very much does survive a
+// restart. Without reseeding, the counter would reissue chunk_id 1, 2, 3…
+// after every restart, colliding with whatever chunk_ids are still
+// physically resident in the same TOAST relation from before the restart
+// and splicing unrelated rows' bytes together on detoast (root cause of
+// the WordPress wp_options neighbor-row corruption, deferral ledger
+// 2026-07-02; see SeedToastOIDCounter, called once at startup after the
+// catalog is loaded). An atomic int64 avoids the serialisation overhead of
+// a mutex for the common concurrent-insert workload.
 var toastOIDCounter atomic.Int64
 
 func toastNextOID() uint32 {
 	return uint32(toastOIDCounter.Add(1))
+}
+
+// AdvanceToastOIDCounterPast bumps the process-global TOAST OID counter so
+// the next-assigned OID is guaranteed to exceed used. A no-op if the
+// counter is already past used. Safe to call concurrently.
+func AdvanceToastOIDCounterPast(used uint32) {
+	for {
+		cur := toastOIDCounter.Load()
+		if cur >= int64(used) {
+			return
+		}
+		if toastOIDCounter.CompareAndSwap(cur, int64(used)) {
+			return
+		}
+	}
+}
+
+// MaxToastChunkIDInRel scans every physically-present tuple in the TOAST
+// relation toastRel — regardless of MVCC visibility, since even an
+// invisible-but-still-resident row's chunk_id must never be reissued — and
+// returns the highest chunk_id (TOAST OID) found. Returns (0, false, nil)
+// if toastRel has no on-disk file yet (the owning table has never TOASTed
+// a value), so callers can skip the scan entirely without risking the
+// smgr "NBlocks recreates a removed file" pitfall.
+func MaxToastChunkIDInRel(pool *storage.Pool, toastRel storage.RelFileNode) (uint32, bool, error) {
+	if pool == nil || !pool.Exists(toastRel) {
+		return 0, false, nil
+	}
+	nBlocks, err := pool.NBlocks(toastRel)
+	if err != nil {
+		return 0, false, err
+	}
+	var max uint32
+	var found bool
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := pool.Pin(storage.BufferTag{Rel: toastRel, Block: blk})
+		if err != nil {
+			return 0, false, err
+		}
+		slot.RLock()
+		page := slot.Page()
+		if storage.IsNew(page) {
+			slot.RUnlock()
+			pool.Unpin(slot)
+			continue
+		}
+		count, _ := storage.PageLinePointerCount(page)
+		for s := uint16(1); s <= uint16(count); s++ {
+			t, err := storage.PageGetHeapTuple(page, s)
+			if err != nil {
+				continue
+			}
+			row, err := DecodeHeapTupleRow(toastCols, t, nil)
+			if err != nil || len(row) < 1 || row[0].Kind != KindInt {
+				continue
+			}
+			id := uint32(row[0].Int)
+			if !found || id > max {
+				max = id
+				found = true
+			}
+		}
+		slot.RUnlock()
+		pool.Unpin(slot)
+	}
+	return max, found, nil
+}
+
+// SeedToastOIDCounter scans the TOAST relations for every main-table
+// RelFileNode passed in and advances the process-global toastOIDCounter
+// past the highest chunk_id found in any of them. Must be called once at
+// startup, after the catalog has been fully populated from the on-disk
+// pg_class/pg_attribute heap (loadUserTablesFromHeap) — otherwise a
+// table's TOAST relation may not resolve to the right RelFileNode. Callers
+// pass one entry per user table (e.g. cat.RelFileNode(tbl) for each table
+// in cat.AllTables()); scanning a table that never TOASTed anything is
+// cheap (MaxToastChunkIDInRel short-circuits on Pool.Exists).
+func SeedToastOIDCounter(pool *storage.Pool, mainRels []storage.RelFileNode) error {
+	for _, mainRel := range mainRels {
+		toastRel := ToastRelFor(mainRel)
+		max, found, err := MaxToastChunkIDInRel(pool, toastRel)
+		if err != nil {
+			return fmt.Errorf("seed TOAST OID counter for rel %d: %w", mainRel.RelOid, err)
+		}
+		if found {
+			AdvanceToastOIDCounterPast(max)
+		}
+	}
+	return nil
 }
 
 // toastRelOIDOffset is added to the main-heap RelOid to derive the TOAST

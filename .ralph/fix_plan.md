@@ -5223,6 +5223,48 @@ documentation-only and is exempt from the design-doc requirement.)
       `0119-0004-create-operator-roundtrip.md` "Loop #74". The
       `CREATE`/`ALTER`/`DROP FUNCTION`/`PROCEDURE` surface is now entirely
       WAL-persisted; the loop #73 ledger row is resolved.
+- [x] **TOAST chunk_id restart durability (root-0022, interactive session).**
+      **COMPLETE 2026-07-02:** closes the WordPress `wp_options`/
+      `wp_user_roles` neighbor-row corruption ledger row (2026-07-02). Root
+      cause was NOT missing TOAST (goopg has had real TOAST since
+      M0046-0006, `internal/executor/toast.go`) but
+      `executor.toastOIDCounter` — a process-local, non-persisted
+      `atomic.Int64` — resetting to 0 on every restart while the TOAST
+      relation it writes `chunk_id` rows into survives on disk; the first
+      TOASTed value written after any restart (no crash needed) reissued
+      `chunk_id 1`, colliding with a pre-restart value's still-resident
+      `chunk_id 1` in the same table's TOAST relation, and
+      `DetoastValue`'s oid-only scan spliced the two unrelated values'
+      bytes together. Fix: new `executor.SeedToastOIDCounter`/
+      `MaxToastChunkIDInRel`/`AdvanceToastOIDCounterPast`
+      (`internal/executor/toast.go`) scan every user table's TOAST
+      relation once at startup (wired into `internal/initdb/open.go`
+      right after the existing M0106-0013 catalog-OID-advance loop,
+      unconditionally — even on the M0114 cache-hit path) and advance the
+      counter past the max `chunk_id` found, mirroring the established
+      catalog-OID restart pattern. `MaxToastChunkIDInRel` short-circuits
+      via `Pool.Exists` before touching `NBlocks`/`Pin` to avoid the smgr
+      O_CREATE-recreates-removed-files pitfall
+      ([[goopg_smgr_ocreate_recreates_removed_files]]). Tests:
+      `TestToastOIDCounterCollisionAcrossRestart` (executor-level,
+      confirmed to FAIL with byte-exact reproduction of the reported
+      corruption when the reseed call is removed) +
+      `TestMaxToastChunkIDInRelNoFile` +
+      `TestSeedToastOIDCounterAdvancesPastExisting`, plus a real
+      cluster-restart e2e `TestPort_ToastValueSurvivesRestartWithoutCollision`
+      (`internal/testport/toast_oid_restart_durability_test.go`, mirrors
+      `serial_sequence_durability_test.go`). Gates: `go build`/`go vet`
+      clean; full `internal/executor`+`internal/initdb`+`internal/storage`
+      suites PASS; `go test -race ./internal/wal/... ./internal/mvcc/...`
+      PASS; TPC-H spotcheck PASS; pgbench smoke = pre-commit hook. Design
+      `docs/design/root-0022-toast-oid-restart-durability.md`. Deferred
+      (ledger row appended): TOAST chunk writes are not per-insert
+      WAL/FPI-protected (`writeHeapTupleToRel` uses plain `MarkDirty`, not
+      the `MarkDirtyChangeRecord` discipline the main-heap insert path
+      uses), so an unclean crash (not just a restart) before the next
+      checkpoint could still lose chunks written after the first one on an
+      already-dirty TOAST page — a narrower, separate fix from this loop's
+      actual reported bug.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
