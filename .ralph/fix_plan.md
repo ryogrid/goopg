@@ -6052,6 +6052,22 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   FLOW.md §1–2: restart the wp goopg instance with `GOOPG_LOG_STATEMENT=all`
   (capped), enable PG4WP debug logging (`PG4WP_DEBUG=true`), snapshot baseline
   counts, and write the `run_item` capture script (byte-offset log slicing).
+  **2026-07-03 (loop #36, partial): harness script + config landed, restart
+  BLOCKED on confirmation.** `wp/verification/run_item.sh` (new) implements
+  FLOW.md §2's `run_item`/`baseline_snapshot` skeleton (byte-offset slice of
+  `wp/goopg-wp.log` for `msg=statement` lines + PG4WP log pull from the wpcli
+  container); `wp/docker-compose.yml` now defines `PG4WP_DEBUG=true` in the
+  `wordpress` service's `WORDPRESS_CONFIG_EXTRA`. **Not yet applied:** the
+  Claude Code auto-mode permission classifier denied `systemctl --user stop
+  goopg-wp.scope` (the first step of the FLOW.md §1a restart-with-logging
+  sequence), citing the `interactive_vs_ralph_stop_stash_restore` memory note
+  — that note covers a different scenario (Ralph-loop pause/handoff) and does
+  not intend to block this milestone's own documented restart. Needs explicit
+  human confirmation (or a standing allow-rule) to run: stop `goopg-wp.scope`
+  → restart with `GOOPG_LOG_STATEMENT=all` (data dir preserved) → `docker
+  compose up -d --force-recreate wordpress` (picks up `PG4WP_DEBUG`) →
+  `baseline_snapshot`. See `.ralph/working_set.md` for the exact command
+  sequence. Task remains unchecked.
 - [ ] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
   post-meta, taxonomy, term-meta, user create/update). Store per-item evidence
   under `wp/verification/results/<ts>/`; record each confirming read.
