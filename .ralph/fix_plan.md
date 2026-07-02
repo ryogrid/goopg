@@ -5985,6 +5985,49 @@ documentation-only and is exempt from the design-doc requirement.)
       never registered in the live role-name registry); `GRANT ... ON
       PARAMETER` GUC-name validation (unrelated to this slice).
 
+- [x] **`GRANT ... ON PARAMETER` GUC-name validation (M0119-0004-ACLHEAP
+      follow-up).** **COMPLETE 2026-07-03:** closes the "GUC-name validation"
+      residual carried by every M0119-0004-ACLHEAP parameter-ACL row since
+      `0119-0004-grant-on-parameter-pgdumpall.md` — goopg previously accepted
+      any string as a parameter name unconditionally. New
+      `config.IsCustomGUCName` (exported from the pre-existing
+      `SET`-on-unregistered-name helper) + new
+      `catalog.InMemory.HasParameterACL` (a non-minting
+      `ParameterAclLookup(missing_ok=true)` analogue) + new
+      `checkParameterACLName` (`internal/executor/operators_ddl_parameter_acl.go`)
+      port `check_GUC_name_for_parameter_acl` exactly: a known compiled-in
+      GUC or a syntactically valid custom/extension name (two-or-more
+      dot-separated identifiers) is accepted; a bare unrecognized name raises
+      `42704`; a dotted name failing the syntax check raises `42602` — both
+      with PG's exact `errmsg`/`errdetail` text (confirmed byte-identical
+      against a live real-PostgreSQL-18.3 side-by-side). `execParameterACLChange`
+      restructured to match `objectNamesToOids`'s exact timing: validation
+      only runs the first time a GRANT would materialize a brand-new entry
+      (`!im.HasParameterACL(name)`) — a second GRANT on an already-materialized
+      name skips it, matching PG. Also fixed a sibling divergence in the same
+      function: REVOKE on a name with no existing ACL entry previously
+      materialized a spurious owner-only row unconditionally (`ParameterACLOID`
+      always mints); now a pure no-op, matching `ParameterAclLookup`'s
+      REVOKE-side behavior. Tests: `TestIsCustomGUCName` (`internal/config`);
+      `TestHasParameterACL` (`internal/catalog/relacl_test.go`);
+      `TestCheckParameterACLName`/`TestExecParameterACLChangeRejectsUnknownName`/
+      `TestExecParameterACLChangeAcceptsKnownAndCustomNames`/
+      `TestExecParameterACLChangeRevokeOnUnknownNameIsNoop`/
+      `TestExecParameterACLChangeSecondGrantSkipsRevalidation`
+      (`internal/executor/operators_ddl_parameter_acl_test.go`). Gates:
+      `go build ./...`/`go vet` clean; `internal/config`+`internal/catalog`+
+      `internal/executor`+`internal/parser`+`internal/server`+`internal/wal`+
+      `internal/initdb` suites PASS; `TestPort_PgDumpallParameterACL` PASS
+      against real `pg_dumpall` 18.3 (unaffected — fixture only uses known
+      GUCs); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+      hook. Design doc: `docs/design/0119-0004-parameter-acl-guc-name-validation.md`;
+      `docs/design/README.md` row `0119-0004cf` added; deferral ledger row
+      appended. Still open: the loaded-extension reserved-namespace-prefix
+      check (`reserved_class_prefix`) is not ported (goopg tracks no
+      loaded-extension GUC namespace registry); the `ROLE_PG_DATABASE_OWNER`
+      carve-out and `check_role_grantor`'s `WITH INHERIT FALSE` edge case
+      from prior rows remain open, unchanged.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

@@ -1306,6 +1306,28 @@ func TestParameterACLOID(t *testing.T) {
 	}
 }
 
+// TestHasParameterACL pins the ParameterAclLookup(missing_ok=true) analogue:
+// false before any ParameterACLOID call for a name, true after — including
+// case-folded lookups — and never mutates state (unlike ParameterACLOID).
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestHasParameterACL(t *testing.T) {
+	c := NewInMemory()
+
+	if c.HasParameterACL("work_mem") {
+		t.Fatalf("HasParameterACL(\"work_mem\") = true on a fresh catalog, want false")
+	}
+	c.ParameterACLOID("work_mem")
+	if !c.HasParameterACL("work_mem") {
+		t.Fatalf("HasParameterACL(\"work_mem\") = false after ParameterACLOID minted it")
+	}
+	if !c.HasParameterACL("Work_Mem") {
+		t.Fatalf("HasParameterACL(\"Work_Mem\") = false, want true (case-folded match)")
+	}
+	if c.HasParameterACL("statement_timeout") {
+		t.Fatalf("HasParameterACL(\"statement_timeout\") = true, want false (never minted)")
+	}
+}
+
 // TestParameterACLText mirrors TestDatabaseACLText/TestTypeACLText for the
 // parameter (pg_parameter_acl) ACL projection. Unlike DATABASE, PUBLIC's
 // acldefault('p', …) is ACL_NO_RIGHTS — no implicit PUBLIC seed — so only the

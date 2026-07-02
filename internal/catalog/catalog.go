@@ -11488,6 +11488,21 @@ func (c *InMemory) ParameterACLOID(parname string) uint32 {
 	return oid
 }
 
+// HasParameterACL reports whether parname already has a pg_parameter_acl
+// entry, without minting one. Mirrors ParameterAclLookup(parameter,
+// missing_ok=true): real PostgreSQL only runs
+// check_GUC_name_for_parameter_acl (name validation) inside
+// ParameterAclCreate, i.e. the first time a GRANT mints the entry — a
+// second GRANT, or any REVOKE, on an already-materialized parameter skips
+// the check. Callers use this to gate name validation the same way.
+func (c *InMemory) HasParameterACL(parname string) bool {
+	parname = strings.ToLower(strings.TrimSpace(parname))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.parameterACLOIDs[parname]
+	return ok
+}
+
 // ParameterACLText renders the materialized pg_parameter_acl.paracl text for
 // the GUC identified by paramOID, or "" (SQL NULL) when no privilege has been
 // granted away. Parameters share the OID-keyed ACL store with relations,

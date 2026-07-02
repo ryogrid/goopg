@@ -92,7 +92,7 @@ func (s *SessionRegistry) Set(name, value string, isLocal bool) error {
 	}
 	v, ok := s.lookupVariable(name)
 	if !ok {
-		if !isCustomGUCName(name) {
+		if !IsCustomGUCName(name) {
 			return fmt.Errorf("unrecognized configuration parameter %q", name)
 		}
 		v = NewVariable(Variable{
@@ -200,6 +200,17 @@ func (s *SessionRegistry) lookupVariable(name string) (*Variable, bool) {
 	}
 	v, ok := s.custom[strings.ToLower(name)]
 	return v, ok
+}
+
+// IsCustomGUCName reports whether name has the syntactic shape PostgreSQL
+// accepts for a custom/extension GUC (two or more dot-separated simple
+// identifiers, e.g. "plpgsql.check_asserts") — mirrors guc.c's
+// valid_custom_variable_name (minus the loaded-extension reserved-prefix
+// check, which goopg does not track). Used both by SET on an unregistered
+// name and by GRANT/REVOKE ... ON PARAMETER's name validation
+// (check_GUC_name_for_parameter_acl).
+func IsCustomGUCName(name string) bool {
+	return isCustomGUCName(name)
 }
 
 func isCustomGUCName(name string) bool {
