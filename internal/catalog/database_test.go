@@ -140,3 +140,101 @@ func TestPgDatabaseExposesFrozenXidColumns(t *testing.T) {
 		}
 	}
 }
+
+// TestSetDatabaseConfigUpsertsInPlace pins SetDatabaseConfig's PG-mirroring
+// GUC_array_change behaviour: re-SET of an already-overridden name replaces
+// the existing entry in place (same slice position) rather than appending a
+// duplicate. M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up).
+func TestSetDatabaseConfigUpsertsInPlace(t *testing.T) {
+	c := NewInMemory()
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
+	c.SetDatabaseConfig(FirstUserOID, "search_path", "public")
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "128MB")
+
+	got := c.DatabaseConfigEntries(FirstUserOID)
+	want := []string{"work_mem=128MB", "search_path=public"}
+	if len(got) != len(want) {
+		t.Fatalf("DatabaseConfigEntries = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestSetDatabaseConfigNameIsCaseInsensitive mirrors PG's GUC name matching:
+// re-SET under a differently-cased spelling of an already-set name still
+// replaces in place.
+func TestSetDatabaseConfigNameIsCaseInsensitive(t *testing.T) {
+	c := NewInMemory()
+	c.SetDatabaseConfig(FirstUserOID, "Work_Mem", "64MB")
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "128MB")
+	got := c.DatabaseConfigEntries(FirstUserOID)
+	if len(got) != 1 || got[0] != "work_mem=128MB" {
+		t.Errorf("DatabaseConfigEntries = %v, want [\"work_mem=128MB\"]", got)
+	}
+}
+
+// TestResetDatabaseConfigRemovesOnlyNamedEntry confirms RESET removes just
+// the matching entry, leaving sibling overrides untouched.
+func TestResetDatabaseConfigRemovesOnlyNamedEntry(t *testing.T) {
+	c := NewInMemory()
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
+	c.SetDatabaseConfig(FirstUserOID, "search_path", "public")
+	c.ResetDatabaseConfig(FirstUserOID, "work_mem")
+	got := c.DatabaseConfigEntries(FirstUserOID)
+	if len(got) != 1 || got[0] != "search_path=public" {
+		t.Errorf("DatabaseConfigEntries after reset = %v, want [\"search_path=public\"]", got)
+	}
+	// Resetting an unrecorded name is a no-op, not an error/panic.
+	c.ResetDatabaseConfig(FirstUserOID, "no_such_guc")
+	if len(c.DatabaseConfigEntries(FirstUserOID)) != 1 {
+		t.Errorf("ResetDatabaseConfig on unknown name should be a no-op")
+	}
+}
+
+// TestResetAllDatabaseConfigClearsEverything pins RESET ALL's full-clear
+// semantics.
+func TestResetAllDatabaseConfigClearsEverything(t *testing.T) {
+	c := NewInMemory()
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
+	c.SetDatabaseConfig(FirstUserOID, "search_path", "public")
+	c.ResetAllDatabaseConfig(FirstUserOID)
+	if got := c.DatabaseConfigEntries(FirstUserOID); len(got) != 0 {
+		t.Errorf("DatabaseConfigEntries after RESET ALL = %v, want empty", got)
+	}
+}
+
+// TestPgDbRoleSettingVirtualRowsProjectsOverrides confirms the previously
+// permanently-empty pg_db_role_setting virtual table now projects real
+// SetDatabaseConfig state as one row keyed by FirstUserOID/setrole=0, with
+// setconfig rendered as a PG-native text[] literal.
+func TestPgDbRoleSettingVirtualRowsProjectsOverrides(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatalf("pg_db_role_setting virtual table not registered")
+	}
+	if rows := tbl.VirtualRows(); len(rows) != 0 {
+		t.Errorf("fresh catalog: pg_db_role_setting rows = %v, want none", rows)
+	}
+
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
+	c.SetDatabaseConfig(FirstUserOID, "search_path", "public,pg_catalog")
+	rows := tbl.VirtualRows()
+	if len(rows) != 1 {
+		t.Fatalf("pg_db_role_setting rows = %v, want exactly 1 row", rows)
+	}
+	row := rows[0]
+	if row[0] != "16384" {
+		t.Errorf("setdatabase = %q, want FirstUserOID (16384)", row[0])
+	}
+	if row[1] != "0" {
+		t.Errorf("setrole = %q, want \"0\"", row[1])
+	}
+	want := `{work_mem=64MB,"search_path=public,pg_catalog"}`
+	if row[2] != want {
+		t.Errorf("setconfig = %q, want %q", row[2], want)
+	}
+}

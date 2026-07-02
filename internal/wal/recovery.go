@@ -862,6 +862,32 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
 	RecordKindAlterRoleRename byte = 72
 
+	// RecordKindAlterDatabaseSetConfig records an `ALTER DATABASE <name> SET
+	// <config> = <value>` event so the pg_db_role_setting.setconfig override
+	// survives a restart (M0119-0004-ACLHEAP ALTER DATABASE ... SET
+	// follow-up). goopg has no per-database file namespace, so the physical
+	// redo path is a no-op; the recovery driver in
+	// internal/initdb/database_config_recovery.go scans the WAL for these
+	// records after physical replay and re-applies them to
+	// catalog.InMemory's dbRoleSettings registry via SetDatabaseConfig.
+	// Format:
+	//   kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes)
+	RecordKindAlterDatabaseSetConfig byte = 73
+
+	// RecordKindAlterDatabaseResetConfig records an `ALTER DATABASE <name>
+	// RESET <config>` event. Same no-op physical redo path as
+	// RecordKindAlterDatabaseSetConfig.
+	// Format:
+	//   kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterDatabaseResetConfig byte = 74
+
+	// RecordKindAlterDatabaseResetAllConfig records an `ALTER DATABASE
+	// <name> RESET ALL` event. Same no-op physical redo path as
+	// RecordKindAlterDatabaseSetConfig.
+	// Format:
+	//   kind(1) | dbOid(4)
+	RecordKindAlterDatabaseResetAllConfig byte = 75
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1243,6 +1269,117 @@ func DecodeAlterRoleRename(payload []byte) (name, newName string, err error) {
 		return "", "", err
 	}
 	return name, newName, nil
+}
+
+// EncodeAlterDatabaseSetConfig encodes an `ALTER DATABASE ... SET name =
+// value` event (M0119-0004-ACLHEAP ALTER DATABASE ... SET follow-up).
+// Format: kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes).
+func EncodeAlterDatabaseSetConfig(dbOid uint32, name, value string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(value) > 0xFFFF {
+		value = value[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterDatabaseSetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	binary.LittleEndian.PutUint16(l[:], uint16(len(value)))
+	buf.Write(l[:])
+	buf.WriteString(value)
+	return buf.Bytes()
+}
+
+// DecodeAlterDatabaseSetConfig decodes a RecordKindAlterDatabaseSetConfig payload.
+func DecodeAlterDatabaseSetConfig(payload []byte) (dbOid uint32, name, value string, err error) {
+	if len(payload) < 7 {
+		return 0, "", "", fmt.Errorf("wal: alter-database-set-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterDatabaseSetConfig {
+		return 0, "", "", fmt.Errorf("wal: record kind %d is not alter-database-set-config", payload[0])
+	}
+	dbOid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-database-set-config payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-database-set-config string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr16(); err != nil {
+		return 0, "", "", err
+	}
+	if value, err = readStr16(); err != nil {
+		return 0, "", "", err
+	}
+	return dbOid, name, value, nil
+}
+
+// EncodeAlterDatabaseResetConfig encodes an `ALTER DATABASE ... RESET name`
+// event. Format: kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterDatabaseResetConfig(dbOid uint32, name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterDatabaseResetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	return buf.Bytes()
+}
+
+// DecodeAlterDatabaseResetConfig decodes a RecordKindAlterDatabaseResetConfig payload.
+func DecodeAlterDatabaseResetConfig(payload []byte) (dbOid uint32, name string, err error) {
+	if len(payload) < 7 {
+		return 0, "", fmt.Errorf("wal: alter-database-reset-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterDatabaseResetConfig {
+		return 0, "", fmt.Errorf("wal: record kind %d is not alter-database-reset-config", payload[0])
+	}
+	dbOid = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return 0, "", fmt.Errorf("wal: alter-database-reset-config payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return dbOid, string(payload[7 : 7+nameLen]), nil
+}
+
+// EncodeAlterDatabaseResetAllConfig encodes an `ALTER DATABASE ... RESET
+// ALL` event. Format: kind(1) | dbOid(4).
+func EncodeAlterDatabaseResetAllConfig(dbOid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindAlterDatabaseResetAllConfig
+	binary.LittleEndian.PutUint32(out[1:5], dbOid)
+	return out
+}
+
+// DecodeAlterDatabaseResetAllConfig decodes a RecordKindAlterDatabaseResetAllConfig payload.
+func DecodeAlterDatabaseResetAllConfig(payload []byte) (dbOid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: alter-database-reset-all-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterDatabaseResetAllConfig {
+		return 0, fmt.Errorf("wal: record kind %d is not alter-database-reset-all-config", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
 }
 
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
@@ -5115,6 +5252,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// in internal/initdb/aggregate_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's user-aggregate registry.
+		return false, nil
+	case RecordKindAlterDatabaseSetConfig, RecordKindAlterDatabaseResetConfig, RecordKindAlterDatabaseResetAllConfig:
+		// ALTER DATABASE ... SET/RESET records (M0119-0004-ACLHEAP ALTER
+		// DATABASE ... SET follow-up) carry only catalog.InMemory's
+		// dbRoleSettings registry state; goopg has no per-database file
+		// namespace, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/database_config_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog

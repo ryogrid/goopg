@@ -1982,6 +1982,23 @@ type InMemory struct {
 	// recovered databases succeed after a crash, NOT for
 	// per-database storage isolation (that lands later).
 	databases map[string]bool
+	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
+	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
+	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
+	// unimplemented feature). Keyed by FirstUserOID (16384) — the SAME
+	// SQL-visible placeholder pg_database.VirtualRows displays for every
+	// non-template database (not c.DBOID(), the real on-disk physical OID
+	// used to key the datacl ACL store / heap resync: pg_db_role_setting is
+	// a pure virtual table with no heap to resync, and pg_dump's
+	// dumpDatabaseConfig cross-references setdatabase against the oid it
+	// already read from pg_database, so the two must agree). Each value is
+	// an ordered list of "name=value" entries in PG's
+	// pg_db_role_setting.setconfig on-disk format (mirrors guc.c's
+	// flatten_set_variable_args output); SET replaces an existing
+	// same-name entry in place or appends, RESET removes the matching
+	// entry, RESET ALL clears the whole slice. M0119-0004-ACLHEAP (ALTER
+	// DATABASE ... SET follow-up).
+	dbRoleSettings map[uint32][]string
 
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
@@ -2757,6 +2774,7 @@ func NewInMemory() *InMemory {
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
+		dbRoleSettings:         make(map[uint32][]string),
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
 		toastRenames:           make(map[uint32]string),
@@ -3895,6 +3913,73 @@ func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.databases, name)
+}
+
+// dbRoleSettingConfigName returns the GUC name half of a "name=value"
+// pg_db_role_setting.setconfig entry, or "" if entry has no '='.
+func dbRoleSettingConfigName(entry string) string {
+	eq := strings.IndexByte(entry, '=')
+	if eq < 0 {
+		return ""
+	}
+	return entry[:eq]
+}
+
+// SetDatabaseConfig upserts an `ALTER DATABASE ... SET name = value`
+// override into dbOid's pg_db_role_setting.setconfig list: an existing
+// entry with the same GUC name (case-insensitive — GUC names are
+// case-insensitive) is replaced in place, otherwise the entry is appended.
+// Mirrors PG's GUC_array_change ordering. Idempotent, so it is also used
+// directly by the WAL-replay recovery driver (no separate DuringRecovery
+// variant is needed). M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up).
+func (c *InMemory) SetDatabaseConfig(dbOid uint32, name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := name + "=" + value
+	entries := c.dbRoleSettings[dbOid]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			entries[i] = entry
+			return
+		}
+	}
+	c.dbRoleSettings[dbOid] = append(entries, entry)
+}
+
+// ResetDatabaseConfig removes a single `ALTER DATABASE ... RESET name`
+// override, if present. A no-op when the name has no override recorded.
+func (c *InMemory) ResetDatabaseConfig(dbOid uint32, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entries := c.dbRoleSettings[dbOid]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			c.dbRoleSettings[dbOid] = append(entries[:i], entries[i+1:]...)
+			return
+		}
+	}
+}
+
+// ResetAllDatabaseConfig clears every `ALTER DATABASE ... SET` override for
+// dbOid (`ALTER DATABASE ... RESET ALL`).
+func (c *InMemory) ResetAllDatabaseConfig(dbOid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.dbRoleSettings, dbOid)
+}
+
+// DatabaseConfigEntries returns a copy of dbOid's pg_db_role_setting.setconfig
+// entries ("name=value" strings, insertion order), or nil when none are set.
+func (c *InMemory) DatabaseConfigEntries(dbOid uint32) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries := c.dbRoleSettings[dbOid]
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, len(entries))
+	copy(out, entries)
+	return out
 }
 
 // RegisterIndexDuringRecovery is the idempotent version of
@@ -8069,9 +8154,14 @@ func (c *InMemory) registerSystemTables() {
 	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabase (--create
 	// only) queries `SELECT unnest(setconfig) FROM pg_db_role_setting WHERE
 	// setrole = 0 AND setdatabase = <dboid>` to render `ALTER DATABASE ... SET
-	// ...` clauses. goopg has no `ALTER DATABASE ... SET` writer yet, so an
-	// empty table (0 rows) is correct — identical to a fresh cluster with no
-	// database-level GUC overrides. M0119-0004-ACLHEAP (datacl half).
+	// ...` clauses. `ALTER DATABASE ... SET`/`RESET` now writes into
+	// SetDatabaseConfig/ResetDatabaseConfig (v0 scope: only the live connected
+	// database, mirroring execDatabaseACLChange's datacl restriction), keyed
+	// by FirstUserOID (16384) to match the oid pg_dump already read from this
+	// same pg_database row; setrole is always "0" since ALTER ROLE ... SET /
+	// ALTER ROLE ... IN DATABASE ... SET remain unimplemented (a separate,
+	// out-of-scope feature — see the deferral ledger). M0119-0004-ACLHEAP
+	// (ALTER DATABASE ... SET follow-up).
 	pgDbRoleSetting := &Table{
 		Schema: "pg_catalog", Name: "pg_db_role_setting", Virtual: true,
 		Columns: []Column{
@@ -8081,7 +8171,18 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2964,
 	}
-	pgDbRoleSetting.VirtualRows = func() [][]string { return nil }
+	pgDbRoleSetting.VirtualRows = func() [][]string {
+		dbOid := FirstUserOID
+		entries := c.DatabaseConfigEntries(dbOid)
+		if len(entries) == 0 {
+			return nil
+		}
+		return [][]string{{
+			strconv.FormatUint(uint64(dbOid), 10),
+			"0",
+			optionsArrayLiteral(entries),
+		}}
+	}
 	c.tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
 
 	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per

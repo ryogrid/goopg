@@ -107,7 +107,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// database in pg_database / can connect to it, and (b) emit a
 		// WAL record so the registration survives a crash. Other
 		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, notice, herr := s.tryHandleDatabaseDDL(sql); handled {
+		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName); handled {
 			if herr != nil {
 				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
 			}
