@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/protocol"
@@ -63,7 +64,13 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// the string-match path, the CREATE/DROP DATABASE|ROLE intercepts, or the
 	// executor — mirroring PostgreSQL's exec_simple_query, which logs before
 	// parse. No-op when logging is disabled. root-0023.
-	s.logStatement("simple", trimmed, sess, connTx)
+	stmtStart := time.Now()
+	wasLogged := s.logStatement("simple", trimmed, sess, connTx)
+	// `log_min_duration_statement` (check_log_duration, postgres.c): timed
+	// across every return path below via defer, since handleQuery's
+	// string-match fast paths and the executor dispatch each return
+	// independently. root-0023 follow-up.
+	defer s.logDuration(stmtStart, wasLogged, "simple", trimmed, sess, connTx)
 
 	matchable := strings.TrimRight(trimmed, ";")
 	matchable = strings.TrimSpace(matchable)

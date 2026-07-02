@@ -6079,6 +6079,36 @@ documentation-only and is exempt from the design-doc requirement.)
       `log_min_duration_statement`, `log_line_prefix`,
       `logging_collector`/`log_directory` remain unimplemented GUC stubs.
 
+- [x] **`log_min_duration_statement` GUC wiring (root-0023 follow-up, loop
+      #40).** **COMPLETE 2026-07-03:** closes the `log_min_duration_statement`
+      residual left by the loop #38 entry above. New
+      `sessionLogMinDurationStatement(sess)` reads the session's effective GUC
+      value (ms, `-1` sentinel for disabled/missing/unparseable — matching the
+      GUC's own `BootVal`); `exceedsLogMinDuration(elapsedMs, thresholdMs)`
+      mirrors PG's `check_log_duration` threshold comparison
+      (`postgres/src/backend/tcop/postgres.c`: `<0` disabled, `0` always logs,
+      `>0` requires `elapsedMs >= thresholdMs`); `(*Server).logDuration(start,
+      wasLogged, proto, sql, sess, connTx)` emits a `"duration"` log record,
+      bare when `wasLogged` (the paired `logStatement` call already printed the
+      statement text) or combined with the statement text when not — exactly
+      PG's own dedup. `logStatement` now returns `bool` (`wasLogged`) instead of
+      `void` for this purpose. Both live call sites
+      (`query.go:handleQuery`, `dispatch_extended.go:executeExtendedQueryViaExecutor`)
+      time the statement via `stmtStart := time.Now()` right after the
+      `logStatement` call and `defer s.logDuration(...)`, so every return path
+      is timed. Tests: `TestSessionLogMinDurationStatement`,
+      `TestExceedsLogMinDuration`, `TestLogDurationEmitsCombinedOrBareLine`
+      (new `capturingHandler` `slog.Handler` asserts actual emitted records),
+      `TestLogStatementReturnsWasLogged`
+      (`internal/server/statement_log_test.go`). Gates: `go build ./...`/
+      `go vet ./...` clean; `internal/server`+`internal/config` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/root-0023-statement-query-logging.md`
+      new "Follow-up: `log_min_duration_statement` GUC (loop #40)" section;
+      `docs/design/README.md` root-0023 row updated. Still open, unrelated to
+      this slice: `log_line_prefix`, `logging_collector`/`log_directory` remain
+      unimplemented GUC stubs.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

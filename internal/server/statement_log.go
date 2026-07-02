@@ -1,7 +1,9 @@
 package server
 
 import (
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/config"
 )
@@ -133,14 +135,16 @@ func (s *Server) effectiveLogStatementLevel(sess *config.SessionRegistry) logSta
 // when it holds an explicit transaction with an assigned xid, the xid is
 // attached so a verification run can group a client's queries by
 // transaction. This is a no-op (one enum compare, plus one session lookup)
-// when logging is disabled.
-func (s *Server) logStatement(proto string, sql string, sess *config.SessionRegistry, connTx *connTxState) {
+// when logging is disabled. The return value is whether a "statement: ..."
+// line was actually emitted — logDuration's was_logged parameter, so a
+// later duration line doesn't repeat the statement text PG already logged.
+func (s *Server) logStatement(proto string, sql string, sess *config.SessionRegistry, connTx *connTxState) bool {
 	lvl := s.effectiveLogStatementLevel(sess)
 	if lvl == logStmtNone {
-		return
+		return false
 	}
 	if lvl != logStmtAll && !lvl.shouldLog(leadingKeyword(sql)) {
-		return
+		return false
 	}
 	attrs := []any{"proto", proto, "statement", strings.TrimSpace(sql)}
 	if connTx != nil && connTx.InExplicit() {
@@ -149,4 +153,69 @@ func (s *Server) logStatement(proto string, sql string, sess *config.SessionRegi
 		}
 	}
 	s.cfg.Logger.Info("statement", attrs...)
+	return true
+}
+
+// sessionLogMinDurationStatement reads the effective `log_min_duration_statement`
+// GUC from the session and returns it in milliseconds. Unlike
+// sessionStatementTimeout (dispatch.go), 0 is a meaningful value here ("log
+// every statement's duration") distinct from disabled, so the sentinel for
+// disabled/missing/unparseable is -1 — matching the GUC's own BootVal
+// (internal/config/defaults.go).
+func sessionLogMinDurationStatement(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return -1
+	}
+	_, eff, ok := sess.Get("log_min_duration_statement")
+	if !ok {
+		return -1
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || ms < 0 {
+		return -1
+	}
+	return ms
+}
+
+// exceedsLogMinDuration mirrors PostgreSQL's check_log_duration threshold
+// comparison (postgres/src/backend/tcop/postgres.c) for
+// log_min_duration_statement: thresholdMs<0 disables duration logging
+// entirely (already filtered by sessionLogMinDurationStatement's -1
+// sentinel, but kept explicit here since this is the semantic boundary),
+// thresholdMs==0 logs every statement's duration, and thresholdMs>0 requires
+// the statement to have run at least that many milliseconds.
+func exceedsLogMinDuration(elapsedMs float64, thresholdMs int64) bool {
+	if thresholdMs < 0 {
+		return false
+	}
+	return thresholdMs == 0 || elapsedMs >= float64(thresholdMs)
+}
+
+// logDuration emits PostgreSQL's `log_min_duration_statement` duration line
+// (check_log_duration, postgres.c) after a statement finishes. wasLogged is
+// logStatement's return value for the same statement: when true, only a bare
+// "duration: X ms" line is emitted (the statement text was already logged);
+// when false, a combined "duration: X ms  statement: Y" line is emitted
+// instead, exactly as PG avoids double-printing the statement text. A no-op
+// when log_min_duration_statement is unset (default -1) or not yet
+// exceeded.
+func (s *Server) logDuration(start time.Time, wasLogged bool, proto string, sql string, sess *config.SessionRegistry, connTx *connTxState) {
+	threshold := sessionLogMinDurationStatement(sess)
+	if threshold < 0 {
+		return
+	}
+	elapsedMs := float64(time.Since(start)) / float64(time.Millisecond)
+	if !exceedsLogMinDuration(elapsedMs, threshold) {
+		return
+	}
+	attrs := []any{"proto", proto, "duration_ms", elapsedMs}
+	if !wasLogged {
+		attrs = append(attrs, "statement", strings.TrimSpace(sql))
+	}
+	if connTx != nil && connTx.InExplicit() {
+		if tx := connTx.Tx(); tx.XID != 0 {
+			attrs = append(attrs, "xid", uint64(tx.XID))
+		}
+	}
+	s.cfg.Logger.Info("duration", attrs...)
 }

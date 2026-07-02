@@ -1,10 +1,43 @@
 package server
 
 import (
+	"context"
+	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/config"
 )
+
+// capturingHandler is a minimal slog.Handler that records every emitted
+// record's message and attrs, so logDuration/logStatement tests can assert
+// on actual log output instead of only the pure decision helpers.
+type capturingHandler struct {
+	records *[]capturedRecord
+}
+
+type capturedRecord struct {
+	msg   string
+	attrs map[string]any
+}
+
+func newCapturingLogger() (*slog.Logger, *[]capturedRecord) {
+	records := &[]capturedRecord{}
+	return slog.New(&capturingHandler{records: records}), records
+}
+
+func (h *capturingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *capturingHandler) Handle(_ context.Context, r slog.Record) error {
+	attrs := make(map[string]any, r.NumAttrs())
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.Any()
+		return true
+	})
+	*h.records = append(*h.records, capturedRecord{msg: r.Message, attrs: attrs})
+	return nil
+}
+func (h *capturingHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *capturingHandler) WithGroup(name string) slog.Handler       { return h }
 
 func TestParseLogStatementLevel(t *testing.T) {
 	cases := []struct {
@@ -116,5 +149,132 @@ func TestEffectiveLogStatementLevel(t *testing.T) {
 	s := &Server{logStmtLevel: logStmtDDL}
 	if got := s.effectiveLogStatementLevel(nil); got != logStmtDDL {
 		t.Errorf("effectiveLogStatementLevel(nil session) = %d, want %d", got, logStmtDDL)
+	}
+}
+
+// TestSessionLogMinDurationStatement pins the -1 disabled sentinel
+// (matching the `log_min_duration_statement` GUC's own BootVal) versus 0
+// ("log every statement") and a positive threshold, plus the nil-session and
+// unparseable-value fallbacks.
+func TestSessionLogMinDurationStatement(t *testing.T) {
+	if got := sessionLogMinDurationStatement(nil); got != -1 {
+		t.Errorf("nil session: got %d, want -1", got)
+	}
+	sess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+	if got := sessionLogMinDurationStatement(sess); got != -1 {
+		t.Errorf("boot default: got %d, want -1", got)
+	}
+	if err := sess.Set("log_min_duration_statement", "0", false); err != nil {
+		t.Fatalf("Set(0): %v", err)
+	}
+	if got := sessionLogMinDurationStatement(sess); got != 0 {
+		t.Errorf("after SET ...=0: got %d, want 0", got)
+	}
+	if err := sess.Set("log_min_duration_statement", "500", false); err != nil {
+		t.Fatalf("Set(500): %v", err)
+	}
+	if got := sessionLogMinDurationStatement(sess); got != 500 {
+		t.Errorf("after SET ...=500: got %d, want 500", got)
+	}
+	if err := sess.Set("log_min_duration_statement", "-1", false); err != nil {
+		t.Fatalf("Set(-1): %v", err)
+	}
+	if got := sessionLogMinDurationStatement(sess); got != -1 {
+		t.Errorf("after SET ...=-1: got %d, want -1", got)
+	}
+}
+
+// TestExceedsLogMinDuration pins check_log_duration's threshold comparison:
+// negative disables, zero always logs, positive is a >= threshold.
+func TestExceedsLogMinDuration(t *testing.T) {
+	cases := []struct {
+		elapsedMs float64
+		threshold int64
+		want      bool
+	}{
+		{elapsedMs: 0, threshold: -1, want: false},
+		{elapsedMs: 9999, threshold: -1, want: false},
+		{elapsedMs: 0, threshold: 0, want: true},
+		{elapsedMs: 12345, threshold: 0, want: true},
+		{elapsedMs: 499, threshold: 500, want: false},
+		{elapsedMs: 500, threshold: 500, want: true},
+		{elapsedMs: 501, threshold: 500, want: true},
+	}
+	for _, c := range cases {
+		if got := exceedsLogMinDuration(c.elapsedMs, c.threshold); got != c.want {
+			t.Errorf("exceedsLogMinDuration(%v, %d) = %v, want %v", c.elapsedMs, c.threshold, got, c.want)
+		}
+	}
+}
+
+// TestLogDurationEmitsCombinedOrBareLine pins check_log_duration's
+// `was_logged` split: when logStatement already emitted the statement text
+// (wasLogged=true), logDuration must NOT repeat it (bare "duration" line);
+// when it did not (wasLogged=false, e.g. log_statement=none but
+// log_min_duration_statement caught it), logDuration must include the
+// statement text so it isn't lost entirely.
+func TestLogDurationEmitsCombinedOrBareLine(t *testing.T) {
+	logger, records := newCapturingLogger()
+	s := &Server{cfg: Config{Logger: logger}}
+	sess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+	if err := sess.Set("log_min_duration_statement", "0", false); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	*records = nil
+	s.logDuration(time.Now(), true, "simple", "SELECT 1", sess, nil)
+	if len(*records) != 1 {
+		t.Fatalf("wasLogged=true: got %d records, want 1", len(*records))
+	}
+	if _, ok := (*records)[0].attrs["statement"]; ok {
+		t.Errorf("wasLogged=true: duration line unexpectedly repeats the statement text: %+v", (*records)[0])
+	}
+
+	*records = nil
+	s.logDuration(time.Now(), false, "simple", "SELECT 1", sess, nil)
+	if len(*records) != 1 {
+		t.Fatalf("wasLogged=false: got %d records, want 1", len(*records))
+	}
+	if got := (*records)[0].attrs["statement"]; got != "SELECT 1" {
+		t.Errorf("wasLogged=false: statement attr = %v, want %q", got, "SELECT 1")
+	}
+
+	// Disabled (boot default -1): no record at all.
+	disabledSess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+	*records = nil
+	s.logDuration(time.Now(), false, "simple", "SELECT 1", disabledSess, nil)
+	if len(*records) != 0 {
+		t.Errorf("disabled threshold: got %d records, want 0", len(*records))
+	}
+
+	// Below threshold: no record.
+	thresholdSess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+	if err := sess.Set("log_min_duration_statement", "0", false); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := thresholdSess.Set("log_min_duration_statement", "60000", false); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	*records = nil
+	s.logDuration(time.Now(), false, "simple", "SELECT 1", thresholdSess, nil)
+	if len(*records) != 0 {
+		t.Errorf("below threshold: got %d records, want 0", len(*records))
+	}
+}
+
+// TestLogStatementReturnsWasLogged pins logStatement's bool return, which
+// logDuration relies on to decide the combined-vs-bare line split.
+func TestLogStatementReturnsWasLogged(t *testing.T) {
+	logger, _ := newCapturingLogger()
+	s := &Server{cfg: Config{Logger: logger}, logStmtLevel: logStmtNone}
+	sess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+	if got := s.logStatement("simple", "SELECT 1", sess, nil); got != false {
+		t.Errorf("log_statement=none: wasLogged = %v, want false", got)
+	}
+	if err := sess.Set("log_statement", "all", false); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got := s.logStatement("simple", "SELECT 1", sess, nil); got != true {
+		t.Errorf("log_statement=all: wasLogged = %v, want true", got)
 	}
 }

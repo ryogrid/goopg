@@ -119,15 +119,51 @@ Test: `TestEffectiveLogStatementLevel` (`internal/server/statement_log_test.go`)
 covers env-louder, session-louder, and both-equal-but-different-verb cases
 plus the nil-session fallback.
 
+## Follow-up: `log_min_duration_statement` GUC (loop #40)
+
+**LANDED.** A client `SET log_min_duration_statement = <ms>` now emits a
+duration line after each statement, mirroring PostgreSQL's
+`check_log_duration` (`postgres/src/backend/tcop/postgres.c`): `-1` (the
+GUC's own `BootVal`) disables duration logging entirely, `0` logs every
+statement's duration unconditionally, and a positive value requires the
+elapsed time to be `>=` the threshold.
+
+`sessionLogMinDurationStatement(sess)` (`internal/server/statement_log.go`)
+reads the session's effective `log_min_duration_statement` value and returns
+it in milliseconds, with `-1` as the shared disabled/missing/unparseable
+sentinel. `exceedsLogMinDuration(elapsedMs, thresholdMs)` is the pure
+threshold comparison. `(*Server).logDuration(start, wasLogged, proto, sql,
+sess, connTx)` times the statement and emits a `"duration"` log record: when
+`wasLogged` is `true` (the `logStatement` call for the same statement already
+printed the text) it emits a bare `duration_ms` line; when `false` it also
+includes the `statement` text, exactly as PG's `check_log_duration` avoids
+double-printing when `log_statement` already logged the text but folds it in
+when only `log_min_duration_statement` fired. `logStatement` now returns a
+`bool` (`wasLogged`) for this purpose instead of `void`.
+
+Both live call sites (`query.go:handleQuery`,
+`dispatch_extended.go:executeExtendedQueryViaExecutor`) wrap the statement
+with `stmtStart := time.Now()` / `defer s.logDuration(...)` right after the
+`logStatement` call, so every return path (string-match fast paths, executor
+dispatch, error returns) is timed — mirroring PG's placement of
+`check_log_duration` at the end of `exec_simple_query`/`exec_execute_message`
+regardless of which code path a statement takes.
+
+Tests (`internal/server/statement_log_test.go`): `TestSessionLogMinDurationStatement`
+(GUC read + sentinel), `TestExceedsLogMinDuration` (threshold matrix),
+`TestLogDurationEmitsCombinedOrBareLine` (a `capturingHandler` `slog.Handler`
+asserts the actual emitted record — bare vs combined line, disabled, and
+below-threshold cases), `TestLogStatementReturnsWasLogged`.
+
 ## Out of scope / deferred
 
-- `log_min_duration_statement` (duration-threshold logging), log-line prefix
-  (`log_line_prefix`), and a `logging_collector`/`log_directory` file sink
-  remain unimplemented GUC stubs.
+- Log-line prefix (`log_line_prefix`) and a `logging_collector`/`log_directory`
+  file sink remain unimplemented GUC stubs.
 
 ## PostgreSQL references
 
 - `postgres/src/backend/tcop/postgres.c` — `check_log_statement`,
-  `exec_simple_query` (logs before parse), `exec_execute_message`
-  (`LOG: execute …`).
-- `postgres/official_docs_in_md/` — `log_statement` GUC semantics.
+  `check_log_duration`, `exec_simple_query` (logs before parse),
+  `exec_execute_message` (`LOG: execute …`).
+- `postgres/official_docs_in_md/` — `log_statement` and
+  `log_min_duration_statement` GUC semantics.
