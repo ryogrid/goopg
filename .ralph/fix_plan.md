@@ -5355,6 +5355,31 @@ documentation-only and is exempt from the design-doc requirement.)
       following the exact pattern already landed for sibling compat
       registries (event triggers loop #71, functions/procedures loops
       #73/74).
+      **`CREATE`/`DROP ACCESS METHOD` WAL/restart persistence LANDED
+      2026-07-02 (design `0119-0004-access-method-roundtrip.md` "Follow-up:
+      WAL/restart persistence"):** closes the resume point directly above.
+      New `RecordKindCreateAccessMethod`/`RecordKindDropAccessMethod` (kinds
+      70/71, `internal/wal/recovery.go`) mirror the event-trigger pattern
+      (loop #71); physical redo is a no-op (no page-level state). New
+      `internal/initdb/access_method_ddl_recovery.go`
+      (`replayAccessMethodDDLRecords`) + `RegisterAccessMethodDuringRecovery`/
+      `DropAccessMethodDuringRecovery` catalog mutators
+      (`internal/catalog/catalog.go`), wired into `internal/initdb/open.go`
+      right after the function/procedure DDL replay call.
+      `execCreateAccessMethod`/`execDropCompat`'s `"access method"` case
+      (`internal/executor/operators_ddl.go`) now WAL-append on success.
+      Tests: `internal/wal/access_method_ddl_test.go` (encode/decode round
+      trips + wrong-kind/truncated-payload guards) +
+      `internal/initdb/access_method_ddl_recovery_test.go` (4 tests: real
+      `Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for CREATE and
+      CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards). Gates:
+      `go build ./...` clean; `go test -race ./internal/wal/...
+      ./internal/mvcc/...` PASS; `internal/wal`+`internal/catalog`+
+      `internal/executor`+`internal/initdb`+`internal/planner`+
+      `internal/parser`+`internal/server` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS (no regression); TPC-H
+      spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl. pgbench
+      TPC-B smoke PASS. Nothing left open on this family.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

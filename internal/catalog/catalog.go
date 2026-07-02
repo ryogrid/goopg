@@ -10902,6 +10902,36 @@ func (c *InMemory) ListAccessMethods() []*AccessMethod {
 	return out
 }
 
+// RegisterAccessMethodDuringRecovery is the idempotent version of
+// RegisterAccessMethod used by the WAL-replay driver
+// (internal/initdb/access_method_ddl_recovery.go). Unlike
+// RegisterAccessMethod it takes the OID from the WAL record (so the
+// recovered access method matches the pre-crash OID exactly) and overwrites
+// rather than erroring when an access method with the same name is already
+// present (replay may see the same record more than once across a
+// partial-then-full replay). Mirrors catalog.InMemory.
+// RegisterEventTriggerDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, DU-002 slice 426 ledger resume point).
+func (c *InMemory) RegisterAccessMethodDuringRecovery(am *AccessMethod) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accessMethods == nil {
+		c.accessMethods = make(map[string]*AccessMethod)
+	}
+	out := *am
+	c.accessMethods[am.Name] = &out
+	c.advanceNextOIDLocked(am.OID)
+}
+
+// DropAccessMethodDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropAccessMethod. Identical to DropAccessMethod but
+// discards the found/not-found result — replay does not care whether the
+// access method was still present. DU-002 restart-persistence follow-up
+// (M0119-0004, DU-002 slice 426 ledger resume point).
+func (c *InMemory) DropAccessMethodDuringRecovery(name string) {
+	_ = c.DropAccessMethod(name)
+}
+
 // EventTrigger is a user-created event trigger (CREATE EVENT TRIGGER). goopg
 // never fires event triggers (no DDL hook invokes evtfoid); this records just
 // enough metadata to round-trip the CREATE/DROP through pg_dump

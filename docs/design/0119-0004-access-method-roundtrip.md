@@ -95,9 +95,56 @@ a restart, matching the current scope of several sibling DU-002 compat
 registries (e.g. event triggers) before their own WAL-persistence slices
 landed.
 
-## Deferred
+## Deferred (original scoping — see follow-up below)
 
 No WAL/restart persistence for `CREATE`/`DROP ACCESS METHOD` — the registry
-is process-local, like `ForeignDataWrapper`/`EventTrigger` were before their
+was process-local, like `ForeignDataWrapper`/`EventTrigger` were before their
 own persistence slices. See `.ralph/deferral_ledger.md` (2026-07-02,
 M0119-0004) for the resume point.
+
+## Follow-up: WAL/restart persistence (2026-07-02)
+
+Closes the "Deferred" section above: `CREATE`/`DROP ACCESS METHOD` now
+survive a restart, mirroring the event-trigger persistence pattern (loop
+#71) exactly — the same shape as every other schema-free, name-keyed
+DU-002 compat registry (PubSub, event triggers, functions/procedures,
+roles).
+
+1. **New WAL record kinds** (`internal/wal/recovery.go`):
+   `RecordKindCreateAccessMethod` (70) carries `oid | handlerOID | amType (1
+   byte) | name`; `RecordKindDropAccessMethod` (71) carries `name`. Physical
+   redo is a no-op (`ApplyRecord`'s dispatch returns `false, nil` for both —
+   `catalog.InMemory.accessMethods` has no page-level state), matching every
+   other logical-DDL-only record family.
+2. **Recovery driver** (`internal/initdb/access_method_ddl_recovery.go`,
+   `replayAccessMethodDDLRecords`): scans the WAL after physical replay and
+   calls two new idempotent catalog mutators (`RegisterAccessMethod
+   DuringRecovery`/`DropAccessMethodDuringRecovery`, `internal/catalog/
+   catalog.go`) that overwrite-by-name and bump `nextOID` past the recovered
+   OID — same contract as `RegisterEventTriggerDuringRecovery`. Wired into
+   `internal/initdb/open.go` right after the function/procedure DDL replay
+   call; access methods are name-keyed (no `NamespaceOID`), so ordering
+   relative to schema replay does not matter.
+3. **Executor** (`internal/executor/operators_ddl.go`):
+   `execCreateAccessMethod` WAL-appends `EncodeCreateAccessMethod` after a
+   successful `RegisterAccessMethod`; `execDropCompat`'s `"access method"`
+   case WAL-appends `EncodeDropAccessMethod` after a successful
+   `DropAccessMethod`. Both are unconditional autocommit-style mutations (no
+   explicit-transaction deferral exists for either statement today), so
+   logging immediately at the mutation point is safe — same reasoning as
+   `execCreateEventTrigger`/`execDropCompat`'s event-trigger case.
+
+Verified via `go test`: `internal/wal/access_method_ddl_test.go` (encode/
+decode round trips incl. multi-byte UTF-8 name + max-uint32 OID, plus
+wrong-kind/truncated-payload guards) and `internal/initdb/
+access_method_ddl_recovery_test.go` (4 tests: real `Init`/`Open`/`WAL.Append`/
+`Close`/re-`Open` round trips for CREATE and CREATE+DROP, plus missing-WAL-dir/
+nil-catalog no-op guards). Gates: `go build ./...` clean; `go test -race
+./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+`internal/catalog`+
+`internal/executor`+`internal/initdb`+`internal/planner`+`internal/parser`+
+`internal/server` suites PASS; `TestPort_PgDumpConnectionSetup` PASS (no
+regression); TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
+pgbench TPC-B smoke PASS.
+
+Nothing left open on the `CREATE`/`DROP ACCESS METHOD` family — this row's
+own resume point (WAL/restart persistence) is fully landed.

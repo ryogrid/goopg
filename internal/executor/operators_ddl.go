@@ -897,8 +897,16 @@ func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
 	if !ok {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires the in-memory catalog"}
 	}
-	if _, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID); err != nil {
+	am, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID)
+	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
+	// ledger resume point): mirrors CREATE EVENT TRIGGER.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAccessMethod(am.Name, am.AMType, am.OID, am.HandlerOID)); werr != nil {
+			return fmt.Errorf("wal create-access-method: %w", werr)
+		}
 	}
 	return nil
 }
@@ -13625,10 +13633,18 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		case "access method":
 			// Drop the dump-visible pg_am registry entry (DU-002,
 			// M0119-0004) so a dropped access method stops round-tripping
-			// through pg_dump. No WAL persistence yet (see the CREATE ACCESS
-			// METHOD ledger row) — mirrors CREATE's current gap.
+			// through pg_dump.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				if im.DropAccessMethod(s.Names[0].String()) {
+				name := s.Names[0].String()
+				if im.DropAccessMethod(name) {
+					// DU-002 restart-persistence follow-up (M0119-0004,
+					// DU-002 slice 426 ledger resume point): mirrors DROP
+					// EVENT TRIGGER.
+					if o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAccessMethod(name)); werr != nil {
+							return fmt.Errorf("wal drop-access-method: %w", werr)
+						}
+					}
 					return nil
 				}
 			}

@@ -1469,6 +1469,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: function DDL replay: %w", err)
 	}
 
+	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
+	// ledger resume point): restore CREATE/DROP ACCESS METHOD objects from
+	// the WAL. Like event triggers, access methods are keyed by a plain name
+	// string, so order relative to schema replay does not matter.
+	if err := replayAccessMethodDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: access method DDL replay: %w", err)
+	}
+
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
 	if err := registerPgSequencesView(cat); err != nil {
