@@ -51,6 +51,28 @@ func TestRoleNameForOID(t *testing.T) {
 	}
 }
 
+// TestRoleNameForOIDOrUnknown pins pg_get_userbyid's exact PG fallback text
+// ("unknown (OID=n)"), distinct from RoleNameForOID's bare-numeral fallback
+// which serves a different internal caller (ACL-text rendering).
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestRoleNameForOIDOrUnknown(t *testing.T) {
+	c := NewInMemory()
+	if got := c.RoleNameForOIDOrUnknown(10); got != "postgres" {
+		t.Errorf("RoleNameForOIDOrUnknown(10) = %q, want \"postgres\"", got)
+	}
+	c.RegisterRole("paramgrantee")
+	oid, ok := c.RoleOID("paramgrantee")
+	if !ok || oid == 0 {
+		t.Fatalf("RoleOID(paramgrantee) = %d, %v; want a non-zero OID", oid, ok)
+	}
+	if got := c.RoleNameForOIDOrUnknown(oid); got != "paramgrantee" {
+		t.Errorf("RoleNameForOIDOrUnknown(%d) = %q, want \"paramgrantee\"", oid, got)
+	}
+	if got := c.RoleNameForOIDOrUnknown(4242); got != "unknown (OID=4242)" {
+		t.Errorf("RoleNameForOIDOrUnknown(4242) = %q, want \"unknown (OID=4242)\"", got)
+	}
+}
+
 // TestRelaclText pins the pg_class.relacl projection that lets a table-level
 // GRANT round-trip through pg_dump (DU-002 slice 331). PostgreSQL leaves relacl
 // NULL until the first GRANT, then materializes an aclitem[] with the owner's
@@ -1258,5 +1280,94 @@ func TestDatabaseACLRevokeFromOwner(t *testing.T) {
 	want := "{postgres=Tc/postgres,=Tc/postgres}"
 	if got := c.DatabaseACLText(dbOID); got != want {
 		t.Fatalf("datacl after REVOKE CREATE FROM postgres = %q; want %q", got, want)
+	}
+}
+
+// TestParameterACLOID pins the lazy synthetic-OID minting: the same
+// (case-folded) parname always returns the same OID, and distinct names get
+// distinct OIDs, mirroring PostgreSQL's ParameterAclLookup/ParameterAclCreate.
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestParameterACLOID(t *testing.T) {
+	c := NewInMemory()
+
+	oid1 := c.ParameterACLOID("work_mem")
+	oid1Again := c.ParameterACLOID("work_mem")
+	if oid1 != oid1Again {
+		t.Fatalf("ParameterACLOID(\"work_mem\") not idempotent: %d then %d", oid1, oid1Again)
+	}
+	// Case-folding: convert_GUC_name_for_parameter_acl lower-cases the name,
+	// so a differently-cased spelling resolves to the same OID.
+	if oid := c.ParameterACLOID("Work_Mem"); oid != oid1 {
+		t.Fatalf("ParameterACLOID(\"Work_Mem\") = %d, want %d (case-folded match)", oid, oid1)
+	}
+	oid2 := c.ParameterACLOID("statement_timeout")
+	if oid2 == oid1 {
+		t.Fatalf("ParameterACLOID(\"statement_timeout\") collided with work_mem's OID %d", oid1)
+	}
+}
+
+// TestParameterACLText mirrors TestDatabaseACLText/TestTypeACLText for the
+// parameter (pg_parameter_acl) ACL projection. Unlike DATABASE, PUBLIC's
+// acldefault('p', …) is ACL_NO_RIGHTS — no implicit PUBLIC seed — so only the
+// owner and named grantee(s) appear. M0119-0004-ACLHEAP (parameter ACL half).
+func TestParameterACLText(t *testing.T) {
+	c := NewInMemory()
+	oid := c.ParameterACLOID("work_mem")
+
+	// No grants → NULL paracl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ParameterACLText(oid); got != "" {
+		t.Fatalf("paracl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	c.GrantTablePrivilege(oid, "grantee_p", "SET")
+	want := "{postgres=sA/postgres,grantee_p=s/postgres}"
+	if got := c.ParameterACLText(oid); got != want {
+		t.Fatalf("paracl after GRANT SET TO grantee_p = %q; want %q", got, want)
+	}
+
+	// A non-parameter keyword renders nothing for that grantee
+	// (relaclTextLockedFor skips letters outside parameterACLPrivOrder).
+	c.GrantTablePrivilege(oid, "noise_role", "SELECT")
+	if got := c.ParameterACLText(oid); got != want {
+		t.Fatalf("paracl must ignore a non-parameter privilege: got %q; want %q", got, want)
+	}
+}
+
+// TestParameterACLRevokeFromOwner pins the owner-side REVOKE, the parameter
+// analogue of TestTypeACLRevokeFromOwner/TestDatabaseACLRevokeFromOwner.
+func TestParameterACLRevokeFromOwner(t *testing.T) {
+	c := NewInMemory()
+	oid := c.ParameterACLOID("statement_timeout")
+
+	c.MaterializeOwnerACL(oid, "postgres", []string{"SET", "ALTER SYSTEM"})
+	c.RevokeTablePrivilege(oid, "postgres", "ALTER SYSTEM")
+	want := "{postgres=s/postgres}"
+	if got := c.ParameterACLText(oid); got != want {
+		t.Fatalf("paracl after REVOKE \"ALTER SYSTEM\" FROM postgres = %q; want %q", got, want)
+	}
+}
+
+// TestParameterACLEntries pins the VirtualRows source: only parameters that
+// have ever received a synthetic OID (via ParameterACLOID) appear, sorted by
+// parname — mirroring pg_dumpall's `ORDER BY 1` over pg_parameter_acl.
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestParameterACLEntries(t *testing.T) {
+	c := NewInMemory()
+	if got := c.ParameterACLEntries(); len(got) != 0 {
+		t.Fatalf("ParameterACLEntries on a fresh catalog = %v, want empty", got)
+	}
+	oidWM := c.ParameterACLOID("work_mem")
+	oidST := c.ParameterACLOID("statement_timeout")
+
+	got := c.ParameterACLEntries()
+	if len(got) != 2 {
+		t.Fatalf("ParameterACLEntries len = %d, want 2: %+v", len(got), got)
+	}
+	// Sorted by parname: "statement_timeout" < "work_mem".
+	if got[0].Parname != "statement_timeout" || got[0].OID != oidST {
+		t.Errorf("entry[0] = %+v, want {OID:%d Parname:statement_timeout}", got[0], oidST)
+	}
+	if got[1].Parname != "work_mem" || got[1].OID != oidWM {
+		t.Errorf("entry[1] = %+v, want {OID:%d Parname:work_mem}", got[1], oidWM)
 	}
 }

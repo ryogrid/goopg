@@ -2233,6 +2233,24 @@ type InMemory struct {
 	// when its column privilege set is fully revoked. M0119-0004-ACLHEAP.
 	attrACLOrder map[attrACLKey][]string
 
+	// parameterACLOIDs assigns a synthetic pg_parameter_acl.oid to each
+	// GUC-level `GRANT SET|ALTER SYSTEM ON PARAMETER <name> ...` target, keyed
+	// by the lower-cased dotted parameter name (mirroring
+	// convert_GUC_name_for_parameter_acl, guc.c). Unlike typacl/datacl,
+	// pg_parameter_acl has no backing real-world object to look an OID up
+	// against — PostgreSQL lazily creates the row on first GRANT
+	// (ParameterAclCreate) — so goopg mints one from the shared nextOID
+	// counter the same way. The OID is otherwise a plain key into the shared
+	// tableACLs store (privileges rendered via ParameterACLText).
+	// M0119-0004-ACLHEAP (parameter ACL half).
+	parameterACLOIDs map[string]uint32
+
+	// parameterACLNames is the reverse of parameterACLOIDs (oid → original
+	// lower-cased parname), so pg_parameter_acl's VirtualRows can project
+	// every GUC that has ever been granted, in a stable order.
+	// M0119-0004-ACLHEAP (parameter ACL half).
+	parameterACLNames map[uint32]string
+
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
@@ -2824,6 +2842,8 @@ func NewInMemory() *InMemory {
 		relACLOwnerRevoked: make(map[uint32]bool),
 		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
 		attrACLOrder:       make(map[attrACLKey][]string),
+		parameterACLOIDs:   make(map[string]uint32),
+		parameterACLNames:  make(map[uint32]string),
 		comments:           make(map[commentKey]string),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
@@ -5625,11 +5645,14 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_auth_members"] = pgAuthMembers
 
-	// pg_parameter_acl — GUC-level ACLs (`GRANT SET ON PARAMETER ...`).
-	// Correctly-empty: goopg has no parameter-ACL GRANT support (a distinct
-	// capability from object-level GRANT — see deferral ledger). Registered
-	// so pg_dumpall's getParameterACLs query resolves instead of failing with
-	// "relation does not exist" (M0119-0004-ACLHEAP follow-up).
+	// pg_parameter_acl — GUC-level ACLs (`GRANT SET|ALTER SYSTEM ON PARAMETER
+	// ...`). Registered so pg_dumpall's getParameterACLs query resolves
+	// instead of failing with "relation does not exist"; rows are projected
+	// from the parameterACLOIDs/parameterACLNames registry, populated lazily
+	// by execParameterACLChange on the first GRANT ON PARAMETER for a given
+	// GUC name (mirrors PostgreSQL's own lazy ParameterAclCreate — a GUC never
+	// appears here until it has been granted at least once).
+	// M0119-0004-ACLHEAP (parameter ACL half).
 	pgParameterACL := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_parameter_acl",
@@ -5641,7 +5664,25 @@ func (c *InMemory) registerSystemTables() {
 		OID:     6243, // upstream's ParameterAclRelationId
 		Virtual: true,
 	}
-	pgParameterACL.VirtualRows = func() [][]string { return nil }
+	pgParameterACL.VirtualRows = func() [][]string {
+		entries := c.ParameterACLEntries()
+		if len(entries) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(entries))
+		for _, e := range entries {
+			paracl := VirtualNull
+			if aclText := c.ParameterACLText(e.OID); aclText != "" {
+				paracl = aclText
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(e.OID), 10),
+				e.Parname,
+				paracl,
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
 
 	// pg_tables — HammerDB probes
@@ -10665,6 +10706,30 @@ func (c *InMemory) RoleNameForOID(oid uint32) string {
 	return strconv.FormatUint(uint64(oid), 10)
 }
 
+// RoleNameForOIDOrUnknown mirrors ruleutils.c's pg_get_userbyid SQL builtin
+// exactly: it resolves oid to its role name, or PG's literal fallback string
+// "unknown (OID=n)" when no such role exists. This differs from
+// RoleNameForOID's own fallback (the bare numeral), which serves ACL-text
+// rendering internals rather than the SQL function's documented contract.
+// M0119-0004-ACLHEAP (parameter ACL half — used by dumpRoleGUCPrivs's
+// pg_get_userbyid(10) call).
+func (c *InMemory) RoleNameForOIDOrUnknown(oid uint32) string {
+	if oid == 10 {
+		return "postgres"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, roid := range c.roles {
+		if roid == oid {
+			if disp, ok := c.roleACLDisplay[name]; ok {
+				return disp
+			}
+			return name
+		}
+	}
+	return fmt.Sprintf("unknown (OID=%d)", oid)
+}
+
 // GrantTablePrivilege records that role may exercise priv on relOID. See the
 // Catalog interface doc. Role names are stored lower-cased and privilege
 // keywords upper-cased so lookups are case-insensitive. M0118-0008.
@@ -11045,6 +11110,87 @@ var typeACLPrivOrder = []aclPrivLetter{
 // materialized typacl reproduces both default entries — structurally identical
 // to the function EXECUTE default (ownerFunctionACLString). M0119-0004-ACLHEAP.
 const ownerTypeACLString = "U"
+
+// parameterACLPrivOrder lists the GUC-level (pg_parameter_acl) privileges in
+// PostgreSQL's canonical aclitemout bit order: SET('s') precedes ALTER
+// SYSTEM('A') (ACL_ALL_RIGHTS_STR, acl.h — "...csAm"). pg_dumpall's
+// dumpRoleGUCPrivs diffs a parameter's paracl against acldefault('p',
+// BOOTSTRAP_SUPERUSERID) client-side in buildACLCommands and re-emits `GRANT
+// … ON PARAMETER …`, so projecting the privilege set in this order matches
+// the aclitem[] text PG stores in pg_parameter_acl.paracl. M0119-0004-ACLHEAP
+// (parameter ACL half).
+var parameterACLPrivOrder = []aclPrivLetter{
+	{"SET", 's'},
+	{"ALTER SYSTEM", 'A'},
+}
+
+// ownerParameterACLString is the privilege-letter string for the owner's full
+// set of parameter privileges, i.e. "sA" (ACL_ALL_RIGHTS_PARAMETER_ACL =
+// SET|ALTER_SYSTEM). Unlike TYPE/FUNCTION, PUBLIC gets NO implicit default
+// (acldefault('p', …)'s world_default is ACL_NO_RIGHTS) — structurally
+// identical to the plain table-privilege pattern (ownerTableACLString), not
+// the owner+PUBLIC pattern. PostgreSQL treats every parameter ACL as owned by
+// the bootstrap superuser (ExecGrant_Parameter hardcodes ownerId =
+// BOOTSTRAP_SUPERUSERID), matching goopg's single "postgres" owner/grantor.
+// M0119-0004-ACLHEAP (parameter ACL half).
+const ownerParameterACLString = "sA"
+
+// ParameterACLOID returns the synthetic pg_parameter_acl.oid for the
+// lower-cased dotted GUC name parname, minting one from the shared nextOID
+// counter and registering it in parameterACLNames on first use (mirrors
+// PostgreSQL's lazy ParameterAclCreate). Repeated calls for the same
+// parname are idempotent. M0119-0004-ACLHEAP (parameter ACL half).
+func (c *InMemory) ParameterACLOID(parname string) uint32 {
+	parname = strings.ToLower(strings.TrimSpace(parname))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if oid, ok := c.parameterACLOIDs[parname]; ok {
+		return oid
+	}
+	oid := c.allocOIDLocked()
+	c.parameterACLOIDs[parname] = oid
+	c.parameterACLNames[oid] = parname
+	return oid
+}
+
+// ParameterACLText renders the materialized pg_parameter_acl.paracl text for
+// the GUC identified by paramOID, or "" (SQL NULL) when no privilege has been
+// granted away. Parameters share the OID-keyed ACL store with relations,
+// schemas, routines, types, and databases (goopg mints parameter-ACL OIDs
+// from the same nextOID counter, so there is no collision). M0119-0004-ACLHEAP
+// (parameter ACL half).
+func (c *InMemory) ParameterACLText(paramOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(paramOID, parameterACLPrivOrder, ownerParameterACLString)
+}
+
+// ParameterACLEntries returns every granted GUC's (oid, parname) pair, sorted
+// by parname, so pg_parameter_acl's VirtualRows can project a deterministic
+// row set mirroring pg_dumpall's `ORDER BY 1` (getParameterACLs/
+// dumpRoleGUCPrivs). Only parameters that have ever received a GRANT appear
+// here — PostgreSQL itself never rows a GUC in pg_parameter_acl until its
+// first GRANT (ParameterAclCreate is lazy). M0119-0004-ACLHEAP (parameter ACL
+// half).
+func (c *InMemory) ParameterACLEntries() []struct {
+	OID     uint32
+	Parname string
+} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]struct {
+		OID     uint32
+		Parname string
+	}, 0, len(c.parameterACLNames))
+	for oid, name := range c.parameterACLNames {
+		out = append(out, struct {
+			OID     uint32
+			Parname string
+		}{OID: oid, Parname: name})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Parname < out[j].Parname })
+	return out
+}
 
 // foreignServerACLPrivOrder lists the foreign-server (pg_foreign_server)
 // privileges in PostgreSQL's canonical aclitemout order. A foreign server has

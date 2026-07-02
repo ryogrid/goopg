@@ -9788,6 +9788,32 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, row, ctx)
+	// pg_get_userbyid(oid) → name: resolves a role OID to its name, or PG's
+	// literal fallback "unknown (OID=n)" when no such role exists
+	// (pg_get_userbyid, ruleutils.c). pg_dumpall's dumpRoleGUCPrivs calls it
+	// as `pg_get_userbyid(10)` (BOOTSTRAP_SUPERUSERID) to resolve
+	// pg_parameter_acl's implicit owner. M0119-0004-ACLHEAP (parameter ACL
+	// half).
+	case "pg_get_userbyid":
+		if len(x.Args) != 1 {
+			return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
+				Message: "pg_get_userbyid(oid) requires exactly 1 argument"}
+		}
+		oidArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if oidArg.IsNull() {
+			return NullDatum, nil
+		}
+		if ctx == nil || ctx.Catalog == nil {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		return NewStringDatum(im.RoleNameForOIDOrUnknown(uint32(oidArg.Int))), nil
 	// pg_stat_force_next_flush() → void: forces the next cumulative-statistics
 	// flush in the current backend to proceed unconditionally (upstream skips a
 	// flush if the rate-limit interval has not elapsed). goopg accumulates

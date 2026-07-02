@@ -2037,6 +2037,13 @@ type CompatNoopStmt struct {
 	// instead of building DatabaseACL/TableACL/TypeACL/AttrACL. Nil for every
 	// object-privilege GRANT/REVOKE. M0119-0004-ACLHEAP.
 	RoleMembership *RoleMembershipChange
+	// ParameterACLChange is set for a GRANT/REVOKE … ON PARAMETER … statement
+	// whose clause was fully parsed. pg_parameter_acl is goopg-virtual-only
+	// (see ParameterACLChange's own doc) — unlike TypeACL/DatabaseACLChange the
+	// executor (execCompatNoop → execParameterACLChange) applies this directly
+	// to the in-memory ACL store, with no heap row to re-sync. Nil when the
+	// clause could not be parsed. M0119-0004-ACLHEAP (parameter ACL half).
+	ParameterACLChange *ParameterACLChange
 	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
 	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
 	// executor stores them in the catalog's foreign-server registry so pg_dump
@@ -2237,6 +2244,24 @@ type RoleMembershipChange struct {
 	Roles         []string // the role(s) being granted/revoked
 	Grantees      []string // the member role(s) receiving/losing membership
 	GrantedBy     string   // optional explicit grantor; "" = current session role
+}
+
+// ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON
+// PARAMETER … statement (pg_parameter_acl, GUC-level ACLs) so the executor
+// can update the synthetic-OID-keyed ACL store. Unlike TypeACLChange/
+// DatabaseACLChange, pg_parameter_acl is a goopg-virtual-only catalog with no
+// heap relfilenode to re-sync (a GUC name is not a real on-disk object the
+// way a type or database row is), so the executor applies the change
+// directly to the in-memory store. ParamNames are raw dotted strings rather
+// than ObjectName — a dot in a GUC name such as "pgaudit.log" is not a schema
+// separator (gram.y's parameter_name production, not qualified_name).
+// M0119-0004-ACLHEAP (parameter ACL half).
+type ParameterACLChange struct {
+	Revoke          bool     // true for REVOKE, false for GRANT
+	Privileges      []string // upper-cased; "SET" | "ALTER SYSTEM" | "ALL"/"ALL PRIVILEGES"
+	ParamNames      []string // lower-cased dotted GUC names
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool     // GRANT … WITH GRANT OPTION
 }
 
 // ColumnPrivilege pairs a single column-grantable privilege keyword with the

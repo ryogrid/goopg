@@ -14119,6 +14119,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return err
 		}
 	}
+	// A GRANT/REVOKE … ON PARAMETER … changes pg_parameter_acl. Unlike
+	// TYPE/DATABASE it has no heap row to re-sync (goopg-virtual-only
+	// catalog), but query.go's isHeapACLObject still excludes it from the
+	// server's virtual-ACL fast path so the parsed clause reaches the
+	// executor here. M0119-0004-ACLHEAP (parameter ACL half).
+	if s.ParameterACLChange != nil {
+		if err := o.execParameterACLChange(s.ParameterACLChange); err != nil {
+			return err
+		}
+	}
 	// A `GRANT <role> TO <role>`/`REVOKE ... FROM <role>` role-membership
 	// statement changes pg_auth_members, which is virtual and sourced
 	// entirely from the roleMembers registry (no heap row to re-sync). The

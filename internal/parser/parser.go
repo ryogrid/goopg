@@ -383,6 +383,79 @@ func buildDatabaseACLChange(revoke bool, toks []Token) *DatabaseACLChange {
 	return dac
 }
 
+// splitTokDottedNames renders each comma-separated run as a single joined
+// string, preserving embedded "." separators verbatim rather than splitting
+// into schema/name (GUC parameter names may themselves be dotted, e.g.
+// "pgaudit.log" — gram.y's parameter_name production, not qualified_name).
+// Quoting is stripped per token and the result lower-cased, mirroring
+// PostgreSQL's convert_GUC_name_for_parameter_acl (guc.c) case-folding.
+// M0119-0004-ACLHEAP (parameter ACL half).
+func splitTokDottedNames(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		var b strings.Builder
+		for _, tk := range run {
+			b.WriteString(strings.Trim(tk.Value, `"`))
+		}
+		if s := b.String(); s != "" {
+			out = append(out, strings.ToLower(s))
+		}
+	}
+	return out
+}
+
+// buildParameterACLChange parses the token run of a GRANT/REVOKE … ON
+// PARAMETER … statement into a ParameterACLChange, mirroring
+// buildDatabaseACLChange's shape. toks is every token after the GRANT/REVOKE
+// keyword with the trailing ';' already excluded. Returns nil when any
+// required list is empty (an unparseable form the caller leaves as a
+// successful no-op). M0119-0004-ACLHEAP (parameter ACL half).
+func buildParameterACLChange(revoke bool, toks []Token) *ParameterACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+2 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 2 // skip the ON and the PARAMETER keyword
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	pac := &ParameterACLChange{
+		Revoke:          revoke,
+		Privileges:      splitTokPrivileges(toks[:onIdx]),
+		ParamNames:      splitTokDottedNames(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(pac.Privileges) == 0 || len(pac.ParamNames) == 0 || len(pac.Grantees) == 0 {
+		return nil
+	}
+	return pac
+}
+
 // buildRoleMembershipChange parses the token run of a `GRANT <role>[, ...]
 // TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
 // [{ADMIN|INHERIT|SET} OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED
@@ -983,6 +1056,13 @@ identLedStatement:
 			// full clause is captured (toks) and parsed into CompatNoopStmt.TypeACL
 			// for the executor to apply (M0119-0004-ACLHEAP).
 			typeClass := ""
+			// parameterACL is true for `ON PARAMETER <names>` — a GUC-level ACL
+			// (pg_parameter_acl). Unlike TYPE/DOMAIN/DATABASE, pg_parameter_acl is
+			// goopg-virtual-only (no heap relfilenode to re-sync), but it still needs
+			// the executor's *Context to reach the ACL store, so the clause is
+			// captured here exactly like the heap-backed classes.
+			// M0119-0004-ACLHEAP (parameter ACL half).
+			parameterACL := false
 			// sawOn is true the moment ANY "on" token appears anywhere in the
 			// statement -- the discriminator between every privilege-GRANT variant
 			// above (which all require an ON <object> clause) and role membership
@@ -1008,6 +1088,9 @@ identLedStatement:
 					case strings.EqualFold(next.Value, "domain"):
 						// `ON DOMAIN <names>` — also a pg_type row (typtype='d').
 						typeClass = "domain"
+					case strings.EqualFold(next.Value, "parameter"):
+						// `ON PARAMETER <names>` — GUC-level ACL (captured below).
+						parameterACL = true
 					case grantNonTableClass(next.Value):
 						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
 					default:
@@ -1030,6 +1113,13 @@ identLedStatement:
 				// which is unrelated to whether the clause parsed cleanly here.
 				// M0119-0004-ACLHEAP (datacl half).
 				ns.DatabaseACLChange = buildDatabaseACLChange(strings.EqualFold(t.Value, "revoke"), toks)
+			} else if parameterACL {
+				// `GRANT/REVOKE … ON PARAMETER …` — pg_parameter_acl is
+				// goopg-virtual-only, so unlike TYPE/DATABASE there is no heap row to
+				// re-sync; the executor (execParameterACLChange) applies the change
+				// directly to the in-memory ACL store. M0119-0004-ACLHEAP (parameter
+				// ACL half).
+				ns.ParameterACLChange = buildParameterACLChange(strings.EqualFold(t.Value, "revoke"), toks)
 			} else if grantHasColumnList(toks) {
 				// A column-level GRANT/REVOKE targets pg_attribute.attacl (heap-backed),
 				// not the whole-relation pg_class.relacl. Capture the parsed clause for

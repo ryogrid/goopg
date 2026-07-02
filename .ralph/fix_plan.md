@@ -5751,6 +5751,43 @@ documentation-only and is exempt from the design-doc requirement.)
       and the standing extended-protocol/multi-database-scope gaps — all
       unchanged from the prior row.
 
+- [x] **`GRANT`/`REVOKE ... ON PARAMETER ...` (`pg_parameter_acl`) round-trip
+      in pg_dumpall (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:**
+      closes the "`GRANT ... ON PARAMETER` unimplemented" residual carried by
+      the three prior rows. Unlike TYPE/DATABASE, `pg_parameter_acl` has no
+      heap relfilenode, so no re-sync step and no PUBLIC default seed are
+      needed. New `parser.ParameterACLChange` (mirrors `DatabaseACLChange`)
+      captures `GRANT/REVOKE {SET|ALTER SYSTEM|ALL} ON PARAMETER <names>
+      TO/FROM <roles>`; names are raw dotted strings via new
+      `splitTokDottedNames` (a GUC name's `.` is not a schema separator).
+      `query.go`'s `isHeapACLObject` gained `" ON PARAMETER "` so the
+      statement reaches the executor instead of the virtual-ACL fast path's
+      no-op. New `catalog.InMemory.ParameterACLOID`/`ParameterACLText`/
+      `ParameterACLEntries` mint a lazy synthetic OID per GUC name and share
+      the existing `tableACLs` store; `pg_parameter_acl.VirtualRows` now
+      projects real rows. New `execParameterACLChange`
+      (`internal/executor/operators_ddl_parameter_acl.go`). Also added the
+      `pg_get_userbyid` SQL builtin (`internal/executor/expr.go`, new
+      `catalog.InMemory.RoleNameForOIDOrUnknown`), needed by
+      `pg_dumpall`'s `dumpRoleGUCPrivs` query. Tests:
+      `internal/parser/op_grant_parameteracl_test.go`;
+      `internal/catalog/relacl_test.go`
+      (`TestParameterACL{OID,Text,RevokeFromOwner,Entries}`,
+      `TestRoleNameForOIDOrUnknown`);
+      `internal/testport/pgdumpall_parameter_acl_test.go`
+      `TestPort_PgDumpallParameterACL` (byte-identical vs real `pg_dumpall`
+      18.3). Gates: `go build ./...`/`go vet` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor`+`internal/server` suites PASS;
+      `TestPort_PgDumpallParameterACL` PASS; `scripts/tpch-spotcheck.sh`
+      PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-grant-on-parameter-pgdumpall.md`;
+      `docs/design/README.md` row `0119-0004bz` added; deferral ledger row
+      appended. Still open: GUC-name validation against a real compiled-in
+      parameter table (goopg has none, so any string is accepted); the
+      grantor-chain circularity check and REVOKE's recursive/cascade
+      dependent-privilege walk (both role-membership, unrelated to this
+      slice) remain open, unchanged from prior rows.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
