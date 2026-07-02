@@ -34,6 +34,15 @@ Policy for **M0117 & M0118**: fix blockers in place; do NOT defer unless
 genuinely compelling (then record a ledger row). Commit + push at every clean,
 green (build + pre-commit) checkpoint.
 
+**Added 2026-07-02 (interactive session):** **M0120** (WordPress WP-CLI
+verification execution & evidence capture) and **M0121** (remediation of the
+failures M0120 finds) are new milestones — see their sections at the end of this
+file. The enabling goopg feature (statement/query logging, `GOOPG_LOG_STATEMENT`,
+design `root-0023`) has already landed. Sequence them after the current
+M0110/M0119 work: **run M0120 first** (it only needs the landed logging + the
+committed `wp/verification/` checklist/flow), **then M0121** consumes its triaged
+failure list.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
 M0096 (RC isolation feature impl + spec pass), M0100 (RC isolation runtime
@@ -5642,3 +5651,57 @@ documentation-only and is exempt from the design-doc requirement.)
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
 > task-ids; the milestone's living nature means it need not be complete at filing.
+
+---
+
+## M0120 — WordPress WP-CLI Verification Execution & Evidence Capture (filed 2026-07-02)
+
+Milestone: `docs/milestones/0120-wordpress-wpcli-verification-execution.md`.
+Artifacts (committed): `wp/verification/CHECKLIST.md` (40 items — 32 write, 8
+read) and `wp/verification/FLOW.md` (execution + evidence-capture procedure).
+Depends on the landed statement-logging feature (`docs/design/root-0023-statement-query-logging.md`,
+`GOOPG_LOG_STATEMENT=all`). Goal: run every checklist item against the live
+WordPress-on-goopg stack, capture WP-CLI output + goopg statement log + PG4WP
+SQL + a confirming read for **every** item (passing ones too), produce a
+PASS/FAIL `report.md`, and triage each failure. No engine fixes here — that is
+M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
+`GOOPG_CG_UNIT=goopg-wp`).
+
+- [ ] **M0120-0001 — Verification harness + pre-run capture setup.** Implement
+  FLOW.md §1–2: restart the wp goopg instance with `GOOPG_LOG_STATEMENT=all`
+  (capped), enable PG4WP debug logging (`PG4WP_DEBUG=true`), snapshot baseline
+  counts, and write the `run_item` capture script (byte-offset log slicing).
+- [ ] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
+  post-meta, taxonomy, term-meta, user create/update). Store per-item evidence
+  under `wp/verification/results/<ts>/`; record each confirming read.
+- [ ] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
+  role/delete, comments + comment-meta, options/transients incl. the TOAST-sized
+  value WP-28, plugin activate/deactivate, raw INSERT/UPDATE/DELETE via
+  `wp db query`). Watch WP-28 for a root-0022-class TOAST regression.
+- [ ] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
+  `option get`, raw SELECT, `db size`/`core version`).
+- [ ] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
+  each FAIL (`goopg-bug`/`goopg-missing`/`pg4wp-limitation`/`harness`, FLOW.md
+  §4); for every goopg failure append a `.ralph/deferral_ledger.md` row and file
+  the cross-referenced `M0121-NNNN` task (the M0120→M0121 handoff).
+
+## M0121 — WordPress WP-CLI Verification Failure Remediation (filed 2026-07-02)
+
+Milestone: `docs/milestones/0121-wordpress-wpcli-verification-remediation.md`.
+Depends on M0120 (its `report.md` + the deferral rows it files). Goal: drive
+every M0120 `goopg-bug`/`goopg-missing` failure to a verified PASS — fix the bug
+or implement the missing capability in **goopg** (never PG4WP, never a
+`goopg_compat` branch) — with a design doc (non-trivial) and a regression test,
+then re-verify via `wp/verification/FLOW.md`. Reserve design-doc filenames
+`docs/design/0121-NNNN-<slug>.md` (or `root-00NN-*.md` for cross-cutting engine
+work) and index each in `docs/design/README.md`. Gates per change: units +
+pgbench-smoke hook, `scripts/tpch-spotcheck.sh` for executor/planner/codec, race
+gate for concurrency-critical packages.
+
+- [ ] **M0121-0001 — Populate from M0120 triage.** This task list is **seeded,
+  not exhaustive**: after M0120-0005, add one `M0121-000N` task per
+  `goopg-bug`/`goopg-missing` failure (cross-referenced from its deferral-ledger
+  row), each closing its ledger row (`- → resolved`) when the checklist item
+  passes its confirming read on a fresh run and a regression test guards it.
+  Failures classed `pg4wp-limitation`/`harness` are documented, not fixed in
+  goopg.

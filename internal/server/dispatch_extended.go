@@ -39,6 +39,11 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 		return nil, qerr
 	}
+	// Per-statement query logging (GOOPG_LOG_STATEMENT), extended protocol.
+	// Logged at Execute (the portal's source query) rather than Bind, so a
+	// reused portal is not logged per-batch — mirroring PostgreSQL's
+	// log_statement on the extended path. No-op when disabled. root-0023.
+	s.logStatement("extended", query, connTx)
 	if len(stmts) == 0 {
 		return &extendedQueryResult{Empty: true}, nil
 	}

@@ -373,6 +373,13 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	cfg := server.Config{
 		Address: *addr,
 		Logger:  logger,
+		// GOOPG_LOG_STATEMENT enables per-statement query logging
+		// (none|ddl|mod|all), mirroring PostgreSQL's log_statement. Off by
+		// default; used by the WordPress-on-goopg verification flow to
+		// capture the SQL clients issue (see wp/verification/FLOW.md and
+		// docs/design/root-0023-statement-query-logging.md). The server
+		// parses and validates the value in server.New.
+		LogStatement: os.Getenv("GOOPG_LOG_STATEMENT"),
 	}
 
 	// Build the GUC registry up front so server-context settings
