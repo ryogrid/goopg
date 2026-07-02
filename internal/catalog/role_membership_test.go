@@ -193,6 +193,70 @@ func TestRoleMembershipEntriesDeterministicOrder(t *testing.T) {
 	}
 }
 
+// TestGrantRoleWouldCreateGrantorCycle verifies AddRoleMems' member-grantor
+// circularity guard (user.c ~1751): a DIFFERENT check from RoleIsMemberOf's
+// role-member loop. A single direct grant (A granted ADMIN on X to B) does
+// NOT by itself block B from granting X back to A WITH ADMIN OPTION — A has
+// no existing membership-in-X row for the simulated revoke to touch, so the
+// grantor-chain check is a no-op (matches PG's literal algorithm: only a
+// grant that would cascade-revoke the CURRENT grantor's own admin-option row
+// creates the circularity).
+func TestGrantRoleWouldCreateGrantorCycle(t *testing.T) {
+	c := NewInMemory()
+	const roleX = 500
+
+	// B (700) got ADMIN on X FROM A (600) — but A itself holds no
+	// membership-in-X row (A only appears as a grantor, never as a member).
+	c.GrantRoleMembership(roleX, 700, 600, boolPtr(true), nil, nil)
+
+	// "B tries to grant X back to A" with no chain to cascade through is NOT
+	// circular: A holds no membership-in-X row, so revoking it (as this
+	// grant would simulate) touches nothing, and B's own admin-option row
+	// (granted by A) is left untouched.
+	if c.GrantRoleWouldCreateGrantorCycle(roleX, []uint32{600}, 700) {
+		t.Errorf("a one-hop grant-back with no existing member row for the target should not be circular")
+	}
+
+	// Now also grant X to A (A becomes a genuine member of X, admin granted
+	// by some third party). B granting X back to A WITH ADMIN is now
+	// circular: revoking A's new membership-in-X row cascades (A is the
+	// grantor of B's admin-option row) to also revoke B's own admin_option,
+	// leaving B with no surviving source of ADMIN OPTION on X to perform the
+	// grant with.
+	c.GrantRoleMembership(roleX, 600, 999, boolPtr(true), nil, nil)
+	if !c.GrantRoleWouldCreateGrantorCycle(roleX, []uint32{600}, 700) {
+		t.Errorf("a chained grant-back that would cascade-revoke the grantor's own admin option must be circular")
+	}
+}
+
+// TestGrantRoleWouldCreateGrantorCycleRetainsUntouchedAdmin verifies that a
+// grantor keeps the ability to grant when the new grantee set does not
+// implicate the grantor's own admin-option row at all.
+func TestGrantRoleWouldCreateGrantorCycleRetainsUntouchedAdmin(t *testing.T) {
+	c := NewInMemory()
+	const roleX = 500
+
+	// B (700) holds ADMIN on X, granted by an unrelated role (999).
+	c.GrantRoleMembership(roleX, 700, 999, boolPtr(true), nil, nil)
+
+	// B grants X to a third, unrelated role (800): nothing about B's own
+	// row is implicated by revoking 800's (nonexistent) membership-in-X row.
+	if c.GrantRoleWouldCreateGrantorCycle(roleX, []uint32{800}, 700) {
+		t.Errorf("granting to an unrelated member must not implicate the grantor's untouched admin row")
+	}
+}
+
+// TestGrantRoleWouldCreateGrantorCycleRejectsBootstrapSuperuserGrantee
+// verifies PG's unconditional rule: ADMIN OPTION can never be (re-)granted
+// to the bootstrap superuser (it needs no source grantor), regardless of
+// any existing pg_auth_members rows.
+func TestGrantRoleWouldCreateGrantorCycleRejectsBootstrapSuperuserGrantee(t *testing.T) {
+	c := NewInMemory()
+	if !c.GrantRoleWouldCreateGrantorCycle(500, []uint32{BootstrapSuperuserOID}, 700) {
+		t.Errorf("granting ADMIN OPTION to the bootstrap superuser must always be rejected")
+	}
+}
+
 // TestUnregisterRoleDropsMembershipRows verifies DROP ROLE cascades removal
 // of any pg_auth_members row referencing the role's OID on either side,
 // mirroring PostgreSQL's DropRole (user.c).

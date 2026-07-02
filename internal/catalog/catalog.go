@@ -9,6 +9,7 @@ package catalog
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -4265,6 +4266,101 @@ func (c *InMemory) RoleIsMemberOf(memberOid, roleOid uint32) bool {
 		}
 	}
 	return false
+}
+
+// BootstrapSuperuserOID is OID 10 (BOOTSTRAP_SUPERUSERID / "postgres"),
+// goopg's single hardcoded superuser (see the many "OID 10 = bootstrap
+// superuser" call sites elsewhere in this file). AddRoleMems' grantor-chain
+// circularity check (user.c) exempts grants made BY the bootstrap superuser
+// and never allows ADMIN OPTION to be (re-)granted TO it.
+const BootstrapSuperuserOID uint32 = 10
+
+// GrantRoleWouldCreateGrantorCycle reports whether granting roleOid's
+// membership WITH ADMIN TRUE to newMemberOids (a single `GRANT roleOid TO
+// member, ...` statement's full grantee list) would create a "member-grantor
+// loop": grantorOid giving ADMIN OPTION on roleOid to someone who is
+// grantorOid's ONLY remaining source of ADMIN OPTION on roleOid, which would
+// make the grant chain non-acyclic (defeating REVOKE .. CASCADE's ability to
+// unwind it). Mirrors AddRoleMems' circularity guard (user.c ~1751), which
+// simulates revoking (cascading through) every existing pg_auth_members row
+// implicated by the new grantees and then checks whether grantorOid still
+// holds an untouched, admin_option row. This is a DIFFERENT check from
+// RoleIsMemberOf's role-member loop (A member of B, B member of A) — this
+// one is about the ADMIN OPTION GRANT chain, not the membership graph itself.
+//
+// Caller must already have gated on `admin option requested && grantorOid !=
+// bootstrapSuperuserOID` (AddRoleMems' `if (popt->admin && grantorId !=
+// BOOTSTRAP_SUPERUSERID)`); grants made by the bootstrap superuser can never
+// be circular since it is always everyone's ultimate admin. M0119-0004-ACLHEAP.
+func (c *InMemory) GrantRoleWouldCreateGrantorCycle(roleOid uint32, newMemberOids []uint32, grantorOid uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// PG unconditionally rejects (re-)granting ADMIN OPTION to the bootstrap
+	// superuser — it needs no source grantor, so any such grant is by
+	// definition ungrantable-back-to.
+	if slices.Contains(newMemberOids, BootstrapSuperuserOID) {
+		return true
+	}
+
+	// memlist: every existing pg_auth_members row for THIS roleOid only
+	// (SearchSysCacheList1(AUTHMEMROLEMEM, roleid) scopes identically).
+	var rows []*RoleMembership
+	for key, m := range c.roleMembers {
+		if key.RoleOID == roleOid {
+			rows = append(rows, m)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].MemberOID < rows[j].MemberOID })
+
+	// deleted[i] tracks whether plan_recursive_revoke would remove rows[i]
+	// entirely. This scoped use (only ever reached via plan_member_revoke,
+	// never plan_single_revoke) always calls plan_recursive_revoke with
+	// revoke_admin_option_only=false and behavior=DROP_CASCADE, so PG's
+	// 5-state RevokeRoleGrantAction collapses to this boolean here: every
+	// row plan_recursive_revoke would touch ends up RRG_DELETE_GRANT.
+	deleted := make([]bool, len(rows))
+	var planRecursiveRevoke func(index int)
+	planRecursiveRevoke = func(index int) {
+		if deleted[index] {
+			return
+		}
+		deleted[index] = true
+		member := rows[index].MemberOID
+		if !rows[index].AdminOption {
+			return
+		}
+		// Would `member` still hold ADMIN OPTION on roleOid via some other,
+		// untouched grant? If so, nothing downstream needs to cascade.
+		for i, r := range rows {
+			if r.MemberOID == member && r.AdminOption && !deleted[i] {
+				return
+			}
+		}
+		// Recurse into grants for which `member` is the grantor — those
+		// would lose their ADMIN OPTION basis too.
+		for i, r := range rows {
+			if r.GrantorOID == member && !deleted[i] {
+				planRecursiveRevoke(i)
+			}
+		}
+	}
+	for _, mid := range newMemberOids {
+		for i, r := range rows {
+			if r.MemberOID == mid {
+				planRecursiveRevoke(i)
+			}
+		}
+	}
+
+	// If the grantor still holds an untouched, admin_option row on roleOid,
+	// it retains the ability to perform this grant — no circularity.
+	for i, r := range rows {
+		if !deleted[i] && r.MemberOID == grantorOid && r.AdminOption {
+			return false
+		}
+	}
+	return true
 }
 
 // RegisterIndexDuringRecovery is the idempotent version of

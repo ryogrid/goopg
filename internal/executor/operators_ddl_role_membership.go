@@ -62,19 +62,38 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 		if err != nil {
 			return err
 		}
+		memberOids := make([]uint32, 0, len(rc.Grantees))
 		for _, memberName := range rc.Grantees {
 			memberOid, err := resolveRole(memberName)
 			if err != nil {
 				return err
 			}
-			// Reject a membership that would create a cycle (including the
-			// trivial self-grant): roleOid must not already be a
-			// (transitive) member of memberOid, mirroring
+			// Reject a membership that would create a role-member cycle
+			// (including the trivial self-grant): roleOid must not already
+			// be a (transitive) member of memberOid, mirroring
 			// is_member_of_role_nosuper's check in AddRoleMems (user.c).
 			if im.RoleIsMemberOf(roleOid, memberOid) {
 				return &ExecError{Code: "0LP01", Message: fmt.Sprintf(
 					"role %q is a member of role %q", roleName, memberName)}
 			}
+			memberOids = append(memberOids, memberOid)
+		}
+
+		// Reject a WITH ADMIN TRUE grant that would create a member-grantor
+		// loop (AddRoleMems, user.c ~1751): a DIFFERENT circularity than the
+		// role-member check above — this one is about the ADMIN OPTION grant
+		// chain, checked once for the whole grantee batch, before any of
+		// this roleOid's grants are applied (matching AddRoleMems' ordering:
+		// per-member sanity checks, then one whole-batch admin check, then
+		// the catalog update loop). The bootstrap superuser can never be on
+		// either side of a circular grant.
+		if rc.AdminOption != nil && *rc.AdminOption && grantorOid != catalog.BootstrapSuperuserOID {
+			if im.GrantRoleWouldCreateGrantorCycle(roleOid, memberOids, grantorOid) {
+				return &ExecError{Code: "0LP01", Message: "ADMIN option cannot be granted back to your own grantor"}
+			}
+		}
+
+		for _, memberOid := range memberOids {
 			im.GrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption)
 			if o.ctx.WAL != nil {
 				_, _, _ = o.ctx.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption))

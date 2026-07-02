@@ -5788,6 +5788,44 @@ documentation-only and is exempt from the design-doc requirement.)
       dependent-privilege walk (both role-membership, unrelated to this
       slice) remain open, unchanged from prior rows.
 
+- [x] **`GRANT ROLE` grantor-chain circularity check (M0119-0004-ACLHEAP
+      follow-up, loop #18).** **COMPLETE 2026-07-03:** closes the
+      "grantor-chain circularity check" residual carried by every
+      M0119-0004-ACLHEAP row since the original `GRANT`/`REVOKE` role
+      membership slice. New `catalog.InMemory.GrantRoleWouldCreateGrantorCycle`
+      is a direct port of `AddRoleMems`' second cycle guard (`user.c` ~1751,
+      `initialize_revoke_actions`/`plan_member_revoke`/`plan_recursive_revoke`),
+      scoped to one `roleOid`'s `pg_auth_members` rows: simulates
+      cascading-revoking every row the new grantee batch implicates, then
+      checks whether the grantor's own `admin_option` row survives untouched;
+      also unconditionally rejects granting ADMIN OPTION to the bootstrap
+      superuser (new exported `catalog.BootstrapSuperuserOID = 10`).
+      `execRoleMembershipChange` (`internal/executor/
+      operators_ddl_role_membership.go`) runs this once per `roleOid` for the
+      whole grantee batch — gated on `rc.AdminOption == true && grantorOid !=
+      BootstrapSuperuserOID` — before applying any of that roleOid's grants,
+      matching `AddRoleMems`' sanity-checks-then-whole-batch-admin-check-then-
+      updates ordering; violation returns `0LP01`/PG's exact message ("ADMIN
+      option cannot be granted back to your own grantor"). Tests:
+      `TestGrantRoleWouldCreateGrantorCycle{,RetainsUntouchedAdmin,
+      RejectsBootstrapSuperuserGrantee}` (`internal/catalog/
+      role_membership_test.go`). Live end-to-end `psql` smoke against a
+      running goopg instance confirmed the chained-cycle scenario errors
+      while 1-hop and unrelated-role grants succeed. Gates: `go build ./...`/
+      `go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/server`+`internal/wal`+`internal/initdb`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Design doc:
+      `docs/design/0119-0004-grant-role-admin-circularity.md`;
+      `docs/design/README.md` row `0119-0004ca` added; deferral ledger row
+      appended. Still open: goopg's `roleMembers` map is keyed by `(RoleOID,
+      MemberOID)` only (one row per pair) unlike real PG's `(roleid, member,
+      grantor)` composite key, so the "retained via another grantor's row"
+      escape hatch can never observe a second legitimate grantor for the same
+      membership; `GRANT ... ON PARAMETER` GUC-name validation and REVOKE's
+      recursive/cascade dependent-privilege walk (both unrelated to this
+      slice) remain open, unchanged from prior rows.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
