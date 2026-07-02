@@ -1857,6 +1857,12 @@ type Catalog interface {
 	// `GRANT … ON FOREIGN SERVER <name> TO …` to the OID-keyed ACL store key.
 	// DU-002 slice 427.
 	ForeignServerOID(name string) uint32
+	// ForeignDataWrapperOID returns the stable OID of the named FDW (CREATE
+	// FOREIGN DATA WRAPPER), or 0 if not found. Used by the FOREIGN DATA WRAPPER
+	// GRANT recorder (internal/server/grant_ddl.go) to resolve the object named
+	// in `GRANT … ON FOREIGN DATA WRAPPER <name> TO …` to the OID-keyed ACL
+	// store key. DU-002 slice 428.
+	ForeignDataWrapperOID(name string) uint32
 	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
 	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
 	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
@@ -7236,9 +7242,11 @@ func (c *InMemory) registerSystemTables() {
 	}
 	// Surface user-created FDWs (CREATE FOREIGN DATA WRAPPER) so they round-trip.
 	// fdwhandler/fdwvalidator are 0 (no handler) — the query's `::regproc` cast
-	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR. fdwacl
-	// and fdwoptions are NULL (empty string), so dumpACL emits nothing and the
-	// OPTIONS clause is skipped. DU-002 slice 375.
+	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR.
+	// fdwoptions is NULL (empty string) absent an OPTIONS clause, so the OPTIONS
+	// clause is skipped. fdwacl materializes via ForeignDataWrapperACLText so a
+	// `GRANT … ON FOREIGN DATA WRAPPER …` round-trips (DU-002 slice 428);
+	// DU-002 slice 375.
 	pgForeignDataWrapper.VirtualRows = func() [][]string {
 		fdws := c.ListForeignDataWrappers()
 		if len(fdws) == 0 {
@@ -7256,7 +7264,7 @@ func (c *InMemory) registerSystemTables() {
 				strconv.FormatUint(uint64(owner), 10), // fdwowner
 				"0",                                   // fdwhandler (regproc 0 → '-')
 				"0",                                   // fdwvalidator (regproc 0 → '-')
-				"",                                    // fdwacl (NULL)
+				c.ForeignDataWrapperACLText(f.OID),    // fdwacl
 				optionsArrayLiteral(f.Options),        // fdwoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
@@ -10438,6 +10446,40 @@ func (c *InMemory) ForeignServerACLText(srvOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString)
+}
+
+// foreignDataWrapperACLPrivOrder lists the foreign-data-wrapper
+// (pg_foreign_data_wrapper) privileges in PostgreSQL's canonical aclitemout
+// order. Like a foreign server, an FDW has a single privilege, USAGE('U')
+// (ACL_ALL_RIGHTS_FDW == ACL_USAGE, acl.h) — projecting the privilege set in
+// this order matches the aclitem[] text PG stores in
+// pg_foreign_data_wrapper.fdwacl. DU-002 slice 428.
+var foreignDataWrapperACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+}
+
+// ownerForeignDataWrapperACLString is the privilege-letter string for the
+// owner's full set of foreign-data-wrapper privileges, i.e. "U". An FDW's
+// world default is ACL_NO_RIGHTS (acldefault('F', owner) =
+// "{postgres=U/postgres}" — PUBLIC gets nothing, same as OBJECT_FOREIGN_SERVER
+// right below OBJECT_FDW in acl.c's acldefault switch), so the FOREIGN DATA
+// WRAPPER GRANT recorder does NOT seed an implicit PUBLIC entry — mirrors
+// ownerForeignServerACLString. DU-002 slice 428.
+const ownerForeignDataWrapperACLString = "U"
+
+// ForeignDataWrapperACLText renders the materialized
+// pg_foreign_data_wrapper.fdwacl text for the FDW identified by fdwOID, or ""
+// (SQL NULL) when no privileges have been granted away. FDWs share the
+// OID-keyed ACL store with relations, schemas, routines, types, and foreign
+// servers (goopg mints FDW OIDs from the same nextOID counter, so there is no
+// collision). pg_dump's getForeignDataWrappers diffs fdwacl against
+// acldefault('F', fdwowner) client-side in buildACLCommands, so projecting
+// the correct aclitem[] text is sufficient for the `GRANT … ON FOREIGN DATA
+// WRAPPER …` round-trip. DU-002 slice 428.
+func (c *InMemory) ForeignDataWrapperACLText(fdwOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString)
 }
 
 // attrACLKey identifies one table column for column-level (pg_attribute.attacl)

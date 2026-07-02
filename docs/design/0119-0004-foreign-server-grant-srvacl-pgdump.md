@@ -92,6 +92,7 @@ adds a new `foreign server` branch ahead of the existing bail).
 ## Still open under M0119-0004
 
 Column-level (`pg_attribute.attacl`, heap re-sync) / database (`datacl`,
-`--create`-only) GRANT projection; `GRANT … ON FOREIGN DATA WRAPPER`
-(`fdwacl`) not modelled; extended-protocol commit-time deferral (see
+`--create`-only) GRANT projection; extended-protocol commit-time deferral (see
 M0119-0004-ACLHEAP, already tracked in the deferral ledger).
+`GRANT … ON FOREIGN DATA WRAPPER` (`fdwacl`) round-trip landed separately —
+see `0119-0004-foreign-data-wrapper-grant-fdwacl-pgdump.md` (DU-002 slice 428).

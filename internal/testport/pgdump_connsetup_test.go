@@ -4919,6 +4919,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "GRANT USAGE ON FOREIGN SERVER goopg_srv TO srv_grantee"); err != nil {
 		t.Fatalf("grant usage on foreign server goopg_srv to srv_grantee: %v", err)
 	}
+	// Slice 428: a FOREIGN DATA WRAPPER GRANT (`GRANT USAGE ON FOREIGN DATA
+	// WRAPPER <name> TO <role>`) must round-trip through pg_dump's fdwacl
+	// projection — the exact same shape as the slice-427 FOREIGN SERVER GRANT
+	// above, since acldefault('F', fdwowner) is byte-identical to
+	// acldefault('S', srvowner) in real PG (both OBJECT_FDW/OBJECT_FOREIGN_SERVER
+	// grant USAGE to the owner only, world default ACL_NO_RIGHTS). USAGE is
+	// FOREIGN DATA WRAPPER's only privilege, so buildACLCommands collapses it to
+	// `GRANT ALL ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee;`, not
+	// `GRANT USAGE ...`. goopg previously modelled NO FDW ACL at all —
+	// `tryRecordTableGrant` had no "data"/"wrapper" branch under "foreign" so it
+	// fell through to the non-table bail, and the pg_foreign_data_wrapper virtual
+	// view hard-coded fdwacl to the constant "" (NULL) — so the GRANT was
+	// silently dropped from every dump. Reuses goopg_fdw (created at slice 375)
+	// so no new CREATE FOREIGN DATA WRAPPER is needed.
+	if err := runSQLSimple(t, c, "CREATE ROLE fdw_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role fdw_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee"); err != nil {
+		t.Fatalf("grant usage on foreign data wrapper goopg_fdw to fdw_grantee: %v", err)
+	}
 	// Slice 417: a FOREIGN TABLE (`CREATE FOREIGN TABLE name (cols) SERVER srv
 	// [OPTIONS (...)]`) must round-trip. pg_dump's getTables selects relkind IN
 	// (..., 'f', ...); for a relkind='f' row it LEFT JOINs
@@ -10993,6 +11013,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// A regression that resurrected the previous nonTableGrantObjects bail (or
 		// re-hardcoded srvacl to NULL) would silently drop the GRANT above with no
 		// other symptom, so this positive assert is the only guard.
+		// Slice 428: a FOREIGN DATA WRAPPER GRANT must round-trip from the
+		// materialized fdwacl, the exact same shape as slice 427 above:
+		// acldefault('F', 10) = "{postgres=U/postgres}" (owner-only default), so a
+		// single explicit grant materializes fdwacl as
+		// "{postgres=U/postgres,fdw_grantee=U/postgres}" and buildACLCommands
+		// collapses the sole USAGE privilege to the ALL form.
+		if want := "GRANT ALL ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER GRANT (slice-428); missing %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// A regression that resurrected the missing "data"/"wrapper" dispatch
+		// branch (or re-hardcoded fdwacl to NULL) would silently drop the GRANT
+		// above with no other symptom, so this positive assert is the only guard.
 		// Slice 377: a USER MAPPING must round-trip as the bare
 		// `CREATE USER MAPPING FOR <user> SERVER <srv>;` form (no OPTIONS — deferred).
 		// dumpUserMappings reads usename from the pg_user_mappings view (filtered by

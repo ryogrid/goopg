@@ -353,6 +353,59 @@ func TestForeignServerACLText(t *testing.T) {
 	}
 }
 
+// TestForeignDataWrapperACLText pins the pg_foreign_data_wrapper.fdwacl
+// projection that lets a `GRANT … ON FOREIGN DATA WRAPPER …` round-trip
+// through pg_dump (DU-002 slice 428). An FDW's owner default is "U" (USAGE
+// only), which pg_dump diffs against via acldefault('F', owner); like a
+// foreign server, an FDW grants PUBLIC nothing by default (world default
+// ACL_NO_RIGHTS), so no implicit PUBLIC entry appears unless a GRANT … TO
+// PUBLIC is recorded explicitly. FDWs share the OID-keyed ACL store with
+// relations/schemas/routines/types/foreign servers, so the same
+// GrantTablePrivilege* recorders apply.
+func TestForeignDataWrapperACLText(t *testing.T) {
+	c := NewInMemory()
+	const fdwOID = 16910
+
+	// No grants → NULL fdwacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ForeignDataWrapperACLText(fdwOID); got != "" {
+		t.Fatalf("fdwacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE materializes the owner entry ("U") plus the grantee ("U").
+	c.GrantTablePrivilege(fdwOID, "fdw_role", "USAGE")
+	want := "{postgres=U/postgres,fdw_role=U/postgres}"
+	if got := c.ForeignDataWrapperACLText(fdwOID); got != want {
+		t.Fatalf("fdwacl after GRANT USAGE = %q; want %q", got, want)
+	}
+
+	// A grant-option USAGE renders "U*".
+	const goFdwOID = 16911
+	c.GrantTablePrivilegeWithGrantOption(goFdwOID, "fdw_role", "USAGE", true)
+	want = "{postgres=U/postgres,fdw_role=U*/postgres}"
+	if got := c.ForeignDataWrapperACLText(goFdwOID); got != want {
+		t.Fatalf("fdwacl after GRANT USAGE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+
+	// GRANT … ON FOREIGN DATA WRAPPER … TO PUBLIC materializes the empty grantee.
+	const pubFdwOID = 16912
+	c.GrantTablePrivilege(pubFdwOID, "PUBLIC", "USAGE")
+	want = "{postgres=U/postgres,=U/postgres}"
+	if got := c.ForeignDataWrapperACLText(pubFdwOID); got != want {
+		t.Fatalf("fdwacl after GRANT USAGE TO PUBLIC = %q; want %q", got, want)
+	}
+
+	// REVOKE ALL ON FOREIGN DATA WRAPPER FROM postgres: materialize the owner
+	// default ("U"), then drop it → fdwacl is the empty array "{}", NOT NULL
+	// (mirrors TestForeignServerACLText's owner REVOKE ALL case).
+	const revFdwOID = 16913
+	c.MaterializeOwnerACL(revFdwOID, "postgres", []string{"USAGE"})
+	c.RevokeTablePrivilege(revFdwOID, "postgres", "USAGE")
+	want = "{}"
+	if got := c.ForeignDataWrapperACLText(revFdwOID); got != want {
+		t.Fatalf("fdwacl after owner REVOKE ALL = %q; want %q", got, want)
+	}
+}
+
 // TestRelaclTextSequence pins the sequence relacl projection that lets a
 // GRANT … ON SEQUENCE round-trip through pg_dump (DU-002 slice 333). A
 // sequence's owner default is "rwU" (USAGE/SELECT/UPDATE), which pg_dump diffs

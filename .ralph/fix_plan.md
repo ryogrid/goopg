@@ -5468,6 +5468,41 @@ documentation-only and is exempt from the design-doc requirement.)
       `GRANT … ON FOREIGN DATA WRAPPER` (`fdwacl`) unmodelled;
       extended-protocol commit-time deferral.
 
+- [x] **FOREIGN DATA WRAPPER GRANT (`pg_foreign_data_wrapper.fdwacl`)
+      round-trip in pg_dump (M0119-0004, DU-002 slice 428, loop #13).**
+      **COMPLETE 2026-07-02:** same-shaped gap one object class over from
+      slice 427 — `GRANT USAGE ON FOREIGN DATA WRAPPER <name> TO <role>` was
+      silently dropped from every dump because `tryRecordTableGrant`/
+      `tryRecordTableRevoke`'s `foreign` branch only recognized a following
+      `server` keyword, and `pg_foreign_data_wrapper.VirtualRows` hard-coded
+      `fdwacl` to `""` (NULL). `OBJECT_FDW` is byte-identical in shape to
+      `OBJECT_FOREIGN_SERVER` in PG's `acldefault` (world default
+      `ACL_NO_RIGHTS`, owner-only `USAGE`), so the fix mirrors slice 427
+      exactly: new `foreignDataWrapperACLPrivOrder`/
+      `ownerForeignDataWrapperACLString = "U"` + `ForeignDataWrapperACLText`
+      (`internal/catalog/catalog.go`, delegates to `relaclTextLockedFor`); new
+      `Catalog.ForeignDataWrapperOID` interface method (concrete impl already
+      existed from slice 375); server gains
+      `allForeignDataWrapperPrivileges = {"USAGE"}` + a `data`→`wrapper`
+      sub-branch alongside the slice-427 `server` sub-branch, dispatching to
+      new `recordForeignDataWrapperGrant`/`recordForeignDataWrapperRevoke`
+      (`internal/server/grant_ddl.go`, mirrors
+      `recordForeignServerGrant`/`recordForeignServerRevoke`). USAGE is FDW's
+      sole privilege, so `buildACLCommands` collapses the full grant to
+      `GRANT ALL ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee;`, same as
+      the FOREIGN SERVER case. Tests: `TestForeignDataWrapperACLText`
+      (`internal/catalog/relacl_test.go`); `TestPort_PgDumpConnectionSetup`
+      DU-002 slice 428 (byte-identical vs real pg_dump 18.3). Gates:
+      `go build ./...` clean; `internal/catalog`+`internal/server` suites
+      PASS; `TestPort_PgDumpConnectionSetup` PASS (5.7s, uncached); pgbench
+      smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-foreign-data-wrapper-grant-fdwacl-pgdump.md`;
+      `docs/design/README.md` row `0119-0004br` added. Foreign-server- and
+      FDW-level GRANT round-trip are both now fully modelled under
+      M0119-0004. Still open (unchanged): column-level (`pg_attribute.attacl`,
+      heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
+      extended-protocol commit-time deferral (M0119-0004-ACLHEAP).
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

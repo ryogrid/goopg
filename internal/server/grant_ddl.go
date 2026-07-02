@@ -61,6 +61,12 @@ var allFunctionPrivileges = []string{"EXECUTE"}
 // renders as the aclitem letter "U". DU-002 slice 427.
 var allForeignServerPrivileges = []string{"USAGE"}
 
+// allForeignDataWrapperPrivileges is the expansion of GRANT ALL [PRIVILEGES]
+// ON a FOREIGN DATA WRAPPER. USAGE is the only FDW privilege (ACL_ALL_RIGHTS_FDW
+// == ACL_USAGE), which pg_dump renders as the aclitem letter "U". DU-002
+// slice 428.
+var allForeignDataWrapperPrivileges = []string{"USAGE"}
+
 // aclOwnerRole is the object owner in goopg's single bootstrap-superuser model.
 // A REVOKE whose grantee is the owner is an owner-side revoke-of-default, which
 // must first materialize the owner's implicit default ACL. DU-002 slice 340.
@@ -142,11 +148,19 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 			// GRANT USAGE ON FOREIGN SERVER <name> TO <roles>. Foreign servers live
 			// in pg_foreign_server and share the OID-keyed ACL store; record under
 			// each server's OID so pg_dump's getForeignServers/dumpACL re-emits the
-			// GRANT from srvacl. GRANT … ON FOREIGN DATA WRAPPER (fdwacl) is not
-			// modelled yet and falls through to the nonTableGrantObjects bail below
-			// (objPart is untouched here, so firstWordLower still sees "foreign").
+			// GRANT from srvacl.
 			s.recordForeignServerGrant(rest2, rolePart, privPart, withGrantOption)
 			return
+		}
+		if rest2, ok2 := cutLeadingKeyword(rest, "data"); ok2 {
+			if rest3, ok3 := cutLeadingKeyword(rest2, "wrapper"); ok3 {
+				// GRANT USAGE ON FOREIGN DATA WRAPPER <name> TO <roles>. FDWs live in
+				// pg_foreign_data_wrapper and share the OID-keyed ACL store; record
+				// under each FDW's OID so pg_dump's getForeignDataWrappers/dumpACL
+				// re-emits the GRANT from fdwacl. DU-002 slice 428.
+				s.recordForeignDataWrapperGrant(rest3, rolePart, privPart, withGrantOption)
+				return
+			}
 		}
 	}
 	// Bail on non-table object classes (ON DATABASE …, etc.).
@@ -252,6 +266,16 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 			// DU-002 slice 427.
 			s.recordForeignServerRevoke(rest2, rolePart, privPart)
 			return
+		}
+		if rest2, ok2 := cutLeadingKeyword(rest, "data"); ok2 {
+			if rest3, ok3 := cutLeadingKeyword(rest2, "wrapper"); ok3 {
+				// REVOKE USAGE ON FOREIGN DATA WRAPPER <name> FROM <roles>. Mirror the
+				// grant recorder's FOREIGN DATA WRAPPER branch: FDWs share the
+				// OID-keyed ACL store, so remove the named privileges from each FDW's
+				// fdwacl. DU-002 slice 428.
+				s.recordForeignDataWrapperRevoke(rest3, rolePart, privPart)
+				return
+			}
 		}
 	}
 	// Only table/sequence relacl is modelled here; bail on every other object
@@ -407,6 +431,70 @@ func (s *Server) recordForeignServerRevoke(objPart, rolePart, privPart string) {
 			// (USAGE only), mirroring recordSchemaRevoke's owner-materialization.
 			if strings.EqualFold(role, aclOwnerRole) {
 				s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allForeignServerPrivileges)
+			}
+			for _, p := range privs {
+				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
+			}
+		}
+	}
+}
+
+// recordForeignDataWrapperGrant records a `GRANT USAGE ON FOREIGN DATA
+// WRAPPER <names> TO <roles>` in the catalog ACL store, keyed by each FDW's
+// pg_foreign_data_wrapper OID. FDWs share the OID-keyed ACL store with
+// relations, schemas, routines, and foreign servers. Like a foreign server, an
+// FDW's acldefault('F', owner) grants USAGE to the owner ONLY (world default
+// ACL_NO_RIGHTS), so no implicit PUBLIC entry is seeded here — mirroring
+// recordForeignServerGrant. Unknown FDWs and an empty/unparseable privilege
+// list are skipped, leaving the statement a successful no-op. DU-002 slice
+// 428.
+func (s *Server) recordForeignDataWrapperGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+	privs := parseGrantPrivileges(privPart, allForeignDataWrapperPrivileges)
+	if len(privs) == 0 {
+		return
+	}
+	fdws := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, fdw := range fdws {
+		oid := s.cfg.Catalog.ForeignDataWrapperOID(strings.Trim(strings.TrimSpace(fdw), `"`))
+		if oid == 0 {
+			continue
+		}
+		for _, role := range roles {
+			for _, p := range privs {
+				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
+			}
+		}
+	}
+}
+
+// recordForeignDataWrapperRevoke removes the named privileges from each FDW's
+// fdwacl in the catalog ACL store, mirroring recordForeignDataWrapperGrant.
+// Unknown FDWs and an empty/unparseable privilege list are skipped, leaving
+// the statement as a successful no-op. Keeping fdwacl in sync lets pg_dump
+// re-emit only the FDW privileges that actually remain after the revoke.
+// DU-002 slice 428.
+func (s *Server) recordForeignDataWrapperRevoke(objPart, rolePart, privPart string) {
+	privs := parseGrantPrivileges(privPart, allForeignDataWrapperPrivileges)
+	if len(privs) == 0 {
+		return
+	}
+	fdws := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, fdw := range fdws {
+		oid := s.cfg.Catalog.ForeignDataWrapperOID(strings.Trim(strings.TrimSpace(fdw), `"`))
+		if oid == 0 {
+			continue
+		}
+		for _, role := range roles {
+			// An owner-side REVOKE (`REVOKE … FROM postgres`) materializes the
+			// owner's full default FDW ACL first so the surviving privileges
+			// render explicitly; PostgreSQL leaves fdwacl NULL until then.
+			// allForeignDataWrapperPrivileges is the owner's full default set
+			// (USAGE only), mirroring recordForeignServerRevoke's owner
+			// materialization.
+			if strings.EqualFold(role, aclOwnerRole) {
+				s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allForeignDataWrapperPrivileges)
 			}
 			for _, p := range privs {
 				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
