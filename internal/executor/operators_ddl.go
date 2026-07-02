@@ -9153,6 +9153,36 @@ func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *Exec
 // 42804 — the analyzer should have caught it but the runtime guard
 // makes the failure mode crisp.
 func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *ExecError) {
+	// Unknown-literal coercion (sibling of the seq-scan promoteCrossKind path):
+	// a probe key built from a quoted literal (`WHERE id = '1'`) arrives as
+	// KindString even for an int/numeric/timestamp column, because bare string
+	// literals are typed `unknown` and resolved against the column (PG's
+	// UNKNOWNOID, parse_coerce.c). Parse it into the column's runtime kind so
+	// the probe encodes symmetrically with the backfilled rows. Backfill values
+	// come pre-decoded with the correct kind, so this branch never rewrites
+	// stored-row datums. Malformed input surfaces PG's 22P02.
+	if v.Kind == KindString {
+		switch {
+		case isInt4Type(col.Type.Name), isInt8Type(col.Type.Name):
+			if v = tryParseStringAs(KindInt, v.StringValue()); v.Kind != KindInt {
+				typ := "bigint"
+				if isInt4Type(col.Type.Name) {
+					typ = "integer"
+				}
+				return nil, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type %s: %q", typ, v.StringValue())}
+			}
+		case isNumericType(col.Type.Name):
+			if v = tryParseStringAs(KindNumeric, v.StringValue()); v.Kind != KindNumeric {
+				return nil, &ExecError{Code: "22P02", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type numeric: %q", v.StringValue())}
+			}
+		case isTimestampType(col.Type.Name) || isTimestamptzType(col.Type.Name) || isDateType(col.Type.Name):
+			// Leave unparseable strings as-is; the kind checks below produce
+			// the existing 42804 for a genuinely non-coercible probe.
+			v = tryParseStringAs(KindTime, v.StringValue())
+		}
+	}
 	switch {
 	case isInt4Type(col.Type.Name):
 		const minInt32 = -1 << 31

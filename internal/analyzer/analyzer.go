@@ -843,7 +843,19 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 	case *parser.NumericConst:
 		return catalog.Type{Name: "numeric"}, nil
 	case *parser.StringConst:
-		return catalog.Type{Name: "text"}, nil
+		// A bare string literal has no type of its own — PostgreSQL types it
+		// as the `unknown` pseudo-type (UNKNOWNOID) and resolves it against the
+		// context (the other operand of a comparison, the target column of an
+		// assignment, a function's parameter type). Mirror that here instead of
+		// hard-typing it as `text`, so e.g. `bigint_col = '1'` type-checks: the
+		// `unknown` short-circuits in isComparable / isAssignable let the literal
+		// coerce to the concrete side, and the runtime (promoteCrossKind /
+		// tryParseStringAs) parses the string into that type. Genuine `text`
+		// columns stay `text`, so real mismatches like `text_col = 1` still error.
+		// Upstream: postgres/src/backend/parser/parse_coerce.c (coerce_type of
+		// UNKNOWNOID) and parse_oper.c (oper_select_candidate). Matches the
+		// existing NullConst/ParamRef/CastExpr cases, which already return unknown.
+		return catalog.Type{Name: "unknown"}, nil
 	case *parser.TypedStringLit:
 		return catalog.Type{Name: x.Type}, nil
 	case *parser.IntervalLit:

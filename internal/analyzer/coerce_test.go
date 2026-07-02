@@ -267,6 +267,63 @@ func TestSerialPseudotypeIntegerTypeCheck(t *testing.T) {
 	}
 }
 
+// TestUnknownStringLiteralCoercion verifies that a bare (unquoted-type) string
+// literal is typed `unknown` and coerces to the other operand's type in a
+// comparison — matching PostgreSQL, which types string literals as UNKNOWNOID.
+// Regression: previously `id = '1'` (numeric column vs quoted literal) raised
+// 42804 "operator = has incompatible operand types \"bigserial\" and \"text\"",
+// which broke real clients (e.g. WordPress issues `... WHERE ID = '1'`).
+func TestUnknownStringLiteralCoercion(t *testing.T) {
+	cat := newTestCatalog(t, "t",
+		[]catalog.Column{
+			{Name: "id", Type: catalog.Type{Name: "bigserial"}}, // WordPress wp_users.ID
+			{Name: "uid", Type: catalog.Type{Name: "int8"}},     // WordPress wp_usermeta.user_id
+			{Name: "n", Type: catalog.Type{Name: "int4"}},
+			{Name: "amt", Type: catalog.Type{Name: "numeric"}},
+			{Name: "name", Type: catalog.Type{Name: "text"}},
+			{Name: "d", Type: catalog.Type{Name: "date"}},
+		})
+	ops := []string{"=", "<>", "<", ">", "<=", ">="}
+	// numeric/bigserial/date column compared to a quoted literal, both orders.
+	numCols := []string{"id", "uid", "n", "amt"}
+	var ok []string
+	for _, c := range numCols {
+		for _, op := range ops {
+			ok = append(ok,
+				"SELECT * FROM t WHERE "+c+" "+op+" '1'",
+				"SELECT * FROM t WHERE '1' "+op+" "+c)
+		}
+	}
+	ok = append(ok,
+		// the exact WordPress shapes
+		"SELECT * FROM t WHERE id = '1'",
+		"SELECT * FROM t WHERE uid = '1'",
+		// text column vs quoted literal still fine (was already OK)
+		"SELECT * FROM t WHERE name = 'admin'",
+		// date column vs quoted literal (unknown → date at runtime)
+		"SELECT * FROM t WHERE d = '2020-01-01'",
+		// literal usable in other unknown-aware contexts
+		"SELECT name || '!' FROM t",
+		"SELECT * FROM t WHERE name LIKE '%x%'",
+	)
+	for _, sql := range ok {
+		if err := analyzeWithCat(t, sql, cat); err != nil {
+			t.Errorf("unknown-literal coercion %q: unexpected error: %v", sql, err)
+		}
+	}
+	// Negative: a genuine text column compared to an *integer* literal must
+	// still error (only the untyped string literal coerces, not a text column).
+	bad := []string{
+		"SELECT * FROM t WHERE name = 5",
+		"SELECT * FROM t WHERE 5 = name",
+	}
+	for _, sql := range bad {
+		if err := analyzeWithCat(t, sql, cat); err == nil {
+			t.Errorf("expected type error for %q, got nil", sql)
+		}
+	}
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 // buildCompareSQLWithTypes builds a SELECT that compares a literal of type lt
