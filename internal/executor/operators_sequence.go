@@ -470,6 +470,45 @@ func (s *seqState) maybePreLogNextval(ctx *Context, v int64) {
 	_, _, _ = ctx.WAL.Append(wal.EncodeSequenceState(p))
 }
 
+// autoGenerateSerialValues fills nextval() values for SERIAL/BIGSERIAL/
+// SMALLSERIAL and IDENTITY columns whose slot is still NULL and was NOT
+// explicitly supplied by the INSERT (an explicit NULL must fall through to
+// the NOT NULL check, mirroring PG). Shared by the plain-insert path
+// (operators_storage.go) and the upsert path (operators_upsert.go) — the two
+// are sibling paths and previously diverged: INSERT ... ON CONFLICT skipped
+// auto-generation entirely, leaving NULL bigserial ids (surfaced by
+// WordPress's option upserts writing 34 NULL wp_options.option_id rows).
+// M0097-0009 / root-0020.
+func autoGenerateSerialValues(ctx *Context, tableName string, cols []catalog.Column, row Row, missing []bool) {
+	for i, col := range cols {
+		if !row[i].IsNull() || !missing[i] {
+			continue
+		}
+		seqName := ""
+		switch strings.ToLower(col.Type.Name) {
+		case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+			seqName = strings.ToLower(tableName) + "_" + strings.ToLower(col.Name) + "_seq"
+			// If the standard tablename_colname_seq was renamed, look up by ownership.
+			if LookupSequence(seqName) == nil {
+				if owned := FindSequenceOwnedBy(strings.ToLower(tableName) + "." + strings.ToLower(col.Name)); owned != "" {
+					seqName = owned
+				}
+			}
+		default:
+			if col.IdentityColumn {
+				seqName = strings.ToLower(tableName) + "_" + strings.ToLower(col.Name) + "_seq"
+			}
+		}
+		if seqName == "" {
+			continue
+		}
+		v, err := evalNextval([]Datum{NewStringDatum(seqName)}, ctx)
+		if err == nil && !v.IsNull() {
+			row[i] = v
+		}
+	}
+}
+
 // RestoreSequenceFromWAL re-registers a sequence from a replayed
 // RecordKindSequenceState record (last record wins). Counter state is
 // restored exactly as logged: Current is the pre-logged horizon for records

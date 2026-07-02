@@ -123,4 +123,39 @@ func TestPort_SerialSequenceSurvivesRestart(t *testing.T) {
 		t.Fatalf("nextval(sdur_dropped) succeeded post-restart, want error " +
 			"(DROP SEQUENCE was not durable — a stale state record was replayed)")
 	}
+
+	// (d) Column DEFAULTs survive the restart too (RecordKindColumnDefaults):
+	// an INSERT omitting the defaulted columns must fill them, not NULL.
+	// Regression: WordPress's `comment_count bigint NOT NULL DEFAULT 0`
+	// raised a NOT NULL violation on every post-restart post creation.
+	if err := runSQLSimple(t, c,
+		"CREATE TABLE ddur (id bigserial NOT NULL, k text UNIQUE, cnt bigint NOT NULL DEFAULT 0, status text DEFAULT 'open')"); err != nil {
+		t.Fatalf("CREATE TABLE ddur: %v", err)
+	}
+	// (e) The upsert path applies serial auto-gen + defaults like the plain
+	// insert path (previously INSERT ... ON CONFLICT left NULL bigserial ids
+	// — WordPress wrote 34 NULL wp_options.option_id rows).
+	if err := runSQLSimple(t, c,
+		"INSERT INTO ddur (k) VALUES ('via-upsert') ON CONFLICT (k) DO UPDATE SET cnt = ddur.cnt + 1"); err != nil {
+		t.Fatalf("upsert INSERT: %v", err)
+	}
+	if got := queryScalar(t, c, "SELECT id FROM ddur WHERE k = 'via-upsert'"); got != "1" {
+		t.Fatalf("upsert-inserted id = %q, want 1 (ON CONFLICT path skipped serial auto-gen)", got)
+	}
+	if err := c.Stop(cluster.ShutdownFast); err != nil {
+		t.Fatalf("stop cluster (defaults): %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("restart cluster (defaults): %v", err)
+	}
+	if err := runSQLSimple(t, c, "INSERT INTO ddur (k) VALUES ('post-restart')"); err != nil {
+		t.Fatalf("post-restart INSERT omitting defaulted columns: %v "+
+			"(column DEFAULTs did not survive the restart)", err)
+	}
+	if got := queryScalar(t, c, "SELECT cnt FROM ddur WHERE k = 'post-restart'"); got != "0" {
+		t.Fatalf("post-restart cnt = %q, want 0 (DEFAULT 0 lost)", got)
+	}
+	if got := queryScalar(t, c, "SELECT status FROM ddur WHERE k = 'post-restart'"); got != "open" {
+		t.Fatalf("post-restart status = %q, want open (DEFAULT 'open' lost)", got)
+	}
 }

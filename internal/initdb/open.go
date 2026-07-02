@@ -1098,6 +1098,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
 	}
 
+	// Column DEFAULT persistence (root-0020 follow-up): re-parse the DEFAULT
+	// expression snapshots emitted by syncTableToCatalogHeap onto the
+	// heap-reloaded columns (DefaultExpr is an in-memory AST pg_attribute
+	// cannot carry). Must run AFTER loadUserTablesFromHeap.
+	if err := replayColumnDefaultsRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: column-defaults replay: %w", err)
+	}
+
 	// Role/auth restart persistence (root-0021): load the durable BASE from
 	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
 	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),

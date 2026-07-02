@@ -11602,6 +11602,31 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
+	// Column DEFAULT persistence (root-0020 follow-up): the reloaded catalog
+	// cannot reconstruct DefaultExpr ASTs from pg_attribute (only atthasdef
+	// survives; no runtime pg_attrdef rows), so snapshot every defaulted
+	// column's expression as SQL text in one WAL record per table. Replay
+	// (internal/initdb/column_defaults_recovery.go) re-parses them after
+	// loadUserTablesFromHeap. Emitting here — the single funnel every
+	// table-persisting DDL path passes through — keeps create/alter in sync.
+	if ctx.WAL != nil {
+		var defs []wal.ColumnDefaultEntry
+		for _, col := range tbl.Columns {
+			if col.Dropped || col.DefaultExpr == nil {
+				continue
+			}
+			if exprSQL := catalog.FormatExprForAttrdef(col.DefaultExpr); exprSQL != "" {
+				defs = append(defs, wal.ColumnDefaultEntry{Name: col.Name, Expr: exprSQL})
+			}
+		}
+		if len(defs) > 0 {
+			_, _, _ = ctx.WAL.Append(wal.EncodeColumnDefaults(wal.ColumnDefaultsPayload{
+				TableOID: tbl.OID,
+				Defaults: defs,
+			}))
+		}
+	}
+
 	// Signal that this transaction wrote to nailed catalog relations (pg_class
 	// and pg_attribute). The xact-marker hook in open.go reads this flag at
 	// commit time to emit RecordKindXactCommitInval and unlink both

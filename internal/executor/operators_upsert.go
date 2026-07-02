@@ -196,6 +196,22 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		for srcIdx, tgtIdx := range o.plan.ColumnIndex {
 			inserted[tgtIdx] = src[srcIdx]
 		}
+		// Parity with the plain-insert path (operators_storage.go): fill
+		// DEFAULT expressions and auto-generate SERIAL/IDENTITY values for
+		// target columns the INSERT did not provide, BEFORE arbiter probing
+		// and partition routing — upstream's ON CONFLICT insertion is a
+		// normal ExecInsert, so defaults/serials apply identically. This
+		// sibling path previously skipped both, leaving NULL bigserial ids
+		// on every `INSERT ... ON CONFLICT`-inserted row (root-0020).
+		upsertMissing := make([]bool, len(parentCols))
+		for i := range upsertMissing {
+			upsertMissing[i] = true
+		}
+		for _, tgtIdx := range o.plan.ColumnIndex {
+			upsertMissing[tgtIdx] = false
+		}
+		applyDefaultsForMissing(parentCols, inserted, upsertMissing)
+		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, parentCols, inserted, upsertMissing)
 		// Clear the speculative-insert index-key cache so a later source row
 		// that conflicts directly (no speculative insert) cannot wrongly reuse
 		// a prior row's keys. applyInsert repopulates it. M0100-0006b.

@@ -1780,35 +1780,8 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// in the INSERT), call nextval on the implicit sequence. An explicit NULL
 		// (column in INSERT target list but value is NULL) must NOT trigger
 		// auto-generation — it falls through to the NOT NULL check below.
-		for i, col := range cols {
-			// Skip: already has a value, or was explicitly supplied (even as NULL).
-			if !row[i].IsNull() || !insertMissing[i] {
-				continue
-			}
-			seqName := ""
-			switch strings.ToLower(col.Type.Name) {
-			case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
-				seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-				// If the standard tablename_colname_seq was renamed, look up by ownership.
-				if LookupSequence(seqName) == nil {
-					if owned := FindSequenceOwnedBy(strings.ToLower(o.plan.Table.Name) + "." + strings.ToLower(col.Name)); owned != "" {
-						seqName = owned
-					}
-				}
-			default:
-				if col.IdentityColumn {
-					seqName = strings.ToLower(o.plan.Table.Name) + "_" + strings.ToLower(col.Name) + "_seq"
-				}
-			}
-			if seqName == "" {
-				continue
-			}
-			seqArgs := []Datum{NewStringDatum(seqName)}
-			v, err := evalNextval(seqArgs, o.ctx)
-			if err == nil && !v.IsNull() {
-				row[i] = v
-			}
-		}
+		// Shared with the upsert (INSERT ... ON CONFLICT) sibling path (root-0020).
+		autoGenerateSerialValues(o.ctx, o.plan.Table.Name, cols, row, insertMissing)
 
 		// Integer range enforcement: coerce explicitly-provided int values to
 		// the column's declared type (catches smallint/int4 out-of-range and

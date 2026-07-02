@@ -88,6 +88,33 @@ flags.
   (`operators_generated.go`, apply-worker path) has no ctx and stays
   unlogged; it self-heals via the nextval pre-log on the SQL path.
 
+## Follow-up (same family, landed after the initial slice)
+
+Re-running the WordPress workload on the fixed engine surfaced two adjacent
+gaps, both fixed in the follow-up commit:
+
+- **Upsert sibling path skipped serial auto-gen and DEFAULTs.** The
+  `INSERT ... ON CONFLICT` operator (`operators_upsert.go`) built its insert
+  row without the `applyDefaultsForMissing` + serial auto-generation block the
+  plain-insert path runs — every upsert-inserted row got NULL for omitted
+  serial/defaulted columns (WordPress wrote 34 NULL `wp_options.option_id`
+  rows via its option upserts). The auto-gen block is now extracted into a
+  shared `autoGenerateSerialValues` helper (`operators_sequence.go`) called by
+  both paths.
+- **Column DEFAULT expressions did not survive restart.**
+  `catalog.Column.DefaultExpr` is an in-memory AST; pg_attribute carries only
+  `atthasdef`, so reloaded columns lost their defaults and post-restart
+  INSERTs omitting them inserted NULL (WordPress: `wp_posts.comment_count
+  bigint NOT NULL DEFAULT 0` failed every post creation). New
+  `RecordKindColumnDefaults`(69) snapshots each table's defaults as SQL text
+  (`catalog.FormatExprForAttrdef`) from `syncTableToCatalogHeap` — the single
+  funnel all table-persisting DDL passes through — and
+  `replayColumnDefaultsRecords` (`internal/initdb/column_defaults_recovery.go`)
+  re-parses them via `parser.ParseExpr` after `loadUserTablesFromHeap`.
+  Upstream analog: pg_attrdef (`postgres/src/backend/catalog/heap.c`,
+  `StoreAttrDefault`). A deparse/reparse gap for an exotic expression degrades
+  to the pre-record NULL-default state for that column only.
+
 ## Tests
 
 - `internal/testport/serial_sequence_durability_test.go` —

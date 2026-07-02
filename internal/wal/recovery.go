@@ -811,6 +811,23 @@ const (
 	// replay does not resurrect it. Format: kind(1) | nameLen(2) | name.
 	RecordKindDropRole byte = 68
 
+	// RecordKindColumnDefaults records a table's column DEFAULT expressions
+	// (as SQL text) so they survive a restart. catalog.Column.DefaultExpr is
+	// an in-memory parser AST that loadUserTablesFromHeap cannot reconstruct
+	// — pg_attribute carries only atthasdef and goopg writes no pg_attrdef
+	// heap rows at runtime — so before this record an INSERT omitting a
+	// defaulted column inserted NULL after a restart (WordPress:
+	// `wp_posts.comment_count bigint NOT NULL DEFAULT 0` raised a NOT NULL
+	// violation on every post-restart post creation). Emitted from
+	// syncTableToCatalogHeap (the single funnel every table-persisting DDL
+	// path goes through), one record per table carrying ALL its defaulted
+	// columns; replay is last-record-wins and re-parses each expression via
+	// parser.ParseExpr. Upstream analog: pg_attrdef
+	// (postgres/src/backend/catalog/heap.c StoreAttrDefault). Format:
+	//   kind(1) | tableOID(4) | count(2) | count × (nameLen(2)+name |
+	//   exprLen(2)+exprSQL)
+	RecordKindColumnDefaults byte = 69
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1141,6 +1158,85 @@ func DecodeDropRole(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-role payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
+// RecordKindColumnDefaults record.
+type ColumnDefaultEntry struct {
+	Name string
+	Expr string // DEFAULT expression as SQL text (parser.ParseExpr round-trips it)
+}
+
+// ColumnDefaultsPayload is the decoded form of a RecordKindColumnDefaults
+// record: every defaulted column of one table. See the constant for the emit
+// policy (per-table snapshot from syncTableToCatalogHeap, last-record-wins).
+type ColumnDefaultsPayload struct {
+	TableOID uint32
+	Defaults []ColumnDefaultEntry
+}
+
+// EncodeColumnDefaults encodes a RecordKindColumnDefaults record.
+func EncodeColumnDefaults(p ColumnDefaultsPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindColumnDefaults)
+	var b4 [4]byte
+	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
+	buf.Write(b4[:])
+	var b2 [2]byte
+	binary.LittleEndian.PutUint16(b2[:], uint16(len(p.Defaults)))
+	buf.Write(b2[:])
+	writeStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(b2[:], uint16(len(s)))
+		buf.Write(b2[:])
+		buf.WriteString(s)
+	}
+	for _, d := range p.Defaults {
+		writeStr16(d.Name)
+		writeStr16(d.Expr)
+	}
+	return buf.Bytes()
+}
+
+// DecodeColumnDefaults decodes a RecordKindColumnDefaults payload.
+func DecodeColumnDefaults(payload []byte) (ColumnDefaultsPayload, error) {
+	var p ColumnDefaultsPayload
+	if len(payload) < 7 {
+		return p, fmt.Errorf("wal: column-defaults payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindColumnDefaults {
+		return p, fmt.Errorf("wal: record kind %d is not column-defaults", payload[0])
+	}
+	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
+	count := int(binary.LittleEndian.Uint16(payload[5:7]))
+	off := 7
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: column-defaults payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: column-defaults string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	for i := 0; i < count; i++ {
+		var d ColumnDefaultEntry
+		var err error
+		if d.Name, err = readStr16(); err != nil {
+			return p, err
+		}
+		if d.Expr, err = readStr16(); err != nil {
+			return p, err
+		}
+		p.Defaults = append(p.Defaults, d)
+	}
+	return p, nil
 }
 
 // EncodeDropSequence encodes a RecordKindDropSequence record.
@@ -4796,6 +4892,13 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/role_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the catalog
 		// role registry; cmd/goopg seeds the auth UserStore from it.
+		return false, nil
+	case RecordKindColumnDefaults:
+		// Column DEFAULT snapshots (root-0020 follow-up) carry only the
+		// in-memory catalog's DefaultExpr ASTs as SQL text; no physical
+		// page state. The recovery driver in
+		// internal/initdb/column_defaults_recovery.go re-parses them after
+		// loadUserTablesFromHeap.
 		return false, nil
 	case RecordKindCreateConversion, RecordKindDropConversion:
 		// CREATE/DROP CONVERSION records (DU-002 restart-persistence
