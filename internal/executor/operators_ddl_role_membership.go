@@ -43,6 +43,23 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 				if err != nil {
 					return err
 				}
+				// A whole-row revoke ("") or `ADMIN OPTION FOR` ("admin")
+				// can cascade to grants memberOid itself made (as grantor)
+				// using the ADMIN OPTION being taken away; INHERIT/SET
+				// OPTION FOR never cascade (plan_single_revoke, user.c).
+				if rc.RevokeOption == "" || rc.RevokeOption == "admin" {
+					deps, blocked := im.RevokeRoleMembershipCascadeSet(roleOid, memberOid, rc.Cascade)
+					if blocked {
+						return &ExecError{Code: "2BP01", Message: "dependent privileges exist",
+							Hint: "Use CASCADE to revoke them too."}
+					}
+					for _, dep := range deps {
+						im.RevokeRoleMembership(roleOid, dep, "")
+						if o.ctx.WAL != nil {
+							_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, dep, ""))
+						}
+					}
+				}
 				im.RevokeRoleMembership(roleOid, memberOid, rc.RevokeOption)
 				if o.ctx.WAL != nil {
 					_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, memberOid, rc.RevokeOption))

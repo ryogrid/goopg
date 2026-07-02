@@ -257,6 +257,73 @@ func TestGrantRoleWouldCreateGrantorCycleRejectsBootstrapSuperuserGrantee(t *tes
 	}
 }
 
+// TestRevokeRoleMembershipCascadeSetNoAdminOptionNeverCascades verifies PG's
+// early-return: a member with no ADMIN OPTION on roleOid could not have
+// re-granted it to anyone, so revoking it never produces dependents —
+// regardless of what other rows exist for roleOid.
+func TestRevokeRoleMembershipCascadeSetNoAdminOptionNeverCascades(t *testing.T) {
+	c := NewInMemory()
+	const roleX = 500
+	c.GrantRoleMembership(roleX, 700, 10, boolPtr(false), nil, nil)
+	// 700 (no admin) itself re-"granted" (recorded, not really possible
+	// without admin, but exercises the walk) roleX to 800.
+	c.GrantRoleMembership(roleX, 800, 700, nil, nil, nil)
+
+	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, false)
+	if deps != nil || blocked {
+		t.Errorf("revoking a non-admin row must never cascade or block: deps=%v blocked=%v", deps, blocked)
+	}
+}
+
+// TestRevokeRoleMembershipCascadeSetBlocksWithoutCascade verifies RESTRICT
+// (cascade=false, including REVOKE's unwritten default) reports blocked=true
+// and produces no dependents to apply when a dependent grant exists.
+func TestRevokeRoleMembershipCascadeSetBlocksWithoutCascade(t *testing.T) {
+	c := NewInMemory()
+	const roleX = 500
+	c.GrantRoleMembership(roleX, 700, 10, boolPtr(true), nil, nil) // 700 has ADMIN on X
+	c.GrantRoleMembership(roleX, 800, 700, nil, nil, nil)          // 700 granted X to 800
+
+	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, false)
+	if !blocked {
+		t.Errorf("RESTRICT with a dependent grant must report blocked=true")
+	}
+	if deps != nil {
+		t.Errorf("blocked revoke must not report a dependent set to apply: %v", deps)
+	}
+}
+
+// TestRevokeRoleMembershipCascadeSetWalksTransitiveChain verifies CASCADE
+// (cascade=true) collects the full transitive chain of dependents, stopping
+// the walk past a dependent row only when that row's own AdminOption is
+// false, and never descending into a sibling grant unrelated to the chain.
+func TestRevokeRoleMembershipCascadeSetWalksTransitiveChain(t *testing.T) {
+	c := NewInMemory()
+	const roleX = 500
+	c.GrantRoleMembership(roleX, 700, 10, boolPtr(true), nil, nil)  // 700: ADMIN, granted by 10
+	c.GrantRoleMembership(roleX, 800, 700, boolPtr(true), nil, nil) // 800: ADMIN, granted by 700
+	c.GrantRoleMembership(roleX, 900, 800, nil, nil, nil)           // 900: no admin, granted by 800 -> chain stops past here
+	c.GrantRoleMembership(roleX, 950, 10, boolPtr(true), nil, nil)  // unrelated sibling, granted by 10 directly
+
+	deps, blocked := c.RevokeRoleMembershipCascadeSet(roleX, 700, true)
+	if blocked {
+		t.Fatalf("CASCADE must never report blocked")
+	}
+	want := map[uint32]bool{800: true, 900: true}
+	if len(deps) != len(want) {
+		t.Fatalf("deps = %v, want members %v", deps, want)
+	}
+	for _, d := range deps {
+		if !want[d] {
+			t.Errorf("unexpected dependent member %d in cascade set: %v", d, deps)
+		}
+		delete(want, d)
+	}
+	if len(want) != 0 {
+		t.Errorf("cascade set missing expected members: %v", want)
+	}
+}
+
 // TestUnregisterRoleDropsMembershipRows verifies DROP ROLE cascades removal
 // of any pg_auth_members row referencing the role's OID on either side,
 // mirroring PostgreSQL's DropRole (user.c).

@@ -497,6 +497,7 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 	granteeEnd := len(toks)
 	var adminOpt, inheritOpt, setOpt *bool
 	grantedBy := ""
+	cascade := false
 	for i := granteeStart; i < len(toks); i++ {
 		switch strings.ToLower(toks[i].Value) {
 		case "with":
@@ -512,14 +513,19 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 			continue
 		case "granted":
 			// GRANTED BY <role> — record the explicit grantor and end the
-			// grantee list.
-			if i+2 < len(toks) && strings.EqualFold(toks[i+1].Value, "by") {
-				grantedBy = strings.Trim(toks[i+2].Value, `"`)
-			}
+			// grantee list, then resume scanning (REVOKE's opt_drop_behavior,
+			// gram.y, follows opt_granted_by — a trailing CASCADE/RESTRICT
+			// can still appear after GRANTED BY <role>).
 			if granteeEnd > i {
 				granteeEnd = i
 			}
+			if i+2 < len(toks) && strings.EqualFold(toks[i+1].Value, "by") {
+				grantedBy = strings.Trim(toks[i+2].Value, `"`)
+				i += 2
+			}
+			continue
 		case "cascade", "restrict":
+			cascade = strings.EqualFold(toks[i].Value, "cascade")
 			if granteeEnd > i {
 				granteeEnd = i
 			}
@@ -538,6 +544,7 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 		Roles:           splitTokRoles(toks[start:sepIdx]),
 		Grantees:        splitTokRoles(toks[granteeStart:granteeEnd]),
 		GrantedBy:       grantedBy,
+		Cascade:         cascade,
 	}
 	if len(rmc.Roles) == 0 || len(rmc.Grantees) == 0 {
 		return nil

@@ -4214,6 +4214,73 @@ func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, revokeOption 
 	return true
 }
 
+// RevokeRoleMembershipCascadeSet computes, WITHOUT mutating any state, the
+// additional pg_auth_members rows a whole-row `REVOKE roleOid FROM
+// memberOid` or a `REVOKE ADMIN OPTION FOR roleOid FROM memberOid` needs to
+// cascade-delete, mirroring plan_recursive_revoke's grantor-chain walk
+// (postgres/src/backend/commands/user.c ~2415). Only relevant when
+// memberOid's own row currently holds AdminOption==true — a member with no
+// ADMIN OPTION on roleOid could not have (re-)granted it to anyone, so
+// there is nothing to cascade (PG's early return when the revoked row's
+// admin_option is already false); in that case (or when no row exists) this
+// returns (nil, false) and the caller applies a plain, non-cascading revoke.
+//
+// When a cascade is possible: dependentMembers lists every member (mirrors
+// PG's per-row full delete, RRG_DELETE_GRANT) that must ALSO be revoked of
+// roleOid — every row transitively granted by memberOid, where the walk
+// continues past a dependent row only if THAT row's own AdminOption is also
+// true (it could itself have re-granted further). If cascade is false
+// (RESTRICT, including REVOKE's unwritten default) and any dependents were
+// found, blocked is true and the caller must raise
+// ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST ("2BP01") — "dependent privileges
+// exist" / hint "Use CASCADE to revoke them too." — and apply nothing;
+// goopg's single-grantor-per-(role,member) row model (see the deferral
+// ledger's multi-grantor note) means plan_recursive_revoke's "would the
+// member still have admin via ANOTHER untouched row" escape hatch can never
+// apply here — every implicated row is that member's only row.
+// M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembershipCascadeSet(roleOid, memberOid uint32, cascade bool) (dependentMembers []uint32, blocked bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	existing, ok := c.roleMembers[roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}]
+	if !ok || !existing.AdminOption {
+		return nil, false
+	}
+	var keys []roleMembershipKey
+	c.collectRoleMembershipCascadeKeysLocked(roleOid, memberOid, &keys)
+	if len(keys) == 0 {
+		return nil, false
+	}
+	if !cascade {
+		return nil, true
+	}
+	dependentMembers = make([]uint32, len(keys))
+	for i, k := range keys {
+		dependentMembers[i] = k.MemberOID
+	}
+	return dependentMembers, false
+}
+
+// collectRoleMembershipCascadeKeysLocked appends every roleOid row granted
+// (directly or transitively) BY grantorMember to *out, recursing past a
+// found row only when that row's own AdminOption is true. Caller holds
+// c.mu (read or write). M0119-0004-ACLHEAP.
+func (c *InMemory) collectRoleMembershipCascadeKeysLocked(roleOid, grantorMember uint32, out *[]roleMembershipKey) {
+	var children []roleMembershipKey
+	for k, m := range c.roleMembers {
+		if k.RoleOID == roleOid && m.GrantorOID == grantorMember && k.MemberOID != grantorMember {
+			children = append(children, k)
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].MemberOID < children[j].MemberOID })
+	for _, k := range children {
+		*out = append(*out, k)
+		if c.roleMembers[k].AdminOption {
+			c.collectRoleMembershipCascadeKeysLocked(roleOid, k.MemberOID, out)
+		}
+	}
+}
+
 // RoleMembershipEntries returns every recorded pg_auth_members row, sorted
 // by (RoleOID, MemberOID) for deterministic virtual-row output.
 // M0119-0004-ACLHEAP.

@@ -2244,6 +2244,14 @@ type RoleMembershipChange struct {
 	Roles         []string // the role(s) being granted/revoked
 	Grantees      []string // the member role(s) receiving/losing membership
 	GrantedBy     string   // optional explicit grantor; "" = current session role
+	// Cascade is REVOKE's trailing `CASCADE` keyword (RevokeRoleStmt's
+	// opt_drop_behavior, gram.y). false covers both an explicit `RESTRICT`
+	// and the unwritten default, which PG also treats as RESTRICT
+	// (DROP_RESTRICT) — a REVOKE of a membership/ADMIN OPTION that has
+	// dependent grants (grants the revoked member made, as grantor, using
+	// that ADMIN OPTION) errors unless CASCADE is given. Meaningless for
+	// GRANT (never set).
+	Cascade bool
 }
 
 // ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON

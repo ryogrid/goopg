@@ -21,6 +21,7 @@ func TestParseGrantRoleMembership(t *testing.T) {
 		wantAdminOpt   *bool
 		wantInheritOpt *bool
 		wantSetOpt     *bool
+		wantCascade    bool
 	}{
 		{
 			sql:          "GRANT admin TO alice",
@@ -101,6 +102,23 @@ func TestParseGrantRoleMembership(t *testing.T) {
 			wantRevoke:   true,
 			wantRoles:    []string{"admin"},
 			wantGrantees: []string{"alice"},
+			wantCascade:  true,
+		},
+		{
+			sql:          "REVOKE admin FROM alice RESTRICT",
+			wantRevoke:   true,
+			wantRoles:    []string{"admin"},
+			wantGrantees: []string{"alice"},
+			wantCascade:  false,
+		},
+		{
+			sql:           "REVOKE ADMIN OPTION FOR admin FROM alice GRANTED BY postgres CASCADE",
+			wantRevoke:    true,
+			wantRevokeOpt: "admin",
+			wantRoles:     []string{"admin"},
+			wantGrantees:  []string{"alice"},
+			wantGrantedBy: "postgres",
+			wantCascade:   true,
 		},
 	}
 	eqBoolPtr := func(a, b *bool) bool {
@@ -148,6 +166,9 @@ func TestParseGrantRoleMembership(t *testing.T) {
 		}
 		if !eqStrs(got.Grantees, tc.wantGrantees) {
 			t.Errorf("%q: Grantees = %v, want %v", tc.sql, got.Grantees, tc.wantGrantees)
+		}
+		if got.Cascade != tc.wantCascade {
+			t.Errorf("%q: Cascade = %v, want %v", tc.sql, got.Cascade, tc.wantCascade)
 		}
 	}
 }
