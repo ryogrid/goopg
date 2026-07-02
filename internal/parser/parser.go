@@ -385,23 +385,32 @@ func buildDatabaseACLChange(revoke bool, toks []Token) *DatabaseACLChange {
 
 // buildRoleMembershipChange parses the token run of a `GRANT <role>[, ...]
 // TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
-// [ADMIN OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED BY <role>]
-// [CASCADE|RESTRICT]` statement into a RoleMembershipChange. toks is every
-// token after the GRANT/REVOKE keyword with the trailing ';' excluded. The
-// caller only reaches this builder when no "on" token appeared anywhere in
-// the statement — every privilege-GRANT variant requires one, so its absence
-// is the discriminator. Returns nil when either role list is empty (an
-// unparseable form the caller leaves as a successful no-op).
+// [{ADMIN|INHERIT|SET} OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED
+// BY <role>] [CASCADE|RESTRICT]` statement into a RoleMembershipChange. toks
+// is every token after the GRANT/REVOKE keyword with the trailing ';'
+// excluded. The caller only reaches this builder when no "on" token appeared
+// anywhere in the statement — every privilege-GRANT variant requires one, so
+// its absence is the discriminator. Returns nil when either role list is
+// empty (an unparseable form the caller leaves as a successful no-op).
 // M0119-0004-ACLHEAP.
 func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange {
 	start := 0
-	adminOptionOnly := false
+	revokeOption := ""
 	if revoke && len(toks) >= 3 &&
-		strings.EqualFold(toks[0].Value, "admin") &&
 		strings.EqualFold(toks[1].Value, "option") &&
 		strings.EqualFold(toks[2].Value, "for") {
-		adminOptionOnly = true
-		start = 3
+		// REVOKE's `ColId OPTION FOR` prefix (gram.y): ColId is any
+		// identifier, but pg_auth_members only recognizes these three —
+		// GrantRole (user.c) raises "unrecognized role option" for anything
+		// else. goopg mirrors only the recognized set; an unrecognized
+		// leading word falls through untouched (treated as the start of the
+		// role list, matching the pre-existing lenient-parse posture of this
+		// builder for other unparseable forms).
+		switch strings.ToLower(toks[0].Value) {
+		case "admin", "inherit", "set":
+			revokeOption = strings.ToLower(toks[0].Value)
+			start = 3
+		}
 	}
 	sep := "to"
 	if revoke {
@@ -448,7 +457,7 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 	}
 	rmc := &RoleMembershipChange{
 		Revoke:          revoke,
-		AdminOptionOnly: adminOptionOnly,
+		RevokeOption:    revokeOption,
 		WithAdminOption: adminOpt != nil && *adminOpt,
 		AdminOption:     adminOpt,
 		InheritOption:   inheritOpt,

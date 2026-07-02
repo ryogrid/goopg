@@ -102,21 +102,36 @@ func TestGrantRoleMembershipInheritSetDefaults(t *testing.T) {
 	}
 }
 
-// TestRevokeRoleMembership verifies both REVOKE forms: a full revoke deletes
-// the row, and REVOKE ADMIN OPTION FOR only clears the flag.
+// TestRevokeRoleMembership verifies all four REVOKE forms: a full revoke
+// deletes the row, and each of REVOKE ADMIN/INHERIT/SET OPTION FOR only
+// clears its own flag and leaves the row (and the other two flags) in place.
 func TestRevokeRoleMembership(t *testing.T) {
 	c := NewInMemory()
 	c.GrantRoleMembership(100, 200, 10, boolPtr(true), nil, nil)
 
-	if !c.RevokeRoleMembership(100, 200, true) {
-		t.Fatalf("RevokeRoleMembership(adminOptionOnly) reported no existing row")
+	if !c.RevokeRoleMembership(100, 200, "admin") {
+		t.Fatalf("RevokeRoleMembership(admin) reported no existing row")
 	}
 	entries := c.RoleMembershipEntries()
 	if len(entries) != 1 || entries[0].AdminOption {
 		t.Fatalf("admin-option-only revoke should keep the row with AdminOption=false: %+v", entries)
 	}
+	if !entries[0].InheritOption || !entries[0].SetOption {
+		t.Fatalf("admin-option-only revoke must not touch inherit/set: %+v", entries)
+	}
 
-	if !c.RevokeRoleMembership(100, 200, false) {
+	if !c.RevokeRoleMembership(100, 200, "inherit") {
+		t.Fatalf("RevokeRoleMembership(inherit) reported no existing row")
+	}
+	if !c.RevokeRoleMembership(100, 200, "set") {
+		t.Fatalf("RevokeRoleMembership(set) reported no existing row")
+	}
+	entries = c.RoleMembershipEntries()
+	if len(entries) != 1 || entries[0].InheritOption || entries[0].SetOption {
+		t.Fatalf("inherit/set-option-only revokes should keep the row with both flags false: %+v", entries)
+	}
+
+	if !c.RevokeRoleMembership(100, 200, "") {
 		t.Fatalf("full RevokeRoleMembership reported no existing row")
 	}
 	if entries := c.RoleMembershipEntries(); len(entries) != 0 {
@@ -125,7 +140,7 @@ func TestRevokeRoleMembership(t *testing.T) {
 
 	// Revoking a non-existent membership is a silent no-op (matches this
 	// codebase's other ACL REVOKE paths).
-	if c.RevokeRoleMembership(999, 999, false) {
+	if c.RevokeRoleMembership(999, 999, "") {
 		t.Errorf("RevokeRoleMembership on a non-existent row reported success")
 	}
 }

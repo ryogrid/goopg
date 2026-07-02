@@ -2209,14 +2209,18 @@ type DatabaseACLChange struct {
 
 // RoleMembershipChange carries the parsed pieces of a `GRANT <role>[, ...]
 // TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
-// [ADMIN OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED BY <role>]
-// [CASCADE|RESTRICT]` statement, so the executor can update the
+// [{ADMIN|INHERIT|SET} OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED
+// BY <role>] [CASCADE|RESTRICT]` statement, so the executor can update the
 // (roleOID, memberOID)-keyed pg_auth_members registry. M0119-0004-ACLHEAP.
 type RoleMembershipChange struct {
 	Revoke bool // true for REVOKE, false for GRANT
-	// AdminOptionOnly is REVOKE's `ADMIN OPTION FOR` prefix: only the
-	// admin_option flag is cleared, the membership row itself survives.
-	AdminOptionOnly bool
+	// RevokeOption is REVOKE's `{ADMIN|INHERIT|SET} OPTION FOR` prefix
+	// (lower-cased "admin"/"inherit"/"set"), matching PG's ColId OPTION FOR
+	// production (RevokeRoleStmt, gram.y) — only the named option flag is
+	// cleared and the membership row itself survives (DelRoleMems's
+	// RRG_REMOVE_{ADMIN,INHERIT,SET}_OPTION, user.c). "" (the common case)
+	// means no prefix was given: the row is deleted entirely.
+	RevokeOption string
 	// WithAdminOption is GRANT's trailing `WITH ADMIN OPTION` (kept for
 	// backward compatibility; equivalent to AdminOption != nil && *AdminOption).
 	WithAdminOption bool

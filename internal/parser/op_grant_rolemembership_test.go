@@ -13,7 +13,7 @@ func TestParseGrantRoleMembership(t *testing.T) {
 	cases := []struct {
 		sql            string
 		wantRevoke     bool
-		wantAdminOnly  bool
+		wantRevokeOpt  string
 		wantRoles      []string
 		wantGrantees   []string
 		wantWithAdmin  bool
@@ -78,7 +78,21 @@ func TestParseGrantRoleMembership(t *testing.T) {
 		{
 			sql:           "REVOKE ADMIN OPTION FOR admin FROM alice",
 			wantRevoke:    true,
-			wantAdminOnly: true,
+			wantRevokeOpt: "admin",
+			wantRoles:     []string{"admin"},
+			wantGrantees:  []string{"alice"},
+		},
+		{
+			sql:           "REVOKE INHERIT OPTION FOR admin FROM alice",
+			wantRevoke:    true,
+			wantRevokeOpt: "inherit",
+			wantRoles:     []string{"admin"},
+			wantGrantees:  []string{"alice"},
+		},
+		{
+			sql:           "REVOKE SET OPTION FOR admin FROM alice",
+			wantRevoke:    true,
+			wantRevokeOpt: "set",
 			wantRoles:     []string{"admin"},
 			wantGrantees:  []string{"alice"},
 		},
@@ -111,8 +125,8 @@ func TestParseGrantRoleMembership(t *testing.T) {
 		if got.Revoke != tc.wantRevoke {
 			t.Errorf("%q: Revoke = %v, want %v", tc.sql, got.Revoke, tc.wantRevoke)
 		}
-		if got.AdminOptionOnly != tc.wantAdminOnly {
-			t.Errorf("%q: AdminOptionOnly = %v, want %v", tc.sql, got.AdminOptionOnly, tc.wantAdminOnly)
+		if got.RevokeOption != tc.wantRevokeOpt {
+			t.Errorf("%q: RevokeOption = %q, want %q", tc.sql, got.RevokeOption, tc.wantRevokeOpt)
 		}
 		if got.WithAdminOption != tc.wantWithAdmin {
 			t.Errorf("%q: WithAdminOption = %v, want %v", tc.sql, got.WithAdminOption, tc.wantWithAdmin)

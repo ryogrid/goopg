@@ -68,30 +68,33 @@ func TestDecodeGrantRoleMembershipRejectsTruncated(t *testing.T) {
 	}
 }
 
-// TestEncodeDecodeRevokeRoleMembershipRoundTrip is the REVOKE counterpart.
+// TestEncodeDecodeRevokeRoleMembershipRoundTrip is the REVOKE counterpart,
+// covering the full revoke ("") plus all three OPTION FOR selectors.
 func TestEncodeDecodeRevokeRoleMembershipRoundTrip(t *testing.T) {
 	cases := []struct {
 		roleOid, memberOid uint32
-		adminOptionOnly    bool
+		revokeOption       string
 	}{
-		{16385, 16386, false},
-		{16385, 16386, true},
-		{4294967295, 4294967295, true},
+		{16385, 16386, ""},
+		{16385, 16386, "admin"},
+		{16385, 16386, "inherit"},
+		{16385, 16386, "set"},
+		{4294967295, 4294967295, "admin"},
 	}
 	for _, c := range cases {
-		raw := EncodeRevokeRoleMembership(c.roleOid, c.memberOid, c.adminOptionOnly)
+		raw := EncodeRevokeRoleMembership(c.roleOid, c.memberOid, c.revokeOption)
 		if raw[0] != RecordKindRevokeRoleMembership {
 			t.Errorf("kind byte = %d, want %d", raw[0], RecordKindRevokeRoleMembership)
 			continue
 		}
-		gotRole, gotMember, gotAdminOnly, err := DecodeRevokeRoleMembership(raw)
+		gotRole, gotMember, gotOpt, err := DecodeRevokeRoleMembership(raw)
 		if err != nil {
 			t.Errorf("decode err: %v", err)
 			continue
 		}
-		if gotRole != c.roleOid || gotMember != c.memberOid || gotAdminOnly != c.adminOptionOnly {
-			t.Errorf("decoded (%d, %d, %v), want (%d, %d, %v)",
-				gotRole, gotMember, gotAdminOnly, c.roleOid, c.memberOid, c.adminOptionOnly)
+		if gotRole != c.roleOid || gotMember != c.memberOid || gotOpt != c.revokeOption {
+			t.Errorf("decoded (%d, %d, %q), want (%d, %d, %q)",
+				gotRole, gotMember, gotOpt, c.roleOid, c.memberOid, c.revokeOption)
 		}
 	}
 }
@@ -99,7 +102,7 @@ func TestEncodeDecodeRevokeRoleMembershipRoundTrip(t *testing.T) {
 // TestDecodeRevokeRoleMembershipRejectsTruncated pins the defensive
 // truncated/wrong-kind guards.
 func TestDecodeRevokeRoleMembershipRejectsTruncated(t *testing.T) {
-	raw := EncodeRevokeRoleMembership(16385, 16386, true)
+	raw := EncodeRevokeRoleMembership(16385, 16386, "admin")
 	if _, _, _, err := DecodeRevokeRoleMembership(raw[:len(raw)-1]); err == nil {
 		t.Error("truncated payload should error")
 	}

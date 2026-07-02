@@ -60,7 +60,7 @@ func TestRoleMembershipRecoveryReplaysGrant(t *testing.T) {
 
 // TestRoleMembershipRecoveryReplaysGrantThenRevoke confirms a REVOKE record
 // following a GRANT removes the row, and a subsequent REVOKE ADMIN OPTION
-// FOR-only record (adminOptionOnly=true) merely clears the flag rather than
+// FOR-only record (revokeOption="admin") merely clears the flag rather than
 // deleting a still-live row.
 func TestRoleMembershipRecoveryReplaysGrantThenRevoke(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
@@ -78,8 +78,8 @@ func TestRoleMembershipRecoveryReplaysGrantThenRevoke(t *testing.T) {
 	appends := [][]byte{
 		wal.EncodeGrantRoleMembership(roleOid1, memberOid1, 10, &adminFalse, nil, nil),
 		wal.EncodeGrantRoleMembership(roleOid2, memberOid2, 10, &adminTrue, nil, nil),
-		wal.EncodeRevokeRoleMembership(roleOid1, memberOid1, false),
-		wal.EncodeRevokeRoleMembership(roleOid2, memberOid2, true),
+		wal.EncodeRevokeRoleMembership(roleOid1, memberOid1, ""),
+		wal.EncodeRevokeRoleMembership(roleOid2, memberOid2, "admin"),
 	}
 	for _, payload := range appends {
 		if _, _, werr := rt1.WAL.Append(payload); werr != nil {

@@ -43,9 +43,9 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 				if err != nil {
 					return err
 				}
-				im.RevokeRoleMembership(roleOid, memberOid, rc.AdminOptionOnly)
+				im.RevokeRoleMembership(roleOid, memberOid, rc.RevokeOption)
 				if o.ctx.WAL != nil {
-					_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, memberOid, rc.AdminOptionOnly))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeRevokeRoleMembership(roleOid, memberOid, rc.RevokeOption))
 				}
 			}
 		}

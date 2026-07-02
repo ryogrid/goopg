@@ -4163,13 +4163,16 @@ func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, ad
 }
 
 // RevokeRoleMembership removes or downgrades a `REVOKE <role> FROM <member>`
-// row. When adminOptionOnly is true (REVOKE ADMIN OPTION FOR ...) only the
-// admin_option flag is cleared and the membership row survives, matching
-// PG's DelRoleMems(admin_opt_only=true). Otherwise the row is deleted
-// entirely. Reports whether a row existed (REVOKE of a non-existent
-// membership is a silent no-op, matching this codebase's other ACL
-// REVOKE paths). M0119-0004-ACLHEAP.
-func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, adminOptionOnly bool) bool {
+// row. revokeOption is "" for a plain REVOKE (the row is deleted entirely)
+// or one of "admin"/"inherit"/"set" for REVOKE's `{ADMIN|INHERIT|SET} OPTION
+// FOR` prefix, in which case only that single flag is cleared and the
+// membership row survives — matching PG's DelRoleMems/plan_single_revoke
+// (RRG_REMOVE_ADMIN_OPTION / RRG_REMOVE_INHERIT_OPTION / RRG_REMOVE_SET_OPTION,
+// user.c; only ADMIN's removal can cascade to dependent grants, which this
+// codebase does not yet model — see the deferral ledger). Reports whether a
+// row existed (REVOKE of a non-existent membership is a silent no-op,
+// matching this codebase's other ACL REVOKE paths). M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, revokeOption string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}
@@ -4177,11 +4180,16 @@ func (c *InMemory) RevokeRoleMembership(roleOid, memberOid uint32, adminOptionOn
 	if !ok {
 		return false
 	}
-	if adminOptionOnly {
+	switch revokeOption {
+	case "admin":
 		existing.AdminOption = false
-		return true
+	case "inherit":
+		existing.InheritOption = false
+	case "set":
+		existing.SetOption = false
+	default:
+		delete(c.roleMembers, key)
 	}
-	delete(c.roleMembers, key)
 	return true
 }
 

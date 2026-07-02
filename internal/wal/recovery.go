@@ -928,11 +928,11 @@ const (
 	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1)
 	RecordKindGrantRoleMembership byte = 79
 
-	// RecordKindRevokeRoleMembership records a `REVOKE [ADMIN OPTION FOR]
-	// <role> FROM <member>` event. Same no-op physical redo path as
-	// RecordKindGrantRoleMembership.
+	// RecordKindRevokeRoleMembership records a `REVOKE
+	// [{ADMIN|INHERIT|SET} OPTION FOR] <role> FROM <member>` event. Same
+	// no-op physical redo path as RecordKindGrantRoleMembership.
 	// Format:
-	//   kind(1) | roleOid(4) | memberOid(4) | adminOptionOnly(1)
+	//   kind(1) | roleOid(4) | memberOid(4) | revokeOption(1)
 	RecordKindRevokeRoleMembership byte = 80
 
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
@@ -1622,32 +1622,42 @@ func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid u
 	return roleOid, memberOid, grantorOid, admin, inherit, set, nil
 }
 
-// EncodeRevokeRoleMembership encodes a `REVOKE [ADMIN OPTION FOR] <role>
-// FROM <member>` event.
-// Format: kind(1) | roleOid(4) | memberOid(4) | adminOptionOnly(1).
-func EncodeRevokeRoleMembership(roleOid, memberOid uint32, adminOptionOnly bool) []byte {
+// revokeRoleMembershipOptionByte maps a RoleMembershipChange.RevokeOption
+// string ("" | "admin" | "inherit" | "set") to/from the single wire byte
+// EncodeRevokeRoleMembership persists. M0119-0004-ACLHEAP.
+var revokeRoleMembershipOptionByte = map[string]byte{"": 0, "admin": 1, "inherit": 2, "set": 3}
+var revokeRoleMembershipOptionName = []string{"", "admin", "inherit", "set"}
+
+// EncodeRevokeRoleMembership encodes a `REVOKE [{ADMIN|INHERIT|SET} OPTION
+// FOR] <role> FROM <member>` event. revokeOption is "" for a plain REVOKE or
+// one of "admin"/"inherit"/"set" for the OPTION FOR prefix (see
+// catalog.InMemory.RevokeRoleMembership).
+// Format: kind(1) | roleOid(4) | memberOid(4) | revokeOption(1).
+func EncodeRevokeRoleMembership(roleOid, memberOid uint32, revokeOption string) []byte {
 	out := make([]byte, 10)
 	out[0] = RecordKindRevokeRoleMembership
 	binary.LittleEndian.PutUint32(out[1:5], roleOid)
 	binary.LittleEndian.PutUint32(out[5:9], memberOid)
-	if adminOptionOnly {
-		out[9] = 1
-	}
+	out[9] = revokeRoleMembershipOptionByte[revokeOption]
 	return out
 }
 
 // DecodeRevokeRoleMembership decodes a RecordKindRevokeRoleMembership payload.
-func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid uint32, adminOptionOnly bool, err error) {
+func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid uint32, revokeOption string, err error) {
 	if len(payload) < 10 {
-		return 0, 0, false, fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
+		return 0, 0, "", fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindRevokeRoleMembership {
-		return 0, 0, false, fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
+		return 0, 0, "", fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
 	}
 	roleOid = binary.LittleEndian.Uint32(payload[1:5])
 	memberOid = binary.LittleEndian.Uint32(payload[5:9])
-	adminOptionOnly = payload[9] != 0
-	return roleOid, memberOid, adminOptionOnly, nil
+	optByte := payload[9]
+	if int(optByte) >= len(revokeRoleMembershipOptionName) {
+		return 0, 0, "", fmt.Errorf("wal: revoke-role-membership unknown option byte %d", optByte)
+	}
+	revokeOption = revokeRoleMembershipOptionName[optByte]
+	return roleOid, memberOid, revokeOption, nil
 }
 
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
