@@ -2733,6 +2733,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.IdentityColumn || isSerial {
 			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
 		}
+		// Restart persistence: mark which column this implicit sequence backs
+		// (the serial spelling / identity kind — replay restores the column's
+		// catalog markers, which pg_attribute cannot carry because it stores
+		// the PG-canonical base integer atttypid), then WAL-log the full
+		// sequence state. See RecordKindSequenceState (wal/recovery.go).
+		var identKind byte
+		if c.IdentityColumn {
+			identKind = 1
+			if c.IdentityAlways {
+				identKind = 2
+			}
+		}
+		spelling := ""
+		if isSerial {
+			spelling = colTypeLow
+		}
+		SetSequenceColumnMarker(seqName, spelling, identKind)
+		WALLogSequenceState(o.ctx, seqName)
 	}
 
 	// If PARTITION BY, annotate the table with partition metadata
@@ -5318,7 +5336,13 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	// Drop sequences that are owned by columns of this table (created via
 	// ALTER SEQUENCE ... OWNED BY table.col, or SERIAL column defaults).
-	DropSequencesOwnedByTable(tbl.Name)
+	// Restart persistence: log a removal record for every implicit sequence
+	// the table owned, so replay does not resurrect them after the DROP TABLE.
+	for _, seqName := range DropSequencesOwnedByTable(tbl.Name) {
+		if o.ctx.WAL != nil {
+			_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(seqName))
+		}
+	}
 	// If this table was shadowing a permanent one, restore it. M0097-0003.
 	if o.ctx.TempTableShadows != nil {
 		key := strings.ToLower(name.Name)
@@ -6398,6 +6422,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				oldName := s.Name.Name
 				newName := act.NewName
 				if RenameSequence(oldName, newName) || RenameSequence("public."+oldName, newName) {
+					// Restart persistence: retire the old name and log the
+					// renamed sequence's state under the new one.
+					if o.ctx.WAL != nil {
+						_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldName))))
+					}
+					WALLogSequenceState(o.ctx, newName)
 					return nil
 				}
 			}
@@ -7010,6 +7040,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				if !RenameSequence(oldFull, newFull) {
 					RenameSequence(oldBare, newFull)
 				}
+				// Restart persistence: retire the old name and log the renamed
+				// sequence's state under the new one (both name forms — the
+				// registry may hold either the bare or qualified key).
+				if o.ctx.WAL != nil {
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare))))
+				}
+				WALLogSequenceState(o.ctx, newFull)
 				// Regenerate the VirtualRows closure to reference the new registry key.
 				capturedNewFull := newFull
 				tbl.VirtualRows = func() [][]string {
@@ -9661,7 +9699,11 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 							sess.RecordSeqRestore(SeqRestoreEntry{Name: seqName, OldCurr: oldCurr})
 						}
 					}
-					ResetSequence(seqName)
+					if ResetSequence(seqName) {
+						// Restart persistence: the reset counter must survive a
+						// restart too. See RecordKindSequenceState.
+						WALLogSequenceState(o.ctx, seqName)
+					}
 				}
 			}
 		}
@@ -12200,6 +12242,9 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
 	// so pg_dump can discover and dump it. M0097-0024.
 	o.createSeqCatalogTable(s.Name, name)
+	// Restart persistence: WAL-log the full sequence definition (no-op for
+	// TEMPORARY sequences — session-scoped). See RecordKindSequenceState.
+	WALLogSequenceState(o.ctx, name)
 	return nil
 }
 
@@ -12212,7 +12257,15 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 // CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
 // identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
 func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
-	if _, ok := o.ctx.Catalog.(*catalog.InMemory); !ok {
+	CreateSequenceCatalogRelation(o.ctx.Catalog, seqObjName, name)
+}
+
+// CreateSequenceCatalogRelation is the ddlOp-independent core of
+// createSeqCatalogTable, shared with startup replay
+// (internal/initdb/sequence_ddl_recovery.go) so a WAL-restored sequence is
+// discoverable via SELECT * FROM seq / pg_class after a restart too.
+func CreateSequenceCatalogRelation(cat catalog.Catalog, seqObjName parser.ObjectName, name string) {
+	if _, ok := cat.(*catalog.InMemory); !ok {
 		return
 	}
 	seqCols := []catalog.Column{
@@ -12220,7 +12273,7 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string)
 		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
 		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
 	}
-	seqTbl, err2 := o.ctx.Catalog.CreateTable(seqObjName, seqCols)
+	seqTbl, err2 := cat.CreateTable(seqObjName, seqCols)
 	if err2 != nil {
 		return
 	}
@@ -12425,6 +12478,9 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	} else if s.ClearOwnedBy {
 		SetSequenceOwnedBy(name, "")
 	}
+	// Restart persistence: WAL-log the post-ALTER definition + counter so the
+	// altered state survives restart. See RecordKindSequenceState.
+	WALLogSequenceState(o.ctx, name)
 	return nil
 }
 
@@ -13181,6 +13237,11 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					Pos:     s.Pos(),
 					Message: fmt.Sprintf("sequence %q does not exist", name.String()),
 				}
+			}
+			// Restart persistence: record the removal so startup replay does
+			// not resurrect the sequence. See RecordKindDropSequence.
+			if o.ctx.WAL != nil {
+				_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(name.String()))))
 			}
 			// Remove the virtual catalog entry created for SELECT * FROM seq_name. M0097-0024.
 			_ = o.ctx.Catalog.DropTable(name)

@@ -1084,6 +1084,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: index DDL replay: %w", err)
 	}
 
+	// Sequence / SERIAL restart persistence: re-register sequences from
+	// RecordKindSequenceState WAL records and restore the owning columns'
+	// serial/identity catalog markers. Must run AFTER loadUserTablesFromHeap
+	// (the owning tables have to be registered so the column markers can be
+	// applied) — the heap-reloaded serial columns read back as their base
+	// integer type because pg_attribute stores the PG-canonical atttypid.
+	// See internal/initdb/sequence_ddl_recovery.go.
+	if err := replaySequenceDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
+	}
+
 	// M0106-0013: stamp the clog from WAL commit/abort records and advance
 	// txnMgr.NextXID past any XIDs recorded in WAL but not yet in the
 	// SLRU/flat-file (the narrow window between WAL fsync and clog writes).

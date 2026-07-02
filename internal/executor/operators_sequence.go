@@ -20,6 +20,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // seqState holds the mutable state of one sequence.
@@ -38,6 +39,20 @@ type seqState struct {
 	dataType  string      // "smallint", "integer", or "bigint" (default)
 	temporary bool        // true for TEMPORARY sequences (allowed in READ ONLY txns)
 	mu        sync.Mutex  // serialises nextval
+
+	// Restart persistence (RecordKindSequenceState — see wal/recovery.go).
+	// colSpelling is the serial spelling ("bigserial", ...) when this
+	// sequence backs a SERIAL column; identityKind is 1/2 for GENERATED
+	// BY DEFAULT/ALWAYS identity columns. Both ride the WAL record so
+	// startup replay can restore the owning column's catalog markers.
+	// logHorizon is the highest (lowest, for descending sequences) value
+	// covered by a WAL record: nextval pre-logs 32 values ahead (upstream
+	// SEQ_LOG_VALS, postgres/src/backend/commands/sequence.c) and only
+	// re-logs when a fetched value crosses the horizon. Guarded by mu.
+	colSpelling  string
+	identityKind byte
+	logHorizon   int64
+	hasLogged    bool
 }
 
 // nextVal atomically advances the sequence and returns the new value.
@@ -296,8 +311,9 @@ func SetSequenceOwnedBy(name, owner string) {
 
 // DropSequencesOwnedByTable drops all sequences whose ownedBy field starts with
 // "tableName." (case-insensitive). Called by DROP TABLE to cascade-drop owned sequences.
-func DropSequencesOwnedByTable(tableName string) {
+func DropSequencesOwnedByTable(tableName string) []string {
 	prefix := strings.ToLower(tableName) + "."
+	var dropped []string
 	seqRegistry.Range(func(k, v any) bool {
 		s := v.(*seqState)
 		s.mu.Lock()
@@ -305,9 +321,11 @@ func DropSequencesOwnedByTable(tableName string) {
 		s.mu.Unlock()
 		if strings.HasPrefix(owned, prefix) {
 			seqRegistry.Delete(k)
+			dropped = append(dropped, k.(string))
 		}
 		return true
 	})
+	return dropped
 }
 
 // ResetSequence resets a sequence to its start value (equivalent to TRUNCATE ... RESTART IDENTITY).
@@ -332,6 +350,152 @@ func GetSequenceCurrentValue(name string) (int64, bool) {
 		return 0, false
 	}
 	return v.(*seqState).current.Load(), true
+}
+
+// ─── Restart persistence (RecordKindSequenceState / RecordKindDropSequence) ───
+//
+// goopg's sequence registry is in-memory only, so every state change that must
+// survive a restart is WAL-logged as a full-state snapshot and re-applied by
+// internal/initdb/sequence_ddl_recovery.go. nextval pre-logs 32 values ahead
+// (upstream SEQ_LOG_VALS, postgres/src/backend/commands/sequence.c) so an
+// insert-heavy workload pays one tiny record per 32 fetches; a crash loses at
+// most the pre-logged gap, exactly like PostgreSQL.
+
+// SetSequenceColumnMarker records that the sequence backs a SERIAL column
+// (spelling = "serial"/"bigserial"/... as stored in the column's catalog
+// type) or an identity column (identityKind 1 = BY DEFAULT, 2 = ALWAYS).
+// The marker rides the sequence's WAL state record so startup replay can
+// restore the owning column's catalog markers, which the INSERT
+// auto-increment path keys on.
+func SetSequenceColumnMarker(name, spelling string, identityKind byte) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.colSpelling = spelling
+	s.identityKind = identityKind
+	s.mu.Unlock()
+}
+
+// payloadLocked builds the WAL snapshot for s with the given counter state.
+// Caller must hold s.mu.
+func (s *seqState) payloadLocked(current int64, called bool) wal.SequenceStatePayload {
+	name := s.seqName
+	if s.schema != "" && s.schema != "public" {
+		name = s.schema + "." + s.seqName
+	}
+	return wal.SequenceStatePayload{
+		Name:         name,
+		Start:        s.start,
+		Increment:    s.increment,
+		Min:          s.min,
+		Max:          s.max,
+		Cache:        s.cache,
+		Current:      current,
+		Cycle:        s.cycle,
+		Called:       called,
+		DataType:     s.dataType,
+		OwnedBy:      s.ownedBy,
+		ColSpelling:  s.colSpelling,
+		IdentityKind: s.identityKind,
+	}
+}
+
+// WALLogSequenceState snapshots the sequence's exact live state and appends a
+// RecordKindSequenceState record. Called after any definition-level mutation
+// (CREATE TABLE with SERIAL/IDENTITY, CREATE/ALTER SEQUENCE, setval, TRUNCATE
+// ... RESTART IDENTITY). Temporary sequences are session-scoped and never
+// logged. A nil ctx/WAL (tests, WAL-less servers) is a no-op.
+func WALLogSequenceState(ctx *Context, name string) {
+	if ctx == nil || ctx.WAL == nil {
+		return
+	}
+	s := LookupSequence(name)
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.temporary {
+		s.mu.Unlock()
+		return
+	}
+	cur := s.current.Load()
+	p := s.payloadLocked(cur, s.called.Load())
+	s.logHorizon = cur
+	s.hasLogged = true
+	s.mu.Unlock()
+	if _, _, err := ctx.WAL.Append(wal.EncodeSequenceState(p)); err != nil {
+		// Durability of the sequence definition is best-effort in the face of
+		// a failing WAL appender (matches the walLog* helpers' error surface —
+		// callers of this helper are DDL paths that have already mutated the
+		// registry). The sequence still works for the life of the process.
+		return
+	}
+}
+
+// maybePreLogNextval WAL-logs the sequence state with the counter advanced
+// SEQ_LOG_VALS (32) values ahead of the just-fetched v, when v has crossed the
+// previously logged horizon. Mirrors upstream sequence.c: replaying the
+// pre-logged horizon never repeats a handed-out value; a crash wastes at most
+// the 32-value gap. Cycled sequences may repeat values after a crash within
+// the wrapped range (same caveat as PG's unlogged gap semantics; v0 accepts it).
+func (s *seqState) maybePreLogNextval(ctx *Context, v int64) {
+	if ctx == nil || ctx.WAL == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.temporary {
+		s.mu.Unlock()
+		return
+	}
+	covered := s.hasLogged &&
+		((s.increment > 0 && v <= s.logHorizon) || (s.increment < 0 && v >= s.logHorizon))
+	if covered {
+		s.mu.Unlock()
+		return
+	}
+	const seqLogVals = 32 // SEQ_LOG_VALS, postgres/src/backend/commands/sequence.c
+	horizon := v + seqLogVals*s.increment
+	if s.increment > 0 && (horizon > s.max || horizon < v) {
+		horizon = s.max
+	} else if s.increment < 0 && (horizon < s.min || horizon > v) {
+		horizon = s.min
+	}
+	p := s.payloadLocked(horizon, true)
+	s.logHorizon = horizon
+	s.hasLogged = true
+	s.mu.Unlock()
+	_, _, _ = ctx.WAL.Append(wal.EncodeSequenceState(p))
+}
+
+// RestoreSequenceFromWAL re-registers a sequence from a replayed
+// RecordKindSequenceState record (last record wins). Counter state is
+// restored exactly as logged: Current is the pre-logged horizon for records
+// emitted by nextval, or the exact value for create/alter/setval snapshots.
+func RestoreSequenceFromWAL(p wal.SequenceStatePayload) {
+	RegisterSequence(p.Name, p.Start, p.Increment, p.Min, p.Max, p.Cycle)
+	if p.Cache > 1 {
+		SetSequenceCache(p.Name, p.Cache)
+	}
+	if p.DataType != "" {
+		SetSequenceDataType(p.Name, p.DataType)
+	}
+	if p.OwnedBy != "" {
+		SetSequenceOwnedBy(p.Name, p.OwnedBy)
+	}
+	SetSequenceColumnMarker(p.Name, p.ColSpelling, p.IdentityKind)
+	s := LookupSequence(p.Name)
+	if s == nil {
+		return
+	}
+	s.current.Store(p.Current)
+	s.called.Store(p.Called)
+	s.mu.Lock()
+	s.logHorizon = p.Current
+	s.hasLogged = true
+	s.mu.Unlock()
 }
 
 // SetSequenceCurrentValue directly sets the internal counter (used for ROLLBACK of RESTART IDENTITY).
@@ -397,6 +561,9 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, &ExecError{Code: "2200H", Message: err.Error()}
 	}
+	// Restart persistence: pre-log the counter 32 values ahead when v crosses
+	// the logged horizon (SEQ_LOG_VALS semantics, sequence.c).
+	s.maybePreLogNextval(ctx, v)
 	// Store for currval / lastval.
 	if ctx != nil {
 		if ctx.CurrSeqVals == nil {
@@ -474,6 +641,9 @@ func evalSetval(args []Datum, ctx *Context) (Datum, error) {
 		s.current.Store(value - s.increment)
 		s.called.Store(false)
 	}
+	// Restart persistence: setval is a definition-level counter change —
+	// log the exact new state (mirrors sequence.c do_setval's XLogInsert).
+	WALLogSequenceState(ctx, name)
 	// Update session state.
 	if ctx != nil {
 		if ctx.CurrSeqVals == nil {
