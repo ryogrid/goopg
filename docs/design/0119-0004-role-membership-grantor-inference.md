@@ -134,12 +134,45 @@ bootstrap superuser, whose implicit-grantor path is unchanged);
   remains unported (unreachable today — unchanged from the prior doc).
 - `GRANT ... ON PARAMETER` GUC-name validation (no compiled-in parameter
   table) remains open, unrelated to this slice.
-- The defensive `SelectBestAdmin == 0` fallback (return `currentUserID`
-  rather than PG's internal-error `elog`) is a deliberate divergence: goopg
-  has no scenario today that can construct a chain where
-  `IsAdminOfRole`(`ROLERECURSE_MEMBERS`, ignores INHERIT) succeeds but
-  `SelectBestAdmin`(`ROLERECURSE_PRIVS`, requires INHERIT) finds nothing,
-  since ADMIN OPTION grants are typically also INHERIT — but it is
-  theoretically reachable via `WITH INHERIT FALSE` on an admin-bearing row,
-  and would silently misattribute the grantor rather than erroring like PG
-  does.
+
+## Follow-up: `SelectBestAdmin == 0` — port PG's "no possible grantors" (2026-07-03)
+
+Closes this doc's own deferred `SelectBestAdmin == 0` residual. The scenario
+was confirmed **reachable**, not theoretical: verified live against real
+PostgreSQL 18.3 (`postgres/local_install`, scratch `initdb` instance) —
+
+```sql
+CREATE ROLE tgt NOLOGIN; CREATE ROLE mid NOLOGIN; CREATE ROLE cur LOGIN;
+GRANT tgt TO mid WITH ADMIN OPTION;
+GRANT mid TO cur WITH INHERIT FALSE;
+-- as cur:
+GRANT tgt TO grantee;  -- ERROR:  XX000: no possible grantors
+                        -- LOCATION:  check_role_grantor, user.c:2231
+```
+
+`checkRoleMembershipAuthorization`'s `IsAdminOfRole` (`is_admin_of_role`,
+`ROLERECURSE_MEMBERS`) walks *any* membership chain to authorize `cur`, but
+`checkRoleGrantor`'s `SelectBestAdmin` (`select_best_admin`,
+`ROLERECURSE_PRIVS`) only walks `INHERIT`-marked edges when inferring an
+implicit grantor — the `WITH INHERIT FALSE` hop to `mid` blocks that walk, so
+no candidate is found even though the operation is authorized.
+`checkRoleGrantor` (`internal/executor/operators_ddl_role_membership.go`) now
+raises `&ExecError{Code: "XX000", Message: "no possible grantors"}` instead of
+the old silent `return currentUserID, nil` fallback, mirroring `user.c:2231`'s
+`elog(ERROR, "no possible grantors")` verbatim (untranslated internal error in
+upstream too, hence the plain, non-PG-formatted message text).
+
+Tests: `TestExecRoleMembershipChangeNoPossibleGrantors`
+(`internal/executor/operators_ddl_role_membership_test.go`) constructs the
+exact `tgt`/`mid`/`cur` chain above and asserts the `XX000` error.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog`+
+`internal/executor`+`internal/parser`+`internal/wal`+`internal/initdb`+
+`internal/server` suites PASS; `TestPort_PgDumpallRoleMembership` PASS
+(unaffected — bootstrap-superuser path never hits this branch);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke = pre-commit
+hook.
+
+**Still open (unchanged):** the `ROLE_PG_DATABASE_OWNER` carve-out and
+`GRANT ... ON PARAMETER` GUC-name validation residuals above are unrelated to
+this slice.

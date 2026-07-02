@@ -207,9 +207,13 @@ func (o *ddlOp) checkRoleMembershipAuthorization(im *catalog.InMemory, currentUs
 // otherwise the grantor is inferred as the closest role (fewest hops,
 // preferring currentUserID's own direct ADMIN OPTION) whose privileges
 // currentUserID inherits and which itself directly holds ADMIN OPTION on
-// roleOid (catalog.SelectBestAdmin) — since checkRoleMembershipAuthorization
-// already proved currentUserID may perform this operation, a best-admin
-// candidate always exists.
+// roleOid (catalog.SelectBestAdmin). No best-admin candidate is guaranteed
+// to exist even though checkRoleMembershipAuthorization already approved
+// the operation: that check (IsAdminOfRole, ROLERECURSE_MEMBERS) walks ANY
+// membership chain, while SelectBestAdmin (ROLERECURSE_PRIVS) only walks
+// INHERIT-marked edges — a WITH INHERIT FALSE membership to an admin-bearing
+// role authorizes but yields no grantor, raising XX000 "no possible
+// grantors" exactly as upstream's elog does (user.c:2231).
 //
 // Explicit GRANTED BY: the named role must be one whose privileges
 // currentUserID possesses (catalog.HasPrivsOfRole) — otherwise this is an
@@ -226,11 +230,18 @@ func (o *ddlOp) checkRoleGrantor(im *catalog.InMemory, currentUserID, roleOid ui
 		}
 		best := im.SelectBestAdmin(currentUserID, roleOid)
 		if best == 0 {
-			// checkRoleMembershipAuthorization already established
-			// currentUserID may perform this operation, so a best admin
-			// should always exist; fall back defensively rather than
-			// mirroring user.c's elog(ERROR, "no possible grantors").
-			return currentUserID, nil
+			// Reachable despite checkRoleMembershipAuthorization's prior
+			// approval: IsAdminOfRole (is_admin_of_role, ROLERECURSE_MEMBERS)
+			// walks ANY membership chain regardless of INHERIT, but
+			// SelectBestAdmin (select_best_admin, ROLERECURSE_PRIVS) only
+			// walks INHERIT-marked edges — a WITH INHERIT FALSE membership
+			// to an admin-bearing intermediate role authorizes the op but
+			// yields no inheritable grantor. Confirmed against live PG 18.3:
+			// GRANT tgt TO mid WITH ADMIN OPTION; GRANT mid TO cur WITH
+			// INHERIT FALSE; then cur running GRANT tgt TO x raises this
+			// exact elog. Mirrors user.c:2231 verbatim (SQLSTATE XX000, not
+			// translated/localized in upstream either).
+			return 0, &ExecError{Code: "XX000", Message: "no possible grantors"}
 		}
 		return best, nil
 	}

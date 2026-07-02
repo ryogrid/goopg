@@ -6028,6 +6028,35 @@ documentation-only and is exempt from the design-doc requirement.)
       carve-out and `check_role_grantor`'s `WITH INHERIT FALSE` edge case
       from prior rows remain open, unchanged.
 
+- [x] **`check_role_grantor`'s `SelectBestAdmin == 0` fallback — port PG's
+      "no possible grantors" (M0119-0004-ACLHEAP follow-up, loop #37).**
+      **COMPLETE 2026-07-03:** closes the `0119-0004ce` row's own deferred
+      "`WITH INHERIT FALSE` admin-chain edge case", confirmed **reachable**
+      (not theoretical) against a live scratch PostgreSQL 18.3 instance
+      (`postgres/local_install`, `initdb`+`pg_ctl` on port 5599): `GRANT tgt
+      TO mid WITH ADMIN OPTION; GRANT mid TO cur WITH INHERIT FALSE;` then
+      `cur` running `GRANT tgt TO grantee` raises `ERROR: XX000: no possible
+      grantors` at `check_role_grantor, user.c:2231` —
+      `checkRoleMembershipAuthorization`'s `IsAdminOfRole`
+      (`ROLERECURSE_MEMBERS`) authorizes `cur` via the same chain that
+      `checkRoleGrantor`'s `SelectBestAdmin` (`ROLERECURSE_PRIVS`,
+      INHERIT-only) then fails to find a grantor through.
+      `internal/executor/operators_ddl_role_membership.go`'s `checkRoleGrantor`
+      now returns `&ExecError{Code: "XX000", Message: "no possible
+      grantors"}` from that branch instead of the old silent `return
+      currentUserID, nil`. Test: `TestExecRoleMembershipChangeNoPossibleGrantors`
+      (`internal/executor/operators_ddl_role_membership_test.go`). Gates: `go
+      build ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/wal`+`internal/initdb`+`internal/server`
+      suites PASS; `TestPort_PgDumpallRoleMembership` PASS (unaffected);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/0119-0004-role-membership-grantor-inference.md`
+      (new "Follow-up" section); `docs/design/README.md` row `0119-0004cg`
+      added; deferral ledger row appended. Still open: the
+      `ROLE_PG_DATABASE_OWNER` carve-out and `GRANT ... ON PARAMETER`'s
+      `reserved_class_prefix` extension-namespace check remain open,
+      unrelated to this slice.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

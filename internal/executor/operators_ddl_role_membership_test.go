@@ -8,7 +8,8 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
-func adminOptTrue() *bool { v := true; return &v }
+func adminOptTrue() *bool    { v := true; return &v }
+func inheritOptFalse() *bool { v := false; return &v }
 
 // TestExecRoleMembershipChangeRequiresAdminOption verifies
 // check_role_membership_authorization's "otherwise, must have admin option
@@ -239,6 +240,51 @@ func TestExecRoleMembershipChangeGrantedByRequiresPrivsOfGrantor(t *testing.T) {
 	if found.GrantorOID != bobOid {
 		t.Errorf("expected grantor to be the explicit GRANTED BY role (bob=%d), got %d", bobOid, found.GrantorOID)
 	}
+}
+
+// TestExecRoleMembershipChangeNoPossibleGrantors verifies the
+// IsAdminOfRole/SelectBestAdmin mismatch confirmed live against PostgreSQL
+// 18.3: a WITH INHERIT FALSE membership to an admin-bearing intermediate
+// role satisfies checkRoleMembershipAuthorization's is_admin_of_role check
+// (ROLERECURSE_MEMBERS, walks any membership chain) but leaves
+// SelectBestAdmin's implicit-grantor inference (ROLERECURSE_PRIVS, only
+// INHERIT-marked edges) with no candidate. Reproduced against real PG 18.3:
+// CREATE ROLE tgt/mid/cur; GRANT tgt TO mid WITH ADMIN OPTION; GRANT mid TO
+// cur WITH INHERIT FALSE; then cur running `GRANT tgt TO grantee` raises
+// `ERROR: XX000: no possible grantors` at user.c:2231 (check_role_grantor).
+// M0119-0004-ACLHEAP.
+func TestExecRoleMembershipChangeNoPossibleGrantors(t *testing.T) {
+	cat := catalog.NewInMemory()
+	cat.RegisterRole("tgt")
+	cat.RegisterRole("mid")
+	cat.RegisterRole("cur")
+	cat.RegisterRole("grantee")
+	midOid, _ := cat.RoleOID("mid")
+	curOid, _ := cat.RoleOID("cur")
+
+	// mid directly holds ADMIN OPTION on tgt; cur is a member of mid but does
+	// NOT inherit mid's privileges (WITH INHERIT FALSE) — authorized to
+	// change tgt's membership (any chain counts for is_admin_of_role), but no
+	// inheritable grantor exists for the implicit-grantor path.
+	cat.GrantRoleMembership(mustOID(cat, "tgt"), midOid, catalog.BootstrapSuperuserOID, adminOptTrue(), nil, nil)
+	cat.GrantRoleMembership(midOid, curOid, catalog.BootstrapSuperuserOID, nil, inheritOptFalse(), nil)
+
+	ctx := &Context{Catalog: cat, NonSuperuserRole: "cur"}
+	op := &ddlOp{ctx: ctx}
+	rc := &parser.RoleMembershipChange{
+		Roles:    []string{"tgt"},
+		Grantees: []string{"grantee"},
+	}
+	err := op.execRoleMembershipChange(rc)
+	execErr, ok := err.(*ExecError)
+	if !ok || execErr.Code != "XX000" || execErr.Message != "no possible grantors" {
+		t.Fatalf("expected XX000 %q, got %#v", "no possible grantors", err)
+	}
+}
+
+func mustOID(cat *catalog.InMemory, name string) uint32 {
+	oid, _ := cat.RoleOID(name)
+	return oid
 }
 
 // TestExecRoleMembershipChangeGrantedByRequiresDirectAdminOption verifies
