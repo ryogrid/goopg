@@ -63,7 +63,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// the string-match path, the CREATE/DROP DATABASE|ROLE intercepts, or the
 	// executor — mirroring PostgreSQL's exec_simple_query, which logs before
 	// parse. No-op when logging is disabled. root-0023.
-	s.logStatement("simple", trimmed, connTx)
+	s.logStatement("simple", trimmed, sess, connTx)
 
 	matchable := strings.TrimRight(trimmed, ";")
 	matchable = strings.TrimSpace(matchable)

@@ -97,11 +97,30 @@ COPY`) plus every DDL verb; `ddl` logs only DDL.
   the extended path (`proto=extended`).
 - `go test ./internal/server/ ./internal/config/` green; `go build ./...` green.
 
+## Follow-up: per-session `log_statement` GUC (loop #38)
+
+**LANDED.** A client `SET log_statement = 'all'` (or `ddl`/`mod`) now takes
+effect even when `GOOPG_LOG_STATEMENT` is quieter or unset, matching
+PostgreSQL's single `log_statement` GUC (the env var is just this server's
+boot-time default for it, not a ceiling).
+
+`(*Server).effectiveLogStatementLevel(sess)` (`internal/server/statement_log.go`)
+reads the session's effective `log_statement` value via `sess.Get`, parses it
+with the existing `parseLogStatementLevel`, and returns whichever of the env
+level and the session level is louder (`none < ddl < mod < all`, so a plain
+integer `>` comparison on the enum works). `logStatement` now takes `sess
+*config.SessionRegistry` and calls this helper instead of reading
+`s.logStmtLevel` directly; both call sites (`query.go:handleQuery`,
+`dispatch_extended.go:executeExtendedQueryViaExecutor`) already had `sess` in
+scope, so no new plumbing was needed. `sess == nil` (not expected on either
+live call site, but defensive) falls back to the env level alone.
+
+Test: `TestEffectiveLogStatementLevel` (`internal/server/statement_log_test.go`)
+covers env-louder, session-louder, and both-equal-but-different-verb cases
+plus the nil-session fallback.
+
 ## Out of scope / deferred
 
-- Making the per-session `log_statement` GUC functional (reading it via
-  `sess.Get` and OR-ing with the env-var level) — recorded in
-  `.ralph/deferral_ledger.md`. The env var is the single global toggle for now.
 - `log_min_duration_statement` (duration-threshold logging), log-line prefix
   (`log_line_prefix`), and a `logging_collector`/`log_directory` file sink
   remain unimplemented GUC stubs.

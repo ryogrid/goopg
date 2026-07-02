@@ -6057,6 +6057,28 @@ documentation-only and is exempt from the design-doc requirement.)
       `reserved_class_prefix` extension-namespace check remain open,
       unrelated to this slice.
 
+- [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
+      #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
+      row's "a client `SET log_statement='all'` has no effect" residual — only
+      the global `GOOPG_LOG_STATEMENT` env var drove statement logging before
+      this loop. New `(*Server).effectiveLogStatementLevel(sess)`
+      (`internal/server/statement_log.go`) ORs the env level with the
+      session's effective `log_statement` value (`sess.Get`, reusing
+      `parseLogStatementLevel`), taking whichever of the two is louder
+      (`none < ddl < mod < all`); `logStatement` now takes `sess
+      *config.SessionRegistry` and both live call sites
+      (`query.go:handleQuery`, `dispatch_extended.go:executeExtendedQueryViaExecutor`)
+      already had `sess` in scope, so no new plumbing was required. Test:
+      `TestEffectiveLogStatementLevel` (`internal/server/statement_log_test.go`,
+      env-louder/session-louder/nil-session cases). Gates: `go build ./...`/
+      `go vet` clean; `internal/server`+`internal/config` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/root-0023-statement-query-logging.md`
+      new "Follow-up" section; `docs/design/README.md` root-0023 row updated;
+      deferral ledger row appended. Still open, unrelated to this slice:
+      `log_min_duration_statement`, `log_line_prefix`,
+      `logging_collector`/`log_directory` remain unimplemented GUC stubs.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

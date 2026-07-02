@@ -2,6 +2,8 @@ package server
 
 import (
 	"strings"
+
+	"github.com/goopg/goopg/internal/config"
 )
 
 // logStatementLevel mirrors PostgreSQL's log_statement enum
@@ -106,16 +108,38 @@ func (lvl logStatementLevel) shouldLog(kw string) bool {
 	}
 }
 
+// effectiveLogStatementLevel is the louder of the global GOOPG_LOG_STATEMENT
+// toggle (s.logStmtLevel) and the session's `log_statement` GUC (a client
+// `SET log_statement = 'all'`), mirroring PostgreSQL's single log_statement
+// GUC by treating the env var as this server's boot-time default for it. sess
+// may be nil (e.g. a connection not yet past startup); the env level alone
+// then applies.
+func (s *Server) effectiveLogStatementLevel(sess *config.SessionRegistry) logStatementLevel {
+	lvl := s.logStmtLevel
+	if sess == nil {
+		return lvl
+	}
+	if _, eff, ok := sess.Get("log_statement"); ok {
+		if sessLvl, valid := parseLogStatementLevel(eff); valid && sessLvl > lvl {
+			lvl = sessLvl
+		}
+	}
+	return lvl
+}
+
 // logStatement emits a single per-statement log line when the configured
-// GOOPG_LOG_STATEMENT level admits it. proto is "simple" or "extended". connTx
-// may be nil; when it holds an explicit transaction with an assigned xid, the
-// xid is attached so a verification run can group a client's queries by
-// transaction. This is a no-op (one enum compare) when logging is disabled.
-func (s *Server) logStatement(proto string, sql string, connTx *connTxState) {
-	if s.logStmtLevel == logStmtNone {
+// GOOPG_LOG_STATEMENT level or the session's `log_statement` GUC (whichever
+// is louder) admits it. proto is "simple" or "extended". connTx may be nil;
+// when it holds an explicit transaction with an assigned xid, the xid is
+// attached so a verification run can group a client's queries by
+// transaction. This is a no-op (one enum compare, plus one session lookup)
+// when logging is disabled.
+func (s *Server) logStatement(proto string, sql string, sess *config.SessionRegistry, connTx *connTxState) {
+	lvl := s.effectiveLogStatementLevel(sess)
+	if lvl == logStmtNone {
 		return
 	}
-	if s.logStmtLevel != logStmtAll && !s.logStmtLevel.shouldLog(leadingKeyword(sql)) {
+	if lvl != logStmtAll && !lvl.shouldLog(leadingKeyword(sql)) {
 		return
 	}
 	attrs := []any{"proto", proto, "statement", strings.TrimSpace(sql)}

@@ -1,6 +1,10 @@
 package server
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/config"
+)
 
 func TestParseLogStatementLevel(t *testing.T) {
 	cases := []struct {
@@ -71,5 +75,46 @@ func TestLogStatementLevelShouldLog(t *testing.T) {
 		if got := c.lvl.shouldLog(c.kw); got != c.exp {
 			t.Errorf("level %d shouldLog(%q) = %v, want %v", c.lvl, c.kw, got, c.exp)
 		}
+	}
+}
+
+// TestEffectiveLogStatementLevel pins root-0023's deferred follow-up: a
+// client `SET log_statement = 'all'` must take effect even when the server's
+// GOOPG_LOG_STATEMENT env-var toggle is quieter (or unset), and the env var
+// must still work when no session GUC override is present — the effective
+// level is whichever of the two is louder, never quieter than either.
+func TestEffectiveLogStatementLevel(t *testing.T) {
+	cases := []struct {
+		name    string
+		envLvl  logStatementLevel
+		sessSet string // "" ⇒ leave the session GUC at its boot default ("none")
+		want    logStatementLevel
+	}{
+		{name: "env-none-sess-unset", envLvl: logStmtNone, sessSet: "", want: logStmtNone},
+		{name: "env-none-sess-all", envLvl: logStmtNone, sessSet: "all", want: logStmtAll},
+		{name: "env-all-sess-unset", envLvl: logStmtAll, sessSet: "", want: logStmtAll},
+		{name: "env-all-sess-none", envLvl: logStmtAll, sessSet: "none", want: logStmtAll},
+		{name: "env-ddl-sess-mod", envLvl: logStmtDDL, sessSet: "mod", want: logStmtMod},
+		{name: "env-mod-sess-ddl", envLvl: logStmtMod, sessSet: "ddl", want: logStmtMod},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sess := config.NewSessionRegistry(config.BuildDefaultRegistry())
+			if tc.sessSet != "" {
+				if err := sess.Set("log_statement", tc.sessSet, false); err != nil {
+					t.Fatalf("Set(log_statement=%q): %v", tc.sessSet, err)
+				}
+			}
+			s := &Server{logStmtLevel: tc.envLvl}
+			if got := s.effectiveLogStatementLevel(sess); got != tc.want {
+				t.Errorf("effectiveLogStatementLevel(env=%d, sess=%q) = %d, want %d",
+					tc.envLvl, tc.sessSet, got, tc.want)
+			}
+		})
+	}
+	// nil session: env level alone applies.
+	s := &Server{logStmtLevel: logStmtDDL}
+	if got := s.effectiveLogStatementLevel(nil); got != logStmtDDL {
+		t.Errorf("effectiveLogStatementLevel(nil session) = %d, want %d", got, logStmtDDL)
 	}
 }
