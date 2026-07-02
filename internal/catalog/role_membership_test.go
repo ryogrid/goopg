@@ -390,3 +390,70 @@ func TestUnregisterRoleDropsMembershipRows(t *testing.T) {
 		t.Errorf("dropping the granted role should remove its membership row: %+v", entries)
 	}
 }
+
+// TestIsSuperuser verifies IsSuperuser: the bootstrap superuser (OID 10) is
+// always superuser; an unregistered/unknown OID and an ordinary registered
+// role default to false; a role with RoleAttrs.Superuser set reports true.
+// M0119-0004-ACLHEAP.
+func TestIsSuperuser(t *testing.T) {
+	c := NewInMemory()
+	if !c.IsSuperuser(BootstrapSuperuserOID) {
+		t.Errorf("bootstrap superuser (OID 10) must always report superuser")
+	}
+	if c.IsSuperuser(999) {
+		t.Errorf("unknown OID must not report superuser")
+	}
+
+	c.RegisterRole("alice")
+	aliceOid, _ := c.RoleOID("alice")
+	if c.IsSuperuser(aliceOid) {
+		t.Errorf("a plain registered role must not report superuser by default")
+	}
+
+	c.SetRoleAttrs("alice", RoleAttrs{Superuser: true})
+	if !c.IsSuperuser(aliceOid) {
+		t.Errorf("a role with RoleAttrs.Superuser=true must report superuser")
+	}
+}
+
+// TestIsAdminOfRole verifies IsAdminOfRole mirrors is_admin_of_role
+// (acl.c): a superuser member is always admin of any role; a role is never
+// its own admin (the self-membership carve-out, unlike RoleIsMemberOf); a
+// direct WITH ADMIN OPTION grant makes memberOid an admin; ADMIN OPTION is
+// inherited transitively through ANY membership chain, not just inheritable
+// ones; and a chain with no ADMIN OPTION anywhere along it reports false.
+// M0119-0004-ACLHEAP.
+func TestIsAdminOfRole(t *testing.T) {
+	c := NewInMemory()
+	if !c.IsAdminOfRole(BootstrapSuperuserOID, 12345) {
+		t.Errorf("the bootstrap superuser must be admin of every role")
+	}
+	if c.IsAdminOfRole(100, 100) {
+		t.Errorf("a role must never be its own admin (self-membership carve-out)")
+	}
+	if c.IsAdminOfRole(100, 200) {
+		t.Errorf("unrelated roles must report false before any grant")
+	}
+
+	// 100 holds a direct WITH ADMIN OPTION grant on 200.
+	c.GrantRoleMembership(200, 100, 10, boolPtr(true), nil, nil)
+	if !c.IsAdminOfRole(100, 200) {
+		t.Errorf("direct ADMIN OPTION grant not detected")
+	}
+
+	// 300 is a plain (non-admin) member of 100, which itself holds ADMIN
+	// OPTION on 200 (via the row above) — 300 must inherit admin-of-200
+	// transitively even though its own membership in 100 carries no ADMIN
+	// OPTION (ROLERECURSE_MEMBERS ignores the option flags while walking).
+	c.GrantRoleMembership(100, 300, 10, nil, nil, nil)
+	if !c.IsAdminOfRole(300, 200) {
+		t.Errorf("transitive ADMIN OPTION inheritance not detected")
+	}
+
+	// 400 is a plain member of 300, but 300 has no ADMIN OPTION on 200 (only
+	// on nothing) — no path to admin-of-200 exists.
+	c.GrantRoleMembership(300, 400, 10, nil, nil, nil)
+	if c.IsAdminOfRole(400, 100) {
+		t.Errorf("a chain with no ADMIN OPTION anywhere must report false")
+	}
+}

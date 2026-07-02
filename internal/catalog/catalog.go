@@ -4360,6 +4360,66 @@ func (c *InMemory) RoleIsMemberOf(memberOid, roleOid uint32) bool {
 	return false
 }
 
+// IsSuperuser reports whether oid names a role with the SUPERUSER attribute:
+// the bootstrap superuser (OID 10, always superuser — see
+// BootstrapSuperuserOID) or a registered role whose RoleAttrs.Superuser is
+// set (CREATE/ALTER ROLE ... SUPERUSER). Mirrors superuser_arg (acl.c).
+// Backs check_role_membership_authorization's "to mess with a superuser
+// role, you gotta be superuser" gate. M0119-0004-ACLHEAP.
+func (c *InMemory) IsSuperuser(oid uint32) bool {
+	if oid == BootstrapSuperuserOID {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, roid := range c.roles {
+		if roid == oid {
+			a := c.roleAttrs[name]
+			return a != nil && a.Superuser
+		}
+	}
+	return false
+}
+
+// IsAdminOfRole reports whether memberOid is the bootstrap/attribute
+// superuser, or holds ADMIN OPTION on roleOid — directly, or indirectly via
+// ANY membership chain (not gated on INHERIT/SET, matching PG's
+// ROLERECURSE_MEMBERS traversal). By policy a role is never its own admin
+// (memberOid == roleOid returns false, matching is_admin_of_role's explicit
+// carve-out), even though RoleIsMemberOf treats self-membership as true.
+// Mirrors is_admin_of_role (postgres/src/backend/utils/adt/acl.c). Backs
+// check_role_membership_authorization's "otherwise, must have admin option
+// on the role to be changed" branch. M0119-0004-ACLHEAP.
+func (c *InMemory) IsAdminOfRole(memberOid, roleOid uint32) bool {
+	if c.IsSuperuser(memberOid) {
+		return true
+	}
+	if memberOid == roleOid {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur {
+				continue
+			}
+			if key.RoleOID == roleOid && m.AdminOption {
+				return true
+			}
+			if !seen[key.RoleOID] {
+				seen[key.RoleOID] = true
+				queue = append(queue, key.RoleOID)
+			}
+		}
+	}
+	return false
+}
+
 // BootstrapSuperuserOID is OID 10 (BOOTSTRAP_SUPERUSERID / "postgres"),
 // goopg's single hardcoded superuser (see the many "OID 10 = bootstrap
 // superuser" call sites elsewhere in this file). AddRoleMems' grantor-chain

@@ -32,6 +32,15 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 		}
 		return oid, nil
 	}
+	// currentUserID is check_role_membership_authorization's currentUserId
+	// (user.c: GetUserId(), captured once before any GRANTED BY override) —
+	// the actual invoking session role whose OWN privileges gate whether
+	// this GRANT/REVOKE is even allowed, as opposed to grantorOid below
+	// (who gets RECORDED as grantor-of-record, which GRANTED BY can
+	// redirect). goopg's simplified session model has no separate "current
+	// user" from "effective DDL-owner role", so both start from the same
+	// resolution. M0119-0004-ACLHEAP.
+	currentUserID := o.currentDDLOwnerOID()
 	// The grantor row a bare REVOKE (no GRANTED BY) targets is, in real PG,
 	// whatever check_role_grantor(is_grant=false) infers for the current
 	// session (usually the current user, falling back to an inherited/
@@ -43,7 +52,7 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 	// actually owns, leaving any OTHER grantor's independent row on the same
 	// (role, member) pair untouched — real PG's (roleid, member, grantor)
 	// unique index. M0119-0004-ACLHEAP.
-	grantorOid := o.currentDDLOwnerOID()
+	grantorOid := currentUserID
 	if rc.GrantedBy != "" {
 		if oid, err := resolveRole(rc.GrantedBy); err == nil {
 			grantorOid = oid
@@ -53,6 +62,9 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 		for _, roleName := range rc.Roles {
 			roleOid, err := resolveRole(roleName)
 			if err != nil {
+				return err
+			}
+			if err := o.checkRoleMembershipAuthorization(im, currentUserID, roleOid, roleName, false); err != nil {
 				return err
 			}
 			for _, memberName := range rc.Grantees {
@@ -88,6 +100,9 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 	for _, roleName := range rc.Roles {
 		roleOid, err := resolveRole(roleName)
 		if err != nil {
+			return err
+		}
+		if err := o.checkRoleMembershipAuthorization(im, currentUserID, roleOid, roleName, true); err != nil {
 			return err
 		}
 		memberOids := make([]uint32, 0, len(rc.Grantees))
@@ -126,6 +141,46 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 			if o.ctx.WAL != nil {
 				_, _, _ = o.ctx.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption))
 			}
+		}
+	}
+	return nil
+}
+
+// checkRoleMembershipAuthorization ports check_role_membership_authorization
+// (postgres/src/backend/commands/user.c): currentUserID must have permission
+// to modify roleOid's membership list. A superuser roleOid can only be
+// touched by a superuser currentUserID; otherwise currentUserID must hold
+// ADMIN OPTION on roleOid (directly or transitively — catalog.IsAdminOfRole).
+// roleName is only used for the error message. Called once per roleOid in
+// the outer loop of both the GRANT and REVOKE branches, before any grantee is
+// resolved — matching user.c's per-statement-role check, which runs before
+// AddRoleMems/DelRoleMems are ever invoked for that role. M0119-0004-ACLHEAP.
+//
+// Not yet ported: the ROLE_PG_DATABASE_OWNER "cannot have explicit members"
+// carve-out (unreachable today since predefined roles like
+// pg_database_owner are never registered in the live role-name registry —
+// resolveRole already fails them with "role does not exist", a separate,
+// out-of-scope gap) — see the deferral ledger.
+func (o *ddlOp) checkRoleMembershipAuthorization(im *catalog.InMemory, currentUserID, roleOid uint32, roleName string, isGrant bool) error {
+	verb := "grant"
+	if !isGrant {
+		verb = "revoke"
+	}
+	if im.IsSuperuser(roleOid) {
+		if !im.IsSuperuser(currentUserID) {
+			return &ExecError{
+				Code:    "42501",
+				Message: fmt.Sprintf("permission denied to %s role %q", verb, roleName),
+				Detail:  fmt.Sprintf("Only roles with the SUPERUSER attribute may %s roles with the SUPERUSER attribute.", verb),
+			}
+		}
+		return nil
+	}
+	if !im.IsAdminOfRole(currentUserID, roleOid) {
+		return &ExecError{
+			Code:    "42501",
+			Message: fmt.Sprintf("permission denied to %s role %q", verb, roleName),
+			Detail:  fmt.Sprintf("Only roles with the ADMIN option on role %q may %s this role.", roleName, verb),
 		}
 	}
 	return nil

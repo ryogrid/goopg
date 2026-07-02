@@ -5901,6 +5901,43 @@ documentation-only and is exempt from the design-doc requirement.)
       role can currently GRANT/REVOKE any role membership); `GRANT ... ON
       PARAMETER` GUC-name validation (unrelated to this slice) remain open.
 
+- [x] **`check_role_membership_authorization` ADMIN OPTION permission gate
+      (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:** closes the
+      "any DDL-owner role can currently GRANT/REVOKE any role membership"
+      residual carried by every M0119-0004-ACLHEAP row since the original
+      role-membership slice. New `catalog.InMemory.IsSuperuser(oid) bool` +
+      `IsAdminOfRole(memberOid, roleOid) bool` (mirrors `is_admin_of_role`,
+      `acl.c`: superuser member always true; a role is never its own admin;
+      otherwise a BFS over `roleMembers` inheriting ADMIN OPTION transitively
+      through any membership chain, matching `ROLERECURSE_MEMBERS`).
+      `execRoleMembershipChange` (`internal/executor/operators_ddl_role_membership.go`)
+      now calls new `checkRoleMembershipAuthorization` once per target role in
+      both the GRANT and REVOKE branches, right after the role name resolves:
+      a superuser-flagged target role requires a superuser grantor/revoker
+      regardless of ADMIN OPTION; otherwise the invoking user must hold ADMIN
+      OPTION on the target role. Both raise `42501` with PG's exact
+      `errmsg`/`errdetail` text. Tests: `TestIsSuperuser`/`TestIsAdminOfRole`
+      (`internal/catalog/role_membership_test.go`); new
+      `internal/executor/operators_ddl_role_membership_test.go`
+      (`TestExecRoleMembershipChangeRequiresAdminOption`,
+      `TestExecRoleMembershipChangeSuperuserRoleRequiresSuperuserGrantor`,
+      `TestExecRoleMembershipChangeRevokeRequiresAdminOption`). Live
+      end-to-end `psql` smoke against a running goopg instance confirmed all
+      scenarios match PG's exact error text. Gates: `go build ./...`/`go vet`
+      clean; `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/wal`+`internal/initdb`+`internal/server` suites PASS;
+      `TestPort_PgDumpallRoleMembership` PASS (unaffected — runs as the
+      bootstrap superuser); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-membership-admin-option-authz.md`;
+      `docs/design/README.md` row `0119-0004cd` added; deferral ledger row
+      appended. Still open: the `ROLE_PG_DATABASE_OWNER` "cannot have
+      explicit members" carve-out (unreachable today — predefined roles are
+      never registered in the live role-name registry); `check_role_grantor`'s
+      inherited-privilege/superuser fallback for a bare REVOKE's implicit
+      grantor; `GRANT ... ON PARAMETER` GUC-name validation (both unrelated to
+      this slice).
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
