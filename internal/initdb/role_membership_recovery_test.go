@@ -24,7 +24,8 @@ func TestRoleMembershipRecoveryReplaysGrant(t *testing.T) {
 		t.Fatalf("first Open: %v", err)
 	}
 	const roleOid, memberOid, grantorOid = 16385, 16386, 10
-	if _, _, werr := rt1.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, true)); werr != nil {
+	admin := true
+	if _, _, werr := rt1.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, &admin, nil, nil)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append grant-role-membership: %v", werr)
 	}
@@ -73,9 +74,10 @@ func TestRoleMembershipRecoveryReplaysGrantThenRevoke(t *testing.T) {
 	}
 	const roleOid1, memberOid1 = 16385, 16386
 	const roleOid2, memberOid2 = 16387, 16388
+	adminFalse, adminTrue := false, true
 	appends := [][]byte{
-		wal.EncodeGrantRoleMembership(roleOid1, memberOid1, 10, false),
-		wal.EncodeGrantRoleMembership(roleOid2, memberOid2, 10, true),
+		wal.EncodeGrantRoleMembership(roleOid1, memberOid1, 10, &adminFalse, nil, nil),
+		wal.EncodeGrantRoleMembership(roleOid2, memberOid2, 10, &adminTrue, nil, nil),
 		wal.EncodeRevokeRoleMembership(roleOid1, memberOid1, false),
 		wal.EncodeRevokeRoleMembership(roleOid2, memberOid2, true),
 	}

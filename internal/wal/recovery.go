@@ -914,9 +914,10 @@ const (
 	RecordKindAlterRoleResetAllConfig byte = 78
 
 	// RecordKindGrantRoleMembership records a `GRANT <role> TO <member>
-	// [WITH ADMIN OPTION]` event so the pg_auth_members row survives a
-	// restart (M0119-0004-ACLHEAP, GRANT/REVOKE ROLE membership). goopg has
-	// no per-role file namespace, so the physical redo path is a no-op; the
+	// [WITH { ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]`
+	// event so the pg_auth_members row survives a restart
+	// (M0119-0004-ACLHEAP, GRANT/REVOKE ROLE membership). goopg has no
+	// per-role file namespace, so the physical redo path is a no-op; the
 	// recovery driver in internal/initdb/role_membership_recovery.go scans
 	// the WAL for these records after physical replay and re-applies them to
 	// catalog.InMemory's roleMembers registry via GrantRoleMembership (which
@@ -924,7 +925,7 @@ const (
 	// by pg_dump/pg_dumpall, so OID stability across a restart is not
 	// required).
 	// Format:
-	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | adminOption(1)
+	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1)
 	RecordKindGrantRoleMembership byte = 79
 
 	// RecordKindRevokeRoleMembership records a `REVOKE [ADMIN OPTION FOR]
@@ -1548,34 +1549,77 @@ func DecodeAlterRoleResetAllConfig(payload []byte) (roleOid, dbOid uint32, err e
 	return binary.LittleEndian.Uint32(payload[1:5]), binary.LittleEndian.Uint32(payload[5:9]), nil
 }
 
-// EncodeGrantRoleMembership encodes a `GRANT <role> TO <member> [WITH ADMIN
-// OPTION]` event.
-// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | adminOption(1).
-func EncodeGrantRoleMembership(roleOid, memberOid, grantorOid uint32, adminOption bool) []byte {
+// Tri-state bit layout for EncodeGrantRoleMembership/DecodeGrantRoleMembership's
+// options byte: each of admin/inherit/set gets a "specified" bit (the WITH
+// clause named it — nil vs non-nil *bool) and a "value" bit (meaningful only
+// when specified).
+const (
+	roleGrantOptAdminSpecified   = 1 << 0
+	roleGrantOptAdminValue       = 1 << 1
+	roleGrantOptInheritSpecified = 1 << 2
+	roleGrantOptInheritValue     = 1 << 3
+	roleGrantOptSetSpecified     = 1 << 4
+	roleGrantOptSetValue         = 1 << 5
+)
+
+// EncodeGrantRoleMembership encodes a `GRANT <role> TO <member> [WITH {
+// ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]` event.
+// admin/inherit/set are tri-state (nil = not specified in the WITH clause).
+// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1).
+func EncodeGrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) []byte {
 	out := make([]byte, 14)
 	out[0] = RecordKindGrantRoleMembership
 	binary.LittleEndian.PutUint32(out[1:5], roleOid)
 	binary.LittleEndian.PutUint32(out[5:9], memberOid)
 	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
-	if adminOption {
-		out[13] = 1
+	var opts byte
+	if admin != nil {
+		opts |= roleGrantOptAdminSpecified
+		if *admin {
+			opts |= roleGrantOptAdminValue
+		}
 	}
+	if inherit != nil {
+		opts |= roleGrantOptInheritSpecified
+		if *inherit {
+			opts |= roleGrantOptInheritValue
+		}
+	}
+	if set != nil {
+		opts |= roleGrantOptSetSpecified
+		if *set {
+			opts |= roleGrantOptSetValue
+		}
+	}
+	out[13] = opts
 	return out
 }
 
 // DecodeGrantRoleMembership decodes a RecordKindGrantRoleMembership payload.
-func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, adminOption bool, err error) {
+func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool, err error) {
 	if len(payload) < 14 {
-		return 0, 0, 0, false, fmt.Errorf("wal: grant-role-membership payload too short (%d bytes)", len(payload))
+		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: grant-role-membership payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindGrantRoleMembership {
-		return 0, 0, 0, false, fmt.Errorf("wal: record kind %d is not grant-role-membership", payload[0])
+		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: record kind %d is not grant-role-membership", payload[0])
 	}
 	roleOid = binary.LittleEndian.Uint32(payload[1:5])
 	memberOid = binary.LittleEndian.Uint32(payload[5:9])
 	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
-	adminOption = payload[13] != 0
-	return roleOid, memberOid, grantorOid, adminOption, nil
+	opts := payload[13]
+	if opts&roleGrantOptAdminSpecified != 0 {
+		v := opts&roleGrantOptAdminValue != 0
+		admin = &v
+	}
+	if opts&roleGrantOptInheritSpecified != 0 {
+		v := opts&roleGrantOptInheritValue != 0
+		inherit = &v
+	}
+	if opts&roleGrantOptSetSpecified != 0 {
+		v := opts&roleGrantOptSetValue != 0
+		set = &v
+	}
+	return roleOid, memberOid, grantorOid, admin, inherit, set, nil
 }
 
 // EncodeRevokeRoleMembership encodes a `REVOKE [ADMIN OPTION FOR] <role>

@@ -75,9 +75,9 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 				return &ExecError{Code: "0LP01", Message: fmt.Sprintf(
 					"role %q is a member of role %q", roleName, memberName)}
 			}
-			im.GrantRoleMembership(roleOid, memberOid, grantorOid, rc.WithAdminOption)
+			im.GrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption)
 			if o.ctx.WAL != nil {
-				_, _, _ = o.ctx.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, rc.WithAdminOption))
+				_, _, _ = o.ctx.WAL.Append(wal.EncodeGrantRoleMembership(roleOid, memberOid, grantorOid, rc.AdminOption, rc.InheritOption, rc.SetOption))
 			}
 		}
 	}

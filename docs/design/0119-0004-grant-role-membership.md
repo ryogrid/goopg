@@ -91,16 +91,19 @@ entirely from a new registry. `execCompatNoop` gained a
 New `catalog.InMemory.roleMembers map[roleMembershipKey]*RoleMembership`
 (`roleMembershipKey{RoleOID, MemberOID}`) mirrors `roleSettings`'s
 established shape. `GrantRoleMembership` upserts in place: a re-grant keeps
-the row's OID stable, always updates the grantor, and only ever *upgrades*
-`AdminOption` (never downgrades on a plain re-grant without `WITH ADMIN
-OPTION`), mirroring `AddRoleMems`'s `ON CONFLICT DO UPDATE SET admin_option =
-(admin_option OR EXCLUDED.admin_option)`. `RoleMembershipEntries()` returns a
-sorted snapshot for the `pg_auth_members.VirtualRows` projection (`oid`,
-`roleid`, `member`, `grantor`, `admin_option` are all live; `inherit_option`/
-`set_option` are not modelled per-grant and always report PG's default `t`/
-`f` — see Deferred). `UnregisterRole` (DROP ROLE) now also purges any
-membership row referencing the dropped role's OID on either side, mirroring
-PG's automatic membership-removal cascade on role drop.
+the row's OID stable and always updates the grantor. `RoleMembershipEntries()`
+returns a sorted snapshot for the `pg_auth_members.VirtualRows` projection.
+`UnregisterRole` (DROP ROLE) now also purges any membership row referencing
+the dropped role's OID on either side, mirroring PG's automatic
+membership-removal cascade on role drop.
+
+**Superseded 2026-07-03** (`0119-0004-grant-role-inherit-set.md`): the
+original `AdminOption`-only upsert (an unconditional "OR" that could only
+ever upgrade, never downgrade, and left `inherit_option`/`set_option`
+hardcoded `t`/`f`) was replaced by a tri-state `admin, inherit, set *bool`
+upsert matching PG's `GRANT_ROLE_SPECIFIED_*` bitmask semantics exactly —
+see that doc for the corrected behavior and the `set_option` default bug it
+also fixed.
 
 ### WAL / restart persistence
 
@@ -161,11 +164,10 @@ PASS; `TestPort_PgDumpallRoleMembership`/`TestPort_PgDumpallGlobalsOnly`/
 
 ## Deferred (ledger row appended)
 
-- **`WITH INHERIT {TRUE|FALSE}`/`WITH SET {TRUE|FALSE}` clauses are not
-  parsed.** `pg_auth_members.inherit_option`/`set_option` always report PG's
-  default (`t`/`f`) regardless of what a real `GRANT ... WITH` clause
-  requested; `buildRoleMembershipChange` only recognises `WITH ADMIN
-  OPTION`.
+- ~~**`WITH INHERIT {TRUE|FALSE}`/`WITH SET {TRUE|FALSE}` clauses are not
+  parsed.**~~ RESOLVED 2026-07-03, see `0119-0004-grant-role-inherit-set.md`
+  (which also fixed a wrong `set_option` default this doc's implementation
+  had introduced).
 - **The grantor-chain (member-grantor loop) circularity check is not
   implemented** — PG's second `AddRoleMems` check (`user.c` lines
   1751–1800-ish, "ADMIN option cannot be granted back to your own grantor")

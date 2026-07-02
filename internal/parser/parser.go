@@ -413,27 +413,34 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 	}
 	granteeStart := sepIdx + 1
 	granteeEnd := len(toks)
-	withAdminOption := false
+	var adminOpt, inheritOpt, setOpt *bool
 	grantedBy := ""
 	for i := granteeStart; i < len(toks); i++ {
 		switch strings.ToLower(toks[i].Value) {
 		case "with":
-			// WITH ADMIN OPTION — record the flag and end the grantee list.
-			if i+2 < len(toks) &&
-				strings.EqualFold(toks[i+1].Value, "admin") &&
-				strings.EqualFold(toks[i+2].Value, "option") {
-				withAdminOption = true
-			}
+			// GRANT's trailing `WITH { ADMIN | INHERIT | SET } { OPTION |
+			// TRUE | FALSE } [, ...]` list (grant_role_opt_list, gram.y).
+			// REVOKE has no WITH clause, so this only fires for GRANT.
+			// End the grantee list here and resume scanning (for a
+			// following GRANTED BY) right after the option list.
 			granteeEnd = i
+			var next int
+			adminOpt, inheritOpt, setOpt, next = parseGrantRoleOptList(toks, i+1)
+			i = next - 1
+			continue
 		case "granted":
 			// GRANTED BY <role> — record the explicit grantor and end the
 			// grantee list.
 			if i+2 < len(toks) && strings.EqualFold(toks[i+1].Value, "by") {
 				grantedBy = strings.Trim(toks[i+2].Value, `"`)
 			}
-			granteeEnd = i
+			if granteeEnd > i {
+				granteeEnd = i
+			}
 		case "cascade", "restrict":
-			granteeEnd = i
+			if granteeEnd > i {
+				granteeEnd = i
+			}
 		default:
 			continue
 		}
@@ -442,7 +449,10 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 	rmc := &RoleMembershipChange{
 		Revoke:          revoke,
 		AdminOptionOnly: adminOptionOnly,
-		WithAdminOption: withAdminOption,
+		WithAdminOption: adminOpt != nil && *adminOpt,
+		AdminOption:     adminOpt,
+		InheritOption:   inheritOpt,
+		SetOption:       setOpt,
 		Roles:           splitTokRoles(toks[start:sepIdx]),
 		Grantees:        splitTokRoles(toks[granteeStart:granteeEnd]),
 		GrantedBy:       grantedBy,
@@ -451,6 +461,50 @@ func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange 
 		return nil
 	}
 	return rmc
+}
+
+// parseGrantRoleOptList parses grant_role_opt_list (gram.y): a comma-separated
+// run of `{ ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE }` pairs starting
+// at toks[from] (already past the WITH keyword). Returns the tri-state
+// admin/inherit/set pointers (nil = that option never appeared in the list)
+// and the index of the first unconsumed token (e.g. "granted"/"cascade", or
+// len(toks) at end of input). M0119-0004-ACLHEAP.
+func parseGrantRoleOptList(toks []Token, from int) (admin, inherit, set *bool, next int) {
+	i := from
+	for i < len(toks) {
+		optName := strings.ToLower(toks[i].Value)
+		if optName != "admin" && optName != "inherit" && optName != "set" {
+			break
+		}
+		if i+1 >= len(toks) {
+			break
+		}
+		var val bool
+		switch strings.ToLower(toks[i+1].Value) {
+		case "option", "true":
+			val = true
+		case "false":
+			val = false
+		default:
+			return admin, inherit, set, i
+		}
+		v := val
+		switch optName {
+		case "admin":
+			admin = &v
+		case "inherit":
+			inherit = &v
+		case "set":
+			set = &v
+		}
+		i += 2
+		if i < len(toks) && toks[i].Kind == TokenSymbol && toks[i].Value == "," {
+			i++
+			continue
+		}
+		break
+	}
+	return admin, inherit, set, i
 }
 
 // grantHasColumnList reports whether the GRANT/REVOKE token run carries a

@@ -4109,35 +4109,55 @@ type roleMembershipKey struct {
 // RoleMembershipEntries in deterministic (RoleOID, MemberOID) order.
 // M0119-0004-ACLHEAP.
 type RoleMembership struct {
-	OID         uint32
-	RoleOID     uint32
-	MemberOID   uint32
-	GrantorOID  uint32
-	AdminOption bool
+	OID           uint32
+	RoleOID       uint32
+	MemberOID     uint32
+	GrantorOID    uint32
+	AdminOption   bool
+	InheritOption bool
+	SetOption     bool
 }
 
-// GrantRoleMembership upserts a `GRANT <role> TO <member>` row: a fresh OID
-// is minted the first time (RoleOID, MemberOID) is seen; re-granting keeps
-// the existing OID and only updates GrantorOID (to the new grantor) and
-// AdminOption (a plain re-grant never *downgrades* an existing WITH ADMIN
-// OPTION, mirroring AddRoleMems' ON CONFLICT DO UPDATE SET admin_option =
-// (admin_option OR EXCLUDED.admin_option), user.c). Returns the row's OID.
-// M0119-0004-ACLHEAP.
-func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, adminOption bool) uint32 {
+// GrantRoleMembership upserts a `GRANT <role> TO <member> [WITH { ADMIN |
+// INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]` row: a fresh OID is
+// minted the first time (RoleOID, MemberOID) is seen; re-granting keeps the
+// existing OID and always updates GrantorOID to the new grantor.
+//
+// admin/inherit/set are tri-state: nil means that option was not named in
+// this statement (PG's GRANT_ROLE_SPECIFIED_* bitmask unset, GrantRole in
+// user.c) — an existing row's value for that option is left untouched
+// (mirroring "a plain re-grant never downgrades an unmentioned option"), and
+// a fresh row falls back to InitGrantRoleOptions' defaults: admin=false,
+// set=true, inherit=the grantee's rolinherit (goopg has no per-role NOINHERIT
+// tracking — CREATE/ALTER ROLE never clears it — so every role's rolinherit
+// is always true, matching this default exactly). A non-nil pointer is the
+// explicit requested value and always applies, including to an existing row
+// (may legitimately downgrade e.g. admin_option, unlike an unspecified
+// option on a bare re-grant). Returns the row's OID. M0119-0004-ACLHEAP.
+func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) uint32 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid}
 	if existing, ok := c.roleMembers[key]; ok {
 		existing.GrantorOID = grantorOid
-		if adminOption {
-			existing.AdminOption = true
+		if admin != nil {
+			existing.AdminOption = *admin
+		}
+		if inherit != nil {
+			existing.InheritOption = *inherit
+		}
+		if set != nil {
+			existing.SetOption = *set
 		}
 		return existing.OID
 	}
 	oid := c.allocOIDLocked()
 	c.roleMembers[key] = &RoleMembership{
 		OID: oid, RoleOID: roleOid, MemberOID: memberOid,
-		GrantorOID: grantorOid, AdminOption: adminOption,
+		GrantorOID:    grantorOid,
+		AdminOption:   admin != nil && *admin,
+		InheritOption: inherit == nil || *inherit,
+		SetOption:     set == nil || *set,
 	}
 	return oid
 }
@@ -5551,12 +5571,10 @@ func (c *InMemory) registerSystemTables() {
 
 	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
 	// from the roleMembers registry GRANT/REVOKE ROLE maintains
-	// (RoleMembershipEntries). inherit_option/set_option are not modelled
-	// (goopg has no per-grant INHERIT/SET clause parsing) and always report
-	// PG's default (t/f) regardless of what a real GRANT ... WITH clause
-	// requested. Registered so pg_dumpall's dumpRoleMembership query
-	// resolves instead of failing with "relation does not exist"
-	// (M0119-0004-ACLHEAP follow-up).
+	// (RoleMembershipEntries), including the per-grant WITH INHERIT/SET
+	// option values a real GRANT requested (GrantRoleMembership). Registered
+	// so pg_dumpall's dumpRoleMembership query resolves instead of failing
+	// with "relation does not exist" (M0119-0004-ACLHEAP follow-up).
 	pgAuthMembers := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_auth_members",
@@ -5577,20 +5595,22 @@ func (c *InMemory) registerSystemTables() {
 		if len(entries) == 0 {
 			return nil
 		}
+		tf := func(b bool) string {
+			if b {
+				return "t"
+			}
+			return "f"
+		}
 		out := make([][]string, 0, len(entries))
 		for _, m := range entries {
-			adminOption := "f"
-			if m.AdminOption {
-				adminOption = "t"
-			}
 			out = append(out, []string{
 				strconv.FormatUint(uint64(m.OID), 10),
 				strconv.FormatUint(uint64(m.RoleOID), 10),
 				strconv.FormatUint(uint64(m.MemberOID), 10),
 				strconv.FormatUint(uint64(m.GrantorOID), 10),
-				adminOption,
-				"t", // inherit_option: PG default (INHERIT), not modelled per-grant
-				"f", // set_option: PG default (NOSET pre-PG16 semantics), not modelled
+				tf(m.AdminOption),
+				tf(m.InheritOption),
+				tf(m.SetOption),
 			})
 		}
 		return out

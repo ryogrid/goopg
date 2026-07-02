@@ -21,7 +21,7 @@ import (
 // roleMembershipRegistryRecovery is the catalog-side surface this recovery
 // pass needs. `*catalog.InMemory` satisfies it.
 type roleMembershipRegistryRecovery interface {
-	GrantRoleMembership(roleOid, memberOid, grantorOid uint32, adminOption bool) uint32
+	GrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) uint32
 	RevokeRoleMembership(roleOid, memberOid uint32, adminOptionOnly bool) bool
 }
 
@@ -58,11 +58,11 @@ func replayRoleMembershipRecords(walDir string, cat catalog.Catalog) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindGrantRoleMembership:
-			roleOid, memberOid, grantorOid, adminOption, derr := wal.DecodeGrantRoleMembership(rec.Payload)
+			roleOid, memberOid, grantorOid, admin, inherit, set, derr := wal.DecodeGrantRoleMembership(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode grant-role-membership at lsn %d: %w", rec.StartLSN, derr)
 			}
-			reg.GrantRoleMembership(roleOid, memberOid, grantorOid, adminOption)
+			reg.GrantRoleMembership(roleOid, memberOid, grantorOid, admin, inherit, set)
 		case wal.RecordKindRevokeRoleMembership:
 			roleOid, memberOid, adminOptionOnly, derr := wal.DecodeRevokeRoleMembership(rec.Payload)
 			if derr != nil {

@@ -73,8 +73,8 @@ func TestPort_PgDumpallRoleMembership(t *testing.T) {
 
 	want := []string{
 		"-- Role memberships",
-		`GRANT memadmin TO memalice WITH ADMIN OPTION, INHERIT TRUE, SET FALSE GRANTED BY postgres;`,
-		`GRANT memadmin TO membob WITH INHERIT TRUE, SET FALSE GRANTED BY postgres;`,
+		`GRANT memadmin TO memalice WITH ADMIN OPTION, INHERIT TRUE GRANTED BY postgres;`,
+		`GRANT memadmin TO membob WITH INHERIT TRUE GRANTED BY postgres;`,
 	}
 	for _, sub := range want {
 		if !strings.Contains(res.Stdout, sub) {

@@ -2217,11 +2217,22 @@ type RoleMembershipChange struct {
 	// AdminOptionOnly is REVOKE's `ADMIN OPTION FOR` prefix: only the
 	// admin_option flag is cleared, the membership row itself survives.
 	AdminOptionOnly bool
-	// WithAdminOption is GRANT's trailing `WITH ADMIN OPTION`.
+	// WithAdminOption is GRANT's trailing `WITH ADMIN OPTION` (kept for
+	// backward compatibility; equivalent to AdminOption != nil && *AdminOption).
 	WithAdminOption bool
-	Roles           []string // the role(s) being granted/revoked
-	Grantees        []string // the member role(s) receiving/losing membership
-	GrantedBy       string   // optional explicit grantor; "" = current session role
+	// AdminOption/InheritOption/SetOption are the tri-state values captured
+	// from GRANT's trailing `WITH { ADMIN | INHERIT | SET } { OPTION | TRUE
+	// | FALSE } [, ...]` list (grant_role_opt_list, gram.y). nil means the
+	// option was not named in this statement — PG's GRANT_ROLE_SPECIFIED_*
+	// bitmask unset (user.c) — so an existing pg_auth_members row's value is
+	// left untouched and a fresh row falls back to InitGrantRoleOptions'
+	// defaults. A non-nil pointer is the explicit requested value.
+	AdminOption   *bool
+	InheritOption *bool
+	SetOption     *bool
+	Roles         []string // the role(s) being granted/revoked
+	Grantees      []string // the member role(s) receiving/losing membership
+	GrantedBy     string   // optional explicit grantor; "" = current session role
 }
 
 // ColumnPrivilege pairs a single column-grantable privilege keyword with the
