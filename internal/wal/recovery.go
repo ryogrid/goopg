@@ -850,6 +850,18 @@ const (
 	//   kind(1) | nameLen(2) | name(nameLen bytes)
 	RecordKindDropAccessMethod byte = 71
 
+	// RecordKindAlterRoleRename records an `ALTER ROLE/USER <name> RENAME TO
+	// <newname>` event so the rename survives a restart. Like
+	// RecordKindRoleState, runtime role DDL never writes the pg_authid heap
+	// directly (only the periodic full-registry SyncPgAuthidFile rewrite
+	// does), so the physical replay path is a no-op; the recovery driver in
+	// internal/initdb/role_ddl_recovery.go re-keys the catalog role registry
+	// entry (preserving its OID) after physical replay. root-0021 follow-up
+	// (M0119-0004).
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterRoleRename byte = 72
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1180,6 +1192,57 @@ func DecodeDropRole(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-role payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeAlterRoleRename encodes a RecordKindAlterRoleRename record.
+func EncodeAlterRoleRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterRoleRename)
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	binary.LittleEndian.PutUint16(l[:], uint16(len(newName)))
+	buf.Write(l[:])
+	buf.WriteString(newName)
+	return buf.Bytes()
+}
+
+// DecodeAlterRoleRename decodes a RecordKindAlterRoleRename payload.
+func DecodeAlterRoleRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 3 {
+		return "", "", fmt.Errorf("wal: alter-role-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-role-rename", payload[0])
+	}
+	off := 1
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-role-rename payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-role-rename string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr16(); err != nil {
+		return "", "", err
+	}
+	if newName, err = readStr16(); err != nil {
+		return "", "", err
+	}
+	return name, newName, nil
 }
 
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
@@ -4977,9 +5040,9 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// and re-applies them to the sequence registry + the owning
 		// column's serial/identity catalog markers.
 		return false, nil
-	case RecordKindRoleState, RecordKindDropRole:
-		// Role state / removal records (CREATE/ALTER/DROP ROLE restart
-		// persistence) carry only the in-memory role registry state +
+	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
+		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE
+		// restart persistence) carry only the in-memory role registry state +
 		// credential; runtime role DDL never writes the pg_authid heap
 		// (initdb-only, like all on-disk shared catalogs), so the physical
 		// replay path has nothing to do. The recovery driver in

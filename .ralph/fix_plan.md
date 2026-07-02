@@ -5381,6 +5381,51 @@ documentation-only and is exempt from the design-doc requirement.)
       spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl. pgbench
       TPC-B smoke PASS. Nothing left open on this family.
 
+- [x] **`ALTER ROLE/USER … RENAME TO` restart persistence (root-0021
+      follow-up, M0119-0004, interactive session).** **COMPLETE 2026-07-02:**
+      closes the root-0021 ledger row's part (a) — RENAME TO previously fell
+      through to the legacy compat no-op (`roleNameFromAlter` returned
+      `hasAttrs=false`, so nothing was parsed, persisted, or even validated).
+      New `renameRole`/`roleRenameFromAlter` (`internal/server/role_ddl.go`)
+      intercept the RENAME TO form ahead of the attribute-form parse and
+      mirror PostgreSQL's `RenameRole` (`postgres/src/backend/commands/
+      user.c`) check order: role-exists (42704), reserved `pg_`-prefix on
+      the new name (42939), new-name-already-exists/`postgres` (42710).
+      Success re-keys three places together: the catalog role registry
+      (new `catalog.InMemory.RenameRole`, preserves the OID so
+      `pg_policy.polroles`/ownership references stay valid), `Server.roles`,
+      and the live `auth.MapUserStore` credential. New
+      `RecordKindAlterRoleRename` (kind 72, `internal/wal/recovery.go`) is
+      the WAL tail entry; `internal/initdb/role_ddl_recovery.go` replays it
+      after physical redo (a no-op, same as `RecordKindRoleState`/
+      `RecordKindDropRole` — role DDL never touches the pg_authid heap
+      directly at runtime, only the periodic full-registry
+      `SyncPgAuthidFile` rewrite does). Renaming the bootstrap superuser
+      (`postgres`) is rejected (`FeatureNotSupported`) since its name is
+      hardcoded in several places (RoleOID, initdb's pg_authid seeding) —
+      out of this slice's scope. Tests:
+      `internal/server/role_ddl_rename_test.go`
+      (`TestRoleRenameFromAlterParsing`/`TestAlterRoleRenameSuccess`/
+      `TestAlterRoleRenameErrors`/`TestCatalogRenameRolePreservesOID`) +
+      case (e) added to `TestPort_CreateRoleSurvivesRestart`
+      (`internal/testport/role_auth_durability_test.go`: rename survives a
+      real cluster restart, old name gone from `pg_roles`, attributes
+      carried to the new name). Gates: `go build ./...` clean; `go vet`
+      server/catalog/wal/initdb clean; targeted rename unit tests PASS;
+      `TestPort_CreateRoleSurvivesRestart` PASS (via
+      `scripts/goopg-test-run.sh`). Design doc updated:
+      `docs/design/root-0021-role-auth-persistence.md` "Follow-up: ALTER
+      ROLE/USER … RENAME TO restart persistence"; `docs/design/README.md`
+      row updated. Deferred (ledger row appended): `SET`/`RESET` forms
+      remain the legacy compat no-op (unrelated to rename, a distinct
+      GUC-storage problem); role membership/CREATEDB/REPLICATION/etc
+      attributes remain accept-and-ignore (unchanged); PG's
+      session/current-user-cannot-be-renamed guard and the
+      superuser-may-only-rename-superuser privilege check are not modelled
+      (this SQL-string-level handler has no per-connection session-role
+      context, same accept-and-ignore posture as every other role-DDL
+      privilege check here).
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

@@ -9944,6 +9944,33 @@ func (c *InMemory) UnregisterRole(name string) {
 	delete(c.roleAttrs, key)
 }
 
+// RenameRole re-keys a registered role's registry entry (the roles map and
+// its roleAttrs sidecar) from oldName to newName, preserving its OID and
+// attributes exactly like PostgreSQL's RenameRole (postgres/src/backend/
+// commands/user.c) — the role keeps the same pg_authid.oid, so existing
+// pg_policy.polroles/ownership references stay valid. Returns false when
+// oldName is unregistered (caller should raise "role does not exist");
+// callers are responsible for the pre-checks RenameRole itself doesn't
+// duplicate (new-name-already-exists, reserved "pg_" prefix). root-0021
+// follow-up (M0119-0004).
+func (c *InMemory) RenameRole(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldKey := strings.ToLower(oldName)
+	newKey := strings.ToLower(newName)
+	oid, ok := c.roles[oldKey]
+	if !ok {
+		return false
+	}
+	delete(c.roles, oldKey)
+	c.roles[newKey] = oid
+	if a, ok := c.roleAttrs[oldKey]; ok {
+		delete(c.roleAttrs, oldKey)
+		c.roleAttrs[newKey] = a
+	}
+	return true
+}
+
 // RoleOID returns the OID minted for a registered role, resolving the seeded
 // bootstrap superuser (`postgres`, OID 10 = BOOTSTRAP_SUPERUSERID) which is not
 // stored in the user-role map. The bool is false for an unknown role. Used by

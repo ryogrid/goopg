@@ -93,10 +93,45 @@ WordPress instance) are unaffected.
 
 ## Known bounds
 
-- `ALTER ROLE … RENAME TO` / `SET`/`RESET` forms keep the legacy compat
-  no-op path (hasAttrs=false in `roleNameFromAlter`).
+- `SET`/`RESET` forms keep the legacy compat no-op path (hasAttrs=false in
+  `roleNameFromAlter`). `RENAME TO` is now handled — see the follow-up below.
 - Membership (`GRANT role TO role`), `CREATEDB`/`REPLICATION`/`VALID UNTIL`
   attributes remain accept-and-ignore, as before.
 - The `pg_roles` virtual view reports real `rolsuper`/`rolcanlogin` for roles
   with recorded attributes; roles registered through other paths keep the
   historical `f`/`t` defaults.
+
+## Follow-up: `ALTER ROLE/USER … RENAME TO` restart persistence
+
+Closes the "Known bounds" RENAME TO gap above. `renameRole`
+(`internal/server/role_ddl.go`) intercepts `ALTER ROLE/USER <name> RENAME TO
+<newname>` ahead of the attribute-form parse (`roleRenameFromAlter`), mirrors
+PostgreSQL's `RenameRole` (`postgres/src/backend/commands/user.c`) checks —
+role-exists (42704), reserved `pg_`-prefix on the new name (42939),
+new-name-already-exists/`postgres` (42710) — then re-keys three places
+together: the catalog role registry (`catalog.InMemory.RenameRole`, new
+method beside `RegisterRole`/`UnregisterRole`, preserves the OID so
+`pg_policy.polroles`/ownership references stay valid), `Server.roles`, and
+the live `auth.MapUserStore` credential. A new `RecordKindAlterRoleRename`
+(kind 72, `internal/wal/recovery.go`) is the WAL tail entry, replayed by
+`internal/initdb/role_ddl_recovery.go` after physical redo (a no-op, same as
+`RecordKindRoleState`/`RecordKindDropRole` — role DDL never touches the
+pg_authid heap directly at runtime, only the periodic full-registry
+`SyncPgAuthidFile` rewrite does).
+
+Renaming the bootstrap superuser (`postgres`) is rejected
+(`FeatureNotSupported`, not persistence-related) — its name is hardcoded in
+several places (`RoleOID`, initdb's pg_authid seeding), a structural change
+out of scope here.
+
+Not modelled (unchanged deferral): PG's "session/current user cannot be
+renamed" guard needs per-connection session-role context this SQL-string-level
+handler doesn't have, and the superuser-may-only-rename-superuser privilege
+check is accept-and-ignore like every other role-DDL privilege check in this
+handler.
+
+Tests: `internal/server/role_ddl_rename_test.go` (parsing +
+`tryHandleRoleDDL` success/error paths, `catalog.InMemory.RenameRole` OID
+preservation) + case (e) added to `TestPort_CreateRoleSurvivesRestart`
+(`internal/testport/role_auth_durability_test.go`: rename survives a real
+cluster restart, old name gone, attributes carried to the new name).
