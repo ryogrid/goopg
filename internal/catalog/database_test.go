@@ -312,6 +312,36 @@ func TestResetRoleConfigRemovesOnlyNamedEntry(t *testing.T) {
 	}
 }
 
+// TestUnregisterRoleDropsRoleConfigRows verifies DROP ROLE also cascades
+// removal of any pg_db_role_setting (setrole != 0) rows keyed by the
+// dropped role's OID, in both the cluster-wide (dbOid=0) and IN-DATABASE
+// scopes — a pre-existing gap alongside the pg_auth_members sweep in
+// TestUnregisterRoleDropsMembershipRows (M0119-0004-ACLHEAP, GRANT/REVOKE
+// role membership follow-up, deferral ledger 2026-07-03 row (d)). A leaked
+// entry would keep haunting pg_dumpall --globals-only output for a role
+// name PG would consider fully gone.
+func TestUnregisterRoleDropsRoleConfigRows(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterRole("alice")
+	roleOid, _ := c.RoleOID("alice")
+	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
+	c.SetRoleConfig(roleOid, FirstUserOID, "search_path", "public")
+
+	c.UnregisterRole("alice")
+
+	if got := c.RoleConfigEntries(roleOid, 0); len(got) != 0 {
+		t.Errorf("cluster-wide RoleConfigEntries after UnregisterRole = %v, want empty", got)
+	}
+	if got := c.RoleConfigEntries(roleOid, FirstUserOID); len(got) != 0 {
+		t.Errorf("IN-DATABASE RoleConfigEntries after UnregisterRole = %v, want empty", got)
+	}
+	for _, row := range c.AllRoleConfigRows() {
+		if row.RoleOID == roleOid {
+			t.Errorf("AllRoleConfigRows still contains a row for the dropped role: %+v", row)
+		}
+	}
+}
+
 // TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides confirms
 // pg_db_role_setting also projects setrole != 0 rows (both the cluster-wide
 // dbOid=0 and IN-DATABASE FirstUserOID forms) alongside the pre-existing

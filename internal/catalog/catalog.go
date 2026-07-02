@@ -10559,6 +10559,11 @@ func (c *InMemory) UnregisterRole(name string) {
 			delete(c.roleMembers, mk)
 		}
 	}
+	for sk := range c.roleSettings {
+		if sk.RoleOID == oid {
+			delete(c.roleSettings, sk)
+		}
+	}
 }
 
 // RenameRole re-keys a registered role's registry entry (the roles map and

@@ -5730,6 +5730,27 @@ documentation-only and is exempt from the design-doc requirement.)
       unrelated to this slice); standing M0119-0004-ACLHEAP items
       (extended-protocol gap, multi-database scope) unchanged.
 
+- [x] **`UnregisterRole` purges `roleSettings` on DROP ROLE (M0119-0004-ACLHEAP
+      follow-up, loop #4).** **COMPLETE 2026-07-03:** closes the prior row's
+      own "`roleSettings`/`dbRoleSettings` not purged on DROP ROLE" residual
+      — the `roleSettings` half only; `dbRoleSettings` is keyed purely by
+      `DBOid` (setrole=0, `ALTER DATABASE ... SET`) with no per-role
+      dimension, so there was nothing there to purge. `internal/catalog/
+      catalog.go`'s `UnregisterRole` now also sweeps `c.roleSettings` for any
+      `roleSettingKey` whose `RoleOID` matches the dropped role's OID
+      (cluster-wide `dbOid=0` and IN-DATABASE `FirstUserOID` scopes both
+      swept, mirroring the pre-existing `roleMembers` sweep alongside it).
+      New test `TestUnregisterRoleDropsRoleConfigRows`
+      (`internal/catalog/database_test.go`). Gates: `go build ./...`/`go vet`
+      clean; `internal/catalog` suite PASS (incl. all `RoleConfig`/
+      `UnregisterRole` tests); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33); pgbench smoke = pre-commit hook. No design-doc-worthy new
+      subsystem (a one-function bugfix in an already-documented registry);
+      deferral ledger row appended. Still open: `WITH INHERIT`/`WITH SET`
+      clauses, grantor-chain circularity check, `GRANT ... ON PARAMETER`,
+      and the standing extended-protocol/multi-database-scope gaps — all
+      unchanged from the prior row.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
