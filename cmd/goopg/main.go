@@ -28,6 +28,7 @@ import (
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
@@ -579,31 +580,73 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.DataDir = rt.DataDir
 		logger.Info("opened data directory", "path", rt.DataDir, "shared_buffers_slots", poolSlots)
 	}
-	if *hbaPath != "" {
-		policy, err := auth.ParseHBAFile(*hbaPath)
+	// Resolve the HBA policy PostgreSQL-style: an explicit --hba wins, else
+	// the data directory's pg_hba.conf (which initdb writes and operators
+	// edit — upstream PG always reads it from the data directory, it has no
+	// --hba flag at all), else the built-in loopback-trust policy. Before
+	// root-0021 the datadir file was silently ignored without --hba, so
+	// operator edits (e.g. adding a scram-sha-256 rule) never took effect.
+	effectiveHBA := *hbaPath
+	if effectiveHBA == "" && *dataDir != "" {
+		candidate := filepath.Join(*dataDir, "pg_hba.conf")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			effectiveHBA = candidate
+		}
+	}
+	if effectiveHBA != "" {
+		policy, err := auth.ParseHBAFile(effectiveHBA)
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)
 			return 1
 		}
 		cfg.Policy = policy
-		logger.Info("loaded pg_hba.conf", "path", *hbaPath, "rules", len(policy.Rules))
+		logger.Info("loaded pg_hba.conf", "path", effectiveHBA, "rules", len(policy.Rules))
 	}
 
-	// Auto-load pg_auth from the data directory when it exists.
-	// pg_auth format: one "username:secret" per line; secret is
-	// plaintext, md5<hex>, or a SCRAM-SHA-256 verifier string.
+	// Credential store (root-0021): always a mutable MapUserStore so
+	// CREATE/ALTER ROLE ... PASSWORD can register credentials at runtime.
+	// Seeded in two layers:
+	//   1. Roles restored from the pg_authid heap + role WAL records by
+	//      initdb.Open (including the bootstrap superuser's --pwfile
+	//      verifier), so password/md5/scram logins keep working across a
+	//      restart without any hand-maintained file.
+	//   2. The optional hand-maintained pg_auth file (one "username:secret"
+	//      per line; plaintext, md5<hex>, or SCRAM-SHA-256 verifier) is
+	//      overlaid last, so an operator override always wins.
+	userStore := auth.NewMapUserStore()
+	if im, ok := cfg.Catalog.(*catalog.InMemory); ok && im != nil {
+		seedCred := func(name, secret string) {
+			if secret == "" {
+				return
+			}
+			if cred, err := auth.CredentialFromSecret(secret); err == nil {
+				userStore.Set(name, cred)
+			}
+		}
+		for _, rs := range im.AllRoleStates() {
+			seedCred(rs.Name, rs.Attrs.Secret)
+		}
+		if a, ok := im.LookupRoleAttrs("postgres"); ok {
+			seedCred("postgres", a.Secret)
+		}
+	}
 	if *dataDir != "" {
 		pgAuthPath := filepath.Join(*dataDir, "pg_auth")
 		if _, statErr := os.Stat(pgAuthPath); statErr == nil {
-			store, err := auth.LoadUsersFile(pgAuthPath)
+			fileStore, err := auth.LoadUsersFile(pgAuthPath)
 			if err != nil {
 				fmt.Fprintf(stderr, "goopg start: %v\n", err)
 				return 1
 			}
-			cfg.UserStore = store
+			for _, name := range fileStore.Users() {
+				if cred, ok := fileStore.Lookup(name); ok {
+					userStore.Set(name, cred)
+				}
+			}
 			logger.Info("loaded pg_auth", "path", pgAuthPath)
 		}
 	}
+	cfg.UserStore = userStore
 
 	// Honour the checkpoint_timeout GUC (milestone 0002). Default of
 	// 300s matches upstream; the prior hard-coded 10s was a

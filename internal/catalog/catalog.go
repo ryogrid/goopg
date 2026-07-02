@@ -2096,6 +2096,18 @@ type InMemory struct {
 	// per-role OID registry added DU-002 slice 330.
 	roles map[string]uint32
 
+	// roleAttrs is the attribute/credential sidecar for `roles`, keyed by the
+	// same lower-cased role name. Carries what pg_authid carries for a live
+	// PostgreSQL role: LOGIN/SUPERUSER flags and the stored password verifier
+	// (SCRAM-SHA-256 by default, mirroring rolpassword — upstream
+	// postgres/src/backend/libpq/crypt.c encrypt_password). Populated by the
+	// server-side CREATE/ALTER ROLE handler and by WAL replay
+	// (internal/initdb/role_ddl_recovery.go) so roles survive a restart;
+	// cmd/goopg seeds the auth UserStore from it after Open. Entries are
+	// optional — a role registered without attributes reads back zero-valued
+	// (no credential, LOGIN defaulting per registration path). root-0021.
+	roleAttrs map[string]*RoleAttrs
+
 	// tableACLs records per-relation privileges granted to non-owner roles, the
 	// minimal ACL store the *-conflict isolation specs need (currently only
 	// TRUNCATE — truncate-conflict, design 0118-0039). Keyed relOID →
@@ -2746,6 +2758,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:              make(map[string]uint32),
+		roleAttrs:          make(map[string]*RoleAttrs),
 		tempNamespaces:     make(map[string]uint32),
 		tableACLs:          make(map[uint32]map[string]map[string]bool),
 		tableACLOrder:      make(map[uint32][]string),
@@ -5052,9 +5065,19 @@ func (c *InMemory) registerSystemTables() {
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			// rolsuper 'f', rolcanlogin 't' — goopg models no role attributes;
-			// only rolname/oid feed the pg_dump policy-role resolution.
-			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, "f", "t"})
+			// Report the recorded attributes (root-0021); a role with no
+			// sidecar entry keeps the historical 'f'/'t' defaults so
+			// pre-existing pg_dump policy-role resolution is unchanged.
+			rolsuper, rolcanlogin := "f", "t"
+			if a := c.roleAttrs[name]; a != nil {
+				if a.Superuser {
+					rolsuper = "t"
+				}
+				if !a.CanLogin {
+					rolcanlogin = "f"
+				}
+			}
+			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, rolsuper, rolcanlogin})
 		}
 		c.mu.RUnlock()
 		return out
@@ -9811,11 +9834,94 @@ func (c *InMemory) RegisterRole(name string) {
 	c.nextOID++
 }
 
+// RoleAttrs carries a registered role's pg_authid-shaped attributes: the
+// LOGIN/SUPERUSER flags and the stored password credential. CredType matches
+// the RecordKindRoleState WAL encoding (0=none, 1=plaintext, 2=md5,
+// 3=scram-sha-256); Secret is the stored verifier in the same shape as
+// pg_authid.rolpassword (SCRAM-SHA-256$… by default). root-0021.
+type RoleAttrs struct {
+	CanLogin  bool
+	Superuser bool
+	CredType  byte
+	Secret    string
+}
+
+// RegisterRoleWithOID registers a role preserving a known OID — used by the
+// pg_authid heap loader and WAL replay so role OIDs stay stable across
+// restarts (pg_policy.polroles and the pg_authid heap reference them).
+// nextOID is bumped past the given OID so later mints never collide.
+func (c *InMemory) RegisterRoleWithOID(name string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	c.roles[key] = oid
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// SetRoleAttrs records (or replaces) the attribute/credential sidecar entry
+// for an already-registered role. A no-op for unregistered names so callers
+// can apply parse results unconditionally after RegisterRole. The bootstrap
+// superuser "postgres" is special-cased: it is never in the roles map (its
+// OID 10 is implicit) but its rolpassword verifier — written by initdb's
+// --pwfile handling into the pg_authid heap — must be recallable so the auth
+// UserStore can authenticate it after a restart. root-0021.
+func (c *InMemory) SetRoleAttrs(name string, attrs RoleAttrs) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := strings.ToLower(name)
+	if _, ok := c.roles[key]; !ok && key != "postgres" {
+		return
+	}
+	a := attrs
+	c.roleAttrs[key] = &a
+}
+
+// LookupRoleAttrs returns the attribute sidecar entry for a role. ok is false
+// when the role is unregistered or has no recorded attributes.
+func (c *InMemory) LookupRoleAttrs(name string) (RoleAttrs, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	a, ok := c.roleAttrs[strings.ToLower(name)]
+	if !ok || a == nil {
+		return RoleAttrs{}, false
+	}
+	return *a, true
+}
+
+// RoleStateSnapshot is one registered role's full registry state, returned by
+// AllRoleStates for WAL logging and UserStore seeding.
+type RoleStateSnapshot struct {
+	Name  string
+	OID   uint32
+	Attrs RoleAttrs
+}
+
+// AllRoleStates returns every user-registered role (the bootstrap superuser
+// `postgres` is not stored in the map) with its attributes, sorted by name.
+func (c *InMemory) AllRoleStates() []RoleStateSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]RoleStateSnapshot, 0, len(c.roles))
+	for name, oid := range c.roles {
+		s := RoleStateSnapshot{Name: name, OID: oid}
+		if a := c.roleAttrs[name]; a != nil {
+			s.Attrs = *a
+		}
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
 // UnregisterRole removes a role from the registry. Called from DROP ROLE.
 func (c *InMemory) UnregisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.roles, strings.ToLower(name))
+	key := strings.ToLower(name)
+	delete(c.roles, key)
+	delete(c.roleAttrs, key)
 }
 
 // RoleOID returns the OID minted for a registered role, resolving the seeded

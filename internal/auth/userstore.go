@@ -181,12 +181,56 @@ func (m *MapUserStore) Set(user string, c Credential) {
 	m.users[user] = c
 }
 
+// Remove deletes the credential for a user (DROP ROLE / password cleared).
+// A no-op for unknown users. root-0021.
+func (m *MapUserStore) Remove(user string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.users, user)
+}
+
+// CredentialFromSecret builds a Credential from a stored secret string,
+// dispatching on its shape exactly like pg_auth lines and PG's own
+// rolpassword parsing (postgres/src/backend/libpq/crypt.c get_password_type):
+// "SCRAM-SHA-256$…" is an upstream SCRAM verifier, "md5"+32-hex is a
+// pre-shadowed MD5 verifier, anything else is a plaintext password. Shared by
+// LoadUsersFile and the CREATE/ALTER ROLE credential path (root-0021).
+func CredentialFromSecret(secret string) (Credential, error) {
+	switch {
+	case strings.HasPrefix(secret, "SCRAM-SHA-256$"):
+		if _, err := ParseSCRAMSecret(secret); err != nil {
+			return Credential{}, fmt.Errorf("invalid SCRAM secret: %w", err)
+		}
+		return Credential{Type: PasswordSCRAMSHA256, Secret: secret}, nil
+	case strings.HasPrefix(secret, "md5") && len(secret) == 35:
+		c, err := ParseMD5Stored(secret)
+		if err != nil {
+			return Credential{}, fmt.Errorf("invalid MD5 secret: %w", err)
+		}
+		return c, nil
+	default:
+		return NewPlaintextCredential(secret), nil
+	}
+}
+
 // Lookup implements UserStore.
 func (m *MapUserStore) Lookup(user string) (Credential, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	c, ok := m.users[user]
 	return c, ok
+}
+
+// Users returns a snapshot of all usernames in the store. root-0021 (used to
+// overlay a pg_auth file onto the catalog-seeded store at startup).
+func (m *MapUserStore) Users() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]string, 0, len(m.users))
+	for name := range m.users {
+		out = append(out, name)
+	}
+	return out
 }
 
 // LoadUsersFile reads a pg_auth-style credential file and returns a
@@ -223,21 +267,9 @@ func LoadUsersFile(path string) (*MapUserStore, error) {
 		}
 		username := line[:idx]
 		secret := line[idx+1:]
-		var cred Credential
-		switch {
-		case strings.HasPrefix(secret, "SCRAM-SHA-256$"):
-			if _, err := ParseSCRAMSecret(secret); err != nil {
-				return nil, fmt.Errorf("pg_auth line %d: invalid SCRAM secret: %w", lineNo, err)
-			}
-			cred = Credential{Type: PasswordSCRAMSHA256, Secret: secret}
-		case strings.HasPrefix(secret, "md5") && len(secret) == 35:
-			if c, err := ParseMD5Stored(secret); err != nil {
-				return nil, fmt.Errorf("pg_auth line %d: invalid MD5 secret: %w", lineNo, err)
-			} else {
-				cred = c
-			}
-		default:
-			cred = NewPlaintextCredential(secret)
+		cred, err := CredentialFromSecret(secret)
+		if err != nil {
+			return nil, fmt.Errorf("pg_auth line %d: %w", lineNo, err)
 		}
 		store.Set(username, cred)
 	}

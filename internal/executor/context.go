@@ -352,6 +352,15 @@ type Context struct {
 	// cluster). M0106-0010 batched-31.
 	DataDir string
 
+	// OnRoleDropped, when non-nil, notifies the server layer that DROP
+	// ROLE/USER/GROUP removed a role, so the connection-time role set and
+	// the auth UserStore stay in sync with the catalog registry. DROP ROLE
+	// parses as a generic DropStmt and lands in execDropCompat's role arm —
+	// unlike CREATE/ALTER ROLE, which only the server-side intercept sees —
+	// so without this hook the two role-DDL paths silently diverge
+	// (root-0021; the recurring sibling-path trap). Set by dispatch.
+	OnRoleDropped func(name string)
+
 	// LogCanonical, when non-nil, emits a PG-canonical WAL record (XLOG_HEAP_INSERT,
 	// XLOG_BTREE_INSERT_LEAF, …) so a vanilla PG18 standby can replay catalog DDL
 	// mutations. Set only when the WAL writer is in PageHeaders mode (PG-compat WAL);

@@ -785,6 +785,32 @@ const (
 	// not resurrect it. Format: kind(1) | nameLen(2) | name.
 	RecordKindDropSequence byte = 66
 
+	// RecordKindRoleState records the FULL state of one role (name +
+	// attribute flags + password verifier) so CREATE/ALTER ROLE survive a
+	// restart, like PostgreSQL's pg_authid (which goopg only bootstraps at
+	// initdb — runtime role DDL was in-memory-only before this record).
+	// Passwords are stored as verifiers, never plaintext-by-default: the
+	// server-side handler turns `PASSWORD 'x'` into an upstream-format
+	// SCRAM-SHA-256 verifier (auth.NewSCRAMSecret, mirroring PG's
+	// encrypt_password in postgres/src/backend/libpq/crypt.c) before the
+	// record is emitted, so the WAL carries the same secret shape as
+	// pg_authid.rolpassword. Emitted on CREATE ROLE/USER/GROUP and ALTER
+	// ROLE/USER; replay is last-record-wins so both share this one kind.
+	// The WAL records are the crash-recovery TAIL only: the durable base
+	// store is the pg_authid heap file (global/1260), rewritten atomically
+	// on every role DDL (initdb.SyncPgAuthidFile) exactly like PostgreSQL's
+	// pg_authid heap is the durable store and its WAL records the tail.
+	// Startup loads the heap first, then replays these records on top.
+	// Format:
+	//   kind(1) | flags(1: bit0=canLogin bit1=superuser) | credType(1:
+	//   0=none 1=plaintext 2=md5 3=scram-sha-256) | oid(4) |
+	//   nameLen(2)+name | secretLen(2)+secret
+	RecordKindRoleState byte = 67
+
+	// RecordKindDropRole records a role removal (DROP ROLE/USER/GROUP) so
+	// replay does not resurrect it. Format: kind(1) | nameLen(2) | name.
+	RecordKindDropRole byte = 68
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1007,6 +1033,114 @@ func DecodeSequenceState(payload []byte) (SequenceStatePayload, error) {
 		return p, err
 	}
 	return p, nil
+}
+
+// RoleStatePayload is the decoded form of a RecordKindRoleState record: one
+// role's name, OID, attribute flags, and stored credential. See the
+// RecordKindRoleState constant for the on-disk format and emit policy.
+type RoleStatePayload struct {
+	Name      string
+	OID       uint32 // registry OID — kept stable across restarts
+	CanLogin  bool
+	Superuser bool
+	CredType  byte   // 0=none, 1=plaintext, 2=md5, 3=scram-sha-256
+	Secret    string // stored verifier (or plaintext for CredType 1)
+}
+
+// EncodeRoleState encodes a RecordKindRoleState record.
+func EncodeRoleState(p RoleStatePayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindRoleState)
+	var flags byte
+	if p.CanLogin {
+		flags |= 1 << 0
+	}
+	if p.Superuser {
+		flags |= 1 << 1
+	}
+	buf.WriteByte(flags)
+	buf.WriteByte(p.CredType)
+	var oid [4]byte
+	binary.LittleEndian.PutUint32(oid[:], p.OID)
+	buf.Write(oid[:])
+	writeStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeStr16(p.Name)
+	writeStr16(p.Secret)
+	return buf.Bytes()
+}
+
+// DecodeRoleState decodes a RecordKindRoleState payload.
+func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
+	var p RoleStatePayload
+	if len(payload) < 7 {
+		return p, fmt.Errorf("wal: role-state payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRoleState {
+		return p, fmt.Errorf("wal: record kind %d is not role-state", payload[0])
+	}
+	flags := payload[1]
+	p.CanLogin = flags&(1<<0) != 0
+	p.Superuser = flags&(1<<1) != 0
+	p.CredType = payload[2]
+	p.OID = binary.LittleEndian.Uint32(payload[3:7])
+	off := 7
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: role-state payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: role-state string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	var err error
+	if p.Name, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.Secret, err = readStr16(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// EncodeDropRole encodes a RecordKindDropRole record.
+// Format identical to EncodeDropDatabase: kind(1) | nameLen(2) | name.
+func EncodeDropRole(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropRole
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropRole decodes a RecordKindDropRole payload.
+func DecodeDropRole(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-role payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropRole {
+		return "", fmt.Errorf("wal: record kind %d is not drop-role", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-role payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
 }
 
 // EncodeDropSequence encodes a RecordKindDropSequence record.
@@ -4652,6 +4786,16 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// records after physical replay (and after loadUserTablesFromHeap)
 		// and re-applies them to the sequence registry + the owning
 		// column's serial/identity catalog markers.
+		return false, nil
+	case RecordKindRoleState, RecordKindDropRole:
+		// Role state / removal records (CREATE/ALTER/DROP ROLE restart
+		// persistence) carry only the in-memory role registry state +
+		// credential; runtime role DDL never writes the pg_authid heap
+		// (initdb-only, like all on-disk shared catalogs), so the physical
+		// replay path has nothing to do. The recovery driver in
+		// internal/initdb/role_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the catalog
+		// role registry; cmd/goopg seeds the auth UserStore from it.
 		return false, nil
 	case RecordKindCreateConversion, RecordKindDropConversion:
 		// CREATE/DROP CONVERSION records (DU-002 restart-persistence

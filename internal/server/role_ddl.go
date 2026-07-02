@@ -1,22 +1,42 @@
 package server
 
-// role_ddl.go — in-process CREATE ROLE / DROP ROLE handler (M0095-0006).
+// role_ddl.go — in-process CREATE/ALTER/DROP ROLE handler (M0095-0006;
+// restart persistence + credentials root-0021).
 //
 // goopg's parser does not yet include a full CREATE/DROP ROLE grammar, so
 // these statements reach the wire layer as parse failures. tryHandleRoleDDL
 // intercepts them before the generic compatNoopCommandTag path so that:
-//   - CREATE ROLE / CREATE USER: registers the role name in the server's
-//     in-memory role set (Server.roles) and returns success.
-//   - DROP ROLE / DROP USER: checks the role set; returns an error if the
-//     role does not exist and IF EXISTS was not specified.
+//   - CREATE ROLE / CREATE USER / CREATE GROUP: registers the role in the
+//     server's in-memory role set (Server.roles) and the catalog role
+//     registry, parses the attribute list (PASSWORD, LOGIN/NOLOGIN,
+//     SUPERUSER/NOSUPERUSER), and mirrors the credential into the live auth
+//     UserStore so password/md5/scram logins authenticate immediately.
+//   - ALTER ROLE / ALTER USER (attribute form): applies the same attribute
+//     parsing to an existing role.
+//   - DROP ROLE / DROP USER / DROP GROUP: unregisters everywhere.
 //
-// Role state is in-memory only for v0; it does not survive a server restart
-// and is not written to the pg_auth file.
+// Persistence mirrors PostgreSQL's pg_authid model (base store + WAL tail):
+// each mutation (a) appends a RecordKindRoleState/DropRole WAL record — the
+// crash-recovery tail — and (b) rebuilds the pg_authid heap file
+// (global/1260) via initdb.SyncPgAuthidFile — the durable base that survives
+// checkpoint-driven WAL segment pruning. Startup loads the heap base first
+// (LoadRolesFromAuthidHeap), then replays newer WAL records on top.
+//
+// Passwords are never persisted in cleartext: `PASSWORD 'x'` becomes an
+// upstream-format SCRAM-SHA-256 verifier (auth.NewSCRAMSecret — the same
+// generator initdb uses for the bootstrap superuser's rolpassword),
+// mirroring PG's encrypt_password (postgres/src/backend/libpq/crypt.c) under
+// the default password_encryption = 'scram-sha-256'. A pre-computed
+// SCRAM-SHA-256$… or md5<hex> secret is stored verbatim, exactly like PG.
 
 import (
 	"strings"
 
+	"github.com/goopg/goopg/internal/auth"
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/sqlstate"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // tryHandleRoleDDL returns (handled, err).
@@ -32,10 +52,60 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 		if name == "" {
 			return false, nil // malformed; let caller handle
 		}
+		// PG defaults: CREATE USER implies LOGIN; CREATE ROLE/GROUP imply
+		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
+		// Explicit LOGIN/NOLOGIN below overrides.
+		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user ")}
+		applyRoleAttrOptions(sql, norm, &attrs)
 		s.registerRole(name)
 		// Also register in catalog so executor-level DROP ROLE IF EXISTS can check.
 		if s.cfg.Catalog != nil {
 			s.cfg.Catalog.RegisterRole(name)
+			if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+				im.SetRoleAttrs(name, attrs)
+			}
+		}
+		s.applyRoleCredential(name, attrs)
+		if err := s.persistRoleState(name, attrs); err != nil {
+			// Roll back the registrations so memory and disk agree
+			// (mirrors tryHandleDatabaseDDL's rollback-on-append-failure).
+			_ = s.unregisterRole(name, true)
+			if s.cfg.Catalog != nil {
+				s.cfg.Catalog.UnregisterRole(name)
+			}
+			s.removeRoleCredential(name)
+			return true, err
+		}
+		return true, nil
+
+	case strings.HasPrefix(norm, "alter role "), strings.HasPrefix(norm, "alter user "):
+		name, hasAttrs := roleNameFromAlter(norm)
+		if name == "" || !hasAttrs {
+			// Not the attribute form (e.g. RENAME TO / SET guc) — leave it to
+			// the pre-existing compat no-op path.
+			return false, nil
+		}
+		isBootstrap := strings.EqualFold(name, "postgres")
+		if !s.roleExists(name) && !isBootstrap {
+			return true, roleDoesNotExistErr(name)
+		}
+		// Start from the recorded attributes so an ALTER only changes what it
+		// names (PG semantics: unspecified attributes keep their value). The
+		// bootstrap superuser defaults to superuser+login.
+		attrs := catalog.RoleAttrs{CanLogin: isBootstrap, Superuser: isBootstrap}
+		im, isInMem := s.cfg.Catalog.(*catalog.InMemory)
+		if isInMem {
+			if cur, found := im.LookupRoleAttrs(name); found {
+				attrs = cur
+			}
+		}
+		applyRoleAttrOptions(sql, norm, &attrs)
+		if isInMem {
+			im.SetRoleAttrs(name, attrs)
+		}
+		s.applyRoleCredential(name, attrs)
+		if err := s.persistRoleState(name, attrs); err != nil {
+			return true, err
 		}
 		return true, nil
 
@@ -52,10 +122,223 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 		if s.cfg.Catalog != nil {
 			s.cfg.Catalog.UnregisterRole(name)
 		}
+		s.removeRoleCredential(name)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeDropRole(strings.ToLower(name))); werr != nil {
+				return true, werr
+			}
+		}
+		s.syncAuthidHeap()
 		return true, nil
 	}
 	return false, nil
 }
+
+// persistRoleState makes a role mutation durable: WAL record (crash tail) +
+// pg_authid heap rewrite (durable base). See the file header for the model.
+func (s *Server) persistRoleState(name string, attrs catalog.RoleAttrs) error {
+	if s.cfg.WAL != nil {
+		var oid uint32
+		if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+			oid, _ = im.RoleOID(name)
+		}
+		if _, _, werr := s.cfg.WAL.Append(wal.EncodeRoleState(wal.RoleStatePayload{
+			Name:      strings.ToLower(name),
+			OID:       oid,
+			CanLogin:  attrs.CanLogin,
+			Superuser: attrs.Superuser,
+			CredType:  attrs.CredType,
+			Secret:    attrs.Secret,
+		})); werr != nil {
+			return werr
+		}
+	}
+	s.syncAuthidHeap()
+	return nil
+}
+
+// syncAuthidHeap rebuilds the pg_authid heap file from the catalog role
+// registry. Best-effort: a failure is logged but does not fail the DDL —
+// the WAL record already carries the state until the next successful sync.
+func (s *Server) syncAuthidHeap() {
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok || s.cfg.DataDir == "" {
+		return
+	}
+	if err := executor.SyncPgAuthidFile(s.cfg.DataDir, im); err != nil && s.cfg.Logger != nil {
+		s.cfg.Logger.Warn("pg_authid heap sync failed", "err", err)
+	}
+}
+
+// applyRoleAttrOptions scans the option list of a CREATE/ALTER ROLE statement
+// and folds the recognised attributes into attrs. norm is the lower-cased
+// normalised statement (keyword matching); sql is the ORIGINAL statement —
+// the password literal must be taken from it because normalizeCompatSQL
+// lower-cases the whole line and would corrupt a case-sensitive password.
+// Unrecognised options (CREATEDB, REPLICATION, VALID UNTIL, ...) are ignored,
+// matching the handler's historical accept-and-ignore behaviour.
+func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs) {
+	if strings.Contains(norm, " nosuperuser") {
+		attrs.Superuser = false
+	} else if strings.Contains(norm, " superuser") {
+		attrs.Superuser = true
+	}
+	if strings.Contains(norm, " nologin") {
+		attrs.CanLogin = false
+	} else if strings.Contains(norm, " login") {
+		attrs.CanLogin = true
+	}
+	if pw, kind, ok := extractRolePassword(sql, norm); ok {
+		switch kind {
+		case rolePasswordNull:
+			attrs.CredType = 0
+			attrs.Secret = ""
+		case rolePasswordSCRAM:
+			attrs.CredType = 3
+			attrs.Secret = pw
+		case rolePasswordMD5:
+			attrs.CredType = 2
+			attrs.Secret = pw
+		default: // plaintext — shadow into a SCRAM verifier like PG's
+			// encrypt_password under password_encryption='scram-sha-256'.
+			sec, err := auth.NewSCRAMSecret(pw)
+			if err != nil {
+				return
+			}
+			attrs.CredType = 3
+			attrs.Secret = sec.String()
+		}
+	}
+}
+
+type rolePasswordKind int
+
+const (
+	rolePasswordPlain rolePasswordKind = iota
+	rolePasswordNull
+	rolePasswordMD5
+	rolePasswordSCRAM
+)
+
+// extractRolePassword finds `[ENCRYPTED] PASSWORD 'secret'` (or PASSWORD
+// NULL) in a CREATE/ALTER ROLE statement. The keyword is located on the
+// normalised string; the literal's bytes are read from the ORIGINAL sql
+// (case-preserved), handling doubled-single-quote escapes.
+func extractRolePassword(sql, norm string) (secret string, kind rolePasswordKind, ok bool) {
+	idx := strings.Index(norm, " password ")
+	if idx < 0 {
+		return "", 0, false
+	}
+	rest := strings.TrimSpace(norm[idx+len(" password "):])
+	if rest == "null" || strings.HasPrefix(rest, "null ") || strings.HasPrefix(rest, "null;") {
+		return "", rolePasswordNull, true
+	}
+	if !strings.HasPrefix(rest, "'") {
+		return "", 0, false
+	}
+	// Locate the literal in the ORIGINAL sql: the first quote after the
+	// (case-insensitive) password keyword.
+	lowSQL := strings.ToLower(sql)
+	kw := strings.Index(lowSQL, "password")
+	if kw < 0 {
+		return "", 0, false
+	}
+	open := strings.Index(sql[kw:], "'")
+	if open < 0 {
+		return "", 0, false
+	}
+	start := kw + open + 1
+	// SQL single-quote escaping: '' inside the literal is a literal quote.
+	var b strings.Builder
+	i := start
+	for i < len(sql) {
+		if sql[i] == '\'' {
+			if i+1 < len(sql) && sql[i+1] == '\'' {
+				b.WriteByte('\'')
+				i += 2
+				continue
+			}
+			break
+		}
+		b.WriteByte(sql[i])
+		i++
+	}
+	secret = b.String()
+	switch {
+	case strings.HasPrefix(secret, "SCRAM-SHA-256$"):
+		return secret, rolePasswordSCRAM, true
+	case len(secret) == 35 && strings.HasPrefix(secret, "md5"):
+		return secret, rolePasswordMD5, true
+	}
+	return secret, rolePasswordPlain, true
+}
+
+// applyRoleCredential mirrors the role's credential into the live auth
+// UserStore so password/md5/scram logins authenticate immediately (the
+// exchange in internal/auth consults cfg.UserStore). No-ops when the store
+// is absent or not the mutable map implementation.
+func (s *Server) applyRoleCredential(name string, attrs catalog.RoleAttrs) {
+	store, ok := s.cfg.UserStore.(*auth.MapUserStore)
+	if !ok || store == nil {
+		return
+	}
+	if attrs.CredType == 0 || attrs.Secret == "" {
+		store.Remove(strings.ToLower(name))
+		return
+	}
+	if cred, err := auth.CredentialFromSecret(attrs.Secret); err == nil {
+		store.Set(strings.ToLower(name), cred)
+	}
+}
+
+// removeRoleCredential drops the role's credential from the live UserStore.
+func (s *Server) removeRoleCredential(name string) {
+	if store, ok := s.cfg.UserStore.(*auth.MapUserStore); ok && store != nil {
+		store.Remove(strings.ToLower(name))
+	}
+}
+
+// roleNameFromAlter extracts the role name from a normalised ALTER ROLE/USER
+// statement and reports whether the statement is the attribute form this
+// handler owns (PASSWORD/LOGIN/SUPERUSER/...). RENAME TO / SET / RESET / IN
+// DATABASE forms return hasAttrs=false so the legacy compat no-op keeps
+// handling them.
+func roleNameFromAlter(norm string) (name string, hasAttrs bool) {
+	var rest string
+	switch {
+	case strings.HasPrefix(norm, "alter role "):
+		rest = strings.TrimSpace(norm[len("alter role "):])
+	case strings.HasPrefix(norm, "alter user "):
+		rest = strings.TrimSpace(norm[len("alter user "):])
+	default:
+		return "", false
+	}
+	name = extractFirstSQLIdent(norm, rest)
+	if name == "" {
+		return "", false
+	}
+	pos := strings.Index(rest, name)
+	if pos < 0 {
+		return "", false
+	}
+	opts := strings.TrimSpace(rest[pos+len(name):])
+	if opts == "" || strings.HasPrefix(opts, "rename ") ||
+		strings.HasPrefix(opts, "set ") || strings.HasPrefix(opts, "reset ") ||
+		strings.HasPrefix(opts, "in database ") {
+		return name, false
+	}
+	return name, true
+}
+
+// roleDoesNotExistErr builds PG's 42704-shaped role error text (the
+// "does not exist" phrasing routes through roleErrorSQLState below).
+func roleDoesNotExistErr(name string) error {
+	return &roleError{msg: "role \"" + name + "\" does not exist"}
+}
+
+type roleError struct{ msg string }
+
+func (e *roleError) Error() string { return e.msg }
 
 // roleNameFromCreate extracts the role name from a normalised CREATE ROLE/USER statement.
 // The input is already lower-cased and trimmed.

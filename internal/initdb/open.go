@@ -1098,6 +1098,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: sequence DDL replay: %w", err)
 	}
 
+	// Role/auth restart persistence (root-0021): load the durable BASE from
+	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
+	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
+	// then replay any newer role WAL records ON TOP (the crash tail).
+	if err := LoadRolesFromAuthidHeap(abs, cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: pg_authid load: %w", err)
+	}
+	if err := replayRoleDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: role DDL replay: %w", err)
+	}
+
 	// M0106-0013: stamp the clog from WAL commit/abort records and advance
 	// txnMgr.NextXID past any XIDs recorded in WAL but not yet in the
 	// SLRU/flat-file (the narrow window between WAL fsync and clog writes).

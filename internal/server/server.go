@@ -350,6 +350,14 @@ func New(cfg Config) *Server {
 		notify:        newNotifyHub(),
 		preparedXacts: newPreparedXactStore(),
 	}
+	// Seed the connection-time role set from the catalog role registry, which
+	// initdb.Open restored from the pg_authid heap + role WAL records
+	// (root-0021) — so roles created before a restart keep authenticating.
+	if im, ok := cfg.Catalog.(*catalog.InMemory); ok && im != nil {
+		for _, rs := range im.AllRoleStates() {
+			s.roles[rs.Name] = struct{}{}
+		}
+	}
 	s.nextPID.Store(0)
 	// Initialize plan cache when storage handles are present (M0098-0005).
 	if cfg.hasStorage() {

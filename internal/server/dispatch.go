@@ -156,9 +156,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			norm := normalizeCompatSQL(sql)
 			var tag string
-			if strings.HasPrefix(norm, "create ") {
+			switch {
+			case strings.HasPrefix(norm, "create "):
 				tag = "CREATE ROLE"
-			} else {
+			case strings.HasPrefix(norm, "alter "):
+				tag = "ALTER ROLE"
+			default:
 				tag = "DROP ROLE"
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -414,6 +417,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
 	ectx.DataDir = s.cfg.DataDir
+	// Keep the connection-time role set + auth UserStore in sync when the
+	// executor's execDropCompat role arm drops a role (DROP ROLE parses as a
+	// generic DropStmt, bypassing tryHandleRoleDDL). root-0021.
+	ectx.OnRoleDropped = func(name string) {
+		_ = s.unregisterRole(name, true)
+		s.removeRoleCredential(name)
+	}
 	ectx.Promote = s.cfg.Promote
 	if s.cfg.IsStandby != nil {
 		ectx.IsStandby = s.cfg.IsStandby()
