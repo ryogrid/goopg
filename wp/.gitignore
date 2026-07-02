@@ -1,0 +1,14 @@
+# Generated / fetched artifacts — not checked in.
+# (gitignore does not support trailing comments; keep patterns on their own lines)
+
+# goopg data directory for the WordPress instance
+goopg-data/
+# third-party PG4WP connector, fetched by setup.sh
+pg4wp/
+# goopg server log for this instance
+goopg-wp.log
+*.log
+# generated admin password (credentials)
+.wp-admin-password
+# generated: host IP for container->goopg access (machine-specific)
+.env
