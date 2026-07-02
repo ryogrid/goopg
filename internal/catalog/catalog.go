@@ -5305,7 +5305,7 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 2},
 			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 3},
 		},
-		OID:     1260, // upstream's AuthIdRelationId
+		OID:     1259102, // synthetic — upstream's pg_roles is a view, no fixed low OID (1260 is pg_authid's, see below)
 		Virtual: true,
 	}
 	pgRoles.VirtualRows = func() [][]string {
@@ -5342,6 +5342,125 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
+
+	// pg_authid — the real, superuser-only role catalog pg_roles is a view
+	// over. pg_dumpall's dumpRoles/dumpUserConfig query it directly (not
+	// pg_roles) for the full attribute set + rolpassword (M0119-0004-ACLHEAP
+	// follow-up: pg_dumpall was failing outright with "relation \"pg_authid\"
+	// does not exist" before this — pg_roles alone never covered it). Sourced
+	// from the same live c.roles/c.roleAttrs state as pg_roles, not the
+	// on-disk global/1260 heap file: that file (pg_authid_sync.go) is a
+	// separate crash-recovery mirror for auth credentials, not a live SQL
+	// read path. Attributes goopg's role DDL never actually sets
+	// (rolinherit/rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
+	// rolconnlimit/rolvaliduntil) report PG's CREATE ROLE defaults, since
+	// nothing can diverge them from those defaults today (see deferral
+	// ledger).
+	pgAuthid := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_authid",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "rolsuper", Type: Type{Name: "bool"}, Ordinal: 2},
+			{Name: "rolinherit", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "rolcreaterole", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "rolcreatedb", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "rolcanlogin", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "rolreplication", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "rolbypassrls", Type: Type{Name: "bool"}, Ordinal: 8},
+			{Name: "rolconnlimit", Type: Type{Name: "int4"}, Ordinal: 9},
+			{Name: "rolpassword", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "rolvaliduntil", Type: Type{Name: "timestamptz"}, Ordinal: 11},
+		},
+		OID:     1260, // upstream's AuthIdRelationId
+		Virtual: true,
+	}
+	pgAuthid.VirtualRows = func() [][]string {
+		rowFor := func(oidStr, name string, a *RoleAttrs) []string {
+			rolsuper, rolcanlogin := "f", "t"
+			rolpassword := VirtualNull
+			if a != nil {
+				if a.Superuser {
+					rolsuper = "t"
+				}
+				if !a.CanLogin {
+					rolcanlogin = "f"
+				}
+				if a.CredType != 0 {
+					rolpassword = a.Secret
+				}
+			}
+			return []string{
+				oidStr, name, rolsuper,
+				"t", // rolinherit: PG default, never overridden by goopg's role DDL
+				"f", // rolcreaterole: not modelled
+				"f", // rolcreatedb: not modelled
+				rolcanlogin,
+				"f", // rolreplication: not modelled
+				"f", // rolbypassrls: not modelled
+				"-1", // rolconnlimit: PG default (no limit), not modelled
+				rolpassword,
+				VirtualNull, // rolvaliduntil: not modelled
+			}
+		}
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		out := [][]string{rowFor("10", "postgres", c.roleAttrs["postgres"])}
+		names := make([]string, 0, len(c.roles))
+		for name := range c.roles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			out = append(out, rowFor(fmt.Sprintf("%d", c.roles[name]), name, c.roleAttrs[name]))
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_authid"] = pgAuthid
+
+	// pg_auth_members — role membership (`GRANT <role> TO <role>`).
+	// Correctly-empty: goopg's parser/executor has no `GRANT role TO role`
+	// support at all yet (a distinct capability from privilege GRANT — see
+	// deferral ledger), so no membership row can ever exist today. Registered
+	// so pg_dumpall's dumpRoleMembership query resolves instead of failing
+	// with "relation does not exist" (M0119-0004-ACLHEAP follow-up).
+	pgAuthMembers := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_auth_members",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "roleid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "member", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "grantor", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "admin_option", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "inherit_option", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "set_option", Type: Type{Name: "bool"}, Ordinal: 6},
+		},
+		OID:     1261, // upstream's AuthMemRelationId
+		Virtual: true,
+	}
+	pgAuthMembers.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_auth_members"] = pgAuthMembers
+
+	// pg_parameter_acl — GUC-level ACLs (`GRANT SET ON PARAMETER ...`).
+	// Correctly-empty: goopg has no parameter-ACL GRANT support (a distinct
+	// capability from object-level GRANT — see deferral ledger). Registered
+	// so pg_dumpall's getParameterACLs query resolves instead of failing with
+	// "relation does not exist" (M0119-0004-ACLHEAP follow-up).
+	pgParameterACL := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_parameter_acl",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "parname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "paracl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
+		},
+		OID:     6243, // upstream's ParameterAclRelationId
+		Virtual: true,
+	}
+	pgParameterACL.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
 
 	// pg_tables — HammerDB probes
 	// `SELECT 1 FROM pg_tables WHERE schemaname = 'public'` to

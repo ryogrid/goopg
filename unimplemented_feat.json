@@ -1,0 +1,3658 @@
+{
+ "generated_at": "2026-07-02",
+ "source": "commit-log.json (2597 commits, 2026-04-28..2026-07-01)",
+ "method": "python prefilter + haiku vocabulary discovery + regex candidate windows + haiku batch extraction + ledger/fix_plan/timeline resolution check + haiku adjudication + later-title/code-grep re-verification + per-item agent code audit (haiku, grep+read)",
+ "counts": {
+  "raw_extracted": 1023,
+  "merged": 893,
+  "dropped_as_resolved": 711,
+  "unimplemented": 181
+ },
+ "unimplemented_features": [
+  {
+   "feature": "Optimize WAL logical change record storage to reduce write-ahead log volume growth during database initialization.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Logical change records to restore the optimisation are deferred to a post-M0002 milestone"
+   ],
+   "first_deferred_commit": "7079f0dd0d098d211f202858469e0cde44c27236",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "7079f0dd0d098d211f202858469e0cde44c27236"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No WAL logical change record optimization found in codebase"
+  },
+  {
+   "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "v0 server-side handler is a no-op until per-GUC SIGHUP-style refresh wires up"
+   ],
+   "first_deferred_commit": "0a33037ed48a55f03e21431bb45290b579548dcc",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "0a33037ed48a55f03e21431bb45290b579548dcc"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: cmd/goopg/main.go:1171 reload command prints configuration reload no-op"
+  },
+  {
+   "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "restart: documented stub since v0 runs in the foreground"
+   ],
+   "first_deferred_commit": "0a33037ed48a55f03e21431bb45290b579548dcc",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "0a33037ed48a55f03e21431bb45290b579548dcc"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: cmd/goopg/main.go:1138 explicit not yet implemented message"
+  },
+  {
+   "feature": "Implement tablespace support for directing table and index storage to different physical locations.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "v0 deliberately defers — tablespaces"
+   ],
+   "first_deferred_commit": "701bff256ed6d1e76e9427315d8b0a85dc1109ca",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "701bff256ed6d1e76e9427315d8b0a85dc1109ca"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:280 rejects external tablespaces as unsupported"
+  },
+  {
+   "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "v0 deliberately defers — multi-database"
+   ],
+   "first_deferred_commit": "701bff256ed6d1e76e9427315d8b0a85dc1109ca",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "701bff256ed6d1e76e9427315d8b0a85dc1109ca"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl_database_acl.go:48 single-database only"
+  },
+  {
+   "feature": "ANY/SOME/ALL quantified subqueries",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Correlated subqueries / initplan caching / ANY-SOME-ALL stay documented as deferred"
+   ],
+   "first_deferred_commit": "d9ded322a4dbe4b0a3ad44634f1efa7818344278",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "d9ded322a4dbe4b0a3ad44634f1efa7818344278"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Only ANY with arrays found (expr.go:5146), no quantified subquery ANY/SOME/ALL support"
+  },
+  {
+   "feature": "DML sub-plan rendering in EXPLAIN (showing plans for INSERT/UPDATE/DELETE statements)",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "deferred items (EXPLAIN ANALYZE, FORMAT JSON, COSTS, the DML sub-plan rendering)"
+   ],
+   "first_deferred_commit": "2ae5755d754faaaddb7dd6fbc39947453cd956ab",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "2ae5755d754faaaddb7dd6fbc39947453cd956ab"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_explain.go:746 UPDATE/DELETE missing from planChildren"
+  },
+  {
+   "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
+   ],
+   "first_deferred_commit": "52d9398be421bdb838c61f69afffa4d6c3cdaabc",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "52d9398be421bdb838c61f69afffa4d6c3cdaabc"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/expr.go:1294 comment says timestamp-timestamp subtraction scope-deferred"
+  },
+  {
+   "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
+   ],
+   "first_deferred_commit": "52d9398be421bdb838c61f69afffa4d6c3cdaabc",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "52d9398be421bdb838c61f69afffa4d6c3cdaabc"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/expr.go:141 IntervalLit only supports day/month/year units"
+  },
+  {
+   "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "the deferred items (SASLprep, channel binding, scram_iterations GUC)"
+   ],
+   "first_deferred_commit": "d6acfaca76f41c41dfebe700bbc10fa0438905bf",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "d6acfaca76f41c41dfebe700bbc10fa0438905bf"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/auth/scram.go:857 channel binding not supported, SASLprep absent"
+  },
+  {
+   "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Lehman/Yao crab-walk is deferred"
+   ],
+   "first_deferred_commit": "c2a7e1570c487b0e7647deadd7971baf7f42aff1",
+   "deferred_date": "2026-04-28",
+   "source_commits": [
+    "c2a7e1570c487b0e7647deadd7971baf7f42aff1"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/btree.go:585 Lehman-Yao right-link only, crab-walk staged"
+  },
+  {
+   "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
+   "task_id": null,
+   "resume_point": "Pool-level page-pin/page-read instrumentation",
+   "evidence": [
+    "BUFFERS / SETTINGS counter rendering is queued as a Pool-level page-pin/page-read instrumentation follow-up"
+   ],
+   "first_deferred_commit": "2af686078fdc2a08f5bcc381f56f2ddc8c58f5e5",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "2af686078fdc2a08f5bcc381f56f2ddc8c58f5e5"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/design/0018-0004 lines 123-125 defer BUFFERS/SETTINGS to future work"
+  },
+  {
+   "feature": "Support for EXPLAIN FORMAT XML and FORMAT YAML options to output query plans in XML or YAML format.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "FORMAT XML/YAML -> \"unsupported FORMAT\""
+   ],
+   "first_deferred_commit": "d257314b779f2a8b202e1d06690b7bb2bf2f3a7c",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "d257314b779f2a8b202e1d06690b7bb2bf2f3a7c"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/explain_options_test.go:136 confirms FORMAT XML unsupported"
+  },
+  {
+   "feature": "Per-CTE execution statistics tracking in PostgreSQL's pg_stat_* system catalogs for individual CTE performance visibility.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "per-CTE pg_stat_* counters"
+   ],
+   "first_deferred_commit": "23f510e44d515ce75ccf6cd0881909b128072af4",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "23f510e44d515ce75ccf6cd0881909b128072af4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No per-CTE execution statistics found in codebase"
+  },
+  {
+   "feature": "DELETE row identification when pgoutput emits empty K body; row identity unavailable for xmax stamping",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "pgoutput emits an empty K body so the row to stamp xmax on isn't identifiable; tracked as a wire-format extension follow-up"
+   ],
+   "first_deferred_commit": "0b26cf92ce03b6b6dddcff29862b447f3324410e",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "0b26cf92ce03b6b6dddcff29862b447f3324410e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/pgoutput.go:17 states v0 DELETE has no pre-image"
+  },
+  {
+   "feature": "MESSAGE message type ('M') in pgoutput",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "'Y' TYPE / 'M' MESSAGE / 2PC / streaming v2: out of scope"
+   ],
+   "first_deferred_commit": "d4f3d52be088b1d075b616f09db87a009162cb63",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "d4f3d52be088b1d075b616f09db87a009162cb63",
+    "d4f3d52be088b1d075b616f09db87a009162cb63"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/pgoutput.go:21 MESSAGE explicitly out of scope"
+  },
+  {
+   "feature": "Per-slot catalog-xmin retention hook in vacuum and pruning operations",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "the per-slot catalog-xmin retention hook in vacuum / pruning remain deferred"
+   ],
+   "first_deferred_commit": "1adc44ac1b310b2aec22aefb293c89f513bb640a",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "1adc44ac1b310b2aec22aefb293c89f513bb640a"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No per-slot catalog-xmin retention hook in vacuum operations"
+  },
+  {
+   "feature": "EXPLAIN SETTINGS option rendering to display configuration settings; currently parsed but produces no output.",
+   "task_id": "M0018-0004",
+   "resume_point": "M0018-0004",
+   "evidence": [
+    "BUFFERS ... parsed-but-no-op until M0018-0004",
+    "SETTINGS ... parsed-but-no-op until M0018-0004"
+   ],
+   "first_deferred_commit": "be11f589bfe1facd22e51c7aa6c0379feb1cae84",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "be11f589bfe1facd22e51c7aa6c0379feb1cae84",
+    "be11f589bfe1facd22e51c7aa6c0379feb1cae84"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/design/0018-0004:123 defers SETTINGS rendering to future work"
+  },
+  {
+   "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
+   "task_id": "m0009",
+   "resume_point": null,
+   "evidence": [
+    "Real perf-pipelining waits on a loop redesign that defers Wait across Appends"
+   ],
+   "first_deferred_commit": "e49ec60d43d25d3b20bb05dd3836090a4ff498c4",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "e49ec60d43d25d3b20bb05dd3836090a4ff498c4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Commit e49ec60d message states loop redesign defers Wait across Appends"
+  },
+  {
+   "feature": "Handling schema changes during a logical slot's lifetime (currently surfaces as decoder errors)",
+   "task_id": "M0008",
+   "resume_point": null,
+   "evidence": [
+    "Schema changes during the slot's life surface as decoder errors when they bite — out of scope for the M0008 first acceptance bar"
+   ],
+   "first_deferred_commit": "1adc44ac1b310b2aec22aefb293c89f513bb640a",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "1adc44ac1b310b2aec22aefb293c89f513bb640a"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/snapshot.go:12-14 schema changes marked out-of-scope, surfaces as decoder errors"
+  },
+  {
+   "feature": "wal_sync_method GUC selector to configure WAL synchronization method.",
+   "task_id": "M0007",
+   "resume_point": null,
+   "evidence": [
+    "wal_sync_method GUC selector ... remain deferred"
+   ],
+   "first_deferred_commit": "1b96d083afd50fa4e1dcc29b48aad57e53a5980b",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "1b96d083afd50fa4e1dcc29b48aad57e53a5980b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/config/defaults.go: wal_sync_method GUC not found"
+  },
+  {
+   "feature": "WAL segment recycling to reuse old segments instead of unlinking.",
+   "task_id": "M0007",
+   "resume_point": null,
+   "evidence": [
+    "`wal_recycle` ... remain deferred"
+   ],
+   "first_deferred_commit": "0e8e2c6481e1a73834bae4212fd4a86385531d89",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "0e8e2c6481e1a73834bae4212fd4a86385531d89"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/retention.go:21 unlinks segments, not recycling by rename"
+  },
+  {
+   "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
+   "task_id": "M0007",
+   "resume_point": null,
+   "evidence": [
+    "eager next-segment lookahead ... remain deferred"
+   ],
+   "first_deferred_commit": "0e8e2c6481e1a73834bae4212fd4a86385531d89",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "0e8e2c6481e1a73834bae4212fd4a86385531d89"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/config/defaults.go: WAL preallocation optimization not found"
+  },
+  {
+   "feature": "Counters for WAL preallocation metrics and monitoring.",
+   "task_id": "M0007",
+   "resume_point": null,
+   "evidence": [
+    "counters ... remain deferred"
+   ],
+   "first_deferred_commit": "0e8e2c6481e1a73834bae4212fd4a86385531d89",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "0e8e2c6481e1a73834bae4212fd4a86385531d89"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/config/defaults.go: WAL preallocation metrics not found"
+  },
+  {
+   "feature": "parsePrimaryConninfo does not parse user, sslmode, password, and other libpq parameters beyond host and port",
+   "task_id": "m0005",
+   "resume_point": null,
+   "evidence": [
+    "user / sslmode / etc. follow in later loops"
+   ],
+   "first_deferred_commit": "b566a837581a64b56c510b018810fdc1fdb9514e",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "b566a837581a64b56c510b018810fdc1fdb9514e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: cmd/goopg/main.go:975-984 parsePrimaryConninfoFull omits sslmode password"
+  },
+  {
+   "feature": "Multi-timeline WAL operations are not implemented",
+   "task_id": "m0005",
+   "resume_point": null,
+   "evidence": [
+    "Out-of-scope: multi-timeline operation"
+   ],
+   "first_deferred_commit": "f4de6953c077b01b4f01c2edfcabc93f94d2f1d0",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "f4de6953c077b01b4f01c2edfcabc93f94d2f1d0"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Commit message explicitly lists multi-timeline operation as out-of-scope"
+  },
+  {
+   "feature": "Cascading replication (standby replicating to other standby instances) is not implemented",
+   "task_id": "m0005",
+   "resume_point": null,
+   "evidence": [
+    "Out-of-scope: cascading replication"
+   ],
+   "first_deferred_commit": "f4de6953c077b01b4f01c2edfcabc93f94d2f1d0",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "f4de6953c077b01b4f01c2edfcabc93f94d2f1d0"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/server/replication.go:1-11 START_REPLICATION deferred, cascading not found"
+  },
+  {
+   "feature": "Streaming replication implementation is deferred across approximately 25 follow-up items spanning wire protocol, WAL streaming machinery, replication slots, standby side features, configuration surface, and promotion logic",
+   "task_id": "m0005",
+   "resume_point": null,
+   "evidence": [
+    "fix_plan.md decomposed into ~25 follow-up items grouped under: architecture, wire protocol, WAL streaming machinery, replication slots, standby side, configuration surface, promotion"
+   ],
+   "first_deferred_commit": "f4de6953c077b01b4f01c2edfcabc93f94d2f1d0",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "f4de6953c077b01b4f01c2edfcabc93f94d2f1d0"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/design/0005-0001-streaming-replication-architecture.md deferral noted"
+  },
+  {
+   "feature": "BETWEEN SYMMETRIC operator variant that allows reversed range endpoints",
+   "task_id": "m0003",
+   "resume_point": "0003-0013",
+   "evidence": [
+    "BETWEEN SYMMETRIC"
+   ],
+   "first_deferred_commit": "64c0eeb2f3d6b970c94eac81575c9249a1f2c23e",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "64c0eeb2f3d6b970c94eac81575c9249a1f2c23e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/design/0003-0013-between-operator.md:101 BETWEEN SYMMETRIC explicitly deferred"
+  },
+  {
+   "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
+   "task_id": "m0003",
+   "resume_point": "0003-0013",
+   "evidence": [
+    "KindDate carrier"
+   ],
+   "first_deferred_commit": "64c0eeb2f3d6b970c94eac81575c9249a1f2c23e",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "64c0eeb2f3d6b970c94eac81575c9249a1f2c23e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/design/0003-0013-between-operator.md:106 KindDate carrier explicitly deferred"
+  },
+  {
+   "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",
+   "task_id": "M0020",
+   "resume_point": "implement frame clause execution logic",
+   "evidence": [
+    "Frame clauses (ROWS / RANGE / GROUPS / frame-exclusion) parse but error explicitly with 'frame clauses are not supported in v0'"
+   ],
+   "first_deferred_commit": "bc36ed838e1b48e6757c563d5de2bff4f35078ce",
+   "deferred_date": "2026-04-30",
+   "source_commits": [
+    "bc36ed838e1b48e6757c563d5de2bff4f35078ce"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "confirmed-open-code-audit: select.go:3439 frame clauses rejected by parser"
+   },
+   "confidence": "high"
+  },
+  {
+   "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
+   "task_id": "M0020",
+   "resume_point": "support named window references and definitions",
+   "evidence": [
+    "Named-window references (`OVER win_name`) and WINDOW definition clauses also deferred"
+   ],
+   "first_deferred_commit": "bc36ed838e1b48e6757c563d5de2bff4f35078ce",
+   "deferred_date": "2026-04-30",
+   "source_commits": [
+    "bc36ed838e1b48e6757c563d5de2bff4f35078ce"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/plan.go:784-790 WindowAgg lacks named window/frame fields"
+  },
+  {
+   "feature": "Implement per-row lock timestamp stamping during streaming execution to track exact lock timing.",
+   "task_id": "M0021",
+   "resume_point": "refactor for per-row streaming stamping",
+   "evidence": [
+    "Per-row streaming stamping needs a seqScanOp Pin/RLock-per-row refactor and is deferred",
+    "streaming per-row stamping ... all stay deferred",
+    "streaming per-row stamping all remain deferred"
+   ],
+   "first_deferred_commit": "c5dceefa8325e419b0d6f5faae5c8a549828aad0",
+   "deferred_date": "2026-04-30",
+   "source_commits": [
+    "c5dceefa8325e419b0d6f5faae5c8a549828aad0",
+    "c5dceefa8325e419b0d6f5faae5c8a549828aad0",
+    "6687f54471f10c412eb7171f3cbf6508230dd489",
+    "05b939ba8dd810981bb99d25d8d34e374f59127d",
+    "78ab700517a9f0a5d507ff4f445933bb41400b1d",
+    "461d68f12dc4172e7e161a4b5a334b3cdbe68c89"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_window.go lacks lock timestamp stamping logic"
+  },
+  {
+   "feature": "Detection of aggregate functions in SELECT ... FOR UPDATE target lists to enforce proper locking constraints when aggregates appear in the target.",
+   "task_id": "M0021-0002",
+   "resume_point": "planner slice",
+   "evidence": [
+    "Aggregate-functions-in-target detection and locking-inside-subqueries deferred"
+   ],
+   "first_deferred_commit": "2dff91ff99c7cce5ba763a0e64862405b20a2700",
+   "deferred_date": "2026-04-30",
+   "source_commits": [
+    "2dff91ff99c7cce5ba763a0e64862405b20a2700"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/locking_test.go:11-98 no aggregate detection in FOR UPDATE"
+  },
+  {
+   "feature": "Optimize per-row writeHeapRow operations by pinning heap data to improve memory locality during bulk writes.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "per-row writeHeapRow pinning + statement-cache deferred"
+   ],
+   "first_deferred_commit": "ff26eaccd3df4b765556a301afe383526c668577",
+   "deferred_date": "2026-05-04",
+   "source_commits": [
+    "ff26eaccd3df4b765556a301afe383526c668577"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/ no pinning/locality optimization found"
+  },
+  {
+   "feature": "Implement statement-level caching to reduce preparation overhead across repeated query executions.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "per-row writeHeapRow pinning + statement-cache deferred"
+   ],
+   "first_deferred_commit": "ff26eaccd3df4b765556a301afe383526c668577",
+   "deferred_date": "2026-05-04",
+   "source_commits": [
+    "ff26eaccd3df4b765556a301afe383526c668577"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/server/dispatch.go:803 only query-scoped cache not statement-level"
+  },
+  {
+   "feature": "Rename XLogInsert/XLogFlush API methods to align with PostgreSQL conventions",
+   "task_id": "M0042-0003",
+   "resume_point": null,
+   "evidence": [
+    "XLogInsert/XLogFlush API rename deferred"
+   ],
+   "first_deferred_commit": "584e00133f315dc5c22b9fc0b1a3413f9f249975",
+   "deferred_date": "2026-05-04",
+   "source_commits": [
+    "584e00133f315dc5c22b9fc0b1a3413f9f249975"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/ no XLogInsert/XLogFlush API renaming detected"
+  },
+  {
+   "feature": "Implement WALInsertLock array to support parallel WAL inserts",
+   "task_id": "M0042-0003",
+   "resume_point": null,
+   "evidence": [
+    "WALInsertLock array for parallel inserts deferred"
+   ],
+   "first_deferred_commit": "584e00133f315dc5c22b9fc0b1a3413f9f249975",
+   "deferred_date": "2026-05-04",
+   "source_commits": [
+    "584e00133f315dc5c22b9fc0b1a3413f9f249975"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/wal_buffer.go no WALInsertLock array implementation"
+  },
+  {
+   "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
+   "task_id": "M0030-0005",
+   "resume_point": null,
+   "evidence": [
+    "pg_index as a real heap table deferred (index metadata remains in Go structs)"
+   ],
+   "first_deferred_commit": "de0e241f5e627522bd9716179715680e2e5cae4b",
+   "deferred_date": "2026-05-04",
+   "source_commits": [
+    "de0e241f5e627522bd9716179715680e2e5cae4b"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/catalog/catalog.go:6424 pg_index Virtual:true not persistent"
+  },
+  {
+   "feature": "Window function frame clauses and named windows are not yet implemented.",
+   "task_id": "M0020",
+   "resume_point": null,
+   "evidence": [
+    "Frame clauses and named windows remain deferred"
+   ],
+   "first_deferred_commit": "73efa222443b770539e589de1b8125a34e92c619",
+   "deferred_date": "2026-05-04",
+   "source_commits": [
+    "73efa222443b770539e589de1b8125a34e92c619"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/plan.go:771-791 WindowFunc lacks frame clause structures"
+  },
+  {
+   "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "The full Borrow-semantics rewrite (design doc 0054-0002 §5.2) is split into a follow-up"
+   ],
+   "first_deferred_commit": "bb85f3c46335e6d143b0b8eb6bbae2ef75df6071",
+   "deferred_date": "2026-05-05",
+   "source_commits": [
+    "bb85f3c46335e6d143b0b8eb6bbae2ef75df6071"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/slot.go:14 only incremental BorrowSemantics removal noted"
+  },
+  {
+   "feature": "Empirical TPC-H verification that index-build column projection achieves DecodeRow cumulative cost ≤ 15% of total query execution time.",
+   "task_id": "M0054-0007-followup-resume",
+   "resume_point": "next HammerDB SF=1 run",
+   "evidence": [
+    "Empirical TPC-H verification (DecodeRow cum ≤ 15 % per the M0054-0005c-followup acceptance) is bundled into the next HammerDB SF=1 run"
+   ],
+   "first_deferred_commit": "2f37db2dadfacded73b277166bb05740738a6507",
+   "deferred_date": "2026-05-05",
+   "source_commits": [
+    "2f37db2dadfacded73b277166bb05740738a6507"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/milestones/0054: empirical TPC-H verification not completed"
+  },
+  {
+   "feature": "Complete HammerDB SF=1 power test after Q9 regression fix (test was aborted after Q9, Q20 and remaining queries were not executed).",
+   "task_id": "M0054-0007-followup-resume",
+   "resume_point": "After M0054-0006-followup-Q9-composite is fixed",
+   "evidence": [
+    "M0054-0007-followup-resume: new sub-task for the NLI-re-enabled retry, blocked by Q9-composite landing first"
+   ],
+   "first_deferred_commit": "57ee4041cffe92b348efe309e4556a4ccad62976",
+   "deferred_date": "2026-05-05",
+   "source_commits": [
+    "57ee4041cffe92b348efe309e4556a4ccad62976"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: analysis/: HammerDB SF=1 test execution incomplete/aborted"
+  },
+  {
+   "feature": "Extend equi-key extractor to handle view-inlined join shapes for Nested-Loop Index Join (TPC-H Q15b not yet supported).",
+   "task_id": "M0054-0006-followup-Q15b",
+   "resume_point": null,
+   "evidence": [
+    "the equi-key extractor doesn't yet handle Q15b's view-inlined join shape"
+   ],
+   "first_deferred_commit": "13fad010a5fbee16b6abdb0f827bf4d685d659c4",
+   "deferred_date": "2026-05-05",
+   "source_commits": [
+    "13fad010a5fbee16b6abdb0f827bf4d685d659c4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/nl_index_join_test.go:254 Q15b disabled: row-layout-flip unfixed"
+  },
+  {
+   "feature": "Implement buffer reuse for rows returned by concatRows() to reduce allocations (currently not reused because callers may retain rows).",
+   "task_id": "0005b-followup",
+   "resume_point": "After Borrow contract is implemented",
+   "evidence": [
+    "rows returned by `concatRows(m, lazyRow)` are intentionally NOT buffer-reused: callers may retain them, and the safe alternative needs the Borrow contract (deferred to 0005b-followup)"
+   ],
+   "first_deferred_commit": "bb85f3c46335e6d143b0b8eb6bbae2ef75df6071",
+   "deferred_date": "2026-05-05",
+   "source_commits": [
+    "bb85f3c46335e6d143b0b8eb6bbae2ef75df6071"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/btree.go:1960 insertItemSorted dedup-grow abandoned due to page-fragment garbage"
+  },
+  {
+   "feature": "IN-list IndexScan optimization requiring Append/Union plan node and cost model for query plan optimization",
+   "task_id": "M0054",
+   "resume_point": null,
+   "evidence": [
+    "M0053-0003 (IN-list IndexScan) scope-reduced — requires Append/Union plan node + cost model, deferred to M0054"
+   ],
+   "first_deferred_commit": "8e5ad8ee6384e3849dea3c571ebdb96d59c8246b",
+   "deferred_date": "2026-05-05",
+   "source_commits": [
+    "8e5ad8ee6384e3849dea3c571ebdb96d59c8246b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/in_list_test.go:14 OR-of-IndexScan plan node not yet implemented"
+  },
+  {
+   "feature": "Posting growth helper functions are implemented but not integrated into the steady-state B-tree insert path, causing in-place insert operations to leak page bytes during memory growth.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "NOT wired into the steady-state insert path — the in-place grow leaks page bytes"
+   ],
+   "first_deferred_commit": "958e1a6c0a89c62a1a179f6f4d59514c79aa2406",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "958e1a6c0a89c62a1a179f6f4d59514c79aa2406"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/btree.go:1960 posting growth helpers defined but deferred from steady-state insert"
+  },
+  {
+   "feature": "Re-enable race condition detector (-race) for concurrent write stress tests",
+   "task_id": "M0056-0002",
+   "resume_point": null,
+   "evidence": [
+    "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
+   ],
+   "first_deferred_commit": "6a88492e9552e1c1f71b998b2177242df98a7961",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "6a88492e9552e1c1f71b998b2177242df98a7961"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/multi_writer_stress_test.go:40 skip blocks race re-enable"
+  },
+  {
+   "feature": "Remove splitMu lock from btree operations for concurrency optimization",
+   "task_id": "M0056-0003",
+   "resume_point": null,
+   "evidence": [
+    "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
+   ],
+   "first_deferred_commit": "6a88492e9552e1c1f71b998b2177242df98a7961",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "6a88492e9552e1c1f71b998b2177242df98a7961"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/btree.go:614 splitMu lock still present"
+  },
+  {
+   "feature": "End-to-end validation of btree concurrent write protocol",
+   "task_id": "M0056-0004",
+   "resume_point": null,
+   "evidence": [
+    "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
+   ],
+   "first_deferred_commit": "6a88492e9552e1c1f71b998b2177242df98a7961",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "6a88492e9552e1c1f71b998b2177242df98a7961"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/milestones/0056: Phase D end-to-end validation in progress, not completed"
+  },
+  {
+   "feature": "Investigate and fix intermittent TestMultiWriterStress flake causing ~20% test failures",
+   "task_id": "M0056-followup-multiwriter-flake",
+   "resume_point": null,
+   "evidence": [
+    "root cause not yet identified. Tracked as `M0056-followup-multiwriter-flake`"
+   ],
+   "first_deferred_commit": "6a88492e9552e1c1f71b998b2177242df98a7961",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "6a88492e9552e1c1f71b998b2177242df98a7961"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/multi_writer_stress_test.go:40 test skipped"
+  },
+  {
+   "feature": "Full splitMu removal from btree Insert slow path (Stage 2 splitMu lifting via writer-coupling)",
+   "task_id": "M0055-0004-followup-stage2-splitmu-removal",
+   "resume_point": null,
+   "evidence": [
+    "lands two of three Stage 2 deliverables... DEFERRED (blocked on a storage-layer prerequisite)"
+   ],
+   "first_deferred_commit": "756e5bea1523089a5c092ca4ad3cb6b22f800c91",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "756e5bea1523089a5c092ca4ad3cb6b22f800c91"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/milestones/0056: Phase C splitMu removal in progress as of status line 1"
+  },
+  {
+   "feature": "Fix storage pool per-slot pinCount accounting race condition in buffer management",
+   "task_id": "M0055-bufpool-pin-race",
+   "resume_point": null,
+   "evidence": [
+    "The bug is in the storage pool's per-slot pinCount accounting and is tracked as a separate sub-task `M0055-bufpool-pin-race` for the storage layer to fix"
+   ],
+   "first_deferred_commit": "756e5bea1523089a5c092ca4ad3cb6b22f800c91",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "756e5bea1523089a5c092ca4ad3cb6b22f800c91"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/milestones/0056: Phase A PinNew race (M0056-0001) in progress, not completed"
+  },
+  {
+   "feature": "Replay-safe WAL log handling for two-phase delete operations to ensure crash recovery consistency in B-tree indices.",
+   "task_id": "M0055-0005-followup-two-phase-del",
+   "resume_point": null,
+   "evidence": [
+    "Two-phase deletion + replay-safe WAL coverage tracked as M0055-0005-followup-two-phase-del"
+   ],
+   "first_deferred_commit": "958e1a6c0a89c62a1a179f6f4d59514c79aa2406",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "958e1a6c0a89c62a1a179f6f4d59514c79aa2406"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree/btree.go:6 WAL records for deletes deferred"
+  },
+  {
+   "feature": "Empirical TPC-H Q20 wall-clock validation using HammerDB SF=1 resume run to confirm performance improvements from multi-parameter correlation unnesting.",
+   "task_id": "M0054-0007",
+   "resume_point": "next HammerDB SF=1 resume run",
+   "evidence": [
+    "Empirical TPC-H Q20 wall-clock validation requires a HammerDB SF=1 resume run, which is out of scope for this loop"
+   ],
+   "first_deferred_commit": "8b1875d29fbfd418163521e308cb4befb15ac847",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "8b1875d29fbfd418163521e308cb4befb15ac847"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Deferral marked: resume point needs HammerDB SF=1 run"
+  },
+  {
+   "feature": "Full verification of all 22 close criteria for M0054-0007 milestone, deferred as a partial milestone to be resumed after M0054-0008 completion.",
+   "task_id": "M0054-0007-followup-resume",
+   "resume_point": "after M0054-0008 lands",
+   "evidence": [
+    "M0054-0007-followup-resume is marked PARTIAL/DEFERRED"
+   ],
+   "first_deferred_commit": "e431ec30ad62e96643e8e966ff221aefa354cdf4",
+   "deferred_date": "2026-05-06",
+   "source_commits": [
+    "e431ec30ad62e96643e8e966ff221aefa354cdf4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Deferral marked: resume point after M0054-0008 completion"
+  },
+  {
+   "feature": "Q21 Anti-NLI currently uses hash variant because lifting conjuncts to outer Predicate breaks negation semantics (returns 0 rows instead of ~411); the inner-Filter conjunct lift is deferred.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "lifting those conjuncts to the outer Predicate broke Anti's negation semantics (returned 0 rows vs canonical ~411 in a probe), so deferred as a follow-up"
+   ],
+   "first_deferred_commit": "f4ef64ea0c4e1859484a89c60ae1028d4bf9edac",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "f4ef64ea0c4e1859484a89c60ae1028d4bf9edac"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:290 shows semi-join uses hash algo, NLI prohibited for semantics"
+  },
+  {
+   "feature": "Q21 build-phase cancel requires proper NLI rewrite for derived-table outer inputs; the fix is deferred out of M0062 scope.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "The proper fix is in NLI rewrite for derived-table outers — symmetric to but distinct from the M0062-0006 MHJ fix. Filed as a follow-up; out of M0062 scope."
+   ],
+   "first_deferred_commit": "977ff2209b2dfa6a2ef07eae7d3b03930fb052fd",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "977ff2209b2dfa6a2ef07eae7d3b03930fb052fd"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:140 defers derived-table NLI rewrite to M0068"
+  },
+  {
+   "feature": "SASLprep pre-processing for SASL authentication username normalization",
+   "task_id": null,
+   "resume_point": "see maybe_not_completed_tasks.md for deferred details",
+   "evidence": [
+    "Tasks include deferred features such as: Authentication: SASLprep"
+   ],
+   "first_deferred_commit": "fef7a709d73510ea2634265a08c6c37aafda690c",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "fef7a709d73510ea2634265a08c6c37aafda690c"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No SASLprep implementation found in auth package"
+  },
+  {
+   "feature": "Channel binding support for SASL authentication to validate client-server channel integrity",
+   "task_id": null,
+   "resume_point": "see maybe_not_completed_tasks.md for deferred details",
+   "evidence": [
+    "Authentication: SASLprep, channel binding"
+   ],
+   "first_deferred_commit": "fef7a709d73510ea2634265a08c6c37aafda690c",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "fef7a709d73510ea2634265a08c6c37aafda690c"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/auth/scram.go:287 channel binding not yet supported"
+  },
+  {
+   "feature": "Optimize Q14 query performance (regressed from 29s baseline to 600s timeout)",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Q14 cancel at 600 s — regression vs prior 29 s baseline"
+   ],
+   "first_deferred_commit": "4930aeef6b4ac5b50468fa0d2ff430bbb2fb7b71",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "4930aeef6b4ac5b50468fa0d2ff430bbb2fb7b71"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:373 mentions Q14 but no performance regression fix found"
+  },
+  {
+   "feature": "Implement range-correlation support for EXISTS with non-equijoin predicates (e.g., l_suppkey <> ...)",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Q21 non-equijoin EXISTS correlation; out-of-scope for M0061-0001",
+    "Q21 still cancels: non-equijoin correlation (l_suppkey <> ...) is documented out-of-scope; needs range-correlation EXISTS."
+   ],
+   "first_deferred_commit": "faf2e71fca988ead7db5c80460b4977afc94bf25",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "faf2e71fca988ead7db5c80460b4977afc94bf25",
+    "4930aeef6b4ac5b50468fa0d2ff430bbb2fb7b71"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/unnest_test.go:274 non-equijoin should NOT unnest"
+  },
+  {
+   "feature": "Q21 Anti-NLI optimization attempt corrupted NLI outer-key probe logic; partial state remains unresolved",
+   "task_id": "M0065",
+   "resume_point": null,
+   "evidence": [
+    "Q21 Anti-NLI lift attempt corrupted the NLI outer-key probe"
+   ],
+   "first_deferred_commit": "d38d26eded4941567c1b36acfb1509ef984f2a2e",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "d38d26eded4941567c1b36acfb1509ef984f2a2e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/bushy.go:1836 references M0065-Q21-walker with unsolved NLI key issues"
+  },
+  {
+   "feature": "Q5 query optimization and correctness testing is not yet addressed.",
+   "task_id": "M0063-0002",
+   "resume_point": null,
+   "evidence": [
+    "M0063-0002 (Q5) and M0063-0003 (Q20) deferred"
+   ],
+   "first_deferred_commit": "e2a37eaa3a060f2078411be9c5654dd271bb57c1",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "e2a37eaa3a060f2078411be9c5654dd271bb57c1"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/milestones/0062-tpch-residual-long-tail.md:41 Q5 optimization pending"
+  },
+  {
+   "feature": "Q8 still returns 0 rows; the full fix requires complete IndexScan-alias plumbing that is currently in progress.",
+   "task_id": "M0062-0002",
+   "resume_point": null,
+   "evidence": [
+    "The IndexScan-alias plumbing is a prerequisite for the full Q8 fix, which is tracked in the M0062-0002 follow-up"
+   ],
+   "first_deferred_commit": "09e24d1fba726b1bae9b7af17cf432f98d190ebd",
+   "deferred_date": "2026-05-07",
+   "source_commits": [
+    "09e24d1fba726b1bae9b7af17cf432f98d190ebd"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: docs/milestones/0062-tpch-residual-long-tail.md:46 Q8 0-rows pending"
+  },
+  {
+   "feature": "Q21 EXISTS unnest residual zero-rows bug fix deferred to slot pipeline",
+   "task_id": "M0071-0005",
+   "resume_point": null,
+   "evidence": [
+    "Q21 residual zero-rows is therefore documented as slot-pipeline-blocked"
+   ],
+   "first_deferred_commit": "f6febe958a8e585eea3c67952f37b8fae10d30df",
+   "deferred_date": "2026-05-08",
+   "source_commits": [
+    "f6febe958a8e585eea3c67952f37b8fae10d30df"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/q21_live_test.go:112 references M0070-0001 but no zero-rows bug fix code"
+  },
+  {
+   "feature": "Q9 composite-NLI follow-up (second half of M0070-0001 fix) deferred to TupleSlot pipeline phase",
+   "task_id": "M0070-0003",
+   "resume_point": null,
+   "evidence": [
+    "folded into Phase 3 (M0070-0003 TupleSlot pipeline)"
+   ],
+   "first_deferred_commit": "5fc515bf8eb958e586200833bd44efd9e74199f8",
+   "deferred_date": "2026-05-08",
+   "source_commits": [
+    "5fc515bf8eb958e586200833bd44efd9e74199f8"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:140 Q9 composite-NLI hoist reverted, deferred to M0068"
+  },
+  {
+   "feature": "Connection pool mutex partitioning to reduce lock contention",
+   "task_id": "M0070-0006",
+   "resume_point": null,
+   "evidence": [
+    "poolMu partitioning DEFERRED → M0070-0006"
+   ],
+   "first_deferred_commit": "e4ee8a28dec91f1a1f87b3899eff24e3c8acb175",
+   "deferred_date": "2026-05-08",
+   "source_commits": [
+    "e4ee8a28dec91f1a1f87b3899eff24e3c8acb175"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: no grep matches for mutex partitioning; connection pool lacks partition"
+  },
+  {
+   "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
+   "task_id": "M0069-0005",
+   "resume_point": null,
+   "evidence": [
+    "in.Negated=true (NOT IN) is rejected — anti-semi-join semantics out of scope"
+   ],
+   "first_deferred_commit": "ebb267d6d1001b0375282ba8d2a750b74cbf2ed4",
+   "deferred_date": "2026-05-08",
+   "source_commits": [
+    "ebb267d6d1001b0375282ba8d2a750b74cbf2ed4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: unnest.go:1200 negated IN rejected for non-correlated case only"
+  },
+  {
+   "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
+   "task_id": "M0069-0005",
+   "resume_point": null,
+   "evidence": [
+    "in.Operand must be a ColumnRef — non-trivial expressions on the LHS keep the runtime cache path"
+   ],
+   "first_deferred_commit": "ebb267d6d1001b0375282ba8d2a750b74cbf2ed4",
+   "deferred_date": "2026-05-08",
+   "source_commits": [
+    "ebb267d6d1001b0375282ba8d2a750b74cbf2ed4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: unnest.go:1203 LHS must be ColumnRef; complex exprs rejected"
+  },
+  {
+   "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",
+   "task_id": "M0068",
+   "resume_point": null,
+   "evidence": [
+    "same schema-vs-runtime layout mismatch from M0064/M0065 walker attempts. Reverted; deferred to M0068"
+   ],
+   "first_deferred_commit": "71cf817e0130d4291233f1a45dcec7eb156bae9c",
+   "deferred_date": "2026-05-08",
+   "source_commits": [
+    "71cf817e0130d4291233f1a45dcec7eb156bae9c"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: nl_index_join.go:133 M0067-0003 reverted due to schema/layout mismatch"
+  },
+  {
+   "feature": "Q5 CPU performance profiling of the OpCode optimization is deferred to the final sweep stage combined with arena work.",
+   "task_id": "M0073-0005",
+   "resume_point": "combined capture with arena work in M0073-0001..4",
+   "evidence": [
+    "Q5 CPU pprof verification deferred to M0073-0005's final sweep"
+   ],
+   "first_deferred_commit": "58efeb063c90a2c0edca7e9146eb4ec80e0740b1",
+   "deferred_date": "2026-05-09",
+   "source_commits": [
+    "58efeb063c90a2c0edca7e9146eb4ec80e0740b1"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: slot.go:14 slot pipeline Stage A done; profiling deferred"
+  },
+  {
+   "feature": "NLI semi/anti joins with partsupp_pk-style index may not correctly emit outer rows; root cause and fix deferred.",
+   "task_id": "M0071-0005",
+   "resume_point": "Stage D follow-up",
+   "evidence": [
+    "to be investigated in M0071-0005 Stage D follow-up"
+   ],
+   "first_deferred_commit": "b0226c3782a8f2edcf6554f776c3762c83baa8d1",
+   "deferred_date": "2026-05-09",
+   "source_commits": [
+    "b0226c3782a8f2edcf6554f776c3762c83baa8d1"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: no grep evidence; NLI semi/anti join issue still deferred"
+  },
+  {
+   "feature": "Q9 chained-NLI rebind logic requires slot pipeline implementation; planner-only approach infeasible",
+   "task_id": "M0071-0005",
+   "resume_point": null,
+   "evidence": [
+    "defer Q9 chained-NLI rebind to slot pipeline; DEFERRED → M0071-0005"
+   ],
+   "first_deferred_commit": "72d544e1715ebeb2c33d24814a94ae621a9cc5bf",
+   "deferred_date": "2026-05-09",
+   "source_commits": [
+    "72d544e1715ebeb2c33d24814a94ae621a9cc5bf"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: slot.go:16 slot pipeline partially migrated; full impl incomplete"
+  },
+  {
+   "feature": "Q5 optimization fix deferred due to empirical regression",
+   "task_id": "M0076-0001",
+   "resume_point": "M0077",
+   "evidence": [
+    "defer Q5 fix to M0077 — empirical regression"
+   ],
+   "first_deferred_commit": "83e7853ccbc31a7fe4c4112b27daecb4db66cd75",
+   "deferred_date": "2026-05-10",
+   "source_commits": [
+    "83e7853ccbc31a7fe4c4112b27daecb4db66cd75"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: no code evidence; Q5 optimization fix deferred per commit"
+  },
+  {
+   "feature": "Root-cause investigation of planner nondeterminism vs pool-state behavior in plan-snapshot regression harness",
+   "task_id": "M0077",
+   "resume_point": null,
+   "evidence": [
+    "Root-cause investigation (planner nondeterminism vs pool-state) deferred to M0077"
+   ],
+   "first_deferred_commit": "b27869c71c9335cfcd5088bc484b6cc26790a09b",
+   "deferred_date": "2026-05-10",
+   "source_commits": [
+    "b27869c71c9335cfcd5088bc484b6cc26790a09b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: no harness/investigation code; diagnostic work deferred"
+  },
+  {
+   "feature": "Diagnose and isolate individual build optimization flag (PGO / GOAMD64=v3 / ldflags) causing +9.5% wall-time regression",
+   "task_id": "M0076-0003",
+   "resume_point": null,
+   "evidence": [
+    "The optimisation flags produced a net +9.5 % wall-time regression on this workload"
+   ],
+   "first_deferred_commit": "7b4a6c79e45a66cf5caf941a5d3fc60ef65a6579",
+   "deferred_date": "2026-05-10",
+   "source_commits": [
+    "7b4a6c79e45a66cf5caf941a5d3fc60ef65a6579"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: no diagnostics; regression investigation deferred"
+  },
+  {
+   "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
+   "task_id": "M0076-0002",
+   "resume_point": null,
+   "evidence": [
+    "only the wiring into filterOp is the deferred piece"
+   ],
+   "first_deferred_commit": "8135c3134fdda3fddafc6065d32c0a335019880a",
+   "deferred_date": "2026-05-10",
+   "source_commits": [
+    "8135c3134fdda3fddafc6065d32c0a335019880a"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: operators.go:224-253 uses row-by-row evalExprSlot; design 0075-0004 defers vectorized filterOp wiring to M0076"
+  },
+  {
+   "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
+   "task_id": "M0076",
+   "resume_point": null,
+   "evidence": [
+    "status flipped to DEFERRED with failure note"
+   ],
+   "first_deferred_commit": "aafef4fd4da298b731e1754ec697a64e09e8705a",
+   "deferred_date": "2026-05-10",
+   "source_commits": [
+    "aafef4fd4da298b731e1754ec697a64e09e8705a"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Datum struct flip was reverted; current datum.go:110 still has Buf []byte"
+  },
+  {
+   "feature": "SeqScanOp predicate batch wiring (vectorized predicate evaluation in sequential scan)",
+   "task_id": "M0075",
+   "resume_point": null,
+   "evidence": [
+    "seqScanOp predicate batch wiring deferred"
+   ],
+   "first_deferred_commit": "639272a735ba16b4a572c975f29d852038fd9a0b",
+   "deferred_date": "2026-05-10",
+   "source_commits": [
+    "639272a735ba16b4a572c975f29d852038fd9a0b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: operators_storage.go has no vectorized batch predicate evaluation in SeqScanOp; row-by-row processing only"
+  },
+  {
+   "feature": "Runtime SET for track_io_timing GUC is not yet wired. Currently only static session-level configuration via postgresql.conf is supported.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Runtime SET is not yet wired (M0093 candidate)"
+   ],
+   "first_deferred_commit": "da7224d74243ac9c430d836d8d54c9b794d60016",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "da7224d74243ac9c430d836d8d54c9b794d60016"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: track_io_timing GUC registered but no runtime SET handler found; claim that it's not wired appears correct"
+  },
+  {
+   "feature": "M0091 performance goal (TPS ≥ 1,000) remains unmet after optimization attempts. Further performance work is filed as a candidate for M0093.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "M0091's TPS ≥ 1,000 bar remains unmet. Filed as M0093 candidate"
+   ],
+   "first_deferred_commit": "82d7acffab6ce7f4599a078da1b891343dab72e4",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "82d7acffab6ce7f4599a078da1b891343dab72e4"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Performance goal TPS≥1000 claimed unmet; no optimization closed the gap since commit"
+  },
+  {
+   "feature": "PostgreSQL features pg_multixact, pg_twophase, and pg_commit_ts are not implemented at the executor level and therefore have no WAL persistence",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "The remaining N/A entries (`pg_multixact`, `pg_twophase`, `pg_commit_ts`) correspond to features goopg has not yet implemented at the executor level"
+   ],
+   "first_deferred_commit": "4e621c58cab44acd457f203ad8056b66b12cb2c8",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "4e621c58cab44acd457f203ad8056b66b12cb2c8"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: pg_multixact, pg_twophase, pg_commit_ts absent from catalog; not implemented at executor level"
+  },
+  {
+   "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "`MarkPageHalfDead` infrastructure stays in place for future use (no current producer outside the BtreeVacuum flag-trailer path)"
+   ],
+   "first_deferred_commit": "2ba63a895f8926cb5ec0bf5458c3fe022280b53b",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "2ba63a895f8926cb5ec0bf5458c3fe022280b53b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "confirmed-open-code-audit: LogBtreeMarkPageHalfDead has zero non-test callers"
+   },
+   "confidence": "high"
+  },
+  {
+   "feature": "Client-driven Pool/Manager/AIO hooks closure-capture optimization for activity-tracking overhead reduction, pending post-fix measurement",
+   "task_id": "m0091-0001",
+   "resume_point": null,
+   "evidence": [
+    "Client-driven Pool / Manager / AIO hooks (lines 478-895) are left as-is for this commit... Plumbing fix is deferred"
+   ],
+   "first_deferred_commit": "3bdc1adc3ba8905353b8249e53a66a3d1f4916e5",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "3bdc1adc3ba8905353b8249e53a66a3d1f4916e5"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "confirmed-open-code-audit: client-driven hooks still per-call LookupCurrentGoroutine open.go:1529"
+   },
+   "confidence": "high"
+  },
+  {
+   "feature": "Spill-path hooks closure-capture optimization (cold-path, left unoptimized)",
+   "task_id": "m0091-0001",
+   "resume_point": null,
+   "evidence": [
+    "Spill-path hooks (executor/spill.go) are cold-path and left"
+   ],
+   "first_deferred_commit": "3bdc1adc3ba8905353b8249e53a66a3d1f4916e5",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "3bdc1adc3ba8905353b8249e53a66a3d1f4916e5"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Spill-path closure-capture optimization described as deferred, left unoptimized cold path"
+  },
+  {
+   "feature": "Client-driven Pool/Manager/AIO hooks optimization (larger refactor scope deferred from M0091)",
+   "task_id": "m0091",
+   "resume_point": null,
+   "evidence": [
+    "Client-driven Pool/Manager/AIO hooks are deferred (smaller share + larger refactor)"
+   ],
+   "first_deferred_commit": "5c34192379d47bd0d07e1663a3bbdbef0d7bb75b",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "5c34192379d47bd0d07e1663a3bbdbef0d7bb75b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Client-driven Pool/Manager/AIO hooks optimization deferred from M0091 scope"
+  },
+  {
+   "feature": "Spill-path per-row lookups optimization (cold path, dropped from scope)",
+   "task_id": "m0091",
+   "resume_point": null,
+   "evidence": [
+    "Spill-path per-row lookups dropped (cold path)"
+   ],
+   "first_deferred_commit": "5c34192379d47bd0d07e1663a3bbdbef0d7bb75b",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "5c34192379d47bd0d07e1663a3bbdbef0d7bb75b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Spill-path per-row lookups optimization dropped from scope, cold path left unoptimized"
+  },
+  {
+   "feature": "Audit of dirty-tracking behavior in Pool.PinNew and Extend operations to identify buffer durability issues",
+   "task_id": "m0089-0002",
+   "resume_point": "docs/design/0089-0002-buffer-pool-dirty-tracking-on-extend.md",
+   "evidence": [
+    "dirty-tracking audit on `Pool.PinNew` / `Extend` is deferred to a follow-up",
+    "m0089-0002 audit still required; follow-up session is needed to do the audit"
+   ],
+   "first_deferred_commit": "57458755353b4b6be48da91352ca0efda1b986f3",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "57458755353b4b6be48da91352ca0efda1b986f3",
+    "2dba444c4294a96d94f36e7f56d974b7d724611f"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Design doc 0089-0002-buffer-pool-dirty-tracking-on-extend.md does not exist; audit undocumented"
+  },
+  {
+   "feature": "Plan cache implementation is deferred. Design document M0092-0008 explains why a plan cache won't help pgbench with client-side literal substitution patterns.",
+   "task_id": "M0092-0008",
+   "resume_point": null,
+   "evidence": [
+    "0092-0008 plan-cache-feasibility.md (DEFERRED, no code change)"
+   ],
+   "first_deferred_commit": "c2a33ef5ef7e1cabb09417460010ec127dee63be",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "c2a33ef5ef7e1cabb09417460010ec127dee63be"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Plan cache deferred; design M0092-0008 explains why caching won't help pgbench patterns"
+  },
+  {
+   "feature": "Structural fix for select-only performance is deferred to M0092. The initial audit is complete but the implementation is left for the next milestone.",
+   "task_id": "M0091-0004",
+   "resume_point": null,
+   "evidence": [
+    "M0091-0004 ✓ audit complete; structural fix deferred to M0092"
+   ],
+   "first_deferred_commit": "f6079a9431e16b2d57a6eb2e2077813c3c81c73a",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "f6079a9431e16b2d57a6eb2e2077813c3c81c73a"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Audit complete but performance fix deferred to M0092"
+  },
+  {
+   "feature": "The needsVacuum function always returns true when RowCount > 0 and does not respect autovacuum reloptions like autovacuum_enabled = off",
+   "task_id": "M0086",
+   "resume_point": null,
+   "evidence": [
+    "needsVacuum currently returns true whenever RowCount > 0"
+   ],
+   "first_deferred_commit": "606cff26be3c33167b167d0c95c39a3974b0e93c",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "606cff26be3c33167b167d0c95c39a3974b0e93c"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/autovacuum/launcher.go:204 ignores autovacuum_enabled reloptions"
+  },
+  {
+   "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",
+   "task_id": "M0087",
+   "resume_point": null,
+   "evidence": [
+    "loadTables uses a *catalog.InMemory type assertion and silently no-ops on any other catalog implementation"
+   ],
+   "first_deferred_commit": "606cff26be3c33167b167d0c95c39a3974b0e93c",
+   "deferred_date": "2026-05-11",
+   "source_commits": [
+    "606cff26be3c33167b167d0c95c39a3974b0e93c"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: launcher.go:181-186 silently returns nil for non-InMemory catalogs"
+  },
+  {
+   "feature": "DEFAULT clause in column definitions is skipped during parsing; default values are not stored or applied to new rows",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "DEFAULT clause skip"
+   ],
+   "first_deferred_commit": "bb65e7d5a78330870b6dadca427d9b6a8bb28b71",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "bb65e7d5a78330870b6dadca427d9b6a8bb28b71"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/ast.go:1127 DefaultExpr parsed but not applied"
+  },
+  {
+   "feature": "Subscriber setup with streaming and logical replication for replicating changes is not implemented in goopg v0.",
+   "task_id": null,
+   "resume_point": "BB-020",
+   "evidence": [
+    "Logical streaming deferred: logical replication protocol not in goopg v0",
+    "Subscriber setup deferred: streaming + logical replication not in goopg v0",
+    "WAL streaming deferred: replication protocol not in goopg v0"
+   ],
+   "first_deferred_commit": "d248a814b94d924a58d0ec14b2805c33d313a6d7",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "d248a814b94d924a58d0ec14b2805c33d313a6d7",
+    "d248a814b94d924a58d0ec14b2805c33d313a6d7",
+    "d248a814b94d924a58d0ec14b2805c33d313a6d7"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Logical replication exists but subscriber setup incomplete"
+  },
+  {
+   "feature": "min_parallel_table_scan_size and min_parallel_index_scan_size GUCs are accepted but not acted upon; query planner ignores these settings.",
+   "task_id": "m0097-0003",
+   "resume_point": null,
+   "evidence": [
+    "no-op stubs (values accepted but not acted upon)"
+   ],
+   "first_deferred_commit": "cb6f83283c36ec12dff775ecf4f269667a17ae45",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "cb6f83283c36ec12dff775ecf4f269667a17ae45"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/config/defaults.go:469+ GUCs registered as no-ops"
+  },
+  {
+   "feature": "evictMu lock serializes MarkDirty and WAL operations; should allow concurrent execution for better write performance.",
+   "task_id": "m0099-0005",
+   "resume_point": "m0099_matrix_summary.md",
+   "evidence": [
+    "evictMu still serialises MarkDirty/WAL"
+   ],
+   "first_deferred_commit": "4f11a6ceeb0ff465a7076216f85e049be1f8f6ea",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "4f11a6ceeb0ff465a7076216f85e049be1f8f6ea"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/storage/bufpool.go evictMu exists, concurrent locking unclear"
+  },
+  {
+   "feature": "pg_relation_size, pg_total_relation_size, pg_indexes_size, and pg_table_size are stubbed; do not return actual relation sizes.",
+   "task_id": "m0097-0018",
+   "resume_point": null,
+   "evidence": [
+    "pg_relation_size/pg_total_relation_size/pg_indexes_size/pg_table_size: stubs"
+   ],
+   "first_deferred_commit": "ee7ee29bbbe080de054109fa2a8fe8669895a9f8",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "ee7ee29bbbe080de054109fa2a8fe8669895a9f8"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: pg_relation_size functions found but stubbed verification needed"
+  },
+  {
+   "feature": "ALTER TYPE RENAME and OWNER operations are no-ops; type names and ownership cannot be modified.",
+   "task_id": "m0097-0017",
+   "resume_point": null,
+   "evidence": [
+    "RENAME/OWNER no-ops"
+   ],
+   "first_deferred_commit": "c1e52ffdb13cc9379f9dba21e05f3edac046e977",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "c1e52ffdb13cc9379f9dba21e05f3edac046e977"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: operators_ddl.go:16198 ALTER TYPE OWNER TO returns nil—is no-op"
+  },
+  {
+   "feature": "regexp_matches() function is a set-returning function stub that returns NULL instead of match results.",
+   "task_id": "m0097-0007",
+   "resume_point": null,
+   "evidence": [
+    "regexp_matches stub (SRF, returns NULL)"
+   ],
+   "first_deferred_commit": "10e23408e381ca0641419f112ded75df393e200a",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "10e23408e381ca0641419f112ded75df393e200a"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: expr.go:7288 regexp_matches() stub returns NULL instead of match results"
+  },
+  {
+   "feature": "pg_get_serial_sequence() is a stub that returns a convention-based sequence name instead of the actual sequence.",
+   "task_id": "m0097-0009",
+   "resume_point": null,
+   "evidence": [
+    "pg_get_serial_sequence stub (returns table_col_seq convention)"
+   ],
+   "first_deferred_commit": "079eacca6866c6fcf1cea34395a911356eaa7810",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "079eacca6866c6fcf1cea34395a911356eaa7810"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: expr.go:7325 pg_get_serial_sequence() is stub returning convention-based name"
+  },
+  {
+   "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",
+   "task_id": "m0097-0004",
+   "resume_point": null,
+   "evidence": [
+    "isfinite(x): stub"
+   ],
+   "first_deferred_commit": "6c3ef866adf696212b9916a91491532c2c884ad2",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "6c3ef866adf696212b9916a91491532c2c884ad2"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/expr.go:5017 — isfinite() is a stub that always returns TRUE for non-NULL input"
+  },
+  {
+   "feature": "justify_hours(), justify_days(), and justify_interval() functions are stubs that return input unchanged.",
+   "task_id": "m0097-0004",
+   "resume_point": null,
+   "evidence": [
+    "justify_hours / justify_days / justify_interval: stubs — return input as-is"
+   ],
+   "first_deferred_commit": "6c3ef866adf696212b9916a91491532c2c884ad2",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "6c3ef866adf696212b9916a91491532c2c884ad2"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/expr.go:5030 — justify_hours/days/interval return input unchanged (stub)"
+  },
+  {
+   "feature": "Add pg_stat_io walsummarizer backend_type rows to track WAL summarizer process statistics.",
+   "task_id": "m0095-0002",
+   "resume_point": null,
+   "evidence": [
+    "pg_stat_io walsummarizer backend_type rows (not implemented)"
+   ],
+   "first_deferred_commit": "0464274aaa2c8284619ee96bde82d5c932217613",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "0464274aaa2c8284619ee96bde82d5c932217613"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No walsummarizer backend_type rows found in replication_views.go"
+  },
+  {
+   "feature": "Implement CREATE/DROP DATABASE commands with full DDL support.",
+   "task_id": "m0095-0007",
+   "resume_point": null,
+   "evidence": [
+    "0007: CREATE/DROP DATABASE stubs"
+   ],
+   "first_deferred_commit": "ccd6b80844a4a9ba299a07ca32d64b27aebbd4ae",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "ccd6b80844a4a9ba299a07ca32d64b27aebbd4ae"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/server/database_ddl.go:71-104 — CREATE/DROP DATABASE implemented but trailing options (TEMPLATE, ENCODING, OWNER) ignored"
+  },
+  {
+   "feature": "No dual-process logical-replication test harness; replcluster currently supports physical replication only",
+   "task_id": "M0103",
+   "resume_point": null,
+   "evidence": [
+    "No dual-process logical-replication test harness (replcluster is physical-only)"
+   ],
+   "first_deferred_commit": "b766c81d29c3e2dad32eab7776f7044be8a599d5",
+   "deferred_date": "2026-05-13",
+   "source_commits": [
+    "b766c81d29c3e2dad32eab7776f7044be8a599d5"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: replcluster.go states v0 physical replication only, no logical harness"
+  },
+  {
+   "feature": "SlotDecoder.Classify must handle RecordKindPageImage records instead of dropping them",
+   "task_id": "M0103-0008",
+   "resume_point": "rung 12",
+   "evidence": [
+    "first-INSERT-into-fresh-page (RecordKindPageImage kind=1) records are still dropped at the SlotDecoder.Classify stage — rung 12"
+   ],
+   "first_deferred_commit": "c972231ed10ae39af8cbda29342c1eecc2e1d587",
+   "deferred_date": "2026-05-14",
+   "source_commits": [
+    "c972231ed10ae39af8cbda29342c1eecc2e1d587"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: classifier.go:141-144 explicitly skips PageImage records, not handled"
+  },
+  {
+   "feature": "Protocol version 2 streaming subxacts with Y/A frames and parent-XID linkage (requires apply-worker subxact tracking)",
+   "task_id": "M0103-0007",
+   "resume_point": "Implement apply-worker subxact tracking in future rung",
+   "evidence": [
+    "proto_version=2 streaming subxacts (Y/A frames + parent-XID linkage) is out of scope; promoting the default ... stays a future rung"
+   ],
+   "first_deferred_commit": "4cfc5a179f7a3d394038d1ac71c7fc02699ac4ad",
+   "deferred_date": "2026-05-14",
+   "source_commits": [
+    "4cfc5a179f7a3d394038d1ac71c7fc02699ac4ad"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No Y/A frame code found for streaming subxacts in pgoutput.go"
+  },
+  {
+   "feature": "TOAST (out-of-line) large value storage replication",
+   "task_id": "M0103-0007",
+   "resume_point": null,
+   "evidence": [
+    "TOAST"
+   ],
+   "first_deferred_commit": "e2cfc8314d5a958ba2245b022a6183e9be49dc25",
+   "deferred_date": "2026-05-14",
+   "source_commits": [
+    "e2cfc8314d5a958ba2245b022a6183e9be49dc25"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No TOAST replication code found in logicalwalsender.go search"
+  },
+  {
+   "feature": "DDL replication (schema changes) in various shapes and scenarios",
+   "task_id": "M0103-0007",
+   "resume_point": null,
+   "evidence": [
+    "DDL replication shapes"
+   ],
+   "first_deferred_commit": "e2cfc8314d5a958ba2245b022a6183e9be49dc25",
+   "deferred_date": "2026-05-14",
+   "source_commits": [
+    "e2cfc8314d5a958ba2245b022a6183e9be49dc25"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No DDL replication code found in initdb/relcache_init.go search"
+  },
+  {
+   "feature": "Standby recovery doesn't transition standbyState to STANDBY_SNAPSHOT_READY, causing pg_ctl timeout during recovery initialization.",
+   "task_id": "M0105-0007",
+   "resume_point": null,
+   "evidence": [
+    "standbyState doesn't transition to STANDBY_SNAPSHOT_READY (causes pg_ctl timeout)"
+   ],
+   "first_deferred_commit": "a28e94763de9d9847a3877b775b73857f52ef730",
+   "deferred_date": "2026-05-16",
+   "source_commits": [
+    "a28e94763de9d9847a3877b775b73857f52ef730"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No standbyState or STANDBY_SNAPSHOT_READY implementation found in codebase"
+  },
+  {
+   "feature": "Standby process doesn't report PM_STATUS_STANDBY status within 120 seconds, causing pg_ctl to timeout.",
+   "task_id": "M0105-0007",
+   "resume_point": null,
+   "evidence": [
+    "standby doesn't report PM_STATUS_STANDBY within 120s"
+   ],
+   "first_deferred_commit": "98548a14f84f1647d5bb45321c3ac2a8f7493587",
+   "deferred_date": "2026-05-16",
+   "source_commits": [
+    "98548a14f84f1647d5bb45321c3ac2a8f7493587"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: PM_STATUS_STANDBY status reporting not found in codebase"
+  },
+  {
+   "feature": "WAL sender closes the replication connection before pg_basebackup considers the WAL stream complete.",
+   "task_id": "M0105-0007",
+   "resume_point": null,
+   "evidence": [
+    "WAL sender to close the connection before pg_basebackup considers the stream complete"
+   ],
+   "first_deferred_commit": "f5bb7c00276507a5e04dbc9a8d323c52825adb9c",
+   "deferred_date": "2026-05-16",
+   "source_commits": [
+    "f5bb7c00276507a5e04dbc9a8d323c52825adb9c"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/server/replication.go:61-62 START_REPLICATION WAL sender marked for future implementation"
+  },
+  {
+   "feature": "PG standby startup fails due to timeline mismatch and invalid WAL records at the redo LSN position.",
+   "task_id": "M0102-0007",
+   "resume_point": null,
+   "evidence": [
+    "PG standby startup still fails (timeline mismatch / invalid record at redo LSN)"
+   ],
+   "first_deferred_commit": "5d51a9d89c6f6bae547f46d66959847a6a9b4663",
+   "deferred_date": "2026-05-16",
+   "source_commits": [
+    "5d51a9d89c6f6bae547f46d66959847a6a9b4663"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: Timeline mismatch handling during standby startup not detected"
+  },
+  {
+   "feature": "Expression-based ON CONFLICT targets (e.g., lower(key)) require expression-index evaluation support, which is deferred as a separate scope beyond this testport parser fix.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "expression-based ON CONFLICT (lower(key)) targets require expression-index evaluation support (separate scope)"
+   ],
+   "first_deferred_commit": "2da50e3997d80b4600e2e716aabeb0b10d825f1c",
+   "deferred_date": "2026-05-20",
+   "source_commits": [
+    "2da50e3997d80b4600e2e716aabeb0b10d825f1c"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/dml.go:148 ON CONFLICT targets only support col_name, not expressions"
+  },
+  {
+   "feature": "Full SeqScan/Project plan node migration from opTreeSlab is deferred to a future loop; plannode.go establishes only the foundation.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "plannode.go establishes the foundation for full SeqScan/Project migration in a future loop"
+   ],
+   "first_deferred_commit": "f9cf00b9370b6e89ee57f8ed1b48bcad2aebcf35",
+   "deferred_date": "2026-05-21",
+   "source_commits": [
+    "f9cf00b9370b6e89ee57f8ed1b48bcad2aebcf35"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/plannode.go:14 states SeqScan/Project not yet migrated"
+  },
+  {
+   "feature": "Splitting state.appendMu's four invariants to enable independent granular locking.",
+   "task_id": "M0107-0007",
+   "resume_point": null,
+   "evidence": [
+    "splitting state.appendMu's four invariants"
+   ],
+   "first_deferred_commit": "d7666ae06779009823fe05fd7c39283570e47c3f",
+   "deferred_date": "2026-05-21",
+   "source_commits": [
+    "d7666ae06779009823fe05fd7c39283570e47c3f"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/wal/stripe_writer_core.go:11 mentions as design, no implementation"
+  },
+  {
+   "feature": "pg_waldump TAP test suite portions (2 tests with mixed BUG_FIX and UNIMPLEMENTED sections)",
+   "task_id": "M0110-0002",
+   "resume_point": "pg_waldump unimplemented test portions",
+   "evidence": [
+    "BUG_FIX + UNIMPLEMENTED"
+   ],
+   "first_deferred_commit": "0a1cd552468dde3742ce0ece57f0cbc5326c90e0",
+   "deferred_date": "2026-05-22",
+   "source_commits": [
+    "0a1cd552468dde3742ce0ece57f0cbc5326c90e0"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/testport/pgwaldump_port_test.go:15-23 — CLI tier ported, server tier deferred due to missing hash/gin/gist/spgist/brin index support"
+  },
+  {
+   "feature": "GIST index support (required for index_including_gist regress test)",
+   "task_id": "M0097-0002",
+   "resume_point": "GIST index implementation",
+   "evidence": [
+    "requires GIST index support, excluded per M0097-0002 policy"
+   ],
+   "first_deferred_commit": "0bd0baa55bbdf0134d800fc3811f64b94b7de183",
+   "deferred_date": "2026-05-22",
+   "source_commits": [
+    "0bd0baa55bbdf0134d800fc3811f64b94b7de183"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/access/btree only — GIST index access method not implemented (only btree exists)"
+  },
+  {
+   "feature": "SELECT * star-expansion within set operation branches (UNION/INTERSECT/EXCEPT)",
+   "task_id": null,
+   "resume_point": "star-expansion in set-op branches",
+   "evidence": [
+    "copyselect still defers on a separate SELECT *-in-set-op-branch star-expansion bug"
+   ],
+   "first_deferred_commit": "5dcb10110d0ea1deebf45d525fa2384e6e414c4e",
+   "deferred_date": "2026-05-25",
+   "source_commits": [
+    "5dcb10110d0ea1deebf45d525fa2384e6e414c4e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No evidence of star expansion in set op branches; each branch planned separately"
+  },
+  {
+   "feature": "GROUP BY GROUPING SETS, ROLLUP, and CUBE syntax forms are not supported; they are parsed as sentinels but not executed.",
+   "task_id": "M0097-regress",
+   "resume_point": null,
+   "evidence": [
+    "consumes unsupported grouping forms and injects an IntegerConst(0) sentinel"
+   ],
+   "first_deferred_commit": "4e8c0511e7aad119c2942169008820f45522efeb",
+   "deferred_date": "2026-05-25",
+   "source_commits": [
+    "4e8c0511e7aad119c2942169008820f45522efeb"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/planner/planner.go:4944 treats ROLLUP/CUBE as plain GROUP BY only"
+  },
+  {
+   "feature": "EXPLAIN output format is not fully implemented for UUID operations",
+   "task_id": "M0097-0029",
+   "resume_point": null,
+   "evidence": [
+    "Remaining: EXPLAIN format"
+   ],
+   "first_deferred_commit": "d7f1cc9914e563fc735be5ed6091aa6cb7570901",
+   "deferred_date": "2026-05-26",
+   "source_commits": [
+    "d7f1cc9914e563fc735be5ed6091aa6cb7570901"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No UUID-specific EXPLAIN output formatting found in codebase"
+  },
+  {
+   "feature": "CTEs (Common Table Expressions) without explicit aliases are not recognized by the parser",
+   "task_id": "M0097-0029",
+   "resume_point": null,
+   "evidence": [
+    "CTE subquery-without-alias parser gap"
+   ],
+   "first_deferred_commit": "d7f1cc9914e563fc735be5ed6091aa6cb7570901",
+   "deferred_date": "2026-05-26",
+   "source_commits": [
+    "d7f1cc9914e563fc735be5ed6091aa6cb7570901"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: CommonTableExpr struct exists (ast.go:732) but aliases requirement unclear"
+  },
+  {
+   "feature": "PostgreSQL extensions (contrib modules) are out of scope and remain unimplemented",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "Extensions remain out of scope"
+   ],
+   "first_deferred_commit": "4405178dde0b38b335cc73684d305eb15b8bbaf7",
+   "deferred_date": "2026-05-27",
+   "source_commits": [
+    "4405178dde0b38b335cc73684d305eb15b8bbaf7"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:199 - only amcheck listed in knownExtensions map"
+  },
+  {
+   "feature": "Role-based access control for INSERT operations is not implemented; SET SESSION AUTHORIZATION remains a no-op so server stays in superuser mode",
+   "task_id": "M0097-0040",
+   "resume_point": null,
+   "evidence": [
+    "requires real role-based INSERT permission checking; SET SESSION AUTHORIZATION is a no-op"
+   ],
+   "first_deferred_commit": "b5a4d394ab9e07305cb21b6558006a0eb9bdee14",
+   "deferred_date": "2026-05-27",
+   "source_commits": [
+    "b5a4d394ab9e07305cb21b6558006a0eb9bdee14"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/server/query.go:230-287 tracks role but no INSERT permission enforcement"
+  },
+  {
+   "feature": "Planner GUC stubs (enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, and others) registered to prevent unrecognized GUC errors but may not affect actual behavior.",
+   "task_id": "M0097-0069",
+   "resume_point": null,
+   "evidence": [
+    "register missing planner GUC stubs so that SET enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, etc. no longer produce 'unrecognized'"
+   ],
+   "first_deferred_commit": "c24965909a0e1da6ff3de8160fff19099770d400",
+   "deferred_date": "2026-05-28",
+   "source_commits": [
+    "c24965909a0e1da6ff3de8160fff19099770d400"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/config/defaults.go:722-768 registers enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation as pure stubs"
+  },
+  {
+   "feature": "I/O statistics tracking not implemented; pg_stat_io virtual table always returns empty rows.",
+   "task_id": "M0095-0002",
+   "resume_point": null,
+   "evidence": [
+    "returns 0 rows (no I/O stats tracked in goopg v0)"
+   ],
+   "first_deferred_commit": "26cb314807117f2f9944dd9adebb397c9700dea1",
+   "deferred_date": "2026-05-29",
+   "source_commits": [
+    "26cb314807117f2f9944dd9adebb397c9700dea1"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "checked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/catalog/catalog.go:5591 - pg_stat_io VirtualRows returns nil"
+  },
+  {
+   "feature": "WAL summarization not running; pg_available_wal_summaries() always returns empty rows.",
+   "task_id": "M0095-0002",
+   "resume_point": null,
+   "evidence": [
+    "always returns 0 rows (no WAL summarizer running since summarize_wal=off)"
+   ],
+   "first_deferred_commit": "26cb314807117f2f9944dd9adebb397c9700dea1",
+   "deferred_date": "2026-05-29",
+   "source_commits": [
+    "26cb314807117f2f9944dd9adebb397c9700dea1"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "checked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_pg_available_wal_summaries.go:23 - Next() returns EOF immediately"
+  },
+  {
+   "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
+   "task_id": "M0097-0073",
+   "resume_point": null,
+   "evidence": [
+    "GUC stubs added"
+   ],
+   "first_deferred_commit": "f0aa2d5db717290097a0c9948f0bf215a7c070d2",
+   "deferred_date": "2026-05-29",
+   "source_commits": [
+    "f0aa2d5db717290097a0c9948f0bf215a7c070d2"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/config/defaults.go:283-304 registers jit, compute_query_id, plan_cache_mode as compatibility stubs only"
+  },
+  {
+   "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "LANGUAGE C functions accepted as stubs"
+   ],
+   "first_deferred_commit": "35bdc90839d4f69d2fc4ed5ac58a9937a0eafc3f",
+   "deferred_date": "2026-05-30",
+   "source_commits": [
+    "35bdc90839d4f69d2fc4ed5ac58a9937a0eafc3f"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/plpgsql_runtime.go:341-352 - LANGUAGE C returns default values"
+  },
+  {
+   "feature": "pg_collation_for() function returns hardcoded 'default' string; collation tracking throughout catalog and query execution is not implemented",
+   "task_id": "M0097-0035",
+   "resume_point": null,
+   "evidence": [
+    "pg_collation_for() stub: returns \"default\" (no collation tracking in v0)"
+   ],
+   "first_deferred_commit": "3efcea87864af6eca947c15b95c8e6da1091fe61",
+   "deferred_date": "2026-05-31",
+   "source_commits": [
+    "3efcea87864af6eca947c15b95c8e6da1091fe61"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/expr.go:6249-6253 - hardcoded POSIX; no collation-aware execution"
+  },
+  {
+   "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",
+   "task_id": "M0097-0150",
+   "resume_point": "Implement actual ownership/schema/name changes for ALTER FUNCTION/PROCEDURE",
+   "evidence": [
+    "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA: no-op"
+   ],
+   "first_deferred_commit": "5519289873faf7c4ecf79f1dcd1e8cc9c0e379b3",
+   "deferred_date": "2026-06-03",
+   "source_commits": [
+    "5519289873faf7c4ecf79f1dcd1e8cc9c0e379b3"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "confirmed-open-code-audit: RENAME enforced but OWNER TO/SET SCHEMA parse-only no-ops ddl.go:6517"
+   },
+   "confidence": "high"
+  },
+  {
+   "feature": "WITH [CASCADED|LOCAL] CHECK OPTION clause enforcement (syntax accepted but not enforced)",
+   "task_id": null,
+   "resume_point": "Implement CHECK OPTION enforcement",
+   "evidence": [
+    "Check enforcement is not yet implemented; the clause is accepted and ignored."
+   ],
+   "first_deferred_commit": "d59e96904e9661398e5389af0e61cbe58febb103",
+   "deferred_date": "2026-06-04",
+   "source_commits": [
+    "d59e96904e9661398e5389af0e61cbe58febb103"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/catalog/catalog.go:329 view CheckOption stored but not enforced"
+  },
+  {
+   "feature": "Foreign Data Wrapper (FDW) functionality stubbed; CREATE FOREIGN DATA WRAPPER and CREATE SERVER create compat registry entries only, without actual FDW implementation.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "FDW stubs: CREATE FOREIGN DATA WRAPPER + CREATE SERVER → compat registry with FDW-server association"
+   ],
+   "first_deferred_commit": "4eb2ac9b71458435516d09d713245034b2608cc3",
+   "deferred_date": "2026-06-04",
+   "source_commits": [
+    "4eb2ac9b71458435516d09d713245034b2608cc3"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:14170 - RegisterForeignDataWrapper stores metadata without remote fetching"
+  },
+  {
+   "feature": "REINDEX INDEX/TABLE command is unimplemented; operates as a no-op stub.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "no-op rebuild (v0 stub)"
+   ],
+   "first_deferred_commit": "7b277e20480f8047ffcd83104d8e0bbbdfc21013",
+   "deferred_date": "2026-06-08",
+   "source_commits": [
+    "7b277e20480f8047ffcd83104d8e0bbbdfc21013"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_reindex.go:6 - Physical reindex is no-op; validation works"
+  },
+  {
+   "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "pg_get_expr stub (→ \"\")"
+   ],
+   "first_deferred_commit": "a910cc325cacea137e68081a5d41b8976f016368",
+   "deferred_date": "2026-06-08",
+   "source_commits": [
+    "a910cc325cacea137e68081a5d41b8976f016368"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/expr.go:7663 pg_get_expr passes through pre-formatted strings only"
+  },
+  {
+   "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",
+   "task_id": "M0110-0003",
+   "resume_point": null,
+   "evidence": [
+    "MVCC/attribute tier... deferred"
+   ],
+   "first_deferred_commit": "850907146a226720500664d07e8257d972690ac6",
+   "deferred_date": "2026-06-14",
+   "source_commits": [
+    "850907146a226720500664d07e8257d972690ac6"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/amcheck/verify_heapam.go:49 MVCC tier available but per-attribute walk not ported"
+  },
+  {
+   "feature": "Four pg_amcheck TAP tests (AC-002: 002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) remain deferred as keystone blockers pending higher tiers.",
+   "task_id": "M0110-0003",
+   "resume_point": null,
+   "evidence": [
+    "Keystone blocker for the four deferred pg_amcheck TAP tests (AC-002: 002_nonesuch/003_check/004_verify_heapam/005_opclass_damage)"
+   ],
+   "first_deferred_commit": "850907146a226720500664d07e8257d972690ac6",
+   "deferred_date": "2026-06-14",
+   "source_commits": [
+    "850907146a226720500664d07e8257d972690ac6"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/testport/pgamcheck002_port_test.go no pgamcheck005_opclass_damage_port_test.go exists"
+  },
+  {
+   "feature": "User schemas should be discoverable via pg_namespace heap rows during PG-standby replication, matching PostgreSQL's schema visibility model.",
+   "task_id": "AC-003",
+   "resume_point": null,
+   "evidence": [
+    "PG-standby user-schema visibility stays out of scope."
+   ],
+   "first_deferred_commit": "2134f4ed6123244e1ea802996e4c16c7dd4be761",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "2134f4ed6123244e1ea802996e4c16c7dd4be761"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: initdb/index_ddl_recovery.go:4 - pg_index heap relation not persisted"
+  },
+  {
+   "feature": "Schema definitions should be queryable via pg_namespace heap rows and indexes (2684/2685), enabling PostgreSQL standby replication to resolve schemas.",
+   "task_id": "AC-003",
+   "resume_point": null,
+   "evidence": [
+    "PG-standby visibility (pg_namespace heap row + 2684/2685 indexes) is out of scope"
+   ],
+   "first_deferred_commit": "1de1e01862db1ed590789d6204bc1f1eb0c74727",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "1de1e01862db1ed590789d6204bc1f1eb0c74727"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: initdb/index_ddl_recovery.go:4 - pg_index heap relation not persisted"
+  },
+  {
+   "feature": "The AC-002 through AC-005 PostgreSQL amcheck TAP test suite has not been ported to goopg.",
+   "task_id": "M0110-0003",
+   "resume_point": "S5",
+   "evidence": [
+    "AC-002..AC-005 TAP port...deferred to rest of S5"
+   ],
+   "first_deferred_commit": "42e67873b562e06f95bb8f393bc94fbd22a0f8f8",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "42e67873b562e06f95bb8f393bc94fbd22a0f8f8"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/testport/ amcheck TAP 005_opclass_damage test not ported"
+  },
+  {
+   "feature": "Runtime pg_database shared-catalog write for datconnlimit invalid-database filtering",
+   "task_id": "M0110-0003",
+   "resume_point": null,
+   "evidence": [
+    "blocked on a runtime pg_database shared-catalog write goopg lacks",
+    "needs a runtime pg_database shared-catalog write goopg lacks"
+   ],
+   "first_deferred_commit": "36133dc670ed40ac61d3ba8f460f3394462845e6",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "36133dc670ed40ac61d3ba8f460f3394462845e6",
+    "c744bdaf4ef49d7c0c2d9b0430ce368abbf572b2"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/testport/pgamcheck002_port_test.go:118 datconnlimit write requires runtime pg_database"
+  },
+  {
+   "feature": "Opclass damage detection test suite (005_opclass_damage)",
+   "task_id": "M0110-0003",
+   "resume_point": null,
+   "evidence": [
+    "005_opclass_damage remain",
+    "AC-003 stays defer (003_check + 005_opclass_damage remain)",
+    "remaining tiers are unsupported AMs/types/TOAST/multi-DB + 005_opclass_damage"
+   ],
+   "first_deferred_commit": "79dcdd708f319c677fa42df8ac5fb848ce1a181c",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "79dcdd708f319c677fa42df8ac5fb848ce1a181c",
+    "79dcdd708f319c677fa42df8ac5fb848ce1a181c",
+    "7e97fcfd428c398d31fc367c847a0c0fe0c55aca",
+    "43d98cfab825371ac56b5c11fa8187090ed82127"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/testport/ no pgamcheck005_opclass_damage_port_test.go file found"
+  },
+  {
+   "feature": "Opclass parity test suite (005_opclass_damage)",
+   "task_id": "M0110-0003",
+   "resume_point": null,
+   "evidence": [
+    "new AC-003 carries the deferred 003/004/005 remainder (real corruption injection + opclass parity)"
+   ],
+   "first_deferred_commit": "383d8b22240622f2ccd7a0e32327f9d7ec974b3e",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "383d8b22240622f2ccd7a0e32327f9d7ec974b3e"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/testport/ 005_opclass_damage parity test file not found"
+  },
+  {
+   "feature": "On-disk pg_tablespace heap visibility management for shared catalog operations",
+   "task_id": "M0095-0003",
+   "resume_point": null,
+   "evidence": [
+    "on-disk pg_tablespace heap visibility (shared-catalog runtime write)"
+   ],
+   "first_deferred_commit": "057b411cf5150b493cae4f86d82fad40a6b62cd3",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "057b411cf5150b493cae4f86d82fad40a6b62cd3"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/session.go:119 shared catalog has no per-session MVCC visibility"
+  },
+  {
+   "feature": "The 1-byte 'char' type (OID 18) cannot be disambiguated from bpchar because the parser folds both to the same internal representation",
+   "task_id": "DU-002",
+   "resume_point": "Modify parser to distinguish literal 'char' from bpchar during type parsing",
+   "evidence": [
+    "\"char\" (18) is deferred: the parser folds both quoted \"char\" and bare char to ct.Name=\"char\", so disambiguating the 1-byte internal char from bpchar needs a parser change, not just a codec entry."
+   ],
+   "first_deferred_commit": "8adfaae25b17f4eb3a154fe97a68e60637ea831a",
+   "deferred_date": "2026-06-16",
+   "source_commits": [
+    "8adfaae25b17f4eb3a154fe97a68e60637ea831a"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/catalog/codec.go:1356 TypeNameToOID folds char to bpchar"
+  },
+  {
+   "feature": "Index column ordering (ASC/DESC/NULLS FIRST/NULLS LAST) is not persisted to disk; ordering is lost across server restart despite faithful dumps within a session",
+   "task_id": "DU-002",
+   "resume_point": "Persist indoption bits to on-disk pg_index heap to enable cross-restart index ordering preservation",
+   "evidence": [
+    "indoption bits are not persisted to the on-disk pg_index heap, so ordering is lost across a restart"
+   ],
+   "first_deferred_commit": "4143ec3df6de7a2c2482c172d59b1a778b35953d",
+   "deferred_date": "2026-06-16",
+   "source_commits": [
+    "4143ec3df6de7a2c2482c172d59b1a778b35953d"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: initdb/index_ddl_recovery.go:4 - indoption not persisted to disk across restarts"
+  },
+  {
+   "feature": "Per-function SET configuration parameters are not tracked; all functions report NULL for the proconfig column.",
+   "task_id": "DU-002",
+   "resume_point": null,
+   "evidence": [
+    "goopg tracks no per-function SET clauses"
+   ],
+   "first_deferred_commit": "fe297936fdf08b0136ae15d81508cb30df22ddc2",
+   "deferred_date": "2026-06-16",
+   "source_commits": [
+    "fe297936fdf08b0136ae15d81508cb30df22ddc2"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: initdb/pg_proc_view.go:220 - proconfig always NULL in views"
+  },
+  {
+   "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
+   "task_id": "M0110-0001",
+   "resume_point": null,
+   "evidence": [
+    "RESET (...) left as the pre-existing no-op (pg_dump never emits it)"
+   ],
+   "first_deferred_commit": "fa14f0f3af8d9923a75c9945c56e8a3bbb78c5b1",
+   "deferred_date": "2026-06-17",
+   "source_commits": [
+    "fa14f0f3af8d9923a75c9945c56e8a3bbb78c5b1"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/ddl.go:7217 ALTER COLUMN RESET not parsed"
+  },
+  {
+   "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",
+   "task_id": "M0110-0001",
+   "resume_point": null,
+   "evidence": [
+    "goopg does not act on n_distinct planner hints"
+   ],
+   "first_deferred_commit": "fa14f0f3af8d9923a75c9945c56e8a3bbb78c5b1",
+   "deferred_date": "2026-06-17",
+   "source_commits": [
+    "fa14f0f3af8d9923a75c9945c56e8a3bbb78c5b1"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:7564 n_distinct stored dump-fidelity only"
+  },
+  {
+   "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",
+   "task_id": "M0110-0001",
+   "resume_point": null,
+   "evidence": [
+    "No CREATE TABLE threading (SET STATISTICS is ALTER-only)"
+   ],
+   "first_deferred_commit": "3153507bc2c63fc6bdbdf114c16f9e75e18b70aa",
+   "deferred_date": "2026-06-17",
+   "source_commits": [
+    "3153507bc2c63fc6bdbdf114c16f9e75e18b70aa"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/ddl.go:3815 SET STATISTICS not in parseColumnDef"
+  },
+  {
+   "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",
+   "task_id": "DU-002 slice 183",
+   "resume_point": null,
+   "evidence": [
+    "Dump-fidelity only: goopg does not TOAST/compress."
+   ],
+   "first_deferred_commit": "2f300f0cb144519a6200c9b80efdeeeab462cd24",
+   "deferred_date": "2026-06-17",
+   "source_commits": [
+    "2f300f0cb144519a6200c9b80efdeeeab462cd24"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:7335 TOAST compression dump-fidelity only"
+  },
+  {
+   "feature": "Autovacuum functionality is not implemented; autovacuum_vacuum_scale_factor values are stored and dumped for compatibility but do not trigger automatic vacuuming",
+   "task_id": "M0110-0001",
+   "resume_point": null,
+   "evidence": [
+    "goopg has no autovacuum, so the value is advisory catalog/dump-only"
+   ],
+   "first_deferred_commit": "d31a1d99070b5b73cec8f515997429425723a27e",
+   "deferred_date": "2026-06-19",
+   "source_commits": [
+    "d31a1d99070b5b73cec8f515997429425723a27e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:1626 goopg has no autovacuum"
+  },
+  {
+   "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
+   "task_id": "M0110-0001",
+   "resume_point": null,
+   "evidence": [
+    "COLLATE/USING accepted but ignored"
+   ],
+   "first_deferred_commit": "9164e87ffef26e8ee2015a5990ed719ad548315a",
+   "deferred_date": "2026-06-20",
+   "source_commits": [
+    "9164e87ffef26e8ee2015a5990ed719ad548315a"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/ddl.go:8432 USING stub-consumed in ALTER TYPE"
+  },
+  {
+   "feature": "Write-Ahead Logging (WAL) for MultiXact operations, enabling creation, modification, and deletion of MultiXact records to be logged and recovered after crashes.",
+   "task_id": "M0118-0003",
+   "resume_point": null,
+   "evidence": [
+    "4-way lock-strength members + WAL persistence + spec promotion remain deferred",
+    "Updater-bearing multi + WAL persistence + spec promotion deferred"
+   ],
+   "first_deferred_commit": "cbf5bf758c6f049b12169f9fbb75c2e5987d2619",
+   "deferred_date": "2026-06-21",
+   "source_commits": [
+    "cbf5bf758c6f049b12169f9fbb75c2e5987d2619",
+    "61246d390e959a1578b4132dd9b8b6b418189616"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "checked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: No WAL record kinds for MultiXact create/modify/delete operations found"
+  },
+  {
+   "feature": "Runtime enforcement of ALTER STATISTICS SET STATISTICS target during DDL operations",
+   "task_id": "M0119-0004",
+   "resume_point": null,
+   "evidence": [
+    "Dump-fidelity only; new field defaults nil"
+   ],
+   "first_deferred_commit": "eeec5291831046c6fa29c9f918b19e7e52b133c8",
+   "deferred_date": "2026-06-29",
+   "source_commits": [
+    "eeec5291831046c6fa29c9f918b19e7e52b133c8"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "confirmed-open-code-audit: operators_ddl.go:15258 catalog-only, not enforced"
+   },
+   "confidence": "high"
+  },
+  {
+   "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",
+   "task_id": "DU-002",
+   "resume_point": "slice 365",
+   "evidence": [
+    "Deferred (ledger): CHECK OPTION enforcement on INSERT/UPDATE through the view; the `WITH (check_option=...)` reloption form before AS + security_barrier/security_invoker stay parsed-and-ignored; restart persistence (in-memory only)."
+   ],
+   "first_deferred_commit": "252f7d365fb99d7a517157a81e9d02619cba7963",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "252f7d365fb99d7a517157a81e9d02619cba7963"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_insert.go no CheckOption enforcement found"
+  },
+  {
+   "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",
+   "task_id": "DU-002-380",
+   "resume_point": null,
+   "evidence": [
+    "HANDLER/VALIDATOR refs"
+   ],
+   "first_deferred_commit": "9b4147097e5298aa76e3ea72517365c565f071ec",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "9b4147097e5298aa76e3ea72517365c565f071ec"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/ddl.go:462 HANDLER/VALIDATOR func references skipped"
+  },
+  {
+   "feature": "Persistent storage of server definitions (currently in-memory only)",
+   "task_id": "DU-002-378",
+   "resume_point": null,
+   "evidence": [
+    "servers in-memory only"
+   ],
+   "first_deferred_commit": "d792e1ab67bef7ad5b5b3d00ac3f5433f3334295",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "d792e1ab67bef7ad5b5b3d00ac3f5433f3334295"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/catalog/catalog.go:11697 foreign servers stored in-memory only"
+  },
+  {
+   "feature": "Persistent storage of server definitions (currently in-memory only)",
+   "task_id": "DU-002-376",
+   "resume_point": null,
+   "evidence": [
+    "servers in-memory only"
+   ],
+   "first_deferred_commit": "46e70c8517917257e9032ba12fbf0403c2bcdd23",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "46e70c8517917257e9032ba12fbf0403c2bcdd23"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/catalog/catalog.go:11697 foreign servers stored in-memory only"
+  },
+  {
+   "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",
+   "task_id": "DU-002-374",
+   "resume_point": null,
+   "evidence": [
+    "per-column `OF type (col WITH OPTIONS ...)` form rejected"
+   ],
+   "first_deferred_commit": "cc080cb37153f936fcf0b6430fc4182749f01fd5",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "cc080cb37153f936fcf0b6430fc4182749f01fd5"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/parser/ddl.go:2713 comment explicitly states not yet supported"
+  },
+  {
+   "feature": "Typed table support for composite types in non-public schemas",
+   "task_id": "DU-002-374",
+   "resume_point": null,
+   "evidence": [
+    "non-public-schema composite OF uncovered"
+   ],
+   "first_deferred_commit": "cc080cb37153f936fcf0b6430fc4182749f01fd5",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "cc080cb37153f936fcf0b6430fc4182749f01fd5"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "high",
+   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:1167 LookupCompositeType lacks schema support"
+  },
+  {
+   "feature": "HammerDB Power Test at Scale Factor 1.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "HammerDB Power Test at SF1 ... as DEFERRED"
+   ],
+   "first_deferred_commit": "f02f0d9def39ead4a4e77c2cfdaef93c8a4b9a54",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "f02f0d9def39ead4a4e77c2cfdaef93c8a4b9a54"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: HammerDB infrastructure present but SF1 power test not specifically found"
+  },
+  {
+   "feature": "Real multi-database and multi-role isolation boundaries with proper tracking across sessions",
+   "task_id": "m0003",
+   "resume_point": null,
+   "evidence": [
+    "real multi-database/multi-role tracking"
+   ],
+   "first_deferred_commit": "9e35e21d703fae62e1a5c299bbfe4e35174d5d04",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "9e35e21d703fae62e1a5c299bbfe4e35174d5d04"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: internal/executor/session.go no currentDatabase isolation boundaries found"
+  },
+  {
+   "feature": "Index definition and tablespace information reconstruction in pg_catalog queries",
+   "task_id": "m0003",
+   "resume_point": null,
+   "evidence": [
+    "indexdef / tablespace reconstruction",
+    "indexdef/tablespace reconstruction"
+   ],
+   "first_deferred_commit": "87a60ab6ebd14878d34111c04d34004982fd8bdf",
+   "deferred_date": "2026-04-29",
+   "source_commits": [
+    "87a60ab6ebd14878d34111c04d34004982fd8bdf",
+    "9e35e21d703fae62e1a5c299bbfe4e35174d5d04"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: internal/initdb/pg_proc_seed_data.go:989 pg_get_indexdef declared, reconstruction unclear"
+  },
+  {
+   "feature": "WITH OPTIONS clause in column definitions implemented as no-op; column-level options are not processed or applied",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "WITH OPTIONS no-op"
+   ],
+   "first_deferred_commit": "bb65e7d5a78330870b6dadca427d9b6a8bb28b71",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "bb65e7d5a78330870b6dadca427d9b6a8bb28b71"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: WITH OPTIONS in ColumnDef definition unclear if consumed"
+  },
+  {
+   "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
+   "task_id": "m0097",
+   "resume_point": null,
+   "evidence": [
+    "goopg does not currently emit"
+   ],
+   "first_deferred_commit": "36e481909792843c0c097536a488f2fa98cc3790",
+   "deferred_date": "2026-05-12",
+   "source_commits": [
+    "36e481909792843c0c097536a488f2fa98cc3790"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: Zero-column SELECT path not traced in protocol"
+  },
+  {
+   "feature": "Resolve subscriber apply stall issue during logical replication",
+   "task_id": "M0103-0008",
+   "resume_point": "rung 9",
+   "evidence": [
+    "rung 9 (subscriber apply stall) deferred to its own design doc"
+   ],
+   "first_deferred_commit": "f1714fea2c165841cfa5a0a402918700b8e3906b",
+   "deferred_date": "2026-05-14",
+   "source_commits": [
+    "f1714fea2c165841cfa5a0a402918700b8e3906b"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: No specific apply stall resolution code found in applyworker.go"
+  },
+  {
+   "feature": "Upstream catalog schema assignment for pg_ts_config_map and pg_ts_config (OID 3764 and 3765) not implemented; placeholder OIDs retained without mapping to official PostgreSQL catalog definitions.",
+   "task_id": "M0106-0010",
+   "resume_point": null,
+   "evidence": [
+    "Pre-existing stale 3764/3765 placeholders left in place (no upstream catalog assignment)"
+   ],
+   "first_deferred_commit": "40fe851ec343d583be182ebf2ac27de5c02a7dfa",
+   "deferred_date": "2026-05-18",
+   "source_commits": [
+    "40fe851ec343d583be182ebf2ac27de5c02a7dfa"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: internal/initdb/pg_ts_config_nailed_test.go:13 pg_ts_config seeded as OID 3602, not 3765"
+  },
+  {
+   "feature": "Schema mismatch between PG18 and goopg for index definitions (tgfoid/attnum derivation) needs to be reconciled in a future loop.",
+   "task_id": "m0106-0010",
+   "resume_point": "Reconcile both schema definitions; currently masked by OID default fallback.",
+   "evidence": [
+    "a future loop should reconcile both definitions"
+   ],
+   "first_deferred_commit": "7ffdaad56d883ef6ec39d2bb16148111d949e18e",
+   "deferred_date": "2026-05-19",
+   "source_commits": [
+    "7ffdaad56d883ef6ec39d2bb16148111d949e18e"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: No tgfoid/attnum derivation schema mismatch evidence found"
+  },
+  {
+   "feature": "Join-based execution path for aggregate sublink promotion to enable faster execution on large inner result sets (currently exceeds statement timeout with 100M ops)",
+   "task_id": null,
+   "resume_point": "Implement join-based execution path for aggregate sublinking",
+   "evidence": [
+    "A join-based execution path would be needed to make this fast enough; deferred."
+   ],
+   "first_deferred_commit": "d7dd89e653a06f5fcba6b2afc55c5429ca32ac61",
+   "deferred_date": "2026-06-04",
+   "source_commits": [
+    "d7dd89e653a06f5fcba6b2afc55c5429ca32ac61"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: Join-based execution path for aggregate sublinks not found in executor"
+  },
+  {
+   "feature": "H2 efficiency fix: fix_plan split and PROMPT trimming to reduce build_loop_context injection size",
+   "task_id": null,
+   "resume_point": "Implement fix_plan split / PROMPT trim optimization",
+   "evidence": [
+    "H2 (fix_plan split / PROMPT trim) skipped — build_loop_context injects only a task count, not fix_plan content"
+   ],
+   "first_deferred_commit": "3deab3e92db6db081ea9aac95c6a83cc4f19afe9",
+   "deferred_date": "2026-06-04",
+   "source_commits": [
+    "3deab3e92db6db081ea9aac95c6a83cc4f19afe9"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: H2 efficiency fix logic not found in executor or planner subsystems"
+  },
+  {
+   "feature": "EXCLUDE USING constraints bypass btree type validation for non-compatible types (box, point); stored as catalog-only without enforcing physical index.",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "createExclusionIndexStub bypasses btree type-validation (box/point columns not btree-compatible); catalog-entry-only"
+   ],
+   "first_deferred_commit": "a910cc325cacea137e68081a5d41b8976f016368",
+   "deferred_date": "2026-06-08",
+   "source_commits": [
+    "a910cc325cacea137e68081a5d41b8976f016368"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: EXCLUDE USING btree validation bypass logic not found in constraint enforcement"
+  },
+  {
+   "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
+   "task_id": "M0100-0007",
+   "resume_point": null,
+   "evidence": [
+    "deferred duplicate-source error"
+   ],
+   "first_deferred_commit": "01356f1c401d4d76fefe7d27956e090219d1d751",
+   "deferred_date": "2026-06-12",
+   "source_commits": [
+    "01356f1c401d4d76fefe7d27956e090219d1d751"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: Duplicate-source error handling in merge cross-partition routing not found"
+  },
+  {
+   "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "No server-side encoding enforcement (on-disk PG-compat)"
+   ],
+   "first_deferred_commit": "8f9ddf252dac8c87c8c20c3f4c9cac27cc62d988",
+   "deferred_date": "2026-06-13",
+   "source_commits": [
+    "8f9ddf252dac8c87c8c20c3f4c9cac27cc62d988"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: No character encoding constraint logic found in server bootstrap or runtime code"
+  },
+  {
+   "feature": "pg_dump test tiers 002-010 requiring broad catalog-view parity and dump/restore round-trip validation",
+   "task_id": null,
+   "resume_point": null,
+   "evidence": [
+    "002-010 stay deferred pending broad catalog-view parity + a dump/restore round-trip"
+   ],
+   "first_deferred_commit": "15ac8cb16e3eaa97cdc259c82eb7b2594795e400",
+   "deferred_date": "2026-06-13",
+   "source_commits": [
+    "15ac8cb16e3eaa97cdc259c82eb7b2594795e400"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: pg_dump test tiers 002-010 require broader test infrastructure exploration"
+  },
+  {
+   "feature": "pg_amcheck server-dependent test tiers (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage), blocked on verify_heapam() SRF implementation and operator-class catalog parity",
+   "task_id": "AC-002",
+   "resume_point": null,
+   "evidence": [
+    "the four server-dependent tests (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) deferred under AC-002 pending the verify_heapam() SRF + operator-class catalog parity"
+   ],
+   "first_deferred_commit": "28d5894ac831f162ff227d8d7827a73f5c268cf9",
+   "deferred_date": "2026-06-13",
+   "source_commits": [
+    "28d5894ac831f162ff227d8d7827a73f5c268cf9"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: pg_amcheck test tiers require broader test infrastructure and verify_heapam exploration"
+  },
+  {
+   "feature": "MVCC/HOT-chain corruption verification in verify_heapam (004) - not faithfully portable due to on-disk varatt_external layout divergence",
+   "task_id": "M0110-0003",
+   "resume_point": null,
+   "evidence": [
+    "The MVCC/attribute + TOAST tiers of 004... are not faithfully portable"
+   ],
+   "first_deferred_commit": "79dcdd708f319c677fa42df8ac5fb848ce1a181c",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "79dcdd708f319c677fa42df8ac5fb848ce1a181c",
+    "79dcdd708f319c677fa42df8ac5fb848ce1a181c"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: amcheck/verify_heapam.go exists but no specific HOT-chain corruption tests found"
+  },
+  {
+   "feature": "pg_subtrans truncation (cleanup of subtransaction ancestry records) is deferred.",
+   "task_id": "M0117-0003",
+   "resume_point": null,
+   "evidence": [
+    "no pg_subtrans truncation yet"
+   ],
+   "first_deferred_commit": "24b09523ff8118140849ac4614bafa89e9a45116",
+   "deferred_date": "2026-06-15",
+   "source_commits": [
+    "24b09523ff8118140849ac4614bafa89e9a45116"
+   ],
+   "resolution_check": {
+    "ledger": "no-match",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: pg_subtrans files exist but truncation deferred status not verified"
+  },
+  {
+   "feature": "Domain CHECK predicates still use legacy wrap instead of new fully-parenthesizing renderer.",
+   "task_id": "DU-002",
+   "resume_point": "slice 362",
+   "evidence": [
+    "Deferred (ledgered): domain CHECK predicates still use the legacy wrap (own slice — domain path owns the VALUE IN ScalarArrayOp renderer)"
+   ],
+   "first_deferred_commit": "1bcbdcd92aec3365d7ecc877cc3ba45a8e8ef08c",
+   "deferred_date": "2026-06-30",
+   "source_commits": [
+    "1bcbdcd92aec3365d7ecc877cc3ba45a8e8ef08c"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "no-match",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: Domain CHECK predicates exist but legacy vs new renderer status not verified"
+  },
+  {
+   "feature": "User-defined function-based casts (WITH FUNCTION casts) are parsed but not dumped in pg_dump; only built-in binary-coercible casts are reachable.",
+   "task_id": "M0119-0004",
+   "resume_point": null,
+   "evidence": [
+    "WITH FUNCTION casts parsed but not dumped (castfunc=0 needs a pg_proc row for dumpCast findFuncByOid)"
+   ],
+   "first_deferred_commit": "b10678cb6603aa523f5acf47ae9a832a75da39ae",
+   "deferred_date": "2026-07-01",
+   "source_commits": [
+    "b10678cb6603aa523f5acf47ae9a832a75da39ae"
+   ],
+   "resolution_check": {
+    "ledger": "open",
+    "fix_plan": "unchecked",
+    "later_commits": "superseded-by-code-audit"
+   },
+   "confidence": "medium",
+   "code_audit": "unclear: Casts exist but function-based cast dumping status not verified"
+  }
+ ]
+}

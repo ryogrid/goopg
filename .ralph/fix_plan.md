@@ -5647,6 +5647,42 @@ documentation-only and is exempt from the design-doc requirement.)
       TIME ZONE`/`SET SESSION AUTHORIZATION`/`SET ... FROM CURRENT`
       unrecognised; `ALTER ROLE ALL SET ...` unsupported.
 
+- [x] **`pg_dumpall --globals-only` unblocked; cluster-wide `ALTER ROLE ...
+      SET` round-trip (M0119-0004-ACLHEAP follow-up, interactive session).**
+      **COMPLETE 2026-07-02:** closes the prior row's own "`pg_dumpall`'s
+      cluster-wide dump surface untested" residual, which had wrongly
+      assumed this was "pure TAP-porting work, not a new engine capability."
+      Probing the real `pg_dumpall --globals-only` binary against goopg
+      failed immediately with `relation "pg_authid" does not exist` —
+      `pg_dumpall`'s `dumpRoles`/`dumpUserConfig` query `pg_authid` directly
+      (not `pg_roles`), a 12-column relation goopg's virtual catalog had
+      never registered. Three new virtual system catalogs
+      (`internal/catalog/catalog.go`): `pg_authid` (OID 1260, sourced from
+      the same live `c.roles`/`c.roleAttrs` state as `pg_roles`, NOT the
+      on-disk `global/1260` crash-recovery heap file — a separate concern;
+      `pg_roles`' stale placeholder OID reassigned to synthetic 1259102);
+      `pg_auth_members` (OID 1261) and `pg_parameter_acl` (OID 6243)
+      registered correctly-empty (role-membership GRANT and parameter-ACL
+      GRANT are both genuinely unimplemented). With all three resolving,
+      `pg_dumpall --globals-only` now runs to completion and correctly
+      dumps cluster-wide `ALTER ROLE <name> SET <guc> TO <value>;` — the
+      prior slice's `roleSettings` store already supported this without
+      further change. Tests:
+      `internal/testport/pgdumpall_role_config_test.go`
+      `TestPort_PgDumpallGlobalsOnly` (real pg_dumpall 18.3 binary). Gates:
+      `go build`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/server`+`internal/planner`+`internal/initdb` suites PASS;
+      full `TestPort_PgDump*` regression set PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-pgdumpall-globals-only.md`;
+      `docs/design/README.md` row `0119-0004bv` added; deferral ledger row
+      appended. Still open: `GRANT <role> TO <role>` role membership (new
+      grammar + storage); `GRANT ... ON PARAMETER` (same shape); seven
+      unmodelled `pg_authid` attribute columns (report PG defaults, honest
+      until `ALTER ROLE` gains real attribute parsing); standing
+      M0119-0004-ACLHEAP items (extended-protocol gap, multi-database
+      scope, `SET TIME ZONE`/etc.) unchanged.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
