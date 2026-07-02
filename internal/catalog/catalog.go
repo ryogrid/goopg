@@ -4420,6 +4420,93 @@ func (c *InMemory) IsAdminOfRole(memberOid, roleOid uint32) bool {
 	return false
 }
 
+// HasPrivsOfRole reports whether memberOid inherits the privileges of
+// roleOid: memberOid == roleOid, memberOid is a superuser, or roleOid is
+// reachable from memberOid via a chain of INHERIT-marked pg_auth_members
+// rows (ROLERECURSE_PRIVS). Distinct from RoleIsMemberOf (ignores INHERIT
+// entirely, used for membership-cycle detection) and IsAdminOfRole (requires
+// ADMIN OPTION, not just membership). Mirrors has_privs_of_role
+// (postgres/src/backend/utils/adt/acl.c). Backs check_role_grantor's
+// "GRANTED BY must name a role whose privileges the current user possesses"
+// gate. M0119-0004-ACLHEAP.
+func (c *InMemory) HasPrivsOfRole(memberOid, roleOid uint32) bool {
+	if memberOid == roleOid {
+		return true
+	}
+	if c.IsSuperuser(memberOid) {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		var next []uint32
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur || !m.InheritOption {
+				continue
+			}
+			if key.RoleOID == roleOid {
+				return true
+			}
+			if !seen[key.RoleOID] {
+				seen[key.RoleOID] = true
+				next = append(next, key.RoleOID)
+			}
+		}
+		sort.Slice(next, func(i, j int) bool { return next[i] < next[j] })
+		queue = append(queue, next...)
+	}
+	return false
+}
+
+// SelectBestAdmin finds a role whose privileges memberOid inherits
+// (transitively, via INHERIT-marked pg_auth_members rows) that directly
+// holds ADMIN OPTION on roleOid — preferring memberOid's own direct ADMIN
+// OPTION over an indirect one, and among indirect options the fewest "hops"
+// (breadth-first, matching roles_is_member_of's traversal order). Returns 0
+// (PG's InvalidOid) if no such role exists. By policy memberOid == roleOid
+// never qualifies (a role cannot have ADMIN OPTION on itself). Mirrors
+// select_best_admin (postgres/src/backend/utils/adt/acl.c). Backs
+// check_role_grantor's implicit-grantor inference (memberOid=currentUserID)
+// and its explicit-GRANTED-BY sanity check (memberOid=the named grantor —
+// there, the caller requires the return value to equal memberOid itself,
+// i.e. the grantor's admin option must be its OWN, not merely inherited).
+// M0119-0004-ACLHEAP.
+func (c *InMemory) SelectBestAdmin(memberOid, roleOid uint32) uint32 {
+	if memberOid == roleOid {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key, m := range c.roleMembers {
+			if key.MemberOID == cur && key.RoleOID == roleOid && m.AdminOption {
+				return cur
+			}
+		}
+		var next []uint32
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur || !m.InheritOption {
+				continue
+			}
+			if !seen[key.RoleOID] {
+				seen[key.RoleOID] = true
+				next = append(next, key.RoleOID)
+			}
+		}
+		sort.Slice(next, func(i, j int) bool { return next[i] < next[j] })
+		queue = append(queue, next...)
+	}
+	return 0
+}
+
 // BootstrapSuperuserOID is OID 10 (BOOTSTRAP_SUPERUSERID / "postgres"),
 // goopg's single hardcoded superuser (see the many "OID 10 = bootstrap
 // superuser" call sites elsewhere in this file). AddRoleMems' grantor-chain

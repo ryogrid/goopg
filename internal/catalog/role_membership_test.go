@@ -457,3 +457,81 @@ func TestIsAdminOfRole(t *testing.T) {
 		t.Errorf("a chain with no ADMIN OPTION anywhere must report false")
 	}
 }
+
+// TestHasPrivsOfRole verifies HasPrivsOfRole mirrors has_privs_of_role
+// (acl.c): a role always has privileges of itself, a superuser has
+// privileges of every role, a role is reachable via a chain of INHERIT-true
+// pg_auth_members rows, and a non-inheritable link blocks the walk past that
+// point — unlike RoleIsMemberOf (which ignores INHERIT entirely). M0119-0004-
+// ACLHEAP (check_role_grantor follow-up).
+func TestHasPrivsOfRole(t *testing.T) {
+	c := NewInMemory()
+	if !c.HasPrivsOfRole(100, 100) {
+		t.Errorf("a role must always have privileges of itself")
+	}
+	if !c.HasPrivsOfRole(BootstrapSuperuserOID, 12345) {
+		t.Errorf("the bootstrap superuser must have privileges of every role")
+	}
+	if c.HasPrivsOfRole(100, 200) {
+		t.Errorf("unrelated roles must report false before any grant")
+	}
+
+	// 100 is an INHERIT member of 200 (no admin option needed).
+	c.GrantRoleMembership(200, 100, 10, nil, boolPtr(true), nil)
+	if !c.HasPrivsOfRole(100, 200) {
+		t.Errorf("a direct INHERIT membership must grant privileges of the role")
+	}
+
+	// 300 is a transitive INHERIT member of 200, via 100.
+	c.GrantRoleMembership(100, 300, 10, nil, boolPtr(true), nil)
+	if !c.HasPrivsOfRole(300, 200) {
+		t.Errorf("a transitive INHERIT chain must grant privileges of the role")
+	}
+
+	// 400 is a member of 300, but WITHOUT INHERIT — the walk must not pass
+	// through this edge, so 400 must not inherit 300's (or 200's) privileges.
+	c.GrantRoleMembership(300, 400, 10, nil, boolPtr(false), nil)
+	if c.HasPrivsOfRole(400, 300) {
+		t.Errorf("a non-inheritable membership must not grant privileges of the role")
+	}
+	if c.HasPrivsOfRole(400, 200) {
+		t.Errorf("a non-inheritable link must block privilege inheritance past it")
+	}
+}
+
+// TestSelectBestAdmin verifies SelectBestAdmin mirrors select_best_admin
+// (acl.c): a role can never be its own admin, a direct ADMIN OPTION grant is
+// preferred (returns memberOid itself), ADMIN OPTION reachable via an
+// INHERIT-true chain resolves to the closest role that directly holds it,
+// and a non-inheritable link blocks the walk from reaching an ancestor's
+// ADMIN OPTION. M0119-0004-ACLHEAP (check_role_grantor follow-up).
+func TestSelectBestAdmin(t *testing.T) {
+	c := NewInMemory()
+	if got := c.SelectBestAdmin(100, 100); got != 0 {
+		t.Errorf("a role must never be its own admin, got %d", got)
+	}
+	if got := c.SelectBestAdmin(100, 200); got != 0 {
+		t.Errorf("unrelated roles must report 0 before any grant, got %d", got)
+	}
+
+	// 100 holds a direct WITH ADMIN OPTION grant on 200.
+	c.GrantRoleMembership(200, 100, 10, boolPtr(true), nil, nil)
+	if got := c.SelectBestAdmin(100, 200); got != 100 {
+		t.Errorf("direct ADMIN OPTION must resolve to memberOid itself, got %d", got)
+	}
+
+	// 300 is an INHERIT member of 100, which itself holds ADMIN OPTION on
+	// 200 — 300's best admin for 200 must resolve to 100, the closest
+	// ancestor that directly holds it.
+	c.GrantRoleMembership(100, 300, 10, nil, boolPtr(true), nil)
+	if got := c.SelectBestAdmin(300, 200); got != 100 {
+		t.Errorf("transitive ADMIN OPTION must resolve to the closest holder (100), got %d", got)
+	}
+
+	// 400 is a member of 300, but WITHOUT INHERIT — the walk must not reach
+	// 100's ADMIN OPTION on 200 through this non-inheritable edge.
+	c.GrantRoleMembership(300, 400, 10, nil, boolPtr(false), nil)
+	if got := c.SelectBestAdmin(400, 200); got != 0 {
+		t.Errorf("a non-inheritable link must block reaching an ancestor's ADMIN OPTION, got %d", got)
+	}
+}

@@ -41,22 +41,20 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 	// user" from "effective DDL-owner role", so both start from the same
 	// resolution. M0119-0004-ACLHEAP.
 	currentUserID := o.currentDDLOwnerOID()
-	// The grantor row a bare REVOKE (no GRANTED BY) targets is, in real PG,
-	// whatever check_role_grantor(is_grant=false) infers for the current
-	// session (usually the current user, falling back to an inherited/
-	// superuser path this codebase does not model — see the deferral
-	// ledger). goopg's simplified session model reuses the SAME resolution
-	// GRANT already applies: the effective DDL-owner role, or an explicit
-	// GRANTED BY override. Shared across both branches below so REVOKE only
-	// ever touches the specific (role, member, grantor) row that grantor
-	// actually owns, leaving any OTHER grantor's independent row on the same
-	// (role, member) pair untouched — real PG's (roleid, member, grantor)
-	// unique index. M0119-0004-ACLHEAP.
-	grantorOid := currentUserID
-	if rc.GrantedBy != "" {
-		if oid, err := resolveRole(rc.GrantedBy); err == nil {
-			grantorOid = oid
+	// GRANTED BY's spec is resolved to an OID exactly once, up front, shared
+	// across every target role in this statement — mirrors
+	// roleSpecsToIds/get_rolespec_oid(missing_ok=false) running ahead of the
+	// per-role AddRoleMems/DelRoleMems loop in ExecGrantRoleStmt (user.c): an
+	// unresolvable GRANTED BY name is a hard "role does not exist" error, not
+	// a silent fall-back to the current user.
+	explicitGrantorOid := uint32(0)
+	haveExplicitGrantor := rc.GrantedBy != ""
+	if haveExplicitGrantor {
+		oid, err := resolveRole(rc.GrantedBy)
+		if err != nil {
+			return err
 		}
+		explicitGrantorOid = oid
 	}
 	if rc.Revoke {
 		for _, roleName := range rc.Roles {
@@ -65,6 +63,10 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 				return err
 			}
 			if err := o.checkRoleMembershipAuthorization(im, currentUserID, roleOid, roleName, false); err != nil {
+				return err
+			}
+			grantorOid, err := o.checkRoleGrantor(im, currentUserID, roleOid, roleName, explicitGrantorOid, haveExplicitGrantor, false)
+			if err != nil {
 				return err
 			}
 			for _, memberName := range rc.Grantees {
@@ -103,6 +105,10 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 			return err
 		}
 		if err := o.checkRoleMembershipAuthorization(im, currentUserID, roleOid, roleName, true); err != nil {
+			return err
+		}
+		grantorOid, err := o.checkRoleGrantor(im, currentUserID, roleOid, roleName, explicitGrantorOid, haveExplicitGrantor, true)
+		if err != nil {
 			return err
 		}
 		memberOids := make([]uint32, 0, len(rc.Grantees))
@@ -184,4 +190,71 @@ func (o *ddlOp) checkRoleMembershipAuthorization(im *catalog.InMemory, currentUs
 		}
 	}
 	return nil
+}
+
+// checkRoleGrantor ports check_role_grantor (postgres/src/backend/commands/
+// user.c): resolves the OID to be RECORDED as grantor-of-record for a
+// GRANT/REVOKE of roleOid's membership, called once per target roleOid AFTER
+// checkRoleMembershipAuthorization has already confirmed currentUserID may
+// touch roleOid's membership list at all (matching AddRoleMems/DelRoleMems'
+// call ordering — check_role_membership_authorization runs in
+// ExecGrantRoleStmt before AddRoleMems/DelRoleMems, and check_role_grantor
+// runs as the first thing inside those).
+//
+// No explicit GRANTED BY (explicitGrantorOid invalid): a superuser
+// currentUserID always grants/revokes as the bootstrap superuser (recording
+// against a fixed identity that never depends on any existing grant row);
+// otherwise the grantor is inferred as the closest role (fewest hops,
+// preferring currentUserID's own direct ADMIN OPTION) whose privileges
+// currentUserID inherits and which itself directly holds ADMIN OPTION on
+// roleOid (catalog.SelectBestAdmin) — since checkRoleMembershipAuthorization
+// already proved currentUserID may perform this operation, a best-admin
+// candidate always exists.
+//
+// Explicit GRANTED BY: the named role must be one whose privileges
+// currentUserID possesses (catalog.HasPrivsOfRole) — otherwise this is an
+// impersonation attempt and is rejected regardless of is_grant. For GRANT
+// specifically (REVOKE gets a pass — "no matching grant should exist
+// anyway, but if it somehow does, let the user get rid of it"), the named
+// grantor must ALSO directly hold ADMIN OPTION on roleOid itself — not
+// merely inherit it from a further role — unless it is the bootstrap
+// superuser, which is exempt from that requirement. M0119-0004-ACLHEAP.
+func (o *ddlOp) checkRoleGrantor(im *catalog.InMemory, currentUserID, roleOid uint32, roleName string, explicitGrantorOid uint32, haveExplicitGrantor, isGrant bool) (uint32, error) {
+	if !haveExplicitGrantor {
+		if im.IsSuperuser(currentUserID) {
+			return catalog.BootstrapSuperuserOID, nil
+		}
+		best := im.SelectBestAdmin(currentUserID, roleOid)
+		if best == 0 {
+			// checkRoleMembershipAuthorization already established
+			// currentUserID may perform this operation, so a best admin
+			// should always exist; fall back defensively rather than
+			// mirroring user.c's elog(ERROR, "no possible grantors").
+			return currentUserID, nil
+		}
+		return best, nil
+	}
+	if !im.HasPrivsOfRole(currentUserID, explicitGrantorOid) {
+		grantorName := im.RoleNameForOID(explicitGrantorOid)
+		verb := "grant privileges as"
+		if !isGrant {
+			verb = "revoke privileges granted by"
+		}
+		return 0, &ExecError{
+			Code:    "42501",
+			Message: fmt.Sprintf("permission denied to %s role %q", verb, grantorName),
+			Detail:  fmt.Sprintf("Only roles with privileges of role %q may %s this role.", grantorName, verb),
+		}
+	}
+	if isGrant && explicitGrantorOid != catalog.BootstrapSuperuserOID {
+		if im.SelectBestAdmin(explicitGrantorOid, roleOid) != explicitGrantorOid {
+			grantorName := im.RoleNameForOID(explicitGrantorOid)
+			return 0, &ExecError{
+				Code:    "42501",
+				Message: fmt.Sprintf("permission denied to grant privileges as role %q", grantorName),
+				Detail:  fmt.Sprintf("The grantor must have the ADMIN option on role %q.", roleName),
+			}
+		}
+	}
+	return explicitGrantorOid, nil
 }
