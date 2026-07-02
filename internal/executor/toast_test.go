@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -122,6 +123,105 @@ func TestToastMultipleChunks(t *testing.T) {
 	}
 	if len(rows[0][0].StringValue()) != len(threeChunks) {
 		t.Errorf("length mismatch: want %d, got %d", len(threeChunks), len(rows[0][0].StringValue()))
+	}
+}
+
+// TestToastChunkInsertsAreIndividuallyWALLogged pins the root-0022 follow-up
+// fix (deferral-ledger row appended alongside the chunk_id counter reseed):
+// every TOAST chunk insert must emit its own WAL record, even when it lands
+// on a page some earlier chunk already dirtied in the same checkpoint epoch.
+//
+// Before the fix, writeHeapTupleToRel dirtied the TOAST page via a bare
+// ctx.Pool.MarkDirty (no per-insert WAL emitter wired at all), so only the
+// first chunk written to a page could ever get an FPI and chunks 2+ into an
+// already-dirty page produced zero WAL output — silently losing them on an
+// unclean crash before the next checkpoint. This test uses a Pool with a
+// real LogHeapInsert hook (mirroring internal/initdb/open.go's production
+// wiring) and asserts one WAL emission per TOAST chunk row, all landing on
+// the same TOAST page.
+func TestToastChunkInsertsAreIndividuallyWALLogged(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	defer mgr.Close()
+
+	type insertRec struct {
+		rel storage.RelFileNode
+		blk storage.BlockNumber
+	}
+	var inserts []insertRec
+	logHeapInsert := func(rel storage.RelFileNode, blk storage.BlockNumber, lineSlot uint16, tuple []byte) (storage.LSN, error) {
+		inserts = append(inserts, insertRec{rel: rel, blk: blk})
+		return storage.LSN(len(inserts)), nil
+	}
+	logFPI := func(_ storage.RelFileNode, _ storage.BlockNumber, _ storage.Page) (storage.LSN, error) {
+		return storage.LSN(1), nil
+	}
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{
+		Slots:          64,
+		LogHeapInsert:  logHeapInsert,
+		LogPageImage:   logFPI,
+		FullPageWrites: true,
+	})
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	defer pool.Close()
+
+	cat := catalog.NewInMemory()
+	mgrMVCC := mvcc.NewManager()
+	tx, err := mgrMVCC.Begin(mvcc.IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := mgrMVCC.SnapshotFor(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := NewContext()
+	ctx.Pool = pool
+	ctx.Catalog = cat
+	ctx.TxnMgr = mgrMVCC
+	ctx.Tx = tx
+	ctx.Snap = snap
+	defer func() { _ = mgrMVCC.Rollback(tx) }()
+
+	if err := runDDL(t, ctx, "CREATE TABLE wal_chunk_test (id int, v text)"); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3 full chunks (3*1996 = 5988 B) fit on one 8 KiB TOAST page: chunk 0
+	// dirties the page, chunks 1 and 2 write into the already-dirty page in
+	// the same checkpoint epoch — exactly the scenario that used to be lost.
+	threeChunks := strings.Repeat("A", 3*ToastMaxChunkSize)
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "wal_chunk_test"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	row := Row{
+		{Kind: KindInt, Int: 1},
+		NewStringDatum(threeChunks),
+	}
+	if err := writeHeapRow(ctx, rel, tbl.Columns, row); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	toastRel := ToastRelFor(rel)
+	nBlocks, err := ctx.Pool.NBlocks(toastRel)
+	if err != nil || nBlocks != 1 {
+		t.Fatalf("expected all 3 chunks on a single TOAST page, got %d blocks (err=%v)", nBlocks, err)
+	}
+
+	var toastInserts []insertRec
+	for _, ins := range inserts {
+		if ins.rel == toastRel {
+			toastInserts = append(toastInserts, ins)
+		}
+	}
+	if len(toastInserts) != 3 {
+		t.Fatalf("logHeapInsert fired for %d TOAST chunk writes, want 3 (one per chunk — chunks written after the page's first dirty must not be silently dropped from the WAL stream)", len(toastInserts))
+	}
+	for i, ins := range toastInserts {
+		if ins.blk != 0 {
+			t.Errorf("toastInserts[%d].blk = %d, want 0 (all 3 chunks land on the same page)", i, ins.blk)
+		}
 	}
 }
 

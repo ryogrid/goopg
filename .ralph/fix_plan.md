@@ -5266,6 +5266,38 @@ documentation-only and is exempt from the design-doc requirement.)
       already-dirty TOAST page — a narrower, separate fix from this loop's
       actual reported bug.
 
+- [x] **TOAST per-chunk WAL durability (root-0022 follow-up, interactive
+      session, loop #2).** **COMPLETE 2026-07-02:** closes the previous
+      loop's own ledger row. `writeHeapTupleToRel`
+      (`internal/executor/toast.go`) dirtied the TOAST page via a bare
+      `ctx.Pool.MarkDirty(slot)`, which never invokes any per-insert WAL
+      emitter — only `maybeEmitFPI`'s first-dirty-in-epoch full-page-image.
+      Since up to ~4 TOAST chunks fit on one 8 KiB page, chunks 2-4 written
+      into an already-dirty page in the same checkpoint epoch produced zero
+      WAL output and would be lost on an unclean crash before the next
+      checkpoint. Fix: both branches of `writeHeapTupleToRel` now call
+      `markHeapInsertDirty(ctx.Pool, slot, ctx.Pool.LogHeapInsert(), rel,
+      blk, lineSlot, raw)` — the same helper the main heap-insert path uses
+      (`operators_storage.go:7750`) — which routes through
+      `Pool.MarkDirtyLogicalChange` and unconditionally emits a WAL record
+      on every call, not just the page's first dirty. No on-disk format
+      change; replay is the generic `RecordKindHeapInsert` record. Logical
+      decoding unaffected (`pgoutput.Change` already filters unregistered
+      relations, and TOAST relations were never registered as publishable
+      tables). Test: `TestToastChunkInsertsAreIndividuallyWALLogged`
+      (`internal/executor/toast_test.go`) — wires a real
+      `LogHeapInsert`/`LogPageImage` pool, writes a 3-chunk value on one
+      page, asserts 3 WAL emissions (confirmed 0 on the pre-fix code by
+      reverting and re-running). Gates: `go build`/`go vet` clean; full
+      `internal/executor` suite PASS; `go test -race
+      ./internal/wal/... ./internal/mvcc/... ./internal/storage/...` PASS;
+      pre-commit gate (incl. TPC-H spotcheck + pgbench TPC-B smoke) run.
+      Design: `docs/design/root-0022-toast-oid-restart-durability.md`
+      "Follow-up: per-chunk WAL durability". This closes the
+      counter-collision AND per-chunk-crash-durability TOAST gaps
+      discovered from the WordPress workload; no further TOAST durability
+      deferrals remain open in the ledger as of this loop.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

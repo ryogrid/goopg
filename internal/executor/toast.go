@@ -279,6 +279,15 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 	if err != nil {
 		return err
 	}
+	// Mirror markHeapInsertDirty/operators_storage.go's per-insert WAL
+	// discipline (not a bare ctx.Pool.MarkDirty): MarkDirty's FPI-on-
+	// first-dirty-only behaviour means the 2nd-4th TOAST chunk written
+	// into an already-dirty page in the same checkpoint epoch would
+	// otherwise produce zero WAL output, losing those chunks on an
+	// unclean crash before the next checkpoint even though the pointer
+	// in the (WAL-protected) main tuple survives. See deferral-ledger
+	// row appended by root-0022.
+	logHeap := ctx.Pool.LogHeapInsert()
 	tryAppend := func(blk storage.BlockNumber) (bool, error) {
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -292,11 +301,14 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 				return false, err
 			}
 		}
-		_, addErr := storage.PageAddHeapTuple(slot.Page(), tuple)
+		lineSlot, addErr := storage.PageAddHeapTuple(slot.Page(), tuple)
 		if addErr == nil {
-			ctx.Pool.MarkDirty(slot)
+			derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, raw)
 			slot.Unlock()
 			ctx.Pool.Unpin(slot)
+			if derr != nil {
+				return false, derr
+			}
 			return true, nil
 		}
 		slot.Unlock()
@@ -319,23 +331,21 @@ func writeHeapTupleToRel(ctx *Context, rel storage.RelFileNode, tuple storage.He
 			return nil
 		}
 	}
-	_ = raw
 	slot, blk, err := ctx.Pool.PinNew(rel)
 	if err != nil {
 		return err
 	}
 	slot.Lock()
-	_, err = storage.PageAddHeapTuple(slot.Page(), tuple)
+	lineSlot, err := storage.PageAddHeapTuple(slot.Page(), tuple)
 	if err != nil {
 		slot.Unlock()
 		ctx.Pool.Unpin(slot)
 		return err
 	}
-	ctx.Pool.MarkDirty(slot)
+	derr := markHeapInsertDirty(ctx.Pool, slot, logHeap, rel, blk, lineSlot, raw)
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
-	_ = blk
-	return nil
+	return derr
 }
 
 // DetoastValue reads a TOAST pointer and reassembles the original value

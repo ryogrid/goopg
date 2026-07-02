@@ -110,16 +110,57 @@ startup.
   the cost already paid by `loadStatisticsFromHeap`/`loadUserIndexesFromHeap`
   in the same startup path); a pathologically large TOAST relation would
   slow startup, not correctness — no change needed for this slice.
-- Still open (deferral ledger, not addressed by this slice): TOAST chunk
-  writes (`writeHeapTupleToRel`) dirty pages via plain `Pool.MarkDirty`
-  rather than the change-record/FPI-per-insert discipline the main heap
-  insert path uses (`markHeapInsertDirty`/`LogHeapInsert`), so a chunk
-  written into an already-dirty TOAST page within the same checkpoint epoch
-  as an earlier chunk on that page is not independently WAL-protected — an
-  **unclean crash** before the next checkpoint could still lose it. This is
-  a narrower, secondary durability gap (requires a crash, not just a
-  restart) distinct from the counter-collision bug this slice fixes;
-  tracked in the ledger for a follow-up loop.
+- **RESOLVED (follow-up, same milestone, see below):** TOAST chunk writes
+  now go through the same per-insert WAL discipline as the main heap insert
+  path, closing the unclean-crash gap described in the original version of
+  this section.
+
+## Follow-up: per-chunk WAL durability
+
+The counter-reseed fix above closes the *restart* collision class but, as
+originally filed in the deferral ledger, left a narrower *unclean-crash*
+gap: `writeHeapTupleToRel` dirtied the TOAST page via a bare
+`ctx.Pool.MarkDirty(slot)`, which never invokes any per-insert WAL emitter
+at all — `MarkDirty`'s `maybeEmitFPI` only ever emits a **full-page-image**
+record, and only on the *first* mutation of a page since the last
+checkpoint. Because up to ~4 TOAST chunks (1996 B each) fit on one 8 KiB
+page, chunk 1 into a fresh page got FPI protection but chunks 2-4 written
+into the now-already-dirty page in the same checkpoint epoch produced
+**zero WAL output**. An unclean crash before the next checkpoint's
+`FlushAllPaced` would lose those chunks even though the (WAL-protected)
+pointer in the main tuple survived — a real, narrow hole in TOAST's
+crash-durability contract, independent of the counter-collision bug.
+
+Fix (`internal/executor/toast.go`, `writeHeapTupleToRel`): route every
+TOAST chunk insert through the exact same `markHeapInsertDirty` helper the
+main heap insert path already uses (`operators_storage.go:7750`,
+`ctx.Pool.LogHeapInsert()`), instead of a bare `MarkDirty`. That helper
+calls `Pool.MarkDirtyLogicalChange`, which — unlike `MarkDirty` — **always**
+invokes the per-insert emitter regardless of whether the page was already
+dirty this epoch (the epoch-gated behaviour only controls whether an
+*additional* FPI is also emitted alongside it). Every TOAST chunk row is
+now independently WAL-durable, matching the main heap-insert path's
+guarantee, with zero change to the on-disk TOAST format or `DetoastValue`'s
+reassembly logic. The `lineSlot` returned by `storage.PageAddHeapTuple` (a
+value the function computed but previously discarded) now feeds the WAL
+record, same as the main insert path.
+
+Because the emitted record is the plain `RecordKindHeapInsert` redo record
+(replayed generically by block/line-slot, oblivious to which relation it
+targets), goopg's own crash-recovery replay covers TOAST relations for
+free. Logical decoding is unaffected: `pgoutput.Change` looks up
+`c.Rel` in the publication snapshot (`PgOutput.snap.Lookup`) and silently
+skips any relation not present there — TOAST relations, whose synthetic
+OID (`mainRel.RelOid + 100_000_000`) is never registered as a user table,
+are filtered out exactly as before.
+
+Test: `internal/executor/toast_test.go`,
+`TestToastChunkInsertsAreIndividuallyWALLogged` — wires a `storage.Pool`
+with a real `LogHeapInsert`/`LogPageImage` hook (mirroring
+`internal/initdb/open.go`'s production wiring), writes a 3-chunk TOASTed
+value that lands entirely on one TOAST page, and asserts the WAL-insert
+hook fires once per chunk (not just once for the page's first dirty).
+Confirmed to fail (0 emissions instead of 3) against the pre-fix code.
 
 ## Tests
 
@@ -134,6 +175,8 @@ startup.
     doesn't create a TOAST file as a side effect.
   - `TestSeedToastOIDCounterAdvancesPastExisting` — focused unit test for
     the seeding helper.
+  - `TestToastChunkInsertsAreIndividuallyWALLogged` — per-chunk WAL
+    durability (see "Follow-up" section above).
 - `internal/testport/toast_oid_restart_durability_test.go`:
   `TestPort_ToastValueSurvivesRestartWithoutCollision` — real cluster
   process restart (`cluster.Stop`/`Start`, mirrors
