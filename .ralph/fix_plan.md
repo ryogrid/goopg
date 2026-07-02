@@ -5938,6 +5938,53 @@ documentation-only and is exempt from the design-doc requirement.)
       grantor; `GRANT ... ON PARAMETER` GUC-name validation (both unrelated to
       this slice).
 
+- [x] **`check_role_grantor` implicit/explicit grantor inference
+      (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:** closes the
+      "`check_role_grantor`'s inherited-privilege/superuser fallback for a
+      bare REVOKE's implicit grantor" residual carried by every
+      M0119-0004-ACLHEAP row since the original role-membership slice.
+      `execRoleMembershipChange` always recorded the grantor-of-record as
+      `currentDDLOwnerOID()` regardless of how that user actually came to
+      hold authorization. New `catalog.InMemory.HasPrivsOfRole(memberOid,
+      roleOid) bool` (mirrors `has_privs_of_role`: self, superuser bypass, or
+      an INHERIT-only BFS chain — `ROLERECURSE_PRIVS`, unlike
+      `IsAdminOfRole`'s unconditional `ROLERECURSE_MEMBERS`) and
+      `SelectBestAdmin(memberOid, roleOid) uint32` (mirrors
+      `select_best_admin`: closest INHERIT-chain ancestor, preferring
+      `memberOid` itself, that directly holds `AdminOption` on `roleOid`; 0
+      if none). New `checkRoleGrantor`
+      (`internal/executor/operators_ddl_role_membership.go`) ports
+      `check_role_grantor` exactly, called once per target `roleOid` right
+      after `checkRoleMembershipAuthorization`: no `GRANTED BY` → superuser
+      current user records as `BootstrapSuperuserOID`, otherwise
+      `SelectBestAdmin(currentUserID, roleOid)` (falls back to
+      `currentUserID` defensively rather than PG's internal-error `elog`,
+      ledgered as a deliberate divergence); explicit `GRANTED BY` →
+      `HasPrivsOfRole` gates impersonation (`42501` for both GRANT/REVOKE,
+      PG's exact per-verb message text), and GRANT additionally requires the
+      named grantor's ADMIN OPTION be its OWN
+      (`SelectBestAdmin(explicitGrantorOid, roleOid) == explicitGrantorOid`),
+      exempting the bootstrap superuser. Also fixed a sibling bug: an
+      unresolvable `GRANTED BY` name previously fell back silently to the
+      current user instead of raising `42704`. Tests:
+      `TestHasPrivsOfRole`/`TestSelectBestAdmin`
+      (`internal/catalog/role_membership_test.go`);
+      `TestExecRoleMembershipChangeInfersGrantorViaInheritedAdmin`/
+      `GrantedByRequiresPrivsOfGrantor`/`GrantedByRequiresDirectAdminOption`/
+      `UnresolvableGrantedByErrors`
+      (`internal/executor/operators_ddl_role_membership_test.go`). Gates:
+      `go build ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/wal`+`internal/initdb`+`internal/server`
+      suites PASS; `TestPort_PgDumpallRoleMembership` PASS (unaffected —
+      bootstrap-superuser path unchanged); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-membership-grantor-inference.md`;
+      `docs/design/README.md` row `0119-0004ce` added; deferral ledger row
+      appended. Still open: the `ROLE_PG_DATABASE_OWNER` "cannot have
+      explicit members" carve-out (unreachable today — predefined roles are
+      never registered in the live role-name registry); `GRANT ... ON
+      PARAMETER` GUC-name validation (unrelated to this slice).
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
