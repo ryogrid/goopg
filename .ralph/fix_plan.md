@@ -5587,6 +5587,57 @@ documentation-only and is exempt from the design-doc requirement.)
       unrecognised (fall through to the no-op); multi-database scope
       unchanged from `datacl`.
 
+- [x] **`ALTER ROLE ... [IN DATABASE ...] SET`/`RESET`/`RESET ALL`
+      (`pg_db_role_setting.setconfig`, `setrole != 0`) round-trip in pg_dump
+      (M0119-0004-ACLHEAP follow-up, interactive session).** **COMPLETE
+      2026-07-02:** closes the loop #17 row's own "`ALTER ROLE ... SET`/
+      `ALTER ROLE ... IN DATABASE ... SET` entirely unimplemented" residual —
+      the `setrole != 0` complement of `pg_db_role_setting`.
+      `parseAlterRoleConfig` (`internal/server/role_ddl.go`) mirrors
+      `parseAlterDatabaseConfig`'s wire-dispatch bypass (reusing
+      `database_ddl.go`'s tokenizer helpers), tried first in
+      `tryHandleRoleDDL`'s `alter role`/`alter user` case, ahead of RENAME and
+      the attribute form. `tryHandleRoleDDL` gained a `dbName` parameter
+      (both `dispatch.go` call sites now pass `connTx.DBName`) so `IN
+      DATABASE` gets the same v0-scope restriction as `ALTER DATABASE ...
+      SET`/`datacl`: naming any database other than the connection's own is a
+      silent no-op. New `catalog.InMemory.roleSettings
+      map[roleSettingKey][]string` (`roleSettingKey{RoleOID, DBOid}`, DBOid
+      0=cluster-wide or `FirstUserOID`=`IN DATABASE`) backs `SetRoleConfig`/
+      `ResetRoleConfig`/`ResetAllRoleConfig`/`RoleConfigEntries`, mirroring
+      the `*DatabaseConfig` quartet's exact semantics; `AllRoleConfigRows()`
+      (sorted) feeds `pg_db_role_setting.VirtualRows` alongside the
+      pre-existing `setrole=0` row. **Scope note (not a gotcha):** PG splits
+      this catalog's dump across `pg_dump --create` (`IN DATABASE`,
+      `setdatabase != 0`) and `pg_dumpall` (plain cluster-wide,
+      `setdatabase = 0`); since M0119-0004 is the pg_dump-only TAP battery,
+      the round-trip test exercises `IN DATABASE` only, though the engine
+      plumbing (and unit tests) already cover `dbOid=0` too. Three new WAL
+      kinds (76-78) + `internal/initdb/role_config_recovery.go` mirror the
+      ALTER-DATABASE-SET restart-persistence pattern; ordering vs. role DDL
+      replay doesn't matter (records key off the role's stable OID, not
+      name). Tests: `internal/catalog/database_test.go` (4 new);
+      `internal/server/role_config_test.go` `TestParseAlterRoleConfig` (9
+      positive + 6 negative) + `TestTryHandleRoleDDLAlterRoleConfig`;
+      `internal/wal/role_config_ddl_test.go`;
+      `internal/initdb/role_config_recovery_test.go`;
+      `internal/testport/pgdump_role_config_test.go`
+      `TestPort_PgDumpRoleConfigSet` (byte-identical vs real pg_dump 18.3
+      `--create`, confirms a cluster-wide override does NOT leak into the
+      pg_dump-only surface). Gates: `go build ./...`/`go vet` clean;
+      `internal/catalog`+`internal/server`+`internal/wal`+`internal/initdb`
+      suites PASS; `TestPort_PgDumpRoleConfigSet`/
+      `TestPort_PgDumpDatabaseConfigSet`/`TestPort_PgDumpDatabaseGrantACL`/
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-config-set-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bu` added; deferral ledger row
+      appended. Still open: extended-protocol gap (standing); multi-database
+      scope (standing); `pg_dumpall`'s cluster-wide dump surface untested
+      (separate future TAP-porting task, not a new engine capability); `SET
+      TIME ZONE`/`SET SESSION AUTHORIZATION`/`SET ... FROM CURRENT`
+      unrecognised; `ALTER ROLE ALL SET ...` unsupported.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

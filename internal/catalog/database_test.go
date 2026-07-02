@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 )
 
@@ -236,5 +237,113 @@ func TestPgDbRoleSettingVirtualRowsProjectsOverrides(t *testing.T) {
 	want := `{work_mem=64MB,"search_path=public,pg_catalog"}`
 	if row[2] != want {
 		t.Errorf("setconfig = %q, want %q", row[2], want)
+	}
+}
+
+// TestSetRoleConfigUpsertsInPlace mirrors TestSetDatabaseConfigUpsertsInPlace
+// for the setrole != 0 half (M0119-0004-ACLHEAP, ALTER ROLE ... SET
+// follow-up): SetRoleConfig replaces a same-name entry in place and appends
+// otherwise, independent of the dbOid scope.
+func TestSetRoleConfigUpsertsInPlace(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterRole("alice")
+	roleOid, _ := c.RoleOID("alice")
+
+	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
+	c.SetRoleConfig(roleOid, 0, "search_path", "public")
+	c.SetRoleConfig(roleOid, 0, "work_mem", "128MB")
+
+	got := c.RoleConfigEntries(roleOid, 0)
+	want := []string{"work_mem=128MB", "search_path=public"}
+	if len(got) != len(want) {
+		t.Fatalf("RoleConfigEntries = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry[%d] = %q, want %q (full: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestRoleConfigScopedByDatabase confirms the same role's cluster-wide
+// (dbOid=0) and IN-DATABASE (dbOid=FirstUserOID) overrides are independent
+// pg_db_role_setting rows.
+func TestRoleConfigScopedByDatabase(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterRole("alice")
+	roleOid, _ := c.RoleOID("alice")
+
+	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
+	c.SetRoleConfig(roleOid, FirstUserOID, "work_mem", "1MB")
+
+	if got := c.RoleConfigEntries(roleOid, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
+		t.Errorf("RoleConfigEntries(role, 0) = %v, want [work_mem=64MB]", got)
+	}
+	if got := c.RoleConfigEntries(roleOid, FirstUserOID); len(got) != 1 || got[0] != "work_mem=1MB" {
+		t.Errorf("RoleConfigEntries(role, FirstUserOID) = %v, want [work_mem=1MB]", got)
+	}
+
+	c.ResetAllRoleConfig(roleOid, 0)
+	if got := c.RoleConfigEntries(roleOid, 0); len(got) != 0 {
+		t.Errorf("RoleConfigEntries(role, 0) after RESET ALL = %v, want empty", got)
+	}
+	if got := c.RoleConfigEntries(roleOid, FirstUserOID); len(got) != 1 {
+		t.Errorf("RESET ALL on dbOid=0 must not touch the IN-DATABASE scope: %v", got)
+	}
+}
+
+// TestResetRoleConfigRemovesOnlyNamedEntry mirrors
+// TestResetDatabaseConfigRemovesOnlyNamedEntry.
+func TestResetRoleConfigRemovesOnlyNamedEntry(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterRole("alice")
+	roleOid, _ := c.RoleOID("alice")
+	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
+	c.SetRoleConfig(roleOid, 0, "search_path", "public")
+	c.ResetRoleConfig(roleOid, 0, "work_mem")
+	got := c.RoleConfigEntries(roleOid, 0)
+	if len(got) != 1 || got[0] != "search_path=public" {
+		t.Errorf("RoleConfigEntries after reset = %v, want [\"search_path=public\"]", got)
+	}
+	// Resetting an unrecorded name is a no-op, not an error/panic.
+	c.ResetRoleConfig(roleOid, 0, "no_such_guc")
+	if len(c.RoleConfigEntries(roleOid, 0)) != 1 {
+		t.Errorf("ResetRoleConfig on unknown name should be a no-op")
+	}
+}
+
+// TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides confirms
+// pg_db_role_setting also projects setrole != 0 rows (both the cluster-wide
+// dbOid=0 and IN-DATABASE FirstUserOID forms) alongside the pre-existing
+// setrole=0 database row, sorted deterministically by (RoleOID, DBOid).
+func TestPgDbRoleSettingVirtualRowsProjectsRoleOverrides(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatalf("pg_db_role_setting virtual table not registered")
+	}
+
+	c.RegisterRole("alice")
+	roleOid, _ := c.RoleOID("alice")
+	c.SetDatabaseConfig(FirstUserOID, "log_statement", "all")
+	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
+	c.SetRoleConfig(roleOid, FirstUserOID, "search_path", "public")
+
+	rows := tbl.VirtualRows()
+	if len(rows) != 3 {
+		t.Fatalf("pg_db_role_setting rows = %v, want exactly 3 rows", rows)
+	}
+	// row 0: the pre-existing setrole=0 database row.
+	if rows[0][0] != "16384" || rows[0][1] != "0" {
+		t.Errorf("row 0 (setdatabase, setrole) = (%q, %q), want (16384, 0)", rows[0][0], rows[0][1])
+	}
+	roleOidStr := strconv.FormatUint(uint64(roleOid), 10)
+	// row 1: the role's cluster-wide (dbOid=0) override.
+	if rows[1][0] != "0" || rows[1][1] != roleOidStr || rows[1][2] != "{work_mem=64MB}" {
+		t.Errorf("row 1 = %v, want (0, %s, {work_mem=64MB})", rows[1], roleOidStr)
+	}
+	// row 2: the role's IN-DATABASE override.
+	if rows[2][0] != "16384" || rows[2][1] != roleOidStr || rows[2][2] != "{search_path=public}" {
+		t.Errorf("row 2 = %v, want (16384, %s, {search_path=public})", rows[2], roleOidStr)
 	}
 }

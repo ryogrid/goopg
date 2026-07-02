@@ -133,7 +133,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Peel the leading role statement off, handle it, then recurse on the
 		// remainder so every statement runs. M0118-0008.
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
-			if handled, herr := s.tryHandleRoleDDL(first); handled {
+			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName); handled {
 				if herr != nil {
 					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
 				}
@@ -150,7 +150,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
-		if handled, herr := s.tryHandleRoleDDL(sql); handled {
+		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName); handled {
 			if herr != nil {
 				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
 			}

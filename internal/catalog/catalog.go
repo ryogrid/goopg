@@ -1999,6 +1999,17 @@ type InMemory struct {
 	// entry, RESET ALL clears the whole slice. M0119-0004-ACLHEAP (ALTER
 	// DATABASE ... SET follow-up).
 	dbRoleSettings map[uint32][]string
+	// roleSettings holds `ALTER ROLE name [IN DATABASE dbname] SET config =
+	// value` overrides (pg_db_role_setting, setrole != 0 rows — the
+	// complement of dbRoleSettings' setrole=0 rows). Keyed by
+	// roleSettingKey{RoleOID, DBOid}: DBOid is 0 for a plain cluster-wide
+	// `ALTER ROLE ... SET` (setdatabase=0, applies in every database) or
+	// FirstUserOID for the `IN DATABASE` form scoped to goopg's single live
+	// database (mirrors dbRoleSettings' FirstUserOID keying — the same SQL
+	// -visible placeholder oid pg_database.VirtualRows displays). Entry
+	// format matches dbRoleSettings (ordered "name=value" strings).
+	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+	roleSettings map[roleSettingKey][]string
 
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
@@ -2775,6 +2786,7 @@ func NewInMemory() *InMemory {
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		dbRoleSettings:         make(map[uint32][]string),
+		roleSettings:           make(map[roleSettingKey][]string),
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
 		toastRenames:           make(map[uint32]string),
@@ -3980,6 +3992,101 @@ func (c *InMemory) DatabaseConfigEntries(dbOid uint32) []string {
 	out := make([]string, len(entries))
 	copy(out, entries)
 	return out
+}
+
+// roleSettingKey identifies one `ALTER ROLE ... SET` override row. See
+// InMemory.roleSettings' doc comment for the DBOid=0 vs FirstUserOID
+// distinction.
+type roleSettingKey struct {
+	RoleOID uint32
+	DBOid   uint32
+}
+
+// SetRoleConfig upserts an `ALTER ROLE ... [IN DATABASE ...] SET name =
+// value` override, mirroring SetDatabaseConfig's in-place-replace-or-append
+// semantics. M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+func (c *InMemory) SetRoleConfig(roleOid, dbOid uint32, name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleSettingKey{RoleOID: roleOid, DBOid: dbOid}
+	entry := name + "=" + value
+	entries := c.roleSettings[key]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			entries[i] = entry
+			return
+		}
+	}
+	c.roleSettings[key] = append(entries, entry)
+}
+
+// ResetRoleConfig removes a single `ALTER ROLE ... [IN DATABASE ...] RESET
+// name` override, if present.
+func (c *InMemory) ResetRoleConfig(roleOid, dbOid uint32, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleSettingKey{RoleOID: roleOid, DBOid: dbOid}
+	entries := c.roleSettings[key]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			c.roleSettings[key] = append(entries[:i], entries[i+1:]...)
+			return
+		}
+	}
+}
+
+// ResetAllRoleConfig clears every override for (roleOid, dbOid) (`ALTER
+// ROLE ... [IN DATABASE ...] RESET ALL`).
+func (c *InMemory) ResetAllRoleConfig(roleOid, dbOid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.roleSettings, roleSettingKey{RoleOID: roleOid, DBOid: dbOid})
+}
+
+// RoleConfigEntries returns a copy of (roleOid, dbOid)'s setconfig entries
+// ("name=value" strings, insertion order), or nil when none are set.
+func (c *InMemory) RoleConfigEntries(roleOid, dbOid uint32) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries := c.roleSettings[roleSettingKey{RoleOID: roleOid, DBOid: dbOid}]
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, len(entries))
+	copy(out, entries)
+	return out
+}
+
+// RoleConfigRow is one pg_db_role_setting row keyed by a non-zero setrole,
+// returned by AllRoleConfigRows in deterministic (RoleOID, DBOid) order.
+type RoleConfigRow struct {
+	RoleOID uint32
+	DBOid   uint32
+	Entries []string
+}
+
+// AllRoleConfigRows returns every `ALTER ROLE ... SET` override currently
+// recorded, sorted by (RoleOID, DBOid) for deterministic pg_db_role_setting
+// virtual-row output.
+func (c *InMemory) AllRoleConfigRows() []RoleConfigRow {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.roleSettings) == 0 {
+		return nil
+	}
+	rows := make([]RoleConfigRow, 0, len(c.roleSettings))
+	for key, entries := range c.roleSettings {
+		cp := make([]string, len(entries))
+		copy(cp, entries)
+		rows = append(rows, RoleConfigRow{RoleOID: key.RoleOID, DBOid: key.DBOid, Entries: cp})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].RoleOID != rows[j].RoleOID {
+			return rows[i].RoleOID < rows[j].RoleOID
+		}
+		return rows[i].DBOid < rows[j].DBOid
+	})
+	return rows
 }
 
 // RegisterIndexDuringRecovery is the idempotent version of
@@ -8151,17 +8258,22 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_shseclabel"] = pgShseclabel
 
 	// pg_db_role_setting — per-database/per-role GUC override catalog
-	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabase (--create
-	// only) queries `SELECT unnest(setconfig) FROM pg_db_role_setting WHERE
-	// setrole = 0 AND setdatabase = <dboid>` to render `ALTER DATABASE ... SET
-	// ...` clauses. `ALTER DATABASE ... SET`/`RESET` now writes into
-	// SetDatabaseConfig/ResetDatabaseConfig (v0 scope: only the live connected
-	// database, mirroring execDatabaseACLChange's datacl restriction), keyed
-	// by FirstUserOID (16384) to match the oid pg_dump already read from this
-	// same pg_database row; setrole is always "0" since ALTER ROLE ... SET /
-	// ALTER ROLE ... IN DATABASE ... SET remain unimplemented (a separate,
-	// out-of-scope feature — see the deferral ledger). M0119-0004-ACLHEAP
-	// (ALTER DATABASE ... SET follow-up).
+	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabaseConfig
+	// (pg_dump.c, --create only) queries `SELECT unnest(setconfig) FROM
+	// pg_db_role_setting WHERE setrole = 0 AND setdatabase = <dboid>` for
+	// `ALTER DATABASE ... SET ...` clauses, and separately `SELECT rolname,
+	// unnest(setconfig) FROM pg_db_role_setting s, pg_roles r WHERE setrole =
+	// r.oid AND setdatabase = <dboid>` for `ALTER ROLE ... IN DATABASE ...
+	// SET ...` clauses. `ALTER DATABASE ... SET`/`RESET` writes into
+	// SetDatabaseConfig/ResetDatabaseConfig (setrole=0 rows, v0 scope: only
+	// the live connected database, mirroring execDatabaseACLChange's datacl
+	// restriction), keyed by FirstUserOID (16384) to match the oid pg_dump
+	// already read from the pg_database row. `ALTER ROLE ... SET`/`RESET`
+	// writes into SetRoleConfig/ResetRoleConfig (setrole != 0 rows), keyed by
+	// the role's real OID and either 0 (cluster-wide) or the same
+	// FirstUserOID (`IN DATABASE`, same v0 single-live-database scope
+	// restriction). M0119-0004-ACLHEAP (ALTER DATABASE/ROLE ... SET
+	// follow-up).
 	pgDbRoleSetting := &Table{
 		Schema: "pg_catalog", Name: "pg_db_role_setting", Virtual: true,
 		Columns: []Column{
@@ -8172,16 +8284,27 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2964,
 	}
 	pgDbRoleSetting.VirtualRows = func() [][]string {
+		var out [][]string
 		dbOid := FirstUserOID
-		entries := c.DatabaseConfigEntries(dbOid)
-		if len(entries) == 0 {
-			return nil
+		if entries := c.DatabaseConfigEntries(dbOid); len(entries) > 0 {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(dbOid), 10),
+				"0",
+				optionsArrayLiteral(entries),
+			})
 		}
-		return [][]string{{
-			strconv.FormatUint(uint64(dbOid), 10),
-			"0",
-			optionsArrayLiteral(entries),
-		}}
+		// setrole != 0 rows: `ALTER ROLE ... [IN DATABASE ...] SET ...`
+		// (M0119-0004-ACLHEAP, ALTER ROLE ... SET follow-up). DBOid is 0 for
+		// a plain cluster-wide override (setdatabase=0) or FirstUserOID for
+		// the IN DATABASE form.
+		for _, row := range c.AllRoleConfigRows() {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(row.DBOid), 10),
+				strconv.FormatUint(uint64(row.RoleOID), 10),
+				optionsArrayLiteral(row.Entries),
+			})
+		}
+		return out
 	}
 	c.tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
 

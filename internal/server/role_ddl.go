@@ -41,11 +41,14 @@ import (
 	"github.com/goopg/goopg/internal/wal"
 )
 
-// tryHandleRoleDDL returns (handled, err).
+// tryHandleRoleDDL returns (handled, err). dbName is the calling
+// connection's own database (connTx.DBName) — needed only for the ALTER
+// ROLE ... [IN DATABASE ...] SET/RESET branch, mirroring
+// tryHandleDatabaseDDL's liveDBName parameter.
 //   - handled=true, err=nil:   statement was handled successfully
 //   - handled=true, err!=nil:  statement was handled but failed (e.g. role not found)
 //   - handled=false, err=nil:  not a role DDL statement; caller should continue
-func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
+func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
 	norm := normalizeCompatSQL(sql)
 	switch {
 	case strings.HasPrefix(norm, "create role "), strings.HasPrefix(norm, "create user "),
@@ -81,6 +84,9 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 		return true, nil
 
 	case strings.HasPrefix(norm, "alter role "), strings.HasPrefix(norm, "alter user "):
+		if op, ok := parseAlterRoleConfig(sql); ok {
+			return s.applyAlterRoleConfig(op, dbName)
+		}
 		if oldName, newName, ok := roleRenameFromAlter(norm); ok {
 			return true, s.renameRole(oldName, newName)
 		}
@@ -393,6 +399,171 @@ func roleNameFromAlter(norm string) (name string, hasAttrs bool) {
 		return name, false
 	}
 	return name, true
+}
+
+// roleConfigRegistry is the subset of catalog.Catalog the ALTER ROLE ...
+// SET/RESET handler needs beyond RoleOID (already exposed directly on the
+// catalog.Catalog interface). catalog.InMemory satisfies this interface.
+// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+type roleConfigRegistry interface {
+	SetRoleConfig(roleOid, dbOid uint32, name, value string)
+	ResetRoleConfig(roleOid, dbOid uint32, name string)
+	ResetAllRoleConfig(roleOid, dbOid uint32)
+}
+
+// alterRoleConfigOp is the result of a successful parseAlterRoleConfig
+// classification: an `ALTER ROLE <name> [IN DATABASE <dbname>] SET <config>
+// = <value>` / `RESET <config>` / `RESET ALL` statement. Mirrors
+// parseAlterDatabaseConfig (internal/server/database_ddl.go) — same
+// string-prefix wire-dispatch bypass, complementary setrole != 0 half of
+// pg_db_role_setting. M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+type alterRoleConfigOp struct {
+	roleName    string
+	hasDatabase bool // true when an "IN DATABASE <dbname>" clause was present
+	dbName      string
+	configName  string // empty when resetAll
+	configValue string // meaningful only when !reset && !resetAll
+	reset       bool   // RESET <name>
+	resetAll    bool   // RESET ALL
+}
+
+// parseAlterRoleConfig recognises the SET/RESET forms of ALTER ROLE/USER
+// described on alterRoleConfigOp, with an optional "IN DATABASE <dbname>"
+// clause between the role name and SET/RESET. Returns ok=false for any
+// other SQL (including the attribute/RENAME forms tryHandleRoleDDL handles
+// elsewhere), leaving the caller to fall through to its existing behaviour.
+//
+// "ALTER ROLE ALL SET ..." (role_specification = ALL, PG's cluster-wide
+// -default form applying to every role) is intentionally NOT special-cased
+// here — roleName "all" simply fails RoleOID resolution in
+// applyAlterRoleConfig and falls through to the pre-existing no-op path;
+// see the deferral ledger.
+func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
+	s := strings.TrimSpace(sql)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	lower := strings.ToLower(s)
+	var stripped string
+	switch {
+	case strings.HasPrefix(lower, "alter role "):
+		stripped = s[len("alter role "):]
+	case strings.HasPrefix(lower, "alter user "):
+		stripped = s[len("alter user "):]
+	default:
+		return alterRoleConfigOp{}, false
+	}
+	roleName, rest, ok := splitLeadingSQLToken(stripped)
+	if !ok || roleName == "" {
+		return alterRoleConfigOp{}, false
+	}
+	op := alterRoleConfigOp{roleName: roleName}
+	lowerRest := strings.ToLower(rest)
+	if strings.HasPrefix(lowerRest, "in database ") {
+		dbName, r2, ok := splitLeadingSQLToken(rest[len("in database "):])
+		if !ok || dbName == "" {
+			return alterRoleConfigOp{}, false
+		}
+		op.hasDatabase = true
+		op.dbName = dbName
+		rest = r2
+		lowerRest = strings.ToLower(rest)
+	}
+	switch {
+	case strings.HasPrefix(lowerRest, "set "):
+		rest = strings.TrimSpace(rest[len("set "):])
+		configName, rest, ok := splitLeadingSQLToken(rest)
+		if !ok || configName == "" {
+			return alterRoleConfigOp{}, false
+		}
+		switch lr := strings.ToLower(rest); {
+		case strings.HasPrefix(lr, "to "):
+			rest = strings.TrimSpace(rest[len("to "):])
+		case strings.HasPrefix(rest, "="):
+			rest = strings.TrimSpace(rest[1:])
+		default:
+			return alterRoleConfigOp{}, false
+		}
+		if strings.EqualFold(rest, "default") {
+			op.configName = configName
+			op.reset = true
+			return op, true
+		}
+		value, ok := flattenConfigValueList(rest)
+		if !ok {
+			return alterRoleConfigOp{}, false
+		}
+		op.configName = configName
+		op.configValue = value
+		return op, true
+	case strings.HasPrefix(lowerRest, "reset "):
+		rest = strings.TrimSpace(rest[len("reset "):])
+		if strings.EqualFold(rest, "all") {
+			op.resetAll = true
+			return op, true
+		}
+		configName, _, ok := splitLeadingSQLToken(rest)
+		if !ok || configName == "" {
+			return alterRoleConfigOp{}, false
+		}
+		op.configName = configName
+		op.reset = true
+		return op, true
+	}
+	return alterRoleConfigOp{}, false
+}
+
+// applyAlterRoleConfig applies a parsed ALTER ROLE ... SET/RESET operation,
+// mirroring applyAlterDatabaseConfig's shape (role DDL has no notice-string
+// channel, unlike database DDL's IF EXISTS-drop notice, so this returns
+// (handled, err) rather than (handled, notice, err)). Naming any database
+// other than the connection's own liveDBName via IN DATABASE is a silent
+// no-op — see applyAlterDatabaseConfig's doc comment for why (goopg v0 has
+// no GUC-override storage for a database it isn't connected to).
+func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string) (bool, error) {
+	if s.cfg.Catalog == nil {
+		return false, nil
+	}
+	roleName := strings.Trim(op.roleName, `"`)
+	roleOid, found := s.cfg.Catalog.RoleOID(roleName)
+	if !found {
+		return true, roleDoesNotExistErr(roleName)
+	}
+	reg, ok := s.cfg.Catalog.(roleConfigRegistry)
+	if !ok {
+		return false, nil
+	}
+	var dbOid uint32
+	if op.hasDatabase {
+		if !strings.EqualFold(strings.Trim(op.dbName, `"`), liveDBName) {
+			return true, nil
+		}
+		dbOid = catalog.FirstUserOID
+	}
+	switch {
+	case op.resetAll:
+		reg.ResetAllRoleConfig(roleOid, dbOid)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleResetAllConfig(roleOid, dbOid)); werr != nil {
+				return true, werr
+			}
+		}
+	case op.reset:
+		reg.ResetRoleConfig(roleOid, dbOid, op.configName)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleResetConfig(roleOid, dbOid, op.configName)); werr != nil {
+				return true, werr
+			}
+		}
+	default:
+		reg.SetRoleConfig(roleOid, dbOid, op.configName, op.configValue)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleSetConfig(roleOid, dbOid, op.configName, op.configValue)); werr != nil {
+				return true, werr
+			}
+		}
+	}
+	return true, nil
 }
 
 // roleRenameFromAlter recognises the `ALTER ROLE/USER <name> RENAME TO

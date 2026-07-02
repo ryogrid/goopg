@@ -1087,6 +1087,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: database config replay: %w", err)
 	}
 
+	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up): replay ALTER ROLE
+	// ... SET/RESET WAL records into pg_db_role_setting. Each record keys
+	// off the role's OID (stable across a rename/restart), not its name, so
+	// ordering relative to role DDL replay does not matter.
+	if err := replayRoleConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: role config replay: %w", err)
+	}
+
 	// M0112: restore per-column planner statistics from pg_statistic.
 	// Non-fatal: if absent or malformed, the planner uses defaults until
 	// the next ANALYZE run.

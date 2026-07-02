@@ -888,6 +888,31 @@ const (
 	//   kind(1) | dbOid(4)
 	RecordKindAlterDatabaseResetAllConfig byte = 75
 
+	// RecordKindAlterRoleSetConfig records an `ALTER ROLE <name> [IN
+	// DATABASE <dbname>] SET <config> = <value>` event so the
+	// pg_db_role_setting.setconfig override survives a restart
+	// (M0119-0004-ACLHEAP ALTER ROLE ... SET follow-up). Same no-op
+	// physical redo path as RecordKindAlterDatabaseSetConfig; the recovery
+	// driver in internal/initdb/role_config_recovery.go re-applies these to
+	// catalog.InMemory's roleSettings registry via SetRoleConfig.
+	// Format:
+	//   kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes)
+	RecordKindAlterRoleSetConfig byte = 76
+
+	// RecordKindAlterRoleResetConfig records an `ALTER ROLE <name> [IN
+	// DATABASE <dbname>] RESET <config>` event. Same no-op physical redo
+	// path as RecordKindAlterRoleSetConfig.
+	// Format:
+	//   kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterRoleResetConfig byte = 77
+
+	// RecordKindAlterRoleResetAllConfig records an `ALTER ROLE <name> [IN
+	// DATABASE <dbname>] RESET ALL` event. Same no-op physical redo path as
+	// RecordKindAlterRoleSetConfig.
+	// Format:
+	//   kind(1) | roleOid(4) | dbOid(4)
+	RecordKindAlterRoleResetAllConfig byte = 78
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1380,6 +1405,126 @@ func DecodeAlterDatabaseResetAllConfig(payload []byte) (dbOid uint32, err error)
 		return 0, fmt.Errorf("wal: record kind %d is not alter-database-reset-all-config", payload[0])
 	}
 	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// EncodeAlterRoleSetConfig encodes an `ALTER ROLE ... [IN DATABASE ...] SET
+// name = value` event (M0119-0004-ACLHEAP ALTER ROLE ... SET follow-up).
+// Format: kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes).
+func EncodeAlterRoleSetConfig(roleOid, dbOid uint32, name, value string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(value) > 0xFFFF {
+		value = value[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterRoleSetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], roleOid)
+	buf.Write(d[:])
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	binary.LittleEndian.PutUint16(l[:], uint16(len(value)))
+	buf.Write(l[:])
+	buf.WriteString(value)
+	return buf.Bytes()
+}
+
+// DecodeAlterRoleSetConfig decodes a RecordKindAlterRoleSetConfig payload.
+func DecodeAlterRoleSetConfig(payload []byte) (roleOid, dbOid uint32, name, value string, err error) {
+	if len(payload) < 11 {
+		return 0, 0, "", "", fmt.Errorf("wal: alter-role-set-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleSetConfig {
+		return 0, 0, "", "", fmt.Errorf("wal: record kind %d is not alter-role-set-config", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	dbOid = binary.LittleEndian.Uint32(payload[5:9])
+	off := 9
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-role-set-config payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-role-set-config string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr16(); err != nil {
+		return 0, 0, "", "", err
+	}
+	if value, err = readStr16(); err != nil {
+		return 0, 0, "", "", err
+	}
+	return roleOid, dbOid, name, value, nil
+}
+
+// EncodeAlterRoleResetConfig encodes an `ALTER ROLE ... [IN DATABASE ...]
+// RESET name` event.
+// Format: kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterRoleResetConfig(roleOid, dbOid uint32, name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterRoleResetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], roleOid)
+	buf.Write(d[:])
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	return buf.Bytes()
+}
+
+// DecodeAlterRoleResetConfig decodes a RecordKindAlterRoleResetConfig payload.
+func DecodeAlterRoleResetConfig(payload []byte) (roleOid, dbOid uint32, name string, err error) {
+	if len(payload) < 11 {
+		return 0, 0, "", fmt.Errorf("wal: alter-role-reset-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleResetConfig {
+		return 0, 0, "", fmt.Errorf("wal: record kind %d is not alter-role-reset-config", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	dbOid = binary.LittleEndian.Uint32(payload[5:9])
+	nameLen := int(binary.LittleEndian.Uint16(payload[9:11]))
+	if len(payload) < 11+nameLen {
+		return 0, 0, "", fmt.Errorf("wal: alter-role-reset-config payload truncated (need %d bytes)", 11+nameLen)
+	}
+	return roleOid, dbOid, string(payload[11 : 11+nameLen]), nil
+}
+
+// EncodeAlterRoleResetAllConfig encodes an `ALTER ROLE ... [IN DATABASE
+// ...] RESET ALL` event.
+// Format: kind(1) | roleOid(4) | dbOid(4).
+func EncodeAlterRoleResetAllConfig(roleOid, dbOid uint32) []byte {
+	out := make([]byte, 9)
+	out[0] = RecordKindAlterRoleResetAllConfig
+	binary.LittleEndian.PutUint32(out[1:5], roleOid)
+	binary.LittleEndian.PutUint32(out[5:9], dbOid)
+	return out
+}
+
+// DecodeAlterRoleResetAllConfig decodes a RecordKindAlterRoleResetAllConfig payload.
+func DecodeAlterRoleResetAllConfig(payload []byte) (roleOid, dbOid uint32, err error) {
+	if len(payload) < 9 {
+		return 0, 0, fmt.Errorf("wal: alter-role-reset-all-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleResetAllConfig {
+		return 0, 0, fmt.Errorf("wal: record kind %d is not alter-role-reset-all-config", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), binary.LittleEndian.Uint32(payload[5:9]), nil
 }
 
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
@@ -5261,6 +5406,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// recovery driver in internal/initdb/database_config_recovery.go
 		// scans the WAL for these records after physical replay and
 		// re-applies them to the registry.
+		return false, nil
+	case RecordKindAlterRoleSetConfig, RecordKindAlterRoleResetConfig, RecordKindAlterRoleResetAllConfig:
+		// ALTER ROLE ... SET/RESET records (M0119-0004-ACLHEAP ALTER ROLE
+		// ... SET follow-up) carry only catalog.InMemory's roleSettings
+		// registry state; same no-op physical replay path as the ALTER
+		// DATABASE ... SET/RESET records above. The recovery driver in
+		// internal/initdb/role_config_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the
+		// registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
