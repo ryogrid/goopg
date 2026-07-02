@@ -1,0 +1,86 @@
+[
+ {
+  "key": "958e1a6c",
+  "date": "2026-05-06",
+  "task_id": "M0055-0005-followup-two-phase-del",
+  "feature": "Replay-safe WAL log handling for two-phase delete operations to ensure crash recovery consistency in B-tree indices.",
+  "resume_point": ""
+ },
+ {
+  "key": "958e1a6c",
+  "date": "2026-05-06",
+  "task_id": "M0055-0006-followup-external-sort",
+  "feature": "External-sort algorithm for sorting index entries during CREATE INDEX to avoid memory exhaustion when processing large datasets that exceed available RAM.",
+  "resume_point": ""
+ },
+ {
+  "key": "0b46771e",
+  "date": "2026-05-06",
+  "task_id": "M0055-0002-followup-rightmost-cache",
+  "feature": "Append-workload fastpath cache on *BTree structure to optimize sequential insert patterns by caching rightmost node references.",
+  "resume_point": ""
+ },
+ {
+  "key": "bf65bba9",
+  "date": "2026-05-06",
+  "task_id": "M0055-0003",
+  "feature": "Dedup retention policy for B-tree indexing, implementing PostgreSQL-compatible value deduplication during index construction and steady-state maintenance.",
+  "resume_point": ""
+ },
+ {
+  "key": "8b1875d2",
+  "date": "2026-05-06",
+  "task_id": "M0054-0007",
+  "feature": "Empirical TPC-H Q20 wall-clock validation using HammerDB SF=1 resume run to confirm performance improvements from multi-parameter correlation unnesting.",
+  "resume_point": "next HammerDB SF=1 resume run"
+ },
+ {
+  "key": "e431ec30",
+  "date": "2026-05-06",
+  "task_id": "M0054-0007-followup-resume",
+  "feature": "Full verification of all 22 close criteria for M0054-0007 milestone, deferred as a partial milestone to be resumed after M0054-0008 completion.",
+  "resume_point": "after M0054-0008 lands"
+ },
+ {
+  "key": "3a7fe104",
+  "date": "2026-05-06",
+  "task_id": "M0054-0009",
+  "feature": "Follow-up optimization task derived from run-013 TPC-H power test findings, addressing performance issues revealed by Q20 timeout (7200s budget exceeded).",
+  "resume_point": ""
+ },
+ {
+  "key": "09e24d1f",
+  "date": "2026-05-07",
+  "task_id": "M0062-0002",
+  "feature": "Q8 still returns 0 rows; the full fix requires complete IndexScan-alias plumbing that is currently in progress.",
+  "resume_point": ""
+ },
+ {
+  "key": "fef7a709",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "SASLprep pre-processing for SASL authentication username normalization",
+  "resume_point": "see maybe_not_completed_tasks.md for deferred details"
+ },
+ {
+  "key": "fef7a709",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Channel binding support for SASL authentication to validate client-server channel integrity",
+  "resume_point": "see maybe_not_completed_tasks.md for deferred details"
+ },
+ {
+  "key": "faf2e71f",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Implement range-correlation support for EXISTS with non-equijoin predicates (e.g., l_suppkey <> ...)",
+  "resume_point": ""
+ },
+ {
+  "key": "e2a37eaa",
+  "date": "2026-05-07",
+  "task_id": "M0063-0002",
+  "feature": "Q5 query optimization and correctness testing is not yet addressed.",
+  "resume_point": ""
+ }
+]

@@ -1,0 +1,86 @@
+[
+ {
+  "key": "d9ded322",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Initplan caching for subqueries (cache results across repeated evaluations)",
+  "resume_point": ""
+ },
+ {
+  "key": "2ae5755d",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "DML sub-plan rendering in EXPLAIN (showing plans for INSERT/UPDATE/DELETE statements)",
+  "resume_point": ""
+ },
+ {
+  "key": "52d9398b",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
+  "resume_point": ""
+ },
+ {
+  "key": "d6acfaca",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
+  "resume_point": ""
+ },
+ {
+  "key": "c2a7e157",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
+  "resume_point": ""
+ },
+ {
+  "key": "2a5d8ce5",
+  "date": "2026-04-28",
+  "task_id": "m0003",
+  "feature": "Outer scope variable restoration for correlated subqueries after execution (lexical scope cleanup)",
+  "resume_point": "0003-0008"
+ },
+ {
+  "key": "2a5d8ce5",
+  "date": "2026-04-28",
+  "task_id": "m0003",
+  "feature": "Initplan caching to reuse results of non-correlated subqueries across multiple outer rows",
+  "resume_point": "0003-0008"
+ },
+ {
+  "key": "aadaa14e",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "Slot-start handshake protocol for logical replication",
+  "resume_point": ""
+ },
+ {
+  "key": "7d346a4b",
+  "date": "2026-04-29",
+  "task_id": "M0008",
+  "feature": "Publication and subscription DDL for logical replication.",
+  "resume_point": ""
+ },
+ {
+  "key": "1b96d083",
+  "date": "2026-04-29",
+  "task_id": "M0007",
+  "feature": "wal_sync_method GUC selector to configure WAL synchronization method.",
+  "resume_point": ""
+ },
+ {
+  "key": "0e8e2c64",
+  "date": "2026-04-29",
+  "task_id": "M0007",
+  "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
+  "resume_point": ""
+ },
+ {
+  "key": "0e8e2c64",
+  "date": "2026-04-29",
+  "task_id": "M0007",
+  "feature": "Counters for WAL preallocation metrics and monitoring.",
+  "resume_point": ""
+ }
+]

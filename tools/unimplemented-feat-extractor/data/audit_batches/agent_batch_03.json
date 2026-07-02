@@ -1,0 +1,86 @@
+[
+ {
+  "key": "4405178d",
+  "date": "2026-05-27",
+  "task_id": null,
+  "feature": "PostgreSQL extensions (contrib modules) are out of scope and remain unimplemented",
+  "resume_point": ""
+ },
+ {
+  "key": "3f9c6749",
+  "date": "2026-05-27",
+  "task_id": "M0097-0004",
+  "feature": "pg_get_viewdef() is stubbed to return NULL instead of reconstructing view definitions from the catalog",
+  "resume_point": ""
+ },
+ {
+  "key": "26cb3148",
+  "date": "2026-05-29",
+  "task_id": "M0095-0002",
+  "feature": "I/O statistics tracking not implemented; pg_stat_io virtual table always returns empty rows.",
+  "resume_point": ""
+ },
+ {
+  "key": "26cb3148",
+  "date": "2026-05-29",
+  "task_id": "M0095-0002",
+  "feature": "WAL summarization not running; pg_available_wal_summaries() always returns empty rows.",
+  "resume_point": ""
+ },
+ {
+  "key": "35bdc908",
+  "date": "2026-05-30",
+  "task_id": null,
+  "feature": "CREATE VIEW WITH options are parsed but not applied; all option clauses are consumed and discarded during view creation",
+  "resume_point": ""
+ },
+ {
+  "key": "35bdc908",
+  "date": "2026-05-30",
+  "task_id": null,
+  "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",
+  "resume_point": ""
+ },
+ {
+  "key": "3efcea87",
+  "date": "2026-05-31",
+  "task_id": "M0097-0035",
+  "feature": "pg_collation_for() function returns hardcoded 'default' string; collation tracking throughout catalog and query execution is not implemented",
+  "resume_point": ""
+ },
+ {
+  "key": "586a5539",
+  "date": "2026-06-02",
+  "task_id": null,
+  "feature": "CREATE FOREIGN TABLE DDL is parsed and accepted but not executed; functionality treated as CompatNoopStmt placeholder",
+  "resume_point": ""
+ },
+ {
+  "key": "0921885d",
+  "date": "2026-06-04",
+  "task_id": null,
+  "feature": "COMMENT ON command is unimplemented; all comment operations are no-ops and comments are not persisted.",
+  "resume_point": ""
+ },
+ {
+  "key": "4eb2ac9b",
+  "date": "2026-06-04",
+  "task_id": null,
+  "feature": "Foreign Data Wrapper (FDW) functionality stubbed; CREATE FOREIGN DATA WRAPPER and CREATE SERVER create compat registry entries only, without actual FDW implementation.",
+  "resume_point": ""
+ },
+ {
+  "key": "2b649557",
+  "date": "2026-06-04",
+  "task_id": null,
+  "feature": "pg_policy system catalog is virtual stub returning 0 rows; row-level security policies not queryable.",
+  "resume_point": ""
+ },
+ {
+  "key": "7b277e20",
+  "date": "2026-06-08",
+  "task_id": null,
+  "feature": "REINDEX INDEX/TABLE command is unimplemented; operates as a no-op stub.",
+  "resume_point": ""
+ }
+]

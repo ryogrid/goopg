@@ -1,0 +1,14 @@
+{"verdicts": [
+  {"key": "8adfaae2", "verdict": "open", "evidence": "internal/catalog/codec.go:1356 TypeNameToOID folds char to bpchar"},
+  {"key": "fa14f0f3", "verdict": "open", "evidence": "internal/parser/ddl.go:7217 ALTER COLUMN RESET not parsed"},
+  {"key": "fa14f0f3", "verdict": "open", "evidence": "internal/executor/operators_ddl.go:7564 n_distinct stored dump-fidelity only"},
+  {"key": "3153507b", "verdict": "open", "evidence": "internal/parser/ddl.go:3815 SET STATISTICS not in parseColumnDef"},
+  {"key": "2f300f0c", "verdict": "open", "evidence": "internal/executor/operators_ddl.go:7335 TOAST compression dump-fidelity only"},
+  {"key": "d31a1d99", "verdict": "open", "evidence": "internal/executor/operators_ddl.go:1626 goopg has no autovacuum"},
+  {"key": "9164e87f", "verdict": "open", "evidence": "internal/parser/ddl.go:8432 USING stub-consumed in ALTER TYPE"},
+  {"key": "d792e1ab", "verdict": "open", "evidence": "internal/catalog/catalog.go:11697 foreign servers stored in-memory only"},
+  {"key": "46e70c85", "verdict": "open", "evidence": "internal/catalog/catalog.go:11697 foreign servers stored in-memory only"},
+  {"key": "cc080cb3", "verdict": "open", "evidence": "internal/executor/operators_ddl.go:1167 LookupCompositeType lacks schema support"},
+  {"key": "252f7d36", "verdict": "open", "evidence": "internal/executor/operators_insert.go no CheckOption enforcement found"},
+  {"key": "9b414709", "verdict": "open", "evidence": "internal/parser/ddl.go:462 HANDLER/VALIDATOR func references skipped"}
+]}

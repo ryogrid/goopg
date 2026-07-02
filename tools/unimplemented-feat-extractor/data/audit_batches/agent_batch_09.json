@@ -1,0 +1,86 @@
+[
+ {
+  "key": "21452746",
+  "date": "2026-04-29",
+  "task_id": "m0009",
+  "feature": "Implement per-I/O pg_aios view and wait events (requires per-handle tracking on the engine)",
+  "resume_point": ""
+ },
+ {
+  "key": "6cadf517",
+  "date": "2026-04-29",
+  "task_id": "m0009",
+  "feature": "Consume io_method, io_workers, and io_max_concurrency GUC parameters in actual callers (heap-scan, checkpointer, WAL writer)",
+  "resume_point": ""
+ },
+ {
+  "key": "1adc44ac",
+  "date": "2026-04-29",
+  "task_id": "M0008",
+  "feature": "Handling schema changes during a logical slot's lifetime (currently surfaces as decoder errors)",
+  "resume_point": ""
+ },
+ {
+  "key": "d8636af0",
+  "date": "2026-04-29",
+  "task_id": "0008-0001",
+  "feature": "Long-lived classifier loop: goroutine per logical slot that consumes RecordIterator and drives OutputPlugin",
+  "resume_point": ""
+ },
+ {
+  "key": "0e8e2c64",
+  "date": "2026-04-29",
+  "task_id": "M0007",
+  "feature": "WAL segment recycling to reuse old segments instead of unlinking.",
+  "resume_point": ""
+ },
+ {
+  "key": "b566a837",
+  "date": "2026-04-29",
+  "task_id": "m0005",
+  "feature": "parsePrimaryConninfo does not parse user, sslmode, password, and other libpq parameters beyond host and port",
+  "resume_point": ""
+ },
+ {
+  "key": "f4de6953",
+  "date": "2026-04-29",
+  "task_id": "m0005",
+  "feature": "Cascading replication (standby replicating to other standby instances) is not implemented",
+  "resume_point": ""
+ },
+ {
+  "key": "f4de6953",
+  "date": "2026-04-29",
+  "task_id": "m0005",
+  "feature": "Streaming replication implementation is deferred across approximately 25 follow-up items spanning wire protocol, WAL streaming machinery, replication slots, standby side features, configuration surface, and promotion logic",
+  "resume_point": ""
+ },
+ {
+  "key": "9e35e21d",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "Real multi-database and multi-role isolation boundaries with proper tracking across sessions",
+  "resume_point": ""
+ },
+ {
+  "key": "87a60ab6",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "Index definition and tablespace information reconstruction in pg_catalog queries",
+  "resume_point": ""
+ },
+ {
+  "key": "64c0eeb2",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "BETWEEN SYMMETRIC operator variant that allows reversed range endpoints",
+  "resume_point": "0003-0013"
+ },
+ {
+  "key": "64c0eeb2",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
+  "resume_point": "0003-0013"
+ }
+]

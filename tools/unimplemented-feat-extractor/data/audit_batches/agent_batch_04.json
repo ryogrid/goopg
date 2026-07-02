@@ -1,0 +1,86 @@
+[
+ {
+  "key": "a910cc32",
+  "date": "2026-06-08",
+  "task_id": null,
+  "feature": "box() data type is stubbed to return NULL; actual box value construction not implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "a910cc32",
+  "date": "2026-06-08",
+  "task_id": null,
+  "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",
+  "resume_point": ""
+ },
+ {
+  "key": "85090714",
+  "date": "2026-06-14",
+  "task_id": "M0110-0003",
+  "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",
+  "resume_point": ""
+ },
+ {
+  "key": "85090714",
+  "date": "2026-06-14",
+  "task_id": "M0110-0003",
+  "feature": "Four pg_amcheck TAP tests (AC-002: 002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) remain deferred as keystone blockers pending higher tiers.",
+  "resume_point": ""
+ },
+ {
+  "key": "318f38c8",
+  "date": "2026-06-15",
+  "task_id": "M0117-0006",
+  "feature": "Resident-bank removal optimization is not implemented.",
+  "resume_point": "Part C"
+ },
+ {
+  "key": "7e97fcfd",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "Multi-database orchestration in pg_amcheck verification",
+  "resume_point": ""
+ },
+ {
+  "key": "79dcdd70",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "Opclass damage detection test suite (005_opclass_damage)",
+  "resume_point": ""
+ },
+ {
+  "key": "42e67873",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "The AC-002 through AC-005 PostgreSQL amcheck TAP test suite has not been ported to goopg.",
+  "resume_point": "S5"
+ },
+ {
+  "key": "36133dc6",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "Runtime pg_database shared-catalog write for datconnlimit invalid-database filtering",
+  "resume_point": ""
+ },
+ {
+  "key": "383d8b22",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "Opclass parity test suite (005_opclass_damage)",
+  "resume_point": ""
+ },
+ {
+  "key": "b542aeba",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "pg_amcheck gap #5 for database-resolution bootstrap query (description incomplete)",
+  "resume_point": ""
+ },
+ {
+  "key": "057b411c",
+  "date": "2026-06-15",
+  "task_id": "M0095-0003",
+  "feature": "On-disk pg_tablespace heap visibility management for shared catalog operations",
+  "resume_point": ""
+ }
+]

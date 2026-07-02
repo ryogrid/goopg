@@ -1,0 +1,86 @@
+[
+ {
+  "key": "c2496590",
+  "date": "2026-05-28",
+  "task_id": "M0097-0069",
+  "feature": "Planner GUC stubs (enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, and others) registered to prevent unrecognized GUC errors but may not affect actual behavior.",
+  "resume_point": ""
+ },
+ {
+  "key": "f0aa2d5d",
+  "date": "2026-05-29",
+  "task_id": "M0097-0073",
+  "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
+  "resume_point": ""
+ },
+ {
+  "key": "1419da52",
+  "date": "2026-06-02",
+  "task_id": "M0097-0145",
+  "feature": "PGTypeColumns() expansion from 7 to 32 columns to support pg_enum NOT EXISTS subquery",
+  "resume_point": "Expand PGTypeColumns() to include all 32 PostgreSQL enum columns"
+ },
+ {
+  "key": "d59e9690",
+  "date": "2026-06-04",
+  "task_id": null,
+  "feature": "WITH [CASCADED|LOCAL] CHECK OPTION clause enforcement (syntax accepted but not enforced)",
+  "resume_point": "Implement CHECK OPTION enforcement"
+ },
+ {
+  "key": "3deab3e9",
+  "date": "2026-06-04",
+  "task_id": null,
+  "feature": "H2 efficiency fix: fix_plan split and PROMPT trimming to reduce build_loop_context injection size",
+  "resume_point": "Implement fix_plan split / PROMPT trim optimization"
+ },
+ {
+  "key": "d7dd89e6",
+  "date": "2026-06-04",
+  "task_id": null,
+  "feature": "Join-based execution path for aggregate sublink promotion to enable faster execution on large inner result sets (currently exceeds statement timeout with 100M ops)",
+  "resume_point": "Implement join-based execution path for aggregate sublinking"
+ },
+ {
+  "key": "6d302bf2",
+  "date": "2026-06-06",
+  "task_id": null,
+  "feature": "Anonymous CHECK constraints stay at OID 0; PostgreSQL-faithful auto-naming of unnamed constraints not implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "a910cc32",
+  "date": "2026-06-08",
+  "task_id": null,
+  "feature": "EXCLUDE USING constraints bypass btree type validation for non-compatible types (box, point); stored as catalog-only without enforcing physical index.",
+  "resume_point": ""
+ },
+ {
+  "key": "01356f1c",
+  "date": "2026-06-12",
+  "task_id": "M0100-0007",
+  "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "15ac8cb1",
+  "date": "2026-06-13",
+  "task_id": null,
+  "feature": "pg_dump test tiers 002-010 requiring broad catalog-view parity and dump/restore round-trip validation",
+  "resume_point": ""
+ },
+ {
+  "key": "28d5894a",
+  "date": "2026-06-13",
+  "task_id": "AC-002",
+  "feature": "pg_amcheck server-dependent test tiers (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage), blocked on verify_heapam() SRF implementation and operator-class catalog parity",
+  "resume_point": ""
+ },
+ {
+  "key": "560dc196",
+  "date": "2026-06-13",
+  "task_id": null,
+  "feature": "Server-side password authentication reading and validation via rolpassword column",
+  "resume_point": ""
+ }
+]

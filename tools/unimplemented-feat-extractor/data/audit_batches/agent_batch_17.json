@@ -1,0 +1,86 @@
+[
+ {
+  "key": "345ef083",
+  "date": "2026-05-12",
+  "task_id": "M0096-0013",
+  "feature": "RAISE NOTICE statements in trigger bodies do not produce output; notices are suppressed instead of being logged",
+  "resume_point": ""
+ },
+ {
+  "key": "0e67eff1",
+  "date": "2026-05-12",
+  "task_id": "m0097-0015",
+  "feature": "pg_partition_root() function returns the input as-is instead of returning the root partition.",
+  "resume_point": ""
+ },
+ {
+  "key": "0464274a",
+  "date": "2026-05-12",
+  "task_id": "m0095-0002",
+  "feature": "Add pg_stat_io walsummarizer backend_type rows to track WAL summarizer process statistics.",
+  "resume_point": ""
+ },
+ {
+  "key": "b766c81d",
+  "date": "2026-05-13",
+  "task_id": "M0103",
+  "feature": "No dual-process logical-replication test harness; replcluster currently supports physical replication only",
+  "resume_point": ""
+ },
+ {
+  "key": "8783ad19",
+  "date": "2026-05-13",
+  "task_id": "M0100-0002",
+  "feature": "Session notices not yet appearing in test output; possible timing or trigger issue under investigation",
+  "resume_point": ""
+ },
+ {
+  "key": "e2cfc831",
+  "date": "2026-05-14",
+  "task_id": "M0103-0007",
+  "feature": "TOAST (out-of-line) large value storage replication",
+  "resume_point": ""
+ },
+ {
+  "key": "4cfc5a17",
+  "date": "2026-05-14",
+  "task_id": "M0103-0007",
+  "feature": "Protocol version 2 streaming subxacts with Y/A frames and parent-XID linkage (requires apply-worker subxact tracking)",
+  "resume_point": "Implement apply-worker subxact tracking in future rung"
+ },
+ {
+  "key": "c972231e",
+  "date": "2026-05-14",
+  "task_id": "M0103-0008",
+  "feature": "SlotDecoder.Classify must handle RecordKindPageImage records instead of dropping them",
+  "resume_point": "rung 12"
+ },
+ {
+  "key": "f1714fea",
+  "date": "2026-05-14",
+  "task_id": "M0103-0008",
+  "feature": "Resolve subscriber apply stall issue during logical replication",
+  "resume_point": "rung 9"
+ },
+ {
+  "key": "a4e30725",
+  "date": "2026-05-14",
+  "task_id": "M0103-0008",
+  "feature": "Parser must support VARIADIC keyword for libpqrcv fetch_table_list queries",
+  "resume_point": ""
+ },
+ {
+  "key": "e2cfc831",
+  "date": "2026-05-14",
+  "task_id": "M0103-0007",
+  "feature": "DDL replication (schema changes) in various shapes and scenarios",
+  "resume_point": ""
+ },
+ {
+  "key": "39752197",
+  "date": "2026-05-14",
+  "task_id": "M0094-0005",
+  "feature": "Primary's WrittenLSN does not advance after INSERT-via-lib/pq or CHECKPOINT RPC operations",
+  "resume_point": ""
+ }
+]

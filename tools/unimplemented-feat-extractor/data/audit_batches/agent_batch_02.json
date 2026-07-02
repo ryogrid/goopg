@@ -1,0 +1,86 @@
+[
+ {
+  "key": "6c3ef866",
+  "date": "2026-05-12",
+  "task_id": "m0097-0004",
+  "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",
+  "resume_point": ""
+ },
+ {
+  "key": "6c3ef866",
+  "date": "2026-05-12",
+  "task_id": "m0097-0004",
+  "feature": "justify_hours(), justify_days(), and justify_interval() functions are stubs that return input unchanged.",
+  "resume_point": ""
+ },
+ {
+  "key": "ccd6b808",
+  "date": "2026-05-12",
+  "task_id": "m0095-0006",
+  "feature": "Implement CREATE/DROP ROLE and CREATE/DROP USER commands for role management.",
+  "resume_point": ""
+ },
+ {
+  "key": "ccd6b808",
+  "date": "2026-05-12",
+  "task_id": "m0095-0007",
+  "feature": "Implement CREATE/DROP DATABASE commands with full DDL support.",
+  "resume_point": ""
+ },
+ {
+  "key": "b766c81d",
+  "date": "2026-05-13",
+  "task_id": "M0103",
+  "feature": "pgoutput wire compatibility with PostgreSQL never verified end-to-end",
+  "resume_point": ""
+ },
+ {
+  "key": "ca8d92f7",
+  "date": "2026-05-15",
+  "task_id": "m0100-0005k",
+  "feature": "FK constraint error messages do not yet include partition-routed names in MESSAGE and CONSTRAINT clauses.",
+  "resume_point": ""
+ },
+ {
+  "key": "ae9d50b2",
+  "date": "2026-05-18",
+  "task_id": "m0106-0010",
+  "feature": "Cannot open pg_database_oid_index file at base/5/2672 (shared catalog index) during autovacuum-launcher backend initialization.",
+  "resume_point": "3cr"
+ },
+ {
+  "key": "7f5703d8",
+  "date": "2026-05-18",
+  "task_id": "m0106-0010",
+  "feature": "Composite-key encoder for pg_amop_fam_strat_index is not implemented; index file 2653 remains an empty placeholder.",
+  "resume_point": "Implement composite-key encoder for file 2653"
+ },
+ {
+  "key": "fcf60677",
+  "date": "2026-05-18",
+  "task_id": "M0106-0010",
+  "feature": "Index pg_partitioned_table_partrelid_index (OID 3351) on pg_partitioned_table catalog not seeded during bootstrap.",
+  "resume_point": "3bt"
+ },
+ {
+  "key": "0a1cd552",
+  "date": "2026-05-22",
+  "task_id": "M0110-0002",
+  "feature": "pg_waldump TAP test suite portions (2 tests with mixed BUG_FIX and UNIMPLEMENTED sections)",
+  "resume_point": "pg_waldump unimplemented test portions"
+ },
+ {
+  "key": "0bd0baa5",
+  "date": "2026-05-22",
+  "task_id": "M0097-0002",
+  "feature": "GIST index support (required for index_including_gist regress test)",
+  "resume_point": "GIST index implementation"
+ },
+ {
+  "key": "38ab040f",
+  "date": "2026-05-25",
+  "task_id": "M0097-regress",
+  "feature": "PostgreSQL's point geometric data type is not supported; emp/stud_emp fixture tables cannot be created without it.",
+  "resume_point": ""
+ }
+]

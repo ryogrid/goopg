@@ -1,0 +1,86 @@
+[
+ {
+  "key": "fb362c14",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Add ctx.Err() cancellation checks to operator handling Q13's LEFT JOIN + NOT LIKE path",
+  "resume_point": "operator on Q13's LEFT JOIN + NOT LIKE path does not check ctx.Err() often enough; M0058-0005 only covered NL/MHJ probe phases"
+ },
+ {
+  "key": "58293128",
+  "date": "2026-05-08",
+  "task_id": "M0066",
+  "feature": "MHJ runtime lazyOut layout does not match declared Output() annotation in planner, causing query correctness issues",
+  "resume_point": ""
+ },
+ {
+  "key": "aafef4fd",
+  "date": "2026-05-10",
+  "task_id": "M0076",
+  "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
+  "resume_point": ""
+ },
+ {
+  "key": "41e76346",
+  "date": "2026-05-11",
+  "task_id": null,
+  "feature": "Handle 'short read at block' errors on subsequent pgbench workloads following fresh restart",
+  "resume_point": ""
+ },
+ {
+  "key": "606cff26",
+  "date": "2026-05-11",
+  "task_id": "M0087",
+  "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",
+  "resume_point": ""
+ },
+ {
+  "key": "daa01ef6",
+  "date": "2026-05-12",
+  "task_id": null,
+  "feature": "Table partitioning (PARTITION BY clause) for dividing large tables is not implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "c1e52ffd",
+  "date": "2026-05-12",
+  "task_id": "m0097-0017",
+  "feature": "ALTER TYPE RENAME and OWNER operations are no-ops; type names and ownership cannot be modified.",
+  "resume_point": ""
+ },
+ {
+  "key": "c1e52ffd",
+  "date": "2026-05-12",
+  "task_id": "m0097-0017",
+  "feature": "enum_first, enum_last, and enum_range functions return NULL instead of enum values.",
+  "resume_point": ""
+ },
+ {
+  "key": "10e23408",
+  "date": "2026-05-12",
+  "task_id": "m0097-0007",
+  "feature": "regexp_matches() function is a set-returning function stub that returns NULL instead of match results.",
+  "resume_point": ""
+ },
+ {
+  "key": "079eacca",
+  "date": "2026-05-12",
+  "task_id": "m0097-0009",
+  "feature": "pg_get_serial_sequence() is a stub that returns a convention-based sequence name instead of the actual sequence.",
+  "resume_point": ""
+ },
+ {
+  "key": "079eacca",
+  "date": "2026-05-12",
+  "task_id": "m0097-0009",
+  "feature": "ALTER SEQUENCE is not implemented and is a no-op executor.",
+  "resume_point": ""
+ },
+ {
+  "key": "e2294d42",
+  "date": "2026-05-12",
+  "task_id": "m0097-0005",
+  "feature": "regexp_replace() function is not implemented (stub).",
+  "resume_point": ""
+ }
+]

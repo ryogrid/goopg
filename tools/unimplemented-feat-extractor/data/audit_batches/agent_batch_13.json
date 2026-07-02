@@ -1,0 +1,86 @@
+[
+ {
+  "key": "e2a37eaa",
+  "date": "2026-05-07",
+  "task_id": "M0063-0003",
+  "feature": "Q20 query optimization and correctness testing is not yet addressed.",
+  "resume_point": ""
+ },
+ {
+  "key": "f4ef64ea",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Q21 Anti-NLI currently uses hash variant because lifting conjuncts to outer Predicate breaks negation semantics (returns 0 rows instead of ~411); the inner-Filter conjunct lift is deferred.",
+  "resume_point": ""
+ },
+ {
+  "key": "977ff220",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Q21 build-phase cancel requires proper NLI rewrite for derived-table outer inputs; the fix is deferred out of M0062 scope.",
+  "resume_point": ""
+ },
+ {
+  "key": "4930aeef",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Optimize Q14 query performance (regressed from 29s baseline to 600s timeout)",
+  "resume_point": ""
+ },
+ {
+  "key": "4930aeef",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Implement IN-with-subquery decorrelation for nested IN (subq IN subq) patterns",
+  "resume_point": ""
+ },
+ {
+  "key": "faf2e71f",
+  "date": "2026-05-07",
+  "task_id": null,
+  "feature": "Optimize IN expressions with subqueries (distinct from literal-list IN optimization)",
+  "resume_point": "InExpr-as-subquery classification; Plan != nil indicates out-of-scope case"
+ },
+ {
+  "key": "d38d26ed",
+  "date": "2026-05-07",
+  "task_id": "M0065",
+  "feature": "Q21 Anti-NLI optimization attempt corrupted NLI outer-key probe logic; partial state remains unresolved",
+  "resume_point": ""
+ },
+ {
+  "key": "66e7475e",
+  "date": "2026-05-07",
+  "task_id": "M0061-0002",
+  "feature": "Optimize Q19 residual OR-of-ANDs filter predicate (expensive after CROSS JOIN removal)",
+  "resume_point": ""
+ },
+ {
+  "key": "965c2a07",
+  "date": "2026-05-08",
+  "task_id": "M0069-0002",
+  "feature": "Per-batch string and bytes arena allocator for memory pooling not implemented",
+  "resume_point": ""
+ },
+ {
+  "key": "f6febe95",
+  "date": "2026-05-08",
+  "task_id": "M0071-0005",
+  "feature": "Q21 EXISTS unnest residual zero-rows bug fix deferred to slot pipeline",
+  "resume_point": ""
+ },
+ {
+  "key": "36102644",
+  "date": "2026-05-08",
+  "task_id": "M0071-0002",
+  "feature": "IN-unnest column-index re-resolution against post-decorrelation layout to fix wrong slot indexing",
+  "resume_point": ""
+ },
+ {
+  "key": "5fc515bf",
+  "date": "2026-05-08",
+  "task_id": "M0070-0003",
+  "feature": "Q9 composite-NLI follow-up (second half of M0070-0001 fix) deferred to TupleSlot pipeline phase",
+  "resume_point": ""
+ }
+]

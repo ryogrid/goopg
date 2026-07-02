@@ -1,0 +1,86 @@
+[
+ {
+  "key": "46e70c85",
+  "date": "2026-06-30",
+  "task_id": "DU-002-376",
+  "feature": "CREATE SERVER TYPE/VERSION/OPTIONS clause parsing and persistence",
+  "resume_point": ""
+ },
+ {
+  "key": "cc080cb3",
+  "date": "2026-06-30",
+  "task_id": "DU-002-374",
+  "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",
+  "resume_point": ""
+ },
+ {
+  "key": "2c7412c1",
+  "date": "2026-06-30",
+  "task_id": "M0119-0004-ACLHEAP",
+  "feature": "Database-level ACL (datacl) on pg_database isn't implemented (heap backing and pg_dump --create-only support pending).",
+  "resume_point": ""
+ },
+ {
+  "key": "95dc91e0",
+  "date": "2026-07-01",
+  "task_id": "DU-002-385",
+  "feature": "Runtime enforcement of domain CHECK constraints during casting operations",
+  "resume_point": ""
+ },
+ {
+  "key": "37517b9a",
+  "date": "2026-07-01",
+  "task_id": "M0119-0004",
+  "feature": "ALTER OPERATOR FAMILY ... ADD to append members to an operator family",
+  "resume_point": ""
+ },
+ {
+  "key": "d6ffb929",
+  "date": "2026-07-01",
+  "task_id": "M0119-0004",
+  "feature": "Comments cannot be set on built-in collations (OID 0); only user-defined collations support COMMENT ON COLLATION.",
+  "resume_point": ""
+ },
+ {
+  "key": "c0cd7261",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Implement evaluation of the :: typecast operator for type conversion expressions (currently parsed but not evaluated).",
+  "resume_point": ""
+ },
+ {
+  "key": "d9ded322",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "ANY/SOME/ALL quantified subqueries",
+  "resume_point": ""
+ },
+ {
+  "key": "52d9398b",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
+  "resume_point": ""
+ },
+ {
+  "key": "7079f0dd",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Optimize WAL logical change record storage to reduce write-ahead log volume growth during database initialization.",
+  "resume_point": ""
+ },
+ {
+  "key": "0a33037e",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
+  "resume_point": ""
+ },
+ {
+  "key": "701bff25",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Implement tablespace support for directing table and index storage to different physical locations.",
+  "resume_point": ""
+ }
+]

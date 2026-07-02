@@ -1,0 +1,86 @@
+[
+ {
+  "key": "2f37db2d",
+  "date": "2026-05-05",
+  "task_id": "M0054-0007-followup-resume",
+  "feature": "Empirical TPC-H verification that index-build column projection achieves DecodeRow cumulative cost ≤ 15% of total query execution time.",
+  "resume_point": "next HammerDB SF=1 run"
+ },
+ {
+  "key": "57ee4041",
+  "date": "2026-05-05",
+  "task_id": "M0054-0007-followup-resume",
+  "feature": "Complete HammerDB SF=1 power test after Q9 regression fix (test was aborted after Q9, Q20 and remaining queries were not executed).",
+  "resume_point": "After M0054-0006-followup-Q9-composite is fixed"
+ },
+ {
+  "key": "7cd397d4",
+  "date": "2026-05-05",
+  "task_id": "M0054-0006-followup-Q9-composite",
+  "feature": "Fix NLI promotion rule to properly bind trailing columns of composite-key indexes (currently only binds leading column, leaving trailing column unbound).",
+  "resume_point": ""
+ },
+ {
+  "key": "13fad010",
+  "date": "2026-05-05",
+  "task_id": "M0054-0006-followup-Q19",
+  "feature": "Extend equi-key extractor to handle three-way OR conditions for Nested-Loop Index Join (TPC-H Q19 not yet supported).",
+  "resume_point": ""
+ },
+ {
+  "key": "13fad010",
+  "date": "2026-05-05",
+  "task_id": "M0054-0006-followup-Q15b",
+  "feature": "Extend equi-key extractor to handle view-inlined join shapes for Nested-Loop Index Join (TPC-H Q15b not yet supported).",
+  "resume_point": ""
+ },
+ {
+  "key": "bb85f3c4",
+  "date": "2026-05-05",
+  "task_id": "0005b-followup",
+  "feature": "Implement buffer reuse for rows returned by concatRows() to reduce allocations (currently not reused because callers may retain rows).",
+  "resume_point": "After Borrow contract is implemented"
+ },
+ {
+  "key": "738c0848",
+  "date": "2026-05-05",
+  "task_id": "M0054-0005b",
+  "feature": "Implement spillReader buffer reuse for allocation reduction (deferred to enable safe implementation without breaking callers that hold spilled rows).",
+  "resume_point": "After Borrow-semantics roll-out completes"
+ },
+ {
+  "key": "8e5ad8ee",
+  "date": "2026-05-05",
+  "task_id": "M0054",
+  "feature": "IN-list IndexScan optimization requiring Append/Union plan node and cost model for query plan optimization",
+  "resume_point": ""
+ },
+ {
+  "key": "6a88492e",
+  "date": "2026-05-06",
+  "task_id": "M0056-0004",
+  "feature": "End-to-end validation of btree concurrent write protocol",
+  "resume_point": ""
+ },
+ {
+  "key": "756e5bea",
+  "date": "2026-05-06",
+  "task_id": "M0055-0004-followup-stage2-splitmu-removal",
+  "feature": "Full splitMu removal from btree Insert slow path (Stage 2 splitMu lifting via writer-coupling)",
+  "resume_point": ""
+ },
+ {
+  "key": "958e1a6c",
+  "date": "2026-05-06",
+  "task_id": null,
+  "feature": "Posting growth helper functions are implemented but not integrated into the steady-state B-tree insert path, causing in-place insert operations to leak page bytes during memory growth.",
+  "resume_point": ""
+ },
+ {
+  "key": "756e5bea",
+  "date": "2026-05-06",
+  "task_id": "M0055-bufpool-pin-race",
+  "feature": "Fix storage pool per-slot pinCount accounting race condition in buffer management",
+  "resume_point": ""
+ }
+]
