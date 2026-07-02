@@ -4896,6 +4896,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'a,b')"); err != nil {
 		t.Fatalf("create server with metachar option: %v", err)
 	}
+	// Slice 427: a FOREIGN SERVER GRANT (`GRANT USAGE ON FOREIGN SERVER <name>
+	// TO <role>`) must round-trip through pg_dump's srvacl projection.
+	// pg_dump's getForeignServers reads srvacl and diffs it client-side (in
+	// buildACLCommands) against acldefault('S', srvowner) = "{postgres=U/postgres}"
+	// (a foreign server's world default is ACL_NO_RIGHTS — unlike FUNCTION/TYPE,
+	// PUBLIC gets nothing by default), so a single explicit GRANT materializes
+	// srvacl as "{postgres=U/postgres,srv_grantee=U/postgres}" and the diff
+	// re-emits the new grant. USAGE is FOREIGN SERVER's only privilege, so
+	// buildACLCommands collapses it to the ALL form (same as the single-privilege
+	// FUNCTION/EXECUTE case at slice 345): `GRANT ALL ON FOREIGN SERVER goopg_srv
+	// TO srv_grantee;`, not `GRANT USAGE ...`. goopg previously modelled NO
+	// foreign-server ACL at all — `tryRecordTableGrant` classified the leading
+	// "foreign" keyword as a non-table object and bailed (nothing recorded), and
+	// the pg_foreign_server virtual view hard-coded srvacl to the constant ""
+	// (NULL) — so the GRANT was silently dropped from every dump. Reuses
+	// goopg_srv (created at slice 376) so no new CREATE SERVER is needed.
+	// Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE ROLE srv_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role srv_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON FOREIGN SERVER goopg_srv TO srv_grantee"); err != nil {
+		t.Fatalf("grant usage on foreign server goopg_srv to srv_grantee: %v", err)
+	}
 	// Slice 417: a FOREIGN TABLE (`CREATE FOREIGN TABLE name (cols) SERVER srv
 	// [OPTIONS (...)]`) must round-trip. pg_dump's getTables selects relkind IN
 	// (..., 'f', ...); for a relkind='f' row it LEFT JOINs
@@ -10955,6 +10978,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			strings.Contains(res.Stdout, "CREATE SERVER goopg_srv VERSION") {
 			t.Errorf("pg_dump emitted a spurious TYPE/VERSION on the bare server (slice-376 NULL srvtype/srvversion regressed)\n  full stdout=%q", res.Stdout)
 		}
+		// Slice 427: a FOREIGN SERVER GRANT must round-trip from the materialized
+		// srvacl. acldefault('S', 10) = "{postgres=U/postgres}" (owner-only default,
+		// no implicit PUBLIC USAGE unlike FUNCTION/TYPE); srvacl after the grant =
+		// "{postgres=U/postgres,srv_grantee=U/postgres}", so buildACLCommands diffs
+		// out the new grantee entry. USAGE is FOREIGN SERVER's sole privilege, so
+		// pg_dump collapses it to the ALL form (same as the single-privilege
+		// FUNCTION/EXECUTE case, slice 345): `GRANT ALL ON FOREIGN SERVER goopg_srv
+		// TO srv_grantee;`, not `GRANT USAGE ...`. Verified byte-identical to real
+		// pg_dump 18.3.
+		if want := "GRANT ALL ON FOREIGN SERVER goopg_srv TO srv_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the FOREIGN SERVER GRANT (slice-427); missing %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// A regression that resurrected the previous nonTableGrantObjects bail (or
+		// re-hardcoded srvacl to NULL) would silently drop the GRANT above with no
+		// other symptom, so this positive assert is the only guard.
 		// Slice 377: a USER MAPPING must round-trip as the bare
 		// `CREATE USER MAPPING FOR <user> SERVER <srv>;` form (no OPTIONS — deferred).
 		// dumpUserMappings reads usename from the pg_user_mappings view (filtered by

@@ -56,6 +56,11 @@ var allSchemaPrivileges = []string{"USAGE", "CREATE"}
 // pg_dump renders as the aclitem letter "X". DU-002 slice 345.
 var allFunctionPrivileges = []string{"EXECUTE"}
 
+// allForeignServerPrivileges is the expansion of GRANT ALL [PRIVILEGES] ON a
+// FOREIGN SERVER. USAGE is the only foreign-server privilege, which pg_dump
+// renders as the aclitem letter "U". DU-002 slice 427.
+var allForeignServerPrivileges = []string{"USAGE"}
+
 // aclOwnerRole is the object owner in goopg's single bootstrap-superuser model.
 // A REVOKE whose grantee is the owner is an owner-side revoke-of-default, which
 // must first materialize the owner's implicit default ACL. DU-002 slice 340.
@@ -132,6 +137,17 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		// GRANT EXECUTE ON ROUTINE … shares the routine ACL path with FUNCTION.
 		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
 		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "foreign"); ok {
+		if rest2, ok2 := cutLeadingKeyword(rest, "server"); ok2 {
+			// GRANT USAGE ON FOREIGN SERVER <name> TO <roles>. Foreign servers live
+			// in pg_foreign_server and share the OID-keyed ACL store; record under
+			// each server's OID so pg_dump's getForeignServers/dumpACL re-emits the
+			// GRANT from srvacl. GRANT … ON FOREIGN DATA WRAPPER (fdwacl) is not
+			// modelled yet and falls through to the nonTableGrantObjects bail below
+			// (objPart is untouched here, so firstWordLower still sees "foreign").
+			s.recordForeignServerGrant(rest2, rolePart, privPart, withGrantOption)
+			return
+		}
 	}
 	// Bail on non-table object classes (ON DATABASE …, etc.).
 	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
@@ -228,6 +244,15 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 		// REVOKE EXECUTE ON ROUTINE … shares the routine ACL path with FUNCTION.
 		s.recordFunctionRevoke(rest, rolePart, privPart)
 		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "foreign"); ok {
+		if rest2, ok2 := cutLeadingKeyword(rest, "server"); ok2 {
+			// REVOKE USAGE ON FOREIGN SERVER <name> FROM <roles>. Mirror the grant
+			// recorder's FOREIGN SERVER branch: servers share the OID-keyed ACL
+			// store, so remove the named privileges from each server's srvacl.
+			// DU-002 slice 427.
+			s.recordForeignServerRevoke(rest2, rolePart, privPart)
+			return
+		}
 	}
 	// Only table/sequence relacl is modelled here; bail on every other object
 	// class (ON DATABASE/FUNCTION/…), matching the grant recorder's scope.
@@ -320,6 +345,68 @@ func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
 			// `REVOKE ALL ON SCHEMA … FROM postgres;`. DU-002 slice 342.
 			if strings.EqualFold(role, aclOwnerRole) {
 				s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allSchemaPrivileges)
+			}
+			for _, p := range privs {
+				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
+			}
+		}
+	}
+}
+
+// recordForeignServerGrant records a `GRANT USAGE ON FOREIGN SERVER <names>
+// TO <roles>` in the catalog ACL store, keyed by each server's pg_foreign_server
+// OID. Foreign servers share the OID-keyed ACL store with relations, schemas,
+// and routines. Unlike a function/type, a foreign server's acldefault('S',
+// owner) grants USAGE to the owner ONLY (world default ACL_NO_RIGHTS), so no
+// implicit PUBLIC entry is seeded here — mirroring recordSchemaGrant, not
+// recordFunctionGrant. Unknown servers and an empty/unparseable privilege list
+// are skipped, leaving the statement a successful no-op. DU-002 slice 427.
+func (s *Server) recordForeignServerGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+	privs := parseGrantPrivileges(privPart, allForeignServerPrivileges)
+	if len(privs) == 0 {
+		return
+	}
+	servers := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, srv := range servers {
+		oid := s.cfg.Catalog.ForeignServerOID(strings.Trim(strings.TrimSpace(srv), `"`))
+		if oid == 0 {
+			continue
+		}
+		for _, role := range roles {
+			for _, p := range privs {
+				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
+			}
+		}
+	}
+}
+
+// recordForeignServerRevoke removes the named privileges from each foreign
+// server's srvacl in the catalog ACL store, mirroring recordForeignServerGrant.
+// Unknown servers and an empty/unparseable privilege list are skipped, leaving
+// the statement as a successful no-op. Keeping srvacl in sync lets pg_dump
+// re-emit only the server privileges that actually remain after the revoke.
+// DU-002 slice 427.
+func (s *Server) recordForeignServerRevoke(objPart, rolePart, privPart string) {
+	privs := parseGrantPrivileges(privPart, allForeignServerPrivileges)
+	if len(privs) == 0 {
+		return
+	}
+	servers := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, srv := range servers {
+		oid := s.cfg.Catalog.ForeignServerOID(strings.Trim(strings.TrimSpace(srv), `"`))
+		if oid == 0 {
+			continue
+		}
+		for _, role := range roles {
+			// An owner-side REVOKE (`REVOKE … FROM postgres`) materializes the
+			// owner's full default foreign-server ACL first so the surviving
+			// privileges render explicitly; PostgreSQL leaves srvacl NULL until
+			// then. allForeignServerPrivileges is the owner's full default set
+			// (USAGE only), mirroring recordSchemaRevoke's owner-materialization.
+			if strings.EqualFold(role, aclOwnerRole) {
+				s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allForeignServerPrivileges)
 			}
 			for _, p := range privs {
 				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)

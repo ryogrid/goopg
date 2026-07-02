@@ -1851,6 +1851,12 @@ type Catalog interface {
 	// (M0097-0022), so the GRANT path must re-sync this text into the heap row;
 	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
 	TypeACLText(typeOID uint32) string
+	// ForeignServerOID returns the stable OID of the named foreign server
+	// (CREATE SERVER), or 0 if not found. Used by the FOREIGN SERVER GRANT
+	// recorder (internal/server/grant_ddl.go) to resolve the object named in
+	// `GRANT … ON FOREIGN SERVER <name> TO …` to the OID-keyed ACL store key.
+	// DU-002 slice 427.
+	ForeignServerOID(name string) uint32
 	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
 	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
 	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
@@ -7290,8 +7296,12 @@ func (c *InMemory) registerSystemTables() {
 	// srvfdw resolves to the referenced FDW's stable OID (dumpForeignServer runs
 	// `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` to recover
 	// the wrapper name). srvtype/srvversion are NULL (empty string), so the TYPE/
-	// VERSION clauses are omitted; srvacl/srvoptions are NULL, so dumpACL emits
-	// nothing and the OPTIONS clause is skipped. DU-002 slice 376.
+	// VERSION clauses are omitted; srvoptions is NULL absent an OPTIONS clause, so
+	// the OPTIONS clause is skipped. DU-002 slice 376. srvacl renders from the
+	// materialized ACL store (ForeignServerACLText) — NULL until a GRANT/REVOKE
+	// … ON FOREIGN SERVER … is recorded, matching acldefault('S', srvowner) and
+	// producing no spurious dumpACL output for the common no-grant case. DU-002
+	// slice 427.
 	pgForeignServer.VirtualRows = func() [][]string {
 		servers := c.ListForeignServers()
 		if len(servers) == 0 {
@@ -7310,7 +7320,7 @@ func (c *InMemory) registerSystemTables() {
 				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
 				s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
 				s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
-				"",                             // srvacl (NULL)
+				c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
 				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
@@ -10395,6 +10405,40 @@ var typeACLPrivOrder = []aclPrivLetter{
 // materialized typacl reproduces both default entries — structurally identical
 // to the function EXECUTE default (ownerFunctionACLString). M0119-0004-ACLHEAP.
 const ownerTypeACLString = "U"
+
+// foreignServerACLPrivOrder lists the foreign-server (pg_foreign_server)
+// privileges in PostgreSQL's canonical aclitemout order. A foreign server has
+// a single privilege, USAGE('U'). pg_dump's getForeignServers diffs a server's
+// srvacl against acldefault('S', srvowner) client-side in buildACLCommands and
+// re-emits `GRANT … ON FOREIGN SERVER …`, so projecting the privilege set in
+// this order matches the aclitem[] text PG stores in pg_foreign_server.srvacl.
+// DU-002 slice 427.
+var foreignServerACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+}
+
+// ownerForeignServerACLString is the privilege-letter string for the owner's
+// full set of foreign-server privileges, i.e. "U". Unlike a function/type, a
+// foreign server's world default is ACL_NO_RIGHTS (acldefault('S', owner) =
+// "{postgres=U/postgres}" — PUBLIC gets nothing), so the FOREIGN SERVER GRANT
+// recorder does NOT seed an implicit PUBLIC entry — the owner-only default
+// mirrors ownerSchemaACLString/ownerTableACLString, not the dual owner+PUBLIC
+// shape of ownerFunctionACLString/ownerTypeACLString. DU-002 slice 427.
+const ownerForeignServerACLString = "U"
+
+// ForeignServerACLText renders the materialized pg_foreign_server.srvacl text
+// for the foreign server identified by srvOID, or "" (SQL NULL) when no
+// privileges have been granted away. Foreign servers share the OID-keyed ACL
+// store with relations, schemas, routines, and types (goopg mints foreign-
+// server OIDs from the same nextOID counter, so there is no collision).
+// pg_dump's getForeignServers diffs srvacl against acldefault('S', srvowner)
+// client-side in buildACLCommands, so projecting the correct aclitem[] text is
+// sufficient for the `GRANT … ON FOREIGN SERVER …` round-trip. DU-002 slice 427.
+func (c *InMemory) ForeignServerACLText(srvOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString)
+}
 
 // attrACLKey identifies one table column for column-level (pg_attribute.attacl)
 // privilege tracking: the owning relation's OID plus the column's 1-based

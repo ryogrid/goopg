@@ -298,6 +298,61 @@ func TestNamespaceACLText(t *testing.T) {
 	}
 }
 
+// TestForeignServerACLText pins the pg_foreign_server.srvacl projection that
+// lets a `GRANT … ON FOREIGN SERVER …` round-trip through pg_dump (DU-002
+// slice 427). A foreign server's owner default is "U" (USAGE only), which
+// pg_dump diffs against via acldefault('S', owner); unlike a function/type, a
+// foreign server grants PUBLIC nothing by default (world default
+// ACL_NO_RIGHTS), so no implicit PUBLIC entry appears unless a GRANT … TO
+// PUBLIC is recorded explicitly. Foreign servers share the OID-keyed ACL store
+// with relations/schemas/routines/types, so the same GrantTablePrivilege*
+// recorders apply.
+func TestForeignServerACLText(t *testing.T) {
+	c := NewInMemory()
+	const srvOID = 16900
+
+	// No grants → NULL srvacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ForeignServerACLText(srvOID); got != "" {
+		t.Fatalf("srvacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE materializes the owner entry ("U") plus the grantee ("U").
+	c.GrantTablePrivilege(srvOID, "srv_role", "USAGE")
+	want := "{postgres=U/postgres,srv_role=U/postgres}"
+	if got := c.ForeignServerACLText(srvOID); got != want {
+		t.Fatalf("srvacl after GRANT USAGE = %q; want %q", got, want)
+	}
+
+	// A grant-option USAGE renders "U*".
+	const goSrvOID = 16901
+	c.GrantTablePrivilegeWithGrantOption(goSrvOID, "srv_role", "USAGE", true)
+	want = "{postgres=U/postgres,srv_role=U*/postgres}"
+	if got := c.ForeignServerACLText(goSrvOID); got != want {
+		t.Fatalf("srvacl after GRANT USAGE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+
+	// GRANT … ON FOREIGN SERVER … TO PUBLIC materializes the empty grantee.
+	const pubSrvOID = 16902
+	c.GrantTablePrivilege(pubSrvOID, "PUBLIC", "USAGE")
+	want = "{postgres=U/postgres,=U/postgres}"
+	if got := c.ForeignServerACLText(pubSrvOID); got != want {
+		t.Fatalf("srvacl after GRANT USAGE TO PUBLIC = %q; want %q", got, want)
+	}
+
+	// REVOKE ALL ON FOREIGN SERVER FROM postgres: materialize the owner default
+	// ("U"), then drop it → srvacl is the empty array "{}", NOT NULL (mirrors
+	// TestRevokeAllFromSchemaOwnerEmptyArray's MaterializeOwnerACL →
+	// RevokeTablePrivilege sequence, only with the foreign-server owner-default
+	// set).
+	const revSrvOID = 16903
+	c.MaterializeOwnerACL(revSrvOID, "postgres", []string{"USAGE"})
+	c.RevokeTablePrivilege(revSrvOID, "postgres", "USAGE")
+	want = "{}"
+	if got := c.ForeignServerACLText(revSrvOID); got != want {
+		t.Fatalf("srvacl after owner REVOKE ALL = %q; want %q", got, want)
+	}
+}
+
 // TestRelaclTextSequence pins the sequence relacl projection that lets a
 // GRANT … ON SEQUENCE round-trip through pg_dump (DU-002 slice 333). A
 // sequence's owner default is "rwU" (USAGE/SELECT/UPDATE), which pg_dump diffs

@@ -5426,6 +5426,48 @@ documentation-only and is exempt from the design-doc requirement.)
       context, same accept-and-ignore posture as every other role-DDL
       privilege check here).
 
+- [x] **FOREIGN SERVER GRANT (`pg_foreign_server.srvacl`) round-trip in
+      pg_dump (M0119-0004, DU-002 slice 427, loop #12).** **COMPLETE
+      2026-07-02:** `GRANT USAGE ON FOREIGN SERVER <name> TO <role>` was
+      silently dropped from every dump — `tryRecordTableGrant`/
+      `tryRecordTableRevoke` classified the leading `foreign` keyword as a
+      non-table object and bailed, and `pg_foreign_server.VirtualRows`
+      hard-coded `srvacl` to `""` (NULL). Foreign servers now share the
+      OID-keyed ACL store with relations/schemas/routines/types via the
+      existing object-type-agnostic `relaclTextLockedFor` core: new
+      `foreignServerACLPrivOrder`/`ownerForeignServerACLString = "U"`
+      (owner-only default, no implicit PUBLIC — mirrors schema/table, not
+      function/type) + `ForeignServerACLText(srvOID)`
+      (`internal/catalog/catalog.go`); new `Catalog.ForeignServerOID`
+      interface method (concrete impl already existed from slice 377); server
+      gains `allForeignServerPrivileges = {"USAGE"}` + a `foreign`→`server`
+      branch in `tryRecordTableGrant`/`tryRecordTableRevoke` dispatching to
+      new `recordForeignServerGrant`/`recordForeignServerRevoke`
+      (`internal/server/grant_ddl.go`, mirrors `recordSchemaGrant`/
+      `recordSchemaRevoke`). USAGE is FOREIGN SERVER's sole privilege, so
+      `buildACLCommands` collapses the full grant to `GRANT ALL ON FOREIGN
+      SERVER goopg_srv TO srv_grantee;` (NOT `GRANT USAGE …`) — same as the
+      single-privilege FUNCTION/EXECUTE case (slice 345). This loop picked up
+      an uncommitted slice from the prior loop's background agent whose guard
+      assertion had the wrong expected form (`GRANT USAGE …`); a standalone
+      e2e repro (`internal/testport`, real cluster + real pg_dump 18.3)
+      isolated the true expected output and the assertion/comments were
+      corrected before landing. Tests: `TestForeignServerACLText`
+      (`internal/catalog/relacl_test.go`: NULL with no grants, plain
+      grant/grant-option/PUBLIC-grantee materialization, owner-side REVOKE
+      ALL empties to `{}`); `TestPort_PgDumpConnectionSetup` DU-002 slice 427
+      (byte-identical vs real pg_dump 18.3). Gates: `go build ./...` clean;
+      `go vet` catalog/server/testport clean; `internal/catalog`+
+      `internal/server` suites PASS; `TestPort_PgDumpConnectionSetup` PASS
+      (5.8s); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-foreign-server-grant-srvacl-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bq` added. Still open under
+      M0119-0004 (unchanged, no new ledger row needed — piggybacks the
+      existing M0119-0004-ACLHEAP thread): column-level (`pg_attribute.attacl`,
+      heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
+      `GRANT … ON FOREIGN DATA WRAPPER` (`fdwacl`) unmodelled;
+      extended-protocol commit-time deferral.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
