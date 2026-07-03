@@ -16077,6 +16077,14 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
 			}
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
+			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
+			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
+			// METHOD.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.MultirangeOID, rt.OpclassOID)); werr != nil {
+					return fmt.Errorf("wal create-range-type: %w", werr)
+				}
+			}
 			return nil
 		}
 		// Composite / base types — register the name so DROP TYPE can
@@ -16543,6 +16551,14 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		}
 		rangeErr := cat.DropRangeType(n)
 		if rangeErr == nil {
+			// DU-002 restart-persistence follow-up (M0110-0001, DU-002
+			// slice 429 ledger resume point, sub-item (c)): mirrors DROP
+			// ACCESS METHOD.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropRangeType(n)); werr != nil {
+					return fmt.Errorf("wal drop-range-type: %w", werr)
+				}
+			}
 			continue // successfully dropped as range type
 		}
 		// Neither enum, composite, nor range — report error or IF EXISTS notice.

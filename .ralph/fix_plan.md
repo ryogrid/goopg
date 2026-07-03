@@ -6469,6 +6469,42 @@ documentation-only and is exempt from the design-doc requirement.)
       subtypes resolve a default opclass rather than a generic PG-style
       `GetDefaultOpClass` lookup.
 
+- [x] **`CREATE`/`DROP TYPE ... AS RANGE` WAL/restart persistence (M0110-0001,
+      DU-002 slice 429 follow-up, sub-item (c)).** **COMPLETE 2026-07-03:**
+      closes sub-item (c) of the slice 429 deferral — `catalog.InMemory.
+      rangeTypes` was a plain in-process map with no WAL record and no
+      startup replay, so a user range type vanished on server restart even
+      though a `pg_dump` taken beforehand round-tripped correctly (same gap
+      the `CREATE ACCESS METHOD` slice had before its own restart-persistence
+      follow-up). Landed the identical shape: new `RecordKindCreateRangeType`/
+      `RecordKindDropRangeType` (kinds 81/82, `internal/wal/recovery.go`,
+      `Encode`/`DecodeCreateRangeType` carries both OIDs + opclass OID + all
+      three names; `Encode`/`DecodeDropRangeType` carries the name);
+      no-op physical redo registered in `ApplyRecord`; new
+      `internal/initdb/range_type_ddl_recovery.go`
+      (`replayRangeTypeDDLRecords`) walks the WAL after physical replay and
+      applies CREATE/DROP records via two new idempotent catalog mutators
+      (`RegisterRangeTypeDuringRecovery`/`DropRangeTypeDuringRecovery`,
+      `internal/catalog/catalog.go`, advancing `nextOID` past *both* the
+      range and multirange OIDs); wired into `internal/initdb/open.go` right
+      after the access-method DDL replay call. `execCreateType`'s `IsRange`
+      branch and the `DROP TYPE` range branch (`internal/executor/
+      operators_ddl.go`) WAL-append on success. Tests:
+      `internal/wal/range_type_ddl_test.go` (encode/decode round trips incl.
+      multi-byte UTF-8 + max-uint32 OIDs, wrong-kind/truncated-payload
+      guards); `internal/initdb/range_type_ddl_recovery_test.go` (4 tests:
+      real `Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for
+      CREATE and CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards).
+      Gates: `go build ./...` clean; `go test -race ./internal/wal/...
+      ./internal/initdb/...` PASS; targeted + package suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS. Design doc: `docs/design/0110-0001-
+      pg-dump-tap-port.md` new "Follow-up: `CREATE`/`DROP TYPE ... AS RANGE`
+      WAL/restart persistence" section; `docs/design/README.md` 0110-0001 row
+      updated; deferral ledger row 389 sub-item (c) closed (new resolved row
+      appended). Still open: sub-items (a) options discarded, (b) no
+      array-of-range/multirange type, (d) only 7 curated subtypes resolve a
+      default opclass.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

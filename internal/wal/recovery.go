@@ -935,6 +935,29 @@ const (
 	//   kind(1) | roleOid(4) | memberOid(4) | revokeOption(1)
 	RecordKindRevokeRoleMembership byte = 80
 
+	// RecordKindCreateRangeType records a `CREATE TYPE name AS RANGE
+	// (subtype = ..., multirange_type_name = ...)` event so it survives a
+	// restart. goopg has no per-range-type on-disk file namespace (like
+	// `CREATE ACCESS METHOD`, catalog.InMemory's rangeTypes map is a pure
+	// in-memory registry), so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/range_type_ddl_recovery.go scans the
+	// WAL for these records after physical replay and re-registers each
+	// range type with its original OIDs. Mirrors RecordKindCreateAccessMethod.
+	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
+	// ledger resume point, sub-item (c)).
+	// Format:
+	//   kind(1) | oid(4) | multirangeOid(4) | opclassOid(4) |
+	//   subtypeNameLen(2)+subtypeName | nameLen(2)+name |
+	//   mrNameLen(2)+mrName
+	RecordKindCreateRangeType byte = 81
+
+	// RecordKindDropRangeType records a `DROP TYPE name` event for a
+	// user-defined range type. Counterpart to RecordKindCreateRangeType; same
+	// no-op physical redo path. Mirrors RecordKindDropAccessMethod.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropRangeType byte = 82
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1813,6 +1836,108 @@ func DecodeDropAccessMethod(payload []byte) (name string, err error) {
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
 		return "", fmt.Errorf("wal: drop-access-method payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateRangeType encodes a CREATE TYPE ... AS RANGE event (DU-002
+// restart-persistence follow-up to M0110-0001, DU-002 slice 429 ledger
+// resume point, sub-item (c)). Both OIDs (range + auto-generated multirange)
+// are carried so recovery re-registers the range type identically to the
+// live server. Format documented at the RecordKindCreateRangeType constant.
+func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, multirangeOID, opclassOID uint32) []byte {
+	if len(subtypeName) > 0xFFFF {
+		subtypeName = subtypeName[:0xFFFF]
+	}
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(multirangeName) > 0xFFFF {
+		multirangeName = multirangeName[:0xFFFF]
+	}
+	out := make([]byte, 19+len(subtypeName)+len(name)+len(multirangeName))
+	out[0] = RecordKindCreateRangeType
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], multirangeOID)
+	binary.LittleEndian.PutUint32(out[9:13], opclassOID)
+	off := 13
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(subtypeName)))
+	off += 2
+	copy(out[off:], subtypeName)
+	off += len(subtypeName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(multirangeName)))
+	off += 2
+	copy(out[off:], multirangeName)
+	return out
+}
+
+// DecodeCreateRangeType decodes a RecordKindCreateRangeType payload.
+func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName string, oid, multirangeOID, opclassOID uint32, err error) {
+	if len(payload) < 15 {
+		return "", "", "", 0, 0, 0, fmt.Errorf("wal: create-range-type payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateRangeType {
+		return "", "", "", 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-range-type", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	multirangeOID = binary.LittleEndian.Uint32(payload[5:9])
+	opclassOID = binary.LittleEndian.Uint32(payload[9:13])
+	off := 13
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-range-type payload truncated (length prefix)")
+		}
+		n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+n {
+			return "", fmt.Errorf("wal: create-range-type payload truncated (need %d bytes)", off+n)
+		}
+		s := string(payload[off : off+n])
+		off += n
+		return s, nil
+	}
+	if subtypeName, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, err
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, err
+	}
+	if multirangeName, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, err
+	}
+	return name, subtypeName, multirangeName, oid, multirangeOID, opclassOID, nil
+}
+
+// EncodeDropRangeType encodes a DROP TYPE event for a user-defined range
+// type (DU-002 restart-persistence follow-up to M0110-0001, DU-002 slice 429
+// ledger resume point, sub-item (c)). Format documented at the
+// RecordKindDropRangeType constant.
+func EncodeDropRangeType(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropRangeType
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropRangeType decodes a RecordKindDropRangeType payload.
+func DecodeDropRangeType(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-range-type payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropRangeType {
+		return "", fmt.Errorf("wal: record kind %d is not drop-range-type", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-range-type payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
 }
@@ -5527,6 +5652,16 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// in internal/initdb/access_method_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// access method registry.
+		return false, nil
+	case RecordKindCreateRangeType, RecordKindDropRangeType:
+		// CREATE/DROP TYPE ... AS RANGE records (DU-002 restart-persistence
+		// follow-up, M0110-0001 DU-002 slice 429 ledger resume point,
+		// sub-item (c)) carry only catalog.InMemory's rangeTypes registry
+		// metadata; goopg has no per-range-type file namespace, so the
+		// physical replay path has nothing to do. The recovery driver in
+		// internal/initdb/range_type_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the range
+		// type registry.
 		return false, nil
 	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate, RecordKindAlterAggregateOwner:
 		// CREATE/ALTER/DROP AGGREGATE records (DU-002 restart-persistence

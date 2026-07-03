@@ -15616,6 +15616,37 @@ func (c *InMemory) DropRangeType(name string) error {
 	return nil
 }
 
+// RegisterRangeTypeDuringRecovery is the idempotent version of
+// RegisterRangeType used by the WAL-replay driver
+// (internal/initdb/range_type_ddl_recovery.go). Unlike RegisterRangeType it
+// takes both OIDs from the WAL record (so the recovered range type matches
+// the pre-crash OIDs exactly) and overwrites rather than erroring when a
+// range type with the same name is already present (replay may see the same
+// record more than once across a partial-then-full replay). Mirrors
+// catalog.InMemory.RegisterAccessMethodDuringRecovery. DU-002
+// restart-persistence follow-up (M0110-0001, DU-002 slice 429 ledger resume
+// point, sub-item (c)).
+func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rangeTypes == nil {
+		c.rangeTypes = make(map[string]*RangeType)
+	}
+	out := *rt
+	c.rangeTypes[rt.Name] = &out
+	c.advanceNextOIDLocked(rt.OID)
+	c.advanceNextOIDLocked(rt.MultirangeOID)
+}
+
+// DropRangeTypeDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropRangeType. Identical to DropRangeType but discards
+// the found/not-found result — replay does not care whether the range type
+// was still present. DU-002 restart-persistence follow-up (M0110-0001,
+// DU-002 slice 429 ledger resume point, sub-item (c)).
+func (c *InMemory) DropRangeTypeDuringRecovery(name string) {
+	_ = c.DropRangeType(name)
+}
+
 // LookupCompositeTypeFields returns the ordered field list for a composite type,
 // or nil if the type is not known or has no field metadata. M0097-composite.
 func (c *InMemory) LookupCompositeTypeFields(name string) []CompositeField {

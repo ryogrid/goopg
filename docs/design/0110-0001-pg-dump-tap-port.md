@@ -11245,3 +11245,56 @@ curated subtypes have a resolvable default opclass rather than a generic
 Gates: `go build ./...` clean; `internal/catalog`+`internal/parser`+
 `internal/executor` suites PASS (`-count=1`); `TestPort_PgDumpConnectionSetup`
 PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+#### Follow-up: `CREATE`/`DROP TYPE ... AS RANGE` WAL/restart persistence (loop after slice 429)
+
+Closes sub-item (c) of the slice 429 deferral: `catalog.InMemory.rangeTypes`
+was a plain in-process map with no WAL record and no startup replay, so a
+`CREATE TYPE ... AS RANGE` (and its auto-generated multirange) vanished on
+server restart even though a `pg_dump` taken beforehand round-tripped
+correctly — the identical gap the `CREATE ACCESS METHOD` slice had before its
+own restart-persistence follow-up (see that section above).
+
+Landed the same shape as the access-method precedent:
+
+- New `RecordKindCreateRangeType`/`RecordKindDropRangeType` (kinds 81/82,
+  `internal/wal/recovery.go`) with `Encode`/`DecodeCreateRangeType` (carries
+  both OIDs — range and auto-generated multirange — plus the resolved
+  opclass OID and all three names so a restart reconstructs the exact
+  pre-crash `RangeType`) and `Encode`/`DecodeDropRangeType` (name only).
+  Physical redo is a no-op (`rangeTypes` has no page-level state), registered
+  in `ApplyRecord`'s no-op switch alongside the other DU-002
+  restart-persistence record families.
+- New `internal/initdb/range_type_ddl_recovery.go`
+  (`replayRangeTypeDDLRecords`) walks the WAL once after physical replay and
+  applies CREATE/DROP records via two new idempotent catalog mutators
+  (`RegisterRangeTypeDuringRecovery`/`DropRangeTypeDuringRecovery`,
+  `internal/catalog/catalog.go`) that overwrite-by-name and bump `nextOID`
+  past *both* recovered OIDs (the range's own and the multirange's — a range
+  type mints two OIDs per `RegisterRangeType` call, unlike the
+  single-OID access-method/event-trigger precedents). Wired into
+  `internal/initdb/open.go` right after the access-method DDL replay call
+  (range types are name-keyed, no ordering dependency on schema replay).
+- `execCreateType`'s `IsRange` branch and the `DROP TYPE` range branch
+  (`internal/executor/operators_ddl.go`) now WAL-append on success — both are
+  unconditional autocommit-style mutations (no explicit-transaction
+  deferral path for `CREATE`/`DROP TYPE`), so logging immediately at the
+  mutation point is safe, mirroring `execCreateAccessMethod`/`execDropCompat`'s
+  `"access method"` case exactly.
+
+Tests: `internal/wal/range_type_ddl_test.go` (encode/decode round trips incl.
+multi-byte UTF-8 names + max-uint32 OIDs, wrong-kind/truncated-payload
+guards); `internal/initdb/range_type_ddl_recovery_test.go` (4 tests: real
+`Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for CREATE and
+CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards).
+
+Gates: `go build ./...` clean; `go test -race ./internal/wal/... ./internal/mvcc/...`
+PASS; `internal/wal`+`internal/catalog`+`internal/executor`+`internal/initdb`
+suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+hook.
+
+Still open (deferral ledger row appended): sub-items (a) `subtype_opclass`/
+`collation`/`canonical`/`subtype_diff` options remain parsed-but-discarded;
+(b) no auto-generated array-of-range/array-of-multirange type; (d) only the
+7 curated subtypes resolve a default opclass rather than a generic
+`GetDefaultOpClass`-style lookup.

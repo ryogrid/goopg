@@ -1520,6 +1520,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: access method DDL replay: %w", err)
 	}
 
+	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
+	// ledger resume point, sub-item (c)): restore CREATE/DROP TYPE ... AS
+	// RANGE objects from the WAL. Like access methods, range types are keyed
+	// by a plain name string, so order relative to schema replay does not
+	// matter.
+	if err := replayRangeTypeDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: range type DDL replay: %w", err)
+	}
+
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
 	if err := registerPgSequencesView(cat); err != nil {
