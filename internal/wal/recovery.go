@@ -1064,6 +1064,17 @@ const (
 	//   kind(1) | familyOid(4) | leftType(4) | rightType(4) | procNum(4)
 	RecordKindDropAmProcMember byte = 91
 
+	// RecordKindDropOperatorFamily records a `DROP OPERATOR FAMILY name USING
+	// method` removal by OID (mirrors RecordKindDropOperatorClass's
+	// rationale: DROP OPERATOR FAMILY's own name/method resolution and
+	// member-purge already happened live). Same no-op physical redo path.
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
+	// the loop #69 ledger row's "DROP OPERATOR FAMILY never actually calls
+	// DropUserOperatorFamily" discovery).
+	// Format:
+	//   kind(1) | oid(4)
+	RecordKindDropOperatorFamily byte = 92
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -2388,6 +2399,26 @@ func DecodeDropOperatorClass(payload []byte) (oid uint32, err error) {
 	}
 	if payload[0] != RecordKindDropOperatorClass {
 		return 0, fmt.Errorf("wal: record kind %d is not drop-operator-class", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// EncodeDropOperatorFamily encodes a DROP OPERATOR FAMILY event by OID.
+// Format documented at the RecordKindDropOperatorFamily constant.
+func EncodeDropOperatorFamily(oid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindDropOperatorFamily
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	return out
+}
+
+// DecodeDropOperatorFamily decodes a RecordKindDropOperatorFamily payload.
+func DecodeDropOperatorFamily(payload []byte) (oid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: drop-operator-family payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropOperatorFamily {
+		return 0, fmt.Errorf("wal: record kind %d is not drop-operator-family", payload[0])
 	}
 	return binary.LittleEndian.Uint32(payload[1:5]), nil
 }
@@ -6319,7 +6350,8 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// ApplyRecord does here.
 		return false, nil
 	case RecordKindCreateOperatorFamily, RecordKindCreateOperatorClass, RecordKindDropOperatorClass,
-		RecordKindCreateAmOpMember, RecordKindDropAmOpMember, RecordKindCreateAmProcMember, RecordKindDropAmProcMember:
+		RecordKindCreateAmOpMember, RecordKindDropAmOpMember, RecordKindCreateAmProcMember, RecordKindDropAmProcMember,
+		RecordKindDropOperatorFamily:
 		// CREATE OPERATOR FAMILY / CREATE OPERATOR CLASS (+ its pg_amop/
 		// pg_amproc AS-list members) / DROP OPERATOR CLASS / ALTER OPERATOR
 		// FAMILY ... ADD|DROP records (DU-002 restart-persistence

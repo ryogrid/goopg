@@ -3281,3 +3281,76 @@ PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook.
 - The `=#=`-shaped operator-symbol `DROP OPERATOR` parser quirk noted in the
   loop #65 section above (already closed by loop #66 — listed here only for
   continuity, no action needed).
+
+## Loop #75 — `DROP OPERATOR FAMILY` correctness + restart/WAL persistence
+(closes the loop #69 row's "Still deferred" item)
+
+### Scope
+
+Closes the loop #69 section's own deferral above: `execDropCompat`'s combined
+`"operator class"`/`"operator family"` arm never called
+`DropUserOperatorFamily` for a bare family (created via `CREATE OPERATOR
+FAMILY`, no `AS` list, no class) — it only ever mutated the legacy
+`opClassSchemas` map, which is keyed by operator *class* name and therefore
+never matched a class-less family. The family stayed resolvable via
+`LookupUserOperatorFamily`/`pg_opfamily` forever, live/same-session, with no
+restart involved. This loop fixes the live correctness bug and, since the fix
+makes the removal well-defined, adds its WAL/restart persistence in the same
+pass (no reason to split them once the live removal actually happens).
+
+### Design
+
+- `catalog.InMemory.DropUserOperatorFamily` (`internal/catalog/catalog.go`)
+  now also purges every `amOpMembers`/`amProcMembers` row whose `FamilyOID`
+  matches, via a new shared `purgeAmMembersForFamilyLocked` helper — mirrors
+  `DropUserOperatorClass`'s own member purge, needed because a family can own
+  "loose" members added via `ALTER OPERATOR FAMILY ... ADD` with no owning
+  class (`ClassOID` zero).
+- `execDropCompat`'s `"operator family"` case (`internal/executor/operators_ddl.go`)
+  gets its own branch, checked *before* falling through to the legacy
+  `opClassSchemas`/`HasOpClass` path: `LookupUserOperatorFamily` resolves the
+  family by schema/name/method; if found, `DropUserOperatorFamily` removes it
+  and members, WAL-logs the removal, and returns — a same-named class (PG's
+  implicit-family-per-class convention) that only exists in the legacy map
+  still falls through unchanged.
+- New `RecordKindDropOperatorFamily` (92, `internal/wal/recovery.go`) — by
+  OID only, same shape as `RecordKindDropOperatorClass` (loop #69): the live
+  DROP's own name/method resolution and member purge already happened before
+  the WAL append, so replay only needs the OID.
+- `DropUserOperatorFamilyByOIDDuringRecovery` — OID-keyed counterpart, mirrors
+  `DropUserOperatorClassByOIDDuringRecovery`; reuses
+  `purgeAmMembersForFamilyLocked`.
+- `internal/initdb/operator_class_ddl_recovery.go`'s `replayOperatorClassDDLRecords`
+  gets one new `case` for the new kind; `wal.ApplyRecord`'s physical-replay
+  switch adds it to the existing catalog-only-kinds case group (same crash-restart
+  fatal class the loop #69 section's "second bug" fixed — new kinds must be
+  added there too, not just to the initdb driver, or a crash restart with this
+  record still after the last checkpoint hits `unsupported kind 92`).
+
+### Tests
+
+- `internal/executor/create_operator_test.go`:
+  `TestDropOperatorFamilyRemovesFamily` — bare family + a loose
+  `ALTER OPERATOR FAMILY ... ADD` member; confirms both the `pg_opfamily` and
+  `pg_amop` virtual rows empty out after `DROP OPERATOR FAMILY`, and a second
+  drop of the same name 42704s.
+- `internal/wal/operator_class_ddl_test.go`:
+  `TestEncodeDecodeDropOperatorFamilyRoundTrip` + wrong-kind guard.
+- `internal/initdb/operator_class_ddl_recovery_test.go`:
+  `TestOperatorClassDDLRecoveryReplaysDropOperatorFamilyAfterCreate` — full
+  `Init`/`Open`/`WAL.Append`/`Close`/`Open` cycle, CREATE + loose-member ADD +
+  DROP OPERATOR FAMILY cancels out across a restart.
+
+### Gates
+
+`go build ./...` clean; targeted new-test run PASS
+(`internal/wal`+`internal/executor`+`internal/initdb`); full
+`internal/catalog`+`internal/executor`+`internal/wal`+`internal/initdb`
+suites PASS (no regression); `scripts/tpch-spotcheck.sh` PASS.
+
+### Still deferred
+
+Nothing new — this loop fully closes the loop #69 row's own deferral. The
+loop #69 section's other two "Still deferred" bullets (range-type
+`canonical`/`subtype_diff` remainder, `=#=`-operator-symbol note) are
+unrelated and remain as recorded there.

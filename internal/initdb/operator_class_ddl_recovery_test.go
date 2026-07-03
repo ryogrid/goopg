@@ -187,6 +187,65 @@ func TestOperatorClassDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	}
 }
 
+// TestOperatorClassDDLRecoveryReplaysDropOperatorFamilyAfterCreate confirms a
+// CREATE OPERATOR FAMILY followed by a DROP OPERATOR FAMILY cancels out
+// across a restart — the family row and every loose amop/amproc row it owns
+// are gone, matching the live DropUserOperatorFamily cleanup. Closes the loop
+// #69 ledger row's "DROP OPERATOR FAMILY never actually calls
+// DropUserOperatorFamily" discovery.
+func TestOperatorClassDDLRecoveryReplaysDropOperatorFamilyAfterCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
+		OID: 40950, Schema: "public", Name: "dropfam", Method: 403,
+	})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-operator-family: %v", werr)
+	}
+	// A loose member (ClassOID=0) owned by the family — mirrors ALTER
+	// OPERATOR FAMILY ... ADD — must be purged along with the family itself.
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateAmOpMember(wal.AmOpMemberPayload{
+		OID: 40951, FamilyOID: 40950, ClassOID: 0, LeftType: 23, RightType: 23, Strategy: 1, OperOID: 97, Method: 403,
+	})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-amop-member: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeDropOperatorFamily(40950)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append drop-operator-family: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+	im := operatorCatalog(t, rt2)
+
+	if fam, ok := im.LookupUserOperatorFamily("public", "dropfam", 403); ok {
+		t.Errorf("after CREATE + DROP OPERATOR FAMILY replay, family \"dropfam\" = %+v, want not found", fam)
+	}
+	for _, m := range im.ListAmOpMembers() {
+		if m.OID == 40951 {
+			t.Errorf("after CREATE + DROP OPERATOR FAMILY replay, loose amop member %+v still present", m)
+		}
+	}
+}
+
 // TestOperatorClassDDLRecoveryReplaysAlterAddThenDropMember confirms an
 // ALTER OPERATOR FAMILY ... ADD member followed by its own ... DROP cancels
 // out, exercising RecordKindDropAmOpMember/RecordKindDropAmProcMember.

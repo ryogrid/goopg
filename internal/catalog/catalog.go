@@ -13415,7 +13415,9 @@ func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamil
 }
 
 // DropUserOperatorFamily removes a user-defined operator family from the
-// registry. Returns true if one was found and removed. DU-002 (M0119-0004).
+// registry, along with any pg_amop/pg_amproc member rows attributed to it
+// (mirrors DropUserOperatorClass's own member purge). Returns true if one
+// was found and removed. DU-002 (M0119-0004).
 func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -13423,11 +13425,56 @@ func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bo
 		return false
 	}
 	key := userOpFamilyKey(schema, name, method)
-	if _, ok := c.userOperatorFamilies[key]; ok {
-		delete(c.userOperatorFamilies, key)
-		return true
+	fam, ok := c.userOperatorFamilies[key]
+	if !ok {
+		return false
 	}
-	return false
+	delete(c.userOperatorFamilies, key)
+	c.purgeAmMembersForFamilyLocked(fam.OID)
+	return true
+}
+
+// purgeAmMembersForFamilyLocked removes every pg_amop/pg_amproc row owned by
+// familyOID (both class-owned and "loose" ALTER OPERATOR FAMILY ... ADD
+// members). Caller must hold c.mu. DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001, closing the loop #69 ledger row's "DROP OPERATOR
+// FAMILY never actually calls DropUserOperatorFamily" discovery).
+func (c *InMemory) purgeAmMembersForFamilyLocked(familyOID uint32) {
+	kept := c.amOpMembers[:0]
+	for _, m := range c.amOpMembers {
+		if m.FamilyOID != familyOID {
+			kept = append(kept, m)
+		}
+	}
+	c.amOpMembers = kept
+	keptP := c.amProcMembers[:0]
+	for _, m := range c.amProcMembers {
+		if m.FamilyOID != familyOID {
+			keptP = append(keptP, m)
+		}
+	}
+	c.amProcMembers = keptP
+}
+
+// DropUserOperatorFamilyByOIDDuringRecovery is the recovery counterpart used
+// for replaying RecordKindDropOperatorFamily. Identical in spirit to
+// DropUserOperatorFamily (removes the family row plus every amop/amproc row
+// it owns) but keyed by OID — DROP OPERATOR FAMILY's own existence check and
+// name/method resolution already happened live, so the WAL record carries
+// the OID directly, mirroring DropUserOperatorClassByOIDDuringRecovery.
+// Discards the found/not-found result — replay does not care whether the
+// family was still present. DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001).
+func (c *InMemory) DropUserOperatorFamilyByOIDDuringRecovery(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, fam := range c.userOperatorFamilies {
+		if fam.OID == oid {
+			delete(c.userOperatorFamilies, key)
+			break
+		}
+	}
+	c.purgeAmMembersForFamilyLocked(oid)
 }
 
 // ListUserOperatorFamilies returns all registered user operator families

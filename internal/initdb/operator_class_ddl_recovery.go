@@ -119,6 +119,12 @@ func replayOperatorClassDDLRecords(walDir string, cat *catalog.InMemory) error {
 				return fmt.Errorf("decode drop-amproc-member at lsn %d: %w", rec.StartLSN, derr)
 			}
 			cat.RemoveAmProcMember(familyOID, leftType, rightType, procNum)
+		case wal.RecordKindDropOperatorFamily:
+			oid, derr := wal.DecodeDropOperatorFamily(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode drop-operator-family at lsn %d: %w", rec.StartLSN, derr)
+			}
+			cat.DropUserOperatorFamilyByOIDDuringRecovery(oid)
 		}
 	}
 	return nil

@@ -838,6 +838,56 @@ func TestDropOperatorClassRemovesMembers(t *testing.T) {
 	}
 }
 
+// TestDropOperatorFamilyRemovesFamily verifies DROP OPERATOR FAMILY on a
+// bare family (created via CREATE OPERATOR FAMILY, no AS list, no class)
+// actually removes it from the registry, purges any loose ALTER OPERATOR
+// FAMILY ... ADD member rows it owns, and re-DROPping the same name errors
+// 42704 — closing the loop #69 ledger row's discovery that the combined
+// execDropCompat "operator class"/"operator family" arm only ever touched
+// the legacy opClassSchemas map (keyed by operator *class* name), so a bare
+// family was never removed from userOperatorFamilies. DU-002
+// (M0119-0004/M0110-0001).
+func TestDropOperatorFamilyRemovesFamily(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD
+		OPERATOR 3 ~=~ (int4, int4)`); err != nil {
+		t.Fatalf("ALTER OPERATOR FAMILY ADD: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	if rows := pgOpfamilyVirtualRows(t, im); len(rows) != 1 {
+		t.Fatalf("pg_opfamily VirtualRows = %v, want 1 row before DROP", rows)
+	}
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %v, want 1 row before DROP", rows)
+	}
+
+	if err := runDDL(t, ctx, `DROP OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("DROP OPERATOR FAMILY: %v", err)
+	}
+	if rows := pgOpfamilyVirtualRows(t, im); len(rows) != 0 {
+		t.Fatalf("pg_opfamily VirtualRows = %v, want empty after DROP OPERATOR FAMILY", rows)
+	}
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
+		t.Fatalf("pg_amop VirtualRows = %v, want empty after DROP OPERATOR FAMILY", rows)
+	}
+	if _, ok := im.LookupUserOperatorFamily("public", "op_family", catalog.AccessMethodOIDByName("btree")); ok {
+		t.Error("op_family still resolves via LookupUserOperatorFamily after DROP OPERATOR FAMILY")
+	}
+
+	err := runDDL(t, ctx, `DROP OPERATOR FAMILY public.op_family USING btree`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("re-DROP error = %v, want ExecError{Code: 42704}", err)
+	}
+}
+
 // TestCreateOperatorClassForOrderBySortFamily verifies an OPERATOR ... FOR
 // ORDER BY family entry resolves the sort family (against the btree access
 // method regardless of the class's own method — opclasscmds.c:

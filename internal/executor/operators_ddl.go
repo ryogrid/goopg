@@ -13410,6 +13410,32 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// Check if the operator class was registered via CREATE OPERATOR CLASS.
 			// If found in the catalog registry, remove it and succeed silently.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+				// closing the loop #69 ledger row's own discovery): a bare
+				// `DROP OPERATOR FAMILY name USING method` for a family
+				// created via `CREATE OPERATOR FAMILY` (no AS list, no
+				// class) was never removed from userOperatorFamilies — the
+				// legacy opClassSchemas map below is keyed by operator
+				// *class* name only. Check the family registry first; a
+				// family that shares its name with a same-named operator
+				// class (PG's implicit-family-per-class convention) falls
+				// through to the opClassSchemas branch below unchanged.
+				if objType == "operator family" {
+					famSchema := name.Schema
+					if famSchema == "" {
+						famSchema = "public"
+					}
+					famMethodOID := catalog.AccessMethodOIDByName(method)
+					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID); found {
+						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID)
+						if o.ctx.WAL != nil {
+							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorFamily(fam.OID)); werr != nil {
+								return fmt.Errorf("wal drop-operator-family: %w", werr)
+							}
+						}
+						return nil
+					}
+				}
 				if im.HasOpClass(name.Name) {
 					im.RemoveOpClass(name.Name)
 					// Also drop the pg_opclass row (DU-002, M0119-0004) so a

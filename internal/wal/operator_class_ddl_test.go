@@ -71,6 +71,27 @@ func TestEncodeDecodeDropOperatorClassRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeDecodeDropOperatorFamilyRoundTrip pins the DROP OPERATOR FAMILY
+// WAL record format (closes the loop #69 ledger row's "DROP OPERATOR FAMILY
+// never actually calls DropUserOperatorFamily" discovery).
+func TestEncodeDecodeDropOperatorFamilyRoundTrip(t *testing.T) {
+	for _, oid := range []uint32{1, 16384, 4294967295} {
+		raw := EncodeDropOperatorFamily(oid)
+		if raw[0] != RecordKindDropOperatorFamily {
+			t.Errorf("oid %d: kind byte = %d, want %d", oid, raw[0], RecordKindDropOperatorFamily)
+			continue
+		}
+		got, err := DecodeDropOperatorFamily(raw)
+		if err != nil {
+			t.Errorf("oid %d: decode err: %v", oid, err)
+			continue
+		}
+		if got != oid {
+			t.Errorf("decoded %d, want %d", got, oid)
+		}
+	}
+}
+
 // TestEncodeDecodeAmOpMemberRoundTrip pins the pg_amop-row WAL record shape
 // (covers both a CREATE OPERATOR CLASS ... AS list entry and an ALTER
 // OPERATOR FAMILY ... ADD entry).
@@ -165,6 +186,9 @@ func TestDecodeOperatorClassRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 	if _, err := DecodeDropOperatorClass(EncodeCreateOperatorFamily(CreateOperatorFamilyPayload{Name: "x"})); err == nil {
 		t.Error("DecodeDropOperatorClass: expected error on wrong kind")
 	}
+	if _, err := DecodeDropOperatorFamily(EncodeDropOperatorClass(1)); err == nil {
+		t.Error("DecodeDropOperatorFamily: expected error on wrong kind")
+	}
 	if _, err := DecodeCreateAmOpMember(EncodeCreateAmProcMember(AmProcMemberPayload{})); err == nil {
 		t.Error("DecodeCreateAmOpMember: expected error on wrong kind")
 	}
@@ -193,6 +217,10 @@ func TestDecodeOperatorClassRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 		}},
 		{"DropOperatorClass", []byte{RecordKindDropOperatorClass, 10, 0}, func(p []byte) error {
 			_, err := DecodeDropOperatorClass(p)
+			return err
+		}},
+		{"DropOperatorFamily", []byte{RecordKindDropOperatorFamily, 10, 0}, func(p []byte) error {
+			_, err := DecodeDropOperatorFamily(p)
 			return err
 		}},
 		{"CreateAmOpMember", []byte{RecordKindCreateAmOpMember, 0, 0, 0, 0}, func(p []byte) error {
