@@ -15473,22 +15473,57 @@ type builtinOpclassInfo struct {
 
 const btreeAccessMethodOID uint32 = 403
 
-// builtinRangeSubtypeOpclasses covers the subtypes of PostgreSQL's five
-// built-in range types (int4range/int8range/numrange/daterange/tsrange/
-// tstzrange) plus text (a common user range subtype with no built-in PG
-// range but a real default btree opclass). A subtype outside this set has no
-// resolvable default opclass in goopg today — RegisterRangeType reports that
-// as PG's own ERRCODE_UNDEFINED_OBJECT ("... has no default operator class
-// for access method \"btree\"") rather than silently registering a broken
-// range. DU-002 (M0110-0001).
+// builtinRangeSubtypeOpclasses covers every PG18 built-in scalar type that
+// has a real default btree operator class, keyed by the subtype's own pg_type
+// OID — not just the five built-in range types' subtypes (int4/int8/numeric/
+// date/timestamp/timestamptz). Values were captured empirically from a live
+// `postgres/local_install` PG 18.3 instance (`select oid, opcname, opcfamily
+// from pg_opclass where opcmethod = btree's oid and opcdefault`, cross-checked
+// per-subtype via `CREATE TYPE ... AS RANGE (subtype = ...)` +
+// `pg_range.rngsubopc`), since most of these opclass OIDs are genbki-assigned
+// (not pinned in pg_opclass.dat) and so aren't derivable from source alone —
+// same reasoning as the pgOpclassEntry duplication note above. Two subtypes
+// resolve to an opclass whose own opcintype differs from the subtype: varchar
+// has no *default* varchar_ops (opcdefault=false), so PG's opclass search
+// falls back to the binary-coercible text_ops (IntypeOID=OIDText); cidr binary
+// -coerces to inet_ops the same way (IntypeOID=OIDInet). A subtype outside
+// this set has no resolvable default opclass in goopg today — RegisterRangeType
+// reports that as PG's own ERRCODE_UNDEFINED_OBJECT ("... has no default
+// operator class for access method \"btree\"") rather than silently
+// registering a broken range. DU-002 (M0110-0001).
 var builtinRangeSubtypeOpclasses = map[uint32]builtinOpclassInfo{
+	OIDInt2:        {OID: 1979, Name: "int2_ops", Family: 1976, IntypeOID: OIDInt2},
 	OIDInt4:        {OID: 1978, Name: "int4_ops", Family: 1976, IntypeOID: OIDInt4},
 	OIDInt8:        {OID: 3124, Name: "int8_ops", Family: 1976, IntypeOID: OIDInt8},
 	OIDNumeric:     {OID: 3125, Name: "numeric_ops", Family: 1988, IntypeOID: OIDNumeric},
+	OIDFloat4:      {OID: 10012, Name: "float4_ops", Family: 1970, IntypeOID: OIDFloat4},
+	OIDFloat8:      {OID: 3123, Name: "float8_ops", Family: 1970, IntypeOID: OIDFloat8},
 	OIDDate:        {OID: 3122, Name: "date_ops", Family: 434, IntypeOID: OIDDate},
+	OIDTime:        {OID: 10038, Name: "time_ops", Family: 1996, IntypeOID: OIDTime},
+	OIDTimeTZ:      {OID: 10041, Name: "timetz_ops", Family: 2000, IntypeOID: OIDTimeTZ},
 	OIDTimestamp:   {OID: 3128, Name: "timestamp_ops", Family: 434, IntypeOID: OIDTimestamp},
 	OIDTimestampTZ: {OID: 3127, Name: "timestamptz_ops", Family: 434, IntypeOID: OIDTimestampTZ},
+	OIDInterval:    {OID: 10022, Name: "interval_ops", Family: 1982, IntypeOID: OIDInterval},
 	OIDText:        {OID: 3126, Name: "text_ops", Family: 1994, IntypeOID: OIDText},
+	OIDVarChar:     {OID: 3126, Name: "text_ops", Family: 1994, IntypeOID: OIDText},
+	OIDBpChar:      {OID: 10004, Name: "bpchar_ops", Family: 426, IntypeOID: OIDBpChar},
+	OIDName:        {OID: 10028, Name: "name_ops", Family: 1994, IntypeOID: OIDName},
+	OIDChar:        {OID: 10007, Name: "char_ops", Family: 429, IntypeOID: OIDChar},
+	OIDBool:        {OID: 10003, Name: "bool_ops", Family: 424, IntypeOID: OIDBool},
+	OIDBytea:       {OID: 10006, Name: "bytea_ops", Family: 428, IntypeOID: OIDBytea},
+	OIDOID:         {OID: 1981, Name: "oid_ops", Family: 1989, IntypeOID: OIDOID},
+	OIDTid:         {OID: 10050, Name: "tid_ops", Family: 2789, IntypeOID: OIDTid},
+	OIDOidvector:   {OID: 10032, Name: "oidvector_ops", Family: 1991, IntypeOID: OIDOidvector},
+	OIDUUID:        {OID: 10065, Name: "uuid_ops", Family: 2968, IntypeOID: OIDUUID},
+	OIDPgLsn:       {OID: 10067, Name: "pg_lsn_ops", Family: 3253, IntypeOID: OIDPgLsn},
+	OIDXid8:        {OID: 10053, Name: "xid8_ops", Family: 5067, IntypeOID: OIDXid8},
+	OIDMoney:       {OID: 10047, Name: "money_ops", Family: 2099, IntypeOID: OIDMoney},
+	OIDBit:         {OID: 10002, Name: "bit_ops", Family: 423, IntypeOID: OIDBit},
+	OIDVarbit:      {OID: 10043, Name: "varbit_ops", Family: 2002, IntypeOID: OIDVarbit},
+	OIDMacaddr:     {OID: 10024, Name: "macaddr_ops", Family: 1984, IntypeOID: OIDMacaddr},
+	OIDMacaddr8:    {OID: 10026, Name: "macaddr8_ops", Family: 3371, IntypeOID: OIDMacaddr8},
+	OIDInet:        {OID: 10015, Name: "inet_ops", Family: 1974, IntypeOID: OIDInet},
+	OIDCidr:        {OID: 10015, Name: "inet_ops", Family: 1974, IntypeOID: OIDInet},
 }
 
 // DefaultBtreeOpclassForSubtype returns the default btree operator class OID

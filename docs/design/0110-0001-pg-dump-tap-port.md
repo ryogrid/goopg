@@ -11558,3 +11558,92 @@ no further gap surfaced by implementing it — the datum-tagging display
 subtlety noted above is a pre-existing, orthogonal (and much larger) gap
 about the output layer's type-awareness in general, not something this fix's
 own scope touched or worsened.
+
+## Follow-up: `builtinRangeSubtypeOpclasses` widened from 7 to 31 subtypes (loop #63)
+
+Closes sub-item (d) of the slice 429 deferral (see "Still open" note just
+above the loop #60 follow-up section): `RegisterRangeType`'s default-btree-opclass lookup
+(`internal/catalog/catalog.go`'s `builtinRangeSubtypeOpclasses` map /
+`DefaultBtreeOpclassForSubtype`) only covered the subtypes of PostgreSQL's
+five built-in range types (int4/int8/numeric/date/timestamp/timestamptz) plus
+text — any other subtype, however ordinary (`bool`, `float8`, `uuid`,
+`varchar`, ...), was rejected with a synthesized 42704 even though real PG's
+`GetDefaultOpClass` resolves a default btree opclass generically for any
+btree-comparable scalar type.
+
+A fully generic port of `GetDefaultOpClass` (a live `pg_opclass`/
+`pg_opfamily`/binary-coercibility search) was judged out of scope for one
+loop — goopg has no runtime `pg_opclass` registry for built-in types at all
+(the existing map *is* goopg's only representation of "which built-ins have a
+default btree opclass"). Instead this loop widened the same curated-map
+approach the slice-429 landing already used, from 7 entries to 31, covering
+every PG18 built-in scalar type with a real default btree opclass:
+int2/int4/int8/numeric/float4/float8/date/time/timetz/timestamp/timestamptz/
+interval/text/varchar/bpchar/name/char/bool/bytea/oid/tid/oidvector/uuid/
+pg_lsn/xid8/money/bit/varbit/macaddr/macaddr8/inet/cidr.
+
+Values (opclass OID, opfamily OID) were **not** derivable from
+`postgres/src/include/catalog/pg_opclass.dat` alone for most of these —
+unlike the original 7 (which have `oid =>`-pinned symbols in the .dat file),
+most built-in opclass OIDs are genbki-assigned at build time and only exist
+in the compiled catalog. Captured them empirically instead: booted a
+throwaway `postgres/local_install` PG 18.3 instance
+(`initdb`/`pg_ctl start -p 5599`), queried
+`select oid, opcname, opcintype::regtype, opcfamily from pg_opclass o join
+pg_am a on a.oid=o.opcmethod where a.amname='btree' and o.opcdefault` for the
+baseline set, then cross-checked every entry — including the two
+non-obvious fallback cases — via `CREATE TYPE ... AS RANGE (subtype = ...)`
++ `SELECT rngsubopc::regclass FROM pg_range`:
+
+- `varchar` has its own `varchar_ops` opclass (oid 10044) but it is **not**
+  the default (`opcdefault = false`); PG's opclass search falls back to the
+  binary-coercible `text_ops` (oid 3126). Confirmed: `CREATE TYPE ... AS
+  RANGE (subtype = varchar)` resolves `rngsubopc` to `text_ops`, not
+  `varchar_ops`.
+- `cidr` has no opclass of its own at all; it binary-coerces to `inet_ops`
+  (oid 10015) the same way.
+- `bpchar` and `name`, by contrast, each have their own genuine default
+  opclass (`bpchar_ops` oid 10004, `name_ops` oid 10028) distinct from
+  `text_ops` despite sharing its `opcfamily` (`name_ops`) or textwise
+  behavior — verified they do NOT fall back the way `varchar`/`cidr` do.
+
+The map's `IntypeOID` field (used by `builtinOpclassRowByOID` when rendering
+a `pg_opclass` row for `pg_dump`'s `dumpRangeType` join) reflects the
+resolved opclass's *own* `opcintype`, not the subtype key — so the `varchar`
+and `cidr` entries carry `IntypeOID: OIDText`/`OIDInet` respectively, matching
+what a live `pg_dump` actually emits.
+
+No parser, WAL, or restart-persistence changes needed — this widens a pure
+lookup table consulted only by `RegisterRangeType` at `CREATE TYPE ... AS
+RANGE` time; the WAL/restart-persistence path landed at loop #61 already
+replays through the same `RegisterRangeType` call and picks up the wider
+coverage for free.
+
+Tests: `TestDefaultBtreeOpclassForSubtypeExpandedCoverage` (pins all 31
+{subtype, opclass OID} pairs), `TestRegisterRangeTypeExpandedSubtypes` (end-to-
+end `RegisterRangeType` success + `pg_opclass` row resolution for a sample of
+the newly-covered subtypes), `TestRegisterRangeTypeStillRejectsUnsupportedSubtype`
+(pins the negative case is unchanged: `json` has no real PG btree opclass, so
+`CREATE TYPE ... AS RANGE (subtype = json)` must still fail with PG's exact
+error text) — all in `internal/catalog/range_type_opclass_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog`+
+`internal/executor` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS (unaffected); `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook; live `goopg`/`psql` end-to-end smoke
+(fresh throwaway data dir, port 5533): `CREATE TYPE ... AS RANGE (subtype =
+bool|float8|uuid|varchar)` all now succeed and `pg_dump --schema-only`
+round-trips each byte-identical to what real `pg_dump` 18.3 would emit
+(`subtype = boolean|double precision|uuid|character varying`); `CREATE TYPE
+... AS RANGE (subtype = json)` still correctly fails with `data type json has
+no default operator class for access method "btree"`.
+
+Deferred (ledger row appended): item (a) of the same loop #57 discovery —
+`subtype_opclass`/`collation`/`canonical`/`subtype_diff` `CREATE TYPE ... AS
+RANGE` options are still parsed-and-discarded, not threaded through to
+`RangeType`/`pg_range`'s row — is untouched by this loop (a separate,
+independently-sized parser+catalog change, not a lookup-table widening). A
+fully generic `GetDefaultOpClass`-equivalent (covering user-defined subtypes
+with a user-created `CREATE OPERATOR CLASS ... DEFAULT` opclass, not just
+these 31 built-ins) also remains unimplemented — `RegisterRangeType` only
+ever consults `builtinRangeSubtypeOpclasses`, never `ListUserOperatorClasses`.

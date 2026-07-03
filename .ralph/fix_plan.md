@@ -131,6 +131,32 @@ prev-link fixes.
       `KindInt`-tagged regtype value from the name→OID direction still
       displaying as a raw number, is pre-existing enum behavior unrelated to
       this fix, not something this loop's scope touches).
+      **2026-07-03 (loop #63, DU-002 slice 429 follow-up): `builtinRangeSubtypeOpclasses`
+      widened from 7 to 31 subtypes — CLOSES sub-item (d) of the slice 429
+      deferral.** `RegisterRangeType`'s default-btree-opclass lookup
+      (`internal/catalog/catalog.go`) previously covered only int4/int8/
+      numeric/date/timestamp/timestamptz/text; `CREATE TYPE ... AS RANGE
+      (subtype = bool|float8|uuid|varchar|...)` was rejected with a
+      synthesized 42704 even though real PG resolves a default opclass for
+      any ordinary btree-comparable scalar. Widened to 31 subtypes (every
+      PG18 built-in scalar type with a real default btree opclass), with
+      OIDs captured empirically from a live PG 18.3 instance and cross-
+      checked per-subtype (incl. two binary-coercible fallbacks: `varchar`→
+      `text_ops`, `cidr`→`inet_ops`). Tests:
+      `TestDefaultBtreeOpclassForSubtypeExpandedCoverage` +
+      `TestRegisterRangeTypeExpandedSubtypes` +
+      `TestRegisterRangeTypeStillRejectsUnsupportedSubtype`
+      (`internal/catalog/range_type_opclass_test.go`). Design doc "Follow-up:
+      `builtinRangeSubtypeOpclasses` widened from 7 to 31 subtypes (loop
+      #63)". Gates: build/vet clean; `internal/catalog`+`internal/executor`
+      suites PASS; `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook; live `goopg`/`psql` smoke incl. `pg_dump` round-trip
+      for 4 newly-covered subtypes. Deferred (ledger row appended): sub-item
+      (a) (`subtype_opclass`/`collation`/`canonical`/`subtype_diff` options
+      still discarded) remains open; the map is still curated/built-in-only,
+      not a real generic `GetDefaultOpClass` port over `pg_opclass` +
+      user-created opclasses (`CREATE OPERATOR CLASS ... DEFAULT`).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit
