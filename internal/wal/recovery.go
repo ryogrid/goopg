@@ -828,6 +828,253 @@ const (
 	//   exprLen(2)+exprSQL)
 	RecordKindColumnDefaults byte = 69
 
+	// RecordKindCreateAccessMethod records a `CREATE ACCESS METHOD name TYPE
+	// {INDEX|TABLE} HANDLER handler_name` event so it survives a restart.
+	// goopg has no per-access-method on-disk file namespace (catalog.InMemory's
+	// accessMethods map is a pure in-memory registry, like eventTriggers), so
+	// the physical redo path is a no-op; the recovery driver in
+	// internal/initdb/access_method_ddl_recovery.go scans the WAL for these
+	// records after physical replay and re-registers each access method with
+	// its original OID. Mirrors RecordKindCreateEventTrigger. DU-002
+	// restart-persistence follow-up (M0119-0004, DU-002 slice 426 ledger
+	// resume point).
+	// Format:
+	//   kind(1) | oid(4) | handlerOID(4) | amType(1: 'i' or 't') |
+	//   nameLen(2) | name(nameLen bytes)
+	RecordKindCreateAccessMethod byte = 70
+
+	// RecordKindDropAccessMethod records a `DROP ACCESS METHOD name` event.
+	// Counterpart to RecordKindCreateAccessMethod; same no-op physical redo
+	// path. Mirrors RecordKindDropEventTrigger.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropAccessMethod byte = 71
+
+	// RecordKindAlterRoleRename records an `ALTER ROLE/USER <name> RENAME TO
+	// <newname>` event so the rename survives a restart. Like
+	// RecordKindRoleState, runtime role DDL never writes the pg_authid heap
+	// directly (only the periodic full-registry SyncPgAuthidFile rewrite
+	// does), so the physical replay path is a no-op; the recovery driver in
+	// internal/initdb/role_ddl_recovery.go re-keys the catalog role registry
+	// entry (preserving its OID) after physical replay. root-0021 follow-up
+	// (M0119-0004).
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindAlterRoleRename byte = 72
+
+	// RecordKindAlterDatabaseSetConfig records an `ALTER DATABASE <name> SET
+	// <config> = <value>` event so the pg_db_role_setting.setconfig override
+	// survives a restart (M0119-0004-ACLHEAP ALTER DATABASE ... SET
+	// follow-up). goopg has no per-database file namespace, so the physical
+	// redo path is a no-op; the recovery driver in
+	// internal/initdb/database_config_recovery.go scans the WAL for these
+	// records after physical replay and re-applies them to
+	// catalog.InMemory's dbRoleSettings registry via SetDatabaseConfig.
+	// Format:
+	//   kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes)
+	RecordKindAlterDatabaseSetConfig byte = 73
+
+	// RecordKindAlterDatabaseResetConfig records an `ALTER DATABASE <name>
+	// RESET <config>` event. Same no-op physical redo path as
+	// RecordKindAlterDatabaseSetConfig.
+	// Format:
+	//   kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterDatabaseResetConfig byte = 74
+
+	// RecordKindAlterDatabaseResetAllConfig records an `ALTER DATABASE
+	// <name> RESET ALL` event. Same no-op physical redo path as
+	// RecordKindAlterDatabaseSetConfig.
+	// Format:
+	//   kind(1) | dbOid(4)
+	RecordKindAlterDatabaseResetAllConfig byte = 75
+
+	// RecordKindAlterRoleSetConfig records an `ALTER ROLE <name> [IN
+	// DATABASE <dbname>] SET <config> = <value>` event so the
+	// pg_db_role_setting.setconfig override survives a restart
+	// (M0119-0004-ACLHEAP ALTER ROLE ... SET follow-up). Same no-op
+	// physical redo path as RecordKindAlterDatabaseSetConfig; the recovery
+	// driver in internal/initdb/role_config_recovery.go re-applies these to
+	// catalog.InMemory's roleSettings registry via SetRoleConfig.
+	// Format:
+	//   kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes)
+	RecordKindAlterRoleSetConfig byte = 76
+
+	// RecordKindAlterRoleResetConfig records an `ALTER ROLE <name> [IN
+	// DATABASE <dbname>] RESET <config>` event. Same no-op physical redo
+	// path as RecordKindAlterRoleSetConfig.
+	// Format:
+	//   kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindAlterRoleResetConfig byte = 77
+
+	// RecordKindAlterRoleResetAllConfig records an `ALTER ROLE <name> [IN
+	// DATABASE <dbname>] RESET ALL` event. Same no-op physical redo path as
+	// RecordKindAlterRoleSetConfig.
+	// Format:
+	//   kind(1) | roleOid(4) | dbOid(4)
+	RecordKindAlterRoleResetAllConfig byte = 78
+
+	// RecordKindGrantRoleMembership records a `GRANT <role> TO <member>
+	// [WITH { ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]`
+	// event so the pg_auth_members row survives a restart
+	// (M0119-0004-ACLHEAP, GRANT/REVOKE ROLE membership). goopg has no
+	// per-role file namespace, so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/role_membership_recovery.go scans
+	// the WAL for these records after physical replay and re-applies them to
+	// catalog.InMemory's roleMembers registry via GrantRoleMembership (which
+	// mints a fresh OID at replay time — pg_auth_members.oid is not dumped
+	// by pg_dump/pg_dumpall, so OID stability across a restart is not
+	// required).
+	// Format:
+	//   kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1)
+	RecordKindGrantRoleMembership byte = 79
+
+	// RecordKindRevokeRoleMembership records a `REVOKE
+	// [{ADMIN|INHERIT|SET} OPTION FOR] <role> FROM <member>` event. Same
+	// no-op physical redo path as RecordKindGrantRoleMembership.
+	// Format:
+	//   kind(1) | roleOid(4) | memberOid(4) | revokeOption(1)
+	RecordKindRevokeRoleMembership byte = 80
+
+	// RecordKindCreateRangeType records a `CREATE TYPE name AS RANGE
+	// (subtype = ..., multirange_type_name = ...)` event so it survives a
+	// restart. goopg has no per-range-type on-disk file namespace (like
+	// `CREATE ACCESS METHOD`, catalog.InMemory's rangeTypes map is a pure
+	// in-memory registry), so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/range_type_ddl_recovery.go scans the
+	// WAL for these records after physical replay and re-registers each
+	// range type with its original OIDs. Mirrors RecordKindCreateAccessMethod.
+	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
+	// ledger resume point, sub-item (c)); arrayOid/multirangeArrayOid added by
+	// the array-type follow-up so the auto-generated `_name` array types
+	// survive a restart with the same OIDs too.
+	// Format:
+	//   kind(1) | oid(4) | multirangeOid(4) | opclassOid(4) | arrayOid(4) |
+	//   multirangeArrayOid(4) | subtypeNameLen(2)+subtypeName |
+	//   nameLen(2)+name | mrNameLen(2)+mrName
+	RecordKindCreateRangeType byte = 81
+
+	// RecordKindDropRangeType records a `DROP TYPE name` event for a
+	// user-defined range type. Counterpart to RecordKindCreateRangeType; same
+	// no-op physical redo path. Mirrors RecordKindDropAccessMethod.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropRangeType byte = 82
+
+	// RecordKindCreateOperator records a `CREATE OPERATOR name (...)` event
+	// so it survives a restart. goopg has no per-operator on-disk file
+	// namespace (like range types, catalog.InMemory's userOperators map is
+	// a pure in-memory registry), so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/operator_ddl_recovery.go scans the
+	// WAL for these records after physical replay and re-registers each
+	// operator with its original OID (plus its COMMUTATOR/NEGATOR/RESTRICT/
+	// JOIN cross-references, which are themselves just OIDs by the time
+	// CREATE OPERATOR's live two-pass resolution finishes). Mirrors
+	// RecordKindCreateRangeType. DU-002 restart-persistence follow-up
+	// (M0119-0004/M0110-0001, discovered while verifying the loop #64 CREATE
+	// TYPE ... AS RANGE opclass/collation follow-up — see ledger). Encoded
+	// via the struct-based EncodeCreateOperator/DecodeCreateOperator pair;
+	// see CreateOperatorPayload.
+	RecordKindCreateOperator byte = 83
+
+	// RecordKindDropOperator records a `DROP OPERATOR name (...)` removal by
+	// OID, so it survives a restart. Counterpart to RecordKindCreateOperator;
+	// same no-op physical redo path. OID (not name+arg-types) is carried
+	// because DROP OPERATOR's own overload resolution already happened live,
+	// mirroring RecordKindDropFunction's identical rationale.
+	// Format:
+	//   kind(1) | oid(4)
+	RecordKindDropOperator byte = 84
+
+	// RecordKindCreateOperatorFamily records a `CREATE OPERATOR FAMILY name
+	// USING method` event so it survives a restart. goopg has no
+	// per-operator-family on-disk file namespace (catalog.InMemory's
+	// userOperatorFamilies map is a pure in-memory registry, like
+	// userOperators), so the physical redo path is a no-op; the recovery
+	// driver in internal/initdb/operator_class_ddl_recovery.go scans the WAL
+	// for these records after physical replay and re-registers each family
+	// with its original OID. Also covers the anonymous family PG
+	// auto-creates when CREATE OPERATOR CLASS omits its own FAMILY clause
+	// (execCreateOpClass's own RegisterUserOperatorFamily call). Mirrors
+	// RecordKindCreateOperator. DU-002 restart-persistence follow-up
+	// (M0119-0004/M0110-0001, closing the loop #65/#66 ledger row's "still
+	// open" item (1)).
+	// Format:
+	//   kind(1) | oid(4) | method(4) | schemaLen(2)+schema | nameLen(2)+name
+	RecordKindCreateOperatorFamily byte = 85
+
+	// RecordKindCreateOperatorClass records a `CREATE OPERATOR CLASS name
+	// [DEFAULT] FOR TYPE type USING method [FAMILY family] [AS ...]` event's
+	// own pg_opclass row (the AS-list members are separate
+	// RecordKindCreateAmOpMember/RecordKindCreateAmProcMember records
+	// appended right after this one). Same no-op physical redo path as
+	// RecordKindCreateOperatorFamily. FamilyOID is carried directly (not
+	// re-resolved by name) because the owning family's own create record
+	// always precedes this one in WAL order and
+	// RegisterUserOperatorFamilyDuringRecovery preserves its OID exactly.
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001).
+	// Format:
+	//   kind(1) | oid(4) | method(4) | familyOid(4) | inTypeOid(4) |
+	//   keyTypeOid(4) | isDefault(1) | schemaLen(2)+schema | nameLen(2)+name
+	RecordKindCreateOperatorClass byte = 86
+
+	// RecordKindDropOperatorClass records a `DROP OPERATOR CLASS name USING
+	// method` removal by OID (mirrors RecordKindDropOperator's rationale:
+	// DROP OPERATOR CLASS's own name/method resolution already happened
+	// live). Recovery also purges every amop/amproc row owned by this class,
+	// mirroring DropUserOperatorClass's live cleanup. Same no-op physical
+	// redo path.
+	// Format:
+	//   kind(1) | oid(4)
+	RecordKindDropOperatorClass byte = 87
+
+	// RecordKindCreateAmOpMember records one pg_amop row — an OPERATOR entry
+	// from either a CREATE OPERATOR CLASS ... AS list or an ALTER OPERATOR
+	// FAMILY ... ADD list (registerOpClassMembers handles both identically;
+	// ClassOID is 0 for the latter's "loose" members, matching
+	// dependVirtualRows' INTERNAL-vs-AUTO dependency distinction). Same
+	// no-op physical redo path as RecordKindCreateOperatorClass. DU-002
+	// restart-persistence follow-up (M0119-0004/M0110-0001).
+	// Format:
+	//   kind(1) | oid(4) | familyOid(4) | classOid(4) | leftType(4) |
+	//   rightType(4) | strategy(4) | operOid(4) | method(4) | sortFamilyOid(4)
+	RecordKindCreateAmOpMember byte = 88
+
+	// RecordKindDropAmOpMember records an `ALTER OPERATOR FAMILY ... DROP
+	// OPERATOR strategy (lefttype, righttype)` removal, keyed the same way
+	// RemoveAmOpMember is (no OID — the member is looked up by its unique
+	// (family, lefttype, righttype, strategy) index, mirroring
+	// dropOperators' own GetSysCacheOid4 lookup). Same no-op physical redo
+	// path. DU-002 restart-persistence follow-up (M0119-0004/M0110-0001).
+	// Format:
+	//   kind(1) | familyOid(4) | leftType(4) | rightType(4) | strategy(4)
+	RecordKindDropAmOpMember byte = 89
+
+	// RecordKindCreateAmProcMember records one pg_amproc row — a FUNCTION
+	// entry from either a CREATE OPERATOR CLASS ... AS list or an ALTER
+	// OPERATOR FAMILY ... ADD list. Mirrors RecordKindCreateAmOpMember.
+	// Format:
+	//   kind(1) | oid(4) | familyOid(4) | classOid(4) | leftType(4) |
+	//   rightType(4) | procNum(4) | procOid(4) | method(4)
+	RecordKindCreateAmProcMember byte = 90
+
+	// RecordKindDropAmProcMember records an `ALTER OPERATOR FAMILY ... DROP
+	// FUNCTION procnum (lefttype, righttype)` removal, keyed the same way
+	// RemoveAmProcMember is. Mirrors RecordKindDropAmOpMember.
+	// Format:
+	//   kind(1) | familyOid(4) | leftType(4) | rightType(4) | procNum(4)
+	RecordKindDropAmProcMember byte = 91
+
+	// RecordKindDropOperatorFamily records a `DROP OPERATOR FAMILY name USING
+	// method` removal by OID (mirrors RecordKindDropOperatorClass's
+	// rationale: DROP OPERATOR FAMILY's own name/method resolution and
+	// member-purge already happened live). Same no-op physical redo path.
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
+	// the loop #69 ledger row's "DROP OPERATOR FAMILY never actually calls
+	// DropUserOperatorFamily" discovery).
+	// Format:
+	//   kind(1) | oid(4)
+	RecordKindDropOperatorFamily byte = 92
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1160,6 +1407,405 @@ func DecodeDropRole(payload []byte) (name string, err error) {
 	return string(payload[3 : 3+nameLen]), nil
 }
 
+// EncodeAlterRoleRename encodes a RecordKindAlterRoleRename record.
+func EncodeAlterRoleRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterRoleRename)
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	binary.LittleEndian.PutUint16(l[:], uint16(len(newName)))
+	buf.Write(l[:])
+	buf.WriteString(newName)
+	return buf.Bytes()
+}
+
+// DecodeAlterRoleRename decodes a RecordKindAlterRoleRename payload.
+func DecodeAlterRoleRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 3 {
+		return "", "", fmt.Errorf("wal: alter-role-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-role-rename", payload[0])
+	}
+	off := 1
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-role-rename payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-role-rename string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr16(); err != nil {
+		return "", "", err
+	}
+	if newName, err = readStr16(); err != nil {
+		return "", "", err
+	}
+	return name, newName, nil
+}
+
+// EncodeAlterDatabaseSetConfig encodes an `ALTER DATABASE ... SET name =
+// value` event (M0119-0004-ACLHEAP ALTER DATABASE ... SET follow-up).
+// Format: kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes).
+func EncodeAlterDatabaseSetConfig(dbOid uint32, name, value string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(value) > 0xFFFF {
+		value = value[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterDatabaseSetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	binary.LittleEndian.PutUint16(l[:], uint16(len(value)))
+	buf.Write(l[:])
+	buf.WriteString(value)
+	return buf.Bytes()
+}
+
+// DecodeAlterDatabaseSetConfig decodes a RecordKindAlterDatabaseSetConfig payload.
+func DecodeAlterDatabaseSetConfig(payload []byte) (dbOid uint32, name, value string, err error) {
+	if len(payload) < 7 {
+		return 0, "", "", fmt.Errorf("wal: alter-database-set-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterDatabaseSetConfig {
+		return 0, "", "", fmt.Errorf("wal: record kind %d is not alter-database-set-config", payload[0])
+	}
+	dbOid = binary.LittleEndian.Uint32(payload[1:5])
+	off := 5
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-database-set-config payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-database-set-config string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr16(); err != nil {
+		return 0, "", "", err
+	}
+	if value, err = readStr16(); err != nil {
+		return 0, "", "", err
+	}
+	return dbOid, name, value, nil
+}
+
+// EncodeAlterDatabaseResetConfig encodes an `ALTER DATABASE ... RESET name`
+// event. Format: kind(1) | dbOid(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterDatabaseResetConfig(dbOid uint32, name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterDatabaseResetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	return buf.Bytes()
+}
+
+// DecodeAlterDatabaseResetConfig decodes a RecordKindAlterDatabaseResetConfig payload.
+func DecodeAlterDatabaseResetConfig(payload []byte) (dbOid uint32, name string, err error) {
+	if len(payload) < 7 {
+		return 0, "", fmt.Errorf("wal: alter-database-reset-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterDatabaseResetConfig {
+		return 0, "", fmt.Errorf("wal: record kind %d is not alter-database-reset-config", payload[0])
+	}
+	dbOid = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return 0, "", fmt.Errorf("wal: alter-database-reset-config payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return dbOid, string(payload[7 : 7+nameLen]), nil
+}
+
+// EncodeAlterDatabaseResetAllConfig encodes an `ALTER DATABASE ... RESET
+// ALL` event. Format: kind(1) | dbOid(4).
+func EncodeAlterDatabaseResetAllConfig(dbOid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindAlterDatabaseResetAllConfig
+	binary.LittleEndian.PutUint32(out[1:5], dbOid)
+	return out
+}
+
+// DecodeAlterDatabaseResetAllConfig decodes a RecordKindAlterDatabaseResetAllConfig payload.
+func DecodeAlterDatabaseResetAllConfig(payload []byte) (dbOid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: alter-database-reset-all-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterDatabaseResetAllConfig {
+		return 0, fmt.Errorf("wal: record kind %d is not alter-database-reset-all-config", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// EncodeAlterRoleSetConfig encodes an `ALTER ROLE ... [IN DATABASE ...] SET
+// name = value` event (M0119-0004-ACLHEAP ALTER ROLE ... SET follow-up).
+// Format: kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes) | valueLen(2) | value(valueLen bytes).
+func EncodeAlterRoleSetConfig(roleOid, dbOid uint32, name, value string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(value) > 0xFFFF {
+		value = value[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterRoleSetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], roleOid)
+	buf.Write(d[:])
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	binary.LittleEndian.PutUint16(l[:], uint16(len(value)))
+	buf.Write(l[:])
+	buf.WriteString(value)
+	return buf.Bytes()
+}
+
+// DecodeAlterRoleSetConfig decodes a RecordKindAlterRoleSetConfig payload.
+func DecodeAlterRoleSetConfig(payload []byte) (roleOid, dbOid uint32, name, value string, err error) {
+	if len(payload) < 11 {
+		return 0, 0, "", "", fmt.Errorf("wal: alter-role-set-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleSetConfig {
+		return 0, 0, "", "", fmt.Errorf("wal: record kind %d is not alter-role-set-config", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	dbOid = binary.LittleEndian.Uint32(payload[5:9])
+	off := 9
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-role-set-config payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-role-set-config string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr16(); err != nil {
+		return 0, 0, "", "", err
+	}
+	if value, err = readStr16(); err != nil {
+		return 0, 0, "", "", err
+	}
+	return roleOid, dbOid, name, value, nil
+}
+
+// EncodeAlterRoleResetConfig encodes an `ALTER ROLE ... [IN DATABASE ...]
+// RESET name` event.
+// Format: kind(1) | roleOid(4) | dbOid(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterRoleResetConfig(roleOid, dbOid uint32, name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindAlterRoleResetConfig)
+	var d [4]byte
+	binary.LittleEndian.PutUint32(d[:], roleOid)
+	buf.Write(d[:])
+	binary.LittleEndian.PutUint32(d[:], dbOid)
+	buf.Write(d[:])
+	var l [2]byte
+	binary.LittleEndian.PutUint16(l[:], uint16(len(name)))
+	buf.Write(l[:])
+	buf.WriteString(name)
+	return buf.Bytes()
+}
+
+// DecodeAlterRoleResetConfig decodes a RecordKindAlterRoleResetConfig payload.
+func DecodeAlterRoleResetConfig(payload []byte) (roleOid, dbOid uint32, name string, err error) {
+	if len(payload) < 11 {
+		return 0, 0, "", fmt.Errorf("wal: alter-role-reset-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleResetConfig {
+		return 0, 0, "", fmt.Errorf("wal: record kind %d is not alter-role-reset-config", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	dbOid = binary.LittleEndian.Uint32(payload[5:9])
+	nameLen := int(binary.LittleEndian.Uint16(payload[9:11]))
+	if len(payload) < 11+nameLen {
+		return 0, 0, "", fmt.Errorf("wal: alter-role-reset-config payload truncated (need %d bytes)", 11+nameLen)
+	}
+	return roleOid, dbOid, string(payload[11 : 11+nameLen]), nil
+}
+
+// EncodeAlterRoleResetAllConfig encodes an `ALTER ROLE ... [IN DATABASE
+// ...] RESET ALL` event.
+// Format: kind(1) | roleOid(4) | dbOid(4).
+func EncodeAlterRoleResetAllConfig(roleOid, dbOid uint32) []byte {
+	out := make([]byte, 9)
+	out[0] = RecordKindAlterRoleResetAllConfig
+	binary.LittleEndian.PutUint32(out[1:5], roleOid)
+	binary.LittleEndian.PutUint32(out[5:9], dbOid)
+	return out
+}
+
+// DecodeAlterRoleResetAllConfig decodes a RecordKindAlterRoleResetAllConfig payload.
+func DecodeAlterRoleResetAllConfig(payload []byte) (roleOid, dbOid uint32, err error) {
+	if len(payload) < 9 {
+		return 0, 0, fmt.Errorf("wal: alter-role-reset-all-config payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRoleResetAllConfig {
+		return 0, 0, fmt.Errorf("wal: record kind %d is not alter-role-reset-all-config", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), binary.LittleEndian.Uint32(payload[5:9]), nil
+}
+
+// Tri-state bit layout for EncodeGrantRoleMembership/DecodeGrantRoleMembership's
+// options byte: each of admin/inherit/set gets a "specified" bit (the WITH
+// clause named it — nil vs non-nil *bool) and a "value" bit (meaningful only
+// when specified).
+const (
+	roleGrantOptAdminSpecified   = 1 << 0
+	roleGrantOptAdminValue       = 1 << 1
+	roleGrantOptInheritSpecified = 1 << 2
+	roleGrantOptInheritValue     = 1 << 3
+	roleGrantOptSetSpecified     = 1 << 4
+	roleGrantOptSetValue         = 1 << 5
+)
+
+// EncodeGrantRoleMembership encodes a `GRANT <role> TO <member> [WITH {
+// ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]]` event.
+// admin/inherit/set are tri-state (nil = not specified in the WITH clause).
+// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | options(1).
+func EncodeGrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) []byte {
+	out := make([]byte, 14)
+	out[0] = RecordKindGrantRoleMembership
+	binary.LittleEndian.PutUint32(out[1:5], roleOid)
+	binary.LittleEndian.PutUint32(out[5:9], memberOid)
+	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
+	var opts byte
+	if admin != nil {
+		opts |= roleGrantOptAdminSpecified
+		if *admin {
+			opts |= roleGrantOptAdminValue
+		}
+	}
+	if inherit != nil {
+		opts |= roleGrantOptInheritSpecified
+		if *inherit {
+			opts |= roleGrantOptInheritValue
+		}
+	}
+	if set != nil {
+		opts |= roleGrantOptSetSpecified
+		if *set {
+			opts |= roleGrantOptSetValue
+		}
+	}
+	out[13] = opts
+	return out
+}
+
+// DecodeGrantRoleMembership decodes a RecordKindGrantRoleMembership payload.
+func DecodeGrantRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool, err error) {
+	if len(payload) < 14 {
+		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: grant-role-membership payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindGrantRoleMembership {
+		return 0, 0, 0, nil, nil, nil, fmt.Errorf("wal: record kind %d is not grant-role-membership", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	memberOid = binary.LittleEndian.Uint32(payload[5:9])
+	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
+	opts := payload[13]
+	if opts&roleGrantOptAdminSpecified != 0 {
+		v := opts&roleGrantOptAdminValue != 0
+		admin = &v
+	}
+	if opts&roleGrantOptInheritSpecified != 0 {
+		v := opts&roleGrantOptInheritValue != 0
+		inherit = &v
+	}
+	if opts&roleGrantOptSetSpecified != 0 {
+		v := opts&roleGrantOptSetValue != 0
+		set = &v
+	}
+	return roleOid, memberOid, grantorOid, admin, inherit, set, nil
+}
+
+// revokeRoleMembershipOptionByte maps a RoleMembershipChange.RevokeOption
+// string ("" | "admin" | "inherit" | "set") to/from the single wire byte
+// EncodeRevokeRoleMembership persists. M0119-0004-ACLHEAP.
+var revokeRoleMembershipOptionByte = map[string]byte{"": 0, "admin": 1, "inherit": 2, "set": 3}
+var revokeRoleMembershipOptionName = []string{"", "admin", "inherit", "set"}
+
+// EncodeRevokeRoleMembership encodes a `REVOKE [{ADMIN|INHERIT|SET} OPTION
+// FOR] <role> FROM <member> [GRANTED BY <grantor>]` event. grantorOid
+// identifies the single (role, member, grantor) row this revoke targets —
+// real PG's (roleid, member, grantor) unique index allows independent rows
+// from different grantors on the same (role, member) pair, so the grantor
+// must be persisted to replay the correct row on recovery. revokeOption is
+// "" for a plain REVOKE or one of "admin"/"inherit"/"set" for the OPTION FOR
+// prefix (see catalog.InMemory.RevokeRoleMembership).
+// Format: kind(1) | roleOid(4) | memberOid(4) | grantorOid(4) | revokeOption(1).
+func EncodeRevokeRoleMembership(roleOid, memberOid, grantorOid uint32, revokeOption string) []byte {
+	out := make([]byte, 14)
+	out[0] = RecordKindRevokeRoleMembership
+	binary.LittleEndian.PutUint32(out[1:5], roleOid)
+	binary.LittleEndian.PutUint32(out[5:9], memberOid)
+	binary.LittleEndian.PutUint32(out[9:13], grantorOid)
+	out[13] = revokeRoleMembershipOptionByte[revokeOption]
+	return out
+}
+
+// DecodeRevokeRoleMembership decodes a RecordKindRevokeRoleMembership payload.
+func DecodeRevokeRoleMembership(payload []byte) (roleOid, memberOid, grantorOid uint32, revokeOption string, err error) {
+	if len(payload) < 14 {
+		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRevokeRoleMembership {
+		return 0, 0, 0, "", fmt.Errorf("wal: record kind %d is not revoke-role-membership", payload[0])
+	}
+	roleOid = binary.LittleEndian.Uint32(payload[1:5])
+	memberOid = binary.LittleEndian.Uint32(payload[5:9])
+	grantorOid = binary.LittleEndian.Uint32(payload[9:13])
+	optByte := payload[13]
+	if int(optByte) >= len(revokeRoleMembershipOptionName) {
+		return 0, 0, 0, "", fmt.Errorf("wal: revoke-role-membership unknown option byte %d", optByte)
+	}
+	revokeOption = revokeRoleMembershipOptionName[optByte]
+	return roleOid, memberOid, grantorOid, revokeOption, nil
+}
+
 // ColumnDefaultEntry is one (column, DEFAULT expression SQL) pair inside a
 // RecordKindColumnDefaults record.
 type ColumnDefaultEntry struct {
@@ -1237,6 +1883,723 @@ func DecodeColumnDefaults(payload []byte) (ColumnDefaultsPayload, error) {
 		p.Defaults = append(p.Defaults, d)
 	}
 	return p, nil
+}
+
+// EncodeCreateAccessMethod encodes a CREATE ACCESS METHOD event (DU-002
+// restart-persistence follow-up to M0119-0004, DU-002 slice 426 ledger
+// resume point). The OID is carried so recovery re-registers the access
+// method identically to the live server. Format documented at the
+// RecordKindCreateAccessMethod constant.
+func EncodeCreateAccessMethod(name, amType string, oid, handlerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	amByte := byte('i')
+	if len(amType) > 0 {
+		amByte = amType[0]
+	}
+	out := make([]byte, 12+len(name))
+	out[0] = RecordKindCreateAccessMethod
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], handlerOID)
+	out[9] = amByte
+	binary.LittleEndian.PutUint16(out[10:12], uint16(len(name)))
+	copy(out[12:], name)
+	return out
+}
+
+// DecodeCreateAccessMethod decodes a RecordKindCreateAccessMethod payload.
+func DecodeCreateAccessMethod(payload []byte) (name, amType string, oid, handlerOID uint32, err error) {
+	if len(payload) < 12 {
+		return "", "", 0, 0, fmt.Errorf("wal: create-access-method payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateAccessMethod {
+		return "", "", 0, 0, fmt.Errorf("wal: record kind %d is not create-access-method", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	handlerOID = binary.LittleEndian.Uint32(payload[5:9])
+	amType = string(payload[9:10])
+	nameLen := int(binary.LittleEndian.Uint16(payload[10:12]))
+	if len(payload) < 12+nameLen {
+		return "", "", 0, 0, fmt.Errorf("wal: create-access-method payload truncated (need %d bytes)", 12+nameLen)
+	}
+	name = string(payload[12 : 12+nameLen])
+	return name, amType, oid, handlerOID, nil
+}
+
+// EncodeDropAccessMethod encodes a DROP ACCESS METHOD event (DU-002
+// restart-persistence follow-up to M0119-0004, DU-002 slice 426 ledger
+// resume point). Format documented at the RecordKindDropAccessMethod
+// constant.
+func EncodeDropAccessMethod(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropAccessMethod
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropAccessMethod decodes a RecordKindDropAccessMethod payload.
+func DecodeDropAccessMethod(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-access-method payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropAccessMethod {
+		return "", fmt.Errorf("wal: record kind %d is not drop-access-method", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-access-method payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateRangeType encodes a CREATE TYPE ... AS RANGE event (DU-002
+// restart-persistence follow-up to M0110-0001, DU-002 slice 429 ledger
+// resume point, sub-item (c)). All four OIDs (range, its auto-generated
+// array, the auto-generated multirange, and the multirange's own
+// auto-generated array — array-type follow-up) are carried so recovery
+// re-registers the range type identically to the live server, plus
+// collationOID (RangeType.CollationOID — a resolved explicit `collation`
+// option or the subtype's own default; sub-item (a) follow-up) so a
+// restarted server doesn't silently drop that resolution back to the
+// unconditional default. Format documented at the RecordKindCreateRangeType
+// constant.
+func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID uint32) []byte {
+	if len(subtypeName) > 0xFFFF {
+		subtypeName = subtypeName[:0xFFFF]
+	}
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(multirangeName) > 0xFFFF {
+		multirangeName = multirangeName[:0xFFFF]
+	}
+	out := make([]byte, 31+len(subtypeName)+len(name)+len(multirangeName))
+	out[0] = RecordKindCreateRangeType
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], multirangeOID)
+	binary.LittleEndian.PutUint32(out[9:13], opclassOID)
+	binary.LittleEndian.PutUint32(out[13:17], arrayOID)
+	binary.LittleEndian.PutUint32(out[17:21], multirangeArrayOID)
+	binary.LittleEndian.PutUint32(out[21:25], collationOID)
+	off := 25
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(subtypeName)))
+	off += 2
+	copy(out[off:], subtypeName)
+	off += len(subtypeName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(multirangeName)))
+	off += 2
+	copy(out[off:], multirangeName)
+	return out
+}
+
+// DecodeCreateRangeType decodes a RecordKindCreateRangeType payload.
+func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID uint32, err error) {
+	if len(payload) < 27 {
+		return "", "", "", 0, 0, 0, 0, 0, 0, fmt.Errorf("wal: create-range-type payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateRangeType {
+		return "", "", "", 0, 0, 0, 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-range-type", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	multirangeOID = binary.LittleEndian.Uint32(payload[5:9])
+	opclassOID = binary.LittleEndian.Uint32(payload[9:13])
+	arrayOID = binary.LittleEndian.Uint32(payload[13:17])
+	multirangeArrayOID = binary.LittleEndian.Uint32(payload[17:21])
+	collationOID = binary.LittleEndian.Uint32(payload[21:25])
+	off := 25
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-range-type payload truncated (length prefix)")
+		}
+		n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+n {
+			return "", fmt.Errorf("wal: create-range-type payload truncated (need %d bytes)", off+n)
+		}
+		s := string(payload[off : off+n])
+		off += n
+		return s, nil
+	}
+	if subtypeName, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, 0, 0, 0, err
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, 0, 0, 0, err
+	}
+	if multirangeName, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, 0, 0, 0, err
+	}
+	return name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, nil
+}
+
+// EncodeDropRangeType encodes a DROP TYPE event for a user-defined range
+// type (DU-002 restart-persistence follow-up to M0110-0001, DU-002 slice 429
+// ledger resume point, sub-item (c)). Format documented at the
+// RecordKindDropRangeType constant.
+func EncodeDropRangeType(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropRangeType
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropRangeType decodes a RecordKindDropRangeType payload.
+func DecodeDropRangeType(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-range-type payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropRangeType {
+		return "", fmt.Errorf("wal: record kind %d is not drop-range-type", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-range-type payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// CreateOperatorPayload carries the metadata needed to fully reconstruct a
+// catalog.UserOperator during WAL replay. Schema is carried as a bare name
+// (not NamespaceOID) so recovery re-resolves it against the recovered
+// schema registry, mirroring CreateAggregateDuringRecovery's identical
+// choice — replay order does not guarantee a schema keeps the same OID
+// across a crash/restart cycle.
+type CreateOperatorPayload struct {
+	OID           uint32
+	Schema        string
+	Name          string
+	LeftType      string
+	RightType     string
+	FuncOID       uint32
+	Owner         uint32
+	CommutatorOID uint32
+	NegatorOID    uint32
+	RestrictOID   uint32
+	JoinOID       uint32
+	CanMerge      bool
+	CanHash       bool
+}
+
+// EncodeCreateOperator encodes a CREATE OPERATOR event (DU-002
+// restart-persistence follow-up to M0119-0004/M0110-0001). Format
+// documented at the RecordKindCreateOperator constant.
+func EncodeCreateOperator(p CreateOperatorPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateOperator)
+	var u32 [4]byte
+	putU32 := func(v uint32) {
+		binary.LittleEndian.PutUint32(u32[:], v)
+		buf.Write(u32[:])
+	}
+	putU32(p.OID)
+	putU32(p.FuncOID)
+	putU32(p.Owner)
+	putU32(p.CommutatorOID)
+	putU32(p.NegatorOID)
+	putU32(p.RestrictOID)
+	putU32(p.JoinOID)
+	var flags byte
+	if p.CanMerge {
+		flags |= 1 << 0
+	}
+	if p.CanHash {
+		flags |= 1 << 1
+	}
+	buf.WriteByte(flags)
+	writeWALStr := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeWALStr(p.Schema)
+	writeWALStr(p.Name)
+	writeWALStr(p.LeftType)
+	writeWALStr(p.RightType)
+	return buf.Bytes()
+}
+
+// DecodeCreateOperator decodes a RecordKindCreateOperator payload.
+func DecodeCreateOperator(payload []byte) (CreateOperatorPayload, error) {
+	var p CreateOperatorPayload
+	if len(payload) < 30 {
+		return p, fmt.Errorf("wal: create-operator payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateOperator {
+		return p, fmt.Errorf("wal: record kind %d is not create-operator", payload[0])
+	}
+	off := 1
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+		return v
+	}
+	p.OID = readU32()
+	p.FuncOID = readU32()
+	p.Owner = readU32()
+	p.CommutatorOID = readU32()
+	p.NegatorOID = readU32()
+	p.RestrictOID = readU32()
+	p.JoinOID = readU32()
+	flags := payload[off]
+	off++
+	p.CanMerge = flags&(1<<0) != 0
+	p.CanHash = flags&(1<<1) != 0
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-operator payload truncated (length prefix)")
+		}
+		n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+n {
+			return "", fmt.Errorf("wal: create-operator payload truncated (need %d bytes)", off+n)
+		}
+		s := string(payload[off : off+n])
+		off += n
+		return s, nil
+	}
+	var err error
+	if p.Schema, err = readStr(); err != nil {
+		return p, err
+	}
+	if p.Name, err = readStr(); err != nil {
+		return p, err
+	}
+	if p.LeftType, err = readStr(); err != nil {
+		return p, err
+	}
+	if p.RightType, err = readStr(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// EncodeDropOperator encodes a DROP OPERATOR event by OID. Format documented
+// at the RecordKindDropOperator constant.
+func EncodeDropOperator(oid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindDropOperator
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	return out
+}
+
+// DecodeDropOperator decodes a RecordKindDropOperator payload.
+func DecodeDropOperator(payload []byte) (oid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: drop-operator payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropOperator {
+		return 0, fmt.Errorf("wal: record kind %d is not drop-operator", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// CreateOperatorFamilyPayload carries the metadata needed to fully
+// reconstruct a catalog.UserOperatorFamily during WAL replay. Schema is
+// carried as a bare name so recovery re-resolves it against the recovered
+// schema registry, mirroring CreateOperatorPayload's identical choice.
+type CreateOperatorFamilyPayload struct {
+	OID    uint32
+	Schema string
+	Name   string
+	Method uint32
+}
+
+// EncodeCreateOperatorFamily encodes a CREATE OPERATOR FAMILY event. Format
+// documented at the RecordKindCreateOperatorFamily constant.
+func EncodeCreateOperatorFamily(p CreateOperatorFamilyPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateOperatorFamily)
+	var u32 [4]byte
+	putU32 := func(v uint32) {
+		binary.LittleEndian.PutUint32(u32[:], v)
+		buf.Write(u32[:])
+	}
+	putU32(p.OID)
+	putU32(p.Method)
+	writeWALStr := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeWALStr(p.Schema)
+	writeWALStr(p.Name)
+	return buf.Bytes()
+}
+
+// DecodeCreateOperatorFamily decodes a RecordKindCreateOperatorFamily payload.
+func DecodeCreateOperatorFamily(payload []byte) (CreateOperatorFamilyPayload, error) {
+	var p CreateOperatorFamilyPayload
+	if len(payload) < 9 {
+		return p, fmt.Errorf("wal: create-operator-family payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateOperatorFamily {
+		return p, fmt.Errorf("wal: record kind %d is not create-operator-family", payload[0])
+	}
+	off := 1
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+		return v
+	}
+	p.OID = readU32()
+	p.Method = readU32()
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-operator-family payload truncated (length prefix)")
+		}
+		n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+n {
+			return "", fmt.Errorf("wal: create-operator-family payload truncated (need %d bytes)", off+n)
+		}
+		s := string(payload[off : off+n])
+		off += n
+		return s, nil
+	}
+	var err error
+	if p.Schema, err = readStr(); err != nil {
+		return p, err
+	}
+	if p.Name, err = readStr(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// CreateOperatorClassPayload carries the metadata needed to fully
+// reconstruct a catalog.UserOperatorClass during WAL replay. FamilyOID is
+// carried directly — see the RecordKindCreateOperatorClass constant for why
+// that is safe (the owning family's own create record always precedes this
+// one).
+type CreateOperatorClassPayload struct {
+	OID        uint32
+	Schema     string
+	Name       string
+	Method     uint32
+	FamilyOID  uint32
+	InTypeOID  uint32
+	KeyTypeOID uint32
+	IsDefault  bool
+}
+
+// EncodeCreateOperatorClass encodes a CREATE OPERATOR CLASS event's own
+// pg_opclass row. Format documented at the RecordKindCreateOperatorClass
+// constant.
+func EncodeCreateOperatorClass(p CreateOperatorClassPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateOperatorClass)
+	var u32 [4]byte
+	putU32 := func(v uint32) {
+		binary.LittleEndian.PutUint32(u32[:], v)
+		buf.Write(u32[:])
+	}
+	putU32(p.OID)
+	putU32(p.Method)
+	putU32(p.FamilyOID)
+	putU32(p.InTypeOID)
+	putU32(p.KeyTypeOID)
+	if p.IsDefault {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+	writeWALStr := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		var l [2]byte
+		binary.LittleEndian.PutUint16(l[:], uint16(len(s)))
+		buf.Write(l[:])
+		buf.WriteString(s)
+	}
+	writeWALStr(p.Schema)
+	writeWALStr(p.Name)
+	return buf.Bytes()
+}
+
+// DecodeCreateOperatorClass decodes a RecordKindCreateOperatorClass payload.
+func DecodeCreateOperatorClass(payload []byte) (CreateOperatorClassPayload, error) {
+	var p CreateOperatorClassPayload
+	if len(payload) < 22 {
+		return p, fmt.Errorf("wal: create-operator-class payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateOperatorClass {
+		return p, fmt.Errorf("wal: record kind %d is not create-operator-class", payload[0])
+	}
+	off := 1
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+		return v
+	}
+	p.OID = readU32()
+	p.Method = readU32()
+	p.FamilyOID = readU32()
+	p.InTypeOID = readU32()
+	p.KeyTypeOID = readU32()
+	p.IsDefault = payload[off] != 0
+	off++
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-operator-class payload truncated (length prefix)")
+		}
+		n := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+n {
+			return "", fmt.Errorf("wal: create-operator-class payload truncated (need %d bytes)", off+n)
+		}
+		s := string(payload[off : off+n])
+		off += n
+		return s, nil
+	}
+	var err error
+	if p.Schema, err = readStr(); err != nil {
+		return p, err
+	}
+	if p.Name, err = readStr(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// EncodeDropOperatorClass encodes a DROP OPERATOR CLASS event by OID. Format
+// documented at the RecordKindDropOperatorClass constant.
+func EncodeDropOperatorClass(oid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindDropOperatorClass
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	return out
+}
+
+// DecodeDropOperatorClass decodes a RecordKindDropOperatorClass payload.
+func DecodeDropOperatorClass(payload []byte) (oid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: drop-operator-class payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropOperatorClass {
+		return 0, fmt.Errorf("wal: record kind %d is not drop-operator-class", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// EncodeDropOperatorFamily encodes a DROP OPERATOR FAMILY event by OID.
+// Format documented at the RecordKindDropOperatorFamily constant.
+func EncodeDropOperatorFamily(oid uint32) []byte {
+	out := make([]byte, 5)
+	out[0] = RecordKindDropOperatorFamily
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	return out
+}
+
+// DecodeDropOperatorFamily decodes a RecordKindDropOperatorFamily payload.
+func DecodeDropOperatorFamily(payload []byte) (oid uint32, err error) {
+	if len(payload) < 5 {
+		return 0, fmt.Errorf("wal: drop-operator-family payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropOperatorFamily {
+		return 0, fmt.Errorf("wal: record kind %d is not drop-operator-family", payload[0])
+	}
+	return binary.LittleEndian.Uint32(payload[1:5]), nil
+}
+
+// AmOpMemberPayload carries the metadata needed to fully reconstruct a
+// catalog.AmOpMember (one pg_amop row) during WAL replay.
+type AmOpMemberPayload struct {
+	OID           uint32
+	FamilyOID     uint32
+	ClassOID      uint32
+	LeftType      uint32
+	RightType     uint32
+	Strategy      uint32
+	OperOID       uint32
+	Method        uint32
+	SortFamilyOID uint32
+}
+
+// EncodeCreateAmOpMember encodes a pg_amop-row-creation event. Format
+// documented at the RecordKindCreateAmOpMember constant.
+func EncodeCreateAmOpMember(p AmOpMemberPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateAmOpMember)
+	var u32 [4]byte
+	putU32 := func(v uint32) {
+		binary.LittleEndian.PutUint32(u32[:], v)
+		buf.Write(u32[:])
+	}
+	putU32(p.OID)
+	putU32(p.FamilyOID)
+	putU32(p.ClassOID)
+	putU32(p.LeftType)
+	putU32(p.RightType)
+	putU32(p.Strategy)
+	putU32(p.OperOID)
+	putU32(p.Method)
+	putU32(p.SortFamilyOID)
+	return buf.Bytes()
+}
+
+// DecodeCreateAmOpMember decodes a RecordKindCreateAmOpMember payload.
+func DecodeCreateAmOpMember(payload []byte) (AmOpMemberPayload, error) {
+	var p AmOpMemberPayload
+	if len(payload) < 37 {
+		return p, fmt.Errorf("wal: create-amop-member payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateAmOpMember {
+		return p, fmt.Errorf("wal: record kind %d is not create-amop-member", payload[0])
+	}
+	off := 1
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+		return v
+	}
+	p.OID = readU32()
+	p.FamilyOID = readU32()
+	p.ClassOID = readU32()
+	p.LeftType = readU32()
+	p.RightType = readU32()
+	p.Strategy = readU32()
+	p.OperOID = readU32()
+	p.Method = readU32()
+	p.SortFamilyOID = readU32()
+	return p, nil
+}
+
+// EncodeDropAmOpMember encodes an ALTER OPERATOR FAMILY ... DROP OPERATOR
+// removal, keyed the same way RemoveAmOpMember is. Format documented at the
+// RecordKindDropAmOpMember constant.
+func EncodeDropAmOpMember(familyOID, leftType, rightType, strategy uint32) []byte {
+	out := make([]byte, 17)
+	out[0] = RecordKindDropAmOpMember
+	binary.LittleEndian.PutUint32(out[1:5], familyOID)
+	binary.LittleEndian.PutUint32(out[5:9], leftType)
+	binary.LittleEndian.PutUint32(out[9:13], rightType)
+	binary.LittleEndian.PutUint32(out[13:17], strategy)
+	return out
+}
+
+// DecodeDropAmOpMember decodes a RecordKindDropAmOpMember payload.
+func DecodeDropAmOpMember(payload []byte) (familyOID, leftType, rightType, strategy uint32, err error) {
+	if len(payload) < 17 {
+		return 0, 0, 0, 0, fmt.Errorf("wal: drop-amop-member payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropAmOpMember {
+		return 0, 0, 0, 0, fmt.Errorf("wal: record kind %d is not drop-amop-member", payload[0])
+	}
+	familyOID = binary.LittleEndian.Uint32(payload[1:5])
+	leftType = binary.LittleEndian.Uint32(payload[5:9])
+	rightType = binary.LittleEndian.Uint32(payload[9:13])
+	strategy = binary.LittleEndian.Uint32(payload[13:17])
+	return familyOID, leftType, rightType, strategy, nil
+}
+
+// AmProcMemberPayload carries the metadata needed to fully reconstruct a
+// catalog.AmProcMember (one pg_amproc row) during WAL replay.
+type AmProcMemberPayload struct {
+	OID       uint32
+	FamilyOID uint32
+	ClassOID  uint32
+	LeftType  uint32
+	RightType uint32
+	ProcNum   uint32
+	ProcOID   uint32
+	Method    uint32
+}
+
+// EncodeCreateAmProcMember encodes a pg_amproc-row-creation event. Format
+// documented at the RecordKindCreateAmProcMember constant.
+func EncodeCreateAmProcMember(p AmProcMemberPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateAmProcMember)
+	var u32 [4]byte
+	putU32 := func(v uint32) {
+		binary.LittleEndian.PutUint32(u32[:], v)
+		buf.Write(u32[:])
+	}
+	putU32(p.OID)
+	putU32(p.FamilyOID)
+	putU32(p.ClassOID)
+	putU32(p.LeftType)
+	putU32(p.RightType)
+	putU32(p.ProcNum)
+	putU32(p.ProcOID)
+	putU32(p.Method)
+	return buf.Bytes()
+}
+
+// DecodeCreateAmProcMember decodes a RecordKindCreateAmProcMember payload.
+func DecodeCreateAmProcMember(payload []byte) (AmProcMemberPayload, error) {
+	var p AmProcMemberPayload
+	if len(payload) < 33 {
+		return p, fmt.Errorf("wal: create-amproc-member payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateAmProcMember {
+		return p, fmt.Errorf("wal: record kind %d is not create-amproc-member", payload[0])
+	}
+	off := 1
+	readU32 := func() uint32 {
+		v := binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+		return v
+	}
+	p.OID = readU32()
+	p.FamilyOID = readU32()
+	p.ClassOID = readU32()
+	p.LeftType = readU32()
+	p.RightType = readU32()
+	p.ProcNum = readU32()
+	p.ProcOID = readU32()
+	p.Method = readU32()
+	return p, nil
+}
+
+// EncodeDropAmProcMember encodes an ALTER OPERATOR FAMILY ... DROP FUNCTION
+// removal, keyed the same way RemoveAmProcMember is. Format documented at
+// the RecordKindDropAmProcMember constant.
+func EncodeDropAmProcMember(familyOID, leftType, rightType, procNum uint32) []byte {
+	out := make([]byte, 17)
+	out[0] = RecordKindDropAmProcMember
+	binary.LittleEndian.PutUint32(out[1:5], familyOID)
+	binary.LittleEndian.PutUint32(out[5:9], leftType)
+	binary.LittleEndian.PutUint32(out[9:13], rightType)
+	binary.LittleEndian.PutUint32(out[13:17], procNum)
+	return out
+}
+
+// DecodeDropAmProcMember decodes a RecordKindDropAmProcMember payload.
+func DecodeDropAmProcMember(payload []byte) (familyOID, leftType, rightType, procNum uint32, err error) {
+	if len(payload) < 17 {
+		return 0, 0, 0, 0, fmt.Errorf("wal: drop-amproc-member payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropAmProcMember {
+		return 0, 0, 0, 0, fmt.Errorf("wal: record kind %d is not drop-amproc-member", payload[0])
+	}
+	familyOID = binary.LittleEndian.Uint32(payload[1:5])
+	leftType = binary.LittleEndian.Uint32(payload[5:9])
+	rightType = binary.LittleEndian.Uint32(payload[9:13])
+	procNum = binary.LittleEndian.Uint32(payload[13:17])
+	return familyOID, leftType, rightType, procNum, nil
 }
 
 // EncodeDropSequence encodes a RecordKindDropSequence record.
@@ -4883,9 +6246,9 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// and re-applies them to the sequence registry + the owning
 		// column's serial/identity catalog markers.
 		return false, nil
-	case RecordKindRoleState, RecordKindDropRole:
-		// Role state / removal records (CREATE/ALTER/DROP ROLE restart
-		// persistence) carry only the in-memory role registry state +
+	case RecordKindRoleState, RecordKindDropRole, RecordKindAlterRoleRename:
+		// Role state / removal / rename records (CREATE/ALTER/DROP ROLE
+		// restart persistence) carry only the in-memory role registry state +
 		// credential; runtime role DDL never writes the pg_authid heap
 		// (initdb-only, like all on-disk shared catalogs), so the physical
 		// replay path has nothing to do. The recovery driver in
@@ -4940,6 +6303,67 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// event trigger registry.
 		return false, nil
+	case RecordKindCreateAccessMethod, RecordKindDropAccessMethod:
+		// CREATE/DROP ACCESS METHOD records (DU-002 restart-persistence
+		// follow-up, M0119-0004 DU-002 slice 426 ledger resume point) carry
+		// only catalog.InMemory's accessMethods registry metadata; goopg has
+		// no per-access-method file namespace (no pluggable storage engine),
+		// so the physical replay path has nothing to do. The recovery driver
+		// in internal/initdb/access_method_ddl_recovery.go scans the WAL for
+		// these records after physical replay and re-applies them to the
+		// access method registry.
+		return false, nil
+	case RecordKindCreateRangeType, RecordKindDropRangeType:
+		// CREATE/DROP TYPE ... AS RANGE records (DU-002 restart-persistence
+		// follow-up, M0110-0001 DU-002 slice 429 ledger resume point,
+		// sub-item (c)) carry only catalog.InMemory's rangeTypes registry
+		// metadata; goopg has no per-range-type file namespace, so the
+		// physical replay path has nothing to do. The recovery driver in
+		// internal/initdb/range_type_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the range
+		// type registry.
+		return false, nil
+	case RecordKindCreateOperator, RecordKindDropOperator, RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
+		// CREATE/DROP OPERATOR (DU-002 restart-persistence follow-up,
+		// M0119-0004/M0110-0001 loop #65/#66) and GRANT/REVOKE ROLE
+		// membership (M0119-0004-ACLHEAP) records carry only in-memory
+		// registry state (userOperators / roleMembers); goopg has no
+		// per-operator or per-role-membership file namespace, so the
+		// physical replay path has nothing to do. **Bug fix (this loop):**
+		// these four kinds previously had NO case in this switch at all —
+		// on a data dir where the last checkpoint predates one of these
+		// records (i.e. no shutdown checkpoint ran between the DDL and the
+		// restart, such as a crash restart), ReplayRecords/ApplyRecord
+		// would hit the `default` branch below and fail the ENTIRE replay
+		// with "unsupported kind N", aborting startup outright — not a
+		// silent data-loss bug, but a crash-recovery availability bug that
+		// a graceful restart (which always takes a shutdown checkpoint,
+		// trimming these pre-checkpoint records out of ReplayRecords'
+		// input before they ever reach ApplyRecord) could never surface.
+		// Discovered while auditing this switch for the CREATE/DROP
+		// OPERATOR CLASS/FAMILY kinds added below — see the deferral
+		// ledger. The recovery drivers in
+		// internal/initdb/operator_ddl_recovery.go and
+		// internal/initdb/role_membership_recovery.go already scan the WAL
+		// unconditionally from LSN 0 (not trimmed to the checkpoint) and
+		// re-apply these records to the catalog, independent of whatever
+		// ApplyRecord does here.
+		return false, nil
+	case RecordKindCreateOperatorFamily, RecordKindCreateOperatorClass, RecordKindDropOperatorClass,
+		RecordKindCreateAmOpMember, RecordKindDropAmOpMember, RecordKindCreateAmProcMember, RecordKindDropAmProcMember,
+		RecordKindDropOperatorFamily:
+		// CREATE OPERATOR FAMILY / CREATE OPERATOR CLASS (+ its pg_amop/
+		// pg_amproc AS-list members) / DROP OPERATOR CLASS / ALTER OPERATOR
+		// FAMILY ... ADD|DROP records (DU-002 restart-persistence
+		// follow-up, M0119-0004/M0110-0001, closing the loop #65/#66 ledger
+		// row's "still open" item (1)) carry only catalog.InMemory's
+		// userOperatorFamilies/userOperatorClasses/amOpMembers/amProcMembers
+		// registry state; goopg has no per-opclass/opfamily file namespace,
+		// so the physical replay path has nothing to do. The recovery
+		// driver in internal/initdb/operator_class_ddl_recovery.go scans
+		// the WAL for these records after physical replay and re-applies
+		// them to the catalog.
+		return false, nil
 	case RecordKindCreateAggregate, RecordKindAlterAggregateRename, RecordKindDropAggregate, RecordKindAlterAggregateOwner:
 		// CREATE/ALTER/DROP AGGREGATE records (DU-002 restart-persistence
 		// follow-up, slice 405 resume point (c)) carry only pg_aggregate/
@@ -4948,6 +6372,24 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// in internal/initdb/aggregate_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's user-aggregate registry.
+		return false, nil
+	case RecordKindAlterDatabaseSetConfig, RecordKindAlterDatabaseResetConfig, RecordKindAlterDatabaseResetAllConfig:
+		// ALTER DATABASE ... SET/RESET records (M0119-0004-ACLHEAP ALTER
+		// DATABASE ... SET follow-up) carry only catalog.InMemory's
+		// dbRoleSettings registry state; goopg has no per-database file
+		// namespace, so the physical replay path has nothing to do. The
+		// recovery driver in internal/initdb/database_config_recovery.go
+		// scans the WAL for these records after physical replay and
+		// re-applies them to the registry.
+		return false, nil
+	case RecordKindAlterRoleSetConfig, RecordKindAlterRoleResetConfig, RecordKindAlterRoleResetAllConfig:
+		// ALTER ROLE ... SET/RESET records (M0119-0004-ACLHEAP ALTER ROLE
+		// ... SET follow-up) carry only catalog.InMemory's roleSettings
+		// registry state; same no-op physical replay path as the ALTER
+		// DATABASE ... SET/RESET records above. The recovery driver in
+		// internal/initdb/role_config_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the
+		// registry.
 		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog

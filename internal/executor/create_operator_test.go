@@ -110,6 +110,48 @@ func TestCreateOperatorSelfNegatorRejected(t *testing.T) {
 	}
 }
 
+// TestDropOperatorSurvivesAcrossRestart mirrors what a restart looks like
+// from DROP OPERATOR's point of view: the operator is present ONLY in the
+// dedicated catalog.UserOperator registry (as RegisterUserOperatorDuringRecovery
+// leaves it after WAL replay — see internal/initdb/operator_ddl_recovery_test.go),
+// with no corresponding compatObjects["operator"] entry (that ephemeral
+// registry is never repopulated by recovery). Loop #66 fix: DROP OPERATOR's
+// existence check must key off LookupUserOperator (restart-durable since
+// loop #65), not off the compat registry alone — the prior compat-registry-only
+// gate spuriously raised 42883 for ANY operator surviving a restart (first
+// noticed with the symbol "=#=" and misdiagnosed as a lexer quirk; reproduces
+// identically for a plain symbol like "~~~", see deferral ledger).
+func TestDropOperatorSurvivesAcrossRestart(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	im.RegisterUserOperatorDuringRecovery(&catalog.UserOperator{
+		OID: 40950, Name: "~~~", LeftType: "int4", RightType: "int4", FuncOID: 40951, Owner: 10,
+	}, "public")
+
+	if _, ok := im.LookupUserOperator("public", "~~~", "int4", "int4"); !ok {
+		t.Fatal("setup: operator not registered via recovery path")
+	}
+
+	if err := runDDL(t, ctx, `DROP OPERATOR public.~~~ (int4, int4)`); err != nil {
+		t.Fatalf("DROP OPERATOR on a recovery-only-registered operator: %v", err)
+	}
+
+	if _, ok := im.LookupUserOperator("public", "~~~", "int4", "int4"); ok {
+		t.Error("operator still present after DROP OPERATOR")
+	}
+
+	// A genuinely unknown operator must still 42883.
+	err := runDDL(t, ctx, `DROP OPERATOR public.~~~ (int4, int4)`)
+	if err == nil {
+		t.Fatal("expected 42883 on re-drop of an already-dropped operator, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("error = %v, want 'does not exist'", err)
+	}
+}
+
 // TestCreateOperatorUnaryAndValidation exercises the unary (prefix) operator
 // form (LEFTARG omitted, RIGHTARG required) and OperatorValidateParams-style
 // attribute checks (operatorcmds.c): COMMUTATOR requires a binary operator;
@@ -793,6 +835,56 @@ func TestDropOperatorClassRemovesMembers(t *testing.T) {
 	}
 	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
 		t.Fatalf("pg_amop VirtualRows = %v, want empty after DROP OPERATOR CLASS", rows)
+	}
+}
+
+// TestDropOperatorFamilyRemovesFamily verifies DROP OPERATOR FAMILY on a
+// bare family (created via CREATE OPERATOR FAMILY, no AS list, no class)
+// actually removes it from the registry, purges any loose ALTER OPERATOR
+// FAMILY ... ADD member rows it owns, and re-DROPping the same name errors
+// 42704 — closing the loop #69 ledger row's discovery that the combined
+// execDropCompat "operator class"/"operator family" arm only ever touched
+// the legacy opClassSchemas map (keyed by operator *class* name), so a bare
+// family was never removed from userOperatorFamilies. DU-002
+// (M0119-0004/M0110-0001).
+func TestDropOperatorFamilyRemovesFamily(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	if err := runDDL(t, ctx, `CREATE OPERATOR public.~=~ (FUNCTION = int4eq, LEFTARG = int4, RIGHTARG = int4)`); err != nil {
+		t.Fatalf("CREATE OPERATOR: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("CREATE OPERATOR FAMILY: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER OPERATOR FAMILY public.op_family USING btree ADD
+		OPERATOR 3 ~=~ (int4, int4)`); err != nil {
+		t.Fatalf("ALTER OPERATOR FAMILY ADD: %v", err)
+	}
+	im := ctx.Catalog.(*catalog.InMemory)
+	if rows := pgOpfamilyVirtualRows(t, im); len(rows) != 1 {
+		t.Fatalf("pg_opfamily VirtualRows = %v, want 1 row before DROP", rows)
+	}
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 1 {
+		t.Fatalf("pg_amop VirtualRows = %v, want 1 row before DROP", rows)
+	}
+
+	if err := runDDL(t, ctx, `DROP OPERATOR FAMILY public.op_family USING btree`); err != nil {
+		t.Fatalf("DROP OPERATOR FAMILY: %v", err)
+	}
+	if rows := pgOpfamilyVirtualRows(t, im); len(rows) != 0 {
+		t.Fatalf("pg_opfamily VirtualRows = %v, want empty after DROP OPERATOR FAMILY", rows)
+	}
+	if rows := pgAmopVirtualRows(t, im); len(rows) != 0 {
+		t.Fatalf("pg_amop VirtualRows = %v, want empty after DROP OPERATOR FAMILY", rows)
+	}
+	if _, ok := im.LookupUserOperatorFamily("public", "op_family", catalog.AccessMethodOIDByName("btree")); ok {
+		t.Error("op_family still resolves via LookupUserOperatorFamily after DROP OPERATOR FAMILY")
+	}
+
+	err := runDDL(t, ctx, `DROP OPERATOR FAMILY public.op_family USING btree`)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42704" {
+		t.Fatalf("re-DROP error = %v, want ExecError{Code: 42704}", err)
 	}
 }
 

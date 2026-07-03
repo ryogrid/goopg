@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/aio"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/control"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/wal"
@@ -1029,6 +1030,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
+	// TOAST OID counter restart persistence (root-0022 follow-up): the
+	// executor's toastOIDCounter is process-local and always starts at 0,
+	// but the TOAST relations it writes chunk_id rows into survive a
+	// restart on disk. Without reseeding, the first TOAST write after
+	// every restart would reissue chunk_id 1, colliding with whatever
+	// chunk_id 1 already resides in the same table's TOAST relation from
+	// before the restart and corrupting detoast reassembly for BOTH
+	// values (deferral ledger 2026-07-02, WordPress wp_options neighbor-row
+	// corruption). Runs unconditionally (even on the M0114 cache-hit path)
+	// since the counter always resets on process start regardless of how
+	// the catalog was loaded. Skips any table whose TOAST relation has no
+	// on-disk file yet (cheap Pool.Exists check inside).
+	{
+		mainRels := make([]storage.RelFileNode, 0, len(cat.AllTables()))
+		for _, tbl := range cat.AllTables() {
+			mainRels = append(mainRels, cat.RelFileNode(tbl))
+		}
+		if err := executor.SeedToastOIDCounter(pool, mainRels); err != nil {
+			slog.Warn("TOAST OID counter reseed failed", "err", err)
+		}
+	}
+
 	// M0114: write the catalog cache after a successful heap scan so the
 	// next startup can skip pg_class/pg_attribute scanning entirely.
 	// Non-fatal: a write failure just means a cold-start next time.
@@ -1050,6 +1073,29 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
+	}
+
+	// M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up): replay
+	// ALTER DATABASE ... SET/RESET WAL records into pg_db_role_setting.
+	// Order relative to replayDatabaseDDLRecords does not matter — each
+	// record carries its own dbOid, not a name resolved through the
+	// database registry.
+	if err := replayDatabaseConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: database config replay: %w", err)
+	}
+
+	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up): replay ALTER ROLE
+	// ... SET/RESET WAL records into pg_db_role_setting. Each record keys
+	// off the role's OID (stable across a rename/restart), not its name, so
+	// ordering relative to role DDL replay does not matter.
+	if err := replayRoleConfigRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: role config replay: %w", err)
 	}
 
 	// M0112: restore per-column planner statistics from pg_statistic.
@@ -1124,6 +1170,23 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: role DDL replay: %w", err)
+	}
+
+	// M0119-0004-ACLHEAP (GRANT/REVOKE ROLE membership): replay GRANT/REVOKE
+	// ROLE WAL records into pg_auth_members. Must run AFTER
+	// LoadRolesFromAuthidHeap/replayRoleDDLRecords immediately above: those
+	// calls load role OIDs preserved from before the crash (RegisterRoleWithOID)
+	// and can advance the catalog's nextOID counter well past its
+	// pre-replay value, so running this pass first (which mints a FRESH OID
+	// per membership row via GrantRoleMembership -> AllocOID, since
+	// pg_auth_members.oid is not dumped by pg_dump/pg_dumpall and so has no
+	// stability requirement of its own) risks a numeric OID collision with a
+	// role OID loaded afterward.
+	if err := replayRoleMembershipRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: role membership replay: %w", err)
 	}
 
 	// M0106-0013: stamp the clog from WAL commit/abort records and advance
@@ -1444,6 +1507,56 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = walWriter.Close()
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: function DDL replay: %w", err)
+	}
+
+	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
+	// ledger resume point): restore CREATE/DROP ACCESS METHOD objects from
+	// the WAL. Like event triggers, access methods are keyed by a plain name
+	// string, so order relative to schema replay does not matter.
+	if err := replayAccessMethodDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: access method DDL replay: %w", err)
+	}
+
+	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
+	// ledger resume point, sub-item (c)): restore CREATE/DROP TYPE ... AS
+	// RANGE objects from the WAL. Like access methods, range types are keyed
+	// by a plain name string, so order relative to schema replay does not
+	// matter.
+	if err := replayRangeTypeDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: range type DDL replay: %w", err)
+	}
+
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+	// discovered while verifying the loop #64 CREATE TYPE ... AS RANGE
+	// opclass/collation follow-up — see ledger): restore CREATE/DROP
+	// OPERATOR objects from the WAL. Runs after schema replay (above) since,
+	// unlike range types/access methods, an operator's registry key embeds
+	// its schema name.
+	if err := replayOperatorDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: operator DDL replay: %w", err)
+	}
+
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
+	// the loop #65/#66 ledger row's "still open" item (1)): restore CREATE
+	// OPERATOR FAMILY / CREATE OPERATOR CLASS (+ its pg_amop/pg_amproc
+	// AS-list members) / DROP OPERATOR CLASS / ALTER OPERATOR FAMILY ...
+	// ADD|DROP objects from the WAL. Runs after the operator DDL replay
+	// above (schema replay must have already run, and a class's AS-list
+	// OPERATOR entries reference user operators by OID).
+	if err := replayOperatorClassDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: operator class/family DDL replay: %w", err)
 	}
 
 	// pg_sequences: virtual catalog view listing all registered sequences.

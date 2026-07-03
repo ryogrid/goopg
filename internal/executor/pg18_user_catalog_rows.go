@@ -675,6 +675,39 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 		}
 	}
+	// A column whose declared type is a user-defined RANGE type (`CREATE TYPE x
+	// AS RANGE (...)`) — or its auto-generated MULTIRANGE type, which a column
+	// can also be declared with directly — likewise resolves to the text
+	// fallback above (no built-in name collision is possible). Re-resolve it to
+	// the range's/multirange's dynamically-allocated pg_type OID so
+	// pg_attribute.atttypid points at it and pg_dump's format_type renders the
+	// schema-qualified range/multirange name (LookupRangeTypeByOID/
+	// ByMultirangeOID, expr.go) rather than `text`. A `myrange[]`/
+	// `mymultirange[]` column resolves to the respective auto-generated array
+	// OID. Guarded on no enum/composite match so the user-type branches stay
+	// mutually exclusive. DU-002 slice 429 follow-up.
+	rangeOID := uint32(0)
+	rangeArrayOID := uint32(0)
+	rangeSubtypeName := ""
+	if cat != nil && typOID == catalog.OIDText && enumOID == 0 && enumArrayOID == 0 && compositeOID == 0 && compositeArrayOID == 0 {
+		if rt, ok := cat.LookupRangeType(col.Type.Name); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if col.Type.IsArray {
+				rangeArrayOID = rt.ArrayOID
+			} else {
+				typOID = rt.OID
+				rangeOID = rt.OID
+			}
+		} else if rt, ok := cat.LookupRangeTypeByMultirangeName(col.Type.Name); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if col.Type.IsArray {
+				rangeArrayOID = rt.MultirangeArrayOID
+			} else {
+				typOID = rt.MultirangeOID
+				rangeOID = rt.MultirangeOID
+			}
+		}
+	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
 	// from the base OID before remapping typOID to the array (_typename) OID.
 	typmod := pgAttTypmod(typOID, col.Type.Args)
@@ -692,6 +725,11 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		case compositeArrayOID != 0:
 			// Composite array OIDs are dynamic too. DU-002 slice 373.
 			typOID = compositeArrayOID
+			attndims = 1
+		case rangeArrayOID != 0:
+			// Range/multirange array OIDs are dynamic too. DU-002 slice 429
+			// follow-up.
+			typOID = rangeArrayOID
 			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
@@ -731,6 +769,17 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// A composite's array type shares the composite element's layout
 		// (mirrors buildUserPGTypeRowForCompositeArray). DU-002 slice 373.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case rangeOID != 0, rangeArrayOID != 0:
+		// A range/multirange (and its array) is always varlena, never
+		// collatable, extended-storage; alignment mirrors PG's DefineRange
+		// rule — double if the subtype is double-aligned, int otherwise
+		// (matches buildUserPGTypeRowForRange/ForRangeArray/ForMultirange/
+		// ForMultirangeArray). DU-002 slice 429 follow-up.
+		align := byte('i')
+		if userTypeAttrsForOID(catalog.TypeNameToOID(rangeSubtypeName)).TypAlign == 'd' {
+			align = 'd'
+		}
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: align, TypStorage: 'x'}
 	}
 	// A per-column storage override (ALTER COLUMN ... SET STORAGE) shadows the
 	// type's default storage in pg_attribute.attstorage. pg_dump compares
@@ -1651,6 +1700,33 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 			}
 		}
 	}
+	// A field whose declared type is a user-defined RANGE (or its
+	// auto-generated MULTIRANGE) type also folds to the text fallback.
+	// Re-resolve to the range's/multirange's pg_type OID so format_type
+	// renders the field as the schema-qualified name rather than `text`.
+	// Mirrors the table-column path (DU-002 slice 429 follow-up).
+	rangeOID := uint32(0)
+	rangeArrayOID := uint32(0)
+	rangeSubtypeName := ""
+	if cat != nil && typOID == catalog.OIDText {
+		if rt, ok := cat.LookupRangeType(base); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if isArray {
+				rangeArrayOID = rt.ArrayOID
+			} else {
+				typOID = rt.OID
+				rangeOID = rt.OID
+			}
+		} else if rt, ok := cat.LookupRangeTypeByMultirangeName(base); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if isArray {
+				rangeArrayOID = rt.MultirangeArrayOID
+			} else {
+				typOID = rt.MultirangeOID
+				rangeOID = rt.MultirangeOID
+			}
+		}
+	}
 	attndims := int64(0)
 	if isArray {
 		switch {
@@ -1665,6 +1741,11 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		case domainArrayOID != 0:
 			// Domain array OIDs are dynamic too. DU-002 slice 252.
 			typOID = domainArrayOID
+			attndims = 1
+		case rangeArrayOID != 0:
+			// Range/multirange array OIDs are dynamic too. DU-002 slice 429
+			// follow-up.
+			typOID = rangeArrayOID
 			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
@@ -1681,6 +1762,14 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		// An enum's array type is a standard varlena array: -1 length,
 		// int-aligned (matching the 4-byte enum element), extended storage.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case rangeOID != 0, rangeArrayOID != 0:
+		// Mirrors the table-column range/multirange case. DU-002 slice 429
+		// follow-up.
+		align := byte('i')
+		if userTypeAttrsForOID(catalog.TypeNameToOID(rangeSubtypeName)).TypAlign == 'd' {
+			align = 'd'
+		}
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: align, TypStorage: 'x'}
 	case compositeArrayOID != 0:
 		// An array of a composite type is a standard varlena array: -1 length,
 		// double-aligned (matching the double-aligned composite element),
@@ -1898,6 +1987,197 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NullDatum,                                      // typdefaultbin (NULL)
 		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// buildUserPGTypeRowForRange builds the pg_type row for a user-defined range
+// type (typtype='r', typcategory='R'). Ranges are always varlena
+// (typlen=-1), never collatable (typcollation=0 — PG's own comment: "ranges
+// never have one"; the subtype's collation instead lives on pg_range.rngcollation),
+// and always TOAST-extended. Alignment mirrors PG's rule in DefineRange:
+// double if the subtype is double-aligned, int otherwise. typarray points at
+// the auto-generated `_name` array type (buildUserPGTypeRowForRangeArray).
+// DU-002 (M0110-0001).
+func buildUserPGTypeRowForRange(rt *catalog.RangeType) Row {
+	subtypeOID := catalog.TypeNameToOID(rt.SubtypeName)
+	align := byte('i')
+	if userTypeAttrsForOID(subtypeOID).TypAlign == 'd' {
+		align = 'd'
+	}
+	return Row{
+		NewIntDatum(int64(rt.OID)),                     // oid
+		NewStringDatum(rt.Name),                        // typname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
+		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(-1),                                 // typlen (always varlena)
+		NewBoolDatum(false),                             // typbyval
+		NewStringDatum("r"),                             // typtype = 'r' (range)
+		NewStringDatum("R"),                             // typcategory = TYPCATEGORY_RANGE
+		NewBoolDatum(false),                             // typispreferred
+		NewBoolDatum(true),                              // typisdefined
+		NewStringDatum(","),                             // typdelim
+		NewIntDatum(0),                                  // typrelid
+		NewIntDatum(0),                                  // typsubscript
+		NewIntDatum(0),                                  // typelem
+		NewIntDatum(int64(rt.ArrayOID)),                 // typarray (auto-generated `_name` array type)
+		NewIntDatum(0),                                  // typinput
+		NewIntDatum(0),                                  // typoutput
+		NewIntDatum(0),                                  // typreceive
+		NewIntDatum(0),                                  // typsend
+		NewIntDatum(0),                                  // typmodin
+		NewIntDatum(0),                                  // typmodout
+		NewIntDatum(0),                                  // typanalyze
+		NewStringDatum(string(align)),                   // typalign
+		NewStringDatum("x"),                             // typstorage = 'x' (extended)
+		NewBoolDatum(false),                             // typnotnull
+		NewIntDatum(0),                                  // typbasetype
+		NewIntDatum(-1),                                 // typtypmod
+		NewIntDatum(0),                                  // typndims
+		NewIntDatum(0),                                  // typcollation (ranges never have one)
+		NullDatum,                                       // typdefaultbin
+		NullDatum,                                       // typdefault
+		NullDatum,                                       // typacl
+	}
+}
+
+// buildUserPGTypeRowForMultirange builds the pg_type row for a range type's
+// auto-generated multirange type (typtype='m', typcategory='R' — matching
+// PG's TypeCreate call in DefineRange, which reuses TYPCATEGORY_RANGE for the
+// multirange too). Same varlena/alignment/no-collation shape as the range
+// itself; typarray points at the multirange's own auto-generated `_name`
+// array type (buildUserPGTypeRowForMultirangeArray). DU-002 (M0110-0001).
+func buildUserPGTypeRowForMultirange(rt *catalog.RangeType) Row {
+	subtypeOID := catalog.TypeNameToOID(rt.SubtypeName)
+	align := byte('i')
+	if userTypeAttrsForOID(subtypeOID).TypAlign == 'd' {
+		align = 'd'
+	}
+	return Row{
+		NewIntDatum(int64(rt.MultirangeOID)),           // oid
+		NewStringDatum(rt.MultirangeName),              // typname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
+		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(-1),                                 // typlen (always varlena)
+		NewBoolDatum(false),                             // typbyval
+		NewStringDatum("m"),                             // typtype = 'm' (multirange)
+		NewStringDatum("R"),                             // typcategory = TYPCATEGORY_RANGE
+		NewBoolDatum(false),                             // typispreferred
+		NewBoolDatum(true),                              // typisdefined
+		NewStringDatum(","),                             // typdelim
+		NewIntDatum(0),                                  // typrelid
+		NewIntDatum(0),                                  // typsubscript
+		NewIntDatum(0),                                  // typelem
+		NewIntDatum(int64(rt.MultirangeArrayOID)),       // typarray (auto-generated `_name` array type)
+		NewIntDatum(0),                                  // typinput
+		NewIntDatum(0),                                  // typoutput
+		NewIntDatum(0),                                  // typreceive
+		NewIntDatum(0),                                  // typsend
+		NewIntDatum(0),                                  // typmodin
+		NewIntDatum(0),                                  // typmodout
+		NewIntDatum(0),                                  // typanalyze
+		NewStringDatum(string(align)),                   // typalign
+		NewStringDatum("x"),                             // typstorage = 'x' (extended)
+		NewBoolDatum(false),                             // typnotnull
+		NewIntDatum(0),                                  // typbasetype
+		NewIntDatum(-1),                                 // typtypmod
+		NewIntDatum(0),                                  // typndims
+		NewIntDatum(0),                                  // typcollation
+		NullDatum,                                       // typdefaultbin
+		NullDatum,                                       // typdefault
+		NullDatum,                                       // typacl
+	}
+}
+
+// buildUserPGTypeRowForRangeArray builds the pg_type row for a range type's
+// auto-generated `_name` array type (typtype='b', typcategory='A'),
+// mirroring buildUserPGTypeRowForEnumArray/buildUserPGTypeRowForCompositeArray.
+// Alignment matches the range type's own alignment (an array's alignment
+// equals its element's). DU-002 (M0110-0001) array-type follow-up.
+func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
+	subtypeOID := catalog.TypeNameToOID(rt.SubtypeName)
+	align := byte('i')
+	if userTypeAttrsForOID(subtypeOID).TypAlign == 'd' {
+		align = 'd'
+	}
+	return Row{
+		NewIntDatum(int64(rt.ArrayOID)),                // oid
+		NewStringDatum("_" + rt.Name),                  // typname (array type name)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(-1),                                 // typlen (varlena array)
+		NewBoolDatum(false),                             // typbyval
+		NewStringDatum("b"),                             // typtype = 'b' (base)
+		NewStringDatum("A"),                             // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                             // typispreferred
+		NewBoolDatum(true),                              // typisdefined
+		NewStringDatum(","),                             // typdelim
+		NewIntDatum(0),                                  // typrelid
+		NewIntDatum(0),                                  // typsubscript
+		NewIntDatum(int64(rt.OID)),                      // typelem = the range element type
+		NewIntDatum(0),                                  // typarray
+		NewIntDatum(0),                                  // typinput
+		NewIntDatum(0),                                  // typoutput
+		NewIntDatum(0),                                  // typreceive
+		NewIntDatum(0),                                  // typsend
+		NewIntDatum(0),                                  // typmodin
+		NewIntDatum(0),                                  // typmodout
+		NewIntDatum(0),                                  // typanalyze
+		NewStringDatum(string(align)),                   // typalign (matches the range element's alignment)
+		NewStringDatum("x"),                             // typstorage = 'x' (extended)
+		NewBoolDatum(false),                             // typnotnull
+		NewIntDatum(0),                                  // typbasetype
+		NewIntDatum(-1),                                 // typtypmod
+		NewIntDatum(0),                                  // typndims
+		NewIntDatum(0),                                  // typcollation
+		NullDatum,                                       // typdefaultbin
+		NullDatum,                                       // typdefault
+		NullDatum,                                       // typacl
+	}
+}
+
+// buildUserPGTypeRowForMultirangeArray builds the pg_type row for a range
+// type's multirange's auto-generated `_name` array type. Same shape as
+// buildUserPGTypeRowForRangeArray but keyed on the multirange's own OID/name.
+// DU-002 (M0110-0001) array-type follow-up.
+func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
+	subtypeOID := catalog.TypeNameToOID(rt.SubtypeName)
+	align := byte('i')
+	if userTypeAttrsForOID(subtypeOID).TypAlign == 'd' {
+		align = 'd'
+	}
+	return Row{
+		NewIntDatum(int64(rt.MultirangeArrayOID)),      // oid
+		NewStringDatum("_" + rt.MultirangeName),        // typname (array type name)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(-1),                                 // typlen (varlena array)
+		NewBoolDatum(false),                             // typbyval
+		NewStringDatum("b"),                             // typtype = 'b' (base)
+		NewStringDatum("A"),                             // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                             // typispreferred
+		NewBoolDatum(true),                              // typisdefined
+		NewStringDatum(","),                             // typdelim
+		NewIntDatum(0),                                  // typrelid
+		NewIntDatum(0),                                  // typsubscript
+		NewIntDatum(int64(rt.MultirangeOID)),            // typelem = the multirange element type
+		NewIntDatum(0),                                  // typarray
+		NewIntDatum(0),                                  // typinput
+		NewIntDatum(0),                                  // typoutput
+		NewIntDatum(0),                                  // typreceive
+		NewIntDatum(0),                                  // typsend
+		NewIntDatum(0),                                  // typmodin
+		NewIntDatum(0),                                  // typmodout
+		NewIntDatum(0),                                  // typanalyze
+		NewStringDatum(string(align)),                   // typalign (matches the multirange element's alignment)
+		NewStringDatum("x"),                             // typstorage = 'x' (extended)
+		NewBoolDatum(false),                             // typnotnull
+		NewIntDatum(0),                                  // typbasetype
+		NewIntDatum(-1),                                 // typtypmod
+		NewIntDatum(0),                                  // typndims
+		NewIntDatum(0),                                  // typcollation
+		NullDatum,                                       // typdefaultbin
+		NullDatum,                                       // typdefault
+		NullDatum,                                       // typacl
 	}
 }
 

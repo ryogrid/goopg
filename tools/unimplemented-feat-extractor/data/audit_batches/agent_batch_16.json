@@ -1,0 +1,86 @@
+[
+ {
+  "key": "f6079a94",
+  "date": "2026-05-11",
+  "task_id": "M0091-0004",
+  "feature": "Structural fix for select-only performance is deferred to M0092. The initial audit is complete but the implementation is left for the next milestone.",
+  "resume_point": ""
+ },
+ {
+  "key": "606cff26",
+  "date": "2026-05-11",
+  "task_id": "M0086",
+  "feature": "The needsVacuum function always returns true when RowCount > 0 and does not respect autovacuum reloptions like autovacuum_enabled = off",
+  "resume_point": ""
+ },
+ {
+  "key": "bb65e7d5",
+  "date": "2026-05-12",
+  "task_id": null,
+  "feature": "DEFAULT clause in column definitions is skipped during parsing; default values are not stored or applied to new rows",
+  "resume_point": ""
+ },
+ {
+  "key": "3f524b66",
+  "date": "2026-05-12",
+  "task_id": "m0097-0007",
+  "feature": "Window function queries are excluded from processing and not executed.",
+  "resume_point": ""
+ },
+ {
+  "key": "01d63fe6",
+  "date": "2026-05-12",
+  "task_id": "m0097-0008",
+  "feature": "DROP for sequence/schema/type objects is not fully implemented; only IF EXISTS NOTICE behavior is handled.",
+  "resume_point": ""
+ },
+ {
+  "key": "bb65e7d5",
+  "date": "2026-05-12",
+  "task_id": null,
+  "feature": "WITH OPTIONS clause in column definitions implemented as no-op; column-level options are not processed or applied",
+  "resume_point": ""
+ },
+ {
+  "key": "d248a814",
+  "date": "2026-05-12",
+  "task_id": null,
+  "feature": "Subscriber setup with streaming and logical replication for replicating changes is not implemented in goopg v0.",
+  "resume_point": "BB-020"
+ },
+ {
+  "key": "cb6f8328",
+  "date": "2026-05-12",
+  "task_id": "m0097-0003",
+  "feature": "min_parallel_table_scan_size and min_parallel_index_scan_size GUCs are accepted but not acted upon; query planner ignores these settings.",
+  "resume_point": ""
+ },
+ {
+  "key": "36e48190",
+  "date": "2026-05-12",
+  "task_id": "m0097",
+  "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
+  "resume_point": ""
+ },
+ {
+  "key": "4f11a6ce",
+  "date": "2026-05-12",
+  "task_id": "m0099-0005",
+  "feature": "evictMu lock serializes MarkDirty and WAL operations; should allow concurrent execution for better write performance.",
+  "resume_point": "m0099_matrix_summary.md"
+ },
+ {
+  "key": "46f2fe1b",
+  "date": "2026-05-12",
+  "task_id": "m0099",
+  "feature": "WAL commit-delay sleep path is disabled due to race condition where stale values are written back; actual fix deferred.",
+  "resume_point": ""
+ },
+ {
+  "key": "ee7ee29b",
+  "date": "2026-05-12",
+  "task_id": "m0097-0018",
+  "feature": "pg_relation_size, pg_total_relation_size, pg_indexes_size, and pg_table_size are stubbed; do not return actual relation sizes.",
+  "resume_point": ""
+ }
+]

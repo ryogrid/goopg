@@ -1,0 +1,86 @@
+[
+ {
+  "key": "18eca8c4",
+  "date": "2026-05-21",
+  "task_id": null,
+  "feature": "Caller wiring to integrate the PinP/UnpinP shim into per-P xid cache and per-P stats counters is deferred to subsequent loops so the shim can land standalone.",
+  "resume_point": ""
+ },
+ {
+  "key": "5cc9c68f",
+  "date": "2026-05-21",
+  "task_id": null,
+  "feature": "PinP/UnpinP shim implementation remains pending; will be completed in a later phase of this milestone.",
+  "resume_point": ""
+ },
+ {
+  "key": "f9cf00b9",
+  "date": "2026-05-21",
+  "task_id": null,
+  "feature": "Full SeqScan/Project plan node migration from opTreeSlab is deferred to a future loop; plannode.go establishes only the foundation.",
+  "resume_point": ""
+ },
+ {
+  "key": "d7666ae0",
+  "date": "2026-05-21",
+  "task_id": "M0107-0007",
+  "feature": "Splitting state.appendMu's four invariants to enable independent granular locking.",
+  "resume_point": ""
+ },
+ {
+  "key": "38ab040f",
+  "date": "2026-05-25",
+  "task_id": "M0097-regress",
+  "feature": "ALTER TABLE RENAME COLUMN for renaming table columns is not implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "5dcb1011",
+  "date": "2026-05-25",
+  "task_id": null,
+  "feature": "SELECT * star-expansion within set operation branches (UNION/INTERSECT/EXCEPT)",
+  "resume_point": "star-expansion in set-op branches"
+ },
+ {
+  "key": "4e8c0511",
+  "date": "2026-05-25",
+  "task_id": "M0097-regress",
+  "feature": "GROUP BY GROUPING SETS, ROLLUP, and CUBE syntax forms are not supported; they are parsed as sentinels but not executed.",
+  "resume_point": ""
+ },
+ {
+  "key": "d7f1cc99",
+  "date": "2026-05-26",
+  "task_id": "M0097-0029",
+  "feature": "ORDER BY clause in aggregate functions (array_agg) is not supported for UUID column types",
+  "resume_point": ""
+ },
+ {
+  "key": "d7f1cc99",
+  "date": "2026-05-26",
+  "task_id": "M0097-0029",
+  "feature": "EXPLAIN output format is not fully implemented for UUID operations",
+  "resume_point": ""
+ },
+ {
+  "key": "d7f1cc99",
+  "date": "2026-05-26",
+  "task_id": "M0097-0029",
+  "feature": "CTEs (Common Table Expressions) without explicit aliases are not recognized by the parser",
+  "resume_point": ""
+ },
+ {
+  "key": "d7f1cc99",
+  "date": "2026-05-26",
+  "task_id": "M0097-0029",
+  "feature": "uuid_extract_timestamp has a timezone parsing mismatch between POSIX (UTC+N) and ISO string format conventions",
+  "resume_point": ""
+ },
+ {
+  "key": "b5a4d394",
+  "date": "2026-05-27",
+  "task_id": "M0097-0040",
+  "feature": "Role-based access control for INSERT operations is not implemented; SET SESSION AUTHORIZATION remains a no-op so server stays in superuser mode",
+  "resume_point": ""
+ }
+]

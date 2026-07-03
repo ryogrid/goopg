@@ -10898,13 +10898,213 @@ resolution gap above (`pg_type`/`pg_operator`/`pg_am` columns) is a
 separate, larger deferral — no fixture currently exercises it either, and
 fixing it generically would mean adding `regproc`/`regprocedure` cases to
 both `dispatch.go` and `dispatch_extended.go`'s text-formatting switches
-(the latter is already missing several cases `dispatch.go` has, e.g.
-`regclass`/`date`/`bytea` — a pre-existing simple-vs-extended-protocol
-divergence, not caused by this change) backed by a full builtin-proc
-OID→name index. `pgProcNameForOID` in this change is scoped to
-`internal/initdb` (where `pgProcAllEntries()` lives); promoting it to a
-general resolver would need it (or an equivalent) reachable from
-`internal/server`/`internal/executor`.
+backed by a full builtin-proc OID→name index. `pgProcNameForOID` in this
+change is scoped to `internal/initdb` (where `pgProcAllEntries()` lives);
+promoting it to a general resolver would need it (or an equivalent)
+reachable from `internal/server`/`internal/executor`. **Correction (loop
+#48):** the "`dispatch_extended.go` is missing several cases `dispatch.go`
+has" half of this note is stale — `appendTypedCellText`
+(`internal/server/dispatch.go`) was unified into one function shared by
+both the simple-query streaming path and the extended-query materializing
+path at some point after this row was written (its own doc comment says
+so), including `regclass`/`regproc`/`regprocedure`/`date`/`bytea`/etc.; only
+the `pg_type`/`pg_operator`/`pg_am` OID→name index itself remains
+unimplemented, not a simple-vs-extended split.
+
+### Plain-`INHERITS` NOT NULL constraint locality fix (loop #48)
+
+Live discovery (not from a ledger row): `pg_dump`'s connection-setup fixture
+had no coverage for a plain (non-partition) `CREATE TABLE child (...)
+INHERITS (parent)` where the inherited column is `NOT NULL` — the single
+most basic form of PostgreSQL table inheritance, exercised by real PG's own
+`002_pg_dump.pl`. Probed live: `CREATE TABLE parent_t (id int PRIMARY KEY,
+name text); CREATE TABLE child_t (extra text) INHERITS (parent_t);` then
+`pg_dump --schema-only` against goopg emitted
+
+```
+CREATE TABLE public.child_t (
+    NOT NULL id,
+    extra text
+)
+INHERITS (public.parent_t);
+```
+
+— syntactically bogus-looking at first glance, but actually PG's own
+documented non-conforming syntax (`pg_dump.c:17213-17233`, comment: "This
+syntax isn't SQL-conforming, but if you wanted standard output you wouldn't
+be creating non-standard objects to begin with") for a column that is
+**not printed** (`shouldPrintColumn` → false, purely inherited, no local
+redeclaration) but whose NOT NULL constraint **is** locally defined
+(`notnull_islocal[j]` true). Real PostgreSQL 18.3, given the identical DDL,
+emits no such element at all — `id` isn't locally NOT NULL in this case, it
+purely inherits both the column and the constraint from `parent_t` (`psql`
+confirms `pg_constraint.conislocal='f'`, `coninhcount=1`, same constraint
+name `parent_t_id_not_null` as the parent's own row). So goopg's output was
+a real, confirmed-against-live-PG divergence, not a cosmetic one.
+
+Root cause: `execCreateTable`'s "PG18 records a contype='n' NOT NULL
+constraint for EVERY not-null column" loop (`internal/executor/
+operators_ddl.go`, ~line 3189, DU-002 slice 50) called
+`tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, true, 0)`
+**unconditionally** — every NOT NULL column got `conislocal='t'`,
+`coninhcount=0`, even a column carried in purely by `INHERITS` and marked
+`col.Inherited=true` earlier in the same function (DU-002 slice 170, for
+the sibling `pg_attribute.attislocal` purpose). That made `notnull_islocal`
+true for `child_t.id`, which is exactly the condition that triggers
+`pg_dump.c`'s "print it as a standalone item since the column itself isn't
+printed" branch.
+
+Fix: the same loop now checks `col.Inherited && s.PartitionOf == nil` (a
+`CREATE TABLE ... PARTITION OF` child also sets `col.Inherited`, but
+partitions always print every column inline regardless of locality —
+`pg_dump.c`'s `tbinfo->ispartition` OR-condition — so this only matters for
+plain `INHERITS`) and, when true, walks `inheritParents` for a parent that
+already carries a NOT NULL constraint on the same column name: if found,
+`isLocal=false`, `inhCount` = count of contributing parents, and the
+constraint's **name is taken from the parent's own constraint** (matching
+real PG, which does not mint a fresh child-local name for a purely
+inherited constraint). A column the child also declares itself in its own
+column list (even if it happens to restate `NOT NULL`) is unaffected —
+`col.Inherited` is only set when the column name is absent from the child's
+own `s.Columns` list (DU-002 slice 170's existing `localCols` check),
+matching real PG's `MergeAttributes` local/inherited split.
+
+New coverage: `TestCreateTableInheritsNotNullConstraintIsNonLocal`
+(`internal/executor/operators_ddl_named_check_test.go`) — asserts the
+parent's own constraint stays `conislocal=t/coninhcount=0`, the child's
+inherited copy is `conislocal=f/coninhcount=1` with the parent's exact
+constraint name, and a second child that locally redeclares the same
+column (`CREATE TABLE child2 (id int NOT NULL, ...) INHERITS (parent)`)
+keeps the pre-existing `conislocal=t/coninhcount=0` behavior (regression
+guard only — multi-parent column-merge semantics, i.e. `attislocal=true`
+*combined with* `attinhcount>0` for an explicitly-redeclared-and-also-
+inherited column, are a separate, unverified-against-PG gap, out of scope
+here). Live end-to-end `pg_dump` smoke against a running goopg instance
+confirmed the fix: `child_t`'s `CREATE TABLE` now omits `id` entirely
+(carried by `INHERITS (parent_t)`), byte-identical to real PostgreSQL
+18.3's own output for the same DDL.
+
+Gates: `go build ./...`/`go vet ./...` clean; new test PASS; full
+`internal/executor`+`internal/catalog` suites PASS (no regression);
+`TestPort_PgDumpConnectionSetup`+`TestPort_PgDump001Basic` PASS; live
+`pg_dump` smoke on an isolated port/data dir vs. a scratch real-PostgreSQL-
+18.3 instance (`postgres/local_install`) for both the fixed case and a
+`PARTITION OF` sanity check (confirmed unaffected — same pre-existing
+behavior before and after, not touched by this fix's `s.PartitionOf == nil`
+guard); `internal/parser`+`internal/server`+`internal/initdb` suites PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+**New discovery, deferred (ledger row appended):** while confirming the
+`PARTITION OF` case is unaffected (not regressed), live probing found a
+**separate, pre-existing** bug, unrelated to this fix: a `CREATE TABLE
+child PARTITION OF parent FOR VALUES ...` child's inherited-NOT-NULL
+columns get **zero** `pg_constraint` contype='n' rows at all (confirmed via
+`psql`: `part_child` has no NOT NULL constraint row even though
+`pg_attribute.attnotnull='t'`/`attinhcount=1`), where real PG 18.3 gives it
+one with `conislocal='f'/coninhcount=1` reusing the parent's name — this
+makes `pg_dump` on a real partition child currently omit the `CONSTRAINT
+<name> NOT NULL` inline suffix PG emits (`id integer CONSTRAINT
+parent_id_not_null NOT NULL,` vs. goopg's plain `id integer,`). This is
+NOT touched by the `s.PartitionOf == nil` guard added above (deliberately —
+scoping this fix to the plain-`INHERITS` case that was actually verified
+live) and needs its own investigation into why the NOT NULL registration
+loop doesn't run for `s.PartitionOf != nil` at all.
+
+### `PARTITION OF` NOT NULL constraint locality fix (loop #53)
+
+Resolves the follow-up gap recorded above. `execCreatePartitionChild`
+(`internal/executor/operators_ddl.go`) has its own, entirely separate NOT
+NULL registration block from `execCreateTable`'s — it only called
+`tbl.AddNotNull` for columns named in `poc.NotNullColumns` (the partition's
+own inline `PARTITION OF parent (col NOT NULL)` column-override list). A
+column that is NOT NULL purely because the **partitioned parent** enforces
+it (the overwhelmingly common case — e.g. a NOT NULL primary-key column on
+the partitioned table) got no `pg_constraint` row registered at all.
+
+Verified live against a scratch real-PostgreSQL-18.3 instance
+(`postgres/local_install`) with three DDL shapes, each cross-checked against
+a scratch goopg instance (`bin/goopg init`/`start` on an isolated port/data
+dir) both via direct `pg_constraint` queries and `pg_dump --schema-only`:
+
+1. **Pure inheritance** — `CREATE TABLE p (id int NOT NULL, v text)
+   PARTITION BY RANGE (id); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM
+   (0) TO (100);`. Real PG: `p1` gets `p_id_not_null` /
+   `conislocal='f'` / `coninhcount=1` — the PARENT's exact constraint name,
+   reused verbatim. `pg_dump` prints `id integer CONSTRAINT p_id_not_null
+   NOT NULL,` (not a bare `NOT NULL`, and not omitted) because
+   `pg_dump.c`'s `print_notnull` OR-condition always fires for
+   `tbinfo->ispartition` regardless of `conislocal` — but the *name* is only
+   printed when it doesn't match the child's own `<child>_<col>_not_null`
+   default-name pattern, which `p_id_not_null` (parent's name) never does.
+   goopg previously emitted zero constraint rows and a bare `id integer,`
+   with no NOT NULL at all — a real, confirmed divergence.
+2. **Local-only** — `CREATE TABLE p2 (id int, v text) PARTITION BY RANGE
+   (id); CREATE TABLE p2a PARTITION OF p2 (v NOT NULL) FOR VALUES FROM (0)
+   TO (100);` (parent column `v` is nullable). Real PG: `p2a_v_not_null` /
+   `t` / `coninhcount=0`. `pg_dump` prints bare `v text NOT NULL` (name
+   matches the child's own default pattern, so PG's
+   `determineNotNullFlags` suppresses printing it explicitly).
+3. **Local-and-inherited** — `CREATE TABLE p3 (id int NOT NULL, v text)
+   PARTITION BY RANGE (id); CREATE TABLE p3a PARTITION OF p3 (id NOT NULL)
+   FOR VALUES FROM (0) TO (100);` (column re-declared NOT NULL in the
+   partition's own list AND already NOT NULL in the parent). Real PG:
+   `p3a_id_not_null` / `t` / `coninhcount=1` — note this gets the CHILD's
+   own auto-generated name (not the parent's), unlike case 1, because it was
+   explicitly re-declared; but `coninhcount` still counts the enforcing
+   parent.
+
+Fix: replace the `poc.NotNullColumns`-only loop with one that walks every
+NOT NULL `tbl.Columns` entry (columns are copied from `parent.Columns` for
+a partition child, so this covers both inherited and to-be-locally-declared
+columns in one pass) and looks up a same-name entry in
+`parent.NotNullConstraints`:
+
+- Column named in `poc.NotNullColumns` (explicit local override): own
+  `<child>_<col>_not_null` name, `isLocal=true`; `inhCount = 1` if a
+  matching parent constraint exists (case 3), else `0` (case 2).
+- Column NOT in `poc.NotNullColumns` but matched in
+  `parent.NotNullConstraints` (pure inheritance, case 1): reuse the
+  *parent's* constraint name and `NoInherit` flag, `isLocal=false`,
+  `inhCount=1` (a partition child has exactly one partition parent).
+- Column matching neither: no constraint registered (nullable column).
+
+All three cases confirmed `pg_constraint`-catalog- and `pg_dump`-output-
+byte-identical to live PG 18.3. New coverage:
+`TestCreatePartitionChildNotNullConstraintLocality`
+(`internal/executor/operators_ddl_named_check_test.go`), asserting all three
+cases' `IsLocal`/`InhCount`/`Name` against the catalog.
+
+Also corrected a misleading comment on `catalog.NamedNotNullConstraint.
+InhCount` / `Table.AddNotNull` (`internal/catalog/catalog.go`) that
+generalized "`inhCount=1` for partition children" — case 2 above shows that
+is only true when the parent also enforces the constraint; reworded to
+describe `InhCount` as "how many enforcing parents", matching its actual
+per-case derivation in both the plain-`INHERITS` and `PARTITION OF` call
+sites.
+
+Gates: `go build ./...`/`go vet ./...` clean; new test + full
+`internal/executor` suite PASS; `internal/catalog`+`internal/parser`+
+`internal/server`+`internal/initdb` suites PASS (no regression, `-count=1`);
+`TestPort_PgDumpConnectionSetup` PASS; live `pg_dump`/`psql` smoke on
+isolated ports vs. both a scratch real-PostgreSQL-18.3 instance and a
+scratch goopg instance for all three cases, output diffed byte-identical.
+
+**New deferral (sibling gap, ledger row appended, NOT `pg_dump`-visible):**
+while deriving case 3's `inhCount=1` rule for `PARTITION OF`, cross-checked
+the analogous plain-`INHERITS` scenario (`CREATE TABLE child2 (id int NOT
+NULL, ...) INHERITS (parent)` where `parent.id` is already NOT NULL) against
+live PG and found the previous fix (loop #48, above) leaves
+`coninhcount=0` where real PG gives `1` — because `col.Inherited` is false
+for a column present in the child's own `s.Columns` list, so
+`execCreateTable`'s `col.Inherited && s.PartitionOf == nil` re-derivation
+branch never runs for it, and it falls through to the loop's `inhCount := 0`
+default. This has no `pg_dump` text impact (PG's plain-`INHERITS`
+`print_notnull` only gates on `conislocal`, never `coninhcount`) — a pure
+direct-`pg_constraint`-query catalog-fidelity gap. Deferred as low-urgency;
+resume point is `internal/executor/operators_ddl.go`'s `execCreateTable`
+NOT NULL loop (~line 3210), mirroring this loop's `poc.NotNullColumns` +
+`parentNC != nil` -> `inhCount = 1` case for the child's own explicit column
+list.
 
 ## Deferred (002–010) — catalog surface estimate
 
@@ -10929,3 +11129,733 @@ logs the next gap: the `tableoid` `?column?` mislabel that segfaults pg_dump in
 `go test -v -run TestEvalAclDefault ./internal/executor/` → PASS.
 `go test ./internal/config/ ./internal/parser/ ./internal/server/` → PASS.
 `go run ./cmd/gen-oracle-port-status` regenerates the status markdown.
+
+## Plain-INHERITS `coninhcount` fix for a locally-redeclared NOT NULL column (loop #54)
+
+Closes the sibling gap recorded in the "PARTITION OF NOT NULL constraint
+locality fix" section's own deferred residual above: for a plain `INHERITS`
+child (not `PARTITION OF`) that explicitly redeclares a column NOT NULL in its
+own column list AND that column is also NOT NULL on the `INHERITS` parent
+(e.g. `CREATE TABLE child2 (id int NOT NULL, ...) INHERITS (parent)` where
+`parent.id` is already NOT NULL), real PostgreSQL 18.3's `MergeAttributes`
+("merging column ... with inherited definition") records `coninhcount=1` even
+though the constraint is `conislocal=t` under the child's own auto-generated
+name — verified live: `child2_t_id_not_null`/`conislocal=t`/`coninhcount=1`.
+goopg's `execCreateTable` NOT NULL registration loop
+(`internal/executor/operators_ddl.go`) previously only re-derived
+`isLocal`/`inhCount` for columns where `col.Inherited` is true (i.e. columns
+carried in purely via `INHERITS`, absent from the child's own column list);
+a column present in the child's own `s.Columns` list has `col.Inherited ==
+false`, so it always fell through to the loop's `inhCount := 0` default
+regardless of what the parent enforced.
+
+Fix: added an `else if !col.Inherited && s.PartitionOf == nil` branch mirroring
+the `PARTITION OF` case-3 rule landed earlier this thread (loop #53,
+`p3a`/`inhCount=1` when the parent also enforces NOT NULL) — if any
+`INHERITS` parent has a matching-name `NotNullConstraints` entry, set
+`inhCount = 1`; `isLocal` and `name` are untouched (stay `true`/the child's own
+auto-generated name), since PG's `print_notnull` for a plain-`INHERITS` child
+only gates on `conislocal`, never `coninhcount` — this fix is **not**
+`pg_dump`-output-visible, only a direct `pg_constraint`-query catalog-fidelity
+correction (relevant to `pg_upgrade`/introspection tooling, not `pg_dump`).
+
+Updated `TestCreateTableInheritsNotNullConstraintIsNonLocal`'s `child2NC`
+assertion from `InhCount != 0` to `InhCount != 1`, matching the corrected,
+live-PG-verified behavior.
+
+Gates: `go build ./...` clean; `internal/executor` suite PASS;
+`internal/catalog`+`internal/parser`+`internal/server`+`internal/initdb`
+suites PASS (no regression, full run); `TestPort_PgDumpConnectionSetup` PASS
+(unaffected — this fix has no dump-text impact); `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook.
+
+### Slice 429 — **`CREATE TYPE ... AS RANGE` round-trip** (new object family)
+
+Before this slice the parser accepted the `AS RANGE (subtype = ..., ...)`
+form only as a name-only discard stub — no `pg_type`/`pg_range` row was ever
+created, so a user range type vanished from `pg_dump` output entirely (not
+even a stub `CREATE TYPE` line).
+
+Landed a full new object family, mirroring the enum/domain/composite
+precedents already in this file:
+
+- **Parser** (`internal/parser/ddl.go` `parseCreateType`, `ast.go`
+  `CreateTypeStmt`): a new `AS RANGE ( subtype = ..., multirange_type_name =
+  ..., ... )` branch. Only `subtype` and `multirange_type_name` are captured
+  into the AST (`IsRange`/`RangeSubtype`/`RangeMultirangeName`); the other PG
+  options (`subtype_opclass`, `collation`, `canonical`, `subtype_diff`) are
+  consumed token-by-token (tracking paren depth so a typmod-bearing subtype
+  like `numeric(10,2)` stays intact) so the statement still parses, but are
+  not applied — see the deferral ledger row for slice 429.
+- **Catalog** (`internal/catalog/catalog.go`): a new `RangeType` registry
+  (`rangeTypes map[string]*RangeType`) with `RegisterRangeType` /
+  `LookupRangeType` / `LookupRangeTypeByOID` / `LookupRangeTypeByMultirangeOID`
+  / `ListRangeTypes` / `DropRangeType`. `RegisterRangeType` allocates two
+  `pg_type` OIDs (range + auto-generated multirange, `deriveMultirangeTypeName`
+  mirroring PG's `makeMultirangeTypeName`: replace the first `"range"`
+  substring with `"multirange"`, else append `"_multirange"`) and resolves a
+  default btree opclass for the subtype via a curated
+  `builtinRangeSubtypeOpclasses` map (int4/int8/numeric/date/timestamp/
+  timestamptz/text — the subtypes of PG's five built-in range types, plus
+  text as a common user subtype with no built-in PG range) — a subtype
+  outside that set is rejected with PG's own `ERRCODE_UNDEFINED_OBJECT`
+  wording ("... has no default operator class for access method \"btree\"").
+- **Executor** (`internal/executor/operators_ddl.go` `execCreateType`/
+  `execDropType`, `pg18_user_catalog_rows.go`): `syncRangeTypeToCatalogHeap`
+  writes two `pg_type` heap rows (`buildUserPGTypeRowForRange`/
+  `ForMultirange` — always varlena, `typstorage='x'`, `typcollation=0`
+  since "ranges never have one", `typarray=0` since no array-of-range type
+  is allocated yet); `execDropType` stamps `xmax` on both before the
+  in-memory delete, mirroring the enum/composite branches.
+- **`pg_range`/`pg_opclass` virtual views** (`internal/catalog/catalog.go`):
+  `pg_range.VirtualRows` now surfaces one row per registered range type
+  (`rngtypid`/`rngsubtype`/`rngmultitypid`/`rngsubopc` populated;
+  `rngcanonical`/`rngsubdiff` hardcoded `"-"` — unsupported options);
+  `pg_opclass.VirtualRows` lazily surfaces the built-in default-opclass row
+  (`builtinOpclassRowByOID`) for each `OpclassOID` actually referenced by a
+  registered range type, so `pg_dump`'s `dumpRangeType` join (`pg_range r,
+  pg_type st, pg_opclass opc WHERE opc.oid = rngsubopc`) resolves. These
+  built-in rows never affect `CREATE OPERATOR CLASS`'s own dump-visibility
+  tests (`TestCreateOperatorClassPopulatesOpclassRow`): their
+  `opcnamespace=11` (`pg_catalog`) is never dumpable.
+- **`format_type`** (`internal/executor/expr.go`): resolves a range type's
+  or multirange type's dynamically-allocated OID to `public.<name>`, so
+  `dumpRangeType`'s own `format_type(rngmultitypid, NULL)` call (which
+  renders the `multirange_type_name = ...` clause) round-trips.
+
+New `TestPort_PgDumpConnectionSetup` fixture (slice 429): `CREATE TYPE
+public.myrange AS RANGE (subtype = int4)` dumps byte-identical to live
+`pg_dump` 18.3's own three-line form:
+
+```
+CREATE TYPE public.myrange AS RANGE (
+    subtype = integer,
+    multirange_type_name = public.mymultirange
+);
+```
+
+**Deferred** (deferral ledger, DU-002 slice 429 — resume points there):
+`subtype_opclass`/`collation`/`canonical`/`subtype_diff` options are parsed
+but discarded; no array-of-range/array-of-multirange auto-generated type
+(`typarray=0`); no WAL/restart persistence (`rangeTypes` is a plain
+in-process map, same gap as the `CREATE ACCESS METHOD` slice); only the 7
+curated subtypes have a resolvable default opclass rather than a generic
+`GetDefaultOpClass`-style lookup.
+
+Gates: `go build ./...` clean; `internal/catalog`+`internal/parser`+
+`internal/executor` suites PASS (`-count=1`); `TestPort_PgDumpConnectionSetup`
+PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+#### Follow-up: `CREATE`/`DROP TYPE ... AS RANGE` WAL/restart persistence (loop after slice 429)
+
+Closes sub-item (c) of the slice 429 deferral: `catalog.InMemory.rangeTypes`
+was a plain in-process map with no WAL record and no startup replay, so a
+`CREATE TYPE ... AS RANGE` (and its auto-generated multirange) vanished on
+server restart even though a `pg_dump` taken beforehand round-tripped
+correctly — the identical gap the `CREATE ACCESS METHOD` slice had before its
+own restart-persistence follow-up (see that section above).
+
+Landed the same shape as the access-method precedent:
+
+- New `RecordKindCreateRangeType`/`RecordKindDropRangeType` (kinds 81/82,
+  `internal/wal/recovery.go`) with `Encode`/`DecodeCreateRangeType` (carries
+  both OIDs — range and auto-generated multirange — plus the resolved
+  opclass OID and all three names so a restart reconstructs the exact
+  pre-crash `RangeType`) and `Encode`/`DecodeDropRangeType` (name only).
+  Physical redo is a no-op (`rangeTypes` has no page-level state), registered
+  in `ApplyRecord`'s no-op switch alongside the other DU-002
+  restart-persistence record families.
+- New `internal/initdb/range_type_ddl_recovery.go`
+  (`replayRangeTypeDDLRecords`) walks the WAL once after physical replay and
+  applies CREATE/DROP records via two new idempotent catalog mutators
+  (`RegisterRangeTypeDuringRecovery`/`DropRangeTypeDuringRecovery`,
+  `internal/catalog/catalog.go`) that overwrite-by-name and bump `nextOID`
+  past *both* recovered OIDs (the range's own and the multirange's — a range
+  type mints two OIDs per `RegisterRangeType` call, unlike the
+  single-OID access-method/event-trigger precedents). Wired into
+  `internal/initdb/open.go` right after the access-method DDL replay call
+  (range types are name-keyed, no ordering dependency on schema replay).
+- `execCreateType`'s `IsRange` branch and the `DROP TYPE` range branch
+  (`internal/executor/operators_ddl.go`) now WAL-append on success — both are
+  unconditional autocommit-style mutations (no explicit-transaction
+  deferral path for `CREATE`/`DROP TYPE`), so logging immediately at the
+  mutation point is safe, mirroring `execCreateAccessMethod`/`execDropCompat`'s
+  `"access method"` case exactly.
+
+Tests: `internal/wal/range_type_ddl_test.go` (encode/decode round trips incl.
+multi-byte UTF-8 names + max-uint32 OIDs, wrong-kind/truncated-payload
+guards); `internal/initdb/range_type_ddl_recovery_test.go` (4 tests: real
+`Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for CREATE and
+CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards).
+
+Gates: `go build ./...` clean; `go test -race ./internal/wal/... ./internal/mvcc/...`
+PASS; `internal/wal`+`internal/catalog`+`internal/executor`+`internal/initdb`
+suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+hook.
+
+Still open (deferral ledger row appended): sub-items (a) `subtype_opclass`/
+`collation`/`canonical`/`subtype_diff` options remain parsed-but-discarded;
+(b) no auto-generated array-of-range/array-of-multirange type; (d) only the
+7 curated subtypes resolve a default opclass rather than a generic
+`GetDefaultOpClass`-style lookup.
+
+#### Follow-up: auto-generated array-of-range / array-of-multirange types (loop #60)
+
+Closes sub-item (b) of the slice 429 deferral: `RegisterRangeType` allocated
+only two OIDs (the range and its multirange), leaving `typarray=0` on both
+`pg_type` rows and no `_name`/`_mymultirange` array-type row at all — the
+same gap the enum/composite/domain families each had before their own
+`ArrayOID` follow-ups (`EnumType.ArrayOID`, `CompositeType.ArrayOID`,
+`Domain.ArrayOID`). A `myrange[]` (or `mymultirange[]`) column, or a `\dT`
+listing that inspects `typarray`, could not resolve or render correctly.
+
+Landed the identical shape as those three precedents:
+
+- `catalog.RangeType` gains `ArrayOID`/`MultirangeArrayOID` fields.
+  `RegisterRangeType` (`internal/catalog/catalog.go`) now allocates all four
+  OIDs from one contiguous `nextOID` block — range, range-array, multirange,
+  multirange-array, in that order (matching PG's own real allocation order
+  noted in the original slice-429 comment) — so `nextOID` advances by 4 per
+  `CREATE TYPE ... AS RANGE` instead of 2.
+- New `buildUserPGTypeRowForRangeArray`/`ForMultirangeArray`
+  (`internal/executor/pg18_user_catalog_rows.go`) mirror
+  `buildUserPGTypeRowForEnumArray`/`ForCompositeArray` exactly:
+  `typtype='b'`/`typcategory='A'`/`typelem=<base OID>`/`typarray=0`, name
+  `_<name>`. Alignment is **not** hardcoded (enum arrays hardcode `'i'`,
+  composite arrays hardcode `'d'`) because a range's own alignment is
+  subtype-dependent (`DefineRange`'s double-if-double-aligned-subtype rule,
+  already computed by `buildUserPGTypeRowForRange`/`ForMultirange`) — the
+  array row recomputes the same subtype-driven alignment so it always
+  matches its element's.
+- `buildUserPGTypeRowForRange`/`ForMultirange`'s own `typarray` field now
+  points at the new array OID instead of the `0` placeholder.
+- `syncRangeTypeToCatalogHeap` (`internal/executor/operators_ddl.go`) writes
+  all four `pg_type` heap rows; the `DROP TYPE` range branch stamps `xmax`
+  on all four (previously only the range + multirange rows).
+- New `Catalog.LookupRangeTypeByArrayOID`/`LookupRangeTypeByMultirangeArrayOID`
+  (interface + `*InMemory` impl, mirroring `LookupCompositeTypeByArrayOID`)
+  back two new `format_type` branches (`internal/executor/expr.go`) so a
+  `myrange[]`/`mymultirange[]` column renders as `public.myrange[]` /
+  `public.mymultirange[]` rather than falling through to the built-in `???`
+  sentinel or a mis-resolved base-type array.
+- WAL/restart persistence extended to match: `EncodeCreateRangeType`/
+  `DecodeCreateRangeType` (`internal/wal/recovery.go`) gained `arrayOID`/
+  `multirangeArrayOID` `uint32` parameters (inserted after `opclassOid`,
+  before the length-prefixed name strings — RecordKindCreateRangeType's
+  format comment updated); `RegisterRangeTypeDuringRecovery`
+  (`internal/catalog/catalog.go`) now advances `nextOID` past all four
+  recovered OIDs, not two.
+
+Deliberately **not** in scope for this follow-up (a new, larger gap found
+while landing it — see the fresh deferral-ledger row): `buildUserPGAttributeRow`
+(`internal/executor/pg18_user_catalog_rows.go`, the sole `pg_attribute`-row
+builder for table columns) has **no case at all** for a table column whose
+declared type is a user-defined range or multirange — scalar or array. Such
+a column's `atttypid` still resolves through the generic `text` fallback (or
+is simply unreachable, since goopg has no range *value* codec/storage path
+yet — not even for the built-in `int4range` family). This is a materially
+larger, separate task (wiring range/multirange resolution into
+`buildUserPGAttributeRow` alongside the enum/domain/composite branches, AND
+a range value wire-format/storage codec that doesn't exist yet for any range
+type, built-in or user-defined) and was never exercised by the slice 429
+fixture (which only ever ran `CREATE TYPE ... AS RANGE` standalone, never a
+table column of that type).
+
+Tests: `internal/executor/pg18_user_catalog_rows_test.go`
+`TestUserPGTypeRowForRangeAndMultirangeArrayTypes` (OID allocation +
+distinctness, re-registration OID stability, both array rows' shape, both
+new `LookupRangeTypeBy*ArrayOID` lookups); `internal/wal/range_type_ddl_test.go`
+and `internal/initdb/range_type_ddl_recovery_test.go` updated for the new
+encode/decode arity and struct fields.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test -race ./internal/wal/...`
+PASS; `internal/catalog`+`internal/wal`+`internal/initdb`+`internal/executor`
+suites PASS (full runs, no regression); `TestPort_PgDumpConnectionSetup` PASS
+(dump output byte-identical — unchanged, since the auto-generated array rows
+are `isarray`-excluded from `pg_dump`'s own `getTypes` the same way the
+enum/composite array rows already were); `scripts/tpch-spotcheck.sh` PASS;
+pgbench smoke = pre-commit hook.
+
+Still open (deferral ledger row appended): sub-items (a) `subtype_opclass`/
+`collation`/`canonical`/`subtype_diff` options remain parsed-but-discarded;
+(d) only the 7 curated subtypes resolve a default opclass; and the newly
+discovered (e) range/multirange-typed table columns have no `pg_attribute`
+resolution and no value storage codec at all (built-in or user-defined).
+
+#### Follow-up: range/multirange-typed table column `pg_attribute` resolution (loop #61)
+
+Closes the **catalog-fidelity half** of discovery (e) above (recorded as a
+fresh ledger row while landing the array-OID follow-up): `CREATE TABLE t (r
+myrange)` did not fail — nothing validates a column's declared type name
+against any registry at `CREATE TABLE` time (confirmed by reading
+`execCreateTable`'s two column-building paths, `internal/executor/
+operators_ddl.go`; the only rewrite is `catalog.InMemory.ResolveColumnType`,
+which resolves domain names to their base type and explicitly leaves
+everything else — including a range name — untouched). The column was
+created fine with `Column.Type.Name = "myrange"`, but `buildUserPGAttributeRow`
+(`internal/executor/pg18_user_catalog_rows.go`) had enum/domain/composite
+branches and **no range/multirange branch at all**, so the column's
+`atttypid` silently fell through to the generic `text` fallback (the
+guaranteed non-built-in sentinel `TypeNameToOID` returns for any unknown
+name).
+
+Landed, mirroring the existing enum/composite branches exactly:
+
+- New `Catalog.LookupRangeType(name)` and `LookupRangeTypeByMultirangeName(name)`
+  interface methods (`internal/catalog/catalog.go`) — `LookupRangeType` already
+  existed as an `*InMemory` method but was never exposed on the interface (the
+  catalog-row builders take `cat catalog.Catalog`, not the concrete type).
+  `LookupRangeTypeByMultirangeName` is new: unlike PG's `pg_type`, `rangeTypes`
+  is keyed by the range name only, but a column can be declared directly with
+  the *multirange*'s own name (`CREATE TABLE t (m mymultirange)`), so a second
+  lookup path is needed — a linear scan over the same small map, matching the
+  existing `LookupRangeTypeByOID`/`ByMultirangeOID`/`ByArrayOID`/
+  `ByMultirangeArrayOID` scan pattern (none of those are indexed either).
+- `buildUserPGAttributeRow` gains a range/multirange resolution block, guarded
+  on `typOID == catalog.OIDText && enumOID == 0 && enumArrayOID == 0 &&
+  compositeOID == 0 && compositeArrayOID == 0` (mutually exclusive with the
+  other user-type branches, same shape as the composite guard): tries
+  `LookupRangeType(col.Type.Name)` first, then
+  `LookupRangeTypeByMultirangeName(col.Type.Name)`; sets `typOID`/`rangeOID` to
+  `rt.OID`/`rt.MultirangeOID` (scalar) or tracks `rangeArrayOID` as
+  `rt.ArrayOID`/`rt.MultirangeArrayOID` (array, remapped in the existing
+  attndims switch alongside `enumArrayOID`/`domainArrayOID`/`compositeArrayOID`).
+  Physical attrs (`attlen=-1, attbyval=false, attstorage='x'`) and alignment
+  mirror `buildUserPGTypeRowForRange`/`ForMultirange`'s own subtype-driven rule
+  (double-aligned iff the subtype is double-aligned, int-aligned otherwise) —
+  a new `rangeOID != 0, rangeArrayOID != 0` case in the attrs switch computes
+  it via `userTypeAttrsForOID(catalog.TypeNameToOID(rangeSubtypeName))`, same
+  as the standalone `pg_type`-row builders do.
+- The identical block was added to `buildUserPGAttributeRowForCompositeField`
+  (`internal/executor/pg18_user_catalog_rows.go`) — a composite type field
+  declared as a range/multirange (e.g. `CREATE TYPE ct AS (r myrange)`) has
+  the exact same missing-branch gap one level down, keyed on `base` (the
+  already-parsed bare type name) instead of `col.Type.Name`.
+- No parser changes, no `CREATE TABLE` type-validation changes (there was none
+  to extend — a range name keeps sailing through unresolved exactly like an
+  enum/composite name already does), and no `expr.go`/`format_type` changes:
+  `format_type`'s range/multirange branches (added for the standalone-type
+  slice 429 fixture) already resolve any OID reaching it via
+  `LookupRangeTypeByOID`/`ByMultirangeOID`/`ByArrayOID`/
+  `ByMultirangeArrayOID` — confirming the bug was isolated to the
+  `atttypid`-resolution step, not the name-rendering step. Live end-to-end
+  verification (`goopg init`/`start` on a throwaway data dir + real `psql`):
+  `CREATE TABLE rangecol_t (id int primary key, r myrange, rarr myrange[], mr
+  mymultirange)` now reports `atttypid` 16422/16423/16424 for
+  `r`/`rarr`/`mr` respectively (the range/range-array/multirange OIDs
+  allocated by the preceding `CREATE TYPE`), and `\d rangecol_t` renders `r
+  public.myrange`, `rarr public.myrange[]`, `mr public.mymultirange` — where
+  before this fix all three fell back to `text`/`text[]`.
+
+Tests: new `TestUserPGAttributeRangeColumn` (table-column scalar/array,
+range-name and multirange-name forms, int4 vs. double-aligned `timestamp`
+subtype, nil-catalog text fallback) and
+`TestUserPGAttributeCompositeFieldRange` (the composite-field analogue) in
+`internal/executor/pg18_user_catalog_rows_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/executor`+
+`internal/catalog` suites PASS (full runs, no regression); `TestPort_
+PgDumpConnectionSetup` PASS (unaffected — this fix touches `pg_attribute`
+resolution only, no dump-text change for the pre-existing slice 429 fixture);
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook; live
+`goopg`/`psql` end-to-end smoke as described above.
+
+**New discovery recorded, not fixed this loop:** verifying the above live
+also surfaced that `OID::regtype` (`internal/executor/expr.go`'s `CastExpr`
+`regtype` branch, `KindInt` case, ~line 651-659) resolves an OID back to a
+type **name** only via `oidToBuiltinTypeName` — it has no fallback to any
+user-type registry (enum/composite/domain/range all reach the same
+generic-fallback code path, so this is not range-specific). A range column's
+`atttypid::regtype` therefore prints the bare numeric OID
+(`SELECT atttypid::regtype FROM pg_attribute ...` → `16422`) where real
+PostgreSQL's `regtypeout` renders the schema-qualified name (`public.myrange`)
+exactly like `format_type` does — a pg_dump-irrelevant but
+introspection-visible divergence for **every** user-defined type kind, not
+just ranges. Still open, unrelated to this loop's `pg_attribute` fix (a fresh
+deferral-ledger row is appended for it).
+
+Still open, carried forward unchanged: sub-items (a) `subtype_opclass`/
+`collation`/`canonical`/`subtype_diff` options remain parsed-but-discarded;
+(d) only the 7 curated subtypes resolve a default opclass; and range/
+multirange **value storage** (parse/wire-format/comparison — the other half
+of discovery (e)) is untouched — a range-typed column can now be introspected
+correctly via `pg_attribute`/`\d`/`pg_dump`, but `INSERT`/`SELECT` of an
+actual range value is still unimplemented for any range type, built-in or
+user-defined.
+
+## Follow-up: `::regtype` / `format_type` OID→name resolution unified (loop #62)
+
+Closes the discovery recorded immediately above: `OID::regtype`'s `KindInt`
+branch (`internal/executor/expr.go`'s `CastExpr` handling, `regtype` case)
+resolved a dynamically-allocated user-type OID only via
+`oidToBuiltinTypeName`, so a range/enum/domain/composite column's
+`atttypid::regtype` printed the bare numeric OID while `format_type` (which
+already had its own five-branch `LookupEnumByOID`/`LookupEnumByArrayOID`/
+`LookupDomainByOID`/`LookupDomainByArrayOID`/`LookupCompositeTypeByOID`/
+`LookupCompositeTypeByArrayOID`/`LookupRangeTypeByOID`/`ByMultirangeOID`/
+`ByArrayOID`/`ByMultirangeArrayOID` else-if chain inlined in its own `case
+"format_type":` arm) rendered the correct schema-qualified name for the exact
+same OID in the exact same session — confirmed live via real `psql`
+(`SELECT atttypid::regtype FROM pg_attribute WHERE attrelid =
+'rangecol_t'::regclass` printed `16422`/`16423`/`16424` where `\d
+rangecol_t`, which uses `format_type`, printed `myrange`/`myrange[]`/
+`mymultirange` in the same session).
+
+Fix extracts that resolution chain into two shared helpers in
+`internal/executor/expr.go` (placed immediately before `formatTypeOID`):
+
+- `userTypeNameForOID(cat catalog.Catalog, oid uint32) (string, bool)` — the
+  OID→name direction, the exact ten-branch chain `format_type`'s fallback used
+  to inline (enum/enum-array/domain/domain-array/composite/composite-array/
+  range/multirange/range-array/multirange-array).
+- `userTypeOIDForName(cat catalog.Catalog, name string) (uint32, bool)` — the
+  reverse name→OID direction, generalizing what was previously an enum-only
+  `if im, ok := ctx.Catalog.(*catalog.InMemory); ok { im.LookupEnum(...) }`
+  branch inside `::regtype`'s `KindString` case to all four user-type kinds
+  (enum/domain/composite/range, plus range's multirange-name form), for
+  symmetry with `userTypeNameForOID` — this was flagged as a "check for
+  symmetry" note in the same discovery row, not an independently-observed live
+  bug (array-form name lookups, e.g. `'myrange[]'::regtype`, are NOT handled,
+  matching the pre-existing enum-only code's own scope).
+
+Both call sites now share one implementation:
+- `format_type`'s `"???"` (unknown-to-`formatTypeOID`) fallback calls
+  `userTypeNameForOID` instead of its own inlined else-if chain.
+- `::regtype`'s `KindInt` case (OID input) and the numeric-OID sub-case of its
+  `KindString` case (`"16422"`-style string input, e.g. from an oidvector
+  element) both call `userTypeNameForOID` after `oidToBuiltinTypeName` misses.
+- `::regtype`'s `KindString` case's name-input sub-case (`'myrange'::regtype`)
+  calls `userTypeOIDForName` instead of the old enum-only branch.
+
+Deliberately unchanged: the *display* of a `KindInt`-tagged regtype value
+produced by the name→OID direction (`'mood'::regtype` renders the raw OID
+number, not the enum name) — this is pre-existing behavior for enums
+(`NewIntDatum` was already what the old enum-only branch returned) unrelated
+to this fix; the wire/output layer picks a `Datum`'s text form from its
+`Kind`, not its declared SQL type, so a `KindInt` datum always prints as a
+plain integer regardless of the `regtype` tag. Fixing that would require datum
+type-tagging at the output layer and is out of scope here — this loop only
+closes the `KindInt`→name direction that was the actual live-verified bug.
+
+Tests: `TestUserTypeNameForOIDAllKinds` / `TestUserTypeOIDForNameAllKinds`
+(`internal/executor/user_type_oid_name_test.go`) pin both helpers directly
+across all ten OID forms / five name forms plus an unknown-OID/unknown-name
+negative case, without needing to drive the full `CastExpr` evaluator.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/executor`+
+`internal/catalog` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS (unaffected); `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook; live `goopg`/`psql` end-to-end smoke
+(fresh throwaway data dir, port 5533): `atttypid::regtype` for
+`myrange`/`myrange[]`/`mymultirange`/`mood`/`zipcode` columns now renders
+`public.myrange`/`public.myrange[]`/`public.mymultirange`/`public.mood`/
+`public.zipcode` (previously the bare numeric OIDs); built-in-type paths
+(`'int4'::regtype`, `25::regtype`, `0::regtype` → `-`, unknown OID →
+raw number) unaffected.
+
+Not fixed, no new deferral needed: this closes the discovery row cleanly with
+no further gap surfaced by implementing it — the datum-tagging display
+subtlety noted above is a pre-existing, orthogonal (and much larger) gap
+about the output layer's type-awareness in general, not something this fix's
+own scope touched or worsened.
+
+## Follow-up: `builtinRangeSubtypeOpclasses` widened from 7 to 31 subtypes (loop #63)
+
+Closes sub-item (d) of the slice 429 deferral (see "Still open" note just
+above the loop #60 follow-up section): `RegisterRangeType`'s default-btree-opclass lookup
+(`internal/catalog/catalog.go`'s `builtinRangeSubtypeOpclasses` map /
+`DefaultBtreeOpclassForSubtype`) only covered the subtypes of PostgreSQL's
+five built-in range types (int4/int8/numeric/date/timestamp/timestamptz) plus
+text — any other subtype, however ordinary (`bool`, `float8`, `uuid`,
+`varchar`, ...), was rejected with a synthesized 42704 even though real PG's
+`GetDefaultOpClass` resolves a default btree opclass generically for any
+btree-comparable scalar type.
+
+A fully generic port of `GetDefaultOpClass` (a live `pg_opclass`/
+`pg_opfamily`/binary-coercibility search) was judged out of scope for one
+loop — goopg has no runtime `pg_opclass` registry for built-in types at all
+(the existing map *is* goopg's only representation of "which built-ins have a
+default btree opclass"). Instead this loop widened the same curated-map
+approach the slice-429 landing already used, from 7 entries to 31, covering
+every PG18 built-in scalar type with a real default btree opclass:
+int2/int4/int8/numeric/float4/float8/date/time/timetz/timestamp/timestamptz/
+interval/text/varchar/bpchar/name/char/bool/bytea/oid/tid/oidvector/uuid/
+pg_lsn/xid8/money/bit/varbit/macaddr/macaddr8/inet/cidr.
+
+Values (opclass OID, opfamily OID) were **not** derivable from
+`postgres/src/include/catalog/pg_opclass.dat` alone for most of these —
+unlike the original 7 (which have `oid =>`-pinned symbols in the .dat file),
+most built-in opclass OIDs are genbki-assigned at build time and only exist
+in the compiled catalog. Captured them empirically instead: booted a
+throwaway `postgres/local_install` PG 18.3 instance
+(`initdb`/`pg_ctl start -p 5599`), queried
+`select oid, opcname, opcintype::regtype, opcfamily from pg_opclass o join
+pg_am a on a.oid=o.opcmethod where a.amname='btree' and o.opcdefault` for the
+baseline set, then cross-checked every entry — including the two
+non-obvious fallback cases — via `CREATE TYPE ... AS RANGE (subtype = ...)`
++ `SELECT rngsubopc::regclass FROM pg_range`:
+
+- `varchar` has its own `varchar_ops` opclass (oid 10044) but it is **not**
+  the default (`opcdefault = false`); PG's opclass search falls back to the
+  binary-coercible `text_ops` (oid 3126). Confirmed: `CREATE TYPE ... AS
+  RANGE (subtype = varchar)` resolves `rngsubopc` to `text_ops`, not
+  `varchar_ops`.
+- `cidr` has no opclass of its own at all; it binary-coerces to `inet_ops`
+  (oid 10015) the same way.
+- `bpchar` and `name`, by contrast, each have their own genuine default
+  opclass (`bpchar_ops` oid 10004, `name_ops` oid 10028) distinct from
+  `text_ops` despite sharing its `opcfamily` (`name_ops`) or textwise
+  behavior — verified they do NOT fall back the way `varchar`/`cidr` do.
+
+The map's `IntypeOID` field (used by `builtinOpclassRowByOID` when rendering
+a `pg_opclass` row for `pg_dump`'s `dumpRangeType` join) reflects the
+resolved opclass's *own* `opcintype`, not the subtype key — so the `varchar`
+and `cidr` entries carry `IntypeOID: OIDText`/`OIDInet` respectively, matching
+what a live `pg_dump` actually emits.
+
+No parser, WAL, or restart-persistence changes needed — this widens a pure
+lookup table consulted only by `RegisterRangeType` at `CREATE TYPE ... AS
+RANGE` time; the WAL/restart-persistence path landed at loop #61 already
+replays through the same `RegisterRangeType` call and picks up the wider
+coverage for free.
+
+Tests: `TestDefaultBtreeOpclassForSubtypeExpandedCoverage` (pins all 31
+{subtype, opclass OID} pairs), `TestRegisterRangeTypeExpandedSubtypes` (end-to-
+end `RegisterRangeType` success + `pg_opclass` row resolution for a sample of
+the newly-covered subtypes), `TestRegisterRangeTypeStillRejectsUnsupportedSubtype`
+(pins the negative case is unchanged: `json` has no real PG btree opclass, so
+`CREATE TYPE ... AS RANGE (subtype = json)` must still fail with PG's exact
+error text) — all in `internal/catalog/range_type_opclass_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog`+
+`internal/executor` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS (unaffected); `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook; live `goopg`/`psql` end-to-end smoke
+(fresh throwaway data dir, port 5533): `CREATE TYPE ... AS RANGE (subtype =
+bool|float8|uuid|varchar)` all now succeed and `pg_dump --schema-only`
+round-trips each byte-identical to what real `pg_dump` 18.3 would emit
+(`subtype = boolean|double precision|uuid|character varying`); `CREATE TYPE
+... AS RANGE (subtype = json)` still correctly fails with `data type json has
+no default operator class for access method "btree"`.
+
+Deferred (ledger row appended): item (a) of the same loop #57 discovery —
+`subtype_opclass`/`collation`/`canonical`/`subtype_diff` `CREATE TYPE ... AS
+RANGE` options are still parsed-and-discarded, not threaded through to
+`RangeType`/`pg_range`'s row — is untouched by this loop (a separate,
+independently-sized parser+catalog change, not a lookup-table widening). A
+fully generic `GetDefaultOpClass`-equivalent (covering user-defined subtypes
+with a user-created `CREATE OPERATOR CLASS ... DEFAULT` opclass, not just
+these 31 built-ins) also remains unimplemented — `RegisterRangeType` only
+ever consults `builtinRangeSubtypeOpclasses`, never `ListUserOperatorClasses`.
+
+## Follow-up: `subtype_opclass`/`collation` `CREATE TYPE ... AS RANGE` options threaded through (loop #64)
+
+Closes sub-item (a) of the slice 429 deferral for two of its four options —
+`subtype_opclass` and `collation`. The other two (`canonical`/`subtype_diff`)
+remain parsed-and-discarded: PG's own `DefineRange` requires a pre-created
+shell type before a `canonical` function can even be looked up
+(`postgres/src/backend/commands/typecmds.c:1531-1537`, "cannot specify a
+canonical function without a pre-created shell type"), and goopg's `CREATE
+TYPE name;` (no `AS` clause) registers a composite-type stub rather than a
+real PG shell type (`typtype='p'`) — that gap plus function-signature
+validation is a separate, larger feature, out of scope for this loop.
+
+**Parser** (`internal/parser/ddl.go`'s `parseCreateType` RANGE branch, `ast.go`'s
+`CreateTypeStmt`): the per-option loop already special-cased
+`multirange_type_name` via `p.parseObjectName()` (dropping schema
+qualification, same rationale as goopg's other user-type registries) while
+`subtype_opclass`/`collation` fell into the generic discard-the-value-tokens
+branch. Converted that `if/else` into a `switch key` with two new cases using
+the same `p.parseObjectName()` pattern, storing the bare name into new
+`CreateTypeStmt.RangeOpclassName`/`RangeCollationName` fields.
+`canonical`/`subtype_diff` still fall through to the `default` branch
+unchanged.
+
+**Catalog** (`internal/catalog/catalog.go`): mirrors PG's `DefineRange`
+resolution (`postgres/src/backend/commands/typecmds.c`, read directly this
+loop) as two new helpers:
+
+- `resolveRangeOpclass(subtypeName, subtypeOID, opclassName)` — implements
+  `findRangeSubOpclass`: empty name → existing `DefaultBtreeOpclassForSubtype`
+  path (unchanged, `42704` if no default exists); a name is looked up first
+  against `builtinOpclassOIDByName` (a new by-name index over the existing
+  `builtinRangeSubtypeOpclasses` map from loop #63) and, if not found there,
+  against `ListUserOperatorClasses()` filtered to `Method == btree`. Either
+  way the resolved opclass's `InTypeOID` must equal the subtype's OID or the
+  call fails with PG's exact `42804` wording ("operator class %q does not
+  accept data type %s") — goopg has no `IsBinaryCoercible` general facility,
+  so (unlike the loop #63 default-resolution map, which already bakes in the
+  two known binary-coercible fallbacks for `varchar`/`cidr`) an explicit
+  `subtype_opclass` naming a differently-typed opclass is rejected even where
+  real PG's binary-coercibility check might accept it — a narrower, documented
+  simplification, not a behavior this loop claims to fully replicate. An
+  unresolvable name fails with PG's `42704` wording ("operator class %q does
+  not exist for access method %q").
+- `resolveRangeCollation(subtypeOID, collationName)` — implements the
+  `type_is_collatable`/`get_collation_oid` half of `DefineRange`:
+  `rangeSubtypeIsCollatable` (new) restates the exact `OIDText`/`OIDVarChar`/
+  `OIDBpChar` set the `pg_range` `VirtualRows` builder already special-cased
+  for the implicit-default case (loop #61's slice 429 landing) — a
+  non-collatable subtype rejects any explicit `collation` name with PG's
+  literal message ("range collation specified but subtype does not support
+  collation", `42809`) and otherwise always resolves to `0` (`InvalidOid`).
+  A collatable subtype resolves an explicit name via a new
+  `builtinCollationOIDByName` (the same 7 BKI-pinned collations already
+  seeded in the `pg_collation` `VirtualRows` builder, duplicated here for the
+  same executor/catalog import-cycle reason `builtinOpclassInfo` documents)
+  falling back to the existing `UserCollationOIDByName`; an empty name
+  resolves to `100` (`DEFAULT_COLLATION_OID`, unchanged from before this
+  loop); an unresolvable name fails with PG's `42704` wording ("collation %q
+  for encoding %q does not exist" — goopg has no per-collation encoding
+  model, so `"UTF8"` is hardcoded as the filler, a minor wording
+  approximation).
+
+Both resolvers return a new `*catalog.RangeTypeOptionError{Code, Message}`
+(not a bare `error`) so `execCreateType`
+(`internal/executor/operators_ddl.go`) can report PG's actual SQLSTATE via a
+type-assertion instead of collapsing every `RegisterRangeType` failure onto
+the pre-existing hardcoded `42704`. `RangeType` gains a `CollationOID` field
+(`pg_range.rngcollation`); the `pg_range` `VirtualRows` builder now reads
+`rt.CollationOID` directly instead of re-deriving it from a duplicate
+subtype-OID switch (the two would have silently diverged the moment an
+explicit `collation` override existed — the "sibling paths must agree" risk
+this project's hard-won rules call out).
+
+**WAL/restart persistence**: extended in the same loop (not left as a fresh
+gap) since the opclass/collation resolution happens once, at `CREATE TYPE`
+time — `EncodeCreateRangeType`/`DecodeCreateRangeType`
+(`internal/wal/recovery.go`) gained a `collationOID` parameter (the resolved
+value, not the raw option string) and `internal/initdb/
+range_type_ddl_recovery.go`'s replay now carries it into the recovered
+`catalog.RangeType`. Verified live: a `textrange2` range type created with an
+explicit user-collation option kept its `rngcollation` OID identical across a
+full server restart.
+
+**Live-verified end-to-end** (fresh throwaway data dir, port 5533, real
+`psql`/`pg_dump` 18.3): `subtype_opclass = int4_ops` resolves to OID 1978
+(unchanged from the default); `subtype_opclass = text_ops` on an `int4`
+subtype fails with the exact `42804` wording; an unknown opclass name fails
+with the exact `42704` wording; `collation = "C"` on a `text` subtype
+resolves `rngcollation` to 950; `collation = "C"` on an `int4` subtype fails
+with the exact `42809` wording; an unknown collation name fails with the
+`42704` wording; a `CREATE OPERATOR CLASS`-registered user opclass resolves
+correctly (`rngsubopc` = the new opclass's own OID) and round-trips through
+`pg_dump`; a `CREATE COLLATION`-registered user collation resolves and
+round-trips through `pg_dump` as `collation = public.my_coll` (a *built-in*
+collation like `"C"` correctly does **not** appear in the dump, matching real
+PG's `findCollationByOid` — pg_dump's internal `CollInfo` list is only
+populated from user-dumpable collations, so a BKI-pinned one is silently
+omitted from the re-emitted `CREATE TYPE` statement, by design).
+
+**New discovery recorded, not fixed this loop (deferral-ledger row
+appended):** `CREATE OPERATOR CLASS` has **no WAL record kind and no restart
+persistence at all** (confirmed by grep — no `RecordKindCreateOperatorClass`
+exists anywhere in `internal/wal/recovery.go`, unlike every other DDL family
+this project has hardened restart-persistence for: access methods, range
+types, composite/enum/domain types, etc.). This was surfaced by, but is
+**not caused by**, this loop's `subtype_opclass` work: after a full server
+restart, a range type created with an explicit user opclass
+(`subtype_opclass = my_int4_ops`) still resolved and displayed correctly from
+the in-memory `RangeType.OpclassOID` (a plain numeric field, restart-durable
+via the `CREATE TYPE ... AS RANGE` WAL record from the loop #61 follow-up),
+but `pg_opclass` itself no longer had a row for `my_int4_ops` (it vanished
+along with every other user-created operator class), so `pg_dump`'s
+`dumpRangeType` join (`pg_range r, pg_type st, pg_opclass opc WHERE opc.oid =
+rngsubopc`) returned zero rows for that specific type and **`pg_dump` failed
+outright** (`query returned 0 rows instead of one`) rather than silently
+mis-rendering just that one type. Tracks as a separate, dedicated-loop-sized
+task (mirrors the shape of the loop #59/#61 "CREATE ACCESS METHOD"/"CREATE
+TYPE ... AS RANGE" WAL/restart-persistence follow-ups) — resume point:
+`internal/wal/recovery.go` needs a new `RecordKindCreateOperatorClass`/
+`RecordKindDropOperatorClass` pair (encode `schema, name, namespaceOID,
+owner, method, familyOID, inTypeOID, isDefault, keyTypeOID`), a WAL-append
+call at `execCreateOperatorClass`'s success path
+(`internal/executor/operators_ddl.go` ~line 15758, right after
+`RegisterUserOperatorClass`), and a new `internal/initdb/
+operator_class_ddl_recovery.go` replay pass wired into `internal/initdb/
+open.go` alongside the existing access-method/range-type replay calls.
+
+Tests: `TestRegisterRangeTypeExplicitOpclass` (named builtin opclass match,
+builtin opclass datatype mismatch, unknown opclass name, user-created
+opclass) + `TestRegisterRangeTypeExplicitCollation` (builtin collation name,
+default-with-no-explicit-option, non-collatable-subtype default, collation
+rejected for non-collatable subtype, unknown collation name, user-created
+collation) in `internal/catalog/range_type_opclass_test.go`;
+`TestParseCreateRangeTypeSubtypeOpclassAndCollation` +
+`TestParseCreateRangeTypeCanonicalSubtypeDiffStillParseAndDiscard` in the new
+`internal/parser/range_type_option_test.go`; `TestEncodeDecodeCreateRangeTypeRoundTrip`
+(extended with a `collationOID` case) + the truncated-payload guard (header
+grew from 21 to 25 bytes) in `internal/wal/range_type_ddl_test.go`;
+`TestRangeTypeDDLRecoveryReplaysCreate` (extended to assert `CollationOID`
+survives restart) in `internal/initdb/range_type_ddl_recovery_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog`+
+`internal/parser`+`internal/wal`+`internal/initdb`+`internal/executor` suites
+PASS (full runs, no regression); `TestPort_PgDumpConnectionSetup` PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook; live
+`goopg`/`psql`/`pg_dump` end-to-end smoke as described above, including a
+full server restart. Deferred (ledger row appended): `canonical`/
+`subtype_diff` options remain parsed-and-discarded (needs real shell-type
+support + function-signature validation); `CREATE OPERATOR CLASS` restart
+persistence (new discovery, tracked above) is a separate task.
+
+## Follow-up: generic default-opclass resolution over user-created opclasses (loop #76)
+
+Closes sub-item (b) of the slice 429 deferral, carried unchanged since loop
+#63/#64: `CREATE TYPE ... AS RANGE (subtype = ...)` with **no** explicit
+`subtype_opclass` option only ever consulted the curated
+`builtinRangeSubtypeOpclasses` map (`DefaultBtreeOpclassForSubtype`) — a
+subtype with no curated builtin entry (e.g. `json`, which real PostgreSQL
+itself has no default btree opclass for either) but with a **user-created**
+`CREATE OPERATOR CLASS ... DEFAULT` btree opclass registered for it still
+failed with the synthesized `42704` "has no default operator class" error,
+even though real PostgreSQL's `GetDefaultOpClass`
+(`postgres/src/backend/catalog/pg_opclass.c`) does a single `pg_opclass` scan
+that finds either a builtin or a user-created default row identically (PG has
+no such builtin/user distinction — everything lives in the one table). This
+was already asymmetric with the *explicit*-name path (`resolveRangeOpclass`'s
+non-empty branch), which loop #64 already wired to fall back to
+`ListUserOperatorClasses()` when a named opclass isn't a curated builtin.
+
+### Change
+
+New `(*InMemory) defaultUserBtreeOpclassForSubtype(subtypeOID) (uint32, bool)`
+(`internal/catalog/catalog.go`, next to `DefaultBtreeOpclassForSubtype`)
+scans `ListUserOperatorClasses()` for a `Method == btree`, `InTypeOID ==
+subtypeOID`, `IsDefault == true` row — mirroring `GetDefaultOpClass`'s own
+`opcmethod = btree AND opcintype = subtypeOID AND opcdefault` scan, narrowed
+to the user-registry half of goopg's split builtin/user opclass storage.
+`resolveRangeOpclass`'s empty-`opclassName` branch now tries the curated
+builtin map first (unchanged — it never varies at runtime, so checking it
+first is a pure optimization, not a behavior choice) and falls back to this
+new method before raising the `42704` error, closing the asymmetry with the
+explicit-name path.
+
+### Tests
+
+`TestRegisterRangeTypeUserDefaultOpclass` (`internal/catalog/range_type_opclass_test.go`):
+a `json`-subtype range with a `CREATE OPERATOR CLASS ... DEFAULT` btree
+opclass registered resolves it via the empty-option path; a **non**-default
+user opclass for the same subtype is correctly NOT picked up implicitly
+(still `42704`); a user-registered `int4` default opclass does not shadow
+the curated `int4_ops` builtin default (curated map wins, matching the "check
+builtin first" ordering choice above — real PG's single-scan behavior is
+technically nondeterministic between two `opcdefault` rows for the same
+type/method, which PostgreSQL itself documents as user error, so goopg's
+deterministic "builtin wins" tie-break is a reasonable, simpler substitute
+rather than a claimed fidelity gap).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/catalog` suite PASS (new
+tests + no regression); full `internal/catalog`+`internal/executor`+
+`internal/parser`+`internal/wal`+`internal/initdb` suites PASS (no
+regression); `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook.
+
+### Still deferred
+
+Range-type `canonical`/`subtype_diff` sub-item (a) remainder (unchanged from
+loop #63/#64 — needs real shell-type support + function-signature
+validation, a materially larger, separately-scoped feature). No other
+residual from this loop's own scope.

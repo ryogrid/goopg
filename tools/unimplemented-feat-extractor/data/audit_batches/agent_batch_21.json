@@ -1,0 +1,86 @@
+[
+ {
+  "key": "8f9ddf25",
+  "date": "2026-06-13",
+  "task_id": null,
+  "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
+  "resume_point": ""
+ },
+ {
+  "key": "2134f4ed",
+  "date": "2026-06-15",
+  "task_id": "AC-003",
+  "feature": "User schemas should be discoverable via pg_namespace heap rows during PG-standby replication, matching PostgreSQL's schema visibility model.",
+  "resume_point": ""
+ },
+ {
+  "key": "1de1e018",
+  "date": "2026-06-15",
+  "task_id": "AC-003",
+  "feature": "Schema definitions should be queryable via pg_namespace heap rows and indexes (2684/2685), enabling PostgreSQL standby replication to resolve schemas.",
+  "resume_point": ""
+ },
+ {
+  "key": "79dcdd70",
+  "date": "2026-06-15",
+  "task_id": "M0110-0003",
+  "feature": "MVCC/HOT-chain corruption verification in verify_heapam (004) - not faithfully portable due to on-disk varatt_external layout divergence",
+  "resume_point": ""
+ },
+ {
+  "key": "24b09523",
+  "date": "2026-06-15",
+  "task_id": "M0117-0003",
+  "feature": "pg_subtrans truncation (cleanup of subtransaction ancestry records) is deferred.",
+  "resume_point": ""
+ },
+ {
+  "key": "4143ec3d",
+  "date": "2026-06-16",
+  "task_id": "DU-002",
+  "feature": "Index column ordering (ASC/DESC/NULLS FIRST/NULLS LAST) is not persisted to disk; ordering is lost across server restart despite faithful dumps within a session",
+  "resume_point": "Persist indoption bits to on-disk pg_index heap to enable cross-restart index ordering preservation"
+ },
+ {
+  "key": "55903e34",
+  "date": "2026-06-16",
+  "task_id": "DU-002",
+  "feature": "RECURSIVE and MATERIALIZED views do not capture RawDef and cannot be dumped or restored",
+  "resume_point": "Implement RawDef capture and storage for RECURSIVE and MATERIALIZED view types"
+ },
+ {
+  "key": "fe297936",
+  "date": "2026-06-16",
+  "task_id": "DU-002",
+  "feature": "Per-function SET configuration parameters are not tracked; all functions report NULL for the proconfig column.",
+  "resume_point": ""
+ },
+ {
+  "key": "cbf5bf75",
+  "date": "2026-06-21",
+  "task_id": "M0118-0003",
+  "feature": "Write-Ahead Logging (WAL) for MultiXact operations, enabling creation, modification, and deletion of MultiXact records to be logged and recovered after crashes.",
+  "resume_point": ""
+ },
+ {
+  "key": "1bcbdcd9",
+  "date": "2026-06-30",
+  "task_id": "DU-002",
+  "feature": "Domain CHECK predicates still use legacy wrap instead of new fully-parenthesizing renderer.",
+  "resume_point": "slice 362"
+ },
+ {
+  "key": "a0a71174",
+  "date": "2026-06-30",
+  "task_id": "DU-002",
+  "feature": "Database-level ACL projection (datacl) is not yet implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "b10678cb",
+  "date": "2026-07-01",
+  "task_id": "M0119-0004",
+  "feature": "User-defined function-based casts (WITH FUNCTION casts) are parsed but not dumped in pg_dump; only built-in binary-coercible casts are reachable.",
+  "resume_point": ""
+ }
+]

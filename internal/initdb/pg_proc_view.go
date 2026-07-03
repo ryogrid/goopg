@@ -65,6 +65,16 @@ func typeNameToOIDStr(typName string) string {
 		return "2279"
 	case "internal":
 		return "2281"
+	case "index_am_handler":
+		// Pseudo-type for the result of an index AM handler function
+		// (CREATE ACCESS METHOD ... TYPE INDEX HANDLER ...). DU-002
+		// (M0119-0004).
+		return "325"
+	case "table_am_handler":
+		// Pseudo-type for the result of a table AM handler function
+		// (CREATE ACCESS METHOD ... TYPE TABLE HANDLER ...). DU-002
+		// (M0119-0004).
+		return "269"
 	case "record":
 		// Pseudo-type representing any composite type. A SQL/plpgsql function
 		// declared `RETURNS record` stores this name on prorettype; pg_dump's

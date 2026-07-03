@@ -1,0 +1,86 @@
+[
+ {
+  "key": "e4ee8a28",
+  "date": "2026-05-08",
+  "task_id": "M0070-0004",
+  "feature": "Q5 predicate pushdown optimization for improved query execution",
+  "resume_point": ""
+ },
+ {
+  "key": "e4ee8a28",
+  "date": "2026-05-08",
+  "task_id": "M0070-0006",
+  "feature": "Connection pool mutex partitioning to reduce lock contention",
+  "resume_point": ""
+ },
+ {
+  "key": "ebb267d6",
+  "date": "2026-05-08",
+  "task_id": "M0069-0005",
+  "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
+  "resume_point": ""
+ },
+ {
+  "key": "ebb267d6",
+  "date": "2026-05-08",
+  "task_id": "M0069-0005",
+  "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
+  "resume_point": ""
+ },
+ {
+  "key": "71cf817e",
+  "date": "2026-05-08",
+  "task_id": "M0068",
+  "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",
+  "resume_point": ""
+ },
+ {
+  "key": "58efeb06",
+  "date": "2026-05-09",
+  "task_id": "M0073-0005",
+  "feature": "Q5 CPU performance profiling of the OpCode optimization is deferred to the final sweep stage combined with arena work.",
+  "resume_point": "combined capture with arena work in M0073-0001..4"
+ },
+ {
+  "key": "b0226c37",
+  "date": "2026-05-09",
+  "task_id": "M0071-0005",
+  "feature": "NLI semi/anti joins with partsupp_pk-style index may not correctly emit outer rows; root cause and fix deferred.",
+  "resume_point": "Stage D follow-up"
+ },
+ {
+  "key": "72d544e1",
+  "date": "2026-05-09",
+  "task_id": "M0071-0005",
+  "feature": "Q9 chained-NLI rebind logic requires slot pipeline implementation; planner-only approach infeasible",
+  "resume_point": ""
+ },
+ {
+  "key": "7b4a6c79",
+  "date": "2026-05-10",
+  "task_id": null,
+  "feature": "Build tags for architecture-specific kernel implementations",
+  "resume_point": ""
+ },
+ {
+  "key": "83e7853c",
+  "date": "2026-05-10",
+  "task_id": "M0076-0001",
+  "feature": "Q5 optimization fix deferred due to empirical regression",
+  "resume_point": "M0077"
+ },
+ {
+  "key": "b27869c7",
+  "date": "2026-05-10",
+  "task_id": "M0077",
+  "feature": "Root-cause investigation of planner nondeterminism vs pool-state behavior in plan-snapshot regression harness",
+  "resume_point": ""
+ },
+ {
+  "key": "7b4a6c79",
+  "date": "2026-05-10",
+  "task_id": "M0076-0003",
+  "feature": "Diagnose and isolate individual build optimization flag (PGO / GOAMD64=v3 / ldflags) causing +9.5% wall-time regression",
+  "resume_point": ""
+ }
+]

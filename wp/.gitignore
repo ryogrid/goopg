@@ -12,3 +12,5 @@ goopg-wp.log
 .wp-admin-password
 # generated: host IP for container->goopg access (machine-specific)
 .env
+# verification-run evidence (WP-CLI output, goopg + PG4WP log slices) — see verification/FLOW.md
+verification/results/

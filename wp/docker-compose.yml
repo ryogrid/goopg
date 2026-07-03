@@ -27,8 +27,11 @@ services:
       WORDPRESS_DB_USER: "postgres"
       WORDPRESS_DB_PASSWORD: "postgres"   # ignored by goopg trust auth
       # PG4WP defaults DB_DRIVER to 'pgsql'; set explicitly for clarity.
+      # PG4WP_DEBUG turns on pg4wp/logs/pg4wp_*.log (rewrite + issued SQL),
+      # captured per verification item by wp/verification/run_item.sh (M0120).
       WORDPRESS_CONFIG_EXTRA: |
         define('DB_DRIVER', 'pgsql');
+        define('PG4WP_DEBUG', true);
     volumes:
       - wp_html:/var/www/html
 

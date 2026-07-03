@@ -109,6 +109,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateEventTrigger(s)
 	case *parser.AlterEventTriggerStmt:
 		return nil, o.execAlterEventTrigger(s)
+	case *parser.CreateAccessMethodStmt:
+		return nil, o.execCreateAccessMethod(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -870,6 +872,75 @@ func (o *ddlOp) execAlterEventTrigger(s *parser.AlterEventTriggerStmt) error {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("unrecognized ALTER EVENT TRIGGER action %q", s.Action)}
 	}
 	return nil
+}
+
+// execCreateAccessMethod registers a CREATE ACCESS METHOD in the runtime
+// pg_am registry so it round-trips through pg_dump (getAccessMethods/
+// dumpAccessMethod). goopg has no pluggable table/index storage engine and
+// never invokes a user-defined AM's handler — this only maintains dump
+// fidelity, mirroring CreateAccessMethod's own validation order
+// (postgres/src/backend/commands/amcmds.c): superuser check, then
+// duplicate-name check, then handler resolution.
+func (o *ddlOp) execCreateAccessMethod(s *parser.CreateAccessMethodStmt) error {
+	if o.ctx.NonSuperuserRole != "" {
+		return &ExecError{Code: "42501", Pos: s.Pos(), Message: fmt.Sprintf("permission denied to create access method %q", s.Name)}
+	}
+	rs := o.ctx.Catalog.Routines()
+	if rs == nil {
+		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires routine registry"}
+	}
+	handlerOID, err := resolveAccessMethodHandlerFunc(rs, s.HandlerName, s.AMType)
+	if err != nil {
+		return err
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "CREATE ACCESS METHOD requires the in-memory catalog"}
+	}
+	am, err := im.RegisterAccessMethod(s.Name, s.AMType, handlerOID)
+	if err != nil {
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// DU-002 restart-persistence follow-up (M0119-0004, DU-002 slice 426
+	// ledger resume point): mirrors CREATE EVENT TRIGGER.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAccessMethod(am.Name, am.AMType, am.OID, am.HandlerOID)); werr != nil {
+			return fmt.Errorf("wal create-access-method: %w", werr)
+		}
+	}
+	return nil
+}
+
+// resolveAccessMethodHandlerFunc mirrors lookup_am_handler_func
+// (postgres/src/backend/commands/amcmds.c): the handler must be a routine
+// taking exactly one argument of type "internal" (LookupFuncName(handler_name,
+// 1, {INTERNALOID}, false)) whose return type matches amType ("i" →
+// index_am_handler, "t" → table_am_handler). A missing/mismatched signature
+// reports 42883 undefined_function with PG's own fixed-signature text; a
+// resolved routine with the wrong return type reports 42809
+// wrong_object_type.
+func resolveAccessMethodHandlerFunc(rs *catalog.Routines, funcName parser.ObjectName, amType string) (uint32, error) {
+	expectedRet := "index_am_handler"
+	if amType == "t" {
+		expectedRet = "table_am_handler"
+	}
+	for _, r := range rs.LookupByName(funcName) {
+		inArgs := make([]catalog.Type, 0, len(r.ArgTypes))
+		for i, t := range r.ArgTypes {
+			if i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+				continue
+			}
+			inArgs = append(inArgs, t)
+		}
+		if len(inArgs) != 1 || !strings.EqualFold(inArgs[0].Name, "internal") {
+			continue
+		}
+		if !strings.EqualFold(r.ReturnType.Name, expectedRet) {
+			return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type %s", funcName.String(), expectedRet)}
+		}
+		return r.OID, nil
+	}
+	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(internal) does not exist", funcName.String())}
 }
 
 // resolveEventTriggerFunc looks up a niladic (0-argument) function by name,
@@ -3122,6 +3193,60 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			colKey := strings.ToLower(col.Name)
 			noInherit := explicitNoInherit[colKey]
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			isLocal := true
+			inhCount := 0
+			// A column carried in purely by a plain `INHERITS (parent)` clause
+			// (col.Inherited, not the child's own column list) whose NOT NULL
+			// comes from the parent must record conislocal='f'/coninhcount>0 with
+			// the PARENT's constraint name, matching real PG's MergeAttributes.
+			// Getting this wrong makes pg_dump's shouldPrintColumn/print_notnull
+			// (pg_dump.c) treat the column as locally NOT NULL and re-emit it
+			// as a malformed standalone `NOT NULL <col>` table element even
+			// though the column itself is never printed (it arrives via
+			// INHERITS). CREATE TABLE ... PARTITION OF also sets col.Inherited,
+			// but partitions always print every column inline regardless of
+			// locality (pg_dump.c's `tbinfo->ispartition` check), so this
+			// re-derivation only matters for s.PartitionOf == nil. DU-002.
+			if col.Inherited && s.PartitionOf == nil {
+				for _, parent := range inheritParents {
+					for _, pnc := range parent.NotNullConstraints {
+						if strings.EqualFold(pnc.ColName, col.Name) {
+							if inhCount == 0 && pnc.Name != "" {
+								name = pnc.Name
+							}
+							inhCount++
+							break
+						}
+					}
+				}
+				if inhCount > 0 {
+					isLocal = false
+				}
+			} else if !col.Inherited && s.PartitionOf == nil {
+				// Column explicitly re-declared in the child's own column
+				// list (e.g. `CREATE TABLE child (id int NOT NULL, ...)
+				// INHERITS (parent)`) that ALSO matches a NOT NULL
+				// constraint enforced by an INHERITS parent: PG's
+				// MergeAttributes ("merging column ... with inherited
+				// definition") still counts the parent's enforcement,
+				// giving coninhcount=1 despite conislocal=t and the child's
+				// own auto-generated name (verified live against PG 18.3).
+				// No pg_dump text impact (print_notnull only gates on
+				// conislocal for a plain-INHERITS child), but pg_constraint
+				// itself must match for direct-catalog consumers
+				// (pg_upgrade, introspection). DU-002.
+				for _, parent := range inheritParents {
+					for _, pnc := range parent.NotNullConstraints {
+						if strings.EqualFold(pnc.ColName, col.Name) {
+							inhCount = 1
+							break
+						}
+					}
+					if inhCount > 0 {
+						break
+					}
+				}
+			}
 			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
 				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the
 				// auto-name. DU-002 slice 273.
@@ -3136,7 +3261,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					noInherit = true
 				}
 			}
-			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, true, 0)
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, isLocal, inhCount)
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:
@@ -3831,16 +3956,48 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		}
 		tbl.AddCheck(pcc.Name, pcc.Expr, oid)
 	}
-	// Register named NOT NULL constraints for NOT NULL columns declared in the
-	// PARTITION OF column override list. These columns come from the parent schema
-	// but the partition child explicitly adds NOT NULL, so IsLocal=true. All
-	// partition child NOT NULL constraints have InhCount=1 (one partition parent).
-	// M0097-0023.
+	// Register named NOT NULL constraints for every NOT NULL column on the
+	// partition child, matching real PG's per-column pg_constraint contype='n'
+	// row (verified against live PG 18.3): a column that is NOT NULL purely
+	// because the parent enforces it (not re-declared in this partition's own
+	// column list) reuses the PARENT's constraint name with
+	// conislocal='f'/coninhcount=1 — pg_dump's ispartition-gated print_notnull
+	// always prints it inline (`CONSTRAINT <parent's name> NOT NULL`) despite
+	// conislocal='f', since partitions print every column regardless of
+	// locality. A column explicitly re-declared NOT NULL in the PARTITION OF
+	// column-constraint list (poc.NotNullColumns) instead gets its OWN
+	// <child>_<col>_not_null name with conislocal='t', and coninhcount is 1
+	// only if the parent ALSO enforces it there (0 if the parent column is
+	// nullable). M0110-0001 (DU-002 partition-child NOT NULL locality).
 	if isIM2 {
+		explicitNotNull := make(map[string]bool, len(poc.NotNullColumns))
 		for _, colName := range poc.NotNullColumns {
-			colKey := strings.ToLower(colName)
-			constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
-			tbl.AddNotNull(constraintName, colName, im2.AllocOID(), false, true, 1)
+			explicitNotNull[strings.ToLower(colName)] = true
+		}
+		for _, col := range tbl.Columns {
+			if !col.NotNull {
+				continue
+			}
+			colKey := strings.ToLower(col.Name)
+			var parentNC *catalog.NamedNotNullConstraint
+			for i := range parent.NotNullConstraints {
+				if strings.EqualFold(parent.NotNullConstraints[i].ColName, col.Name) {
+					parentNC = &parent.NotNullConstraints[i]
+					break
+				}
+			}
+			if explicitNotNull[colKey] {
+				inhCount := 0
+				if parentNC != nil {
+					inhCount = 1
+				}
+				constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+				tbl.AddNotNull(constraintName, col.Name, im2.AllocOID(), false, true, inhCount)
+				continue
+			}
+			if parentNC != nil {
+				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, 1)
+			}
 		}
 	}
 	return nil
@@ -11438,6 +11595,39 @@ func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
+// syncRangeTypeToCatalogHeap writes the pg_type heap rows for a user-defined
+// range type: the range itself (typtype='r') and its auto-generated
+// multirange type (typtype='m'), mirroring syncEnumTypeToCatalogHeap /
+// syncDomainTypeToCatalogHeap. pg_dump's getTypes reads pg_type to discover
+// both, and dumpRangeType re-renders `CREATE TYPE ... AS RANGE (...)` via a
+// separate query against pg_range/pg_opclass (see the pg_range/pg_opclass
+// Virtual views in internal/catalog/catalog.go, which surface a matching row
+// for a registered range type without a heap write — pg_range/pg_opclass are
+// not heap-backed like pg_type). DU-002 (M0110-0001).
+func syncRangeTypeToCatalogHeap(ctx *Context, rt *catalog.RangeType) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRange(rt)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRangeArray(rt)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirange(rt)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
+		return
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
 // deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
 // Called by execDropType so dropped enums don't leave orphan pg_type rows.
 // pg_type rows are written by syncEnumTypeToCatalogHeap using pgTypeColumnsPG18
@@ -13012,6 +13202,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		}
 		for _, name := range s.Names {
 			roleName := strings.ToLower(name.Name)
+			// Predefined "pg_*" roles are pinned objects (OID below PG's
+			// FirstUnpinnedObjectId, postgres/src/include/access/transam.h) —
+			// checkSharedDependencies (pg_shdepend.c) rejects DROP
+			// unconditionally, even under IF EXISTS (the role DOES exist;
+			// IF EXISTS only suppresses the "does not exist" case below).
+			// Verified against a real PG 18.3 instance. M0119-0004-ACLHEAP.
+			if o.ctx.Catalog.IsPredefinedRole(roleName) {
+				return &ExecError{Code: "2BP01", Pos: s.Pos(),
+					Message: fmt.Sprintf("cannot drop role %s because it is required by the database system", roleName)}
+			}
 			exists := o.ctx.Catalog.RoleExists(roleName)
 			if s.IfExists {
 				if !exists {
@@ -13210,6 +13410,32 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			// Check if the operator class was registered via CREATE OPERATOR CLASS.
 			// If found in the catalog registry, remove it and succeed silently.
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+				// closing the loop #69 ledger row's own discovery): a bare
+				// `DROP OPERATOR FAMILY name USING method` for a family
+				// created via `CREATE OPERATOR FAMILY` (no AS list, no
+				// class) was never removed from userOperatorFamilies — the
+				// legacy opClassSchemas map below is keyed by operator
+				// *class* name only. Check the family registry first; a
+				// family that shares its name with a same-named operator
+				// class (PG's implicit-family-per-class convention) falls
+				// through to the opClassSchemas branch below unchanged.
+				if objType == "operator family" {
+					famSchema := name.Schema
+					if famSchema == "" {
+						famSchema = "public"
+					}
+					famMethodOID := catalog.AccessMethodOIDByName(method)
+					if fam, found := im.LookupUserOperatorFamily(famSchema, name.Name, famMethodOID); found {
+						im.DropUserOperatorFamily(famSchema, name.Name, famMethodOID)
+						if o.ctx.WAL != nil {
+							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorFamily(fam.OID)); werr != nil {
+								return fmt.Errorf("wal drop-operator-family: %w", werr)
+							}
+						}
+						return nil
+					}
+				}
 				if im.HasOpClass(name.Name) {
 					im.RemoveOpClass(name.Name)
 					// Also drop the pg_opclass row (DU-002, M0119-0004) so a
@@ -13221,7 +13447,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						if classSchema == "" {
 							classSchema = "public"
 						}
-						im.DropUserOperatorClass(classSchema, name.Name, catalog.AccessMethodOIDByName(method))
+						classMethodOID := catalog.AccessMethodOIDByName(method)
+						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID)
+						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID)
+						// DU-002 restart-persistence follow-up
+						// (M0119-0004/M0110-0001, closing the loop #65/#66
+						// ledger row's "still open" item (1)): mirrors DROP
+						// OPERATOR's own WAL append so the drop survives a
+						// restart. ocFound is false for a class that only
+						// exists in the legacy opClassSchemas registry (no
+						// pg_opclass row was ever registered, e.g. an
+						// unparseable USING method at CREATE time) — nothing
+						// to WAL-log in that case.
+						if ocFound && o.ctx.WAL != nil {
+							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorClass(oc.OID)); werr != nil {
+								return fmt.Errorf("wal drop-operator-class: %w", werr)
+							}
+						}
 					}
 					return nil
 				}
@@ -13481,17 +13723,36 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			o.ctx.AddNotice(fmt.Sprintf("operator %s does not exist, skipping", opName))
 			return nil
 		}
-		// Check compat registry: if the operator was registered via CREATE OPERATOR (noop), succeed silently.
+		// Existence check: the dedicated operator registry (catalog.UserOperator)
+		// is the restart-durable source of truth as of loop #65's CREATE/DROP
+		// OPERATOR WAL persistence — unlike the ephemeral compatObjects registry
+		// below, RegisterUserOperatorDuringRecovery repopulates it on replay.
+		// Gating existence on compatObjects alone (the pre-loop-66 behavior)
+		// meant a `DROP OPERATOR` on any user operator surviving a restart
+		// spuriously failed with 42883 even though pg_operator still listed it
+		// (looked like a "=...=-shaped symbol" lexer quirk when first noticed —
+		// it reproduces for any operator symbol, e.g. `~~~`, once persisted
+		// across a restart; see deferral ledger loop #65 row).
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			key := opName + "(" + leftCanon + "," + rightCanon + ")"
-			if im.DropCompatObject("operator", key) {
-				schema := opNameObj.Schema
-				if schema == "" {
-					schema = "public"
-				}
-				// Also remove the dedicated operator registry entry so pg_dump
-				// no longer re-emits it (mirrors DropCast/DropTransform).
+			schema := opNameObj.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			if existing, found := im.LookupUserOperator(schema, opName, leftType, rightType); found {
+				// Best-effort cleanup of the compat registry too; absent (e.g.
+				// after a restart) is expected and not an error.
+				key := opName + "(" + leftCanon + "," + rightCanon + ")"
+				im.DropCompatObject("operator", key)
 				im.DropUserOperator(schema, opName, leftType, rightType)
+				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+				// discovered while verifying the loop #64 CREATE TYPE ... AS
+				// RANGE opclass/collation follow-up — see ledger): mirrors
+				// CREATE OPERATOR's own WAL append.
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperator(existing.OID)); werr != nil {
+						return fmt.Errorf("wal drop-operator: %w", werr)
+					}
+				}
 				return nil
 			}
 		}
@@ -13554,6 +13815,24 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					if o.ctx.WAL != nil {
 						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropEventTrigger(name)); werr != nil {
 							return fmt.Errorf("wal drop-event-trigger: %w", werr)
+						}
+					}
+					return nil
+				}
+			}
+		case "access method":
+			// Drop the dump-visible pg_am registry entry (DU-002,
+			// M0119-0004) so a dropped access method stops round-tripping
+			// through pg_dump.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				name := s.Names[0].String()
+				if im.DropAccessMethod(name) {
+					// DU-002 restart-persistence follow-up (M0119-0004,
+					// DU-002 slice 426 ledger resume point): mirrors DROP
+					// EVENT TRIGGER.
+					if o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAccessMethod(name)); werr != nil {
+							return fmt.Errorf("wal drop-access-method: %w", werr)
 						}
 					}
 					return nil
@@ -14021,6 +14300,36 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return err
 		}
 	}
+	// A GRANT/REVOKE … ON DATABASE … changes pg_database.datacl, also
+	// heap-backed (a SHARED cluster-wide catalog). query.go's isHeapACLObject
+	// excludes it from the server's virtual-ACL fast path so it reaches the
+	// executor here. M0119-0004-ACLHEAP (datacl half).
+	if s.DatabaseACLChange != nil {
+		if err := o.execDatabaseACLChange(s.DatabaseACLChange); err != nil {
+			return err
+		}
+	}
+	// A GRANT/REVOKE … ON PARAMETER … changes pg_parameter_acl. Unlike
+	// TYPE/DATABASE it has no heap row to re-sync (goopg-virtual-only
+	// catalog), but query.go's isHeapACLObject still excludes it from the
+	// server's virtual-ACL fast path so the parsed clause reaches the
+	// executor here. M0119-0004-ACLHEAP (parameter ACL half).
+	if s.ParameterACLChange != nil {
+		if err := o.execParameterACLChange(s.ParameterACLChange); err != nil {
+			return err
+		}
+	}
+	// A `GRANT <role> TO <role>`/`REVOKE ... FROM <role>` role-membership
+	// statement changes pg_auth_members, which is virtual and sourced
+	// entirely from the roleMembers registry (no heap row to re-sync). The
+	// server excludes this form (no `ON <object>` clause) from its own
+	// virtual-ACL fast path (query.go) so it reaches the executor here.
+	// M0119-0004-ACLHEAP.
+	if s.RoleMembership != nil {
+		if err := o.execRoleMembershipChange(s.RoleMembership); err != nil {
+			return err
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}
@@ -14034,7 +14343,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	// (applyFDWOptionChanges), rather than the flat replace
 	// RegisterForeignDataWrapper performs for CREATE. Unlike CREATE, the
 	// target FDW must already exist. DU-002 slice 421.
-	if s.Tag == "ALTER" && s.ObjType == "foreign-data wrapper" {
+	if s.Tag == "ALTER FOREIGN DATA WRAPPER" && s.ObjType == "foreign-data wrapper" {
 		fdwName := s.ObjName.String()
 		fdw, found := im.LookupForeignDataWrapper(fdwName)
 		if !found {
@@ -14228,6 +14537,23 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 					other.NegatorOID = op.OID
 				}
 			}
+
+			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+			// discovered while verifying the loop #64 CREATE TYPE ... AS
+			// RANGE opclass/collation follow-up — see ledger): mirrors
+			// CREATE TYPE ... AS RANGE's own WAL append. op's final state
+			// (post COMMUTATOR/NEGATOR back-patch) is what gets persisted,
+			// so a restart reproduces exactly what pg_operator showed the
+			// client before the crash.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperator(wal.CreateOperatorPayload{
+					OID: op.OID, Schema: schema, Name: op.Name, LeftType: op.LeftType, RightType: op.RightType,
+					FuncOID: op.FuncOID, Owner: op.Owner, CommutatorOID: op.CommutatorOID, NegatorOID: op.NegatorOID,
+					RestrictOID: op.RestrictOID, JoinOID: op.JoinOID, CanMerge: op.CanMerge, CanHash: op.CanHash,
+				})); werr != nil {
+					return fmt.Errorf("wal create-operator: %w", werr)
+				}
+			}
 		}
 	case "operator family":
 		// Register the user-defined operator family (CREATE OPERATOR FAMILY
@@ -14252,7 +14578,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if nsOID == 0 {
 			nsOID = o.ctx.Catalog.SchemaOID("public")
 		}
-		im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+		// closing the loop #65/#66 ledger row's "still open" item (1)):
+		// mirrors CREATE OPERATOR's own WAL append so the family survives a
+		// restart.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
+				OID: fam.OID, Schema: schema, Name: fam.Name, Method: methodOID,
+			})); werr != nil {
+				return fmt.Errorf("wal create-operator-family: %w", werr)
+			}
+		}
 	case "cast":
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
 		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).
@@ -15490,6 +15827,17 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		// creating role for these compat objects).
 		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0)
 		famOID = fam.OID
+		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001):
+		// mirrors CREATE OPERATOR FAMILY's own WAL append (execCompatNoop's
+		// "operator family" case) so this auto-created anonymous family
+		// survives a restart too.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
+				OID: fam.OID, Schema: schema, Name: fam.Name, Method: methodOID,
+			})); werr != nil {
+				return fmt.Errorf("wal create-operator-family: %w", werr)
+			}
+		}
 	}
 
 	var keyTypeOID uint32
@@ -15508,6 +15856,19 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		}
 	}
 	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
+	// the loop #65/#66 ledger row's "still open" item (1)): mirrors CREATE
+	// OPERATOR's own WAL append so the class survives a restart. The
+	// AS-list members are appended separately by registerOpClassMembers
+	// below.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorClass(wal.CreateOperatorClassPayload{
+			OID: oc.OID, Schema: schema, Name: oc.Name, Method: methodOID, FamilyOID: famOID,
+			InTypeOID: inTypeOID, IsDefault: s.IsDefault, KeyTypeOID: keyTypeOID,
+		})); werr != nil {
+			return fmt.Errorf("wal create-operator-class: %w", werr)
+		}
+	}
 	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos(), false, "")
 }
 
@@ -15588,11 +15949,23 @@ func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
 				return &ExecError{Code: "42704", Pos: s.Pos(),
 					Message: fmt.Sprintf("function %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
 			}
+			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+			// closing the loop #65/#66 ledger row's "still open" item (1)).
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAmProcMember(fam.OID, leftOID, rightOID, uint32(m.Number))); werr != nil {
+					return fmt.Errorf("wal drop-amproc-member: %w", werr)
+				}
+			}
 			continue
 		}
 		if !im.RemoveAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("operator %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number))); werr != nil {
+				return fmt.Errorf("wal drop-amop-member: %w", werr)
+			}
 		}
 	}
 	return nil
@@ -15643,7 +16016,19 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 					}
 				}
 			}
-			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
+			pm := im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
+			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+			// closing the loop #65/#66 ledger row's "still open" item (1)):
+			// covers both a CREATE OPERATOR CLASS ... AS list FUNCTION entry
+			// and an ALTER OPERATOR FAMILY ... ADD FUNCTION entry.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAmProcMember(wal.AmProcMemberPayload{
+					OID: pm.OID, FamilyOID: pm.FamilyOID, ClassOID: pm.ClassOID, LeftType: pm.LeftType,
+					RightType: pm.RightType, ProcNum: pm.ProcNum, ProcOID: pm.ProcOID, Method: pm.Method,
+				})); werr != nil {
+					return fmt.Errorf("wal create-amproc-member: %w", werr)
+				}
+			}
 			continue
 		}
 		if isAdd && !m.HasExplicitArgTypes {
@@ -15693,7 +16078,20 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 			}
 			sortFamilyOID = fam.OID
 		}
-		im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID, sortFamilyOID)
+		opm := im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID, sortFamilyOID)
+		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+		// closing the loop #65/#66 ledger row's "still open" item (1)):
+		// covers both a CREATE OPERATOR CLASS ... AS list OPERATOR entry
+		// and an ALTER OPERATOR FAMILY ... ADD OPERATOR entry.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAmOpMember(wal.AmOpMemberPayload{
+				OID: opm.OID, FamilyOID: opm.FamilyOID, ClassOID: opm.ClassOID, LeftType: opm.LeftType,
+				RightType: opm.RightType, Strategy: opm.Strategy, OperOID: opm.OperOID, Method: opm.Method,
+				SortFamilyOID: opm.SortFamilyOID,
+			})); werr != nil {
+				return fmt.Errorf("wal create-amop-member: %w", werr)
+			}
+		}
 	}
 	return nil
 }
@@ -15825,7 +16223,36 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		return nil
 	}
 	if !s.IsEnum {
-		// Composite / range / base types — register the name so DROP TYPE can
+		// AS RANGE (subtype = ..., ...) — register a real range type (pg_type
+		// typtype='r' + its auto-generated multirange typtype='m'), so it
+		// round-trips through pg_dump instead of vanishing as a bare name-only
+		// stub. DU-002 (M0110-0001).
+		if s.IsRange {
+			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName, s.RangeOpclassName, s.RangeCollationName)
+			if err != nil {
+				// RegisterRangeType reports option-resolution failures (missing
+				// default/named opclass, datatype mismatch, unsupported/missing
+				// collation) via *catalog.RangeTypeOptionError carrying PG's own
+				// SQLSTATE; fall back to 42704 for anything else. DU-002
+				// (M0110-0001, slice 429 follow-up sub-item (a)).
+				code := "42704"
+				if rte, ok := err.(*catalog.RangeTypeOptionError); ok {
+					code = rte.Code
+				}
+				return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
+			}
+			syncRangeTypeToCatalogHeap(o.ctx, rt)
+			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
+			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
+			// METHOD.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID)); werr != nil {
+					return fmt.Errorf("wal create-range-type: %w", werr)
+				}
+			}
+			return nil
+		}
+		// Composite / base types — register the name so DROP TYPE can
 		// succeed without error. If the type has a parsed field list, also
 		// store the fields to enable PL/pgSQL field access/assignment.
 		// M0097-0064, M0097-composite.
@@ -16277,7 +16704,31 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		if compErr == nil {
 			continue // successfully dropped as composite type
 		}
-		// Neither enum nor composite — report error or IF EXISTS notice.
+		// Stamp the range type's pg_type rows (the range + its auto-generated
+		// multirange) before the in-memory delete, mirroring the enum/composite
+		// branches above. DU-002 (M0110-0001).
+		if rt, ok := cat.LookupRangeType(n); ok && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeArrayOID, o.ctx.Tx.XID)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
+		}
+		rangeErr := cat.DropRangeType(n)
+		if rangeErr == nil {
+			// DU-002 restart-persistence follow-up (M0110-0001, DU-002
+			// slice 429 ledger resume point, sub-item (c)): mirrors DROP
+			// ACCESS METHOD.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropRangeType(n)); werr != nil {
+					return fmt.Errorf("wal drop-range-type: %w", werr)
+				}
+			}
+			continue // successfully dropped as range type
+		}
+		// Neither enum, composite, nor range — report error or IF EXISTS notice.
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", n))
 			continue

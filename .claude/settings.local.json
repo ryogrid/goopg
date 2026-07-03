@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(xargs -I{} basename {} .sql)"
+      "Bash(xargs -I{} basename {} .sql)",
+      "Bash(systemctl --user stop goopg-wp.scope)",
+      "Bash(systemctl --user reset-failed goopg-wp.scope)"
     ]
   },
   "hooks": {

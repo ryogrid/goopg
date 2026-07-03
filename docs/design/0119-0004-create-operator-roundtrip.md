@@ -2843,3 +2843,514 @@ select-only) PASS.
 The `CREATE`/`ALTER`/`DROP FUNCTION` and `CREATE`/`ALTER`/`DROP PROCEDURE`
 surface goopg supports at the SQL level is entirely WAL-persisted; the
 loop #73 deferral-ledger row is resolved.
+
+## Loop #65 — CREATE/DROP OPERATOR restart/WAL persistence
+
+Discovered while live-verifying loop #64's CREATE TYPE ... AS RANGE
+`subtype_opclass`/`collation` follow-up: a range type referencing a
+user-defined operator class lost that opclass across a restart. Chasing
+that down (`docs/design/0110-0001-pg-dump-tap-port.md`) surfaced a deeper,
+independent gap — `CREATE OPERATOR` itself had **zero** WAL/restart
+persistence. `catalog.InMemory.userOperators` was a pure in-memory map with
+no counterpart to the `RecordKindCreateFunction`/`RecordKindCreateRangeType`
+treatment every other DU-002 DDL family already got; a `CREATE OPERATOR`
+survived only until the next server restart, at which point `pg_operator`
+(and any opclass `AS` list referencing it) silently reverted to empty. This
+loop closes that gap for the operator itself; `CREATE OPERATOR CLASS`/
+`CREATE OPERATOR FAMILY`/pg_amop/pg_amproc member persistence remain open
+(see "Still deferred" below and the ledger) — scoped out as their own
+follow-up per the one-task-per-loop rule, since they need new struct
+surface (family FK, member lists) beyond a single object's fields.
+
+### What landed
+
+Two new WAL record kinds in `internal/wal/recovery.go`:
+`RecordKindCreateOperator` (83), `RecordKindDropOperator` (84) — the next
+free bytes after loop #64's range-type pair (81/82).
+`CreateOperatorPayload`/`EncodeCreateOperator`/`DecodeCreateOperator` follow
+the `CreateFunctionPayload` struct-based precedent (too many fields —
+OID, schema, name, left/right type, func OID, owner, commutator/negator/
+restrict/join OIDs, canmerge/canhash — for a flat positional signature).
+`DropOperator` carries the resolved OID, not name+signature, mirroring
+`RecordKindDropFunction`'s identical rationale: `DROP OPERATOR`'s own
+overload resolution (`execDropCompat`'s `"operator"` case) already ran live
+before the WAL record is written.
+
+`catalog.InMemory` gained `RegisterUserOperatorDuringRecovery` (idempotent,
+OID-preserving — takes every field, including the cross-reference OIDs,
+straight from the WAL record, advances `nextOID` past it, and re-resolves
+`NamespaceOID` from the `schema` name against the live schema registry
+rather than trusting a stored OID, mirroring
+`RegisterUserAggregateDuringRecovery`) and
+`DropUserOperatorByOIDDuringRecovery` (linear scan by OID — the registry
+only ever holds a handful of user-defined operators in practice, same
+justification `LookupUserOperatorByOID` already uses).
+
+New driver `internal/initdb/operator_ddl_recovery.go`
+(`replayOperatorDDLRecords`) mirrors `replayRangeTypeDDLRecords`
+structurally: scan `wal.ReadAll`, filter `wal.IsGoopgNativeRecord`, switch
+on the kind byte. Wired into `open.go` right after the range-type replay
+call. Unlike range types (keyed by bare name), an operator's registry key
+embeds its schema, so the recovery driver depends on schema replay having
+already run — true by construction since it's wired after every
+schema-independent replay driver that came before it in `open.go`, and
+`RegisterUserOperatorDuringRecovery`'s own schema-name-to-OID resolution
+falls back to `public` exactly like the aggregate recovery path if the
+schema isn't found (a defensive fallback, not the expected case).
+
+The executor wiring appends the WAL record at the tail end of
+`execCompatNoop`'s `"operator"` case (`internal/executor/operators_ddl.go`)
+— after the COMMUTATOR/NEGATOR two-pass back-patch completes, so the
+persisted record reflects the operator's fully-resolved final state, not an
+intermediate one. `execDropCompat`'s `"operator"` case looks the operator
+up by (schema, name, left/right type) to capture its OID *before*
+`DropUserOperator` deletes the entry, then appends
+`EncodeDropOperator(droppedOID)` — skipped if the lookup came up empty
+(mirrors the `IF EXISTS`/silent-success paths above it, which return before
+reaching this point anyway).
+
+### Live PG-compatible verification
+
+Manual server (`tmp/loop65-verify`, real `psql`/`pg_dump`, PID-file
+lifecycle per the manual-server-test-workflow convention): `CREATE FUNCTION`
++ `CREATE OPERATOR public.=#= (FUNCTION = ..., LEFTARG = int4, RIGHTARG =
+int4, COMMUTATOR = public.=#=, MERGES, HASHES)` — `pg_operator` shows it
+correctly (`oprcanmerge`/`oprcanhash` = t, `oprcom` self-referencing) and
+`pg_dump --schema-only` round-trips the exact `CREATE OPERATOR`/
+`COMMUTATOR = OPERATOR(...)`/`MERGES`/`HASHES`/`ALTER OPERATOR ... OWNER TO`
+shape. A `goopg stop`/`start` restart cycle over the same data dir
+confirmed `pg_operator` still shows it identically post-restart (OID,
+`oprcom`, flags all preserved) — repeated across two consecutive restarts.
+A second operator (`public.~~~`) confirmed the DROP side: `DROP OPERATOR`
+removes it immediately, and it stays gone across a subsequent restart
+(count 0 both before and after).
+
+### New discovery, not fixed (unrelated to persistence)
+
+`DROP OPERATOR public.=#= (int4, int4)` failed live with a spurious
+`42883 operator does not exist`, even though the identical `=#=` symbol's
+`CREATE OPERATOR` and `pg_dump` round-trip both worked correctly in the same
+session (`SELECT ... FROM pg_operator WHERE oprname = '=#='` found it). A
+plainer symbol (`~~~`) dropped cleanly. This points at a `DROP OPERATOR`
+grammar/lexer quirk mis-tokenizing an `=...=`-shaped multi-char operator
+symbol specifically in the `DROP OPERATOR name (type, type)` positional-args
+context (unlike `CREATE OPERATOR name (LEFTARG = ..., ...)`'s key-value
+context, which parses the same symbol fine) — not a registry or WAL bug.
+Out of scope for this loop (a pre-existing, narrow parser edge case
+unrelated to restart persistence); recorded in the ledger with a resume
+point (`internal/parser/lexer.go`'s operator-char class vs. whatever tokenizes
+the `DROP OPERATOR` name).
+
+### Tests
+
+`internal/wal/operator_ddl_test.go`:
+`TestEncodeDecodeCreateOperatorRoundTrip`,
+`TestEncodeDecodeDropOperatorRoundTrip`,
+`TestDecodeOperatorRejectsWrongKindAndTruncatedPayload`.
+`internal/initdb/operator_ddl_recovery_test.go`:
+`TestOperatorDDLRecoveryReplaysCreate` (full `Init`/`Open`/`Close`/`Open`
+cycle, asserts every field including cross-reference OIDs and
+`CanMerge`/`CanHash` survive), `TestOperatorDDLRecoveryReplaysDropAfterCreate`
+(CREATE then DROP replay cancels out), plus the missing-WAL-dir/nil-catalog
+guard tests mirroring the range-type recovery suite.
+
+## Loop #66 — `DROP OPERATOR` post-restart 42883 fix (closes the loop #65 "new discovery")
+
+The loop #65 row above misdiagnosed its own live-verification finding as a
+"`DROP OPERATOR` lexer/parser quirk mis-tokenizing an `=...=`-shaped
+operator symbol." Re-investigating from scratch (a parser-level probe test
+proved `=#=` tokenizes and parses identically for both `CREATE OPERATOR` and
+`DROP OPERATOR` — same `Name`, same `ArgTypes`) and then reproducing live
+against a real restart cycle showed the true trigger is **any** operator
+symbol, plain or exotic (`~~~` reproduces identically), and only **after a
+restart**. The loop #65 verification session happened to test `~~~`'s CREATE
++ DROP back-to-back in the same live session (before that session's own
+restart), while `=#=`'s DROP was tested only after the restart — timing, not
+the symbol's characters, is what differed.
+
+### Root cause
+
+`execDropCompat`'s `"operator"` case (`internal/executor/operators_ddl.go`)
+gated existence purely on the ephemeral `catalog.InMemory.compatObjects`
+registry (`im.DropCompatObject("operator", key)`) — a plain in-memory map
+populated only by a live `CREATE OPERATOR` statement's `RegisterCompatObject`
+call, with **no WAL record and no recovery replay** of its own. Loop #65 made
+the *dedicated* `userOperators` registry restart-durable
+(`RegisterUserOperatorDuringRecovery`), but never revisited this older gate,
+which still fires first and returns 42883 before ever consulting
+`userOperators` when the compat-registry entry is missing — exactly the
+post-restart state.
+
+### Fix
+
+Swapped the gating check in `execDropCompat`'s `"operator"` case from
+`im.DropCompatObject(...)` to `im.LookupUserOperator(schema, opName,
+leftType, rightType)` — the restart-durable registry is now the sole source
+of truth for existence. The compat-registry entry is still cleared as
+best-effort bookkeeping (a no-op, not an error, when absent post-restart) to
+avoid an unbounded leak in the ephemeral map across a long-running session
+that never restarts.
+
+### Live PG-compatible verification
+
+Manual server (throwaway data dir, real `psql`, PID-file lifecycle):
+`CREATE OPERATOR public.=#= (...COMMUTATOR = public.=#=, MERGES, HASHES)`,
+full restart, `DROP OPERATOR public.=#= (int4, int4)` now succeeds (`pg_operator`
+row gone) where it previously raised 42883; repeated for `public.~~~` with the
+same outcome. A second restart after the DROP confirms the drop itself stays
+durable (0 rows both times). Also re-verified the surrounding cases still
+behave correctly post-fix: a fresh (never-restarted) `CREATE`+`DROP` pair,
+`DROP OPERATOR IF EXISTS` on an already-dropped operator (notice, no error),
+and `DROP OPERATOR` on a truly nonexistent operator (still 42883).
+
+### Tests
+
+`internal/executor/create_operator_test.go`:
+`TestDropOperatorSurvivesAcrossRestart` — registers an operator via
+`RegisterUserOperatorDuringRecovery` only (bypassing the live-CREATE compat
+registry entirely, i.e. simulating exactly the post-restart state) and
+asserts `DROP OPERATOR` succeeds, the registry entry is gone afterward, and a
+second DROP on the same (now-removed) operator still 42883s.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/wal`+`internal/catalog`+
+`internal/initdb`+`internal/executor` suites PASS; `TestPort_PgDumpConnectionSetup`
+PASS; live `goopg`/`psql`/`pg_dump` end-to-end smoke incl. two full server
+restarts (described above); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke = pre-commit hook.
+
+### Still deferred
+
+`CREATE OPERATOR CLASS`/`CREATE OPERATOR FAMILY`/pg_amop/pg_amproc member
+persistence (the loop #64 discovery's other half — `userOperatorClasses`/
+`userOperatorFamilies` and the amop/amproc member stores are all still pure
+in-memory); the range-type `canonical`/`subtype_diff` sub-item (a) remainder
+and generic `GetDefaultOpClass`-over-user-opclasses gap (sub-item (b)) from
+loop #63/#64; the `=#=`-shaped operator-symbol `DROP OPERATOR` parser quirk
+noted above.
+
+## Loop #69 — CREATE OPERATOR CLASS/FAMILY + pg_amop/pg_amproc restart/WAL
+persistence (closes the loop #65/#66 "still open" item (1))
+
+### Scope
+
+Closes the deferral this design doc's own "Still deferred" section (loop
+#65/#66) named: `catalog.InMemory.userOperatorClasses`/`userOperatorFamilies`
+and the shared `amOpMembers`/`amProcMembers` stores were all still pure
+in-memory, so an operator class/family (and its `AS`-list `pg_amop`/
+`pg_amproc` members) vanished across a restart even though the plain
+`CREATE OPERATOR`-defined operators/functions it referenced now survived
+(loop #65). Covers every mutation path that writes to these four registries:
+`CREATE OPERATOR FAMILY`, `CREATE OPERATOR CLASS ... AS ...` (both the class
+row and its `AS`-list members), `ALTER OPERATOR FAMILY ... ADD` (which shares
+`registerOpClassMembers` with `CREATE OPERATOR CLASS`'s own `AS` list),
+`ALTER OPERATOR FAMILY ... DROP`, and `DROP OPERATOR CLASS`. `DROP OPERATOR
+FAMILY` is **not** covered — see "New discovery, not fixed" below.
+
+### Design
+
+Eight new record kinds (`internal/wal/recovery.go`, 85–91), each following the
+existing `CreateOperator`/`DropOperator` (loop #65) shape — a physical-redo
+no-op (goopg has no per-opclass/opfamily on-disk file namespace) plus a
+struct-based `Encode*`/`Decode*` pair:
+
+- `RecordKindCreateOperatorFamily` (85) — `CreateOperatorFamilyPayload{OID,
+  Schema, Name, Method}`. Schema is carried as a bare name (re-resolved
+  against the recovered schema registry at replay time), mirroring
+  `CreateOperatorPayload`'s identical choice.
+- `RecordKindCreateOperatorClass` (86) — `CreateOperatorClassPayload{OID,
+  Schema, Name, Method, FamilyOID, InTypeOID, KeyTypeOID, IsDefault}`.
+  `FamilyOID` is carried **directly** (not re-resolved by name) — safe
+  because the owning family's own create record always precedes this one in
+  WAL order and `RegisterUserOperatorFamilyDuringRecovery` preserves its
+  original OID exactly (see below), the same "OID stays valid because
+  replay order matches creation order" argument `CreateOperatorPayload`'s
+  `FuncOID`/`CommutatorOID` fields already rely on.
+- `RecordKindDropOperatorClass` (87) — by OID only, mirrors
+  `RecordKindDropOperator`'s rationale (the live DROP's own name/method
+  resolution already happened before the WAL append).
+- `RecordKindCreateAmOpMember` (88) / `RecordKindCreateAmProcMember` (90) —
+  one `AmOpMemberPayload`/`AmProcMemberPayload` per `pg_amop`/`pg_amproc`
+  row. **Reused for two live call sites**: a `CREATE OPERATOR CLASS ... AS`
+  list entry (`ClassOID` non-zero) and an `ALTER OPERATOR FAMILY ... ADD`
+  entry (`ClassOID` zero, a "loose" member) — both go through the shared
+  `registerOpClassMembers` helper and produce the identical `AmOpMember`/
+  `AmProcMember` shape, so one WAL record kind covers both without
+  duplicating the encode/decode pair.
+- `RecordKindDropAmOpMember` (89) / `RecordKindDropAmProcMember` (91) — a
+  keyed removal (`familyOID, leftType, rightType, strategy-or-procNum`), no
+  OID, mirroring how `RemoveAmOpMember`/`RemoveAmProcMember` themselves look
+  the row up (`ALTER OPERATOR FAMILY ... DROP`).
+
+Catalog additions (`internal/catalog/catalog.go`), one `*DuringRecovery`
+counterpart per `Register*` that needs OID preservation, mirroring
+`RegisterUserOperatorDuringRecovery`'s shape exactly (idempotent by key,
+takes the OID from the payload instead of allocating one, calls
+`advanceNextOIDLocked`):
+
+- `RegisterUserOperatorFamilyDuringRecovery` / `RegisterUserOperatorClassDuringRecovery`
+  — re-resolve `NamespaceOID` from the bare schema name the same way
+  `RegisterUserOperatorDuringRecovery` does (unknown/empty → `public`).
+  `RegisterUserOperatorClassDuringRecovery` **also** repopulates the older,
+  structurally separate `opClassSchemas` map (`RegisterOpClassSchema`'s
+  backing store) — this was the trickiest part of the loop, see "Bug found
+  while landing this" below.
+- `DropUserOperatorClassByOIDDuringRecovery` — finds the class by OID (a
+  linear scan; the registry is small), removes it, purges every
+  `amOpMembers`/`amProcMembers` row whose `ClassOID` matches (mirrors the
+  live `DropUserOperatorClass`'s own cleanup), and removes the
+  `opClassSchemas` entry.
+- `RegisterAmOpMemberDuringRecovery` / `RegisterAmProcMemberDuringRecovery`
+  — idempotent by OID (overwrite-in-place on a re-applied record, append
+  otherwise); `RemoveAmOpMember`/`RemoveAmProcMember` themselves were
+  already idempotent (return a discarded bool) so the DROP replay path
+  reuses them directly with no new wrapper.
+- New `LookupUserOperatorClass(schema, name, method)` — the live
+  `execDropCompat` DROP OPERATOR CLASS path needed a way to recover the
+  class's OID *before* removing it (to WAL-log the drop by OID, mirroring
+  `DROP OPERATOR`'s own look-up-then-drop-by-OID shape); no such lookup
+  existed for classes (only `LookupUserOperatorFamily` did).
+
+New recovery driver `internal/initdb/operator_class_ddl_recovery.go`
+(`replayOperatorClassDDLRecords`), wired into `open.go` immediately after the
+existing `replayOperatorDDLRecords` call (schema replay must already have
+run; a class's `AS`-list `OPERATOR` entries reference user operators by OID,
+which the operator DDL replay call restores).
+
+Executor wiring (`internal/executor/operators_ddl.go`), one WAL append per
+mutation, all guarded by the standard `if o.ctx.WAL != nil` (extended
+protocol has no explicit-transaction deferral path for any of these — it
+auto-commits per statement — so logging immediately at the mutation point is
+safe, same as every prior DU-002 follow-up):
+
+- `execCompatNoop`'s `"operator family"` case — append after
+  `RegisterUserOperatorFamily`.
+- `execCreateOpClass`'s anonymous-family branch (`FAMILY` clause omitted) —
+  append after its own `RegisterUserOperatorFamily` call (a second call
+  site, distinct from the one above — PG auto-creates this family,
+  `opclasscmds.c`'s `DefineOpClass`).
+- `execCreateOpClass`'s own class registration — append after
+  `RegisterUserOperatorClass`, before delegating to
+  `registerOpClassMembers` for the `AS` list.
+- `registerOpClassMembers` — append right after each
+  `RegisterAmOpMember`/`RegisterAmProcMember` call. Since this helper is
+  shared by `execCreateOpClass`'s `AS` list and `execAlterOpFamilyAdd`, one
+  append site each covers both live callers.
+- `execAlterOpFamilyDrop` — append after each successful
+  `RemoveAmOpMember`/`RemoveAmProcMember` call.
+- `execDropCompat`'s `"operator class"` arm — `LookupUserOperatorClass`
+  *before* calling `DropUserOperatorClass` (to capture the OID), append
+  after, guarded on `ocFound` (a class that only ever existed in the legacy
+  `opClassSchemas` registry — e.g. one whose `USING method` failed to parse
+  at CREATE time — has no `pg_opclass` row to WAL-log).
+
+### Bug found while landing this: `DROP OPERATOR CLASS` used a different
+existence registry than `CREATE OPERATOR CLASS` populates for restart state
+
+`execDropCompat`'s combined `"operator class"`/`"operator family"` arm
+(`internal/executor/operators_ddl.go`) gates existence on
+`im.HasOpClass(name.Name)` — a **flat, name-only** legacy map
+(`opClassSchemas`, M0097-0022, originally built only for `DROP SCHEMA
+CASCADE` detail text) — not on the newer, schema/method-scoped
+`userOperatorClasses` registry (M0119-0004, slice 411) that actually backs
+`pg_dump`'s `pg_opclass` row. The live `execCreateOpClass` path populates
+*both* registries on every CREATE, so this discrepancy is invisible without
+a restart in between. But a naive recovery replay that only restored
+`userOperatorClasses` (mirroring `RegisterUserOperatorDuringRecovery`'s
+scope for plain operators) would have left `opClassSchemas` empty after
+restart — `DROP OPERATOR CLASS` on a class that demonstrably still exists in
+`pg_dump`'s output would 42704 ("does not exist") until the process either
+restarted again after a fresh in-session `CREATE OPERATOR CLASS`, or
+never dropped it at all. Caught before it shipped by writing
+`TestOperatorClassDDLRecoveryReplaysCreate`'s `HasOpClass` assertion (see
+Tests below) and tracing why it initially failed. Fix:
+`RegisterUserOperatorClassDuringRecovery` writes both `userOperatorClasses`
+**and** `opClassSchemas` in the same call, keeping the two registries in
+sync the way the live CREATE path already does.
+
+### Second bug found while landing this: `ApplyRecord` had zero cases for
+four existing record kinds — a crash-restart (not graceful-restart) fatal
+
+While adding cases to `wal.ApplyRecord`'s physical-replay switch for the new
+kinds, an audit of the existing ~40-case switch turned up that
+`RecordKindGrantRoleMembership`/`RecordKindRevokeRoleMembership` (79/80,
+M0119-0004-ACLHEAP) and `RecordKindCreateOperator`/`RecordKindDropOperator`
+(83/84, loop #65) had **no case at all** — falling straight through to
+`ApplyRecord`'s `default: return false, fmt.Errorf("unsupported kind %d",
+...)`. `ReplayRecords` (the sole caller, via `ReplayFromDirWithMgr` at
+startup) treats any non-nil `ApplyRecord` error as fatal and aborts the
+*entire* replay loop, not just that one record.
+
+This did not surface in any prior "live-verified end-to-end incl. full
+server restart" claim (loop #65/#66 included) because `ReplayRecords` only
+replays records **after the last checkpoint** (`replayStart`'s trim, an
+optimization valid for physical page records: a checkpoint means dirty pages
+are already durably flushed) — and a graceful `Close()` always takes a
+shutdown checkpoint, which for these catalog-only records (no physical page
+effect to "already be flushed") happens to retroactively erase them from
+`ReplayRecords`' input by accident, not by design. The catalog-only
+recovery drivers (`operator_ddl_recovery.go`, `role_membership_recovery.go`,
+and now `operator_class_ddl_recovery.go`) are deliberately checkpoint-blind —
+they call `wal.ReadAll(walDir, 0)` from LSN 0 every time — so the *catalog*
+state was always correct after a graceful restart. Only a **crash restart**
+(`kill -KILL`, no shutdown checkpoint) with one of these four record kinds
+still after the last checkpoint would have hit the fatal error and refused
+to start at all.
+
+Confirmed live: `CREATE OPERATOR FAMILY`/`CREATE OPERATOR CLASS ... AS ...`
+against a throwaway data dir, then `kill -KILL` the running server (no
+graceful shutdown, so no shutdown checkpoint), then restart — before this
+fix's four added `case` arms this would have failed to start
+(`unsupported kind 83`); after, it starts cleanly and both the class and its
+`AS`-list member row survive with correct field values (see "Live
+PG-compatible verification" below).
+
+Fix: two new `case` arms in `ApplyRecord`'s switch — one folding in the
+pre-existing gap (`RecordKindCreateOperator`, `RecordKindDropOperator`,
+`RecordKindGrantRoleMembership`, `RecordKindRevokeRoleMembership`, all
+`return false, nil`, matching every other catalog-only kind's shape) and one
+for the eight new kinds this loop adds.
+
+### Live PG-compatible verification
+
+Manual server (throwaway data dir, real `psql`/`pg_dump`, PID-file
+lifecycle): `CREATE OPERATOR FAMILY my_int_ops USING btree`, `CREATE
+OPERATOR CLASS my_int_ops_class DEFAULT FOR TYPE int4 USING btree FAMILY
+my_int_ops AS OPERATOR 1..5, FUNCTION 1 btint4cmp(int4,int4)`, and a second
+class with no explicit `FAMILY` clause (exercises the anonymous-family
+branch) — then **`kill -KILL`** the server PID directly (bypassing the
+`goopg ctl`/`SIGTERM` graceful path entirely, so no shutdown checkpoint
+runs, deliberately exercising the crash-restart path the `ApplyRecord` bug
+above only manifests on). Restart succeeded (no `unsupported kind` fatal).
+Post-restart: both `pg_opfamily` rows present; both `pg_opclass` rows present
+with correct `opcdefault`; the `FUNCTION 1 btint4cmp` `pg_amproc` row present
+with the correct `amprocfamily`/`amprocnum`/`amproc` (the `OPERATOR`
+entries for `<`/`<=`/`=`/`>=`/`>` on `int4` never resolved in the first
+place — a pre-existing, already-ledgered limitation: goopg has no
+builtin-operator catalog, only user-defined operators resolve in an `AS`
+list, unrelated to this loop). `DROP OPERATOR CLASS my_int_ops_class USING
+btree` post-restart succeeds (previously would have 42704'd without the
+`opClassSchemas` fix above) and correctly purges the `pg_amproc` row too.
+`pg_dump` round-trips `my_int_ops`/`my_int_ops_noop_class` correctly
+post-restart.
+
+### Tests
+
+- `internal/wal/operator_class_ddl_test.go` — encode/decode round-trip +
+  wrong-kind/truncated-payload guards for all eight new record kinds.
+- `internal/initdb/operator_class_ddl_recovery_test.go` — full
+  `Init`/`Open`/`WAL.Append`/`Close`/`Open` cycles (real physical replay,
+  not a mock): `TestOperatorClassDDLRecoveryReplaysCreate` (family + class +
+  one `AS`-list `AmOpMember` + one `AmProcMember`, including the
+  `HasOpClass` legacy-registry-sync assertion that caught the first bug
+  above), `TestOperatorClassDDLRecoveryReplaysDropAfterCreate` (CREATE +
+  DROP OPERATOR CLASS cancels out, family survives), and
+  `TestOperatorClassDDLRecoveryReplaysAlterAddThenDropMember` (a "loose"
+  `ClassOID=0` member add-then-drop, exercising the
+  `RecordKindDropAmOpMember` path) + the standard missing-WAL-dir/nil-catalog
+  no-op guards.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `go test -race
+./internal/wal/... ./internal/mvcc/...` PASS; `internal/catalog`+
+`internal/executor`+`internal/initdb`+`internal/planner`+`internal/parser`+
+`internal/server` suites PASS (full runs, no regression); `TestPort_PgDumpConnectionSetup`
+PASS; live `goopg`/`psql`/`pg_dump` end-to-end smoke incl. a hard
+`kill -KILL` crash restart (described above); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook.
+
+### Still deferred
+
+- **`DROP OPERATOR FAMILY` restart persistence — deliberately not added.**
+  Auditing `execDropCompat`'s combined `"operator class"`/`"operator
+  family"` arm while landing this turned up that the live DROP path only
+  ever removes from the legacy `opClassSchemas` map — it **never calls
+  `DropUserOperatorFamily`**, so a family created via `CREATE OPERATOR
+  FAMILY` (no `AS` list, no class) is never actually removed from
+  `userOperatorFamilies` even in the live, same-session, no-restart case.
+  This is a pre-existing correctness gap independent of restart/WAL
+  persistence (there is nothing well-defined to WAL-log a removal of, since
+  the live removal itself does not happen); left for a future
+  `DROP OPERATOR FAMILY` correctness fix rather than folded into this
+  persistence-only loop.
+- Range-type `canonical`/`subtype_diff` sub-item (a) remainder and generic
+  `GetDefaultOpClass`-over-user-opclasses gap (sub-item (b)) from
+  loop #63/#64 (unchanged, unrelated to this loop).
+- The `=#=`-shaped operator-symbol `DROP OPERATOR` parser quirk noted in the
+  loop #65 section above (already closed by loop #66 — listed here only for
+  continuity, no action needed).
+
+## Loop #75 — `DROP OPERATOR FAMILY` correctness + restart/WAL persistence
+(closes the loop #69 row's "Still deferred" item)
+
+### Scope
+
+Closes the loop #69 section's own deferral above: `execDropCompat`'s combined
+`"operator class"`/`"operator family"` arm never called
+`DropUserOperatorFamily` for a bare family (created via `CREATE OPERATOR
+FAMILY`, no `AS` list, no class) — it only ever mutated the legacy
+`opClassSchemas` map, which is keyed by operator *class* name and therefore
+never matched a class-less family. The family stayed resolvable via
+`LookupUserOperatorFamily`/`pg_opfamily` forever, live/same-session, with no
+restart involved. This loop fixes the live correctness bug and, since the fix
+makes the removal well-defined, adds its WAL/restart persistence in the same
+pass (no reason to split them once the live removal actually happens).
+
+### Design
+
+- `catalog.InMemory.DropUserOperatorFamily` (`internal/catalog/catalog.go`)
+  now also purges every `amOpMembers`/`amProcMembers` row whose `FamilyOID`
+  matches, via a new shared `purgeAmMembersForFamilyLocked` helper — mirrors
+  `DropUserOperatorClass`'s own member purge, needed because a family can own
+  "loose" members added via `ALTER OPERATOR FAMILY ... ADD` with no owning
+  class (`ClassOID` zero).
+- `execDropCompat`'s `"operator family"` case (`internal/executor/operators_ddl.go`)
+  gets its own branch, checked *before* falling through to the legacy
+  `opClassSchemas`/`HasOpClass` path: `LookupUserOperatorFamily` resolves the
+  family by schema/name/method; if found, `DropUserOperatorFamily` removes it
+  and members, WAL-logs the removal, and returns — a same-named class (PG's
+  implicit-family-per-class convention) that only exists in the legacy map
+  still falls through unchanged.
+- New `RecordKindDropOperatorFamily` (92, `internal/wal/recovery.go`) — by
+  OID only, same shape as `RecordKindDropOperatorClass` (loop #69): the live
+  DROP's own name/method resolution and member purge already happened before
+  the WAL append, so replay only needs the OID.
+- `DropUserOperatorFamilyByOIDDuringRecovery` — OID-keyed counterpart, mirrors
+  `DropUserOperatorClassByOIDDuringRecovery`; reuses
+  `purgeAmMembersForFamilyLocked`.
+- `internal/initdb/operator_class_ddl_recovery.go`'s `replayOperatorClassDDLRecords`
+  gets one new `case` for the new kind; `wal.ApplyRecord`'s physical-replay
+  switch adds it to the existing catalog-only-kinds case group (same crash-restart
+  fatal class the loop #69 section's "second bug" fixed — new kinds must be
+  added there too, not just to the initdb driver, or a crash restart with this
+  record still after the last checkpoint hits `unsupported kind 92`).
+
+### Tests
+
+- `internal/executor/create_operator_test.go`:
+  `TestDropOperatorFamilyRemovesFamily` — bare family + a loose
+  `ALTER OPERATOR FAMILY ... ADD` member; confirms both the `pg_opfamily` and
+  `pg_amop` virtual rows empty out after `DROP OPERATOR FAMILY`, and a second
+  drop of the same name 42704s.
+- `internal/wal/operator_class_ddl_test.go`:
+  `TestEncodeDecodeDropOperatorFamilyRoundTrip` + wrong-kind guard.
+- `internal/initdb/operator_class_ddl_recovery_test.go`:
+  `TestOperatorClassDDLRecoveryReplaysDropOperatorFamilyAfterCreate` — full
+  `Init`/`Open`/`WAL.Append`/`Close`/`Open` cycle, CREATE + loose-member ADD +
+  DROP OPERATOR FAMILY cancels out across a restart.
+
+### Gates
+
+`go build ./...` clean; targeted new-test run PASS
+(`internal/wal`+`internal/executor`+`internal/initdb`); full
+`internal/catalog`+`internal/executor`+`internal/wal`+`internal/initdb`
+suites PASS (no regression); `scripts/tpch-spotcheck.sh` PASS.
+
+### Still deferred
+
+Nothing new — this loop fully closes the loop #69 row's own deferral. The
+loop #69 section's other two "Still deferred" bullets (range-type
+`canonical`/`subtype_diff` remainder, `=#=`-operator-symbol note) are
+unrelated and remain as recorded there.

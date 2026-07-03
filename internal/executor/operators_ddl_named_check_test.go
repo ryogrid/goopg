@@ -128,6 +128,195 @@ func TestAlterTableSetDropNotNull(t *testing.T) {
 	}
 }
 
+// TestCreateTableInheritsNotNullConstraintIsNonLocal verifies that a column
+// pulled into a child purely via a plain `INHERITS (parent)` clause (not
+// redeclared in the child's own column list) whose NOT NULL comes from the
+// parent gets conislocal='f'/coninhcount=1 and reuses the PARENT's
+// constraint name — matching real PostgreSQL's MergeAttributes (confirmed
+// against a live PostgreSQL 18.3 instance: `parent_t_id_not_null` appears on
+// BOTH tables, conislocal=t/coninhcount=0 on the parent, conislocal=f/
+// coninhcount=1 on the child). Before this fix goopg always recorded
+// isLocal=true/inhCount=0 for every NOT NULL column regardless of origin,
+// which made pg_dump's shouldPrintColumn/print_notnull (pg_dump.c) treat the
+// purely-inherited column as locally NOT NULL and emit a malformed
+// standalone `NOT NULL id` table element (PG's non-conforming syntax for a
+// LOCAL not-null override on a non-printed inherited column) even though the
+// column is never locally declared at all — real PG emits no such element
+// and lets INHERITS carry the column in unchanged. M0119-0004-ACLHEAP
+// follow-up (M0110-0001 pg_dump catalog-view parity thread).
+func TestCreateTableInheritsNotNullConstraintIsNonLocal(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE parent_t (id integer PRIMARY KEY, name text)`); err != nil {
+		t.Fatalf("CREATE TABLE parent_t: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE child_t (extra text) INHERITS (parent_t)`); err != nil {
+		t.Fatalf("CREATE TABLE child_t: %v", err)
+	}
+
+	parentTbl, ok := cat.LookupTable(parser.ObjectName{Name: "parent_t"})
+	if !ok {
+		t.Fatal("parent_t table not found")
+	}
+	childTbl, ok := cat.LookupTable(parser.ObjectName{Name: "child_t"})
+	if !ok {
+		t.Fatal("child_t table not found")
+	}
+
+	nnFor := func(tbl *catalog.Table, col string) (catalog.NamedNotNullConstraint, bool) {
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, col) {
+				return nc, true
+			}
+		}
+		return catalog.NamedNotNullConstraint{}, false
+	}
+
+	parentNC, ok := nnFor(parentTbl, "id")
+	if !ok {
+		t.Fatalf("parent_t.id should carry a contype='n' constraint (PK implies NOT NULL); got %+v", parentTbl.NotNullConstraints)
+	}
+	if !parentNC.IsLocal || parentNC.InhCount != 0 {
+		t.Errorf("parent_t.id NOT NULL should be conislocal=t/coninhcount=0, got IsLocal=%v InhCount=%d", parentNC.IsLocal, parentNC.InhCount)
+	}
+
+	childNC, ok := nnFor(childTbl, "id")
+	if !ok {
+		t.Fatalf("child_t.id should carry a contype='n' constraint inherited from parent_t; got %+v", childTbl.NotNullConstraints)
+	}
+	if childNC.IsLocal {
+		t.Errorf("child_t.id NOT NULL should be conislocal=f (purely inherited via INHERITS), got IsLocal=true")
+	}
+	if childNC.InhCount != 1 {
+		t.Errorf("child_t.id NOT NULL should be coninhcount=1, got %d", childNC.InhCount)
+	}
+	if childNC.Name != parentNC.Name {
+		t.Errorf("child_t.id NOT NULL constraint name should match the parent's (%q), got %q", parentNC.Name, childNC.Name)
+	}
+
+	// A column the child ALSO declares itself (even one implied NOT NULL by a
+	// child-local PRIMARY KEY) is locally defined (conislocal=t, own name),
+	// but since the INHERITS parent ALSO enforces NOT NULL on it, real PG's
+	// MergeAttributes ("merging column ... with inherited definition") still
+	// counts that parent enforcement: coninhcount=1, not 0 (verified live
+	// against PG 18.3: `child2_t_id_not_null`/conislocal=t/coninhcount=1).
+	if err := runDDL(t, ctx, `CREATE TABLE child2_t (id integer NOT NULL, extra text) INHERITS (parent_t)`); err != nil {
+		t.Fatalf("CREATE TABLE child2_t: %v", err)
+	}
+	child2Tbl, ok := cat.LookupTable(parser.ObjectName{Name: "child2_t"})
+	if !ok {
+		t.Fatal("child2_t table not found")
+	}
+	child2NC, ok := nnFor(child2Tbl, "id")
+	if !ok {
+		t.Fatalf("child2_t.id should carry a contype='n' constraint; got %+v", child2Tbl.NotNullConstraints)
+	}
+	if !child2NC.IsLocal || child2NC.InhCount != 1 {
+		t.Errorf("child2_t.id (locally redeclared, parent also NOT NULL) NOT NULL should be conislocal=t/coninhcount=1, got IsLocal=%v InhCount=%d", child2NC.IsLocal, child2NC.InhCount)
+	}
+}
+
+// TestCreatePartitionChildNotNullConstraintLocality verifies that CREATE TABLE
+// ... PARTITION OF registers a contype='n' pg_constraint row for EVERY NOT
+// NULL column, not just ones explicitly listed in the partition's own
+// column-constraint clause. Verified against live PostgreSQL 18.3:
+//   - A column NOT NULL purely because the parent enforces it (not
+//     re-declared on the partition) reuses the PARENT's constraint name with
+//     conislocal='f'/coninhcount=1.
+//   - A column explicitly re-declared NOT NULL on the partition gets its own
+//     <child>_<col>_not_null name with conislocal='t'; coninhcount is 1 if
+//     the parent also enforces it there, 0 if the parent column is nullable.
+//
+// M0110-0001 (DU-002 partition-child NOT NULL locality).
+func TestCreatePartitionChildNotNullConstraintLocality(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE p (id int NOT NULL, v text) PARTITION BY RANGE (id)`); err != nil {
+		t.Fatalf("CREATE TABLE p: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE p1 PARTITION OF p FOR VALUES FROM (0) TO (100)`); err != nil {
+		t.Fatalf("CREATE TABLE p1: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE p2 (id int, v text) PARTITION BY RANGE (id)`); err != nil {
+		t.Fatalf("CREATE TABLE p2: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE p2a PARTITION OF p2 (v NOT NULL) FOR VALUES FROM (0) TO (100)`); err != nil {
+		t.Fatalf("CREATE TABLE p2a: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE p3 (id int NOT NULL, v text) PARTITION BY RANGE (id)`); err != nil {
+		t.Fatalf("CREATE TABLE p3: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE p3a PARTITION OF p3 (id NOT NULL) FOR VALUES FROM (0) TO (100)`); err != nil {
+		t.Fatalf("CREATE TABLE p3a: %v", err)
+	}
+
+	nnFor := func(tbl *catalog.Table, col string) (catalog.NamedNotNullConstraint, bool) {
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, col) {
+				return nc, true
+			}
+		}
+		return catalog.NamedNotNullConstraint{}, false
+	}
+	lookup := func(name string) *catalog.Table {
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("%s table not found", name)
+		}
+		return tbl
+	}
+
+	pTbl, p1Tbl := lookup("p"), lookup("p1")
+	pNC, ok := nnFor(pTbl, "id")
+	if !ok {
+		t.Fatalf("p.id should carry a contype='n' constraint; got %+v", pTbl.NotNullConstraints)
+	}
+	// Purely inherited (not re-declared on p1): reuse parent's name, non-local.
+	p1NC, ok := nnFor(p1Tbl, "id")
+	if !ok {
+		t.Fatalf("p1.id should carry a contype='n' constraint inherited from p; got %+v", p1Tbl.NotNullConstraints)
+	}
+	if p1NC.IsLocal {
+		t.Errorf("p1.id NOT NULL should be conislocal=f (purely inherited from partition parent), got IsLocal=true")
+	}
+	if p1NC.InhCount != 1 {
+		t.Errorf("p1.id NOT NULL should be coninhcount=1, got %d", p1NC.InhCount)
+	}
+	if p1NC.Name != pNC.Name {
+		t.Errorf("p1.id NOT NULL constraint name should match the parent's (%q), got %q", pNC.Name, p1NC.Name)
+	}
+
+	// Explicitly re-declared on the partition; parent column is nullable:
+	// local, own name, coninhcount=0.
+	p2aTbl := lookup("p2a")
+	p2aNC, ok := nnFor(p2aTbl, "v")
+	if !ok {
+		t.Fatalf("p2a.v should carry a contype='n' constraint; got %+v", p2aTbl.NotNullConstraints)
+	}
+	if !p2aNC.IsLocal || p2aNC.InhCount != 0 {
+		t.Errorf("p2a.v (locally declared, parent nullable) NOT NULL should be conislocal=t/coninhcount=0, got IsLocal=%v InhCount=%d", p2aNC.IsLocal, p2aNC.InhCount)
+	}
+	if p2aNC.Name != "p2a_v_not_null" {
+		t.Errorf("p2a.v NOT NULL constraint should get its own name, got %q", p2aNC.Name)
+	}
+
+	// Explicitly re-declared on the partition; parent ALSO enforces NOT NULL:
+	// local, own name (not the parent's), coninhcount=1.
+	p3aTbl := lookup("p3a")
+	p3aNC, ok := nnFor(p3aTbl, "id")
+	if !ok {
+		t.Fatalf("p3a.id should carry a contype='n' constraint; got %+v", p3aTbl.NotNullConstraints)
+	}
+	if !p3aNC.IsLocal || p3aNC.InhCount != 1 {
+		t.Errorf("p3a.id (locally redeclared, parent also NOT NULL) NOT NULL should be conislocal=t/coninhcount=1, got IsLocal=%v InhCount=%d", p3aNC.IsLocal, p3aNC.InhCount)
+	}
+	if p3aNC.Name != "p3a_id_not_null" {
+		t.Errorf("p3a.id NOT NULL constraint should get its own name (not the parent's), got %q", p3aNC.Name)
+	}
+}
+
 // TestAlterTableAddNotNullNamed verifies that `ALTER TABLE ... ADD CONSTRAINT
 // <name> NOT NULL <col>` marks the column NOT NULL AND records a contype='n'
 // constraint carrying the EXPLICIT name (not the auto-name), with

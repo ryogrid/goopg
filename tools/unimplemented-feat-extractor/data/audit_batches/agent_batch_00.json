@@ -1,0 +1,86 @@
+[
+ {
+  "key": "0a33037e",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
+  "resume_point": ""
+ },
+ {
+  "key": "701bff25",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",
+  "resume_point": ""
+ },
+ {
+  "key": "c241718c",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "Multi-table join planning and execution",
+  "resume_point": ""
+ },
+ {
+  "key": "c241718c",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "GROUP BY clause for row aggregation by column values",
+  "resume_point": ""
+ },
+ {
+  "key": "c241718c",
+  "date": "2026-04-28",
+  "task_id": null,
+  "feature": "HAVING clause for filtering aggregated groups",
+  "resume_point": ""
+ },
+ {
+  "key": "831a2576",
+  "date": "2026-04-29",
+  "task_id": "M0005",
+  "feature": "client_addr plumbing for replication connection tracking.",
+  "resume_point": ""
+ },
+ {
+  "key": "d4f3d52b",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "MESSAGE message type ('M') in pgoutput",
+  "resume_point": ""
+ },
+ {
+  "key": "b890029d",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "ILIKE operator for case-insensitive pattern matching with SQL LIKE semantics",
+  "resume_point": "0003-0011"
+ },
+ {
+  "key": "de0e241f",
+  "date": "2026-05-04",
+  "task_id": "M0030-0005",
+  "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
+  "resume_point": ""
+ },
+ {
+  "key": "6a88492e",
+  "date": "2026-05-06",
+  "task_id": "M0056-followup-multiwriter-flake",
+  "feature": "Investigate and fix intermittent TestMultiWriterStress flake causing ~20% test failures",
+  "resume_point": ""
+ },
+ {
+  "key": "6a88492e",
+  "date": "2026-05-06",
+  "task_id": "M0056-0002",
+  "feature": "Re-enable race condition detector (-race) for concurrent write stress tests",
+  "resume_point": ""
+ },
+ {
+  "key": "6a88492e",
+  "date": "2026-05-06",
+  "task_id": "M0056-0003",
+  "feature": "Remove splitMu lock from btree operations for concurrency optimization",
+  "resume_point": ""
+ }
+]

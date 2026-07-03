@@ -60,14 +60,148 @@ func TestExtractFirstIdentifier(t *testing.T) {
 // dispatch path can fall through cleanly.
 func TestDatabaseDDLCommandTag(t *testing.T) {
 	cases := map[string]string{
-		"CREATE DATABASE tpch":      "CREATE DATABASE",
-		"DROP DATABASE tpch":        "DROP DATABASE",
-		"DROP DATABASE IF EXISTS x": "DROP DATABASE",
-		"SELECT 1":                  "",
+		"CREATE DATABASE tpch":              "CREATE DATABASE",
+		"DROP DATABASE tpch":                "DROP DATABASE",
+		"DROP DATABASE IF EXISTS x":         "DROP DATABASE",
+		"ALTER DATABASE postgres SET a = 1": "ALTER DATABASE",
+		"ALTER DATABASE postgres RESET a":   "ALTER DATABASE",
+		"SELECT 1":                          "",
 	}
 	for sql, want := range cases {
 		if got := databaseDDLCommandTag(sql); got != want {
 			t.Errorf("databaseDDLCommandTag(%q) = %q, want %q", sql, got, want)
+		}
+	}
+}
+
+// TestParseAlterDatabaseConfig pins parseAlterDatabaseConfig's classification
+// of the SET/RESET/RESET ALL forms goopg's parser cannot recognise (ALTER
+// DATABASE requires the literal TABLE keyword — see parseAlter,
+// internal/parser/ddl.go), plus its deliberate rejection of every other
+// ALTER DATABASE sub-form (which must keep falling through to
+// compatNoopCommandTag unchanged). M0119-0004-ACLHEAP (ALTER DATABASE ...
+// SET follow-up).
+func TestParseAlterDatabaseConfig(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want alterDatabaseConfigOp
+		ok   bool
+	}{
+		{
+			sql:  "ALTER DATABASE postgres SET work_mem = '64MB'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			sql:  "alter database postgres set work_mem to '64MB';",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			// unquoted / numeric values are stored verbatim (no quotes to strip).
+			sql:  "ALTER DATABASE postgres SET statement_timeout = 5000",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "statement_timeout", configValue: "5000"},
+			ok:   true,
+		},
+		{
+			// a GUC_LIST_QUOTE-shaped multi-value SET flattens to a comma
+			// join with no per-element quoting (mirrors guc.c
+			// flatten_set_variable_args; the display quoting is pg_dump's
+			// own client-side job, not goopg's).
+			sql:  "ALTER DATABASE postgres SET search_path TO public, pg_catalog",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "search_path", configValue: "public,pg_catalog"},
+			ok:   true,
+		},
+		{
+			// SET ... TO DEFAULT is equivalent to RESET.
+			sql:  "ALTER DATABASE postgres SET work_mem TO DEFAULT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "work_mem", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  `ALTER DATABASE "My DB" SET work_mem = '64MB'`,
+			want: alterDatabaseConfigOp{dbName: "My DB", configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres RESET work_mem",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "work_mem", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres RESET ALL",
+			want: alterDatabaseConfigOp{dbName: "postgres", resetAll: true},
+			ok:   true,
+		},
+		// gram.y set_rest "special syntaxes" — valid inside ALTER DATABASE's
+		// SetResetClause exactly like a plain SET (same grammar production).
+		{
+			sql:  "ALTER DATABASE postgres SET TIME ZONE 'UTC'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "timezone", configValue: "UTC"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET TIME ZONE DEFAULT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "timezone", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET SCHEMA 'app'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "search_path", configValue: "app"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET NAMES 'utf8'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "client_encoding", configValue: "utf8"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET NAMES",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "client_encoding", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET ROLE 'alice'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "role", configValue: "alice"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET SESSION AUTHORIZATION 'alice'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "session_authorization", configValue: "alice"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET SESSION AUTHORIZATION DEFAULT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "session_authorization", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET XML OPTION DOCUMENT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "xmloption", configValue: "DOCUMENT"},
+			ok:   true,
+		},
+		// negatives: unmodelled ALTER DATABASE forms must fall through
+		// unrecognised so the pre-existing compatNoopCommandTag absorption
+		// still handles them.
+		{sql: "ALTER DATABASE postgres CONNECTION LIMIT = 5", ok: false},
+		{sql: "ALTER DATABASE postgres RENAME TO foo", ok: false},
+		{sql: "ALTER DATABASE postgres OWNER TO alice", ok: false},
+		{sql: "ALTER DATABASE postgres IS_TEMPLATE true", ok: false},
+		{sql: "ALTER TABLE t SET (fillfactor = 50)", ok: false},
+		{sql: "SELECT 1", ok: false},
+		{sql: "", ok: false},
+	}
+	for _, c := range cases {
+		got, ok := parseAlterDatabaseConfig(c.sql)
+		if ok != c.ok {
+			t.Errorf("parseAlterDatabaseConfig(%q) ok = %v, want %v (got %+v)", c.sql, ok, c.ok, got)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if got != c.want {
+			t.Errorf("parseAlterDatabaseConfig(%q) = %+v, want %+v", c.sql, got, c.want)
 		}
 	}
 }

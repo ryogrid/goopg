@@ -2021,6 +2021,29 @@ type CompatNoopStmt struct {
 	// so the executor (execCompatNoop → execAttrACLChange) can apply it. Nil for a
 	// table-level (whole-relation) GRANT. M0119-0004-ACLHEAP (attacl half).
 	AttrACL *AttrACLChange
+	// DatabaseACLChange is set for a GRANT/REVOKE … ON DATABASE … statement whose
+	// clause was fully parsed (privileges/names/grantees). Unlike DatabaseACL
+	// (bool, above — used purely for the intra-grant-inplace xmax lock-wait
+	// mechanism), this carries enough detail for the executor
+	// (execCompatNoop → execDatabaseACLChange) to update the OID-keyed ACL store
+	// and re-sync the heap-backed pg_database.datacl row. Nil when the clause
+	// could not be parsed (rare malformed input — falls back to the xmax-only
+	// no-op). M0119-0004-ACLHEAP (datacl half).
+	DatabaseACLChange *DatabaseACLChange
+	// RoleMembership is set for a `GRANT <role> TO <role>`/`REVOKE ... FROM
+	// <role>` role-membership statement (pg_auth_members). Unlike every other
+	// GRANT/REVOKE variant above, role membership has no `ON <object>` clause
+	// at all — that absence is the parser's discriminator for routing here
+	// instead of building DatabaseACL/TableACL/TypeACL/AttrACL. Nil for every
+	// object-privilege GRANT/REVOKE. M0119-0004-ACLHEAP.
+	RoleMembership *RoleMembershipChange
+	// ParameterACLChange is set for a GRANT/REVOKE … ON PARAMETER … statement
+	// whose clause was fully parsed. pg_parameter_acl is goopg-virtual-only
+	// (see ParameterACLChange's own doc) — unlike TypeACL/DatabaseACLChange the
+	// executor (execCompatNoop → execParameterACLChange) applies this directly
+	// to the in-memory ACL store, with no heap row to re-sync. Nil when the
+	// clause could not be parsed. M0119-0004-ACLHEAP (parameter ACL half).
+	ParameterACLChange *ParameterACLChange
 	// Options carries an OPTIONS (name 'value', …) clause as "name=value" elements
 	// for foreign-object DDL (CREATE SERVER, and later FDW / USER MAPPING). The
 	// executor stores them in the catalog's foreign-server registry so pg_dump
@@ -2169,6 +2192,82 @@ type TypeACLChange struct {
 	IsDomain        bool     // ON DOMAIN (vs ON TYPE); both resolve to pg_type
 	Privileges      []string // upper-cased privilege keywords; "ALL" left unexpanded
 	TypeNames       []ObjectName
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+}
+
+// DatabaseACLChange carries the parsed pieces of a GRANT/REVOKE … ON DATABASE …
+// statement so the executor can update the OID-keyed ACL store and re-sync the
+// heap-backed pg_database.datacl row. pg_database is a SHARED (cluster-wide)
+// catalog — a single relfilenode, not duplicated per connected database like
+// pg_type/pg_attribute — so the executor targets it directly with no
+// mirror-to-postgres-DB step. A database's acldefault('d', owner) grants
+// CREATE+TEMPORARY+CONNECT to the owner but only TEMPORARY+CONNECT to PUBLIC
+// (PG withholds CREATE from the PUBLIC default — the one DATABASE-specific
+// asymmetry vs TYPE/FUNCTION's uniform owner==PUBLIC default).
+// M0119-0004-ACLHEAP (datacl half).
+type DatabaseACLChange struct {
+	Revoke          bool     // true for REVOKE, false for GRANT
+	Privileges      []string // upper-cased privilege keywords; "ALL" left unexpanded
+	DatabaseNames   []string
+	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
+	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+}
+
+// RoleMembershipChange carries the parsed pieces of a `GRANT <role>[, ...]
+// TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
+// [{ADMIN|INHERIT|SET} OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED
+// BY <role>] [CASCADE|RESTRICT]` statement, so the executor can update the
+// (roleOID, memberOID)-keyed pg_auth_members registry. M0119-0004-ACLHEAP.
+type RoleMembershipChange struct {
+	Revoke bool // true for REVOKE, false for GRANT
+	// RevokeOption is REVOKE's `{ADMIN|INHERIT|SET} OPTION FOR` prefix
+	// (lower-cased "admin"/"inherit"/"set"), matching PG's ColId OPTION FOR
+	// production (RevokeRoleStmt, gram.y) — only the named option flag is
+	// cleared and the membership row itself survives (DelRoleMems's
+	// RRG_REMOVE_{ADMIN,INHERIT,SET}_OPTION, user.c). "" (the common case)
+	// means no prefix was given: the row is deleted entirely.
+	RevokeOption string
+	// WithAdminOption is GRANT's trailing `WITH ADMIN OPTION` (kept for
+	// backward compatibility; equivalent to AdminOption != nil && *AdminOption).
+	WithAdminOption bool
+	// AdminOption/InheritOption/SetOption are the tri-state values captured
+	// from GRANT's trailing `WITH { ADMIN | INHERIT | SET } { OPTION | TRUE
+	// | FALSE } [, ...]` list (grant_role_opt_list, gram.y). nil means the
+	// option was not named in this statement — PG's GRANT_ROLE_SPECIFIED_*
+	// bitmask unset (user.c) — so an existing pg_auth_members row's value is
+	// left untouched and a fresh row falls back to InitGrantRoleOptions'
+	// defaults. A non-nil pointer is the explicit requested value.
+	AdminOption   *bool
+	InheritOption *bool
+	SetOption     *bool
+	Roles         []string // the role(s) being granted/revoked
+	Grantees      []string // the member role(s) receiving/losing membership
+	GrantedBy     string   // optional explicit grantor; "" = current session role
+	// Cascade is REVOKE's trailing `CASCADE` keyword (RevokeRoleStmt's
+	// opt_drop_behavior, gram.y). false covers both an explicit `RESTRICT`
+	// and the unwritten default, which PG also treats as RESTRICT
+	// (DROP_RESTRICT) — a REVOKE of a membership/ADMIN OPTION that has
+	// dependent grants (grants the revoked member made, as grantor, using
+	// that ADMIN OPTION) errors unless CASCADE is given. Meaningless for
+	// GRANT (never set).
+	Cascade bool
+}
+
+// ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON
+// PARAMETER … statement (pg_parameter_acl, GUC-level ACLs) so the executor
+// can update the synthetic-OID-keyed ACL store. Unlike TypeACLChange/
+// DatabaseACLChange, pg_parameter_acl is a goopg-virtual-only catalog with no
+// heap relfilenode to re-sync (a GUC name is not a real on-disk object the
+// way a type or database row is), so the executor applies the change
+// directly to the in-memory store. ParamNames are raw dotted strings rather
+// than ObjectName — a dot in a GUC name such as "pgaudit.log" is not a schema
+// separator (gram.y's parameter_name production, not qualified_name).
+// M0119-0004-ACLHEAP (parameter ACL half).
+type ParameterACLChange struct {
+	Revoke          bool     // true for REVOKE, false for GRANT
+	Privileges      []string // upper-cased; "SET" | "ALTER SYSTEM" | "ALL"/"ALL PRIVILEGES"
+	ParamNames      []string // lower-cased dotted GUC names
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
 }
@@ -2390,6 +2489,24 @@ type CreateEventTriggerStmt struct {
 
 func (s *CreateEventTriggerStmt) Pos() int  { return s.pos }
 func (s *CreateEventTriggerStmt) stmtNode() {}
+
+// CreateAccessMethodStmt — `CREATE ACCESS METHOD name TYPE {INDEX|TABLE}
+// HANDLER handler_name`.
+//
+// goopg never invokes a user-defined access method (no pluggable table/index
+// storage engine) — this only round-trips the DDL through pg_dump
+// (pg_am virtual view → getAccessMethods/dumpAccessMethod). DU-002
+// (M0119-0004). DROP ACCESS METHOD reuses the generic DropCompatStmt (see
+// execDropCompat's "access method" case).
+type CreateAccessMethodStmt struct {
+	pos         int
+	Name        string
+	AMType      string // "i" (INDEX) or "t" (TABLE) — pg_am.amtype
+	HandlerName ObjectName
+}
+
+func (s *CreateAccessMethodStmt) Pos() int  { return s.pos }
+func (s *CreateAccessMethodStmt) stmtNode() {}
 
 // AlterEventTriggerStmt — one of:
 //
@@ -3051,6 +3168,30 @@ type CreateTypeStmt struct {
 	EnumValues      []string
 	IsComposite     bool
 	CompositeFields []TypeField
+	// IsRange marks `CREATE TYPE name AS RANGE (subtype = ..., ...)`. `subtype`,
+	// `multirange_type_name`, `subtype_opclass`, and `collation` are captured
+	// and applied; `canonical`/`subtype_diff` are parsed (so they don't break
+	// the statement) but not yet applied — they require pre-created shell-type
+	// + function-signature validation support goopg doesn't have yet. DU-002
+	// (M0110-0001, slice 429 follow-up sub-item (a)).
+	IsRange bool
+	// RangeSubtype is the space-joined subtype type-name tokens as written
+	// (e.g. "int4", "timestamp with time zone").
+	RangeSubtype string
+	// RangeMultirangeName is the explicit `multirange_type_name` value's bare
+	// name (schema qualification is dropped; goopg assumes public like its
+	// other user-type registries). Empty means auto-derive from Name, mirroring
+	// PostgreSQL's makeMultirangeTypeName ("range"->"multirange", else append
+	// "_multirange").
+	RangeMultirangeName string
+	// RangeOpclassName is the explicit `subtype_opclass` value's bare name
+	// (schema qualification dropped, same rationale as RangeMultirangeName).
+	// Empty means "resolve the subtype's default btree opclass".
+	RangeOpclassName string
+	// RangeCollationName is the explicit `collation` value's bare name (schema
+	// qualification dropped). Empty means "use the subtype's own default
+	// collation" (or InvalidOid for a non-collatable subtype).
+	RangeCollationName string
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }

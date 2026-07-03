@@ -1,0 +1,86 @@
+[
+ {
+  "key": "8adfaae2",
+  "date": "2026-06-16",
+  "task_id": "DU-002",
+  "feature": "The 1-byte 'char' type (OID 18) cannot be disambiguated from bpchar because the parser folds both to the same internal representation",
+  "resume_point": "Modify parser to distinguish literal 'char' from bpchar during type parsing"
+ },
+ {
+  "key": "fa14f0f3",
+  "date": "2026-06-17",
+  "task_id": "M0110-0001",
+  "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
+  "resume_point": ""
+ },
+ {
+  "key": "fa14f0f3",
+  "date": "2026-06-17",
+  "task_id": "M0110-0001",
+  "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",
+  "resume_point": ""
+ },
+ {
+  "key": "3153507b",
+  "date": "2026-06-17",
+  "task_id": "M0110-0001",
+  "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",
+  "resume_point": ""
+ },
+ {
+  "key": "2f300f0c",
+  "date": "2026-06-17",
+  "task_id": "DU-002 slice 183",
+  "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",
+  "resume_point": ""
+ },
+ {
+  "key": "d31a1d99",
+  "date": "2026-06-19",
+  "task_id": "M0110-0001",
+  "feature": "Autovacuum functionality is not implemented; autovacuum_vacuum_scale_factor values are stored and dumped for compatibility but do not trigger automatic vacuuming",
+  "resume_point": ""
+ },
+ {
+  "key": "9164e87f",
+  "date": "2026-06-20",
+  "task_id": "M0110-0001",
+  "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
+  "resume_point": ""
+ },
+ {
+  "key": "d792e1ab",
+  "date": "2026-06-30",
+  "task_id": "DU-002-378",
+  "feature": "Persistent storage of server definitions (currently in-memory only)",
+  "resume_point": ""
+ },
+ {
+  "key": "46e70c85",
+  "date": "2026-06-30",
+  "task_id": "DU-002-376",
+  "feature": "Persistent storage of server definitions (currently in-memory only)",
+  "resume_point": ""
+ },
+ {
+  "key": "cc080cb3",
+  "date": "2026-06-30",
+  "task_id": "DU-002-374",
+  "feature": "Typed table support for composite types in non-public schemas",
+  "resume_point": ""
+ },
+ {
+  "key": "252f7d36",
+  "date": "2026-06-30",
+  "task_id": "DU-002",
+  "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",
+  "resume_point": "slice 365"
+ },
+ {
+  "key": "9b414709",
+  "date": "2026-06-30",
+  "task_id": "DU-002-380",
+  "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",
+  "resume_point": ""
+ }
+]

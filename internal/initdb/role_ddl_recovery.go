@@ -47,6 +47,17 @@ func replayRoleDDLRecords(walDir string, cat catalog.Catalog) error {
 		if len(rec.Payload) == 0 {
 			continue
 		}
+		if len(rec.Payload) == 88 {
+			// PG checkpoint records are a fixed 88-byte CheckPoint struct
+			// with no leading kind-tag byte at all (wal.classifyXLogRecord
+			// dispatches on length alone, format.go:234) — Payload[0] here
+			// is just the low byte of the record's redo-LSN field, which
+			// can coincidentally equal any RecordKind constant (discovered
+			// via a real collision with RecordKindAlterRoleRename=72 on
+			// the long-lived TPC-H bench WAL). Skip rather than risk
+			// misdecoding a checkpoint as role DDL.
+			continue
+		}
 		switch rec.Payload[0] {
 		case wal.RecordKindRoleState:
 			p, derr := wal.DecodeRoleState(rec.Payload)
@@ -70,6 +81,12 @@ func replayRoleDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-role at lsn %d: %w", rec.StartLSN, derr)
 			}
 			im.UnregisterRole(name)
+		case wal.RecordKindAlterRoleRename:
+			name, newName, derr := wal.DecodeAlterRoleRename(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-role-rename at lsn %d: %w", rec.StartLSN, derr)
+			}
+			im.RenameRole(name, newName)
 		}
 	}
 	return nil

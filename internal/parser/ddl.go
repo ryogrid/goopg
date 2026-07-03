@@ -126,6 +126,20 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		return p.parseCreateEventTriggerTail(t.Pos)
+	// CREATE ACCESS METHOD name TYPE {INDEX|TABLE} HANDLER handler_name —
+	// register in the runtime pg_am registry so pg_dump round-trips it
+	// (getAccessMethods/dumpAccessMethod). DU-002 (M0119-0004). "ACCESS" is
+	// unreserved and unregistered as a keyword, matched via the ident path
+	// like "event"/"collation"; DROP ACCESS METHOD already parses generically
+	// (internal/parser/ddl.go's ident-DROP-target list).
+	case p.acceptIdentKeyword("access"):
+		if unlogged || orReplace {
+			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED / OR REPLACE not valid for CREATE ACCESS METHOD"}
+		}
+		if !p.acceptIdentKeyword("method") {
+			return nil, p.errAtCur("expected METHOD after ACCESS")
+		}
+		return p.parseCreateAccessMethodTail(t.Pos)
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFunction:
 		if unlogged {
 			return nil, &SyntaxError{Pos: t.Pos, Message: "UNLOGGED is not valid for CREATE FUNCTION"}
@@ -305,6 +319,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		if ns, ok := stmt.(*CompatNoopStmt); ok {
+			ns.Tag = "CREATE OPERATOR"
 			ns.ObjType = "operator"
 			ns.ObjName = ObjectName{Name: opName.Name, Schema: opName.Schema}
 			ns.ArgTypes = []string{leftArg, rightArg}
@@ -353,6 +368,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		if ns, ok := stmt.(*CompatNoopStmt); ok && tsType != "" {
+			ns.Tag = "CREATE " + strings.ToUpper(tsType)
 			ns.ObjType = tsType
 			ns.ObjName = tsName
 		}
@@ -410,7 +426,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			}
 			p.advance()
 		}
-		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "server", ObjName: name}
+		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SERVER", ObjType: "server", ObjName: name}
 		if fdwName.Name != "" {
 			ns.TableName = fdwName // reuse TableName field to store FDW association
 		}
@@ -428,7 +444,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, p.errAtCur("expected MAPPING after CREATE USER")
 		}
 		userName, srvName, umOptions := p.scanUserMappingForServer()
-		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "user mapping", ObjName: ObjectName{Name: userName}}
+		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE USER MAPPING", ObjType: "user mapping", ObjName: ObjectName{Name: userName}}
 		ns.TableName = ObjectName{Name: srvName} // reuse TableName for the server association
 		ns.Options = umOptions
 		return ns, nil
@@ -464,7 +480,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 				}
 				p.advance()
 			}
-			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "foreign-data wrapper", ObjName: name}
+			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name}
 			ns.Options = options
 			return ns, nil
 		}
@@ -1279,6 +1295,7 @@ func (p *parser) parseCreateOpFamilyTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	if ns, ok := stmt.(*CompatNoopStmt); ok {
+		ns.Tag = "CREATE OPERATOR FAMILY"
 		ns.ObjType = "operator family"
 		ns.ObjName = name
 		ns.OpFamilyMethod = method
@@ -1972,6 +1989,7 @@ func (p *parser) parseCreateConversionTail(pos int, isDefault bool) (Stmt, error
 		return nil, err
 	}
 	if ns, ok := stmt.(*CompatNoopStmt); ok {
+		ns.Tag = "CREATE CONVERSION"
 		ns.ObjType = "conversion"
 		ns.ObjName = convName
 		ns.ConvForEncoding = forEnc.Value
@@ -2184,6 +2202,45 @@ func (p *parser) parseCreateEventTriggerTail(pos int) (Stmt, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("event trigger functions take no arguments")
 	}
+	return stmt, nil
+}
+
+// parseCreateAccessMethodTail picks up after CREATE ACCESS METHOD.
+// Grammar (postgres/src/backend/parser/gram.y CreateAmStmt):
+//
+//	name TYPE_P {INDEX | TABLE} HANDLER handler_name
+//
+// handler_name is a plain (possibly schema-qualified) function name with no
+// parenthesized arg list — PostgreSQL resolves it via LookupFuncName against
+// the fixed one-argument-of-type-internal handler signature (amcmds.c
+// lookup_am_handler_func), mirrored by resolveAccessMethodHandlerFunc in the
+// executor.
+func (p *parser) parseCreateAccessMethodTail(pos int) (Stmt, error) {
+	stmt := &CreateAccessMethodStmt{pos: pos}
+	name, err := p.parseIdent()
+	if err != nil {
+		return nil, p.errAtCur("expected access method name after CREATE ACCESS METHOD")
+	}
+	stmt.Name = name.Value
+	if !p.acceptIdentKeyword("type") {
+		return nil, p.errAtCur("expected TYPE in CREATE ACCESS METHOD")
+	}
+	switch {
+	case p.acceptKeyword(KwIndex):
+		stmt.AMType = "i"
+	case p.acceptKeyword(KwTable):
+		stmt.AMType = "t"
+	default:
+		return nil, p.errAtCur("expected INDEX or TABLE in CREATE ACCESS METHOD")
+	}
+	if !p.acceptIdentKeyword("handler") {
+		return nil, p.errAtCur("expected HANDLER in CREATE ACCESS METHOD")
+	}
+	handlerName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.HandlerName = handlerName
 	return stmt, nil
 }
 
@@ -6903,7 +6960,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
 	}
 	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
 	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply
@@ -7987,6 +8044,79 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 		return stmt, nil
 	}
 	if !p.acceptIdentKeyword("enum") {
+		// AS RANGE ( subtype = ..., multirange_type_name = ..., ... ) — range
+		// type. `subtype`, `multirange_type_name`, `subtype_opclass`, and
+		// `collation` are captured; `canonical`/`subtype_diff` are consumed so
+		// the statement still parses but are not yet applied (DU-002,
+		// M0110-0001, slice 429 follow-up sub-item (a)).
+		if p.acceptIdentKeyword("range") {
+			stmt.IsRange = true
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '(' after RANGE")
+			}
+			for {
+				if p.cur().Kind != TokenIdent {
+					break
+				}
+				key := strings.ToLower(p.advance().Value)
+				if c := p.cur(); (c.Kind == TokenSymbol || c.Kind == TokenOperator) && c.Value == "=" {
+					p.advance()
+				} else {
+					return nil, p.errAtCur("expected '=' in range type option")
+				}
+				switch key {
+				case "multirange_type_name":
+					mrName, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.RangeMultirangeName = mrName.Name
+				case "subtype_opclass":
+					ocName, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.RangeOpclassName = ocName.Name
+				case "collation":
+					collName, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.RangeCollationName = collName.Name
+				default:
+					// Collect value tokens until a top-level ',' or ')', tracking
+					// paren depth so a typmod-bearing subtype (e.g. numeric(10,2))
+					// stays intact. Mirrors the composite-field type collector above.
+					var valueParts []string
+					parenDepth := 0
+					for p.cur().Kind != TokenEOF {
+						tok := p.cur()
+						if tok.Kind == TokenSymbol && parenDepth == 0 &&
+							(tok.Value == "," || tok.Value == ")") {
+							break
+						}
+						if tok.Kind == TokenSymbol && tok.Value == "(" {
+							parenDepth++
+						} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+							parenDepth--
+						}
+						valueParts = append(valueParts, tok.Value)
+						p.advance()
+					}
+					if key == "subtype" {
+						stmt.RangeSubtype = strings.Join(valueParts, " ")
+					}
+				}
+				if p.acceptSymbol(",") {
+					continue
+				}
+				break
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after RANGE option list")
+			}
+			return stmt, nil
+		}
 		// AS ( ... ) — composite type with field list.
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance() // consume '('

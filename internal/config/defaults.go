@@ -833,6 +833,16 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSuset,
 		Scope:   ScopeSession,
 	}))
+	// log_line_prefix: PGC_SIGHUP in upstream (guc_tables.c) — config-file
+	// only, never client-SET-able, unlike log_statement/log_min_duration_statement
+	// above. goopg's statement/duration log lines
+	// (internal/server/statement_log.go) expand the %m/%p/%u/%d/%a/%x subset
+	// of PG's escape set against it; BootVal mirrors upstream's own default.
+	r.MustRegister(NewVariable(Variable{
+		Name: "log_line_prefix", Type: TypeString, BootVal: "%m [%p] ",
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
 
 	// default_statistics_target is read by ANALYZE clients to
 	// gauge sample sizes; pgAdmin / DBeaver inspect it on

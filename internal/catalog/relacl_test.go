@@ -51,6 +51,28 @@ func TestRoleNameForOID(t *testing.T) {
 	}
 }
 
+// TestRoleNameForOIDOrUnknown pins pg_get_userbyid's exact PG fallback text
+// ("unknown (OID=n)"), distinct from RoleNameForOID's bare-numeral fallback
+// which serves a different internal caller (ACL-text rendering).
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestRoleNameForOIDOrUnknown(t *testing.T) {
+	c := NewInMemory()
+	if got := c.RoleNameForOIDOrUnknown(10); got != "postgres" {
+		t.Errorf("RoleNameForOIDOrUnknown(10) = %q, want \"postgres\"", got)
+	}
+	c.RegisterRole("paramgrantee")
+	oid, ok := c.RoleOID("paramgrantee")
+	if !ok || oid == 0 {
+		t.Fatalf("RoleOID(paramgrantee) = %d, %v; want a non-zero OID", oid, ok)
+	}
+	if got := c.RoleNameForOIDOrUnknown(oid); got != "paramgrantee" {
+		t.Errorf("RoleNameForOIDOrUnknown(%d) = %q, want \"paramgrantee\"", oid, got)
+	}
+	if got := c.RoleNameForOIDOrUnknown(4242); got != "unknown (OID=4242)" {
+		t.Errorf("RoleNameForOIDOrUnknown(4242) = %q, want \"unknown (OID=4242)\"", got)
+	}
+}
+
 // TestRelaclText pins the pg_class.relacl projection that lets a table-level
 // GRANT round-trip through pg_dump (DU-002 slice 331). PostgreSQL leaves relacl
 // NULL until the first GRANT, then materializes an aclitem[] with the owner's
@@ -295,6 +317,114 @@ func TestNamespaceACLText(t *testing.T) {
 	want = "{postgres=UC/postgres,=U/postgres}"
 	if got := c.NamespaceACLText(pubSchemaOID); got != want {
 		t.Fatalf("nspacl after GRANT USAGE TO PUBLIC = %q; want %q", got, want)
+	}
+}
+
+// TestForeignServerACLText pins the pg_foreign_server.srvacl projection that
+// lets a `GRANT … ON FOREIGN SERVER …` round-trip through pg_dump (DU-002
+// slice 427). A foreign server's owner default is "U" (USAGE only), which
+// pg_dump diffs against via acldefault('S', owner); unlike a function/type, a
+// foreign server grants PUBLIC nothing by default (world default
+// ACL_NO_RIGHTS), so no implicit PUBLIC entry appears unless a GRANT … TO
+// PUBLIC is recorded explicitly. Foreign servers share the OID-keyed ACL store
+// with relations/schemas/routines/types, so the same GrantTablePrivilege*
+// recorders apply.
+func TestForeignServerACLText(t *testing.T) {
+	c := NewInMemory()
+	const srvOID = 16900
+
+	// No grants → NULL srvacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ForeignServerACLText(srvOID); got != "" {
+		t.Fatalf("srvacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE materializes the owner entry ("U") plus the grantee ("U").
+	c.GrantTablePrivilege(srvOID, "srv_role", "USAGE")
+	want := "{postgres=U/postgres,srv_role=U/postgres}"
+	if got := c.ForeignServerACLText(srvOID); got != want {
+		t.Fatalf("srvacl after GRANT USAGE = %q; want %q", got, want)
+	}
+
+	// A grant-option USAGE renders "U*".
+	const goSrvOID = 16901
+	c.GrantTablePrivilegeWithGrantOption(goSrvOID, "srv_role", "USAGE", true)
+	want = "{postgres=U/postgres,srv_role=U*/postgres}"
+	if got := c.ForeignServerACLText(goSrvOID); got != want {
+		t.Fatalf("srvacl after GRANT USAGE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+
+	// GRANT … ON FOREIGN SERVER … TO PUBLIC materializes the empty grantee.
+	const pubSrvOID = 16902
+	c.GrantTablePrivilege(pubSrvOID, "PUBLIC", "USAGE")
+	want = "{postgres=U/postgres,=U/postgres}"
+	if got := c.ForeignServerACLText(pubSrvOID); got != want {
+		t.Fatalf("srvacl after GRANT USAGE TO PUBLIC = %q; want %q", got, want)
+	}
+
+	// REVOKE ALL ON FOREIGN SERVER FROM postgres: materialize the owner default
+	// ("U"), then drop it → srvacl is the empty array "{}", NOT NULL (mirrors
+	// TestRevokeAllFromSchemaOwnerEmptyArray's MaterializeOwnerACL →
+	// RevokeTablePrivilege sequence, only with the foreign-server owner-default
+	// set).
+	const revSrvOID = 16903
+	c.MaterializeOwnerACL(revSrvOID, "postgres", []string{"USAGE"})
+	c.RevokeTablePrivilege(revSrvOID, "postgres", "USAGE")
+	want = "{}"
+	if got := c.ForeignServerACLText(revSrvOID); got != want {
+		t.Fatalf("srvacl after owner REVOKE ALL = %q; want %q", got, want)
+	}
+}
+
+// TestForeignDataWrapperACLText pins the pg_foreign_data_wrapper.fdwacl
+// projection that lets a `GRANT … ON FOREIGN DATA WRAPPER …` round-trip
+// through pg_dump (DU-002 slice 428). An FDW's owner default is "U" (USAGE
+// only), which pg_dump diffs against via acldefault('F', owner); like a
+// foreign server, an FDW grants PUBLIC nothing by default (world default
+// ACL_NO_RIGHTS), so no implicit PUBLIC entry appears unless a GRANT … TO
+// PUBLIC is recorded explicitly. FDWs share the OID-keyed ACL store with
+// relations/schemas/routines/types/foreign servers, so the same
+// GrantTablePrivilege* recorders apply.
+func TestForeignDataWrapperACLText(t *testing.T) {
+	c := NewInMemory()
+	const fdwOID = 16910
+
+	// No grants → NULL fdwacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ForeignDataWrapperACLText(fdwOID); got != "" {
+		t.Fatalf("fdwacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE materializes the owner entry ("U") plus the grantee ("U").
+	c.GrantTablePrivilege(fdwOID, "fdw_role", "USAGE")
+	want := "{postgres=U/postgres,fdw_role=U/postgres}"
+	if got := c.ForeignDataWrapperACLText(fdwOID); got != want {
+		t.Fatalf("fdwacl after GRANT USAGE = %q; want %q", got, want)
+	}
+
+	// A grant-option USAGE renders "U*".
+	const goFdwOID = 16911
+	c.GrantTablePrivilegeWithGrantOption(goFdwOID, "fdw_role", "USAGE", true)
+	want = "{postgres=U/postgres,fdw_role=U*/postgres}"
+	if got := c.ForeignDataWrapperACLText(goFdwOID); got != want {
+		t.Fatalf("fdwacl after GRANT USAGE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+
+	// GRANT … ON FOREIGN DATA WRAPPER … TO PUBLIC materializes the empty grantee.
+	const pubFdwOID = 16912
+	c.GrantTablePrivilege(pubFdwOID, "PUBLIC", "USAGE")
+	want = "{postgres=U/postgres,=U/postgres}"
+	if got := c.ForeignDataWrapperACLText(pubFdwOID); got != want {
+		t.Fatalf("fdwacl after GRANT USAGE TO PUBLIC = %q; want %q", got, want)
+	}
+
+	// REVOKE ALL ON FOREIGN DATA WRAPPER FROM postgres: materialize the owner
+	// default ("U"), then drop it → fdwacl is the empty array "{}", NOT NULL
+	// (mirrors TestForeignServerACLText's owner REVOKE ALL case).
+	const revFdwOID = 16913
+	c.MaterializeOwnerACL(revFdwOID, "postgres", []string{"USAGE"})
+	c.RevokeTablePrivilege(revFdwOID, "postgres", "USAGE")
+	want = "{}"
+	if got := c.ForeignDataWrapperACLText(revFdwOID); got != want {
+		t.Fatalf("fdwacl after owner REVOKE ALL = %q; want %q", got, want)
 	}
 }
 
@@ -1090,4 +1220,176 @@ func TestAttrACLGranteeNameRendering(t *testing.T) {
 			t.Fatalf("attacl for an unsafe-char grantee = %q; want %q", got, want)
 		}
 	})
+}
+
+// TestDatabaseACLText pins the pg_database.datacl projection that the
+// GRANT-on-DATABASE round-trip needs (M0119-0004-ACLHEAP, datacl half). A
+// database's acldefault('d', owner) is "{postgres=CTc/postgres,=Tc/postgres}"
+// — the owner holds CREATE+TEMPORARY+CONNECT but PUBLIC holds only
+// TEMPORARY+CONNECT (PG withholds CREATE from the PUBLIC default) — the one
+// DATABASE-specific asymmetry vs a type/function's uniform owner==PUBLIC
+// default (TestTypeACLText). pg_dump's getDatabases diffs the materialized
+// datacl against acldefault('d', datdba) and re-emits the GRANT for the new
+// grantee only. Unlike proacl this text must additionally be written back
+// into the heap-backed pg_database row by the GRANT path (a SHARED catalog,
+// unlike per-database pg_type); this test pins only the renderer half.
+func TestDatabaseACLText(t *testing.T) {
+	c := NewInMemory()
+	const dbOID = 16700 // a database OID distinct from the routine/relation tests
+
+	// No grants → NULL datacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.DatabaseACLText(dbOID); got != "" {
+		t.Fatalf("datacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT CREATE … TO a grantee seeds the implicit PUBLIC TEMPORARY+CONNECT
+	// default plus the grantee's CREATE; the owner entry is rendered from the
+	// owner-default string "CTc". Grantees render in GRANT order (PUBLIC
+	// granted first, then grantee_db) with the owner pulled to the head,
+	// mirroring the typacl projection.
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
+	c.GrantTablePrivilege(dbOID, "grantee_db", "CREATE")
+	want := "{postgres=CTc/postgres,=Tc/postgres,grantee_db=C/postgres}"
+	if got := c.DatabaseACLText(dbOID); got != want {
+		t.Fatalf("datacl after GRANT CREATE TO grantee_db = %q; want %q", got, want)
+	}
+
+	// A non-database keyword renders nothing for that grantee
+	// (relaclTextLockedFor skips letters outside databaseACLPrivOrder).
+	c.GrantTablePrivilege(dbOID, "noise_role", "SELECT")
+	if got := c.DatabaseACLText(dbOID); got != want {
+		t.Fatalf("datacl must ignore a non-database privilege: got %q; want %q", got, want)
+	}
+}
+
+// TestDatabaseACLRevokeFromOwner pins the owner-side database REVOKE. A
+// database's acldefault('d', owner) grants the FULL CTc set to the owner but
+// only the reduced Tc set to PUBLIC — the asymmetric-default counterpart of
+// TestTypeACLRevokeFromOwner. Revoking just the owner's CREATE leaves the
+// owner's remaining TEMPORARY+CONNECT explicit, alongside PUBLIC's untouched
+// implicit default.
+func TestDatabaseACLRevokeFromOwner(t *testing.T) {
+	c := NewInMemory()
+	const dbOID = 16701
+
+	c.MaterializeOwnerACL(dbOID, "postgres", []string{"CREATE", "TEMPORARY", "CONNECT"})
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "TEMPORARY")
+	c.GrantTablePrivilege(dbOID, "PUBLIC", "CONNECT")
+	c.RevokeTablePrivilege(dbOID, "postgres", "CREATE")
+	want := "{postgres=Tc/postgres,=Tc/postgres}"
+	if got := c.DatabaseACLText(dbOID); got != want {
+		t.Fatalf("datacl after REVOKE CREATE FROM postgres = %q; want %q", got, want)
+	}
+}
+
+// TestParameterACLOID pins the lazy synthetic-OID minting: the same
+// (case-folded) parname always returns the same OID, and distinct names get
+// distinct OIDs, mirroring PostgreSQL's ParameterAclLookup/ParameterAclCreate.
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestParameterACLOID(t *testing.T) {
+	c := NewInMemory()
+
+	oid1 := c.ParameterACLOID("work_mem")
+	oid1Again := c.ParameterACLOID("work_mem")
+	if oid1 != oid1Again {
+		t.Fatalf("ParameterACLOID(\"work_mem\") not idempotent: %d then %d", oid1, oid1Again)
+	}
+	// Case-folding: convert_GUC_name_for_parameter_acl lower-cases the name,
+	// so a differently-cased spelling resolves to the same OID.
+	if oid := c.ParameterACLOID("Work_Mem"); oid != oid1 {
+		t.Fatalf("ParameterACLOID(\"Work_Mem\") = %d, want %d (case-folded match)", oid, oid1)
+	}
+	oid2 := c.ParameterACLOID("statement_timeout")
+	if oid2 == oid1 {
+		t.Fatalf("ParameterACLOID(\"statement_timeout\") collided with work_mem's OID %d", oid1)
+	}
+}
+
+// TestHasParameterACL pins the ParameterAclLookup(missing_ok=true) analogue:
+// false before any ParameterACLOID call for a name, true after — including
+// case-folded lookups — and never mutates state (unlike ParameterACLOID).
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestHasParameterACL(t *testing.T) {
+	c := NewInMemory()
+
+	if c.HasParameterACL("work_mem") {
+		t.Fatalf("HasParameterACL(\"work_mem\") = true on a fresh catalog, want false")
+	}
+	c.ParameterACLOID("work_mem")
+	if !c.HasParameterACL("work_mem") {
+		t.Fatalf("HasParameterACL(\"work_mem\") = false after ParameterACLOID minted it")
+	}
+	if !c.HasParameterACL("Work_Mem") {
+		t.Fatalf("HasParameterACL(\"Work_Mem\") = false, want true (case-folded match)")
+	}
+	if c.HasParameterACL("statement_timeout") {
+		t.Fatalf("HasParameterACL(\"statement_timeout\") = true, want false (never minted)")
+	}
+}
+
+// TestParameterACLText mirrors TestDatabaseACLText/TestTypeACLText for the
+// parameter (pg_parameter_acl) ACL projection. Unlike DATABASE, PUBLIC's
+// acldefault('p', …) is ACL_NO_RIGHTS — no implicit PUBLIC seed — so only the
+// owner and named grantee(s) appear. M0119-0004-ACLHEAP (parameter ACL half).
+func TestParameterACLText(t *testing.T) {
+	c := NewInMemory()
+	oid := c.ParameterACLOID("work_mem")
+
+	// No grants → NULL paracl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ParameterACLText(oid); got != "" {
+		t.Fatalf("paracl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	c.GrantTablePrivilege(oid, "grantee_p", "SET")
+	want := "{postgres=sA/postgres,grantee_p=s/postgres}"
+	if got := c.ParameterACLText(oid); got != want {
+		t.Fatalf("paracl after GRANT SET TO grantee_p = %q; want %q", got, want)
+	}
+
+	// A non-parameter keyword renders nothing for that grantee
+	// (relaclTextLockedFor skips letters outside parameterACLPrivOrder).
+	c.GrantTablePrivilege(oid, "noise_role", "SELECT")
+	if got := c.ParameterACLText(oid); got != want {
+		t.Fatalf("paracl must ignore a non-parameter privilege: got %q; want %q", got, want)
+	}
+}
+
+// TestParameterACLRevokeFromOwner pins the owner-side REVOKE, the parameter
+// analogue of TestTypeACLRevokeFromOwner/TestDatabaseACLRevokeFromOwner.
+func TestParameterACLRevokeFromOwner(t *testing.T) {
+	c := NewInMemory()
+	oid := c.ParameterACLOID("statement_timeout")
+
+	c.MaterializeOwnerACL(oid, "postgres", []string{"SET", "ALTER SYSTEM"})
+	c.RevokeTablePrivilege(oid, "postgres", "ALTER SYSTEM")
+	want := "{postgres=s/postgres}"
+	if got := c.ParameterACLText(oid); got != want {
+		t.Fatalf("paracl after REVOKE \"ALTER SYSTEM\" FROM postgres = %q; want %q", got, want)
+	}
+}
+
+// TestParameterACLEntries pins the VirtualRows source: only parameters that
+// have ever received a synthetic OID (via ParameterACLOID) appear, sorted by
+// parname — mirroring pg_dumpall's `ORDER BY 1` over pg_parameter_acl.
+// M0119-0004-ACLHEAP (parameter ACL half).
+func TestParameterACLEntries(t *testing.T) {
+	c := NewInMemory()
+	if got := c.ParameterACLEntries(); len(got) != 0 {
+		t.Fatalf("ParameterACLEntries on a fresh catalog = %v, want empty", got)
+	}
+	oidWM := c.ParameterACLOID("work_mem")
+	oidST := c.ParameterACLOID("statement_timeout")
+
+	got := c.ParameterACLEntries()
+	if len(got) != 2 {
+		t.Fatalf("ParameterACLEntries len = %d, want 2: %+v", len(got), got)
+	}
+	// Sorted by parname: "statement_timeout" < "work_mem".
+	if got[0].Parname != "statement_timeout" || got[0].OID != oidST {
+		t.Errorf("entry[0] = %+v, want {OID:%d Parname:statement_timeout}", got[0], oidST)
+	}
+	if got[1].Parname != "work_mem" || got[1].OID != oidWM {
+		t.Errorf("entry[1] = %+v, want {OID:%d Parname:work_mem}", got[1], oidWM)
+	}
 }

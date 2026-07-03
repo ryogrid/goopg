@@ -1,0 +1,86 @@
+[
+ {
+  "key": "8135c313",
+  "date": "2026-05-10",
+  "task_id": "M0076-0002",
+  "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
+  "resume_point": ""
+ },
+ {
+  "key": "639272a7",
+  "date": "2026-05-10",
+  "task_id": "M0075",
+  "feature": "SeqScanOp predicate batch wiring (vectorized predicate evaluation in sequential scan)",
+  "resume_point": ""
+ },
+ {
+  "key": "639272a7",
+  "date": "2026-05-10",
+  "task_id": "M0075",
+  "feature": "Datum struct flip (packed layout reorganization across 37 call sites including detoast/spill/COPY paths)",
+  "resume_point": ""
+ },
+ {
+  "key": "82d7acff",
+  "date": "2026-05-11",
+  "task_id": null,
+  "feature": "M0091 performance goal (TPS ≥ 1,000) remains unmet after optimization attempts. Further performance work is filed as a candidate for M0093.",
+  "resume_point": ""
+ },
+ {
+  "key": "3bdc1adc",
+  "date": "2026-05-11",
+  "task_id": "m0091-0001",
+  "feature": "Spill-path hooks closure-capture optimization (cold-path, left unoptimized)",
+  "resume_point": ""
+ },
+ {
+  "key": "da7224d7",
+  "date": "2026-05-11",
+  "task_id": null,
+  "feature": "Runtime SET for track_io_timing GUC is not yet wired. Currently only static session-level configuration via postgresql.conf is supported.",
+  "resume_point": ""
+ },
+ {
+  "key": "4e621c58",
+  "date": "2026-05-11",
+  "task_id": null,
+  "feature": "PostgreSQL features pg_multixact, pg_twophase, and pg_commit_ts are not implemented at the executor level and therefore have no WAL persistence",
+  "resume_point": ""
+ },
+ {
+  "key": "54f53d49",
+  "date": "2026-05-11",
+  "task_id": "m0093-0002",
+  "feature": "Wire MaterializeWriterXID at UPSERT update branch to assign eager XIDs for insert-or-update operations.",
+  "resume_point": ""
+ },
+ {
+  "key": "5c341923",
+  "date": "2026-05-11",
+  "task_id": "m0091",
+  "feature": "Client-driven Pool/Manager/AIO hooks optimization (larger refactor scope deferred from M0091)",
+  "resume_point": ""
+ },
+ {
+  "key": "5c341923",
+  "date": "2026-05-11",
+  "task_id": "m0091",
+  "feature": "Spill-path per-row lookups optimization (cold path, dropped from scope)",
+  "resume_point": ""
+ },
+ {
+  "key": "57458755",
+  "date": "2026-05-11",
+  "task_id": "m0089-0002",
+  "feature": "Audit of dirty-tracking behavior in Pool.PinNew and Extend operations to identify buffer durability issues",
+  "resume_point": "docs/design/0089-0002-buffer-pool-dirty-tracking-on-extend.md"
+ },
+ {
+  "key": "c2a33ef5",
+  "date": "2026-05-11",
+  "task_id": "M0092-0008",
+  "feature": "Plan cache implementation is deferred. Design document M0092-0008 explains why a plan cache won't help pgbench with client-side literal substitution patterns.",
+  "resume_point": ""
+ }
+]

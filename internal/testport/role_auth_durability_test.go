@@ -140,11 +140,25 @@ func TestPort_CreateRoleSurvivesRestart(t *testing.T) {
 	if err := runSQLSimple(t, c, "ALTER ROLE wpuser PASSWORD 'rotated-secret'"); err != nil {
 		t.Fatalf("ALTER ROLE PASSWORD: %v", err)
 	}
+	// (e) ALTER ROLE ... RENAME TO is durable too (root-0021 follow-up):
+	// rename norole, restart, and confirm the new name carries the old
+	// role's attributes forward while the old name is gone.
+	if err := runSQLSimple(t, c, "ALTER ROLE norole RENAME TO renamed_role"); err != nil {
+		t.Fatalf("ALTER ROLE RENAME TO: %v", err)
+	}
 	if err := c.Stop(cluster.ShutdownFast); err != nil {
 		t.Fatalf("stop cluster (2): %v", err)
 	}
 	if err := c.Start(); err != nil {
 		t.Fatalf("restart cluster (2): %v", err)
+	}
+	if got := queryScalar(t, c,
+		"SELECT count(*) FROM pg_roles WHERE rolname = 'norole'"); got != "0" {
+		t.Fatalf("post-restart old role name count = %q, want 0 (RENAME TO not durable)", got)
+	}
+	if got := queryScalar(t, c,
+		"SELECT rolcanlogin FROM pg_roles WHERE rolname = 'renamed_role'"); got != "f" {
+		t.Fatalf("post-restart pg_roles.rolcanlogin(renamed_role) = %q, want f (renamed role lost attrs)", got)
 	}
 	host, port, err := splitHostPort(c.ListenAddr())
 	if err != nil {

@@ -78,6 +78,17 @@ type Config struct {
 	// slog.Default().
 	Logger *slog.Logger
 
+	// LogStatement controls per-statement query logging, mirroring
+	// PostgreSQL's log_statement GUC: "none" (default), "ddl", "mod",
+	// or "all". Every received statement whose kind matches the level is
+	// emitted to Logger before execution (successful statements too), with
+	// the SQL text and, when inside an explicit transaction, the xid — so a
+	// verification run can capture exactly which queries a client issued.
+	// Driven by the GOOPG_LOG_STATEMENT environment variable (cmd/goopg).
+	// An empty or unrecognised value is treated as "none". See
+	// docs/design/root-0023-statement-query-logging.md.
+	LogStatement string
+
 	// AcceptDeadline bounds Accept() so the goroutine can notice context
 	// cancellation. Defaults to 250ms; tests can shrink it.
 	AcceptDeadline time.Duration
@@ -337,11 +348,18 @@ type Server struct {
 	// PREPARED can finalise it from ANY backend. Always non-nil. M0118-0009
 	// (stats — cross-backend two-phase commit).
 	preparedXacts *preparedXactStore
+
+	// logStmtLevel is cfg.LogStatement parsed once at construction. It
+	// gates the per-statement query log emitted from the simple and
+	// extended dispatch paths (statement_log.go). logStmtNone (the
+	// default) makes logStatement a cheap no-op.
+	logStmtLevel logStatementLevel
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
 func New(cfg Config) *Server {
 	cfg.defaults()
+	lvl, ok := parseLogStatementLevel(cfg.LogStatement)
 	s := &Server{
 		cfg:           cfg,
 		ready:         make(chan struct{}),
@@ -349,6 +367,13 @@ func New(cfg Config) *Server {
 		roles:         map[string]struct{}{"postgres": {}},
 		notify:        newNotifyHub(),
 		preparedXacts: newPreparedXactStore(),
+		logStmtLevel:  lvl,
+	}
+	if !ok {
+		cfg.Logger.Warn("unrecognised GOOPG_LOG_STATEMENT value; statement logging disabled",
+			"value", cfg.LogStatement, "expected", "none|ddl|mod|all")
+	} else if lvl != logStmtNone {
+		cfg.Logger.Info("statement logging enabled", "log_statement", strings.ToLower(strings.TrimSpace(cfg.LogStatement)))
 	}
 	// Seed the connection-time role set from the catalog role registry, which
 	// initdb.Open restored from the pg_authid heap + role WAL records

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/protocol"
@@ -58,6 +59,19 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	}
 
+	// Per-statement query logging (GOOPG_LOG_STATEMENT). Logged here — the
+	// earliest point the full simple-query string is known, before routing to
+	// the string-match path, the CREATE/DROP DATABASE|ROLE intercepts, or the
+	// executor — mirroring PostgreSQL's exec_simple_query, which logs before
+	// parse. No-op when logging is disabled. root-0023.
+	stmtStart := time.Now()
+	wasLogged := s.logStatement("simple", trimmed, sess, connTx)
+	// `log_min_duration_statement` (check_log_duration, postgres.c): timed
+	// across every return path below via defer, since handleQuery's
+	// string-match fast paths and the executor dispatch each return
+	// independently. root-0023 follow-up.
+	defer s.logDuration(stmtStart, wasLogged, "simple", trimmed, sess, connTx)
+
 	matchable := strings.TrimRight(trimmed, ";")
 	matchable = strings.TrimSpace(matchable)
 
@@ -83,7 +97,27 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// row; execCompatNoop updates the OID-keyed ACL store and rewrites the
 	// pg_type row. Exclude it from the server GRANT/REVOKE fast path so it falls
 	// through. M0119-0004-ACLHEAP.
-	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ")
+	// `GRANT/REVOKE … ON DATABASE …` changes pg_database.datacl, also heap-backed
+	// (a SHARED cluster-wide catalog), so it must run through the executor
+	// alongside TYPE/DOMAIN rather than the server's own ACL fast path below
+	// (which only records the virtually-served relation/schema/function ACLs).
+	// "database" is already excluded from that fast path's actual recording via
+	// nonTableGrantObjects (grant_ddl.go), but without this the fast path still
+	// short-circuits with an empty no-op "GRANT"/"REVOKE" completion before the
+	// executor ever sees the statement, so execDatabaseACLChange never ran for a
+	// single-statement autocommit GRANT ON DATABASE. M0119-0004-ACLHEAP (datacl
+	// half).
+	// `GRANT/REVOKE … ON PARAMETER …` changes pg_parameter_acl. It is a
+	// goopg-virtual-only catalog (no heap row to re-sync), but like role
+	// membership the server's virtual-ACL fast path below has no model for
+	// it (tryRecordTableGrant/tryRecordTableRevoke's nonTableGrantObjects
+	// already excludes "parameter" from being recorded there, but without
+	// this it would still short-circuit to an empty no-op completion before
+	// the executor ever sees the statement) — route it to the executor
+	// alongside TYPE/DOMAIN/DATABASE instead. M0119-0004-ACLHEAP (parameter
+	// ACL half).
+	isHeapACLObject := strings.Contains(upper, " ON TYPE ") || strings.Contains(upper, " ON DOMAIN ") ||
+		strings.Contains(upper, " ON DATABASE ") || strings.Contains(upper, " ON PARAMETER ")
 	// A column-level GRANT/REVOKE — `GRANT <priv>(<cols>) ON [TABLE] <name> …` —
 	// changes pg_attribute.attacl, which is heap-backed like pg_type.typacl, so it
 	// too must run through the executor (where an *executor.Context re-syncs the heap
@@ -94,6 +128,17 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		if lp := strings.IndexByte(upper, '('); lp >= 0 && lp < onPos {
 			isHeapACLObject = true
 		}
+	}
+	// GRANT/REVOKE role membership (`GRANT <role> TO <role>`) has no `ON
+	// <object>` clause at all — the discriminator vs. every privilege-GRANT
+	// variant above, which all require one. It changes pg_auth_members, which
+	// the server's virtual-ACL fast path below does not model
+	// (tryRecordTableGrant/tryRecordTableRevoke, grant_ddl.go, both bail
+	// immediately on a missing " on "), so it must run through the executor
+	// (execCompatNoop → execRoleMembershipChange) where the parser's
+	// RoleMembershipChange is available. M0119-0004-ACLHEAP.
+	if !strings.Contains(upper, " ON ") {
+		isHeapACLObject = true
 	}
 
 	// A single-statement, autocommit table-level GRANT is recorded in the

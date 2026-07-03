@@ -177,8 +177,73 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 		t.Errorf("pg_roles col1=%s want rolname", roles.Columns[1].Name)
 	}
 	rrows := roles.VirtualRows()
-	if len(rrows) != 1 || rrows[0][0] != "10" || rrows[0][1] != "postgres" {
-		t.Errorf("pg_roles rows=%v want one (10, postgres, t, t)", rrows)
+	// 1 bootstrap superuser + PG18's 16 built-in "pg_*" predefined roles
+	// (M0119-0004-ACLHEAP: pg_authid/pg_roles predefined-role rows).
+	if len(rrows) != 17 || rrows[0][0] != "10" || rrows[0][1] != "postgres" {
+		t.Errorf("pg_roles rows=%v want 17 (10,postgres,t,t first)", rrows)
+	}
+	foundPredefined := false
+	for _, r := range rrows {
+		if r[1] == "pg_read_all_data" {
+			foundPredefined = true
+			if r[2] != "f" || r[3] != "f" {
+				t.Errorf("pg_roles pg_read_all_data row=%v want rolsuper=f rolcanlogin=f", r)
+			}
+		}
+	}
+	if !foundPredefined {
+		t.Errorf("pg_roles rows=%v missing predefined role pg_read_all_data", rrows)
+	}
+}
+
+// TestPgAuthidExposesPredefinedRoles pins the M0119-0004-ACLHEAP follow-up
+// (0119-0004ch ledger discovery (a)): pg_dumpall's dumpRoleMembership query
+// LEFT JOINs pg_roles to resolve a pg_auth_members row's role/member OID back
+// to a name, then does `WHERE NOT (ur.rolname ~ '^pg_' AND um.rolname ~
+// '^pg_')` to skip predefined-role-to-predefined-role memberships. Before
+// this fix pg_authid/pg_roles projected only c.roles (user-created roles),
+// so `ur.rolname`/`um.rolname` came back NULL for any predefined grantee —
+// `NOT (NULL AND ...)` is NULL, which pg_dumpall's WHERE treats as
+// false, silently dropping a real `GRANT pg_read_all_data TO alice`
+// membership row from the dump output.
+func TestPgAuthidExposesPredefinedRoles(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterRole("alice")
+
+	authid, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_authid"})
+	if !ok {
+		t.Fatal("pg_authid not registered")
+	}
+	rows := authid.VirtualRows()
+
+	// bootstrap superuser + alice + 16 predefined pg_* roles.
+	if len(rows) != 18 {
+		t.Fatalf("pg_authid rows=%d want 18 (1 postgres + 1 alice + 16 predefined)", len(rows))
+	}
+
+	var predefinedOID string
+	for _, r := range rows {
+		if r[1] == "pg_read_all_data" {
+			predefinedOID = r[0]
+			if r[2] != "f" { // rolsuper
+				t.Errorf("pg_read_all_data rolsuper=%s want f", r[2])
+			}
+			if r[3] != "t" { // rolinherit
+				t.Errorf("pg_read_all_data rolinherit=%s want t", r[3])
+			}
+			if r[6] != "f" { // rolcanlogin
+				t.Errorf("pg_read_all_data rolcanlogin=%s want f", r[6])
+			}
+			if r[9] != "-1" { // rolconnlimit
+				t.Errorf("pg_read_all_data rolconnlimit=%s want -1", r[9])
+			}
+			if r[10] != VirtualNull { // rolpassword
+				t.Errorf("pg_read_all_data rolpassword=%s want NULL", r[10])
+			}
+		}
+	}
+	if predefinedOID != "6181" {
+		t.Errorf("pg_read_all_data oid=%s want 6181 (fixed pg_authid.dat OID)", predefinedOID)
 	}
 }
 

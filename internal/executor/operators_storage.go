@@ -821,16 +821,27 @@ type seqScanOp struct {
 	// attrACLColIdx is -1 for every non-pg_attribute scan (the common case → no-op).
 	attrACLCat    *catalog.InMemory
 	attrACLColIdx int
+
+	// dbACLCat / dbACLColIdx drive the pg_database.datacl heap-decode override
+	// (M0119-0004-ACLHEAP, datacl half) — the database analogue of the typacl
+	// hook above. A `GRANT … ON DATABASE …` stores datacl as a PG-native
+	// _aclitem binary blob (KindBytes); when scanning pg_database this hook
+	// renders it to canonical aclitemout text so pg_dump's getDatabases reads
+	// the granted database ACL. dbACLColIdx is -1 for every non-pg_database
+	// scan (the common case → no-op).
+	dbACLCat    *catalog.InMemory
+	dbACLColIdx int
 }
 
-// renderHeapACLColumnInto renders a heap-backed ACL column — pg_type.typacl or
-// pg_attribute.attacl, stored as a PG-native _aclitem blob (KindBytes) — to
-// canonical aclitemout text in place. The seqScanOp.Next() hot path renders these
-// inline with a pre-resolved column index; this shared variant covers the
-// index-scan path so pg_dump reads the same text regardless of which plan a
-// catalog query picks (getTypes seq-scans pg_type; getColumnACLs index-scans
-// pg_attribute by attrelid). A no-op for non-catalog tables, a non-InMemory
-// catalog, and a NULL ACL column. M0119-0004-ACLHEAP.
+// renderHeapACLColumnInto renders a heap-backed ACL column — pg_type.typacl,
+// pg_attribute.attacl, or pg_database.datacl — stored as a PG-native _aclitem
+// blob (KindBytes) — to canonical aclitemout text in place. The
+// seqScanOp.Next() hot path renders these inline with a pre-resolved column
+// index; this shared variant covers the index-scan path so pg_dump reads the
+// same text regardless of which plan a catalog query picks (getTypes
+// seq-scans pg_type; getColumnACLs index-scans pg_attribute by attrelid). A
+// no-op for non-catalog tables, a non-InMemory catalog, and a NULL ACL
+// column. M0119-0004-ACLHEAP.
 func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []catalog.Column, row Row) {
 	if tbl == nil {
 		return
@@ -841,6 +852,8 @@ func renderHeapACLColumnInto(cat catalog.Catalog, tbl *catalog.Table, cols []cat
 		aclName = "typacl"
 	case catalog.AttributeRelationId:
 		aclName = "attacl"
+	case catalog.PgDatabaseRelationOID:
+		aclName = "datacl"
 	default:
 		return
 	}
@@ -1072,6 +1085,26 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			}
 			if o.attrACLColIdx >= 0 {
 				o.attrACLCat = im
+			}
+		}
+	}
+	// M0119-0004-ACLHEAP (datacl half): arm the pg_database.datacl heap-decode
+	// override only when scanning the heap-backed pg_database catalog. Resolved
+	// once here (column positions are stable) so Next() does a single bool/index
+	// check per row. The blob is written by a `GRANT … ON DATABASE …`
+	// (execDatabaseACLChange → resyncDatabaseACLHeapRow) and rendered back to
+	// canonical aclitemout text here.
+	o.dbACLColIdx = -1
+	if o.tbl != nil && o.tbl.OID == catalog.PgDatabaseRelationOID {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for i, col := range o.cols {
+				if col.Name == "datacl" {
+					o.dbACLColIdx = i
+					break
+				}
+			}
+			if o.dbACLColIdx >= 0 {
+				o.dbACLCat = im
 			}
 		}
 	}
@@ -1547,6 +1580,17 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				if d := row[o.attrACLColIdx]; d.Kind == KindBytes {
 					if txt, derr := decodeAclItemArrayText(d.BytesValue(), o.attrACLCat.RoleNameForOID); derr == nil {
 						row[o.attrACLColIdx] = NewStringDatum(txt)
+					}
+				}
+			}
+			// M0119-0004-ACLHEAP (datacl half): the sibling pg_database.datacl
+			// render — same KindBytes _aclitem decode, written by a
+			// `GRANT … ON DATABASE …`. Dormant for a NULL datacl and every
+			// non-pg_database scan (-1).
+			if o.dbACLColIdx >= 0 && o.dbACLColIdx < len(row) {
+				if d := row[o.dbACLColIdx]; d.Kind == KindBytes {
+					if txt, derr := decodeAclItemArrayText(d.BytesValue(), o.dbACLCat.RoleNameForOID); derr == nil {
+						row[o.dbACLColIdx] = NewStringDatum(txt)
 					}
 				}
 			}

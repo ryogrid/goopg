@@ -1,0 +1,86 @@
+[
+ {
+  "key": "f4de6953",
+  "date": "2026-04-29",
+  "task_id": "m0005",
+  "feature": "Multi-timeline WAL operations are not implemented",
+  "resume_point": ""
+ },
+ {
+  "key": "2af68607",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
+  "resume_point": "Pool-level page-pin/page-read instrumentation"
+ },
+ {
+  "key": "d257314b",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "Support for EXPLAIN FORMAT XML and FORMAT YAML options to output query plans in XML or YAML format.",
+  "resume_point": ""
+ },
+ {
+  "key": "23f510e4",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "Per-CTE execution statistics tracking in PostgreSQL's pg_stat_* system catalogs for individual CTE performance visibility.",
+  "resume_point": ""
+ },
+ {
+  "key": "0b26cf92",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "DELETE row identification when pgoutput emits empty K body; row identity unavailable for xmax stamping",
+  "resume_point": ""
+ },
+ {
+  "key": "d4f3d52b",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "UPDATE reorder-buffer fold to combine paired HeapDelete+HeapInsert into single UPDATE message",
+  "resume_point": ""
+ },
+ {
+  "key": "1adc44ac",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "Per-slot catalog-xmin retention hook in vacuum and pruning operations",
+  "resume_point": ""
+ },
+ {
+  "key": "f02f0d9d",
+  "date": "2026-04-29",
+  "task_id": null,
+  "feature": "HammerDB Power Test at Scale Factor 1.",
+  "resume_point": ""
+ },
+ {
+  "key": "c1f21e41",
+  "date": "2026-04-29",
+  "task_id": "M0014-0002",
+  "feature": "Conversion of XLogRecord headers from legacy 8-byte length+CRC32-IEEE format to PostgreSQL's upstream XLogRecord format for full WAL compatibility.",
+  "resume_point": "M0014-0002 step 2"
+ },
+ {
+  "key": "be11f589",
+  "date": "2026-04-29",
+  "task_id": "M0018-0003",
+  "feature": "EXPLAIN SUMMARY option rendering to display summary statistics; currently parsed but produces no output.",
+  "resume_point": "M0018-0003"
+ },
+ {
+  "key": "be11f589",
+  "date": "2026-04-29",
+  "task_id": "M0018-0004",
+  "feature": "EXPLAIN SETTINGS option rendering to display configuration settings; currently parsed but produces no output.",
+  "resume_point": "M0018-0004"
+ },
+ {
+  "key": "e49ec60d",
+  "date": "2026-04-29",
+  "task_id": "m0009",
+  "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
+  "resume_point": ""
+ }
+]

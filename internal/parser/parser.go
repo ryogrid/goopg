@@ -331,6 +331,271 @@ func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 	return tac
 }
 
+// buildDatabaseACLChange parses the token run of a GRANT/REVOKE … ON DATABASE …
+// statement into a DatabaseACLChange, mirroring buildTypeACLChange's shape.
+// toks is every token after the GRANT/REVOKE keyword with the trailing ';'
+// excluded. Returns nil when any required list is empty (an unparseable form
+// the caller leaves as the pre-existing xmax-only no-op).
+// M0119-0004-ACLHEAP (datacl half).
+func buildDatabaseACLChange(revoke bool, toks []Token) *DatabaseACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+2 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 2 // skip the ON and the DATABASE keyword
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	dac := &DatabaseACLChange{
+		Revoke:          revoke,
+		Privileges:      splitTokPrivileges(toks[:onIdx]),
+		DatabaseNames:   splitTokRoles(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(dac.Privileges) == 0 || len(dac.DatabaseNames) == 0 || len(dac.Grantees) == 0 {
+		return nil
+	}
+	return dac
+}
+
+// splitTokDottedNames renders each comma-separated run as a single joined
+// string, preserving embedded "." separators verbatim rather than splitting
+// into schema/name (GUC parameter names may themselves be dotted, e.g.
+// "pgaudit.log" — gram.y's parameter_name production, not qualified_name).
+// Quoting is stripped per token and the result lower-cased, mirroring
+// PostgreSQL's convert_GUC_name_for_parameter_acl (guc.c) case-folding.
+// M0119-0004-ACLHEAP (parameter ACL half).
+func splitTokDottedNames(toks []Token) []string {
+	var out []string
+	for _, run := range splitTokRuns(toks) {
+		var b strings.Builder
+		for _, tk := range run {
+			b.WriteString(strings.Trim(tk.Value, `"`))
+		}
+		if s := b.String(); s != "" {
+			out = append(out, strings.ToLower(s))
+		}
+	}
+	return out
+}
+
+// buildParameterACLChange parses the token run of a GRANT/REVOKE … ON
+// PARAMETER … statement into a ParameterACLChange, mirroring
+// buildDatabaseACLChange's shape. toks is every token after the GRANT/REVOKE
+// keyword with the trailing ';' already excluded. Returns nil when any
+// required list is empty (an unparseable form the caller leaves as a
+// successful no-op). M0119-0004-ACLHEAP (parameter ACL half).
+func buildParameterACLChange(revoke bool, toks []Token) *ParameterACLChange {
+	onIdx := tokIndexOf(toks, 0, "on")
+	if onIdx < 0 || onIdx+2 > len(toks) {
+		return nil
+	}
+	nameStart := onIdx + 2 // skip the ON and the PARAMETER keyword
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, nameStart, sep)
+	if sepIdx < 0 || sepIdx < nameStart {
+		return nil
+	}
+	roleStart := sepIdx + 1
+	roleEnd := len(toks)
+	withGrantOption := false
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+			}
+			roleEnd = i
+		case "granted", "cascade", "restrict":
+			roleEnd = i
+		default:
+			continue
+		}
+		break
+	}
+	pac := &ParameterACLChange{
+		Revoke:          revoke,
+		Privileges:      splitTokPrivileges(toks[:onIdx]),
+		ParamNames:      splitTokDottedNames(toks[nameStart:sepIdx]),
+		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
+		WithGrantOption: withGrantOption,
+	}
+	if len(pac.Privileges) == 0 || len(pac.ParamNames) == 0 || len(pac.Grantees) == 0 {
+		return nil
+	}
+	return pac
+}
+
+// buildRoleMembershipChange parses the token run of a `GRANT <role>[, ...]
+// TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
+// [{ADMIN|INHERIT|SET} OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED
+// BY <role>] [CASCADE|RESTRICT]` statement into a RoleMembershipChange. toks
+// is every token after the GRANT/REVOKE keyword with the trailing ';'
+// excluded. The caller only reaches this builder when no "on" token appeared
+// anywhere in the statement — every privilege-GRANT variant requires one, so
+// its absence is the discriminator. Returns nil when either role list is
+// empty (an unparseable form the caller leaves as a successful no-op).
+// M0119-0004-ACLHEAP.
+func buildRoleMembershipChange(revoke bool, toks []Token) *RoleMembershipChange {
+	start := 0
+	revokeOption := ""
+	if revoke && len(toks) >= 3 &&
+		strings.EqualFold(toks[1].Value, "option") &&
+		strings.EqualFold(toks[2].Value, "for") {
+		// REVOKE's `ColId OPTION FOR` prefix (gram.y): ColId is any
+		// identifier, but pg_auth_members only recognizes these three —
+		// GrantRole (user.c) raises "unrecognized role option" for anything
+		// else. goopg mirrors only the recognized set; an unrecognized
+		// leading word falls through untouched (treated as the start of the
+		// role list, matching the pre-existing lenient-parse posture of this
+		// builder for other unparseable forms).
+		switch strings.ToLower(toks[0].Value) {
+		case "admin", "inherit", "set":
+			revokeOption = strings.ToLower(toks[0].Value)
+			start = 3
+		}
+	}
+	sep := "to"
+	if revoke {
+		sep = "from"
+	}
+	sepIdx := tokIndexOf(toks, start, sep)
+	if sepIdx < 0 || sepIdx <= start {
+		return nil
+	}
+	granteeStart := sepIdx + 1
+	granteeEnd := len(toks)
+	var adminOpt, inheritOpt, setOpt *bool
+	grantedBy := ""
+	cascade := false
+	for i := granteeStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			// GRANT's trailing `WITH { ADMIN | INHERIT | SET } { OPTION |
+			// TRUE | FALSE } [, ...]` list (grant_role_opt_list, gram.y).
+			// REVOKE has no WITH clause, so this only fires for GRANT.
+			// End the grantee list here and resume scanning (for a
+			// following GRANTED BY) right after the option list.
+			granteeEnd = i
+			var next int
+			adminOpt, inheritOpt, setOpt, next = parseGrantRoleOptList(toks, i+1)
+			i = next - 1
+			continue
+		case "granted":
+			// GRANTED BY <role> — record the explicit grantor and end the
+			// grantee list, then resume scanning (REVOKE's opt_drop_behavior,
+			// gram.y, follows opt_granted_by — a trailing CASCADE/RESTRICT
+			// can still appear after GRANTED BY <role>).
+			if granteeEnd > i {
+				granteeEnd = i
+			}
+			if i+2 < len(toks) && strings.EqualFold(toks[i+1].Value, "by") {
+				grantedBy = strings.Trim(toks[i+2].Value, `"`)
+				i += 2
+			}
+			continue
+		case "cascade", "restrict":
+			cascade = strings.EqualFold(toks[i].Value, "cascade")
+			if granteeEnd > i {
+				granteeEnd = i
+			}
+		default:
+			continue
+		}
+		break
+	}
+	rmc := &RoleMembershipChange{
+		Revoke:          revoke,
+		RevokeOption:    revokeOption,
+		WithAdminOption: adminOpt != nil && *adminOpt,
+		AdminOption:     adminOpt,
+		InheritOption:   inheritOpt,
+		SetOption:       setOpt,
+		Roles:           splitTokRoles(toks[start:sepIdx]),
+		Grantees:        splitTokRoles(toks[granteeStart:granteeEnd]),
+		GrantedBy:       grantedBy,
+		Cascade:         cascade,
+	}
+	if len(rmc.Roles) == 0 || len(rmc.Grantees) == 0 {
+		return nil
+	}
+	return rmc
+}
+
+// parseGrantRoleOptList parses grant_role_opt_list (gram.y): a comma-separated
+// run of `{ ADMIN | INHERIT | SET } { OPTION | TRUE | FALSE }` pairs starting
+// at toks[from] (already past the WITH keyword). Returns the tri-state
+// admin/inherit/set pointers (nil = that option never appeared in the list)
+// and the index of the first unconsumed token (e.g. "granted"/"cascade", or
+// len(toks) at end of input). M0119-0004-ACLHEAP.
+func parseGrantRoleOptList(toks []Token, from int) (admin, inherit, set *bool, next int) {
+	i := from
+	for i < len(toks) {
+		optName := strings.ToLower(toks[i].Value)
+		if optName != "admin" && optName != "inherit" && optName != "set" {
+			break
+		}
+		if i+1 >= len(toks) {
+			break
+		}
+		var val bool
+		switch strings.ToLower(toks[i+1].Value) {
+		case "option", "true":
+			val = true
+		case "false":
+			val = false
+		default:
+			return admin, inherit, set, i
+		}
+		v := val
+		switch optName {
+		case "admin":
+			admin = &v
+		case "inherit":
+			inherit = &v
+		case "set":
+			set = &v
+		}
+		i += 2
+		if i < len(toks) && toks[i].Kind == TokenSymbol && toks[i].Value == "," {
+			i++
+			continue
+		}
+		break
+	}
+	return admin, inherit, set, i
+}
+
 // grantHasColumnList reports whether the GRANT/REVOKE token run carries a
 // parenthesised column list BEFORE the ON keyword — the signature of a
 // column-level grant (`GRANT SELECT (a, b) ON TABLE t …`). A function grant's
@@ -798,12 +1063,25 @@ identLedStatement:
 			// full clause is captured (toks) and parsed into CompatNoopStmt.TypeACL
 			// for the executor to apply (M0119-0004-ACLHEAP).
 			typeClass := ""
+			// parameterACL is true for `ON PARAMETER <names>` — a GUC-level ACL
+			// (pg_parameter_acl). Unlike TYPE/DOMAIN/DATABASE, pg_parameter_acl is
+			// goopg-virtual-only (no heap relfilenode to re-sync), but it still needs
+			// the executor's *Context to reach the ACL store, so the clause is
+			// captured here exactly like the heap-backed classes.
+			// M0119-0004-ACLHEAP (parameter ACL half).
+			parameterACL := false
+			// sawOn is true the moment ANY "on" token appears anywhere in the
+			// statement -- the discriminator between every privilege-GRANT variant
+			// above (which all require an ON <object> clause) and role membership
+			// (GRANT <role> TO <role>, which never has one). M0119-0004-ACLHEAP.
+			sawOn := false
 			var toks []Token
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
 				if strings.EqualFold(p.cur().Value, "on") {
+					sawOn = true
 					next := p.peek(1)
 					switch {
 					case strings.EqualFold(next.Value, "database"):
@@ -817,6 +1095,9 @@ identLedStatement:
 					case strings.EqualFold(next.Value, "domain"):
 						// `ON DOMAIN <names>` — also a pg_type row (typtype='d').
 						typeClass = "domain"
+					case strings.EqualFold(next.Value, "parameter"):
+						// `ON PARAMETER <names>` — GUC-level ACL (captured below).
+						parameterACL = true
 					case grantNonTableClass(next.Value):
 						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
 					default:
@@ -830,6 +1111,22 @@ identLedStatement:
 			ns := &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}
 			if typeClass != "" {
 				ns.TypeACL = buildTypeACLChange(strings.EqualFold(t.Value, "revoke"), typeClass == "domain", toks)
+			} else if databaseACL {
+				// `GRANT/REVOKE … ON DATABASE …` also changes pg_database.datacl,
+				// heap-backed exactly like pg_type.typacl — capture the full clause
+				// so execDatabaseACLChange can apply it. DatabaseACL (bool) above is
+				// left set unconditionally: it independently drives the
+				// intra-grant-inplace xmax lock-wait mechanism (design 0118-0098),
+				// which is unrelated to whether the clause parsed cleanly here.
+				// M0119-0004-ACLHEAP (datacl half).
+				ns.DatabaseACLChange = buildDatabaseACLChange(strings.EqualFold(t.Value, "revoke"), toks)
+			} else if parameterACL {
+				// `GRANT/REVOKE … ON PARAMETER …` — pg_parameter_acl is
+				// goopg-virtual-only, so unlike TYPE/DATABASE there is no heap row to
+				// re-sync; the executor (execParameterACLChange) applies the change
+				// directly to the in-memory ACL store. M0119-0004-ACLHEAP (parameter
+				// ACL half).
+				ns.ParameterACLChange = buildParameterACLChange(strings.EqualFold(t.Value, "revoke"), toks)
 			} else if grantHasColumnList(toks) {
 				// A column-level GRANT/REVOKE targets pg_attribute.attacl (heap-backed),
 				// not the whole-relation pg_class.relacl. Capture the parsed clause for
@@ -839,6 +1136,14 @@ identLedStatement:
 					ns.AttrACL = aac
 					ns.TableACL = ""
 				}
+			} else if !sawOn {
+				// No `ON <object>` clause anywhere in the statement — the
+				// role-membership form (`GRANT <role> TO <role>`/`REVOKE ...
+				// FROM <role>`), a distinct capability from every
+				// object-privilege GRANT/REVOKE above. Unparseable input (e.g.
+				// PG's `GRANT <role> TO PUBLIC`, always rejected by PG itself)
+				// falls back to the pre-existing no-op. M0119-0004-ACLHEAP.
+				ns.RoleMembership = buildRoleMembershipChange(strings.EqualFold(t.Value, "revoke"), toks)
 			}
 			return ns, nil
 		case "comment":

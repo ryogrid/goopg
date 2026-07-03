@@ -107,7 +107,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// database in pg_database / can connect to it, and (b) emit a
 		// WAL record so the registration survives a crash. Other
 		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, notice, herr := s.tryHandleDatabaseDDL(sql); handled {
+		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName); handled {
 			if herr != nil {
 				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
 			}
@@ -133,9 +133,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Peel the leading role statement off, handle it, then recurse on the
 		// remainder so every statement runs. M0118-0008.
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
-			if handled, herr := s.tryHandleRoleDDL(first); handled {
+			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName); handled {
 				if herr != nil {
-					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 				}
 				normFirst := normalizeCompatSQL(first)
 				tag := "CREATE ROLE"
@@ -150,9 +150,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
-		if handled, herr := s.tryHandleRoleDDL(sql); handled {
+		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName); handled {
 			if herr != nil {
-				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 			}
 			norm := normalizeCompatSQL(sql)
 			var tag string
@@ -2296,6 +2296,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "ALTER STATISTICS"
 	case *parser.AlterOpFamilyAddStmt, *parser.AlterOpFamilyDropStmt:
 		return "ALTER OPERATOR FAMILY"
+	case *parser.CreateOpClassStmt:
+		return "CREATE OPERATOR CLASS"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {
@@ -2304,7 +2306,48 @@ func ddlTag(stmt parser.Stmt) string {
 	if _, ok := stmt.(*parser.CommentOnStmt); ok {
 		return "COMMENT"
 	}
+	if dc, ok := stmt.(*parser.DropCompatStmt); ok {
+		if tag, ok := dropCompatTags[dc.ObjType]; ok {
+			return tag
+		}
+	}
 	return "OK"
+}
+
+// dropCompatTags maps a DropCompatStmt's ObjType (see parser.DropCompatStmt)
+// to PostgreSQL's real CommandComplete tag
+// (postgres/src/include/tcop/cmdtaglist.h). DROP ROLE/USER/GROUP all parse
+// into the same DropRoleStmt node in real PG and share the CMDTAG_DROP_ROLE
+// tag regardless of the surface keyword used (utility.c CreateCommandTag),
+// so "group"/"role"/"user" all map to "DROP ROLE" here too.
+var dropCompatTags = map[string]string{
+	"database":                  "DROP DATABASE",
+	"foreign table":             "DROP FOREIGN TABLE",
+	"foreign-data wrapper":      "DROP FOREIGN DATA WRAPPER",
+	"user mapping":              "DROP USER MAPPING",
+	"aggregate":                 "DROP AGGREGATE",
+	"operator class":            "DROP OPERATOR CLASS",
+	"operator family":           "DROP OPERATOR FAMILY",
+	"operator":                  "DROP OPERATOR",
+	"text search dictionary":    "DROP TEXT SEARCH DICTIONARY",
+	"text search parser":        "DROP TEXT SEARCH PARSER",
+	"text search template":      "DROP TEXT SEARCH TEMPLATE",
+	"text search configuration": "DROP TEXT SEARCH CONFIGURATION",
+	"cast":                      "DROP CAST",
+	"transform":                 "DROP TRANSFORM",
+	"sequence":                  "DROP SEQUENCE",
+	"schema":                    "DROP SCHEMA",
+	"collation":                 "DROP COLLATION",
+	"materialized view":         "DROP MATERIALIZED VIEW",
+	"extension":                 "DROP EXTENSION",
+	"server":                    "DROP SERVER",
+	"language":                  "DROP LANGUAGE",
+	"access method":             "DROP ACCESS METHOD",
+	"event trigger":             "DROP EVENT TRIGGER",
+	"group":                     "DROP ROLE",
+	"role":                      "DROP ROLE",
+	"user":                      "DROP ROLE",
+	"conversion":                "DROP CONVERSION",
 }
 
 func utilityTag(stmt parser.Stmt) string {

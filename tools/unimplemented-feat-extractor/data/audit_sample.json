@@ -1,0 +1,86 @@
+[
+ {
+  "n": 1,
+  "feature": "Boolean equality operators booleq and boolne implemented as stubs returning hardcoded values instead of performing actual boolean comparisons",
+  "task_id": null,
+  "date": "2026-05-12",
+  "confidence": "medium"
+ },
+ {
+  "n": 2,
+  "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
+  "task_id": null,
+  "date": "2026-05-11",
+  "confidence": "medium"
+ },
+ {
+  "n": 3,
+  "feature": "Optimization to materialize CTEs only once during execution rather than re-computing at each reference.",
+  "task_id": null,
+  "date": "2026-04-29",
+  "confidence": "medium"
+ },
+ {
+  "n": 4,
+  "feature": "Cardinality estimates consumption by planner for join method and order selection",
+  "task_id": "m0003",
+  "date": "2026-04-28",
+  "confidence": "medium"
+ },
+ {
+  "n": 5,
+  "feature": "walsender_disconnect log event that fires on every walsender exit path.",
+  "task_id": "M0005",
+  "date": "2026-04-29",
+  "confidence": "medium"
+ },
+ {
+  "n": 6,
+  "feature": "Implement analyzer name resolution, planner WindowAgg node generation, and executor per-partition streaming for window functions.",
+  "task_id": "M0020",
+  "date": "2026-04-30",
+  "confidence": "medium"
+ },
+ {
+  "n": 7,
+  "feature": "Runtime enforcement of ALTER STATISTICS SET STATISTICS target during DDL operations",
+  "task_id": "M0119-0004",
+  "date": "2026-06-29",
+  "confidence": "high"
+ },
+ {
+  "n": 8,
+  "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",
+  "task_id": "M0097-0150",
+  "date": "2026-06-03",
+  "confidence": "high"
+ },
+ {
+  "n": 9,
+  "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",
+  "task_id": "M0020",
+  "date": "2026-04-30",
+  "confidence": "medium"
+ },
+ {
+  "n": 10,
+  "feature": "Client-driven Pool/Manager/AIO hooks closure-capture optimization for activity-tracking overhead reduction, pending post-fix measurement",
+  "task_id": "m0091-0001",
+  "date": "2026-05-11",
+  "confidence": "medium"
+ },
+ {
+  "n": 11,
+  "feature": "Wait-queue upgrade priority enforcement for permissions 2 and 3.",
+  "task_id": "M0118-0004",
+  "date": "2026-06-22",
+  "confidence": "medium"
+ },
+ {
+  "n": 12,
+  "feature": "CREATE AGGREGATE does not support the OWNER TO clause.",
+  "task_id": "DU-002",
+  "date": "2026-07-01",
+  "confidence": "medium"
+ }
+]

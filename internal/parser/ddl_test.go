@@ -1118,8 +1118,8 @@ func TestParseAlterForeignDataWrapperOptions(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected *CompatNoopStmt, got %T", stmts[0])
 	}
-	if cn.Tag != "ALTER" {
-		t.Errorf("Tag=%q, want %q", cn.Tag, "ALTER")
+	if cn.Tag != "ALTER FOREIGN DATA WRAPPER" {
+		t.Errorf("Tag=%q, want %q", cn.Tag, "ALTER FOREIGN DATA WRAPPER")
 	}
 	if cn.ObjType != "foreign-data wrapper" {
 		t.Errorf("ObjType=%q, want %q", cn.ObjType, "foreign-data wrapper")

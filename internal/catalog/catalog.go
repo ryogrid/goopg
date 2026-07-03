@@ -9,6 +9,7 @@ package catalog
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -227,11 +228,13 @@ type NamedNotNullConstraint struct {
 	OID       uint32 // synthetic OID for pg_constraint virtual table
 	NoInherit bool   // PG18: NOT NULL NO INHERIT
 	IsLocal   bool   // conislocal: true if locally declared
-	InhCount  int    // coninhcount: 1 for partition children (they always inherit from one parent)
+	InhCount  int    // coninhcount: how many parents (plain-INHERITS or partition) enforce this NOT NULL
 }
 
 // AddNotNull appends a named NOT NULL constraint to the table.
-// isLocal=true means the constraint is locally declared; inhCount=1 for partition children.
+// isLocal=true means the constraint is locally declared (attislocal or explicitly
+// re-declared); inhCount counts enforcing parents — 0 for a purely local
+// constraint, 1 for one inheriting/partition parent that also enforces it.
 func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isLocal bool, inhCount int) {
 	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
 		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,
@@ -1808,6 +1811,10 @@ type Catalog interface {
 	// RoleOID returns the OID minted for a registered role (or 10 for the seeded
 	// `postgres` superuser); the bool is false for an unknown role. DU-002 slice 330.
 	RoleOID(name string) (uint32, bool)
+	// IsPredefinedRole reports whether name is one of PG18's 16 built-in
+	// "pg_*" predefined roles (pg_authid.dat) — a fixed, install-time fact,
+	// not the user-created `roles` registry. M0119-0004-ACLHEAP.
+	IsPredefinedRole(name string) bool
 	// GrantTablePrivilege records that role may exercise priv on the relation
 	// identified by relOID. priv is an upper-cased keyword ("TRUNCATE", …); role
 	// is matched case-insensitively. Minimal ACL store for the *-conflict
@@ -1851,6 +1858,18 @@ type Catalog interface {
 	// (M0097-0022), so the GRANT path must re-sync this text into the heap row;
 	// this renderer supplies the canonical aclitem[] text. M0119-0004-ACLHEAP.
 	TypeACLText(typeOID uint32) string
+	// ForeignServerOID returns the stable OID of the named foreign server
+	// (CREATE SERVER), or 0 if not found. Used by the FOREIGN SERVER GRANT
+	// recorder (internal/server/grant_ddl.go) to resolve the object named in
+	// `GRANT … ON FOREIGN SERVER <name> TO …` to the OID-keyed ACL store key.
+	// DU-002 slice 427.
+	ForeignServerOID(name string) uint32
+	// ForeignDataWrapperOID returns the stable OID of the named FDW (CREATE
+	// FOREIGN DATA WRAPPER), or 0 if not found. Used by the FOREIGN DATA WRAPPER
+	// GRANT recorder (internal/server/grant_ddl.go) to resolve the object named
+	// in `GRANT … ON FOREIGN DATA WRAPPER <name> TO …` to the OID-keyed ACL
+	// store key. DU-002 slice 428.
+	ForeignDataWrapperOID(name string) uint32
 	// GrantColumnPrivilege / GrantColumnPrivilegeWithGrantOption record a
 	// column-level (pg_attribute.attacl) GRANT of priv on column attNum of
 	// relOID to role. RevokeColumnPrivilege removes one. AttrACLText renders the
@@ -1937,6 +1956,31 @@ type Catalog interface {
 	// to render a composite-array field (`addr[]`) as the schema-qualified array
 	// name. DU-002 slice 250.
 	LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bool)
+	// LookupRangeType finds a user-defined range type by name (case-insensitive).
+	// Exposed on the interface so the catalog-row builders can resolve a range
+	// (or multirange) column's declared type name to its pg_type OID, mirroring
+	// LookupEnum/LookupCompositeType. DU-002 slice 429 follow-up.
+	LookupRangeType(name string) (*RangeType, bool)
+	// LookupRangeTypeByMultirangeName finds a user-defined range type by its
+	// auto-generated multirange type's name (case-insensitive) — a column can be
+	// declared directly with the multirange name (e.g. `mymultirange`), not only
+	// the range name. DU-002 slice 429 follow-up.
+	LookupRangeTypeByMultirangeName(name string) (*RangeType, bool)
+	// LookupRangeTypeByOID finds a user-defined range type by its pg_type OID,
+	// used by format_type to render a range column's declared type. M0110-0001.
+	LookupRangeTypeByOID(oid uint32) (*RangeType, bool)
+	// LookupRangeTypeByMultirangeOID finds a user-defined range type by the
+	// pg_type OID of its auto-generated multirange type, used by format_type
+	// to resolve pg_range.rngmultitypid. M0110-0001.
+	LookupRangeTypeByMultirangeOID(oid uint32) (*RangeType, bool)
+	// LookupRangeTypeByArrayOID finds a user-defined range type by the
+	// pg_type OID of its auto-generated `_name` array type, used by
+	// format_type to render a `myrange[]` column. M0110-0001.
+	LookupRangeTypeByArrayOID(oid uint32) (*RangeType, bool)
+	// LookupRangeTypeByMultirangeArrayOID finds a user-defined range type by
+	// the pg_type OID of its multirange's auto-generated `_name` array type,
+	// used by format_type to render a `mymultirange[]` column. M0110-0001.
+	LookupRangeTypeByMultirangeArrayOID(oid uint32) (*RangeType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -1970,6 +2014,41 @@ type InMemory struct {
 	// recovered databases succeed after a crash, NOT for
 	// per-database storage isolation (that lands later).
 	databases map[string]bool
+	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
+	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
+	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
+	// unimplemented feature). Keyed by FirstUserOID (16384) — the SAME
+	// SQL-visible placeholder pg_database.VirtualRows displays for every
+	// non-template database (not c.DBOID(), the real on-disk physical OID
+	// used to key the datacl ACL store / heap resync: pg_db_role_setting is
+	// a pure virtual table with no heap to resync, and pg_dump's
+	// dumpDatabaseConfig cross-references setdatabase against the oid it
+	// already read from pg_database, so the two must agree). Each value is
+	// an ordered list of "name=value" entries in PG's
+	// pg_db_role_setting.setconfig on-disk format (mirrors guc.c's
+	// flatten_set_variable_args output); SET replaces an existing
+	// same-name entry in place or appends, RESET removes the matching
+	// entry, RESET ALL clears the whole slice. M0119-0004-ACLHEAP (ALTER
+	// DATABASE ... SET follow-up).
+	dbRoleSettings map[uint32][]string
+	// roleSettings holds `ALTER ROLE name [IN DATABASE dbname] SET config =
+	// value` overrides (pg_db_role_setting, setrole != 0 rows — the
+	// complement of dbRoleSettings' setrole=0 rows). Keyed by
+	// roleSettingKey{RoleOID, DBOid}: DBOid is 0 for a plain cluster-wide
+	// `ALTER ROLE ... SET` (setdatabase=0, applies in every database) or
+	// FirstUserOID for the `IN DATABASE` form scoped to goopg's single live
+	// database (mirrors dbRoleSettings' FirstUserOID keying — the same SQL
+	// -visible placeholder oid pg_database.VirtualRows displays). Entry
+	// format matches dbRoleSettings (ordered "name=value" strings).
+	// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+	roleSettings map[roleSettingKey][]string
+	// roleMembers holds `GRANT <role> TO <role>` role-membership rows
+	// (pg_auth_members). Keyed by (RoleOID, MemberOID) — PG allows only one
+	// membership row per (roleid, member) pair; a re-GRANT updates the
+	// existing row's grantor/admin_option in place rather than duplicating it
+	// (mirrors AddRoleMems' ON CONFLICT DO UPDATE, user.c). GRANT/REVOKE ROLE
+	// membership (M0119-0004-ACLHEAP).
+	roleMembers map[roleMembershipKey]*RoleMembership
 
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
@@ -2039,6 +2118,11 @@ type InMemory struct {
 	// CREATE TYPE ... AS (...), so a pg_type heap row (typtype='c') can be
 	// synthesized for pg_dump / catalog parity. DU-002 slice 242.
 	compositeTypes map[string]*CompositeType
+	// rangeTypes holds user-defined range types created via
+	// CREATE TYPE ... AS RANGE (subtype = ..., ...), keyed by lower-case name,
+	// so pg_type (typtype='r'/'m') and pg_range heap/virtual rows can be
+	// synthesized for pg_dump / catalog parity. DU-002 (M0110-0001).
+	rangeTypes map[string]*RangeType
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -2095,6 +2179,23 @@ type InMemory struct {
 	// getPolicies resolves it back to the name via pg_roles). M0097-drop_if_exists;
 	// per-role OID registry added DU-002 slice 330.
 	roles map[string]uint32
+
+	// predefinedRoles maps the lower-cased name of each of PG18's 16
+	// built-in "pg_*" predefined roles (predefinedRoleSeeds) to its fixed
+	// OID. Unlike `roles`, this is a fixed, install-time fact — populated
+	// once at construction (newPredefinedRoleMap), never mutated by
+	// RegisterRole/UnregisterRole/RenameRole, and deliberately excluded from
+	// AllRoleStates() so pg_authid heap sync (which already has its own
+	// dedicated predefined-role writer, executor.pgAuthidPredefined) never
+	// sees a duplicate row. Consulted by RoleOID/RoleExists/IsPredefinedRole
+	// so predefined-role names resolve for GRANT/REVOKE role membership,
+	// OWNER TO, CREATE POLICY ... TO, etc. — exactly like a real PG
+	// pg_authid row — while staying immune to DROP/ALTER/RENAME ROLE (backed
+	// by IsPredefinedRole's "pinned object" guard at the DROP ROLE call
+	// site; ALTER/RENAME already gate through the separate server-level
+	// `s.roles` registry in internal/server/role_ddl.go, unaffected by this
+	// map). M0119-0004-ACLHEAP.
+	predefinedRoles map[string]uint32
 
 	// roleAttrs is the attribute/credential sidecar for `roles`, keyed by the
 	// same lower-cased role name. Carries what pg_authid carries for a live
@@ -2186,6 +2287,24 @@ type InMemory struct {
 	// when its column privilege set is fully revoked. M0119-0004-ACLHEAP.
 	attrACLOrder map[attrACLKey][]string
 
+	// parameterACLOIDs assigns a synthetic pg_parameter_acl.oid to each
+	// GUC-level `GRANT SET|ALTER SYSTEM ON PARAMETER <name> ...` target, keyed
+	// by the lower-cased dotted parameter name (mirroring
+	// convert_GUC_name_for_parameter_acl, guc.c). Unlike typacl/datacl,
+	// pg_parameter_acl has no backing real-world object to look an OID up
+	// against — PostgreSQL lazily creates the row on first GRANT
+	// (ParameterAclCreate) — so goopg mints one from the shared nextOID
+	// counter the same way. The OID is otherwise a plain key into the shared
+	// tableACLs store (privileges rendered via ParameterACLText).
+	// M0119-0004-ACLHEAP (parameter ACL half).
+	parameterACLOIDs map[string]uint32
+
+	// parameterACLNames is the reverse of parameterACLOIDs (oid → original
+	// lower-cased parname), so pg_parameter_acl's VirtualRows can project
+	// every GUC that has ever been granted, in a stable order.
+	// M0119-0004-ACLHEAP (parameter ACL half).
+	parameterACLNames map[uint32]string
+
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
@@ -2196,6 +2315,13 @@ type InMemory struct {
 	// not execute FDWs; only enough metadata is kept for dump fidelity. Key:
 	// fdwname. DU-002 slice 375.
 	fdws map[string]*ForeignDataWrapper
+
+	// accessMethods tracks user-defined access methods (CREATE ACCESS METHOD)
+	// with a stable OID so they round-trip through pg_dump's getAccessMethods
+	// (pg_am virtual view → dumpAccessMethod). goopg never invokes a
+	// user-defined AM (no pluggable storage engine); only enough metadata is
+	// kept for dump fidelity. Key: amname. DU-002 (M0119-0004).
+	accessMethods map[string]*AccessMethod
 
 	// eventTriggers tracks event triggers (CREATE EVENT TRIGGER) with a stable
 	// OID so they round-trip through pg_dump's getEventTriggers
@@ -2585,6 +2711,26 @@ type CompositeType struct {
 	Fields   []CompositeField // ordered field list
 }
 
+// RangeType describes a user-defined range type created via
+// `CREATE TYPE x AS RANGE (subtype = ..., ...)`. PostgreSQL allocates a
+// pg_type row for the range itself (typtype='r'), a pg_range row, an
+// auto-generated multirange type (typtype='m', default name derived by
+// makeMultirangeTypeName), and an auto-generated `_name` array type for both
+// the range and the multirange (typtype='b'/typcategory='A', mirroring
+// EnumType.ArrayOID / CompositeType.ArrayOID). goopg synthesizes all four
+// pg_type rows. DU-002, M0110-0001.
+type RangeType struct {
+	Name               string // lower-case range type name
+	OID                uint32 // pg_type.oid of the range type
+	ArrayOID           uint32 // pg_type.oid of the range's auto-generated `_name` array type
+	SubtypeName        string // subtype name as declared (e.g. "int4", "timestamp with time zone")
+	OpclassOID         uint32 // btree opclass OID for the subtype, explicit `subtype_opclass` or resolved default (pg_range.rngsubopc)
+	CollationOID       uint32 // collation OID for the subtype, explicit `collation` or the subtype's own typcollation; 0 (InvalidOid) if the subtype is not collatable (pg_range.rngcollation)
+	MultirangeOID      uint32 // pg_type.oid of the auto-generated multirange type
+	MultirangeArrayOID uint32 // pg_type.oid of the multirange's auto-generated `_name` array type
+	MultirangeName     string // lower-case multirange type name
+}
+
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
 // It is stored in InMemory.userAggregates and looked up by lower-case name.
 type UserAggregate struct {
@@ -2738,6 +2884,9 @@ func NewInMemory() *InMemory {
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
+		dbRoleSettings:         make(map[uint32][]string),
+		roleSettings:           make(map[roleSettingKey][]string),
+		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
 		toastRenames:           make(map[uint32]string),
@@ -2747,6 +2896,7 @@ func NewInMemory() *InMemory {
 		compositeTypeNames:     make(map[string]bool),
 		compositeTypeFields:    make(map[string][]CompositeField),
 		compositeTypes:         make(map[string]*CompositeType),
+		rangeTypes:             make(map[string]*RangeType),
 		constraintViewDeps:     make(map[string][]string),
 		opClassHashFuncs:       make(map[string]string),
 		opClassSchemas:         make(map[string]string),
@@ -2758,6 +2908,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:              make(map[string]uint32),
+		predefinedRoles:    newPredefinedRoleMap(),
 		roleAttrs:          make(map[string]*RoleAttrs),
 		tempNamespaces:     make(map[string]uint32),
 		tableACLs:          make(map[uint32]map[string]map[string]bool),
@@ -2767,6 +2918,8 @@ func NewInMemory() *InMemory {
 		relACLOwnerRevoked: make(map[uint32]bool),
 		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
 		attrACLOrder:       make(map[attrACLKey][]string),
+		parameterACLOIDs:   make(map[string]uint32),
+		parameterACLNames:  make(map[uint32]string),
 		comments:           make(map[commentKey]string),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
@@ -3878,6 +4031,652 @@ func (c *InMemory) UnregisterDatabaseDuringRecovery(name string) {
 	delete(c.databases, name)
 }
 
+// dbRoleSettingConfigName returns the GUC name half of a "name=value"
+// pg_db_role_setting.setconfig entry, or "" if entry has no '='.
+func dbRoleSettingConfigName(entry string) string {
+	eq := strings.IndexByte(entry, '=')
+	if eq < 0 {
+		return ""
+	}
+	return entry[:eq]
+}
+
+// SetDatabaseConfig upserts an `ALTER DATABASE ... SET name = value`
+// override into dbOid's pg_db_role_setting.setconfig list: an existing
+// entry with the same GUC name (case-insensitive — GUC names are
+// case-insensitive) is replaced in place, otherwise the entry is appended.
+// Mirrors PG's GUC_array_change ordering. Idempotent, so it is also used
+// directly by the WAL-replay recovery driver (no separate DuringRecovery
+// variant is needed). M0119-0004-ACLHEAP (ALTER DATABASE ... SET follow-up).
+func (c *InMemory) SetDatabaseConfig(dbOid uint32, name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := name + "=" + value
+	entries := c.dbRoleSettings[dbOid]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			entries[i] = entry
+			return
+		}
+	}
+	c.dbRoleSettings[dbOid] = append(entries, entry)
+}
+
+// ResetDatabaseConfig removes a single `ALTER DATABASE ... RESET name`
+// override, if present. A no-op when the name has no override recorded.
+func (c *InMemory) ResetDatabaseConfig(dbOid uint32, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entries := c.dbRoleSettings[dbOid]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			c.dbRoleSettings[dbOid] = append(entries[:i], entries[i+1:]...)
+			return
+		}
+	}
+}
+
+// ResetAllDatabaseConfig clears every `ALTER DATABASE ... SET` override for
+// dbOid (`ALTER DATABASE ... RESET ALL`).
+func (c *InMemory) ResetAllDatabaseConfig(dbOid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.dbRoleSettings, dbOid)
+}
+
+// DatabaseConfigEntries returns a copy of dbOid's pg_db_role_setting.setconfig
+// entries ("name=value" strings, insertion order), or nil when none are set.
+func (c *InMemory) DatabaseConfigEntries(dbOid uint32) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries := c.dbRoleSettings[dbOid]
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, len(entries))
+	copy(out, entries)
+	return out
+}
+
+// roleSettingKey identifies one `ALTER ROLE ... SET` override row. See
+// InMemory.roleSettings' doc comment for the DBOid=0 vs FirstUserOID
+// distinction.
+type roleSettingKey struct {
+	RoleOID uint32
+	DBOid   uint32
+}
+
+// SetRoleConfig upserts an `ALTER ROLE ... [IN DATABASE ...] SET name =
+// value` override, mirroring SetDatabaseConfig's in-place-replace-or-append
+// semantics. M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+func (c *InMemory) SetRoleConfig(roleOid, dbOid uint32, name, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleSettingKey{RoleOID: roleOid, DBOid: dbOid}
+	entry := name + "=" + value
+	entries := c.roleSettings[key]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			entries[i] = entry
+			return
+		}
+	}
+	c.roleSettings[key] = append(entries, entry)
+}
+
+// ResetRoleConfig removes a single `ALTER ROLE ... [IN DATABASE ...] RESET
+// name` override, if present.
+func (c *InMemory) ResetRoleConfig(roleOid, dbOid uint32, name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleSettingKey{RoleOID: roleOid, DBOid: dbOid}
+	entries := c.roleSettings[key]
+	for i, e := range entries {
+		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
+			c.roleSettings[key] = append(entries[:i], entries[i+1:]...)
+			return
+		}
+	}
+}
+
+// ResetAllRoleConfig clears every override for (roleOid, dbOid) (`ALTER
+// ROLE ... [IN DATABASE ...] RESET ALL`).
+func (c *InMemory) ResetAllRoleConfig(roleOid, dbOid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.roleSettings, roleSettingKey{RoleOID: roleOid, DBOid: dbOid})
+}
+
+// RoleConfigEntries returns a copy of (roleOid, dbOid)'s setconfig entries
+// ("name=value" strings, insertion order), or nil when none are set.
+func (c *InMemory) RoleConfigEntries(roleOid, dbOid uint32) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entries := c.roleSettings[roleSettingKey{RoleOID: roleOid, DBOid: dbOid}]
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, len(entries))
+	copy(out, entries)
+	return out
+}
+
+// RoleConfigRow is one pg_db_role_setting row keyed by a non-zero setrole,
+// returned by AllRoleConfigRows in deterministic (RoleOID, DBOid) order.
+type RoleConfigRow struct {
+	RoleOID uint32
+	DBOid   uint32
+	Entries []string
+}
+
+// AllRoleConfigRows returns every `ALTER ROLE ... SET` override currently
+// recorded, sorted by (RoleOID, DBOid) for deterministic pg_db_role_setting
+// virtual-row output.
+func (c *InMemory) AllRoleConfigRows() []RoleConfigRow {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.roleSettings) == 0 {
+		return nil
+	}
+	rows := make([]RoleConfigRow, 0, len(c.roleSettings))
+	for key, entries := range c.roleSettings {
+		cp := make([]string, len(entries))
+		copy(cp, entries)
+		rows = append(rows, RoleConfigRow{RoleOID: key.RoleOID, DBOid: key.DBOid, Entries: cp})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].RoleOID != rows[j].RoleOID {
+			return rows[i].RoleOID < rows[j].RoleOID
+		}
+		return rows[i].DBOid < rows[j].DBOid
+	})
+	return rows
+}
+
+// roleMembershipKey identifies one pg_auth_members row: RoleOID is the role
+// being granted (roleid), MemberOID is the role receiving membership
+// (member), GrantorOID is who granted it (grantor). Real PG's unique index
+// is the (roleid, member, grantor) triple (pg_auth_members_role_member_index,
+// pg_auth_members.h) — the SAME (role, member) pair can hold one independent
+// row per distinct grantor, e.g. two different admins each granting the same
+// role to the same member. See InMemory.roleMembers' doc comment.
+type roleMembershipKey struct {
+	RoleOID    uint32
+	MemberOID  uint32
+	GrantorOID uint32
+}
+
+// RoleMembership is one pg_auth_members row, returned by
+// RoleMembershipEntries in deterministic (RoleOID, MemberOID) order.
+// M0119-0004-ACLHEAP.
+type RoleMembership struct {
+	OID           uint32
+	RoleOID       uint32
+	MemberOID     uint32
+	GrantorOID    uint32
+	AdminOption   bool
+	InheritOption bool
+	SetOption     bool
+}
+
+// GrantRoleMembership upserts a `GRANT <role> TO <member> [WITH { ADMIN |
+// INHERIT | SET } { OPTION | TRUE | FALSE } [, ...]] [GRANTED BY <grantor>]`
+// row: a fresh OID is minted the first time (RoleOID, MemberOID, GrantorOID)
+// is seen — a DIFFERENT grantor granting the same (role, member) pair mints
+// its own independent row, matching real PG's (roleid, member, grantor)
+// unique index (AddRoleMems' SearchSysCache3, user.c) — re-granting BY THE
+// SAME grantor keeps the existing OID and only updates the option flags.
+//
+// admin/inherit/set are tri-state: nil means that option was not named in
+// this statement (PG's GRANT_ROLE_SPECIFIED_* bitmask unset, GrantRole in
+// user.c) — an existing row's value for that option is left untouched
+// (mirroring "a plain re-grant never downgrades an unmentioned option"), and
+// a fresh row falls back to InitGrantRoleOptions' defaults: admin=false,
+// set=true, inherit=the grantee's rolinherit (goopg has no per-role NOINHERIT
+// tracking — CREATE/ALTER ROLE never clears it — so every role's rolinherit
+// is always true, matching this default exactly). A non-nil pointer is the
+// explicit requested value and always applies, including to an existing row
+// (may legitimately downgrade e.g. admin_option, unlike an unspecified
+// option on a bare re-grant). Returns the row's OID. M0119-0004-ACLHEAP.
+func (c *InMemory) GrantRoleMembership(roleOid, memberOid, grantorOid uint32, admin, inherit, set *bool) uint32 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}
+	if existing, ok := c.roleMembers[key]; ok {
+		if admin != nil {
+			existing.AdminOption = *admin
+		}
+		if inherit != nil {
+			existing.InheritOption = *inherit
+		}
+		if set != nil {
+			existing.SetOption = *set
+		}
+		return existing.OID
+	}
+	oid := c.allocOIDLocked()
+	c.roleMembers[key] = &RoleMembership{
+		OID: oid, RoleOID: roleOid, MemberOID: memberOid,
+		GrantorOID:    grantorOid,
+		AdminOption:   admin != nil && *admin,
+		InheritOption: inherit == nil || *inherit,
+		SetOption:     set == nil || *set,
+	}
+	return oid
+}
+
+// RevokeRoleMembership removes or downgrades the ONE `REVOKE <role> FROM
+// <member> [GRANTED BY <grantor>]` row identified by (roleOid, memberOid,
+// grantorOid) — real PG's plan_single_revoke/DelRoleMems (user.c) only ever
+// touches the specific grantor-scoped tuple check_role_grantor resolved,
+// leaving any OTHER grantor's independent row on the same (role, member)
+// pair untouched. revokeOption is "" for a plain REVOKE (the row is deleted
+// entirely) or one of "admin"/"inherit"/"set" for REVOKE's
+// `{ADMIN|INHERIT|SET} OPTION FOR` prefix, in which case only that single
+// flag is cleared and the membership row survives — matching PG's
+// DelRoleMems/plan_single_revoke (RRG_REMOVE_ADMIN_OPTION /
+// RRG_REMOVE_INHERIT_OPTION / RRG_REMOVE_SET_OPTION, user.c). Reports
+// whether a row existed (REVOKE of a non-existent membership is a silent
+// no-op, matching this codebase's other ACL REVOKE paths). M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembership(roleOid, memberOid, grantorOid uint32, revokeOption string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	key := roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}
+	existing, ok := c.roleMembers[key]
+	if !ok {
+		return false
+	}
+	switch revokeOption {
+	case "admin":
+		existing.AdminOption = false
+	case "inherit":
+		existing.InheritOption = false
+	case "set":
+		existing.SetOption = false
+	default:
+		delete(c.roleMembers, key)
+	}
+	return true
+}
+
+// RevokeRoleMembershipCascadeSet computes, WITHOUT mutating any state, the
+// additional pg_auth_members rows a whole-row `REVOKE roleOid FROM
+// memberOid` or a `REVOKE ADMIN OPTION FOR roleOid FROM memberOid` needs to
+// cascade-delete, mirroring plan_recursive_revoke's grantor-chain walk
+// (postgres/src/backend/commands/user.c ~2415). Only relevant when
+// memberOid's own row currently holds AdminOption==true — a member with no
+// ADMIN OPTION on roleOid could not have (re-)granted it to anyone, so
+// there is nothing to cascade (PG's early return when the revoked row's
+// admin_option is already false); in that case (or when no row exists) this
+// returns (nil, false) and the caller applies a plain, non-cascading revoke.
+//
+// When a cascade is possible: dependentMembers lists every dependent row
+// (mirrors PG's per-row full delete, RRG_DELETE_GRANT) that must ALSO be
+// revoked — every row transitively granted BY memberOid (regardless of which
+// role granted memberOid ITS membership; only the specific (roleOid,
+// memberOid, grantorOid) row at the top of the walk is scoped by grantor),
+// where the walk continues past a dependent row only if THAT row's own
+// AdminOption is also true (it could itself have re-granted further). If
+// cascade is false (RESTRICT, including REVOKE's unwritten default) and any
+// dependents were found, blocked is true and the caller must raise
+// ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST ("2BP01") — "dependent privileges
+// exist" / hint "Use CASCADE to revoke them too." — and apply nothing. Each
+// DependentRoleMembership pins the exact (member, grantor) row to revoke —
+// real PG's "would the member still have admin via ANOTHER untouched row"
+// escape hatch (plan_recursive_revoke) is naturally modeled since a member
+// can now hold independent rows from multiple grantors and only the one
+// implicated by this walk is torn down. M0119-0004-ACLHEAP.
+func (c *InMemory) RevokeRoleMembershipCascadeSet(roleOid, memberOid, grantorOid uint32, cascade bool) (dependentMembers []DependentRoleMembership, blocked bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	existing, ok := c.roleMembers[roleMembershipKey{RoleOID: roleOid, MemberOID: memberOid, GrantorOID: grantorOid}]
+	if !ok || !existing.AdminOption {
+		return nil, false
+	}
+	var keys []roleMembershipKey
+	c.collectRoleMembershipCascadeKeysLocked(roleOid, memberOid, &keys)
+	if len(keys) == 0 {
+		return nil, false
+	}
+	if !cascade {
+		return nil, true
+	}
+	dependentMembers = make([]DependentRoleMembership, len(keys))
+	for i, k := range keys {
+		dependentMembers[i] = DependentRoleMembership{MemberOID: k.MemberOID, GrantorOID: k.GrantorOID}
+	}
+	return dependentMembers, false
+}
+
+// DependentRoleMembership identifies one pg_auth_members row
+// RevokeRoleMembershipCascadeSet found downstream of a cascading REVOKE —
+// enough to target the exact row via RevokeRoleMembership(roleOid,
+// MemberOID, GrantorOID, ""). M0119-0004-ACLHEAP.
+type DependentRoleMembership struct {
+	MemberOID  uint32
+	GrantorOID uint32
+}
+
+// collectRoleMembershipCascadeKeysLocked appends every roleOid row granted
+// (directly or transitively) BY grantorMember to *out, recursing past a
+// found row only when that row's own AdminOption is true. Caller holds
+// c.mu (read or write). M0119-0004-ACLHEAP.
+func (c *InMemory) collectRoleMembershipCascadeKeysLocked(roleOid, grantorMember uint32, out *[]roleMembershipKey) {
+	var children []roleMembershipKey
+	for k, m := range c.roleMembers {
+		if k.RoleOID == roleOid && m.GrantorOID == grantorMember && k.MemberOID != grantorMember {
+			children = append(children, k)
+		}
+	}
+	sort.Slice(children, func(i, j int) bool { return children[i].MemberOID < children[j].MemberOID })
+	for _, k := range children {
+		*out = append(*out, k)
+		if c.roleMembers[k].AdminOption {
+			c.collectRoleMembershipCascadeKeysLocked(roleOid, k.MemberOID, out)
+		}
+	}
+}
+
+// RoleMembershipEntries returns every recorded pg_auth_members row, sorted
+// by (RoleOID, MemberOID, GrantorOID) for deterministic virtual-row output —
+// the same (RoleOID, MemberOID) pair may now legitimately appear more than
+// once, one row per distinct grantor. M0119-0004-ACLHEAP.
+func (c *InMemory) RoleMembershipEntries() []RoleMembership {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.roleMembers) == 0 {
+		return nil
+	}
+	out := make([]RoleMembership, 0, len(c.roleMembers))
+	for _, m := range c.roleMembers {
+		out = append(out, *m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].RoleOID != out[j].RoleOID {
+			return out[i].RoleOID < out[j].RoleOID
+		}
+		if out[i].MemberOID != out[j].MemberOID {
+			return out[i].MemberOID < out[j].MemberOID
+		}
+		return out[i].GrantorOID < out[j].GrantorOID
+	})
+	return out
+}
+
+// RoleIsMemberOf reports whether memberOid is, directly or transitively, a
+// member of roleOid via the recorded pg_auth_members rows (a self-check,
+// memberOid == roleOid, always reports true). Mirrors
+// is_member_of_role_nosuper's traversal (user.c) — ignoring superuser
+// bypass, which does not apply to membership-loop detection. GRANT ROLE
+// uses this to reject a membership that would create a cycle (`role "x" is
+// a member of role "y"`, ERRCODE_INVALID_GRANT_OPERATION). M0119-0004-ACLHEAP.
+func (c *InMemory) RoleIsMemberOf(memberOid, roleOid uint32) bool {
+	if memberOid == roleOid {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key := range c.roleMembers {
+			if key.MemberOID != cur || seen[key.RoleOID] {
+				continue
+			}
+			if key.RoleOID == roleOid {
+				return true
+			}
+			seen[key.RoleOID] = true
+			queue = append(queue, key.RoleOID)
+		}
+	}
+	return false
+}
+
+// IsSuperuser reports whether oid names a role with the SUPERUSER attribute:
+// the bootstrap superuser (OID 10, always superuser — see
+// BootstrapSuperuserOID) or a registered role whose RoleAttrs.Superuser is
+// set (CREATE/ALTER ROLE ... SUPERUSER). Mirrors superuser_arg (acl.c).
+// Backs check_role_membership_authorization's "to mess with a superuser
+// role, you gotta be superuser" gate. M0119-0004-ACLHEAP.
+func (c *InMemory) IsSuperuser(oid uint32) bool {
+	if oid == BootstrapSuperuserOID {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, roid := range c.roles {
+		if roid == oid {
+			a := c.roleAttrs[name]
+			return a != nil && a.Superuser
+		}
+	}
+	return false
+}
+
+// IsAdminOfRole reports whether memberOid is the bootstrap/attribute
+// superuser, or holds ADMIN OPTION on roleOid — directly, or indirectly via
+// ANY membership chain (not gated on INHERIT/SET, matching PG's
+// ROLERECURSE_MEMBERS traversal). By policy a role is never its own admin
+// (memberOid == roleOid returns false, matching is_admin_of_role's explicit
+// carve-out), even though RoleIsMemberOf treats self-membership as true.
+// Mirrors is_admin_of_role (postgres/src/backend/utils/adt/acl.c). Backs
+// check_role_membership_authorization's "otherwise, must have admin option
+// on the role to be changed" branch. M0119-0004-ACLHEAP.
+func (c *InMemory) IsAdminOfRole(memberOid, roleOid uint32) bool {
+	if c.IsSuperuser(memberOid) {
+		return true
+	}
+	if memberOid == roleOid {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur {
+				continue
+			}
+			if key.RoleOID == roleOid && m.AdminOption {
+				return true
+			}
+			if !seen[key.RoleOID] {
+				seen[key.RoleOID] = true
+				queue = append(queue, key.RoleOID)
+			}
+		}
+	}
+	return false
+}
+
+// HasPrivsOfRole reports whether memberOid inherits the privileges of
+// roleOid: memberOid == roleOid, memberOid is a superuser, or roleOid is
+// reachable from memberOid via a chain of INHERIT-marked pg_auth_members
+// rows (ROLERECURSE_PRIVS). Distinct from RoleIsMemberOf (ignores INHERIT
+// entirely, used for membership-cycle detection) and IsAdminOfRole (requires
+// ADMIN OPTION, not just membership). Mirrors has_privs_of_role
+// (postgres/src/backend/utils/adt/acl.c). Backs check_role_grantor's
+// "GRANTED BY must name a role whose privileges the current user possesses"
+// gate. M0119-0004-ACLHEAP.
+func (c *InMemory) HasPrivsOfRole(memberOid, roleOid uint32) bool {
+	if memberOid == roleOid {
+		return true
+	}
+	if c.IsSuperuser(memberOid) {
+		return true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		var next []uint32
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur || !m.InheritOption {
+				continue
+			}
+			if key.RoleOID == roleOid {
+				return true
+			}
+			if !seen[key.RoleOID] {
+				seen[key.RoleOID] = true
+				next = append(next, key.RoleOID)
+			}
+		}
+		sort.Slice(next, func(i, j int) bool { return next[i] < next[j] })
+		queue = append(queue, next...)
+	}
+	return false
+}
+
+// SelectBestAdmin finds a role whose privileges memberOid inherits
+// (transitively, via INHERIT-marked pg_auth_members rows) that directly
+// holds ADMIN OPTION on roleOid — preferring memberOid's own direct ADMIN
+// OPTION over an indirect one, and among indirect options the fewest "hops"
+// (breadth-first, matching roles_is_member_of's traversal order). Returns 0
+// (PG's InvalidOid) if no such role exists. By policy memberOid == roleOid
+// never qualifies (a role cannot have ADMIN OPTION on itself). Mirrors
+// select_best_admin (postgres/src/backend/utils/adt/acl.c). Backs
+// check_role_grantor's implicit-grantor inference (memberOid=currentUserID)
+// and its explicit-GRANTED-BY sanity check (memberOid=the named grantor —
+// there, the caller requires the return value to equal memberOid itself,
+// i.e. the grantor's admin option must be its OWN, not merely inherited).
+// M0119-0004-ACLHEAP.
+func (c *InMemory) SelectBestAdmin(memberOid, roleOid uint32) uint32 {
+	if memberOid == roleOid {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	seen := map[uint32]bool{memberOid: true}
+	queue := []uint32{memberOid}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for key, m := range c.roleMembers {
+			if key.MemberOID == cur && key.RoleOID == roleOid && m.AdminOption {
+				return cur
+			}
+		}
+		var next []uint32
+		for key, m := range c.roleMembers {
+			if key.MemberOID != cur || !m.InheritOption {
+				continue
+			}
+			if !seen[key.RoleOID] {
+				seen[key.RoleOID] = true
+				next = append(next, key.RoleOID)
+			}
+		}
+		sort.Slice(next, func(i, j int) bool { return next[i] < next[j] })
+		queue = append(queue, next...)
+	}
+	return 0
+}
+
+// BootstrapSuperuserOID is OID 10 (BOOTSTRAP_SUPERUSERID / "postgres"),
+// goopg's single hardcoded superuser (see the many "OID 10 = bootstrap
+// superuser" call sites elsewhere in this file). AddRoleMems' grantor-chain
+// circularity check (user.c) exempts grants made BY the bootstrap superuser
+// and never allows ADMIN OPTION to be (re-)granted TO it.
+const BootstrapSuperuserOID uint32 = 10
+
+// GrantRoleWouldCreateGrantorCycle reports whether granting roleOid's
+// membership WITH ADMIN TRUE to newMemberOids (a single `GRANT roleOid TO
+// member, ...` statement's full grantee list) would create a "member-grantor
+// loop": grantorOid giving ADMIN OPTION on roleOid to someone who is
+// grantorOid's ONLY remaining source of ADMIN OPTION on roleOid, which would
+// make the grant chain non-acyclic (defeating REVOKE .. CASCADE's ability to
+// unwind it). Mirrors AddRoleMems' circularity guard (user.c ~1751), which
+// simulates revoking (cascading through) every existing pg_auth_members row
+// implicated by the new grantees and then checks whether grantorOid still
+// holds an untouched, admin_option row. This is a DIFFERENT check from
+// RoleIsMemberOf's role-member loop (A member of B, B member of A) — this
+// one is about the ADMIN OPTION GRANT chain, not the membership graph itself.
+//
+// Caller must already have gated on `admin option requested && grantorOid !=
+// bootstrapSuperuserOID` (AddRoleMems' `if (popt->admin && grantorId !=
+// BOOTSTRAP_SUPERUSERID)`); grants made by the bootstrap superuser can never
+// be circular since it is always everyone's ultimate admin. M0119-0004-ACLHEAP.
+func (c *InMemory) GrantRoleWouldCreateGrantorCycle(roleOid uint32, newMemberOids []uint32, grantorOid uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// PG unconditionally rejects (re-)granting ADMIN OPTION to the bootstrap
+	// superuser — it needs no source grantor, so any such grant is by
+	// definition ungrantable-back-to.
+	if slices.Contains(newMemberOids, BootstrapSuperuserOID) {
+		return true
+	}
+
+	// memlist: every existing pg_auth_members row for THIS roleOid only
+	// (SearchSysCacheList1(AUTHMEMROLEMEM, roleid) scopes identically).
+	var rows []*RoleMembership
+	for key, m := range c.roleMembers {
+		if key.RoleOID == roleOid {
+			rows = append(rows, m)
+		}
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].MemberOID < rows[j].MemberOID })
+
+	// deleted[i] tracks whether plan_recursive_revoke would remove rows[i]
+	// entirely. This scoped use (only ever reached via plan_member_revoke,
+	// never plan_single_revoke) always calls plan_recursive_revoke with
+	// revoke_admin_option_only=false and behavior=DROP_CASCADE, so PG's
+	// 5-state RevokeRoleGrantAction collapses to this boolean here: every
+	// row plan_recursive_revoke would touch ends up RRG_DELETE_GRANT.
+	deleted := make([]bool, len(rows))
+	var planRecursiveRevoke func(index int)
+	planRecursiveRevoke = func(index int) {
+		if deleted[index] {
+			return
+		}
+		deleted[index] = true
+		member := rows[index].MemberOID
+		if !rows[index].AdminOption {
+			return
+		}
+		// Would `member` still hold ADMIN OPTION on roleOid via some other,
+		// untouched grant? If so, nothing downstream needs to cascade.
+		for i, r := range rows {
+			if r.MemberOID == member && r.AdminOption && !deleted[i] {
+				return
+			}
+		}
+		// Recurse into grants for which `member` is the grantor — those
+		// would lose their ADMIN OPTION basis too.
+		for i, r := range rows {
+			if r.GrantorOID == member && !deleted[i] {
+				planRecursiveRevoke(i)
+			}
+		}
+	}
+	for _, mid := range newMemberOids {
+		for i, r := range rows {
+			if r.MemberOID == mid {
+				planRecursiveRevoke(i)
+			}
+		}
+	}
+
+	// If the grantor still holds an untouched, admin_option row on roleOid,
+	// it retains the ability to perform this grant — no circularity.
+	for i, r := range rows {
+		if !deleted[i] && r.MemberOID == grantorOid && r.AdminOption {
+			return false
+		}
+	}
+	return true
+}
+
 // RegisterIndexDuringRecovery is the idempotent version of
 // CreateIndex used by the WAL-replay driver. Differs from
 // CreateIndex in three ways: (a) the OID comes from the WAL
@@ -4958,8 +5757,8 @@ func (c *InMemory) registerSystemTables() {
 		Columns: []Column{
 			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
 			{Name: "datname", Type: Type{Name: "name"}, Ordinal: 1},
-			{Name: "datdba", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "encoding", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "datdba", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "encoding", Type: Type{Name: "int4"}, Ordinal: 3},
 			// Additional columns for vacuumdb --all (M0095-0004).
 			{Name: "datallowconn", Type: Type{Name: "boolean"}, Ordinal: 4},
 			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 5},
@@ -4975,6 +5774,27 @@ func (c *InMemory) registerSystemTables() {
 			// pg_database` resolve the column instead of erroring 42703. M0117-0008.
 			{Name: "datfrozenxid", Type: Type{Name: "xid"}, Ordinal: 7},
 			{Name: "datminmxid", Type: Type{Name: "xid"}, Ordinal: 8},
+			// dattablespace / datcollate / datctype / datlocprovider / datlocale /
+			// daticurules / datcollversion / datacl: added so pg_dump's
+			// getDatabases query (dumpDatabase, only issued under -C/--create —
+			// dopt.outputCreateDB) resolves instead of erroring 42703 on
+			// datcollate. Values mirror what a fresh `initdb --locale=C` libc
+			// cluster's real bootstrapPostgresDatabase heap row carries
+			// (internal/initdb/initdb.go); goopg v0 does not track per-database
+			// locale/tablespace overrides, so every row reports the bootstrap
+			// default. M0119-0004-ACLHEAP (datacl half).
+			{Name: "dattablespace", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "datcollate", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "datctype", Type: Type{Name: "text"}, Ordinal: 11},
+			{Name: "datlocprovider", Type: Type{Name: "char"}, Ordinal: 12},
+			{Name: "datlocale", Type: Type{Name: "text"}, Ordinal: 13},
+			{Name: "daticurules", Type: Type{Name: "text"}, Ordinal: 14},
+			{Name: "datcollversion", Type: Type{Name: "text"}, Ordinal: 15},
+			// datacl: the GRANT/REVOKE … ON DATABASE … projection (this slice).
+			// NULL (VirtualNull) until a GRANT is recorded, matching
+			// acldefault('d', datdba) so pg_dump emits no ACL commands for an
+			// ungranted database.
+			{Name: "datacl", Type: Type{Name: "aclitem[]"}, Ordinal: 16},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -5012,6 +5832,25 @@ func (c *InMemory) registerSystemTables() {
 			case "template0":
 				oid, datallowconn, datistemplate = "4", "false", "true"
 			}
+			// datacl is keyed by c.DBOID() — the REAL on-disk OID read from the
+			// physical global/1262 heap by detectCatalogDBOID at startup (PG18's
+			// well-known postgres database OID 5) — NOT by this row's displayed
+			// "oid" placeholder above. execDatabaseACLChange / resyncDatabaseACLHeapRow
+			// key the ACL store and the physical heap resync under c.DBOID() (the
+			// heap resync MUST match the real on-disk tuple's oid column), so this
+			// lookup mirrors that key rather than the legacy 16384
+			// firstNormalObjectOID placeholder other subsystems (e.g. CREATE
+			// SUBSCRIPTION's subdbid) already depend on for "the" connected
+			// database — changing the displayed oid to match broke pg_dump's
+			// subscription round-trip (subdbid join no longer matched). Only the
+			// live "postgres" row can carry a granted ACL (execDatabaseACLChange's
+			// v0 single-database scope), so every other row is unconditionally NULL.
+			datacl := VirtualNull
+			if n == "postgres" {
+				if aclText := c.DatabaseACLText(c.DBOID()); aclText != "" {
+					datacl = aclText
+				}
+			}
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
@@ -5022,6 +5861,14 @@ func (c *InMemory) registerSystemTables() {
 				datistemplate, // datistemplate: true for template0/template1
 				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
 				"1",           // datminmxid: FirstMultiXactId bootstrap floor
+				"1663",        // dattablespace: pg_default (goopg v0 has no per-DB tablespace override)
+				"C",           // datcollate: fresh `initdb --locale=C` bootstrap value
+				"C",           // datctype: fresh `initdb --locale=C` bootstrap value
+				"c",           // datlocprovider: 'c' = libc (bootstrap default provider)
+				VirtualNull,   // datlocale: NULL under the libc provider
+				VirtualNull,   // daticurules: NULL (no ICU rules)
+				VirtualNull,   // datcollversion: NULL (recomputed on restore, mirrors pg_collation)
+				datacl,        // datacl: GRANT/REVOKE … ON DATABASE … projection (M0119-0004-ACLHEAP)
 			})
 		}
 		return out
@@ -5046,7 +5893,7 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 2},
 			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 3},
 		},
-		OID:     1260, // upstream's AuthIdRelationId
+		OID:     1259102, // synthetic — upstream's pg_roles is a view, no fixed low OID (1260 is pg_authid's, see below)
 		Virtual: true,
 	}
 	pgRoles.VirtualRows = func() [][]string {
@@ -5080,9 +5927,202 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, rolsuper, rolcanlogin})
 		}
 		c.mu.RUnlock()
+		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat) — always
+		// rolsuper='f'/rolcanlogin='f', matching SyncPgAuthidFile's frozen
+		// predefined rows (internal/executor/pg_authid_sync.go). Needed so
+		// pg_dumpall's dumpRoleMembership query (which LEFT JOINs pg_roles to
+		// resolve a membership row's role/member name) doesn't silently drop a
+		// `GRANT pg_read_all_data TO alice`-style row when ur.rolname/
+		// um.rolname come back NULL for a predefined grantee (0119-0004ch
+		// ledger discovery (a)).
+		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
+		for _, s := range predefinedRoleSeeds {
+			predefinedNames = append(predefinedNames, s.name)
+		}
+		sort.Strings(predefinedNames)
+		for _, name := range predefinedNames {
+			out = append(out, []string{fmt.Sprintf("%d", c.predefinedRoles[name]), name, "f", "f"})
+		}
 		return out
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
+
+	// pg_authid — the real, superuser-only role catalog pg_roles is a view
+	// over. pg_dumpall's dumpRoles/dumpUserConfig query it directly (not
+	// pg_roles) for the full attribute set + rolpassword (M0119-0004-ACLHEAP
+	// follow-up: pg_dumpall was failing outright with "relation \"pg_authid\"
+	// does not exist" before this — pg_roles alone never covered it). Sourced
+	// from the same live c.roles/c.roleAttrs state as pg_roles, not the
+	// on-disk global/1260 heap file: that file (pg_authid_sync.go) is a
+	// separate crash-recovery mirror for auth credentials, not a live SQL
+	// read path. Attributes goopg's role DDL never actually sets
+	// (rolinherit/rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
+	// rolconnlimit/rolvaliduntil) report PG's CREATE ROLE defaults, since
+	// nothing can diverge them from those defaults today (see deferral
+	// ledger).
+	pgAuthid := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_authid",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "rolsuper", Type: Type{Name: "bool"}, Ordinal: 2},
+			{Name: "rolinherit", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "rolcreaterole", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "rolcreatedb", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "rolcanlogin", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "rolreplication", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "rolbypassrls", Type: Type{Name: "bool"}, Ordinal: 8},
+			{Name: "rolconnlimit", Type: Type{Name: "int4"}, Ordinal: 9},
+			{Name: "rolpassword", Type: Type{Name: "text"}, Ordinal: 10},
+			{Name: "rolvaliduntil", Type: Type{Name: "timestamptz"}, Ordinal: 11},
+		},
+		OID:     1260, // upstream's AuthIdRelationId
+		Virtual: true,
+	}
+	pgAuthid.VirtualRows = func() [][]string {
+		rowFor := func(oidStr, name string, a *RoleAttrs) []string {
+			rolsuper, rolcanlogin := "f", "t"
+			rolpassword := VirtualNull
+			if a != nil {
+				if a.Superuser {
+					rolsuper = "t"
+				}
+				if !a.CanLogin {
+					rolcanlogin = "f"
+				}
+				if a.CredType != 0 {
+					rolpassword = a.Secret
+				}
+			}
+			return []string{
+				oidStr, name, rolsuper,
+				"t", // rolinherit: PG default, never overridden by goopg's role DDL
+				"f", // rolcreaterole: not modelled
+				"f", // rolcreatedb: not modelled
+				rolcanlogin,
+				"f", // rolreplication: not modelled
+				"f", // rolbypassrls: not modelled
+				"-1", // rolconnlimit: PG default (no limit), not modelled
+				rolpassword,
+				VirtualNull, // rolvaliduntil: not modelled
+			}
+		}
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		out := [][]string{rowFor("10", "postgres", c.roleAttrs["postgres"])}
+		names := make([]string, 0, len(c.roles))
+		for name := range c.roles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			out = append(out, rowFor(fmt.Sprintf("%d", c.roles[name]), name, c.roleAttrs[name]))
+		}
+		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat), same
+		// gap/rationale as pg_roles above (0119-0004ch ledger discovery (a)):
+		// a zero-value RoleAttrs{} drives rowFor's defaults to exactly PG's
+		// predefined-role shape (rolsuper/rolcanlogin='f', rolpassword NULL),
+		// matching SyncPgAuthidFile's frozen rows.
+		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
+		for _, s := range predefinedRoleSeeds {
+			predefinedNames = append(predefinedNames, s.name)
+		}
+		sort.Strings(predefinedNames)
+		for _, name := range predefinedNames {
+			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{}))
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_authid"] = pgAuthid
+
+	// pg_auth_members — role membership (`GRANT <role> TO <role>`), sourced
+	// from the roleMembers registry GRANT/REVOKE ROLE maintains
+	// (RoleMembershipEntries), including the per-grant WITH INHERIT/SET
+	// option values a real GRANT requested (GrantRoleMembership). Registered
+	// so pg_dumpall's dumpRoleMembership query resolves instead of failing
+	// with "relation does not exist" (M0119-0004-ACLHEAP follow-up).
+	pgAuthMembers := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_auth_members",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "roleid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "member", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "grantor", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "admin_option", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "inherit_option", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "set_option", Type: Type{Name: "bool"}, Ordinal: 6},
+		},
+		OID:     1261, // upstream's AuthMemRelationId
+		Virtual: true,
+	}
+	pgAuthMembers.VirtualRows = func() [][]string {
+		entries := c.RoleMembershipEntries()
+		if len(entries) == 0 {
+			return nil
+		}
+		tf := func(b bool) string {
+			if b {
+				return "t"
+			}
+			return "f"
+		}
+		out := make([][]string, 0, len(entries))
+		for _, m := range entries {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(m.OID), 10),
+				strconv.FormatUint(uint64(m.RoleOID), 10),
+				strconv.FormatUint(uint64(m.MemberOID), 10),
+				strconv.FormatUint(uint64(m.GrantorOID), 10),
+				tf(m.AdminOption),
+				tf(m.InheritOption),
+				tf(m.SetOption),
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_auth_members"] = pgAuthMembers
+
+	// pg_parameter_acl — GUC-level ACLs (`GRANT SET|ALTER SYSTEM ON PARAMETER
+	// ...`). Registered so pg_dumpall's getParameterACLs query resolves
+	// instead of failing with "relation does not exist"; rows are projected
+	// from the parameterACLOIDs/parameterACLNames registry, populated lazily
+	// by execParameterACLChange on the first GRANT ON PARAMETER for a given
+	// GUC name (mirrors PostgreSQL's own lazy ParameterAclCreate — a GUC never
+	// appears here until it has been granted at least once).
+	// M0119-0004-ACLHEAP (parameter ACL half).
+	pgParameterACL := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_parameter_acl",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "parname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "paracl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
+		},
+		OID:     6243, // upstream's ParameterAclRelationId
+		Virtual: true,
+	}
+	pgParameterACL.VirtualRows = func() [][]string {
+		entries := c.ParameterACLEntries()
+		if len(entries) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(entries))
+		for _, e := range entries {
+			paracl := VirtualNull
+			if aclText := c.ParameterACLText(e.OID); aclText != "" {
+				paracl = aclText
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(e.OID), 10),
+				e.Parname,
+				paracl,
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_parameter_acl"] = pgParameterACL
 
 	// pg_tables — HammerDB probes
 	// `SELECT 1 FROM pg_tables WHERE schemaname = 'public'` to
@@ -6636,7 +7676,7 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2601,
 	}
 	pgAm.VirtualRows = func() [][]string {
-		return [][]string{
+		rows := [][]string{
 			{"2", "heap", "3", "t"},
 			{"403", "btree", "330", "i"},
 			{"405", "hash", "331", "i"},
@@ -6645,6 +7685,19 @@ func (c *InMemory) registerSystemTables() {
 			{"4000", "spgist", "334", "i"},
 			{"3580", "brin", "335", "i"},
 		}
+		// Surface user-created access methods (CREATE ACCESS METHOD) so they
+		// round-trip through pg_dump's getAccessMethods (only oid >=
+		// FirstNormalObjectId rows are dumpable — the 7 built-ins above are
+		// filtered out there, not here). DU-002 (M0119-0004).
+		for _, am := range c.ListAccessMethods() {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(am.OID), 10),
+				am.Name,
+				strconv.FormatUint(uint64(am.HandlerOID), 10),
+				am.AMType,
+			})
+		}
+		return rows
 	}
 	c.tables["pg_catalog.pg_am"] = pgAm
 
@@ -7003,10 +8056,17 @@ func (c *InMemory) registerSystemTables() {
 	// pg_opclass` — it reads ALL operator classes and filters out system-defined
 	// ones at dump-out time by namespace dumpability. A CREATE OPERATOR CLASS
 	// registers a row here (catalog.UserOperatorClass, ListUserOperatorClasses)
-	// so pg_dump's getOpclasses/dumpOpclass re-emit it; with none registered
-	// this view is empty exactly as before. The built-ins are in pg_catalog
-	// (never dumped). Schema matches PG's pg_opclass (pg_opclass.h). M0110-0001
-	// (DU-002 slice 10; CREATE OPERATOR CLASS support added M0119-0004).
+	// so pg_dump's getOpclasses/dumpOpclass re-emit it. A small set of built-in
+	// default btree opclasses (builtinRangeSubtypeOpclasses) is also surfaced —
+	// real PG's pg_opclass genuinely contains ~600 built-in rows queryable via
+	// plain SQL (pg_dump's own comment above: "we filter out system-defined
+	// opclasses at dump-out time", i.e. client-side by namespace, not via a SQL
+	// WHERE clause) — goopg exposes just enough of them for a range type's
+	// `pg_range.rngsubopc` to resolve via the `dumpRangeType` join. They stay
+	// out of the dump: their opcnamespace (pg_catalog, 11) is never dumpable.
+	// Schema matches PG's pg_opclass (pg_opclass.h). M0110-0001 (DU-002 slice
+	// 10; CREATE OPERATOR CLASS support added M0119-0004; built-in range
+	// subtype opclasses added M0110-0001 range-type round-trip).
 	pgOpclass := &Table{
 		Schema: "pg_catalog", Name: "pg_opclass", Virtual: true,
 		Columns: []Column{
@@ -7024,10 +8084,24 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgOpclass.VirtualRows = func() [][]string {
 		classes := c.ListUserOperatorClasses()
-		if len(classes) == 0 {
+		var builtinRows [][]string
+		if rts := c.ListRangeTypes(); len(rts) > 0 {
+			seen := make(map[uint32]bool)
+			for _, rt := range rts {
+				if rt.OpclassOID == 0 || seen[rt.OpclassOID] {
+					continue
+				}
+				seen[rt.OpclassOID] = true
+				if row, ok := builtinOpclassRowByOID(rt.OpclassOID); ok {
+					builtinRows = append(builtinRows, row)
+				}
+			}
+		}
+		if len(classes) == 0 && len(builtinRows) == 0 {
 			return nil
 		}
-		out := make([][]string, 0, len(classes))
+		out := make([][]string, 0, len(classes)+len(builtinRows))
+		out = append(out, builtinRows...)
 		for _, oc := range classes {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(oc.OID), 10),                     // oid
@@ -7210,9 +8284,11 @@ func (c *InMemory) registerSystemTables() {
 	}
 	// Surface user-created FDWs (CREATE FOREIGN DATA WRAPPER) so they round-trip.
 	// fdwhandler/fdwvalidator are 0 (no handler) — the query's `::regproc` cast
-	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR. fdwacl
-	// and fdwoptions are NULL (empty string), so dumpACL emits nothing and the
-	// OPTIONS clause is skipped. DU-002 slice 375.
+	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR.
+	// fdwoptions is NULL (empty string) absent an OPTIONS clause, so the OPTIONS
+	// clause is skipped. fdwacl materializes via ForeignDataWrapperACLText so a
+	// `GRANT … ON FOREIGN DATA WRAPPER …` round-trips (DU-002 slice 428);
+	// DU-002 slice 375.
 	pgForeignDataWrapper.VirtualRows = func() [][]string {
 		fdws := c.ListForeignDataWrappers()
 		if len(fdws) == 0 {
@@ -7230,7 +8306,7 @@ func (c *InMemory) registerSystemTables() {
 				strconv.FormatUint(uint64(owner), 10), // fdwowner
 				"0",                                   // fdwhandler (regproc 0 → '-')
 				"0",                                   // fdwvalidator (regproc 0 → '-')
-				"",                                    // fdwacl (NULL)
+				c.ForeignDataWrapperACLText(f.OID),    // fdwacl
 				optionsArrayLiteral(f.Options),        // fdwoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
@@ -7270,8 +8346,12 @@ func (c *InMemory) registerSystemTables() {
 	// srvfdw resolves to the referenced FDW's stable OID (dumpForeignServer runs
 	// `SELECT fdwname FROM pg_foreign_data_wrapper WHERE oid = srvfdw` to recover
 	// the wrapper name). srvtype/srvversion are NULL (empty string), so the TYPE/
-	// VERSION clauses are omitted; srvacl/srvoptions are NULL, so dumpACL emits
-	// nothing and the OPTIONS clause is skipped. DU-002 slice 376.
+	// VERSION clauses are omitted; srvoptions is NULL absent an OPTIONS clause, so
+	// the OPTIONS clause is skipped. DU-002 slice 376. srvacl renders from the
+	// materialized ACL store (ForeignServerACLText) — NULL until a GRANT/REVOKE
+	// … ON FOREIGN SERVER … is recorded, matching acldefault('S', srvowner) and
+	// producing no spurious dumpACL output for the common no-grant case. DU-002
+	// slice 427.
 	pgForeignServer.VirtualRows = func() [][]string {
 		servers := c.ListForeignServers()
 		if len(servers) == 0 {
@@ -7290,7 +8370,7 @@ func (c *InMemory) registerSystemTables() {
 				strconv.FormatUint(uint64(c.ForeignDataWrapperOID(s.FdwName)), 10), // srvfdw
 				s.Type,                         // srvtype ("" → NULL, TYPE clause omitted)
 				s.Version,                      // srvversion ("" → NULL, VERSION clause omitted)
-				"",                             // srvacl (NULL)
+				c.ForeignServerACLText(s.OID),  // srvacl (NULL until a GRANT, DU-002 slice 427)
 				optionsArrayLiteral(s.Options), // srvoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
@@ -7469,13 +8549,12 @@ func (c *InMemory) registerSystemTables() {
 	//   WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid )
 	//   ORDER BY 3,4
 	// (pg_dump.c getCasts: range types' auto-generated casts are excluded via the
-	// NOT EXISTS against pg_range so they aren't dumped separately). goopg defines
-	// no range types (no CREATE TYPE ... AS RANGE), so an empty view (0 rows) is
-	// correct — the NOT EXISTS is always true, matching PG's outcome when no user
-	// range types exist. Schema matches PG's pg_range (pg_range.h): NOTE pg_range
-	// has NO oid column; rngtypid is the key. Cols: rngtypid oid, rngsubtype oid,
-	// rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc(oid),
-	// rngsubdiff regproc(oid). M0110-0001 (DU-002 slice 22).
+	// NOT EXISTS against pg_range so they aren't dumped separately). Schema
+	// matches PG's pg_range (pg_range.h): NOTE pg_range has NO oid column;
+	// rngtypid is the key. Cols: rngtypid oid, rngsubtype oid, rngmultitypid
+	// oid, rngcollation oid, rngsubopc oid, rngcanonical regproc, rngsubdiff
+	// regproc. M0110-0001 (DU-002 slice 22; populated M0110-0001 range-type
+	// round-trip).
 	pgRange := &Table{
 		Schema: "pg_catalog", Name: "pg_range", Virtual: true,
 		Columns: []Column{
@@ -7484,12 +8563,41 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "rngmultitypid", Type: Type{Name: "oid"}, Ordinal: 2},
 			{Name: "rngcollation", Type: Type{Name: "oid"}, Ordinal: 3},
 			{Name: "rngsubopc", Type: Type{Name: "oid"}, Ordinal: 4},
-			{Name: "rngcanonical", Type: Type{Name: "oid"}, Ordinal: 5},
-			{Name: "rngsubdiff", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "rngcanonical", Type: Type{Name: "regproc"}, Ordinal: 5},
+			{Name: "rngsubdiff", Type: Type{Name: "regproc"}, Ordinal: 6},
 		},
 		OID: 3541,
 	}
-	pgRange.VirtualRows = func() [][]string { return nil }
+	// Surface user-created range types (CREATE TYPE ... AS RANGE) so
+	// pg_dump's dumpRangeType join finds a row. rngcanonical/rngsubdiff are
+	// always "-" (unsupported `canonical`/`subtype_diff` options — DU-002
+	// deferral); rngcollation is RegisterRangeType's resolved
+	// RangeType.CollationOID (0/InvalidOid for a non-collatable subtype, the
+	// subtype's own default, or an explicit `collation` option override), so
+	// dumpRangeType's `CASE WHEN rngcollation = st.typcollation THEN 0 ...`
+	// still yields 0 for the common no-explicit-collation case but now also
+	// reflects a real override. DU-002 (M0110-0001, slice 429 follow-up
+	// sub-item (a)).
+	pgRange.VirtualRows = func() [][]string {
+		rts := c.ListRangeTypes()
+		if len(rts) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(rts))
+		for _, rt := range rts {
+			subtypeOID := TypeNameToOID(rt.SubtypeName)
+			out = append(out, []string{
+				strconv.FormatUint(uint64(rt.OID), 10),           // rngtypid
+				strconv.FormatUint(uint64(subtypeOID), 10),       // rngsubtype
+				strconv.FormatUint(uint64(rt.MultirangeOID), 10), // rngmultitypid
+				strconv.FormatUint(uint64(rt.CollationOID), 10),  // rngcollation
+				strconv.FormatUint(uint64(rt.OpclassOID), 10),    // rngsubopc
+				"-", // rngcanonical
+				"-", // rngsubdiff
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_range"] = pgRange
 
 	// pg_event_trigger — event-trigger catalog (OID 3466). After getCasts,
@@ -7956,6 +9064,79 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgSeclabels.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
+
+	// pg_shseclabel — the raw shared (cluster-wide) security-label catalog
+	// (pg_shseclabel.h, SharedSecLabelRelationId 3592). dumpDatabase's
+	// dumpSecLabel helper (pg_dump --create only) queries this base table
+	// directly for the connected database's row rather than going through the
+	// pg_seclabels view above (SELECT provider, label FROM pg_shseclabel WHERE
+	// classoid = 'pg_database'::regclass AND objoid = <dboid>). goopg supports
+	// no SECURITY LABEL, so an empty table (0 rows) is correct — identical to a
+	// stock cluster with no shared security labels applied. M0119-0004-ACLHEAP
+	// (datacl half).
+	pgShseclabel := &Table{
+		Schema: "pg_catalog", Name: "pg_shseclabel", Virtual: true,
+		Columns: []Column{
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "provider", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "label", Type: Type{Name: "text"}, Ordinal: 3},
+		},
+		OID: 3592,
+	}
+	pgShseclabel.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_shseclabel"] = pgShseclabel
+
+	// pg_db_role_setting — per-database/per-role GUC override catalog
+	// (pg_db_role_setting.h, DbRoleSettingRelationId 2964). dumpDatabaseConfig
+	// (pg_dump.c, --create only) queries `SELECT unnest(setconfig) FROM
+	// pg_db_role_setting WHERE setrole = 0 AND setdatabase = <dboid>` for
+	// `ALTER DATABASE ... SET ...` clauses, and separately `SELECT rolname,
+	// unnest(setconfig) FROM pg_db_role_setting s, pg_roles r WHERE setrole =
+	// r.oid AND setdatabase = <dboid>` for `ALTER ROLE ... IN DATABASE ...
+	// SET ...` clauses. `ALTER DATABASE ... SET`/`RESET` writes into
+	// SetDatabaseConfig/ResetDatabaseConfig (setrole=0 rows, v0 scope: only
+	// the live connected database, mirroring execDatabaseACLChange's datacl
+	// restriction), keyed by FirstUserOID (16384) to match the oid pg_dump
+	// already read from the pg_database row. `ALTER ROLE ... SET`/`RESET`
+	// writes into SetRoleConfig/ResetRoleConfig (setrole != 0 rows), keyed by
+	// the role's real OID and either 0 (cluster-wide) or the same
+	// FirstUserOID (`IN DATABASE`, same v0 single-live-database scope
+	// restriction). M0119-0004-ACLHEAP (ALTER DATABASE/ROLE ... SET
+	// follow-up).
+	pgDbRoleSetting := &Table{
+		Schema: "pg_catalog", Name: "pg_db_role_setting", Virtual: true,
+		Columns: []Column{
+			{Name: "setdatabase", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "setrole", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "setconfig", Type: Type{Name: "text[]"}, Ordinal: 2},
+		},
+		OID: 2964,
+	}
+	pgDbRoleSetting.VirtualRows = func() [][]string {
+		var out [][]string
+		dbOid := FirstUserOID
+		if entries := c.DatabaseConfigEntries(dbOid); len(entries) > 0 {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(dbOid), 10),
+				"0",
+				optionsArrayLiteral(entries),
+			})
+		}
+		// setrole != 0 rows: `ALTER ROLE ... [IN DATABASE ...] SET ...`
+		// (M0119-0004-ACLHEAP, ALTER ROLE ... SET follow-up). DBOid is 0 for
+		// a plain cluster-wide override (setdatabase=0) or FirstUserOID for
+		// the IN DATABASE form.
+		for _, row := range c.AllRoleConfigRows() {
+			out = append(out, []string{
+				strconv.FormatUint(uint64(row.DBOid), 10),
+				strconv.FormatUint(uint64(row.RoleOID), 10),
+				optionsArrayLiteral(row.Entries),
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_db_role_setting"] = pgDbRoleSetting
 
 	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per
 	// sequence relation). After getTables, pg_dump's getSequences issues:
@@ -9811,12 +10992,63 @@ func (c *InMemory) tempNamespaceOIDLocked(owner string) uint32 {
 	return c.tempNamespaces[owner]
 }
 
-// RoleExists reports whether a role with the given name has been registered.
+// RoleExists reports whether a role with the given name has been registered,
+// or is one of PG18's 16 built-in "pg_*" predefined roles (predefinedRoles —
+// M0119-0004-ACLHEAP).
 func (c *InMemory) RoleExists(name string) bool {
+	key := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	_, ok := c.roles[strings.ToLower(name)]
+	if _, ok := c.roles[key]; ok {
+		return true
+	}
+	_, ok := c.predefinedRoles[key]
 	return ok
+}
+
+// predefinedRoleSeeds lists PG18's 16 built-in "pg_*" predefined roles
+// (postgres/src/include/catalog/pg_authid.dat) and their fixed OIDs. Twin of
+// internal/initdb/initdb.go's `predefined` slice (heap seeding) and
+// internal/executor/pg_authid_sync.go's `pgAuthidPredefined` (heap resync) —
+// internal/catalog cannot import either (would create an import cycle), so
+// this is a third, deliberately independent copy; keep all three in sync.
+var predefinedRoleSeeds = []struct {
+	oid  uint32
+	name string
+}{
+	{6171, "pg_database_owner"},
+	{6181, "pg_read_all_data"},
+	{6182, "pg_write_all_data"},
+	{3373, "pg_monitor"},
+	{3374, "pg_read_all_settings"},
+	{3375, "pg_read_all_stats"},
+	{3377, "pg_stat_scan_tables"},
+	{4569, "pg_read_server_files"},
+	{4570, "pg_write_server_files"},
+	{4571, "pg_execute_server_program"},
+	{4200, "pg_signal_backend"},
+	{4544, "pg_checkpoint"},
+	{6337, "pg_maintain"},
+	{4550, "pg_use_reserved_connections"},
+	{6304, "pg_create_subscription"},
+	{6392, "pg_signal_autovacuum_worker"},
+}
+
+// RoleOIDPgDatabaseOwner is ROLE_PG_DATABASE_OWNER (postgres/src/include/
+// catalog/pg_authid.h): the predefined role whose "charter ... is to have
+// exactly one, implicit, situation-dependent member" —
+// check_role_membership_authorization (postgres/src/backend/commands/user.c)
+// rejects any explicit `GRANT pg_database_owner TO ...`. M0119-0004-ACLHEAP.
+const RoleOIDPgDatabaseOwner uint32 = 6171
+
+// newPredefinedRoleMap builds the name->OID lookup for predefinedRoleSeeds,
+// used to populate InMemory.predefinedRoles at construction.
+func newPredefinedRoleMap() map[string]uint32 {
+	m := make(map[string]uint32, len(predefinedRoleSeeds))
+	for _, s := range predefinedRoleSeeds {
+		m[s.name] = s.oid
+	}
+	return m
 }
 
 // RegisterRole records a user-created role. Called from CREATE ROLE/USER. A
@@ -9916,19 +11148,65 @@ func (c *InMemory) AllRoleStates() []RoleStateSnapshot {
 }
 
 // UnregisterRole removes a role from the registry. Called from DROP ROLE.
+// Also drops any pg_auth_members rows referencing the role's OID on either
+// side (roleid or member) — PG cascades membership removal automatically
+// when a role is dropped (DropRole, user.c), unlike an ordinary DROP
+// RESTRICT. M0119-0004-ACLHEAP.
 func (c *InMemory) UnregisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := strings.ToLower(name)
+	oid, hadOID := c.roles[key]
 	delete(c.roles, key)
 	delete(c.roleAttrs, key)
+	if !hadOID {
+		return
+	}
+	for mk := range c.roleMembers {
+		if mk.RoleOID == oid || mk.MemberOID == oid || mk.GrantorOID == oid {
+			delete(c.roleMembers, mk)
+		}
+	}
+	for sk := range c.roleSettings {
+		if sk.RoleOID == oid {
+			delete(c.roleSettings, sk)
+		}
+	}
+}
+
+// RenameRole re-keys a registered role's registry entry (the roles map and
+// its roleAttrs sidecar) from oldName to newName, preserving its OID and
+// attributes exactly like PostgreSQL's RenameRole (postgres/src/backend/
+// commands/user.c) — the role keeps the same pg_authid.oid, so existing
+// pg_policy.polroles/ownership references stay valid. Returns false when
+// oldName is unregistered (caller should raise "role does not exist");
+// callers are responsible for the pre-checks RenameRole itself doesn't
+// duplicate (new-name-already-exists, reserved "pg_" prefix). root-0021
+// follow-up (M0119-0004).
+func (c *InMemory) RenameRole(oldName, newName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	oldKey := strings.ToLower(oldName)
+	newKey := strings.ToLower(newName)
+	oid, ok := c.roles[oldKey]
+	if !ok {
+		return false
+	}
+	delete(c.roles, oldKey)
+	c.roles[newKey] = oid
+	if a, ok := c.roleAttrs[oldKey]; ok {
+		delete(c.roleAttrs, oldKey)
+		c.roleAttrs[newKey] = a
+	}
+	return true
 }
 
 // RoleOID returns the OID minted for a registered role, resolving the seeded
 // bootstrap superuser (`postgres`, OID 10 = BOOTSTRAP_SUPERUSERID) which is not
-// stored in the user-role map. The bool is false for an unknown role. Used by
-// CREATE POLICY ... TO <role> to record role OIDs in pg_policy.polroles.
-// DU-002 slice 330.
+// stored in the user-role map, and PG18's 16 built-in "pg_*" predefined roles
+// (predefinedRoles — M0119-0004-ACLHEAP). The bool is false for an unknown
+// role. Used by CREATE POLICY ... TO <role> to record role OIDs in
+// pg_policy.polroles. DU-002 slice 330.
 func (c *InMemory) RoleOID(name string) (uint32, bool) {
 	key := strings.ToLower(name)
 	if key == "postgres" {
@@ -9936,8 +11214,56 @@ func (c *InMemory) RoleOID(name string) (uint32, bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// predefinedRoles is checked FIRST and always wins: it is a fixed,
+	// install-time fact (unlike `roles`, whose CREATE ROLE producer does not
+	// yet port PG's IsReservedName "pg_"-prefix rejection — a pre-existing,
+	// separate gap), so an exact-name collision must never let a
+	// user-registered entry shadow a predefined role's real OID.
+	if oid, ok := c.predefinedRoles[key]; ok {
+		return oid, true
+	}
 	oid, ok := c.roles[key]
 	return oid, ok
+}
+
+// IsPredefinedRole reports whether name is one of PG18's 16 built-in "pg_*"
+// predefined roles (predefinedRoleSeeds) — a fixed, install-time fact,
+// distinct from the user-created `roles` registry. Backs DROP ROLE/USER/
+// GROUP's "pinned object" guard: PostgreSQL's checkSharedDependencies
+// (postgres/src/backend/catalog/pg_shdepend.c) rejects dropping any object
+// whose OID is below FirstUnpinnedObjectId (12000) with "cannot drop %s
+// because it is required by the database system" — every predefined role OID
+// qualifies. M0119-0004-ACLHEAP.
+func (c *InMemory) IsPredefinedRole(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.predefinedRoles[strings.ToLower(name)]
+	return ok
+}
+
+// roleNameForOIDLocked resolves oid against `roles` (preferring the
+// roleACLDisplay case-preserved spelling) and, failing that, against
+// predefinedRoles (whose canonical name IS its map key — predefined roles
+// are always registered lower-case, matching PG's own bare pg_authid
+// spelling). Caller must already hold c.mu (read or write). Shared by
+// RoleNameForOID/RoleNameForOIDOrUnknown so both reverse-lookups recognise a
+// predefined-role OID exactly like their forward counterpart, RoleOID.
+// M0119-0004-ACLHEAP.
+func (c *InMemory) roleNameForOIDLocked(oid uint32) (string, bool) {
+	for name, roid := range c.roles {
+		if roid == oid {
+			if disp, ok := c.roleACLDisplay[name]; ok {
+				return disp, true
+			}
+			return name, true
+		}
+	}
+	for name, roid := range c.predefinedRoles {
+		if roid == oid {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // RoleNameForOID is the reverse of RoleOID: it resolves a role OID back to the
@@ -9957,15 +11283,29 @@ func (c *InMemory) RoleNameForOID(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for name, roid := range c.roles {
-		if roid == oid {
-			if disp, ok := c.roleACLDisplay[name]; ok {
-				return disp
-			}
-			return name
-		}
+	if name, ok := c.roleNameForOIDLocked(oid); ok {
+		return name
 	}
 	return strconv.FormatUint(uint64(oid), 10)
+}
+
+// RoleNameForOIDOrUnknown mirrors ruleutils.c's pg_get_userbyid SQL builtin
+// exactly: it resolves oid to its role name, or PG's literal fallback string
+// "unknown (OID=n)" when no such role exists. This differs from
+// RoleNameForOID's own fallback (the bare numeral), which serves ACL-text
+// rendering internals rather than the SQL function's documented contract.
+// M0119-0004-ACLHEAP (parameter ACL half — used by dumpRoleGUCPrivs's
+// pg_get_userbyid(10) call).
+func (c *InMemory) RoleNameForOIDOrUnknown(oid uint32) string {
+	if oid == 10 {
+		return "postgres"
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if name, ok := c.roleNameForOIDLocked(oid); ok {
+		return name
+	}
+	return fmt.Sprintf("unknown (OID=%d)", oid)
 }
 
 // GrantTablePrivilege records that role may exercise priv on relOID. See the
@@ -10348,6 +11688,208 @@ var typeACLPrivOrder = []aclPrivLetter{
 // materialized typacl reproduces both default entries — structurally identical
 // to the function EXECUTE default (ownerFunctionACLString). M0119-0004-ACLHEAP.
 const ownerTypeACLString = "U"
+
+// parameterACLPrivOrder lists the GUC-level (pg_parameter_acl) privileges in
+// PostgreSQL's canonical aclitemout bit order: SET('s') precedes ALTER
+// SYSTEM('A') (ACL_ALL_RIGHTS_STR, acl.h — "...csAm"). pg_dumpall's
+// dumpRoleGUCPrivs diffs a parameter's paracl against acldefault('p',
+// BOOTSTRAP_SUPERUSERID) client-side in buildACLCommands and re-emits `GRANT
+// … ON PARAMETER …`, so projecting the privilege set in this order matches
+// the aclitem[] text PG stores in pg_parameter_acl.paracl. M0119-0004-ACLHEAP
+// (parameter ACL half).
+var parameterACLPrivOrder = []aclPrivLetter{
+	{"SET", 's'},
+	{"ALTER SYSTEM", 'A'},
+}
+
+// ownerParameterACLString is the privilege-letter string for the owner's full
+// set of parameter privileges, i.e. "sA" (ACL_ALL_RIGHTS_PARAMETER_ACL =
+// SET|ALTER_SYSTEM). Unlike TYPE/FUNCTION, PUBLIC gets NO implicit default
+// (acldefault('p', …)'s world_default is ACL_NO_RIGHTS) — structurally
+// identical to the plain table-privilege pattern (ownerTableACLString), not
+// the owner+PUBLIC pattern. PostgreSQL treats every parameter ACL as owned by
+// the bootstrap superuser (ExecGrant_Parameter hardcodes ownerId =
+// BOOTSTRAP_SUPERUSERID), matching goopg's single "postgres" owner/grantor.
+// M0119-0004-ACLHEAP (parameter ACL half).
+const ownerParameterACLString = "sA"
+
+// ParameterACLOID returns the synthetic pg_parameter_acl.oid for the
+// lower-cased dotted GUC name parname, minting one from the shared nextOID
+// counter and registering it in parameterACLNames on first use (mirrors
+// PostgreSQL's lazy ParameterAclCreate). Repeated calls for the same
+// parname are idempotent. M0119-0004-ACLHEAP (parameter ACL half).
+func (c *InMemory) ParameterACLOID(parname string) uint32 {
+	parname = strings.ToLower(strings.TrimSpace(parname))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if oid, ok := c.parameterACLOIDs[parname]; ok {
+		return oid
+	}
+	oid := c.allocOIDLocked()
+	c.parameterACLOIDs[parname] = oid
+	c.parameterACLNames[oid] = parname
+	return oid
+}
+
+// HasParameterACL reports whether parname already has a pg_parameter_acl
+// entry, without minting one. Mirrors ParameterAclLookup(parameter,
+// missing_ok=true): real PostgreSQL only runs
+// check_GUC_name_for_parameter_acl (name validation) inside
+// ParameterAclCreate, i.e. the first time a GRANT mints the entry — a
+// second GRANT, or any REVOKE, on an already-materialized parameter skips
+// the check. Callers use this to gate name validation the same way.
+func (c *InMemory) HasParameterACL(parname string) bool {
+	parname = strings.ToLower(strings.TrimSpace(parname))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.parameterACLOIDs[parname]
+	return ok
+}
+
+// ParameterACLText renders the materialized pg_parameter_acl.paracl text for
+// the GUC identified by paramOID, or "" (SQL NULL) when no privilege has been
+// granted away. Parameters share the OID-keyed ACL store with relations,
+// schemas, routines, types, and databases (goopg mints parameter-ACL OIDs
+// from the same nextOID counter, so there is no collision). M0119-0004-ACLHEAP
+// (parameter ACL half).
+func (c *InMemory) ParameterACLText(paramOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(paramOID, parameterACLPrivOrder, ownerParameterACLString)
+}
+
+// ParameterACLEntries returns every granted GUC's (oid, parname) pair, sorted
+// by parname, so pg_parameter_acl's VirtualRows can project a deterministic
+// row set mirroring pg_dumpall's `ORDER BY 1` (getParameterACLs/
+// dumpRoleGUCPrivs). Only parameters that have ever received a GRANT appear
+// here — PostgreSQL itself never rows a GUC in pg_parameter_acl until its
+// first GRANT (ParameterAclCreate is lazy). M0119-0004-ACLHEAP (parameter ACL
+// half).
+func (c *InMemory) ParameterACLEntries() []struct {
+	OID     uint32
+	Parname string
+} {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]struct {
+		OID     uint32
+		Parname string
+	}, 0, len(c.parameterACLNames))
+	for oid, name := range c.parameterACLNames {
+		out = append(out, struct {
+			OID     uint32
+			Parname string
+		}{OID: oid, Parname: name})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Parname < out[j].Parname })
+	return out
+}
+
+// foreignServerACLPrivOrder lists the foreign-server (pg_foreign_server)
+// privileges in PostgreSQL's canonical aclitemout order. A foreign server has
+// a single privilege, USAGE('U'). pg_dump's getForeignServers diffs a server's
+// srvacl against acldefault('S', srvowner) client-side in buildACLCommands and
+// re-emits `GRANT … ON FOREIGN SERVER …`, so projecting the privilege set in
+// this order matches the aclitem[] text PG stores in pg_foreign_server.srvacl.
+// DU-002 slice 427.
+var foreignServerACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+}
+
+// ownerForeignServerACLString is the privilege-letter string for the owner's
+// full set of foreign-server privileges, i.e. "U". Unlike a function/type, a
+// foreign server's world default is ACL_NO_RIGHTS (acldefault('S', owner) =
+// "{postgres=U/postgres}" — PUBLIC gets nothing), so the FOREIGN SERVER GRANT
+// recorder does NOT seed an implicit PUBLIC entry — the owner-only default
+// mirrors ownerSchemaACLString/ownerTableACLString, not the dual owner+PUBLIC
+// shape of ownerFunctionACLString/ownerTypeACLString. DU-002 slice 427.
+const ownerForeignServerACLString = "U"
+
+// ForeignServerACLText renders the materialized pg_foreign_server.srvacl text
+// for the foreign server identified by srvOID, or "" (SQL NULL) when no
+// privileges have been granted away. Foreign servers share the OID-keyed ACL
+// store with relations, schemas, routines, and types (goopg mints foreign-
+// server OIDs from the same nextOID counter, so there is no collision).
+// pg_dump's getForeignServers diffs srvacl against acldefault('S', srvowner)
+// client-side in buildACLCommands, so projecting the correct aclitem[] text is
+// sufficient for the `GRANT … ON FOREIGN SERVER …` round-trip. DU-002 slice 427.
+func (c *InMemory) ForeignServerACLText(srvOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(srvOID, foreignServerACLPrivOrder, ownerForeignServerACLString)
+}
+
+// foreignDataWrapperACLPrivOrder lists the foreign-data-wrapper
+// (pg_foreign_data_wrapper) privileges in PostgreSQL's canonical aclitemout
+// order. Like a foreign server, an FDW has a single privilege, USAGE('U')
+// (ACL_ALL_RIGHTS_FDW == ACL_USAGE, acl.h) — projecting the privilege set in
+// this order matches the aclitem[] text PG stores in
+// pg_foreign_data_wrapper.fdwacl. DU-002 slice 428.
+var foreignDataWrapperACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+}
+
+// ownerForeignDataWrapperACLString is the privilege-letter string for the
+// owner's full set of foreign-data-wrapper privileges, i.e. "U". An FDW's
+// world default is ACL_NO_RIGHTS (acldefault('F', owner) =
+// "{postgres=U/postgres}" — PUBLIC gets nothing, same as OBJECT_FOREIGN_SERVER
+// right below OBJECT_FDW in acl.c's acldefault switch), so the FOREIGN DATA
+// WRAPPER GRANT recorder does NOT seed an implicit PUBLIC entry — mirrors
+// ownerForeignServerACLString. DU-002 slice 428.
+const ownerForeignDataWrapperACLString = "U"
+
+// ForeignDataWrapperACLText renders the materialized
+// pg_foreign_data_wrapper.fdwacl text for the FDW identified by fdwOID, or ""
+// (SQL NULL) when no privileges have been granted away. FDWs share the
+// OID-keyed ACL store with relations, schemas, routines, types, and foreign
+// servers (goopg mints FDW OIDs from the same nextOID counter, so there is no
+// collision). pg_dump's getForeignDataWrappers diffs fdwacl against
+// acldefault('F', fdwowner) client-side in buildACLCommands, so projecting
+// the correct aclitem[] text is sufficient for the `GRANT … ON FOREIGN DATA
+// WRAPPER …` round-trip. DU-002 slice 428.
+func (c *InMemory) ForeignDataWrapperACLText(fdwOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(fdwOID, foreignDataWrapperACLPrivOrder, ownerForeignDataWrapperACLString)
+}
+
+// databaseACLPrivOrder lists the database (pg_database) privileges in
+// PostgreSQL's canonical aclitemout bit order: CREATE('C'), TEMPORARY('T'),
+// CONNECT('c') (ACL_ALL_RIGHTS_DATABASE, acl.h). pg_dump's getDatabases diffs
+// datacl against acldefault('d', datdba) client-side in buildACLCommands, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_database.datacl. M0119-0004-ACLHEAP (datacl half).
+var databaseACLPrivOrder = []aclPrivLetter{
+	{"CREATE", 'C'},
+	{"TEMPORARY", 'T'},
+	{"CONNECT", 'c'},
+}
+
+// ownerDatabaseACLString is the privilege-letter string for the owner's full
+// set of database privileges, i.e. "CTc". Unlike a type/function (whose
+// world default equals the owner default), a database's world_default is
+// ACL_CREATE_TEMP | ACL_CONNECT — PUBLIC gets TEMPORARY+CONNECT but NOT
+// CREATE — so the DATABASE GRANT recorder seeds PUBLIC's reduced default
+// explicitly rather than reusing this owner string. M0119-0004-ACLHEAP
+// (datacl half).
+const ownerDatabaseACLString = "CTc"
+
+// DatabaseACLText renders the materialized pg_database.datacl text for the
+// database identified by dbOID, or "" (SQL NULL) when no privileges have been
+// granted away. Databases share the OID-keyed ACL store with relations,
+// schemas, routines, types, and foreign objects (goopg mints database OIDs
+// from a disjoint range at initdb, so there is no collision). pg_dump's
+// getDatabases diffs datacl against acldefault('d', datdba) client-side in
+// buildACLCommands, so projecting the correct aclitem[] text is the renderer
+// half of the `GRANT … ON DATABASE …` round-trip; the GRANT path must
+// additionally re-sync this text into the heap-backed pg_database row
+// (M0119-0004-ACLHEAP, pg_database is a SHARED catalog — a single relfilenode,
+// not duplicated per connected database like pg_type/pg_attribute).
+func (c *InMemory) DatabaseACLText(dbOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(dbOID, databaseACLPrivOrder, ownerDatabaseACLString)
+}
 
 // attrACLKey identifies one table column for column-level (pg_attribute.attacl)
 // privilege tracking: the owning relation's OID plus the column's 1-based
@@ -10815,6 +12357,101 @@ func (c *InMemory) LookupForeignDataWrapper(name string) (*ForeignDataWrapper, b
 	defer c.mu.RUnlock()
 	f, ok := c.fdws[name]
 	return f, ok
+}
+
+// AccessMethod is a user-created access method (CREATE ACCESS METHOD). goopg
+// never invokes a user-defined AM (no pluggable table/index storage engine);
+// this records just enough metadata to round-trip the CREATE through pg_dump
+// (pg_am virtual view → getAccessMethods/dumpAccessMethod). DU-002
+// (M0119-0004).
+type AccessMethod struct {
+	Name       string // amname
+	OID        uint32 // pg_am.oid (assigned from the catalog OID counter)
+	AMType     string // pg_am.amtype: "i" (INDEX) or "t" (TABLE)
+	HandlerOID uint32 // pg_am.amhandler — FK to pg_proc
+}
+
+// RegisterAccessMethod records a user-defined access method. Returns an error
+// if the name collides with a built-in AM (pg_am's static 7 rows) or an
+// already-registered user AM — mirrors PostgreSQL's own duplicate-name check
+// in CreateAccessMethod (amcmds.c), which errors before this ever reaches the
+// catalog. DU-002 (M0119-0004).
+func (c *InMemory) RegisterAccessMethod(name, amType string, handlerOID uint32) (*AccessMethod, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if AccessMethodOIDByName(name) != 0 {
+		return nil, fmt.Errorf("access method %q already exists", name)
+	}
+	if c.accessMethods == nil {
+		c.accessMethods = make(map[string]*AccessMethod)
+	}
+	if _, ok := c.accessMethods[name]; ok {
+		return nil, fmt.Errorf("access method %q already exists", name)
+	}
+	am := &AccessMethod{Name: name, OID: c.allocOIDLocked(), AMType: amType, HandlerOID: handlerOID}
+	c.accessMethods[name] = am
+	return am, nil
+}
+
+// DropAccessMethod removes a user-defined access method from the registry.
+// Returns true if found. DU-002 (M0119-0004).
+func (c *InMemory) DropAccessMethod(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accessMethods == nil {
+		return false
+	}
+	if _, ok := c.accessMethods[name]; ok {
+		delete(c.accessMethods, name)
+		return true
+	}
+	return false
+}
+
+// ListAccessMethods returns all registered user-defined access methods
+// sorted by name. DU-002 (M0119-0004).
+func (c *InMemory) ListAccessMethods() []*AccessMethod {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.accessMethods) == 0 {
+		return nil
+	}
+	out := make([]*AccessMethod, 0, len(c.accessMethods))
+	for _, am := range c.accessMethods {
+		out = append(out, am)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// RegisterAccessMethodDuringRecovery is the idempotent version of
+// RegisterAccessMethod used by the WAL-replay driver
+// (internal/initdb/access_method_ddl_recovery.go). Unlike
+// RegisterAccessMethod it takes the OID from the WAL record (so the
+// recovered access method matches the pre-crash OID exactly) and overwrites
+// rather than erroring when an access method with the same name is already
+// present (replay may see the same record more than once across a
+// partial-then-full replay). Mirrors catalog.InMemory.
+// RegisterEventTriggerDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004, DU-002 slice 426 ledger resume point).
+func (c *InMemory) RegisterAccessMethodDuringRecovery(am *AccessMethod) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.accessMethods == nil {
+		c.accessMethods = make(map[string]*AccessMethod)
+	}
+	out := *am
+	c.accessMethods[am.Name] = &out
+	c.advanceNextOIDLocked(am.OID)
+}
+
+// DropAccessMethodDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropAccessMethod. Identical to DropAccessMethod but
+// discards the found/not-found result — replay does not care whether the
+// access method was still present. DU-002 restart-persistence follow-up
+// (M0119-0004, DU-002 slice 426 ledger resume point).
+func (c *InMemory) DropAccessMethodDuringRecovery(name string) {
+	_ = c.DropAccessMethod(name)
 }
 
 // EventTrigger is a user-created event trigger (CREATE EVENT TRIGGER). goopg
@@ -11525,6 +13162,55 @@ func (c *InMemory) DropUserOperator(schema, name, leftType, rightType string) bo
 	return false
 }
 
+// RegisterUserOperatorDuringRecovery is the idempotent version of
+// RegisterUserOperator used by the WAL-replay driver
+// (internal/initdb/operator_ddl_recovery.go). Unlike RegisterUserOperator it
+// takes the OID (and every cross-reference field) from the WAL record so the
+// recovered operator matches the pre-crash server exactly, and advances
+// nextOID past it so subsequent allocations do not collide. Re-applying a
+// record for an operator that already exists just overwrites it in place.
+// Mirrors RegisterRangeTypeDuringRecovery/RegisterUserAggregateDuringRecovery.
+// `schema` resolves the operator's NamespaceOID the same way
+// RegisterUserAggregateDuringRecovery does (unknown/empty → public); this
+// depends on replaySchemaDDLRecords having already restored the schema
+// registry, which the caller (replayOperatorDDLRecords) guarantees by
+// running after it. DU-002 restart-persistence follow-up (M0119-0004/
+// M0110-0001, discovered while verifying the loop #64 CREATE TYPE ... AS
+// RANGE opclass/collation follow-up — see ledger).
+func (c *InMemory) RegisterUserOperatorDuringRecovery(op *UserOperator, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		c.userOperators = make(map[string]*UserOperator)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	out := *op
+	out.NamespaceOID = nsOID
+	key := userOperatorKey(schema, op.Name, op.LeftType, op.RightType)
+	c.userOperators[key] = &out
+	c.advanceNextOIDLocked(op.OID)
+}
+
+// DropUserOperatorByOIDDuringRecovery is the recovery counterpart used for
+// replaying RecordKindDropOperator. Identical in spirit to DropUserOperator
+// but keyed by OID (DROP OPERATOR's own overload resolution already
+// happened live, so the WAL record carries the OID directly, mirroring
+// DropByOIDDuringRecovery for routines). Discards the found/not-found
+// result — replay does not care whether the operator was still present.
+func (c *InMemory) DropUserOperatorByOIDDuringRecovery(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, op := range c.userOperators {
+		if op.OID == oid {
+			delete(c.userOperators, key)
+			return
+		}
+	}
+}
+
 // ListUserOperators returns all registered user operators sorted by OID
 // (stable creation order). DU-002 (M0119-0004).
 func (c *InMemory) ListUserOperators() []*UserOperator {
@@ -11701,8 +13387,37 @@ func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID,
 	return f
 }
 
+// RegisterUserOperatorFamilyDuringRecovery is the idempotent version of
+// RegisterUserOperatorFamily used by the WAL-replay driver
+// (internal/initdb/operator_class_ddl_recovery.go). Unlike
+// RegisterUserOperatorFamily it takes the OID from the WAL record so the
+// recovered family matches the pre-crash server exactly, and advances
+// nextOID past it. `schema` resolves the family's NamespaceOID the same way
+// RegisterUserOperatorDuringRecovery does (unknown/empty → public); this
+// depends on replaySchemaDDLRecords having already restored the schema
+// registry. DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+// closing the loop #65/#66 ledger row's "still open" item (1)).
+func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamily, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorFamilies == nil {
+		c.userOperatorFamilies = make(map[string]*UserOperatorFamily)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	out := *f
+	out.NamespaceOID = nsOID
+	key := userOpFamilyKey(schema, f.Name, f.Method)
+	c.userOperatorFamilies[key] = &out
+	c.advanceNextOIDLocked(f.OID)
+}
+
 // DropUserOperatorFamily removes a user-defined operator family from the
-// registry. Returns true if one was found and removed. DU-002 (M0119-0004).
+// registry, along with any pg_amop/pg_amproc member rows attributed to it
+// (mirrors DropUserOperatorClass's own member purge). Returns true if one
+// was found and removed. DU-002 (M0119-0004).
 func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -11710,11 +13425,56 @@ func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bo
 		return false
 	}
 	key := userOpFamilyKey(schema, name, method)
-	if _, ok := c.userOperatorFamilies[key]; ok {
-		delete(c.userOperatorFamilies, key)
-		return true
+	fam, ok := c.userOperatorFamilies[key]
+	if !ok {
+		return false
 	}
-	return false
+	delete(c.userOperatorFamilies, key)
+	c.purgeAmMembersForFamilyLocked(fam.OID)
+	return true
+}
+
+// purgeAmMembersForFamilyLocked removes every pg_amop/pg_amproc row owned by
+// familyOID (both class-owned and "loose" ALTER OPERATOR FAMILY ... ADD
+// members). Caller must hold c.mu. DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001, closing the loop #69 ledger row's "DROP OPERATOR
+// FAMILY never actually calls DropUserOperatorFamily" discovery).
+func (c *InMemory) purgeAmMembersForFamilyLocked(familyOID uint32) {
+	kept := c.amOpMembers[:0]
+	for _, m := range c.amOpMembers {
+		if m.FamilyOID != familyOID {
+			kept = append(kept, m)
+		}
+	}
+	c.amOpMembers = kept
+	keptP := c.amProcMembers[:0]
+	for _, m := range c.amProcMembers {
+		if m.FamilyOID != familyOID {
+			keptP = append(keptP, m)
+		}
+	}
+	c.amProcMembers = keptP
+}
+
+// DropUserOperatorFamilyByOIDDuringRecovery is the recovery counterpart used
+// for replaying RecordKindDropOperatorFamily. Identical in spirit to
+// DropUserOperatorFamily (removes the family row plus every amop/amproc row
+// it owns) but keyed by OID — DROP OPERATOR FAMILY's own existence check and
+// name/method resolution already happened live, so the WAL record carries
+// the OID directly, mirroring DropUserOperatorClassByOIDDuringRecovery.
+// Discards the found/not-found result — replay does not care whether the
+// family was still present. DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001).
+func (c *InMemory) DropUserOperatorFamilyByOIDDuringRecovery(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, fam := range c.userOperatorFamilies {
+		if fam.OID == oid {
+			delete(c.userOperatorFamilies, key)
+			break
+		}
+	}
+	c.purgeAmMembersForFamilyLocked(oid)
 }
 
 // ListUserOperatorFamilies returns all registered user operator families
@@ -11828,6 +13588,53 @@ func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, 
 	return oc
 }
 
+// RegisterUserOperatorClassDuringRecovery is the idempotent version of
+// RegisterUserOperatorClass used by the WAL-replay driver
+// (internal/initdb/operator_class_ddl_recovery.go). Unlike
+// RegisterUserOperatorClass it takes the OID (and FamilyOID) from the WAL
+// record so the recovered class matches the pre-crash server exactly, and
+// advances nextOID past it. Also repopulates the legacy opClassSchemas
+// registry (RegisterOpClassSchema's backing map) so a post-restart DROP
+// OPERATOR CLASS — which checks HasOpClass, not userOperatorClasses — still
+// finds the class, mirroring what the live execCreateOpClass path does via
+// its own separate RegisterOpClassSchema call. `schema` resolves
+// NamespaceOID the same way RegisterUserOperatorDuringRecovery does. DU-002
+// restart-persistence follow-up (M0119-0004/M0110-0001, closing the
+// loop #65/#66 ledger row's "still open" item (1)).
+func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorClasses == nil {
+		c.userOperatorClasses = make(map[string]*UserOperatorClass)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	out := *oc
+	out.NamespaceOID = nsOID
+	key := userOpClassKey(schema, oc.Name, oc.Method)
+	c.userOperatorClasses[key] = &out
+	if c.opClassSchemas == nil {
+		c.opClassSchemas = make(map[string]string)
+	}
+	c.opClassSchemas[oc.Name] = schema
+	c.advanceNextOIDLocked(oc.OID)
+}
+
+// LookupUserOperatorClass finds a previously-registered operator class by
+// its identity (schema, name, method). Used by execDropCompat's DROP
+// OPERATOR CLASS path to recover the class's OID before removing it, so the
+// removal can be WAL-logged by OID (mirroring DROP OPERATOR's own
+// look-up-then-drop-by-OID shape). DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001).
+func (c *InMemory) LookupUserOperatorClass(schema, name string, method uint32) (*UserOperatorClass, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oc, ok := c.userOperatorClasses[userOpClassKey(schema, name, method)]
+	return oc, ok
+}
+
 // DropUserOperatorClass removes a user-defined operator class from the
 // registry, along with any pg_amop/pg_amproc member rows attributed to it
 // (slice 411). Returns true if one was found and removed. DU-002 (M0119-0004).
@@ -11859,6 +13666,46 @@ func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) boo
 	}
 	c.amProcMembers = keptP
 	return true
+}
+
+// DropUserOperatorClassByOIDDuringRecovery is the recovery counterpart used
+// for replaying RecordKindDropOperatorClass. Identical in spirit to
+// DropUserOperatorClass (removes the class row plus every amop/amproc row it
+// owns) but keyed by OID — DROP OPERATOR CLASS's own existence check and
+// name/method resolution already happened live, so the WAL record carries
+// the OID directly, mirroring DropUserOperatorByOIDDuringRecovery. Also
+// removes the legacy opClassSchemas entry, mirroring the live
+// execDropCompat path's RemoveOpClass call. Discards the found/not-found
+// result — replay does not care whether the class was still present.
+// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001).
+func (c *InMemory) DropUserOperatorClassByOIDDuringRecovery(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var name string
+	for key, oc := range c.userOperatorClasses {
+		if oc.OID == oid {
+			name = oc.Name
+			delete(c.userOperatorClasses, key)
+			break
+		}
+	}
+	kept := c.amOpMembers[:0]
+	for _, m := range c.amOpMembers {
+		if m.ClassOID != oid {
+			kept = append(kept, m)
+		}
+	}
+	c.amOpMembers = kept
+	keptP := c.amProcMembers[:0]
+	for _, m := range c.amProcMembers {
+		if m.ClassOID != oid {
+			keptP = append(keptP, m)
+		}
+	}
+	c.amProcMembers = keptP
+	if name != "" {
+		delete(c.opClassSchemas, name)
+	}
 }
 
 // ListUserOperatorClasses returns all registered user operator classes sorted
@@ -11932,6 +13779,30 @@ func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, 
 	return m
 }
 
+// RegisterAmOpMemberDuringRecovery is the idempotent version of
+// RegisterAmOpMember used by the WAL-replay driver
+// (internal/initdb/operator_class_ddl_recovery.go). Unlike RegisterAmOpMember
+// it takes the OID from the WAL record (covers both a CREATE OPERATOR
+// CLASS ... AS list entry and an ALTER OPERATOR FAMILY ... ADD entry — both
+// go through registerOpClassMembers and share the same AmOpMember shape) and
+// advances nextOID past it. Re-applying a record for a member that already
+// exists (same OID) just overwrites it in place. DU-002 restart-persistence
+// follow-up (M0119-0004/M0110-0001).
+func (c *InMemory) RegisterAmOpMemberDuringRecovery(m *AmOpMember) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := *m
+	for i, existing := range c.amOpMembers {
+		if existing.OID == m.OID {
+			c.amOpMembers[i] = &out
+			c.advanceNextOIDLocked(m.OID)
+			return
+		}
+	}
+	c.amOpMembers = append(c.amOpMembers, &out)
+	c.advanceNextOIDLocked(m.OID)
+}
+
 // RegisterAmProcMember records one pg_amproc row, allocating a stable OID.
 // Mirrors RegisterAmOpMember. DU-002 (M0119-0004) slice 411.
 func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType, procNum, procOID, method uint32) *AmProcMember {
@@ -11944,6 +13815,25 @@ func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType
 	}
 	c.amProcMembers = append(c.amProcMembers, m)
 	return m
+}
+
+// RegisterAmProcMemberDuringRecovery is the idempotent version of
+// RegisterAmProcMember used by the WAL-replay driver. Mirrors
+// RegisterAmOpMemberDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001).
+func (c *InMemory) RegisterAmProcMemberDuringRecovery(m *AmProcMember) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := *m
+	for i, existing := range c.amProcMembers {
+		if existing.OID == m.OID {
+			c.amProcMembers[i] = &out
+			c.advanceNextOIDLocked(m.OID)
+			return
+		}
+	}
+	c.amProcMembers = append(c.amProcMembers, &out)
+	c.advanceNextOIDLocked(m.OID)
 }
 
 // ListAmOpMembers returns all registered pg_amop rows in creation order.
@@ -13816,6 +15706,467 @@ func (c *InMemory) LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bo
 		}
 	}
 	return nil, false
+}
+
+// builtinOpclassInfo describes one built-in btree operator class row, enough
+// to satisfy pg_dump's `dumpRangeType` join (`pg_range r, pg_type st,
+// pg_opclass opc WHERE opc.oid = rngsubopc`) and to serve as the resolved
+// default opclass for a `CREATE TYPE ... AS RANGE (subtype = ...)`. OIDs/
+// family OIDs are the real PG18 values (postgres/src/include/catalog/
+// pg_opclass.dat), duplicated from internal/initdb/initdb.go's
+// pgOpclassEntry list (executor/catalog cannot import initdb — import
+// cycle — see pgTypeColumnsPG18 for the same duplication pattern).
+type builtinOpclassInfo struct {
+	OID      uint32
+	Name     string
+	Family   uint32
+	IntypeOID uint32
+}
+
+const btreeAccessMethodOID uint32 = 403
+
+// builtinRangeSubtypeOpclasses covers every PG18 built-in scalar type that
+// has a real default btree operator class, keyed by the subtype's own pg_type
+// OID — not just the five built-in range types' subtypes (int4/int8/numeric/
+// date/timestamp/timestamptz). Values were captured empirically from a live
+// `postgres/local_install` PG 18.3 instance (`select oid, opcname, opcfamily
+// from pg_opclass where opcmethod = btree's oid and opcdefault`, cross-checked
+// per-subtype via `CREATE TYPE ... AS RANGE (subtype = ...)` +
+// `pg_range.rngsubopc`), since most of these opclass OIDs are genbki-assigned
+// (not pinned in pg_opclass.dat) and so aren't derivable from source alone —
+// same reasoning as the pgOpclassEntry duplication note above. Two subtypes
+// resolve to an opclass whose own opcintype differs from the subtype: varchar
+// has no *default* varchar_ops (opcdefault=false), so PG's opclass search
+// falls back to the binary-coercible text_ops (IntypeOID=OIDText); cidr binary
+// -coerces to inet_ops the same way (IntypeOID=OIDInet). A subtype outside
+// this set has no resolvable default opclass in goopg today — RegisterRangeType
+// reports that as PG's own ERRCODE_UNDEFINED_OBJECT ("... has no default
+// operator class for access method \"btree\"") rather than silently
+// registering a broken range. DU-002 (M0110-0001).
+var builtinRangeSubtypeOpclasses = map[uint32]builtinOpclassInfo{
+	OIDInt2:        {OID: 1979, Name: "int2_ops", Family: 1976, IntypeOID: OIDInt2},
+	OIDInt4:        {OID: 1978, Name: "int4_ops", Family: 1976, IntypeOID: OIDInt4},
+	OIDInt8:        {OID: 3124, Name: "int8_ops", Family: 1976, IntypeOID: OIDInt8},
+	OIDNumeric:     {OID: 3125, Name: "numeric_ops", Family: 1988, IntypeOID: OIDNumeric},
+	OIDFloat4:      {OID: 10012, Name: "float4_ops", Family: 1970, IntypeOID: OIDFloat4},
+	OIDFloat8:      {OID: 3123, Name: "float8_ops", Family: 1970, IntypeOID: OIDFloat8},
+	OIDDate:        {OID: 3122, Name: "date_ops", Family: 434, IntypeOID: OIDDate},
+	OIDTime:        {OID: 10038, Name: "time_ops", Family: 1996, IntypeOID: OIDTime},
+	OIDTimeTZ:      {OID: 10041, Name: "timetz_ops", Family: 2000, IntypeOID: OIDTimeTZ},
+	OIDTimestamp:   {OID: 3128, Name: "timestamp_ops", Family: 434, IntypeOID: OIDTimestamp},
+	OIDTimestampTZ: {OID: 3127, Name: "timestamptz_ops", Family: 434, IntypeOID: OIDTimestampTZ},
+	OIDInterval:    {OID: 10022, Name: "interval_ops", Family: 1982, IntypeOID: OIDInterval},
+	OIDText:        {OID: 3126, Name: "text_ops", Family: 1994, IntypeOID: OIDText},
+	OIDVarChar:     {OID: 3126, Name: "text_ops", Family: 1994, IntypeOID: OIDText},
+	OIDBpChar:      {OID: 10004, Name: "bpchar_ops", Family: 426, IntypeOID: OIDBpChar},
+	OIDName:        {OID: 10028, Name: "name_ops", Family: 1994, IntypeOID: OIDName},
+	OIDChar:        {OID: 10007, Name: "char_ops", Family: 429, IntypeOID: OIDChar},
+	OIDBool:        {OID: 10003, Name: "bool_ops", Family: 424, IntypeOID: OIDBool},
+	OIDBytea:       {OID: 10006, Name: "bytea_ops", Family: 428, IntypeOID: OIDBytea},
+	OIDOID:         {OID: 1981, Name: "oid_ops", Family: 1989, IntypeOID: OIDOID},
+	OIDTid:         {OID: 10050, Name: "tid_ops", Family: 2789, IntypeOID: OIDTid},
+	OIDOidvector:   {OID: 10032, Name: "oidvector_ops", Family: 1991, IntypeOID: OIDOidvector},
+	OIDUUID:        {OID: 10065, Name: "uuid_ops", Family: 2968, IntypeOID: OIDUUID},
+	OIDPgLsn:       {OID: 10067, Name: "pg_lsn_ops", Family: 3253, IntypeOID: OIDPgLsn},
+	OIDXid8:        {OID: 10053, Name: "xid8_ops", Family: 5067, IntypeOID: OIDXid8},
+	OIDMoney:       {OID: 10047, Name: "money_ops", Family: 2099, IntypeOID: OIDMoney},
+	OIDBit:         {OID: 10002, Name: "bit_ops", Family: 423, IntypeOID: OIDBit},
+	OIDVarbit:      {OID: 10043, Name: "varbit_ops", Family: 2002, IntypeOID: OIDVarbit},
+	OIDMacaddr:     {OID: 10024, Name: "macaddr_ops", Family: 1984, IntypeOID: OIDMacaddr},
+	OIDMacaddr8:    {OID: 10026, Name: "macaddr8_ops", Family: 3371, IntypeOID: OIDMacaddr8},
+	OIDInet:        {OID: 10015, Name: "inet_ops", Family: 1974, IntypeOID: OIDInet},
+	OIDCidr:        {OID: 10015, Name: "inet_ops", Family: 1974, IntypeOID: OIDInet},
+}
+
+// DefaultBtreeOpclassForSubtype returns the default btree operator class OID
+// for a range subtype's pg_type OID, or ok=false if goopg has no default
+// opclass on record for it (see builtinRangeSubtypeOpclasses). M0110-0001.
+func DefaultBtreeOpclassForSubtype(subtypeOID uint32) (uint32, bool) {
+	oc, ok := builtinRangeSubtypeOpclasses[subtypeOID]
+	if !ok {
+		return 0, false
+	}
+	return oc.OID, true
+}
+
+// builtinOpclassRowByOID renders a single builtinRangeSubtypeOpclasses entry
+// as a pg_opclass virtual-table row (see pg_opclass's VirtualRows), so the
+// pg_dump `dumpRangeType` join finds a matching row for a range type's
+// resolved default opclass. Only emitted lazily, keyed by the OIDs actually
+// referenced by a registered range type — pg_opclass must otherwise stay
+// exactly as populated by CREATE OPERATOR CLASS (TestCreateOperatorClassPopulatesOpclassRow
+// and siblings assert an exact row count). opcnamespace=11 (pg_catalog),
+// opcowner=10 (bootstrap superuser), opcdefault=true, opckeytype=0 for all of
+// them — matching PG18's real rows. M0110-0001.
+func builtinOpclassRowByOID(oid uint32) ([]string, bool) {
+	for _, oc := range builtinRangeSubtypeOpclasses {
+		if oc.OID != oid {
+			continue
+		}
+		return []string{
+			strconv.FormatUint(uint64(oc.OID), 10),               // oid
+			strconv.FormatUint(uint64(btreeAccessMethodOID), 10), // opcmethod
+			oc.Name,                                    // opcname
+			"11",                                        // opcnamespace = pg_catalog
+			"10",                                        // opcowner = bootstrap superuser
+			strconv.FormatUint(uint64(oc.Family), 10),   // opcfamily
+			strconv.FormatUint(uint64(oc.IntypeOID), 10), // opcintype
+			"t", // opcdefault
+			"0", // opckeytype
+		}, true
+	}
+	return nil, false
+}
+
+// deriveMultirangeTypeName mirrors PostgreSQL's makeMultirangeTypeName
+// (postgres/src/backend/catalog/pg_type.c): if the range type name contains
+// "range", replace the first occurrence with "multirange"; otherwise append
+// "_multirange". M0110-0001.
+func deriveMultirangeTypeName(rangeName string) string {
+	if idx := strings.Index(rangeName, "range"); idx >= 0 {
+		return rangeName[:idx] + "multi" + rangeName[idx:]
+	}
+	return rangeName + "_multirange"
+}
+
+// RangeTypeOptionError carries the PostgreSQL SQLSTATE for a `CREATE TYPE
+// ... AS RANGE` option-resolution failure (missing default opclass, a named
+// `subtype_opclass` that doesn't exist or doesn't accept the subtype, or a
+// `collation` that doesn't exist or was given for a non-collatable subtype),
+// so the executor can report PG's own code instead of collapsing every
+// RegisterRangeType failure onto 42704 undefined_object. DU-002 (M0110-0001,
+// slice 429 follow-up sub-item (a)).
+type RangeTypeOptionError struct {
+	Code    string
+	Message string
+}
+
+func (e *RangeTypeOptionError) Error() string { return e.Message }
+
+// builtinCollationOIDByName resolves one of PG18's 7 BKI-pinned collation
+// names to its OID. Duplicated from the `pg_collation` VirtualRows seed
+// above / the executor's own `collationNameToOID` (internal/executor/
+// pg18_user_catalog_rows.go) rather than shared, since RegisterRangeType
+// lives in the catalog package and executor cannot be imported back into it
+// — same import-cycle reasoning as builtinOpclassInfo/builtinRangeSubtypeOpclasses.
+// Matching is case-sensitive, mirroring real PostgreSQL identifier semantics
+// (`collation = "C"` requires the exact case; there is no unquoted `c`
+// built-in). DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+func builtinCollationOIDByName(name string) (uint32, bool) {
+	switch name {
+	case "default":
+		return 100, true
+	case "C":
+		return 950, true
+	case "POSIX":
+		return 951, true
+	case "ucs_basic":
+		return 962, true
+	case "unicode":
+		return 963, true
+	case "pg_c_utf8":
+		return 811, true
+	case "pg_unicode_fast":
+		return 6411, true
+	}
+	return 0, false
+}
+
+// builtinOpclassOIDByName looks up a builtinRangeSubtypeOpclasses entry by
+// its opclass name (case-sensitive), for resolving an explicit
+// `subtype_opclass = ...` range option. DU-002 (M0110-0001, slice 429
+// follow-up sub-item (a)).
+func builtinOpclassOIDByName(name string) (builtinOpclassInfo, bool) {
+	for _, oc := range builtinRangeSubtypeOpclasses {
+		if oc.Name == name {
+			return oc, true
+		}
+	}
+	return builtinOpclassInfo{}, false
+}
+
+// defaultUserBtreeOpclassForSubtype mirrors GetDefaultOpClass's (postgres/
+// src/backend/catalog/pg_opclass.c) pg_opclass scan for a user-created
+// default btree opclass over the given subtype. Real PG stores builtin and
+// user opclasses in the same pg_opclass table, so a single scan finds
+// either; goopg splits them into the curated `builtinRangeSubtypeOpclasses`
+// map (checked first by callers via DefaultBtreeOpclassForSubtype, since it
+// never changes at runtime) and the live `userOperatorClasses` registry
+// (this method) — callers must check both to reproduce the single-scan
+// behavior. DU-002 (M0110-0001, slice 429 follow-up sub-item (b)).
+func (c *InMemory) defaultUserBtreeOpclassForSubtype(subtypeOID uint32) (uint32, bool) {
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == btreeAccessMethodOID && uoc.InTypeOID == subtypeOID && uoc.IsDefault {
+			return uoc.OID, true
+		}
+	}
+	return 0, false
+}
+
+// resolveRangeOpclass implements PG's findRangeSubOpclass (postgres/src/
+// backend/commands/typecmds.c): an explicit `subtype_opclass` name must
+// name an existing btree opclass that accepts (is binary-coercible with)
+// the subtype, else the default opclass is used. DU-002 (M0110-0001, slice
+// 429 follow-up sub-item (a)).
+func (c *InMemory) resolveRangeOpclass(subtypeName string, subtypeOID uint32, opclassName string) (uint32, *RangeTypeOptionError) {
+	if opclassName == "" {
+		if oid, ok := DefaultBtreeOpclassForSubtype(subtypeOID); ok {
+			return oid, nil
+		}
+		if oid, ok := c.defaultUserBtreeOpclassForSubtype(subtypeOID); ok {
+			return oid, nil
+		}
+		return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+			"data type %s has no default operator class for access method %q", subtypeName, "btree")}
+	}
+	if oc, ok := builtinOpclassOIDByName(opclassName); ok {
+		if oc.IntypeOID != subtypeOID {
+			return 0, &RangeTypeOptionError{Code: "42804", Message: fmt.Sprintf(
+				"operator class %q does not accept data type %s", opclassName, subtypeName)}
+		}
+		return oc.OID, nil
+	}
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method != btreeAccessMethodOID || !strings.EqualFold(uoc.Name, opclassName) {
+			continue
+		}
+		if uoc.InTypeOID != subtypeOID {
+			return 0, &RangeTypeOptionError{Code: "42804", Message: fmt.Sprintf(
+				"operator class %q does not accept data type %s", opclassName, subtypeName)}
+		}
+		return uoc.OID, nil
+	}
+	return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+		"operator class %q does not exist for access method %q", opclassName, "btree")}
+}
+
+// rangeCollatableSubtypes are the subtype OIDs RegisterRangeType treats as
+// collatable for a range's `collation` option — the same set the pg_range
+// VirtualRows builder above already special-cases for the implicit-default
+// case. Real PostgreSQL's `type_is_collatable` covers more built-ins, but
+// these are the only range subtypes goopg's own typcollation resolution
+// models today. DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+func rangeSubtypeIsCollatable(subtypeOID uint32) bool {
+	switch subtypeOID {
+	case OIDText, OIDVarChar, OIDBpChar:
+		return true
+	}
+	return false
+}
+
+// resolveRangeCollation implements PG's DefineRange collation resolution
+// (postgres/src/backend/commands/typecmds.c): an explicit `collation` name
+// is only legal for a collatable subtype and must resolve to a known
+// collation (built-in or `CREATE COLLATION`-registered); otherwise the
+// subtype's own default collation (DEFAULT_COLLATION_OID for text/varchar/
+// bpchar) applies, and a non-collatable subtype gets InvalidOid (0).
+// DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+func (c *InMemory) resolveRangeCollation(subtypeOID uint32, collationName string) (uint32, *RangeTypeOptionError) {
+	if !rangeSubtypeIsCollatable(subtypeOID) {
+		if collationName != "" {
+			return 0, &RangeTypeOptionError{Code: "42809", Message: "range collation specified but subtype does not support collation"}
+		}
+		return 0, nil
+	}
+	if collationName == "" {
+		return 100, nil // DEFAULT_COLLATION_OID — subtype's own typcollation
+	}
+	if oid, ok := builtinCollationOIDByName(collationName); ok {
+		return oid, nil
+	}
+	if oid := c.UserCollationOIDByName(collationName); oid != 0 {
+		return oid, nil
+	}
+	return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+		"collation %q for encoding %q does not exist", collationName, "UTF8")}
+}
+
+// RegisterRangeType records a `CREATE TYPE ... AS RANGE (subtype = ...)`
+// range type, allocating pg_type OIDs for the range itself, its
+// auto-generated `_name` array type, its auto-generated multirange type, and
+// the multirange's own auto-generated array type — matching PG's real
+// allocation order (range, range-array, multirange, multirange-array).
+// opclassName/collationName are the (possibly empty) `subtype_opclass` /
+// `collation` option values; empty means "use PG's default resolution".
+// Returns a *RangeTypeOptionError (carrying PG's own SQLSTATE) if any option
+// fails to resolve. M0110-0001.
+func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, opclassName, collationName string) (*RangeType, error) {
+	subtypeOID := TypeNameToOID(subtypeName)
+	opclassOID, rerr := c.resolveRangeOpclass(subtypeName, subtypeOID, opclassName)
+	if rerr != nil {
+		return nil, rerr
+	}
+	collationOID, rerr := c.resolveRangeCollation(subtypeOID, collationName)
+	if rerr != nil {
+		return nil, rerr
+	}
+	k := strings.ToLower(name)
+	mrName := strings.ToLower(explicitMultirangeName)
+	if mrName == "" {
+		mrName = deriveMultirangeTypeName(k)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt, exists := c.rangeTypes[k]
+	if !exists {
+		rt = &RangeType{
+			Name:               k,
+			OID:                c.nextOID,
+			ArrayOID:           c.nextOID + 1,
+			MultirangeOID:      c.nextOID + 2,
+			MultirangeArrayOID: c.nextOID + 3,
+		}
+		c.nextOID += 4
+		c.rangeTypes[k] = rt
+	}
+	rt.SubtypeName = subtypeName
+	rt.OpclassOID = opclassOID
+	rt.CollationOID = collationOID
+	rt.MultirangeName = mrName
+	return rt, nil
+}
+
+// LookupRangeType finds a user-defined range type by name (case-insensitive).
+// M0110-0001.
+func (c *InMemory) LookupRangeType(name string) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	rt, ok := c.rangeTypes[strings.ToLower(name)]
+	return rt, ok
+}
+
+// LookupRangeTypeByMultirangeName finds a user-defined range type by its
+// auto-generated multirange type's name (case-insensitive). rangeTypes is
+// keyed by the range name only, so this is a linear scan — mirrors the other
+// ByOID-style lookups below, which scan the same small map. M0110-0001 DU-002
+// slice 429 follow-up.
+func (c *InMemory) LookupRangeTypeByMultirangeName(name string) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	lower := strings.ToLower(name)
+	for _, rt := range c.rangeTypes {
+		if rt.MultirangeName == lower {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByOID finds a user-defined range type by its pg_type OID,
+// used by format_type to render a range column's declared type. M0110-0001.
+func (c *InMemory) LookupRangeTypeByOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.OID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByMultirangeOID finds a user-defined range type by the
+// pg_type OID of its auto-generated multirange type, used by format_type to
+// resolve pg_range.rngmultitypid via `format_type(rngmultitypid, NULL)`.
+// M0110-0001.
+func (c *InMemory) LookupRangeTypeByMultirangeOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.MultirangeOID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByArrayOID finds a user-defined range type by the pg_type
+// OID of its auto-generated `_name` array type, used by format_type to
+// render a `myrange[]` column as the schema-qualified array name. Mirrors
+// LookupCompositeTypeByArrayOID / LookupEnumByArrayOID. DU-002 (M0110-0001).
+func (c *InMemory) LookupRangeTypeByArrayOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.ArrayOID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByMultirangeArrayOID finds a user-defined range type by the
+// pg_type OID of its multirange's auto-generated `_name` array type, used by
+// format_type to render a `mymultirange[]` column as the schema-qualified
+// array name. DU-002 (M0110-0001).
+func (c *InMemory) LookupRangeTypeByMultirangeArrayOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.MultirangeArrayOID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// ListRangeTypes returns every registered range type, for pg_type/pg_range
+// virtual-row generation (pg_dump CREATE TYPE ... AS RANGE round-trip).
+// M0110-0001.
+func (c *InMemory) ListRangeTypes() []*RangeType {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*RangeType, 0, len(c.rangeTypes))
+	for _, rt := range c.rangeTypes {
+		out = append(out, rt)
+	}
+	return out
+}
+
+// DropRangeType removes a range type. Returns an error if not found.
+// M0110-0001.
+func (c *InMemory) DropRangeType(name string) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.rangeTypes[k]; !ok {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.rangeTypes, k)
+	return nil
+}
+
+// RegisterRangeTypeDuringRecovery is the idempotent version of
+// RegisterRangeType used by the WAL-replay driver
+// (internal/initdb/range_type_ddl_recovery.go). Unlike RegisterRangeType it
+// takes both OIDs from the WAL record (so the recovered range type matches
+// the pre-crash OIDs exactly) and overwrites rather than erroring when a
+// range type with the same name is already present (replay may see the same
+// record more than once across a partial-then-full replay). Mirrors
+// catalog.InMemory.RegisterAccessMethodDuringRecovery. DU-002
+// restart-persistence follow-up (M0110-0001, DU-002 slice 429 ledger resume
+// point, sub-item (c)).
+func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rangeTypes == nil {
+		c.rangeTypes = make(map[string]*RangeType)
+	}
+	out := *rt
+	c.rangeTypes[rt.Name] = &out
+	c.advanceNextOIDLocked(rt.OID)
+	c.advanceNextOIDLocked(rt.ArrayOID)
+	c.advanceNextOIDLocked(rt.MultirangeOID)
+	c.advanceNextOIDLocked(rt.MultirangeArrayOID)
+}
+
+// DropRangeTypeDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropRangeType. Identical to DropRangeType but discards
+// the found/not-found result — replay does not care whether the range type
+// was still present. DU-002 restart-persistence follow-up (M0110-0001,
+// DU-002 slice 429 ledger resume point, sub-item (c)).
+func (c *InMemory) DropRangeTypeDuringRecovery(name string) {
+	_ = c.DropRangeType(name)
 }
 
 // LookupCompositeTypeFields returns the ordered field list for a composite type,

@@ -4281,6 +4281,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create type money_amt: %v", err)
 	}
 
+	// Slice 429: `CREATE TYPE ... AS RANGE (subtype = ...)` must round-trip.
+	// Before this slice the parser accepted the RANGE form only as a discard
+	// stub (no pg_type/pg_range row at all), so the type vanished from the
+	// dump entirely — not even a stub CREATE TYPE line. RegisterRangeType now
+	// writes real pg_type rows (typtype='r' + the auto-generated multirange
+	// typtype='m') and pg_range/pg_opclass virtual rows carry enough of a
+	// default-btree-opclass row for pg_dump's dumpRangeType join to resolve,
+	// so the dump reproduces PG's own `subtype = integer, multirange_type_name
+	// = public.mymultirange` shape verbatim (opclass/collation/canonical/
+	// subtype_diff are all defaults here, so none of those optional clauses
+	// print — see the deferral ledger for the unsupported-option gap).
+	if err := runSQLSimple(t, c, "CREATE TYPE public.myrange AS RANGE (subtype = int4)"); err != nil {
+		t.Fatalf("create type myrange: %v", err)
+	}
+
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
 	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
@@ -4896,6 +4911,49 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SERVER goopg_srv_mc FOREIGN DATA WRAPPER goopg_fdw OPTIONS (host 'a,b')"); err != nil {
 		t.Fatalf("create server with metachar option: %v", err)
 	}
+	// Slice 427: a FOREIGN SERVER GRANT (`GRANT USAGE ON FOREIGN SERVER <name>
+	// TO <role>`) must round-trip through pg_dump's srvacl projection.
+	// pg_dump's getForeignServers reads srvacl and diffs it client-side (in
+	// buildACLCommands) against acldefault('S', srvowner) = "{postgres=U/postgres}"
+	// (a foreign server's world default is ACL_NO_RIGHTS — unlike FUNCTION/TYPE,
+	// PUBLIC gets nothing by default), so a single explicit GRANT materializes
+	// srvacl as "{postgres=U/postgres,srv_grantee=U/postgres}" and the diff
+	// re-emits the new grant. USAGE is FOREIGN SERVER's only privilege, so
+	// buildACLCommands collapses it to the ALL form (same as the single-privilege
+	// FUNCTION/EXECUTE case at slice 345): `GRANT ALL ON FOREIGN SERVER goopg_srv
+	// TO srv_grantee;`, not `GRANT USAGE ...`. goopg previously modelled NO
+	// foreign-server ACL at all — `tryRecordTableGrant` classified the leading
+	// "foreign" keyword as a non-table object and bailed (nothing recorded), and
+	// the pg_foreign_server virtual view hard-coded srvacl to the constant ""
+	// (NULL) — so the GRANT was silently dropped from every dump. Reuses
+	// goopg_srv (created at slice 376) so no new CREATE SERVER is needed.
+	// Verified against real pg_dump 18.3.
+	if err := runSQLSimple(t, c, "CREATE ROLE srv_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role srv_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON FOREIGN SERVER goopg_srv TO srv_grantee"); err != nil {
+		t.Fatalf("grant usage on foreign server goopg_srv to srv_grantee: %v", err)
+	}
+	// Slice 428: a FOREIGN DATA WRAPPER GRANT (`GRANT USAGE ON FOREIGN DATA
+	// WRAPPER <name> TO <role>`) must round-trip through pg_dump's fdwacl
+	// projection — the exact same shape as the slice-427 FOREIGN SERVER GRANT
+	// above, since acldefault('F', fdwowner) is byte-identical to
+	// acldefault('S', srvowner) in real PG (both OBJECT_FDW/OBJECT_FOREIGN_SERVER
+	// grant USAGE to the owner only, world default ACL_NO_RIGHTS). USAGE is
+	// FOREIGN DATA WRAPPER's only privilege, so buildACLCommands collapses it to
+	// `GRANT ALL ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee;`, not
+	// `GRANT USAGE ...`. goopg previously modelled NO FDW ACL at all —
+	// `tryRecordTableGrant` had no "data"/"wrapper" branch under "foreign" so it
+	// fell through to the non-table bail, and the pg_foreign_data_wrapper virtual
+	// view hard-coded fdwacl to the constant "" (NULL) — so the GRANT was
+	// silently dropped from every dump. Reuses goopg_fdw (created at slice 375)
+	// so no new CREATE FOREIGN DATA WRAPPER is needed.
+	if err := runSQLSimple(t, c, "CREATE ROLE fdw_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role fdw_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee"); err != nil {
+		t.Fatalf("grant usage on foreign data wrapper goopg_fdw to fdw_grantee: %v", err)
+	}
 	// Slice 417: a FOREIGN TABLE (`CREATE FOREIGN TABLE name (cols) SERVER srv
 	// [OPTIONS (...)]`) must round-trip. pg_dump's getTables selects relkind IN
 	// (..., 'f', ...); for a relkind='f' row it LEFT JOINs
@@ -4956,6 +5014,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// way (the apply launcher wake is async and out of band).
 	if err := runSQLSimple(t, c, "CREATE SUBSCRIPTION goopg_sub1 CONNECTION 'host=localhost port=5432 dbname=goopg_remote' PUBLICATION goopg_pub1 WITH (connect = false, slot_name = goopg_sub1)"); err != nil {
 		t.Fatalf("create subscription: %v", err)
+	}
+	// Slice 426: CREATE ACCESS METHOD must round-trip. pg_dump's
+	// getAccessMethods() selects every pg_am row with oid >=
+	// FirstNormalObjectId (the 7 built-ins below that threshold are filtered
+	// out client-side by selectDumpableAccessMethod) and resolves amhandler
+	// via `::pg_catalog.regproc`; dumpAccessMethod re-emits `CREATE ACCESS
+	// METHOD <name> TYPE {INDEX|TABLE} HANDLER <handler>;`. Before this slice
+	// "CREATE ACCESS METHOD" was a bare parse error (no parseCreateAccessMethod
+	// path existed at all) and pg_am.VirtualRows served only the 7 built-in
+	// rows. The HANDLER function must resolve via PostgreSQL's own fixed
+	// lookup_am_handler_func signature — exactly one argument of type
+	// "internal", returning the AM-type-matching pseudo-type
+	// (index_am_handler/table_am_handler) — so a real (LANGUAGE C stub, never
+	// invoked — goopg has no pluggable storage engine, mirroring the
+	// CREATE CONVERSION FROM-function precedent) handler function is created
+	// first.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.goopg_am_handler(internal) RETURNS index_am_handler LANGUAGE c AS 'goopg_am_handler'"); err != nil {
+		t.Fatalf("create function goopg_am_handler: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ACCESS METHOD goopg_am TYPE INDEX HANDLER goopg_am_handler"); err != nil {
+		t.Fatalf("create access method: %v", err)
 	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
@@ -10934,6 +11013,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			strings.Contains(res.Stdout, "CREATE SERVER goopg_srv VERSION") {
 			t.Errorf("pg_dump emitted a spurious TYPE/VERSION on the bare server (slice-376 NULL srvtype/srvversion regressed)\n  full stdout=%q", res.Stdout)
 		}
+		// Slice 427: a FOREIGN SERVER GRANT must round-trip from the materialized
+		// srvacl. acldefault('S', 10) = "{postgres=U/postgres}" (owner-only default,
+		// no implicit PUBLIC USAGE unlike FUNCTION/TYPE); srvacl after the grant =
+		// "{postgres=U/postgres,srv_grantee=U/postgres}", so buildACLCommands diffs
+		// out the new grantee entry. USAGE is FOREIGN SERVER's sole privilege, so
+		// pg_dump collapses it to the ALL form (same as the single-privilege
+		// FUNCTION/EXECUTE case, slice 345): `GRANT ALL ON FOREIGN SERVER goopg_srv
+		// TO srv_grantee;`, not `GRANT USAGE ...`. Verified byte-identical to real
+		// pg_dump 18.3.
+		if want := "GRANT ALL ON FOREIGN SERVER goopg_srv TO srv_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the FOREIGN SERVER GRANT (slice-427); missing %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// A regression that resurrected the previous nonTableGrantObjects bail (or
+		// re-hardcoded srvacl to NULL) would silently drop the GRANT above with no
+		// other symptom, so this positive assert is the only guard.
+		// Slice 428: a FOREIGN DATA WRAPPER GRANT must round-trip from the
+		// materialized fdwacl, the exact same shape as slice 427 above:
+		// acldefault('F', 10) = "{postgres=U/postgres}" (owner-only default), so a
+		// single explicit grant materializes fdwacl as
+		// "{postgres=U/postgres,fdw_grantee=U/postgres}" and buildACLCommands
+		// collapses the sole USAGE privilege to the ALL form.
+		if want := "GRANT ALL ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the FOREIGN DATA WRAPPER GRANT (slice-428); missing %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// A regression that resurrected the missing "data"/"wrapper" dispatch
+		// branch (or re-hardcoded fdwacl to NULL) would silently drop the GRANT
+		// above with no other symptom, so this positive assert is the only guard.
 		// Slice 377: a USER MAPPING must round-trip as the bare
 		// `CREATE USER MAPPING FOR <user> SERVER <srv>;` form (no OPTIONS — deferred).
 		// dumpUserMappings reads usename from the pg_user_mappings view (filtered by
@@ -11062,6 +11168,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER SUBSCRIPTION goopg_sub1 OWNER TO postgres;") {
 			t.Errorf("pg_dump dropped the ALTER SUBSCRIPTION OWNER TO (slice-423, subowner resolution); full stdout=%q", res.Stdout)
+		}
+		// Slice 426: CREATE ACCESS METHOD must round-trip, resolving amhandler
+		// to the schema-qualified handler function name (pg_dump connects with
+		// search_path='' so a regproc cast always schema-qualifies). Verified
+		// byte-identical against dumpAccessMethod's own emit logic
+		// (postgres/src/bin/pg_dump/pg_dump.c) — "CREATE ACCESS METHOD %s TYPE
+		// {INDEX|TABLE} HANDLER %s;\n" with a single trailing space before
+		// HANDLER when amtype renders "TYPE INDEX " / "TYPE TABLE ".
+		amStmt := "CREATE ACCESS METHOD goopg_am TYPE INDEX HANDLER public.goopg_am_handler;"
+		if !strings.Contains(res.Stdout, amStmt) {
+			t.Errorf("pg_dump dropped the CREATE ACCESS METHOD round-trip (slice-426); missing %q\n  full stdout=%q", amStmt, res.Stdout)
+		}
+		// The 7 built-in access methods (heap/btree/hash/gist/gin/spgist/brin)
+		// must stay filtered out (selectDumpableAccessMethod's oid <=
+		// g_last_builtin_oid gate) — a regression here would spuriously dump
+		// them too.
+		if strings.Contains(res.Stdout, "CREATE ACCESS METHOD btree") ||
+			strings.Contains(res.Stdout, "CREATE ACCESS METHOD heap") {
+			t.Errorf("pg_dump spuriously dumped a built-in access method (slice-426 oid-threshold filter regressed); full stdout=%q", res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact
@@ -11352,6 +11477,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		dfltScrub := strings.ReplaceAll(res.Stdout, "ATTACH PARTITION public.pdef_def DEFAULT;\n", "")
 		if strings.Contains(dfltScrub, "DEFAULT;\n") || strings.Contains(dfltScrub, "DEFAULT \n") {
 			t.Errorf("pg_dump emitted a spurious empty DEFAULT on the domain (slice-90 pg_get_expr(NULL) regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 429: `CREATE TYPE ... AS RANGE` must round-trip verbatim, matching
+		// real pg_dump 18.3's own dumpRangeType rendering (verified live): a
+		// three-line `CREATE TYPE public.myrange AS RANGE (\n    subtype =
+		// integer,\n    multirange_type_name = public.mymultirange\n);`. Before
+		// this slice the type had NO pg_type/pg_range row at all (RegisterRangeType
+		// didn't exist — the parser only accepted the RANGE form as a discard
+		// stub), so it vanished from the dump entirely.
+		rangeDefs := []string{
+			"CREATE TYPE public.myrange AS RANGE (",
+			"subtype = integer,",
+			"multirange_type_name = public.mymultirange",
+		}
+		for _, sub := range rangeDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the RANGE type round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		return
 	}

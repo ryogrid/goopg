@@ -34,6 +34,15 @@ Policy for **M0117 & M0118**: fix blockers in place; do NOT defer unless
 genuinely compelling (then record a ledger row). Commit + push at every clean,
 green (build + pre-commit) checkpoint.
 
+**Added 2026-07-02 (interactive session):** **M0120** (WordPress WP-CLI
+verification execution & evidence capture) and **M0121** (remediation of the
+failures M0120 finds) are new milestones — see their sections at the end of this
+file. The enabling goopg feature (statement/query logging, `GOOPG_LOG_STATEMENT`,
+design `root-0023`) has already landed. Sequence them after the current
+M0110/M0119 work: **run M0120 first** (it only needs the landed logging + the
+committed `wp/verification/` checklist/flow), **then M0121** consumes its triaged
+failure list.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
 M0096 (RC isolation feature impl + spec pass), M0100 (RC isolation runtime
@@ -75,6 +84,146 @@ prev-link fixes.
       (CSV row DU-002, slice-by-slice). Design `0110-0001-pg-dump-tap-port.md`.
       Resume = next gap in pg_dump's getter battery (latest blocker tracked in
       `.ralph/working_set.md` / ledger).
+      **2026-07-03 (loop #54): plain-`INHERITS` `coninhcount` sibling gap
+      CLOSED** (not `pg_dump`-visible — direct-`pg_constraint`-query fidelity
+      only; see ledger + design doc "loop #54" section). The NOT NULL
+      constraint-locality thread (loops #48/#53/#54) is now internally
+      consistent across plain-`INHERITS` and `PARTITION OF`; no further known
+      NOT NULL locality gaps. Resume for `002-010` proper is still the next
+      catalog-getter gap surfaced by `TestPort_PgDumpConnectionSetup`.
+      **2026-07-03 (loop #61, DU-002 slice 429 follow-up): range/multirange
+      table-column `pg_attribute` resolution LANDED** — closes the
+      catalog-fidelity half of the loop #60 discovery. `buildUserPGAttributeRow`/
+      `buildUserPGAttributeRowForCompositeField`
+      (`internal/executor/pg18_user_catalog_rows.go`) gain a range/multirange
+      branch (mirroring the enum/composite ones), backed by two new
+      `Catalog` interface methods (`LookupRangeType`, new
+      `LookupRangeTypeByMultirangeName`). A `CREATE TABLE t (r myrange)`
+      column's `atttypid` no longer falls back to `text`; verified live via
+      real `goopg`/`psql` (`\d` now renders `public.myrange`/
+      `public.myrange[]`/`public.mymultirange`). Tests:
+      `TestUserPGAttributeRangeColumn` + `TestUserPGAttributeCompositeFieldRange`.
+      Design doc "Follow-up: range/multirange-typed table column
+      `pg_attribute` resolution (loop #61)". Gates: build/vet clean;
+      `internal/executor`+`internal/catalog` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
+      appended): range/multirange **value storage** (parse/wire-format/
+      comparison) is still entirely unimplemented — this fix is
+      introspection-only.
+      **2026-07-03 (loop #62, DU-002 slice 429 follow-up): `::regtype` /
+      `format_type` OID→name resolution unified — CLOSES the loop #61
+      discovery above.** `format_type`'s inlined ten-branch enum/domain/
+      composite/range else-if chain and `::regtype`'s `KindInt`-only
+      `oidToBuiltinTypeName` lookup are now the same shared helper,
+      `userTypeNameForOID` (`internal/executor/expr.go`); a symmetric
+      `userTypeOIDForName` generalizes the old enum-only `'name'::regtype`
+      branch to all four user-type kinds. Live-verified: `atttypid::regtype`
+      for a range/enum/domain column now renders `public.<name>` (previously
+      the bare numeric OID), matching `format_type` in the same session.
+      Tests: `TestUserTypeNameForOIDAllKinds` + `TestUserTypeOIDForNameAllKinds`
+      (`internal/executor/user_type_oid_name_test.go`). Design doc "Follow-up:
+      `::regtype` / `format_type` OID→name resolution unified (loop #62)".
+      Gates: build/vet clean; `internal/executor`+`internal/catalog` suites
+      PASS; `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook; live `goopg`/`psql`
+      smoke. No new deferral — closes cleanly (the one remaining wrinkle, a
+      `KindInt`-tagged regtype value from the name→OID direction still
+      displaying as a raw number, is pre-existing enum behavior unrelated to
+      this fix, not something this loop's scope touches).
+      **2026-07-03 (loop #63, DU-002 slice 429 follow-up): `builtinRangeSubtypeOpclasses`
+      widened from 7 to 31 subtypes — CLOSES sub-item (d) of the slice 429
+      deferral.** `RegisterRangeType`'s default-btree-opclass lookup
+      (`internal/catalog/catalog.go`) previously covered only int4/int8/
+      numeric/date/timestamp/timestamptz/text; `CREATE TYPE ... AS RANGE
+      (subtype = bool|float8|uuid|varchar|...)` was rejected with a
+      synthesized 42704 even though real PG resolves a default opclass for
+      any ordinary btree-comparable scalar. Widened to 31 subtypes (every
+      PG18 built-in scalar type with a real default btree opclass), with
+      OIDs captured empirically from a live PG 18.3 instance and cross-
+      checked per-subtype (incl. two binary-coercible fallbacks: `varchar`→
+      `text_ops`, `cidr`→`inet_ops`). Tests:
+      `TestDefaultBtreeOpclassForSubtypeExpandedCoverage` +
+      `TestRegisterRangeTypeExpandedSubtypes` +
+      `TestRegisterRangeTypeStillRejectsUnsupportedSubtype`
+      (`internal/catalog/range_type_opclass_test.go`). Design doc "Follow-up:
+      `builtinRangeSubtypeOpclasses` widened from 7 to 31 subtypes (loop
+      #63)". Gates: build/vet clean; `internal/catalog`+`internal/executor`
+      suites PASS; `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook; live `goopg`/`psql` smoke incl. `pg_dump` round-trip
+      for 4 newly-covered subtypes. Deferred (ledger row appended): sub-item
+      (a) (`subtype_opclass`/`collation`/`canonical`/`subtype_diff` options
+      still discarded) remains open; the map is still curated/built-in-only,
+      not a real generic `GetDefaultOpClass` port over `pg_opclass` +
+      user-created opclasses (`CREATE OPERATOR CLASS ... DEFAULT`).
+      **2026-07-03 (loop #64, DU-002 slice 429 follow-up): `subtype_opclass`/
+      `collation` `CREATE TYPE ... AS RANGE` options threaded through end-to-
+      end — closes two of sub-item (a)'s four options.** Parser
+      (`internal/parser/ddl.go`'s `parseCreateType`) now captures
+      `subtype_opclass`/`collation` into new `CreateTypeStmt.RangeOpclassName`/
+      `RangeCollationName` fields (same bare-name-kept pattern as the existing
+      `multirange_type_name` capture); `canonical`/`subtype_diff` still
+      parse-and-discard (need real shell-type + function-signature support
+      goopg lacks). `internal/catalog/catalog.go` gained
+      `resolveRangeOpclass`/`resolveRangeCollation`, mirroring PG's
+      `DefineRange` (`postgres/src/backend/commands/typecmds.c`, read this
+      loop): an explicit opclass name resolves against the builtin map (loop
+      #63) or `ListUserOperatorClasses()`, rejecting a datatype mismatch
+      (42804) or unknown name (42704); an explicit collation name resolves
+      against 7 BKI builtins or `UserCollationOIDByName`, rejecting a
+      collation on a non-collatable subtype (42809, PG's exact wording) or an
+      unknown name (42704) — both via a new `*catalog.RangeTypeOptionError`
+      so `execCreateType` reports PG's actual SQLSTATE instead of a hardcoded
+      42704. `RangeType` gained `CollationOID` (`pg_range.rngcollation`,
+      replacing the old ad hoc subtype-OID switch in `pg_range`'s
+      `VirtualRows` — a sibling-paths-must-agree fix), threaded through
+      `EncodeCreateRangeType`/`DecodeCreateRangeType` WAL persistence too.
+      Tests: `TestRegisterRangeTypeExplicitOpclass` +
+      `TestRegisterRangeTypeExplicitCollation`
+      (`internal/catalog/range_type_opclass_test.go`);
+      `TestParseCreateRangeTypeSubtypeOpclassAndCollation` +
+      `TestParseCreateRangeTypeCanonicalSubtypeDiffStillParseAndDiscard`
+      (new `internal/parser/range_type_option_test.go`); extended
+      `internal/wal/range_type_ddl_test.go` +
+      `internal/initdb/range_type_ddl_recovery_test.go` for the new
+      `collationOID` field. Design doc "Follow-up: `subtype_opclass`/
+      `collation` `CREATE TYPE ... AS RANGE` options threaded through (loop
+      #64)". Gates: build/vet clean; `internal/catalog`+`internal/parser`+
+      `internal/wal`+`internal/initdb`+`internal/executor` suites PASS (full
+      runs); `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook; live
+      `goopg`/`psql`/`pg_dump` end-to-end smoke incl. a full server restart
+      (verified `CollationOID` survives). **New discovery (ledger row
+      appended, not fixed this loop):** live-verifying a range type with a
+      user-opclass `subtype_opclass` across a restart found `CREATE OPERATOR
+      CLASS` has **no WAL/restart persistence at all** — the opclass itself
+      vanishes on restart (though the range type's own numeric `OpclassOID`
+      survives fine), so `pg_dump` then fails outright
+      (`query returned 0 rows instead of one`) for any range type
+      referencing it. Still open: `canonical`/`subtype_diff` (sub-item (a)
+      remainder) and the generic `GetDefaultOpClass`-over-user-opclasses gap
+      (sub-item (b), unchanged from loop #63; **closed by loop #76 below**).
+      **2026-07-03 (loop #76, DU-002 slice 429 follow-up): generic default-
+      opclass resolution over user-created opclasses LANDED — CLOSES
+      sub-item (b).** `resolveRangeOpclass`'s empty-`subtype_opclass` branch
+      (`internal/catalog/catalog.go`) now falls back to a new
+      `defaultUserBtreeOpclassForSubtype` scan of `ListUserOperatorClasses()`
+      (mirroring PG's `GetDefaultOpClass`,
+      `postgres/src/backend/catalog/pg_opclass.c`) when no curated builtin
+      default exists for the subtype, so `CREATE TYPE ... AS RANGE` over a
+      subtype like `json` (no PG built-in default btree opclass) now
+      resolves a user-registered `CREATE OPERATOR CLASS ... DEFAULT`
+      opclass instead of a synthesized 42704. Tests:
+      `TestRegisterRangeTypeUserDefaultOpclass`
+      (`internal/catalog/range_type_opclass_test.go`). Design doc
+      "Follow-up: generic default-opclass resolution over user-created
+      opclasses (loop #76)". Gates: build/vet clean;
+      `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/wal`+`internal/initdb` suites PASS. Remaining open on this
+      deferral thread: `canonical`/`subtype_diff` (sub-item (a) remainder —
+      needs real shell-type + function-signature support, a materially
+      larger separately-scoped feature).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit
@@ -5059,6 +5208,30 @@ documentation-only and is exempt from the design-doc requirement.)
       no WAL/restart persistence in goopg (a pre-existing, broader gap, not
       specific to event triggers), so an event trigger's `evtfoid` can
       dangle post-restart if its backing function was created post-initdb.
+      **Note (loop #78): this "no WAL/restart persistence" claim was
+      re-verified live at HEAD and found FALSE — already fixed by loop #73's
+      CREATE/ALTER/DROP FUNCTION+PROCEDURE WAL/restart persistence work
+      (`internal/wal/recovery.go` `RecordKindCreateFunction`/
+      `internal/initdb/function_ddl_recovery.go`); this note is stale and can
+      be treated as resolved by loop #73, no code change needed.**
+      **2026-07-03 (loop #78): `TIME ZONE`/`SCHEMA`/`NAMES`/`ROLE`/`SESSION
+      AUTHORIZATION`/`XML OPTION` special-form GUC translation LANDED** for
+      `ALTER DATABASE`/`ALTER ROLE ... SET` — closes the `0119-0004bt`/
+      `0119-0004bu` design-doc rows' own "`SET TIME ZONE`/`SET SESSION
+      AUTHORIZATION` special forms unrecognised" residual. New shared
+      `parseSetRestSpecialForm` (`internal/server/database_ddl.go`) mirrors
+      PG's `gram.y` `set_rest` production's six special syntaxes, called from
+      both `parseAlterDatabaseConfig` and `parseAlterRoleConfig` ahead of the
+      generic `name TO|= value` parse. `SET ... FROM CURRENT` remains
+      unrecognised (needs a live session-GUC read, a different mechanism —
+      see the deferral ledger row). Tests: `TestParseAlterDatabaseConfig`/
+      `TestParseAlterRoleConfig` extended (6 forms × 2 functions + 1
+      `IN DATABASE` case). Gates: `go build ./...` clean; `internal/server`
+      suite PASS; live `psql`/`pg_dumpall` smoke (throwaway data dir);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `0119-0004-database-config-set-pgdump.md`
+      "Follow-up: ... special-form GUC translation (loop #78)", indexed as
+      `0119-0004cp` in `docs/design/README.md`.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
@@ -5223,8 +5396,1440 @@ documentation-only and is exempt from the design-doc requirement.)
       `0119-0004-create-operator-roundtrip.md` "Loop #74". The
       `CREATE`/`ALTER`/`DROP FUNCTION`/`PROCEDURE` surface is now entirely
       WAL-persisted; the loop #73 ledger row is resolved.
+- [x] **TOAST chunk_id restart durability (root-0022, interactive session).**
+      **COMPLETE 2026-07-02:** closes the WordPress `wp_options`/
+      `wp_user_roles` neighbor-row corruption ledger row (2026-07-02). Root
+      cause was NOT missing TOAST (goopg has had real TOAST since
+      M0046-0006, `internal/executor/toast.go`) but
+      `executor.toastOIDCounter` — a process-local, non-persisted
+      `atomic.Int64` — resetting to 0 on every restart while the TOAST
+      relation it writes `chunk_id` rows into survives on disk; the first
+      TOASTed value written after any restart (no crash needed) reissued
+      `chunk_id 1`, colliding with a pre-restart value's still-resident
+      `chunk_id 1` in the same table's TOAST relation, and
+      `DetoastValue`'s oid-only scan spliced the two unrelated values'
+      bytes together. Fix: new `executor.SeedToastOIDCounter`/
+      `MaxToastChunkIDInRel`/`AdvanceToastOIDCounterPast`
+      (`internal/executor/toast.go`) scan every user table's TOAST
+      relation once at startup (wired into `internal/initdb/open.go`
+      right after the existing M0106-0013 catalog-OID-advance loop,
+      unconditionally — even on the M0114 cache-hit path) and advance the
+      counter past the max `chunk_id` found, mirroring the established
+      catalog-OID restart pattern. `MaxToastChunkIDInRel` short-circuits
+      via `Pool.Exists` before touching `NBlocks`/`Pin` to avoid the smgr
+      O_CREATE-recreates-removed-files pitfall
+      ([[goopg_smgr_ocreate_recreates_removed_files]]). Tests:
+      `TestToastOIDCounterCollisionAcrossRestart` (executor-level,
+      confirmed to FAIL with byte-exact reproduction of the reported
+      corruption when the reseed call is removed) +
+      `TestMaxToastChunkIDInRelNoFile` +
+      `TestSeedToastOIDCounterAdvancesPastExisting`, plus a real
+      cluster-restart e2e `TestPort_ToastValueSurvivesRestartWithoutCollision`
+      (`internal/testport/toast_oid_restart_durability_test.go`, mirrors
+      `serial_sequence_durability_test.go`). Gates: `go build`/`go vet`
+      clean; full `internal/executor`+`internal/initdb`+`internal/storage`
+      suites PASS; `go test -race ./internal/wal/... ./internal/mvcc/...`
+      PASS; TPC-H spotcheck PASS; pgbench smoke = pre-commit hook. Design
+      `docs/design/root-0022-toast-oid-restart-durability.md`. Deferred
+      (ledger row appended): TOAST chunk writes are not per-insert
+      WAL/FPI-protected (`writeHeapTupleToRel` uses plain `MarkDirty`, not
+      the `MarkDirtyChangeRecord` discipline the main-heap insert path
+      uses), so an unclean crash (not just a restart) before the next
+      checkpoint could still lose chunks written after the first one on an
+      already-dirty TOAST page — a narrower, separate fix from this loop's
+      actual reported bug.
+
+- [x] **TOAST per-chunk WAL durability (root-0022 follow-up, interactive
+      session, loop #2).** **COMPLETE 2026-07-02:** closes the previous
+      loop's own ledger row. `writeHeapTupleToRel`
+      (`internal/executor/toast.go`) dirtied the TOAST page via a bare
+      `ctx.Pool.MarkDirty(slot)`, which never invokes any per-insert WAL
+      emitter — only `maybeEmitFPI`'s first-dirty-in-epoch full-page-image.
+      Since up to ~4 TOAST chunks fit on one 8 KiB page, chunks 2-4 written
+      into an already-dirty page in the same checkpoint epoch produced zero
+      WAL output and would be lost on an unclean crash before the next
+      checkpoint. Fix: both branches of `writeHeapTupleToRel` now call
+      `markHeapInsertDirty(ctx.Pool, slot, ctx.Pool.LogHeapInsert(), rel,
+      blk, lineSlot, raw)` — the same helper the main heap-insert path uses
+      (`operators_storage.go:7750`) — which routes through
+      `Pool.MarkDirtyLogicalChange` and unconditionally emits a WAL record
+      on every call, not just the page's first dirty. No on-disk format
+      change; replay is the generic `RecordKindHeapInsert` record. Logical
+      decoding unaffected (`pgoutput.Change` already filters unregistered
+      relations, and TOAST relations were never registered as publishable
+      tables). Test: `TestToastChunkInsertsAreIndividuallyWALLogged`
+      (`internal/executor/toast_test.go`) — wires a real
+      `LogHeapInsert`/`LogPageImage` pool, writes a 3-chunk value on one
+      page, asserts 3 WAL emissions (confirmed 0 on the pre-fix code by
+      reverting and re-running). Gates: `go build`/`go vet` clean; full
+      `internal/executor` suite PASS; `go test -race
+      ./internal/wal/... ./internal/mvcc/... ./internal/storage/...` PASS;
+      pre-commit gate (incl. TPC-H spotcheck + pgbench TPC-B smoke) run.
+      Design: `docs/design/root-0022-toast-oid-restart-durability.md`
+      "Follow-up: per-chunk WAL durability". This closes the
+      counter-collision AND per-chunk-crash-durability TOAST gaps
+      discovered from the WordPress workload; no further TOAST durability
+      deferrals remain open in the ledger as of this loop.
+
+- [x] **`CREATE ACCESS METHOD` round-trip in pg_dump (M0119-0004, DU-002
+      slice 426, interactive session).** **COMPLETE 2026-07-02:** `CREATE
+      ACCESS METHOD name TYPE {INDEX|TABLE} HANDLER handler_name` was a
+      bare parse error (no parse path existed at all), and
+      `pg_am.VirtualRows` only ever emitted the 7 built-in AM rows, so
+      pg_dump's `getAccessMethods()` always read 0 dumpable rows.
+      goopg has no pluggable table/index storage engine and never invokes
+      a user-defined AM's handler — this is dump-fidelity only, same scope
+      as the existing CREATE OPERATOR/OPERATOR CLASS compat-registration
+      slices. Parser: new `CreateAccessMethodStmt` AST node +
+      `parseCreateAccessMethodTail` (mirrors `gram.y`'s `CreateAmStmt`);
+      `DROP ACCESS METHOD` already parsed generically via the ident-DROP-
+      target list (M0097-0071). Catalog: new `AccessMethod{Name, OID,
+      AMType, HandlerOID}` registry (`RegisterAccessMethod`/
+      `DropAccessMethod`/`ListAccessMethods`, keyed by amname, mirrors the
+      `ForeignDataWrapper`/`EventTrigger` compat-registry shape);
+      `pg_am.VirtualRows` appends user AM rows after the 7 built-ins (no
+      oid-range filtering needed — pg_dump's own `selectDumpableAccessMethod`
+      does that client-side). Executor: `execCreateAccessMethod` mirrors
+      `CreateAccessMethod`'s validation order (superuser 42501 → handler
+      resolution → duplicate-name 42710, including a built-in-name
+      collision via `catalog.AccessMethodOIDByName`);
+      `resolveAccessMethodHandlerFunc` mirrors `lookup_am_handler_func`
+      (`amcmds.c`) — the handler must resolve to a routine with exactly
+      one argument of type `internal`, returning the AM-type-matching
+      pseudo-type (`index_am_handler`/`table_am_handler`; 42883 if
+      unresolved, 42809 if wrong return type); `execDropCompat`'s existing
+      `"access method"` case now also calls `DropAccessMethod`. New
+      pseudo-type OIDs 325 (`index_am_handler`)/269 (`table_am_handler`)
+      in `typeNameToOIDStr` let a `CREATE FUNCTION ... RETURNS
+      index_am_handler` handler stub resolve a `prorettype` at all. Tests:
+      `TestParseCreateAccessMethod`/`TestParseCreateAccessMethodErrors`/
+      `TestParseDropAccessMethod` (`internal/parser/access_method_test.go`),
+      `TestCreateAccessMethodRegistersRow`/`TestCreateAccessMethodTableType`/
+      `TestCreateAccessMethodUnknownFunctionErrors`/
+      `TestCreateAccessMethodWrongReturnTypeErrors`/
+      `TestCreateAccessMethodDuplicateNameErrors`/
+      `TestDropAccessMethodRemovesRow`
+      (`internal/executor/operators_ddl_access_method_test.go`), plus
+      slice 426 in `TestPort_PgDumpConnectionSetup` (real `LANGUAGE c`
+      handler stub + `CREATE ACCESS METHOD` verified byte-identical vs
+      live PG 18.3, plus a built-in-AM-not-dumped regression guard).
+      Gates: `go build`/`go vet` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor`+`internal/planner`+
+      `internal/initdb` suites PASS; `TestPort_PgDumpConnectionSetup`
+      PASS (7.5s); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      pre-commit gate incl. pgbench TPC-B/simple-update/select-only smoke
+      (0 failed transactions across 5181+6815+398183 transactions) PASS.
+      Design doc: `docs/design/0119-0004-access-method-roundtrip.md`.
+      Deferred (ledger row appended): no WAL/restart persistence yet — the
+      `accessMethods` registry is a plain in-process map, so a `CREATE`/
+      `DROP ACCESS METHOD` vanishes on server restart (a dump taken before
+      a restart still round-trips correctly; only the live registry itself
+      is non-durable). Resume point: add a WAL record + startup replay
+      following the exact pattern already landed for sibling compat
+      registries (event triggers loop #71, functions/procedures loops
+      #73/74).
+      **`CREATE`/`DROP ACCESS METHOD` WAL/restart persistence LANDED
+      2026-07-02 (design `0119-0004-access-method-roundtrip.md` "Follow-up:
+      WAL/restart persistence"):** closes the resume point directly above.
+      New `RecordKindCreateAccessMethod`/`RecordKindDropAccessMethod` (kinds
+      70/71, `internal/wal/recovery.go`) mirror the event-trigger pattern
+      (loop #71); physical redo is a no-op (no page-level state). New
+      `internal/initdb/access_method_ddl_recovery.go`
+      (`replayAccessMethodDDLRecords`) + `RegisterAccessMethodDuringRecovery`/
+      `DropAccessMethodDuringRecovery` catalog mutators
+      (`internal/catalog/catalog.go`), wired into `internal/initdb/open.go`
+      right after the function/procedure DDL replay call.
+      `execCreateAccessMethod`/`execDropCompat`'s `"access method"` case
+      (`internal/executor/operators_ddl.go`) now WAL-append on success.
+      Tests: `internal/wal/access_method_ddl_test.go` (encode/decode round
+      trips + wrong-kind/truncated-payload guards) +
+      `internal/initdb/access_method_ddl_recovery_test.go` (4 tests: real
+      `Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for CREATE and
+      CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards). Gates:
+      `go build ./...` clean; `go test -race ./internal/wal/...
+      ./internal/mvcc/...` PASS; `internal/wal`+`internal/catalog`+
+      `internal/executor`+`internal/initdb`+`internal/planner`+
+      `internal/parser`+`internal/server` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS (no regression); TPC-H
+      spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl. pgbench
+      TPC-B smoke PASS. Nothing left open on this family.
+
+- [x] **`ALTER ROLE/USER … RENAME TO` restart persistence (root-0021
+      follow-up, M0119-0004, interactive session).** **COMPLETE 2026-07-02:**
+      closes the root-0021 ledger row's part (a) — RENAME TO previously fell
+      through to the legacy compat no-op (`roleNameFromAlter` returned
+      `hasAttrs=false`, so nothing was parsed, persisted, or even validated).
+      New `renameRole`/`roleRenameFromAlter` (`internal/server/role_ddl.go`)
+      intercept the RENAME TO form ahead of the attribute-form parse and
+      mirror PostgreSQL's `RenameRole` (`postgres/src/backend/commands/
+      user.c`) check order: role-exists (42704), reserved `pg_`-prefix on
+      the new name (42939), new-name-already-exists/`postgres` (42710).
+      Success re-keys three places together: the catalog role registry
+      (new `catalog.InMemory.RenameRole`, preserves the OID so
+      `pg_policy.polroles`/ownership references stay valid), `Server.roles`,
+      and the live `auth.MapUserStore` credential. New
+      `RecordKindAlterRoleRename` (kind 72, `internal/wal/recovery.go`) is
+      the WAL tail entry; `internal/initdb/role_ddl_recovery.go` replays it
+      after physical redo (a no-op, same as `RecordKindRoleState`/
+      `RecordKindDropRole` — role DDL never touches the pg_authid heap
+      directly at runtime, only the periodic full-registry
+      `SyncPgAuthidFile` rewrite does). Renaming the bootstrap superuser
+      (`postgres`) is rejected (`FeatureNotSupported`) since its name is
+      hardcoded in several places (RoleOID, initdb's pg_authid seeding) —
+      out of this slice's scope. Tests:
+      `internal/server/role_ddl_rename_test.go`
+      (`TestRoleRenameFromAlterParsing`/`TestAlterRoleRenameSuccess`/
+      `TestAlterRoleRenameErrors`/`TestCatalogRenameRolePreservesOID`) +
+      case (e) added to `TestPort_CreateRoleSurvivesRestart`
+      (`internal/testport/role_auth_durability_test.go`: rename survives a
+      real cluster restart, old name gone from `pg_roles`, attributes
+      carried to the new name). Gates: `go build ./...` clean; `go vet`
+      server/catalog/wal/initdb clean; targeted rename unit tests PASS;
+      `TestPort_CreateRoleSurvivesRestart` PASS (via
+      `scripts/goopg-test-run.sh`). Design doc updated:
+      `docs/design/root-0021-role-auth-persistence.md` "Follow-up: ALTER
+      ROLE/USER … RENAME TO restart persistence"; `docs/design/README.md`
+      row updated. Deferred (ledger row appended): `SET`/`RESET` forms
+      remain the legacy compat no-op (unrelated to rename, a distinct
+      GUC-storage problem); role membership/CREATEDB/REPLICATION/etc
+      attributes remain accept-and-ignore (unchanged); PG's
+      session/current-user-cannot-be-renamed guard and the
+      superuser-may-only-rename-superuser privilege check are not modelled
+      (this SQL-string-level handler has no per-connection session-role
+      context, same accept-and-ignore posture as every other role-DDL
+      privilege check here).
+
+- [x] **FOREIGN SERVER GRANT (`pg_foreign_server.srvacl`) round-trip in
+      pg_dump (M0119-0004, DU-002 slice 427, loop #12).** **COMPLETE
+      2026-07-02:** `GRANT USAGE ON FOREIGN SERVER <name> TO <role>` was
+      silently dropped from every dump — `tryRecordTableGrant`/
+      `tryRecordTableRevoke` classified the leading `foreign` keyword as a
+      non-table object and bailed, and `pg_foreign_server.VirtualRows`
+      hard-coded `srvacl` to `""` (NULL). Foreign servers now share the
+      OID-keyed ACL store with relations/schemas/routines/types via the
+      existing object-type-agnostic `relaclTextLockedFor` core: new
+      `foreignServerACLPrivOrder`/`ownerForeignServerACLString = "U"`
+      (owner-only default, no implicit PUBLIC — mirrors schema/table, not
+      function/type) + `ForeignServerACLText(srvOID)`
+      (`internal/catalog/catalog.go`); new `Catalog.ForeignServerOID`
+      interface method (concrete impl already existed from slice 377); server
+      gains `allForeignServerPrivileges = {"USAGE"}` + a `foreign`→`server`
+      branch in `tryRecordTableGrant`/`tryRecordTableRevoke` dispatching to
+      new `recordForeignServerGrant`/`recordForeignServerRevoke`
+      (`internal/server/grant_ddl.go`, mirrors `recordSchemaGrant`/
+      `recordSchemaRevoke`). USAGE is FOREIGN SERVER's sole privilege, so
+      `buildACLCommands` collapses the full grant to `GRANT ALL ON FOREIGN
+      SERVER goopg_srv TO srv_grantee;` (NOT `GRANT USAGE …`) — same as the
+      single-privilege FUNCTION/EXECUTE case (slice 345). This loop picked up
+      an uncommitted slice from the prior loop's background agent whose guard
+      assertion had the wrong expected form (`GRANT USAGE …`); a standalone
+      e2e repro (`internal/testport`, real cluster + real pg_dump 18.3)
+      isolated the true expected output and the assertion/comments were
+      corrected before landing. Tests: `TestForeignServerACLText`
+      (`internal/catalog/relacl_test.go`: NULL with no grants, plain
+      grant/grant-option/PUBLIC-grantee materialization, owner-side REVOKE
+      ALL empties to `{}`); `TestPort_PgDumpConnectionSetup` DU-002 slice 427
+      (byte-identical vs real pg_dump 18.3). Gates: `go build ./...` clean;
+      `go vet` catalog/server/testport clean; `internal/catalog`+
+      `internal/server` suites PASS; `TestPort_PgDumpConnectionSetup` PASS
+      (5.8s); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-foreign-server-grant-srvacl-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bq` added. Still open under
+      M0119-0004 (unchanged, no new ledger row needed — piggybacks the
+      existing M0119-0004-ACLHEAP thread): column-level (`pg_attribute.attacl`,
+      heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
+      `GRANT … ON FOREIGN DATA WRAPPER` (`fdwacl`) unmodelled;
+      extended-protocol commit-time deferral.
+
+- [x] **FOREIGN DATA WRAPPER GRANT (`pg_foreign_data_wrapper.fdwacl`)
+      round-trip in pg_dump (M0119-0004, DU-002 slice 428, loop #13).**
+      **COMPLETE 2026-07-02:** same-shaped gap one object class over from
+      slice 427 — `GRANT USAGE ON FOREIGN DATA WRAPPER <name> TO <role>` was
+      silently dropped from every dump because `tryRecordTableGrant`/
+      `tryRecordTableRevoke`'s `foreign` branch only recognized a following
+      `server` keyword, and `pg_foreign_data_wrapper.VirtualRows` hard-coded
+      `fdwacl` to `""` (NULL). `OBJECT_FDW` is byte-identical in shape to
+      `OBJECT_FOREIGN_SERVER` in PG's `acldefault` (world default
+      `ACL_NO_RIGHTS`, owner-only `USAGE`), so the fix mirrors slice 427
+      exactly: new `foreignDataWrapperACLPrivOrder`/
+      `ownerForeignDataWrapperACLString = "U"` + `ForeignDataWrapperACLText`
+      (`internal/catalog/catalog.go`, delegates to `relaclTextLockedFor`); new
+      `Catalog.ForeignDataWrapperOID` interface method (concrete impl already
+      existed from slice 375); server gains
+      `allForeignDataWrapperPrivileges = {"USAGE"}` + a `data`→`wrapper`
+      sub-branch alongside the slice-427 `server` sub-branch, dispatching to
+      new `recordForeignDataWrapperGrant`/`recordForeignDataWrapperRevoke`
+      (`internal/server/grant_ddl.go`, mirrors
+      `recordForeignServerGrant`/`recordForeignServerRevoke`). USAGE is FDW's
+      sole privilege, so `buildACLCommands` collapses the full grant to
+      `GRANT ALL ON FOREIGN DATA WRAPPER goopg_fdw TO fdw_grantee;`, same as
+      the FOREIGN SERVER case. Tests: `TestForeignDataWrapperACLText`
+      (`internal/catalog/relacl_test.go`); `TestPort_PgDumpConnectionSetup`
+      DU-002 slice 428 (byte-identical vs real pg_dump 18.3). Gates:
+      `go build ./...` clean; `internal/catalog`+`internal/server` suites
+      PASS; `TestPort_PgDumpConnectionSetup` PASS (5.7s, uncached); pgbench
+      smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-foreign-data-wrapper-grant-fdwacl-pgdump.md`;
+      `docs/design/README.md` row `0119-0004br` added. Foreign-server- and
+      FDW-level GRANT round-trip are both now fully modelled under
+      M0119-0004. Still open (unchanged): column-level (`pg_attribute.attacl`,
+      heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
+      extended-protocol commit-time deferral (M0119-0004-ACLHEAP).
+
+- [x] **DATABASE GRANT (`pg_database.datacl`) round-trip in pg_dump
+      (M0119-0004-ACLHEAP, datacl half, loop #16).** **COMPLETE 2026-07-02:**
+      closes the last object class left open under M0119-0004-ACLHEAP (loop
+      #89's ledger row had marked `datacl` "PERMANENTLY DEFERRED" — its ACL
+      section is only emitted by pg_dump under `-C`/`--create`, and no test
+      harness had ever exercised `--create`). Landed the typacl/srvacl/
+      fdwacl-template GRANT/REVOKE parser capture + executor writer
+      (`internal/executor/operators_ddl_database_acl.go`) + `DatabaseACLText`
+      catalog renderer + heap-decode hook, AND built the first `pg_dump
+      --create` test harness (`TestPort_PgDumpDatabaseGrantACL`), which
+      exposed that goopg's SQL-visible `pg_database` virtual catalog was
+      missing 8 columns pg_dump's `--create` query needs (`datcollate`/
+      `datctype`/`datlocprovider`/`datlocale`/`daticurules`/`datcollversion`/
+      `dattablespace`/`datacl`) and that two catalogs it queries directly
+      (`pg_shseclabel`, `pg_db_role_setting`) were never registered — both now
+      correctly-empty virtual tables. Added `shobj_description` builtin. A
+      mid-loop regression (changing the displayed `postgres` row's oid to
+      match the ACL-store key broke `TestPort_PgDumpConnectionSetup`'s CREATE
+      SUBSCRIPTION round-trip via `subdbid`) was caught by stash-comparing
+      against the pre-change tree and fixed by decoupling the display-oid
+      from the internal `c.DBOID()`-keyed ACL lookup. Tests:
+      `TestParseGrantDatabaseACL`/`TestParseGrantNonDatabaseLeavesDatabaseACLChangeNil`
+      (`internal/parser`); `TestDatabaseACLText`/`TestDatabaseACLRevokeFromOwner`
+      (`internal/catalog`); `TestPort_PgDumpDatabaseGrantACL`
+      (`internal/testport`, byte-identical vs real pg_dump 18.3 `--create`).
+      Gates: `go build`/`go vet` clean; `internal/catalog`+`internal/parser`+
+      `internal/executor`+`internal/planner`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS (regression-checked);
+      `TestPort_IsolationIntraGrantInplaceDb` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-database-grant-datacl-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bs` added. With typacl/attacl/
+      relacl/nspacl/proacl/srvacl/fdwacl/datacl all landed,
+      M0119-0004-ACLHEAP's object-class coverage is complete. Still open
+      (deferral ledger row appended): `datacl` only round-trips for the single
+      live-connected database (no true multi-database support); `ALTER
+      DATABASE ... SET`/`SECURITY LABEL` remain unimplemented (now
+      correctly-empty catalogs, not missing-relation errors);
+      extended-protocol commit-time deferral (M0119-0004-ACLHEAP) remains
+      open.
+
+- [x] **`ALTER DATABASE ... SET`/`RESET`/`RESET ALL` (`pg_db_role_setting.setconfig`)
+      round-trip in pg_dump (M0119-0004-ACLHEAP follow-up, loop #17).**
+      **COMPLETE 2026-07-02:** closes the loop #16 datacl-half row's own
+      "`ALTER DATABASE ... SET` remains unimplemented" residual. goopg's
+      parser has no `ALTER DATABASE` grammar at all, so `SET`/`RESET`/
+      `RESET ALL` are intercepted at the wire-protocol dispatch layer
+      (`parseAlterDatabaseConfig`, `internal/server/database_ddl.go`, mirrors
+      the existing CREATE/DROP DATABASE string-prefix bypass) rather than
+      teaching `parseAlter` a new statement shape; every other `ALTER
+      DATABASE` sub-form (`CONNECTION LIMIT`, `RENAME TO`, `OWNER TO`, ...)
+      stays unrecognised and keeps falling through to the pre-existing
+      `compatNoopCommandTag` no-op. New `catalog.InMemory.dbRoleSettings`
+      store (`SetDatabaseConfig`/`ResetDatabaseConfig`/
+      `ResetAllDatabaseConfig`/`DatabaseConfigEntries`, in-place upsert by
+      case-insensitive GUC name) backs the previously permanently-empty
+      `pg_db_role_setting.VirtualRows`. Keying gotcha caught by the pg_dump
+      round-trip test, not assumed: the store must key by
+      `catalog.FirstUserOID` (16384, the SQL-visible placeholder oid
+      `pg_database` displays), NOT `catalog.InMemory.DBOID()` (the real
+      on-disk oid `datacl`'s heap resync uses) — `dumpDatabaseConfig` issues
+      a separate query cross-referencing the oid a prior `pg_database` query
+      already read, unlike `datacl` which is read in the same row/query.
+      Three new WAL kinds (73-75) + `internal/initdb/database_config_recovery.go`
+      give it restart persistence. Tests: `internal/catalog/database_test.go`
+      (5 new); `internal/server/database_ddl_test.go` `TestParseAlterDatabaseConfig`
+      (7 positive + 6 negative); `internal/wal/database_config_ddl_test.go`;
+      `internal/initdb/database_config_recovery_test.go`;
+      `internal/testport/pgdump_database_config_test.go`
+      `TestPort_PgDumpDatabaseConfigSet` (byte-identical vs real pg_dump 18.3
+      `--create`). Gates: `go build`/`go vet` clean; `internal/catalog`+
+      `internal/server`+`internal/wal`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpDatabaseConfigSet`/`TestPort_PgDumpDatabaseGrantACL`/
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-database-config-set-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bt` added; deferral ledger row
+      appended. Still open: extended-protocol path has no equivalent hook
+      (standing M0119-0004-ACLHEAP gap); `ALTER ROLE ... SET`/`ALTER ROLE ...
+      IN DATABASE ... SET` (`setrole != 0`) entirely unimplemented; `SET TIME
+      ZONE`/`SET SESSION AUTHORIZATION`/`SET ... FROM CURRENT` special forms
+      unrecognised (fall through to the no-op); multi-database scope
+      unchanged from `datacl`.
+
+- [x] **`ALTER ROLE ... [IN DATABASE ...] SET`/`RESET`/`RESET ALL`
+      (`pg_db_role_setting.setconfig`, `setrole != 0`) round-trip in pg_dump
+      (M0119-0004-ACLHEAP follow-up, interactive session).** **COMPLETE
+      2026-07-02:** closes the loop #17 row's own "`ALTER ROLE ... SET`/
+      `ALTER ROLE ... IN DATABASE ... SET` entirely unimplemented" residual —
+      the `setrole != 0` complement of `pg_db_role_setting`.
+      `parseAlterRoleConfig` (`internal/server/role_ddl.go`) mirrors
+      `parseAlterDatabaseConfig`'s wire-dispatch bypass (reusing
+      `database_ddl.go`'s tokenizer helpers), tried first in
+      `tryHandleRoleDDL`'s `alter role`/`alter user` case, ahead of RENAME and
+      the attribute form. `tryHandleRoleDDL` gained a `dbName` parameter
+      (both `dispatch.go` call sites now pass `connTx.DBName`) so `IN
+      DATABASE` gets the same v0-scope restriction as `ALTER DATABASE ...
+      SET`/`datacl`: naming any database other than the connection's own is a
+      silent no-op. New `catalog.InMemory.roleSettings
+      map[roleSettingKey][]string` (`roleSettingKey{RoleOID, DBOid}`, DBOid
+      0=cluster-wide or `FirstUserOID`=`IN DATABASE`) backs `SetRoleConfig`/
+      `ResetRoleConfig`/`ResetAllRoleConfig`/`RoleConfigEntries`, mirroring
+      the `*DatabaseConfig` quartet's exact semantics; `AllRoleConfigRows()`
+      (sorted) feeds `pg_db_role_setting.VirtualRows` alongside the
+      pre-existing `setrole=0` row. **Scope note (not a gotcha):** PG splits
+      this catalog's dump across `pg_dump --create` (`IN DATABASE`,
+      `setdatabase != 0`) and `pg_dumpall` (plain cluster-wide,
+      `setdatabase = 0`); since M0119-0004 is the pg_dump-only TAP battery,
+      the round-trip test exercises `IN DATABASE` only, though the engine
+      plumbing (and unit tests) already cover `dbOid=0` too. Three new WAL
+      kinds (76-78) + `internal/initdb/role_config_recovery.go` mirror the
+      ALTER-DATABASE-SET restart-persistence pattern; ordering vs. role DDL
+      replay doesn't matter (records key off the role's stable OID, not
+      name). Tests: `internal/catalog/database_test.go` (4 new);
+      `internal/server/role_config_test.go` `TestParseAlterRoleConfig` (9
+      positive + 6 negative) + `TestTryHandleRoleDDLAlterRoleConfig`;
+      `internal/wal/role_config_ddl_test.go`;
+      `internal/initdb/role_config_recovery_test.go`;
+      `internal/testport/pgdump_role_config_test.go`
+      `TestPort_PgDumpRoleConfigSet` (byte-identical vs real pg_dump 18.3
+      `--create`, confirms a cluster-wide override does NOT leak into the
+      pg_dump-only surface). Gates: `go build ./...`/`go vet` clean;
+      `internal/catalog`+`internal/server`+`internal/wal`+`internal/initdb`
+      suites PASS; `TestPort_PgDumpRoleConfigSet`/
+      `TestPort_PgDumpDatabaseConfigSet`/`TestPort_PgDumpDatabaseGrantACL`/
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-config-set-pgdump.md`;
+      `docs/design/README.md` row `0119-0004bu` added; deferral ledger row
+      appended. Still open: extended-protocol gap (standing); multi-database
+      scope (standing); `pg_dumpall`'s cluster-wide dump surface untested
+      (separate future TAP-porting task, not a new engine capability); `SET
+      TIME ZONE`/`SET SESSION AUTHORIZATION`/`SET ... FROM CURRENT`
+      unrecognised; `ALTER ROLE ALL SET ...` unsupported.
+
+- [x] **`pg_dumpall --globals-only` unblocked; cluster-wide `ALTER ROLE ...
+      SET` round-trip (M0119-0004-ACLHEAP follow-up, interactive session).**
+      **COMPLETE 2026-07-02:** closes the prior row's own "`pg_dumpall`'s
+      cluster-wide dump surface untested" residual, which had wrongly
+      assumed this was "pure TAP-porting work, not a new engine capability."
+      Probing the real `pg_dumpall --globals-only` binary against goopg
+      failed immediately with `relation "pg_authid" does not exist` —
+      `pg_dumpall`'s `dumpRoles`/`dumpUserConfig` query `pg_authid` directly
+      (not `pg_roles`), a 12-column relation goopg's virtual catalog had
+      never registered. Three new virtual system catalogs
+      (`internal/catalog/catalog.go`): `pg_authid` (OID 1260, sourced from
+      the same live `c.roles`/`c.roleAttrs` state as `pg_roles`, NOT the
+      on-disk `global/1260` crash-recovery heap file — a separate concern;
+      `pg_roles`' stale placeholder OID reassigned to synthetic 1259102);
+      `pg_auth_members` (OID 1261) and `pg_parameter_acl` (OID 6243)
+      registered correctly-empty (role-membership GRANT and parameter-ACL
+      GRANT are both genuinely unimplemented). With all three resolving,
+      `pg_dumpall --globals-only` now runs to completion and correctly
+      dumps cluster-wide `ALTER ROLE <name> SET <guc> TO <value>;` — the
+      prior slice's `roleSettings` store already supported this without
+      further change. Tests:
+      `internal/testport/pgdumpall_role_config_test.go`
+      `TestPort_PgDumpallGlobalsOnly` (real pg_dumpall 18.3 binary). Gates:
+      `go build`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/server`+`internal/planner`+`internal/initdb` suites PASS;
+      full `TestPort_PgDump*` regression set PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-pgdumpall-globals-only.md`;
+      `docs/design/README.md` row `0119-0004bv` added; deferral ledger row
+      appended. Still open: `GRANT <role> TO <role>` role membership (new
+      grammar + storage); `GRANT ... ON PARAMETER` (same shape); seven
+      unmodelled `pg_authid` attribute columns (report PG defaults, honest
+      until `ALTER ROLE` gains real attribute parsing); standing
+      M0119-0004-ACLHEAP items (extended-protocol gap, multi-database
+      scope, `SET TIME ZONE`/etc.) unchanged.
+
+- [x] **`GRANT`/`REVOKE` role membership (`pg_auth_members`) round-trip in
+      pg_dumpall (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:**
+      closes the prior row's own "`GRANT <role> TO <role>` role membership —
+      new parser grammar + `pg_auth_members` real storage" residual. Parser's
+      shared GRANT/REVOKE token loop now tracks `sawOn bool` (role membership
+      has no `ON <object>` clause, the discriminator vs. every other
+      variant); `buildRoleMembershipChange` captures
+      `CompatNoopStmt.RoleMembership`. Server's virtual-ACL fast path
+      (`query.go`) now excludes any GRANT/REVOKE with no `" ON "` substring
+      so it reaches the executor. New `execRoleMembershipChange`
+      (`internal/executor/operators_ddl_role_membership.go`) resolves
+      role/grantee names via `RoleOID` (unresolvable name incl. PUBLIC →
+      42704, matching real PG), rejects a membership cycle incl. self-grant
+      via new `catalog.InMemory.RoleIsMemberOf` (0LP01), and drives new
+      `GrantRoleMembership`/`RevokeRoleMembership` on a
+      `roleMembers map[roleMembershipKey]*RoleMembership` registry (mirrors
+      `roleSettings`'s shape; re-grant upserts in place, admin_option never
+      downgrades). `pg_auth_members.VirtualRows` now projects the live
+      registry; `UnregisterRole` cascades membership-row removal. Two new
+      WAL kinds (79/80) + `internal/initdb/role_membership_recovery.go`
+      replay AFTER role DDL replay (not alongside `roleSettings`'s replay)
+      since `GrantRoleMembership` mints a fresh OID at replay time and an
+      earlier position risked colliding with a role OID loaded afterward.
+      Tests: `internal/parser/op_grant_rolemembership_test.go`;
+      `internal/catalog/role_membership_test.go`;
+      `internal/wal/role_membership_ddl_test.go`;
+      `internal/initdb/role_membership_recovery_test.go`;
+      `internal/testport/pgdumpall_role_membership_test.go`
+      `TestPort_PgDumpallRoleMembership` (byte-identical vs real pg_dumpall
+      18.3, incl. the `WITH ADMIN OPTION, INHERIT TRUE, SET FALSE GRANTED BY
+      postgres` clause and a revoked membership's correct absence). Gates:
+      `go build ./...`/`go vet` clean; `internal/parser`+`internal/catalog`+
+      `internal/wal`+`internal/initdb`+`internal/executor`+`internal/server`
+      suites PASS; `TestPort_PgDumpallRoleMembership`/
+      `TestPort_PgDumpallGlobalsOnly`/`TestPort_PgDumpRoleConfigSet`/
+      `TestPort_PgDumpDatabaseConfigSet` PASS; `scripts/tpch-spotcheck.sh`
+      PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-grant-role-membership.md`;
+      `docs/design/README.md` row `0119-0004bw` added; deferral ledger row
+      appended. Still open: `WITH INHERIT`/`WITH SET` clauses unparsed
+      (always report PG defaults); grantor-chain (member-grantor loop)
+      circularity check unimplemented (only role-member-loop is checked);
+      `GRANT ... ON PARAMETER` unimplemented; `roleSettings`/
+      `dbRoleSettings` not purged on DROP ROLE (pre-existing sibling gap,
+      unrelated to this slice); standing M0119-0004-ACLHEAP items
+      (extended-protocol gap, multi-database scope) unchanged.
+
+- [x] **`UnregisterRole` purges `roleSettings` on DROP ROLE (M0119-0004-ACLHEAP
+      follow-up, loop #4).** **COMPLETE 2026-07-03:** closes the prior row's
+      own "`roleSettings`/`dbRoleSettings` not purged on DROP ROLE" residual
+      — the `roleSettings` half only; `dbRoleSettings` is keyed purely by
+      `DBOid` (setrole=0, `ALTER DATABASE ... SET`) with no per-role
+      dimension, so there was nothing there to purge. `internal/catalog/
+      catalog.go`'s `UnregisterRole` now also sweeps `c.roleSettings` for any
+      `roleSettingKey` whose `RoleOID` matches the dropped role's OID
+      (cluster-wide `dbOid=0` and IN-DATABASE `FirstUserOID` scopes both
+      swept, mirroring the pre-existing `roleMembers` sweep alongside it).
+      New test `TestUnregisterRoleDropsRoleConfigRows`
+      (`internal/catalog/database_test.go`). Gates: `go build ./...`/`go vet`
+      clean; `internal/catalog` suite PASS (incl. all `RoleConfig`/
+      `UnregisterRole` tests); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33); pgbench smoke = pre-commit hook. No design-doc-worthy new
+      subsystem (a one-function bugfix in an already-documented registry);
+      deferral ledger row appended. Still open: `WITH INHERIT`/`WITH SET`
+      clauses, grantor-chain circularity check, `GRANT ... ON PARAMETER`,
+      and the standing extended-protocol/multi-database-scope gaps — all
+      unchanged from the prior row.
+
+- [x] **`GRANT`/`REVOKE ... ON PARAMETER ...` (`pg_parameter_acl`) round-trip
+      in pg_dumpall (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:**
+      closes the "`GRANT ... ON PARAMETER` unimplemented" residual carried by
+      the three prior rows. Unlike TYPE/DATABASE, `pg_parameter_acl` has no
+      heap relfilenode, so no re-sync step and no PUBLIC default seed are
+      needed. New `parser.ParameterACLChange` (mirrors `DatabaseACLChange`)
+      captures `GRANT/REVOKE {SET|ALTER SYSTEM|ALL} ON PARAMETER <names>
+      TO/FROM <roles>`; names are raw dotted strings via new
+      `splitTokDottedNames` (a GUC name's `.` is not a schema separator).
+      `query.go`'s `isHeapACLObject` gained `" ON PARAMETER "` so the
+      statement reaches the executor instead of the virtual-ACL fast path's
+      no-op. New `catalog.InMemory.ParameterACLOID`/`ParameterACLText`/
+      `ParameterACLEntries` mint a lazy synthetic OID per GUC name and share
+      the existing `tableACLs` store; `pg_parameter_acl.VirtualRows` now
+      projects real rows. New `execParameterACLChange`
+      (`internal/executor/operators_ddl_parameter_acl.go`). Also added the
+      `pg_get_userbyid` SQL builtin (`internal/executor/expr.go`, new
+      `catalog.InMemory.RoleNameForOIDOrUnknown`), needed by
+      `pg_dumpall`'s `dumpRoleGUCPrivs` query. Tests:
+      `internal/parser/op_grant_parameteracl_test.go`;
+      `internal/catalog/relacl_test.go`
+      (`TestParameterACL{OID,Text,RevokeFromOwner,Entries}`,
+      `TestRoleNameForOIDOrUnknown`);
+      `internal/testport/pgdumpall_parameter_acl_test.go`
+      `TestPort_PgDumpallParameterACL` (byte-identical vs real `pg_dumpall`
+      18.3). Gates: `go build ./...`/`go vet` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor`+`internal/server` suites PASS;
+      `TestPort_PgDumpallParameterACL` PASS; `scripts/tpch-spotcheck.sh`
+      PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-grant-on-parameter-pgdumpall.md`;
+      `docs/design/README.md` row `0119-0004bz` added; deferral ledger row
+      appended. Still open: GUC-name validation against a real compiled-in
+      parameter table (goopg has none, so any string is accepted); the
+      grantor-chain circularity check and REVOKE's recursive/cascade
+      dependent-privilege walk (both role-membership, unrelated to this
+      slice) remain open, unchanged from prior rows.
+
+- [x] **`GRANT ROLE` grantor-chain circularity check (M0119-0004-ACLHEAP
+      follow-up, loop #18).** **COMPLETE 2026-07-03:** closes the
+      "grantor-chain circularity check" residual carried by every
+      M0119-0004-ACLHEAP row since the original `GRANT`/`REVOKE` role
+      membership slice. New `catalog.InMemory.GrantRoleWouldCreateGrantorCycle`
+      is a direct port of `AddRoleMems`' second cycle guard (`user.c` ~1751,
+      `initialize_revoke_actions`/`plan_member_revoke`/`plan_recursive_revoke`),
+      scoped to one `roleOid`'s `pg_auth_members` rows: simulates
+      cascading-revoking every row the new grantee batch implicates, then
+      checks whether the grantor's own `admin_option` row survives untouched;
+      also unconditionally rejects granting ADMIN OPTION to the bootstrap
+      superuser (new exported `catalog.BootstrapSuperuserOID = 10`).
+      `execRoleMembershipChange` (`internal/executor/
+      operators_ddl_role_membership.go`) runs this once per `roleOid` for the
+      whole grantee batch — gated on `rc.AdminOption == true && grantorOid !=
+      BootstrapSuperuserOID` — before applying any of that roleOid's grants,
+      matching `AddRoleMems`' sanity-checks-then-whole-batch-admin-check-then-
+      updates ordering; violation returns `0LP01`/PG's exact message ("ADMIN
+      option cannot be granted back to your own grantor"). Tests:
+      `TestGrantRoleWouldCreateGrantorCycle{,RetainsUntouchedAdmin,
+      RejectsBootstrapSuperuserGrantee}` (`internal/catalog/
+      role_membership_test.go`). Live end-to-end `psql` smoke against a
+      running goopg instance confirmed the chained-cycle scenario errors
+      while 1-hop and unrelated-role grants succeed. Gates: `go build ./...`/
+      `go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/server`+`internal/wal`+`internal/initdb`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Design doc:
+      `docs/design/0119-0004-grant-role-admin-circularity.md`;
+      `docs/design/README.md` row `0119-0004ca` added; deferral ledger row
+      appended. Still open: goopg's `roleMembers` map is keyed by `(RoleOID,
+      MemberOID)` only (one row per pair) unlike real PG's `(roleid, member,
+      grantor)` composite key, so the "retained via another grantor's row"
+      escape hatch can never observe a second legitimate grantor for the same
+      membership; `GRANT ... ON PARAMETER` GUC-name validation and REVOKE's
+      recursive/cascade dependent-privilege walk (both unrelated to this
+      slice) remain open, unchanged from prior rows.
+
+- [x] **`REVOKE ROLE` CASCADE/RESTRICT dependent-privilege walk
+      (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:** closes the
+      "REVOKE's recursive/cascade dependent-privilege walk" residual carried
+      by every M0119-0004-ACLHEAP row since the REVOKE-OPTION-FOR
+      generalization row. `CASCADE`/`RESTRICT` were parsed and trimmed but
+      never read by the executor; new `parser.RoleMembershipChange.Cascade
+      bool` is now populated by `buildRoleMembershipChange`, also fixing a
+      latent ordering bug where `GRANTED BY <role>` unconditionally
+      terminated the option scan so a trailing `CASCADE` after `GRANTED BY`
+      was never reached. New
+      `catalog.InMemory.RevokeRoleMembershipCascadeSet` is a read-only
+      simulation of `plan_recursive_revoke` (`user.c`); `RESTRICT`/the
+      unwritten default with dependents raises `2BP01` (hint "Use CASCADE to
+      revoke them too."), `CASCADE` applies the full transitive chain first.
+      Tests: `TestParseGrantRoleMembership` new cases;
+      `TestRevokeRoleMembershipCascadeSet{NoAdminOptionNeverCascades,
+      BlocksWithoutCascade,WalksTransitiveChain}`. Live end-to-end `psql`
+      smoke confirmed both the block and the cascade path. Gates: `go build
+      ./...`/`go vet` clean; full suite PASS; `scripts/tpch-spotcheck.sh`
+      PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-revoke-role-cascade.md`; `docs/design/README.md`
+      row `0119-0004cb` added; deferral ledger row appended. Still open:
+      multi-grantor `roleMembers` keying and `GRANT ... ON PARAMETER`
+      GUC-name validation, unchanged from prior rows.
+
+- [x] **`pg_auth_members` multi-grantor rows (M0119-0004-ACLHEAP
+      follow-up).** **COMPLETE 2026-07-03:** closes the "goopg's
+      `roleMembers` map is keyed by `(RoleOID, MemberOID)` only" residual
+      carried by every M0119-0004-ACLHEAP row since the original role-
+      membership slice. `roleMembershipKey` (`internal/catalog/catalog.go`)
+      gained a `GrantorOID` field, matching real PG's `(roleid, member,
+      grantor)` unique index (`pg_auth_members_role_member_index`).
+      `GrantRoleMembership` now mints an independent row for a DIFFERENT
+      grantor granting the same `(role, member)` pair instead of silently
+      overwriting the existing row's grantor (a real, demonstrable
+      divergence from PG the old model had); a re-grant BY THE SAME grantor
+      still upserts in place. `RevokeRoleMembership` gained a `grantorOid`
+      parameter and only ever touches the one row identified by the full
+      triple, leaving any other grantor's row untouched.
+      `RevokeRoleMembershipCascadeSet` gained the same parameter and now
+      returns `[]DependentRoleMembership{MemberOID, GrantorOID}` (was
+      `[]uint32`) so cascade dependents are revoked at their own specific
+      grantor — this also makes `plan_recursive_revoke`'s "would the member
+      still hold admin via ANOTHER untouched row" escape hatch reachable for
+      the first time. `UnregisterRole` (DROP ROLE) now also purges rows
+      where the dropped role is the grantor (pre-existing gap fixed
+      incidentally). `execRoleMembershipChange`
+      (`internal/executor/operators_ddl_role_membership.go`) now resolves
+      `grantorOid` once, shared by GRANT and REVOKE — REVOKE previously
+      silently ignored `rc.GrantedBy` entirely.
+      `EncodeRevokeRoleMembership`/`DecodeRevokeRoleMembership`
+      (`internal/wal/recovery.go`) gained a `grantorOid` field (14-byte
+      payload, up from 10) so a grantor-scoped REVOKE replays the correct
+      row after a restart. Tests: `TestGrantRoleMembershipUpsertsInPlace`
+      rewritten for same-grantor-upserts-in-place vs.
+      different-grantor-mints-independent-row; new
+      `TestRevokeRoleMembershipTargetsOnlyItsOwnGrantorRow`; cascade tests
+      updated for the new parameter/return type
+      (`internal/catalog/role_membership_test.go`); WAL round-trip tests
+      updated (`internal/wal/role_membership_ddl_test.go`); new
+      `TestRoleMembershipRecoveryReplaysMultiGrantorRows`
+      (`internal/initdb/role_membership_recovery_test.go`). Gates: `go build
+      ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb`+`internal/parser`+`internal/server`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-membership-multi-grantor.md`;
+      `docs/design/README.md` row `0119-0004cc` added; deferral ledger row
+      appended. Still open: `check_role_grantor`'s inherited-privilege/
+      superuser fallback for a bare REVOKE's implicit grantor (goopg always
+      uses the effective DDL-owner role); `check_role_membership_
+      authorization`'s ADMIN-OPTION-required permission check (any DDL-owner
+      role can currently GRANT/REVOKE any role membership); `GRANT ... ON
+      PARAMETER` GUC-name validation (unrelated to this slice) remain open.
+
+- [x] **`check_role_membership_authorization` ADMIN OPTION permission gate
+      (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:** closes the
+      "any DDL-owner role can currently GRANT/REVOKE any role membership"
+      residual carried by every M0119-0004-ACLHEAP row since the original
+      role-membership slice. New `catalog.InMemory.IsSuperuser(oid) bool` +
+      `IsAdminOfRole(memberOid, roleOid) bool` (mirrors `is_admin_of_role`,
+      `acl.c`: superuser member always true; a role is never its own admin;
+      otherwise a BFS over `roleMembers` inheriting ADMIN OPTION transitively
+      through any membership chain, matching `ROLERECURSE_MEMBERS`).
+      `execRoleMembershipChange` (`internal/executor/operators_ddl_role_membership.go`)
+      now calls new `checkRoleMembershipAuthorization` once per target role in
+      both the GRANT and REVOKE branches, right after the role name resolves:
+      a superuser-flagged target role requires a superuser grantor/revoker
+      regardless of ADMIN OPTION; otherwise the invoking user must hold ADMIN
+      OPTION on the target role. Both raise `42501` with PG's exact
+      `errmsg`/`errdetail` text. Tests: `TestIsSuperuser`/`TestIsAdminOfRole`
+      (`internal/catalog/role_membership_test.go`); new
+      `internal/executor/operators_ddl_role_membership_test.go`
+      (`TestExecRoleMembershipChangeRequiresAdminOption`,
+      `TestExecRoleMembershipChangeSuperuserRoleRequiresSuperuserGrantor`,
+      `TestExecRoleMembershipChangeRevokeRequiresAdminOption`). Live
+      end-to-end `psql` smoke against a running goopg instance confirmed all
+      scenarios match PG's exact error text. Gates: `go build ./...`/`go vet`
+      clean; `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/wal`+`internal/initdb`+`internal/server` suites PASS;
+      `TestPort_PgDumpallRoleMembership` PASS (unaffected — runs as the
+      bootstrap superuser); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-membership-admin-option-authz.md`;
+      `docs/design/README.md` row `0119-0004cd` added; deferral ledger row
+      appended. Still open: the `ROLE_PG_DATABASE_OWNER` "cannot have
+      explicit members" carve-out (unreachable today — predefined roles are
+      never registered in the live role-name registry); `check_role_grantor`'s
+      inherited-privilege/superuser fallback for a bare REVOKE's implicit
+      grantor; `GRANT ... ON PARAMETER` GUC-name validation (both unrelated to
+      this slice).
+
+- [x] **`check_role_grantor` implicit/explicit grantor inference
+      (M0119-0004-ACLHEAP follow-up).** **COMPLETE 2026-07-03:** closes the
+      "`check_role_grantor`'s inherited-privilege/superuser fallback for a
+      bare REVOKE's implicit grantor" residual carried by every
+      M0119-0004-ACLHEAP row since the original role-membership slice.
+      `execRoleMembershipChange` always recorded the grantor-of-record as
+      `currentDDLOwnerOID()` regardless of how that user actually came to
+      hold authorization. New `catalog.InMemory.HasPrivsOfRole(memberOid,
+      roleOid) bool` (mirrors `has_privs_of_role`: self, superuser bypass, or
+      an INHERIT-only BFS chain — `ROLERECURSE_PRIVS`, unlike
+      `IsAdminOfRole`'s unconditional `ROLERECURSE_MEMBERS`) and
+      `SelectBestAdmin(memberOid, roleOid) uint32` (mirrors
+      `select_best_admin`: closest INHERIT-chain ancestor, preferring
+      `memberOid` itself, that directly holds `AdminOption` on `roleOid`; 0
+      if none). New `checkRoleGrantor`
+      (`internal/executor/operators_ddl_role_membership.go`) ports
+      `check_role_grantor` exactly, called once per target `roleOid` right
+      after `checkRoleMembershipAuthorization`: no `GRANTED BY` → superuser
+      current user records as `BootstrapSuperuserOID`, otherwise
+      `SelectBestAdmin(currentUserID, roleOid)` (falls back to
+      `currentUserID` defensively rather than PG's internal-error `elog`,
+      ledgered as a deliberate divergence); explicit `GRANTED BY` →
+      `HasPrivsOfRole` gates impersonation (`42501` for both GRANT/REVOKE,
+      PG's exact per-verb message text), and GRANT additionally requires the
+      named grantor's ADMIN OPTION be its OWN
+      (`SelectBestAdmin(explicitGrantorOid, roleOid) == explicitGrantorOid`),
+      exempting the bootstrap superuser. Also fixed a sibling bug: an
+      unresolvable `GRANTED BY` name previously fell back silently to the
+      current user instead of raising `42704`. Tests:
+      `TestHasPrivsOfRole`/`TestSelectBestAdmin`
+      (`internal/catalog/role_membership_test.go`);
+      `TestExecRoleMembershipChangeInfersGrantorViaInheritedAdmin`/
+      `GrantedByRequiresPrivsOfGrantor`/`GrantedByRequiresDirectAdminOption`/
+      `UnresolvableGrantedByErrors`
+      (`internal/executor/operators_ddl_role_membership_test.go`). Gates:
+      `go build ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/wal`+`internal/initdb`+`internal/server`
+      suites PASS; `TestPort_PgDumpallRoleMembership` PASS (unaffected —
+      bootstrap-superuser path unchanged); `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-role-membership-grantor-inference.md`;
+      `docs/design/README.md` row `0119-0004ce` added; deferral ledger row
+      appended. Still open: the `ROLE_PG_DATABASE_OWNER` "cannot have
+      explicit members" carve-out (unreachable today — predefined roles are
+      never registered in the live role-name registry); `GRANT ... ON
+      PARAMETER` GUC-name validation (unrelated to this slice).
+
+- [x] **`GRANT ... ON PARAMETER` GUC-name validation (M0119-0004-ACLHEAP
+      follow-up).** **COMPLETE 2026-07-03:** closes the "GUC-name validation"
+      residual carried by every M0119-0004-ACLHEAP parameter-ACL row since
+      `0119-0004-grant-on-parameter-pgdumpall.md` — goopg previously accepted
+      any string as a parameter name unconditionally. New
+      `config.IsCustomGUCName` (exported from the pre-existing
+      `SET`-on-unregistered-name helper) + new
+      `catalog.InMemory.HasParameterACL` (a non-minting
+      `ParameterAclLookup(missing_ok=true)` analogue) + new
+      `checkParameterACLName` (`internal/executor/operators_ddl_parameter_acl.go`)
+      port `check_GUC_name_for_parameter_acl` exactly: a known compiled-in
+      GUC or a syntactically valid custom/extension name (two-or-more
+      dot-separated identifiers) is accepted; a bare unrecognized name raises
+      `42704`; a dotted name failing the syntax check raises `42602` — both
+      with PG's exact `errmsg`/`errdetail` text (confirmed byte-identical
+      against a live real-PostgreSQL-18.3 side-by-side). `execParameterACLChange`
+      restructured to match `objectNamesToOids`'s exact timing: validation
+      only runs the first time a GRANT would materialize a brand-new entry
+      (`!im.HasParameterACL(name)`) — a second GRANT on an already-materialized
+      name skips it, matching PG. Also fixed a sibling divergence in the same
+      function: REVOKE on a name with no existing ACL entry previously
+      materialized a spurious owner-only row unconditionally (`ParameterACLOID`
+      always mints); now a pure no-op, matching `ParameterAclLookup`'s
+      REVOKE-side behavior. Tests: `TestIsCustomGUCName` (`internal/config`);
+      `TestHasParameterACL` (`internal/catalog/relacl_test.go`);
+      `TestCheckParameterACLName`/`TestExecParameterACLChangeRejectsUnknownName`/
+      `TestExecParameterACLChangeAcceptsKnownAndCustomNames`/
+      `TestExecParameterACLChangeRevokeOnUnknownNameIsNoop`/
+      `TestExecParameterACLChangeSecondGrantSkipsRevalidation`
+      (`internal/executor/operators_ddl_parameter_acl_test.go`). Gates:
+      `go build ./...`/`go vet` clean; `internal/config`+`internal/catalog`+
+      `internal/executor`+`internal/parser`+`internal/server`+`internal/wal`+
+      `internal/initdb` suites PASS; `TestPort_PgDumpallParameterACL` PASS
+      against real `pg_dumpall` 18.3 (unaffected — fixture only uses known
+      GUCs); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+      hook. Design doc: `docs/design/0119-0004-parameter-acl-guc-name-validation.md`;
+      `docs/design/README.md` row `0119-0004cf` added; deferral ledger row
+      appended. Still open: the loaded-extension reserved-namespace-prefix
+      check (`reserved_class_prefix`) is not ported (goopg tracks no
+      loaded-extension GUC namespace registry); the `ROLE_PG_DATABASE_OWNER`
+      carve-out and `check_role_grantor`'s `WITH INHERIT FALSE` edge case
+      from prior rows remain open, unchanged.
+
+- [x] **`check_role_grantor`'s `SelectBestAdmin == 0` fallback — port PG's
+      "no possible grantors" (M0119-0004-ACLHEAP follow-up, loop #37).**
+      **COMPLETE 2026-07-03:** closes the `0119-0004ce` row's own deferred
+      "`WITH INHERIT FALSE` admin-chain edge case", confirmed **reachable**
+      (not theoretical) against a live scratch PostgreSQL 18.3 instance
+      (`postgres/local_install`, `initdb`+`pg_ctl` on port 5599): `GRANT tgt
+      TO mid WITH ADMIN OPTION; GRANT mid TO cur WITH INHERIT FALSE;` then
+      `cur` running `GRANT tgt TO grantee` raises `ERROR: XX000: no possible
+      grantors` at `check_role_grantor, user.c:2231` —
+      `checkRoleMembershipAuthorization`'s `IsAdminOfRole`
+      (`ROLERECURSE_MEMBERS`) authorizes `cur` via the same chain that
+      `checkRoleGrantor`'s `SelectBestAdmin` (`ROLERECURSE_PRIVS`,
+      INHERIT-only) then fails to find a grantor through.
+      `internal/executor/operators_ddl_role_membership.go`'s `checkRoleGrantor`
+      now returns `&ExecError{Code: "XX000", Message: "no possible
+      grantors"}` from that branch instead of the old silent `return
+      currentUserID, nil`. Test: `TestExecRoleMembershipChangeNoPossibleGrantors`
+      (`internal/executor/operators_ddl_role_membership_test.go`). Gates: `go
+      build ./...`/`go vet` clean; `internal/catalog`+`internal/executor`+
+      `internal/parser`+`internal/wal`+`internal/initdb`+`internal/server`
+      suites PASS; `TestPort_PgDumpallRoleMembership` PASS (unaffected);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/0119-0004-role-membership-grantor-inference.md`
+      (new "Follow-up" section); `docs/design/README.md` row `0119-0004cg`
+      added; deferral ledger row appended. Still open: the
+      `ROLE_PG_DATABASE_OWNER` carve-out and `GRANT ... ON PARAMETER`'s
+      `reserved_class_prefix` extension-namespace check remain open,
+      unrelated to this slice.
+
+- [x] **Predefined-role name resolution + `ROLE_PG_DATABASE_OWNER` carve-out
+      (M0119-0004-ACLHEAP follow-up, loop #43).** **COMPLETE 2026-07-03:**
+      closes the `0119-0004cd` row's own deferred `ROLE_PG_DATABASE_OWNER`
+      residual, which was **unreachable, not merely unimplemented**: goopg's
+      16 PG18 predefined `pg_*` roles were only ever heap-seeded
+      (`internal/initdb/initdb.go`) or heap-resynced
+      (`internal/executor/pg_authid_sync.go`), never registered in the live
+      catalog role-name registry, so `resolveRole("pg_database_owner")`
+      already failed with `42704` before `checkRoleMembershipAuthorization`
+      ever ran — and the standard PG idiom `GRANT pg_read_all_data TO alice`
+      didn't work at all. New `catalog.InMemory.predefinedRoles`
+      (`internal/catalog/catalog.go`) is a dedicated, read-only map
+      populated once at `NewInMemory()` construction from a new
+      `predefinedRoleSeeds` list (a third independent copy of the same
+      16-role data — `internal/catalog` cannot import either existing copy
+      without an import cycle), consulted by `RoleOID`/`RoleExists`
+      (predefined checked FIRST, so a hypothetical exact-name collision from
+      goopg's own pre-existing "CREATE ROLE doesn't reject `pg_`-prefixed
+      names" gap can never shadow the real OID) and a new shared
+      `roleNameForOIDLocked` helper feeding `RoleNameForOID`/
+      `RoleNameForOIDOrUnknown` (the reverse direction — moved together per
+      the sibling-path rule) — but structurally separate from `roles`, so
+      `RegisterRole`/`UnregisterRole`/`RenameRole`/`AllRoleStates` never see
+      it (no pg_authid heap-sync duplication). New `IsPredefinedRole`
+      (added to the `Catalog` interface) backs a new DROP ROLE/USER/GROUP
+      pinned-object guard (`execDropCompat`, `internal/executor/
+      operators_ddl.go`) this loop had to add in the same pass: without it,
+      registering these names as resolvable would let `DROP ROLE
+      pg_read_all_data` silently succeed, which real PG 18.3 rejects
+      unconditionally (verified live, scratch `initdb`+`pg_ctl` instance,
+      port 5599) with `2BP01 "cannot drop role %s because it is required by
+      the database system"` (PG's generic pinned-object check,
+      `checkSharedDependencies`/`IsPinnedObject`, `pg_shdepend.c` — every
+      predefined role OID is below `FirstUnpinnedObjectId`=12000),
+      unaffected by `IF EXISTS`. `checkRoleMembershipAuthorization`
+      (`internal/executor/operators_ddl_role_membership.go`) now checks the
+      carve-out first, unconditionally, `isGrant`-only (REVOKE unaffected),
+      raising `0A000` with PG's exact unquoted `role %s cannot have explicit
+      members` text. Tests: `TestPredefinedRoleResolution`
+      (`internal/catalog/role_membership_test.go`);
+      `TestExecRoleMembershipChangeGrantsPredefinedRole`/
+      `GrantPgDatabaseOwnerRejected`/`TestExecDropCompatPredefinedRolePinned`
+      (`internal/executor/operators_ddl_role_membership_test.go`);
+      `internal/initdb/role_ddl_recovery_test.go`'s
+      `TestPgAuthidSyncLoadRoundTrip` updated — its old assertion
+      ("predefined role must never appear in `RoleExists`") encoded exactly
+      the gap this loop closes. Gates: `go build ./...`/`go vet ./...`
+      clean; `internal/catalog`+`internal/executor`+`internal/server`+
+      `internal/parser`+`internal/wal`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpallRoleMembership`+`TestPort_PgDumpConnectionSetup`
+      PASS (no regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-predefined-role-resolution.md` (new);
+      `docs/design/README.md` row `0119-0004ch` added; deferral ledger row
+      appended. Still open (newly discovered while scoping this loop, not
+      required to close the `0119-0004cd` residual itself, which IS fully
+      landed): (a) the 16 predefined roles remain entirely absent from the
+      `pg_authid`/`pg_roles` virtual catalog views, so a `GRANT
+      pg_read_all_data TO alice` row, while now correctly stored, will not
+      survive a real `pg_dumpall` round-trip (its `LEFT JOIN pg_roles`
+      produces a NULL role name and the dump silently drops the row); (b)
+      `CREATE ROLE`'s missing `IsReservedName` "pg_"-prefix rejection
+      (`internal/server/role_ddl.go` — only the RENAME TO path checks it
+      today) remains unfixed at the source, though this loop's `RoleOID`
+      lookup-priority ordering defends against the resulting OID-shadowing
+      risk.
+
+- [x] **`CREATE ROLE`/`USER`/`GROUP` reserved-`pg_`-prefix rejection
+      (M0119-0004-ACLHEAP follow-up, loop #44).** **COMPLETE 2026-07-03:**
+      closes discovery (b) from the loop #43 entry above: `tryHandleRoleDDL`'s
+      `"create role "`/`"create user "`/`"create group "` branch
+      (`internal/server/role_ddl.go`) never called `isReservedRoleName` —
+      only `ALTER ROLE ... RENAME TO` did — so `CREATE ROLE pg_custom`
+      silently succeeded where real PG's `CreateRole`
+      (`postgres/src/backend/commands/user.c`) raises `42939 "role name
+      \"%s\" is reserved"` before its `pg_authid` duplicate-name lookup.
+      Fix wires the existing `isReservedRoleName`/`reservedRoleNameErr`
+      helpers (already used by `renameRole`) into the CREATE branch
+      immediately after name extraction — no new helper needed. Tests:
+      `TestCreateRoleRejectsReservedPgPrefix`/`TestCreateRoleAllowsNonReservedName`
+      (`internal/server/role_ddl_create_reserved_test.go`, new). Gates:
+      `go build ./...`/`go vet` clean; `internal/server`+`internal/catalog`+
+      `internal/executor`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpallRoleMembership`+`TestPort_PgDumpConnectionSetup`
+      PASS (no regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-create-role-reserved-prefix.md` (new);
+      `docs/design/README.md` row `0119-0004ci` added. Still open,
+      unrelated to this slice: discovery (a) above — the 16 predefined
+      roles remain absent from the `pg_authid`/`pg_roles` virtual catalog
+      views, so a `GRANT pg_read_all_data TO alice` row won't survive a
+      real `pg_dumpall` round-trip; PG's `errdetail` text for the reserved-
+      name error is not ported (`roleError` has no detail field, shared
+      simplification with the RENAME TO path).
+
+- [x] **`pg_authid`/`pg_roles` predefined-role virtual rows (M0119-0004-ACLHEAP
+      follow-up, loop #46).** **COMPLETE 2026-07-03:** closes discovery (a)
+      from the loop #43 entry above. `internal/catalog/catalog.go`'s `pgRoles`/
+      `pgAuthid` `VirtualRows` closures now append a second row-emission pass
+      over `predefinedRoleSeeds` (sorted by name) using each role's fixed OID
+      from `c.predefinedRoles` — `pg_roles` emits `rolsuper='f'`/
+      `rolcanlogin='f'` literals; `pg_authid` reuses the existing `rowFor`
+      helper with a zero-value `&RoleAttrs{}`, whose existing default-flip
+      logic already produces PG's exact predefined-role shape (rolinherit=`t`,
+      rolconnlimit=`-1`, rolpassword=`NULL`) with no new per-row logic needed.
+      Verified end-to-end against the exact failure mode described in the
+      loop #43 discovery: new `TestPort_PgDumpallPredefinedRoleMembership`
+      (`internal/testport/pgdumpall_role_membership_test.go`) grants
+      `pg_read_all_data` to a real role plus a second membership sorting after
+      it by role name, and asserts real `pg_dumpall --globals-only` emits both
+      `GRANT` lines with no "orphaned pg_auth_members entry" warning — before
+      this fix, the NULL `ur.rolname` for the predefined-role grant made
+      `pg_dumpall` treat it as orphaned and, since rows are `ORDER BY role`
+      with NULLs sorting last, `break` out of its membership loop entirely,
+      silently dropping every subsequent membership row too, not just the
+      predefined-role one. Unit coverage: `TestPgCatalogBootstrapViews`
+      extended (17 `pg_roles` rows: 1 bootstrap superuser + 16 predefined,
+      `pg_read_all_data`'s `rolsuper`/`rolcanlogin` both asserted `f`); new
+      `TestPgAuthidExposesPredefinedRoles` (18 `pg_authid` rows incl. a
+      registered user role, `pg_read_all_data`'s full attribute row incl.
+      fixed OID 6181) (`internal/catalog/catalog_test.go`). Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/catalog` suite PASS;
+      `TestPort_PgDumpallPredefinedRoleMembership` (new) +
+      `TestPort_PgDumpallRoleMembership` (no regression) PASS against real
+      `pg_dumpall` 18.3. Design doc:
+      `docs/design/0119-0004-predefined-role-resolution.md` new "Follow-up:
+      `pg_authid`/`pg_roles` predefined-role rows (loop #46)" section;
+      `docs/design/README.md` row `0119-0004cj` added, `0119-0004ch`/
+      `0119-0004ci` rows' "Still open" notes updated to point at it; deferral
+      ledger row appended (marks the loop #43 discovery (a) row `resolved`).
+      Still open, unrelated to this slice: `roleError` detail-field threading
+      (`0119-0004ci`'s own residual); `GRANT ... ON PARAMETER`'s
+      `reserved_class_prefix` extension-namespace check.
+
+- [x] **`roleError` `errdetail`-field threading (M0119-0004-ACLHEAP follow-up,
+      loop #47).** **COMPLETE 2026-07-03:** closes the `0119-0004ci` row's own
+      named residual — PG's `CreateRole`/`RenameRole` (`postgres/src/backend/
+      commands/user.c:356,1388,1395`) always pairs the reserved-`pg_`-prefix
+      `errmsg` with a fixed `errdetail("Role names starting with \"pg_\" are
+      reserved.")`, but `roleError` (`internal/server/role_ddl.go`) had no
+      detail field, so goopg's wire `ErrorResponse` for `CREATE ROLE pg_x`/
+      `ALTER ROLE x RENAME TO pg_x` was missing the `D` field entirely. Added
+      `detail string` to `roleError`; `reservedRoleNameErr` now sets it to
+      PG's exact fixed text (same literal at every call site, unlike the
+      errmsg which interpolates the name). New `roleErrorDetailFields(err)
+      []protocol.ErrorField` returns a single `FieldDetail` entry when set;
+      wired into both `writeQueryError` call sites in
+      `internal/server/dispatch.go` (the `splitLeadingRoleDDL` batch-
+      recursion branch and the single-statement `tryHandleRoleDDL` branch) —
+      since `renameRole` returns through the same `tryHandleRoleDDL` path,
+      one wiring point per call site covers both CREATE and RENAME. Tests:
+      extended `TestCreateRoleRejectsReservedPgPrefix` to assert the exact
+      `roleErrorDetailFields` output; new
+      `TestRoleErrorDetailFieldsEmptyForNonReservedErrors` guards
+      `roleDoesNotExistErr`/`roleAlreadyExistsErr` against detail leakage
+      (`internal/server/role_ddl_create_reserved_test.go`). Verified
+      end-to-end via live `psql` against a running goopg instance
+      (fresh build, isolated port/data dir): byte-identical `ERROR`/`DETAIL`
+      wire output for both `CREATE ROLE pg_custom` and
+      `ALTER ROLE alice2 RENAME TO pg_alice2`. Gates: `go build ./...`/
+      `go vet ./...` clean; `internal/server` suite PASS (full package, no
+      regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-create-role-reserved-prefix.md` gained a
+      "Follow-up: `roleError` detail-field threading (loop #47)" section;
+      `docs/design/README.md` row `0119-0004ck` added, `0119-0004ci`/
+      `0119-0004cj` rows' "Still open" notes updated to point at it; deferral
+      ledger row appended (marks the loop #47 `0119-0004ci` residual row
+      `resolved`). No new deferral — this was itself the deferred item.
+      Remaining, unrelated to this slice: `GRANT ... ON PARAMETER`'s
+      `reserved_class_prefix` extension-namespace check; `check_role_grantor`'s
+      inherited-privilege/superuser fallback for a bare REVOKE's implicit
+      grantor.
+
+- [x] **Plain-`INHERITS` NOT NULL constraint locality fix (M0110-0001
+      follow-up, loop #48).** **COMPLETE 2026-07-03:** live `pg_dump`
+      discovery (not sourced from a prior ledger row) against the most basic
+      form of table inheritance — `CREATE TABLE parent_t (id int PRIMARY
+      KEY, name text); CREATE TABLE child_t (extra text) INHERITS
+      (parent_t);` — found goopg's `pg_dump --schema-only` emitted a
+      malformed `CREATE TABLE public.child_t ( NOT NULL id, extra text )
+      INHERITS (public.parent_t);` where live PostgreSQL 18.3 (verified
+      side-by-side, `postgres/local_install`) emits `CREATE TABLE
+      public.child_t (extra text) INHERITS (public.parent_t);` with no
+      mention of `id` at all — a real, confirmed-against-live-PG
+      divergence. Root cause: `execCreateTable`'s NOT NULL constraint
+      registration loop (`internal/executor/operators_ddl.go` ~line 3189,
+      DU-002 slice 50) called `tbl.AddNotNull(..., isLocal=true,
+      inhCount=0)` unconditionally for every NOT NULL column, even one
+      carried in purely by `INHERITS` (`col.Inherited=true`, DU-002 slice
+      170 — previously only consumed for the sibling `pg_attribute.
+      attislocal` purpose) — making `pg_constraint.conislocal='t'` for
+      `child_t.id`, exactly the condition `pg_dump.c`'s `dumpTableSchema`
+      (~line 17213) uses to re-emit a non-printed inherited column as a
+      standalone non-conforming `NOT NULL <col>` table element (PG's own
+      documented syntax for a LOCAL not-null override on an otherwise
+      inherited-and-unprinted column — the wrong branch to be in here,
+      since `id` is not local at all). Fix: when `col.Inherited &&
+      s.PartitionOf == nil` (a `PARTITION OF` child also sets
+      `col.Inherited`, but partitions always print every column inline
+      regardless of locality — `pg_dump.c`'s `ispartition` OR-condition —
+      so this only matters for plain `INHERITS`), derive `isLocal`/
+      `inhCount`/constraint-name from the `INHERITS` parent's own NOT NULL
+      constraint on the same column, matching real PG's `MergeAttributes`.
+      A column the child also declares itself is unaffected (`col.
+      Inherited` is only set when absent from the child's own column list,
+      per the pre-existing DU-002 slice 170 `localCols` check). Test: new
+      `TestCreateTableInheritsNotNullConstraintIsNonLocal`
+      (`internal/executor/operators_ddl_named_check_test.go`) — parent
+      stays `conislocal=t/coninhcount=0`, child's inherited copy is
+      `conislocal=f/coninhcount=1` with the parent's exact constraint name,
+      and a child that locally redeclares the column keeps the pre-existing
+      `conislocal=t/coninhcount=0` behavior (regression guard only). Gates:
+      `go build ./...`/`go vet ./...` clean; new test PASS; full
+      `internal/executor`+`internal/catalog` suites PASS (no regression);
+      `TestPort_PgDumpConnectionSetup`+`TestPort_PgDump001Basic` PASS; live
+      `pg_dump` smoke on an isolated port/data dir vs. a scratch real-
+      PostgreSQL-18.3 instance for both the fixed case and a `PARTITION OF`
+      sanity check (confirmed unaffected — identical before/after, not
+      touched by the `s.PartitionOf == nil` guard); `internal/parser`+
+      `internal/server`+`internal/initdb` suites PASS; `scripts/tpch-
+      spotcheck.sh` PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Plain-`INHERITS` NOT
+      NULL constraint locality fix (loop #48)" section (also corrects a
+      stale note in the same doc: the "`dispatch_extended.go` missing
+      several cases `dispatch.go` has" divergence was already resolved by
+      an earlier unrelated refactor unifying `appendTypedCellText` across
+      both protocols); `docs/design/README.md` row `0110-0001` addendum
+      added; deferral ledger row appended (task-id `M0110-0001`). **New
+      deferral:** a `PARTITION OF` child registers **zero**
+      `pg_constraint` contype='n' rows for its inherited-NOT-NULL columns
+      at all (confirmed via `psql` against a live goopg instance:
+      `attnotnull='t'`/`attinhcount=1` on `pg_attribute`, but no matching
+      `pg_constraint` row whatsoever) — a separate, pre-existing bug found
+      while confirming this loop's fix doesn't regress the partition case
+      (deliberately not fixed here — needs its own live-PG-verified
+      follow-up).
+
+- [x] **`PARTITION OF` NOT NULL constraint locality fix (M0110-0001
+      follow-up, loop #53).** **COMPLETE 2026-07-03:** resolves the
+      follow-up gap recorded by the previous item. `execCreatePartitionChild`
+      (`internal/executor/operators_ddl.go`) only called `tbl.AddNotNull` for
+      columns in `poc.NotNullColumns` (the partition's own inline `(col NOT
+      NULL)` override list); a column that is NOT NULL purely because the
+      partitioned PARENT enforces it got zero `pg_constraint` contype='n' row
+      at all. Verified live against `postgres/local_install` PG 18.3 with
+      three cases (`CREATE TABLE p (id int NOT NULL, v text) PARTITION BY
+      RANGE (id); CREATE TABLE p1 PARTITION OF p ...` for pure inheritance;
+      `p2/p2a (v NOT NULL)` for local-only; `p3/p3a (id NOT NULL)` for
+      local-and-inherited) and confirmed goopg was byte-divergent on the
+      first case (missing row) and the catalog fields on the third. Fix:
+      iterate every NOT NULL `tbl.Columns` entry — a column absent from
+      `poc.NotNullColumns` but present in `parent.NotNullConstraints` reuses
+      the parent's constraint name with `isLocal=false, inhCount=1`; a column
+      present in `poc.NotNullColumns` gets its own `<child>_<col>_not_null`
+      name with `isLocal=true`, and `inhCount` is 1 if the parent also
+      enforces it or 0 otherwise. All three cases confirmed catalog- AND
+      `pg_dump`-output-identical to live PG 18.3 (`p1`: `id integer
+      CONSTRAINT p_id_not_null NOT NULL,`; `p2a`/`p3a`: bare `NOT NULL` since
+      the generated name matches PG's default-name-suppression rule). Test:
+      new `TestCreatePartitionChildNotNullConstraintLocality`
+      (`internal/executor/operators_ddl_named_check_test.go`) covering all
+      three cases. Gates: `go build ./...`/`go vet ./...` clean; new test +
+      full `internal/executor` suite PASS; `internal/catalog`+
+      `internal/parser`+`internal/server`+`internal/initdb` suites PASS (no
+      regression); `TestPort_PgDumpConnectionSetup` PASS; live `pg_dump`/
+      `psql` smoke on isolated ports vs. both a scratch real-PostgreSQL-18.3
+      instance and a scratch goopg instance, output diffed byte-identical.
+      Design doc: `docs/design/0110-0001-pg-dump-tap-port.md` new
+      "`PARTITION OF` NOT NULL constraint locality fix (loop #53)" section;
+      `docs/design/README.md` row `0110-0001` addendum updated; deferral
+      ledger rows appended (resolves the prior row's "deferred" item).
+      **New deferral (sibling gap, NOT `pg_dump`-visible):** the plain-
+      `INHERITS` fix (previous item) leaves `coninhcount=0` instead of PG's
+      `1` when a child both explicitly redeclares a column NOT NULL AND the
+      `INHERITS` parent already enforces it (`col.Inherited` is false for a
+      column in the child's own list, so the `col.Inherited &&
+      s.PartitionOf == nil` re-derivation branch never runs for it) —
+      confirmed live (PG gives `child2_t_id_not_null`/`t`/`1`, goopg gives
+      `t`/`0`); no dump-text impact (PG's plain-INHERITS `print_notnull` only
+      gates on `conislocal`, never `coninhcount`), so deferred as low-urgency
+      catalog-fidelity-only.
+
+- [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
+      #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
+      row's "a client `SET log_statement='all'` has no effect" residual — only
+      the global `GOOPG_LOG_STATEMENT` env var drove statement logging before
+      this loop. New `(*Server).effectiveLogStatementLevel(sess)`
+      (`internal/server/statement_log.go`) ORs the env level with the
+      session's effective `log_statement` value (`sess.Get`, reusing
+      `parseLogStatementLevel`), taking whichever of the two is louder
+      (`none < ddl < mod < all`); `logStatement` now takes `sess
+      *config.SessionRegistry` and both live call sites
+      (`query.go:handleQuery`, `dispatch_extended.go:executeExtendedQueryViaExecutor`)
+      already had `sess` in scope, so no new plumbing was required. Test:
+      `TestEffectiveLogStatementLevel` (`internal/server/statement_log_test.go`,
+      env-louder/session-louder/nil-session cases). Gates: `go build ./...`/
+      `go vet` clean; `internal/server`+`internal/config` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/root-0023-statement-query-logging.md`
+      new "Follow-up" section; `docs/design/README.md` root-0023 row updated;
+      deferral ledger row appended. Still open, unrelated to this slice:
+      `log_min_duration_statement`, `log_line_prefix`,
+      `logging_collector`/`log_directory` remain unimplemented GUC stubs.
+
+- [x] **`log_min_duration_statement` GUC wiring (root-0023 follow-up, loop
+      #40).** **COMPLETE 2026-07-03:** closes the `log_min_duration_statement`
+      residual left by the loop #38 entry above. New
+      `sessionLogMinDurationStatement(sess)` reads the session's effective GUC
+      value (ms, `-1` sentinel for disabled/missing/unparseable — matching the
+      GUC's own `BootVal`); `exceedsLogMinDuration(elapsedMs, thresholdMs)`
+      mirrors PG's `check_log_duration` threshold comparison
+      (`postgres/src/backend/tcop/postgres.c`: `<0` disabled, `0` always logs,
+      `>0` requires `elapsedMs >= thresholdMs`); `(*Server).logDuration(start,
+      wasLogged, proto, sql, sess, connTx)` emits a `"duration"` log record,
+      bare when `wasLogged` (the paired `logStatement` call already printed the
+      statement text) or combined with the statement text when not — exactly
+      PG's own dedup. `logStatement` now returns `bool` (`wasLogged`) instead of
+      `void` for this purpose. Both live call sites
+      (`query.go:handleQuery`, `dispatch_extended.go:executeExtendedQueryViaExecutor`)
+      time the statement via `stmtStart := time.Now()` right after the
+      `logStatement` call and `defer s.logDuration(...)`, so every return path
+      is timed. Tests: `TestSessionLogMinDurationStatement`,
+      `TestExceedsLogMinDuration`, `TestLogDurationEmitsCombinedOrBareLine`
+      (new `capturingHandler` `slog.Handler` asserts actual emitted records),
+      `TestLogStatementReturnsWasLogged`
+      (`internal/server/statement_log_test.go`). Gates: `go build ./...`/
+      `go vet ./...` clean; `internal/server`+`internal/config` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/root-0023-statement-query-logging.md`
+      new "Follow-up: `log_min_duration_statement` GUC (loop #40)" section;
+      `docs/design/README.md` root-0023 row updated. Still open, unrelated to
+      this slice: `log_line_prefix`, `logging_collector`/`log_directory` remain
+      unimplemented GUC stubs.
+
+- [x] **`log_line_prefix` GUC wiring — partial subset (root-0023 follow-up,
+      loop #42).** **COMPLETE 2026-07-03:** registers `log_line_prefix`
+      (`internal/config/defaults.go`) as `ContextSigHup`/`BootVal` `"%m [%p] "`,
+      matching upstream `guc_tables.c` exactly (config-file-only, not
+      client-`SET`-able, unlike the `ContextSuset` `log_statement`/
+      `log_min_duration_statement` siblings above — picked up via the existing
+      `postgresql.conf`/`-c` `ParseConfigFile`/`ApplyConfigEntries` path, no new
+      env var). `formatLogLinePrefix(format, logLineFields)`
+      (`internal/server/statement_log.go`) mirrors `elog.c`'s
+      `log_status_format`, expanding the `%m`/`%p`/`%u`/`%d`/`%a`/`%x`/`%%`
+      subset (with numeric/negative padding) goopg's statement/duration logger
+      has real data for at its two call sites; any other escape is dropped,
+      matching PG's own unrecognised-specifier "ignore it" default.
+      `(*Server).logLinePrefix`/`prefixAttr` read the registry's current value
+      and attach it as a leading `"prefix"` slog attr on both `logStatement`
+      and `logDuration`, omitted when the GUC expands to `""` (PG's "no
+      prefix"). Tests: `TestFormatLogLinePrefix` (every supported escape,
+      padding, unknown-field placeholders, unrecognised-escape drop, trailing
+      `%`), `TestServerLogLinePrefix` (registry-driven attach/omit through
+      `logStatement`) (`internal/server/statement_log_test.go`). Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/server`+`internal/config`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. `postgresql.conf.sample` gained the commented default
+      (required by `TestSampleConfigCoversRegistry`). Design doc:
+      `docs/design/root-0023-statement-query-logging.md` new "Follow-up:
+      `log_line_prefix` GUC (loop #42)" section; `docs/design/README.md`
+      root-0023 row updated; deferral ledger row appended. Still open: the
+      remaining `log_line_prefix` escapes (`%l`/`%c`/`%e`/`%r`/`%h`/`%i`/`%t`/
+      `%n`/`%s`/`%v`/`%P`/`%b`/`%L`/`%Q` — need per-connection remote-host/
+      backend-type/line-counter state goopg doesn't track at these call
+      sites), applying the prefix to goopg's other `slog` output (only the two
+      root-0023 lines are wired), and `logging_collector`/`log_directory`.
+
+- [x] **`CREATE TYPE ... AS RANGE` round-trip in pg_dump (M0110-0001, DU-002
+      slice 429).** **COMPLETE 2026-07-03:** new object family — the parser
+      previously accepted the `AS RANGE (subtype = ..., ...)` form only as a
+      name-only discard stub with no `pg_type`/`pg_range` row, so a user
+      range type vanished from `pg_dump` entirely. Landed: `CreateTypeStmt.
+      IsRange`/`RangeSubtype`/`RangeMultirangeName` (`internal/parser/ast.go`,
+      `ddl.go` `parseCreateType`); new `catalog.RangeType` registry
+      (`RegisterRangeType`/`LookupRangeType`/`LookupRangeTypeByOID`/
+      `LookupRangeTypeByMultirangeOID`/`ListRangeTypes`/`DropRangeType`,
+      `internal/catalog/catalog.go`) allocating real `pg_type` OIDs for the
+      range (`typtype='r'`) + auto-derived multirange (`typtype='m'`,
+      `deriveMultirangeTypeName` mirrors `makeMultirangeTypeName`), resolving
+      a default btree opclass via a curated `builtinRangeSubtypeOpclasses`
+      map (int4/int8/numeric/date/timestamp/timestamptz/text);
+      `syncRangeTypeToCatalogHeap`/`buildUserPGTypeRowForRange`/
+      `ForMultirange` (`internal/executor/operators_ddl.go`,
+      `pg18_user_catalog_rows.go`) write the `pg_type` heap rows;
+      `pg_range`/`pg_opclass` virtual views (`catalog.go`) surface matching
+      rows so `pg_dump`'s `dumpRangeType` join resolves; `format_type`
+      (`internal/executor/expr.go`) resolves a range/multirange OID to its
+      schema-qualified name. New `TestPort_PgDumpConnectionSetup` fixture
+      (slice 429) verified byte-identical vs live `pg_dump` 18.3: `CREATE
+      TYPE public.myrange AS RANGE (subtype = integer, multirange_type_name =
+      public.mymultirange);`. Gates: `go build ./...` clean; `internal/catalog`
+      +`internal/parser`+`internal/executor` suites PASS (`-count=1`);
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS.
+      Design doc: `docs/design/0110-0001-pg-dump-tap-port.md` new "Slice 429
+      — `CREATE TYPE ... AS RANGE` round-trip" section; `docs/design/README.md`
+      0110-0001 row updated; deferral ledger row appended (task-id
+      `M0110-0001 (DU-002 slice 429)`). Still open (see ledger row): `subtype_
+      opclass`/`collation`/`canonical`/`subtype_diff` options parsed but
+      discarded; no array-of-range/multirange auto-generated type
+      (`typarray=0`); no WAL/restart persistence (`rangeTypes` is a plain
+      in-process map, same gap as `CREATE ACCESS METHOD`); only the 7 curated
+      subtypes resolve a default opclass rather than a generic PG-style
+      `GetDefaultOpClass` lookup.
+
+- [x] **`CREATE`/`DROP TYPE ... AS RANGE` WAL/restart persistence (M0110-0001,
+      DU-002 slice 429 follow-up, sub-item (c)).** **COMPLETE 2026-07-03:**
+      closes sub-item (c) of the slice 429 deferral — `catalog.InMemory.
+      rangeTypes` was a plain in-process map with no WAL record and no
+      startup replay, so a user range type vanished on server restart even
+      though a `pg_dump` taken beforehand round-tripped correctly (same gap
+      the `CREATE ACCESS METHOD` slice had before its own restart-persistence
+      follow-up). Landed the identical shape: new `RecordKindCreateRangeType`/
+      `RecordKindDropRangeType` (kinds 81/82, `internal/wal/recovery.go`,
+      `Encode`/`DecodeCreateRangeType` carries both OIDs + opclass OID + all
+      three names; `Encode`/`DecodeDropRangeType` carries the name);
+      no-op physical redo registered in `ApplyRecord`; new
+      `internal/initdb/range_type_ddl_recovery.go`
+      (`replayRangeTypeDDLRecords`) walks the WAL after physical replay and
+      applies CREATE/DROP records via two new idempotent catalog mutators
+      (`RegisterRangeTypeDuringRecovery`/`DropRangeTypeDuringRecovery`,
+      `internal/catalog/catalog.go`, advancing `nextOID` past *both* the
+      range and multirange OIDs); wired into `internal/initdb/open.go` right
+      after the access-method DDL replay call. `execCreateType`'s `IsRange`
+      branch and the `DROP TYPE` range branch (`internal/executor/
+      operators_ddl.go`) WAL-append on success. Tests:
+      `internal/wal/range_type_ddl_test.go` (encode/decode round trips incl.
+      multi-byte UTF-8 + max-uint32 OIDs, wrong-kind/truncated-payload
+      guards); `internal/initdb/range_type_ddl_recovery_test.go` (4 tests:
+      real `Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for
+      CREATE and CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards).
+      Gates: `go build ./...` clean; `go test -race ./internal/wal/...
+      ./internal/initdb/...` PASS; targeted + package suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS. Design doc: `docs/design/0110-0001-
+      pg-dump-tap-port.md` new "Follow-up: `CREATE`/`DROP TYPE ... AS RANGE`
+      WAL/restart persistence" section; `docs/design/README.md` 0110-0001 row
+      updated; deferral ledger row 389 sub-item (c) closed (new resolved row
+      appended). Still open: sub-items (a) options discarded, (b) no
+      array-of-range/multirange type, (d) only 7 curated subtypes resolve a
+      default opclass.
+- [x] **Auto-generated array-of-range / array-of-multirange types
+      (M0110-0001, DU-002 slice 429 follow-up, sub-item (b)).**
+      **COMPLETE 2026-07-03 (loop #60):** closes sub-item (b) of the slice 429
+      deferral — `RegisterRangeType` only ever allocated two OIDs (range +
+      multirange), leaving `typarray=0` on both `pg_type` rows and no
+      auto-generated `_name` array-type row at all, the same gap the enum/
+      composite/domain families each had before their own `ArrayOID`
+      follow-ups. `catalog.RangeType` gains `ArrayOID`/`MultirangeArrayOID`;
+      `RegisterRangeType` (`internal/catalog/catalog.go`) now allocates all
+      four OIDs (range, range-array, multirange, multirange-array) from one
+      contiguous `nextOID` block. New `buildUserPGTypeRowForRangeArray`/
+      `ForMultirangeArray` (`internal/executor/pg18_user_catalog_rows.go`)
+      mirror `buildUserPGTypeRowForEnumArray`/`ForCompositeArray`
+      (`typtype='b'`/`typcategory='A'`/`typelem`, subtype-driven alignment
+      rather than a hardcoded one); the base rows' `typarray` now point at
+      the new OIDs; `syncRangeTypeToCatalogHeap`/`execDropType`'s range
+      branch write/stamp-xmax all four `pg_type` heap rows. New
+      `Catalog.LookupRangeTypeByArrayOID`/`LookupRangeTypeByMultirangeArrayOID`
+      back two new `format_type` branches (`internal/executor/expr.go`) so a
+      `myrange[]`/`mymultirange[]` column renders as `public.myrange[]`/
+      `public.mymultirange[]`. WAL/restart persistence extended to match:
+      `EncodeCreateRangeType`/`DecodeCreateRangeType`
+      (`internal/wal/recovery.go`) gained `arrayOID`/`multirangeArrayOID`
+      params; `RegisterRangeTypeDuringRecovery` advances `nextOID` past all
+      four recovered OIDs. New `TestUserPGTypeRowForRangeAndMultirangeArrayTypes`
+      (`internal/executor/pg18_user_catalog_rows_test.go`);
+      `internal/wal/range_type_ddl_test.go` +
+      `internal/initdb/range_type_ddl_recovery_test.go` updated for the new
+      arity/fields. Gates: `go build ./...`/`go vet ./...` clean; `go test
+      -race ./internal/wal/...` PASS; `internal/catalog`+`internal/wal`+
+      `internal/initdb`+`internal/executor` suites PASS (full runs, no
+      regression); `TestPort_PgDumpConnectionSetup` PASS (dump output
+      byte-identical/unaffected — the new array rows are `isarray`-excluded
+      from `pg_dump`'s own `getTypes`, same mechanism as the pre-existing
+      enum/composite array rows); `scripts/tpch-spotcheck.sh` PASS; pgbench
+      smoke = pre-commit hook. Design doc: `docs/design/0110-0001-pg-dump-
+      tap-port.md` new "Follow-up: auto-generated array-of-range /
+      array-of-multirange types (loop #60)" section; `docs/design/README.md`
+      0110-0001 row updated; deferral ledger sub-item (b) closed (new
+      resolved row appended). **New discovery recorded, not fixed this
+      loop:** range/multirange-typed table columns have no `pg_attribute`
+      resolution and no value storage codec at all (built-in or
+      user-defined) — a separate, larger task; fresh deferral-ledger row
+      appended. Still open: sub-items (a) options discarded, (d) only 7
+      curated subtypes resolve a default opclass.
+- [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
+      **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
+      "cosmetic only, not investigated further this loop" deferral for
+      `CREATE OPERATOR FAMILY`'s bare `CREATE` tag, generalized to the full
+      class of the same bug found by static review of every
+      `CompatNoopStmt`/`DropCompatStmt` literal in `internal/parser/ddl.go`.
+      `ddlTag` (`internal/server/dispatch.go`) had no case for
+      `*parser.CreateOpClassStmt`/`*parser.DropCompatStmt` (fell to `"OK"`);
+      `parseSkipToSemicolon`'s shared fallback hardcoded `Tag: "CREATE"` and
+      fed `CREATE OPERATOR`, `CREATE OPERATOR FAMILY`,
+      `CREATE [DEFAULT] CONVERSION`, and all four `CREATE TEXT SEARCH *`
+      forms without any caller overriding it; `CREATE SERVER`/
+      `CREATE USER MAPPING`/`CREATE FOREIGN DATA WRAPPER` hardcoded bare
+      `"CREATE"`; `ALTER FOREIGN DATA WRAPPER ... OPTIONS (...)` hardcoded
+      bare `"ALTER"` (pinned wrong by a pre-existing test). Fixed by setting
+      the real PG tag (`postgres/src/include/tcop/cmdtaglist.h`) at each
+      site, a new `ddlTag` case for `CreateOpClassStmt`
+      (`"CREATE OPERATOR CLASS"`), and a new `dropCompatTags` map covering
+      all 25 `DropCompatStmt.ObjType` values (`group`/`role`/`user` →
+      `"DROP ROLE"`, matching PG's `T_DropRoleStmt`-keyed `CreateCommandTag`
+      in `utility.c`, which ignores the surface DROP keyword). Both
+      simple-query and extended-protocol paths share `commandTagFor`/
+      `ddlTag` — one chokepoint fix. Does NOT affect `pg_dump` output text
+      (pg_dump never reads `CommandComplete` tags), a separate
+      wire-protocol-fidelity axis from the DU-002 dump-text-parity slices.
+      Tests: new `internal/server/ddl_command_tag_test.go`
+      `TestDDLCommandTagMatchesPostgres` (20 cases); corrected
+      `internal/parser/ddl_test.go`'s `TestParseAlterForeignDataWrapperOptions`
+      (previously asserted the bug). Gates: `go build ./...`/`go vet ./...`
+      clean; `internal/parser`+`internal/server`+`internal/executor`+
+      `internal/catalog`+`internal/wal`+`internal/initdb` suites PASS (no
+      regression); `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      Design `docs/design/0119-0004-ddl-command-tag-fidelity.md`;
+      `docs/design/README.md` row `0119-0004co` added. Deferral ledger
+      row appended (`resolved` — no residual). No new deferral: this closes
+      the full class of bare/incorrect tags findable by static review; a
+      future DDL form added via the same stub pattern must set its own tag.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open
 > task-ids; the milestone's living nature means it need not be complete at filing.
+
+---
+
+## M0120 — WordPress WP-CLI Verification Execution & Evidence Capture (filed 2026-07-02)
+
+Milestone: `docs/milestones/0120-wordpress-wpcli-verification-execution.md`.
+Artifacts (committed): `wp/verification/CHECKLIST.md` (40 items — 32 write, 8
+read) and `wp/verification/FLOW.md` (execution + evidence-capture procedure).
+Depends on the landed statement-logging feature (`docs/design/root-0023-statement-query-logging.md`,
+`GOOPG_LOG_STATEMENT=all`). Goal: run every checklist item against the live
+WordPress-on-goopg stack, capture WP-CLI output + goopg statement log + PG4WP
+SQL + a confirming read for **every** item (passing ones too), produce a
+PASS/FAIL `report.md`, and triage each failure. No engine fixes here — that is
+M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
+`GOOPG_CG_UNIT=goopg-wp`).
+
+- [x] **M0120-0001 — Verification harness + pre-run capture setup.** Implement
+  FLOW.md §1–2: restart the wp goopg instance with `GOOPG_LOG_STATEMENT=all`
+  (capped), enable PG4WP debug logging (`PG4WP_DEBUG=true`), snapshot baseline
+  counts, and write the `run_item` capture script (byte-offset log slicing).
+  **2026-07-03 (loop #36, partial): harness script + config landed, restart
+  BLOCKED on confirmation.** `wp/verification/run_item.sh` (new) implements
+  FLOW.md §2's `run_item`/`baseline_snapshot` skeleton (byte-offset slice of
+  `wp/goopg-wp.log` for `msg=statement` lines + PG4WP log pull from the wpcli
+  container); `wp/docker-compose.yml` now defines `PG4WP_DEBUG=true` in the
+  `wordpress` service's `WORDPRESS_CONFIG_EXTRA`.
+  **2026-07-03 (interactive session — HUMAN-APPROVED + executed): DONE.** The
+  blocker was two reinforcing layers: (1) the loop runs `claude` in
+  `--permission-mode auto` (`.ralphrc`), whose built-in classifier does not
+  auto-approve `systemctl` even with `Bash(*)` in `--allowedTools`; and (2) the
+  classifier cited the `interactive_vs_ralph_stop_stash_restore` memory, whose
+  "leave the wp server running" line is scoped to the loop-pause scenario and was
+  over-applied. Both were resolved: a standing allow-rule
+  (`Bash(systemctl --user stop goopg-wp.scope)` + `…reset-failed…`) was added to
+  `.claude/settings.local.json`, and the memory note + its `MEMORY.md` hook were
+  re-scoped with an explicit M0120 carve-out. The FLOW.md §1a–1d sequence was
+  then executed: stopped `goopg-wp.scope` → relaunched capped with
+  `GOOPG_LOG_STATEMENT=all` (data dir preserved — WP `posts=18/users=1/options=158`
+  identical pre/post restart; `msg="statement logging enabled" log_statement=all`
+  confirmed) → recreated the `wordpress` container. **Discovery:** the compose
+  `--force-recreate` does NOT apply `PG4WP_DEBUG` on an existing `wp_html` volume
+  (WordPress won't rewrite an existing `wp-config.php`), so `define('PG4WP_DEBUG',
+  true);` was injected directly into `wp-config.php` (FLOW.md §1b updated to make
+  this a required step, not just a one-off). Both capture paths verified: goopg
+  `msg=statement` lines AND fresh `pg4wp_*.log` for a probe query. Baseline
+  snapshot captured (`baseline_snapshot` → `post_count=7/user_count=1/comment_count=1`,
+  WP-CLI default-status counts) under `wp/verification/results/<ts>/baseline.txt`.
+  See `wp/verification/FLOW.md §1a` for the exact command sequence
+  (`.ralph/working_set.md` had been reset to idle by a later loop). Next:
+  M0120-0002 (execute + capture write items WP-01…WP-16).
+- [ ] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
+  post-meta, taxonomy, term-meta, user create/update). Store per-item evidence
+  under `wp/verification/results/<ts>/`; record each confirming read.
+- [ ] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
+  role/delete, comments + comment-meta, options/transients incl. the TOAST-sized
+  value WP-28, plugin activate/deactivate, raw INSERT/UPDATE/DELETE via
+  `wp db query`). Watch WP-28 for a root-0022-class TOAST regression.
+- [ ] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
+  `option get`, raw SELECT, `db size`/`core version`).
+- [ ] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
+  each FAIL (`goopg-bug`/`goopg-missing`/`pg4wp-limitation`/`harness`, FLOW.md
+  §4); for every goopg failure append a `.ralph/deferral_ledger.md` row and file
+  the cross-referenced `M0121-NNNN` task (the M0120→M0121 handoff).
+
+## M0121 — WordPress WP-CLI Verification Failure Remediation (filed 2026-07-02)
+
+Milestone: `docs/milestones/0121-wordpress-wpcli-verification-remediation.md`.
+Depends on M0120 (its `report.md` + the deferral rows it files). Goal: drive
+every M0120 `goopg-bug`/`goopg-missing` failure to a verified PASS — fix the bug
+or implement the missing capability in **goopg** (never PG4WP, never a
+`goopg_compat` branch) — with a design doc (non-trivial) and a regression test,
+then re-verify via `wp/verification/FLOW.md`. Reserve design-doc filenames
+`docs/design/0121-NNNN-<slug>.md` (or `root-00NN-*.md` for cross-cutting engine
+work) and index each in `docs/design/README.md`. Gates per change: units +
+pgbench-smoke hook, `scripts/tpch-spotcheck.sh` for executor/planner/codec, race
+gate for concurrency-critical packages.
+
+- [ ] **M0121-0001 — Populate from M0120 triage.** This task list is **seeded,
+  not exhaustive**: after M0120-0005, add one `M0121-000N` task per
+  `goopg-bug`/`goopg-missing` failure (cross-referenced from its deferral-ledger
+  row), each closing its ledger row (`- → resolved`) when the checklist item
+  passes its confirming read on a fresh run and a regression test guards it.
+  Failures classed `pg4wp-limitation`/`harness` are documented, not fixed in
+  goopg.

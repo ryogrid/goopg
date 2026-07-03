@@ -13,6 +13,8 @@ package server
 //     UserStore so password/md5/scram logins authenticate immediately.
 //   - ALTER ROLE / ALTER USER (attribute form): applies the same attribute
 //     parsing to an existing role.
+//   - ALTER ROLE / ALTER USER ... RENAME TO: re-keys the role registry entry
+//     (preserving its OID) and the live auth credential (root-0021 follow-up).
 //   - DROP ROLE / DROP USER / DROP GROUP: unregisters everywhere.
 //
 // Persistence mirrors PostgreSQL's pg_authid model (base store + WAL tail):
@@ -35,15 +37,19 @@ import (
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/wal"
 )
 
-// tryHandleRoleDDL returns (handled, err).
+// tryHandleRoleDDL returns (handled, err). dbName is the calling
+// connection's own database (connTx.DBName) — needed only for the ALTER
+// ROLE ... [IN DATABASE ...] SET/RESET branch, mirroring
+// tryHandleDatabaseDDL's liveDBName parameter.
 //   - handled=true, err=nil:   statement was handled successfully
 //   - handled=true, err!=nil:  statement was handled but failed (e.g. role not found)
 //   - handled=false, err=nil:  not a role DDL statement; caller should continue
-func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
+func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
 	norm := normalizeCompatSQL(sql)
 	switch {
 	case strings.HasPrefix(norm, "create role "), strings.HasPrefix(norm, "create user "),
@@ -51,6 +57,13 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 		name := roleNameFromCreate(norm)
 		if name == "" {
 			return false, nil // malformed; let caller handle
+		}
+		// CreateRole (postgres/src/backend/commands/user.c) rejects the
+		// reserved "pg_" namespace before it even opens pg_authid — i.e.
+		// before the duplicate-name check below, matching PG's error
+		// precedence for `CREATE ROLE pg_x` even when pg_x already exists.
+		if isReservedRoleName(name) {
+			return true, reservedRoleNameErr(name)
 		}
 		// PG defaults: CREATE USER implies LOGIN; CREATE ROLE/GROUP imply
 		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
@@ -79,10 +92,16 @@ func (s *Server) tryHandleRoleDDL(sql string) (bool, error) {
 		return true, nil
 
 	case strings.HasPrefix(norm, "alter role "), strings.HasPrefix(norm, "alter user "):
+		if op, ok := parseAlterRoleConfig(sql); ok {
+			return s.applyAlterRoleConfig(op, dbName)
+		}
+		if oldName, newName, ok := roleRenameFromAlter(norm); ok {
+			return true, s.renameRole(oldName, newName)
+		}
 		name, hasAttrs := roleNameFromAlter(norm)
 		if name == "" || !hasAttrs {
-			// Not the attribute form (e.g. RENAME TO / SET guc) — leave it to
-			// the pre-existing compat no-op path.
+			// Not the attribute form (e.g. SET/RESET guc) — leave it to the
+			// pre-existing compat no-op path.
 			return false, nil
 		}
 		isBootstrap := strings.EqualFold(name, "postgres")
@@ -168,6 +187,66 @@ func (s *Server) syncAuthidHeap() {
 	if err := executor.SyncPgAuthidFile(s.cfg.DataDir, im); err != nil && s.cfg.Logger != nil {
 		s.cfg.Logger.Warn("pg_authid heap sync failed", "err", err)
 	}
+}
+
+// renameRole implements `ALTER ROLE/USER <name> RENAME TO <newname>`,
+// mirroring PostgreSQL's RenameRole (postgres/src/backend/commands/user.c):
+// role-exists (42704), reserved-"pg_"-prefix on the new name (42939), and
+// new-name-already-exists (42710) checks, then re-keys the catalog role
+// registry (preserving the OID), the connection-time role set, the live auth
+// credential, and appends the WAL rename record. root-0021 follow-up
+// (M0119-0004). Not modelled here (see the deferral ledger): PG's
+// "session/current user cannot be renamed" guard, which needs per-connection
+// session-role context this SQL-string-level handler does not have, and the
+// superuser-may-only-rename-superuser privilege check, which — like every
+// other role-DDL privilege check in this handler — is accept-and-ignore
+// today.
+func (s *Server) renameRole(name, newName string) error {
+	isBootstrap := strings.EqualFold(name, "postgres")
+	if !s.roleExists(name) && !isBootstrap {
+		return roleDoesNotExistErr(name)
+	}
+	if isBootstrap {
+		// The bootstrap superuser's identity is hardcoded to the literal
+		// name "postgres" in several places (RoleOID, initdb's pg_authid
+		// seeding); renaming it away is a structural change out of this
+		// slice's scope, not just a persistence gap.
+		return &roleError{code: sqlstate.FeatureNotSupported, msg: "cannot rename the bootstrap superuser"}
+	}
+	if isReservedRoleName(newName) {
+		return reservedRoleNameErr(newName)
+	}
+	if s.roleExists(newName) || strings.EqualFold(newName, "postgres") {
+		return roleAlreadyExistsErr(newName)
+	}
+	im, isInMem := s.cfg.Catalog.(*catalog.InMemory)
+	if isInMem && !im.RenameRole(name, newName) {
+		return roleDoesNotExistErr(name)
+	}
+	s.rolesMu.Lock()
+	delete(s.roles, name)
+	s.roles[strings.ToLower(newName)] = struct{}{}
+	s.rolesMu.Unlock()
+	if store, ok := s.cfg.UserStore.(*auth.MapUserStore); ok && store != nil {
+		if cred, found := store.Lookup(strings.ToLower(name)); found {
+			store.Set(strings.ToLower(newName), cred)
+			store.Remove(strings.ToLower(name))
+		}
+	}
+	if s.cfg.WAL != nil {
+		if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleRename(strings.ToLower(name), strings.ToLower(newName))); werr != nil {
+			return werr
+		}
+	}
+	s.syncAuthidHeap()
+	return nil
+}
+
+// isReservedRoleName mirrors PostgreSQL's IsReservedName (postgres/src/
+// backend/commands/user.c): role names starting with "pg_" are reserved for
+// system roles.
+func isReservedRoleName(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "pg_")
 }
 
 // applyRoleAttrOptions scans the option list of a CREATE/ALTER ROLE statement
@@ -330,13 +409,242 @@ func roleNameFromAlter(norm string) (name string, hasAttrs bool) {
 	return name, true
 }
 
+// roleConfigRegistry is the subset of catalog.Catalog the ALTER ROLE ...
+// SET/RESET handler needs beyond RoleOID (already exposed directly on the
+// catalog.Catalog interface). catalog.InMemory satisfies this interface.
+// M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+type roleConfigRegistry interface {
+	SetRoleConfig(roleOid, dbOid uint32, name, value string)
+	ResetRoleConfig(roleOid, dbOid uint32, name string)
+	ResetAllRoleConfig(roleOid, dbOid uint32)
+}
+
+// alterRoleConfigOp is the result of a successful parseAlterRoleConfig
+// classification: an `ALTER ROLE <name> [IN DATABASE <dbname>] SET <config>
+// = <value>` / `RESET <config>` / `RESET ALL` statement. Mirrors
+// parseAlterDatabaseConfig (internal/server/database_ddl.go) — same
+// string-prefix wire-dispatch bypass, complementary setrole != 0 half of
+// pg_db_role_setting. M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
+type alterRoleConfigOp struct {
+	roleName    string
+	hasDatabase bool // true when an "IN DATABASE <dbname>" clause was present
+	dbName      string
+	configName  string // empty when resetAll
+	configValue string // meaningful only when !reset && !resetAll
+	reset       bool   // RESET <name>
+	resetAll    bool   // RESET ALL
+}
+
+// parseAlterRoleConfig recognises the SET/RESET forms of ALTER ROLE/USER
+// described on alterRoleConfigOp, with an optional "IN DATABASE <dbname>"
+// clause between the role name and SET/RESET. Returns ok=false for any
+// other SQL (including the attribute/RENAME forms tryHandleRoleDDL handles
+// elsewhere), leaving the caller to fall through to its existing behaviour.
+//
+// "ALTER ROLE ALL SET ..." (role_specification = ALL, PG's cluster-wide
+// -default form applying to every role) is intentionally NOT special-cased
+// here — roleName "all" simply fails RoleOID resolution in
+// applyAlterRoleConfig and falls through to the pre-existing no-op path;
+// see the deferral ledger.
+func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
+	s := strings.TrimSpace(sql)
+	for strings.HasSuffix(s, ";") {
+		s = strings.TrimSpace(strings.TrimSuffix(s, ";"))
+	}
+	lower := strings.ToLower(s)
+	var stripped string
+	switch {
+	case strings.HasPrefix(lower, "alter role "):
+		stripped = s[len("alter role "):]
+	case strings.HasPrefix(lower, "alter user "):
+		stripped = s[len("alter user "):]
+	default:
+		return alterRoleConfigOp{}, false
+	}
+	roleName, rest, ok := splitLeadingSQLToken(stripped)
+	if !ok || roleName == "" {
+		return alterRoleConfigOp{}, false
+	}
+	op := alterRoleConfigOp{roleName: roleName}
+	lowerRest := strings.ToLower(rest)
+	if strings.HasPrefix(lowerRest, "in database ") {
+		dbName, r2, ok := splitLeadingSQLToken(rest[len("in database "):])
+		if !ok || dbName == "" {
+			return alterRoleConfigOp{}, false
+		}
+		op.hasDatabase = true
+		op.dbName = dbName
+		rest = r2
+		lowerRest = strings.ToLower(rest)
+	}
+	switch {
+	case strings.HasPrefix(lowerRest, "set "):
+		rest = strings.TrimSpace(rest[len("set "):])
+		if name, value, reset, matched := parseSetRestSpecialForm(rest); matched {
+			op.configName = name
+			if reset {
+				op.reset = true
+			} else {
+				op.configValue = value
+			}
+			return op, true
+		}
+		configName, rest, ok := splitLeadingSQLToken(rest)
+		if !ok || configName == "" {
+			return alterRoleConfigOp{}, false
+		}
+		switch lr := strings.ToLower(rest); {
+		case strings.HasPrefix(lr, "to "):
+			rest = strings.TrimSpace(rest[len("to "):])
+		case strings.HasPrefix(rest, "="):
+			rest = strings.TrimSpace(rest[1:])
+		default:
+			return alterRoleConfigOp{}, false
+		}
+		if strings.EqualFold(rest, "default") {
+			op.configName = configName
+			op.reset = true
+			return op, true
+		}
+		value, ok := flattenConfigValueList(rest)
+		if !ok {
+			return alterRoleConfigOp{}, false
+		}
+		op.configName = configName
+		op.configValue = value
+		return op, true
+	case strings.HasPrefix(lowerRest, "reset "):
+		rest = strings.TrimSpace(rest[len("reset "):])
+		if strings.EqualFold(rest, "all") {
+			op.resetAll = true
+			return op, true
+		}
+		configName, _, ok := splitLeadingSQLToken(rest)
+		if !ok || configName == "" {
+			return alterRoleConfigOp{}, false
+		}
+		op.configName = configName
+		op.reset = true
+		return op, true
+	}
+	return alterRoleConfigOp{}, false
+}
+
+// applyAlterRoleConfig applies a parsed ALTER ROLE ... SET/RESET operation,
+// mirroring applyAlterDatabaseConfig's shape (role DDL has no notice-string
+// channel, unlike database DDL's IF EXISTS-drop notice, so this returns
+// (handled, err) rather than (handled, notice, err)). Naming any database
+// other than the connection's own liveDBName via IN DATABASE is a silent
+// no-op — see applyAlterDatabaseConfig's doc comment for why (goopg v0 has
+// no GUC-override storage for a database it isn't connected to).
+func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string) (bool, error) {
+	if s.cfg.Catalog == nil {
+		return false, nil
+	}
+	roleName := strings.Trim(op.roleName, `"`)
+	roleOid, found := s.cfg.Catalog.RoleOID(roleName)
+	if !found {
+		return true, roleDoesNotExistErr(roleName)
+	}
+	reg, ok := s.cfg.Catalog.(roleConfigRegistry)
+	if !ok {
+		return false, nil
+	}
+	var dbOid uint32
+	if op.hasDatabase {
+		if !strings.EqualFold(strings.Trim(op.dbName, `"`), liveDBName) {
+			return true, nil
+		}
+		dbOid = catalog.FirstUserOID
+	}
+	switch {
+	case op.resetAll:
+		reg.ResetAllRoleConfig(roleOid, dbOid)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleResetAllConfig(roleOid, dbOid)); werr != nil {
+				return true, werr
+			}
+		}
+	case op.reset:
+		reg.ResetRoleConfig(roleOid, dbOid, op.configName)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleResetConfig(roleOid, dbOid, op.configName)); werr != nil {
+				return true, werr
+			}
+		}
+	default:
+		reg.SetRoleConfig(roleOid, dbOid, op.configName, op.configValue)
+		if s.cfg.WAL != nil {
+			if _, _, werr := s.cfg.WAL.Append(wal.EncodeAlterRoleSetConfig(roleOid, dbOid, op.configName, op.configValue)); werr != nil {
+				return true, werr
+			}
+		}
+	}
+	return true, nil
+}
+
+// roleRenameFromAlter recognises the `ALTER ROLE/USER <name> RENAME TO
+// <newname>` form and extracts both names. ok is false for any other ALTER
+// ROLE/USER shape (attribute form, SET/RESET, IN DATABASE).
+func roleRenameFromAlter(norm string) (name, newName string, ok bool) {
+	var rest string
+	switch {
+	case strings.HasPrefix(norm, "alter role "):
+		rest = strings.TrimSpace(norm[len("alter role "):])
+	case strings.HasPrefix(norm, "alter user "):
+		rest = strings.TrimSpace(norm[len("alter user "):])
+	default:
+		return "", "", false
+	}
+	name = extractFirstSQLIdent(norm, rest)
+	if name == "" {
+		return "", "", false
+	}
+	pos := strings.Index(rest, name)
+	if pos < 0 {
+		return "", "", false
+	}
+	tail := strings.TrimSpace(rest[pos+len(name):])
+	if !strings.HasPrefix(tail, "rename to ") {
+		return "", "", false
+	}
+	tail = strings.TrimSpace(tail[len("rename to "):])
+	newName = extractFirstSQLIdent(norm, tail)
+	if newName == "" {
+		return "", "", false
+	}
+	return name, newName, true
+}
+
 // roleDoesNotExistErr builds PG's 42704-shaped role error text (the
 // "does not exist" phrasing routes through roleErrorSQLState below).
 func roleDoesNotExistErr(name string) error {
-	return &roleError{msg: "role \"" + name + "\" does not exist"}
+	return &roleError{code: sqlstate.UndefinedObject, msg: "role \"" + name + "\" does not exist"}
 }
 
-type roleError struct{ msg string }
+// roleAlreadyExistsErr builds PG's 42710-shaped "role already exists" error
+// (RenameRole's "make sure the new name doesn't exist" check, user.c).
+func roleAlreadyExistsErr(name string) error {
+	return &roleError{code: sqlstate.DuplicateObject, msg: "role \"" + name + "\" already exists"}
+}
+
+// reservedRoleNameErr builds PG's 42939-shaped "reserved role name" error
+// (RenameRole's IsReservedName check, user.c: names starting with "pg_" are
+// reserved for the system). PG pairs this errmsg with a fixed errdetail at
+// all three call sites (user.c:356,1388,1395), not a per-name one.
+func reservedRoleNameErr(name string) error {
+	return &roleError{
+		code:   sqlstate.ReservedName,
+		msg:    "role name \"" + name + "\" is reserved",
+		detail: "Role names starting with \"pg_\" are reserved.",
+	}
+}
+
+type roleError struct {
+	code   sqlstate.Code
+	msg    string
+	detail string
+}
 
 func (e *roleError) Error() string { return e.msg }
 
@@ -519,8 +827,21 @@ func scanDollarTag(sql string, i int) (tag string, after int, ok bool) {
 // roleErrorSQLState returns the SQLSTATE for role-related errors.
 // PostgreSQL uses 42704 (undefined_object) for "role does not exist".
 func roleErrorSQLState(err error) sqlstate.Code {
+	if re, ok := err.(*roleError); ok && re.code != "" {
+		return re.code
+	}
 	if err != nil && strings.Contains(err.Error(), "does not exist") {
 		return sqlstate.UndefinedObject
 	}
 	return sqlstate.SystemError
+}
+
+// roleErrorDetailFields returns the wire ErrorField(s) carrying a role
+// error's errdetail, if any (e.g. reservedRoleNameErr's fixed pg_-prefix
+// detail text). Empty for role errors with no PG errdetail counterpart.
+func roleErrorDetailFields(err error) []protocol.ErrorField {
+	if re, ok := err.(*roleError); ok && re.detail != "" {
+		return []protocol.ErrorField{{Code: protocol.FieldDetail, Value: re.detail}}
+	}
+	return nil
 }

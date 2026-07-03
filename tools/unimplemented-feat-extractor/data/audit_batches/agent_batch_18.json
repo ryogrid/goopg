@@ -1,0 +1,86 @@
+[
+ {
+  "key": "f5bb7c00",
+  "date": "2026-05-16",
+  "task_id": "M0105-0007",
+  "feature": "WAL sender closes the replication connection before pg_basebackup considers the WAL stream complete.",
+  "resume_point": ""
+ },
+ {
+  "key": "a28e9476",
+  "date": "2026-05-16",
+  "task_id": "M0105-0007",
+  "feature": "Standby recovery doesn't transition standbyState to STANDBY_SNAPSHOT_READY, causing pg_ctl timeout during recovery initialization.",
+  "resume_point": ""
+ },
+ {
+  "key": "98548a14",
+  "date": "2026-05-16",
+  "task_id": "M0105-0007",
+  "feature": "Standby process doesn't report PM_STATUS_STANDBY status within 120 seconds, causing pg_ctl to timeout.",
+  "resume_point": ""
+ },
+ {
+  "key": "5d51a9d8",
+  "date": "2026-05-16",
+  "task_id": "M0102-0007",
+  "feature": "PG standby startup fails due to timeline mismatch and invalid WAL records at the redo LSN position.",
+  "resume_point": ""
+ },
+ {
+  "key": "20c6ad88",
+  "date": "2026-05-17",
+  "task_id": "m0106-0010",
+  "feature": "Per-column type fidelity in indexKeyAttrs is not implemented; index keys are currently all typed as oid instead of their actual column types.",
+  "resume_point": "Implement per-column type tracking in indexKeyAttrs in next E2E re-run"
+ },
+ {
+  "key": "a993f586",
+  "date": "2026-05-18",
+  "task_id": "3dm",
+  "feature": "pg_rewrite ev_action pg_node_tree serialization deferred; requires canonical nodeToString implementation for rewrite Query tree conversion.",
+  "resume_point": "Implement canonical nodeToString serialization for rewrite Query tree ev_action fields."
+ },
+ {
+  "key": "8c91ca31",
+  "date": "2026-05-18",
+  "task_id": "m0106-0010",
+  "feature": "Catalog entry for pg_foreign_data_wrapper_oid_index (OID 112, oid_ops PKEY) not initialized; deferred for subsequent implementation.",
+  "resume_point": "Step 3ax"
+ },
+ {
+  "key": "ccfb1ac2",
+  "date": "2026-05-18",
+  "task_id": "m0106-0010",
+  "feature": "pg_index_indrelid_index btree is not populated; file 2678 stays as an empty placeholder because it is not used during early startup syscache lookups.",
+  "resume_point": "Populate pg_index_indrelid_index if later needed for additional startup phases"
+ },
+ {
+  "key": "40fe851e",
+  "date": "2026-05-18",
+  "task_id": "M0106-0010",
+  "feature": "Upstream catalog schema assignment for pg_ts_config_map and pg_ts_config (OID 3764 and 3765) not implemented; placeholder OIDs retained without mapping to official PostgreSQL catalog definitions.",
+  "resume_point": ""
+ },
+ {
+  "key": "7ffdaad5",
+  "date": "2026-05-19",
+  "task_id": "m0106-0010",
+  "feature": "Schema mismatch between PG18 and goopg for index definitions (tgfoid/attnum derivation) needs to be reconciled in a future loop.",
+  "resume_point": "Reconcile both schema definitions; currently masked by OID default fallback."
+ },
+ {
+  "key": "58be3b83",
+  "date": "2026-05-19",
+  "task_id": "m0106-0010",
+  "feature": "ReportParameters currently no-op when dataDir is empty or walWriter is nil; only fires in PageHeaders mode, limiting test scenarios without full on-disk cluster.",
+  "resume_point": "Extend ReportParameters to work with empty dataDir / nil walWriter for broader test coverage."
+ },
+ {
+  "key": "2da50e39",
+  "date": "2026-05-20",
+  "task_id": null,
+  "feature": "Expression-based ON CONFLICT targets (e.g., lower(key)) require expression-index evaluation support, which is deferred as a separate scope beyond this testport parser fix.",
+  "resume_point": ""
+ }
+]

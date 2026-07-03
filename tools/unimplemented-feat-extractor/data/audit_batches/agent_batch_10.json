@@ -1,0 +1,86 @@
+[
+ {
+  "key": "b04866de",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "Arbitrary-precision NUMERIC type supporting values beyond int64 mantissa+scale representation",
+  "resume_point": "0003-0012"
+ },
+ {
+  "key": "b890029d",
+  "date": "2026-04-29",
+  "task_id": "m0003",
+  "feature": "Index prefix-anchor extraction from LIKE patterns to enable prefix-based index seeks",
+  "resume_point": "0003-0011"
+ },
+ {
+  "key": "bc36ed83",
+  "date": "2026-04-30",
+  "task_id": "M0020",
+  "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
+  "resume_point": "support named window references and definitions"
+ },
+ {
+  "key": "c5dceefa",
+  "date": "2026-04-30",
+  "task_id": "M0021",
+  "feature": "Implement per-row lock timestamp stamping during streaming execution to track exact lock timing.",
+  "resume_point": "refactor for per-row streaming stamping"
+ },
+ {
+  "key": "7c4f5890",
+  "date": "2026-04-30",
+  "task_id": "0022-0002",
+  "feature": "Integration of SetWaitEvent method in executor to report AIO wait events in pg_stat_activity",
+  "resume_point": "executor integration layer"
+ },
+ {
+  "key": "2dff91ff",
+  "date": "2026-04-30",
+  "task_id": "M0021-0002",
+  "feature": "Detection of aggregate functions in SELECT ... FOR UPDATE target lists to enforce proper locking constraints when aggregates appear in the target.",
+  "resume_point": "planner slice"
+ },
+ {
+  "key": "ff26eacc",
+  "date": "2026-05-04",
+  "task_id": null,
+  "feature": "Optimize per-row writeHeapRow operations by pinning heap data to improve memory locality during bulk writes.",
+  "resume_point": ""
+ },
+ {
+  "key": "ff26eacc",
+  "date": "2026-05-04",
+  "task_id": null,
+  "feature": "Implement statement-level caching to reduce preparation overhead across repeated query executions.",
+  "resume_point": ""
+ },
+ {
+  "key": "584e0013",
+  "date": "2026-05-04",
+  "task_id": "M0042-0003",
+  "feature": "Rename XLogInsert/XLogFlush API methods to align with PostgreSQL conventions",
+  "resume_point": ""
+ },
+ {
+  "key": "584e0013",
+  "date": "2026-05-04",
+  "task_id": "M0042-0003",
+  "feature": "Implement WALInsertLock array to support parallel WAL inserts",
+  "resume_point": ""
+ },
+ {
+  "key": "73efa222",
+  "date": "2026-05-04",
+  "task_id": "M0020",
+  "feature": "Window function frame clauses and named windows are not yet implemented.",
+  "resume_point": ""
+ },
+ {
+  "key": "bb85f3c4",
+  "date": "2026-05-05",
+  "task_id": null,
+  "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
+  "resume_point": ""
+ }
+]
