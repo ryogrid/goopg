@@ -7134,6 +7134,76 @@ documentation-only and is exempt from the design-doc requirement.)
       grammar-coverage thread closes cleanly. Resume for `002-010` proper is
       still the next catalog-getter gap surfaced by
       `TestPort_PgDumpConnectionSetup`.
+      **2026-07-04 (DU-002 slice 433): `ALTER TABLE ... ALTER CONSTRAINT`
+      (PG18) LANDED — a new grammar entirely, not a slice-430/431/432
+      follow-up.** Real PG lets an ALREADY-EXISTING constraint's
+      deferrability and/or enforceability be re-declared after the fact via
+      `ALTER TABLE t ALTER CONSTRAINT name ConstraintAttributeSpec`
+      (restricted to FOREIGN KEY constraints only — verified against live
+      PostgreSQL 18.3, throwaway `initdb`+`pg_ctl` cluster port 5599); goopg
+      had NO support for this form at all — `ALTER TABLE t ALTER
+      CONSTRAINT ...` either mis-parsed `CONSTRAINT` as an `ALTER COLUMN`
+      column identifier (both start with the bare `ALTER` keyword) or
+      hard-failed. New `parser.AlterTableAlterConstraint` action kind +
+      `AlterTableAction.AlterConstraintDeferrable/InitiallyDeferred/
+      Enforced` plus a `Has*` flag per attribute class
+      (`internal/parser/ast.go`), mirroring `ATAlterConstraint.
+      alterDeferrability`/`alterEnforceability` so `ALTER CONSTRAINT c NOT
+      ENFORCED` alone doesn't also reset deferrability. New
+      `parser.parseAlterConstraintAttrs` (`internal/parser/ddl.go`, next to
+      `parseFKConstraintAttrs`) parses `[NOT] DEFERRABLE [INITIALLY
+      DEFERRED|IMMEDIATE]`/`[NOT] ENFORCED` in either order — deliberately
+      NOT `NOT VALID`, which real PG's own grammar action rejects here
+      (`processCASbits`, gram.y ~19513). New dispatch branch in
+      `parseAlterTableStmt`, placed immediately before the pre-existing
+      generic `ALTER COLUMN` branch and gated on `CONSTRAINT` (not
+      `COLUMN`) as the very next token after `ALTER`. New `(*ddlOp)
+      execAlterTableAlterConstraint`/`nonFKConstraintExists`
+      (`internal/executor/operators_ddl.go`, alongside
+      `execAlterTableDropConstraint`) look up the named FK, mutate only the
+      attribute class(es) actually named (`Deferrable`/`InitiallyDeferred`,
+      or `NotEnforced = !Enforced` + `NotValid = !Enforced` mirroring
+      `AlterConstrUpdateConstraintEntry`'s `convalidated = is_enforced`),
+      and raise the same `42809`/`42704` real PG raises (verified live,
+      exact message text) for a non-FK or undefined name. Acquires
+      `AccessExclusiveLock` per `AlterTableGetLockLevel` → `AT_AlterConstraint`
+      (tablecmds.c ~4703). No changes needed to `pg_constraint`,
+      `buildForeignKeyDefString`, or the FK-insert/on-delete runtime
+      skips — all already read `catalog.ForeignKey`'s mutated fields
+      generically since slice 431, so a live `ALTER CONSTRAINT` takes
+      effect immediately for both dump output and subsequent DML. Tests:
+      `TestParseAlterTableAlterConstraint` (new
+      `internal/parser/alter_constraint_test.go`, 5 cases incl. a control
+      confirming `ALTER COLUMN a TYPE bigint` still dispatches correctly);
+      `TestFKAlterConstraint` (new
+      `internal/executor/operators_fk_alter_constraint_test.go`, 4 cases:
+      NOT ENFORCED→ENFORCED round trip incl. `pg_constraint`/
+      `pg_get_constraintdef`/runtime-skip toggling live, a
+      DEFERRABLE-only statement leaving enforceability untouched, a CHECK
+      constraint rejected with `42809`, an undefined name rejected with
+      `42704`); new `TestPort_PgDumpConnectionSetup` fixture
+      `acfknenf_parent`/`acfknenf_child` (FK added enforced via plain `ADD
+      CONSTRAINT`, then flipped via `ALTER CONSTRAINT ... NOT ENFORCED`)
+      verified to dump byte-identically to slice 431's directly-declared
+      `fknenf_fk`. Design doc `docs/design/0110-0001-pg-dump-tap-port.md`
+      "Follow-up: `ALTER TABLE ... ALTER CONSTRAINT` (PG18) round-trip in
+      pg_dump (DU-002 slice 433)"; `docs/design/README.md` row `0110-0001`
+      addendum appended. Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+      PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33); pgbench smoke = pre-commit hook. **Two new discoveries,
+      deliberately deferred, ledger row appended:** (1) unlike real PG,
+      goopg's `ALTER CONSTRAINT ... ENFORCED` transition does not perform a
+      phase-3 dangling-reference scan before re-enforcing — flag-flip only,
+      matching (not worsening) `VALIDATE CONSTRAINT`'s own pre-existing
+      flag-only simplification (dump fidelity unaffected). (2) Live-
+      confirmed (throwaway probe, not merged): `ALTER TABLE ... DROP
+      CONSTRAINT` only searches `NamedChecks`/`PRIMARY KEY` by name —
+      dropping a real FOREIGN KEY or `UNIQUE` constraint misreports `42704
+      does not exist`; pre-existing, unrelated to this slice's own
+      grammar, noticed while reading the function this slice's
+      wrong-object-type lookup borrows from.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

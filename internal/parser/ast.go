@@ -2768,6 +2768,18 @@ const (
 	// parsed verb list. Only meaningful on a foreign table — the executor
 	// rejects a plain table. DU-002 slice 420.
 	AlterTableSetForeignOptions
+	// AlterTableAlterConstraint — `ALTER CONSTRAINT name
+	// ConstraintAttributeSpec` (`[NOT] DEFERRABLE [INITIALLY DEFERRED |
+	// INITIALLY IMMEDIATE]` and/or `[NOT] ENFORCED`, in either order).
+	// Mirrors PG's AT_AlterConstraint (tablecmds.c ATExecAlterConstraint,
+	// PG18 added the ENFORCED half): flips an EXISTING constraint's
+	// condeferrable/condeferred and/or conenforced, rather than declaring a
+	// new one. Real PG restricts this to FOREIGN KEY constraints
+	// (tablecmds.c ~12249/12254, ERRCODE_WRONG_OBJECT_TYPE 42809 for any
+	// other constraint kind) — the executor enforces the same restriction.
+	// ConstraintName holds the target constraint; AlterConstraint* fields
+	// carry the parsed attributes. DU-002 slice 433.
+	AlterTableAlterConstraint
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -2910,6 +2922,20 @@ type AlterTableAction struct {
 	// AlterTableSetForeignOptions (`ALTER FOREIGN TABLE ... OPTIONS (...)`,
 	// table-level, ColumnName unused). DU-002 slice 419/420.
 	FDWOptionChanges []FDWOptionChange
+
+	// AlterConstraint* fields are populated for AlterTableAlterConstraint
+	// (`ALTER CONSTRAINT name ...`); ConstraintName holds the target
+	// constraint. Each Has* flag records whether that attribute class was
+	// actually named in the trailer (mirroring ATAlterConstraint's own
+	// alterDeferrability/alterEnforceability bits) so the executor only
+	// touches the attribute(s) the statement mentioned, leaving the rest of
+	// the constraint's state untouched — `ALTER CONSTRAINT c NOT ENFORCED`
+	// alone must not also reset deferrability. DU-002 slice 433.
+	AlterConstraintDeferrable        bool
+	AlterConstraintInitiallyDeferred bool
+	AlterConstraintHasDeferrability  bool
+	AlterConstraintEnforced          bool
+	AlterConstraintHasEnforceability bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

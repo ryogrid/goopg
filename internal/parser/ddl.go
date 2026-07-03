@@ -2683,6 +2683,67 @@ func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notVal
 	return
 }
 
+// parseAlterConstraintAttrs consumes the ConstraintAttributeSpec trailer of
+// `ALTER TABLE ... ALTER CONSTRAINT name ...` (PG18 gram.y): `[NOT]
+// DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` and/or `[NOT]
+// ENFORCED`, in either order. Unlike parseFKConstraintAttrs (used by the
+// FK-defining forms), NOT VALID is not part of this grammar production —
+// real PG rejects it with "constraints cannot be altered to be NOT VALID"
+// (processCASbits, gram.y ~19513) — so a bare NOT not followed by
+// DEFERRABLE/ENFORCED is deliberately left unconsumed for the statement's
+// normal trailing-token check to reject. The two has* return values record
+// whether that attribute class was mentioned at all, mirroring
+// ATAlterConstraint.alterDeferrability/alterEnforceability (tablecmds.c):
+// ALTER CONSTRAINT only touches the attribute(s) actually named. DU-002
+// slice 433.
+func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability bool) {
+	for {
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+			switch {
+			case p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "enforced"):
+				p.advance() // NOT
+				p.advance() // ENFORCED
+				hasEnforceability = true
+				continue
+			case p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwDeferrable:
+				p.advance() // NOT
+				p.advance() // DEFERRABLE
+				hasDeferrability = true
+				deferrable = false
+				continue
+			}
+			break
+		}
+		if p.acceptKeyword(KwDeferrable) {
+			deferrable = true
+			hasDeferrability = true
+			if p.acceptIdentKeyword("initially") {
+				initiallyDeferred = p.acceptIdentKeyword("deferred")
+				if !initiallyDeferred {
+					_ = p.acceptIdentKeyword("immediate")
+				}
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("initially") {
+			deferrable = true
+			hasDeferrability = true
+			initiallyDeferred = p.acceptIdentKeyword("deferred")
+			if !initiallyDeferred {
+				_ = p.acceptIdentKeyword("immediate")
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("enforced") { // bare ENFORCED
+			enforced = true
+			hasEnforceability = true
+			continue
+		}
+		break
+	}
+	return
+}
+
 // parseCreateTableTail picks up after CREATE [UNLOGGED] TABLE.
 func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	stmt := &CreateTableStmt{pos: pos, Unlogged: unlogged}
@@ -7270,6 +7331,34 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// parseAlterTableAction() to support comma-separated multi-action ALTER TABLE
 	// statements (e.g. "ALTER TABLE t DROP COLUMN a, DROP COLUMN b"). Fall through
 	// to the multi-action loop below. M0097-0028.
+	// ALTER CONSTRAINT name ConstraintAttributeSpec (PG18) — re-declares an
+	// EXISTING constraint's deferrability/enforceability rather than adding a
+	// new one. Must be checked before the generic "ALTER COLUMN" branch below:
+	// both start with the bare ALTER keyword, and CONSTRAINT (not COLUMN) is
+	// the only thing distinguishing them at this point in the grammar — the
+	// ALTER COLUMN branch would otherwise consume "CONSTRAINT" as if it were a
+	// (quoted) column name. DU-002 slice 433.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwConstraint {
+		p.advance() // ALTER
+		p.advance() // CONSTRAINT
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability := p.parseAlterConstraintAttrs()
+		stmt.Actions = append(stmt.Actions, AlterTableAction{
+			pos:                              nameTok.Pos,
+			Kind:                             AlterTableAlterConstraint,
+			ConstraintName:                   identText(nameTok),
+			AlterConstraintDeferrable:        deferrable,
+			AlterConstraintInitiallyDeferred: initiallyDeferred,
+			AlterConstraintHasDeferrability:  hasDeferrability,
+			AlterConstraintEnforced:          enforced,
+			AlterConstraintHasEnforceability: hasEnforceability,
+		})
+		return stmt, nil
+	}
 	// ALTER COLUMN — handle SET (options) and TYPE specially; consume other forms as no-op.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 		p.advance() // consume ALTER

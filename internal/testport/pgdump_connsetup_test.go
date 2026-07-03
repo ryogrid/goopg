@@ -4363,6 +4363,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TABLE public.cttlfknenf_child (id integer, pid integer, FOREIGN KEY (pid) REFERENCES public.cttlfknenf_parent(id) NOT ENFORCED)"); err != nil {
 		t.Fatalf("create table cttlfknenf_child with table-level FK not enforced: %v", err)
 	}
+	// Slice 433: `ALTER TABLE ... ALTER CONSTRAINT name NOT ENFORCED` (PG18)
+	// re-declares an ALREADY-EXISTING foreign key's enforceability, rather
+	// than declaring a new constraint NOT ENFORCED from the start the way
+	// slices 431/432 did. pg_dump's getConstraints reads convalidated='f'/
+	// conenforced='f' straight off pg_constraint regardless of how the row
+	// got that way, so the dumped ALTER TABLE ADD CONSTRAINT statement must
+	// be byte-identical to the direct-NOT-ENFORCED forms above.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.acfknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table acfknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.acfknenf_child (id integer, pid integer)"); err != nil {
+		t.Fatalf("create table acfknenf_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.acfknenf_child ADD CONSTRAINT acfknenf_fk FOREIGN KEY (pid) REFERENCES public.acfknenf_parent(id)"); err != nil {
+		t.Fatalf("alter table acfknenf_child add foreign key: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.acfknenf_child ALTER CONSTRAINT acfknenf_fk NOT ENFORCED"); err != nil {
+		t.Fatalf("alter table acfknenf_child alter constraint not enforced: %v", err)
+	}
 
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
@@ -11600,6 +11619,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a CREATE TABLE-time foreign key constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 433: `ALTER TABLE ... ALTER CONSTRAINT name NOT ENFORCED`
+		// re-declaring an already-enforced FK must dump identically to a FK
+		// that was NOT ENFORCED from the moment it was added (slice 431).
+		acFKNotEnforcedDef := "ADD CONSTRAINT acfknenf_fk FOREIGN KEY (pid) REFERENCES public.acfknenf_parent(id) NOT ENFORCED;"
+		if !strings.Contains(res.Stdout, acFKNotEnforcedDef) {
+			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on an ALTER CONSTRAINT-flipped foreign key; missing %q\n  full stdout=%q", acFKNotEnforcedDef, res.Stdout)
 		}
 		return
 	}

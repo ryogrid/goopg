@@ -6796,6 +6796,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := o.execAlterTableDropConstraint(tbl, act); err != nil {
 				return err
 			}
+		case parser.AlterTableAlterConstraint:
+			// ALTER CONSTRAINT name ConstraintAttributeSpec (PG18) —
+			// re-declares an EXISTING constraint's deferrability and/or
+			// enforceability, rather than adding a new one.
+			// AlterTableGetLockLevel maps AT_AlterConstraint to
+			// AccessExclusiveLock (tablecmds.c ~4703).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
+			if err := o.execAlterTableAlterConstraint(tbl, act); err != nil {
+				return err
+			}
 		case parser.AlterTableAttachPartition:
 			// ATTACH PARTITION child FOR VALUES … (M0096-0007)
 			if act.AttachPartitionOf == nil {
@@ -8670,6 +8685,81 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		im.DropPrimaryKeyConstraint(tbl.OID, act.ConstraintName)
 	}
 	return nil
+}
+
+// execAlterTableAlterConstraint handles `ALTER TABLE t ALTER CONSTRAINT name
+// ConstraintAttributeSpec` (PG18): re-declares an EXISTING constraint's
+// deferrability (condeferrable/condeferred) and/or enforceability
+// (conenforced), rather than adding a new one. Real PG restricts this to
+// FOREIGN KEY constraints (tablecmds.c ATExecAlterConstraint ~12249/12254) —
+// naming a CHECK/PRIMARY KEY/UNIQUE constraint raises ERRCODE_WRONG_OBJECT_TYPE
+// (42809) with a message that depends on which attribute was requested, and
+// naming a constraint that doesn't exist at all raises
+// ERRCODE_UNDEFINED_OBJECT (42704) — both verified byte-for-byte against live
+// PostgreSQL 18.3. When enforceability changes, convalidated is set equal to
+// the new conenforced value (AlterConstrUpdateConstraintEntry,
+// tablecmds.c): going NOT ENFORCED marks it unvalidated for consistency, and
+// going back to ENFORCED marks it validated again. Real PG performs an actual
+// phase-3 data scan on that ENFORCED transition and errors on a dangling
+// reference; goopg does not model that scan here, mirroring the same
+// simplification VALIDATE CONSTRAINT already makes (flag-flip only, no data
+// re-check) rather than introducing a second, inconsistent semantics.
+// DU-002 slice 433.
+func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
+	for i := range tbl.ForeignKeys {
+		if !strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
+			continue
+		}
+		if act.AlterConstraintHasDeferrability {
+			tbl.ForeignKeys[i].Deferrable = act.AlterConstraintDeferrable
+			tbl.ForeignKeys[i].InitiallyDeferred = act.AlterConstraintInitiallyDeferred
+		}
+		if act.AlterConstraintHasEnforceability {
+			tbl.ForeignKeys[i].NotEnforced = !act.AlterConstraintEnforced
+			tbl.ForeignKeys[i].NotValid = !act.AlterConstraintEnforced
+		}
+		return nil
+	}
+	// The name exists but names a non-FK constraint: real PG reports a
+	// type-specific 42809 depending on which attribute class was requested
+	// (ATExecAlterConstraint, tablecmds.c ~12249/12254).
+	if o.nonFKConstraintExists(tbl, act.ConstraintName) {
+		if act.AlterConstraintHasDeferrability {
+			return &ExecError{
+				Code:    "42809",
+				Pos:     act.Pos(),
+				Message: fmt.Sprintf("constraint %q of relation %q is not a foreign key constraint", act.ConstraintName, tbl.Name),
+			}
+		}
+		return &ExecError{
+			Code:    "42809",
+			Pos:     act.Pos(),
+			Message: fmt.Sprintf("cannot alter enforceability of constraint %q of relation %q", act.ConstraintName, tbl.Name),
+		}
+	}
+	return &ExecError{
+		Code:    "42704",
+		Pos:     act.Pos(),
+		Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name),
+	}
+}
+
+// nonFKConstraintExists reports whether tbl has a CHECK, PRIMARY KEY, or
+// UNIQUE constraint (any kind other than FOREIGN KEY) with the given name.
+// Used by execAlterTableAlterConstraint to distinguish "wrong constraint
+// type" (42809) from "no such constraint" (42704).
+func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
+	for _, nc := range tbl.NamedChecks {
+		if strings.EqualFold(nc.Name, name) {
+			return true
+		}
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if (idx.Primary || idx.Unique) && strings.EqualFold(idx.Name, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // pkConstraintRef is a (tableOID, constraintName, tableName) triple recording
