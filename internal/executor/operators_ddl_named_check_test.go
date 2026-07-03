@@ -196,8 +196,11 @@ func TestCreateTableInheritsNotNullConstraintIsNonLocal(t *testing.T) {
 	}
 
 	// A column the child ALSO declares itself (even one implied NOT NULL by a
-	// child-local PRIMARY KEY) is locally defined, not inherited — unaffected
-	// by this fix.
+	// child-local PRIMARY KEY) is locally defined (conislocal=t, own name),
+	// but since the INHERITS parent ALSO enforces NOT NULL on it, real PG's
+	// MergeAttributes ("merging column ... with inherited definition") still
+	// counts that parent enforcement: coninhcount=1, not 0 (verified live
+	// against PG 18.3: `child2_t_id_not_null`/conislocal=t/coninhcount=1).
 	if err := runDDL(t, ctx, `CREATE TABLE child2_t (id integer NOT NULL, extra text) INHERITS (parent_t)`); err != nil {
 		t.Fatalf("CREATE TABLE child2_t: %v", err)
 	}
@@ -209,8 +212,8 @@ func TestCreateTableInheritsNotNullConstraintIsNonLocal(t *testing.T) {
 	if !ok {
 		t.Fatalf("child2_t.id should carry a contype='n' constraint; got %+v", child2Tbl.NotNullConstraints)
 	}
-	if !child2NC.IsLocal || child2NC.InhCount != 0 {
-		t.Errorf("child2_t.id (locally redeclared) NOT NULL should be conislocal=t/coninhcount=0, got IsLocal=%v InhCount=%d", child2NC.IsLocal, child2NC.InhCount)
+	if !child2NC.IsLocal || child2NC.InhCount != 1 {
+		t.Errorf("child2_t.id (locally redeclared, parent also NOT NULL) NOT NULL should be conislocal=t/coninhcount=1, got IsLocal=%v InhCount=%d", child2NC.IsLocal, child2NC.InhCount)
 	}
 }
 

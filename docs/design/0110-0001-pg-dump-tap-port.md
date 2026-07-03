@@ -11129,3 +11129,42 @@ logs the next gap: the `tableoid` `?column?` mislabel that segfaults pg_dump in
 `go test -v -run TestEvalAclDefault ./internal/executor/` → PASS.
 `go test ./internal/config/ ./internal/parser/ ./internal/server/` → PASS.
 `go run ./cmd/gen-oracle-port-status` regenerates the status markdown.
+
+## Plain-INHERITS `coninhcount` fix for a locally-redeclared NOT NULL column (loop #54)
+
+Closes the sibling gap recorded in the "PARTITION OF NOT NULL constraint
+locality fix" section's own deferred residual above: for a plain `INHERITS`
+child (not `PARTITION OF`) that explicitly redeclares a column NOT NULL in its
+own column list AND that column is also NOT NULL on the `INHERITS` parent
+(e.g. `CREATE TABLE child2 (id int NOT NULL, ...) INHERITS (parent)` where
+`parent.id` is already NOT NULL), real PostgreSQL 18.3's `MergeAttributes`
+("merging column ... with inherited definition") records `coninhcount=1` even
+though the constraint is `conislocal=t` under the child's own auto-generated
+name — verified live: `child2_t_id_not_null`/`conislocal=t`/`coninhcount=1`.
+goopg's `execCreateTable` NOT NULL registration loop
+(`internal/executor/operators_ddl.go`) previously only re-derived
+`isLocal`/`inhCount` for columns where `col.Inherited` is true (i.e. columns
+carried in purely via `INHERITS`, absent from the child's own column list);
+a column present in the child's own `s.Columns` list has `col.Inherited ==
+false`, so it always fell through to the loop's `inhCount := 0` default
+regardless of what the parent enforced.
+
+Fix: added an `else if !col.Inherited && s.PartitionOf == nil` branch mirroring
+the `PARTITION OF` case-3 rule landed earlier this thread (loop #53,
+`p3a`/`inhCount=1` when the parent also enforces NOT NULL) — if any
+`INHERITS` parent has a matching-name `NotNullConstraints` entry, set
+`inhCount = 1`; `isLocal` and `name` are untouched (stay `true`/the child's own
+auto-generated name), since PG's `print_notnull` for a plain-`INHERITS` child
+only gates on `conislocal`, never `coninhcount` — this fix is **not**
+`pg_dump`-output-visible, only a direct `pg_constraint`-query catalog-fidelity
+correction (relevant to `pg_upgrade`/introspection tooling, not `pg_dump`).
+
+Updated `TestCreateTableInheritsNotNullConstraintIsNonLocal`'s `child2NC`
+assertion from `InhCount != 0` to `InhCount != 1`, matching the corrected,
+live-PG-verified behavior.
+
+Gates: `go build ./...` clean; `internal/executor` suite PASS;
+`internal/catalog`+`internal/parser`+`internal/server`+`internal/initdb`
+suites PASS (no regression, full run); `TestPort_PgDumpConnectionSetup` PASS
+(unaffected — this fix has no dump-text impact); `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook.

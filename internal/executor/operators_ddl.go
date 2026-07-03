@@ -3222,6 +3222,30 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				if inhCount > 0 {
 					isLocal = false
 				}
+			} else if !col.Inherited && s.PartitionOf == nil {
+				// Column explicitly re-declared in the child's own column
+				// list (e.g. `CREATE TABLE child (id int NOT NULL, ...)
+				// INHERITS (parent)`) that ALSO matches a NOT NULL
+				// constraint enforced by an INHERITS parent: PG's
+				// MergeAttributes ("merging column ... with inherited
+				// definition") still counts the parent's enforcement,
+				// giving coninhcount=1 despite conislocal=t and the child's
+				// own auto-generated name (verified live against PG 18.3).
+				// No pg_dump text impact (print_notnull only gates on
+				// conislocal for a plain-INHERITS child), but pg_constraint
+				// itself must match for direct-catalog consumers
+				// (pg_upgrade, introspection). DU-002.
+				for _, parent := range inheritParents {
+					for _, pnc := range parent.NotNullConstraints {
+						if strings.EqualFold(pnc.ColName, col.Name) {
+							inhCount = 1
+							break
+						}
+					}
+					if inhCount > 0 {
+						break
+					}
+				}
 			}
 			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
 				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the

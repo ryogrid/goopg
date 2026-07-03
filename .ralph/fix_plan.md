@@ -84,6 +84,13 @@ prev-link fixes.
       (CSV row DU-002, slice-by-slice). Design `0110-0001-pg-dump-tap-port.md`.
       Resume = next gap in pg_dump's getter battery (latest blocker tracked in
       `.ralph/working_set.md` / ledger).
+      **2026-07-03 (loop #54): plain-`INHERITS` `coninhcount` sibling gap
+      CLOSED** (not `pg_dump`-visible — direct-`pg_constraint`-query fidelity
+      only; see ledger + design doc "loop #54" section). The NOT NULL
+      constraint-locality thread (loops #48/#53/#54) is now internally
+      consistent across plain-`INHERITS` and `PARTITION OF`; no further known
+      NOT NULL locality gaps. Resume for `002-010` proper is still the next
+      catalog-getter gap surfaced by `TestPort_PgDumpConnectionSetup`.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit
