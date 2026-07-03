@@ -32,6 +32,7 @@ package server
 // SCRAM-SHA-256$… or md5<hex> secret is stored verbatim, exactly like PG.
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/auth"
@@ -49,7 +50,7 @@ import (
 //   - handled=true, err=nil:   statement was handled successfully
 //   - handled=true, err!=nil:  statement was handled but failed (e.g. role not found)
 //   - handled=false, err=nil:  not a role DDL statement; caller should continue
-func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
+func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent currentGUCResolver) (bool, error) {
 	norm := normalizeCompatSQL(sql)
 	switch {
 	case strings.HasPrefix(norm, "create role "), strings.HasPrefix(norm, "create user "),
@@ -93,7 +94,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
 
 	case strings.HasPrefix(norm, "alter role "), strings.HasPrefix(norm, "alter user "):
 		if op, ok := parseAlterRoleConfig(sql); ok {
-			return s.applyAlterRoleConfig(op, dbName)
+			return s.applyAlterRoleConfig(op, dbName, resolveCurrent)
 		}
 		if oldName, newName, ok := roleRenameFromAlter(norm); ok {
 			return true, s.renameRole(oldName, newName)
@@ -430,9 +431,10 @@ type alterRoleConfigOp struct {
 	hasDatabase bool // true when an "IN DATABASE <dbname>" clause was present
 	dbName      string
 	configName  string // empty when resetAll
-	configValue string // meaningful only when !reset && !resetAll
+	configValue string // meaningful only when !reset && !resetAll && !fromCurrent
 	reset       bool   // RESET <name>
 	resetAll    bool   // RESET ALL
+	fromCurrent bool   // SET <name> FROM CURRENT — configValue resolved at apply time
 }
 
 // parseAlterRoleConfig recognises the SET/RESET forms of ALTER ROLE/USER
@@ -493,6 +495,13 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 		if !ok || configName == "" {
 			return alterRoleConfigOp{}, false
 		}
+		// "var_name FROM CURRENT" — see parseAlterDatabaseConfig's identical
+		// branch for the grammar citation; resolved at apply time.
+		if strings.EqualFold(strings.TrimSpace(rest), "from current") {
+			op.configName = configName
+			op.fromCurrent = true
+			return op, true
+		}
 		switch lr := strings.ToLower(rest); {
 		case strings.HasPrefix(lr, "to "):
 			rest = strings.TrimSpace(rest[len("to "):])
@@ -537,7 +546,7 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 // other than the connection's own liveDBName via IN DATABASE is a silent
 // no-op — see applyAlterDatabaseConfig's doc comment for why (goopg v0 has
 // no GUC-override storage for a database it isn't connected to).
-func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string) (bool, error) {
+func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, resolveCurrent currentGUCResolver) (bool, error) {
 	if s.cfg.Catalog == nil {
 		return false, nil
 	}
@@ -556,6 +565,20 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string) (
 			return true, nil
 		}
 		dbOid = catalog.FirstUserOID
+	}
+	if op.fromCurrent {
+		// Resolve the live session's CURRENT effective value now — see
+		// applyAlterDatabaseConfig's identical branch for the rationale
+		// (only reached once any "IN DATABASE <other>" no-op has already
+		// returned above).
+		if resolveCurrent == nil {
+			return true, &roleError{code: sqlstate.UndefinedObject, msg: fmt.Sprintf("unrecognized configuration parameter %q", op.configName)}
+		}
+		val, ok := resolveCurrent(op.configName)
+		if !ok {
+			return true, &roleError{code: sqlstate.UndefinedObject, msg: fmt.Sprintf("unrecognized configuration parameter %q", op.configName)}
+		}
+		op.configValue = val
 	}
 	switch {
 	case op.resetAll:

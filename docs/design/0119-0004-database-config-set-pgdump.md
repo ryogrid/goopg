@@ -237,3 +237,108 @@ for all six forms plus one `IN DATABASE` combination.
 Gates: `go build ./...` clean; `go test ./internal/server/...` PASS (full
 suite, no regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 pgbench smoke = pre-commit hook.
+
+### Follow-up: `SET ... FROM CURRENT` (loop #79)
+
+Closes the `SET ... FROM CURRENT` bullet above — the residual loop #78
+explicitly left open. Real PG's `set_rest_more` grammar production
+(`postgres/src/backend/parser/gram.y` ~line 1697) has a `var_name FROM
+CURRENT` alternative distinct from the six literal-carrying special forms
+loop #78 handled: `VariableSetStmt{kind: VAR_SET_CURRENT, name: var_name}`,
+with NO literal value in the parse tree at all. `ExtractSetVariableArgs`
+(`postgres/src/backend/utils/misc/guc_funcs.c`) resolves the stored value
+at *apply* time via `GetConfigOptionByName(name, NULL, false)` — the
+calling session's live/current effective value for that GUC, not anything
+present in the SQL text. This is the reason loop #78 scoped it out: the six
+special forms are pure syntax translation (no I/O), while `FROM CURRENT`
+needs a live-session read that `parseAlterDatabaseConfig`/
+`parseAlterRoleConfig` — deliberately kept as pure, session-less parse
+functions — have no way to perform.
+
+Landed as a two-layer split mirroring that boundary:
+- **Parse layer** (unchanged purity): `parseAlterDatabaseConfig`/
+  `parseAlterRoleConfig` (`internal/server/database_ddl.go`/`role_ddl.go`)
+  gained a `var_name FROM CURRENT` detection right after they split off
+  `configName` via `splitLeadingSQLToken` — a case alongside the existing
+  `TO `/`=` branches, not a new case inside `parseSetRestSpecialForm` (that
+  helper only matches FIXED keyword prefixes for the six special forms;
+  `FROM CURRENT` instead matches an arbitrary `var_name` FOLLOWED by a
+  fixed suffix, a different shape). Sets a new `fromCurrent bool` field on
+  `alterDatabaseConfigOp`/`alterRoleConfigOp`, leaving `configValue` empty.
+- **Apply layer** (new I/O): `applyAlterDatabaseConfig`/
+  `applyAlterRoleConfig` take a new `currentGUCResolver func(name string)
+  (string, bool)` parameter; when `op.fromCurrent`, they call it to resolve
+  `op.configValue` immediately before the `SetDatabaseConfig`/
+  `SetRoleConfig` write — an unresolved name (`ok=false`, including a nil
+  resolver — no live session) returns PG's exact `unrecognized
+  configuration parameter "%s"` text (`guc.c` ~line 1168, `ERRCODE_UNDEFINED_
+  OBJECT`/42704 — surfaced via the existing `roleError{code:
+  sqlstate.UndefinedObject}` wrapper on the role side; the database side
+  still routes through `tryHandleDatabaseDDL`'s pre-existing single
+  `sqlstate.SystemError` mapping for ALL its errors — see Deferred below).
+  `tryHandleDatabaseDDL`/`tryHandleRoleDDL` threaded the resolver through as
+  a new third parameter. `dispatch.go`'s `dispatchSimpleQueryViaExecutor`
+  builds ONE resolver closure per dispatch call (`sess.Get(name)` — the
+  same `SessionRegistry.Get` SHOW/`ectx.GetSetting` already use) and passes
+  it to all three call sites (the CREATE/DROP DATABASE-parse-failure
+  intercept, the split-leading-role-DDL recursion, and the plain role-DDL
+  intercept); the resolver degrades to always-`ok=false` when `sess` is nil
+  (some embedded/test paths), matching an unresolvable name.
+  The resolution deliberately happens AFTER the existing "not my own live
+  database"/"IN DATABASE otherdb" no-op checks, so an ALTER targeting a
+  database/role-scope goopg has no storage for (v0 has no cross-database
+  isolation) never has to resolve anything or surface a spurious
+  "unrecognized parameter" error.
+
+Live-verified end-to-end (throwaway data dir, real `psql` 18.3, both
+goopg and a separately-`initdb`'d real PG 18.3 for comparison):
+`SET work_mem = '77MB'; ALTER DATABASE postgres SET work_mem FROM
+CURRENT;` and the `ALTER ROLE` equivalent with `search_path` both populate
+`pg_db_role_setting.setconfig`/`pg_roles`-joined `setconfig` with the
+session's current value; `ALTER DATABASE postgres SET no_such_guc_xyz FROM
+CURRENT` errors `unrecognized configuration parameter "no_such_guc_xyz"` on
+both engines.
+
+Tests: `TestParseAlterDatabaseConfig`/`TestParseAlterRoleConfig` extended
+with `FROM CURRENT` parse cases; new
+`TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent`
+(`database_ddl_test.go`)/`TestTryHandleRoleDDLAlterRoleConfigFromCurrent`
+(`role_config_test.go`) cover the apply-layer resolver (success, nil
+resolver, unresolved name, and — database side only — the "other database"
+no-op never consulting the resolver).
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/server/...`
+PASS (full suite, no regression); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); full `scripts/ralph-precommit-test.sh` PASS (incl. pgbench
+TPC-B/simple-update/select-only smoke, 0 failed transactions); live
+`goopg`/`psql` vs. real PG 18.3 byte-comparison as described above.
+
+Deferred (ledger row appended, `M0119-0004-ACLHEAP`):
+
+1. **GUC unit-display formatting** — real PG's `GetConfigOptionByName`
+   calls the variable's `_ShowOption(record, use_units=true)` formatter, so
+   `SET work_mem = '77MB'; ... FROM CURRENT` stores the literal
+   `work_mem=77MB` (unit-suffixed) in `pg_db_role_setting`. goopg's
+   `SessionRegistry.Get` (the mechanism this loop's resolver AND the
+   pre-existing `SHOW work_mem` both call) has no such display formatter —
+   it returns the canonicalised raw-unit value (`work_mem=78848`, KB
+   integer, no suffix). Confirmed via a live A/B: `SHOW work_mem` on goopg
+   already printed `78848` (no unit) BEFORE this loop's change — this is a
+   pre-existing, broader gap (affects `SHOW`/`SHOW ALL` too, not just `FROM
+   CURRENT`), not something this loop introduced or could reasonably fix
+   as a bounded follow-up. Resume point: a PG-style optimal-unit
+   display formatter for `GUC_UNIT_KB`/`_MB`/`_S`/`_MS`-flagged
+   `config.Variable`s, wired into `SessionRegistry.Get`'s effective-value
+   path (or a parallel "display" method used by `SHOW`/`ectx.GetSetting`/
+   this loop's resolver alike).
+2. **Database-DDL error SQLSTATE fidelity** — `tryHandleDatabaseDDL`'s
+   caller (`dispatch.go` ~line 112) maps EVERY error from the database-DDL
+   intercept (including this loop's new "unrecognized configuration
+   parameter") to a single hardcoded `sqlstate.SystemError`, unlike the
+   role-DDL side's `roleError`-typed/`roleErrorSQLState`-dispatched errors.
+   Pre-existing (shared by `CreateDatabase`/`DropDatabase`'s own error
+   paths too), not introduced by this loop, but now newly visible via a
+   case (unrecognized GUC name) real PG reports as 42704. Resume point: a
+   `databaseDDLError{code, msg}` type mirroring `roleError`, wired into
+   `dispatch.go`'s one `s.writeQueryError(w, sqlstate.SystemError, ...)`
+   call site the same way `roleErrorSQLState` is.

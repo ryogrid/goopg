@@ -101,13 +101,25 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	// — so we no longer acquire a throwaway KindExpr child just to pass it in.
 	stmts, err := parser.Parse(sql)
 	if err != nil {
+		// Resolves `ALTER DATABASE/ROLE ... SET <name> FROM CURRENT` against
+		// this connection's live session GUC state (mirrors PG's
+		// GetConfigOptionByName(name, NULL, false), see currentGUCResolver's
+		// doc comment). sess is nil on some embedded/test paths — the
+		// resolver degrades to "unrecognized" there, same as no live session.
+		resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
+			if sess == nil {
+				return "", false
+			}
+			_, eff, ok := sess.Get(name)
+			return eff, ok
+		})
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
 		// here (the parser doesn't recognise them yet) so we can
 		// (a) update the catalog so subsequent connections see the
 		// database in pg_database / can connect to it, and (b) emit a
 		// WAL record so the registration survives a crash. Other
 		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName); handled {
+		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
 			if herr != nil {
 				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
 			}
@@ -133,7 +145,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Peel the leading role statement off, handle it, then recurse on the
 		// remainder so every statement runs. M0118-0008.
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
-			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName); handled {
+			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName, resolveCurrentGUC); handled {
 				if herr != nil {
 					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 				}
@@ -150,7 +162,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
-		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName); handled {
+		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
 			if herr != nil {
 				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 			}

@@ -45,7 +45,7 @@ func newTestRoleServer() *Server {
 
 func TestAlterRoleRenameSuccess(t *testing.T) {
 	s := newTestRoleServer()
-	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN PASSWORD 'secret'", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN PASSWORD 'secret'", "postgres", nil); !handled || err != nil {
 		t.Fatalf("CREATE ROLE: handled=%v err=%v", handled, err)
 	}
 	im := s.cfg.Catalog.(*catalog.InMemory)
@@ -54,7 +54,7 @@ func TestAlterRoleRenameSuccess(t *testing.T) {
 		t.Fatal("role foo not registered in catalog")
 	}
 
-	handled, err := s.tryHandleRoleDDL("ALTER ROLE foo RENAME TO bar", "postgres")
+	handled, err := s.tryHandleRoleDDL("ALTER ROLE foo RENAME TO bar", "postgres", nil)
 	if !handled || err != nil {
 		t.Fatalf("ALTER ROLE RENAME TO: handled=%v err=%v", handled, err)
 	}
@@ -83,10 +83,10 @@ func TestAlterRoleRenameSuccess(t *testing.T) {
 
 func TestAlterRoleRenameErrors(t *testing.T) {
 	s := newTestRoleServer()
-	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN", "postgres", nil); !handled || err != nil {
 		t.Fatalf("CREATE ROLE foo: handled=%v err=%v", handled, err)
 	}
-	if handled, err := s.tryHandleRoleDDL("CREATE ROLE existing LOGIN", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("CREATE ROLE existing LOGIN", "postgres", nil); !handled || err != nil {
 		t.Fatalf("CREATE ROLE existing: handled=%v err=%v", handled, err)
 	}
 
@@ -102,7 +102,7 @@ func TestAlterRoleRenameErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			handled, err := s.tryHandleRoleDDL(tc.sql, "postgres")
+			handled, err := s.tryHandleRoleDDL(tc.sql, "postgres", nil)
 			if !handled {
 				t.Fatalf("%s: expected handled=true", tc.sql)
 			}

@@ -122,6 +122,18 @@ func TestParseAlterRoleConfig(t *testing.T) {
 			want: alterRoleConfigOp{roleName: "foo", hasDatabase: true, dbName: "postgres", configName: "timezone", configValue: "UTC"},
 			ok:   true,
 		},
+		// "var_name FROM CURRENT" — see TestParseAlterDatabaseConfig's
+		// identical case for the grammar citation; resolved at apply time.
+		{
+			sql:  "ALTER ROLE foo SET work_mem FROM CURRENT",
+			want: alterRoleConfigOp{roleName: "foo", configName: "work_mem", fromCurrent: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo IN DATABASE postgres SET search_path FROM CURRENT",
+			want: alterRoleConfigOp{roleName: "foo", hasDatabase: true, dbName: "postgres", configName: "search_path", fromCurrent: true},
+			ok:   true,
+		},
 		// negatives: forms handled elsewhere in tryHandleRoleDDL, or
 		// unmodelled ALTER ROLE forms, must fall through unrecognised.
 		{sql: "ALTER ROLE foo RENAME TO bar", ok: false},
@@ -149,7 +161,7 @@ func TestParseAlterRoleConfig(t *testing.T) {
 
 func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	s := newTestRoleServer()
-	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN", "postgres", nil); !handled || err != nil {
 		t.Fatalf("CREATE ROLE foo: handled=%v err=%v", handled, err)
 	}
 	im := s.cfg.Catalog.(*catalog.InMemory)
@@ -159,7 +171,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	}
 
 	// Cluster-wide SET (no IN DATABASE): dbOid=0.
-	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo SET work_mem = '64MB'", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo SET work_mem = '64MB'", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo SET work_mem: handled=%v err=%v", handled, err)
 	}
 	if got := im.RoleConfigEntries(roleOid, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
@@ -168,7 +180,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 
 	// IN DATABASE matching the connection's own live database: recorded
 	// under FirstUserOID.
-	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE postgres SET search_path TO public", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE postgres SET search_path TO public", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo IN DATABASE postgres SET: handled=%v err=%v", handled, err)
 	}
 	if got := im.RoleConfigEntries(roleOid, catalog.FirstUserOID); len(got) != 1 || got[0] != "search_path=public" {
@@ -178,7 +190,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	// IN DATABASE naming a DIFFERENT database than the live connection is a
 	// silent no-op (v0 single-live-database scope, mirrors
 	// applyAlterDatabaseConfig's identical restriction).
-	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE otherdb SET work_mem = '1MB'", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE otherdb SET work_mem = '1MB'", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo IN DATABASE otherdb SET: handled=%v err=%v", handled, err)
 	}
 	if got := im.RoleConfigEntries(roleOid, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
@@ -186,7 +198,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	}
 
 	// RESET removes only the named entry.
-	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo RESET work_mem", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo RESET work_mem", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo RESET work_mem: handled=%v err=%v", handled, err)
 	}
 	if got := im.RoleConfigEntries(roleOid, 0); len(got) != 0 {
@@ -197,7 +209,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	}
 
 	// RESET ALL clears the IN DATABASE scope too.
-	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE postgres RESET ALL", "postgres"); !handled || err != nil {
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo IN DATABASE postgres RESET ALL", "postgres", nil); !handled || err != nil {
 		t.Fatalf("ALTER ROLE foo IN DATABASE postgres RESET ALL: handled=%v err=%v", handled, err)
 	}
 	if got := im.RoleConfigEntries(roleOid, catalog.FirstUserOID); len(got) != 0 {
@@ -206,7 +218,7 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 
 	// A nonexistent role errors 42704 (undefined_object), matching
 	// roleDoesNotExistErr's use elsewhere in this file.
-	handled, err := s.tryHandleRoleDDL("ALTER ROLE nosuchrole SET work_mem = '1MB'", "postgres")
+	handled, err := s.tryHandleRoleDDL("ALTER ROLE nosuchrole SET work_mem = '1MB'", "postgres", nil)
 	if !handled {
 		t.Fatal("ALTER ROLE nosuchrole SET: expected handled=true")
 	}
@@ -215,5 +227,52 @@ func TestTryHandleRoleDDLAlterRoleConfig(t *testing.T) {
 	}
 	if got := roleErrorSQLState(err); got != sqlstate.UndefinedObject {
 		t.Errorf("ALTER ROLE nosuchrole SET: SQLSTATE = %q, want %q", got, sqlstate.UndefinedObject)
+	}
+}
+
+// TestTryHandleRoleDDLAlterRoleConfigFromCurrent covers "SET <name> FROM
+// CURRENT" (VAR_SET_CURRENT): the stored value must be whatever the live
+// session's resolver reports for that name RIGHT NOW, not a literal parsed
+// out of the SQL text (there is none). Mirrors PG's ExtractSetVariableArgs
+// VAR_SET_CURRENT case (GetConfigOptionByName).
+func TestTryHandleRoleDDLAlterRoleConfigFromCurrent(t *testing.T) {
+	s := newTestRoleServer()
+	if handled, err := s.tryHandleRoleDDL("CREATE ROLE foo LOGIN", "postgres", nil); !handled || err != nil {
+		t.Fatalf("CREATE ROLE foo: handled=%v err=%v", handled, err)
+	}
+	im := s.cfg.Catalog.(*catalog.InMemory)
+	roleOid, _ := im.RoleOID("foo")
+
+	live := map[string]string{"work_mem": "128MB"}
+	resolver := currentGUCResolver(func(name string) (string, bool) {
+		v, ok := live[name]
+		return v, ok
+	})
+
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE foo SET work_mem FROM CURRENT", "postgres", resolver); !handled || err != nil {
+		t.Fatalf("ALTER ROLE foo SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
+	}
+	if got := im.RoleConfigEntries(roleOid, 0); len(got) != 1 || got[0] != "work_mem=128MB" {
+		t.Errorf("RoleConfigEntries(foo, 0) = %v, want [work_mem=128MB]", got)
+	}
+
+	// An unrecognised GUC name (resolver reports ok=false) errors 42704,
+	// matching GetConfigOptionByName's "unrecognized configuration
+	// parameter" ereport.
+	handled, err := s.tryHandleRoleDDL("ALTER ROLE foo SET no_such_guc FROM CURRENT", "postgres", resolver)
+	if !handled {
+		t.Fatal("ALTER ROLE foo SET no_such_guc FROM CURRENT: expected handled=true")
+	}
+	if err == nil {
+		t.Fatal("ALTER ROLE foo SET no_such_guc FROM CURRENT: expected an error")
+	}
+	if got := roleErrorSQLState(err); got != sqlstate.UndefinedObject {
+		t.Errorf("SQLSTATE = %q, want %q", got, sqlstate.UndefinedObject)
+	}
+
+	// A nil resolver (no live session) behaves the same as ok=false.
+	handled, err = s.tryHandleRoleDDL("ALTER ROLE foo SET work_mem FROM CURRENT", "postgres", nil)
+	if !handled || err == nil {
+		t.Fatalf("ALTER ROLE foo SET work_mem FROM CURRENT (nil resolver): handled=%v err=%v", handled, err)
 	}
 }

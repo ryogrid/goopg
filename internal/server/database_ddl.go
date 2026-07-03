@@ -67,10 +67,20 @@ const (
 type alterDatabaseConfigOp struct {
 	dbName      string
 	configName  string // empty when resetAll
-	configValue string // meaningful only when !reset && !resetAll
+	configValue string // meaningful only when !reset && !resetAll && !fromCurrent
 	reset       bool   // RESET <name>
 	resetAll    bool   // RESET ALL
+	fromCurrent bool   // SET <name> FROM CURRENT — configValue resolved at apply time
 }
+
+// currentGUCResolver resolves the calling session's live/current effective
+// value for a GUC name — the mechanism `ALTER DATABASE/ROLE ... SET <name>
+// FROM CURRENT` needs. Mirrors PG's ExtractSetVariableArgs VAR_SET_CURRENT
+// case (postgres/src/backend/utils/misc/guc_funcs.c), which resolves via
+// GetConfigOptionByName(name, NULL, false). ok=false means the name is not a
+// recognised GUC (a nil resolver — no live session, e.g. some embedded/test
+// paths — behaves the same way).
+type currentGUCResolver func(name string) (string, bool)
 
 // parseAlterDatabaseConfig recognises the SET/RESET forms of ALTER DATABASE
 // described on alterDatabaseConfigOp. Returns ok=false for any other SQL
@@ -102,6 +112,13 @@ func parseAlterDatabaseConfig(sql string) (alterDatabaseConfigOp, bool) {
 		configName, rest, ok := splitLeadingSQLToken(rest)
 		if !ok || configName == "" {
 			return alterDatabaseConfigOp{}, false
+		}
+		// "var_name FROM CURRENT" (set_rest_more's VAR_SET_CURRENT production,
+		// postgres/src/backend/parser/gram.y) — the value is the live session's
+		// CURRENT effective value for configName, resolved later at apply time
+		// (parseAlterDatabaseConfig stays a pure/session-less parse function).
+		if strings.EqualFold(strings.TrimSpace(rest), "from current") {
+			return alterDatabaseConfigOp{dbName: dbName, configName: configName, fromCurrent: true}, true
 		}
 		switch lowerRest := strings.ToLower(rest); {
 		case strings.HasPrefix(lowerRest, "to "):
@@ -418,9 +435,9 @@ func databaseDDLCommandTag(sql string) string {
 // effect when the named database is the connection's own live database;
 // naming any OTHER database is a silent no-op, matching goopg v0's
 // single-live-database-storage scope (see the package doc comment above).
-func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string) (bool, string, error) {
+func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurrent currentGUCResolver) (bool, string, error) {
 	if op, ok := parseAlterDatabaseConfig(sql); ok {
-		return s.applyAlterDatabaseConfig(op, liveDBName)
+		return s.applyAlterDatabaseConfig(op, liveDBName, resolveCurrent)
 	}
 	kind, name := classifyDatabaseDDL(sql)
 	if kind == databaseDDLNone {
@@ -511,7 +528,7 @@ type databaseConfigRegistry interface {
 // Naming any database other than the connection's own liveDBName is a
 // silent no-op (handled=true, err=nil) — see tryHandleDatabaseDDL's doc
 // comment for why.
-func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName string) (bool, string, error) {
+func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName string, resolveCurrent currentGUCResolver) (bool, string, error) {
 	if s.cfg.Catalog == nil {
 		return false, "", nil
 	}
@@ -528,6 +545,21 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		// database the caller has CONNECT/ownership rights on (goopg has
 		// no cross-database permission model to reject this differently).
 		return true, "", nil
+	}
+	if op.fromCurrent {
+		// Resolve the live session's CURRENT effective value now (mirrors
+		// PG's GetConfigOptionByName call at parse-to-apply time) — only
+		// once we know this ALTER DATABASE targets the caller's own live
+		// database, so an "other database" no-op never has to resolve
+		// anything or surface a bogus "unrecognized parameter" error.
+		if resolveCurrent == nil {
+			return true, "", fmt.Errorf("unrecognized configuration parameter %q", op.configName)
+		}
+		val, ok := resolveCurrent(op.configName)
+		if !ok {
+			return true, "", fmt.Errorf("unrecognized configuration parameter %q", op.configName)
+		}
+		op.configValue = val
 	}
 	// FirstUserOID (16384) is the SAME SQL-visible placeholder OID
 	// pg_database.VirtualRows displays for the "postgres" row — NOT

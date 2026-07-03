@@ -5232,6 +5232,41 @@ documentation-only and is exempt from the design-doc requirement.)
       pre-commit hook. Design doc: `0119-0004-database-config-set-pgdump.md`
       "Follow-up: ... special-form GUC translation (loop #78)", indexed as
       `0119-0004cp` in `docs/design/README.md`.
+      **2026-07-03 (loop #79): `SET ... FROM CURRENT` LANDED — closes the
+      loop #78 residual, the last named gap in the ALTER DATABASE/ROLE
+      `SET`/`RESET` special-syntax battery.** `parseAlterDatabaseConfig`/
+      `parseAlterRoleConfig` gained a `var_name FROM CURRENT` detection
+      (new `fromCurrent bool` op field, `configValue` resolved later);
+      `applyAlterDatabaseConfig`/`applyAlterRoleConfig` gained a new
+      `currentGUCResolver` parameter consulted after the existing
+      "other database" no-op checks, raising PG's exact `unrecognized
+      configuration parameter "%s"` (42704) for an unresolved name.
+      `dispatch.go` builds the resolver once per dispatch call from
+      `sess.Get` (same accessor `SHOW` uses) and threads it through
+      `tryHandleDatabaseDDL`/`tryHandleRoleDDL`'s new third parameter.
+      Live-verified against both goopg and a separately-`initdb`'d real PG
+      18.3. Tests: `TestParseAlterDatabaseConfig`/`TestParseAlterRoleConfig`
+      extended; new `TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent`/
+      `TestTryHandleRoleDDLAlterRoleConfigFromCurrent`. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/server/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      `scripts/ralph-precommit-test.sh` PASS (pgbench smoke, 0 failed).
+      Design doc: `0119-0004-database-config-set-pgdump.md` "Follow-up:
+      `SET ... FROM CURRENT` (loop #79)", indexed as `0119-0004cq`.
+      **Deferred (ledger row appended):** (1) goopg's `SessionRegistry.Get`
+      has no PG-style unit-display formatter, so `FROM CURRENT` (and the
+      pre-existing `SHOW`) store/print the raw canonical value
+      (`work_mem=78848`) instead of PG's unit-suffixed display form
+      (`work_mem=77MB`) — confirmed pre-existing via a live `SHOW work_mem`
+      A/B, not introduced this loop. (2) the database-DDL error path
+      (`dispatch.go` ~line 112) maps every `tryHandleDatabaseDDL` error to a
+      single hardcoded `sqlstate.SystemError`, unlike the role-DDL side's
+      typed `roleError`/`roleErrorSQLState` — pre-existing, newly visible
+      via this loop's new 42704-worthy error case. **All six-plus-one named
+      `set_rest`/`set_rest_more` special forms for ALTER DATABASE/ROLE are
+      now handled; remaining M0119-0004-ACLHEAP residuals are the
+      extended-protocol-only dispatch gap, multi-database scope, the
+      `pg_dumpall` cluster-wide-dump surface, and `ALTER ROLE ALL SET ...`.**
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

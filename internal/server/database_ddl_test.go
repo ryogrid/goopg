@@ -2,6 +2,8 @@ package server
 
 import (
 	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
 )
 
 // TestClassifyDatabaseDDL pins the M0054-0001 string-prefix matcher
@@ -180,6 +182,19 @@ func TestParseAlterDatabaseConfig(t *testing.T) {
 			want: alterDatabaseConfigOp{dbName: "postgres", configName: "xmloption", configValue: "DOCUMENT"},
 			ok:   true,
 		},
+		// "var_name FROM CURRENT" (set_rest_more's VAR_SET_CURRENT) — an
+		// arbitrary GUC name, not one of the six special-syntax keywords
+		// above; configValue is resolved later at apply time, not here.
+		{
+			sql:  "ALTER DATABASE postgres SET work_mem FROM CURRENT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "work_mem", fromCurrent: true},
+			ok:   true,
+		},
+		{
+			sql:  "alter database postgres set search_path from current;",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "search_path", fromCurrent: true},
+			ok:   true,
+		},
 		// negatives: unmodelled ALTER DATABASE forms must fall through
 		// unrecognised so the pre-existing compatNoopCommandTag absorption
 		// still handles them.
@@ -203,5 +218,53 @@ func TestParseAlterDatabaseConfig(t *testing.T) {
 		if got != c.want {
 			t.Errorf("parseAlterDatabaseConfig(%q) = %+v, want %+v", c.sql, got, c.want)
 		}
+	}
+}
+
+// TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent covers "SET <name>
+// FROM CURRENT" (VAR_SET_CURRENT) for ALTER DATABASE — the role-side sibling
+// of TestTryHandleRoleDDLAlterRoleConfigFromCurrent (role_config_test.go).
+// The stored value must come from the live session's resolver, not a literal
+// in the SQL text (there is none for this form).
+func TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	live := map[string]string{"work_mem": "128MB"}
+	resolver := currentGUCResolver(func(name string) (string, bool) {
+		v, ok := live[name]
+		return v, ok
+	})
+
+	handled, _, err := s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET work_mem FROM CURRENT", "postgres", resolver)
+	if !handled || err != nil {
+		t.Fatalf("ALTER DATABASE postgres SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
+	}
+	if got := im.DatabaseConfigEntries(catalog.FirstUserOID); len(got) != 1 || got[0] != "work_mem=128MB" {
+		t.Errorf("DatabaseConfigEntries(FirstUserOID) = %v, want [work_mem=128MB]", got)
+	}
+
+	// An unrecognised GUC name (resolver reports ok=false) errors.
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET no_such_guc FROM CURRENT", "postgres", resolver)
+	if !handled {
+		t.Fatal("ALTER DATABASE postgres SET no_such_guc FROM CURRENT: expected handled=true")
+	}
+	if err == nil {
+		t.Fatal("ALTER DATABASE postgres SET no_such_guc FROM CURRENT: expected an error")
+	}
+
+	// A nil resolver (no live session) behaves the same as ok=false.
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE postgres SET work_mem FROM CURRENT", "postgres", nil)
+	if !handled || err == nil {
+		t.Fatalf("ALTER DATABASE postgres SET work_mem FROM CURRENT (nil resolver): handled=%v err=%v", handled, err)
+	}
+
+	// A database other than the connection's own live database is a silent
+	// no-op — the resolver must never be consulted (a nil resolver here must
+	// NOT error), mirroring applyAlterDatabaseConfig's identical restriction
+	// for the literal-value forms.
+	handled, _, err = s.tryHandleDatabaseDDL("ALTER DATABASE otherdb SET work_mem FROM CURRENT", "postgres", nil)
+	if !handled || err != nil {
+		t.Fatalf("ALTER DATABASE otherdb SET work_mem FROM CURRENT: handled=%v err=%v", handled, err)
 	}
 }
