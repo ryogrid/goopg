@@ -1956,6 +1956,13 @@ type Catalog interface {
 	// to render a composite-array field (`addr[]`) as the schema-qualified array
 	// name. DU-002 slice 250.
 	LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bool)
+	// LookupRangeTypeByOID finds a user-defined range type by its pg_type OID,
+	// used by format_type to render a range column's declared type. M0110-0001.
+	LookupRangeTypeByOID(oid uint32) (*RangeType, bool)
+	// LookupRangeTypeByMultirangeOID finds a user-defined range type by the
+	// pg_type OID of its auto-generated multirange type, used by format_type
+	// to resolve pg_range.rngmultitypid. M0110-0001.
+	LookupRangeTypeByMultirangeOID(oid uint32) (*RangeType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -2093,6 +2100,11 @@ type InMemory struct {
 	// CREATE TYPE ... AS (...), so a pg_type heap row (typtype='c') can be
 	// synthesized for pg_dump / catalog parity. DU-002 slice 242.
 	compositeTypes map[string]*CompositeType
+	// rangeTypes holds user-defined range types created via
+	// CREATE TYPE ... AS RANGE (subtype = ..., ...), keyed by lower-case name,
+	// so pg_type (typtype='r'/'m') and pg_range heap/virtual rows can be
+	// synthesized for pg_dump / catalog parity. DU-002 (M0110-0001).
+	rangeTypes map[string]*RangeType
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -2681,6 +2693,22 @@ type CompositeType struct {
 	Fields   []CompositeField // ordered field list
 }
 
+// RangeType describes a user-defined range type created via
+// `CREATE TYPE x AS RANGE (subtype = ..., ...)`. PostgreSQL allocates a
+// pg_type row for the range itself (typtype='r'), a pg_range row, and an
+// auto-generated multirange type (typtype='m', default name derived by
+// makeMultirangeTypeName). goopg currently synthesizes those three; the
+// range's own auto-generated array type and the multirange's array type are a
+// follow-up (see fix_plan / deferral ledger — DU-002, M0110-0001).
+type RangeType struct {
+	Name           string // lower-case range type name
+	OID            uint32 // pg_type.oid of the range type
+	SubtypeName    string // subtype name as declared (e.g. "int4", "timestamp with time zone")
+	OpclassOID     uint32 // default btree opclass OID for the subtype (pg_range.rngsubopc)
+	MultirangeOID  uint32 // pg_type.oid of the auto-generated multirange type
+	MultirangeName string // lower-case multirange type name
+}
+
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
 // It is stored in InMemory.userAggregates and looked up by lower-case name.
 type UserAggregate struct {
@@ -2846,6 +2874,7 @@ func NewInMemory() *InMemory {
 		compositeTypeNames:     make(map[string]bool),
 		compositeTypeFields:    make(map[string][]CompositeField),
 		compositeTypes:         make(map[string]*CompositeType),
+		rangeTypes:             make(map[string]*RangeType),
 		constraintViewDeps:     make(map[string][]string),
 		opClassHashFuncs:       make(map[string]string),
 		opClassSchemas:         make(map[string]string),
@@ -8005,10 +8034,17 @@ func (c *InMemory) registerSystemTables() {
 	// pg_opclass` — it reads ALL operator classes and filters out system-defined
 	// ones at dump-out time by namespace dumpability. A CREATE OPERATOR CLASS
 	// registers a row here (catalog.UserOperatorClass, ListUserOperatorClasses)
-	// so pg_dump's getOpclasses/dumpOpclass re-emit it; with none registered
-	// this view is empty exactly as before. The built-ins are in pg_catalog
-	// (never dumped). Schema matches PG's pg_opclass (pg_opclass.h). M0110-0001
-	// (DU-002 slice 10; CREATE OPERATOR CLASS support added M0119-0004).
+	// so pg_dump's getOpclasses/dumpOpclass re-emit it. A small set of built-in
+	// default btree opclasses (builtinRangeSubtypeOpclasses) is also surfaced —
+	// real PG's pg_opclass genuinely contains ~600 built-in rows queryable via
+	// plain SQL (pg_dump's own comment above: "we filter out system-defined
+	// opclasses at dump-out time", i.e. client-side by namespace, not via a SQL
+	// WHERE clause) — goopg exposes just enough of them for a range type's
+	// `pg_range.rngsubopc` to resolve via the `dumpRangeType` join. They stay
+	// out of the dump: their opcnamespace (pg_catalog, 11) is never dumpable.
+	// Schema matches PG's pg_opclass (pg_opclass.h). M0110-0001 (DU-002 slice
+	// 10; CREATE OPERATOR CLASS support added M0119-0004; built-in range
+	// subtype opclasses added M0110-0001 range-type round-trip).
 	pgOpclass := &Table{
 		Schema: "pg_catalog", Name: "pg_opclass", Virtual: true,
 		Columns: []Column{
@@ -8026,10 +8062,24 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgOpclass.VirtualRows = func() [][]string {
 		classes := c.ListUserOperatorClasses()
-		if len(classes) == 0 {
+		var builtinRows [][]string
+		if rts := c.ListRangeTypes(); len(rts) > 0 {
+			seen := make(map[uint32]bool)
+			for _, rt := range rts {
+				if rt.OpclassOID == 0 || seen[rt.OpclassOID] {
+					continue
+				}
+				seen[rt.OpclassOID] = true
+				if row, ok := builtinOpclassRowByOID(rt.OpclassOID); ok {
+					builtinRows = append(builtinRows, row)
+				}
+			}
+		}
+		if len(classes) == 0 && len(builtinRows) == 0 {
 			return nil
 		}
-		out := make([][]string, 0, len(classes))
+		out := make([][]string, 0, len(classes)+len(builtinRows))
+		out = append(out, builtinRows...)
 		for _, oc := range classes {
 			out = append(out, []string{
 				strconv.FormatUint(uint64(oc.OID), 10),                     // oid
@@ -8477,13 +8527,12 @@ func (c *InMemory) registerSystemTables() {
 	//   WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid )
 	//   ORDER BY 3,4
 	// (pg_dump.c getCasts: range types' auto-generated casts are excluded via the
-	// NOT EXISTS against pg_range so they aren't dumped separately). goopg defines
-	// no range types (no CREATE TYPE ... AS RANGE), so an empty view (0 rows) is
-	// correct — the NOT EXISTS is always true, matching PG's outcome when no user
-	// range types exist. Schema matches PG's pg_range (pg_range.h): NOTE pg_range
-	// has NO oid column; rngtypid is the key. Cols: rngtypid oid, rngsubtype oid,
-	// rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc(oid),
-	// rngsubdiff regproc(oid). M0110-0001 (DU-002 slice 22).
+	// NOT EXISTS against pg_range so they aren't dumped separately). Schema
+	// matches PG's pg_range (pg_range.h): NOTE pg_range has NO oid column;
+	// rngtypid is the key. Cols: rngtypid oid, rngsubtype oid, rngmultitypid
+	// oid, rngcollation oid, rngsubopc oid, rngcanonical regproc, rngsubdiff
+	// regproc. M0110-0001 (DU-002 slice 22; populated M0110-0001 range-type
+	// round-trip).
 	pgRange := &Table{
 		Schema: "pg_catalog", Name: "pg_range", Virtual: true,
 		Columns: []Column{
@@ -8492,12 +8541,43 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "rngmultitypid", Type: Type{Name: "oid"}, Ordinal: 2},
 			{Name: "rngcollation", Type: Type{Name: "oid"}, Ordinal: 3},
 			{Name: "rngsubopc", Type: Type{Name: "oid"}, Ordinal: 4},
-			{Name: "rngcanonical", Type: Type{Name: "oid"}, Ordinal: 5},
-			{Name: "rngsubdiff", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "rngcanonical", Type: Type{Name: "regproc"}, Ordinal: 5},
+			{Name: "rngsubdiff", Type: Type{Name: "regproc"}, Ordinal: 6},
 		},
 		OID: 3541,
 	}
-	pgRange.VirtualRows = func() [][]string { return nil }
+	// Surface user-created range types (CREATE TYPE ... AS RANGE) so
+	// pg_dump's dumpRangeType join finds a row. rngcanonical/rngsubdiff are
+	// always "-" (unsupported `canonical`/`subtype_diff` options — DU-002
+	// deferral); rngcollation mirrors the subtype's own typcollation so
+	// dumpRangeType's `CASE WHEN rngcollation = st.typcollation THEN 0 ...`
+	// always yields 0 (no COLLATE clause), matching the common case of no
+	// explicit `collation` option. M0110-0001.
+	pgRange.VirtualRows = func() [][]string {
+		rts := c.ListRangeTypes()
+		if len(rts) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(rts))
+		for _, rt := range rts {
+			subtypeOID := TypeNameToOID(rt.SubtypeName)
+			var collation uint32
+			switch subtypeOID {
+			case OIDText, OIDVarChar, OIDBpChar:
+				collation = 100 // DEFAULT_COLLATION_OID
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(rt.OID), 10),           // rngtypid
+				strconv.FormatUint(uint64(subtypeOID), 10),       // rngsubtype
+				strconv.FormatUint(uint64(rt.MultirangeOID), 10), // rngmultitypid
+				strconv.FormatUint(uint64(collation), 10),        // rngcollation
+				strconv.FormatUint(uint64(rt.OpclassOID), 10),    // rngsubopc
+				"-", // rngcanonical
+				"-", // rngsubdiff
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_range"] = pgRange
 
 	// pg_event_trigger — event-trigger catalog (OID 3466). After getCasts,
@@ -15353,6 +15433,187 @@ func (c *InMemory) LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bo
 		}
 	}
 	return nil, false
+}
+
+// builtinOpclassInfo describes one built-in btree operator class row, enough
+// to satisfy pg_dump's `dumpRangeType` join (`pg_range r, pg_type st,
+// pg_opclass opc WHERE opc.oid = rngsubopc`) and to serve as the resolved
+// default opclass for a `CREATE TYPE ... AS RANGE (subtype = ...)`. OIDs/
+// family OIDs are the real PG18 values (postgres/src/include/catalog/
+// pg_opclass.dat), duplicated from internal/initdb/initdb.go's
+// pgOpclassEntry list (executor/catalog cannot import initdb — import
+// cycle — see pgTypeColumnsPG18 for the same duplication pattern).
+type builtinOpclassInfo struct {
+	OID      uint32
+	Name     string
+	Family   uint32
+	IntypeOID uint32
+}
+
+const btreeAccessMethodOID uint32 = 403
+
+// builtinRangeSubtypeOpclasses covers the subtypes of PostgreSQL's five
+// built-in range types (int4range/int8range/numrange/daterange/tsrange/
+// tstzrange) plus text (a common user range subtype with no built-in PG
+// range but a real default btree opclass). A subtype outside this set has no
+// resolvable default opclass in goopg today — RegisterRangeType reports that
+// as PG's own ERRCODE_UNDEFINED_OBJECT ("... has no default operator class
+// for access method \"btree\"") rather than silently registering a broken
+// range. DU-002 (M0110-0001).
+var builtinRangeSubtypeOpclasses = map[uint32]builtinOpclassInfo{
+	OIDInt4:        {OID: 1978, Name: "int4_ops", Family: 1976, IntypeOID: OIDInt4},
+	OIDInt8:        {OID: 3124, Name: "int8_ops", Family: 1976, IntypeOID: OIDInt8},
+	OIDNumeric:     {OID: 3125, Name: "numeric_ops", Family: 1988, IntypeOID: OIDNumeric},
+	OIDDate:        {OID: 3122, Name: "date_ops", Family: 434, IntypeOID: OIDDate},
+	OIDTimestamp:   {OID: 3128, Name: "timestamp_ops", Family: 434, IntypeOID: OIDTimestamp},
+	OIDTimestampTZ: {OID: 3127, Name: "timestamptz_ops", Family: 434, IntypeOID: OIDTimestampTZ},
+	OIDText:        {OID: 3126, Name: "text_ops", Family: 1994, IntypeOID: OIDText},
+}
+
+// DefaultBtreeOpclassForSubtype returns the default btree operator class OID
+// for a range subtype's pg_type OID, or ok=false if goopg has no default
+// opclass on record for it (see builtinRangeSubtypeOpclasses). M0110-0001.
+func DefaultBtreeOpclassForSubtype(subtypeOID uint32) (uint32, bool) {
+	oc, ok := builtinRangeSubtypeOpclasses[subtypeOID]
+	if !ok {
+		return 0, false
+	}
+	return oc.OID, true
+}
+
+// builtinOpclassRowByOID renders a single builtinRangeSubtypeOpclasses entry
+// as a pg_opclass virtual-table row (see pg_opclass's VirtualRows), so the
+// pg_dump `dumpRangeType` join finds a matching row for a range type's
+// resolved default opclass. Only emitted lazily, keyed by the OIDs actually
+// referenced by a registered range type — pg_opclass must otherwise stay
+// exactly as populated by CREATE OPERATOR CLASS (TestCreateOperatorClassPopulatesOpclassRow
+// and siblings assert an exact row count). opcnamespace=11 (pg_catalog),
+// opcowner=10 (bootstrap superuser), opcdefault=true, opckeytype=0 for all of
+// them — matching PG18's real rows. M0110-0001.
+func builtinOpclassRowByOID(oid uint32) ([]string, bool) {
+	for _, oc := range builtinRangeSubtypeOpclasses {
+		if oc.OID != oid {
+			continue
+		}
+		return []string{
+			strconv.FormatUint(uint64(oc.OID), 10),               // oid
+			strconv.FormatUint(uint64(btreeAccessMethodOID), 10), // opcmethod
+			oc.Name,                                    // opcname
+			"11",                                        // opcnamespace = pg_catalog
+			"10",                                        // opcowner = bootstrap superuser
+			strconv.FormatUint(uint64(oc.Family), 10),   // opcfamily
+			strconv.FormatUint(uint64(oc.IntypeOID), 10), // opcintype
+			"t", // opcdefault
+			"0", // opckeytype
+		}, true
+	}
+	return nil, false
+}
+
+// deriveMultirangeTypeName mirrors PostgreSQL's makeMultirangeTypeName
+// (postgres/src/backend/catalog/pg_type.c): if the range type name contains
+// "range", replace the first occurrence with "multirange"; otherwise append
+// "_multirange". M0110-0001.
+func deriveMultirangeTypeName(rangeName string) string {
+	if idx := strings.Index(rangeName, "range"); idx >= 0 {
+		return rangeName[:idx] + "multi" + rangeName[idx:]
+	}
+	return rangeName + "_multirange"
+}
+
+// RegisterRangeType records a `CREATE TYPE ... AS RANGE (subtype = ...)`
+// range type, allocating pg_type OIDs for both the range itself and its
+// auto-generated multirange type (matching PG's real allocation order:
+// range's array OID would come next, then multirange, then multirange's
+// array — the two array OIDs are not yet allocated, see the deferral
+// ledger). Returns an error matching PG's own wording if the subtype has no
+// resolvable default btree opclass. M0110-0001.
+func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName string) (*RangeType, error) {
+	subtypeOID := TypeNameToOID(subtypeName)
+	opclassOID, ok := DefaultBtreeOpclassForSubtype(subtypeOID)
+	if !ok {
+		return nil, fmt.Errorf("data type %s has no default operator class for access method %q", subtypeName, "btree")
+	}
+	k := strings.ToLower(name)
+	mrName := strings.ToLower(explicitMultirangeName)
+	if mrName == "" {
+		mrName = deriveMultirangeTypeName(k)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt, exists := c.rangeTypes[k]
+	if !exists {
+		rt = &RangeType{Name: k, OID: c.nextOID, MultirangeOID: c.nextOID + 1}
+		c.nextOID += 2
+		c.rangeTypes[k] = rt
+	}
+	rt.SubtypeName = subtypeName
+	rt.OpclassOID = opclassOID
+	rt.MultirangeName = mrName
+	return rt, nil
+}
+
+// LookupRangeType finds a user-defined range type by name (case-insensitive).
+// M0110-0001.
+func (c *InMemory) LookupRangeType(name string) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	rt, ok := c.rangeTypes[strings.ToLower(name)]
+	return rt, ok
+}
+
+// LookupRangeTypeByOID finds a user-defined range type by its pg_type OID,
+// used by format_type to render a range column's declared type. M0110-0001.
+func (c *InMemory) LookupRangeTypeByOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.OID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByMultirangeOID finds a user-defined range type by the
+// pg_type OID of its auto-generated multirange type, used by format_type to
+// resolve pg_range.rngmultitypid via `format_type(rngmultitypid, NULL)`.
+// M0110-0001.
+func (c *InMemory) LookupRangeTypeByMultirangeOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.MultirangeOID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// ListRangeTypes returns every registered range type, for pg_type/pg_range
+// virtual-row generation (pg_dump CREATE TYPE ... AS RANGE round-trip).
+// M0110-0001.
+func (c *InMemory) ListRangeTypes() []*RangeType {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*RangeType, 0, len(c.rangeTypes))
+	for _, rt := range c.rangeTypes {
+		out = append(out, rt)
+	}
+	return out
+}
+
+// DropRangeType removes a range type. Returns an error if not found.
+// M0110-0001.
+func (c *InMemory) DropRangeType(name string) error {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.rangeTypes[k]; !ok {
+		return fmt.Errorf("type %q does not exist", name)
+	}
+	delete(c.rangeTypes, k)
+	return nil
 }
 
 // LookupCompositeTypeFields returns the ordered field list for a composite type,

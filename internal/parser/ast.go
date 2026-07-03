@@ -3168,6 +3168,20 @@ type CreateTypeStmt struct {
 	EnumValues      []string
 	IsComposite     bool
 	CompositeFields []TypeField
+	// IsRange marks `CREATE TYPE name AS RANGE (subtype = ..., ...)`. Only the
+	// `subtype` and `multirange_type_name` options are captured; the others
+	// (subtype_opclass, collation, canonical, subtype_diff) are parsed (so they
+	// don't break the statement) but not yet applied. DU-002 (M0110-0001).
+	IsRange bool
+	// RangeSubtype is the space-joined subtype type-name tokens as written
+	// (e.g. "int4", "timestamp with time zone").
+	RangeSubtype string
+	// RangeMultirangeName is the explicit `multirange_type_name` value's bare
+	// name (schema qualification is dropped; goopg assumes public like its
+	// other user-type registries). Empty means auto-derive from Name, mirroring
+	// PostgreSQL's makeMultirangeTypeName ("range"->"multirange", else append
+	// "_multirange").
+	RangeMultirangeName string
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }

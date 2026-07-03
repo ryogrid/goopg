@@ -11168,3 +11168,80 @@ Gates: `go build ./...` clean; `internal/executor` suite PASS;
 suites PASS (no regression, full run); `TestPort_PgDumpConnectionSetup` PASS
 (unaffected — this fix has no dump-text impact); `scripts/tpch-spotcheck.sh`
 PASS; pgbench smoke = pre-commit hook.
+
+### Slice 429 — **`CREATE TYPE ... AS RANGE` round-trip** (new object family)
+
+Before this slice the parser accepted the `AS RANGE (subtype = ..., ...)`
+form only as a name-only discard stub — no `pg_type`/`pg_range` row was ever
+created, so a user range type vanished from `pg_dump` output entirely (not
+even a stub `CREATE TYPE` line).
+
+Landed a full new object family, mirroring the enum/domain/composite
+precedents already in this file:
+
+- **Parser** (`internal/parser/ddl.go` `parseCreateType`, `ast.go`
+  `CreateTypeStmt`): a new `AS RANGE ( subtype = ..., multirange_type_name =
+  ..., ... )` branch. Only `subtype` and `multirange_type_name` are captured
+  into the AST (`IsRange`/`RangeSubtype`/`RangeMultirangeName`); the other PG
+  options (`subtype_opclass`, `collation`, `canonical`, `subtype_diff`) are
+  consumed token-by-token (tracking paren depth so a typmod-bearing subtype
+  like `numeric(10,2)` stays intact) so the statement still parses, but are
+  not applied — see the deferral ledger row for slice 429.
+- **Catalog** (`internal/catalog/catalog.go`): a new `RangeType` registry
+  (`rangeTypes map[string]*RangeType`) with `RegisterRangeType` /
+  `LookupRangeType` / `LookupRangeTypeByOID` / `LookupRangeTypeByMultirangeOID`
+  / `ListRangeTypes` / `DropRangeType`. `RegisterRangeType` allocates two
+  `pg_type` OIDs (range + auto-generated multirange, `deriveMultirangeTypeName`
+  mirroring PG's `makeMultirangeTypeName`: replace the first `"range"`
+  substring with `"multirange"`, else append `"_multirange"`) and resolves a
+  default btree opclass for the subtype via a curated
+  `builtinRangeSubtypeOpclasses` map (int4/int8/numeric/date/timestamp/
+  timestamptz/text — the subtypes of PG's five built-in range types, plus
+  text as a common user subtype with no built-in PG range) — a subtype
+  outside that set is rejected with PG's own `ERRCODE_UNDEFINED_OBJECT`
+  wording ("... has no default operator class for access method \"btree\"").
+- **Executor** (`internal/executor/operators_ddl.go` `execCreateType`/
+  `execDropType`, `pg18_user_catalog_rows.go`): `syncRangeTypeToCatalogHeap`
+  writes two `pg_type` heap rows (`buildUserPGTypeRowForRange`/
+  `ForMultirange` — always varlena, `typstorage='x'`, `typcollation=0`
+  since "ranges never have one", `typarray=0` since no array-of-range type
+  is allocated yet); `execDropType` stamps `xmax` on both before the
+  in-memory delete, mirroring the enum/composite branches.
+- **`pg_range`/`pg_opclass` virtual views** (`internal/catalog/catalog.go`):
+  `pg_range.VirtualRows` now surfaces one row per registered range type
+  (`rngtypid`/`rngsubtype`/`rngmultitypid`/`rngsubopc` populated;
+  `rngcanonical`/`rngsubdiff` hardcoded `"-"` — unsupported options);
+  `pg_opclass.VirtualRows` lazily surfaces the built-in default-opclass row
+  (`builtinOpclassRowByOID`) for each `OpclassOID` actually referenced by a
+  registered range type, so `pg_dump`'s `dumpRangeType` join (`pg_range r,
+  pg_type st, pg_opclass opc WHERE opc.oid = rngsubopc`) resolves. These
+  built-in rows never affect `CREATE OPERATOR CLASS`'s own dump-visibility
+  tests (`TestCreateOperatorClassPopulatesOpclassRow`): their
+  `opcnamespace=11` (`pg_catalog`) is never dumpable.
+- **`format_type`** (`internal/executor/expr.go`): resolves a range type's
+  or multirange type's dynamically-allocated OID to `public.<name>`, so
+  `dumpRangeType`'s own `format_type(rngmultitypid, NULL)` call (which
+  renders the `multirange_type_name = ...` clause) round-trips.
+
+New `TestPort_PgDumpConnectionSetup` fixture (slice 429): `CREATE TYPE
+public.myrange AS RANGE (subtype = int4)` dumps byte-identical to live
+`pg_dump` 18.3's own three-line form:
+
+```
+CREATE TYPE public.myrange AS RANGE (
+    subtype = integer,
+    multirange_type_name = public.mymultirange
+);
+```
+
+**Deferred** (deferral ledger, DU-002 slice 429 — resume points there):
+`subtype_opclass`/`collation`/`canonical`/`subtype_diff` options are parsed
+but discarded; no array-of-range/array-of-multirange auto-generated type
+(`typarray=0`); no WAL/restart persistence (`rangeTypes` is a plain
+in-process map, same gap as the `CREATE ACCESS METHOD` slice); only the 7
+curated subtypes have a resolvable default opclass rather than a generic
+`GetDefaultOpClass`-style lookup.
+
+Gates: `go build ./...` clean; `internal/catalog`+`internal/parser`+
+`internal/executor` suites PASS (`-count=1`); `TestPort_PgDumpConnectionSetup`
+PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.

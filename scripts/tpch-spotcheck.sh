@@ -27,8 +27,9 @@
 # every fresh build_schema_goopg.sh (see comments in that file).
 #
 # Tunables:
-#   TPCH_SPOTCHECK_TIMEOUT  per-query budget for tpch-runner   (default 600s)
-#   TPCH_SPOTCHECK_MIN_MB   data-dir size below which we SKIP  (default 100)
+#   TPCH_SPOTCHECK_TIMEOUT        per-query budget for tpch-runner        (default 600s)
+#   TPCH_SPOTCHECK_MIN_MB         data-dir size below which we SKIP       (default 100)
+#   TPCH_SPOTCHECK_READY_TIMEOUT  seconds to wait for readiness           (default 120)
 #
 set -euo pipefail
 
@@ -124,7 +125,7 @@ cleanup() {
 trap cleanup EXIT
 
 ready=0
-for _ in $(seq 1 60); do
+for _ in $(seq 1 "${TPCH_SPOTCHECK_READY_TIMEOUT:-120}"); do
     if ! kill -0 "${server_pid}" 2>/dev/null; then
         break   # server process died — fall through to the error below
     fi

@@ -11595,6 +11595,33 @@ func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
+// syncRangeTypeToCatalogHeap writes the pg_type heap rows for a user-defined
+// range type: the range itself (typtype='r') and its auto-generated
+// multirange type (typtype='m'), mirroring syncEnumTypeToCatalogHeap /
+// syncDomainTypeToCatalogHeap. pg_dump's getTypes reads pg_type to discover
+// both, and dumpRangeType re-renders `CREATE TYPE ... AS RANGE (...)` via a
+// separate query against pg_range/pg_opclass (see the pg_range/pg_opclass
+// Virtual views in internal/catalog/catalog.go, which surface a matching row
+// for a registered range type without a heap write — pg_range/pg_opclass are
+// not heap-backed like pg_type). DU-002 (M0110-0001).
+func syncRangeTypeToCatalogHeap(ctx *Context, rt *catalog.RangeType) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRange(rt)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirange(rt)); err != nil {
+		return
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
 // deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
 // Called by execDropType so dropped enums don't leave orphan pg_type rows.
 // pg_type rows are written by syncEnumTypeToCatalogHeap using pgTypeColumnsPG18
@@ -16040,7 +16067,19 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		return nil
 	}
 	if !s.IsEnum {
-		// Composite / range / base types — register the name so DROP TYPE can
+		// AS RANGE (subtype = ..., ...) — register a real range type (pg_type
+		// typtype='r' + its auto-generated multirange typtype='m'), so it
+		// round-trips through pg_dump instead of vanishing as a bare name-only
+		// stub. DU-002 (M0110-0001).
+		if s.IsRange {
+			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName)
+			if err != nil {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+			}
+			syncRangeTypeToCatalogHeap(o.ctx, rt)
+			return nil
+		}
+		// Composite / base types — register the name so DROP TYPE can
 		// succeed without error. If the type has a parsed field list, also
 		// store the fields to enable PL/pgSQL field access/assignment.
 		// M0097-0064, M0097-composite.
@@ -16492,7 +16531,21 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		if compErr == nil {
 			continue // successfully dropped as composite type
 		}
-		// Neither enum nor composite — report error or IF EXISTS notice.
+		// Stamp the range type's pg_type rows (the range + its auto-generated
+		// multirange) before the in-memory delete, mirroring the enum/composite
+		// branches above. DU-002 (M0110-0001).
+		if rt, ok := cat.LookupRangeType(n); ok && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
+		}
+		rangeErr := cat.DropRangeType(n)
+		if rangeErr == nil {
+			continue // successfully dropped as range type
+		}
+		// Neither enum, composite, nor range — report error or IF EXISTS notice.
 		if s.IfExists {
 			o.ctx.AddNotice(fmt.Sprintf("type %q does not exist, skipping", n))
 			continue

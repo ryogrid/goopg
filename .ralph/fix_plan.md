@@ -6432,6 +6432,43 @@ documentation-only and is exempt from the design-doc requirement.)
       sites), applying the prefix to goopg's other `slog` output (only the two
       root-0023 lines are wired), and `logging_collector`/`log_directory`.
 
+- [x] **`CREATE TYPE ... AS RANGE` round-trip in pg_dump (M0110-0001, DU-002
+      slice 429).** **COMPLETE 2026-07-03:** new object family — the parser
+      previously accepted the `AS RANGE (subtype = ..., ...)` form only as a
+      name-only discard stub with no `pg_type`/`pg_range` row, so a user
+      range type vanished from `pg_dump` entirely. Landed: `CreateTypeStmt.
+      IsRange`/`RangeSubtype`/`RangeMultirangeName` (`internal/parser/ast.go`,
+      `ddl.go` `parseCreateType`); new `catalog.RangeType` registry
+      (`RegisterRangeType`/`LookupRangeType`/`LookupRangeTypeByOID`/
+      `LookupRangeTypeByMultirangeOID`/`ListRangeTypes`/`DropRangeType`,
+      `internal/catalog/catalog.go`) allocating real `pg_type` OIDs for the
+      range (`typtype='r'`) + auto-derived multirange (`typtype='m'`,
+      `deriveMultirangeTypeName` mirrors `makeMultirangeTypeName`), resolving
+      a default btree opclass via a curated `builtinRangeSubtypeOpclasses`
+      map (int4/int8/numeric/date/timestamp/timestamptz/text);
+      `syncRangeTypeToCatalogHeap`/`buildUserPGTypeRowForRange`/
+      `ForMultirange` (`internal/executor/operators_ddl.go`,
+      `pg18_user_catalog_rows.go`) write the `pg_type` heap rows;
+      `pg_range`/`pg_opclass` virtual views (`catalog.go`) surface matching
+      rows so `pg_dump`'s `dumpRangeType` join resolves; `format_type`
+      (`internal/executor/expr.go`) resolves a range/multirange OID to its
+      schema-qualified name. New `TestPort_PgDumpConnectionSetup` fixture
+      (slice 429) verified byte-identical vs live `pg_dump` 18.3: `CREATE
+      TYPE public.myrange AS RANGE (subtype = integer, multirange_type_name =
+      public.mymultirange);`. Gates: `go build ./...` clean; `internal/catalog`
+      +`internal/parser`+`internal/executor` suites PASS (`-count=1`);
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS.
+      Design doc: `docs/design/0110-0001-pg-dump-tap-port.md` new "Slice 429
+      — `CREATE TYPE ... AS RANGE` round-trip" section; `docs/design/README.md`
+      0110-0001 row updated; deferral ledger row appended (task-id
+      `M0110-0001 (DU-002 slice 429)`). Still open (see ledger row): `subtype_
+      opclass`/`collation`/`canonical`/`subtype_diff` options parsed but
+      discarded; no array-of-range/multirange auto-generated type
+      (`typarray=0`); no WAL/restart persistence (`rangeTypes` is a plain
+      in-process map, same gap as `CREATE ACCESS METHOD`); only the 7 curated
+      subtypes resolve a default opclass rather than a generic PG-style
+      `GetDefaultOpClass` lookup.
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

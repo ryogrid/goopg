@@ -8040,6 +8040,66 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 		return stmt, nil
 	}
 	if !p.acceptIdentKeyword("enum") {
+		// AS RANGE ( subtype = ..., multirange_type_name = ..., ... ) — range
+		// type. Only `subtype` and `multirange_type_name` are captured; the
+		// other options (subtype_opclass, collation, canonical, subtype_diff)
+		// are consumed so the statement still parses but are not yet applied.
+		// DU-002 (M0110-0001).
+		if p.acceptIdentKeyword("range") {
+			stmt.IsRange = true
+			if !p.acceptSymbol("(") {
+				return nil, p.errAtCur("expected '(' after RANGE")
+			}
+			for {
+				if p.cur().Kind != TokenIdent {
+					break
+				}
+				key := strings.ToLower(p.advance().Value)
+				if c := p.cur(); (c.Kind == TokenSymbol || c.Kind == TokenOperator) && c.Value == "=" {
+					p.advance()
+				} else {
+					return nil, p.errAtCur("expected '=' in range type option")
+				}
+				if key == "multirange_type_name" {
+					mrName, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.RangeMultirangeName = mrName.Name
+				} else {
+					// Collect value tokens until a top-level ',' or ')', tracking
+					// paren depth so a typmod-bearing subtype (e.g. numeric(10,2))
+					// stays intact. Mirrors the composite-field type collector above.
+					var valueParts []string
+					parenDepth := 0
+					for p.cur().Kind != TokenEOF {
+						tok := p.cur()
+						if tok.Kind == TokenSymbol && parenDepth == 0 &&
+							(tok.Value == "," || tok.Value == ")") {
+							break
+						}
+						if tok.Kind == TokenSymbol && tok.Value == "(" {
+							parenDepth++
+						} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+							parenDepth--
+						}
+						valueParts = append(valueParts, tok.Value)
+						p.advance()
+					}
+					if key == "subtype" {
+						stmt.RangeSubtype = strings.Join(valueParts, " ")
+					}
+				}
+				if p.acceptSymbol(",") {
+					continue
+				}
+				break
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ')' after RANGE option list")
+			}
+			return stmt, nil
+		}
 		// AS ( ... ) — composite type with field list.
 		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance() // consume '('

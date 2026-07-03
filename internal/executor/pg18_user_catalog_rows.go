@@ -1901,6 +1901,103 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 	}
 }
 
+// buildUserPGTypeRowForRange builds the pg_type row for a user-defined range
+// type (typtype='r', typcategory='R'). Ranges are always varlena
+// (typlen=-1), never collatable (typcollation=0 — PG's own comment: "ranges
+// never have one"; the subtype's collation instead lives on pg_range.rngcollation),
+// and always TOAST-extended. Alignment mirrors PG's rule in DefineRange:
+// double if the subtype is double-aligned, int otherwise. typarray is 0 (no
+// auto-generated array-of-range type yet — DU-002 deferral). DU-002
+// (M0110-0001).
+func buildUserPGTypeRowForRange(rt *catalog.RangeType) Row {
+	subtypeOID := catalog.TypeNameToOID(rt.SubtypeName)
+	align := byte('i')
+	if userTypeAttrsForOID(subtypeOID).TypAlign == 'd' {
+		align = 'd'
+	}
+	return Row{
+		NewIntDatum(int64(rt.OID)),                     // oid
+		NewStringDatum(rt.Name),                        // typname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
+		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(-1),                                 // typlen (always varlena)
+		NewBoolDatum(false),                             // typbyval
+		NewStringDatum("r"),                             // typtype = 'r' (range)
+		NewStringDatum("R"),                             // typcategory = TYPCATEGORY_RANGE
+		NewBoolDatum(false),                             // typispreferred
+		NewBoolDatum(true),                              // typisdefined
+		NewStringDatum(","),                             // typdelim
+		NewIntDatum(0),                                  // typrelid
+		NewIntDatum(0),                                  // typsubscript
+		NewIntDatum(0),                                  // typelem
+		NewIntDatum(0),                                  // typarray (deferred — no array-of-range type yet)
+		NewIntDatum(0),                                  // typinput
+		NewIntDatum(0),                                  // typoutput
+		NewIntDatum(0),                                  // typreceive
+		NewIntDatum(0),                                  // typsend
+		NewIntDatum(0),                                  // typmodin
+		NewIntDatum(0),                                  // typmodout
+		NewIntDatum(0),                                  // typanalyze
+		NewStringDatum(string(align)),                   // typalign
+		NewStringDatum("x"),                             // typstorage = 'x' (extended)
+		NewBoolDatum(false),                             // typnotnull
+		NewIntDatum(0),                                  // typbasetype
+		NewIntDatum(-1),                                 // typtypmod
+		NewIntDatum(0),                                  // typndims
+		NewIntDatum(0),                                  // typcollation (ranges never have one)
+		NullDatum,                                       // typdefaultbin
+		NullDatum,                                       // typdefault
+		NullDatum,                                       // typacl
+	}
+}
+
+// buildUserPGTypeRowForMultirange builds the pg_type row for a range type's
+// auto-generated multirange type (typtype='m', typcategory='R' — matching
+// PG's TypeCreate call in DefineRange, which reuses TYPCATEGORY_RANGE for the
+// multirange too). Same varlena/alignment/no-collation shape as the range
+// itself. DU-002 (M0110-0001).
+func buildUserPGTypeRowForMultirange(rt *catalog.RangeType) Row {
+	subtypeOID := catalog.TypeNameToOID(rt.SubtypeName)
+	align := byte('i')
+	if userTypeAttrsForOID(subtypeOID).TypAlign == 'd' {
+		align = 'd'
+	}
+	return Row{
+		NewIntDatum(int64(rt.MultirangeOID)),           // oid
+		NewStringDatum(rt.MultirangeName),              // typname
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
+		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(-1),                                 // typlen (always varlena)
+		NewBoolDatum(false),                             // typbyval
+		NewStringDatum("m"),                             // typtype = 'm' (multirange)
+		NewStringDatum("R"),                             // typcategory = TYPCATEGORY_RANGE
+		NewBoolDatum(false),                             // typispreferred
+		NewBoolDatum(true),                              // typisdefined
+		NewStringDatum(","),                             // typdelim
+		NewIntDatum(0),                                  // typrelid
+		NewIntDatum(0),                                  // typsubscript
+		NewIntDatum(0),                                  // typelem
+		NewIntDatum(0),                                  // typarray (deferred — no array-of-multirange type yet)
+		NewIntDatum(0),                                  // typinput
+		NewIntDatum(0),                                  // typoutput
+		NewIntDatum(0),                                  // typreceive
+		NewIntDatum(0),                                  // typsend
+		NewIntDatum(0),                                  // typmodin
+		NewIntDatum(0),                                  // typmodout
+		NewIntDatum(0),                                  // typanalyze
+		NewStringDatum(string(align)),                   // typalign
+		NewStringDatum("x"),                             // typstorage = 'x' (extended)
+		NewBoolDatum(false),                             // typnotnull
+		NewIntDatum(0),                                  // typbasetype
+		NewIntDatum(-1),                                 // typtypmod
+		NewIntDatum(0),                                  // typndims
+		NewIntDatum(0),                                  // typcollation
+		NullDatum,                                       // typdefaultbin
+		NullDatum,                                       // typdefault
+		NullDatum,                                       // typacl
+	}
+}
+
 // pgAggregateColumnsPG18 mirrors internal/initdb's pgAggregateColDefs — the
 // canonical PG18 pg_aggregate row layout (22 columns, matching
 // FormData_pg_aggregate in postgres/src/include/catalog/pg_aggregate.h).

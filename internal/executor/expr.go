@@ -9703,6 +9703,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					// array name so the dump round-trips as `public.addr[]`, not
 					// `text[]`. DU-002 slice 250.
 					name = "public." + ct.Name + "[]"
+				} else if rt, ok := ctx.Catalog.LookupRangeTypeByOID(uint32(typeOID)); ok {
+					// A range type's dynamically-allocated pg_type OID; render it
+					// as the schema-qualified range name so dumpRangeType's own
+					// `CREATE TYPE ... AS RANGE` header round-trips. DU-002
+					// (M0110-0001).
+					name = "public." + rt.Name
+				} else if rt, ok := ctx.Catalog.LookupRangeTypeByMultirangeOID(uint32(typeOID)); ok {
+					// dumpRangeType's own query resolves rngmultitypid via
+					// `format_type(rngmultitypid, NULL)` to emit the
+					// `multirange_type_name = ...` clause. DU-002 (M0110-0001).
+					name = "public." + rt.MultirangeName
 				}
 			}
 			return NewStringDatum(name), nil

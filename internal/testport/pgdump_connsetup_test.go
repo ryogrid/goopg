@@ -4281,6 +4281,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create type money_amt: %v", err)
 	}
 
+	// Slice 429: `CREATE TYPE ... AS RANGE (subtype = ...)` must round-trip.
+	// Before this slice the parser accepted the RANGE form only as a discard
+	// stub (no pg_type/pg_range row at all), so the type vanished from the
+	// dump entirely — not even a stub CREATE TYPE line. RegisterRangeType now
+	// writes real pg_type rows (typtype='r' + the auto-generated multirange
+	// typtype='m') and pg_range/pg_opclass virtual rows carry enough of a
+	// default-btree-opclass row for pg_dump's dumpRangeType join to resolve,
+	// so the dump reproduces PG's own `subtype = integer, multirange_type_name
+	// = public.mymultirange` shape verbatim (opclass/collation/canonical/
+	// subtype_diff are all defaults here, so none of those optional clauses
+	// print — see the deferral ledger for the unsupported-option gap).
+	if err := runSQLSimple(t, c, "CREATE TYPE public.myrange AS RANGE (subtype = int4)"); err != nil {
+		t.Fatalf("create type myrange: %v", err)
+	}
+
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
 	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
@@ -11462,6 +11477,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		dfltScrub := strings.ReplaceAll(res.Stdout, "ATTACH PARTITION public.pdef_def DEFAULT;\n", "")
 		if strings.Contains(dfltScrub, "DEFAULT;\n") || strings.Contains(dfltScrub, "DEFAULT \n") {
 			t.Errorf("pg_dump emitted a spurious empty DEFAULT on the domain (slice-90 pg_get_expr(NULL) regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 429: `CREATE TYPE ... AS RANGE` must round-trip verbatim, matching
+		// real pg_dump 18.3's own dumpRangeType rendering (verified live): a
+		// three-line `CREATE TYPE public.myrange AS RANGE (\n    subtype =
+		// integer,\n    multirange_type_name = public.mymultirange\n);`. Before
+		// this slice the type had NO pg_type/pg_range row at all (RegisterRangeType
+		// didn't exist — the parser only accepted the RANGE form as a discard
+		// stub), so it vanished from the dump entirely.
+		rangeDefs := []string{
+			"CREATE TYPE public.myrange AS RANGE (",
+			"subtype = integer,",
+			"multirange_type_name = public.mymultirange",
+		}
+		for _, sub := range rangeDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the RANGE type round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		return
 	}
