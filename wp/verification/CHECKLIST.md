@@ -37,6 +37,20 @@ Update checks are disabled by `mu-plugins/disable-update-checks.php` because
 A failure rooted in the PG4WP rewriter rather than in goopg's SQL execution is
 recorded as a **PG4WP limitation**, not a goopg bug.
 
+**Second known non-goopg limitation** (found in M0120-0003, item WP-32):
+`wp db query "..."` does not go through WordPress's PHP `$wpdb`/PG4WP layer at
+all — WP-CLI shells out to the native `mysql` CLI client, connecting directly
+to `DB_HOST` (goopg's PostgreSQL wire-protocol listener). The `mysql` client's
+handshake fails immediately (`ERROR 2013 ... Lost connection ... reading
+initial communication packet`) because it expects a MySQL greeting packet, not
+a PostgreSQL one — confirmed via the goopg statement log showing the query
+never arrives at goopg at all. This affects **every** `wp db query` invocation
+(WP-32 and the read-only **WP-R7**), and is unfixable without goopg speaking a
+second, MySQL-compatible wire protocol (out of scope) or a PG4WP-side shim for
+WP-CLI's `db` command family (also out of scope). Classify as **harness/PG4WP
+limitation**, never as a goopg bug — see
+`wp/verification/results/20260704-073700/summary.md` for the full repro.
+
 ---
 
 ## A. Posts & pages (write)

@@ -7889,10 +7889,27 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   resume point in `.ralph/deferral_ledger.md` (2026-07-04, M0120-0002 row);
   seeded as **M0121-0002** below (M0121-0001's per-failure seeding, done a
   loop early since the crash is high-value to not lose).
-- [ ] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
+- [x] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
   role/delete, comments + comment-meta, options/transients incl. the TOAST-sized
   value WP-28, plugin activate/deactivate, raw INSERT/UPDATE/DELETE via
-  `wp db query`). Watch WP-28 for a root-0022-class TOAST regression.
+  `wp db query`). Watch WP-28 for a root-0022-class TOAST regression. **DONE
+  2026-07-04**: ran `wp/verification/driver_wp17_32.sh` (new, mirrors
+  `driver_wp01_16.sh`) against the live stack from M0120-0002, results +
+  triage in `wp/verification/results/20260704-073700/summary.md`. 15/16 items
+  PASS (30/32 sub-steps incl. confirming reads); WP-28's TOAST-sized
+  (20000-byte) option round-tripped cleanly (`wc -c` = 20001, no root-0022
+  regression). The single FAIL — **WP-32** (`wp db query` raw
+  INSERT/UPDATE/DELETE) — is a **harness/PG4WP limitation, not a goopg bug**:
+  WP-CLI's `db query` shells out to the native `mysql` CLI against `DB_HOST`
+  (goopg's PG wire-protocol port), so the MySQL handshake fails before any SQL
+  reaches goopg (confirmed via the goopg statement log showing zero
+  INSERT/UPDATE/DELETE traffic for those steps). Documented in
+  `CHECKLIST.md`'s "Known non-goopg limitation" section (now has two entries)
+  since **WP-R7** (M0120-0004) will hit the identical failure — do not
+  re-diagnose it there. No new goopg bugs discovered this loop (no deferral
+  ledger row needed). No Go code changed (pure harness execution +
+  fix_plan/CHECKLIST bookkeeping), so no build/test/pgbench gates apply beyond
+  `make ralph-state-guard`.
 - [ ] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
   `option get`, raw SELECT, `db size`/`core version`).
 - [ ] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
