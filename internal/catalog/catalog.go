@@ -13162,6 +13162,55 @@ func (c *InMemory) DropUserOperator(schema, name, leftType, rightType string) bo
 	return false
 }
 
+// RegisterUserOperatorDuringRecovery is the idempotent version of
+// RegisterUserOperator used by the WAL-replay driver
+// (internal/initdb/operator_ddl_recovery.go). Unlike RegisterUserOperator it
+// takes the OID (and every cross-reference field) from the WAL record so the
+// recovered operator matches the pre-crash server exactly, and advances
+// nextOID past it so subsequent allocations do not collide. Re-applying a
+// record for an operator that already exists just overwrites it in place.
+// Mirrors RegisterRangeTypeDuringRecovery/RegisterUserAggregateDuringRecovery.
+// `schema` resolves the operator's NamespaceOID the same way
+// RegisterUserAggregateDuringRecovery does (unknown/empty → public); this
+// depends on replaySchemaDDLRecords having already restored the schema
+// registry, which the caller (replayOperatorDDLRecords) guarantees by
+// running after it. DU-002 restart-persistence follow-up (M0119-0004/
+// M0110-0001, discovered while verifying the loop #64 CREATE TYPE ... AS
+// RANGE opclass/collation follow-up — see ledger).
+func (c *InMemory) RegisterUserOperatorDuringRecovery(op *UserOperator, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperators == nil {
+		c.userOperators = make(map[string]*UserOperator)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	out := *op
+	out.NamespaceOID = nsOID
+	key := userOperatorKey(schema, op.Name, op.LeftType, op.RightType)
+	c.userOperators[key] = &out
+	c.advanceNextOIDLocked(op.OID)
+}
+
+// DropUserOperatorByOIDDuringRecovery is the recovery counterpart used for
+// replaying RecordKindDropOperator. Identical in spirit to DropUserOperator
+// but keyed by OID (DROP OPERATOR's own overload resolution already
+// happened live, so the WAL record carries the OID directly, mirroring
+// DropByOIDDuringRecovery for routines). Discards the found/not-found
+// result — replay does not care whether the operator was still present.
+func (c *InMemory) DropUserOperatorByOIDDuringRecovery(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, op := range c.userOperators {
+		if op.OID == oid {
+			delete(c.userOperators, key)
+			return
+		}
+	}
+}
+
 // ListUserOperators returns all registered user operators sorted by OID
 // (stable creation order). DU-002 (M0119-0004).
 func (c *InMemory) ListUserOperators() []*UserOperator {

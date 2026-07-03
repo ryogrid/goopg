@@ -2843,3 +2843,131 @@ select-only) PASS.
 The `CREATE`/`ALTER`/`DROP FUNCTION` and `CREATE`/`ALTER`/`DROP PROCEDURE`
 surface goopg supports at the SQL level is entirely WAL-persisted; the
 loop #73 deferral-ledger row is resolved.
+
+## Loop #65 — CREATE/DROP OPERATOR restart/WAL persistence
+
+Discovered while live-verifying loop #64's CREATE TYPE ... AS RANGE
+`subtype_opclass`/`collation` follow-up: a range type referencing a
+user-defined operator class lost that opclass across a restart. Chasing
+that down (`docs/design/0110-0001-pg-dump-tap-port.md`) surfaced a deeper,
+independent gap — `CREATE OPERATOR` itself had **zero** WAL/restart
+persistence. `catalog.InMemory.userOperators` was a pure in-memory map with
+no counterpart to the `RecordKindCreateFunction`/`RecordKindCreateRangeType`
+treatment every other DU-002 DDL family already got; a `CREATE OPERATOR`
+survived only until the next server restart, at which point `pg_operator`
+(and any opclass `AS` list referencing it) silently reverted to empty. This
+loop closes that gap for the operator itself; `CREATE OPERATOR CLASS`/
+`CREATE OPERATOR FAMILY`/pg_amop/pg_amproc member persistence remain open
+(see "Still deferred" below and the ledger) — scoped out as their own
+follow-up per the one-task-per-loop rule, since they need new struct
+surface (family FK, member lists) beyond a single object's fields.
+
+### What landed
+
+Two new WAL record kinds in `internal/wal/recovery.go`:
+`RecordKindCreateOperator` (83), `RecordKindDropOperator` (84) — the next
+free bytes after loop #64's range-type pair (81/82).
+`CreateOperatorPayload`/`EncodeCreateOperator`/`DecodeCreateOperator` follow
+the `CreateFunctionPayload` struct-based precedent (too many fields —
+OID, schema, name, left/right type, func OID, owner, commutator/negator/
+restrict/join OIDs, canmerge/canhash — for a flat positional signature).
+`DropOperator` carries the resolved OID, not name+signature, mirroring
+`RecordKindDropFunction`'s identical rationale: `DROP OPERATOR`'s own
+overload resolution (`execDropCompat`'s `"operator"` case) already ran live
+before the WAL record is written.
+
+`catalog.InMemory` gained `RegisterUserOperatorDuringRecovery` (idempotent,
+OID-preserving — takes every field, including the cross-reference OIDs,
+straight from the WAL record, advances `nextOID` past it, and re-resolves
+`NamespaceOID` from the `schema` name against the live schema registry
+rather than trusting a stored OID, mirroring
+`RegisterUserAggregateDuringRecovery`) and
+`DropUserOperatorByOIDDuringRecovery` (linear scan by OID — the registry
+only ever holds a handful of user-defined operators in practice, same
+justification `LookupUserOperatorByOID` already uses).
+
+New driver `internal/initdb/operator_ddl_recovery.go`
+(`replayOperatorDDLRecords`) mirrors `replayRangeTypeDDLRecords`
+structurally: scan `wal.ReadAll`, filter `wal.IsGoopgNativeRecord`, switch
+on the kind byte. Wired into `open.go` right after the range-type replay
+call. Unlike range types (keyed by bare name), an operator's registry key
+embeds its schema, so the recovery driver depends on schema replay having
+already run — true by construction since it's wired after every
+schema-independent replay driver that came before it in `open.go`, and
+`RegisterUserOperatorDuringRecovery`'s own schema-name-to-OID resolution
+falls back to `public` exactly like the aggregate recovery path if the
+schema isn't found (a defensive fallback, not the expected case).
+
+The executor wiring appends the WAL record at the tail end of
+`execCompatNoop`'s `"operator"` case (`internal/executor/operators_ddl.go`)
+— after the COMMUTATOR/NEGATOR two-pass back-patch completes, so the
+persisted record reflects the operator's fully-resolved final state, not an
+intermediate one. `execDropCompat`'s `"operator"` case looks the operator
+up by (schema, name, left/right type) to capture its OID *before*
+`DropUserOperator` deletes the entry, then appends
+`EncodeDropOperator(droppedOID)` — skipped if the lookup came up empty
+(mirrors the `IF EXISTS`/silent-success paths above it, which return before
+reaching this point anyway).
+
+### Live PG-compatible verification
+
+Manual server (`tmp/loop65-verify`, real `psql`/`pg_dump`, PID-file
+lifecycle per the manual-server-test-workflow convention): `CREATE FUNCTION`
++ `CREATE OPERATOR public.=#= (FUNCTION = ..., LEFTARG = int4, RIGHTARG =
+int4, COMMUTATOR = public.=#=, MERGES, HASHES)` — `pg_operator` shows it
+correctly (`oprcanmerge`/`oprcanhash` = t, `oprcom` self-referencing) and
+`pg_dump --schema-only` round-trips the exact `CREATE OPERATOR`/
+`COMMUTATOR = OPERATOR(...)`/`MERGES`/`HASHES`/`ALTER OPERATOR ... OWNER TO`
+shape. A `goopg stop`/`start` restart cycle over the same data dir
+confirmed `pg_operator` still shows it identically post-restart (OID,
+`oprcom`, flags all preserved) — repeated across two consecutive restarts.
+A second operator (`public.~~~`) confirmed the DROP side: `DROP OPERATOR`
+removes it immediately, and it stays gone across a subsequent restart
+(count 0 both before and after).
+
+### New discovery, not fixed (unrelated to persistence)
+
+`DROP OPERATOR public.=#= (int4, int4)` failed live with a spurious
+`42883 operator does not exist`, even though the identical `=#=` symbol's
+`CREATE OPERATOR` and `pg_dump` round-trip both worked correctly in the same
+session (`SELECT ... FROM pg_operator WHERE oprname = '=#='` found it). A
+plainer symbol (`~~~`) dropped cleanly. This points at a `DROP OPERATOR`
+grammar/lexer quirk mis-tokenizing an `=...=`-shaped multi-char operator
+symbol specifically in the `DROP OPERATOR name (type, type)` positional-args
+context (unlike `CREATE OPERATOR name (LEFTARG = ..., ...)`'s key-value
+context, which parses the same symbol fine) — not a registry or WAL bug.
+Out of scope for this loop (a pre-existing, narrow parser edge case
+unrelated to restart persistence); recorded in the ledger with a resume
+point (`internal/parser/lexer.go`'s operator-char class vs. whatever tokenizes
+the `DROP OPERATOR` name).
+
+### Tests
+
+`internal/wal/operator_ddl_test.go`:
+`TestEncodeDecodeCreateOperatorRoundTrip`,
+`TestEncodeDecodeDropOperatorRoundTrip`,
+`TestDecodeOperatorRejectsWrongKindAndTruncatedPayload`.
+`internal/initdb/operator_ddl_recovery_test.go`:
+`TestOperatorDDLRecoveryReplaysCreate` (full `Init`/`Open`/`Close`/`Open`
+cycle, asserts every field including cross-reference OIDs and
+`CanMerge`/`CanHash` survive), `TestOperatorDDLRecoveryReplaysDropAfterCreate`
+(CREATE then DROP replay cancels out), plus the missing-WAL-dir/nil-catalog
+guard tests mirroring the range-type recovery suite.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/wal`+`internal/catalog`+
+`internal/initdb`+`internal/executor` suites PASS; `TestPort_PgDumpConnectionSetup`
+PASS; live `goopg`/`psql`/`pg_dump` end-to-end smoke incl. two full server
+restarts (described above); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke = pre-commit hook.
+
+### Still deferred
+
+`CREATE OPERATOR CLASS`/`CREATE OPERATOR FAMILY`/pg_amop/pg_amproc member
+persistence (the loop #64 discovery's other half — `userOperatorClasses`/
+`userOperatorFamilies` and the amop/amproc member stores are all still pure
+in-memory); the range-type `canonical`/`subtype_diff` sub-item (a) remainder
+and generic `GetDefaultOpClass`-over-user-opclasses gap (sub-item (b)) from
+loop #63/#64; the `=#=`-shaped operator-symbol `DROP OPERATOR` parser quirk
+noted above.

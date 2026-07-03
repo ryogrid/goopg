@@ -1532,6 +1532,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: range type DDL replay: %w", err)
 	}
 
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+	// discovered while verifying the loop #64 CREATE TYPE ... AS RANGE
+	// opclass/collation follow-up — see ledger): restore CREATE/DROP
+	// OPERATOR objects from the WAL. Runs after schema replay (above) since,
+	// unlike range types/access methods, an operator's registry key embeds
+	// its schema name.
+	if err := replayOperatorDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: operator DDL replay: %w", err)
+	}
+
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
 	if err := registerPgSequencesView(cat); err != nil {

@@ -13691,7 +13691,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 				// Also remove the dedicated operator registry entry so pg_dump
 				// no longer re-emits it (mirrors DropCast/DropTransform).
+				droppedOID := uint32(0)
+				if existing, ok := im.LookupUserOperator(schema, opName, leftType, rightType); ok {
+					droppedOID = existing.OID
+				}
 				im.DropUserOperator(schema, opName, leftType, rightType)
+				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+				// discovered while verifying the loop #64 CREATE TYPE ... AS
+				// RANGE opclass/collation follow-up — see ledger): mirrors
+				// CREATE OPERATOR's own WAL append.
+				if droppedOID != 0 && o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperator(droppedOID)); werr != nil {
+						return fmt.Errorf("wal drop-operator: %w", werr)
+					}
+				}
 				return nil
 			}
 		}
@@ -14474,6 +14487,23 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			if hasNegator {
 				if other := im.LookupUserOperatorByOID(negatorOID); other != nil && other.NegatorOID == 0 {
 					other.NegatorOID = op.OID
+				}
+			}
+
+			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+			// discovered while verifying the loop #64 CREATE TYPE ... AS
+			// RANGE opclass/collation follow-up — see ledger): mirrors
+			// CREATE TYPE ... AS RANGE's own WAL append. op's final state
+			// (post COMMUTATOR/NEGATOR back-patch) is what gets persisted,
+			// so a restart reproduces exactly what pg_operator showed the
+			// client before the crash.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperator(wal.CreateOperatorPayload{
+					OID: op.OID, Schema: schema, Name: op.Name, LeftType: op.LeftType, RightType: op.RightType,
+					FuncOID: op.FuncOID, Owner: op.Owner, CommutatorOID: op.CommutatorOID, NegatorOID: op.NegatorOID,
+					RestrictOID: op.RestrictOID, JoinOID: op.JoinOID, CanMerge: op.CanMerge, CanHash: op.CanHash,
+				})); werr != nil {
+					return fmt.Errorf("wal create-operator: %w", werr)
 				}
 			}
 		}
