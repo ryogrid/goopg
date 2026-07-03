@@ -6825,6 +6825,81 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
+	// ALTER VIEW name RENAME TO / OWNER TO / SET SCHEMA — same treatment as
+	// ALTER SEQUENCE (DU-002 slice 439): a view is just a relation
+	// (pg_class.relkind='v'), and real PostgreSQL backs all three with the
+	// same generic commands (RenameRelation/AlterTableOwner/
+	// AlterTableNamespace, postgres/src/backend/commands/tablecmds.c), so
+	// they reuse the generic relation executor (execAlterTable) exactly like
+	// the materialized-view SET SCHEMA case above. Previously ALTER VIEW had
+	// no dedicated case at all here, so it fell into the blanket
+	// "schema/view/collation/..." compat-stub loop below, which silently
+	// consumed and discarded RENAME/OWNER/SET SCHEMA — a functional no-op,
+	// not merely a mistagging bug. DU-002 slice 440.
+	if p.acceptKeyword(KwView) {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if p.acceptIdentKeyword("rename") && p.acceptKeyword(KwTo) {
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			renameStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			renameStmt.Actions = append(renameStmt.Actions, AlterTableAction{
+				pos:     newNameTok.Pos,
+				Kind:    AlterTableRenameTable,
+				NewName: identText(newNameTok),
+			})
+			return renameStmt, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+			// bootstrap superuser in goopg (mirrors ALTER SEQUENCE/TABLE OWNER TO).
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.OwnerTo = ""
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.OwnerTo = identText(tok)
+			}
+			if ownerStmt.OwnerTo == "" {
+				ownerStmt.OwnerTo = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			return &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, SetSchema: identText(schemaTok), TagOverride: "ALTER VIEW"}, nil
+		}
+		// Other ALTER VIEW forms (RENAME COLUMN, ALTER COLUMN ... SET/DROP
+		// DEFAULT, SET/RESET reloptions) are not yet modeled — consume as a
+		// no-op like the pre-existing compat stub did for everything (see
+		// deferral ledger).
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
 	// ALTER OPERATOR name (left_type, right_type) SET (option = value, ...) —
 	// PG's post-creation attribute-edit form (AlterOperator, operatorcmds.c).
 	// Checked before the generic operator compat-stub loop below (which would
@@ -7077,10 +7152,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return nil, p.errAtCur("expected DISABLE, ENABLE, RENAME TO, or OWNER TO in ALTER EVENT TRIGGER")
 	}
-	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
-	// SYSTEM — compatibility stubs. Consume until end of statement.
+	// ALTER SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
+	// SYSTEM — compatibility stubs. Consume until end of statement. (ALTER
+	// VIEW has its own dedicated case above, DU-002 slice 440 — "view" is
+	// intentionally not in this list.)
 	for _, objIdent := range []string{
-		"schema", "view",
+		"schema",
 		"collation", "domain", "extension", "language",
 		"operator", "system",
 	} {

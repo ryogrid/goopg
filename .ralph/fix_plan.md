@@ -325,6 +325,50 @@ prev-link fixes.
       SEQUENCE`) never validates the target role exists. Resume for
       `002-010` proper remains the next catalog-getter gap surfaced by
       `TestPort_PgDumpConnectionSetup`.
+      **2026-07-04 (loop #100, DU-002 slice 440): `ALTER VIEW ... RENAME TO /
+      OWNER TO / SET SCHEMA` were not just mistagged but fully silent
+      no-ops — now they actually apply.** Following up on slice 439's
+      prediction (1) above, auditing `ALTER VIEW` found something worse than
+      mistagging: `internal/parser/ddl.go`'s `parseAlter` had NO dedicated
+      case for plain `ALTER VIEW` at all (only `ALTER MATERIALIZED VIEW`), so
+      every `ALTER VIEW` form — including RENAME TO/OWNER TO/SET SCHEMA —
+      fell into the blanket "schema/view/collation/domain/extension/
+      language/operator/system" compat-stub loop, which parses successfully
+      but just consumes the tokens and returns an empty `*AlterTableStmt`
+      with no `Name` and no actions: the statement silently did nothing.
+      Fixed by giving `ALTER VIEW` its own case (mirroring the slice-439
+      `ALTER SEQUENCE` pattern exactly — a view is just a relation,
+      `pg_class.relkind='v'`, and real PG backs all three with the same
+      generic `RenameRelation`/`AlterTableOwner`/`AlterTableNamespace`
+      commands), reusing `execAlterTable` and tagging via the existing
+      `AlterTableStmt.TagOverride = "ALTER VIEW"`. Removed `"view"` from the
+      now-dead catch-all list. Other `ALTER VIEW` forms (RENAME COLUMN,
+      ALTER COLUMN SET/DROP DEFAULT, SET/RESET reloptions) still fall to the
+      no-op stub — deferred, see ledger. Tests: `TestAlterViewRenameTo`/
+      `OwnerTo`/`OwnerToCurrentUser`/`SetSchema`
+      (`internal/executor/operators_alter_view_relation_ops_test.go`,
+      asserting the catalog `Table.View` survives the rename/move and a
+      post-change `SELECT` against the view still returns the right rows —
+      not just that the catalog key moved); 3 new cases in
+      `TestDDLCommandTagMatchesPostgres`
+      (`internal/server/ddl_command_tag_test.go`). Design doc "Follow-up:
+      `ALTER VIEW ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops
+      (DU-002 slice 440)". Gates: build/vet clean; `internal/parser`+
+      `internal/executor`+`internal/server` suites PASS (full, no
+      regressions); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): (1) `ALTER
+      MATERIALIZED VIEW ... SET SCHEMA` and `ALTER INDEX ... RENAME TO`
+      still carry the pre-existing tag-mistagging bug noted in slice 439's
+      deferral — not touched by this loop, which only fixed the functional
+      no-op for plain `ALTER VIEW`. (2) `ALTER VIEW` sub-forms other than
+      RENAME TO/OWNER TO/SET SCHEMA (RENAME COLUMN, ALTER COLUMN ... SET/DROP
+      DEFAULT, SET/RESET reloptions) still silently no-op — not modeled at
+      all. (3) Plain `ALTER SCHEMA ... RENAME TO / OWNER TO` has an identical
+      (arguably worse) gap — there is no `RenameSchema`/schema-owner
+      mechanism anywhere in the catalog, so it isn't a quick AlterTableStmt
+      reuse like sequences/views; it needs real pg_namespace-rename support
+      first. Out of scope for this bounded loop (Effort-L: new catalog
+      capability, not a parser-routing fix).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

@@ -50,6 +50,14 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		{"alter sequence rename to", `ALTER SEQUENCE my_seq RENAME TO my_seq2`, "ALTER SEQUENCE"},
 		{"alter sequence owner to", `ALTER SEQUENCE my_seq OWNER TO CURRENT_USER`, "ALTER SEQUENCE"},
 		{"alter sequence set schema", `ALTER SEQUENCE my_seq SET SCHEMA my_schema`, "ALTER SEQUENCE"},
+		// DU-002 slice 440: ALTER VIEW RENAME TO/OWNER TO/SET SCHEMA get the
+		// same AlterTableStmt-reuse + TagOverride treatment as ALTER SEQUENCE
+		// above (a view is just a relation too) — previously these fell into
+		// the blanket "schema/view/collation/..." compat-stub loop, which
+		// both mistagged AND silently discarded the change entirely.
+		{"alter view rename to", `ALTER VIEW my_view RENAME TO my_view2`, "ALTER VIEW"},
+		{"alter view owner to", `ALTER VIEW my_view OWNER TO CURRENT_USER`, "ALTER VIEW"},
+		{"alter view set schema", `ALTER VIEW my_view SET SCHEMA my_schema`, "ALTER VIEW"},
 	}
 
 	for _, tc := range cases {
