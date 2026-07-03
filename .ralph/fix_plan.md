@@ -7839,7 +7839,7 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   See `wp/verification/FLOW.md §1a` for the exact command sequence
   (`.ralph/working_set.md` had been reset to idle by a later loop). Next:
   M0120-0002 (execute + capture write items WP-01…WP-16).
-- [ ] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
+- [x] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
   post-meta, taxonomy, term-meta, user create/update). Store per-item evidence
   under `wp/verification/results/<ts>/`; record each confirming read.
   **2026-07-03 (loop): BLOCKED before completion.** Driver script written
@@ -7871,6 +7871,24 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   added to `.claude/settings.local.json` — that edit is pending explicit user
   authorization because the auto-mode classifier blocks self-modification of
   permission settings.
+  **2026-07-04 (loop): DONE.** Re-ran `driver_wp01_16.sh` against the reset
+  schema (`wp/verification/results/20260704-072755/`, see `summary.md` there
+  for the full per-item table). 13/16 PASS. Two failures: **WP-13** ("Invalid
+  taxonomy category") classed `harness` — it targets `pageID` with the
+  `category` taxonomy, which WP core never registers for `page` objects (fails
+  identically on real WordPress; `CHECKLIST.md` needs a `post`-type target
+  instead, not a goopg fix). **WP-02/WP-03** (`post update`/`post delete`
+  trash, no `--force`) classed **goopg-bug**: both crash the backend
+  connection with a recurring panic (`index out of range [1] with length 1`
+  in `evalFastExpr`/`Slot.Get`, `internal/executor/opnode.go:99` +
+  `exprnode.go:222`, via `filterOpNext`) while re-assigning the post's
+  existing category (`wp_set_post_categories` → `SELECT term_taxonomy_id FROM
+  wp_term_relationships WHERE object_id=? AND term_taxonomy_id=?`). Confirmed
+  NOT new — `wp/goopg-wp.log` has 8 occurrences of the identical stack back to
+  2026-07-02, never previously ledgered. Full repro sequence, stack trace, and
+  resume point in `.ralph/deferral_ledger.md` (2026-07-04, M0120-0002 row);
+  seeded as **M0121-0002** below (M0121-0001's per-failure seeding, done a
+  loop early since the crash is high-value to not lose).
 - [ ] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
   role/delete, comments + comment-meta, options/transients incl. the TOAST-sized
   value WP-28, plugin activate/deactivate, raw INSERT/UPDATE/DELETE via
@@ -7902,3 +7920,25 @@ gate for concurrency-critical packages.
   passes its confirming read on a fresh run and a regression test guards it.
   Failures classed `pg4wp-limitation`/`harness` are documented, not fixed in
   goopg.
+- [ ] **M0121-0002 — Fix backend panic on `post update`/`post delete` (trash)
+  default-category reassignment.** Seeded from M0120-0002 (deferral ledger row
+  2026-07-04). `wp_set_post_categories`'s `SELECT term_taxonomy_id FROM
+  wp_term_relationships WHERE object_id=? AND term_taxonomy_id=?` panics with
+  `index out of range [1] with length 1` in `evalFastExpr`'s `ExprColumnRef`
+  case (`internal/executor/exprnode.go:222`) via `filterOpNext`
+  (`internal/executor/opnode.go:717`) — a compiled filter's column index
+  doesn't match a narrower slot (suspect an index-only/projected scan of
+  `wp_term_relationships` not remapping the residual filter's `ColumnRef`
+  index, or a plan/expr-slab reuse issue — a single fresh `psql` connection
+  running the isolated SQL text does NOT reproduce it, so bisect using the
+  full statement sequence in `wp/verification/results/20260704-072755/WP-02/
+  goopg_statements.log`, starting from the preceding `UPDATE wp_posts`, not
+  the bare SELECT). Requires a race/regression-gated executor session per the
+  WAL/MVCC practice card (filter/projection column-index correctness is
+  plan-level, not WAL, but treat evalFastExpr changes with the same care as
+  sibling-path fixes — cross-check `evalExprSlot`, the interpreted-evaluator
+  twin, stays in sync). Add a minimal Go-level regression test once
+  root-caused (a 3-column table + PK/composite-index scan projecting one
+  column + a residual filter on the second column is likely sufficient,
+  no WordPress/PG4WP required). Re-verify via `driver_wp01_16.sh` WP-02/WP-03
+  and close the ledger row.
