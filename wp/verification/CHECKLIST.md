@@ -51,6 +51,18 @@ WP-CLI's `db` command family (also out of scope). Classify as **harness/PG4WP
 limitation**, never as a goopg bug — see
 `wp/verification/results/20260704-073700/summary.md` for the full repro.
 
+**Third known non-goopg limitation** (found in M0120-0004, item WP-R8's `wp db
+size --tables` sub-step): the vendored PG4WP rewriter
+`rewriters/ShowTablesSQLRewriter.php` builds its query with a **single-quoted**
+PHP string literal (`'SELECT tablename FROM pg_tables WHERE schemaname =
+\'$schema\';'`), so the `$schema` PHP variable is never interpolated — goopg
+receives the literal text `$schema` as the filter value, correctly matches
+zero rows, and `db size --tables` prints a header with no table rows (exit 0,
+no visible error). goopg's execution of the query it actually received is
+correct; the defect is entirely upstream in PG4WP. Classify as **PG4WP
+limitation**, never as a goopg bug — see
+`wp/verification/results/20260704-075221/summary.md` for the full repro.
+
 ---
 
 ## A. Posts & pages (write)

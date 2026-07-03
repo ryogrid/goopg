@@ -7909,8 +7909,24 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   ledger row needed). No Go code changed (pure harness execution +
   fix_plan/CHECKLIST bookkeeping), so no build/test/pgbench gates apply beyond
   `make ralph-state-guard`.
-- [ ] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
-  `option get`, raw SELECT, `db size`/`core version`).
+- [x] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
+  `option get`, raw SELECT, `db size`/`core version`). **Completed
+  2026-07-04**: wrote `wp/verification/driver_wpr1_r8.sh` (new, mirrors the
+  prior two drivers) and ran it against the live stack from M0120-0002/0003,
+  results + triage in `wp/verification/results/20260704-075221/summary.md`.
+  7/9 sub-steps PASS; 2 FAIL, both **pre-existing/newly-confirmed pg4wp
+  limitations, not goopg bugs**: WP-R7 (`db query "SELECT COUNT(*) ..."`)
+  fails identically to WP-32 (mysql-CLI handshake against goopg's PG port,
+  confirmed via zero statement-log traffic), as predicted in M0120-0003's
+  working_set carry. WP-R8's `db size --tables` sub-step is a **new**
+  non-goopg finding: PG4WP's `ShowTablesSQLRewriter.php` builds its query with
+  a single-quoted PHP string, so `$schema` is never interpolated and goopg
+  correctly returns zero rows for the literal (bogus) schema name `$schema`
+  — goopg's execution is correct, the bug is entirely in the vendored PG4WP
+  rewriter. Added a third bullet to `CHECKLIST.md`'s "Known non-goopg
+  limitation" section. No new goopg bugs, no deferral-ledger row needed. No Go
+  code changed (pure harness execution + fix_plan/CHECKLIST bookkeeping), so
+  no build/test/pgbench gates apply beyond `make ralph-state-guard`.
 - [ ] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
   each FAIL (`goopg-bug`/`goopg-missing`/`pg4wp-limitation`/`harness`, FLOW.md
   §4); for every goopg failure append a `.ralph/deferral_ledger.md` row and file
