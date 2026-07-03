@@ -7236,6 +7236,58 @@ documentation-only and is exempt from the design-doc requirement.)
       of the bounded scope); discovery (1) above (`ALTER CONSTRAINT ...
       ENFORCED`'s missing phase-3 dangling-reference scan) remains
       untouched, unrelated to this row.
+      **2026-07-04 (DU-002 slice 433 follow-up, 2nd pass): `ALTER TABLE ...
+      DROP CONSTRAINT` for EXCLUDE LANDED — closes the EXCLUDE gap flagged
+      above.** `execAlterTableDropConstraint` gained a fifth search branch
+      (CHECK → FOREIGN KEY → UNIQUE → EXCLUDE → PRIMARY KEY), scanning
+      `IndexesOnTable` for `idx.IsExclusion`; new
+      `catalog.InMemory.DropExclusionConstraint` shares the `dropIndexByName`
+      helper with `DropUniqueConstraint`/`DropPrimaryKeyConstraint`. Test:
+      `TestDropConstraintForeignKeyAndUnique/Exclude`. Gates: build clean;
+      `internal/catalog`+`internal/executor`+`internal/parser` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook.
+      `execAlterTableDropConstraint` now covers all five constraint kinds
+      `pg_constraint`'s name lookup can return. Discovery (1) above (`ALTER
+      CONSTRAINT ... ENFORCED`'s missing phase-3 scan) remains open.
+      **2026-07-04 (DU-002 slice 433, item (1)): real phase-3
+      dangling-reference scan for `VALIDATE CONSTRAINT` /
+      `ALTER CONSTRAINT ... ENFORCED` LANDED — closes discovery (1), the
+      last open item from the original slice 433 row.** Live-verified
+      against a scratch PostgreSQL 18.3 instance first: both DDL forms
+      really do scan existing rows and reject a dangling reference with the
+      same `23503` shape an `INSERT` would raise; confirmed the source in
+      `tablecmds.c` (`ATExecValidateConstraint`'s `QueueFKConstraintValidation`
+      gated on `!convalidated`, and `ATExecAlterConstrEnforceability`'s
+      "Create triggers" branch, gated on `conenforced` actually changing,
+      building an equivalent inline phase-3 entry — both run
+      `validateForeignKeyConstraint`). New `(*ddlOp)
+      validateFKConstraintExistingRows` (`internal/executor/operators_ddl.go`,
+      next to `nonFKConstraintExists`) walks the child table's heap with the
+      same simplified liveness scan `collectBTreeEntries` uses for `CREATE
+      INDEX` bulk build, and calls the existing `assertParentExists` per row
+      (same function `INSERT` uses, so the error shape is byte-identical).
+      `VALIDATE CONSTRAINT` gates the scan on `NotValid` (already-valid FK is
+      a no-op); `execAlterTableAlterConstraint` gates it on the
+      enforceability actually transitioning AND only the NOT ENFORCED →
+      ENFORCED direction (matching PG's own gates). On violation, the flags
+      are left unchanged. Fixed a pre-existing test bug found along the way:
+      `TestFKAlterConstraint/NotEnforcedThenEnforced` expected a dangling
+      re-ENFORCED to silently succeed — never real PG behavior, an artifact
+      of the old flag-only-flip shortcut; updated to assert the correct
+      rejection. Tests: `TestFKAlterConstraint/NotEnforcedThenEnforced`
+      (updated) + new `TestValidateConstraintRealPhase3Scan` (3 subtests).
+      Design doc `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up:
+      real phase-3 dangling-reference scan for `VALIDATE CONSTRAINT` /
+      `ALTER CONSTRAINT ... ENFORCED` (DU-002 slice 433, item (1))";
+      `docs/design/README.md` row `0110-0001` addendum appended. Gates:
+      `go build ./...`/`go vet ./internal/executor/...` clean;
+      `internal/executor` suite PASS (full, `-count=1`, no regression);
+      `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, elapsed
+      27.40s/94.13s); pgbench smoke = pre-commit hook. No new deferral —
+      the constraint-DDL work opened across slices 430–433 has no further
+      known deferrals in this ledger thread.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

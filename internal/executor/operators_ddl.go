@@ -6725,21 +6725,35 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				return err
 			}
-			// Flip the constraint's convalidated flag from 'f' to 't'. The
-			// only validatable constraint goopg models is the FK (NOT VALID);
-			// a CHECK NOT VALID is accepted but already enforced. An unknown
-			// name matches PostgreSQL's error. A NOT ENFORCED FK cannot be
-			// validated at all — mirrors ATExecValidateConstraint's own guard
-			// (tablecmds.c:12955 `if (!con->conenforced) ereport(ERROR, ...
-			// "cannot validate NOT ENFORCED constraint")`, SQLSTATE
-			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE = 55000). DU-002 slice 431.
+			// Validate and flip the constraint's convalidated flag from 'f' to
+			// 't'. The only validatable constraint goopg models is the FK
+			// (NOT VALID); a CHECK NOT VALID is accepted but already
+			// enforced. An unknown name matches PostgreSQL's error. A NOT
+			// ENFORCED FK cannot be validated at all — mirrors
+			// ATExecValidateConstraint's own guard (tablecmds.c:12955
+			// `if (!con->conenforced) ereport(ERROR, ... "cannot validate
+			// NOT ENFORCED constraint")`, SQLSTATE
+			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE = 55000). DU-002 slice
+			// 431; real phase-3 data scan added DU-002 slice 433 2nd
+			// enforceability follow-up.
 			found := false
 			for i := range tbl.ForeignKeys {
 				if strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
 					if tbl.ForeignKeys[i].NotEnforced {
 						return &ExecError{Code: "55000", Pos: act.Pos(), Message: "cannot validate NOT ENFORCED constraint"}
 					}
-					tbl.ForeignKeys[i].NotValid = false
+					if tbl.ForeignKeys[i].NotValid {
+						// Real phase-3 dangling-reference scan (validateForeignKeyConstraint,
+						// tablecmds.c), gated exactly like PG's `if (!con->convalidated)`
+						// in ATExecValidateConstraint — an already-valid FK is a no-op.
+						if err := o.validateFKConstraintExistingRows(tbl, tbl.ForeignKeys[i]); err != nil {
+							if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+								ee.Pos = act.Pos()
+							}
+							return err
+						}
+						tbl.ForeignKeys[i].NotValid = false
+					}
 					found = true
 					break
 				}
@@ -8754,9 +8768,11 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 // tablecmds.c): going NOT ENFORCED marks it unvalidated for consistency, and
 // going back to ENFORCED marks it validated again. Real PG performs an actual
 // phase-3 data scan on that ENFORCED transition and errors on a dangling
-// reference; goopg does not model that scan here, mirroring the same
-// simplification VALIDATE CONSTRAINT already makes (flag-flip only, no data
-// re-check) rather than introducing a second, inconsistent semantics.
+// reference (ATExecAlterConstrEnforceability's inline phase-3 NewConstraint
+// queue entry, live-verified against PostgreSQL 18.3); goopg now runs the
+// same scan via validateFKConstraintExistingRows before flipping the flags,
+// matching VALIDATE CONSTRAINT's own real scan (DU-002 slice 433 2nd
+// enforceability follow-up).
 // DU-002 slice 433.
 func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
 	for i := range tbl.ForeignKeys {
@@ -8768,8 +8784,29 @@ func (o *ddlOp) execAlterTableAlterConstraint(tbl *catalog.Table, act parser.Alt
 			tbl.ForeignKeys[i].InitiallyDeferred = act.AlterConstraintInitiallyDeferred
 		}
 		if act.AlterConstraintHasEnforceability {
-			tbl.ForeignKeys[i].NotEnforced = !act.AlterConstraintEnforced
-			tbl.ForeignKeys[i].NotValid = !act.AlterConstraintEnforced
+			wasEnforced := !tbl.ForeignKeys[i].NotEnforced
+			// Real PG only queues the phase-3 dangling-reference scan and
+			// touches convalidated when enforceability actually changes
+			// (`if (currcon->conenforced != cmdcon->is_enforced)`,
+			// ATExecAlterConstrEnforceability); re-asserting the current
+			// state is a no-op, matching VALIDATE CONSTRAINT's own
+			// already-valid no-op above.
+			if wasEnforced != act.AlterConstraintEnforced {
+				if act.AlterConstraintEnforced {
+					// NOT ENFORCED → ENFORCED: real phase-3 scan
+					// (ATExecAlterConstrEnforceability's inline
+					// NewConstraint phase-3 queue entry, "Create
+					// triggers" branch), same as VALIDATE CONSTRAINT's.
+					if err := o.validateFKConstraintExistingRows(tbl, tbl.ForeignKeys[i]); err != nil {
+						if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+							ee.Pos = act.Pos()
+						}
+						return err
+					}
+				}
+				tbl.ForeignKeys[i].NotEnforced = !act.AlterConstraintEnforced
+				tbl.ForeignKeys[i].NotValid = !act.AlterConstraintEnforced
+			}
 		}
 		return nil
 	}
@@ -8813,6 +8850,74 @@ func (o *ddlOp) nonFKConstraintExists(tbl *catalog.Table, name string) bool {
 		}
 	}
 	return false
+}
+
+// validateFKConstraintExistingRows scans every live row of fkOwnerTbl and, for
+// each non-null FK key value, checks that a matching parent row exists —
+// mirroring PostgreSQL's validateForeignKeyConstraint (tablecmds.c), which
+// scans the referencing table under RegisterSnapshot(GetLatestSnapshot()) and
+// fires RI_FKey_check_ins per row as if it had just been inserted. Two DDL
+// paths queue this exact scan in real PG: VALIDATE CONSTRAINT
+// (QueueFKConstraintValidation, gated on !convalidated) and ALTER TABLE …
+// ALTER CONSTRAINT … ENFORCED transitioning NOT ENFORCED → ENFORCED
+// (ATExecAlterConstrEnforceability's inline phase-3 NewConstraint, gated on
+// the enforceability actually changing) — both call sites below apply the
+// same gating before invoking this helper. The heap walk mirrors
+// collectBTreeEntries's simplified "Xmin valid, Xmax invalid" liveness check
+// (no snapshot MVCC visibility), the established pattern for DDL-time
+// existing-row scans in this codebase (CREATE INDEX bulk build). Returns the
+// first 23503 violation found, same error shape as an ordinary INSERT FK
+// check (assertParentExists), matching real PG's ri_ReportViolation format.
+func (o *ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk catalog.ForeignKey) error {
+	rel := o.ctx.Catalog.RelFileNode(fkOwnerTbl)
+	nBlocks, err := o.ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	sctx := mctx.Acquire(o.ctx.Mctx, mctx.KindExpr)
+	defer sctx.Release()
+	var scanRow Row
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			o.ctx.Pool.Unpin(slot)
+			continue
+		}
+		count, err := storage.PageLinePointerCount(page)
+		if err != nil {
+			o.ctx.Pool.Unpin(slot)
+			return &ExecError{Code: "XX000", Message: err.Error()}
+		}
+		for i := uint16(1); i <= uint16(count); i++ {
+			tuple, terr := storage.PageGetHeapTuple(page, i)
+			if terr != nil {
+				continue
+			}
+			if tuple.Header.Xmin == storage.InvalidTransactionID || tuple.Header.Xmax != storage.InvalidTransactionID {
+				continue
+			}
+			if scanRow == nil || len(scanRow) != len(fkOwnerTbl.Columns) {
+				scanRow = make(Row, len(fkOwnerTbl.Columns))
+			}
+			if decErr := DecodeHeapTupleRowInto(scanRow, fkOwnerTbl.Columns, tuple, sctx); decErr != nil {
+				continue
+			}
+			vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, scanRow)
+			if allNull {
+				continue
+			}
+			if perr := assertParentExists(o.ctx, fkOwnerTbl, nil, fk, vals); perr != nil {
+				o.ctx.Pool.Unpin(slot)
+				return perr
+			}
+		}
+		o.ctx.Pool.Unpin(slot)
+	}
+	return nil
 }
 
 // pkConstraintRef is a (tableOID, constraintName, tableName) triple recording

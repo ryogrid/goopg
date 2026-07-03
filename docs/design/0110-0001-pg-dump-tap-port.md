@@ -12441,3 +12441,104 @@ five constraint kinds `pg_constraint`'s name lookup can return (CHECK,
 FOREIGN KEY, UNIQUE, EXCLUDE, PRIMARY KEY). Deferred item (1) of slice 433's
 original row (the missing phase-3 dangling-reference scan on `ALTER
 CONSTRAINT ... ENFORCED`) remains open, untouched by this loop.
+
+## Follow-up: real phase-3 dangling-reference scan for `VALIDATE CONSTRAINT` / `ALTER CONSTRAINT ... ENFORCED` (DU-002 slice 433, item (1))
+
+### Problem
+
+Slice 433's original row deferred item (1): both `VALIDATE CONSTRAINT` and
+`ALTER TABLE ... ALTER CONSTRAINT ... ENFORCED` only flipped the FK's
+`NotValid`/`NotEnforced` flags without re-checking existing rows against the
+referenced table — a data-integrity gap, since a row that became dangling
+while the constraint was `NOT VALID`/`NOT ENFORCED` would silently survive
+re-validation/re-enforcement. Live-verified against a scratch PostgreSQL 18.3
+instance (`postgres/local_install`) before implementing: both DDL forms
+**do** perform a real scan and reject on a dangling reference —
+
+```
+ALTER TABLE child ALTER CONSTRAINT child_pid_fkey ENFORCED;
+ERROR:  insert or update on table "child" violates foreign key constraint "child_pid_fkey"
+DETAIL:  Key (pid)=(999) is not present in table "parent".
+```
+
+Reading `tablecmds.c` confirmed the source of that scan for both entry
+points: `ATExecValidateConstraint` calls `QueueFKConstraintValidation` when
+`!con->convalidated`, and `ATExecAlterConstrEnforceability`'s "Create
+triggers" branch (taken only when `changed`, i.e. `conenforced` actually
+transitions) builds an equivalent inline `NewConstraint` phase-3 queue entry.
+Both ultimately run `validateForeignKeyConstraint`, which scans the
+referencing table under `RegisterSnapshot(GetLatestSnapshot())` and fires
+`RI_FKey_check_ins` per row as if it had just been inserted — the same
+per-row parent-exists check an ordinary `INSERT` runs, just applied
+retroactively to every existing row.
+
+### Fix
+
+New `(*ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk
+catalog.ForeignKey) error` (`internal/executor/operators_ddl.go`, next to
+`nonFKConstraintExists`) walks every heap page of `fkOwnerTbl` with the same
+simplified liveness check `collectBTreeEntries` already uses for `CREATE
+INDEX` bulk build (`Xmin` valid, `Xmax` invalid — no snapshot MVCC
+visibility, the established pattern for DDL-time existing-row scans in this
+codebase), decodes each live row, extracts the FK column values
+(`fkColValues`), and calls the existing `assertParentExists` helper per row —
+the exact same function an `INSERT` uses, so the error shape (`23503`,
+message, `DETAIL`) is byte-identical to a live `INSERT` violation.
+
+Both call sites now gate on this scan exactly like real PG gates the phase-3
+queue entry:
+
+- `VALIDATE CONSTRAINT` (`internal/executor/operators_ddl.go`,
+  `AlterTableValidateConstraint` case): scans only `if
+  tbl.ForeignKeys[i].NotValid` (mirrors `if (!con->convalidated)`); an
+  already-valid FK is a no-op, matching PG's `InvalidObjectAddress` return.
+- `execAlterTableAlterConstraint`: scans only when enforceability actually
+  transitions (`wasEnforced != act.AlterConstraintEnforced`, mirrors `if
+  (currcon->conenforced != cmdcon->is_enforced)`), and only on the NOT
+  ENFORCED → ENFORCED direction (mirrors PG only queuing phase-3 validation
+  in the "Create triggers" branch, not the "Drop triggers" branch). Both
+  transitions still touch `NotEnforced`/`NotValid`; the scan is only inserted
+  ahead of the ENFORCED direction. On violation, the flags are left
+  unchanged (the function returns before flipping them), so a rejected
+  re-ENFORCED leaves the constraint exactly as it was — matching PG's
+  transaction-abort semantics (the whole `ALTER TABLE` statement fails, no
+  partial catalog update persists).
+
+No change was needed to `pg_constraint`/`pg_get_constraintdef` — both already
+read the mutated `NotValid`/`NotEnforced` fields generically.
+
+### Tests
+
+`internal/executor/operators_fk_alter_constraint_test.go`:
+
+- `TestFKAlterConstraint/NotEnforcedThenEnforced` updated: the pre-existing
+  flow left a dangling row `(2, 999)` inserted during the NOT ENFORCED
+  window, then flipped back to ENFORCED expecting success — that expectation
+  was itself wrong relative to real PG (confirmed live above), so the test
+  now asserts the re-ENFORCED attempt is rejected with `23503` while the
+  dangling row remains, then clears the row and asserts the same ALTER
+  succeeds.
+- New `TestValidateConstraintRealPhase3Scan`, three subtests:
+  `ValidateConstraintRejectsDanglingRow` (NOT VALID FK with a pre-existing
+  dangling row → `VALIDATE CONSTRAINT` rejects with `23503`/`DETAIL`
+  mentioning the dangling key, `NotValid` stays `true`; fixing the data and
+  re-running succeeds), `ValidateConstraintAlreadyValidIsNoOp` (a
+  fully-enforced FK's redundant `VALIDATE CONSTRAINT` no-ops), and
+  `AlterConstraintEnforcedNoOpWhenAlreadyEnforced` (re-asserting `ENFORCED`
+  on an already-enforced FK is a no-op, pinning down the `changed` gate).
+
+### Gates
+
+`go build ./...`/`go vet ./internal/executor/...` clean; `internal/executor`
+suite PASS (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+pre-commit hook; live scratch PostgreSQL 18.3 instance used to confirm the
+target behavior before implementing (see the `ERROR`/`DETAIL` transcript
+above).
+
+### Deferred
+
+None new — this closes item (1), the last open item from slice 433's
+original deferral row. The FK/CHECK/EXCLUDE/UNIQUE/PRIMARY KEY constraint
+DDL surface opened across slices 430–433 has no further known deferrals in
+this ledger thread.

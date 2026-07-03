@@ -84,9 +84,25 @@ func TestFKAlterConstraint(t *testing.T) {
 			t.Fatalf("INSERT with dangling FK reference under NOT ENFORCED should succeed, got: %v", err)
 		}
 
-		// Flip back to ENFORCED: pg_get_constraintdef must drop the trailer
-		// entirely (real PG also re-validates convalidated='t' — this
-		// simplification mirrors VALIDATE CONSTRAINT's own flag-only flip).
+		// Flipping back to ENFORCED now runs a real phase-3 dangling-reference
+		// scan (validateForeignKeyConstraint equivalent, live-verified against
+		// PostgreSQL 18.3) and must reject the dangling row (2, 999) left
+		// behind by the NOT ENFORCED window above, leaving the flags
+		// untouched (the ALTER fails before flipping them).
+		err = runDDL(t, ctx, `ALTER TABLE acfk_child ALTER CONSTRAINT acfk_fk ENFORCED`)
+		ee, ok = err.(*ExecError)
+		if !ok || ee.Code != "23503" {
+			t.Fatalf("expected 23503 re-ENFORCED over a dangling reference, got: %v", err)
+		}
+		if !tbl.ForeignKeys[0].NotEnforced || !tbl.ForeignKeys[0].NotValid {
+			t.Fatalf("expected NotEnforced=true NotValid=true unchanged after rejected re-ENFORCED, got %+v", tbl.ForeignKeys[0])
+		}
+
+		// Clear the dangling reference, then the same re-ENFORCED succeeds:
+		// pg_get_constraintdef must drop the trailer entirely.
+		if err := runDDL(t, ctx, `DELETE FROM acfk_child WHERE id = 2`); err != nil {
+			t.Fatalf("DELETE dangling row: %v", err)
+		}
 		if err := runDDL(t, ctx, `ALTER TABLE acfk_child ALTER CONSTRAINT acfk_fk ENFORCED`); err != nil {
 			t.Fatalf("ALTER CONSTRAINT ... ENFORCED: %v", err)
 		}
@@ -158,6 +174,113 @@ func TestFKAlterConstraint(t *testing.T) {
 		ee, ok := err.(*ExecError)
 		if !ok || ee.Code != "42704" {
 			t.Fatalf("expected 42704 undefined_object, got: %v", err)
+		}
+	})
+}
+
+// TestValidateConstraintRealPhase3Scan covers the follow-up to DU-002 slice
+// 433: `VALIDATE CONSTRAINT` and `ALTER CONSTRAINT ... ENFORCED` now perform a
+// real per-row dangling-reference scan (validateFKConstraintExistingRows),
+// mirroring PostgreSQL's validateForeignKeyConstraint (tablecmds.c), instead
+// of the old flag-only flip. Both entry points share the same scan helper.
+func TestValidateConstraintRealPhase3Scan(t *testing.T) {
+	t.Run("ValidateConstraintRejectsDanglingRow", func(t *testing.T) {
+		ctx, cat, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE vcs_parent (id integer PRIMARY KEY)`); err != nil {
+			t.Fatalf("CREATE TABLE vcs_parent: %v", err)
+		}
+		if err := runDDL(t, ctx, `CREATE TABLE vcs_child (id integer, pid integer)`); err != nil {
+			t.Fatalf("CREATE TABLE vcs_child: %v", err)
+		}
+		if err := runDDL(t, ctx, `INSERT INTO vcs_child VALUES (1, 999)`); err != nil {
+			t.Fatalf("INSERT dangling row before FK exists: %v", err)
+		}
+		if err := runDDL(t, ctx, `ALTER TABLE vcs_child ADD CONSTRAINT vcs_fk FOREIGN KEY (pid) REFERENCES vcs_parent(id) NOT VALID`); err != nil {
+			t.Fatalf("ADD CONSTRAINT ... NOT VALID: %v", err)
+		}
+
+		// Real PG scans existing rows and rejects — same 23503 shape as an
+		// ordinary INSERT FK violation.
+		err := runDDL(t, ctx, `ALTER TABLE vcs_child VALIDATE CONSTRAINT vcs_fk`)
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "23503" {
+			t.Fatalf("expected 23503 on VALIDATE CONSTRAINT over a dangling row, got: %v", err)
+		}
+		if !strings.Contains(ee.Detail, "999") {
+			t.Errorf("Detail = %q, want it to mention the dangling key value 999", ee.Detail)
+		}
+
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: "vcs_child"})
+		if !ok {
+			t.Fatal("vcs_child table not found")
+		}
+		if !tbl.ForeignKeys[0].NotValid {
+			t.Fatalf("expected NotValid to remain true after a rejected VALIDATE CONSTRAINT, got %+v", tbl.ForeignKeys[0])
+		}
+
+		// Fix the data, then VALIDATE CONSTRAINT succeeds.
+		if err := runDDL(t, ctx, `INSERT INTO vcs_parent VALUES (999)`); err != nil {
+			t.Fatalf("INSERT INTO vcs_parent: %v", err)
+		}
+		if err := runDDL(t, ctx, `ALTER TABLE vcs_child VALIDATE CONSTRAINT vcs_fk`); err != nil {
+			t.Fatalf("VALIDATE CONSTRAINT after fixing data: %v", err)
+		}
+		if tbl.ForeignKeys[0].NotValid {
+			t.Fatalf("expected NotValid=false after a successful VALIDATE CONSTRAINT, got %+v", tbl.ForeignKeys[0])
+		}
+	})
+
+	t.Run("ValidateConstraintAlreadyValidIsNoOp", func(t *testing.T) {
+		ctx, cat, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE vcnv_parent (id integer PRIMARY KEY)`); err != nil {
+			t.Fatalf("CREATE TABLE vcnv_parent: %v", err)
+		}
+		if err := runDDL(t, ctx, `CREATE TABLE vcnv_child (id integer, pid integer)`); err != nil {
+			t.Fatalf("CREATE TABLE vcnv_child: %v", err)
+		}
+		if err := runDDL(t, ctx, `ALTER TABLE vcnv_child ADD CONSTRAINT vcnv_fk FOREIGN KEY (pid) REFERENCES vcnv_parent(id)`); err != nil {
+			t.Fatalf("ADD CONSTRAINT: %v", err)
+		}
+		// Already validated (no NOT VALID) — VALIDATE CONSTRAINT must be a
+		// no-op and must NOT scan (a dangling row would otherwise be
+		// impossible to insert here anyway, since the FK is enforced).
+		if err := runDDL(t, ctx, `ALTER TABLE vcnv_child VALIDATE CONSTRAINT vcnv_fk`); err != nil {
+			t.Fatalf("VALIDATE CONSTRAINT on an already-valid FK: %v", err)
+		}
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: "vcnv_child"})
+		if !ok {
+			t.Fatal("vcnv_child table not found")
+		}
+		if tbl.ForeignKeys[0].NotValid {
+			t.Fatalf("expected NotValid=false (unchanged), got %+v", tbl.ForeignKeys[0])
+		}
+	})
+
+	t.Run("AlterConstraintEnforcedNoOpWhenAlreadyEnforced", func(t *testing.T) {
+		ctx, _, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE acnp_parent (id integer PRIMARY KEY)`); err != nil {
+			t.Fatalf("CREATE TABLE acnp_parent: %v", err)
+		}
+		if err := runDDL(t, ctx, `CREATE TABLE acnp_child (id integer, pid integer)`); err != nil {
+			t.Fatalf("CREATE TABLE acnp_child: %v", err)
+		}
+		if err := runDDL(t, ctx, `ALTER TABLE acnp_child ADD CONSTRAINT acnp_fk FOREIGN KEY (pid) REFERENCES acnp_parent(id)`); err != nil {
+			t.Fatalf("ADD CONSTRAINT: %v", err)
+		}
+		// Already ENFORCED — real PG's `changed` gate means re-asserting
+		// ENFORCED is a no-op with no phase-3 scan (verified against real
+		// PostgreSQL's `if (currcon->conenforced != cmdcon->is_enforced)`
+		// guard in ATExecAlterConstrEnforceability). Nothing to scan here
+		// anyway since the FK has always been enforced, but this pins down
+		// that the no-op path doesn't error.
+		if err := runDDL(t, ctx, `ALTER TABLE acnp_child ALTER CONSTRAINT acnp_fk ENFORCED`); err != nil {
+			t.Fatalf("ALTER CONSTRAINT ... ENFORCED (already enforced): %v", err)
 		}
 	})
 }
