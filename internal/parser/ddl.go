@@ -2632,6 +2632,57 @@ func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) 
 	}
 }
 
+// parseFKConstraintAttrs consumes the `[NOT] DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE]`, `NOT VALID`, and `[NOT] ENFORCED` trailer that can
+// follow a FOREIGN KEY constraint's REFERENCES/ON DELETE/ON UPDATE clauses, in
+// any order (PG gram.y's ConstraintAttributeSpec list applies identically
+// regardless of which FK form is being parsed). Shared by the inline column
+// REFERENCES path, the table-level FOREIGN KEY path, and ALTER TABLE ADD
+// FOREIGN KEY so all three stay in lockstep — NOT VALID/NOT ENFORCED
+// previously only round-tripped through the ALTER TABLE form (DU-002 slice
+// 431); this extends the same trailer to CREATE TABLE-time FK constraints
+// (DU-002 slice 432).
+func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notValid, notEnforced bool) {
+	for {
+		if p.acceptKeyword(KwNot) {
+			if p.acceptIdentKeyword("valid") {
+				notValid = true
+				continue
+			}
+			if p.acceptIdentKeyword("enforced") {
+				notEnforced = true
+				continue
+			}
+			_, _ = p.expectKeyword(KwDeferrable)
+			deferrable = false
+			continue
+		}
+		if p.acceptKeyword(KwDeferrable) {
+			deferrable = true
+			if p.acceptIdentKeyword("initially") {
+				initiallyDeferred = p.acceptIdentKeyword("deferred")
+				if !initiallyDeferred {
+					_ = p.acceptIdentKeyword("immediate")
+				}
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("initially") {
+			deferrable = true
+			initiallyDeferred = p.acceptIdentKeyword("deferred")
+			if !initiallyDeferred {
+				_ = p.acceptIdentKeyword("immediate")
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("enforced") { // bare ENFORCED — already the default
+			continue
+		}
+		break
+	}
+	return
+}
+
 // parseCreateTableTail picks up after CREATE [UNLOGGED] TABLE.
 func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	stmt := &CreateTableStmt{pos: pos, Unlogged: unlogged}
@@ -4063,22 +4114,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 					col.OnUpdate = action
 				}
 			}
-			// Parse [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
-			// Also accept bare INITIALLY DEFERRED (implicit DEFERRABLE).
-			if p.acceptKeyword(KwNot) {
-				_, _ = p.expectKeyword(KwDeferrable)
-				col.FKDeferrable = false
-			} else if p.acceptKeyword(KwDeferrable) {
-				col.FKDeferrable = true
-				if p.acceptIdentKeyword("initially") {
-					col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
-					_ = p.acceptIdentKeyword("immediate")
-				}
-			} else if p.acceptIdentKeyword("initially") {
-				col.FKDeferrable = true
-				col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
-				_ = p.acceptIdentKeyword("immediate")
-			}
+			// Parse [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE],
+			// NOT VALID, and [NOT] ENFORCED, in any order (PG18 for the latter
+			// two). DU-002 slice 432 — extends slice 431's ALTER TABLE-only fix
+			// to the inline column REFERENCES form.
+			col.FKDeferrable, col.FKInitiallyDeferred, col.FKNotValid, col.FKNotEnforced = p.parseFKConstraintAttrs()
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance()
@@ -5400,22 +5440,11 @@ func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
 			fk.OnUpdate = action
 		}
 	}
-	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]; also accept a
-	// bare INITIALLY DEFERRED (implies DEFERRABLE), mirroring the inline path.
-	if p.acceptKeyword(KwNot) {
-		_, _ = p.expectKeyword(KwDeferrable)
-		fk.Deferrable = false
-	} else if p.acceptKeyword(KwDeferrable) {
-		fk.Deferrable = true
-		if p.acceptIdentKeyword("initially") {
-			fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
-			_ = p.acceptIdentKeyword("immediate")
-		}
-	} else if p.acceptIdentKeyword("initially") {
-		fk.Deferrable = true
-		fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
-		_ = p.acceptIdentKeyword("immediate")
-	}
+	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE], NOT VALID,
+	// and [NOT] ENFORCED, in any order (PG18 for the latter two). DU-002 slice
+	// 432 — extends slice 431's ALTER TABLE-only fix to the table-level
+	// FOREIGN KEY form.
+	fk.Deferrable, fk.InitiallyDeferred, fk.NotValid, fk.NotEnforced = p.parseFKConstraintAttrs()
 	return fk, nil
 }
 
@@ -7905,38 +7934,12 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// derives convalidated='f' from `NotValid || NotEnforced` instead
 		// (mirroring PG's processCASbits, which sets *not_valid=true only as
 		// an internal consistency detail, not something surfaced back through
-		// this AST). DU-002 slice 431.
-		deferrable := false
-		notValid := false
-		notEnforced := false
-		for {
-			if p.acceptKeyword(KwNot) {
-				if p.acceptIdentKeyword("valid") {
-					notValid = true
-					continue
-				}
-				if p.acceptIdentKeyword("enforced") {
-					notEnforced = true
-					continue
-				}
-				if _, err := p.expectKeyword(KwDeferrable); err != nil {
-					return AlterTableAction{}, err
-				}
-				deferrable = false
-				continue
-			}
-			if p.acceptKeyword(KwDeferrable) {
-				deferrable = true
-				if p.acceptIdentKeyword("initially") {
-					_ = p.acceptIdentKeyword("deferred") || p.acceptIdentKeyword("immediate")
-				}
-				continue
-			}
-			if p.acceptIdentKeyword("enforced") { // bare ENFORCED — already the default
-				continue
-			}
-			break
-		}
+		// this AST). DU-002 slice 431. Shared with the CREATE TABLE-time FK
+		// forms (inline column REFERENCES, table-level FOREIGN KEY) via
+		// parseFKConstraintAttrs so all three stay in lockstep (DU-002 slice
+		// 432); AlterTableAction has no InitiallyDeferred field to populate, so
+		// that return value is discarded here.
+		deferrable, _, notValid, notEnforced := p.parseFKConstraintAttrs()
 		act.Kind = AlterTableAddForeignKey
 		act.Columns = cols
 		act.RefTable = refTable

@@ -7084,6 +7084,56 @@ documentation-only and is exempt from the design-doc requirement.)
       forms) accept neither `NOT VALID` nor `NOT ENFORCED` at all — a
       narrower, pre-existing gap, scoped out per the one-narrow-area-per-loop
       pattern.
+      **2026-07-04 (loop #95, DU-002 slice 432): `CREATE TABLE`-time FK
+      `NOT VALID`/`NOT ENFORCED` LANDED — closes the loop #94 deferral
+      above.** Both CREATE TABLE-time FK forms (inline column `REFERENCES`
+      in `parseColumnDef` and table-level `FOREIGN KEY (...) REFERENCES ...`
+      in `parseTableForeignKey`, `internal/parser/ddl.go`) now accept and
+      round-trip the same `[NOT] DEFERRABLE`/`NOT VALID`/`[NOT] ENFORCED`
+      trailer the ALTER TABLE form got in loop #94, via a new shared helper
+      `parser.parseFKConstraintAttrs` (next to `parseConstraintDeferrable`)
+      used by all three FK grammar sites — including a refactor of the ALTER
+      TABLE call site itself onto the same helper, closing a small
+      pre-existing asymmetry (no bare `INITIALLY DEFERRED` support without a
+      preceding `DEFERRABLE` keyword) for free. New `ColumnDef.FKNotValid`/
+      `FKNotEnforced` and `TableForeignKeyDef.NotValid`/`NotEnforced`
+      (`internal/parser/ast.go`) thread into `catalog.ForeignKey.NotValid`/
+      `NotEnforced` at both CREATE TABLE FK-registration sites
+      (`internal/executor/operators_ddl.go`). No other executor change was
+      needed: `pg_constraint`'s conenforced/convalidated row builder,
+      `buildForeignKeyDefString`, the FK-insert/on-delete runtime skips, and
+      the VALIDATE CONSTRAINT `55000` guard all already read
+      `catalog.ForeignKey.NotValid`/`NotEnforced` generically (loop #94 built
+      them that way), so they picked up the new call sites automatically.
+      Tests: `TestParseFKNotEnforcedCreateTableTime`
+      (`internal/parser/fk_not_enforced_test.go`);
+      `TestFKNotEnforcedCreateTableTime` (new
+      `internal/executor/operators_fk_not_enforced_create_table_test.go`,
+      covering catalog wiring, `pg_constraint`, `pg_get_constraintdef`, and
+      the runtime skip for both FK forms plus an enforced control); new
+      `TestPort_PgDumpConnectionSetup` fixtures `ctfknenf_parent`/
+      `ctfknenf_child` (inline) and `cttlfknenf_parent`/`cttlfknenf_child`
+      (table-level), asserted to dump identically to the loop #94
+      ALTER TABLE-authored form. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `CREATE
+      TABLE`-time FK `NOT VALID`/`NOT ENFORCED` (loop #95, DU-002 slice
+      432)"; `docs/design/README.md` row `0110-0001` addendum appended.
+      Gates: `go build ./...` clean; `internal/parser`+`internal/catalog`+
+      `internal/executor` suites PASS (full, no regression);
+      `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`, per this
+      project's documented convention of never running the whole
+      `internal/testport` package as a suite — a full-package
+      `go test ./internal/testport/...` run hit Go's default 10-minute
+      per-package `-timeout` mid-`TestPort_IsolationMultipleRowVersions`, an
+      accumulated-runtime artifact of the package's TAP/isolation-spec
+      volume unrelated to this slice, not a test failure);
+      `scripts/tpch-spotcheck.sh` PASS (rerun fresh: Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. No new deferral: all three FK-constraint
+      parse sites now accept and round-trip the same `NOT VALID`/
+      `NOT ENFORCED` trailer — the FK
+      grammar-coverage thread closes cleanly. Resume for `002-010` proper is
+      still the next catalog-getter gap surfaced by
+      `TestPort_PgDumpConnectionSetup`.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

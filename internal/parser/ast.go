@@ -1146,6 +1146,11 @@ type ColumnDef struct {
 	// Threaded into catalog.ForeignKey so pg_constraint.confmatchtype='f' and
 	// pg_get_constraintdef re-emit ` MATCH FULL`. DU-002 slice 309.
 	FKMatchFull bool
+	// FKNotValid/FKNotEnforced mirror AlterTableAction's NotValid/FKNotEnforced
+	// for an inline `REFERENCES … NOT VALID` / `NOT ENFORCED` trailer at
+	// CREATE TABLE time (PG18 for NOT ENFORCED). DU-002 slice 432.
+	FKNotValid    bool
+	FKNotEnforced bool
 
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
@@ -1250,6 +1255,12 @@ type TableForeignKeyDef struct {
 	// MatchFull is true for `… MATCH FULL`; MATCH SIMPLE (default) leaves it
 	// false. Threaded into catalog.ForeignKey for confmatchtype round-trip. DU-002 slice 309.
 	MatchFull bool
+	// NotValid/NotEnforced mirror AlterTableAction's NotValid/FKNotEnforced for
+	// a table-level `FOREIGN KEY (...) REFERENCES ... NOT VALID` / `NOT
+	// ENFORCED` trailer at CREATE TABLE time (PG18 for NOT ENFORCED). DU-002
+	// slice 432.
+	NotValid    bool
+	NotEnforced bool
 }
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name

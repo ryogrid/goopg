@@ -12067,3 +12067,87 @@ attempt `NOT VALID`, which real PG's grammar also permits there, however
 redundant it is against an empty new table). Left out of this slice's scope
 (a third, differently-shaped parser change, not merely adding an ENFORCED
 branch to an already-present trailer loop); ledger row appended.
+
+## Follow-up: `CREATE TABLE`-time FK `NOT VALID`/`NOT ENFORCED` (loop #95, DU-002 slice 432)
+
+Implements the slice 431 deferral above in full: `NOT VALID` and `[NOT]
+ENFORCED` (PG18) now round-trip identically whether a FOREIGN KEY constraint
+is added via `ALTER TABLE` (slice 431) or written at `CREATE TABLE` time,
+via either the inline column `REFERENCES` clause or the table-level
+`FOREIGN KEY (...) REFERENCES ...` clause.
+
+### What changed
+
+- New shared helper `parser.parseFKConstraintAttrs`
+  (`internal/parser/ddl.go`, next to `parseConstraintDeferrable`) consumes
+  `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`, `NOT VALID`, and `[NOT]
+  ENFORCED` in any order — the same order-independent loop slice 431 wrote
+  inline for `ALTER TABLE ADD FOREIGN KEY`, now factored out so all three FK
+  grammar sites share one implementation instead of three independently
+  drifting copies (the project's standing "sibling paths must change
+  together" rule). All three call sites — `parseColumnDef`'s `REFERENCES`
+  case, `parseTableForeignKey`, and the ALTER TABLE ADD FOREIGN KEY action
+  parser — now call this one helper.
+- `ColumnDef` gains `FKNotValid`/`FKNotEnforced` (`internal/parser/ast.go`);
+  `TableForeignKeyDef` gains `NotValid`/`NotEnforced`. Both mirror
+  `AlterTableAction`'s existing `NotValid`/`FKNotEnforced` fields.
+- `internal/executor/operators_ddl.go`'s CREATE TABLE handler threads both
+  new fields into `catalog.ForeignKey.NotValid`/`NotEnforced` at both FK
+  registration sites (inline-column loop and table-level-FK loop). No other
+  executor change was needed: `pg_constraint`'s `conenforced`/`convalidated`
+  row builder (`internal/catalog/catalog.go` ~line 7031/7058),
+  `buildForeignKeyDefString` (`internal/executor/expr.go`), the
+  `checkFKInsertForConstraints`/`enforceFKOnDelete` runtime skips, and the
+  `AlterTableValidateConstraint` `55000` guard (`internal/executor/operators_fk.go`,
+  `internal/executor/operators_ddl.go`) all already read
+  `catalog.ForeignKey.NotValid`/`NotEnforced` generically, independent of
+  which grammar form created the constraint — slice 431 built these to be
+  reused, and they were.
+- A refactor side-effect: the ALTER TABLE ADD FOREIGN KEY path previously had
+  no branch for a bare `INITIALLY DEFERRED`/`INITIALLY IMMEDIATE` without a
+  preceding `DEFERRABLE` keyword (unlike the two CREATE TABLE-time forms,
+  which already handled it) — routing it through the shared helper closes
+  that small pre-existing asymmetry for free. `AlterTableAction` has no
+  `InitiallyDeferred` field to populate, so the helper's corresponding return
+  value is discarded at that one call site (unchanged existing behavior).
+
+### Tests
+
+`TestParseFKNotEnforcedCreateTableTime` (`internal/parser/fk_not_enforced_test.go`)
+covers both new call sites: inline-column plain `NOT ENFORCED`, `NOT VALID
+NOT ENFORCED` composition, `DEFERRABLE NOT ENFORCED` composition, and the
+table-level form's plain `NOT ENFORCED`, `NOT VALID NOT ENFORCED`
+composition, and no-trailer control.
+`TestFKNotEnforcedCreateTableTime` (new
+`internal/executor/operators_fk_not_enforced_create_table_test.go`) covers
+the inline-column form end-to-end (catalog `NotEnforced`, `pg_constraint`
+`convalidated`/`conenforced`, `pg_get_constraintdef` rendering, and the
+runtime skip allowing a dangling FK reference) and the table-level form
+(catalog wiring + runtime skip), plus an enforced control confirming the
+fixture would otherwise raise `23503`.
+`TestPort_PgDumpConnectionSetup` gained two new fixtures alongside slice
+431's `fknenf_parent`/`fknenf_child` (ALTER TABLE-authored): `ctfknenf_parent`/
+`ctfknenf_child` (inline column `REFERENCES ... NOT ENFORCED`) and
+`cttlfknenf_parent`/`cttlfknenf_child` (table-level `FOREIGN KEY (...)
+REFERENCES ... NOT ENFORCED`), both asserted to dump as the standalone
+post-data `ALTER TABLE ... ADD CONSTRAINT <table>_pid_fkey FOREIGN KEY (pid)
+REFERENCES public.<parent>(id) NOT ENFORCED;` form — the same "separate,
+auto-named exactly like an ordinary same-shape FK" treatment slice 431
+established for the ALTER TABLE-authored form, now confirmed independent of
+which CREATE-time grammar produced the row.
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS; `internal/testport` full suite PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+### Deferred
+
+None outstanding for FK `NOT VALID`/`NOT ENFORCED` grammar coverage — all
+three FK-constraint parse sites (`ALTER TABLE ADD FOREIGN KEY`, inline column
+`REFERENCES`, table-level `FOREIGN KEY`) now accept and round-trip the same
+trailer. The still-open, unrelated DU-002 thread is the next catalog-getter
+gap surfaced by `TestPort_PgDumpConnectionSetup`'s fallback log branch (see
+the top of this file's running "Resume" pointer).

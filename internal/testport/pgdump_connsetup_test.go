@@ -4342,6 +4342,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "ALTER TABLE public.fknenf_child ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES public.fknenf_parent(id) NOT ENFORCED"); err != nil {
 		t.Fatalf("alter table fknenf_child add foreign key not enforced: %v", err)
 	}
+	// Slice 432: the same NOT ENFORCED trailer, written at CREATE TABLE time
+	// instead of via a later ALTER TABLE — both the inline column REFERENCES
+	// form and the table-level FOREIGN KEY form. Real pg_dump's getConstraints
+	// reads convalidated='f' straight off pg_constraint regardless of which
+	// grammar form created the row, so both must be pulled out to the same
+	// standalone post-data `ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED;`
+	// as the ALTER TABLE-authored fknenf_fk above — auto-named
+	// <table>_<col>_fkey (inline) / <table>_<firstcol>_fkey (table-level),
+	// same as an ordinary (enforced) FK of the same shape.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ctfknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table ctfknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ctfknenf_child (id integer, pid integer REFERENCES public.ctfknenf_parent(id) NOT ENFORCED)"); err != nil {
+		t.Fatalf("create table ctfknenf_child with inline FK not enforced: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.cttlfknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table cttlfknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.cttlfknenf_child (id integer, pid integer, FOREIGN KEY (pid) REFERENCES public.cttlfknenf_parent(id) NOT ENFORCED)"); err != nil {
+		t.Fatalf("create table cttlfknenf_child with table-level FK not enforced: %v", err)
+	}
 
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
@@ -11567,6 +11588,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		fkNotEnforcedDef := "ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES public.fknenf_parent(id) NOT ENFORCED;"
 		if !strings.Contains(res.Stdout, fkNotEnforcedDef) {
 			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a foreign key constraint; missing %q\n  full stdout=%q", fkNotEnforcedDef, res.Stdout)
+		}
+		// Slice 432: the same trailer written at CREATE TABLE time (inline
+		// column REFERENCES and table-level FOREIGN KEY) must round-trip
+		// identically to the ALTER TABLE-authored form above.
+		ctFKNotEnforcedDefs := []string{
+			"ADD CONSTRAINT ctfknenf_child_pid_fkey FOREIGN KEY (pid) REFERENCES public.ctfknenf_parent(id) NOT ENFORCED;",
+			"ADD CONSTRAINT cttlfknenf_child_pid_fkey FOREIGN KEY (pid) REFERENCES public.cttlfknenf_parent(id) NOT ENFORCED;",
+		}
+		for _, sub := range ctFKNotEnforcedDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a CREATE TABLE-time foreign key constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		return
 	}
