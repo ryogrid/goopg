@@ -85,3 +85,69 @@ func TestPort_PgDumpallRoleMembership(t *testing.T) {
 		t.Errorf("revoked membership should not appear in the dump\nfull stdout=%s", res.Stdout)
 	}
 }
+
+// TestPort_PgDumpallPredefinedRoleMembership pins the exact regression
+// M0119-0004-ACLHEAP's pg_authid/pg_roles predefined-role rows fixed
+// (catalog.go's pgRoles/pgAuthid VirtualRows): before that fix, pg_authid and
+// pg_roles projected only user-created roles, so dumpRoleMembership's `LEFT
+// JOIN pg_roles ur ON ur.oid = a.roleid` came back NULL for a grant whose
+// roleid is one of PG18's 16 built-in "pg_*" predefined roles (e.g.
+// pg_read_all_data, OID 6181 — not stored in goopg's user-role registry).
+// pg_dumpall.c's dumpRoleMembership treats a NULL `role` column as an
+// "orphaned pg_auth_members entry", logs a warning, and — because rows are
+// ORDER BY role and NULLs sort last — `break`s out of the loop entirely,
+// silently dropping every remaining membership row in the dump, not just the
+// one naming the predefined role.
+func TestPort_PgDumpallPredefinedRoleMembership(t *testing.T) {
+	bin := clientToolBin(t, "pg_dumpall")
+	if bin == "" {
+		t.Skip("pg_dumpall not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgdumpallpredefinedrole")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE ROLE predalice LOGIN"); err != nil {
+		t.Fatalf("create role predalice: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT pg_read_all_data TO predalice"); err != nil {
+		t.Fatalf("grant pg_read_all_data to predalice: %v", err)
+	}
+	// A membership row sorting AFTER the predefined-role grant (by role name)
+	// that must still be dumped — proves the loop doesn't bail out early.
+	if err := runSQLSimple(t, c, "CREATE ROLE predbob LOGIN"); err != nil {
+		t.Fatalf("create role predbob: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE predtrailing"); err != nil {
+		t.Fatalf("create role predtrailing: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT predtrailing TO predbob"); err != nil {
+		t.Fatalf("grant predtrailing to predbob: %v", err)
+	}
+
+	res, err := util.RunCommand(util.CommandSpec{
+		Name:    bin,
+		Args:    []string{"--no-sync", "--globals-only"},
+		Env:     amcheckEnv(t, c),
+		Timeout: 30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("run pg_dumpall: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("pg_dumpall --globals-only exited %d\nstdout=%s\nstderr=%s", res.ExitCode, res.Stdout, res.Stderr)
+	}
+
+	want := []string{
+		`GRANT pg_read_all_data TO predalice WITH INHERIT TRUE GRANTED BY postgres;`,
+		`GRANT predtrailing TO predbob WITH INHERIT TRUE GRANTED BY postgres;`,
+	}
+	for _, sub := range want {
+		if !strings.Contains(res.Stdout, sub) {
+			t.Errorf("pg_dumpall --globals-only output missing %q\nfull stdout=%s", sub, res.Stdout)
+		}
+	}
+	if strings.Contains(res.Stderr, "orphaned pg_auth_members") {
+		t.Errorf("pg_dumpall reported an orphaned pg_auth_members entry\nstderr=%s", res.Stderr)
+	}
+}

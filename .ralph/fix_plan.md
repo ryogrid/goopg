@@ -6152,6 +6152,45 @@ documentation-only and is exempt from the design-doc requirement.)
       name error is not ported (`roleError` has no detail field, shared
       simplification with the RENAME TO path).
 
+- [x] **`pg_authid`/`pg_roles` predefined-role virtual rows (M0119-0004-ACLHEAP
+      follow-up, loop #46).** **COMPLETE 2026-07-03:** closes discovery (a)
+      from the loop #43 entry above. `internal/catalog/catalog.go`'s `pgRoles`/
+      `pgAuthid` `VirtualRows` closures now append a second row-emission pass
+      over `predefinedRoleSeeds` (sorted by name) using each role's fixed OID
+      from `c.predefinedRoles` — `pg_roles` emits `rolsuper='f'`/
+      `rolcanlogin='f'` literals; `pg_authid` reuses the existing `rowFor`
+      helper with a zero-value `&RoleAttrs{}`, whose existing default-flip
+      logic already produces PG's exact predefined-role shape (rolinherit=`t`,
+      rolconnlimit=`-1`, rolpassword=`NULL`) with no new per-row logic needed.
+      Verified end-to-end against the exact failure mode described in the
+      loop #43 discovery: new `TestPort_PgDumpallPredefinedRoleMembership`
+      (`internal/testport/pgdumpall_role_membership_test.go`) grants
+      `pg_read_all_data` to a real role plus a second membership sorting after
+      it by role name, and asserts real `pg_dumpall --globals-only` emits both
+      `GRANT` lines with no "orphaned pg_auth_members entry" warning — before
+      this fix, the NULL `ur.rolname` for the predefined-role grant made
+      `pg_dumpall` treat it as orphaned and, since rows are `ORDER BY role`
+      with NULLs sorting last, `break` out of its membership loop entirely,
+      silently dropping every subsequent membership row too, not just the
+      predefined-role one. Unit coverage: `TestPgCatalogBootstrapViews`
+      extended (17 `pg_roles` rows: 1 bootstrap superuser + 16 predefined,
+      `pg_read_all_data`'s `rolsuper`/`rolcanlogin` both asserted `f`); new
+      `TestPgAuthidExposesPredefinedRoles` (18 `pg_authid` rows incl. a
+      registered user role, `pg_read_all_data`'s full attribute row incl.
+      fixed OID 6181) (`internal/catalog/catalog_test.go`). Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/catalog` suite PASS;
+      `TestPort_PgDumpallPredefinedRoleMembership` (new) +
+      `TestPort_PgDumpallRoleMembership` (no regression) PASS against real
+      `pg_dumpall` 18.3. Design doc:
+      `docs/design/0119-0004-predefined-role-resolution.md` new "Follow-up:
+      `pg_authid`/`pg_roles` predefined-role rows (loop #46)" section;
+      `docs/design/README.md` row `0119-0004cj` added, `0119-0004ch`/
+      `0119-0004ci` rows' "Still open" notes updated to point at it; deferral
+      ledger row appended (marks the loop #43 discovery (a) row `resolved`).
+      Still open, unrelated to this slice: `roleError` detail-field threading
+      (`0119-0004ci`'s own residual); `GRANT ... ON PARAMETER`'s
+      `reserved_class_prefix` extension-namespace check.
+
 - [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
       #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
       row's "a client `SET log_statement='all'` has no effect" residual — only

@@ -5874,6 +5874,22 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, rolsuper, rolcanlogin})
 		}
 		c.mu.RUnlock()
+		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat) — always
+		// rolsuper='f'/rolcanlogin='f', matching SyncPgAuthidFile's frozen
+		// predefined rows (internal/executor/pg_authid_sync.go). Needed so
+		// pg_dumpall's dumpRoleMembership query (which LEFT JOINs pg_roles to
+		// resolve a membership row's role/member name) doesn't silently drop a
+		// `GRANT pg_read_all_data TO alice`-style row when ur.rolname/
+		// um.rolname come back NULL for a predefined grantee (0119-0004ch
+		// ledger discovery (a)).
+		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
+		for _, s := range predefinedRoleSeeds {
+			predefinedNames = append(predefinedNames, s.name)
+		}
+		sort.Strings(predefinedNames)
+		for _, name := range predefinedNames {
+			out = append(out, []string{fmt.Sprintf("%d", c.predefinedRoles[name]), name, "f", "f"})
+		}
 		return out
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
@@ -5949,6 +5965,19 @@ func (c *InMemory) registerSystemTables() {
 		sort.Strings(names)
 		for _, name := range names {
 			out = append(out, rowFor(fmt.Sprintf("%d", c.roles[name]), name, c.roleAttrs[name]))
+		}
+		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat), same
+		// gap/rationale as pg_roles above (0119-0004ch ledger discovery (a)):
+		// a zero-value RoleAttrs{} drives rowFor's defaults to exactly PG's
+		// predefined-role shape (rolsuper/rolcanlogin='f', rolpassword NULL),
+		// matching SyncPgAuthidFile's frozen rows.
+		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
+		for _, s := range predefinedRoleSeeds {
+			predefinedNames = append(predefinedNames, s.name)
+		}
+		sort.Strings(predefinedNames)
+		for _, name := range predefinedNames {
+			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{}))
 		}
 		return out
 	}

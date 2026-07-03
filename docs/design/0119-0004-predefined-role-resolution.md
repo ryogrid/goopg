@@ -138,16 +138,48 @@ PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook.
 
 ## Deferred
 
-See `.ralph/deferral_ledger.md` (M0119-0004-ACLHEAP, this loop's row): the 16
-predefined roles are still **entirely absent from the `pg_authid`/`pg_roles`
-virtual catalog views** (`internal/catalog/catalog.go`'s `pgAuthid`/`pgRoles`
-`VirtualRows` closures only project `roles`, never `predefinedRoles`) — a
-pre-existing, broader gap this loop's narrower `RoleOID`/`RoleExists`
-resolution did not touch. This means a `GRANT pg_read_all_data TO alice`
-membership row, while now correctly stored, will not survive a real
-`pg_dumpall` round-trip: `dumpRoleMembership`'s query LEFT JOINs
-`pg_auth_members` against `pg_roles`, and a NULL `ur.rolname` (predefined role
-missing from the view) makes the `WHERE NOT (...)` predicate evaluate to
-`NULL`, silently dropping the row from the dump. `reserved_class_prefix`
-extension-namespace validation for `GRANT ... ON PARAMETER` remains open,
-unrelated to this slice.
+`reserved_class_prefix` extension-namespace validation for `GRANT ... ON
+PARAMETER` remains open, unrelated to this slice.
+
+## Follow-up: `pg_authid`/`pg_roles` predefined-role rows (loop #46)
+
+Closes discovery (a) above: `internal/catalog/catalog.go`'s `pgRoles`/
+`pgAuthid` `VirtualRows` closures now append a second row-emission pass over
+`predefinedRoleSeeds` (sorted by name for deterministic output), after the
+existing `c.roles` loop, using each predefined role's fixed OID from
+`c.predefinedRoles`:
+
+- `pg_roles`: `rolsuper='f'`, `rolcanlogin='f'` — every PG18 predefined role's
+  real `pg_authid.dat` shape.
+- `pg_authid`: reuses the existing `rowFor` helper with a zero-value
+  `&RoleAttrs{}` — `rowFor`'s own default-flip logic (`!a.CanLogin` →
+  `rolcanlogin='f'`) combined with its hardcoded `rolinherit="t"` literal
+  already produces exactly PG's predefined-role row shape (rolsuper/
+  rolcanlogin=`f`, rolinherit=`t`, rolconnlimit=`-1`, rolpassword=`NULL`) with
+  no new per-row logic.
+
+This is a read-only *view* addition — `predefinedRoles` itself (the OID
+registry) is unchanged, still structurally separate from `roles`, still
+excluded from `AllRoleStates()` (no heap-sync duplication risk).
+
+Verified end-to-end against the exact failure mode described above:
+`TestPort_PgDumpallPredefinedRoleMembership`
+(`internal/testport/pgdumpall_role_membership_test.go`) grants
+`pg_read_all_data` to a real role, then a second membership sorting after it
+by role name, and asserts real `pg_dumpall --globals-only` emits both `GRANT`
+lines with no "orphaned pg_auth_members entry" warning — before this fix, the
+NULL `ur.rolname` for the predefined-role grant made `pg_dumpall` treat it as
+orphaned and (since rows are `ORDER BY role` and NULLs sort last, so all
+subsequent rows are also incorrectly at risk once a NULL is hit) `break` out
+of its membership loop.
+
+Unit coverage: `TestPgCatalogBootstrapViews` (`pg_roles` extended to assert 17
+rows: 1 bootstrap superuser + 16 predefined, `pg_read_all_data`'s
+`rolsuper`/`rolcanlogin` both `f`); new `TestPgAuthidExposesPredefinedRoles`
+(`pg_authid` — 18 rows including a registered user role, `pg_read_all_data`'s
+full attribute row incl. fixed OID 6181) (`internal/catalog/catalog_test.go`).
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog` suite PASS;
+`TestPort_PgDumpallPredefinedRoleMembership` (new) +
+`TestPort_PgDumpallRoleMembership` (no regression) PASS against real
+`pg_dumpall` 18.3.
