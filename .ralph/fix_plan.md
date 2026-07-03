@@ -224,6 +224,36 @@ prev-link fixes.
       deferral thread: `canonical`/`subtype_diff` (sub-item (a) remainder —
       needs real shell-type + function-signature support, a materially
       larger separately-scoped feature).
+      **2026-07-04 (loop #97, DU-002 slice 436): `COMMENT ON <object>` now
+      raises PostgreSQL's own per-object-kind `does not exist` error instead
+      of a silent no-op — CLOSES the systemic deferral recorded since slice
+      386.** `execCommentOn` (`internal/executor/operators_ddl.go`) gained a
+      shared `undefinedRelation()` 42P01 closure for the six relation-kind
+      cases (table/view/sequence/materialized view/foreign table/index) and
+      a specific `ExecError` for every other case (type/domain 42704, schema
+      3F000, column 42703, constraint/trigger/policy/rule 42704 with their
+      own `for table`/`for relation` wording, statistics/access
+      method/server/foreign data wrapper/extension/collation/cast 42704,
+      function 42883 via a new `commentOnFuncSig` helper mirroring DROP
+      FUNCTION's), all sourced from `postgres/src/backend/catalog/
+      objectaddress.c`'s `get_object_address` family and its per-kind lookup
+      helpers. `TestCommentOnUnknownAccessMethodIsNoop` (slice 434, which had
+      explicitly documented itself as pinning a to-be-superseded divergence)
+      is replaced by `TestCommentOnUnknownAccessMethodErrors`; two new test
+      files (`TestCommentOnUndefinedObjectErrors` table-driven across every
+      bare-name object kind, `TestCommentOnUndefinedRelationSubObjectErrors`
+      for the missing-table vs missing-sub-object paths) pin the new
+      behavior. Design doc "Follow-up: `COMMENT ON <object>` raises
+      PostgreSQL's own `does not exist` error instead of a silent no-op
+      (DU-002 slice 436)". Gates: build/vet clean; `internal/executor`+
+      `internal/parser`+`internal/catalog` suites PASS; `TestPort_
+      PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
+      appended): `commentOnFuncSig` renders the function name unqualified
+      even for a schema-qualified `COMMENT ON FUNCTION schema.name(...)` —
+      a pre-existing simplification shared by DROP FUNCTION's sibling
+      helper, not introduced here. Resume for `002-010` proper remains the
+      next catalog-getter gap surfaced by `TestPort_PgDumpConnectionSetup`.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

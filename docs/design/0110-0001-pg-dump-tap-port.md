@@ -12763,3 +12763,98 @@ pre-existing "COMMENT ON nonexistent object is a silent no-op" gap (recorded
 against slice 434) now also applies to `"foreign table"` as one more sibling
 case, but that is the same already-recorded systemic deferral, not a new
 one.
+
+## Follow-up: `COMMENT ON <object>` raises PostgreSQL's own `does not exist` error instead of a silent no-op (DU-002 slice 436)
+
+### Problem
+
+Every prior `COMMENT ON` slice (386–388, 390, 396, 434, 435) recorded the same
+standing discovery and deliberately deferred it as a systemic, out-of-scope
+change: `execCommentOn` (`internal/executor/operators_ddl.go`) resolves the
+target object by name for each of its ~19 `ObjKind` cases, and on a failed
+lookup every single case `return`ed `nil` — a silent no-op. Real PostgreSQL
+raises a specific `does not exist` error for every one of these object kinds
+(verified against `postgres/src/backend/catalog/objectaddress.c`'s
+`get_object_address` family and the per-object-kind lookup helpers it calls —
+`RangeVarGetRelidExtended`, `get_relation_constraint_oid`, `get_trigger_oid`,
+`get_relation_policy_oid`, `get_rewrite_oid`, `get_collation_oid`,
+`get_cast_oid`, `get_statistics_object_oid`, `LookupFuncWithArgs`, etc.), e.g.
+`COMMENT ON SERVER nonexistent_srv IS 'x'` → `ERROR: server "nonexistent_srv"
+does not exist` (live-verified against PG 18.3 in the slice 434 row). Since
+every case shares the exact same lookup-then-`SetComment` shape, this loop
+closes the whole deferral in one pass rather than one object kind at a time.
+
+### PostgreSQL oracle (message + SQLSTATE per object kind)
+
+Traced each `ObjKind`'s real lookup path in `./postgres/src/backend`:
+
+| object kind(s) | lookup path | SQLSTATE | message |
+|---|---|---|---|
+| table/view/sequence/materialized view/foreign table/index | `get_relation_by_qualified_name` → `RangeVarGetRelidExtended` (`namespace.c`) | `42P01` (`ERRCODE_UNDEFINED_TABLE`) | `relation "%s" does not exist` — **identical regardless of requested relation kind**, since the not-found branch is reached before any relkind check |
+| column | `get_object_address_attribute` (`objectaddress.c:1528`) | `42703` | `column "%s" of relation "%s" does not exist` |
+| schema | `LookupExplicitNamespace`/similar (`namespace.c:3547`) | `3F000` | `schema "%s" does not exist` |
+| type, domain | `get_object_address_type` → `LookupTypeName` (`objectaddress.c:1623`) | `42704` | `type "%s" does not exist` |
+| constraint (COMMENT ON CONSTRAINT ... ON table) | `get_relation_constraint_oid` (`pg_constraint.c:1234`) | `42704` | `constraint "%s" for table "%s" does not exist` |
+| trigger | `get_trigger_oid` (`trigger.c:1403`) | `42704` | `trigger "%s" for table "%s" does not exist` |
+| policy | `get_relation_policy_oid` (`policy.c:1204`) | `42704` | `policy "%s" for table "%s" does not exist` |
+| rule | `get_rewrite_oid` (`rewriteSupport.c:108`) | `42704` | `rule "%s" for relation "%s" does not exist` |
+| statistics | `get_statistics_object_oid` (`namespace.c:2619`) | `42704` | `statistics object "%s" does not exist` |
+| function | `LookupFuncWithArgs` (`parse_func.c`) | `42883` (`ERRCODE_UNDEFINED_FUNCTION`) | `function %s does not exist` (with the `(argtypes)` signature) |
+| access method | `get_am_oid` (`amcmds.c:154`) | `42704` | `access method "%s" does not exist` |
+| server | `GetForeignServerByName` (`foreign.c:714`) | `42704` | `server "%s" does not exist` |
+| foreign data wrapper | `GetForeignDataWrapperByName` (`foreign.c:692`) | `42704` | `foreign-data wrapper "%s" does not exist` |
+| extension | `get_extension_oid` (`extension.c:198`) | `42704` | `extension "%s" does not exist` |
+| collation | `get_collation_oid` (`namespace.c:4019`) | `42704` | `collation "%s" for encoding "%s" does not exist` (goopg is always UTF8, matching the pre-existing `resolveRangeCollation` precedent, `internal/catalog/catalog.go`) |
+| cast | `get_cast_oid` (`lsyscache.c:1109`) | `42704` | `cast from type %s to type %s does not exist` |
+
+### Fix
+
+`execCommentOn` gained a shared `undefinedRelation()` closure (42P01, used by
+the six relation-kind cases) and a per-case `ExecError{Code, Message}` return
+in place of every `return nil` on a failed lookup, using the exact wording
+above. Two cases needed a two-stage check (relation exists but the named
+sub-object on it does not): `column` (42703 `column ... of relation ...`) and
+`constraint`/`trigger`/`policy`/`rule` (each object kind's own `for table`/
+`for relation` message), matching real PG's own two-stage `RangeVarGetRelid`→
+`get_*_oid` lookup shape exactly. `cast`'s error re-used the existing
+`dropCompatCanonicalType` type-name canonicalizer (already shared with `DROP
+CAST`'s equivalent error at `internal/executor/operators_ddl.go`); `function`'s
+error gained a small local `commentOnFuncSig` helper mirroring the
+`buildFuncSigError` closure `DROP FUNCTION` already has, rendering
+`name(type1, type2)` from `CommentOnStmt.Args`.
+
+The pre-existing `TestCommentOnUnknownAccessMethodIsNoop` (slice 434) was
+explicitly written to be superseded by this fix — its own doc comment said so
+— and is replaced by `TestCommentOnUnknownAccessMethodErrors`, asserting the
+42704 error. Two new test files exercise every case: `TestCommentOnUndefinedObjectErrors`
+(table-driven, one subtest per bare-name object kind) and
+`TestCommentOnUndefinedRelationSubObjectErrors` (both the "table itself
+missing" 42P01 path and the "table exists, sub-object missing" path for
+column/constraint/trigger/policy/rule), both in
+`internal/executor/operators_ddl_comment_on_undefined_test.go`.
+
+### Scope note: what this does NOT change
+
+Only the "object not found" branch of each case changed. The happy-path
+lookup/`SetComment` logic, OID/classoid assignments, and every other existing
+behavior (built-in access methods/collations still resolving to OID 0 and
+therefore now raising `does not exist` rather than silently no-op'ing —
+matching real PG, since PG never lets you `COMMENT ON` an object it can't
+name-resolve either) are unchanged.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/executor`+`internal/parser`+
+`internal/catalog` suites PASS (full, no regressions); `TestPort_PgDumpConnectionSetup`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+pre-commit hook.
+
+### Deferred
+
+None new — this closes the standing systemic deferral recorded since slice
+386 rather than opening a fresh one. One pre-existing, unrelated-to-this-fix
+limitation remains visible in the `function` case: `commentOnFuncSig` (like
+its `DROP FUNCTION` sibling) renders the function name unqualified even when
+`COMMENT ON FUNCTION schema.name(...)` was schema-qualified, whereas real PG's
+`func_signature_string` includes the schema when given — a pre-existing
+simplification shared by DROP FUNCTION, not introduced here.

@@ -15502,6 +15502,16 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgCast         = 2605 // pg_cast: casts
 		oidPgAm           = 2601 // pg_am: access methods
 	)
+	// undefinedRelation mirrors PostgreSQL's get_relation_by_qualified_name
+	// (objectaddress.c) / RangeVarGetRelidExtended (namespace.c): COMMENT ON
+	// TABLE/VIEW/SEQUENCE/MATERIALIZED VIEW/FOREIGN TABLE/INDEX all funnel
+	// through the same relation-by-name lookup, so an unresolved name raises
+	// the identical 42P01 "relation ... does not exist" regardless of which
+	// relation kind was requested. DU-002 slice 436.
+	undefinedRelation := func() error {
+		return &ExecError{Code: "42P01", Pos: s.Pos(),
+			Message: fmt.Sprintf("relation %q does not exist", s.ObjName.String())}
+	}
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view", "foreign table":
 		// Views, sequences, materialized views, and foreign tables are all
@@ -15513,7 +15523,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// pg_description row is keyword-agnostic. DU-002 slices 145, 146, 435.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		im.SetComment(oidPgClass, tbl.OID, 0, s.Description)
 	case "type":
@@ -15523,7 +15533,8 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// pg_dump could not re-emit it. DU-002 slice 146.
 		et, ok := im.LookupEnum(s.ObjName.Name)
 		if !ok {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
 		}
 		im.SetComment(oidPgType, et.OID, 0, s.Description)
 	case "domain":
@@ -15532,7 +15543,8 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// keyword-agnostic. DU-002 slice 146.
 		dom, ok := im.LookupDomain(s.ObjName.Name)
 		if !ok {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.ObjName.String())}
 		}
 		im.SetComment(oidPgType, dom.OID, 0, s.Description)
 	case "schema":
@@ -15541,7 +15553,8 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// pg_dump could not re-emit it. DU-002 slice 145.
 		oid := im.SchemaOID(s.ObjName.Name)
 		if oid == 0 {
-			return nil
+			return &ExecError{Code: "3F000", Pos: s.Pos(),
+				Message: fmt.Sprintf("schema %q does not exist", s.ObjName.Name)}
 		}
 		im.SetComment(oidPgNamespace, oid, 0, s.Description)
 	case "access method":
@@ -15550,51 +15563,48 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// (tableoid=pg_am=2601) and objsubid 0, then re-emits `COMMENT ON ACCESS
 		// METHOD <name> IS '...'`. Only user-defined AMs (CREATE ACCESS METHOD)
 		// are resolvable here — the 7 built-ins are not registered in
-		// c.accessMethods, so a COMMENT ON a built-in AM is a harmless no-op
-		// (pg_dump never dumps their comments either, since it never dumps the
-		// built-ins themselves). Without this a COMMENT ON ACCESS METHOD was
-		// silently swallowed (parser dropped it) and never reached
-		// pg_description, so pg_dump could not re-emit it. DU-002 slice 434.
+		// c.accessMethods, so a COMMENT ON a built-in AM raises the same
+		// "does not exist" error real PG would (pg_dump never dumps their
+		// comments either, since it never dumps the built-ins themselves).
+		// DU-002 slice 434.
 		oid := im.UserAccessMethodOID(s.ObjName.Name)
 		if oid == 0 {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("access method %q does not exist", s.ObjName.Name)}
 		}
 		im.SetComment(oidPgAm, oid, 0, s.Description)
 	case "server":
 		// Foreign servers live in pg_foreign_server (classoid 1417). pg_dump's
 		// dumpForeignServer keys the comment lookup on the server's catalogId
 		// (tableoid=pg_foreign_server=1417) and objsubid 0, then re-emits
-		// `COMMENT ON SERVER <name> IS '...'`. Without this a COMMENT ON SERVER
-		// was silently swallowed (parser dropped it) and never reached
-		// pg_description, so pg_dump could not re-emit it. DU-002 slice 386.
+		// `COMMENT ON SERVER <name> IS '...'`. DU-002 slice 386.
 		oid := im.ForeignServerOID(s.ObjName.Name)
 		if oid == 0 {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("server %q does not exist", s.ObjName.Name)}
 		}
 		im.SetComment(oidPgForeignSrv, oid, 0, s.Description)
 	case "foreign data wrapper":
 		// Foreign-data wrappers live in pg_foreign_data_wrapper (classoid 2328).
 		// pg_dump's dumpForeignDataWrapper keys the comment lookup on the FDW's
 		// catalogId (tableoid=pg_foreign_data_wrapper=2328) and objsubid 0, then
-		// re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. Without this
-		// a COMMENT ON FOREIGN DATA WRAPPER was silently swallowed (parser dropped
-		// it) and never reached pg_description, so pg_dump could not re-emit it.
-		// DU-002 slice 387.
+		// re-emits `COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'`. DU-002
+		// slice 387.
 		oid := im.ForeignDataWrapperOID(s.ObjName.Name)
 		if oid == 0 {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", s.ObjName.Name)}
 		}
 		im.SetComment(oidPgFdw, oid, 0, s.Description)
 	case "extension":
 		// Extensions live in pg_extension (classoid 3079). pg_dump's dumpExtension
 		// keys the comment lookup on the extension's catalogId
 		// (tableoid=pg_extension=3079) and objsubid 0, then re-emits
-		// `COMMENT ON EXTENSION <name> IS '...'`. Without this a COMMENT ON
-		// EXTENSION was silently swallowed (parser dropped it) and never reached
-		// pg_description, so pg_dump could not re-emit it. DU-002 slice 388.
+		// `COMMENT ON EXTENSION <name> IS '...'`. DU-002 slice 388.
 		oid := im.ExtensionOID(s.ObjName.Name)
 		if oid == 0 {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("extension %q does not exist", s.ObjName.Name)}
 		}
 		im.SetComment(oidPgExtension, oid, 0, s.Description)
 	case "collation":
@@ -15603,13 +15613,13 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// (tableoid=pg_collation=3456) and objsubid 0, then re-emits
 		// `COMMENT ON COLLATION <schema>.<name> IS '...'`. Resolve the user
 		// collation's OID by name via the same registry getCollations dumps from.
-		// Built-in collations report OID 0 here (pg_dump never dumps their
-		// comments), so a COMMENT ON a built-in is a harmless no-op. Without this a
-		// COMMENT ON COLLATION was silently swallowed (parser dropped it) and never
-		// reached pg_description, so pg_dump could not re-emit it. DU-002 slice 390.
+		// A COMMENT on a built-in raises real PG's own "for encoding" wording
+		// (get_collation_oid, namespace.c) — goopg is always UTF8. DU-002
+		// slice 390.
 		uc, ok := im.CollationAttrsByName(s.ObjName.Name)
 		if !ok || uc.OID == 0 {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("collation %q for encoding %q does not exist", s.ObjName.String(), "UTF8")}
 		}
 		im.SetComment(oidPgCollation, uc.OID, 0, s.Description)
 	case "cast":
@@ -15617,36 +15627,44 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		// comment lookup on the cast's catalogId (tableoid=pg_cast=2605) and
 		// objsubid 0, then re-emits `COMMENT ON CAST (<source> AS <target>)
 		// IS '...'`. Resolve the user cast's OID by its (source, target) type
-		// pair via the same registry getCasts dumps from. A COMMENT on a cast
-		// goopg never registered (e.g. a built-in coercion) is a harmless no-op.
-		// Without this a COMMENT ON CAST was silently swallowed (parser dropped
-		// it) and never reached pg_description. DU-002 slice 396.
+		// pair via the same registry getCasts dumps from. DU-002 slice 396.
 		cst := im.CastByTypes(s.CastSource, s.CastTarget)
 		if cst == nil || cst.OID == 0 {
-			return nil
+			fromCanon := dropCompatCanonicalType(s.CastSource)
+			if fromCanon == "" {
+				fromCanon = s.CastSource
+			}
+			toCanon := dropCompatCanonicalType(s.CastTarget)
+			if toCanon == "" {
+				toCanon = s.CastTarget
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("cast from type %s to type %s does not exist", fromCanon, toCanon)}
 		}
 		im.SetComment(oidPgCast, cst.OID, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		im.SetComment(oidPgClass, idx.OID, 0, s.Description)
 	case "column":
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		for i, col := range tbl.Columns {
 			if strings.EqualFold(col.Name, s.SubName) {
 				im.SetComment(oidPgClass, tbl.OID, int32(i+1), s.Description)
-				break
+				return nil
 			}
 		}
+		return &ExecError{Code: "42703", Pos: s.Pos(),
+			Message: fmt.Sprintf("column %q of relation %q does not exist", s.SubName, s.ObjName.String())}
 	case "constraint":
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		for _, nc := range tbl.NamedChecks {
 			if strings.EqualFold(nc.Name, s.SubName) {
@@ -15663,9 +15681,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		}
 		// UNIQUE / PRIMARY KEY / EXCLUDE constraints are backed by indexes whose
 		// Name equals the constraint name; the index OID is the pg_constraint OID
-		// emitted by pg_constraint's VirtualRows. Without this, a COMMENT ON these
-		// constraint kinds was silently dropped and never reached pg_description,
-		// so pg_dump could not re-emit it. DU-002 slice 144.
+		// emitted by pg_constraint's VirtualRows. DU-002 slice 144.
 		for _, idx := range im.IndexesOnTable(tbl) {
 			if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
 				im.SetComment(oidPgConstraint, idx.OID, 0, s.Description)
@@ -15679,16 +15695,17 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("constraint %q for table %q does not exist", s.SubName, tbl.Name)}
 	case "trigger":
 		// Triggers live in pg_trigger (classoid 2620). pg_dump's dumpTrigger keys
 		// the comment lookup on the trigger's catalogId.tableoid (pg_trigger =
 		// 2620) and objsubid 0, then re-emits `COMMENT ON TRIGGER <name> ON
 		// <table> IS '...'`. Resolve the trigger by name on the named table.
-		// Without this a COMMENT ON TRIGGER was silently swallowed (parser dropped
-		// it) and never reached pg_description. DU-002 slice 370.
+		// DU-002 slice 370.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		for _, trig := range tbl.Triggers {
 			if strings.EqualFold(trig.Name, s.SubName) && trig.OID != 0 {
@@ -15696,16 +15713,17 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("trigger %q for table %q does not exist", s.SubName, tbl.Name)}
 	case "policy":
 		// Policies live in pg_policy (classoid 3256). pg_dump's dumpPolicy keys
 		// the comment lookup on the policy's catalogId (tableoid=pg_policy=3256)
 		// and objsubid 0, then re-emits `COMMENT ON POLICY <name> ON <table>
-		// IS '...'`. Resolve the policy by name on the named table. Without this
-		// a COMMENT ON POLICY was silently swallowed (parser dropped it) and never
-		// reached pg_description. DU-002 slice 371.
+		// IS '...'`. Resolve the policy by name on the named table. DU-002
+		// slice 371.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		for _, pol := range tbl.Policies {
 			if strings.EqualFold(pol.Name, s.SubName) && pol.OID != 0 {
@@ -15713,17 +15731,18 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("policy %q for table %q does not exist", s.SubName, tbl.Name)}
 	case "rule":
 		// Rules live in pg_rewrite (classoid 2618). pg_dump's dumpRule keys the
 		// comment lookup on the rule's catalogId (tableoid=pg_rewrite=2618) and
 		// objsubid 0, then re-emits `COMMENT ON RULE <name> ON <table> IS '...'`.
 		// goopg models each CREATE RULE as a catalog.RuleInfo (with its own OID)
 		// on the owning table (DU-002 slice 324); resolve the rule by name there.
-		// Without this a COMMENT ON RULE was silently swallowed (parser dropped
-		// it) and never reached pg_description. DU-002 slice 372.
+		// DU-002 slice 372.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
-			return nil
+			return undefinedRelation()
 		}
 		for _, r := range tbl.Rules {
 			if strings.EqualFold(r.Name, s.SubName) && r.OID != 0 {
@@ -15731,21 +15750,23 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("rule %q for relation %q does not exist", s.SubName, tbl.Name)}
 	case "statistics":
 		stat, ok := im.LookupStatistics(s.ObjName.Name)
 		if !ok {
-			return nil
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("statistics object %q does not exist", s.ObjName.String())}
 		}
 		im.SetComment(oidPgStatisticExt, stat.OID, 0, s.Description)
 	case "function":
 		// Functions live in pg_proc (classoid 1255). Resolve the routine by
 		// name + argument signature (mirrors DROP FUNCTION's resolution) so the
-		// correct overload is keyed. Without this a COMMENT ON FUNCTION was
-		// silently swallowed and never reached pg_description, so pg_dump could
-		// not re-emit it. DU-002 slice 147.
+		// correct overload is keyed. DU-002 slice 147.
 		rs := im.Routines()
 		if rs == nil {
-			return nil
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("function %s does not exist", commentOnFuncSig(s))}
 		}
 		argTypes := make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
@@ -15753,11 +15774,35 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		}
 		r, ok := rs.Lookup(s.ObjName, argTypes)
 		if !ok || r == nil {
-			return nil
+			return &ExecError{Code: "42883", Pos: s.Pos(),
+				Message: fmt.Sprintf("function %s does not exist", commentOnFuncSig(s))}
 		}
 		im.SetComment(oidPgProc, r.OID, 0, s.Description)
 	}
 	return nil
+}
+
+// commentOnFuncSig renders "name(type1, type2)" for a COMMENT ON FUNCTION
+// "does not exist" error (42883, ERRCODE_UNDEFINED_FUNCTION), mirroring PG's
+// func_signature_string (used by LookupFuncWithArgs) and the equivalent
+// helper in DROP FUNCTION's error path. DU-002 slice 436.
+func commentOnFuncSig(s *parser.CommentOnStmt) string {
+	sig := s.ObjName.Name + "("
+	if s.Args != nil {
+		parts := make([]string, len(s.Args))
+		for i, a := range s.Args {
+			canon := dropCompatCanonicalType(a.Type.Name)
+			if canon == "" {
+				canon = strings.ToLower(a.Type.Name)
+			}
+			if a.Type.IsArray {
+				canon += "[]"
+			}
+			parts[i] = canon
+		}
+		sig += strings.Join(parts, ", ")
+	}
+	return sig + ")"
 }
 
 // execCreateStatistics registers a new extended statistics object. M0097-0023.

@@ -182,21 +182,25 @@ func TestCommentOnAccessMethodStoresDescription(t *testing.T) {
 	}
 }
 
-// TestCommentOnUnknownAccessMethodIsNoop pins the (pre-existing,
-// slice-434-inherited) convention shared by every COMMENT ON <top-level
-// object> case in execCommentOn: an unresolvable object name is a silent
-// no-op rather than a 42704 error. This diverges from real PostgreSQL, which
-// raises `access method "..." does not exist` (verified live against PG
-// 18.3) — flagged in the DU-002 slice 434 ledger row as a pre-existing,
-// out-of-scope gap shared by every other object kind in this function
-// (server/FDW/extension/etc.), not something newly introduced here. This
-// test pins goopg's actual (divergent) current behavior so a future fix
-// updates the test deliberately instead of it silently starting to fail.
-func TestCommentOnUnknownAccessMethodIsNoop(t *testing.T) {
+// TestCommentOnUnknownAccessMethodErrors pins the DU-002 slice 436 fix: an
+// unresolvable COMMENT ON ACCESS METHOD name now raises the same 42704
+// `access method "..." does not exist` error real PostgreSQL 18.3 raises
+// (verified live), replacing the silent no-op the slice 434 row had flagged
+// as a pre-existing, out-of-scope divergence.
+func TestCommentOnUnknownAccessMethodErrors(t *testing.T) {
 	ctx, _, cleanup := newStorageFixture(t)
 	defer cleanup()
 
-	if err := runDDL(t, ctx, `COMMENT ON ACCESS METHOD nosuchmethod IS 'x'`); err != nil {
-		t.Fatalf("COMMENT ON ACCESS METHOD (unknown name): %v", err)
+	err := runDDL(t, ctx, `COMMENT ON ACCESS METHOD nosuchmethod IS 'x'`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42704" {
+		t.Errorf("Code=%q want 42704", ee.Code)
+	}
+	want := `access method "nosuchmethod" does not exist`
+	if ee.Message != want {
+		t.Errorf("Message=%q want %q", ee.Message, want)
 	}
 }
