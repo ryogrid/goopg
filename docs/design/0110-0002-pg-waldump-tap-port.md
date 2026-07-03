@@ -175,3 +175,37 @@ pruning) has the same "HOT-class path skips canonical FPI" gap. Pruning
 reclaims dead space without changing live tuple data, so it may not matter for
 crash/standby correctness the way the HOT-update gap did, but it was flagged
 and not checked.
+
+## 2026-07-03: prune/VACUUM canonical-WAL audit (confirmed, not fixed)
+
+Followed up on the flag above. Confirmed the gap exists, and it is bigger than
+the flag anticipated:
+
+- **Opportunistic prune** (`tryApplyHOTUpdate`'s page-full fallback,
+  `operators_storage.go` ~3225-3234 → `markHeapPruneOptDirty` ~2714) calls
+  only `pool.LogHeapPruneOpt()` — goopg's native `RecordKindHeapPruneOpt`
+  (`internal/wal/recovery.go:105`). No `ctx.LogCanonical` call anywhere in the
+  function.
+- **Real `VACUUM`** (`operators_vacuum.go`'s `vacuumOp.Next` →
+  `vacuum.VacuumWithOptions`, `internal/vacuum/vacuum.go:56`) has the identical
+  gap, and is architecturally the more important case since VACUUM is the
+  common real-world trigger for pruning. `internal/vacuum` has no
+  `LogCanonical`-shaped parameter at all today.
+- Ruled out `maybeEmitFPI`/`logFPI` (`internal/storage/bufpool.go:1182`) as an
+  implicit safety net — it also only emits a goopg-native record
+  (`RecordKindPageImage`, `wal.EncodePageImage`), not a PG rmgr-decodable one.
+
+Net effect: a page whose only WAL activity since its last canonical touch is
+pruning/VACUUM is invisible to `pg_waldump` in every mode (not just
+`--save-fullpage`), and a real PG18 standby attached via `ctx.LogCanonical`
+would drift from the primary's line-pointer/redirect state (live tuple data
+is unaffected).
+
+Not a blocker for any currently `pass_required` test — `WD-003` above exercises
+CTAS + HOT-UPDATE only, no VACUUM. No code changed this loop; implementing the
+fix (a new `catalog.PgCanonicalHeapPrune`, mirroring `PgCanonicalHeapInplace`'s
+single-full-page-image approach, plus wiring into both call sites above) is a
+new-capability addition — a public API change on `vacuum.VacuumWithOptions`
+touching every caller, not a copy-paste. Full trace + concrete resume point in
+the deferral ledger (task-id `M0119-0005`, row dated 2026-07-03, immediately
+after the WD-003 row).

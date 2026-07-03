@@ -5467,6 +5467,17 @@ documentation-only and is exempt from the design-doc requirement.)
       section). **`002_save_fullpage.pl` (WD-003) DONE.** **Remaining:**
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering)
       — needs hash/gin/gist/spgist/brin AMs, unrelated to the WD-003 fix below.
+      **Also confirmed backlog (2026-07-03 audit, no `pass_required` test
+      depends on it yet):** page-pruning (both the opportunistic
+      `markHeapPruneOptDirty` path, `internal/executor/operators_storage.go`
+      ~2714, and the real `VACUUM` path, `internal/vacuum/vacuum.go`
+      `VacuumWithOptions`) emits only goopg's native WAL record kinds, never a
+      PG-canonical (`ctx.LogCanonical`) record — so `pg_waldump` sees zero
+      records for any page whose only WAL activity is pruning/VACUUM, in any
+      mode. See deferral ledger row (task-id `M0119-0005`, dated 2026-07-03,
+      the one after the WD-003 row) for the full trace and a concrete
+      implementation resume point (`catalog.PgCanonicalHeapPrune` + wiring at
+      both call sites).
 - [x] **`pg_waldump --save-fullpage` (WD-003, `002_save_fullpage.pl`).**
       **COMPLETE 2026-07-03:** `TestPort_PgWaldump002SaveFullpage`
       (`internal/testport/pgwaldump_savefullpage_test.go`) now PASSes (was
