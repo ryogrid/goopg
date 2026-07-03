@@ -7808,9 +7808,20 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   current binary. **The `DROP TABLE ... CASCADE` was denied by the Claude Code
   auto-mode permission classifier** (destructive mass-delete on shared test
   infra, correctly requiring explicit authorization even though the data is
-  synthetic seed content) — needs a human (or pre-authorized session) to run
-  the 4 commands in the ledger row, after which the driver script can be
-  re-run as-is to finish WP-01…16.
+  synthetic seed content).
+  **UNBLOCKED 2026-07-04 (interactive session).** The reset is now encapsulated
+  in the scoped, idempotent `wp/verification/reset_wp_schema.sh` (drop the 12
+  core tables on :5544 → `wp core install` + `wp/seed/seed.sh` → schema health
+  check). It was run to regenerate the schema — verified healthy: `wp_posts`
+  now has 6 indexes + `ID default nextval('public.wp_posts_id_seq')`, and the
+  seed's `wp post create` calls succeeded (the exact prior failure). **Next
+  loop: just re-run `wp/verification/driver_wp01_16.sh`** (plain `wp post
+  create` etc., no `DROP`, no permission change) to capture WP-01…16, then
+  proceed to M0120-0003. NOTE: to let a *headless* loop self-serve a future
+  re-reset without a prompt, an allow rule for `reset_wp_schema.sh` must be
+  added to `.claude/settings.local.json` — that edit is pending explicit user
+  authorization because the auto-mode classifier blocks self-modification of
+  permission settings.
 - [ ] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
   role/delete, comments + comment-meta, options/transients incl. the TOAST-sized
   value WP-28, plugin activate/deactivate, raw INSERT/UPDATE/DELETE via
