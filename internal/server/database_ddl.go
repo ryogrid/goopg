@@ -36,6 +36,7 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -531,6 +532,39 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 		return true, "", nil
 	}
 	return false, "", nil
+}
+
+// handleDatabaseDDLBypass runs tryHandleDatabaseDDL against sql and, when it
+// applies, writes the resulting NoticeResponse/CommandComplete/ReadyForQuery
+// sequence (or the mapped ErrorResponse) directly to w — the simple-query
+// wire-response shape shared by both of dispatchSimpleQueryViaExecutor's two
+// call sites (the DROP DATABASE pre-parse check and the CREATE/ALTER
+// DATABASE parse-failure fallback). Returns handled=false when sql isn't a
+// database-DDL bypass form (or the bypass degrades to legacy no-op, e.g. no
+// catalog plumbed), so the caller continues its normal dispatch path.
+func (s *Server) handleDatabaseDDLBypass(sql, liveDBName string, resolveCurrent currentGUCResolver, w *protocol.FrameWriter) (handled bool, err error) {
+	handled, notice, herr := s.tryHandleDatabaseDDL(sql, liveDBName, resolveCurrent)
+	if !handled {
+		return false, nil
+	}
+	if herr != nil {
+		return true, s.writeQueryError(w, databaseDDLErrorSQLState(herr), herr.Error())
+	}
+	if notice != "" {
+		if err := w.WriteNoticeResponse([]protocol.ErrorField{
+			{Code: protocol.FieldSeverity, Value: "NOTICE"},
+			{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+			{Code: protocol.FieldSQLState, Value: "00000"},
+			{Code: protocol.FieldMessage, Value: notice},
+		}); err != nil {
+			return true, err
+		}
+	}
+	tag := databaseDDLCommandTag(sql)
+	if err := w.WriteCommandComplete(tag); err != nil {
+		return true, err
+	}
+	return true, w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
 
 // databaseRegistry is the subset of catalog.Catalog the database-DDL

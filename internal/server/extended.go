@@ -44,6 +44,7 @@ type boundParam struct {
 type extendedMessageError struct {
 	Code     sqlstate.Code
 	Message  string
+	Detail   string // errdetail text; "" = omit FieldDetail
 	Routine  string
 	Position int // 1-based byte offset; 0 = omit FieldPosition
 }
@@ -53,11 +54,13 @@ type extendedQueryResult struct {
 	Rows       [][][]byte
 	CommandTag string
 	Empty      bool
+	Notice     string // NoticeResponse text to emit before CommandComplete; "" = none
 }
 
 type extendedQueryError struct {
 	Code     sqlstate.Code
 	Message  string
+	Detail   string // errdetail text; "" = omit FieldDetail
 	Position int // 1-based byte offset; 0 = omit FieldPosition
 }
 
@@ -82,6 +85,9 @@ func (s *Server) writeExtendedMessageError(w *protocol.FrameWriter, em *extended
 	}
 	if em.Position > 0 {
 		fields = append(fields, protocol.ErrorField{Code: protocol.FieldPosition, Value: strconv.Itoa(em.Position)})
+	}
+	if em.Detail != "" {
+		fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: em.Detail})
 	}
 	return w.WriteErrorResponse(fields)
 }
@@ -316,7 +322,17 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	if portal.Result == nil {
 		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum, state.DBName, connTx)
 		if qerr != nil {
-			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
+			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Detail: qerr.Detail, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
+		}
+		if res.Notice != "" {
+			if err := w.WriteNoticeResponse([]protocol.ErrorField{
+				{Code: protocol.FieldSeverity, Value: "NOTICE"},
+				{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
+				{Code: protocol.FieldSQLState, Value: "00000"},
+				{Code: protocol.FieldMessage, Value: res.Notice},
+			}); err != nil {
+				return nil, err
+			}
 		}
 		portal.Result = res
 		portal.RowPos = 0

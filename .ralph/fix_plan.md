@@ -5331,6 +5331,81 @@ documentation-only and is exempt from the design-doc requirement.)
       RESET, so `pg_db_role_setting` keeps a stale blank-`setconfig` row
       where real PG deletes it entirely — pre-existing, reproduces for named
       roles too, out of this loop's bounded scope.**
+      **2026-07-03 (loop #83): phantom empty-`setconfig` `pg_db_role_setting`
+      row after last RESET FIXED** — closes the loop #82 deferral above.
+      `ResetDatabaseConfig`/`ResetRoleConfig` (`internal/catalog/catalog.go`)
+      now `delete()` the map key outright when the last entry is removed,
+      mirroring `ResetAllDatabaseConfig`/`ResetAllRoleConfig`'s existing
+      full-delete semantics; `AllRoleConfigRows` had no `len(entries) > 0`
+      guard (unlike the `setrole=0` branch beside it), so a lingering
+      empty-slice map entry always surfaced as a spurious row with
+      `setconfig={}`. Tests: `TestResetDatabaseConfigLastEntryDeletesMapKey`/
+      `TestResetRoleConfigLastEntryDeletesMapKey`. Gates: build/vet clean;
+      `internal/catalog`+`internal/server`+`internal/initdb` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS. Design doc: "Follow-up: phantom
+      empty-`setconfig` row after last RESET (loop #83)", indexed as
+      `0119-0004cu`. No new deferrals.
+      **2026-07-03 (loop #84): extended-protocol dispatch hook for
+      CREATE/DROP/ALTER DATABASE/ROLE LANDED** — closes the standing
+      "extended-protocol path has no equivalent hook" residual named by
+      every M0119-0004-ACLHEAP row since loop #17. New
+      `Server.tryHandleDatabaseOrRoleDDLExtended`
+      (`internal/server/dispatch_extended.go`) mirrors the simple-query
+      bypass, wired into `executeExtendedQueryViaExecutor`'s parse-error
+      branch; a client defaulting to the Parse/Bind/Execute protocol
+      (JDBC/npgsql/psycopg2) previously got a silent 42601 for these DDL
+      forms instead of the DDL applying. Tests:
+      `TestExtendedProtocolDatabaseAndRoleDDL`/
+      `TestExtendedProtocolRoleDDLError`
+      (`internal/server/dispatch_extended_ddl_test.go`). Gates: build/vet
+      clean; `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS.
+      Design doc: "Follow-up: extended-protocol dispatch hook for
+      DATABASE/ROLE DDL (loop #84)", indexed as `0119-0004cv`. Deferred
+      (ledger row appended): (1) NoticeResponse forwarding, (2) errdetail
+      forwarding, and (3) `compatNoopCommandTag`'s much broader
+      extended-protocol gap.
+      **2026-07-03 (loop #85): extended-protocol Notice/Detail forwarding
+      LANDED, plus a real `DROP DATABASE` dead-stub bug FOUND AND FIXED** —
+      closes loop #84's deferred items (1)/(2). `extendedQueryResult` gained
+      `Notice string`; `extendedQueryError`/`extendedMessageError` gained
+      `Detail string`; `handleExecuteFrame`/`writeExtendedMessageError` wire
+      them through. While writing the regression test for (1)
+      (`DROP DATABASE IF EXISTS <nonexistent>` should emit a NOTICE), found
+      that `DROP DATABASE` has real parser grammar (`DropCompatStmt`'s
+      `database` arm, added after M0054-0001's catalog-backed bypass,
+      unaware of it) so `parser.Parse` never fails for it — the real
+      catalog-backed `tryHandleDatabaseDDL` DROP branch was entirely
+      unreachable on BOTH protocols, and every `DROP DATABASE` instead hit
+      `execDropCompat`'s `objType == "database"` arm
+      (`internal/executor/operators_ddl.go` ~13236), a hardcoded
+      pre-catalog-tracking stub that always reports "does not exist"
+      regardless of real catalog state. `DROP DATABASE` on a database a
+      prior `CREATE DATABASE` actually created therefore ALWAYS spuriously
+      failed — a real, protocol-independent correctness bug invisible to
+      prior unit tests (they called `tryHandleDatabaseDDL` directly,
+      bypassing the wire-dispatch entry point where the parser wins). Fixed
+      with a pre-`parser.Parse` check
+      (`classifyDatabaseDDL(sql) == databaseDDLDrop`) in both
+      `dispatchSimpleQueryViaExecutor` and `executeExtendedQueryViaExecutor`,
+      routing to a new shared `Server.handleDatabaseDDLBypass` helper
+      (factored out of the pre-existing inlined notice/error/tag/
+      `ReadyForQuery` sequence) so the real catalog-backed DROP wins over the
+      dead stub; falls through unchanged to the legacy stub when no real
+      catalog is plumbed (embedded/test paths). Tests:
+      `TestExtendedProtocolDatabaseDDLNotice`,
+      `TestExtendedProtocolRoleDDLErrorDetail`,
+      `TestSimpleQueryDropDatabaseActuallyDrops`
+      (`internal/server/dispatch_extended_ddl_test.go`). Gates: build/vet
+      clean; `internal/server`+`internal/catalog`+`internal/parser`+
+      `internal/executor`+`internal/initdb` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      `scripts/ralph-precommit-test.sh` PASS. Design doc: "Follow-up:
+      extended-protocol Notice/Detail forwarding + a real `DROP DATABASE`
+      dead-stub bug found while testing it (loop #85)", indexed as
+      `0119-0004cw`. Deferred (ledger row appended): item (3)
+      (`compatNoopCommandTag`'s extended-protocol parity) remains open,
+      unchanged; the parser grammar + executor stub for `DROP DATABASE` are
+      left in place as the intentional no-catalog fallback, not deleted.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -28,6 +28,15 @@ import (
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
 func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string, connTx *connTxState) (*extendedQueryResult, *extendedQueryError) {
+	// DROP DATABASE has real parser grammar (a generic no-op DDL absorption,
+	// DropCompatStmt) that would otherwise shadow tryHandleDatabaseDDL's real
+	// catalog-backed DROP entirely — see dispatchSimpleQueryViaExecutor's
+	// identical pre-parse check (dispatch.go) for the full explanation.
+	if kind, _ := classifyDatabaseDDL(query); kind == databaseDDLDrop {
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+			return res, qerr
+		}
+	}
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		// CREATE/DROP/ALTER DATABASE and CREATE/DROP/ALTER ROLE are not
@@ -340,15 +349,15 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *
 		_, eff, ok := sess.GetDisplay(name)
 		return eff, ok
 	})
-	if handled, _, herr := s.tryHandleDatabaseDDL(query, dbName, resolveCurrentGUC); handled {
+	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, resolveCurrentGUC); handled {
 		if herr != nil {
 			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error()}, true
 		}
-		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query)}, nil, true
+		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query), Notice: notice}, nil, true
 	}
 	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC); handled {
 		if herr != nil {
-			return nil, &extendedQueryError{Code: roleErrorSQLState(herr), Message: herr.Error()}, true
+			return nil, &extendedQueryError{Code: roleErrorSQLState(herr), Message: herr.Error(), Detail: roleErrorDetail(herr)}, true
 		}
 		norm := normalizeCompatSQL(query)
 		var tag string

@@ -885,3 +885,13 @@ func roleErrorDetailFields(err error) []protocol.ErrorField {
 	}
 	return nil
 }
+
+// roleErrorDetail returns a role error's bare errdetail text (the
+// extended-protocol counterpart of roleErrorDetailFields, whose wire-field
+// wrapping is simple-query-only). "" when err carries no PG errdetail.
+func roleErrorDetail(err error) string {
+	if re, ok := err.(*roleError); ok {
+		return re.detail
+	}
+	return ""
+}

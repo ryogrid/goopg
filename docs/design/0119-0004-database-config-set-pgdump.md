@@ -699,3 +699,91 @@ Resume points: (1)/(2) — add the missing field(s) to `extendedQueryResult`/
 `writeExtendedMessageError`. (3) — a dedicated loop scoped to
 `compatNoopCommandTag`'s extended-protocol parity, likely its own
 M0119-0004 sub-task given the breadth of statement forms it covers.
+
+## Follow-up: extended-protocol Notice/Detail forwarding + a real `DROP DATABASE` dead-stub bug found while testing it (loop #85)
+
+Sets out to close deferred items (1) and (2) of the loop #84 row above: a
+`NoticeResponse` and an errdetail (`FieldDetail`) sub-field were both
+unreachable on the extended-query-protocol response path.
+
+**Plumbing landed:** `extendedQueryResult` gained `Notice string`;
+`extendedQueryError`/`extendedMessageError` both gained `Detail string`
+(`internal/server/extended.go`). `writeExtendedMessageError` now appends a
+`FieldDetail` `ErrorField` when `em.Detail != ""`. `handleExecuteFrame`
+writes a `NoticeResponse` (same four fields the simple-query path's inline
+`w.WriteNoticeResponse` call uses: Severity/SeverityNonLocal/SQLState=00000/
+Message) right after computing a fresh `portal.Result`, before any
+`CommandComplete`/`DataRow` write, whenever `res.Notice != ""`; propagates
+`qerr.Detail` into the `extendedMessageError` it builds on the error path.
+`tryHandleDatabaseOrRoleDDLExtended` now captures `tryHandleDatabaseDDL`'s
+`notice` return (previously discarded with `_`) into the result's `Notice`
+field, and a new `roleErrorDetail(err) string` helper (`role_ddl.go`, the
+bare-string counterpart of the existing `roleErrorDetailFields` wire-field
+wrapper) feeds `roleError.detail` into the `extendedQueryError.Detail` built
+for a role-DDL error.
+
+**Real bug found while writing the regression test for (1):** the natural
+test — `DROP DATABASE IF EXISTS <nonexistent>` over the extended protocol,
+expecting the notice — failed with an EMPTY notice. Root cause: `DROP
+DATABASE` has real parser grammar (`parser.parseDropTail`'s `database` arm,
+`internal/parser/ddl.go` ~4898, added 2026-06-01 commit `efd725af` — after
+M0054-0001's catalog-backed bypass below it, unaware of it), so
+`parser.Parse` **succeeds** for every `DROP DATABASE` statement, in both
+protocols. That means `tryHandleDatabaseDDL`'s dedicated DROP branch
+(`internal/server/database_ddl.go`, the one with the real `notice` return
+this follow-up was trying to test) was **entirely unreachable** — both
+`dispatchSimpleQueryViaExecutor` and `executeExtendedQueryViaExecutor` only
+call it from their `parser.Parse` *failure* branch. A successfully-parsed
+`DROP DATABASE` instead routes through the executor's generic
+`DropCompatStmt` handling, whose `objType == "database"` arm
+(`internal/executor/operators_ddl.go` ~13236, committed the same day as the
+parser grammar, `efd725af`) is a **hardcoded pre-catalog-tracking stub**: it
+always emits "does not exist[, skipping]" (or the 3D000 error) regardless of
+what `catalog.InMemory`'s `databases` registry actually holds — it never
+calls `DropDatabase` at all. Net effect: `DROP DATABASE` on a database a
+prior `CREATE DATABASE` in the same session actually created **always**
+failed with a spurious "does not exist", a real correctness bug (not
+specific to the extended protocol — `TestSimpleQueryDropDatabaseActuallyDrops`
+below reproduces it over the simple-query protocol too), invisible to the
+pre-existing unit tests because they all called `tryHandleDatabaseDDL`
+directly rather than driving it through the real wire-dispatch entry point.
+
+**Fix:** a pre-`parser.Parse` check in both dispatch entry points —
+`if kind, _ := classifyDatabaseDDL(sql); kind == databaseDDLDrop` — routes
+straight to a new shared `Server.handleDatabaseDDLBypass(sql, liveDBName,
+resolveCurrent, w) (handled bool, err error)` helper (`database_ddl.go`,
+factored out of `dispatchSimpleQueryViaExecutor`'s previously-inlined
+notice/error/tag/`ReadyForQuery` sequence) before the parser ever sees the
+statement, so the real catalog-backed `tryHandleDatabaseDDL` DROP branch
+wins over the dead executor stub. `CREATE`/`ALTER DATABASE` need no such
+pre-check — the parser has no grammar for them at all, so `parser.Parse`
+already fails and hits the existing post-parse-failure call to the same
+helper. `executeExtendedQueryViaExecutor` gained the identical pre-check
+(calling the existing `tryHandleDatabaseOrRoleDDLExtended`, not a new
+extended-only helper). When `s.cfg.Catalog` is nil or not a
+`databaseRegistry` (embedded/test paths), `handleDatabaseDDLBypass` returns
+`handled=false` exactly as `tryHandleDatabaseDDL` always has, so both
+callers fall through to the pre-existing `parser.Parse` → `DropCompatStmt`
+stub path unchanged — preserving the legacy no-op behaviour those paths
+relied on. The parser grammar and the executor's `DropCompatStmt` stub are
+both left in place (untouched) as that intentional fallback; they are not
+now unreachable in the general case, only pre-empted whenever a real
+catalog is plumbed.
+
+Tests: `TestExtendedProtocolDatabaseDDLNotice` (extended-protocol `DROP
+DATABASE IF EXISTS` on a nonexistent name → `NoticeResponse` then
+`CommandComplete "DROP DATABASE"`), `TestExtendedProtocolRoleDDLErrorDetail`
+(`CREATE ROLE pg_*` → `42939` + the fixed pg_-prefix `FieldDetail` text),
+and `TestSimpleQueryDropDatabaseActuallyDrops` (real `CREATE DATABASE` →
+`DROP DATABASE` round-trip over the simple-query protocol, pinning the bug
+fix independent of the extended-protocol plumbing) — all new,
+`internal/server/dispatch_extended_ddl_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/server/...
+./internal/catalog/... ./internal/parser/... ./internal/executor/...
+./internal/initdb/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS; full `scripts/ralph-precommit-test.sh` PASS (pgbench smoke).
+
+No new deferrals for items (1)/(2) — both fully closed. Item (3)
+(`compatNoopCommandTag`'s extended-protocol parity) remains open, unchanged
+from loop #84, still a materially larger separate gap.

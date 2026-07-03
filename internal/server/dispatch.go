@@ -95,47 +95,43 @@ func maybeForceGCAfterCommit() {
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
 func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
+	resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
+		if sess == nil {
+			return "", false
+		}
+		_, eff, ok := sess.GetDisplay(name)
+		return eff, ok
+	})
+	// DROP DATABASE has real parser grammar (DropCompatStmt, a generic no-op
+	// DDL absorption added after M0054-0001's bypass below) that would
+	// otherwise shadow tryHandleDatabaseDDL's real catalog-backed DROP
+	// entirely: DropCompatStmt's "database" arm (internal/executor/
+	// operators_ddl.go execDropCompat) is a hardcoded pre-M0054-0001 stub
+	// that always reports "does not exist" regardless of catalog state, so
+	// parser.Parse succeeding for this statement must not be allowed to win.
+	// Checked here, before Parse, so it takes precedence; CREATE/ALTER
+	// DATABASE need no such pre-check because the parser has no grammar for
+	// them at all (parser.Parse always fails, hitting the bypass below).
+	if kind, _ := classifyDatabaseDDL(sql); kind == databaseDDLDrop {
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+			return err
+		}
+	}
 	// Parse uses the heap-backed tokenSlicePool (allocation-free in steady
 	// state). The M0107-0003 Phase C.3 mctx token-arena fast path was retired
 	// as fundamentally GC-unsafe — see docs/design/0107-0003d-token-pool-gc-safety.md
 	// — so we no longer acquire a throwaway KindExpr child just to pass it in.
 	stmts, err := parser.Parse(sql)
 	if err != nil {
-		// Resolves `ALTER DATABASE/ROLE ... SET <name> FROM CURRENT` against
-		// this connection's live session GUC state (mirrors PG's
-		// GetConfigOptionByName(name, NULL, false), see currentGUCResolver's
-		// doc comment). sess is nil on some embedded/test paths — the
-		// resolver degrades to "unrecognized" there, same as no live session.
-		resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
-			if sess == nil {
-				return "", false
-			}
-			_, eff, ok := sess.GetDisplay(name)
-			return eff, ok
-		})
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
-		// here (the parser doesn't recognise them yet) so we can
-		// (a) update the catalog so subsequent connections see the
-		// database in pg_database / can connect to it, and (b) emit a
-		// WAL record so the registration survives a crash. Other
-		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
-			if herr != nil {
-				return s.writeQueryError(w, databaseDDLErrorSQLState(herr), herr.Error())
-			}
-			if notice != "" {
-				_ = w.WriteNoticeResponse([]protocol.ErrorField{
-					{Code: protocol.FieldSeverity, Value: "NOTICE"},
-					{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
-					{Code: protocol.FieldSQLState, Value: "00000"},
-					{Code: protocol.FieldMessage, Value: notice},
-				})
-			}
-			tag := databaseDDLCommandTag(sql)
-			if err := w.WriteCommandComplete(tag); err != nil {
-				return err
-			}
-			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		// here (the parser doesn't recognise CREATE DATABASE / ALTER
+		// DATABASE) so we can (a) update the catalog so subsequent
+		// connections see the database in pg_database / can connect to
+		// it, and (b) emit a WAL record so the registration survives a
+		// crash. Other commands fall through to the wire-protocol no-op
+		// tag handler.
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+			return err
 		}
 		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE
 		// (which the parser does not recognise, so the whole batch lands here)

@@ -158,3 +158,118 @@ func TestExtendedProtocolRoleDDLError(t *testing.T) {
 		t.Fatalf("ALTER ROLE on nonexistent role: SQLSTATE=%q, want 42704 (undefined_object)", gotCode)
 	}
 }
+
+// TestExtendedProtocolDatabaseDDLNotice pins loop #84's item (1) residual:
+// tryHandleDatabaseDDL's notice return (e.g. DROP DATABASE IF EXISTS on a
+// nonexistent name) was silently dropped by
+// tryHandleDatabaseOrRoleDDLExtended — the DDL applied but the client never
+// saw the NOTICE a real PG / the simple-query path both emit. Verifies a
+// NoticeResponse frame now precedes CommandComplete over the wire.
+func TestExtendedProtocolDatabaseDDLNotice(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndCompleteDB(t, addr, "postgres")
+	defer conn.Close()
+
+	frames := extendedExec(t, conn, "dbnotice", `DROP DATABASE IF EXISTS extddl_ghost_db`)
+	var gotNotice string
+	for _, f := range frames {
+		if f.Type != protocol.MsgNoticeResponse {
+			continue
+		}
+		fields := parseErrorFields(t, f.Payload)
+		gotNotice = fields[protocol.FieldMessage]
+	}
+	wantNotice := `database "extddl_ghost_db" does not exist, skipping`
+	if gotNotice != wantNotice {
+		t.Fatalf("DROP DATABASE IF EXISTS: NoticeResponse message=%q, want %q", gotNotice, wantNotice)
+	}
+	tag, errPayload := commandCompleteTag(t, frames)
+	if errPayload != "" {
+		t.Fatalf("DROP DATABASE IF EXISTS: unexpected ErrorResponse: %s", errPayload)
+	}
+	if tag != "DROP DATABASE" {
+		t.Fatalf("DROP DATABASE IF EXISTS: CommandComplete tag=%q, want %q", tag, "DROP DATABASE")
+	}
+}
+
+// TestSimpleQueryDropDatabaseActuallyDrops pins a real bug this loop found
+// while wiring extended-protocol Notice forwarding: DROP DATABASE has real
+// parser grammar (DropCompatStmt, a generic no-op DDL absorption added after
+// M0054-0001's CREATE/DROP DATABASE catalog-backed bypass), so parser.Parse
+// always SUCCEEDED for "DROP DATABASE ..." and the query was silently routed
+// to execDropCompat's hardcoded "database" stub (pre-dates real database
+// catalog tracking; always reports "does not exist", ignoring catalog
+// state entirely) instead of tryHandleDatabaseDDL's real
+// catalog.DropDatabase call. DROP DATABASE on a database that genuinely
+// exists therefore always 3D000'd. Verifies CREATE DATABASE + DROP DATABASE
+// round-trips through the catalog for real over the simple-query protocol.
+func TestSimpleQueryDropDatabaseActuallyDrops(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	if err := sendSimpleQuery(conn, []byte("CREATE DATABASE extddl_dropme")); err != nil {
+		t.Fatalf("send CREATE DATABASE: %v", err)
+	}
+	frames := readUntilReady(t, conn)
+	tag, errPayload := commandCompleteTag(t, frames)
+	if errPayload != "" {
+		t.Fatalf("CREATE DATABASE: unexpected ErrorResponse: %s", errPayload)
+	}
+	if tag != "CREATE DATABASE" {
+		t.Fatalf("CREATE DATABASE: CommandComplete tag=%q, want %q", tag, "CREATE DATABASE")
+	}
+	if !im.HasDatabase("extddl_dropme") {
+		t.Fatal("extddl_dropme not registered in catalog after CREATE DATABASE")
+	}
+
+	if err := sendSimpleQuery(conn, []byte("DROP DATABASE extddl_dropme")); err != nil {
+		t.Fatalf("send DROP DATABASE: %v", err)
+	}
+	frames = readUntilReady(t, conn)
+	tag, errPayload = commandCompleteTag(t, frames)
+	if errPayload != "" {
+		t.Fatalf("DROP DATABASE on an existing database: unexpected ErrorResponse (this is the bug this test pins): %s", errPayload)
+	}
+	if tag != "DROP DATABASE" {
+		t.Fatalf("DROP DATABASE: CommandComplete tag=%q, want %q", tag, "DROP DATABASE")
+	}
+	if im.HasDatabase("extddl_dropme") {
+		t.Fatal("extddl_dropme still registered in catalog after DROP DATABASE")
+	}
+}
+
+// TestExtendedProtocolRoleDDLErrorDetail pins loop #84's item (2) residual:
+// roleErrorDetailFields' errdetail text (e.g. reservedRoleNameErr's fixed
+// pg_-prefix detail) had no extended-protocol counterpart — the
+// ErrorResponse carried Code/Message but silently dropped the FieldDetail a
+// real PG (and the simple-query path) both send for this exact error.
+func TestExtendedProtocolRoleDDLErrorDetail(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndCompleteDB(t, addr, "postgres")
+	defer conn.Close()
+
+	frames := extendedExec(t, conn, "crreserved", "CREATE ROLE pg_extddl_reserved LOGIN")
+	var gotCode, gotDetail string
+	for _, f := range frames {
+		if f.Type != protocol.MsgErrorResponse {
+			continue
+		}
+		fields := parseErrorFields(t, f.Payload)
+		gotCode = fields[protocol.FieldSQLState]
+		gotDetail = fields[protocol.FieldDetail]
+	}
+	if gotCode != "42939" {
+		t.Fatalf("CREATE ROLE pg_*: SQLSTATE=%q, want 42939 (reserved_name)", gotCode)
+	}
+	if gotDetail == "" {
+		t.Fatal("CREATE ROLE pg_*: ErrorResponse has no FieldDetail, want the pg_-prefix errdetail text")
+	}
+}
