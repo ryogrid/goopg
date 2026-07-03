@@ -13531,3 +13531,102 @@ whatever pg_class/heap row `syncTableToCatalogHeap` writes for a matview
 today (probably just `relkind='m'`, insufficient on its own — same shape of
 gap `RecordKindCreateIndex`'s doc comment describes for indexes, "goopg has
 no pg_index relation").
+
+## Follow-up: `ALTER VIEW` sub-forms complete the grammar (DU-002 slice 444)
+
+**2026-07-04.** Slice 440's deferral row left three `ALTER VIEW` sub-forms
+unmodeled — `RENAME [COLUMN] old TO new`, `ALTER [COLUMN] col SET/DROP
+DEFAULT`, and `SET`/`RESET (view_option_name [= value], ...)` — all falling
+to the catch-all no-op consume loop inside the `ALTER VIEW` parser case. Per
+`postgres/doc/src/sgml/ref/alter_view.sgml`, these three sub-forms plus the
+three slice-440 already closed (`RENAME TO`/`OWNER TO`/`SET SCHEMA`) are
+PG's **complete** `ALTER VIEW` grammar — seven `synopsis` lines, nothing
+else. This slice closes all three remaining forms in one pass:
+
+- **`RENAME [COLUMN] old TO new`**: previously the `p.acceptIdentKeyword
+  ("rename") && p.acceptKeyword(KwTo)` short-circuit already consumed the
+  `rename` token on ANY `RENAME ...` form, so a `RENAME COLUMN` fell through
+  to the catch-all no-op with `rename` already eaten — a silent no-op, same
+  bug class as slice 440. Split into an `if p.acceptIdentKeyword("rename")`
+  block that branches on whether `TO` follows immediately (plain rename) or
+  not (`RENAME [COLUMN] old TO new`, reusing the existing
+  `AlterTableRenameColumn` action).
+- **`ALTER [COLUMN] col SET DEFAULT expr` / `DROP DEFAULT`**: new parser
+  branch reusing `AlterTableSetDefault`/`AlterTableDropDefault` — the exact
+  actions `ALTER TABLE`'s own `ALTER COLUMN` form produces, so
+  `execAlterTable`'s existing dispatch needed no executor change (it mutates
+  `tbl.Columns[i].DefaultExpr` generically, not relkind-gated). This is PG's
+  updatable-view column-default mechanism (backs an `INSERT`/`UPDATE`
+  through the view when the target column is omitted).
+- **`SET`/`RESET (view_option_name [= value], ...)`**: reuses
+  `AlterTableSetReloptions`/`AlterTableResetReloptions` (views are
+  `catalog.Table` too, and the executor's reloption switch was already
+  generic over relkind). `execAlterTableSetReloptions`/
+  `ResetReloptions` gained two new cases, `security_barrier`/
+  `security_invoker` (`catalog.Table.SecurityBarrier`/`SecurityInvoker`,
+  boolean), immediately followed by a third, **`check_option`** — PG's enum
+  reloption (`local`/`cascaded`, case-insensitive per
+  `reloptions.c`'s `RELOPT_TYPE_ENUM` handling, `pg_strcasecmp`), rejecting
+  an invalid value with the same `22023 invalid value for enum option
+  "check_option": <val>` PG itself raises
+  (`postgres/src/backend/access/common/reloptions.c:1677`). All three
+  `view_option_name`s from the sgml doc are now handled — `check_option`
+  already had `catalog.Table.CheckOption`/`CREATE VIEW WITH` support
+  (`execCreateView`); this closes the `ALTER VIEW SET (check_option = ...)`
+  gap on the same field.
+
+### `RENAME COLUMN` pg_attribute heap-resync gap (found + closed, not
+introduced by this slice)
+
+Auditing `AlterTableRenameColumn`'s existing branch (reused unchanged by the
+new `ALTER VIEW RENAME COLUMN` case) found it had **no**
+`syncTableToCatalogHeap` call — unlike `SET STORAGE`/`SET COMPRESSION`/every
+other column-mutating `ALTER TABLE` arm in the same switch, which all
+explicitly delete-and-rewrite the affected relation's catalog heap rows
+because `pg_attribute` is a heap populated once at `CREATE TABLE` time (see
+`[[pg_attribute_alter_needs_heap_resync]]`). Without it, a column rename's
+new name never reaches `pg_dump`/a live `SELECT ... FROM pg_attribute` —
+this is a **pre-existing gap for ordinary `ALTER TABLE RENAME COLUMN` on
+tables too**, not specific to views (no prior test or ledger row covered
+it). Closed by adding the identical `deleteCatalogRowsForOID` +
+`syncTableToCatalogHeap` pattern to the `AlterTableRenameColumn` case,
+gated the same way (`catalogHeapSyncAvailable(o.ctx)`). Live-verified
+end-to-end (fresh scratch `goopg`, real `psql`/`pg_dump` PG 18.3 client):
+`CREATE TABLE t (a int, b int); ALTER TABLE t RENAME COLUMN a TO renamed_a`
+now round-trips `renamed_a` through both a live `SELECT ... FROM
+pg_attribute` and `pg_dump --schema-only`; a chained `CREATE VIEW v AS
+SELECT renamed_a, b FROM t; ALTER VIEW v RENAME COLUMN renamed_a TO va`
+also round-trips correctly when each statement is sent as its own simple
+Query message.
+
+### Fresh discovery (deferred, out of scope): multi-statement simple-query
+batch failure corrupts an EARLIER statement's catalog-heap resync
+
+While live-verifying the above, sending several statements in **one**
+simple-query message (`psql -c "stmt1; stmt2; stmt3"`, all `\;`-joined)
+where an EARLIER statement calls the delete-then-resync pattern (RENAME
+COLUMN, but reproduces identically with plain `SET STORAGE` — **unrelated
+to this slice's code**, a pre-existing and generic gap) and a LATER
+statement in the same batch **fails**, left the relation's `pg_attribute`
+heap rows **empty** (`SELECT attname FROM pg_attribute WHERE attrelid =
+'batch_t'::regclass` → 0 rows; `pg_dump` emits `CREATE TABLE public.batch_t
+(\n);` with no columns at all) — even though the table itself still exists
+and is otherwise queryable. Per PostgreSQL's documented simple-query
+semantics, multiple statements in one message run as a single implicit
+transaction: a later failure should roll back **everything**, including the
+earlier `CREATE TABLE`, so the table shouldn't exist at all afterward.
+goopg instead partially rolls back — the table registration survives but
+its catalog-heap sync does not — an atomicity violation, not merely a
+missing feature. Reproduced minimally: `CREATE TABLE t (a int); ALTER TABLE
+t ALTER COLUMN a SET STORAGE external; SELECT 1/0;` sent as one `psql -c`
+batch leaves `t`'s `pg_attribute` empty. Sending the identical statements as
+separate `psql -c` invocations (no batching) does not reproduce it. Resume
+point: `internal/server/dispatch.go`'s `dispatchSimpleQueryViaExecutor`
+(~line 97) and its per-statement loop/transaction handling, cross-referenced
+against `deleteCatalogRowsForOID`/`syncTableToCatalogHeap`
+(`internal/executor/operators_ddl.go`) — likely an MVCC-visibility ordering
+issue where the resync's xmax/xmin stamps are decided independently of
+whether the enclosing implicit batch transaction ultimately commits. Not
+fixed here: this is a WAL/MVCC-class transaction-atomicity bug (practice
+card: race detector + recovery/replication gates), not a parser-grammar
+change, and reproduces without any of this slice's diff.

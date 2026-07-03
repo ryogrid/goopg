@@ -7407,8 +7407,42 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						}
 					}
 				}
-				// Update stored view/matview ASTs that reference this column.
-				im.RenameColumnInViews(tbl.Name, oldColName, newColName)
+				// Update stored view/matview ASTs that reference this column —
+				// but only when tbl is itself a source TABLE: this propagates a
+				// table column rename into dependent views' inner SELECT lists
+				// (mirroring PG, where a view's compiled query addresses columns
+				// by attnum so a table rename needs no Var fixup, but goopg
+				// stores views as literal name-referencing ASTs). When tbl IS a
+				// view, RENAME COLUMN only changes the VIEW's own OUTPUT column
+				// name (what external queries call the view's i-th column) — the
+				// view's inner SELECT still reads the unchanged underlying table
+				// column, so rewriting it here would corrupt the view body
+				// (previously renamed_a would leak into the inner
+				// "SELECT a FROM src" query, which src does not have). DU-002
+				// slice 444.
+				if tbl.View == nil {
+					im.RenameColumnInViews(tbl.Name, oldColName, newColName)
+				}
+			}
+			// pg_attribute is a heap populated at CREATE TABLE (see SET
+			// STORAGE/SET COMPRESSION above); the in-memory Column.Name
+			// mutation above is invisible to pg_dump until the heap rows are
+			// deleted and rewritten from the current catalog.Table state,
+			// same delete-old-rows + syncTableToCatalogHeap pattern as every
+			// other column-mutating ALTER arm in this switch. Pre-existing
+			// gap for ordinary ALTER TABLE RENAME COLUMN too (not previously
+			// covered by any pg_dump test); closed here because DU-002 slice
+			// 444's new ALTER VIEW RENAME COLUMN reuses this exact action.
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
 			}
 		case parser.AlterTableInherit:
 			// INHERIT parent_table — register the named table as a parent of tbl
@@ -8160,6 +8194,42 @@ func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.Alter
 					Detail:  "Valid values are between \"128\" and \"8160\"."}
 			}
 			toastTupleTarget = &tt
+		case "security_barrier":
+			// View-only reloption (PG's view_reloptions); CREATE VIEW WITH
+			// already models it (s.SecurityBarrier at execCreateView) — ALTER
+			// VIEW ... SET (security_barrier = ...) reuses this same generic
+			// SET-reloptions path (views are catalog.Table too), so it must be
+			// handled here as well. DU-002 slice 444.
+			b, parsed := parseReloptionBool(strings.TrimSpace(v))
+			if !parsed {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for boolean option \"security_barrier\": %s", v)}
+			}
+			tbl.SecurityBarrier = b
+			tbl.SecurityBarrierSet = true
+		case "security_invoker":
+			b, parsed := parseReloptionBool(strings.TrimSpace(v))
+			if !parsed {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for boolean option \"security_invoker\": %s", v)}
+			}
+			tbl.SecurityInvoker = b
+			tbl.SecurityInvokerSet = true
+		case "check_option":
+			// View-only enum reloption (PG's view_reloptions), the third and
+			// last view_option_name alongside security_barrier/
+			// security_invoker above — CREATE VIEW WITH already models it
+			// (s.CheckOption at execCreateView); ALTER VIEW ... SET
+			// (check_option = ...) reuses this same generic path. PG compares
+			// case-insensitively (reloptions.c RELOPT_TYPE_ENUM,
+			// pg_strcasecmp) and stores the canonical lowercase form. DU-002
+			// slice 444.
+			co := strings.ToLower(strings.TrimSpace(v))
+			if co != "local" && co != "cascaded" {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for enum option \"check_option\": %s", v)}
+			}
+			tbl.CheckOption = co
 		default:
 			// Unrecognized but lowercase: accept and ignore (CREATE TABLE WITH
 			// behaves the same — it only stores the options it models).
@@ -8200,6 +8270,14 @@ func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.Alt
 			tbl.AutovacuumEnabledSet = false
 		case "toast_tuple_target":
 			tbl.ToastTupleTarget = 0
+		case "security_barrier":
+			tbl.SecurityBarrier = false
+			tbl.SecurityBarrierSet = false
+		case "security_invoker":
+			tbl.SecurityInvoker = false
+			tbl.SecurityInvokerSet = false
+		case "check_option":
+			tbl.CheckOption = ""
 		}
 	}
 }

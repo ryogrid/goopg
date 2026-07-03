@@ -499,6 +499,55 @@ prev-link fixes.
       restart), so the `SET SCHEMA` move on top of it doesn't survive
       either — needs new matview-specific catalog/WAL capability, not a
       parser-routing/tag fix.
+      **2026-07-04 (loop #58, DU-002 slice 444): `ALTER VIEW` grammar
+      completed in full.** Closes the three sub-forms slice 440's ledger row
+      left open — `RENAME [COLUMN] old TO new` (was a silent no-op, same bug
+      class as slice 440: the `rename`-token short-circuit already consumed
+      it before falling through to the catch-all no-op loop),
+      `ALTER [COLUMN] col SET DEFAULT expr` / `DROP DEFAULT` (PG's
+      updatable-view column-default mechanism), and `SET`/`RESET
+      (view_option_name [= value], ...)`. Per
+      `postgres/doc/src/sgml/ref/alter_view.sgml` these plus slice 440's
+      three (RENAME TO/OWNER TO/SET SCHEMA) are PG's complete 7-form ALTER
+      VIEW grammar — no ALTER VIEW gap remains. All new forms reuse existing
+      `AlterTableRenameColumn`/`AlterTableSetDefault`/`AlterTableDropDefault`/
+      `AlterTableSetReloptions`/`AlterTableResetReloptions` actions and
+      `execAlterTable`'s already-generic (relkind-agnostic) dispatch — no new
+      executor action kinds. `execAlterTableSetReloptions`/
+      `ResetReloptions` gained `security_barrier`/`security_invoker`
+      (boolean) and `check_option` (enum `local`/`cascaded`,
+      case-insensitive, PG's own `22023 invalid value for enum option`
+      wording from `reloptions.c:1677`) — the complete `view_option_name`
+      set. Also found and closed while auditing `RENAME COLUMN`:
+      `AlterTableRenameColumn` had no `syncTableToCatalogHeap` call at all
+      (every sibling column-mutating ALTER arm in the same switch — SET
+      STORAGE, SET COMPRESSION — has one), so a renamed column's new name
+      never reached `pg_dump`/live `pg_attribute` — a pre-existing gap for
+      ordinary `ALTER TABLE RENAME COLUMN` on tables too, not view-specific;
+      closed with the identical delete-then-resync pattern. Tests:
+      `TestAlterViewRenameColumn`/`AlterColumnSetDropDefault`/
+      `SetResetReloptions`/`SetResetCheckOption`
+      (`internal/executor/operators_alter_view_relation_ops_test.go`).
+      Design doc "Follow-up: `ALTER VIEW` sub-forms complete the grammar
+      (DU-002 slice 444)" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb`+`internal/server` suites PASS (full,
+      no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook; live `goopg`/`psql`/`pg_dump` (PG 18.3
+      client) smoke confirming both table and view `RENAME COLUMN` round-trip
+      through `pg_dump`. Deferred (ledger row appended, fresh discovery, NOT
+      introduced by this slice and NOT view-specific — reproduces
+      identically with plain `SET STORAGE`, no RENAME COLUMN or view
+      involved): a multi-statement simple-query batch where an earlier
+      statement's catalog-heap resync is followed by a later statement that
+      fails in the SAME batch leaves the relation's `pg_attribute` heap rows
+      empty rather than rolling back the whole implicit batch transaction as
+      real PostgreSQL's simple-query semantics require — an atomicity
+      violation in `internal/server/dispatch.go`'s
+      `dispatchSimpleQueryViaExecutor`, out of scope for this bounded
+      parser-grammar loop (WAL/MVCC-class transaction-atomicity bug).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

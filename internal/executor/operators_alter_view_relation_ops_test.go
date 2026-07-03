@@ -159,3 +159,171 @@ func TestAlterViewRenameOwnerSchemaCommandTag(t *testing.T) {
 		}
 	}
 }
+
+// TestAlterViewRenameColumn pins DU-002 slice 444: `ALTER VIEW name RENAME
+// [COLUMN] old TO new` previously fell through the `&& p.acceptKeyword(KwTo)`
+// short-circuit (which already consumed "RENAME") straight into the
+// catch-all no-op consume loop — a silent no-op, same class of bug as the
+// pre-slice-440 RENAME TO/OWNER TO/SET SCHEMA gap.
+func TestAlterViewRenameColumn(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE viewsrc5 (a int, b int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO viewsrc5 VALUES (1, 2)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW vrencol AS SELECT a, b FROM viewsrc5"); err != nil {
+		t.Fatalf("CREATE VIEW: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vrencol RENAME COLUMN a TO renamed_a"); err != nil {
+		t.Fatalf("ALTER VIEW RENAME COLUMN: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "vrencol"})
+	if !ok {
+		t.Fatalf("catalog lost the vrencol relation after RENAME COLUMN")
+	}
+	found := false
+	for _, col := range tbl.Columns {
+		if col.Name == "renamed_a" {
+			found = true
+		}
+		if col.Name == "a" {
+			t.Errorf("column %q still present after RENAME COLUMN a TO renamed_a", col.Name)
+		}
+	}
+	if !found {
+		t.Fatalf("column renamed_a not present after RENAME COLUMN")
+	}
+	rows := runQueryRows(t, ctx, "SELECT renamed_a, b FROM vrencol")
+	if len(rows) != 1 {
+		t.Fatalf("SELECT renamed_a, b FROM vrencol: got %d rows, want 1", len(rows))
+	}
+}
+
+// TestAlterViewAlterColumnSetDropDefault pins DU-002 slice 444: `ALTER VIEW
+// name ALTER [COLUMN] col SET DEFAULT expr` / `DROP DEFAULT` previously fell
+// to the catch-all no-op consume loop.
+func TestAlterViewAlterColumnSetDropDefault(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE viewsrc6 (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW vdef AS SELECT a FROM viewsrc6"); err != nil {
+		t.Fatalf("CREATE VIEW: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vdef ALTER COLUMN a SET DEFAULT 42"); err != nil {
+		t.Fatalf("ALTER VIEW ALTER COLUMN SET DEFAULT: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "vdef"})
+	if !ok {
+		t.Fatalf("catalog lost the vdef relation after SET DEFAULT")
+	}
+	gotDefault := false
+	for _, c := range tbl.Columns {
+		if c.Name == "a" && c.DefaultExpr != nil {
+			gotDefault = true
+		}
+	}
+	if !gotDefault {
+		t.Fatalf("column a has no DefaultExpr after SET DEFAULT")
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vdef ALTER COLUMN a DROP DEFAULT"); err != nil {
+		t.Fatalf("ALTER VIEW ALTER COLUMN DROP DEFAULT: %v", err)
+	}
+	tbl, ok = cat.LookupTable(parser.ObjectName{Name: "vdef"})
+	if !ok {
+		t.Fatalf("catalog lost the vdef relation after DROP DEFAULT")
+	}
+	for _, c := range tbl.Columns {
+		if c.Name == "a" && c.DefaultExpr != nil {
+			t.Errorf("column a still has a DefaultExpr after DROP DEFAULT")
+		}
+	}
+}
+
+// TestAlterViewSetResetReloptions pins DU-002 slice 444: `ALTER VIEW name SET
+// (option = value, ...)` / `RESET (option, ...)` previously fell to the
+// catch-all no-op consume loop (checked after SET SCHEMA, which matches on
+// the literal "schema" identifier rather than "(", so the two forms never
+// collide).
+func TestAlterViewSetResetReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE viewsrc7 (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW vopt AS SELECT a FROM viewsrc7"); err != nil {
+		t.Fatalf("CREATE VIEW: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vopt SET (security_barrier = true)"); err != nil {
+		t.Fatalf("ALTER VIEW SET (...): %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "vopt"})
+	if !ok {
+		t.Fatalf("catalog lost the vopt relation after SET (...)")
+	}
+	if !tbl.SecurityBarrierSet || !tbl.SecurityBarrier {
+		t.Errorf("SecurityBarrier = %v, SecurityBarrierSet = %v; want true, true", tbl.SecurityBarrier, tbl.SecurityBarrierSet)
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vopt RESET (security_barrier)"); err != nil {
+		t.Fatalf("ALTER VIEW RESET (...): %v", err)
+	}
+	tbl, ok = cat.LookupTable(parser.ObjectName{Name: "vopt"})
+	if !ok {
+		t.Fatalf("catalog lost the vopt relation after RESET (...)")
+	}
+	if tbl.SecurityBarrierSet {
+		t.Errorf("SecurityBarrierSet still true after RESET (...)")
+	}
+}
+
+// TestAlterViewSetResetCheckOption pins DU-002 slice 444's completion of the
+// third and last view_option_name (alongside security_barrier/
+// security_invoker in TestAlterViewSetResetReloptions above): `check_option`
+// is an enum reloption (`local`/`cascaded`, PG compares case-insensitively),
+// unlike the two boolean options, and an invalid value must be rejected
+// (22023) rather than silently accepted like an unmodeled option name.
+func TestAlterViewSetResetCheckOption(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE viewsrc8 (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE VIEW vcheck AS SELECT a FROM viewsrc8"); err != nil {
+		t.Fatalf("CREATE VIEW: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vcheck SET (check_option = CASCADED)"); err != nil {
+		t.Fatalf("ALTER VIEW SET (check_option = CASCADED): %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "vcheck"})
+	if !ok {
+		t.Fatalf("catalog lost the vcheck relation after SET (check_option = ...)")
+	}
+	if tbl.CheckOption != "cascaded" {
+		t.Errorf("CheckOption = %q, want %q (case-folded)", tbl.CheckOption, "cascaded")
+	}
+	if err := runDDL(t, ctx, "ALTER VIEW vcheck RESET (check_option)"); err != nil {
+		t.Fatalf("ALTER VIEW RESET (check_option): %v", err)
+	}
+	tbl, ok = cat.LookupTable(parser.ObjectName{Name: "vcheck"})
+	if !ok {
+		t.Fatalf("catalog lost the vcheck relation after RESET (check_option)")
+	}
+	if tbl.CheckOption != "" {
+		t.Errorf("CheckOption = %q after RESET, want empty", tbl.CheckOption)
+	}
+	err := runDDL(t, ctx, "ALTER VIEW vcheck SET (check_option = bogus)")
+	if err == nil {
+		t.Fatalf("ALTER VIEW SET (check_option = bogus): want error, got nil")
+	}
+	if execErr, ok := err.(*ExecError); !ok || execErr.Code != "22023" {
+		t.Errorf("ALTER VIEW SET (check_option = bogus) error = %v, want ExecError 22023", err)
+	}
+}

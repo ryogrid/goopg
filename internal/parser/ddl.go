@@ -6902,18 +6902,47 @@ func (p *parser) parseAlter() (Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		if p.acceptIdentKeyword("rename") && p.acceptKeyword(KwTo) {
+		if p.acceptIdentKeyword("rename") {
+			if p.acceptKeyword(KwTo) {
+				newNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				renameStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+				renameStmt.Actions = append(renameStmt.Actions, AlterTableAction{
+					pos:     newNameTok.Pos,
+					Kind:    AlterTableRenameTable,
+					NewName: identText(newNameTok),
+				})
+				return renameStmt, nil
+			}
+			// RENAME [COLUMN] old_name TO new_name — COLUMN is optional in PG's
+			// grammar (ATT_VIEW like ATT_TABLE). Previously the `&&
+			// p.acceptKeyword(KwTo)` short-circuit above already consumed the
+			// "rename" token and then fell through to the catch-all no-op loop
+			// below on any non-RENAME-TO form, so this was a silent no-op
+			// exactly like the pre-slice-440 RENAME TO/OWNER TO/SET SCHEMA gap.
+			// DU-002 slice 444 (closes the slice-440 ledger row's resume point).
+			_ = p.acceptKeyword(KwColumn)
+			oldNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
 			newNameTok, err := p.parseIdent()
 			if err != nil {
 				return nil, err
 			}
-			renameStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
-			renameStmt.Actions = append(renameStmt.Actions, AlterTableAction{
-				pos:     newNameTok.Pos,
-				Kind:    AlterTableRenameTable,
-				NewName: identText(newNameTok),
+			renameColStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			renameColStmt.Actions = append(renameColStmt.Actions, AlterTableAction{
+				pos:           oldNameTok.Pos,
+				Kind:          AlterTableRenameColumn,
+				OldColumnName: identText(oldNameTok),
+				NewName:       identText(newNameTok),
 			})
-			return renameStmt, nil
+			return renameColStmt, nil
 		}
 		if p.acceptIdentKeyword("owner") {
 			if _, err := p.expectKeyword(KwTo); err != nil {
@@ -6942,10 +6971,85 @@ func (p *parser) parseAlter() (Stmt, error) {
 			p.advance()
 			return &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, SetSchema: identText(schemaTok), TagOverride: "ALTER VIEW"}, nil
 		}
-		// Other ALTER VIEW forms (RENAME COLUMN, ALTER COLUMN ... SET/DROP
-		// DEFAULT, SET/RESET reloptions) are not yet modeled — consume as a
-		// no-op like the pre-existing compat stub did for everything (see
-		// deferral ledger).
+		// SET (view_option = value, ...) / RESET (view_option, ...) — view-level
+		// storage-parameter reloptions (e.g. `security_barrier`,
+		// `check_option`). Reuses the same AlterTableSetReloptions/
+		// AlterTableResetReloptions actions ALTER TABLE's own SET/RESET form
+		// produces (both are relations, execAlterTable's dispatch is generic
+		// over tbl.Reloptions). Checked after SET SCHEMA (which matches on the
+		// "schema" identifier, not "(") so the two forms never collide. DU-002
+		// slice 444.
+		if cur := p.cur(); isAlterReloptVerb(cur) && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+			reset := cur.Kind == TokenKeyword && cur.Keyword == KwReset ||
+				cur.Kind == TokenIdent && strings.EqualFold(cur.Value, "reset")
+			p.advance() // SET or RESET
+			opts, err := p.parseWithOptions()
+			if err != nil {
+				return nil, err
+			}
+			kind := AlterTableSetReloptions
+			if reset {
+				kind = AlterTableResetReloptions
+			}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{pos: t.Pos, Kind: kind, With: opts})
+			return stmt, nil
+		}
+		// ALTER [COLUMN] col SET DEFAULT expr / DROP DEFAULT — PG's
+		// updatable-view column-default form (backs an INSERT/UPDATE through
+		// the view when the target column is omitted). Reuses the identical
+		// AlterTableSetDefault/AlterTableDropDefault actions ALTER TABLE's own
+		// ALTER COLUMN form produces; execAlterTable's dispatch mutates
+		// tbl.Columns[i].DefaultExpr generically regardless of relkind. DU-002
+		// slice 444.
+		if p.acceptKeyword(KwAlter) {
+			_ = p.acceptKeyword(KwColumn)
+			colTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			colName := identText(colTok)
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
+				p.advance() // SET
+				if _, err := p.expectKeyword(KwDefault); err != nil {
+					return nil, err
+				}
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					pos:         colTok.Pos,
+					Kind:        AlterTableSetDefault,
+					ColumnName:  colName,
+					DefaultExpr: expr,
+				})
+				return stmt, nil
+			}
+			if p.acceptKeyword(KwDrop) {
+				if _, err := p.expectKeyword(KwDefault); err != nil {
+					return nil, err
+				}
+				stmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					pos:        colTok.Pos,
+					Kind:       AlterTableDropDefault,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
+			// Unrecognized ALTER COLUMN form on a view — consume as a no-op.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &AlterTableStmt{pos: t.Pos}, nil
+		}
+		// Other ALTER VIEW forms not yet modeled — consume as a no-op like the
+		// pre-existing compat stub did for everything (see deferral ledger).
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
