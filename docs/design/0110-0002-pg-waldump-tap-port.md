@@ -271,11 +271,48 @@ files; `go test -race ./internal/wal/... ./internal/mvcc/...` PASS; full
 `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
 
 Still open (unchanged from the audit): `001_basic.pl`'s server-dependent tier
-(hash/gin/gist/spgist/brin AMs) remains unported; no `pass_required` test yet
-exercises `pg_waldump` against a VACUUM-pruned page end-to-end (this loop
-verified the canonical record's byte layout and emission via unit tests, not a
-live `pg_waldump --rmgr=Heap2` round-trip) — a natural follow-up once/if that
-becomes `pass_required`. Whether the temp-table-only opportunistic prune path
-inside `pruneTouchedTempPages` (`operators_indexonly.go:285`) needs the same
-treatment remains unchecked (temp relations are backend-private and never
-WAL-logged/replicated in real PG, so it is likely N/A — not confirmed).
+(hash/gin/gist/spgist/brin AMs) remains unported.
+
+## 2026-07-04: live `pg_waldump --rmgr=Heap2` round-trip + temp-table N/A confirmation
+
+Closed both items the prune/VACUUM fix above left open.
+
+1. **Live round-trip (WD-004).** New `TestPort_PgWaldumpVacuumPruneRoundtrip`
+   (`internal/testport/pgwaldump_vacuum_prune_test.go`) creates a table,
+   deletes half its rows, runs `VACUUM` (exercising
+   `vacuum.VacuumOptions.LogCanonical`), stops the cluster, and runs the real
+   upstream `pg_waldump --rmgr=Heap2` binary against the resulting WAL
+   segment(s). Asserts (a) no structural decode error (same "incorrect
+   prev-link" / "invalid magic number" / "incorrect resource manager" guard
+   `TestPort_WALPgWaldumpCompat` (W-001) already uses) and (b) the output
+   contains a `PRUNE_VACUUM_SCAN` record whose `blkref` names this table's
+   exact `spc/db/relnode` locator. Live-verified (×3, no flake): pg_waldump
+   printed `rmgr: Heap2 ... desc: PRUNE_VACUUM_SCAN , isCatalogRel: F,
+   blkref #0: rel 1663/5/16403 blk 0 FPW` — confirms
+   `BuildCanonicalHeapPrunePayload`'s FPI-only encoding
+   (`internal/catalog/canonical.go`) round-trips through a real PG18 reader,
+   not just the unit-level payload assertions from the prior loop. This is
+   NOT a standby-replay test (no second goopg instance consumes the WAL as a
+   physical standby) — only that a vanilla PG18 tool reads the bytes. CSV:
+   new `WD-004` row (`postgres-oracle-port-status.csv`, `utility`/`port`/
+   `pass_required=yes`, mirroring how `W-001` covers general WAL readability
+   without being tied to one upstream `.pl` file); `target-inventory.csv`
+   unchanged (same precedent as `W-001` — no entry, since neither is a port
+   of one specific upstream TAP file).
+2. **Temp-table opportunistic prune — confirmed N/A.** Verified directly
+   against `postgres/src/include/utils/rel.h`'s `RelationNeedsWAL` macro:
+   `(RelationIsPermanent(relation) && ...)` — a temp relation
+   (`relpersistence == RELPERSISTENCE_TEMP`) never satisfies
+   `RelationIsPermanent`, so real PG issues **zero** WAL for any temp-relation
+   change, prune included. `pruneTouchedTempPages`
+   (`internal/executor/operators_indexonly.go:284`) is gated
+   `!o.plan.Table.Temp { return }` (temp-only) and should therefore stay
+   exactly as-is — adding `emitCanonicalHeapPruneLocked`-style canonical
+   emission there would itself be the divergence from PG, not fixing one.
+   No code change; this closes the open question as documented fact rather
+   than an unconfirmed guess.
+
+Gates: `go build ./...`/`go vet ./...` clean; `gofmt -l` clean on the new
+test file; `TestPort_PgWaldumpVacuumPruneRoundtrip` PASS ×3 (no flake, run
+through `scripts/goopg-test-run.sh`); `go run ./cmd/gen-oracle-port-status`
+regenerated `postgres-oracle-port-status.md` from the CSV.

@@ -5481,13 +5481,26 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestOpportunisticPruneEmitsCanonicalWAL` (`internal/executor`). Design
       doc `docs/design/0110-0002-pg-waldump-tap-port.md` "2026-07-03:
       prune/VACUUM canonical-WAL fix (LANDED)". Deferral ledger row 419
-      flipped to `resolved`; new row appended. Still open (no `pass_required`
-      test depends on either): a live `pg_waldump --rmgr=Heap2`/standby
-      round-trip against a VACUUM-pruned page, and whether the temp-table-only
-      `pruneTouchedTempPages` opportunistic-prune path
-      (`internal/executor/operators_indexonly.go:285`) needs the same
-      treatment (likely N/A — temp relations aren't WAL-logged in real PG —
-      but unconfirmed).
+      flipped to `resolved`; new row appended.
+      **Live round-trip + temp-table question CLOSED 2026-07-04 (loop #26):**
+      new `TestPort_PgWaldumpVacuumPruneRoundtrip`
+      (`internal/testport/pgwaldump_vacuum_prune_test.go`) drives a real
+      DELETE+VACUUM workload and runs the upstream `pg_waldump --rmgr=Heap2`
+      binary against the resulting WAL, asserting a decoded
+      `PRUNE_VACUUM_SCAN` record for the correct relation locator with no
+      structural error (PASS ×3, no flake). New CSV row `WD-004`
+      (`port`/`pass_required=yes`; `postgres-oracle-port-status.csv`,
+      regenerated `.md` via `go run ./cmd/gen-oracle-port-status`). Separately
+      confirmed via `postgres/src/include/utils/rel.h`'s `RelationNeedsWAL`
+      macro that temp relations never need WAL in real PG (`RelationIsPermanent`
+      is false for `RELPERSISTENCE_TEMP`), so `pruneTouchedTempPages`
+      (`internal/executor/operators_indexonly.go:284`, already temp-only
+      gated) correctly stays without canonical-WAL emission — no code change,
+      confirmed N/A rather than unconfirmed. Design doc "2026-07-04: live
+      `pg_waldump --rmgr=Heap2` round-trip + temp-table N/A confirmation".
+      Deferral ledger row appended (M0119-0005, resolved). **Still open:**
+      only `001_basic.pl`'s server-dependent tier (hash/gin/gist/spgist/brin
+      AMs) remains for this item.
 - [x] **`pg_waldump --save-fullpage` (WD-003, `002_save_fullpage.pl`).**
       **COMPLETE 2026-07-03:** `TestPort_PgWaldump002SaveFullpage`
       (`internal/testport/pgwaldump_savefullpage_test.go`) now PASSes (was
