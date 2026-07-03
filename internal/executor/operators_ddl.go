@@ -8683,6 +8683,25 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		return nil
 	}
 
+	// 3.5. EXCLUDE constraints — also index-backed like UNIQUE/PRIMARY KEY, but
+	// distinguished by idx.IsExclusion rather than idx.Unique/IsConstraint.
+	// Previously fell through to the PK branch's 42704 even though the
+	// constraint existed (live-confirmed, not fixed alongside the FK/UNIQUE
+	// branches above). DU-002 slice 433 follow-up (2nd pass).
+	var exclIdx *catalog.Index
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if idx.IsExclusion && strings.EqualFold(idx.Name, act.ConstraintName) {
+			exclIdx = idx
+			break
+		}
+	}
+	if exclIdx != nil {
+		if isIM {
+			im.DropExclusionConstraint(tbl.OID, act.ConstraintName)
+		}
+		return nil
+	}
+
 	// 4. PRIMARY KEY constraints.
 	var pkIdx *catalog.Index
 	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {

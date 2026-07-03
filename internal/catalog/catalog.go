@@ -15004,6 +15004,18 @@ func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) 
 	return c.dropIndexByName(tableOID, constraintName)
 }
 
+// DropExclusionConstraint removes the named EXCLUDE constraint (index-backed,
+// distinguished from UNIQUE/PRIMARY KEY by idx.IsExclusion rather than
+// idx.Unique/IsConstraint) from the table's index registries. Returns true if
+// found and removed. Shares dropIndexByName — an EXCLUDE index is stored the
+// same way as a PK/UNIQUE index; only the caller-side lookup differs. DU-002
+// slice 433 follow-up (2nd pass).
+func (c *InMemory) DropExclusionConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropIndexByName(tableOID, constraintName)
+}
+
 // dropIndexByName removes the named index (backing either a PRIMARY KEY or a
 // UNIQUE constraint) from both the per-table and flat index registries.
 // Caller must hold c.mu for writing.

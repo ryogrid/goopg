@@ -98,6 +98,52 @@ func TestDropConstraintForeignKeyAndUnique(t *testing.T) {
 		}
 	})
 
+	t.Run("Exclude", func(t *testing.T) {
+		ctx, cat, cleanup := newDDLFixture(t)
+		defer cleanup()
+
+		if err := runDDL(t, ctx, `CREATE TABLE dcex_t (c1 int, c2 int,
+			CONSTRAINT dcex_excl EXCLUDE USING btree (c1 WITH =))`); err != nil {
+			t.Fatalf("CREATE TABLE dcex_t: %v", err)
+		}
+
+		if _, ok := cat.LookupIndex(parser.ObjectName{Name: "dcex_excl"}); !ok {
+			t.Fatal("dcex_excl index not found before drop")
+		}
+
+		// Confirm the exclusion check is live before the drop (sanity, mirrors
+		// TestExclusionConstraintBtreeEqualityFires).
+		if err := runDDL(t, ctx, `INSERT INTO dcex_t VALUES (1, 2)`); err != nil {
+			t.Fatalf("INSERT 1: %v", err)
+		}
+		err := runDDL(t, ctx, `INSERT INTO dcex_t VALUES (1, 20)`)
+		ee, ok := err.(*ExecError)
+		if !ok || ee.Code != "23P01" {
+			t.Fatalf("expected 23P01 exclusion violation before drop, got: %v", err)
+		}
+
+		if err := runDDL(t, ctx, `ALTER TABLE dcex_t DROP CONSTRAINT dcex_excl`); err != nil {
+			t.Fatalf("DROP CONSTRAINT dcex_excl: %v", err)
+		}
+
+		if _, ok := cat.LookupIndex(parser.ObjectName{Name: "dcex_excl"}); ok {
+			t.Fatal("dcex_excl index still present after drop")
+		}
+
+		// The exclusion check must actually be gone: the same duplicate c1 now
+		// inserts without conflict.
+		if err := runDDL(t, ctx, `INSERT INTO dcex_t VALUES (1, 20)`); err != nil {
+			t.Fatalf("INSERT (duplicate c1, no more EXCLUDE constraint) should succeed: %v", err)
+		}
+
+		// Dropping again must report undefined_object, not silently succeed.
+		err = runDDL(t, ctx, `ALTER TABLE dcex_t DROP CONSTRAINT dcex_excl`)
+		ee, ok = err.(*ExecError)
+		if !ok || ee.Code != "42704" {
+			t.Fatalf("expected 42704 on re-drop, got: %v", err)
+		}
+	})
+
 	t.Run("UndefinedConstraintStillRejected", func(t *testing.T) {
 		ctx, _, cleanup := newDDLFixture(t)
 		defer cleanup()

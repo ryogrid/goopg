@@ -12381,15 +12381,63 @@ pre-commit hook.
 
 ### Deferred
 
-None new — this closes deferred item (2) of slice 433's own row cleanly (a
-constraint-kind dispatch gap in one pre-existing function, now handling all
-four constraint kinds real PG's `pg_constraint` name lookup covers: CHECK,
-FOREIGN KEY, UNIQUE, PRIMARY KEY). `EXCLUDE` (`idx.IsExclusion`) constraints
-were intentionally left out of scope — `execAlterTableDropConstraint` never
-claimed to support dropping those by this path before this fix either, and
-nothing in this loop's investigation surfaced a live report of that gap the
-way the FK/UNIQUE one was live-confirmed; a future loop can fold it in as a
-one-line addition to the same UNIQUE-branch index scan if it turns out to be
-needed. Deferred item (1) of slice 433's row (the missing phase-3
-dangling-reference scan on `ALTER CONSTRAINT ... ENFORCED`) remains open,
-untouched by this loop.
+This closes deferred item (2) of slice 433's own row cleanly for CHECK,
+FOREIGN KEY, UNIQUE, and PRIMARY KEY. `EXCLUDE` (`idx.IsExclusion`)
+constraints were intentionally left out of this pass's scope (see the
+follow-up below, which closes that remaining gap). Deferred item (1) of
+slice 433's row (the missing phase-3 dangling-reference scan on `ALTER
+CONSTRAINT ... ENFORCED`) remains open, untouched by this loop.
+
+## Follow-up: `ALTER TABLE ... DROP CONSTRAINT` for EXCLUDE (DU-002 slice 433 follow-up, 2nd pass)
+
+### Problem
+
+The FK/UNIQUE follow-up above deliberately left `EXCLUDE` constraints
+(`idx.IsExclusion`) unreachable through `execAlterTableDropConstraint` — no
+live report had surfaced that specific gap yet. Live-probing it this loop
+confirmed the same class of bug: a real `EXCLUDE USING btree (...)`
+constraint, being index-backed with `idx.IsExclusion = true` but
+`idx.IsConstraint = false`/`idx.Unique = false` (it is not a UNIQUE index),
+matched none of the existing branches and fell through to the PRIMARY KEY
+branch's `42704 does not exist`, even though the constraint existed.
+
+### Fix
+
+Added a fourth search branch (CHECK → FOREIGN KEY → UNIQUE → **EXCLUDE** →
+PRIMARY KEY) to `execAlterTableDropConstraint`, scanning `IndexesOnTable` for
+`idx.IsExclusion && strings.EqualFold(idx.Name, act.ConstraintName)` — the
+same index-registry scan the UNIQUE branch uses, just keyed on the
+`IsExclusion` flag instead of `Unique && IsConstraint`. A new
+`catalog.InMemory.DropExclusionConstraint` method does the removal, sharing
+the same private `dropIndexByName` helper as `DropUniqueConstraint`/
+`DropPrimaryKeyConstraint` (all three are mechanically identical index
+removal; only the caller-side lookup differs per constraint kind).
+
+### Tests
+
+`TestDropConstraintForeignKeyAndUnique/Exclude`
+(`internal/executor/operators_fk_unique_drop_constraint_test.go`, extending
+the existing table-driven test): creates a table with a named
+`EXCLUDE USING btree (c1 WITH =)` constraint, confirms the exclusion check is
+live (a duplicate `c1` raises `23P01`, mirroring
+`TestExclusionConstraintBtreeEqualityFires`), drops it by name, confirms the
+backing index is gone from `LookupIndex`, confirms the same duplicate now
+inserts without conflict (the runtime check is actually gone, not just the
+catalog bookkeeping), and confirms re-dropping the same name still raises
+`42704` rather than silently succeeding again.
+
+### Gates
+
+`go build ./...` clean; `internal/catalog`+`internal/executor`+
+`internal/parser` suites PASS (full, no regression); `TestPort_PgDumpConnectionSetup`
+PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+pre-commit hook.
+
+### Deferred
+
+None new — this closes the EXCLUDE gap noted as deliberately-out-of-scope in
+the FK/UNIQUE follow-up above; `execAlterTableDropConstraint` now covers all
+five constraint kinds `pg_constraint`'s name lookup can return (CHECK,
+FOREIGN KEY, UNIQUE, EXCLUDE, PRIMARY KEY). Deferred item (1) of slice 433's
+original row (the missing phase-3 dangling-reference scan on `ALTER
+CONSTRAINT ... ENFORCED`) remains open, untouched by this loop.
