@@ -57,6 +57,13 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
 		if name == "" {
 			return false, nil // malformed; let caller handle
 		}
+		// CreateRole (postgres/src/backend/commands/user.c) rejects the
+		// reserved "pg_" namespace before it even opens pg_authid — i.e.
+		// before the duplicate-name check below, matching PG's error
+		// precedence for `CREATE ROLE pg_x` even when pg_x already exists.
+		if isReservedRoleName(name) {
+			return true, reservedRoleNameErr(name)
+		}
 		// PG defaults: CREATE USER implies LOGIN; CREATE ROLE/GROUP imply
 		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
 		// Explicit LOGIN/NOLOGIN below overrides.

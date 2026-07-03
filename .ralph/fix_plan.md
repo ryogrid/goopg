@@ -6124,6 +6124,34 @@ documentation-only and is exempt from the design-doc requirement.)
       lookup-priority ordering defends against the resulting OID-shadowing
       risk.
 
+- [x] **`CREATE ROLE`/`USER`/`GROUP` reserved-`pg_`-prefix rejection
+      (M0119-0004-ACLHEAP follow-up, loop #44).** **COMPLETE 2026-07-03:**
+      closes discovery (b) from the loop #43 entry above: `tryHandleRoleDDL`'s
+      `"create role "`/`"create user "`/`"create group "` branch
+      (`internal/server/role_ddl.go`) never called `isReservedRoleName` —
+      only `ALTER ROLE ... RENAME TO` did — so `CREATE ROLE pg_custom`
+      silently succeeded where real PG's `CreateRole`
+      (`postgres/src/backend/commands/user.c`) raises `42939 "role name
+      \"%s\" is reserved"` before its `pg_authid` duplicate-name lookup.
+      Fix wires the existing `isReservedRoleName`/`reservedRoleNameErr`
+      helpers (already used by `renameRole`) into the CREATE branch
+      immediately after name extraction — no new helper needed. Tests:
+      `TestCreateRoleRejectsReservedPgPrefix`/`TestCreateRoleAllowsNonReservedName`
+      (`internal/server/role_ddl_create_reserved_test.go`, new). Gates:
+      `go build ./...`/`go vet` clean; `internal/server`+`internal/catalog`+
+      `internal/executor`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpallRoleMembership`+`TestPort_PgDumpConnectionSetup`
+      PASS (no regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-create-role-reserved-prefix.md` (new);
+      `docs/design/README.md` row `0119-0004ci` added. Still open,
+      unrelated to this slice: discovery (a) above — the 16 predefined
+      roles remain absent from the `pg_authid`/`pg_roles` virtual catalog
+      views, so a `GRANT pg_read_all_data TO alice` row won't survive a
+      real `pg_dumpall` round-trip; PG's `errdetail` text for the reserved-
+      name error is not ported (`roleError` has no detail field, shared
+      simplification with the RENAME TO path).
+
 - [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
       #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
       row's "a client `SET log_statement='all'` has no effect" residual — only
