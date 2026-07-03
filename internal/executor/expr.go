@@ -6126,9 +6126,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					missingOK = missingArg.BoolValue()
 				}
 			}
-			if ctx != nil && ctx.GetSetting != nil {
-				if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
-					return NewStringDatum(value), nil
+			if ctx != nil {
+				getSetting := ctx.GetSettingDisplay
+				if getSetting == nil {
+					getSetting = ctx.GetSetting
+				}
+				if getSetting != nil {
+					if value, ok := getSetting(nameArg.StringValue()); ok {
+						return NewStringDatum(value), nil
+					}
 				}
 			}
 			if missingOK {
@@ -6305,8 +6311,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if err := ctx.SetSetting(nameArg.StringValue(), newVal.Format(), isLocal); err != nil {
 					return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(), Message: err.Error()}
 				}
-				if ctx.GetSetting != nil {
-					if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
+				getSetting := ctx.GetSettingDisplay
+				if getSetting == nil {
+					getSetting = ctx.GetSetting
+				}
+				if getSetting != nil {
+					if value, ok := getSetting(nameArg.StringValue()); ok {
 						return NewStringDatum(value), nil
 					}
 				}

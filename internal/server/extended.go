@@ -427,7 +427,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 
 	switch {
 	case upper == "SHOW ALL":
-		rows := sess.All()
+		rows := sess.AllDisplay()
 		out := make([][][]byte, 0, len(rows))
 		for _, kv := range rows {
 			out = append(out, [][]byte{[]byte(kv.Name), []byte(kv.Value)})
@@ -443,7 +443,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 	case strings.HasPrefix(upper, "SHOW "):
 		name := strings.TrimSpace(matchable[len("SHOW "):])
 		if strings.EqualFold(name, "ALL") {
-			rows := sess.All()
+			rows := sess.AllDisplay()
 			out := make([][][]byte, 0, len(rows))
 			for _, kv := range rows {
 				out = append(out, [][]byte{[]byte(kv.Name), []byte(kv.Value)})
@@ -458,7 +458,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 			}, nil
 		}
 		name = strings.Trim(name, " \"'")
-		v, eff, ok := sess.Get(name)
+		v, eff, ok := sess.GetDisplay(name)
 		if !ok {
 			return nil, &extendedQueryError{Code: sqlstate.UndefinedObject, Message: fmt.Sprintf("unrecognized configuration parameter %q", name)}
 		}

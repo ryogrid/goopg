@@ -211,6 +211,18 @@ type Context struct {
 	// AllSettings returns the effective SHOW ALL view for this session.
 	AllSettings func() []SettingValue
 
+	// GetSettingDisplay and AllSettingsDisplay are the client-visible-display
+	// counterparts of GetSetting/AllSettings — unit-flagged GUCs come back
+	// formatted like real PG's SHOW/current_setting() (e.g. "77MB" rather
+	// than the bare "78848" GetSetting returns for internal consumers).
+	// Wired by the server alongside GetSetting/AllSettings; nil falls back
+	// to the raw GetSetting/AllSettings so callers that predate this field
+	// (tests, embedded contexts) keep working unformatted. Used by SHOW /
+	// SHOW ALL execution and the current_setting() SQL builtin — never by
+	// internal GUC consumers that parse the raw numeric value themselves.
+	GetSettingDisplay  func(name string) (string, bool)
+	AllSettingsDisplay func() []SettingValue
+
 	// ResetSetting and ResetAllSettings expose RESET name / RESET ALL to
 	// executor-run utility statements.
 	ResetSetting     func(name string) error

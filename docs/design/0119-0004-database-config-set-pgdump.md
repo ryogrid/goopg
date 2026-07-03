@@ -396,3 +396,99 @@ PASS (full suite, no regression); `scripts/tpch-spotcheck.sh` PASS
 No new deferrals — this follow-up closes deferred item 2 in full (all
 `tryHandleDatabaseDDL`/`applyAlterDatabaseConfig` error sites are now typed).
 Deferred item 1 (GUC unit-display formatting) remains open, unrelated scope.
+
+## Follow-up: GUC unit-display formatting (loop #81)
+
+Closes deferred item (1) of the loop #79 row (`FROM CURRENT` storing the
+session's raw canonicalised GUC value — e.g. `work_mem=78848` — instead of
+PG's unit-suffixed display form `work_mem=77MB`).
+
+**Root cause.** Real PG's `GetConfigOptionByName(name, NULL, false)`
+(`guc.c`), the function `ExtractSetVariableArgs`/`set_config_by_name`/
+`ShowGUCConfigOption` all resolve a GUC's *value* through, always calls
+`ShowGUCOption(record, use_units=true)`, which for a `GUC_UNIT`-flagged
+`PGC_INT`/`PGC_REAL` variable converts the stored base-unit value to the
+greatest unit that divides it evenly (`convert_int_from_base_unit` /
+`convert_real_from_base_unit`) — but only when the value is `> 0`; 0 and
+negative "disabled" sentinels print bare, with no unit suffix at all. goopg's
+`config.Variable.Value` stores the bare canonical base-unit integer
+(`FormatDisplayValue`'s "raw" input) and had no equivalent formatter, so
+every display-facing surface — `SHOW`, `SHOW ALL`, `current_setting()`,
+`set_config()`, and the `FROM CURRENT` resolver — printed the raw integer
+(`work_mem` → `78848` instead of `77MB`), verified as still broken via a
+live `SHOW work_mem` A/B against a real, separately-`initdb`'d PostgreSQL
+18.3 instance before this loop's fix.
+
+**Fix — additive, not a rewire of `GetSetting`.** `ctx.GetSetting`/
+`sess.Get`/`ctx.AllSettings` are also read by internal Go consumers that
+parse the *raw* bare integer directly (`Context.deadlockTimeout` parsing
+`deadlock_timeout` as milliseconds, `sessionWorkMem`, `track_counts`/
+`track_functions` boolean checks, etc.) — reformatting those in place would
+have broken every one of them. Instead:
+
+- `config.Variable.FormatDisplayValue(raw string) string`
+  (`internal/config/guc.go`) is a new, pure formatter mirroring
+  `convert_int_from_base_unit` exactly: two ordered (`memoryDisplayUnits`/
+  `timeDisplayUnits`) unit tables keyed by the variable's native `Unit`,
+  walked greatest-to-smallest, accepting the first unit whose multiplier
+  evenly divides the raw value (falling back to the base unit itself, whose
+  multiplier is 1 and therefore always "divides evenly"). Only applies to
+  `TypeInt` variables with `Unit != UnitNone`, and only when the parsed
+  value is `> 0` (matching upstream's `result > 0` gate) — everything else
+  (strings, enums, bools, unitless ints, non-positive values) passes through
+  unchanged.
+- `config.SessionRegistry.GetDisplay`/`AllDisplay` (`internal/config/
+  session.go`) are new parallel accessors — `Get`/`All` plus
+  `FormatDisplayValue` — leaving `Get`/`All` themselves untouched.
+- `executor.Context` gained two new optional fields, `GetSettingDisplay`/
+  `AllSettingsDisplay` (`internal/executor/context.go`), populated by the
+  server from `sess.GetDisplay`/`sess.AllDisplay` alongside the pre-existing
+  `GetSetting`/`AllSettings` (both `dispatch.go`'s main ectx wiring and
+  `dispatch_extended.go`'s extended-protocol wiring). Every genuine
+  display-boundary call site now prefers the `*Display` variant, falling
+  back to the raw one only when nil (so pre-existing tests/embedded
+  `Context`s that never set it keep their old unformatted behaviour):
+  `utilitySettingsOp.nextShow`'s both branches (`internal/executor/
+  operators_utility_settings.go`, backing SHOW/SHOW ALL through the planner/
+  executor path), `current_setting()`/`set_config()`
+  (`internal/executor/expr.go`) — the latter matches upstream's
+  `set_config_by_name` also returning through `GetConfigOptionByName`. The
+  simple-protocol fast paths (`handleShow`/`handleShowAll`,
+  `internal/server/query.go`; the `SHOW`/`SHOW ALL` literal-match arms,
+  `internal/server/extended.go`) call `sess.GetDisplay`/`AllDisplay`
+  directly (always live-wired, no fallback needed). The `FROM CURRENT`
+  resolver closure (`resolveCurrentGUC`, `internal/server/dispatch.go`) now
+  calls `sess.GetDisplay` instead of `sess.Get`, matching
+  `GetConfigOptionByName`'s own `use_units=true`.
+
+**Live-verified** against a running goopg instance (throwaway data dir,
+port 5535, real `psql`) and cross-checked against a real, separately-
+`initdb`'d PostgreSQL 18.3 instance for every case: `SHOW work_mem` (default
+`512MB`; after `SET work_mem='77MB'` → `77MB`), `SELECT
+current_setting('work_mem')` → `77MB`, `SELECT set_config('work_mem',
+'99MB', false)` → `99MB`, `SHOW checkpoint_timeout` → `5min`, `SHOW
+deadlock_timeout` → `1s` (boot value 1000ms), `SHOW statement_timeout`/
+`SHOW lock_timeout` (disabled, value 0) → bare `0` (no unit — the `result >
+0` gate), `SET deadlock_timeout='250ms'; SHOW deadlock_timeout` → `250ms`,
+`SET work_mem='77MB'; ALTER DATABASE postgres SET work_mem FROM CURRENT;
+SELECT * FROM pg_db_role_setting` → `setconfig = {work_mem=77MB}` (was
+`{work_mem=78848}` before this fix). Confirmed the `search_path` (unitless
+string GUC) fast path is unaffected.
+
+Tests: `TestFormatDisplayValue`/`TestSessionRegistryGetDisplay`
+(`internal/config/guc_test.go`) pin the exact raw→display mappings observed
+against real PG 18.3 above, plus the non-unit/non-int/non-positive
+passthrough cases.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/config/... ./internal/server/... ./internal/executor/...` PASS
+(no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+`scripts/ralph-precommit-test.sh` PASS (pgbench smoke, 0 failed
+transactions).
+
+No new deferrals — this follow-up closes deferred item (1) of the loop #79
+row in full. `pg_settings`'s `unit` column
+(`internal/catalog/catalog.go`'s `pgSettings.VirtualRows`) remains a
+hardcoded minimal 2-row stub (pre-existing, unrelated to this GUC's own
+`Value` display — `pg_settings` is out of scope for this loop, tracked
+separately if a future loop needs a real per-GUC `pg_settings` row source).

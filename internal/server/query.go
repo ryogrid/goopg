@@ -351,7 +351,7 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 // named after the variable. Matches upstream's SHOW behaviour.
 func (s *Server) handleShow(w *protocol.FrameWriter, sess *config.SessionRegistry, name string) error {
 	name = strings.Trim(name, " \"'")
-	v, eff, ok := sess.Get(name)
+	v, eff, ok := sess.GetDisplay(name)
 	if !ok {
 		return s.writeQueryError(w, sqlstate.UndefinedObject,
 			fmt.Sprintf("unrecognized configuration parameter %q", name))
@@ -381,7 +381,7 @@ func (s *Server) handleShowAll(w *protocol.FrameWriter, sess *config.SessionRegi
 	}); err != nil {
 		return err
 	}
-	rows := sess.All()
+	rows := sess.AllDisplay()
 	for _, kv := range rows {
 		if err := w.WriteDataRow([][]byte{[]byte(kv.Name), []byte(kv.Value)}); err != nil {
 			return err

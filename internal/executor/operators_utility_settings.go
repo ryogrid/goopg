@@ -188,19 +188,27 @@ func (o *utilitySettingsOp) nextShow(stmt *parser.ShowStmt) (TupleSlot, error) {
 			return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SHOW is not supported in this executor context"}
 		}
 		if stmt.All {
-			if o.ctx.AllSettings == nil {
+			allSettings := o.ctx.AllSettingsDisplay
+			if allSettings == nil {
+				allSettings = o.ctx.AllSettings
+			}
+			if allSettings == nil {
 				return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SHOW ALL is not supported in this executor context"}
 			}
-			settings := o.ctx.AllSettings()
+			settings := allSettings()
 			o.rows = make([]Row, 0, len(settings))
 			for _, kv := range settings {
 				o.rows = append(o.rows, Row{NewStringDatum(kv.Name), NewStringDatum(kv.Value)})
 			}
 		} else {
-			if o.ctx.GetSetting == nil {
+			getSetting := o.ctx.GetSettingDisplay
+			if getSetting == nil {
+				getSetting = o.ctx.GetSetting
+			}
+			if getSetting == nil {
 				return nil, &ExecError{Code: "0A000", Pos: stmt.Pos(), Message: "SHOW is not supported in this executor context"}
 			}
-			value, ok := o.ctx.GetSetting(stmt.Name)
+			value, ok := getSetting(stmt.Name)
 			if !ok {
 				return nil, &ExecError{Code: "42704", Pos: stmt.Pos(), Message: fmt.Sprintf("unrecognized configuration parameter %q", stmt.Name)}
 			}

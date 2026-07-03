@@ -110,7 +110,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			if sess == nil {
 				return "", false
 			}
-			_, eff, ok := sess.Get(name)
+			_, eff, ok := sess.GetDisplay(name)
 			return eff, ok
 		})
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
@@ -329,11 +329,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			_, eff, ok := sess.Get(name)
 			return eff, ok
 		}
+		ectx.GetSettingDisplay = func(name string) (string, bool) {
+			_, eff, ok := sess.GetDisplay(name)
+			return eff, ok
+		}
 		ectx.SetSetting = func(name, value string, isLocal bool) error {
 			return sess.Set(name, value, isLocal)
 		}
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
+		ectx.AllSettingsDisplay = func() []executor.SettingValue {
+			all := sess.AllDisplay()
 			out := make([]executor.SettingValue, 0, len(all))
 			for _, kv := range all {
 				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
