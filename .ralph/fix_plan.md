@@ -43,6 +43,11 @@ M0110/M0119 work: **run M0120 first** (it only needs the landed logging + the
 committed `wp/verification/` checklist/flow), **then M0121** consumes its triaged
 failure list.
 
+**M0120 and M0121 are both now CLOSED (2026-07-04)** — every sub-task `[x]`,
+report.md tallies `goopg-missing: 0`, and the one `goopg-bug` found (WP-02/WP-03,
+one root cause) is fixed + regression-tested + ledger-resolved. **Resume M0110
+next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
 M0096 (RC isolation feature impl + spec pass), M0100 (RC isolation runtime
@@ -7957,13 +7962,20 @@ work) and index each in `docs/design/README.md`. Gates per change: units +
 pgbench-smoke hook, `scripts/tpch-spotcheck.sh` for executor/planner/codec, race
 gate for concurrency-critical packages.
 
-- [ ] **M0121-0001 — Populate from M0120 triage.** This task list is **seeded,
-  not exhaustive**: after M0120-0005, add one `M0121-000N` task per
-  `goopg-bug`/`goopg-missing` failure (cross-referenced from its deferral-ledger
-  row), each closing its ledger row (`- → resolved`) when the checklist item
-  passes its confirming read on a fresh run and a regression test guards it.
-  Failures classed `pg4wp-limitation`/`harness` are documented, not fixed in
-  goopg.
+- [x] **M0121-0001 — Populate from M0120 triage.** DONE (2026-07-04). This task
+  list is **seeded, not exhaustive**: after M0120-0005, add one `M0121-000N`
+  task per `goopg-bug`/`goopg-missing` failure (cross-referenced from its
+  deferral-ledger row), each closing its ledger row (`- → resolved`) when the
+  checklist item passes its confirming read on a fresh run and a regression
+  test guards it. Failures classed `pg4wp-limitation`/`harness` are
+  documented, not fixed in goopg. **Resolution:** `wp/verification/report.md`
+  (M0120-0005's aggregate, all 40 items) tallies `goopg-bug: 2` (WP-02/WP-03,
+  one root cause) and `goopg-missing: 0` — no further per-failure tasks to
+  seed. WP-02/WP-03 were already seeded as **M0121-0002** (done a loop early
+  since the crash was high-value to not lose) and are now `[x]` above, with
+  their deferral-ledger row cross-referenced/closed. No `pg4wp-limitation`/
+  `harness` failures (WP-13, WP-32, WP-R7, WP-R8) get goopg tasks per policy.
+  **M0121 milestone is CLOSED** (0001–0002 both `[x]`, nothing further seeded).
 - [x] **M0121-0002 — Fix backend panic on `post update`/`post delete` (trash)
   default-category reassignment.** DONE (2026-07-04). Root cause:
   `tryPromoteIndexOnlyScan` (`internal/planner/planner.go`) narrowed a
