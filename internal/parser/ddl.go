@@ -6697,7 +6697,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			if err != nil {
 				return nil, err
 			}
-			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName, TagOverride: "ALTER INDEX"}
 			stmt.Actions = append(stmt.Actions, AlterTableAction{
 				pos:     newNameTok.Pos,
 				Kind:    AlterTableRenameTable,
@@ -6867,7 +6867,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				schemaNameTok := p.cur()
 				p.advance()
 				schemaName := identText(schemaNameTok)
-				return &AlterTableStmt{pos: t.Pos, Name: mvName, SetSchema: schemaName}, nil
+				return &AlterTableStmt{pos: t.Pos, Name: mvName, SetSchema: schemaName, TagOverride: "ALTER MATERIALIZED VIEW"}, nil
 			}
 		}
 		// Other ALTER MATERIALIZED VIEW actions — consume until ';'.

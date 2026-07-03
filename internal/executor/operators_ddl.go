@@ -6629,6 +6629,33 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						}
 					}
 				}
+				if act.Kind == parser.AlterTableRenameTable {
+					// ALTER INDEX name RENAME TO newname on a real (non-TOAST)
+					// index. Previously fell through to the "silently accept in
+					// v0" default below — the command tag reported success but
+					// no catalog mutation ever happened (DU-002 slice 443).
+					oldSchema, oldName := idx.Schema, idx.Name
+					oldObjName := parser.ObjectName{Schema: oldSchema, Name: oldName}
+					newObjName := parser.ObjectName{Schema: oldSchema, Name: act.NewName}
+					im, isIM := o.ctx.Catalog.(*catalog.InMemory)
+					if !isIM {
+						return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "catalog does not support index rename"}
+					}
+					if err := im.RenameIndex(oldObjName, newObjName); err != nil {
+						return &ExecError{Code: "42P07", Pos: act.Pos(), Message: err.Error()}
+					}
+					// Use ctx.Pool.LogChangeRecord, the same WAL-emission path
+					// CREATE/DROP INDEX use just above (M0079-0001) — not
+					// ctx.WAL.Append (the newer per-object-DDL pattern most other
+					// ALTER forms in this file use) — because RenameIndexDuringRecovery
+					// is replayed by the same `replayIndexDDLRecords` driver that
+					// consumes those CREATE/DROP INDEX records, and ctx.Pool is
+					// always wired whereas ctx.WAL is not guaranteed to be in every
+					// executor context that reaches this operator.
+					if o.ctx.Pool != nil {
+						_, _ = o.ctx.Pool.LogChangeRecord(wal.EncodeRenameIndex(oldSchema, oldName, act.NewName))
+					}
+				}
 			}
 			// Other ALTER actions on index: silently accept in v0.
 			return nil

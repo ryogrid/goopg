@@ -40,6 +40,7 @@ import (
 type indexRegistryRecovery interface {
 	RegisterIndexDuringRecovery(schema, name string, tableOID uint32, cols []string, unique bool, method string, primary bool, oid uint32)
 	UnregisterIndexDuringRecovery(schema, name string)
+	RenameIndexDuringRecovery(schema, oldName, newName string)
 }
 
 // replayIndexDDLRecords reads every WAL record under walDir and
@@ -101,6 +102,12 @@ func replayIndexDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-index at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.UnregisterIndexDuringRecovery(p.Schema, p.Name)
+		case wal.RecordKindRenameIndex:
+			schema, oldName, newName, derr := wal.DecodeRenameIndex(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode rename-index at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.RenameIndexDuringRecovery(schema, oldName, newName)
 		}
 	}
 	return nil

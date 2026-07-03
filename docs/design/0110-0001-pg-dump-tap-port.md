@@ -13384,3 +13384,150 @@ None — this closes the last unmodelled `ALTER COLLATION` form in full,
 including restart persistence (unlike the ALTER STATISTICS slice, which left
 its RENAME/OWNER/SET SCHEMA in-memory-only). No further known `ALTER
 COLLATION` grammar gap.
+
+## Follow-up: `ALTER INDEX ... RENAME TO` / `ALTER MATERIALIZED VIEW ... SET SCHEMA` command-tag mistagging AND `ALTER INDEX` was ALSO a functional no-op (DU-002 slice 443)
+
+### Problem
+
+The slice 439 ledger row predicted (but didn't fix) a tag-mistagging bug:
+`ALTER INDEX ... RENAME TO` and `ALTER MATERIALIZED VIEW ... SET SCHEMA`
+both reuse `AlterTableStmt` (an index/matview is just a relation too) but,
+unlike the slice 439/440 `ALTER SEQUENCE`/`ALTER VIEW` sites, neither
+construction site set `TagOverride` — so `ddlTag` fell through to the
+blanket `"ALTER TABLE"` default instead of PG's `"ALTER INDEX"` /
+`"ALTER MATERIALIZED VIEW"`.
+
+Auditing the `ALTER INDEX RENAME TO` site to fix the tag found something
+worse: **the rename never applied at all.** `execAlterTable`
+(`internal/executor/operators_ddl.go`) reaches an index (as opposed to a
+heap table) via `o.ctx.Catalog.LookupIndex(s.Name)`, then loops over
+`s.Actions` handling `AlterTableAlterColumnSet`/`AlterTableSetStatistics`/
+`AlterIndexAttachPartition`/`AlterIndexSetReloptions` — there was no case
+for `AlterTableRenameTable` at all, so it fell through to the loop's
+`// Other ALTER actions on index: silently accept in v0.` default and
+`return nil`. The client received a clean `ALTER INDEX`-tagged (well,
+`ALTER TABLE`-tagged, pre-fix) success reply and the index kept its old
+name in the catalog — live-verified against a real `psql`: `ALTER INDEX
+idx443 RENAME TO idx443_renamed` returned `ALTER TABLE` and a follow-up `\d`
+still showed `idx443`, not `idx443_renamed`. The M0118-0008 TOAST-exposure
+slice 4 comment on that code ("carries Name so a synthetic pg_toast index
+rename can be intercepted") only ever wired the *pg_toast-schema* fallback
+path a few lines below (`strings.EqualFold(s.Name.Schema, "pg_toast")`) — a
+plain user index was never covered.
+
+### Change
+
+- **Parser** (`internal/parser/ddl.go`): the `ALTER INDEX name RENAME TO
+  newname` construction site (`if p.acceptIdentKeyword("rename")` inside the
+  `ALTER INDEX` block) and the `ALTER MATERIALIZED VIEW name SET SCHEMA
+  newschema` construction site now both set `TagOverride: "ALTER INDEX"` /
+  `TagOverride: "ALTER MATERIALIZED VIEW"` respectively — closing the slice
+  439 prediction in full (`ALTER VIEW`/`ALTER SEQUENCE` were already fixed by
+  slices 439/440; those were the only two remaining un-audited sites).
+- **Catalog** (`internal/catalog/catalog.go`): new `InMemory.RenameIndex(old,
+  new parser.ObjectName) error` (mirrors `RenameTable`'s shape: re-keys
+  `c.indexes` and the owning table's `c.byTable[tableOID]` slot, preserving
+  the `*Index` pointer; 42P07-shaped error text on a name collision) and its
+  idempotent WAL-replay counterpart `RenameIndexDuringRecovery(schema,
+  oldName, newName string)` (mirrors `RegisterIndexDuringRecovery`: a missing
+  old entry is a silent no-op, not an error).
+  - Both share a new private `lookupIndexLocked` helper factored out of
+    `LookupIndex`'s body, because a genuine "" vs `"public."` catalog-key
+    ambiguity surfaced while writing the restart-recovery test: a live DDL
+    session keys an unqualified index under the *bare* name (`CreateIndex`'s
+    caller passes `Schema: tbl.Schema`, which `execCreateTable` only ever
+    sets to a non-empty string when the writable search_path schema isn't
+    `"public"` — see `internal/executor/operators_ddl.go`'s `execCreateTable`
+    around the `currentWritableSchema` check), while `loadUserIndexesFromHeap`
+    (M0113's pg_index-heap reload path, `internal/initdb/open.go`) resolves
+    the namespace OID to the explicit string `"public"`. A rename issued
+    live and a rename replayed after a restart can therefore need to resolve
+    the *same* logical index under two different literal map keys.
+    `lookupIndexLocked` performs the same fallback dance `LookupIndex`
+    already did (try the literal key, then `"public."+name` when
+    unqualified, then the bare name when qualified) and returns the actual
+    key found so the rename can delete-then-reinsert under the correct slot.
+- **Executor** (`internal/executor/operators_ddl.go`): a new
+  `act.Kind == parser.AlterTableRenameTable` case inside the index branch's
+  action loop — calls `catalog.InMemory.RenameIndex`, raising `42P07` on a
+  name collision, then WAL-logs via `o.ctx.Pool.LogChangeRecord(...)`.
+  Deliberately uses the **same WAL-emission mechanism CREATE/DROP INDEX use**
+  (`ctx.Pool.LogChangeRecord`, M0079-0001) rather than the `ctx.WAL.Append`
+  pattern most other ALTER-form slices in this thread use (439-442): the
+  rename record is replayed by the same `replayIndexDDLRecords` driver that
+  already consumes the CREATE/DROP INDEX records, and `ctx.Pool` is
+  guaranteed wired in every executor context that reaches DDL, whereas
+  `ctx.WAL` is not (confirmed by writing the recovery test below — the
+  `internal/initdb` package's `runDDL` test harness, `ddl_catalog_sync_test.go`,
+  never sets `ctx.WAL`, only `ctx.Pool`/`ctx.Catalog`/`ctx.TxnMgr`/`ctx.Tx`/
+  `ctx.Snap`).
+- **WAL** (`internal/wal/recovery.go`): new `RecordKindRenameIndex` (byte 94)
+  plus `EncodeRenameIndex`/`DecodeRenameIndex` (`kind(1) | schemaLen(2) |
+  schema | oldNameLen(2) | oldName | newNameLen(2) | newName`); added to the
+  `RecordKindCreateIndex, RecordKindDropIndex` no-op physical-replay case in
+  `ApplyRecord` (renamed to `RecordKindCreateIndex, RecordKindDropIndex,
+  RecordKindRenameIndex`) and to `nativeApplyRecordKindKnown`'s whitelist.
+- **Recovery** (`internal/initdb/index_ddl_recovery.go`): `indexRegistryRecovery`
+  gains `RenameIndexDuringRecovery`; `replayIndexDDLRecords` gains a
+  `wal.RecordKindRenameIndex` case decoding the record and calling it.
+
+### Tests
+
+`TestAlterIndexRenameToApplies`/`UnknownRelation`/`Collision`/`CommandTag`
+(`internal/executor/operators_alter_index_rename_test.go` — full
+parse→plan→exec round trip: the renamed index keeps its `Table`/`Columns`,
+the old name is gone, a 42P01/42P07-shaped error on an unknown/colliding
+target, and the `"ALTER INDEX"` tag). Extended
+`TestDDLCommandTagMatchesPostgres` (`internal/server/ddl_command_tag_test.go`)
+with `alter index rename to` / `alter materialized view set schema` cases.
+`TestEncodeDecodeRenameIndexRoundTrip` (incl. multi-byte UTF-8) +
+`TestDecodeRenameIndexRejects{WrongKind,TruncatedPayload}`
+(`internal/wal/rename_index_test.go`).
+`TestRenameIndexSurvivesRestartViaWAL`
+(`internal/initdb/index_ddl_recovery_test.go` — CREATE INDEX + RENAME, close
+without `SaveCatalog` (simulated crash), reopen, confirm the new name is
+present with the correct owning table and the old name is gone; this is the
+test that surfaced the "" vs `"public."` key-ambiguity bug above — it failed
+with "not found" until `lookupIndexLocked` was factored out and used on both
+the delete and lookup sides).
+
+Live-verified end-to-end against a real `goopg`/`psql` (PG 18.3 client):
+`ALTER INDEX idx443 RENAME TO idx443_renamed` now returns the `ALTER INDEX`
+tag (was `ALTER TABLE`) AND `\d t443` / `pg_indexes` show the new name (was:
+tag said success, name silently stayed `idx443`); a full server restart
+(`goopg stop` / `goopg start` against the same data dir) confirmed
+`idx443_renamed` survives.
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor`+`internal/wal`+`internal/initdb`+`internal/server`
+suites PASS (full, no regressions); pgbench smoke = pre-commit hook; live
+`goopg`/`psql` smoke described above, including a full restart.
+
+### Deferred
+
+Live-verifying the `ALTER MATERIALIZED VIEW ... SET SCHEMA` tag fix
+surfaced a **much larger pre-existing gap, unrelated to this slice's scope**:
+materialized views have **no restart persistence at all** in goopg. A
+`CREATE MATERIALIZED VIEW mv AS SELECT ...` followed by a server restart
+leaves `mv` in the catalog as a plain heap table (`\d mv` shows `"Table"`,
+not `"Materialized view"`; `\dm` lists nothing) — so naturally the `SET
+SCHEMA` move on top of it doesn't survive either (reverts to its pre-move
+name/schema, table-ness and all). This is not a small follow-up like the
+tag fix above; it needs matview-specific catalog/WAL support (a
+`Table.MatView`-equivalent marker persisted across restart, likely alongside
+`CREATE MATERIALIZED VIEW`'s own restart persistence, which appears to not
+exist either) — out of scope for this bounded loop. No ledger precedent for
+this gap was found (`grep -in "materialized view" .ralph/deferral_ledger.md`
+turns up only the slice-440/436 mentions, neither about restart
+persistence), so this is a fresh discovery, not a repeat.
+
+Resume point: `internal/executor/operators_ddl.go`'s `execCreateMatView`
+(or equivalent) likely never emits a WAL record analogous to
+`RecordKindCreateIndex`/the collation-DDL family; `internal/initdb/open.go`'s
+`loadUserTablesFromHeap` would need to reconstruct the matview marker from
+whatever pg_class/heap row `syncTableToCatalogHeap` writes for a matview
+today (probably just `relkind='m'`, insufficient on its own — same shape of
+gap `RecordKindCreateIndex`'s doc comment describes for indexes, "goopg has
+no pg_index relation").

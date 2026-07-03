@@ -58,6 +58,14 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		{"alter view rename to", `ALTER VIEW my_view RENAME TO my_view2`, "ALTER VIEW"},
 		{"alter view owner to", `ALTER VIEW my_view OWNER TO CURRENT_USER`, "ALTER VIEW"},
 		{"alter view set schema", `ALTER VIEW my_view SET SCHEMA my_schema`, "ALTER VIEW"},
+		// DU-002 slice 443: ALTER INDEX ... RENAME TO and ALTER MATERIALIZED
+		// VIEW ... SET SCHEMA both reuse AlterTableStmt (an index/matview is
+		// just a relation too) but, unlike the slice 439/440 sequence/view
+		// sites above, were never given a TagOverride — they fell through to
+		// ddlTag's blanket "ALTER TABLE" default, exactly the mistagging gap
+		// the slice 439 deferral predicted for these two forms.
+		{"alter index rename to", `ALTER INDEX my_idx RENAME TO my_idx2`, "ALTER INDEX"},
+		{"alter materialized view set schema", `ALTER MATERIALIZED VIEW my_mv SET SCHEMA my_schema`, "ALTER MATERIALIZED VIEW"},
 	}
 
 	for _, tc := range cases {

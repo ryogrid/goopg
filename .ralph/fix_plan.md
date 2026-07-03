@@ -442,6 +442,63 @@ prev-link fixes.
       `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
       No deferral — closes the last unmodelled `ALTER COLLATION` grammar
       form in full (ledger row marked `resolved`, not `-`).
+      **2026-07-04 (loop #57, DU-002 slice 443): `ALTER INDEX ... RENAME TO`
+      / `ALTER MATERIALIZED VIEW ... SET SCHEMA` command-tag mistagging
+      fixed — AND `ALTER INDEX ... RENAME TO` was found to ALSO be a
+      functional no-op.** Closes the slice 439 tag-mistagging prediction for
+      the two remaining un-audited `AlterTableStmt`-reuse sites
+      (`TagOverride = "ALTER INDEX"` / `"ALTER MATERIALIZED VIEW"` added at
+      their `internal/parser/ddl.go` construction sites). Auditing `ALTER
+      INDEX RENAME TO` to fix the tag found the rename itself never applied:
+      `execAlterTable`'s index branch (`internal/executor/operators_ddl.go`,
+      reached when `s.Name` resolves via `LookupIndex` rather than a heap
+      table) had no case for `AlterTableRenameTable` at all — it fell
+      through to `// Other ALTER actions on index: silently accept in v0.`
+      and returned success with no catalog mutation. Live-verified against a
+      real `psql`: `ALTER INDEX idx443 RENAME TO idx443_renamed` returned
+      `ALTER TABLE` (pre-fix tag bug) and a follow-up `\d` still showed the
+      old name. Fixed with new `catalog.InMemory.RenameIndex`/
+      `RenameIndexDuringRecovery` (re-keys `c.indexes` + the owning table's
+      `c.byTable` slot, mirroring `RenameTable`), sharing a new
+      `lookupIndexLocked` helper (factored out of `LookupIndex`) that
+      resolves a genuine `""` vs `"public."` catalog-key ambiguity between a
+      live session's bare-name index keys and the M0113
+      `loadUserIndexesFromHeap` restart-reload path's explicit `"public"`
+      resolution — this ambiguity surfaced as a real test failure
+      (`TestRenameIndexSurvivesRestartViaWAL` initially failed with "not
+      found" until the shared lookup was used on both the delete and
+      re-insert sides). New `wal.RecordKindRenameIndex` (byte 94) +
+      `EncodeRenameIndex`/`DecodeRenameIndex`, emitted via
+      `ctx.Pool.LogChangeRecord` — deliberately the same mechanism
+      CREATE/DROP INDEX use (M0079-0001), not the `ctx.WAL.Append` pattern
+      most other slices in this thread use, because `ctx.WAL` is not wired
+      in every executor context that reaches DDL (confirmed by the
+      `internal/initdb` test harness, which never sets it) while `ctx.Pool`
+      always is; `internal/initdb/index_ddl_recovery.go`'s
+      `replayIndexDDLRecords` gains the matching replay case. Tests:
+      `TestAlterIndexRenameToApplies`/`UnknownRelation`/`Collision`/
+      `CommandTag` (`internal/executor/operators_alter_index_rename_test.go`);
+      2 new cases in `TestDDLCommandTagMatchesPostgres`
+      (`internal/server/ddl_command_tag_test.go`);
+      `TestEncodeDecodeRenameIndexRoundTrip` + 2 reject-cases
+      (`internal/wal/rename_index_test.go`);
+      `TestRenameIndexSurvivesRestartViaWAL`
+      (`internal/initdb/index_ddl_recovery_test.go`). Design doc "Follow-up:
+      `ALTER INDEX ... RENAME TO` / `ALTER MATERIALIZED VIEW ... SET SCHEMA`
+      command-tag mistagging AND `ALTER INDEX` was ALSO a functional no-op
+      (DU-002 slice 443)" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb`+`internal/server` suites PASS (full,
+      no regressions); pgbench smoke = pre-commit hook; live `goopg`/`psql`
+      smoke incl. a full server restart confirming the rename survives.
+      Deferred (ledger row appended, fresh discovery — not this slice's
+      scope): materialized views have no restart persistence at all in
+      goopg (a `CREATE MATERIALIZED VIEW` reverts to a plain table after
+      restart), so the `SET SCHEMA` move on top of it doesn't survive
+      either — needs new matview-specific catalog/WAL capability, not a
+      parser-routing/tag fix.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

@@ -9921,23 +9921,42 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	idx, _, ok := c.lookupIndexLocked(name)
+	return idx, ok
+}
+
+// lookupIndexLocked is the shared name-resolution core behind LookupIndex,
+// RenameIndex, and RenameIndexDuringRecovery — callers must already hold
+// c.mu. Returns the found index, the actual map key it lives under (which
+// may differ from key(name) — see the fallback below), and whether it was
+// found.
+//
+// The "" vs "public." ambiguity this resolves: a live DDL session stores an
+// unqualified index under the bare-name key (CREATE TABLE only sets
+// tbl.Schema when the writable search_path schema isn't "public", so a
+// same-session CreateIndex/RenameIndex/etc. consistently keys off ""); a
+// server restart's pg_index-heap reload (loadUserIndexesFromHeap, M0113)
+// resolves the namespace OID to the explicit string "public" instead. A
+// rename/lookup issued before vs. after a restart can therefore target the
+// same logical index under two different literal keys.
+func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bool) {
 	if idx, ok := c.indexes[key(name)]; ok {
-		return idx, ok
+		return idx, key(name), ok
 	}
 	if name.Schema == "" {
 		// Unqualified name: try "public.<name>" first (indexes created via DDL
 		// always carry the table's schema, which defaults to "public").
 		if idx, ok := c.indexes["public."+name.Name]; ok {
-			return idx, ok
+			return idx, "public." + name.Name, ok
 		}
 	} else {
 		// Schema-qualified lookup failed: fall back to bare name for indexes
 		// created without an explicit schema in the catalog key.
 		if idx, ok := c.indexes[name.Name]; ok {
-			return idx, ok
+			return idx, name.Name, ok
 		}
 	}
-	return nil, false
+	return nil, "", false
 }
 
 // CreateTable installs a new table in the catalog. Returns an error
@@ -10063,6 +10082,61 @@ func (c *InMemory) RestoreIndex(idx *Index) {
 		c.byTable[idx.Table.OID] = map[string]*Index{}
 	}
 	c.byTable[idx.Table.OID][k] = idx
+}
+
+// RenameIndex renames a catalog index entry from old to new, re-keying both
+// `c.indexes` and the owning table's `c.byTable` slot (mirrors RenameTable's
+// shape, DU-002 slice 443). Returns an error when old does not exist or new
+// already exists — real PostgreSQL raises 42P07 for the latter
+// (RenameRelation -> RangeVarCallbackForAlterRelation's namespace check).
+func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx, oldK, exists := c.lookupIndexLocked(old)
+	if !exists {
+		return fmt.Errorf("relation %q does not exist", key(old))
+	}
+	newK := key(parser.ObjectName{Schema: idx.Schema, Name: new.Name})
+	if _, _, collides := c.lookupIndexLocked(parser.ObjectName{Schema: idx.Schema, Name: new.Name}); collides {
+		return fmt.Errorf("relation %q already exists", newK)
+	}
+	idx.Name = new.Name
+	c.indexes[newK] = idx
+	delete(c.indexes, oldK)
+	if idx.Table != nil {
+		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+			delete(perTable, oldK)
+			perTable[newK] = idx
+		}
+	}
+	return nil
+}
+
+// RenameIndexDuringRecovery is the idempotent WAL-replay counterpart to
+// RenameIndex, mirroring RegisterIndexDuringRecovery's shape. A missing old
+// entry (already renamed by a prior pass, or a JSON snapshot that captured
+// the post-rename state) is a silent no-op rather than an error. Uses
+// lookupIndexLocked (not a bare key(schema, oldName) lookup) because the
+// WAL record's schema reflects the live session's "" convention while a
+// prior M0113 pg_index-heap reload may have re-keyed the same index under
+// the resolved "public." form — see lookupIndexLocked's doc comment.
+func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx, oldK, exists := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: oldName})
+	if !exists {
+		return
+	}
+	newK := key(parser.ObjectName{Schema: idx.Schema, Name: newName})
+	idx.Name = newName
+	c.indexes[newK] = idx
+	delete(c.indexes, oldK)
+	if idx.Table != nil {
+		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+			delete(perTable, oldK)
+			perTable[newK] = idx
+		}
+	}
 }
 
 // DropTable removes a table from the catalog. Returns an error when
