@@ -7964,25 +7964,37 @@ gate for concurrency-critical packages.
   passes its confirming read on a fresh run and a regression test guards it.
   Failures classed `pg4wp-limitation`/`harness` are documented, not fixed in
   goopg.
-- [ ] **M0121-0002 — Fix backend panic on `post update`/`post delete` (trash)
-  default-category reassignment.** Seeded from M0120-0002 (deferral ledger row
-  2026-07-04). `wp_set_post_categories`'s `SELECT term_taxonomy_id FROM
-  wp_term_relationships WHERE object_id=? AND term_taxonomy_id=?` panics with
-  `index out of range [1] with length 1` in `evalFastExpr`'s `ExprColumnRef`
-  case (`internal/executor/exprnode.go:222`) via `filterOpNext`
-  (`internal/executor/opnode.go:717`) — a compiled filter's column index
-  doesn't match a narrower slot (suspect an index-only/projected scan of
-  `wp_term_relationships` not remapping the residual filter's `ColumnRef`
-  index, or a plan/expr-slab reuse issue — a single fresh `psql` connection
-  running the isolated SQL text does NOT reproduce it, so bisect using the
-  full statement sequence in `wp/verification/results/20260704-072755/WP-02/
-  goopg_statements.log`, starting from the preceding `UPDATE wp_posts`, not
-  the bare SELECT). Requires a race/regression-gated executor session per the
-  WAL/MVCC practice card (filter/projection column-index correctness is
-  plan-level, not WAL, but treat evalFastExpr changes with the same care as
-  sibling-path fixes — cross-check `evalExprSlot`, the interpreted-evaluator
-  twin, stays in sync). Add a minimal Go-level regression test once
-  root-caused (a 3-column table + PK/composite-index scan projecting one
-  column + a residual filter on the second column is likely sufficient,
-  no WordPress/PG4WP required). Re-verify via `driver_wp01_16.sh` WP-02/WP-03
-  and close the ledger row.
+- [x] **M0121-0002 — Fix backend panic on `post update`/`post delete` (trash)
+  default-category reassignment.** DONE (2026-07-04). Root cause:
+  `tryPromoteIndexOnlyScan` (`internal/planner/planner.go`) narrowed a
+  promoted `Filter(IndexOnlyScan)`'s covered/output schema using only the
+  `Project`'s target list, never checking whether the surviving
+  `Filter.Predicate` referenced a column, and never remapping that
+  predicate's `ColumnRef.Index` off its pre-promotion (full-row) position —
+  a residual filter (`term_taxonomy_id = ?`) was left pointing one past the
+  end of the narrowed 1-column scan row, panicking `Slot.Get`
+  (`internal/executor/opnode.go:99`). Root-caused directly with a single
+  fresh `psql` connection once a *matching* `object_id` was used (the
+  original "not reproducible via a single connection" note was because the
+  tested `object_id` had since been deleted from seed data — the scan probe
+  then yielded zero rows, so the buggy filter predicate was never
+  evaluated). Fix: `tryPromoteIndexOnlyScan` now walks the surviving
+  `Filter.Predicate` (`walkColumnRefs`) to extend `covered` with any column
+  it needs (abandoning the promotion if the filter needs an uncovered/
+  non-indexed column or an outer/subquery ref — falls back to the
+  pre-existing correct `IndexScan`+`Filter`+`Project` shape), then remaps
+  the predicate's `ColumnRef.Index` via new `remapColumnRefsToSchema`
+  (mirrors `shiftColumnRefsBy`'s case list), reinstating an explicit
+  `Project` only when the filter pulled in a column beyond the `SELECT`
+  list. Design doc `docs/design/0121-0002-indexonly-scan-residual-filter-remap.md`.
+  Regression test `TestIndexOnlyScanResidualFilterColumnRemap`
+  (`internal/executor/indexonly_residual_filter_test.go`; confirmed it
+  panics with the same signature when the fix is reverted). Gates:
+  `go build ./...` clean; `go test ./internal/planner/...
+  ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+  Q13=33); re-verified end-to-end via `driver_wp01_16.sh`-equivalent
+  WP-01..WP-03 against the real WP-CLI/docker instance (post update/trash
+  now succeed, no panic in `wp/goopg-wp.log` for the run window) after a
+  `reset_wp_schema.sh` re-seed (the WP schema had drifted stale again,
+  unrelated to this fix). No new deferral-ledger row needed — no scope was
+  left unimplemented.
