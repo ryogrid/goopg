@@ -6571,8 +6571,20 @@ func (p *parser) parseAlter() (Stmt, error) {
 		case p.acceptIdentKeyword("refresh"):
 			_ = p.acceptIdentKeyword("version")
 			stmt.Action = "refresh"
+		case (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema"):
+			// SET SCHEMA newschema — DU-002 slice 442, closes the last
+			// unmodelled ALTER COLLATION form (RENAME TO / OWNER TO were
+			// already dedicated cases; only this one fell to the no-op
+			// default below).
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			stmt.Action = "setschema"
+			stmt.NewSchema = identText(schemaTok)
 		default:
-			// Unmodelled form (e.g. SET SCHEMA) — consume as a no-op.
+			// Unmodelled form — consume as a no-op.
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break

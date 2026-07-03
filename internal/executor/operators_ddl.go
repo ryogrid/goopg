@@ -440,19 +440,20 @@ func (o *ddlOp) execCreateCollation(s *parser.CreateCollationStmt) error {
 }
 
 // execAlterCollation handles ALTER COLLATION [IF EXISTS] name RENAME TO
-// newname | OWNER TO role | REFRESH VERSION. Only user-created collations
-// (the userCollations registry CREATE COLLATION populates) can be targeted —
-// a built-in collation is never registered there, so it always reports "does
-// not exist" here, mirroring DROP COLLATION's refusal to touch a pinned
-// pg_collation row. REFRESH VERSION has no real collation-versioning engine
-// behind it in goopg, so it mirrors PG's own no-detectable-version branch
-// (e.g. non-glibc libc): always a "version has not changed" NOTICE, no
-// catalog write, so nothing to WAL-log. RENAME TO / OWNER TO DO WAL-log
-// (RecordKindAlterCollationRename/Owner) so the mutation survives a restart —
-// mirrors CREATE/DROP COLLATION's restart-persistence, unlike ALTER TABLE
-// RENAME/OWNER TO which stays in-memory-only today. M0119-0004 (DU-002,
-// loop #50 ledger follow-up; WAL logging added as the loop #50 ledger's
-// resume-point (a)).
+// newname | OWNER TO role | SET SCHEMA newschema | REFRESH VERSION. Only
+// user-created collations (the userCollations registry CREATE COLLATION
+// populates) can be targeted — a built-in collation is never registered
+// there, so it always reports "does not exist" here, mirroring DROP
+// COLLATION's refusal to touch a pinned pg_collation row. REFRESH VERSION has
+// no real collation-versioning engine behind it in goopg, so it mirrors PG's
+// own no-detectable-version branch (e.g. non-glibc libc): always a "version
+// has not changed" NOTICE, no catalog write, so nothing to WAL-log. RENAME TO
+// / OWNER TO / SET SCHEMA DO WAL-log (RecordKindAlterCollationRename/Owner/
+// SetSchema) so the mutation survives a restart — mirrors CREATE/DROP
+// COLLATION's restart-persistence, unlike ALTER TABLE RENAME/OWNER TO which
+// stays in-memory-only today. M0119-0004 (DU-002, loop #50 ledger follow-up;
+// WAL logging added as the loop #50 ledger's resume-point (a)). SET SCHEMA
+// added DU-002 slice 442 (closes the last unmodelled ALTER COLLATION form).
 func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -498,6 +499,20 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 			}
 		}
 		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetCollationSchema(s.Name.Name, schema, newSchema) {
+			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterCollationSetSchema(s.Name.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal alter-collation-set-schema: %w", werr)
+			}
+		}
+		return nil
 	case "refresh":
 		if _, found := im.CollationAttrsByName(s.Name.Name); !found {
 			return notFound()
@@ -505,7 +520,7 @@ func (o *ddlOp) execAlterCollation(s *parser.AlterCollationStmt) error {
 		o.ctx.AddNotice(fmt.Sprintf("version has not changed for collation %q", s.Name.Name))
 		return nil
 	default:
-		// Unmodelled ALTER COLLATION form (e.g. SET SCHEMA) — no-op.
+		// Unmodelled ALTER COLLATION form — no-op.
 		return nil
 	}
 }

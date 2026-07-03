@@ -78,3 +78,53 @@ func TestAlterCollationRenameOwnerRefresh(t *testing.T) {
 		t.Errorf("err = %v, want it to name the missing collation", err)
 	}
 }
+
+// TestAlterCollationSetSchema guards DU-002 slice 442: ALTER COLLATION name
+// SET SCHEMA newschema was the last unmodelled ALTER COLLATION form
+// (RENAME TO / OWNER TO already had dedicated parser+executor support),
+// silently discarded as a no-op.
+func TestAlterCollationSetSchema(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE SCHEMA otherschema`); err != nil {
+		t.Fatalf("CREATE SCHEMA: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE COLLATION setschemacoll (LOCALE = 'C')`); err != nil {
+		t.Fatalf("CREATE COLLATION: %v", err)
+	}
+
+	if err := runDDL(t, ctx, `ALTER COLLATION setschemacoll SET SCHEMA otherschema`); err != nil {
+		t.Fatalf("ALTER COLLATION SET SCHEMA: %v", err)
+	}
+	uc, found := im.CollationAttrsByName("setschemacoll")
+	if !found {
+		t.Fatal("collation not found via CollationAttrsByName after SET SCHEMA")
+	}
+	wantNsOID := im.SchemaOID("otherschema")
+	if wantNsOID == 0 {
+		t.Fatal("SchemaOID(\"otherschema\") = 0, want a real namespace OID")
+	}
+	if uc.NamespaceOID != wantNsOID {
+		t.Errorf("NamespaceOID after SET SCHEMA = %d, want %d (otherschema)", uc.NamespaceOID, wantNsOID)
+	}
+
+	// IF EXISTS on an unknown collation is a no-op.
+	if err := runDDL(t, ctx, `ALTER COLLATION IF EXISTS nosuchcoll SET SCHEMA otherschema`); err != nil {
+		t.Fatalf("ALTER COLLATION IF EXISTS SET SCHEMA on unknown collation should be a no-op, got: %v", err)
+	}
+
+	// Without IF EXISTS, an unknown collation raises 42704.
+	err := runDDL(t, ctx, `ALTER COLLATION nosuchcoll SET SCHEMA otherschema`)
+	if err == nil {
+		t.Fatal("ALTER COLLATION SET SCHEMA on unknown collation without IF EXISTS should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+}

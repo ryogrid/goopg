@@ -10454,6 +10454,31 @@ func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool 
 	return false
 }
 
+// SetCollationSchema moves a user-created collation with the given bare name
+// from `schema` into `newSchema` (SET SCHEMA), resolving both schema names to
+// their namespace OID the same way SetCollationOwner/RenameCollation do
+// (unknown → public). Returns false if no such collation is registered.
+// DU-002 slice 442.
+func (c *InMemory) SetCollationSchema(name, schema, newSchema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
 // CreateCollationDuringRecovery is the idempotent version of CreateCollation
 // used by the WAL-replay driver (internal/initdb/collation_ddl_recovery.go).
 // Unlike CreateCollation it takes the OID from the WAL record (so the
@@ -10510,6 +10535,13 @@ func (c *InMemory) RenameCollationDuringRecovery(name, schema, newName string) {
 // restart-persistence follow-up (M0119-0004).
 func (c *InMemory) SetCollationOwnerDuringRecovery(name, schema string, ownerOID uint32) {
 	c.SetCollationOwner(name, schema, ownerOID)
+}
+
+// SetCollationSchemaDuringRecovery is the discard-result recovery counterpart
+// to SetCollationSchema, mirroring SetCollationOwnerDuringRecovery. DU-002
+// slice 442.
+func (c *InMemory) SetCollationSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetCollationSchema(name, schema, newSchema)
 }
 
 // CreateConversion records a CREATE [DEFAULT] CONVERSION in the runtime

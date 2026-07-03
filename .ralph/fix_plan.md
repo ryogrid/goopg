@@ -411,6 +411,37 @@ prev-link fixes.
       further known `ALTER STATISTICS` grammar gap — `SET STATISTICS`/
       `RENAME TO`/`OWNER TO`/`SET SCHEMA` is PG's complete grammar for this
       statement.
+      **2026-07-04 (loop #56, DU-002 slice 442): `ALTER COLLATION name SET
+      SCHEMA newschema` was the last unmodelled ALTER COLLATION form — now
+      closed, WITH restart persistence.** `ALTER COLLATION` already had
+      WAL-logged `RENAME TO`/`OWNER TO` (loop #50 follow-up); `SET SCHEMA`
+      fell to the generic no-op default in `parseAlter`'s collation case.
+      Added `AlterCollationStmt.NewSchema` (parser); `catalog.InMemory.
+      SetCollationSchema`/`SetCollationSchemaDuringRecovery` (re-keys
+      `userCollations` by `NamespaceOID`, mirroring `SetCollationOwner`'s
+      schema-resolution shape); a `"setschema"` case in `execAlterCollation`
+      that raises `42704` for an unknown target (`IF EXISTS` → notice) and
+      WAL-logs via a new `RecordKindAlterCollationSetSchema` (byte 93,
+      `EncodeAlterCollationSetSchema`/`DecodeAlterCollationSetSchema`); the
+      matching `internal/initdb/collation_ddl_recovery.go` replay case. The
+      virtual `pg_collation` view already projects `uc.NamespaceOID`
+      directly, so no further wiring was needed for `pg_dump` visibility
+      (unlike slice 441's `pg_statistic_ext` namespace-projection fix).
+      Tests: `TestParseAlterCollationSetSchema` (parser),
+      `TestAlterCollationSetSchema` (executor, full round trip +
+      `IF EXISTS`/`42704`), `TestEncodeDecodeAlterCollationSetSchemaRoundTrip`
+      + 2 reject-cases (wal, incl. multi-byte UTF-8),
+      `TestCollationDDLRecoveryReplaysSetSchemaAfterCreate` (initdb, WAL
+      replay across a close/reopen). Design doc "Follow-up: `ALTER COLLATION
+      name SET SCHEMA newschema` was the last unmodelled ALTER COLLATION
+      form (DU-002 slice 442)" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb` suites PASS (full, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      No deferral — closes the last unmodelled `ALTER COLLATION` grammar
+      form in full (ledger row marked `resolved`, not `-`).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

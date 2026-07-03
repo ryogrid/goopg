@@ -79,8 +79,7 @@ func TestParseAlterCollationOwner(t *testing.T) {
 }
 
 // TestParseAlterCollationRefreshVersion pins `ALTER COLLATION name REFRESH
-// VERSION` and confirms an unmodelled trailing form (SET SCHEMA) still parses
-// without error, as a no-op (Action == "").
+// VERSION`.
 func TestParseAlterCollationRefreshVersion(t *testing.T) {
 	stmts, err := Parse("ALTER COLLATION mycoll REFRESH VERSION")
 	if err != nil {
@@ -93,16 +92,24 @@ func TestParseAlterCollationRefreshVersion(t *testing.T) {
 	if ac.Action != "refresh" {
 		t.Errorf("Action = %q, want %q", ac.Action, "refresh")
 	}
+}
 
-	stmts, err = Parse("ALTER COLLATION mycoll SET SCHEMA other")
+// TestParseAlterCollationSetSchema pins the `ALTER COLLATION name SET SCHEMA
+// newschema` shape — DU-002 slice 442, previously an unmodelled no-op
+// (Action == "").
+func TestParseAlterCollationSetSchema(t *testing.T) {
+	stmts, err := Parse("ALTER COLLATION mycoll SET SCHEMA other")
 	if err != nil {
 		t.Fatalf("Parse (SET SCHEMA): %v", err)
 	}
-	ac, ok = stmts[0].(*AlterCollationStmt)
+	ac, ok := stmts[0].(*AlterCollationStmt)
 	if !ok {
 		t.Fatalf("stmt type = %T, want *AlterCollationStmt", stmts[0])
 	}
-	if ac.Action != "" {
-		t.Errorf("Action = %q, want empty (unmodelled no-op)", ac.Action)
+	if ac.Action != "setschema" {
+		t.Errorf("Action = %q, want %q", ac.Action, "setschema")
+	}
+	if ac.NewSchema != "other" {
+		t.Errorf("NewSchema = %q, want %q", ac.NewSchema, "other")
 	}
 }

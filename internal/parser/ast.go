@@ -1662,12 +1662,13 @@ func (s *CreateCollationStmt) stmtNode() {}
 // can't detect a version, e.g. non-glibc libc) and performs no catalog write.
 // M0119-0004 (DU-002, loop #50 ledger follow-up).
 type AlterCollationStmt struct {
-	pos      int
-	Name     ObjectName
-	IfExists bool
-	Action   string // "rename" | "owner" | "refresh" | "" (unmodelled, no-op)
-	NewName  string // for Action == "rename"
-	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	pos       int
+	Name      ObjectName
+	IfExists  bool
+	Action    string // "rename" | "owner" | "setschema" | "refresh" | "" (unmodelled, no-op)
+	NewName   string // for Action == "rename"
+	NewOwner  string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	NewSchema string // for Action == "setschema"
 }
 
 func (s *AlterCollationStmt) Pos() int  { return s.pos }

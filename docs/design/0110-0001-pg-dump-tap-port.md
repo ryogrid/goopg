@@ -13303,3 +13303,84 @@ pre-existing gap this slice did not create or need to fix. (3) `ALTER
 STATISTICS` sub-forms beyond these four (there are none in PG's own
 grammar — `SET STATISTICS`/`RENAME TO`/`OWNER TO`/`SET SCHEMA` is the
 complete set) are not applicable; no further known ALTER STATISTICS gap.
+
+## Follow-up: `ALTER COLLATION name SET SCHEMA newschema` was the last unmodelled ALTER COLLATION form (DU-002 slice 442)
+
+### Problem
+
+`ALTER COLLATION` already had dedicated `RENAME TO` / `OWNER TO` support
+(loop #50 ledger follow-up to M0119-0004), including WAL logging
+(`RecordKindAlterCollationRename`/`Owner`) so the mutation survives a
+restart. `SET SCHEMA` was the one remaining grammar form: `parseAlter`'s
+collation case had no dedicated branch for it, so it fell to the generic
+`default:` no-op — tokens consumed, `Action` left `""`, no catalog mutation,
+a clean success reply that silently did nothing. Same silent-no-op class as
+the `ALTER SEQUENCE`/`ALTER VIEW`/`ALTER STATISTICS` slices (439–441), here
+closing the collation object kind's own remaining gap rather than a new
+object kind.
+
+### Change
+
+- **Parser** (`internal/parser/ast.go`/`ddl.go`): `AlterCollationStmt` gains
+  `NewSchema string`; a new case in the collation `Action`-switch detects
+  `SET SCHEMA newschema` (checked before the `default:` no-op fallback) and
+  sets `Action = "setschema"`.
+- **Catalog** (`internal/catalog/catalog.go`): new `InMemory.SetCollationSchema`
+  (mirrors `SetCollationOwner`'s schema-resolution shape — both `schema` and
+  `newSchema` resolve to a namespace OID via `c.schemas[...]`, falling back to
+  `public` — and re-points the matching `userCollations` entry's
+  `NamespaceOID`) plus `SetCollationSchemaDuringRecovery`, the discard-result
+  recovery counterpart used by WAL replay.
+- **Executor** (`internal/executor/operators_ddl.go`): new `"setschema"` case
+  in `execAlterCollation` — resolves `NewSchema` (defaulting to `public` like
+  PG's own default-schema behavior), calls `SetCollationSchema`, raises
+  `42704` for an unknown target (`IF EXISTS` downgrades to a no-op), and
+  WAL-logs via `wal.EncodeAlterCollationSetSchema` when `o.ctx.WAL != nil` —
+  matching the RENAME/OWNER precedent's restart-durability treatment rather
+  than repeating the ALTER STATISTICS slice's "in-memory-only" deferral.
+- **WAL** (`internal/wal/recovery.go`): new `RecordKindAlterCollationSetSchema`
+  (byte 93) plus `EncodeAlterCollationSetSchema`/`DecodeAlterCollationSetSchema`
+  (`kind(1) | nameLen(2) | name | schemaLen(2) | schema | newSchemaLen(2) |
+  newSchema`); `ApplyRecord` routes it through the existing collation-DDL
+  metadata-only no-op physical-replay branch alongside
+  CREATE/DROP/RENAME/OWNER.
+- **Recovery** (`internal/initdb/collation_ddl_recovery.go`): new case in
+  `replayCollationDDLRecords` decoding the record and calling
+  `SetCollationSchemaDuringRecovery`.
+
+The virtual `pg_collation` view already projects `uc.NamespaceOID` directly
+(no separate cached column to invalidate), so the schema move is immediately
+visible to `\dO`/`pg_dump`'s `getCollations`/`dumpCollation` with no further
+wiring — unlike the ALTER STATISTICS slice's `pg_statistic_ext` virtual
+row, which needed its own namespace-projection fix.
+
+### Tests
+
+`TestParseAlterCollationSetSchema` (`internal/parser/alter_collation_test.go`
+— pins `Action == "setschema"` and `NewSchema`, replacing the old
+"unmodelled no-op" assertion). `TestAlterCollationSetSchema`
+(`internal/executor/alter_collation_test.go` — full parse→plan→exec round
+trip: SET SCHEMA moves `NamespaceOID`, `IF EXISTS` on an unknown collation is
+a no-op, without it a `42704` names the missing object).
+`TestEncodeDecodeAlterCollationSetSchemaRoundTrip` +
+`TestDecodeAlterCollationSetSchemaRejects{WrongKind,TruncatedPayload}`
+(`internal/wal/collation_ddl_test.go`, including a multi-byte UTF-8 case).
+`TestCollationDDLRecoveryReplaysSetSchemaAfterCreate`
+(`internal/initdb/collation_ddl_recovery_test.go` — CREATE in `public` + SET
+SCHEMA to a second schema created via `EncodeCreateSchema`, closed and
+reopened, confirms the collation is gone from `public` and present in the
+new schema with its original OID preserved).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor`+`internal/wal`+`internal/initdb` suites PASS (full, no
+regressions); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+hook.
+
+### Deferred
+
+None — this closes the last unmodelled `ALTER COLLATION` form in full,
+including restart persistence (unlike the ALTER STATISTICS slice, which left
+its RENAME/OWNER/SET SCHEMA in-memory-only). No further known `ALTER
+COLLATION` grammar gap.

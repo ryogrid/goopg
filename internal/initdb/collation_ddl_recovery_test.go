@@ -211,6 +211,59 @@ func TestCollationDDLRecoveryReplaysOwnerAfterCreate(t *testing.T) {
 	}
 }
 
+// TestCollationDDLRecoveryReplaysSetSchemaAfterCreate mirrors the
+// rename/owner tests for ALTER COLLATION ... SET SCHEMA (DU-002 slice 442).
+func TestCollationDDLRecoveryReplaysSetSchemaAfterCreate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40530)
+	const wantSchemaOID = uint32(40531)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("otherschema", wantSchemaOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-schema: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateCollation("mycoll", "public", "C", "C", "", "", wantOID, 10, -1, 'c', true)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterCollationSetSchema("mycoll", "public", "otherschema")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append set-schema: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	if uc := findUserCollation(cat, "mycoll", "public"); uc != nil {
+		t.Errorf("after CREATE + SET SCHEMA replay, \"mycoll\" still in public = %+v, want nil", uc)
+	}
+	uc := findUserCollation(cat, "mycoll", "otherschema")
+	if uc == nil {
+		t.Fatalf("after CREATE + SET SCHEMA replay, \"mycoll\" not found in otherschema; registry = %+v", cat.ListUserCollations())
+	}
+	if uc.OID != wantOID {
+		t.Errorf("after CREATE + SET SCHEMA replay, OID = %d, want %d (moved collation must keep its original OID)", uc.OID, wantOID)
+	}
+}
+
 // TestReplayCollationDDLRecordsHandlesMissingWalDir verifies the recovery
 // hook is idempotent when invoked against a missing pg_wal directory (brand
 // new initdb).
