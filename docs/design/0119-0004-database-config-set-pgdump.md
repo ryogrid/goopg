@@ -787,3 +787,64 @@ PASS; full `scripts/ralph-precommit-test.sh` PASS (pgbench smoke).
 No new deferrals for items (1)/(2) — both fully closed. Item (3)
 (`compatNoopCommandTag`'s extended-protocol parity) remains open, unchanged
 from loop #84, still a materially larger separate gap.
+
+## Follow-up: `compatNoopCommandTag` extended-protocol parity, first slice (loop #86)
+
+Starts closing item (3) of the loop #84/#85 rows: `dispatchSimpleQueryViaExecutor`'s
+`compatNoopCommandTag` fallback (`internal/server/dispatch.go` ~line 1274) — the
+no-op-DDL absorption for `GRANT`/`REVOKE`/`CREATE SCHEMA`/`COMMENT ON`/
+`SECURITY LABEL` forms (plus a few `CREATE`/`ALTER`/`DROP ROLE`/`DATABASE`
+spellings already covered by `tryHandleDatabaseOrRoleDDLExtended`) that the
+parser doesn't recognise at all — had no counterpart on
+`executeExtendedQueryViaExecutor`. A client driving one of these statements
+via Parse/Bind/Execute (JDBC/npgsql/psycopg2's default protocol) got a hard
+`42601` syntax error where psql's simple-query default silently absorbed it
+as a no-op — the same class of correctness gap loop #84 fixed for the
+database/role DDL bypass, just for the broader `compatNoopCommandTag` set.
+
+**Fix:** new `Server.tryCompatNoopExtended(query string) (*extendedQueryResult,
+*extendedQueryError, bool)` (`dispatch_extended.go`) calls the existing
+(unexported, already-shared) `compatNoopCommandTag(sql)` and, on a match,
+returns a bare `&extendedQueryResult{CommandTag: tag}` — wired into
+`executeExtendedQueryViaExecutor`'s `parser.Parse` error branch immediately
+after the existing `tryHandleDatabaseOrRoleDDLExtended` call, before the
+generic syntax-error fallback. `CREATE SCHEMA`'s catalog-registration +
+WAL-persistence side effect (previously inlined in
+`dispatchSimpleQueryViaExecutor`'s `compatNoopCommandTag` branch) was
+factored out into a new shared helper, `Server.registerCompatNoopSchema(sql
+string) error` (`dispatch.go`, next to `compatNoopCommandTag`), called from
+both the simple-query branch and `tryCompatNoopExtended` — so schema
+registration behaves byte-identically regardless of which wire protocol the
+client used, per this project's sibling-paths-must-stay-in-sync rule.
+
+**Scope note:** this closes the fallback-tag half of item (3) — the
+generic "parser doesn't recognise this form, treat it as a no-op" path. It
+does **not** touch the *parseable* forms of GRANT/REVOKE/CREATE SCHEMA/
+COMMENT ON that already have real parser grammar and go through the normal
+`stmts, err := parser.Parse(query)` success path unchanged on both
+protocols (already at parity — no gap there). `SECURITY LABEL` has no
+parser grammar at all, so it is fully covered by this fallback; `CREATE
+SCHEMA` likewise (no parser support for any form, confirmed via
+`grep -n "create schema" internal/parser/*.go` returning nothing).
+
+Tests: `TestExtendedProtocolCompatNoopSchema`
+(`internal/server/dispatch_extended_ddl_test.go`) — `CREATE SCHEMA` over a
+real Parse/Bind/Execute/Sync wire sequence, asserting `CommandComplete
+"CREATE SCHEMA"` (not a `42601` ErrorResponse) and that
+`catalog.InMemory.SchemaExists` reflects the new schema afterward, mirroring
+`TestSimpleQueryDropDatabaseActuallyDrops`'s "drive it over the real wire
+protocol, not a direct function call" style.
+
+Gates: `go build ./...`/`go vet ./internal/server/...` clean;
+`go test ./internal/server/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS.
+
+Deferred (ledger row appended): `GRANT`/`REVOKE` forms that the parser
+rejects (e.g. `GRANT ... ON ALL TABLES IN SCHEMA ...`, `GRANT ... ON LARGE
+OBJECT ...` — grammar the parser doesn't special-case) now also get the
+generic `tryCompatNoopExtended` absorption, matching the simple-query
+path's existing behaviour, but this loop did not enumerate or test every
+individual unparseable GRANT/REVOKE/COMMENT ON sub-form — only confirmed
+the shared dispatch mechanism is now symmetric between protocols. A future
+pass should audit each `compatNoopCommandTag` case for a dedicated
+extended-protocol regression test, the way `CREATE SCHEMA` got one here.

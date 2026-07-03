@@ -178,23 +178,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
 		if tag, ok := compatNoopCommandTag(sql); ok {
-			// Side-effect: register schema for CREATE SCHEMA statements.
-			if tag == "CREATE SCHEMA" && s.cfg.Catalog != nil {
-				norm := normalizeCompatSQL(sql)
-				if schemaName := schemaNameFromCreate(norm); schemaName != "" {
-					s.cfg.Catalog.RegisterSchema(schemaName)
-					// M0110-0003: persist so the schema survives a restart.
-					// This branch handles CREATE SCHEMA forms the parser
-					// rejects; the parsed CompatNoopStmt path emits the same
-					// record from execCompatNoop.
-					if s.cfg.WAL != nil {
-						if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
-							oid := im.SchemaOID(schemaName)
-							if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid)); werr != nil {
-								return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
-							}
-						}
-					}
+			if tag == "CREATE SCHEMA" {
+				if werr := s.registerCompatNoopSchema(sql); werr != nil {
+					return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -1291,7 +1277,7 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
 	case strings.HasPrefix(norm, "create schema "), norm == "create schema":
-		return "CREATE SCHEMA", true // name extraction done separately in dispatchSimpleQueryViaExecutor
+		return "CREATE SCHEMA", true // name extraction done separately in registerCompatNoopSchema
 	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
 	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
@@ -1312,6 +1298,39 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "SECURITY LABEL", true
 	}
 	return "", false
+}
+
+// registerCompatNoopSchema applies CREATE SCHEMA's catalog+WAL side effect
+// for the compatNoopCommandTag absorption path (a CREATE SCHEMA form the
+// parser doesn't recognise, e.g. lacking IF NOT EXISTS support). Shared by
+// both wire protocols — dispatchSimpleQueryViaExecutor and
+// executeExtendedQueryViaExecutor's tryCompatNoopExtended — so the schema
+// registers and persists identically regardless of which protocol the
+// client used. M0119-0004-ACLHEAP follow-up (loop #86, item (3) of the
+// loop #84 row).
+func (s *Server) registerCompatNoopSchema(sql string) error {
+	if s.cfg.Catalog == nil {
+		return nil
+	}
+	norm := normalizeCompatSQL(sql)
+	schemaName := schemaNameFromCreate(norm)
+	if schemaName == "" {
+		return nil
+	}
+	s.cfg.Catalog.RegisterSchema(schemaName)
+	// M0110-0003: persist so the schema survives a restart. This branch
+	// handles CREATE SCHEMA forms the parser rejects; the parsed
+	// CompatNoopStmt path emits the same record from execCompatNoop.
+	if s.cfg.WAL == nil {
+		return nil
+	}
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	oid := im.SchemaOID(schemaName)
+	_, _, err := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid))
+	return err
 }
 
 // schemaNameFromCreate extracts the schema name from a normalised CREATE SCHEMA statement.

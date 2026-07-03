@@ -5406,6 +5406,30 @@ documentation-only and is exempt from the design-doc requirement.)
       (`compatNoopCommandTag`'s extended-protocol parity) remains open,
       unchanged; the parser grammar + executor stub for `DROP DATABASE` are
       left in place as the intentional no-catalog fallback, not deleted.
+      **2026-07-03 (loop #86): `compatNoopCommandTag` extended-protocol
+      parity, first slice LANDED** — starts closing item (3) of the loop
+      #84/#85 rows. New `Server.tryCompatNoopExtended`
+      (`internal/server/dispatch_extended.go`) calls the existing shared
+      `compatNoopCommandTag(sql)` fallback (GRANT/REVOKE/CREATE SCHEMA/
+      COMMENT ON/SECURITY LABEL forms the parser doesn't recognise at all)
+      and returns a bare CommandTag result, wired into
+      `executeExtendedQueryViaExecutor`'s parse-error branch right after
+      `tryHandleDatabaseOrRoleDDLExtended` — a client using Parse/Bind/
+      Execute for one of these forms previously got a hard 42601 where
+      psql's simple-query default silently absorbed it. `CREATE SCHEMA`'s
+      catalog-registration + WAL-persistence side effect (previously
+      inlined in the simple-query branch) was factored into a new shared
+      `Server.registerCompatNoopSchema` (`dispatch.go`), called from both
+      protocols. Tests: `TestExtendedProtocolCompatNoopSchema`
+      (`internal/server/dispatch_extended_ddl_test.go`) — CREATE SCHEMA
+      over a real wire Parse/Bind/Execute/Sync sequence. Gates: build/vet
+      clean; `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc: "Follow-up: `compatNoopCommandTag`
+      extended-protocol parity, first slice (loop #86)", indexed as
+      `0119-0004cx`. Deferred (ledger row appended): only CREATE SCHEMA got
+      a dedicated regression test; a future pass should test each
+      remaining GRANT/REVOKE/COMMENT ON/SECURITY LABEL unparseable
+      sub-form individually — item (3) remains a multi-loop sub-task.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

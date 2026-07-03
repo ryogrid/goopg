@@ -46,6 +46,9 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
 			return res, qerr
 		}
+		if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
+			return res, qerr
+		}
 		msg, extra := syntaxErrorMsg(err)
 		qerr := &extendedQueryError{Code: sqlstate.SyntaxError, Message: msg}
 		for _, f := range extra {
@@ -372,6 +375,33 @@ func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *
 		return &extendedQueryResult{CommandTag: tag}, nil, true
 	}
 	return nil, nil, false
+}
+
+// tryCompatNoopExtended is the extended-query-protocol counterpart of
+// dispatchSimpleQueryViaExecutor's compatNoopCommandTag absorption
+// (dispatch.go ~line 180): GRANT/REVOKE/CREATE SCHEMA/COMMENT ON/SECURITY
+// LABEL forms (and a few CREATE/ALTER/DROP ROLE/DATABASE spellings already
+// covered by tryHandleDatabaseOrRoleDDLExtended above) that the parser
+// doesn't recognise at all. Until this fix a client using Parse/Bind/
+// Execute (JDBC/npgsql/psycopg2's default) for one of these forms got a
+// hard 42601 syntax error instead of the same no-op absorption psql's
+// simple-query default receives — a real correctness gap, not just missing
+// coverage. M0119-0004-ACLHEAP follow-up (loop #86, item (3) of the loop
+// #84 row, `0119-0004cv`/`0119-0004cw`).
+//
+// Returns handled=false when query does not match any compatNoopCommandTag
+// prefix, so the caller falls through to its normal syntax-error path.
+func (s *Server) tryCompatNoopExtended(query string) (*extendedQueryResult, *extendedQueryError, bool) {
+	tag, ok := compatNoopCommandTag(query)
+	if !ok {
+		return nil, nil, false
+	}
+	if tag == "CREATE SCHEMA" {
+		if werr := s.registerCompatNoopSchema(query); werr != nil {
+			return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: werr.Error()}, true
+		}
+	}
+	return &extendedQueryResult{CommandTag: tag}, nil, true
 }
 
 func paramsToDatums(params []boundParam) ([]executor.Datum, *extendedQueryError) {

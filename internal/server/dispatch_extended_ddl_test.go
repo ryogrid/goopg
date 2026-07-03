@@ -273,3 +273,36 @@ func TestExtendedProtocolRoleDDLErrorDetail(t *testing.T) {
 		t.Fatal("CREATE ROLE pg_*: ErrorResponse has no FieldDetail, want the pg_-prefix errdetail text")
 	}
 }
+
+// TestExtendedProtocolCompatNoopSchema pins item (3) of the loop #84 row
+// (`0119-0004cv`/`0119-0004cw`): compatNoopCommandTag's no-op DDL absorption
+// (dispatch.go, ~line 180 — GRANT/REVOKE/CREATE SCHEMA/COMMENT ON/SECURITY
+// LABEL forms the parser doesn't recognise at all) had no extended-protocol
+// counterpart, so a client using Parse/Bind/Execute for one of these forms
+// got a hard 42601 syntax error where psql's simple-query default silently
+// absorbed it. CREATE SCHEMA has no parser grammar whatsoever (parser.Parse
+// always fails), making it a clean probe: exercises the catalog+WAL side
+// effect (registerCompatNoopSchema) round-trips identically to the
+// simple-query path.
+func TestExtendedProtocolCompatNoopSchema(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+	conn := dialAndCompleteDB(t, addr, "postgres")
+	defer conn.Close()
+
+	frames := extendedExec(t, conn, "cs", "CREATE SCHEMA extddl_compatnoop_schema")
+	tag, errPayload := commandCompleteTag(t, frames)
+	if errPayload != "" {
+		t.Fatalf("CREATE SCHEMA: unexpected ErrorResponse: %s", errPayload)
+	}
+	if tag != "CREATE SCHEMA" {
+		t.Fatalf("CREATE SCHEMA: CommandComplete tag=%q, want %q", tag, "CREATE SCHEMA")
+	}
+	if !im.SchemaExists("extddl_compatnoop_schema") {
+		t.Fatal("extddl_compatnoop_schema not registered in catalog after extended-protocol CREATE SCHEMA")
+	}
+}
