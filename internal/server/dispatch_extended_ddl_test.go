@@ -9,6 +9,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/protocol"
+	"github.com/goopg/goopg/internal/sqlstate"
 )
 
 // dialAndCompleteDB is dialAndComplete but connects to a named database
@@ -397,5 +398,92 @@ func TestExtendedProtocolCompatNoopCommentOnMalformed(t *testing.T) {
 	}
 	if tag != "COMMENT" {
 		t.Fatalf("COMMENT ON TABLE (no name), simple-query: CommandComplete tag=%q, want %q", tag, "COMMENT")
+	}
+}
+
+// TestSimpleQueryMultiStatementCompatNoopBatchRejectsLaterSyntaxError pins
+// the multi-statement-batch masking bug found while writing the tests above
+// (M0119-0004-ACLHEAP loop #87 deferral, closed by splitLeadingCompatNoopDDL/
+// isMultiStatementSQL in loop #88): a simple-query batch whose FIRST
+// statement matches a compatNoopCommandTag prefix (GRANT, here) followed by
+// a LATER statement that is genuinely invalid SQL must report the real
+// syntax error for the whole batch and execute nothing — matching real
+// PostgreSQL's exec_simple_query/pg_parse_query semantics (the entire
+// message is parsed up front; any statement's syntax error rejects the
+// whole message, nothing runs). Before the fix, parser.Parse failed for the
+// full multi-statement string (Go's recursive-descent parser returns 0
+// statements + one error for the whole input, not a partial list) and
+// compatNoopCommandTag then matched the raw multi-statement text's leading
+// "grant " prefix, silently absorbing the WHOLE batch as a bare
+// CommandComplete "GRANT" success — swallowing the real syntax error and
+// running neither statement.
+func TestSimpleQueryMultiStatementCompatNoopBatchRejectsLaterSyntaxError(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndCompleteDB(t, addr, "postgres")
+	defer conn.Close()
+
+	const batch = "GRANT SELECT ON nosuchtable TO nosuchrole; !!! not valid sql at all((("
+	// Precondition: the first statement alone parses fine (per
+	// TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable's
+	// finding) but the full batch does not — otherwise this test would not
+	// be exercising the masking path at all.
+	if _, err := parser.Parse("GRANT SELECT ON nosuchtable TO nosuchrole"); err != nil {
+		t.Fatalf("precondition: GRANT alone failed to parse: %v", err)
+	}
+	if _, err := parser.Parse(batch); err == nil {
+		t.Fatalf("precondition: full batch parsed successfully; want a parse error to reach the masking path")
+	}
+
+	writeQuery(t, conn, batch)
+	frames := readUntilReady(t, conn)
+
+	if len(frames) != 2 {
+		t.Fatalf("frames=%d, want 2 (ErrorResponse, ReadyForQuery); got %+v", len(frames), frames)
+	}
+	if frames[0].Type != protocol.MsgErrorResponse {
+		t.Fatalf("frame[0].Type=%c, want E (ErrorResponse) — batch must not be silently absorbed as CommandComplete", frames[0].Type)
+	}
+	fields := parseErrorFields(t, frames[0].Payload)
+	if got := fields[protocol.FieldSQLState]; got != string(sqlstate.SyntaxError) {
+		t.Errorf("SQLSTATE = %q, want %q (syntax_error)", got, sqlstate.SyntaxError)
+	}
+	if frames[1].Type != protocol.MsgReadyForQuery {
+		t.Fatalf("frame[1].Type=%c, want Z (ReadyForQuery)", frames[1].Type)
+	}
+}
+
+// TestSimpleQueryMultiStatementCompatNoopDDLStillRecurses is the companion
+// regression guard for the fix above: a multi-statement batch whose FIRST
+// statement is a genuine parser-gap compatNoopCommandTag form (CREATE
+// SCHEMA, which the parser has no grammar for at all, unlike GRANT) followed
+// by a well-formed second statement must still run BOTH statements — the
+// splitLeadingCompatNoopDDL split-first-handle-recurse-rest path (mirroring
+// splitLeadingRoleDDL, M0118-0008) must keep working for the case it exists
+// for, not just reject everything multi-statement.
+func TestSimpleQueryMultiStatementCompatNoopDDLStillRecurses(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndCompleteDB(t, addr, "postgres")
+	defer conn.Close()
+
+	const batch = "CREATE SCHEMA noop_batch_recurse_schema; SELECT 1"
+	writeQuery(t, conn, batch)
+	frames := readUntilReady(t, conn)
+
+	var tags []string
+	for _, f := range frames {
+		if f.Type == protocol.MsgErrorResponse {
+			t.Fatalf("unexpected ErrorResponse in recursed batch: %s", string(f.Payload))
+		}
+		if f.Type == protocol.MsgCommandComplete {
+			tags = append(tags, strings.TrimSuffix(string(f.Payload), "\x00"))
+		}
+	}
+	if len(tags) != 2 || tags[0] != "CREATE SCHEMA" || tags[1] != "SELECT 1" {
+		t.Fatalf("CommandComplete tags=%v, want [\"CREATE SCHEMA\" \"SELECT 1\"]", tags)
+	}
+	if frames[len(frames)-1].Type != protocol.MsgReadyForQuery {
+		t.Fatalf("last frame type=%c, want Z (ReadyForQuery)", frames[len(frames)-1].Type)
 	}
 }

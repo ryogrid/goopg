@@ -6976,6 +6976,62 @@ documentation-only and is exempt from the design-doc requirement.)
       the full class of bare/incorrect tags findable by static review; a
       future DDL form added via the same stub pattern must set its own tag.
 
+- [x] **`compatNoopCommandTag` multi-statement-batch masking fix
+      (M0119-0004-ACLHEAP follow-up, loop #88).** **COMPLETE 2026-07-03:**
+      closes the loop #87 ledger row's discovery — a simple-query batch whose
+      FIRST statement matched a `compatNoopCommandTag` prefix (GRANT here,
+      but applicable to all ~12 prefixes) followed by a LATER genuinely
+      invalid statement made `parser.Parse` fail for the WHOLE batch (Go's
+      recursive-descent parser returns 0 statements + one error for the full
+      string, not a partial list), and `compatNoopCommandTag` then matched
+      the raw multi-statement text's leading prefix — silently absorbing the
+      entire batch as a bare `CommandComplete "GRANT"` success, swallowing
+      the real syntax error and executing neither statement. Real PostgreSQL
+      (`postgres/src/backend/tcop/postgres.c` `exec_simple_query`→
+      `pg_parse_query`) parses the full multi-statement string atomically and
+      raises a genuine `42601` for the whole message when any statement
+      fails to parse — it never silently reports success. Fix: two new
+      helpers in `internal/server/dispatch.go` — `isMultiStatementSQL` (does
+      `sql` carry a real second statement past its first top-level `;`?) and
+      `splitLeadingCompatNoopDDL` (mirrors `splitLeadingRoleDDL`,
+      M0118-0008: splits off the first statement only when it BOTH matches
+      `compatNoopCommandTag` AND fails to parse in isolation — the genuine
+      parser-gap case, e.g. `CREATE SCHEMA`/`CREATE DATABASE`, whose grammar
+      is entirely unimplemented). `GRANT`/`REVOKE`/`COMMENT ON`/`SECURITY
+      LABEL` are excluded from the split because a lone instance of any of
+      them always parses successfully (loop #87 finding) — so if the FULL
+      batch still fails to parse, the failure is necessarily a LATER
+      statement, and `dispatchSimpleQueryViaExecutor`'s compatNoop absorption
+      at line ~180 is now gated: `splitLeadingCompatNoopDDL` first (handles
+      the legitimate parser-gap workaround, executes the first statement and
+      recurses into the rest — unchanged observable behavior for e.g.
+      `CREATE SCHEMA s; SELECT 1`), then `compatNoopCommandTag(sql)` is only
+      called directly when `!isMultiStatementSQL(sql)` (single-statement
+      case, unchanged). A genuinely-invalid multi-statement batch now falls
+      through to the real `42601` syntax error and executes nothing.
+      `tryCompatNoopExtended` (extended-protocol counterpart,
+      `dispatch_extended.go`) needed no change — a Parse message carries
+      exactly one SQL command per the wire protocol spec (already documented
+      at that function's definition), so this bug is simple-query-only.
+      Tests: new `TestSimpleQueryMultiStatementCompatNoopBatchRejectsLaterSyntaxError`
+      (drives `"GRANT SELECT ON nosuchtable TO nosuchrole; !!! not valid sql
+      at all((("` over the wire, asserts `ErrorResponse`+`42601` and NO
+      `CommandComplete`; verified RED against the pre-fix code via a
+      temporary `git stash` of just `dispatch.go`) and
+      `TestSimpleQueryMultiStatementCompatNoopDDLStillRecurses` (regression
+      guard: `"CREATE SCHEMA noop_batch_recurse_schema; SELECT 1"` must still
+      run BOTH statements) in `internal/server/dispatch_extended_ddl_test.go`.
+      Gates: `go build ./...`/`go vet ./...` clean; `gofmt -l` clean;
+      `go test ./internal/server/...` PASS (full package, no regression);
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      Design `docs/design/0119-0004-database-config-set-pgdump.md` gained a
+      "Follow-up: compatNoopCommandTag multi-statement-batch masking fix
+      (loop #88)" section; `docs/design/README.md` row `0119-0004cz` added.
+      Deferral ledger row appended (marks the loop #87 row `resolved`). No
+      new deferral — this closes the discovery from loop #87 in full (all
+      ~12 `compatNoopCommandTag` prefixes share the one gated call site, not
+      just GRANT).
+
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
 > tasks over time. Finalize the themed-task set from the ledger's distinct open

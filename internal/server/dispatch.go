@@ -177,16 +177,35 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
-		if tag, ok := compatNoopCommandTag(sql); ok {
+		if first, rest, tag, ok := splitLeadingCompatNoopDDL(sql); ok {
 			if tag == "CREATE SCHEMA" {
-				if werr := s.registerCompatNoopSchema(sql); werr != nil {
+				if werr := s.registerCompatNoopSchema(first); werr != nil {
 					return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
-			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, rest, connTx, prepStmts)
+		}
+		// A multi-statement batch that isn't the parser-gap workaround case
+		// above must not have compatNoopCommandTag matched against its raw,
+		// unsplit text below — that would absorb the WHOLE batch (including
+		// a later, genuinely invalid statement) as a bare success instead of
+		// reporting the real syntax error, silently executing nothing.
+		// M0119-0004-ACLHEAP loop #87 follow-up.
+		if !isMultiStatementSQL(sql) {
+			if tag, ok := compatNoopCommandTag(sql); ok {
+				if tag == "CREATE SCHEMA" {
+					if werr := s.registerCompatNoopSchema(sql); werr != nil {
+						return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
+					}
+				}
+				if err := w.WriteCommandComplete(tag); err != nil {
+					return err
+				}
+				return w.WriteReadyForQuery(protocol.TxStatusIdle)
+			}
 		}
 		msg, extra := syntaxErrorMsg(err)
 		return s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...)
@@ -1298,6 +1317,56 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "SECURITY LABEL", true
 	}
 	return "", false
+}
+
+// isMultiStatementSQL reports whether sql carries a real second statement
+// after its first top-level ';' (a trailing terminator with nothing but
+// whitespace after it does not count). Used to gate the compatNoopCommandTag
+// absorption below: matching a batch's leading prefix is only safe to do
+// against a single statement, never against the raw text of a multi-
+// statement batch. M0119-0004-ACLHEAP loop #87 follow-up.
+func isMultiStatementSQL(sql string) bool {
+	end := firstTopLevelSemicolon(sql)
+	return end >= 0 && strings.TrimSpace(sql[end+1:]) != ""
+}
+
+// splitLeadingCompatNoopDDL splits a multi-statement batch whose FIRST
+// statement matches compatNoopCommandTag AND whose grammar is entirely
+// unimplemented (parser.Parse fails even in isolation — e.g. CREATE SCHEMA,
+// CREATE/ALTER/DROP DATABASE; CREATE/ALTER/DROP ROLE is peeled off earlier by
+// splitLeadingRoleDDL). Mirrors splitLeadingRoleDDL's split-first-handle-
+// recurse-rest shape (M0118-0008) so trailing statements in the batch are not
+// silently dropped.
+//
+// GRANT/REVOKE/COMMENT ON/SECURITY LABEL are deliberately excluded from this
+// split: their grammar exists and a lone instance of any of them always
+// parses successfully (verified M0119-0004-ACLHEAP loop #87), so if parsing
+// the FULL batch still fails, the failure must come from a LATER statement
+// being genuinely invalid SQL. In that case ok is false and the caller must
+// fall through to the real syntax error for the whole batch rather than
+// absorb it — the multi-statement-masking bug this function closes.
+func splitLeadingCompatNoopDDL(sql string) (first, rest, tag string, ok bool) {
+	end := firstTopLevelSemicolon(sql)
+	if end < 0 {
+		return "", "", "", false
+	}
+	first = sql[:end]
+	rest = strings.TrimSpace(sql[end+1:])
+	if rest == "" {
+		return "", "", "", false
+	}
+	tag, matched := compatNoopCommandTag(first)
+	if !matched {
+		return "", "", "", false
+	}
+	if _, err := parser.Parse(first); err == nil {
+		// The first statement has real grammar and parses fine standalone
+		// (e.g. GRANT/REVOKE/COMMENT ON/SECURITY LABEL) — the batch's
+		// overall parse failure comes from a later statement, so this is
+		// not a parser-gap workaround case.
+		return "", "", "", false
+	}
+	return first, rest, tag, true
 }
 
 // registerCompatNoopSchema applies CREATE SCHEMA's catalog+WAL side effect

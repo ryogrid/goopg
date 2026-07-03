@@ -896,3 +896,81 @@ this situation. Not specific to GRANT — applies to every
 `compatNoopCommandTag`-matched prefix. Out of this loop's bounded scope
 (touches the shared matching logic across all ~12 prefix cases); see the
 ledger row for the resume point.
+
+## Follow-up: `compatNoopCommandTag` multi-statement-batch masking fix (loop #88)
+
+Closes the loop #87 section's own discovery above: a simple-query batch whose
+FIRST statement matched a `compatNoopCommandTag` prefix, followed by a LATER
+genuinely-invalid statement, was silently absorbed in full as a bare
+`CommandComplete` success — the real syntax error was swallowed and neither
+statement executed.
+
+**Root cause recap.** Go's recursive-descent `parser.Parse` returns 0
+statements + one error for an entire multi-statement string when ANY
+statement in it fails to parse — never a partial statement list. When
+`dispatchSimpleQueryViaExecutor` (`internal/server/dispatch.go` ~line 124)
+hit that error, its `compatNoopCommandTag(sql)` fallback (~line 180) matched
+against the raw, unsplit multi-statement `sql` string's leading prefix — so
+`"GRANT SELECT ON t TO x; !!! garbage"` matched `"grant "` and was absorbed
+as `CommandComplete "GRANT"`, even though the batch as a whole never parsed
+and neither statement ran.
+
+**Fix.** Two new helpers next to `compatNoopCommandTag`
+(`internal/server/dispatch.go`):
+
+- `isMultiStatementSQL(sql string) bool` — true when `sql` has a real second
+  statement past its first top-level `;` (reuses `firstTopLevelSemicolon`
+  from `role_ddl.go`, the same top-level-`;` scanner `splitLeadingRoleDDL`
+  already relies on — quote/comment/dollar-quote aware).
+- `splitLeadingCompatNoopDDL(sql string) (first, rest, tag string, ok bool)` —
+  mirrors `splitLeadingRoleDDL`'s split-first-handle-recurse-rest shape
+  (M0118-0008). Splits off the first statement only when it BOTH matches
+  `compatNoopCommandTag` AND fails to parse **in isolation** — the genuine
+  parser-gap case (`CREATE SCHEMA`, `CREATE`/`ALTER`/`DROP DATABASE`; ROLE
+  forms are peeled off earlier by `splitLeadingRoleDDL` itself). `GRANT`/
+  `REVOKE`/`COMMENT ON`/`SECURITY LABEL` are deliberately excluded: per loop
+  #87's finding, a lone instance of any of them always parses successfully,
+  so if the FULL batch still fails to parse, the failure must come from a
+  LATER statement — `splitLeadingCompatNoopDDL` returns `ok=false` for that
+  case, on purpose, so the caller falls through to the real syntax error.
+
+The `compatNoopCommandTag` call site now reads: try
+`splitLeadingCompatNoopDDL` first (the legitimate workaround — executes the
+first statement's tag/side-effect, then recurses into
+`dispatchSimpleQueryViaExecutor` on the remainder, so trailing statements are
+never dropped, exactly like `CREATE ROLE x; CREATE TABLE y` already worked);
+otherwise, only call `compatNoopCommandTag(sql)` directly against the raw
+string when `!isMultiStatementSQL(sql)` (the ordinary single-statement case,
+byte-for-byte unchanged). A multi-statement batch that is neither case falls
+through to the pre-existing `syntaxErrorMsg(err)` / `sqlstate.SyntaxError`
+path — matching real PostgreSQL's `exec_simple_query`→`pg_parse_query`
+semantics (`postgres/src/backend/tcop/postgres.c`): the full message is
+parsed atomically, and any statement's syntax error rejects the whole
+message, with nothing executed.
+
+`tryCompatNoopExtended` (`dispatch_extended.go`) needed no equivalent change:
+per its own doc comment (loop #86), a Parse message carries exactly one SQL
+command per the wire protocol spec, so the extended-protocol path was never
+exposed to this bug.
+
+**Tests** (`internal/server/dispatch_extended_ddl_test.go`):
+- `TestSimpleQueryMultiStatementCompatNoopBatchRejectsLaterSyntaxError` drives
+  `"GRANT SELECT ON nosuchtable TO nosuchrole; !!! not valid sql at all((("`
+  over the real simple-query wire protocol and asserts exactly
+  `ErrorResponse` (SQLSTATE `42601`) + `ReadyForQuery` — no `CommandComplete`.
+  Verified RED against the pre-fix `dispatch.go` via a temporary
+  `git stash push -- internal/server/dispatch.go` / test-run / `stash pop`
+  round-trip before committing the fix.
+- `TestSimpleQueryMultiStatementCompatNoopDDLStillRecurses` is the companion
+  regression guard: `"CREATE SCHEMA noop_batch_recurse_schema; SELECT 1"`
+  must still run BOTH statements (two `CommandComplete` tags, no error) —
+  proving the legitimate parser-gap workaround path is untouched.
+
+Gates: `go build ./...`/`go vet ./...` clean; `gofmt -l` clean;
+`go test ./internal/server/...` PASS (full package, no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke = pre-commit
+hook.
+
+No new deferral: this closes the loop #87 discovery in full — all ~12
+`compatNoopCommandTag`-matched prefixes share the one gated call site fixed
+here, not just `GRANT`.
