@@ -63,9 +63,22 @@ define('PG4WP_DEBUG', true);        // logs pg4wp_*.log: converted + unmodified 
 ```
 
 then recreate the container: `docker compose -f wp/docker-compose.yml up -d --force-recreate wordpress`.
-(For a one-off run without editing compose, `define('PG4WP_DEBUG', true);` can
-be inserted at the top of the running container's `wp-content/wp-config.php`.)
-PG4WP then writes:
+
+**IMPORTANT — recreate alone is not enough on an existing `wp_html` volume.**
+The WordPress entrypoint only writes `WORDPRESS_CONFIG_EXTRA` into `wp-config.php`
+when that file does **not** already exist. Because `wp_html` persists across
+recreates, a `--force-recreate` leaves the old `wp-config.php` in place and
+`PG4WP_DEBUG` never lands (verified 2026-07-03, M0120-0001). So after recreating,
+inject the define directly (idempotent) — the file lives at the doc root
+`wp-config.php`, not under `wp-content/`:
+
+```bash
+docker compose -f wp/docker-compose.yml run --rm --no-TTY wpcli \
+  sh -c "grep -q PG4WP_DEBUG wp-config.php || sed -i \"1a define('PG4WP_DEBUG', true);\" wp-config.php"
+```
+
+Confirm with `grep -n PG4WP_DEBUG wp-config.php`, then run any `wp` command and
+check `wp-content/pg4wp/logs/pg4wp_*.log` appears. PG4WP then writes:
 - `pg4wp/logs/pg4wp_*.log` — each `initial → converted` rewrite,
 - `pg4wp/logs/pg4wp_unmodified.log` — queries passed through unchanged,
 - `pg4wp/logs/pg4wp_errors.log` — error-generating queries (`PG4WP_LOG_ERRORS`,
