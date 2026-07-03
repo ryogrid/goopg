@@ -3193,6 +3193,36 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			colKey := strings.ToLower(col.Name)
 			noInherit := explicitNoInherit[colKey]
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			isLocal := true
+			inhCount := 0
+			// A column carried in purely by a plain `INHERITS (parent)` clause
+			// (col.Inherited, not the child's own column list) whose NOT NULL
+			// comes from the parent must record conislocal='f'/coninhcount>0 with
+			// the PARENT's constraint name, matching real PG's MergeAttributes.
+			// Getting this wrong makes pg_dump's shouldPrintColumn/print_notnull
+			// (pg_dump.c) treat the column as locally NOT NULL and re-emit it
+			// as a malformed standalone `NOT NULL <col>` table element even
+			// though the column itself is never printed (it arrives via
+			// INHERITS). CREATE TABLE ... PARTITION OF also sets col.Inherited,
+			// but partitions always print every column inline regardless of
+			// locality (pg_dump.c's `tbinfo->ispartition` check), so this
+			// re-derivation only matters for s.PartitionOf == nil. DU-002.
+			if col.Inherited && s.PartitionOf == nil {
+				for _, parent := range inheritParents {
+					for _, pnc := range parent.NotNullConstraints {
+						if strings.EqualFold(pnc.ColName, col.Name) {
+							if inhCount == 0 && pnc.Name != "" {
+								name = pnc.Name
+							}
+							inhCount++
+							break
+						}
+					}
+				}
+				if inhCount > 0 {
+					isLocal = false
+				}
+			}
 			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
 				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the
 				// auto-name. DU-002 slice 273.
@@ -3207,7 +3237,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					noInherit = true
 				}
 			}
-			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, true, 0)
+			tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, isLocal, inhCount)
 		}
 	}
 	// Copy pg_description comments from LIKE INCLUDING COMMENTS sources:

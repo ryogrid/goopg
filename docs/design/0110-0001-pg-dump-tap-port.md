@@ -10898,13 +10898,117 @@ resolution gap above (`pg_type`/`pg_operator`/`pg_am` columns) is a
 separate, larger deferral — no fixture currently exercises it either, and
 fixing it generically would mean adding `regproc`/`regprocedure` cases to
 both `dispatch.go` and `dispatch_extended.go`'s text-formatting switches
-(the latter is already missing several cases `dispatch.go` has, e.g.
-`regclass`/`date`/`bytea` — a pre-existing simple-vs-extended-protocol
-divergence, not caused by this change) backed by a full builtin-proc
-OID→name index. `pgProcNameForOID` in this change is scoped to
-`internal/initdb` (where `pgProcAllEntries()` lives); promoting it to a
-general resolver would need it (or an equivalent) reachable from
-`internal/server`/`internal/executor`.
+backed by a full builtin-proc OID→name index. `pgProcNameForOID` in this
+change is scoped to `internal/initdb` (where `pgProcAllEntries()` lives);
+promoting it to a general resolver would need it (or an equivalent)
+reachable from `internal/server`/`internal/executor`. **Correction (loop
+#48):** the "`dispatch_extended.go` is missing several cases `dispatch.go`
+has" half of this note is stale — `appendTypedCellText`
+(`internal/server/dispatch.go`) was unified into one function shared by
+both the simple-query streaming path and the extended-query materializing
+path at some point after this row was written (its own doc comment says
+so), including `regclass`/`regproc`/`regprocedure`/`date`/`bytea`/etc.; only
+the `pg_type`/`pg_operator`/`pg_am` OID→name index itself remains
+unimplemented, not a simple-vs-extended split.
+
+### Plain-`INHERITS` NOT NULL constraint locality fix (loop #48)
+
+Live discovery (not from a ledger row): `pg_dump`'s connection-setup fixture
+had no coverage for a plain (non-partition) `CREATE TABLE child (...)
+INHERITS (parent)` where the inherited column is `NOT NULL` — the single
+most basic form of PostgreSQL table inheritance, exercised by real PG's own
+`002_pg_dump.pl`. Probed live: `CREATE TABLE parent_t (id int PRIMARY KEY,
+name text); CREATE TABLE child_t (extra text) INHERITS (parent_t);` then
+`pg_dump --schema-only` against goopg emitted
+
+```
+CREATE TABLE public.child_t (
+    NOT NULL id,
+    extra text
+)
+INHERITS (public.parent_t);
+```
+
+— syntactically bogus-looking at first glance, but actually PG's own
+documented non-conforming syntax (`pg_dump.c:17213-17233`, comment: "This
+syntax isn't SQL-conforming, but if you wanted standard output you wouldn't
+be creating non-standard objects to begin with") for a column that is
+**not printed** (`shouldPrintColumn` → false, purely inherited, no local
+redeclaration) but whose NOT NULL constraint **is** locally defined
+(`notnull_islocal[j]` true). Real PostgreSQL 18.3, given the identical DDL,
+emits no such element at all — `id` isn't locally NOT NULL in this case, it
+purely inherits both the column and the constraint from `parent_t` (`psql`
+confirms `pg_constraint.conislocal='f'`, `coninhcount=1`, same constraint
+name `parent_t_id_not_null` as the parent's own row). So goopg's output was
+a real, confirmed-against-live-PG divergence, not a cosmetic one.
+
+Root cause: `execCreateTable`'s "PG18 records a contype='n' NOT NULL
+constraint for EVERY not-null column" loop (`internal/executor/
+operators_ddl.go`, ~line 3189, DU-002 slice 50) called
+`tbl.AddNotNull(name, col.Name, im.AllocOID(), noInherit, true, 0)`
+**unconditionally** — every NOT NULL column got `conislocal='t'`,
+`coninhcount=0`, even a column carried in purely by `INHERITS` and marked
+`col.Inherited=true` earlier in the same function (DU-002 slice 170, for
+the sibling `pg_attribute.attislocal` purpose). That made `notnull_islocal`
+true for `child_t.id`, which is exactly the condition that triggers
+`pg_dump.c`'s "print it as a standalone item since the column itself isn't
+printed" branch.
+
+Fix: the same loop now checks `col.Inherited && s.PartitionOf == nil` (a
+`CREATE TABLE ... PARTITION OF` child also sets `col.Inherited`, but
+partitions always print every column inline regardless of locality —
+`pg_dump.c`'s `tbinfo->ispartition` OR-condition — so this only matters for
+plain `INHERITS`) and, when true, walks `inheritParents` for a parent that
+already carries a NOT NULL constraint on the same column name: if found,
+`isLocal=false`, `inhCount` = count of contributing parents, and the
+constraint's **name is taken from the parent's own constraint** (matching
+real PG, which does not mint a fresh child-local name for a purely
+inherited constraint). A column the child also declares itself in its own
+column list (even if it happens to restate `NOT NULL`) is unaffected —
+`col.Inherited` is only set when the column name is absent from the child's
+own `s.Columns` list (DU-002 slice 170's existing `localCols` check),
+matching real PG's `MergeAttributes` local/inherited split.
+
+New coverage: `TestCreateTableInheritsNotNullConstraintIsNonLocal`
+(`internal/executor/operators_ddl_named_check_test.go`) — asserts the
+parent's own constraint stays `conislocal=t/coninhcount=0`, the child's
+inherited copy is `conislocal=f/coninhcount=1` with the parent's exact
+constraint name, and a second child that locally redeclares the same
+column (`CREATE TABLE child2 (id int NOT NULL, ...) INHERITS (parent)`)
+keeps the pre-existing `conislocal=t/coninhcount=0` behavior (regression
+guard only — multi-parent column-merge semantics, i.e. `attislocal=true`
+*combined with* `attinhcount>0` for an explicitly-redeclared-and-also-
+inherited column, are a separate, unverified-against-PG gap, out of scope
+here). Live end-to-end `pg_dump` smoke against a running goopg instance
+confirmed the fix: `child_t`'s `CREATE TABLE` now omits `id` entirely
+(carried by `INHERITS (parent_t)`), byte-identical to real PostgreSQL
+18.3's own output for the same DDL.
+
+Gates: `go build ./...`/`go vet ./...` clean; new test PASS; full
+`internal/executor`+`internal/catalog` suites PASS (no regression);
+`TestPort_PgDumpConnectionSetup`+`TestPort_PgDump001Basic` PASS; live
+`pg_dump` smoke on an isolated port/data dir vs. a scratch real-PostgreSQL-
+18.3 instance (`postgres/local_install`) for both the fixed case and a
+`PARTITION OF` sanity check (confirmed unaffected — same pre-existing
+behavior before and after, not touched by this fix's `s.PartitionOf == nil`
+guard); `internal/parser`+`internal/server`+`internal/initdb` suites PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+**New discovery, deferred (ledger row appended):** while confirming the
+`PARTITION OF` case is unaffected (not regressed), live probing found a
+**separate, pre-existing** bug, unrelated to this fix: a `CREATE TABLE
+child PARTITION OF parent FOR VALUES ...` child's inherited-NOT-NULL
+columns get **zero** `pg_constraint` contype='n' rows at all (confirmed via
+`psql`: `part_child` has no NOT NULL constraint row even though
+`pg_attribute.attnotnull='t'`/`attinhcount=1`), where real PG 18.3 gives it
+one with `conislocal='f'/coninhcount=1` reusing the parent's name — this
+makes `pg_dump` on a real partition child currently omit the `CONSTRAINT
+<name> NOT NULL` inline suffix PG emits (`id integer CONSTRAINT
+parent_id_not_null NOT NULL,` vs. goopg's plain `id integer,`). This is
+NOT touched by the `s.PartitionOf == nil` guard added above (deliberately —
+scoping this fix to the plain-`INHERITS` case that was actually verified
+live) and needs its own investigation into why the NOT NULL registration
+loop doesn't run for `s.PartitionOf != nil` at all.
 
 ## Deferred (002–010) — catalog surface estimate
 

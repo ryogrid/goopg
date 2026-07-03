@@ -6231,6 +6231,70 @@ documentation-only and is exempt from the design-doc requirement.)
       inherited-privilege/superuser fallback for a bare REVOKE's implicit
       grantor.
 
+- [x] **Plain-`INHERITS` NOT NULL constraint locality fix (M0110-0001
+      follow-up, loop #48).** **COMPLETE 2026-07-03:** live `pg_dump`
+      discovery (not sourced from a prior ledger row) against the most basic
+      form of table inheritance — `CREATE TABLE parent_t (id int PRIMARY
+      KEY, name text); CREATE TABLE child_t (extra text) INHERITS
+      (parent_t);` — found goopg's `pg_dump --schema-only` emitted a
+      malformed `CREATE TABLE public.child_t ( NOT NULL id, extra text )
+      INHERITS (public.parent_t);` where live PostgreSQL 18.3 (verified
+      side-by-side, `postgres/local_install`) emits `CREATE TABLE
+      public.child_t (extra text) INHERITS (public.parent_t);` with no
+      mention of `id` at all — a real, confirmed-against-live-PG
+      divergence. Root cause: `execCreateTable`'s NOT NULL constraint
+      registration loop (`internal/executor/operators_ddl.go` ~line 3189,
+      DU-002 slice 50) called `tbl.AddNotNull(..., isLocal=true,
+      inhCount=0)` unconditionally for every NOT NULL column, even one
+      carried in purely by `INHERITS` (`col.Inherited=true`, DU-002 slice
+      170 — previously only consumed for the sibling `pg_attribute.
+      attislocal` purpose) — making `pg_constraint.conislocal='t'` for
+      `child_t.id`, exactly the condition `pg_dump.c`'s `dumpTableSchema`
+      (~line 17213) uses to re-emit a non-printed inherited column as a
+      standalone non-conforming `NOT NULL <col>` table element (PG's own
+      documented syntax for a LOCAL not-null override on an otherwise
+      inherited-and-unprinted column — the wrong branch to be in here,
+      since `id` is not local at all). Fix: when `col.Inherited &&
+      s.PartitionOf == nil` (a `PARTITION OF` child also sets
+      `col.Inherited`, but partitions always print every column inline
+      regardless of locality — `pg_dump.c`'s `ispartition` OR-condition —
+      so this only matters for plain `INHERITS`), derive `isLocal`/
+      `inhCount`/constraint-name from the `INHERITS` parent's own NOT NULL
+      constraint on the same column, matching real PG's `MergeAttributes`.
+      A column the child also declares itself is unaffected (`col.
+      Inherited` is only set when absent from the child's own column list,
+      per the pre-existing DU-002 slice 170 `localCols` check). Test: new
+      `TestCreateTableInheritsNotNullConstraintIsNonLocal`
+      (`internal/executor/operators_ddl_named_check_test.go`) — parent
+      stays `conislocal=t/coninhcount=0`, child's inherited copy is
+      `conislocal=f/coninhcount=1` with the parent's exact constraint name,
+      and a child that locally redeclares the column keeps the pre-existing
+      `conislocal=t/coninhcount=0` behavior (regression guard only). Gates:
+      `go build ./...`/`go vet ./...` clean; new test PASS; full
+      `internal/executor`+`internal/catalog` suites PASS (no regression);
+      `TestPort_PgDumpConnectionSetup`+`TestPort_PgDump001Basic` PASS; live
+      `pg_dump` smoke on an isolated port/data dir vs. a scratch real-
+      PostgreSQL-18.3 instance for both the fixed case and a `PARTITION OF`
+      sanity check (confirmed unaffected — identical before/after, not
+      touched by the `s.PartitionOf == nil` guard); `internal/parser`+
+      `internal/server`+`internal/initdb` suites PASS; `scripts/tpch-
+      spotcheck.sh` PASS; pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Plain-`INHERITS` NOT
+      NULL constraint locality fix (loop #48)" section (also corrects a
+      stale note in the same doc: the "`dispatch_extended.go` missing
+      several cases `dispatch.go` has" divergence was already resolved by
+      an earlier unrelated refactor unifying `appendTypedCellText` across
+      both protocols); `docs/design/README.md` row `0110-0001` addendum
+      added; deferral ledger row appended (task-id `M0110-0001`). **New
+      deferral:** a `PARTITION OF` child registers **zero**
+      `pg_constraint` contype='n' rows for its inherited-NOT-NULL columns
+      at all (confirmed via `psql` against a live goopg instance:
+      `attnotnull='t'`/`attinhcount=1` on `pg_attribute`, but no matching
+      `pg_constraint` row whatsoever) — a separate, pre-existing bug found
+      while confirming this loop's fix doesn't regress the partition case
+      (deliberately not fixed here — needs its own live-PG-verified
+      follow-up).
+
 - [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
       #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
       row's "a client `SET log_statement='all'` has no effect" residual — only
