@@ -195,6 +195,29 @@ func TestResetDatabaseConfigRemovesOnlyNamedEntry(t *testing.T) {
 	}
 }
 
+// TestResetDatabaseConfigLastEntryDeletesMapKey guards against a phantom
+// pg_db_role_setting row: RESETting the last remaining override for a dbOid
+// must delete the dbRoleSettings map entry entirely, not leave behind a
+// present-but-empty slice — real PG has zero pg_db_role_setting rows for
+// this dbOid once its last override is reset (deferral ledger 2026-07-03,
+// loop #82 row).
+func TestResetDatabaseConfigLastEntryDeletesMapKey(t *testing.T) {
+	c := NewInMemory()
+	c.SetDatabaseConfig(FirstUserOID, "work_mem", "64MB")
+	c.ResetDatabaseConfig(FirstUserOID, "work_mem")
+
+	if _, ok := c.dbRoleSettings[FirstUserOID]; ok {
+		t.Errorf("dbRoleSettings still has a key for %d after its last entry was reset", FirstUserOID)
+	}
+	tbl, ok := c.tables["pg_catalog.pg_db_role_setting"]
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatalf("pg_db_role_setting virtual table not registered")
+	}
+	if rows := tbl.VirtualRows(); len(rows) != 0 {
+		t.Errorf("pg_db_role_setting rows = %v, want none after last override reset", rows)
+	}
+}
+
 // TestResetAllDatabaseConfigClearsEverything pins RESET ALL's full-clear
 // semantics.
 func TestResetAllDatabaseConfigClearsEverything(t *testing.T) {
@@ -309,6 +332,30 @@ func TestResetRoleConfigRemovesOnlyNamedEntry(t *testing.T) {
 	c.ResetRoleConfig(roleOid, 0, "no_such_guc")
 	if len(c.RoleConfigEntries(roleOid, 0)) != 1 {
 		t.Errorf("ResetRoleConfig on unknown name should be a no-op")
+	}
+}
+
+// TestResetRoleConfigLastEntryDeletesMapKey guards against a phantom
+// pg_db_role_setting row: RESETting the last remaining override for a
+// (roleOid, dbOid) pair must delete the roleSettings map entry entirely, not
+// leave behind a present-but-empty slice — AllRoleConfigRows/pg_db_role_setting
+// must show zero rows for this role, matching real PG (deferral ledger
+// 2026-07-03, loop #82 row).
+func TestResetRoleConfigLastEntryDeletesMapKey(t *testing.T) {
+	c := NewInMemory()
+	c.RegisterRole("alice")
+	roleOid, _ := c.RoleOID("alice")
+	c.SetRoleConfig(roleOid, 0, "work_mem", "64MB")
+	c.ResetRoleConfig(roleOid, 0, "work_mem")
+
+	key := roleSettingKey{RoleOID: roleOid, DBOid: 0}
+	if _, ok := c.roleSettings[key]; ok {
+		t.Errorf("roleSettings still has a key for %+v after its last entry was reset", key)
+	}
+	for _, row := range c.AllRoleConfigRows() {
+		if row.RoleOID == roleOid {
+			t.Errorf("AllRoleConfigRows still contains a row for %d after its last override was reset: %+v", roleOid, row)
+		}
 	}
 }
 

@@ -4064,13 +4064,21 @@ func (c *InMemory) SetDatabaseConfig(dbOid uint32, name, value string) {
 
 // ResetDatabaseConfig removes a single `ALTER DATABASE ... RESET name`
 // override, if present. A no-op when the name has no override recorded.
+// Deletes the dbOid map key entirely when the last entry is removed (mirrors
+// ResetAllDatabaseConfig's full-delete semantics) so pg_db_role_setting stops
+// emitting a phantom row with a blank setconfig array.
 func (c *InMemory) ResetDatabaseConfig(dbOid uint32, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entries := c.dbRoleSettings[dbOid]
 	for i, e := range entries {
 		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
-			c.dbRoleSettings[dbOid] = append(entries[:i], entries[i+1:]...)
+			remaining := append(entries[:i], entries[i+1:]...)
+			if len(remaining) == 0 {
+				delete(c.dbRoleSettings, dbOid)
+			} else {
+				c.dbRoleSettings[dbOid] = remaining
+			}
 			return
 		}
 	}
@@ -4125,7 +4133,10 @@ func (c *InMemory) SetRoleConfig(roleOid, dbOid uint32, name, value string) {
 }
 
 // ResetRoleConfig removes a single `ALTER ROLE ... [IN DATABASE ...] RESET
-// name` override, if present.
+// name` override, if present. Deletes the key entirely when the last entry
+// is removed (mirrors ResetAllRoleConfig's full-delete semantics) so
+// pg_db_role_setting stops emitting a phantom row with a blank setconfig
+// array.
 func (c *InMemory) ResetRoleConfig(roleOid, dbOid uint32, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -4133,7 +4144,12 @@ func (c *InMemory) ResetRoleConfig(roleOid, dbOid uint32, name string) {
 	entries := c.roleSettings[key]
 	for i, e := range entries {
 		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
-			c.roleSettings[key] = append(entries[:i], entries[i+1:]...)
+			remaining := append(entries[:i], entries[i+1:]...)
+			if len(remaining) == 0 {
+				delete(c.roleSettings, key)
+			} else {
+				c.roleSettings[key] = remaining
+			}
 			return
 		}
 	}

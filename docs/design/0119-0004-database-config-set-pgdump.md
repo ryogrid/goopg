@@ -586,3 +586,34 @@ goopg's still has the row with a blank `setconfig`). This reproduces
 identically for the plain named-role case (predates this loop, not
 introduced by the `ALL` fix) and is out of this loop's bounded scope — see
 the deferral ledger for the resume point.
+
+## Follow-up: phantom empty-`setconfig` row after last RESET (loop #83)
+
+Closes the loop #82 deferral above. `ResetDatabaseConfig`/`ResetRoleConfig`
+(`internal/catalog/catalog.go`) now `delete()` the `dbRoleSettings`/
+`roleSettings` map key outright when removing the matched entry leaves the
+slice empty, instead of writing the empty-but-non-nil slice back — mirrors
+the full-delete semantics `ResetAllDatabaseConfig`/`ResetAllRoleConfig`
+already used. Root cause was purely in the two single-entry RESET paths:
+`AllRoleConfigRows` (the `pg_db_role_setting.VirtualRows` enumerator for
+`setrole != 0` rows) iterates every key present in `c.roleSettings` with no
+`len(entries) > 0` guard — unlike the `setrole=0` database-row branch right
+above it in the same `VirtualRows` closure, which already checks
+`len(entries) > 0` before emitting (`internal/catalog/catalog.go` ~line
+9119) — so a lingering empty-slice map entry always surfaced as a row with
+`setconfig = {}`, exactly the divergence the loop #82 A/B observed against
+real PG.
+
+Tests: `TestResetDatabaseConfigLastEntryDeletesMapKey`,
+`TestResetRoleConfigLastEntryDeletesMapKey`
+(`internal/catalog/database_test.go`) — assert the map key is gone and
+`pg_db_role_setting.VirtualRows`/`AllRoleConfigRows` emit zero matching rows
+after the last override is RESET.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/catalog/... ./internal/server/... ./internal/initdb/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+hook.
+
+No new deferral — this closes the loop #82 row cleanly; the fix is a pure
+map-hygiene correction with no wire-protocol or WAL-format surface.
