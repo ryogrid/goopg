@@ -7326,6 +7326,46 @@ documentation-only and is exempt from the design-doc requirement.)
       across every object kind `execCommentOn` handles (not
       access-method-specific — real PG raises `42704 does not exist`);
       scoped out as a systemic ~20-case change, not a narrow slice.
+- [x] **`COMMENT ON FOREIGN TABLE` round-trip in pg_dump (M0110-0001,
+      DU-002 slice 435).** **COMPLETE 2026-07-04:** a dispatched research-only
+      agent swept the full `comment_type` grammar production (real PG's
+      `gram.y`) against goopg's `parseCommentOnTail` and found
+      `COMMENT ON FOREIGN TABLE <name>` was a **hard parse error**, not a
+      silent drop — the `FOREIGN` arm unconditionally required
+      `DATA WRAPPER` after it. Live-verified divergent from a scratch
+      PostgreSQL 18.3 instance: `CREATE FOREIGN DATA WRAPPER` +
+      `CREATE SERVER` + `CREATE FOREIGN TABLE ft1 (...)` +
+      `COMMENT ON FOREIGN TABLE ft1 IS '...'` all succeed on real PG, and
+      `pg_dump --schema-only` re-emits `COMMENT ON FOREIGN TABLE public.ft1
+      IS '...';` (`dumpTableSchema`, same path as an ordinary table
+      comment). Fixed: `parseCommentOnTail`'s `case p.acceptKeyword(KwForeign):`
+      now branches on `TABLE` vs `DATA WRAPPER` after consuming `FOREIGN`
+      exactly once (an early draft used a short-circuit
+      `p.acceptKeyword(KwForeign) && p.acceptKeyword(KwTable)` case
+      condition, which silently regressed `COMMENT ON FOREIGN DATA WRAPPER`
+      into a no-op by consuming `FOREIGN` even when `TABLE` didn't follow —
+      caught before committing and rewritten as a single case body with a
+      nested `if`); `execCommentOn`'s existing
+      `case "table", "view", "sequence", "materialized view":` arm gained
+      `"foreign table"` (no new catalog resolver needed — foreign tables
+      already share `im.LookupTable`/classoid=pg_class=1259). Tests:
+      `TestParseCommentOnForeignTable`
+      (`internal/parser/comment_on_test.go`, bare + schema-qualified names);
+      `TestCommentOnForeignTableStoresDescription`
+      (`internal/executor/operators_ddl_comment_foreign_table_test.go`);
+      extended the slice-417/418 `goopg_ftable` fixture in
+      `TestPort_PgDumpConnectionSetup` with a byte-exact `COMMENT ON FOREIGN
+      TABLE public.goopg_ftable IS '...';` assertion. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `COMMENT ON
+      FOREIGN TABLE` round-trip in pg_dump (DU-002 slice 435)";
+      `docs/design/README.md` row `0110-0001` addendum appended. Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor` suites PASS (full, `-count=1`,
+      no regression, including `TestParseCommentOnForeignDataWrapper`
+      unchanged); `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. No new deferral — this was a hard parse-error fix,
+      not a partial/simplified implementation.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

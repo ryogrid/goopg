@@ -3085,14 +3085,28 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 		}
 		cs.ObjName = name
 	case p.acceptKeyword(KwForeign):
-		// COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'. Foreign-data wrappers
-		// live in pg_foreign_data_wrapper (classoid 2328); pg_dump's
-		// dumpForeignDataWrapper re-emits `COMMENT ON FOREIGN DATA WRAPPER <name>
-		// IS '...'`. FOREIGN is a reserved keyword (KwForeign); DATA and WRAPPER
-		// are unreserved ident-keywords. An FDW is a top-level object (no schema),
-		// so parse a bare name. DU-002 slice 387.
+		// COMMENT ON FOREIGN TABLE [schema.]name IS '...' or COMMENT ON FOREIGN
+		// DATA WRAPPER <name> IS '...'. Foreign tables are pg_class relations
+		// (relkind='f') sharing goopg's ordinary table registry (CREATE FOREIGN
+		// TABLE, DU-002 slice 417/418); pg_dump's dumpTableSchema re-emits
+		// `COMMENT ON FOREIGN TABLE <name> IS '...'` for a commented foreign
+		// table, keyed on the same classoid=pg_class (1259) lookup as COMMENT
+		// ON TABLE. Without this branch, "FOREIGN" only recognized "FOREIGN
+		// DATA WRAPPER" and any other continuation (including TABLE) was a
+		// hard parse error. FOREIGN is a reserved keyword (KwForeign); TABLE,
+		// DATA, and WRAPPER disambiguate which object kind follows. DU-002
+		// slice 435 (TABLE arm); slice 387 (DATA WRAPPER arm, pre-existing).
+		if p.acceptKeyword(KwTable) {
+			cs.ObjKind = "foreign table"
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, true, err
+			}
+			cs.ObjName = name
+			break
+		}
 		if !p.acceptIdentKeyword("data") || !p.acceptIdentKeyword("wrapper") {
-			return nil, true, p.errAtCur("expected DATA WRAPPER after FOREIGN in COMMENT ON")
+			return nil, true, p.errAtCur("expected TABLE or DATA WRAPPER after FOREIGN in COMMENT ON")
 		}
 		cs.ObjKind = "foreign data wrapper"
 		name, err := p.parseObjectName()

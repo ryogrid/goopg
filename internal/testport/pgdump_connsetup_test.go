@@ -5066,6 +5066,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE FOREIGN TABLE public.goopg_ftable (c1 int options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name 'x1')"); err != nil {
 		t.Fatalf("create foreign table: %v", err)
 	}
+	// Slice 435: COMMENT ON FOREIGN TABLE must round-trip, the sibling of
+	// COMMENT ON TABLE/VIEW/SEQUENCE/MATERIALIZED VIEW (all pg_class relations
+	// sharing the same classoid=1259 lookup). Before this slice
+	// parseCommentOnTail's "FOREIGN" branch only recognized "FOREIGN DATA
+	// WRAPPER" — any other continuation, including TABLE, was a hard *parse
+	// error* (a strictly worse failure mode than the silent-drop bugs earlier
+	// COMMENT ON slices fixed). pg_dump's dumpTableSchema re-emits a trailing
+	// `COMMENT ON FOREIGN TABLE <name> IS '...';` for a commented foreign
+	// table exactly like it does for an ordinary commented table.
+	if err := runSQLSimple(t, c, "COMMENT ON FOREIGN TABLE public.goopg_ftable IS 'a goopg foreign table comment'"); err != nil {
+		t.Fatalf("comment on foreign table: %v", err)
+	}
 	// Slice 422: CREATE PUBLICATION must survive the dump. Before this slice,
 	// `pg_publication.pubowner` (internal/initdb/replication_views.go) was
 	// hardcoded to the empty string ("roles aren't OID-stable yet"). Real
@@ -11240,6 +11252,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		attFDWOptionsStmt := "ALTER FOREIGN TABLE ONLY public.goopg_ftable ALTER COLUMN c1 OPTIONS (\n    column_name 'col1'\n);"
 		if !strings.Contains(res.Stdout, attFDWOptionsStmt) {
 			t.Errorf("pg_dump dropped the per-column FDW OPTIONS round-trip (slice-418); missing %q\n  full stdout=%q", attFDWOptionsStmt, res.Stdout)
+		}
+		// Slice 435: COMMENT ON FOREIGN TABLE must round-trip. Before this
+		// slice "COMMENT ON FOREIGN TABLE" was a hard parser error in goopg
+		// (parseCommentOnTail's "FOREIGN" branch only recognized "FOREIGN DATA
+		// WRAPPER"), so this comment could never even be stored, let alone
+		// re-emitted by dumpTableSchema's trailing `COMMENT ON FOREIGN TABLE
+		// <name> IS '...';` block.
+		ftableCommentStmt := "COMMENT ON FOREIGN TABLE public.goopg_ftable IS 'a goopg foreign table comment';"
+		if !strings.Contains(res.Stdout, ftableCommentStmt) {
+			t.Errorf("pg_dump dropped the COMMENT ON FOREIGN TABLE round-trip (slice-435); missing %q\n  full stdout=%q", ftableCommentStmt, res.Stdout)
 		}
 		// Slice 422: CREATE PUBLICATION must round-trip, and pg_dump must not
 		// abort. Before this slice pg_publication.pubowner was always "" and

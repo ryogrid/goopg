@@ -265,6 +265,48 @@ func TestParseCommentOnForeignDataWrapper(t *testing.T) {
 	}
 }
 
+// TestParseCommentOnForeignTable covers COMMENT ON FOREIGN TABLE <name>. Foreign
+// tables are pg_class relations (relkind='f') sharing goopg's ordinary table
+// registry; pg_dump's dumpTableSchema re-emits `COMMENT ON FOREIGN TABLE <name>
+// IS '...'`. Before slice 435 the "FOREIGN" branch only recognized "FOREIGN DATA
+// WRAPPER" and any other continuation (including TABLE) was a hard parse error
+// (not merely a silent drop). DU-002 slice 435.
+func TestParseCommentOnForeignTable(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantSchema string
+		wantName   string
+	}{
+		{"COMMENT ON FOREIGN TABLE ft1 IS 'a foreign table comment'", "", "ft1"},
+		{"COMMENT ON FOREIGN TABLE public.ft2 IS 'c'", "public", "ft2"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "foreign table" {
+			t.Errorf("%q: ObjKind=%q, want foreign table", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != tc.wantSchema {
+			t.Errorf("%q: ObjName.Schema=%q, want %q", tc.sql, cs.ObjName.Schema, tc.wantSchema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}
+
 // TestParseCommentOnExtension covers COMMENT ON EXTENSION <name>. Extensions are
 // top-level, schema-less objects (pg_extension, classoid 3079); pg_dump's
 // dumpExtension re-emits `COMMENT ON EXTENSION <name> IS '...'`. EXTENSION is an

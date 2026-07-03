@@ -12657,3 +12657,109 @@ message (e.g. `%s "%s" does not exist` with the PG-specific object-kind
 noun) on an unresolved OID, instead of the current uniform `return nil`.
 Scoped out of this slice deliberately (a ~20-case systemic change, not a
 narrow one); left as a discovery for a future dedicated slice.
+
+## Follow-up: `COMMENT ON FOREIGN TABLE` round-trip in pg_dump (DU-002 slice 435)
+
+### Problem
+
+A research sweep for the next slice after 434 probed the full `comment_type`
+grammar production in real PostgreSQL's `gram.y` against goopg's
+`parseCommentOnTail` (`internal/parser/parser.go`) and found `COMMENT ON
+FOREIGN TABLE <name>` was not merely dropped (like the pre-434 access-method
+gap) but a **hard parse error**: the `case p.acceptKeyword(KwForeign):` arm
+unconditionally required `DATA WRAPPER` after `FOREIGN` (the `COMMENT ON
+FOREIGN DATA WRAPPER` shape), so `COMMENT ON FOREIGN TABLE ft1 IS '...'`
+failed with `syntax error ... expected DATA WRAPPER after FOREIGN in COMMENT
+ON (got table)`.
+
+Confirmed live against a scratch PostgreSQL 18.3 instance
+(`postgres/local_install`):
+
+```sql
+CREATE FOREIGN DATA WRAPPER dummy_fdw;
+CREATE SERVER dummy_srv FOREIGN DATA WRAPPER dummy_fdw;
+CREATE FOREIGN TABLE ft1 (a int, b text) SERVER dummy_srv;
+COMMENT ON FOREIGN TABLE ft1 IS 'a foreign table comment';
+```
+
+All four statements succeed on real PG, and `pg_dump --schema-only` re-emits
+(`dumpTableSchema`, `pg_dump.c`, the same code path that dumps a comment on
+an ordinary table):
+
+```
+COMMENT ON FOREIGN TABLE public.ft1 IS 'a foreign table comment';
+```
+
+goopg could not even parse the `COMMENT ON FOREIGN TABLE` statement, so the
+comment could never reach `pg_description` in the first place — a strictly
+worse failure mode than the silent-drop bugs earlier `COMMENT ON` slices
+fixed (this one aborts the whole statement/transaction with a syntax error
+instead of quietly discarding one clause).
+
+### Fix
+
+Foreign tables (`relkind='f'`, `CREATE FOREIGN TABLE`, DU-002 slice 417/418)
+are pg_class relations sharing goopg's ordinary table registry — same as
+views/sequences/materialized views — so this needed only two of the usual
+three sites (no new catalog resolver: `LookupTable` already resolves foreign
+tables by name).
+
+1. **Parser** (`internal/parser/parser.go`, `parseCommentOnTail`): the
+   `case p.acceptKeyword(KwForeign):` arm now branches on what follows
+   `FOREIGN` — `p.acceptKeyword(KwTable)` first (parses a schema-qualifiable
+   object name into `ObjKind = "foreign table"`), falling back to the
+   pre-existing `DATA WRAPPER` check only when `TABLE` didn't match. **Care
+   taken to avoid a short-circuit bug**: an early draft used
+   `case p.acceptKeyword(KwForeign) && p.acceptKeyword(KwTable):` as the case
+   condition, which consumes the `FOREIGN` token as a side effect of the
+   first `acceptKeyword` call even when the second one (`KwTable`) fails to
+   match (e.g. on `FOREIGN DATA WRAPPER`) — the next `case
+   p.acceptKeyword(KwForeign):` arm would then silently fail to re-match
+   `FOREIGN` (already consumed) and fall through to the unsupported-type
+   default, regressing `COMMENT ON FOREIGN DATA WRAPPER` into a silent
+   no-op. Fixed by consuming `FOREIGN` exactly once in a single `case` body
+   and branching with a nested `if` inside it instead.
+2. **Executor** (`internal/executor/operators_ddl.go`, `execCommentOn`):
+   added `"foreign table"` to the existing
+   `case "table", "view", "sequence", "materialized view":` arm — no new
+   logic, since `im.LookupTable(s.ObjName)` + `oidPgClass` (1259) already
+   resolves a foreign table the same way it resolves an ordinary table.
+
+No pg_dump-side change was needed (same reasoning as slice 434):
+`collectComments`'s single `pg_description` query is object-kind-agnostic,
+and `dumpTableSchema`'s trailing comment block is keyword-agnostic across
+every `relkind` it handles.
+
+### Tests
+
+- `internal/parser/comment_on_test.go`: `TestParseCommentOnForeignTable`
+  (bare and schema-qualified names, asserts `ObjKind = "foreign table"`);
+  re-ran `TestParseCommentOnForeignDataWrapper` unchanged to confirm the
+  sibling case wasn't regressed by the branch restructuring.
+- `internal/executor/operators_ddl_comment_foreign_table_test.go`:
+  `TestCommentOnForeignTableStoresDescription` (end-to-end `CREATE SERVER`
+  + `CREATE FOREIGN TABLE` + `COMMENT ON FOREIGN TABLE`, asserts
+  `im.GetComment(1259, tbl.OID, 0)`).
+- `internal/testport/pgdump_connsetup_test.go`: extended the slice-417/418
+  `goopg_ftable` fixture with `COMMENT ON FOREIGN TABLE public.goopg_ftable
+  IS '...'` and a new byte-exact assertion for the `COMMENT ON FOREIGN
+  TABLE public.goopg_ftable IS '...';` line in `pg_dump`'s output
+  (`TestPort_PgDumpConnectionSetup`).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser` +
+`internal/catalog` + `internal/executor` suites PASS (full, `-count=1`, no
+regressions); `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`); live
+scratch PostgreSQL 18.3 instance used to confirm the target rendering before
+implementing (transcript above); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); pgbench smoke = pre-commit hook.
+
+### Deferred
+
+None new. This slice fixes a hard parse error, not a partial/simplified
+implementation — no PG behavior was knowingly left unmirrored. The
+pre-existing "COMMENT ON nonexistent object is a silent no-op" gap (recorded
+against slice 434) now also applies to `"foreign table"` as one more sibling
+case, but that is the same already-recorded systemic deferral, not a new
+one.

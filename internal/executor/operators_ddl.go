@@ -15503,12 +15503,14 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgAm           = 2601 // pg_am: access methods
 	)
 	switch s.ObjKind {
-	case "table", "view", "sequence", "materialized view":
-		// Views, sequences, and materialized views are pg_class relations stored
-		// in the same table registry as ordinary tables, so they share the
-		// classoid (1259) and LookupTable path. pg_dump chooses the COMMENT ON
-		// keyword from relkind (relkind='m' → MATERIALIZED VIEW); the stored
-		// pg_description row is keyword-agnostic. DU-002 slices 145, 146.
+	case "table", "view", "sequence", "materialized view", "foreign table":
+		// Views, sequences, materialized views, and foreign tables are all
+		// pg_class relations stored in the same table registry as ordinary
+		// tables (foreign tables are relkind='f', CREATE FOREIGN TABLE, DU-002
+		// slice 417/418), so they share the classoid (1259) and LookupTable
+		// path. pg_dump chooses the COMMENT ON keyword from relkind (relkind='m'
+		// → MATERIALIZED VIEW, relkind='f' → FOREIGN TABLE); the stored
+		// pg_description row is keyword-agnostic. DU-002 slices 145, 146, 435.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
 			return nil
