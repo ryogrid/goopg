@@ -1,37 +1,35 @@
 (idle — nothing in flight)
 
-M0120 milestone is fully CLOSED (0001-0005 all [x], committed). Next
-recommended task: **M0121-0002** — fix the backend panic on `wp post
-update`/`wp post delete` (trash, no `--force`)'s default-category
-reassignment. Full repro, stack trace, and resume point are in
-`.ralph/deferral_ledger.md` (2026-07-04, M0120-0002 row) and
-`.ralph/fix_plan.md`'s M0121-0002 entry: panic is `runtime error: index out of
-range [1] with length 1` in `Slot.Get` (`internal/executor/opnode.go:99`)
-called from `evalFastExpr`'s `ExprColumnRef` case
-(`internal/executor/exprnode.go:222`, colIdx=1) via `filterOpNext`
-(`internal/executor/opnode.go:717`), triggered by
-`wp_set_post_categories`'s `SELECT term_taxonomy_id FROM
-wp_term_relationships WHERE object_id = ? AND term_taxonomy_id = ?` — a
-3-column table (`object_id,term_taxonomy_id,term_order`); suspect a
-filter/residual ColumnRef index not remapped to a narrower
-projected/index-only-scan row. NOT reproducible via a single fresh isolated
-psql connection running the same SQL text — likely depends on
-session/plan-cache state built up by the preceding statement sequence in the
-same connection (see `wp/verification/results/20260704-072755/WP-02/
-goopg_statements.log` for the exact sequence to replay). This is a WAL/MVCC-
-adjacent executor bug per the practice card — needs the race-gate + a
-dedicated regression test, not a quick patch. Also note **M0121-0001**
-(populate M0121 task list from M0120 triage) can be closed as a one-line
-fix_plan tick in the same loop as M0121-0002 since `wp/verification/report.md`
-confirms no other goopg-bug/goopg-missing failures were found — M0121-0002 is
-the only seeded task needed.
+M0121-0002 CLOSED (2026-07-04, commit bd170262, pushed). Root cause: planner's
+`tryPromoteIndexOnlyScan` (`internal/planner/planner.go`) narrowed a promoted
+`Filter(IndexOnlyScan)`'s covered/output schema using only the `Project`'s
+target list, never checking whether the surviving `Filter.Predicate` also
+referenced a column, and never remapping that predicate's `ColumnRef.Index`
+off its pre-promotion (full-row) position — panicked `Slot.Get` whenever
+WordPress's `wp_set_object_terms` query matched a real `object_id` row.
+Fixed by extending `covered` with any column the residual filter still needs
+(index-permitting; else abandon the promotion) and remapping via new
+`remapColumnRefsToSchema`. Design doc
+`docs/design/0121-0002-indexonly-scan-residual-filter-remap.md`; regression
+test `internal/executor/indexonly_residual_filter_test.go` (confirmed it
+panics with the same signature when the fix is reverted). Re-verified
+end-to-end via WP-01..WP-03 against the real WP-CLI/docker instance after a
+`reset_wp_schema.sh` re-seed (schema had drifted stale again, unrelated to
+this fix) — post update/trash now succeed, no panic in `wp/goopg-wp.log`.
 
-Also worth a follow-up (low priority, harness-only, not goopg): WP-13 in
-`wp/verification/CHECKLIST.md` targets `pageID` with the `category` taxonomy,
-which WP core doesn't register for `page` objects — should be retargeted to a
-`post`-type object. Not blocking, not ledgered (not a goopg gap).
+Next recommended task: **M0121-0001** — trivial one-line tick. M0120-0005's
+aggregate `report.md` already confirmed M0121-0002 was the *only*
+goopg-attributable failure seeded from the M0120 triage sweep (all others are
+harness/pg4wp-limitation, documented in `CHECKLIST.md`, no ledger row
+needed). With M0121-0002 now done, M0121-0001's "populate the task list"
+scope is fully satisfied — just flip its checkbox to `[x]` in
+`.ralph/fix_plan.md` (was left unchecked this loop only to respect the
+one-task-per-loop rule) and consider M0121 milestone CLOSED. After that,
+resume **M0110** (pg_dump TAP, paused) per the Current Priority banner, or
+check for a newer directive at the top of `.ralph/fix_plan.md`.
 
-Gates run this loop: `make ralph-state-guard` (ran, self-repaired the same
-stale "completed" progress marker pattern as prior loops, then passed). No Go
-code changed (pure harness aggregation + fix_plan bookkeeping), so no
-build/test/pgbench gates apply beyond the state guard.
+Gates run this loop: `go build ./...` clean; `go test ./internal/planner/...
+./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); `make ralph-state-guard` (self-repaired the same recurring stale
+"completed" progress marker pattern as prior loops, then passed); pre-commit
+pgbench smoke (TPC-B/simple-update/select-only, 0 failed transactions) PASS.
