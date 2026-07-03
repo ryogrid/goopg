@@ -14988,6 +14988,26 @@ func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName st
 func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.dropIndexByName(tableOID, constraintName)
+}
+
+// DropUniqueConstraint removes the named UNIQUE constraint (index-backed,
+// like a primary key) from the table's index registries. Returns true if
+// found and removed. Shares dropIndexByName with DropPrimaryKeyConstraint —
+// both a PK and a named UNIQUE constraint are stored the same way (an Index
+// with IsConstraint set), so the removal logic doesn't need to differ; only
+// the caller-side lookup that finds the index by name distinguishes Primary
+// from plain Unique. DU-002 slice 433 follow-up.
+func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropIndexByName(tableOID, constraintName)
+}
+
+// dropIndexByName removes the named index (backing either a PRIMARY KEY or a
+// UNIQUE constraint) from both the per-table and flat index registries.
+// Caller must hold c.mu for writing.
+func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool {
 	inner, ok := c.byTable[tableOID]
 	if !ok {
 		return false
@@ -15004,6 +15024,28 @@ func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName stri
 		}
 	}
 	return true
+}
+
+// DropForeignKeyConstraint removes the named foreign-key constraint from the
+// table's ForeignKeys slice. Returns true if found and removed. Unlike
+// PK/UNIQUE constraints, a foreign key isn't backed by a separate Index
+// registry entry — it lives only on Table.ForeignKeys — so this looks the
+// table up by OID and mutates that slice directly. DU-002 slice 433
+// follow-up.
+func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tbl, ok := c.tableByOID(tableOID)
+	if !ok {
+		return false
+	}
+	for i := range tbl.ForeignKeys {
+		if strings.EqualFold(tbl.ForeignKeys[i].Name, constraintName) {
+			tbl.ForeignKeys = append(tbl.ForeignKeys[:i], tbl.ForeignKeys[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // HasPrimaryKey reports whether table has a primary-key index.

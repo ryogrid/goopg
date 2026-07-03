@@ -7204,6 +7204,38 @@ documentation-only and is exempt from the design-doc requirement.)
       does not exist`; pre-existing, unrelated to this slice's own
       grammar, noticed while reading the function this slice's
       wrong-object-type lookup borrows from.
+      **2026-07-04 (DU-002 slice 433 follow-up): `ALTER TABLE ... DROP
+      CONSTRAINT` for FOREIGN KEY / UNIQUE LANDED — closes discovery (2)
+      above.** `execAlterTableDropConstraint`
+      (`internal/executor/operators_ddl.go`) now searches CHECK → FOREIGN
+      KEY → UNIQUE → PRIMARY KEY by name (matching real PG's name-based
+      `pg_constraint`/`ATExecDropConstraint` lookup) instead of only
+      CHECK/PRIMARY KEY; two new `catalog.InMemory` methods,
+      `DropForeignKeyConstraint` (splices `Table.ForeignKeys` directly, an
+      FK isn't index-backed) and `DropUniqueConstraint` (shares a new
+      `dropIndexByName` helper with the refactored `DropPrimaryKeyConstraint`,
+      since a UNIQUE constraint is index-backed exactly like a PK). No
+      `pg_constraint`/`pg_get_constraintdef`/FK-runtime-check changes
+      needed — all already read the mutated sources of truth generically.
+      Tests: `TestDropConstraintForeignKeyAndUnique`
+      (`internal/executor/operators_fk_unique_drop_constraint_test.go`),
+      verifying both the catalog removal AND the runtime behavior change
+      (a previously-rejected dangling FK insert now succeeds; a
+      previously-rejected duplicate UNIQUE value now inserts; an unrelated
+      sibling PRIMARY KEY survives a UNIQUE drop untouched). Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `ALTER TABLE
+      ... DROP CONSTRAINT` for FOREIGN KEY / UNIQUE (DU-002 slice 433
+      follow-up)"; `docs/design/README.md` row `0110-0001` addendum
+      appended. Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/catalog`+`internal/executor`+`internal/parser` suites PASS
+      (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+      PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
+      appended): `EXCLUDE` constraints remain unreachable through this DROP
+      CONSTRAINT path (no live-confirmed gap surfaced this loop, left out
+      of the bounded scope); discovery (1) above (`ALTER CONSTRAINT ...
+      ENFORCED`'s missing phase-3 dangling-reference scan) remains
+      untouched, unrelated to this row.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

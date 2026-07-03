@@ -8612,8 +8612,13 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 }
 
 // execAlterTableDropConstraint handles `ALTER TABLE t DROP CONSTRAINT name [RESTRICT|CASCADE]`.
-// For PK constraints it enforces view→constraint dependencies (RESTRICT mode)
-// before removing the index. For CHECK constraints it blocks inherited drops.
+// Checked in the order CHECK / FOREIGN KEY / UNIQUE / PRIMARY KEY, mirroring
+// real PG's name-based pg_constraint lookup (the constraint kind only matters
+// for the removal mechanics, not the search). For PK constraints it enforces
+// view→constraint dependencies (RESTRICT mode) before removing the index. For
+// CHECK constraints it blocks inherited drops. FOREIGN KEY / UNIQUE support
+// added DU-002 slice 433 follow-up (previously misreported 42704 for a real
+// constraint of either kind — see deferral ledger).
 // M0097-0036 / functional_deps / M0097-0023.
 func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.AlterTableAction) error {
 	im, isIM := o.ctx.Catalog.(*catalog.InMemory)
@@ -8649,7 +8654,36 @@ func (o *ddlOp) execAlterTableDropConstraint(tbl *catalog.Table, act parser.Alte
 		return nil
 	}
 
-	// 2. PRIMARY KEY constraints.
+	// 2. FOREIGN KEY constraints. DU-002 slice 433 follow-up: previously
+	// unhandled here, so a real FK fell straight through to the PK branch's
+	// 42704 even though the constraint existed.
+	for _, fk := range tbl.ForeignKeys {
+		if strings.EqualFold(fk.Name, act.ConstraintName) {
+			if isIM {
+				im.DropForeignKeyConstraint(tbl.OID, act.ConstraintName)
+			}
+			return nil
+		}
+	}
+
+	// 3. UNIQUE constraints — index-backed like a PRIMARY KEY, but with
+	// idx.Primary false. Same DU-002 slice 433 follow-up as the FK branch
+	// above.
+	var uqIdx *catalog.Index
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if !idx.Primary && idx.Unique && idx.IsConstraint && strings.EqualFold(idx.Name, act.ConstraintName) {
+			uqIdx = idx
+			break
+		}
+	}
+	if uqIdx != nil {
+		if isIM {
+			im.DropUniqueConstraint(tbl.OID, act.ConstraintName)
+		}
+		return nil
+	}
+
+	// 4. PRIMARY KEY constraints.
 	var pkIdx *catalog.Index
 	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
 		if idx.Primary && strings.EqualFold(idx.Name, act.ConstraintName) {

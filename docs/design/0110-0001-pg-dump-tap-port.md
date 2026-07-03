@@ -12297,3 +12297,99 @@ investigated further this loop (pre-existing, unrelated to `ALTER
 CONSTRAINT`'s own grammar); ledger-recorded as a fresh discovery. The
 still-open DU-002 002-010 catalog-view-parity resume point remains the
 builtin `pg_proc` exposure gap documented earlier in this file.
+
+## Follow-up: `ALTER TABLE ... DROP CONSTRAINT` for FOREIGN KEY / UNIQUE (DU-002 slice 433 follow-up)
+
+### Problem
+
+Slice 433's own deferral (above) live-confirmed that `execAlterTableDropConstraint`
+(`internal/executor/operators_ddl.go`) only ever searched `tbl.NamedChecks`
+(CHECK) and `Primary`-flagged indexes (PRIMARY KEY) for the target constraint
+name. A real, existing FOREIGN KEY or UNIQUE constraint fell straight through
+to the PRIMARY KEY branch's final `42704 constraint "..." of relation "..."
+does not exist` — a plain false negative, not a PG-parity design choice: real
+PG's `ATExecDropConstraint` (`tablecmds.c`) resolves the target purely by
+`pg_constraint` name, independent of `contype`.
+
+### Fix
+
+Added two search branches to `execAlterTableDropConstraint`, ordered CHECK →
+FOREIGN KEY → UNIQUE → PRIMARY KEY (the last two both index-backed, checked
+via `IndexesOnTable`, distinguished only by `idx.Primary`):
+
+- FOREIGN KEY: linear scan of `tbl.ForeignKeys` by name (case-insensitive,
+  matching every other constraint-name comparison in this function).
+- UNIQUE: same `IndexesOnTable` scan the PRIMARY KEY branch already used,
+  but requiring `!idx.Primary && idx.Unique && idx.IsConstraint` — a named
+  UNIQUE constraint is stored exactly like a PRIMARY KEY (an `Index` with
+  `IsConstraint` set), differing only in the `Primary` flag.
+
+Two new `catalog.InMemory` methods do the actual removal, mirroring the
+existing `DropPrimaryKeyConstraint`:
+
+- `DropUniqueConstraint` — identical mechanics to `DropPrimaryKeyConstraint`
+  (both just remove a named `Index` from the per-table and flat index
+  registries), so both now share a private `dropIndexByName` helper instead
+  of duplicating the removal loop.
+- `DropForeignKeyConstraint` — a foreign key isn't index-backed at all; it
+  lives only on `Table.ForeignKeys`, so this looks the table up by OID
+  (`tableByOID`, already used internally elsewhere under the same lock) and
+  splices the matching entry out of that slice directly.
+
+No `pg_constraint`/`pg_get_constraintdef`/FK-runtime-check change was needed:
+those all already read `tbl.ForeignKeys`/the index registries directly, so a
+dropped FK or UNIQUE constraint is invisible to them for free once removed
+from its source of truth — the bug was purely in
+`execAlterTableDropConstraint`'s search coverage, not in any downstream
+consumer.
+
+The functional-dependency `RESTRICT` view-dependency check
+(`ViewsDependingOnConstraint`) that gates the PRIMARY KEY branch was
+deliberately **not** extended to the new UNIQUE branch: `constraintViewDeps`
+is populated only by `CREATE VIEW`'s PK-specific GROUP BY functional-
+dependency tracking (M0097-0036's own doc comment: "records that a view
+relies on a **PK** constraint"), so it can never contain an entry keyed by a
+UNIQUE constraint's name today — adding the check there would be dead code,
+not a real behavioral gap.
+
+### Tests
+
+`TestDropConstraintForeignKeyAndUnique`
+(`internal/executor/operators_fk_unique_drop_constraint_test.go`), three
+subtests:
+
+- `ForeignKey` — adds an FK, drops it by name, asserts `tbl.ForeignKeys` is
+  empty, and (the behavioral proof, not just catalog bookkeeping) that a
+  previously-rejected dangling-reference `INSERT` now succeeds; re-dropping
+  the same name is confirmed to still raise `42704` rather than silently
+  succeeding a second time.
+- `Unique` — adds a named UNIQUE constraint, drops it by name, asserts the
+  backing index is gone from `LookupIndex`, that a duplicate value now
+  inserts without conflict, and that the table's unrelated PRIMARY KEY index
+  survives untouched (regression guard against an over-broad removal that
+  matched more than the named constraint).
+- `UndefinedConstraintStillRejected` — an unrelated table with no matching
+  constraint of any kind still gets `42704`, guarding against the new
+  branches accidentally swallowing the not-found case.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/catalog`+`internal/executor`
+suites PASS (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+pre-commit hook.
+
+### Deferred
+
+None new — this closes deferred item (2) of slice 433's own row cleanly (a
+constraint-kind dispatch gap in one pre-existing function, now handling all
+four constraint kinds real PG's `pg_constraint` name lookup covers: CHECK,
+FOREIGN KEY, UNIQUE, PRIMARY KEY). `EXCLUDE` (`idx.IsExclusion`) constraints
+were intentionally left out of scope — `execAlterTableDropConstraint` never
+claimed to support dropping those by this path before this fix either, and
+nothing in this loop's investigation surfaced a live report of that gap the
+way the FK/UNIQUE one was live-confirmed; a future loop can fold it in as a
+one-line addition to the same UNIQUE-branch index scan if it turns out to be
+needed. Deferred item (1) of slice 433's row (the missing phase-3
+dangling-reference scan on `ALTER CONSTRAINT ... ENFORCED`) remains open,
+untouched by this loop.
