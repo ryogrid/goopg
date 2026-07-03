@@ -617,3 +617,85 @@ hook.
 
 No new deferral — this closes the loop #82 row cleanly; the fix is a pure
 map-hygiene correction with no wire-protocol or WAL-format surface.
+
+## Follow-up: extended-protocol dispatch hook for DATABASE/ROLE DDL (loop #84)
+
+Closes the standing "extended-protocol path has no equivalent hook" residual
+named by every M0119-0004-ACLHEAP row since loop #17 (`0119-0004bt` onward).
+goopg's parser has no grammar at all for `CREATE`/`DROP`/`ALTER DATABASE` or
+`CREATE`/`DROP`/`ALTER ROLE` — both wire protocols must intercept these
+statements by string-prefix matching on the raw SQL text after
+`parser.Parse` fails. `dispatchSimpleQueryViaExecutor` (`internal/server/
+dispatch.go` ~line 122-183, the simple-query protocol psql uses
+interactively) has always had this bypass, calling `tryHandleDatabaseDDL`/
+`tryHandleRoleDDL`. `executeExtendedQueryViaExecutor` (`internal/server/
+dispatch_extended.go`, the Parse/Bind/Execute protocol JDBC, npgsql,
+psycopg2's default mode, and most other client libraries use for **every**
+statement, not just parameterized ones) never had a counterpart — a parse
+failure there went straight to a `42601` syntax error. This was a silent
+correctness bug, not a coverage gap: any driver defaulting to the extended
+protocol got a `CREATE ROLE`/`ALTER DATABASE ... SET`/etc. rejected outright
+where real PG (and goopg's own simple-query path) accepts it.
+
+New `Server.tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess
+*config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool)`
+(`internal/server/dispatch_extended.go`) mirrors the simple-query bypass:
+builds the same `currentGUCResolver` closure over `sess.GetDisplay` (backing
+`SET ... FROM CURRENT`), tries `tryHandleDatabaseDDL` then `tryHandleRoleDDL`,
+and maps each outcome to an `extendedQueryResult`/`extendedQueryError` with
+the same `databaseDDLErrorSQLState`/`roleErrorSQLState` translation and
+`databaseDDLCommandTag`/CREATE-ALTER-DROP-ROLE tag logic the simple-query
+path uses. Called from `executeExtendedQueryViaExecutor`'s existing
+`parser.Parse` error branch, before it falls through to the generic syntax
+error. Unlike the simple-query path, no `splitLeadingRoleDDL` multi-statement
+recursion is needed — the wire protocol only allows a single SQL command per
+Parse message, unlike simple-query's semicolon-separated batches.
+
+Live-verified over the wire (not just via the direct-call unit style prior
+loops used): a real Parse/Bind/Execute/Sync sequence against a running
+goopg instance for `CREATE ROLE`, `ALTER ROLE ... SET`, `ALTER DATABASE ...
+SET`, and `DROP ROLE` all now return the correct `CommandComplete` tag and
+apply the catalog mutation, matching the simple-query path byte-for-byte;
+`ALTER ROLE nonexistent_role SET ...` over the extended protocol now reports
+`42704` (undefined_object), matching `roleErrorSQLState`, instead of a
+generic syntax error.
+
+Tests: `TestExtendedProtocolDatabaseAndRoleDDL` (CREATE ROLE → ALTER ROLE
+... SET → ALTER DATABASE ... SET → DROP ROLE, each driven over the wire via
+Parse/Bind/Execute/Sync, cross-checked against `catalog.InMemory` side
+effects) and `TestExtendedProtocolRoleDDLError` (SQLSTATE fidelity for the
+nonexistent-role case) — both new, `internal/server/
+dispatch_extended_ddl_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/server/...` PASS (full package, no regressions); `scripts/
+tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook.
+
+**Deferred (bounded, out of this loop's scope):**
+1. `tryHandleDatabaseDDL`'s `notice` return (e.g. `DROP DATABASE IF EXISTS`
+   on a nonexistent name) is dropped on the extended path —
+   `extendedQueryResult` has no `Notice` field and `handleExecuteFrame`
+   has no NoticeResponse-writing hook, unlike the simple-query path's
+   direct `w.WriteNoticeResponse` call. Cosmetic only (the DDL still
+   succeeds and returns the correct CommandComplete); adding it means
+   threading a new field through `extendedQueryResult` →
+   `handleExecuteFrame` → a new `w.WriteNoticeResponse` call, unrelated to
+   this loop's actual-failure fix.
+2. `roleErrorDetailFields`'s errdetail text (used by e.g. the reserved
+   `pg_`-prefix role-name error) has no extended-protocol counterpart
+   either — `extendedQueryError`/`extendedMessageError` carry only
+   `Code`/`Message`/`Position`, no detail-field slot. Same shape of gap as
+   (1); affects only the DETAIL line of one specific error family, not its
+   SQLSTATE or message text.
+3. `compatNoopCommandTag` (the much broader no-op-DDL absorption for every
+   other unrecognised statement form — `CREATE INDEX CONCURRENTLY`, most
+   `ALTER TABLE` sub-forms, etc.) still has no extended-protocol
+   counterpart. This is a materially larger, pre-existing, separate gap
+   (dozens of statement forms, not the two DDL families this loop's ledger
+   row named) — out of scope for a single loop.
+
+Resume points: (1)/(2) — add the missing field(s) to `extendedQueryResult`/
+`extendedQueryError` and wire the write-through in `handleExecuteFrame`/
+`writeExtendedMessageError`. (3) — a dedicated loop scoped to
+`compatNoopCommandTag`'s extended-protocol parity, likely its own
+M0119-0004 sub-task given the breadth of statement forms it covers.

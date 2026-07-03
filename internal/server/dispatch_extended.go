@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/config"
@@ -29,6 +30,13 @@ import (
 func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string, connTx *connTxState) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
+		// CREATE/DROP/ALTER DATABASE and CREATE/DROP/ALTER ROLE are not
+		// parser grammar (same string-prefix wire-dispatch bypass the
+		// simple-query path uses in dispatchSimpleQueryViaExecutor) — try
+		// that bypass here too before surfacing a syntax error. M0119-0004.
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+			return res, qerr
+		}
 		msg, extra := syntaxErrorMsg(err)
 		qerr := &extendedQueryError{Code: sqlstate.SyntaxError, Message: msg}
 		for _, f := range extra {
@@ -306,6 +314,57 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 // information through Bind, so every value lands as a string Datum
 // and the planner/expression evaluator coerces on read (e.g. via
 // `$1::int4` casts). NULL parameters become NullDatum.
+// tryHandleDatabaseOrRoleDDLExtended is the extended-query-protocol
+// counterpart of dispatchSimpleQueryViaExecutor's CREATE/DROP/ALTER
+// DATABASE and CREATE/DROP/ALTER ROLE wire-dispatch bypass (dispatch.go
+// ~line 122-183): goopg's parser has no grammar for these statements at
+// all, so both protocols intercept them by string-prefix matching before
+// falling through to a syntax error. Until this fix the extended path had
+// no such hook, so a client that sends these DDL statements through a
+// prepared statement (JDBC, npgsql, psycopg2's default protocol, etc.
+// rather than psql's simple-query default) got a silent 42601 syntax
+// error instead of the DDL being applied — a real correctness bug, not
+// just missing test coverage. M0119-0004-ACLHEAP.
+//
+// Unlike the simple-query path, a single Parse message may only carry one
+// SQL command (wire protocol spec), so the splitLeadingRoleDDL
+// multi-statement recursion dispatch.go needs has no counterpart here.
+//
+// Returns handled=false when query is not a DDL form this bypass
+// recognises, so the caller falls through to its normal syntax-error path.
+func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool) {
+	resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
+		if sess == nil {
+			return "", false
+		}
+		_, eff, ok := sess.GetDisplay(name)
+		return eff, ok
+	})
+	if handled, _, herr := s.tryHandleDatabaseDDL(query, dbName, resolveCurrentGUC); handled {
+		if herr != nil {
+			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error()}, true
+		}
+		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query)}, nil, true
+	}
+	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC); handled {
+		if herr != nil {
+			return nil, &extendedQueryError{Code: roleErrorSQLState(herr), Message: herr.Error()}, true
+		}
+		norm := normalizeCompatSQL(query)
+		var tag string
+		switch {
+		case strings.HasPrefix(norm, "create "):
+			tag = "CREATE ROLE"
+		case strings.HasPrefix(norm, "alter "):
+			tag = "ALTER ROLE"
+		default:
+			tag = "DROP ROLE"
+		}
+		return &extendedQueryResult{CommandTag: tag}, nil, true
+	}
+	return nil, nil, false
+}
+
 func paramsToDatums(params []boundParam) ([]executor.Datum, *extendedQueryError) {
 	out := make([]executor.Datum, len(params))
 	for i, p := range params {
