@@ -7866,11 +7866,10 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   seed's `wp post create` calls succeeded (the exact prior failure). **Next
   loop: just re-run `wp/verification/driver_wp01_16.sh`** (plain `wp post
   create` etc., no `DROP`, no permission change) to capture WP-01…16, then
-  proceed to M0120-0003. NOTE: to let a *headless* loop self-serve a future
-  re-reset without a prompt, an allow rule for `reset_wp_schema.sh` must be
-  added to `.claude/settings.local.json` — that edit is pending explicit user
-  authorization because the auto-mode classifier blocks self-modification of
-  permission settings.
+  proceed to M0120-0003. Headless self-serve re-reset is now ENABLED: the user
+  authorized and added `Bash(wp/verification/reset_wp_schema.sh)` +
+  `Bash(bash wp/verification/reset_wp_schema.sh)` to `.claude/settings.local.json`
+  (2026-07-04), so a future loop can re-run the reset without a prompt.
   **2026-07-04 (loop): DONE.** Re-ran `driver_wp01_16.sh` against the reset
   schema (`wp/verification/results/20260704-072755/`, see `summary.md` there
   for the full per-item table). 13/16 PASS. Two failures: **WP-13** ("Invalid
