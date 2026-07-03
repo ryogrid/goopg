@@ -155,6 +155,35 @@ func TestExecDropFunctionMissingNoIfExistsErrors(t *testing.T) {
 	}
 }
 
+// TestExecDropFunctionMissingSchemaQualifiedErrorMessage pins the DU-002
+// slice 437 fix: DROP FUNCTION's "does not exist" / "could not find a
+// function named" messages must include the schema qualifier the statement
+// was given, matching real PG's NameListToString(funcname) (used by both
+// func_signature_string, parse_func.c, and dropcmds.c's does_not_exist_skipping
+// FUNCTION case) — before this fix goopg rendered the bare object name only,
+// silently dropping an explicit schema qualifier from the error text.
+func TestExecDropFunctionMissingSchemaQualifiedErrorMessage(t *testing.T) {
+	cat := catalog.NewInMemory()
+
+	err := runRoutineDDL(t, `DROP FUNCTION public.nope(int)`, cat)
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "42883" {
+		t.Fatalf("got err=%v, want ExecError SQLSTATE 42883", err)
+	}
+	if want := `function public.nope(integer) does not exist`; ee.Message != want {
+		t.Errorf("Message = %q, want %q", ee.Message, want)
+	}
+
+	err = runRoutineDDL(t, `DROP FUNCTION public.nope`, cat)
+	ee, ok = err.(*ExecError)
+	if !ok || ee.Code != "42883" {
+		t.Fatalf("got err=%v, want ExecError SQLSTATE 42883", err)
+	}
+	if want := `could not find a function named "public.nope"`; ee.Message != want {
+		t.Errorf("Message = %q, want %q", ee.Message, want)
+	}
+}
+
 // TestExecDropFunctionIfExistsSwallowsMissing pins the IF EXISTS
 // contract: missing routine is a no-op.
 func TestExecDropFunctionIfExistsSwallowsMissing(t *testing.T) {

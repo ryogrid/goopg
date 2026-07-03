@@ -60,6 +60,29 @@ func TestCommentOnUndefinedObjectErrors(t *testing.T) {
 	}
 }
 
+// TestCommentOnUndefinedFunctionSchemaQualifiedErrorMessage pins the DU-002
+// slice 437 fix: COMMENT ON FUNCTION's "does not exist" message must include
+// an explicit schema qualifier, mirroring DROP FUNCTION's sibling
+// func_signature_string-based error (both ultimately reflect real PG's
+// NameListToString(funcname)) — before this fix commentOnFuncSig rendered
+// the bare object name, silently dropping the schema from the error text.
+func TestCommentOnUndefinedFunctionSchemaQualifiedErrorMessage(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	err := runDDL(t, ctx, `COMMENT ON FUNCTION public.nosuchfunc(integer) IS 'x'`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42883" {
+		t.Errorf("Code=%q want 42883", ee.Code)
+	}
+	if want := `function public.nosuchfunc(integer) does not exist`; ee.Message != want {
+		t.Errorf("Message=%q want %q", ee.Message, want)
+	}
+}
+
 // TestCommentOnUndefinedRelationSubObjectErrors covers the four object kinds
 // keyed on an existing table (column/constraint/trigger/policy/rule): each
 // must raise "relation ... does not exist" (42P01) when the table itself is

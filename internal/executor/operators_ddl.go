@@ -11564,17 +11564,17 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		// When no argument list was given, PG says "could not find a function named X".
 		if s.Args == nil {
 			if s.IfExists {
-				o.ctx.AddNotice(fmt.Sprintf("function %s does not exist, skipping", s.Name.Name))
+				o.ctx.AddNotice(fmt.Sprintf("function %s does not exist, skipping", s.Name.String()))
 				return nil
 			}
 			return &ExecError{Code: "42883", Pos: s.Pos(),
-				Message: fmt.Sprintf("could not find a function named %q", s.Name.Name)}
+				Message: fmt.Sprintf("could not find a function named %q", s.Name.String())}
 		}
 		// Build the function signature for error/notice messages.
 		// PG format for IF EXISTS notice: "function name(pg_catalog.type,...) does not exist, skipping"
 		// PG format for ERROR: "function name(canonical_type,...) does not exist"
 		buildFuncSigNotice := func() string {
-			sig := s.Name.Name + "("
+			sig := s.Name.String() + "("
 			if s.Args != nil {
 				parts := make([]string, len(s.Args))
 				for i, a := range s.Args {
@@ -11595,7 +11595,7 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 			return sig + ")"
 		}
 		buildFuncSigError := func() string {
-			sig := s.Name.Name + "("
+			sig := s.Name.String() + "("
 			if s.Args != nil {
 				parts := make([]string, len(s.Args))
 				for i, a := range s.Args {
@@ -15787,7 +15787,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 // func_signature_string (used by LookupFuncWithArgs) and the equivalent
 // helper in DROP FUNCTION's error path. DU-002 slice 436.
 func commentOnFuncSig(s *parser.CommentOnStmt) string {
-	sig := s.ObjName.Name + "("
+	sig := s.ObjName.String() + "("
 	if s.Args != nil {
 		parts := make([]string, len(s.Args))
 		for i, a := range s.Args {

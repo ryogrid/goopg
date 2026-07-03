@@ -12857,4 +12857,59 @@ limitation remains visible in the `function` case: `commentOnFuncSig` (like
 its `DROP FUNCTION` sibling) renders the function name unqualified even when
 `COMMENT ON FUNCTION schema.name(...)` was schema-qualified, whereas real PG's
 `func_signature_string` includes the schema when given — a pre-existing
-simplification shared by DROP FUNCTION, not introduced here.
+simplification shared with `DROP FUNCTION`, resolved below (slice 437).
+
+## Follow-up: schema-qualify `DROP FUNCTION` / `COMMENT ON FUNCTION` "does not exist" messages (DU-002 slice 437)
+
+### Problem
+
+The slice 436 row above flagged a pre-existing, DROP-FUNCTION-shared
+simplification: `commentOnFuncSig` and `DROP FUNCTION`'s `buildFuncSigError`/
+`buildFuncSigNotice` closures (`internal/executor/operators_ddl.go`) both
+rendered the target function's bare `s.ObjName.Name`/`s.Name.Name` in their
+"does not exist" message, silently dropping an explicit schema qualifier even
+when the statement was schema-qualified — e.g. `DROP FUNCTION
+public.nope(int)` reported `function nope(integer) does not exist` instead of
+`function public.nope(integer) does not exist`. Real PostgreSQL's
+`func_signature_string` (`postgres/src/backend/utils/adt/regproc.c`) builds
+its message from `NameListToString(funcname)`, which renders every qualifier
+present in the parsed name list — so a schema-qualified DROP/COMMENT target
+must keep its schema in the error text.
+
+### Fix
+
+Both call sites already had a schema-aware renderer available on
+`parser.ObjectName`: `String()` returns `Schema + "." + Name` when `Schema !=
+""`, or the bare `Name` otherwise (`internal/parser/ast.go`). Swapped every
+`s.Name.Name`/`s.ObjName.Name` reference inside `execDropFunction`'s
+`buildFuncSigNotice`/`buildFuncSigError`/no-arg-list branches and
+`commentOnFuncSig` to `s.Name.String()`/`s.ObjName.String()` — no new type or
+helper needed, since the schema-qualified rendering was already the exact
+`ObjectName.String()` contract used everywhere else in the codebase (e.g.
+`DROP FUNCTION`'s own no-arg-list "could not find a function named %q"
+branch, which already used the bare field and is now consistent with the
+rest of the message).
+
+### Tests
+
+`TestExecDropFunctionMissingSchemaQualifiedErrorMessage`
+(`internal/executor/operators_function_test.go`) — both the with-arg-list
+(`DROP FUNCTION public.nope(int)` → `function public.nope(integer) does not
+exist`) and no-arg-list (`DROP FUNCTION public.nope` → `could not find a
+function named "public.nope"`) forms.
+`TestCommentOnUndefinedFunctionSchemaQualifiedErrorMessage`
+(`internal/executor/operators_ddl_comment_on_undefined_test.go`) — `COMMENT
+ON FUNCTION public.nosuchfunc(integer) IS 'x'` → `function
+public.nosuchfunc(integer) does not exist`.
+
+### Gates
+
+`go build ./...` clean; `internal/executor`+`internal/parser`+
+`internal/catalog` suites PASS (full, no regressions); `TestPort_PgDumpConnectionSetup`
+PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+### Deferred
+
+None — this closes the slice 436 deferral in full; no new discovery this
+loop. This was a pure message-formatting fix (no catalog/WAL/wire-format
+change), so no sibling-path audit beyond the two call sites was needed.
