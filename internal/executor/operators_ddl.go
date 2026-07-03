@@ -13421,7 +13421,23 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						if classSchema == "" {
 							classSchema = "public"
 						}
-						im.DropUserOperatorClass(classSchema, name.Name, catalog.AccessMethodOIDByName(method))
+						classMethodOID := catalog.AccessMethodOIDByName(method)
+						oc, ocFound := im.LookupUserOperatorClass(classSchema, name.Name, classMethodOID)
+						im.DropUserOperatorClass(classSchema, name.Name, classMethodOID)
+						// DU-002 restart-persistence follow-up
+						// (M0119-0004/M0110-0001, closing the loop #65/#66
+						// ledger row's "still open" item (1)): mirrors DROP
+						// OPERATOR's own WAL append so the drop survives a
+						// restart. ocFound is false for a class that only
+						// exists in the legacy opClassSchemas registry (no
+						// pg_opclass row was ever registered, e.g. an
+						// unparseable USING method at CREATE time) — nothing
+						// to WAL-log in that case.
+						if ocFound && o.ctx.WAL != nil {
+							if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperatorClass(oc.OID)); werr != nil {
+								return fmt.Errorf("wal drop-operator-class: %w", werr)
+							}
+						}
 					}
 					return nil
 				}
@@ -14536,7 +14552,18 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if nsOID == 0 {
 			nsOID = o.ctx.Catalog.SchemaOID("public")
 		}
-		im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+		fam := im.RegisterUserOperatorFamily(schema, s.ObjName.Name, nsOID, methodOID, 0)
+		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+		// closing the loop #65/#66 ledger row's "still open" item (1)):
+		// mirrors CREATE OPERATOR's own WAL append so the family survives a
+		// restart.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
+				OID: fam.OID, Schema: schema, Name: fam.Name, Method: methodOID,
+			})); werr != nil {
+				return fmt.Errorf("wal create-operator-family: %w", werr)
+			}
+		}
 	case "cast":
 		// Register the user-defined cast (CREATE CAST (source AS target) …) so it
 		// round-trips through pg_dump (pg_cast virtual view → getCasts/dumpCast).
@@ -15774,6 +15801,17 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		// creating role for these compat objects).
 		fam := im.RegisterUserOperatorFamily(schema, s.Name, nsOID, methodOID, 0)
 		famOID = fam.OID
+		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001):
+		// mirrors CREATE OPERATOR FAMILY's own WAL append (execCompatNoop's
+		// "operator family" case) so this auto-created anonymous family
+		// survives a restart too.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorFamily(wal.CreateOperatorFamilyPayload{
+				OID: fam.OID, Schema: schema, Name: fam.Name, Method: methodOID,
+			})); werr != nil {
+				return fmt.Errorf("wal create-operator-family: %w", werr)
+			}
+		}
 	}
 
 	var keyTypeOID uint32
@@ -15792,6 +15830,19 @@ func (o *ddlOp) execCreateOpClass(s *parser.CreateOpClassStmt) error {
 		}
 	}
 	oc := im.RegisterUserOperatorClass(schema, s.Name, nsOID, 0, methodOID, famOID, inTypeOID, s.IsDefault, keyTypeOID)
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
+	// the loop #65/#66 ledger row's "still open" item (1)): mirrors CREATE
+	// OPERATOR's own WAL append so the class survives a restart. The
+	// AS-list members are appended separately by registerOpClassMembers
+	// below.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateOperatorClass(wal.CreateOperatorClassPayload{
+			OID: oc.OID, Schema: schema, Name: oc.Name, Method: methodOID, FamilyOID: famOID,
+			InTypeOID: inTypeOID, IsDefault: s.IsDefault, KeyTypeOID: keyTypeOID,
+		})); werr != nil {
+			return fmt.Errorf("wal create-operator-class: %w", werr)
+		}
+	}
 	return o.registerOpClassMembers(im, s.Members, schema, famOID, oc.OID, methodOID, s.Method, s.Pos(), false, "")
 }
 
@@ -15872,11 +15923,23 @@ func (o *ddlOp) execAlterOpFamilyDrop(s *parser.AlterOpFamilyDropStmt) error {
 				return &ExecError{Code: "42704", Pos: s.Pos(),
 					Message: fmt.Sprintf("function %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
 			}
+			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+			// closing the loop #65/#66 ledger row's "still open" item (1)).
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAmProcMember(fam.OID, leftOID, rightOID, uint32(m.Number))); werr != nil {
+					return fmt.Errorf("wal drop-amproc-member: %w", werr)
+				}
+			}
 			continue
 		}
 		if !im.RemoveAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number)) {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("operator %d(%s,%s) does not exist in operator family %q", m.Number, m.LeftType, m.RightType, fam.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropAmOpMember(fam.OID, leftOID, rightOID, uint32(m.Number))); werr != nil {
+				return fmt.Errorf("wal drop-amop-member: %w", werr)
+			}
 		}
 	}
 	return nil
@@ -15927,7 +15990,19 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 					}
 				}
 			}
-			im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
+			pm := im.RegisterAmProcMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), procOID, methodOID)
+			// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+			// closing the loop #65/#66 ledger row's "still open" item (1)):
+			// covers both a CREATE OPERATOR CLASS ... AS list FUNCTION entry
+			// and an ALTER OPERATOR FAMILY ... ADD FUNCTION entry.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAmProcMember(wal.AmProcMemberPayload{
+					OID: pm.OID, FamilyOID: pm.FamilyOID, ClassOID: pm.ClassOID, LeftType: pm.LeftType,
+					RightType: pm.RightType, ProcNum: pm.ProcNum, ProcOID: pm.ProcOID, Method: pm.Method,
+				})); werr != nil {
+					return fmt.Errorf("wal create-amproc-member: %w", werr)
+				}
+			}
 			continue
 		}
 		if isAdd && !m.HasExplicitArgTypes {
@@ -15977,7 +16052,20 @@ func (o *ddlOp) registerOpClassMembers(im *catalog.InMemory, members []parser.Op
 			}
 			sortFamilyOID = fam.OID
 		}
-		im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID, sortFamilyOID)
+		opm := im.RegisterAmOpMember(famOID, classOID, leftOID, rightOID, uint32(m.Number), operOID, methodOID, sortFamilyOID)
+		// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+		// closing the loop #65/#66 ledger row's "still open" item (1)):
+		// covers both a CREATE OPERATOR CLASS ... AS list OPERATOR entry
+		// and an ALTER OPERATOR FAMILY ... ADD OPERATOR entry.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateAmOpMember(wal.AmOpMemberPayload{
+				OID: opm.OID, FamilyOID: opm.FamilyOID, ClassOID: opm.ClassOID, LeftType: opm.LeftType,
+				RightType: opm.RightType, Strategy: opm.Strategy, OperOID: opm.OperOID, Method: opm.Method,
+				SortFamilyOID: opm.SortFamilyOID,
+			})); werr != nil {
+				return fmt.Errorf("wal create-amop-member: %w", werr)
+			}
+		}
 	}
 	return nil
 }

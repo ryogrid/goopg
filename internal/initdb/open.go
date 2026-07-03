@@ -1545,6 +1545,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: operator DDL replay: %w", err)
 	}
 
+	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001, closing
+	// the loop #65/#66 ledger row's "still open" item (1)): restore CREATE
+	// OPERATOR FAMILY / CREATE OPERATOR CLASS (+ its pg_amop/pg_amproc
+	// AS-list members) / DROP OPERATOR CLASS / ALTER OPERATOR FAMILY ...
+	// ADD|DROP objects from the WAL. Runs after the operator DDL replay
+	// above (schema replay must have already run, and a class's AS-list
+	// OPERATOR entries reference user operators by OID).
+	if err := replayOperatorClassDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: operator class/family DDL replay: %w", err)
+	}
+
 	// pg_sequences: virtual catalog view listing all registered sequences.
 	// M0097-0024.
 	if err := registerPgSequencesView(cat); err != nil {

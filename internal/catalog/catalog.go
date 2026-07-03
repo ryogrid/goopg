@@ -13387,6 +13387,33 @@ func (c *InMemory) RegisterUserOperatorFamily(schema, name string, namespaceOID,
 	return f
 }
 
+// RegisterUserOperatorFamilyDuringRecovery is the idempotent version of
+// RegisterUserOperatorFamily used by the WAL-replay driver
+// (internal/initdb/operator_class_ddl_recovery.go). Unlike
+// RegisterUserOperatorFamily it takes the OID from the WAL record so the
+// recovered family matches the pre-crash server exactly, and advances
+// nextOID past it. `schema` resolves the family's NamespaceOID the same way
+// RegisterUserOperatorDuringRecovery does (unknown/empty → public); this
+// depends on replaySchemaDDLRecords having already restored the schema
+// registry. DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
+// closing the loop #65/#66 ledger row's "still open" item (1)).
+func (c *InMemory) RegisterUserOperatorFamilyDuringRecovery(f *UserOperatorFamily, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorFamilies == nil {
+		c.userOperatorFamilies = make(map[string]*UserOperatorFamily)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	out := *f
+	out.NamespaceOID = nsOID
+	key := userOpFamilyKey(schema, f.Name, f.Method)
+	c.userOperatorFamilies[key] = &out
+	c.advanceNextOIDLocked(f.OID)
+}
+
 // DropUserOperatorFamily removes a user-defined operator family from the
 // registry. Returns true if one was found and removed. DU-002 (M0119-0004).
 func (c *InMemory) DropUserOperatorFamily(schema, name string, method uint32) bool {
@@ -13514,6 +13541,53 @@ func (c *InMemory) RegisterUserOperatorClass(schema, name string, namespaceOID, 
 	return oc
 }
 
+// RegisterUserOperatorClassDuringRecovery is the idempotent version of
+// RegisterUserOperatorClass used by the WAL-replay driver
+// (internal/initdb/operator_class_ddl_recovery.go). Unlike
+// RegisterUserOperatorClass it takes the OID (and FamilyOID) from the WAL
+// record so the recovered class matches the pre-crash server exactly, and
+// advances nextOID past it. Also repopulates the legacy opClassSchemas
+// registry (RegisterOpClassSchema's backing map) so a post-restart DROP
+// OPERATOR CLASS — which checks HasOpClass, not userOperatorClasses — still
+// finds the class, mirroring what the live execCreateOpClass path does via
+// its own separate RegisterOpClassSchema call. `schema` resolves
+// NamespaceOID the same way RegisterUserOperatorDuringRecovery does. DU-002
+// restart-persistence follow-up (M0119-0004/M0110-0001, closing the
+// loop #65/#66 ledger row's "still open" item (1)).
+func (c *InMemory) RegisterUserOperatorClassDuringRecovery(oc *UserOperatorClass, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.userOperatorClasses == nil {
+		c.userOperatorClasses = make(map[string]*UserOperatorClass)
+	}
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	out := *oc
+	out.NamespaceOID = nsOID
+	key := userOpClassKey(schema, oc.Name, oc.Method)
+	c.userOperatorClasses[key] = &out
+	if c.opClassSchemas == nil {
+		c.opClassSchemas = make(map[string]string)
+	}
+	c.opClassSchemas[oc.Name] = schema
+	c.advanceNextOIDLocked(oc.OID)
+}
+
+// LookupUserOperatorClass finds a previously-registered operator class by
+// its identity (schema, name, method). Used by execDropCompat's DROP
+// OPERATOR CLASS path to recover the class's OID before removing it, so the
+// removal can be WAL-logged by OID (mirroring DROP OPERATOR's own
+// look-up-then-drop-by-OID shape). DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001).
+func (c *InMemory) LookupUserOperatorClass(schema, name string, method uint32) (*UserOperatorClass, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oc, ok := c.userOperatorClasses[userOpClassKey(schema, name, method)]
+	return oc, ok
+}
+
 // DropUserOperatorClass removes a user-defined operator class from the
 // registry, along with any pg_amop/pg_amproc member rows attributed to it
 // (slice 411). Returns true if one was found and removed. DU-002 (M0119-0004).
@@ -13545,6 +13619,46 @@ func (c *InMemory) DropUserOperatorClass(schema, name string, method uint32) boo
 	}
 	c.amProcMembers = keptP
 	return true
+}
+
+// DropUserOperatorClassByOIDDuringRecovery is the recovery counterpart used
+// for replaying RecordKindDropOperatorClass. Identical in spirit to
+// DropUserOperatorClass (removes the class row plus every amop/amproc row it
+// owns) but keyed by OID — DROP OPERATOR CLASS's own existence check and
+// name/method resolution already happened live, so the WAL record carries
+// the OID directly, mirroring DropUserOperatorByOIDDuringRecovery. Also
+// removes the legacy opClassSchemas entry, mirroring the live
+// execDropCompat path's RemoveOpClass call. Discards the found/not-found
+// result — replay does not care whether the class was still present.
+// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001).
+func (c *InMemory) DropUserOperatorClassByOIDDuringRecovery(oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var name string
+	for key, oc := range c.userOperatorClasses {
+		if oc.OID == oid {
+			name = oc.Name
+			delete(c.userOperatorClasses, key)
+			break
+		}
+	}
+	kept := c.amOpMembers[:0]
+	for _, m := range c.amOpMembers {
+		if m.ClassOID != oid {
+			kept = append(kept, m)
+		}
+	}
+	c.amOpMembers = kept
+	keptP := c.amProcMembers[:0]
+	for _, m := range c.amProcMembers {
+		if m.ClassOID != oid {
+			keptP = append(keptP, m)
+		}
+	}
+	c.amProcMembers = keptP
+	if name != "" {
+		delete(c.opClassSchemas, name)
+	}
 }
 
 // ListUserOperatorClasses returns all registered user operator classes sorted
@@ -13618,6 +13732,30 @@ func (c *InMemory) RegisterAmOpMember(familyOID, classOID, leftType, rightType, 
 	return m
 }
 
+// RegisterAmOpMemberDuringRecovery is the idempotent version of
+// RegisterAmOpMember used by the WAL-replay driver
+// (internal/initdb/operator_class_ddl_recovery.go). Unlike RegisterAmOpMember
+// it takes the OID from the WAL record (covers both a CREATE OPERATOR
+// CLASS ... AS list entry and an ALTER OPERATOR FAMILY ... ADD entry — both
+// go through registerOpClassMembers and share the same AmOpMember shape) and
+// advances nextOID past it. Re-applying a record for a member that already
+// exists (same OID) just overwrites it in place. DU-002 restart-persistence
+// follow-up (M0119-0004/M0110-0001).
+func (c *InMemory) RegisterAmOpMemberDuringRecovery(m *AmOpMember) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := *m
+	for i, existing := range c.amOpMembers {
+		if existing.OID == m.OID {
+			c.amOpMembers[i] = &out
+			c.advanceNextOIDLocked(m.OID)
+			return
+		}
+	}
+	c.amOpMembers = append(c.amOpMembers, &out)
+	c.advanceNextOIDLocked(m.OID)
+}
+
 // RegisterAmProcMember records one pg_amproc row, allocating a stable OID.
 // Mirrors RegisterAmOpMember. DU-002 (M0119-0004) slice 411.
 func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType, procNum, procOID, method uint32) *AmProcMember {
@@ -13630,6 +13768,25 @@ func (c *InMemory) RegisterAmProcMember(familyOID, classOID, leftType, rightType
 	}
 	c.amProcMembers = append(c.amProcMembers, m)
 	return m
+}
+
+// RegisterAmProcMemberDuringRecovery is the idempotent version of
+// RegisterAmProcMember used by the WAL-replay driver. Mirrors
+// RegisterAmOpMemberDuringRecovery. DU-002 restart-persistence follow-up
+// (M0119-0004/M0110-0001).
+func (c *InMemory) RegisterAmProcMemberDuringRecovery(m *AmProcMember) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := *m
+	for i, existing := range c.amProcMembers {
+		if existing.OID == m.OID {
+			c.amProcMembers[i] = &out
+			c.advanceNextOIDLocked(m.OID)
+			return
+		}
+	}
+	c.amProcMembers = append(c.amProcMembers, &out)
+	c.advanceNextOIDLocked(m.OID)
 }
 
 // ListAmOpMembers returns all registered pg_amop rows in creation order.
