@@ -36,8 +36,33 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/wal"
 )
+
+// databaseDDLError carries a specific PG SQLSTATE for a
+// tryHandleDatabaseDDL/applyAlterDatabaseConfig failure, mirroring
+// roleError's shape on the role-DDL side (see role_ddl.go). Errors
+// without this wrapper (e.g. a WAL-append failure) fall back to
+// sqlstate.SystemError via databaseDDLErrorSQLState, matching an
+// internal-error rather than a user-facing PG error condition.
+type databaseDDLError struct {
+	code sqlstate.Code
+	msg  string
+}
+
+func (e *databaseDDLError) Error() string { return e.msg }
+
+// databaseDDLErrorSQLState returns the SQLSTATE for a database-DDL error,
+// mirroring roleErrorSQLState. M0119-0004-ACLHEAP follow-up (loop #79
+// deferral: database-DDL errors previously all mapped to the generic
+// sqlstate.SystemError, unlike the role-DDL side's typed dispatch).
+func databaseDDLErrorSQLState(err error) sqlstate.Code {
+	if de, ok := err.(*databaseDDLError); ok && de.code != "" {
+		return de.code
+	}
+	return sqlstate.SystemError
+}
 
 // databaseDDLKind is the result of inspecting a SQL string for a
 // CREATE / DROP DATABASE prefix.
@@ -444,7 +469,7 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 		return false, "", nil
 	}
 	if name == "" {
-		return true, "", errors.New("missing database name")
+		return true, "", &databaseDDLError{code: sqlstate.SyntaxError, msg: "missing database name"}
 	}
 	if s.cfg.Catalog == nil {
 		// No catalog plumbed (some test/embedded paths). Fall back to
@@ -461,11 +486,11 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 	case databaseDDLCreate:
 		if err := cat.CreateDatabase(name); err != nil {
 			if errors.Is(err, catalog.ErrDatabaseExists) {
-				// PostgreSQL returns "database already exists" with
-				// SQLSTATE 42P04. Surface the same error text but
-				// route through the generic system-error path; the
-				// caller wraps SQLSTATE.
-				return true, "", err
+				// PG: dbcommands.c createdb(), ERRCODE_DUPLICATE_DATABASE.
+				return true, "", &databaseDDLError{
+					code: sqlstate.DuplicateDatabase,
+					msg:  fmt.Sprintf("database %q already exists", name),
+				}
 			}
 			return true, "", err
 		}
@@ -488,8 +513,11 @@ func (s *Server) tryHandleDatabaseDDL(sql string, liveDBName string, resolveCurr
 					notice := fmt.Sprintf("database %q does not exist, skipping", name)
 					return true, notice, nil
 				}
-				// Non-IF-EXISTS: produce PG-compatible error with database name.
-				return true, "", fmt.Errorf("database %q does not exist", name)
+				// Non-IF-EXISTS: PG: dbcommands.c dropdb(), ERRCODE_UNDEFINED_DATABASE.
+				return true, "", &databaseDDLError{
+					code: sqlstate.UndefinedDatabase,
+					msg:  fmt.Sprintf("database %q does not exist", name),
+				}
 			}
 			return true, "", err
 		}
@@ -553,11 +581,17 @@ func (s *Server) applyAlterDatabaseConfig(op alterDatabaseConfigOp, liveDBName s
 		// database, so an "other database" no-op never has to resolve
 		// anything or surface a bogus "unrecognized parameter" error.
 		if resolveCurrent == nil {
-			return true, "", fmt.Errorf("unrecognized configuration parameter %q", op.configName)
+			return true, "", &databaseDDLError{
+				code: sqlstate.UndefinedObject,
+				msg:  fmt.Sprintf("unrecognized configuration parameter %q", op.configName),
+			}
 		}
 		val, ok := resolveCurrent(op.configName)
 		if !ok {
-			return true, "", fmt.Errorf("unrecognized configuration parameter %q", op.configName)
+			return true, "", &databaseDDLError{
+				code: sqlstate.UndefinedObject,
+				msg:  fmt.Sprintf("unrecognized configuration parameter %q", op.configName),
+			}
 		}
 		op.configValue = val
 	}

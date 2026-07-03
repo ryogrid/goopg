@@ -5267,6 +5267,26 @@ documentation-only and is exempt from the design-doc requirement.)
       now handled; remaining M0119-0004-ACLHEAP residuals are the
       extended-protocol-only dispatch gap, multi-database scope, the
       `pg_dumpall` cluster-wide-dump surface, and `ALTER ROLE ALL SET ...`.**
+      **2026-07-03 (loop #80): database-DDL error SQLSTATE fidelity
+      LANDED** — closes deferred item (2) of the loop #79 note above. New
+      `databaseDDLError{code, msg}` (`internal/server/database_ddl.go`)
+      mirrors `roleError`; `databaseDDLErrorSQLState` mirrors
+      `roleErrorSQLState`. `dispatch.go`'s `tryHandleDatabaseDDL` call site
+      now maps errors via `databaseDDLErrorSQLState` instead of a hardcoded
+      `sqlstate.SystemError`. All four error sites converted:
+      `CREATE DATABASE` duplicate → 42P04 (+ message now includes the
+      database name, matching PG's `dbcommands.c` text — previously bare
+      "database already exists"); `DROP DATABASE` undefined → 3D000;
+      `... SET name FROM CURRENT` unresolved GUC → 42704; the unreachable
+      "missing database name" guard → 42601, for consistency. New test
+      `TestDatabaseDDLErrorSQLState`. Gates: build/vet clean;
+      `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); full `scripts/ralph-precommit-test.sh` PASS (pgbench
+      smoke, 0 failed). Design doc: `0119-0004-database-config-set-pgdump.md`
+      "Follow-up: database-DDL error SQLSTATE fidelity (loop #80)", indexed
+      as `0119-0004cr`. Deferred item (1) (GUC unit-display formatting)
+      remains open, unrelated scope — no new deferral needed, this closes
+      the loop #79 row's item (2) in full.**
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

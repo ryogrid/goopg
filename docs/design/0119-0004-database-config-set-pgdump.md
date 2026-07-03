@@ -342,3 +342,57 @@ Deferred (ledger row appended, `M0119-0004-ACLHEAP`):
    `databaseDDLError{code, msg}` type mirroring `roleError`, wired into
    `dispatch.go`'s one `s.writeQueryError(w, sqlstate.SystemError, ...)`
    call site the same way `roleErrorSQLState` is.
+
+## Follow-up: database-DDL error SQLSTATE fidelity (loop #80)
+
+Closes deferred item 2 above. Added `databaseDDLError{code sqlstate.Code,
+msg string}` (`internal/server/database_ddl.go`) mirroring `roleError`
+(`role_ddl.go`) exactly, plus a `databaseDDLErrorSQLState(err) sqlstate.Code`
+helper mirroring `roleErrorSQLState` (type-asserts `*databaseDDLError`,
+falls back to `sqlstate.SystemError` for an untyped/internal error such as a
+WAL-append failure). `dispatch.go`'s one `tryHandleDatabaseDDL` call site
+(~line 122) now calls `databaseDDLErrorSQLState(herr)` instead of the
+hardcoded `sqlstate.SystemError`.
+
+All four error-construction sites in `database_ddl.go` were converted to the
+typed error with the real PG SQLSTATE (cross-checked against
+`postgres/src/backend/commands/dbcommands.c`):
+
+- `CREATE DATABASE` on an existing name — `sqlstate.DuplicateDatabase`
+  (42P04, `ERRCODE_DUPLICATE_DATABASE`, `createdb()`). Bonus fidelity fix:
+  the message text also gained the database name (`database "tpch" already
+  exists`, matching `dbcommands.c`'s `errmsg`) — previously it surfaced the
+  bare `catalog.ErrDatabaseExists` sentinel text ("database already
+  exists", no name), since that raw sentinel was returned as-is.
+- `DROP DATABASE` (non-`IF EXISTS`) on a nonexistent name —
+  `sqlstate.UndefinedDatabase` (3D000, `ERRCODE_UNDEFINED_DATABASE`,
+  `dropdb()`); message text was already PG-correct, only the SQLSTATE
+  changed.
+- `ALTER DATABASE ... SET name FROM CURRENT` on an unresolved GUC name (nil
+  resolver or `resolveCurrent` reporting `ok=false`) —
+  `sqlstate.UndefinedObject` (42704), the same code `SET`/loop #78's six
+  literal-carrying special forms already use for this message.
+- The defensive "missing database name" internal-parse-guard branch (name
+  empty despite `classifyDatabaseDDL` matching a kind — not known to be
+  reachable from any real SQL shape) got `sqlstate.SyntaxError` for
+  consistency; behaviourally inert since no test/live SQL reaches it.
+
+The `errors.Is(err, catalog.ErrDatabaseExists)` / `ErrDatabaseNotFound`
+branches are otherwise unchanged — `catalog.InMemory.CreateDatabase`/
+`DropDatabase` (`internal/catalog/catalog.go`) return only those two
+sentinels or nil, so the surrounding "any other error" fallthrough arms stay
+on the generic `sqlstate.SystemError` default (defensive, not known to be
+live).
+
+New test `TestDatabaseDDLErrorSQLState` (`database_ddl_test.go`) pins all
+three converted user-facing cases (duplicate create, undefined drop,
+unresolved `FROM CURRENT` GUC) plus the untyped-error fallback.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test ./internal/server/...`
+PASS (full suite, no regression); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); full `scripts/ralph-precommit-test.sh` PASS (pgbench smoke,
+0 failed transactions).
+
+No new deferrals — this follow-up closes deferred item 2 in full (all
+`tryHandleDatabaseDDL`/`applyAlterDatabaseConfig` error sites are now typed).
+Deferred item 1 (GUC unit-display formatting) remains open, unrelated scope.

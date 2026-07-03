@@ -121,7 +121,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// commands fall through to the wire-protocol no-op tag handler.
 		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
 			if herr != nil {
-				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
+				return s.writeQueryError(w, databaseDDLErrorSQLState(herr), herr.Error())
 			}
 			if notice != "" {
 				_ = w.WriteNoticeResponse([]protocol.ErrorField{
