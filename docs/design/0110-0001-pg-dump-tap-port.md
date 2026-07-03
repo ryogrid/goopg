@@ -11798,3 +11798,64 @@ full server restart. Deferred (ledger row appended): `canonical`/
 `subtype_diff` options remain parsed-and-discarded (needs real shell-type
 support + function-signature validation); `CREATE OPERATOR CLASS` restart
 persistence (new discovery, tracked above) is a separate task.
+
+## Follow-up: generic default-opclass resolution over user-created opclasses (loop #76)
+
+Closes sub-item (b) of the slice 429 deferral, carried unchanged since loop
+#63/#64: `CREATE TYPE ... AS RANGE (subtype = ...)` with **no** explicit
+`subtype_opclass` option only ever consulted the curated
+`builtinRangeSubtypeOpclasses` map (`DefaultBtreeOpclassForSubtype`) — a
+subtype with no curated builtin entry (e.g. `json`, which real PostgreSQL
+itself has no default btree opclass for either) but with a **user-created**
+`CREATE OPERATOR CLASS ... DEFAULT` btree opclass registered for it still
+failed with the synthesized `42704` "has no default operator class" error,
+even though real PostgreSQL's `GetDefaultOpClass`
+(`postgres/src/backend/catalog/pg_opclass.c`) does a single `pg_opclass` scan
+that finds either a builtin or a user-created default row identically (PG has
+no such builtin/user distinction — everything lives in the one table). This
+was already asymmetric with the *explicit*-name path (`resolveRangeOpclass`'s
+non-empty branch), which loop #64 already wired to fall back to
+`ListUserOperatorClasses()` when a named opclass isn't a curated builtin.
+
+### Change
+
+New `(*InMemory) defaultUserBtreeOpclassForSubtype(subtypeOID) (uint32, bool)`
+(`internal/catalog/catalog.go`, next to `DefaultBtreeOpclassForSubtype`)
+scans `ListUserOperatorClasses()` for a `Method == btree`, `InTypeOID ==
+subtypeOID`, `IsDefault == true` row — mirroring `GetDefaultOpClass`'s own
+`opcmethod = btree AND opcintype = subtypeOID AND opcdefault` scan, narrowed
+to the user-registry half of goopg's split builtin/user opclass storage.
+`resolveRangeOpclass`'s empty-`opclassName` branch now tries the curated
+builtin map first (unchanged — it never varies at runtime, so checking it
+first is a pure optimization, not a behavior choice) and falls back to this
+new method before raising the `42704` error, closing the asymmetry with the
+explicit-name path.
+
+### Tests
+
+`TestRegisterRangeTypeUserDefaultOpclass` (`internal/catalog/range_type_opclass_test.go`):
+a `json`-subtype range with a `CREATE OPERATOR CLASS ... DEFAULT` btree
+opclass registered resolves it via the empty-option path; a **non**-default
+user opclass for the same subtype is correctly NOT picked up implicitly
+(still `42704`); a user-registered `int4` default opclass does not shadow
+the curated `int4_ops` builtin default (curated map wins, matching the "check
+builtin first" ordering choice above — real PG's single-scan behavior is
+technically nondeterministic between two `opcdefault` rows for the same
+type/method, which PostgreSQL itself documents as user error, so goopg's
+deterministic "builtin wins" tie-break is a reasonable, simpler substitute
+rather than a claimed fidelity gap).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/catalog` suite PASS (new
+tests + no regression); full `internal/catalog`+`internal/executor`+
+`internal/parser`+`internal/wal`+`internal/initdb` suites PASS (no
+regression); `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook.
+
+### Still deferred
+
+Range-type `canonical`/`subtype_diff` sub-item (a) remainder (unchanged from
+loop #63/#64 — needs real shell-type support + function-signature
+validation, a materially larger, separately-scoped feature). No other
+residual from this loop's own scope.

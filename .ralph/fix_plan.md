@@ -203,7 +203,27 @@ prev-link fixes.
       (`query returned 0 rows instead of one`) for any range type
       referencing it. Still open: `canonical`/`subtype_diff` (sub-item (a)
       remainder) and the generic `GetDefaultOpClass`-over-user-opclasses gap
-      (sub-item (b), unchanged from loop #63).
+      (sub-item (b), unchanged from loop #63; **closed by loop #76 below**).
+      **2026-07-03 (loop #76, DU-002 slice 429 follow-up): generic default-
+      opclass resolution over user-created opclasses LANDED — CLOSES
+      sub-item (b).** `resolveRangeOpclass`'s empty-`subtype_opclass` branch
+      (`internal/catalog/catalog.go`) now falls back to a new
+      `defaultUserBtreeOpclassForSubtype` scan of `ListUserOperatorClasses()`
+      (mirroring PG's `GetDefaultOpClass`,
+      `postgres/src/backend/catalog/pg_opclass.c`) when no curated builtin
+      default exists for the subtype, so `CREATE TYPE ... AS RANGE` over a
+      subtype like `json` (no PG built-in default btree opclass) now
+      resolves a user-registered `CREATE OPERATOR CLASS ... DEFAULT`
+      opclass instead of a synthesized 42704. Tests:
+      `TestRegisterRangeTypeUserDefaultOpclass`
+      (`internal/catalog/range_type_opclass_test.go`). Design doc
+      "Follow-up: generic default-opclass resolution over user-created
+      opclasses (loop #76)". Gates: build/vet clean;
+      `internal/catalog`+`internal/executor`+`internal/parser`+
+      `internal/wal`+`internal/initdb` suites PASS. Remaining open on this
+      deferral thread: `canonical`/`subtype_diff` (sub-item (a) remainder —
+      needs real shell-type + function-signature support, a materially
+      larger separately-scoped feature).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

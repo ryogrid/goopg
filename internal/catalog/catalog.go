@@ -15885,6 +15885,24 @@ func builtinOpclassOIDByName(name string) (builtinOpclassInfo, bool) {
 	return builtinOpclassInfo{}, false
 }
 
+// defaultUserBtreeOpclassForSubtype mirrors GetDefaultOpClass's (postgres/
+// src/backend/catalog/pg_opclass.c) pg_opclass scan for a user-created
+// default btree opclass over the given subtype. Real PG stores builtin and
+// user opclasses in the same pg_opclass table, so a single scan finds
+// either; goopg splits them into the curated `builtinRangeSubtypeOpclasses`
+// map (checked first by callers via DefaultBtreeOpclassForSubtype, since it
+// never changes at runtime) and the live `userOperatorClasses` registry
+// (this method) — callers must check both to reproduce the single-scan
+// behavior. DU-002 (M0110-0001, slice 429 follow-up sub-item (b)).
+func (c *InMemory) defaultUserBtreeOpclassForSubtype(subtypeOID uint32) (uint32, bool) {
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method == btreeAccessMethodOID && uoc.InTypeOID == subtypeOID && uoc.IsDefault {
+			return uoc.OID, true
+		}
+	}
+	return 0, false
+}
+
 // resolveRangeOpclass implements PG's findRangeSubOpclass (postgres/src/
 // backend/commands/typecmds.c): an explicit `subtype_opclass` name must
 // name an existing btree opclass that accepts (is binary-coercible with)
@@ -15892,12 +15910,14 @@ func builtinOpclassOIDByName(name string) (builtinOpclassInfo, bool) {
 // 429 follow-up sub-item (a)).
 func (c *InMemory) resolveRangeOpclass(subtypeName string, subtypeOID uint32, opclassName string) (uint32, *RangeTypeOptionError) {
 	if opclassName == "" {
-		oid, ok := DefaultBtreeOpclassForSubtype(subtypeOID)
-		if !ok {
-			return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
-				"data type %s has no default operator class for access method %q", subtypeName, "btree")}
+		if oid, ok := DefaultBtreeOpclassForSubtype(subtypeOID); ok {
+			return oid, nil
 		}
-		return oid, nil
+		if oid, ok := c.defaultUserBtreeOpclassForSubtype(subtypeOID); ok {
+			return oid, nil
+		}
+		return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+			"data type %s has no default operator class for access method %q", subtypeName, "btree")}
 	}
 	if oc, ok := builtinOpclassOIDByName(opclassName); ok {
 		if oc.IntypeOID != subtypeOID {

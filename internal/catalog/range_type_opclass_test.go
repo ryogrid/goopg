@@ -179,6 +179,55 @@ func TestRegisterRangeTypeExplicitOpclass(t *testing.T) {
 	})
 }
 
+// TestRegisterRangeTypeUserDefaultOpclass exercises the DU-002 (M0110-0001,
+// slice 429 follow-up sub-item (b)) generic-default-opclass gap: a subtype
+// with no curated `builtinRangeSubtypeOpclasses` entry (json — PostgreSQL
+// itself has no built-in btree opclass for it, confirmed by
+// TestRegisterRangeTypeStillRejectsUnsupportedSubtype above) must still
+// resolve via a user-created `CREATE OPERATOR CLASS ... DEFAULT` btree
+// opclass when the range's `subtype_opclass` option is omitted, mirroring
+// PostgreSQL's single `GetDefaultOpClass` pg_opclass scan (which does not
+// distinguish builtin vs. user-created rows).
+func TestRegisterRangeTypeUserDefaultOpclass(t *testing.T) {
+	t.Run("user default opclass resolves the empty subtype_opclass option", func(t *testing.T) {
+		c := NewInMemory()
+		uoc := c.RegisterUserOperatorClass("public", "my_json_ops", PublicNamespaceOID, 10, btreeAccessMethodOID, 0, OIDJSON, true, 0)
+		rt, err := c.RegisterRangeType("jsonrange", "json", "", "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.OpclassOID != uoc.OID {
+			t.Errorf("OpclassOID = %d, want %d (my_json_ops)", rt.OpclassOID, uoc.OID)
+		}
+	})
+	t.Run("non-default user opclass is not picked up implicitly", func(t *testing.T) {
+		c := NewInMemory()
+		c.RegisterUserOperatorClass("public", "my_json_ops", PublicNamespaceOID, 10, btreeAccessMethodOID, 0, OIDJSON, false, 0)
+		_, err := c.RegisterRangeType("jsonrange", "json", "", "", "")
+		if err == nil {
+			t.Fatal("expected an error (no default opclass), got nil")
+		}
+		var rte *RangeTypeOptionError
+		if !errors.As(err, &rte) {
+			t.Fatalf("error is not *RangeTypeOptionError: %v (%T)", err, err)
+		}
+		if rte.Code != "42704" {
+			t.Errorf("Code = %q, want 42704", rte.Code)
+		}
+	})
+	t.Run("curated builtin default still wins over a user opclass for the same subtype", func(t *testing.T) {
+		c := NewInMemory()
+		c.RegisterUserOperatorClass("public", "my_int4_ops", PublicNamespaceOID, 10, btreeAccessMethodOID, 0, OIDInt4, true, 0)
+		rt, err := c.RegisterRangeType("myrange", "int4", "", "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.OpclassOID != 1978 {
+			t.Errorf("OpclassOID = %d, want 1978 (curated int4_ops)", rt.OpclassOID)
+		}
+	})
+}
+
 // TestRegisterRangeTypeExplicitCollation exercises the DU-002 (M0110-0001,
 // slice 429 follow-up sub-item (a)) `collation` option: a built-in name
 // resolves to its OID for a collatable subtype, a user-created (CREATE
