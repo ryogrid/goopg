@@ -15500,6 +15500,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 		oidPgExtension    = 3079 // pg_extension: installed extensions
 		oidPgCollation    = 3456 // pg_collation: collations
 		oidPgCast         = 2605 // pg_cast: casts
+		oidPgAm           = 2601 // pg_am: access methods
 	)
 	switch s.ObjKind {
 	case "table", "view", "sequence", "materialized view":
@@ -15541,6 +15542,22 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgNamespace, oid, 0, s.Description)
+	case "access method":
+		// Access methods live in pg_am (classoid 2601). pg_dump's
+		// dumpAccessMethod keys the comment lookup on the AM's catalogId
+		// (tableoid=pg_am=2601) and objsubid 0, then re-emits `COMMENT ON ACCESS
+		// METHOD <name> IS '...'`. Only user-defined AMs (CREATE ACCESS METHOD)
+		// are resolvable here — the 7 built-ins are not registered in
+		// c.accessMethods, so a COMMENT ON a built-in AM is a harmless no-op
+		// (pg_dump never dumps their comments either, since it never dumps the
+		// built-ins themselves). Without this a COMMENT ON ACCESS METHOD was
+		// silently swallowed (parser dropped it) and never reached
+		// pg_description, so pg_dump could not re-emit it. DU-002 slice 434.
+		oid := im.UserAccessMethodOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgAm, oid, 0, s.Description)
 	case "server":
 		// Foreign servers live in pg_foreign_server (classoid 1417). pg_dump's
 		// dumpForeignServer keys the comment lookup on the server's catalogId

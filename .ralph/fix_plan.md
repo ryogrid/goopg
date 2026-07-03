@@ -7288,6 +7288,44 @@ documentation-only and is exempt from the design-doc requirement.)
       27.40s/94.13s); pgbench smoke = pre-commit hook. No new deferral —
       the constraint-DDL work opened across slices 430–433 has no further
       known deferrals in this ledger thread.
+- [x] **`COMMENT ON ACCESS METHOD` round-trip in pg_dump (M0110-0001,
+      DU-002 slice 434).** **COMPLETE 2026-07-04:** fresh candidate sweep
+      after the slices 430–433 constraint-DDL thread closed with "no further
+      known deferrals" — probed `COMMENT ON` object-kind coverage and found
+      `parseCommentOnTail` (`internal/parser/parser.go`) had no `"access
+      method"` branch, so `COMMENT ON ACCESS METHOD` silently discarded the
+      comment (fell into the unsupported-type default). Live-verified
+      divergent from a scratch PostgreSQL 18.3 instance first: real PG's
+      `dumpAccessMethod` (`pg_dump.c`) always emits a trailing `COMMENT ON
+      ACCESS METHOD <name> IS '...';` block when a comment exists; goopg's
+      pg_dump omitted it entirely. Fixed with the same 3-site pattern as the
+      `COMMENT ON SERVER`/`FOREIGN DATA WRAPPER` siblings: new parser branch
+      (bare schema-less name, requires `METHOD` after `ACCESS`); new
+      `catalog.InMemory.UserAccessMethodOID(name)` (mirrors
+      `ForeignServerOID`/`ForeignDataWrapperOID`/`ExtensionOID`); new
+      `execCommentOn` `case "access method"` keying `pg_description` on
+      classoid=pg_am=2601. No pg_dump-side change needed — `collectComments`'s
+      single `pg_description` query is object-kind-agnostic. Tests:
+      `TestParseCommentOnAccessMethod` +
+      `TestParseCommentOnAccessMethodMissingMethodKeyword`
+      (`internal/parser/comment_on_test.go`);
+      `TestCommentOnAccessMethodStoresDescription` +
+      `TestCommentOnUnknownAccessMethodIsNoop`
+      (`internal/executor/operators_ddl_access_method_test.go`); extended the
+      slice-426 `TestPort_PgDumpConnectionSetup` fixture with a byte-exact
+      `COMMENT ON ACCESS METHOD goopg_am IS '...';` assertion. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `COMMENT ON
+      ACCESS METHOD` round-trip in pg_dump (DU-002 slice 434)";
+      `docs/design/README.md` row `0110-0001` addendum appended. Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor` suites PASS (full, `-count=1`,
+      no regression); `TestPort_PgDumpConnectionSetup` PASS (explicit
+      `-run`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. New deferral (ledger row appended, not fixed
+      this loop): `COMMENT ON` a nonexistent object name is a silent no-op
+      across every object kind `execCommentOn` handles (not
+      access-method-specific — real PG raises `42704 does not exist`);
+      scoped out as a systemic ~20-case change, not a narrow slice.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

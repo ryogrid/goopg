@@ -145,3 +145,58 @@ func TestDropAccessMethodRemovesRow(t *testing.T) {
 		t.Errorf("ListAccessMethods=%+v want empty after DROP", got)
 	}
 }
+
+// TestCommentOnAccessMethodStoresDescription pins execCommentOn's "access
+// method" case (DU-002 slice 434): COMMENT ON ACCESS METHOD must key
+// pg_description on the AM's own pg_am OID (classoid 2601, objsubid 0) so
+// pg_dump's dumpAccessMethod re-emits the comment. Before this slice the
+// parser had no "access method" branch in parseCommentOnTail, so the
+// statement was silently discarded and never reached SetComment.
+func TestCommentOnAccessMethodStoresDescription(t *testing.T) {
+	const oidPgAm = 2601
+
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION myam_handler(internal) RETURNS index_am_handler LANGUAGE c AS 'myam_handler'`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE ACCESS METHOD myam TYPE INDEX HANDLER myam_handler`); err != nil {
+		t.Fatalf("CREATE ACCESS METHOD: %v", err)
+	}
+	if err := runDDL(t, ctx, `COMMENT ON ACCESS METHOD myam IS 'a test access method'`); err != nil {
+		t.Fatalf("COMMENT ON ACCESS METHOD: %v", err)
+	}
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	ams := im.ListAccessMethods()
+	if len(ams) != 1 {
+		t.Fatalf("ListAccessMethods len=%d want 1", len(ams))
+	}
+	desc, ok := im.GetComment(oidPgAm, ams[0].OID, 0)
+	if !ok {
+		t.Fatalf("GetComment(pg_am, %d, 0) not found", ams[0].OID)
+	}
+	if desc != "a test access method" {
+		t.Errorf("description=%q want %q", desc, "a test access method")
+	}
+}
+
+// TestCommentOnUnknownAccessMethodIsNoop pins the (pre-existing,
+// slice-434-inherited) convention shared by every COMMENT ON <top-level
+// object> case in execCommentOn: an unresolvable object name is a silent
+// no-op rather than a 42704 error. This diverges from real PostgreSQL, which
+// raises `access method "..." does not exist` (verified live against PG
+// 18.3) — flagged in the DU-002 slice 434 ledger row as a pre-existing,
+// out-of-scope gap shared by every other object kind in this function
+// (server/FDW/extension/etc.), not something newly introduced here. This
+// test pins goopg's actual (divergent) current behavior so a future fix
+// updates the test deliberately instead of it silently starting to fail.
+func TestCommentOnUnknownAccessMethodIsNoop(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `COMMENT ON ACCESS METHOD nosuchmethod IS 'x'`); err != nil {
+		t.Fatalf("COMMENT ON ACCESS METHOD (unknown name): %v", err)
+	}
+}

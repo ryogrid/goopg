@@ -5123,6 +5123,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE ACCESS METHOD goopg_am TYPE INDEX HANDLER goopg_am_handler"); err != nil {
 		t.Fatalf("create access method: %v", err)
 	}
+	// Slice 434: COMMENT ON ACCESS METHOD must round-trip, the sibling of
+	// COMMENT ON SERVER/FOREIGN DATA WRAPPER/EXTENSION. Before this slice
+	// parseCommentOnTail had no "access method" branch (COMMENT ON ACCESS
+	// METHOD fell into the unsupported-type default and was silently
+	// discarded — verified live against real pg_dump 18.3: the comment never
+	// reached pg_description, so pg_dump's dumpAccessMethod never emitted the
+	// trailing `COMMENT ON ACCESS METHOD <name> IS '...';` block real PG
+	// always does). Access methods have no schema (top-level object, like
+	// SERVER/FDW), so this mirrors the bare-name COMMENT ON SERVER shape.
+	if err := runSQLSimple(t, c, "COMMENT ON ACCESS METHOD goopg_am IS 'a goopg access method comment'"); err != nil {
+		t.Fatalf("comment on access method: %v", err)
+	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
 	// registers a pg_extension row (classoid 3079) with a stable OID. pg_dump's
@@ -11274,6 +11286,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "CREATE ACCESS METHOD btree") ||
 			strings.Contains(res.Stdout, "CREATE ACCESS METHOD heap") {
 			t.Errorf("pg_dump spuriously dumped a built-in access method (slice-426 oid-threshold filter regressed); full stdout=%q", res.Stdout)
+		}
+		// Slice 434: COMMENT ON ACCESS METHOD must round-trip. dumpAccessMethod
+		// (pg_dump.c) emits a trailing `COMMENT ON ACCESS METHOD <name> IS
+		// '...';` block right after the CREATE, sourced from collectComments'
+		// single `SELECT description, classoid, objoid, objsubid FROM
+		// pg_catalog.pg_description` query keyed on the AM's own catalogId
+		// (classoid=pg_am=2601, objsubid=0). Verified byte-identical against a
+		// live PG 18.3 `CREATE ACCESS METHOD ... HANDLER bthandler;` +
+		// `COMMENT ON ACCESS METHOD ... IS '...';` round-trip.
+		amCommentStmt := "COMMENT ON ACCESS METHOD goopg_am IS 'a goopg access method comment';"
+		if !strings.Contains(res.Stdout, amCommentStmt) {
+			t.Errorf("pg_dump dropped the COMMENT ON ACCESS METHOD round-trip (slice-434); missing %q\n  full stdout=%q", amCommentStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact

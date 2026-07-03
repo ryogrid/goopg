@@ -12542,3 +12542,118 @@ None new — this closes item (1), the last open item from slice 433's
 original deferral row. The FK/CHECK/EXCLUDE/UNIQUE/PRIMARY KEY constraint
 DDL surface opened across slices 430–433 has no further known deferrals in
 this ledger thread.
+
+## Follow-up: `COMMENT ON ACCESS METHOD` round-trip in pg_dump (DU-002 slice 434)
+
+### Problem
+
+With the constraint-DDL thread (slices 430–433) closed, this loop swept a
+fresh candidate area: `COMMENT ON <object>` coverage. goopg already handles
+`COMMENT ON` for ~20 object kinds (TABLE/COLUMN/CONSTRAINT/TRIGGER/POLICY/
+RULE/STATISTICS/VIEW/SEQUENCE/SCHEMA/MATERIALIZED VIEW/TYPE/DOMAIN/
+COLLATION/SERVER/FOREIGN DATA WRAPPER/EXTENSION/CAST/FUNCTION/INDEX), but
+`parseCommentOnTail` (`internal/parser/parser.go`) had no `"access method"`
+branch — `CREATE ACCESS METHOD` itself round-tripped through pg_dump since
+slice 426, but a `COMMENT ON ACCESS METHOD` fell into the switch's
+unsupported-type default (`return nil, false, nil`) and was silently
+discarded by the caller.
+
+Confirmed as a real divergence by live-verifying side-by-side against a
+scratch PostgreSQL 18.3 instance (`postgres/local_install`) before
+implementing: `CREATE ACCESS METHOD my_am TYPE INDEX HANDLER bthandler;` +
+`COMMENT ON ACCESS METHOD my_am IS 'a test access method';`, then
+`pg_dump --schema-only`. Real PG emits the standard trailing comment block
+(`dumpAccessMethod`, `pg_dump.c`):
+
+```
+--
+-- Name: ACCESS METHOD my_am; Type: COMMENT; Schema: -; Owner:
+--
+
+COMMENT ON ACCESS METHOD my_am IS 'a test access method';
+```
+
+goopg's pg_dump (pre-fix) executed `COMMENT ON ACCESS METHOD` as a silent
+no-op and never emitted this block — the comment vanished from the dump
+entirely.
+
+### Fix
+
+Three-site change mirroring the existing `COMMENT ON SERVER` /
+`COMMENT ON FOREIGN DATA WRAPPER` sibling pattern exactly (both are
+top-level, schema-less objects, same as an access method):
+
+1. **Parser** (`internal/parser/parser.go`, `parseCommentOnTail`): new
+   `case p.acceptIdentKeyword("access")` branch — requires a following
+   `METHOD` ident-keyword (mirrors `CREATE ACCESS METHOD`'s own
+   `parseCreateAccessMethodTail` dispatch in `internal/parser/ddl.go`),
+   then parses a bare (schema-less) object name into `ObjKind = "access
+   method"`.
+2. **Catalog** (`internal/catalog/catalog.go`): new
+   `(*InMemory) UserAccessMethodOID(name string) uint32` — looks up a
+   user-registered AM (`c.accessMethods`) by name and returns its OID, or 0
+   if unregistered (covers both "no such AM" and "name is one of the 7
+   built-ins", which are not tracked in this map). Mirrors
+   `ForeignServerOID`/`ForeignDataWrapperOID`/`ExtensionOID` exactly.
+3. **Executor** (`internal/executor/operators_ddl.go`, `execCommentOn`):
+   new `case "access method"` — resolves the OID via `UserAccessMethodOID`
+   and calls `im.SetComment(oidPgAm /* 2601 */, oid, 0, s.Description)`.
+   `pg_am`'s OID (2601) is already used elsewhere in this file/package (the
+   `pg_am` virtual-view registration in `catalog.go`); a COMMENT on one of
+   the 7 built-in AMs resolves to OID 0 and is a harmless no-op (consistent
+   with `CREATE ACCESS METHOD`'s own built-in-name collision guard, and with
+   real PG never dumping a built-in's comment either since it never dumps
+   the built-in AM itself).
+
+No pg_dump-side change was needed: `collectComments`'s single
+`SELECT description, classoid, objoid, objsubid FROM pg_catalog.pg_description`
+query (run server-side against goopg) already picks up any row regardless
+of object kind — `dumpAccessMethod`'s own `dumpComment(fout, "ACCESS
+METHOD", ...)` call was already dormant code waiting for a matching
+`pg_description` row to exist.
+
+### Tests
+
+- `internal/parser/comment_on_test.go`:
+  `TestParseCommentOnAccessMethod` (parses `ObjKind`/`ObjName` for two
+  cases, asserts schema-less) and
+  `TestParseCommentOnAccessMethodMissingMethodKeyword` (bare `ACCESS`
+  without `METHOD` is a parse error).
+- `internal/executor/operators_ddl_access_method_test.go`:
+  `TestCommentOnAccessMethodStoresDescription` (end-to-end
+  `CREATE ACCESS METHOD` + `COMMENT ON ACCESS METHOD`, asserts
+  `im.GetComment(2601, am.OID, 0)`) and
+  `TestCommentOnUnknownAccessMethodIsNoop` (pins the existing, deliberately
+  unchanged no-op-on-unknown-name behavior — see Deferred below).
+- `internal/testport/pgdump_connsetup_test.go`: extended the slice-426
+  fixture with `COMMENT ON ACCESS METHOD goopg_am IS '...'` and a new
+  byte-exact assertion for the `COMMENT ON ACCESS METHOD goopg_am IS
+  '...';` line in `pg_dump`'s output (`TestPort_PgDumpConnectionSetup`).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser` + `internal/catalog`
++ `internal/executor` suites PASS (full, `-count=1`, no regressions);
+`TestPort_PgDumpConnectionSetup` PASS (explicit `-run`); live scratch
+PostgreSQL 18.3 instance used to confirm the target rendering before
+implementing (transcript above); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`COMMENT ON` a **nonexistent** object name is a silent no-op in goopg across
+every object kind this function handles (server/FDW/extension/collation/
+cast/… and now access method) — real PostgreSQL raises a `does not exist`
+error (verified live: `COMMENT ON SERVER nonexistent_srv IS 'x'` → `ERROR:
+server "nonexistent_srv" does not exist` on PG 18.3; `COMMENT ON ACCESS
+METHOD nonexistent_am IS 'x'` → `ERROR:  access method "nonexistent_am"
+does not exist`). This is a pre-existing, uniform simplification across
+`execCommentOn`'s entire `switch s.ObjKind` — not something newly introduced
+by this slice — so fixing it only for `"access method"` would be
+inconsistent with every sibling case. Resume point: `execCommentOn`
+(`internal/executor/operators_ddl.go`) would need every `case` in the
+switch to synthesize PG's per-object-kind `42704 undefined_object` error
+message (e.g. `%s "%s" does not exist` with the PG-specific object-kind
+noun) on an unresolved OID, instead of the current uniform `return nil`.
+Scoped out of this slice deliberately (a ~20-case systemic change, not a
+narrow one); left as a discovery for a future dedicated slice.

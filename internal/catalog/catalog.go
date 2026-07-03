@@ -12479,6 +12479,21 @@ func (c *InMemory) ListAccessMethods() []*AccessMethod {
 	return out
 }
 
+// UserAccessMethodOID returns the stable OID of the named user-defined access
+// method, or 0 if no such AM is registered (including the 7 built-ins, which
+// are not tracked in this map — see AccessMethodOIDByName for those). Used by
+// COMMENT ON ACCESS METHOD to resolve the pg_am.oid to key the pg_description
+// row on, mirroring ForeignServerOID/ForeignDataWrapperOID/ExtensionOID.
+// DU-002 slice 434.
+func (c *InMemory) UserAccessMethodOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if am, ok := c.accessMethods[name]; ok {
+		return am.OID
+	}
+	return 0
+}
+
 // RegisterAccessMethodDuringRecovery is the idempotent version of
 // RegisterAccessMethod used by the WAL-replay driver
 // (internal/initdb/access_method_ddl_recovery.go). Unlike

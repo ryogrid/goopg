@@ -3056,6 +3056,23 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("access"):
+		// COMMENT ON ACCESS METHOD <name> IS '...'. Access methods live in pg_am
+		// (classoid 2601); pg_dump's dumpAccessMethod re-emits `COMMENT ON ACCESS
+		// METHOD <name> IS '...'` (dumpComment(fout, "ACCESS METHOD", qamname, ...)
+		// — pg_dump.c). "ACCESS" is unreserved and unregistered as a keyword
+		// (matched via the ident path, same as CREATE ACCESS METHOD); an access
+		// method is a top-level object (no schema), so parse a bare name.
+		// DU-002 slice 434.
+		if !p.acceptIdentKeyword("method") {
+			return nil, true, p.errAtCur("expected METHOD after ACCESS in COMMENT ON")
+		}
+		cs.ObjKind = "access method"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptIdentKeyword("server"):
 		// COMMENT ON SERVER <name> IS '...'. Foreign servers live in
 		// pg_foreign_server (classoid 1417); pg_dump's dumpForeignServer re-emits
