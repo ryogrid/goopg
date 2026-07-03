@@ -5464,8 +5464,42 @@ documentation-only and is exempt from the design-doc requirement.)
       can meaningfully be — no further individual sub-form tests are
       needed since the remaining forms are unreachable.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
-      section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
-      PG-decodable FPI/heap WAL (+ index AMs for the server tier).
+      section). **`002_save_fullpage.pl` (WD-003) DONE.** **Remaining:**
+      `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering)
+      — needs hash/gin/gist/spgist/brin AMs, unrelated to the WD-003 fix below.
+- [x] **`pg_waldump --save-fullpage` (WD-003, `002_save_fullpage.pl`).**
+      **COMPLETE 2026-07-03:** `TestPort_PgWaldump002SaveFullpage`
+      (`internal/testport/pgwaldump_savefullpage_test.go`) now PASSes (was
+      `t.Skip`ped). Root cause: `tryApplyHOTUpdate`
+      (`internal/executor/operators_storage.go` ~3300) never emitted a
+      PG-canonical FPI record on the HOT-update path — only goopg's native
+      opaque record via `markHeapHotUpdateDirty` — so an unindexed table's
+      `UPDATE` (always HOT-eligible) left `pg_waldump --save-fullpage` with
+      zero blocks to extract for any relation, regardless of the CTAS INSERT
+      records that already worked. Fixed with a new `emitCanonicalHeapHotUpdate`
+      helper reusing the existing `catalog.PgCanonicalHeapInplace`
+      (XLOG_HEAP_INPLACE), mirroring `emitCanonicalHeapInsert`/
+      `emitCanonicalHeapDelete`'s established pattern. Also fixed the test's own
+      relation-locator resolution: it read the DB component from
+      `pg_database.oid`, a documented legacy display placeholder that does not
+      match the real on-disk OID goopg's WAL/storage layer uses — switched to
+      globbing `base/<dbOid>/<relnode>`, the same workaround
+      `pgamcheck004_port_test.go`'s `findHeapFile` already uses for the
+      identical gap. Verified via a manual `goopg init`/`start`/psql/`pg_waldump`
+      round-trip: the real upstream binary extracts 200 correctly-named+ordered
+      FPI files (100 CTAS INSERT + 100 HOT UPDATE). CSV: `WD-002` split into the
+      still-deferred `001_basic.pl` server tier + new `WD-003`
+      (`port`/`pass_required=yes`). Design doc
+      `docs/design/0110-0002-pg-waldump-tap-port.md` updated; README.md
+      unaffected (no new design doc file). Gates: `go build ./...` clean;
+      `gofmt -l` clean on touched files; `go test ./internal/executor/...`
+      PASS; `TestPort_PgWaldump002SaveFullpage` PASS ×3 (no flake);
+      `go test ./internal/testport/...` /
+      `./internal/catalog/... ./internal/wal/... ./internal/initdb/...` PASS
+      (full, no regression); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Deferral ledger row appended. Still open: `001_basic.pl`
+      server tier (index AMs) and an unaudited `markHeapPruneOptDirty` HOT-class
+      check (see ledger row).
 - [ ] **M0119-0006 — pg_amcheck server tier** (source: M0110-0003; see M0110
       ledger rows). `002_nonesuch` … `005_opclass_damage`; `CREATE EXTENSION
       amcheck` + `verify_heapam()` SRF on top of `internal/amcheck` + opclass

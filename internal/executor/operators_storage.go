@@ -3300,6 +3300,9 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
+	if derr == nil {
+		derr = emitCanonicalHeapHotUpdate(ctx, rel, blk, newSlot)
+	}
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
 		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
 		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
@@ -7883,6 +7886,35 @@ func emitCanonicalHeapInsert(ctx *Context, rel storage.RelFileNode, ptr storage.
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
+	return emitErr
+}
+
+// emitCanonicalHeapHotUpdate emits a PG-canonical XLOG_HEAP_INPLACE record
+// with a full-page image for the page at (rel, blk), after a HOT update has
+// stamped the old tuple's xmax and inserted the new tuple in place on the
+// same page (tryApplyHOTUpdate, after markHeapHotUpdateDirty). Only called
+// when ctx.LogCanonical is non-nil. A vanilla PG18 standby (or
+// pg_waldump --save-fullpage) restores the whole page from this FPI rather
+// than re-deriving the HOT chain link — mirrors PgCanonicalHeapInplace's use
+// for the datfrozenxid in-place update (M0117-0008 Part B).
+func emitCanonicalHeapHotUpdate(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, newSlot uint16) error {
+	if ctx.LogCanonical == nil || ctx.Pool == nil {
+		return nil
+	}
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return fmt.Errorf("canonical WAL pin hot update: %w", err)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	s.Lock()
+	copy(page, s.Page())
+	endLSN, emitErr := catalog.PgCanonicalHeapInplace(rel, blk, page, newSlot, uint32(ctx.Tx.XID), ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
+		ctx.Pool.MarkDirty(s)
+	}
+	s.Unlock()
+	ctx.Pool.Unpin(s)
 	return emitErr
 }
 

@@ -119,3 +119,59 @@ previously-hidden facts:
 Resume: emit `xl_prev` 0-based on disk in `internal/wal` (encode + decode
 siblings, re-verify M0102 replication + recovery E2E + re-init), then un-skip
 `TestPort_PgWaldump002SaveFullpage` and repair `W-001`.
+
+## 2026-07-03: `TestPort_PgWaldump002SaveFullpage` un-skipped (WD-003)
+
+The `xl_prev` blocker above was resolved in an earlier loop (`prevRecPtr`
+seeding fix, `internal/wal/writer.go`). Re-running the test after that fix
+still found zero extracted full-page images, for two reasons investigated and
+fixed this loop:
+
+1. **The HOT-update path never emitted a PG-canonical FPI.** goopg's canonical
+   (PG-decodable) WAL emission — `catalog.PgCanonicalHeapInsert`/
+   `PgCanonicalHeapDelete`, wired via `ctx.LogCanonical` — was already called
+   from every insert/delete site (`internal/executor/operators_storage.go`),
+   proven working for the test's `CREATE TABLE ... AS SELECT` (100 canonical
+   `INSERT` FPIs, confirmed against real `pg_waldump` output). But
+   `tryApplyHOTUpdate` (~line 3300) only called `markHeapHotUpdateDirty`,
+   goopg's *native* opaque WAL record — no canonical sibling. Since
+   `test_table` has no index, the test's `UPDATE test_table SET a = a + 1`
+   always takes the HOT path (same-page tuple rewrite, no index maintenance),
+   so every one of its 100 row updates was invisible to `pg_waldump`. Fixed
+   with a new `emitCanonicalHeapHotUpdate` (`operators_storage.go`, next to
+   `emitCanonicalHeapInsert`/`emitCanonicalHeapDelete`) that re-pins the page
+   after the HOT stamp+insert and calls the existing
+   `catalog.PgCanonicalHeapInplace` (XLOG_HEAP_INPLACE) — already used
+   elsewhere for the `datfrozenxid` runtime write (M0117-0008 Part B). A HOT
+   update rewrites the whole page in place (xmax stamp + new tuple, same
+   block), so "restore the whole page from an FPI" is exactly the right
+   semantics; no new canonical record type was needed.
+2. **The test's own relation-locator resolution was wrong.** It read the DB
+   component of `TBLSPC/DB/RELNODE` from `SELECT oid FROM pg_database WHERE
+   datname = current_database()`, but `pg_database.oid` is a documented
+   legacy display placeholder (`"16384"`, the `FirstNormalObjectId` constant —
+   see `catalog.go`'s `pgDatabase.VirtualRows` comment: changing it to the real
+   value once broke pg_dump's subscription round-trip) for every non-template
+   database. The value goopg's WAL/storage layer actually writes into block
+   references (`detectCatalogDBOID`'s scan of the physical `global/1262` heap
+   at startup) is only observable on disk as the `base/<dbOid>/` directory
+   name. `pgamcheck004_port_test.go` had already hit and worked around the
+   identical gap (`findHeapFile`); this test now globs
+   `base/*/<relnode>` the same way instead of trusting the SQL column.
+
+Verified independently of the Go test: a manual `goopg init`/`start`, `psql`
+`CREATE TABLE ... AS SELECT`/`CHECKPOINT`/`UPDATE`, `stop`, then the real
+`postgres/local_install/bin/pg_waldump --save-fullpage --relation <locator>`
+round-trip extracts 200 correctly-named, correctly-LSN-ordered full-page-image
+files (100 `INSERT` + 100 `INPLACE`).
+
+**CSV**: `WD-002` narrowed to just the still-deferred `001_basic.pl`
+server-dependent tier (hash/gin/gist/spgist/brin AMs, unrelated to this fix).
+New row `WD-003` = `port` / `pass_required=yes` for `002_save_fullpage.pl`.
+
+**Not investigated this loop** (see deferral ledger): whether
+`markHeapPruneOptDirty` (`operators_storage.go` ~2714, opportunistic page
+pruning) has the same "HOT-class path skips canonical FPI" gap. Pruning
+reclaims dead space without changing live tuple data, so it may not matter for
+crash/standby correctness the way the HOT-update gap did, but it was flagged
+and not checked.
