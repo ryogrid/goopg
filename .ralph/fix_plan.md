@@ -283,6 +283,48 @@ prev-link fixes.
       `lo_open`/...; no `pg_largeobject` heap storage or SQL-level API at
       all). Resume for `002-010` proper remains the next catalog-getter gap
       surfaced by `TestPort_PgDumpConnectionSetup`.
+      **2026-07-04 (loop #99, DU-002 slice 439): `ALTER SEQUENCE ... RENAME
+      TO / OWNER TO / SET SCHEMA` were unparseable — all three now succeed.**
+      `TestPort_PgDumpConnectionSetup` again came up fully green through
+      slice 438 with no predicted next blocker, so this loop delegated a
+      live-probing pass (goopg vs. a scratch real PostgreSQL 18.3 instance)
+      to find the next SQL surface gap. `internal/parser/ddl.go`'s `ALTER
+      SEQUENCE` branch only parsed `SeqOptList` options — no case for these
+      three grammar-distinct forms — so the leftover token surfaced as a
+      bare syntax error. Fixed by detecting them before the option loop and
+      returning an `*AlterTableStmt` directly (a sequence is just a relation,
+      and real PG backs all three with the same generic `RenameRelation`/
+      `AlterTableOwner`/`AlterTableNamespace` commands ALTER TABLE already
+      uses), reusing `execAlterTable` — the same pattern the pre-existing
+      `ALTER INDEX ... RENAME TO` case already uses. Extended
+      `execAlterTable`'s `SET SCHEMA` branch with the same `tbl.IsSequence`
+      → `RenameSequence` registry cascade the `RENAME` case already had (a
+      real bug: bare `tbl.Schema` write left the schema-qualified
+      `seqRegistry` key stale). Also fixed a command-tag fidelity gap this
+      exposed live: `AlterTableStmt` gained `TagOverride` so these three tag
+      `"ALTER SEQUENCE"` (matching real PG), not the blanket `"ALTER TABLE"`
+      `ddlTag` previously returned for every `AlterTableStmt` — direct
+      sibling of the M0119-0004 (loop #77) tag-fidelity effort. Tests:
+      `TestAlterSequenceRenameTo`/`OwnerTo`/`OwnerToCurrentUser`/`SetSchema`/
+      `RenameOwnerSchemaNotCombinedWithOptions`
+      (`internal/executor/operators_alter_sequence_relation_ops_test.go`);
+      3 new cases in `TestDDLCommandTagMatchesPostgres`
+      (`internal/server/ddl_command_tag_test.go`). Design doc "Follow-up:
+      `ALTER SEQUENCE ... RENAME TO / OWNER TO / SET SCHEMA` were
+      unparseable (DU-002 slice 439)". Gates: build/vet clean;
+      `internal/parser`+`internal/executor`+`internal/server` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook; live `goopg`/`psql`
+      smoke (rename→nextval→owner→set schema→nextval) cross-checked
+      tag-for-tag against real PostgreSQL 18.3. Deferred (ledger row
+      appended): (1) `ALTER INDEX`/`ALTER VIEW`/`ALTER MATERIALIZED VIEW`
+      forms that reuse `AlterTableStmt` the same way likely have the
+      identical pre-existing tag-mistagging bug — not audited or fixed here,
+      only the three new ALTER SEQUENCE sites. (2) `execAlterTable`'s `OWNER
+      TO` branch (shared by `ALTER TABLE`/`ALTER SCHEMA`/now `ALTER
+      SEQUENCE`) never validates the target role exists. Resume for
+      `002-010` proper remains the next catalog-getter gap surfaced by
+      `TestPort_PgDumpConnectionSetup`.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

@@ -13014,3 +13014,118 @@ assigning a new object's initial ACL. (2) large objects (`lo_create`/
 `lo_open`/`lo_import`/...) — entirely unimplemented; `pg_largeobject_metadata`
 stays empty by construction (slice 29). Both are new discoveries from this
 loop's probe, not previously recorded.
+
+## Follow-up: `ALTER SEQUENCE ... RENAME TO / OWNER TO / SET SCHEMA` were unparseable (DU-002 slice 439)
+
+### Problem
+
+`TestPort_PgDumpConnectionSetup` again came up fully green against every
+fixture through slice 438 with no predicted next blocker, so this loop
+delegated a live-probing pass (goopg vs. a scratch real PostgreSQL 18.3
+instance under `postgres/local_install`) to find the next untested SQL
+surface. It found:
+
+```sql
+CREATE SEQUENCE seqx;
+ALTER SEQUENCE seqx RENAME TO seqy;    -- goopg: syntax error (got "rename")
+ALTER SEQUENCE seqx OWNER TO postgres; -- goopg: syntax error (got "owner")
+ALTER SEQUENCE seqx SET SCHEMA sch1;   -- goopg: syntax error (got "schema")
+```
+
+All three succeed in real PostgreSQL 18.3 (verified live). `internal/parser/
+ddl.go`'s `ALTER SEQUENCE` branch parsed only the `SeqOptList` options
+(`INCREMENT`, `MINVALUE`, ..., `OWNED BY`) — `gram.y`'s three sibling
+productions (`RenameStmt`, `AlterOwnerStmt`, `AlterObjectSchemaStmt`, all of
+which also cover a sequence via `OBJECT_SEQUENCE`) had no case at all, so the
+leftover `RENAME`/`OWNER`/`SET SCHEMA` tokens fell through the option loop's
+`default: return stmt, nil` and surfaced as a bare syntax error at the
+top-level statement parser.
+
+### Fix
+
+A sequence is just an ordinary relation (`pg_class.relkind = 'S'`) — real
+PostgreSQL backs `ALTER SEQUENCE ... RENAME/OWNER TO/SET SCHEMA` with the
+exact same generic relation commands ALTER TABLE uses (`RenameRelation`,
+`AlterTableOwner`, `AlterTableNamespace`, `postgres/src/backend/commands/
+tablecmds.c`). goopg already has this generic path fully working for
+tables/indexes (`AlterTableStmt` / `execAlterTable`), including — since the
+existing `ALTER INDEX ... RENAME TO` case reuses it the same way — a
+`tbl.IsSequence` cascade into the sequence registry for RENAME (an implicit
+SERIAL-column sequence has no catalog entry at all and is renamed directly
+via `RenameSequence`; an explicit `CREATE SEQUENCE`-registered one has both a
+catalog `Table` row and a `seqRegistry` entry that must move together).
+
+So rather than growing `AlterSequenceStmt` a third time, the `ALTER SEQUENCE`
+parser branch (`internal/parser/ddl.go`, right after the name is parsed, before
+the `SeqOptList` loop — these are mutually-exclusive top-level forms, not
+combinable with the loop like real PG's grammar) now detects these three
+forms and returns an `*AlterTableStmt` directly, reusing `execAlterTable`
+unchanged for the RENAME and OWNER TO cases. The one genuinely new gap this
+exposed: `execAlterTable`'s `SET SCHEMA` branch only updated `tbl.Schema`,
+with no `tbl.IsSequence` cascade into the registry (unlike the RENAME case,
+which already had one) — a real bug, since `seqRegistry`'s key is
+schema-qualified, so `nextval('newschema.seq')` would fail to resolve after a
+bare `tbl.Schema` write. Added the same `RenameSequence(oldFull, newFull)`
+cascade (with WAL retire/re-log and `VirtualRows` closure regeneration) the
+RENAME case already has.
+
+**Command-tag fidelity, caught by live-verifying against real PG before
+declaring this done:** reusing `AlterTableStmt` for these three ALTER
+SEQUENCE forms meant `dispatch.go`'s `ddlTag` — which switches on Go type, not
+PostgreSQL object kind — returned the blanket `"ALTER TABLE"` `CommandComplete`
+tag for all three, but real PG tags them `"ALTER SEQUENCE"` (`CreateCommandTag`
+keys off the parse node's declared object type, `OBJECT_SEQUENCE`, not the
+relation's underlying kind). `AlterTableStmt` gained a `TagOverride string`
+field (empty = the existing `"ALTER TABLE"` default); the three new
+construction sites set it to `"ALTER SEQUENCE"`; `ddlTag`'s
+`*parser.AlterTableStmt` case returns it when non-empty. This is the direct
+sibling of the M0119-0004 (loop #77) DDL-tag-fidelity effort — that loop's
+static sweep covered every `CompatNoopStmt`/`DropCompatStmt` literal but did
+not anticipate a *different* relkind's grammar reusing `AlterTableStmt`
+itself, so it did not catch this instance. (`ALTER INDEX ... RENAME TO`
+already reused `AlterTableStmt` the same way before this loop and has the
+same latent mistagging — noted but not fixed here, see Deferred below, since
+it is pre-existing and not part of this loop's own new divergence.)
+
+### Tests
+
+`TestAlterSequenceRenameTo` / `TestAlterSequenceOwnerTo` /
+`TestAlterSequenceOwnerToCurrentUser` / `TestAlterSequenceSetSchema` /
+`TestAlterSequenceRenameOwnerSchemaNotCombinedWithOptions`
+(`internal/executor/operators_alter_sequence_relation_ops_test.go`) — full
+parse→plan→exec round-trips asserting the catalog `Table` and `seqRegistry`
+entry both move, `nextval()` resolves under the new name/schema, and the old
+name/schema no longer resolves; the last case confirms a plain
+options-only `ALTER SEQUENCE` (including the pre-existing `SET UNLOGGED`
+no-op form, which shares the "set" token with the new SET SCHEMA check) is
+unaffected. `TestDDLCommandTagMatchesPostgres`
+(`internal/server/ddl_command_tag_test.go`) gained three cases pinning the
+`"ALTER SEQUENCE"` tag. Live-verified end-to-end against `goopg`/`psql`
+(rename → nextval → owner → set schema → nextval under the new schema) and
+cross-checked tag-for-tag against a scratch real PostgreSQL 18.3 instance.
+
+### Gates
+
+`go build ./...` clean; `go vet ./...` clean; `internal/parser`+
+`internal/executor`+`internal/server` suites PASS (full, no regressions);
+`TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke = pre-commit hook; live `goopg`/`psql` smoke
+(rename/owner/set-schema chain) cross-checked against real PostgreSQL 18.3.
+
+### Deferred (ledger row appended)
+
+(1) `ALTER INDEX ... RENAME TO` (pre-existing, not introduced this loop) has
+the same `AlterTableStmt`-reuse mistagging this loop fixed for sequences —
+still emits `"ALTER TABLE"` instead of PG's `"ALTER INDEX"`; likewise `ALTER
+VIEW`/`ALTER MATERIALIZED VIEW ... SET SCHEMA` (also `AlterTableStmt`-reuse
+sites) probably mistag the same way. Out of scope for this loop's bounded
+fix (would need auditing every `AlterTableStmt` construction site across
+non-table relkinds, not just the three new ALTER SEQUENCE ones). (2) `ALTER
+SEQUENCE ... OWNER TO <role>` (and, pre-existing, the same `execAlterTable`
+branch for `ALTER TABLE`/`ALTER SCHEMA`/...) accepts any role name without
+validating it exists — real PostgreSQL's `AlterTableOwner`
+(`postgres/src/backend/commands/tablecmds.c`) raises `role "..." does not
+exist` via `get_rolespec_oid`. goopg has no role-existence check anywhere in
+this shared branch. A probe-only candidate the earlier slice-438 loop also
+ruled out as "too large to scope as one bounded slice" (spans every OWNER TO
+site, not just sequences).

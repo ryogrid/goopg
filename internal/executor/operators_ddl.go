@@ -6472,7 +6472,45 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 		}
+		oldSchema, oldBare := tbl.Schema, tbl.Name
 		tbl.Schema = s.SetSchema
+		if tbl.IsSequence {
+			// Mirror the AlterTableRenameTable cascade below: the sequence
+			// registry key is schema-qualified, so a bare tbl.Schema update
+			// alone would leave nextval()/etc. resolving the OLD schema
+			// name. DU-002 slice 439 (ALTER SEQUENCE ... SET SCHEMA).
+			qualName := func(schema, name string) string {
+				if schema == "" {
+					return name
+				}
+				return schema + "." + name
+			}
+			oldFull := qualName(oldSchema, oldBare)
+			newFull := qualName(s.SetSchema, oldBare)
+			if RenameSequence(oldFull, newFull) || RenameSequence(oldBare, newFull) {
+				if o.ctx.WAL != nil {
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldBare))))
+				}
+				WALLogSequenceState(o.ctx, newFull)
+				capturedNewFull := newFull
+				tbl.VirtualRows = func() [][]string {
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					if !ok2 {
+						return nil
+					}
+					calledStr := "f"
+					if called {
+						calledStr = "t"
+					}
+					return [][]string{{
+						fmt.Sprintf("%d", lv),
+						fmt.Sprintf("%d", lc),
+						calledStr,
+					}}
+				}
+			}
+		}
 		return nil
 	}
 	// Handle ENABLE/DISABLE TRIGGER — a semantic no-op in v0, but it takes a

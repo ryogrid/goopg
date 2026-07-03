@@ -41,6 +41,15 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		{"drop user", `DROP USER my_user`, "DROP ROLE"},
 		{"drop group", `DROP GROUP my_group`, "DROP ROLE"},
 		{"drop text search parser", `DROP TEXT SEARCH PARSER my_parser`, "DROP TEXT SEARCH PARSER"},
+		// DU-002 slice 439: ALTER SEQUENCE RENAME TO/OWNER TO/SET SCHEMA reuse
+		// AlterTableStmt (a sequence is just a relation, mirroring PG's own
+		// RenameRelation/AlterTableOwner/AlterTableNamespace), which would
+		// otherwise tag as the generic "ALTER TABLE" via ddlTag's blanket
+		// case — TagOverride corrects it to match PG's CreateCommandTag,
+		// which tags by the statement's declared object type (OBJECT_SEQUENCE).
+		{"alter sequence rename to", `ALTER SEQUENCE my_seq RENAME TO my_seq2`, "ALTER SEQUENCE"},
+		{"alter sequence owner to", `ALTER SEQUENCE my_seq OWNER TO CURRENT_USER`, "ALTER SEQUENCE"},
+		{"alter sequence set schema", `ALTER SEQUENCE my_seq SET SCHEMA my_schema`, "ALTER SEQUENCE"},
 	}
 
 	for _, tc := range cases {

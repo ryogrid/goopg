@@ -6217,6 +6217,59 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Name = name
+		// ALTER SEQUENCE name RENAME TO / OWNER TO / SET SCHEMA — distinct
+		// top-level forms in PG's grammar (RenameStmt / AlterOwnerStmt /
+		// AlterObjectSchemaStmt), not combinable with the SeqOptList options
+		// parsed below, so detect and short-circuit before that loop. All
+		// three reuse the generic relation executor (execAlterTable) via
+		// AlterTableStmt — a sequence is just a relation (relkind='S') and
+		// execAlterTable's AlterTableRenameTable case already cascades into
+		// the sequence registry (tbl.IsSequence). Previously these three
+		// forms had no case at all here, so the leftover RENAME/OWNER/SET
+		// token surfaced as a bare syntax error. DU-002 slice 439.
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			renameStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: stmt.IfExists, TagOverride: "ALTER SEQUENCE"}
+			renameStmt.Actions = append(renameStmt.Actions, AlterTableAction{
+				pos:     newNameTok.Pos,
+				Kind:    AlterTableRenameTable,
+				NewName: identText(newNameTok),
+			})
+			return renameStmt, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: stmt.IfExists, TagOverride: "ALTER SEQUENCE"}
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+			// bootstrap superuser in goopg (mirrors ALTER TABLE OWNER TO).
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.OwnerTo = ""
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.OwnerTo = identText(tok)
+			}
+			if ownerStmt.OwnerTo == "" {
+				ownerStmt.OwnerTo = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			return &AlterTableStmt{pos: t.Pos, Name: name, IfExists: stmt.IfExists, SetSchema: identText(schemaTok), TagOverride: "ALTER SEQUENCE"}, nil
+		}
 		// Parse sequence options — same switch pattern as CREATE SEQUENCE.
 		for {
 			switch {

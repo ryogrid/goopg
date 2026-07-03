@@ -2357,7 +2357,7 @@ func transactionTag(v planner.TransactionVerb) string {
 }
 
 func ddlTag(stmt parser.Stmt) string {
-	switch stmt.(type) {
+	switch v := stmt.(type) {
 	case *parser.CreateTableStmt:
 		return "CREATE TABLE"
 	case *parser.CreateIndexStmt:
@@ -2373,6 +2373,9 @@ func ddlTag(stmt parser.Stmt) string {
 	case *parser.TruncateStmt:
 		return "TRUNCATE TABLE"
 	case *parser.AlterTableStmt:
+		if v.TagOverride != "" {
+			return v.TagOverride
+		}
 		return "ALTER TABLE"
 	case *parser.CreateTypeStmt:
 		return "CREATE TYPE"

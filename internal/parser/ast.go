@@ -2975,6 +2975,15 @@ type AlterTableStmt struct {
 	// whether a SET ROLE session owns the relation. M0118-0008 (vacuum-conflict /
 	// cluster-conflict).
 	OwnerTo string
+	// TagOverride overrides the default "ALTER TABLE" CommandComplete tag
+	// (dispatch.go's ddlTag) when this AlterTableStmt was built by a
+	// different relkind's grammar reusing the same generic executor path
+	// (e.g. ALTER SEQUENCE ... RENAME TO/OWNER TO/SET SCHEMA — a sequence is
+	// just a relation, so real PostgreSQL's RenameRelation/AlterTableOwner/
+	// AlterTableNamespace back it identically, but CreateCommandTag still
+	// tags by the statement's declared object type). Empty means "ALTER
+	// TABLE". DU-002 slice 439.
+	TagOverride string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }
