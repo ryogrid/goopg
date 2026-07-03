@@ -319,6 +319,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		if ns, ok := stmt.(*CompatNoopStmt); ok {
+			ns.Tag = "CREATE OPERATOR"
 			ns.ObjType = "operator"
 			ns.ObjName = ObjectName{Name: opName.Name, Schema: opName.Schema}
 			ns.ArgTypes = []string{leftArg, rightArg}
@@ -367,6 +368,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, err
 		}
 		if ns, ok := stmt.(*CompatNoopStmt); ok && tsType != "" {
+			ns.Tag = "CREATE " + strings.ToUpper(tsType)
 			ns.ObjType = tsType
 			ns.ObjName = tsName
 		}
@@ -424,7 +426,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			}
 			p.advance()
 		}
-		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "server", ObjName: name}
+		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SERVER", ObjType: "server", ObjName: name}
 		if fdwName.Name != "" {
 			ns.TableName = fdwName // reuse TableName field to store FDW association
 		}
@@ -442,7 +444,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			return nil, p.errAtCur("expected MAPPING after CREATE USER")
 		}
 		userName, srvName, umOptions := p.scanUserMappingForServer()
-		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "user mapping", ObjName: ObjectName{Name: userName}}
+		ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE USER MAPPING", ObjType: "user mapping", ObjName: ObjectName{Name: userName}}
 		ns.TableName = ObjectName{Name: srvName} // reuse TableName for the server association
 		ns.Options = umOptions
 		return ns, nil
@@ -478,7 +480,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 				}
 				p.advance()
 			}
-			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE", ObjType: "foreign-data wrapper", ObjName: name}
+			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name}
 			ns.Options = options
 			return ns, nil
 		}
@@ -1293,6 +1295,7 @@ func (p *parser) parseCreateOpFamilyTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	if ns, ok := stmt.(*CompatNoopStmt); ok {
+		ns.Tag = "CREATE OPERATOR FAMILY"
 		ns.ObjType = "operator family"
 		ns.ObjName = name
 		ns.OpFamilyMethod = method
@@ -1986,6 +1989,7 @@ func (p *parser) parseCreateConversionTail(pos int, isDefault bool) (Stmt, error
 		return nil, err
 	}
 	if ns, ok := stmt.(*CompatNoopStmt); ok {
+		ns.Tag = "CREATE CONVERSION"
 		ns.ObjType = "conversion"
 		ns.ObjName = convName
 		ns.ConvForEncoding = forEnc.Value
@@ -6956,7 +6960,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
 	}
 	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
 	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply

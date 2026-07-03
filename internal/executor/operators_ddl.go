@@ -14343,7 +14343,7 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	// (applyFDWOptionChanges), rather than the flat replace
 	// RegisterForeignDataWrapper performs for CREATE. Unlike CREATE, the
 	// target FDW must already exist. DU-002 slice 421.
-	if s.Tag == "ALTER" && s.ObjType == "foreign-data wrapper" {
+	if s.Tag == "ALTER FOREIGN DATA WRAPPER" && s.ObjType == "foreign-data wrapper" {
 		fdwName := s.ObjName.String()
 		fdw, found := im.LookupForeignDataWrapper(fdwName)
 		if !found {

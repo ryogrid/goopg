@@ -6682,6 +6682,44 @@ documentation-only and is exempt from the design-doc requirement.)
       user-defined) — a separate, larger task; fresh deferral-ledger row
       appended. Still open: sub-items (a) options discarded, (d) only 7
       curated subtypes resolve a default opclass.
+- [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
+      **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
+      "cosmetic only, not investigated further this loop" deferral for
+      `CREATE OPERATOR FAMILY`'s bare `CREATE` tag, generalized to the full
+      class of the same bug found by static review of every
+      `CompatNoopStmt`/`DropCompatStmt` literal in `internal/parser/ddl.go`.
+      `ddlTag` (`internal/server/dispatch.go`) had no case for
+      `*parser.CreateOpClassStmt`/`*parser.DropCompatStmt` (fell to `"OK"`);
+      `parseSkipToSemicolon`'s shared fallback hardcoded `Tag: "CREATE"` and
+      fed `CREATE OPERATOR`, `CREATE OPERATOR FAMILY`,
+      `CREATE [DEFAULT] CONVERSION`, and all four `CREATE TEXT SEARCH *`
+      forms without any caller overriding it; `CREATE SERVER`/
+      `CREATE USER MAPPING`/`CREATE FOREIGN DATA WRAPPER` hardcoded bare
+      `"CREATE"`; `ALTER FOREIGN DATA WRAPPER ... OPTIONS (...)` hardcoded
+      bare `"ALTER"` (pinned wrong by a pre-existing test). Fixed by setting
+      the real PG tag (`postgres/src/include/tcop/cmdtaglist.h`) at each
+      site, a new `ddlTag` case for `CreateOpClassStmt`
+      (`"CREATE OPERATOR CLASS"`), and a new `dropCompatTags` map covering
+      all 25 `DropCompatStmt.ObjType` values (`group`/`role`/`user` →
+      `"DROP ROLE"`, matching PG's `T_DropRoleStmt`-keyed `CreateCommandTag`
+      in `utility.c`, which ignores the surface DROP keyword). Both
+      simple-query and extended-protocol paths share `commandTagFor`/
+      `ddlTag` — one chokepoint fix. Does NOT affect `pg_dump` output text
+      (pg_dump never reads `CommandComplete` tags), a separate
+      wire-protocol-fidelity axis from the DU-002 dump-text-parity slices.
+      Tests: new `internal/server/ddl_command_tag_test.go`
+      `TestDDLCommandTagMatchesPostgres` (20 cases); corrected
+      `internal/parser/ddl_test.go`'s `TestParseAlterForeignDataWrapperOptions`
+      (previously asserted the bug). Gates: `go build ./...`/`go vet ./...`
+      clean; `internal/parser`+`internal/server`+`internal/executor`+
+      `internal/catalog`+`internal/wal`+`internal/initdb` suites PASS (no
+      regression); `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      Design `docs/design/0119-0004-ddl-command-tag-fidelity.md`;
+      `docs/design/README.md` row `0119-0004co` added. Deferral ledger
+      row appended (`resolved` — no residual). No new deferral: this closes
+      the full class of bare/incorrect tags findable by static review; a
+      future DDL form added via the same stub pattern must set its own tag.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
