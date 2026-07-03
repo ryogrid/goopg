@@ -110,6 +110,48 @@ func TestCreateOperatorSelfNegatorRejected(t *testing.T) {
 	}
 }
 
+// TestDropOperatorSurvivesAcrossRestart mirrors what a restart looks like
+// from DROP OPERATOR's point of view: the operator is present ONLY in the
+// dedicated catalog.UserOperator registry (as RegisterUserOperatorDuringRecovery
+// leaves it after WAL replay — see internal/initdb/operator_ddl_recovery_test.go),
+// with no corresponding compatObjects["operator"] entry (that ephemeral
+// registry is never repopulated by recovery). Loop #66 fix: DROP OPERATOR's
+// existence check must key off LookupUserOperator (restart-durable since
+// loop #65), not off the compat registry alone — the prior compat-registry-only
+// gate spuriously raised 42883 for ANY operator surviving a restart (first
+// noticed with the symbol "=#=" and misdiagnosed as a lexer quirk; reproduces
+// identically for a plain symbol like "~~~", see deferral ledger).
+func TestDropOperatorSurvivesAcrossRestart(t *testing.T) {
+	ctx := NewContext()
+	ctx.Catalog = catalog.NewInMemory()
+	im := ctx.Catalog.(*catalog.InMemory)
+
+	im.RegisterUserOperatorDuringRecovery(&catalog.UserOperator{
+		OID: 40950, Name: "~~~", LeftType: "int4", RightType: "int4", FuncOID: 40951, Owner: 10,
+	}, "public")
+
+	if _, ok := im.LookupUserOperator("public", "~~~", "int4", "int4"); !ok {
+		t.Fatal("setup: operator not registered via recovery path")
+	}
+
+	if err := runDDL(t, ctx, `DROP OPERATOR public.~~~ (int4, int4)`); err != nil {
+		t.Fatalf("DROP OPERATOR on a recovery-only-registered operator: %v", err)
+	}
+
+	if _, ok := im.LookupUserOperator("public", "~~~", "int4", "int4"); ok {
+		t.Error("operator still present after DROP OPERATOR")
+	}
+
+	// A genuinely unknown operator must still 42883.
+	err := runDDL(t, ctx, `DROP OPERATOR public.~~~ (int4, int4)`)
+	if err == nil {
+		t.Fatal("expected 42883 on re-drop of an already-dropped operator, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("error = %v, want 'does not exist'", err)
+	}
+}
+
 // TestCreateOperatorUnaryAndValidation exercises the unary (prefix) operator
 // form (LEFTARG omitted, RIGHTARG required) and OperatorValidateParams-style
 // attribute checks (operatorcmds.c): COMMUTATOR requires a binary operator;

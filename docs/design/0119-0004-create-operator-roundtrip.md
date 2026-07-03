@@ -2954,6 +2954,64 @@ cycle, asserts every field including cross-reference OIDs and
 (CREATE then DROP replay cancels out), plus the missing-WAL-dir/nil-catalog
 guard tests mirroring the range-type recovery suite.
 
+## Loop #66 — `DROP OPERATOR` post-restart 42883 fix (closes the loop #65 "new discovery")
+
+The loop #65 row above misdiagnosed its own live-verification finding as a
+"`DROP OPERATOR` lexer/parser quirk mis-tokenizing an `=...=`-shaped
+operator symbol." Re-investigating from scratch (a parser-level probe test
+proved `=#=` tokenizes and parses identically for both `CREATE OPERATOR` and
+`DROP OPERATOR` — same `Name`, same `ArgTypes`) and then reproducing live
+against a real restart cycle showed the true trigger is **any** operator
+symbol, plain or exotic (`~~~` reproduces identically), and only **after a
+restart**. The loop #65 verification session happened to test `~~~`'s CREATE
++ DROP back-to-back in the same live session (before that session's own
+restart), while `=#=`'s DROP was tested only after the restart — timing, not
+the symbol's characters, is what differed.
+
+### Root cause
+
+`execDropCompat`'s `"operator"` case (`internal/executor/operators_ddl.go`)
+gated existence purely on the ephemeral `catalog.InMemory.compatObjects`
+registry (`im.DropCompatObject("operator", key)`) — a plain in-memory map
+populated only by a live `CREATE OPERATOR` statement's `RegisterCompatObject`
+call, with **no WAL record and no recovery replay** of its own. Loop #65 made
+the *dedicated* `userOperators` registry restart-durable
+(`RegisterUserOperatorDuringRecovery`), but never revisited this older gate,
+which still fires first and returns 42883 before ever consulting
+`userOperators` when the compat-registry entry is missing — exactly the
+post-restart state.
+
+### Fix
+
+Swapped the gating check in `execDropCompat`'s `"operator"` case from
+`im.DropCompatObject(...)` to `im.LookupUserOperator(schema, opName,
+leftType, rightType)` — the restart-durable registry is now the sole source
+of truth for existence. The compat-registry entry is still cleared as
+best-effort bookkeeping (a no-op, not an error, when absent post-restart) to
+avoid an unbounded leak in the ephemeral map across a long-running session
+that never restarts.
+
+### Live PG-compatible verification
+
+Manual server (throwaway data dir, real `psql`, PID-file lifecycle):
+`CREATE OPERATOR public.=#= (...COMMUTATOR = public.=#=, MERGES, HASHES)`,
+full restart, `DROP OPERATOR public.=#= (int4, int4)` now succeeds (`pg_operator`
+row gone) where it previously raised 42883; repeated for `public.~~~` with the
+same outcome. A second restart after the DROP confirms the drop itself stays
+durable (0 rows both times). Also re-verified the surrounding cases still
+behave correctly post-fix: a fresh (never-restarted) `CREATE`+`DROP` pair,
+`DROP OPERATOR IF EXISTS` on an already-dropped operator (notice, no error),
+and `DROP OPERATOR` on a truly nonexistent operator (still 42883).
+
+### Tests
+
+`internal/executor/create_operator_test.go`:
+`TestDropOperatorSurvivesAcrossRestart` — registers an operator via
+`RegisterUserOperatorDuringRecovery` only (bypassing the live-CREATE compat
+registry entirely, i.e. simulating exactly the post-restart state) and
+asserts `DROP OPERATOR` succeeds, the registry entry is gone afterward, and a
+second DROP on the same (now-removed) operator still 42883s.
+
 ### Gates
 
 `go build ./...`/`go vet ./...` clean; `internal/wal`+`internal/catalog`+

@@ -13681,27 +13681,33 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			o.ctx.AddNotice(fmt.Sprintf("operator %s does not exist, skipping", opName))
 			return nil
 		}
-		// Check compat registry: if the operator was registered via CREATE OPERATOR (noop), succeed silently.
+		// Existence check: the dedicated operator registry (catalog.UserOperator)
+		// is the restart-durable source of truth as of loop #65's CREATE/DROP
+		// OPERATOR WAL persistence — unlike the ephemeral compatObjects registry
+		// below, RegisterUserOperatorDuringRecovery repopulates it on replay.
+		// Gating existence on compatObjects alone (the pre-loop-66 behavior)
+		// meant a `DROP OPERATOR` on any user operator surviving a restart
+		// spuriously failed with 42883 even though pg_operator still listed it
+		// (looked like a "=...=-shaped symbol" lexer quirk when first noticed —
+		// it reproduces for any operator symbol, e.g. `~~~`, once persisted
+		// across a restart; see deferral ledger loop #65 row).
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-			key := opName + "(" + leftCanon + "," + rightCanon + ")"
-			if im.DropCompatObject("operator", key) {
-				schema := opNameObj.Schema
-				if schema == "" {
-					schema = "public"
-				}
-				// Also remove the dedicated operator registry entry so pg_dump
-				// no longer re-emits it (mirrors DropCast/DropTransform).
-				droppedOID := uint32(0)
-				if existing, ok := im.LookupUserOperator(schema, opName, leftType, rightType); ok {
-					droppedOID = existing.OID
-				}
+			schema := opNameObj.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			if existing, found := im.LookupUserOperator(schema, opName, leftType, rightType); found {
+				// Best-effort cleanup of the compat registry too; absent (e.g.
+				// after a restart) is expected and not an error.
+				key := opName + "(" + leftCanon + "," + rightCanon + ")"
+				im.DropCompatObject("operator", key)
 				im.DropUserOperator(schema, opName, leftType, rightType)
 				// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
 				// discovered while verifying the loop #64 CREATE TYPE ... AS
 				// RANGE opclass/collation follow-up — see ledger): mirrors
 				// CREATE OPERATOR's own WAL append.
-				if droppedOID != 0 && o.ctx.WAL != nil {
-					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperator(droppedOID)); werr != nil {
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropOperator(existing.OID)); werr != nil {
 						return fmt.Errorf("wal drop-operator: %w", werr)
 					}
 				}
