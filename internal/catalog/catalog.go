@@ -228,11 +228,13 @@ type NamedNotNullConstraint struct {
 	OID       uint32 // synthetic OID for pg_constraint virtual table
 	NoInherit bool   // PG18: NOT NULL NO INHERIT
 	IsLocal   bool   // conislocal: true if locally declared
-	InhCount  int    // coninhcount: 1 for partition children (they always inherit from one parent)
+	InhCount  int    // coninhcount: how many parents (plain-INHERITS or partition) enforce this NOT NULL
 }
 
 // AddNotNull appends a named NOT NULL constraint to the table.
-// isLocal=true means the constraint is locally declared; inhCount=1 for partition children.
+// isLocal=true means the constraint is locally declared (attislocal or explicitly
+// re-declared); inhCount counts enforcing parents — 0 for a purely local
+// constraint, 1 for one inheriting/partition parent that also enforces it.
 func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isLocal bool, inhCount int) {
 	t.NotNullConstraints = append(t.NotNullConstraints, NamedNotNullConstraint{
 		Name: name, ColName: colName, OID: oid, NoInherit: noInherit,

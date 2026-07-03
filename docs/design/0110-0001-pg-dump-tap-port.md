@@ -11010,6 +11010,102 @@ scoping this fix to the plain-`INHERITS` case that was actually verified
 live) and needs its own investigation into why the NOT NULL registration
 loop doesn't run for `s.PartitionOf != nil` at all.
 
+### `PARTITION OF` NOT NULL constraint locality fix (loop #53)
+
+Resolves the follow-up gap recorded above. `execCreatePartitionChild`
+(`internal/executor/operators_ddl.go`) has its own, entirely separate NOT
+NULL registration block from `execCreateTable`'s — it only called
+`tbl.AddNotNull` for columns named in `poc.NotNullColumns` (the partition's
+own inline `PARTITION OF parent (col NOT NULL)` column-override list). A
+column that is NOT NULL purely because the **partitioned parent** enforces
+it (the overwhelmingly common case — e.g. a NOT NULL primary-key column on
+the partitioned table) got no `pg_constraint` row registered at all.
+
+Verified live against a scratch real-PostgreSQL-18.3 instance
+(`postgres/local_install`) with three DDL shapes, each cross-checked against
+a scratch goopg instance (`bin/goopg init`/`start` on an isolated port/data
+dir) both via direct `pg_constraint` queries and `pg_dump --schema-only`:
+
+1. **Pure inheritance** — `CREATE TABLE p (id int NOT NULL, v text)
+   PARTITION BY RANGE (id); CREATE TABLE p1 PARTITION OF p FOR VALUES FROM
+   (0) TO (100);`. Real PG: `p1` gets `p_id_not_null` /
+   `conislocal='f'` / `coninhcount=1` — the PARENT's exact constraint name,
+   reused verbatim. `pg_dump` prints `id integer CONSTRAINT p_id_not_null
+   NOT NULL,` (not a bare `NOT NULL`, and not omitted) because
+   `pg_dump.c`'s `print_notnull` OR-condition always fires for
+   `tbinfo->ispartition` regardless of `conislocal` — but the *name* is only
+   printed when it doesn't match the child's own `<child>_<col>_not_null`
+   default-name pattern, which `p_id_not_null` (parent's name) never does.
+   goopg previously emitted zero constraint rows and a bare `id integer,`
+   with no NOT NULL at all — a real, confirmed divergence.
+2. **Local-only** — `CREATE TABLE p2 (id int, v text) PARTITION BY RANGE
+   (id); CREATE TABLE p2a PARTITION OF p2 (v NOT NULL) FOR VALUES FROM (0)
+   TO (100);` (parent column `v` is nullable). Real PG: `p2a_v_not_null` /
+   `t` / `coninhcount=0`. `pg_dump` prints bare `v text NOT NULL` (name
+   matches the child's own default pattern, so PG's
+   `determineNotNullFlags` suppresses printing it explicitly).
+3. **Local-and-inherited** — `CREATE TABLE p3 (id int NOT NULL, v text)
+   PARTITION BY RANGE (id); CREATE TABLE p3a PARTITION OF p3 (id NOT NULL)
+   FOR VALUES FROM (0) TO (100);` (column re-declared NOT NULL in the
+   partition's own list AND already NOT NULL in the parent). Real PG:
+   `p3a_id_not_null` / `t` / `coninhcount=1` — note this gets the CHILD's
+   own auto-generated name (not the parent's), unlike case 1, because it was
+   explicitly re-declared; but `coninhcount` still counts the enforcing
+   parent.
+
+Fix: replace the `poc.NotNullColumns`-only loop with one that walks every
+NOT NULL `tbl.Columns` entry (columns are copied from `parent.Columns` for
+a partition child, so this covers both inherited and to-be-locally-declared
+columns in one pass) and looks up a same-name entry in
+`parent.NotNullConstraints`:
+
+- Column named in `poc.NotNullColumns` (explicit local override): own
+  `<child>_<col>_not_null` name, `isLocal=true`; `inhCount = 1` if a
+  matching parent constraint exists (case 3), else `0` (case 2).
+- Column NOT in `poc.NotNullColumns` but matched in
+  `parent.NotNullConstraints` (pure inheritance, case 1): reuse the
+  *parent's* constraint name and `NoInherit` flag, `isLocal=false`,
+  `inhCount=1` (a partition child has exactly one partition parent).
+- Column matching neither: no constraint registered (nullable column).
+
+All three cases confirmed `pg_constraint`-catalog- and `pg_dump`-output-
+byte-identical to live PG 18.3. New coverage:
+`TestCreatePartitionChildNotNullConstraintLocality`
+(`internal/executor/operators_ddl_named_check_test.go`), asserting all three
+cases' `IsLocal`/`InhCount`/`Name` against the catalog.
+
+Also corrected a misleading comment on `catalog.NamedNotNullConstraint.
+InhCount` / `Table.AddNotNull` (`internal/catalog/catalog.go`) that
+generalized "`inhCount=1` for partition children" — case 2 above shows that
+is only true when the parent also enforces the constraint; reworded to
+describe `InhCount` as "how many enforcing parents", matching its actual
+per-case derivation in both the plain-`INHERITS` and `PARTITION OF` call
+sites.
+
+Gates: `go build ./...`/`go vet ./...` clean; new test + full
+`internal/executor` suite PASS; `internal/catalog`+`internal/parser`+
+`internal/server`+`internal/initdb` suites PASS (no regression, `-count=1`);
+`TestPort_PgDumpConnectionSetup` PASS; live `pg_dump`/`psql` smoke on
+isolated ports vs. both a scratch real-PostgreSQL-18.3 instance and a
+scratch goopg instance for all three cases, output diffed byte-identical.
+
+**New deferral (sibling gap, ledger row appended, NOT `pg_dump`-visible):**
+while deriving case 3's `inhCount=1` rule for `PARTITION OF`, cross-checked
+the analogous plain-`INHERITS` scenario (`CREATE TABLE child2 (id int NOT
+NULL, ...) INHERITS (parent)` where `parent.id` is already NOT NULL) against
+live PG and found the previous fix (loop #48, above) leaves
+`coninhcount=0` where real PG gives `1` — because `col.Inherited` is false
+for a column present in the child's own `s.Columns` list, so
+`execCreateTable`'s `col.Inherited && s.PartitionOf == nil` re-derivation
+branch never runs for it, and it falls through to the loop's `inhCount := 0`
+default. This has no `pg_dump` text impact (PG's plain-`INHERITS`
+`print_notnull` only gates on `conislocal`, never `coninhcount`) — a pure
+direct-`pg_constraint`-query catalog-fidelity gap. Deferred as low-urgency;
+resume point is `internal/executor/operators_ddl.go`'s `execCreateTable`
+NOT NULL loop (~line 3210), mirroring this loop's `poc.NotNullColumns` +
+`parentNC != nil` -> `inhCount = 1` case for the child's own explicit column
+list.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -3932,16 +3932,48 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		}
 		tbl.AddCheck(pcc.Name, pcc.Expr, oid)
 	}
-	// Register named NOT NULL constraints for NOT NULL columns declared in the
-	// PARTITION OF column override list. These columns come from the parent schema
-	// but the partition child explicitly adds NOT NULL, so IsLocal=true. All
-	// partition child NOT NULL constraints have InhCount=1 (one partition parent).
-	// M0097-0023.
+	// Register named NOT NULL constraints for every NOT NULL column on the
+	// partition child, matching real PG's per-column pg_constraint contype='n'
+	// row (verified against live PG 18.3): a column that is NOT NULL purely
+	// because the parent enforces it (not re-declared in this partition's own
+	// column list) reuses the PARENT's constraint name with
+	// conislocal='f'/coninhcount=1 — pg_dump's ispartition-gated print_notnull
+	// always prints it inline (`CONSTRAINT <parent's name> NOT NULL`) despite
+	// conislocal='f', since partitions print every column regardless of
+	// locality. A column explicitly re-declared NOT NULL in the PARTITION OF
+	// column-constraint list (poc.NotNullColumns) instead gets its OWN
+	// <child>_<col>_not_null name with conislocal='t', and coninhcount is 1
+	// only if the parent ALSO enforces it there (0 if the parent column is
+	// nullable). M0110-0001 (DU-002 partition-child NOT NULL locality).
 	if isIM2 {
+		explicitNotNull := make(map[string]bool, len(poc.NotNullColumns))
 		for _, colName := range poc.NotNullColumns {
-			colKey := strings.ToLower(colName)
-			constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
-			tbl.AddNotNull(constraintName, colName, im2.AllocOID(), false, true, 1)
+			explicitNotNull[strings.ToLower(colName)] = true
+		}
+		for _, col := range tbl.Columns {
+			if !col.NotNull {
+				continue
+			}
+			colKey := strings.ToLower(col.Name)
+			var parentNC *catalog.NamedNotNullConstraint
+			for i := range parent.NotNullConstraints {
+				if strings.EqualFold(parent.NotNullConstraints[i].ColName, col.Name) {
+					parentNC = &parent.NotNullConstraints[i]
+					break
+				}
+			}
+			if explicitNotNull[colKey] {
+				inhCount := 0
+				if parentNC != nil {
+					inhCount = 1
+				}
+				constraintName := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+				tbl.AddNotNull(constraintName, col.Name, im2.AllocOID(), false, true, inhCount)
+				continue
+			}
+			if parentNC != nil {
+				tbl.AddNotNull(parentNC.Name, col.Name, im2.AllocOID(), parentNC.NoInherit, false, 1)
+			}
 		}
 	}
 	return nil

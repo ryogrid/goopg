@@ -6295,6 +6295,51 @@ documentation-only and is exempt from the design-doc requirement.)
       (deliberately not fixed here — needs its own live-PG-verified
       follow-up).
 
+- [x] **`PARTITION OF` NOT NULL constraint locality fix (M0110-0001
+      follow-up, loop #53).** **COMPLETE 2026-07-03:** resolves the
+      follow-up gap recorded by the previous item. `execCreatePartitionChild`
+      (`internal/executor/operators_ddl.go`) only called `tbl.AddNotNull` for
+      columns in `poc.NotNullColumns` (the partition's own inline `(col NOT
+      NULL)` override list); a column that is NOT NULL purely because the
+      partitioned PARENT enforces it got zero `pg_constraint` contype='n' row
+      at all. Verified live against `postgres/local_install` PG 18.3 with
+      three cases (`CREATE TABLE p (id int NOT NULL, v text) PARTITION BY
+      RANGE (id); CREATE TABLE p1 PARTITION OF p ...` for pure inheritance;
+      `p2/p2a (v NOT NULL)` for local-only; `p3/p3a (id NOT NULL)` for
+      local-and-inherited) and confirmed goopg was byte-divergent on the
+      first case (missing row) and the catalog fields on the third. Fix:
+      iterate every NOT NULL `tbl.Columns` entry — a column absent from
+      `poc.NotNullColumns` but present in `parent.NotNullConstraints` reuses
+      the parent's constraint name with `isLocal=false, inhCount=1`; a column
+      present in `poc.NotNullColumns` gets its own `<child>_<col>_not_null`
+      name with `isLocal=true`, and `inhCount` is 1 if the parent also
+      enforces it or 0 otherwise. All three cases confirmed catalog- AND
+      `pg_dump`-output-identical to live PG 18.3 (`p1`: `id integer
+      CONSTRAINT p_id_not_null NOT NULL,`; `p2a`/`p3a`: bare `NOT NULL` since
+      the generated name matches PG's default-name-suppression rule). Test:
+      new `TestCreatePartitionChildNotNullConstraintLocality`
+      (`internal/executor/operators_ddl_named_check_test.go`) covering all
+      three cases. Gates: `go build ./...`/`go vet ./...` clean; new test +
+      full `internal/executor` suite PASS; `internal/catalog`+
+      `internal/parser`+`internal/server`+`internal/initdb` suites PASS (no
+      regression); `TestPort_PgDumpConnectionSetup` PASS; live `pg_dump`/
+      `psql` smoke on isolated ports vs. both a scratch real-PostgreSQL-18.3
+      instance and a scratch goopg instance, output diffed byte-identical.
+      Design doc: `docs/design/0110-0001-pg-dump-tap-port.md` new
+      "`PARTITION OF` NOT NULL constraint locality fix (loop #53)" section;
+      `docs/design/README.md` row `0110-0001` addendum updated; deferral
+      ledger rows appended (resolves the prior row's "deferred" item).
+      **New deferral (sibling gap, NOT `pg_dump`-visible):** the plain-
+      `INHERITS` fix (previous item) leaves `coninhcount=0` instead of PG's
+      `1` when a child both explicitly redeclares a column NOT NULL AND the
+      `INHERITS` parent already enforces it (`col.Inherited` is false for a
+      column in the child's own list, so the `col.Inherited &&
+      s.PartitionOf == nil` re-derivation branch never runs for it) —
+      confirmed live (PG gives `child2_t_id_not_null`/`t`/`1`, goopg gives
+      `t`/`0`); no dump-text impact (PG's plain-INHERITS `print_notnull` only
+      gates on `conislocal`, never `coninhcount`), so deferred as low-urgency
+      catalog-fidelity-only.
+
 - [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
       #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
       row's "a client `SET log_statement='all'` has no effect" residual — only
