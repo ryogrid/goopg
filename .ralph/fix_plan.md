@@ -5467,17 +5467,27 @@ documentation-only and is exempt from the design-doc requirement.)
       section). **`002_save_fullpage.pl` (WD-003) DONE.** **Remaining:**
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering)
       — needs hash/gin/gist/spgist/brin AMs, unrelated to the WD-003 fix below.
-      **Also confirmed backlog (2026-07-03 audit, no `pass_required` test
-      depends on it yet):** page-pruning (both the opportunistic
-      `markHeapPruneOptDirty` path, `internal/executor/operators_storage.go`
-      ~2714, and the real `VACUUM` path, `internal/vacuum/vacuum.go`
-      `VacuumWithOptions`) emits only goopg's native WAL record kinds, never a
-      PG-canonical (`ctx.LogCanonical`) record — so `pg_waldump` sees zero
-      records for any page whose only WAL activity is pruning/VACUUM, in any
-      mode. See deferral ledger row (task-id `M0119-0005`, dated 2026-07-03,
-      the one after the WD-003 row) for the full trace and a concrete
-      implementation resume point (`catalog.PgCanonicalHeapPrune` + wiring at
-      both call sites).
+      **Prune/VACUUM canonical-WAL gap FIXED 2026-07-03 (loop #91):** new
+      `catalog.PgCanonicalHeapPrune` (`internal/catalog/canonical.go`, new
+      `RM_HEAP2_ID`-based rmgr, `XLOG_HEAP2_PRUNE_ON_ACCESS`/`_VACUUM_SCAN`)
+      wired into both the opportunistic `markHeapPruneOptDirty` fallback
+      (`internal/executor/operators_storage.go`, new
+      `emitCanonicalHeapPruneLocked`) and the real `VACUUM` path
+      (`internal/vacuum/vacuum.go`'s new `VacuumOptions.LogCanonical` field,
+      threaded from `operators_vacuum.go`). Tests:
+      `TestBuildCanonicalHeapPrunePayload`/`TestPgCanonicalHeapPrune_NilLogFn`
+      (`internal/catalog`), `TestVacuumWithOptionsEmitsCanonicalPruneRecord`/
+      `TestVacuumWithOptionsNilLogCanonicalIsNoop` (`internal/vacuum`),
+      `TestOpportunisticPruneEmitsCanonicalWAL` (`internal/executor`). Design
+      doc `docs/design/0110-0002-pg-waldump-tap-port.md` "2026-07-03:
+      prune/VACUUM canonical-WAL fix (LANDED)". Deferral ledger row 419
+      flipped to `resolved`; new row appended. Still open (no `pass_required`
+      test depends on either): a live `pg_waldump --rmgr=Heap2`/standby
+      round-trip against a VACUUM-pruned page, and whether the temp-table-only
+      `pruneTouchedTempPages` opportunistic-prune path
+      (`internal/executor/operators_indexonly.go:285`) needs the same
+      treatment (likely N/A — temp relations aren't WAL-logged in real PG —
+      but unconfirmed).
 - [x] **`pg_waldump --save-fullpage` (WD-003, `002_save_fullpage.pl`).**
       **COMPLETE 2026-07-03:** `TestPort_PgWaldump002SaveFullpage`
       (`internal/testport/pgwaldump_savefullpage_test.go`) now PASSes (was

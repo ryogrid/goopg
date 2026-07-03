@@ -3,6 +3,7 @@ package vacuum
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -255,5 +256,100 @@ func TestAnalyzeReturnsRowCountAndAvgWidth(t *testing.T) {
 	// (24+2 + 24+5) / 2 = 27.5
 	if stats.AvgWidth != 27.5 {
 		t.Errorf("AvgWidth=%v want=27.5", stats.AvgWidth)
+	}
+}
+
+// TestVacuumWithOptionsEmitsCanonicalPruneRecord guards M0119-0005's fix:
+// before this, VacuumWithOptions emitted only goopg's native
+// RecordKindHeapPruneOpt for a page with reclaimed tuples, so pg_waldump
+// (or a real PG18 standby) saw zero WAL activity for a page whose only
+// change was VACUUM pruning. VacuumOptions.LogCanonical must now receive one
+// PG-canonical XLOG_HEAP2_PRUNE_VACUUM_SCAN payload per pruned page.
+func TestVacuumWithOptionsEmitsCanonicalPruneRecord(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s)
+
+	mvccMgr := mvcc.NewManager()
+	tx1, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+	tx2, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xid2, _ := mvccMgr.AssignXID(tx2)
+	tx2.XID = xid2
+	mvccMgr.Commit(tx2)
+
+	// One dead tuple (committed xmax below the oldest-xmin horizon) so this
+	// page actually gets reclaimed.
+	dead := storage.NewHeapTuple(tx1.XID, tx2.XID, []byte("dead-tuple-data"))
+	addTuple(t, pool, rel, 0, dead)
+
+	var captured []byte
+	logCanonical := func(payload []byte) (uint64, error) {
+		captured = append([]byte(nil), payload...)
+		return 100, nil
+	}
+
+	stats, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{LogCanonical: logCanonical})
+	if err != nil {
+		t.Fatalf("VacuumWithOptions: %v", err)
+	}
+	if stats.Dead != 1 {
+		t.Fatalf("stats.Dead=%d want=1 (nothing reclaimed, canonical hook can't have fired)", stats.Dead)
+	}
+	if captured == nil {
+		t.Fatal("LogCanonical was never called for a page with a reclaimed tuple")
+	}
+	if captured[0] != catalog.RecordKindCanonical {
+		t.Errorf("payload[0] = 0x%02x, want RecordKindCanonical (0x%02x)", captured[0], catalog.RecordKindCanonical)
+	}
+	const rmHeap2ID = 9 // RM_HEAP2_ID (postgres/src/include/access/rmgrlist.h)
+	if captured[1] != rmHeap2ID {
+		t.Errorf("payload[1] (rmgr) = %d, want %d (RM_HEAP2_ID)", captured[1], rmHeap2ID)
+	}
+	const xlogHeap2PruneVacuumScan = 0x20
+	if captured[2] != xlogHeap2PruneVacuumScan {
+		t.Errorf("payload[2] (info) = 0x%02x, want 0x%02x (XLOG_HEAP2_PRUNE_VACUUM_SCAN)", captured[2], xlogHeap2PruneVacuumScan)
+	}
+}
+
+// TestVacuumWithOptionsNilLogCanonicalIsNoop verifies the default
+// (LogCanonical unset) VacuumOptions zero value keeps VacuumWithOptions's
+// pre-M0119-0005 behaviour unchanged — no panic, no extra WAL.
+func TestVacuumWithOptionsNilLogCanonicalIsNoop(t *testing.T) {
+	pool, _, rel, cleanup := newRel(t)
+	defer cleanup()
+
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s)
+
+	mvccMgr := mvcc.NewManager()
+	tx1, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xid1, _ := mvccMgr.AssignXID(tx1)
+	tx1.XID = xid1
+	mvccMgr.Commit(tx1)
+	tx2, _ := mvccMgr.Begin(mvcc.IsolationReadCommitted)
+	xid2, _ := mvccMgr.AssignXID(tx2)
+	tx2.XID = xid2
+	mvccMgr.Commit(tx2)
+
+	dead := storage.NewHeapTuple(tx1.XID, tx2.XID, []byte("dead-tuple-data"))
+	addTuple(t, pool, rel, 0, dead)
+
+	stats, err := VacuumWithOptions(pool, mvccMgr, rel, VacuumOptions{})
+	if err != nil {
+		t.Fatalf("VacuumWithOptions: %v", err)
+	}
+	if stats.Dead != 1 {
+		t.Fatalf("stats.Dead=%d want=1", stats.Dead)
 	}
 }

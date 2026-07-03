@@ -3229,6 +3229,11 @@ func tryApplyHOTUpdate(
 				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
 				// restores space first.
 				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {
+					if cerr := emitCanonicalHeapPruneLocked(ctx, s, rel, blk, uint32(effectiveWriterXID(ctx)), true); cerr != nil {
+						s.Unlock()
+						ctx.Pool.Unpin(s)
+						return false, cerr
+					}
 					newSlot, addErr = storage.PageAddHeapTuple(s.Page(), tup)
 				}
 			}
@@ -7915,6 +7920,35 @@ func emitCanonicalHeapHotUpdate(ctx *Context, rel storage.RelFileNode, blk stora
 	}
 	s.Unlock()
 	ctx.Pool.Unpin(s)
+	return emitErr
+}
+
+// emitCanonicalHeapPruneLocked emits a PG-canonical XLOG_HEAP2_PRUNE_* record
+// with a full-page image for the page held by the already-pinned-and-locked
+// slot s, capturing its CURRENT (post-prune) contents. Unlike the sibling
+// emitCanonicalHeap* helpers, this one does NOT re-Pin/Lock: it is called
+// from inside tryApplyHOTUpdate's page-full opportunistic-prune fallback
+// while the page's content lock is still held (re-locking the same slot
+// would deadlock), immediately after markHeapPruneOptDirty so the FPI
+// reflects the pruned-but-not-yet-re-added state. Only called when
+// ctx.LogCanonical is non-nil. xid is InvalidTransactionID (0) for a
+// VACUUM-driven prune (vacuumCore has no live transaction of its own to
+// stamp) and the current transaction's xid for an in-transaction
+// opportunistic prune — inert either way, since a standby restores the
+// whole page from the FPI without consulting the record's xl_xid.
+func emitCanonicalHeapPruneLocked(ctx *Context, s *storage.Slot, rel storage.RelFileNode, blk storage.BlockNumber, xid uint32, onAccess bool) error {
+	if ctx.LogCanonical == nil {
+		return nil
+	}
+	page := make(storage.Page, storage.BlockSize)
+	copy(page, s.Page())
+	endLSN, emitErr := catalog.PgCanonicalHeapPrune(rel, blk, page, xid, onAccess, ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
+		if ctx.Pool != nil {
+			ctx.Pool.MarkDirty(s)
+		}
+	}
 	return emitErr
 }
 

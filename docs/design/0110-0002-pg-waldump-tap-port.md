@@ -209,3 +209,73 @@ new-capability addition — a public API change on `vacuum.VacuumWithOptions`
 touching every caller, not a copy-paste. Full trace + concrete resume point in
 the deferral ledger (task-id `M0119-0005`, row dated 2026-07-03, immediately
 after the WD-003 row).
+
+## 2026-07-03: prune/VACUUM canonical-WAL fix (LANDED)
+
+Implemented the resume point from the audit above. New `catalog.PgCanonicalHeapPrune`
+/ `BuildCanonicalHeapPrunePayload` (`internal/catalog/canonical.go`) encodes a
+PG-canonical `XLOG_HEAP2_PRUNE_ON_ACCESS` (0x10) or `XLOG_HEAP2_PRUNE_VACUUM_SCAN`
+(0x20) record under `RM_HEAP2_ID` (9) — a **distinct** rmgr from `RM_HEAP_ID`
+(10, used by insert/delete/inplace), matching PG's own rmgr split
+(`postgres/src/include/access/rmgrlist.h`). The main-data section is the
+minimal `xl_heap_prune{reason(1), flags(1)}` (`SizeOfHeapPrune`, no
+`XLHP_HAS_CONFLICT_HORIZON`/`XLHP_HAS_REDIRECTIONS` bits set) — verified
+against `heap_xlog_prune_freeze`
+(`postgres/src/backend/access/heap/heapam_xlog.c`) that once the block
+reference carries a full-page image, `XLogReadBufferForRedoExtended` returns
+`BLK_RESTORED` and the redo function returns **before** parsing any block-data
+sub-records (freeze plans / redirected / dead / unused offset arrays) at all —
+so, exactly like `PgCanonicalHeapInplace`/`PgCanonicalHeapDelete`'s established
+simplification, none of those arrays need encoding.
+
+Two call sites wired, both only when `ctx.LogCanonical`/`opts.LogCanonical` is
+non-nil (an absent hook is a total no-op, matching every other `emitCanonical*`
+helper):
+
+- **Opportunistic prune** — new `emitCanonicalHeapPruneLocked` (unexported,
+  `operators_storage.go`) is called from `tryApplyHOTUpdate`'s page-full
+  fallback immediately after `markHeapPruneOptDirty` succeeds, **while the
+  page's content lock from the enclosing HOT-update is still held**. It
+  deliberately does NOT re-Pin/Lock the slot like the sibling
+  `emitCanonicalHeapInsert`/`emitCanonicalHeapHotUpdate`/`emitCanonicalHeapDelete`
+  helpers (all called after their caller has released the lock) — re-locking
+  the same already-held slot would deadlock. It instead copies the
+  already-locked slot's current (post-prune) page bytes directly. `onAccess`
+  is hardcoded `true` at this call site (`PRUNE_ON_ACCESS`).
+- **Real VACUUM** — `vacuum.VacuumOptions` gained a `LogCanonical
+  catalog.LogCanonicalFunc` field (a new import of `internal/catalog` into
+  `internal/vacuum`; no cycle, catalog does not import vacuum). `vacuumCore`'s
+  existing dead-tuple-reclamation block (`internal/vacuum/vacuum.go`, the
+  `if reclaimed > 0` arm) emits the canonical record right after its existing
+  `MarkDirtyChangeRecord`/`logPrune` call, using `xid=InvalidTransactionID (0)`
+  — VACUUM has no live user transaction of its own to stamp, and (as traced
+  above) a standby restoring the whole page from the FPI never consults the
+  record's `xl_xid` — with `onAccess=false` (`PRUNE_VACUUM_SCAN`).
+  `operators_vacuum.go`'s `vacuumOp.Next` threads `o.ctx.LogCanonical` into the
+  `vacuum.VacuumOptions{}` literal it already builds.
+
+Tests: `TestBuildCanonicalHeapPrunePayload` (both `onAccess` cases, byte-layout
+pin, `internal/catalog/canonical_test.go`), `TestPgCanonicalHeapPrune_NilLogFn`;
+`TestVacuumWithOptionsEmitsCanonicalPruneRecord` /
+`TestVacuumWithOptionsNilLogCanonicalIsNoop` (`internal/vacuum/vacuum_test.go`);
+`TestOpportunisticPruneEmitsCanonicalWAL` (`internal/executor/prune_test.go`,
+reuses `TestOpportunisticPruneReclaims`'s exact fixture/repro with
+`ctx.LogCanonical` wired, asserting an `XLOG_HEAP2_PRUNE_ON_ACCESS` record was
+emitted for the opportunistic prune, distinct from the same update's own
+`XLOG_HEAP_INPLACE` HOT-update record).
+
+Gates: `go build ./...`/`go vet ./...` clean; `gofmt -l` clean on touched
+files; `go test -race ./internal/wal/... ./internal/mvcc/...` PASS; full
+`internal/catalog`+`internal/vacuum`+`internal/executor`+`internal/initdb`+
+`internal/planner`+`internal/server` suites PASS (no regression);
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+Still open (unchanged from the audit): `001_basic.pl`'s server-dependent tier
+(hash/gin/gist/spgist/brin AMs) remains unported; no `pass_required` test yet
+exercises `pg_waldump` against a VACUUM-pruned page end-to-end (this loop
+verified the canonical record's byte layout and emission via unit tests, not a
+live `pg_waldump --rmgr=Heap2` round-trip) — a natural follow-up once/if that
+becomes `pass_required`. Whether the temp-table-only opportunistic prune path
+inside `pruneTouchedTempPages` (`operators_indexonly.go:285`) needs the same
+treatment remains unchecked (temp relations are backend-private and never
+WAL-logged/replicated in real PG, so it is likely N/A — not confirmed).
