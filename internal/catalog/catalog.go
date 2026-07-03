@@ -1809,6 +1809,10 @@ type Catalog interface {
 	// RoleOID returns the OID minted for a registered role (or 10 for the seeded
 	// `postgres` superuser); the bool is false for an unknown role. DU-002 slice 330.
 	RoleOID(name string) (uint32, bool)
+	// IsPredefinedRole reports whether name is one of PG18's 16 built-in
+	// "pg_*" predefined roles (pg_authid.dat) — a fixed, install-time fact,
+	// not the user-created `roles` registry. M0119-0004-ACLHEAP.
+	IsPredefinedRole(name string) bool
 	// GrantTablePrivilege records that role may exercise priv on the relation
 	// identified by relOID. priv is an upper-cased keyword ("TRUNCATE", …); role
 	// is matched case-insensitively. Minimal ACL store for the *-conflict
@@ -2143,6 +2147,23 @@ type InMemory struct {
 	// getPolicies resolves it back to the name via pg_roles). M0097-drop_if_exists;
 	// per-role OID registry added DU-002 slice 330.
 	roles map[string]uint32
+
+	// predefinedRoles maps the lower-cased name of each of PG18's 16
+	// built-in "pg_*" predefined roles (predefinedRoleSeeds) to its fixed
+	// OID. Unlike `roles`, this is a fixed, install-time fact — populated
+	// once at construction (newPredefinedRoleMap), never mutated by
+	// RegisterRole/UnregisterRole/RenameRole, and deliberately excluded from
+	// AllRoleStates() so pg_authid heap sync (which already has its own
+	// dedicated predefined-role writer, executor.pgAuthidPredefined) never
+	// sees a duplicate row. Consulted by RoleOID/RoleExists/IsPredefinedRole
+	// so predefined-role names resolve for GRANT/REVOKE role membership,
+	// OWNER TO, CREATE POLICY ... TO, etc. — exactly like a real PG
+	// pg_authid row — while staying immune to DROP/ALTER/RENAME ROLE (backed
+	// by IsPredefinedRole's "pinned object" guard at the DROP ROLE call
+	// site; ALTER/RENAME already gate through the separate server-level
+	// `s.roles` registry in internal/server/role_ddl.go, unaffected by this
+	// map). M0119-0004-ACLHEAP.
+	predefinedRoles map[string]uint32
 
 	// roleAttrs is the attribute/credential sidecar for `roles`, keyed by the
 	// same lower-cased role name. Carries what pg_authid carries for a live
@@ -2834,6 +2855,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:              make(map[string]uint32),
+		predefinedRoles:    newPredefinedRoleMap(),
 		roleAttrs:          make(map[string]*RoleAttrs),
 		tempNamespaces:     make(map[string]uint32),
 		tableACLs:          make(map[uint32]map[string]map[string]bool),
@@ -10839,12 +10861,63 @@ func (c *InMemory) tempNamespaceOIDLocked(owner string) uint32 {
 	return c.tempNamespaces[owner]
 }
 
-// RoleExists reports whether a role with the given name has been registered.
+// RoleExists reports whether a role with the given name has been registered,
+// or is one of PG18's 16 built-in "pg_*" predefined roles (predefinedRoles —
+// M0119-0004-ACLHEAP).
 func (c *InMemory) RoleExists(name string) bool {
+	key := strings.ToLower(name)
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	_, ok := c.roles[strings.ToLower(name)]
+	if _, ok := c.roles[key]; ok {
+		return true
+	}
+	_, ok := c.predefinedRoles[key]
 	return ok
+}
+
+// predefinedRoleSeeds lists PG18's 16 built-in "pg_*" predefined roles
+// (postgres/src/include/catalog/pg_authid.dat) and their fixed OIDs. Twin of
+// internal/initdb/initdb.go's `predefined` slice (heap seeding) and
+// internal/executor/pg_authid_sync.go's `pgAuthidPredefined` (heap resync) —
+// internal/catalog cannot import either (would create an import cycle), so
+// this is a third, deliberately independent copy; keep all three in sync.
+var predefinedRoleSeeds = []struct {
+	oid  uint32
+	name string
+}{
+	{6171, "pg_database_owner"},
+	{6181, "pg_read_all_data"},
+	{6182, "pg_write_all_data"},
+	{3373, "pg_monitor"},
+	{3374, "pg_read_all_settings"},
+	{3375, "pg_read_all_stats"},
+	{3377, "pg_stat_scan_tables"},
+	{4569, "pg_read_server_files"},
+	{4570, "pg_write_server_files"},
+	{4571, "pg_execute_server_program"},
+	{4200, "pg_signal_backend"},
+	{4544, "pg_checkpoint"},
+	{6337, "pg_maintain"},
+	{4550, "pg_use_reserved_connections"},
+	{6304, "pg_create_subscription"},
+	{6392, "pg_signal_autovacuum_worker"},
+}
+
+// RoleOIDPgDatabaseOwner is ROLE_PG_DATABASE_OWNER (postgres/src/include/
+// catalog/pg_authid.h): the predefined role whose "charter ... is to have
+// exactly one, implicit, situation-dependent member" —
+// check_role_membership_authorization (postgres/src/backend/commands/user.c)
+// rejects any explicit `GRANT pg_database_owner TO ...`. M0119-0004-ACLHEAP.
+const RoleOIDPgDatabaseOwner uint32 = 6171
+
+// newPredefinedRoleMap builds the name->OID lookup for predefinedRoleSeeds,
+// used to populate InMemory.predefinedRoles at construction.
+func newPredefinedRoleMap() map[string]uint32 {
+	m := make(map[string]uint32, len(predefinedRoleSeeds))
+	for _, s := range predefinedRoleSeeds {
+		m[s.name] = s.oid
+	}
+	return m
 }
 
 // RegisterRole records a user-created role. Called from CREATE ROLE/USER. A
@@ -10999,9 +11072,10 @@ func (c *InMemory) RenameRole(oldName, newName string) bool {
 
 // RoleOID returns the OID minted for a registered role, resolving the seeded
 // bootstrap superuser (`postgres`, OID 10 = BOOTSTRAP_SUPERUSERID) which is not
-// stored in the user-role map. The bool is false for an unknown role. Used by
-// CREATE POLICY ... TO <role> to record role OIDs in pg_policy.polroles.
-// DU-002 slice 330.
+// stored in the user-role map, and PG18's 16 built-in "pg_*" predefined roles
+// (predefinedRoles — M0119-0004-ACLHEAP). The bool is false for an unknown
+// role. Used by CREATE POLICY ... TO <role> to record role OIDs in
+// pg_policy.polroles. DU-002 slice 330.
 func (c *InMemory) RoleOID(name string) (uint32, bool) {
 	key := strings.ToLower(name)
 	if key == "postgres" {
@@ -11009,8 +11083,56 @@ func (c *InMemory) RoleOID(name string) (uint32, bool) {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// predefinedRoles is checked FIRST and always wins: it is a fixed,
+	// install-time fact (unlike `roles`, whose CREATE ROLE producer does not
+	// yet port PG's IsReservedName "pg_"-prefix rejection — a pre-existing,
+	// separate gap), so an exact-name collision must never let a
+	// user-registered entry shadow a predefined role's real OID.
+	if oid, ok := c.predefinedRoles[key]; ok {
+		return oid, true
+	}
 	oid, ok := c.roles[key]
 	return oid, ok
+}
+
+// IsPredefinedRole reports whether name is one of PG18's 16 built-in "pg_*"
+// predefined roles (predefinedRoleSeeds) — a fixed, install-time fact,
+// distinct from the user-created `roles` registry. Backs DROP ROLE/USER/
+// GROUP's "pinned object" guard: PostgreSQL's checkSharedDependencies
+// (postgres/src/backend/catalog/pg_shdepend.c) rejects dropping any object
+// whose OID is below FirstUnpinnedObjectId (12000) with "cannot drop %s
+// because it is required by the database system" — every predefined role OID
+// qualifies. M0119-0004-ACLHEAP.
+func (c *InMemory) IsPredefinedRole(name string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	_, ok := c.predefinedRoles[strings.ToLower(name)]
+	return ok
+}
+
+// roleNameForOIDLocked resolves oid against `roles` (preferring the
+// roleACLDisplay case-preserved spelling) and, failing that, against
+// predefinedRoles (whose canonical name IS its map key — predefined roles
+// are always registered lower-case, matching PG's own bare pg_authid
+// spelling). Caller must already hold c.mu (read or write). Shared by
+// RoleNameForOID/RoleNameForOIDOrUnknown so both reverse-lookups recognise a
+// predefined-role OID exactly like their forward counterpart, RoleOID.
+// M0119-0004-ACLHEAP.
+func (c *InMemory) roleNameForOIDLocked(oid uint32) (string, bool) {
+	for name, roid := range c.roles {
+		if roid == oid {
+			if disp, ok := c.roleACLDisplay[name]; ok {
+				return disp, true
+			}
+			return name, true
+		}
+	}
+	for name, roid := range c.predefinedRoles {
+		if roid == oid {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // RoleNameForOID is the reverse of RoleOID: it resolves a role OID back to the
@@ -11030,13 +11152,8 @@ func (c *InMemory) RoleNameForOID(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for name, roid := range c.roles {
-		if roid == oid {
-			if disp, ok := c.roleACLDisplay[name]; ok {
-				return disp
-			}
-			return name
-		}
+	if name, ok := c.roleNameForOIDLocked(oid); ok {
+		return name
 	}
 	return strconv.FormatUint(uint64(oid), 10)
 }
@@ -11054,13 +11171,8 @@ func (c *InMemory) RoleNameForOIDOrUnknown(oid uint32) string {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	for name, roid := range c.roles {
-		if roid == oid {
-			if disp, ok := c.roleACLDisplay[name]; ok {
-				return disp
-			}
-			return name
-		}
+	if name, ok := c.roleNameForOIDLocked(oid); ok {
+		return name
 	}
 	return fmt.Sprintf("unknown (OID=%d)", oid)
 }

@@ -161,13 +161,19 @@ func (o *ddlOp) execRoleMembershipChange(rc *parser.RoleMembershipChange) error 
 // the outer loop of both the GRANT and REVOKE branches, before any grantee is
 // resolved — matching user.c's per-statement-role check, which runs before
 // AddRoleMems/DelRoleMems are ever invoked for that role. M0119-0004-ACLHEAP.
-//
-// Not yet ported: the ROLE_PG_DATABASE_OWNER "cannot have explicit members"
-// carve-out (unreachable today since predefined roles like
-// pg_database_owner are never registered in the live role-name registry —
-// resolveRole already fails them with "role does not exist", a separate,
-// out-of-scope gap) — see the deferral ledger.
 func (o *ddlOp) checkRoleMembershipAuthorization(im *catalog.InMemory, currentUserID, roleOid uint32, roleName string, isGrant bool) error {
+	// "The charter of pg_database_owner is to have exactly one, implicit,
+	// situation-dependent member." (user.c) — a plain GRANT naming it as the
+	// target role is rejected unconditionally, checked first, ahead of the
+	// superuser/admin-option checks below (matches
+	// check_role_membership_authorization's own ordering). REVOKE is
+	// unaffected. M0119-0004-ACLHEAP.
+	if isGrant && roleOid == catalog.RoleOIDPgDatabaseOwner {
+		return &ExecError{
+			Code:    "0A000",
+			Message: fmt.Sprintf("role %q cannot have explicit members", roleName),
+		}
+	}
 	verb := "grant"
 	if !isGrant {
 		verb = "revoke"

@@ -6057,6 +6057,73 @@ documentation-only and is exempt from the design-doc requirement.)
       `reserved_class_prefix` extension-namespace check remain open,
       unrelated to this slice.
 
+- [x] **Predefined-role name resolution + `ROLE_PG_DATABASE_OWNER` carve-out
+      (M0119-0004-ACLHEAP follow-up, loop #43).** **COMPLETE 2026-07-03:**
+      closes the `0119-0004cd` row's own deferred `ROLE_PG_DATABASE_OWNER`
+      residual, which was **unreachable, not merely unimplemented**: goopg's
+      16 PG18 predefined `pg_*` roles were only ever heap-seeded
+      (`internal/initdb/initdb.go`) or heap-resynced
+      (`internal/executor/pg_authid_sync.go`), never registered in the live
+      catalog role-name registry, so `resolveRole("pg_database_owner")`
+      already failed with `42704` before `checkRoleMembershipAuthorization`
+      ever ran — and the standard PG idiom `GRANT pg_read_all_data TO alice`
+      didn't work at all. New `catalog.InMemory.predefinedRoles`
+      (`internal/catalog/catalog.go`) is a dedicated, read-only map
+      populated once at `NewInMemory()` construction from a new
+      `predefinedRoleSeeds` list (a third independent copy of the same
+      16-role data — `internal/catalog` cannot import either existing copy
+      without an import cycle), consulted by `RoleOID`/`RoleExists`
+      (predefined checked FIRST, so a hypothetical exact-name collision from
+      goopg's own pre-existing "CREATE ROLE doesn't reject `pg_`-prefixed
+      names" gap can never shadow the real OID) and a new shared
+      `roleNameForOIDLocked` helper feeding `RoleNameForOID`/
+      `RoleNameForOIDOrUnknown` (the reverse direction — moved together per
+      the sibling-path rule) — but structurally separate from `roles`, so
+      `RegisterRole`/`UnregisterRole`/`RenameRole`/`AllRoleStates` never see
+      it (no pg_authid heap-sync duplication). New `IsPredefinedRole`
+      (added to the `Catalog` interface) backs a new DROP ROLE/USER/GROUP
+      pinned-object guard (`execDropCompat`, `internal/executor/
+      operators_ddl.go`) this loop had to add in the same pass: without it,
+      registering these names as resolvable would let `DROP ROLE
+      pg_read_all_data` silently succeed, which real PG 18.3 rejects
+      unconditionally (verified live, scratch `initdb`+`pg_ctl` instance,
+      port 5599) with `2BP01 "cannot drop role %s because it is required by
+      the database system"` (PG's generic pinned-object check,
+      `checkSharedDependencies`/`IsPinnedObject`, `pg_shdepend.c` — every
+      predefined role OID is below `FirstUnpinnedObjectId`=12000),
+      unaffected by `IF EXISTS`. `checkRoleMembershipAuthorization`
+      (`internal/executor/operators_ddl_role_membership.go`) now checks the
+      carve-out first, unconditionally, `isGrant`-only (REVOKE unaffected),
+      raising `0A000` with PG's exact unquoted `role %s cannot have explicit
+      members` text. Tests: `TestPredefinedRoleResolution`
+      (`internal/catalog/role_membership_test.go`);
+      `TestExecRoleMembershipChangeGrantsPredefinedRole`/
+      `GrantPgDatabaseOwnerRejected`/`TestExecDropCompatPredefinedRolePinned`
+      (`internal/executor/operators_ddl_role_membership_test.go`);
+      `internal/initdb/role_ddl_recovery_test.go`'s
+      `TestPgAuthidSyncLoadRoundTrip` updated — its old assertion
+      ("predefined role must never appear in `RoleExists`") encoded exactly
+      the gap this loop closes. Gates: `go build ./...`/`go vet ./...`
+      clean; `internal/catalog`+`internal/executor`+`internal/server`+
+      `internal/parser`+`internal/wal`+`internal/initdb` suites PASS;
+      `TestPort_PgDumpallRoleMembership`+`TestPort_PgDumpConnectionSetup`
+      PASS (no regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-predefined-role-resolution.md` (new);
+      `docs/design/README.md` row `0119-0004ch` added; deferral ledger row
+      appended. Still open (newly discovered while scoping this loop, not
+      required to close the `0119-0004cd` residual itself, which IS fully
+      landed): (a) the 16 predefined roles remain entirely absent from the
+      `pg_authid`/`pg_roles` virtual catalog views, so a `GRANT
+      pg_read_all_data TO alice` row, while now correctly stored, will not
+      survive a real `pg_dumpall` round-trip (its `LEFT JOIN pg_roles`
+      produces a NULL role name and the dump silently drops the row); (b)
+      `CREATE ROLE`'s missing `IsReservedName` "pg_"-prefix rejection
+      (`internal/server/role_ddl.go` — only the RENAME TO path checks it
+      today) remains unfixed at the source, though this loop's `RoleOID`
+      lookup-priority ordering defends against the resulting OID-shadowing
+      risk.
+
 - [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
       #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
       row's "a client `SET log_statement='all'` has no effect" residual — only

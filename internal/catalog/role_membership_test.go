@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func boolPtr(b bool) *bool { return &b }
 
@@ -533,5 +536,63 @@ func TestSelectBestAdmin(t *testing.T) {
 	c.GrantRoleMembership(300, 400, 10, nil, boolPtr(false), nil)
 	if got := c.SelectBestAdmin(400, 200); got != 0 {
 		t.Errorf("a non-inheritable link must block reaching an ancestor's ADMIN OPTION, got %d", got)
+	}
+}
+
+// TestPredefinedRoleResolution verifies PG18's 16 built-in "pg_*" predefined
+// roles resolve through RoleOID/RoleExists exactly like a registered role
+// (needed so `GRANT pg_read_all_data TO alice` and similar work), report
+// true from IsPredefinedRole, and are immune to the mutations that operate
+// only on the user-created `roles` registry (RegisterRole re-registration
+// under the same name must not clobber the predefined OID; UnregisterRole
+// must not remove it). M0119-0004-ACLHEAP.
+func TestPredefinedRoleResolution(t *testing.T) {
+	c := NewInMemory()
+
+	oid, ok := c.RoleOID("pg_database_owner")
+	if !ok || oid != RoleOIDPgDatabaseOwner {
+		t.Fatalf("RoleOID(pg_database_owner) = (%d, %v), want (%d, true)", oid, ok, RoleOIDPgDatabaseOwner)
+	}
+	if !c.RoleExists("pg_database_owner") {
+		t.Errorf("RoleExists(pg_database_owner) = false, want true")
+	}
+	if !c.IsPredefinedRole("pg_database_owner") {
+		t.Errorf("IsPredefinedRole(pg_database_owner) = false, want true")
+	}
+	// Case-insensitive, matching every other role-name lookup in this file.
+	if !c.IsPredefinedRole("PG_DATABASE_OWNER") {
+		t.Errorf("IsPredefinedRole must be case-insensitive")
+	}
+
+	oid, ok = c.RoleOID("pg_read_all_data")
+	if !ok || oid != 6181 {
+		t.Fatalf("RoleOID(pg_read_all_data) = (%d, %v), want (6181, true)", oid, ok)
+	}
+
+	if c.RoleExists("pg_not_a_real_role") {
+		t.Errorf("RoleExists(pg_not_a_real_role) = true, want false")
+	}
+	if c.IsPredefinedRole("pg_not_a_real_role") {
+		t.Errorf("IsPredefinedRole(pg_not_a_real_role) = true, want false")
+	}
+
+	// Not part of the user-role registry: RegisterRole/UnregisterRole must
+	// not disturb it.
+	c.RegisterRole("pg_database_owner")
+	oid, ok = c.RoleOID("pg_database_owner")
+	if !ok || oid != RoleOIDPgDatabaseOwner {
+		t.Errorf("RegisterRole must not shadow the predefined OID: got (%d, %v)", oid, ok)
+	}
+	c.UnregisterRole("pg_database_owner")
+	if !c.RoleExists("pg_database_owner") {
+		t.Errorf("UnregisterRole must not remove a predefined role")
+	}
+
+	// Excluded from AllRoleStates so pg_authid heap sync's own dedicated
+	// predefined-role writer never sees a duplicate.
+	for _, s := range c.AllRoleStates() {
+		if s.Name == "pg_database_owner" || strings.HasPrefix(s.Name, "pg_") {
+			t.Errorf("AllRoleStates must exclude predefined roles, found %q", s.Name)
+		}
 	}
 }

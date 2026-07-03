@@ -65,9 +65,20 @@ func TestPgAuthidSyncLoadRoundTrip(t *testing.T) {
 	if !attrs.CanLogin || attrs.Superuser || attrs.CredType != 3 || attrs.Secret != testVerifier {
 		t.Errorf("wpuser attrs = %+v, want CanLogin=true Super=false CredType=3 verifier preserved", attrs)
 	}
-	// Predefined pg_* roles stay heap-only, never registry roles.
-	if cat2.RoleExists("pg_monitor") {
-		t.Error("predefined role pg_monitor leaked into the registry")
+	// Predefined pg_* roles resolve (RoleExists/RoleOID — M0119-0004-ACLHEAP's
+	// dedicated predefinedRoles map, populated at InMemory construction, not
+	// by this heap load) but must never become a `roles` registry entry: the
+	// pg_authid heap loader still skips them (pg_authid_load.go's "predefined
+	// — heap-only, not a registry role" branch), so they stay absent from
+	// AllRoleStates and pg_authid heap sync's own dedicated predefined-role
+	// writer never sees a duplicate row.
+	if !cat2.RoleExists("pg_monitor") {
+		t.Error("predefined role pg_monitor must resolve via RoleExists")
+	}
+	for _, s := range cat2.AllRoleStates() {
+		if s.Name == "pg_monitor" {
+			t.Error("predefined role pg_monitor leaked into the AllRoleStates registry")
+		}
 	}
 }
 

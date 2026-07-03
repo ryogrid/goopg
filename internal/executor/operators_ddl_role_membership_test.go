@@ -354,3 +354,102 @@ func TestExecRoleMembershipChangeUnresolvableGrantedByErrors(t *testing.T) {
 		t.Fatalf("rejected grant must not mutate state, got %+v", got)
 	}
 }
+
+// TestExecRoleMembershipChangeGrantsPredefinedRole verifies a predefined
+// "pg_*" role (catalog.RoleOID's new predefinedRoles resolution,
+// M0119-0004-ACLHEAP) is a valid GRANT target: `GRANT pg_read_all_data TO
+// alice` (a standard, documented PG idiom) now succeeds instead of
+// incorrectly raising "role does not exist".
+func TestExecRoleMembershipChangeGrantsPredefinedRole(t *testing.T) {
+	cat := catalog.NewInMemory()
+	cat.RegisterRole("alice")
+
+	op := &ddlOp{ctx: &Context{Catalog: cat}}
+	rc := &parser.RoleMembershipChange{
+		Roles:    []string{"pg_read_all_data"},
+		Grantees: []string{"alice"},
+	}
+	if err := op.execRoleMembershipChange(rc); err != nil {
+		t.Fatalf("expected GRANT pg_read_all_data TO alice to succeed, got %v", err)
+	}
+	entries := cat.RoleMembershipEntries()
+	if len(entries) != 1 || entries[0].RoleOID != 6181 {
+		t.Fatalf("expected one membership row for pg_read_all_data (OID 6181), got %+v", entries)
+	}
+}
+
+// TestExecRoleMembershipChangeGrantPgDatabaseOwnerRejected verifies
+// check_role_membership_authorization's ROLE_PG_DATABASE_OWNER carve-out
+// (user.c: "The charter of pg_database_owner is to have exactly one,
+// implicit, situation-dependent member"): `GRANT pg_database_owner TO
+// alice` is rejected with 0A000, even when the grantor is the bootstrap
+// superuser (the check runs unconditionally, ahead of the superuser/
+// admin-option gates). REVOKE is unaffected by the carve-out. M0119-0004-ACLHEAP.
+func TestExecRoleMembershipChangeGrantPgDatabaseOwnerRejected(t *testing.T) {
+	cat := catalog.NewInMemory()
+	cat.RegisterRole("alice")
+
+	op := &ddlOp{ctx: &Context{Catalog: cat}}
+	rc := &parser.RoleMembershipChange{
+		Roles:    []string{"pg_database_owner"},
+		Grantees: []string{"alice"},
+	}
+	err := op.execRoleMembershipChange(rc)
+	execErr, ok := err.(*ExecError)
+	if !ok || execErr.Code != "0A000" {
+		t.Fatalf("expected 0A000 (cannot have explicit members), got %#v", err)
+	}
+	if got := cat.RoleMembershipEntries(); len(got) != 0 {
+		t.Fatalf("rejected grant must not mutate state, got %+v", got)
+	}
+
+	// REVOKE is not gated by this carve-out (a no-op revoke of a
+	// never-granted row still succeeds, matching every other REVOKE target).
+	rc.Revoke = true
+	if err := op.execRoleMembershipChange(rc); err != nil {
+		t.Fatalf("expected REVOKE pg_database_owner FROM alice to succeed (unaffected by the GRANT-only carve-out), got %v", err)
+	}
+}
+
+// TestExecDropCompatPredefinedRolePinned verifies DROP ROLE/USER/GROUP
+// rejects any of PG18's 16 built-in "pg_*" predefined roles with 2BP01
+// ("cannot drop role %s because it is required by the database system"),
+// mirroring checkSharedDependencies' pinned-object guard
+// (postgres/src/backend/catalog/pg_shdepend.c) — verified against a real PG
+// 18.3 instance, including that IF EXISTS does NOT suppress the error (the
+// role DOES exist; IF EXISTS only suppresses "does not exist"). A plain
+// user-registered role is unaffected. M0119-0004-ACLHEAP.
+func TestExecDropCompatPredefinedRolePinned(t *testing.T) {
+	cat := catalog.NewInMemory()
+	cat.RegisterRole("alice")
+
+	op := &ddlOp{ctx: &Context{Catalog: cat}}
+
+	for _, ifExists := range []bool{false, true} {
+		stmt := &parser.DropCompatStmt{
+			ObjType:  "role",
+			IfExists: ifExists,
+			Names:    []parser.ObjectName{{Name: "pg_read_all_data"}},
+		}
+		err := op.execDropCompat(stmt)
+		execErr, ok := err.(*ExecError)
+		if !ok || execErr.Code != "2BP01" {
+			t.Fatalf("IfExists=%v: expected 2BP01 pinned-object error, got %#v", ifExists, err)
+		}
+		if !cat.RoleExists("pg_read_all_data") {
+			t.Errorf("IfExists=%v: predefined role must survive the rejected DROP", ifExists)
+		}
+	}
+
+	// A plain registered role is unaffected by the guard.
+	stmt := &parser.DropCompatStmt{
+		ObjType: "role",
+		Names:   []parser.ObjectName{{Name: "alice"}},
+	}
+	if err := op.execDropCompat(stmt); err != nil {
+		t.Fatalf("expected DROP ROLE alice to succeed, got %v", err)
+	}
+	if cat.RoleExists("alice") {
+		t.Errorf("expected alice to be dropped")
+	}
+}

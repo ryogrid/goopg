@@ -13083,6 +13083,16 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		}
 		for _, name := range s.Names {
 			roleName := strings.ToLower(name.Name)
+			// Predefined "pg_*" roles are pinned objects (OID below PG's
+			// FirstUnpinnedObjectId, postgres/src/include/access/transam.h) —
+			// checkSharedDependencies (pg_shdepend.c) rejects DROP
+			// unconditionally, even under IF EXISTS (the role DOES exist;
+			// IF EXISTS only suppresses the "does not exist" case below).
+			// Verified against a real PG 18.3 instance. M0119-0004-ACLHEAP.
+			if o.ctx.Catalog.IsPredefinedRole(roleName) {
+				return &ExecError{Code: "2BP01", Pos: s.Pos(),
+					Message: fmt.Sprintf("cannot drop role %s because it is required by the database system", roleName)}
+			}
 			exists := o.ctx.Catalog.RoleExists(roleName)
 			if s.IfExists {
 				if !exists {
