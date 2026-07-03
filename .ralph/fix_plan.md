@@ -252,8 +252,37 @@ prev-link fixes.
       appended): `commentOnFuncSig` renders the function name unqualified
       even for a schema-qualified `COMMENT ON FUNCTION schema.name(...)` —
       a pre-existing simplification shared by DROP FUNCTION's sibling
-      helper, not introduced here. Resume for `002-010` proper remains the
-      next catalog-getter gap surfaced by `TestPort_PgDumpConnectionSetup`.
+      helper, not introduced here.
+      **2026-07-04 (loop #98, DU-002 slice 438): `SECURITY LABEL` now always
+      raises PostgreSQL's own "provider not loaded" error instead of a
+      silent no-op.** `TestPort_PgDumpConnectionSetup` came up fully green
+      against every fixture through slice 437 with no predicted next
+      blocker, so this loop probed for an untested SQL surface directly (a
+      throwaway `zz_probe_test.go`, deleted before commit).
+      `SECURITY LABEL [FOR provider] ON <object> IS '...'` parsed into a bare
+      `CompatNoopStmt` the executor silently accepted; real PG's
+      `ExecSecLabelStmt` (`postgres/src/backend/commands/seclabel.c`) checks
+      its label-provider list BEFORE ever resolving the target object, and
+      since goopg has no C-extension mechanism to load one, the list is
+      always empty — every such statement a real PG cluster would accept
+      from goopg must raise a 22023 error. `internal/parser/parser.go`'s
+      `case "security":` arm now captures the optional `FOR provider` name
+      into `CompatNoopStmt.SecurityLabelProvider`; `execCompatNoop`
+      (`internal/executor/operators_ddl.go`) returns the matching
+      `*ExecError` unconditionally. Test: `TestSecurityLabelAlwaysErrors`
+      (`internal/executor/operators_security_label_test.go`). Design doc
+      "Follow-up: `SECURITY LABEL` always raises PostgreSQL's own \"provider
+      not loaded\" error instead of a silent no-op (DU-002 slice 438)".
+      Gates: build/vet clean; `internal/parser`+`internal/executor`+
+      `internal/server` suites PASS; `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): two related features
+      probed alongside this one confirmed genuinely unimplemented, each
+      Effort-L — `ALTER DEFAULT PRIVILEGES` (no parser support; `pg_default_acl`
+      stays a permanently-empty virtual view) and large objects (`lo_create`/
+      `lo_open`/...; no `pg_largeobject` heap storage or SQL-level API at
+      all). Resume for `002-010` proper remains the next catalog-getter gap
+      surfaced by `TestPort_PgDumpConnectionSetup`.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

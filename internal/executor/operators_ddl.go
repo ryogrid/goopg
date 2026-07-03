@@ -14491,6 +14491,19 @@ func operatorArgOrNone(t string) string {
 // If the statement carries ObjType+ObjName, it registers the object in the compat
 // registry so subsequent DROP statements can verify its existence. M0097-drop_if_exists.
 func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
+	// SECURITY LABEL always fails: goopg has no C-extension mechanism to load a
+	// security-label provider (sepgsql, etc.), so `label_provider_list` is
+	// permanently empty, exactly as real PG's ExecSecLabelStmt (seclabel.c)
+	// checks BEFORE ever resolving the target object. Mirror both of its
+	// ERRCODE_INVALID_PARAMETER_VALUE (22023) messages verbatim. DU-002 slice 438.
+	if s.Tag == "SECURITY LABEL" {
+		if s.SecurityLabelProvider != "" {
+			return &ExecError{Code: "22023", Pos: -1,
+				Message: fmt.Sprintf("security label provider %q is not loaded", s.SecurityLabelProvider)}
+		}
+		return &ExecError{Code: "22023", Pos: -1,
+			Message: "no security label providers have been loaded"}
+	}
 	// A GRANT/REVOKE … ON DATABASE changes the pg_database ACL. PostgreSQL takes
 	// no heavyweight lock for an ACL change — the lock IS the catalog tuple's
 	// xmax — so a concurrent in-place datfrozenxid update (a database-wide VACUUM)

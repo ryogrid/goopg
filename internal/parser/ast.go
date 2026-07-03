@@ -2016,6 +2016,13 @@ type CompatNoopStmt struct {
 	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
 	TableName ObjectName // optional: table name for rule compat registry
 	RuleKind  string     // optional: rule kind for COPY DML error messages (M0097-0140)
+	// SecurityLabelProvider is set (possibly to "") for a `SECURITY LABEL ...`
+	// statement (Tag == "SECURITY LABEL"); "" means no `FOR provider` clause was
+	// given. goopg loads no security-label providers at all, so the executor
+	// always raises PG's own ExecSecLabelStmt error (seclabel.c) for this Tag —
+	// the object clause is parsed-and-discarded since real PG checks the
+	// provider list before ever resolving the target object. DU-002 slice 438.
+	SecurityLabelProvider string
 	// DatabaseACL is set for a GRANT/REVOKE … ON DATABASE … statement. Such an
 	// ACL change takes no heavyweight lock in PostgreSQL — its lock is the
 	// pg_database tuple's xmax — so the executor records the writer XID

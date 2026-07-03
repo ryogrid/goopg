@@ -1174,15 +1174,35 @@ identLedStatement:
 			}
 			return &CompatNoopStmt{pos: t.Pos, Tag: "COMMENT"}, nil
 		case "security":
-			// SECURITY LABEL … — parse as a no-op.
-			p.advance()
+			// SECURITY LABEL [FOR provider] ON <object> IS 'text'|NULL. goopg
+			// loads no security-label providers (no C extension mechanism to
+			// load one), so per PG's own ExecSecLabelStmt (seclabel.c) — which
+			// checks the provider list BEFORE resolving the target object —
+			// this must always raise "security label provider ... is not
+			// loaded" (FOR given) or "no security label providers have been
+			// loaded" (bare form) rather than silently succeeding. The object
+			// clause is parsed-and-discarded: real PG never reaches it either.
+			// DU-002 slice 438.
+			p.advance() // consume SECURITY
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "label") {
+				p.advance() // consume LABEL
+			}
+			provider := ""
+			if p.acceptKeyword(KwFor) {
+				if pt := p.cur(); pt.Kind == TokenStringLit {
+					provider = pt.Value
+					p.advance()
+				} else if id, err := p.parseIdent(); err == nil {
+					provider = identText(id)
+				}
+			}
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL", SecurityLabelProvider: provider}, nil
 		case "lock":
 			// LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT].
 			// M0097: parse into LockTableStmt so the executor can track locks in pg_locks.

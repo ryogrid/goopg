@@ -12913,3 +12913,104 @@ PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
 None — this closes the slice 436 deferral in full; no new discovery this
 loop. This was a pure message-formatting fix (no catalog/WAL/wire-format
 change), so no sibling-path audit beyond the two call sites was needed.
+
+## Follow-up: `SECURITY LABEL` always raises PostgreSQL's own "provider not loaded" error instead of a silent no-op (DU-002 slice 438)
+
+### Problem
+
+`TestPort_PgDumpConnectionSetup` (the DU-002 discovery guard) currently
+passes cleanly against every fixture accumulated through slice 437 — no
+predicted next blocker was recorded, so this loop probed for an untested SQL
+surface directly (a throwaway `zz_probe_test.go`, deleted before commit) with
+several candidates: `ALTER DEFAULT PRIVILEGES` (unimplemented, Effort-L —
+left for a dedicated loop, ledger row below), `CREATE TABLESPACE ... LOCATION`
+(already correctly rejected — goopg has no external-tablespace support and
+says so), `lo_create()` (unimplemented, Effort-L — no large-object subsystem
+at all, ledger row below), and `SECURITY LABEL ... ON TABLE ... IS '...'`.
+
+The last one silently **succeeded** — `parser.go`'s `case "security":` arm
+(added under M0097-0016 as a blanket compatibility stub alongside GRANT/
+REVOKE/COMMENT ON) consumed the entire statement into a bare
+`CompatNoopStmt{Tag: "SECURITY LABEL"}` with no execution-side handling at
+all, so the executor's `execCompatNoop` fell through every `if` guard and
+returned `nil`. Live-verified against a scratch PostgreSQL 18.3 instance
+(`postgres/local_install`) before implementing:
+
+```
+postgres=# SECURITY LABEL FOR selinux ON TABLE foo IS 'system_u:object_r:sepgsql_table_t:s0';
+ERROR:  22023: security label provider "selinux" is not loaded
+LOCATION:  ExecSecLabelStmt, seclabel.c:151
+postgres=# SECURITY LABEL ON TABLE foo IS 'x';
+ERROR:  22023: no security label providers have been loaded
+LOCATION:  ExecSecLabelStmt, seclabel.c:129
+```
+
+Reading `postgres/src/backend/commands/seclabel.c`'s `ExecSecLabelStmt`
+confirms *why* this is a correctness gap rather than a legitimate no-op, and
+why it is unconditional: PostgreSQL only has label providers when a loadable
+module (`sepgsql`, etc.) registers one via `register_label_provider()` at
+`_PG_init()` time (normally through `shared_preload_libraries`). It checks
+`label_provider_list` **before ever resolving the target object** —
+`get_object_address()` is called only after the provider check succeeds.
+goopg has no C-extension-loading mechanism at all, so `label_provider_list`
+is permanently and unconditionally empty; every `SECURITY LABEL` statement a
+real, unmodified PostgreSQL cluster would ever accept from goopg must
+therefore raise one of exactly the two errors above — there is no
+provider-loaded case to reach. This is the direct sibling of the slice 436
+COMMENT ON fix (a silent-no-op class of divergence for an object-annotation
+DDL statement).
+
+### Fix
+
+`internal/parser/parser.go`'s `case "security":` arm now captures the
+optional `FOR provider` clause (a bare identifier via the existing
+`parseIdent()` unreserved-keyword-aware helper, or a string literal per
+`gram.y`'s `NonReservedWord_or_Sconst`) into a new
+`CompatNoopStmt.SecurityLabelProvider string` field (`internal/parser/ast.go`)
+before consuming the rest of the statement exactly as before (the object
+clause is still parsed-and-discarded — real PG never reaches it either, so
+there is nothing to make goopg resolve).
+
+`internal/executor/operators_ddl.go`'s `execCompatNoop` gained an
+unconditional guard at the top, ahead of every existing `if s.XxxACL`
+branch: when `s.Tag == "SECURITY LABEL"`, return an `*ExecError` with
+`Code: "22023"` (`ERRCODE_INVALID_PARAMETER_VALUE`) and PG's exact wording —
+`security label provider "<name>" is not loaded` when
+`SecurityLabelProvider != ""`, else `no security label providers have been
+loaded`. No catalog/WAL/wire-format touch: this statement never wrote
+anything (there is no `pg_seclabel`/`pg_shseclabel` heap in goopg — the
+`pg_seclabels` virtual view stays permanently empty by construction, slice
+31), so there is nothing to unwind.
+
+### Tests
+
+`TestSecurityLabelAlwaysErrors`
+(`internal/executor/operators_security_label_test.go`) — table-driven across
+the bare form, an explicit `FOR provider` clause, a `COLUMN` target, and a
+nonexistent target table (confirming the provider check really does fire
+before any object-existence check, matching real PG's call order).
+`TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable`
+(`internal/server/dispatch_extended_ddl_test.go`, pre-existing) already
+pinned that `parser.Parse` never fails for a `SECURITY LABEL` statement —
+unaffected, since this fix only changes what the *executor* does with the
+parsed statement, not parseability.
+
+### Gates
+
+`go build ./...` clean; `go vet ./...` clean; `internal/parser`+
+`internal/executor`+`internal/server` suites PASS (full, no regressions);
+`TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS;
+pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+Two candidates probed alongside this one and found genuinely unimplemented,
+each Effort-L and out of scope for this loop: (1) `ALTER DEFAULT PRIVILEGES`
+— no parser support at all (`pg_default_acl` stays a permanently-empty
+virtual view, slice 20); a real implementation needs new catalog storage
+(a `DefaultACL` list keyed by role/schema/objtype) plus wiring every `CREATE
+TABLE`/`CREATE SEQUENCE`/`CREATE FUNCTION`/... path to consult it when
+assigning a new object's initial ACL. (2) large objects (`lo_create`/
+`lo_open`/`lo_import`/...) — entirely unimplemented; `pg_largeobject_metadata`
+stays empty by construction (slice 29). Both are new discoveries from this
+loop's probe, not previously recorded.
