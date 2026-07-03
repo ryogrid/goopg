@@ -11381,3 +11381,104 @@ Still open (deferral ledger row appended): sub-items (a) `subtype_opclass`/
 (d) only the 7 curated subtypes resolve a default opclass; and the newly
 discovered (e) range/multirange-typed table columns have no `pg_attribute`
 resolution and no value storage codec at all (built-in or user-defined).
+
+#### Follow-up: range/multirange-typed table column `pg_attribute` resolution (loop #61)
+
+Closes the **catalog-fidelity half** of discovery (e) above (recorded as a
+fresh ledger row while landing the array-OID follow-up): `CREATE TABLE t (r
+myrange)` did not fail — nothing validates a column's declared type name
+against any registry at `CREATE TABLE` time (confirmed by reading
+`execCreateTable`'s two column-building paths, `internal/executor/
+operators_ddl.go`; the only rewrite is `catalog.InMemory.ResolveColumnType`,
+which resolves domain names to their base type and explicitly leaves
+everything else — including a range name — untouched). The column was
+created fine with `Column.Type.Name = "myrange"`, but `buildUserPGAttributeRow`
+(`internal/executor/pg18_user_catalog_rows.go`) had enum/domain/composite
+branches and **no range/multirange branch at all**, so the column's
+`atttypid` silently fell through to the generic `text` fallback (the
+guaranteed non-built-in sentinel `TypeNameToOID` returns for any unknown
+name).
+
+Landed, mirroring the existing enum/composite branches exactly:
+
+- New `Catalog.LookupRangeType(name)` and `LookupRangeTypeByMultirangeName(name)`
+  interface methods (`internal/catalog/catalog.go`) — `LookupRangeType` already
+  existed as an `*InMemory` method but was never exposed on the interface (the
+  catalog-row builders take `cat catalog.Catalog`, not the concrete type).
+  `LookupRangeTypeByMultirangeName` is new: unlike PG's `pg_type`, `rangeTypes`
+  is keyed by the range name only, but a column can be declared directly with
+  the *multirange*'s own name (`CREATE TABLE t (m mymultirange)`), so a second
+  lookup path is needed — a linear scan over the same small map, matching the
+  existing `LookupRangeTypeByOID`/`ByMultirangeOID`/`ByArrayOID`/
+  `ByMultirangeArrayOID` scan pattern (none of those are indexed either).
+- `buildUserPGAttributeRow` gains a range/multirange resolution block, guarded
+  on `typOID == catalog.OIDText && enumOID == 0 && enumArrayOID == 0 &&
+  compositeOID == 0 && compositeArrayOID == 0` (mutually exclusive with the
+  other user-type branches, same shape as the composite guard): tries
+  `LookupRangeType(col.Type.Name)` first, then
+  `LookupRangeTypeByMultirangeName(col.Type.Name)`; sets `typOID`/`rangeOID` to
+  `rt.OID`/`rt.MultirangeOID` (scalar) or tracks `rangeArrayOID` as
+  `rt.ArrayOID`/`rt.MultirangeArrayOID` (array, remapped in the existing
+  attndims switch alongside `enumArrayOID`/`domainArrayOID`/`compositeArrayOID`).
+  Physical attrs (`attlen=-1, attbyval=false, attstorage='x'`) and alignment
+  mirror `buildUserPGTypeRowForRange`/`ForMultirange`'s own subtype-driven rule
+  (double-aligned iff the subtype is double-aligned, int-aligned otherwise) —
+  a new `rangeOID != 0, rangeArrayOID != 0` case in the attrs switch computes
+  it via `userTypeAttrsForOID(catalog.TypeNameToOID(rangeSubtypeName))`, same
+  as the standalone `pg_type`-row builders do.
+- The identical block was added to `buildUserPGAttributeRowForCompositeField`
+  (`internal/executor/pg18_user_catalog_rows.go`) — a composite type field
+  declared as a range/multirange (e.g. `CREATE TYPE ct AS (r myrange)`) has
+  the exact same missing-branch gap one level down, keyed on `base` (the
+  already-parsed bare type name) instead of `col.Type.Name`.
+- No parser changes, no `CREATE TABLE` type-validation changes (there was none
+  to extend — a range name keeps sailing through unresolved exactly like an
+  enum/composite name already does), and no `expr.go`/`format_type` changes:
+  `format_type`'s range/multirange branches (added for the standalone-type
+  slice 429 fixture) already resolve any OID reaching it via
+  `LookupRangeTypeByOID`/`ByMultirangeOID`/`ByArrayOID`/
+  `ByMultirangeArrayOID` — confirming the bug was isolated to the
+  `atttypid`-resolution step, not the name-rendering step. Live end-to-end
+  verification (`goopg init`/`start` on a throwaway data dir + real `psql`):
+  `CREATE TABLE rangecol_t (id int primary key, r myrange, rarr myrange[], mr
+  mymultirange)` now reports `atttypid` 16422/16423/16424 for
+  `r`/`rarr`/`mr` respectively (the range/range-array/multirange OIDs
+  allocated by the preceding `CREATE TYPE`), and `\d rangecol_t` renders `r
+  public.myrange`, `rarr public.myrange[]`, `mr public.mymultirange` — where
+  before this fix all three fell back to `text`/`text[]`.
+
+Tests: new `TestUserPGAttributeRangeColumn` (table-column scalar/array,
+range-name and multirange-name forms, int4 vs. double-aligned `timestamp`
+subtype, nil-catalog text fallback) and
+`TestUserPGAttributeCompositeFieldRange` (the composite-field analogue) in
+`internal/executor/pg18_user_catalog_rows_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/executor`+
+`internal/catalog` suites PASS (full runs, no regression); `TestPort_
+PgDumpConnectionSetup` PASS (unaffected — this fix touches `pg_attribute`
+resolution only, no dump-text change for the pre-existing slice 429 fixture);
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook; live
+`goopg`/`psql` end-to-end smoke as described above.
+
+**New discovery recorded, not fixed this loop:** verifying the above live
+also surfaced that `OID::regtype` (`internal/executor/expr.go`'s `CastExpr`
+`regtype` branch, `KindInt` case, ~line 651-659) resolves an OID back to a
+type **name** only via `oidToBuiltinTypeName` — it has no fallback to any
+user-type registry (enum/composite/domain/range all reach the same
+generic-fallback code path, so this is not range-specific). A range column's
+`atttypid::regtype` therefore prints the bare numeric OID
+(`SELECT atttypid::regtype FROM pg_attribute ...` → `16422`) where real
+PostgreSQL's `regtypeout` renders the schema-qualified name (`public.myrange`)
+exactly like `format_type` does — a pg_dump-irrelevant but
+introspection-visible divergence for **every** user-defined type kind, not
+just ranges. Still open, unrelated to this loop's `pg_attribute` fix (a fresh
+deferral-ledger row is appended for it).
+
+Still open, carried forward unchanged: sub-items (a) `subtype_opclass`/
+`collation`/`canonical`/`subtype_diff` options remain parsed-but-discarded;
+(d) only the 7 curated subtypes resolve a default opclass; and range/
+multirange **value storage** (parse/wire-format/comparison — the other half
+of discovery (e)) is untouched — a range-typed column can now be introspected
+correctly via `pg_attribute`/`\d`/`pg_dump`, but `INSERT`/`SELECT` of an
+actual range value is still unimplemented for any range type, built-in or
+user-defined.

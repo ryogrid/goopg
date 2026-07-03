@@ -91,6 +91,28 @@ prev-link fixes.
       consistent across plain-`INHERITS` and `PARTITION OF`; no further known
       NOT NULL locality gaps. Resume for `002-010` proper is still the next
       catalog-getter gap surfaced by `TestPort_PgDumpConnectionSetup`.
+      **2026-07-03 (loop #61, DU-002 slice 429 follow-up): range/multirange
+      table-column `pg_attribute` resolution LANDED** — closes the
+      catalog-fidelity half of the loop #60 discovery. `buildUserPGAttributeRow`/
+      `buildUserPGAttributeRowForCompositeField`
+      (`internal/executor/pg18_user_catalog_rows.go`) gain a range/multirange
+      branch (mirroring the enum/composite ones), backed by two new
+      `Catalog` interface methods (`LookupRangeType`, new
+      `LookupRangeTypeByMultirangeName`). A `CREATE TABLE t (r myrange)`
+      column's `atttypid` no longer falls back to `text`; verified live via
+      real `goopg`/`psql` (`\d` now renders `public.myrange`/
+      `public.myrange[]`/`public.mymultirange`). Tests:
+      `TestUserPGAttributeRangeColumn` + `TestUserPGAttributeCompositeFieldRange`.
+      Design doc "Follow-up: range/multirange-typed table column
+      `pg_attribute` resolution (loop #61)". Gates: build/vet clean;
+      `internal/executor`+`internal/catalog` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
+      appended): range/multirange **value storage** (parse/wire-format/
+      comparison) is still entirely unimplemented — this fix is
+      introspection-only. New discovery (separate ledger row, `-` open):
+      `OID::regtype` has no user-type-registry fallback (generic gap across
+      enum/composite/domain/range, not range-specific).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

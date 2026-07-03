@@ -675,6 +675,39 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 		}
 	}
+	// A column whose declared type is a user-defined RANGE type (`CREATE TYPE x
+	// AS RANGE (...)`) — or its auto-generated MULTIRANGE type, which a column
+	// can also be declared with directly — likewise resolves to the text
+	// fallback above (no built-in name collision is possible). Re-resolve it to
+	// the range's/multirange's dynamically-allocated pg_type OID so
+	// pg_attribute.atttypid points at it and pg_dump's format_type renders the
+	// schema-qualified range/multirange name (LookupRangeTypeByOID/
+	// ByMultirangeOID, expr.go) rather than `text`. A `myrange[]`/
+	// `mymultirange[]` column resolves to the respective auto-generated array
+	// OID. Guarded on no enum/composite match so the user-type branches stay
+	// mutually exclusive. DU-002 slice 429 follow-up.
+	rangeOID := uint32(0)
+	rangeArrayOID := uint32(0)
+	rangeSubtypeName := ""
+	if cat != nil && typOID == catalog.OIDText && enumOID == 0 && enumArrayOID == 0 && compositeOID == 0 && compositeArrayOID == 0 {
+		if rt, ok := cat.LookupRangeType(col.Type.Name); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if col.Type.IsArray {
+				rangeArrayOID = rt.ArrayOID
+			} else {
+				typOID = rt.OID
+				rangeOID = rt.OID
+			}
+		} else if rt, ok := cat.LookupRangeTypeByMultirangeName(col.Type.Name); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if col.Type.IsArray {
+				rangeArrayOID = rt.MultirangeArrayOID
+			} else {
+				typOID = rt.MultirangeOID
+				rangeOID = rt.MultirangeOID
+			}
+		}
+	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
 	// from the base OID before remapping typOID to the array (_typename) OID.
 	typmod := pgAttTypmod(typOID, col.Type.Args)
@@ -692,6 +725,11 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		case compositeArrayOID != 0:
 			// Composite array OIDs are dynamic too. DU-002 slice 373.
 			typOID = compositeArrayOID
+			attndims = 1
+		case rangeArrayOID != 0:
+			// Range/multirange array OIDs are dynamic too. DU-002 slice 429
+			// follow-up.
+			typOID = rangeArrayOID
 			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
@@ -731,6 +769,17 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// A composite's array type shares the composite element's layout
 		// (mirrors buildUserPGTypeRowForCompositeArray). DU-002 slice 373.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case rangeOID != 0, rangeArrayOID != 0:
+		// A range/multirange (and its array) is always varlena, never
+		// collatable, extended-storage; alignment mirrors PG's DefineRange
+		// rule — double if the subtype is double-aligned, int otherwise
+		// (matches buildUserPGTypeRowForRange/ForRangeArray/ForMultirange/
+		// ForMultirangeArray). DU-002 slice 429 follow-up.
+		align := byte('i')
+		if userTypeAttrsForOID(catalog.TypeNameToOID(rangeSubtypeName)).TypAlign == 'd' {
+			align = 'd'
+		}
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: align, TypStorage: 'x'}
 	}
 	// A per-column storage override (ALTER COLUMN ... SET STORAGE) shadows the
 	// type's default storage in pg_attribute.attstorage. pg_dump compares
@@ -1651,6 +1700,33 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 			}
 		}
 	}
+	// A field whose declared type is a user-defined RANGE (or its
+	// auto-generated MULTIRANGE) type also folds to the text fallback.
+	// Re-resolve to the range's/multirange's pg_type OID so format_type
+	// renders the field as the schema-qualified name rather than `text`.
+	// Mirrors the table-column path (DU-002 slice 429 follow-up).
+	rangeOID := uint32(0)
+	rangeArrayOID := uint32(0)
+	rangeSubtypeName := ""
+	if cat != nil && typOID == catalog.OIDText {
+		if rt, ok := cat.LookupRangeType(base); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if isArray {
+				rangeArrayOID = rt.ArrayOID
+			} else {
+				typOID = rt.OID
+				rangeOID = rt.OID
+			}
+		} else if rt, ok := cat.LookupRangeTypeByMultirangeName(base); ok {
+			rangeSubtypeName = rt.SubtypeName
+			if isArray {
+				rangeArrayOID = rt.MultirangeArrayOID
+			} else {
+				typOID = rt.MultirangeOID
+				rangeOID = rt.MultirangeOID
+			}
+		}
+	}
 	attndims := int64(0)
 	if isArray {
 		switch {
@@ -1665,6 +1741,11 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		case domainArrayOID != 0:
 			// Domain array OIDs are dynamic too. DU-002 slice 252.
 			typOID = domainArrayOID
+			attndims = 1
+		case rangeArrayOID != 0:
+			// Range/multirange array OIDs are dynamic too. DU-002 slice 429
+			// follow-up.
+			typOID = rangeArrayOID
 			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
@@ -1681,6 +1762,14 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		// An enum's array type is a standard varlena array: -1 length,
 		// int-aligned (matching the 4-byte enum element), extended storage.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case rangeOID != 0, rangeArrayOID != 0:
+		// Mirrors the table-column range/multirange case. DU-002 slice 429
+		// follow-up.
+		align := byte('i')
+		if userTypeAttrsForOID(catalog.TypeNameToOID(rangeSubtypeName)).TypAlign == 'd' {
+			align = 'd'
+		}
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: align, TypStorage: 'x'}
 	case compositeArrayOID != 0:
 		// An array of a composite type is a standard varlena array: -1 length,
 		// double-aligned (matching the double-aligned composite element),

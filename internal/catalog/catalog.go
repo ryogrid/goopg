@@ -1956,6 +1956,16 @@ type Catalog interface {
 	// to render a composite-array field (`addr[]`) as the schema-qualified array
 	// name. DU-002 slice 250.
 	LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bool)
+	// LookupRangeType finds a user-defined range type by name (case-insensitive).
+	// Exposed on the interface so the catalog-row builders can resolve a range
+	// (or multirange) column's declared type name to its pg_type OID, mirroring
+	// LookupEnum/LookupCompositeType. DU-002 slice 429 follow-up.
+	LookupRangeType(name string) (*RangeType, bool)
+	// LookupRangeTypeByMultirangeName finds a user-defined range type by its
+	// auto-generated multirange type's name (case-insensitive) — a column can be
+	// declared directly with the multirange name (e.g. `mymultirange`), not only
+	// the range name. DU-002 slice 429 follow-up.
+	LookupRangeTypeByMultirangeName(name string) (*RangeType, bool)
 	// LookupRangeTypeByOID finds a user-defined range type by its pg_type OID,
 	// used by format_type to render a range column's declared type. M0110-0001.
 	LookupRangeTypeByOID(oid uint32) (*RangeType, bool)
@@ -15577,6 +15587,23 @@ func (c *InMemory) LookupRangeType(name string) (*RangeType, bool) {
 	defer c.mu.RUnlock()
 	rt, ok := c.rangeTypes[strings.ToLower(name)]
 	return rt, ok
+}
+
+// LookupRangeTypeByMultirangeName finds a user-defined range type by its
+// auto-generated multirange type's name (case-insensitive). rangeTypes is
+// keyed by the range name only, so this is a linear scan — mirrors the other
+// ByOID-style lookups below, which scan the same small map. M0110-0001 DU-002
+// slice 429 follow-up.
+func (c *InMemory) LookupRangeTypeByMultirangeName(name string) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	lower := strings.ToLower(name)
+	for _, rt := range c.rangeTypes {
+		if rt.MultirangeName == lower {
+			return rt, true
+		}
+	}
+	return nil, false
 }
 
 // LookupRangeTypeByOID finds a user-defined range type by its pg_type OID,

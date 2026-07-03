@@ -1388,6 +1388,72 @@ func TestUserPGAttributeCompositeFieldNestedComposite(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldRange pins the RANGE/MULTIRANGE-FIELD
+// resolution for a composite type field (DU-002 slice 429 follow-up) — the
+// composite-field analogue of TestUserPGAttributeRangeColumn. A composite
+// field declared with a user-defined range type (or its auto-generated
+// multirange type), scalar or array, folds to the text fallback inside
+// parseCompositeFieldType exactly like the enum/domain/nested-composite
+// cases above; the builder must re-resolve it to the range's/multirange's
+// pg_type OID.
+func TestUserPGAttributeCompositeFieldRange(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	if err != nil {
+		t.Fatalf("RegisterRangeType: %v", err)
+	}
+	// CREATE TYPE rec AS (span myrange, spans myrange[], mspan mymultirange).
+	ct := cat.RegisterCompositeTypeWithFields("rec", []catalog.CompositeField{
+		{Name: "span", ColType: "myrange"},
+		{Name: "spans", ColType: "myrange [ ]"},
+		{Name: "mspan", ColType: rt.MultirangeName},
+	})
+
+	a0 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[0], 1)
+	if got := uint32(a0[atttypidIdx].Int); got != rt.OID {
+		t.Errorf("span field: atttypid=%d want %d (range OID)", got, rt.OID)
+	}
+	if got := a0[attlenIdx].Int; got != -1 {
+		t.Errorf("span field: attlen=%d want -1 (varlena range)", got)
+	}
+	if got := a0[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("span field: attbyval=%v want false", got)
+	}
+	if got := a0[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("span field: attalign=%q want \"i\" (int4 subtype)", got)
+	}
+	if got := a0[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("span field: attstorage=%q want \"x\" (extended)", got)
+	}
+
+	a1 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != rt.ArrayOID {
+		t.Errorf("spans field: atttypid=%d want %d (range array OID)", got, rt.ArrayOID)
+	}
+	if got := a1[attndimsIdx].Int; got != 1 {
+		t.Errorf("spans field: attndims=%d want 1", got)
+	}
+
+	a2 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[2], 3)
+	if got := uint32(a2[atttypidIdx].Int); got != rt.MultirangeOID {
+		t.Errorf("mspan field: atttypid=%d want %d (multirange OID)", got, rt.MultirangeOID)
+	}
+
+	// Without a catalog the range cannot be resolved → text fallback.
+	aNil := buildUserPGAttributeRowForCompositeField(nil, ct, ct.Fields[0], 1)
+	if got := uint32(aNil[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("span field (nil cat): atttypid=%d want %d (text fallback)", got, catalog.OIDText)
+	}
+}
+
 // TestUserPGAttributeCompositeFieldCompositeArray pins the COMPOSITE-ARRAY-FIELD
 // resolution (DU-002 slice 250). A composite field whose declared type is an
 // array of another user-defined composite type (`addr[]`) folds to the text
@@ -1868,6 +1934,104 @@ func TestUserPGAttributeCompositeColumn(t *testing.T) {
 	}
 	if got := uint32(buildUserPGAttributeRow(nil, tbl, arr)[atttypidIdx].Int); got != catalog.ArrayOIDForBase(catalog.OIDText) {
 		t.Errorf("nil-catalog composite-array column: atttypid=%d want %d (text[])", got, catalog.ArrayOIDForBase(catalog.OIDText))
+	}
+}
+
+// TestUserPGAttributeRangeColumn pins pg_attribute resolution for a table
+// column declared with a user-defined RANGE type or its auto-generated
+// MULTIRANGE type (scalar and array forms of both) — the discovery recorded
+// in the DU-002 slice 429 deferral-ledger row: buildUserPGAttributeRow had
+// enum/domain/composite branches but no range/multirange branch at all, so
+// such a column silently fell through to the generic text fallback.
+func TestUserPGAttributeRangeColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	if err != nil {
+		t.Fatalf("RegisterRangeType: %v", err)
+	}
+	// timestamp is double-aligned, unlike int4's int-alignment — exercises the
+	// subtype-driven align derivation (mirrors buildUserPGTypeRowForRange).
+	tsRT, err := cat.RegisterRangeType("mytsrange", "timestamp", "")
+	if err != nil {
+		t.Fatalf("RegisterRangeType(timestamp): %v", err)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "rangecol", OID: 16600}
+
+	checkScalar := func(name string, col catalog.Column, wantOID uint32, wantAlign string) {
+		t.Helper()
+		row := buildUserPGAttributeRow(cat, tbl, col)
+		if got := uint32(row[atttypidIdx].Int); got != wantOID {
+			t.Errorf("%s: atttypid=%d want %d", name, got, wantOID)
+		}
+		if got := row[attndimsIdx].Int; got != 0 {
+			t.Errorf("%s: attndims=%d want 0", name, got)
+		}
+		if got := row[attlenIdx].Int; got != -1 {
+			t.Errorf("%s: attlen=%d want -1", name, got)
+		}
+		if got := row[attbyvalIdx].BoolValue(); got != false {
+			t.Errorf("%s: attbyval=%v want false", name, got)
+		}
+		if got := row[attalignIdx].StringValue(); got != wantAlign {
+			t.Errorf("%s: attalign=%q want %q", name, got, wantAlign)
+		}
+		if got := row[attstorageIdx].StringValue(); got != "x" {
+			t.Errorf("%s: attstorage=%q want \"x\"", name, got)
+		}
+	}
+	checkArray := func(name string, col catalog.Column, wantArrayOID uint32, wantAlign string) {
+		t.Helper()
+		row := buildUserPGAttributeRow(cat, tbl, col)
+		if got := uint32(row[atttypidIdx].Int); got != wantArrayOID {
+			t.Errorf("%s: atttypid=%d want %d (array OID)", name, got, wantArrayOID)
+		}
+		if got := row[attndimsIdx].Int; got != 1 {
+			t.Errorf("%s: attndims=%d want 1", name, got)
+		}
+		if got := row[attalignIdx].StringValue(); got != wantAlign {
+			t.Errorf("%s: attalign=%q want %q", name, got, wantAlign)
+		}
+		if got := row[attstorageIdx].StringValue(); got != "x" {
+			t.Errorf("%s: attstorage=%q want \"x\"", name, got)
+		}
+	}
+
+	// Scalar range column: atttypid = range OID, int-aligned (int4 subtype).
+	checkScalar("range column", catalog.Column{Name: "r", Type: catalog.Type{Name: "myrange"}}, rt.OID, "i")
+	// Array-of-range column: atttypid = range's auto-generated array OID.
+	checkArray("range-array column", catalog.Column{Name: "rarr", Type: catalog.Type{Name: "myrange", IsArray: true}}, rt.ArrayOID, "i")
+	// Scalar multirange column, declared directly by the multirange's own name.
+	checkScalar("multirange column", catalog.Column{Name: "mr", Type: catalog.Type{Name: rt.MultirangeName}}, rt.MultirangeOID, "i")
+	// Array-of-multirange column.
+	checkArray("multirange-array column", catalog.Column{Name: "mrarr", Type: catalog.Type{Name: rt.MultirangeName, IsArray: true}}, rt.MultirangeArrayOID, "i")
+	// Double-aligned subtype (timestamp) propagates to both the range and its
+	// auto-generated array.
+	checkScalar("timestamp-range column", catalog.Column{Name: "tsr", Type: catalog.Type{Name: "mytsrange"}}, tsRT.OID, "d")
+	checkArray("timestamp-range-array column", catalog.Column{Name: "tsrarr", Type: catalog.Type{Name: "mytsrange", IsArray: true}}, tsRT.ArrayOID, "d")
+
+	// LookupRangeTypeByOID/ByArrayOID/ByMultirangeOID/ByMultirangeArrayOID are
+	// the inverses format_type uses to render the column back to its
+	// schema-qualified range/multirange name.
+	if got, ok := cat.LookupRangeTypeByOID(rt.OID); !ok || got.Name != "myrange" {
+		t.Errorf("LookupRangeTypeByOID(%d)=%v,%v want myrange,true", rt.OID, got, ok)
+	}
+	if got, ok := cat.LookupRangeTypeByMultirangeOID(rt.MultirangeOID); !ok || got.Name != "myrange" {
+		t.Errorf("LookupRangeTypeByMultirangeOID(%d)=%v,%v want myrange,true", rt.MultirangeOID, got, ok)
+	}
+
+	// nil catalog (unit fixture without a registry): no re-resolution, the
+	// scalar column folds to the built-in text OID and the array to text[].
+	scalar := catalog.Column{Name: "r", Type: catalog.Type{Name: "myrange"}}
+	if got := uint32(buildUserPGAttributeRow(nil, tbl, scalar)[atttypidIdx].Int); got != uint32(catalog.OIDText) {
+		t.Errorf("nil-catalog range column: atttypid=%d want %d (text)", got, catalog.OIDText)
 	}
 }
 
