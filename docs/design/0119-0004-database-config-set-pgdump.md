@@ -181,8 +181,59 @@ resolved through the database registry.
   role-scoped and role-and-database-scoped halves of `pg_db_role_setting`,
   `setrole != 0`) remain entirely unimplemented — `dumpDatabaseConfig`'s
   second query (`setrole = r.oid`) always returns zero rows against goopg.
-- **`SET TIME ZONE value`, `SET SESSION AUTHORIZATION`, and `SET ... FROM
-  CURRENT`** (PG grammar special-cases distinct from the plain `SET name =
-  value` form) are not recognised by `parseAlterDatabaseConfig` and fall
-  through to the pre-existing no-op absorption like any other unmodelled
-  ALTER DATABASE form.
+- **`SET ... FROM CURRENT`** (PG grammar special-case distinct from the
+  plain `SET name = value` form — reads the session's *current* value of
+  the named GUC rather than a literal) is not recognised by
+  `parseAlterDatabaseConfig` and falls through to the pre-existing no-op
+  absorption like any other unmodelled ALTER DATABASE form. Needs the
+  session's live GUC-value lookup wired through, which the six special
+  forms fixed below did not need (they carry their own literal value).
+
+### Follow-up: `TIME ZONE`/`SCHEMA`/`NAMES`/`ROLE`/`SESSION AUTHORIZATION`/`XML OPTION` special-form GUC translation (loop #78)
+
+Closes the `SET TIME ZONE value`/`SET SESSION AUTHORIZATION` bullet above
+(minus `SET ... FROM CURRENT`, which remains open — see above). Real PG's
+`set_rest` grammar production (`postgres/src/backend/parser/gram.y`
+~line 1708) accepts six "special syntaxes" as alternatives to the generic
+`name TO|= value` form: `TIME ZONE zone_value`, `SCHEMA Sconst`, `NAMES
+opt_encoding`, `ROLE NonReservedWord_or_Sconst`, `SESSION AUTHORIZATION
+{NonReservedWord_or_Sconst|DEFAULT}`, `XML OPTION {DOCUMENT|CONTENT}` —
+each translating to a plain `VariableSetStmt{kind: VAR_SET_VALUE|
+VAR_SET_DEFAULT, name: "timezone"|"search_path"|"client_encoding"|"role"|
+"session_authorization"|"xmloption"}`. `SetResetClause` (used by both the
+plain `SET` statement and `AlterDatabaseSetStmt`/`AlterRoleSetStmt`)
+reduces to the identical `set_rest` production, so all six are valid inside
+`ALTER DATABASE ... SET` too, and `dbcommands.c AlterDatabaseSet` ->
+`pg_db_role_setting.c AlterSetting` -> `guc_funcs.c
+ExtractSetVariableArgs` stores the translated name/value pair exactly like
+the generic form — no separate storage path. `parseAlterDatabaseConfig`
+only ever matched `configName TO|= value`/`RESET [name|ALL]`, so e.g. `SET
+TIME ZONE 'UTC'` failed the `to `/`=` check (its first token, `TIME`, was
+treated as `configName`, leaving `ZONE 'UTC'` as the unmatched remainder)
+and silently fell through to no-op absorption — a real command a WordPress-
+or ORM-style client can plausibly send (`SET SCHEMA`/`SET NAMES` are common
+compatibility idioms) was accepted with an `ALTER DATABASE`
+`CommandComplete` but never actually applied. New shared helper
+`parseSetRestSpecialForm` (`internal/server/database_ddl.go`, used by both
+`parseAlterDatabaseConfig` and `parseAlterRoleConfig` — see the sibling
+role-config design doc) recognizes the six forms on the raw text following
+`SET ` and returns the translated `(configName, configValue, reset)`
+before the generic `configName TO|= value` parse runs; `TRANSACTION
+SNAPSHOT` is deliberately excluded (`ExtractSetVariableArgs` has no case
+for `VAR_SET_MULTI`, so real PG cannot store it via `AlterSetting` either —
+it is a transaction-scoped command, not a persistable GUC). Live-verified
+end-to-end (throwaway data dir, real `psql`/`pg_dumpall` 18.3): `ALTER
+DATABASE postgres SET TIME ZONE 'UTC'`/`SET SCHEMA 'app'`/`SET NAMES
+'utf8'` all populate `pg_db_role_setting.setconfig` with the correct
+translated GUC name, and `ALTER ROLE ... SET SESSION AUTHORIZATION
+'postgres'` round-trips byte-identically through `pg_dumpall
+--roles-only` (`ALTER ROLE verifyrole SET session_authorization TO
+'postgres';`).
+
+Tests: `TestParseAlterDatabaseConfig`/`TestParseAlterRoleConfig`
+(`internal/server/database_ddl_test.go`/`role_config_test.go`), new cases
+for all six forms plus one `IN DATABASE` combination.
+
+Gates: `go build ./...` clean; `go test ./internal/server/...` PASS (full
+suite, no regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke = pre-commit hook.

@@ -70,6 +70,58 @@ func TestParseAlterRoleConfig(t *testing.T) {
 			want: alterRoleConfigOp{roleName: "foo", hasDatabase: true, dbName: "postgres", resetAll: true},
 			ok:   true,
 		},
+		// gram.y set_rest "special syntaxes" — valid inside ALTER ROLE's
+		// SetResetClause exactly like a plain SET (same grammar production).
+		{
+			sql:  "ALTER ROLE foo SET TIME ZONE 'UTC'",
+			want: alterRoleConfigOp{roleName: "foo", configName: "timezone", configValue: "UTC"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET TIME ZONE DEFAULT",
+			want: alterRoleConfigOp{roleName: "foo", configName: "timezone", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET SCHEMA 'app'",
+			want: alterRoleConfigOp{roleName: "foo", configName: "search_path", configValue: "app"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET NAMES 'utf8'",
+			want: alterRoleConfigOp{roleName: "foo", configName: "client_encoding", configValue: "utf8"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET NAMES",
+			want: alterRoleConfigOp{roleName: "foo", configName: "client_encoding", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET ROLE 'alice'",
+			want: alterRoleConfigOp{roleName: "foo", configName: "role", configValue: "alice"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET SESSION AUTHORIZATION 'alice'",
+			want: alterRoleConfigOp{roleName: "foo", configName: "session_authorization", configValue: "alice"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET SESSION AUTHORIZATION DEFAULT",
+			want: alterRoleConfigOp{roleName: "foo", configName: "session_authorization", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo SET XML OPTION DOCUMENT",
+			want: alterRoleConfigOp{roleName: "foo", configName: "xmloption", configValue: "DOCUMENT"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE foo IN DATABASE postgres SET TIME ZONE 'UTC'",
+			want: alterRoleConfigOp{roleName: "foo", hasDatabase: true, dbName: "postgres", configName: "timezone", configValue: "UTC"},
+			ok:   true,
+		},
 		// negatives: forms handled elsewhere in tryHandleRoleDDL, or
 		// unmodelled ALTER ROLE forms, must fall through unrecognised.
 		{sql: "ALTER ROLE foo RENAME TO bar", ok: false},

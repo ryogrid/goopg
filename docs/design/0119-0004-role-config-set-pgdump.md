@@ -185,8 +185,13 @@ rename — `RenameRole` preserves it), not its name.
   (`RoleConfigEntries(roleOid, 0)`) already supports this shape (exercised
   by the unit/WAL/recovery tests above), so closing this is purely a
   pg_dumpall TAP-porting task, not a new engine capability.
-- **`SET TIME ZONE value`, `SET SESSION AUTHORIZATION`, and `SET ... FROM
-  CURRENT`** are not recognised by `parseAlterRoleConfig` and fall through
-  to the pre-existing no-op absorption, same as `parseAlterDatabaseConfig`.
+- **`SET ... FROM CURRENT`** is not recognised by `parseAlterRoleConfig` and
+  falls through to the pre-existing no-op absorption, same as
+  `parseAlterDatabaseConfig`. `SET TIME ZONE value`/`SET SCHEMA`/`SET
+  NAMES`/`SET ROLE`/`SET SESSION AUTHORIZATION`/`SET XML OPTION` are now
+  recognised — see the "Follow-up: ... special-form GUC translation (loop
+  #78)" section in the sibling `0119-0004-database-config-set-pgdump.md`
+  design doc (shared `parseSetRestSpecialForm` helper, used by both parse
+  functions).
 - **"ALTER ROLE ALL SET ..."** (PG's `role_specification = ALL` form) is not
   supported — see the Fix section's role-resolution note.

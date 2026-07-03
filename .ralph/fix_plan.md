@@ -5208,6 +5208,30 @@ documentation-only and is exempt from the design-doc requirement.)
       no WAL/restart persistence in goopg (a pre-existing, broader gap, not
       specific to event triggers), so an event trigger's `evtfoid` can
       dangle post-restart if its backing function was created post-initdb.
+      **Note (loop #78): this "no WAL/restart persistence" claim was
+      re-verified live at HEAD and found FALSE — already fixed by loop #73's
+      CREATE/ALTER/DROP FUNCTION+PROCEDURE WAL/restart persistence work
+      (`internal/wal/recovery.go` `RecordKindCreateFunction`/
+      `internal/initdb/function_ddl_recovery.go`); this note is stale and can
+      be treated as resolved by loop #73, no code change needed.**
+      **2026-07-03 (loop #78): `TIME ZONE`/`SCHEMA`/`NAMES`/`ROLE`/`SESSION
+      AUTHORIZATION`/`XML OPTION` special-form GUC translation LANDED** for
+      `ALTER DATABASE`/`ALTER ROLE ... SET` — closes the `0119-0004bt`/
+      `0119-0004bu` design-doc rows' own "`SET TIME ZONE`/`SET SESSION
+      AUTHORIZATION` special forms unrecognised" residual. New shared
+      `parseSetRestSpecialForm` (`internal/server/database_ddl.go`) mirrors
+      PG's `gram.y` `set_rest` production's six special syntaxes, called from
+      both `parseAlterDatabaseConfig` and `parseAlterRoleConfig` ahead of the
+      generic `name TO|= value` parse. `SET ... FROM CURRENT` remains
+      unrecognised (needs a live session-GUC read, a different mechanism —
+      see the deferral ledger row). Tests: `TestParseAlterDatabaseConfig`/
+      `TestParseAlterRoleConfig` extended (6 forms × 2 functions + 1
+      `IN DATABASE` case). Gates: `go build ./...` clean; `internal/server`
+      suite PASS; live `psql`/`pg_dumpall` smoke (throwaway data dir);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `0119-0004-database-config-set-pgdump.md`
+      "Follow-up: ... special-form GUC translation (loop #78)", indexed as
+      `0119-0004cp` in `docs/design/README.md`.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

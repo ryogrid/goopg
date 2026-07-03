@@ -93,6 +93,12 @@ func parseAlterDatabaseConfig(sql string) (alterDatabaseConfigOp, bool) {
 	switch {
 	case strings.HasPrefix(lowerRest, "set "):
 		rest = strings.TrimSpace(rest[len("set "):])
+		if name, value, reset, matched := parseSetRestSpecialForm(rest); matched {
+			if reset {
+				return alterDatabaseConfigOp{dbName: dbName, configName: name, reset: true}, true
+			}
+			return alterDatabaseConfigOp{dbName: dbName, configName: name, configValue: value}, true
+		}
 		configName, rest, ok := splitLeadingSQLToken(rest)
 		if !ok || configName == "" {
 			return alterDatabaseConfigOp{}, false
@@ -195,6 +201,83 @@ func flattenConfigValueList(s string) (string, bool) {
 		}
 	}
 	return strings.Join(flat, ","), true
+}
+
+// parseSetRestSpecialForm recognizes the SQL-standard/PostgreSQL "special
+// syntaxes" that gram.y's set_rest production accepts as alternatives to
+// the generic `name TO|= value` form (postgres/src/backend/parser/gram.y,
+// set_rest: TIME ZONE / SCHEMA / NAMES / ROLE / SESSION AUTHORIZATION /
+// XML OPTION). SetResetClause — used by both the plain SET statement and
+// ALTER DATABASE/ROLE's SET clause (AlterDatabaseSetStmt/AlterRoleSetStmt)
+// — reduces to the identical set_rest production, so these forms are valid
+// there too and PG's AlterSetting stores the same translated name/value
+// pair into pg_db_role_setting (dbcommands.c AlterDatabaseSet -> guc_funcs.c
+// ExtractSetVariableArgs). rest is the text immediately following the "set "
+// keyword (already trimmed). matched=false means rest is not one of these
+// forms; the caller should fall back to generic name/value parsing.
+//
+// TRANSACTION SNAPSHOT is deliberately excluded: its VAR_SET_MULTI kind has
+// no case in ExtractSetVariableArgs, so real PG cannot store it via
+// AlterSetting either — it is a transaction-scoped command, not a
+// persistable GUC.
+func parseSetRestSpecialForm(rest string) (configName, configValue string, reset, matched bool) {
+	lower := strings.ToLower(rest)
+	switch {
+	case strings.HasPrefix(lower, "time zone "):
+		val := strings.TrimSpace(rest[len("time zone "):])
+		if strings.EqualFold(val, "default") || strings.EqualFold(val, "local") {
+			return "timezone", "", true, true
+		}
+		v, ok := flattenConfigValueList(val)
+		if !ok {
+			return "", "", false, false
+		}
+		return "timezone", v, false, true
+	case strings.HasPrefix(lower, "schema "):
+		val := strings.TrimSpace(rest[len("schema "):])
+		v, ok := flattenConfigValueList(val)
+		if !ok {
+			return "", "", false, false
+		}
+		return "search_path", v, false, true
+	case lower == "names" || strings.HasPrefix(lower, "names "):
+		val := strings.TrimSpace(rest[len("names"):])
+		if val == "" || strings.EqualFold(val, "default") {
+			return "client_encoding", "", true, true
+		}
+		v, ok := flattenConfigValueList(val)
+		if !ok {
+			return "", "", false, false
+		}
+		return "client_encoding", v, false, true
+	case strings.HasPrefix(lower, "role "):
+		val := strings.TrimSpace(rest[len("role "):])
+		v, ok := flattenConfigValueList(val)
+		if !ok {
+			return "", "", false, false
+		}
+		return "role", v, false, true
+	case strings.HasPrefix(lower, "session authorization "):
+		val := strings.TrimSpace(rest[len("session authorization "):])
+		if strings.EqualFold(val, "default") {
+			return "session_authorization", "", true, true
+		}
+		v, ok := flattenConfigValueList(val)
+		if !ok {
+			return "", "", false, false
+		}
+		return "session_authorization", v, false, true
+	case strings.HasPrefix(lower, "xml option "):
+		val := strings.TrimSpace(rest[len("xml option "):])
+		switch strings.ToUpper(val) {
+		case "DOCUMENT":
+			return "xmloption", "DOCUMENT", false, true
+		case "CONTENT":
+			return "xmloption", "CONTENT", false, true
+		}
+		return "", "", false, false
+	}
+	return "", "", false, false
 }
 
 // splitTopLevelSQLCommas splits s on ',' characters that are not inside a

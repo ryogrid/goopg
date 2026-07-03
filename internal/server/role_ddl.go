@@ -480,6 +480,15 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 	switch {
 	case strings.HasPrefix(lowerRest, "set "):
 		rest = strings.TrimSpace(rest[len("set "):])
+		if name, value, reset, matched := parseSetRestSpecialForm(rest); matched {
+			op.configName = name
+			if reset {
+				op.reset = true
+			} else {
+				op.configValue = value
+			}
+			return op, true
+		}
 		configName, rest, ok := splitLeadingSQLToken(rest)
 		if !ok || configName == "" {
 			return alterRoleConfigOp{}, false

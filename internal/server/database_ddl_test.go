@@ -133,6 +133,53 @@ func TestParseAlterDatabaseConfig(t *testing.T) {
 			want: alterDatabaseConfigOp{dbName: "postgres", resetAll: true},
 			ok:   true,
 		},
+		// gram.y set_rest "special syntaxes" — valid inside ALTER DATABASE's
+		// SetResetClause exactly like a plain SET (same grammar production).
+		{
+			sql:  "ALTER DATABASE postgres SET TIME ZONE 'UTC'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "timezone", configValue: "UTC"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET TIME ZONE DEFAULT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "timezone", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET SCHEMA 'app'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "search_path", configValue: "app"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET NAMES 'utf8'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "client_encoding", configValue: "utf8"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET NAMES",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "client_encoding", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET ROLE 'alice'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "role", configValue: "alice"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET SESSION AUTHORIZATION 'alice'",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "session_authorization", configValue: "alice"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET SESSION AUTHORIZATION DEFAULT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "session_authorization", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER DATABASE postgres SET XML OPTION DOCUMENT",
+			want: alterDatabaseConfigOp{dbName: "postgres", configName: "xmloption", configValue: "DOCUMENT"},
+			ok:   true,
+		},
 		// negatives: unmodelled ALTER DATABASE forms must fall through
 		// unrecognised so the pre-existing compatNoopCommandTag absorption
 		// still handles them.
