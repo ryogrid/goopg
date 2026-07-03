@@ -3107,7 +3107,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	for _, c := range s.Columns {
 		if c.CheckExpr != "" {
 			autoName := tbl.Name + "_" + c.Name + "_check"
-			tbl.AddCheck(autoName, c.CheckExpr, o.allocConstraintOID(autoName))
+			// c.CheckNotEnforced carries a column-level `CHECK (...) NOT
+			// ENFORCED` (PG18) so the dumped constraintdef re-emits the
+			// suffix and pg_constraint reports conenforced=false. DU-002
+			// slice 430.
+			tbl.AddCheckFull(autoName, c.CheckExpr, o.allocConstraintOID(autoName), false, false, c.CheckNotEnforced)
 		}
 	}
 	// Table-level CHECK constraints written without an explicit CONSTRAINT name
@@ -3120,17 +3124,20 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// and OID 0, so the dumped CREATE TABLE silently dropped them. DU-002 slice 127.
 	for i, chk := range s.TableChecks {
 		autoName := o.autoCheckName(tbl, chk)
-		// TableCheckNoInherit is parallel to TableChecks; an anonymous
-		// `CHECK (...) NO INHERIT` must keep its flag so the dumped
-		// constraintdef re-emits the suffix. DU-002 slice 128.
+		// TableCheckNoInherit/TableCheckNotEnforced are parallel to
+		// TableChecks; an anonymous `CHECK (...) NO INHERIT`/`NOT ENFORCED`
+		// must keep its flags so the dumped constraintdef re-emits the
+		// suffixes. DU-002 slices 128, 430.
 		noInherit := i < len(s.TableCheckNoInherit) && s.TableCheckNoInherit[i]
-		tbl.AddCheckWithNoInherit(autoName, chk, o.allocConstraintOID(autoName), noInherit)
+		notEnforced := i < len(s.TableCheckNotEnforced) && s.TableCheckNotEnforced[i]
+		tbl.AddCheckFull(autoName, chk, o.allocConstraintOID(autoName), false, noInherit, notEnforced)
 	}
 	// Named table-level CHECK constraints from CONSTRAINT name CHECK (expr). M0097-0023.
-	// A named `CONSTRAINT c CHECK (...) NO INHERIT` must keep its per-constraint
-	// flag so the dumped constraintdef re-emits the suffix. DU-002 slice 129.
+	// A named `CONSTRAINT c CHECK (...) NO INHERIT`/`NOT ENFORCED` must keep
+	// its per-constraint flags so the dumped constraintdef re-emits the
+	// suffixes. DU-002 slices 129, 430.
 	for _, nc := range s.TableNamedChecks {
-		tbl.AddCheckWithNoInherit(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name), nc.NoInherit)
+		tbl.AddCheckFull(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name), false, nc.NoInherit, nc.NotEnforced)
 	}
 	// Copy statistics from LIKE INCLUDING STATISTICS (or INCLUDING ALL) sources. M0097-0023.
 	if len(likeStatisticsSources) > 0 {
@@ -6743,7 +6750,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
-				tbl.AddCheckWithNotValid(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid)
+				// act.CheckNotEnforced carries an `ADD CONSTRAINT ... CHECK
+				// (...) NOT ENFORCED` (PG18) so the dumped constraintdef
+				// re-emits the ` NOT ENFORCED` suffix (taking precedence over
+				// NOT VALID) and pg_constraint reports conenforced=false.
+				// DU-002 slice 430.
+				tbl.AddCheckFull(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid, false, act.CheckNotEnforced)
 				// Propagate to partition children: merge if child already has the
 				// same constraint (locally defined), otherwise inherit it. M0097-0023.
 				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {

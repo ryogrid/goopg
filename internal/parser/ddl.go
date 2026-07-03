@@ -3215,9 +3215,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, err
 			}
 			stmt.TableChecks = append(stmt.TableChecks, expr)
-			// Accept optional NOT ENFORCED / ENFORCED modifier.
+			// Accept optional NOT ENFORCED / ENFORCED modifier, recording
+			// NOT ENFORCED per-check (parallel to TableChecks) so pg_dump
+			// re-emits the trailing ` NOT ENFORCED` and pg_constraint reports
+			// conenforced=false. DU-002 slice 430.
+			notEnforced := false
 			if p.acceptKeyword(KwNot) {
-				_ = p.acceptIdentKeyword("enforced")
+				if p.acceptIdentKeyword("enforced") {
+					notEnforced = true
+				}
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
@@ -3230,6 +3236,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				noInherit = true
 			}
 			stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
+			stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
@@ -3375,8 +3382,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				} else {
 					stmt.TableChecks = append(stmt.TableChecks, expr)
 				}
+				notEnforced := false
 				if p.acceptKeyword(KwNot) {
-					_ = p.acceptIdentKeyword("enforced")
+					if p.acceptIdentKeyword("enforced") {
+						notEnforced = true
+					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
@@ -3387,15 +3397,22 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					stmt.TableHasNoInheritCheck = true
 					noInherit = true
 				}
-				// Keep TableCheckNoInherit parallel to TableChecks: only the
-				// anonymous branch appended an expr. DU-002 slice 128.
+				// Keep TableCheckNoInherit/TableCheckNotEnforced parallel to
+				// TableChecks: only the anonymous branch appended an expr.
+				// DU-002 slices 128, 430.
 				if anonCheck {
 					stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
-				} else if noInherit && len(stmt.TableNamedChecks) > 0 {
-					// Named branch appended before NO INHERIT was parsed; carry the
-					// per-constraint flag so the named NO-INHERIT check re-emits the
-					// suffix on dump. DU-002 slice 129.
-					stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
+					stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
+				} else if len(stmt.TableNamedChecks) > 0 {
+					// Named branch appended before NO INHERIT/NOT ENFORCED were
+					// parsed; carry the per-constraint flags so the named check
+					// re-emits the suffixes on dump. DU-002 slices 129, 430.
+					if noInherit {
+						stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
+					}
+					if notEnforced {
+						stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NotEnforced = true
+					}
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —
@@ -4089,9 +4106,13 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				return ColumnDef{}, err
 			}
 			col.CheckExpr = expr
-			// Accept optional NOT ENFORCED / ENFORCED.
+			// Accept optional NOT ENFORCED / ENFORCED, recording NOT ENFORCED
+			// so pg_dump re-emits the trailing ` NOT ENFORCED` and
+			// pg_constraint reports conenforced=false. DU-002 slice 430.
 			if p.acceptKeyword(KwNot) {
-				_ = p.acceptIdentKeyword("enforced")
+				if p.acceptIdentKeyword("enforced") {
+					col.CheckNotEnforced = true
+				}
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
@@ -4113,7 +4134,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				col.CheckExpr = expr
 				if p.acceptKeyword(KwNot) {
-					_ = p.acceptIdentKeyword("enforced")
+					if p.acceptIdentKeyword("enforced") {
+						col.CheckNotEnforced = true
+					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
@@ -7913,19 +7936,27 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			return AlterTableAction{}, err
 		}
 		// Consume optional NOT VALID and/or [NOT] ENFORCED trailers (PG18+).
-		// Possible orderings: NOT VALID, ENFORCED, NOT ENFORCED, NOT VALID ENFORCED.
-		// NOT VALID must survive into pg_constraint.convalidated='f' so pg_dump
-		// re-emits the ` NOT VALID` tail and loads data before the constraint.
-		// DU-002 slice 308.
+		// Possible orderings: NOT VALID, ENFORCED, NOT ENFORCED, NOT VALID ENFORCED,
+		// NOT VALID NOT ENFORCED. NOT VALID must survive into
+		// pg_constraint.convalidated='f' so pg_dump re-emits the ` NOT VALID`
+		// tail and loads data before the constraint (DU-002 slice 308); NOT
+		// ENFORCED must likewise survive into conenforced='f' so pg_dump
+		// re-emits the ` NOT ENFORCED` tail instead (which takes precedence
+		// over NOT VALID in the rendered text). DU-002 slice 430.
 		notValid := false
+		notEnforced := false
 		if p.acceptKeyword(KwNot) {
 			if !p.acceptIdentKeyword("valid") {
-				_ = p.acceptIdentKeyword("enforced") // NOT ENFORCED
+				if p.acceptIdentKeyword("enforced") { // NOT ENFORCED
+					notEnforced = true
+				}
 			} else {
 				notValid = true
 				// NOT VALID — also accept optional trailing [NOT] ENFORCED.
 				if p.acceptKeyword(KwNot) {
-					_ = p.acceptIdentKeyword("enforced")
+					if p.acceptIdentKeyword("enforced") {
+						notEnforced = true
+					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
@@ -7936,6 +7967,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
 		act.NotValid = notValid
+		act.CheckNotEnforced = notEnforced
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.

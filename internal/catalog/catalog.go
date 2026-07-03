@@ -217,6 +217,16 @@ type NamedCheckConstraint struct {
 	IsLocal   bool   // conislocal: true if locally defined (not purely inherited)
 	InhCount  int    // coninhcount: number of direct parents this was inherited from
 	NotValid  bool   // convalidated='f': added NOT VALID, existing rows not checked yet
+	// NotEnforced mirrors pg_constraint.conenforced='f' (PG18 NOT ENFORCED
+	// constraints). pg_get_constraintdef_worker checks this FIRST and, when
+	// true, appends the trailing ` NOT ENFORCED` regardless of NotValid
+	// (PostgreSQL considers validated status irrelevant once a constraint
+	// isn't enforced — ruleutils.c's `if (!conenforced) ... else if
+	// (!convalidated) ...`). Real PG also implicitly leaves such a constraint
+	// unvalidated (skip_validation=!is_enforced in tablecmds.c), so goopg
+	// treats NotEnforced as implying "not validated" wherever convalidated is
+	// projected. DU-002 slice 430.
+	NotEnforced bool
 }
 
 // NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
@@ -248,7 +258,7 @@ func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isL
 // constraints (pg_constraint's VirtualRows skips empty-name / zero-OID rows so
 // the common unnamed case stays invisible in the catalog). M0097-0023.
 func (t *Table) AddCheck(name, expr string, oid uint32) {
-	t.AddCheckWithNoInherit(name, expr, oid, false)
+	t.AddCheckFull(name, expr, oid, false, false, false)
 }
 
 // AddCheckWithNotValid is AddCheck for a CHECK added with NOT VALID
@@ -258,10 +268,7 @@ func (t *Table) AddCheck(name, expr string, oid uint32) {
 // constraint, and pg_dump dumps it as a separate ALTER TABLE ADD CONSTRAINT so
 // possibly-violating data loads before the constraint. DU-002 slice 308.
 func (t *Table) AddCheckWithNotValid(name, expr string, oid uint32, notValid bool) {
-	t.CheckConstraints = append(t.CheckConstraints, expr)
-	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
-		Name: name, Expr: expr, OID: oid, IsLocal: true, NotValid: notValid,
-	})
+	t.AddCheckFull(name, expr, oid, notValid, false, false)
 }
 
 // AddCheckWithNoInherit is AddCheck for a CHECK that may carry NO INHERIT
@@ -269,9 +276,21 @@ func (t *Table) AddCheckWithNotValid(name, expr string, oid uint32, notValid boo
 // must record the flag so pg_get_constraintdef re-emits the ` NO INHERIT`
 // suffix on dump and pg_constraint reports connoinherit. DU-002 slice 128.
 func (t *Table) AddCheckWithNoInherit(name, expr string, oid uint32, noInherit bool) {
+	t.AddCheckFull(name, expr, oid, false, noInherit, false)
+}
+
+// AddCheckFull is the fully-parameterized CHECK constraint registration
+// underlying AddCheck/AddCheckWithNotValid/AddCheckWithNoInherit, threading
+// PG18's NOT VALID / NO INHERIT / NOT ENFORCED flags (pg_constraint's
+// convalidated / connoinherit / conenforced columns) through a single call
+// site so callers that need more than one flag at once (e.g. ALTER TABLE ADD
+// CONSTRAINT CHECK ... NOT ENFORCED) don't need a fresh Add* wrapper.
+// DU-002 slice 430.
+func (t *Table) AddCheckFull(name, expr string, oid uint32, notValid, noInherit, notEnforced bool) {
 	t.CheckConstraints = append(t.CheckConstraints, expr)
 	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
-		Name: name, Expr: expr, OID: oid, IsLocal: true, NoInherit: noInherit,
+		Name: name, Expr: expr, OID: oid, IsLocal: true,
+		NotValid: notValid, NoInherit: noInherit, NotEnforced: notEnforced,
 	})
 }
 
@@ -6752,8 +6771,12 @@ func (c *InMemory) registerSystemTables() {
 				row[3] = "c"                        // contype = check
 				row[4] = "f"                        // condeferrable
 				row[5] = "f"                        // condeferred
-				if nc.NotValid {
-					row[6] = "f" // convalidated — added NOT VALID, not yet validated
+				if nc.NotValid || nc.NotEnforced {
+					// convalidated='f' — either explicitly added NOT VALID, or
+					// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
+					// skip_validation=!is_enforced, so an unenforced constraint
+					// is implicitly unvalidated too). DU-002 slice 430.
+					row[6] = "f" // convalidated
 				} else {
 					row[6] = "t" // convalidated
 				}
@@ -6778,7 +6801,11 @@ func (c *InMemory) registerSystemTables() {
 				}
 				row[18] = "f"     // conperiod
 				row[24] = nc.Expr // conbin
-				row[25] = "t"     // conenforced: always true in v0
+				if nc.NotEnforced {
+					row[25] = "f" // conenforced — CHECK ... NOT ENFORCED. DU-002 slice 430.
+				} else {
+					row[25] = "t" // conenforced
+				}
 				out = append(out, row)
 			}
 		}

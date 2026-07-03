@@ -4296,6 +4296,38 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create type myrange: %v", err)
 	}
 
+	// Slice 430: a CHECK constraint added with NOT ENFORCED (PG18) must
+	// round-trip with a trailing ` NOT ENFORCED` — a form pg_get_constraintdef
+	// gives PRIORITY over NOT VALID (ruleutils.c:2601-2604 checks conenforced
+	// FIRST and only falls back to convalidated when the constraint IS
+	// enforced: "Validated status is irrelevant when the constraint is NOT
+	// ENFORCED"). Real PG's ATAddCheckNNConstraint also sets
+	// skip_validation=!is_enforced, so a NOT ENFORCED constraint is *always*
+	// convalidated='f' too, and pg_dump's getTableConstraints marks it
+	// `separate = !validated` — it is dumped via a standalone
+	// `ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED;` AFTER the table (and
+	// data), exactly like a NOT VALID constraint (slice 308), never inline in
+	// CREATE TABLE. Before this slice `NOT ENFORCED` was accepted by the
+	// parser (in three CREATE TABLE spots and one ALTER TABLE spot) purely as
+	// a discard — pg_constraint.conenforced was hardcoded 't' always, so the
+	// dump silently re-enforced a constraint the user explicitly disabled.
+	// nenf_alter exercises the ALTER TABLE ADD CONSTRAINT ... CHECK ... NOT
+	// ENFORCED path (named); nenf_inline exercises the CREATE TABLE-inline,
+	// anonymous table-level `CHECK (...) NOT ENFORCED` path (auto-named
+	// nenf_inline_val_check, per slice 127's single-column naming rule) —
+	// demonstrating that even an inline-written NOT ENFORCED check still gets
+	// pulled out to a separate post-data ALTER TABLE by real pg_dump, purely
+	// from reading convalidated='f' off goopg's pg_constraint.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nenf_alter (id integer, val integer)"); err != nil {
+		t.Fatalf("create table nenf_alter: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nenf_alter ADD CONSTRAINT nenf_chk CHECK (val > 0) NOT ENFORCED"); err != nil {
+		t.Fatalf("alter table nenf_alter add check not enforced: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nenf_inline (id integer, val integer, CHECK (val > 0) NOT ENFORCED)"); err != nil {
+		t.Fatalf("create table nenf_inline: %v", err)
+	}
+
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
 	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
@@ -11493,6 +11525,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range rangeDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped the RANGE type round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Slice 430: a CHECK constraint added with NOT ENFORCED (PG18) must
+		// round-trip the trailing ` NOT ENFORCED`, and — because NOT ENFORCED
+		// implies convalidated='f' too (mirroring real PG) — pg_dump must dump
+		// it as a standalone `ADD CONSTRAINT ... NOT ENFORCED;` statement, the
+		// same "separate" treatment slice 308 verified for NOT VALID.
+		// nenf_alter covers the ALTER TABLE ADD CONSTRAINT ... NOT ENFORCED
+		// path; nenf_inline covers an inline, anonymous table-level
+		// `CHECK (...) NOT ENFORCED` (auto-named nenf_inline_val_check per
+		// slice 127) still getting pulled out of CREATE TABLE into its own
+		// post-data ALTER TABLE by real pg_dump.
+		notEnforcedDefs := []string{
+			"ADD CONSTRAINT nenf_chk CHECK ((val > 0)) NOT ENFORCED;",
+			"ADD CONSTRAINT nenf_inline_val_check CHECK ((val > 0)) NOT ENFORCED;",
+		}
+		for _, sub := range notEnforcedDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a check constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return

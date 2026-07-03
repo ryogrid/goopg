@@ -11859,3 +11859,91 @@ Range-type `canonical`/`subtype_diff` sub-item (a) remainder (unchanged from
 loop #63/#64 — needs real shell-type support + function-signature
 validation, a materially larger, separately-scoped feature). No other
 residual from this loop's own scope.
+
+## Follow-up: `CHECK ... NOT ENFORCED` (PG18) round-trip in pg_dump (slice 430)
+
+Closes a fresh gap discovered while auditing DU-002's remaining coverage: PG18
+introduced non-enforced CHECK (and foreign key) constraints
+(`ADD CONSTRAINT ... CHECK (...) NOT ENFORCED`). goopg's parser already
+*accepted* the `NOT ENFORCED` / `ENFORCED` trailer in every CHECK-constraint
+form (anonymous table-level, named table-level, inline column-level, and
+`ALTER TABLE ADD CONSTRAINT`) — but purely as a discard: the token was
+consumed and then thrown away in all four call sites
+(`internal/parser/ddl.go`). `pg_constraint.conenforced` was hardcoded `'t'`
+everywhere in the virtual-table builder (`internal/catalog/catalog.go`), so a
+constraint the user explicitly created as unenforced silently came back
+"enforced" from `pg_dump`, which reads `pg_get_constraintdef(oid)` — a real
+fidelity bug, not just a missing feature.
+
+### Change
+
+New `CheckNotEnforced`/`TableCheckNotEnforced`/`PartitionCheckConstraint.NotEnforced`/
+`AlterTableAction.CheckNotEnforced` fields (`internal/parser/ast.go`) thread
+the flag through all four CHECK-constraint parser call sites
+(`internal/parser/ddl.go`), mirroring the pre-existing `NoInherit` plumbing
+exactly. `catalog.NamedCheckConstraint` gains a `NotEnforced bool` field, and
+a new `(*Table) AddCheckFull(name, expr string, oid uint32, notValid,
+noInherit, notEnforced bool)` unifies the three previously-separate
+`AddCheck*` wrappers (`AddCheck`/`AddCheckWithNotValid`/`AddCheckWithNoInherit`
+now delegate to it) so a caller needing more than one flag (the ALTER TABLE
+ADD CONSTRAINT CHECK path) doesn't need yet another wrapper
+(`internal/catalog/catalog.go`). The `pg_constraint` virtual-row builder for
+table CHECK constraints now projects `conenforced='f'` when `NotEnforced`, and
+— mirroring real PostgreSQL's `ATAddCheckNNConstraint`
+(`tablecmds.c`: `skip_validation = !is_enforced`) — also projects
+`convalidated='f'` whenever `NotEnforced` is set (in addition to the
+pre-existing `NotValid` case), since PG considers a NOT ENFORCED constraint
+implicitly unvalidated too. `pg_get_constraintdef`'s CHECK branch
+(`internal/executor/expr.go`) now mirrors `ruleutils.c`'s exact precedence
+("Validated status is irrelevant when the constraint is NOT ENFORCED"): it
+checks `NotEnforced` FIRST and appends ` NOT ENFORCED`, falling back to
+` NOT VALID` only when the constraint IS enforced.
+
+Because `pg_dump`'s own `getTableConstraints` marks a constraint `separate =
+!validated` (`pg_dump.c`), the new `convalidated='f'` projection is what
+actually makes `pg_dump` pull a NOT ENFORCED CHECK — even one written *inline*
+in `CREATE TABLE` — out into its own post-data `ALTER TABLE ... ADD
+CONSTRAINT ... NOT ENFORCED;` statement, exactly like a NOT VALID constraint
+(slice 308). No pg_dump-side code changed; this falls out entirely from
+`pg_dump` reading goopg's corrected `pg_constraint` rows.
+
+### Tests
+
+`TestParseCheckNotEnforced` (`internal/parser/check_alter_test.go`) covers all
+four parser call sites plus composition with NOT VALID in either order and
+the bare-ENFORCED/no-trailer default-false cases.
+`TestCheckConstraintNotEnforcedAlterTable`,
+`TestCheckConstraintNotEnforcedCreateTableForms`, and
+`TestCheckConstraintPlainNotValidStillRendersNotValid` (new
+`internal/executor/operators_ddl_check_notenforced_test.go`) cover the
+catalog/`pg_constraint`/`pg_get_constraintdef` wiring and guard against the
+new precedence check accidentally swallowing the pre-existing NOT VALID
+rendering. New `TestPort_PgDumpConnectionSetup` fixtures `nenf_alter`
+(`ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED`) and `nenf_inline`
+(inline, anonymous, auto-named `nenf_inline_val_check`) verified byte-identical
+vs live `pg_dump` 18.3: both render as standalone
+`ALTER TABLE ... ADD CONSTRAINT <name> CHECK ((val > 0)) NOT ENFORCED;`
+statements after the table (and data), never inline in `CREATE TABLE`.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `gofmt -l` clean on every touched file
+(pre-existing go1.25-vs-go1.26.3 struct-alignment mismatch in
+`internal/parser/ast.go`, `internal/catalog/catalog.go`,
+`internal/executor/operators_ddl.go`, `internal/executor/expr.go`, and the
+pre-existing single-line-`if` style in `internal/parser/check_alter_test.go`
+is untouched — confirmed via `git stash`/`gofmt -l` before-vs-after diffing
+that none of it is newly introduced by this slice); `internal/parser`+
+`internal/catalog`+`internal/executor` suites PASS (full runs, `-count=1`, no
+regression); `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`FOREIGN KEY ... NOT ENFORCED` (real PG18 supports NOT ENFORCED on FK
+constraints too, not just CHECK) is untouched — the ALTER TABLE ADD FOREIGN
+KEY parser path (`internal/parser/ddl.go`, the `[NOT] DEFERRABLE`/`NOT VALID`
+trailer loop) has no ENFORCED handling at all, so `... FOREIGN KEY (...)
+REFERENCES ... NOT ENFORCED` is a hard parse error today rather than a silent
+discard. Scoped out of this slice (CHECK-only, per the established
+one-narrow-area-per-slice pattern); ledger row appended.

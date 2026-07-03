@@ -1164,6 +1164,12 @@ type ColumnDef struct {
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool
+	// CheckNotEnforced is true when the inline CHECK constraint carries a
+	// `NOT ENFORCED` trailer (PG18 conenforced='f'). pg_get_constraintdef
+	// appends a trailing ` NOT ENFORCED` for such a constraint (taking
+	// precedence over NOT VALID in the rendered text — PG considers validated
+	// status irrelevant once a constraint isn't enforced). DU-002 slice 430.
+	CheckNotEnforced bool
 	// Compression is the per-column TOAST compression method from an inline
 	// `COMPRESSION <method>` clause (`col text COMPRESSION lz4`) — "pglz" or
 	// "lz4". Empty when no method was written. Threaded onto catalog.Column.
@@ -1304,6 +1310,10 @@ type CreateTableStmt struct {
 	// `CHECK (...) NO INHERIT` re-emits its suffix through pg_get_constraintdef
 	// on dump. DU-002 slice 128.
 	TableCheckNoInherit []bool
+	// TableCheckNotEnforced is parallel to TableChecks: entry i is true when
+	// the anonymous table-level CHECK at TableChecks[i] carries a
+	// `NOT ENFORCED` trailer (PG18 conenforced='f'). DU-002 slice 430.
+	TableCheckNotEnforced []bool
 	// TableNamedChecks holds explicitly named table-level CHECK constraints,
 	// e.g. `CONSTRAINT check_a CHECK (a > 0)`. M0097-0023.
 	TableNamedChecks []PartitionCheckConstraint
@@ -1451,6 +1461,11 @@ type PartitionCheckConstraint struct {
 	// connoinherit='t'); the dumped constraintdef must re-emit the ` NO INHERIT`
 	// suffix and pg_constraint must report connoinherit. DU-002 slice 129.
 	NoInherit bool
+	// NotEnforced is true for `CONSTRAINT c CHECK (...) NOT ENFORCED` (PG18
+	// conenforced='f'); pg_get_constraintdef re-emits the trailing
+	// ` NOT ENFORCED` and pg_constraint must report conenforced=false.
+	// DU-002 slice 430.
+	NotEnforced bool
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
@@ -2809,6 +2824,11 @@ type AlterTableAction struct {
 
 	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
 	CheckExpr string
+	// CheckNotEnforced is true for `ADD CONSTRAINT ... CHECK (...) NOT ENFORCED`
+	// (PG18 conenforced='f'); pg_get_constraintdef re-emits the trailing
+	// ` NOT ENFORCED` and takes precedence over NOT VALID in the rendered
+	// text. DU-002 slice 430.
+	CheckNotEnforced bool
 
 	// NewType is the target column type for AlterTableAlterColumnType.
 	// M0097-0022.
