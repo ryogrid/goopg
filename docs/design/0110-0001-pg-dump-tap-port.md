@@ -13217,3 +13217,89 @@ anywhere in `internal/catalog` at all, so unlike sequences/views this can't
 be closed by routing through the existing `AlterTableStmt`/`execAlterTable`
 path — it needs new pg_namespace-rename catalog support first. Out of scope
 for this bounded loop (Effort-L: new catalog capability).
+
+## Follow-up: `ALTER STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops (DU-002 slice 441)
+
+### Problem
+
+Slice 317 (`docs/design/0119-0004-alter-statistics-set-statistics.md`) gave
+`ALTER STATISTICS` a real parser node (`AlterStatisticsStmt`) for the `SET
+STATISTICS n` form, but deliberately left the other three grammar-distinct
+forms — `RENAME TO` / `OWNER TO` / `SET SCHEMA` — as intentional no-ops: the
+trailing tokens were consumed and discarded, and `execAlterStatistics`
+short-circuited on `!s.HasTarget`. That means `ALTER STATISTICS s RENAME TO
+s2` (or `OWNER TO` / `SET SCHEMA`) executed successfully — a clean reply,
+correctly tagged `"ALTER STATISTICS"` (this AST node is not a reused
+`AlterTableStmt`, so unlike the ALTER SEQUENCE/VIEW slices there was no
+command-tag mistagging here) — while leaving the statistics object
+completely unchanged. Same silent-no-op class as `ALTER VIEW` before slice
+440, on a different object kind.
+
+### Change
+
+Mirrors `execAlterCollation`'s `Action`-switch shape:
+
+- **Parser** (`internal/parser/ast.go`/`ddl.go`): `AlterStatisticsStmt` gains
+  `Action string` (`"rename"` / `"owner"` / `"setschema"` / `""` — `""` still
+  means SET STATISTICS, gated by the pre-existing `HasTarget`), `NewName`,
+  `NewOwner` (with the `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` →
+  `"current_user"` sentinel, matching `ALTER COLLATION`/`ALTER TABLE`),
+  `NewSchema`. RENAME TO / OWNER TO are detected before the pre-existing `SET
+  STATISTICS` branch; `SET SCHEMA` shares the same leading `SET` token as
+  `SET STATISTICS`, so it is special-cased first inside that branch (peek at
+  the following keyword: `schema` vs `statistics`).
+- **Catalog** (`internal/catalog/catalog.go`): new `StatisticsObject.Owner
+  uint32` (0 = unset, defaults to the bootstrap superuser — `OwnerOrDefault()`,
+  mirroring `UserAggregate.Owner`/`OwnerOrDefault()`). Three new mutators
+  beside the pre-existing `SetStatisticsTarget`: `RenameStatisticsObject`,
+  `SetStatisticsOwner`, `SetStatisticsSchema` — rename/schema-move both
+  re-key the `statisticsObjs` map via `qualifiedKey()` since that key is
+  `schema.name`. The `pg_statistic_ext` virtual row's `stxowner` cell now
+  projects `OwnerOrDefault()` instead of the hardcoded `"10"`; its
+  `stxnamespace` cell now resolves the real namespace OID via
+  `c.schemas[strings.ToLower(schema)]` (falling back to `c.schemas["public"]`)
+  instead of a `public → "2200" / else → "0"` ternary — the previous ternary
+  meant any non-public statistics object already had a bogus
+  `stxnamespace=0` even before this slice's `SET SCHEMA` addition existed to
+  change it.
+- **Executor** (`internal/executor/operators_ddl.go`): `execAlterStatistics`
+  restructured as a `switch s.Action` (mirroring `execAlterCollation`),
+  falling through to the pre-existing `SET STATISTICS` handling for `Action
+  == ""`. An unknown target object raises `42704 statistics object "..."
+  does not exist`; `IF EXISTS` downgrades to a notice — same shape as `ALTER
+  COLLATION`.
+
+Not WAL-logged — RENAME/OWNER/SET SCHEMA are in-memory-only, matching the
+pre-existing (also unlogged) `ALTER COLLATION RENAME TO`/`OWNER TO`
+precedent (see that slice's own ledger row (a)). `CREATE STATISTICS` itself
+is not yet WAL-logged either, so statistics objects as a whole do not
+survive a restart today — a pre-existing gap, not introduced or widened by
+this slice.
+
+### Tests
+
+`TestParseAlterStatisticsRenameOwnerSetSchema` (`internal/parser/alter_test.go`
+— rename / owner / owner-CURRENT_USER / setschema / IF-EXISTS-setschema, and
+confirms `HasTarget` stays false for all of them). `TestAlterStatisticsRenameOwnerSetSchema`
+(`internal/executor/alter_statistics_test.go` — full parse→plan→exec round
+trips: RENAME TO moves the lookup key, OWNER TO resolves a real registered
+role's OID via `RoleOID`, SET SCHEMA re-keys the map and updates `Schema`,
+`IF EXISTS` on an unknown object is a no-op, and without it a `42704` names
+the missing object).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+`internal/executor`
+suites PASS (full, no regressions); `scripts/tpch-spotcheck.sh` PASS;
+pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+(1) RENAME/OWNER/SET SCHEMA are in-memory-only — no WAL logging, same as
+`ALTER COLLATION`'s equivalent forms; a restart loses the mutation. (2)
+Statistics objects overall have no restart persistence at all — `CREATE
+STATISTICS` itself is not WAL-logged, so this is a strictly larger
+pre-existing gap this slice did not create or need to fix. (3) `ALTER
+STATISTICS` sub-forms beyond these four (there are none in PG's own
+grammar — `SET STATISTICS`/`RENAME TO`/`OWNER TO`/`SET SCHEMA` is the
+complete set) are not applicable; no further known ALTER STATISTICS gap.

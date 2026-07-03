@@ -369,6 +369,48 @@ prev-link fixes.
       reuse like sequences/views; it needs real pg_namespace-rename support
       first. Out of scope for this bounded loop (Effort-L: new catalog
       capability, not a parser-routing fix).
+      **2026-07-04 (loop #101, DU-002 slice 441): `ALTER STATISTICS ...
+      RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops — now they
+      actually apply.** Following up on the slice 439/440 ALTER-form-gap
+      thread, `internal/parser/ddl.go`'s pre-existing `ALTER STATISTICS`
+      branch (slice 317) only modeled `SET STATISTICS n`; the other three
+      forms parsed to the same `AlterStatisticsStmt` node with
+      `HasTarget=false` and were deliberately consumed as no-ops — unlike
+      sequences/views this node was already tagged correctly
+      (`"ALTER STATISTICS"`, not a reused mistaggable `AlterTableStmt`), so
+      the gap was purely functional. Fixed with an `Action`-switch shape
+      mirroring `execAlterCollation`: `AlterStatisticsStmt` gains `Action`
+      (`"rename"`/`"owner"`/`"setschema"`)/`NewName`/`NewOwner`/`NewSchema`;
+      new `catalog.StatisticsObject.Owner uint32` (+`OwnerOrDefault()`,
+      mirroring `UserAggregate.Owner`) and three new mutators
+      (`RenameStatisticsObject`/`SetStatisticsOwner`/`SetStatisticsSchema`)
+      re-keying the schema-qualified `statisticsObjs` map; `pg_statistic_ext`'s
+      `stxowner`/`stxnamespace` virtual cells now project the real
+      owner/namespace (`c.schemas[schema]` lookup) instead of a hardcoded
+      `"10"` and a `public → "2200" / else → "0"` ternary — the ternary bug
+      predates this slice (any non-public statistics object already had a
+      bogus `stxnamespace=0`) but is now fixed as part of making `SET SCHEMA`
+      actually observable. `execAlterStatistics` raises `42704` for an
+      unknown target (`IF EXISTS` downgrades to a notice), matching `ALTER
+      COLLATION`. Tests: `TestParseAlterStatisticsRenameOwnerSetSchema`
+      (`internal/parser/alter_test.go`); `TestAlterStatisticsRenameOwnerSetSchema`
+      (`internal/executor/alter_statistics_test.go`, full parse→plan→exec
+      round trip incl. `IF EXISTS` both ways). Design doc "Follow-up: `ALTER
+      STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops
+      (DU-002 slice 441)" appended to `docs/design/0110-0001-pg-dump-tap-port.md`
+      (the established home for this ALTER-form-gap slice thread);
+      `docs/design/README.md`'s `0110-0001` row updated in the same commit.
+      Gates: `go build ./...` clean; `internal/parser`+`internal/catalog`+
+      `internal/executor` suites PASS (full, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      Deferred (ledger row appended): (1) RENAME/OWNER/SET SCHEMA are
+      in-memory-only, not WAL-logged — same as `ALTER COLLATION`'s
+      equivalent forms. (2) Statistics objects overall have no restart
+      persistence at all (`CREATE STATISTICS` itself is not WAL-logged) — a
+      strictly larger pre-existing gap, not introduced or widened here. No
+      further known `ALTER STATISTICS` grammar gap — `SET STATISTICS`/
+      `RENAME TO`/`OWNER TO`/`SET SCHEMA` is PG's complete grammar for this
+      statement.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

@@ -2383,13 +2383,12 @@ type CreateStatisticsStmt struct {
 func (s *CreateStatisticsStmt) Pos() int  { return s.pos }
 func (s *CreateStatisticsStmt) stmtNode() {}
 
-// AlterStatisticsStmt represents `ALTER STATISTICS name SET STATISTICS n`. The
-// statistics target governs the sample size used for the extended-statistics
-// object; PG stores it in pg_statistic_ext.stxstattarget. Only the SET
-// STATISTICS form is modelled — other ALTER STATISTICS forms (RENAME / OWNER TO
-// / SET SCHEMA) parse to this node with HasTarget=false and are no-ops. The
-// value round-trips through pg_dump (dumpStatisticsExt emits the ALTER whenever
-// stxstattarget >= 0). DU-002 slice 317.
+// AlterStatisticsStmt represents `ALTER STATISTICS name SET STATISTICS n` and
+// the RENAME TO / OWNER TO / SET SCHEMA forms. The statistics target governs
+// the sample size used for the extended-statistics object; PG stores it in
+// pg_statistic_ext.stxstattarget. The value round-trips through pg_dump
+// (dumpStatisticsExt emits the ALTER whenever stxstattarget >= 0). DU-002
+// slice 317; RENAME/OWNER/SET SCHEMA added DU-002 slice 441.
 type AlterStatisticsStmt struct {
 	pos      int
 	Name     ObjectName // statistics object name (possibly schema-qualified)
@@ -2398,9 +2397,16 @@ type AlterStatisticsStmt struct {
 	// object to the default (PG stores stxstattarget=NULL). Only meaningful when
 	// HasTarget is set.
 	Target int
-	// HasTarget reports the statement carried a SET STATISTICS clause (vs an
-	// unmodelled ALTER STATISTICS form parsed as a no-op).
+	// HasTarget reports the statement carried a SET STATISTICS clause (vs
+	// Action carrying a RENAME/OWNER/SET SCHEMA form instead).
 	HasTarget bool
+	// Action selects a RENAME/OWNER/SET SCHEMA form: "rename" | "owner" |
+	// "setschema" | "" (SET STATISTICS, gated by HasTarget, or an unmodelled
+	// form). DU-002 slice 441.
+	Action    string
+	NewName   string // for Action == "rename"
+	NewOwner  string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	NewSchema string // for Action == "setschema"
 }
 
 func (s *AlterStatisticsStmt) Pos() int  { return s.pos }

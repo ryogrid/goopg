@@ -2586,6 +2586,19 @@ type StatisticsObject struct {
 	// pg_dump emits no ALTER. A non-nil value >= 0 round-trips as an
 	// `ALTER STATISTICS ... SET STATISTICS <n>` after the CREATE. DU-002 slice 317.
 	StatTarget *int
+	// Owner is the stxowner role OID, settable via `ALTER STATISTICS ... OWNER
+	// TO`. 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. DU-002 slice 441.
+	Owner uint32
+}
+
+// OwnerOrDefault returns s.Owner, falling back to the bootstrap superuser OID
+// (10) for statistics objects that never had OWNER TO applied.
+func (s *StatisticsObject) OwnerOrDefault() uint32 {
+	if s.Owner == 0 {
+		return 10
+	}
+	return s.Owner
 }
 
 // qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
@@ -3017,6 +3030,73 @@ func (c *InMemory) SetStatisticsTarget(name string, target *int) bool {
 		return false
 	}
 	obj.StatTarget = target
+	return true
+}
+
+// RenameStatisticsObject renames a statistics object (ALTER STATISTICS ...
+// RENAME TO), re-keying the schema-qualified map entry. Returns false if no
+// such object exists. DU-002 slice 441.
+func (c *InMemory) RenameStatisticsObject(name, newName string) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	delete(c.statisticsObjs, key)
+	obj.Name = newName
+	c.statisticsObjs[obj.qualifiedKey()] = obj
+	return true
+}
+
+// SetStatisticsOwner sets the owning role OID of a statistics object (ALTER
+// STATISTICS ... OWNER TO). Returns false if no such object exists. DU-002
+// slice 441.
+func (c *InMemory) SetStatisticsOwner(name string, ownerOID uint32) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	obj.Owner = ownerOID
+	return true
+}
+
+// SetStatisticsSchema moves a statistics object to a new schema (ALTER
+// STATISTICS ... SET SCHEMA), re-keying the map entry. Returns false if no
+// such object exists. DU-002 slice 441.
+func (c *InMemory) SetStatisticsSchema(name, newSchema string) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	delete(c.statisticsObjs, key)
+	obj.Schema = newSchema
+	c.statisticsObjs[obj.qualifiedKey()] = obj
 	return true
 }
 
@@ -7352,16 +7432,16 @@ func (c *InMemory) registerSystemTables() {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := "2200" // public namespace OID
-			if schema != "public" {
-				nsOID = "0"
+			nsOID := c.schemas[strings.ToLower(schema)]
+			if nsOID == 0 {
+				nsOID = c.schemas["public"]
 			}
 			row := make([]string, 9)
-			row[0] = fmt.Sprintf("%d", obj.OID)      // oid
-			row[1] = fmt.Sprintf("%d", obj.TableOID) // stxrelid
-			row[2] = obj.Name                        // stxname
-			row[3] = nsOID                           // stxnamespace
-			row[4] = "10"                            // stxowner (bootstrap superuser)
+			row[0] = fmt.Sprintf("%d", obj.OID)              // oid
+			row[1] = fmt.Sprintf("%d", obj.TableOID)         // stxrelid
+			row[2] = obj.Name                                // stxname
+			row[3] = fmt.Sprintf("%d", nsOID)                // stxnamespace
+			row[4] = fmt.Sprintf("%d", obj.OwnerOrDefault()) // stxowner
 			// stxstattarget: PG18 stores NULL for the default (BKI_FORCE_NULL),
 			// which pg_dump's getExtendedStatistics maps to -1 → no ALTER. The
 			// string-based virtual-row machinery has no int NULL sentinel (an
@@ -7375,9 +7455,9 @@ func (c *InMemory) registerSystemTables() {
 			} else {
 				row[5] = "-1" // default (pg_dump-equivalent of NULL → no ALTER)
 			}
-			row[6] = ""                              // stxkeys
-			row[7] = ""                              // stxexprs
-			row[8] = ""                              // stxkind
+			row[6] = "" // stxkeys
+			row[7] = "" // stxexprs
+			row[8] = "" // stxkind
 			out = append(out, row)
 		}
 		return out

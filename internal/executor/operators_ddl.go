@@ -15890,17 +15890,17 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 	return nil
 }
 
-// execAlterStatistics applies `ALTER STATISTICS ... SET STATISTICS n` to an
-// extended-statistics object. The target is recorded on the catalog object
-// (pg_statistic_ext.stxstattarget) purely for pg_dump round-trip fidelity —
-// goopg does not sample extended statistics at this granularity. A negative
-// target (-1) resets to the default (NULL); pg_dump then emits no ALTER. Forms
-// other than SET STATISTICS (RENAME / OWNER TO / SET SCHEMA) parse to a node
-// with HasTarget=false and are no-ops. DU-002 slice 317.
+// execAlterStatistics applies `ALTER STATISTICS ...` to an extended-statistics
+// object: SET STATISTICS n (the sample target, pg_statistic_ext.stxstattarget,
+// purely for pg_dump round-trip fidelity — goopg does not sample extended
+// statistics at this granularity; a negative target -1 resets to the default
+// NULL, and pg_dump then emits no ALTER — DU-002 slice 317), or RENAME TO /
+// OWNER TO / SET SCHEMA (DU-002 slice 441, mirroring execAlterCollation).
+// RENAME/OWNER/SET SCHEMA are in-memory-only (not WAL-logged), matching the
+// pre-existing ALTER COLLATION RENAME/OWNER precedent — CREATE STATISTICS
+// itself is not yet WAL-logged either, so statistics objects as a whole do
+// not survive a restart (see deferral ledger).
 func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
-	if !s.HasTarget {
-		return nil
-	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -15908,6 +15908,41 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 	name := s.Name.Name
 	if s.Name.Schema != "" {
 		name = s.Name.Schema + "." + s.Name.Name
+	}
+	notFound := func() error {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("statistics object %q does not exist, skipping", s.Name.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("statistics object %q does not exist", s.Name.Name)}
+	}
+	switch s.Action {
+	case "rename":
+		if !im.RenameStatisticsObject(name, s.NewName) {
+			return notFound()
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateStatisticsFull's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetStatisticsOwner(name, ownerOID) {
+			return notFound()
+		}
+		return nil
+	case "setschema":
+		if !im.SetStatisticsSchema(name, s.NewSchema) {
+			return notFound()
+		}
+		return nil
+	}
+	if !s.HasTarget {
+		return nil
 	}
 	var target *int
 	if s.Target >= 0 {

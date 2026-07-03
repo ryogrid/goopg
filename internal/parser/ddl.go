@@ -6367,9 +6367,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 	}
 	// ALTER STATISTICS name SET STATISTICS n — set the extended-statistics
-	// sample target (pg_statistic_ext.stxstattarget). Other ALTER STATISTICS
-	// forms (RENAME / OWNER TO / SET SCHEMA) are consumed as no-ops. The target
-	// round-trips through pg_dump's dumpStatisticsExt. DU-002 slice 317.
+	// sample target (pg_statistic_ext.stxstattarget); round-trips through
+	// pg_dump's dumpStatisticsExt. DU-002 slice 317. RENAME TO / OWNER TO /
+	// SET SCHEMA — distinct top-level forms (RenameStmt/AlterOwnerStmt/
+	// AlterObjectSchemaStmt in PG's grammar) — actually move/rename/
+	// re-own the object (catalog.RenameStatisticsObject/SetStatisticsOwner/
+	// SetStatisticsSchema). DU-002 slice 441.
 	if p.acceptIdentKeyword("statistics") {
 		stmt := &AlterStatisticsStmt{pos: t.Pos}
 		if p.acceptKeyword(KwIf) {
@@ -6383,9 +6386,48 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Name = name
-		// SET STATISTICS n — the only modelled form. `SET STATISTICS` here is the
-		// keyword KwSet (or the bare ident) followed by the unreserved "statistics".
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = "rename"
+			stmt.NewName = identText(newNameTok)
+			return stmt, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			stmt.Action = "owner"
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				stmt.NewOwner = "current_user"
+			} else {
+				tok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				stmt.NewOwner = identText(tok)
+			}
+			return stmt, nil
+		}
+		// SET SCHEMA / SET STATISTICS n both start with the same SET token
+		// (KwSet or the bare ident); branch on the following keyword.
 		if p.acceptKeyword(KwSet) || p.acceptIdentKeyword("set") {
+			if p.acceptIdentKeyword("schema") {
+				schemaTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				stmt.Action = "setschema"
+				stmt.NewSchema = identText(schemaTok)
+				return stmt, nil
+			}
 			if p.acceptIdentKeyword("statistics") {
 				neg := false
 				if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
