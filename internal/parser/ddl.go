@@ -7889,17 +7889,34 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				onUpdate = action
 			}
 		}
-		// Optional [NOT] DEFERRABLE [INITIALLY …] and/or NOT VALID trailers, in
-		// any order (PG grammar allows `… DEFERRABLE NOT VALID` etc.). `NOT VALID`
-		// (ALTER TABLE ADD FOREIGN KEY … NOT VALID) creates the constraint without
-		// checking pre-existing rows; a later VALIDATE CONSTRAINT performs the
-		// scan. M0118-0008 (alter-table-1/2 isolation specs).
+		// Optional [NOT] DEFERRABLE [INITIALLY …], NOT VALID, and/or [NOT]
+		// ENFORCED trailers, in any order (PG grammar's ConstraintAttributeSpec
+		// allows e.g. `… DEFERRABLE NOT VALID` or `… NOT ENFORCED` in any
+		// sequence — gram.y's ConstraintAttributeElem list applies identically
+		// to CHECK and FOREIGN KEY constraints). `NOT VALID` (ALTER TABLE ADD
+		// FOREIGN KEY … NOT VALID) creates the constraint without checking
+		// pre-existing rows; a later VALIDATE CONSTRAINT performs the scan.
+		// M0118-0008 (alter-table-1/2 isolation specs). `NOT ENFORCED` (PG18)
+		// disables the constraint's action/check triggers entirely — mirrored
+		// here the same way the CHECK-constraint form already threads it
+		// (DU-002 slice 430): the AST field stays independent of NotValid (a
+		// bare NOT ENFORCED does NOT set NotValid here, matching
+		// TestParseCheckNotEnforced's CHECK-form precedent); the catalog layer
+		// derives convalidated='f' from `NotValid || NotEnforced` instead
+		// (mirroring PG's processCASbits, which sets *not_valid=true only as
+		// an internal consistency detail, not something surfaced back through
+		// this AST). DU-002 slice 431.
 		deferrable := false
 		notValid := false
+		notEnforced := false
 		for {
 			if p.acceptKeyword(KwNot) {
 				if p.acceptIdentKeyword("valid") {
 					notValid = true
+					continue
+				}
+				if p.acceptIdentKeyword("enforced") {
+					notEnforced = true
 					continue
 				}
 				if _, err := p.expectKeyword(KwDeferrable); err != nil {
@@ -7915,6 +7932,9 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				}
 				continue
 			}
+			if p.acceptIdentKeyword("enforced") { // bare ENFORCED — already the default
+				continue
+			}
 			break
 		}
 		act.Kind = AlterTableAddForeignKey
@@ -7923,6 +7943,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
 		act.NotValid = notValid
+		act.FKNotEnforced = notEnforced
 		act.MatchFull = matchFull
 		act.OnDelete = onDelete
 		act.OnUpdate = onUpdate

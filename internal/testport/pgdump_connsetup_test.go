@@ -4327,6 +4327,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TABLE public.nenf_inline (id integer, val integer, CHECK (val > 0) NOT ENFORCED)"); err != nil {
 		t.Fatalf("create table nenf_inline: %v", err)
 	}
+	// Slice 431: a FOREIGN KEY constraint added with NOT ENFORCED (PG18, the
+	// FK-side sibling of slice 430's CHECK support) must round-trip the same
+	// way — real PostgreSQL's `ALTER TABLE ADD FOREIGN KEY ... NOT ENFORCED`
+	// grammar was previously a hard parse error in goopg (unlike the CHECK
+	// forms, which merely discarded the flag), so this is the FK form's first
+	// pg_dump round-trip coverage at all, not just a precedence fix.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.fknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table fknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.fknenf_child (id integer, pid integer)"); err != nil {
+		t.Fatalf("create table fknenf_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.fknenf_child ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES public.fknenf_parent(id) NOT ENFORCED"); err != nil {
+		t.Fatalf("alter table fknenf_child add foreign key not enforced: %v", err)
+	}
 
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
@@ -11545,6 +11560,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a check constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 431: the FK-side sibling of slice 430 — a FOREIGN KEY added
+		// with NOT ENFORCED must round-trip the same way, dumped as a
+		// standalone post-data ALTER TABLE (convalidated='f' is implied).
+		fkNotEnforcedDef := "ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES public.fknenf_parent(id) NOT ENFORCED;"
+		if !strings.Contains(res.Stdout, fkNotEnforcedDef) {
+			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a foreign key constraint; missing %q\n  full stdout=%q", fkNotEnforcedDef, res.Stdout)
 		}
 		return
 	}

@@ -7049,12 +7049,41 @@ documentation-only and is exempt from the design-doc requirement.)
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
       pre-commit hook. Design doc: `docs/design/0110-0001-pg-dump-tap-
       port.md` new "Follow-up: `CHECK ... NOT ENFORCED` (PG18) round-trip in
-      pg_dump (slice 430)" section; deferral ledger row appended. Still open:
-      `FOREIGN KEY ... NOT ENFORCED` (PG18 also supports this on FK
-      constraints) is untouched — the ALTER TABLE ADD FOREIGN KEY parser path
-      has no ENFORCED handling at all, so that form is a hard parse error
-      today, not a silent discard; scoped out per the one-narrow-area-per-
-      slice pattern.
+      pg_dump (slice 430)" section; deferral ledger row appended.
+      **2026-07-04 (loop #94, DU-002 slice 431): `FOREIGN KEY ... NOT
+      ENFORCED` (PG18) LANDED — closes the slice 430 deferral above.**
+      `internal/parser/ddl.go`'s ALTER TABLE ADD FOREIGN KEY trailer loop
+      gained a `NOT ENFORCED`/bare `ENFORCED` branch (new
+      `AlterTableAction.FKNotEnforced`); `catalog.ForeignKey.NotEnforced`
+      drives `pg_constraint.conenforced='f'`/`convalidated='f'` and
+      `buildForeignKeyDefString` gives it precedence over NOT VALID, mirroring
+      the CHECK form exactly. Beyond dump fidelity, this loop also closed the
+      *behavioral* gap: real PG creates zero RI triggers for a NOT ENFORCED FK
+      (`tablecmds.c:11065`/`:10920`), so `checkFKInsertForConstraints`
+      (`internal/executor/operators_fk.go`) and `enforceFKOnDelete` now skip a
+      `NotEnforced` FK entirely (not merely deferred — never checked), and
+      `AlterTableValidateConstraint` rejects `VALIDATE CONSTRAINT` on one with
+      `55000` (mirrors `ATExecValidateConstraint`'s own guard). Tests:
+      `TestParseFKNotEnforced` (`internal/parser/fk_not_enforced_test.go`);
+      `TestFKNotEnforcedAlterTable`,
+      `TestFKNotEnforcedPlainNotValidStillRendersNotValid`,
+      `TestFKNotEnforcedSkipsRuntimeCheck`,
+      `TestFKNotEnforcedValidateConstraintErrors` (new
+      `internal/executor/operators_fk_not_enforced_test.go`); new
+      `TestPort_PgDumpConnectionSetup` fixture `fknenf_parent`/`fknenf_child`
+      verified vs live `pg_dump` 18.3. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `FOREIGN KEY ...
+      NOT ENFORCED` (PG18) round-trip in pg_dump (loop #94, slice 431)".
+      Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (full, no regression); `TestPort_PgDumpConnectionSetup` PASS;
+      `internal/testport` full suite PASS; `internal/wal`+`internal/initdb`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. Deferral ledger row appended. Still open:
+      `CREATE TABLE`-time FK constraints (inline column-level and table-level
+      forms) accept neither `NOT VALID` nor `NOT ENFORCED` at all — a
+      narrower, pre-existing gap, scoped out per the one-narrow-area-per-loop
+      pattern.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for

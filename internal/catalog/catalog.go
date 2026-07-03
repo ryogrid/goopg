@@ -1418,6 +1418,14 @@ type ForeignKey struct {
 	// is 'f' and pg_get_constraintdef emits ` MATCH FULL`. MATCH SIMPLE (the
 	// default) leaves it false (confmatchtype='s'). DU-002 slice 309.
 	MatchFull bool
+	// NotEnforced mirrors pg_constraint.conenforced='f' (PG18 NOT ENFORCED),
+	// disabling the constraint's action/check triggers entirely at runtime;
+	// pg_get_constraintdef gives it precedence over NotValid in the rendered
+	// text, the same way catalog.NamedCheckConstraint.NotEnforced already
+	// works for CHECK. The pg_constraint convalidated projection treats this
+	// as implying NotValid too (mirrors PG's processCASbits), even though
+	// NotValid itself is kept independent here. DU-002 slice 431.
+	NotEnforced bool
 }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
@@ -7020,8 +7028,8 @@ func (c *InMemory) registerSystemTables() {
 				} else {
 					row[5] = "f" // condeferred
 				}
-				if fk.NotValid {
-					row[6] = "f" // convalidated — NOT VALID, not yet validated
+				if fk.NotValid || fk.NotEnforced {
+					row[6] = "f" // convalidated — NOT VALID (or implied by NOT ENFORCED)
 				} else {
 					row[6] = "t" // convalidated
 				}
@@ -7046,7 +7054,11 @@ func (c *InMemory) registerSystemTables() {
 				if len(confdelsetcols) > 0 {
 					row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
 				}
-				row[25] = "t" // conenforced
+				if fk.NotEnforced {
+					row[25] = "f" // conenforced — FOREIGN KEY ... NOT ENFORCED. DU-002 slice 431.
+				} else {
+					row[25] = "t" // conenforced
+				}
 				out = append(out, row)
 			}
 		}

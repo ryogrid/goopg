@@ -4740,12 +4740,15 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 			def += " INITIALLY DEFERRED"
 		}
 	}
-	// A NOT-VALID FK (pg_constraint.convalidated='f') carries a trailing
-	// ` NOT VALID` in pg_get_constraintdef, appended after the DEFERRABLE
-	// clauses — the shared tail of pg_get_constraintdef_worker (ruleutils.c:2604).
-	// pg_dump re-emits this verbatim so the restored FK is likewise unvalidated.
-	// DU-002 slice 307.
-	if fk.NotValid {
+	// The shared tail of pg_get_constraintdef_worker (ruleutils.c:2601-2604):
+	// "Validated status is irrelevant when the constraint is NOT ENFORCED" —
+	// conenforced is checked FIRST, and NOT VALID is only considered when the
+	// constraint IS enforced. A NOT-VALID FK (pg_constraint.convalidated='f')
+	// carries a trailing ` NOT VALID`; pg_dump re-emits either verbatim so the
+	// restored FK matches. DU-002 slices 307, 431.
+	if fk.NotEnforced {
+		def += " NOT ENFORCED"
+	} else if fk.NotValid {
 		def += " NOT VALID"
 	}
 	return def

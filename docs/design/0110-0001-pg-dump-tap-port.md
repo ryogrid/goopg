@@ -11947,3 +11947,123 @@ trailer loop) has no ENFORCED handling at all, so `... FOREIGN KEY (...)
 REFERENCES ... NOT ENFORCED` is a hard parse error today rather than a silent
 discard. Scoped out of this slice (CHECK-only, per the established
 one-narrow-area-per-slice pattern); ledger row appended.
+
+## Follow-up: `FOREIGN KEY ... NOT ENFORCED` (PG18) round-trip in pg_dump (loop #94, slice 431)
+
+Closes the slice 430 deferral above: the FK-side sibling of `CHECK ...
+NOT ENFORCED`. Unlike the CHECK forms (which silently discarded the trailer
+before slice 430), `ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY (...)
+REFERENCES ... NOT ENFORCED` was a **hard parse error** in goopg — the FK
+trailer loop (`internal/parser/ddl.go`, positioned after `ON DELETE`/`ON
+UPDATE`) only recognised `[NOT] DEFERRABLE` and `NOT VALID`, so any FK carrying
+`NOT ENFORCED` (or bare `ENFORCED`) failed to parse at all.
+
+### PG oracle behavior confirmed
+
+`postgres/src/backend/parser/gram.y`'s `ConstraintAttributeSpec` production
+(the `[NOT] DEFERRABLE [INITIALLY ...] | NOT VALID | [NOT] ENFORCED` trailer
+grammar) is genuinely shared between CHECK and FOREIGN KEY constraints — both
+route through the same `processCASbits` validator
+(`gram.y:19513-19543`), which accepts `is_enforced` for both `CONSTRAINT_CHECK`
+and `CONSTRAINT_FOREIGN` (confirmed via `tablecmds.c`'s `fkconstraint->is_enforced`
+call sites: `MergeCheckConstraint`, `ATAddForeignKeyConstraint`,
+`ATExecValidateConstraint`). Two behavioral facts drove this loop's scope
+beyond a pure parser fix:
+
+1. **`processCASbits` sets `*not_valid = true` when `CAS_NOT_ENFORCED` is set**
+   (`gram.y:19527`) — but this is a compiler-internal detail baked into the
+   Constraint node before `transformFKConstraint`/`ATAddForeignKeyConstraint`
+   even see it; it is not a *separately user-visible* AST flag. goopg's
+   existing CHECK precedent (slice 430) deliberately keeps its own parsed
+   `NotValid` field independent of `NotEnforced` and instead derives
+   `convalidated='f'` at the catalog-projection layer via `NotValid ||
+   NotEnforced` (see `TestParseCheckNotEnforced`'s
+   `AlterTableAddConstraint` case: `act.NotValid` stays `false` for a bare
+   `NOT ENFORCED`). This slice's FK parser mirrors that exact shape for
+   consistency (sibling-paths-must-agree) rather than literally copying
+   `processCASbits`' internal mutation.
+2. **`addFkRecurseReferencing`/`addFkRecurseReferenced` gate trigger creation
+   on `is_enforced`** (`tablecmds.c:11065`, `:10920`): a NOT ENFORCED FK gets
+   **zero** RI check/action triggers in real PG — not merely deferred
+   checking, but no checking machinery at all. Since goopg has no actual
+   trigger objects for FK enforcement (the checks are inlined into the
+   INSERT/UPDATE/DELETE operators), the equivalent fix is an early skip at the
+   two functions that stand in for those triggers.
+
+### Landed
+
+- **Parser** (`internal/parser/ddl.go`, ALTER TABLE ADD FOREIGN KEY trailer
+  loop): generalized to a single loop accepting `NOT VALID`, `NOT ENFORCED`,
+  bare `ENFORCED`, and `[NOT] DEFERRABLE` in any order (previously a
+  sequential DEFERRABLE→NOT VALID chain with no ENFORCED branch at all). New
+  `AlterTableAction.FKNotEnforced` (`internal/parser/ast.go`), independent of
+  `NotValid` per the design note above.
+- **Catalog** (`internal/catalog/catalog.go`): new `ForeignKey.NotEnforced`
+  field. The `pg_constraint` FK-row builder now projects `convalidated='f'`
+  when `fk.NotValid || fk.NotEnforced` (previously `fk.NotValid` alone) and
+  `conenforced='f'` when `fk.NotEnforced` (previously hardcoded `'t'`).
+- **`pg_get_constraintdef`** (`internal/executor/expr.go`,
+  `buildForeignKeyDefString`): mirrors `ruleutils.c`'s shared tail exactly —
+  checks `NotEnforced` first and appends ` NOT ENFORCED`, falling back to
+  ` NOT VALID` only when the FK IS enforced (same precedence already applied
+  to the CHECK branch in slice 430).
+- **DDL execution** (`internal/executor/operators_ddl.go`): the
+  `AlterTableAddForeignKey` handler threads `act.FKNotEnforced` into the new
+  `catalog.ForeignKey.NotEnforced` field.
+- **Runtime enforcement skip** (`internal/executor/operators_fk.go`): the
+  behavioral half, mirroring PG's "no trigger at all" semantics.
+  `checkFKInsertForConstraints` (the single choke point for both INSERT and
+  UPDATE-side "parent must exist" checks) now `continue`s immediately for a
+  `fk.NotEnforced` constraint, before even gathering column values or
+  consulting `fkCheckDeferred` — an unenforced FK is not merely deferred, it
+  is never checked. `enforceFKOnDelete`'s per-referencing-FK loop likewise
+  skips a `ref.FK.NotEnforced` entry entirely, so CASCADE/SET NULL/RESTRICT/NO
+  ACTION referential actions are all suppressed for an unenforced FK exactly
+  as they would be for a real PG FK with no action triggers installed.
+- **VALIDATE CONSTRAINT guard** (`internal/executor/operators_ddl.go`,
+  `AlterTableValidateConstraint`): mirrors `ATExecValidateConstraint`'s own
+  guard (`tablecmds.c:12955`, `if (!con->conenforced) ereport(ERROR, ...
+  "cannot validate NOT ENFORCED constraint")`, SQLSTATE
+  `ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE` = `55000`) — a NOT ENFORCED FK
+  now rejects `VALIDATE CONSTRAINT` with `55000` instead of silently flipping
+  `NotValid` to `false`.
+
+### Tests
+
+`TestParseFKNotEnforced` (`internal/parser/fk_not_enforced_test.go`) mirrors
+`TestParseCheckNotEnforced`'s case shape (plain NOT ENFORCED, NOT VALID + NOT
+ENFORCED composition, DEFERRABLE + NOT ENFORCED composition, plain NOT VALID,
+bare ENFORCED, no trailer). `TestFKNotEnforcedAlterTable`,
+`TestFKNotEnforcedPlainNotValidStillRendersNotValid`,
+`TestFKNotEnforcedSkipsRuntimeCheck` (both the NOT ENFORCED case and an
+enforced control case confirming the fixture would otherwise 23503), and
+`TestFKNotEnforcedValidateConstraintErrors` (new
+`internal/executor/operators_fk_not_enforced_test.go`) cover the
+catalog/`pg_constraint`/`pg_get_constraintdef` wiring, the runtime skip, and
+the VALIDATE CONSTRAINT guard. New `TestPort_PgDumpConnectionSetup` fixture
+`fknenf_child`/`fknenf_parent` (`ALTER TABLE ... ADD CONSTRAINT ... FOREIGN
+KEY ... NOT ENFORCED`) verified to render as a standalone post-data
+`ALTER TABLE ... ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES
+public.fknenf_parent(id) NOT ENFORCED;` statement.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS; `internal/testport` full suite PASS;
+`internal/wal`+`internal/initdb` suites PASS (no regression from the
+`catalog.ForeignKey` struct change); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`CREATE TABLE`-time FK constraints (both the inline column-level `REFERENCES`
+form, `parseColumnDef` ~`internal/parser/ddl.go:4028`, and the table-level
+`FOREIGN KEY (...) REFERENCES ...` form, `parseTableForeignKey`) accept
+**neither** `NOT VALID` **nor** `NOT ENFORCED` at all — a pre-existing,
+narrower gap than the one this slice closed (the ALTER TABLE form was a hard
+parse error specifically for `ENFORCED`; the CREATE TABLE forms don't even
+attempt `NOT VALID`, which real PG's grammar also permits there, however
+redundant it is against an empty new table). Left out of this slice's scope
+(a third, differently-shaped parser change, not merely adding an ENFORCED
+branch to an already-present trailer loop); ledger row appended.

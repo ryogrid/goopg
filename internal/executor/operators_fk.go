@@ -110,6 +110,13 @@ func checkFKInsert(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *catalog.T
 // column is modified). M0118-0008 (detach-partition-concurrently-4).
 func checkFKInsertForConstraints(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *catalog.Table, row Row, fks []catalog.ForeignKey) error {
 	for _, fk := range fks {
+		// A NOT ENFORCED FK (PG18) gets no RI check trigger at all in real PG
+		// (addFkRecurseReferencing's `if (fkconstraint->is_enforced)` gate,
+		// tablecmds.c:11065) — skip the parent-exists check entirely rather
+		// than merely deferring it. DU-002 slice 431.
+		if fk.NotEnforced {
+			continue
+		}
 		// Gather the FK column values.
 		vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, row)
 		if allNull {
@@ -155,6 +162,13 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 	leafIsPartition := leafTbl != parentTbl && im.IsPartitionChild(leafTbl.OID)
 	refs := im.FindFKsReferencingTable(parentTbl.Name)
 	for _, ref := range refs {
+		// A NOT ENFORCED FK (PG18) gets no action trigger at all in real PG
+		// (addFkRecurseReferenced's `if (fkconstraint->is_enforced)` gate,
+		// tablecmds.c:10920) — CASCADE/SET NULL/RESTRICT/NO ACTION are all
+		// skipped, not merely deferred. DU-002 slice 431.
+		if ref.FK.NotEnforced {
+			continue
+		}
 		// Get the referenced column values from the deleted parent row.
 		refCols := ref.FK.RefColumns
 		if len(refCols) == 0 {

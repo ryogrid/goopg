@@ -6701,6 +6701,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				Deferrable:      act.Deferrable,
 				NotValid:        act.NotValid,
 				MatchFull:       act.MatchFull,
+				NotEnforced:     act.FKNotEnforced,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableValidateConstraint:
@@ -6723,10 +6724,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// Flip the constraint's convalidated flag from 'f' to 't'. The
 			// only validatable constraint goopg models is the FK (NOT VALID);
 			// a CHECK NOT VALID is accepted but already enforced. An unknown
-			// name matches PostgreSQL's error.
+			// name matches PostgreSQL's error. A NOT ENFORCED FK cannot be
+			// validated at all — mirrors ATExecValidateConstraint's own guard
+			// (tablecmds.c:12955 `if (!con->conenforced) ereport(ERROR, ...
+			// "cannot validate NOT ENFORCED constraint")`, SQLSTATE
+			// ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE = 55000). DU-002 slice 431.
 			found := false
 			for i := range tbl.ForeignKeys {
 				if strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
+					if tbl.ForeignKeys[i].NotEnforced {
+						return &ExecError{Code: "55000", Pos: act.Pos(), Message: "cannot validate NOT ENFORCED constraint"}
+					}
 					tbl.ForeignKeys[i].NotValid = false
 					found = true
 					break

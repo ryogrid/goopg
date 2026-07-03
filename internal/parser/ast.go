@@ -2803,6 +2803,11 @@ type AlterTableAction struct {
 	OnDeleteSetCols []string
 	NotValid        bool // true if `NOT VALID` (skip validation of existing rows)
 	MatchFull       bool // true if `MATCH FULL`; MATCH SIMPLE (default) leaves it false. DU-002 slice 309.
+	// FKNotEnforced is true for `ADD CONSTRAINT ... FOREIGN KEY (...)
+	// REFERENCES ... NOT ENFORCED` (PG18 conenforced='f'); mirrors
+	// CheckNotEnforced for the FK constraint form — pg_get_constraintdef gives
+	// it precedence over NOT VALID in the rendered text. DU-002 slice 431.
+	FKNotEnforced bool
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.
