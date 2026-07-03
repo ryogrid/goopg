@@ -7927,10 +7927,22 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   limitation" section. No new goopg bugs, no deferral-ledger row needed. No Go
   code changed (pure harness execution + fix_plan/CHECKLIST bookkeeping), so
   no build/test/pgbench gates apply beyond `make ralph-state-guard`.
-- [ ] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
+- [x] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
   each FAIL (`goopg-bug`/`goopg-missing`/`pg4wp-limitation`/`harness`, FLOW.md
   §4); for every goopg failure append a `.ralph/deferral_ledger.md` row and file
   the cross-referenced `M0121-NNNN` task (the M0120→M0121 handoff).
+  **DONE 2026-07-04**: wrote `wp/verification/report.md` (committed, not under
+  the git-ignored `results/`) aggregating all 40 items from the three
+  per-run `summary.md` triage docs (M0120-0002/0003/0004). Tally: 34/40 fully
+  PASS; FAILs classed 2×`goopg-bug` (WP-02/WP-03, one root cause), 1×`harness`
+  (WP-13 — checklist targets the wrong object type, not a goopg bug), 3×
+  `pg4wp-limitation` (WP-32, WP-R7, WP-R8's `db size` sub-step — all already
+  documented in `CHECKLIST.md`'s "Known non-goopg limitation" section). Only
+  one goopg-attributable failure exists across the whole sweep; its
+  `.ralph/deferral_ledger.md` row was already filed by the M0120-0002 loop
+  (2026-07-04, `status: -`, cross-referencing **M0121-0002**) — verified
+  present, no new row needed. M0120 milestone is now fully complete
+  (0001–0005 all `[x]`). Next: M0121-0002 (fix the backend panic).
 
 ## M0121 — WordPress WP-CLI Verification Failure Remediation (filed 2026-07-02)
 
