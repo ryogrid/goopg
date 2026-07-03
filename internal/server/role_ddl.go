@@ -428,6 +428,7 @@ type roleConfigRegistry interface {
 // pg_db_role_setting. M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
 type alterRoleConfigOp struct {
 	roleName    string
+	allRoles    bool // true for "ALTER ROLE ALL SET/RESET ..." (role_specification = ALL, an unquoted keyword — roleName is meaningless when this is set)
 	hasDatabase bool // true when an "IN DATABASE <dbname>" clause was present
 	dbName      string
 	configName  string // empty when resetAll
@@ -443,11 +444,14 @@ type alterRoleConfigOp struct {
 // other SQL (including the attribute/RENAME forms tryHandleRoleDDL handles
 // elsewhere), leaving the caller to fall through to its existing behaviour.
 //
-// "ALTER ROLE ALL SET ..." (role_specification = ALL, PG's cluster-wide
-// -default form applying to every role) is intentionally NOT special-cased
-// here — roleName "all" simply fails RoleOID resolution in
-// applyAlterRoleConfig and falls through to the pre-existing no-op path;
-// see the deferral ledger.
+// "ALTER ROLE ALL SET ..." (PG grammar: `ALTER ROLE ALL opt_in_database
+// SetResetClause`, gram.y ~line 1377 — a distinct production from the
+// RoleSpec-carrying form, not `RoleSpec: ALL`; AlterRoleSet, user.c ~line
+// 1000, leaves `roleid = InvalidOid` (0) when `stmt->role == NULL`) is
+// recognised below as op.allRoles when the bare, UNQUOTED keyword ALL
+// follows ALTER ROLE/USER — a quoted `"ALL"`/`"all"` names a real role and
+// must still resolve via RoleOID, exactly like real PG's grammar only
+// matches the bare ALL keyword token.
 func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 	s := strings.TrimSpace(sql)
 	for strings.HasSuffix(s, ";") {
@@ -463,11 +467,16 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 	default:
 		return alterRoleConfigOp{}, false
 	}
+	quoted := strings.HasPrefix(strings.TrimLeft(stripped, " \t\r\n"), `"`)
 	roleName, rest, ok := splitLeadingSQLToken(stripped)
 	if !ok || roleName == "" {
 		return alterRoleConfigOp{}, false
 	}
 	op := alterRoleConfigOp{roleName: roleName}
+	if !quoted && strings.EqualFold(roleName, "all") {
+		op.allRoles = true
+		op.roleName = ""
+	}
 	lowerRest := strings.ToLower(rest)
 	if strings.HasPrefix(lowerRest, "in database ") {
 		dbName, r2, ok := splitLeadingSQLToken(rest[len("in database "):])
@@ -550,11 +559,19 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, r
 	if s.cfg.Catalog == nil {
 		return false, nil
 	}
-	roleName := strings.Trim(op.roleName, `"`)
-	roleOid, found := s.cfg.Catalog.RoleOID(roleName)
-	if !found {
-		return true, roleDoesNotExistErr(roleName)
+	var roleOid uint32
+	if !op.allRoles {
+		roleName := strings.Trim(op.roleName, `"`)
+		var found bool
+		roleOid, found = s.cfg.Catalog.RoleOID(roleName)
+		if !found {
+			return true, roleDoesNotExistErr(roleName)
+		}
 	}
+	// op.allRoles ("ALTER ROLE ALL ...") leaves roleOid at its zero value —
+	// real PG's AlterRoleSet does the same (roleid stays InvalidOid/0 when
+	// stmt->role == NULL), so it lands in the same setrole=0 row as any
+	// other cluster-wide override; see parseAlterRoleConfig's doc comment.
 	reg, ok := s.cfg.Catalog.(roleConfigRegistry)
 	if !ok {
 		return false, nil

@@ -134,6 +134,52 @@ func TestParseAlterRoleConfig(t *testing.T) {
 			want: alterRoleConfigOp{roleName: "foo", hasDatabase: true, dbName: "postgres", configName: "search_path", fromCurrent: true},
 			ok:   true,
 		},
+		// "ALTER ROLE ALL ..." (role_specification = ALL, gram.y's separate
+		// `ALTER ROLE ALL opt_in_database SetResetClause` production): the
+		// bare unquoted keyword sets allRoles with an empty roleName.
+		{
+			sql:  "ALTER ROLE ALL SET work_mem = '64MB'",
+			want: alterRoleConfigOp{allRoles: true, configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			sql:  "alter role all set work_mem to '64MB'",
+			want: alterRoleConfigOp{allRoles: true, configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE ALL IN DATABASE postgres SET work_mem = '64MB'",
+			want: alterRoleConfigOp{allRoles: true, hasDatabase: true, dbName: "postgres", configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE ALL RESET work_mem",
+			want: alterRoleConfigOp{allRoles: true, configName: "work_mem", reset: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER ROLE ALL RESET ALL",
+			want: alterRoleConfigOp{allRoles: true, resetAll: true},
+			ok:   true,
+		},
+		{
+			sql:  "ALTER USER ALL SET work_mem = '64MB'",
+			want: alterRoleConfigOp{allRoles: true, configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		// A quoted "ALL"/"all" names a real role, not the ALL keyword — must
+		// still resolve via RoleOID like any other role name.
+		{
+			sql:  `ALTER ROLE "ALL" SET work_mem = '64MB'`,
+			want: alterRoleConfigOp{roleName: "ALL", configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+		{
+			sql:  `ALTER ROLE "all" SET work_mem = '64MB'`,
+			want: alterRoleConfigOp{roleName: "all", configName: "work_mem", configValue: "64MB"},
+			ok:   true,
+		},
+
 		// negatives: forms handled elsewhere in tryHandleRoleDDL, or
 		// unmodelled ALTER ROLE forms, must fall through unrecognised.
 		{sql: "ALTER ROLE foo RENAME TO bar", ok: false},
@@ -274,5 +320,57 @@ func TestTryHandleRoleDDLAlterRoleConfigFromCurrent(t *testing.T) {
 	handled, err = s.tryHandleRoleDDL("ALTER ROLE foo SET work_mem FROM CURRENT", "postgres", nil)
 	if !handled || err == nil {
 		t.Fatalf("ALTER ROLE foo SET work_mem FROM CURRENT (nil resolver): handled=%v err=%v", handled, err)
+	}
+}
+
+// TestTryHandleRoleDDLAlterRoleAll covers "ALTER ROLE ALL ...": real PG's
+// AlterRoleSet (user.c) leaves roleid=InvalidOid (0) when the parsed
+// role_specification is the ALL keyword (stmt->role == NULL), so the
+// cluster-wide default lands in the same setrole=0 pg_db_role_setting row
+// that any other roleOid keys off of — no RoleOID lookup, and no
+// "role does not exist" error, unlike a named role.
+func TestTryHandleRoleDDLAlterRoleAll(t *testing.T) {
+	s := newTestRoleServer()
+	im := s.cfg.Catalog.(*catalog.InMemory)
+
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE ALL SET work_mem = '64MB'", "postgres", nil); !handled || err != nil {
+		t.Fatalf("ALTER ROLE ALL SET work_mem: handled=%v err=%v", handled, err)
+	}
+	if got := im.RoleConfigEntries(0, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
+		t.Errorf("RoleConfigEntries(0, 0) = %v, want [work_mem=64MB]", got)
+	}
+
+	// IN DATABASE matching the connection's own live database: recorded
+	// under (roleOid=0, FirstUserOID) — the "setdatabase=<db>, setrole=0"
+	// row, distinct from the plain cluster-wide (0,0) row above.
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE ALL IN DATABASE postgres SET search_path TO public", "postgres", nil); !handled || err != nil {
+		t.Fatalf("ALTER ROLE ALL IN DATABASE postgres SET: handled=%v err=%v", handled, err)
+	}
+	if got := im.RoleConfigEntries(0, catalog.FirstUserOID); len(got) != 1 || got[0] != "search_path=public" {
+		t.Errorf("RoleConfigEntries(0, FirstUserOID) = %v, want [search_path=public]", got)
+	}
+	if got := im.RoleConfigEntries(0, 0); len(got) != 1 || got[0] != "work_mem=64MB" {
+		t.Errorf("cluster-wide (0,0) entry mutated by an IN DATABASE ALTER ROLE ALL: %v", got)
+	}
+
+	// RESET removes only the named entry from the (0,0) row.
+	if handled, err := s.tryHandleRoleDDL("ALTER ROLE ALL RESET work_mem", "postgres", nil); !handled || err != nil {
+		t.Fatalf("ALTER ROLE ALL RESET work_mem: handled=%v err=%v", handled, err)
+	}
+	if got := im.RoleConfigEntries(0, 0); len(got) != 0 {
+		t.Errorf("RoleConfigEntries(0, 0) after RESET = %v, want empty", got)
+	}
+
+	// A quoted "ALL" role name is a real (nonexistent here) role, not the
+	// ALL keyword — must still error like any other undefined role.
+	handled, err := s.tryHandleRoleDDL(`ALTER ROLE "ALL" SET work_mem = '1MB'`, "postgres", nil)
+	if !handled {
+		t.Fatal(`ALTER ROLE "ALL" SET: expected handled=true`)
+	}
+	if err == nil {
+		t.Fatal(`ALTER ROLE "ALL" SET: expected an error (no role literally named ALL)`)
+	}
+	if got := roleErrorSQLState(err); got != sqlstate.UndefinedObject {
+		t.Errorf(`ALTER ROLE "ALL" SET: SQLSTATE = %q, want %q`, got, sqlstate.UndefinedObject)
 	}
 }

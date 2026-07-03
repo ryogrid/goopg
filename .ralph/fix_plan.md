@@ -5287,6 +5287,50 @@ documentation-only and is exempt from the design-doc requirement.)
       as `0119-0004cr`. Deferred item (1) (GUC unit-display formatting)
       remains open, unrelated scope — no new deferral needed, this closes
       the loop #79 row's item (2) in full.**
+      **2026-07-03 (loop #81): GUC unit-display formatting LANDED** — closes
+      deferred item (1) of the loop #79 note in full. New
+      `config.Variable.FormatDisplayValue` (`internal/config/guc.go`) mirrors
+      `convert_int_from_base_unit`; `SessionRegistry.GetDisplay`/`AllDisplay`
+      layer it onto `Get`/`All` (which stay untouched for internal Go
+      consumers). `executor.Context` gained optional
+      `GetSettingDisplay`/`AllSettingsDisplay`, wired at every real display
+      boundary (`SHOW`/`SHOW ALL`, `current_setting()`/`set_config()`, the
+      `FROM CURRENT` resolver). Live-verified against goopg + real PG 18.3
+      byte-for-byte (`work_mem`, `checkpoint_timeout`, etc., incl. the bare-`0`
+      disabled case). Tests: `TestFormatDisplayValue`/
+      `TestSessionRegistryGetDisplay`. Gates: build/vet clean;
+      `internal/config`+`internal/server`+`internal/executor` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      `scripts/ralph-precommit-test.sh` PASS (pgbench smoke). Design doc:
+      "Follow-up: GUC unit-display formatting (loop #81)", indexed as
+      `0119-0004cs`. No new deferrals — both loop #79 deferred items now
+      resolved.
+      **2026-07-03 (loop #82): `ALTER ROLE ALL SET/RESET ...` LANDED** —
+      closes the last-named M0119-0004-ACLHEAP residual called out in the
+      loop #79 note (`role_specification = ALL`, PG's cluster-wide-default
+      form). New `alterRoleConfigOp.allRoles bool`
+      (`internal/server/role_ddl.go`); `parseAlterRoleConfig` detects the
+      bare UNQUOTED `ALL` token right after `ALTER ROLE`/`ALTER USER` (a
+      quoted `"ALL"`/`"all"` is still a real role identifier);
+      `applyAlterRoleConfig` skips the `catalog.RoleOID` lookup when
+      `op.allRoles`, leaving `roleOid=0` (mirrors PG's `AlterRoleSet` leaving
+      `roleid=InvalidOid`) instead of the pre-existing code's incorrect
+      `role "all" does not exist` error. No WAL/catalog schema change needed.
+      Live-verified against goopg + real PG 18.3: identical three-row
+      `pg_db_role_setting` shape for `ALTER ROLE ALL SET`/`ALTER ROLE foo
+      SET`/`ALTER ROLE ALL IN DATABASE ... SET`; `RESET` and quoted-`"ALL"`
+      negative case both match PG; restart persistence confirmed. Tests:
+      `TestParseAlterRoleConfig` extended (6 `ALL` shapes + 2 quoted
+      cases); new `TestTryHandleRoleDDLAlterRoleAll`. Gates: build/vet
+      clean; `internal/server` suite PASS; live psql + real-PG A/B;
+      `scripts/tpch-spotcheck.sh` PASS; full `scripts/ralph-precommit-test.sh`
+      PASS. Design doc: "Follow-up: `ALTER ROLE ALL SET/RESET ...` (loop
+      #82)", indexed as `0119-0004ct`. **Deferred (ledger row appended):**
+      `ResetRoleConfig`/`ResetDatabaseConfig` (`internal/catalog/catalog.go`)
+      never delete the map key when an entry slice becomes empty after a
+      RESET, so `pg_db_role_setting` keeps a stale blank-`setconfig` row
+      where real PG deletes it entirely — pre-existing, reproduces for named
+      roles too, out of this loop's bounded scope.**
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

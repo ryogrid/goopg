@@ -179,8 +179,12 @@ resolved through the database registry.
   multi-database storage.
 - **`ALTER ROLE ... SET` / `ALTER ROLE ... IN DATABASE ... SET`** (the
   role-scoped and role-and-database-scoped halves of `pg_db_role_setting`,
-  `setrole != 0`) remain entirely unimplemented — `dumpDatabaseConfig`'s
-  second query (`setrole = r.oid`) always returns zero rows against goopg.
+  `setrole != 0`) landed in a later, undocumented-here loop (see
+  `internal/server/role_ddl.go`'s `parseAlterRoleConfig`/
+  `applyAlterRoleConfig`, `internal/server/role_config_test.go`) — this bullet
+  was stale. `ALTER ROLE ALL SET/RESET ...` (the `setrole=0`
+  cluster-wide-default sub-case) was still unimplemented until the "Follow-up:
+  `ALTER ROLE ALL SET/RESET ...` (loop #82)" section below closed it.
 - **`SET ... FROM CURRENT`** (PG grammar special-case distinct from the
   plain `SET name = value` form — reads the session's *current* value of
   the named GUC rather than a literal) is not recognised by
@@ -492,3 +496,93 @@ row in full. `pg_settings`'s `unit` column
 hardcoded minimal 2-row stub (pre-existing, unrelated to this GUC's own
 `Value` display — `pg_settings` is out of scope for this loop, tracked
 separately if a future loop needs a real per-GUC `pg_settings` row source).
+
+## Follow-up: `ALTER ROLE ALL SET/RESET ...` (loop #82)
+
+Closes the "**`ALTER ROLE ... SET` / `ALTER ROLE ... IN DATABASE ... SET`**"
+bullet's cluster-wide-default sub-case under "Still open under
+M0119-0004-ACLHEAP" above — the `role_specification = ALL` form of
+`ALTER ROLE`/`ALTER USER`, PG's per-cluster default-GUC mechanism (distinct
+from a named role's own override).
+
+**Grammar.** `postgres/src/backend/parser/gram.y` ~line 1377 defines
+`ALTER ROLE ALL opt_in_database SetResetClause` as a *separate* production
+from the `RoleSpec`-carrying form — `n->role = NULL` — not `RoleSpec: ALL`
+(that only covers `public` → `ROLESPEC_PUBLIC`, gram.y ~17502). `AlterRoleSet`
+(`postgres/src/backend/commands/user.c` ~line 1000) leaves `roleid =
+InvalidOid` (0) whenever `stmt->role == NULL`, then calls `AlterSetting
+(databaseid, roleid, stmt->setstmt)` — `pg_db_role_setting.c`'s `AlterSetting`
+writes `setrole=0` verbatim, no ALL-specific translation. Net: `ALTER ROLE ALL
+SET x=y` → `(setdatabase=0, setrole=0)`; `ALTER ROLE ALL IN DATABASE db SET
+x=y` → `(setdatabase=<db oid>, setrole=0)` — the *same* `setrole=0` row shape
+`ALTER DATABASE ... SET` already produces for its own `(setdatabase=<db oid>,
+setrole=0)` case, confirming goopg's existing `SetRoleConfig(roleOid, dbOid,
+...)`/`RoleConfigRow`/`pg_db_role_setting.VirtualRows` plumbing (built for
+named roles) needed no schema change — only `roleOid=0` needed to be
+reachable from the ALL keyword instead of only ever coming from a
+`catalog.RoleOID` lookup.
+
+**Fix.** `alterRoleConfigOp` (`internal/server/role_ddl.go`) gained a new
+`allRoles bool` field. `parseAlterRoleConfig` detects the bare, UNQUOTED
+`ALL` token immediately after `ALTER ROLE`/`ALTER USER` (checked before
+`splitLeadingSQLToken` is even called, by inspecting whether the raw text
+starts with `"` — a quoted `"ALL"`/`"all"` is a real role identifier, exactly
+matching the grammar's ALL-is-a-keyword-not-a-RoleSpec distinction) and sets
+`allRoles=true` with `roleName` left empty; every other production
+(`IN DATABASE`, the six `set_rest` special forms, `FROM CURRENT`, `RESET`,
+`RESET ALL`) is unchanged and composes with the flag automatically, since
+they all operate on `rest` after the role-name token is consumed.
+`applyAlterRoleConfig` skips the `catalog.RoleOID` lookup entirely when
+`op.allRoles` (leaving `roleOid` at its Go zero value, 0 — mirrors
+`AlterRoleSet`'s `InvalidOid` default exactly) instead of erroring
+`role "all" does not exist`, which is what the pre-existing code did before
+this loop (a real, user-visible correctness bug, not a no-op as an earlier
+loop's stale comment on `parseAlterRoleConfig` claimed — corrected in the
+same edit). No WAL/catalog schema change was needed: `EncodeAlterRoleSetConfig`/
+`EncodeAlterRoleResetConfig`/`EncodeAlterRoleResetAllConfig`
+(`internal/wal/recovery.go`) and their recovery-replay counterparts
+(`internal/initdb/role_config_recovery.go`) already carry `roleOid` as a
+plain `uint32` with no reserved-zero special-casing, so restart persistence
+worked immediately.
+
+**Live-verified** against a running goopg instance (throwaway data dir, port
+5537, real `psql`) and cross-checked against a real, separately-`initdb`'d
+PostgreSQL 18.3 instance:
+`ALTER ROLE ALL SET work_mem = '64MB'; CREATE ROLE foo LOGIN; ALTER ROLE foo
+SET work_mem = '32MB'; ALTER ROLE ALL IN DATABASE postgres SET search_path TO
+public; SELECT setdatabase, setrole, setconfig FROM pg_db_role_setting` on
+both engines produced the identical three-row shape — `(0, 0,
+{work_mem=64MB})` / `(0, <foo's oid>, {work_mem=32MB})` / (`<postgres db
+oid>`, `0`, `{search_path=public}`) — differing only in the OID values
+themselves (goopg's fixed placeholder OIDs vs real PG's assigned ones, an
+existing, unrelated v0 scope restriction). `ALTER ROLE ALL RESET work_mem`
+correctly removed only that entry. A quoted `ALTER ROLE "ALL" SET ...` (no
+role literally named ALL exists) correctly raised `role "ALL" does not
+exist` on both engines, confirming the quoted-identifier-is-not-the-keyword
+distinction. Restart persistence confirmed (`goopg stop`/`start` on the same
+data dir, `pg_db_role_setting` unchanged).
+
+Tests: `TestParseAlterRoleConfig` extended (6 new `ALL` shapes + 2 quoted-
+`"ALL"` negative-classification cases); new
+`TestTryHandleRoleDDLAlterRoleAll` (`internal/server/role_config_test.go`) —
+cluster-wide SET, `IN DATABASE` SET, RESET, and the quoted-`"ALL"`-errors
+case.
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/server/...` PASS (no regressions); live psql + real-PG A/B above;
+`scripts/tpch-spotcheck.sh` PASS; full `scripts/ralph-precommit-test.sh`
+PASS (pgbench smoke).
+
+**Deferred (ledger row appended):** live-verification of this loop's own
+`ALTER ROLE foo RESET work_mem` case surfaced a **pre-existing, unrelated**
+bug — `ResetRoleConfig`/`ResetDatabaseConfig` (`internal/catalog/catalog.go`)
+remove the *matched entry* from a `(roleOid, dbOid)`/`dbOid`'s entry slice
+but never delete the map key itself when the slice becomes empty, so
+`pg_db_role_setting` keeps emitting a stale row with an empty `setconfig`
+(`{}`/blank) after the last override is reset, where real PG deletes the
+whole row (confirmed via an A/B: after `ALTER ROLE foo RESET work_mem`
+empties foo's only entry, real PG's `pg_db_role_setting` has one fewer row;
+goopg's still has the row with a blank `setconfig`). This reproduces
+identically for the plain named-role case (predates this loop, not
+introduced by the `ALL` fix) and is out of this loop's bounded scope — see
+the deferral ledger for the resume point.
