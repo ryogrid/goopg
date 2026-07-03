@@ -638,13 +638,16 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
+					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid)); ok {
+						return NewStringDatum(uname), nil
+					}
 					return NewStringDatum(typName), nil
 				}
-				// Try as a type name → return OID (for enum types)
-				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-					if et, found := im.LookupEnum(typName); found {
-						return NewIntDatum(int64(et.OID)), nil
-					}
+				// Try as a type name → return OID, across all four
+				// user-type kinds (enum/domain/composite/range/multirange),
+				// mirroring userTypeNameForOID's reverse direction.
+				if oid, ok := userTypeOIDForName(ctx.Catalog, typName); ok {
+					return NewIntDatum(int64(oid)), nil
 				}
 				// Built-in type name → return itself
 				return v, nil
@@ -655,6 +658,17 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 				if name := oidToBuiltinTypeName(uint32(v.Int)); name != "" {
 					return NewStringDatum(name), nil
+				}
+				// A user-defined enum/domain/composite/range/multirange
+				// type's pg_type OID is dynamically allocated; oidToBuiltinTypeName
+				// only knows PG's static OIDs, so resolve it here — previously
+				// this rendered the bare numeric OID (e.g. `atttypid::regtype`
+				// for a range-typed column showed "16422" instead of
+				// "myrange"), diverging from PG's regtypeout (regproc.c),
+				// which always renders the schema-qualified name. DU-002
+				// (M0110-0001) regtype/format_type unification follow-up.
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int)); ok {
+					return NewStringDatum(uname), nil
 				}
 				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
 			}
@@ -9664,67 +9678,16 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			name := formatTypeOID(typeOID, typmod)
 			if name == "???" && ctx != nil && ctx.Catalog != nil {
-				// A user-defined enum's pg_type OID is dynamically allocated,
+				// A user-defined type's pg_type OID is dynamically allocated,
 				// so formatTypeOID (built-ins only) returns the unknown
-				// sentinel. Resolve it to the enum's schema-qualified name.
+				// sentinel; resolve it via the shared enum/domain/composite/
+				// range/multirange lookup (also used by the ::regtype cast).
 				// pg_dump runs with search_path='', under which format_type
-				// qualifies a non-visible type with its namespace; goopg enums
-				// live in public, hence the public. prefix. DU-002 slice 88.
-				if et, ok := ctx.Catalog.LookupEnumByOID(uint32(typeOID)); ok {
-					name = "public." + et.Name
-				} else if et, ok := ctx.Catalog.LookupEnumByArrayOID(uint32(typeOID)); ok {
-					// A `mood[]` column carries the enum's auto-generated array
-					// OID; render it as the schema-qualified array name so the
-					// dump round-trips as `public.mood[]`, not `text[]`. DU-002
-					// slice 89.
-					name = "public." + et.Name + "[]"
-				} else if dom, ok := ctx.Catalog.LookupDomainByOID(uint32(typeOID)); ok {
-					// A domain column carries the domain's dynamically-allocated
-					// pg_type OID; render it as the schema-qualified domain name
-					// (NOT the base type) so the dump round-trips as
-					// `public.zipcode`. DU-002 slice 90.
-					name = "public." + dom.Name
-				} else if dom, ok := ctx.Catalog.LookupDomainByArrayOID(uint32(typeOID)); ok {
-					// A `d[]` column carries the domain's auto-generated array OID;
-					// render it as the schema-qualified array name so the dump
-					// round-trips as `public.d[]`, not the base type's array.
-					// DU-002 slice 251.
-					name = "public." + dom.Name + "[]"
-				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByOID(uint32(typeOID)); ok {
-					// A nested-composite field carries the inner composite type's
-					// dynamically-allocated pg_type OID; render it as the
-					// schema-qualified composite name so dumpCompositeType emits
-					// `<field> public.<inner>` rather than the text fallback.
-					// DU-002 slice 249.
-					name = "public." + ct.Name
-				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByArrayOID(uint32(typeOID)); ok {
-					// A composite-array field (`addr[]`) carries the composite's
-					// auto-generated array OID; render it as the schema-qualified
-					// array name so the dump round-trips as `public.addr[]`, not
-					// `text[]`. DU-002 slice 250.
-					name = "public." + ct.Name + "[]"
-				} else if rt, ok := ctx.Catalog.LookupRangeTypeByOID(uint32(typeOID)); ok {
-					// A range type's dynamically-allocated pg_type OID; render it
-					// as the schema-qualified range name so dumpRangeType's own
-					// `CREATE TYPE ... AS RANGE` header round-trips. DU-002
-					// (M0110-0001).
-					name = "public." + rt.Name
-				} else if rt, ok := ctx.Catalog.LookupRangeTypeByMultirangeOID(uint32(typeOID)); ok {
-					// dumpRangeType's own query resolves rngmultitypid via
-					// `format_type(rngmultitypid, NULL)` to emit the
-					// `multirange_type_name = ...` clause. DU-002 (M0110-0001).
-					name = "public." + rt.MultirangeName
-				} else if rt, ok := ctx.Catalog.LookupRangeTypeByArrayOID(uint32(typeOID)); ok {
-					// A `myrange[]` column carries the range's auto-generated
-					// array OID; render it as the schema-qualified array name
-					// so the dump round-trips as `public.myrange[]`, not
-					// `text[]`. DU-002 (M0110-0001) array-type follow-up.
-					name = "public." + rt.Name + "[]"
-				} else if rt, ok := ctx.Catalog.LookupRangeTypeByMultirangeArrayOID(uint32(typeOID)); ok {
-					// A `mymultirange[]` column carries the multirange's
-					// auto-generated array OID. DU-002 (M0110-0001)
-					// array-type follow-up.
-					name = "public." + rt.MultirangeName + "[]"
+				// qualifies a non-visible type with its namespace; goopg's
+				// user types all live in public, hence the public. prefix.
+				// DU-002 slices 88-90/249-251/(M0110-0001).
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID)); ok {
+					name = uname
 				}
 			}
 			return NewStringDatum(name), nil
@@ -11758,6 +11721,74 @@ func pgFormatTypeName(t string) string {
 		return "numeric"
 	}
 	return t
+}
+
+// userTypeNameForOID resolves a dynamically-allocated pg_type OID (one goopg
+// itself assigned to a user-defined enum/domain/composite/range/multirange
+// type, or one of their auto-generated array types) to its schema-qualified
+// name. Shared by format_type's built-in-fallback path and the `::regtype`
+// cast, since both need the identical resolution across all four user-type
+// kinds — goopg enums/domains/composites/ranges all live in public, hence the
+// public. prefix (matches pg_dump's search_path='' visibility). Returns
+// ("", false) if oid does not match any user type. DU-002 (M0110-0001)
+// regtype/format_type unification follow-up.
+func userTypeNameForOID(cat catalog.Catalog, oid uint32) (string, bool) {
+	if et, ok := cat.LookupEnumByOID(oid); ok {
+		return "public." + et.Name, true
+	}
+	if et, ok := cat.LookupEnumByArrayOID(oid); ok {
+		return "public." + et.Name + "[]", true
+	}
+	if dom, ok := cat.LookupDomainByOID(oid); ok {
+		return "public." + dom.Name, true
+	}
+	if dom, ok := cat.LookupDomainByArrayOID(oid); ok {
+		return "public." + dom.Name + "[]", true
+	}
+	if ct, ok := cat.LookupCompositeTypeByOID(oid); ok {
+		return "public." + ct.Name, true
+	}
+	if ct, ok := cat.LookupCompositeTypeByArrayOID(oid); ok {
+		return "public." + ct.Name + "[]", true
+	}
+	if rt, ok := cat.LookupRangeTypeByOID(oid); ok {
+		return "public." + rt.Name, true
+	}
+	if rt, ok := cat.LookupRangeTypeByMultirangeOID(oid); ok {
+		return "public." + rt.MultirangeName, true
+	}
+	if rt, ok := cat.LookupRangeTypeByArrayOID(oid); ok {
+		return "public." + rt.Name + "[]", true
+	}
+	if rt, ok := cat.LookupRangeTypeByMultirangeArrayOID(oid); ok {
+		return "public." + rt.MultirangeName + "[]", true
+	}
+	return "", false
+}
+
+// userTypeOIDForName resolves a user-defined type name to its pg_type OID,
+// searching the enum/domain/composite/range/multirange registries in turn —
+// the name-based mirror of userTypeNameForOID, used by `::regtype`'s
+// string→OID direction (e.g. `'myrange'::regtype`). Array-form names
+// (`myrange[]`) are not handled here, matching the pre-existing enum-only
+// behavior this generalizes. Returns (0, false) if name matches no user type.
+func userTypeOIDForName(cat catalog.Catalog, name string) (uint32, bool) {
+	if et, ok := cat.LookupEnum(name); ok {
+		return et.OID, true
+	}
+	if dom, ok := cat.LookupDomain(name); ok {
+		return dom.OID, true
+	}
+	if ct := cat.LookupCompositeType(name); ct != nil {
+		return ct.OID, true
+	}
+	if rt, ok := cat.LookupRangeType(name); ok {
+		return rt.OID, true
+	}
+	if rt, ok := cat.LookupRangeTypeByMultirangeName(name); ok {
+		return rt.MultirangeOID, true
+	}
+	return 0, false
 }
 
 // formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.

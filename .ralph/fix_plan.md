@@ -110,9 +110,27 @@ prev-link fixes.
       (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
       appended): range/multirange **value storage** (parse/wire-format/
       comparison) is still entirely unimplemented — this fix is
-      introspection-only. New discovery (separate ledger row, `-` open):
-      `OID::regtype` has no user-type-registry fallback (generic gap across
-      enum/composite/domain/range, not range-specific).
+      introspection-only.
+      **2026-07-03 (loop #62, DU-002 slice 429 follow-up): `::regtype` /
+      `format_type` OID→name resolution unified — CLOSES the loop #61
+      discovery above.** `format_type`'s inlined ten-branch enum/domain/
+      composite/range else-if chain and `::regtype`'s `KindInt`-only
+      `oidToBuiltinTypeName` lookup are now the same shared helper,
+      `userTypeNameForOID` (`internal/executor/expr.go`); a symmetric
+      `userTypeOIDForName` generalizes the old enum-only `'name'::regtype`
+      branch to all four user-type kinds. Live-verified: `atttypid::regtype`
+      for a range/enum/domain column now renders `public.<name>` (previously
+      the bare numeric OID), matching `format_type` in the same session.
+      Tests: `TestUserTypeNameForOIDAllKinds` + `TestUserTypeOIDForNameAllKinds`
+      (`internal/executor/user_type_oid_name_test.go`). Design doc "Follow-up:
+      `::regtype` / `format_type` OID→name resolution unified (loop #62)".
+      Gates: build/vet clean; `internal/executor`+`internal/catalog` suites
+      PASS; `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook; live `goopg`/`psql`
+      smoke. No new deferral — closes cleanly (the one remaining wrinkle, a
+      `KindInt`-tagged regtype value from the name→OID direction still
+      displaying as a raw number, is pre-existing enum behavior unrelated to
+      this fix, not something this loop's scope touches).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

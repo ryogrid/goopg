@@ -11482,3 +11482,79 @@ of discovery (e)) is untouched — a range-typed column can now be introspected
 correctly via `pg_attribute`/`\d`/`pg_dump`, but `INSERT`/`SELECT` of an
 actual range value is still unimplemented for any range type, built-in or
 user-defined.
+
+## Follow-up: `::regtype` / `format_type` OID→name resolution unified (loop #62)
+
+Closes the discovery recorded immediately above: `OID::regtype`'s `KindInt`
+branch (`internal/executor/expr.go`'s `CastExpr` handling, `regtype` case)
+resolved a dynamically-allocated user-type OID only via
+`oidToBuiltinTypeName`, so a range/enum/domain/composite column's
+`atttypid::regtype` printed the bare numeric OID while `format_type` (which
+already had its own five-branch `LookupEnumByOID`/`LookupEnumByArrayOID`/
+`LookupDomainByOID`/`LookupDomainByArrayOID`/`LookupCompositeTypeByOID`/
+`LookupCompositeTypeByArrayOID`/`LookupRangeTypeByOID`/`ByMultirangeOID`/
+`ByArrayOID`/`ByMultirangeArrayOID` else-if chain inlined in its own `case
+"format_type":` arm) rendered the correct schema-qualified name for the exact
+same OID in the exact same session — confirmed live via real `psql`
+(`SELECT atttypid::regtype FROM pg_attribute WHERE attrelid =
+'rangecol_t'::regclass` printed `16422`/`16423`/`16424` where `\d
+rangecol_t`, which uses `format_type`, printed `myrange`/`myrange[]`/
+`mymultirange` in the same session).
+
+Fix extracts that resolution chain into two shared helpers in
+`internal/executor/expr.go` (placed immediately before `formatTypeOID`):
+
+- `userTypeNameForOID(cat catalog.Catalog, oid uint32) (string, bool)` — the
+  OID→name direction, the exact ten-branch chain `format_type`'s fallback used
+  to inline (enum/enum-array/domain/domain-array/composite/composite-array/
+  range/multirange/range-array/multirange-array).
+- `userTypeOIDForName(cat catalog.Catalog, name string) (uint32, bool)` — the
+  reverse name→OID direction, generalizing what was previously an enum-only
+  `if im, ok := ctx.Catalog.(*catalog.InMemory); ok { im.LookupEnum(...) }`
+  branch inside `::regtype`'s `KindString` case to all four user-type kinds
+  (enum/domain/composite/range, plus range's multirange-name form), for
+  symmetry with `userTypeNameForOID` — this was flagged as a "check for
+  symmetry" note in the same discovery row, not an independently-observed live
+  bug (array-form name lookups, e.g. `'myrange[]'::regtype`, are NOT handled,
+  matching the pre-existing enum-only code's own scope).
+
+Both call sites now share one implementation:
+- `format_type`'s `"???"` (unknown-to-`formatTypeOID`) fallback calls
+  `userTypeNameForOID` instead of its own inlined else-if chain.
+- `::regtype`'s `KindInt` case (OID input) and the numeric-OID sub-case of its
+  `KindString` case (`"16422"`-style string input, e.g. from an oidvector
+  element) both call `userTypeNameForOID` after `oidToBuiltinTypeName` misses.
+- `::regtype`'s `KindString` case's name-input sub-case (`'myrange'::regtype`)
+  calls `userTypeOIDForName` instead of the old enum-only branch.
+
+Deliberately unchanged: the *display* of a `KindInt`-tagged regtype value
+produced by the name→OID direction (`'mood'::regtype` renders the raw OID
+number, not the enum name) — this is pre-existing behavior for enums
+(`NewIntDatum` was already what the old enum-only branch returned) unrelated
+to this fix; the wire/output layer picks a `Datum`'s text form from its
+`Kind`, not its declared SQL type, so a `KindInt` datum always prints as a
+plain integer regardless of the `regtype` tag. Fixing that would require datum
+type-tagging at the output layer and is out of scope here — this loop only
+closes the `KindInt`→name direction that was the actual live-verified bug.
+
+Tests: `TestUserTypeNameForOIDAllKinds` / `TestUserTypeOIDForNameAllKinds`
+(`internal/executor/user_type_oid_name_test.go`) pin both helpers directly
+across all ten OID forms / five name forms plus an unknown-OID/unknown-name
+negative case, without needing to drive the full `CastExpr` evaluator.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/executor`+
+`internal/catalog` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS (unaffected); `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook; live `goopg`/`psql` end-to-end smoke
+(fresh throwaway data dir, port 5533): `atttypid::regtype` for
+`myrange`/`myrange[]`/`mymultirange`/`mood`/`zipcode` columns now renders
+`public.myrange`/`public.myrange[]`/`public.mymultirange`/`public.mood`/
+`public.zipcode` (previously the bare numeric OIDs); built-in-type paths
+(`'int4'::regtype`, `25::regtype`, `0::regtype` → `-`, unknown OID →
+raw number) unaffected.
+
+Not fixed, no new deferral needed: this closes the discovery row cleanly with
+no further gap surfaced by implementing it — the datum-tagging display
+subtlety noted above is a pre-existing, orthogonal (and much larger) gap
+about the output layer's type-awareness in general, not something this fix's
+own scope touched or worsened.
