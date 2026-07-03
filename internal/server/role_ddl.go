@@ -37,6 +37,7 @@ import (
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 	"github.com/goopg/goopg/internal/wal"
 )
@@ -620,14 +621,20 @@ func roleAlreadyExistsErr(name string) error {
 
 // reservedRoleNameErr builds PG's 42939-shaped "reserved role name" error
 // (RenameRole's IsReservedName check, user.c: names starting with "pg_" are
-// reserved for the system).
+// reserved for the system). PG pairs this errmsg with a fixed errdetail at
+// all three call sites (user.c:356,1388,1395), not a per-name one.
 func reservedRoleNameErr(name string) error {
-	return &roleError{code: sqlstate.ReservedName, msg: "role name \"" + name + "\" is reserved"}
+	return &roleError{
+		code:   sqlstate.ReservedName,
+		msg:    "role name \"" + name + "\" is reserved",
+		detail: "Role names starting with \"pg_\" are reserved.",
+	}
 }
 
 type roleError struct {
-	code sqlstate.Code
-	msg  string
+	code   sqlstate.Code
+	msg    string
+	detail string
 }
 
 func (e *roleError) Error() string { return e.msg }
@@ -818,4 +825,14 @@ func roleErrorSQLState(err error) sqlstate.Code {
 		return sqlstate.UndefinedObject
 	}
 	return sqlstate.SystemError
+}
+
+// roleErrorDetailFields returns the wire ErrorField(s) carrying a role
+// error's errdetail, if any (e.g. reservedRoleNameErr's fixed pg_-prefix
+// detail text). Empty for role errors with no PG errdetail counterpart.
+func roleErrorDetailFields(err error) []protocol.ErrorField {
+	if re, ok := err.(*roleError); ok && re.detail != "" {
+		return []protocol.ErrorField{{Code: protocol.FieldDetail, Value: re.detail}}
+	}
+	return nil
 }

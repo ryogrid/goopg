@@ -135,7 +135,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
 			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName); handled {
 				if herr != nil {
-					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 				}
 				normFirst := normalizeCompatSQL(first)
 				tag := "CREATE ROLE"
@@ -152,7 +152,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
 		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName); handled {
 			if herr != nil {
-				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 			}
 			norm := normalizeCompatSQL(sql)
 			var tag string

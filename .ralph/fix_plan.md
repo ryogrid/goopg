@@ -6191,6 +6191,46 @@ documentation-only and is exempt from the design-doc requirement.)
       (`0119-0004ci`'s own residual); `GRANT ... ON PARAMETER`'s
       `reserved_class_prefix` extension-namespace check.
 
+- [x] **`roleError` `errdetail`-field threading (M0119-0004-ACLHEAP follow-up,
+      loop #47).** **COMPLETE 2026-07-03:** closes the `0119-0004ci` row's own
+      named residual — PG's `CreateRole`/`RenameRole` (`postgres/src/backend/
+      commands/user.c:356,1388,1395`) always pairs the reserved-`pg_`-prefix
+      `errmsg` with a fixed `errdetail("Role names starting with \"pg_\" are
+      reserved.")`, but `roleError` (`internal/server/role_ddl.go`) had no
+      detail field, so goopg's wire `ErrorResponse` for `CREATE ROLE pg_x`/
+      `ALTER ROLE x RENAME TO pg_x` was missing the `D` field entirely. Added
+      `detail string` to `roleError`; `reservedRoleNameErr` now sets it to
+      PG's exact fixed text (same literal at every call site, unlike the
+      errmsg which interpolates the name). New `roleErrorDetailFields(err)
+      []protocol.ErrorField` returns a single `FieldDetail` entry when set;
+      wired into both `writeQueryError` call sites in
+      `internal/server/dispatch.go` (the `splitLeadingRoleDDL` batch-
+      recursion branch and the single-statement `tryHandleRoleDDL` branch) —
+      since `renameRole` returns through the same `tryHandleRoleDDL` path,
+      one wiring point per call site covers both CREATE and RENAME. Tests:
+      extended `TestCreateRoleRejectsReservedPgPrefix` to assert the exact
+      `roleErrorDetailFields` output; new
+      `TestRoleErrorDetailFieldsEmptyForNonReservedErrors` guards
+      `roleDoesNotExistErr`/`roleAlreadyExistsErr` against detail leakage
+      (`internal/server/role_ddl_create_reserved_test.go`). Verified
+      end-to-end via live `psql` against a running goopg instance
+      (fresh build, isolated port/data dir): byte-identical `ERROR`/`DETAIL`
+      wire output for both `CREATE ROLE pg_custom` and
+      `ALTER ROLE alice2 RENAME TO pg_alice2`. Gates: `go build ./...`/
+      `go vet ./...` clean; `internal/server` suite PASS (full package, no
+      regression); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. Design doc:
+      `docs/design/0119-0004-create-role-reserved-prefix.md` gained a
+      "Follow-up: `roleError` detail-field threading (loop #47)" section;
+      `docs/design/README.md` row `0119-0004ck` added, `0119-0004ci`/
+      `0119-0004cj` rows' "Still open" notes updated to point at it; deferral
+      ledger row appended (marks the loop #47 `0119-0004ci` residual row
+      `resolved`). No new deferral — this was itself the deferred item.
+      Remaining, unrelated to this slice: `GRANT ... ON PARAMETER`'s
+      `reserved_class_prefix` extension-namespace check; `check_role_grantor`'s
+      inherited-privilege/superuser fallback for a bare REVOKE's implicit
+      grantor.
+
 - [x] **Per-session `log_statement` GUC wiring (root-0023 follow-up, loop
       #38).** **COMPLETE 2026-07-03:** closes the original `root-0023` ledger
       row's "a client `SET log_statement='all'` has no effect" residual — only

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
 
@@ -41,7 +42,27 @@ func TestCreateRoleRejectsReservedPgPrefix(t *testing.T) {
 			if s.roleExists("pg_custom") {
 				t.Errorf("%s: role must not be registered after rejection", tc.sql)
 			}
+			// PG pairs this errmsg with a fixed errdetail at every IsReservedName
+			// call site (user.c:356,1388,1395); the wire ErrorResponse must carry
+			// it as a 'D' field, not fold it into the message text.
+			wantDetail := "Role names starting with \"pg_\" are reserved."
+			fields := roleErrorDetailFields(err)
+			if len(fields) != 1 || fields[0].Code != protocol.FieldDetail || fields[0].Value != wantDetail {
+				t.Errorf("%s: roleErrorDetailFields = %+v, want single FieldDetail %q", tc.sql, fields, wantDetail)
+			}
 		})
+	}
+}
+
+// TestRoleErrorDetailFieldsEmptyForNonReservedErrors guards against the
+// detail text leaking onto unrelated roleErrors (e.g. "does not exist" has
+// no errdetail counterpart in PG's DropRole/RenameRole).
+func TestRoleErrorDetailFieldsEmptyForNonReservedErrors(t *testing.T) {
+	if fields := roleErrorDetailFields(roleDoesNotExistErr("ghost")); len(fields) != 0 {
+		t.Errorf("roleDoesNotExistErr: roleErrorDetailFields = %+v, want empty", fields)
+	}
+	if fields := roleErrorDetailFields(roleAlreadyExistsErr("dup")); len(fields) != 0 {
+		t.Errorf("roleAlreadyExistsErr: roleErrorDetailFields = %+v, want empty", fields)
 	}
 }
 

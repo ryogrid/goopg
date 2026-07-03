@@ -74,3 +74,49 @@ TO path) carries only the `errmsg`, an existing simplification already
 accepted for that path; `roleError` has no detail field today. Extending it
 is a small, generically-useful follow-up (would also improve the RENAME TO
 error) but out of scope for this single-check wiring fix.
+
+## Follow-up: `roleError` detail-field threading (loop #47)
+
+Closed the "Deferred" residual above. `roleError` (`internal/server/
+role_ddl.go`) gained a `detail string` field; `reservedRoleNameErr` sets it
+to PG's fixed text, matching all three `IsReservedName` call sites in
+`user.c` (lines 356, 1388, 1395 — the detail text is the same literal
+regardless of role name or call site, unlike the errmsg which interpolates
+the name). `roleAlreadyExistsErr`/`roleDoesNotExistErr` leave `detail` at
+its zero value — neither has a PG `errdetail` counterpart.
+
+New `roleErrorDetailFields(err) []protocol.ErrorField` returns a single
+`{Code: protocol.FieldDetail, ...}` entry when `detail` is set, `nil`
+otherwise. Both wire-error call sites in `internal/server/dispatch.go` —
+the `splitLeadingRoleDDL` batch-recursion branch and the single-statement
+`tryHandleRoleDDL` branch — now pass it as trailing `writeQueryError`
+variadic args. Since `renameRole` (the `ALTER ROLE ... RENAME TO` handler)
+also returns through `tryHandleRoleDDL`, one wiring point at each dispatch
+call site covers both the CREATE and RENAME reserved-name errors — they
+were never on separate wire paths, only `reservedRoleNameErr`'s single
+construction site needed the new field.
+
+Verified end-to-end against a real running goopg instance (`psql` over the
+wire, not just unit assertions):
+
+```
+$ psql -c "CREATE ROLE pg_custom;"
+ERROR:  role name "pg_custom" is reserved
+DETAIL:  Role names starting with "pg_" are reserved.
+$ psql -c "CREATE ROLE alice2; ALTER ROLE alice2 RENAME TO pg_alice2;"
+CREATE ROLE
+ERROR:  role name "pg_alice2" is reserved
+DETAIL:  Role names starting with "pg_" are reserved.
+```
+
+Tests: `TestCreateRoleRejectsReservedPgPrefix` extended to assert the exact
+`roleErrorDetailFields` output per case; new
+`TestRoleErrorDetailFieldsEmptyForNonReservedErrors` (`internal/server/
+role_ddl_create_reserved_test.go`) guards against the detail leaking onto
+`roleDoesNotExistErr`/`roleAlreadyExistsErr`. Gates: `go build ./...`/
+`go vet ./...` clean; `internal/server` suite PASS (full package, no
+regression); live `psql` smoke above; `scripts/tpch-spotcheck.sh` PASS;
+pgbench smoke = pre-commit hook.
+
+No new deferral — this was itself the deferred item, and closing it
+surfaced no further PG behavior gap.
