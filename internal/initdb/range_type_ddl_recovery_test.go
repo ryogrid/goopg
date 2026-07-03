@@ -42,7 +42,8 @@ func TestRangeTypeDDLRecoveryReplaysCreate(t *testing.T) {
 	const wantMultirangeOID = uint32(40902)
 	const wantMultirangeArrayOID = uint32(40903)
 	const wantOpclassOID = uint32(1978)
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateRangeType("myrange", "int4", "mymultirange", wantOID, wantArrayOID, wantMultirangeOID, wantMultirangeArrayOID, wantOpclassOID)); werr != nil {
+	const wantCollationOID = uint32(0)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateRangeType("myrange", "int4", "mymultirange", wantOID, wantArrayOID, wantMultirangeOID, wantMultirangeArrayOID, wantOpclassOID, wantCollationOID)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create-range-type: %v", werr)
 	}
@@ -68,9 +69,10 @@ func TestRangeTypeDDLRecoveryReplaysCreate(t *testing.T) {
 	}
 	if found.OID != wantOID || found.ArrayOID != wantArrayOID || found.MultirangeOID != wantMultirangeOID ||
 		found.MultirangeArrayOID != wantMultirangeArrayOID || found.OpclassOID != wantOpclassOID ||
+		found.CollationOID != wantCollationOID ||
 		found.SubtypeName != "int4" || found.MultirangeName != "mymultirange" {
-		t.Errorf("after WAL replay, range type = %+v, want OID=%d ArrayOID=%d MultirangeOID=%d MultirangeArrayOID=%d OpclassOID=%d SubtypeName=int4 MultirangeName=mymultirange",
-			found, wantOID, wantArrayOID, wantMultirangeOID, wantMultirangeArrayOID, wantOpclassOID)
+		t.Errorf("after WAL replay, range type = %+v, want OID=%d ArrayOID=%d MultirangeOID=%d MultirangeArrayOID=%d OpclassOID=%d CollationOID=%d SubtypeName=int4 MultirangeName=mymultirange",
+			found, wantOID, wantArrayOID, wantMultirangeOID, wantMultirangeArrayOID, wantOpclassOID, wantCollationOID)
 	}
 }
 
@@ -87,7 +89,7 @@ func TestRangeTypeDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Open: %v", err)
 	}
-	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateRangeType("myrange", "int4", "mymultirange", 40910, 40911, 40912, 40913, 1978)); werr != nil {
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateRangeType("myrange", "int4", "mymultirange", 40910, 40911, 40912, 40913, 1978, 0)); werr != nil {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append create: %v", werr)
 	}

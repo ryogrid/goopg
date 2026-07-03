@@ -8041,10 +8041,10 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 	}
 	if !p.acceptIdentKeyword("enum") {
 		// AS RANGE ( subtype = ..., multirange_type_name = ..., ... ) — range
-		// type. Only `subtype` and `multirange_type_name` are captured; the
-		// other options (subtype_opclass, collation, canonical, subtype_diff)
-		// are consumed so the statement still parses but are not yet applied.
-		// DU-002 (M0110-0001).
+		// type. `subtype`, `multirange_type_name`, `subtype_opclass`, and
+		// `collation` are captured; `canonical`/`subtype_diff` are consumed so
+		// the statement still parses but are not yet applied (DU-002,
+		// M0110-0001, slice 429 follow-up sub-item (a)).
 		if p.acceptIdentKeyword("range") {
 			stmt.IsRange = true
 			if !p.acceptSymbol("(") {
@@ -8060,13 +8060,26 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 				} else {
 					return nil, p.errAtCur("expected '=' in range type option")
 				}
-				if key == "multirange_type_name" {
+				switch key {
+				case "multirange_type_name":
 					mrName, err := p.parseObjectName()
 					if err != nil {
 						return nil, err
 					}
 					stmt.RangeMultirangeName = mrName.Name
-				} else {
+				case "subtype_opclass":
+					ocName, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.RangeOpclassName = ocName.Name
+				case "collation":
+					collName, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					stmt.RangeCollationName = collName.Name
+				default:
 					// Collect value tokens until a top-level ',' or ')', tracking
 					// paren depth so a typmod-bearing subtype (e.g. numeric(10,2))
 					// stays intact. Mirrors the composite-field type collector above.

@@ -899,7 +899,7 @@ func TestUserPGTypeRowForRangeAndMultirangeArrayTypes(t *testing.T) {
 		typarrayIdx    = 14
 	)
 	cat := catalog.NewInMemory()
-	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	rt, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
 	if err != nil {
 		t.Fatalf("RegisterRangeType: %v", err)
 	}
@@ -913,7 +913,7 @@ func TestUserPGTypeRowForRangeAndMultirangeArrayTypes(t *testing.T) {
 	// Re-registration (e.g. a second CREATE TYPE attempt against the same
 	// name) keeps OIDs stable, mirroring the composite type's re-register
 	// case.
-	rt2, err := cat.RegisterRangeType("myrange", "int4", "")
+	rt2, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
 	if err != nil {
 		t.Fatalf("re-register RegisterRangeType: %v", err)
 	}
@@ -1406,7 +1406,7 @@ func TestUserPGAttributeCompositeFieldRange(t *testing.T) {
 		attstorageIdx = 9
 	)
 	cat := catalog.NewInMemory()
-	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	rt, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
 	if err != nil {
 		t.Fatalf("RegisterRangeType: %v", err)
 	}
@@ -1953,13 +1953,13 @@ func TestUserPGAttributeRangeColumn(t *testing.T) {
 		attstorageIdx = 9
 	)
 	cat := catalog.NewInMemory()
-	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	rt, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
 	if err != nil {
 		t.Fatalf("RegisterRangeType: %v", err)
 	}
 	// timestamp is double-aligned, unlike int4's int-alignment — exercises the
 	// subtype-driven align derivation (mirrors buildUserPGTypeRowForRange).
-	tsRT, err := cat.RegisterRangeType("mytsrange", "timestamp", "")
+	tsRT, err := cat.RegisterRangeType("mytsrange", "timestamp", "", "", "")
 	if err != nil {
 		t.Fatalf("RegisterRangeType(timestamp): %v", err)
 	}

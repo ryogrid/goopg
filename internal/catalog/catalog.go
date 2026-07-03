@@ -2724,7 +2724,8 @@ type RangeType struct {
 	OID                uint32 // pg_type.oid of the range type
 	ArrayOID           uint32 // pg_type.oid of the range's auto-generated `_name` array type
 	SubtypeName        string // subtype name as declared (e.g. "int4", "timestamp with time zone")
-	OpclassOID         uint32 // default btree opclass OID for the subtype (pg_range.rngsubopc)
+	OpclassOID         uint32 // btree opclass OID for the subtype, explicit `subtype_opclass` or resolved default (pg_range.rngsubopc)
+	CollationOID       uint32 // collation OID for the subtype, explicit `collation` or the subtype's own typcollation; 0 (InvalidOid) if the subtype is not collatable (pg_range.rngcollation)
 	MultirangeOID      uint32 // pg_type.oid of the auto-generated multirange type
 	MultirangeArrayOID uint32 // pg_type.oid of the multirange's auto-generated `_name` array type
 	MultirangeName     string // lower-case multirange type name
@@ -8570,10 +8571,13 @@ func (c *InMemory) registerSystemTables() {
 	// Surface user-created range types (CREATE TYPE ... AS RANGE) so
 	// pg_dump's dumpRangeType join finds a row. rngcanonical/rngsubdiff are
 	// always "-" (unsupported `canonical`/`subtype_diff` options — DU-002
-	// deferral); rngcollation mirrors the subtype's own typcollation so
+	// deferral); rngcollation is RegisterRangeType's resolved
+	// RangeType.CollationOID (0/InvalidOid for a non-collatable subtype, the
+	// subtype's own default, or an explicit `collation` option override), so
 	// dumpRangeType's `CASE WHEN rngcollation = st.typcollation THEN 0 ...`
-	// always yields 0 (no COLLATE clause), matching the common case of no
-	// explicit `collation` option. M0110-0001.
+	// still yields 0 for the common no-explicit-collation case but now also
+	// reflects a real override. DU-002 (M0110-0001, slice 429 follow-up
+	// sub-item (a)).
 	pgRange.VirtualRows = func() [][]string {
 		rts := c.ListRangeTypes()
 		if len(rts) == 0 {
@@ -8582,16 +8586,11 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(rts))
 		for _, rt := range rts {
 			subtypeOID := TypeNameToOID(rt.SubtypeName)
-			var collation uint32
-			switch subtypeOID {
-			case OIDText, OIDVarChar, OIDBpChar:
-				collation = 100 // DEFAULT_COLLATION_OID
-			}
 			out = append(out, []string{
 				strconv.FormatUint(uint64(rt.OID), 10),           // rngtypid
 				strconv.FormatUint(uint64(subtypeOID), 10),       // rngsubtype
 				strconv.FormatUint(uint64(rt.MultirangeOID), 10), // rngmultitypid
-				strconv.FormatUint(uint64(collation), 10),        // rngcollation
+				strconv.FormatUint(uint64(rt.CollationOID), 10),  // rngcollation
 				strconv.FormatUint(uint64(rt.OpclassOID), 10),    // rngsubopc
 				"-", // rngcanonical
 				"-", // rngsubdiff
@@ -15577,18 +15576,156 @@ func deriveMultirangeTypeName(rangeName string) string {
 	return rangeName + "_multirange"
 }
 
+// RangeTypeOptionError carries the PostgreSQL SQLSTATE for a `CREATE TYPE
+// ... AS RANGE` option-resolution failure (missing default opclass, a named
+// `subtype_opclass` that doesn't exist or doesn't accept the subtype, or a
+// `collation` that doesn't exist or was given for a non-collatable subtype),
+// so the executor can report PG's own code instead of collapsing every
+// RegisterRangeType failure onto 42704 undefined_object. DU-002 (M0110-0001,
+// slice 429 follow-up sub-item (a)).
+type RangeTypeOptionError struct {
+	Code    string
+	Message string
+}
+
+func (e *RangeTypeOptionError) Error() string { return e.Message }
+
+// builtinCollationOIDByName resolves one of PG18's 7 BKI-pinned collation
+// names to its OID. Duplicated from the `pg_collation` VirtualRows seed
+// above / the executor's own `collationNameToOID` (internal/executor/
+// pg18_user_catalog_rows.go) rather than shared, since RegisterRangeType
+// lives in the catalog package and executor cannot be imported back into it
+// — same import-cycle reasoning as builtinOpclassInfo/builtinRangeSubtypeOpclasses.
+// Matching is case-sensitive, mirroring real PostgreSQL identifier semantics
+// (`collation = "C"` requires the exact case; there is no unquoted `c`
+// built-in). DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+func builtinCollationOIDByName(name string) (uint32, bool) {
+	switch name {
+	case "default":
+		return 100, true
+	case "C":
+		return 950, true
+	case "POSIX":
+		return 951, true
+	case "ucs_basic":
+		return 962, true
+	case "unicode":
+		return 963, true
+	case "pg_c_utf8":
+		return 811, true
+	case "pg_unicode_fast":
+		return 6411, true
+	}
+	return 0, false
+}
+
+// builtinOpclassOIDByName looks up a builtinRangeSubtypeOpclasses entry by
+// its opclass name (case-sensitive), for resolving an explicit
+// `subtype_opclass = ...` range option. DU-002 (M0110-0001, slice 429
+// follow-up sub-item (a)).
+func builtinOpclassOIDByName(name string) (builtinOpclassInfo, bool) {
+	for _, oc := range builtinRangeSubtypeOpclasses {
+		if oc.Name == name {
+			return oc, true
+		}
+	}
+	return builtinOpclassInfo{}, false
+}
+
+// resolveRangeOpclass implements PG's findRangeSubOpclass (postgres/src/
+// backend/commands/typecmds.c): an explicit `subtype_opclass` name must
+// name an existing btree opclass that accepts (is binary-coercible with)
+// the subtype, else the default opclass is used. DU-002 (M0110-0001, slice
+// 429 follow-up sub-item (a)).
+func (c *InMemory) resolveRangeOpclass(subtypeName string, subtypeOID uint32, opclassName string) (uint32, *RangeTypeOptionError) {
+	if opclassName == "" {
+		oid, ok := DefaultBtreeOpclassForSubtype(subtypeOID)
+		if !ok {
+			return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+				"data type %s has no default operator class for access method %q", subtypeName, "btree")}
+		}
+		return oid, nil
+	}
+	if oc, ok := builtinOpclassOIDByName(opclassName); ok {
+		if oc.IntypeOID != subtypeOID {
+			return 0, &RangeTypeOptionError{Code: "42804", Message: fmt.Sprintf(
+				"operator class %q does not accept data type %s", opclassName, subtypeName)}
+		}
+		return oc.OID, nil
+	}
+	for _, uoc := range c.ListUserOperatorClasses() {
+		if uoc.Method != btreeAccessMethodOID || !strings.EqualFold(uoc.Name, opclassName) {
+			continue
+		}
+		if uoc.InTypeOID != subtypeOID {
+			return 0, &RangeTypeOptionError{Code: "42804", Message: fmt.Sprintf(
+				"operator class %q does not accept data type %s", opclassName, subtypeName)}
+		}
+		return uoc.OID, nil
+	}
+	return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+		"operator class %q does not exist for access method %q", opclassName, "btree")}
+}
+
+// rangeCollatableSubtypes are the subtype OIDs RegisterRangeType treats as
+// collatable for a range's `collation` option — the same set the pg_range
+// VirtualRows builder above already special-cases for the implicit-default
+// case. Real PostgreSQL's `type_is_collatable` covers more built-ins, but
+// these are the only range subtypes goopg's own typcollation resolution
+// models today. DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+func rangeSubtypeIsCollatable(subtypeOID uint32) bool {
+	switch subtypeOID {
+	case OIDText, OIDVarChar, OIDBpChar:
+		return true
+	}
+	return false
+}
+
+// resolveRangeCollation implements PG's DefineRange collation resolution
+// (postgres/src/backend/commands/typecmds.c): an explicit `collation` name
+// is only legal for a collatable subtype and must resolve to a known
+// collation (built-in or `CREATE COLLATION`-registered); otherwise the
+// subtype's own default collation (DEFAULT_COLLATION_OID for text/varchar/
+// bpchar) applies, and a non-collatable subtype gets InvalidOid (0).
+// DU-002 (M0110-0001, slice 429 follow-up sub-item (a)).
+func (c *InMemory) resolveRangeCollation(subtypeOID uint32, collationName string) (uint32, *RangeTypeOptionError) {
+	if !rangeSubtypeIsCollatable(subtypeOID) {
+		if collationName != "" {
+			return 0, &RangeTypeOptionError{Code: "42809", Message: "range collation specified but subtype does not support collation"}
+		}
+		return 0, nil
+	}
+	if collationName == "" {
+		return 100, nil // DEFAULT_COLLATION_OID — subtype's own typcollation
+	}
+	if oid, ok := builtinCollationOIDByName(collationName); ok {
+		return oid, nil
+	}
+	if oid := c.UserCollationOIDByName(collationName); oid != 0 {
+		return oid, nil
+	}
+	return 0, &RangeTypeOptionError{Code: "42704", Message: fmt.Sprintf(
+		"collation %q for encoding %q does not exist", collationName, "UTF8")}
+}
+
 // RegisterRangeType records a `CREATE TYPE ... AS RANGE (subtype = ...)`
 // range type, allocating pg_type OIDs for the range itself, its
 // auto-generated `_name` array type, its auto-generated multirange type, and
 // the multirange's own auto-generated array type — matching PG's real
 // allocation order (range, range-array, multirange, multirange-array).
-// Returns an error matching PG's own wording if the subtype has no
-// resolvable default btree opclass. M0110-0001.
-func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName string) (*RangeType, error) {
+// opclassName/collationName are the (possibly empty) `subtype_opclass` /
+// `collation` option values; empty means "use PG's default resolution".
+// Returns a *RangeTypeOptionError (carrying PG's own SQLSTATE) if any option
+// fails to resolve. M0110-0001.
+func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName, opclassName, collationName string) (*RangeType, error) {
 	subtypeOID := TypeNameToOID(subtypeName)
-	opclassOID, ok := DefaultBtreeOpclassForSubtype(subtypeOID)
-	if !ok {
-		return nil, fmt.Errorf("data type %s has no default operator class for access method %q", subtypeName, "btree")
+	opclassOID, rerr := c.resolveRangeOpclass(subtypeName, subtypeOID, opclassName)
+	if rerr != nil {
+		return nil, rerr
+	}
+	collationOID, rerr := c.resolveRangeCollation(subtypeOID, collationName)
+	if rerr != nil {
+		return nil, rerr
 	}
 	k := strings.ToLower(name)
 	mrName := strings.ToLower(explicitMultirangeName)
@@ -15611,6 +15748,7 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName s
 	}
 	rt.SubtypeName = subtypeName
 	rt.OpclassOID = opclassOID
+	rt.CollationOID = collationOID
 	rt.MultirangeName = mrName
 	return rt, nil
 }

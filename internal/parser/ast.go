@@ -3168,10 +3168,12 @@ type CreateTypeStmt struct {
 	EnumValues      []string
 	IsComposite     bool
 	CompositeFields []TypeField
-	// IsRange marks `CREATE TYPE name AS RANGE (subtype = ..., ...)`. Only the
-	// `subtype` and `multirange_type_name` options are captured; the others
-	// (subtype_opclass, collation, canonical, subtype_diff) are parsed (so they
-	// don't break the statement) but not yet applied. DU-002 (M0110-0001).
+	// IsRange marks `CREATE TYPE name AS RANGE (subtype = ..., ...)`. `subtype`,
+	// `multirange_type_name`, `subtype_opclass`, and `collation` are captured
+	// and applied; `canonical`/`subtype_diff` are parsed (so they don't break
+	// the statement) but not yet applied — they require pre-created shell-type
+	// + function-signature validation support goopg doesn't have yet. DU-002
+	// (M0110-0001, slice 429 follow-up sub-item (a)).
 	IsRange bool
 	// RangeSubtype is the space-joined subtype type-name tokens as written
 	// (e.g. "int4", "timestamp with time zone").
@@ -3182,6 +3184,14 @@ type CreateTypeStmt struct {
 	// PostgreSQL's makeMultirangeTypeName ("range"->"multirange", else append
 	// "_multirange").
 	RangeMultirangeName string
+	// RangeOpclassName is the explicit `subtype_opclass` value's bare name
+	// (schema qualification dropped, same rationale as RangeMultirangeName).
+	// Empty means "resolve the subtype's default btree opclass".
+	RangeOpclassName string
+	// RangeCollationName is the explicit `collation` value's bare name (schema
+	// qualification dropped). Empty means "use the subtype's own default
+	// collation" (or InvalidOid for a non-collatable subtype).
+	RangeCollationName string
 }
 
 func (s *CreateTypeStmt) Pos() int  { return s.pos }

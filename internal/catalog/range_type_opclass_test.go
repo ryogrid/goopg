@@ -1,6 +1,9 @@
 package catalog
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // TestDefaultBtreeOpclassForSubtypeExpandedCoverage verifies the DU-002
 // (M0110-0001) follow-up widening builtinRangeSubtypeOpclasses from the
@@ -82,7 +85,7 @@ func TestRegisterRangeTypeExpandedSubtypes(t *testing.T) {
 	for _, tc := range subtypes {
 		t.Run(tc.rangeName, func(t *testing.T) {
 			c := NewInMemory()
-			rt, err := c.RegisterRangeType(tc.rangeName, tc.subtype, "")
+			rt, err := c.RegisterRangeType(tc.rangeName, tc.subtype, "", "", "")
 			if err != nil {
 				t.Fatalf("RegisterRangeType(%q, %q) unexpected error: %v", tc.rangeName, tc.subtype, err)
 			}
@@ -103,7 +106,7 @@ func TestRegisterRangeTypeExpandedSubtypes(t *testing.T) {
 // range.
 func TestRegisterRangeTypeStillRejectsUnsupportedSubtype(t *testing.T) {
 	c := NewInMemory()
-	_, err := c.RegisterRangeType("jsonrange", "json", "")
+	_, err := c.RegisterRangeType("jsonrange", "json", "", "", "")
 	if err == nil {
 		t.Fatal("RegisterRangeType(\"jsonrange\", \"json\") expected an error, got nil")
 	}
@@ -111,4 +114,154 @@ func TestRegisterRangeTypeStillRejectsUnsupportedSubtype(t *testing.T) {
 	if err.Error() != want {
 		t.Errorf("RegisterRangeType error = %q, want %q", err.Error(), want)
 	}
+}
+
+// TestRegisterRangeTypeExplicitOpclass exercises the DU-002 (M0110-0001,
+// slice 429 follow-up sub-item (a)) `subtype_opclass` option: a named
+// built-in opclass that accepts the subtype is used verbatim (not just the
+// default), a named opclass whose opcintype doesn't accept the subtype is
+// rejected with PG's ERRCODE_DATATYPE_MISMATCH wording, an unknown name is
+// rejected with ERRCODE_UNDEFINED_OBJECT wording, and a user-created (CREATE
+// OPERATOR CLASS) btree opclass for the subtype resolves too.
+func TestRegisterRangeTypeExplicitOpclass(t *testing.T) {
+	t.Run("named builtin opclass matching subtype", func(t *testing.T) {
+		c := NewInMemory()
+		rt, err := c.RegisterRangeType("myrange", "int4", "", "int4_ops", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.OpclassOID != 1978 {
+			t.Errorf("OpclassOID = %d, want 1978 (int4_ops)", rt.OpclassOID)
+		}
+	})
+	t.Run("named builtin opclass datatype mismatch", func(t *testing.T) {
+		c := NewInMemory()
+		_, err := c.RegisterRangeType("myrange", "int4", "", "text_ops", "")
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		var rte *RangeTypeOptionError
+		if !errors.As(err, &rte) {
+			t.Fatalf("error is not *RangeTypeOptionError: %v (%T)", err, err)
+		}
+		if rte.Code != "42804" {
+			t.Errorf("Code = %q, want 42804", rte.Code)
+		}
+		const want = `operator class "text_ops" does not accept data type int4`
+		if err.Error() != want {
+			t.Errorf("error = %q, want %q", err.Error(), want)
+		}
+	})
+	t.Run("unknown opclass name", func(t *testing.T) {
+		c := NewInMemory()
+		_, err := c.RegisterRangeType("myrange", "int4", "", "nope_ops", "")
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		var rte *RangeTypeOptionError
+		if !errors.As(err, &rte) {
+			t.Fatalf("error is not *RangeTypeOptionError: %v (%T)", err, err)
+		}
+		if rte.Code != "42704" {
+			t.Errorf("Code = %q, want 42704", rte.Code)
+		}
+	})
+	t.Run("user-created btree opclass for the subtype", func(t *testing.T) {
+		c := NewInMemory()
+		uoc := c.RegisterUserOperatorClass("public", "my_int4_ops", PublicNamespaceOID, 10, btreeAccessMethodOID, 0, OIDInt4, false, 0)
+		rt, err := c.RegisterRangeType("myrange", "int4", "", "my_int4_ops", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.OpclassOID != uoc.OID {
+			t.Errorf("OpclassOID = %d, want %d (my_int4_ops)", rt.OpclassOID, uoc.OID)
+		}
+	})
+}
+
+// TestRegisterRangeTypeExplicitCollation exercises the DU-002 (M0110-0001,
+// slice 429 follow-up sub-item (a)) `collation` option: a built-in name
+// resolves to its OID for a collatable subtype, a user-created (CREATE
+// COLLATION) name resolves too, specifying one for a non-collatable subtype
+// (e.g. int4) is rejected (ERRCODE_WRONG_OBJECT_TYPE), and an unknown name is
+// rejected (ERRCODE_UNDEFINED_OBJECT). With no explicit collation, a
+// collatable subtype still gets the DEFAULT_COLLATION_OID (100) it always
+// had, and a non-collatable subtype gets 0 (InvalidOid).
+func TestRegisterRangeTypeExplicitCollation(t *testing.T) {
+	t.Run("builtin collation name on collatable subtype", func(t *testing.T) {
+		c := NewInMemory()
+		rt, err := c.RegisterRangeType("textrange", "text", "", "", "C")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.CollationOID != 950 {
+			t.Errorf("CollationOID = %d, want 950 (C)", rt.CollationOID)
+		}
+	})
+	t.Run("no explicit collation defaults to DEFAULT_COLLATION_OID", func(t *testing.T) {
+		c := NewInMemory()
+		rt, err := c.RegisterRangeType("textrange", "text", "", "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.CollationOID != 100 {
+			t.Errorf("CollationOID = %d, want 100 (default)", rt.CollationOID)
+		}
+	})
+	t.Run("non-collatable subtype gets InvalidOid", func(t *testing.T) {
+		c := NewInMemory()
+		rt, err := c.RegisterRangeType("myrange", "int4", "", "", "")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.CollationOID != 0 {
+			t.Errorf("CollationOID = %d, want 0 (InvalidOid)", rt.CollationOID)
+		}
+	})
+	t.Run("collation specified for non-collatable subtype rejected", func(t *testing.T) {
+		c := NewInMemory()
+		_, err := c.RegisterRangeType("myrange", "int4", "", "", "C")
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		var rte *RangeTypeOptionError
+		if !errors.As(err, &rte) {
+			t.Fatalf("error is not *RangeTypeOptionError: %v (%T)", err, err)
+		}
+		if rte.Code != "42809" {
+			t.Errorf("Code = %q, want 42809", rte.Code)
+		}
+		const want = "range collation specified but subtype does not support collation"
+		if err.Error() != want {
+			t.Errorf("error = %q, want %q", err.Error(), want)
+		}
+	})
+	t.Run("unknown collation name", func(t *testing.T) {
+		c := NewInMemory()
+		_, err := c.RegisterRangeType("textrange", "text", "", "", "nope_collation")
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		var rte *RangeTypeOptionError
+		if !errors.As(err, &rte) {
+			t.Fatalf("error is not *RangeTypeOptionError: %v (%T)", err, err)
+		}
+		if rte.Code != "42704" {
+			t.Errorf("Code = %q, want 42704", rte.Code)
+		}
+	})
+	t.Run("user-created collation name", func(t *testing.T) {
+		c := NewInMemory()
+		oid, cerr := c.CreateCollation(&UserCollation{Name: "my_coll", Provider: 'c', Collate: "C", Ctype: "C", Deterministic: true}, "public", false)
+		if cerr != nil {
+			t.Fatalf("CreateCollation: %v", cerr)
+		}
+		rt, err := c.RegisterRangeType("textrange", "text", "", "", "my_coll")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if rt.CollationOID != oid {
+			t.Errorf("CollationOID = %d, want %d (my_coll)", rt.CollationOID, oid)
+		}
+	})
 }

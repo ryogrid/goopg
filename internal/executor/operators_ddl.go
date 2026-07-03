@@ -16078,16 +16078,25 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 		// round-trips through pg_dump instead of vanishing as a bare name-only
 		// stub. DU-002 (M0110-0001).
 		if s.IsRange {
-			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName)
+			rt, err := cat.RegisterRangeType(s.Name, s.RangeSubtype, s.RangeMultirangeName, s.RangeOpclassName, s.RangeCollationName)
 			if err != nil {
-				return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()}
+				// RegisterRangeType reports option-resolution failures (missing
+				// default/named opclass, datatype mismatch, unsupported/missing
+				// collation) via *catalog.RangeTypeOptionError carrying PG's own
+				// SQLSTATE; fall back to 42704 for anything else. DU-002
+				// (M0110-0001, slice 429 follow-up sub-item (a)).
+				code := "42704"
+				if rte, ok := err.(*catalog.RangeTypeOptionError); ok {
+					code = rte.Code
+				}
+				return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 			}
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
 			// METHOD.
 			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID)); werr != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID)); werr != nil {
 					return fmt.Errorf("wal create-range-type: %w", werr)
 				}
 			}

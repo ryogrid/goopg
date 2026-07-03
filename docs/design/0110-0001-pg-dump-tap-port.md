@@ -11647,3 +11647,154 @@ fully generic `GetDefaultOpClass`-equivalent (covering user-defined subtypes
 with a user-created `CREATE OPERATOR CLASS ... DEFAULT` opclass, not just
 these 31 built-ins) also remains unimplemented — `RegisterRangeType` only
 ever consults `builtinRangeSubtypeOpclasses`, never `ListUserOperatorClasses`.
+
+## Follow-up: `subtype_opclass`/`collation` `CREATE TYPE ... AS RANGE` options threaded through (loop #64)
+
+Closes sub-item (a) of the slice 429 deferral for two of its four options —
+`subtype_opclass` and `collation`. The other two (`canonical`/`subtype_diff`)
+remain parsed-and-discarded: PG's own `DefineRange` requires a pre-created
+shell type before a `canonical` function can even be looked up
+(`postgres/src/backend/commands/typecmds.c:1531-1537`, "cannot specify a
+canonical function without a pre-created shell type"), and goopg's `CREATE
+TYPE name;` (no `AS` clause) registers a composite-type stub rather than a
+real PG shell type (`typtype='p'`) — that gap plus function-signature
+validation is a separate, larger feature, out of scope for this loop.
+
+**Parser** (`internal/parser/ddl.go`'s `parseCreateType` RANGE branch, `ast.go`'s
+`CreateTypeStmt`): the per-option loop already special-cased
+`multirange_type_name` via `p.parseObjectName()` (dropping schema
+qualification, same rationale as goopg's other user-type registries) while
+`subtype_opclass`/`collation` fell into the generic discard-the-value-tokens
+branch. Converted that `if/else` into a `switch key` with two new cases using
+the same `p.parseObjectName()` pattern, storing the bare name into new
+`CreateTypeStmt.RangeOpclassName`/`RangeCollationName` fields.
+`canonical`/`subtype_diff` still fall through to the `default` branch
+unchanged.
+
+**Catalog** (`internal/catalog/catalog.go`): mirrors PG's `DefineRange`
+resolution (`postgres/src/backend/commands/typecmds.c`, read directly this
+loop) as two new helpers:
+
+- `resolveRangeOpclass(subtypeName, subtypeOID, opclassName)` — implements
+  `findRangeSubOpclass`: empty name → existing `DefaultBtreeOpclassForSubtype`
+  path (unchanged, `42704` if no default exists); a name is looked up first
+  against `builtinOpclassOIDByName` (a new by-name index over the existing
+  `builtinRangeSubtypeOpclasses` map from loop #63) and, if not found there,
+  against `ListUserOperatorClasses()` filtered to `Method == btree`. Either
+  way the resolved opclass's `InTypeOID` must equal the subtype's OID or the
+  call fails with PG's exact `42804` wording ("operator class %q does not
+  accept data type %s") — goopg has no `IsBinaryCoercible` general facility,
+  so (unlike the loop #63 default-resolution map, which already bakes in the
+  two known binary-coercible fallbacks for `varchar`/`cidr`) an explicit
+  `subtype_opclass` naming a differently-typed opclass is rejected even where
+  real PG's binary-coercibility check might accept it — a narrower, documented
+  simplification, not a behavior this loop claims to fully replicate. An
+  unresolvable name fails with PG's `42704` wording ("operator class %q does
+  not exist for access method %q").
+- `resolveRangeCollation(subtypeOID, collationName)` — implements the
+  `type_is_collatable`/`get_collation_oid` half of `DefineRange`:
+  `rangeSubtypeIsCollatable` (new) restates the exact `OIDText`/`OIDVarChar`/
+  `OIDBpChar` set the `pg_range` `VirtualRows` builder already special-cased
+  for the implicit-default case (loop #61's slice 429 landing) — a
+  non-collatable subtype rejects any explicit `collation` name with PG's
+  literal message ("range collation specified but subtype does not support
+  collation", `42809`) and otherwise always resolves to `0` (`InvalidOid`).
+  A collatable subtype resolves an explicit name via a new
+  `builtinCollationOIDByName` (the same 7 BKI-pinned collations already
+  seeded in the `pg_collation` `VirtualRows` builder, duplicated here for the
+  same executor/catalog import-cycle reason `builtinOpclassInfo` documents)
+  falling back to the existing `UserCollationOIDByName`; an empty name
+  resolves to `100` (`DEFAULT_COLLATION_OID`, unchanged from before this
+  loop); an unresolvable name fails with PG's `42704` wording ("collation %q
+  for encoding %q does not exist" — goopg has no per-collation encoding
+  model, so `"UTF8"` is hardcoded as the filler, a minor wording
+  approximation).
+
+Both resolvers return a new `*catalog.RangeTypeOptionError{Code, Message}`
+(not a bare `error`) so `execCreateType`
+(`internal/executor/operators_ddl.go`) can report PG's actual SQLSTATE via a
+type-assertion instead of collapsing every `RegisterRangeType` failure onto
+the pre-existing hardcoded `42704`. `RangeType` gains a `CollationOID` field
+(`pg_range.rngcollation`); the `pg_range` `VirtualRows` builder now reads
+`rt.CollationOID` directly instead of re-deriving it from a duplicate
+subtype-OID switch (the two would have silently diverged the moment an
+explicit `collation` override existed — the "sibling paths must agree" risk
+this project's hard-won rules call out).
+
+**WAL/restart persistence**: extended in the same loop (not left as a fresh
+gap) since the opclass/collation resolution happens once, at `CREATE TYPE`
+time — `EncodeCreateRangeType`/`DecodeCreateRangeType`
+(`internal/wal/recovery.go`) gained a `collationOID` parameter (the resolved
+value, not the raw option string) and `internal/initdb/
+range_type_ddl_recovery.go`'s replay now carries it into the recovered
+`catalog.RangeType`. Verified live: a `textrange2` range type created with an
+explicit user-collation option kept its `rngcollation` OID identical across a
+full server restart.
+
+**Live-verified end-to-end** (fresh throwaway data dir, port 5533, real
+`psql`/`pg_dump` 18.3): `subtype_opclass = int4_ops` resolves to OID 1978
+(unchanged from the default); `subtype_opclass = text_ops` on an `int4`
+subtype fails with the exact `42804` wording; an unknown opclass name fails
+with the exact `42704` wording; `collation = "C"` on a `text` subtype
+resolves `rngcollation` to 950; `collation = "C"` on an `int4` subtype fails
+with the exact `42809` wording; an unknown collation name fails with the
+`42704` wording; a `CREATE OPERATOR CLASS`-registered user opclass resolves
+correctly (`rngsubopc` = the new opclass's own OID) and round-trips through
+`pg_dump`; a `CREATE COLLATION`-registered user collation resolves and
+round-trips through `pg_dump` as `collation = public.my_coll` (a *built-in*
+collation like `"C"` correctly does **not** appear in the dump, matching real
+PG's `findCollationByOid` — pg_dump's internal `CollInfo` list is only
+populated from user-dumpable collations, so a BKI-pinned one is silently
+omitted from the re-emitted `CREATE TYPE` statement, by design).
+
+**New discovery recorded, not fixed this loop (deferral-ledger row
+appended):** `CREATE OPERATOR CLASS` has **no WAL record kind and no restart
+persistence at all** (confirmed by grep — no `RecordKindCreateOperatorClass`
+exists anywhere in `internal/wal/recovery.go`, unlike every other DDL family
+this project has hardened restart-persistence for: access methods, range
+types, composite/enum/domain types, etc.). This was surfaced by, but is
+**not caused by**, this loop's `subtype_opclass` work: after a full server
+restart, a range type created with an explicit user opclass
+(`subtype_opclass = my_int4_ops`) still resolved and displayed correctly from
+the in-memory `RangeType.OpclassOID` (a plain numeric field, restart-durable
+via the `CREATE TYPE ... AS RANGE` WAL record from the loop #61 follow-up),
+but `pg_opclass` itself no longer had a row for `my_int4_ops` (it vanished
+along with every other user-created operator class), so `pg_dump`'s
+`dumpRangeType` join (`pg_range r, pg_type st, pg_opclass opc WHERE opc.oid =
+rngsubopc`) returned zero rows for that specific type and **`pg_dump` failed
+outright** (`query returned 0 rows instead of one`) rather than silently
+mis-rendering just that one type. Tracks as a separate, dedicated-loop-sized
+task (mirrors the shape of the loop #59/#61 "CREATE ACCESS METHOD"/"CREATE
+TYPE ... AS RANGE" WAL/restart-persistence follow-ups) — resume point:
+`internal/wal/recovery.go` needs a new `RecordKindCreateOperatorClass`/
+`RecordKindDropOperatorClass` pair (encode `schema, name, namespaceOID,
+owner, method, familyOID, inTypeOID, isDefault, keyTypeOID`), a WAL-append
+call at `execCreateOperatorClass`'s success path
+(`internal/executor/operators_ddl.go` ~line 15758, right after
+`RegisterUserOperatorClass`), and a new `internal/initdb/
+operator_class_ddl_recovery.go` replay pass wired into `internal/initdb/
+open.go` alongside the existing access-method/range-type replay calls.
+
+Tests: `TestRegisterRangeTypeExplicitOpclass` (named builtin opclass match,
+builtin opclass datatype mismatch, unknown opclass name, user-created
+opclass) + `TestRegisterRangeTypeExplicitCollation` (builtin collation name,
+default-with-no-explicit-option, non-collatable-subtype default, collation
+rejected for non-collatable subtype, unknown collation name, user-created
+collation) in `internal/catalog/range_type_opclass_test.go`;
+`TestParseCreateRangeTypeSubtypeOpclassAndCollation` +
+`TestParseCreateRangeTypeCanonicalSubtypeDiffStillParseAndDiscard` in the new
+`internal/parser/range_type_option_test.go`; `TestEncodeDecodeCreateRangeTypeRoundTrip`
+(extended with a `collationOID` case) + the truncated-payload guard (header
+grew from 21 to 25 bytes) in `internal/wal/range_type_ddl_test.go`;
+`TestRangeTypeDDLRecoveryReplaysCreate` (extended to assert `CollationOID`
+survives restart) in `internal/initdb/range_type_ddl_recovery_test.go`.
+
+Gates: `go build ./...`/`go vet ./...` clean; `internal/catalog`+
+`internal/parser`+`internal/wal`+`internal/initdb`+`internal/executor` suites
+PASS (full runs, no regression); `TestPort_PgDumpConnectionSetup` PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook; live
+`goopg`/`psql`/`pg_dump` end-to-end smoke as described above, including a
+full server restart. Deferred (ledger row appended): `canonical`/
+`subtype_diff` options remain parsed-and-discarded (needs real shell-type
+support + function-signature validation); `CREATE OPERATOR CLASS` restart
+persistence (new discovery, tracked above) is a separate task.

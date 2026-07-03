@@ -30,7 +30,7 @@ func TestUserTypeNameForOIDAllKinds(t *testing.T) {
 	ct := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
 		{Name: "city", ColType: "text"},
 	})
-	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	rt, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
 	if err != nil {
 		t.Fatalf("RegisterRangeType: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestUserTypeOIDForNameAllKinds(t *testing.T) {
 	ct := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
 		{Name: "city", ColType: "text"},
 	})
-	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	rt, err := cat.RegisterRangeType("myrange", "int4", "", "", "")
 	if err != nil {
 		t.Fatalf("RegisterRangeType: %v", err)
 	}

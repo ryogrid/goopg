@@ -157,6 +157,53 @@ prev-link fixes.
       still discarded) remains open; the map is still curated/built-in-only,
       not a real generic `GetDefaultOpClass` port over `pg_opclass` +
       user-created opclasses (`CREATE OPERATOR CLASS ... DEFAULT`).
+      **2026-07-03 (loop #64, DU-002 slice 429 follow-up): `subtype_opclass`/
+      `collation` `CREATE TYPE ... AS RANGE` options threaded through end-to-
+      end — closes two of sub-item (a)'s four options.** Parser
+      (`internal/parser/ddl.go`'s `parseCreateType`) now captures
+      `subtype_opclass`/`collation` into new `CreateTypeStmt.RangeOpclassName`/
+      `RangeCollationName` fields (same bare-name-kept pattern as the existing
+      `multirange_type_name` capture); `canonical`/`subtype_diff` still
+      parse-and-discard (need real shell-type + function-signature support
+      goopg lacks). `internal/catalog/catalog.go` gained
+      `resolveRangeOpclass`/`resolveRangeCollation`, mirroring PG's
+      `DefineRange` (`postgres/src/backend/commands/typecmds.c`, read this
+      loop): an explicit opclass name resolves against the builtin map (loop
+      #63) or `ListUserOperatorClasses()`, rejecting a datatype mismatch
+      (42804) or unknown name (42704); an explicit collation name resolves
+      against 7 BKI builtins or `UserCollationOIDByName`, rejecting a
+      collation on a non-collatable subtype (42809, PG's exact wording) or an
+      unknown name (42704) — both via a new `*catalog.RangeTypeOptionError`
+      so `execCreateType` reports PG's actual SQLSTATE instead of a hardcoded
+      42704. `RangeType` gained `CollationOID` (`pg_range.rngcollation`,
+      replacing the old ad hoc subtype-OID switch in `pg_range`'s
+      `VirtualRows` — a sibling-paths-must-agree fix), threaded through
+      `EncodeCreateRangeType`/`DecodeCreateRangeType` WAL persistence too.
+      Tests: `TestRegisterRangeTypeExplicitOpclass` +
+      `TestRegisterRangeTypeExplicitCollation`
+      (`internal/catalog/range_type_opclass_test.go`);
+      `TestParseCreateRangeTypeSubtypeOpclassAndCollation` +
+      `TestParseCreateRangeTypeCanonicalSubtypeDiffStillParseAndDiscard`
+      (new `internal/parser/range_type_option_test.go`); extended
+      `internal/wal/range_type_ddl_test.go` +
+      `internal/initdb/range_type_ddl_recovery_test.go` for the new
+      `collationOID` field. Design doc "Follow-up: `subtype_opclass`/
+      `collation` `CREATE TYPE ... AS RANGE` options threaded through (loop
+      #64)". Gates: build/vet clean; `internal/catalog`+`internal/parser`+
+      `internal/wal`+`internal/initdb`+`internal/executor` suites PASS (full
+      runs); `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook; live
+      `goopg`/`psql`/`pg_dump` end-to-end smoke incl. a full server restart
+      (verified `CollationOID` survives). **New discovery (ledger row
+      appended, not fixed this loop):** live-verifying a range type with a
+      user-opclass `subtype_opclass` across a restart found `CREATE OPERATOR
+      CLASS` has **no WAL/restart persistence at all** — the opclass itself
+      vanishes on restart (though the range type's own numeric `OpclassOID`
+      survives fine), so `pg_dump` then fails outright
+      (`query returned 0 rows instead of one`) for any range type
+      referencing it. Still open: `canonical`/`subtype_diff` (sub-item (a)
+      remainder) and the generic `GetDefaultOpClass`-over-user-opclasses gap
+      (sub-item (b), unchanged from loop #63).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit
