@@ -1963,6 +1963,14 @@ type Catalog interface {
 	// pg_type OID of its auto-generated multirange type, used by format_type
 	// to resolve pg_range.rngmultitypid. M0110-0001.
 	LookupRangeTypeByMultirangeOID(oid uint32) (*RangeType, bool)
+	// LookupRangeTypeByArrayOID finds a user-defined range type by the
+	// pg_type OID of its auto-generated `_name` array type, used by
+	// format_type to render a `myrange[]` column. M0110-0001.
+	LookupRangeTypeByArrayOID(oid uint32) (*RangeType, bool)
+	// LookupRangeTypeByMultirangeArrayOID finds a user-defined range type by
+	// the pg_type OID of its multirange's auto-generated `_name` array type,
+	// used by format_type to render a `mymultirange[]` column. M0110-0001.
+	LookupRangeTypeByMultirangeArrayOID(oid uint32) (*RangeType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -2695,18 +2703,21 @@ type CompositeType struct {
 
 // RangeType describes a user-defined range type created via
 // `CREATE TYPE x AS RANGE (subtype = ..., ...)`. PostgreSQL allocates a
-// pg_type row for the range itself (typtype='r'), a pg_range row, and an
+// pg_type row for the range itself (typtype='r'), a pg_range row, an
 // auto-generated multirange type (typtype='m', default name derived by
-// makeMultirangeTypeName). goopg currently synthesizes those three; the
-// range's own auto-generated array type and the multirange's array type are a
-// follow-up (see fix_plan / deferral ledger — DU-002, M0110-0001).
+// makeMultirangeTypeName), and an auto-generated `_name` array type for both
+// the range and the multirange (typtype='b'/typcategory='A', mirroring
+// EnumType.ArrayOID / CompositeType.ArrayOID). goopg synthesizes all four
+// pg_type rows. DU-002, M0110-0001.
 type RangeType struct {
-	Name           string // lower-case range type name
-	OID            uint32 // pg_type.oid of the range type
-	SubtypeName    string // subtype name as declared (e.g. "int4", "timestamp with time zone")
-	OpclassOID     uint32 // default btree opclass OID for the subtype (pg_range.rngsubopc)
-	MultirangeOID  uint32 // pg_type.oid of the auto-generated multirange type
-	MultirangeName string // lower-case multirange type name
+	Name               string // lower-case range type name
+	OID                uint32 // pg_type.oid of the range type
+	ArrayOID           uint32 // pg_type.oid of the range's auto-generated `_name` array type
+	SubtypeName        string // subtype name as declared (e.g. "int4", "timestamp with time zone")
+	OpclassOID         uint32 // default btree opclass OID for the subtype (pg_range.rngsubopc)
+	MultirangeOID      uint32 // pg_type.oid of the auto-generated multirange type
+	MultirangeArrayOID uint32 // pg_type.oid of the multirange's auto-generated `_name` array type
+	MultirangeName     string // lower-case multirange type name
 }
 
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
@@ -15522,11 +15533,11 @@ func deriveMultirangeTypeName(rangeName string) string {
 }
 
 // RegisterRangeType records a `CREATE TYPE ... AS RANGE (subtype = ...)`
-// range type, allocating pg_type OIDs for both the range itself and its
-// auto-generated multirange type (matching PG's real allocation order:
-// range's array OID would come next, then multirange, then multirange's
-// array — the two array OIDs are not yet allocated, see the deferral
-// ledger). Returns an error matching PG's own wording if the subtype has no
+// range type, allocating pg_type OIDs for the range itself, its
+// auto-generated `_name` array type, its auto-generated multirange type, and
+// the multirange's own auto-generated array type — matching PG's real
+// allocation order (range, range-array, multirange, multirange-array).
+// Returns an error matching PG's own wording if the subtype has no
 // resolvable default btree opclass. M0110-0001.
 func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName string) (*RangeType, error) {
 	subtypeOID := TypeNameToOID(subtypeName)
@@ -15543,8 +15554,14 @@ func (c *InMemory) RegisterRangeType(name, subtypeName, explicitMultirangeName s
 	defer c.mu.Unlock()
 	rt, exists := c.rangeTypes[k]
 	if !exists {
-		rt = &RangeType{Name: k, OID: c.nextOID, MultirangeOID: c.nextOID + 1}
-		c.nextOID += 2
+		rt = &RangeType{
+			Name:               k,
+			OID:                c.nextOID,
+			ArrayOID:           c.nextOID + 1,
+			MultirangeOID:      c.nextOID + 2,
+			MultirangeArrayOID: c.nextOID + 3,
+		}
+		c.nextOID += 4
 		c.rangeTypes[k] = rt
 	}
 	rt.SubtypeName = subtypeName
@@ -15584,6 +15601,36 @@ func (c *InMemory) LookupRangeTypeByMultirangeOID(oid uint32) (*RangeType, bool)
 	defer c.mu.RUnlock()
 	for _, rt := range c.rangeTypes {
 		if rt.MultirangeOID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByArrayOID finds a user-defined range type by the pg_type
+// OID of its auto-generated `_name` array type, used by format_type to
+// render a `myrange[]` column as the schema-qualified array name. Mirrors
+// LookupCompositeTypeByArrayOID / LookupEnumByArrayOID. DU-002 (M0110-0001).
+func (c *InMemory) LookupRangeTypeByArrayOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.ArrayOID == oid {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+// LookupRangeTypeByMultirangeArrayOID finds a user-defined range type by the
+// pg_type OID of its multirange's auto-generated `_name` array type, used by
+// format_type to render a `mymultirange[]` column as the schema-qualified
+// array name. DU-002 (M0110-0001).
+func (c *InMemory) LookupRangeTypeByMultirangeArrayOID(oid uint32) (*RangeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, rt := range c.rangeTypes {
+		if rt.MultirangeArrayOID == oid {
 			return rt, true
 		}
 	}
@@ -15635,7 +15682,9 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 	out := *rt
 	c.rangeTypes[rt.Name] = &out
 	c.advanceNextOIDLocked(rt.OID)
+	c.advanceNextOIDLocked(rt.ArrayOID)
 	c.advanceNextOIDLocked(rt.MultirangeOID)
+	c.advanceNextOIDLocked(rt.MultirangeArrayOID)
 }
 
 // DropRangeTypeDuringRecovery is the idempotent counterpart used for

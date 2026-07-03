@@ -58,17 +58,19 @@ func replayRangeTypeDDLRecords(walDir string, cat *catalog.InMemory) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateRangeType:
-			name, subtypeName, multirangeName, oid, multirangeOID, opclassOID, derr := wal.DecodeCreateRangeType(rec.Payload)
+			name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, derr := wal.DecodeCreateRangeType(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-range-type at lsn %d: %w", rec.StartLSN, derr)
 			}
 			cat.RegisterRangeTypeDuringRecovery(&catalog.RangeType{
-				Name:           name,
-				OID:            oid,
-				SubtypeName:    subtypeName,
-				OpclassOID:     opclassOID,
-				MultirangeOID:  multirangeOID,
-				MultirangeName: multirangeName,
+				Name:               name,
+				OID:                oid,
+				ArrayOID:           arrayOID,
+				SubtypeName:        subtypeName,
+				OpclassOID:         opclassOID,
+				MultirangeOID:      multirangeOID,
+				MultirangeArrayOID: multirangeArrayOID,
+				MultirangeName:     multirangeName,
 			})
 		case wal.RecordKindDropRangeType:
 			name, derr := wal.DecodeDropRangeType(rec.Payload)

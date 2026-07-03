@@ -11616,7 +11616,13 @@ func syncRangeTypeToCatalogHeap(ctx *Context, rt *catalog.RangeType) {
 	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRange(rt)); err != nil {
 		return
 	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForRangeArray(rt)); err != nil {
+		return
+	}
 	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirange(rt)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForMultirangeArray(rt)); err != nil {
 		return
 	}
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
@@ -16081,7 +16087,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
 			// METHOD.
 			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.MultirangeOID, rt.OpclassOID)); werr != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID)); werr != nil {
 					return fmt.Errorf("wal create-range-type: %w", werr)
 				}
 			}
@@ -16545,7 +16551,9 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		if rt, ok := cat.LookupRangeType(n); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.ArrayOID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeOID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, rt.MultirangeArrayOID, o.ctx.Tx.XID)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
 		}

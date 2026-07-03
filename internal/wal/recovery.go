@@ -944,11 +944,13 @@ const (
 	// WAL for these records after physical replay and re-registers each
 	// range type with its original OIDs. Mirrors RecordKindCreateAccessMethod.
 	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
-	// ledger resume point, sub-item (c)).
+	// ledger resume point, sub-item (c)); arrayOid/multirangeArrayOid added by
+	// the array-type follow-up so the auto-generated `_name` array types
+	// survive a restart with the same OIDs too.
 	// Format:
-	//   kind(1) | oid(4) | multirangeOid(4) | opclassOid(4) |
-	//   subtypeNameLen(2)+subtypeName | nameLen(2)+name |
-	//   mrNameLen(2)+mrName
+	//   kind(1) | oid(4) | multirangeOid(4) | opclassOid(4) | arrayOid(4) |
+	//   multirangeArrayOid(4) | subtypeNameLen(2)+subtypeName |
+	//   nameLen(2)+name | mrNameLen(2)+mrName
 	RecordKindCreateRangeType byte = 81
 
 	// RecordKindDropRangeType records a `DROP TYPE name` event for a
@@ -1842,10 +1844,12 @@ func DecodeDropAccessMethod(payload []byte) (name string, err error) {
 
 // EncodeCreateRangeType encodes a CREATE TYPE ... AS RANGE event (DU-002
 // restart-persistence follow-up to M0110-0001, DU-002 slice 429 ledger
-// resume point, sub-item (c)). Both OIDs (range + auto-generated multirange)
-// are carried so recovery re-registers the range type identically to the
-// live server. Format documented at the RecordKindCreateRangeType constant.
-func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, multirangeOID, opclassOID uint32) []byte {
+// resume point, sub-item (c)). All four OIDs (range, its auto-generated
+// array, the auto-generated multirange, and the multirange's own
+// auto-generated array — array-type follow-up) are carried so recovery
+// re-registers the range type identically to the live server. Format
+// documented at the RecordKindCreateRangeType constant.
+func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID uint32) []byte {
 	if len(subtypeName) > 0xFFFF {
 		subtypeName = subtypeName[:0xFFFF]
 	}
@@ -1855,12 +1859,14 @@ func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, multir
 	if len(multirangeName) > 0xFFFF {
 		multirangeName = multirangeName[:0xFFFF]
 	}
-	out := make([]byte, 19+len(subtypeName)+len(name)+len(multirangeName))
+	out := make([]byte, 27+len(subtypeName)+len(name)+len(multirangeName))
 	out[0] = RecordKindCreateRangeType
 	binary.LittleEndian.PutUint32(out[1:5], oid)
 	binary.LittleEndian.PutUint32(out[5:9], multirangeOID)
 	binary.LittleEndian.PutUint32(out[9:13], opclassOID)
-	off := 13
+	binary.LittleEndian.PutUint32(out[13:17], arrayOID)
+	binary.LittleEndian.PutUint32(out[17:21], multirangeArrayOID)
+	off := 21
 	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(subtypeName)))
 	off += 2
 	copy(out[off:], subtypeName)
@@ -1876,17 +1882,19 @@ func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, multir
 }
 
 // DecodeCreateRangeType decodes a RecordKindCreateRangeType payload.
-func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName string, oid, multirangeOID, opclassOID uint32, err error) {
-	if len(payload) < 15 {
-		return "", "", "", 0, 0, 0, fmt.Errorf("wal: create-range-type payload too short (%d bytes)", len(payload))
+func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID uint32, err error) {
+	if len(payload) < 23 {
+		return "", "", "", 0, 0, 0, 0, 0, fmt.Errorf("wal: create-range-type payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateRangeType {
-		return "", "", "", 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-range-type", payload[0])
+		return "", "", "", 0, 0, 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-range-type", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	multirangeOID = binary.LittleEndian.Uint32(payload[5:9])
 	opclassOID = binary.LittleEndian.Uint32(payload[9:13])
-	off := 13
+	arrayOID = binary.LittleEndian.Uint32(payload[13:17])
+	multirangeArrayOID = binary.LittleEndian.Uint32(payload[17:21])
+	off := 21
 	readStr := func() (string, error) {
 		if len(payload) < off+2 {
 			return "", fmt.Errorf("wal: create-range-type payload truncated (length prefix)")
@@ -1901,15 +1909,15 @@ func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName st
 		return s, nil
 	}
 	if subtypeName, err = readStr(); err != nil {
-		return "", "", "", 0, 0, 0, err
+		return "", "", "", 0, 0, 0, 0, 0, err
 	}
 	if name, err = readStr(); err != nil {
-		return "", "", "", 0, 0, 0, err
+		return "", "", "", 0, 0, 0, 0, 0, err
 	}
 	if multirangeName, err = readStr(); err != nil {
-		return "", "", "", 0, 0, 0, err
+		return "", "", "", 0, 0, 0, 0, 0, err
 	}
-	return name, subtypeName, multirangeName, oid, multirangeOID, opclassOID, nil
+	return name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, nil
 }
 
 // EncodeDropRangeType encodes a DROP TYPE event for a user-defined range

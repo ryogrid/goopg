@@ -882,6 +882,101 @@ func TestUserPGTypeRowForComposite(t *testing.T) {
 // (relkind='c', reltype=composite OID, oid=ct.RelOID, relnatts=#fields) and the
 // per-field pg_attribute rows that pg_dump's dumpCompositeType walks via
 // pg_type.typrelid → pg_class → pg_attribute. DU-002 slice 243.
+// TestUserPGTypeRowForRangeAndMultirangeArrayTypes pins the DU-002
+// (M0110-0001) array-type follow-up: RegisterRangeType now allocates OIDs
+// for the range's own auto-generated `_name` array type and the
+// multirange's auto-generated `_name` array type too (matching PG's real
+// allocation order — range, range-array, multirange, multirange-array), and
+// the row builders wire typarray on the base rows / typelem+typcategory='A'
+// on the array rows, mirroring TestUserPGTypeRowForComposite.
+func TestUserPGTypeRowForRangeAndMultirangeArrayTypes(t *testing.T) {
+	const (
+		oidIdx         = 0
+		typnameIdx     = 1
+		typtypeIdx     = 6
+		typcategoryIdx = 7
+		typelemIdx     = 13
+		typarrayIdx    = 14
+	)
+	cat := catalog.NewInMemory()
+	rt, err := cat.RegisterRangeType("myrange", "int4", "")
+	if err != nil {
+		t.Fatalf("RegisterRangeType: %v", err)
+	}
+	if rt.OID == 0 || rt.ArrayOID != rt.OID+1 || rt.MultirangeOID != rt.OID+2 || rt.MultirangeArrayOID != rt.OID+3 {
+		t.Fatalf("RegisterRangeType OID alloc: %+v", rt)
+	}
+	if rt.ArrayOID == rt.MultirangeOID || rt.ArrayOID == rt.MultirangeArrayOID || rt.MultirangeOID == rt.MultirangeArrayOID {
+		t.Fatalf("range/array/multirange/multirange-array OIDs must be distinct: %+v", rt)
+	}
+
+	// Re-registration (e.g. a second CREATE TYPE attempt against the same
+	// name) keeps OIDs stable, mirroring the composite type's re-register
+	// case.
+	rt2, err := cat.RegisterRangeType("myrange", "int4", "")
+	if err != nil {
+		t.Fatalf("re-register RegisterRangeType: %v", err)
+	}
+	if rt2.OID != rt.OID || rt2.ArrayOID != rt.ArrayOID || rt2.MultirangeOID != rt.MultirangeOID || rt2.MultirangeArrayOID != rt.MultirangeArrayOID {
+		t.Fatalf("re-register changed OIDs: %+v vs %+v", rt2, rt)
+	}
+
+	// Base range row's typarray must point at the auto-generated array row.
+	rangeRow := buildUserPGTypeRowForRange(rt)
+	if got := uint32(rangeRow[typarrayIdx].Int); got != rt.ArrayOID {
+		t.Errorf("range typarray=%d want %d", got, rt.ArrayOID)
+	}
+
+	// Range array companion row (`_myrange`).
+	rangeArr := buildUserPGTypeRowForRangeArray(rt)
+	if got := uint32(rangeArr[oidIdx].Int); got != rt.ArrayOID {
+		t.Errorf("range array oid=%d want %d", got, rt.ArrayOID)
+	}
+	if got := rangeArr[typnameIdx].StringValue(); got != "_myrange" {
+		t.Errorf("range array typname=%q want _myrange", got)
+	}
+	if got := rangeArr[typtypeIdx].StringValue(); got != "b" {
+		t.Errorf("range array typtype=%q want b (base)", got)
+	}
+	if got := rangeArr[typcategoryIdx].StringValue(); got != "A" {
+		t.Errorf("range array typcategory=%q want A", got)
+	}
+	if got := uint32(rangeArr[typelemIdx].Int); got != rt.OID {
+		t.Errorf("range array typelem=%d want %d (range element)", got, rt.OID)
+	}
+	if got := uint32(rangeArr[typarrayIdx].Int); got != 0 {
+		t.Errorf("range array typarray=%d want 0", got)
+	}
+
+	// Base multirange row's typarray must point at its own auto-generated
+	// array row (distinct from the range's array).
+	mrRow := buildUserPGTypeRowForMultirange(rt)
+	if got := uint32(mrRow[typarrayIdx].Int); got != rt.MultirangeArrayOID {
+		t.Errorf("multirange typarray=%d want %d", got, rt.MultirangeArrayOID)
+	}
+
+	// Multirange array companion row (`_mymultirange`).
+	mrArr := buildUserPGTypeRowForMultirangeArray(rt)
+	if got := uint32(mrArr[oidIdx].Int); got != rt.MultirangeArrayOID {
+		t.Errorf("multirange array oid=%d want %d", got, rt.MultirangeArrayOID)
+	}
+	if got := mrArr[typnameIdx].StringValue(); got != "_mymultirange" {
+		t.Errorf("multirange array typname=%q want _mymultirange", got)
+	}
+	if got := uint32(mrArr[typelemIdx].Int); got != rt.MultirangeOID {
+		t.Errorf("multirange array typelem=%d want %d (multirange element)", got, rt.MultirangeOID)
+	}
+
+	// format_type resolution: LookupRangeTypeByArrayOID/ByMultirangeArrayOID
+	// must resolve back to rt, mirroring LookupCompositeTypeByArrayOID.
+	if got, ok := cat.LookupRangeTypeByArrayOID(rt.ArrayOID); !ok || got.Name != "myrange" {
+		t.Errorf("LookupRangeTypeByArrayOID(%d) = %+v, %v; want myrange", rt.ArrayOID, got, ok)
+	}
+	if got, ok := cat.LookupRangeTypeByMultirangeArrayOID(rt.MultirangeArrayOID); !ok || got.Name != "myrange" {
+		t.Errorf("LookupRangeTypeByMultirangeArrayOID(%d) = %+v, %v; want myrange", rt.MultirangeArrayOID, got, ok)
+	}
+}
+
 func TestUserPGClassAndAttributeForComposite(t *testing.T) {
 	const (
 		// pg_class column indices (pgClassColumnsPG18 layout).

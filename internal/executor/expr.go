@@ -9714,6 +9714,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					// `format_type(rngmultitypid, NULL)` to emit the
 					// `multirange_type_name = ...` clause. DU-002 (M0110-0001).
 					name = "public." + rt.MultirangeName
+				} else if rt, ok := ctx.Catalog.LookupRangeTypeByArrayOID(uint32(typeOID)); ok {
+					// A `myrange[]` column carries the range's auto-generated
+					// array OID; render it as the schema-qualified array name
+					// so the dump round-trips as `public.myrange[]`, not
+					// `text[]`. DU-002 (M0110-0001) array-type follow-up.
+					name = "public." + rt.Name + "[]"
+				} else if rt, ok := ctx.Catalog.LookupRangeTypeByMultirangeArrayOID(uint32(typeOID)); ok {
+					// A `mymultirange[]` column carries the multirange's
+					// auto-generated array OID. DU-002 (M0110-0001)
+					// array-type follow-up.
+					name = "public." + rt.MultirangeName + "[]"
 				}
 			}
 			return NewStringDatum(name), nil

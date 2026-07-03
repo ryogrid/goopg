@@ -6504,6 +6504,51 @@ documentation-only and is exempt from the design-doc requirement.)
       appended). Still open: sub-items (a) options discarded, (b) no
       array-of-range/multirange type, (d) only 7 curated subtypes resolve a
       default opclass.
+- [x] **Auto-generated array-of-range / array-of-multirange types
+      (M0110-0001, DU-002 slice 429 follow-up, sub-item (b)).**
+      **COMPLETE 2026-07-03 (loop #60):** closes sub-item (b) of the slice 429
+      deferral — `RegisterRangeType` only ever allocated two OIDs (range +
+      multirange), leaving `typarray=0` on both `pg_type` rows and no
+      auto-generated `_name` array-type row at all, the same gap the enum/
+      composite/domain families each had before their own `ArrayOID`
+      follow-ups. `catalog.RangeType` gains `ArrayOID`/`MultirangeArrayOID`;
+      `RegisterRangeType` (`internal/catalog/catalog.go`) now allocates all
+      four OIDs (range, range-array, multirange, multirange-array) from one
+      contiguous `nextOID` block. New `buildUserPGTypeRowForRangeArray`/
+      `ForMultirangeArray` (`internal/executor/pg18_user_catalog_rows.go`)
+      mirror `buildUserPGTypeRowForEnumArray`/`ForCompositeArray`
+      (`typtype='b'`/`typcategory='A'`/`typelem`, subtype-driven alignment
+      rather than a hardcoded one); the base rows' `typarray` now point at
+      the new OIDs; `syncRangeTypeToCatalogHeap`/`execDropType`'s range
+      branch write/stamp-xmax all four `pg_type` heap rows. New
+      `Catalog.LookupRangeTypeByArrayOID`/`LookupRangeTypeByMultirangeArrayOID`
+      back two new `format_type` branches (`internal/executor/expr.go`) so a
+      `myrange[]`/`mymultirange[]` column renders as `public.myrange[]`/
+      `public.mymultirange[]`. WAL/restart persistence extended to match:
+      `EncodeCreateRangeType`/`DecodeCreateRangeType`
+      (`internal/wal/recovery.go`) gained `arrayOID`/`multirangeArrayOID`
+      params; `RegisterRangeTypeDuringRecovery` advances `nextOID` past all
+      four recovered OIDs. New `TestUserPGTypeRowForRangeAndMultirangeArrayTypes`
+      (`internal/executor/pg18_user_catalog_rows_test.go`);
+      `internal/wal/range_type_ddl_test.go` +
+      `internal/initdb/range_type_ddl_recovery_test.go` updated for the new
+      arity/fields. Gates: `go build ./...`/`go vet ./...` clean; `go test
+      -race ./internal/wal/...` PASS; `internal/catalog`+`internal/wal`+
+      `internal/initdb`+`internal/executor` suites PASS (full runs, no
+      regression); `TestPort_PgDumpConnectionSetup` PASS (dump output
+      byte-identical/unaffected — the new array rows are `isarray`-excluded
+      from `pg_dump`'s own `getTypes`, same mechanism as the pre-existing
+      enum/composite array rows); `scripts/tpch-spotcheck.sh` PASS; pgbench
+      smoke = pre-commit hook. Design doc: `docs/design/0110-0001-pg-dump-
+      tap-port.md` new "Follow-up: auto-generated array-of-range /
+      array-of-multirange types (loop #60)" section; `docs/design/README.md`
+      0110-0001 row updated; deferral ledger sub-item (b) closed (new
+      resolved row appended). **New discovery recorded, not fixed this
+      loop:** range/multirange-typed table columns have no `pg_attribute`
+      resolution and no value storage codec at all (built-in or
+      user-defined) — a separate, larger task; fresh deferral-ledger row
+      appended. Still open: sub-items (a) options discarded, (d) only 7
+      curated subtypes resolve a default opclass.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
