@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/protocol"
 )
 
@@ -304,5 +305,97 @@ func TestExtendedProtocolCompatNoopSchema(t *testing.T) {
 	}
 	if !im.SchemaExists("extddl_compatnoop_schema") {
 		t.Fatal("extddl_compatnoop_schema not registered in catalog after extended-protocol CREATE SCHEMA")
+	}
+}
+
+// TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable pins a
+// finding from auditing item (3) of the loop #84 row (`0119-0004cv`/
+// `0119-0004cw`), which named "GRANT ... ON ALL TABLES IN SCHEMA ...",
+// "GRANT ... ON LARGE OBJECT ..." etc. as candidate probes for
+// compatNoopCommandTag's GRANT/REVOKE/SECURITY LABEL branches
+// (dispatch.go ~1281-1298): unlike CREATE SCHEMA, none of those branches are
+// actually reachable through a single well-formed statement. parser.go's
+// `case "grant", "revoke"` (~1046) and `case "security"` (~1176) top-level
+// dispatch arms consume every token up to the terminating ';'/EOF with no
+// required structure and no error return on any path, so parser.Parse
+// NEVER fails for a string beginning with GRANT/REVOKE/SECURITY LABEL —
+// every such statement parses into a CompatNoopStmt (or a concrete
+// TypeACLChange/DatabaseACLChange/ParameterACLChange/AttrACLChange/
+// RoleMembership payload) that flows through the ordinary planner/executor
+// pipeline identically on both wire protocols, never through
+// compatNoopCommandTag/tryCompatNoopExtended at all. This test pins that
+// fact directly (rather than writing extended-protocol wire tests that
+// could never exercise the target fallback): every case below must produce
+// a real (non-fallback) parse.
+func TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable(t *testing.T) {
+	cases := []string{
+		"GRANT SELECT ON ALL TABLES IN SCHEMA public TO nosuchrole",
+		"GRANT ALL ON LARGE OBJECT 12345 TO nosuchrole",
+		"REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA public FROM nosuchrole",
+		"GRANT",
+		"REVOKE",
+		"SECURITY LABEL ON TABLE nosuchtable IS 'x'",
+	}
+	for _, sql := range cases {
+		if _, ok := compatNoopCommandTag(sql); !ok {
+			t.Fatalf("compatNoopCommandTag(%q) = false; want true (matches its prefix, confirming the branch exists)", sql)
+		}
+		if _, err := parser.Parse(sql); err != nil {
+			t.Fatalf("parser.Parse(%q) = %v; want nil — this statement should never reach compatNoopCommandTag in the live dispatch path", sql, err)
+		}
+	}
+}
+
+// TestExtendedProtocolCompatNoopCommentOnMalformed pins the one GRANT/
+// REVOKE/COMMENT ON/SECURITY LABEL sub-case that genuinely reaches
+// compatNoopCommandTag's fallback via a single well-formed statement (see
+// TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable's
+// finding that the other three never do): `COMMENT ON <supported-kind>`
+// with the required name/target omitted. parseCommentOnTail
+// (internal/parser/parser.go) returns a genuine parse error for a
+// truncated clause of a *supported* ObjKind (TABLE/INDEX/COLUMN/
+// CONSTRAINT/TRIGGER/...) — unlike an *unsupported* ObjKind, which is
+// accepted as a silent CompatNoopStmt no-op by design (M0097-0023) — so
+// `COMMENT ON TABLE` with no table name is the one input that actually
+// drives compatNoopCommandTag's "comment on " branch and therefore
+// tryCompatNoopExtended. Confirms extended-protocol parity with the
+// simple-query path's existing (silent-absorption) behavior for this
+// malformed input, matching loop #86's actual shared-mechanism goal.
+func TestExtendedProtocolCompatNoopCommentOnMalformed(t *testing.T) {
+	const malformed = "COMMENT ON TABLE"
+	if _, err := parser.Parse(malformed); err == nil {
+		t.Fatalf("parser.Parse(%q) succeeded; want a parse error (precondition for reaching compatNoopCommandTag)", malformed)
+	}
+	if tag, ok := compatNoopCommandTag(malformed); !ok || tag != "COMMENT" {
+		t.Fatalf("compatNoopCommandTag(%q) = (%q, %v); want (\"COMMENT\", true)", malformed, tag, ok)
+	}
+
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+	conn := dialAndCompleteDB(t, addr, "postgres")
+	defer conn.Close()
+
+	frames := extendedExec(t, conn, "cotm", malformed)
+	tag, errPayload := commandCompleteTag(t, frames)
+	if errPayload != "" {
+		t.Fatalf("COMMENT ON TABLE (no name), extended protocol: unexpected ErrorResponse: %s", errPayload)
+	}
+	if tag != "COMMENT" {
+		t.Fatalf("COMMENT ON TABLE (no name), extended protocol: CommandComplete tag=%q, want %q", tag, "COMMENT")
+	}
+
+	// Simple-query path: same statement must be absorbed identically.
+	conn2 := dialAndCompleteDB(t, addr, "postgres")
+	defer conn2.Close()
+	if err := sendSimpleQuery(conn2, []byte(malformed)); err != nil {
+		t.Fatalf("send COMMENT ON TABLE (no name): %v", err)
+	}
+	frames = readUntilReady(t, conn2)
+	tag, errPayload = commandCompleteTag(t, frames)
+	if errPayload != "" {
+		t.Fatalf("COMMENT ON TABLE (no name), simple-query: unexpected ErrorResponse: %s", errPayload)
+	}
+	if tag != "COMMENT" {
+		t.Fatalf("COMMENT ON TABLE (no name), simple-query: CommandComplete tag=%q, want %q", tag, "COMMENT")
 	}
 }

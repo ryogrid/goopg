@@ -848,3 +848,51 @@ individual unparseable GRANT/REVOKE/COMMENT ON sub-form — only confirmed
 the shared dispatch mechanism is now symmetric between protocols. A future
 pass should audit each `compatNoopCommandTag` case for a dedicated
 extended-protocol regression test, the way `CREATE SCHEMA` got one here.
+
+**Correction (loop #87):** the paragraph above, and this section's earlier
+"`SECURITY LABEL` has no parser grammar at all" claim, are **wrong** — audited
+in full while attempting to act on the "future pass" deferral above. Every
+example named (`GRANT ... ON ALL TABLES IN SCHEMA ...`, `GRANT ... ON LARGE
+OBJECT ...`, bare `SECURITY LABEL ...`) in fact parses successfully today:
+`internal/parser/parser.go`'s `case "grant", "revoke"` (~1046) and
+`case "security"` (~1176) top-level dispatch arms consume every token up to
+the terminating `;`/EOF with **no required structure and no error return on
+any path**, so `parser.Parse` never fails for a single well-formed statement
+beginning `GRANT `/`REVOKE `/`SECURITY LABEL` — confirmed by direct probe
+(`parser.Parse` on all three named examples returns `err == nil`). These
+always resolve into a `CompatNoopStmt` (or a concrete
+`TypeACLChange`/`DatabaseACLChange`/`ParameterACLChange`/`AttrACLChange`/
+`RoleMembership` payload) that flows through the ordinary planner/executor
+pipeline identically on both wire protocols — `compatNoopCommandTag`/
+`tryCompatNoopExtended` never fire for them at all, making those three
+branches unreachable dead code for any single-statement input. `COMMENT ON`
+is the one exception: `parseCommentOnTail`'s per-`ObjKind` arms
+(TABLE/INDEX/COLUMN/CONSTRAINT/TRIGGER/...) return a genuine parse error when
+a *supported* kind's clause is truncated (e.g. `COMMENT ON TABLE` with no
+table name) — an *unsupported* `ObjKind` is instead accepted as a silent
+`CompatNoopStmt` no-op by design (M0097-0023) and never fails to parse. So
+`COMMENT ON TABLE` (malformed) is the sole reachable single-statement probe
+of loop #86's shared mechanism among these four keywords.
+
+New tests (`internal/server/dispatch_extended_ddl_test.go`):
+`TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable` pins the
+GRANT/REVOKE/SECURITY LABEL unreachability directly via `parser.Parse` +
+`compatNoopCommandTag` (a wire round-trip would only re-prove the
+already-shared ordinary executor path, not this fallback);
+`TestExtendedProtocolCompatNoopCommentOnMalformed` drives the one reachable
+case (`COMMENT ON TABLE`, no name) over both wire protocols, confirming
+parity (`CommandComplete "COMMENT"`, no error, on both).
+
+New discovery while probing reachability, deferred (fresh ledger row, loop
+#87): a **multi-statement simple-query batch** whose first statement is a
+well-formed `GRANT ...;` (or any other `compatNoopCommandTag`-matched
+prefix) followed by a later genuinely-invalid statement makes the *whole*
+`parser.Parse` call fail (0 statements, one error for the entire string), and
+`compatNoopCommandTag` then matches the raw multi-statement text's leading
+prefix — silently absorbing the **entire batch** as a bare `CommandComplete`
+success, swallowing the real syntax error and executing neither statement.
+Real PostgreSQL instead raises a genuine `42601` for the whole message in
+this situation. Not specific to GRANT — applies to every
+`compatNoopCommandTag`-matched prefix. Out of this loop's bounded scope
+(touches the shared matching logic across all ~12 prefix cases); see the
+ledger row for the resume point.

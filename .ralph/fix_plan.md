@@ -5430,6 +5430,39 @@ documentation-only and is exempt from the design-doc requirement.)
       a dedicated regression test; a future pass should test each
       remaining GRANT/REVOKE/COMMENT ON/SECURITY LABEL unparseable
       sub-form individually — item (3) remains a multi-loop sub-task.
+      **2026-07-03 (loop #87): reachability audit + correction of the loop
+      #86 follow-up plan.** The loop #86 row's plan ("test each remaining
+      GRANT/REVOKE/COMMENT ON/SECURITY LABEL sub-form") rested on a wrong
+      premise for 3 of the 4 forms: `internal/parser/parser.go`'s
+      `case "grant", "revoke"` (~1046) and `case "security"` (~1176)
+      dispatch arms never fail to parse a single well-formed statement (no
+      required structure, no error path), so `compatNoopCommandTag`/
+      `tryCompatNoopExtended` can never fire for them — confirmed with
+      probes including the loop #86 row's own named examples. Only
+      `COMMENT ON` genuinely reaches the fallback, and only for a
+      malformed clause of a *supported* `ObjKind` (e.g. `COMMENT ON TABLE`
+      with no name); unsupported kinds are a deliberate silent no-op
+      (M0097-0023) that also never fails to parse. New
+      `TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable`
+      pins the unreachability directly; new
+      `TestExtendedProtocolCompatNoopCommentOnMalformed` drives the one
+      reachable case over both wire protocols, confirming parity (both
+      `internal/server/dispatch_extended_ddl_test.go`). Gates: build/vet
+      clean; `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc: "Correction (loop #87)" section of
+      `0119-0004-database-config-set-pgdump.md`, indexed as `0119-0004cy`.
+      Deferred (ledger row appended): found a NEW, broader,
+      protocol-independent gap while probing — a multi-statement
+      simple-query batch whose first statement is a well-formed
+      `compatNoopCommandTag`-matched prefix followed by a later
+      genuinely-invalid statement makes the whole `parser.Parse` call
+      fail, and `compatNoopCommandTag` then matches the raw multi-statement
+      text's leading prefix, silently absorbing the entire batch as a bare
+      success instead of the `42601` real PostgreSQL raises. Applies to
+      every `compatNoopCommandTag` prefix (not just GRANT/REVOKE/COMMENT/
+      SECURITY LABEL); item (3) is otherwise now closed to the extent it
+      can meaningfully be — no further individual sub-form tests are
+      needed since the remaining forms are unreachable.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
