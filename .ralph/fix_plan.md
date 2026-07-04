@@ -211,11 +211,23 @@ mirroring M0119's ledger `status` column.
       `instrumentedOp` ANALYZE wrapper (`internal/executor/instrument.go`)
       now also diffs `Pool.BufferCounters()` snapshots per node; TEXT
       rendering only (`Buffers: shared hit=N read=N`), under ANALYZE only.
-      Still open: FORMAT JSON/XML/YAML BUFFERS rendering, `EXPLAIN
-      (BUFFERS)` without ANALYZE (PG 17+ planning-time buffers — no
-      planning-phase buffer counters exist), `dirtied=`/`written=`/local-
-      temp-buffer terms, `pg_stat_io` (table registered, `VirtualRows`
-      always returns nil), `track_io_timing` runtime SET (GUC registered
+      BUFFERS rendering FORMAT JSON/XML/YAML **done** (2026-07-04, later
+      loop): `planToJSONWithStats` sets flat `"Shared Hit Blocks"`/`"Shared
+      Read Blocks"` properties whenever BUFFERS is requested (matches
+      upstream's non-TEXT `show_buffer_usage` branch). `pg_stat_io` row
+      shape **done** (2026-07-04, later loop): `internal/executor/
+      pgstat_io.go` ports upstream's `pgstat_tracks_io_bktype`/`_object`/
+      `_op` predicates (verified against a real PostgreSQL 18.3 cluster —
+      79 rows), wired via `valuesOp.Open`; the one cell goopg instruments
+      (client backend/relation/normal reads/read_bytes/hits) is real, every
+      other tracked cell is an honest 0, untracked cells are NULL. Also fixed
+      a wrong test assumption in `TestPort_PgWalsummary002Blocks` (upstream
+      does report 2 walsummarizer rows even with summarize_wal=off).
+      Still open: `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time
+      buffers — no planning-phase buffer counters exist), `dirtied=`/
+      `written=`/local-temp-buffer terms, `pg_stat_io`'s other 7 I/O
+      counters (writes/extends/evictions/reuses/writebacks/fsyncs + their
+      bytes/time columns), `track_io_timing` runtime SET (GUC registered
       but only consulted once at process boot).
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame

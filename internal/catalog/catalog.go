@@ -5299,121 +5299,10 @@ func (c *InMemory) registerSystemTables() {
 			// array literal (`{fillfactor=70}`). Empty → "" → planner maps it to
 			// SQL NULL (DU-002 slice 47), so a plain table emits no WITH clause;
 			// a non-empty one round-trips through pg_dump as `WITH
-			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). Multiple options
-			// (e.g. fillfactor + parallel_workers, slice 195) join in a fixed
-			// order as `{fillfactor=70,parallel_workers=4}`; autovacuum_enabled
-			// (slice 196) follows as a boolean element, then toast_tuple_target
-			// (slice 197) and autovacuum_vacuum_threshold (slice 198) as trailing
-			// integer elements, then autovacuum_vacuum_scale_factor (slice 199),
-			// autovacuum_analyze_scale_factor (slice 200),
-			// autovacuum_vacuum_insert_scale_factor (slice 201) and
-			// autovacuum_vacuum_cost_delay (slice 202) as REAL-typed elements,
-			// then autovacuum_analyze_threshold (slice 203) as a trailing integer
-			// element.
-			var relopts []string
-			if t.Fillfactor != 0 {
-				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
-			}
-			if t.ParallelWorkersSet {
-				relopts = append(relopts, "parallel_workers="+strconv.Itoa(t.ParallelWorkers))
-			}
-			if t.AutovacuumEnabledSet {
-				relopts = append(relopts, "autovacuum_enabled="+strconv.FormatBool(t.AutovacuumEnabled))
-			}
-			if t.ToastTupleTarget != 0 {
-				relopts = append(relopts, "toast_tuple_target="+strconv.Itoa(t.ToastTupleTarget))
-			}
-			if t.AutovacuumVacuumThresholdSet {
-				relopts = append(relopts, "autovacuum_vacuum_threshold="+strconv.Itoa(t.AutovacuumVacuumThreshold))
-			}
-			if t.AutovacuumVacuumScaleFactorSet {
-				relopts = append(relopts, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumScaleFactor, 'g', -1, 64))
-			}
-			if t.AutovacuumAnalyzeScaleFactorSet {
-				relopts = append(relopts, "autovacuum_analyze_scale_factor="+strconv.FormatFloat(t.AutovacuumAnalyzeScaleFactor, 'g', -1, 64))
-			}
-			if t.AutovacuumVacuumInsertScaleFactorSet {
-				relopts = append(relopts, "autovacuum_vacuum_insert_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumInsertScaleFactor, 'g', -1, 64))
-			}
-			if t.AutovacuumVacuumCostDelaySet {
-				relopts = append(relopts, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(t.AutovacuumVacuumCostDelay, 'g', -1, 64))
-			}
-			if t.AutovacuumAnalyzeThresholdSet {
-				relopts = append(relopts, "autovacuum_analyze_threshold="+strconv.Itoa(t.AutovacuumAnalyzeThreshold))
-			}
-			if t.AutovacuumVacuumInsertThresholdSet {
-				relopts = append(relopts, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(t.AutovacuumVacuumInsertThreshold))
-			}
-			if t.VacuumTruncateSet {
-				relopts = append(relopts, "vacuum_truncate="+strconv.FormatBool(t.VacuumTruncate))
-			}
-			if t.LogAutovacuumMinDurationSet {
-				relopts = append(relopts, "log_autovacuum_min_duration="+strconv.Itoa(t.LogAutovacuumMinDuration))
-			}
-			if t.AutovacuumFreezeMinAgeSet {
-				relopts = append(relopts, "autovacuum_freeze_min_age="+strconv.Itoa(t.AutovacuumFreezeMinAge))
-			}
-			if t.AutovacuumFreezeMaxAgeSet {
-				relopts = append(relopts, "autovacuum_freeze_max_age="+strconv.Itoa(t.AutovacuumFreezeMaxAge))
-			}
-			if t.AutovacuumFreezeTableAgeSet {
-				relopts = append(relopts, "autovacuum_freeze_table_age="+strconv.Itoa(t.AutovacuumFreezeTableAge))
-			}
-			if t.AutovacuumMultixactFreezeMinAgeSet {
-				relopts = append(relopts, "autovacuum_multixact_freeze_min_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMinAge))
-			}
-			if t.AutovacuumMultixactFreezeMaxAgeSet {
-				relopts = append(relopts, "autovacuum_multixact_freeze_max_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMaxAge))
-			}
-			if t.AutovacuumMultixactFreezeTableAgeSet {
-				relopts = append(relopts, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(t.AutovacuumMultixactFreezeTableAge))
-			}
-			if t.AutovacuumVacuumCostLimitSet {
-				relopts = append(relopts, "autovacuum_vacuum_cost_limit="+strconv.Itoa(t.AutovacuumVacuumCostLimit))
-			}
-			if t.UserCatalogTableSet {
-				relopts = append(relopts, "user_catalog_table="+strconv.FormatBool(t.UserCatalogTable))
-			}
-			if t.AutovacuumVacuumMaxThresholdSet {
-				relopts = append(relopts, "autovacuum_vacuum_max_threshold="+strconv.Itoa(t.AutovacuumVacuumMaxThreshold))
-			}
-			if t.VacuumMaxEagerFreezeFailureRateSet {
-				relopts = append(relopts, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(t.VacuumMaxEagerFreezeFailureRate, 'g', -1, 64))
-			}
-			if t.VacuumIndexCleanupSet {
-				relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
-			}
-			// A view's `WITH (security_barrier=<bool>)` is stored by PostgreSQL as
-			// the `security_barrier=<bool>` pg_class.reloption. Unlike check_option,
-			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
-			// the `WITH (security_barrier='true')` clause after the view name
-			// (appendReloptionsArray). Placed before check_option so a view carrying
-			// both surfaces as `{security_barrier=...,check_option=...}`, matching
-			// PostgreSQL's stored order. M0119-0004 (slice 366).
-			if t.SecurityBarrierSet {
-				relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
-			}
-			// A view's `WITH (security_invoker=<bool>)` is stored by PostgreSQL as
-			// the `security_invoker=<bool>` pg_class.reloption. Like security_barrier,
-			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
-			// the `WITH (security_invoker='true')` clause after the view name
-			// (appendReloptionsArray). Placed after security_barrier and before
-			// check_option so a view carrying several options surfaces in PG's stored
-			// WITH-clause order. M0119-0004 (slice 367).
-			if t.SecurityInvokerSet {
-				relopts = append(relopts, "security_invoker="+strconv.FormatBool(t.SecurityInvoker))
-			}
-			// A view's `WITH [CASCADED|LOCAL] CHECK OPTION` is stored by PostgreSQL
-			// as the `check_option=<mode>` pg_class.reloption. pg_dump's getTables
-			// then strips it from the reloptions array (array_remove) and re-emits
-			// it as the `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (slice 365).
-			if t.CheckOption != "" {
-				relopts = append(relopts, "check_option="+t.CheckOption)
-			}
-			reloptions := ""
-			if len(relopts) > 0 {
-				reloptions = arrayTextLiteral(relopts)
-			}
+			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). BuildTableReloptions
+			// is the single source of truth (shared with executor.buildUserPGClassRow's
+			// heap-persisted row, M0119-0004) so the two never drift apart.
+			reloptions := BuildTableReloptions(t)
 			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
 			// table / materialized view with at least one toastable (varlena)
 			// column (needs_toast_table, src/backend/catalog/toasting.c), plus
@@ -6796,9 +6685,13 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
 
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
-	// goopg v0 does not track I/O statistics; all counters are 0 and no
-	// rows are returned. The table exists so queries filtering by
-	// backend_type (e.g. 'walsummarizer') succeed and return 0 rows.
+	// The static VirtualRows fallback below returns no rows; the real,
+	// live row set (upstream's exact 79-row valid-combination shape, with
+	// goopg's one instrumented cell filled in) is built by
+	// executor.fetchIOStatRows and swapped in at Open time — see
+	// valuesOp.Open's "pg_stat_io" case (M0122-0003). This fallback only
+	// fires for code paths that read VirtualRows() directly (bypassing the
+	// executor), e.g. pg_dump's catalog introspection.
 	pgStatIO := &Table{
 		Schema: "pg_catalog", Name: "pg_stat_io", Virtual: true,
 		Columns: []Column{
@@ -13204,6 +13097,115 @@ func quoteArrayElement(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// BuildTableReloptions renders a table's or view's storage parameters as the
+// PostgreSQL pg_class.reloptions text[] external literal (e.g.
+// "{fillfactor=70}"), or "" when the table carries none (planner/heap-encode
+// callers must map "" to SQL NULL themselves — see arrayTextLiteral's
+// contract). This is the single source of truth for reloptions so the live
+// virtual pg_class row (registerSystemTables' VirtualRows) and the
+// heap-persisted row written for restart durability (executor's
+// buildUserPGClassRow) never drift apart (M0119-0004: buildUserPGClassRow
+// used to hardcode "{}", silently losing every reloption across a restart).
+//
+// Element order matches PostgreSQL's own stored order exactly: fillfactor,
+// parallel_workers, autovacuum_enabled, toast_tuple_target, then the
+// autovacuum_* family, vacuum_truncate, log_autovacuum_min_duration, the
+// autovacuum_*freeze* family, autovacuum_vacuum_cost_limit,
+// user_catalog_table, autovacuum_vacuum_max_threshold,
+// vacuum_max_eager_freeze_failure_rate, vacuum_index_cleanup, then (views
+// only) security_barrier, security_invoker, check_option.
+func BuildTableReloptions(t *Table) string {
+	var relopts []string
+	if t.Fillfactor != 0 {
+		relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
+	}
+	if t.ParallelWorkersSet {
+		relopts = append(relopts, "parallel_workers="+strconv.Itoa(t.ParallelWorkers))
+	}
+	if t.AutovacuumEnabledSet {
+		relopts = append(relopts, "autovacuum_enabled="+strconv.FormatBool(t.AutovacuumEnabled))
+	}
+	if t.ToastTupleTarget != 0 {
+		relopts = append(relopts, "toast_tuple_target="+strconv.Itoa(t.ToastTupleTarget))
+	}
+	if t.AutovacuumVacuumThresholdSet {
+		relopts = append(relopts, "autovacuum_vacuum_threshold="+strconv.Itoa(t.AutovacuumVacuumThreshold))
+	}
+	if t.AutovacuumVacuumScaleFactorSet {
+		relopts = append(relopts, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumScaleFactor, 'g', -1, 64))
+	}
+	if t.AutovacuumAnalyzeScaleFactorSet {
+		relopts = append(relopts, "autovacuum_analyze_scale_factor="+strconv.FormatFloat(t.AutovacuumAnalyzeScaleFactor, 'g', -1, 64))
+	}
+	if t.AutovacuumVacuumInsertScaleFactorSet {
+		relopts = append(relopts, "autovacuum_vacuum_insert_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumInsertScaleFactor, 'g', -1, 64))
+	}
+	if t.AutovacuumVacuumCostDelaySet {
+		relopts = append(relopts, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(t.AutovacuumVacuumCostDelay, 'g', -1, 64))
+	}
+	if t.AutovacuumAnalyzeThresholdSet {
+		relopts = append(relopts, "autovacuum_analyze_threshold="+strconv.Itoa(t.AutovacuumAnalyzeThreshold))
+	}
+	if t.AutovacuumVacuumInsertThresholdSet {
+		relopts = append(relopts, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(t.AutovacuumVacuumInsertThreshold))
+	}
+	if t.VacuumTruncateSet {
+		relopts = append(relopts, "vacuum_truncate="+strconv.FormatBool(t.VacuumTruncate))
+	}
+	if t.LogAutovacuumMinDurationSet {
+		relopts = append(relopts, "log_autovacuum_min_duration="+strconv.Itoa(t.LogAutovacuumMinDuration))
+	}
+	if t.AutovacuumFreezeMinAgeSet {
+		relopts = append(relopts, "autovacuum_freeze_min_age="+strconv.Itoa(t.AutovacuumFreezeMinAge))
+	}
+	if t.AutovacuumFreezeMaxAgeSet {
+		relopts = append(relopts, "autovacuum_freeze_max_age="+strconv.Itoa(t.AutovacuumFreezeMaxAge))
+	}
+	if t.AutovacuumFreezeTableAgeSet {
+		relopts = append(relopts, "autovacuum_freeze_table_age="+strconv.Itoa(t.AutovacuumFreezeTableAge))
+	}
+	if t.AutovacuumMultixactFreezeMinAgeSet {
+		relopts = append(relopts, "autovacuum_multixact_freeze_min_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMinAge))
+	}
+	if t.AutovacuumMultixactFreezeMaxAgeSet {
+		relopts = append(relopts, "autovacuum_multixact_freeze_max_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMaxAge))
+	}
+	if t.AutovacuumMultixactFreezeTableAgeSet {
+		relopts = append(relopts, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(t.AutovacuumMultixactFreezeTableAge))
+	}
+	if t.AutovacuumVacuumCostLimitSet {
+		relopts = append(relopts, "autovacuum_vacuum_cost_limit="+strconv.Itoa(t.AutovacuumVacuumCostLimit))
+	}
+	if t.UserCatalogTableSet {
+		relopts = append(relopts, "user_catalog_table="+strconv.FormatBool(t.UserCatalogTable))
+	}
+	if t.AutovacuumVacuumMaxThresholdSet {
+		relopts = append(relopts, "autovacuum_vacuum_max_threshold="+strconv.Itoa(t.AutovacuumVacuumMaxThreshold))
+	}
+	if t.VacuumMaxEagerFreezeFailureRateSet {
+		relopts = append(relopts, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(t.VacuumMaxEagerFreezeFailureRate, 'g', -1, 64))
+	}
+	if t.VacuumIndexCleanupSet {
+		relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
+	}
+	// Views: security_barrier / security_invoker / check_option. See the
+	// per-field comments at their catalog.Table struct definitions for why
+	// this order matches PostgreSQL's stored order.
+	if t.SecurityBarrierSet {
+		relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
+	}
+	if t.SecurityInvokerSet {
+		relopts = append(relopts, "security_invoker="+strconv.FormatBool(t.SecurityInvoker))
+	}
+	if t.CheckOption != "" {
+		relopts = append(relopts, "check_option="+t.CheckOption)
+	}
+	if len(relopts) == 0 {
+		return ""
+	}
+	return arrayTextLiteral(relopts)
 }
 
 // arrayTextLiteral renders elements as a PostgreSQL text[] external literal

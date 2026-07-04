@@ -98,6 +98,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// blks_zeroed) honouring the session's stats_fetch_consistency, which
 			// the static catalog VirtualRows fallback cannot do. M0118-0009.
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchSLRURows(ctx))
+		} else if tbl.Name == "pg_stat_io" {
+			// pg_stat_io reports live pool-wide shared-buffer counters (the one
+			// IO signal goopg instruments), which the static catalog VirtualRows
+			// fallback cannot do. M0122-0003.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchIOStatRows(ctx))
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}
