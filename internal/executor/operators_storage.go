@@ -5501,6 +5501,15 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						}
 					}
 					_ = computeGeneratedColumns(writeCols, actualNewRow)
+					// WITH CHECK OPTION enforcement — same rationale/restriction as
+					// the plain SeqScan path (line ~4206): only the base table's own
+					// rows are checked, not a partition/inheritance child's (those
+					// stay a documented limitation, root-0025 deferred items 4/5).
+					if o.plan.ViewCheckQual != nil && fst.tbl == o.plan.Table {
+						if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, parentNewRow); err != nil {
+							return err
+						}
+					}
 					var fromPortion Row
 					if needFromForReturning && len(combinedRow) > tgtColCount {
 						fromPortion = cloneRow(combinedRow[tgtColCount:])

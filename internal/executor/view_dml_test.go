@@ -574,3 +574,92 @@ func TestUpdatableViewColumnSubsetReorderRename(t *testing.T) {
 		t.Fatalf("UPDATE vsub SET val: err=%v, want *planner.PlanError 42703 (val is not part of vsub's row type)", err)
 	}
 }
+
+// TestUpdatableViewUpdateFromDeleteUsing pins root-0025 deferred item 3:
+// `UPDATE ... FROM` and `DELETE ... USING` against a simple auto-updatable
+// view now rewrite onto the view's base relation exactly like the
+// FROM/USING-free forms, instead of being rejected 55000 unconditionally.
+// The view's own WHERE qual (and CHECK OPTION, for UPDATE) is still
+// enforced against the combined cross-product row, and the view's own
+// (possibly renamed) column vocabulary resolves in SET/WHERE/RETURNING via
+// the same viewProxyTable machinery the FROM/USING-free path already uses.
+func TestUpdatableViewUpdateFromDeleteUsing(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE tf1 (id int primary key, amount int)")
+	must("CREATE TABLE tf2 (id int primary key, bump int)")
+	must("INSERT INTO tf1 VALUES (1, 100), (2, 200)")
+	must("INSERT INTO tf2 VALUES (1, 5), (2, 999)")
+	// Renamed column + a WHERE qual restricting the view to id=1 only, so
+	// row id=2 must never be touched even though tf2 supplies a matching
+	// join row for it too.
+	must("CREATE VIEW vf1 AS SELECT id, amount AS amt FROM tf1 WHERE id = 1")
+
+	must("UPDATE vf1 SET amt = amt + bump FROM tf2 WHERE vf1.id = tf2.id")
+	rows := runQueryRows(t, ctx, "SELECT id, amount FROM tf1 ORDER BY id")
+	if len(rows) != 2 || rows[0][1].Format() != "105" || rows[1][1].Format() != "200" {
+		t.Fatalf("UPDATE view FROM: got %v, want [[1 105] [2 200]] (id=2 outside the view's own qual must be untouched)", rows)
+	}
+
+	must("CREATE TABLE td1 (id int primary key, val int)")
+	must("CREATE TABLE td2 (id int primary key)")
+	must("INSERT INTO td1 VALUES (1, 1), (2, 2)")
+	must("INSERT INTO td2 VALUES (1), (2)")
+	must("CREATE VIEW vd1 AS SELECT id AS xid, val FROM td1 WHERE val = 1")
+
+	must("DELETE FROM vd1 USING td2 WHERE vd1.xid = td2.id")
+	rows = runQueryRows(t, ctx, "SELECT id FROM td1")
+	if len(rows) != 1 || rows[0][0].Format() != "2" {
+		t.Fatalf("DELETE view USING: got %v, want just id=2 (id=1 matched WHERE and the view's own qual)", rows)
+	}
+
+	// CHECK OPTION must still be enforced through UPDATE ... FROM.
+	must("CREATE TABLE tc1 (id int primary key, val int)")
+	must("INSERT INTO tc1 VALUES (1, 20)")
+	must("CREATE VIEW vc1 AS SELECT id, val FROM tc1 WHERE val > 15 WITH CHECK OPTION")
+	must("CREATE TABLE tc2 (id int primary key, newval int)")
+	must("INSERT INTO tc2 VALUES (1, 1)")
+	err := runDDL(t, ctx, "UPDATE vc1 SET val = tc2.newval FROM tc2 WHERE vc1.id = tc2.id")
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("UPDATE view FROM violating CHECK OPTION: err=%v, want ExecError 44000", err)
+	}
+	rows = runQueryRows(t, ctx, "SELECT val FROM tc1 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "20" {
+		t.Fatalf("rejected UPDATE...FROM must leave the row unchanged, got %v", rows)
+	}
+
+	// A view outside the auto-updatable subset (aggregation) stays rejected
+	// 55000 for UPDATE ... FROM / DELETE ... USING too, not just the
+	// FROM/USING-free forms.
+	must("CREATE TABLE ta1 (id int primary key, val int)")
+	must("CREATE TABLE ta2 (id int primary key)")
+	must("INSERT INTO ta1 VALUES (1, 10)")
+	must("INSERT INTO ta2 VALUES (1)")
+	must("CREATE VIEW vagg1 AS SELECT id, count(*) AS c FROM ta1 GROUP BY id")
+	stmts, perr := parser.Parse("UPDATE vagg1 SET id = 2 FROM ta2 WHERE vagg1.id = ta2.id")
+	if perr != nil {
+		t.Fatalf("Parse: %v", perr)
+	}
+	_, perr = planner.Plan(stmts[0], ctx.Catalog)
+	pe, ok := perr.(*planner.PlanError)
+	if !ok || pe.Code != "55000" {
+		t.Fatalf("UPDATE aggregate view FROM: err=%v, want *planner.PlanError 55000", perr)
+	}
+	stmts, perr = parser.Parse("DELETE FROM vagg1 USING ta2 WHERE vagg1.id = ta2.id")
+	if perr != nil {
+		t.Fatalf("Parse: %v", perr)
+	}
+	_, perr = planner.Plan(stmts[0], ctx.Catalog)
+	pe, ok = perr.(*planner.PlanError)
+	if !ok || pe.Code != "55000" {
+		t.Fatalf("DELETE aggregate view USING: err=%v, want *planner.PlanError 55000", perr)
+	}
+}

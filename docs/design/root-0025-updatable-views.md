@@ -334,6 +334,68 @@ Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`
 `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
 `scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
 
+## Follow-up: `UPDATE ... FROM` / `DELETE ... USING` a view (closes deferred item 3)
+
+`planUpdate`/`planDelete` no longer special-case `len(s.From) > 0` /
+`len(s.Using) > 0` to an unconditional `viewNotUpdatableError` before even
+computing `viewAutoUpdatableChain` — the chain/`colMap`/`viewQual`/
+`resolveTbl` computation now runs unconditionally when the target is a view,
+and the FROM/USING cross-product branches reuse the same `resolveScope`
+(`resolveTbl` when the target was a view, else `tbl`) that the FROM/USING-free
+branches already used for `SET`/`WHERE`/`RETURNING` resolution. The view's own
+qual (`viewQual`, the AND of every chain level's `WHERE`, translated onto
+`base` by `viewChainQuals`) is ANDed into `FromPred`/`UsingPred` so the
+cross-product still only matches rows the view itself would expose — the same
+restriction the FROM/USING-free path already applies via a `Filter` wrapping
+the plain scan. `WITH CHECK OPTION` is likewise threaded through: the `Update`
+plan node built in the FROM branch now carries `ViewCheckQual`/`ViewCheckName`
+(previously only set in the FROM-free branch), and the executor's
+`updateWithFrom` (`internal/executor/operators_storage.go`) gained a
+`checkViewCheckOption` call at the same point the pending row's `parentNewRow`
+is finalized — gated to `fst.tbl == o.plan.Table` (the exact base relation),
+mirroring the identical restriction the FROM-free path's inheritance/partition
+branch already has (see deferred item 5 below: a CHECK OPTION view over a
+partitioned/inherited base still only enforces on the parent's own rows, not
+child-routed ones — unchanged, not fixed by this pass). `DELETE ... USING`
+needs no CHECK OPTION wiring — PostgreSQL never enforces it on DELETE.
+
+**A pre-existing, previously-untested bug this surfaced and fixed in the same
+pass:** `viewProxyTable`'s synthetic table keeps `base`'s own `Name` (needed
+so ordinal-keyed lookups elsewhere — e.g. partition routing — keep working),
+not the view's. Every DML form substituting `resolveTbl` in place of a view
+(`INSERT`/`UPDATE`/`DELETE`, FROM/USING or not) built its resolve-context
+binding with `s.Target.Alias` as the alias — which is empty whenever the
+statement gives the view no explicit `AS` alias. With no alias and a proxy
+table named after `base`, an unaliased qualified reference to the view by its
+*own* name (`UPDATE v SET x = 1 WHERE v.id = 1`, no `AS`) failed to resolve
+(`42703`) — the qualifier `v` matched neither the binding's empty alias nor
+the proxy's borrowed `base` name. This was latent and untested before this
+loop because no existing view-DML test qualified a column reference with the
+view's own name; `UPDATE ... FROM` / `DELETE ... USING` needed it to
+disambiguate the target from the FROM/USING relation(s) in the same query and
+so exposed it immediately. Fixed by a new `viewResolveAlias(explicit,
+viewName string) string` helper (`internal/planner/view_dml.go`): returns
+`explicit` when the statement supplied one, otherwise the view's own
+pre-rewrite name. Applied at all four `resolveTbl`-driven binding sites
+(`planInsert`'s `RETURNING` context, `planUpdate`'s FROM and FROM-free
+contexts, `planDelete`'s USING and USING-free contexts) — `INSERT`'s `ON
+CONFLICT` resolution is unaffected (documented residual, item 1's "Known
+residual" note: it already resolves directly against `base`, not through a
+proxy, so it was never subject to this bug either).
+
+New test `TestUpdatableViewUpdateFromDeleteUsing`
+(`internal/executor/view_dml_test.go`): `UPDATE ... FROM` and `DELETE ...
+USING` through a renamed-column, `WHERE`-qualified view rewrite onto `base`
+and leave rows outside the view's own qual untouched even when the FROM/USING
+table would otherwise match them; `WITH CHECK OPTION` still rejects (`44000`)
+an `UPDATE ... FROM` that would produce a row outside the view's qual; an
+aggregation view (outside the auto-updatable subset) still rejects both forms
+`55000`.
+
+Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`;
+`go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
+`scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
+
 ## Deferred
 
 See `.ralph/deferral_ledger.md` for the formal entry. Summary:
@@ -348,10 +410,12 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    above): `viewAutoUpdatableChain` recurses through a chain of simple
    updatable views, and CASCADED/LOCAL CHECK OPTION propagation now actually
    matters (previously moot, single-relation only).
-3. **`UPDATE ... FROM` / `DELETE ... USING` a view.** Rejected
-   unconditionally regardless of whether the base view would otherwise
-   qualify. Needs the view qual threaded through the cross-product path
-   (`FromPred`/`UsingPred`) instead of a plain `Filter`.
+3. ~~**`UPDATE ... FROM` / `DELETE ... USING` a view.**~~ — **RESOLVED** (see
+   the "Follow-up: `UPDATE ... FROM` / `DELETE ... USING` a view" note above):
+   the view qual is now threaded through the cross-product path
+   (`FromPred`/`UsingPred`), and `WITH CHECK OPTION` is enforced for
+   `UPDATE ... FROM` (restricted to the base relation's own rows, same as the
+   FROM-free path — see item 5).
 4. ~~**`updateViaIndex` residual-predicate gap**~~ — **RESOLVED** (see the
    "Follow-up" note above): `updateViaIndex` now evaluates `o.pred` on its
    initial scan, not just the EPQ recheck; the `planUpdate` workaround that

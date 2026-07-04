@@ -216,10 +216,44 @@ test ./internal/planner/... ./internal/executor/... ./internal/catalog/...
 ./internal/parser/... ./internal/server/...` PASS (new test:
 `TestUpdatableViewColumnSubsetReorderRename`, plus `TestNonUpdatableViewDMLRejected`
 updated since renaming is no longer rejected); `scripts/tpch-spotcheck.sh`
-PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** the
-`UPDATE...FROM`/`DELETE...USING` view item, the `ON CONFLICT`-against-
-renamed-view residual just noted, or continue the M0119-0004 pg_dump
-catalog-view parity battery / next unresolved DU-002 slice from the
+PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **This loop (2026-07-04)
+closed root-0025 deferred item 3:** `UPDATE ... FROM` / `DELETE ... USING`
+against a simple auto-updatable view no longer rejects unconditionally —
+`planUpdate`/`planDelete` compute `viewAutoUpdatableChain`/`viewQual`/
+`resolveTbl` unconditionally (removing the old early-return special case) and
+the FROM/USING cross-product branches reuse the same `resolveScope` the
+FROM/USING-free branches already used, ANDing `viewQual` into
+`FromPred`/`UsingPred` so the cross-product still only matches rows the view
+itself exposes. `WITH CHECK OPTION` is now threaded through too: the FROM
+branch's `Update` node carries `ViewCheckQual`/`ViewCheckName`, and
+`updateWithFrom` (`internal/executor/operators_storage.go`) gained a
+`checkViewCheckOption` call gated to the exact base relation (matching the
+FROM-free path's own partition/inheritance-child exclusion — deferred item 5
+unchanged). Along the way, found and fixed a previously-untested latent bug
+across ALL view-DML forms (not just this one): `viewProxyTable`'s synthetic
+table keeps `base`'s own name, so an unaliased qualified reference to the
+view by its own name (`UPDATE v SET x=1 WHERE v.id=1`, no `AS`) failed
+`42703` — the qualifier matched neither the empty alias nor the proxy's
+borrowed base name. `UPDATE...FROM`/`DELETE...USING` needed this to
+disambiguate the target from the FROM/USING relation(s), which is what
+surfaced it. Fixed via new `viewResolveAlias(explicit, viewName string)
+string` (`internal/planner/view_dml.go`), applied at all four
+`resolveTbl`-driven binding sites (`planInsert`'s RETURNING context,
+`planUpdate`'s FROM/FROM-free contexts, `planDelete`'s USING/USING-free
+contexts). New test `TestUpdatableViewUpdateFromDeleteUsing`
+(`internal/executor/view_dml_test.go`). Design doc `root-0025-updatable-
+views.md` new "Follow-up: `UPDATE ... FROM` / `DELETE ... USING` a view"
+section; `docs/design/README.md` row updated; ledger row appended.
+**Root-0025 deferred items are now: (5) CHECK OPTION on partition/
+inheritance-child-routed rows, and the narrower `ON CONFLICT`-against-
+renamed-view residual (item 1's "Known residual") — everything else in the
+milestone is closed.** Gates: `go build ./...` clean; `go vet` clean on
+touched packages; `go test ./internal/planner/... ./internal/executor/...
+./internal/catalog/... ./internal/parser/... ./internal/server/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook. **Next
+up:** CHECK OPTION on partition/inheritance-child-routed rows (item 5), the
+`ON CONFLICT`-against-renamed-view residual, or continue the M0119-0004
+pg_dump catalog-view parity battery / next unresolved DU-002 slice from the
 deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)

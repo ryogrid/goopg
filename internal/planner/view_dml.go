@@ -237,6 +237,21 @@ func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, 
 	return resolveExpr(tbl.View.Where, ctx)
 }
 
+// viewResolveAlias picks the alias a DML statement's resolveContext binding
+// should use when substituting resolveTbl (viewProxyTable) in place of a
+// view target: the statement's own explicit alias when given, otherwise the
+// view's own name. resolveTbl's Name field is always the physical base
+// relation's name (ordinal-based lookups elsewhere — e.g. partition
+// routing — key off it), never the view's, so without this an unaliased
+// qualified reference to the view itself (`UPDATE v SET ... WHERE v.col =
+// ...`) would fail to resolve against the substituted binding.
+func viewResolveAlias(explicit, viewName string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return viewName
+}
+
 // andExpr combines two possibly-nil boolean Exprs with AND, returning
 // whichever side is non-nil when the other is absent.
 func andExpr(pos int, left, right Expr) Expr {

@@ -7194,6 +7194,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	var viewCheckName string
 	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
 	var outerColMap []int         // view's own column ordinal -> base ordinal, only when resolveTbl != nil
+	viewName := tbl.Name
 	if tbl.View != nil {
 		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
@@ -7332,7 +7333,11 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		if resolveTbl != nil {
 			retTbl = resolveTbl
 		}
-		retCtx := singleBindingContext(retTbl, s.Target.Alias)
+		retAlias := s.Target.Alias
+		if resolveTbl != nil {
+			retAlias = viewResolveAlias(s.Target.Alias, viewName)
+		}
+		retCtx := singleBindingContext(retTbl, retAlias)
 		retCtx.cat = cat
 		// When this INSERT has ON CONFLICT DO UPDATE, add `excluded` to the
 		// RETURNING scope as notReferenceable. This lets resolveColumnRefAt
@@ -7732,17 +7737,18 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
 	// UPDATE against a view: rewrite onto the auto-updatable base relation,
-	// same restriction as planInsert. UPDATE … FROM a view stays rejected
-	// unconditionally (out of scope — see docs/design/root-0025-updatable-views.md)
-	// rather than threading the view qual through the cross-product path.
+	// same restriction as planInsert. UPDATE … FROM a view is allowed for the
+	// same auto-updatable subset (root-0025 deferred item 3): resolveTbl's
+	// column-name proxy lets SET/WHERE/RETURNING resolve the view's own
+	// vocabulary, and the view's own qual (viewQual) is ANDed into FromPred
+	// so the cross-product path still restricts to rows the view itself
+	// exposes.
 	var viewQual Expr
 	var viewCheckQual Expr
 	var viewCheckName string
 	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
+	viewName := tbl.Name
 	if tbl.View != nil {
-		if len(s.From) > 0 {
-			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
-		}
 		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
@@ -7759,6 +7765,12 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), colMaps[0])
 		tbl = base
 	}
+	resolveScope := tbl
+	targetAlias := s.Target.Alias
+	if resolveTbl != nil {
+		resolveScope = resolveTbl
+		targetAlias = viewResolveAlias(s.Target.Alias, viewName)
+	}
 
 	// Build resolve context.  When UPDATE … FROM is present, the FROM tables
 	// are appended as additional bindings so that SET and WHERE expressions can
@@ -7768,9 +7780,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	var fromSchema Schema
 	if len(s.From) > 0 {
 		bindings := []rangeBinding{
-			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+			{table: resolveScope, alias: targetAlias, offset: 0, sourceIdx: 1},
 		}
-		sch := tableSchemaWithSource(tbl, 1)
+		sch := tableSchemaWithSource(resolveScope, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.From {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
@@ -7816,17 +7828,21 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		}
 		set := make([]Expr, len(tbl.Columns))
 		for _, a := range s.Set {
-			if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
+			if err := applyUpdateAssign(a, resolveScope, set, ctx, cat); err != nil {
 				return nil, err
 			}
 		}
 		// The target scan has NO filter; the executor does the nested-loop
 		// cross-product and applies FromPred against the combined row. M0097-0065.
-		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		// FromPred also carries the view's own qual (viewQual) when the
+		// target is a view, restricting the cross-product to rows the view
+		// itself would expose (root-0025 deferred item 3).
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		upd := &Update{
 			pos: s.Pos(), Table: tbl, Child: tgtScan, Set: set,
 			FromTables: fromTables, FromScans: fromScans, FromSchema: fromSchema,
-			FromPred: pred,
+			FromPred:      andExpr(s.Pos(), viewQual, pred),
+			ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName,
 		}
 		if len(s.Returning) > 0 {
 			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
@@ -7839,11 +7855,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
-	resolveScope := tbl
-	if resolveTbl != nil {
-		resolveScope = resolveTbl
-	}
-	ctx := singleBindingContext(resolveScope, s.Target.Alias)
+	ctx := singleBindingContext(resolveScope, targetAlias)
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
@@ -7906,17 +7918,16 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
 	// DELETE against a view: rewrite onto the auto-updatable base relation,
-	// same restriction as planInsert/planUpdate. DELETE … USING a view stays
-	// rejected unconditionally, same rationale as UPDATE … FROM. CHECK
+	// same restriction as planInsert/planUpdate. DELETE … USING a view is
+	// allowed for the same auto-updatable subset (root-0025 deferred item 3),
+	// mirroring UPDATE … FROM: viewQual is ANDed into UsingPred. CHECK
 	// OPTION does not apply to DELETE (PostgreSQL only enforces it on
 	// INSERT/UPDATE — the row is leaving the view's underlying storage, not
 	// being written into it).
 	var viewQual Expr
 	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
+	viewName := tbl.Name
 	if tbl.View != nil {
-		if len(s.Using) > 0 {
-			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
-		}
 		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
@@ -7929,6 +7940,12 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), colMaps[0])
 		tbl = base
 	}
+	resolveScope := tbl
+	targetAlias := s.Target.Alias
+	if resolveTbl != nil {
+		resolveScope = resolveTbl
+		targetAlias = viewResolveAlias(s.Target.Alias, viewName)
+	}
 
 	// DELETE … USING (M0097-0076): build a combined resolve context
 	// over the target plus all USING tables so that WHERE and
@@ -7939,9 +7956,9 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		var usingScans []Node
 		var usingSchema Schema
 		bindings := []rangeBinding{
-			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+			{table: resolveScope, alias: targetAlias, offset: 0, sourceIdx: 1},
 		}
-		sch := tableSchemaWithSource(tbl, 1)
+		sch := tableSchemaWithSource(resolveScope, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.Using {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
@@ -7980,11 +7997,15 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 		}
-		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		// The target scan has NO filter; the executor does the nested-loop
+		// cross-product and applies UsingPred against the combined row.
+		// UsingPred also carries the view's own qual (viewQual) when the
+		// target is a view (root-0025 deferred item 3).
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		del := &Delete{
 			pos: s.Pos(), Table: tbl, Child: tgtScan,
 			UsingTables: usingTables, UsingScans: usingScans, UsingSchema: usingSchema,
-			UsingPred: pred,
+			UsingPred: andExpr(s.Pos(), viewQual, pred),
 		}
 		if len(s.Returning) > 0 {
 			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
@@ -7997,11 +8018,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(del, dmlPlans), nil
 	}
 
-	resolveScope := tbl
-	if resolveTbl != nil {
-		resolveScope = resolveTbl
-	}
-	ctx := singleBindingContext(resolveScope, s.Target.Alias)
+	ctx := singleBindingContext(resolveScope, targetAlias)
 	// When an explicit alias is set, using the original table name in WHERE
 	// must produce the PostgreSQL-specific error. M0097-0003.
 	if s.Target.Alias != "" {
