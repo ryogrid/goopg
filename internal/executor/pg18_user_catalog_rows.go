@@ -1356,7 +1356,7 @@ func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
 		NewIntDatum(int64(et.OID)),                     // oid
 		NewStringDatum(et.Name),                        // typname (name type)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(et.OwnerOrDefault())),        // typowner
 		NewIntDatum(4),                                 // typlen (enum = 4 bytes, like oid)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("e"),                            // typtype = 'e' (enum)
@@ -1403,7 +1403,7 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewIntDatum(int64(et.ArrayOID)),                // oid
 		NewStringDatum("_" + et.Name),                  // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(et.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                // typlen (varlena array)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("b"),                            // typtype = 'b' (base)
@@ -1447,7 +1447,7 @@ func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
 		NewIntDatum(int64(ct.OID)),                     // oid
 		NewStringDatum(ct.Name),                        // typname (name type)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(ct.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                // typlen (varlena composite)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("c"),                            // typtype = 'c' (composite)
@@ -1487,7 +1487,7 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewIntDatum(int64(ct.ArrayOID)),                // oid
 		NewStringDatum("_" + ct.Name),                  // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(ct.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                // typlen (varlena array)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("b"),                            // typtype = 'b' (base)

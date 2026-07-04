@@ -2645,6 +2645,20 @@ type EnumType struct {
 	// `public.mood[]` rather than `text[]`. DU-002 slice 89.
 	ArrayOID uint32
 	Values   []EnumValue // ordered by SortOrder; each element stores its own sortorder
+	// Owner is the typowner role OID, settable via `ALTER TYPE ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
+	Owner uint32
+}
+
+// OwnerOrDefault returns et.Owner, falling back to the bootstrap superuser OID
+// (10) for enum types that never had OWNER TO applied. Mirrors
+// StatisticsObject.OwnerOrDefault.
+func (et *EnumType) OwnerOrDefault() uint32 {
+	if et.Owner == 0 {
+		return 10
+	}
+	return et.Owner
 }
 
 // Domain holds one user-defined domain type. M0097-0017.
@@ -2756,6 +2770,20 @@ type CompositeType struct {
 	ArrayOID uint32           // OID of the auto-generated `_name` array type
 	RelOID   uint32           // pg_class.oid of the implicit relation (relkind='c')
 	Fields   []CompositeField // ordered field list
+	// Owner is the typowner role OID, settable via `ALTER TYPE ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
+	Owner uint32
+}
+
+// OwnerOrDefault returns ct.Owner, falling back to the bootstrap superuser OID
+// (10) for composite types that never had OWNER TO applied. Mirrors
+// StatisticsObject.OwnerOrDefault.
+func (ct *CompositeType) OwnerOrDefault() uint32 {
+	if ct.Owner == 0 {
+		return 10
+	}
+	return ct.Owner
 }
 
 // RangeType describes a user-defined range type created via
@@ -16273,6 +16301,63 @@ func (c *InMemory) RenameEnum(oldName, newName string) error {
 	et.Name = nk
 	c.enumTypes[nk] = et
 	return nil
+}
+
+// SetEnumOwner records the typowner role OID for an existing enum type.
+// Returns false if no such enum is registered. Mirrors SetCollationOwner.
+// M0122-0005 (m0097-0017 follow-up).
+func (c *InMemory) SetEnumOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.enumTypes[k]
+	if !ok {
+		return false
+	}
+	et.Owner = ownerOID
+	return true
+}
+
+// RenameCompositeType renames a composite type from oldName to newName,
+// mirroring RenameEnum. M0122-0005 (m0097-0017 follow-up): ALTER TYPE ...
+// RENAME TO previously always called RenameEnum regardless of the target
+// type's kind, so renaming a composite type raised a spurious "type does not
+// exist" (42710) instead of renaming it.
+func (c *InMemory) RenameCompositeType(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ct, found := c.compositeTypes[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.compositeTypes[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.compositeTypes, ok)
+	delete(c.compositeTypeNames, ok)
+	delete(c.compositeTypeFields, ok)
+	ct.Name = nk
+	c.compositeTypes[nk] = ct
+	c.compositeTypeNames[nk] = true
+	c.compositeTypeFields[nk] = ct.Fields
+	return nil
+}
+
+// SetCompositeTypeOwner records the typowner role OID for an existing
+// composite type. Returns false if no such composite type is registered.
+// Mirrors SetEnumOwner. M0122-0005 (m0097-0017 follow-up).
+func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ct, ok := c.compositeTypes[k]
+	if !ok {
+		return false
+	}
+	ct.Owner = ownerOID
+	return true
 }
 
 // AddEnumValue appends a new label to an existing enum. before/after are

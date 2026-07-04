@@ -1988,6 +1988,7 @@
    "feature": "ALTER TYPE RENAME and OWNER operations are no-ops; type names and ownership cannot be modified.",
    "task_id": "m0097-0017",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "RENAME/OWNER no-ops"
    ],
@@ -2002,7 +2003,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: operators_ddl.go:16198 ALTER TYPE OWNER TO returns nil—is no-op"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, docs/design/0122-0005-alter-type-owner-rename.md): ALTER TYPE ... OWNER TO now parses the target role (AlterTypeStmt.NewOwner, internal/parser/ddl.go) and the executor (execAlterType, internal/executor/operators_ddl.go) resolves it via cat.RoleOID and calls new SetEnumOwner/SetCompositeTypeOwner (internal/catalog/catalog.go), raising 42704 for an unknown type or role instead of silently no-op'ing. ALTER TYPE <composite> RENAME TO was ALSO found to be silently BROKEN (not just absent): it unconditionally called RenameEnum regardless of type kind, raising a spurious 42710 for a composite type; now dispatches by kind via a new RenameCompositeType. New EnumType.Owner/CompositeType.Owner + OwnerOrDefault() (mirrors StatisticsObject); pg_type typowner rendering for enum/composite base+array rows reads it instead of a hardcoded bootstrapSuperuserOID. Tests: TestAlterTypeOwnerToParsing (parser), TestAlterTypeOwnerTo/TestAlterTypeRenameToComposite (executor). Deferred (see ledger): restart persistence of Owner (enum/composite CREATE TYPE itself has no WAL/heap-reload durability path yet, independent of this change), and range/multirange/domain typowner (ALTER TYPE never routes ownership changes to those kinds today)."
   },
   {
    "feature": "regexp_matches() function is a set-returning function stub that returns NULL instead of match results.",

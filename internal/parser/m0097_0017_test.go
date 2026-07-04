@@ -400,6 +400,42 @@ func TestAlterTypeMultiSubcommandParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeOwnerToParsing covers the m0097-0017 follow-up (M0122-0005):
+// ALTER TYPE ... OWNER TO role previously fell into the final catch-all stub
+// (consumed, no AST field), so the executor could never see the target
+// owner. NewOwner captures the role name, or the "current_user" sentinel for
+// CURRENT_USER/SESSION_USER/CURRENT_ROLE, mirroring AlterCollationStmt.
+func TestAlterTypeOwnerToParsing(t *testing.T) {
+	tests := []struct {
+		sql      string
+		wantName string
+		wantOwn  string
+	}{
+		{`ALTER TYPE addr OWNER TO alice`, "addr", "alice"},
+		{`ALTER TYPE addr OWNER TO CURRENT_USER`, "addr", "current_user"},
+		{`ALTER TYPE addr OWNER TO SESSION_USER`, "addr", "current_user"},
+		{`ALTER TYPE addr OWNER TO CURRENT_ROLE`, "addr", "current_user"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql, func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			at, ok := stmts[0].(*parser.AlterTypeStmt)
+			if !ok {
+				t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+			}
+			if at.Name != tc.wantName || at.NewOwner != tc.wantOwn {
+				t.Errorf("got {Name: %q, NewOwner: %q}, want {%q, %q}", at.Name, at.NewOwner, tc.wantName, tc.wantOwn)
+			}
+			if at.RenameTo != "" {
+				t.Errorf("RenameTo = %q, want empty (must not take the RENAME TO branch)", at.RenameTo)
+			}
+		})
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

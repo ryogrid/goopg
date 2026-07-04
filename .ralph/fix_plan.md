@@ -504,6 +504,14 @@ mirroring M0119's ledger `status` column.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
+      **ALTER TYPE RENAME/OWNER landed (2026-07-05, this loop, m0097-0017):**
+      `OWNER TO` now works for enum + composite types; also fixed a separate bug
+      where composite `RENAME TO` raised a spurious 42710 (unconditionally called
+      the enum-only rename). Design `docs/design/0122-0005-alter-type-owner-rename.md`.
+      Deferred: restart persistence of the new owner field, range/domain typowner
+      (ledger row, same date). **Still open in this bucket:** 1-byte `char`
+      disambiguation, `pg_collation_for`, function-based cast dumping, domain CHECK
+      renderer, `pg_ts_config` OIDs.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
       restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.

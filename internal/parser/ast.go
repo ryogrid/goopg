@@ -3344,6 +3344,11 @@ type AlterTypeStmt struct {
 	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
 	RenameNewValue string // RENAME VALUE: replacement label
 	RenameTo       string // RENAME TO: new type name (M0097-enum-rename)
+	// NewOwner holds the target role name for ALTER TYPE ... OWNER TO role
+	// (empty when not an OWNER TO statement). "current_user" is the sentinel
+	// for CURRENT_USER/SESSION_USER/CURRENT_ROLE, mirroring
+	// AlterCollationStmt.NewOwner. M0122-0005 (m0097-0017 follow-up).
+	NewOwner string
 	// ADD ATTRIBUTE col_name type — appends a field to a composite type.
 	// DU-002 slice 253.
 	AddAttrName string // new composite-type attribute name (empty when not ADD ATTRIBUTE)

@@ -17256,6 +17256,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType, Collation: f.Collation}
 			}
 			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			ct.Owner = o.currentDDLOwnerOID()
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
 			// composite type is visible to pg_dump's getTypes and catalog
 			// queries. DU-002 slice 242.
@@ -17275,6 +17276,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 		} else {
 			cat.RegisterCompositeType(s.Name)
+			if ct := cat.LookupCompositeType(s.Name); ct != nil {
+				ct.Owner = o.currentDDLOwnerOID()
+			}
 		}
 		return nil
 	}
@@ -17282,6 +17286,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	et.Owner = o.currentDDLOwnerOID()
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
 	// returns a match for the new type. M0097-0022.
 	syncEnumTypeToCatalogHeap(o.ctx, et)
@@ -17496,8 +17501,19 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 	}
-	// RENAME TO new_name — rename the enum type. Track for ROLLBACK.  M0097-0022.
+	// RENAME TO new_name — rename the type. Track enum renames for ROLLBACK.
+	// M0097-0022. Dispatched by type kind: a composite type's Name is only
+	// registered in cat.compositeTypes, not cat.enumTypes, so unconditionally
+	// calling RenameEnum previously raised a spurious "type does not exist"
+	// (42710) for `ALTER TYPE <composite> RENAME TO ...`. M0122-0005
+	// (m0097-0017 follow-up).
 	if s.RenameTo != "" {
+		if cat.LookupCompositeType(s.Name) != nil {
+			if err := cat.RenameCompositeType(s.Name, s.RenameTo); err != nil {
+				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+			}
+			return nil
+		}
 		err := cat.RenameEnum(s.Name, s.RenameTo)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -17517,8 +17533,29 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		return nil
 	}
+	// OWNER TO role — update typowner on the enum or composite type. Was
+	// previously a complete no-op regardless of whether the target type
+	// existed. M0122-0005 (m0097-0017 follow-up).
+	if s.NewOwner != "" {
+		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterCollation's default
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := cat.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if cat.LookupCompositeType(s.Name) != nil {
+			cat.SetCompositeTypeOwner(s.Name, ownerOID)
+			return nil
+		}
+		if !cat.SetEnumOwner(s.Name, ownerOID) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	}
 	if s.AddValue == "" {
-		return nil // OWNER TO — no-op
+		return nil // unmodelled ALTER TYPE variant — no-op
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
 	if err == nil {

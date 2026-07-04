@@ -8965,7 +8965,26 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// Any other ALTER TYPE variant (OWNER TO, etc.) — consume as stub.
+	// OWNER TO role — capture the new owner so the executor can update
+	// typowner instead of silently no-op'ing. M0122-0005 (m0097-0017
+	// follow-up). CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+	// bootstrap superuser sentinel, mirroring ALTER COLLATION ... OWNER TO.
+	if p.acceptIdentKeyword("owner") {
+		if _, err := p.expectKeyword(KwTo); err != nil {
+			return nil, err
+		}
+		if p.acceptIdentKeyword("current_user") ||
+			p.acceptIdentKeyword("session_user") ||
+			p.acceptIdentKeyword("current_role") {
+			stmt.NewOwner = "current_user"
+		} else if tok, err := p.parseIdent(); err == nil {
+			stmt.NewOwner = identText(tok)
+		} else {
+			stmt.NewOwner = "current_user"
+		}
+		return stmt, nil
+	}
+	// Any other ALTER TYPE variant — consume as stub.
 	for p.cur().Kind != TokenEOF {
 		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 			break
