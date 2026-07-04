@@ -1,59 +1,40 @@
-Task: M0110-0001 (DU-002 slice 445 follow-up) — ALTER STATISTICS RENAME
-TO/OWNER TO/SET SCHEMA WAL/restart persistence, closing resume point (1) of
-the slice-441/445 ledger rows (the last open item on the statistics
-restart-durability thread).
+(idle — nothing in flight)
 
-Files touched (implementation complete, NOT yet committed):
-internal/wal/statistics_ddl.go (+test) — new RecordKindAlterStatisticsRename/
-Owner/SetSchema (kinds 97/98/99) + Encode/Decode pairs;
-internal/wal/recovery.go — added a combined no-op case for
-RecordKindCreateStatistics/DropStatistics/AlterStatisticsRename/Owner/
-SetSchema in wal.ApplyRecord's physical-replay switch (this was ALSO missing
-for the pre-existing 95/96 kinds from last loop — a real gap for standby
-streaming replication via stream_replayer.go, found and fixed in this same
-loop, not a separate slice);
-internal/catalog/catalog.go — RenameStatisticsObjectDuringRecovery/
-SetStatisticsOwnerDuringRecovery/SetStatisticsSchemaDuringRecovery;
-internal/initdb/statistics_ddl_recovery.go (+test) — statisticsRegistryRecovery
-interface + replayStatisticsDDLRecords gain the 3 new cases;
-internal/executor/operators_ddl.go — execAlterStatistics's three Action
-cases now WAL-append after each in-memory mutation;
-docs/design/0110-0001-pg-dump-tap-port.md "loop #97" section;
-docs/design/README.md index entry appended (loop #96 was also missing an
-index entry — added both #96 and #97 in this loop);
-.ralph/deferral_ledger.md — slice-441 row flipped `resolved`, slice-445 row
-flipped `resolved`, new `resolved` row appended for this loop's closure;
-.ralph/fix_plan.md — new [x] entry + Current Priority banner updated.
+Loop #9 closed out the M0110-0001 DU-002 slice-445-follow-up work that was
+already implemented (but uncommitted) at loop start: ALTER STATISTICS
+RENAME TO/OWNER TO/SET SCHEMA WAL persistence (kinds 97/98/99) + a
+physical-replay gap fix for kinds 95-99 in wal.ApplyRecord (standby
+streaming-replication path). This loop's own work was verification-only:
+ran `scripts/tpch-spotcheck.sh` (PASS, Q12=2/Q13=33), committed
+(`9f1f6bc5`), which triggered the pre-commit pgbench smoke hook (PASS, 3/3
+workloads, 0 failed txns), pushed to
+`origin/align-data-structure-with-pg`, and ran `make ralph-state-guard`
+(self-repaired the same benign status/progress marker mismatch seen every
+loop; clean after).
 
-Key symbols: execAlterStatistics, replayStatisticsDDLRecords,
-wal.ApplyRecord (the collation-case switch block ~line 6419 in recovery.go),
-EncodeAlterStatisticsRename/Owner/SetSchema.
+Next candidate task (NOT started — pick this up fresh next loop): plain
+`ALTER SCHEMA name RENAME TO newname` / `ALTER SCHEMA name OWNER TO role`
+— the last open resume point ((3) of the slice-440 deferral_ledger.md row,
+line ~434) in the DU-002 ALTER-form audit thread. Unlike ALTER
+SEQUENCE/VIEW (slices 439/440, both fixed by reusing `AlterTableStmt`/
+execAlterTable), goopg has NO `RenameSchema`/schema-owner-change mechanism
+anywhere in `internal/catalog` — needs new catalog support: rekey the
+`catalog.Schema` registry entry AND re-point every contained table's
+`.Schema` field on rename. Resume point per the ledger: grep
+`type.*Schema.*struct` in internal/catalog/catalog.go, add a
+`RenameSchema(old, new string) error` + owner field, wire a new
+`parseAlter` case in internal/parser/ddl.go (currently swallowed by the
+generic schema/view/collation/... catch-all).
 
-Gates run so far: go build ./... clean. Targeted new tests all PASS:
-`go test ./internal/wal/... -run Statistics` (10/10),
-`go test ./internal/initdb/... -run Statistics` (6/6, incl. new
-TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema),
-`go test ./internal/executor/... -run Statistics` (2/2, pre-existing
-TestAlterStatisticsRenameOwnerSetSchema still passes unchanged).
+Other still-open, smaller resume points from the same thread (lower
+priority than ALTER SCHEMA, pick whichever is cheaper if ALTER SCHEMA
+proves too large for one loop):
+- slice-439 resume (2): execAlterTable's OWNER TO branch (shared by ALTER
+  TABLE/SCHEMA/SEQUENCE) never validates the role exists — add a
+  role-existence lookup raising PG's `role "..." does not exist`.
+- slice-434 (DU-002): COMMENT ON a nonexistent object across ~20 object
+  kinds is a silent no-op instead of PG's 42704 (systemic, was explicitly
+  scoped OUT of slice 436 which only fixed the object-kind lookup for
+  access method).
 
-Gates run and PASS (this loop, all fresh): `go build ./...` clean; full
-`go test ./internal/wal/... ./internal/catalog/... ./internal/executor/...
-./internal/initdb/... ./internal/parser/...` (initdb 336s uncached, rest
-cached/fast) all PASS; `go test -race ./internal/wal/... ./internal/mvcc/...`
-PASS (also re-ran `-race -count=1 -run Statistics` across
-wal+mvcc+initdb+executor specifically); `make ralph-state-guard` self-repaired
-the recurring benign status/progress mismatch (same pattern every loop),
-clean after. `gofmt -l` flags 3 pre-existing-drift files
-(statistics_ddl_test.go/catalog.go/operators_ddl.go) — diffed each against
-gofmt output and confirmed via `git diff` that every flagged hunk is in
-UNRELATED pre-existing lines far from this loop's additions (go1.25-vs-
-go1.26.3 mismatch per standing memory); left untouched.
-
-Gates NOT yet run (launched in background, awaiting completion):
-`scripts/tpch-spotcheck.sh` (background task bmj4mzgl1). Still needed after
-that: pgbench smoke (pre-commit hook path, `.githooks/pre-commit`).
-
-Next step: check the tpch-spotcheck background result (expect Q12=2/Q13=33);
-if PASS, run the pgbench smoke, then commit (implementation is complete and
-self-contained — do NOT re-implement, only verification gates remain) and
-push to origin/align-data-structure-with-pg.
+No implementation started on any of these yet — next loop should pick ONE.
