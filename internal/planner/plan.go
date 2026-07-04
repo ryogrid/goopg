@@ -1252,6 +1252,16 @@ type Insert struct {
 	OnConflict      *OnConflictPlan
 	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
 	ReturningSchema Schema // output schema when Returning is non-nil
+
+	// ViewCheckQual/ViewCheckName are set when this INSERT's original target
+	// was a `WITH CHECK OPTION` view that was rewritten onto Table (its
+	// auto-updatable base relation, see viewAutoUpdatableBase). The executor
+	// evaluates ViewCheckQual against each finalized row and raises 44000
+	// ("new row violates check option for view") when it isn't true — mirrors
+	// execMain.c's WCO_VIEW_CHECK. nil when the target wasn't a CHECK OPTION
+	// view. M0119-0004 slice-365 follow-up.
+	ViewCheckQual Expr
+	ViewCheckName string
 }
 
 func (n *Insert) Pos() int       { return n.pos }
@@ -1430,6 +1440,11 @@ type Update struct {
 	FromScans  []Node // one per FROM table (may be SeqScan or subquery node)
 	FromSchema Schema // combined schema of all FROM tables
 	FromPred   Expr   // WHERE predicate over combined row (nil = no filter)
+
+	// ViewCheckQual/ViewCheckName — see Insert.ViewCheckQual. Evaluated
+	// against the post-SET row before it is written back.
+	ViewCheckQual Expr
+	ViewCheckName string
 }
 
 func (n *Update) Pos() int       { return n.pos }

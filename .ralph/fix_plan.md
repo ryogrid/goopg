@@ -171,10 +171,35 @@ a PG-timestamp-literal parser, out of scope; ledger row appended. Design doc
 `docs/design/README.md`'s root-0021 row updated. Gates: `go build ./...`
 clean; `go vet` clean on touched packages; `internal/server`/`internal/
 catalog`/`internal/initdb`/`internal/executor` suites PASS; `go test -race
-./internal/wal/...` PASS. **Next up:** continue the M0119-0004 pg_dump
-catalog-view parity battery, item 2 from loop #107's shortlist (view `WITH
-CHECK OPTION` never enforced at runtime), or pick the next unresolved DU-002
-slice from the deferral ledger.
+./internal/wal/...` PASS.
+
+**Loop #109 (2026-07-04) closed item 2 from loop #107's shortlist** (view
+`WITH CHECK OPTION` never enforced at runtime) — and along the way found the
+gap was bigger than the deferral ledger's slice-365 note assumed: `planInsert`/
+`planUpdate`/`planDelete` never checked `catalog.Table.View` at all, so DML
+against ANY view (not just CHECK OPTION ones) silently wrote/matched against
+the view's own nonexistent-heap OID and reported success while doing nothing.
+Fixed for a restricted "simple passthrough" auto-updatable subset (single base
+relation, no joins/aggregation/set-ops, unrenamed in-order full column list):
+`viewAutoUpdatableBase` (`internal/planner/view_dml.go`) rewrites eligible
+INSERT/UPDATE/DELETE onto the base table, else rejects `55000` (PG's
+`error_view_not_updatable`); `WITH CHECK OPTION` raises `44000`
+(`checkViewCheckOption`, `internal/executor/operators_fk.go`) against the
+finalized row. Surfaced and fixed a latent, view-independent bug too:
+`updateOp.updateViaIndex`'s initial B-tree scan never evaluates `o.pred` (only
+its EPQ-recheck path does), silently dropping a `Filter`-wrapped `IndexScan`'s
+residual predicate on the uncontended path — `planUpdate` now skips the index
+fast-path when a view qual is present. Tests: `internal/executor/
+view_dml_test.go` (5 tests). Design doc `docs/design/root-0025-updatable-
+views.md`; `docs/design/README.md` indexed. Deferred (ledger row appended):
+column subset/reorder/rename views, view-of-view chaining, `UPDATE...FROM`/
+`DELETE...USING` a view, CHECK OPTION on partition/inheritance-child-routed
+rows, and the general `updateViaIndex` residual-predicate gap. Gates: `go
+build ./...` clean; `go test ./internal/planner/... ./internal/executor/...
+./internal/parser/... ./internal/catalog/... ./internal/server/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke = pre-commit
+hook. **Next up:** continue the M0119-0004 pg_dump catalog-view parity
+battery, or pick the next unresolved DU-002 slice from the deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

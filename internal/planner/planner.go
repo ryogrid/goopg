@@ -7183,6 +7183,30 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			Message: fmt.Sprintf("relation %q does not exist", s.Target.Name),
 		}
 	}
+	// INSERT into a view: rewrite onto the view's auto-updatable base
+	// relation when the defining query is a simple single-table passthrough
+	// (viewAutoUpdatableBase); anything requiring INSTEAD OF trigger/rule
+	// machinery goopg doesn't have stays rejected with 55000, matching
+	// PostgreSQL's error_view_not_updatable. From here on `tbl` is always a
+	// real heap relation, so the rest of this function needs no other view
+	// awareness. M0119-0004 slice-365 follow-up (WITH CHECK OPTION).
+	var viewCheckQual Expr
+	var viewCheckName string
+	if tbl.View != nil {
+		base, autoOK := viewAutoUpdatableBase(tbl, cat)
+		if !autoOK {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdInsert)
+		}
+		if tbl.CheckOption != "" {
+			q, qerr := viewQualOnBase(tbl, base, cat)
+			if qerr != nil {
+				return nil, qerr
+			}
+			viewCheckQual = q
+			viewCheckName = tbl.Name
+		}
+		tbl = base
+	}
 	// Map source-row column index -> target table column ordinal.
 	// Generated columns are excluded from the mapping when no explicit
 	// column list is provided — they are computed by the executor. M0096-0008.
@@ -7277,7 +7301,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 		source = &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
 	}
-	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex}
+	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if s.OnConflict != nil {
 		oc, err := planOnConflict(s.OnConflict, tbl, s.Target.Alias, cat)
 		if err != nil {
@@ -7685,6 +7709,32 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
+	// UPDATE against a view: rewrite onto the auto-updatable base relation,
+	// same restriction as planInsert. UPDATE … FROM a view stays rejected
+	// unconditionally (out of scope — see docs/design/root-0025-updatable-views.md)
+	// rather than threading the view qual through the cross-product path.
+	var viewQual Expr
+	var viewCheckQual Expr
+	var viewCheckName string
+	if tbl.View != nil {
+		if len(s.From) > 0 {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
+		}
+		base, autoOK := viewAutoUpdatableBase(tbl, cat)
+		if !autoOK {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
+		}
+		q, qerr := viewQualOnBase(tbl, base, cat)
+		if qerr != nil {
+			return nil, qerr
+		}
+		viewQual = q
+		if tbl.CheckOption != "" {
+			viewCheckQual = q
+			viewCheckName = tbl.Name
+		}
+		tbl = base
+	}
 
 	// Build resolve context.  When UPDATE … FROM is present, the FROM tables
 	// are appended as additional bindings so that SET and WHERE expressions can
@@ -7773,17 +7823,39 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		// for `WHERE indexed_col = key` shapes. Mirrors planSelect's
 		// `if idxNode, ok, err := planIndexScanFromWhere(...)` arm.
 		// Falls through to Filter(SeqScan) on no index match.
-		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
-			return nil, err
-		} else if ok {
-			node = idxNode
+		//
+		// Skipped entirely when viewQual is set: updateViaIndex
+		// (operators_storage.go) only evaluates the index's own equality
+		// key on its initial scan pass — any *additional* AND'd predicate
+		// (the view's own WHERE qual) is silently unenforced there except
+		// during an EPQ concurrent-update recheck. Forcing the plain
+		// SeqScan+Filter path guarantees viewQual is actually evaluated
+		// (scanMatching always applies o.pred). Sacrifices the O(log n)
+		// index probe for view-target UPDATE; correctness over speed.
+		if viewQual == nil {
+			if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+				return nil, err
+			} else if ok {
+				node = idxNode
+			} else {
+				pred, err := resolveExpr(s.Where, ctx)
+				if err != nil {
+					return nil, err
+				}
+				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			}
 		} else {
 			pred, err := resolveExpr(s.Where, ctx)
 			if err != nil {
 				return nil, err
 			}
-			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: andExpr(s.Where.Pos(), viewQual, pred)}
 		}
+	} else if viewQual != nil {
+		// Restrict candidate rows to those visible through the view — PG
+		// only lets UPDATE [through a view] touch rows its own WHERE
+		// qual would include.
+		node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
 	}
 	set := make([]Expr, len(tbl.Columns))
 	for _, a := range s.Set {
@@ -7791,7 +7863,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		}
 	}
-	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}
+	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if len(s.Returning) > 0 {
 		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
 		if err != nil {
@@ -7812,6 +7884,28 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: s.Target.Schema, Name: s.Target.Name})
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
+	}
+	// DELETE against a view: rewrite onto the auto-updatable base relation,
+	// same restriction as planInsert/planUpdate. DELETE … USING a view stays
+	// rejected unconditionally, same rationale as UPDATE … FROM. CHECK
+	// OPTION does not apply to DELETE (PostgreSQL only enforces it on
+	// INSERT/UPDATE — the row is leaving the view's underlying storage, not
+	// being written into it).
+	var viewQual Expr
+	if tbl.View != nil {
+		if len(s.Using) > 0 {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
+		}
+		base, autoOK := viewAutoUpdatableBase(tbl, cat)
+		if !autoOK {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
+		}
+		q, qerr := viewQualOnBase(tbl, base, cat)
+		if qerr != nil {
+			return nil, qerr
+		}
+		viewQual = q
+		tbl = base
 	}
 
 	// DELETE … USING (M0097-0076): build a combined resolve context
@@ -7897,13 +7991,20 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		} else if ok {
 			node = idxNode
+			// See planUpdate's identical comment: merge into a single
+			// Filter layer, extractScan only unwraps one.
+			if viewQual != nil {
+				node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
+			}
 		} else {
 			pred, err := resolveExpr(s.Where, ctx)
 			if err != nil {
 				return nil, err
 			}
-			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: andExpr(s.Where.Pos(), viewQual, pred)}
 		}
+	} else if viewQual != nil {
+		node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
 	}
 	del := &Delete{pos: s.Pos(), Table: tbl, Child: node}
 	if len(s.Returning) > 0 {

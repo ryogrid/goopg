@@ -1894,6 +1894,14 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			}
 		}
 
+		// WITH CHECK OPTION enforcement: the INSERT's original target was a
+		// CHECK OPTION view rewritten onto Table. M0119-0004 slice-365 follow-up.
+		if o.plan.ViewCheckQual != nil {
+			if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, row); err != nil {
+				return nil, err
+			}
+		}
+
 		// Partition routing (M0096-0007): if the target table is partitioned,
 		// route the row to the appropriate partition child BEFORE the FK check
 		// so that violation MESSAGEs name the leaf partition (matches upstream
@@ -3580,6 +3588,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				newRow[i] = row[i]
 			}
 		}
+		// WITH CHECK OPTION enforcement — see the identical check in the
+		// SeqScan path's per-row callback for the rationale.
+		if o.plan.ViewCheckQual != nil {
+			if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, newRow); err != nil {
+				return false, err
+			}
+		}
 		pending = append(pending, pendingUpdate{
 			blk:    ptr.Block,
 			slot:   actualSlot, // use live slot, not the index-pointed slot
@@ -4164,6 +4179,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
+
+			// WITH CHECK OPTION enforcement: only the base/parent table's own
+			// rows are checked — ViewCheckQual was resolved against the base
+			// table's column layout, and a partition/inheritance child's
+			// captureCols can be reordered relative to it (M0096-0013), so
+			// checking those rows against it would compare the wrong columns.
+			// A CHECK OPTION view over a partitioned/inherited base table not
+			// enforcing on child-routed rows is a documented limitation.
+			// M0119-0004 slice-365 follow-up.
+			if o.plan.ViewCheckQual != nil && scanTbl == tbl {
+				if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, newRow); err != nil {
+					return err
+				}
+			}
 
 			// M0100-0011: Phase 1 EPQ for all isolation levels — wait for any
 			// in-progress xmax before processing the next row, so BEFORE trigger
