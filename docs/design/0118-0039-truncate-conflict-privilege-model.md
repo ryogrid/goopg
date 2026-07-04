@@ -210,3 +210,62 @@ bootstrap superuser always pass without a GRANT).
 Gates: `go build ./...` clean; `go test ./internal/executor/...
 ./internal/planner/... ./internal/server/... ./internal/catalog/...` PASS (no
 regressions); pre-commit pgbench smoke PASS.
+
+## Follow-up (2026-07-05, same day): SELECT privilege enforcement
+
+Closes the "deliberately out of scope" gap noted just above. `seqScanOp.Open`
+(`operators_storage.go`), `indexScanOp.openPrep` (`operators_index.go`), and
+`indexOnlyScanOp.Open` (`operators_indexonly.go`) — the three operators that
+read a heap relation directly — now call `dmlPrivilegePermitted(ctx, tbl,
+"SELECT")` before doing any lock acquisition or scan setup, raising the same
+`42501 permission denied for table %s` on failure.
+
+**System-catalog carve-out (the blast-radius risk the ledger flagged):**
+`dmlPrivilegePermitted` gained one new branch —
+`if priv == "SELECT" && catalog.IsSystemRelation(tbl.OID) { return true }`
+(`IsSystemRelation` = `oid < FirstUserOID`, i.e. below `FirstNormalObjectId`
+16384) — checked *before* the owner/grant lookup. PostgreSQL seeds every
+system catalog with an implicit PUBLIC `SELECT` grant at initdb time via
+`pg_init_privis`; goopg has no equivalent default-ACL seeding mechanism (a
+research pass confirmed `tableACLs` is empty for every relation, catalog or
+user, until an explicit `GRANT` runs — `CREATE TABLE` never seeds it, not even
+for the owner). Without the carve-out, gating SELECT would 42501 every
+`psql \d`, `pg_dump` run, and `information_schema` query issued by a
+non-superuser role — none of which are covered by any existing regression
+test, so this would have been a silent, un-caught break. The carve-out is
+scoped to `priv == "SELECT"` only: a non-superuser role writing to a system
+catalog via `INSERT`/`UPDATE`/`DELETE` still needs a real grant, unchanged
+from the prior loop's behavior.
+
+**Verified no regression:** full `internal/executor`, `internal/planner`,
+`internal/catalog`, `internal/server` suites pass; the role/GRANT-adjacent
+isolation specs `truncate-conflict` and `intra-grant-inplace` (both drive
+`SET ROLE` + table ACLs) still pass byte-identical; `tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33).
+
+**Deliberately out of scope (see ledger):** views are inlined into the
+querying session's own plan (`planner.go`'s `if tbl.View != nil { inner, err
+:= Plan(tbl.View, cat) }`) with no view-owner/security-definer identity
+anywhere in planner or executor. PostgreSQL runs a view's underlying-table
+reads as the *view owner*, so `GRANT SELECT ON view TO role` with no grant on
+the base table still lets `role` read through the view; goopg now denies that
+same query (42501) because the inlined scan checks the *querying* role's
+privilege on the base table. No existing test combines a non-superuser role
+with a view-only grant, so this is a recorded scope boundary, not a caught
+regression. Column-level privileges, `WITH GRANT OPTION` propagation, and
+`GRANT … TO PUBLIC` remain unmodelled, same as prior loops.
+
+Tests: `internal/executor/storage_dml_test.go`'s
+`TestSeqScanRequiresSelectPrivilege` (unprivileged role denied, GRANT unblocks,
+owner and superuser bypass), `TestIndexScansRequireSelectPrivilege` (sibling
+pin for `indexScanOp`/`indexOnlyScanOp` — a fix scoped to `seqScanOp` alone
+would leave an index-scan-chosen plan able to bypass the gate), and
+`TestSystemCatalogSelectAlwaysPermitted` (catalog SELECT always permitted;
+catalog INSERT still requires a grant).
+
+Gates: `go build ./...` clean; `go vet` clean; `go test
+./internal/executor/... ./internal/planner/... ./internal/catalog/...
+./internal/server/...` PASS; `go test ./internal/testport/... -run
+'TestPort_IsolationTruncateConflict|TestPort_IsolationIntraGrantInplace'`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench
+smoke PASS.

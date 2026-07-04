@@ -1032,6 +1032,9 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
+	if o.tbl != nil && !dmlPrivilegePermitted(ctx, o.tbl, "SELECT") {
+		return &ExecError{Code: "42501", Pos: o.pos, Message: fmt.Sprintf("permission denied for table %s", o.tbl.Name)}
+	}
 	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
 	if o.tbl != nil && o.tbl.IsMatView && !o.tbl.IsPopulated {
 		return &ExecError{Code: "55000", Pos: o.pos,
@@ -1729,6 +1732,15 @@ func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
 	role := ctx.NonSuperuserRole
 	if role == "" {
 		return true // bootstrap superuser: full privileges
+	}
+	if priv == "SELECT" && tbl != nil && catalog.IsSystemRelation(tbl.OID) {
+		// PostgreSQL seeds every system catalog/view with an implicit PUBLIC
+		// SELECT grant at initdb time (pg_init_privs) so any role can read
+		// pg_catalog/information_schema for introspection (psql \d, pg_dump,
+		// driver metadata queries). goopg has no per-catalog default-ACL
+		// seeding, so mirror that outcome by always permitting SELECT on
+		// relations below FirstNormalObjectId. M0097-0040 SELECT follow-up.
+		return true
 	}
 	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, role) {
 		return true

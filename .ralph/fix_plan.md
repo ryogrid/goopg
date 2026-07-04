@@ -365,10 +365,21 @@ mirroring M0119's ledger `status` column.
       `TestDMLRequiresTablePrivilege`. Design:
       `docs/design/0118-0039-truncate-conflict-privilege-model.md` Follow-up
       section; `unimplemented_feat.json` M0097-0040 updated in place.
-      **Still open in this bucket:** `SELECT` privilege enforcement (higher
-      blast radius — every read path including internal system-catalog
-      scans — needs its own bounded loop, ledger row), SASLprep/channel
-      binding/`scram_iterations`, encoding constraints.
+      **`SELECT` enforcement landed (2026-07-05, same day):**
+      `seqScanOp.Open`/`indexScanOp.openPrep`/`indexOnlyScanOp.Open` now call
+      `dmlPrivilegePermitted(ctx, tbl, "SELECT")`, with a
+      `catalog.IsSystemRelation(tbl.OID)` carve-out that always permits
+      SELECT on pg_catalog/information_schema (no pg_init_privs-equivalent
+      default-ACL seeding exists). Tests:
+      `TestSeqScanRequiresSelectPrivilege`,
+      `TestIndexScansRequireSelectPrivilege`,
+      `TestSystemCatalogSelectAlwaysPermitted`. Design doc Follow-up section
+      extended; `unimplemented_feat.json` updated in place. **Still open in
+      this bucket:** views inline into the querying role's own scan with no
+      view-owner identity, so `GRANT SELECT ON view` alone (no base-table
+      grant) is now denied (ledger, scope boundary — untested by any
+      existing suite). SASLprep/channel binding/`scram_iterations`, encoding
+      constraints.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).
