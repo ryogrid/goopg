@@ -13532,6 +13532,68 @@ today (probably just `relkind='m'`, insufficient on its own — same shape of
 gap `RecordKindCreateIndex`'s doc comment describes for indexes, "goopg has
 no pg_index relation").
 
+## Follow-up: materialized-view restart persistence (M0119-0004, this loop)
+
+Closes the gap immediately above. The root cause was confirmed exactly as
+guessed: `buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go`)
+hardcoded `relkind` to `"r"`/`"p"` only — a matview's pg_class heap row was
+written as an ordinary table (`relkind='r'`), and `loadUserTablesFromHeap`
+(`internal/initdb/open.go`) filtered strictly on `row.RelKind == "r"`, so a
+restarted matview reloaded with `IsMatView=false`, `View=nil`: a silent
+downgrade to a plain table (its physical row data survived, since matviews —
+unlike plain views — have real heap storage, but the "this is a matview with
+this refresh query" metadata did not).
+
+Fix, mirroring `RecordKindCreateIndex`'s pattern (M0079-0001) exactly, since
+plain `CREATE VIEW` has no on-disk persistence at all today to model this on
+(views are runtime-only; a separate, larger, pre-existing gap, not touched
+here):
+
+- `buildUserPGClassRow` now emits `relkind='m'` when `tbl.IsMatView` (before
+  the partition check, since a matview can't be partitioned).
+- `loadUserTablesFromHeap`'s pg_class scan filter now accepts `relkind` `"r"`
+  **or** `"m"`; the reloaded `catalog.Table` sets `IsMatView = tr.RelKind ==
+  "m"` directly from the recovered row.
+- New `RecordKindCreateMatView` (`internal/wal/recovery.go`, byte 102 — the
+  next free byte at the time this landed; the design-doc-adjacent "byte 95"
+  guess above turned out taken by `RecordKindCreateStatistics`, defined in a
+  sibling file `statistics_ddl.go` that a plain grep of `recovery.go` alone
+  missed) carries `tableOID | populated(1) | queryLen(2) | querySQL` — the
+  view body as SQL text (`tbl.ViewDef`, already stored for `pg_get_viewdef`)
+  plus `tbl.IsPopulated` (the `WITH NO DATA` flag). Emitted from
+  `syncTableToCatalogHeap` (the same single funnel `RecordKindColumnDefaults`
+  uses) via `ctx.Pool.LogChangeRecord`, **not** `ctx.WAL.Append` — matching
+  `RecordKindCreateIndex`'s emission call, not `RecordKindColumnDefaults`'s,
+  because the initdb-level test harness (`runDDL` in
+  `internal/initdb/ddl_catalog_sync_test.go`) only wires `ctx.Pool`, not
+  `ctx.WAL`; using the same hook as the already-proven-testable `CREATE INDEX`
+  record made this change verifiable at the same layer.
+- New `internal/initdb/matview_ddl_recovery.go`'s `replayMatViewRecords`
+  (same shape as `column_defaults_recovery.go`): scans WAL after
+  `loadUserTablesFromHeap`, re-parses `p.Query` via `parser.Parse` into a
+  `*parser.SelectStmt`, and sets `tbl.View`/`tbl.ViewDef`/`tbl.IsMatView`/
+  `tbl.IsPopulated` on the reloaded table; last-record-wins, skips
+  (does not fail startup) on a decode/parse gap or a since-dropped table.
+
+Tests: `internal/initdb/matview_ddl_recovery_test.go` —
+`TestMatViewSurvivesRestartViaWAL` (populated case: `IsMatView`,
+`IsPopulated=true`, `View`, `Columns` all survive a Close-without-SaveCatalog
+restart) and `TestMatViewWithNoDataSurvivesRestartViaWAL` (`WITH NO DATA` →
+`IsPopulated=false` survives too). Both confirmed RED against the pre-fix
+tree (`git stash` of the 4 production files, rerun, reverted).
+
+Deferred (unchanged, separate, larger gap — not attempted here): plain
+`CREATE VIEW` has zero on-disk persistence — `execCreateView` never calls
+`syncTableToCatalogHeap`, so a non-materialized view does not survive a
+restart at all today (reloads as if it never existed, not merely as a plain
+table). Resume: give plain views the same `syncTableToCatalogHeap` +
+relkind='v' + a `RecordKindCreateView`-equivalent WAL record treatment this
+loop just built for matviews — the two are structurally the same fix, but
+views additionally need to decide how `loadUserTablesFromHeap`'s "physical
+row" assumption (a view has no relfilenode/no attribute-derived physical
+columns list) interacts with the pg_attribute-driven column-reload path,
+which this loop did not investigate.
+
 ## Follow-up: `ALTER VIEW` sub-forms complete the grammar (DU-002 slice 444)
 
 **2026-07-04.** Slice 440's deferral row left three `ALTER VIEW` sub-forms

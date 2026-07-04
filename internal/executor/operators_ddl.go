@@ -12308,6 +12308,25 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
+	// Materialized-view query persistence: pg_class.relkind='m' (set above by
+	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a matview, but
+	// the defining SELECT lives only in tbl.View (an in-memory AST) — goopg
+	// writes no pg_rewrite-equivalent heap rows, so it must be snapshotted as
+	// SQL text the same way M0079-0001's CREATE INDEX record is. Emitted from
+	// this single funnel keeps CREATE and any future ALTER MATERIALIZED VIEW
+	// ... RENAME/SET SCHEMA in sync automatically. Replay:
+	// internal/initdb/matview_ddl_recovery.go.
+	if ctx.Pool != nil && tbl.IsMatView && tbl.ViewDef != "" {
+		payload := wal.EncodeMatView(wal.MatViewPayload{
+			TableOID:    tbl.OID,
+			IsPopulated: tbl.IsPopulated,
+			Query:       tbl.ViewDef,
+		})
+		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
+			return fmt.Errorf("matview WAL record: %w", err)
+		}
+	}
+
 	// Signal that this transaction wrote to nailed catalog relations (pg_class
 	// and pg_attribute). The xact-marker hook in open.go reads this flag at
 	// commit time to emit RecordKindXactCommitInval and unlink both

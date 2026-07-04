@@ -422,6 +422,8 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	relkind := "r"
 	if tbl.PartitionMethod != "" {
 		relkind = "p" // partitioned table
+	} else if tbl.IsMatView {
+		relkind = "m" // materialized view (has physical storage, unlike a plain view)
 	}
 	relfilenode := int64(tbl.OID)
 	if relkind == "p" {

@@ -1155,6 +1155,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: column-defaults replay: %w", err)
 	}
 
+	// Materialized-view query persistence (M0119-0004 follow-up): re-parse the
+	// defining-query snapshots emitted by syncTableToCatalogHeap onto the
+	// heap-reloaded matviews (View is an in-memory AST pg_class cannot carry).
+	// Must run AFTER loadUserTablesFromHeap.
+	if err := replayMatViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: matview replay: %w", err)
+	}
+
 	// Role/auth restart persistence (root-0021): load the durable BASE from
 	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
 	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
@@ -2060,7 +2071,8 @@ func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []s
 
 // loadUserTablesFromHeap loads the in-memory catalog with user tables
 // found in the pg_class and pg_attribute heap relfiles (M0030-0003). It scans
-// all live (xmin≠0, xmax=0) pg_class rows with relkind='r' and OID ≥ FirstUserOID,
+// all live (xmin≠0, xmax=0) pg_class rows with relkind='r' or 'm' (materialized
+// view — has physical storage like a table) and OID ≥ FirstUserOID,
 // then collects their column definitions from pg_attribute rows, and calls
 // TryRegisterUserTable for each.
 //
@@ -2187,7 +2199,7 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
 				continue
 			}
-			if row.RelKind == "r" && row.OID >= catalog.FirstUserOID {
+			if (row.RelKind == "r" || row.RelKind == "m") && row.OID >= catalog.FirstUserOID {
 				userTableRows = append(userTableRows, recoveredPGClassRow{row: row, physical: physicalRow})
 			}
 		}
@@ -2294,6 +2306,10 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			Columns:        cols,
 			OID:            tr.OID,
 			SmallDimension: tr.RelName == "region" || tr.RelName == "nation",
+			// IsMatView from relkind alone; View/ViewDef/IsPopulated are
+			// restored afterward by replayMatViewRecords (the AST/populated
+			// flag have no heap representation — see RecordKindCreateMatView).
+			IsMatView: tr.RelKind == "m",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode

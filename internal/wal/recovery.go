@@ -1096,6 +1096,21 @@ const (
 	//   oldName(oldNameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
 	RecordKindRenameIndex byte = 94
 
+	// RecordKindCreateMatView records a materialized view's defining query
+	// (as SQL text) and populated state so both survive a restart. A matview
+	// is a *catalog.Table with IsMatView=true, View (parser AST) and ViewDef
+	// (raw SQL) set — pg_class.relkind carries 'm' on disk (buildUserPGClassRow),
+	// but loadUserTablesFromHeap cannot reconstruct the AST from relkind alone,
+	// and syncTableToCatalogHeap writes no pg_rewrite-equivalent heap rows. Before
+	// this record, a restarted matview reloaded as an ordinary relkind='m'-blind
+	// table with View=nil (loadUserTablesFromHeap only recognized relkind='r'),
+	// losing both its matview-ness and its refresh query. Emitted from
+	// syncTableToCatalogHeap (the same single funnel as RecordKindColumnDefaults),
+	// one record per matview, last-record-wins; replay re-parses the query via
+	// parser.Parse. Upstream analog: pg_rewrite (postgres/src/backend/rewrite/rewriteDefine.c).
+	// Format: kind(1) | tableOID(4) | populated(1) | queryLen(2) | querySQL
+	RecordKindCreateMatView byte = 102
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -1936,6 +1951,56 @@ func DecodeColumnDefaults(payload []byte) (ColumnDefaultsPayload, error) {
 		}
 		p.Defaults = append(p.Defaults, d)
 	}
+	return p, nil
+}
+
+// MatViewPayload is the decoded form of a RecordKindCreateMatView record: one
+// materialized view's defining query and populated state.
+type MatViewPayload struct {
+	TableOID    uint32
+	IsPopulated bool
+	Query       string // SELECT body as SQL text (parser.Parse round-trips it)
+}
+
+// EncodeMatView encodes a RecordKindCreateMatView record.
+func EncodeMatView(p MatViewPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateMatView)
+	var b4 [4]byte
+	binary.LittleEndian.PutUint32(b4[:], p.TableOID)
+	buf.Write(b4[:])
+	if p.IsPopulated {
+		buf.WriteByte(1)
+	} else {
+		buf.WriteByte(0)
+	}
+	q := p.Query
+	if len(q) > 0xFFFF {
+		q = q[:0xFFFF]
+	}
+	var b2 [2]byte
+	binary.LittleEndian.PutUint16(b2[:], uint16(len(q)))
+	buf.Write(b2[:])
+	buf.WriteString(q)
+	return buf.Bytes()
+}
+
+// DecodeMatView decodes a RecordKindCreateMatView payload.
+func DecodeMatView(payload []byte) (MatViewPayload, error) {
+	var p MatViewPayload
+	if len(payload) < 8 {
+		return p, fmt.Errorf("wal: matview payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateMatView {
+		return p, fmt.Errorf("wal: record kind %d is not create-matview", payload[0])
+	}
+	p.TableOID = binary.LittleEndian.Uint32(payload[1:5])
+	p.IsPopulated = payload[5] != 0
+	qLen := int(binary.LittleEndian.Uint16(payload[6:8]))
+	if len(payload) < 8+qLen {
+		return p, fmt.Errorf("wal: matview payload truncated (need %d bytes at 8)", qLen)
+	}
+	p.Query = string(payload[8 : 8+qLen])
 	return p, nil
 }
 
@@ -6440,6 +6505,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// page state. The recovery driver in
 		// internal/initdb/column_defaults_recovery.go re-parses them after
 		// loadUserTablesFromHeap.
+		return false, nil
+	case RecordKindCreateMatView:
+		// Materialized-view query snapshots carry only the in-memory
+		// catalog's View AST as SQL text + IsPopulated; no physical page
+		// state (the matview's own heap data is ordinary pg_class-tracked
+		// storage, already covered by loadUserTablesFromHeap). The recovery
+		// driver in internal/initdb/matview_ddl_recovery.go re-parses the
+		// query after loadUserTablesFromHeap.
 		return false, nil
 	case RecordKindCreateConversion, RecordKindDropConversion:
 		// CREATE/DROP CONVERSION records (DU-002 restart-persistence
