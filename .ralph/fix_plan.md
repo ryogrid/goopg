@@ -138,3 +138,85 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every future
 > deferral-ledger entry (any new `status = -` row) feed additional M0119 tasks over
 > time; the milestone's living nature means it need not be complete at filing.
+
+## M0122 — Unimplemented-Feature Backlog Consumption (filed 2026-07-04)
+
+Milestone: `docs/milestones/0122-unimplemented-feature-backlog-consumption.md`
+(**living milestone** — tasks are appended over time). Source of truth:
+`unimplemented_feat.json` (repo root; 181 entries generated 2026-07-02 from the
+commit log). Goal: drive every `open` feature entry to closure — implement the
+deferred scope, or verify it already landed and mark the entry `resolved`.
+
+**⚠️ Verify-before-implement (READ FIRST):** `unimplemented_feat.json` is a
+2026-07-02 snapshot and **may list features that are already implemented** — 24
+entries have an `unclear`/absent `code_audit` and 61 have an open matching ledger
+row (7 overlap both). When you pick up ANY M0122 task, FIRST re-verify each
+candidate against current HEAD (grep/read code, probe a live goopg, check
+ledger/fix_plan/git log). If it already exists, set the entry's `status` to
+`resolved` (cite the proof) and DO NOT re-implement. Only build genuinely-missing
+scope.
+
+**Per-task rule (applies to every M0122 implementation task):** before
+implementation begins, the picking agent MUST (1) create a design doc at
+`docs/design/<id>-NNNN-*.md` and index it in `docs/design/README.md`, and (2) have
+that design doc pass an agent review. Implementation starts only after the
+reviewed design doc exists. (The triage task M0122-0001 is doc-only, exempt.)
+Tracking field = a per-entry `status` (`open`/`resolved`) added by M0122-0001,
+mirroring M0119's ledger `status` column.
+
+- [ ] **M0122-0001 — Backlog triage / re-verification pass** (doc-only, exempt).
+      Re-audit all 181 entries vs current HEAD; add the `status` field (init
+      `open`/`resolved`); resolve the already-done ones — start with the 24
+      `unclear`/no-audit + 61 `resolution_check.ledger=open` entries (7 overlap).
+      Dedupe against M0119 + `.ralph/deferral_ledger.md` so nothing is worked
+      twice. This task discharges the "may already be implemented" risk.
+- [ ] **M0122-0002 — Catalog system functions & pg_* view stubs** (~9). Quick wins:
+      `pg_relation_size`/`pg_total_relation_size`, `regexp_matches`, `pg_get_expr`,
+      `isfinite`, `justify_*`, `pg_get_serial_sequence`, `pg_get_indexdef` recon.
+- [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7). EXPLAIN
+      FORMAT XML/YAML, SETTINGS/BUFFERS rendering, `pg_stat_io` virtual table,
+      per-CTE stats, `track_io_timing` runtime SET.
+- [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
+      ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, ANY/SOME/ALL, DEFAULT-clause
+      parsing, intervals, BETWEEN SYMMETRIC, CTE-without-alias, WITH CHECK OPTION.
+- [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
+      1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
+      dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
+- [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
+      Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
+      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
+- [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
+      DATABASE full DDL, `goopg ctl restart`, REINDEX, SIGHUP config reload,
+      tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs.
+- [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
+      / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
+      encoding constraints during bootstrap/runtime.
+- [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
+      recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
+      `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).
+- [ ] **M0122-0010 — Concurrency: buffer pool & btree locking** (~17, LARGE).
+      Lehman/Yao crab-walk, `splitMu` removal, storage-pool pin-count race,
+      re-enable the `-race` gate. Gate: race detector mandatory.
+- [ ] **M0122-0011 — Query optimizer & TPC-H/HammerDB correctness** (~17). Anti/
+      semi-join unnesting (NOT IN), Q8/Q9/Q21 row-count fixes; several blocked on
+      the slot/TupleSlot pipeline (see M0122-0012). Gate: TPC-H spot-check.
+- [ ] **M0122-0012 — Perf infra: vectorization / slot-pipeline / harness** (~19,
+      ARCHITECTURAL). Borrow-semantics allocation rewrite, plannode migration,
+      vectorized FilterOp/SeqScanOp, plan cache, HammerDB SF1 validation.
+- [ ] **M0122-0013 — Physical/streaming replication & standby** (~10, EPIC/blocked).
+      Streaming-replication epic (~25 sub-items), cascading replication,
+      `STANDBY_SNAPSHOT_READY` transition.
+- [ ] **M0122-0014 — Logical replication / decoding / subscription** (~11, EPIC).
+      pgoutput DELETE identity, subscriber apply worker, DDL replication. Blocked
+      on logical decoding (tracks D-004; overlaps M0119-0007 — dedupe).
+- [ ] **M0122-0015 — Test-suite porting: amcheck / verify_heapam / pg_dump** (~8).
+      `verify_heapam()` SRF + opclass parity, AC-002..005, pg_dump 002-010.
+      **Overlaps M0119-0004/0006 — the triage assigns each item to ONE milestone;
+      do not double-work.**
+
+> This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
+> future feature deferral appended to `unimplemented_feat.json` (any new `open`
+> entry) feed additional M0122 tasks over time; the milestone's living nature
+> means it need not be complete at filing. Small/residual entries (TOAST
+> compression, autovacuum, FDW/HANDLER stub, GIST, LANGUAGE C) fold into the
+> nearest cluster by the triage.
