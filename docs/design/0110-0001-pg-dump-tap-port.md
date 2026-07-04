@@ -13582,17 +13582,85 @@ restart) and `TestMatViewWithNoDataSurvivesRestartViaWAL` (`WITH NO DATA` →
 `IsPopulated=false` survives too). Both confirmed RED against the pre-fix
 tree (`git stash` of the 4 production files, rerun, reverted).
 
-Deferred (unchanged, separate, larger gap — not attempted here): plain
-`CREATE VIEW` has zero on-disk persistence — `execCreateView` never calls
-`syncTableToCatalogHeap`, so a non-materialized view does not survive a
-restart at all today (reloads as if it never existed, not merely as a plain
-table). Resume: give plain views the same `syncTableToCatalogHeap` +
-relkind='v' + a `RecordKindCreateView`-equivalent WAL record treatment this
-loop just built for matviews — the two are structurally the same fix, but
-views additionally need to decide how `loadUserTablesFromHeap`'s "physical
-row" assumption (a view has no relfilenode/no attribute-derived physical
-columns list) interacts with the pg_attribute-driven column-reload path,
-which this loop did not investigate.
+Deferred (closed by the next follow-up below): plain `CREATE VIEW` has zero
+on-disk persistence — `execCreateView` never calls `syncTableToCatalogHeap`,
+so a non-materialized view does not survive a restart at all today (reloads
+as if it never existed, not merely as a plain table).
+
+## Follow-up: plain CREATE VIEW restart persistence (M0119-0004, later loop)
+
+Closes the "Deferred" gap immediately above. Structurally the same fix as the
+matview one, mirrored one level down (a plain view has no physical heap
+storage at all, whereas a matview does):
+
+- `buildUserPGClassRow` now emits `relkind='v'` when `tbl.View != nil` (and
+  the table isn't a matview), with `relfilenode=0` alongside partitioned
+  tables (`relkind='p'`) — a view has no physical storage to point at.
+- `loadUserTablesFromHeap`'s pg_class scan filter now also accepts
+  `relkind == "v"`; the reloaded `catalog.Table` sets `Virtual = tr.RelKind
+  == "v"` (mirroring `catalog.InMemory.CreateView`'s own `Virtual: true`) so
+  the reloaded relation is recognized as storage-less immediately, before
+  `replayViewRecords` runs.
+- New `RecordKindCreateView` (`internal/wal/recovery.go`, byte 103, the next
+  free byte after `RecordKindCreateMatView`=102) carries
+  `tableOID | queryLen(2) | querySQL` — no `populated` byte, since a plain
+  view has no `WITH NO DATA` analog. Emitted from `syncTableToCatalogHeap`
+  (the same funnel, right after the matview block) via
+  `ctx.Pool.LogChangeRecord`, gated on `tbl.View != nil && !tbl.IsMatView &&
+  tbl.ViewDef != ""` so the two emissions are mutually exclusive.
+- New `internal/initdb/view_ddl_recovery.go`'s `replayViewRecords` (near-copy
+  of `matview_ddl_recovery.go`'s `replayMatViewRecords`, minus the
+  `IsPopulated` field): scans WAL after `loadUserTablesFromHeap`, re-parses
+  `p.Query` into a `*parser.SelectStmt`, sets `tbl.View`/`tbl.ViewDef`.
+  Wired into `internal/initdb/open.go` right after `replayMatViewRecords`.
+- `execCreateView` (`internal/executor/operators_ddl.go`) now calls
+  `syncTableToCatalogHeap` (gated on `catalogHeapSyncAvailable`, same guard
+  every other DDL path uses) after setting `vt.ViewDef`/`CheckOption`/
+  `SecurityBarrier`/`SecurityInvoker` on the new table.
+- **OID-churn on `CREATE OR REPLACE VIEW`:** `catalog.InMemory.CreateView`
+  always assigns a fresh OID, even on replace (it does not reuse the old
+  view's OID). Without cleanup, replacing a view would leave the *old* OID's
+  pg_class/pg_attribute rows on disk, un-stamped, so a restart would register
+  the view twice — once under the stale OID (frozen at its pre-replace
+  definition) and once under the new one. `execCreateView` now captures the
+  pre-existing view's OID before the temporary `im.DropView` (used to break
+  circular-view planning), and after the new table's heap sync, stamps xmax
+  on the old OID's rows via `deleteCatalogRowsForOID` whenever the OID
+  changed.
+- **Drop-side cleanup, both for the new view case and as a fix to a
+  pre-existing matview gap:** neither `execDropOneView` nor
+  `execDropOneMatView` ever stamped xmax on the pg_class/pg_attribute rows
+  their own CREATE wrote — `replayMatViewRecords`'s own "matview dropped
+  since the snapshot" comment (written during the earlier matview loop)
+  anticipated a drop leaving no trace, but nothing was ever wired up to make
+  that true. Concretely: `DROP MATERIALIZED VIEW` (and, after this loop,
+  `DROP VIEW`) followed by a restart resurrected the dropped relation. Both
+  functions now capture the `*catalog.Table` from the pre-drop `LookupTable`
+  call and, on successful `catalog.DropView`, stamp xmax via the same
+  `deleteCatalogRowsForOID`/`catalogHeapSyncAvailable`/`MaterializeWriterXID`
+  pattern `dropTableByRefImmediate` uses for `DROP TABLE`.
+
+Tests: `internal/initdb/view_ddl_recovery_test.go` —
+`TestViewSurvivesRestartViaWAL` (a plain view's `View`/`Columns`/`Virtual`
+survive a Close-without-SaveCatalog restart), and covers both new hazards:
+`TestViewOrReplaceSurvivesRestartWithoutDuplicate` (a `CREATE OR REPLACE
+VIEW` body's columns reflect the *replacement*, not the original, after
+restart — the OID-churn cleanup) and `TestDropViewNotResurrectedAfterRestart`
+/ `TestDropMatViewNotResurrectedAfterRestart` (drop-then-restart does not
+resurrect either kind of view).
+
+Deferred (unchanged, separate, larger gaps — not attempted here): (1)
+`CheckOption`/`SecurityBarrier`/`SecurityInvoker` are not round-tripped
+through the heap-persisted pg_class row at all — `buildUserPGClassRow`
+hardcodes `reloptions` to `"{}"` unconditionally, so these three view
+storage options are lost across a restart even though the view body itself
+now survives (pre-existing, not introduced by this loop, and not
+view-specific — no reloption of any kind round-trips through the heap yet).
+(2) `DROP MATERIALIZED VIEW` still leaks the matview's physical heap file on
+disk — unlike `DROP TABLE`, neither `execDropOneMatView` nor this loop's fix
+calls `o.ctx.Pool.Manager().DropRelation`/`InvalidateRel`/FSM/VM cleanup for
+the matview's own storage; this loop only closed the catalog-heap-row
+resurrection hole, not the physical-storage leak.
 
 ## Follow-up: `ALTER VIEW` sub-forms complete the grammar (DU-002 slice 444)
 

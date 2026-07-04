@@ -1166,6 +1166,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: matview replay: %w", err)
 	}
 
+	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
+	// matview replay above): re-parse the defining-query snapshots emitted by
+	// syncTableToCatalogHeap onto the heap-reloaded views (View is an
+	// in-memory AST pg_class cannot carry). Must run AFTER loadUserTablesFromHeap.
+	if err := replayViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: view replay: %w", err)
+	}
+
 	// Role/auth restart persistence (root-0021): load the durable BASE from
 	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
 	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
@@ -2199,7 +2210,7 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
 				continue
 			}
-			if (row.RelKind == "r" || row.RelKind == "m") && row.OID >= catalog.FirstUserOID {
+			if (row.RelKind == "r" || row.RelKind == "m" || row.RelKind == "v") && row.OID >= catalog.FirstUserOID {
 				userTableRows = append(userTableRows, recoveredPGClassRow{row: row, physical: physicalRow})
 			}
 		}
@@ -2310,6 +2321,11 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			// restored afterward by replayMatViewRecords (the AST/populated
 			// flag have no heap representation — see RecordKindCreateMatView).
 			IsMatView: tr.RelKind == "m",
+			// A plain view (relkind='v') has no physical heap storage — mirror
+			// catalog.InMemory.CreateView's Virtual=true. View/ViewDef are
+			// restored afterward by replayViewRecords (the AST has no heap
+			// representation — see RecordKindCreateView).
+			Virtual: tr.RelKind == "v",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode

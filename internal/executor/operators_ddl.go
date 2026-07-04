@@ -4645,8 +4645,17 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// (circular-view stack overflow). The view is removed only for the
 	// duration of planning, then re-inserted when we call CreateView below.
 	var planSchema planner.Schema
+	// CreateView below always assigns a fresh OID, even on OR REPLACE — the
+	// old view's pg_class/pg_attribute heap rows (if any) would otherwise
+	// linger under the stale OID and resurrect a duplicate registration for
+	// the same name after a restart. Capture it here (before the temporary
+	// DropView) so the heap-sync block below can stamp its xmax.
+	var oldViewOID uint32
 	if s.OrReplace {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			if existing, ok2 := im.LookupTable(s.Name); ok2 && existing.View != nil {
+				oldViewOID = existing.OID
+			}
 			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
 		}
 	}
@@ -4731,6 +4740,31 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		if s.SecurityInvoker != nil {
 			vt.SecurityInvoker = *s.SecurityInvoker
 			vt.SecurityInvokerSet = true
+		}
+	}
+	// Restart persistence (M0119-0004 follow-up, sibling of
+	// execCreateMatView's own heap-sync call): a plain view previously had
+	// zero on-disk footprint — CREATE VIEW never called
+	// syncTableToCatalogHeap — so it ceased to exist after any restart.
+	// syncTableToCatalogHeap writes the pg_class/pg_attribute rows
+	// (relkind='v', buildUserPGClassRow) and the RecordKindCreateView WAL
+	// snapshot of the defining query (replayed by
+	// internal/initdb/view_ddl_recovery.go).
+	if vt != nil && catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, vt); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+		// CREATE OR REPLACE VIEW assigns a fresh OID (catalog.CreateView), so
+		// the old view's now-orphaned pg_class/pg_attribute rows must be
+		// stamped deleted — otherwise loadUserTablesFromHeap would register
+		// both the old and new OID under the same name after a restart.
+		if oldViewOID != 0 && oldViewOID != vt.OID {
+			if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
+				xmax := o.ctx.Tx.XID
+				for _, dbOid := range catalogDBOids(o.ctx) {
+					deleteCatalogRowsForOID(o.ctx, dbOid, oldViewOID, xmax)
+				}
+			}
 		}
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
@@ -4856,7 +4890,8 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	if ifExists && o.dropSchemaQualifiedNotice(name) {
 		return nil
 	}
-	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
+	tbl, ok := o.ctx.Catalog.LookupTable(name)
+	if !ok {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
 			return nil
@@ -4901,6 +4936,20 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		im.UnregisterViewConstraintDeps(name.String())
 	}
+	// Restart persistence (M0119-0004 follow-up): stamp xmax on the on-disk
+	// pg_class/pg_attribute rows this view's own CREATE VIEW wrote via
+	// syncTableToCatalogHeap. Without this, the in-memory drop is not
+	// reflected in the heap, and a subsequent restart would resurrect the
+	// dropped view via loadUserTablesFromHeap + replayViewRecords — mirrors
+	// dropTableByRefImmediate's identical DROP TABLE cleanup.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+	}
 	return nil
 }
 
@@ -4916,7 +4965,8 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	if ifExists && o.dropSchemaQualifiedNotice(name) {
 		return nil
 	}
-	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
+	tbl, ok := o.ctx.Catalog.LookupTable(name)
+	if !ok {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("materialized view %q does not exist, skipping", name.String()))
 			return nil
@@ -4969,6 +5019,22 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 			return nil
 		}
 		return &ExecError{Code: "42P01", Pos: pos, Message: err.Error()}
+	}
+	// Restart persistence: stamp xmax on the on-disk pg_class/pg_attribute
+	// rows this matview's own CREATE MATERIALIZED VIEW wrote via
+	// syncTableToCatalogHeap (M0119-0004's matview-persistence loop added the
+	// write side but never the drop-side cleanup — replayMatViewRecords's own
+	// "matview dropped since the snapshot" comment already anticipated this;
+	// it was simply never wired up). Without this, DROP MATERIALIZED VIEW
+	// followed by a restart resurrects the matview. Mirrors
+	// dropTableByRefImmediate / execDropOneView's identical cleanup.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
 	}
 	return nil
 }
@@ -12324,6 +12390,24 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		})
 		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
 			return fmt.Errorf("matview WAL record: %w", err)
+		}
+	}
+
+	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
+	// matview record above): pg_class.relkind='v' (set above by
+	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a plain view,
+	// but the defining SELECT lives only in tbl.View (an in-memory AST) — same
+	// gap as matviews, snapshotted as SQL text the same way. Emitted from this
+	// single funnel keeps CREATE VIEW and any future ALTER VIEW ...
+	// RENAME/SET SCHEMA in sync automatically. Replay:
+	// internal/initdb/view_ddl_recovery.go.
+	if ctx.Pool != nil && tbl.View != nil && !tbl.IsMatView && tbl.ViewDef != "" {
+		payload := wal.EncodeView(wal.ViewPayload{
+			TableOID: tbl.OID,
+			Query:    tbl.ViewDef,
+		})
+		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
+			return fmt.Errorf("view WAL record: %w", err)
 		}
 	}
 

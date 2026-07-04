@@ -424,10 +424,12 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		relkind = "p" // partitioned table
 	} else if tbl.IsMatView {
 		relkind = "m" // materialized view (has physical storage, unlike a plain view)
+	} else if tbl.View != nil {
+		relkind = "v" // plain view (no physical storage — the SELECT substitutes at reference time)
 	}
 	relfilenode := int64(tbl.OID)
-	if relkind == "p" {
-		relfilenode = 0 // partitioned tables have no physical storage
+	if relkind == "p" || relkind == "v" {
+		relfilenode = 0 // partitioned tables and plain views have no physical storage
 	}
 	isPartition := tbl.PartitionParentOID != 0
 	// relpersistence: 'u' for UNLOGGED tables, 'p' for permanent. pg_dump keys
