@@ -179,3 +179,110 @@ func TestSimpleQueryBatchAbortUndoesEarlierCreateType(t *testing.T) {
 		t.Fatalf("enum type %q was not created by a standalone (non-aborting) CREATE TYPE; frames=%+v", typeName, frames)
 	}
 }
+
+// TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType pins the
+// resolution of root-0024's first-residual sub-part (2) (deferral ledger row
+// for `M0110-0001 (root-0024 residual (1), enum/composite half, loop #104)`):
+// a `CREATE TYPE mood AS ENUM(...); BEGIN; ROLLBACK;` compound batch, all one
+// simple-query message, must undo the pre-BEGIN autocommit `CREATE TYPE` too,
+// mirroring the identical `pendingDDL`/`CREATE TABLE` case already covered by
+// TestSimpleQueryBatchExplicitBeginUndoesEarlierAutocommitCreateTable.
+//
+// That loop's ledger row predicted this combination still leaked the type,
+// reasoning that the `connTx.InExplicit()` write-back guard added alongside
+// `TracksDDLUndo()` would skip carrying `ectx.PendingCreatedEnums`/etc. into
+// `connTx` "before BEGIN promotes the session". That reasoning was wrong: the
+// write-back runs unconditionally after EVERY successful statement — including
+// `BEGIN` itself — and by the time `BEGIN`'s own statement finishes,
+// `connTx.InExplicit()` is already true (`connTx.Begin()` runs inside the
+// `TxBegin` case). Since `ectx.PendingCreatedEnums` lives on the
+// message-scoped `*executor.Context` (not on the session object `BEGIN`
+// replaces), it already held the pre-BEGIN `CREATE TYPE` entry, so that same
+// write-back carries it into `connTx` — no dedicated hand-off (like
+// `pendingDDL`'s `priorDDLCreates` drain-and-replay) was actually needed.
+// This test formalizes that discovery so it stays covered.
+func TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const typeName = "zz_batch_atomicity_midbegin_mood"
+	writeQuery(t, conn, "CREATE TYPE "+typeName+" AS ENUM ('sad','ok'); BEGIN; ROLLBACK;")
+	frames := readUntilReady(t, conn)
+	if _, found := im.LookupEnum(typeName); found {
+		t.Fatalf("enum type %q survived autocommit-CREATE-then-mid-batch-BEGIN-ROLLBACK; frames=%+v", typeName, frames)
+	}
+
+	// A real PG multi-statement abort: the failing statement aborts the
+	// WHOLE simple-query message (remaining statements, including a trailing
+	// ROLLBACK in that same message, are never executed — matching
+	// postgres.c's exec_simple_query semantics), so the explicit ROLLBACK
+	// must be sent as its own follow-up message to actually fire.
+	const typeName2 = "zz_batch_atomicity_midbegin_mood2"
+	writeQuery(t, conn, "CREATE TYPE "+typeName2+" AS ENUM ('sad','ok'); BEGIN; SELECT * FROM zz_definitely_missing_relation;")
+	readUntilReady(t, conn)
+	writeQuery(t, conn, "ROLLBACK;")
+	frames = readUntilReady(t, conn)
+	if _, found := im.LookupEnum(typeName2); found {
+		t.Fatalf("enum type %q survived autocommit-CREATE-then-mid-batch-BEGIN-error-then-ROLLBACK; frames=%+v", typeName2, frames)
+	}
+}
+
+// TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateComposite and
+// TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitAddValue extend the
+// coverage above to the other two record sites `TracksDDLUndo()` gates
+// (composite-type creation, `ALTER TYPE ... ADD VALUE`) — same mechanism,
+// same expected behavior.
+func TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateComposite(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const typeName = "zz_batch_atomicity_midbegin_composite"
+	writeQuery(t, conn, "CREATE TYPE "+typeName+" AS (a int4, b text); BEGIN; ROLLBACK;")
+	frames := readUntilReady(t, conn)
+	if ct := im.LookupCompositeType(typeName); ct != nil {
+		t.Fatalf("composite type %q survived autocommit-CREATE-then-mid-batch-BEGIN-ROLLBACK; frames=%+v", typeName, frames)
+	}
+}
+
+func TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitAddValue(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const typeName = "zz_batch_atomicity_midbegin_addvalue"
+	writeQuery(t, conn, "CREATE TYPE "+typeName+" AS ENUM ('sad','ok');")
+	readUntilReady(t, conn)
+
+	writeQuery(t, conn, "ALTER TYPE "+typeName+" ADD VALUE 'happy'; BEGIN; ROLLBACK;")
+	frames := readUntilReady(t, conn)
+
+	et, found := im.LookupEnum(typeName)
+	if !found {
+		t.Fatalf("enum type %q vanished entirely; frames=%+v", typeName, frames)
+	}
+	for _, v := range et.Values {
+		if v.Label == "happy" {
+			t.Fatalf("enum value 'happy' survived autocommit-ADD-VALUE-then-mid-batch-BEGIN-ROLLBACK; frames=%+v", frames)
+		}
+	}
+}

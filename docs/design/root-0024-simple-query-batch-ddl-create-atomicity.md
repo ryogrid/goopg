@@ -136,22 +136,19 @@ end-to-end; only `RecordDDLCreate`/`ProcessRollbackUndos` were touched.
 - ~~**A `CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;`
   compound batch still loses `t1`'s undo entry.**~~ **CLOSED — see
   "Follow-up" below.**
-- **The mid-batch-`BEGIN` compound-batch combination is NOT covered by the
-  enum/composite follow-up below.** A
-  `CREATE TYPE mood AS ENUM ('a','b'); BEGIN; ...; ROLLBACK;` batch (all one
-  message) still leaks `mood`: the write-back guard the follow-up adds
-  (`dispatch.go`, gated on `connTx.InExplicit()`) intentionally does NOT
-  write the autocommit-tracked `ectx.PendingCreatedEnums`/etc. into `connTx`
-  before the `BEGIN` promotes the session, so the `TxRollback`/`TxCommit`
-  shortcut cases (which read `connTx.Pending*`, not `ectx.Pending*`) never
-  see it — the same residual class `pendingDDL` needed a dedicated
-  drain-and-replay hand-off for (loop #103's "Follow-up" below), not yet
-  built for enum/composite. Resume point: either have the `planner.TxBegin`
-  case eagerly write `ectx.Pending*` into `connTx` before promoting (mirrors
-  the `pendingDDL` hand-off's spirit, simpler here since these fields already
-  live on `ctx` rather than the session), or have the `TxCommit`/`TxRollback`
-  shortcut cases consult `ectx.Pending*` directly instead of `connTx.Pending*`
-  when `ectx` is available.
+- ~~**The mid-batch-`BEGIN` compound-batch combination is NOT covered by the
+  enum/composite follow-up below.**~~ **CLOSED — confirmed already resolved,
+  see "Follow-up: mid-batch-`BEGIN` combination confirmed already resolved
+  for enum/composite" below.** The prior reasoning above (that the
+  `connTx.InExplicit()` write-back guard skips carrying
+  `ectx.PendingCreatedEnums`/etc. into `connTx` "before `BEGIN` promotes the
+  session") was mistaken: the write-back runs unconditionally after **every**
+  successful statement, including `BEGIN` itself, and by the time `BEGIN`'s
+  own statement finishes, `connTx.InExplicit()` is already `true`
+  (`connTx.Begin()` runs earlier in the same `TxBegin` case) — so the very
+  next write-back after `BEGIN` already carries the pre-`BEGIN` autocommit
+  entries into `connTx`. No code change was needed; this loop only added
+  regression coverage and corrected the record.
 
 Deferral ledger: row appended (M0110-0001, resolved) cross-referencing this
 doc for both residuals.
@@ -328,3 +325,66 @@ Gates: `go build ./...` clean; `go test ./internal/server/...
 ./internal/executor/... ./internal/catalog/...` PASS (full, no regressions,
 `-count=1`); `go test -race -count=1 ./internal/wal/... ./internal/mvcc/...`
 PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke via the pre-commit hook.
+
+## Follow-up: mid-batch-`BEGIN` combination confirmed already resolved for enum/composite (2026-07-04)
+
+While scoping the remaining open item in "Deferred" above (TRUNCATE/DROP-in-
+savepoint tracking), re-examined the other listed residual — the
+`CREATE TYPE mood AS ENUM(...); BEGIN; ...; ROLLBACK;` mid-batch-`BEGIN`
+combination — before starting on the TRUNCATE work, since it was flagged as
+"NOT yet built" by the loop that closed the single-message case. Tracing the
+actual code (not re-deriving from the prior note) showed the claim was wrong:
+
+- `ectx.PendingCreatedEnums`/`PendingCreatedComposites`/`PendingEnumValues`/
+  `PendingEnumRenames` live on `*executor.Context` (`ectx`), which is
+  allocated once per simple-query message and never replaced mid-message —
+  unlike `pendingDDL`, which lives on the `*executor.BasicSession` object
+  that `BEGIN` replaces (hence `pendingDDL` genuinely needed the
+  `priorDDLCreates` drain-and-replay hand-off in the loop #103 follow-up
+  above).
+- `dispatch.go`'s `ectx.Pending*` → `connTx` write-back (guarded by
+  `connTx.InExplicit()`, added by the enum/composite follow-up above) runs
+  **after every successful statement**, not only after non-transaction-control
+  ones. `BEGIN` is itself a successful statement that reaches this same
+  post-statement code path, and by then `connTx.InExplicit()` is already
+  `true` (`connTx.Begin()` executes earlier in the same `TxBegin` case, before
+  `executeOneSimpleStmt` returns). So the write-back that fires right after
+  `BEGIN` completes already copies whatever `ectx.PendingCreatedEnums` etc.
+  held at that point — including any pre-`BEGIN` autocommit `CREATE TYPE`
+  entries — into `connTx`. No special hand-off was ever required for this
+  field group; the prior note's "resume point" was solving a problem that
+  does not exist.
+
+Verified empirically with throwaway probes (both the plain-`ROLLBACK` and the
+`BEGIN`-then-a-later-statement-errors-then-a-separate-message-`ROLLBACK`
+forms — the latter matters because a real PostgreSQL simple-query message
+aborts entirely at the first error, so a trailing `ROLLBACK;` written in the
+*same* aborting message is never executed; the actual `ROLLBACK` must arrive
+in a follow-up message, exactly like a real client would issue it after
+seeing the error) before writing the permanent tests, confirming the type
+is correctly undone in both cases with zero code changes.
+
+Formalized as four permanent regression tests in
+`internal/server/dispatch_batch_atomicity_test.go`:
+`TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateType` (both the
+plain-`ROLLBACK` and separate-message-`ROLLBACK`-after-mid-batch-error
+forms), `TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitCreateComposite`,
+and `TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitAddValue` — covering
+all three of `TracksDDLUndo()`'s enum/composite record sites reachable this
+way (enum creation, composite creation, `ALTER TYPE ... ADD VALUE`; `ALTER
+TYPE ... RENAME TO` follows the identical code path and is not separately
+tested).
+
+This closes root-0024's first residual for enum/composite entirely (both
+the single-message case, closed by the prior follow-up, and the
+mid-batch-`BEGIN` case, confirmed already-working by this one). The one
+remaining open item under "Deferred" above is the TRUNCATE/DROP-in-savepoint
+tracking gap, which is unrelated (a genuinely un-implemented gate, not a
+mistaken prediction) and still needs its own `TracksDDLUndo()` extension.
+
+Gates: `go build ./...` clean; `go test ./internal/server/...
+./internal/executor/... ./internal/catalog/...` PASS (full, no regressions);
+no WAL/MVCC code touched (test-only + doc-only change), so the race gate and
+`scripts/tpch-spotcheck.sh` are unaffected by this loop's diff but were
+re-run anyway per the standing pre-commit gates; pgbench smoke via the
+pre-commit hook.

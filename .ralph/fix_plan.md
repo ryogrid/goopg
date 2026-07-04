@@ -98,18 +98,26 @@ pending-set entry into a later unrelated aborting batch (the same
 collateral-damage hazard class the `connTxState.Session()` fix closed for
 `pendingDDL`). Test: `TestSimpleQueryBatchAbortUndoesEarlierCreateType`,
 confirmed RED pre-fix. Design doc `root-0024` new "Follow-up: enum/composite-
-type creation now undo-aware..." section; ledger row appended. **Two
-sub-parts remain open** (see the ledger row's `deferred`/`resume point`
-columns for both): (a) TRUNCATE/DROP-in-savepoint tracking is still
-`inTx`-gated, untouched by this loop; (b) the mid-batch-`BEGIN` compound-batch
-combination (autocommit `CREATE TYPE`, then `BEGIN`, then `ROLLBACK`, all one
-message) still leaks the type — needs the same drain-and-replay hand-off
-class `pendingDDL`'s mid-batch-`BEGIN` residual needed (loop #103), not yet
-built for the `ctx.Pending*`-based enum/composite mechanism. **Next up:**
-continue the M0119-0004 pg_dump catalog-view parity battery, or pick up
-either of the two enum/composite sub-parts above, or `root-0024`'s
-TRUNCATE/DROP-in-savepoint sibling gap — none is independently urgent, see
-each's own Deferred section.
+type creation now undo-aware..." section; ledger row appended. **This loop
+(2026-07-04, #105) closed sub-part (b) above** — traced the actual code
+instead of trusting the prior loop's note, and found the mid-batch-`BEGIN`
+combination (autocommit `CREATE TYPE`, then `BEGIN`, then `ROLLBACK`) was
+**already correctly undoing the type**: `dispatch.go`'s `ectx.Pending*`→
+`connTx` write-back fires after every successful statement including `BEGIN`
+itself, and `connTx.InExplicit()` is already true by the time `BEGIN`
+finishes, so it already carries the pre-`BEGIN` autocommit entries into
+`connTx` — no dedicated hand-off (unlike `pendingDDL`, which lives on the
+session object `BEGIN` replaces) was ever needed. No engine code changed;
+landed four permanent regression tests
+(`internal/server/dispatch_batch_atomicity_test.go`) plus a design-doc/
+ledger correction. Root-0024's first residual is now **fully closed for
+enum/composite**. **Remaining open: sub-part (a)**, TRUNCATE/DROP-in-
+savepoint tracking, still `inTx`-gated — needs `Session.TracksDDLUndo()`
+extended to `RecordTruncate`/`RecordDDLDrop`, auditing deferred-constraint-
+timing call sites first. **Next up:** continue the M0119-0004 pg_dump
+catalog-view parity battery, or pick up `root-0024`'s remaining
+TRUNCATE/DROP-in-savepoint sibling gap — neither is independently urgent,
+see each's own Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
