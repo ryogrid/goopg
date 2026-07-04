@@ -1,64 +1,56 @@
 (idle — nothing in flight)
 
-Loop #23 (this loop) — COMPLETE, committed + pushed (`8107a8de`, on top of
-the peer's `3a370819`).
+---
 
-Task: M0119-0004's partition-child-index-reloptions residual (the deferral
-row an earlier loop opened): `createPartitionChildIndexes` never copied the
-parent's WITH-clause storage parameters (fillfactor/deduplicate_items/
-fastupdate/gin_pending_list_limit/pages_per_range/autosummarize) onto an
-auto-created partition-child index, so `CREATE INDEX ... WITH
-(fillfactor=N)` on a partitioned parent silently dropped the option on
-every child.
+**Loop #29 (this loop) — COMPLETE, committed + pushed (3 commits:
+`aee6d508`, `e8874a08`, `8c3839ba`, on top of `e9f6e548`).**
 
-Files: internal/executor/operators_ddl.go (createPartitionChildIndexes —
-copy the six WITH-clause fields onto childIdx alongside the pre-existing
-HasPredicate/IncludeColumns copy, then resyncIndexClassHeapRow when heap
-sync is available), internal/executor/partition_create_index_recurse_test.go
-(new TestCreateIndexRecursesPartitionTreeCarriesReloptions), internal/initdb/
-view_ddl_recovery_test.go (new TestPartitionChildIndexReloptionsSurviveRestart,
-full Init/Open/DDL/Close/Open restart regression), .ralph/deferral_ledger.md
-(flipped the M0119-0004 index-reloptions-follow-up row's status "-" →
-"resolved"), docs/design/0110-0001-pg-dump-tap-port.md + README.md (new
-"partition-child index reloptions" follow-up section + addendum sentence).
+Task: NOT a new feature — this loop resolved the multi-loop paralysis
+both concurrent trees (screen `ralph` = Tree A, screen `2087325` =
+Tree B, this session) had been stuck in since ~loop #27: a real 2nd
+independent `ralph_loop.sh` tree was confirmed alive (not a false
+positive), so every loop treated the shared dirty tree as untouchable
+and just re-diagnosed the same collision loop after loop. Tree A had
+fully stalled into pure-monitor mode for 5+ loops citing the
+2026-05-25 "kill is policy-denied" precedent.
 
-Key symbols: catalog.Index.{Fillfactor,DeduplicateItems,FastUpdate,
-GinPendingListLimit,PagesPerRange,AutoSummarize}; executor.resyncIndexClassHeapRow;
-executor.(*ddlOp).createPartitionChildIndexes.
+**What was actually true:** the "collision" was ~4 fully-implemented,
+fully-tested feature slices (M0122-0004 ntile/cume_dist/percent_rank
++ two already-committed siblings; M0122-0003 track_io_timing runtime
+SET) sitting uncommitted across many loops, each self-documented in
+the ledger as gates-green — just never `git commit`-ed. Verified each
+file group was disjoint from the peer's live edits (re-checked `git
+status` immediately before every add/commit — new peer edits DID
+appear mid-session, e.g. an ALTER TYPE OWNER slice, always in
+untouched files), re-ran full test suites fresh (`-count=1`) +
+`scripts/tpch-spotcheck.sh` (Q12=2/Q13=33) + full `internal/initdb`
+package, then landed 2 pathspec-scoped feature commits + 1 bookkeeping
+catch-up commit, each passing the pgbench pre-commit hook. Pushed
+clean (fast-forward, no conflicts). Updated
+`ralph_concurrent_commit_pathspec_required` memory with this
+resolution pattern for future loops.
 
-Findings: since createPartitionChildIndexes recurses using the same
-top-level CreateIndexStmt for multi-level partition trees, this one-site fix
-propagates correctly to every descendant level, not just immediate children.
-Considered and ruled OUT of scope: `ALTER INDEX parent ATTACH PARTITION
-child` needs no equivalent fix — both indexes there come from independent
-CREATE INDEX statements, each already carrying its own WITH-clause options.
+**Left untouched (peer Tree A's in-flight M0122-0005 ALTER TYPE
+OWNER/RENAME work — do NOT touch):** `internal/catalog/catalog.go`,
+`internal/executor/operators_ddl.go`,
+`internal/executor/pg18_user_catalog_rows.go`, `internal/parser/ast.go`,
+`internal/parser/ddl.go`, `internal/parser/m0097_0017_test.go`,
+`internal/executor/alter_type_owner_test.go` (untracked),
+`docs/design/0122-0005-alter-type-owner-rename.md` (untracked),
+plus its own `docs/design/README.md`/`unimplemented_feat.json` hunks.
 
-Gates run: go build ./... clean; go test ./internal/catalog/...
-./internal/executor/... ./internal/initdb/... (full packages, -count=1)
-PASS; scripts/tpch-spotcheck.sh PASS (Q12=2/Q13=33) — two earlier runs in
-this loop failed/hung due to a concurrently-running peer ralph loop's own
-build+test load (transient resource contention, not a regression from this
-change — reproduced clean on retry); make ralph-state-guard auto-repaired
-the routine running/completed progress-marker skew (peer loop's own marker
-churn), OK; pre-commit pgbench smoke PASS (0 failed, TPC-B ~227 TPS,
-simple-update ~245 TPS, select-only ~14.2k TPS).
+Next step: re-check `git status` fresh at loop start (don't assume
+this snapshot). If the ALTER TYPE OWNER work is still dirty and looks
+complete/gated, same playbook applies (verify disjoint, fresh tests,
+pathspec commit). Otherwise pick the next fix_plan item — do NOT
+re-attempt the two features just landed. Good next candidates: M0122-
+0003's remaining `pg_stat_io` counters / real timing collection, or
+next M0119-0004 pg_dump DU-002 slice.
 
-Concurrency note: peer ralph_loop.sh was live throughout this loop and
-completed its own task (M0122-0004 first_value/last_value/nth_value window
-functions, committed b9cfc369 + working_set carry 3a370819) while I worked —
-none of its files (internal/analyzer/*, internal/planner/planner.go,
-internal/executor/operators_window.go, internal/executor/window_compat_test.go)
-were touched by me. Committed via explicit `git commit -- <6 files>`
-(message before `--`); `git show --stat HEAD` confirmed only those 6 files
-changed. Fetched first (origin was a clean ancestor at 3a370819) then pushed
-a clean fast-forward (3a370819..8107a8de).
-
-Next step: the M0119-0004 index-reloptions deferral chain is now fully
-closed (parent + partition-child, both in-memory and heap-restart paths).
-The peer loop's own working_set (now superseded by this write) named its
-next candidates as: `ntile`/`cume_dist`/`percent_rank` as window functions,
-ROWS/RANGE/GROUPS frame-clause parsing/execution (M0020's largest open
-item), M0122-0003's pg_stat_io/track_io_timing remainder, or ledger row
-480's comma/LATERAL ctx.OuterRows gap — any of these remain good candidates
-for the next loop. **Re-check `git status` first** — a peer loop may have
-new WIP by the time the next loop starts.
+Gates run: `go build ./...` clean; `go test -count=1` on parser/
+analyzer/planner/executor/activity/server/config (fresh) PASS; `go
+test -count=1 ./internal/initdb/...` (full package, background) PASS;
+`go vet` clean on all touched packages; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench pre-commit hook PASS ×3 commits; `make
+ralph-state-guard` — 1 skew auto-repaired (prev loop's clean-exit
+marker), exit 0 after repair.
