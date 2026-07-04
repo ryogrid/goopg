@@ -27,6 +27,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/sqlkeywords"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // sessionPRNG is the per-process random-number generator used by random(),
@@ -3247,6 +3248,188 @@ func parsePgSnapshotValid(s string) bool {
 		}
 	}
 	return true
+}
+
+// resolveRegclassOID evaluates a regclass/oid argument to its underlying OID.
+// A regclass value already carries its OID once evaluated (or, less
+// commonly, arrives as the textual OID from an explicit ::regclass cast) —
+// same pattern already used by pg_get_indexdef/pg_get_statisticsobjdef.
+func resolveRegclassOID(argExpr planner.Expr, row Row, ctx *Context) (uint32, bool) {
+	arg, err := evalExpr(argExpr, row, ctx)
+	if err != nil || arg.IsNull() {
+		return 0, false
+	}
+	if arg.Kind == KindInt {
+		return uint32(arg.Int), true
+	}
+	v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+	if perr != nil {
+		return 0, false
+	}
+	return uint32(v), true
+}
+
+// parseForkName maps a pg_relation_size fork-name argument to storage's
+// ForkNumber, matching PG's forkname_to_number (relfilenodemap.c/relpath.h).
+func parseForkName(s string) (storage.ForkNumber, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "main":
+		return storage.MainFork, true
+	case "fsm":
+		return storage.FSMFork, true
+	case "vm", "visibilitymap":
+		return storage.VisibilityMapFork, true
+	case "init":
+		return storage.InitFork, true
+	default:
+		return 0, false
+	}
+}
+
+// relationForkSize returns the byte size of one fork of rel, or 0 if that
+// fork's file has never been created. Checking Pool.Exists first is load-
+// bearing: calling NBlocks on a fork that doesn't exist would silently
+// create it (smgr O_CREATE semantics) — pg_relation_size must never do
+// that as a side effect of merely being called.
+func relationForkSize(pool *storage.Pool, rel storage.RelFileNode, fork storage.ForkNumber) int64 {
+	rel.Fork = fork
+	if !pool.Exists(rel) {
+		return 0
+	}
+	n, err := pool.NBlocks(rel)
+	if err != nil {
+		return 0
+	}
+	return int64(n) * storage.BlockSize
+}
+
+// relationAllForksSize sums the main/fsm/vm forks of rel — goopg never
+// materializes FSM/VM as separate on-disk forks, so those two always
+// contribute 0 via relationForkSize's Exists check (an accurate "never
+// created" answer, not a stub value).
+func relationAllForksSize(pool *storage.Pool, rel storage.RelFileNode) int64 {
+	return relationForkSize(pool, rel, storage.MainFork) +
+		relationForkSize(pool, rel, storage.FSMFork) +
+		relationForkSize(pool, rel, storage.VisibilityMapFork)
+}
+
+// relationFileNodeForOID resolves a regclass OID to its RelFileNode, for
+// either an ordinary table or an index — pg_relation_size accepts both.
+func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNode, bool) {
+	if tbl, ok := cat.LookupTableByOID(oid); ok {
+		return cat.RelFileNode(tbl), true
+	}
+	if idx, ok := cat.LookupIndexByOID(oid); ok {
+		return cat.IndexRelFileNode(idx), true
+	}
+	return storage.RelFileNode{}, false
+}
+
+// evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
+// mirroring PG's calculate_relation_size (dbsize.c): the byte size of one
+// named fork (default "main") of the relation's own storage. M0122-0002.
+func evalPgRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationFileNodeForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	fork := storage.MainFork
+	if len(x.Args) >= 2 {
+		forkArg, err := evalExpr(x.Args[1], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if forkArg.IsNull() {
+			return NullDatum, nil
+		}
+		f, ok := parseForkName(forkArg.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid fork name %q", forkArg.StringValue())}
+		}
+		fork = f
+	}
+	return Datum{Kind: KindInt, Int: relationForkSize(ctx.Pool, rel, fork)}, nil
+}
+
+// evalPgTableSize implements pg_table_size(relation) → bigint, mirroring
+// PG's calculate_table_size: the table's own main/fsm/vm forks plus its
+// TOAST relation's forks (but not its indexes — pg_indexes_size covers
+// those separately). M0122-0002.
+func evalPgTableSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationFileNodeForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	total := relationAllForksSize(ctx.Pool, rel)
+	if toastRel, ok := cat.ToastRelFileNode(rel); ok {
+		total += relationAllForksSize(ctx.Pool, toastRel)
+	}
+	return Datum{Kind: KindInt, Int: total}, nil
+}
+
+// evalPgIndexesSize implements pg_indexes_size(relation) → bigint: the
+// summed size of every index belonging to the named table. M0122-0002.
+func evalPgIndexesSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	var total int64
+	for _, idx := range cat.AllIndexes() {
+		if idx.Table == nil || idx.Table.OID != oid {
+			continue
+		}
+		total += relationAllForksSize(ctx.Pool, cat.IndexRelFileNode(idx))
+	}
+	return Datum{Kind: KindInt, Int: total}, nil
+}
+
+// evalPgTotalRelationSize implements pg_total_relation_size(relation) →
+// bigint: pg_table_size + pg_indexes_size, matching PG's
+// calculate_total_relation_size. M0122-0002.
+func evalPgTotalRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	tableSize, err := evalPgTableSize(x, row, ctx)
+	if err != nil || tableSize.IsNull() {
+		return tableSize, err
+	}
+	idxSize, err := evalPgIndexesSize(x, row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	total := tableSize.Int
+	if !idxSize.IsNull() {
+		total += idxSize.Int
+	}
+	return Datum{Kind: KindInt, Int: total}, nil
 }
 
 // sizePretty formats a byte count as a human-readable size string, matching
@@ -7192,13 +7375,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Stub: return 8 MB. M0097-0018.
 		return Datum{Kind: KindInt, Int: 8 * 1024 * 1024}, nil
 
-	case "pg_relation_size", "pg_total_relation_size", "pg_indexes_size":
-		// Stub: return 8 kB. M0097-0018.
-		return Datum{Kind: KindInt, Int: 8 * 1024}, nil
+	case "pg_relation_size":
+		return evalPgRelationSize(x, row, ctx)
+
+	case "pg_total_relation_size":
+		return evalPgTotalRelationSize(x, row, ctx)
+
+	case "pg_indexes_size":
+		return evalPgIndexesSize(x, row, ctx)
 
 	case "pg_table_size":
-		// Stub: return 8 kB. M0097-0018.
-		return Datum{Kind: KindInt, Int: 8 * 1024}, nil
+		return evalPgTableSize(x, row, ctx)
 
 	// ── xid8 comparison function (M0097-0018) ─────────────────────────────
 	case "xid8cmp":
