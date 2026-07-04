@@ -480,3 +480,95 @@ could generalize into arbitrary frame-bounds computation), plus
 combining named-window forms (`OVER (win ORDER BY ...)`, a named
 window based on another named window), which are real deferred
 upstream syntax, not implemented shortcuts.
+
+## Follow-up: ROWS window frame clause (2026-07-05, M0122-0004)
+
+Implemented the `{ROWS|RANGE|GROUPS} frame_extent [frame_exclusion]`
+window frame clause — the last item named by the previous Follow-up
+section. Only `ROWS` mode reaches the executor; `RANGE`/`GROUPS`
+parse structurally but are rejected by the analyzer (`0A000`), a
+deliberate v0 scope limit rather than a bug (`RANGE`'s peer-group
+value comparison needs a `<` operator lookup per ORDER BY column that
+this slice doesn't build; `GROUPS` needs group-counting bounds).
+
+**Parser (`internal/parser/expr.go`/`select.go`):** new
+`WindowFrame`/`FrameMode`/`FrameBoundKind`/`FrameExclusion` AST types
+(`WindowDef.Frame *WindowFrame`, nil when no frame clause was
+written). `parseFrameClause`/`parseFrameBound`/`parseFrameExclusion`
+mirror gram.y's `opt_frame_clause`/`frame_extent`/`frame_bound`
+productions; `ROWS`/`RANGE`/`GROUPS`/`UNBOUNDED`/`PRECEDING`/
+`FOLLOWING`/`CURRENT`/`EXCLUDE`/`TIES`/`OTHERS` are all soft
+(unreserved) keywords like `WITHIN`/`FILTER`/`WINDOW`, so no lexer
+change was needed. Bound-ordering validation and the `RANGE`/`GROUPS`
+rejection are deliberately left to the analyzer, which is the only
+layer in this codebase that raises non-syntax SQLSTATEs — the parser
+now accepts any syntactically valid frame clause.
+
+**Analyzer (`internal/analyzer/analyzer.go`):** new
+`validateWindowFrame`, called from `analyzeWindowFuncCall`, reproduces
+`gram.y`'s frame-bound reduce-time checks (all `42P20`): a start of
+`UNBOUNDED FOLLOWING`, an end of `UNBOUNDED PRECEDING`, a `CURRENT
+ROW` start with a `PRECEDING` end, and a `FOLLOWING` start with a
+`PRECEDING`/`CURRENT ROW` end are all rejected. `RANGE`/`GROUPS` are
+rejected with `0A000` before bound validation. Offset expressions are
+type-checked here (via `analyzeExpr`) but not range/null-checked —
+that mirrors `LIMIT`/`OFFSET`'s pattern of deferring range/null checks
+to a once-per-query runtime evaluation, since an offset can't be
+range-checked until it's evaluated.
+
+**Planner (`internal/planner/plan.go`/`planner.go`):** `WindowAgg`
+gains a `Frame *planner.WindowFrame` field — a resolved form of
+`parser.WindowFrame` where `StartOffset`/`EndOffset` are planner
+`Expr`s (resolved against the window's input schema by
+`resolveWindowFrame`, the same way `PARTITION BY`/`ORDER BY` are
+resolved) instead of raw `parser.Expr`. `windowSpecKey` (used to group
+window function calls sharing one `WindowAgg` node) now also hashes
+the frame clause via a new `windowFrameKey`, so two calls differing
+only in their frame clause are correctly split into separate nodes
+rather than silently sharing one `Frame`.
+
+**Executor (`internal/executor/operators_window.go`):** frame offset
+expressions are evaluated once per query (`resolveFrameOffset`,
+mirroring `limitOp.Open`'s once-per-query `LIMIT`/`OFFSET`
+evaluation — PostgreSQL disallows column/aggregate/window references
+in a frame offset for exactly this reason) into `frameStartOff`/
+`frameEndOff`, raising `22004` (null offset), `42804` (non-integer),
+or `22013` (negative) to match `nodeWindowAgg.c`'s exact error
+wording. New `frameBounds(pStart, pEnd, i)` reproduces
+`update_frameheadpos`/`update_frametailpos`'s ROWS-mode arithmetic
+exactly (postgres/src/backend/executor/nodeWindowAgg.c): both bounds
+clamp to the partition, and an out-of-order result collapses to an
+empty frame rather than erroring, matching upstream. `evalFrameAggFuncs`
+branches to a new `evalExplicitFrameAggFuncs` when `o.plan.Frame != nil`
+— per-row frame bounds via `frameBounds` instead of the shared
+per-partition peer-group accumulation the default-frame path uses —
+with `frameRowExcluded` applying `EXCLUDE CURRENT ROW`/`GROUP`/`TIES`
+against the row's peer-group bounds (`peerBoundsOf`) when an exclusion
+was specified. `first_value`/`last_value`/`nth_value` also switch to
+`o.frameBounds` (plus `firstInFrame`/`lastInFrame`/`nthInFrame` for
+exclusion-aware searching) when `o.plan.Frame != nil`, so they respect
+an explicit `ROWS` frame too. `cume_dist` is the one exception by
+design — per PG spec it is frame-independent and always uses the
+default-frame `frameEnd[]`/peer-group bounds even under an explicit
+frame clause (matches `window_cume_dist` in
+`postgres/src/backend/utils/adt/windowfuncs.c`, which never consults
+the frame).
+
+**Tests:** `internal/parser/window_test.go`
+(`TestParseWindowFuncAcceptsFrameClause`, replacing the old
+`TestParseWindowFuncRejectsFrameClause`, plus frame-shape parse-tree
+pins), `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowFrameRowsAccepted`,
+`TestAnalyzeWindowFrameRangeGroupsRejected`,
+`TestAnalyzeWindowFrameBoundOrderingRejected`),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowExplicitRowsFrameSliding`,
+`TestCompatWindowExplicitFrameExcludeCurrentRow`,
+`TestCompatWindowExplicitFrameExcludeGroupAndTies`,
+`TestCompatWindowFrameNegativeOffsetRejected` — all cross-checked
+against upstream PostgreSQL 18.3 row-for-row).
+
+**Deferred (ledger row, M0122-0004):** `RANGE`/`GROUPS` frame modes —
+the substantially larger remaining item, needing per-ORDER-BY-column
+`<`/`=` peer comparison (`RANGE`) or group-counting bounds (`GROUPS`)
+instead of `ROWS`' plain row-index arithmetic.

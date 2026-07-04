@@ -676,3 +676,234 @@ func TestCompatWindowPercentRankSingleRow(t *testing.T) {
 		t.Fatalf("pr=%v want 0", pr)
 	}
 }
+
+// TestCompatWindowExplicitRowsFrameSliding pins an explicit `ROWS
+// BETWEEN 1 PRECEDING AND 1 FOLLOWING` sliding frame for sum/
+// first_value/last_value/nth_value across a partition boundary
+// (M0122-0004 frame-clause slice) — cross-checked row-for-row against
+// a scratch upstream PostgreSQL 18.3 instance.
+func TestCompatWindowExplicitRowsFrameSliding(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 40}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 50}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 100}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 200}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, "+
+			"sum(val) OVER w AS sliding, "+
+			"first_value(val) OVER w AS fv, "+
+			"last_value(val) OVER w AS lv, "+
+			"nth_value(val, 2) OVER w AS nv2 "+
+			"FROM t "+
+			"WINDOW w AS (PARTITION BY grp ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) "+
+			"ORDER BY grp, val")
+	want := []struct{ grp, val, sliding, fv, lv, nv2 int64 }{
+		{1, 10, 30, 10, 20, 20},
+		{1, 20, 60, 10, 30, 20},
+		{1, 30, 90, 20, 40, 30},
+		{1, 40, 120, 30, 50, 40},
+		{1, 50, 90, 40, 50, 50},
+		{2, 100, 300, 100, 200, 200},
+		{2, 200, 300, 100, 200, 200},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int, rows[i][5].Int}
+		wantVals := []int64{w.grp, w.val, w.sliding, w.fv, w.lv, w.nv2}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wantVals[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wantVals)
+			}
+		}
+	}
+}
+
+// TestCompatWindowExplicitFrameExcludeCurrentRow pins `ROWS BETWEEN 1
+// PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW` and `ROWS BETWEEN
+// UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW` — the
+// second shape starts at count()=0 on the first row since UNBOUNDED
+// PRECEDING..CURRENT ROW is just row 0 itself and EXCLUDE CURRENT ROW
+// removes it — cross-checked against a scratch upstream PostgreSQL
+// 18.3 instance.
+func TestCompatWindowExplicitFrameExcludeCurrentRow(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 30}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 40}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 50}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) AS excl_cur "+
+			"FROM t ORDER BY val")
+	wantExclCur := []struct{ val, exclCur int64 }{
+		{10, 20},
+		{20, 40},
+		{30, 60},
+		{40, 80},
+		{50, 40},
+	}
+	if len(rows) != len(wantExclCur) {
+		t.Fatalf("rows=%d want %d", len(rows), len(wantExclCur))
+	}
+	for i, w := range wantExclCur {
+		if rows[i][0].Int != w.val || rows[i][1].Kind != KindInt || rows[i][1].Int != w.exclCur {
+			t.Fatalf("row[%d]=%+v want val=%d excl_cur=%d", i, rows[i], w.val, w.exclCur)
+		}
+	}
+
+	rows = runQuery(t, ctx,
+		"SELECT val, count(*) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) AS cnt_excl "+
+			"FROM t ORDER BY val")
+	wantCntExcl := []struct{ val, cntExcl int64 }{
+		{10, 0},
+		{20, 1},
+		{30, 2},
+		{40, 3},
+		{50, 4},
+	}
+	if len(rows) != len(wantCntExcl) {
+		t.Fatalf("rows=%d want %d", len(rows), len(wantCntExcl))
+	}
+	for i, w := range wantCntExcl {
+		if rows[i][0].Int != w.val || rows[i][1].Kind != KindInt || rows[i][1].Int != w.cntExcl {
+			t.Fatalf("row[%d]=%+v want val=%d cnt_excl=%d", i, rows[i], w.val, w.cntExcl)
+		}
+	}
+}
+
+// TestCompatWindowExplicitFrameExcludeGroupAndTies pins EXCLUDE GROUP
+// vs EXCLUDE TIES against a tied ORDER BY value: GROUP removes the
+// whole peer group (including the current row), TIES removes the
+// peer group except the current row itself — cross-checked against a
+// scratch upstream PostgreSQL 18.3 instance.
+func TestCompatWindowExplicitFrameExcludeGroupAndTies(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 30}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) AS excl_group "+
+			"FROM t ORDER BY val")
+	wantGroup := []struct{ val, exclGroup int64 }{
+		{10, 70},
+		{20, 40},
+		{20, 40},
+		{30, 50},
+	}
+	if len(rows) != len(wantGroup) {
+		t.Fatalf("rows=%d want %d", len(rows), len(wantGroup))
+	}
+	for i, w := range wantGroup {
+		if rows[i][0].Int != w.val || rows[i][1].Kind != KindInt || rows[i][1].Int != w.exclGroup {
+			t.Fatalf("row[%d]=%+v want val=%d excl_group=%d", i, rows[i], w.val, w.exclGroup)
+		}
+	}
+
+	rows = runQuery(t, ctx,
+		"SELECT val, sum(val) OVER (ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) AS excl_ties "+
+			"FROM t ORDER BY val")
+	wantTies := []struct{ val, exclTies int64 }{
+		{10, 80},
+		{20, 60},
+		{20, 60},
+		{30, 80},
+	}
+	if len(rows) != len(wantTies) {
+		t.Fatalf("rows=%d want %d", len(rows), len(wantTies))
+	}
+	for i, w := range wantTies {
+		if rows[i][0].Int != w.val || rows[i][1].Kind != KindInt || rows[i][1].Int != w.exclTies {
+			t.Fatalf("row[%d]=%+v want val=%d excl_ties=%d", i, rows[i], w.val, w.exclTies)
+		}
+	}
+}
+
+// TestCompatWindowFrameNegativeOffsetRejected pins nodeWindowAgg.c's
+// runtime negative-offset check (22013) — a negative frame offset
+// can't be caught until it's evaluated, so this is an executor-time
+// error like LIMIT/OFFSET's type check, not a parse/analyze error.
+// Matches upstream's exact wording ("frame starting offset must not
+// be negative").
+func TestCompatWindowFrameNegativeOffsetRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	sql := "SELECT sum(val) OVER (ORDER BY val ROWS BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t"
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatalf("Plan(%q): %v", sql, err)
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatalf("Build(%q): %v", sql, err)
+	}
+	if err := op.Open(ctx); err == nil {
+		t.Fatal("expected error, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22013" {
+		t.Fatalf("err=%v want ExecError 22013", err)
+	}
+}

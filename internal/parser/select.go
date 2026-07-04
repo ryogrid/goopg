@@ -3744,11 +3744,9 @@ func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
 }
 
 // parseWindowDef parses the `OVER ( [PARTITION BY exprs]
-// [ORDER BY sortlist] )` body, or the bare `OVER window_name` form
-// (M0020 named-window slice) that defers PartitionBy/OrderBy to the
-// analyzer's WindowClause lookup. Frame clauses (ROWS / RANGE /
-// GROUPS) are deferred — `parseWindowSpecBody` errors on any token
-// that isn't `)` after the optional ORDER BY.
+// [ORDER BY sortlist] [frame clause] )` body, or the bare `OVER
+// window_name` form (M0020 named-window slice) that defers
+// PartitionBy/OrderBy/Frame to the analyzer's WindowClause lookup.
 func (p *parser) parseWindowDef() (*WindowDef, error) {
 	t, err := p.expectKeyword(KwOver)
 	if err != nil {
@@ -3793,10 +3791,133 @@ func (p *parser) parseWindowSpecBody(pos int) (*WindowDef, error) {
 		}
 		wd.OrderBy = sl
 	}
+	frame, err := p.parseFrameClause()
+	if err != nil {
+		return nil, err
+	}
+	wd.Frame = frame
 	if !p.acceptSymbol(")") {
-		return nil, p.errAtCur("expected ')' after window definition (frame clauses are not supported in v0)")
+		return nil, p.errAtCur("expected ')' after window definition")
 	}
 	return wd, nil
+}
+
+// parseFrameClause parses the optional `{ROWS|RANGE|GROUPS} frame_extent
+// [frame_exclusion]` window frame clause trailing a window spec's
+// PARTITION BY/ORDER BY (M0122-0004). Returns nil, nil when no frame
+// clause is present — the default frame applies (see
+// internal/executor/operators_window.go). Mirrors gram.y's
+// opt_frame_clause/frame_extent productions; ROWS/RANGE/GROUPS,
+// UNBOUNDED, PRECEDING, FOLLOWING, CURRENT, EXCLUDE, TIES, and OTHERS
+// are all soft (unreserved) keywords like WITHIN/FILTER/WINDOW, so no
+// lexer/token-table change is needed. Bound-ordering validation
+// (SQLSTATE 42P20) and the RANGE/GROUPS scope limitation are left to
+// the analyzer, which is the only place in this codebase that raises
+// non-syntax SQLSTATEs.
+func (p *parser) parseFrameClause() (*WindowFrame, error) {
+	var mode FrameMode
+	switch {
+	case p.acceptIdentKeyword("rows"):
+		mode = FrameModeRows
+	case p.acceptIdentKeyword("range"):
+		mode = FrameModeRange
+	case p.acceptIdentKeyword("groups"):
+		mode = FrameModeGroups
+	default:
+		return nil, nil
+	}
+	fr := &WindowFrame{Mode: mode, EndKind: FrameBoundCurrentRow}
+	if p.acceptKeyword(KwBetween) {
+		startKind, startOffset, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwAnd); err != nil {
+			return nil, err
+		}
+		endKind, endOffset, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		fr.StartKind, fr.StartOffset = startKind, startOffset
+		fr.EndKind, fr.EndOffset = endKind, endOffset
+		fr.HasBetween = true
+	} else {
+		startKind, startOffset, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		fr.StartKind, fr.StartOffset = startKind, startOffset
+		// frame_extent: frame_bound (single-bound form) — end defaults
+		// to CURRENT ROW (already set above).
+	}
+	excl, err := p.parseFrameExclusion()
+	if err != nil {
+		return nil, err
+	}
+	fr.Exclusion = excl
+	return fr, nil
+}
+
+// parseFrameBound parses one `UNBOUNDED PRECEDING|FOLLOWING`,
+// `CURRENT ROW`, or `<expr> PRECEDING|FOLLOWING` frame bound.
+func (p *parser) parseFrameBound() (FrameBoundKind, Expr, error) {
+	switch {
+	case p.acceptIdentKeyword("unbounded"):
+		switch {
+		case p.acceptIdentKeyword("preceding"):
+			return FrameBoundUnboundedPreceding, nil, nil
+		case p.acceptIdentKeyword("following"):
+			return FrameBoundUnboundedFollowing, nil, nil
+		default:
+			return 0, nil, p.errAtCur("expected PRECEDING or FOLLOWING after UNBOUNDED")
+		}
+	case p.acceptIdentKeyword("current"):
+		if !p.acceptIdentKeyword("row") {
+			return 0, nil, p.errAtCur("expected ROW after CURRENT")
+		}
+		return FrameBoundCurrentRow, nil, nil
+	default:
+		offset, err := p.parseExpr()
+		if err != nil {
+			return 0, nil, err
+		}
+		switch {
+		case p.acceptIdentKeyword("preceding"):
+			return FrameBoundOffsetPreceding, offset, nil
+		case p.acceptIdentKeyword("following"):
+			return FrameBoundOffsetFollowing, offset, nil
+		default:
+			return 0, nil, p.errAtCur("expected PRECEDING or FOLLOWING after frame bound offset")
+		}
+	}
+}
+
+// parseFrameExclusion parses the optional `EXCLUDE {CURRENT ROW |
+// GROUP | TIES | NO OTHERS}` clause. Returns FrameExcludeNone (which
+// also represents the omitted clause) when EXCLUDE isn't present.
+func (p *parser) parseFrameExclusion() (FrameExclusion, error) {
+	if !p.acceptIdentKeyword("exclude") {
+		return FrameExcludeNone, nil
+	}
+	switch {
+	case p.acceptIdentKeyword("current"):
+		if !p.acceptIdentKeyword("row") {
+			return 0, p.errAtCur("expected ROW after EXCLUDE CURRENT")
+		}
+		return FrameExcludeCurrentRow, nil
+	case p.acceptKeyword(KwGroup):
+		return FrameExcludeGroup, nil
+	case p.acceptIdentKeyword("ties"):
+		return FrameExcludeTies, nil
+	case p.acceptIdentKeyword("no"):
+		if !p.acceptIdentKeyword("others") {
+			return 0, p.errAtCur("expected OTHERS after EXCLUDE NO")
+		}
+		return FrameExcludeNone, nil
+	default:
+		return 0, p.errAtCur("expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE")
+	}
 }
 
 // parseWindowClauseList parses the comma-separated `name AS (...)`

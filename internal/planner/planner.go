@@ -5040,12 +5040,18 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		byKey[k] = windowBinding{index: idx, typ: wf.Type}
 	}
 
+	frame, err := resolveWindowFrame(calls[0].Over.Frame, inputCtx, agg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	windowNode := &WindowAgg{
 		pos:         s.Pos(),
 		Child:       child,
 		PartitionBy: partition,
 		OrderBy:     order,
 		Funcs:       funcs,
+		Frame:       frame,
 		schema:      outputSchema,
 	}
 	outCtx := newResolveContext(nil, outputSchema)
@@ -5103,6 +5109,36 @@ func inferExprType(e Expr) catalog.Type {
 	default:
 		return catalog.Type{Name: "text"}
 	}
+}
+
+// resolveWindowFrame resolves a parser.WindowFrame's offset
+// expressions into planner Exprs, the same way buildWindowStage
+// resolves PARTITION BY/ORDER BY/FILTER expressions for the window's
+// input. Returns nil for a nil frame (default frame — unchanged
+// executor behavior). The analyzer has already rejected RANGE/GROUPS
+// and validated bound ordering, so this only needs to carry the
+// already-validated shape through — mode isn't even threaded since a
+// Frame reaching here is always ROWS.
+func resolveWindowFrame(fr *parser.WindowFrame, inputCtx *resolveContext, agg *aggregateSurface) (*WindowFrame, error) {
+	if fr == nil {
+		return nil, nil
+	}
+	out := &WindowFrame{StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion}
+	if fr.StartOffset != nil {
+		r, err := resolveExprForWindowInput(fr.StartOffset, inputCtx, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.StartOffset = r
+	}
+	if fr.EndOffset != nil {
+		r, err := resolveExprForWindowInput(fr.EndOffset, inputCtx, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.EndOffset = r
+	}
+	return out, nil
 }
 
 func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggregateSurface) (WindowFunc, error) {
@@ -5262,6 +5298,29 @@ func windowSpecKey(w *parser.WindowDef) string {
 			b.WriteString(":asc")
 		}
 		b.WriteString("|")
+	}
+	b.WriteString("f:")
+	b.WriteString(windowFrameKey(w.Frame))
+	return b.String()
+}
+
+// windowFrameKey renders a parser.WindowFrame into a comparison key
+// for windowSpecKey, so two window calls with different explicit
+// frame clauses (or one with a frame and one without) are correctly
+// treated as distinct window specifications rather than silently
+// sharing one WindowAgg node's Frame.
+func windowFrameKey(fr *parser.WindowFrame) string {
+	if fr == nil {
+		return ""
+	}
+	b := strings.Builder{}
+	fmt.Fprintf(&b, "%d:%d:%d:%d:", fr.Mode, fr.StartKind, fr.EndKind, fr.Exclusion)
+	if fr.StartOffset != nil {
+		b.WriteString(parserExprKey(fr.StartOffset))
+	}
+	b.WriteString("|")
+	if fr.EndOffset != nil {
+		b.WriteString(parserExprKey(fr.EndOffset))
 	}
 	return b.String()
 }

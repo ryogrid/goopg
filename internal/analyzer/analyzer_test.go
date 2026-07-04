@@ -323,6 +323,58 @@ func TestAnalyzeNamedWindowUndefinedRejected(t *testing.T) {
 		"42P20")
 }
 
+// TestAnalyzeWindowFrameRowsAccepted pins that a ROWS frame clause
+// (any valid bound shape) analyzes cleanly (M0122-0004 frame-clause
+// slice) — the executor is the one that actually applies these
+// bounds; the analyzer only validates mode/ordering/offset-expr shape.
+func TestAnalyzeWindowFrameRowsAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM pgbench_accounts",
+		"SELECT first_value(abalance) OVER (ORDER BY aid ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowFrameRangeGroupsRejected pins that RANGE/GROUPS
+// frame units are rejected with 0A000 — only ROWS reaches the
+// executor in this slice (see docs/design/0020-0001-window-parser-and-ast.md).
+func TestAnalyzeWindowFrameRangeGroupsRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (ORDER BY aid RANGE UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance) OVER (ORDER BY aid GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM pgbench_accounts",
+		"0A000")
+}
+
+// TestAnalyzeWindowFrameBoundOrderingRejected pins gram.y's
+// frame_extent/frame_bound windowing-error validations (all 42P20):
+// an UNBOUNDED FOLLOWING start, an UNBOUNDED PRECEDING end, and the
+// two "starting row can't come after the range it must cover" shapes.
+func TestAnalyzeWindowFrameBoundOrderingRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	cases := []string{
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS UNBOUNDED FOLLOWING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN CURRENT ROW AND 1 PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN 1 FOLLOWING AND CURRENT ROW) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS BETWEEN 1 FOLLOWING AND 1 PRECEDING) FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (ORDER BY aid ROWS 1 FOLLOWING) FROM pgbench_accounts",
+	}
+	for _, sql := range cases {
+		expectAnalyzeCode(t, cat, sql, "42P20")
+	}
+}
+
 // TestAnalyzeWithOrdinalityNamedColumn is the regression pin for the
 // WITH-ORDINALITY 42703 bug: tableFuncColumns never threaded
 // rv.TableFunc.WithOrdinality through, so the analyzer's synthetic FROM-item

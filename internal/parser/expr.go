@@ -477,23 +477,80 @@ type FuncCall struct {
 func (e *FuncCall) Pos() int { return e.pos }
 func (*FuncCall) exprNode()  {}
 
+// FrameMode identifies which of ROWS/RANGE/GROUPS an explicit window
+// frame clause uses (SQL:2003 <window frame units>). WindowDef.Frame
+// stays nil when no explicit frame clause was written — the default
+// frame (RANGE UNBOUNDED PRECEDING, peer-inclusive) applies.
+type FrameMode int
+
+const (
+	FrameModeRows FrameMode = iota
+	FrameModeRange
+	FrameModeGroups
+)
+
+// FrameBoundKind identifies one endpoint of a window frame
+// (SQL:2003 <window frame bound>). Ordered UNBOUNDED PRECEDING <
+// OFFSET PRECEDING < CURRENT ROW < OFFSET FOLLOWING < UNBOUNDED
+// FOLLOWING to mirror gram.y's bound-ordering validation.
+type FrameBoundKind int
+
+const (
+	FrameBoundUnboundedPreceding FrameBoundKind = iota
+	FrameBoundOffsetPreceding
+	FrameBoundCurrentRow
+	FrameBoundOffsetFollowing
+	FrameBoundUnboundedFollowing
+)
+
+// FrameExclusion identifies an optional EXCLUDE clause
+// (SQL:2003 <window frame exclusion>). FrameExcludeNone covers both
+// an omitted clause and the explicit EXCLUDE NO OTHERS spelling —
+// both mean "exclude nothing".
+type FrameExclusion int
+
+const (
+	FrameExcludeNone FrameExclusion = iota
+	FrameExcludeCurrentRow
+	FrameExcludeGroup
+	FrameExcludeTies
+)
+
+// WindowFrame is the parsed `{ROWS|RANGE|GROUPS} BETWEEN bound AND
+// bound [EXCLUDE ...]` frame clause of a window definition. Only
+// FrameModeRows reaches the executor (M0122-0004 frame-clause slice);
+// RANGE/GROUPS parse structurally but are rejected by the analyzer
+// (0A000) — see docs/design/0020-0001-window-parser-and-ast.md.
+type WindowFrame struct {
+	Mode        FrameMode
+	StartKind   FrameBoundKind
+	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	EndKind     FrameBoundKind
+	EndOffset   Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	Exclusion   FrameExclusion
+	// HasBetween is true for the `BETWEEN bound AND bound` spelling
+	// and false for the single-bound `frame_bound` spelling (where
+	// EndKind defaults to FrameBoundCurrentRow). The analyzer's
+	// bound-ordering validation needs this to reproduce gram.y's
+	// distinct wording for the two forms (frame_extent productions).
+	HasBetween bool
+}
+
 // WindowDef is the parsed `OVER ( [PARTITION BY exprs]
-// [ORDER BY sortlist] )` tail attached to a FuncCall (M0020 step
-// 1). Frame clauses (ROWS / RANGE / GROUPS) and frame exclusion
-// are deferred to a later slice — they're optional in upstream and
-// ROW_NUMBER / RANK / LAG / LEAD don't need explicit frames at the
-// SQL surface (the executor uses default frames).
+// [ORDER BY sortlist] [frame clause] )` tail attached to a FuncCall
+// (M0020 step 1; frame clause added M0122-0004).
 //
-// RefName is set instead of PartitionBy/OrderBy for the bare
+// RefName is set instead of PartitionBy/OrderBy/Frame for the bare
 // `OVER window_name` form (M0020 named-window slice); the analyzer
 // resolves it against the enclosing SelectStmt.WindowClause and
-// copies the definition's PartitionBy/OrderBy in, so every
+// copies the definition's PartitionBy/OrderBy/Frame in, so every
 // downstream consumer (planner, executor) only ever sees the
 // resolved form and needs no RefName-awareness of its own.
 type WindowDef struct {
 	pos         int
 	PartitionBy []Expr
 	OrderBy     []SortBy
+	Frame       *WindowFrame
 	RefName     string
 }
 

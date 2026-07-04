@@ -678,6 +678,23 @@ mirroring M0119's ledger `status` column.
       (`internal/executor/storage_test.go`) all PASS.
       `unimplemented_feat.json` entry updated in place (`status:
       resolved`).
+      **ROWS window frame clause narrowed in this bucket (2026-07-05,
+      later loop):** implemented `{ROWS|RANGE|GROUPS} frame_extent
+      [frame_exclusion]` — `ROWS` mode now parses and executes
+      end-to-end (new `parser.WindowFrame` AST, `analyzer.
+      validateWindowFrame` bound-ordering checks, `planner.WindowAgg.
+      Frame`, executor's `frameBounds`/`evalExplicitFrameAggFuncs`
+      reproducing `nodeWindowAgg.c`'s ROWS arithmetic including
+      `EXCLUDE`). `RANGE`/`GROUPS` remain rejected (`0A000`, deliberate
+      v0 scope limit — value-based peer comparison / group-counting
+      bounds, a materially separate semantic model from `ROWS`' row-index
+      arithmetic). Design: `docs/design/0020-0001-window-parser-and-ast.md`
+      new Follow-up section; both matching `unimplemented_feat.json`
+      entries annotated in place; ledger row appended (2026-07-05).
+      Gates: `go build ./...` clean; `go test -count=1
+      ./internal/parser/... ./internal/analyzer/... ./internal/planner/...
+      ./internal/executor/... ./internal/storage/...` PASS (no
+      regressions).
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

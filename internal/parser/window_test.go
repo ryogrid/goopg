@@ -100,20 +100,21 @@ func TestParseWindowFuncCountStarOver(t *testing.T) {
 	}
 }
 
-// TestParseWindowFuncRejectsFrameClause — frame clauses (ROWS /
-// RANGE / GROUPS) parse but are explicitly rejected so users
-// see a clear "deferred" diagnostic rather than a vague syntax
-// error. Pins the deferred-frame contract so a future ROWS
-// implementation can flip the reject without changing the
-// parser AST shape.
-func TestParseWindowFuncRejectsFrameClause(t *testing.T) {
+// TestParseWindowFuncAcceptsFrameClause — frame clauses (ROWS /
+// RANGE / GROUPS) now parse successfully (M0122-0004 frame-clause
+// slice; previously any frame clause was a parse-time reject — see
+// TestParseWindowFrame* above for shape coverage). RANGE/GROUPS are
+// still rejected, but at the analyzer layer (0A000) since only the
+// analyzer raises non-syntax SQLSTATEs in this codebase — see
+// internal/analyzer's window frame tests for that rejection.
+func TestParseWindowFuncAcceptsFrameClause(t *testing.T) {
 	cases := []string{
 		"SELECT row_number() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
-		"SELECT row_number() OVER (ORDER BY a RANGE UNBOUNDED PRECEDING) FROM t",
+		"SELECT sum(x) OVER (ORDER BY a RANGE UNBOUNDED PRECEDING) FROM t",
 	}
 	for _, sql := range cases {
-		if _, err := Parse(sql); err == nil {
-			t.Errorf("Parse(%q) succeeded; want error on frame clause", sql)
+		if _, err := Parse(sql); err != nil {
+			t.Errorf("Parse(%q) failed: %v", sql, err)
 		}
 	}
 }
@@ -161,6 +162,156 @@ func TestParseWindowClauseMultipleNamedWindows(t *testing.T) {
 	}
 	if s.WindowClause[0].Name != "w1" || s.WindowClause[1].Name != "w2" {
 		t.Errorf("WindowClause names = %q, %q", s.WindowClause[0].Name, s.WindowClause[1].Name)
+	}
+}
+
+// TestParseWindowFrameRowsBetweenOffsets — the general BETWEEN form
+// with two numeric offsets on both sides (M0122-0004 frame-clause
+// slice).
+func TestParseWindowFrameRowsBetweenOffsets(t *testing.T) {
+	stmts, err := Parse("SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	fr := fc.Over.Frame
+	if fr == nil {
+		t.Fatal("Frame = nil, want a parsed ROWS clause")
+	}
+	if fr.Mode != FrameModeRows {
+		t.Errorf("Mode = %v, want FrameModeRows", fr.Mode)
+	}
+	if fr.StartKind != FrameBoundOffsetPreceding || fr.StartOffset == nil {
+		t.Errorf("StartKind/StartOffset = %v/%v, want FrameBoundOffsetPreceding/non-nil", fr.StartKind, fr.StartOffset)
+	}
+	if fr.EndKind != FrameBoundOffsetFollowing || fr.EndOffset == nil {
+		t.Errorf("EndKind/EndOffset = %v/%v, want FrameBoundOffsetFollowing/non-nil", fr.EndKind, fr.EndOffset)
+	}
+	if fr.Exclusion != FrameExcludeNone {
+		t.Errorf("Exclusion = %v, want FrameExcludeNone", fr.Exclusion)
+	}
+}
+
+// TestParseWindowFrameSingleBoundDefaultsEndToCurrentRow — the
+// single-frame_bound form (`ROWS <bound>` with no BETWEEN/AND)
+// defaults the end bound to CURRENT ROW, per gram.y's frame_extent:
+// frame_bound production.
+func TestParseWindowFrameSingleBoundDefaultsEndToCurrentRow(t *testing.T) {
+	stmts, err := Parse("SELECT sum(x) OVER (ORDER BY y ROWS UNBOUNDED PRECEDING) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	fr := fc.Over.Frame
+	if fr == nil {
+		t.Fatal("Frame = nil, want a parsed ROWS clause")
+	}
+	if fr.StartKind != FrameBoundUnboundedPreceding {
+		t.Errorf("StartKind = %v, want FrameBoundUnboundedPreceding", fr.StartKind)
+	}
+	if fr.EndKind != FrameBoundCurrentRow {
+		t.Errorf("EndKind = %v, want FrameBoundCurrentRow (single-bound default)", fr.EndKind)
+	}
+}
+
+// TestParseWindowFrameCurrentRowBound pins `CURRENT ROW` frame_bound
+// parsing on both ends of a BETWEEN clause.
+func TestParseWindowFrameCurrentRowBound(t *testing.T) {
+	stmts, err := Parse("SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	fr := fc.Over.Frame
+	if fr.StartKind != FrameBoundCurrentRow {
+		t.Errorf("StartKind = %v, want FrameBoundCurrentRow", fr.StartKind)
+	}
+	if fr.EndKind != FrameBoundUnboundedFollowing {
+		t.Errorf("EndKind = %v, want FrameBoundUnboundedFollowing", fr.EndKind)
+	}
+}
+
+// TestParseWindowFrameExcludeClauses pins all four EXCLUDE spellings,
+// including that EXCLUDE NO OTHERS parses to the same FrameExcludeNone
+// as an omitted clause (gram.y's opt_window_exclusion_clause).
+func TestParseWindowFrameExcludeClauses(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want FrameExclusion
+	}{
+		{"SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t", FrameExcludeCurrentRow},
+		{"SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM t", FrameExcludeGroup},
+		{"SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t", FrameExcludeTies},
+		{"SELECT sum(x) OVER (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW EXCLUDE NO OTHERS) FROM t", FrameExcludeNone},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.sql)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sql, err)
+		}
+		fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+		if fc.Over.Frame.Exclusion != c.want {
+			t.Errorf("%s: Exclusion = %v, want %v", c.sql, fc.Over.Frame.Exclusion, c.want)
+		}
+	}
+}
+
+// TestParseWindowFrameRangeAndGroupsModesParse pins that RANGE and
+// GROUPS frame clauses parse structurally (Mode set accordingly) even
+// though the analyzer rejects them with 0A000 — only ROWS reaches the
+// executor in this slice.
+func TestParseWindowFrameRangeAndGroupsModesParse(t *testing.T) {
+	stmts, err := Parse("SELECT sum(x) OVER (ORDER BY y RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	if fc.Over.Frame.Mode != FrameModeRange {
+		t.Errorf("Mode = %v, want FrameModeRange", fc.Over.Frame.Mode)
+	}
+
+	stmts, err = Parse("SELECT sum(x) OVER (ORDER BY y GROUPS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc = stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	if fc.Over.Frame.Mode != FrameModeGroups {
+		t.Errorf("Mode = %v, want FrameModeGroups", fc.Over.Frame.Mode)
+	}
+}
+
+// TestParseWindowFrameBoundOrderingErrors pins the gram.y
+// frame_extent/frame_bound windowing-error validations that a
+// resume-point loop must still add at the analyzer layer (this parser
+// itself doesn't raise 42P20 — see parseFrameClause's doc comment).
+// This test only pins that these currently-invalid shapes still parse
+// (no premature rejection at the parser layer); the analyzer test file
+// pins the actual 42P20 rejections.
+func TestParseWindowFrameNoFrameClauseStaysNil(t *testing.T) {
+	stmts, err := Parse("SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := stmts[0].(*SelectStmt).Targets[0].Expr.(*FuncCall)
+	if fc.Over.Frame != nil {
+		t.Errorf("Frame = %+v, want nil when no frame clause is written", fc.Over.Frame)
+	}
+}
+
+// TestParseWindowClauseFrameOnNamedWindow pins that a named `WINDOW
+// name AS (...)` item can also carry a frame clause — parseWindowSpecBody
+// is shared between the anonymous and named forms
+// (pattern_sibling_paths_must_agree), so this must stay in sync with
+// TestParseWindowFrameRowsBetweenOffsets.
+func TestParseWindowClauseFrameOnNamedWindow(t *testing.T) {
+	stmts, err := Parse("SELECT sum(x) OVER w FROM t WINDOW w AS (ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	fr := s.WindowClause[0].Def.Frame
+	if fr == nil || fr.StartKind != FrameBoundOffsetPreceding {
+		t.Fatalf("WindowClause[0].Def.Frame = %+v, want StartKind FrameBoundOffsetPreceding", fr)
 	}
 }
 

@@ -861,6 +861,7 @@ func resolveWindowRefsInExpr(e parser.Expr, defs map[string]*parser.WindowDef) e
 			}
 			x.Over.PartitionBy = def.PartitionBy
 			x.Over.OrderBy = def.OrderBy
+			x.Over.Frame = def.Frame
 		}
 		for _, a := range x.Args {
 			if err := resolveWindowRefsInExpr(a, defs); err != nil {
@@ -1473,7 +1474,56 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 	}
+	if err := validateWindowFrame(x.Over.Frame, x.Over.Pos(), ctx); err != nil {
+		return catalog.Type{}, err
+	}
 	return retType, nil
+}
+
+// validateWindowFrame validates a parsed window frame clause's mode
+// and bound ordering (SQL:2003 <window frame clause>), mirroring
+// gram.y's frame_extent/frame_bound reduce-time checks — all
+// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE/GROUPS scope
+// limitation (0A000). Returns nil for a nil frame (no explicit frame
+// clause was written — the default frame applies). Also type-checks
+// (but does not range-check) any offset expressions; the executor
+// mirrors LIMIT's pattern of range/null-checking a once-evaluated
+// constant expression at runtime (22004/22013), since an offset can't
+// be validated until it's evaluated.
+func validateWindowFrame(fr *parser.WindowFrame, pos int, ctx *scope) error {
+	if fr == nil {
+		return nil
+	}
+	if fr.Mode != parser.FrameModeRows {
+		return analyzeError(pos, "0A000", "RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented")
+	}
+	if fr.StartKind == parser.FrameBoundUnboundedFollowing {
+		return analyzeError(pos, "42P20", "frame start cannot be UNBOUNDED FOLLOWING")
+	}
+	if fr.HasBetween {
+		if fr.EndKind == parser.FrameBoundUnboundedPreceding {
+			return analyzeError(pos, "42P20", "frame end cannot be UNBOUNDED PRECEDING")
+		}
+		if fr.StartKind == parser.FrameBoundCurrentRow && fr.EndKind == parser.FrameBoundOffsetPreceding {
+			return analyzeError(pos, "42P20", "frame starting from current row cannot have preceding rows")
+		}
+		if fr.StartKind == parser.FrameBoundOffsetFollowing && (fr.EndKind == parser.FrameBoundOffsetPreceding || fr.EndKind == parser.FrameBoundCurrentRow) {
+			return analyzeError(pos, "42P20", "frame starting from following row cannot have preceding rows")
+		}
+	} else if fr.StartKind == parser.FrameBoundOffsetFollowing {
+		return analyzeError(pos, "42P20", "frame starting from following row cannot end with current row")
+	}
+	if fr.StartOffset != nil {
+		if _, err := analyzeExpr(fr.StartOffset, ctx); err != nil {
+			return err
+		}
+	}
+	if fr.EndOffset != nil {
+		if _, err := analyzeExpr(fr.EndOffset, ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {

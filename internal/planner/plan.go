@@ -803,7 +803,29 @@ type WindowAgg struct {
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
-	schema      Schema
+	// Frame is the resolved ROWS window frame clause shared by every
+	// func in this node (nil when no explicit frame clause was
+	// written — the executor's default frame applies). The analyzer
+	// already rejected RANGE/GROUPS and validated bound ordering, so
+	// by the time a Frame reaches the planner it is always ROWS-mode
+	// and well-formed (M0122-0004 frame-clause slice).
+	Frame  *WindowFrame
+	schema Schema
+}
+
+// WindowFrame is the planner-resolved form of parser.WindowFrame:
+// StartOffset/EndOffset are planner Exprs (resolved against the
+// window's input schema, mirroring how Limit.Limit/Offset are
+// resolved) instead of raw parser.Expr. StartKind/EndKind/Exclusion
+// reuse the parser package's small bound-kind enums directly rather
+// than duplicating them, matching the existing convention of BinaryOp/
+// UnaryOp.Op reusing parser.OpCode.
+type WindowFrame struct {
+	StartKind   parser.FrameBoundKind
+	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	EndKind     parser.FrameBoundKind
+	EndOffset   Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	Exclusion   parser.FrameExclusion
 }
 
 func (n *WindowAgg) Pos() int       { return n.pos }
