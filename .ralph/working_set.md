@@ -41,9 +41,8 @@ UNIQUE/EXCLUDE/FK constraint timing, stats scoping); (2) a
 still loses t1's undo entry when the throwaway session is replaced by the real
 one mid-batch (not a regression — was never undoable before either).
 
-Next step: not yet committed as of end of this turn's work — commit + push
-this change set (triggers the pgbench-smoke pre-commit hook). Then resume
-M0110/M0119 per fix_plan.md's Current Priority banner: continue the
-M0119-0004 pg_dump catalog-view parity battery (next gap via
-`TestPort_PgDumpConnectionSetup`), or pick up one of the two residuals above
-if a fresh discovery motivates it.
+Committed and pushed this loop (22a9fbc5, pgbench smoke pre-commit hook PASS,
+0 failed transactions across all 3 workloads). Next step: resume M0110/M0119
+per fix_plan.md's Current Priority banner: continue the M0119-0004 pg_dump
+catalog-view parity battery (next gap via `TestPort_PgDumpConnectionSetup`),
+or pick up one of the two residuals above if a fresh discovery motivates it.
