@@ -26,6 +26,8 @@ import (
 type schemaRegistryRecovery interface {
 	RegisterSchemaDuringRecovery(name string, oid uint32)
 	UnregisterSchemaDuringRecovery(name string)
+	RenameSchemaDuringRecovery(old, new string)
+	SetSchemaOwnerDuringRecovery(name string, ownerOID uint32)
 }
 
 // replaySchemaDDLRecords reads every WAL record under walDir and applies
@@ -80,6 +82,18 @@ func replaySchemaDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-schema at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.UnregisterSchemaDuringRecovery(name)
+		case wal.RecordKindAlterSchemaRename:
+			name, newName, derr := wal.DecodeAlterSchemaRename(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-schema-rename at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.RenameSchemaDuringRecovery(name, newName)
+		case wal.RecordKindAlterSchemaOwner:
+			name, ownerOID, derr := wal.DecodeAlterSchemaOwner(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-schema-owner at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetSchemaOwnerDuringRecovery(name, ownerOID)
 		}
 	}
 	return nil

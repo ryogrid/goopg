@@ -173,6 +173,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateStatistics(s)
 	case *parser.AlterStatisticsStmt:
 		return nil, o.execAlterStatistics(s)
+	case *parser.AlterSchemaStmt:
+		return nil, o.execAlterSchema(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -16127,6 +16129,90 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		target = &v
 	}
 	im.SetStatisticsTarget(name, target)
+	return nil
+}
+
+// execAlterSchema implements ALTER SCHEMA name RENAME TO / OWNER TO (DU-002
+// slice 440 resume point (3), M0110-0001). Unlike ALTER SEQUENCE/VIEW (slices
+// 439/440), a schema is not a relation, so it cannot be routed through
+// execAlterTable — it needs the dedicated catalog.RenameSchema/SetSchemaOwner
+// mechanism. RENAME cascades into every table/view/sequence/index whose
+// Schema names the old schema (goopg keys those catalogs by schema NAME, not
+// OID like real PostgreSQL's relnamespace) and, for any moved sequence,
+// mirrors the SET SCHEMA-on-single-sequence cascade in execAlterTable so
+// nextval()/currval() keep resolving under the sequence's new qualified name.
+func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	switch s.Action {
+	case "rename":
+		if !im.SchemaExists(s.Name) {
+			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
+		}
+		if im.SchemaExists(s.NewName) {
+			return &ExecError{Code: "42P06", Pos: s.Pos(), Message: fmt.Sprintf("schema %q already exists", s.NewName)}
+		}
+		moved, err := im.RenameSchema(s.Name, s.NewName)
+		if err != nil {
+			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaRename(s.Name, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-schema-rename: %w", werr)
+			}
+		}
+		for _, tbl := range moved {
+			if !tbl.IsSequence {
+				continue
+			}
+			oldFull := s.Name + "." + tbl.Name
+			newFull := s.NewName + "." + tbl.Name
+			if RenameSequence(oldFull, newFull) || RenameSequence(tbl.Name, newFull) {
+				if o.ctx.WAL != nil {
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(tbl.Name))))
+				}
+				WALLogSequenceState(o.ctx, newFull)
+				capturedNewFull := newFull
+				tbl.VirtualRows = func() [][]string {
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					if !ok2 {
+						return nil
+					}
+					calledStr := "f"
+					if called {
+						calledStr = "t"
+					}
+					return [][]string{{
+						fmt.Sprintf("%d", lv),
+						fmt.Sprintf("%d", lc),
+						calledStr,
+					}}
+				}
+			}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors pg_namespace.nspowner's prior hardcoded default
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetSchemaOwner(s.Name, ownerOID) {
+			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaOwner(s.Name, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-schema-owner: %w", werr)
+			}
+		}
+		return nil
+	}
 	return nil
 }
 

@@ -6356,13 +6356,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// physical replay and re-applies them to the catalog's database
 		// list.
 		return false, nil
-	case RecordKindCreateSchema, RecordKindDropSchema:
-		// CREATE/DROP SCHEMA records (M0110-0003) carry only the schema
-		// name (+ OID for create); goopg has no per-schema file namespace,
-		// so the physical replay path has nothing to do. The recovery
-		// driver in internal/initdb/schema_ddl_recovery.go scans the WAL
-		// for these records after physical replay and re-applies them to
-		// the catalog's schema registry.
+	case RecordKindCreateSchema, RecordKindDropSchema, RecordKindAlterSchemaRename, RecordKindAlterSchemaOwner:
+		// CREATE/DROP/ALTER SCHEMA records (M0110-0003 / DU-002 slice 440
+		// resume point (3)) carry only pg_namespace metadata; goopg has no
+		// per-schema file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
+		// internal/initdb/schema_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the
+		// catalog's schema registry.
 		return false, nil
 	case RecordKindCreateTransform, RecordKindDropTransform:
 		// CREATE/DROP TRANSFORM records (M0119-0004 restart persistence)

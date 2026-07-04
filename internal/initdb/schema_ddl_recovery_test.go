@@ -102,6 +102,63 @@ func TestSchemaDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	}
 }
 
+// TestSchemaDDLRecoveryReplaysAlterRenameOwner confirms DU-002 slice 440
+// resume point (3) (M0110-0001): ALTER SCHEMA RENAME TO / OWNER TO are now
+// WAL-logged and replayed in order, so the post-restart registry reflects the
+// schema's final identity and owner, not its as-created one.
+func TestSchemaDDLRecoveryReplaysAlterRenameOwner(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40130)
+	const wantOwnerOID = uint32(16385)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("s1", wantOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-schema: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterSchemaRename("s1", "s2")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append alter-schema-rename: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterSchemaOwner("s2", wantOwnerOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append alter-schema-owner: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat := rt2.Catalog.(*catalog.InMemory)
+	if cat.SchemaExists("s1") {
+		t.Error("after rename replay, old schema name s1 still resolves, want gone")
+	}
+	if !cat.SchemaExists("s2") {
+		t.Fatal("after rename replay, renamed schema s2 not found")
+	}
+	if got := cat.SchemaOID("s2"); got != wantOID {
+		t.Errorf("after rename replay, SchemaOID(s2) = %d, want %d (OID not preserved)", got, wantOID)
+	}
+	if got := cat.SchemaOwnerOID("s2"); got != wantOwnerOID {
+		t.Errorf("after owner replay, SchemaOwnerOID(s2) = %d, want %d", got, wantOwnerOID)
+	}
+}
+
 // TestReplaySchemaDDLRecordsHandlesMissingWalDir verifies the recovery hook is
 // idempotent when invoked against a missing pg_wal directory (brand new initdb).
 func TestReplaySchemaDDLRecordsHandlesMissingWalDir(t *testing.T) {

@@ -13790,3 +13790,127 @@ slice 317). Gates: `go build ./...`/`go vet ./...` clean; `go test -race
 `internal/catalog`+`internal/executor`+`internal/initdb`+`internal/parser`
 suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
 pgbench TPC-B smoke PASS.
+
+## Follow-up: `ALTER SCHEMA name RENAME TO / OWNER TO` had no catalog mechanism at all (DU-002 slice 440 resume point (3))
+
+Closes the last open resume point of the slice-440 ledger row. Unlike ALTER
+SEQUENCE/VIEW (slices 439/440), a schema is not a relation and cannot be
+routed through `execAlterTable`; unlike ALTER STATISTICS/COLLATION (slices
+441/442), goopg had no schema-object registry mutators at all — `ALTER
+SCHEMA` fell into the same blanket "schema/view/collation/..." compat-stub
+loop in `parseAlter` that ALTER VIEW fell into before slice 440, silently
+consuming and discarding both `RENAME TO` and `OWNER TO`.
+
+Real PostgreSQL's `ALTER SCHEMA` only has these two forms
+(`postgres/src/backend/commands/schemacmds.c`'s `RenameSchema`/
+`AlterSchemaOwner`); there is no `SET SCHEMA` (schemas aren't nested) and no
+sample-target-style in-memory-only form like statistics' `SET STATISTICS n`.
+
+### The name-vs-OID mismatch that makes this harder than ALTER SEQUENCE/VIEW
+
+Real PostgreSQL's namespace rename is a single `pg_namespace` row update:
+every other catalog references a schema by OID (`relnamespace`), so renaming
+just changes `nspname` and every contained object's `relnamespace` is still
+valid. goopg's `catalog.InMemory.tables`/`.indexes` maps instead key directly
+by schema **name** (`"schema.name"`, see `key()`), and `Table.Schema`/
+`Index.Schema` store the name, not an OID. So a schema rename in goopg must
+cascade into every table/index whose `Schema` field names the old schema,
+re-keying both the map entry and the field — the exact complexity the
+slice-440 ledger row flagged as the reason this couldn't reuse the
+relation-level `SetSchema` mechanism.
+
+### What landed
+
+- `catalog.InMemory` gains `schemaOwners map[string]uint32` (lowercase
+  schema name → owner OID; absent = bootstrap superuser 10, matching
+  `pg_namespace.nspowner`'s previous hardcoded `"10"` literal, now wired
+  through `SchemaOwnerOID`) and:
+  - `SchemaOwnerOID(name) uint32` / `SetSchemaOwner(name, ownerOID) bool` /
+    `SetSchemaOwnerDuringRecovery`.
+  - `RenameSchema(old, new) ([]*Table, error)`: re-keys `schemas`/
+    `schemaOwners`, then iterates `c.tables` and `c.indexes` re-pointing
+    `Schema` + the map key for every entry whose `Schema` names the old
+    schema. Returns the subset of moved tables that are sequences (`Table.
+    IsSequence`) so the executor can additionally cascade the
+    executor-side `seqRegistry` (a `sync.Map` in `internal/executor`, which
+    `internal/catalog` cannot import). Errors mirror upstream: `schema
+    "old" does not exist` / `schema "new" already exists`.
+  - `RenameSchemaDuringRecovery` — discard-result idempotent wrapper.
+- `internal/parser/ast.go`: new `AlterSchemaStmt{Name, Action ("rename"|
+  "owner"), NewName, NewOwner}` node.
+- `internal/parser/ddl.go`'s `parseAlter`: dedicated `if
+  p.acceptIdentKeyword("schema")` case placed before the generic compat-stub
+  loop (which now only handles `collation`/`domain`/`extension`/`language`/
+  `operator`/`system` — "schema" removed from that list, same treatment
+  "view" got at slice 440), parsing `RENAME TO`/`OWNER TO` (with the
+  `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` → `"current_user"` sentinel,
+  matching every other OWNER TO site) and falling back to a no-op consume
+  for any other trailing tokens.
+- `internal/server/dispatch.go`'s `ddlTag`: `*parser.AlterSchemaStmt` →
+  `"ALTER SCHEMA"`.
+- `internal/planner/planner.go`: `*parser.AlterSchemaStmt` routed to the
+  generic `DDL` plan node (was missing entirely — surfaced as `unsupported
+  statement type *parser.AlterSchemaStmt` during live verification even
+  after the parser+executor sides were wired, since every other new
+  statement type needs this case too).
+- `internal/executor/operators_ddl.go`'s new `execAlterSchema`: `"rename"`
+  pre-checks `SchemaExists` both ways for the right SQLSTATE (`3F000`
+  undefined_schema / `42P06` duplicate_schema, matching upstream's
+  `ERRCODE_UNDEFINED_SCHEMA`/`ERRCODE_DUPLICATE_SCHEMA`), calls
+  `catalog.RenameSchema`, WAL-logs it, then for each returned sequence
+  mirrors `execAlterTable`'s SET SCHEMA-on-single-sequence cascade exactly
+  (`RenameSequence` the live `seqRegistry` entry, `WAL.Append
+  (EncodeDropSequence(old))` + `WALLogSequenceState(new)` so the sequence's
+  current value round-trips a restart under its new qualified name, and
+  refresh `Table.VirtualRows` to read from the new key). `"owner"` resolves
+  the target role via `im.RoleOID` (raising `42704 role "..." does not
+  exist` on a miss — the same role-existence-check pattern
+  `execAlterStatistics` already established, closing this specific instance
+  of the slice-439 resume-point-(2) gap for the schema OWNER TO site; the
+  shared `execAlterTable` OWNER TO branch used by TABLE/SEQUENCE/VIEW still
+  has no such check, unchanged) and calls `SetSchemaOwner` + WAL-logs it.
+- New WAL record kinds `RecordKindAlterSchemaRename`/`Owner` (100/101,
+  `internal/wal/schema_alter_ddl.go`, same wire format as the ALTER
+  STATISTICS rename/owner pair) with encode/decode pairs, a physical-replay
+  no-op case in `wal.ApplyRecord` (extends the existing `RecordKindCreate
+  Schema, RecordKindDropSchema` case rather than adding a new one, since
+  CREATE/DROP SCHEMA kinds 34/35 already had the "no per-schema file
+  namespace" no-op), and recovery replay wired into
+  `internal/initdb/schema_ddl_recovery.go`'s `schemaRegistryRecovery`
+  interface + `replaySchemaDDLRecords` switch (mirrors CREATE/DROP SCHEMA
+  exactly, run in WAL order after them).
+- Tests: `internal/executor/alter_schema_test.go`
+  (`TestAlterSchemaRenameOwner` — rename cascades a contained table's
+  `Schema` field and re-keys `LookupTable`, both SQLSTATEs, owner-role
+  validation, owner default); `internal/wal/schema_alter_ddl_test.go`
+  (round-trip + wrong-kind + truncated-payload for both new kinds);
+  `internal/initdb/schema_ddl_recovery_test.go`'s new
+  `TestSchemaDDLRecoveryReplaysAlterRenameOwner` (real `Init`/`Open`/
+  WAL.Append(create+rename+owner)/`Close`/re-`Open` round trip).
+- Live-verified end-to-end against goopg/psql beyond the unit tests: `CREATE
+  SCHEMA s1` → table + sequence inside it → `ALTER SCHEMA s1 RENAME TO s2`
+  → both the table and `nextval()` on the sequence resolve under `s2` and
+  not `s1` → `ALTER SCHEMA s2 OWNER TO alice` → `pg_namespace.nspowner`
+  reflects the new owner's OID → **full server restart** → schema name,
+  owner, table data, and sequence continuity (next `nextval()` still
+  monotonic, not reset) all survive.
+
+### Deferred (recorded in the ledger, not silently dropped)
+
+`RenameSchema`'s table/index/sequence cascade does **not** extend to every
+other schema-name-keyed registry in `catalog.InMemory` — `opClassSchemas`
+(operator classes) and `statisticsObjs` (extended-statistics objects, keyed
+`schema.name`) were not audited and will orphan under the old schema name if
+a schema containing one of these is renamed. `userCollations`/
+`userConversions` carry a `Schema` field but aren't stored in a schema-keyed
+map, so they're likely unaffected but weren't verified either way. See the
+deferral-ledger row appended this loop for the exact resume point (a shared
+"rekey entries whose Schema matches" helper, reused by `RenameSchema` for
+each additional registry).
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/initdb/...
+./internal/catalog/... ./internal/parser/... ./internal/executor/...
+./internal/planner/... ./internal/server/...` PASS; unit pre-commit gate
+(`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`) PASS; TPC-H
+spotcheck PASS; live end-to-end verification against `psql` including a full
+server restart, described above.

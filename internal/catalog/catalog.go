@@ -2185,6 +2185,13 @@ type InMemory struct {
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
 	schemas map[string]uint32
 
+	// schemaOwners maps lowercase schema name → owning role OID, set by
+	// `ALTER SCHEMA name OWNER TO role` (DU-002 slice 440 resume point (3),
+	// M0110-0001). A schema absent from this map has no explicit owner
+	// change recorded and defaults to the bootstrap superuser (OID 10),
+	// matching pg_namespace.nspowner's previous hardcoded literal.
+	schemaOwners map[string]uint32
+
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
 	// namespace (pg_temp_<id>). In PostgreSQL every backend that creates a
@@ -2947,6 +2954,7 @@ func NewInMemory() *InMemory {
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
+		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),
 		predefinedRoles:    newPredefinedRoleMap(),
 		roleAttrs:          make(map[string]*RoleAttrs),
@@ -5827,10 +5835,10 @@ func (c *InMemory) registerSystemTables() {
 				continue // skip internal alias
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(s.oid)),  // oid
-				s.name,                    // nspname
-				"10",                      // nspowner
-				c.NamespaceACLText(s.oid), // nspacl (NULL until a schema GRANT, slice 335)
+				strconv.Itoa(int(s.oid)), // oid
+				s.name,                   // nspname
+				strconv.Itoa(int(c.SchemaOwnerOID(s.name))), // nspowner (ALTER SCHEMA ... OWNER TO, DU-002 slice 440 resume point (3); defaults to bootstrap superuser)
+				c.NamespaceACLText(s.oid),                   // nspacl (NULL until a schema GRANT, slice 335)
 			})
 		}
 		return out
@@ -10366,6 +10374,106 @@ func (c *InMemory) UnregisterSchema(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.schemas, strings.ToLower(name))
+}
+
+// SchemaOwnerOID returns the owning role OID recorded for the given schema
+// (ALTER SCHEMA ... OWNER TO), or the bootstrap superuser (10) — the
+// long-standing pg_namespace.nspowner default — when no explicit owner
+// change has been recorded. DU-002 slice 440 resume point (3) (M0110-0001).
+func (c *InMemory) SchemaOwnerOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if oid, ok := c.schemaOwners[strings.ToLower(name)]; ok {
+		return oid
+	}
+	return 10
+}
+
+// SetSchemaOwner records the owning role OID for a schema (ALTER SCHEMA ...
+// OWNER TO). Returns false if the schema does not exist. DU-002 slice 440
+// resume point (3) (M0110-0001).
+func (c *InMemory) SetSchemaOwner(name string, ownerOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.schemas[lc]; !ok {
+		return false
+	}
+	c.schemaOwners[lc] = ownerOID
+	return true
+}
+
+// SetSchemaOwnerDuringRecovery is the discard-result recovery counterpart to
+// SetSchemaOwner, mirroring SetStatisticsOwnerDuringRecovery.
+func (c *InMemory) SetSchemaOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetSchemaOwner(name, ownerOID)
+}
+
+// RenameSchema renames a user schema (ALTER SCHEMA ... RENAME TO). Real
+// PostgreSQL's namespace rename is a single pg_namespace row update because
+// every other catalog references a schema by OID (relnamespace); goopg's
+// Table/Index catalog instead keys directly by schema NAME (see key()), so a
+// schema rename must cascade into every table/view/sequence/index whose
+// Schema field names the old schema, re-keying their map entries too.
+// Returns the tables that were sequences (so the caller can additionally
+// cascade the executor-side seqRegistry, mirroring the SET SCHEMA-on-single-
+// sequence cascade in execAlterTable) and an error if old does not exist or
+// new already exists (mirrors upstream RenameSchema,
+// postgres/src/backend/commands/schemacmds.c). DU-002 slice 440 resume point
+// (3) (M0110-0001).
+func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lcOld := strings.ToLower(old)
+	lcNew := strings.ToLower(new)
+	oid, ok := c.schemas[lcOld]
+	if !ok {
+		return nil, fmt.Errorf("schema %q does not exist", old)
+	}
+	if _, exists := c.schemas[lcNew]; exists {
+		return nil, fmt.Errorf("schema %q already exists", new)
+	}
+	delete(c.schemas, lcOld)
+	c.schemas[lcNew] = oid
+	if owner, ok := c.schemaOwners[lcOld]; ok {
+		delete(c.schemaOwners, lcOld)
+		c.schemaOwners[lcNew] = owner
+	}
+	var movedSequences []*Table
+	for k, tbl := range c.tables {
+		if !strings.EqualFold(tbl.Schema, old) {
+			continue
+		}
+		tbl.Schema = new
+		newK := key(parser.ObjectName{Schema: new, Name: tbl.Name})
+		if newK != k {
+			delete(c.tables, k)
+			c.tables[newK] = tbl
+		}
+		if tbl.IsSequence {
+			movedSequences = append(movedSequences, tbl)
+		}
+	}
+	for k, idx := range c.indexes {
+		if !strings.EqualFold(idx.Schema, old) {
+			continue
+		}
+		idx.Schema = new
+		newK := key(parser.ObjectName{Schema: new, Name: idx.Name})
+		if newK != k {
+			delete(c.indexes, k)
+			c.indexes[newK] = idx
+		}
+	}
+	return movedSequences, nil
+}
+
+// RenameSchemaDuringRecovery is the idempotent, discard-result recovery
+// counterpart to RenameSchema used by the WAL-replay driver. Errors (e.g. a
+// stale record replaying after a later drop) are swallowed, mirroring
+// RenameStatisticsObjectDuringRecovery.
+func (c *InMemory) RenameSchemaDuringRecovery(old, new string) {
+	_, _ = c.RenameSchema(old, new)
 }
 
 // RegisterSchemaDuringRecovery is the idempotent version of RegisterSchema

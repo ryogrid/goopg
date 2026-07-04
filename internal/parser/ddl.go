@@ -7311,12 +7311,61 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return nil, p.errAtCur("expected DISABLE, ENABLE, RENAME TO, or OWNER TO in ALTER EVENT TRIGGER")
 	}
-	// ALTER SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
-	// SYSTEM — compatibility stubs. Consume until end of statement. (ALTER
-	// VIEW has its own dedicated case above, DU-002 slice 440 — "view" is
-	// intentionally not in this list.)
+	// ALTER SCHEMA name RENAME TO newname / ALTER SCHEMA name OWNER TO role —
+	// real PostgreSQL's only two ALTER SCHEMA forms (schemacmds.c's
+	// RenameSchema/AlterSchemaOwner). Previously "schema" fell into the
+	// generic compat-stub loop below, which silently consumed and discarded
+	// both forms — a functional no-op, not merely a mistagging bug, the same
+	// class of gap ALTER VIEW had before DU-002 slice 440. DU-002 slice 440
+	// resume point (3) (M0110-0001).
+	if p.acceptIdentKeyword("schema") {
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		name := identText(nameTok)
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterSchemaStmt{pos: t.Pos, Name: name, Action: "rename", NewName: identText(newNameTok)}, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterSchemaStmt{pos: t.Pos, Name: name, Action: "owner"}
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.NewOwner = identText(tok)
+			} else {
+				ownerStmt.NewOwner = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		// Unmodelled ALTER SCHEMA form — consume to the terminator and
+		// return a no-op, mirroring the compat-stub loop's prior behavior.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
+	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
+	// its own dedicated case above, DU-002 slice 440 — "view" is
+	// intentionally not in this list; ALTER SCHEMA has its own dedicated
+	// case immediately above — DU-002 slice 440 resume point (3).)
 	for _, objIdent := range []string{
-		"schema",
 		"collation", "domain", "extension", "language",
 		"operator", "system",
 	} {

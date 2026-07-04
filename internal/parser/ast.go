@@ -2413,6 +2413,27 @@ type AlterStatisticsStmt struct {
 func (s *AlterStatisticsStmt) Pos() int  { return s.pos }
 func (s *AlterStatisticsStmt) stmtNode() {}
 
+// AlterSchemaStmt represents `ALTER SCHEMA name RENAME TO newname` and
+// `ALTER SCHEMA name OWNER TO {new_owner | CURRENT_ROLE | CURRENT_USER |
+// SESSION_USER}` — the only two forms real PostgreSQL's grammar defines for
+// ALTER SCHEMA (schemacmds.c's RenameSchema / AlterSchemaOwner). Previously
+// goopg had no dedicated case at all: ALTER SCHEMA fell into the blanket
+// "schema/view/collation/..." compat-stub loop in parseAlter, which silently
+// consumed and discarded both forms — a functional no-op, not merely a
+// mistagging bug, the same class of gap ALTER VIEW had before DU-002 slice
+// 440. DU-002 slice 440 resume point (3) (M0110-0001).
+type AlterSchemaStmt struct {
+	pos  int
+	Name string // schema name (never qualified — schemas aren't nested)
+	// Action selects the form: "rename" | "owner".
+	Action   string
+	NewName  string // for Action == "rename"
+	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+}
+
+func (s *AlterSchemaStmt) Pos() int  { return s.pos }
+func (s *AlterSchemaStmt) stmtNode() {}
+
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
 	Schema string
