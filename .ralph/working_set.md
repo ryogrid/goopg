@@ -2,197 +2,102 @@
 
 ---
 
-**Loop #18.** Concurrency guard confirmed a second, genuinely independent
-`ralph_loop.sh` tree again this loop (root `2087326` → `2087655` →
-`2462391`, separate from the screen-rooted `2085426` → `2085428` → `2462793`
-tree). `git status` at loop start showed the peer's WIP still in progress
-(`internal/catalog/catalog.go`/`codec.go`, `internal/executor/codec.go`/
-`pg18_user_catalog_rows.go`(+test), `internal/initdb/open.go`/
-`view_ddl_recovery_test.go`) — none of those files touched this loop.
+**Loop #19 (this loop) — COMPLETE, committed + pushed (`97e7318c`).**
+Picked up the M0122-0004 backlog item "ANY/SOME/ALL" (confirmed via a
+background research agent + my own code reading that it was genuinely
+incomplete, not stale — unlike window frames/GROUPING SETS which are
+medium/large and GROUPING SETS/DEFAULT-clause/intervals which are
+already largely done or too big for one loop).
 
-Picked up `M0122-0004` (SQL language/executor backlog, ~21 items). Landed +
-pushed `091fa948`:
-- `internal/parser/token.go`/`keywords.go`: new reserved keywords
-  `KwSymmetric`/`KwAsymmetric` (matches upstream kwlist.h's
-  `RESERVED_KEYWORD` classification for both).
-- `internal/parser/select.go`: new `p.acceptBetweenOrdering()` helper
-  consumes the optional keyword after `[NOT] BETWEEN`; `parseBetweenTail`
-  gained a `symmetric bool` param — `BETWEEN SYMMETRIC low AND high`
-  desugars to `(x>=low AND x<=high) OR (x>=high AND x<=low)`, still
-  entirely inside the parser (no analyzer/planner/executor change, same
-  strategy as plain BETWEEN). `ASYMMETRIC` is an accepted no-op spelling.
-- Tests: `internal/parser/between_test.go` (SYMMETRIC/NOT-SYMMETRIC/
-  ASYMMETRIC AST-shape pins).
-- **Verify-before-implement also closed a second stale bucket item**:
-  "CTE-without-alias" (`unimplemented_feat.json` task `M0097-0029`) turned
-  out already fixed by a same-day-in-history commit `8d281a1b` (synthetic
-  `__sq_<pos>` alias for FROM-subqueries without an explicit alias) —
-  confirmed via a throwaway probe test reproducing the uuid.sql shape the
-  entry cited, then reverted the probe. No code change needed there, just
-  closed the stale entry + fix_plan banner.
-- Design: `docs/design/0003-0013-between-operator.md` new "Follow-up:
-  BETWEEN SYMMETRIC/ASYMMETRIC" section (also removed the now-stale
-  "Out of scope: BETWEEN SYMMETRIC" line); `docs/design/README.md` row
-  updated in place. `.ralph/fix_plan.md` M0122-0004 banner updated (both
-  sub-items struck from the open list, closure notes appended).
-  `unimplemented_feat.json`: both matching entries (BETWEEN SYMMETRIC,
-  CTE-without-alias) updated in place with `RESOLVED`/audit notes.
+Landed: `expr op ANY|SOME|ALL (array | subquery)` now works for every
+comparison operator (`=`,`!=`,`<>`,`<`,`>`,`<=`,`>=`) and all four POSIX
+regex operators. Previously only `=`/`!=`/`<>`/regex supported ANY
+(array/scalar only), `ALL` worked only for `=` (via a NOT-wrap hack),
+`SOME` wasn't a recognized keyword at all, and no operator accepted a
+`(SELECT ...)` subquery operand.
+
+- `internal/parser/token.go`/`keywords.go`: new `KwSome` keyword
+  (unreserved, same class as the pre-existing `KwAny`).
+- `internal/parser/expr.go` / `internal/planner/plan.go`: `InExpr` gains
+  `AllOp bool` (AND semantics) beside the pre-existing `AnyOp` (element-
+  wise operator, OR semantics). Threaded through all planner construction
+  sites (`planner.go:5787,9513,10497,10726`, `foldconst.go:66`).
+  `internal/executor/expr.go`'s `evalInExpr` gained the ALL branch
+  (AND-short-circuit-false), placed before the existing ANY branch.
+- `internal/parser/select.go`: `parseAnyTail` now also accepts a `SELECT`
+  operand (mirrors `parseInTail`'s subquery detection) — previously only
+  `ARRAY[...]`/scalar. New `isAnyOrSomeTok`/`isAllTok` helpers. Extended
+  the pre-existing regex-ANY block and the `=`/`!=`/`<>` ANY block in
+  place to accept SOME/ALL; added ONE new dispatch block for the
+  previously-uncovered combos (`<,>,<=,>=` × ANY/SOME/ALL, `!=`/`<>` ALL).
+  Did NOT rewrite the pre-existing `= ALL` NotEqualAny/NOT-wrap path —
+  left it untouched to avoid regressing already-shipped behavior.
+- Subquery operand needed **zero new executor plumbing**: discovered
+  `collectInValues` (`internal/executor/expr.go`) already generically
+  drains an arbitrary single-column subquery plan (built for
+  `IN (subquery)`) and is read identically regardless of List vs Plan —
+  confirmed via `planInExpr` (`internal/planner/planner.go:9503`) already
+  threading `AnyOp` through both branches unconditionally.
+- Tests: `internal/parser/any_all_test.go` (AST-shape pins for all
+  operator×quantifier combos + subquery form), `internal/executor/any_all_test.go`
+  (end-to-end array + subquery evaluation, incl. `v > ALL (SELECT ...)`
+  shapes). Both new files, no existing tests modified.
+- Design: `docs/design/0003-0008-subqueries.md` new "Follow-up: ANY / SOME
+  / ALL" section (removed the doc's own stale "ANY/SOME/ALL... deferred"
+  out-of-scope line); `docs/design/README.md` row updated in place.
+  `.ralph/fix_plan.md` M0122-0004 banner updated (ANY/SOME/ALL struck from
+  open list, closure note appended). `unimplemented_feat.json`'s matching
+  entry ("ANY/SOME/ALL quantified subqueries") updated in place with
+  RESOLVED audit note. `.ralph/deferral_ledger.md` new row recording the
+  one deliberate known limitation below.
+- **Known limitation (recorded, not fixed):** NULL-element handling is
+  not fully three-valued — both ANY and ALL skip NULL elements and
+  return a definite true/false rather than propagating NULL per upstream
+  `ScalarArrayOpExpr` semantics. This predates this loop (the ANY branch,
+  M0097-0068); the new ALL branch deliberately mirrors the same
+  simplification for consistency rather than being asymmetrically "more
+  correct". Resume point in the ledger if a failing test ever demands it.
 - Gates: `go build ./...` clean; `go test ./internal/parser/...
-  ./internal/executor/... ./internal/planner/...` PASS (no regressions).
-  Pre-commit pgbench smoke hook PASS (~97-136 TPS TPC-B, ~12.5k TPS
-  select-only). No TPC-H spot-check needed — parser-only change, zero
-  executor/planner/codec touch (per the practice card's own scoping: a
-  BETWEEN desugar reuses existing BinaryOp/UnaryOp nodes, nothing new for
-  the executor to evaluate). `make ralph-state-guard`: clean, no repair
-  needed this loop.
-- Committed via explicit `git add -- <9 files>` + `git commit -- <same 9
-  files>`, verified `git show --stat HEAD` touched only those 9 files and
-  the peer's dirty set was untouched before AND after. Pushed clean
-  fast-forward (`0a1ddfe7..091fa948`).
+  ./internal/planner/... ./internal/executor/...` PASS (no regressions,
+  confirmed via a retry-loop around a transient build break — see
+  concurrency note below). Pre-commit pgbench smoke hook PASS (0 failed
+  transactions; ~227-247 TPS TPC-B/simple-update, ~14.1k TPS select-only).
+  `make ralph-state-guard`: found status/progress inconsistent
+  (status="running" vs progress="completed" from a prior loop's clean-exit
+  marker), auto-repaired to progress="in_progress", now OK.
 
-**WITH-ORDINALITY named-column bug — ROOT CAUSE FOUND (background Explore
-agent, completed after this loop's main task, not yet implemented):**
+**Concurrency note:** the peer `ralph_loop.sh` tree (screen-rooted
+`2085426` chain, live PID `2652067` this loop) was actively writing to
+`internal/catalog/catalog.go`/`codec.go`, `internal/executor/codec.go`/
+`operators_storage.go`/`pg18_user_catalog_rows*.go`/`storage_dml_test.go`,
+`internal/initdb/open.go`/`view_ddl_recovery_test.go`,
+`docs/design/0110-0001-pg-dump-tap-port.md` throughout this loop — none of
+those files were touched. Mid-loop the peer's edit to
+`operators_storage.go` (calling a not-yet-defined `dmlPrivilegePermitted`)
+transiently broke `go test ./internal/executor/...` (NOT `go build ./...`,
+which doesn't compile `_test.go` files) for ~1 poll cycle; a retry-loop
+(`until go test ...; do sleep 5; done`) confirmed it self-resolved once the
+peer finished that edit — no action needed on my end beyond not panicking
+at a red build that isn't mine. Committed via explicit `git add -- <15
+files>` + `git commit -m ... -- <same 15 files>` (message BEFORE `--`,
+not after — `git commit -- <paths> -m msg` mis-parses the message as a
+pathspec), verified `git show --stat HEAD` touched only those 15 files
+and the peer's dirty set was byte-identical before and after. Fetched
++ pushed clean fast-forward (`129f7be9..97e7318c`, ahead-1/behind-0 at
+fetch time).
 
-The 42703 is NOT in the planner (loop #17's own notes mis-pointed there —
-`wrapOrdinality`/`planFromUnnest` are entirely correct and never even run
-for the failing query). `planner.Plan()` calls `analyzer.Analyze()`
-*before* `planSelect` (`internal/planner/planner.go:94-97`) and returns on
-error, so the real bug is in **`internal/analyzer/analyzer.go`**:
-
-- `lookupTable()` (analyzer.go:1471-1493) builds the FROM-item's synthetic
-  table for any `TableFunc` via `tableFuncColumns(rv.TableFunc.Name, alias,
-  rv.Columns)` — **no `WithOrdinality` param passed at all** (`grep
-  WithOrdinality internal/analyzer/analyzer.go` = 0 hits).
-- `tableFuncColumns()` (analyzer.go:1505-1611) hand-mirrors the planner's
-  per-function dispatch but has no `"unnest"`/`"regexp_matches"` case;
-  falls to `default:` (1603-1611) → **always a single column** named
-  `colAliases[0]` (`"m"`). `"n"` is never added to this table, so naming it
-  explicitly in the outer SELECT hits `lookupColumn` → 42703.
-- `*` is unaffected only because `analyzeStar()` (817-837) does
-  `return nil` immediately for an unqualified `*` (line 821-822) — no
-  column-existence check at all; the real columns used downstream come
-  from `planSelect`, which the analyzer never cross-checks.
-
-**Fix**: thread `rv.TableFunc.WithOrdinality` into `tableFuncColumns`'s
-signature (called from `lookupTable`), add real `unnest`/`regexp_matches`
-element-type cases (currently silently wrong even without ordinality —
-they return a generic `int8` column regardless of the SRF's actual output
-type), and append a trailing ordinality column named `colAliases[len-1]`
-when set — mirroring `wrapOrdinality`'s already-correct logic
-(`internal/planner/planner.go:3426-3447`). This is planner-adjacent but
-purely a parser/analyzer-package change (`internal/analyzer/`); check
-whether that package is in the peer's dirty set before touching it.
-
-Next step: re-check `git status` first (peer's catalog/executor/initdb WIP
-may have landed by now; also confirm `internal/analyzer/` isn't part of
-it). Then either implement the WITH-ORDINALITY analyzer fix above (small,
-well-scoped, root cause fully diagnosed — just needs the
-`tableFuncColumns` signature change + 2 new cases + ordinality-column
-append), or continue M0122-0004's remaining open sub-items (window frames
-/ GROUPING SETS / ANY-SOME-ALL / DEFAULT-clause / intervals — all still
-open, none yet scoped) or the comma/LATERAL-join `ctx.OuterRows` wiring gap
-(ledger row 480, separate from this one, still unscoped/unfixed).
-
----
-
-**Loop #17 (this loop).** Concurrency guard again confirmed a second,
-independent `ralph_loop.sh` tree (screen-rooted `2085426` chain, this
-session rooted at `2087326`→`2087655`). Rather than block, found an
-existing but stale, uncommitted worktree at `/tmp/wt-buffers-dirtied-written`
-(branch `explain-buffers-dirtied-written`, only 2 commits behind current
-HEAD) that a prior loop iteration had left mid-flight on exactly the next
-open `M0122-0003` sub-item (`dirtied=`/`written=` BUFFERS counters) — per
-`worktree_isolation_escapes_foreign_wip_block`, rebased it onto current
-HEAD (clean, no conflicts on the code; one `docs/design/README.md` merge
-conflict from `git stash pop`, resolved by keeping the newer upstream
-`0122-0002` row + the stash's extended `0122-0003` row with the
-dirtied/written closure paragraph), fixed one gofmt alignment nit in my
-own added `nodeStats` struct lines (did NOT touch the pre-existing
-unrelated gofmt drift in the same files — repo is on a stale gofmt
-version, `goopg_gofmt_version_mismatch_no_w`), verified
-`go build ./...`/`go vet`/`go test ./internal/executor/...
-./internal/storage/...` all clean, appended a new deferral-ledger row
-(closing the dirtied/written gap named by the two BUFFERS rows above it),
-committed (`e49ac798`), rebased again onto 2 newer peer commits
-(`091fa948`/`5d5c5ec1` landed mid-loop), rebuilt/retested clean, pushed
-fast-forward (`5d5c5ec1..a896a842`), then removed the worktree + deleted
-the local branch. Pre-commit pgbench smoke PASS (0 failed, TPC-B ~189
-TPS / simple-update ~254 TPS / select-only ~14.4k TPS via `PATH`+
-`LD_LIBRARY_PATH` pointed at `postgres/local_install/{bin,lib}` — the
-worktree has no `postgres/` dir of its own, it's untracked in the main
-tree). Did **not** run `scripts/tpch-spotcheck.sh` for real: the worktree
-has no `bench/tpch/runtime_goopg/data` (untracked, main-tree-only, and
-was actively being touched — mtime during this loop — by the concurrent
-peer's own possible spotcheck run); script SKIPPED cleanly (exit 0, by
-design for a machine/worktree without the data set). Risk judged low: this
-change is purely additive instrumentation (new atomic counters + new
-EXPLAIN render fields), touches no join/filter/row-count logic, and a
-prior loop iteration's design-doc text already recorded a real-server
-live verification of this exact code (`UPDATE` immediately after `INSERT`
-withholds `dirtied=`, reports it after an intervening `CHECKPOINT`).
-
-M0122-0003 remaining open items (see the ledger's newest row): `EXPLAIN
-(BUFFERS)` without `ANALYZE` (no planning-phase buffer counters exist),
-local/temp-buffer terms (no local-buffer-manager concept at all), the
-other 7 `pg_stat_io` I/O counters, `track_io_timing` runtime `SET`.
-
-Next step: (idle for this thread — task fully committed+pushed). Good next
-picks per the fix_plan banner: continue M0122-0003's remaining sub-items
-above (all need the same "storage-instrumentation-layer" work, flagged
-multi-loop), or M0122-0004's open items (see Loop #18's note above), or
-next `M0119-0004` pg_dump catalog-view parity slice. **Before picking
-anything touching `internal/catalog/`, `internal/executor/codec.go`,
-`internal/executor/pg18_user_catalog_rows*.go`, `internal/initdb/open.go`,
-`internal/initdb/view_ddl_recovery_test.go`, or `internal/analyzer/` — those
-were the concurrent peer's live dirty set as of this loop's end; re-check
-`git status` first.**
-
----
-
-**Loop #19 (this loop) — COMPLETE, committed + pushed.** Picked up the
-WITH-ORDINALITY root cause loop #17/#18 diagnosed (analyzer, not planner)
-and implemented the fix: `internal/analyzer/analyzer.go`'s
-`tableFuncColumns` now takes `*parser.TableFuncRef` (was a bare name
-string), strips/re-appends the trailing ordinality alias mirroring
-`wrapOrdinality` (`internal/planner/planner.go`), and gained real `unnest`
-(N-column zip)/`regexp_matches` (`text[]`) cases that previously fell to
-the wrong single-`int8` generic default. `unnest`'s element type stays a
-`text` placeholder (analyzer has no scope/resolveContext at `lookupTable`
-time to `analyzeExpr` the array arg) — recorded as a known, non-regressive
-imprecision in the ledger, not an open bug.
-
-Tests: `internal/analyzer/analyzer_test.go`'s
-`TestAnalyzeWithOrdinalityNamedColumn`. Verified end-to-end against a live
-goopg server with real PG 18.3 `psql` (unnest/generate_series/
-regexp_matches, single+multi-arg unnest, named ordinality + element
-columns all resolve). Gates: build clean; `go test
-./internal/analyzer/... ./internal/planner/... ./internal/executor/...
-./internal/parser/...` PASS; pre-commit pgbench smoke PASS
-(~233-251 TPS TPC-B/simple-update, ~14.3k TPS select-only).
-
-Docs: `docs/design/0103-0008-derived-subquery-srf-schema-propagation.md`
-new "Follow-up" section + `docs/design/README.md` row updated in place.
-`.ralph/fix_plan.md` M0122-0004 banner updated; `.ralph/deferral_ledger.md`
-new `resolved` row closing the WITH-ORDINALITY half of ledger row 480 (the
-comma/LATERAL `ctx.OuterRows` half is separate, still open).
-
-**Concurrency note:** the peer `ralph_loop.sh` tree's WIP (`internal/catalog/
-catalog.go`/`codec.go`, `internal/executor/codec.go`/
-`pg18_user_catalog_rows*.go`, `internal/initdb/open.go`/
-`view_ddl_recovery_test.go`, `docs/design/0110-0001-*.md`) was still
-uncommitted throughout this loop; none of those files were touched.
-Mid-loop the peer pushed `a896a842`/`fc985ed4` (M0122-0003 dirtied/written
-counters) via a route that diverged local history from origin (ahead
-2/behind 2) — reconciled via `git stash push -- <peer's dirty tracked
-files>` (never touched the untracked 1.5G `postgres/` dir), `git rebase
-origin/align-data-structure-with-pg` (clean, no conflicts — git recognised
-the local working_set.md-only commit as already-applied and dropped it),
-`git stash pop` (clean), rebuilt/retested, pushed fast-forward
-(`fc985ed4..c98baf68`). Re-verify `git status` before picking the next task.
-
-Next step: pick M0122-0004's remaining open sub-items (window frames /
-GROUPING SETS / ANY-SOME-ALL / DEFAULT-clause / intervals — still open,
-none yet scoped), or the comma/LATERAL-join `ctx.OuterRows` wiring gap
-(ledger row 480, now the only unfixed half), or continue M0122-0003's
-`pg_stat_io`/`track_io_timing` remainder, or the next `M0119-0004` pg_dump
-catalog-view parity slice.
+Next step: pick M0122-0004's remaining open sub-items — window frames
+ROWS/RANGE/GROUPS (medium: needs new `WindowFrame` AST field + executor
+frame evaluation, `parseWindowDef` currently hard-errors on any frame
+clause, `internal/parser/select.go:3437`), GROUPING SETS/ROLLUP/CUBE
+(large: parser already accepts the syntax but the planner comment at
+`internal/planner/planner.go:5070-5072` says explicitly it's "handled as
+plain GROUP BY on the key columns" — no real multi-level grouping-set
+expansion, no NULL-substituted rows, likely no `GROUPING()` function;
+needs a probe to confirm `GROUPING()` status before scoping), or DEFAULT-
+clause/intervals (both already extensively implemented per this loop's
+research agent — would need a probe to find any real remaining gap before
+picking). Also still open: the comma/LATERAL-join `ctx.OuterRows` wiring
+gap (ledger row 480), and M0122-0003's `pg_stat_io`/`track_io_timing`
+remainder. Re-check `git status` first — the peer's dirty file set above
+may have changed by the time the next loop starts.
