@@ -7192,12 +7192,14 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	// awareness. M0119-0004 slice-365 follow-up (WITH CHECK OPTION).
 	var viewCheckQual Expr
 	var viewCheckName string
+	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
+	var outerColMap []int         // view's own column ordinal -> base ordinal, only when resolveTbl != nil
 	if tbl.View != nil {
-		chain, base, autoOK := viewAutoUpdatableChain(tbl, cat)
+		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdInsert)
 		}
-		_, checked, qerr := viewChainQuals(s.Pos(), chain, base, cat)
+		_, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
 		if qerr != nil {
 			return nil, qerr
 		}
@@ -7205,27 +7207,43 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			viewCheckQual = checked
 			viewCheckName = tbl.Name
 		}
+		outerColMap = colMaps[0]
+		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), outerColMap)
 		tbl = base
 	}
 	// Map source-row column index -> target table column ordinal.
 	// Generated columns are excluded from the mapping when no explicit
 	// column list is provided — they are computed by the executor. M0096-0008.
+	// For a view target, the source-row order is the VIEW's own column
+	// order (outerColMap), not base's physical order — root-0025 deferred
+	// item 1 (a view may subset/reorder/rename base's columns).
 	var colIndex []int
 	if len(s.Columns) == 0 {
-		colIndex = make([]int, 0, len(tbl.Columns))
-		for i, col := range tbl.Columns {
-			if col.GeneratedAlways {
-				continue // skip generated columns; executor fills them in
+		if resolveTbl != nil {
+			colIndex = make([]int, 0, len(outerColMap))
+			for _, baseOrd := range outerColMap {
+				if tbl.Columns[baseOrd].GeneratedAlways {
+					continue
+				}
+				colIndex = append(colIndex, baseOrd)
 			}
-			colIndex = append(colIndex, i)
-		}
-		if len(colIndex) == len(tbl.Columns) {
-			// No generated columns — keep original 1:1 mapping for compatibility.
+		} else {
+			colIndex = make([]int, 0, len(tbl.Columns))
+			for i, col := range tbl.Columns {
+				if col.GeneratedAlways {
+					continue // skip generated columns; executor fills them in
+				}
+				colIndex = append(colIndex, i)
+			}
 		}
 	} else {
+		lookupTbl := tbl
+		if resolveTbl != nil {
+			lookupTbl = resolveTbl
+		}
 		colIndex = make([]int, 0, len(s.Columns))
 		for _, name := range s.Columns {
-			col, ok := cat.LookupColumn(tbl, name)
+			col, ok := cat.LookupColumn(lookupTbl, name)
 			if !ok {
 				return nil, &PlanError{
 					Pos:     s.Target.Pos(),
@@ -7310,7 +7328,11 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		insert.OnConflict = oc
 	}
 	if len(s.Returning) > 0 {
-		retCtx := singleBindingContext(tbl, s.Target.Alias)
+		retTbl := tbl
+		if resolveTbl != nil {
+			retTbl = resolveTbl
+		}
+		retCtx := singleBindingContext(retTbl, s.Target.Alias)
 		retCtx.cat = cat
 		// When this INSERT has ON CONFLICT DO UPDATE, add `excluded` to the
 		// RETURNING scope as notReferenceable. This lets resolveColumnRefAt
@@ -7319,7 +7341,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		// generic "missing FROM-clause entry" error.
 		if insert.OnConflict != nil && insert.OnConflict.Action == OnConflictActionUpdate {
 			retCtx.bindings = append(retCtx.bindings, rangeBinding{
-				table:            tbl,
+				table:            retTbl,
 				alias:            "excluded",
 				qualifiedOnly:    true,
 				notReferenceable: true,
@@ -7716,15 +7738,16 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	var viewQual Expr
 	var viewCheckQual Expr
 	var viewCheckName string
+	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
 	if tbl.View != nil {
 		if len(s.From) > 0 {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
 		}
-		chain, base, autoOK := viewAutoUpdatableChain(tbl, cat)
+		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
 		}
-		all, checked, qerr := viewChainQuals(s.Pos(), chain, base, cat)
+		all, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
 		if qerr != nil {
 			return nil, qerr
 		}
@@ -7733,6 +7756,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			viewCheckQual = checked
 			viewCheckName = tbl.Name
 		}
+		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), colMaps[0])
 		tbl = base
 	}
 
@@ -7815,7 +7839,11 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(tbl, s.Target.Alias)
+	resolveScope := tbl
+	if resolveTbl != nil {
+		resolveScope = resolveTbl
+	}
+	ctx := singleBindingContext(resolveScope, s.Target.Alias)
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
@@ -7851,7 +7879,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	}
 	set := make([]Expr, len(tbl.Columns))
 	for _, a := range s.Set {
-		if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
+		if err := applyUpdateAssign(a, resolveScope, set, ctx, cat); err != nil {
 			return nil, err
 		}
 	}
@@ -7884,19 +7912,21 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	// INSERT/UPDATE — the row is leaving the view's underlying storage, not
 	// being written into it).
 	var viewQual Expr
+	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
 	if tbl.View != nil {
 		if len(s.Using) > 0 {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
 		}
-		chain, base, autoOK := viewAutoUpdatableChain(tbl, cat)
+		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
 		}
-		all, _, qerr := viewChainQuals(s.Pos(), chain, base, cat)
+		all, _, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
 		if qerr != nil {
 			return nil, qerr
 		}
 		viewQual = all
+		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), colMaps[0])
 		tbl = base
 	}
 
@@ -7967,7 +7997,11 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(del, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(tbl, s.Target.Alias)
+	resolveScope := tbl
+	if resolveTbl != nil {
+		resolveScope = resolveTbl
+	}
+	ctx := singleBindingContext(resolveScope, s.Target.Alias)
 	// When an explicit alias is set, using the original table name in WHERE
 	// must produce the PostgreSQL-specific error. M0097-0003.
 	if s.Target.Alias != "" {

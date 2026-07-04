@@ -439,9 +439,11 @@ func TestChainedViewInnerNotAutoUpdatableRejectsWholeChain(t *testing.T) {
 }
 
 // TestNonUpdatableViewDMLRejected confirms that views outside the restricted
-// auto-updatable subset (aggregates, joins, renamed columns) are rejected at
-// plan time with 55000 — never silently accepted with lost writes, which was
-// the pre-fix behavior for every view regardless of shape.
+// auto-updatable subset (aggregates, joins, expression columns) are rejected
+// at plan time with 55000 — never silently accepted with lost writes, which
+// was the pre-fix behavior for every view regardless of shape. A view that
+// merely renames/reorders/subsets a plain column-reference target list is
+// NOT in this category — see TestUpdatableViewColumnSubsetReorderRename.
 func TestNonUpdatableViewDMLRejected(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -455,7 +457,7 @@ func TestNonUpdatableViewDMLRejected(t *testing.T) {
 	must("CREATE TABLE t6 (id int primary key, val int)")
 	must("INSERT INTO t6 VALUES (1, 10)")
 	must("CREATE VIEW vagg AS SELECT id, count(*) FROM t6 GROUP BY id")
-	must("CREATE VIEW vren (xid, xval) AS SELECT id, val FROM t6")
+	must("CREATE VIEW vexpr AS SELECT id, val + 1 AS valplus FROM t6")
 
 	planErr := func(sql string) *planner.PlanError {
 		t.Helper()
@@ -480,13 +482,95 @@ func TestNonUpdatableViewDMLRejected(t *testing.T) {
 	if pe := planErr("DELETE FROM vagg WHERE id = 1"); pe.Code != "55000" {
 		t.Errorf("DELETE FROM aggregate view: code=%q, want 55000", pe.Code)
 	}
-	if pe := planErr("INSERT INTO vren VALUES (9, 9)"); pe.Code != "55000" {
-		t.Errorf("INSERT into renamed-column view: code=%q, want 55000", pe.Code)
+	if pe := planErr("INSERT INTO vexpr VALUES (9, 9)"); pe.Code != "55000" {
+		t.Errorf("INSERT into expression-column view: code=%q, want 55000", pe.Code)
 	}
 
 	// Base table must be untouched by every rejected attempt.
 	rows := runQueryRows(t, ctx, "SELECT id FROM t6")
 	if len(rows) != 1 {
 		t.Fatalf("rejected DML must not have mutated the base table, got %v", rows)
+	}
+}
+
+// TestUpdatableViewColumnSubsetReorderRename pins root-0025 deferred item 1:
+// a simple auto-updatable view may rename (either via a per-target AS alias
+// or an explicit `CREATE VIEW v (a, b)` column list), reorder, and/or expose
+// only a subset of its base relation's columns — PostgreSQL's rule only
+// requires each view column to be a plain, unqualified reference to a base
+// column, not that every base column appear once in order. Before this fix
+// all three shapes were rejected 55000 by the stricter `tbl.Columns ==
+// base.Columns` positional-identity check.
+func TestUpdatableViewColumnSubsetReorderRename(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	// Rename via per-target AS alias.
+	must("CREATE TABLE tr1 (id int primary key, val int)")
+	must("INSERT INTO tr1 VALUES (1, 10)")
+	must("CREATE VIEW vren1 AS SELECT id, val AS renamed_val FROM tr1")
+	must("INSERT INTO vren1 (id, renamed_val) VALUES (2, 20)")
+	must("UPDATE vren1 SET renamed_val = 99 WHERE id = 1")
+	rows := runQueryRows(t, ctx, "SELECT id, val FROM tr1 ORDER BY id")
+	if len(rows) != 2 || rows[0][1].Format() != "99" || rows[1][1].Format() != "20" {
+		t.Fatalf("rename via AS alias: got %v, want [[1 99] [2 20]]", rows)
+	}
+	if err := runDDL(t, ctx, "DELETE FROM vren1 WHERE renamed_val = 99"); err != nil {
+		t.Fatalf("DELETE FROM vren1 WHERE renamed_val: %v", err)
+	}
+	rows = runQueryRows(t, ctx, "SELECT id FROM tr1")
+	if len(rows) != 1 || rows[0][0].Format() != "2" {
+		t.Fatalf("after DELETE via renamed column: got %v, want just id=2", rows)
+	}
+
+	// Rename via an explicit CREATE VIEW column-name list.
+	must("CREATE TABLE tr2 (id int primary key, val int)")
+	must("INSERT INTO tr2 VALUES (1, 10)")
+	must("CREATE VIEW vren2 (xid, xval) AS SELECT id, val FROM tr2")
+	must("INSERT INTO vren2 VALUES (2, 20)") // no explicit column list: view's own order
+	must("UPDATE vren2 SET xval = 999 WHERE xid = 1")
+	rows = runQueryRows(t, ctx, "SELECT id, val FROM tr2 ORDER BY id")
+	if len(rows) != 2 || rows[0][1].Format() != "999" || rows[1][1].Format() != "20" {
+		t.Fatalf("rename via CREATE VIEW column list: got %v, want [[1 999] [2 20]]", rows)
+	}
+
+	// Reorder: the view's target list swaps the base relation's column
+	// order, so a column-list-free INSERT must map source values through the
+	// VIEW's own order, not base's physical order.
+	must("CREATE TABLE tr3 (id int primary key, val int)")
+	must("CREATE VIEW vswap AS SELECT val, id FROM tr3")
+	must("INSERT INTO vswap VALUES (30, 3)") // val=30, id=3 in view order
+	rows = runQueryRows(t, ctx, "SELECT id, val FROM tr3")
+	if len(rows) != 1 || rows[0][0].Format() != "3" || rows[0][1].Format() != "30" {
+		t.Fatalf("reordered view INSERT: got %v, want id=3 val=30", rows)
+	}
+
+	// Subset: the view exposes only `id`; `val` is not part of its row type
+	// at all, so referencing it through the view is 42703, and an INSERT
+	// with no column list only supplies the exposed column (the excluded
+	// column falls back to its default/NULL, mirroring a plain INSERT that
+	// omits a column).
+	must("CREATE TABLE tr4 (id int primary key, val int)")
+	must("CREATE VIEW vsub AS SELECT id FROM tr4")
+	must("INSERT INTO vsub VALUES (4)")
+	rows = runQueryRows(t, ctx, "SELECT id, val FROM tr4")
+	if len(rows) != 1 || rows[0][0].Format() != "4" || !rows[0][1].IsNull() {
+		t.Fatalf("subset view INSERT: got %v, want id=4 val=NULL", rows)
+	}
+	stmts, err := parser.Parse("UPDATE vsub SET val = 1 WHERE id = 4")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	_, err = planner.Plan(stmts[0], ctx.Catalog)
+	pe, ok := err.(*planner.PlanError)
+	if !ok || pe.Code != "42703" {
+		t.Fatalf("UPDATE vsub SET val: err=%v, want *planner.PlanError 42703 (val is not part of vsub's row type)", err)
 	}
 }

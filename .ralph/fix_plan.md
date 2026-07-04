@@ -198,8 +198,29 @@ rows, and the general `updateViaIndex` residual-predicate gap. Gates: `go
 build ./...` clean; `go test ./internal/planner/... ./internal/executor/...
 ./internal/parser/... ./internal/catalog/... ./internal/server/...` PASS;
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke = pre-commit
-hook. **Next up:** continue the M0119-0004 pg_dump catalog-view parity
-battery, or pick the next unresolved DU-002 slice from the deferral ledger.
+hook. Loop #109 closed root-0025 deferred item 2 (view-of-view chaining);
+the loop after that closed item 1 (column subset/reorder/rename):
+`viewColumnMap`/`viewAutoUpdatableChain` now return a per-level `colMap
+[]int` instead of requiring positional identity, and new `viewProxyTable`
+lets `planInsert`/`planUpdate`/`planDelete` resolve a DML statement's column
+list/`SET`/`WHERE`/`RETURNING` using the view's own (renamed/reordered/
+subset) vocabulary while the plan node's actual scan/mutation target stays
+the true base table — see `docs/design/root-0025-updatable-views.md`'s
+"Follow-up: column subset/reorder/rename" section and the matching ledger
+row. Deferred: `INSERT ... ON CONFLICT` against a renamed view column still
+resolves against base directly (`42703` rather than resolving — safe, narrow
+residual). Root-0025 deferred items (3) `UPDATE...FROM`/`DELETE...USING` a
+view and CHECK OPTION on partition/inheritance-child-routed rows remain
+open. Gates: `go build ./...` clean; `go vet` clean on touched packages; `go
+test ./internal/planner/... ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/server/...` PASS (new test:
+`TestUpdatableViewColumnSubsetReorderRename`, plus `TestNonUpdatableViewDMLRejected`
+updated since renaming is no longer rejected); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** the
+`UPDATE...FROM`/`DELETE...USING` view item, the `ON CONFLICT`-against-
+renamed-view residual just noted, or continue the M0119-0004 pg_dump
+catalog-view parity battery / next unresolved DU-002 slice from the
+deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

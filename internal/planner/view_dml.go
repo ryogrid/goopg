@@ -13,47 +13,50 @@ import (
 // view can be rewritten onto, mirroring PostgreSQL's "simply updatable view"
 // rule (rewriteHandler.c's view_is_auto_updatable / rewrite_targetlist):
 // exactly one base relation in FROM, no joins/aggregation/set-ops/limiting,
-// and a target list that is a bare, unrenamed, in-order passthrough of every
-// column of that relation (either `SELECT *` or an explicit column list
-// naming each base column once, in catalog order).
+// and a target list in which every entry is a bare column reference to that
+// relation (root-0025 deferred item 1: a subset, reordering, and/or renaming
+// of the base relation's columns is fine — PostgreSQL's rule only requires
+// each view column to be a plain Var over the base relation, not that every
+// base column appear exactly once in order).
 //
 // When the FROM relation is itself such a simple updatable view, the walk
 // recurses into it (view-of-view chaining) — PostgreSQL updates through an
 // arbitrarily deep chain of simple views the same way it updates through
-// one. Because every level's target list is required to be an unrenamed,
-// in-order passthrough, column names and ordinals are identical at every
-// level all the way down to base, so a chain level's own WHERE clause can
-// always be resolved directly against base (see viewQualOnBase/
-// viewChainQuals) without any column-mapping translation.
+// one.
 //
 // chain holds every view level from outermost (tbl itself) to innermost, in
 // that order — the same top-to-bottom order PostgreSQL's CASCADED/LOCAL
-// CHECK OPTION propagation walks (see viewChainQuals).
+// CHECK OPTION propagation walks (see viewChainQuals). colMaps is parallel
+// to chain: colMaps[k][i] is the ordinal, within the ultimate base
+// relation, that chain[k]'s own i-th output column maps onto — composed
+// through every intervening chain level so callers never need to translate
+// column ordinals themselves.
 //
 // This is a deliberately narrow subset of PostgreSQL's real rule (which also
-// auto-updates views exposing a subset/reordering/renaming of columns, via
-// a per-column attribute map). goopg has no INSTEAD OF trigger/rule
-// mechanism, so anything outside this subset stays read-only — see
-// docs/design/root-0025-updatable-views.md.
+// auto-updates views whose target list mixes plain columns with arbitrary
+// expressions, so long as INSERT/UPDATE doesn't target the expression
+// columns). goopg has no INSTEAD OF trigger/rule mechanism and requires
+// every target-list entry to be a plain column reference; anything outside
+// that stays read-only — see docs/design/root-0025-updatable-views.md.
 //
 // ok is false for anything requiring that broader machinery; callers should
 // reject the DML with 55000 ("cannot insert/update/delete into/from view").
-func viewAutoUpdatableChain(tbl *catalog.Table, cat catalog.Catalog) (chain []*catalog.Table, base *catalog.Table, ok bool) {
+func viewAutoUpdatableChain(tbl *catalog.Table, cat catalog.Catalog) (chain []*catalog.Table, base *catalog.Table, colMaps [][]int, ok bool) {
 	v := tbl.View
-	if v == nil || len(tbl.ViewColumnAliases) > 0 {
-		return nil, nil, false
+	if v == nil {
+		return nil, nil, nil, false
 	}
 	if v.Distinct || len(v.DistinctOn) > 0 || len(v.GroupBy) > 0 || v.Having != nil ||
 		v.Limit != nil || v.Offset != nil || v.SetOp != nil || len(v.Locking) > 0 ||
 		len(v.ValuesRows) > 0 || v.With != nil {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	if len(v.From) != 1 || hasJoinClauses(v.FromExprs) {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	rv := v.From[0]
 	if rv.Subquery != nil || rv.TableFunc != nil {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	// CreateView marks EVERY view — including a plain, chainable one — as
 	// catalog.Table.Virtual (it has no physical heap storage of its own), so
@@ -62,48 +65,109 @@ func viewAutoUpdatableChain(tbl *catalog.Table, cat catalog.Catalog) (chain []*c
 	// recursive chain-walk below via its own b.View != nil check.
 	b, found := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
 	if !found || (b.Virtual && b.View == nil) || b.IsMatView {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	if !viewTargetsPassthrough(v.Targets, rv, b) {
-		return nil, nil, false
+	ownMap, mapOK := viewColumnMap(v.Targets, rv, b)
+	if !mapOK {
+		return nil, nil, nil, false
 	}
 	if b.View != nil {
-		innerChain, innerBase, innerOK := viewAutoUpdatableChain(b, cat)
+		innerChain, innerBase, innerColMaps, innerOK := viewAutoUpdatableChain(b, cat)
 		if !innerOK {
-			return nil, nil, false
+			return nil, nil, nil, false
 		}
-		return append([]*catalog.Table{tbl}, innerChain...), innerBase, true
+		composed := make([]int, len(ownMap))
+		for i, bOrd := range ownMap {
+			composed[i] = innerColMaps[0][bOrd]
+		}
+		return append([]*catalog.Table{tbl}, innerChain...), innerBase,
+			append([][]int{composed}, innerColMaps...), true
 	}
-	return []*catalog.Table{tbl}, b, true
+	return []*catalog.Table{tbl}, b, [][]int{ownMap}, true
 }
 
-// viewTargetsPassthrough reports whether targets is a bare, unrenamed,
-// in-order passthrough of every column of b (either `SELECT *` or an
-// explicit column list naming each column of b once, in catalog order) —
-// the target-list half of viewAutoUpdatableChain's "simply updatable view"
-// rule, shared by every level of a view chain.
-func viewTargetsPassthrough(targets []parser.ResTarget, rv parser.RangeVar, b *catalog.Table) bool {
+// viewColumnMap reports whether targets is a target list in which every
+// entry is a bare column reference to a column of b (either `SELECT *` or
+// an explicit list of plain column references — no expressions), and if so
+// returns the per-entry mapping from target-list ordinal to b's column
+// ordinal. Unlike PostgreSQL's full per-column attribute map, goopg requires
+// EVERY entry to be a plain column reference (mixed expression/plain-column
+// views stay entirely read-only) — but within that restriction, a subset of
+// b's columns, a reordering, and/or a rename (via column alias or an
+// explicit `CREATE VIEW v (a, b)` column list — both are already folded
+// into the view's own catalog.Table.Columns names by CreateView, so this
+// function only needs to match against the SOURCE column referenced, not
+// whatever the view calls it) are all fine — root-0025 deferred item 1.
+func viewColumnMap(targets []parser.ResTarget, rv parser.RangeVar, b *catalog.Table) ([]int, bool) {
 	if len(targets) == 1 {
 		if star, isStar := targets[0].Expr.(*parser.StarExpr); isStar && star.Table == "" && star.Schema == "" && targets[0].Alias == "" {
-			return true
+			m := make([]int, len(b.Columns))
+			for i := range m {
+				m[i] = i
+			}
+			return m, true
 		}
 	}
-	if len(targets) != len(b.Columns) {
-		return false
-	}
+	m := make([]int, len(targets))
 	for i, t := range targets {
 		cr, isCol := t.Expr.(*parser.ColumnRef)
-		if !isCol || !strings.EqualFold(cr.Column, b.Columns[i].Name) {
-			return false
+		if !isCol {
+			return nil, false
 		}
 		if cr.Table != "" && !strings.EqualFold(cr.Table, rv.Name) && !strings.EqualFold(cr.Table, rv.Alias) {
-			return false
+			return nil, false
 		}
-		if t.Alias != "" && !strings.EqualFold(t.Alias, b.Columns[i].Name) {
-			return false
+		j := -1
+		for k := range b.Columns {
+			if strings.EqualFold(b.Columns[k].Name, cr.Column) {
+				j = k
+				break
+			}
 		}
+		if j == -1 {
+			return nil, false
+		}
+		m[i] = j
 	}
-	return true
+	return m, true
+}
+
+// viewColumnNames returns tbl's own output column names, in ordinal order —
+// the names a DML statement (or an outer chain level's WHERE clause) that
+// references tbl uses, regardless of whether they came from the defining
+// query's per-target aliases or an explicit `CREATE VIEW v (a, b, ...)`
+// column list (CreateView already folds either source into tbl.Columns).
+func viewColumnNames(tbl *catalog.Table) []string {
+	names := make([]string, len(tbl.Columns))
+	for i, c := range tbl.Columns {
+		names[i] = c.Name
+	}
+	return names
+}
+
+// viewProxyTable builds a synthetic table with the exact same physical
+// column count, order, and ordinals as base — so a row scanned from base is
+// still indexed identically — but with the column at base ordinal colMap[i]
+// renamed to names[i] for every i. A base column not covered by colMap (the
+// view selects a strict subset of base's columns) is left with an empty
+// Name, which can never match a real ColumnRef (the parser never produces
+// one with an empty column name), so it is unresolvable through the view —
+// matching PostgreSQL, which only exposes a view's own target-list columns.
+//
+// This lets a DML statement (or a chain level's own WHERE clause) written
+// against a view that subsets/reorders/renames its base relation's columns
+// resolve directly onto base's physical row layout via the normal
+// name-based resolveContext machinery, with no separate rewrite pass.
+func viewProxyTable(base *catalog.Table, names []string, colMap []int) *catalog.Table {
+	proxy := *base
+	proxy.Columns = append([]catalog.Column(nil), base.Columns...)
+	for i := range proxy.Columns {
+		proxy.Columns[i].Name = ""
+	}
+	for viewOrd, baseOrd := range colMap {
+		proxy.Columns[baseOrd].Name = names[viewOrd]
+	}
+	return &proxy
 }
 
 // viewChainQuals resolves every level of a view chain's own WHERE clause
@@ -122,10 +186,16 @@ func viewTargetsPassthrough(targets []parser.ResTarget, rv parser.RangeVar, b *c
 //     inner level's own CheckOption setting; a LOCAL check option checks
 //     only levels that themselves specify CHECK OPTION. checked is nil when
 //     no level in the chain triggers a check.
-func viewChainQuals(pos int, chain []*catalog.Table, base *catalog.Table, cat catalog.Catalog) (all, checked Expr, err error) {
+func viewChainQuals(pos int, chain []*catalog.Table, colMaps [][]int, base *catalog.Table, cat catalog.Catalog) (all, checked Expr, err error) {
 	forceCascade := false
-	for _, lvl := range chain {
-		q, qerr := viewQualOnBase(lvl, base, cat)
+	for i, lvl := range chain {
+		var innerNames []string
+		var innerColMap []int
+		if i+1 < len(chain) {
+			innerNames = viewColumnNames(chain[i+1])
+			innerColMap = colMaps[i+1]
+		}
+		q, qerr := viewQualOnBase(lvl, innerNames, innerColMap, base, cat)
 		if qerr != nil {
 			return nil, nil, qerr
 		}
@@ -140,12 +210,16 @@ func viewChainQuals(pos int, chain []*catalog.Table, base *catalog.Table, cat ca
 	return all, checked, nil
 }
 
-// viewQualOnBase resolves a view's own WHERE clause against its base
-// relation, using the alias the view's defining query itself bound (not
-// whatever alias the outer DML statement used) so unqualified and
-// qualified column references inside the stored qual resolve correctly.
-// Returns nil when the view has no WHERE clause.
-func viewQualOnBase(tbl *catalog.Table, base *catalog.Table, cat catalog.Catalog) (Expr, error) {
+// viewQualOnBase resolves a view's own WHERE clause — written using the
+// column names of its immediate FROM relation, and the alias the view's
+// defining query itself bound (not whatever alias the outer DML statement
+// used) — against the ultimate base relation. When the immediate FROM
+// relation is itself a view further down the chain (innerNames/innerColMap
+// non-nil), a viewProxyTable translates that level's exposed column names
+// onto base's physical layout first; when the immediate FROM is base
+// itself, its names already are base's own names and no translation is
+// needed. Returns nil when the view has no WHERE clause.
+func viewQualOnBase(tbl *catalog.Table, innerNames []string, innerColMap []int, base *catalog.Table, cat catalog.Catalog) (Expr, error) {
 	if tbl.View.Where == nil {
 		return nil, nil
 	}
@@ -154,7 +228,11 @@ func viewQualOnBase(tbl *catalog.Table, base *catalog.Table, cat catalog.Catalog
 	if alias == "" {
 		alias = rv.Name
 	}
-	ctx := singleBindingContext(base, alias)
+	resolveTbl := base
+	if innerNames != nil {
+		resolveTbl = viewProxyTable(base, innerNames, innerColMap)
+	}
+	ctx := singleBindingContext(resolveTbl, alias)
 	ctx.cat = cat
 	return resolveExpr(tbl.View.Where, ctx)
 }

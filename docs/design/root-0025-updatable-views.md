@@ -203,13 +203,18 @@ virtual relations — so the pre-existing single-level check's `b.Virtual`
 guard, which happened to also exclude views (since the separate `b.View !=
 nil` check already did that job), had to become `b.Virtual && b.View == nil`
 to admit a view as a valid intermediate relation while still excluding actual
-system catalogs (`pg_class` etc., `Virtual` with no `View`). Every level's
-target list is still required to be an unrenamed, in-order full-column-list
-passthrough (`viewTargetsPassthrough`, factored out of the old single-level
-function body unchanged), so column names and ordinals are identical at every
-level all the way down to `base` — a chain level's own `WHERE` therefore still
-resolves directly against `base` via the pre-existing `viewQualOnBase`, with
-no column-mapping translation needed.
+system catalogs (`pg_class` etc., `Virtual` with no `View`).
+
+At the time this landed, every level's target list was still required to be
+an unrenamed, in-order full-column-list passthrough, so column names and
+ordinals were identical at every level all the way down to `base` and a chain
+level's own `WHERE` resolved directly against `base`. The "Follow-up: column
+subset/reorder/rename" section below replaced that restriction with a
+per-level column map, and `viewQualOnBase` now resolves each level's own
+`WHERE` against whatever its *immediate* `FROM` relation exposes (translated
+onto `base`'s physical layout via `viewProxyTable` when that immediate `FROM`
+is itself a renaming/reordering/subsetting view), not unconditionally against
+`base`.
 
 Two combination rules, both implemented in the new `viewChainQuals`:
 
@@ -245,15 +250,100 @@ rather than silently rewriting past it).
 Gates: `go build ./...`; `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/...`;
 `scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
 
+## Follow-up: column subset/reorder/rename (closes deferred item 1)
+
+`viewColumnMap` (`internal/planner/view_dml.go`, replacing
+`viewTargetsPassthrough`) relaxes the eligibility check from "target list is
+an unrenamed, in-order, full-column-list passthrough" to "every target-list
+entry is a bare column reference to a column of the `FROM` relation" —
+matching PostgreSQL's `view_col_is_auto_updatable` (a view column is
+updatable iff its expression is a plain `Var` over the base relation; goopg
+additionally requires *every* column to qualify, since it has no
+per-column-expression rewrite machinery). Within that restriction, a subset
+of the base relation's columns, a reordering, and/or a rename are all now
+accepted: the function returns a `colMap []int` (target-list ordinal → `b`'s
+column ordinal) instead of a bool. This also let the standalone
+`len(tbl.ViewColumnAliases) > 0` gate be deleted outright — an explicit
+`CREATE VIEW v (a, b) AS SELECT x, y FROM t` column-name list and a per-target
+`SELECT x AS a, y AS b` alias are just two spellings of the same rename
+(`execCreateView` already folds either into `catalog.Table.Columns[i].Name`
+at `CREATE VIEW` time), so there is no longer a reason to treat them
+differently from the eligibility check's point of view.
+
+`viewAutoUpdatableChain` composes each level's own `colMap` down through the
+chain (a level's `ownMap[i]` gives its immediate `FROM`'s ordinal; composing
+with that `FROM`'s own already-composed map — when it is itself a view —
+yields the ordinal in the ultimate `base`), returning `colMaps [][]int`
+parallel to `chain`. Two new helpers turn a `colMap` into something
+`resolveExpr` can use directly, with no separate query-rewrite pass:
+
+- `viewColumnNames(tbl)` — a view's own output column names, in order
+  (already resolved by `CreateView` regardless of which rename spelling was
+  used).
+- `viewProxyTable(base, names, colMap)` — a synthetic `*catalog.Table` with
+  the *exact same physical column count/order/ordinals as `base`* (so a row
+  scanned from `base` indexes identically), but with the column at ordinal
+  `colMap[i]` renamed to `names[i]`. A `base` column not covered by `colMap`
+  (the view selects a strict subset) is left with an empty `Name`, which can
+  never match a real `parser.ColumnRef` — hiding it from resolution exactly
+  as PostgreSQL does (a view's row type only has its own target-list
+  columns).
+
+Passing this proxy — instead of `base` itself — to `singleBindingContext`
+lets `planInsert`/`planUpdate`/`planDelete` resolve a DML statement's column
+list, `SET`, `WHERE`, and `RETURNING` exactly as before, with no new
+resolution code path: `cat.LookupColumn`/`resolveExpr` find columns by name
+against the proxy and get back the correct **base** ordinal via each
+`catalog.Column`'s `Ordinal` field, which the proxy preserves unchanged. The
+plan node's own `Table` field (the real scan/mutation target at execution
+time) is always the true `base`, never the proxy — the proxy exists purely
+to give planning-time name resolution the view's vocabulary. The same
+technique closes the loose end the chaining follow-up left open: each chain
+level's own `WHERE` (`viewQualOnBase`) now resolves against a proxy shaped
+like its *immediate* `FROM`'s exposure (built from that level's own composed
+`colMap`) instead of unconditionally against `base`, so a chain that mixes
+renaming at different levels still resolves each level's stored qual
+correctly.
+
+For `INSERT` with no explicit column list, the source row's column *i* maps
+onto `outerColMap[i]` (the view's own ordinal order) rather than `base`'s
+physical order — `INSERT INTO v VALUES (...)` must supply values in the
+view's own column order, matching PostgreSQL's `transformInsertStmt`.
+
+Known residual, deliberately out of scope for this pass: `INSERT ... ON
+CONFLICT` arbiter-target and `DO UPDATE SET` resolution
+(`resolveArbiterIndex`/`planOnConflict`) still resolve against `base`
+directly, not through the proxy — targeting a renamed view column in `ON
+CONFLICT (...)` or `DO UPDATE SET ...` fails `42703` rather than resolving.
+This is a safe failure (a clear error, not silent corruption), and combining
+`ON CONFLICT` with a renaming view is a narrow enough case that plumbing the
+proxy through arbiter-index resolution was left for a dedicated pass — see
+`.ralph/deferral_ledger.md`.
+
+New tests in `internal/executor/view_dml_test.go`:
+`TestUpdatableViewColumnSubsetReorderRename` (rename via per-target alias,
+rename via explicit `CREATE VIEW` column list, column reorder with a
+column-list-free `INSERT`, column subset with both a successful `INSERT`
+against the exposed column and a `42703` rejection referencing the hidden
+one). `TestNonUpdatableViewDMLRejected`'s renamed-column case (`vren`) was
+replaced with an expression-column case (`vexpr`) — renaming a plain column
+reference is no longer rejected, but a target-list entry that is an
+expression (not a bare column reference) still is.
+
+Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`;
+`go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
+`scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
+
 ## Deferred
 
 See `.ralph/deferral_ledger.md` for the formal entry. Summary:
 
-1. **Column subset/reorder/rename.** PG's full per-column attribute map
-   (a view exposing a renamed/reordered/subset of the base table's columns)
-   is rejected here (`55000`) rather than rewritten. Needs a `colMap []int`
-   threaded through `Set`/`Returning`/row-assembly instead of relying on
-   `tbl.Columns == base.Columns` positional identity.
+1. ~~**Column subset/reorder/rename.**~~ — **RESOLVED** (see the "Follow-up:
+   column subset/reorder/rename" note above): `viewColumnMap` +
+   `viewProxyTable` replace the `tbl.Columns == base.Columns` positional-
+   identity requirement with a per-column ordinal map. `INSERT ... ON
+   CONFLICT` against a renamed view column remains a narrower open residual
+   (see that section).
 2. ~~**View-of-view chaining.**~~ — **RESOLVED** (see the "Follow-up" note
    above): `viewAutoUpdatableChain` recurses through a chain of simple
    updatable views, and CASCADED/LOCAL CHECK OPTION propagation now actually
