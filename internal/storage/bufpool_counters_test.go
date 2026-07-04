@@ -255,3 +255,62 @@ func TestPoolOnFlushHooksFireOnDirtyVictimEviction(t *testing.T) {
 		t.Errorf("OnFlushWait/OnFlushDone after one dirty-victim eviction = waits=%d dones=%d, want 1/1", waits, dones)
 	}
 }
+
+// TestPoolExtendTimeNanosAccumulates is AddExtendTimeNanos/ExtendTimeNanos's
+// extend_time analogue of TestPoolWriteTimeNanosAccumulates above (M0122-0003
+// pg_stat_io follow-up: real per-wait-event relation-extension timing).
+func TestPoolExtendTimeNanosAccumulates(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	if got := pool.ExtendTimeNanos(); got != 0 {
+		t.Fatalf("ExtendTimeNanos before any accumulation = %d, want 0", got)
+	}
+	pool.AddExtendTimeNanos(1_000_000)
+	pool.AddExtendTimeNanos(2_000_000)
+	if got, want := pool.ExtendTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("ExtendTimeNanos after two adds = %d, want %d", got, want)
+	}
+	// Non-positive durations (WaitEventEnd's zero-guard for a mismatched or
+	// clock-skewed pair) must not be recorded.
+	pool.AddExtendTimeNanos(0)
+	pool.AddExtendTimeNanos(-5)
+	if got, want := pool.ExtendTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("ExtendTimeNanos after non-positive adds = %d, want unchanged %d", got, want)
+	}
+}
+
+// TestPoolOnExtendHooksFireOnPinNewExtend pins the OnExtendWait/OnExtendDone
+// bracket itself: it must fire exactly once per PinNew call (the pool's sole
+// smgr Extend call site), mirroring TestPoolOnFlushHooksFireOnDirtyVictimEviction.
+func TestPoolOnExtendHooksFireOnPinNewExtend(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	var waits, dones int
+	pool.OnExtendWait = func() { waits++ }
+	pool.OnExtendDone = func() { dones++ }
+
+	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+
+	for i := 0; i < 3; i++ {
+		s, _, err := pool.PinNew(rel)
+		if err != nil {
+			t.Fatalf("PinNew %d: %v", i, err)
+		}
+		pool.Unpin(s)
+		if waits != i+1 || dones != i+1 {
+			t.Fatalf("after PinNew %d: waits=%d dones=%d, want %d/%d", i, waits, dones, i+1, i+1)
+		}
+	}
+}

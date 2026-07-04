@@ -215,6 +215,14 @@ type Pool struct {
 	sharedEvictionCount atomic.Int64
 	sharedExtendCount   atomic.Int64
 
+	// sharedExtendTimeNanos is sharedWriteTimeNanos's relation-extension
+	// sibling: real wall-clock time spent in PinNew's mgr.Extend call (the
+	// exact span the OnExtendWait/OnExtendDone bracket covers), backing
+	// pg_stat_io's extend_time column. Only accumulated when the extending
+	// backend has track_io_timing on (see initdb.Open's OnExtendDone
+	// wiring, which mirrors OnFlushDone's AddWriteTimeNanos call exactly).
+	sharedExtendTimeNanos atomic.Int64
+
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.
 	bgwriterMu   sync.Mutex
@@ -249,6 +257,21 @@ type Pool struct {
 
 	// OnFlushDone is called after that flush finishes.
 	OnFlushDone func()
+
+	// OnExtendWait is called when PinNew is about to extend rel via the
+	// pool's sole smgr Extend call (extend_time's OnFlushWait analogue).
+	// Deliberately a distinct pair from storage.Manager's own
+	// OnExtendWait/OnExtendDone (smgr.go) rather than a reuse: the
+	// Manager-level hooks fire for every Extend/ExtendBatch call
+	// regardless of caller, while this pool-level pair — like
+	// OnFlushWait/OnFlushDone versus Manager.OnWriteWait/OnWriteDone —
+	// exists to attribute IO time to pg_stat_io's per-backend-type
+	// extend_time column, which upstream's pgBufferUsage tracks
+	// per-backend, not per-smgr-call.
+	OnExtendWait func()
+
+	// OnExtendDone is called after that extend finishes.
+	OnExtendDone func()
 
 	// OnBufferIOWait is called when a goroutine waits for an in-flight read.
 	OnBufferIOWait func()
@@ -565,6 +588,23 @@ func (p *Pool) ExtendCount() int64 {
 	return p.sharedExtendCount.Load()
 }
 
+// AddExtendTimeNanos accumulates n nanoseconds of real relation-extension
+// wait time into the pool-wide extend-time tally. Called only from the
+// OnExtendDone hook when the extending backend has track_io_timing enabled
+// (see sharedExtendTimeNanos's doc comment).
+func (p *Pool) AddExtendTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedExtendTimeNanos.Add(n)
+	}
+}
+
+// ExtendTimeNanos returns the pool-wide cumulative real time spent
+// extending relations by backends with track_io_timing on, backing
+// pg_stat_io's extend_time column (milliseconds).
+func (p *Pool) ExtendTimeNanos() int64 {
+	return p.sharedExtendTimeNanos.Load()
+}
+
 // SyncAllDataFiles fdatasyncs every open data file.
 func (p *Pool) SyncAllDataFiles() error {
 	if p.mgr == nil {
@@ -815,7 +855,13 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
+	if p.OnExtendWait != nil {
+		p.OnExtendWait()
+	}
 	blk, err := p.mgr.Extend(rel, s.page)
+	if p.OnExtendDone != nil {
+		p.OnExtendDone()
+	}
 	s.contentMu.Unlock()
 	if err != nil {
 		p.pinMu.Lock()

@@ -641,6 +641,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			pool.AddWriteTimeNanos(int64(d))
 		}
 	}
+	// extend_time's OnFlushWait/OnFlushDone analogue: brackets PinNew's
+	// mgr.Extend call (M0122-0003 pg_stat_io follow-up).
+	pool.OnExtendWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
+		}
+	}
+	pool.OnExtendDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddExtendTimeNanos(int64(d))
+		}
+	}
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}

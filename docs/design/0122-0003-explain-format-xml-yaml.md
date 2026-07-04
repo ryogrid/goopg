@@ -628,3 +628,58 @@ during a clean fill — mirrors `bm_io_in_progress_test.go`'s `OnPinWait`
 hook-invocation pattern). `internal/executor/pgstat_io_test.go` —
 `TestPgStatIOWriteTimeRendered` (end-to-end rendered-cell assertion,
 mirrors `TestPgStatIOReadTimeAndWritesRendered`).
+
+## `extend_time` counter (later loop, 2026-07-05)
+
+`extend_time` — the resume point the `write_time` section above left open
+— now renders a real value, via the same new-hook-pair pattern
+`write_time` used (not a reuse of an existing counter).
+
+`storage.Pool` gains `sharedExtendTimeNanos` (`internal/storage/bufpool.go`),
+`write_time`'s (`sharedWriteTimeNanos`) relation-extension sibling, plus a
+matching `OnExtendWait`/`OnExtendDone` hook pair — the extend-side analogue
+of `OnFlushWait`/`OnFlushDone`. The new pair brackets `PinNew`'s
+`p.mgr.Extend(rel, s.page)` call exactly — the pool's sole smgr `Extend`
+call site, the same span the pre-existing `sharedExtendCount` counter
+already attributes to (`extends`/`extend_bytes`). New
+`AddExtendTimeNanos`/`ExtendTimeNanos` accessor pair mirrors
+`AddWriteTimeNanos`/`WriteTimeNanos` exactly, including the non-positive-
+duration guard.
+
+`internal/initdb/open.go` wires `pool.OnExtendWait`/`pool.OnExtendDone`
+immediately after the pre-existing `pool.OnFlushWait`/`pool.OnFlushDone`
+block, using the identical `act.LookupTrackedGoroutine()` →
+`WaitEventStart(..., WaitDataFileExtend)` / `WaitEventEnd()` →
+`AddExtendTimeNanos` pattern — deliberately a new `Pool`-level pair, not a
+reuse of `storage.Manager`'s existing `mgr.OnExtendWait`/`mgr.OnExtendDone`
+(`internal/storage/smgr.go`), for the same per-backend-attribution reason
+`write_time` documented for `mgr.OnWriteWait`/`OnWriteDone`: the
+`Manager`-level hooks fire for every `Extend`/`ExtendBatch` call regardless
+of caller, while this `Pool`-level pair is scoped to exactly the `PinNew`
+foreground-extension span pg_stat_io's per-backend-type `extend_time`
+column needs.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` reads
+`Pool.ExtendTimeNanos()` and renders it (via the existing `nsToMs` helper)
+as the `extend_time` column (col 13) alongside the pre-existing
+`extends`/`extend_bytes` cells, for the same "client backend/relation/normal"
+row.
+
+**Tests:** `internal/storage/bufpool_counters_test.go` —
+`TestPoolExtendTimeNanosAccumulates` (accumulation + non-positive-duration
+guard, mirrors `TestPoolWriteTimeNanosAccumulates`),
+`TestPoolOnExtendHooksFireOnPinNewExtend` (installs counting
+`OnExtendWait`/`OnExtendDone` closures directly on a real `Pool`, confirms
+they fire exactly once per `PinNew` call across several calls — mirrors
+`TestPoolOnFlushHooksFireOnDirtyVictimEviction`'s hook-invocation pattern).
+`internal/executor/pgstat_io_test.go` — `TestPgStatIOExtendTimeRendered`
+(end-to-end rendered-cell assertion, mirrors `TestPgStatIOWriteTimeRendered`).
+
+Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
+ANALYZE (planning-time buffers), local/temp-buffer terms, the 3 remaining
+`pg_stat_io` op counters (reuses/writebacks/fsyncs — each needs a genuinely
+new counting mechanism: strategy-ring reuse, bgwriter/checkpointer-scoped
+writeback attribution, fsync call-site instrumentation respectively),
+EXPLAIN's `I/O Timings` line (now renderable since both `write_time` and
+`extend_time` exist), and the `CTEDMLPrefix` nested-node instrumentation
+residual.

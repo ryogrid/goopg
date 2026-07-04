@@ -272,3 +272,38 @@ func TestPgStatIOWriteTimeRendered(t *testing.T) {
 		t.Errorf("write_time (col 8) = %q, want %q", found[8], "1.250")
 	}
 }
+
+// TestPgStatIOExtendTimeRendered is write_time's extend_time analogue:
+// fetchIOStatRows must render real extend_time (col 13, from
+// Pool.ExtendTimeNanos, accumulated by the OnExtendDone hook wired in
+// internal/initdb/open.go around PinNew's mgr.Extend call) instead of the
+// previous hardcoded "0".
+func TestPgStatIOExtendTimeRendered(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	// 0.75ms of accumulated extend wait — mirrors what OnExtendDone would
+	// add via a real track_io_timing-gated WaitEventEnd duration.
+	pool.AddExtendTimeNanos(750_000)
+
+	ctx := &Context{Pool: pool}
+	rows := fetchIOStatRows(ctx)
+	var found []string
+	for _, r := range rows {
+		if r[0] == "client backend" && r[1] == "relation" && r[2] == "normal" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no client backend/relation/normal row found")
+	}
+	if found[13] != "0.750" {
+		t.Errorf("extend_time (col 13) = %q, want %q", found[13], "0.750")
+	}
+}

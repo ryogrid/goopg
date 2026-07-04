@@ -19,22 +19,22 @@ package executor
 //
 // goopg tracks a handful of real IO counters today: storage.Pool's pool-wide
 // shared hit/read/written/evicted/extended tallies (added for EXPLAIN
-// (BUFFERS) rendering) plus real wall-clock read_time/write_time
+// (BUFFERS) rendering) plus real wall-clock read_time/write_time/extend_time
 // accumulators (M0122-0003 track_io_timing follow-up: Pool.OnPinDone /
-// Pool.OnFlushDone accumulate the actual pinLoad disk-read / evictVictim
-// dirty-flush duration via ActivityRegistry.WaitEventEnd, each gated on the
-// backend's track_io_timing flag). Those real signals are wired into the
-// one cell they correspond to — backend_type='client backend',
-// object='relation', context='normal', columns reads/read_bytes/read_time/
-// writes/write_bytes/write_time/hits/evictions/extends/extend_bytes —
+// Pool.OnFlushDone / Pool.OnExtendDone accumulate the actual pinLoad
+// disk-read / evictVictim dirty-flush / PinNew relation-extension duration
+// via ActivityRegistry.WaitEventEnd, each gated on the backend's
+// track_io_timing flag). Those real signals are wired into the one cell
+// they correspond to — backend_type='client backend', object='relation',
+// context='normal', columns reads/read_bytes/read_time/writes/write_bytes/
+// write_time/hits/evictions/extends/extend_bytes/extend_time —
 // everything else that upstream *tracks* renders as a real 0 (goopg has not
 // performed that IO, which is true), and every untracked cell still renders
 // NULL, matching upstream's row *shape* exactly even though most of its
 // counts are not yet collected. This is a deliberate, bounded slice of the
 // wider IO-instrumentation gap (see .ralph/deferral_ledger.md, M0122-0003):
-// extend_time and the remaining three op counters (reuses/writebacks/
-// fsyncs, plus their _bytes/_time siblings) remain future work and are NOT
-// fabricated here.
+// the remaining three op counters (reuses/writebacks/fsyncs, plus their
+// _bytes/_time siblings) remain future work and are NOT fabricated here.
 
 import (
 	"strconv"
@@ -223,18 +223,20 @@ const pgStatIOColCount = 20
 // order (backend type, then object, then context — matching
 // pg_stat_io_build_tuples' nested loops), giving every valid combination
 // upstream's exact NULL/zero cell shape. The single cell goopg actually
-// instruments (client backend / relation / normal: reads, read_bytes, hits,
-// evictions, extends, extend_bytes) is filled from storage.Pool's
-// shared-buffer counters; every other tracked cell is a faithful 0 (goopg
-// has done none of that IO), not a guess.
+// instruments (client backend / relation / normal: reads, read_bytes,
+// read_time, writes, write_bytes, write_time, hits, evictions, extends,
+// extend_bytes, extend_time) is filled from storage.Pool's shared-buffer
+// counters; every other tracked cell is a faithful 0 (goopg has done none
+// of that IO), not a guess.
 func fetchIOStatRows(ctx *Context) [][]string {
-	var poolHit, poolRead, poolWritten, poolReadTimeNanos, poolWriteTimeNanos, poolEvictions, poolExtends int64
+	var poolHit, poolRead, poolWritten, poolReadTimeNanos, poolWriteTimeNanos, poolEvictions, poolExtends, poolExtendTimeNanos int64
 	if ctx != nil && ctx.Pool != nil {
 		poolHit, poolRead, _, poolWritten = ctx.Pool.BufferCounters()
 		poolReadTimeNanos = ctx.Pool.ReadTimeNanos()
 		poolWriteTimeNanos = ctx.Pool.WriteTimeNanos()
 		poolEvictions = ctx.Pool.EvictionCount()
 		poolExtends = ctx.Pool.ExtendCount()
+		poolExtendTimeNanos = ctx.Pool.ExtendTimeNanos()
 	}
 
 	var rows [][]string
@@ -277,6 +279,7 @@ func fetchIOStatRows(ctx *Context) [][]string {
 						case ioOpExtend:
 							count = poolExtends
 							bytes = poolExtends * 8192
+							timeMillis = strconv.FormatFloat(nsToMs(poolExtendTimeNanos), 'f', 3, 64)
 						}
 					}
 					cells[countCol] = strconv.FormatInt(count, 10)
