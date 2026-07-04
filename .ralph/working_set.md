@@ -2,72 +2,79 @@
 
 ---
 
-**Loop #38 (this session) — COMPLETE, committed + pushed.**
+**Loop #32 (this session) — COMPLETE, committed + pushed.**
 
-Task: M0122-0004 backlog bucket — close a stale `unimplemented_feat.json`
-entry via verify-before-implement (continuing the pattern the peer loop
-has been running against the M0122-0005 bucket).
+Task: M0122-0003 — implement 2 of the 5 still-`0` `pg_stat_io` op counters
+named as open by the prior loop's ledger row: `evictions` and `extends`
+(+ `extend_bytes`).
 
-Landed (bookkeeping only, zero source-code changes): the entry claiming
-"DEFAULT clause in column definitions is skipped during parsing; default
-values are not stored or applied to new rows" (dated 2026-05-12, `first_
-deferred_commit` `bb65e7d5`) is stale. Verified the full pipeline is and
-has been wired for a long time: `internal/parser/ddl.go:4208-4214` stores
-`ColumnDef.DefaultExpr`; `internal/planner/planner.go`'s
-`defaultMarkerReplacement`/`rewriteInsertDefaultMarkers` substitute it
-(or a synthesized `nextval(...)` for SERIAL/IDENTITY columns, else NULL)
-for omitted INSERT columns and explicit `DEFAULT` markers/`UPDATE SET
-col = DEFAULT`; `internal/executor/operators_ddl.go` persists/validates
-it across CREATE TABLE, `LIKE ... INCLUDING DEFAULTS`, ALTER TABLE
-ADD/ALTER COLUMN, and pg_dump's attrdef rendering. Confirmed via the
-existing `TestInsertFillsMissingColumnDefault*`
-suite (`internal/executor/storage_test.go`, all PASS at current HEAD)
-— no new tests needed since coverage was already comprehensive. Updated
-`.ralph/fix_plan.md`'s M0122-0004 bucket + `unimplemented_feat.json`
-entry (`status: resolved`, same in-place-edit style as the peer's
-M0122-0005 closures — surgical `Edit`, not a full JSON rewrite, per
-[[goopg_unimplemented_feat_json_no_full_rewrite]]). Committed as
-`e1387bb1` (2 files: `.ralph/fix_plan.md`, `unimplemented_feat.json`,
-pathspec-scoped).
+Landed: `storage.Pool` (`internal/storage/bufpool.go`) gains
+`sharedEvictionCount`/`sharedExtendCount` atomic counters +
+`EvictionCount()`/`ExtendCount()` accessors — same pattern as the
+pre-existing `sharedDirtiedCount`/`sharedWrittenCount`/`sharedReadTimeNanos`
+trio (own accessor pair, not a wider `BufferCounters()` tuple, to avoid
+touching its 4 existing call sites). `sharedEvictionCount` increments once
+in `evictVictim`, right after the "slot was free" early-return check (only
+when a real, valid tag is displaced), regardless of dirty state — a strict
+superset of the dirty-only `sharedWrittenCount`. `sharedExtendCount`
+increments once in `PinNew` right after its `p.mgr.Extend` call succeeds —
+confirmed the pool's *only* smgr-Extend call site (grepped, no sibling).
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` wires both into the
+existing per-op `switch` for the one row goopg instruments (client
+backend/relation/normal); `extends` also renders `extend_bytes`
+(`count*8192`). Tests: `internal/storage/bufpool_counters_test.go`
+(`TestBufferCountersEvictionAndExtend` — 2-slot pool, fills to capacity
+with 0 evictions then forces N further evictions via N more `PinNew`
+calls), `internal/executor/pgstat_io_test.go`
+(`TestPgStatIOEvictionsAndExtendsRendered` — end-to-end rendered-cell
+assertion). Design: `docs/design/0122-0003-explain-format-xml-yaml.md`
+new "`evictions`/`extends` counters" section; `docs/design/README.md` row
+extended. Ledger row appended (`.ralph/deferral_ledger.md`, 2026-07-05,
+M0122-0003, narrows the prior read-timing row). `.ralph/fix_plan.md`'s
+M0122-0003 item + "Next up" banner updated to reflect current remaining
+scope. Committed as `e1e64c2b` (8 files, pathspec-scoped commit), pushed.
 
-Concurrency note: a live peer `ralph_loop.sh` tree was active throughout
-this loop (screen `ralph`, its own loop landed `47480a27` — a
-working_set.md carry commit — right before this loop started, then
-continued into an in-flight edit of `internal/executor/pgstat_io.go` +
-`internal/executor/pgstat_io_test.go` + `internal/storage/bufpool.go` +
-`internal/storage/bufpool_counters_test.go`, all left completely
-untouched here). `.ralph/progress.json` and `.ralph/working_set.md`
-were both mid-flux (peer actively writing) at loop start — confirmed via
-repeated `git status`/`git diff` polling before ever touching the tree;
-this loop's own commit used an explicit pathspec (`git commit ... --
-.ralph/fix_plan.md unimplemented_feat.json`) to stay fully disjoint from
-the peer's in-flight files. `.ralph/progress.json` picked up one more
-change after this loop's commit: `make ralph-state-guard` (mandatory
-per-loop gate) auto-repaired a stale `status="running"`/
-`progress="completed"` mismatch (the peer's previous loop's clean-exit
-marker) back to `status="running"`/`progress="in_progress"` with a
-refreshed timestamp — a legitimate, expected repair-tool write, not a
-manual edit.
+Concurrency note: a live peer `ralph_loop.sh` tree (own process tree,
+loop #38→#39 by the time this loop finished) was active throughout —
+confirmed via `pgrep -af ralph_loop.sh`/`ps -ef` showing two genuinely
+independent process trees (different parent PIDs), not the documented
+subshell-argv-duplication artifact. The peer's own loop-#38 carry note
+(overwritten by this entry) recorded that it saw this loop's in-flight
+edits to `pgstat_io.go`/`bufpool.go`/their tests and deliberately left
+them untouched, confirming disjointness from both sides before either
+committed. The peer landed 2 commits on fully disjoint files during this
+loop (`e1387bb1` DEFAULT-clause stale-entry closure + its `e5893325`
+working_set carry, both M0122-0004 `unimplemented_feat.json`/bookkeeping
+only) — confirmed via `git log`/`git diff --cached` before this loop's own
+commit, no functional overlap. This loop's own commit used an explicit
+pathspec covering only the files it exclusively owned (storage/executor
+source+tests, ledger, design docs, fix_plan.md) — never touching
+`.ralph/progress.json` (still shows a harmless timestamp-only diff from
+`make ralph-state-guard`'s auto-repair; left uncommitted, likely the
+driver's own bookkeeping to pick up) or `unimplemented_feat.json` (peer
+already committed it before this loop's own commit ran).
 
-Next step: M0122-0004's remaining open items are frame clause parsing/
-execution (ROWS/RANGE/GROUPS — now has three real consumers to
-generalize against: `evalFrameAggFuncs`/`frameEnd`/`evalNtileFuncs`),
-GROUPING SETS/ROLLUP/CUBE (confirmed-open per `unimplemented_feat.json`:
-`internal/planner/planner.go:4944` treats ROLLUP/CUBE as plain GROUP BY
-only, sentinel-injected), combining named-window forms, and intervals
-(timestamp-timestamp arithmetic, sub-day units — `internal/parser/
-expr.go:141`). Per the peer's own carry note, M0122-0005 has two open
-sub-items left: 1-byte `char`(OID 18) disambiguation
-(`internal/catalog/codec.go:1356` `TypeNameToOID` folds quoted `"char"`
-and bare `char` together) and `pg_collation_for()` (large — no collation
-tracking in v0 by design). Re-check `git status` + `pgrep -af
-ralph_loop.sh` fresh at loop start before picking any of these up —
-multiple independent loops are still running concurrently on this tree.
+Next step: M0122-0003 remaining sub-items (per the fix_plan banner):
+`EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers — no
+planning-phase buffer counters exist), local/temp-buffer terms,
+`write_time`/`extend_time` + the 3 remaining `pg_stat_io` op counters
+(reuses/writebacks/fsyncs — each needs a genuinely new counting mechanism:
+strategy-ring reuse, bgwriter/checkpointer-scoped writeback attribution,
+fsync call-site instrumentation respectively — not mechanical extensions
+of the eviction/extend pattern), EXPLAIN's `I/O Timings` line, and a
+`CTEDMLPrefix` nested-node instrumentation residual. Alternatively:
+M0119-0004 pg_dump catalog-view parity, or the next unresolved M0122-0005
+sub-item (per the peer's own carry notes: 1-byte `char` OID
+disambiguation, `pg_collation_for()`). Re-check `git status` +
+`pgrep -af ralph_loop.sh` fresh at loop start — multiple independent
+loops may still be running concurrently on this tree.
 
-Gates run: `go build ./...` clean; `go test ./internal/executor/... -run
-'TestInsertFillsMissingColumnDefault|TestInsertDoesNotOverrideExplicit
-ColumnDefault'` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33,
-elapsed 27.80s/95.14s); pre-commit pgbench smoke PASS (machine-enforced
-hook: 225/242/13362 TPS across TPC-B/update/select-only); `make
-ralph-state-guard` — found + auto-repaired 1 stale status/progress
-mismatch (see concurrency note above), consistent after repair.
+Gates run: `go build ./...` clean; `go vet` clean on
+`internal/storage/... internal/executor/...`; `go test
+./internal/storage/... ./internal/executor/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench smoke
+PASS (machine-enforced hook, ~235-14365 TPS across TPC-B/update/
+select-only); `make ralph-state-guard` — found + auto-repaired a
+stale-`completed`-marker inconsistency in `.ralph/progress.json` (the
+peer's clean-exit marker from a prior loop, not a project-completion
+marker), consistent after repair.
