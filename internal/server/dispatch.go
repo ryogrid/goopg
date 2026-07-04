@@ -242,8 +242,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
 	var advisoryReleaseTarget any
+	// ectx is assigned once the executor.Context is built below; predeclared
+	// here so the abort branch of this defer can reach it. A later statement's
+	// error in this same multi-statement message must undo any earlier CREATE
+	// TABLE/INDEX in the batch, not just the mvcc heap writes: RegisterTable
+	// is a non-transactional in-memory catalog mutation, so without this the
+	// table registration survives an aborted implicit batch while its
+	// pg_class/pg_attribute heap rows (written under the rolled-back tx) do
+	// not, permanently desyncing pg_dump-visible catalog state from the live
+	// catalog (M0110-0001 DU-002 slice 444 deferral, 2026-07-04).
+	var ectx *executor.Context
 	defer func() {
 		if autoCommit && !commit {
+			if ectx != nil {
+				if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+					executor.ProcessRollbackUndos(ectx, bs)
+				}
+			}
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		}
@@ -268,7 +283,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	stmtCtx := mctx.Acquire(sessCtxForStmt, mctx.KindStmt)
 	defer stmtCtx.Release()
 
-	ectx := executor.NewContext()
+	ectx = executor.NewContext()
 	ectx.Mctx = stmtCtx
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
@@ -282,6 +297,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	if connTx != nil {
 		if sess := connTx.Session(); sess != nil {
 			ectx.Session = sess
+		} else {
+			// Autocommit implicit batch (no explicit BEGIN): still give
+			// execCreateTable/execCreateIndex a *BasicSession to record
+			// against (RecordDDLCreate asserts on ctx.Session, unconditional
+			// on explicit-transaction status) so the abort defer above can
+			// undo a half-applied CREATE via ProcessRollbackUndos when a
+			// LATER statement in this same message fails. Message-scoped
+			// only — never shared with connTx, so it carries nothing across
+			// Query messages. InExplicitTransaction() stays false on it, so
+			// every other Session-gated code path (enum/composite pending
+			// tracking, TRUNCATE/DROP-in-savepoint snapshotting) is unaffected.
+			ectx.Session = executor.NewBasicSession()
 		}
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.

@@ -45,8 +45,15 @@ failure list.
 
 **M0120 and M0121 are both now CLOSED (2026-07-04)** — every sub-task `[x]`,
 report.md tallies `goopg-missing: 0`, and the one `goopg-bug` found (WP-02/WP-03,
-one root cause) is fixed + regression-tested + ledger-resolved. **Resume M0110
-next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above.
+one root cause) is fixed + regression-tested + ledger-resolved. **Resumed M0110
+next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above: this
+loop closed the M0110-0001 DU-002 slice 444 deferral (simple-query batch
+CREATE TABLE/INDEX atomicity on abort — design `root-0024`). **Next up:**
+either continue the M0119-0004 pg_dump catalog-view parity battery (next gap
+found via `TestPort_PgDumpConnectionSetup`), or pick up one of `root-0024`'s
+own two documented residuals (enum/composite-type undo + the mid-batch-BEGIN
+throwaway-session handoff) if a fresh discovery motivates it — neither is
+independently ledgered as its own task, see the design doc's Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
@@ -7789,6 +7796,45 @@ documentation-only and is exempt from the design-doc requirement.)
       new deferral — this closes the discovery from loop #87 in full (all
       ~12 `compatNoopCommandTag` prefixes share the one gated call site, not
       just GRANT).
+
+- [x] **Simple-query multi-statement batch: CREATE TABLE/INDEX atomicity on
+      abort (M0110-0001 DU-002 slice 444 follow-up, resumed after M0120/M0121).**
+      **COMPLETE 2026-07-04:** closes the slice-444 discovery in full for
+      CREATE TABLE/CREATE INDEX. Root cause: `dispatchSimpleQueryViaExecutor`
+      (`internal/server/dispatch.go`) begins exactly ONE `mvcc.Transaction`
+      per Query message, so a later statement's failure must roll back an
+      earlier successful `CREATE TABLE` too — but `catalog.InMemory.RegisterTable`
+      is non-transactional, and the existing undo machinery
+      (`sess.RecordDDLCreate`/`executor.ProcessRollbackUndos`, already used by
+      explicit `BEGIN...ROLLBACK`) never engaged for autocommit batches because
+      `connTx.Session()` returns `nil` outside an explicit transaction, so
+      `ectx.Session` stayed `nil` and (a) `RecordDDLCreate`'s type assertion
+      never fired and (b) the autocommit-abort defer never called
+      `ProcessRollbackUndos` at all. Fix: `dispatch.go` now wires a
+      message-scoped throwaway `*executor.BasicSession` for autocommit batches
+      (predeclaring `ectx` above the abort defer so the defer can reach it),
+      and the abort defer calls `executor.ProcessRollbackUndos` before
+      `TxnMgr.Rollback`. `RecordDDLCreate`'s `if !s.inTx { return }` guard
+      (`internal/executor/session.go`) was dead code for every pre-existing
+      caller (only reachable with `inTx==true`) — removed, since the new
+      throwaway session deliberately keeps `inTx==false` to avoid touching the
+      ~20 other `Session.InExplicitTransaction()` call sites (deferred
+      UNIQUE/EXCLUDE/FK constraint timing, stats scoping) that are out of
+      scope for this fix. Regression: `TestSimpleQueryBatchAbortUndoesEarlierCreateTable`
+      (`internal/server/dispatch_batch_atomicity_test.go`; confirmed RED
+      without the fix). Design doc
+      `docs/design/root-0024-simple-query-batch-ddl-create-atomicity.md`;
+      `docs/design/README.md` indexed. Gates: `go build ./...` clean;
+      `internal/server`+`internal/executor`+`internal/catalog`+`internal/mvcc`+
+      `internal/wal`+`internal/initdb` suites PASS (full, no regression);
+      `-race` on `internal/mvcc`+`internal/wal`+`internal/server` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Deferral ledger row (M0110-0001 DU-002 slice 444)
+      flipped `resolved`, citing this fix + its two documented residuals
+      (enum/composite-type + TRUNCATE/DROP-in-savepoint tracking stay
+      explicit-transaction-only; a `CREATE TABLE; BEGIN; ...; ROLLBACK;`
+      compound batch still loses the pre-BEGIN entry) — both recorded in the
+      design doc's own Deferred section rather than re-ledgered separately.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
