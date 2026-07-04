@@ -4910,14 +4910,31 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		// replaying CREATE INDEX records.
 		return
 	}
-	k := key(parser.ObjectName{Schema: schema, Name: name})
-	if existing, dup := c.indexes[k]; dup {
-		// JSON snapshot or earlier WAL pass already registered
+	// Dup-check via lookupIndexLocked (not a bare key(...) map probe): this
+	// recovery hook is called from two independent drivers that can disagree
+	// on `schema` for the exact same physical index — loadUserIndexesFromHeap
+	// resolves the index's real schema from its pg_class namespace OID
+	// (e.g. "public"), while replayIndexDDLRecords passes the raw, often
+	// unqualified schema captured verbatim in the original CREATE INDEX WAL
+	// record (""). A bare key(...) probe treats those as different indexes
+	// and registers a second, divergent *Index for the same OID; whichever
+	// key a later ALTER INDEX RENAME/DROP recovery call happens to hit then
+	// silently misses the other one (an unqualified rename could leave the
+	// old name "resurrected" under the untouched duplicate — caught by
+	// TestRenameIndexSurvivesRestartViaWAL once loadUserIndexesFromHeap
+	// started actually finding pg_index rows, M0119-0004 index-reloptions
+	// follow-up). lookupIndexLocked already implements the same "" vs
+	// "public." collision fallback reads rely on, so reusing it here keeps
+	// recovery's notion of "same index" consistent with LookupIndex's.
+	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}); dup {
+		// JSON snapshot or earlier recovery pass already registered
 		// this index. Idempotent no-op.
 		_ = existing
+		_ = existingKey
 		c.advanceNextOIDLocked(oid)
 		return
 	}
+	k := key(parser.ObjectName{Schema: schema, Name: name})
 	idx := &Index{
 		Schema:  schema,
 		Name:    name,
@@ -4942,8 +4959,12 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	k := key(parser.ObjectName{Schema: schema, Name: name})
-	idx, ok := c.indexes[k]
+	// Resolve via lookupIndexLocked, not a bare key(...) probe — same "" vs
+	// "public." collision rationale as RegisterIndexDuringRecovery above: a
+	// DROP INDEX WAL record's raw (often unqualified) schema must resolve to
+	// whatever key the index actually lives under, or the drop silently
+	// no-ops and the index is "resurrected" after restart.
+	idx, k, ok := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name})
 	if !ok {
 		return
 	}
@@ -5551,14 +5572,7 @@ func (c *InMemory) registerSystemTables() {
 			// (NULL) when unset so a plain index dumps byte-identically. Options
 			// are joined in declaration-stable order (fillfactor first), mirroring
 			// the array order PG stores. DU-002 slices 218/219.
-			idxReloptions := ""
-			if opts := idx.reloptionList(); len(opts) > 0 {
-				parts := make([]string, len(opts))
-				for i, kv := range opts {
-					parts[i] = kv[0] + "=" + kv[1]
-				}
-				idxReloptions = arrayTextLiteral(parts)
-			}
+			idxReloptions := BuildIndexReloptions(idx)
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
 				idx.Name,                    // 1:  relname
@@ -13325,6 +13339,91 @@ func ApplyTableReloptions(t *Table, text string) {
 			t.SecurityInvokerSet = true
 		case "check_option":
 			t.CheckOption = val
+		}
+	}
+}
+
+// BuildIndexReloptions renders an index's storage parameters as the
+// PostgreSQL pg_class.reloptions text[] external literal (e.g.
+// "{fillfactor=70,fastupdate=off}"), or "" when the index carries none. This
+// is the single source of truth for index reloptions so the live virtual
+// pg_class row (registerSystemTables' VirtualRows, via idx.reloptionList())
+// and the heap-persisted row written for restart durability
+// (executor.buildUserPGClassRowForIndex) never drift apart — mirrors
+// BuildTableReloptions/TableReloptionsElements for tables/views (M0119-0004
+// index-reloptions follow-up: buildUserPGClassRowForIndex used to hardcode
+// "{}", silently losing fillfactor/fastupdate/gin_pending_list_limit/
+// pages_per_range/autosummarize/deduplicate_items across a restart).
+func BuildIndexReloptions(idx *Index) string {
+	relopts := IndexReloptionsElements(idx)
+	if len(relopts) == 0 {
+		return ""
+	}
+	return arrayTextLiteral(relopts)
+}
+
+// IndexReloptionsElements is BuildIndexReloptions's element-list form: the
+// raw "key=value" strings before joining into the text[] external literal.
+// Physical heap-tuple encoding needs the individual elements (to build a
+// proper PG ArrayType blob via pgTextArrayBytes), not the pre-joined "{a,b}"
+// string BuildIndexReloptions returns — matches TableReloptionsElements's
+// contract for tables.
+func IndexReloptionsElements(idx *Index) []string {
+	opts := idx.reloptionList()
+	if len(opts) == 0 {
+		return nil
+	}
+	relopts := make([]string, len(opts))
+	for i, kv := range opts {
+		relopts[i] = kv[0] + "=" + kv[1]
+	}
+	return relopts
+}
+
+// ApplyIndexReloptions is BuildIndexReloptions's inverse: given a
+// pg_class.reloptions text[] external literal in the exact form
+// BuildIndexReloptions itself produces (e.g.
+// "{fillfactor=70,fastupdate=off}"), it sets the corresponding fields on idx.
+// Used by loadUserIndexesFromHeap to restore an index's storage parameters
+// from the heap-persisted pg_class row after a restart — without this, an
+// index's fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
+// pages_per_range/autosummarize silently reverted to defaults across every
+// restart (the index-reloptions residual left open by M0119-0004's
+// table/view reloptions fix). Mirrors ApplyTableReloptions's contract: no
+// general array-literal parsing — goopg only ever needs to round-trip its
+// own emitted content here, and every value BuildIndexReloptions emits is a
+// bare number/on/off token that never needs quoting. Malformed/unknown keys
+// are silently ignored so a forward-compatible reader tolerates options
+// written by a newer goopg version.
+func ApplyIndexReloptions(idx *Index, text string) {
+	if len(text) < 2 || text[0] != '{' || text[len(text)-1] != '}' {
+		return
+	}
+	inner := text[1 : len(text)-1]
+	if inner == "" {
+		return
+	}
+	for _, kv := range strings.Split(inner, ",") {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "fillfactor":
+			idx.Fillfactor, _ = strconv.Atoi(val)
+		case "deduplicate_items":
+			v := val == "on"
+			idx.DeduplicateItems = &v
+		case "fastupdate":
+			v := val == "on"
+			idx.FastUpdate = &v
+		case "gin_pending_list_limit":
+			idx.GinPendingListLimit, _ = strconv.Atoi(val)
+		case "pages_per_range":
+			idx.PagesPerRange, _ = strconv.Atoi(val)
+		case "autosummarize":
+			v := val == "on"
+			idx.AutoSummarize = &v
 		}
 	}
 }

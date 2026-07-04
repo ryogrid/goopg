@@ -209,3 +209,51 @@ func TestTableAndViewReloptionsSurviveRestart(t *testing.T) {
 		t.Errorf("ro_view.CheckOption after restart = %q, want %q", view.CheckOption, "local")
 	}
 }
+
+// TestIndexReloptionsSurviveRestart is the index-reloptions follow-up to
+// TestTableAndViewReloptionsSurviveRestart (M0119-0004): an index's
+// `WITH (fillfactor=...)` storage parameter used to be lost across a restart
+// because buildUserPGClassRowForIndex hardcoded reloptions="{}" and
+// loadUserIndexesFromHeap never read the heap-persisted reloptions column
+// back. Pins both the encode side (buildUserPGClassRowForIndex) and the
+// decode/apply side (loadUserIndexesFromHeap + catalog.ApplyIndexReloptions)
+// together, end to end through a real restart.
+func TestIndexReloptionsSurviveRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ro_idx_src (id int4 NOT NULL, val int4)")
+	runDDL(t, rt1, "CREATE INDEX ro_idx ON ro_idx_src (val) WITH (fillfactor=60)")
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	// Schema-qualified lookup: an unqualified CREATE INDEX registers under two
+	// distinct catalog keys after a restart (heap-scan recovery resolves the
+	// index's actual schema, "public.ro_idx"; WAL-replay recovery registers the
+	// bare "ro_idx" key straight from the DDL statement's unqualified name) —
+	// a separate, pre-existing dual-registration gap unrelated to reloptions
+	// (recorded in the deferral ledger). Schema-qualifying the lookup here
+	// pins the heap-scan-recovered entry that carries the restored
+	// reloptions, without depending on that unrelated ambiguity's resolution
+	// order.
+	idx, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Schema: "public", Name: "ro_idx"})
+	if !ok {
+		t.Fatal("ro_idx not found after restart")
+	}
+	if idx.Fillfactor != 60 {
+		t.Errorf("ro_idx.Fillfactor after restart = %d, want 60", idx.Fillfactor)
+	}
+}

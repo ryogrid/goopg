@@ -2613,9 +2613,10 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 	page := make(storage.Page, storage.BlockSize)
 
 	type indexClassRow struct {
-		oid  uint32
-		name string
-		nsp  uint32
+		oid        uint32
+		name       string
+		nsp        uint32
+		relOptions string
 	}
 	var indexRows []indexClassRow
 
@@ -2643,7 +2644,24 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 				continue
 			}
 			if row.RelKind == "i" && row.OID >= catalog.FirstUserOID {
-				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace})
+				// reloptions (attnum 33) is a varlena column past the fixed-offset
+				// prefix DecodePGClassPhysicalRow decodes, same gap
+				// loadUserTablesFromHeap works around for tables/views — re-decode
+				// the full PG18-canonical row with the general PG-tuple decoder to
+				// recover an index's fillfactor/fastupdate/etc. (M0119-0004
+				// index-reloptions follow-up). Best-effort: a decode failure here
+				// just leaves relOptions empty.
+				relOptions := ""
+				natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+				cols := executor.PGClassColumnsPG18()
+				decoded := make(executor.Row, len(cols))
+				if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr == nil {
+					const reloptionsOrdinal = 32
+					if reloptionsOrdinal < len(decoded) && !decoded[reloptionsOrdinal].IsNull() {
+						relOptions = decoded[reloptionsOrdinal].StringValue()
+					}
+				}
+				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace, relOptions: relOptions})
 			}
 		}
 	}
@@ -2740,6 +2758,16 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			schema = name
 		}
 		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid)
+		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
+		// pages_per_range/autosummarize from the heap-persisted pg_class row —
+		// without this they silently revert to defaults across every restart
+		// (M0119-0004 index-reloptions follow-up, sibling of loadUserTablesFromHeap's
+		// catalog.ApplyTableReloptions call for tables/views).
+		if ir.relOptions != "" {
+			if newIdx, ok := cat.LookupIndexByOID(ir.oid); ok {
+				catalog.ApplyIndexReloptions(newIdx, ir.relOptions)
+			}
+		}
 	}
 	return nil
 }

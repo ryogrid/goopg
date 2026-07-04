@@ -288,6 +288,56 @@ func TestBuildUserPGClassRowReloptionsSurvivesHeapEncode(t *testing.T) {
 	}
 }
 
+// TestBuildUserPGClassRowForIndexReloptionsSurvivesHeapEncode pins the
+// index-reloptions follow-up to M0119-0004: buildUserPGClassRowForIndex used
+// to hardcode reloptions="{}" unconditionally, so an index's fillfactor/
+// fastupdate/etc. storage parameters were silently dropped from the
+// heap-persisted pg_class row and lost across a restart. It must instead
+// reuse catalog.IndexReloptionsElements — the same builder the live virtual
+// pg_class row uses — encode a real PG ArrayType blob, and emit SQL NULL
+// when the index carries no reloptions at all, matching real PostgreSQL
+// (sibling of TestBuildUserPGClassRowReloptionsSurvivesHeapEncode for
+// tables/views).
+func TestBuildUserPGClassRowForIndexReloptionsSurvivesHeapEncode(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	decodeReloptions := func(t *testing.T, idx *catalog.Index) Datum {
+		t.Helper()
+		row := buildUserPGClassRowForIndex(nil, idx)
+		body, err := EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("EncodeRowPG: %v", err)
+		}
+		bitmap := NullBitmapPG(row)
+		tuple := storage.NewHeapTupleWithNulls(1, storage.InvalidTransactionID, bitmap, body)
+		tuple.Header.SetNatts(len(cols))
+		natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, tuple.Data, tuple.Bitmap, natts, nil); err != nil {
+			t.Fatalf("DecodeRowIntoMctxPGTuple: %v", err)
+		}
+		return decoded[32]
+	}
+
+	plain := &catalog.Index{Schema: "public", Name: "plain_idx", OID: 16411, Columns: []string{"id"}}
+	if got := decodeReloptions(t, plain); !got.IsNull() {
+		t.Errorf("plain index reloptions = %q, want NULL", got.StringValue())
+	}
+
+	fastUpdateOff := false
+	withOpts := &catalog.Index{
+		Schema:              "public",
+		Name:                "opts_idx",
+		OID:                 16412,
+		Columns:             []string{"id"},
+		Fillfactor:          70,
+		FastUpdate:          &fastUpdateOff,
+		GinPendingListLimit: 8192,
+	}
+	if got, want := decodeReloptions(t, withOpts).StringValue(), "{fillfactor=70,fastupdate=off,gin_pending_list_limit=8192}"; got != want {
+		t.Errorf("opts_idx reloptions = %q, want %q", got, want)
+	}
+}
+
 // TestSyncTableStampsHeapHasVarWidthOnPGClassRow pins M0106-0010 batched-49:
 // the pg_class row written by `syncTableToCatalogHeap` for a user CREATE
 // TABLE must carry HEAP_HASVARWIDTH in t_infomask, because PG18's

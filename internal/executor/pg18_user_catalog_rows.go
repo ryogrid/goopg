@@ -525,6 +525,16 @@ func indexPersistence(idx *catalog.Index) string {
 // pg_class row for a user-defined index.
 func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 	natts := int64(len(idx.Columns))
+	// reloptions: shared builder with catalog.go's live VirtualRows pg_class
+	// path (catalog.IndexReloptionsElements) so an index's storage parameters
+	// (fillfactor, deduplicate_items, fastupdate, gin_pending_list_limit,
+	// pages_per_range, autosummarize) survive a restart instead of being
+	// silently dropped by a hardcoded "{}" — mirrors buildUserPGClassRow's
+	// table/view fix (M0119-0004 index-reloptions follow-up).
+	idxReloptionsDatum := NullDatum
+	if relopts := catalog.IndexReloptionsElements(idx); len(relopts) > 0 {
+		idxReloptionsDatum = NewBytesDatum(pgTextArrayBytes(relopts))
+	}
 	return Row{
 		NewIntDatum(int64(idx.OID)),
 		NewStringDatum(idx.Name),
@@ -558,7 +568,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(minFrozenXID),             // relfrozenxid
 		NewIntDatum(minFrozenMXID),            // relminmxid
 		NewStringDatum("{}"),                  // relacl
-		NewStringDatum("{}"),                  // reloptions
+		idxReloptionsDatum,                    // reloptions (fillfactor/fastupdate/… or NULL)
 		NewStringDatum(""),                    // relpartbound
 	}
 }

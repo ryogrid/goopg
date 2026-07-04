@@ -121,10 +121,18 @@ func mirrorCatalogRelToPostgresDB(ctx *Context, relOID uint32) error {
 // strict subset) from DBOid=1 to DBOid=5.
 func mirrorTouchedCatalogsToPostgresDB(ctx *Context) error {
 	mirroredOIDs := []uint32{
-		catalog.RelationRelationId,  // 1259 pg_class
-		catalog.AttributeRelationId, // 1249 pg_attribute
-		pgClassOidIndexOID,          // 2662
-		pgClassRelnameNspIndexOID,   // 2663
+		catalog.RelationRelationId,     // 1259 pg_class
+		catalog.AttributeRelationId,    // 1249 pg_attribute
+		catalog.IndexRelationId,        // 2610 pg_index — syncIndexToCatalogHeap's
+		// pg_index row was never mirrored here, so loadUserIndexesFromHeap's Pass
+		// 2 heap scan (which reads from cat.DBOID(), almost always PostgresDBOid
+		// in real usage — see detectCatalogDBOID) never found a live pg_index row
+		// for any user index: every CREATE INDEX heap-recovery on restart silently
+		// fell back to the WAL-replay path instead (M0119-0004 index-reloptions
+		// follow-up — this is what made the new reloptions-survival plumbing a
+		// no-op until this line was added).
+		pgClassOidIndexOID,             // 2662
+		pgClassRelnameNspIndexOID,      // 2663
 		pgAttributeRelidAttnumIndexOID, // 2659
 	}
 	for _, oid := range mirroredOIDs {

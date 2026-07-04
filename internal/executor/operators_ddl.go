@@ -5997,6 +5997,19 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				}
 				idx.ColCollations = coll
 			}
+			// Flush the just-set fields (reloptions on pg_class, everything else
+			// on pg_index) to the heap-persisted catalog rows — createBTreeIndex's
+			// own sync ran before any of these fields existed on idx, so without
+			// this resync they all silently reverted to defaults across a restart
+			// (M0119-0004 index-reloptions follow-up).
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := resyncIndexClassHeapRow(o.ctx, idx); err != nil {
+					return err
+				}
+				if err := resyncIndexHeapRow(o.ctx, idx); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	// CREATE INDEX on a partitioned table recurses into every existing partition
@@ -12503,6 +12516,58 @@ func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName str
 		}
 	}
 	return idx, nil
+}
+
+// resyncIndexClassHeapRow rewrites the pg_class HEAP row for a single index
+// from its current catalog.Index state (buildUserPGClassRowForIndex).
+// createBTreeIndex's initial syncIndexToCatalogHeap call (invoked from inside
+// createBTreeIndex, before the WITH-clause storage-parameter fields —
+// Fillfactor/DeduplicateItems/FastUpdate/GinPendingListLimit/PagesPerRange/
+// AutoSummarize — are copied onto idx by the CREATE INDEX caller) always saw
+// a zero-value idx, so the heap-persisted pg_class row's reloptions column
+// was silently empty/NULL: a plain `CREATE INDEX … WITH (fillfactor=N)`
+// round-tripped correctly through the live virtual pg_class row (which reads
+// idx directly) but reverted to no reloptions across a restart (M0119-0004
+// index-reloptions follow-up, sibling of resyncIndexHeapRow below which does
+// the same delete-old-row + rewrite pattern for pg_index).
+func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range catalogDBOids(ctx) {
+			classRel := storage.RelFileNode{
+				DBOid:  dbOid,
+				RelOid: catalog.RelationRelationId,
+				Fork:   storage.MainFork,
+			}
+			stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
+				row, derr := catalog.DecodePGClassPhysicalRow(data)
+				return derr == nil && row.OID == idx.OID
+			})
+		}
+	}
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
+	if err != nil {
+		return fmt.Errorf("pg_class reloptions resync for index: %w", err)
+	}
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
+	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index resync for index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index resync for index: %w", err)
+	}
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
+	return nil
 }
 
 // resyncIndexHeapRow rewrites the pg_index HEAP row for a single index from its

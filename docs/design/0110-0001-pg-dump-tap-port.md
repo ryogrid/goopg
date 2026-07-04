@@ -14277,3 +14277,130 @@ Gates: `go build ./...` / `go vet ./...` clean; `go test
 ./internal/catalog/...` PASS; `go test ./internal/executor/...` (full
 package) PASS; `go test ./internal/initdb/...` (full package) PASS;
 `make ralph-state-guard` OK; pgbench smoke = pre-commit hook.
+
+## Follow-up: index reloptions never survived a restart either (M0119-0004, later loop)
+
+Closes the "index reloptions" item the "reloptions never survived a restart"
+follow-up above left explicitly out of scope: `buildUserPGClassRowForIndex`
+(`internal/executor/pg18_user_catalog_rows.go`) still hardcoded the index's
+own pg_class `reloptions` column to `"{}"` unconditionally, so `CREATE INDEX
+... WITH (fillfactor=N)` (and GIN's `fastupdate`/`gin_pending_list_limit`,
+BRIN's `pages_per_range`/`autosummarize`, btree's `deduplicate_items`) all
+silently reverted to defaults across a restart, mirroring the table/view bug
+above but for the sibling index-row builder.
+
+Mechanically this reused the same three-part fix (element-list builder +
+ArrayType-blob encode + decode/apply), extended by symmetry to indexes:
+`catalog.IndexReloptionsElements`/`BuildIndexReloptions`/
+`ApplyIndexReloptions` (`internal/catalog/catalog.go`) mirror the table
+versions exactly, built on top of the pre-existing (previously unexported)
+`idx.reloptionList()` the live virtual pg_class row already used — no new
+element-list logic needed, unlike the table case. The live virtual pg_class
+index row (`registerSystemTables`'s index branch) was refactored to call
+`BuildIndexReloptions` instead of its own inline copy of the same
+"key=value" join, closing a small duplication the table fix had already
+flagged as a risk ([[pattern_sibling_paths_must_agree]]).
+
+That alone was not sufficient — a real Init/Open/CREATE INDEX/Close/Open
+repro (mirroring `TestTableAndViewReloptionsSurviveRestart`) kept failing
+after the encode/decode plumbing was wired up, and root-causing why surfaced
+**two further, independent bugs**, both fixed in this loop:
+
+1. **Ordering bug: `createBTreeIndex` syncs the heap row before the
+   WITH-clause fields exist on `idx`.** The plain `CREATE INDEX` statement
+   handler calls `o.createBTreeIndex(...)` first, which internally calls
+   `syncIndexToCatalogHeap` (writing the pg_class/pg_index heap rows) as its
+   last step *before returning* — but the caller only copies
+   `s.Fillfactor`/`s.DeduplicateItems`/etc. onto the just-created `idx`
+   *after* `createBTreeIndex` returns (needed because `createBTreeIndex` is
+   shared by 14+ call sites, most of which have no WITH-clause options to
+   thread through its signature). So the very first heap-persisted pg_class
+   row for every btree index always captured a zero-value reloptions state,
+   even though the live in-memory `idx` (and therefore the live virtual
+   pg_class row, which reads `idx` directly) showed the WITH-clause values
+   correctly right up until the next restart. Fixed by adding
+   `resyncIndexClassHeapRow` (`internal/executor/operators_ddl.go`) — sibling
+   of the pre-existing `resyncIndexHeapRow` (which does the identical
+   stamp-old-row-then-rewrite pattern for pg_index, used elsewhere for
+   post-creation replica-identity/clustering flag changes) — and calling
+   both right after the WITH-clause field-setting block. Calling
+   `resyncIndexHeapRep` too (not just the new pg_class resync) was a small
+   deliberate scope extension: `idx.NullsNotDistinct`/`HasPredicate`/
+   `ColOpClasses`/`ColCollations` are set in that exact same block and suffer
+   the identical staleness bug on pg_index, and the fix was a zero-new-logic
+   reuse of an already-tested function directly adjacent to the code being
+   changed ([[pattern_sibling_paths_must_agree]]) — fixing only the
+   reloptions half while leaving this obviously-identical sibling bug in
+   place would have been a false economy.
+
+2. **`pg_index` was never mirrored to `PostgresDBOid`.**
+   `mirrorTouchedCatalogsToPostgresDB`
+   (`internal/executor/sys_catalog_postgres_db_mirror.go`) — which
+   `syncIndexToCatalogHeap`/`resyncIndexHeapRow`/`resyncIndexClassHeapRow`
+   all call at the end to propagate a catalog write from `DefaultDBOid` (1)
+   to `PostgresDBOid` (5, the "postgres" database PG clients actually
+   connect to) — mirrored `pg_class`/`pg_attribute` and their two secondary
+   btree indexes, but never `catalog.IndexRelationId` (2610, pg_index)
+   itself. Since a real running goopg server's catalog `DBOID()` is set at
+   startup to whatever OID the bootstrap "postgres" `pg_database` row uses
+   (`detectCatalogDBOID`, almost always 5, not the `DefaultDBOid`=1 every
+   sync function actually writes to), `loadUserIndexesFromHeap`'s Pass 2
+   heap scan — which reads from `cat.DBOID()` — has **never** found a live
+   `pg_index` row for any user-created index, in any goopg deployment,
+   since M0113 introduced heap-scan index recovery: every restart's index
+   recovery silently fell through entirely to the WAL-replay path
+   (`replayIndexDDLRecords`) instead. This was invisible because WAL replay
+   independently reconstructs the column list/unique/primary flags well
+   enough for ordinary use — but it carries none of the storage-parameter or
+   predicate/opclass/collation/nulls-not-distinct fields the CREATE INDEX WAL
+   record doesn't encode, so those were silently lost on *every* restart
+   regardless of this loop's reloptions fix. Fixed by adding
+   `catalog.IndexRelationId` to `mirroredOIDs`.
+
+**A third bug was found, and this one WAS fixed in this loop** (not deferred
+— it broke a pre-existing, previously-green test the moment bug 2's fix made
+heap-scan index recovery actually run): fixing bug 2 above exposed that an
+**unqualified** `CREATE INDEX name ON tbl (...)` (no explicit schema) ends up
+registered under **two different catalog map keys** after a restart —
+heap-scan recovery (`loadUserIndexesFromHeap` Pass 3) resolves and registers
+under the index's real schema (`"public.name"`), while WAL-replay recovery
+(`replayIndexDDLRecords` → `RegisterIndexDuringRecovery`) registers under the
+raw, unqualified `idxName.Schema` captured verbatim from the original DDL
+statement (bare `"name"`) — these are different `catalog.InMemory.indexes`
+map keys, so two independent `*Index` objects existed for the same physical
+index post-restart. `RegisterIndexDuringRecovery`'s dup-check and
+`UnregisterIndexDuringRecovery`'s lookup both did a bare `key(...)` map probe
+instead of the "" vs "public." collision-aware resolution `lookupIndexLocked`
+already implements for reads (and `RenameIndexDuringRecovery` already reused
+for writes) — so an `ALTER INDEX ... RENAME`/`DROP INDEX` replayed from WAL
+against an unqualified name could hit the *wrong* one of the two duplicate
+keys and silently no-op, observed concretely as
+`TestRenameIndexSurvivesRestartViaWAL` failing with "old index name
+resurrected after restart" once heap-scan recovery started actually
+registering indexes. Fixed by switching both functions to
+`lookupIndexLocked`, the same one-line-pattern fix `RenameIndexDuringRecovery`
+already demonstrated — no new resolution logic, just consistent reuse
+([[pattern_sibling_paths_must_agree]]).
+
+Tests: `internal/executor/pg18_user_catalog_rows_test.go` —
+`TestBuildUserPGClassRowForIndexReloptionsSurvivesHeapEncode` (sibling of the
+table version, same `EncodeRowPG`→`DecodeRowIntoMctxPGTuple` round-trip
+discipline). `internal/initdb/view_ddl_recovery_test.go` —
+`TestIndexReloptionsSurviveRestart`, the full Init/Open/DDL/Close/Open
+regression pinning `WITH (fillfactor=60)` surviving a real restart (looked up
+via a schema-qualified name — an unqualified lookup would still work now
+that the dual-registration bug is fixed, but qualifying makes the test
+assert the specific heap-scan-recovered object regardless). Re-verified
+green: `TestRenameIndexSurvivesRestartViaWAL`,
+`TestCreateIndexRecoveredOIDDoesNotCollide` (both pre-existing, full
+`internal/initdb` package run).
+
+Scope note: partition-child indexes are NOT covered by this fix —
+`createPartitionChildIndexes` never copies the parent's WITH-clause fields
+onto `childIdx` at all (a pre-existing, separate gap, recorded in the
+ledger, not touched here).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/initdb/...` (full packages) PASS,
+including the two new tests above; `make ralph-state-guard` OK; pgbench
+smoke = pre-commit hook.
