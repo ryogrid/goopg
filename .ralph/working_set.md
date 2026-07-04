@@ -101,3 +101,68 @@ picking). Also still open: the comma/LATERAL-join `ctx.OuterRows` wiring
 gap (ledger row 480), and M0122-0003's `pg_stat_io`/`track_io_timing`
 remainder. Re-check `git status` first — the peer's dirty file set above
 may have changed by the time the next loop starts.
+
+---
+
+**Loop #20 (this loop, the "peer" referenced just above) — COMPLETE,
+committed + pushed (`46bd3f2a`, on top of the `97e7318c`/`6173ea86`
+ANY/SOME/ALL work above — same shared working tree/`.git`, not separate
+clones, so our two loops' commits interleave on one branch).**
+
+Started investigating the same M0122-0004 backlog (per loop #19's "Next
+step" above) but a live mid-investigation `git status` recheck caught the
+peer *already* writing `internal/parser/{select,keywords,token,expr}.go` +
+`internal/planner/{foldconst,plan,planner}.go` for exactly the ANY/SOME/ALL
+item — pivoted immediately, touched none of those files. (The peer's note
+above independently confirms this from their side: my own later edit to
+`operators_storage.go` transiently broke their `go test` for one poll
+cycle before I'd finished it.)
+
+Picked up **M0097-0040** instead — a `unimplemented_feat.json` entry with
+`fix_plan: no-match` (not folded into any M0122 bucket): `GRANT/REVOKE
+INSERT|SELECT|UPDATE|DELETE` were already recorded in `catalog.tableACLs`
+(for `pg_dump` `relacl` fidelity) but only `TRUNCATE`/`MAINTAIN` ever
+consulted `HasTablePrivilege` — plain DML silently ignored REVOKEs.
+
+Landed: `internal/executor/operators_storage.go`'s new
+`dmlPrivilegePermitted(ctx, tbl, priv) bool` (bootstrap-superuser bypass →
+table-owner bypass → `HasTablePrivilege` lookup, mirrors
+`operators_vacuum.go`'s `maintenancePermitted`), called pre-lock from
+`insertOp`/`updateOp`/`deleteOp.Open` → `42501 permission denied for table
+%s`. Verified (read-only) that `fkCascadeDelete` and the logical-replication
+apply worker both write heap pages directly, bypassing `insertOp`/
+`updateOp`/`deleteOp` entirely — so FK CASCADE and replication apply are
+unaffected, matching PG (RI triggers aren't subject to the invoker's ACLs).
+
+Tests: `internal/executor/storage_dml_test.go`'s
+`TestDMLRequiresTablePrivilege`. Design:
+`docs/design/0118-0039-truncate-conflict-privilege-model.md` new Follow-up
+section; `docs/design/README.md` row updated. `.ralph/fix_plan.md`
+M0122-0008 banner updated. `unimplemented_feat.json` M0097-0040 → resolved.
+`.ralph/deferral_ledger.md`: new row for the still-open `SELECT`-privilege
+gap (every read path incl. internal system-catalog scans — separate bounded
+loop, not folded in here).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/server/... ./internal/catalog/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench smoke
+PASS (0 failed, TPC-B ~232-250 TPS, select-only ~14.2k TPS).
+`make ralph-state-guard`: auto-repaired the same routine running/completed
+progress-marker skew, exit 0. Committed via explicit `git commit -m ... --
+<7 files>`; `git show --stat HEAD` confirmed only those 7 files changed and
+the peer's dirty set (`catalog.go`/`catalog/codec.go`/`executor/codec.go`/
+`pg18_user_catalog_rows*.go`/`initdb/open.go`/
+`initdb/view_ddl_recovery_test.go`/`docs/design/0110-0001-*.md`) was
+untouched before and after. Push was a clean fast-forward.
+
+Next step: pick M0122-0004's still-open window frames ROWS/RANGE/GROUPS or
+GROUPING SETS/ROLLUP/CUBE (both confirmed genuinely unimplemented, see
+loop #19's notes above for exact file:line pointers) — **re-check
+`git status` first**, the peer may be mid-flight on one of them again.
+Or continue the SELECT-privilege follow-up this loop deferred (ledger row
+above): `seqScanOp.Open`/index-scan paths need the same
+`dmlPrivilegePermitted(ctx, tbl, "SELECT")` gate, but require a dedicated
+regression pass confirming internal system-catalog scans on behalf of a
+non-superuser session stay unaffected. Or the comma/LATERAL-join
+`ctx.OuterRows` wiring gap (ledger row 480, still open), or `M0122-0003`'s
+`pg_stat_io`/`track_io_timing` remainder.
