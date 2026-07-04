@@ -1970,6 +1970,19 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						}
 					}
 				}
+				// Capture the throwaway autocommit session's (if any) pending
+				// DDL-create undo list BEFORE connTx.Begin() lazily allocates the
+				// real BasicSession below — otherwise a `CREATE TABLE t1(...);
+				// BEGIN; ...; ROLLBACK` compound batch silently drops t1's undo
+				// entry: the throwaway session that recorded it (wired at dispatch
+				// entry because no explicit transaction existed yet) is discarded
+				// in favour of connTx's brand-new session, so a later ROLLBACK in
+				// the same message can no longer undo t1 via ProcessRollbackUndos
+				// (root-0024 residual: "compound batch still loses t1's undo entry").
+				var priorDDLCreates []executor.DDLUndoEntry
+				if bs, ok := ctx.Session.(*executor.BasicSession); ok && bs != nil {
+					priorDDLCreates = bs.TakePendingDDLCreates()
+				}
 				connTx.Begin(ctx.Tx)
 				// connTx.Begin lazily creates the BasicSession; when BEGIN is the
 				// first statement of a multi-statement simple-query message the
@@ -1979,6 +1992,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// the now-live session for the remainder of the batch. M0118-0009.
 				if sess := connTx.Session(); sess != nil {
 					ctx.Session = sess
+					for _, e := range priorDDLCreates {
+						sess.RecordDDLCreate(e)
+					}
 				}
 				// Propagate READ ONLY / READ WRITE mode from START TRANSACTION / BEGIN.
 				if connTx.Session() != nil {

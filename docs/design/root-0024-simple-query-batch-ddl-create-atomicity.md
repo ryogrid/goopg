@@ -133,17 +133,50 @@ end-to-end; only `RecordDDLCreate`/`ProcessRollbackUndos` were touched.
   call sites enumerated above; audit `deferred_unique.go`/
   `deferred_exclusion.go`/`operators_fk.go` deferred-constraint-timing
   behavior separately before touching `inTx` itself.
-- **A `CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;`
-  compound batch still loses `t1`'s undo entry.** When an explicit `BEGIN`
-  appears mid-batch, `connTx.Begin()` creates the real `*BasicSession` and
-  `dispatch.go` re-wires `ectx.Session` to it (pre-existing code, M0118-0009),
-  discarding the throwaway session's already-recorded `pendingDDL` for `t1`.
-  Not a regression (this compound case was never undoable before this fix
-  either), but also not fixed by it. Resume point: when re-wiring
-  `ectx.Session` off the throwaway onto the real session in that mid-batch
-  `BEGIN` handler (`internal/server/dispatch.go`, the `connTx.Begin(ctx.Tx)`
-  branch inside the `TxBegin` case), copy over the throwaway session's
-  pending DDL/undo lists first.
+- ~~**A `CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;`
+  compound batch still loses `t1`'s undo entry.**~~ **CLOSED — see
+  "Follow-up" below.**
 
 Deferral ledger: row appended (M0110-0001, resolved) cross-referencing this
 doc for both residuals.
+
+## Follow-up: mid-batch `BEGIN` preserves the throwaway session's pending DDL creates (2026-07-04, loop #103)
+
+Closes the second residual above. `internal/server/dispatch.go`'s
+`planner.TxBegin` case (inside `executeOneSimpleStmt`) now drains
+`ctx.Session`'s pending DDL-create undo list via
+`(*executor.BasicSession).TakePendingDDLCreates()` **before**
+`connTx.Begin(ctx.Tx)` lazily allocates the real, empty `*BasicSession` that
+`ctx.Session` gets re-wired to for the rest of the batch, then replays each
+drained entry onto the new session via `RecordDDLCreate` immediately after
+the re-wire. This is a plain hand-off, not a new mechanism: `TakePendingDDLCreates`/
+`RecordDDLCreate` already existed for `execRollback`'s ordinary use of the
+list.
+
+`t1`'s `CREATE TABLE` (recorded on the message-scoped throwaway session
+before any explicit transaction exists, per root-0024's original fix) now
+survives the mid-batch session hand-off, so a `ROLLBACK` later in the same
+message correctly undoes it via `ProcessRollbackUndos` alongside `t2`
+(recorded on the real session, unaffected either way).
+
+Test: `TestSimpleQueryBatchExplicitBeginUndoesEarlierAutocommitCreateTable`
+(`internal/server/dispatch_batch_atomicity_test.go`) drives
+`CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;` as one
+simple-query message over a real wire connection and asserts neither table
+exists afterward. Confirmed RED against the pre-fix tree (reverting only
+`dispatch.go`): `t1` survives, `t2` does not.
+
+The first residual (enum/composite-type creation and TRUNCATE/DROP-in-
+savepoint tracking staying explicit-transaction-only for autocommit
+batches) is untouched by this follow-up and remains open — it needs the
+dedicated `BasicSession` flag described above, not this hand-off fix, since
+those code paths are gated on `InExplicitTransaction()` rather than tracked
+via an always-recording list like `pendingDDL`.
+
+Gates: `go build ./...` clean; `go test ./internal/server/... ./internal/executor/...
+./internal/catalog/...` PASS (full, no regressions); `go test -race
+./internal/wal/... ./internal/mvcc/...` PASS (one unrelated pre-existing
+flake in `internal/wal`'s `TestConcurrentAppendAcrossSegmentBoundariesNoOverflow`
+reproduced identically on the pre-fix tree run in isolation and passed on
+rerun — not caused by this change); TPC-H spotcheck; pgbench smoke via the
+pre-commit hook.

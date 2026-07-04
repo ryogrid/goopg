@@ -75,3 +75,45 @@ func TestSimpleQueryBatchAbortUndoesEarlierCreateTable(t *testing.T) {
 		t.Fatalf("table %q was not created by a standalone (non-aborting) CREATE TABLE; frames=%+v", tblName, frames)
 	}
 }
+
+// TestSimpleQueryBatchExplicitBeginUndoesEarlierAutocommitCreateTable pins the
+// root-0024 design doc's second documented residual: a
+// `CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;` compound
+// batch — all in ONE simple-query message — must roll back BOTH t1 (created
+// before the explicit BEGIN, under the message's throwaway autocommit
+// session) and t2 (created inside the explicit block).
+//
+// Before the fix, `t1`'s CREATE was recorded via RecordDDLCreate on the
+// throwaway *executor.BasicSession wired at dispatch entry (no explicit
+// transaction existed yet). The mid-batch BEGIN handler
+// (internal/server/dispatch.go's planner.TxBegin case) then lazily allocates
+// connTx's own *executor.BasicSession and re-wires ctx.Session onto it for
+// the rest of the batch — silently discarding the throwaway session's
+// pendingDDL list. The subsequent ROLLBACK's ProcessRollbackUndos call only
+// sees t2's entry, so t1 survives the rollback despite never having
+// committed on its own (PostgreSQL rolls back the whole block). The fix
+// drains the throwaway session's pending DDL-create list before it is
+// discarded and replays it onto the newly-allocated session.
+func TestSimpleQueryBatchExplicitBeginUndoesEarlierAutocommitCreateTable(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const t1Name = "zz_compound_batch_t1"
+	const t2Name = "zz_compound_batch_t2"
+	writeQuery(t, conn, "CREATE TABLE "+t1Name+" (a int4); BEGIN; CREATE TABLE "+t2Name+" (b int4); ROLLBACK;")
+	frames := readUntilReady(t, conn)
+
+	if _, found := im.LookupTable(parser.ObjectName{Name: t1Name}); found {
+		t.Fatalf("table %q (created before the mid-batch BEGIN) survived the ROLLBACK; frames=%+v", t1Name, frames)
+	}
+	if _, found := im.LookupTable(parser.ObjectName{Name: t2Name}); found {
+		t.Fatalf("table %q (created inside the explicit block) survived the ROLLBACK; frames=%+v", t2Name, frames)
+	}
+}

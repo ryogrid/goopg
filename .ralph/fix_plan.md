@@ -59,11 +59,22 @@ point (3): no `RenameSchema`/schema-owner mechanism existed at all), and
 this loop (2026-07-04, #102) closed that fix's own follow-up (`RenameSchema`
 now cascades `opClassSchemas`/`statisticsObjs`, not just `tables`/`indexes`/
 `seqRegistry`) — no open resume points remain on the ALTER-SCHEMA thread
-either. **Next up:** either continue the M0119-0004 pg_dump catalog-view
-parity battery (next gap found via `TestPort_PgDumpConnectionSetup`), or
-pick up one of `root-0024`'s own two documented residuals (enum/
-composite-type undo + the mid-batch-BEGIN throwaway-session handoff) —
-neither is independently urgent, see each's own Deferred section.
+either. This loop (2026-07-04, #103) closed the second of `root-0024`'s two
+documented residuals: the mid-batch-BEGIN throwaway-session handoff now
+drains and replays the throwaway session's pending DDL-create undo list
+onto the newly-allocated real session (`internal/server/dispatch.go`'s
+`planner.TxBegin` case), so a `CREATE TABLE t1(...); BEGIN; CREATE TABLE
+t2(...); ROLLBACK;` compound batch correctly undoes both tables. Design doc
+`root-0024` "Follow-up" section; ledger row appended. `root-0024`'s FIRST
+residual (enum/composite-type creation + TRUNCATE/DROP-in-savepoint
+tracking staying explicit-transaction-only for autocommit batches) remains
+open — it needs a dedicated `BasicSession` flag distinct from `inTx`, not
+this hand-off pattern, plus a broader audit of ~20 `InExplicitTransaction()`
+call sites. **Next up:** either continue the M0119-0004 pg_dump
+catalog-view parity battery (next gap found via
+`TestPort_PgDumpConnectionSetup`), or pick up `root-0024`'s remaining
+enum/composite-type-undo residual — neither is independently urgent, see
+each's own Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
