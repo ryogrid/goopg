@@ -232,7 +232,19 @@ mirroring M0119's ledger `status` column.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, ANY/SOME/ALL, DEFAULT-clause
-      parsing, intervals, BETWEEN SYMMETRIC, CTE-without-alias, WITH CHECK OPTION.
+      parsing, intervals, BETWEEN SYMMETRIC, CTE-without-alias. **WITH CHECK
+      OPTION removed from this bucket (2026-07-04, loop #14):** verify-before-
+      implement caught that it was already fully resolved by the root-0025
+      loop (enforcement, `44000`) plus prior `security_barrier`/
+      `security_invoker` reloption-form parsing — only the `WITH
+      (check_option=...)` reloption-form spelling itself was still an open
+      gap, now closed (`internal/parser/ddl.go`; design
+      `docs/design/root-0025-updatable-views.md`'s new Follow-up section;
+      ledger). `unimplemented_feat.json`'s matching entry was stale, updated
+      in place. Only remaining sub-item (restart persistence of
+      check_option/security_barrier/security_invoker) tracks under
+      M0119-0004, not here — a concurrent loop was mid-flight on exactly that
+      gap; check `git log`/the ledger before re-picking it up.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

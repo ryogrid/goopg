@@ -122,6 +122,41 @@ func TestInsertViewCheckOptionViolation(t *testing.T) {
 	}
 }
 
+// TestInsertViewCheckOptionReloptionFormViolation pins that a view declared
+// with the pre-AS `WITH (check_option=local)` reloption-form spelling
+// enforces CHECK OPTION exactly like the trailing `WITH ... CHECK OPTION`
+// clause does (M0122-0004 follow-up): both spellings set the same
+// catalog.Table.CheckOption field that checkViewCheckOption reads.
+func TestInsertViewCheckOptionReloptionFormViolation(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE t4b (id int primary key, val int)")
+	must("CREATE VIEW v4b WITH (check_option=local) AS SELECT id, val FROM t4b WHERE val > 15")
+
+	err := runDDL(t, ctx, "INSERT INTO v4b VALUES (1, 5)")
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("INSERT violating CHECK OPTION: err=%v, want ExecError 44000", err)
+	}
+	rows := runQueryRows(t, ctx, "SELECT id FROM t4b")
+	if len(rows) != 0 {
+		t.Fatalf("rejected INSERT must not have written a row, got %v", rows)
+	}
+
+	must("INSERT INTO v4b VALUES (2, 25)")
+	rows = runQueryRows(t, ctx, "SELECT id, val FROM t4b")
+	if len(rows) != 1 || rows[0][1].Format() != "25" {
+		t.Fatalf("valid INSERT through CHECK OPTION view: got %v", rows)
+	}
+}
+
 func TestUpdateViewCheckOptionViolation(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()

@@ -3155,6 +3155,7 @@
    "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",
    "task_id": "DU-002",
    "resume_point": "slice 365",
+   "status": "open",
    "evidence": [
     "Deferred (ledger): CHECK OPTION enforcement on INSERT/UPDATE through the view; the `WITH (check_option=...)` reloption form before AS + security_barrier/security_invoker stay parsed-and-ignored; restart persistence (in-memory only)."
    ],
@@ -3169,7 +3170,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_insert.go no CheckOption enforcement found"
+   "code_audit": "PARTIALLY RESOLVED 2026-07-04 (M0119-0004/M0122-0004): enforcement now lands `44000` on INSERT/UPDATE violation (`internal/executor/operators_fk.go:checkViewCheckOption`, design `docs/design/root-0025-updatable-views.md`); `WITH (security_barrier=...)`/`WITH (security_invoker=...)` reloption forms parse (`internal/parser/ddl.go` slices 366/367); `WITH (check_option=...)` reloption form now also parses (this loop, same file). Only remaining sub-item: restart persistence is still in-memory-only as of this entry's last audit — re-check `internal/initdb/open.go`'s `loadUserTablesFromHeap`/`ApplyTableReloptions` before re-flagging, a concurrent M0119-0004 loop was mid-flight on exactly that gap when this entry was last audited."
   },
   {
    "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",

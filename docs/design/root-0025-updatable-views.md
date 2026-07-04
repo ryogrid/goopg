@@ -519,6 +519,35 @@ clean; `go test ./internal/planner/... ./internal/executor/... ./internal/catalo
 ./internal/parser/... ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh`
 PASS (Q12=2/Q13=33); pgbench smoke via the pre-commit hook.
 
+## Follow-up: `WITH (check_option = ...)` reloption-form spelling (M0122-0004)
+
+The predecessor DU-002 slice-365 ledger row (2026-06-30, before CHECK OPTION
+enforcement existed at all) recorded three residuals: (1) no enforcement —
+closed by this doc's main fix above; (2) the pre-AS `WITH (check_option=...)`
+reloption-form spelling was parsed-and-ignored (only the trailing `WITH
+[CASCADED|LOCAL] CHECK OPTION` clause was captured), alongside
+`security_barrier`/`security_invoker` which *were* already captured in that
+same pre-AS options loop; (3) restart persistence.
+
+Item (2)'s `check_option` half was a stale gap: `internal/parser/ddl.go`'s
+`parseCreateViewTail` pre-AS `WITH (...)` loop handled `security_barrier`/
+`security_invoker` (slices 366/367) but had no case for `check_option` at all,
+silently dropping it — even though upstream's `DefineView` (`view.c`) folds
+the trailing clause into the exact same `check_option` reloption DefElem
+internally, i.e. both spellings are one PG option. Fixed by adding a
+`check_option` branch to that loop (mirrors the boolean options' lenient,
+non-erroring style: an unrecognized/omitted value defaults to `cascaded`,
+matching PG's own default and this parser's existing tolerance for the sibling
+options). `execCreateView` already read `s.CheckOption` regardless of which
+spelling set it, so no executor change was needed — `checkViewCheckOption`
+enforcement and `BuildTableReloptions`/pg_dump rendering both already worked
+correctly for a view created via this spelling as soon as the parser captured
+it. Tests: `TestParseCreateViewCheckOptionReloptionForm` (parser) and
+`TestInsertViewCheckOptionReloptionFormViolation` (executor, confirms
+end-to-end 44000 enforcement identical to the trailing-clause spelling).
+
+Item (3), restart persistence, remains open — see item 6 in "Deferred" below.
+
 ## Deferred
 
 See `.ralph/deferral_ledger.md` for the formal entry. Summary:

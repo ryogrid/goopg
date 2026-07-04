@@ -2362,9 +2362,9 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	}
 	// Optional WITH (view_option_name [= view_option_value] [, ...]) before AS.
 	// PostgreSQL supports security_invoker, security_barrier, check_option.
-	// goopg captures security_barrier (M0119-0004 slice 366) and security_invoker
-	// (slice 367) so they round-trip as pg_class.reloptions; the reloption form of
-	// check_option is still accepted-and-ignored.
+	// goopg captures security_barrier (M0119-0004 slice 366), security_invoker
+	// (slice 367), and check_option (M0122-0004 follow-up) so all three round-trip
+	// as pg_class.reloptions.
 	if p.acceptKeyword(KwWith) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after WITH in CREATE VIEW")
@@ -2406,6 +2406,24 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 				}
 				stmt.SecurityInvoker = &b
 			}
+			// check_option surfaces as the `check_option=<local|cascaded>`
+			// pg_class.reloption (view_reloptions' RELOPT_TYPE_ENUM entry,
+			// reloptions.c) — the reloption-form spelling of the trailing
+			// `WITH [CASCADED|LOCAL] CHECK OPTION` clause parsed below; both
+			// set the same stmt.CheckOption field, so whichever spelling
+			// appears (or a later one, if a statement absurdly used both)
+			// wins. PG compares the value case-insensitively and defaults an
+			// unrecognized/omitted value to cascaded — mirrored here rather
+			// than raising a semantic error, matching this loop's existing
+			// lenient handling of security_barrier/security_invoker above
+			// (neither validates its boolean token either).
+			if strings.EqualFold(optName.Value, "check_option") {
+				mode := "cascaded"
+				if hasVal && strings.EqualFold(strings.TrimSpace(optVal), "local") {
+					mode = "local"
+				}
+				stmt.CheckOption = mode
+			}
 			p.acceptSymbol(",")
 		}
 	}
@@ -2437,8 +2455,9 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	stmt.RawDef = p.captureSrcSpan(cur.Pos, p.cur())
 	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause. The mode is
 	// captured into CheckOption ("cascaded" is the default when the qualifier is
-	// omitted) so it surfaces as the `check_option` pg_class.reloption for pg_dump.
-	// goopg does not yet ENFORCE the check at INSERT/UPDATE time (M0119-0004 slice 365).
+	// omitted) so it surfaces as the `check_option` pg_class.reloption for pg_dump
+	// AND is enforced at INSERT/UPDATE time via checkViewCheckOption
+	// (internal/executor/operators_fk.go, M0119-0004 slice-365 follow-up).
 	if p.acceptKeyword(KwWith) {
 		mode := "cascaded"
 		if p.acceptIdentKeyword("cascaded") {
