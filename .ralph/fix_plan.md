@@ -30,13 +30,13 @@ are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
 defer unless genuinely compelling (then record a ledger row); commit + push at
 every clean, green (build + pre-commit) checkpoint.
 
-**Next up:** M0122-0002 (catalog function quick wins) is now fully DONE
-(2026-07-04, loop #7) — `regexp_matches` was the one genuine gap among its ~9
-items, fixed; the rest were already implemented and re-verified against
-current HEAD. Continue the M0119-0004 pg_dump catalog-view parity battery /
-next unresolved DU-002 slice from `.ralph/deferral_ledger.md`, or pick up the
-next M0122 backlog item (M0122-0003 EXPLAIN/pg_stat instrumentation is the
-next unchecked one in list order).
+**Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is partially done
+(2026-07-04, loop #8) — FORMAT XML/YAML and per-CTE ANALYZE stats both
+landed (two independent loop #8 slices; see the M0122-0003 line item for
+detail), 4 sub-items remain open (SETTINGS/BUFFERS rendering, `pg_stat_io`
+real data, `track_io_timing` runtime SET). Pick up one of those next, or
+continue the M0119-0004 pg_dump catalog-view parity battery / next
+unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -178,9 +178,31 @@ mirroring M0119's ledger `status` column.
       deferred, ledger row), `pg_get_expr`, `isfinite`, `justify_*`,
       `pg_get_serial_sequence`, `pg_get_indexdef` (already implemented, verified
       2026-07-04). Design: `docs/design/0122-0002-pg-relation-size-real-sizes.md`.
-- [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7). EXPLAIN
-      FORMAT XML/YAML, SETTINGS/BUFFERS rendering, `pg_stat_io` virtual table,
-      per-CTE stats, `track_io_timing` runtime SET.
+- [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
+      FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
+      `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE
+      stats **done** (2026-07-04, loop #8, correcting an earlier note in
+      this same banner): `Build()`'s `CTEScan`/`CTEDMLPrefix`/
+      `MaterializedCTEScan` cases skipped `maybeInstrument`, so the CTE
+      node's *own* EXPLAIN line (e.g. `CTE Scan on a`, `CTE DML`) reported
+      cost-only estimates under ANALYZE — only its inlined child showed
+      actual rows/time, which is what made the gap look closed under a
+      surface read of existing tests (they only grep for "actual time="
+      anywhere in the output, not on the CTE node's own line). Fixed by
+      wrapping all 3 constructor call sites in `maybeInstrument`
+      (`internal/executor/executor.go`); new regression tests
+      `TestExplainCTEScanAnalyzeReportsActualRows` /
+      `TestExplainCTEDMLPrefixAnalyzeReportsActualRows` assert the node's
+      own line, not just the output as a whole. One residual gap deferred
+      (ledger row): DML-CTE inner nodes (the INSERT/UPDATE/DELETE plan +
+      outer body) are Built lazily inside `cteDMLPrefixOp.Open()`, outside
+      the `withInstrumentation` scope, so they still don't show actual
+      stats. Still open: SETTINGS rendering (parsed, never emitted),
+      BUFFERS rendering (parsed, never emitted — no buffer hit/read
+      counters exist), `pg_stat_io` (table registered, `VirtualRows`
+      always returns nil), `track_io_timing` runtime SET (GUC registered
+      but only consulted once at process boot).
+      Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, ANY/SOME/ALL, DEFAULT-clause
       parsing, intervals, BETWEEN SYMMETRIC, CTE-without-alias, WITH CHECK OPTION.

@@ -470,6 +470,8 @@ type ExplainFormat int
 const (
 	ExplainFormatText ExplainFormat = iota
 	ExplainFormatJSON
+	ExplainFormatXML
+	ExplainFormatYAML
 )
 
 // ExplainOptions carries the parsed EXPLAIN options (M0018-0001).

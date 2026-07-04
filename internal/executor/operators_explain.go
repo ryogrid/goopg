@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -85,7 +84,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		}
 		execNs = time.Since(execStart).Nanoseconds()
 
-		if opts.Format == parser.ExplainFormatJSON {
+		if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
 			// Upstream nests the plan tree under a top-level "Plan" key, with
 			// Planning Time / Execution Time as its siblings:
 			//   [ { "Plan": {...}, "Planning Time": .., "Execution Time": .. } ]
@@ -96,11 +95,11 @@ func (o *explainOp) Open(ctx *Context) error {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
 			}
-			out, err := json.MarshalIndent([]any{root}, "", "  ")
+			out, err := renderExplainTree(opts.Format, root)
 			if err != nil {
-				return fmt.Errorf("explain: marshal JSON: %w", err)
+				return err
 			}
-			o.rows = []Row{{NewStringDatum(string(out))}}
+			o.rows = []Row{{NewStringDatum(out)}}
 			return nil
 		}
 		var b strings.Builder
@@ -114,17 +113,17 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 
-	if opts.Format == parser.ExplainFormatJSON {
-		// FORMAT JSON: emit one row whose cell is the JSON-
-		// encoded plan tree, nested under a top-level "Plan" key
+	if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
+		// FORMAT JSON/XML/YAML: emit one row whose cell is the
+		// serialized plan tree, nested under a top-level "Plan" key
 		// inside the single-element array, matching upstream's
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
 		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
-		out, err := json.MarshalIndent([]any{root}, "", "  ")
+		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
-			return fmt.Errorf("explain: marshal JSON: %w", err)
+			return err
 		}
-		o.rows = []Row{{NewStringDatum(string(out))}}
+		o.rows = []Row{{NewStringDatum(out)}}
 		return nil
 	}
 	var b strings.Builder
