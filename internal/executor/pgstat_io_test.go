@@ -184,3 +184,56 @@ func TestPgStatIOReadTimeAndWritesRendered(t *testing.T) {
 		t.Errorf("writes (col 6) = %q, want a nonzero count reflecting the forced eviction", found[6])
 	}
 }
+
+// TestPgStatIOEvictionsAndExtendsRendered pins the M0122-0003 pg_stat_io
+// follow-up: fetchIOStatRows must render real evictions (col 15, from
+// Pool.EvictionCount) and extends/extend_bytes (cols 11/12, from
+// Pool.ExtendCount) for the one row goopg instruments, instead of the
+// previous hardcoded "0".
+func TestPgStatIOEvictionsAndExtendsRendered(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 1, Fork: storage.MainFork}
+	// 2 PinNew calls fill the pool's 2 slots (no eviction), a 3rd forces one.
+	for i := 0; i < 3; i++ {
+		s, _, err := pool.PinNew(rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool.Unpin(s)
+	}
+	if got := pool.ExtendCount(); got != 3 {
+		t.Fatalf("setup: ExtendCount = %d, want 3", got)
+	}
+	if got := pool.EvictionCount(); got != 1 {
+		t.Fatalf("setup: EvictionCount = %d, want 1", got)
+	}
+
+	ctx := &Context{Pool: pool}
+	rows := fetchIOStatRows(ctx)
+	var found []string
+	for _, r := range rows {
+		if r[0] == "client backend" && r[1] == "relation" && r[2] == "normal" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no client backend/relation/normal row found")
+	}
+	if found[15] != "1" {
+		t.Errorf("evictions (col 15) = %q, want %q", found[15], "1")
+	}
+	if found[11] != "3" {
+		t.Errorf("extends (col 11) = %q, want %q", found[11], "3")
+	}
+	if found[12] != "24576" {
+		t.Errorf("extend_bytes (col 12) = %q, want %q", found[12], "24576")
+	}
+}

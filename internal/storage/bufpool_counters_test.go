@@ -82,6 +82,66 @@ func TestBufferCountersDirtiedAndWritten(t *testing.T) {
 	}
 }
 
+// TestBufferCountersEvictionAndExtend pins the M0122-0003 pg_stat_io
+// follow-up: storage.Pool must also track evictions / extends (backing
+// pg_stat_io's evictions and extends/extend_bytes columns), mirroring
+// bufmgr.c's shared_blks_evicted / shared_blks_extend accounting.
+// extendCount advances once per PinNew relation extension; evictionCount
+// advances once per real victim eviction (a valid tag actually displaced
+// from a slot), regardless of whether the victim was dirty.
+func TestBufferCountersEvictionAndExtend(t *testing.T) {
+	const poolSlots = 2
+
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: poolSlots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+
+	if got := pool.EvictionCount(); got != 0 {
+		t.Fatalf("EvictionCount before any activity = %d, want 0", got)
+	}
+	if got := pool.ExtendCount(); got != 0 {
+		t.Fatalf("ExtendCount before any activity = %d, want 0", got)
+	}
+
+	// Filling the pool's own slot count via PinNew must not evict anything
+	// (every slot starts free) but must advance extendCount once per call.
+	for i := 0; i < poolSlots; i++ {
+		s, _, err := pool.PinNew(rel)
+		if err != nil {
+			t.Fatalf("PinNew %d: %v", i, err)
+		}
+		pool.Unpin(s)
+	}
+	if got := pool.ExtendCount(); got != poolSlots {
+		t.Errorf("ExtendCount after %d PinNew calls = %d, want %d", poolSlots, got, poolSlots)
+	}
+	if got := pool.EvictionCount(); got != 0 {
+		t.Errorf("EvictionCount after filling empty slots = %d, want 0 (nothing evicted yet)", got)
+	}
+
+	// One more PinNew than the pool has slots forces a real eviction.
+	const extra = 3
+	for i := 0; i < extra; i++ {
+		s, _, err := pool.PinNew(rel)
+		if err != nil {
+			t.Fatalf("PinNew extra %d: %v", i, err)
+		}
+		pool.Unpin(s)
+	}
+	if got, want := pool.ExtendCount(), int64(poolSlots+extra); got != want {
+		t.Errorf("ExtendCount after %d more PinNew calls = %d, want %d", extra, got, want)
+	}
+	if got := pool.EvictionCount(); got != extra {
+		t.Errorf("EvictionCount after forcing %d evictions = %d, want %d", extra, got, extra)
+	}
+}
+
 // TestPoolReadTimeNanosAccumulates pins the M0122-0003 track_io_timing
 // follow-up: Pool.AddReadTimeNanos/ReadTimeNanos back pg_stat_io's
 // read_time column. storage.Pool itself never calls AddReadTimeNanos

@@ -195,6 +195,18 @@ type Pool struct {
 	// without this package needing to know about the activity registry.
 	sharedReadTimeNanos atomic.Int64
 
+	// sharedEvictionCount / sharedExtendCount back pg_stat_io's evictions /
+	// extends columns (M0122-0003 follow-up: "the remaining five op
+	// counters"). evictionCount increments once per real victim eviction
+	// (evictVictim, only when a valid tag is actually displaced — an empty
+	// slot is not an eviction), regardless of whether the victim was dirty,
+	// mirroring pgBufferUsage's shared_blks_evicted accounting in bufmgr.c's
+	// StrategyGetBuffer/BufferAlloc. extendCount increments once per
+	// successful PinNew relation extension (the pool's sole smgr Extend
+	// call site), mirroring shared_blks_extend.
+	sharedEvictionCount atomic.Int64
+	sharedExtendCount   atomic.Int64
+
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.
 	bgwriterMu   sync.Mutex
@@ -509,6 +521,18 @@ func (p *Pool) ReadTimeNanos() int64 {
 	return p.sharedReadTimeNanos.Load()
 }
 
+// EvictionCount returns the pool-wide cumulative count of real victim
+// evictions (backs pg_stat_io's evictions column).
+func (p *Pool) EvictionCount() int64 {
+	return p.sharedEvictionCount.Load()
+}
+
+// ExtendCount returns the pool-wide cumulative count of relation extensions
+// (backs pg_stat_io's extends / extend_bytes columns).
+func (p *Pool) ExtendCount() int64 {
+	return p.sharedExtendCount.Load()
+}
+
 // SyncAllDataFiles fdatasyncs every open data file.
 func (p *Pool) SyncAllDataFiles() error {
 	if p.mgr == nil {
@@ -704,6 +728,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	if oldTag == (BufferTag{}) {
 		return nil // slot was free
 	}
+	p.sharedEvictionCount.Add(1)
 	// Delete from bufmap BEFORE flushing to ensure no stale lookups.
 	p.bm.Delete(oldTag, int32(victimIdx))
 	p.tombstones.Add(1)
@@ -760,6 +785,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
+	p.sharedExtendCount.Add(1)
 	p.pinMu.Lock()
 
 	// Emit SmgrCreate WAL record on first block creation.

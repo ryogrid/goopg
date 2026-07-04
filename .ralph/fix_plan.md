@@ -30,13 +30,17 @@ are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
 defer unless genuinely compelling (then record a ledger row); commit + push at
 every clean, green (build + pre-commit) checkpoint.
 
-**Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is partially done
-(2026-07-04) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
-and BUFFERS TEXT rendering (shared hit/read, ANALYZE-only) have all
-landed; see the M0122-0003 line item for detail. Remaining sub-items:
-BUFFERS FORMAT JSON/XML/YAML + planning-only variant + dirtied/written
-counters, `pg_stat_io` real data, `track_io_timing` runtime SET. Pick up
-one of those next, or continue the M0119-0004 pg_dump catalog-view
+**Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
+(2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
+BUFFERS TEXT+JSON/XML/YAML rendering, `pg_stat_io` row shape + real
+reads/read_bytes/read_time/writes/write_bytes/hits/evictions/extends/
+extend_bytes, and `track_io_timing` runtime SET have all landed; see the
+M0122-0003 line item for detail. Remaining sub-items: `EXPLAIN (BUFFERS)`
+without ANALYZE (planning-time buffers), local/temp-buffer terms,
+`write_time`/`extend_time` + the 3 remaining `pg_stat_io` op counters
+(reuses/writebacks/fsyncs), EXPLAIN's `I/O Timings` line, a `CTEDMLPrefix`
+nested-node instrumentation residual. Pick up one of those next, or
+continue the M0119-0004 pg_dump catalog-view
 parity battery / next
 unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 
@@ -321,10 +325,27 @@ mirroring M0119's ledger `status` column.
       `TestWaitEventEndOutOfRangeProcNumReturnsZero`), `internal/storage/
       bufpool_counters_test.go` (`TestPoolReadTimeNanosAccumulates`),
       `internal/executor/pgstat_io_test.go`
-      (`TestPgStatIOReadTimeAndWritesRendered`). Still open: `write_time`
-      (evictVictim's flush has no wait-event hook to time yet) and the
-      remaining 5 op counters (extends/evictions/reuses/writebacks/fsyncs +
-      their bytes/time columns) — see ledger row 2026-07-05.
+      (`TestPgStatIOReadTimeAndWritesRendered`). Still open (at that point):
+      `write_time` (evictVictim's flush has no wait-event hook to time yet)
+      and the remaining 5 op counters (extends/evictions/reuses/writebacks/
+      fsyncs + their bytes/time columns) — see ledger row 2026-07-05.
+      `evictions`/`extends` op counters **done** (2026-07-05, later loop):
+      `storage.Pool` gains `sharedEvictionCount`/`sharedExtendCount` +
+      `EvictionCount()`/`ExtendCount()` accessors; eviction increments once
+      per real victim eviction in `evictVictim` (any tag actually displaced,
+      dirty or not), extend increments once per successful `PinNew` relation
+      extension (the pool's sole `mgr.Extend` call site). `fetchIOStatRows`
+      renders both plus `extend_bytes` for the one row goopg instruments.
+      Tests: `internal/storage/bufpool_counters_test.go`
+      (`TestBufferCountersEvictionAndExtend`), `internal/executor/
+      pgstat_io_test.go` (`TestPgStatIOEvictionsAndExtendsRendered`).
+      Design: `docs/design/0122-0003-explain-format-xml-yaml.md` new
+      "`evictions`/`extends` counters" section. Still open: `write_time`,
+      `extend_time`, and the remaining 3 op counters (reuses/writebacks/
+      fsyncs + their bytes/time columns) — each needs a genuinely new
+      counting mechanism (strategy-ring reuse, bgwriter/checkpointer-scoped
+      writeback attribution, fsync call-site instrumentation respectively),
+      not a mechanical extension of the eviction/extend pattern.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause

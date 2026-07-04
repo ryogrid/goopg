@@ -538,3 +538,44 @@ guard). `internal/executor/pgstat_io_test.go` —
 with a forced backend-driven eviction and injected read time, asserting
 both the `read_time` and `writes` columns render real, non-placeholder
 values).
+
+## `evictions` / `extends` counters (later loop, 2026-07-05)
+
+Two of the five still-`0` `pg_stat_io` op counters named in the section
+above now render real values, closing part of that gap (`write_time` and
+the remaining three op counters — reuses/writebacks/fsyncs — are still
+open, see the updated ledger row).
+
+`storage.Pool` gains `sharedEvictionCount`/`sharedExtendCount`
+(`internal/storage/bufpool.go`), following the exact pattern of the
+pre-existing `sharedDirtiedCount`/`sharedWrittenCount` pair (own atomic
+counters, own `EvictionCount()`/`ExtendCount()` accessors — a new method
+pair rather than widening `BufferCounters()`'s 4-value return, to avoid
+touching its four existing call sites): `sharedEvictionCount` increments
+once in `evictVictim`, immediately after the "slot was free" early return
+(i.e. only when a *valid* tag is actually displaced — mirrors
+`bufmgr.c`'s `shared_blks_evicted` accounting), regardless of whether the
+victim was dirty (the dirty-only `sharedWrittenCount` increments
+separately, further down the same function, only on a successful flush).
+`sharedExtendCount` increments once in `PinNew`, right after its sole
+`p.mgr.Extend` call succeeds — this is the pool's only relation-extension
+call site (verified: no other `Extend(` caller exists in the package),
+so no sibling site needed updating.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` wires both into the
+`ioOpEvict`/`ioOpExtend` cases of the existing per-op `switch` (same
+"client backend/relation/normal" cell the other real counters already
+populate) — `extends` also gets `extend_bytes` (`count * 8192`, matching
+the `reads`/`writes` byte-column convention); `extend_time` is left at the
+existing default `"0"` (no per-extend timing hook exists yet, same
+"count wired, time not yet" partial state `read_time` was in before its
+own follow-up).
+
+**Tests:** `internal/storage/bufpool_counters_test.go` —
+`TestBufferCountersEvictionAndExtend` (a 2-slot pool: fills exactly to
+capacity via `PinNew` with zero evictions, then forces N further evictions
+via N more `PinNew` calls, asserting both counters independently).
+`internal/executor/pgstat_io_test.go` —
+`TestPgStatIOEvictionsAndExtendsRendered` (end-to-end: asserts the
+rendered `evictions`/`extends`/`extend_bytes` cells match the underlying
+counters after a controlled fill-then-evict sequence).
