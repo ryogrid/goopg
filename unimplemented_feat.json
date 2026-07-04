@@ -3640,6 +3640,7 @@
    "feature": "User-defined function-based casts (WITH FUNCTION casts) are parsed but not dumped in pg_dump; only built-in binary-coercible casts are reachable.",
    "task_id": "M0119-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "WITH FUNCTION casts parsed but not dumped (castfunc=0 needs a pg_proc row for dumpCast findFuncByOid)"
    ],
@@ -3653,8 +3654,8 @@
     "fix_plan": "unchecked",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: Casts exist but function-based cast dumping status not verified"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, this loop, verify-before-implement): stale entry — already closed by commit e12e573b (2026-07-01, DU-002 slice 397), predating this backlog's 2026-07-02 snapshot. dumpCast's COERCION_METHOD_FUNCTION arm renders `WITH FUNCTION <ns>.<signature>` via findFuncByOid(castfunc); the parser (parseCreateCastTail) captures the function name/args into CompatNoopStmt.CastFuncName/CastFuncArgs, the executor resolves the routine via Routines().Lookup and passes routine.OID as Cast.FuncOID, and pg_cast's virtual row surfaces it. No code change needed this loop. Verified live: TestParseCreateCastWithFunction (parser), TestValidateCreateCast (executor), and TestPort_PgDumpConnectionSetup's slice-397/404 assertions (real pg_dump 18.3 round-trip for both a user-defined WITH FUNCTION cast and a built-in-function WITH FUNCTION cast) all PASS at current HEAD."
   }
  ]
 }

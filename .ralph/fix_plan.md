@@ -298,6 +298,33 @@ mirroring M0119's ledger `status` column.
       per-wait-event timing *collection* to back `track_io_timing`/
       `I/O Timings` (the GUC now reaches the hooks live, but the hooks still
       only track wait *occurrence*, not wall-clock duration).
+      Real read-timing collection + `writes` count **done** (2026-07-05,
+      loop #30): `internal/activity/registry.go`'s `WaitEventEnd` now
+      returns the real wall-clock `time.Duration` elapsed since the
+      matching `WaitEventStart` (read from the mono-clock `stateChange`
+      stamp before overwriting it) instead of a discarded value.
+      `internal/storage/bufpool.go`'s `Pool` gains a `sharedReadTimeNanos`
+      accumulator + `AddReadTimeNanos`/`ReadTimeNanos` methods.
+      `internal/initdb/open.go`'s pre-existing `OnPinDone` closure (already
+      gated on the pinning backend's `track_io_timing` flag via
+      `LookupTrackedGoroutine`) now passes `WaitEventEnd`'s returned
+      duration into `pool.AddReadTimeNanos`, so real per-read wall-clock
+      time only ever accumulates when `track_io_timing` is genuinely on —
+      no new gate needed, reusing the existing one. `internal/executor/
+      pgstat_io.go`'s `fetchIOStatRows` renders this as the `read_time`
+      column (milliseconds, reusing `operators_explain.go`'s `nsToMs`) and
+      also fixed a pre-existing dead-wiring bug: `BufferCounters()`'s
+      `written` return value was already being collected (dirtied/written
+      counters landed 2026-07-04) but silently discarded by `fetchIOStatRows`
+      — now wired into the `writes`/`write_bytes` columns. Tests:
+      `internal/activity/registry_test.go` (`TestWaitEventEndReturnsElapsedDuration`,
+      `TestWaitEventEndOutOfRangeProcNumReturnsZero`), `internal/storage/
+      bufpool_counters_test.go` (`TestPoolReadTimeNanosAccumulates`),
+      `internal/executor/pgstat_io_test.go`
+      (`TestPgStatIOReadTimeAndWritesRendered`). Still open: `write_time`
+      (evictVictim's flush has no wait-event hook to time yet) and the
+      remaining 5 op counters (extends/evictions/reuses/writebacks/fsyncs +
+      their bytes/time columns) — see ledger row 2026-07-05.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
@@ -509,9 +536,19 @@ mirroring M0119's ledger `status` column.
       where composite `RENAME TO` raised a spurious 42710 (unconditionally called
       the enum-only rename). Design `docs/design/0122-0005-alter-type-owner-rename.md`.
       Deferred: restart persistence of the new owner field, range/domain typowner
-      (ledger row, same date). **Still open in this bucket:** 1-byte `char`
-      disambiguation, `pg_collation_for`, function-based cast dumping, domain CHECK
-      renderer, `pg_ts_config` OIDs.
+      (ledger row, same date). **Function-based cast dumping removed from this
+      bucket (2026-07-05, this loop, verify-before-implement):** stale entry —
+      already closed by commit `e12e573b` (2026-07-01, DU-002 slice 397),
+      predating the M0122 backlog's 2026-07-02 snapshot. `dumpCast`'s
+      `COERCION_METHOD_FUNCTION` arm already renders `WITH FUNCTION
+      <ns>.<signature>` for a user-defined `CREATE CAST ... WITH FUNCTION`; no
+      code change needed. Verified at current HEAD:
+      `TestParseCreateCastWithFunction`, `TestValidateCreateCast`, and
+      `TestPort_PgDumpConnectionSetup`'s slice-397/404 assertions (real
+      `pg_dump` 18.3 round-trip) all PASS. `unimplemented_feat.json` entry
+      updated in place (`status: resolved`). **Still open in this bucket:**
+      1-byte `char` disambiguation, `pg_collation_for`, domain CHECK renderer,
+      `pg_ts_config` OIDs.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
       restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
