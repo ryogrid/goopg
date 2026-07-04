@@ -95,3 +95,58 @@ func TestAlterSchemaRenameOwner(t *testing.T) {
 		t.Errorf("SchemaOwnerOID(taken) = %d, want 10 (default)", got)
 	}
 }
+
+// TestAlterSchemaRenameCascadesOpClassAndStatistics guards the DU-002
+// slice-440-resume-point-(3) ledger row's own follow-up: RenameSchema's
+// tables/indexes/sequences cascade left the opClassSchemas and
+// statisticsObjs registries un-cascaded, so an operator class or extended
+// statistics object inside a renamed schema became unreachable under its
+// new schema-qualified name (and, for statistics, still resolved — wrongly —
+// under the stale old-schema key).
+func TestAlterSchemaRenameCascadesOpClassAndStatistics(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE SCHEMA s1`); err != nil {
+		t.Fatalf("CREATE SCHEMA: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE s1.t1 (a int, b int)`); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE STATISTICS s1.stat1 ON a, b FROM s1.t1`); err != nil {
+		t.Fatalf("CREATE STATISTICS: %v", err)
+	}
+	im.RegisterOpClassSchema("opc1", "s1")
+
+	if err := runDDL(t, ctx, `ALTER SCHEMA s1 RENAME TO s2`); err != nil {
+		t.Fatalf("ALTER SCHEMA RENAME TO: %v", err)
+	}
+
+	// The operator class's tracked schema follows the rename.
+	if got := im.OpClassesInSchema("s1"); len(got) != 0 {
+		t.Errorf("OpClassesInSchema(s1) after rename = %v, want empty", got)
+	}
+	if got := im.OpClassesInSchema("s2"); len(got) != 1 || got[0] != "opc1" {
+		t.Errorf("OpClassesInSchema(s2) after rename = %v, want [opc1]", got)
+	}
+
+	// The statistics object re-keys under the new schema-qualified name and
+	// its Schema field is updated (checked directly since LookupStatistics
+	// takes a bare name and would happily resolve either "public."-defaulted
+	// key — the qualified re-key is the part under test here).
+	obj, found := im.LookupStatistics("s2.stat1")
+	if !found {
+		t.Fatal("LookupStatistics(\"s2.stat1\") not found after schema RENAME")
+	}
+	if obj.Schema != "s2" {
+		t.Errorf("statistics object Schema after rename = %q, want s2", obj.Schema)
+	}
+	if _, found := im.LookupStatistics("s1.stat1"); found {
+		t.Error("statistics object still resolves under the old schema-qualified name after RENAME TO")
+	}
+}

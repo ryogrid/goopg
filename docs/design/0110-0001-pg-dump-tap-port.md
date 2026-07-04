@@ -13914,3 +13914,53 @@ Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/initdb/...
 (`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`) PASS; TPC-H
 spotcheck PASS; live end-to-end verification against `psql` including a full
 server restart, described above.
+
+## Follow-up: `RenameSchema` cascades `opClassSchemas`/`statisticsObjs` (DU-002 slice 440 resume point (3) follow-up, loop #102)
+
+Closes the ledger row appended by the previous section: `RenameSchema`'s
+table/index/sequence cascade left two further schema-name-keyed registries
+un-cascaded, so an operator class or extended-statistics object defined
+inside a renamed schema became unreachable (or, for statistics, stayed
+wrongly reachable under the *old* schema-qualified key — the map key never
+moved even though nothing else referenced it).
+
+- `opClassSchemas` is keyed by **operator class name** with the schema as
+  the *value* (`map[string]string`), not a schema-qualified key — so its
+  cascade is a plain value rewrite: for every entry whose value equals the
+  old schema (case-insensitive), point it at the new schema. No re-keying
+  needed, unlike `tables`/`indexes`.
+- `statisticsObjs` is keyed `schema.name` (lowercase, via
+  `StatisticsObject.qualifiedKey()`) — cascaded with the exact same
+  delete-mutate-reinsert shape `RenameSchema` already uses for
+  `tables`/`indexes`: for every object whose `Schema` (defaulting to
+  `"public"` when empty, matching `qualifiedKey`'s own default) matches the
+  old schema, update `Schema` and re-key via `qualifiedKey()`.
+- Investigated whether `userCollations`/`userConversions` need the same
+  treatment: both structs reference their schema via `NamespaceOID`
+  (resolved once at CREATE time from the schema's OID), not a `Schema`
+  string field re-derived by name — the same OID-indirection real
+  PostgreSQL's `pg_namespace` uses. Since `RenameSchema` keeps a schema's
+  OID stable (only the `schemas` map's name→OID entry is re-keyed), any
+  pre-existing `NamespaceOID` reference is automatically still valid after
+  the rename. No cascade needed, confirmed by reading both struct
+  definitions (`internal/catalog/catalog.go`) rather than assumed.
+- Still unaudited: any schema-qualified function/type/domain registry
+  reached via a `LookupTable`-style schema-name key (none were found while
+  scoping this loop, but the catalog was not exhaustively grepped for every
+  possible schema-name-keyed map).
+
+Test: `TestAlterSchemaRenameCascadesOpClassAndStatistics`
+(`internal/executor/alter_schema_test.go`) — registers an operator class
+and an extended-statistics object inside a schema, renames the schema, and
+asserts the opclass's tracked schema follows the rename
+(`OpClassesInSchema`) and the statistics object re-keys to the new
+schema-qualified name (`LookupStatistics("s2.stat1")` succeeds,
+`LookupStatistics("s1.stat1")` no longer does).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/...` PASS (full, no regressions); `TestPort_
+PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench
+smoke = pre-commit hook. No new deferral for the two registries fixed this
+loop; the "any other schema-qualified registry" caveat above remains open
+but is not newly discovered — it restates the prior row's own residual
+uncertainty.

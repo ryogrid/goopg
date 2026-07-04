@@ -50,15 +50,20 @@ next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above: this
 loop closed the M0110-0001 DU-002 slice 444 deferral (simple-query batch
 CREATE TABLE/INDEX atomicity on abort — design `root-0024`), the following
 loop closed DU-002 slice 445 (`CREATE`/`DROP STATISTICS` WAL/restart
-persistence + new `DROP STATISTICS` support), and the loop after that closed
+persistence + new `DROP STATISTICS` support), the loop after that closed
 resume point (1) of the slice-441/445 ledger rows (`ALTER STATISTICS
 RENAME/OWNER/SET SCHEMA` WAL persistence) — statistics restart durability is
-now fully closed, no open resume points remain on that thread. **Next up:**
-either continue the M0119-0004 pg_dump catalog-view parity battery (next gap
-found via `TestPort_PgDumpConnectionSetup`), or pick up one of `root-0024`'s
-own two documented residuals (enum/composite-type undo + the mid-batch-BEGIN
-throwaway-session handoff) — neither is independently urgent, see each's own
-Deferred section.
+now fully closed, no open resume points remain on that thread — the loop
+after that closed `ALTER SCHEMA ... RENAME TO / OWNER TO` (slice-440 resume
+point (3): no `RenameSchema`/schema-owner mechanism existed at all), and
+this loop (2026-07-04, #102) closed that fix's own follow-up (`RenameSchema`
+now cascades `opClassSchemas`/`statisticsObjs`, not just `tables`/`indexes`/
+`seqRegistry`) — no open resume points remain on the ALTER-SCHEMA thread
+either. **Next up:** either continue the M0119-0004 pg_dump catalog-view
+parity battery (next gap found via `TestPort_PgDumpConnectionSetup`), or
+pick up one of `root-0024`'s own two documented residuals (enum/
+composite-type undo + the mid-batch-BEGIN throwaway-session handoff) —
+neither is independently urgent, see each's own Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
@@ -565,6 +570,39 @@ prev-link fixes.
       violation in `internal/server/dispatch.go`'s
       `dispatchSimpleQueryViaExecutor`, out of scope for this bounded
       parser-grammar loop (WAL/MVCC-class transaction-atomicity bug).
+      **2026-07-04 (loop #102, DU-002 slice 440 resume point (3) follow-up):
+      `RenameSchema` now cascades `opClassSchemas`/`statisticsObjs` — CLOSES
+      the last open resume point of the slice-440-resume-point-(3) ledger
+      row.** The previous loop's `ALTER SCHEMA RENAME TO / OWNER TO` fix
+      cascaded `tables`/`indexes`/the executor `seqRegistry` but left two
+      further schema-name-keyed registries un-cascaded: `opClassSchemas`
+      (`internal/catalog/catalog.go`, keyed by operator-class name with the
+      schema as the *value* — cascaded via a plain value rewrite, no
+      re-keying needed) and `statisticsObjs` (keyed `schema.name` — cascaded
+      via the exact delete-mutate-reinsert-by-`qualifiedKey()` shape
+      `RenameStatisticsObject`/`SetStatisticsSchema` already use). Also
+      checked (not assumed) whether `userCollations`/`userConversions` need
+      the same treatment: both reference their schema via `NamespaceOID`
+      (resolved once at CREATE time), the same OID-indirection real
+      PostgreSQL's own `pg_namespace` uses, and `RenameSchema` never changes
+      a schema's OID — so any existing `NamespaceOID` reference stays valid
+      across a rename with no cascade required. Test:
+      `TestAlterSchemaRenameCascadesOpClassAndStatistics`
+      (`internal/executor/alter_schema_test.go`). Design doc "Follow-up:
+      `RenameSchema` cascades `opClassSchemas`/`statisticsObjs`" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `go test ./internal/catalog/... ./internal/executor/...` PASS
+      (full, no regressions); `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): any further
+      schema-qualified function/type/domain registry reached via a
+      `LookupTable`-style schema-name key remains unaudited — no such
+      registry was found while scoping this loop, but the catalog was not
+      exhaustively grepped for every possible schema-name-keyed map, so
+      this is a residual caveat, not a confirmed gap. Resume for `002-010`
+      proper remains the next catalog-getter gap surfaced by
+      `TestPort_PgDumpConnectionSetup`.
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

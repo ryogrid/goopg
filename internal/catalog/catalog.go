@@ -10413,14 +10413,19 @@ func (c *InMemory) SetSchemaOwnerDuringRecovery(name string, ownerOID uint32) {
 // PostgreSQL's namespace rename is a single pg_namespace row update because
 // every other catalog references a schema by OID (relnamespace); goopg's
 // Table/Index catalog instead keys directly by schema NAME (see key()), so a
-// schema rename must cascade into every table/view/sequence/index whose
-// Schema field names the old schema, re-keying their map entries too.
-// Returns the tables that were sequences (so the caller can additionally
-// cascade the executor-side seqRegistry, mirroring the SET SCHEMA-on-single-
-// sequence cascade in execAlterTable) and an error if old does not exist or
-// new already exists (mirrors upstream RenameSchema,
-// postgres/src/backend/commands/schemacmds.c). DU-002 slice 440 resume point
-// (3) (M0110-0001).
+// schema rename must cascade into every table/view/sequence/index/operator
+// class/statistics object whose Schema field names the old schema, re-keying
+// their map entries too. Returns the tables that were sequences (so the
+// caller can additionally cascade the executor-side seqRegistry, mirroring
+// the SET SCHEMA-on-single-sequence cascade in execAlterTable) and an error
+// if old does not exist or new already exists (mirrors upstream
+// RenameSchema, postgres/src/backend/commands/schemacmds.c). DU-002 slice 440
+// resume point (3) (M0110-0001); the opClassSchemas/statisticsObjs cascades
+// close the slice-440-resume-point(3) ledger row's own follow-up (schema-
+// name-keyed registries left un-cascaded). Still not audited/cascaded here:
+// userCollations/userConversions (carry a Schema field but aren't in a
+// schema-keyed map, so likely unaffected — not verified) and any
+// schema-qualified function/type/domain registries.
 func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -10463,6 +10468,26 @@ func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
 		if newK != k {
 			delete(c.indexes, k)
 			c.indexes[newK] = idx
+		}
+	}
+	for name, schema := range c.opClassSchemas {
+		if strings.EqualFold(schema, old) {
+			c.opClassSchemas[name] = new
+		}
+	}
+	for k, obj := range c.statisticsObjs {
+		objSchema := obj.Schema
+		if objSchema == "" {
+			objSchema = "public"
+		}
+		if !strings.EqualFold(objSchema, old) {
+			continue
+		}
+		obj.Schema = new
+		newK := obj.qualifiedKey()
+		if newK != k {
+			delete(c.statisticsObjs, k)
+			c.statisticsObjs[newK] = obj
 		}
 	}
 	return movedSequences, nil
