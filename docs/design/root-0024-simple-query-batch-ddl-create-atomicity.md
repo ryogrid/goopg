@@ -122,17 +122,16 @@ end-to-end; only `RecordDDLCreate`/`ProcessRollbackUndos` were touched.
 - ~~**Enum/composite-type creation ... NOT yet undo-aware for an autocommit
   multi-statement batch.**~~ **CLOSED for the single-message case — see
   "Follow-up: enum/composite-type creation now undo-aware for a
-  single-message autocommit batch" below.** TRUNCATE/DROP-in-savepoint
-  tracking remains explicit-transaction-only (still gated on `inTx`,
-  untouched by that follow-up) — a batch like
-  `TRUNCATE t; SELECT 1/0;` in one autocommit message does not restore `t`'s
-  pre-truncate pages, and a `DROP TABLE`-inside-savepoint's undo tracking is
-  likewise still `inTx`-gated. Resume point if picked up: extend
-  `Session.TracksDDLUndo()` (added by the enum/composite follow-up) to also
-  gate `RecordTruncate`/`RecordDDLDrop`'s effective tracking, auditing
-  `deferred_unique.go`/`deferred_exclusion.go`/`operators_fk.go`
-  deferred-constraint-timing behavior separately first (still untouched,
-  still gated on the real `inTx`).
+  single-message autocommit batch" below.** ~~TRUNCATE tracking remains
+  explicit-transaction-only.~~ **CLOSED — see "Follow-up: TRUNCATE undo
+  tracking now autocommit-batch-aware" below.** `DROP TABLE`-inside-savepoint
+  undo tracking (`RecordDDLDrop`) is intentionally left `inTx`-gated: it is
+  additionally gated on `SavepointDepth() > 0`, and `SAVEPOINT` itself raises
+  `25P01` ("SAVEPOINT can only be used in transaction blocks") outside an
+  explicit transaction (`execSavepoint`, `internal/executor/operators_tx.go`),
+  so that code path is structurally unreachable from a message-scoped
+  autocommit session regardless of its `InExplicitTransaction()` gate —
+  nothing to fix there.
 - ~~**A `CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;`
   compound batch still loses `t1`'s undo entry.**~~ **CLOSED — see
   "Follow-up" below.**
@@ -388,3 +387,56 @@ no WAL/MVCC code touched (test-only + doc-only change), so the race gate and
 `scripts/tpch-spotcheck.sh` are unaffected by this loop's diff but were
 re-run anyway per the standing pre-commit gates; pgbench smoke via the
 pre-commit hook.
+
+## Follow-up: TRUNCATE undo tracking now autocommit-batch-aware (2026-07-04)
+
+Closes the TRUNCATE half of root-0024's first residual (the last open item
+under "Deferred" above, besides the structurally-unreachable
+`DROP TABLE`-in-savepoint case). `truncateTableAndPartitions`
+(`internal/executor/operators_ddl.go`) snapshots a table's (and its indexes')
+pre-truncate pages into a `TruncateUndoEntry` and calls
+`(*BasicSession).RecordTruncate` so `ProcessRollbackUndos` can restore them —
+but the call was gated on `Session.InExplicitTransaction()`, so a
+message-scoped autocommit throwaway session (`NewAutocommitUndoSession`)
+never got an entry recorded: `TRUNCATE t; SELECT 1/0;` as one simple-query
+message truncated `t` and left it empty even though the whole implicit batch
+transaction rolled back everywhere else.
+
+Fix: the gate is now `Session.TracksDDLUndo()` (added by the enum/composite
+follow-up above), the same one-line pattern already used for the four
+enum/composite record sites. No other plumbing was needed —
+`ProcessRollbackUndos` (`internal/executor/operators_tx.go`) already
+unconditionally drains and restores `TakePendingTruncates()` on abort
+whenever `ctx.Pool != nil`, and dispatch.go's abort defer already calls
+`ProcessRollbackUndos` against the same throwaway session for every
+autocommit batch (the original root-0024 mechanism) — so recording the entry
+was the only missing piece.
+
+The sibling `RecordDDLDrop` call site (`execDropTable`,
+`internal/executor/operators_ddl.go`) was audited and left unchanged: it is
+additionally gated on `bsess.SavepointDepth() > 0`, and `SAVEPOINT` itself
+raises `25P01` outside an explicit transaction (`execSavepoint`,
+`internal/executor/operators_tx.go`), so `SavepointDepth()` can never be
+nonzero on a session where `InExplicitTransaction()` is false — widening that
+gate to `TracksDDLUndo()` would be a no-op given the existing
+`SavepointDepth() > 0` conjunct, so it was left as `InExplicitTransaction()`
+for clarity (no dead-code risk either way, but no reason to touch a working,
+correctly-scoped call site).
+
+Test: `TestSimpleQueryBatchAbortUndoesEarlierTruncate`
+(`internal/server/dispatch_batch_atomicity_test.go`) creates a 3-row table,
+runs `TRUNCATE t; SELECT * FROM zz_definitely_missing_relation;` as one
+message, and asserts a follow-up `SELECT * FROM t` still returns all 3 rows.
+Confirmed RED against the pre-fix tree (reverting only `operators_ddl.go`):
+0 rows returned.
+
+This closes root-0024's first residual in full — no open items remain under
+"Deferred" above.
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/server/...` PASS (full, no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=33); pgbench smoke via the pre-commit hook. No WAL/MVCC
+package code touched, so the race gate is not required by the practice card,
+but the change is adjacent to transaction-rollback machinery, so
+`go test -race ./internal/executor/... ./internal/server/...` was run anyway
+(clean).

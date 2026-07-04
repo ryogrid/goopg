@@ -111,13 +111,27 @@ session object `BEGIN` replaces) was ever needed. No engine code changed;
 landed four permanent regression tests
 (`internal/server/dispatch_batch_atomicity_test.go`) plus a design-doc/
 ledger correction. Root-0024's first residual is now **fully closed for
-enum/composite**. **Remaining open: sub-part (a)**, TRUNCATE/DROP-in-
-savepoint tracking, still `inTx`-gated — needs `Session.TracksDDLUndo()`
-extended to `RecordTruncate`/`RecordDDLDrop`, auditing deferred-constraint-
-timing call sites first. **Next up:** continue the M0119-0004 pg_dump
-catalog-view parity battery, or pick up `root-0024`'s remaining
-TRUNCATE/DROP-in-savepoint sibling gap — neither is independently urgent,
-see each's own Deferred section.
+enum/composite**. **This loop (2026-07-04, #106) closed sub-part (a)**:
+`truncateTableAndPartitions`'s `RecordTruncate` call site
+(`internal/executor/operators_ddl.go`) now gates on `TracksDDLUndo()` instead
+of `InExplicitTransaction()`, so a `TRUNCATE t; SELECT 1/0;` autocommit batch
+correctly restores `t`'s pre-truncate pages (`ProcessRollbackUndos` already
+drained/restored `TakePendingTruncates()` unconditionally on abort — only the
+record-site gate was missing). The sibling `RecordDDLDrop` (DROP-in-savepoint)
+call site was audited, not changed: it is additionally gated on
+`SavepointDepth() > 0`, and `SAVEPOINT` itself raises `25P01` outside an
+explicit transaction, so that gate is structurally unreachable from an
+autocommit session — nothing to fix. Test:
+`TestSimpleQueryBatchAbortUndoesEarlierTruncate`
+(`internal/server/dispatch_batch_atomicity_test.go`), confirmed RED pre-fix.
+Design doc `root-0024` new "Follow-up: TRUNCATE undo tracking now
+autocommit-batch-aware" section; ledger row appended. **root-0024's first
+residual is now fully closed — no open items remain in its Deferred
+section.** Gates: build clean; `internal/executor`+`internal/server` suites
+PASS (incl. `-race`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+smoke = pre-commit hook. **Next up:** continue the M0119-0004 pg_dump
+catalog-view parity battery, or pick the next unresolved DU-002 slice from the
+deferral ledger — root-0024 itself has no remaining open threads.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

@@ -10438,7 +10438,11 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	// Snapshot pages before truncation for transactional rollback support.
-	if sess, isBas := o.ctx.Session.(*BasicSession); isBas && sess.InExplicitTransaction() {
+	// TracksDDLUndo() (not InExplicitTransaction()) so a message-scoped
+	// autocommit-batch throwaway session (NewAutocommitUndoSession) also
+	// records this for undo if a LATER statement in the same batch aborts —
+	// root-0024 residual (1), TRUNCATE half, M0110-0001.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas && sess.TracksDDLUndo() {
 		entry := TruncateUndoEntry{
 			Heap: snapshotRelPages(o.ctx, rel),
 		}

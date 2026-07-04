@@ -5,6 +5,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/protocol"
 )
 
 // TestSimpleQueryBatchAbortUndoesEarlierCreateTable pins the M0110-0001
@@ -284,5 +285,68 @@ func TestSimpleQueryMidBatchBeginUndoesEarlierAutocommitAddValue(t *testing.T) {
 		if v.Label == "happy" {
 			t.Fatalf("enum value 'happy' survived autocommit-ADD-VALUE-then-mid-batch-BEGIN-ROLLBACK; frames=%+v", frames)
 		}
+	}
+}
+
+// TestSimpleQueryBatchAbortUndoesEarlierTruncate closes root-0024's first
+// residual's remaining TRUNCATE half (deferral-ledger row "M0110-0001
+// (root-0024 residual (1), enum/composite half, loop #104)" resume point
+// (1)): a TRUNCATE inside a message-scoped autocommit batch was never
+// undo-tracked, the same bug class already fixed for CREATE TABLE/INDEX
+// (TestSimpleQueryBatchAbortUndoesEarlierCreateTable) and CREATE TYPE
+// (TestSimpleQueryBatchAbortUndoesEarlierCreateType). Before the fix,
+// truncateTableAndPartitions (internal/executor/operators_ddl.go) only called
+// RecordTruncate when Session.InExplicitTransaction() was true, so the
+// message-scoped throwaway autocommit session never got a page-snapshot undo
+// entry — a LATER statement's failure in the same message left the table
+// permanently empty despite the whole implicit batch transaction rolling back
+// everywhere else. The fix gates on TracksDDLUndo() instead, matching the
+// enum/composite fix; ProcessRollbackUndos already unconditionally drains and
+// restores TakePendingTruncates() on abort, so no new plumbing was needed.
+func TestSimpleQueryBatchAbortUndoesEarlierTruncate(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const tblName = "zz_batch_atomicity_truncate"
+	writeQuery(t, conn, "CREATE TABLE "+tblName+" (a int4);")
+	readUntilReady(t, conn)
+	writeQuery(t, conn, "INSERT INTO "+tblName+" VALUES (1), (2), (3);")
+	readUntilReady(t, conn)
+
+	writeQuery(t, conn, "TRUNCATE "+tblName+"; SELECT * FROM zz_definitely_missing_relation;")
+	frames := readUntilReady(t, conn)
+
+	sawTruncateComplete := false
+	sawError := false
+	for _, f := range frames {
+		switch f.Type {
+		case 'C': // CommandComplete
+			if string(f.Payload) == "TRUNCATE TABLE\x00" {
+				sawTruncateComplete = true
+			}
+		case 'E': // ErrorResponse
+			sawError = true
+		}
+	}
+	if !sawTruncateComplete {
+		t.Fatalf("expected TRUNCATE TABLE CommandComplete before the batch-aborting error; frames=%+v", frames)
+	}
+	if !sawError {
+		t.Fatalf("expected an ErrorResponse for the invalid second statement; frames=%+v", frames)
+	}
+
+	writeQuery(t, conn, "SELECT * FROM "+tblName+" ORDER BY a;")
+	frames = readUntilReady(t, conn)
+	var rowCount int
+	for _, f := range frames {
+		if f.Type == protocol.MsgDataRow {
+			rowCount++
+		}
+	}
+	if rowCount != 3 {
+		t.Fatalf("row count after aborted autocommit TRUNCATE = %d, want 3 (TRUNCATE should have been undone); frames=%+v", rowCount, frames)
 	}
 }
