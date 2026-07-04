@@ -175,3 +175,83 @@ func TestPoolReadTimeNanosAccumulates(t *testing.T) {
 		t.Errorf("ReadTimeNanos after non-positive adds = %d, want unchanged %d", got, want)
 	}
 }
+
+// TestPoolWriteTimeNanosAccumulates is AddWriteTimeNanos/WriteTimeNanos's
+// write_time analogue of TestPoolReadTimeNanosAccumulates above (M0122-0003
+// pg_stat_io follow-up: real per-wait-event flush timing).
+func TestPoolWriteTimeNanosAccumulates(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	if got := pool.WriteTimeNanos(); got != 0 {
+		t.Fatalf("WriteTimeNanos before any accumulation = %d, want 0", got)
+	}
+	pool.AddWriteTimeNanos(1_000_000)
+	pool.AddWriteTimeNanos(2_000_000)
+	if got, want := pool.WriteTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("WriteTimeNanos after two adds = %d, want %d", got, want)
+	}
+	// Non-positive durations (WaitEventEnd's zero-guard for a mismatched or
+	// clock-skewed pair) must not be recorded.
+	pool.AddWriteTimeNanos(0)
+	pool.AddWriteTimeNanos(-5)
+	if got, want := pool.WriteTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("WriteTimeNanos after non-positive adds = %d, want unchanged %d", got, want)
+	}
+}
+
+// TestPoolOnFlushHooksFireOnDirtyVictimEviction pins the OnFlushWait/
+// OnFlushDone bracket itself: it must fire exactly once per dirty-victim
+// flush inside evictVictim (mirrors bm_io_in_progress_test.go's OnPinWait
+// hook-invocation pattern), and must NOT fire for a clean-victim eviction
+// (evictVictim only calls flushSlot when wasDirty).
+func TestPoolOnFlushHooksFireOnDirtyVictimEviction(t *testing.T) {
+	const poolSlots = 2
+
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: poolSlots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	var waits, dones int
+	pool.OnFlushWait = func() { waits++ }
+	pool.OnFlushDone = func() { dones++ }
+
+	rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+
+	// Fill the pool and dirty every page; nothing evicted yet (clean fill,
+	// mirrors TestBufferCountersEvictionAndExtend), so the hooks must not
+	// have fired.
+	for i := 0; i < poolSlots; i++ {
+		s, _, err := pool.PinNew(rel)
+		if err != nil {
+			t.Fatalf("PinNew %d: %v", i, err)
+		}
+		pool.MarkDirty(s)
+		pool.Unpin(s)
+	}
+	if waits != 0 || dones != 0 {
+		t.Fatalf("OnFlushWait/OnFlushDone fired during clean fill: waits=%d dones=%d, want 0/0", waits, dones)
+	}
+
+	// One more PinNew than the pool has slots forces a real eviction of a
+	// dirty victim, which must flush through the OnFlushWait/OnFlushDone
+	// bracket exactly once.
+	s, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatalf("PinNew extra: %v", err)
+	}
+	pool.Unpin(s)
+
+	if waits != 1 || dones != 1 {
+		t.Errorf("OnFlushWait/OnFlushDone after one dirty-victim eviction = waits=%d dones=%d, want 1/1", waits, dones)
+	}
+}

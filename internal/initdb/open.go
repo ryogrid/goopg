@@ -628,6 +628,19 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			pool.AddReadTimeNanos(int64(d))
 		}
 	}
+	// write_time's OnPinWait/OnPinDone analogue: brackets evictVictim's
+	// dirty-victim flushSlot call (M0122-0003 pg_stat_io follow-up).
+	pool.OnFlushWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnFlushDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddWriteTimeNanos(int64(d))
+		}
+	}
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}

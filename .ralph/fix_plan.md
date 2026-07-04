@@ -33,11 +33,11 @@ every clean, green (build + pre-commit) checkpoint.
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
 BUFFERS TEXT+JSON/XML/YAML rendering, `pg_stat_io` row shape + real
-reads/read_bytes/read_time/writes/write_bytes/hits/evictions/extends/
-extend_bytes, and `track_io_timing` runtime SET have all landed; see the
-M0122-0003 line item for detail. Remaining sub-items: `EXPLAIN (BUFFERS)`
-without ANALYZE (planning-time buffers), local/temp-buffer terms,
-`write_time`/`extend_time` + the 3 remaining `pg_stat_io` op counters
+reads/read_bytes/read_time/writes/write_bytes/write_time/hits/evictions/
+extends/extend_bytes, and `track_io_timing` runtime SET have all landed;
+see the M0122-0003 line item for detail. Remaining sub-items: `EXPLAIN
+(BUFFERS)` without ANALYZE (planning-time buffers), local/temp-buffer
+terms, `extend_time` + the 3 remaining `pg_stat_io` op counters
 (reuses/writebacks/fsyncs), EXPLAIN's `I/O Timings` line, a `CTEDMLPrefix`
 nested-node instrumentation residual. Pick up one of those next, or
 continue the M0119-0004 pg_dump catalog-view

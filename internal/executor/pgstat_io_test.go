@@ -237,3 +237,38 @@ func TestPgStatIOEvictionsAndExtendsRendered(t *testing.T) {
 		t.Errorf("extend_bytes (col 12) = %q, want %q", found[12], "24576")
 	}
 }
+
+// TestPgStatIOWriteTimeRendered is write_time's TestPgStatIOReadTimeAndWritesRendered
+// analogue: fetchIOStatRows must render real write_time (col 8, from
+// Pool.WriteTimeNanos, accumulated by the OnFlushDone hook wired in
+// internal/initdb/open.go around evictVictim's dirty-victim flush) instead
+// of the previous hardcoded "0".
+func TestPgStatIOWriteTimeRendered(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	// 1.25ms of accumulated flush wait — mirrors what OnFlushDone would add
+	// via a real track_io_timing-gated WaitEventEnd duration.
+	pool.AddWriteTimeNanos(1_250_000)
+
+	ctx := &Context{Pool: pool}
+	rows := fetchIOStatRows(ctx)
+	var found []string
+	for _, r := range rows {
+		if r[0] == "client backend" && r[1] == "relation" && r[2] == "normal" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no client backend/relation/normal row found")
+	}
+	if found[8] != "1.250" {
+		t.Errorf("write_time (col 8) = %q, want %q", found[8], "1.250")
+	}
+}

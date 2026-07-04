@@ -195,6 +195,14 @@ type Pool struct {
 	// without this package needing to know about the activity registry.
 	sharedReadTimeNanos atomic.Int64
 
+	// sharedWriteTimeNanos is sharedReadTimeNanos's write-side sibling: real
+	// wall-clock time spent in evictVictim's dirty-victim flushSlot call
+	// (the exact span the OnFlushWait/OnFlushDone bracket covers), backing
+	// pg_stat_io's write_time column. Only accumulated when the evicting
+	// backend has track_io_timing on (see initdb.Open's OnFlushDone wiring,
+	// which mirrors OnPinDone's AddReadTimeNanos call exactly).
+	sharedWriteTimeNanos atomic.Int64
+
 	// sharedEvictionCount / sharedExtendCount back pg_stat_io's evictions /
 	// extends columns (M0122-0003 follow-up: "the remaining five op
 	// counters"). evictionCount increments once per real victim eviction
@@ -234,6 +242,13 @@ type Pool struct {
 
 	// OnPinDone is called after the disk read finishes.
 	OnPinDone func()
+
+	// OnFlushWait is called when evictVictim is about to flush a dirty
+	// victim's page to disk (write_time's OnPinWait analogue).
+	OnFlushWait func()
+
+	// OnFlushDone is called after that flush finishes.
+	OnFlushDone func()
 
 	// OnBufferIOWait is called when a goroutine waits for an in-flight read.
 	OnBufferIOWait func()
@@ -521,6 +536,23 @@ func (p *Pool) ReadTimeNanos() int64 {
 	return p.sharedReadTimeNanos.Load()
 }
 
+// AddWriteTimeNanos accumulates n nanoseconds of real dirty-victim flush
+// wait time into the pool-wide write-time tally. Called only from the
+// OnFlushDone hook when the evicting backend has track_io_timing enabled
+// (see sharedWriteTimeNanos's doc comment).
+func (p *Pool) AddWriteTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedWriteTimeNanos.Add(n)
+	}
+}
+
+// WriteTimeNanos returns the pool-wide cumulative real time spent flushing
+// dirty victims by backends with track_io_timing on, backing pg_stat_io's
+// write_time column (milliseconds).
+func (p *Pool) WriteTimeNanos() int64 {
+	return p.sharedWriteTimeNanos.Load()
+}
+
 // EvictionCount returns the pool-wide cumulative count of real victim
 // evictions (backs pg_stat_io's evictions column).
 func (p *Pool) EvictionCount() int64 {
@@ -738,7 +770,13 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		// Release pinMu while doing IO so other goroutines can proceed.
 		p.pinMu.Unlock()
 		s.contentMu.Lock()
+		if p.OnFlushWait != nil {
+			p.OnFlushWait()
+		}
 		flushErr := p.flushSlot(oldTag, s.page)
+		if p.OnFlushDone != nil {
+			p.OnFlushDone()
+		}
 		s.contentMu.Unlock()
 		p.pinMu.Lock()
 		if flushErr != nil {

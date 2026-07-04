@@ -579,3 +579,52 @@ via N more `PinNew` calls, asserting both counters independently).
 `TestPgStatIOEvictionsAndExtendsRendered` (end-to-end: asserts the
 rendered `evictions`/`extends`/`extend_bytes` cells match the underlying
 counters after a controlled fill-then-evict sequence).
+
+## `write_time` counter (later loop, 2026-07-05)
+
+`write_time` — the last resume point the `evictions`/`extends` section
+above left open — now renders a real value, backed by a genuinely new
+timing hook (unlike `evictions`/`extends`, which reused the pre-existing
+counter-pattern with no new hook needed).
+
+`storage.Pool` gains `sharedWriteTimeNanos` (`internal/storage/bufpool.go`),
+`read_time`'s (`sharedReadTimeNanos`) write-side sibling, plus a matching
+`OnFlushWait`/`OnFlushDone` hook pair — the write-side analogue of the
+pre-existing `OnPinWait`/`OnPinDone` bracket around `pinLoad`'s disk read.
+The new pair brackets `evictVictim`'s dirty-victim `flushSlot` call exactly
+(same `contentMu`-held span `OnPinWait`/`OnPinDone` brackets on the read
+side), so accumulated time reflects only the same foreground,
+backend-driven flushes `sharedWrittenCount` already counts — not
+bgwriter/checkpointer background flushes (consistent with that counter's
+own documented per-backend-attribution rationale). New
+`AddWriteTimeNanos`/`WriteTimeNanos` accessor pair mirrors
+`AddReadTimeNanos`/`ReadTimeNanos` exactly, including the non-positive-
+duration guard.
+
+`internal/initdb/open.go` wires `pool.OnFlushWait`/`pool.OnFlushDone`
+immediately after the pre-existing `pool.OnPinWait`/`pool.OnPinDone` block,
+using the identical `act.LookupTrackedGoroutine()` → `WaitEventStart(...,
+WaitDataFileWrite)` / `WaitEventEnd()` → `AddWriteTimeNanos` pattern (same
+`WaitDataFileWrite` wait event `mgr.OnWriteWait`/`OnWriteDone` already use
+at the lower `storage.Manager.WriteBlock` layer for `pg_stat_activity`
+purposes — this new pair is a separate, `Pool`-level bracket scoped to
+exactly the foreground-eviction span, deliberately not reusing `mgr`'s
+existing hooks since those fire for every `WriteBlock` call including
+background flushes this counter must exclude).
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` reads
+`Pool.WriteTimeNanos()` and renders it (via the existing `nsToMs` helper)
+as the `write_time` column (col 8) alongside the pre-existing
+`writes`/`write_bytes` cells, for the same "client backend/relation/normal"
+row.
+
+**Tests:** `internal/storage/bufpool_counters_test.go` —
+`TestPoolWriteTimeNanosAccumulates` (accumulation + non-positive-duration
+guard, mirrors `TestPoolReadTimeNanosAccumulates`),
+`TestPoolOnFlushHooksFireOnDirtyVictimEviction` (installs counting
+`OnFlushWait`/`OnFlushDone` closures directly on a real `Pool`, confirms
+they fire exactly once per forced dirty-victim eviction and not at all
+during a clean fill — mirrors `bm_io_in_progress_test.go`'s `OnPinWait`
+hook-invocation pattern). `internal/executor/pgstat_io_test.go` —
+`TestPgStatIOWriteTimeRendered` (end-to-end rendered-cell assertion,
+mirrors `TestPgStatIOReadTimeAndWritesRendered`).
