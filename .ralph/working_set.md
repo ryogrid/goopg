@@ -1,80 +1,86 @@
 (idle — nothing in flight)
 
-Last completed (this loop, 2026-07-04): closed root-0025 deferred item 2
-(view-of-view chaining) — a simple auto-updatable view (single base
-relation, unrenamed in-order full-column passthrough, no
-joins/aggregation/set-ops) can now be defined `FROM` another simple
-auto-updatable view and INSERT/UPDATE/DELETE against the outer view rewrites
-all the way down to the real base table, mirroring PostgreSQL's
-`rewriteHandler.c` recursive view rewrite.
+Last completed (this loop, 2026-07-04): closed root-0025 deferred item 1
+(column subset/reorder/rename auto-updatable views). A simple auto-updatable
+view (single base relation, no joins/aggregation/set-ops) can now expose a
+renamed, reordered, and/or subset column list of its base relation and
+INSERT/UPDATE/DELETE against the view still rewrites correctly onto the
+base table — matching PostgreSQL's real rule (`view_col_is_auto_updatable`:
+a view column is updatable iff it's a plain Var over the base relation; no
+requirement that every base column appear, in order, unrenamed).
 
-`viewAutoUpdatableBase` renamed to `viewAutoUpdatableChain`
-(`internal/planner/view_dml.go`) and now recurses when the FROM relation is
-itself a view, returning the full chain (outermost to innermost) plus the
-ultimate base table. Column names/ordinals are identical at every level by
-construction (the passthrough requirement), so no column-mapping plumbing
-was needed. Had to fix a latent eligibility bug found while implementing
-this: `catalog.InMemory.CreateView` sets `Table.Virtual = true` on EVERY
-view (not just goopg's system-catalog virtual relations) — the old
-single-level code's `b.Virtual` guard only worked because the separate
-`b.View != nil` check already excluded views; now that a view IS a valid
-intermediate, the guard had to become `b.Virtual && b.View == nil` to keep
-excluding real system catalogs (`pg_class` etc.) without also excluding
-chainable views.
+`viewTargetsPassthrough` (`internal/planner/view_dml.go`) replaced by
+`viewColumnMap`, which now returns `(colMap []int, ok bool)` — colMap[i] is
+the base ordinal that view target-list ordinal i maps onto — instead of a
+bool requiring positional identity. `viewAutoUpdatableChain` composes each
+level's own colMap down through a view chain, returning `colMaps [][]int`
+parallel to `chain`. New `viewColumnNames` (a view's own resolved output
+names) and `viewProxyTable` (a synthetic *catalog.Table with base's exact
+physical column layout/ordinals, but the exposed ordinals renamed to the
+view's own names and unexposed ordinals hidden via an empty, unmatchable
+Name) let `planInsert`/`planUpdate`/`planDelete` pass this proxy to
+`singleBindingContext` in place of base — so a DML statement's column
+list/SET/WHERE/RETURNING resolve using the view's own vocabulary through
+the ordinary name-based resolveContext machinery, no separate rewrite pass
+needed, while the plan node's actual scan/mutation Table field stays the
+true base throughout. `viewQualOnBase` also now resolves each chain level's
+own stored WHERE against a proxy shaped like its *immediate* FROM's
+exposure (not unconditionally against base as before), closing a
+correctness gap the chaining loop's "identical names at every level"
+assumption had been hiding. The standalone `len(tbl.ViewColumnAliases) > 0`
+gate was deleted outright: `execCreateView` already folds an explicit
+`CREATE VIEW v (a, b)` column-name list into `catalog.Table.Columns[i].Name`
+exactly the same as a per-target AS alias, so treating the two rename
+spellings differently for eligibility was never load-bearing.
 
-New `viewChainQuals` (`internal/planner/view_dml.go`) combines each chain
-level's own resolved WHERE qual two ways: `all` = unconditional AND of every
-level (the UPDATE/DELETE row-visibility restriction — a chained view only
-exposes rows visible through every level's own SELECT); `checked` = AND of
-only the CASCADED/LOCAL-CHECK-OPTION-eligible levels, exactly mirroring
-`rewriteHandler.c`'s propagation (~line 3791-3843): a CASCADED check option
-(default for unqualified `WITH CHECK OPTION`) forces every inner level to be
-checked too regardless of that level's own setting; LOCAL checks only
-levels that themselves declare CHECK OPTION. `planInsert`/`planUpdate`/
-`planDelete` (`internal/planner/planner.go`) call `viewAutoUpdatableChain` +
-`viewChainQuals` instead of the old single-level pair.
+Test `TestUpdatableViewColumnSubsetReorderRename`
+(`internal/executor/view_dml_test.go`) covers rename-via-AS-alias,
+rename-via-explicit-column-list, reorder (column-list-free INSERT mapping
+through the view's own order, not base's physical order), and subset
+(successful INSERT against the exposed column + 42703 against the hidden
+one). `TestNonUpdatableViewDMLRejected`'s renamed-column case (`vren`) was
+replaced with an expression-column case (`vexpr`), since renaming a plain
+column reference is no longer in the rejected category — only a
+target-list entry that isn't a bare column reference still is.
 
 Design doc `docs/design/root-0025-updatable-views.md` gained a "Follow-up:
-view-of-view chaining" section; `docs/design/README.md`'s root-0025 row
-updated. Deferral ledger row appended (status `resolved`) closing item 2 of
-the earlier root-0025 ledger entry — items (1) column subset/reorder/rename
-and (3) `UPDATE...FROM`/`DELETE...USING` a view, and (4) CHECK OPTION on
-partition/inheritance-child-routed rows remain open exactly as recorded
-there. Noted one residual fidelity gap (not worth fixing in a chaining-
-focused loop): `viewCheckName` in the 44000 error always names the outermost
-DML-targeted view even when an inner level's qual is what failed —
-PostgreSQL's per-level `WithCheckOption.relname` would report the specific
-inner view instead. Purely cosmetic (the row is still correctly rejected).
+column subset/reorder/rename" section (also corrected the chaining
+follow-up's now-outdated "identical names at every level" claim);
+`docs/design/README.md`'s root-0025 row updated. Deferral ledger row
+appended (status `resolved`) closing item 1. Noted one deliberate residual:
+`INSERT ... ON CONFLICT`'s arbiter-target (`resolveArbiterIndex`) and DO
+UPDATE SET/WHERE (`planOnConflict`) resolution still resolve directly
+against base, not through the view's proxy — targeting a renamed view
+column in `ON CONFLICT (...)` or `DO UPDATE SET renamed_col = ...` fails
+42703 (a safe, narrow failure) rather than resolving. Root-0025 deferred
+items (3) `UPDATE...FROM`/`DELETE...USING` a view and CHECK OPTION on
+partition/inheritance-child-routed rows remain open exactly as recorded in
+the earlier ledger row.
 
-Committed (`d7e0dd4e`) and pushed to `align-data-structure-with-pg`.
+Committed (`18bd8222`) and pushed to `align-data-structure-with-pg`.
 
-Gates run this loop: `go build ./...` clean; `go vet` clean (only pre-existing
-unrelated lint notes); `go test ./internal/planner/... ./internal/executor/...
-./internal/catalog/... ./internal/parser/...` PASS (new tests:
-`TestChainedViewInsertUpdateDeleteRewriteToBase`,
-`TestChainedViewCheckOptionCascadeReachesInnerView`,
-`TestChainedViewCheckOptionLocalDoesNotForceInnerCheck`,
-`TestChainedViewCheckOptionInnerEnforcedRegardlessOfOuter`,
-`TestChainedViewInnerNotAutoUpdatableRejectsWholeChain`, all in
-`internal/executor/view_dml_test.go`, plus all 6 pre-existing view_dml tests
-re-verified passing); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
-pgbench smoke via the pre-commit hook PASS (0 failed across all 3 phases
-this run's SCOPE=smoke path exercised — TPC-B, simple-update, select-only).
+Gates run this loop: `go build ./...` clean; `go vet ./internal/planner/...
+./internal/executor/...` clean; `go test ./internal/planner/...
+./internal/executor/... ./internal/catalog/... ./internal/parser/...
+./internal/server/...` PASS (new test as above; all 6 pre-existing
+view_dml_test.go tests + 5 chaining tests re-verified passing);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke via the
+pre-commit hook PASS (0 failed across TPC-B, simple-update, select-only).
 `make ralph-state-guard` self-repaired the same recurring benign
 progress.json "completed" artifact noted in prior loops' carries (expected
 every loop, not a defect).
 
 Next step: no work in flight. Pick the next item from
-`.ralph/deferral_ledger.md` (status `-`, ~155 open rows) or
-`docs/design/README.md`'s open items. Good bounded candidates on the
-root-0025 line: item (1) column subset/reorder/rename (needs a `colMap
-[]int` threaded through `Set`/`Returning`/row-assembly in
-`internal/planner/view_dml.go`/`planner.go`, replacing the
-`tbl.Columns == base.Columns` positional-identity assumption — the
-`viewTargetsPassthrough` helper this loop factored out is the natural place
-to generalize into a column-map builder), or item (3)
+`.ralph/deferral_ledger.md` (status `-`) or `docs/design/README.md`'s open
+items. Good bounded candidates on the root-0025 line: item (3)
 `UPDATE...FROM`/`DELETE...USING` a view (thread the view qual into
-`FromPred`/`UsingPred` in `planUpdate`/`planDelete`'s FROM/USING branches).
-Alternatively resume the M0119-0004 pg_dump catalog-view parity battery via
-`TestPort_PgDumpConnectionSetup` (has been the discovery engine for DU-002
-slices through at least 445).
+`FromPred`/`UsingPred` in `planUpdate`/`planDelete`'s FROM/USING branches,
+`internal/planner/planner.go`), the `ON CONFLICT`-against-renamed-view
+residual just noted (thread `resolveTbl`/colMap into `planOnConflict`'s
+`tbl` param and `resolveArbiterIndex`'s target-column lookup, translating
+back to base ordinals before the actual index lookup), or CHECK OPTION on
+partition/inheritance-child-routed rows (item 4/5 — remap `newRow`/
+`parentNewRow` through the child's column map before the CHECK OPTION eval
+in `updateScanTables`'s child branch). Alternatively resume the M0119-0004
+pg_dump catalog-view parity battery via `TestPort_PgDumpConnectionSetup`, or
+pick the next unresolved DU-002 slice from the deferral ledger.
