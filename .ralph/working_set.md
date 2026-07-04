@@ -92,3 +92,57 @@ append), or continue M0122-0004's remaining open sub-items (window frames
 / GROUPING SETS / ANY-SOME-ALL / DEFAULT-clause / intervals — all still
 open, none yet scoped) or the comma/LATERAL-join `ctx.OuterRows` wiring gap
 (ledger row 480, separate from this one, still unscoped/unfixed).
+
+---
+
+**Loop #17 (this loop).** Concurrency guard again confirmed a second,
+independent `ralph_loop.sh` tree (screen-rooted `2085426` chain, this
+session rooted at `2087326`→`2087655`). Rather than block, found an
+existing but stale, uncommitted worktree at `/tmp/wt-buffers-dirtied-written`
+(branch `explain-buffers-dirtied-written`, only 2 commits behind current
+HEAD) that a prior loop iteration had left mid-flight on exactly the next
+open `M0122-0003` sub-item (`dirtied=`/`written=` BUFFERS counters) — per
+`worktree_isolation_escapes_foreign_wip_block`, rebased it onto current
+HEAD (clean, no conflicts on the code; one `docs/design/README.md` merge
+conflict from `git stash pop`, resolved by keeping the newer upstream
+`0122-0002` row + the stash's extended `0122-0003` row with the
+dirtied/written closure paragraph), fixed one gofmt alignment nit in my
+own added `nodeStats` struct lines (did NOT touch the pre-existing
+unrelated gofmt drift in the same files — repo is on a stale gofmt
+version, `goopg_gofmt_version_mismatch_no_w`), verified
+`go build ./...`/`go vet`/`go test ./internal/executor/...
+./internal/storage/...` all clean, appended a new deferral-ledger row
+(closing the dirtied/written gap named by the two BUFFERS rows above it),
+committed (`e49ac798`), rebased again onto 2 newer peer commits
+(`091fa948`/`5d5c5ec1` landed mid-loop), rebuilt/retested clean, pushed
+fast-forward (`5d5c5ec1..a896a842`), then removed the worktree + deleted
+the local branch. Pre-commit pgbench smoke PASS (0 failed, TPC-B ~189
+TPS / simple-update ~254 TPS / select-only ~14.4k TPS via `PATH`+
+`LD_LIBRARY_PATH` pointed at `postgres/local_install/{bin,lib}` — the
+worktree has no `postgres/` dir of its own, it's untracked in the main
+tree). Did **not** run `scripts/tpch-spotcheck.sh` for real: the worktree
+has no `bench/tpch/runtime_goopg/data` (untracked, main-tree-only, and
+was actively being touched — mtime during this loop — by the concurrent
+peer's own possible spotcheck run); script SKIPPED cleanly (exit 0, by
+design for a machine/worktree without the data set). Risk judged low: this
+change is purely additive instrumentation (new atomic counters + new
+EXPLAIN render fields), touches no join/filter/row-count logic, and a
+prior loop iteration's design-doc text already recorded a real-server
+live verification of this exact code (`UPDATE` immediately after `INSERT`
+withholds `dirtied=`, reports it after an intervening `CHECKPOINT`).
+
+M0122-0003 remaining open items (see the ledger's newest row): `EXPLAIN
+(BUFFERS)` without `ANALYZE` (no planning-phase buffer counters exist),
+local/temp-buffer terms (no local-buffer-manager concept at all), the
+other 7 `pg_stat_io` I/O counters, `track_io_timing` runtime `SET`.
+
+Next step: (idle for this thread — task fully committed+pushed). Good next
+picks per the fix_plan banner: continue M0122-0003's remaining sub-items
+above (all need the same "storage-instrumentation-layer" work, flagged
+multi-loop), or M0122-0004's open items (see Loop #18's note above), or
+next `M0119-0004` pg_dump catalog-view parity slice. **Before picking
+anything touching `internal/catalog/`, `internal/executor/codec.go`,
+`internal/executor/pg18_user_catalog_rows*.go`, `internal/initdb/open.go`,
+`internal/initdb/view_ddl_recovery_test.go`, or `internal/analyzer/` — those
+were the concurrent peer's live dirty set as of this loop's end; re-check
+`git status` first.**
