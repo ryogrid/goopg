@@ -1778,17 +1778,20 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if op != OpUnknown {
 					pos := t.Pos
 					p.advance() // consume the operator token
-					// `expr ~ ANY(array)` / `expr ~* ANY(array)` etc. — ScalarArrayOpExpr.
-					// Desugar to InExpr with AnyOp set so the executor applies the
-					// operator element-wise and OR-s the results. M0097-0068.
-					if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAny {
-						p.advance() // ANY
+					// `expr ~ ANY|SOME(array)` / `expr ~* ALL(subquery)` etc. —
+					// ScalarArrayOpExpr. Desugar to InExpr with AnyOp set so the
+					// executor applies the operator element-wise and OR-s
+					// (ANY/SOME) or AND-s (ALL) the results. M0097-0068, M0122-0004.
+					if isAnyOrSomeTok(p.cur()) || isAllTok(p.cur()) {
+						allQuant := isAllTok(p.cur())
+						p.advance() // ANY / SOME / ALL
 						inExpr, err := p.parseAnyTail(left, pos)
 						if err != nil {
 							return nil, err
 						}
 						if ie, ok := inExpr.(*InExpr); ok {
 							ie.AnyOp = op
+							ie.AllOp = allQuant
 						}
 						left = inExpr
 						continue
@@ -1900,17 +1903,17 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			}
 		}
 
-		// `expr = ANY (array[...])` — desugar to `expr IN (...)`.
-		// `expr != ANY (array[...])` / `expr <> ANY (...)` — desugar to
+		// `expr = ANY|SOME (array[...])` — desugar to `expr IN (...)`.
+		// `expr != ANY|SOME (array[...])` / `expr <> ANY|SOME (...)` — desugar to
 		// `expr NOT IN (...)` (semantically "at least one element is !=",
 		// which for a finite non-null list equals NOT IN). M0097-0067.
 		if precCompare >= min {
 			if t := p.cur(); t.Kind == TokenOperator && (t.Value == "=" || t.Value == "!=" || t.Value == "<>") &&
-				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAny {
+				isAnyOrSomeTok(p.peek(1)) {
 				notEq := t.Value != "="
 				pos := t.Pos
 				p.advance() // = / != / <>
-				p.advance() // ANY
+				p.advance() // ANY / SOME
 				inExpr, err := p.parseAnyTail(left, pos)
 				if err != nil {
 					return nil, err
@@ -1947,6 +1950,48 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				}
 				left = &UnaryOp{pos: pos, Op: OpNot, Operand: inExpr}
 				continue
+			}
+		}
+
+		// `expr <op> ANY|SOME|ALL (array[...] | subquery)` for the ordering
+		// comparisons (< > <= >=) and `!=`/`<>` ALL — the remaining operator
+		// x quantifier combinations not covered by the `=`/`!=`/`<>` ANY and
+		// `=` ALL forms above. Generalizes via InExpr.AnyOp/AllOp: ANY/SOME
+		// ORs the per-element comparison, ALL ANDs it (evalInExpr,
+		// internal/executor/expr.go). M0122-0004.
+		if precCompare >= min {
+			var ordOp OpCode
+			if t := p.cur(); t.Kind == TokenOperator {
+				switch t.Value {
+				case "<":
+					ordOp = OpLt
+				case ">":
+					ordOp = OpGt
+				case "<=":
+					ordOp = OpLe
+				case ">=":
+					ordOp = OpGe
+				case "!=", "<>":
+					ordOp = OpNe
+				}
+			}
+			if ordOp != OpUnknown {
+				isAll := isAllTok(p.peek(1))
+				if isAll || (ordOp != OpNe && isAnyOrSomeTok(p.peek(1))) {
+					pos := p.cur().Pos
+					p.advance() // the operator
+					p.advance() // ANY / SOME / ALL
+					inExpr, err := p.parseAnyTail(left, pos)
+					if err != nil {
+						return nil, err
+					}
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.AnyOp = ordOp
+						ie.AllOp = isAll
+					}
+					left = inExpr
+					continue
+				}
 			}
 		}
 
@@ -2075,11 +2120,47 @@ func (p *parser) peekQualifiedOp() (OpCode, int) {
 	return OpUnknown, 0
 }
 
-// parseAnyTail parses `ANY (array[e1, e2, ...])` after `=` has been consumed.
-// Returns an InExpr equivalent to `left IN (e1, e2, ...)`.
+// isAnyOrSomeTok reports whether t is the ANY or SOME keyword. SOME is an
+// accepted synonym for ANY in scalar-array/subquery comparisons
+// (`expr op SOME (...)`). M0122-0004.
+func isAnyOrSomeTok(t Token) bool {
+	return t.Kind == TokenKeyword && (t.Keyword == KwAny || t.Keyword == KwSome)
+}
+
+// isAllTok reports whether t is the ALL keyword used as a comparison
+// quantifier (`expr op ALL (...)`).
+func isAllTok(t Token) bool {
+	return t.Kind == TokenKeyword && t.Keyword == KwAll
+}
+
+// parseAnyTail parses the parenthesised operand of `ANY|SOME|ALL (...)`
+// after the quantifier keyword has been consumed: either
+// `ANY (array[e1, e2, ...])`, a bare value list, or a `(SELECT ...)`
+// subquery. The caller sets AnyOp/AllOp on the returned InExpr to select
+// the comparison operator and ANY-vs-ALL semantics; a bare `IN`-style
+// equality check leaves both zero/false.
 func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 	if !p.acceptSymbol("(") {
-		return nil, p.errAtCur("expected '(' after ANY")
+		return nil, p.errAtCur("expected '(' after ANY/SOME/ALL")
+	}
+	// `expr op ANY|ALL (SELECT ...)` — subquery form, mirroring parseInTail.
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
+		inner, err := p.parseSelect()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close ANY/ALL subquery")
+		}
+		sel, ok := inner.(*SelectStmt)
+		if !ok {
+			return nil, &SyntaxError{Pos: pos, Message: "ANY/ALL subquery did not produce SELECT"}
+		}
+		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
 	}
 	var elems []Expr
 	// array[e1, e2, ...] constructor form.

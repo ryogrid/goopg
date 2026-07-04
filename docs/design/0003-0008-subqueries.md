@@ -38,10 +38,14 @@ A scalar subquery returns at most one row × one column. v0
 recognises the syntax `( SELECT … )` in expression position;
 it does **not** yet support:
 
-- `IN (subquery)` / `NOT IN` / `ANY` / `SOME` / `ALL`.
+- `IN (subquery)` / `NOT IN`.
 - `EXISTS (subquery)`.
 - Correlated subqueries (parameter pull-up). The inner plan
   in v0 cannot reference outer-row columns.
+
+(`ANY` / `SOME` / `ALL` were also unsupported at the time this section was
+written; see the "Follow-up: ANY / SOME / ALL" section below — closed
+2026-07-05.)
 
 Trying any of those raises a 0A000 feature-not-supported error
 either at parse time (for `EXISTS`/`IN` whose grammar isn't
@@ -237,9 +241,63 @@ End-to-end verified via psql 18.3:
   per-outer-row re-evaluation is correct but quadratic for
   large outers. TPC-H queries at SF1 will be slow but
   produce the right answer.
-- ANY / SOME / ALL (subquery / value-list quantified
-  comparisons). Distinct from IN.
 - `LATERAL` joins (related grammar; not used by TPC-H).
+
+## Follow-up: ANY / SOME / ALL quantified comparisons (2026-07-05, M0122-0004)
+
+The "out of scope" ANY/SOME/ALL gap above is closed. Previously only
+`=`/`!=`/`<>` plus the four POSIX regex operators supported `ANY` against
+an array literal or single scalar expression, and `ALL` was wired for `=`
+only (via a `NOT (expr != ANY (...))` desugar). `SOME` was not a
+recognised keyword at all, and no operator supported a `(SELECT ...)`
+operand — only `IN (subquery)` did.
+
+### Generalizing InExpr instead of adding a new node
+
+`expr op ANY|SOME|ALL (...)` is a PostgreSQL `ScalarArrayOpExpr`: apply
+`op` between the left operand and every element of the right-hand set,
+then OR (ANY/SOME) or AND (ALL) the per-element results. goopg already had
+half of this machinery — `InExpr.AnyOp` (element-wise operator) — from the
+regex-ANY and `!=`-ANY work (M0097-0067/0068). This loop:
+
+- Adds `InExpr.AllOp bool` (parser and planner) alongside the existing
+  `AnyOp`. When `AnyOp != 0`, `AllOp` selects AND-of-comparisons instead of
+  the default OR.
+- Adds the `SOME` keyword (`internal/parser/token.go`/`keywords.go`),
+  unreserved like the existing `ANY`, and threads it through every ANY
+  check via a shared `isAnyOrSomeTok` helper.
+- Extends `parseAnyTail` (`internal/parser/select.go`) to also accept a
+  `(SELECT ...)` operand, mirroring `parseInTail`'s subquery detection —
+  previously it only parsed an `ARRAY[...]` literal or a bare scalar
+  expression.
+- Adds one new dispatch block in `parseExprPrec` covering the operator ×
+  quantifier combinations the pre-existing `=`/`!=`/`<>`/regex blocks
+  didn't reach: `<`, `>`, `<=`, `>=` with ANY/SOME/ALL, and `!=`/`<>` with
+  ALL. The pre-existing blocks are extended in place to accept `SOME` and
+  (for the regex operators) `ALL`, rather than rewritten, to avoid
+  disturbing their already-shipped behavior.
+- `internal/executor/expr.go`'s `evalInExpr` gains an ALL branch alongside
+  the existing ANY branch: AND of per-element comparisons, short-circuits
+  false as soon as one element fails. NULL elements are skipped in both
+  branches (pre-existing ANY simplification, kept consistent rather than
+  fixed only for the new ALL path — see Known limitations below).
+- The subquery form required zero new executor plumbing:
+  `collectInValues` already drains an arbitrary single-column subquery
+  plan for `IN (subquery)`; `AnyOp`/`AllOp` are read generically
+  regardless of whether the source was `List` or `Plan`.
+
+### Known limitations (not fixed by this loop)
+
+- **NULL handling is not fully three-valued.** Upstream's ScalarArrayOpExpr
+  returns NULL (not false) for `x = ANY(array)` when no element matches but
+  at least one element is NULL, and symmetrically for ALL. goopg's ANY/ALL
+  branches skip NULL elements and return a definite true/false. This
+  simplification predates this loop (M0097-0068's ANY branch already did
+  it); the new ALL branch intentionally matches it for consistency rather
+  than being "more correct" than its sibling in an asymmetric way.
+- Decorrelation/caching for the new subquery form rides the same
+  non-correlated subquery cache as `IN (subquery)` — no new optimization
+  work, no new correctness gap either.
 
 ## Cross-references
 

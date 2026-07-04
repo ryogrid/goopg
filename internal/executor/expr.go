@@ -5425,6 +5425,26 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	if err != nil {
 		return Datum{}, err
 	}
+	// op ALL semantics (ScalarArrayOpExpr, useOr=false): `left op ALL(...)` —
+	// AND of (left op elem) for each element; false as soon as one element
+	// fails the comparison. NULL elements are skipped (same simplification
+	// as the ANY branch below, not full three-valued NULL propagation).
+	// M0122-0004.
+	if x.AnyOp != 0 && x.AllOp {
+		for _, v := range values {
+			if v.IsNull() {
+				continue
+			}
+			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			if err != nil {
+				return Datum{}, err
+			}
+			if res.Kind == KindBool && !res.BoolValue() {
+				return NewBoolDatum(false), nil
+			}
+		}
+		return NewBoolDatum(true), nil
+	}
 	// op ANY semantics (ScalarArrayOpExpr): `left op ANY(array)` — OR of
 	// (left op elem) for each element. Used for non-equality operators like
 	// `col ~ ANY(ARRAY[...])`. M0097-0068.

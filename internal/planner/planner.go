@@ -5784,7 +5784,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if x.Subquery != nil {
 			return planInExpr(x, win.input)
 		}
-		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, List: list}, nil
+		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, List: list}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
@@ -9510,7 +9510,7 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp}
 	if x.Subquery != nil {
 		if ctx == nil || ctx.cat == nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
@@ -10495,6 +10495,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			Negated:         x.Negated,
 			NotEqualAny:     x.NotEqualAny,
 			AnyOp:           x.AnyOp,
+			AllOp:           x.AllOp,
 			Plan:            x.Plan,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,
@@ -10724,6 +10725,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			Negated:         x.Negated,
 			NotEqualAny:     x.NotEqualAny,
 			AnyOp:           x.AnyOp,
+			AllOp:           x.AllOp,
 			Plan:            x.Plan,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,

@@ -207,9 +207,13 @@ type InExpr struct {
 	// Distinct from Negated which means NOT IN (AND of != comparisons).
 	// M0097-0067.
 	NotEqualAny bool
-	// AnyOp, when non-zero, indicates `left op ANY(array)` with the given operator.
-	// Used for non-equality ANY predicates such as `col ~ ANY(ARRAY[...])`.
-	AnyOp           parser.OpCode
+	// AnyOp, when non-zero, indicates `left op ANY|SOME|ALL(...)` with the
+	// given operator. Used for non-equality ANY/ALL predicates such as
+	// `col ~ ANY(ARRAY[...])` or `col < ALL(SELECT ...)`.
+	AnyOp parser.OpCode
+	// AllOp selects ALL (AND) instead of ANY/SOME (OR) semantics when AnyOp
+	// is set. M0122-0004.
+	AllOp           bool
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool

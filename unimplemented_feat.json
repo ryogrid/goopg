@@ -127,7 +127,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Only ANY with arrays found (expr.go:5146), no quantified subquery ANY/SOME/ALL support"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): expr op ANY|SOME|ALL now supported for arrays, scalars, AND (SELECT ...) subqueries, across =/!=/<>/</>/<=/>=/regex operators. New InExpr.AllOp (AND semantics) + KwSome keyword + parseAnyTail subquery form (internal/parser/select.go, internal/executor/expr.go). Tests: internal/parser/any_all_test.go, internal/executor/any_all_test.go. Design: docs/design/0003-0008-subqueries.md Follow-up section."
   },
   {
    "feature": "DML sub-plan rendering in EXPLAIN (showing plans for INSERT/UPDATE/DELETE statements)",

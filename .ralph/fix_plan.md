@@ -287,7 +287,7 @@ mirroring M0119's ledger `status` column.
       runtime SET (GUC registered but only consulted once at process boot).
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
-      ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, ANY/SOME/ALL, DEFAULT-clause
+      ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
       OPTION removed from this bucket (2026-07-04, loop #14):** verify-before-
       implement caught that it was already fully resolved by the root-0025
@@ -318,6 +318,29 @@ mirroring M0119's ledger `status` column.
       throwaway probe reproducing the uuid.sql shape the entry cited.
       `unimplemented_feat.json` entry updated in place, no code change
       needed.
+      **ANY/SOME/ALL removed from this bucket (2026-07-05, this loop):**
+      implemented the remaining operator × quantifier combinations and the
+      subquery operand form. Previously only `=`/`!=`/`<>`/regex operators
+      supported ANY against an array/scalar, `ALL` only for `=`, `SOME`
+      wasn't a keyword, and no operator accepted a `(SELECT ...)` operand.
+      New `KwSome` keyword (`internal/parser/token.go`/`keywords.go`,
+      unreserved like `KwAny`); `parser.InExpr`/`planner.InExpr` gained
+      `AllOp bool` alongside the existing `AnyOp`; `parseAnyTail`
+      (`internal/parser/select.go`) now also accepts a `SELECT` operand
+      mirroring `parseInTail`; a new dispatch block in `parseExprPrec`
+      covers `<`/`>`/`<=`/`>=` × ANY/SOME/ALL and `!=`/`<>` ALL (the
+      pre-existing `=`/`!=`/`<>`/regex ANY blocks were extended in place
+      for SOME/ALL rather than rewritten). `internal/executor/expr.go`'s
+      `evalInExpr` gained an AND-semantics ALL branch; the subquery operand
+      needed zero new executor plumbing (`collectInValues` already drains
+      an arbitrary single-column subquery for `IN (subquery)`). Tests:
+      `internal/parser/any_all_test.go`, `internal/executor/any_all_test.go`.
+      Design: `docs/design/0003-0008-subqueries.md` new Follow-up section
+      (also removed the stale "ANY / SOME / ALL... deferred" out-of-scope
+      line); `docs/design/README.md` row updated in place. Known limitation
+      (not fixed, matches a pre-existing ANY simplification kept
+      consistent): NULL elements are skipped rather than fully
+      three-valued (see design doc).
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

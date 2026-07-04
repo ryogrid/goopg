@@ -220,6 +220,9 @@ const (
 	KwParallel Keyword = "parallel"
 	KwLateral  Keyword = "lateral"
 	KwAny      Keyword = "any"
+	// M0122-0004: SOME is a synonym for ANY in scalar-array comparisons
+	// (`expr op SOME (...)`); accepted everywhere KwAny is.
+	KwSome Keyword = "some"
 
 	// M0095-0005: REINDEX statement stub.
 	KwReindex Keyword = "reindex"
@@ -382,6 +385,7 @@ var keywords = map[string]Keyword{
 	"parallel":     KwParallel,
 	"lateral":      KwLateral,
 	"any":          KwAny,
+	"some":         KwSome,
 	"reindex":      KwReindex,
 	"cluster":      KwCluster,
 	"prepare":      KwPrepare,

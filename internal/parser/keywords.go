@@ -94,6 +94,7 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwCall:         KwCatUnreserved,
 	KwFreeze:       KwCatUnreserved,
 	KwAny:          KwCatUnreserved,
+	KwSome:         KwCatUnreserved,
 	KwParallel:     KwCatUnreserved,
 	KwReindex:      KwCatUnreserved,
 	KwCluster:      KwCatUnreserved,
