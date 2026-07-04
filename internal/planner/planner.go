@@ -4980,6 +4980,28 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 			outTyp = inputTyp
 		}
 		return WindowFunc{pos: fc.Pos(), Name: name, Type: outTyp, Args: []Expr{argResolved}, Filter: filterExpr, InputType: inputTyp}, nil
+	case "first_value", "last_value":
+		if fc.Star || fc.Distinct || len(fc.Args) != 1 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() requires exactly one argument", name)}
+		}
+		argResolved, err := resolveExprForWindowInput(fc.Args[0], inputCtx, agg)
+		if err != nil {
+			return WindowFunc{}, err
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: inferExprType(argResolved), Args: []Expr{argResolved}}, nil
+	case "nth_value":
+		if fc.Star || fc.Distinct || len(fc.Args) != 2 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "window function nth_value() requires exactly two arguments"}
+		}
+		args := make([]Expr, 0, 2)
+		for _, a := range fc.Args {
+			resolved, err := resolveExprForWindowInput(a, inputCtx, agg)
+			if err != nil {
+				return WindowFunc{}, err
+			}
+			args = append(args, resolved)
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: inferExprType(args[0]), Args: args}, nil
 	default:
 		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
 	}

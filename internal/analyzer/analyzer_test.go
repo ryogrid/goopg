@@ -131,12 +131,43 @@ func TestAnalyzeWindowFunctionAccepted(t *testing.T) {
 
 func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
-	// count(*) OVER () is now supported (M0122-0004 frame-consuming
-	// aggregates) — first_value() is a real PostgreSQL window function
-	// still unimplemented in v0, so it remains the rejection case.
+	// count(*) OVER () and first_value/last_value/nth_value are now
+	// supported (M0122-0004) — ntile() is a real PostgreSQL window
+	// function still unimplemented in v0, so it remains the rejection case.
 	expectAnalyzeCode(t, cat,
-		"SELECT first_value(aid) OVER () FROM pgbench_accounts",
+		"SELECT ntile(4) OVER () FROM pgbench_accounts",
 		"0A000")
+}
+
+// TestAnalyzeWindowValueFunctionsAccepted pins the M0122-0004
+// first_value/last_value/nth_value window functions.
+func TestAnalyzeWindowValueFunctionsAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT first_value(abalance) OVER (ORDER BY aid) FROM pgbench_accounts",
+		"SELECT last_value(abalance) OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts",
+		"SELECT nth_value(abalance, 2) OVER (ORDER BY aid) FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowValueFunctionsRejected pins the argument-shape checks
+// for first_value/last_value/nth_value.
+func TestAnalyzeWindowValueFunctionsRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT first_value(*) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT last_value(abalance, aid) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT nth_value(abalance) OVER () FROM pgbench_accounts",
+		"42601")
 }
 
 // TestAnalyzeWindowAggregateFunctionsAccepted pins the M0122-0004

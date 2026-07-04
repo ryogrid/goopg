@@ -423,16 +423,46 @@ mirroring M0119's ledger `status` column.
       `unimplemented_feat.json`'s frame-clause entry annotated in
       place (frame clauses themselves remain confirmed-open — this
       slice only gives them a real consumer for a future loop).
+      **first_value/last_value/nth_value removed from this bucket
+      (2026-07-05, this loop):** implemented all three as window
+      functions on the same default-frame infra the previous slice
+      built. `buildWindowFunc`/`analyzeWindowFuncCall` gained
+      `first_value`/`last_value` (1 arg) and `nth_value` (2 args)
+      cases mirroring `lag`/`lead`'s arg-shape checks. Executor
+      (`operators_window.go`) adds a per-partition `frameEnd[]` array
+      (gated by `hasFrameValueWindowFunc`) derived from the existing
+      `peerGroupBounds` — no new frame-bounds computation needed:
+      `first_value` reads the partition head (`o.rows[pStart]`),
+      `last_value` reads the current row's peer-group tail
+      (`o.rows[frameEnd[localIdx]-1]`), `nth_value` evaluates its `n`
+      argument per row (like `lag`/`lead`'s offset), rejects `n <= 0`
+      with `22016` (matches `window_nth_value` in
+      `postgres/src/backend/utils/adt/windowfuncs.c` exactly, error
+      text included), and returns `NULL` once `pStart+n-1` reaches or
+      passes the frame end. Tests:
+      `internal/analyzer/analyzer_test.go`
+      (`TestAnalyzeWindowValueFunctionsAccepted`,
+      `TestAnalyzeWindowValueFunctionsRejected`;
+      `TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+      `ntile()` since `first_value()` is no longer a valid rejection
+      case), `internal/executor/window_compat_test.go`
+      (`TestCompatWindowValueFunctionsDefaultFrame`,
+      `TestCompatWindowNthValueOutOfFrameAndInvalidN`) — cross-checked
+      row-for-row (incl. the `nth_value(val,0)` error text) against a
+      scratch upstream PostgreSQL 18.3 instance. Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
+      section; `docs/design/README.md` row extended;
+      `unimplemented_feat.json` entry updated in place.
       **Still open in this bucket:** frame clause parsing/execution
-      itself (ROWS/RANGE/GROUPS — now has a real consumer:
-      `evalFrameAggFuncs`'s `peerGroupBounds` could generalize into an
-      arbitrary frame-bounds function); combining forms (`OVER (win
+      itself (ROWS/RANGE/GROUPS — now has two real consumers:
+      `evalFrameAggFuncs`/`frameEnd` computation could generalize into
+      an arbitrary frame-bounds function); combining forms (`OVER (win
       ORDER BY ...)`, a named window based on another named window) are
       also out of scope (real upstream syntax, deferred — see design doc);
-      `first_value`/`last_value`/`nth_value`/`ntile`/`cume_dist`/
-      `percent_rank` as window functions remain unimplemented.
-      GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause parsing, intervals also
-      remain.
+      `ntile`/`cume_dist`/`percent_rank` as window functions remain
+      unimplemented (they exist only as `WITHIN GROUP` ordered-set
+      aggregates today, a different code path). GROUPING
+      SETS/ROLLUP/CUBE, DEFAULT-clause parsing, intervals also remain.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

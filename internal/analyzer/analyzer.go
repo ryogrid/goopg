@@ -1408,6 +1408,27 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 		case "min", "max":
 			retType = argTyp
 		}
+	case "first_value", "last_value":
+		if x.Star || x.Distinct || len(x.Args) != 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() requires exactly one argument", name))
+		}
+		valueTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		retType = valueTyp
+	case "nth_value":
+		if x.Star || x.Distinct || len(x.Args) != 2 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", "window function nth_value() requires exactly two arguments")
+		}
+		valueTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Args[1], ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		retType = valueTyp
 	default:
 		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
 	}

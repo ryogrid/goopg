@@ -314,3 +314,56 @@ frame clause into `evalFrameAggFuncs` by generalizing
 an explicit frame clause with row_number/rank/lag/lead (which
 PostgreSQL rejects — those functions cannot have a non-default
 frame) is not yet enforced since frame clauses aren't parsed at all.
+
+## Follow-up: first_value/last_value/nth_value (2026-07-05, M0122-0004)
+
+Implemented `first_value`/`last_value`/`nth_value` as window functions,
+reusing the same default-frame infrastructure the previous Follow-up
+section built for `sum`/`count`/`avg`/`min`/`max`. Per spec (and
+`window_first_value`/`window_last_value`/`window_nth_value` in
+`postgres/src/backend/utils/adt/windowfuncs.c`), these evaluate their
+value expression at a specific row of the frame rather than
+accumulating over it: `first_value` at the frame head, `last_value`
+at the frame tail, `nth_value(expr, n)` at the n-th row from the frame
+head (1-based, `NULL` if `n` is beyond the frame).
+
+**AST/planner:** `buildWindowFunc` (`internal/planner/planner.go`)
+gained `"first_value"`/`"last_value"` (exactly one argument, no
+DISTINCT/star, return type = argument type via `inferExprType` — same
+pattern as `lag`/`lead`) and `"nth_value"` (exactly two arguments:
+value expression and `n`) cases. `analyzeWindowFuncCall`
+(`internal/analyzer/analyzer.go`) mirrors the same arg-shape checks.
+
+**Executor:** `internal/executor/operators_window.go`'s default frame
+end (for a row's own peer group) is exactly the boundary
+`evalFrameAggFuncs`'s `peerGroupBounds` already computes, so no new
+frame-bounds logic was needed — only a new `frameEnd[]` per-partition
+array (`hasFrameValueWindowFunc` gates its computation) mapping each
+row's local index to its peer group's exclusive end, built once per
+partition from the existing `peerGroupBounds` output. Given that:
+`first_value` reads `o.rows[pStart]` (frame head is always the
+partition start, since the default frame has no upper-bound-only
+variant these functions would need); `last_value` reads
+`o.rows[frameEnd[localIdx]-1]`; `nth_value` evaluates its `n`
+argument per current row (same as `lag`/`lead`'s offset), rejects
+`n <= 0` with `22016` (`argument of nth_value must be greater than
+zero`, matching `window_nth_value`'s `ERRCODE_INVALID_ARGUMENT_FOR_
+NTH_VALUE` exactly), and returns `NULL` when `pStart + n - 1` falls
+at or past the frame end.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowValueFunctionsAccepted`,
+`TestAnalyzeWindowValueFunctionsRejected`;
+`TestAnalyzeWindowFunctionUnsupportedRejected` repointed at `ntile()`
+since `first_value()` is no longer a valid rejection case),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowValueFunctionsDefaultFrame`,
+`TestCompatWindowNthValueOutOfFrameAndInvalidN`) — cross-checked
+row-for-row (including the `nth_value(val, 0)` error text) against a
+scratch upstream PostgreSQL 18.3 instance.
+
+**Still open:** `ntile`/`cume_dist`/`percent_rank` as window functions
+remain unimplemented (they exist today only as `WITHIN GROUP`
+ordered-set aggregates, a different code path). ROWS/RANGE/GROUPS
+frame-clause parsing/execution itself is still the largest remaining
+piece of this bucket — see the previous Follow-up section.

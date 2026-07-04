@@ -164,6 +164,26 @@ func (o *windowOp) evalWindowFuncs() error {
 			return err
 		}
 
+		// frameEnd[i-pStart] is the exclusive end of the peer group
+		// containing row i — the default-frame end (RANGE UNBOUNDED
+		// PRECEDING AND CURRENT ROW) that first_value/last_value/
+		// nth_value need. Only computed when one of those functions is
+		// actually present.
+		var frameEnd []int
+		if hasFrameValueWindowFunc(o.plan.Funcs) {
+			groupBounds, err := o.peerGroupBounds(pStart, pEnd)
+			if err != nil {
+				return err
+			}
+			frameEnd = make([]int, pEnd-pStart)
+			for g := 0; g < len(groupBounds)-1; g++ {
+				gStart, gEnd := groupBounds[g], groupBounds[g+1]
+				for i := gStart; i < gEnd; i++ {
+					frameEnd[i-pStart] = gEnd
+				}
+			}
+		}
+
 		for i := pStart; i < pEnd; i++ {
 			rowNum++
 			if i > pStart {
@@ -222,6 +242,42 @@ func (o *windowOp) evalWindowFuncs() error {
 					}
 				case "sum", "count", "avg", "min", "max":
 					// Already computed per-frame in evalFrameAggFuncs above.
+				case "first_value":
+					v, err := evalExpr(fn.Args[0], o.rows[pStart], o.ctx)
+					if err != nil {
+						return err
+					}
+					o.rows[i][colIdx] = v
+				case "last_value":
+					tailIdx := frameEnd[localIdx] - 1
+					v, err := evalExpr(fn.Args[0], o.rows[tailIdx], o.ctx)
+					if err != nil {
+						return err
+					}
+					o.rows[i][colIdx] = v
+				case "nth_value":
+					nVal, err := evalExpr(fn.Args[1], o.rows[i], o.ctx)
+					if err != nil {
+						return err
+					}
+					if nVal.IsNull() {
+						o.rows[i][colIdx] = NullDatum
+						continue
+					}
+					if nVal.Kind != KindInt || nVal.Int <= 0 {
+						return &ExecError{Code: "22016", Pos: fn.Pos(), Message: "argument of nth_value must be greater than zero"}
+					}
+					targetLocal := int(nVal.Int) - 1 // offset from frame head (pStart)
+					target := pStart + targetLocal
+					if target >= frameEnd[localIdx] {
+						o.rows[i][colIdx] = NullDatum
+						continue
+					}
+					v, err := evalExpr(fn.Args[0], o.rows[target], o.ctx)
+					if err != nil {
+						return err
+					}
+					o.rows[i][colIdx] = v
 				default:
 					return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
 				}
@@ -239,6 +295,19 @@ func isFrameAggWindowFunc(name string) bool {
 	switch strings.ToLower(name) {
 	case "sum", "count", "avg", "min", "max":
 		return true
+	}
+	return false
+}
+
+// hasFrameValueWindowFunc reports whether fns contains first_value,
+// last_value, or nth_value — the frame-relative-offset window functions
+// that need the default-frame end (peer-group boundary) computed per row.
+func hasFrameValueWindowFunc(fns []planner.WindowFunc) bool {
+	for _, fn := range fns {
+		switch strings.ToLower(fn.Name) {
+		case "first_value", "last_value", "nth_value":
+			return true
+		}
 	}
 	return false
 }
