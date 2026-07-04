@@ -197,9 +197,14 @@ mirroring M0119's ledger `status` column.
       (ledger row): DML-CTE inner nodes (the INSERT/UPDATE/DELETE plan +
       outer body) are Built lazily inside `cteDMLPrefixOp.Open()`, outside
       the `withInstrumentation` scope, so they still don't show actual
-      stats. Still open: SETTINGS rendering (parsed, never emitted),
-      BUFFERS rendering (parsed, never emitted — no buffer hit/read
-      counters exist), `pg_stat_io` (table registered, `VirtualRows`
+      stats. SETTINGS rendering **done** (2026-07-04, later loop):
+      `internal/config/guc.go` gains `FlagExplain` (mirrors `GUC_EXPLAIN`),
+      tagged on the 45 goopg-registered GUCs upstream flags;
+      `SessionRegistry.ExplainVariables()` + `Context.ExplainSettings`
+      (wired in both dispatch.go and dispatch_extended.go) render
+      `Settings: k = 'v', ...` (TEXT) / `"Settings": {...}` (JSON/XML/YAML).
+      Still open: BUFFERS rendering (parsed, never emitted — no buffer
+      hit/read counters exist), `pg_stat_io` (table registered, `VirtualRows`
       always returns nil), `track_io_timing` runtime SET (GUC registered
       but only consulted once at process boot).
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).

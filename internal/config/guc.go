@@ -98,6 +98,11 @@ const (
 	FlagNotInSample
 	// FlagCustom: defined outside the seeded set (placeholder value).
 	FlagCustom
+	// FlagExplain: mirrors guc_tables.c's GUC_EXPLAIN — this variable
+	// affects query planning and is eligible for EXPLAIN (SETTINGS)
+	// once its effective value differs from BootVal. See
+	// get_explain_guc_options / ExplainPrintSettings (explain.c).
+	FlagExplain
 )
 
 // Variable is one GUC. Use NewVariable in BuildDefaultRegistry rather

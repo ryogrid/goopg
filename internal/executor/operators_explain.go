@@ -95,6 +95,7 @@ func (o *explainOp) Open(ctx *Context) error {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
 			}
+			addExplainSettingsGroup(ctx, opts, root)
 			out, err := renderExplainTree(opts.Format, root)
 			if err != nil {
 				return err
@@ -104,6 +105,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		}
 		var b strings.Builder
 		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats)
+		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
 				Row{NewStringDatum(fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs)))},
@@ -119,6 +121,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		// inside the single-element array, matching upstream's
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
 		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
+		addExplainSettingsGroup(ctx, opts, root)
 		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
 			return err
@@ -128,7 +131,47 @@ func (o *explainOp) Open(ctx *Context) error {
 	}
 	var b strings.Builder
 	walkPlan(&b, o.plan.Child, 0, &o.rows, opts)
+	appendExplainSettingsRow(ctx, opts, &o.rows)
 	return nil
+}
+
+// appendExplainSettingsRow adds the upstream `Settings: k = 'v', ...` TEXT
+// line (ExplainPrintSettings in explain.c, non-JSON branch) when EXPLAIN
+// (SETTINGS) was requested and at least one FlagExplain-tagged GUC differs
+// from its built-in default. Unlike the structured formats, PG prints
+// nothing at all — not even an empty "Settings:" label — when the
+// modified-GUC list is empty.
+func appendExplainSettingsRow(ctx *Context, opts parser.ExplainOptions, rows *[]Row) {
+	if !opts.Settings || ctx == nil || ctx.ExplainSettings == nil {
+		return
+	}
+	vals := ctx.ExplainSettings()
+	if len(vals) == 0 {
+		return
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = fmt.Sprintf("%s = '%s'", v.Name, v.Value)
+	}
+	*rows = append(*rows, Row{NewStringDatum("Settings: " + strings.Join(parts, ", "))})
+}
+
+// addExplainSettingsGroup adds the "Settings" object that PG's structured
+// (JSON/XML/YAML) formats always include once SETTINGS is requested — unlike
+// TEXT, the group is present (as an empty object) even with zero modified
+// GUCs, mirroring ExplainPrintSettings's format != EXPLAIN_FORMAT_TEXT branch
+// which has no early return.
+func addExplainSettingsGroup(ctx *Context, opts parser.ExplainOptions, root map[string]any) {
+	if !opts.Settings {
+		return
+	}
+	settings := map[string]any{}
+	if ctx != nil && ctx.ExplainSettings != nil {
+		for _, v := range ctx.ExplainSettings() {
+			settings[v.Name] = v.Value
+		}
+	}
+	root["Settings"] = settings
 }
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }

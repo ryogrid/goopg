@@ -211,6 +211,14 @@ type Context struct {
 	// AllSettings returns the effective SHOW ALL view for this session.
 	AllSettings func() []SettingValue
 
+	// ExplainSettings returns the EXPLAIN (SETTINGS) list: GUCs flagged
+	// FlagExplain whose effective value differs from their built-in
+	// default. Wired by the server from SessionRegistry.ExplainVariables;
+	// nil means EXPLAIN (SETTINGS) always reports no modified GUCs (the
+	// TEXT format then omits the "Settings:" line entirely, matching
+	// upstream's behaviour with zero modified GUCs).
+	ExplainSettings func() []SettingValue
+
 	// GetSettingDisplay and AllSettingsDisplay are the client-visible-display
 	// counterparts of GetSetting/AllSettings — unit-flagged GUCs come back
 	// formatted like real PG's SHOW/current_setting() (e.g. "77MB" rather

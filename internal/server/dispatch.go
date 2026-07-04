@@ -389,6 +389,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			return out
 		}
+		ectx.ExplainSettings = func() []executor.SettingValue {
+			all := sess.ExplainVariables()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
 		ectx.ResetSetting = sess.Reset
 		ectx.ResetAllSettings = sess.ResetAll
 		ectx.BeginLocalTransaction = sess.BeginTransaction

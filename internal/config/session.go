@@ -317,6 +317,40 @@ type ReportableValue struct {
 	Value string
 }
 
+// ExplainVariables returns every FlagExplain variable whose *effective*
+// (session-layered) value differs from its built-in BootVal — the
+// EXPLAIN (SETTINGS) list. Mirrors upstream's get_explain_guc_options
+// (guc.c): only GUCs flagged GUC_EXPLAIN, and only when modified from
+// the compiled-in default (not merely from PGC_S_DEFAULT source).
+// Sorted by name (global.All()'s order) for deterministic output;
+// upstream's guc_nondef_list order reflects modification history
+// instead, which this codebase does not track.
+//
+// BootVal is stored as the raw author-facing literal (e.g. "512MB"),
+// while Value/eff are always canonicalized (e.g. "524288") — comparing
+// eff directly against BootVal would flag nearly every unit-bearing GUC
+// as "modified" even at boot, so BootVal is canonicalized the same way
+// NewVariable canonicalizes the initial Value before the comparison.
+func (s *SessionRegistry) ExplainVariables() []ReportableValue {
+	all := s.global.All()
+	var out []ReportableValue
+	for _, v := range all {
+		if v.Flags&FlagExplain == 0 {
+			continue
+		}
+		bootCanon, err := v.canonicalize(v.BootVal)
+		if err != nil {
+			continue
+		}
+		_, eff, _ := s.Get(v.Name)
+		if eff == bootCanon {
+			continue
+		}
+		out = append(out, ReportableValue{Name: v.Name, Value: eff})
+	}
+	return out
+}
+
 // All returns every variable plus its effective value, for SHOW ALL.
 func (s *SessionRegistry) All() []ReportableValue {
 	all := s.global.All()

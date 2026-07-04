@@ -107,12 +107,76 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 |---|---|
 | FORMAT XML | **done, this loop** |
 | FORMAT YAML | **done, this loop** |
-| SETTINGS rendering | open — parsed (`opts.Settings`/`Set.Settings`), never read in `operators_explain.go`; no "Settings:" line ever emitted |
+| SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
 | BUFFERS rendering | open — parsed (`opts.Buffers`), never read; `nodeStats` has no buffer hit/read counters |
 | `pg_stat_io` | open — table registered (`internal/catalog/catalog.go:6798`, OID 8061) but `VirtualRows` always returns `nil`; no I/O stat collection exists |
 | per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
 | `track_io_timing` runtime `SET` | open — GUC registered `ContextUserset` but only consulted once at process boot (`cmd/goopg/main.go`'s `boolGUC` → `initdb.OpenOptions.TrackIOTiming`), not re-checked per session/query |
 
 Remaining items recorded in `.ralph/deferral_ledger.md` (2026-07-04,
-M0122-0003 row) with resume points. The fix_plan checkbox stays unchecked
+M0122-0003 rows) with resume points. The fix_plan checkbox stays unchecked
 until the rest of the cluster lands.
+
+## SETTINGS rendering (later loop, 2026-07-04)
+
+`EXPLAIN (SETTINGS)` lists GUCs affecting query planning whose value
+differs from their built-in default (`explain.sgml`), mirroring upstream's
+`get_explain_guc_options` (`guc.c`) + `ExplainPrintSettings` (`explain.c`).
+
+**GUC tagging.** `internal/config/guc.go` gains a `FlagExplain` bit
+(mirrors `guc_tables.c`'s `GUC_EXPLAIN`). A full extraction of every
+`GUC_EXPLAIN`-flagged struct in `postgres/src/backend/utils/misc/
+guc_tables.c` found 62 names; `internal/config/defaults.go` tags the 45
+that goopg registers at all (all 24 `enable_*` planner-method toggles —
+including the goopg-only `enable_nestloop_index` for consistency — plus
+`work_mem`, `random_page_cost`, `effective_cache_size`, the four per-tuple
+cost GUCs, `hash_mem_multiplier`, `search_path`, `plan_cache_mode`,
+`jit`/`jit_above_cost`, the two collapse-limit GUCs, `parallel_setup_cost`/
+`parallel_tuple_cost`/`max_parallel_workers_per_gather`/
+`min_parallel_{table,index}_scan_size`/`parallel_leader_participation`,
+`debug_parallel_query`). The other 17 (`geqo*`, `temp_buffers`,
+`maintenance_io_concurrency`, `constraint_exclusion`, etc.) have no goopg
+registry entry at all and are simply unreachable — ledger row below.
+
+**Boot-value comparison bug.** `Variable.BootVal` is the raw author-facing
+literal (e.g. `"512MB"`); `Variable.Value`/the effective value is always
+canonicalized (e.g. `"524288"`) by `NewVariable`/`Set`. A first-draft
+`ExplainVariables()` compared the canonical effective value directly
+against the raw `BootVal` string, which made nearly every unit-bearing
+GUC (`work_mem`, `effective_cache_size`, `random_page_cost`, ...) appear
+"modified" even on a freshly built registry with zero `SET` statements —
+caught by `TestExplainVariablesEmptyByDefault`. Fixed by canonicalizing
+`BootVal` the same way (`v.canonicalize(v.BootVal)`) before comparing.
+
+**Wiring.** `internal/config/session.go`'s `SessionRegistry.
+ExplainVariables()` returns the FlagExplain vars whose session-layered
+effective value differs from the canonicalized boot value, sorted by name
+(deterministic; upstream's `guc_nondef_list` order instead reflects
+modification history, which this codebase doesn't track). A new
+`executor.Context.ExplainSettings func() []SettingValue` field is wired in
+**both** `internal/server/dispatch.go` (simple protocol) and
+`dispatch_extended.go` (extended protocol) to `sess.ExplainVariables()`,
+matching the existing `AllSettings`/`AllSettingsDisplay` wiring pattern.
+
+**Rendering.** `internal/executor/operators_explain.go` adds two helpers
+called from all four `explainOp.Open` branches (ANALYZE/non-ANALYZE ×
+TEXT/structured):
+- `appendExplainSettingsRow` — TEXT: one `Settings: k = 'v', k2 = 'v2'`
+  row appended after the plan (and, under ANALYZE, before the Planning/
+  Execution Time rows — mirrors `ExplainPrintSettings` running inside
+  `ExplainPrintPlan`, itself called before the timing summary in
+  `ExplainOnePlan`). Omitted entirely when the modified-GUC list is empty,
+  matching `ExplainPrintSettings`'s TEXT-branch `if (num <= 0) return`.
+- `addExplainSettingsGroup` — JSON/XML/YAML: a `"Settings"` key sibling
+  to `"Plan"` at the top level, always present (as `{}` when nothing is
+  modified) once SETTINGS is requested — the structured-format branch of
+  `ExplainPrintSettings` has no early return, unlike TEXT. No format-
+  specific code needed: `writeXMLKeyedValue`/`writeYAMLKeyedValue` already
+  handle a `map[string]any` leaf generically (existing FORMAT XML/YAML
+  infra from the section above).
+
+**Tests:** `internal/executor/explain_settings_test.go` (TEXT
+default-omitted, TEXT with/without modified GUCs, JSON always-present-group,
+JSON with modified GUCs, ANALYZE placement before Planning Time).
+`internal/config/guc_test.go`: `TestExplainVariablesEmptyByDefault`,
+`TestExplainVariablesReportsModifiedPlannerGUC`.
