@@ -37,6 +37,7 @@ func TestPgAuthidSyncLoadRoundTrip(t *testing.T) {
 	cat1.SetRoleAttrs("wpuser", catalog.RoleAttrs{
 		CanLogin: true, Superuser: false, CredType: 3, Secret: testVerifier,
 		CreateDB: true, CreateRole: true, Replication: true, BypassRLS: true, ConnLimit: 42,
+		ValidUntil: "2030-01-01 00:00:00+00",
 	})
 	if err := executor.SyncPgAuthidFile(dir, cat1); err != nil {
 		_ = rt1.Close()
@@ -67,11 +68,14 @@ func TestPgAuthidSyncLoadRoundTrip(t *testing.T) {
 		t.Errorf("wpuser attrs = %+v, want CanLogin=true Super=false CredType=3 verifier preserved", attrs)
 	}
 	// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit round-trip through
-	// the pg_authid heap file itself (DU-002 slice 439 follow-up) — unlike
-	// ValidUntil, which is deliberately NOT persisted there yet (see
-	// buildAuthidUserRow's doc comment) and so is not asserted here.
+	// the pg_authid heap file itself (DU-002 slice 439 follow-up); ValidUntil
+	// now round-trips too (DU-002 slice 439 triage item 1 follow-up —
+	// buildAuthidUserRow/ReadPgAuthidRows encode/decode a real timestamptz).
 	if !attrs.CreateDB || !attrs.CreateRole || !attrs.Replication || !attrs.BypassRLS || attrs.ConnLimit != 42 {
 		t.Errorf("wpuser attrs = %+v, want CreateDB/CreateRole/Replication/BypassRLS=true ConnLimit=42", attrs)
+	}
+	if attrs.ValidUntil != "2030-01-01 00:00:00+00" {
+		t.Errorf("wpuser attrs.ValidUntil = %q, want %q", attrs.ValidUntil, "2030-01-01 00:00:00+00")
 	}
 	// Predefined pg_* roles resolve (RoleExists/RoleOID — M0119-0004-ACLHEAP's
 	// dedicated predefinedRoles map, populated at InMemory construction, not

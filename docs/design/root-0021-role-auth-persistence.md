@@ -136,19 +136,12 @@ attribute in this design, with one exception:
   `internal/initdb/role_ddl_recovery.go`) carries ALL six new fields.
 - `executor.SyncPgAuthidFile`/`ReadPgAuthidRows`/`initdb.LoadRolesFromAuthidHeap`
   (the durable base, `global/1260`) carry the four bools + `ConnLimit`
-  through `buildAuthidUserRow`'s expanded signature, but deliberately do
-  **NOT** round-trip `ValidUntil`: the heap column is a real
-  `timestamptz` (matching PG's `pg_authid.rolvaliduntil` layout for a real
-  PG18 standby reading the file), and encoding an arbitrary
-  `VALID UNTIL` literal into that binary representation needs a full
-  PG-timestamp-literal parser (`PGTimestampIn`-equivalent) that doesn't
-  exist yet — a materially bigger, separate task. `rolvaliduntil` in the
-  heap file is unconditionally `NULL` now (previously it was, oddly, Unix
-  epoch `1970-01-01` for every non-predefined row — an unrelated latent bug
-  fixed in the same pass since it's the exact field this change touches).
-  **Consequence:** `VALID UNTIL` survives a WAL-tail replay (crash
-  recovery) but is lost across a clean restart after the WAL segment
-  carrying it has been pruned by a checkpoint — see the deferral ledger.
+  through `buildAuthidUserRow`'s expanded signature. `ValidUntil` originally
+  did **NOT** round-trip through the heap column (it stayed unconditionally
+  `NULL`, previously it was, oddly, Unix epoch `1970-01-01` for every
+  non-predefined row — an unrelated latent bug fixed in the same pass since
+  it's the exact field this change touches) — **closed by the "Follow-up:
+  `VALID UNTIL` heap round-trip" section below.**
 
 `catalog.go`'s `pg_authid` `VirtualRows` (the live SQL-visible table
 `pg_dump`/`pg_dumpall` actually query — not the heap file, see the file's own
@@ -200,3 +193,41 @@ Tests: `internal/server/role_ddl_rename_test.go` (parsing +
 preservation) + case (e) added to `TestPort_CreateRoleSurvivesRestart`
 (`internal/testport/role_auth_durability_test.go`: rename survives a real
 cluster restart, old name gone, attributes carried to the new name).
+
+## Follow-up: `VALID UNTIL` heap round-trip (DU-002 slice 439 triage item 1
+follow-up)
+
+Closes the residual named above — `rolvaliduntil` was unconditionally
+written as `NULL` to the pg_authid heap file, so a `VALID UNTIL` value set
+by `ALTER ROLE` reverted to no-expiration after a clean restart once the WAL
+segment carrying its crash-tail record was pruned by a checkpoint.
+
+The blocker the original row cited — no PG-timestamp-literal parser exists —
+turned out to be already solved elsewhere: `parseCopyTimestamp`
+(`internal/executor/copy_text.go`) already parses every layout PG's own
+`timestamptz_in` commonly produces (used today for `COPY` text input and
+generic `timestamptz`-column literal coercion, `codec.go`'s `encodeValuePG`
+switch). `buildAuthidUserRow` (`internal/executor/pg_authid_sync.go`) now
+parses `validUntil` with it and, on success, writes a real `timestamptz`
+column value (`NewTimeDatum`) instead of `NullDatum`; `ReadPgAuthidRows`
+decodes it back via a new `formatValidUntilText` helper that renders the
+same `"YYYY-MM-DD HH:MM:SS[.ffffff]+00"` text shape
+`extractRoleValidUntil` (`internal/server/role_ddl.go`) captures from the
+original `VALID UNTIL '...'` literal (goopg stores the column as UTC
+internally, so the zone suffix is always `+00`).
+
+**Deliberately still deferred, narrower than the original gap:** PG's
+`infinity`/`-infinity` timestamptz sentinels (and any other literal
+`parseCopyTimestamp` can't parse) still fall back to `NULL` in the heap
+file — goopg's `timestamptz` type has no infinity representation anywhere
+in the engine yet (encode/decode, comparison, arithmetic), so teaching just
+this one column about it would be an inconsistent, narrow carve-out. A
+`VALID UNTIL 'infinity'` role still round-trips correctly through the WAL
+crash-tail + live `RoleAttrs` sidecar (unchanged), only the heap-file base
+loses it across a checkpoint-pruned clean restart — see the deferral
+ledger for the resume point (full engine-wide timestamptz infinity support).
+
+Tests: `internal/initdb/role_ddl_recovery_test.go`'s
+`TestPgAuthidSyncLoadRoundTrip` extended to set and assert a `ValidUntil`
+value survives a real heap-file round trip across `Open` cycles (previously
+explicitly NOT asserted, per the stale comment this loop removed).

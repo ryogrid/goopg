@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
@@ -153,7 +154,7 @@ func ReadPgAuthidRows(dataDir string) ([]DecodedAuthidRow, error) {
 				d.HasPasswd = d.Password != ""
 			}
 			if !row[11].IsNull() {
-				d.ValidUntil = row[11].StringValue()
+				d.ValidUntil = formatValidUntilText(row[11].TimeValue())
 			}
 			if d.Rolname == "" {
 				continue
@@ -165,13 +166,21 @@ func ReadPgAuthidRows(dataDir string) ([]DecodedAuthidRow, error) {
 }
 
 // buildAuthidUserRow builds a bootstrap-shaped (non-null, xmin=1) pg_authid
-// row for a runtime role. Mirrors buildBootstrapRow in initdb.go. rolvaliduntil
-// is always NULL: goopg's role-DDL attribute set doesn't round-trip a real
-// timestamptz value through this heap file yet (VALID UNTIL is tracked in
-// the live RoleAttrs sidecar + WAL crash-tail only — see the deferral
-// ledger), so persisting anything other than NULL here would be worse than
-// the honest gap.
-func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword string) Row {
+// row for a runtime role. Mirrors buildBootstrapRow in initdb.go.
+// rolvaliduntil is encoded as a real timestamptz when validUntil parses as a
+// concrete instant (DU-002 slice 439 triage item 1 follow-up — closes the
+// "always NULL" gap this doc comment used to describe); PG's `infinity`/
+// `-infinity` sentinels and any other unparseable literal still fall back to
+// NULL, since goopg's timestamptz type has no infinity representation yet
+// (see the deferral ledger) — narrower than the original gap, which lost
+// every VALID UNTIL value, not just the sentinel ones.
+func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword, validUntil string) Row {
+	validUntilDatum := NullDatum
+	if validUntil != "" {
+		if t, err := parseCopyTimestamp(validUntil); err == nil {
+			validUntilDatum = NewTimeDatum(t)
+		}
+	}
 	return Row{
 		NewIntDatum(oid),
 		NewStringDatum(rolname),
@@ -184,8 +193,20 @@ func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, cr
 		NewBoolDatum(bypassRLS),
 		NewIntDatum(int64(connLimit)),
 		NewStringDatum(rolpassword),
-		NullDatum,
+		validUntilDatum,
 	}
+}
+
+// formatValidUntilText renders a decoded rolvaliduntil timestamptz back into
+// the same "YYYY-MM-DD HH:MM:SS[.ffffff]+00" text form extractRoleValidUntil
+// captures from a `VALID UNTIL '...'` literal (goopg stores rolvaliduntil as
+// UTC internally, so the zone suffix is always "+00").
+func formatValidUntilText(t time.Time) string {
+	t = t.UTC()
+	if t.Nanosecond() != 0 {
+		return t.Format("2006-01-02 15:04:05.000000+00")
+	}
+	return t.Format("2006-01-02 15:04:05+00")
 }
 
 // SyncPgAuthidFile atomically rebuilds global/1260 from the catalog role
@@ -228,13 +249,15 @@ func SyncPgAuthidFile(dataDir string, cat *catalog.InMemory) error {
 	// sidecar entry overrides them.
 	superCreateDB, superCreateRole, superReplication, superBypassRLS := true, true, true, true
 	superConnLimit := int32(-1)
+	superValidUntil := ""
 	if a, ok := cat.LookupRoleAttrs("postgres"); ok {
 		superCreateDB, superCreateRole = a.CreateDB, a.CreateRole
 		superReplication, superBypassRLS = a.Replication, a.BypassRLS
 		superConnLimit = a.ConnLimit
+		superValidUntil = a.ValidUntil
 	}
 	tuples := []encTuple{{row: buildAuthidUserRow(10, superName, true, true,
-		superCreateDB, superCreateRole, superReplication, superBypassRLS, superConnLimit, superVerifier)}}
+		superCreateDB, superCreateRole, superReplication, superBypassRLS, superConnLimit, superVerifier, superValidUntil)}}
 	for _, rs := range cat.AllRoleStates() {
 		secret := ""
 		if rs.Attrs.CredType != 0 {
@@ -243,11 +266,11 @@ func SyncPgAuthidFile(dataDir string, cat *catalog.InMemory) error {
 		tuples = append(tuples, encTuple{
 			row: buildAuthidUserRow(int64(rs.OID), rs.Name, rs.Attrs.Superuser, rs.Attrs.CanLogin,
 				rs.Attrs.CreateDB, rs.Attrs.CreateRole, rs.Attrs.Replication, rs.Attrs.BypassRLS,
-				rs.Attrs.ConnLimit, secret),
+				rs.Attrs.ConnLimit, secret, rs.Attrs.ValidUntil),
 		})
 	}
 	for _, p := range pgAuthidPredefined {
-		row := buildAuthidUserRow(p.oid, p.name, false, false, false, false, false, false, -1, "")
+		row := buildAuthidUserRow(p.oid, p.name, false, false, false, false, false, false, -1, "", "")
 		row[3] = NewBoolDatum(true) // rolinherit
 		row[10] = NullDatum         // rolpassword NULL
 		tuples = append(tuples, encTuple{row: row, frozen: true})
