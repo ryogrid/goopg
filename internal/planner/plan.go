@@ -1232,6 +1232,23 @@ type PgOptionsToTable struct {
 func (n *PgOptionsToTable) Pos() int       { return n.pos }
 func (n *PgOptionsToTable) Output() Schema { return n.schema }
 
+// FromRegexpMatches is the FROM-clause SRF plan node for
+// FROM regexp_matches(string, pattern[, flags]). Unlike RegexpMatchesCol
+// (SELECT-list position), this produces its own range-table entry with a
+// single text[] output column — one row per match when flags contains 'g',
+// otherwise at most one row, zero rows on no match (matches PG's SRF
+// row-count semantics, not the scalar fallback's NULL). M0122-0002 follow-up.
+type FromRegexpMatches struct {
+	pos         int
+	StringExpr  Expr
+	PatternExpr Expr
+	FlagsExpr   Expr // nil when not given
+	schema      Schema
+}
+
+func (n *FromRegexpMatches) Pos() int       { return n.pos }
+func (n *FromRegexpMatches) Output() Schema { return n.schema }
+
 // VerifyHeapam is the FROM-clause SRF plan node for amcheck's
 // verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries
 // the relation argument plus the optional startblock / endblock block-range

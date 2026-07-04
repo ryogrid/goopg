@@ -68,6 +68,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newPgPartitionTreeOp(p)), nil
 	case *planner.PgOptionsToTable:
 		return maybeInstrument(p, newPgOptionsToTableOp(p)), nil
+	case *planner.FromRegexpMatches:
+		return maybeInstrument(p, newFromRegexpMatchesOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls

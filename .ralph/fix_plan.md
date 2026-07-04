@@ -191,8 +191,22 @@ mirroring M0119's ledger `status` column.
       PostgreSQL 18.3 cluster (`'g'` flag → one row per match, no flag → at
       most the first match, no match → **zero** rows, unlike the scalar
       fallback's NULL). Tests: `internal/executor/regexp_matches_srf_test.go`.
-      Still deferred: the FROM-clause form (`FROM regexp_matches(...)`) is
-      unwired — ledger row.
+      **Follow-up (2026-07-04, later loop):** the FROM-clause form
+      (`FROM regexp_matches(...)`) now lands too — `FromRegexpMatches` plan
+      node + `planFromRegexpMatches` (`internal/planner/planner.go`,
+      dispatched from `planTableFuncRangeVar` alongside `unnest`), executed
+      by `fromRegexpMatchesOp`
+      (`internal/executor/operators_from_regexp_matches.go`) reusing
+      `evalRegexpMatchesSRF`. Single `text[]` column, default name
+      `regexp_matches`, supports `AS alias(col)` and `WITH ORDINALITY`.
+      Tests: `internal/executor/from_regexp_matches_test.go`. Discovered
+      (not fixed — separate ledger row) two generic, unnest-shared gaps:
+      `WITH ORDINALITY AS t(m, n)` fails when both columns are named
+      explicitly in the outer SELECT list (`*` works), and a same-level
+      comma/LATERAL join correlating a FROM-clause SRF arg to a preceding
+      sibling FROM item's column fails (`ctx.OuterRows` unwired for that
+      execution path) — M0122-0002 is now fully closed; those two are
+      independent cross-cutting gaps, see ledger.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE

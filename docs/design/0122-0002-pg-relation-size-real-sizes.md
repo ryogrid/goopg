@@ -163,12 +163,58 @@ Gates: `go build ./...`/`go vet ./...` clean; `go test
 shared `ProjectSet`/`buildSelectSrfProjectSet` planner path — see
 `.ralph/working_set.md` for the result recorded this loop.
 
-**Still deferred:** the FROM-clause form (`SELECT * FROM
-regexp_matches(...)`) is not wired — that needs a `planFromRegexpMatches`
-counterpart to `planFromUnnest`/`planFromGenerateSeries`
-(`internal/planner/planner.go`), analogous to how `unnest`/`generate_series`
-each have both a target-list path (this doc) and a FROM-clause path. Ledger
-row appended (`.ralph/deferral_ledger.md`, M0122-0002).
+**Still deferred (at the time of the previous loop):** the FROM-clause form
+(`SELECT * FROM regexp_matches(...)`) was not wired — closed by the
+follow-up below.
+
+## Follow-up: `regexp_matches` FROM-clause SRF form (2026-07-04, later loop)
+
+`FROM regexp_matches(string, pattern[, flags])` now plans as its own
+row-producing source, analogous to how `unnest`/`generate_series` each have
+both a target-list path (above) and a FROM-clause path:
+
+- `internal/planner/plan.go` gains `FromRegexpMatches` (`StringExpr`,
+  `PatternExpr`, `FlagsExpr`, single `text[]`-typed output column).
+- `internal/planner/planner.go`'s `planFromRegexpMatches`, dispatched from
+  `planTableFuncRangeVar` alongside `unnest`/`pg_options_to_table`. Default
+  output column name `regexp_matches` (matches real PG's own default —
+  verified against a real PostgreSQL 18.3 cluster), overridable via
+  `AS alias(col)`; `WITH ORDINALITY` supported via the existing
+  `wrapOrdinality` helper.
+- `internal/executor/operators_from_regexp_matches.go`'s `fromRegexpMatchesOp`
+  reuses the same `evalRegexpMatchesSRF` the SELECT-list form added — no new
+  match-expansion logic, only a new physical source node/operator.
+
+Row-count semantics are identical to the SELECT-list form (one row per
+match with `'g'`, at most one otherwise, zero rows on no match — verified
+against real PG: `FROM regexp_matches('foobarbequebaz', '(bar)(beque)')` →
+1 row; the same pattern with `'g'` against a doubled subject → 2 rows;
+`FROM regexp_matches('nomatch', 'xyz')` → 0 rows).
+
+Tests: `internal/executor/from_regexp_matches_test.go` (`TestFromRegexpMatches`).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2 rows,
+Q13=33 rows).
+
+**Newly discovered, NOT fixed here (separate ledger row, M0122-0002
+FROM-clause follow-up):** two generic gaps that reproduce identically with
+plain `unnest` (confirmed via control tests), so they predate and are
+unrelated to this specific change:
+1. `WITH ORDINALITY AS t(m, n)` — naming both aliased columns explicitly in
+   the outer `SELECT m, n FROM ...` list fails `42703: column "n" does not
+   exist`, while `SELECT *` over the identical FROM item resolves fine.
+2. A same-level comma-join (or explicit `LATERAL`) correlating a FROM-clause
+   SRF's argument to a *preceding sibling* FROM item's column fails
+   (`XX000: column ref ... on nil slot`) — `ctx.OuterRows` appears to only
+   get wired for subquery-based correlation (e.g. `pg_options_to_table`'s
+   documented pg_dump usage), not a top-level multi-item `FROM a, b`
+   nested-loop. This blocks the realistic pg_dump-style
+   `FROM tbl, regexp_matches(tbl.col, ...) AS t(m)` idiom.
+
+Both are cross-cutting FROM-list/target-list resolution gaps shared by every
+FROM-clause SRF, not specific to `regexp_matches` — out of scope for this
+loop's bounded pick; see `.ralph/deferral_ledger.md` for resume points.
 
 ## Deferred / out of scope
 
