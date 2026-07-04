@@ -5379,6 +5379,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 		"language", "access", "event",
 		"group", "role", "user",
 		"conversion", // M0097-0071
+		"statistics", // DU-002 restart-persistence follow-up (previously unparsed)
 	} {
 		if p.acceptIdentKeyword(objType) {
 			// "materialized view" is two words; VIEW is a keyword token, not ident. M0097-0038.

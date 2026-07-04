@@ -13630,3 +13630,83 @@ whether the enclosing implicit batch transaction ultimately commits. Not
 fixed here: this is a WAL/MVCC-class transaction-atomicity bug (practice
 card: race detector + recovery/replication gates), not a parser-grammar
 change, and reproduces without any of this slice's diff.
+
+### `CREATE`/`DROP STATISTICS` WAL/restart persistence + `DROP STATISTICS`
+support (loop #96, DU-002 slice 445)
+
+Closes resume point (2) of the slice-441 ledger row: statistics objects
+(`pg_statistic_ext`) were never WAL-logged at all, since `CREATE STATISTICS`
+itself first landed (M0097-0023) — the object lived only in
+`catalog.InMemory.statisticsObjs`, so it silently vanished on restart and
+any subsequent `ALTER STATISTICS` mutation (slice 441) had nothing durable
+to attach to. While scoping the fix, auditing `DROP STATISTICS` found it was
+**entirely unparsed** — no grammar rule in `internal/parser/ddl.go`
+`parseDrop` matched the `STATISTICS` keyword at all, so
+`DROP STATISTICS name` failed with a plain syntax error. This is a
+prerequisite discovery, not introduced by this slice: a restart-durable
+`CREATE STATISTICS` needs a working `DROP STATISTICS` to test the pair, and
+pg_dump/regress fixtures (`postgres/src/test/regress/sql/stats_ext.sql`) use
+`DROP STATISTICS` throughout.
+
+**Landed**, mirroring the `CREATE`/`DROP COLLATION` precedent
+(`RecordKindCreateCollation`/`RecordKindDropCollation`, kinds 42/43) exactly:
+
+- `internal/parser/ddl.go`: added `"statistics"` to the generic ident-based
+  `DropCompatStmt` object-type list (`parseDrop`) — `DROP STATISTICS
+  [IF EXISTS] name [, ...] [CASCADE|RESTRICT]` needs no special-cased
+  argument parsing (unlike `DROP CAST`/`DROP TRANSFORM`), so it fits the same
+  shape as `sequence`/`collation`/`conversion`.
+- `internal/executor/operators_ddl.go`'s `execDropCompat` gains an
+  `objType == "statistics"` case (mirroring the `"collation"` case
+  immediately above it): resolves each name via the new
+  `catalog.InMemory.DropStatistics(name, schema)`, WAL-appends
+  `EncodeDropStatistics` on success, and raises `42704` (or an `IF EXISTS`
+  notice) for an unknown object — same shape as `DROP COLLATION`.
+- `execCreateStatistics` now captures the `*catalog.StatisticsObject`
+  returned by `RegisterStatisticsFull` and WAL-appends
+  `EncodeCreateStatistics` (name/schema/OID/TableOID/Owner/Kinds/Columns/
+  Exprs/HasExpr) when `o.ctx.WAL != nil`.
+- New `internal/wal/statistics_ddl.go`: `RecordKindCreateStatistics`/
+  `RecordKindDropStatistics` (kinds 95/96, the first free values after
+  `RecordKindRenameIndex`=94) + their Encode/Decode pairs. Unlike collation's
+  fixed-shape payload, `CREATE STATISTICS` carries three variable-length
+  string slices (`Kinds`/`Columns`/`Exprs`), so the format adds a generic
+  `count(2) | (elemLen(2) | elem)*` sub-encoding
+  (`encodeStatisticsStringSlice`/`decodeStatisticsStringSlice`) reused for
+  all three.
+- New `catalog.InMemory.RegisterStatisticsDuringRecovery` (overwrites by
+  qualified name + bumps `nextOID`, mirroring
+  `RegisterAccessMethodDuringRecovery`) and `DropStatistics`/
+  `DropStatisticsDuringRecovery` (mirroring `DropCollation`).
+- New `internal/initdb/statistics_ddl_recovery.go`
+  (`replayStatisticsDDLRecords`), wired into `open.go` right after the
+  access-method DDL replay call (grouped with the other name-keyed DU-002
+  replay passes; there is no real ordering dependency on
+  `loadUserTablesFromHeap` since the recorded `TableOID` is restored
+  verbatim rather than re-resolved by name).
+- Tests: `internal/wal/statistics_ddl_test.go` (encode/decode round trips
+  incl. empty/multi-element string slices, wrong-kind/truncated-payload
+  guards), `internal/initdb/statistics_ddl_recovery_test.go` (real
+  `Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for CREATE and
+  CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards),
+  `internal/executor/drop_statistics_test.go` (unqualified + schema-qualified
+  DROP, `IF EXISTS` no-op, missing-object `42704`).
+
+**Still deferred** (not closed by this slice): resume point (1) of the same
+ledger row — `ALTER STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA`
+(slice 441) is still in-memory-only, exactly like the pre-existing (also
+unlogged at the time) `ALTER COLLATION RENAME/OWNER` precedent was before
+its own follow-up slices (442/443) added `RecordKindAlterCollationRename`/
+`RecordKindAlterCollationOwner`/`RecordKindAlterCollationSetSchema`. A CREATE
+now survives a restart with its original name/owner/schema; a RENAME/OWNER
+TO/SET SCHEMA applied before a restart is lost, and the object reverts to
+its as-created identity. Resume point: `execAlterStatistics`'s three
+mutation call sites (`internal/executor/operators_ddl.go`, around
+`RenameStatisticsObject`/`SetStatisticsOwner`/`SetStatisticsSchema`) need a
+`RecordKindAlterStatisticsRename`/`...Owner`/`...SetSchema` triple + a
+`replayStatisticsDDLRecords` case each, following this slice's own
+CREATE/DROP template (or the ALTER COLLATION one directly). Gates: `go build
+./...` clean; `go test -race ./internal/wal/... ./internal/mvcc/...` PASS;
+`internal/wal`+`internal/catalog`+`internal/executor`+`internal/initdb`+
+`internal/parser` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full
+pre-commit gate incl. pgbench TPC-B smoke PASS.

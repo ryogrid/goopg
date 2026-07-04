@@ -13813,6 +13813,38 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 		return nil
 	}
 
+	// DROP STATISTICS [IF EXISTS] name [, ...] [CASCADE|RESTRICT] — extended
+	// statistics objects (pg_statistic_ext). Previously entirely unparsed (no
+	// DROP STATISTICS support existed at all, discovered while closing the
+	// slice-441 restart-persistence gap for CREATE STATISTICS). Mirrors the
+	// "collation" case above. DU-002 restart-persistence follow-up.
+	if objType == "statistics" {
+		im, imOK := o.ctx.Catalog.(*catalog.InMemory)
+		for _, name := range s.Names {
+			if o.dropSchemaQualifiedNotice(name) {
+				continue
+			}
+			schema := name.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			if imOK && im.DropStatistics(name.Name, schema) {
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropStatistics(name.Name, schema)); werr != nil {
+						return fmt.Errorf("wal drop-statistics: %w", werr)
+					}
+				}
+				continue
+			}
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("statistics object %q does not exist, skipping", name.Name))
+				continue
+			}
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("statistics object %q does not exist", name.Name)}
+		}
+		return nil
+	}
+
 	// DROP OPERATOR CLASS/FAMILY name USING method — M0097-0071.
 	// PG validates the access method first; if unknown, always errors (even with IF EXISTS).
 	// Known access methods: btree, hash, gist, gin, spgist, brin, heap.
@@ -16006,7 +16038,15 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 	for _, e := range s.Exprs {
 		exprs = append(exprs, defaultExprToSQL(e))
 	}
-	im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
+	obj := im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
+	// DU-002 restart-persistence follow-up (slice 441's own resume point):
+	// CREATE STATISTICS was never WAL-logged, so the object vanished on
+	// restart and ALTER STATISTICS had nothing durable to attach to.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateStatistics(obj.Name, obj.Schema, obj.OID, obj.TableOID, obj.Owner, obj.Kinds, obj.Columns, obj.Exprs, obj.HasExpr)); werr != nil {
+			return fmt.Errorf("wal create-statistics: %w", werr)
+		}
+	}
 	return nil
 }
 

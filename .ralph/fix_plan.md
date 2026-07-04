@@ -48,12 +48,15 @@ report.md tallies `goopg-missing: 0`, and the one `goopg-bug` found (WP-02/WP-03
 one root cause) is fixed + regression-tested + ledger-resolved. **Resumed M0110
 next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above: this
 loop closed the M0110-0001 DU-002 slice 444 deferral (simple-query batch
-CREATE TABLE/INDEX atomicity on abort — design `root-0024`). **Next up:**
+CREATE TABLE/INDEX atomicity on abort — design `root-0024`), and the
+following loop closed DU-002 slice 445 (`CREATE`/`DROP STATISTICS`
+WAL/restart persistence + new `DROP STATISTICS` support). **Next up:**
 either continue the M0119-0004 pg_dump catalog-view parity battery (next gap
-found via `TestPort_PgDumpConnectionSetup`), or pick up one of `root-0024`'s
+found via `TestPort_PgDumpConnectionSetup`), pick up one of `root-0024`'s
 own two documented residuals (enum/composite-type undo + the mid-batch-BEGIN
-throwaway-session handoff) if a fresh discovery motivates it — neither is
-independently ledgered as its own task, see the design doc's Deferred section.
+throwaway-session handoff), or close resume point (1) of the slice-441/445
+ledger rows (`ALTER STATISTICS RENAME/OWNER/SET SCHEMA` WAL persistence) —
+none is independently urgent, see each's own Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
@@ -7835,6 +7838,41 @@ documentation-only and is exempt from the design-doc requirement.)
       explicit-transaction-only; a `CREATE TABLE; BEGIN; ...; ROLLBACK;`
       compound batch still loses the pre-BEGIN entry) — both recorded in the
       design doc's own Deferred section rather than re-ledgered separately.
+
+- [x] **`CREATE`/`DROP STATISTICS` WAL/restart persistence + new `DROP
+      STATISTICS` support (M0110-0001 DU-002 slice 445, closing resume point
+      (2) of the slice-441 ledger row).** **COMPLETE 2026-07-04:** statistics
+      objects (`pg_statistic_ext`) were never WAL-logged since `CREATE
+      STATISTICS` first landed (M0097-0023) — the object lived only in
+      `catalog.InMemory.statisticsObjs` and vanished on restart. While
+      scoping the fix, found `DROP STATISTICS` was **entirely unparsed** (no
+      grammar rule at all) — added as a prerequisite. Mirrors the `CREATE`/
+      `DROP COLLATION` precedent: new `internal/wal/statistics_ddl.go`
+      (`RecordKindCreateStatistics`/`RecordKindDropStatistics`, kinds 95/96,
+      with a generic string-slice sub-encoding for `Kinds`/`Columns`/`Exprs`);
+      `catalog.InMemory.RegisterStatisticsDuringRecovery`/`DropStatistics`/
+      `DropStatisticsDuringRecovery`; new
+      `internal/initdb/statistics_ddl_recovery.go`
+      (`replayStatisticsDDLRecords`, wired into `open.go` after the
+      access-method DDL replay call); `execCreateStatistics` WAL-appends on
+      success; `execDropCompat` gains an `objType == "statistics"` case;
+      `internal/parser/ddl.go`'s generic ident-based `DropCompatStmt`
+      object-type list gains `"statistics"`. Tests:
+      `internal/wal/statistics_ddl_test.go`,
+      `internal/initdb/statistics_ddl_recovery_test.go` (real
+      `Init`/`Open`/re-`Open` round trips for CREATE and CREATE+DROP),
+      `internal/executor/drop_statistics_test.go`. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "loop #96, DU-002 slice
+      445" section. Gates: `go build ./...` clean; `go test -race
+      ./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+      `internal/catalog`+`internal/executor`+`internal/initdb`+
+      `internal/parser` suites PASS (full, no regression); TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. **Still deferred**
+      (resume point (1) of the same ledger row, unchanged): `ALTER
+      STATISTICS ... RENAME TO/OWNER TO/SET SCHEMA` (slice 441) is still
+      in-memory-only — a restart reverts the object to its as-created
+      name/owner/schema. Ledger row appended (new row, not flipping the
+      slice-441 row `resolved` since resume point (1) remains open).
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

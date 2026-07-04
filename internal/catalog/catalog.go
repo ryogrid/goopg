@@ -2994,6 +2994,55 @@ func (c *InMemory) RegisterStatisticsFull(schema, name string, tableOID uint32, 
 	return obj
 }
 
+// RegisterStatisticsDuringRecovery re-registers a statistics object from a
+// decoded RecordKindCreateStatistics WAL record, overwriting-by-qualified-name
+// (mirrors RegisterAccessMethodDuringRecovery/CreateCollationDuringRecovery)
+// so replaying the same record twice is idempotent. DU-002 restart-persistence
+// follow-up to slice 441.
+func (c *InMemory) RegisterStatisticsDuringRecovery(schema, name string, oid, tableOID, ownerOID uint32, kinds, columns, exprs []string, hasExpr bool) {
+	if schema == "" {
+		schema = "public"
+	}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: oid, TableOID: tableOID, Owner: ownerOID, Kinds: kinds, Columns: columns, Exprs: exprs, HasExpr: hasExpr}
+	key := obj.qualifiedKey()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		c.statisticsObjs = make(map[string]*StatisticsObject)
+	}
+	c.statisticsObjs[key] = obj
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// DropStatistics removes a statistics object by unqualified name and schema
+// (defaulting to "public"), mirroring DropCollation. Returns false if no such
+// object is registered.
+func (c *InMemory) DropStatistics(name, schema string) bool {
+	if schema == "" {
+		schema = "public"
+	}
+	key := strings.ToLower(schema + "." + name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	if _, ok := c.statisticsObjs[key]; !ok {
+		return false
+	}
+	delete(c.statisticsObjs, key)
+	return true
+}
+
+// DropStatisticsDuringRecovery is the recovery-replay counterpart to
+// DropStatistics; a missing object is a silent no-op (the record it created
+// may predate the last checkpoint this recovery pass starts from).
+func (c *InMemory) DropStatisticsDuringRecovery(name, schema string) {
+	c.DropStatistics(name, schema)
+}
+
 // LookupStatistics finds a statistics object by name. The name may be
 // schema-qualified; if not, the public schema is tried. M0097-0023.
 func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
