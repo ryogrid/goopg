@@ -146,3 +146,53 @@ anything touching `internal/catalog/`, `internal/executor/codec.go`,
 `internal/initdb/view_ddl_recovery_test.go`, or `internal/analyzer/` — those
 were the concurrent peer's live dirty set as of this loop's end; re-check
 `git status` first.**
+
+---
+
+**Loop #19 (this loop) — COMPLETE, committed + pushed.** Picked up the
+WITH-ORDINALITY root cause loop #17/#18 diagnosed (analyzer, not planner)
+and implemented the fix: `internal/analyzer/analyzer.go`'s
+`tableFuncColumns` now takes `*parser.TableFuncRef` (was a bare name
+string), strips/re-appends the trailing ordinality alias mirroring
+`wrapOrdinality` (`internal/planner/planner.go`), and gained real `unnest`
+(N-column zip)/`regexp_matches` (`text[]`) cases that previously fell to
+the wrong single-`int8` generic default. `unnest`'s element type stays a
+`text` placeholder (analyzer has no scope/resolveContext at `lookupTable`
+time to `analyzeExpr` the array arg) — recorded as a known, non-regressive
+imprecision in the ledger, not an open bug.
+
+Tests: `internal/analyzer/analyzer_test.go`'s
+`TestAnalyzeWithOrdinalityNamedColumn`. Verified end-to-end against a live
+goopg server with real PG 18.3 `psql` (unnest/generate_series/
+regexp_matches, single+multi-arg unnest, named ordinality + element
+columns all resolve). Gates: build clean; `go test
+./internal/analyzer/... ./internal/planner/... ./internal/executor/...
+./internal/parser/...` PASS; pre-commit pgbench smoke PASS
+(~233-251 TPS TPC-B/simple-update, ~14.3k TPS select-only).
+
+Docs: `docs/design/0103-0008-derived-subquery-srf-schema-propagation.md`
+new "Follow-up" section + `docs/design/README.md` row updated in place.
+`.ralph/fix_plan.md` M0122-0004 banner updated; `.ralph/deferral_ledger.md`
+new `resolved` row closing the WITH-ORDINALITY half of ledger row 480 (the
+comma/LATERAL `ctx.OuterRows` half is separate, still open).
+
+**Concurrency note:** the peer `ralph_loop.sh` tree's WIP (`internal/catalog/
+catalog.go`/`codec.go`, `internal/executor/codec.go`/
+`pg18_user_catalog_rows*.go`, `internal/initdb/open.go`/
+`view_ddl_recovery_test.go`, `docs/design/0110-0001-*.md`) was still
+uncommitted throughout this loop; none of those files were touched.
+Mid-loop the peer pushed `a896a842`/`fc985ed4` (M0122-0003 dirtied/written
+counters) via a route that diverged local history from origin (ahead
+2/behind 2) — reconciled via `git stash push -- <peer's dirty tracked
+files>` (never touched the untracked 1.5G `postgres/` dir), `git rebase
+origin/align-data-structure-with-pg` (clean, no conflicts — git recognised
+the local working_set.md-only commit as already-applied and dropped it),
+`git stash pop` (clean), rebuilt/retested, pushed fast-forward
+(`fc985ed4..c98baf68`). Re-verify `git status` before picking the next task.
+
+Next step: pick M0122-0004's remaining open sub-items (window frames /
+GROUPING SETS / ANY-SOME-ALL / DEFAULT-clause / intervals — still open,
+none yet scoped), or the comma/LATERAL-join `ctx.OuterRows` wiring gap
+(ledger row 480, now the only unfixed half), or continue M0122-0003's
+`pg_stat_io`/`track_io_timing` remainder, or the next `M0119-0004` pg_dump
+catalog-view parity slice.
