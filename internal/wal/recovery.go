@@ -1075,6 +1075,27 @@ const (
 	//   kind(1) | oid(4)
 	RecordKindDropOperatorFamily byte = 92
 
+	// RecordKindAlterCollationSetSchema records an `ALTER COLLATION name SET
+	// SCHEMA newschema` move, the last previously-unmodelled ALTER COLLATION
+	// form (RENAME TO / OWNER TO already had dedicated record kinds 44/45).
+	// Same no-op physical redo path — only pg_collation.collnamespace
+	// metadata changes. DU-002 slice 442.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
+	RecordKindAlterCollationSetSchema byte = 93
+
+	// RecordKindRenameIndex records an `ALTER INDEX name RENAME TO newname`
+	// event on a real (non-TOAST) index — previously a functional no-op with
+	// no catalog mutation at all, so there was nothing to WAL-log (DU-002
+	// slice 443). Same no-op physical redo path as RecordKindCreateIndex /
+	// RecordKindDropIndex: only the in-memory index registry's name/key
+	// changes; btree pages and the pg_class row are untouched by a rename.
+	// Format:
+	//   kind(1) | schemaLen(2) | schema(schemaLen bytes) | oldNameLen(2) |
+	//   oldName(oldNameLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindRenameIndex byte = 94
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -3241,6 +3262,129 @@ func DecodeAlterCollationRename(payload []byte) (name, schema, newName string, e
 	}
 	newName = string(payload[off : off+newNameLen])
 	return name, schema, newName, nil
+}
+
+// EncodeAlterCollationSetSchema encodes an ALTER COLLATION ... SET SCHEMA
+// event (DU-002 slice 442). Format: kind(1) | nameLen(2) | name(nameLen
+// bytes) | schemaLen(2) | schema(schemaLen bytes) | newSchemaLen(2) |
+// newSchema(newSchemaLen bytes).
+func EncodeAlterCollationSetSchema(name, schema, newSchema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newSchema))
+	out[0] = RecordKindAlterCollationSetSchema
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newSchema)))
+	off += 2
+	copy(out[off:], newSchema)
+	return out
+}
+
+// DecodeAlterCollationSetSchema decodes a RecordKindAlterCollationSetSchema
+// payload.
+func DecodeAlterCollationSetSchema(payload []byte) (name, schema, newSchema string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-set-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterCollationSetSchema {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not alter-collation-set-schema", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-set-schema payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-collation-set-schema payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newSchemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newSchemaLen {
+		return "", "", "", fmt.Errorf("wal: alter-collation-set-schema payload truncated (need %d bytes)", off+newSchemaLen)
+	}
+	newSchema = string(payload[off : off+newSchemaLen])
+	return name, schema, newSchema, nil
+}
+
+// EncodeRenameIndex encodes an `ALTER INDEX name RENAME TO newname` event
+// (DU-002 slice 443). Format: kind(1) | schemaLen(2) | schema(schemaLen
+// bytes) | oldNameLen(2) | oldName(oldNameLen bytes) | newNameLen(2) |
+// newName(newNameLen bytes).
+func EncodeRenameIndex(schema, oldName, newName string) []byte {
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(oldName) > 0xFFFF {
+		oldName = oldName[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(schema)+len(oldName)+len(newName))
+	out[0] = RecordKindRenameIndex
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(schema)))
+	off := 3
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(oldName)))
+	off += 2
+	copy(out[off:], oldName)
+	off += len(oldName)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeRenameIndex decodes a RecordKindRenameIndex payload.
+func DecodeRenameIndex(payload []byte) (schema, oldName, newName string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: rename-index payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRenameIndex {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not rename-index", payload[0])
+	}
+	schemaLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: rename-index payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	oldNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+oldNameLen+2 {
+		return "", "", "", fmt.Errorf("wal: rename-index payload truncated (need %d bytes)", off+oldNameLen+2)
+	}
+	oldName = string(payload[off : off+oldNameLen])
+	off += oldNameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", "", fmt.Errorf("wal: rename-index payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return schema, oldName, newName, nil
 }
 
 // EncodeAlterCollationOwner encodes an ALTER COLLATION ... OWNER TO event
@@ -6272,7 +6416,7 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's conversion registry.
 		return false, nil
-	case RecordKindCreateCollation, RecordKindDropCollation, RecordKindAlterCollationRename, RecordKindAlterCollationOwner:
+	case RecordKindCreateCollation, RecordKindDropCollation, RecordKindAlterCollationRename, RecordKindAlterCollationOwner, RecordKindAlterCollationSetSchema:
 		// CREATE/DROP/ALTER COLLATION records (DU-002 restart-persistence
 		// follow-up) carry only pg_collation metadata; goopg has no
 		// per-collation file namespace, so the physical replay path has
@@ -6280,6 +6424,23 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/collation_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's collation registry.
+		return false, nil
+	case RecordKindCreateStatistics, RecordKindDropStatistics, RecordKindAlterStatisticsRename, RecordKindAlterStatisticsOwner, RecordKindAlterStatisticsSetSchema:
+		// CREATE/DROP/ALTER STATISTICS records (DU-002 restart-persistence
+		// follow-up) carry only pg_statistic_ext metadata; goopg has no
+		// per-statistics-object file namespace, so the physical replay path
+		// has nothing to do. The recovery driver in
+		// internal/initdb/statistics_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the catalog's
+		// statistics registry. Mirrors the RecordKindCreateCollation case
+		// above; CREATE/DROP STATISTICS (kinds 95/96) were missing this case
+		// entirely until this fix — falling to the switch's default
+		// "unsupported kind" error whenever ApplyRecord ran on a
+		// non-XLog-wrapped native record (the standby streaming-replication
+		// path, internal/wal/stream_replayer.go), even though startup
+		// crash-recovery on the primary never called ApplyRecord for these
+		// (internal/initdb/open.go invokes replayStatisticsDDLRecords
+		// directly) and so never observed the gap.
 		return false, nil
 	case RecordKindCreatePublication, RecordKindDropPublication, RecordKindAlterPublicationOwner,
 		RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
@@ -6391,14 +6552,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// records after physical replay and re-applies them to the
 		// registry.
 		return false, nil
-	case RecordKindCreateIndex, RecordKindDropIndex:
-		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
-		// metadata that goopg's heap representation cannot fully
-		// store (no pg_index relation). The on-disk btree pages and
-		// the index relfile are restored by RecordKindBtreeInsert /
-		// RecordKindSmgrCreate; the in-memory catalog state is
-		// reconstructed by `internal/initdb.replayIndexDDLRecords`
-		// after physical replay finishes.
+	case RecordKindCreateIndex, RecordKindDropIndex, RecordKindRenameIndex:
+		// CREATE/DROP/RENAME INDEX records (M0079-0001; RENAME added
+		// DU-002 slice 443) carry the catalog metadata that goopg's heap
+		// representation cannot fully store (no pg_index relation). The
+		// on-disk btree pages and the index relfile are restored by
+		// RecordKindBtreeInsert / RecordKindSmgrCreate — a rename touches
+		// neither — so the in-memory catalog state is reconstructed by
+		// `internal/initdb.replayIndexDDLRecords` after physical replay
+		// finishes.
 		return false, nil
 	case RecordKindCanonical:
 		// PG-canonical catalog WAL record (M0106-0010 batched-32).
@@ -6471,6 +6633,7 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindDropSchema,
 		RecordKindCreateIndex,
 		RecordKindDropIndex,
+		RecordKindRenameIndex,
 		RecordKindXactAssignment,
 		RecordKindXactRollbackTo,
 		RecordKindXactSubAbort,

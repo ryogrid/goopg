@@ -101,6 +101,49 @@ func TestDropIndexSurvivesRestartViaWAL(t *testing.T) {
 	}
 }
 
+// TestRenameIndexSurvivesRestartViaWAL pins the DU-002 slice 443 recovery
+// path: `ALTER INDEX ... RENAME TO` must survive a restart via
+// wal.RecordKindRenameIndex, the same way CREATE/DROP INDEX already do.
+func TestRenameIndexSurvivesRestartViaWAL(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ridx (id int4 NOT NULL)")
+	runDDL(t, rt1, "CREATE INDEX ridx_old_name ON ridx (id)")
+	runDDL(t, rt1, "ALTER INDEX ridx_old_name RENAME TO ridx_new_name")
+	// Note: NO SaveCatalog call here — simulating a crash.
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	tbl, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "ridx"})
+	if !ok {
+		t.Fatal("ridx not found after restart — table heap recovery failed")
+	}
+	idx, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "ridx_new_name"})
+	if !ok {
+		t.Fatal("ridx_new_name not found after restart — rename WAL replay failed")
+	}
+	if idx.Table == nil || idx.Table.OID != tbl.OID {
+		t.Errorf("index.Table OID mismatch: got=%v want=%d", idx.Table, tbl.OID)
+	}
+	if _, stillThere := rt2.Catalog.LookupIndex(parser.ObjectName{Name: "ridx_old_name"}); stillThere {
+		t.Error("old index name ridx_old_name resurrected after restart")
+	}
+}
+
 // TestCreateIndexRecoveredOIDDoesNotCollide pins the
 // nextOID-advance step in `RegisterIndexDuringRecovery`:
 // after recovery, a new CREATE INDEX must allocate an OID

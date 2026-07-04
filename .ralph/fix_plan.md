@@ -43,6 +43,23 @@ M0110/M0119 work: **run M0120 first** (it only needs the landed logging + the
 committed `wp/verification/` checklist/flow), **then M0121** consumes its triaged
 failure list.
 
+**M0120 and M0121 are both now CLOSED (2026-07-04)** — every sub-task `[x]`,
+report.md tallies `goopg-missing: 0`, and the one `goopg-bug` found (WP-02/WP-03,
+one root cause) is fixed + regression-tested + ledger-resolved. **Resumed M0110
+next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above: this
+loop closed the M0110-0001 DU-002 slice 444 deferral (simple-query batch
+CREATE TABLE/INDEX atomicity on abort — design `root-0024`), the following
+loop closed DU-002 slice 445 (`CREATE`/`DROP STATISTICS` WAL/restart
+persistence + new `DROP STATISTICS` support), and the loop after that closed
+resume point (1) of the slice-441/445 ledger rows (`ALTER STATISTICS
+RENAME/OWNER/SET SCHEMA` WAL persistence) — statistics restart durability is
+now fully closed, no open resume points remain on that thread. **Next up:**
+either continue the M0119-0004 pg_dump catalog-view parity battery (next gap
+found via `TestPort_PgDumpConnectionSetup`), or pick up one of `root-0024`'s
+own two documented residuals (enum/composite-type undo + the mid-batch-BEGIN
+throwaway-session handoff) — neither is independently urgent, see each's own
+Deferred section.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
 M0096 (RC isolation feature impl + spec pass), M0100 (RC isolation runtime
@@ -224,6 +241,330 @@ prev-link fixes.
       deferral thread: `canonical`/`subtype_diff` (sub-item (a) remainder —
       needs real shell-type + function-signature support, a materially
       larger separately-scoped feature).
+      **2026-07-04 (loop #97, DU-002 slice 436): `COMMENT ON <object>` now
+      raises PostgreSQL's own per-object-kind `does not exist` error instead
+      of a silent no-op — CLOSES the systemic deferral recorded since slice
+      386.** `execCommentOn` (`internal/executor/operators_ddl.go`) gained a
+      shared `undefinedRelation()` 42P01 closure for the six relation-kind
+      cases (table/view/sequence/materialized view/foreign table/index) and
+      a specific `ExecError` for every other case (type/domain 42704, schema
+      3F000, column 42703, constraint/trigger/policy/rule 42704 with their
+      own `for table`/`for relation` wording, statistics/access
+      method/server/foreign data wrapper/extension/collation/cast 42704,
+      function 42883 via a new `commentOnFuncSig` helper mirroring DROP
+      FUNCTION's), all sourced from `postgres/src/backend/catalog/
+      objectaddress.c`'s `get_object_address` family and its per-kind lookup
+      helpers. `TestCommentOnUnknownAccessMethodIsNoop` (slice 434, which had
+      explicitly documented itself as pinning a to-be-superseded divergence)
+      is replaced by `TestCommentOnUnknownAccessMethodErrors`; two new test
+      files (`TestCommentOnUndefinedObjectErrors` table-driven across every
+      bare-name object kind, `TestCommentOnUndefinedRelationSubObjectErrors`
+      for the missing-table vs missing-sub-object paths) pin the new
+      behavior. Design doc "Follow-up: `COMMENT ON <object>` raises
+      PostgreSQL's own `does not exist` error instead of a silent no-op
+      (DU-002 slice 436)". Gates: build/vet clean; `internal/executor`+
+      `internal/parser`+`internal/catalog` suites PASS; `TestPort_
+      PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
+      appended): `commentOnFuncSig` renders the function name unqualified
+      even for a schema-qualified `COMMENT ON FUNCTION schema.name(...)` —
+      a pre-existing simplification shared by DROP FUNCTION's sibling
+      helper, not introduced here.
+      **2026-07-04 (loop #98, DU-002 slice 438): `SECURITY LABEL` now always
+      raises PostgreSQL's own "provider not loaded" error instead of a
+      silent no-op.** `TestPort_PgDumpConnectionSetup` came up fully green
+      against every fixture through slice 437 with no predicted next
+      blocker, so this loop probed for an untested SQL surface directly (a
+      throwaway `zz_probe_test.go`, deleted before commit).
+      `SECURITY LABEL [FOR provider] ON <object> IS '...'` parsed into a bare
+      `CompatNoopStmt` the executor silently accepted; real PG's
+      `ExecSecLabelStmt` (`postgres/src/backend/commands/seclabel.c`) checks
+      its label-provider list BEFORE ever resolving the target object, and
+      since goopg has no C-extension mechanism to load one, the list is
+      always empty — every such statement a real PG cluster would accept
+      from goopg must raise a 22023 error. `internal/parser/parser.go`'s
+      `case "security":` arm now captures the optional `FOR provider` name
+      into `CompatNoopStmt.SecurityLabelProvider`; `execCompatNoop`
+      (`internal/executor/operators_ddl.go`) returns the matching
+      `*ExecError` unconditionally. Test: `TestSecurityLabelAlwaysErrors`
+      (`internal/executor/operators_security_label_test.go`). Design doc
+      "Follow-up: `SECURITY LABEL` always raises PostgreSQL's own \"provider
+      not loaded\" error instead of a silent no-op (DU-002 slice 438)".
+      Gates: build/vet clean; `internal/parser`+`internal/executor`+
+      `internal/server` suites PASS; `TestPort_PgDumpConnectionSetup` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): two related features
+      probed alongside this one confirmed genuinely unimplemented, each
+      Effort-L — `ALTER DEFAULT PRIVILEGES` (no parser support; `pg_default_acl`
+      stays a permanently-empty virtual view) and large objects (`lo_create`/
+      `lo_open`/...; no `pg_largeobject` heap storage or SQL-level API at
+      all). Resume for `002-010` proper remains the next catalog-getter gap
+      surfaced by `TestPort_PgDumpConnectionSetup`.
+      **2026-07-04 (loop #99, DU-002 slice 439): `ALTER SEQUENCE ... RENAME
+      TO / OWNER TO / SET SCHEMA` were unparseable — all three now succeed.**
+      `TestPort_PgDumpConnectionSetup` again came up fully green through
+      slice 438 with no predicted next blocker, so this loop delegated a
+      live-probing pass (goopg vs. a scratch real PostgreSQL 18.3 instance)
+      to find the next SQL surface gap. `internal/parser/ddl.go`'s `ALTER
+      SEQUENCE` branch only parsed `SeqOptList` options — no case for these
+      three grammar-distinct forms — so the leftover token surfaced as a
+      bare syntax error. Fixed by detecting them before the option loop and
+      returning an `*AlterTableStmt` directly (a sequence is just a relation,
+      and real PG backs all three with the same generic `RenameRelation`/
+      `AlterTableOwner`/`AlterTableNamespace` commands ALTER TABLE already
+      uses), reusing `execAlterTable` — the same pattern the pre-existing
+      `ALTER INDEX ... RENAME TO` case already uses. Extended
+      `execAlterTable`'s `SET SCHEMA` branch with the same `tbl.IsSequence`
+      → `RenameSequence` registry cascade the `RENAME` case already had (a
+      real bug: bare `tbl.Schema` write left the schema-qualified
+      `seqRegistry` key stale). Also fixed a command-tag fidelity gap this
+      exposed live: `AlterTableStmt` gained `TagOverride` so these three tag
+      `"ALTER SEQUENCE"` (matching real PG), not the blanket `"ALTER TABLE"`
+      `ddlTag` previously returned for every `AlterTableStmt` — direct
+      sibling of the M0119-0004 (loop #77) tag-fidelity effort. Tests:
+      `TestAlterSequenceRenameTo`/`OwnerTo`/`OwnerToCurrentUser`/`SetSchema`/
+      `RenameOwnerSchemaNotCombinedWithOptions`
+      (`internal/executor/operators_alter_sequence_relation_ops_test.go`);
+      3 new cases in `TestDDLCommandTagMatchesPostgres`
+      (`internal/server/ddl_command_tag_test.go`). Design doc "Follow-up:
+      `ALTER SEQUENCE ... RENAME TO / OWNER TO / SET SCHEMA` were
+      unparseable (DU-002 slice 439)". Gates: build/vet clean;
+      `internal/parser`+`internal/executor`+`internal/server` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook; live `goopg`/`psql`
+      smoke (rename→nextval→owner→set schema→nextval) cross-checked
+      tag-for-tag against real PostgreSQL 18.3. Deferred (ledger row
+      appended): (1) `ALTER INDEX`/`ALTER VIEW`/`ALTER MATERIALIZED VIEW`
+      forms that reuse `AlterTableStmt` the same way likely have the
+      identical pre-existing tag-mistagging bug — not audited or fixed here,
+      only the three new ALTER SEQUENCE sites. (2) `execAlterTable`'s `OWNER
+      TO` branch (shared by `ALTER TABLE`/`ALTER SCHEMA`/now `ALTER
+      SEQUENCE`) never validates the target role exists. Resume for
+      `002-010` proper remains the next catalog-getter gap surfaced by
+      `TestPort_PgDumpConnectionSetup`.
+      **2026-07-04 (loop #100, DU-002 slice 440): `ALTER VIEW ... RENAME TO /
+      OWNER TO / SET SCHEMA` were not just mistagged but fully silent
+      no-ops — now they actually apply.** Following up on slice 439's
+      prediction (1) above, auditing `ALTER VIEW` found something worse than
+      mistagging: `internal/parser/ddl.go`'s `parseAlter` had NO dedicated
+      case for plain `ALTER VIEW` at all (only `ALTER MATERIALIZED VIEW`), so
+      every `ALTER VIEW` form — including RENAME TO/OWNER TO/SET SCHEMA —
+      fell into the blanket "schema/view/collation/domain/extension/
+      language/operator/system" compat-stub loop, which parses successfully
+      but just consumes the tokens and returns an empty `*AlterTableStmt`
+      with no `Name` and no actions: the statement silently did nothing.
+      Fixed by giving `ALTER VIEW` its own case (mirroring the slice-439
+      `ALTER SEQUENCE` pattern exactly — a view is just a relation,
+      `pg_class.relkind='v'`, and real PG backs all three with the same
+      generic `RenameRelation`/`AlterTableOwner`/`AlterTableNamespace`
+      commands), reusing `execAlterTable` and tagging via the existing
+      `AlterTableStmt.TagOverride = "ALTER VIEW"`. Removed `"view"` from the
+      now-dead catch-all list. Other `ALTER VIEW` forms (RENAME COLUMN,
+      ALTER COLUMN SET/DROP DEFAULT, SET/RESET reloptions) still fall to the
+      no-op stub — deferred, see ledger. Tests: `TestAlterViewRenameTo`/
+      `OwnerTo`/`OwnerToCurrentUser`/`SetSchema`
+      (`internal/executor/operators_alter_view_relation_ops_test.go`,
+      asserting the catalog `Table.View` survives the rename/move and a
+      post-change `SELECT` against the view still returns the right rows —
+      not just that the catalog key moved); 3 new cases in
+      `TestDDLCommandTagMatchesPostgres`
+      (`internal/server/ddl_command_tag_test.go`). Design doc "Follow-up:
+      `ALTER VIEW ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops
+      (DU-002 slice 440)". Gates: build/vet clean; `internal/parser`+
+      `internal/executor`+`internal/server` suites PASS (full, no
+      regressions); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Deferred (ledger row appended): (1) `ALTER
+      MATERIALIZED VIEW ... SET SCHEMA` and `ALTER INDEX ... RENAME TO`
+      still carry the pre-existing tag-mistagging bug noted in slice 439's
+      deferral — not touched by this loop, which only fixed the functional
+      no-op for plain `ALTER VIEW`. (2) `ALTER VIEW` sub-forms other than
+      RENAME TO/OWNER TO/SET SCHEMA (RENAME COLUMN, ALTER COLUMN ... SET/DROP
+      DEFAULT, SET/RESET reloptions) still silently no-op — not modeled at
+      all. (3) Plain `ALTER SCHEMA ... RENAME TO / OWNER TO` has an identical
+      (arguably worse) gap — there is no `RenameSchema`/schema-owner
+      mechanism anywhere in the catalog, so it isn't a quick AlterTableStmt
+      reuse like sequences/views; it needs real pg_namespace-rename support
+      first. Out of scope for this bounded loop (Effort-L: new catalog
+      capability, not a parser-routing fix).
+      **2026-07-04 (loop #101, DU-002 slice 441): `ALTER STATISTICS ...
+      RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops — now they
+      actually apply.** Following up on the slice 439/440 ALTER-form-gap
+      thread, `internal/parser/ddl.go`'s pre-existing `ALTER STATISTICS`
+      branch (slice 317) only modeled `SET STATISTICS n`; the other three
+      forms parsed to the same `AlterStatisticsStmt` node with
+      `HasTarget=false` and were deliberately consumed as no-ops — unlike
+      sequences/views this node was already tagged correctly
+      (`"ALTER STATISTICS"`, not a reused mistaggable `AlterTableStmt`), so
+      the gap was purely functional. Fixed with an `Action`-switch shape
+      mirroring `execAlterCollation`: `AlterStatisticsStmt` gains `Action`
+      (`"rename"`/`"owner"`/`"setschema"`)/`NewName`/`NewOwner`/`NewSchema`;
+      new `catalog.StatisticsObject.Owner uint32` (+`OwnerOrDefault()`,
+      mirroring `UserAggregate.Owner`) and three new mutators
+      (`RenameStatisticsObject`/`SetStatisticsOwner`/`SetStatisticsSchema`)
+      re-keying the schema-qualified `statisticsObjs` map; `pg_statistic_ext`'s
+      `stxowner`/`stxnamespace` virtual cells now project the real
+      owner/namespace (`c.schemas[schema]` lookup) instead of a hardcoded
+      `"10"` and a `public → "2200" / else → "0"` ternary — the ternary bug
+      predates this slice (any non-public statistics object already had a
+      bogus `stxnamespace=0`) but is now fixed as part of making `SET SCHEMA`
+      actually observable. `execAlterStatistics` raises `42704` for an
+      unknown target (`IF EXISTS` downgrades to a notice), matching `ALTER
+      COLLATION`. Tests: `TestParseAlterStatisticsRenameOwnerSetSchema`
+      (`internal/parser/alter_test.go`); `TestAlterStatisticsRenameOwnerSetSchema`
+      (`internal/executor/alter_statistics_test.go`, full parse→plan→exec
+      round trip incl. `IF EXISTS` both ways). Design doc "Follow-up: `ALTER
+      STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops
+      (DU-002 slice 441)" appended to `docs/design/0110-0001-pg-dump-tap-port.md`
+      (the established home for this ALTER-form-gap slice thread);
+      `docs/design/README.md`'s `0110-0001` row updated in the same commit.
+      Gates: `go build ./...` clean; `internal/parser`+`internal/catalog`+
+      `internal/executor` suites PASS (full, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      Deferred (ledger row appended): (1) RENAME/OWNER/SET SCHEMA are
+      in-memory-only, not WAL-logged — same as `ALTER COLLATION`'s
+      equivalent forms. (2) Statistics objects overall have no restart
+      persistence at all (`CREATE STATISTICS` itself is not WAL-logged) — a
+      strictly larger pre-existing gap, not introduced or widened here. No
+      further known `ALTER STATISTICS` grammar gap — `SET STATISTICS`/
+      `RENAME TO`/`OWNER TO`/`SET SCHEMA` is PG's complete grammar for this
+      statement.
+      **2026-07-04 (loop #56, DU-002 slice 442): `ALTER COLLATION name SET
+      SCHEMA newschema` was the last unmodelled ALTER COLLATION form — now
+      closed, WITH restart persistence.** `ALTER COLLATION` already had
+      WAL-logged `RENAME TO`/`OWNER TO` (loop #50 follow-up); `SET SCHEMA`
+      fell to the generic no-op default in `parseAlter`'s collation case.
+      Added `AlterCollationStmt.NewSchema` (parser); `catalog.InMemory.
+      SetCollationSchema`/`SetCollationSchemaDuringRecovery` (re-keys
+      `userCollations` by `NamespaceOID`, mirroring `SetCollationOwner`'s
+      schema-resolution shape); a `"setschema"` case in `execAlterCollation`
+      that raises `42704` for an unknown target (`IF EXISTS` → notice) and
+      WAL-logs via a new `RecordKindAlterCollationSetSchema` (byte 93,
+      `EncodeAlterCollationSetSchema`/`DecodeAlterCollationSetSchema`); the
+      matching `internal/initdb/collation_ddl_recovery.go` replay case. The
+      virtual `pg_collation` view already projects `uc.NamespaceOID`
+      directly, so no further wiring was needed for `pg_dump` visibility
+      (unlike slice 441's `pg_statistic_ext` namespace-projection fix).
+      Tests: `TestParseAlterCollationSetSchema` (parser),
+      `TestAlterCollationSetSchema` (executor, full round trip +
+      `IF EXISTS`/`42704`), `TestEncodeDecodeAlterCollationSetSchemaRoundTrip`
+      + 2 reject-cases (wal, incl. multi-byte UTF-8),
+      `TestCollationDDLRecoveryReplaysSetSchemaAfterCreate` (initdb, WAL
+      replay across a close/reopen). Design doc "Follow-up: `ALTER COLLATION
+      name SET SCHEMA newschema` was the last unmodelled ALTER COLLATION
+      form (DU-002 slice 442)" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb` suites PASS (full, no regressions);
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      No deferral — closes the last unmodelled `ALTER COLLATION` grammar
+      form in full (ledger row marked `resolved`, not `-`).
+      **2026-07-04 (loop #57, DU-002 slice 443): `ALTER INDEX ... RENAME TO`
+      / `ALTER MATERIALIZED VIEW ... SET SCHEMA` command-tag mistagging
+      fixed — AND `ALTER INDEX ... RENAME TO` was found to ALSO be a
+      functional no-op.** Closes the slice 439 tag-mistagging prediction for
+      the two remaining un-audited `AlterTableStmt`-reuse sites
+      (`TagOverride = "ALTER INDEX"` / `"ALTER MATERIALIZED VIEW"` added at
+      their `internal/parser/ddl.go` construction sites). Auditing `ALTER
+      INDEX RENAME TO` to fix the tag found the rename itself never applied:
+      `execAlterTable`'s index branch (`internal/executor/operators_ddl.go`,
+      reached when `s.Name` resolves via `LookupIndex` rather than a heap
+      table) had no case for `AlterTableRenameTable` at all — it fell
+      through to `// Other ALTER actions on index: silently accept in v0.`
+      and returned success with no catalog mutation. Live-verified against a
+      real `psql`: `ALTER INDEX idx443 RENAME TO idx443_renamed` returned
+      `ALTER TABLE` (pre-fix tag bug) and a follow-up `\d` still showed the
+      old name. Fixed with new `catalog.InMemory.RenameIndex`/
+      `RenameIndexDuringRecovery` (re-keys `c.indexes` + the owning table's
+      `c.byTable` slot, mirroring `RenameTable`), sharing a new
+      `lookupIndexLocked` helper (factored out of `LookupIndex`) that
+      resolves a genuine `""` vs `"public."` catalog-key ambiguity between a
+      live session's bare-name index keys and the M0113
+      `loadUserIndexesFromHeap` restart-reload path's explicit `"public"`
+      resolution — this ambiguity surfaced as a real test failure
+      (`TestRenameIndexSurvivesRestartViaWAL` initially failed with "not
+      found" until the shared lookup was used on both the delete and
+      re-insert sides). New `wal.RecordKindRenameIndex` (byte 94) +
+      `EncodeRenameIndex`/`DecodeRenameIndex`, emitted via
+      `ctx.Pool.LogChangeRecord` — deliberately the same mechanism
+      CREATE/DROP INDEX use (M0079-0001), not the `ctx.WAL.Append` pattern
+      most other slices in this thread use, because `ctx.WAL` is not wired
+      in every executor context that reaches DDL (confirmed by the
+      `internal/initdb` test harness, which never sets it) while `ctx.Pool`
+      always is; `internal/initdb/index_ddl_recovery.go`'s
+      `replayIndexDDLRecords` gains the matching replay case. Tests:
+      `TestAlterIndexRenameToApplies`/`UnknownRelation`/`Collision`/
+      `CommandTag` (`internal/executor/operators_alter_index_rename_test.go`);
+      2 new cases in `TestDDLCommandTagMatchesPostgres`
+      (`internal/server/ddl_command_tag_test.go`);
+      `TestEncodeDecodeRenameIndexRoundTrip` + 2 reject-cases
+      (`internal/wal/rename_index_test.go`);
+      `TestRenameIndexSurvivesRestartViaWAL`
+      (`internal/initdb/index_ddl_recovery_test.go`). Design doc "Follow-up:
+      `ALTER INDEX ... RENAME TO` / `ALTER MATERIALIZED VIEW ... SET SCHEMA`
+      command-tag mistagging AND `ALTER INDEX` was ALSO a functional no-op
+      (DU-002 slice 443)" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb`+`internal/server` suites PASS (full,
+      no regressions); pgbench smoke = pre-commit hook; live `goopg`/`psql`
+      smoke incl. a full server restart confirming the rename survives.
+      Deferred (ledger row appended, fresh discovery — not this slice's
+      scope): materialized views have no restart persistence at all in
+      goopg (a `CREATE MATERIALIZED VIEW` reverts to a plain table after
+      restart), so the `SET SCHEMA` move on top of it doesn't survive
+      either — needs new matview-specific catalog/WAL capability, not a
+      parser-routing/tag fix.
+      **2026-07-04 (loop #58, DU-002 slice 444): `ALTER VIEW` grammar
+      completed in full.** Closes the three sub-forms slice 440's ledger row
+      left open — `RENAME [COLUMN] old TO new` (was a silent no-op, same bug
+      class as slice 440: the `rename`-token short-circuit already consumed
+      it before falling through to the catch-all no-op loop),
+      `ALTER [COLUMN] col SET DEFAULT expr` / `DROP DEFAULT` (PG's
+      updatable-view column-default mechanism), and `SET`/`RESET
+      (view_option_name [= value], ...)`. Per
+      `postgres/doc/src/sgml/ref/alter_view.sgml` these plus slice 440's
+      three (RENAME TO/OWNER TO/SET SCHEMA) are PG's complete 7-form ALTER
+      VIEW grammar — no ALTER VIEW gap remains. All new forms reuse existing
+      `AlterTableRenameColumn`/`AlterTableSetDefault`/`AlterTableDropDefault`/
+      `AlterTableSetReloptions`/`AlterTableResetReloptions` actions and
+      `execAlterTable`'s already-generic (relkind-agnostic) dispatch — no new
+      executor action kinds. `execAlterTableSetReloptions`/
+      `ResetReloptions` gained `security_barrier`/`security_invoker`
+      (boolean) and `check_option` (enum `local`/`cascaded`,
+      case-insensitive, PG's own `22023 invalid value for enum option`
+      wording from `reloptions.c:1677`) — the complete `view_option_name`
+      set. Also found and closed while auditing `RENAME COLUMN`:
+      `AlterTableRenameColumn` had no `syncTableToCatalogHeap` call at all
+      (every sibling column-mutating ALTER arm in the same switch — SET
+      STORAGE, SET COMPRESSION — has one), so a renamed column's new name
+      never reached `pg_dump`/live `pg_attribute` — a pre-existing gap for
+      ordinary `ALTER TABLE RENAME COLUMN` on tables too, not view-specific;
+      closed with the identical delete-then-resync pattern. Tests:
+      `TestAlterViewRenameColumn`/`AlterColumnSetDropDefault`/
+      `SetResetReloptions`/`SetResetCheckOption`
+      (`internal/executor/operators_alter_view_relation_ops_test.go`).
+      Design doc "Follow-up: `ALTER VIEW` sub-forms complete the grammar
+      (DU-002 slice 444)" appended to
+      `docs/design/0110-0001-pg-dump-tap-port.md`; `docs/design/README.md`'s
+      `0110-0001` row updated in the same commit. Gates: `go build ./...`
+      clean; `internal/parser`+`internal/catalog`+`internal/executor`+
+      `internal/wal`+`internal/initdb`+`internal/server` suites PASS (full,
+      no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      pgbench smoke = pre-commit hook; live `goopg`/`psql`/`pg_dump` (PG 18.3
+      client) smoke confirming both table and view `RENAME COLUMN` round-trip
+      through `pg_dump`. Deferred (ledger row appended, fresh discovery, NOT
+      introduced by this slice and NOT view-specific — reproduces
+      identically with plain `SET STORAGE`, no RENAME COLUMN or view
+      involved): a multi-statement simple-query batch where an earlier
+      statement's catalog-heap resync is followed by a later statement that
+      fails in the SAME batch leaves the relation's `pg_attribute` heap rows
+      empty rather than rolling back the whole implicit batch transaction as
+      real PostgreSQL's simple-query semantics require — an atomicity
+      violation in `internal/server/dispatch.go`'s
+      `dispatchSimpleQueryViaExecutor`, out of scope for this bounded
+      parser-grammar loop (WAL/MVCC-class transaction-atomicity bug).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit
@@ -5232,9 +5573,308 @@ documentation-only and is exempt from the design-doc requirement.)
       pre-commit hook. Design doc: `0119-0004-database-config-set-pgdump.md`
       "Follow-up: ... special-form GUC translation (loop #78)", indexed as
       `0119-0004cp` in `docs/design/README.md`.
+      **2026-07-03 (loop #79): `SET ... FROM CURRENT` LANDED — closes the
+      loop #78 residual, the last named gap in the ALTER DATABASE/ROLE
+      `SET`/`RESET` special-syntax battery.** `parseAlterDatabaseConfig`/
+      `parseAlterRoleConfig` gained a `var_name FROM CURRENT` detection
+      (new `fromCurrent bool` op field, `configValue` resolved later);
+      `applyAlterDatabaseConfig`/`applyAlterRoleConfig` gained a new
+      `currentGUCResolver` parameter consulted after the existing
+      "other database" no-op checks, raising PG's exact `unrecognized
+      configuration parameter "%s"` (42704) for an unresolved name.
+      `dispatch.go` builds the resolver once per dispatch call from
+      `sess.Get` (same accessor `SHOW` uses) and threads it through
+      `tryHandleDatabaseDDL`/`tryHandleRoleDDL`'s new third parameter.
+      Live-verified against both goopg and a separately-`initdb`'d real PG
+      18.3. Tests: `TestParseAlterDatabaseConfig`/`TestParseAlterRoleConfig`
+      extended; new `TestTryHandleDatabaseDDLAlterDatabaseConfigFromCurrent`/
+      `TestTryHandleRoleDDLAlterRoleConfigFromCurrent`. Gates: `go build
+      ./...`/`go vet ./...` clean; `go test ./internal/server/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      `scripts/ralph-precommit-test.sh` PASS (pgbench smoke, 0 failed).
+      Design doc: `0119-0004-database-config-set-pgdump.md` "Follow-up:
+      `SET ... FROM CURRENT` (loop #79)", indexed as `0119-0004cq`.
+      **Deferred (ledger row appended):** (1) goopg's `SessionRegistry.Get`
+      has no PG-style unit-display formatter, so `FROM CURRENT` (and the
+      pre-existing `SHOW`) store/print the raw canonical value
+      (`work_mem=78848`) instead of PG's unit-suffixed display form
+      (`work_mem=77MB`) — confirmed pre-existing via a live `SHOW work_mem`
+      A/B, not introduced this loop. (2) the database-DDL error path
+      (`dispatch.go` ~line 112) maps every `tryHandleDatabaseDDL` error to a
+      single hardcoded `sqlstate.SystemError`, unlike the role-DDL side's
+      typed `roleError`/`roleErrorSQLState` — pre-existing, newly visible
+      via this loop's new 42704-worthy error case. **All six-plus-one named
+      `set_rest`/`set_rest_more` special forms for ALTER DATABASE/ROLE are
+      now handled; remaining M0119-0004-ACLHEAP residuals are the
+      extended-protocol-only dispatch gap, multi-database scope, the
+      `pg_dumpall` cluster-wide-dump surface, and `ALTER ROLE ALL SET ...`.**
+      **2026-07-03 (loop #80): database-DDL error SQLSTATE fidelity
+      LANDED** — closes deferred item (2) of the loop #79 note above. New
+      `databaseDDLError{code, msg}` (`internal/server/database_ddl.go`)
+      mirrors `roleError`; `databaseDDLErrorSQLState` mirrors
+      `roleErrorSQLState`. `dispatch.go`'s `tryHandleDatabaseDDL` call site
+      now maps errors via `databaseDDLErrorSQLState` instead of a hardcoded
+      `sqlstate.SystemError`. All four error sites converted:
+      `CREATE DATABASE` duplicate → 42P04 (+ message now includes the
+      database name, matching PG's `dbcommands.c` text — previously bare
+      "database already exists"); `DROP DATABASE` undefined → 3D000;
+      `... SET name FROM CURRENT` unresolved GUC → 42704; the unreachable
+      "missing database name" guard → 42601, for consistency. New test
+      `TestDatabaseDDLErrorSQLState`. Gates: build/vet clean;
+      `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); full `scripts/ralph-precommit-test.sh` PASS (pgbench
+      smoke, 0 failed). Design doc: `0119-0004-database-config-set-pgdump.md`
+      "Follow-up: database-DDL error SQLSTATE fidelity (loop #80)", indexed
+      as `0119-0004cr`. Deferred item (1) (GUC unit-display formatting)
+      remains open, unrelated scope — no new deferral needed, this closes
+      the loop #79 row's item (2) in full.**
+      **2026-07-03 (loop #81): GUC unit-display formatting LANDED** — closes
+      deferred item (1) of the loop #79 note in full. New
+      `config.Variable.FormatDisplayValue` (`internal/config/guc.go`) mirrors
+      `convert_int_from_base_unit`; `SessionRegistry.GetDisplay`/`AllDisplay`
+      layer it onto `Get`/`All` (which stay untouched for internal Go
+      consumers). `executor.Context` gained optional
+      `GetSettingDisplay`/`AllSettingsDisplay`, wired at every real display
+      boundary (`SHOW`/`SHOW ALL`, `current_setting()`/`set_config()`, the
+      `FROM CURRENT` resolver). Live-verified against goopg + real PG 18.3
+      byte-for-byte (`work_mem`, `checkpoint_timeout`, etc., incl. the bare-`0`
+      disabled case). Tests: `TestFormatDisplayValue`/
+      `TestSessionRegistryGetDisplay`. Gates: build/vet clean;
+      `internal/config`+`internal/server`+`internal/executor` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      `scripts/ralph-precommit-test.sh` PASS (pgbench smoke). Design doc:
+      "Follow-up: GUC unit-display formatting (loop #81)", indexed as
+      `0119-0004cs`. No new deferrals — both loop #79 deferred items now
+      resolved.
+      **2026-07-03 (loop #82): `ALTER ROLE ALL SET/RESET ...` LANDED** —
+      closes the last-named M0119-0004-ACLHEAP residual called out in the
+      loop #79 note (`role_specification = ALL`, PG's cluster-wide-default
+      form). New `alterRoleConfigOp.allRoles bool`
+      (`internal/server/role_ddl.go`); `parseAlterRoleConfig` detects the
+      bare UNQUOTED `ALL` token right after `ALTER ROLE`/`ALTER USER` (a
+      quoted `"ALL"`/`"all"` is still a real role identifier);
+      `applyAlterRoleConfig` skips the `catalog.RoleOID` lookup when
+      `op.allRoles`, leaving `roleOid=0` (mirrors PG's `AlterRoleSet` leaving
+      `roleid=InvalidOid`) instead of the pre-existing code's incorrect
+      `role "all" does not exist` error. No WAL/catalog schema change needed.
+      Live-verified against goopg + real PG 18.3: identical three-row
+      `pg_db_role_setting` shape for `ALTER ROLE ALL SET`/`ALTER ROLE foo
+      SET`/`ALTER ROLE ALL IN DATABASE ... SET`; `RESET` and quoted-`"ALL"`
+      negative case both match PG; restart persistence confirmed. Tests:
+      `TestParseAlterRoleConfig` extended (6 `ALL` shapes + 2 quoted
+      cases); new `TestTryHandleRoleDDLAlterRoleAll`. Gates: build/vet
+      clean; `internal/server` suite PASS; live psql + real-PG A/B;
+      `scripts/tpch-spotcheck.sh` PASS; full `scripts/ralph-precommit-test.sh`
+      PASS. Design doc: "Follow-up: `ALTER ROLE ALL SET/RESET ...` (loop
+      #82)", indexed as `0119-0004ct`. **Deferred (ledger row appended):**
+      `ResetRoleConfig`/`ResetDatabaseConfig` (`internal/catalog/catalog.go`)
+      never delete the map key when an entry slice becomes empty after a
+      RESET, so `pg_db_role_setting` keeps a stale blank-`setconfig` row
+      where real PG deletes it entirely — pre-existing, reproduces for named
+      roles too, out of this loop's bounded scope.**
+      **2026-07-03 (loop #83): phantom empty-`setconfig` `pg_db_role_setting`
+      row after last RESET FIXED** — closes the loop #82 deferral above.
+      `ResetDatabaseConfig`/`ResetRoleConfig` (`internal/catalog/catalog.go`)
+      now `delete()` the map key outright when the last entry is removed,
+      mirroring `ResetAllDatabaseConfig`/`ResetAllRoleConfig`'s existing
+      full-delete semantics; `AllRoleConfigRows` had no `len(entries) > 0`
+      guard (unlike the `setrole=0` branch beside it), so a lingering
+      empty-slice map entry always surfaced as a spurious row with
+      `setconfig={}`. Tests: `TestResetDatabaseConfigLastEntryDeletesMapKey`/
+      `TestResetRoleConfigLastEntryDeletesMapKey`. Gates: build/vet clean;
+      `internal/catalog`+`internal/server`+`internal/initdb` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS. Design doc: "Follow-up: phantom
+      empty-`setconfig` row after last RESET (loop #83)", indexed as
+      `0119-0004cu`. No new deferrals.
+      **2026-07-03 (loop #84): extended-protocol dispatch hook for
+      CREATE/DROP/ALTER DATABASE/ROLE LANDED** — closes the standing
+      "extended-protocol path has no equivalent hook" residual named by
+      every M0119-0004-ACLHEAP row since loop #17. New
+      `Server.tryHandleDatabaseOrRoleDDLExtended`
+      (`internal/server/dispatch_extended.go`) mirrors the simple-query
+      bypass, wired into `executeExtendedQueryViaExecutor`'s parse-error
+      branch; a client defaulting to the Parse/Bind/Execute protocol
+      (JDBC/npgsql/psycopg2) previously got a silent 42601 for these DDL
+      forms instead of the DDL applying. Tests:
+      `TestExtendedProtocolDatabaseAndRoleDDL`/
+      `TestExtendedProtocolRoleDDLError`
+      (`internal/server/dispatch_extended_ddl_test.go`). Gates: build/vet
+      clean; `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS.
+      Design doc: "Follow-up: extended-protocol dispatch hook for
+      DATABASE/ROLE DDL (loop #84)", indexed as `0119-0004cv`. Deferred
+      (ledger row appended): (1) NoticeResponse forwarding, (2) errdetail
+      forwarding, and (3) `compatNoopCommandTag`'s much broader
+      extended-protocol gap.
+      **2026-07-03 (loop #85): extended-protocol Notice/Detail forwarding
+      LANDED, plus a real `DROP DATABASE` dead-stub bug FOUND AND FIXED** —
+      closes loop #84's deferred items (1)/(2). `extendedQueryResult` gained
+      `Notice string`; `extendedQueryError`/`extendedMessageError` gained
+      `Detail string`; `handleExecuteFrame`/`writeExtendedMessageError` wire
+      them through. While writing the regression test for (1)
+      (`DROP DATABASE IF EXISTS <nonexistent>` should emit a NOTICE), found
+      that `DROP DATABASE` has real parser grammar (`DropCompatStmt`'s
+      `database` arm, added after M0054-0001's catalog-backed bypass,
+      unaware of it) so `parser.Parse` never fails for it — the real
+      catalog-backed `tryHandleDatabaseDDL` DROP branch was entirely
+      unreachable on BOTH protocols, and every `DROP DATABASE` instead hit
+      `execDropCompat`'s `objType == "database"` arm
+      (`internal/executor/operators_ddl.go` ~13236), a hardcoded
+      pre-catalog-tracking stub that always reports "does not exist"
+      regardless of real catalog state. `DROP DATABASE` on a database a
+      prior `CREATE DATABASE` actually created therefore ALWAYS spuriously
+      failed — a real, protocol-independent correctness bug invisible to
+      prior unit tests (they called `tryHandleDatabaseDDL` directly,
+      bypassing the wire-dispatch entry point where the parser wins). Fixed
+      with a pre-`parser.Parse` check
+      (`classifyDatabaseDDL(sql) == databaseDDLDrop`) in both
+      `dispatchSimpleQueryViaExecutor` and `executeExtendedQueryViaExecutor`,
+      routing to a new shared `Server.handleDatabaseDDLBypass` helper
+      (factored out of the pre-existing inlined notice/error/tag/
+      `ReadyForQuery` sequence) so the real catalog-backed DROP wins over the
+      dead stub; falls through unchanged to the legacy stub when no real
+      catalog is plumbed (embedded/test paths). Tests:
+      `TestExtendedProtocolDatabaseDDLNotice`,
+      `TestExtendedProtocolRoleDDLErrorDetail`,
+      `TestSimpleQueryDropDatabaseActuallyDrops`
+      (`internal/server/dispatch_extended_ddl_test.go`). Gates: build/vet
+      clean; `internal/server`+`internal/catalog`+`internal/parser`+
+      `internal/executor`+`internal/initdb` suites PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); full
+      `scripts/ralph-precommit-test.sh` PASS. Design doc: "Follow-up:
+      extended-protocol Notice/Detail forwarding + a real `DROP DATABASE`
+      dead-stub bug found while testing it (loop #85)", indexed as
+      `0119-0004cw`. Deferred (ledger row appended): item (3)
+      (`compatNoopCommandTag`'s extended-protocol parity) remains open,
+      unchanged; the parser grammar + executor stub for `DROP DATABASE` are
+      left in place as the intentional no-catalog fallback, not deleted.
+      **2026-07-03 (loop #86): `compatNoopCommandTag` extended-protocol
+      parity, first slice LANDED** — starts closing item (3) of the loop
+      #84/#85 rows. New `Server.tryCompatNoopExtended`
+      (`internal/server/dispatch_extended.go`) calls the existing shared
+      `compatNoopCommandTag(sql)` fallback (GRANT/REVOKE/CREATE SCHEMA/
+      COMMENT ON/SECURITY LABEL forms the parser doesn't recognise at all)
+      and returns a bare CommandTag result, wired into
+      `executeExtendedQueryViaExecutor`'s parse-error branch right after
+      `tryHandleDatabaseOrRoleDDLExtended` — a client using Parse/Bind/
+      Execute for one of these forms previously got a hard 42601 where
+      psql's simple-query default silently absorbed it. `CREATE SCHEMA`'s
+      catalog-registration + WAL-persistence side effect (previously
+      inlined in the simple-query branch) was factored into a new shared
+      `Server.registerCompatNoopSchema` (`dispatch.go`), called from both
+      protocols. Tests: `TestExtendedProtocolCompatNoopSchema`
+      (`internal/server/dispatch_extended_ddl_test.go`) — CREATE SCHEMA
+      over a real wire Parse/Bind/Execute/Sync sequence. Gates: build/vet
+      clean; `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc: "Follow-up: `compatNoopCommandTag`
+      extended-protocol parity, first slice (loop #86)", indexed as
+      `0119-0004cx`. Deferred (ledger row appended): only CREATE SCHEMA got
+      a dedicated regression test; a future pass should test each
+      remaining GRANT/REVOKE/COMMENT ON/SECURITY LABEL unparseable
+      sub-form individually — item (3) remains a multi-loop sub-task.
+      **2026-07-03 (loop #87): reachability audit + correction of the loop
+      #86 follow-up plan.** The loop #86 row's plan ("test each remaining
+      GRANT/REVOKE/COMMENT ON/SECURITY LABEL sub-form") rested on a wrong
+      premise for 3 of the 4 forms: `internal/parser/parser.go`'s
+      `case "grant", "revoke"` (~1046) and `case "security"` (~1176)
+      dispatch arms never fail to parse a single well-formed statement (no
+      required structure, no error path), so `compatNoopCommandTag`/
+      `tryCompatNoopExtended` can never fire for them — confirmed with
+      probes including the loop #86 row's own named examples. Only
+      `COMMENT ON` genuinely reaches the fallback, and only for a
+      malformed clause of a *supported* `ObjKind` (e.g. `COMMENT ON TABLE`
+      with no name); unsupported kinds are a deliberate silent no-op
+      (M0097-0023) that also never fails to parse. New
+      `TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable`
+      pins the unreachability directly; new
+      `TestExtendedProtocolCompatNoopCommentOnMalformed` drives the one
+      reachable case over both wire protocols, confirming parity (both
+      `internal/server/dispatch_extended_ddl_test.go`). Gates: build/vet
+      clean; `internal/server` suite PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc: "Correction (loop #87)" section of
+      `0119-0004-database-config-set-pgdump.md`, indexed as `0119-0004cy`.
+      Deferred (ledger row appended): found a NEW, broader,
+      protocol-independent gap while probing — a multi-statement
+      simple-query batch whose first statement is a well-formed
+      `compatNoopCommandTag`-matched prefix followed by a later
+      genuinely-invalid statement makes the whole `parser.Parse` call
+      fail, and `compatNoopCommandTag` then matches the raw multi-statement
+      text's leading prefix, silently absorbing the entire batch as a bare
+      success instead of the `42601` real PostgreSQL raises. Applies to
+      every `compatNoopCommandTag` prefix (not just GRANT/REVOKE/COMMENT/
+      SECURITY LABEL); item (3) is otherwise now closed to the extent it
+      can meaningfully be — no further individual sub-form tests are
+      needed since the remaining forms are unreachable.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
-      section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
-      PG-decodable FPI/heap WAL (+ index AMs for the server tier).
+      section). **`002_save_fullpage.pl` (WD-003) DONE.** **Remaining:**
+      `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering)
+      — needs hash/gin/gist/spgist/brin AMs, unrelated to the WD-003 fix below.
+      **Prune/VACUUM canonical-WAL gap FIXED 2026-07-03 (loop #91):** new
+      `catalog.PgCanonicalHeapPrune` (`internal/catalog/canonical.go`, new
+      `RM_HEAP2_ID`-based rmgr, `XLOG_HEAP2_PRUNE_ON_ACCESS`/`_VACUUM_SCAN`)
+      wired into both the opportunistic `markHeapPruneOptDirty` fallback
+      (`internal/executor/operators_storage.go`, new
+      `emitCanonicalHeapPruneLocked`) and the real `VACUUM` path
+      (`internal/vacuum/vacuum.go`'s new `VacuumOptions.LogCanonical` field,
+      threaded from `operators_vacuum.go`). Tests:
+      `TestBuildCanonicalHeapPrunePayload`/`TestPgCanonicalHeapPrune_NilLogFn`
+      (`internal/catalog`), `TestVacuumWithOptionsEmitsCanonicalPruneRecord`/
+      `TestVacuumWithOptionsNilLogCanonicalIsNoop` (`internal/vacuum`),
+      `TestOpportunisticPruneEmitsCanonicalWAL` (`internal/executor`). Design
+      doc `docs/design/0110-0002-pg-waldump-tap-port.md` "2026-07-03:
+      prune/VACUUM canonical-WAL fix (LANDED)". Deferral ledger row 419
+      flipped to `resolved`; new row appended.
+      **Live round-trip + temp-table question CLOSED 2026-07-04 (loop #26):**
+      new `TestPort_PgWaldumpVacuumPruneRoundtrip`
+      (`internal/testport/pgwaldump_vacuum_prune_test.go`) drives a real
+      DELETE+VACUUM workload and runs the upstream `pg_waldump --rmgr=Heap2`
+      binary against the resulting WAL, asserting a decoded
+      `PRUNE_VACUUM_SCAN` record for the correct relation locator with no
+      structural error (PASS ×3, no flake). New CSV row `WD-004`
+      (`port`/`pass_required=yes`; `postgres-oracle-port-status.csv`,
+      regenerated `.md` via `go run ./cmd/gen-oracle-port-status`). Separately
+      confirmed via `postgres/src/include/utils/rel.h`'s `RelationNeedsWAL`
+      macro that temp relations never need WAL in real PG (`RelationIsPermanent`
+      is false for `RELPERSISTENCE_TEMP`), so `pruneTouchedTempPages`
+      (`internal/executor/operators_indexonly.go:284`, already temp-only
+      gated) correctly stays without canonical-WAL emission — no code change,
+      confirmed N/A rather than unconfirmed. Design doc "2026-07-04: live
+      `pg_waldump --rmgr=Heap2` round-trip + temp-table N/A confirmation".
+      Deferral ledger row appended (M0119-0005, resolved). **Still open:**
+      only `001_basic.pl`'s server-dependent tier (hash/gin/gist/spgist/brin
+      AMs) remains for this item.
+- [x] **`pg_waldump --save-fullpage` (WD-003, `002_save_fullpage.pl`).**
+      **COMPLETE 2026-07-03:** `TestPort_PgWaldump002SaveFullpage`
+      (`internal/testport/pgwaldump_savefullpage_test.go`) now PASSes (was
+      `t.Skip`ped). Root cause: `tryApplyHOTUpdate`
+      (`internal/executor/operators_storage.go` ~3300) never emitted a
+      PG-canonical FPI record on the HOT-update path — only goopg's native
+      opaque record via `markHeapHotUpdateDirty` — so an unindexed table's
+      `UPDATE` (always HOT-eligible) left `pg_waldump --save-fullpage` with
+      zero blocks to extract for any relation, regardless of the CTAS INSERT
+      records that already worked. Fixed with a new `emitCanonicalHeapHotUpdate`
+      helper reusing the existing `catalog.PgCanonicalHeapInplace`
+      (XLOG_HEAP_INPLACE), mirroring `emitCanonicalHeapInsert`/
+      `emitCanonicalHeapDelete`'s established pattern. Also fixed the test's own
+      relation-locator resolution: it read the DB component from
+      `pg_database.oid`, a documented legacy display placeholder that does not
+      match the real on-disk OID goopg's WAL/storage layer uses — switched to
+      globbing `base/<dbOid>/<relnode>`, the same workaround
+      `pgamcheck004_port_test.go`'s `findHeapFile` already uses for the
+      identical gap. Verified via a manual `goopg init`/`start`/psql/`pg_waldump`
+      round-trip: the real upstream binary extracts 200 correctly-named+ordered
+      FPI files (100 CTAS INSERT + 100 HOT UPDATE). CSV: `WD-002` split into the
+      still-deferred `001_basic.pl` server tier + new `WD-003`
+      (`port`/`pass_required=yes`). Design doc
+      `docs/design/0110-0002-pg-waldump-tap-port.md` updated; README.md
+      unaffected (no new design doc file). Gates: `go build ./...` clean;
+      `gofmt -l` clean on touched files; `go test ./internal/executor/...`
+      PASS; `TestPort_PgWaldump002SaveFullpage` PASS ×3 (no flake);
+      `go test ./internal/testport/...` /
+      `./internal/catalog/... ./internal/wal/... ./internal/initdb/...` PASS
+      (full, no regression); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+      pre-commit hook. Deferral ledger row appended. Still open: `001_basic.pl`
+      server tier (index AMs) and an unaudited `markHeapPruneOptDirty` HOT-class
+      check (see ledger row).
 - [ ] **M0119-0006 — pg_amcheck server tier** (source: M0110-0003; see M0110
       ledger rows). `002_nonesuch` … `005_opclass_damage`; `CREATE EXTENSION
       amcheck` + `verify_heapam()` SRF on top of `internal/amcheck` + opclass
@@ -6706,6 +7346,367 @@ documentation-only and is exempt from the design-doc requirement.)
       user-defined) — a separate, larger task; fresh deferral-ledger row
       appended. Still open: sub-items (a) options discarded, (d) only 7
       curated subtypes resolve a default opclass.
+- [x] **CHECK `... NOT ENFORCED` (PG18) round-trip in pg_dump (M0110-0001,
+      DU-002 slice 430).** **COMPLETE 2026-07-04:** goopg's parser already
+      accepted the `NOT ENFORCED`/`ENFORCED` trailer in all four CHECK-
+      constraint forms (anonymous table-level, named table-level, inline
+      column-level, `ALTER TABLE ADD CONSTRAINT`) but only as a discard —
+      `pg_constraint.conenforced` was hardcoded `'t'` everywhere
+      (`internal/catalog/catalog.go`), so a constraint the user explicitly
+      created as unenforced silently came back "enforced" from `pg_dump`.
+      Landed: `CheckNotEnforced`/`TableCheckNotEnforced`/
+      `PartitionCheckConstraint.NotEnforced`/`AlterTableAction.
+      CheckNotEnforced` (`internal/parser/ast.go`) threaded through all four
+      parser call sites (`internal/parser/ddl.go`, mirroring the pre-existing
+      `NoInherit` plumbing); `catalog.NamedCheckConstraint.NotEnforced` plus a
+      new unifying `(*Table) AddCheckFull(name, expr string, oid uint32,
+      notValid, noInherit, notEnforced bool)` that `AddCheck`/
+      `AddCheckWithNotValid`/`AddCheckWithNoInherit` now delegate to
+      (`internal/catalog/catalog.go`); the `pg_constraint` virtual builder
+      projects `conenforced='f'` for such a row and — mirroring real PG's
+      `ATAddCheckNNConstraint` (`skip_validation = !is_enforced`) — also
+      `convalidated='f'`; `pg_get_constraintdef`'s CHECK branch
+      (`internal/executor/expr.go`) now matches `ruleutils.c`'s exact
+      precedence (checks `conenforced` FIRST, appends ` NOT ENFORCED`, and
+      only falls back to ` NOT VALID` when the constraint IS enforced).
+      Because `pg_dump` itself marks a constraint `separate = !validated`,
+      the corrected `convalidated` projection is what makes real `pg_dump`
+      pull even an *inline*-written NOT ENFORCED CHECK out into its own
+      post-data `ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED;` statement
+      — no pg_dump-side code touched, this falls out of the corrected
+      `pg_constraint` rows alone. New `TestPort_PgDumpConnectionSetup`
+      fixtures `nenf_alter`/`nenf_inline` (slice 430) verified byte-identical
+      vs live `pg_dump` 18.3. New unit tests: `TestParseCheckNotEnforced`
+      (`internal/parser/check_alter_test.go`);
+      `TestCheckConstraintNotEnforcedAlterTable`,
+      `TestCheckConstraintNotEnforcedCreateTableForms`,
+      `TestCheckConstraintPlainNotValidStillRendersNotValid` (new
+      `internal/executor/operators_ddl_check_notenforced_test.go`). Gates:
+      `go build ./...`/`go vet ./...` clean; `gofmt -l` clean on every
+      touched file (pre-existing go1.25-vs-go1.26.3 struct-alignment
+      mismatch confirmed unaffected via `git stash` diffing);
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (full runs, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Design doc: `docs/design/0110-0001-pg-dump-tap-
+      port.md` new "Follow-up: `CHECK ... NOT ENFORCED` (PG18) round-trip in
+      pg_dump (slice 430)" section; deferral ledger row appended.
+      **2026-07-04 (loop #94, DU-002 slice 431): `FOREIGN KEY ... NOT
+      ENFORCED` (PG18) LANDED — closes the slice 430 deferral above.**
+      `internal/parser/ddl.go`'s ALTER TABLE ADD FOREIGN KEY trailer loop
+      gained a `NOT ENFORCED`/bare `ENFORCED` branch (new
+      `AlterTableAction.FKNotEnforced`); `catalog.ForeignKey.NotEnforced`
+      drives `pg_constraint.conenforced='f'`/`convalidated='f'` and
+      `buildForeignKeyDefString` gives it precedence over NOT VALID, mirroring
+      the CHECK form exactly. Beyond dump fidelity, this loop also closed the
+      *behavioral* gap: real PG creates zero RI triggers for a NOT ENFORCED FK
+      (`tablecmds.c:11065`/`:10920`), so `checkFKInsertForConstraints`
+      (`internal/executor/operators_fk.go`) and `enforceFKOnDelete` now skip a
+      `NotEnforced` FK entirely (not merely deferred — never checked), and
+      `AlterTableValidateConstraint` rejects `VALIDATE CONSTRAINT` on one with
+      `55000` (mirrors `ATExecValidateConstraint`'s own guard). Tests:
+      `TestParseFKNotEnforced` (`internal/parser/fk_not_enforced_test.go`);
+      `TestFKNotEnforcedAlterTable`,
+      `TestFKNotEnforcedPlainNotValidStillRendersNotValid`,
+      `TestFKNotEnforcedSkipsRuntimeCheck`,
+      `TestFKNotEnforcedValidateConstraintErrors` (new
+      `internal/executor/operators_fk_not_enforced_test.go`); new
+      `TestPort_PgDumpConnectionSetup` fixture `fknenf_parent`/`fknenf_child`
+      verified vs live `pg_dump` 18.3. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `FOREIGN KEY ...
+      NOT ENFORCED` (PG18) round-trip in pg_dump (loop #94, slice 431)".
+      Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (full, no regression); `TestPort_PgDumpConnectionSetup` PASS;
+      `internal/testport` full suite PASS; `internal/wal`+`internal/initdb`
+      suites PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. Deferral ledger row appended. Still open:
+      `CREATE TABLE`-time FK constraints (inline column-level and table-level
+      forms) accept neither `NOT VALID` nor `NOT ENFORCED` at all — a
+      narrower, pre-existing gap, scoped out per the one-narrow-area-per-loop
+      pattern.
+      **2026-07-04 (loop #95, DU-002 slice 432): `CREATE TABLE`-time FK
+      `NOT VALID`/`NOT ENFORCED` LANDED — closes the loop #94 deferral
+      above.** Both CREATE TABLE-time FK forms (inline column `REFERENCES`
+      in `parseColumnDef` and table-level `FOREIGN KEY (...) REFERENCES ...`
+      in `parseTableForeignKey`, `internal/parser/ddl.go`) now accept and
+      round-trip the same `[NOT] DEFERRABLE`/`NOT VALID`/`[NOT] ENFORCED`
+      trailer the ALTER TABLE form got in loop #94, via a new shared helper
+      `parser.parseFKConstraintAttrs` (next to `parseConstraintDeferrable`)
+      used by all three FK grammar sites — including a refactor of the ALTER
+      TABLE call site itself onto the same helper, closing a small
+      pre-existing asymmetry (no bare `INITIALLY DEFERRED` support without a
+      preceding `DEFERRABLE` keyword) for free. New `ColumnDef.FKNotValid`/
+      `FKNotEnforced` and `TableForeignKeyDef.NotValid`/`NotEnforced`
+      (`internal/parser/ast.go`) thread into `catalog.ForeignKey.NotValid`/
+      `NotEnforced` at both CREATE TABLE FK-registration sites
+      (`internal/executor/operators_ddl.go`). No other executor change was
+      needed: `pg_constraint`'s conenforced/convalidated row builder,
+      `buildForeignKeyDefString`, the FK-insert/on-delete runtime skips, and
+      the VALIDATE CONSTRAINT `55000` guard all already read
+      `catalog.ForeignKey.NotValid`/`NotEnforced` generically (loop #94 built
+      them that way), so they picked up the new call sites automatically.
+      Tests: `TestParseFKNotEnforcedCreateTableTime`
+      (`internal/parser/fk_not_enforced_test.go`);
+      `TestFKNotEnforcedCreateTableTime` (new
+      `internal/executor/operators_fk_not_enforced_create_table_test.go`,
+      covering catalog wiring, `pg_constraint`, `pg_get_constraintdef`, and
+      the runtime skip for both FK forms plus an enforced control); new
+      `TestPort_PgDumpConnectionSetup` fixtures `ctfknenf_parent`/
+      `ctfknenf_child` (inline) and `cttlfknenf_parent`/`cttlfknenf_child`
+      (table-level), asserted to dump identically to the loop #94
+      ALTER TABLE-authored form. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `CREATE
+      TABLE`-time FK `NOT VALID`/`NOT ENFORCED` (loop #95, DU-002 slice
+      432)"; `docs/design/README.md` row `0110-0001` addendum appended.
+      Gates: `go build ./...` clean; `internal/parser`+`internal/catalog`+
+      `internal/executor` suites PASS (full, no regression);
+      `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`, per this
+      project's documented convention of never running the whole
+      `internal/testport` package as a suite — a full-package
+      `go test ./internal/testport/...` run hit Go's default 10-minute
+      per-package `-timeout` mid-`TestPort_IsolationMultipleRowVersions`, an
+      accumulated-runtime artifact of the package's TAP/isolation-spec
+      volume unrelated to this slice, not a test failure);
+      `scripts/tpch-spotcheck.sh` PASS (rerun fresh: Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. No new deferral: all three FK-constraint
+      parse sites now accept and round-trip the same `NOT VALID`/
+      `NOT ENFORCED` trailer — the FK
+      grammar-coverage thread closes cleanly. Resume for `002-010` proper is
+      still the next catalog-getter gap surfaced by
+      `TestPort_PgDumpConnectionSetup`.
+      **2026-07-04 (DU-002 slice 433): `ALTER TABLE ... ALTER CONSTRAINT`
+      (PG18) LANDED — a new grammar entirely, not a slice-430/431/432
+      follow-up.** Real PG lets an ALREADY-EXISTING constraint's
+      deferrability and/or enforceability be re-declared after the fact via
+      `ALTER TABLE t ALTER CONSTRAINT name ConstraintAttributeSpec`
+      (restricted to FOREIGN KEY constraints only — verified against live
+      PostgreSQL 18.3, throwaway `initdb`+`pg_ctl` cluster port 5599); goopg
+      had NO support for this form at all — `ALTER TABLE t ALTER
+      CONSTRAINT ...` either mis-parsed `CONSTRAINT` as an `ALTER COLUMN`
+      column identifier (both start with the bare `ALTER` keyword) or
+      hard-failed. New `parser.AlterTableAlterConstraint` action kind +
+      `AlterTableAction.AlterConstraintDeferrable/InitiallyDeferred/
+      Enforced` plus a `Has*` flag per attribute class
+      (`internal/parser/ast.go`), mirroring `ATAlterConstraint.
+      alterDeferrability`/`alterEnforceability` so `ALTER CONSTRAINT c NOT
+      ENFORCED` alone doesn't also reset deferrability. New
+      `parser.parseAlterConstraintAttrs` (`internal/parser/ddl.go`, next to
+      `parseFKConstraintAttrs`) parses `[NOT] DEFERRABLE [INITIALLY
+      DEFERRED|IMMEDIATE]`/`[NOT] ENFORCED` in either order — deliberately
+      NOT `NOT VALID`, which real PG's own grammar action rejects here
+      (`processCASbits`, gram.y ~19513). New dispatch branch in
+      `parseAlterTableStmt`, placed immediately before the pre-existing
+      generic `ALTER COLUMN` branch and gated on `CONSTRAINT` (not
+      `COLUMN`) as the very next token after `ALTER`. New `(*ddlOp)
+      execAlterTableAlterConstraint`/`nonFKConstraintExists`
+      (`internal/executor/operators_ddl.go`, alongside
+      `execAlterTableDropConstraint`) look up the named FK, mutate only the
+      attribute class(es) actually named (`Deferrable`/`InitiallyDeferred`,
+      or `NotEnforced = !Enforced` + `NotValid = !Enforced` mirroring
+      `AlterConstrUpdateConstraintEntry`'s `convalidated = is_enforced`),
+      and raise the same `42809`/`42704` real PG raises (verified live,
+      exact message text) for a non-FK or undefined name. Acquires
+      `AccessExclusiveLock` per `AlterTableGetLockLevel` → `AT_AlterConstraint`
+      (tablecmds.c ~4703). No changes needed to `pg_constraint`,
+      `buildForeignKeyDefString`, or the FK-insert/on-delete runtime
+      skips — all already read `catalog.ForeignKey`'s mutated fields
+      generically since slice 431, so a live `ALTER CONSTRAINT` takes
+      effect immediately for both dump output and subsequent DML. Tests:
+      `TestParseAlterTableAlterConstraint` (new
+      `internal/parser/alter_constraint_test.go`, 5 cases incl. a control
+      confirming `ALTER COLUMN a TYPE bigint` still dispatches correctly);
+      `TestFKAlterConstraint` (new
+      `internal/executor/operators_fk_alter_constraint_test.go`, 4 cases:
+      NOT ENFORCED→ENFORCED round trip incl. `pg_constraint`/
+      `pg_get_constraintdef`/runtime-skip toggling live, a
+      DEFERRABLE-only statement leaving enforceability untouched, a CHECK
+      constraint rejected with `42809`, an undefined name rejected with
+      `42704`); new `TestPort_PgDumpConnectionSetup` fixture
+      `acfknenf_parent`/`acfknenf_child` (FK added enforced via plain `ADD
+      CONSTRAINT`, then flipped via `ALTER CONSTRAINT ... NOT ENFORCED`)
+      verified to dump byte-identically to slice 431's directly-declared
+      `fknenf_fk`. Design doc `docs/design/0110-0001-pg-dump-tap-port.md`
+      "Follow-up: `ALTER TABLE ... ALTER CONSTRAINT` (PG18) round-trip in
+      pg_dump (DU-002 slice 433)"; `docs/design/README.md` row `0110-0001`
+      addendum appended. Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/parser`+`internal/catalog`+`internal/executor` suites PASS
+      (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+      PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33); pgbench smoke = pre-commit hook. **Two new discoveries,
+      deliberately deferred, ledger row appended:** (1) unlike real PG,
+      goopg's `ALTER CONSTRAINT ... ENFORCED` transition does not perform a
+      phase-3 dangling-reference scan before re-enforcing — flag-flip only,
+      matching (not worsening) `VALIDATE CONSTRAINT`'s own pre-existing
+      flag-only simplification (dump fidelity unaffected). (2) Live-
+      confirmed (throwaway probe, not merged): `ALTER TABLE ... DROP
+      CONSTRAINT` only searches `NamedChecks`/`PRIMARY KEY` by name —
+      dropping a real FOREIGN KEY or `UNIQUE` constraint misreports `42704
+      does not exist`; pre-existing, unrelated to this slice's own
+      grammar, noticed while reading the function this slice's
+      wrong-object-type lookup borrows from.
+      **2026-07-04 (DU-002 slice 433 follow-up): `ALTER TABLE ... DROP
+      CONSTRAINT` for FOREIGN KEY / UNIQUE LANDED — closes discovery (2)
+      above.** `execAlterTableDropConstraint`
+      (`internal/executor/operators_ddl.go`) now searches CHECK → FOREIGN
+      KEY → UNIQUE → PRIMARY KEY by name (matching real PG's name-based
+      `pg_constraint`/`ATExecDropConstraint` lookup) instead of only
+      CHECK/PRIMARY KEY; two new `catalog.InMemory` methods,
+      `DropForeignKeyConstraint` (splices `Table.ForeignKeys` directly, an
+      FK isn't index-backed) and `DropUniqueConstraint` (shares a new
+      `dropIndexByName` helper with the refactored `DropPrimaryKeyConstraint`,
+      since a UNIQUE constraint is index-backed exactly like a PK). No
+      `pg_constraint`/`pg_get_constraintdef`/FK-runtime-check changes
+      needed — all already read the mutated sources of truth generically.
+      Tests: `TestDropConstraintForeignKeyAndUnique`
+      (`internal/executor/operators_fk_unique_drop_constraint_test.go`),
+      verifying both the catalog removal AND the runtime behavior change
+      (a previously-rejected dangling FK insert now succeeds; a
+      previously-rejected duplicate UNIQUE value now inserts; an unrelated
+      sibling PRIMARY KEY survives a UNIQUE drop untouched). Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `ALTER TABLE
+      ... DROP CONSTRAINT` for FOREIGN KEY / UNIQUE (DU-002 slice 433
+      follow-up)"; `docs/design/README.md` row `0110-0001` addendum
+      appended. Gates: `go build ./...`/`go vet ./...` clean;
+      `internal/catalog`+`internal/executor`+`internal/parser` suites PASS
+      (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+      PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33); pgbench smoke = pre-commit hook. Deferred (ledger row
+      appended): `EXCLUDE` constraints remain unreachable through this DROP
+      CONSTRAINT path (no live-confirmed gap surfaced this loop, left out
+      of the bounded scope); discovery (1) above (`ALTER CONSTRAINT ...
+      ENFORCED`'s missing phase-3 dangling-reference scan) remains
+      untouched, unrelated to this row.
+      **2026-07-04 (DU-002 slice 433 follow-up, 2nd pass): `ALTER TABLE ...
+      DROP CONSTRAINT` for EXCLUDE LANDED — closes the EXCLUDE gap flagged
+      above.** `execAlterTableDropConstraint` gained a fifth search branch
+      (CHECK → FOREIGN KEY → UNIQUE → EXCLUDE → PRIMARY KEY), scanning
+      `IndexesOnTable` for `idx.IsExclusion`; new
+      `catalog.InMemory.DropExclusionConstraint` shares the `dropIndexByName`
+      helper with `DropUniqueConstraint`/`DropPrimaryKeyConstraint`. Test:
+      `TestDropConstraintForeignKeyAndUnique/Exclude`. Gates: build clean;
+      `internal/catalog`+`internal/executor`+`internal/parser` suites PASS;
+      `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); pgbench smoke = pre-commit hook.
+      `execAlterTableDropConstraint` now covers all five constraint kinds
+      `pg_constraint`'s name lookup can return. Discovery (1) above (`ALTER
+      CONSTRAINT ... ENFORCED`'s missing phase-3 scan) remains open.
+      **2026-07-04 (DU-002 slice 433, item (1)): real phase-3
+      dangling-reference scan for `VALIDATE CONSTRAINT` /
+      `ALTER CONSTRAINT ... ENFORCED` LANDED — closes discovery (1), the
+      last open item from the original slice 433 row.** Live-verified
+      against a scratch PostgreSQL 18.3 instance first: both DDL forms
+      really do scan existing rows and reject a dangling reference with the
+      same `23503` shape an `INSERT` would raise; confirmed the source in
+      `tablecmds.c` (`ATExecValidateConstraint`'s `QueueFKConstraintValidation`
+      gated on `!convalidated`, and `ATExecAlterConstrEnforceability`'s
+      "Create triggers" branch, gated on `conenforced` actually changing,
+      building an equivalent inline phase-3 entry — both run
+      `validateForeignKeyConstraint`). New `(*ddlOp)
+      validateFKConstraintExistingRows` (`internal/executor/operators_ddl.go`,
+      next to `nonFKConstraintExists`) walks the child table's heap with the
+      same simplified liveness scan `collectBTreeEntries` uses for `CREATE
+      INDEX` bulk build, and calls the existing `assertParentExists` per row
+      (same function `INSERT` uses, so the error shape is byte-identical).
+      `VALIDATE CONSTRAINT` gates the scan on `NotValid` (already-valid FK is
+      a no-op); `execAlterTableAlterConstraint` gates it on the
+      enforceability actually transitioning AND only the NOT ENFORCED →
+      ENFORCED direction (matching PG's own gates). On violation, the flags
+      are left unchanged. Fixed a pre-existing test bug found along the way:
+      `TestFKAlterConstraint/NotEnforcedThenEnforced` expected a dangling
+      re-ENFORCED to silently succeed — never real PG behavior, an artifact
+      of the old flag-only-flip shortcut; updated to assert the correct
+      rejection. Tests: `TestFKAlterConstraint/NotEnforcedThenEnforced`
+      (updated) + new `TestValidateConstraintRealPhase3Scan` (3 subtests).
+      Design doc `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up:
+      real phase-3 dangling-reference scan for `VALIDATE CONSTRAINT` /
+      `ALTER CONSTRAINT ... ENFORCED` (DU-002 slice 433, item (1))";
+      `docs/design/README.md` row `0110-0001` addendum appended. Gates:
+      `go build ./...`/`go vet ./internal/executor/...` clean;
+      `internal/executor` suite PASS (full, `-count=1`, no regression);
+      `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, elapsed
+      27.40s/94.13s); pgbench smoke = pre-commit hook. No new deferral —
+      the constraint-DDL work opened across slices 430–433 has no further
+      known deferrals in this ledger thread.
+- [x] **`COMMENT ON ACCESS METHOD` round-trip in pg_dump (M0110-0001,
+      DU-002 slice 434).** **COMPLETE 2026-07-04:** fresh candidate sweep
+      after the slices 430–433 constraint-DDL thread closed with "no further
+      known deferrals" — probed `COMMENT ON` object-kind coverage and found
+      `parseCommentOnTail` (`internal/parser/parser.go`) had no `"access
+      method"` branch, so `COMMENT ON ACCESS METHOD` silently discarded the
+      comment (fell into the unsupported-type default). Live-verified
+      divergent from a scratch PostgreSQL 18.3 instance first: real PG's
+      `dumpAccessMethod` (`pg_dump.c`) always emits a trailing `COMMENT ON
+      ACCESS METHOD <name> IS '...';` block when a comment exists; goopg's
+      pg_dump omitted it entirely. Fixed with the same 3-site pattern as the
+      `COMMENT ON SERVER`/`FOREIGN DATA WRAPPER` siblings: new parser branch
+      (bare schema-less name, requires `METHOD` after `ACCESS`); new
+      `catalog.InMemory.UserAccessMethodOID(name)` (mirrors
+      `ForeignServerOID`/`ForeignDataWrapperOID`/`ExtensionOID`); new
+      `execCommentOn` `case "access method"` keying `pg_description` on
+      classoid=pg_am=2601. No pg_dump-side change needed — `collectComments`'s
+      single `pg_description` query is object-kind-agnostic. Tests:
+      `TestParseCommentOnAccessMethod` +
+      `TestParseCommentOnAccessMethodMissingMethodKeyword`
+      (`internal/parser/comment_on_test.go`);
+      `TestCommentOnAccessMethodStoresDescription` +
+      `TestCommentOnUnknownAccessMethodIsNoop`
+      (`internal/executor/operators_ddl_access_method_test.go`); extended the
+      slice-426 `TestPort_PgDumpConnectionSetup` fixture with a byte-exact
+      `COMMENT ON ACCESS METHOD goopg_am IS '...';` assertion. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `COMMENT ON
+      ACCESS METHOD` round-trip in pg_dump (DU-002 slice 434)";
+      `docs/design/README.md` row `0110-0001` addendum appended. Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor` suites PASS (full, `-count=1`,
+      no regression); `TestPort_PgDumpConnectionSetup` PASS (explicit
+      `-run`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
+      smoke = pre-commit hook. New deferral (ledger row appended, not fixed
+      this loop): `COMMENT ON` a nonexistent object name is a silent no-op
+      across every object kind `execCommentOn` handles (not
+      access-method-specific — real PG raises `42704 does not exist`);
+      scoped out as a systemic ~20-case change, not a narrow slice.
+- [x] **`COMMENT ON FOREIGN TABLE` round-trip in pg_dump (M0110-0001,
+      DU-002 slice 435).** **COMPLETE 2026-07-04:** a dispatched research-only
+      agent swept the full `comment_type` grammar production (real PG's
+      `gram.y`) against goopg's `parseCommentOnTail` and found
+      `COMMENT ON FOREIGN TABLE <name>` was a **hard parse error**, not a
+      silent drop — the `FOREIGN` arm unconditionally required
+      `DATA WRAPPER` after it. Live-verified divergent from a scratch
+      PostgreSQL 18.3 instance: `CREATE FOREIGN DATA WRAPPER` +
+      `CREATE SERVER` + `CREATE FOREIGN TABLE ft1 (...)` +
+      `COMMENT ON FOREIGN TABLE ft1 IS '...'` all succeed on real PG, and
+      `pg_dump --schema-only` re-emits `COMMENT ON FOREIGN TABLE public.ft1
+      IS '...';` (`dumpTableSchema`, same path as an ordinary table
+      comment). Fixed: `parseCommentOnTail`'s `case p.acceptKeyword(KwForeign):`
+      now branches on `TABLE` vs `DATA WRAPPER` after consuming `FOREIGN`
+      exactly once (an early draft used a short-circuit
+      `p.acceptKeyword(KwForeign) && p.acceptKeyword(KwTable)` case
+      condition, which silently regressed `COMMENT ON FOREIGN DATA WRAPPER`
+      into a no-op by consuming `FOREIGN` even when `TABLE` didn't follow —
+      caught before committing and rewritten as a single case body with a
+      nested `if`); `execCommentOn`'s existing
+      `case "table", "view", "sequence", "materialized view":` arm gained
+      `"foreign table"` (no new catalog resolver needed — foreign tables
+      already share `im.LookupTable`/classoid=pg_class=1259). Tests:
+      `TestParseCommentOnForeignTable`
+      (`internal/parser/comment_on_test.go`, bare + schema-qualified names);
+      `TestCommentOnForeignTableStoresDescription`
+      (`internal/executor/operators_ddl_comment_foreign_table_test.go`);
+      extended the slice-417/418 `goopg_ftable` fixture in
+      `TestPort_PgDumpConnectionSetup` with a byte-exact `COMMENT ON FOREIGN
+      TABLE public.goopg_ftable IS '...';` assertion. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "Follow-up: `COMMENT ON
+      FOREIGN TABLE` round-trip in pg_dump (DU-002 slice 435)";
+      `docs/design/README.md` row `0110-0001` addendum appended. Gates:
+      `go build ./...`/`go vet ./...` clean; `internal/parser`+
+      `internal/catalog`+`internal/executor` suites PASS (full, `-count=1`,
+      no regression, including `TestParseCommentOnForeignDataWrapper`
+      unchanged); `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. No new deferral — this was a hard parse-error fix,
+      not a partial/simplified implementation.
 - [x] **DDL `CommandComplete` tag fidelity (M0119-0004, loop #77).**
       **COMPLETE 2026-07-03:** closes the loop #41 ledger row's own
       "cosmetic only, not investigated further this loop" deferral for
@@ -6744,6 +7745,184 @@ documentation-only and is exempt from the design-doc requirement.)
       row appended (`resolved` — no residual). No new deferral: this closes
       the full class of bare/incorrect tags findable by static review; a
       future DDL form added via the same stub pattern must set its own tag.
+
+- [x] **`compatNoopCommandTag` multi-statement-batch masking fix
+      (M0119-0004-ACLHEAP follow-up, loop #88).** **COMPLETE 2026-07-03:**
+      closes the loop #87 ledger row's discovery — a simple-query batch whose
+      FIRST statement matched a `compatNoopCommandTag` prefix (GRANT here,
+      but applicable to all ~12 prefixes) followed by a LATER genuinely
+      invalid statement made `parser.Parse` fail for the WHOLE batch (Go's
+      recursive-descent parser returns 0 statements + one error for the full
+      string, not a partial list), and `compatNoopCommandTag` then matched
+      the raw multi-statement text's leading prefix — silently absorbing the
+      entire batch as a bare `CommandComplete "GRANT"` success, swallowing
+      the real syntax error and executing neither statement. Real PostgreSQL
+      (`postgres/src/backend/tcop/postgres.c` `exec_simple_query`→
+      `pg_parse_query`) parses the full multi-statement string atomically and
+      raises a genuine `42601` for the whole message when any statement
+      fails to parse — it never silently reports success. Fix: two new
+      helpers in `internal/server/dispatch.go` — `isMultiStatementSQL` (does
+      `sql` carry a real second statement past its first top-level `;`?) and
+      `splitLeadingCompatNoopDDL` (mirrors `splitLeadingRoleDDL`,
+      M0118-0008: splits off the first statement only when it BOTH matches
+      `compatNoopCommandTag` AND fails to parse in isolation — the genuine
+      parser-gap case, e.g. `CREATE SCHEMA`/`CREATE DATABASE`, whose grammar
+      is entirely unimplemented). `GRANT`/`REVOKE`/`COMMENT ON`/`SECURITY
+      LABEL` are excluded from the split because a lone instance of any of
+      them always parses successfully (loop #87 finding) — so if the FULL
+      batch still fails to parse, the failure is necessarily a LATER
+      statement, and `dispatchSimpleQueryViaExecutor`'s compatNoop absorption
+      at line ~180 is now gated: `splitLeadingCompatNoopDDL` first (handles
+      the legitimate parser-gap workaround, executes the first statement and
+      recurses into the rest — unchanged observable behavior for e.g.
+      `CREATE SCHEMA s; SELECT 1`), then `compatNoopCommandTag(sql)` is only
+      called directly when `!isMultiStatementSQL(sql)` (single-statement
+      case, unchanged). A genuinely-invalid multi-statement batch now falls
+      through to the real `42601` syntax error and executes nothing.
+      `tryCompatNoopExtended` (extended-protocol counterpart,
+      `dispatch_extended.go`) needed no change — a Parse message carries
+      exactly one SQL command per the wire protocol spec (already documented
+      at that function's definition), so this bug is simple-query-only.
+      Tests: new `TestSimpleQueryMultiStatementCompatNoopBatchRejectsLaterSyntaxError`
+      (drives `"GRANT SELECT ON nosuchtable TO nosuchrole; !!! not valid sql
+      at all((("` over the wire, asserts `ErrorResponse`+`42601` and NO
+      `CommandComplete`; verified RED against the pre-fix code via a
+      temporary `git stash` of just `dispatch.go`) and
+      `TestSimpleQueryMultiStatementCompatNoopDDLStillRecurses` (regression
+      guard: `"CREATE SCHEMA noop_batch_recurse_schema; SELECT 1"` must still
+      run BOTH statements) in `internal/server/dispatch_extended_ddl_test.go`.
+      Gates: `go build ./...`/`go vet ./...` clean; `gofmt -l` clean;
+      `go test ./internal/server/...` PASS (full package, no regression);
+      `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+      Design `docs/design/0119-0004-database-config-set-pgdump.md` gained a
+      "Follow-up: compatNoopCommandTag multi-statement-batch masking fix
+      (loop #88)" section; `docs/design/README.md` row `0119-0004cz` added.
+      Deferral ledger row appended (marks the loop #87 row `resolved`). No
+      new deferral — this closes the discovery from loop #87 in full (all
+      ~12 `compatNoopCommandTag` prefixes share the one gated call site, not
+      just GRANT).
+
+- [x] **Simple-query multi-statement batch: CREATE TABLE/INDEX atomicity on
+      abort (M0110-0001 DU-002 slice 444 follow-up, resumed after M0120/M0121).**
+      **COMPLETE 2026-07-04:** closes the slice-444 discovery in full for
+      CREATE TABLE/CREATE INDEX. Root cause: `dispatchSimpleQueryViaExecutor`
+      (`internal/server/dispatch.go`) begins exactly ONE `mvcc.Transaction`
+      per Query message, so a later statement's failure must roll back an
+      earlier successful `CREATE TABLE` too — but `catalog.InMemory.RegisterTable`
+      is non-transactional, and the existing undo machinery
+      (`sess.RecordDDLCreate`/`executor.ProcessRollbackUndos`, already used by
+      explicit `BEGIN...ROLLBACK`) never engaged for autocommit batches because
+      `connTx.Session()` returns `nil` outside an explicit transaction, so
+      `ectx.Session` stayed `nil` and (a) `RecordDDLCreate`'s type assertion
+      never fired and (b) the autocommit-abort defer never called
+      `ProcessRollbackUndos` at all. Fix: `dispatch.go` now wires a
+      message-scoped throwaway `*executor.BasicSession` for autocommit batches
+      (predeclaring `ectx` above the abort defer so the defer can reach it),
+      and the abort defer calls `executor.ProcessRollbackUndos` before
+      `TxnMgr.Rollback`. `RecordDDLCreate`'s `if !s.inTx { return }` guard
+      (`internal/executor/session.go`) was dead code for every pre-existing
+      caller (only reachable with `inTx==true`) — removed, since the new
+      throwaway session deliberately keeps `inTx==false` to avoid touching the
+      ~20 other `Session.InExplicitTransaction()` call sites (deferred
+      UNIQUE/EXCLUDE/FK constraint timing, stats scoping) that are out of
+      scope for this fix. Regression: `TestSimpleQueryBatchAbortUndoesEarlierCreateTable`
+      (`internal/server/dispatch_batch_atomicity_test.go`; confirmed RED
+      without the fix). Design doc
+      `docs/design/root-0024-simple-query-batch-ddl-create-atomicity.md`;
+      `docs/design/README.md` indexed. Gates: `go build ./...` clean;
+      `internal/server`+`internal/executor`+`internal/catalog`+`internal/mvcc`+
+      `internal/wal`+`internal/initdb` suites PASS (full, no regression);
+      `-race` on `internal/mvcc`+`internal/wal`+`internal/server` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+      pre-commit hook. Deferral ledger row (M0110-0001 DU-002 slice 444)
+      flipped `resolved`, citing this fix + its two documented residuals
+      (enum/composite-type + TRUNCATE/DROP-in-savepoint tracking stay
+      explicit-transaction-only; a `CREATE TABLE; BEGIN; ...; ROLLBACK;`
+      compound batch still loses the pre-BEGIN entry) — both recorded in the
+      design doc's own Deferred section rather than re-ledgered separately.
+
+- [x] **`CREATE`/`DROP STATISTICS` WAL/restart persistence + new `DROP
+      STATISTICS` support (M0110-0001 DU-002 slice 445, closing resume point
+      (2) of the slice-441 ledger row).** **COMPLETE 2026-07-04:** statistics
+      objects (`pg_statistic_ext`) were never WAL-logged since `CREATE
+      STATISTICS` first landed (M0097-0023) — the object lived only in
+      `catalog.InMemory.statisticsObjs` and vanished on restart. While
+      scoping the fix, found `DROP STATISTICS` was **entirely unparsed** (no
+      grammar rule at all) — added as a prerequisite. Mirrors the `CREATE`/
+      `DROP COLLATION` precedent: new `internal/wal/statistics_ddl.go`
+      (`RecordKindCreateStatistics`/`RecordKindDropStatistics`, kinds 95/96,
+      with a generic string-slice sub-encoding for `Kinds`/`Columns`/`Exprs`);
+      `catalog.InMemory.RegisterStatisticsDuringRecovery`/`DropStatistics`/
+      `DropStatisticsDuringRecovery`; new
+      `internal/initdb/statistics_ddl_recovery.go`
+      (`replayStatisticsDDLRecords`, wired into `open.go` after the
+      access-method DDL replay call); `execCreateStatistics` WAL-appends on
+      success; `execDropCompat` gains an `objType == "statistics"` case;
+      `internal/parser/ddl.go`'s generic ident-based `DropCompatStmt`
+      object-type list gains `"statistics"`. Tests:
+      `internal/wal/statistics_ddl_test.go`,
+      `internal/initdb/statistics_ddl_recovery_test.go` (real
+      `Init`/`Open`/re-`Open` round trips for CREATE and CREATE+DROP),
+      `internal/executor/drop_statistics_test.go`. Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "loop #96, DU-002 slice
+      445" section. Gates: `go build ./...` clean; `go test -race
+      ./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+      `internal/catalog`+`internal/executor`+`internal/initdb`+
+      `internal/parser` suites PASS (full, no regression); TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. **Still deferred**
+      (resume point (1) of the same ledger row, unchanged): `ALTER
+      STATISTICS ... RENAME TO/OWNER TO/SET SCHEMA` (slice 441) is still
+      in-memory-only — a restart reverts the object to its as-created
+      name/owner/schema. Ledger row appended (new row, not flipping the
+      slice-441 row `resolved` since resume point (1) remains open).
+
+- [x] **`ALTER STATISTICS ... RENAME TO/OWNER TO/SET SCHEMA` WAL/restart
+      persistence (M0110-0001, DU-002 slice 445 follow-up, closing resume
+      point (1) of the slice-441 ledger row).** **COMPLETE 2026-07-04:**
+      mirrors the `ALTER COLLATION` three-form precedent exactly. New
+      `internal/wal/statistics_ddl.go` record kinds
+      `RecordKindAlterStatisticsRename`/`...Owner`/`...SetSchema` (97/98/99)
+      + Encode/Decode pairs; `execAlterStatistics`'s three `Action` cases
+      each WAL-append after the in-memory mutation succeeds;
+      `catalog.InMemory` gains `RenameStatisticsObjectDuringRecovery`/
+      `SetStatisticsOwnerDuringRecovery`/`SetStatisticsSchemaDuringRecovery`;
+      `internal/initdb/statistics_ddl_recovery.go`'s
+      `statisticsRegistryRecovery` interface + `replayStatisticsDDLRecords`
+      gain the matching three cases. **Also fixed in the same loop** (found
+      while wiring these new kinds, not a separate slice): `CREATE`/`DROP
+      STATISTICS` (kinds 95/96, landed slice 445) were missing an explicit
+      case in `wal.ApplyRecord`'s physical-replay switch — every other
+      logical-only DDL kind (collation, publication/subscription, etc.) has
+      one that returns `(false, nil)` to opt out of physical redo; without
+      it, a 95/96/97/98/99 record hit the switch's `default: return false,
+      fmt.Errorf("unsupported kind %d", ...)`. This had no effect on the
+      primary's own crash recovery (`internal/initdb/open.go` calls
+      `replayStatisticsDDLRecords` directly, never through
+      `wal.ApplyRecord`), but would have broken standby/streaming-replication
+      replay (`internal/wal/stream_replayer.go`, the actual caller of
+      `wal.ApplyRecord`) for any of these five record kinds. Added one
+      combined case for all five, mirroring the `RecordKindCreateCollation,
+      RecordKindDropCollation, ...` case directly above it in
+      `internal/wal/recovery.go`. Tests:
+      `internal/wal/statistics_ddl_test.go` (round-trip + wrong-kind +
+      truncated-payload for all three new kinds),
+      `internal/initdb/statistics_ddl_recovery_test.go`'s
+      `TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema` (real
+      `Init`/`Open`/WAL.Append(create→rename→owner→set-schema)/`Close`/
+      re-`Open`, confirming the final identity survives and the original
+      name no longer resolves). Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "loop #97" section. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+      `internal/catalog`+`internal/executor`+`internal/initdb`+
+      `internal/parser` suites PASS (full, no regression); TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Both resume points
+      of the original slice-441 ledger row are now closed — statistics
+      restart durability (object + its ALTER mutations) is complete.
+      `ALTER STATISTICS ... SET STATISTICS n` remains intentionally
+      in-memory-only (matches upstream: no durable state beyond a catalog
+      column goopg has no heap for, same as the pre-existing slice-317
+      non-gap).
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119
@@ -6799,19 +7978,110 @@ M0121. Run each capture through the memory cap (`scripts/goopg-test-run.sh`,
   See `wp/verification/FLOW.md §1a` for the exact command sequence
   (`.ralph/working_set.md` had been reset to idle by a later loop). Next:
   M0120-0002 (execute + capture write items WP-01…WP-16).
-- [ ] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
+- [x] **M0120-0002 — Execute + capture write items WP-01…WP-16** (posts, pages,
   post-meta, taxonomy, term-meta, user create/update). Store per-item evidence
   under `wp/verification/results/<ts>/`; record each confirming read.
-- [ ] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
+  **2026-07-03 (loop): BLOCKED before completion.** Driver script written
+  (`wp/verification/driver_wp01_16.sh`) and run; WP-01 (`post create`)
+  failed immediately with `null value in column "ID" ... violates not-null
+  constraint`. Root cause (live-verified, see deferral ledger row): every WP
+  core table's PK column (`wp_posts.ID`, `wp_users.ID`, `wp_comments.comment_ID`,
+  `wp_terms.term_id`, `wp_term_taxonomy.term_taxonomy_id`, the three `*meta.meta_id`
+  columns, `wp_usermeta.umeta_id`) has **no default and no indexes/PK at all** —
+  a stale schema predating the current goopg build's serial/DDL fixes (a fresh
+  `bigserial` probe table against the same running instance works correctly, so
+  this is a harness-data-staleness issue, not a live regression). Fix = drop +
+  recreate the WP schema (`DROP TABLE wp_* CASCADE` then `wp core install` then
+  `wp/seed/seed.sh`) so it's regenerated by PG4WP's `dbDelta` against the
+  current binary. **The `DROP TABLE ... CASCADE` was denied by the Claude Code
+  auto-mode permission classifier** (destructive mass-delete on shared test
+  infra, correctly requiring explicit authorization even though the data is
+  synthetic seed content).
+  **UNBLOCKED 2026-07-04 (interactive session).** The reset is now encapsulated
+  in the scoped, idempotent `wp/verification/reset_wp_schema.sh` (drop the 12
+  core tables on :5544 → `wp core install` + `wp/seed/seed.sh` → schema health
+  check). It was run to regenerate the schema — verified healthy: `wp_posts`
+  now has 6 indexes + `ID default nextval('public.wp_posts_id_seq')`, and the
+  seed's `wp post create` calls succeeded (the exact prior failure). **Next
+  loop: just re-run `wp/verification/driver_wp01_16.sh`** (plain `wp post
+  create` etc., no `DROP`, no permission change) to capture WP-01…16, then
+  proceed to M0120-0003. Headless self-serve re-reset is now ENABLED: the user
+  authorized and added `Bash(wp/verification/reset_wp_schema.sh)` +
+  `Bash(bash wp/verification/reset_wp_schema.sh)` to `.claude/settings.local.json`
+  (2026-07-04), so a future loop can re-run the reset without a prompt.
+  **2026-07-04 (loop): DONE.** Re-ran `driver_wp01_16.sh` against the reset
+  schema (`wp/verification/results/20260704-072755/`, see `summary.md` there
+  for the full per-item table). 13/16 PASS. Two failures: **WP-13** ("Invalid
+  taxonomy category") classed `harness` — it targets `pageID` with the
+  `category` taxonomy, which WP core never registers for `page` objects (fails
+  identically on real WordPress; `CHECKLIST.md` needs a `post`-type target
+  instead, not a goopg fix). **WP-02/WP-03** (`post update`/`post delete`
+  trash, no `--force`) classed **goopg-bug**: both crash the backend
+  connection with a recurring panic (`index out of range [1] with length 1`
+  in `evalFastExpr`/`Slot.Get`, `internal/executor/opnode.go:99` +
+  `exprnode.go:222`, via `filterOpNext`) while re-assigning the post's
+  existing category (`wp_set_post_categories` → `SELECT term_taxonomy_id FROM
+  wp_term_relationships WHERE object_id=? AND term_taxonomy_id=?`). Confirmed
+  NOT new — `wp/goopg-wp.log` has 8 occurrences of the identical stack back to
+  2026-07-02, never previously ledgered. Full repro sequence, stack trace, and
+  resume point in `.ralph/deferral_ledger.md` (2026-07-04, M0120-0002 row);
+  seeded as **M0121-0002** below (M0121-0001's per-failure seeding, done a
+  loop early since the crash is high-value to not lose).
+- [x] **M0120-0003 — Execute + capture write items WP-17…WP-32** (user
   role/delete, comments + comment-meta, options/transients incl. the TOAST-sized
   value WP-28, plugin activate/deactivate, raw INSERT/UPDATE/DELETE via
-  `wp db query`). Watch WP-28 for a root-0022-class TOAST regression.
-- [ ] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
-  `option get`, raw SELECT, `db size`/`core version`).
-- [ ] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
+  `wp db query`). Watch WP-28 for a root-0022-class TOAST regression. **DONE
+  2026-07-04**: ran `wp/verification/driver_wp17_32.sh` (new, mirrors
+  `driver_wp01_16.sh`) against the live stack from M0120-0002, results +
+  triage in `wp/verification/results/20260704-073700/summary.md`. 15/16 items
+  PASS (30/32 sub-steps incl. confirming reads); WP-28's TOAST-sized
+  (20000-byte) option round-tripped cleanly (`wc -c` = 20001, no root-0022
+  regression). The single FAIL — **WP-32** (`wp db query` raw
+  INSERT/UPDATE/DELETE) — is a **harness/PG4WP limitation, not a goopg bug**:
+  WP-CLI's `db query` shells out to the native `mysql` CLI against `DB_HOST`
+  (goopg's PG wire-protocol port), so the MySQL handshake fails before any SQL
+  reaches goopg (confirmed via the goopg statement log showing zero
+  INSERT/UPDATE/DELETE traffic for those steps). Documented in
+  `CHECKLIST.md`'s "Known non-goopg limitation" section (now has two entries)
+  since **WP-R7** (M0120-0004) will hit the identical failure — do not
+  re-diagnose it there. No new goopg bugs discovered this loop (no deferral
+  ledger row needed). No Go code changed (pure harness execution +
+  fix_plan/CHECKLIST bookkeeping), so no build/test/pgbench gates apply beyond
+  `make ralph-state-guard`.
+- [x] **M0120-0004 — Execute + capture read items WP-R1…WP-R8** (list/get/count,
+  `option get`, raw SELECT, `db size`/`core version`). **Completed
+  2026-07-04**: wrote `wp/verification/driver_wpr1_r8.sh` (new, mirrors the
+  prior two drivers) and ran it against the live stack from M0120-0002/0003,
+  results + triage in `wp/verification/results/20260704-075221/summary.md`.
+  7/9 sub-steps PASS; 2 FAIL, both **pre-existing/newly-confirmed pg4wp
+  limitations, not goopg bugs**: WP-R7 (`db query "SELECT COUNT(*) ..."`)
+  fails identically to WP-32 (mysql-CLI handshake against goopg's PG port,
+  confirmed via zero statement-log traffic), as predicted in M0120-0003's
+  working_set carry. WP-R8's `db size --tables` sub-step is a **new**
+  non-goopg finding: PG4WP's `ShowTablesSQLRewriter.php` builds its query with
+  a single-quoted PHP string, so `$schema` is never interpolated and goopg
+  correctly returns zero rows for the literal (bogus) schema name `$schema`
+  — goopg's execution is correct, the bug is entirely in the vendored PG4WP
+  rewriter. Added a third bullet to `CHECKLIST.md`'s "Known non-goopg
+  limitation" section. No new goopg bugs, no deferral-ledger row needed. No Go
+  code changed (pure harness execution + fix_plan/CHECKLIST bookkeeping), so
+  no build/test/pgbench gates apply beyond `make ralph-state-guard`.
+- [x] **M0120-0005 — Aggregate `report.md` + triage.** Per-item PASS/FAIL; class
   each FAIL (`goopg-bug`/`goopg-missing`/`pg4wp-limitation`/`harness`, FLOW.md
   §4); for every goopg failure append a `.ralph/deferral_ledger.md` row and file
   the cross-referenced `M0121-NNNN` task (the M0120→M0121 handoff).
+  **DONE 2026-07-04**: wrote `wp/verification/report.md` (committed, not under
+  the git-ignored `results/`) aggregating all 40 items from the three
+  per-run `summary.md` triage docs (M0120-0002/0003/0004). Tally: 34/40 fully
+  PASS; FAILs classed 2×`goopg-bug` (WP-02/WP-03, one root cause), 1×`harness`
+  (WP-13 — checklist targets the wrong object type, not a goopg bug), 3×
+  `pg4wp-limitation` (WP-32, WP-R7, WP-R8's `db size` sub-step — all already
+  documented in `CHECKLIST.md`'s "Known non-goopg limitation" section). Only
+  one goopg-attributable failure exists across the whole sweep; its
+  `.ralph/deferral_ledger.md` row was already filed by the M0120-0002 loop
+  (2026-07-04, `status: -`, cross-referencing **M0121-0002**) — verified
+  present, no new row needed. M0120 milestone is now fully complete
+  (0001–0005 all `[x]`). Next: M0121-0002 (fix the backend panic).
 
 ## M0121 — WordPress WP-CLI Verification Failure Remediation (filed 2026-07-02)
 
@@ -6826,10 +8096,51 @@ work) and index each in `docs/design/README.md`. Gates per change: units +
 pgbench-smoke hook, `scripts/tpch-spotcheck.sh` for executor/planner/codec, race
 gate for concurrency-critical packages.
 
-- [ ] **M0121-0001 — Populate from M0120 triage.** This task list is **seeded,
-  not exhaustive**: after M0120-0005, add one `M0121-000N` task per
-  `goopg-bug`/`goopg-missing` failure (cross-referenced from its deferral-ledger
-  row), each closing its ledger row (`- → resolved`) when the checklist item
-  passes its confirming read on a fresh run and a regression test guards it.
-  Failures classed `pg4wp-limitation`/`harness` are documented, not fixed in
-  goopg.
+- [x] **M0121-0001 — Populate from M0120 triage.** DONE (2026-07-04). This task
+  list is **seeded, not exhaustive**: after M0120-0005, add one `M0121-000N`
+  task per `goopg-bug`/`goopg-missing` failure (cross-referenced from its
+  deferral-ledger row), each closing its ledger row (`- → resolved`) when the
+  checklist item passes its confirming read on a fresh run and a regression
+  test guards it. Failures classed `pg4wp-limitation`/`harness` are
+  documented, not fixed in goopg. **Resolution:** `wp/verification/report.md`
+  (M0120-0005's aggregate, all 40 items) tallies `goopg-bug: 2` (WP-02/WP-03,
+  one root cause) and `goopg-missing: 0` — no further per-failure tasks to
+  seed. WP-02/WP-03 were already seeded as **M0121-0002** (done a loop early
+  since the crash was high-value to not lose) and are now `[x]` above, with
+  their deferral-ledger row cross-referenced/closed. No `pg4wp-limitation`/
+  `harness` failures (WP-13, WP-32, WP-R7, WP-R8) get goopg tasks per policy.
+  **M0121 milestone is CLOSED** (0001–0002 both `[x]`, nothing further seeded).
+- [x] **M0121-0002 — Fix backend panic on `post update`/`post delete` (trash)
+  default-category reassignment.** DONE (2026-07-04). Root cause:
+  `tryPromoteIndexOnlyScan` (`internal/planner/planner.go`) narrowed a
+  promoted `Filter(IndexOnlyScan)`'s covered/output schema using only the
+  `Project`'s target list, never checking whether the surviving
+  `Filter.Predicate` referenced a column, and never remapping that
+  predicate's `ColumnRef.Index` off its pre-promotion (full-row) position —
+  a residual filter (`term_taxonomy_id = ?`) was left pointing one past the
+  end of the narrowed 1-column scan row, panicking `Slot.Get`
+  (`internal/executor/opnode.go:99`). Root-caused directly with a single
+  fresh `psql` connection once a *matching* `object_id` was used (the
+  original "not reproducible via a single connection" note was because the
+  tested `object_id` had since been deleted from seed data — the scan probe
+  then yielded zero rows, so the buggy filter predicate was never
+  evaluated). Fix: `tryPromoteIndexOnlyScan` now walks the surviving
+  `Filter.Predicate` (`walkColumnRefs`) to extend `covered` with any column
+  it needs (abandoning the promotion if the filter needs an uncovered/
+  non-indexed column or an outer/subquery ref — falls back to the
+  pre-existing correct `IndexScan`+`Filter`+`Project` shape), then remaps
+  the predicate's `ColumnRef.Index` via new `remapColumnRefsToSchema`
+  (mirrors `shiftColumnRefsBy`'s case list), reinstating an explicit
+  `Project` only when the filter pulled in a column beyond the `SELECT`
+  list. Design doc `docs/design/0121-0002-indexonly-scan-residual-filter-remap.md`.
+  Regression test `TestIndexOnlyScanResidualFilterColumnRemap`
+  (`internal/executor/indexonly_residual_filter_test.go`; confirmed it
+  panics with the same signature when the fix is reverted). Gates:
+  `go build ./...` clean; `go test ./internal/planner/...
+  ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+  Q13=33); re-verified end-to-end via `driver_wp01_16.sh`-equivalent
+  WP-01..WP-03 against the real WP-CLI/docker instance (post update/trash
+  now succeed, no panic in `wp/goopg-wp.log` for the run window) after a
+  `reset_wp_schema.sh` re-seed (the WP schema had drifted stale again,
+  unrelated to this fix). No new deferral-ledger row needed — no scope was
+  left unimplemented.

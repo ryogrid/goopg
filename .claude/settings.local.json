@@ -1,6 +1,8 @@
 {
   "permissions": {
     "allow": [
+      "Bash(wp/verification/reset_wp_schema.sh)",
+      "Bash(bash wp/verification/reset_wp_schema.sh)",
       "Bash(xargs -I{} basename {} .sql)",
       "Bash(systemctl --user stop goopg-wp.scope)",
       "Bash(systemctl --user reset-failed goopg-wp.scope)"

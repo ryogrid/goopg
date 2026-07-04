@@ -4740,12 +4740,15 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 			def += " INITIALLY DEFERRED"
 		}
 	}
-	// A NOT-VALID FK (pg_constraint.convalidated='f') carries a trailing
-	// ` NOT VALID` in pg_get_constraintdef, appended after the DEFERRABLE
-	// clauses — the shared tail of pg_get_constraintdef_worker (ruleutils.c:2604).
-	// pg_dump re-emits this verbatim so the restored FK is likewise unvalidated.
-	// DU-002 slice 307.
-	if fk.NotValid {
+	// The shared tail of pg_get_constraintdef_worker (ruleutils.c:2601-2604):
+	// "Validated status is irrelevant when the constraint is NOT ENFORCED" —
+	// conenforced is checked FIRST, and NOT VALID is only considered when the
+	// constraint IS enforced. A NOT-VALID FK (pg_constraint.convalidated='f')
+	// carries a trailing ` NOT VALID`; pg_dump re-emits either verbatim so the
+	// restored FK matches. DU-002 slices 307, 431.
+	if fk.NotEnforced {
+		def += " NOT ENFORCED"
+	} else if fk.NotValid {
 		def += " NOT VALID"
 	}
 	return def
@@ -6126,9 +6129,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					missingOK = missingArg.BoolValue()
 				}
 			}
-			if ctx != nil && ctx.GetSetting != nil {
-				if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
-					return NewStringDatum(value), nil
+			if ctx != nil {
+				getSetting := ctx.GetSettingDisplay
+				if getSetting == nil {
+					getSetting = ctx.GetSetting
+				}
+				if getSetting != nil {
+					if value, ok := getSetting(nameArg.StringValue()); ok {
+						return NewStringDatum(value), nil
+					}
 				}
 			}
 			if missingOK {
@@ -6305,8 +6314,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				if err := ctx.SetSetting(nameArg.StringValue(), newVal.Format(), isLocal); err != nil {
 					return Datum{}, &ExecError{Code: "22023", Pos: x.Pos(), Message: err.Error()}
 				}
-				if ctx.GetSetting != nil {
-					if value, ok := ctx.GetSetting(nameArg.StringValue()); ok {
+				getSetting := ctx.GetSettingDisplay
+				if getSetting == nil {
+					getSetting = ctx.GetSetting
+				}
+				if getSetting != nil {
+					if value, ok := getSetting(nameArg.StringValue()); ok {
 						return NewStringDatum(value), nil
 					}
 				}
@@ -7515,10 +7528,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if nc.NoInherit {
 						def += " NO INHERIT"
 					}
-					// pg_get_constraintdef_worker appends the shared ` NOT VALID`
-					// tail for convalidated='f'; pg_dump then emits the CHECK as a
-					// separate ALTER TABLE ADD CONSTRAINT. DU-002 slice 308.
-					if nc.NotValid {
+					// pg_get_constraintdef_worker's shared tail (ruleutils.c):
+					// "Validated status is irrelevant when the constraint is
+					// NOT ENFORCED" — checks conenforced FIRST and only falls
+					// back to convalidated when the constraint IS enforced.
+					// DU-002 slices 308, 430.
+					if nc.NotEnforced {
+						def += " NOT ENFORCED"
+					} else if nc.NotValid {
 						def += " NOT VALID"
 					}
 					return NewStringDatum(def), nil

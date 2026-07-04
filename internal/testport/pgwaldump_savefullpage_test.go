@@ -39,15 +39,29 @@ package testport
 //   * block_size is the compile-time constant 8192 (goopg does not expose
 //     current_setting('block_size') as an executable GUC read in this path);
 //     goopg's BLCKSZ is 8192.
+//   * the relation locator's DB component is NOT read from
+//     `pg_database.oid`: that column is a legacy display placeholder
+//     ("16384", firstNormalObjectOID) for every non-template database
+//     (catalog.go's pgDatabase.VirtualRows — changing it broke pg_dump's
+//     subscription round-trip). The real on-disk OID goopg's WAL/storage
+//     layer uses (detectCatalogDBOID's global/1262 heap scan at startup) is
+//     only observable as the `base/<dbOid>/` directory name, so this test
+//     globs for it — the same workaround pgamcheck004_port_test.go already
+//     uses (findHeapFile) for the identical gap.
 //
-// CSV row: WD-002 stays `defer`. This test (TestPort_PgWaldump002SaveFullpage)
+// CSV row: WD-003 (`port`/`pass_required=yes`; WD-002 narrowed to just the
+// still-deferred 001_basic.pl server tier). This test (TestPort_PgWaldump002SaveFullpage)
 // is a self-promoting reproduction: it drives the full --save-fullpage path and
-// asserts the extracted-file format + LSN ordering, but t.Skips with a precise
-// blocker when it hits the goopg on-disk-WAL incompatibility (xl_prev written as
-// a 1-based LSN, so pg_waldump cannot walk the record chain — see the skip site
-// for the exact origin and resume point). It auto-promotes to a real pass once
-// xl_prev is emitted 0-based on disk. The 001_basic.pl server tier stays
-// deferred separately (needs hash/gin/gist/spgist/brin AMs).
+// asserts the extracted-file format + LSN ordering. Two blockers previously kept
+// it skipped: (1) xl_prev written as a 1-based LSN, so pg_waldump could not walk
+// the record chain — RESOLVED separately (prevRecPtr seeding fix); (2) HOT
+// updates (the update path this test's workload always takes on an unindexed
+// table) emitted only goopg's native opaque WAL record, never a PG-canonical
+// FPI — fixed this loop via emitCanonicalHeapHotUpdate
+// (internal/executor/operators_storage.go), which mirrors the existing
+// PgCanonicalHeapInplace path used for the datfrozenxid in-place update. The
+// 001_basic.pl server tier stays deferred separately (needs
+// hash/gin/gist/spgist/brin AMs).
 
 import (
 	"encoding/binary"
@@ -116,11 +130,26 @@ func TestPort_PgWaldump002SaveFullpage(t *testing.T) {
 	// uses the default tablespace OID (pg_default = 1663, the only value
 	// internal/wal accepts on decode), so the tablespace component is fixed.
 	const pgDefaultTablespace = 1663
-	dbOID := runSQL("SELECT oid FROM pg_database WHERE datname = current_database()")
 	relNode := runSQL("SELECT pg_relation_filenode('test_table'::regclass)")
-	if dbOID == "" || relNode == "" {
-		t.Fatalf("could not resolve relation locator: db=%q relnode=%q", dbOID, relNode)
+	if relNode == "" {
+		t.Fatalf("could not resolve relnode for test_table")
 	}
+	// The DB component is NOT `SELECT oid FROM pg_database ...`: that column is
+	// a legacy display placeholder (firstNormalObjectOID, "16384") for every
+	// non-template database — see catalog.go's pgDatabase.VirtualRows comment
+	// ("changing the displayed oid to match broke pg_dump's subscription
+	// round-trip"). The value goopg's WAL/storage layer actually uses is the
+	// real on-disk OID from detectCatalogDBOID (global/1262 heap scan at
+	// startup), which is only observable on disk as the base/<dbOid>/ directory
+	// name. Glob for it, mirroring findHeapFile (pgamcheck004_port_test.go) and
+	// pgamcheck004's own "glob across database dirs" comment for the identical
+	// gap.
+	dbDirMatches, globErr := filepath.Glob(filepath.Join(c.DataDir(), "base", "*", relNode))
+	if globErr != nil || len(dbDirMatches) != 1 {
+		t.Fatalf("could not resolve on-disk database dir for relnode %s: matches=%v err=%v",
+			relNode, dbDirMatches, globErr)
+	}
+	dbOID := filepath.Base(filepath.Dir(dbDirMatches[0]))
 	relation := fmt.Sprintf("%d/%s/%s", pgDefaultTablespace, dbOID, relNode)
 	t.Logf("test_table relation locator = %s", relation)
 
@@ -211,24 +240,14 @@ func TestPort_PgWaldump002SaveFullpage(t *testing.T) {
 			"(internal/wal/writer.go detectWritePos / scanLastSegmentEnd)", relation)
 	}
 	if fileCount == 0 {
-		// Remaining blocker (genuinely separate from xl_prev): goopg routes
-		// every non-checkpoint record through RmgrXLog with an unknown info
-		// byte (0xF0, internal/wal/format.go classifyXLogRecord) so PG's
-		// xlog_redo safely skips them during recovery. Those records carry
-		// goopg's opaque payload, NOT PG-format block references with embedded
-		// full-page images, so pg_waldump --save-fullpage finds nothing to
-		// extract for any relation. Emitting PG-decodable heap WAL records with
-		// backup blocks (XLogRecordBlockHeader + BKPIMAGE) is a large, separate
-		// feature.
-		//
-		// Auto-promotes: once goopg emits PG-format FPI records, pg_waldump
-		// will extract them and the filename/LSN assertions above run for real.
-		t.Skipf("blocked: goopg emits no PG-decodable full-page-image records "+
-			"(all non-checkpoint records route through RmgrXLog/0xF0, opaque to "+
-			"PG), so --save-fullpage extracts nothing for relation %s. The "+
-			"xl_prev prev-link blocker is RESOLVED — pg_waldump now walks the "+
-			"full chain. Resume: emit PG-format heap WAL records with backup "+
-			"blocks, then un-skip.", relation)
+		// Both prior blockers (xl_prev prev-link, and the HOT-update path never
+		// emitting a PG-canonical FPI) are now fixed — see the file-level doc
+		// comment. A count of zero here is therefore a REGRESSION of one of
+		// those fixes, not an expected/skippable outcome.
+		t.Errorf("pg_waldump --save-fullpage extracted no full-page images for "+
+			"relation %s — check emitCanonicalHeapHotUpdate "+
+			"(internal/executor/operators_storage.go) and the xl_prev seeding "+
+			"fix (internal/wal/writer.go) for a regression", relation)
 	}
 	t.Logf("verified %d extracted full-page image(s)", fileCount)
 }

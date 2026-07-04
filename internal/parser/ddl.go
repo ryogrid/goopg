@@ -2632,6 +2632,118 @@ func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) 
 	}
 }
 
+// parseFKConstraintAttrs consumes the `[NOT] DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE]`, `NOT VALID`, and `[NOT] ENFORCED` trailer that can
+// follow a FOREIGN KEY constraint's REFERENCES/ON DELETE/ON UPDATE clauses, in
+// any order (PG gram.y's ConstraintAttributeSpec list applies identically
+// regardless of which FK form is being parsed). Shared by the inline column
+// REFERENCES path, the table-level FOREIGN KEY path, and ALTER TABLE ADD
+// FOREIGN KEY so all three stay in lockstep — NOT VALID/NOT ENFORCED
+// previously only round-tripped through the ALTER TABLE form (DU-002 slice
+// 431); this extends the same trailer to CREATE TABLE-time FK constraints
+// (DU-002 slice 432).
+func (p *parser) parseFKConstraintAttrs() (deferrable, initiallyDeferred, notValid, notEnforced bool) {
+	for {
+		if p.acceptKeyword(KwNot) {
+			if p.acceptIdentKeyword("valid") {
+				notValid = true
+				continue
+			}
+			if p.acceptIdentKeyword("enforced") {
+				notEnforced = true
+				continue
+			}
+			_, _ = p.expectKeyword(KwDeferrable)
+			deferrable = false
+			continue
+		}
+		if p.acceptKeyword(KwDeferrable) {
+			deferrable = true
+			if p.acceptIdentKeyword("initially") {
+				initiallyDeferred = p.acceptIdentKeyword("deferred")
+				if !initiallyDeferred {
+					_ = p.acceptIdentKeyword("immediate")
+				}
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("initially") {
+			deferrable = true
+			initiallyDeferred = p.acceptIdentKeyword("deferred")
+			if !initiallyDeferred {
+				_ = p.acceptIdentKeyword("immediate")
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("enforced") { // bare ENFORCED — already the default
+			continue
+		}
+		break
+	}
+	return
+}
+
+// parseAlterConstraintAttrs consumes the ConstraintAttributeSpec trailer of
+// `ALTER TABLE ... ALTER CONSTRAINT name ...` (PG18 gram.y): `[NOT]
+// DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` and/or `[NOT]
+// ENFORCED`, in either order. Unlike parseFKConstraintAttrs (used by the
+// FK-defining forms), NOT VALID is not part of this grammar production —
+// real PG rejects it with "constraints cannot be altered to be NOT VALID"
+// (processCASbits, gram.y ~19513) — so a bare NOT not followed by
+// DEFERRABLE/ENFORCED is deliberately left unconsumed for the statement's
+// normal trailing-token check to reject. The two has* return values record
+// whether that attribute class was mentioned at all, mirroring
+// ATAlterConstraint.alterDeferrability/alterEnforceability (tablecmds.c):
+// ALTER CONSTRAINT only touches the attribute(s) actually named. DU-002
+// slice 433.
+func (p *parser) parseAlterConstraintAttrs() (deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability bool) {
+	for {
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+			switch {
+			case p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "enforced"):
+				p.advance() // NOT
+				p.advance() // ENFORCED
+				hasEnforceability = true
+				continue
+			case p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwDeferrable:
+				p.advance() // NOT
+				p.advance() // DEFERRABLE
+				hasDeferrability = true
+				deferrable = false
+				continue
+			}
+			break
+		}
+		if p.acceptKeyword(KwDeferrable) {
+			deferrable = true
+			hasDeferrability = true
+			if p.acceptIdentKeyword("initially") {
+				initiallyDeferred = p.acceptIdentKeyword("deferred")
+				if !initiallyDeferred {
+					_ = p.acceptIdentKeyword("immediate")
+				}
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("initially") {
+			deferrable = true
+			hasDeferrability = true
+			initiallyDeferred = p.acceptIdentKeyword("deferred")
+			if !initiallyDeferred {
+				_ = p.acceptIdentKeyword("immediate")
+			}
+			continue
+		}
+		if p.acceptIdentKeyword("enforced") { // bare ENFORCED
+			enforced = true
+			hasEnforceability = true
+			continue
+		}
+		break
+	}
+	return
+}
+
 // parseCreateTableTail picks up after CREATE [UNLOGGED] TABLE.
 func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	stmt := &CreateTableStmt{pos: pos, Unlogged: unlogged}
@@ -3215,9 +3327,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				return nil, err
 			}
 			stmt.TableChecks = append(stmt.TableChecks, expr)
-			// Accept optional NOT ENFORCED / ENFORCED modifier.
+			// Accept optional NOT ENFORCED / ENFORCED modifier, recording
+			// NOT ENFORCED per-check (parallel to TableChecks) so pg_dump
+			// re-emits the trailing ` NOT ENFORCED` and pg_constraint reports
+			// conenforced=false. DU-002 slice 430.
+			notEnforced := false
 			if p.acceptKeyword(KwNot) {
-				_ = p.acceptIdentKeyword("enforced")
+				if p.acceptIdentKeyword("enforced") {
+					notEnforced = true
+				}
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
@@ -3230,6 +3348,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				noInherit = true
 			}
 			stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
+			stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
@@ -3375,8 +3494,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				} else {
 					stmt.TableChecks = append(stmt.TableChecks, expr)
 				}
+				notEnforced := false
 				if p.acceptKeyword(KwNot) {
-					_ = p.acceptIdentKeyword("enforced")
+					if p.acceptIdentKeyword("enforced") {
+						notEnforced = true
+					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
@@ -3387,15 +3509,22 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					stmt.TableHasNoInheritCheck = true
 					noInherit = true
 				}
-				// Keep TableCheckNoInherit parallel to TableChecks: only the
-				// anonymous branch appended an expr. DU-002 slice 128.
+				// Keep TableCheckNoInherit/TableCheckNotEnforced parallel to
+				// TableChecks: only the anonymous branch appended an expr.
+				// DU-002 slices 128, 430.
 				if anonCheck {
 					stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
-				} else if noInherit && len(stmt.TableNamedChecks) > 0 {
-					// Named branch appended before NO INHERIT was parsed; carry the
-					// per-constraint flag so the named NO-INHERIT check re-emits the
-					// suffix on dump. DU-002 slice 129.
-					stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
+					stmt.TableCheckNotEnforced = append(stmt.TableCheckNotEnforced, notEnforced)
+				} else if len(stmt.TableNamedChecks) > 0 {
+					// Named branch appended before NO INHERIT/NOT ENFORCED were
+					// parsed; carry the per-constraint flags so the named check
+					// re-emits the suffixes on dump. DU-002 slices 129, 430.
+					if noInherit {
+						stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
+					}
+					if notEnforced {
+						stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NotEnforced = true
+					}
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —
@@ -4046,22 +4175,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 					col.OnUpdate = action
 				}
 			}
-			// Parse [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
-			// Also accept bare INITIALLY DEFERRED (implicit DEFERRABLE).
-			if p.acceptKeyword(KwNot) {
-				_, _ = p.expectKeyword(KwDeferrable)
-				col.FKDeferrable = false
-			} else if p.acceptKeyword(KwDeferrable) {
-				col.FKDeferrable = true
-				if p.acceptIdentKeyword("initially") {
-					col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
-					_ = p.acceptIdentKeyword("immediate")
-				}
-			} else if p.acceptIdentKeyword("initially") {
-				col.FKDeferrable = true
-				col.FKInitiallyDeferred = p.acceptIdentKeyword("deferred")
-				_ = p.acceptIdentKeyword("immediate")
-			}
+			// Parse [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE],
+			// NOT VALID, and [NOT] ENFORCED, in any order (PG18 for the latter
+			// two). DU-002 slice 432 — extends slice 431's ALTER TABLE-only fix
+			// to the inline column REFERENCES form.
+			col.FKDeferrable, col.FKInitiallyDeferred, col.FKNotValid, col.FKNotEnforced = p.parseFKConstraintAttrs()
 		// UNIQUE constraint on column
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance()
@@ -4089,9 +4207,13 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				return ColumnDef{}, err
 			}
 			col.CheckExpr = expr
-			// Accept optional NOT ENFORCED / ENFORCED.
+			// Accept optional NOT ENFORCED / ENFORCED, recording NOT ENFORCED
+			// so pg_dump re-emits the trailing ` NOT ENFORCED` and
+			// pg_constraint reports conenforced=false. DU-002 slice 430.
 			if p.acceptKeyword(KwNot) {
-				_ = p.acceptIdentKeyword("enforced")
+				if p.acceptIdentKeyword("enforced") {
+					col.CheckNotEnforced = true
+				}
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
@@ -4113,7 +4235,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				col.CheckExpr = expr
 				if p.acceptKeyword(KwNot) {
-					_ = p.acceptIdentKeyword("enforced")
+					if p.acceptIdentKeyword("enforced") {
+						col.CheckNotEnforced = true
+					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
@@ -5255,6 +5379,7 @@ func (p *parser) parseDrop() (Stmt, error) {
 		"language", "access", "event",
 		"group", "role", "user",
 		"conversion", // M0097-0071
+		"statistics", // DU-002 restart-persistence follow-up (previously unparsed)
 	} {
 		if p.acceptIdentKeyword(objType) {
 			// "materialized view" is two words; VIEW is a keyword token, not ident. M0097-0038.
@@ -5377,22 +5502,11 @@ func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
 			fk.OnUpdate = action
 		}
 	}
-	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]; also accept a
-	// bare INITIALLY DEFERRED (implies DEFERRABLE), mirroring the inline path.
-	if p.acceptKeyword(KwNot) {
-		_, _ = p.expectKeyword(KwDeferrable)
-		fk.Deferrable = false
-	} else if p.acceptKeyword(KwDeferrable) {
-		fk.Deferrable = true
-		if p.acceptIdentKeyword("initially") {
-			fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
-			_ = p.acceptIdentKeyword("immediate")
-		}
-	} else if p.acceptIdentKeyword("initially") {
-		fk.Deferrable = true
-		fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
-		_ = p.acceptIdentKeyword("immediate")
-	}
+	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE], NOT VALID,
+	// and [NOT] ENFORCED, in any order (PG18 for the latter two). DU-002 slice
+	// 432 — extends slice 431's ALTER TABLE-only fix to the table-level
+	// FOREIGN KEY form.
+	fk.Deferrable, fk.InitiallyDeferred, fk.NotValid, fk.NotEnforced = p.parseFKConstraintAttrs()
 	return fk, nil
 }
 
@@ -6104,6 +6218,59 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Name = name
+		// ALTER SEQUENCE name RENAME TO / OWNER TO / SET SCHEMA — distinct
+		// top-level forms in PG's grammar (RenameStmt / AlterOwnerStmt /
+		// AlterObjectSchemaStmt), not combinable with the SeqOptList options
+		// parsed below, so detect and short-circuit before that loop. All
+		// three reuse the generic relation executor (execAlterTable) via
+		// AlterTableStmt — a sequence is just a relation (relkind='S') and
+		// execAlterTable's AlterTableRenameTable case already cascades into
+		// the sequence registry (tbl.IsSequence). Previously these three
+		// forms had no case at all here, so the leftover RENAME/OWNER/SET
+		// token surfaced as a bare syntax error. DU-002 slice 439.
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			renameStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: stmt.IfExists, TagOverride: "ALTER SEQUENCE"}
+			renameStmt.Actions = append(renameStmt.Actions, AlterTableAction{
+				pos:     newNameTok.Pos,
+				Kind:    AlterTableRenameTable,
+				NewName: identText(newNameTok),
+			})
+			return renameStmt, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: stmt.IfExists, TagOverride: "ALTER SEQUENCE"}
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+			// bootstrap superuser in goopg (mirrors ALTER TABLE OWNER TO).
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.OwnerTo = ""
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.OwnerTo = identText(tok)
+			}
+			if ownerStmt.OwnerTo == "" {
+				ownerStmt.OwnerTo = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			return &AlterTableStmt{pos: t.Pos, Name: name, IfExists: stmt.IfExists, SetSchema: identText(schemaTok), TagOverride: "ALTER SEQUENCE"}, nil
+		}
 		// Parse sequence options — same switch pattern as CREATE SEQUENCE.
 		for {
 			switch {
@@ -6201,9 +6368,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 	}
 	// ALTER STATISTICS name SET STATISTICS n — set the extended-statistics
-	// sample target (pg_statistic_ext.stxstattarget). Other ALTER STATISTICS
-	// forms (RENAME / OWNER TO / SET SCHEMA) are consumed as no-ops. The target
-	// round-trips through pg_dump's dumpStatisticsExt. DU-002 slice 317.
+	// sample target (pg_statistic_ext.stxstattarget); round-trips through
+	// pg_dump's dumpStatisticsExt. DU-002 slice 317. RENAME TO / OWNER TO /
+	// SET SCHEMA — distinct top-level forms (RenameStmt/AlterOwnerStmt/
+	// AlterObjectSchemaStmt in PG's grammar) — actually move/rename/
+	// re-own the object (catalog.RenameStatisticsObject/SetStatisticsOwner/
+	// SetStatisticsSchema). DU-002 slice 441.
 	if p.acceptIdentKeyword("statistics") {
 		stmt := &AlterStatisticsStmt{pos: t.Pos}
 		if p.acceptKeyword(KwIf) {
@@ -6217,9 +6387,48 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		stmt.Name = name
-		// SET STATISTICS n — the only modelled form. `SET STATISTICS` here is the
-		// keyword KwSet (or the bare ident) followed by the unreserved "statistics".
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Action = "rename"
+			stmt.NewName = identText(newNameTok)
+			return stmt, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			stmt.Action = "owner"
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				stmt.NewOwner = "current_user"
+			} else {
+				tok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				stmt.NewOwner = identText(tok)
+			}
+			return stmt, nil
+		}
+		// SET SCHEMA / SET STATISTICS n both start with the same SET token
+		// (KwSet or the bare ident); branch on the following keyword.
 		if p.acceptKeyword(KwSet) || p.acceptIdentKeyword("set") {
+			if p.acceptIdentKeyword("schema") {
+				schemaTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				stmt.Action = "setschema"
+				stmt.NewSchema = identText(schemaTok)
+				return stmt, nil
+			}
 			if p.acceptIdentKeyword("statistics") {
 				neg := false
 				if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
@@ -6363,8 +6572,20 @@ func (p *parser) parseAlter() (Stmt, error) {
 		case p.acceptIdentKeyword("refresh"):
 			_ = p.acceptIdentKeyword("version")
 			stmt.Action = "refresh"
+		case (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema"):
+			// SET SCHEMA newschema — DU-002 slice 442, closes the last
+			// unmodelled ALTER COLLATION form (RENAME TO / OWNER TO were
+			// already dedicated cases; only this one fell to the no-op
+			// default below).
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			stmt.Action = "setschema"
+			stmt.NewSchema = identText(schemaTok)
 		default:
-			// Unmodelled form (e.g. SET SCHEMA) — consume as a no-op.
+			// Unmodelled form — consume as a no-op.
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
@@ -6477,7 +6698,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			if err != nil {
 				return nil, err
 			}
-			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName, TagOverride: "ALTER INDEX"}
 			stmt.Actions = append(stmt.Actions, AlterTableAction{
 				pos:     newNameTok.Pos,
 				Kind:    AlterTableRenameTable,
@@ -6647,10 +6868,189 @@ func (p *parser) parseAlter() (Stmt, error) {
 				schemaNameTok := p.cur()
 				p.advance()
 				schemaName := identText(schemaNameTok)
-				return &AlterTableStmt{pos: t.Pos, Name: mvName, SetSchema: schemaName}, nil
+				return &AlterTableStmt{pos: t.Pos, Name: mvName, SetSchema: schemaName, TagOverride: "ALTER MATERIALIZED VIEW"}, nil
 			}
 		}
 		// Other ALTER MATERIALIZED VIEW actions — consume until ';'.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER VIEW name RENAME TO / OWNER TO / SET SCHEMA — same treatment as
+	// ALTER SEQUENCE (DU-002 slice 439): a view is just a relation
+	// (pg_class.relkind='v'), and real PostgreSQL backs all three with the
+	// same generic commands (RenameRelation/AlterTableOwner/
+	// AlterTableNamespace, postgres/src/backend/commands/tablecmds.c), so
+	// they reuse the generic relation executor (execAlterTable) exactly like
+	// the materialized-view SET SCHEMA case above. Previously ALTER VIEW had
+	// no dedicated case at all here, so it fell into the blanket
+	// "schema/view/collation/..." compat-stub loop below, which silently
+	// consumed and discarded RENAME/OWNER/SET SCHEMA — a functional no-op,
+	// not merely a mistagging bug. DU-002 slice 440.
+	if p.acceptKeyword(KwView) {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if p.acceptIdentKeyword("rename") {
+			if p.acceptKeyword(KwTo) {
+				newNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				renameStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+				renameStmt.Actions = append(renameStmt.Actions, AlterTableAction{
+					pos:     newNameTok.Pos,
+					Kind:    AlterTableRenameTable,
+					NewName: identText(newNameTok),
+				})
+				return renameStmt, nil
+			}
+			// RENAME [COLUMN] old_name TO new_name — COLUMN is optional in PG's
+			// grammar (ATT_VIEW like ATT_TABLE). Previously the `&&
+			// p.acceptKeyword(KwTo)` short-circuit above already consumed the
+			// "rename" token and then fell through to the catch-all no-op loop
+			// below on any non-RENAME-TO form, so this was a silent no-op
+			// exactly like the pre-slice-440 RENAME TO/OWNER TO/SET SCHEMA gap.
+			// DU-002 slice 444 (closes the slice-440 ledger row's resume point).
+			_ = p.acceptKeyword(KwColumn)
+			oldNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			renameColStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			renameColStmt.Actions = append(renameColStmt.Actions, AlterTableAction{
+				pos:           oldNameTok.Pos,
+				Kind:          AlterTableRenameColumn,
+				OldColumnName: identText(oldNameTok),
+				NewName:       identText(newNameTok),
+			})
+			return renameColStmt, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+			// bootstrap superuser in goopg (mirrors ALTER SEQUENCE/TABLE OWNER TO).
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.OwnerTo = ""
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.OwnerTo = identText(tok)
+			}
+			if ownerStmt.OwnerTo == "" {
+				ownerStmt.OwnerTo = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+			p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+			p.advance() // SET
+			p.advance() // SCHEMA
+			schemaTok := p.cur()
+			p.advance()
+			return &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, SetSchema: identText(schemaTok), TagOverride: "ALTER VIEW"}, nil
+		}
+		// SET (view_option = value, ...) / RESET (view_option, ...) — view-level
+		// storage-parameter reloptions (e.g. `security_barrier`,
+		// `check_option`). Reuses the same AlterTableSetReloptions/
+		// AlterTableResetReloptions actions ALTER TABLE's own SET/RESET form
+		// produces (both are relations, execAlterTable's dispatch is generic
+		// over tbl.Reloptions). Checked after SET SCHEMA (which matches on the
+		// "schema" identifier, not "(") so the two forms never collide. DU-002
+		// slice 444.
+		if cur := p.cur(); isAlterReloptVerb(cur) && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+			reset := cur.Kind == TokenKeyword && cur.Keyword == KwReset ||
+				cur.Kind == TokenIdent && strings.EqualFold(cur.Value, "reset")
+			p.advance() // SET or RESET
+			opts, err := p.parseWithOptions()
+			if err != nil {
+				return nil, err
+			}
+			kind := AlterTableSetReloptions
+			if reset {
+				kind = AlterTableResetReloptions
+			}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{pos: t.Pos, Kind: kind, With: opts})
+			return stmt, nil
+		}
+		// ALTER [COLUMN] col SET DEFAULT expr / DROP DEFAULT — PG's
+		// updatable-view column-default form (backs an INSERT/UPDATE through
+		// the view when the target column is omitted). Reuses the identical
+		// AlterTableSetDefault/AlterTableDropDefault actions ALTER TABLE's own
+		// ALTER COLUMN form produces; execAlterTable's dispatch mutates
+		// tbl.Columns[i].DefaultExpr generically regardless of relkind. DU-002
+		// slice 444.
+		if p.acceptKeyword(KwAlter) {
+			_ = p.acceptKeyword(KwColumn)
+			colTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			colName := identText(colTok)
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet {
+				p.advance() // SET
+				if _, err := p.expectKeyword(KwDefault); err != nil {
+					return nil, err
+				}
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					pos:         colTok.Pos,
+					Kind:        AlterTableSetDefault,
+					ColumnName:  colName,
+					DefaultExpr: expr,
+				})
+				return stmt, nil
+			}
+			if p.acceptKeyword(KwDrop) {
+				if _, err := p.expectKeyword(KwDefault); err != nil {
+					return nil, err
+				}
+				stmt := &AlterTableStmt{pos: t.Pos, Name: name, IfExists: ifExists, TagOverride: "ALTER VIEW"}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					pos:        colTok.Pos,
+					Kind:       AlterTableDropDefault,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
+			// Unrecognized ALTER COLUMN form on a view — consume as a no-op.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return &AlterTableStmt{pos: t.Pos}, nil
+		}
+		// Other ALTER VIEW forms not yet modeled — consume as a no-op like the
+		// pre-existing compat stub did for everything (see deferral ledger).
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
@@ -6911,10 +7311,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return nil, p.errAtCur("expected DISABLE, ENABLE, RENAME TO, or OWNER TO in ALTER EVENT TRIGGER")
 	}
-	// ALTER VIEW / SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
-	// SYSTEM — compatibility stubs. Consume until end of statement.
+	// ALTER SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
+	// SYSTEM — compatibility stubs. Consume until end of statement. (ALTER
+	// VIEW has its own dedicated case above, DU-002 slice 440 — "view" is
+	// intentionally not in this list.)
 	for _, objIdent := range []string{
-		"schema", "view",
+		"schema",
 		"collation", "domain", "extension", "language",
 		"operator", "system",
 	} {
@@ -7218,6 +7620,34 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// parseAlterTableAction() to support comma-separated multi-action ALTER TABLE
 	// statements (e.g. "ALTER TABLE t DROP COLUMN a, DROP COLUMN b"). Fall through
 	// to the multi-action loop below. M0097-0028.
+	// ALTER CONSTRAINT name ConstraintAttributeSpec (PG18) — re-declares an
+	// EXISTING constraint's deferrability/enforceability rather than adding a
+	// new one. Must be checked before the generic "ALTER COLUMN" branch below:
+	// both start with the bare ALTER keyword, and CONSTRAINT (not COLUMN) is
+	// the only thing distinguishing them at this point in the grammar — the
+	// ALTER COLUMN branch would otherwise consume "CONSTRAINT" as if it were a
+	// (quoted) column name. DU-002 slice 433.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter &&
+		p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwConstraint {
+		p.advance() // ALTER
+		p.advance() // CONSTRAINT
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		deferrable, initiallyDeferred, enforced, hasDeferrability, hasEnforceability := p.parseAlterConstraintAttrs()
+		stmt.Actions = append(stmt.Actions, AlterTableAction{
+			pos:                              nameTok.Pos,
+			Kind:                             AlterTableAlterConstraint,
+			ConstraintName:                   identText(nameTok),
+			AlterConstraintDeferrable:        deferrable,
+			AlterConstraintInitiallyDeferred: initiallyDeferred,
+			AlterConstraintHasDeferrability:  hasDeferrability,
+			AlterConstraintEnforced:          enforced,
+			AlterConstraintHasEnforceability: hasEnforceability,
+		})
+		return stmt, nil
+	}
 	// ALTER COLUMN — handle SET (options) and TYPE specially; consume other forms as no-op.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAlter {
 		p.advance() // consume ALTER
@@ -7866,40 +8296,35 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				onUpdate = action
 			}
 		}
-		// Optional [NOT] DEFERRABLE [INITIALLY …] and/or NOT VALID trailers, in
-		// any order (PG grammar allows `… DEFERRABLE NOT VALID` etc.). `NOT VALID`
-		// (ALTER TABLE ADD FOREIGN KEY … NOT VALID) creates the constraint without
-		// checking pre-existing rows; a later VALIDATE CONSTRAINT performs the
-		// scan. M0118-0008 (alter-table-1/2 isolation specs).
-		deferrable := false
-		notValid := false
-		for {
-			if p.acceptKeyword(KwNot) {
-				if p.acceptIdentKeyword("valid") {
-					notValid = true
-					continue
-				}
-				if _, err := p.expectKeyword(KwDeferrable); err != nil {
-					return AlterTableAction{}, err
-				}
-				deferrable = false
-				continue
-			}
-			if p.acceptKeyword(KwDeferrable) {
-				deferrable = true
-				if p.acceptIdentKeyword("initially") {
-					_ = p.acceptIdentKeyword("deferred") || p.acceptIdentKeyword("immediate")
-				}
-				continue
-			}
-			break
-		}
+		// Optional [NOT] DEFERRABLE [INITIALLY …], NOT VALID, and/or [NOT]
+		// ENFORCED trailers, in any order (PG grammar's ConstraintAttributeSpec
+		// allows e.g. `… DEFERRABLE NOT VALID` or `… NOT ENFORCED` in any
+		// sequence — gram.y's ConstraintAttributeElem list applies identically
+		// to CHECK and FOREIGN KEY constraints). `NOT VALID` (ALTER TABLE ADD
+		// FOREIGN KEY … NOT VALID) creates the constraint without checking
+		// pre-existing rows; a later VALIDATE CONSTRAINT performs the scan.
+		// M0118-0008 (alter-table-1/2 isolation specs). `NOT ENFORCED` (PG18)
+		// disables the constraint's action/check triggers entirely — mirrored
+		// here the same way the CHECK-constraint form already threads it
+		// (DU-002 slice 430): the AST field stays independent of NotValid (a
+		// bare NOT ENFORCED does NOT set NotValid here, matching
+		// TestParseCheckNotEnforced's CHECK-form precedent); the catalog layer
+		// derives convalidated='f' from `NotValid || NotEnforced` instead
+		// (mirroring PG's processCASbits, which sets *not_valid=true only as
+		// an internal consistency detail, not something surfaced back through
+		// this AST). DU-002 slice 431. Shared with the CREATE TABLE-time FK
+		// forms (inline column REFERENCES, table-level FOREIGN KEY) via
+		// parseFKConstraintAttrs so all three stay in lockstep (DU-002 slice
+		// 432); AlterTableAction has no InitiallyDeferred field to populate, so
+		// that return value is discarded here.
+		deferrable, _, notValid, notEnforced := p.parseFKConstraintAttrs()
 		act.Kind = AlterTableAddForeignKey
 		act.Columns = cols
 		act.RefTable = refTable
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
 		act.NotValid = notValid
+		act.FKNotEnforced = notEnforced
 		act.MatchFull = matchFull
 		act.OnDelete = onDelete
 		act.OnUpdate = onUpdate
@@ -7913,19 +8338,27 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			return AlterTableAction{}, err
 		}
 		// Consume optional NOT VALID and/or [NOT] ENFORCED trailers (PG18+).
-		// Possible orderings: NOT VALID, ENFORCED, NOT ENFORCED, NOT VALID ENFORCED.
-		// NOT VALID must survive into pg_constraint.convalidated='f' so pg_dump
-		// re-emits the ` NOT VALID` tail and loads data before the constraint.
-		// DU-002 slice 308.
+		// Possible orderings: NOT VALID, ENFORCED, NOT ENFORCED, NOT VALID ENFORCED,
+		// NOT VALID NOT ENFORCED. NOT VALID must survive into
+		// pg_constraint.convalidated='f' so pg_dump re-emits the ` NOT VALID`
+		// tail and loads data before the constraint (DU-002 slice 308); NOT
+		// ENFORCED must likewise survive into conenforced='f' so pg_dump
+		// re-emits the ` NOT ENFORCED` tail instead (which takes precedence
+		// over NOT VALID in the rendered text). DU-002 slice 430.
 		notValid := false
+		notEnforced := false
 		if p.acceptKeyword(KwNot) {
 			if !p.acceptIdentKeyword("valid") {
-				_ = p.acceptIdentKeyword("enforced") // NOT ENFORCED
+				if p.acceptIdentKeyword("enforced") { // NOT ENFORCED
+					notEnforced = true
+				}
 			} else {
 				notValid = true
 				// NOT VALID — also accept optional trailing [NOT] ENFORCED.
 				if p.acceptKeyword(KwNot) {
-					_ = p.acceptIdentKeyword("enforced")
+					if p.acceptIdentKeyword("enforced") {
+						notEnforced = true
+					}
 				} else {
 					_ = p.acceptIdentKeyword("enforced")
 				}
@@ -7936,6 +8369,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
 		act.NotValid = notValid
+		act.CheckNotEnforced = notEnforced
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.

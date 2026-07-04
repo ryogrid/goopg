@@ -642,14 +642,17 @@ func (s *BasicSession) IsTransactionFailed() bool { return s.txFailed }
 // SetTransactionFailed marks the transaction as failed.
 func (s *BasicSession) SetTransactionFailed() { s.txFailed = true }
 
-// RecordDDLCreate records a CREATE TABLE or CREATE INDEX for potential rollback.
-// Called by DDL operators after catalog.CreateTable / catalog.CreateIndex succeed.
-// Only records when inside an explicit transaction; autocommit DDL is durable
-// immediately and must not be undone by a later ROLLBACK.
+// RecordDDLCreate records a CREATE TABLE or CREATE INDEX for potential
+// rollback. Called by DDL operators after catalog.CreateTable /
+// catalog.CreateIndex succeed. Recorded unconditionally: besides an explicit
+// BEGIN block, a *BasicSession is also wired message-scoped for an autocommit
+// simple-query batch (dispatchSimpleQueryViaExecutor) so that a LATER
+// statement's failure in the SAME multi-statement message can still undo an
+// earlier CREATE via ProcessRollbackUndos — that batch runs under one
+// implicit mvcc transaction, so it is not actually durable until every
+// statement in the message succeeds (M0110-0001 DU-002 slice 444 deferral,
+// 2026-07-04). A session that never aborts simply never drains this list.
 func (s *BasicSession) RecordDDLCreate(e DDLUndoEntry) {
-	if !s.inTx {
-		return
-	}
 	s.pendingDDL = append(s.pendingDDL, e)
 }
 

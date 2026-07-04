@@ -4296,6 +4296,93 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create type myrange: %v", err)
 	}
 
+	// Slice 430: a CHECK constraint added with NOT ENFORCED (PG18) must
+	// round-trip with a trailing ` NOT ENFORCED` — a form pg_get_constraintdef
+	// gives PRIORITY over NOT VALID (ruleutils.c:2601-2604 checks conenforced
+	// FIRST and only falls back to convalidated when the constraint IS
+	// enforced: "Validated status is irrelevant when the constraint is NOT
+	// ENFORCED"). Real PG's ATAddCheckNNConstraint also sets
+	// skip_validation=!is_enforced, so a NOT ENFORCED constraint is *always*
+	// convalidated='f' too, and pg_dump's getTableConstraints marks it
+	// `separate = !validated` — it is dumped via a standalone
+	// `ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED;` AFTER the table (and
+	// data), exactly like a NOT VALID constraint (slice 308), never inline in
+	// CREATE TABLE. Before this slice `NOT ENFORCED` was accepted by the
+	// parser (in three CREATE TABLE spots and one ALTER TABLE spot) purely as
+	// a discard — pg_constraint.conenforced was hardcoded 't' always, so the
+	// dump silently re-enforced a constraint the user explicitly disabled.
+	// nenf_alter exercises the ALTER TABLE ADD CONSTRAINT ... CHECK ... NOT
+	// ENFORCED path (named); nenf_inline exercises the CREATE TABLE-inline,
+	// anonymous table-level `CHECK (...) NOT ENFORCED` path (auto-named
+	// nenf_inline_val_check, per slice 127's single-column naming rule) —
+	// demonstrating that even an inline-written NOT ENFORCED check still gets
+	// pulled out to a separate post-data ALTER TABLE by real pg_dump, purely
+	// from reading convalidated='f' off goopg's pg_constraint.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nenf_alter (id integer, val integer)"); err != nil {
+		t.Fatalf("create table nenf_alter: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nenf_alter ADD CONSTRAINT nenf_chk CHECK (val > 0) NOT ENFORCED"); err != nil {
+		t.Fatalf("alter table nenf_alter add check not enforced: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nenf_inline (id integer, val integer, CHECK (val > 0) NOT ENFORCED)"); err != nil {
+		t.Fatalf("create table nenf_inline: %v", err)
+	}
+	// Slice 431: a FOREIGN KEY constraint added with NOT ENFORCED (PG18, the
+	// FK-side sibling of slice 430's CHECK support) must round-trip the same
+	// way — real PostgreSQL's `ALTER TABLE ADD FOREIGN KEY ... NOT ENFORCED`
+	// grammar was previously a hard parse error in goopg (unlike the CHECK
+	// forms, which merely discarded the flag), so this is the FK form's first
+	// pg_dump round-trip coverage at all, not just a precedence fix.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.fknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table fknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.fknenf_child (id integer, pid integer)"); err != nil {
+		t.Fatalf("create table fknenf_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.fknenf_child ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES public.fknenf_parent(id) NOT ENFORCED"); err != nil {
+		t.Fatalf("alter table fknenf_child add foreign key not enforced: %v", err)
+	}
+	// Slice 432: the same NOT ENFORCED trailer, written at CREATE TABLE time
+	// instead of via a later ALTER TABLE — both the inline column REFERENCES
+	// form and the table-level FOREIGN KEY form. Real pg_dump's getConstraints
+	// reads convalidated='f' straight off pg_constraint regardless of which
+	// grammar form created the row, so both must be pulled out to the same
+	// standalone post-data `ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED;`
+	// as the ALTER TABLE-authored fknenf_fk above — auto-named
+	// <table>_<col>_fkey (inline) / <table>_<firstcol>_fkey (table-level),
+	// same as an ordinary (enforced) FK of the same shape.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ctfknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table ctfknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ctfknenf_child (id integer, pid integer REFERENCES public.ctfknenf_parent(id) NOT ENFORCED)"); err != nil {
+		t.Fatalf("create table ctfknenf_child with inline FK not enforced: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.cttlfknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table cttlfknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.cttlfknenf_child (id integer, pid integer, FOREIGN KEY (pid) REFERENCES public.cttlfknenf_parent(id) NOT ENFORCED)"); err != nil {
+		t.Fatalf("create table cttlfknenf_child with table-level FK not enforced: %v", err)
+	}
+	// Slice 433: `ALTER TABLE ... ALTER CONSTRAINT name NOT ENFORCED` (PG18)
+	// re-declares an ALREADY-EXISTING foreign key's enforceability, rather
+	// than declaring a new constraint NOT ENFORCED from the start the way
+	// slices 431/432 did. pg_dump's getConstraints reads convalidated='f'/
+	// conenforced='f' straight off pg_constraint regardless of how the row
+	// got that way, so the dumped ALTER TABLE ADD CONSTRAINT statement must
+	// be byte-identical to the direct-NOT-ENFORCED forms above.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.acfknenf_parent (id integer)"); err != nil {
+		t.Fatalf("create table acfknenf_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.acfknenf_child (id integer, pid integer)"); err != nil {
+		t.Fatalf("create table acfknenf_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.acfknenf_child ADD CONSTRAINT acfknenf_fk FOREIGN KEY (pid) REFERENCES public.acfknenf_parent(id)"); err != nil {
+		t.Fatalf("alter table acfknenf_child add foreign key: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.acfknenf_child ALTER CONSTRAINT acfknenf_fk NOT ENFORCED"); err != nil {
+		t.Fatalf("alter table acfknenf_child alter constraint not enforced: %v", err)
+	}
+
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
 	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
@@ -4979,6 +5066,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE FOREIGN TABLE public.goopg_ftable (c1 int options (column_name 'col1')) SERVER goopg_srv OPTIONS (schema_name 'x1')"); err != nil {
 		t.Fatalf("create foreign table: %v", err)
 	}
+	// Slice 435: COMMENT ON FOREIGN TABLE must round-trip, the sibling of
+	// COMMENT ON TABLE/VIEW/SEQUENCE/MATERIALIZED VIEW (all pg_class relations
+	// sharing the same classoid=1259 lookup). Before this slice
+	// parseCommentOnTail's "FOREIGN" branch only recognized "FOREIGN DATA
+	// WRAPPER" — any other continuation, including TABLE, was a hard *parse
+	// error* (a strictly worse failure mode than the silent-drop bugs earlier
+	// COMMENT ON slices fixed). pg_dump's dumpTableSchema re-emits a trailing
+	// `COMMENT ON FOREIGN TABLE <name> IS '...';` for a commented foreign
+	// table exactly like it does for an ordinary commented table.
+	if err := runSQLSimple(t, c, "COMMENT ON FOREIGN TABLE public.goopg_ftable IS 'a goopg foreign table comment'"); err != nil {
+		t.Fatalf("comment on foreign table: %v", err)
+	}
 	// Slice 422: CREATE PUBLICATION must survive the dump. Before this slice,
 	// `pg_publication.pubowner` (internal/initdb/replication_views.go) was
 	// hardcoded to the empty string ("roles aren't OID-stable yet"). Real
@@ -5035,6 +5134,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "CREATE ACCESS METHOD goopg_am TYPE INDEX HANDLER goopg_am_handler"); err != nil {
 		t.Fatalf("create access method: %v", err)
+	}
+	// Slice 434: COMMENT ON ACCESS METHOD must round-trip, the sibling of
+	// COMMENT ON SERVER/FOREIGN DATA WRAPPER/EXTENSION. Before this slice
+	// parseCommentOnTail had no "access method" branch (COMMENT ON ACCESS
+	// METHOD fell into the unsupported-type default and was silently
+	// discarded — verified live against real pg_dump 18.3: the comment never
+	// reached pg_description, so pg_dump's dumpAccessMethod never emitted the
+	// trailing `COMMENT ON ACCESS METHOD <name> IS '...';` block real PG
+	// always does). Access methods have no schema (top-level object, like
+	// SERVER/FDW), so this mirrors the bare-name COMMENT ON SERVER shape.
+	if err := runSQLSimple(t, c, "COMMENT ON ACCESS METHOD goopg_am IS 'a goopg access method comment'"); err != nil {
+		t.Fatalf("comment on access method: %v", err)
 	}
 	// Slice 388: install an extension so COMMENT ON EXTENSION has a target. amcheck
 	// is the one extension goopg ships (knownExtensions), so CREATE EXTENSION
@@ -11142,6 +11253,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, attFDWOptionsStmt) {
 			t.Errorf("pg_dump dropped the per-column FDW OPTIONS round-trip (slice-418); missing %q\n  full stdout=%q", attFDWOptionsStmt, res.Stdout)
 		}
+		// Slice 435: COMMENT ON FOREIGN TABLE must round-trip. Before this
+		// slice "COMMENT ON FOREIGN TABLE" was a hard parser error in goopg
+		// (parseCommentOnTail's "FOREIGN" branch only recognized "FOREIGN DATA
+		// WRAPPER"), so this comment could never even be stored, let alone
+		// re-emitted by dumpTableSchema's trailing `COMMENT ON FOREIGN TABLE
+		// <name> IS '...';` block.
+		ftableCommentStmt := "COMMENT ON FOREIGN TABLE public.goopg_ftable IS 'a goopg foreign table comment';"
+		if !strings.Contains(res.Stdout, ftableCommentStmt) {
+			t.Errorf("pg_dump dropped the COMMENT ON FOREIGN TABLE round-trip (slice-435); missing %q\n  full stdout=%q", ftableCommentStmt, res.Stdout)
+		}
 		// Slice 422: CREATE PUBLICATION must round-trip, and pg_dump must not
 		// abort. Before this slice pg_publication.pubowner was always "" and
 		// pg_dump's getRoleName() pg_fatal()'d on it — a regression here would
@@ -11187,6 +11308,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "CREATE ACCESS METHOD btree") ||
 			strings.Contains(res.Stdout, "CREATE ACCESS METHOD heap") {
 			t.Errorf("pg_dump spuriously dumped a built-in access method (slice-426 oid-threshold filter regressed); full stdout=%q", res.Stdout)
+		}
+		// Slice 434: COMMENT ON ACCESS METHOD must round-trip. dumpAccessMethod
+		// (pg_dump.c) emits a trailing `COMMENT ON ACCESS METHOD <name> IS
+		// '...';` block right after the CREATE, sourced from collectComments'
+		// single `SELECT description, classoid, objoid, objsubid FROM
+		// pg_catalog.pg_description` query keyed on the AM's own catalogId
+		// (classoid=pg_am=2601, objsubid=0). Verified byte-identical against a
+		// live PG 18.3 `CREATE ACCESS METHOD ... HANDLER bthandler;` +
+		// `COMMENT ON ACCESS METHOD ... IS '...';` round-trip.
+		amCommentStmt := "COMMENT ON ACCESS METHOD goopg_am IS 'a goopg access method comment';"
+		if !strings.Contains(res.Stdout, amCommentStmt) {
+			t.Errorf("pg_dump dropped the COMMENT ON ACCESS METHOD round-trip (slice-434); missing %q\n  full stdout=%q", amCommentStmt, res.Stdout)
 		}
 		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
 		// spurious COLLATE clause. The positive assertion above pins the exact
@@ -11494,6 +11627,51 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped the RANGE type round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 430: a CHECK constraint added with NOT ENFORCED (PG18) must
+		// round-trip the trailing ` NOT ENFORCED`, and — because NOT ENFORCED
+		// implies convalidated='f' too (mirroring real PG) — pg_dump must dump
+		// it as a standalone `ADD CONSTRAINT ... NOT ENFORCED;` statement, the
+		// same "separate" treatment slice 308 verified for NOT VALID.
+		// nenf_alter covers the ALTER TABLE ADD CONSTRAINT ... NOT ENFORCED
+		// path; nenf_inline covers an inline, anonymous table-level
+		// `CHECK (...) NOT ENFORCED` (auto-named nenf_inline_val_check per
+		// slice 127) still getting pulled out of CREATE TABLE into its own
+		// post-data ALTER TABLE by real pg_dump.
+		notEnforcedDefs := []string{
+			"ADD CONSTRAINT nenf_chk CHECK ((val > 0)) NOT ENFORCED;",
+			"ADD CONSTRAINT nenf_inline_val_check CHECK ((val > 0)) NOT ENFORCED;",
+		}
+		for _, sub := range notEnforcedDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a check constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Slice 431: the FK-side sibling of slice 430 — a FOREIGN KEY added
+		// with NOT ENFORCED must round-trip the same way, dumped as a
+		// standalone post-data ALTER TABLE (convalidated='f' is implied).
+		fkNotEnforcedDef := "ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES public.fknenf_parent(id) NOT ENFORCED;"
+		if !strings.Contains(res.Stdout, fkNotEnforcedDef) {
+			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a foreign key constraint; missing %q\n  full stdout=%q", fkNotEnforcedDef, res.Stdout)
+		}
+		// Slice 432: the same trailer written at CREATE TABLE time (inline
+		// column REFERENCES and table-level FOREIGN KEY) must round-trip
+		// identically to the ALTER TABLE-authored form above.
+		ctFKNotEnforcedDefs := []string{
+			"ADD CONSTRAINT ctfknenf_child_pid_fkey FOREIGN KEY (pid) REFERENCES public.ctfknenf_parent(id) NOT ENFORCED;",
+			"ADD CONSTRAINT cttlfknenf_child_pid_fkey FOREIGN KEY (pid) REFERENCES public.cttlfknenf_parent(id) NOT ENFORCED;",
+		}
+		for _, sub := range ctFKNotEnforcedDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the NOT ENFORCED suffix on a CREATE TABLE-time foreign key constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Slice 433: `ALTER TABLE ... ALTER CONSTRAINT name NOT ENFORCED`
+		// re-declaring an already-enforced FK must dump identically to a FK
+		// that was NOT ENFORCED from the moment it was added (slice 431).
+		acFKNotEnforcedDef := "ADD CONSTRAINT acfknenf_fk FOREIGN KEY (pid) REFERENCES public.acfknenf_parent(id) NOT ENFORCED;"
+		if !strings.Contains(res.Stdout, acFKNotEnforcedDef) {
+			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on an ALTER CONSTRAINT-flipped foreign key; missing %q\n  full stdout=%q", acFKNotEnforcedDef, res.Stdout)
 		}
 		return
 	}

@@ -104,3 +104,10 @@ every existing object; TPC-H/pgbench carry no statistics objects.
 The broader pg_dump 002–010 catalog-view parity battery (further DU-002 slices);
 extended-protocol commit-time deferral (architecturally entangled — the extended
 protocol is auto-commit-per-statement).
+
+## Follow-up
+
+See `docs/design/0110-0001-pg-dump-tap-port.md` ("Follow-up: `ALTER
+STATISTICS … RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops (DU-002
+slice 441)") — the DU-002 ALTER-form-gap slices (439/440/441) are tracked
+there rather than per-object-type design docs.

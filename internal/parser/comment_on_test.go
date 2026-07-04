@@ -265,6 +265,48 @@ func TestParseCommentOnForeignDataWrapper(t *testing.T) {
 	}
 }
 
+// TestParseCommentOnForeignTable covers COMMENT ON FOREIGN TABLE <name>. Foreign
+// tables are pg_class relations (relkind='f') sharing goopg's ordinary table
+// registry; pg_dump's dumpTableSchema re-emits `COMMENT ON FOREIGN TABLE <name>
+// IS '...'`. Before slice 435 the "FOREIGN" branch only recognized "FOREIGN DATA
+// WRAPPER" and any other continuation (including TABLE) was a hard parse error
+// (not merely a silent drop). DU-002 slice 435.
+func TestParseCommentOnForeignTable(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantSchema string
+		wantName   string
+	}{
+		{"COMMENT ON FOREIGN TABLE ft1 IS 'a foreign table comment'", "", "ft1"},
+		{"COMMENT ON FOREIGN TABLE public.ft2 IS 'c'", "public", "ft2"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "foreign table" {
+			t.Errorf("%q: ObjKind=%q, want foreign table", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != tc.wantSchema {
+			t.Errorf("%q: ObjName.Schema=%q, want %q", tc.sql, cs.ObjName.Schema, tc.wantSchema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}
+
 // TestParseCommentOnExtension covers COMMENT ON EXTENSION <name>. Extensions are
 // top-level, schema-less objects (pg_extension, classoid 3079); pg_dump's
 // dumpExtension re-emits `COMMENT ON EXTENSION <name> IS '...'`. EXTENSION is an
@@ -388,5 +430,58 @@ func TestParseCommentOnCast(t *testing.T) {
 		if cs.CastTarget != tc.wantTarget {
 			t.Errorf("%q: CastTarget=%q, want %q", tc.sql, cs.CastTarget, tc.wantTarget)
 		}
+	}
+}
+
+// TestParseCommentOnAccessMethod covers COMMENT ON ACCESS METHOD, the sibling
+// of COMMENT ON SERVER/FOREIGN DATA WRAPPER. Access methods live in pg_am
+// (classoid 2601); pg_dump's dumpAccessMethod re-emits `COMMENT ON ACCESS
+// METHOD <name> IS '...'`. "ACCESS" is unreserved and unregistered as a
+// keyword (matched via the ident path, same as CREATE ACCESS METHOD); an
+// access method is a top-level (schema-less) object. Before slice 434 the
+// parser had no "access method" branch and silently swallowed the statement
+// (it fell into parseCommentOnTail's unsupported-type default, so the
+// comment never reached pg_description). DU-002 slice 434.
+func TestParseCommentOnAccessMethod(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantName string
+	}{
+		{"COMMENT ON ACCESS METHOD goopg_am IS 'an access method comment'", "goopg_am"},
+		{"COMMENT ON ACCESS METHOD my_am IS 'c'", "my_am"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Errorf("%q: unexpected parse error: %v", tc.sql, err)
+			continue
+		}
+		if len(stmts) != 1 {
+			t.Errorf("%q: got %d stmts, want 1", tc.sql, len(stmts))
+			continue
+		}
+		cs, ok := stmts[0].(*CommentOnStmt)
+		if !ok {
+			t.Errorf("%q: got %T, want *CommentOnStmt", tc.sql, stmts[0])
+			continue
+		}
+		if cs.ObjKind != "access method" {
+			t.Errorf("%q: ObjKind=%q, want \"access method\"", tc.sql, cs.ObjKind)
+		}
+		if cs.ObjName.Schema != "" {
+			t.Errorf("%q: ObjName.Schema=%q, want empty (access method is schema-less)", tc.sql, cs.ObjName.Schema)
+		}
+		if cs.ObjName.Name != tc.wantName {
+			t.Errorf("%q: ObjName.Name=%q, want %q", tc.sql, cs.ObjName.Name, tc.wantName)
+		}
+	}
+}
+
+// TestParseCommentOnAccessMethodMissingMethodKeyword covers the error path
+// when METHOD is omitted after ACCESS.
+func TestParseCommentOnAccessMethodMissingMethodKeyword(t *testing.T) {
+	_, err := Parse("COMMENT ON ACCESS goopg_am IS 'x'")
+	if err == nil {
+		t.Fatalf("expected parse error for COMMENT ON ACCESS without METHOD, got nil")
 	}
 }

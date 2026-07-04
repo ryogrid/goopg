@@ -293,6 +293,70 @@ func (v *Variable) Reset() {
 // human-readable "8MB" can format separately).
 func (v *Variable) Display() string { return v.Value }
 
+// unitConversion is one (suffix, base-units-per-suffix-unit) entry, mirroring
+// a row of guc.c's memory_unit_conversion_table / time_unit_conversion_table
+// (postgres/src/backend/utils/misc/guc.c) restricted to the rows for a single
+// base unit, ordered greatest-to-smallest as upstream requires.
+type unitConversion struct {
+	suffix     string
+	multiplier int64
+}
+
+// memoryDisplayUnits/timeDisplayUnits give, for each possible native storage
+// Unit, the ordered (greatest-to-smallest, terminating at the base unit
+// itself) list of display units convert_int_from_base_unit walks.
+var memoryDisplayUnits = map[Unit][]unitConversion{
+	UnitBytes: {{"TB", 1024 * 1024 * 1024 * 1024}, {"GB", 1024 * 1024 * 1024}, {"MB", 1024 * 1024}, {"kB", 1024}, {"B", 1}},
+	UnitKB:    {{"TB", 1024 * 1024 * 1024}, {"GB", 1024 * 1024}, {"MB", 1024}, {"kB", 1}},
+	UnitMB:    {{"TB", 1024 * 1024}, {"GB", 1024}, {"MB", 1}},
+	UnitGB:    {{"TB", 1024}, {"GB", 1}},
+	UnitTB:    {{"TB", 1}},
+}
+
+var timeDisplayUnits = map[Unit][]unitConversion{
+	UnitMs:  {{"d", 86400000}, {"h", 3600000}, {"min", 60000}, {"s", 1000}, {"ms", 1}},
+	UnitS:   {{"d", 86400}, {"h", 3600}, {"min", 60}, {"s", 1}},
+	UnitMin: {{"d", 1440}, {"h", 60}, {"min", 1}},
+	UnitH:   {{"d", 24}, {"h", 1}},
+	UnitD:   {{"d", 1}},
+}
+
+// FormatDisplayValue renders raw — the variable's canonical bare-number
+// string — the way a client-visible display renders it: with a
+// human-friendly unit suffix chosen so it divides evenly, mirroring
+// upstream's ShowGUCOption(record, use_units=true) ->
+// convert_int_from_base_unit (postgres/src/backend/utils/misc/guc.c). Used
+// by SHOW, current_setting(), and ALTER DATABASE/ROLE ... SET ... FROM
+// CURRENT (all three route through GetConfigOptionByName(name, NULL, false)
+// upstream, which always passes use_units=true).
+//
+// Only TypeInt variables with a declared Unit are reformatted; upstream also
+// restricts unit conversion to result > 0, so 0 and negative values (e.g. the
+// "disabled" sentinel used by statement_timeout/lock_timeout) are returned
+// unchanged, matching real PG's bare "0" for SHOW statement_timeout.
+func (v *Variable) FormatDisplayValue(raw string) string {
+	if v.Type != TypeInt || v.Unit == UnitNone {
+		return raw
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || n <= 0 {
+		return raw
+	}
+	table, ok := memoryDisplayUnits[v.Unit]
+	if !ok {
+		table, ok = timeDisplayUnits[v.Unit]
+	}
+	if !ok {
+		return raw
+	}
+	for _, u := range table {
+		if u.multiplier <= 1 || n%u.multiplier == 0 {
+			return strconv.FormatInt(n/u.multiplier, 10) + u.suffix
+		}
+	}
+	return raw
+}
+
 // NewVariable constructs a Variable with its boot value installed.
 // Panics if the boot value fails validation — boot values are author
 // errors, not user errors.

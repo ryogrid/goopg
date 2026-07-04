@@ -11859,3 +11859,1934 @@ Range-type `canonical`/`subtype_diff` sub-item (a) remainder (unchanged from
 loop #63/#64 — needs real shell-type support + function-signature
 validation, a materially larger, separately-scoped feature). No other
 residual from this loop's own scope.
+
+## Follow-up: `CHECK ... NOT ENFORCED` (PG18) round-trip in pg_dump (slice 430)
+
+Closes a fresh gap discovered while auditing DU-002's remaining coverage: PG18
+introduced non-enforced CHECK (and foreign key) constraints
+(`ADD CONSTRAINT ... CHECK (...) NOT ENFORCED`). goopg's parser already
+*accepted* the `NOT ENFORCED` / `ENFORCED` trailer in every CHECK-constraint
+form (anonymous table-level, named table-level, inline column-level, and
+`ALTER TABLE ADD CONSTRAINT`) — but purely as a discard: the token was
+consumed and then thrown away in all four call sites
+(`internal/parser/ddl.go`). `pg_constraint.conenforced` was hardcoded `'t'`
+everywhere in the virtual-table builder (`internal/catalog/catalog.go`), so a
+constraint the user explicitly created as unenforced silently came back
+"enforced" from `pg_dump`, which reads `pg_get_constraintdef(oid)` — a real
+fidelity bug, not just a missing feature.
+
+### Change
+
+New `CheckNotEnforced`/`TableCheckNotEnforced`/`PartitionCheckConstraint.NotEnforced`/
+`AlterTableAction.CheckNotEnforced` fields (`internal/parser/ast.go`) thread
+the flag through all four CHECK-constraint parser call sites
+(`internal/parser/ddl.go`), mirroring the pre-existing `NoInherit` plumbing
+exactly. `catalog.NamedCheckConstraint` gains a `NotEnforced bool` field, and
+a new `(*Table) AddCheckFull(name, expr string, oid uint32, notValid,
+noInherit, notEnforced bool)` unifies the three previously-separate
+`AddCheck*` wrappers (`AddCheck`/`AddCheckWithNotValid`/`AddCheckWithNoInherit`
+now delegate to it) so a caller needing more than one flag (the ALTER TABLE
+ADD CONSTRAINT CHECK path) doesn't need yet another wrapper
+(`internal/catalog/catalog.go`). The `pg_constraint` virtual-row builder for
+table CHECK constraints now projects `conenforced='f'` when `NotEnforced`, and
+— mirroring real PostgreSQL's `ATAddCheckNNConstraint`
+(`tablecmds.c`: `skip_validation = !is_enforced`) — also projects
+`convalidated='f'` whenever `NotEnforced` is set (in addition to the
+pre-existing `NotValid` case), since PG considers a NOT ENFORCED constraint
+implicitly unvalidated too. `pg_get_constraintdef`'s CHECK branch
+(`internal/executor/expr.go`) now mirrors `ruleutils.c`'s exact precedence
+("Validated status is irrelevant when the constraint is NOT ENFORCED"): it
+checks `NotEnforced` FIRST and appends ` NOT ENFORCED`, falling back to
+` NOT VALID` only when the constraint IS enforced.
+
+Because `pg_dump`'s own `getTableConstraints` marks a constraint `separate =
+!validated` (`pg_dump.c`), the new `convalidated='f'` projection is what
+actually makes `pg_dump` pull a NOT ENFORCED CHECK — even one written *inline*
+in `CREATE TABLE` — out into its own post-data `ALTER TABLE ... ADD
+CONSTRAINT ... NOT ENFORCED;` statement, exactly like a NOT VALID constraint
+(slice 308). No pg_dump-side code changed; this falls out entirely from
+`pg_dump` reading goopg's corrected `pg_constraint` rows.
+
+### Tests
+
+`TestParseCheckNotEnforced` (`internal/parser/check_alter_test.go`) covers all
+four parser call sites plus composition with NOT VALID in either order and
+the bare-ENFORCED/no-trailer default-false cases.
+`TestCheckConstraintNotEnforcedAlterTable`,
+`TestCheckConstraintNotEnforcedCreateTableForms`, and
+`TestCheckConstraintPlainNotValidStillRendersNotValid` (new
+`internal/executor/operators_ddl_check_notenforced_test.go`) cover the
+catalog/`pg_constraint`/`pg_get_constraintdef` wiring and guard against the
+new precedence check accidentally swallowing the pre-existing NOT VALID
+rendering. New `TestPort_PgDumpConnectionSetup` fixtures `nenf_alter`
+(`ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED`) and `nenf_inline`
+(inline, anonymous, auto-named `nenf_inline_val_check`) verified byte-identical
+vs live `pg_dump` 18.3: both render as standalone
+`ALTER TABLE ... ADD CONSTRAINT <name> CHECK ((val > 0)) NOT ENFORCED;`
+statements after the table (and data), never inline in `CREATE TABLE`.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `gofmt -l` clean on every touched file
+(pre-existing go1.25-vs-go1.26.3 struct-alignment mismatch in
+`internal/parser/ast.go`, `internal/catalog/catalog.go`,
+`internal/executor/operators_ddl.go`, `internal/executor/expr.go`, and the
+pre-existing single-line-`if` style in `internal/parser/check_alter_test.go`
+is untouched — confirmed via `git stash`/`gofmt -l` before-vs-after diffing
+that none of it is newly introduced by this slice); `internal/parser`+
+`internal/catalog`+`internal/executor` suites PASS (full runs, `-count=1`, no
+regression); `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh`
+PASS; pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`FOREIGN KEY ... NOT ENFORCED` (real PG18 supports NOT ENFORCED on FK
+constraints too, not just CHECK) is untouched — the ALTER TABLE ADD FOREIGN
+KEY parser path (`internal/parser/ddl.go`, the `[NOT] DEFERRABLE`/`NOT VALID`
+trailer loop) has no ENFORCED handling at all, so `... FOREIGN KEY (...)
+REFERENCES ... NOT ENFORCED` is a hard parse error today rather than a silent
+discard. Scoped out of this slice (CHECK-only, per the established
+one-narrow-area-per-slice pattern); ledger row appended.
+
+## Follow-up: `FOREIGN KEY ... NOT ENFORCED` (PG18) round-trip in pg_dump (loop #94, slice 431)
+
+Closes the slice 430 deferral above: the FK-side sibling of `CHECK ...
+NOT ENFORCED`. Unlike the CHECK forms (which silently discarded the trailer
+before slice 430), `ALTER TABLE ADD CONSTRAINT ... FOREIGN KEY (...)
+REFERENCES ... NOT ENFORCED` was a **hard parse error** in goopg — the FK
+trailer loop (`internal/parser/ddl.go`, positioned after `ON DELETE`/`ON
+UPDATE`) only recognised `[NOT] DEFERRABLE` and `NOT VALID`, so any FK carrying
+`NOT ENFORCED` (or bare `ENFORCED`) failed to parse at all.
+
+### PG oracle behavior confirmed
+
+`postgres/src/backend/parser/gram.y`'s `ConstraintAttributeSpec` production
+(the `[NOT] DEFERRABLE [INITIALLY ...] | NOT VALID | [NOT] ENFORCED` trailer
+grammar) is genuinely shared between CHECK and FOREIGN KEY constraints — both
+route through the same `processCASbits` validator
+(`gram.y:19513-19543`), which accepts `is_enforced` for both `CONSTRAINT_CHECK`
+and `CONSTRAINT_FOREIGN` (confirmed via `tablecmds.c`'s `fkconstraint->is_enforced`
+call sites: `MergeCheckConstraint`, `ATAddForeignKeyConstraint`,
+`ATExecValidateConstraint`). Two behavioral facts drove this loop's scope
+beyond a pure parser fix:
+
+1. **`processCASbits` sets `*not_valid = true` when `CAS_NOT_ENFORCED` is set**
+   (`gram.y:19527`) — but this is a compiler-internal detail baked into the
+   Constraint node before `transformFKConstraint`/`ATAddForeignKeyConstraint`
+   even see it; it is not a *separately user-visible* AST flag. goopg's
+   existing CHECK precedent (slice 430) deliberately keeps its own parsed
+   `NotValid` field independent of `NotEnforced` and instead derives
+   `convalidated='f'` at the catalog-projection layer via `NotValid ||
+   NotEnforced` (see `TestParseCheckNotEnforced`'s
+   `AlterTableAddConstraint` case: `act.NotValid` stays `false` for a bare
+   `NOT ENFORCED`). This slice's FK parser mirrors that exact shape for
+   consistency (sibling-paths-must-agree) rather than literally copying
+   `processCASbits`' internal mutation.
+2. **`addFkRecurseReferencing`/`addFkRecurseReferenced` gate trigger creation
+   on `is_enforced`** (`tablecmds.c:11065`, `:10920`): a NOT ENFORCED FK gets
+   **zero** RI check/action triggers in real PG — not merely deferred
+   checking, but no checking machinery at all. Since goopg has no actual
+   trigger objects for FK enforcement (the checks are inlined into the
+   INSERT/UPDATE/DELETE operators), the equivalent fix is an early skip at the
+   two functions that stand in for those triggers.
+
+### Landed
+
+- **Parser** (`internal/parser/ddl.go`, ALTER TABLE ADD FOREIGN KEY trailer
+  loop): generalized to a single loop accepting `NOT VALID`, `NOT ENFORCED`,
+  bare `ENFORCED`, and `[NOT] DEFERRABLE` in any order (previously a
+  sequential DEFERRABLE→NOT VALID chain with no ENFORCED branch at all). New
+  `AlterTableAction.FKNotEnforced` (`internal/parser/ast.go`), independent of
+  `NotValid` per the design note above.
+- **Catalog** (`internal/catalog/catalog.go`): new `ForeignKey.NotEnforced`
+  field. The `pg_constraint` FK-row builder now projects `convalidated='f'`
+  when `fk.NotValid || fk.NotEnforced` (previously `fk.NotValid` alone) and
+  `conenforced='f'` when `fk.NotEnforced` (previously hardcoded `'t'`).
+- **`pg_get_constraintdef`** (`internal/executor/expr.go`,
+  `buildForeignKeyDefString`): mirrors `ruleutils.c`'s shared tail exactly —
+  checks `NotEnforced` first and appends ` NOT ENFORCED`, falling back to
+  ` NOT VALID` only when the FK IS enforced (same precedence already applied
+  to the CHECK branch in slice 430).
+- **DDL execution** (`internal/executor/operators_ddl.go`): the
+  `AlterTableAddForeignKey` handler threads `act.FKNotEnforced` into the new
+  `catalog.ForeignKey.NotEnforced` field.
+- **Runtime enforcement skip** (`internal/executor/operators_fk.go`): the
+  behavioral half, mirroring PG's "no trigger at all" semantics.
+  `checkFKInsertForConstraints` (the single choke point for both INSERT and
+  UPDATE-side "parent must exist" checks) now `continue`s immediately for a
+  `fk.NotEnforced` constraint, before even gathering column values or
+  consulting `fkCheckDeferred` — an unenforced FK is not merely deferred, it
+  is never checked. `enforceFKOnDelete`'s per-referencing-FK loop likewise
+  skips a `ref.FK.NotEnforced` entry entirely, so CASCADE/SET NULL/RESTRICT/NO
+  ACTION referential actions are all suppressed for an unenforced FK exactly
+  as they would be for a real PG FK with no action triggers installed.
+- **VALIDATE CONSTRAINT guard** (`internal/executor/operators_ddl.go`,
+  `AlterTableValidateConstraint`): mirrors `ATExecValidateConstraint`'s own
+  guard (`tablecmds.c:12955`, `if (!con->conenforced) ereport(ERROR, ...
+  "cannot validate NOT ENFORCED constraint")`, SQLSTATE
+  `ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE` = `55000`) — a NOT ENFORCED FK
+  now rejects `VALIDATE CONSTRAINT` with `55000` instead of silently flipping
+  `NotValid` to `false`.
+
+### Tests
+
+`TestParseFKNotEnforced` (`internal/parser/fk_not_enforced_test.go`) mirrors
+`TestParseCheckNotEnforced`'s case shape (plain NOT ENFORCED, NOT VALID + NOT
+ENFORCED composition, DEFERRABLE + NOT ENFORCED composition, plain NOT VALID,
+bare ENFORCED, no trailer). `TestFKNotEnforcedAlterTable`,
+`TestFKNotEnforcedPlainNotValidStillRendersNotValid`,
+`TestFKNotEnforcedSkipsRuntimeCheck` (both the NOT ENFORCED case and an
+enforced control case confirming the fixture would otherwise 23503), and
+`TestFKNotEnforcedValidateConstraintErrors` (new
+`internal/executor/operators_fk_not_enforced_test.go`) cover the
+catalog/`pg_constraint`/`pg_get_constraintdef` wiring, the runtime skip, and
+the VALIDATE CONSTRAINT guard. New `TestPort_PgDumpConnectionSetup` fixture
+`fknenf_child`/`fknenf_parent` (`ALTER TABLE ... ADD CONSTRAINT ... FOREIGN
+KEY ... NOT ENFORCED`) verified to render as a standalone post-data
+`ALTER TABLE ... ADD CONSTRAINT fknenf_fk FOREIGN KEY (pid) REFERENCES
+public.fknenf_parent(id) NOT ENFORCED;` statement.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS; `internal/testport` full suite PASS;
+`internal/wal`+`internal/initdb` suites PASS (no regression from the
+`catalog.ForeignKey` struct change); `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`CREATE TABLE`-time FK constraints (both the inline column-level `REFERENCES`
+form, `parseColumnDef` ~`internal/parser/ddl.go:4028`, and the table-level
+`FOREIGN KEY (...) REFERENCES ...` form, `parseTableForeignKey`) accept
+**neither** `NOT VALID` **nor** `NOT ENFORCED` at all — a pre-existing,
+narrower gap than the one this slice closed (the ALTER TABLE form was a hard
+parse error specifically for `ENFORCED`; the CREATE TABLE forms don't even
+attempt `NOT VALID`, which real PG's grammar also permits there, however
+redundant it is against an empty new table). Left out of this slice's scope
+(a third, differently-shaped parser change, not merely adding an ENFORCED
+branch to an already-present trailer loop); ledger row appended.
+
+## Follow-up: `CREATE TABLE`-time FK `NOT VALID`/`NOT ENFORCED` (loop #95, DU-002 slice 432)
+
+Implements the slice 431 deferral above in full: `NOT VALID` and `[NOT]
+ENFORCED` (PG18) now round-trip identically whether a FOREIGN KEY constraint
+is added via `ALTER TABLE` (slice 431) or written at `CREATE TABLE` time,
+via either the inline column `REFERENCES` clause or the table-level
+`FOREIGN KEY (...) REFERENCES ...` clause.
+
+### What changed
+
+- New shared helper `parser.parseFKConstraintAttrs`
+  (`internal/parser/ddl.go`, next to `parseConstraintDeferrable`) consumes
+  `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]`, `NOT VALID`, and `[NOT]
+  ENFORCED` in any order — the same order-independent loop slice 431 wrote
+  inline for `ALTER TABLE ADD FOREIGN KEY`, now factored out so all three FK
+  grammar sites share one implementation instead of three independently
+  drifting copies (the project's standing "sibling paths must change
+  together" rule). All three call sites — `parseColumnDef`'s `REFERENCES`
+  case, `parseTableForeignKey`, and the ALTER TABLE ADD FOREIGN KEY action
+  parser — now call this one helper.
+- `ColumnDef` gains `FKNotValid`/`FKNotEnforced` (`internal/parser/ast.go`);
+  `TableForeignKeyDef` gains `NotValid`/`NotEnforced`. Both mirror
+  `AlterTableAction`'s existing `NotValid`/`FKNotEnforced` fields.
+- `internal/executor/operators_ddl.go`'s CREATE TABLE handler threads both
+  new fields into `catalog.ForeignKey.NotValid`/`NotEnforced` at both FK
+  registration sites (inline-column loop and table-level-FK loop). No other
+  executor change was needed: `pg_constraint`'s `conenforced`/`convalidated`
+  row builder (`internal/catalog/catalog.go` ~line 7031/7058),
+  `buildForeignKeyDefString` (`internal/executor/expr.go`), the
+  `checkFKInsertForConstraints`/`enforceFKOnDelete` runtime skips, and the
+  `AlterTableValidateConstraint` `55000` guard (`internal/executor/operators_fk.go`,
+  `internal/executor/operators_ddl.go`) all already read
+  `catalog.ForeignKey.NotValid`/`NotEnforced` generically, independent of
+  which grammar form created the constraint — slice 431 built these to be
+  reused, and they were.
+- A refactor side-effect: the ALTER TABLE ADD FOREIGN KEY path previously had
+  no branch for a bare `INITIALLY DEFERRED`/`INITIALLY IMMEDIATE` without a
+  preceding `DEFERRABLE` keyword (unlike the two CREATE TABLE-time forms,
+  which already handled it) — routing it through the shared helper closes
+  that small pre-existing asymmetry for free. `AlterTableAction` has no
+  `InitiallyDeferred` field to populate, so the helper's corresponding return
+  value is discarded at that one call site (unchanged existing behavior).
+
+### Tests
+
+`TestParseFKNotEnforcedCreateTableTime` (`internal/parser/fk_not_enforced_test.go`)
+covers both new call sites: inline-column plain `NOT ENFORCED`, `NOT VALID
+NOT ENFORCED` composition, `DEFERRABLE NOT ENFORCED` composition, and the
+table-level form's plain `NOT ENFORCED`, `NOT VALID NOT ENFORCED`
+composition, and no-trailer control.
+`TestFKNotEnforcedCreateTableTime` (new
+`internal/executor/operators_fk_not_enforced_create_table_test.go`) covers
+the inline-column form end-to-end (catalog `NotEnforced`, `pg_constraint`
+`convalidated`/`conenforced`, `pg_get_constraintdef` rendering, and the
+runtime skip allowing a dangling FK reference) and the table-level form
+(catalog wiring + runtime skip), plus an enforced control confirming the
+fixture would otherwise raise `23503`.
+`TestPort_PgDumpConnectionSetup` gained two new fixtures alongside slice
+431's `fknenf_parent`/`fknenf_child` (ALTER TABLE-authored): `ctfknenf_parent`/
+`ctfknenf_child` (inline column `REFERENCES ... NOT ENFORCED`) and
+`cttlfknenf_parent`/`cttlfknenf_child` (table-level `FOREIGN KEY (...)
+REFERENCES ... NOT ENFORCED`), both asserted to dump as the standalone
+post-data `ALTER TABLE ... ADD CONSTRAINT <table>_pid_fkey FOREIGN KEY (pid)
+REFERENCES public.<parent>(id) NOT ENFORCED;` form — the same "separate,
+auto-named exactly like an ordinary same-shape FK" treatment slice 431
+established for the ALTER TABLE-authored form, now confirmed independent of
+which CREATE-time grammar produced the row.
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor` suites PASS (full runs, no regression);
+`TestPort_PgDumpConnectionSetup` PASS; `internal/testport` full suite PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+### Deferred
+
+None outstanding for FK `NOT VALID`/`NOT ENFORCED` grammar coverage — all
+three FK-constraint parse sites (`ALTER TABLE ADD FOREIGN KEY`, inline column
+`REFERENCES`, table-level `FOREIGN KEY`) now accept and round-trip the same
+trailer. The still-open, unrelated DU-002 thread is the next catalog-getter
+gap surfaced by `TestPort_PgDumpConnectionSetup`'s fallback log branch (see
+the top of this file's running "Resume" pointer).
+
+## Follow-up: `ALTER TABLE ... ALTER CONSTRAINT` (PG18) round-trip in pg_dump (DU-002 slice 433)
+
+Slices 430-432 gave FK/CHECK constraints a `NOT ENFORCED` flag *at the
+moment they are created* (inline, table-level, or `ADD CONSTRAINT`). Real
+PostgreSQL 18 also lets a constraint's enforceability (and, pre-existing
+since much older PG, its deferrability) be re-declared *after the fact* via
+`ALTER TABLE t ALTER CONSTRAINT name ConstraintAttributeSpec` — goopg's
+parser had no support for this form at all: it would either mis-parse
+`CONSTRAINT` as an `ALTER COLUMN` column name (both start with the bare
+`ALTER` keyword) or hard-fail. This slice adds it, restricted — matching
+real PG exactly — to FOREIGN KEY constraints only.
+
+### What changed
+
+- Live-verified against real PostgreSQL 18.3 first (throwaway `initdb`+
+  `pg_ctl` cluster, port 5599): `ALTER TABLE c ALTER CONSTRAINT fk NOT
+  ENFORCED` dumps byte-identically to a FK that was `NOT ENFORCED` from
+  creation (same standalone post-data `ADD CONSTRAINT ... NOT ENFORCED;`
+  statement); naming a CHECK constraint raises `42809`
+  ("cannot alter enforceability of constraint ... of relation ..."\); naming
+  a constraint that names a non-FK when only deferrability is requested
+  raises a different `42809` ("... is not a foreign key constraint");
+  naming an undefined constraint raises `42704`. Also confirmed real PG sets
+  `convalidated` equal to the new `conenforced` value on every enforceability
+  change (`AlterConstrUpdateConstraintEntry`, `tablecmds.c`) — including a
+  real phase-3 revalidation scan when flipping back to `ENFORCED` (a
+  dangling reference that was tolerated while `NOT ENFORCED` makes the
+  re-`ENFORCED` statement itself fail with `23503`).
+- New `parser.AlterTableAlterConstraint` action kind and
+  `AlterTableAction.AlterConstraint*` fields (`internal/parser/ast.go`):
+  `Deferrable`/`InitiallyDeferred`/`Enforced` plus a `Has*` flag per
+  attribute class, mirroring `ATAlterConstraint.alterDeferrability`/
+  `alterEnforceability` — `ALTER CONSTRAINT c NOT ENFORCED` alone must not
+  also reset deferrability, and vice versa.
+  `ConstraintName` (already on the struct) carries the target name.
+- New `parser.parseAlterConstraintAttrs` (`internal/parser/ddl.go`, next to
+  `parseFKConstraintAttrs`) parses `[NOT] DEFERRABLE [INITIALLY DEFERRED |
+  INITIALLY IMMEDIATE]` and `[NOT] ENFORCED` in either order/repetition.
+  Deliberately does **not** accept `NOT VALID` — that combination is not
+  part of this grammar production at all in real PG (`processCASbits`,
+  `gram.y` ~19513, `"constraints cannot be altered to be NOT VALID"`); an
+  unrecognized `NOT`-trailer is left unconsumed for the statement's normal
+  trailing-token check to reject, rather than silently accepted.
+- New dispatch branch in `parseAlterTableStmt`
+  (`internal/parser/ddl.go`), placed immediately **before** the pre-existing
+  generic `ALTER COLUMN` branch and gated on the next token being
+  `CONSTRAINT` (not `COLUMN`) — both forms start with the bare `ALTER`
+  keyword, so without this ordering the `ALTER COLUMN` branch would consume
+  `CONSTRAINT` as if it were a column identifier.
+- New `(*ddlOp) execAlterTableAlterConstraint`
+  (`internal/executor/operators_ddl.go`, alongside
+  `execAlterTableDropConstraint`): looks up the named constraint in
+  `tbl.ForeignKeys`; if found, applies only the attribute class(es) the
+  `Has*` flags mark as present — `Deferrable`/`InitiallyDeferred` for a
+  deferrability change, `NotEnforced = !Enforced` **and** `NotValid =
+  !Enforced` for an enforceability change (mirroring
+  `AlterConstrUpdateConstraintEntry`'s `convalidated = is_enforced`). If the
+  name instead matches a `NamedChecks` entry or a `PRIMARY KEY`/`UNIQUE`
+  index (new small helper `nonFKConstraintExists`), raises `42809` with the
+  same attribute-dependent message text real PG uses; an unmatched name
+  raises `42704`. New case `parser.AlterTableAlterConstraint` in the
+  `ALTER TABLE` action switch acquires an `AccessExclusiveLock`
+  (`AlterTableGetLockLevel` → `AT_AlterConstraint`, `tablecmds.c` ~4703) via
+  the existing `acquireDDLLockTxn` transaction-scoped helper.
+- **Known, deliberate simplification, not a new gap:** unlike real PG,
+  goopg's re-`ENFORCED` transition does **not** perform an actual phase-3
+  scan for dangling references — it only flips the flags. This exactly
+  mirrors the pre-existing `VALIDATE CONSTRAINT` executor case (slice 431),
+  which already does a flag-only flip with no row scan; giving `ALTER
+  CONSTRAINT ... ENFORCED` a real data check while `VALIDATE CONSTRAINT`
+  still doesn't have one would be a new, narrower inconsistency, not a
+  fix — both are captured together as the resume point below. Since
+  `pg_dump` only reads the resulting catalog flags (never re-derives them
+  from live data), this simplification does not affect dump fidelity.
+- No changes were needed to `pg_constraint`'s virtual-row builder,
+  `buildForeignKeyDefString`, or the FK-insert/on-delete runtime skips —
+  all three already read `catalog.ForeignKey.Deferrable`/
+  `InitiallyDeferred`/`NotEnforced`/`NotValid` generically (built that way
+  since slice 431), so a live `ALTER CONSTRAINT` mutation of those same
+  fields takes effect immediately for both dump output and subsequent DML,
+  with no extra wiring.
+
+### Tests
+
+`TestParseAlterTableAlterConstraint` (new
+`internal/parser/alter_constraint_test.go`) covers: plain `NOT ENFORCED`;
+bare `ENFORCED`; `DEFERRABLE INITIALLY DEFERRED`; `NOT DEFERRABLE ENFORCED`
+composed in one statement; and a control confirming an ordinary `ALTER
+COLUMN a TYPE bigint` still dispatches to `AlterTableAlterColumnType`
+unaffected by the new branch's placement ahead of it.
+`TestFKAlterConstraint` (new
+`internal/executor/operators_fk_alter_constraint_test.go`) covers: an
+already-enforced FK flipped `NOT ENFORCED` then back to `ENFORCED`
+end-to-end (catalog fields, `pg_constraint` `convalidated`/`conenforced`,
+`pg_get_constraintdef` rendering both directions, and the runtime skip
+toggling live for INSERTs in between) — with a `23503` control both before
+the flip and matching real PG's own dangling-reference behavior in spirit
+(goopg does not re-check on re-`ENFORCED`, documented above); a
+`DEFERRABLE INITIALLY DEFERRED`-only statement confirmed to leave
+enforceability untouched; a CHECK constraint name rejected with `42809`
+matching real PG's exact enforceability-specific message; and an undefined
+constraint name rejected with `42704`.
+New `TestPort_PgDumpConnectionSetup` fixture `acfknenf_parent`/
+`acfknenf_child`: an ordinarily-enforced FK added via plain `ADD CONSTRAINT`,
+then flipped with `ALTER CONSTRAINT acfknenf_fk NOT ENFORCED` — asserted to
+dump via the identical `ADD CONSTRAINT acfknenf_fk FOREIGN KEY (pid)
+REFERENCES public.acfknenf_parent(id) NOT ENFORCED;` form slice 431's
+directly-declared `fknenf_fk` fixture produces, confirming pg_dump cannot
+distinguish (and must not need to distinguish) how a constraint arrived at
+its unenforced state.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor` suites PASS (full runs, `-count=1`, no regression);
+`TestPort_PgDumpConnectionSetup` PASS (explicit `-run`, per this project's
+documented convention of never running the whole `internal/testport`
+package as a suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`ALTER CONSTRAINT ... ENFORCED`'s missing phase-3 dangling-reference scan
+(see above) is now shared by two call sites (`VALIDATE CONSTRAINT` and
+`ALTER CONSTRAINT ... ENFORCED`) instead of one — a genuine, if
+narrow, behavioral gap (schema/dump fidelity is unaffected; only the
+runtime accept/reject decision on the transition itself is optimistic).
+Resume point: give both a real row-scan pass, reusing whatever iteration
+`checkFKInsertForConstraints` already does per-row, the next time either is
+in scope. Unrelated to this slice's own thread, `ALTER TABLE ... DROP
+CONSTRAINT` (`execAlterTableDropConstraint`,
+`internal/executor/operators_ddl.go`) only searches `NamedChecks` and
+`PRIMARY KEY` indexes for the target name — dropping a FOREIGN KEY or
+`UNIQUE` constraint by name is not wired through this function at all.
+Live-confirmed (throwaway probe test, not merged): `CREATE TABLE p (id int
+PRIMARY KEY); CREATE TABLE c (id int, pid int); ALTER TABLE c ADD CONSTRAINT
+fk FOREIGN KEY (pid) REFERENCES p(id); ALTER TABLE c DROP CONSTRAINT fk;`
+incorrectly returns `42704: constraint "fk" of relation "c" does not exist`
+against a live goopg server, even though the constraint plainly exists —
+`catalog.InMemory` has no `DropForeignKeyConstraint`/`DropUniqueConstraint`
+counterpart to the existing `DropPrimaryKeyConstraint` at all. Not
+investigated further this loop (pre-existing, unrelated to `ALTER
+CONSTRAINT`'s own grammar); ledger-recorded as a fresh discovery. The
+still-open DU-002 002-010 catalog-view-parity resume point remains the
+builtin `pg_proc` exposure gap documented earlier in this file.
+
+## Follow-up: `ALTER TABLE ... DROP CONSTRAINT` for FOREIGN KEY / UNIQUE (DU-002 slice 433 follow-up)
+
+### Problem
+
+Slice 433's own deferral (above) live-confirmed that `execAlterTableDropConstraint`
+(`internal/executor/operators_ddl.go`) only ever searched `tbl.NamedChecks`
+(CHECK) and `Primary`-flagged indexes (PRIMARY KEY) for the target constraint
+name. A real, existing FOREIGN KEY or UNIQUE constraint fell straight through
+to the PRIMARY KEY branch's final `42704 constraint "..." of relation "..."
+does not exist` — a plain false negative, not a PG-parity design choice: real
+PG's `ATExecDropConstraint` (`tablecmds.c`) resolves the target purely by
+`pg_constraint` name, independent of `contype`.
+
+### Fix
+
+Added two search branches to `execAlterTableDropConstraint`, ordered CHECK →
+FOREIGN KEY → UNIQUE → PRIMARY KEY (the last two both index-backed, checked
+via `IndexesOnTable`, distinguished only by `idx.Primary`):
+
+- FOREIGN KEY: linear scan of `tbl.ForeignKeys` by name (case-insensitive,
+  matching every other constraint-name comparison in this function).
+- UNIQUE: same `IndexesOnTable` scan the PRIMARY KEY branch already used,
+  but requiring `!idx.Primary && idx.Unique && idx.IsConstraint` — a named
+  UNIQUE constraint is stored exactly like a PRIMARY KEY (an `Index` with
+  `IsConstraint` set), differing only in the `Primary` flag.
+
+Two new `catalog.InMemory` methods do the actual removal, mirroring the
+existing `DropPrimaryKeyConstraint`:
+
+- `DropUniqueConstraint` — identical mechanics to `DropPrimaryKeyConstraint`
+  (both just remove a named `Index` from the per-table and flat index
+  registries), so both now share a private `dropIndexByName` helper instead
+  of duplicating the removal loop.
+- `DropForeignKeyConstraint` — a foreign key isn't index-backed at all; it
+  lives only on `Table.ForeignKeys`, so this looks the table up by OID
+  (`tableByOID`, already used internally elsewhere under the same lock) and
+  splices the matching entry out of that slice directly.
+
+No `pg_constraint`/`pg_get_constraintdef`/FK-runtime-check change was needed:
+those all already read `tbl.ForeignKeys`/the index registries directly, so a
+dropped FK or UNIQUE constraint is invisible to them for free once removed
+from its source of truth — the bug was purely in
+`execAlterTableDropConstraint`'s search coverage, not in any downstream
+consumer.
+
+The functional-dependency `RESTRICT` view-dependency check
+(`ViewsDependingOnConstraint`) that gates the PRIMARY KEY branch was
+deliberately **not** extended to the new UNIQUE branch: `constraintViewDeps`
+is populated only by `CREATE VIEW`'s PK-specific GROUP BY functional-
+dependency tracking (M0097-0036's own doc comment: "records that a view
+relies on a **PK** constraint"), so it can never contain an entry keyed by a
+UNIQUE constraint's name today — adding the check there would be dead code,
+not a real behavioral gap.
+
+### Tests
+
+`TestDropConstraintForeignKeyAndUnique`
+(`internal/executor/operators_fk_unique_drop_constraint_test.go`), three
+subtests:
+
+- `ForeignKey` — adds an FK, drops it by name, asserts `tbl.ForeignKeys` is
+  empty, and (the behavioral proof, not just catalog bookkeeping) that a
+  previously-rejected dangling-reference `INSERT` now succeeds; re-dropping
+  the same name is confirmed to still raise `42704` rather than silently
+  succeeding a second time.
+- `Unique` — adds a named UNIQUE constraint, drops it by name, asserts the
+  backing index is gone from `LookupIndex`, that a duplicate value now
+  inserts without conflict, and that the table's unrelated PRIMARY KEY index
+  survives untouched (regression guard against an over-broad removal that
+  matched more than the named constraint).
+- `UndefinedConstraintStillRejected` — an unrelated table with no matching
+  constraint of any kind still gets `42704`, guarding against the new
+  branches accidentally swallowing the not-found case.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/catalog`+`internal/executor`
+suites PASS (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+pre-commit hook.
+
+### Deferred
+
+This closes deferred item (2) of slice 433's own row cleanly for CHECK,
+FOREIGN KEY, UNIQUE, and PRIMARY KEY. `EXCLUDE` (`idx.IsExclusion`)
+constraints were intentionally left out of this pass's scope (see the
+follow-up below, which closes that remaining gap). Deferred item (1) of
+slice 433's row (the missing phase-3 dangling-reference scan on `ALTER
+CONSTRAINT ... ENFORCED`) remains open, untouched by this loop.
+
+## Follow-up: `ALTER TABLE ... DROP CONSTRAINT` for EXCLUDE (DU-002 slice 433 follow-up, 2nd pass)
+
+### Problem
+
+The FK/UNIQUE follow-up above deliberately left `EXCLUDE` constraints
+(`idx.IsExclusion`) unreachable through `execAlterTableDropConstraint` — no
+live report had surfaced that specific gap yet. Live-probing it this loop
+confirmed the same class of bug: a real `EXCLUDE USING btree (...)`
+constraint, being index-backed with `idx.IsExclusion = true` but
+`idx.IsConstraint = false`/`idx.Unique = false` (it is not a UNIQUE index),
+matched none of the existing branches and fell through to the PRIMARY KEY
+branch's `42704 does not exist`, even though the constraint existed.
+
+### Fix
+
+Added a fourth search branch (CHECK → FOREIGN KEY → UNIQUE → **EXCLUDE** →
+PRIMARY KEY) to `execAlterTableDropConstraint`, scanning `IndexesOnTable` for
+`idx.IsExclusion && strings.EqualFold(idx.Name, act.ConstraintName)` — the
+same index-registry scan the UNIQUE branch uses, just keyed on the
+`IsExclusion` flag instead of `Unique && IsConstraint`. A new
+`catalog.InMemory.DropExclusionConstraint` method does the removal, sharing
+the same private `dropIndexByName` helper as `DropUniqueConstraint`/
+`DropPrimaryKeyConstraint` (all three are mechanically identical index
+removal; only the caller-side lookup differs per constraint kind).
+
+### Tests
+
+`TestDropConstraintForeignKeyAndUnique/Exclude`
+(`internal/executor/operators_fk_unique_drop_constraint_test.go`, extending
+the existing table-driven test): creates a table with a named
+`EXCLUDE USING btree (c1 WITH =)` constraint, confirms the exclusion check is
+live (a duplicate `c1` raises `23P01`, mirroring
+`TestExclusionConstraintBtreeEqualityFires`), drops it by name, confirms the
+backing index is gone from `LookupIndex`, confirms the same duplicate now
+inserts without conflict (the runtime check is actually gone, not just the
+catalog bookkeeping), and confirms re-dropping the same name still raises
+`42704` rather than silently succeeding again.
+
+### Gates
+
+`go build ./...` clean; `internal/catalog`+`internal/executor`+
+`internal/parser` suites PASS (full, no regression); `TestPort_PgDumpConnectionSetup`
+PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+pre-commit hook.
+
+### Deferred
+
+None new — this closes the EXCLUDE gap noted as deliberately-out-of-scope in
+the FK/UNIQUE follow-up above; `execAlterTableDropConstraint` now covers all
+five constraint kinds `pg_constraint`'s name lookup can return (CHECK,
+FOREIGN KEY, UNIQUE, EXCLUDE, PRIMARY KEY). Deferred item (1) of slice 433's
+original row (the missing phase-3 dangling-reference scan on `ALTER
+CONSTRAINT ... ENFORCED`) remains open, untouched by this loop.
+
+## Follow-up: real phase-3 dangling-reference scan for `VALIDATE CONSTRAINT` / `ALTER CONSTRAINT ... ENFORCED` (DU-002 slice 433, item (1))
+
+### Problem
+
+Slice 433's original row deferred item (1): both `VALIDATE CONSTRAINT` and
+`ALTER TABLE ... ALTER CONSTRAINT ... ENFORCED` only flipped the FK's
+`NotValid`/`NotEnforced` flags without re-checking existing rows against the
+referenced table — a data-integrity gap, since a row that became dangling
+while the constraint was `NOT VALID`/`NOT ENFORCED` would silently survive
+re-validation/re-enforcement. Live-verified against a scratch PostgreSQL 18.3
+instance (`postgres/local_install`) before implementing: both DDL forms
+**do** perform a real scan and reject on a dangling reference —
+
+```
+ALTER TABLE child ALTER CONSTRAINT child_pid_fkey ENFORCED;
+ERROR:  insert or update on table "child" violates foreign key constraint "child_pid_fkey"
+DETAIL:  Key (pid)=(999) is not present in table "parent".
+```
+
+Reading `tablecmds.c` confirmed the source of that scan for both entry
+points: `ATExecValidateConstraint` calls `QueueFKConstraintValidation` when
+`!con->convalidated`, and `ATExecAlterConstrEnforceability`'s "Create
+triggers" branch (taken only when `changed`, i.e. `conenforced` actually
+transitions) builds an equivalent inline `NewConstraint` phase-3 queue entry.
+Both ultimately run `validateForeignKeyConstraint`, which scans the
+referencing table under `RegisterSnapshot(GetLatestSnapshot())` and fires
+`RI_FKey_check_ins` per row as if it had just been inserted — the same
+per-row parent-exists check an ordinary `INSERT` runs, just applied
+retroactively to every existing row.
+
+### Fix
+
+New `(*ddlOp) validateFKConstraintExistingRows(fkOwnerTbl *catalog.Table, fk
+catalog.ForeignKey) error` (`internal/executor/operators_ddl.go`, next to
+`nonFKConstraintExists`) walks every heap page of `fkOwnerTbl` with the same
+simplified liveness check `collectBTreeEntries` already uses for `CREATE
+INDEX` bulk build (`Xmin` valid, `Xmax` invalid — no snapshot MVCC
+visibility, the established pattern for DDL-time existing-row scans in this
+codebase), decodes each live row, extracts the FK column values
+(`fkColValues`), and calls the existing `assertParentExists` helper per row —
+the exact same function an `INSERT` uses, so the error shape (`23503`,
+message, `DETAIL`) is byte-identical to a live `INSERT` violation.
+
+Both call sites now gate on this scan exactly like real PG gates the phase-3
+queue entry:
+
+- `VALIDATE CONSTRAINT` (`internal/executor/operators_ddl.go`,
+  `AlterTableValidateConstraint` case): scans only `if
+  tbl.ForeignKeys[i].NotValid` (mirrors `if (!con->convalidated)`); an
+  already-valid FK is a no-op, matching PG's `InvalidObjectAddress` return.
+- `execAlterTableAlterConstraint`: scans only when enforceability actually
+  transitions (`wasEnforced != act.AlterConstraintEnforced`, mirrors `if
+  (currcon->conenforced != cmdcon->is_enforced)`), and only on the NOT
+  ENFORCED → ENFORCED direction (mirrors PG only queuing phase-3 validation
+  in the "Create triggers" branch, not the "Drop triggers" branch). Both
+  transitions still touch `NotEnforced`/`NotValid`; the scan is only inserted
+  ahead of the ENFORCED direction. On violation, the flags are left
+  unchanged (the function returns before flipping them), so a rejected
+  re-ENFORCED leaves the constraint exactly as it was — matching PG's
+  transaction-abort semantics (the whole `ALTER TABLE` statement fails, no
+  partial catalog update persists).
+
+No change was needed to `pg_constraint`/`pg_get_constraintdef` — both already
+read the mutated `NotValid`/`NotEnforced` fields generically.
+
+### Tests
+
+`internal/executor/operators_fk_alter_constraint_test.go`:
+
+- `TestFKAlterConstraint/NotEnforcedThenEnforced` updated: the pre-existing
+  flow left a dangling row `(2, 999)` inserted during the NOT ENFORCED
+  window, then flipped back to ENFORCED expecting success — that expectation
+  was itself wrong relative to real PG (confirmed live above), so the test
+  now asserts the re-ENFORCED attempt is rejected with `23503` while the
+  dangling row remains, then clears the row and asserts the same ALTER
+  succeeds.
+- New `TestValidateConstraintRealPhase3Scan`, three subtests:
+  `ValidateConstraintRejectsDanglingRow` (NOT VALID FK with a pre-existing
+  dangling row → `VALIDATE CONSTRAINT` rejects with `23503`/`DETAIL`
+  mentioning the dangling key, `NotValid` stays `true`; fixing the data and
+  re-running succeeds), `ValidateConstraintAlreadyValidIsNoOp` (a
+  fully-enforced FK's redundant `VALIDATE CONSTRAINT` no-ops), and
+  `AlterConstraintEnforcedNoOpWhenAlreadyEnforced` (re-asserting `ENFORCED`
+  on an already-enforced FK is a no-op, pinning down the `changed` gate).
+
+### Gates
+
+`go build ./...`/`go vet ./internal/executor/...` clean; `internal/executor`
+suite PASS (full, `-count=1`, no regression); `TestPort_PgDumpConnectionSetup`
+PASS (explicit `-run`); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke =
+pre-commit hook; live scratch PostgreSQL 18.3 instance used to confirm the
+target behavior before implementing (see the `ERROR`/`DETAIL` transcript
+above).
+
+### Deferred
+
+None new — this closes item (1), the last open item from slice 433's
+original deferral row. The FK/CHECK/EXCLUDE/UNIQUE/PRIMARY KEY constraint
+DDL surface opened across slices 430–433 has no further known deferrals in
+this ledger thread.
+
+## Follow-up: `COMMENT ON ACCESS METHOD` round-trip in pg_dump (DU-002 slice 434)
+
+### Problem
+
+With the constraint-DDL thread (slices 430–433) closed, this loop swept a
+fresh candidate area: `COMMENT ON <object>` coverage. goopg already handles
+`COMMENT ON` for ~20 object kinds (TABLE/COLUMN/CONSTRAINT/TRIGGER/POLICY/
+RULE/STATISTICS/VIEW/SEQUENCE/SCHEMA/MATERIALIZED VIEW/TYPE/DOMAIN/
+COLLATION/SERVER/FOREIGN DATA WRAPPER/EXTENSION/CAST/FUNCTION/INDEX), but
+`parseCommentOnTail` (`internal/parser/parser.go`) had no `"access method"`
+branch — `CREATE ACCESS METHOD` itself round-tripped through pg_dump since
+slice 426, but a `COMMENT ON ACCESS METHOD` fell into the switch's
+unsupported-type default (`return nil, false, nil`) and was silently
+discarded by the caller.
+
+Confirmed as a real divergence by live-verifying side-by-side against a
+scratch PostgreSQL 18.3 instance (`postgres/local_install`) before
+implementing: `CREATE ACCESS METHOD my_am TYPE INDEX HANDLER bthandler;` +
+`COMMENT ON ACCESS METHOD my_am IS 'a test access method';`, then
+`pg_dump --schema-only`. Real PG emits the standard trailing comment block
+(`dumpAccessMethod`, `pg_dump.c`):
+
+```
+--
+-- Name: ACCESS METHOD my_am; Type: COMMENT; Schema: -; Owner:
+--
+
+COMMENT ON ACCESS METHOD my_am IS 'a test access method';
+```
+
+goopg's pg_dump (pre-fix) executed `COMMENT ON ACCESS METHOD` as a silent
+no-op and never emitted this block — the comment vanished from the dump
+entirely.
+
+### Fix
+
+Three-site change mirroring the existing `COMMENT ON SERVER` /
+`COMMENT ON FOREIGN DATA WRAPPER` sibling pattern exactly (both are
+top-level, schema-less objects, same as an access method):
+
+1. **Parser** (`internal/parser/parser.go`, `parseCommentOnTail`): new
+   `case p.acceptIdentKeyword("access")` branch — requires a following
+   `METHOD` ident-keyword (mirrors `CREATE ACCESS METHOD`'s own
+   `parseCreateAccessMethodTail` dispatch in `internal/parser/ddl.go`),
+   then parses a bare (schema-less) object name into `ObjKind = "access
+   method"`.
+2. **Catalog** (`internal/catalog/catalog.go`): new
+   `(*InMemory) UserAccessMethodOID(name string) uint32` — looks up a
+   user-registered AM (`c.accessMethods`) by name and returns its OID, or 0
+   if unregistered (covers both "no such AM" and "name is one of the 7
+   built-ins", which are not tracked in this map). Mirrors
+   `ForeignServerOID`/`ForeignDataWrapperOID`/`ExtensionOID` exactly.
+3. **Executor** (`internal/executor/operators_ddl.go`, `execCommentOn`):
+   new `case "access method"` — resolves the OID via `UserAccessMethodOID`
+   and calls `im.SetComment(oidPgAm /* 2601 */, oid, 0, s.Description)`.
+   `pg_am`'s OID (2601) is already used elsewhere in this file/package (the
+   `pg_am` virtual-view registration in `catalog.go`); a COMMENT on one of
+   the 7 built-in AMs resolves to OID 0 and is a harmless no-op (consistent
+   with `CREATE ACCESS METHOD`'s own built-in-name collision guard, and with
+   real PG never dumping a built-in's comment either since it never dumps
+   the built-in AM itself).
+
+No pg_dump-side change was needed: `collectComments`'s single
+`SELECT description, classoid, objoid, objsubid FROM pg_catalog.pg_description`
+query (run server-side against goopg) already picks up any row regardless
+of object kind — `dumpAccessMethod`'s own `dumpComment(fout, "ACCESS
+METHOD", ...)` call was already dormant code waiting for a matching
+`pg_description` row to exist.
+
+### Tests
+
+- `internal/parser/comment_on_test.go`:
+  `TestParseCommentOnAccessMethod` (parses `ObjKind`/`ObjName` for two
+  cases, asserts schema-less) and
+  `TestParseCommentOnAccessMethodMissingMethodKeyword` (bare `ACCESS`
+  without `METHOD` is a parse error).
+- `internal/executor/operators_ddl_access_method_test.go`:
+  `TestCommentOnAccessMethodStoresDescription` (end-to-end
+  `CREATE ACCESS METHOD` + `COMMENT ON ACCESS METHOD`, asserts
+  `im.GetComment(2601, am.OID, 0)`) and
+  `TestCommentOnUnknownAccessMethodIsNoop` (pins the existing, deliberately
+  unchanged no-op-on-unknown-name behavior — see Deferred below).
+- `internal/testport/pgdump_connsetup_test.go`: extended the slice-426
+  fixture with `COMMENT ON ACCESS METHOD goopg_am IS '...'` and a new
+  byte-exact assertion for the `COMMENT ON ACCESS METHOD goopg_am IS
+  '...';` line in `pg_dump`'s output (`TestPort_PgDumpConnectionSetup`).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser` + `internal/catalog`
++ `internal/executor` suites PASS (full, `-count=1`, no regressions);
+`TestPort_PgDumpConnectionSetup` PASS (explicit `-run`); live scratch
+PostgreSQL 18.3 instance used to confirm the target rendering before
+implementing (transcript above); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); pgbench smoke = pre-commit hook.
+
+### Deferred
+
+`COMMENT ON` a **nonexistent** object name is a silent no-op in goopg across
+every object kind this function handles (server/FDW/extension/collation/
+cast/… and now access method) — real PostgreSQL raises a `does not exist`
+error (verified live: `COMMENT ON SERVER nonexistent_srv IS 'x'` → `ERROR:
+server "nonexistent_srv" does not exist` on PG 18.3; `COMMENT ON ACCESS
+METHOD nonexistent_am IS 'x'` → `ERROR:  access method "nonexistent_am"
+does not exist`). This is a pre-existing, uniform simplification across
+`execCommentOn`'s entire `switch s.ObjKind` — not something newly introduced
+by this slice — so fixing it only for `"access method"` would be
+inconsistent with every sibling case. Resume point: `execCommentOn`
+(`internal/executor/operators_ddl.go`) would need every `case` in the
+switch to synthesize PG's per-object-kind `42704 undefined_object` error
+message (e.g. `%s "%s" does not exist` with the PG-specific object-kind
+noun) on an unresolved OID, instead of the current uniform `return nil`.
+Scoped out of this slice deliberately (a ~20-case systemic change, not a
+narrow one); left as a discovery for a future dedicated slice.
+
+## Follow-up: `COMMENT ON FOREIGN TABLE` round-trip in pg_dump (DU-002 slice 435)
+
+### Problem
+
+A research sweep for the next slice after 434 probed the full `comment_type`
+grammar production in real PostgreSQL's `gram.y` against goopg's
+`parseCommentOnTail` (`internal/parser/parser.go`) and found `COMMENT ON
+FOREIGN TABLE <name>` was not merely dropped (like the pre-434 access-method
+gap) but a **hard parse error**: the `case p.acceptKeyword(KwForeign):` arm
+unconditionally required `DATA WRAPPER` after `FOREIGN` (the `COMMENT ON
+FOREIGN DATA WRAPPER` shape), so `COMMENT ON FOREIGN TABLE ft1 IS '...'`
+failed with `syntax error ... expected DATA WRAPPER after FOREIGN in COMMENT
+ON (got table)`.
+
+Confirmed live against a scratch PostgreSQL 18.3 instance
+(`postgres/local_install`):
+
+```sql
+CREATE FOREIGN DATA WRAPPER dummy_fdw;
+CREATE SERVER dummy_srv FOREIGN DATA WRAPPER dummy_fdw;
+CREATE FOREIGN TABLE ft1 (a int, b text) SERVER dummy_srv;
+COMMENT ON FOREIGN TABLE ft1 IS 'a foreign table comment';
+```
+
+All four statements succeed on real PG, and `pg_dump --schema-only` re-emits
+(`dumpTableSchema`, `pg_dump.c`, the same code path that dumps a comment on
+an ordinary table):
+
+```
+COMMENT ON FOREIGN TABLE public.ft1 IS 'a foreign table comment';
+```
+
+goopg could not even parse the `COMMENT ON FOREIGN TABLE` statement, so the
+comment could never reach `pg_description` in the first place — a strictly
+worse failure mode than the silent-drop bugs earlier `COMMENT ON` slices
+fixed (this one aborts the whole statement/transaction with a syntax error
+instead of quietly discarding one clause).
+
+### Fix
+
+Foreign tables (`relkind='f'`, `CREATE FOREIGN TABLE`, DU-002 slice 417/418)
+are pg_class relations sharing goopg's ordinary table registry — same as
+views/sequences/materialized views — so this needed only two of the usual
+three sites (no new catalog resolver: `LookupTable` already resolves foreign
+tables by name).
+
+1. **Parser** (`internal/parser/parser.go`, `parseCommentOnTail`): the
+   `case p.acceptKeyword(KwForeign):` arm now branches on what follows
+   `FOREIGN` — `p.acceptKeyword(KwTable)` first (parses a schema-qualifiable
+   object name into `ObjKind = "foreign table"`), falling back to the
+   pre-existing `DATA WRAPPER` check only when `TABLE` didn't match. **Care
+   taken to avoid a short-circuit bug**: an early draft used
+   `case p.acceptKeyword(KwForeign) && p.acceptKeyword(KwTable):` as the case
+   condition, which consumes the `FOREIGN` token as a side effect of the
+   first `acceptKeyword` call even when the second one (`KwTable`) fails to
+   match (e.g. on `FOREIGN DATA WRAPPER`) — the next `case
+   p.acceptKeyword(KwForeign):` arm would then silently fail to re-match
+   `FOREIGN` (already consumed) and fall through to the unsupported-type
+   default, regressing `COMMENT ON FOREIGN DATA WRAPPER` into a silent
+   no-op. Fixed by consuming `FOREIGN` exactly once in a single `case` body
+   and branching with a nested `if` inside it instead.
+2. **Executor** (`internal/executor/operators_ddl.go`, `execCommentOn`):
+   added `"foreign table"` to the existing
+   `case "table", "view", "sequence", "materialized view":` arm — no new
+   logic, since `im.LookupTable(s.ObjName)` + `oidPgClass` (1259) already
+   resolves a foreign table the same way it resolves an ordinary table.
+
+No pg_dump-side change was needed (same reasoning as slice 434):
+`collectComments`'s single `pg_description` query is object-kind-agnostic,
+and `dumpTableSchema`'s trailing comment block is keyword-agnostic across
+every `relkind` it handles.
+
+### Tests
+
+- `internal/parser/comment_on_test.go`: `TestParseCommentOnForeignTable`
+  (bare and schema-qualified names, asserts `ObjKind = "foreign table"`);
+  re-ran `TestParseCommentOnForeignDataWrapper` unchanged to confirm the
+  sibling case wasn't regressed by the branch restructuring.
+- `internal/executor/operators_ddl_comment_foreign_table_test.go`:
+  `TestCommentOnForeignTableStoresDescription` (end-to-end `CREATE SERVER`
+  + `CREATE FOREIGN TABLE` + `COMMENT ON FOREIGN TABLE`, asserts
+  `im.GetComment(1259, tbl.OID, 0)`).
+- `internal/testport/pgdump_connsetup_test.go`: extended the slice-417/418
+  `goopg_ftable` fixture with `COMMENT ON FOREIGN TABLE public.goopg_ftable
+  IS '...'` and a new byte-exact assertion for the `COMMENT ON FOREIGN
+  TABLE public.goopg_ftable IS '...';` line in `pg_dump`'s output
+  (`TestPort_PgDumpConnectionSetup`).
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/parser` +
+`internal/catalog` + `internal/executor` suites PASS (full, `-count=1`, no
+regressions); `TestPort_PgDumpConnectionSetup` PASS (explicit `-run`); live
+scratch PostgreSQL 18.3 instance used to confirm the target rendering before
+implementing (transcript above); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); pgbench smoke = pre-commit hook.
+
+### Deferred
+
+None new. This slice fixes a hard parse error, not a partial/simplified
+implementation — no PG behavior was knowingly left unmirrored. The
+pre-existing "COMMENT ON nonexistent object is a silent no-op" gap (recorded
+against slice 434) now also applies to `"foreign table"` as one more sibling
+case, but that is the same already-recorded systemic deferral, not a new
+one.
+
+## Follow-up: `COMMENT ON <object>` raises PostgreSQL's own `does not exist` error instead of a silent no-op (DU-002 slice 436)
+
+### Problem
+
+Every prior `COMMENT ON` slice (386–388, 390, 396, 434, 435) recorded the same
+standing discovery and deliberately deferred it as a systemic, out-of-scope
+change: `execCommentOn` (`internal/executor/operators_ddl.go`) resolves the
+target object by name for each of its ~19 `ObjKind` cases, and on a failed
+lookup every single case `return`ed `nil` — a silent no-op. Real PostgreSQL
+raises a specific `does not exist` error for every one of these object kinds
+(verified against `postgres/src/backend/catalog/objectaddress.c`'s
+`get_object_address` family and the per-object-kind lookup helpers it calls —
+`RangeVarGetRelidExtended`, `get_relation_constraint_oid`, `get_trigger_oid`,
+`get_relation_policy_oid`, `get_rewrite_oid`, `get_collation_oid`,
+`get_cast_oid`, `get_statistics_object_oid`, `LookupFuncWithArgs`, etc.), e.g.
+`COMMENT ON SERVER nonexistent_srv IS 'x'` → `ERROR: server "nonexistent_srv"
+does not exist` (live-verified against PG 18.3 in the slice 434 row). Since
+every case shares the exact same lookup-then-`SetComment` shape, this loop
+closes the whole deferral in one pass rather than one object kind at a time.
+
+### PostgreSQL oracle (message + SQLSTATE per object kind)
+
+Traced each `ObjKind`'s real lookup path in `./postgres/src/backend`:
+
+| object kind(s) | lookup path | SQLSTATE | message |
+|---|---|---|---|
+| table/view/sequence/materialized view/foreign table/index | `get_relation_by_qualified_name` → `RangeVarGetRelidExtended` (`namespace.c`) | `42P01` (`ERRCODE_UNDEFINED_TABLE`) | `relation "%s" does not exist` — **identical regardless of requested relation kind**, since the not-found branch is reached before any relkind check |
+| column | `get_object_address_attribute` (`objectaddress.c:1528`) | `42703` | `column "%s" of relation "%s" does not exist` |
+| schema | `LookupExplicitNamespace`/similar (`namespace.c:3547`) | `3F000` | `schema "%s" does not exist` |
+| type, domain | `get_object_address_type` → `LookupTypeName` (`objectaddress.c:1623`) | `42704` | `type "%s" does not exist` |
+| constraint (COMMENT ON CONSTRAINT ... ON table) | `get_relation_constraint_oid` (`pg_constraint.c:1234`) | `42704` | `constraint "%s" for table "%s" does not exist` |
+| trigger | `get_trigger_oid` (`trigger.c:1403`) | `42704` | `trigger "%s" for table "%s" does not exist` |
+| policy | `get_relation_policy_oid` (`policy.c:1204`) | `42704` | `policy "%s" for table "%s" does not exist` |
+| rule | `get_rewrite_oid` (`rewriteSupport.c:108`) | `42704` | `rule "%s" for relation "%s" does not exist` |
+| statistics | `get_statistics_object_oid` (`namespace.c:2619`) | `42704` | `statistics object "%s" does not exist` |
+| function | `LookupFuncWithArgs` (`parse_func.c`) | `42883` (`ERRCODE_UNDEFINED_FUNCTION`) | `function %s does not exist` (with the `(argtypes)` signature) |
+| access method | `get_am_oid` (`amcmds.c:154`) | `42704` | `access method "%s" does not exist` |
+| server | `GetForeignServerByName` (`foreign.c:714`) | `42704` | `server "%s" does not exist` |
+| foreign data wrapper | `GetForeignDataWrapperByName` (`foreign.c:692`) | `42704` | `foreign-data wrapper "%s" does not exist` |
+| extension | `get_extension_oid` (`extension.c:198`) | `42704` | `extension "%s" does not exist` |
+| collation | `get_collation_oid` (`namespace.c:4019`) | `42704` | `collation "%s" for encoding "%s" does not exist` (goopg is always UTF8, matching the pre-existing `resolveRangeCollation` precedent, `internal/catalog/catalog.go`) |
+| cast | `get_cast_oid` (`lsyscache.c:1109`) | `42704` | `cast from type %s to type %s does not exist` |
+
+### Fix
+
+`execCommentOn` gained a shared `undefinedRelation()` closure (42P01, used by
+the six relation-kind cases) and a per-case `ExecError{Code, Message}` return
+in place of every `return nil` on a failed lookup, using the exact wording
+above. Two cases needed a two-stage check (relation exists but the named
+sub-object on it does not): `column` (42703 `column ... of relation ...`) and
+`constraint`/`trigger`/`policy`/`rule` (each object kind's own `for table`/
+`for relation` message), matching real PG's own two-stage `RangeVarGetRelid`→
+`get_*_oid` lookup shape exactly. `cast`'s error re-used the existing
+`dropCompatCanonicalType` type-name canonicalizer (already shared with `DROP
+CAST`'s equivalent error at `internal/executor/operators_ddl.go`); `function`'s
+error gained a small local `commentOnFuncSig` helper mirroring the
+`buildFuncSigError` closure `DROP FUNCTION` already has, rendering
+`name(type1, type2)` from `CommentOnStmt.Args`.
+
+The pre-existing `TestCommentOnUnknownAccessMethodIsNoop` (slice 434) was
+explicitly written to be superseded by this fix — its own doc comment said so
+— and is replaced by `TestCommentOnUnknownAccessMethodErrors`, asserting the
+42704 error. Two new test files exercise every case: `TestCommentOnUndefinedObjectErrors`
+(table-driven, one subtest per bare-name object kind) and
+`TestCommentOnUndefinedRelationSubObjectErrors` (both the "table itself
+missing" 42P01 path and the "table exists, sub-object missing" path for
+column/constraint/trigger/policy/rule), both in
+`internal/executor/operators_ddl_comment_on_undefined_test.go`.
+
+### Scope note: what this does NOT change
+
+Only the "object not found" branch of each case changed. The happy-path
+lookup/`SetComment` logic, OID/classoid assignments, and every other existing
+behavior (built-in access methods/collations still resolving to OID 0 and
+therefore now raising `does not exist` rather than silently no-op'ing —
+matching real PG, since PG never lets you `COMMENT ON` an object it can't
+name-resolve either) are unchanged.
+
+### Gates
+
+`go build ./...`/`go vet ./...` clean; `internal/executor`+`internal/parser`+
+`internal/catalog` suites PASS (full, no regressions); `TestPort_PgDumpConnectionSetup`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke =
+pre-commit hook.
+
+### Deferred
+
+None new — this closes the standing systemic deferral recorded since slice
+386 rather than opening a fresh one. One pre-existing, unrelated-to-this-fix
+limitation remains visible in the `function` case: `commentOnFuncSig` (like
+its `DROP FUNCTION` sibling) renders the function name unqualified even when
+`COMMENT ON FUNCTION schema.name(...)` was schema-qualified, whereas real PG's
+`func_signature_string` includes the schema when given — a pre-existing
+simplification shared with `DROP FUNCTION`, resolved below (slice 437).
+
+## Follow-up: schema-qualify `DROP FUNCTION` / `COMMENT ON FUNCTION` "does not exist" messages (DU-002 slice 437)
+
+### Problem
+
+The slice 436 row above flagged a pre-existing, DROP-FUNCTION-shared
+simplification: `commentOnFuncSig` and `DROP FUNCTION`'s `buildFuncSigError`/
+`buildFuncSigNotice` closures (`internal/executor/operators_ddl.go`) both
+rendered the target function's bare `s.ObjName.Name`/`s.Name.Name` in their
+"does not exist" message, silently dropping an explicit schema qualifier even
+when the statement was schema-qualified — e.g. `DROP FUNCTION
+public.nope(int)` reported `function nope(integer) does not exist` instead of
+`function public.nope(integer) does not exist`. Real PostgreSQL's
+`func_signature_string` (`postgres/src/backend/utils/adt/regproc.c`) builds
+its message from `NameListToString(funcname)`, which renders every qualifier
+present in the parsed name list — so a schema-qualified DROP/COMMENT target
+must keep its schema in the error text.
+
+### Fix
+
+Both call sites already had a schema-aware renderer available on
+`parser.ObjectName`: `String()` returns `Schema + "." + Name` when `Schema !=
+""`, or the bare `Name` otherwise (`internal/parser/ast.go`). Swapped every
+`s.Name.Name`/`s.ObjName.Name` reference inside `execDropFunction`'s
+`buildFuncSigNotice`/`buildFuncSigError`/no-arg-list branches and
+`commentOnFuncSig` to `s.Name.String()`/`s.ObjName.String()` — no new type or
+helper needed, since the schema-qualified rendering was already the exact
+`ObjectName.String()` contract used everywhere else in the codebase (e.g.
+`DROP FUNCTION`'s own no-arg-list "could not find a function named %q"
+branch, which already used the bare field and is now consistent with the
+rest of the message).
+
+### Tests
+
+`TestExecDropFunctionMissingSchemaQualifiedErrorMessage`
+(`internal/executor/operators_function_test.go`) — both the with-arg-list
+(`DROP FUNCTION public.nope(int)` → `function public.nope(integer) does not
+exist`) and no-arg-list (`DROP FUNCTION public.nope` → `could not find a
+function named "public.nope"`) forms.
+`TestCommentOnUndefinedFunctionSchemaQualifiedErrorMessage`
+(`internal/executor/operators_ddl_comment_on_undefined_test.go`) — `COMMENT
+ON FUNCTION public.nosuchfunc(integer) IS 'x'` → `function
+public.nosuchfunc(integer) does not exist`.
+
+### Gates
+
+`go build ./...` clean; `internal/executor`+`internal/parser`+
+`internal/catalog` suites PASS (full, no regressions); `TestPort_PgDumpConnectionSetup`
+PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook.
+
+### Deferred
+
+None — this closes the slice 436 deferral in full; no new discovery this
+loop. This was a pure message-formatting fix (no catalog/WAL/wire-format
+change), so no sibling-path audit beyond the two call sites was needed.
+
+## Follow-up: `SECURITY LABEL` always raises PostgreSQL's own "provider not loaded" error instead of a silent no-op (DU-002 slice 438)
+
+### Problem
+
+`TestPort_PgDumpConnectionSetup` (the DU-002 discovery guard) currently
+passes cleanly against every fixture accumulated through slice 437 — no
+predicted next blocker was recorded, so this loop probed for an untested SQL
+surface directly (a throwaway `zz_probe_test.go`, deleted before commit) with
+several candidates: `ALTER DEFAULT PRIVILEGES` (unimplemented, Effort-L —
+left for a dedicated loop, ledger row below), `CREATE TABLESPACE ... LOCATION`
+(already correctly rejected — goopg has no external-tablespace support and
+says so), `lo_create()` (unimplemented, Effort-L — no large-object subsystem
+at all, ledger row below), and `SECURITY LABEL ... ON TABLE ... IS '...'`.
+
+The last one silently **succeeded** — `parser.go`'s `case "security":` arm
+(added under M0097-0016 as a blanket compatibility stub alongside GRANT/
+REVOKE/COMMENT ON) consumed the entire statement into a bare
+`CompatNoopStmt{Tag: "SECURITY LABEL"}` with no execution-side handling at
+all, so the executor's `execCompatNoop` fell through every `if` guard and
+returned `nil`. Live-verified against a scratch PostgreSQL 18.3 instance
+(`postgres/local_install`) before implementing:
+
+```
+postgres=# SECURITY LABEL FOR selinux ON TABLE foo IS 'system_u:object_r:sepgsql_table_t:s0';
+ERROR:  22023: security label provider "selinux" is not loaded
+LOCATION:  ExecSecLabelStmt, seclabel.c:151
+postgres=# SECURITY LABEL ON TABLE foo IS 'x';
+ERROR:  22023: no security label providers have been loaded
+LOCATION:  ExecSecLabelStmt, seclabel.c:129
+```
+
+Reading `postgres/src/backend/commands/seclabel.c`'s `ExecSecLabelStmt`
+confirms *why* this is a correctness gap rather than a legitimate no-op, and
+why it is unconditional: PostgreSQL only has label providers when a loadable
+module (`sepgsql`, etc.) registers one via `register_label_provider()` at
+`_PG_init()` time (normally through `shared_preload_libraries`). It checks
+`label_provider_list` **before ever resolving the target object** —
+`get_object_address()` is called only after the provider check succeeds.
+goopg has no C-extension-loading mechanism at all, so `label_provider_list`
+is permanently and unconditionally empty; every `SECURITY LABEL` statement a
+real, unmodified PostgreSQL cluster would ever accept from goopg must
+therefore raise one of exactly the two errors above — there is no
+provider-loaded case to reach. This is the direct sibling of the slice 436
+COMMENT ON fix (a silent-no-op class of divergence for an object-annotation
+DDL statement).
+
+### Fix
+
+`internal/parser/parser.go`'s `case "security":` arm now captures the
+optional `FOR provider` clause (a bare identifier via the existing
+`parseIdent()` unreserved-keyword-aware helper, or a string literal per
+`gram.y`'s `NonReservedWord_or_Sconst`) into a new
+`CompatNoopStmt.SecurityLabelProvider string` field (`internal/parser/ast.go`)
+before consuming the rest of the statement exactly as before (the object
+clause is still parsed-and-discarded — real PG never reaches it either, so
+there is nothing to make goopg resolve).
+
+`internal/executor/operators_ddl.go`'s `execCompatNoop` gained an
+unconditional guard at the top, ahead of every existing `if s.XxxACL`
+branch: when `s.Tag == "SECURITY LABEL"`, return an `*ExecError` with
+`Code: "22023"` (`ERRCODE_INVALID_PARAMETER_VALUE`) and PG's exact wording —
+`security label provider "<name>" is not loaded` when
+`SecurityLabelProvider != ""`, else `no security label providers have been
+loaded`. No catalog/WAL/wire-format touch: this statement never wrote
+anything (there is no `pg_seclabel`/`pg_shseclabel` heap in goopg — the
+`pg_seclabels` virtual view stays permanently empty by construction, slice
+31), so there is nothing to unwind.
+
+### Tests
+
+`TestSecurityLabelAlwaysErrors`
+(`internal/executor/operators_security_label_test.go`) — table-driven across
+the bare form, an explicit `FOR provider` clause, a `COLUMN` target, and a
+nonexistent target table (confirming the provider check really does fire
+before any object-existence check, matching real PG's call order).
+`TestExtendedProtocolCompatNoopGrantRevokeSecurityLabelUnreachable`
+(`internal/server/dispatch_extended_ddl_test.go`, pre-existing) already
+pinned that `parser.Parse` never fails for a `SECURITY LABEL` statement —
+unaffected, since this fix only changes what the *executor* does with the
+parsed statement, not parseability.
+
+### Gates
+
+`go build ./...` clean; `go vet ./...` clean; `internal/parser`+
+`internal/executor`+`internal/server` suites PASS (full, no regressions);
+`TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS;
+pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+Two candidates probed alongside this one and found genuinely unimplemented,
+each Effort-L and out of scope for this loop: (1) `ALTER DEFAULT PRIVILEGES`
+— no parser support at all (`pg_default_acl` stays a permanently-empty
+virtual view, slice 20); a real implementation needs new catalog storage
+(a `DefaultACL` list keyed by role/schema/objtype) plus wiring every `CREATE
+TABLE`/`CREATE SEQUENCE`/`CREATE FUNCTION`/... path to consult it when
+assigning a new object's initial ACL. (2) large objects (`lo_create`/
+`lo_open`/`lo_import`/...) — entirely unimplemented; `pg_largeobject_metadata`
+stays empty by construction (slice 29). Both are new discoveries from this
+loop's probe, not previously recorded.
+
+## Follow-up: `ALTER SEQUENCE ... RENAME TO / OWNER TO / SET SCHEMA` were unparseable (DU-002 slice 439)
+
+### Problem
+
+`TestPort_PgDumpConnectionSetup` again came up fully green against every
+fixture through slice 438 with no predicted next blocker, so this loop
+delegated a live-probing pass (goopg vs. a scratch real PostgreSQL 18.3
+instance under `postgres/local_install`) to find the next untested SQL
+surface. It found:
+
+```sql
+CREATE SEQUENCE seqx;
+ALTER SEQUENCE seqx RENAME TO seqy;    -- goopg: syntax error (got "rename")
+ALTER SEQUENCE seqx OWNER TO postgres; -- goopg: syntax error (got "owner")
+ALTER SEQUENCE seqx SET SCHEMA sch1;   -- goopg: syntax error (got "schema")
+```
+
+All three succeed in real PostgreSQL 18.3 (verified live). `internal/parser/
+ddl.go`'s `ALTER SEQUENCE` branch parsed only the `SeqOptList` options
+(`INCREMENT`, `MINVALUE`, ..., `OWNED BY`) — `gram.y`'s three sibling
+productions (`RenameStmt`, `AlterOwnerStmt`, `AlterObjectSchemaStmt`, all of
+which also cover a sequence via `OBJECT_SEQUENCE`) had no case at all, so the
+leftover `RENAME`/`OWNER`/`SET SCHEMA` tokens fell through the option loop's
+`default: return stmt, nil` and surfaced as a bare syntax error at the
+top-level statement parser.
+
+### Fix
+
+A sequence is just an ordinary relation (`pg_class.relkind = 'S'`) — real
+PostgreSQL backs `ALTER SEQUENCE ... RENAME/OWNER TO/SET SCHEMA` with the
+exact same generic relation commands ALTER TABLE uses (`RenameRelation`,
+`AlterTableOwner`, `AlterTableNamespace`, `postgres/src/backend/commands/
+tablecmds.c`). goopg already has this generic path fully working for
+tables/indexes (`AlterTableStmt` / `execAlterTable`), including — since the
+existing `ALTER INDEX ... RENAME TO` case reuses it the same way — a
+`tbl.IsSequence` cascade into the sequence registry for RENAME (an implicit
+SERIAL-column sequence has no catalog entry at all and is renamed directly
+via `RenameSequence`; an explicit `CREATE SEQUENCE`-registered one has both a
+catalog `Table` row and a `seqRegistry` entry that must move together).
+
+So rather than growing `AlterSequenceStmt` a third time, the `ALTER SEQUENCE`
+parser branch (`internal/parser/ddl.go`, right after the name is parsed, before
+the `SeqOptList` loop — these are mutually-exclusive top-level forms, not
+combinable with the loop like real PG's grammar) now detects these three
+forms and returns an `*AlterTableStmt` directly, reusing `execAlterTable`
+unchanged for the RENAME and OWNER TO cases. The one genuinely new gap this
+exposed: `execAlterTable`'s `SET SCHEMA` branch only updated `tbl.Schema`,
+with no `tbl.IsSequence` cascade into the registry (unlike the RENAME case,
+which already had one) — a real bug, since `seqRegistry`'s key is
+schema-qualified, so `nextval('newschema.seq')` would fail to resolve after a
+bare `tbl.Schema` write. Added the same `RenameSequence(oldFull, newFull)`
+cascade (with WAL retire/re-log and `VirtualRows` closure regeneration) the
+RENAME case already has.
+
+**Command-tag fidelity, caught by live-verifying against real PG before
+declaring this done:** reusing `AlterTableStmt` for these three ALTER
+SEQUENCE forms meant `dispatch.go`'s `ddlTag` — which switches on Go type, not
+PostgreSQL object kind — returned the blanket `"ALTER TABLE"` `CommandComplete`
+tag for all three, but real PG tags them `"ALTER SEQUENCE"` (`CreateCommandTag`
+keys off the parse node's declared object type, `OBJECT_SEQUENCE`, not the
+relation's underlying kind). `AlterTableStmt` gained a `TagOverride string`
+field (empty = the existing `"ALTER TABLE"` default); the three new
+construction sites set it to `"ALTER SEQUENCE"`; `ddlTag`'s
+`*parser.AlterTableStmt` case returns it when non-empty. This is the direct
+sibling of the M0119-0004 (loop #77) DDL-tag-fidelity effort — that loop's
+static sweep covered every `CompatNoopStmt`/`DropCompatStmt` literal but did
+not anticipate a *different* relkind's grammar reusing `AlterTableStmt`
+itself, so it did not catch this instance. (`ALTER INDEX ... RENAME TO`
+already reused `AlterTableStmt` the same way before this loop and has the
+same latent mistagging — noted but not fixed here, see Deferred below, since
+it is pre-existing and not part of this loop's own new divergence.)
+
+### Tests
+
+`TestAlterSequenceRenameTo` / `TestAlterSequenceOwnerTo` /
+`TestAlterSequenceOwnerToCurrentUser` / `TestAlterSequenceSetSchema` /
+`TestAlterSequenceRenameOwnerSchemaNotCombinedWithOptions`
+(`internal/executor/operators_alter_sequence_relation_ops_test.go`) — full
+parse→plan→exec round-trips asserting the catalog `Table` and `seqRegistry`
+entry both move, `nextval()` resolves under the new name/schema, and the old
+name/schema no longer resolves; the last case confirms a plain
+options-only `ALTER SEQUENCE` (including the pre-existing `SET UNLOGGED`
+no-op form, which shares the "set" token with the new SET SCHEMA check) is
+unaffected. `TestDDLCommandTagMatchesPostgres`
+(`internal/server/ddl_command_tag_test.go`) gained three cases pinning the
+`"ALTER SEQUENCE"` tag. Live-verified end-to-end against `goopg`/`psql`
+(rename → nextval → owner → set schema → nextval under the new schema) and
+cross-checked tag-for-tag against a scratch real PostgreSQL 18.3 instance.
+
+### Gates
+
+`go build ./...` clean; `go vet ./...` clean; `internal/parser`+
+`internal/executor`+`internal/server` suites PASS (full, no regressions);
+`TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke = pre-commit hook; live `goopg`/`psql` smoke
+(rename/owner/set-schema chain) cross-checked against real PostgreSQL 18.3.
+
+### Deferred (ledger row appended)
+
+(1) `ALTER INDEX ... RENAME TO` (pre-existing, not introduced this loop) has
+the same `AlterTableStmt`-reuse mistagging this loop fixed for sequences —
+still emits `"ALTER TABLE"` instead of PG's `"ALTER INDEX"`; likewise `ALTER
+VIEW`/`ALTER MATERIALIZED VIEW ... SET SCHEMA` (also `AlterTableStmt`-reuse
+sites) probably mistag the same way. Out of scope for this loop's bounded
+fix (would need auditing every `AlterTableStmt` construction site across
+non-table relkinds, not just the three new ALTER SEQUENCE ones). (2) `ALTER
+SEQUENCE ... OWNER TO <role>` (and, pre-existing, the same `execAlterTable`
+branch for `ALTER TABLE`/`ALTER SCHEMA`/...) accepts any role name without
+validating it exists — real PostgreSQL's `AlterTableOwner`
+(`postgres/src/backend/commands/tablecmds.c`) raises `role "..." does not
+exist` via `get_rolespec_oid`. goopg has no role-existence check anywhere in
+this shared branch. A probe-only candidate the earlier slice-438 loop also
+ruled out as "too large to scope as one bounded slice" (spans every OWNER TO
+site, not just sequences).
+
+## Follow-up: `ALTER VIEW ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops (DU-002 slice 440)
+
+**2026-07-04.** Slice 439's deferral (1) predicted that `ALTER VIEW`/`ALTER
+MATERIALIZED VIEW ... SET SCHEMA`, which also reuse `AlterTableStmt`, "likely
+have the identical pre-existing tag-mistagging bug." Auditing `ALTER VIEW`
+found something worse: `internal/parser/ddl.go`'s `parseAlter` had **no
+dedicated case for plain `ALTER VIEW` at all** — only `ALTER MATERIALIZED
+VIEW` was handled. Every plain `ALTER VIEW` statement (RENAME TO, OWNER TO,
+SET SCHEMA, and everything else) fell through to the blanket
+`"schema"/"view"/"collation"/"domain"/"extension"/"language"/"operator"/"system"`
+compat-stub loop near the bottom of `parseAlter`, which parses successfully
+but just consumes tokens to the semicolon and returns a bare
+`&AlterTableStmt{pos: t.Pos}` — no `Name`, no `Actions`. The client got a
+clean `ALTER TABLE`-tagged (mistagged) success reply, but the rename / owner
+change / schema move **never happened** — a functional no-op, not just a
+cosmetic tag bug.
+
+### Fix
+
+Mirrors the slice 439 `ALTER SEQUENCE` fix exactly: a view is just a relation
+(`pg_class.relkind='v'`), and real PostgreSQL backs `RENAME TO`/`OWNER TO`/
+`SET SCHEMA` on a view with the same generic `RenameRelation`/
+`AlterTableOwner`/`AlterTableNamespace` commands as any other relation
+(`postgres/src/backend/commands/tablecmds.c`; `ALTER VIEW` has no dedicated
+executor path in real PG for these three forms either — `AlterViewStmt` in
+`gram.y` covers only `SET`/`RESET` reloptions and `ALTER COLUMN ... SET/DROP
+DEFAULT`, while RENAME/OWNER/SET SCHEMA are parsed as the generic
+`RenameStmt`/`AlterOwnerStmt`/`AlterObjectSchemaStmt` productions shared with
+tables and sequences). Added a dedicated `if p.acceptKeyword(KwView) { ... }`
+case in `parseAlter`, positioned before the catch-all stub loop, that:
+
+- parses `[IF EXISTS] name`,
+- on `RENAME TO newname` returns an `*AlterTableStmt` carrying an
+  `AlterTableRenameTable` action (same shape the ALTER SEQUENCE/ALTER INDEX
+  RENAME cases already produce),
+- on `OWNER TO role` (including `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE`
+  → the bootstrap-superuser sentinel) sets `OwnerTo`,
+- on `SET SCHEMA newschema` sets `SetSchema`,
+- otherwise falls back to the same "consume to `;`, return an empty
+  `AlterTableStmt`" no-op the old catch-all used, for sub-forms not yet
+  modeled (see Deferred).
+
+All three constructors set `TagOverride: "ALTER VIEW"` so `dispatch.go`'s
+`ddlTag` reports the PG-accurate tag instead of the blanket `"ALTER TABLE"`.
+`execAlterTable` needed no changes at all: it already resolves the target via
+`lookupTableWithSearch` (relkind-agnostic) and `catalog.InMemory.RenameTable`
+already re-keys any table/view/sequence entry while preserving the pointer
+(so a view's `.View` field, its parsed `SELECT` body, survives a rename/
+schema-move unchanged) — this generic path was never view-specific, it was
+simply never *reached* for `ALTER VIEW` before this fix.
+
+`"view"` was removed from the catch-all stub's identifier list (now dead
+code — the dedicated case above always consumes the `VIEW` keyword first).
+
+### Tests
+
+`TestAlterViewRenameTo`/`OwnerTo`/`OwnerToCurrentUser`/`SetSchema`
+(`internal/executor/operators_alter_view_relation_ops_test.go`) — full
+parse→plan→exec round-trips that, unlike a bare catalog-key check, also
+re-run `SELECT ... FROM <view>` under the new name/schema afterward and
+assert the expected row count, proving the view definition (not just the
+catalog entry) survived. `TestAlterViewRenameOwnerSchemaCommandTag` pins
+`AlterTableStmt.TagOverride == "ALTER VIEW"` at the parser level. 3 new cases
+in `TestDDLCommandTagMatchesPostgres` (`internal/server/ddl_command_tag_test.go`).
+
+### Gates
+
+`go build ./...` clean; `go vet ./internal/parser/... ./internal/executor/...`
+clean; `internal/parser`+`internal/executor`+`internal/server` suites PASS
+(full, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+(1) `ALTER MATERIALIZED VIEW ... SET SCHEMA` and `ALTER INDEX ... RENAME TO`
+still carry the slice-439-noted tag-mistagging bug (both reuse
+`AlterTableStmt` with no `TagOverride`) — not touched by this loop, which
+only closed the functional no-op for plain `ALTER VIEW`. (2) `ALTER VIEW`
+sub-forms other than RENAME TO/OWNER TO/SET SCHEMA — `RENAME COLUMN`,
+`ALTER COLUMN ... SET/DROP DEFAULT`, `SET`/`RESET (reloptions)` — still fall
+to the no-op stub inside the new case and silently do nothing; not modeled.
+(3) Plain `ALTER SCHEMA ... RENAME TO`/`OWNER TO` has an equivalent
+(arguably worse) gap: there is no `RenameSchema`/schema-owner mechanism
+anywhere in `internal/catalog` at all, so unlike sequences/views this can't
+be closed by routing through the existing `AlterTableStmt`/`execAlterTable`
+path — it needs new pg_namespace-rename catalog support first. Out of scope
+for this bounded loop (Effort-L: new catalog capability).
+
+## Follow-up: `ALTER STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA` were silent no-ops (DU-002 slice 441)
+
+### Problem
+
+Slice 317 (`docs/design/0119-0004-alter-statistics-set-statistics.md`) gave
+`ALTER STATISTICS` a real parser node (`AlterStatisticsStmt`) for the `SET
+STATISTICS n` form, but deliberately left the other three grammar-distinct
+forms — `RENAME TO` / `OWNER TO` / `SET SCHEMA` — as intentional no-ops: the
+trailing tokens were consumed and discarded, and `execAlterStatistics`
+short-circuited on `!s.HasTarget`. That means `ALTER STATISTICS s RENAME TO
+s2` (or `OWNER TO` / `SET SCHEMA`) executed successfully — a clean reply,
+correctly tagged `"ALTER STATISTICS"` (this AST node is not a reused
+`AlterTableStmt`, so unlike the ALTER SEQUENCE/VIEW slices there was no
+command-tag mistagging here) — while leaving the statistics object
+completely unchanged. Same silent-no-op class as `ALTER VIEW` before slice
+440, on a different object kind.
+
+### Change
+
+Mirrors `execAlterCollation`'s `Action`-switch shape:
+
+- **Parser** (`internal/parser/ast.go`/`ddl.go`): `AlterStatisticsStmt` gains
+  `Action string` (`"rename"` / `"owner"` / `"setschema"` / `""` — `""` still
+  means SET STATISTICS, gated by the pre-existing `HasTarget`), `NewName`,
+  `NewOwner` (with the `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` →
+  `"current_user"` sentinel, matching `ALTER COLLATION`/`ALTER TABLE`),
+  `NewSchema`. RENAME TO / OWNER TO are detected before the pre-existing `SET
+  STATISTICS` branch; `SET SCHEMA` shares the same leading `SET` token as
+  `SET STATISTICS`, so it is special-cased first inside that branch (peek at
+  the following keyword: `schema` vs `statistics`).
+- **Catalog** (`internal/catalog/catalog.go`): new `StatisticsObject.Owner
+  uint32` (0 = unset, defaults to the bootstrap superuser — `OwnerOrDefault()`,
+  mirroring `UserAggregate.Owner`/`OwnerOrDefault()`). Three new mutators
+  beside the pre-existing `SetStatisticsTarget`: `RenameStatisticsObject`,
+  `SetStatisticsOwner`, `SetStatisticsSchema` — rename/schema-move both
+  re-key the `statisticsObjs` map via `qualifiedKey()` since that key is
+  `schema.name`. The `pg_statistic_ext` virtual row's `stxowner` cell now
+  projects `OwnerOrDefault()` instead of the hardcoded `"10"`; its
+  `stxnamespace` cell now resolves the real namespace OID via
+  `c.schemas[strings.ToLower(schema)]` (falling back to `c.schemas["public"]`)
+  instead of a `public → "2200" / else → "0"` ternary — the previous ternary
+  meant any non-public statistics object already had a bogus
+  `stxnamespace=0` even before this slice's `SET SCHEMA` addition existed to
+  change it.
+- **Executor** (`internal/executor/operators_ddl.go`): `execAlterStatistics`
+  restructured as a `switch s.Action` (mirroring `execAlterCollation`),
+  falling through to the pre-existing `SET STATISTICS` handling for `Action
+  == ""`. An unknown target object raises `42704 statistics object "..."
+  does not exist`; `IF EXISTS` downgrades to a notice — same shape as `ALTER
+  COLLATION`.
+
+Not WAL-logged — RENAME/OWNER/SET SCHEMA are in-memory-only, matching the
+pre-existing (also unlogged) `ALTER COLLATION RENAME TO`/`OWNER TO`
+precedent (see that slice's own ledger row (a)). `CREATE STATISTICS` itself
+is not yet WAL-logged either, so statistics objects as a whole do not
+survive a restart today — a pre-existing gap, not introduced or widened by
+this slice.
+
+### Tests
+
+`TestParseAlterStatisticsRenameOwnerSetSchema` (`internal/parser/alter_test.go`
+— rename / owner / owner-CURRENT_USER / setschema / IF-EXISTS-setschema, and
+confirms `HasTarget` stays false for all of them). `TestAlterStatisticsRenameOwnerSetSchema`
+(`internal/executor/alter_statistics_test.go` — full parse→plan→exec round
+trips: RENAME TO moves the lookup key, OWNER TO resolves a real registered
+role's OID via `RoleOID`, SET SCHEMA re-keys the map and updates `Schema`,
+`IF EXISTS` on an unknown object is a no-op, and without it a `42704` names
+the missing object).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+`internal/executor`
+suites PASS (full, no regressions); `scripts/tpch-spotcheck.sh` PASS;
+pgbench smoke = pre-commit hook.
+
+### Deferred (ledger row appended)
+
+(1) RENAME/OWNER/SET SCHEMA are in-memory-only — no WAL logging, same as
+`ALTER COLLATION`'s equivalent forms; a restart loses the mutation. (2)
+Statistics objects overall have no restart persistence at all — `CREATE
+STATISTICS` itself is not WAL-logged, so this is a strictly larger
+pre-existing gap this slice did not create or need to fix. (3) `ALTER
+STATISTICS` sub-forms beyond these four (there are none in PG's own
+grammar — `SET STATISTICS`/`RENAME TO`/`OWNER TO`/`SET SCHEMA` is the
+complete set) are not applicable; no further known ALTER STATISTICS gap.
+
+## Follow-up: `ALTER COLLATION name SET SCHEMA newschema` was the last unmodelled ALTER COLLATION form (DU-002 slice 442)
+
+### Problem
+
+`ALTER COLLATION` already had dedicated `RENAME TO` / `OWNER TO` support
+(loop #50 ledger follow-up to M0119-0004), including WAL logging
+(`RecordKindAlterCollationRename`/`Owner`) so the mutation survives a
+restart. `SET SCHEMA` was the one remaining grammar form: `parseAlter`'s
+collation case had no dedicated branch for it, so it fell to the generic
+`default:` no-op — tokens consumed, `Action` left `""`, no catalog mutation,
+a clean success reply that silently did nothing. Same silent-no-op class as
+the `ALTER SEQUENCE`/`ALTER VIEW`/`ALTER STATISTICS` slices (439–441), here
+closing the collation object kind's own remaining gap rather than a new
+object kind.
+
+### Change
+
+- **Parser** (`internal/parser/ast.go`/`ddl.go`): `AlterCollationStmt` gains
+  `NewSchema string`; a new case in the collation `Action`-switch detects
+  `SET SCHEMA newschema` (checked before the `default:` no-op fallback) and
+  sets `Action = "setschema"`.
+- **Catalog** (`internal/catalog/catalog.go`): new `InMemory.SetCollationSchema`
+  (mirrors `SetCollationOwner`'s schema-resolution shape — both `schema` and
+  `newSchema` resolve to a namespace OID via `c.schemas[...]`, falling back to
+  `public` — and re-points the matching `userCollations` entry's
+  `NamespaceOID`) plus `SetCollationSchemaDuringRecovery`, the discard-result
+  recovery counterpart used by WAL replay.
+- **Executor** (`internal/executor/operators_ddl.go`): new `"setschema"` case
+  in `execAlterCollation` — resolves `NewSchema` (defaulting to `public` like
+  PG's own default-schema behavior), calls `SetCollationSchema`, raises
+  `42704` for an unknown target (`IF EXISTS` downgrades to a no-op), and
+  WAL-logs via `wal.EncodeAlterCollationSetSchema` when `o.ctx.WAL != nil` —
+  matching the RENAME/OWNER precedent's restart-durability treatment rather
+  than repeating the ALTER STATISTICS slice's "in-memory-only" deferral.
+- **WAL** (`internal/wal/recovery.go`): new `RecordKindAlterCollationSetSchema`
+  (byte 93) plus `EncodeAlterCollationSetSchema`/`DecodeAlterCollationSetSchema`
+  (`kind(1) | nameLen(2) | name | schemaLen(2) | schema | newSchemaLen(2) |
+  newSchema`); `ApplyRecord` routes it through the existing collation-DDL
+  metadata-only no-op physical-replay branch alongside
+  CREATE/DROP/RENAME/OWNER.
+- **Recovery** (`internal/initdb/collation_ddl_recovery.go`): new case in
+  `replayCollationDDLRecords` decoding the record and calling
+  `SetCollationSchemaDuringRecovery`.
+
+The virtual `pg_collation` view already projects `uc.NamespaceOID` directly
+(no separate cached column to invalidate), so the schema move is immediately
+visible to `\dO`/`pg_dump`'s `getCollations`/`dumpCollation` with no further
+wiring — unlike the ALTER STATISTICS slice's `pg_statistic_ext` virtual
+row, which needed its own namespace-projection fix.
+
+### Tests
+
+`TestParseAlterCollationSetSchema` (`internal/parser/alter_collation_test.go`
+— pins `Action == "setschema"` and `NewSchema`, replacing the old
+"unmodelled no-op" assertion). `TestAlterCollationSetSchema`
+(`internal/executor/alter_collation_test.go` — full parse→plan→exec round
+trip: SET SCHEMA moves `NamespaceOID`, `IF EXISTS` on an unknown collation is
+a no-op, without it a `42704` names the missing object).
+`TestEncodeDecodeAlterCollationSetSchemaRoundTrip` +
+`TestDecodeAlterCollationSetSchemaRejects{WrongKind,TruncatedPayload}`
+(`internal/wal/collation_ddl_test.go`, including a multi-byte UTF-8 case).
+`TestCollationDDLRecoveryReplaysSetSchemaAfterCreate`
+(`internal/initdb/collation_ddl_recovery_test.go` — CREATE in `public` + SET
+SCHEMA to a second schema created via `EncodeCreateSchema`, closed and
+reopened, confirms the collation is gone from `public` and present in the
+new schema with its original OID preserved).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor`+`internal/wal`+`internal/initdb` suites PASS (full, no
+regressions); `scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit
+hook.
+
+### Deferred
+
+None — this closes the last unmodelled `ALTER COLLATION` form in full,
+including restart persistence (unlike the ALTER STATISTICS slice, which left
+its RENAME/OWNER/SET SCHEMA in-memory-only). No further known `ALTER
+COLLATION` grammar gap.
+
+## Follow-up: `ALTER INDEX ... RENAME TO` / `ALTER MATERIALIZED VIEW ... SET SCHEMA` command-tag mistagging AND `ALTER INDEX` was ALSO a functional no-op (DU-002 slice 443)
+
+### Problem
+
+The slice 439 ledger row predicted (but didn't fix) a tag-mistagging bug:
+`ALTER INDEX ... RENAME TO` and `ALTER MATERIALIZED VIEW ... SET SCHEMA`
+both reuse `AlterTableStmt` (an index/matview is just a relation too) but,
+unlike the slice 439/440 `ALTER SEQUENCE`/`ALTER VIEW` sites, neither
+construction site set `TagOverride` — so `ddlTag` fell through to the
+blanket `"ALTER TABLE"` default instead of PG's `"ALTER INDEX"` /
+`"ALTER MATERIALIZED VIEW"`.
+
+Auditing the `ALTER INDEX RENAME TO` site to fix the tag found something
+worse: **the rename never applied at all.** `execAlterTable`
+(`internal/executor/operators_ddl.go`) reaches an index (as opposed to a
+heap table) via `o.ctx.Catalog.LookupIndex(s.Name)`, then loops over
+`s.Actions` handling `AlterTableAlterColumnSet`/`AlterTableSetStatistics`/
+`AlterIndexAttachPartition`/`AlterIndexSetReloptions` — there was no case
+for `AlterTableRenameTable` at all, so it fell through to the loop's
+`// Other ALTER actions on index: silently accept in v0.` default and
+`return nil`. The client received a clean `ALTER INDEX`-tagged (well,
+`ALTER TABLE`-tagged, pre-fix) success reply and the index kept its old
+name in the catalog — live-verified against a real `psql`: `ALTER INDEX
+idx443 RENAME TO idx443_renamed` returned `ALTER TABLE` and a follow-up `\d`
+still showed `idx443`, not `idx443_renamed`. The M0118-0008 TOAST-exposure
+slice 4 comment on that code ("carries Name so a synthetic pg_toast index
+rename can be intercepted") only ever wired the *pg_toast-schema* fallback
+path a few lines below (`strings.EqualFold(s.Name.Schema, "pg_toast")`) — a
+plain user index was never covered.
+
+### Change
+
+- **Parser** (`internal/parser/ddl.go`): the `ALTER INDEX name RENAME TO
+  newname` construction site (`if p.acceptIdentKeyword("rename")` inside the
+  `ALTER INDEX` block) and the `ALTER MATERIALIZED VIEW name SET SCHEMA
+  newschema` construction site now both set `TagOverride: "ALTER INDEX"` /
+  `TagOverride: "ALTER MATERIALIZED VIEW"` respectively — closing the slice
+  439 prediction in full (`ALTER VIEW`/`ALTER SEQUENCE` were already fixed by
+  slices 439/440; those were the only two remaining un-audited sites).
+- **Catalog** (`internal/catalog/catalog.go`): new `InMemory.RenameIndex(old,
+  new parser.ObjectName) error` (mirrors `RenameTable`'s shape: re-keys
+  `c.indexes` and the owning table's `c.byTable[tableOID]` slot, preserving
+  the `*Index` pointer; 42P07-shaped error text on a name collision) and its
+  idempotent WAL-replay counterpart `RenameIndexDuringRecovery(schema,
+  oldName, newName string)` (mirrors `RegisterIndexDuringRecovery`: a missing
+  old entry is a silent no-op, not an error).
+  - Both share a new private `lookupIndexLocked` helper factored out of
+    `LookupIndex`'s body, because a genuine "" vs `"public."` catalog-key
+    ambiguity surfaced while writing the restart-recovery test: a live DDL
+    session keys an unqualified index under the *bare* name (`CreateIndex`'s
+    caller passes `Schema: tbl.Schema`, which `execCreateTable` only ever
+    sets to a non-empty string when the writable search_path schema isn't
+    `"public"` — see `internal/executor/operators_ddl.go`'s `execCreateTable`
+    around the `currentWritableSchema` check), while `loadUserIndexesFromHeap`
+    (M0113's pg_index-heap reload path, `internal/initdb/open.go`) resolves
+    the namespace OID to the explicit string `"public"`. A rename issued
+    live and a rename replayed after a restart can therefore need to resolve
+    the *same* logical index under two different literal map keys.
+    `lookupIndexLocked` performs the same fallback dance `LookupIndex`
+    already did (try the literal key, then `"public."+name` when
+    unqualified, then the bare name when qualified) and returns the actual
+    key found so the rename can delete-then-reinsert under the correct slot.
+- **Executor** (`internal/executor/operators_ddl.go`): a new
+  `act.Kind == parser.AlterTableRenameTable` case inside the index branch's
+  action loop — calls `catalog.InMemory.RenameIndex`, raising `42P07` on a
+  name collision, then WAL-logs via `o.ctx.Pool.LogChangeRecord(...)`.
+  Deliberately uses the **same WAL-emission mechanism CREATE/DROP INDEX use**
+  (`ctx.Pool.LogChangeRecord`, M0079-0001) rather than the `ctx.WAL.Append`
+  pattern most other ALTER-form slices in this thread use (439-442): the
+  rename record is replayed by the same `replayIndexDDLRecords` driver that
+  already consumes the CREATE/DROP INDEX records, and `ctx.Pool` is
+  guaranteed wired in every executor context that reaches DDL, whereas
+  `ctx.WAL` is not (confirmed by writing the recovery test below — the
+  `internal/initdb` package's `runDDL` test harness, `ddl_catalog_sync_test.go`,
+  never sets `ctx.WAL`, only `ctx.Pool`/`ctx.Catalog`/`ctx.TxnMgr`/`ctx.Tx`/
+  `ctx.Snap`).
+- **WAL** (`internal/wal/recovery.go`): new `RecordKindRenameIndex` (byte 94)
+  plus `EncodeRenameIndex`/`DecodeRenameIndex` (`kind(1) | schemaLen(2) |
+  schema | oldNameLen(2) | oldName | newNameLen(2) | newName`); added to the
+  `RecordKindCreateIndex, RecordKindDropIndex` no-op physical-replay case in
+  `ApplyRecord` (renamed to `RecordKindCreateIndex, RecordKindDropIndex,
+  RecordKindRenameIndex`) and to `nativeApplyRecordKindKnown`'s whitelist.
+- **Recovery** (`internal/initdb/index_ddl_recovery.go`): `indexRegistryRecovery`
+  gains `RenameIndexDuringRecovery`; `replayIndexDDLRecords` gains a
+  `wal.RecordKindRenameIndex` case decoding the record and calling it.
+
+### Tests
+
+`TestAlterIndexRenameToApplies`/`UnknownRelation`/`Collision`/`CommandTag`
+(`internal/executor/operators_alter_index_rename_test.go` — full
+parse→plan→exec round trip: the renamed index keeps its `Table`/`Columns`,
+the old name is gone, a 42P01/42P07-shaped error on an unknown/colliding
+target, and the `"ALTER INDEX"` tag). Extended
+`TestDDLCommandTagMatchesPostgres` (`internal/server/ddl_command_tag_test.go`)
+with `alter index rename to` / `alter materialized view set schema` cases.
+`TestEncodeDecodeRenameIndexRoundTrip` (incl. multi-byte UTF-8) +
+`TestDecodeRenameIndexRejects{WrongKind,TruncatedPayload}`
+(`internal/wal/rename_index_test.go`).
+`TestRenameIndexSurvivesRestartViaWAL`
+(`internal/initdb/index_ddl_recovery_test.go` — CREATE INDEX + RENAME, close
+without `SaveCatalog` (simulated crash), reopen, confirm the new name is
+present with the correct owning table and the old name is gone; this is the
+test that surfaced the "" vs `"public."` key-ambiguity bug above — it failed
+with "not found" until `lookupIndexLocked` was factored out and used on both
+the delete and lookup sides).
+
+Live-verified end-to-end against a real `goopg`/`psql` (PG 18.3 client):
+`ALTER INDEX idx443 RENAME TO idx443_renamed` now returns the `ALTER INDEX`
+tag (was `ALTER TABLE`) AND `\d t443` / `pg_indexes` show the new name (was:
+tag said success, name silently stayed `idx443`); a full server restart
+(`goopg stop` / `goopg start` against the same data dir) confirmed
+`idx443_renamed` survives.
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor`+`internal/wal`+`internal/initdb`+`internal/server`
+suites PASS (full, no regressions); pgbench smoke = pre-commit hook; live
+`goopg`/`psql` smoke described above, including a full restart.
+
+### Deferred
+
+Live-verifying the `ALTER MATERIALIZED VIEW ... SET SCHEMA` tag fix
+surfaced a **much larger pre-existing gap, unrelated to this slice's scope**:
+materialized views have **no restart persistence at all** in goopg. A
+`CREATE MATERIALIZED VIEW mv AS SELECT ...` followed by a server restart
+leaves `mv` in the catalog as a plain heap table (`\d mv` shows `"Table"`,
+not `"Materialized view"`; `\dm` lists nothing) — so naturally the `SET
+SCHEMA` move on top of it doesn't survive either (reverts to its pre-move
+name/schema, table-ness and all). This is not a small follow-up like the
+tag fix above; it needs matview-specific catalog/WAL support (a
+`Table.MatView`-equivalent marker persisted across restart, likely alongside
+`CREATE MATERIALIZED VIEW`'s own restart persistence, which appears to not
+exist either) — out of scope for this bounded loop. No ledger precedent for
+this gap was found (`grep -in "materialized view" .ralph/deferral_ledger.md`
+turns up only the slice-440/436 mentions, neither about restart
+persistence), so this is a fresh discovery, not a repeat.
+
+Resume point: `internal/executor/operators_ddl.go`'s `execCreateMatView`
+(or equivalent) likely never emits a WAL record analogous to
+`RecordKindCreateIndex`/the collation-DDL family; `internal/initdb/open.go`'s
+`loadUserTablesFromHeap` would need to reconstruct the matview marker from
+whatever pg_class/heap row `syncTableToCatalogHeap` writes for a matview
+today (probably just `relkind='m'`, insufficient on its own — same shape of
+gap `RecordKindCreateIndex`'s doc comment describes for indexes, "goopg has
+no pg_index relation").
+
+## Follow-up: `ALTER VIEW` sub-forms complete the grammar (DU-002 slice 444)
+
+**2026-07-04.** Slice 440's deferral row left three `ALTER VIEW` sub-forms
+unmodeled — `RENAME [COLUMN] old TO new`, `ALTER [COLUMN] col SET/DROP
+DEFAULT`, and `SET`/`RESET (view_option_name [= value], ...)` — all falling
+to the catch-all no-op consume loop inside the `ALTER VIEW` parser case. Per
+`postgres/doc/src/sgml/ref/alter_view.sgml`, these three sub-forms plus the
+three slice-440 already closed (`RENAME TO`/`OWNER TO`/`SET SCHEMA`) are
+PG's **complete** `ALTER VIEW` grammar — seven `synopsis` lines, nothing
+else. This slice closes all three remaining forms in one pass:
+
+- **`RENAME [COLUMN] old TO new`**: previously the `p.acceptIdentKeyword
+  ("rename") && p.acceptKeyword(KwTo)` short-circuit already consumed the
+  `rename` token on ANY `RENAME ...` form, so a `RENAME COLUMN` fell through
+  to the catch-all no-op with `rename` already eaten — a silent no-op, same
+  bug class as slice 440. Split into an `if p.acceptIdentKeyword("rename")`
+  block that branches on whether `TO` follows immediately (plain rename) or
+  not (`RENAME [COLUMN] old TO new`, reusing the existing
+  `AlterTableRenameColumn` action).
+- **`ALTER [COLUMN] col SET DEFAULT expr` / `DROP DEFAULT`**: new parser
+  branch reusing `AlterTableSetDefault`/`AlterTableDropDefault` — the exact
+  actions `ALTER TABLE`'s own `ALTER COLUMN` form produces, so
+  `execAlterTable`'s existing dispatch needed no executor change (it mutates
+  `tbl.Columns[i].DefaultExpr` generically, not relkind-gated). This is PG's
+  updatable-view column-default mechanism (backs an `INSERT`/`UPDATE`
+  through the view when the target column is omitted).
+- **`SET`/`RESET (view_option_name [= value], ...)`**: reuses
+  `AlterTableSetReloptions`/`AlterTableResetReloptions` (views are
+  `catalog.Table` too, and the executor's reloption switch was already
+  generic over relkind). `execAlterTableSetReloptions`/
+  `ResetReloptions` gained two new cases, `security_barrier`/
+  `security_invoker` (`catalog.Table.SecurityBarrier`/`SecurityInvoker`,
+  boolean), immediately followed by a third, **`check_option`** — PG's enum
+  reloption (`local`/`cascaded`, case-insensitive per
+  `reloptions.c`'s `RELOPT_TYPE_ENUM` handling, `pg_strcasecmp`), rejecting
+  an invalid value with the same `22023 invalid value for enum option
+  "check_option": <val>` PG itself raises
+  (`postgres/src/backend/access/common/reloptions.c:1677`). All three
+  `view_option_name`s from the sgml doc are now handled — `check_option`
+  already had `catalog.Table.CheckOption`/`CREATE VIEW WITH` support
+  (`execCreateView`); this closes the `ALTER VIEW SET (check_option = ...)`
+  gap on the same field.
+
+### `RENAME COLUMN` pg_attribute heap-resync gap (found + closed, not
+introduced by this slice)
+
+Auditing `AlterTableRenameColumn`'s existing branch (reused unchanged by the
+new `ALTER VIEW RENAME COLUMN` case) found it had **no**
+`syncTableToCatalogHeap` call — unlike `SET STORAGE`/`SET COMPRESSION`/every
+other column-mutating `ALTER TABLE` arm in the same switch, which all
+explicitly delete-and-rewrite the affected relation's catalog heap rows
+because `pg_attribute` is a heap populated once at `CREATE TABLE` time (see
+`[[pg_attribute_alter_needs_heap_resync]]`). Without it, a column rename's
+new name never reaches `pg_dump`/a live `SELECT ... FROM pg_attribute` —
+this is a **pre-existing gap for ordinary `ALTER TABLE RENAME COLUMN` on
+tables too**, not specific to views (no prior test or ledger row covered
+it). Closed by adding the identical `deleteCatalogRowsForOID` +
+`syncTableToCatalogHeap` pattern to the `AlterTableRenameColumn` case,
+gated the same way (`catalogHeapSyncAvailable(o.ctx)`). Live-verified
+end-to-end (fresh scratch `goopg`, real `psql`/`pg_dump` PG 18.3 client):
+`CREATE TABLE t (a int, b int); ALTER TABLE t RENAME COLUMN a TO renamed_a`
+now round-trips `renamed_a` through both a live `SELECT ... FROM
+pg_attribute` and `pg_dump --schema-only`; a chained `CREATE VIEW v AS
+SELECT renamed_a, b FROM t; ALTER VIEW v RENAME COLUMN renamed_a TO va`
+also round-trips correctly when each statement is sent as its own simple
+Query message.
+
+### Fresh discovery (deferred, out of scope): multi-statement simple-query
+batch failure corrupts an EARLIER statement's catalog-heap resync
+
+While live-verifying the above, sending several statements in **one**
+simple-query message (`psql -c "stmt1; stmt2; stmt3"`, all `\;`-joined)
+where an EARLIER statement calls the delete-then-resync pattern (RENAME
+COLUMN, but reproduces identically with plain `SET STORAGE` — **unrelated
+to this slice's code**, a pre-existing and generic gap) and a LATER
+statement in the same batch **fails**, left the relation's `pg_attribute`
+heap rows **empty** (`SELECT attname FROM pg_attribute WHERE attrelid =
+'batch_t'::regclass` → 0 rows; `pg_dump` emits `CREATE TABLE public.batch_t
+(\n);` with no columns at all) — even though the table itself still exists
+and is otherwise queryable. Per PostgreSQL's documented simple-query
+semantics, multiple statements in one message run as a single implicit
+transaction: a later failure should roll back **everything**, including the
+earlier `CREATE TABLE`, so the table shouldn't exist at all afterward.
+goopg instead partially rolls back — the table registration survives but
+its catalog-heap sync does not — an atomicity violation, not merely a
+missing feature. Reproduced minimally: `CREATE TABLE t (a int); ALTER TABLE
+t ALTER COLUMN a SET STORAGE external; SELECT 1/0;` sent as one `psql -c`
+batch leaves `t`'s `pg_attribute` empty. Sending the identical statements as
+separate `psql -c` invocations (no batching) does not reproduce it. Resume
+point: `internal/server/dispatch.go`'s `dispatchSimpleQueryViaExecutor`
+(~line 97) and its per-statement loop/transaction handling, cross-referenced
+against `deleteCatalogRowsForOID`/`syncTableToCatalogHeap`
+(`internal/executor/operators_ddl.go`) — likely an MVCC-visibility ordering
+issue where the resync's xmax/xmin stamps are decided independently of
+whether the enclosing implicit batch transaction ultimately commits. Not
+fixed here: this is a WAL/MVCC-class transaction-atomicity bug (practice
+card: race detector + recovery/replication gates), not a parser-grammar
+change, and reproduces without any of this slice's diff.
+
+### `CREATE`/`DROP STATISTICS` WAL/restart persistence + `DROP STATISTICS`
+support (loop #96, DU-002 slice 445)
+
+Closes resume point (2) of the slice-441 ledger row: statistics objects
+(`pg_statistic_ext`) were never WAL-logged at all, since `CREATE STATISTICS`
+itself first landed (M0097-0023) — the object lived only in
+`catalog.InMemory.statisticsObjs`, so it silently vanished on restart and
+any subsequent `ALTER STATISTICS` mutation (slice 441) had nothing durable
+to attach to. While scoping the fix, auditing `DROP STATISTICS` found it was
+**entirely unparsed** — no grammar rule in `internal/parser/ddl.go`
+`parseDrop` matched the `STATISTICS` keyword at all, so
+`DROP STATISTICS name` failed with a plain syntax error. This is a
+prerequisite discovery, not introduced by this slice: a restart-durable
+`CREATE STATISTICS` needs a working `DROP STATISTICS` to test the pair, and
+pg_dump/regress fixtures (`postgres/src/test/regress/sql/stats_ext.sql`) use
+`DROP STATISTICS` throughout.
+
+**Landed**, mirroring the `CREATE`/`DROP COLLATION` precedent
+(`RecordKindCreateCollation`/`RecordKindDropCollation`, kinds 42/43) exactly:
+
+- `internal/parser/ddl.go`: added `"statistics"` to the generic ident-based
+  `DropCompatStmt` object-type list (`parseDrop`) — `DROP STATISTICS
+  [IF EXISTS] name [, ...] [CASCADE|RESTRICT]` needs no special-cased
+  argument parsing (unlike `DROP CAST`/`DROP TRANSFORM`), so it fits the same
+  shape as `sequence`/`collation`/`conversion`.
+- `internal/executor/operators_ddl.go`'s `execDropCompat` gains an
+  `objType == "statistics"` case (mirroring the `"collation"` case
+  immediately above it): resolves each name via the new
+  `catalog.InMemory.DropStatistics(name, schema)`, WAL-appends
+  `EncodeDropStatistics` on success, and raises `42704` (or an `IF EXISTS`
+  notice) for an unknown object — same shape as `DROP COLLATION`.
+- `execCreateStatistics` now captures the `*catalog.StatisticsObject`
+  returned by `RegisterStatisticsFull` and WAL-appends
+  `EncodeCreateStatistics` (name/schema/OID/TableOID/Owner/Kinds/Columns/
+  Exprs/HasExpr) when `o.ctx.WAL != nil`.
+- New `internal/wal/statistics_ddl.go`: `RecordKindCreateStatistics`/
+  `RecordKindDropStatistics` (kinds 95/96, the first free values after
+  `RecordKindRenameIndex`=94) + their Encode/Decode pairs. Unlike collation's
+  fixed-shape payload, `CREATE STATISTICS` carries three variable-length
+  string slices (`Kinds`/`Columns`/`Exprs`), so the format adds a generic
+  `count(2) | (elemLen(2) | elem)*` sub-encoding
+  (`encodeStatisticsStringSlice`/`decodeStatisticsStringSlice`) reused for
+  all three.
+- New `catalog.InMemory.RegisterStatisticsDuringRecovery` (overwrites by
+  qualified name + bumps `nextOID`, mirroring
+  `RegisterAccessMethodDuringRecovery`) and `DropStatistics`/
+  `DropStatisticsDuringRecovery` (mirroring `DropCollation`).
+- New `internal/initdb/statistics_ddl_recovery.go`
+  (`replayStatisticsDDLRecords`), wired into `open.go` right after the
+  access-method DDL replay call (grouped with the other name-keyed DU-002
+  replay passes; there is no real ordering dependency on
+  `loadUserTablesFromHeap` since the recorded `TableOID` is restored
+  verbatim rather than re-resolved by name).
+- Tests: `internal/wal/statistics_ddl_test.go` (encode/decode round trips
+  incl. empty/multi-element string slices, wrong-kind/truncated-payload
+  guards), `internal/initdb/statistics_ddl_recovery_test.go` (real
+  `Init`/`Open`/`WAL.Append`/`Close`/re-`Open` round trips for CREATE and
+  CREATE+DROP, plus missing-WAL-dir/nil-catalog no-op guards),
+  `internal/executor/drop_statistics_test.go` (unqualified + schema-qualified
+  DROP, `IF EXISTS` no-op, missing-object `42704`).
+
+**Still deferred** (not closed by this slice): resume point (1) of the same
+ledger row — `ALTER STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA`
+(slice 441) is still in-memory-only, exactly like the pre-existing (also
+unlogged at the time) `ALTER COLLATION RENAME/OWNER` precedent was before
+its own follow-up slices (442/443) added `RecordKindAlterCollationRename`/
+`RecordKindAlterCollationOwner`/`RecordKindAlterCollationSetSchema`. A CREATE
+now survives a restart with its original name/owner/schema; a RENAME/OWNER
+TO/SET SCHEMA applied before a restart is lost, and the object reverts to
+its as-created identity. Resume point: `execAlterStatistics`'s three
+mutation call sites (`internal/executor/operators_ddl.go`, around
+`RenameStatisticsObject`/`SetStatisticsOwner`/`SetStatisticsSchema`) need a
+`RecordKindAlterStatisticsRename`/`...Owner`/`...SetSchema` triple + a
+`replayStatisticsDDLRecords` case each, following this slice's own
+CREATE/DROP template (or the ALTER COLLATION one directly). Gates: `go build
+./...` clean; `go test -race ./internal/wal/... ./internal/mvcc/...` PASS;
+`internal/wal`+`internal/catalog`+`internal/executor`+`internal/initdb`+
+`internal/parser` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full
+pre-commit gate incl. pgbench TPC-B smoke PASS.
+
+### `ALTER STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA` WAL/restart
+persistence (loop #97, DU-002 slice 445 follow-up, resume point (1) of the
+slice-441 row CLOSED)
+
+Closes resume point (1) of the slice-441 ledger row (the one remaining piece
+of the DU-002 statistics restart-durability gap after slice 445 landed
+CREATE/DROP): `ALTER STATISTICS name RENAME TO`/`OWNER TO`/`SET SCHEMA` were
+applied to the live `catalog.InMemory.statisticsObjs` registry correctly
+(slice 441) but never WAL-logged, so a restart between the `ALTER` and the
+next checkpoint reverted the object to its as-created name/owner/schema even
+though the object itself now survived (slice 445). Landed by mirroring the
+`ALTER COLLATION` three-form precedent exactly (`RecordKindAlterCollationRename`/
+`...Owner`/`...SetSchema`, slices 441-443):
+
+- `internal/wal/statistics_ddl.go`: three new record kinds —
+  `RecordKindAlterStatisticsRename`/`RecordKindAlterStatisticsOwner`/
+  `RecordKindAlterStatisticsSetSchema` (97/98/99, the first free values
+  after `RecordKindDropStatistics`=96) + their Encode/Decode pairs. The
+  rename/set-schema payloads carry the (possibly schema-qualified) `name`
+  key `execAlterStatistics` already resolves via `RenameStatisticsObject`/
+  `SetStatisticsSchema` (unlike collation's separate `name`+`schema`
+  fields — statistics' in-memory mutators take one combined key, so the
+  WAL format follows that shape rather than introducing a new one).
+- `internal/executor/operators_ddl.go`'s `execAlterStatistics`: each of the
+  three `Action` cases (`"rename"`/`"owner"`/`"setschema"`) now appends the
+  matching WAL record after the in-memory mutation succeeds, guarded by
+  `o.ctx.WAL != nil` exactly like the CREATE/DROP call sites.
+- `catalog.InMemory` gains three discard-result recovery counterparts
+  (`RenameStatisticsObjectDuringRecovery`/`SetStatisticsOwnerDuringRecovery`/
+  `SetStatisticsSchemaDuringRecovery`), mirroring
+  `RenameCollationDuringRecovery`/`SetCollationOwnerDuringRecovery`/
+  `SetCollationSchemaDuringRecovery`.
+- `internal/initdb/statistics_ddl_recovery.go`: `statisticsRegistryRecovery`
+  gains the three new interface methods; `replayStatisticsDDLRecords` gains
+  a decode+apply case for each new record kind, run in WAL order after the
+  existing CREATE/DROP cases so a `CREATE` → `RENAME` → `OWNER` → `SET
+  SCHEMA` sequence replays to the object's final identity.
+- **Found and fixed in the same loop, not a separate slice**: `CREATE`/
+  `DROP STATISTICS` (kinds 95/96, landed loop #96) were missing from
+  `wal.ApplyRecord`'s physical-replay switch entirely — every other
+  logical-only DDL record kind (collation, publication/subscription,
+  conversion, column-defaults, role) has an explicit case in that switch
+  returning `(false, nil)` to opt out of physical redo (the recovery driver
+  in `internal/initdb` applies these directly instead), but statistics'
+  case was never added when 95/96 landed. This had no observed effect on
+  the primary's own crash-recovery gates, because `internal/initdb/open.go`
+  calls `replayStatisticsDDLRecords` directly and never routes through
+  `wal.ApplyRecord` for local startup replay — but `wal.ApplyRecord` **is**
+  the entry point `internal/wal/stream_replayer.go` uses for
+  standby/streaming-replication replay, where a 95/96/97/98/99 record would
+  have hit the switch's `default: return false, fmt.Errorf("unsupported
+  kind %d", ...)` case and aborted replication. Added one combined case
+  (mirroring the `RecordKindCreateCollation, RecordKindDropCollation, ...`
+  case immediately above it in `internal/wal/recovery.go`) covering all
+  five statistics kinds.
+- Tests: `internal/wal/statistics_ddl_test.go` gains encode/decode
+  round-trip + wrong-kind + truncated-payload tests for all three new
+  record kinds (`TestEncodeDecodeAlterStatisticsRenameRoundTrip`/
+  `...OwnerRoundTrip`/`...SetSchemaRoundTrip`/
+  `TestDecodeAlterStatisticsRejectsWrongKind`/
+  `TestDecodeAlterStatisticsRejectsTruncatedPayload`).
+  `internal/initdb/statistics_ddl_recovery_test.go` gains
+  `TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema`: a real
+  `Init`/`Open`/WAL.Append(create+rename+owner+set-schema)/`Close`/re-`Open`
+  round trip confirming the post-restart registry reflects the final
+  renamed/re-owned/moved identity, not the as-created one, and that the
+  original name no longer resolves.
+
+**Nothing deferred by this slice** — both resume points of the original
+slice-441 ledger row (statistics restart durability as a whole) are now
+closed; `ALTER STATISTICS ... SET STATISTICS n` (the sample-target form)
+remains intentionally in-memory-only, matching upstream: PG itself has no
+durable state here beyond the `pg_statistic_ext.stxstattarget` catalog
+column, which goopg has no on-disk heap for (same non-gap already noted for
+slice 317). Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+`internal/catalog`+`internal/executor`+`internal/initdb`+`internal/parser`
+suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
+pgbench TPC-B smoke PASS.

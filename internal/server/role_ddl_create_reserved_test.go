@@ -29,7 +29,7 @@ func TestCreateRoleRejectsReservedPgPrefix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.sql, func(t *testing.T) {
 			s := newTestRoleServer()
-			handled, err := s.tryHandleRoleDDL(tc.sql, "postgres")
+			handled, err := s.tryHandleRoleDDL(tc.sql, "postgres", nil)
 			if !handled {
 				t.Fatalf("%s: expected handled=true", tc.sql)
 			}
@@ -68,7 +68,7 @@ func TestRoleErrorDetailFieldsEmptyForNonReservedErrors(t *testing.T) {
 
 func TestCreateRoleAllowsNonReservedName(t *testing.T) {
 	s := newTestRoleServer()
-	handled, err := s.tryHandleRoleDDL("CREATE ROLE alice LOGIN", "postgres")
+	handled, err := s.tryHandleRoleDDL("CREATE ROLE alice LOGIN", "postgres", nil)
 	if !handled || err != nil {
 		t.Fatalf("CREATE ROLE alice: handled=%v err=%v", handled, err)
 	}

@@ -37,6 +37,32 @@ Update checks are disabled by `mu-plugins/disable-update-checks.php` because
 A failure rooted in the PG4WP rewriter rather than in goopg's SQL execution is
 recorded as a **PG4WP limitation**, not a goopg bug.
 
+**Second known non-goopg limitation** (found in M0120-0003, item WP-32):
+`wp db query "..."` does not go through WordPress's PHP `$wpdb`/PG4WP layer at
+all — WP-CLI shells out to the native `mysql` CLI client, connecting directly
+to `DB_HOST` (goopg's PostgreSQL wire-protocol listener). The `mysql` client's
+handshake fails immediately (`ERROR 2013 ... Lost connection ... reading
+initial communication packet`) because it expects a MySQL greeting packet, not
+a PostgreSQL one — confirmed via the goopg statement log showing the query
+never arrives at goopg at all. This affects **every** `wp db query` invocation
+(WP-32 and the read-only **WP-R7**), and is unfixable without goopg speaking a
+second, MySQL-compatible wire protocol (out of scope) or a PG4WP-side shim for
+WP-CLI's `db` command family (also out of scope). Classify as **harness/PG4WP
+limitation**, never as a goopg bug — see
+`wp/verification/results/20260704-073700/summary.md` for the full repro.
+
+**Third known non-goopg limitation** (found in M0120-0004, item WP-R8's `wp db
+size --tables` sub-step): the vendored PG4WP rewriter
+`rewriters/ShowTablesSQLRewriter.php` builds its query with a **single-quoted**
+PHP string literal (`'SELECT tablename FROM pg_tables WHERE schemaname =
+\'$schema\';'`), so the `$schema` PHP variable is never interpolated — goopg
+receives the literal text `$schema` as the filter value, correctly matches
+zero rows, and `db size --tables` prints a header with no table rows (exit 0,
+no visible error). goopg's execution of the query it actually received is
+correct; the defect is entirely upstream in PG4WP. Classify as **PG4WP
+limitation**, never as a goopg bug — see
+`wp/verification/results/20260704-075221/summary.md` for the full repro.
+
 ---
 
 ## A. Posts & pages (write)

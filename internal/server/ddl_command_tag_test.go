@@ -41,6 +41,31 @@ func TestDDLCommandTagMatchesPostgres(t *testing.T) {
 		{"drop user", `DROP USER my_user`, "DROP ROLE"},
 		{"drop group", `DROP GROUP my_group`, "DROP ROLE"},
 		{"drop text search parser", `DROP TEXT SEARCH PARSER my_parser`, "DROP TEXT SEARCH PARSER"},
+		// DU-002 slice 439: ALTER SEQUENCE RENAME TO/OWNER TO/SET SCHEMA reuse
+		// AlterTableStmt (a sequence is just a relation, mirroring PG's own
+		// RenameRelation/AlterTableOwner/AlterTableNamespace), which would
+		// otherwise tag as the generic "ALTER TABLE" via ddlTag's blanket
+		// case — TagOverride corrects it to match PG's CreateCommandTag,
+		// which tags by the statement's declared object type (OBJECT_SEQUENCE).
+		{"alter sequence rename to", `ALTER SEQUENCE my_seq RENAME TO my_seq2`, "ALTER SEQUENCE"},
+		{"alter sequence owner to", `ALTER SEQUENCE my_seq OWNER TO CURRENT_USER`, "ALTER SEQUENCE"},
+		{"alter sequence set schema", `ALTER SEQUENCE my_seq SET SCHEMA my_schema`, "ALTER SEQUENCE"},
+		// DU-002 slice 440: ALTER VIEW RENAME TO/OWNER TO/SET SCHEMA get the
+		// same AlterTableStmt-reuse + TagOverride treatment as ALTER SEQUENCE
+		// above (a view is just a relation too) — previously these fell into
+		// the blanket "schema/view/collation/..." compat-stub loop, which
+		// both mistagged AND silently discarded the change entirely.
+		{"alter view rename to", `ALTER VIEW my_view RENAME TO my_view2`, "ALTER VIEW"},
+		{"alter view owner to", `ALTER VIEW my_view OWNER TO CURRENT_USER`, "ALTER VIEW"},
+		{"alter view set schema", `ALTER VIEW my_view SET SCHEMA my_schema`, "ALTER VIEW"},
+		// DU-002 slice 443: ALTER INDEX ... RENAME TO and ALTER MATERIALIZED
+		// VIEW ... SET SCHEMA both reuse AlterTableStmt (an index/matview is
+		// just a relation too) but, unlike the slice 439/440 sequence/view
+		// sites above, were never given a TagOverride — they fell through to
+		// ddlTag's blanket "ALTER TABLE" default, exactly the mistagging gap
+		// the slice 439 deferral predicted for these two forms.
+		{"alter index rename to", `ALTER INDEX my_idx RENAME TO my_idx2`, "ALTER INDEX"},
+		{"alter materialized view set schema", `ALTER MATERIALIZED VIEW my_mv SET SCHEMA my_schema`, "ALTER MATERIALIZED VIEW"},
 	}
 
 	for _, tc := range cases {

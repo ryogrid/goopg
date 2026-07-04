@@ -95,6 +95,28 @@ func maybeForceGCAfterCommit() {
 // COPY is handled in dispatchCopyViaExecutor; this function returns
 // nil after delegating when the parsed statement is a COPY.
 func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, sql string, connTx *connTxState, prepStmts *preparedStatements) error {
+	resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
+		if sess == nil {
+			return "", false
+		}
+		_, eff, ok := sess.GetDisplay(name)
+		return eff, ok
+	})
+	// DROP DATABASE has real parser grammar (DropCompatStmt, a generic no-op
+	// DDL absorption added after M0054-0001's bypass below) that would
+	// otherwise shadow tryHandleDatabaseDDL's real catalog-backed DROP
+	// entirely: DropCompatStmt's "database" arm (internal/executor/
+	// operators_ddl.go execDropCompat) is a hardcoded pre-M0054-0001 stub
+	// that always reports "does not exist" regardless of catalog state, so
+	// parser.Parse succeeding for this statement must not be allowed to win.
+	// Checked here, before Parse, so it takes precedence; CREATE/ALTER
+	// DATABASE need no such pre-check because the parser has no grammar for
+	// them at all (parser.Parse always fails, hitting the bypass below).
+	if kind, _ := classifyDatabaseDDL(sql); kind == databaseDDLDrop {
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+			return err
+		}
+	}
 	// Parse uses the heap-backed tokenSlicePool (allocation-free in steady
 	// state). The M0107-0003 Phase C.3 mctx token-arena fast path was retired
 	// as fundamentally GC-unsafe — see docs/design/0107-0003d-token-pool-gc-safety.md
@@ -102,28 +124,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	stmts, err := parser.Parse(sql)
 	if err != nil {
 		// M0054-0001: CREATE DATABASE / DROP DATABASE are intercepted
-		// here (the parser doesn't recognise them yet) so we can
-		// (a) update the catalog so subsequent connections see the
-		// database in pg_database / can connect to it, and (b) emit a
-		// WAL record so the registration survives a crash. Other
-		// commands fall through to the wire-protocol no-op tag handler.
-		if handled, notice, herr := s.tryHandleDatabaseDDL(sql, connTx.DBName); handled {
-			if herr != nil {
-				return s.writeQueryError(w, sqlstate.SystemError, herr.Error())
-			}
-			if notice != "" {
-				_ = w.WriteNoticeResponse([]protocol.ErrorField{
-					{Code: protocol.FieldSeverity, Value: "NOTICE"},
-					{Code: protocol.FieldSeverityNonLocal, Value: "NOTICE"},
-					{Code: protocol.FieldSQLState, Value: "00000"},
-					{Code: protocol.FieldMessage, Value: notice},
-				})
-			}
-			tag := databaseDDLCommandTag(sql)
-			if err := w.WriteCommandComplete(tag); err != nil {
-				return err
-			}
-			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		// here (the parser doesn't recognise CREATE DATABASE / ALTER
+		// DATABASE) so we can (a) update the catalog so subsequent
+		// connections see the database in pg_database / can connect to
+		// it, and (b) emit a WAL record so the registration survives a
+		// crash. Other commands fall through to the wire-protocol no-op
+		// tag handler.
+		if handled, err := s.handleDatabaseDDLBypass(sql, connTx.DBName, resolveCurrentGUC, w); handled {
+			return err
 		}
 		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE
 		// (which the parser does not recognise, so the whole batch lands here)
@@ -133,7 +141,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// Peel the leading role statement off, handle it, then recurse on the
 		// remainder so every statement runs. M0118-0008.
 		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
-			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName); handled {
+			if handled, herr := s.tryHandleRoleDDL(first, connTx.DBName, resolveCurrentGUC); handled {
 				if herr != nil {
 					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 				}
@@ -150,7 +158,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
-		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName); handled {
+		if handled, herr := s.tryHandleRoleDDL(sql, connTx.DBName, resolveCurrentGUC); handled {
 			if herr != nil {
 				return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error(), roleErrorDetailFields(herr)...)
 			}
@@ -169,30 +177,35 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
-		if tag, ok := compatNoopCommandTag(sql); ok {
-			// Side-effect: register schema for CREATE SCHEMA statements.
-			if tag == "CREATE SCHEMA" && s.cfg.Catalog != nil {
-				norm := normalizeCompatSQL(sql)
-				if schemaName := schemaNameFromCreate(norm); schemaName != "" {
-					s.cfg.Catalog.RegisterSchema(schemaName)
-					// M0110-0003: persist so the schema survives a restart.
-					// This branch handles CREATE SCHEMA forms the parser
-					// rejects; the parsed CompatNoopStmt path emits the same
-					// record from execCompatNoop.
-					if s.cfg.WAL != nil {
-						if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
-							oid := im.SchemaOID(schemaName)
-							if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid)); werr != nil {
-								return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
-							}
-						}
-					}
+		if first, rest, tag, ok := splitLeadingCompatNoopDDL(sql); ok {
+			if tag == "CREATE SCHEMA" {
+				if werr := s.registerCompatNoopSchema(first); werr != nil {
+					return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
 				return err
 			}
-			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, rest, connTx, prepStmts)
+		}
+		// A multi-statement batch that isn't the parser-gap workaround case
+		// above must not have compatNoopCommandTag matched against its raw,
+		// unsplit text below — that would absorb the WHOLE batch (including
+		// a later, genuinely invalid statement) as a bare success instead of
+		// reporting the real syntax error, silently executing nothing.
+		// M0119-0004-ACLHEAP loop #87 follow-up.
+		if !isMultiStatementSQL(sql) {
+			if tag, ok := compatNoopCommandTag(sql); ok {
+				if tag == "CREATE SCHEMA" {
+					if werr := s.registerCompatNoopSchema(sql); werr != nil {
+						return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
+					}
+				}
+				if err := w.WriteCommandComplete(tag); err != nil {
+					return err
+				}
+				return w.WriteReadyForQuery(protocol.TxStatusIdle)
+			}
 		}
 		msg, extra := syntaxErrorMsg(err)
 		return s.writeQueryError(w, sqlstate.SyntaxError, msg, extra...)
@@ -229,8 +242,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	backendID := lockmgr.BackendID(s.nextBackendID.Add(1))
 	commit := false
 	var advisoryReleaseTarget any
+	// ectx is assigned once the executor.Context is built below; predeclared
+	// here so the abort branch of this defer can reach it. A later statement's
+	// error in this same multi-statement message must undo any earlier CREATE
+	// TABLE/INDEX in the batch, not just the mvcc heap writes: RegisterTable
+	// is a non-transactional in-memory catalog mutation, so without this the
+	// table registration survives an aborted implicit batch while its
+	// pg_class/pg_attribute heap rows (written under the rolled-back tx) do
+	// not, permanently desyncing pg_dump-visible catalog state from the live
+	// catalog (M0110-0001 DU-002 slice 444 deferral, 2026-07-04).
+	var ectx *executor.Context
 	defer func() {
 		if autoCommit && !commit {
+			if ectx != nil {
+				if bs, ok := ectx.Session.(*executor.BasicSession); ok {
+					executor.ProcessRollbackUndos(ectx, bs)
+				}
+			}
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		}
@@ -255,7 +283,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	stmtCtx := mctx.Acquire(sessCtxForStmt, mctx.KindStmt)
 	defer stmtCtx.Release()
 
-	ectx := executor.NewContext()
+	ectx = executor.NewContext()
 	ectx.Mctx = stmtCtx
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
@@ -269,6 +297,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	if connTx != nil {
 		if sess := connTx.Session(); sess != nil {
 			ectx.Session = sess
+		} else {
+			// Autocommit implicit batch (no explicit BEGIN): still give
+			// execCreateTable/execCreateIndex a *BasicSession to record
+			// against (RecordDDLCreate asserts on ctx.Session, unconditional
+			// on explicit-transaction status) so the abort defer above can
+			// undo a half-applied CREATE via ProcessRollbackUndos when a
+			// LATER statement in this same message fails. Message-scoped
+			// only — never shared with connTx, so it carries nothing across
+			// Query messages. InExplicitTransaction() stays false on it, so
+			// every other Session-gated code path (enum/composite pending
+			// tracking, TRUNCATE/DROP-in-savepoint snapshotting) is unaffected.
+			ectx.Session = executor.NewBasicSession()
 		}
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.
@@ -317,11 +357,23 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			_, eff, ok := sess.Get(name)
 			return eff, ok
 		}
+		ectx.GetSettingDisplay = func(name string) (string, bool) {
+			_, eff, ok := sess.GetDisplay(name)
+			return eff, ok
+		}
 		ectx.SetSetting = func(name, value string, isLocal bool) error {
 			return sess.Set(name, value, isLocal)
 		}
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
+		ectx.AllSettingsDisplay = func() []executor.SettingValue {
+			all := sess.AllDisplay()
 			out := make([]executor.SettingValue, 0, len(all))
 			for _, kv := range all {
 				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
@@ -1271,7 +1323,7 @@ func compatNoopCommandTag(sql string) (string, bool) {
 	case strings.HasPrefix(norm, "create user "), strings.HasPrefix(norm, "create role "):
 		return "CREATE ROLE", true
 	case strings.HasPrefix(norm, "create schema "), norm == "create schema":
-		return "CREATE SCHEMA", true // name extraction done separately in dispatchSimpleQueryViaExecutor
+		return "CREATE SCHEMA", true // name extraction done separately in registerCompatNoopSchema
 	case strings.HasPrefix(norm, "grant "), norm == "grant":
 		return "GRANT", true
 	case strings.HasPrefix(norm, "revoke "), norm == "revoke":
@@ -1292,6 +1344,89 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "SECURITY LABEL", true
 	}
 	return "", false
+}
+
+// isMultiStatementSQL reports whether sql carries a real second statement
+// after its first top-level ';' (a trailing terminator with nothing but
+// whitespace after it does not count). Used to gate the compatNoopCommandTag
+// absorption below: matching a batch's leading prefix is only safe to do
+// against a single statement, never against the raw text of a multi-
+// statement batch. M0119-0004-ACLHEAP loop #87 follow-up.
+func isMultiStatementSQL(sql string) bool {
+	end := firstTopLevelSemicolon(sql)
+	return end >= 0 && strings.TrimSpace(sql[end+1:]) != ""
+}
+
+// splitLeadingCompatNoopDDL splits a multi-statement batch whose FIRST
+// statement matches compatNoopCommandTag AND whose grammar is entirely
+// unimplemented (parser.Parse fails even in isolation — e.g. CREATE SCHEMA,
+// CREATE/ALTER/DROP DATABASE; CREATE/ALTER/DROP ROLE is peeled off earlier by
+// splitLeadingRoleDDL). Mirrors splitLeadingRoleDDL's split-first-handle-
+// recurse-rest shape (M0118-0008) so trailing statements in the batch are not
+// silently dropped.
+//
+// GRANT/REVOKE/COMMENT ON/SECURITY LABEL are deliberately excluded from this
+// split: their grammar exists and a lone instance of any of them always
+// parses successfully (verified M0119-0004-ACLHEAP loop #87), so if parsing
+// the FULL batch still fails, the failure must come from a LATER statement
+// being genuinely invalid SQL. In that case ok is false and the caller must
+// fall through to the real syntax error for the whole batch rather than
+// absorb it — the multi-statement-masking bug this function closes.
+func splitLeadingCompatNoopDDL(sql string) (first, rest, tag string, ok bool) {
+	end := firstTopLevelSemicolon(sql)
+	if end < 0 {
+		return "", "", "", false
+	}
+	first = sql[:end]
+	rest = strings.TrimSpace(sql[end+1:])
+	if rest == "" {
+		return "", "", "", false
+	}
+	tag, matched := compatNoopCommandTag(first)
+	if !matched {
+		return "", "", "", false
+	}
+	if _, err := parser.Parse(first); err == nil {
+		// The first statement has real grammar and parses fine standalone
+		// (e.g. GRANT/REVOKE/COMMENT ON/SECURITY LABEL) — the batch's
+		// overall parse failure comes from a later statement, so this is
+		// not a parser-gap workaround case.
+		return "", "", "", false
+	}
+	return first, rest, tag, true
+}
+
+// registerCompatNoopSchema applies CREATE SCHEMA's catalog+WAL side effect
+// for the compatNoopCommandTag absorption path (a CREATE SCHEMA form the
+// parser doesn't recognise, e.g. lacking IF NOT EXISTS support). Shared by
+// both wire protocols — dispatchSimpleQueryViaExecutor and
+// executeExtendedQueryViaExecutor's tryCompatNoopExtended — so the schema
+// registers and persists identically regardless of which protocol the
+// client used. M0119-0004-ACLHEAP follow-up (loop #86, item (3) of the
+// loop #84 row).
+func (s *Server) registerCompatNoopSchema(sql string) error {
+	if s.cfg.Catalog == nil {
+		return nil
+	}
+	norm := normalizeCompatSQL(sql)
+	schemaName := schemaNameFromCreate(norm)
+	if schemaName == "" {
+		return nil
+	}
+	s.cfg.Catalog.RegisterSchema(schemaName)
+	// M0110-0003: persist so the schema survives a restart. This branch
+	// handles CREATE SCHEMA forms the parser rejects; the parsed
+	// CompatNoopStmt path emits the same record from execCompatNoop.
+	if s.cfg.WAL == nil {
+		return nil
+	}
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	oid := im.SchemaOID(schemaName)
+	_, _, err := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid))
+	return err
 }
 
 // schemaNameFromCreate extracts the schema name from a normalised CREATE SCHEMA statement.
@@ -2249,7 +2384,7 @@ func transactionTag(v planner.TransactionVerb) string {
 }
 
 func ddlTag(stmt parser.Stmt) string {
-	switch stmt.(type) {
+	switch v := stmt.(type) {
 	case *parser.CreateTableStmt:
 		return "CREATE TABLE"
 	case *parser.CreateIndexStmt:
@@ -2265,6 +2400,9 @@ func ddlTag(stmt parser.Stmt) string {
 	case *parser.TruncateStmt:
 		return "TRUNCATE TABLE"
 	case *parser.AlterTableStmt:
+		if v.TagOverride != "" {
+			return v.TagOverride
+		}
 		return "ALTER TABLE"
 	case *parser.CreateTypeStmt:
 		return "CREATE TYPE"

@@ -124,6 +124,97 @@ func TestBuildCanonicalHeapInsertPayload(t *testing.T) {
 	}
 }
 
+// TestBuildCanonicalHeapPrunePayload verifies the byte layout of a canonical
+// XLOG_HEAP2_PRUNE_* payload — RM_HEAP2_ID rmgr (distinct from RM_HEAP_ID),
+// the onAccess/VACUUM info-byte + reason-byte selection, and that no
+// block-data sub-records are encoded (FPI-only, as PG's
+// heap_xlog_prune_freeze skips them entirely on a restored full-page image).
+func TestBuildCanonicalHeapPrunePayload(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 16400, Fork: storage.MainFork}
+	blk := storage.BlockNumber(3)
+	page := make(storage.Page, storage.BlockSize)
+	for i := range page {
+		page[i] = byte(i % 251)
+	}
+	xid := uint32(777)
+
+	cases := []struct {
+		name       string
+		onAccess   bool
+		wantInfo   uint8
+		wantReason uint8
+	}{
+		{"on-access", true, canonicalInfoHeap2PruneOnAccess, pruneReasonOnAccess},
+		{"vacuum-scan", false, canonicalInfoHeap2PruneVacuumScan, pruneReasonVacuumScan},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := BuildCanonicalHeapPrunePayload(rel, blk, page, xid, tc.onAccess)
+
+			if payload[0] != RecordKindCanonical {
+				t.Fatalf("payload[0] = 0x%02x, want RecordKindCanonical", payload[0])
+			}
+			if payload[1] != canonicalRmgrHeap2 {
+				t.Fatalf("payload[1] (rmgr) = %d, want %d (RmgrHeap2)", payload[1], canonicalRmgrHeap2)
+			}
+			if payload[2] != tc.wantInfo {
+				t.Fatalf("payload[2] (info) = 0x%02x, want 0x%02x", payload[2], tc.wantInfo)
+			}
+			gotXID := binary.LittleEndian.Uint32(payload[3:7])
+			if gotXID != xid {
+				t.Fatalf("payload[3:7] (xid) = %d, want %d", gotXID, xid)
+			}
+
+			// Total: 7 (envelope) + 25 (block ref) + 2 (main-data hdr) + 8192 (FPI) + 2 (main data content) = 8228.
+			const wantLen = canonicalHeaderSize + 25 + 2 + storage.BlockSize + 2
+			if len(payload) != wantLen {
+				t.Fatalf("len(payload) = %d, want %d", len(payload), wantLen)
+			}
+
+			body := payload[canonicalHeaderSize:]
+			// Block reference header: block data_len must be 0 (no sub-records).
+			dataLen := binary.LittleEndian.Uint16(body[2:4])
+			if dataLen != 0 {
+				t.Errorf("data_len = %d, want 0 (FPI-only, no block-data sub-records)", dataLen)
+			}
+			bn := binary.LittleEndian.Uint32(body[21:25])
+			if bn != uint32(blk) {
+				t.Errorf("blockNum = %d, want %d", bn, blk)
+			}
+
+			// FPI bytes.
+			fpi := body[27 : 27+storage.BlockSize]
+			for i, b := range fpi {
+				if b != page[i] {
+					t.Fatalf("FPI mismatch at byte %d: got 0x%02x, want 0x%02x", i, b, page[i])
+				}
+			}
+
+			// Main data: xl_heap_prune{reason, flags=0}.
+			mdContent := body[27+storage.BlockSize:]
+			if len(mdContent) != 2 {
+				t.Fatalf("main data content len = %d, want 2", len(mdContent))
+			}
+			if mdContent[0] != tc.wantReason {
+				t.Errorf("main data reason = %d, want %d", mdContent[0], tc.wantReason)
+			}
+			if mdContent[1] != 0 {
+				t.Errorf("main data flags = 0x%02x, want 0", mdContent[1])
+			}
+		})
+	}
+}
+
+// TestPgCanonicalHeapPrune_NilLogFn verifies the nil-hook no-op guard shared
+// by every PgCanonicalHeap* constructor.
+func TestPgCanonicalHeapPrune_NilLogFn(t *testing.T) {
+	rel := storage.RelFileNode{DBOid: 5, RelOid: 16400}
+	page := make(storage.Page, storage.BlockSize)
+	if _, err := PgCanonicalHeapPrune(rel, 0, page, 42, true, nil); err != nil {
+		t.Fatalf("unexpected error with nil logFn: %v", err)
+	}
+}
+
 // TestBuildCanonicalBtreeInsertPayload verifies the XLOG_BTREE_INSERT_LEAF
 // payload layout.
 func TestBuildCanonicalBtreeInsertPayload(t *testing.T) {

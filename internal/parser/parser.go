@@ -1174,15 +1174,35 @@ identLedStatement:
 			}
 			return &CompatNoopStmt{pos: t.Pos, Tag: "COMMENT"}, nil
 		case "security":
-			// SECURITY LABEL … — parse as a no-op.
-			p.advance()
+			// SECURITY LABEL [FOR provider] ON <object> IS 'text'|NULL. goopg
+			// loads no security-label providers (no C extension mechanism to
+			// load one), so per PG's own ExecSecLabelStmt (seclabel.c) — which
+			// checks the provider list BEFORE resolving the target object —
+			// this must always raise "security label provider ... is not
+			// loaded" (FOR given) or "no security label providers have been
+			// loaded" (bare form) rather than silently succeeding. The object
+			// clause is parsed-and-discarded: real PG never reaches it either.
+			// DU-002 slice 438.
+			p.advance() // consume SECURITY
+			if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "label") {
+				p.advance() // consume LABEL
+			}
+			provider := ""
+			if p.acceptKeyword(KwFor) {
+				if pt := p.cur(); pt.Kind == TokenStringLit {
+					provider = pt.Value
+					p.advance()
+				} else if id, err := p.parseIdent(); err == nil {
+					provider = identText(id)
+				}
+			}
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL"}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "SECURITY LABEL", SecurityLabelProvider: provider}, nil
 		case "lock":
 			// LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT].
 			// M0097: parse into LockTableStmt so the executor can track locks in pg_locks.
@@ -3056,6 +3076,23 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("access"):
+		// COMMENT ON ACCESS METHOD <name> IS '...'. Access methods live in pg_am
+		// (classoid 2601); pg_dump's dumpAccessMethod re-emits `COMMENT ON ACCESS
+		// METHOD <name> IS '...'` (dumpComment(fout, "ACCESS METHOD", qamname, ...)
+		// — pg_dump.c). "ACCESS" is unreserved and unregistered as a keyword
+		// (matched via the ident path, same as CREATE ACCESS METHOD); an access
+		// method is a top-level object (no schema), so parse a bare name.
+		// DU-002 slice 434.
+		if !p.acceptIdentKeyword("method") {
+			return nil, true, p.errAtCur("expected METHOD after ACCESS in COMMENT ON")
+		}
+		cs.ObjKind = "access method"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	case p.acceptIdentKeyword("server"):
 		// COMMENT ON SERVER <name> IS '...'. Foreign servers live in
 		// pg_foreign_server (classoid 1417); pg_dump's dumpForeignServer re-emits
@@ -3068,14 +3105,28 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 		}
 		cs.ObjName = name
 	case p.acceptKeyword(KwForeign):
-		// COMMENT ON FOREIGN DATA WRAPPER <name> IS '...'. Foreign-data wrappers
-		// live in pg_foreign_data_wrapper (classoid 2328); pg_dump's
-		// dumpForeignDataWrapper re-emits `COMMENT ON FOREIGN DATA WRAPPER <name>
-		// IS '...'`. FOREIGN is a reserved keyword (KwForeign); DATA and WRAPPER
-		// are unreserved ident-keywords. An FDW is a top-level object (no schema),
-		// so parse a bare name. DU-002 slice 387.
+		// COMMENT ON FOREIGN TABLE [schema.]name IS '...' or COMMENT ON FOREIGN
+		// DATA WRAPPER <name> IS '...'. Foreign tables are pg_class relations
+		// (relkind='f') sharing goopg's ordinary table registry (CREATE FOREIGN
+		// TABLE, DU-002 slice 417/418); pg_dump's dumpTableSchema re-emits
+		// `COMMENT ON FOREIGN TABLE <name> IS '...'` for a commented foreign
+		// table, keyed on the same classoid=pg_class (1259) lookup as COMMENT
+		// ON TABLE. Without this branch, "FOREIGN" only recognized "FOREIGN
+		// DATA WRAPPER" and any other continuation (including TABLE) was a
+		// hard parse error. FOREIGN is a reserved keyword (KwForeign); TABLE,
+		// DATA, and WRAPPER disambiguate which object kind follows. DU-002
+		// slice 435 (TABLE arm); slice 387 (DATA WRAPPER arm, pre-existing).
+		if p.acceptKeyword(KwTable) {
+			cs.ObjKind = "foreign table"
+			name, err := p.parseObjectName()
+			if err != nil {
+				return nil, true, err
+			}
+			cs.ObjName = name
+			break
+		}
 		if !p.acceptIdentKeyword("data") || !p.acceptIdentKeyword("wrapper") {
-			return nil, true, p.errAtCur("expected DATA WRAPPER after FOREIGN in COMMENT ON")
+			return nil, true, p.errAtCur("expected TABLE or DATA WRAPPER after FOREIGN in COMMENT ON")
 		}
 		cs.ObjKind = "foreign data wrapper"
 		name, err := p.parseObjectName()

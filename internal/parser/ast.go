@@ -1146,6 +1146,11 @@ type ColumnDef struct {
 	// Threaded into catalog.ForeignKey so pg_constraint.confmatchtype='f' and
 	// pg_get_constraintdef re-emit ` MATCH FULL`. DU-002 slice 309.
 	FKMatchFull bool
+	// FKNotValid/FKNotEnforced mirror AlterTableAction's NotValid/FKNotEnforced
+	// for an inline `REFERENCES … NOT VALID` / `NOT ENFORCED` trailer at
+	// CREATE TABLE time (PG18 for NOT ENFORCED). DU-002 slice 432.
+	FKNotValid    bool
+	FKNotEnforced bool
 
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
@@ -1164,6 +1169,12 @@ type ColumnDef struct {
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool
+	// CheckNotEnforced is true when the inline CHECK constraint carries a
+	// `NOT ENFORCED` trailer (PG18 conenforced='f'). pg_get_constraintdef
+	// appends a trailing ` NOT ENFORCED` for such a constraint (taking
+	// precedence over NOT VALID in the rendered text — PG considers validated
+	// status irrelevant once a constraint isn't enforced). DU-002 slice 430.
+	CheckNotEnforced bool
 	// Compression is the per-column TOAST compression method from an inline
 	// `COMPRESSION <method>` clause (`col text COMPRESSION lz4`) — "pglz" or
 	// "lz4". Empty when no method was written. Threaded onto catalog.Column.
@@ -1244,6 +1255,12 @@ type TableForeignKeyDef struct {
 	// MatchFull is true for `… MATCH FULL`; MATCH SIMPLE (default) leaves it
 	// false. Threaded into catalog.ForeignKey for confmatchtype round-trip. DU-002 slice 309.
 	MatchFull bool
+	// NotValid/NotEnforced mirror AlterTableAction's NotValid/FKNotEnforced for
+	// a table-level `FOREIGN KEY (...) REFERENCES ... NOT VALID` / `NOT
+	// ENFORCED` trailer at CREATE TABLE time (PG18 for NOT ENFORCED). DU-002
+	// slice 432.
+	NotValid    bool
+	NotEnforced bool
 }
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
@@ -1304,6 +1321,10 @@ type CreateTableStmt struct {
 	// `CHECK (...) NO INHERIT` re-emits its suffix through pg_get_constraintdef
 	// on dump. DU-002 slice 128.
 	TableCheckNoInherit []bool
+	// TableCheckNotEnforced is parallel to TableChecks: entry i is true when
+	// the anonymous table-level CHECK at TableChecks[i] carries a
+	// `NOT ENFORCED` trailer (PG18 conenforced='f'). DU-002 slice 430.
+	TableCheckNotEnforced []bool
 	// TableNamedChecks holds explicitly named table-level CHECK constraints,
 	// e.g. `CONSTRAINT check_a CHECK (a > 0)`. M0097-0023.
 	TableNamedChecks []PartitionCheckConstraint
@@ -1451,6 +1472,11 @@ type PartitionCheckConstraint struct {
 	// connoinherit='t'); the dumped constraintdef must re-emit the ` NO INHERIT`
 	// suffix and pg_constraint must report connoinherit. DU-002 slice 129.
 	NoInherit bool
+	// NotEnforced is true for `CONSTRAINT c CHECK (...) NOT ENFORCED` (PG18
+	// conenforced='f'); pg_get_constraintdef re-emits the trailing
+	// ` NOT ENFORCED` and pg_constraint must report conenforced=false.
+	// DU-002 slice 430.
+	NotEnforced bool
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
@@ -1636,12 +1662,13 @@ func (s *CreateCollationStmt) stmtNode() {}
 // can't detect a version, e.g. non-glibc libc) and performs no catalog write.
 // M0119-0004 (DU-002, loop #50 ledger follow-up).
 type AlterCollationStmt struct {
-	pos      int
-	Name     ObjectName
-	IfExists bool
-	Action   string // "rename" | "owner" | "refresh" | "" (unmodelled, no-op)
-	NewName  string // for Action == "rename"
-	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	pos       int
+	Name      ObjectName
+	IfExists  bool
+	Action    string // "rename" | "owner" | "setschema" | "refresh" | "" (unmodelled, no-op)
+	NewName   string // for Action == "rename"
+	NewOwner  string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	NewSchema string // for Action == "setschema"
 }
 
 func (s *AlterCollationStmt) Pos() int  { return s.pos }
@@ -1990,6 +2017,13 @@ type CompatNoopStmt struct {
 	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
 	TableName ObjectName // optional: table name for rule compat registry
 	RuleKind  string     // optional: rule kind for COPY DML error messages (M0097-0140)
+	// SecurityLabelProvider is set (possibly to "") for a `SECURITY LABEL ...`
+	// statement (Tag == "SECURITY LABEL"); "" means no `FOR provider` clause was
+	// given. goopg loads no security-label providers at all, so the executor
+	// always raises PG's own ExecSecLabelStmt error (seclabel.c) for this Tag —
+	// the object clause is parsed-and-discarded since real PG checks the
+	// provider list before ever resolving the target object. DU-002 slice 438.
+	SecurityLabelProvider string
 	// DatabaseACL is set for a GRANT/REVOKE … ON DATABASE … statement. Such an
 	// ACL change takes no heavyweight lock in PostgreSQL — its lock is the
 	// pg_database tuple's xmax — so the executor records the writer XID
@@ -2350,13 +2384,12 @@ type CreateStatisticsStmt struct {
 func (s *CreateStatisticsStmt) Pos() int  { return s.pos }
 func (s *CreateStatisticsStmt) stmtNode() {}
 
-// AlterStatisticsStmt represents `ALTER STATISTICS name SET STATISTICS n`. The
-// statistics target governs the sample size used for the extended-statistics
-// object; PG stores it in pg_statistic_ext.stxstattarget. Only the SET
-// STATISTICS form is modelled — other ALTER STATISTICS forms (RENAME / OWNER TO
-// / SET SCHEMA) parse to this node with HasTarget=false and are no-ops. The
-// value round-trips through pg_dump (dumpStatisticsExt emits the ALTER whenever
-// stxstattarget >= 0). DU-002 slice 317.
+// AlterStatisticsStmt represents `ALTER STATISTICS name SET STATISTICS n` and
+// the RENAME TO / OWNER TO / SET SCHEMA forms. The statistics target governs
+// the sample size used for the extended-statistics object; PG stores it in
+// pg_statistic_ext.stxstattarget. The value round-trips through pg_dump
+// (dumpStatisticsExt emits the ALTER whenever stxstattarget >= 0). DU-002
+// slice 317; RENAME/OWNER/SET SCHEMA added DU-002 slice 441.
 type AlterStatisticsStmt struct {
 	pos      int
 	Name     ObjectName // statistics object name (possibly schema-qualified)
@@ -2365,9 +2398,16 @@ type AlterStatisticsStmt struct {
 	// object to the default (PG stores stxstattarget=NULL). Only meaningful when
 	// HasTarget is set.
 	Target int
-	// HasTarget reports the statement carried a SET STATISTICS clause (vs an
-	// unmodelled ALTER STATISTICS form parsed as a no-op).
+	// HasTarget reports the statement carried a SET STATISTICS clause (vs
+	// Action carrying a RENAME/OWNER/SET SCHEMA form instead).
 	HasTarget bool
+	// Action selects a RENAME/OWNER/SET SCHEMA form: "rename" | "owner" |
+	// "setschema" | "" (SET STATISTICS, gated by HasTarget, or an unmodelled
+	// form). DU-002 slice 441.
+	Action    string
+	NewName   string // for Action == "rename"
+	NewOwner  string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+	NewSchema string // for Action == "setschema"
 }
 
 func (s *AlterStatisticsStmt) Pos() int  { return s.pos }
@@ -2742,6 +2782,18 @@ const (
 	// parsed verb list. Only meaningful on a foreign table — the executor
 	// rejects a plain table. DU-002 slice 420.
 	AlterTableSetForeignOptions
+	// AlterTableAlterConstraint — `ALTER CONSTRAINT name
+	// ConstraintAttributeSpec` (`[NOT] DEFERRABLE [INITIALLY DEFERRED |
+	// INITIALLY IMMEDIATE]` and/or `[NOT] ENFORCED`, in either order).
+	// Mirrors PG's AT_AlterConstraint (tablecmds.c ATExecAlterConstraint,
+	// PG18 added the ENFORCED half): flips an EXISTING constraint's
+	// condeferrable/condeferred and/or conenforced, rather than declaring a
+	// new one. Real PG restricts this to FOREIGN KEY constraints
+	// (tablecmds.c ~12249/12254, ERRCODE_WRONG_OBJECT_TYPE 42809 for any
+	// other constraint kind) — the executor enforces the same restriction.
+	// ConstraintName holds the target constraint; AlterConstraint* fields
+	// carry the parsed attributes. DU-002 slice 433.
+	AlterTableAlterConstraint
 )
 
 // FDWOptionVerb tags one entry of an `ALTER FOREIGN TABLE ... OPTIONS (...)`
@@ -2788,6 +2840,11 @@ type AlterTableAction struct {
 	OnDeleteSetCols []string
 	NotValid        bool // true if `NOT VALID` (skip validation of existing rows)
 	MatchFull       bool // true if `MATCH FULL`; MATCH SIMPLE (default) leaves it false. DU-002 slice 309.
+	// FKNotEnforced is true for `ADD CONSTRAINT ... FOREIGN KEY (...)
+	// REFERENCES ... NOT ENFORCED` (PG18 conenforced='f'); mirrors
+	// CheckNotEnforced for the FK constraint form — pg_get_constraintdef gives
+	// it precedence over NOT VALID in the rendered text. DU-002 slice 431.
+	FKNotEnforced bool
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.
@@ -2809,6 +2866,11 @@ type AlterTableAction struct {
 
 	// CheckExpr is the raw SQL expression for AlterTableAddCheck.
 	CheckExpr string
+	// CheckNotEnforced is true for `ADD CONSTRAINT ... CHECK (...) NOT ENFORCED`
+	// (PG18 conenforced='f'); pg_get_constraintdef re-emits the trailing
+	// ` NOT ENFORCED` and takes precedence over NOT VALID in the rendered
+	// text. DU-002 slice 430.
+	CheckNotEnforced bool
 
 	// NewType is the target column type for AlterTableAlterColumnType.
 	// M0097-0022.
@@ -2874,6 +2936,20 @@ type AlterTableAction struct {
 	// AlterTableSetForeignOptions (`ALTER FOREIGN TABLE ... OPTIONS (...)`,
 	// table-level, ColumnName unused). DU-002 slice 419/420.
 	FDWOptionChanges []FDWOptionChange
+
+	// AlterConstraint* fields are populated for AlterTableAlterConstraint
+	// (`ALTER CONSTRAINT name ...`); ConstraintName holds the target
+	// constraint. Each Has* flag records whether that attribute class was
+	// actually named in the trailer (mirroring ATAlterConstraint's own
+	// alterDeferrability/alterEnforceability bits) so the executor only
+	// touches the attribute(s) the statement mentioned, leaving the rest of
+	// the constraint's state untouched — `ALTER CONSTRAINT c NOT ENFORCED`
+	// alone must not also reset deferrability. DU-002 slice 433.
+	AlterConstraintDeferrable        bool
+	AlterConstraintInitiallyDeferred bool
+	AlterConstraintHasDeferrability  bool
+	AlterConstraintEnforced          bool
+	AlterConstraintHasEnforceability bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
@@ -2906,6 +2982,15 @@ type AlterTableStmt struct {
 	// whether a SET ROLE session owns the relation. M0118-0008 (vacuum-conflict /
 	// cluster-conflict).
 	OwnerTo string
+	// TagOverride overrides the default "ALTER TABLE" CommandComplete tag
+	// (dispatch.go's ddlTag) when this AlterTableStmt was built by a
+	// different relkind's grammar reusing the same generic executor path
+	// (e.g. ALTER SEQUENCE ... RENAME TO/OWNER TO/SET SCHEMA — a sequence is
+	// just a relation, so real PostgreSQL's RenameRelation/AlterTableOwner/
+	// AlterTableNamespace back it identically, but CreateCommandTag still
+	// tags by the statement's declared object type). Empty means "ALTER
+	// TABLE". DU-002 slice 439.
+	TagOverride string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }

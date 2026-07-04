@@ -661,6 +661,52 @@ func TestParseAlterStatisticsSetStatistics(t *testing.T) {
 	}
 }
 
+// TestParseAlterStatisticsRenameOwnerSetSchema pins parsing of the
+// RENAME TO / OWNER TO / SET SCHEMA forms of ALTER STATISTICS into an
+// AlterStatisticsStmt's Action/NewName/NewOwner/NewSchema fields — previously
+// these parsed to a fully unmodelled no-op (HasTarget=false, no Action),
+// silently discarding the mutation. DU-002 slice 441.
+func TestParseAlterStatisticsRenameOwnerSetSchema(t *testing.T) {
+	for _, tc := range []struct {
+		sql        string
+		wantAction string
+		wantValue  string
+	}{
+		{"ALTER STATISTICS s RENAME TO s2", "rename", "s2"},
+		{"ALTER STATISTICS s OWNER TO alice", "owner", "alice"},
+		{"ALTER STATISTICS s OWNER TO CURRENT_USER", "owner", "current_user"},
+		{"ALTER STATISTICS s SET SCHEMA myschema", "setschema", "myschema"},
+		{"ALTER STATISTICS IF EXISTS s SET SCHEMA myschema", "setschema", "myschema"},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		as, ok := stmts[0].(*AlterStatisticsStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if as.Action != tc.wantAction {
+			t.Errorf("Parse(%q): Action=%q want %q", tc.sql, as.Action, tc.wantAction)
+		}
+		var got string
+		switch tc.wantAction {
+		case "rename":
+			got = as.NewName
+		case "owner":
+			got = as.NewOwner
+		case "setschema":
+			got = as.NewSchema
+		}
+		if got != tc.wantValue {
+			t.Errorf("Parse(%q): got %q want %q", tc.sql, got, tc.wantValue)
+		}
+		if as.HasTarget {
+			t.Errorf("Parse(%q): HasTarget=true, want false for a RENAME/OWNER/SET SCHEMA form", tc.sql)
+		}
+	}
+}
+
 // TestParseAlterTableSetColumnOptions verifies the per-column attribute-option
 // list (`ALTER COLUMN c SET (opt=value, …)`) is captured and normalized to PG's
 // stored `name=value` form for pg_attribute.attoptions round-trip. DU-002 slice 185.

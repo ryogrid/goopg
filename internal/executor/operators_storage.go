@@ -3229,6 +3229,11 @@ func tryApplyHOTUpdate(
 				// Emit WAL for the prune BEFORE the HOT-insert WAL so replay
 				// restores space first.
 				if pderr := markHeapPruneOptDirty(ctx.Pool, s, rel, blk, result); pderr == nil {
+					if cerr := emitCanonicalHeapPruneLocked(ctx, s, rel, blk, uint32(effectiveWriterXID(ctx)), true); cerr != nil {
+						s.Unlock()
+						ctx.Pool.Unpin(s)
+						return false, cerr
+					}
 					newSlot, addErr = storage.PageAddHeapTuple(s.Page(), tup)
 				}
 			}
@@ -3300,6 +3305,9 @@ func tryApplyHOTUpdate(
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
+	if derr == nil {
+		derr = emitCanonicalHeapHotUpdate(ctx, rel, blk, newSlot)
+	}
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
 		newItemPtr := storage.ItemPointer{Block: blk, Offset: newSlot}
 		oldItemPtr := storage.ItemPointer{Block: blk, Offset: oldSlot}
@@ -7883,6 +7891,64 @@ func emitCanonicalHeapInsert(ctx *Context, rel storage.RelFileNode, ptr storage.
 	}
 	slot.Unlock()
 	ctx.Pool.Unpin(slot)
+	return emitErr
+}
+
+// emitCanonicalHeapHotUpdate emits a PG-canonical XLOG_HEAP_INPLACE record
+// with a full-page image for the page at (rel, blk), after a HOT update has
+// stamped the old tuple's xmax and inserted the new tuple in place on the
+// same page (tryApplyHOTUpdate, after markHeapHotUpdateDirty). Only called
+// when ctx.LogCanonical is non-nil. A vanilla PG18 standby (or
+// pg_waldump --save-fullpage) restores the whole page from this FPI rather
+// than re-deriving the HOT chain link — mirrors PgCanonicalHeapInplace's use
+// for the datfrozenxid in-place update (M0117-0008 Part B).
+func emitCanonicalHeapHotUpdate(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, newSlot uint16) error {
+	if ctx.LogCanonical == nil || ctx.Pool == nil {
+		return nil
+	}
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+	if err != nil {
+		return fmt.Errorf("canonical WAL pin hot update: %w", err)
+	}
+	page := make(storage.Page, storage.BlockSize)
+	s.Lock()
+	copy(page, s.Page())
+	endLSN, emitErr := catalog.PgCanonicalHeapInplace(rel, blk, page, newSlot, uint32(ctx.Tx.XID), ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
+		ctx.Pool.MarkDirty(s)
+	}
+	s.Unlock()
+	ctx.Pool.Unpin(s)
+	return emitErr
+}
+
+// emitCanonicalHeapPruneLocked emits a PG-canonical XLOG_HEAP2_PRUNE_* record
+// with a full-page image for the page held by the already-pinned-and-locked
+// slot s, capturing its CURRENT (post-prune) contents. Unlike the sibling
+// emitCanonicalHeap* helpers, this one does NOT re-Pin/Lock: it is called
+// from inside tryApplyHOTUpdate's page-full opportunistic-prune fallback
+// while the page's content lock is still held (re-locking the same slot
+// would deadlock), immediately after markHeapPruneOptDirty so the FPI
+// reflects the pruned-but-not-yet-re-added state. Only called when
+// ctx.LogCanonical is non-nil. xid is InvalidTransactionID (0) for a
+// VACUUM-driven prune (vacuumCore has no live transaction of its own to
+// stamp) and the current transaction's xid for an in-transaction
+// opportunistic prune — inert either way, since a standby restores the
+// whole page from the FPI without consulting the record's xl_xid.
+func emitCanonicalHeapPruneLocked(ctx *Context, s *storage.Slot, rel storage.RelFileNode, blk storage.BlockNumber, xid uint32, onAccess bool) error {
+	if ctx.LogCanonical == nil {
+		return nil
+	}
+	page := make(storage.Page, storage.BlockSize)
+	copy(page, s.Page())
+	endLSN, emitErr := catalog.PgCanonicalHeapPrune(rel, blk, page, xid, onAccess, ctx.LogCanonical)
+	if emitErr == nil && endLSN != 0 {
+		storage.MustHeader(s.Page()).SetLSN(storage.LSN(endLSN))
+		if ctx.Pool != nil {
+			ctx.Pool.MarkDirty(s)
+		}
+	}
 	return emitErr
 }
 

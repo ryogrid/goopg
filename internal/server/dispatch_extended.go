@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/config"
@@ -27,8 +28,27 @@ import (
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
 func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string, connTx *connTxState) (*extendedQueryResult, *extendedQueryError) {
+	// DROP DATABASE has real parser grammar (a generic no-op DDL absorption,
+	// DropCompatStmt) that would otherwise shadow tryHandleDatabaseDDL's real
+	// catalog-backed DROP entirely — see dispatchSimpleQueryViaExecutor's
+	// identical pre-parse check (dispatch.go) for the full explanation.
+	if kind, _ := classifyDatabaseDDL(query); kind == databaseDDLDrop {
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+			return res, qerr
+		}
+	}
 	stmts, err := parser.Parse(query)
 	if err != nil {
+		// CREATE/DROP/ALTER DATABASE and CREATE/DROP/ALTER ROLE are not
+		// parser grammar (same string-prefix wire-dispatch bypass the
+		// simple-query path uses in dispatchSimpleQueryViaExecutor) — try
+		// that bypass here too before surfacing a syntax error. M0119-0004.
+		if res, qerr, handled := s.tryHandleDatabaseOrRoleDDLExtended(query, dbName, sess); handled {
+			return res, qerr
+		}
+		if res, qerr, handled := s.tryCompatNoopExtended(query); handled {
+			return res, qerr
+		}
 		msg, extra := syntaxErrorMsg(err)
 		qerr := &extendedQueryError{Code: sqlstate.SyntaxError, Message: msg}
 		for _, f := range extra {
@@ -134,11 +154,23 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			_, eff, ok := sess.Get(name)
 			return eff, ok
 		}
+		ectx.GetSettingDisplay = func(name string) (string, bool) {
+			_, eff, ok := sess.GetDisplay(name)
+			return eff, ok
+		}
 		ectx.SetSetting = func(name, value string, isLocal bool) error {
 			return sess.Set(name, value, isLocal)
 		}
 		ectx.AllSettings = func() []executor.SettingValue {
 			all := sess.All()
+			out := make([]executor.SettingValue, 0, len(all))
+			for _, kv := range all {
+				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
+			}
+			return out
+		}
+		ectx.AllSettingsDisplay = func() []executor.SettingValue {
+			all := sess.AllDisplay()
 			out := make([]executor.SettingValue, 0, len(all))
 			for _, kv := range all {
 				out = append(out, executor.SettingValue{Name: kv.Name, Value: kv.Value})
@@ -294,6 +326,84 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 // information through Bind, so every value lands as a string Datum
 // and the planner/expression evaluator coerces on read (e.g. via
 // `$1::int4` casts). NULL parameters become NullDatum.
+// tryHandleDatabaseOrRoleDDLExtended is the extended-query-protocol
+// counterpart of dispatchSimpleQueryViaExecutor's CREATE/DROP/ALTER
+// DATABASE and CREATE/DROP/ALTER ROLE wire-dispatch bypass (dispatch.go
+// ~line 122-183): goopg's parser has no grammar for these statements at
+// all, so both protocols intercept them by string-prefix matching before
+// falling through to a syntax error. Until this fix the extended path had
+// no such hook, so a client that sends these DDL statements through a
+// prepared statement (JDBC, npgsql, psycopg2's default protocol, etc.
+// rather than psql's simple-query default) got a silent 42601 syntax
+// error instead of the DDL being applied — a real correctness bug, not
+// just missing test coverage. M0119-0004-ACLHEAP.
+//
+// Unlike the simple-query path, a single Parse message may only carry one
+// SQL command (wire protocol spec), so the splitLeadingRoleDDL
+// multi-statement recursion dispatch.go needs has no counterpart here.
+//
+// Returns handled=false when query is not a DDL form this bypass
+// recognises, so the caller falls through to its normal syntax-error path.
+func (s *Server) tryHandleDatabaseOrRoleDDLExtended(query, dbName string, sess *config.SessionRegistry) (*extendedQueryResult, *extendedQueryError, bool) {
+	resolveCurrentGUC := currentGUCResolver(func(name string) (string, bool) {
+		if sess == nil {
+			return "", false
+		}
+		_, eff, ok := sess.GetDisplay(name)
+		return eff, ok
+	})
+	if handled, notice, herr := s.tryHandleDatabaseDDL(query, dbName, resolveCurrentGUC); handled {
+		if herr != nil {
+			return nil, &extendedQueryError{Code: databaseDDLErrorSQLState(herr), Message: herr.Error()}, true
+		}
+		return &extendedQueryResult{CommandTag: databaseDDLCommandTag(query), Notice: notice}, nil, true
+	}
+	if handled, herr := s.tryHandleRoleDDL(query, dbName, resolveCurrentGUC); handled {
+		if herr != nil {
+			return nil, &extendedQueryError{Code: roleErrorSQLState(herr), Message: herr.Error(), Detail: roleErrorDetail(herr)}, true
+		}
+		norm := normalizeCompatSQL(query)
+		var tag string
+		switch {
+		case strings.HasPrefix(norm, "create "):
+			tag = "CREATE ROLE"
+		case strings.HasPrefix(norm, "alter "):
+			tag = "ALTER ROLE"
+		default:
+			tag = "DROP ROLE"
+		}
+		return &extendedQueryResult{CommandTag: tag}, nil, true
+	}
+	return nil, nil, false
+}
+
+// tryCompatNoopExtended is the extended-query-protocol counterpart of
+// dispatchSimpleQueryViaExecutor's compatNoopCommandTag absorption
+// (dispatch.go ~line 180): GRANT/REVOKE/CREATE SCHEMA/COMMENT ON/SECURITY
+// LABEL forms (and a few CREATE/ALTER/DROP ROLE/DATABASE spellings already
+// covered by tryHandleDatabaseOrRoleDDLExtended above) that the parser
+// doesn't recognise at all. Until this fix a client using Parse/Bind/
+// Execute (JDBC/npgsql/psycopg2's default) for one of these forms got a
+// hard 42601 syntax error instead of the same no-op absorption psql's
+// simple-query default receives — a real correctness gap, not just missing
+// coverage. M0119-0004-ACLHEAP follow-up (loop #86, item (3) of the loop
+// #84 row, `0119-0004cv`/`0119-0004cw`).
+//
+// Returns handled=false when query does not match any compatNoopCommandTag
+// prefix, so the caller falls through to its normal syntax-error path.
+func (s *Server) tryCompatNoopExtended(query string) (*extendedQueryResult, *extendedQueryError, bool) {
+	tag, ok := compatNoopCommandTag(query)
+	if !ok {
+		return nil, nil, false
+	}
+	if tag == "CREATE SCHEMA" {
+		if werr := s.registerCompatNoopSchema(query); werr != nil {
+			return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: werr.Error()}, true
+		}
+	}
+	return &extendedQueryResult{CommandTag: tag}, nil, true
+}
+
 func paramsToDatums(params []boundParam) ([]executor.Datum, *extendedQueryError) {
 	out := make([]executor.Datum, len(params))
 	for i, p := range params {

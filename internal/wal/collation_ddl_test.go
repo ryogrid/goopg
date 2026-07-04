@@ -181,3 +181,44 @@ func TestDecodeAlterCollationOwnerRejectsTruncatedPayload(t *testing.T) {
 		t.Error("expected error decoding truncated alter-collation-owner payload")
 	}
 }
+
+// TestEncodeDecodeAlterCollationSetSchemaRoundTrip is the SET SCHEMA
+// counterpart (DU-002 slice 442, closing the last unmodelled ALTER COLLATION
+// form).
+func TestEncodeDecodeAlterCollationSetSchemaRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, newSchema string }{
+		{"mycoll", "public", "otherschema"},
+		{"icucoll", "myschema", "myschema2"},
+		{"日本語照合", "myschema", "新しいスキーマ"}, // multi-byte UTF-8
+	}
+	for _, c := range cases {
+		raw := EncodeAlterCollationSetSchema(c.name, c.schema, c.newSchema)
+		if raw[0] != RecordKindAlterCollationSetSchema {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterCollationSetSchema)
+			continue
+		}
+		gotName, gotSchema, gotNewSchema, err := DecodeAlterCollationSetSchema(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotNewSchema != c.newSchema {
+			t.Errorf("%q: decoded (%q, %q, %q)", c.name, gotName, gotSchema, gotNewSchema)
+		}
+	}
+}
+
+func TestDecodeAlterCollationSetSchemaRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropCollation("mycoll", "public")
+	if _, _, _, err := DecodeAlterCollationSetSchema(bogus); err == nil {
+		t.Error("expected error decoding non-alter-collation-set-schema payload")
+	}
+}
+
+func TestDecodeAlterCollationSetSchemaRejectsTruncatedPayload(t *testing.T) {
+	// kind + nameLen=10, but no bytes follow.
+	truncated := []byte{RecordKindAlterCollationSetSchema, 10, 0}
+	if _, _, _, err := DecodeAlterCollationSetSchema(truncated); err == nil {
+		t.Error("expected error decoding truncated alter-collation-set-schema payload")
+	}
+}

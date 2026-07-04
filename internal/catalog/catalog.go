@@ -217,6 +217,16 @@ type NamedCheckConstraint struct {
 	IsLocal   bool   // conislocal: true if locally defined (not purely inherited)
 	InhCount  int    // coninhcount: number of direct parents this was inherited from
 	NotValid  bool   // convalidated='f': added NOT VALID, existing rows not checked yet
+	// NotEnforced mirrors pg_constraint.conenforced='f' (PG18 NOT ENFORCED
+	// constraints). pg_get_constraintdef_worker checks this FIRST and, when
+	// true, appends the trailing ` NOT ENFORCED` regardless of NotValid
+	// (PostgreSQL considers validated status irrelevant once a constraint
+	// isn't enforced — ruleutils.c's `if (!conenforced) ... else if
+	// (!convalidated) ...`). Real PG also implicitly leaves such a constraint
+	// unvalidated (skip_validation=!is_enforced in tablecmds.c), so goopg
+	// treats NotEnforced as implying "not validated" wherever convalidated is
+	// projected. DU-002 slice 430.
+	NotEnforced bool
 }
 
 // NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
@@ -248,7 +258,7 @@ func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isL
 // constraints (pg_constraint's VirtualRows skips empty-name / zero-OID rows so
 // the common unnamed case stays invisible in the catalog). M0097-0023.
 func (t *Table) AddCheck(name, expr string, oid uint32) {
-	t.AddCheckWithNoInherit(name, expr, oid, false)
+	t.AddCheckFull(name, expr, oid, false, false, false)
 }
 
 // AddCheckWithNotValid is AddCheck for a CHECK added with NOT VALID
@@ -258,10 +268,7 @@ func (t *Table) AddCheck(name, expr string, oid uint32) {
 // constraint, and pg_dump dumps it as a separate ALTER TABLE ADD CONSTRAINT so
 // possibly-violating data loads before the constraint. DU-002 slice 308.
 func (t *Table) AddCheckWithNotValid(name, expr string, oid uint32, notValid bool) {
-	t.CheckConstraints = append(t.CheckConstraints, expr)
-	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
-		Name: name, Expr: expr, OID: oid, IsLocal: true, NotValid: notValid,
-	})
+	t.AddCheckFull(name, expr, oid, notValid, false, false)
 }
 
 // AddCheckWithNoInherit is AddCheck for a CHECK that may carry NO INHERIT
@@ -269,9 +276,21 @@ func (t *Table) AddCheckWithNotValid(name, expr string, oid uint32, notValid boo
 // must record the flag so pg_get_constraintdef re-emits the ` NO INHERIT`
 // suffix on dump and pg_constraint reports connoinherit. DU-002 slice 128.
 func (t *Table) AddCheckWithNoInherit(name, expr string, oid uint32, noInherit bool) {
+	t.AddCheckFull(name, expr, oid, false, noInherit, false)
+}
+
+// AddCheckFull is the fully-parameterized CHECK constraint registration
+// underlying AddCheck/AddCheckWithNotValid/AddCheckWithNoInherit, threading
+// PG18's NOT VALID / NO INHERIT / NOT ENFORCED flags (pg_constraint's
+// convalidated / connoinherit / conenforced columns) through a single call
+// site so callers that need more than one flag at once (e.g. ALTER TABLE ADD
+// CONSTRAINT CHECK ... NOT ENFORCED) don't need a fresh Add* wrapper.
+// DU-002 slice 430.
+func (t *Table) AddCheckFull(name, expr string, oid uint32, notValid, noInherit, notEnforced bool) {
 	t.CheckConstraints = append(t.CheckConstraints, expr)
 	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
-		Name: name, Expr: expr, OID: oid, IsLocal: true, NoInherit: noInherit,
+		Name: name, Expr: expr, OID: oid, IsLocal: true,
+		NotValid: notValid, NoInherit: noInherit, NotEnforced: notEnforced,
 	})
 }
 
@@ -1399,6 +1418,14 @@ type ForeignKey struct {
 	// is 'f' and pg_get_constraintdef emits ` MATCH FULL`. MATCH SIMPLE (the
 	// default) leaves it false (confmatchtype='s'). DU-002 slice 309.
 	MatchFull bool
+	// NotEnforced mirrors pg_constraint.conenforced='f' (PG18 NOT ENFORCED),
+	// disabling the constraint's action/check triggers entirely at runtime;
+	// pg_get_constraintdef gives it precedence over NotValid in the rendered
+	// text, the same way catalog.NamedCheckConstraint.NotEnforced already
+	// works for CHECK. The pg_constraint convalidated projection treats this
+	// as implying NotValid too (mirrors PG's processCASbits), even though
+	// NotValid itself is kept independent here. DU-002 slice 431.
+	NotEnforced bool
 }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
@@ -2559,6 +2586,19 @@ type StatisticsObject struct {
 	// pg_dump emits no ALTER. A non-nil value >= 0 round-trips as an
 	// `ALTER STATISTICS ... SET STATISTICS <n>` after the CREATE. DU-002 slice 317.
 	StatTarget *int
+	// Owner is the stxowner role OID, settable via `ALTER STATISTICS ... OWNER
+	// TO`. 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. DU-002 slice 441.
+	Owner uint32
+}
+
+// OwnerOrDefault returns s.Owner, falling back to the bootstrap superuser OID
+// (10) for statistics objects that never had OWNER TO applied.
+func (s *StatisticsObject) OwnerOrDefault() uint32 {
+	if s.Owner == 0 {
+		return 10
+	}
+	return s.Owner
 }
 
 // qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
@@ -2954,6 +2994,55 @@ func (c *InMemory) RegisterStatisticsFull(schema, name string, tableOID uint32, 
 	return obj
 }
 
+// RegisterStatisticsDuringRecovery re-registers a statistics object from a
+// decoded RecordKindCreateStatistics WAL record, overwriting-by-qualified-name
+// (mirrors RegisterAccessMethodDuringRecovery/CreateCollationDuringRecovery)
+// so replaying the same record twice is idempotent. DU-002 restart-persistence
+// follow-up to slice 441.
+func (c *InMemory) RegisterStatisticsDuringRecovery(schema, name string, oid, tableOID, ownerOID uint32, kinds, columns, exprs []string, hasExpr bool) {
+	if schema == "" {
+		schema = "public"
+	}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: oid, TableOID: tableOID, Owner: ownerOID, Kinds: kinds, Columns: columns, Exprs: exprs, HasExpr: hasExpr}
+	key := obj.qualifiedKey()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		c.statisticsObjs = make(map[string]*StatisticsObject)
+	}
+	c.statisticsObjs[key] = obj
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// DropStatistics removes a statistics object by unqualified name and schema
+// (defaulting to "public"), mirroring DropCollation. Returns false if no such
+// object is registered.
+func (c *InMemory) DropStatistics(name, schema string) bool {
+	if schema == "" {
+		schema = "public"
+	}
+	key := strings.ToLower(schema + "." + name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	if _, ok := c.statisticsObjs[key]; !ok {
+		return false
+	}
+	delete(c.statisticsObjs, key)
+	return true
+}
+
+// DropStatisticsDuringRecovery is the recovery-replay counterpart to
+// DropStatistics; a missing object is a silent no-op (the record it created
+// may predate the last checkpoint this recovery pass starts from).
+func (c *InMemory) DropStatisticsDuringRecovery(name, schema string) {
+	c.DropStatistics(name, schema)
+}
+
 // LookupStatistics finds a statistics object by name. The name may be
 // schema-qualified; if not, the public schema is tried. M0097-0023.
 func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
@@ -2991,6 +3080,93 @@ func (c *InMemory) SetStatisticsTarget(name string, target *int) bool {
 	}
 	obj.StatTarget = target
 	return true
+}
+
+// RenameStatisticsObject renames a statistics object (ALTER STATISTICS ...
+// RENAME TO), re-keying the schema-qualified map entry. Returns false if no
+// such object exists. DU-002 slice 441.
+func (c *InMemory) RenameStatisticsObject(name, newName string) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	delete(c.statisticsObjs, key)
+	obj.Name = newName
+	c.statisticsObjs[obj.qualifiedKey()] = obj
+	return true
+}
+
+// SetStatisticsOwner sets the owning role OID of a statistics object (ALTER
+// STATISTICS ... OWNER TO). Returns false if no such object exists. DU-002
+// slice 441.
+func (c *InMemory) SetStatisticsOwner(name string, ownerOID uint32) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	obj.Owner = ownerOID
+	return true
+}
+
+// SetStatisticsSchema moves a statistics object to a new schema (ALTER
+// STATISTICS ... SET SCHEMA), re-keying the map entry. Returns false if no
+// such object exists. DU-002 slice 441.
+func (c *InMemory) SetStatisticsSchema(name, newSchema string) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	delete(c.statisticsObjs, key)
+	obj.Schema = newSchema
+	c.statisticsObjs[obj.qualifiedKey()] = obj
+	return true
+}
+
+// RenameStatisticsObjectDuringRecovery is the discard-result recovery
+// counterpart to RenameStatisticsObject, mirroring
+// RenameCollationDuringRecovery. DU-002 restart-persistence follow-up
+// (resume point (1) of the slice-441/445 ledger rows).
+func (c *InMemory) RenameStatisticsObjectDuringRecovery(name, newName string) {
+	c.RenameStatisticsObject(name, newName)
+}
+
+// SetStatisticsOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetStatisticsOwner, mirroring SetCollationOwnerDuringRecovery.
+func (c *InMemory) SetStatisticsOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetStatisticsOwner(name, ownerOID)
+}
+
+// SetStatisticsSchemaDuringRecovery is the discard-result recovery
+// counterpart to SetStatisticsSchema, mirroring SetCollationSchemaDuringRecovery.
+func (c *InMemory) SetStatisticsSchemaDuringRecovery(name, newSchema string) {
+	c.SetStatisticsSchema(name, newSchema)
 }
 
 // AllStatistics returns a snapshot of all registered statistics objects. M0097-0023.
@@ -4064,13 +4240,21 @@ func (c *InMemory) SetDatabaseConfig(dbOid uint32, name, value string) {
 
 // ResetDatabaseConfig removes a single `ALTER DATABASE ... RESET name`
 // override, if present. A no-op when the name has no override recorded.
+// Deletes the dbOid map key entirely when the last entry is removed (mirrors
+// ResetAllDatabaseConfig's full-delete semantics) so pg_db_role_setting stops
+// emitting a phantom row with a blank setconfig array.
 func (c *InMemory) ResetDatabaseConfig(dbOid uint32, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entries := c.dbRoleSettings[dbOid]
 	for i, e := range entries {
 		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
-			c.dbRoleSettings[dbOid] = append(entries[:i], entries[i+1:]...)
+			remaining := append(entries[:i], entries[i+1:]...)
+			if len(remaining) == 0 {
+				delete(c.dbRoleSettings, dbOid)
+			} else {
+				c.dbRoleSettings[dbOid] = remaining
+			}
 			return
 		}
 	}
@@ -4125,7 +4309,10 @@ func (c *InMemory) SetRoleConfig(roleOid, dbOid uint32, name, value string) {
 }
 
 // ResetRoleConfig removes a single `ALTER ROLE ... [IN DATABASE ...] RESET
-// name` override, if present.
+// name` override, if present. Deletes the key entirely when the last entry
+// is removed (mirrors ResetAllRoleConfig's full-delete semantics) so
+// pg_db_role_setting stops emitting a phantom row with a blank setconfig
+// array.
 func (c *InMemory) ResetRoleConfig(roleOid, dbOid uint32, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -4133,7 +4320,12 @@ func (c *InMemory) ResetRoleConfig(roleOid, dbOid uint32, name string) {
 	entries := c.roleSettings[key]
 	for i, e := range entries {
 		if strings.EqualFold(dbRoleSettingConfigName(e), name) {
-			c.roleSettings[key] = append(entries[:i], entries[i+1:]...)
+			remaining := append(entries[:i], entries[i+1:]...)
+			if len(remaining) == 0 {
+				delete(c.roleSettings, key)
+			} else {
+				c.roleSettings[key] = remaining
+			}
 			return
 		}
 	}
@@ -6736,8 +6928,12 @@ func (c *InMemory) registerSystemTables() {
 				row[3] = "c"                        // contype = check
 				row[4] = "f"                        // condeferrable
 				row[5] = "f"                        // condeferred
-				if nc.NotValid {
-					row[6] = "f" // convalidated — added NOT VALID, not yet validated
+				if nc.NotValid || nc.NotEnforced {
+					// convalidated='f' — either explicitly added NOT VALID, or
+					// NOT ENFORCED (real PG's ATAddCheckNNConstraint sets
+					// skip_validation=!is_enforced, so an unenforced constraint
+					// is implicitly unvalidated too). DU-002 slice 430.
+					row[6] = "f" // convalidated
 				} else {
 					row[6] = "t" // convalidated
 				}
@@ -6762,7 +6958,11 @@ func (c *InMemory) registerSystemTables() {
 				}
 				row[18] = "f"     // conperiod
 				row[24] = nc.Expr // conbin
-				row[25] = "t"     // conenforced: always true in v0
+				if nc.NotEnforced {
+					row[25] = "f" // conenforced — CHECK ... NOT ENFORCED. DU-002 slice 430.
+				} else {
+					row[25] = "t" // conenforced
+				}
 				out = append(out, row)
 			}
 		}
@@ -6977,8 +7177,8 @@ func (c *InMemory) registerSystemTables() {
 				} else {
 					row[5] = "f" // condeferred
 				}
-				if fk.NotValid {
-					row[6] = "f" // convalidated — NOT VALID, not yet validated
+				if fk.NotValid || fk.NotEnforced {
+					row[6] = "f" // convalidated — NOT VALID (or implied by NOT ENFORCED)
 				} else {
 					row[6] = "t" // convalidated
 				}
@@ -7003,7 +7203,11 @@ func (c *InMemory) registerSystemTables() {
 				if len(confdelsetcols) > 0 {
 					row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
 				}
-				row[25] = "t" // conenforced
+				if fk.NotEnforced {
+					row[25] = "f" // conenforced — FOREIGN KEY ... NOT ENFORCED. DU-002 slice 431.
+				} else {
+					row[25] = "t" // conenforced
+				}
 				out = append(out, row)
 			}
 		}
@@ -7297,16 +7501,16 @@ func (c *InMemory) registerSystemTables() {
 			if schema == "" {
 				schema = "public"
 			}
-			nsOID := "2200" // public namespace OID
-			if schema != "public" {
-				nsOID = "0"
+			nsOID := c.schemas[strings.ToLower(schema)]
+			if nsOID == 0 {
+				nsOID = c.schemas["public"]
 			}
 			row := make([]string, 9)
-			row[0] = fmt.Sprintf("%d", obj.OID)      // oid
-			row[1] = fmt.Sprintf("%d", obj.TableOID) // stxrelid
-			row[2] = obj.Name                        // stxname
-			row[3] = nsOID                           // stxnamespace
-			row[4] = "10"                            // stxowner (bootstrap superuser)
+			row[0] = fmt.Sprintf("%d", obj.OID)              // oid
+			row[1] = fmt.Sprintf("%d", obj.TableOID)         // stxrelid
+			row[2] = obj.Name                                // stxname
+			row[3] = fmt.Sprintf("%d", nsOID)                // stxnamespace
+			row[4] = fmt.Sprintf("%d", obj.OwnerOrDefault()) // stxowner
 			// stxstattarget: PG18 stores NULL for the default (BKI_FORCE_NULL),
 			// which pg_dump's getExtendedStatistics maps to -1 → no ALTER. The
 			// string-based virtual-row machinery has no int NULL sentinel (an
@@ -7320,9 +7524,9 @@ func (c *InMemory) registerSystemTables() {
 			} else {
 				row[5] = "-1" // default (pg_dump-equivalent of NULL → no ALTER)
 			}
-			row[6] = ""                              // stxkeys
-			row[7] = ""                              // stxexprs
-			row[8] = ""                              // stxkind
+			row[6] = "" // stxkeys
+			row[7] = "" // stxexprs
+			row[8] = "" // stxkind
 			out = append(out, row)
 		}
 		return out
@@ -9786,23 +9990,42 @@ func (c *InMemory) LookupColumn(table *Table, name string) (*Column, bool) {
 func (c *InMemory) LookupIndex(name parser.ObjectName) (*Index, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	idx, _, ok := c.lookupIndexLocked(name)
+	return idx, ok
+}
+
+// lookupIndexLocked is the shared name-resolution core behind LookupIndex,
+// RenameIndex, and RenameIndexDuringRecovery — callers must already hold
+// c.mu. Returns the found index, the actual map key it lives under (which
+// may differ from key(name) — see the fallback below), and whether it was
+// found.
+//
+// The "" vs "public." ambiguity this resolves: a live DDL session stores an
+// unqualified index under the bare-name key (CREATE TABLE only sets
+// tbl.Schema when the writable search_path schema isn't "public", so a
+// same-session CreateIndex/RenameIndex/etc. consistently keys off ""); a
+// server restart's pg_index-heap reload (loadUserIndexesFromHeap, M0113)
+// resolves the namespace OID to the explicit string "public" instead. A
+// rename/lookup issued before vs. after a restart can therefore target the
+// same logical index under two different literal keys.
+func (c *InMemory) lookupIndexLocked(name parser.ObjectName) (*Index, string, bool) {
 	if idx, ok := c.indexes[key(name)]; ok {
-		return idx, ok
+		return idx, key(name), ok
 	}
 	if name.Schema == "" {
 		// Unqualified name: try "public.<name>" first (indexes created via DDL
 		// always carry the table's schema, which defaults to "public").
 		if idx, ok := c.indexes["public."+name.Name]; ok {
-			return idx, ok
+			return idx, "public." + name.Name, ok
 		}
 	} else {
 		// Schema-qualified lookup failed: fall back to bare name for indexes
 		// created without an explicit schema in the catalog key.
 		if idx, ok := c.indexes[name.Name]; ok {
-			return idx, ok
+			return idx, name.Name, ok
 		}
 	}
-	return nil, false
+	return nil, "", false
 }
 
 // CreateTable installs a new table in the catalog. Returns an error
@@ -9928,6 +10151,61 @@ func (c *InMemory) RestoreIndex(idx *Index) {
 		c.byTable[idx.Table.OID] = map[string]*Index{}
 	}
 	c.byTable[idx.Table.OID][k] = idx
+}
+
+// RenameIndex renames a catalog index entry from old to new, re-keying both
+// `c.indexes` and the owning table's `c.byTable` slot (mirrors RenameTable's
+// shape, DU-002 slice 443). Returns an error when old does not exist or new
+// already exists — real PostgreSQL raises 42P07 for the latter
+// (RenameRelation -> RangeVarCallbackForAlterRelation's namespace check).
+func (c *InMemory) RenameIndex(old, new parser.ObjectName) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx, oldK, exists := c.lookupIndexLocked(old)
+	if !exists {
+		return fmt.Errorf("relation %q does not exist", key(old))
+	}
+	newK := key(parser.ObjectName{Schema: idx.Schema, Name: new.Name})
+	if _, _, collides := c.lookupIndexLocked(parser.ObjectName{Schema: idx.Schema, Name: new.Name}); collides {
+		return fmt.Errorf("relation %q already exists", newK)
+	}
+	idx.Name = new.Name
+	c.indexes[newK] = idx
+	delete(c.indexes, oldK)
+	if idx.Table != nil {
+		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+			delete(perTable, oldK)
+			perTable[newK] = idx
+		}
+	}
+	return nil
+}
+
+// RenameIndexDuringRecovery is the idempotent WAL-replay counterpart to
+// RenameIndex, mirroring RegisterIndexDuringRecovery's shape. A missing old
+// entry (already renamed by a prior pass, or a JSON snapshot that captured
+// the post-rename state) is a silent no-op rather than an error. Uses
+// lookupIndexLocked (not a bare key(schema, oldName) lookup) because the
+// WAL record's schema reflects the live session's "" convention while a
+// prior M0113 pg_index-heap reload may have re-keyed the same index under
+// the resolved "public." form — see lookupIndexLocked's doc comment.
+func (c *InMemory) RenameIndexDuringRecovery(schema, oldName, newName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx, oldK, exists := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: oldName})
+	if !exists {
+		return
+	}
+	newK := key(parser.ObjectName{Schema: idx.Schema, Name: newName})
+	idx.Name = newName
+	c.indexes[newK] = idx
+	delete(c.indexes, oldK)
+	if idx.Table != nil {
+		if perTable := c.byTable[idx.Table.OID]; perTable != nil {
+			delete(perTable, oldK)
+			perTable[newK] = idx
+		}
+	}
 }
 
 // DropTable removes a table from the catalog. Returns an error when
@@ -10319,6 +10597,31 @@ func (c *InMemory) SetCollationOwner(name, schema string, ownerOID uint32) bool 
 	return false
 }
 
+// SetCollationSchema moves a user-created collation with the given bare name
+// from `schema` into `newSchema` (SET SCHEMA), resolving both schema names to
+// their namespace OID the same way SetCollationOwner/RenameCollation do
+// (unknown → public). Returns false if no such collation is registered.
+// DU-002 slice 442.
+func (c *InMemory) SetCollationSchema(name, schema, newSchema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userCollations {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
 // CreateCollationDuringRecovery is the idempotent version of CreateCollation
 // used by the WAL-replay driver (internal/initdb/collation_ddl_recovery.go).
 // Unlike CreateCollation it takes the OID from the WAL record (so the
@@ -10375,6 +10678,13 @@ func (c *InMemory) RenameCollationDuringRecovery(name, schema, newName string) {
 // restart-persistence follow-up (M0119-0004).
 func (c *InMemory) SetCollationOwnerDuringRecovery(name, schema string, ownerOID uint32) {
 	c.SetCollationOwner(name, schema, ownerOID)
+}
+
+// SetCollationSchemaDuringRecovery is the discard-result recovery counterpart
+// to SetCollationSchema, mirroring SetCollationOwnerDuringRecovery. DU-002
+// slice 442.
+func (c *InMemory) SetCollationSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetCollationSchema(name, schema, newSchema)
 }
 
 // CreateConversion records a CREATE [DEFAULT] CONVERSION in the runtime
@@ -12422,6 +12732,21 @@ func (c *InMemory) ListAccessMethods() []*AccessMethod {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// UserAccessMethodOID returns the stable OID of the named user-defined access
+// method, or 0 if no such AM is registered (including the 7 built-ins, which
+// are not tracked in this map — see AccessMethodOIDByName for those). Used by
+// COMMENT ON ACCESS METHOD to resolve the pg_am.oid to key the pg_description
+// row on, mirroring ForeignServerOID/ForeignDataWrapperOID/ExtensionOID.
+// DU-002 slice 434.
+func (c *InMemory) UserAccessMethodOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if am, ok := c.accessMethods[name]; ok {
+		return am.OID
+	}
+	return 0
 }
 
 // RegisterAccessMethodDuringRecovery is the idempotent version of
@@ -14933,6 +15258,38 @@ func (c *InMemory) ViewsDependingOnConstraint(tableOID uint32, constraintName st
 func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.dropIndexByName(tableOID, constraintName)
+}
+
+// DropUniqueConstraint removes the named UNIQUE constraint (index-backed,
+// like a primary key) from the table's index registries. Returns true if
+// found and removed. Shares dropIndexByName with DropPrimaryKeyConstraint —
+// both a PK and a named UNIQUE constraint are stored the same way (an Index
+// with IsConstraint set), so the removal logic doesn't need to differ; only
+// the caller-side lookup that finds the index by name distinguishes Primary
+// from plain Unique. DU-002 slice 433 follow-up.
+func (c *InMemory) DropUniqueConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropIndexByName(tableOID, constraintName)
+}
+
+// DropExclusionConstraint removes the named EXCLUDE constraint (index-backed,
+// distinguished from UNIQUE/PRIMARY KEY by idx.IsExclusion rather than
+// idx.Unique/IsConstraint) from the table's index registries. Returns true if
+// found and removed. Shares dropIndexByName — an EXCLUDE index is stored the
+// same way as a PK/UNIQUE index; only the caller-side lookup differs. DU-002
+// slice 433 follow-up (2nd pass).
+func (c *InMemory) DropExclusionConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dropIndexByName(tableOID, constraintName)
+}
+
+// dropIndexByName removes the named index (backing either a PRIMARY KEY or a
+// UNIQUE constraint) from both the per-table and flat index registries.
+// Caller must hold c.mu for writing.
+func (c *InMemory) dropIndexByName(tableOID uint32, constraintName string) bool {
 	inner, ok := c.byTable[tableOID]
 	if !ok {
 		return false
@@ -14949,6 +15306,28 @@ func (c *InMemory) DropPrimaryKeyConstraint(tableOID uint32, constraintName stri
 		}
 	}
 	return true
+}
+
+// DropForeignKeyConstraint removes the named foreign-key constraint from the
+// table's ForeignKeys slice. Returns true if found and removed. Unlike
+// PK/UNIQUE constraints, a foreign key isn't backed by a separate Index
+// registry entry — it lives only on Table.ForeignKeys — so this looks the
+// table up by OID and mutates that slice directly. DU-002 slice 433
+// follow-up.
+func (c *InMemory) DropForeignKeyConstraint(tableOID uint32, constraintName string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tbl, ok := c.tableByOID(tableOID)
+	if !ok {
+		return false
+	}
+	for i := range tbl.ForeignKeys {
+		if strings.EqualFold(tbl.ForeignKeys[i].Name, constraintName) {
+			tbl.ForeignKeys = append(tbl.ForeignKeys[:i], tbl.ForeignKeys[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // HasPrimaryKey reports whether table has a primary-key index.

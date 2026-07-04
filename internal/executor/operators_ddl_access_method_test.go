@@ -145,3 +145,62 @@ func TestDropAccessMethodRemovesRow(t *testing.T) {
 		t.Errorf("ListAccessMethods=%+v want empty after DROP", got)
 	}
 }
+
+// TestCommentOnAccessMethodStoresDescription pins execCommentOn's "access
+// method" case (DU-002 slice 434): COMMENT ON ACCESS METHOD must key
+// pg_description on the AM's own pg_am OID (classoid 2601, objsubid 0) so
+// pg_dump's dumpAccessMethod re-emits the comment. Before this slice the
+// parser had no "access method" branch in parseCommentOnTail, so the
+// statement was silently discarded and never reached SetComment.
+func TestCommentOnAccessMethodStoresDescription(t *testing.T) {
+	const oidPgAm = 2601
+
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE FUNCTION myam_handler(internal) RETURNS index_am_handler LANGUAGE c AS 'myam_handler'`); err != nil {
+		t.Fatalf("CREATE FUNCTION: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE ACCESS METHOD myam TYPE INDEX HANDLER myam_handler`); err != nil {
+		t.Fatalf("CREATE ACCESS METHOD: %v", err)
+	}
+	if err := runDDL(t, ctx, `COMMENT ON ACCESS METHOD myam IS 'a test access method'`); err != nil {
+		t.Fatalf("COMMENT ON ACCESS METHOD: %v", err)
+	}
+
+	im := ctx.Catalog.(*catalog.InMemory)
+	ams := im.ListAccessMethods()
+	if len(ams) != 1 {
+		t.Fatalf("ListAccessMethods len=%d want 1", len(ams))
+	}
+	desc, ok := im.GetComment(oidPgAm, ams[0].OID, 0)
+	if !ok {
+		t.Fatalf("GetComment(pg_am, %d, 0) not found", ams[0].OID)
+	}
+	if desc != "a test access method" {
+		t.Errorf("description=%q want %q", desc, "a test access method")
+	}
+}
+
+// TestCommentOnUnknownAccessMethodErrors pins the DU-002 slice 436 fix: an
+// unresolvable COMMENT ON ACCESS METHOD name now raises the same 42704
+// `access method "..." does not exist` error real PostgreSQL 18.3 raises
+// (verified live), replacing the silent no-op the slice 434 row had flagged
+// as a pre-existing, out-of-scope divergence.
+func TestCommentOnUnknownAccessMethodErrors(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	err := runDDL(t, ctx, `COMMENT ON ACCESS METHOD nosuchmethod IS 'x'`)
+	var ee *ExecError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err type = %T, want *ExecError; err=%v", err, err)
+	}
+	if ee.Code != "42704" {
+		t.Errorf("Code=%q want 42704", ee.Code)
+	}
+	want := `access method "nosuchmethod" does not exist`
+	if ee.Message != want {
+		t.Errorf("Message=%q want %q", ee.Message, want)
+	}
+}

@@ -1520,6 +1520,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: access method DDL replay: %w", err)
 	}
 
+	// DU-002 restart-persistence follow-up (slice 441's own resume point):
+	// restore CREATE/DROP STATISTICS (extended-statistics) objects from the
+	// WAL. Runs after loadUserTablesFromHeap (above) so a restored object's
+	// recorded TableOID lines up with the table it was defined on, though the
+	// catalog stores the OID verbatim rather than re-resolving it.
+	if err := replayStatisticsDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: statistics DDL replay: %w", err)
+	}
+
 	// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice 429
 	// ledger resume point, sub-item (c)): restore CREATE/DROP TYPE ... AS
 	// RANGE objects from the WAL. Like access methods, range types are keyed

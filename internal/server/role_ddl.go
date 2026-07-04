@@ -32,6 +32,7 @@ package server
 // SCRAM-SHA-256$… or md5<hex> secret is stored verbatim, exactly like PG.
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/goopg/goopg/internal/auth"
@@ -49,7 +50,7 @@ import (
 //   - handled=true, err=nil:   statement was handled successfully
 //   - handled=true, err!=nil:  statement was handled but failed (e.g. role not found)
 //   - handled=false, err=nil:  not a role DDL statement; caller should continue
-func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
+func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent currentGUCResolver) (bool, error) {
 	norm := normalizeCompatSQL(sql)
 	switch {
 	case strings.HasPrefix(norm, "create role "), strings.HasPrefix(norm, "create user "),
@@ -93,7 +94,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string) (bool, error) {
 
 	case strings.HasPrefix(norm, "alter role "), strings.HasPrefix(norm, "alter user "):
 		if op, ok := parseAlterRoleConfig(sql); ok {
-			return s.applyAlterRoleConfig(op, dbName)
+			return s.applyAlterRoleConfig(op, dbName, resolveCurrent)
 		}
 		if oldName, newName, ok := roleRenameFromAlter(norm); ok {
 			return true, s.renameRole(oldName, newName)
@@ -427,12 +428,14 @@ type roleConfigRegistry interface {
 // pg_db_role_setting. M0119-0004-ACLHEAP (ALTER ROLE ... SET follow-up).
 type alterRoleConfigOp struct {
 	roleName    string
+	allRoles    bool // true for "ALTER ROLE ALL SET/RESET ..." (role_specification = ALL, an unquoted keyword — roleName is meaningless when this is set)
 	hasDatabase bool // true when an "IN DATABASE <dbname>" clause was present
 	dbName      string
 	configName  string // empty when resetAll
-	configValue string // meaningful only when !reset && !resetAll
+	configValue string // meaningful only when !reset && !resetAll && !fromCurrent
 	reset       bool   // RESET <name>
 	resetAll    bool   // RESET ALL
+	fromCurrent bool   // SET <name> FROM CURRENT — configValue resolved at apply time
 }
 
 // parseAlterRoleConfig recognises the SET/RESET forms of ALTER ROLE/USER
@@ -441,11 +444,14 @@ type alterRoleConfigOp struct {
 // other SQL (including the attribute/RENAME forms tryHandleRoleDDL handles
 // elsewhere), leaving the caller to fall through to its existing behaviour.
 //
-// "ALTER ROLE ALL SET ..." (role_specification = ALL, PG's cluster-wide
-// -default form applying to every role) is intentionally NOT special-cased
-// here — roleName "all" simply fails RoleOID resolution in
-// applyAlterRoleConfig and falls through to the pre-existing no-op path;
-// see the deferral ledger.
+// "ALTER ROLE ALL SET ..." (PG grammar: `ALTER ROLE ALL opt_in_database
+// SetResetClause`, gram.y ~line 1377 — a distinct production from the
+// RoleSpec-carrying form, not `RoleSpec: ALL`; AlterRoleSet, user.c ~line
+// 1000, leaves `roleid = InvalidOid` (0) when `stmt->role == NULL`) is
+// recognised below as op.allRoles when the bare, UNQUOTED keyword ALL
+// follows ALTER ROLE/USER — a quoted `"ALL"`/`"all"` names a real role and
+// must still resolve via RoleOID, exactly like real PG's grammar only
+// matches the bare ALL keyword token.
 func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 	s := strings.TrimSpace(sql)
 	for strings.HasSuffix(s, ";") {
@@ -461,11 +467,16 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 	default:
 		return alterRoleConfigOp{}, false
 	}
+	quoted := strings.HasPrefix(strings.TrimLeft(stripped, " \t\r\n"), `"`)
 	roleName, rest, ok := splitLeadingSQLToken(stripped)
 	if !ok || roleName == "" {
 		return alterRoleConfigOp{}, false
 	}
 	op := alterRoleConfigOp{roleName: roleName}
+	if !quoted && strings.EqualFold(roleName, "all") {
+		op.allRoles = true
+		op.roleName = ""
+	}
 	lowerRest := strings.ToLower(rest)
 	if strings.HasPrefix(lowerRest, "in database ") {
 		dbName, r2, ok := splitLeadingSQLToken(rest[len("in database "):])
@@ -492,6 +503,13 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 		configName, rest, ok := splitLeadingSQLToken(rest)
 		if !ok || configName == "" {
 			return alterRoleConfigOp{}, false
+		}
+		// "var_name FROM CURRENT" — see parseAlterDatabaseConfig's identical
+		// branch for the grammar citation; resolved at apply time.
+		if strings.EqualFold(strings.TrimSpace(rest), "from current") {
+			op.configName = configName
+			op.fromCurrent = true
+			return op, true
 		}
 		switch lr := strings.ToLower(rest); {
 		case strings.HasPrefix(lr, "to "):
@@ -537,15 +555,23 @@ func parseAlterRoleConfig(sql string) (alterRoleConfigOp, bool) {
 // other than the connection's own liveDBName via IN DATABASE is a silent
 // no-op — see applyAlterDatabaseConfig's doc comment for why (goopg v0 has
 // no GUC-override storage for a database it isn't connected to).
-func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string) (bool, error) {
+func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string, resolveCurrent currentGUCResolver) (bool, error) {
 	if s.cfg.Catalog == nil {
 		return false, nil
 	}
-	roleName := strings.Trim(op.roleName, `"`)
-	roleOid, found := s.cfg.Catalog.RoleOID(roleName)
-	if !found {
-		return true, roleDoesNotExistErr(roleName)
+	var roleOid uint32
+	if !op.allRoles {
+		roleName := strings.Trim(op.roleName, `"`)
+		var found bool
+		roleOid, found = s.cfg.Catalog.RoleOID(roleName)
+		if !found {
+			return true, roleDoesNotExistErr(roleName)
+		}
 	}
+	// op.allRoles ("ALTER ROLE ALL ...") leaves roleOid at its zero value —
+	// real PG's AlterRoleSet does the same (roleid stays InvalidOid/0 when
+	// stmt->role == NULL), so it lands in the same setrole=0 row as any
+	// other cluster-wide override; see parseAlterRoleConfig's doc comment.
 	reg, ok := s.cfg.Catalog.(roleConfigRegistry)
 	if !ok {
 		return false, nil
@@ -556,6 +582,20 @@ func (s *Server) applyAlterRoleConfig(op alterRoleConfigOp, liveDBName string) (
 			return true, nil
 		}
 		dbOid = catalog.FirstUserOID
+	}
+	if op.fromCurrent {
+		// Resolve the live session's CURRENT effective value now — see
+		// applyAlterDatabaseConfig's identical branch for the rationale
+		// (only reached once any "IN DATABASE <other>" no-op has already
+		// returned above).
+		if resolveCurrent == nil {
+			return true, &roleError{code: sqlstate.UndefinedObject, msg: fmt.Sprintf("unrecognized configuration parameter %q", op.configName)}
+		}
+		val, ok := resolveCurrent(op.configName)
+		if !ok {
+			return true, &roleError{code: sqlstate.UndefinedObject, msg: fmt.Sprintf("unrecognized configuration parameter %q", op.configName)}
+		}
+		op.configValue = val
 	}
 	switch {
 	case op.resetAll:
@@ -844,4 +884,14 @@ func roleErrorDetailFields(err error) []protocol.ErrorField {
 		return []protocol.ErrorField{{Code: protocol.FieldDetail, Value: re.detail}}
 	}
 	return nil
+}
+
+// roleErrorDetail returns a role error's bare errdetail text (the
+// extended-protocol counterpart of roleErrorDetailFields, whose wire-field
+// wrapping is simple-query-only). "" when err carries no PG errdetail.
+func roleErrorDetail(err error) string {
+	if re, ok := err.(*roleError); ok {
+		return re.detail
+	}
+	return ""
 }

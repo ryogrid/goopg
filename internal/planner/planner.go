@@ -9996,29 +9996,98 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 	for _, c := range idxScan.Index.Columns {
 		idxColSet[c] = true
 	}
+	colByName := make(map[string]catalog.Column, len(idxScan.Table.Columns))
+	for _, c := range idxScan.Table.Columns {
+		colByName[c.Name] = c
+	}
 	covered := make([]catalog.Column, 0, len(proj.Targets))
+	coveredIdx := make(map[string]int, len(proj.Targets))
 	for _, t := range proj.Targets {
 		cr, isCR := t.(*ColumnRef)
 		if !isCR || !idxColSet[cr.Name] {
 			return proj // target not in index — cannot use index-only
 		}
-		// Find the full column definition from the table.
-		col, found := func() (catalog.Column, bool) {
-			for _, c := range idxScan.Table.Columns {
-				if c.Name == cr.Name {
-					return c, true
-				}
-			}
-			return catalog.Column{}, false
-		}()
+		col, found := colByName[cr.Name]
 		if !found {
 			return proj
+		}
+		if _, exists := coveredIdx[cr.Name]; !exists {
+			coveredIdx[cr.Name] = len(covered)
 		}
 		covered = append(covered, col)
 	}
 	if len(covered) == 0 {
 		return proj
 	}
+
+	// A surviving Filter's Predicate still carries ColumnRef.Index values
+	// resolved against idxScan's full (pre-promotion) output schema. Any
+	// column it references that isn't already in `covered` (e.g. a residual
+	// conjunct on a column outside the SELECT list) must be appended so the
+	// predicate keeps a valid slot to read once the scan narrows to
+	// `covered` — otherwise it panics `Slot.Get` at evaluation time
+	// (M0121-0002: WordPress `wp_set_object_terms`'s `SELECT
+	// term_taxonomy_id FROM wp_term_relationships WHERE object_id = ? AND
+	// term_taxonomy_id = ?` crashed the connection this way — the residual
+	// `term_taxonomy_id = ?` conjunct's ColumnRef still pointed at its
+	// pre-promotion index (1) after Covered narrowed to a single column).
+	// Bail to the unpromoted plan when the filter needs a column the index
+	// doesn't carry at all, or references something walkColumnRefs treats
+	// as out of scope (outer/subquery refs) — safe, just forgoes the
+	// IndexOnlyScan optimization for that shape.
+	oldSchema := idxScan.Output()
+	if filter != nil {
+		ok := true
+		walkColumnRefs(filter.Predicate, func(oldIdx int) {
+			if !ok || oldIdx < 0 || oldIdx >= len(oldSchema) {
+				ok = false
+				return
+			}
+			name := oldSchema[oldIdx].Name
+			if _, exists := coveredIdx[name]; exists {
+				return
+			}
+			if !idxColSet[name] {
+				ok = false
+				return
+			}
+			col, found := colByName[name]
+			if !found {
+				ok = false
+				return
+			}
+			coveredIdx[name] = len(covered)
+			covered = append(covered, col)
+		}, func() { ok = false })
+		if !ok {
+			return proj
+		}
+	}
+
+	// needsProject is true only when the filter pulled in a column beyond
+	// the original SELECT list — the common case (no filter, or the filter
+	// only touches already-selected columns) keeps the existing
+	// direct-passthrough shape (no Project) with `covered` in exactly
+	// proj.Targets' order, unchanged from before this fix.
+	needsProject := len(covered) > len(proj.Targets)
+	iosSchema := proj.schema
+	if needsProject {
+		iosSchema = make(Schema, len(covered))
+		for i, c := range covered {
+			sc := SchemaColumn{Name: c.Name, Type: c.Type}
+			for _, old := range oldSchema {
+				if old.Name == c.Name {
+					sc = old
+					break
+				}
+			}
+			iosSchema[i] = sc
+		}
+	}
+	if filter != nil {
+		filter.Predicate = remapColumnRefsToSchema(filter.Predicate, oldSchema, coveredIdx)
+	}
+
 	ios := &IndexOnlyScan{
 		pos:     idxScan.pos,
 		Table:   idxScan.Table,
@@ -10028,14 +10097,113 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		LowKey:  idxScan.LowKey,
 		HighKey: idxScan.HighKey,
 		Covered: covered,
-		schema:  proj.schema,
+		schema:  iosSchema,
 	}
+
+	var out Node = ios
 	if filter != nil {
 		// Keep the Filter but replace its child with IndexOnlyScan.
 		filter.Child = ios
-		return filter
+		out = filter
 	}
-	return ios
+	if !needsProject {
+		return out
+	}
+	// The filter needed a column outside the SELECT list, so `covered`
+	// (and thus ios' output schema) is wider than proj.Targets — reinstate
+	// an explicit Project to narrow back down to the requested columns,
+	// with each target's ColumnRef re-pointed at its position in `covered`.
+	newTargets := make([]Expr, len(proj.Targets))
+	for i, t := range proj.Targets {
+		cr := t.(*ColumnRef)
+		nc := *cr
+		nc.Index = coveredIdx[cr.Name]
+		newTargets[i] = &nc
+	}
+	return &Project{pos: proj.pos, Child: out, Targets: newTargets, schema: proj.schema}
+}
+
+// remapColumnRefsToSchema rewrites every ColumnRef in e — indexed against
+// oldSchema — to its position in newIndex (column name -> new index).
+// Mirrors shiftColumnRefsBy's traversal (kept in lockstep with it and with
+// walkColumnRefs); used when a Filter predicate survives an IndexOnlyScan
+// promotion that narrows or reorders the child scan's output columns
+// (M0121-0002).
+func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) Expr {
+	if e == nil {
+		return nil
+	}
+	switch x := e.(type) {
+	case *ColumnRef:
+		cl := *x
+		cl.Index = newIndex[oldSchema[x.Index].Name]
+		return &cl
+	case *BinaryOp:
+		return &BinaryOp{
+			pos:        x.Pos(),
+			Op:         x.Op,
+			Left:       remapColumnRefsToSchema(x.Left, oldSchema, newIndex),
+			Right:      remapColumnRefsToSchema(x.Right, oldSchema, newIndex),
+			ResultType: x.ResultType,
+		}
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+	case *UnaryOp:
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex)}
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = remapColumnRefsToSchema(a, oldSchema, newIndex)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic}
+	case *InExpr:
+		list := make([]Expr, len(x.List))
+		for i, item := range x.List {
+			list[i] = remapColumnRefsToSchema(item, oldSchema, newIndex)
+		}
+		return &InExpr{
+			pos:             x.Pos(),
+			Operand:         remapColumnRefsToSchema(x.Operand, oldSchema, newIndex),
+			Negated:         x.Negated,
+			NotEqualAny:     x.NotEqualAny,
+			AnyOp:           x.AnyOp,
+			Plan:            x.Plan,
+			List:            list,
+			IsNonCorrelated: x.IsNonCorrelated,
+		}
+	case *CaseExpr:
+		whens := make([]CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = CaseWhen{
+				When: remapColumnRefsToSchema(w.When, oldSchema, newIndex),
+				Then: remapColumnRefsToSchema(w.Then, oldSchema, newIndex),
+			}
+		}
+		return &CaseExpr{
+			pos:     x.Pos(),
+			Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex),
+			Whens:   whens,
+			Else:    remapColumnRefsToSchema(x.Else, oldSchema, newIndex),
+		}
+	case *ExtractExpr:
+		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: remapColumnRefsToSchema(x.Source, oldSchema, newIndex)}
+	case *IsNullExpr:
+		return &IsNullExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), Negated: x.Negated}
+	case *IsBoolExpr:
+		return &IsBoolExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}
+	case *IsDistinctFromExpr:
+		return &IsDistinctFromExpr{pos: x.Pos(), Left: remapColumnRefsToSchema(x.Left, oldSchema, newIndex), Right: remapColumnRefsToSchema(x.Right, oldSchema, newIndex), Negated: x.Negated}
+	case *CollateExpr:
+		return &CollateExpr{pos: x.Pos(), Operand: remapColumnRefsToSchema(x.Operand, oldSchema, newIndex), CollationName: x.CollationName}
+	case *RowExpr:
+		elems := make([]Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			elems[i] = remapColumnRefsToSchema(el, oldSchema, newIndex)
+		}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
+	default:
+		return e
+	}
 }
 
 // tryPromoteOrderedIndexOnlyScan promotes a `Project(Sort(SeqScan))` plan to an

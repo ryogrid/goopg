@@ -48,6 +48,84 @@ func TestVariableUnitConversion(t *testing.T) {
 	}
 }
 
+// TestFormatDisplayValue pins the exact (raw -> display) mappings observed
+// against a real, separately-initdb'd PostgreSQL 18.3 instance for SHOW on
+// these GUCs (see the M0119-0004-ACLHEAP loop #79 ledger row's deferred item
+// (1)): a unit-flagged int GUC's raw canonical (unitless base-unit) value
+// must render with the greatest evenly-dividing unit, and 0/negative values
+// (the "disabled" sentinel several timeout GUCs use) must render bare, with
+// no unit suffix at all — mirrors guc.c's ShowGUCOption(record, use_units=true)
+// -> convert_int_from_base_unit, which only converts when result > 0.
+func TestFormatDisplayValue(t *testing.T) {
+	cases := []struct {
+		name string
+		unit Unit
+		raw  string
+		want string
+	}{
+		{"work_mem", UnitKB, "78848", "77MB"},       // SET work_mem = '77MB'
+		{"shared_buffers", UnitKB, "131072", "128MB"}, // 128MB boot value
+		{"checkpoint_timeout", UnitS, "300", "5min"},
+		{"deadlock_timeout", UnitMs, "1000", "1s"},
+		{"wal_receiver_status_interval", UnitS, "10", "10s"},
+		{"statement_timeout", UnitMs, "90000", "90s"},
+		{"statement_timeout (disabled)", UnitMs, "0", "0"},
+		{"lock_timeout (disabled)", UnitMs, "0", "0"},
+		{"max_slot_wal_keep_size (disabled)", UnitMB, "-1", "-1"},
+		{"min_wal_size", UnitMB, "80", "80MB"},
+		{"effective_cache_size", UnitKB, "4194304", "4GB"},
+		{"odd kb amount, no evenly-dividing MB", UnitKB, "1025", "1025kB"},
+	}
+	for _, c := range cases {
+		v := NewVariable(Variable{Name: "x", Type: TypeInt, Unit: c.unit, BootVal: c.raw, Context: ContextUserset})
+		if got := v.FormatDisplayValue(c.raw); got != c.want {
+			t.Errorf("%s: FormatDisplayValue(%q) = %q, want %q", c.name, c.raw, got, c.want)
+		}
+	}
+	// Non-unit and non-int GUCs pass through unchanged.
+	str := NewVariable(Variable{Name: "y", Type: TypeString, BootVal: "hello", Context: ContextUserset})
+	if got := str.FormatDisplayValue("hello"); got != "hello" {
+		t.Errorf("string GUC: got %q, want unchanged %q", got, "hello")
+	}
+	unitless := NewVariable(Variable{Name: "z", Type: TypeInt, BootVal: "5", Context: ContextUserset})
+	if got := unitless.FormatDisplayValue("5"); got != "5" {
+		t.Errorf("unitless int GUC: got %q, want unchanged %q", got, "5")
+	}
+}
+
+// TestSessionRegistryGetDisplay confirms GetDisplay/AllDisplay format
+// unit-flagged GUCs while Get/All keep returning the raw bare-number form
+// internal consumers (e.g. deadlockTimeout) rely on.
+func TestSessionRegistryGetDisplay(t *testing.T) {
+	r := NewRegistry()
+	r.MustRegister(NewVariable(Variable{
+		Name: "work_mem", Type: TypeInt, Unit: UnitKB,
+		BootVal: "512MB", Context: ContextUserset,
+	}))
+	sess := NewSessionRegistry(r)
+	if err := sess.Set("work_mem", "77MB", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, raw, _ := sess.Get("work_mem"); raw != "78848" {
+		t.Errorf("Get raw = %q, want 78848", raw)
+	}
+	if _, disp, _ := sess.GetDisplay("work_mem"); disp != "77MB" {
+		t.Errorf("GetDisplay = %q, want 77MB", disp)
+	}
+	found := false
+	for _, kv := range sess.AllDisplay() {
+		if kv.Name == "work_mem" {
+			found = true
+			if kv.Value != "77MB" {
+				t.Errorf("AllDisplay work_mem = %q, want 77MB", kv.Value)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("AllDisplay did not include work_mem")
+	}
+}
+
 func TestVariableEnumValidation(t *testing.T) {
 	v := NewVariable(Variable{
 		Name: "isolation", Type: TypeEnum,

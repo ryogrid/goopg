@@ -20,6 +20,7 @@ type LogCanonicalFunc func(payload []byte) (uint64, error)
 // PG resource manager IDs mirrored from internal/wal/xlog_record.go.
 // Defined locally to avoid the catalog → wal import cycle.
 const (
+	canonicalRmgrHeap2 uint8 = 9  // RM_HEAP2_ID (distinct rmgr from RM_HEAP_ID; carries PRUNE/VACUUM records)
 	canonicalRmgrHeap  uint8 = 10 // RM_HEAP_ID
 	canonicalRmgrBtree uint8 = 11 // RM_BTREE_ID
 )
@@ -30,6 +31,19 @@ const (
 	canonicalInfoHeapDelete  uint8 = 0x10 // XLOG_HEAP_DELETE
 	canonicalInfoHeapInplace uint8 = 0x70 // XLOG_HEAP_INPLACE
 	canonicalInfoBtreeInsert uint8 = 0x00 // XLOG_BTREE_INSERT_LEAF
+
+	// RM_HEAP2_ID opcodes (heapam_xlog.h). PG documents that
+	// ON_ACCESS/VACUUM_SCAN/VACUUM_CLEANUP "have separate opcodes just for
+	// debugging and analysis purposes" — replay is identical for all three.
+	canonicalInfoHeap2PruneOnAccess   uint8 = 0x10 // XLOG_HEAP2_PRUNE_ON_ACCESS
+	canonicalInfoHeap2PruneVacuumScan uint8 = 0x20 // XLOG_HEAP2_PRUNE_VACUUM_SCAN
+)
+
+// PruneReason mirrors PG's PruneReason enum (heapam.h), stored in the
+// xl_heap_prune main-data "reason" byte.
+const (
+	pruneReasonOnAccess   uint8 = 0 // PRUNE_ON_ACCESS
+	pruneReasonVacuumScan uint8 = 1 // PRUNE_VACUUM_SCAN
 )
 
 // XLog block reference format flags (mirrors pg_xlog_decode.go constants).
@@ -263,6 +277,63 @@ func BuildCanonicalHeapDeletePayload(
 	// mainData[7] = 0 (flags)
 	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
 	return buildCanonicalPayload(canonicalRmgrHeap, canonicalInfoHeapDelete, xid, body)
+}
+
+// PgCanonicalHeapPrune emits a PG-canonical XLOG_HEAP2_PRUNE_* record with a
+// full-page image for a page that had opportunistic (on-access) or VACUUM
+// pruning applied — dead/HOT-chain line pointers marked LP_REDIRECT/LP_UNUSED
+// and the page repacked. A vanilla PG18 standby's heap_xlog_prune_freeze
+// restores the whole page from the FPI and returns before parsing any
+// block-data sub-records at all (BLK_RESTORED short-circuit,
+// postgres/src/backend/access/heap/heapam_xlog.c), so — mirroring
+// PgCanonicalHeapInplace/PgCanonicalHeapDelete's established simplification —
+// no redirect/dead/unused offset arrays need to be encoded.
+//
+// onAccess selects PRUNE_ON_ACCESS (the opportunistic page-full fallback,
+// e.g. inside a HOT update) vs PRUNE_VACUUM_SCAN (VACUUM's heap pass);
+// PG treats both identically at replay and only reports them differently
+// for human-readable pg_waldump/pg_walinspect output.
+func PgCanonicalHeapPrune(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	xid uint32,
+	onAccess bool,
+	logFn LogCanonicalFunc,
+) (uint64, error) {
+	if logFn == nil {
+		return 0, nil
+	}
+	return logFn(BuildCanonicalHeapPrunePayload(rel, blk, page, xid, onAccess))
+}
+
+// BuildCanonicalHeapPrunePayload encodes a XLOG_HEAP2_PRUNE_* payload with a
+// full-page image. xl_heap_prune struct layout (heapam_xlog.h):
+//
+//	reason  uint8  (1 byte)
+//	flags   uint8  (1 byte) — total 2 bytes of main-data content (SizeOfHeapPrune)
+//
+// flags=0: no XLHP_HAS_CONFLICT_HORIZON/XLHP_HAS_REDIRECTIONS/etc, so the
+// replay-side Assert `(flags&CLEANUP_LOCK)!=0 || (flags&(REDIRECTIONS|DEAD))==0`
+// holds trivially and no block-data sub-records are needed alongside the FPI.
+func BuildCanonicalHeapPrunePayload(
+	rel storage.RelFileNode,
+	blk storage.BlockNumber,
+	page storage.Page,
+	xid uint32,
+	onAccess bool,
+) []byte {
+	reason := pruneReasonVacuumScan
+	info := canonicalInfoHeap2PruneVacuumScan
+	if onAccess {
+		reason = pruneReasonOnAccess
+		info = canonicalInfoHeap2PruneOnAccess
+	}
+	var mainData [2]byte
+	mainData[0] = reason
+	// mainData[1] = 0 (flags)
+	body := buildCanonicalSingleFPIBody(rel, blk, page, mainData[:])
+	return buildCanonicalPayload(canonicalRmgrHeap2, info, xid, body)
 }
 
 // canonicalRmgrXact mirrors PG's RM_XACT_ID. Defined locally to keep

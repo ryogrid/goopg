@@ -33,6 +33,7 @@ type collationRegistryRecovery interface {
 	DropCollationDuringRecovery(name, schema string)
 	RenameCollationDuringRecovery(name, schema, newName string)
 	SetCollationOwnerDuringRecovery(name, schema string, ownerOID uint32)
+	SetCollationSchemaDuringRecovery(name, schema, newSchema string)
 }
 
 // replayCollationDDLRecords reads every WAL record under walDir and applies
@@ -111,6 +112,12 @@ func replayCollationDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode alter-collation-owner at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.SetCollationOwnerDuringRecovery(name, schema, ownerOID)
+		case wal.RecordKindAlterCollationSetSchema:
+			name, schema, newSchema, derr := wal.DecodeAlterCollationSetSchema(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-collation-set-schema at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetCollationSchemaDuringRecovery(name, schema, newSchema)
 		}
 	}
 	return nil

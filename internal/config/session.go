@@ -81,6 +81,33 @@ func (s *SessionRegistry) Get(name string) (*Variable, string, bool) {
 	return v, v.Value, true
 }
 
+// GetDisplay is like Get but returns the client-visible display form (e.g.
+// "77MB" rather than "78848") for unit-flagged GUCs — the pair backs SHOW,
+// current_setting(), and ALTER DATABASE/ROLE ... SET ... FROM CURRENT, all of
+// which mirror upstream's GetConfigOptionByName(name, NULL, false) ->
+// ShowGUCOption(record, use_units=true). Internal callers that need the raw
+// canonical value for their own arithmetic (e.g. deadlock_timeout parsing a
+// bare millisecond integer) must keep using Get, not this method.
+func (s *SessionRegistry) GetDisplay(name string) (*Variable, string, bool) {
+	v, eff, ok := s.Get(name)
+	if !ok {
+		return v, eff, ok
+	}
+	return v, v.FormatDisplayValue(eff), true
+}
+
+// AllDisplay is like All but formats each value via GetDisplay — the SHOW
+// ALL / pg_settings-style counterpart to GetDisplay.
+func (s *SessionRegistry) AllDisplay() []ReportableValue {
+	all := s.global.All()
+	out := make([]ReportableValue, 0, len(all))
+	for _, v := range all {
+		_, eff, _ := s.GetDisplay(v.Name)
+		out = append(out, ReportableValue{Name: v.Name, Value: eff})
+	}
+	return out
+}
+
 // Set applies SET name = value (or SET LOCAL ...). Returns an error if
 // the variable doesn't exist, the value fails validation, or the
 // variable's Context forbids SQL-driven changes.
