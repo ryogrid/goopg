@@ -367,3 +367,65 @@ remain unimplemented (they exist today only as `WITHIN GROUP`
 ordered-set aggregates, a different code path). ROWS/RANGE/GROUPS
 frame-clause parsing/execution itself is still the largest remaining
 piece of this bucket — see the previous Follow-up section.
+
+## Follow-up: ntile/cume_dist/percent_rank (2026-07-05, M0122-0004)
+
+Implemented the three remaining ranking window functions named as open
+in the previous two Follow-up sections. Unlike `first_value`/
+`last_value`/`nth_value`, none of these are frame-relative — they
+needed their own per-partition computation rather than a drop-in onto
+`peerGroupBounds`'s existing consumers, matching the prediction in the
+`2026-07-05` `M0122-0003`-adjacent ledger row that this would not be
+mechanical.
+
+**AST/planner:** `buildWindowFunc` (`internal/planner/planner.go`)
+gained `"cume_dist"`/`"percent_rank"` (zero arguments, no DISTINCT/star,
+return type `float8` — matches `pg_proc.dat`) and `"ntile"` (exactly
+one argument, return type `int4`) cases. `analyzeWindowFuncCall`
+(`internal/analyzer/analyzer.go`) mirrors the same arg-shape checks.
+
+**Executor (`internal/executor/operators_window.go`):**
+
+- `ntile(nbuckets)` reproduces `window_ntile`
+  (`postgres/src/backend/utils/adt/windowfuncs.c`) exactly: `nbuckets`
+  is evaluated once per partition (from the partition's first row,
+  matching upstream's first-call-only argument evaluation), rejects
+  `nbuckets <= 0` with `22014`
+  (`argument of ntile must be greater than zero`), and the first
+  `total % nbuckets` buckets get one extra row rather than
+  concentrating the remainder in the last bucket. New
+  `evalNtileFuncs`/`evalNtileFunc`, called from `evalWindowFuncs`
+  alongside the existing `evalFrameAggFuncs` pre-computation pass.
+- `percent_rank()` = `(rank - 1) / (total_rows - 1)`, `0` when the
+  partition has a single row (matches `window_percent_rank`'s
+  divide-by-zero guard).
+- `cume_dist()` = `NP / total_rows`, where `NP` is the 1-based count of
+  rows at or before the current row's peer group — i.e. exactly the
+  existing `frameEnd[]` boundary (`peerGroupBounds`) also used by
+  `first_value`/`last_value`. `hasFrameValueWindowFunc` was extended to
+  also gate `frameEnd[]` computation for `cume_dist`.
+- Both `percent_rank`/`cume_dist` reuse the existing `rank` local
+  (already computed for `rank()`/`dense_rank()`) rather than
+  recomputing tie position.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowRankingFunctionsAccepted`,
+`TestAnalyzeWindowRankingFunctionsRejected`;
+`TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+`dense_rank()` since `ntile()` is no longer a valid rejection case),
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowNtileBuckets`,
+`TestCompatWindowNtileMoreBucketsThanRows`,
+`TestCompatWindowNtileInvalidArgument`,
+`TestCompatWindowPercentRankAndCumeDist`) — the bucket-sizing and
+percent_rank/cume_dist cases pin exact values reasoned from upstream's
+algorithm, including the non-obvious "remainder buckets get the extra
+row, not the last bucket" rule.
+
+**Still open:** `dense_rank()` as a window function (only its `WITHIN
+GROUP` ordered-set-aggregate form exists) is now the only rejection
+case left for `TestAnalyzeWindowFunctionUnsupportedRejected`.
+ROWS/RANGE/GROUPS frame-clause parsing/execution itself remains the
+largest item in this M0020 bucket — every ranking/value/aggregate
+window function implemented so far still assumes PostgreSQL's default
+frame; an explicit frame clause is not yet parseable at all.

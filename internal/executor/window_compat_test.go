@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -444,5 +445,183 @@ func TestCompatWindowRankNullPeersAsc(t *testing.T) {
 	}
 	if !rows[2][0].IsNull() || rows[2][1].Kind != KindInt || rows[2][1].Int != 2 {
 		t.Fatalf("row2=%+v want NULL rank=2", rows[2])
+	}
+}
+
+// TestCompatWindowNtileBuckets pins ntile()'s bucket-sizing algorithm: the
+// first `total % nbuckets` buckets get one extra row (matches window_ntile
+// in postgres/src/backend/utils/adt/windowfuncs.c) rather than
+// concentrating the remainder in the last bucket.
+func TestCompatWindowNtileBuckets(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	for _, v := range []int64{1, 2, 3, 4, 5, 6, 7} {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: v}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx, "SELECT val, ntile(3) OVER (ORDER BY val) AS nt FROM t ORDER BY val")
+	want := []int64{1, 1, 1, 2, 2, 3, 3}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("row[%d] nt=%+v want %d", i, rows[i][1], w)
+		}
+	}
+}
+
+// TestCompatWindowNtileMoreBucketsThanRows pins the nbuckets > total case:
+// each row becomes its own bucket (1..total); the remaining buckets are
+// simply never assigned to any row.
+func TestCompatWindowNtileMoreBucketsThanRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	for _, v := range []int64{1, 2, 3} {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: v}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx, "SELECT val, ntile(10) OVER (ORDER BY val) AS nt FROM t ORDER BY val")
+	want := []int64{1, 2, 3}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w {
+			t.Fatalf("row[%d] nt=%+v want %d", i, rows[i][1], w)
+		}
+	}
+}
+
+// TestCompatWindowNtileInvalidArgument pins the 22014
+// invalid_argument_for_ntile_function error for a non-positive bucket
+// count (matches window_ntile's ERRCODE_INVALID_ARGUMENT_FOR_NTILE).
+func TestCompatWindowNtileInvalidArgument(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	sql := "SELECT val, ntile(0) OVER (ORDER BY val) FROM t"
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		t.Fatalf("Plan(%q): %v", sql, err)
+	}
+	op, err := Build(plan)
+	if err != nil {
+		t.Fatalf("Build(%q): %v", sql, err)
+	}
+	if err := op.Open(ctx); err == nil {
+		t.Fatal("ntile(0) expected error, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "22014" {
+		t.Fatalf("ntile(0) err=%v want ExecError 22014", err)
+	}
+}
+
+// TestCompatWindowPercentRankAndCumeDist pins percent_rank()/cume_dist()'s
+// tie-aware formulas: (rank-1)/(total-1) and NP/NR where NP is the 1-based
+// end position of the current row's peer group (matches
+// window_percent_rank/window_cume_dist in
+// postgres/src/backend/utils/adt/windowfuncs.c).
+func TestCompatWindowPercentRankAndCumeDist(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 20}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT val, percent_rank() OVER (ORDER BY val) AS pr, cume_dist() OVER (ORDER BY val) AS cd FROM t ORDER BY val")
+	want := []struct{ pr, cd float64 }{
+		{0, 0.4}, {0, 0.4}, {0.5, 0.8}, {0.5, 0.8}, {1, 1},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		pr, err := strconv.ParseFloat(rows[i][1].StringValue(), 64)
+		if err != nil {
+			t.Fatalf("row[%d] pr parse: %v (%+v)", i, err, rows[i][1])
+		}
+		cd, err := strconv.ParseFloat(rows[i][2].StringValue(), 64)
+		if err != nil {
+			t.Fatalf("row[%d] cd parse: %v (%+v)", i, err, rows[i][2])
+		}
+		if pr != w.pr {
+			t.Fatalf("row[%d] pr=%v want %v", i, pr, w.pr)
+		}
+		if cd != w.cd {
+			t.Fatalf("row[%d] cd=%v want %v", i, cd, w.cd)
+		}
+	}
+}
+
+// TestCompatWindowPercentRankSingleRow pins the "return zero if there's
+// only one row, per spec" special case in window_percent_rank.
+func TestCompatWindowPercentRankSingleRow(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	if err := writeHeapRow(ctx, rel, tbl.Columns, Row{{Kind: KindInt, Int: 1}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows := runQuery(t, ctx, "SELECT percent_rank() OVER (ORDER BY val) AS pr FROM t")
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	pr, err := strconv.ParseFloat(rows[0][0].StringValue(), 64)
+	if err != nil {
+		t.Fatalf("pr parse: %v", err)
+	}
+	if pr != 0 {
+		t.Fatalf("pr=%v want 0", pr)
 	}
 }

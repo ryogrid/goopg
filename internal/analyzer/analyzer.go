@@ -1429,6 +1429,19 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 		retType = valueTyp
+	case "cume_dist", "percent_rank":
+		if x.Star || x.Distinct || len(x.Args) != 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
+		}
+		retType = catalog.Type{Name: "float8"}
+	case "ntile":
+		if x.Star || x.Distinct || len(x.Args) != 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", "window function ntile() requires exactly one argument")
+		}
+		if _, err := analyzeExpr(x.Args[0], ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		retType = catalog.Type{Name: "int4"}
 	default:
 		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
 	}

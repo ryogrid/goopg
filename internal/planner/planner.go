@@ -5002,6 +5002,20 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 			args = append(args, resolved)
 		}
 		return WindowFunc{pos: fc.Pos(), Name: name, Type: inferExprType(args[0]), Args: args}, nil
+	case "cume_dist", "percent_rank":
+		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "float8"}}, nil
+	case "ntile":
+		if fc.Star || fc.Distinct || len(fc.Args) != 1 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "window function ntile() requires exactly one argument"}
+		}
+		argResolved, err := resolveExprForWindowInput(fc.Args[0], inputCtx, agg)
+		if err != nil {
+			return WindowFunc{}, err
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int4"}, Args: []Expr{argResolved}}, nil
 	default:
 		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
 	}

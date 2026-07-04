@@ -2,6 +2,7 @@ package executor
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/planner"
@@ -163,12 +164,15 @@ func (o *windowOp) evalWindowFuncs() error {
 		if err := o.evalFrameAggFuncs(aggHelper, colBase, pStart, pEnd); err != nil {
 			return err
 		}
+		if err := o.evalNtileFuncs(colBase, pStart, pEnd); err != nil {
+			return err
+		}
 
 		// frameEnd[i-pStart] is the exclusive end of the peer group
 		// containing row i — the default-frame end (RANGE UNBOUNDED
 		// PRECEDING AND CURRENT ROW) that first_value/last_value/
-		// nth_value need. Only computed when one of those functions is
-		// actually present.
+		// nth_value/cume_dist need. Only computed when one of those
+		// functions is actually present.
 		var frameEnd []int
 		if hasFrameValueWindowFunc(o.plan.Funcs) {
 			groupBounds, err := o.peerGroupBounds(pStart, pEnd)
@@ -242,6 +246,21 @@ func (o *windowOp) evalWindowFuncs() error {
 					}
 				case "sum", "count", "avg", "min", "max":
 					// Already computed per-frame in evalFrameAggFuncs above.
+				case "ntile":
+					// Already computed per-partition in evalNtileFuncs above.
+				case "percent_rank":
+					total := int64(pEnd - pStart)
+					if total <= 1 {
+						o.rows[i][colIdx] = NewStringDatum("0")
+					} else {
+						result := float64(rank-1) / float64(total-1)
+						o.rows[i][colIdx] = NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+					}
+				case "cume_dist":
+					total := int64(pEnd - pStart)
+					np := int64(frameEnd[localIdx] - pStart)
+					result := float64(np) / float64(total)
+					o.rows[i][colIdx] = NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
 				case "first_value":
 					v, err := evalExpr(fn.Args[0], o.rows[pStart], o.ctx)
 					if err != nil {
@@ -300,16 +319,86 @@ func isFrameAggWindowFunc(name string) bool {
 }
 
 // hasFrameValueWindowFunc reports whether fns contains first_value,
-// last_value, or nth_value — the frame-relative-offset window functions
-// that need the default-frame end (peer-group boundary) computed per row.
+// last_value, nth_value, or cume_dist — functions that need the
+// default-frame end (peer-group boundary) computed per row.
 func hasFrameValueWindowFunc(fns []planner.WindowFunc) bool {
 	for _, fn := range fns {
 		switch strings.ToLower(fn.Name) {
-		case "first_value", "last_value", "nth_value":
+		case "first_value", "last_value", "nth_value", "cume_dist":
 			return true
 		}
 	}
 	return false
+}
+
+// evalNtileFuncs computes ntile() bucket numbers for every ntile() call in
+// o.plan.Funcs across one partition, writing results directly into o.rows —
+// mirroring how evalFrameAggFuncs pre-computes sum/count/avg/min/max so the
+// per-row switch in evalWindowFuncs only has to skip already-filled columns.
+func (o *windowOp) evalNtileFuncs(colBase, pStart, pEnd int) error {
+	for j, fn := range o.plan.Funcs {
+		if strings.ToLower(fn.Name) != "ntile" {
+			continue
+		}
+		if err := o.evalNtileFunc(fn, colBase+j, pStart, pEnd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// evalNtileFunc computes ntile()'s bucket assignment for one partition,
+// reproducing window_ntile's exact bucket-sizing algorithm
+// (postgres/src/backend/utils/adt/windowfuncs.c): the first `total %
+// nbuckets` buckets get one extra row so the remainder isn't concentrated
+// in the last bucket. The bucket-count argument is evaluated once, from the
+// partition's first row, matching PostgreSQL's WinGetFuncArgCurrent-on-
+// first-call semantics.
+func (o *windowOp) evalNtileFunc(fn planner.WindowFunc, colIdx, pStart, pEnd int) error {
+	total := int64(pEnd - pStart)
+	if total == 0 {
+		return nil
+	}
+	nArg, err := evalExpr(fn.Args[0], o.rows[pStart], o.ctx)
+	if err != nil {
+		return err
+	}
+	if nArg.IsNull() {
+		for i := pStart; i < pEnd; i++ {
+			o.rows[i][colIdx] = NullDatum
+		}
+		return nil
+	}
+	if nArg.Kind != KindInt || nArg.Int <= 0 {
+		return &ExecError{Code: "22014", Pos: fn.Pos(), Message: "argument of ntile must be greater than zero"}
+	}
+	nbuckets := nArg.Int
+
+	ntile := int64(1)
+	rowsPerBucket := int64(0)
+	boundary := total / nbuckets
+	remainder := int64(0)
+	if boundary <= 0 {
+		boundary = 1
+	} else {
+		remainder = total % nbuckets
+		if remainder != 0 {
+			boundary++
+		}
+	}
+	for i := pStart; i < pEnd; i++ {
+		rowsPerBucket++
+		if boundary < rowsPerBucket {
+			if remainder != 0 && ntile == remainder {
+				remainder = 0
+				boundary--
+			}
+			ntile++
+			rowsPerBucket = 1
+		}
+		o.rows[i][colIdx] = NewIntDatum(ntile)
+	}
+	return nil
 }
 
 // evalFrameAggFuncs computes sum/count/avg/min/max window functions for

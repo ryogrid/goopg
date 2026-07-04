@@ -131,11 +131,13 @@ func TestAnalyzeWindowFunctionAccepted(t *testing.T) {
 
 func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
-	// count(*) OVER () and first_value/last_value/nth_value are now
-	// supported (M0122-0004) — ntile() is a real PostgreSQL window
-	// function still unimplemented in v0, so it remains the rejection case.
+	// count(*) OVER () and first_value/last_value/nth_value/ntile/
+	// cume_dist/percent_rank are now supported (M0122-0004) — dense_rank()
+	// as a window function is a real PostgreSQL window function still
+	// unimplemented in v0 (only its WITHIN GROUP ordered-set-aggregate
+	// form exists), so it remains the rejection case.
 	expectAnalyzeCode(t, cat,
-		"SELECT ntile(4) OVER () FROM pgbench_accounts",
+		"SELECT dense_rank() OVER () FROM pgbench_accounts",
 		"0A000")
 }
 
@@ -167,6 +169,40 @@ func TestAnalyzeWindowValueFunctionsRejected(t *testing.T) {
 		"42601")
 	expectAnalyzeCode(t, cat,
 		"SELECT nth_value(abalance) OVER () FROM pgbench_accounts",
+		"42601")
+}
+
+// TestAnalyzeWindowRankingFunctionsAccepted pins the M0122-0004
+// ntile/cume_dist/percent_rank window functions.
+func TestAnalyzeWindowRankingFunctionsAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT ntile(4) OVER (ORDER BY aid) FROM pgbench_accounts",
+		"SELECT cume_dist() OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts",
+		"SELECT percent_rank() OVER (ORDER BY aid) FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowRankingFunctionsRejected pins the argument-shape checks
+// for ntile/cume_dist/percent_rank.
+func TestAnalyzeWindowRankingFunctionsRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT ntile() OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT ntile(4, 5) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT cume_dist(1) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT percent_rank(*) OVER () FROM pgbench_accounts",
 		"42601")
 }
 
