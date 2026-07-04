@@ -1,46 +1,70 @@
 (idle — nothing in flight)
 
-M0122-0003 (EXPLAIN FORMAT XML/YAML + per-CTE ANALYZE stats) committed and
-pushed to `align-data-structure-with-pg` (`abb4a549`):
-- FORMAT XML/YAML: `internal/parser/ast.go` gains `ExplainFormatXML`/
-  `ExplainFormatYAML`; new `internal/executor/operators_explain_format.go`
-  walks the existing `planToJSON`/`planToJSONWithStats` tree (no new
-  tree-build logic), mirroring PG's `explain_format.c` tag sanitization /
-  YAML line-starting rules. Tests: `explain_format_xml_yaml_test.go`.
-- Per-CTE ANALYZE stats: `Build()`'s `CTEScan`/`CTEDMLPrefix`/
-  `MaterializedCTEScan` cases now route through `maybeInstrument`, so the
-  CTE node's own EXPLAIN line reports actual rows/time (previously only
-  its inlined child did). Tests: `with_explain_test.go`. Residual deferred
-  (ledger): `cteDMLPrefixOp.Open()` Builds its DML/body plans lazily,
-  outside the ANALYZE instrumentation scope, so nested nodes under "CTE
-  DML" still show cost-only estimates.
-- Both slices were produced by two concurrently-running `ralph_loop.sh`
-  iterations on the same shared working tree (no worktree isolation) and
-  reconciled into one commit — verified disjoint + green before folding
-  in, per the root-0026 precedent. Design:
-  `docs/design/0122-0003-explain-format-xml-yaml.md`. 4 ledger rows added
-  (SETTINGS/BUFFERS rendering, `pg_stat_io` real data, `track_io_timing`
-  runtime SET, CTEDMLPrefix residual above).
-- Gates: build/vet clean; `internal/executor` + `internal/parser` full
-  packages PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
-  smoke via pre-commit hook PASS.
+M0122-0003 (EXPLAIN SETTINGS rendering) committed and pushed to
+`align-data-structure-with-pg` (`adfb7dc7`):
+- `internal/config/guc.go` gains `FlagExplain` (mirrors `guc_tables.c`'s
+  `GUC_EXPLAIN`), tagged on the 45 goopg-registered GUCs upstream flags
+  out of 62 total (extracted via a full-file scan of
+  `postgres/src/backend/utils/misc/guc_tables.c`). 17 upstream names have
+  no goopg registry entry at all (geqo*, temp_buffers, etc) — unreachable,
+  not a bug, noted in the ledger.
+- `internal/config/session.go`'s `SessionRegistry.ExplainVariables()`
+  compares each FlagExplain GUC's effective value against its
+  **canonicalized** BootVal — caught and fixed a real bug where comparing
+  against the raw literal BootVal (e.g. "512MB") vs. the canonicalized
+  effective value (e.g. "524288") false-flagged nearly every unit-bearing
+  GUC as "modified" even at boot (`TestExplainVariablesEmptyByDefault`
+  caught it before commit).
+- New `Context.ExplainSettings` field wired in BOTH
+  `internal/server/dispatch.go` and `dispatch_extended.go` (simple +
+  extended protocol paths — sibling-paths rule).
+- `internal/executor/operators_explain.go`: `appendExplainSettingsRow`
+  (TEXT, omitted when empty) + `addExplainSettingsGroup` (JSON/XML/YAML,
+  always-present `{}` when empty) called from all 4 `explainOp.Open`
+  branches.
+- Design: `docs/design/0122-0003-explain-format-xml-yaml.md` (new
+  "SETTINGS rendering" section + cluster-status table updated) +
+  `docs/design/README.md` index entry extended in place (no new doc file
+  — same milestone slice).
+- Tests: `internal/executor/explain_settings_test.go` (6 tests),
+  `internal/config/guc_test.go` (+2 tests). Ledger row appended
+  (`.ralph/deferral_ledger.md`, 2026-07-04, M0122-0003) — BUFFERS/
+  `pg_stat_io`/`track_io_timing` still open, unchanged.
+- Gates: build/vet clean; `internal/executor`+`internal/config`+
+  `internal/server` full packages PASS; `make ralph-state-guard`
+  auto-repaired the routine running/completed skew (harmless, documented
+  pattern); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench smoke
+  via pre-commit hook PASS.
 
-**Concurrency hazard — STILL UNRESOLVED after 3+ loops (#6, #7, #8).** Two
-independent `ralph_loop.sh --live` trees are both running on this exact
-working tree right now (named `ralph` screen PID 2085426; unnamed Attached
-screen `2087325.pts-9`) — confirmed via distinct cwd/ancestry, not a
-subshell false-positive. This loop hit a concrete collision (not just
-theoretical git-merge evidence like #6/#7): found the sibling's uncommitted
-CTE-instrumentation fix mid-task and reconciled it cleanly. Sent a
-PushNotification to the human this loop per the #7 note's escalation
-instruction (desktop notification; mobile not sent — Remote Control
-inactive). Did not kill either process (Attached screen = possible live
-human terminal; can't get sign-off autonomously). If loop #9 still finds
-two trees, escalate again — a human should actively decide whether to
-consolidate (`screen -r 2087325` or `-r 2085426` to inspect).
+**Concurrency hazard — STILL PRESENT, now 4+ loops (#6,#7,#8,#9), but
+non-blocking.** Two independent `ralph_loop.sh --live` trees are both
+still running on this exact working tree (Tree A: root `2085426`
+`SCREEN -dmS ralph`, this loop's own lineage; Tree B: root `2087325`
+screen, PID `2087655`). This loop caught Tree B's WIP mid-session
+(`internal/executor/pg18_user_catalog_rows.go` +2, `internal/wal/
+recovery.go` +73, then moments later two new untracked files
+`internal/initdb/matview_ddl_recovery.go`/`_test.go` appeared) — clearly a
+materialized-view DDL/recovery feature in progress. Followed the #6-#8
+precedent: staged an EXPLICIT file list for `git add` (never `-A`/`.`),
+verified `git status` after staging showed none of Tree B's files, and
+committed/pushed cleanly without touching its work. Did not attempt any
+kill (per the historical 2026-05-25 saga in memory, killing a peer
+supervisor is policy-blocked without user authorization anyway; also
+moot here since this hazard hasn't actually blocked progress in 4 loops —
+unlike that 6-hour standoff, both trees keep landing disjoint work
+cleanly). If a future loop finds itself editing a file Tree B is also
+mid-edit on (check `git status` + `git diff --stat` for files you didn't
+touch, before every `git add`), stop and reconcile per the root-0026
+precedent rather than force-add.
 
-Next step: pick up the M0122-0003 remainder (SETTINGS/BUFFERS rendering +
-`pg_stat_io` share a root cause — no buffer-pool hit/read counters exist
-yet in `internal/executor/instrument.go`'s `nodeStats`; bundle as one unit
-per the ledger rows) or continue the M0119-0004 pg_dump catalog-view parity
-battery per `.ralph/fix_plan.md`.
+Next step: pick up the M0122-0003 remainder — BUFFERS rendering +
+`pg_stat_io` real data + `track_io_timing` runtime SET all share one root
+cause (no buffer-pool hit/read/write counters exist anywhere in
+`internal/executor/instrument.go`'s `nodeStats`); this is a real
+instrumentation-layer addition (locate `Pool.Get`/pin-count call sites in
+the storage package, decide hit-vs-read, add counters), bigger than a
+single loop — scope the first slice narrowly (e.g. just `shared hit=N
+read=N` counters for SeqScan/IndexScan, skip dirtied/written/local/temp
+initially). Alternatively continue the M0119-0004 pg_dump catalog-view
+parity battery per `.ralph/fix_plan.md` if BUFFERS instrumentation looks
+too large for one loop.
