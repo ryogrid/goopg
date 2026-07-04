@@ -13964,3 +13964,48 @@ smoke = pre-commit hook. No new deferral for the two registries fixed this
 loop; the "any other schema-qualified registry" caveat above remains open
 but is not newly discovered — it restates the prior row's own residual
 uncertainty.
+
+## Follow-up: `ALTER TABLE ... OWNER TO` (and the ALTER SEQUENCE/VIEW forms sharing its code path) now reject an unknown role (loop #107)
+
+Closes a standing ledger row: unlike every sibling OWNER TO site (`ALTER
+SCHEMA`, `ALTER STATISTICS`, `ALTER COLLATION`, `ALTER AGGREGATE`, `ALTER
+PUBLICATION`/`SUBSCRIPTION`, `ALTER EVENT TRIGGER` — all of which resolve
+the target role via `catalog.InMemory.RoleOID` and raise `42704 role "..."
+does not exist` for an unknown one, mirroring real PostgreSQL's
+`AlterTableOwner`/`get_role_oid(false)` in
+`postgres/src/backend/commands/tablecmds.c`), `execAlterTable`
+(`internal/executor/operators_ddl.go`, the `s.OwnerTo != ""` branch) wrote
+`tbl.Owner = s.OwnerTo` unconditionally — an `ALTER TABLE t OWNER TO
+typo_role` silently "succeeded" and left the table permanently owned by a
+nonexistent role.
+
+- Fix: the same `im.RoleOID(s.OwnerTo)` existence check (skipped only for
+  the `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` sentinel, which maps to
+  the empty-string bootstrap-superuser convention) now gates the
+  assignment; the returned OID itself is discarded since `catalog.Table.Owner`
+  stores the role **name**, not an OID (unlike e.g.
+  `catalog.Publication.Owner`), so only the `found` bool is used.
+  `ALTER TABLE`/`ALTER SEQUENCE`/`ALTER VIEW` OWNER TO all route through
+  this one `execAlterTable` function (per the DU-002 slice 439/440 design
+  notes above), so the fix and its role-existence enforcement apply to all
+  three relation kinds at once — not a table-only fix.
+- The two pre-existing tests that exercised this path with an unregistered
+  role name (`TestAlterSequenceOwnerTo`, `TestAlterViewOwnerTo`, both
+  `OWNER TO alice` with no prior `CREATE ROLE alice`) now register the role
+  first (`cat.(*catalog.InMemory).RegisterRole("alice")`) since they
+  currently exercise the newly-enforced path; this is a same-loop
+  necessary correction, not a scope-creep change to unrelated behavior.
+
+New: `internal/executor/operators_alter_table_owner_test.go` —
+`TestAlterTableOwnerTo` (success with registered role),
+`TestAlterTableOwnerToCurrentUser` (sentinel unaffected), and
+`TestAlterTableOwnerToUnknownRoleErrors` (the actual regression guard:
+confirms 42704 and that `tbl.Owner` is left unchanged rather than set to
+the bogus name).
+
+Gates: `go build ./...` clean; `go vet ./internal/executor/...` clean;
+`go test ./internal/executor/...` PASS (full, incl. `-race`); `go test
+./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); pgbench smoke = pre-commit hook; `make ralph-state-guard` OK.
+No new deferral — this closes the ledger row in full for all three
+relation kinds sharing the code path.

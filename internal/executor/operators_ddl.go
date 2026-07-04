@@ -6580,6 +6580,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		if strings.EqualFold(s.OwnerTo, "current_user") {
 			tbl.Owner = ""
 		} else {
+			// Mirror the role-existence check every other OWNER TO site already
+			// makes (schema/sequence/view/collation/statistics — see
+			// grep for "role %q does not exist" in this file); table owner is
+			// stored as a name not an OID here, so RoleOID's bool is only used
+			// for the existence check, not to replace tbl.Owner.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if _, found := im.RoleOID(s.OwnerTo); !found {
+					return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.OwnerTo)}
+				}
+			}
 			tbl.Owner = s.OwnerTo
 		}
 		return nil

@@ -129,9 +129,30 @@ autocommit-batch-aware" section; ledger row appended. **root-0024's first
 residual is now fully closed — no open items remain in its Deferred
 section.** Gates: build clean; `internal/executor`+`internal/server` suites
 PASS (incl. `-race`); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
-smoke = pre-commit hook. **Next up:** continue the M0119-0004 pg_dump
-catalog-view parity battery, or pick the next unresolved DU-002 slice from the
-deferral ledger — root-0024 itself has no remaining open threads.
+smoke = pre-commit hook. **This loop (2026-07-04, #107) closed DU-002 slice
+439's own resume point (2):** `ALTER TABLE ... OWNER TO` (and the `ALTER
+SEQUENCE`/`ALTER VIEW` forms sharing its `execAlterTable` code path)
+previously accepted any role name unconditionally instead of raising
+`role "..." does not exist` (42704) for an unknown one, unlike 6 sibling
+OWNER TO sites (schema/statistics/collation/aggregate/publication/
+subscription/event-trigger) that already made the `im.RoleOID` existence
+check. Fixed by adding the identical check (skipped only for the
+`CURRENT_USER` sentinel). Two pre-existing tests
+(`TestAlterSequenceOwnerTo`/`TestAlterViewOwnerTo`) used an unregistered
+role name and needed a `RegisterRole` call added since they now exercise
+the newly-enforced path; new `internal/executor/operators_alter_table_owner_test.go`
+adds the dedicated table-level coverage (success/CURRENT_USER/unknown-role-
+rejects). Also audited and confirmed already-fixed: the loop-#61 row's
+sibling resume point (1), `ALTER INDEX`/`ALTER VIEW`/`ALTER MATERIALIZED
+VIEW`'s command-tag mistagging (all already carry `TagOverride`). Design
+doc `0110-0001-pg-dump-tap-port.md` new "Follow-up: `ALTER TABLE ... OWNER
+TO` ... now reject an unknown role (loop #107)" section; ledger row
+appended (DU-002 slice 439 resume point (2) now fully closed on both its
+resume points). Gates: build/vet clean; `internal/executor` suite PASS
+(incl. `-race`); `internal/server` suite PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** continue
+the M0119-0004 pg_dump catalog-view parity battery, or pick the next
+unresolved DU-002 slice from the deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

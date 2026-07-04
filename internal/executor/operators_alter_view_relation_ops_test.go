@@ -16,6 +16,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -55,6 +56,7 @@ func TestAlterViewOwnerTo(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
+	cat.(*catalog.InMemory).RegisterRole("alice")
 	if err := runDDL(t, ctx, "CREATE TABLE viewsrc2 (a int)"); err != nil {
 		t.Fatalf("CREATE TABLE: %v", err)
 	}
