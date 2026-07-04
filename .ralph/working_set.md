@@ -2,88 +2,98 @@
 
 ---
 
-**Loop #39 (this session) — COMPLETE, committed + pushed (`f2fb90db`).**
+**Loop #40 (this session) — COMPLETE, committed + pushed (`c128093c`).**
 
-Task: M0122-0004 — implement real `GROUP BY GROUPING SETS / ROLLUP / CUBE`
-semantics (previously silently downgraded to a plain GROUP BY via an
-`IntegerConst(0)` sentinel, per the fix_plan's "still open" list and a
-confirmed-open `unimplemented_feat.json` entry, `task_id: M0097-regress`).
+Task: M0122-0004 — implement the `{ROWS|RANGE|GROUPS} BETWEEN ... AND
+... [EXCLUDE ...]` window frame clause. Previously the parser rejected
+any frame clause outright and every window function (sum/count/avg/
+min/max/first_value/last_value/nth_value/etc.) hard-coded PostgreSQL's
+*default* frame — this was the sole remaining open item in the M0020/
+M0122-0004 window-function series per the prior loop's own note.
 
-Landed: parser (`internal/parser/select.go`'s rewritten
-`parseGroupByElems` + `parseGroupingUnitList`/`parseGroupingSetsList`/
-`rollupAlternatives`/`cubeAlternatives`/`cartesianProductGroupingSets`)
-expands ROLLUP/CUBE/explicit GROUPING SETS into `SelectStmt.GroupingSets
-*GroupingSetsSpec` (`internal/parser/ast.go`), a materialized `[][]Expr`
-set list cross-multiplied against plain GROUP BY columns per SQL:1999
-§7.9. Planner's `rewriteGroupingSets` (`internal/planner/planner.go`,
-hooked into `planSelect` right after the indirection-star rewrite, before
-the CTE preplan / `s.SetOp != nil` check) expands this into a synthetic
-UNION ALL chain of plain-GROUP-BY branches — falls straight through into
-the pre-existing N-ary set-op planning machinery (segment flattening,
-`wrapSetOpBranchWithCasts`, `wrapSetOpSortLimit`) completely unmodified.
-`substituteGroupingExpr` NULLs out excluded-dimension references per
-branch (recursing `BinaryOp`/`UnaryOp`/`IsNullExpr`/`IsBoolExpr`/
-`IsDistinctFromExpr`/`CollateExpr`/`CastExpr`/`RowExpr`/`CaseExpr`/
-non-aggregate `FuncCall`) and resolves the new `GROUPING(...)`
-pseudo-function (dedicated `*parser.GroupingCall` AST node, analyzer-typed
-`int4`) to a literal bitmask per branch. No executor change needed.
-Removed the now-dead `IntegerConst{Value:0}` sentinel-skip in
-`buildAggregateStage` (a literal `GROUP BY 0` now correctly 42P10s).
-Tests: `internal/parser/select_test.go` (5 parse-shape tests),
-`internal/executor/grouping_sets_compat_test.go` (4 end-to-end
-ROLLUP/CUBE/GROUPING-SETS/GROUPING() tests). Design:
-`docs/design/0122-0004-grouping-sets-rollup-cube.md`;
-`docs/design/README.md` new row; `unimplemented_feat.json` entry updated
-in place (`status: resolved`); `.ralph/deferral_ledger.md` row appended
-(2026-07-05) for the substitution walker's known-narrow gaps (doesn't
-cover every `parser.Expr` variant — `InExpr`/`ExistsExpr`/array exprs —
-or window-function `.Over.PartitionBy`/`.OrderBy`). Committed as
-`f2fb90db` (12 files, pathspec-scoped to stay disjoint from the peer's
-in-flight `internal/executor/pgstat_io.go`/`pgstat_io_test.go`/
-`internal/storage/bufpool.go`/`bufpool_counters_test.go`/
-`internal/initdb/open.go`/`docs/design/0122-0003-explain-format-xml-yaml.md`),
+Landed: `ROWS` mode end-to-end (`RANGE`/`GROUPS` parse structurally but
+are rejected `0A000` — a deliberate, ledgered v0 scope limit, not a
+bug: they need value-based peer comparison / group-counting bounds,
+a materially separate model from `ROWS`' row-index arithmetic).
+Parser: new `parser.WindowFrame`/`FrameMode`/`FrameBoundKind`/
+`FrameExclusion` AST (`internal/parser/expr.go`), `parseFrameClause`/
+`parseFrameBound`/`parseFrameExclusion` (`internal/parser/select.go`)
+mirroring gram.y's `opt_frame_clause`/`frame_extent`/`frame_bound` —
+all new keywords (ROWS/RANGE/GROUPS/UNBOUNDED/PRECEDING/FOLLOWING/
+CURRENT/EXCLUDE/TIES/OTHERS) are soft ident-keywords, no lexer change.
+Analyzer: `validateWindowFrame` (`internal/analyzer/analyzer.go`)
+reproduces gram.y's bound-ordering checks (`42P20`) and rejects
+`RANGE`/`GROUPS` (`0A000`). Planner: `WindowAgg.Frame` (`internal/
+planner/plan.go`/`planner.go`), `resolveWindowFrame` resolves offset
+exprs against the window's input schema; `windowSpecKey` now hashes
+the frame too (`windowFrameKey`) so differing frames don't collapse
+into one node. Executor (`internal/executor/operators_window.go`):
+`frameBounds` reproduces `nodeWindowAgg.c`'s `update_frameheadpos`/
+`update_frametailpos` ROWS arithmetic exactly (clamped, out-of-order →
+empty frame); `resolveFrameOffset` evaluates offsets once per query
+like `limitOp` (`22004`/`42804`/`22013`); `evalExplicitFrameAggFuncs`
+recomputes sum/count/avg/min/max per row (frame can shrink, no valid
+running total — correctness-first, TPC-H doesn't use frame clauses so
+this doesn't touch the spot-check gate); `frameRowExcluded`/
+`firstInFrame`/`lastInFrame`/`nthInFrame` implement `EXCLUDE CURRENT
+ROW`/`GROUP`/`TIES`; `first_value`/`last_value`/`nth_value` switch to
+`frameBounds` under an explicit frame; `cume_dist` deliberately stays
+frame-independent (matches `window_cume_dist` — never consults frame).
+All new logic is gated behind `o.plan.Frame != nil`, so the pre-existing
+default-frame path (and all its tests) is untouched byte-for-byte — the
+scoping report's hazard didn't materialize.
+
+Tests: `internal/parser/window_test.go` (7 new frame-shape tests +
+repointed the old reject-test to accept), `internal/analyzer/
+analyzer_test.go` (`TestAnalyzeWindowFrameRowsAccepted`/
+`RangeGroupsRejected`/`BoundOrderingRejected`), `internal/executor/
+window_compat_test.go` (`TestCompatWindowExplicitRowsFrameSliding`/
+`ExcludeCurrentRow`/`ExcludeGroupAndTies`/`FrameNegativeOffsetRejected`
+— all cross-checked row-for-row against a scratch upstream PostgreSQL
+18.3 instance spun up on port 5546 for this verification). Design:
+`docs/design/0020-0001-window-parser-and-ast.md` new Follow-up section;
+`docs/design/README.md` row extended; both matching
+`unimplemented_feat.json` entries annotated in place (surgical edit,
+not a full rewrite); `.ralph/deferral_ledger.md` row appended
+(2026-07-05) for the remaining `RANGE`/`GROUPS` gap with a concrete
+resume point (`validateWindowFrame`'s mode check + a `frameBounds`
+RANGE/GROUPS branch). Committed as `c128093c` (14 files, pathspec-
+scoped to stay disjoint from the peer's in-flight `pgstat_io.go`/
+`pgstat_io_test.go`/`bufpool.go`/`bufpool_counters_test.go`/
+`initdb/open.go`/`docs/design/0122-0003-explain-format-xml-yaml.md`),
 pushed to `origin/align-data-structure-with-pg`.
 
-Concurrency note: a live peer `ralph_loop.sh` tree was active throughout
-(confirmed via `pgrep -af ralph_loop.sh` at loop start — multiple
-independent loop processes). The peer landed its own M0122-0003
-`write_time` work as commit `13725c89` (pushed) *during* this loop —
-confirmed via `git status`/`git diff --stat` polling before staging; this
-loop's `git add`/`git commit` used an explicit pathspec covering only the
-12 grouping-sets files, so `13725c89` simply became this commit's parent
-(shared working tree, no rebase needed) and none of the peer's source
-files were ever staged here. `.ralph/fix_plan.md`/`.ralph/deferral_ledger.md`/
-`docs/design/README.md` (shared bookkeeping files both loops append to)
-picked up peer content in between reads — committed anyway per
-established precedent (loop #38's own note): these are
-continuously-appended shared logs, not source files; whoever commits next
-captures the current merged state, nothing is lost. This file
-(`working_set.md`) itself hit a stale-read conflict from the peer's own
-loop #33 completion note mid-write — resolved by re-reading before this
-overwrite (their detail is preserved in their own commit `13725c89` +
-design doc + ledger row, not lost).
+Note on `working_set.md`/ledger/fix_plan/unimplemented_feat.json/design
+doc content: this loop's context was compacted mid-session (a very long
+single turn implementing 4 subsystems); the bookkeeping edits to these
+shared files were made earlier in the same turn and had already landed
+on disk by the time the summarized context resumed — verified their
+content against `git diff` before committing rather than re-deriving.
 
-Next step: remaining M0122-0004 open items — frame clause parsing/
-execution (ROWS/RANGE/GROUPS — `evalFrameAggFuncs`/`frameEnd`/
-`evalNtileFuncs` have three real consumers to generalize against),
-combining named-window forms, and intervals (timestamp-timestamp
-arithmetic, sub-day units — `internal/parser/expr.go`'s `IntervalLit`
-only supports day/month/year). M0122-0003's remaining sub-items per the
-peer's own note: `extend_time`, `EXPLAIN (BUFFERS)` without ANALYZE,
-local/temp-buffer terms, 3 remaining `pg_stat_io` op counters
-(reuses/writebacks/fsyncs), EXPLAIN's `I/O Timings` line, a
-`CTEDMLPrefix` residual. M0122-0005 has two open sub-items: 1-byte
-`char`(OID 18) disambiguation (`internal/catalog/codec.go:1356`
-`TypeNameToOID`) and `pg_collation_for()` (large — no collation tracking
-in v0 by design). Re-check `git status` + `pgrep -af ralph_loop.sh` fresh
-at loop start — multiple independent loops are still running
-concurrently on this tree.
+Next step for a future M0122-0004 loop: `RANGE`/`GROUPS` frame modes
+(`internal/analyzer/analyzer.go`'s `validateWindowFrame`'s
+`fr.Mode != parser.FrameModeRows` early-reject; `internal/executor/
+operators_window.go`'s `frameBounds` needs a RANGE branch that
+binary-searches the ORDER BY column's value ± offset instead of row
+counts, and a GROUPS branch counting peer-group boundaries via the
+existing `peerGroupBounds`). Combining named-window forms (`OVER (win
+ORDER BY ...)`) and intervals (sub-day units) remain separately
+deferred per the M0122-0004 fix_plan bucket. Re-check `git status` +
+`pgrep -af ralph_loop.sh` fresh at loop start — a peer loop was active
+throughout this one (confirmed via `pgrep`/`git status` polling before
+staging; its own M0122-0003 `write_time`/evictions/extends work stayed
+untouched by this commit).
 
-Gates run: `go build ./...` clean; `go vet ./internal/parser/...
-./internal/analyzer/... ./internal/planner/... ./internal/executor/...`
-clean; `go test ./internal/parser/... ./internal/analyzer/...
-./internal/planner/... ./internal/executor/...` PASS (no regressions);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, elapsed 26.92s/95.96s);
-pre-commit pgbench smoke PASS (machine-enforced hook: 191/172/12450 TPS
-across TPC-B/update/select-only); `make ralph-state-guard` run next
-(before final status block).
+Gates: `go build ./...` clean; `go vet`/`go test -count=1
+./internal/parser/... ./internal/analyzer/... ./internal/planner/...
+./internal/executor/... ./internal/storage/...` PASS (no regressions,
+including all pre-existing default-frame window compat tests
+byte-identical); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33,
+elapsed 28.08s/92.07s) — two earlier attempts hit host-load-induced
+startup/connection instability (2 concurrent ralph loops + this
+session on one machine, 9GB swap in use) unrelated to this diff (Q13
+doesn't touch window functions); a clean re-run passed cleanly. Mandatory
+pre-commit pgbench smoke hook PASS (188/249/14237 TPS across TPC-B/
+update/select-only). `make ralph-state-guard` PASS (one auto-repair:
+`progress.json`'s stale `completed` marker from a prior loop's clean
+exit reconciled to `in_progress`, unrelated to this loop's own files).
