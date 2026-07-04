@@ -3354,3 +3354,98 @@ Nothing new — this loop fully closes the loop #69 row's own deferral. The
 loop #69 section's other two "Still deferred" bullets (range-type
 `canonical`/`subtype_diff` remainder, `=#=`-operator-symbol note) are
 unrelated and remain as recorded there.
+
+## Loop #76 — `CREATE`/`ALTER FOREIGN DATA WRAPPER ... HANDLER`/`VALIDATOR` resolution (DU-002, closes slice 375/380/421's open item)
+
+Closes the "HANDLER/VALIDATOR func references are skipped (goopg tracks no
+funcs)" limitation carried forward unresolved since slice 375 (loop-#?
+history above), restated in slice 380's and the loop #58 (slice 421,
+`ALTER FOREIGN DATA WRAPPER`) deferral rows. Every prior FDW slice parsed
+past `HANDLER h`/`VALIDATOR v`/`NO HANDLER`/`NO VALIDATOR` by advancing the
+token cursor and discarding the function name entirely, so
+`pg_foreign_data_wrapper.fdwhandler`/`fdwvalidator` were hard-wired to `0`
+and `dumpForeignDataWrapper`'s `::regproc` cast always rendered `-`,
+silently dropping a real handler/validator from the dump.
+
+### The fix
+
+Mirrors `foreigncmds.c`'s `CreateForeignDataWrapper`/
+`AlterForeignDataWrapper`, which resolve the clause via
+`lookup_fdw_handler_func`/`lookup_fdw_validator_func` (both thin wrappers
+around `LookupFuncName`) before touching the catalog:
+
+- Parser (`internal/parser/ddl.go`): new `scanFDWFuncClause` recognises one
+  `HANDLER name | NO HANDLER` or `VALIDATOR name | NO VALIDATOR` clause and
+  returns the (possibly schema-qualified) `*ObjectName`. Both the CREATE and
+  ALTER FDW arms call it in their scan loop instead of falling through to the
+  generic `p.advance()` skip. New `CompatNoopStmt` fields
+  (`internal/parser/ast.go`): `FDWHandlerFunc`/`FDWValidatorFunc
+  *ObjectName` (nil = no function named) plus, ALTER-only,
+  `FDWHandlerGiven`/`FDWValidatorGiven bool` — needed because ALTER has three
+  distinct states CREATE doesn't (clause absent → leave unchanged; `NO
+  HANDLER` → clear; `HANDLER f` → set), while CREATE only ever needs
+  nil-vs-non-nil.
+- Executor (`internal/executor/operators_ddl.go`): new
+  `resolveFDWHandlerFunc`/`resolveFDWValidatorFunc`, mirroring the fixed
+  signatures PG's lookups require — handler: 0 arguments, return type
+  `fdw_handler` (42809 `wrong_object_type` on a mismatched return type,
+  42883 `undefined_function` if no niladic overload exists); validator:
+  exactly `(text[], oid)` (return type is never checked — the validator's
+  result is ignored). `execCompatNoop`'s CREATE arm resolves both before
+  calling `RegisterForeignDataWrapper` (so a bad name raises without leaving
+  a half-created FDW); the ALTER arm resolves on `*Given` and applies to the
+  looked-up `*catalog.ForeignDataWrapper` before the OPTIONS merge, matching
+  `AlterForeignDataWrapper`'s clause-processing order.
+- Catalog (`internal/catalog/catalog.go`): `ForeignDataWrapper` gains
+  `HandlerOID`/`ValidatorOID uint32` (0 = `InvalidOid`); the
+  `pg_foreign_data_wrapper.VirtualRows` `fdwhandler`/`fdwvalidator` cells now
+  render the real OID instead of a hard-coded `"0"`, so the existing
+  `::regproc` cast (already correct since slice 375) resolves it back to the
+  function name.
+
+### Scope / limitations
+
+Only user-defined (`CREATE FUNCTION ... LANGUAGE c/plpgsql/...`) routines
+resolve — goopg implements no actual FDW handler execution path (no
+`postgres_fdw`/`file_fdw`-equivalent contrib extension), so a real-world
+name like `postgres_fdw_handler` still 42883s. This is fine for the
+dump-fidelity goal this closes (a `CREATE FUNCTION` stub naming itself as
+the handler round-trips byte-for-byte through `pg_dump`) but the FDW is
+still catalog-only bookkeeping: no query ever actually invokes the
+resolved handler to plan/scan a foreign table.
+
+### Tests
+
+- `internal/parser/op_compat_test.go`: `TestParseCreateFDWHandlerValidator`
+  — CREATE captures schema-qualified `HANDLER`/bare `VALIDATOR` names, a
+  bare CREATE leaves both nil, and ALTER's three states (`NO HANDLER`/`NO
+  VALIDATOR` → `Given=true,Func=nil`; OPTIONS-only → `Given=false`; `HANDLER
+  f` → `Given=true,Func=f`) are distinguished.
+- `internal/executor/operators_fdw_handler_validator_test.go` (new file):
+  `TestCreateForeignDataWrapperHandlerValidatorResolved` (end-to-end through
+  `pg_foreign_data_wrapper`'s own `::regproc` cast — resolves to the real
+  function names, and a bare FDW still folds to `-`),
+  `TestCreateForeignDataWrapperHandlerErrors` (42883 undefined name, 42809
+  wrong return type, neither leaves a half-created FDW),
+  `TestAlterForeignDataWrapperHandlerValidatorSetAndClear` (set via `HANDLER
+  f`, unchanged across an unrelated OPTIONS-only ALTER, cleared via `NO
+  HANDLER`).
+- `internal/executor/operators_alter_foreign_data_wrapper_test.go` doc
+  comment updated to point at the new test for HANDLER/VALIDATOR resolution
+  (its own `NO HANDLER` case only pins that the no-op path doesn't disturb
+  OPTIONS).
+
+### Gates
+
+`go build ./...` clean; `internal/parser`+`internal/catalog`+
+`internal/executor` suites PASS (`-count=1`, no regression); targeted new
+tests PASS individually; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+### Still deferred
+
+Real FDW handler *execution* (a foreign-table scan actually calling into
+the resolved handler's plan/scan callbacks) remains entirely unimplemented
+— out of scope here and for the dump-fidelity goal this whole DU-002 family
+targets; would require a genuine extension/FDW execution framework
+(comparable in scope to M0060-0005/0006/0007's deferred contrib-extension
+work), not a forcing fixture for pg_dump parity.

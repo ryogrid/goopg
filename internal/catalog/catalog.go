@@ -8511,12 +8511,15 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2328,
 	}
 	// Surface user-created FDWs (CREATE FOREIGN DATA WRAPPER) so they round-trip.
-	// fdwhandler/fdwvalidator are 0 (no handler) — the query's `::regproc` cast
-	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR.
-	// fdwoptions is NULL (empty string) absent an OPTIONS clause, so the OPTIONS
-	// clause is skipped. fdwacl materializes via ForeignDataWrapperACLText so a
-	// `GRANT … ON FOREIGN DATA WRAPPER …` round-trips (DU-002 slice 428);
-	// DU-002 slice 375.
+	// fdwhandler/fdwvalidator hold the real pg_proc OID resolved at CREATE/ALTER
+	// time (0 when no HANDLER/VALIDATOR clause was given) — the query's
+	// `::regproc` cast renders 0 as '-' (so dumpForeignDataWrapper omits the
+	// clause) and a non-zero OID as the resolved function name (DU-002
+	// M0119-0004, closing the "HANDLER/VALIDATOR discarded" gap slices
+	// 375/380/421 left open). fdwoptions is NULL (empty string) absent an
+	// OPTIONS clause, so the OPTIONS clause is skipped. fdwacl materializes via
+	// ForeignDataWrapperACLText so a `GRANT … ON FOREIGN DATA WRAPPER …`
+	// round-trips (DU-002 slice 428); DU-002 slice 375.
 	pgForeignDataWrapper.VirtualRows = func() [][]string {
 		fdws := c.ListForeignDataWrappers()
 		if len(fdws) == 0 {
@@ -8529,13 +8532,13 @@ func (c *InMemory) registerSystemTables() {
 				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
 			}
 			out = append(out, []string{
-				strconv.FormatUint(uint64(f.OID), 10), // oid
-				f.Name,                                // fdwname
-				strconv.FormatUint(uint64(owner), 10), // fdwowner
-				"0",                                   // fdwhandler (regproc 0 → '-')
-				"0",                                   // fdwvalidator (regproc 0 → '-')
-				c.ForeignDataWrapperACLText(f.OID),    // fdwacl
-				optionsArrayLiteral(f.Options),        // fdwoptions text[] ("{name=value,…}" or "" for NULL)
+				strconv.FormatUint(uint64(f.OID), 10),          // oid
+				f.Name,                                         // fdwname
+				strconv.FormatUint(uint64(owner), 10),          // fdwowner
+				strconv.FormatUint(uint64(f.HandlerOID), 10),   // fdwhandler
+				strconv.FormatUint(uint64(f.ValidatorOID), 10), // fdwvalidator
+				c.ForeignDataWrapperACLText(f.OID),             // fdwacl
+				optionsArrayLiteral(f.Options),                 // fdwoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
 		return out
@@ -12758,6 +12761,14 @@ type ForeignDataWrapper struct {
 	// dumpForeignDataWrapper re-emits an `OPTIONS (name 'value', …)` clause.
 	// Nil/empty → no OPTIONS clause. DU-002 slice 380.
 	Options []string
+	// HandlerOID / ValidatorOID are pg_foreign_data_wrapper.fdwhandler/
+	// fdwvalidator — the pg_proc OIDs of a `HANDLER f`/`VALIDATOR f` clause,
+	// resolved by the executor (resolveFDWHandlerFunc/resolveFDWValidatorFunc)
+	// at CREATE/ALTER time. 0 (InvalidOid) means no handler/validator; the
+	// `::regproc` cast pg_dump's getForeignDataWrappers applies renders 0 as
+	// '-', so dumpForeignDataWrapper omits the clause. DU-002 (M0119-0004).
+	HandlerOID   uint32
+	ValidatorOID uint32
 }
 
 // RegisterForeignDataWrapper records an FDW, allocating a stable OID on first

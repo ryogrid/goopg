@@ -461,13 +461,16 @@ func (p *parser) parseCreate() (Stmt, error) {
 			// [VALIDATOR f | NO VALIDATOR] [OPTIONS (...)] — register as compat
 			// object. The OPTIONS clause (always last) round-trips through pg_dump
 			// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper). The
-			// HANDLER/VALIDATOR func references are skipped (goopg tracks no funcs).
-			// DU-002 slice 380.
+			// HANDLER/VALIDATOR func names are captured (FDWHandlerFunc/
+			// FDWValidatorFunc) so the executor can resolve them to real pg_proc
+			// OIDs (DU-002 M0119-0004, closing the "func references are skipped"
+			// gap slice 380 left open).
 			name, err := p.parseObjectName()
 			if err != nil {
 				return nil, err
 			}
 			var options []string
+			var handlerFunc, validatorFunc *ObjectName
 			for {
 				tok := p.cur()
 				if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -478,10 +481,23 @@ func (p *parser) parseCreate() (Stmt, error) {
 					options = p.scanFDWOptionsList()
 					continue
 				}
+				if kind, fn, consumed, err := p.scanFDWFuncClause(); consumed {
+					if err != nil {
+						return nil, err
+					}
+					if kind == "handler" {
+						handlerFunc = fn
+					} else {
+						validatorFunc = fn
+					}
+					continue
+				}
 				p.advance()
 			}
 			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name}
 			ns.Options = options
+			ns.FDWHandlerFunc = handlerFunc
+			ns.FDWValidatorFunc = validatorFunc
 			return ns, nil
 		}
 		// Other CREATE FOREIGN ... → skip.
@@ -573,6 +589,47 @@ func (p *parser) scanUserMappingForServer() (user, server string, options []stri
 		p.advance()
 	}
 	return user, server, options
+}
+
+// scanFDWFuncClause recognises one `HANDLER handler_name | NO HANDLER` or
+// `VALIDATOR handler_name | NO VALIDATOR` clause of a CREATE/ALTER FOREIGN
+// DATA WRAPPER statement (gram.y's fdw_option), assuming the cursor is
+// positioned on the leading token. handler_name is a plain (possibly
+// schema-qualified) function name with no parenthesized arg list — PostgreSQL
+// resolves it via a fixed signature (LookupFuncName), mirrored by
+// resolveFDWHandlerFunc/resolveFDWValidatorFunc in the executor. Returns
+// consumed=false (and advances nothing) when the cursor is on neither form,
+// so the caller's generic skip-loop handles it. kind is "handler" or
+// "validator"; fn is nil for the `NO ...` form. DU-002 (M0119-0004).
+func (p *parser) scanFDWFuncClause() (kind string, fn *ObjectName, consumed bool, err error) {
+	tok := p.cur()
+	isHandler := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "handler")
+	isValidator := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "validator")
+	if isHandler || isValidator {
+		p.advance()
+		name, perr := p.parseObjectName()
+		if perr != nil {
+			return "", nil, true, perr
+		}
+		if isHandler {
+			return "handler", &name, true, nil
+		}
+		return "validator", &name, true, nil
+	}
+	if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "no") {
+		next := p.peek(1)
+		nextIsHandler := next.Kind == TokenIdent && strings.EqualFold(next.Value, "handler")
+		nextIsValidator := next.Kind == TokenIdent && strings.EqualFold(next.Value, "validator")
+		if nextIsHandler || nextIsValidator {
+			p.advance() // NO
+			p.advance() // HANDLER|VALIDATOR
+			if nextIsHandler {
+				return "handler", nil, true, nil
+			}
+			return "validator", nil, true, nil
+		}
+	}
+	return "", nil, false, nil
 }
 
 // scanFDWOptionsList consumes an `OPTIONS ( name 'value' [, …] )` clause,
@@ -7385,11 +7442,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// distinct statement from ALTER [FOREIGN] TABLE (no TABLE keyword, no
 	// relation actions), so it must be recognised BEFORE the FOREIGN-TABLE
 	// check below consumes FOREIGN expecting TABLE to follow. Mirrors CREATE
-	// FOREIGN DATA WRAPPER's parsing (skips HANDLER/VALIDATOR func references —
-	// goopg tracks no funcs — DU-002 slice 380) but captures the OPTIONS
-	// clause as a verb-tagged change list (ADD/SET/DROP), not a flat replace,
-	// since ALTER merges onto the existing fdwoptions (transformGenericOptions,
-	// gram.y AlterFdwStmt) rather than recreating it. DU-002 slice 421.
+	// FOREIGN DATA WRAPPER's parsing (captures HANDLER/VALIDATOR func names —
+	// DU-002 M0119-0004, closing the "goopg tracks no funcs" gap slice 380 left
+	// open) but captures the OPTIONS clause as a verb-tagged change list
+	// (ADD/SET/DROP), not a flat replace, since ALTER merges onto the existing
+	// fdwoptions (transformGenericOptions, gram.y AlterFdwStmt) rather than
+	// recreating it. DU-002 slice 421.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign &&
 		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "data") {
 		p.advance() // consume FOREIGN
@@ -7400,6 +7458,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		var changes []FDWOptionChange
+		var handlerFunc, validatorFunc *ObjectName
+		var handlerGiven, validatorGiven bool
 		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -7409,9 +7469,25 @@ func (p *parser) parseAlter() (Stmt, error) {
 				changes = p.scanAlterFDWOptionsList()
 				continue
 			}
+			if kind, fn, consumed, err := p.scanFDWFuncClause(); consumed {
+				if err != nil {
+					return nil, err
+				}
+				if kind == "handler" {
+					handlerFunc, handlerGiven = fn, true
+				} else {
+					validatorFunc, validatorGiven = fn, true
+				}
+				continue
+			}
 			p.advance()
 		}
-		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
+		return &CompatNoopStmt{
+			pos: t.Pos, Tag: "ALTER FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name,
+			FDWOptionChanges: changes,
+			FDWHandlerFunc:   handlerFunc, FDWHandlerGiven: handlerGiven,
+			FDWValidatorFunc: validatorFunc, FDWValidatorGiven: validatorGiven,
+		}, nil
 	}
 	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
 	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply

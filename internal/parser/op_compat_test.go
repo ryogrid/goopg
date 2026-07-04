@@ -229,10 +229,12 @@ func TestParseCreateServerTypeVersion(t *testing.T) {
 }
 
 // TestParseCreateFDWOptions verifies that CREATE FOREIGN DATA WRAPPER captures an
-// OPTIONS (name 'value', …) clause as "name=value" elements (and skips any
-// HANDLER/VALIDATOR clauses preceding it), so the wrapper's options round-trip
-// through pg_dump (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper).
-// DU-002 slice 380.
+// OPTIONS (name 'value', …) clause as "name=value" elements (independently of
+// any HANDLER/VALIDATOR clause preceding it — see
+// TestParseCreateFDWHandlerValidator for that clause), so the wrapper's
+// options round-trip through pg_dump
+// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper). DU-002
+// slice 380.
 func TestParseCreateFDWOptions(t *testing.T) {
 	// Bare CREATE FOREIGN DATA WRAPPER (no OPTIONS) carries nil Options.
 	stmts, err := Parse("CREATE FOREIGN DATA WRAPPER goopg_fdw")
@@ -271,6 +273,69 @@ func TestParseCreateFDWOptions(t *testing.T) {
 		if ns.Options[i] != want[i] {
 			t.Errorf("Options[%d] = %q, want %q", i, ns.Options[i], want[i])
 		}
+	}
+}
+
+// TestParseCreateFDWHandlerValidator pins the DU-002 (M0119-0004) closure of
+// the "HANDLER/VALIDATOR func references are skipped" gap: CREATE/ALTER
+// FOREIGN DATA WRAPPER now captures the function names onto
+// FDWHandlerFunc/FDWValidatorFunc (schema-qualified or bare), and ALTER's
+// paired *Given flags distinguish an absent clause (nil, Given=false, leave
+// unchanged) from an explicit `NO HANDLER`/`NO VALIDATOR` (nil, Given=true,
+// clear it).
+func TestParseCreateFDWHandlerValidator(t *testing.T) {
+	stmts, err := Parse("CREATE FOREIGN DATA WRAPPER goopg_fdw HANDLER myschema.my_handler VALIDATOR my_validator")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns := stmts[0].(*CompatNoopStmt)
+	if ns.FDWHandlerFunc == nil || ns.FDWHandlerFunc.Schema != "myschema" || ns.FDWHandlerFunc.Name != "my_handler" {
+		t.Errorf("FDWHandlerFunc = %+v, want myschema.my_handler", ns.FDWHandlerFunc)
+	}
+	if ns.FDWValidatorFunc == nil || ns.FDWValidatorFunc.Schema != "" || ns.FDWValidatorFunc.Name != "my_validator" {
+		t.Errorf("FDWValidatorFunc = %+v, want my_validator", ns.FDWValidatorFunc)
+	}
+
+	// Bare CREATE (no HANDLER/VALIDATOR clause at all) leaves both nil.
+	stmts, err = Parse("CREATE FOREIGN DATA WRAPPER goopg_fdw2")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns = stmts[0].(*CompatNoopStmt)
+	if ns.FDWHandlerFunc != nil || ns.FDWValidatorFunc != nil {
+		t.Errorf("bare CREATE FDWHandlerFunc/FDWValidatorFunc = %+v/%+v, want nil/nil", ns.FDWHandlerFunc, ns.FDWValidatorFunc)
+	}
+
+	// ALTER: an explicit NO HANDLER/NO VALIDATOR sets Given=true with a nil
+	// Func (clear); an absent clause (OPTIONS only) leaves Given=false.
+	stmts, err = Parse("ALTER FOREIGN DATA WRAPPER goopg_fdw NO HANDLER NO VALIDATOR")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns = stmts[0].(*CompatNoopStmt)
+	if !ns.FDWHandlerGiven || ns.FDWHandlerFunc != nil {
+		t.Errorf("ALTER NO HANDLER: Given=%v Func=%+v, want Given=true Func=nil", ns.FDWHandlerGiven, ns.FDWHandlerFunc)
+	}
+	if !ns.FDWValidatorGiven || ns.FDWValidatorFunc != nil {
+		t.Errorf("ALTER NO VALIDATOR: Given=%v Func=%+v, want Given=true Func=nil", ns.FDWValidatorGiven, ns.FDWValidatorFunc)
+	}
+
+	stmts, err = Parse("ALTER FOREIGN DATA WRAPPER goopg_fdw OPTIONS (ADD x 'y')")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns = stmts[0].(*CompatNoopStmt)
+	if ns.FDWHandlerGiven || ns.FDWValidatorGiven {
+		t.Errorf("ALTER OPTIONS-only: HandlerGiven=%v ValidatorGiven=%v, want false/false", ns.FDWHandlerGiven, ns.FDWValidatorGiven)
+	}
+
+	stmts, err = Parse("ALTER FOREIGN DATA WRAPPER goopg_fdw HANDLER new_handler")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	ns = stmts[0].(*CompatNoopStmt)
+	if !ns.FDWHandlerGiven || ns.FDWHandlerFunc == nil || ns.FDWHandlerFunc.Name != "new_handler" {
+		t.Errorf("ALTER HANDLER new_handler: Given=%v Func=%+v", ns.FDWHandlerGiven, ns.FDWHandlerFunc)
 	}
 }
 

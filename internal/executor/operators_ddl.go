@@ -960,6 +960,51 @@ func resolveAccessMethodHandlerFunc(rs *catalog.Routines, funcName parser.Object
 	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(internal) does not exist", funcName.String())}
 }
 
+// resolveFDWHandlerFunc mirrors foreigncmds.c's lookup_fdw_handler_func: a
+// `HANDLER f` clause on CREATE/ALTER FOREIGN DATA WRAPPER must name a niladic
+// routine ("handlers have no arguments", LookupFuncName(name, 0, NULL,
+// false)) whose return type is fdw_handler. Only user-defined (CREATE
+// FUNCTION) routines are resolved — goopg has no builtin FDW handler
+// functions (postgres_fdw/file_fdw are contrib extensions goopg does not
+// implement), so a real handler name like postgres_fdw_handler will not
+// resolve; deferred, not needed for the dump-fidelity round-trip this closes.
+func resolveFDWHandlerFunc(rs *catalog.Routines, funcName parser.ObjectName) (uint32, error) {
+	for _, r := range rs.LookupByName(funcName) {
+		if len(r.ArgTypes) != 0 {
+			continue
+		}
+		if !strings.EqualFold(r.ReturnType.Name, "fdw_handler") {
+			return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type fdw_handler", funcName.String())}
+		}
+		return r.OID, nil
+	}
+	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s() does not exist", funcName.String())}
+}
+
+// resolveFDWValidatorFunc mirrors lookup_fdw_validator_func: a `VALIDATOR f`
+// clause must name a routine taking exactly (text[], oid)
+// (LookupFuncName(name, 2, {TEXTARRAYOID, OIDOID}, false)); the validator's
+// return type is never checked (its result is ignored).
+func resolveFDWValidatorFunc(rs *catalog.Routines, funcName parser.ObjectName) (uint32, error) {
+	for _, r := range rs.LookupByName(funcName) {
+		if len(r.ArgTypes) != 2 {
+			continue
+		}
+		// execCreateFunction stores an array arg's "[]" suffix folded into
+		// Name (e.g. "text[]"), NOT via the column-Type IsArray flag —
+		// mirrors that argTypes[i].Name construction (operators_ddl.go
+		// execCreateFunction), not catalog.Column's convention.
+		if !strings.EqualFold(r.ArgTypes[0].Name, "text[]") {
+			continue
+		}
+		if !strings.EqualFold(r.ArgTypes[1].Name, "oid") {
+			continue
+		}
+		return r.OID, nil
+	}
+	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(text[], oid) does not exist", funcName.String())}
+}
+
 // resolveEventTriggerFunc looks up a niladic (0-argument) function by name,
 // mirroring CreateEventTrigger's `LookupFuncName(stmt->funcname, 0, NULL,
 // false)` — a user-defined routine is tried first (LookupByName already
@@ -14841,6 +14886,30 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", fdwName)}
 		}
+		// HANDLER/VALIDATOR are resolved (and any 42883/42809 error raised)
+		// before the OPTIONS merge, mirroring foreigncmds.c's
+		// AlterForeignDataWrapper (parse_func_options runs before the
+		// def_list_append_merge OPTIONS pass). *Given false means the clause
+		// was absent — leave the existing OID unchanged; Given true with a nil
+		// Func means `NO HANDLER`/`NO VALIDATOR` — clear it.
+		if s.FDWHandlerGiven {
+			if s.FDWHandlerFunc == nil {
+				fdw.HandlerOID = 0
+			} else if oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc); rerr != nil {
+				return rerr
+			} else {
+				fdw.HandlerOID = oid
+			}
+		}
+		if s.FDWValidatorGiven {
+			if s.FDWValidatorFunc == nil {
+				fdw.ValidatorOID = 0
+			} else if oid, rerr := resolveFDWValidatorFunc(im.Routines(), *s.FDWValidatorFunc); rerr != nil {
+				return rerr
+			} else {
+				fdw.ValidatorOID = oid
+			}
+		}
 		merged, mergeErr := applyFDWOptionChanges(fdw.Options, s.FDWOptionChanges)
 		if mergeErr != nil {
 			return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
@@ -14868,8 +14937,28 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// repeated VirtualRows calls return the same identity. Options threads
 		// the OPTIONS (...) clause so fdwoptions round-trips
 		// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper).
-		// DU-002 slice 375 (options: slice 380).
-		im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+		// DU-002 slice 375 (options: slice 380). HandlerOID/ValidatorOID are
+		// resolved before registering (mirrors CreateForeignDataWrapper's
+		// parse_func_options running before the catalog insert) so a bad
+		// HANDLER/VALIDATOR name raises 42883/42809 without creating the FDW.
+		var handlerOID, validatorOID uint32
+		if s.FDWHandlerFunc != nil {
+			oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc)
+			if rerr != nil {
+				return rerr
+			}
+			handlerOID = oid
+		}
+		if s.FDWValidatorFunc != nil {
+			oid, rerr := resolveFDWValidatorFunc(im.Routines(), *s.FDWValidatorFunc)
+			if rerr != nil {
+				return rerr
+			}
+			validatorOID = oid
+		}
+		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+		fdw.HandlerOID = handlerOID
+		fdw.ValidatorOID = validatorOID
 	case "user mapping":
 		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
 		// so it round-trips through pg_dump (pg_user_mappings virtual view →

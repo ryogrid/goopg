@@ -2098,6 +2098,19 @@ type CompatNoopStmt struct {
 	// Empty when the clause is absent. DU-002 slice 381.
 	ServerType    string
 	ServerVersion string
+	// FDWHandlerFunc / FDWValidatorFunc carry the possibly-schema-qualified
+	// function name from a `[CREATE|ALTER] FOREIGN DATA WRAPPER name [HANDLER
+	// f|NO HANDLER] [VALIDATOR f|NO VALIDATOR] ...` clause (Tag ==
+	// "CREATE FOREIGN DATA WRAPPER" or "ALTER FOREIGN DATA WRAPPER"). Nil means
+	// the clause named no function (`NO HANDLER`/`NO VALIDATOR`, or CREATE's
+	// default when the clause is absent entirely). The paired *Given flag
+	// disambiguates, for ALTER only, "clause absent → leave unchanged" (Given
+	// false) from "NO HANDLER/NO VALIDATOR → clear it" (Given true, Func nil);
+	// CREATE has no "unchanged" state so it ignores *Given. DU-002 (M0119-0004).
+	FDWHandlerFunc    *ObjectName
+	FDWHandlerGiven   bool
+	FDWValidatorFunc  *ObjectName
+	FDWValidatorGiven bool
 	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
 	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
 	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
