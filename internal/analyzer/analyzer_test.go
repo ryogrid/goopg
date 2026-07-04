@@ -174,3 +174,32 @@ func TestAnalyzeWindowFunctionPlacementRejected(t *testing.T) {
 		"SELECT aid FROM pgbench_accounts HAVING row_number() OVER () > 0",
 		"0A000")
 }
+
+// TestAnalyzeWithOrdinalityNamedColumn is the regression pin for the
+// WITH-ORDINALITY 42703 bug: tableFuncColumns never threaded
+// rv.TableFunc.WithOrdinality through, so the analyzer's synthetic FROM-item
+// table never had an ordinality column, and unnest/regexp_matches fell to
+// the generic single-int8-column default — naming either the ordinality
+// column or the SRF's own element column explicitly in the outer SELECT hit
+// "column does not exist" even though the planner produced the row
+// correctly. Root cause: internal/analyzer/analyzer.go's tableFuncColumns
+// (not the planner's wrapOrdinality/planFromUnnest, which were always
+// correct). See .ralph/working_set.md history for the diagnosis loop.
+func TestAnalyzeWithOrdinalityNamedColumn(t *testing.T) {
+	cat := analyzerCatalog(t)
+	ok := []string{
+		"SELECT n, m FROM unnest(ARRAY[1,2,3]) WITH ORDINALITY AS t(m, n)",
+		"SELECT ord FROM generate_series(1, 3) WITH ORDINALITY AS t(val, ord)",
+		"SELECT ord FROM regexp_matches('a1b2', '[0-9]', 'g') WITH ORDINALITY AS t(m, ord)",
+		"SELECT a, b, n FROM unnest(ARRAY[1,2], ARRAY[3,4]) WITH ORDINALITY AS t(a, b, n)",
+		"SELECT val FROM unnest(ARRAY[1,2,3]) WITH ORDINALITY AS t(val, n)",
+	}
+	for _, sql := range ok {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Errorf("Analyze(%q) expected success, got: %v", sql, err)
+		}
+	}
+	expectAnalyzeCode(t, cat,
+		"SELECT bogus FROM unnest(ARRAY[1,2,3]) WITH ORDINALITY AS t(m, n)",
+		"42703")
+}

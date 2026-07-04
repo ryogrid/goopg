@@ -1486,7 +1486,7 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		if alias == "" {
 			alias = rv.TableFunc.Name
 		}
-		cols := tableFuncColumns(rv.TableFunc.Name, alias, rv.Columns)
+		cols := tableFuncColumns(rv.TableFunc, alias, rv.Columns)
 		return &catalog.Table{Name: alias, Columns: cols}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
@@ -1502,8 +1502,29 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 // column list the planner will produce at execution time. Unknown
 // functions fall back to a single column named after the alias (the
 // pre-M0103-0008 behaviour, sufficient for generate_series).
-func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Column {
-	switch strings.ToLower(funcName) {
+//
+// WITH ORDINALITY appends a trailing int8 column, named from the last
+// explicit column alias when given (else "ordinality") — mirrors
+// wrapOrdinality (internal/planner/planner.go). The trailing alias is
+// stripped before dispatch so per-function cases below see only the
+// base-column aliases, same as the planner's colAliases[:len-1] slices.
+func tableFuncColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	ordColName := "ordinality"
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		ordColName = colAliases[len(colAliases)-1]
+		colAliases = colAliases[:len(colAliases)-1]
+	}
+	cols := tableFuncBaseColumns(tf, alias, colAliases)
+	if tf.WithOrdinality {
+		cols = append(cols, catalog.Column{Name: ordColName, Type: catalog.Type{Name: "int8"}, Ordinal: len(cols)})
+	}
+	return cols
+}
+
+// tableFuncBaseColumns dispatches on function name for tableFuncColumns,
+// before any WITH ORDINALITY column is appended.
+func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	switch strings.ToLower(tf.Name) {
 	case "pg_get_publication_tables":
 		names := []string{"relid", "attrs", "qual"}
 		types := []string{"oid", "text", "text"}
@@ -1601,6 +1622,37 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
 		}
 		return cols
+	case "unnest":
+		// unnest(arr1[, arr2, ...]) zips N arrays into N columns. Mirrors
+		// planFromUnnest; the analyzer has no expression-type resolution
+		// available yet at this point in scope-building (lookupTable runs
+		// before the FROM scope exists), so element types fall back to
+		// "text" rather than the array's real element type — sufficient
+		// for column-name resolution (42703), imprecise for typing.
+		n := len(tf.Args)
+		if n == 0 {
+			n = 1
+		}
+		cols := make([]catalog.Column, n)
+		for i := 0; i < n; i++ {
+			name := "unnest"
+			if n == 1 {
+				name = alias
+			}
+			if i < len(colAliases) && colAliases[i] != "" {
+				name = colAliases[i]
+			}
+			cols[i] = catalog.Column{Name: name, Type: catalog.Type{Name: "text"}, Ordinal: i}
+		}
+		return cols
+	case "regexp_matches":
+		// regexp_matches(string, pattern[, flags]) → single text[] column.
+		// Mirrors planFromRegexpMatches. M0122-0004 WITH-ORDINALITY fix.
+		colName := alias
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "text[]"}, Ordinal: 0}}
 	default:
 		// generate_series and unknown SRFs: 1 int8 column named after
 		// the alias. Preserves pre-M0103-0008 behaviour.

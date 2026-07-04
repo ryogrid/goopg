@@ -207,6 +207,27 @@ mirroring M0119's ledger `status` column.
       sibling FROM item's column fails (`ctx.OuterRows` unwired for that
       execution path) — M0122-0002 is now fully closed; those two are
       independent cross-cutting gaps, see ledger.
+      **`WITH ORDINALITY` named-column gap FIXED (2026-07-04, later loop):**
+      root cause was never in the planner (`wrapOrdinality`/`planFromUnnest`
+      were always correct) — it was `internal/analyzer/analyzer.go`'s
+      `tableFuncColumns`, which never threaded `rv.TableFunc.WithOrdinality`
+      through and had no `unnest`/`regexp_matches` cases at all (silently
+      fell to the generic single-`int8`-column default), so the analyzer's
+      synthetic FROM-item table never had the ordinality/element columns
+      naming an explicit outer-SELECT column against them hit `42703`
+      even though the planner and executor already produced the row
+      correctly (`*` worked because `analyzeStar` skips column-existence
+      checking entirely). Fix: `tableFuncColumns` now takes `*parser.TableFuncRef`,
+      strips/re-appends the trailing ordinality alias the same way
+      `wrapOrdinality` does, and gained real `unnest` (N-column zip,
+      `text`-typed pending real element-type inference — the analyzer
+      runs before the FROM scope exists so it cannot resolve the array
+      arg's type yet) and `regexp_matches` (`text[]`) cases. Tests:
+      `internal/analyzer/analyzer_test.go`'s
+      `TestAnalyzeWithOrdinalityNamedColumn`. Verified end-to-end against
+      a live server + real `psql` (`unnest`/`generate_series`/
+      `regexp_matches`, single- and multi-arg `unnest`). The comma/LATERAL
+      `ctx.OuterRows` gap (ledger row 480) is separate and still open.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE
