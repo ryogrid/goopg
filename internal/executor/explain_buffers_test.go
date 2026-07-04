@@ -55,6 +55,65 @@ func TestExplainBuffersOffByDefault(t *testing.T) {
 	}
 }
 
+// TestExplainBuffersJSONAlwaysIncludesSharedBlocks pins the FORMAT JSON slice
+// of M0122-0003 BUFFERS: unlike TEXT's "Buffers:" line (only printed when
+// non-zero), upstream's non-text show_buffer_usage() prints "Shared Hit
+// Blocks"/"Shared Read Blocks" unconditionally once BUFFERS is requested,
+// even when a counter is zero (explain.c's peek_buffer_usage comment: "when
+// format is anything other than text, we print even if the counters are all
+// zeroes"). Scope: shared-only — dirtied/written/local/temp remain deferred.
+func TestExplainBuffersJSONAlwaysIncludesSharedBlocks(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf4 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM ebuf4")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Shared Hit Blocks"`) {
+		t.Errorf("expected \"Shared Hit Blocks\" key in JSON output:\n%s", out)
+	}
+	if !strings.Contains(out, `"Shared Read Blocks"`) {
+		t.Errorf("expected \"Shared Read Blocks\" key in JSON output:\n%s", out)
+	}
+}
+
+// TestExplainBuffersJSONOmittedWithoutBuffersOption confirms the JSON/XML/YAML
+// "Shared Hit/Read Blocks" properties are opt-in, matching TEXT's BUFFERS gate.
+func TestExplainBuffersJSONOmittedWithoutBuffersOption(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf5 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, FORMAT JSON) SELECT data FROM ebuf5")
+	out := strings.Join(lines, "\n")
+	if strings.Contains(out, "Shared Hit Blocks") || strings.Contains(out, "Shared Read Blocks") {
+		t.Errorf("EXPLAIN (ANALYZE, FORMAT JSON) without BUFFERS unexpectedly reported shared blocks:\n%s", out)
+	}
+}
+
+// TestExplainBuffersXMLTagSanitized pins the XML rendering of the same
+// property: xmlTagName sanitizes the space to '-' (ExplainXMLTag upstream).
+func TestExplainBuffersXMLTagSanitized(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf6 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT XML) SELECT data FROM ebuf6")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, "<Shared-Hit-Blocks>") || !strings.Contains(out, "<Shared-Read-Blocks>") {
+		t.Errorf("expected <Shared-Hit-Blocks>/<Shared-Read-Blocks> tags in XML output:\n%s", out)
+	}
+}
+
 // TestExplainBuffersRepeatScanAccumulatesHits runs the same query twice so
 // the second pass's pages are guaranteed resident, exercising the hit-only
 // branch of formatBuffersLine (no read= term once nothing needs a disk

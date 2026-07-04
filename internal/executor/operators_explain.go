@@ -579,6 +579,19 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
 			obj["Heap Fetches"] = s.heapFetches
 		}
+		// EXPLAIN (ANALYZE, BUFFERS, FORMAT {JSON,XML,YAML}): unlike TEXT's
+		// "Buffers:" line (formatBuffersLine, only printed when non-zero),
+		// upstream's non-text show_buffer_usage() prints these properties
+		// unconditionally once BUFFERS is requested, even when zero
+		// (explain.c's peek_buffer_usage: "when format is anything other
+		// than text, we print even if the counters are all zeroes"). Only
+		// the shared hit/read counters goopg actually tracks are emitted
+		// here; dirtied/written/local/temp/I-O-timing remain deferred
+		// (ledger, M0122-0003).
+		if opts.Buffers {
+			obj["Shared Hit Blocks"] = s.bufHit
+			obj["Shared Read Blocks"] = s.bufRead
+		}
 	}
 	// Re-render Plans recursively with stats, replacing the
 	// stats-free children that planToJSON installed.

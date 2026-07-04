@@ -108,7 +108,7 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | FORMAT XML | **done, this loop** |
 | FORMAT YAML | **done, this loop** |
 | SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
-| BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
+| BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
 | `pg_stat_io` | open — table registered (`internal/catalog/catalog.go:6798`, OID 8061) but `VirtualRows` always returns `nil`; no I/O stat collection exists |
 | per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
 | `track_io_timing` runtime `SET` | open — GUC registered `ContextUserset` but only consulted once at process boot (`cmd/goopg/main.go`'s `boolGUC` → `initdb.OpenOptions.TrackIOTiming`), not re-checked per session/query |
@@ -228,14 +228,12 @@ rule: the whole line is omitted when both counters are zero, and each of
 `hit=`/`read=` is omitted individually when that counter is zero.
 
 **Deferred (ledger row, same date):**
-- FORMAT JSON/XML/YAML rendering (`planToJSONWithStats` doesn't add a
-  `Buffers` key yet) — TEXT was landed first since it needed no schema
-  changes to the structured-format tree.
 - `EXPLAIN (BUFFERS)` without `ANALYZE` (PG 17+ shows *planning-time*
   buffer usage in this case) — goopg has no separate planning-phase buffer
   counters; `walkPlan`/`walkPlanFiltered` (the non-ANALYZE path) never
   calls into the buffer accounting at all.
-- `dirtied=`/`written=`/local- and temp-buffer terms.
+- `dirtied=`/`written=`/local- and temp-buffer terms, and `I/O Timings`
+  (gated on `track_io_timing`, itself only read at process boot).
 - The two narrow `Pin()` call sites scoped out above (new-block allocation,
   race-recovery re-pin).
 
@@ -244,3 +242,28 @@ rule: the whole line is omitted when both counters are zero, and each of
 hit=/read= populated), `TestExplainBuffersOffByDefault` (no BUFFERS ⇒ no
 line, even under ANALYZE), `TestExplainBuffersRepeatScanAccumulatesHits`
 (a second, warm-cache pass reports hit-only, no read=).
+
+### FORMAT JSON/XML/YAML (later loop, 2026-07-04)
+
+Upstream's `show_buffer_usage` non-TEXT branch prints `"Shared Hit
+Blocks"`/`"Shared Read Blocks"`/... as flat sibling properties on the plan
+node object — **not** nested under a `"Buffers"` key as an earlier ledger
+note had guessed — and, per `peek_buffer_usage`'s comment ("when format is
+anything other than text, we print even if the counters are all
+zeroes"), unconditionally once BUFFERS is requested, unlike TEXT's
+positive-only gating. `planToJSONWithStats` (`internal/executor/
+operators_explain.go`) now sets `obj["Shared Hit Blocks"]`/`obj["Shared
+Read Blocks"]` from the same per-node `nodeStats.bufHit`/`bufRead` the
+TEXT line already reads, whenever `opts.Buffers` is set — scoped to the
+two counters goopg actually tracks; the other 8 upstream properties
+(`Shared Dirtied/Written Blocks`, all four `Local *`, both `Temp *`) are
+not emitted at all (an always-zero stub would misrepresent untracked
+dirty/write activity as "confirmed zero"). No XML/YAML-specific code
+needed — both formats already render an arbitrary `map[string]any` leaf
+generically (`xmlTagName` sanitizes `"Shared Hit Blocks"` to
+`Shared-Hit-Blocks`; the YAML renderer keys off the same map).
+
+**Tests:** `TestExplainBuffersJSONAlwaysIncludesSharedBlocks` (present
+even when a counter is zero), `TestExplainBuffersJSONOmittedWithoutBuffersOption`
+(gated on `opts.Buffers`), `TestExplainBuffersXMLTagSanitized` (tag-name
+sanitization).
