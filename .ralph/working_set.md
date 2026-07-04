@@ -1,167 +1,81 @@
 (idle — nothing in flight)
 
-M0119-0004 (plain CREATE VIEW restart persistence) committed and pushed to
-`align-data-structure-with-pg` (`71cab6e7`):
-- Root cause: `execCreateView` never called `syncTableToCatalogHeap`, so a
-  plain (non-materialized) view had zero on-disk persistence — it simply
-  ceased to exist after any restart, unlike a matview (M0119-0004's earlier
-  loop) which at least survived as a downgraded table. Mirrored that fix one
-  level down: `buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go`)
-  emits `relkind='v'` (relfilenode=0) for `tbl.View != nil`;
-  `loadUserTablesFromHeap` (`internal/initdb/open.go`) accepts relkind='v'
-  and sets the reloaded table's `Virtual=true`; new `wal.RecordKindCreateView`
-  (byte 103) carries `tableOID|queryLen|querySQL`, emitted from
-  `syncTableToCatalogHeap`; new `internal/initdb/view_ddl_recovery.go`'s
-  `replayViewRecords` (near-copy of `replayMatViewRecords`) re-parses it
-  after `loadUserTablesFromHeap`, wired into `open.go`.
-- Also closed two hazards in the same diff: (a) `CREATE OR REPLACE VIEW`'s
-  OID churn (catalog.CreateView always assigns a fresh OID even on replace)
-  — old OID's heap rows now stamped xmax-deleted via `deleteCatalogRowsForOID`;
-  (b) `DROP VIEW`/`DROP MATERIALIZED VIEW` never stamped xmax on their own
-  CREATE's heap rows (the matview half was a pre-existing gap from the
-  earlier M0119-0004 loop, closed here as the sibling fix) — both
-  `execDropOneView`/`execDropOneMatView` now mirror `dropTableByRefImmediate`'s
-  cleanup.
-  Tests: `internal/initdb/view_ddl_recovery_test.go` (4 tests, all pass).
-  Design: `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up: plain
-  CREATE VIEW restart persistence" section.
-- Deferred (ledger rows, both `-` status): (1) view `reloptions`
-  (CheckOption/SecurityBarrier/SecurityInvoker) still don't round-trip
-  through the heap-persisted pg_class row (`buildUserPGClassRow` hardcodes
-  `reloptions="{}"` unconditionally — pre-existing, not view-specific). (2)
-  `DROP MATERIALIZED VIEW` still leaks its physical heap file on disk (no
-  `Pool.Manager().DropRelation` call for the matview's own storage).
-- **New MAINT discovery (ledger row, unrelated to this loop's correctness):**
-  `scripts/tpch-spotcheck.sh` hangs indefinitely against the long-lived
-  `bench/tpch/runtime_goopg/data` dir (2.2GB, `global/`=283MB — abnormally
-  large). Confirmed via `git stash` of this loop's 4 production files +
-  rebuild that the hang **predates and is unrelated to** this change (still
-  hangs with the files stashed). Leading hypothesis: repeated non-idempotent
-  spotcheck runs across many prior loops bloated the mirrored shared
-  catalogs (`mirrorTouchedCatalogsToPostgresDB`) without ever resetting.
-  Gates run instead: `go build`/`go vet` clean; `go test
-  ./internal/wal/... ./internal/initdb/... ./internal/executor/...` all
-  PASS (one confirmed-flaky unrelated WAL test, reran 3/3 green in
-  isolation); pre-commit pgbench smoke hook (fresh tmp data dir, unrelated
-  to the bloated bench dir) PASS at commit time.
-
-**Concurrency note (loop #11):** Tree B (the peer `ralph_loop.sh` tree) was
-actively mid-edit on M0122-0003 BUFFERS rendering at loop start
-(`instrument.go`/`operators_explain.go`/`bufpool.go`/`explain_buffers_test.go`)
-and committed+pushed it cleanly mid-session (`2ca35bee`/`1fe2ef84`); by the
-time this loop was ready to commit, Tree B had already staged (index only,
-not committed) a NEW slice touching `docs/design/0122-0003-*.md`,
-`docs/design/README.md`, `explain_buffers_test.go`, `operators_explain.go`.
-Used `git commit -- <explicit pathspec list>` (not `git add` + plain
-`git commit`) specifically BECAUSE Tree B's files were already index-staged
-— pathspec-limited commit records only the named paths' current worktree
-content and leaves everything else (staged or not) completely alone.
-Verified via `git status` before AND after that none of Tree B's files
-changed status. `.ralph/deferral_ledger.md` is a shared append-target both
-trees write to — re-read it fresh immediately before editing to avoid
-clobbering a concurrent append (this loop's Edit only flipped one row's
-status field and appended after the true current last line).
-
-Next step: either (a) `bench/tpch/setup_goopg.sh` to regenerate the TPC-H
-data dir and confirm the spotcheck hang clears (a one-time MAINT reload,
-see the new ledger row), restoring the mandatory spotcheck gate for future
-executor/planner loops; or (b) pick up the next M0119/M0122 item per
-`.ralph/fix_plan.md` — e.g. the CheckOption/SecurityBarrier/SecurityInvoker
-reloptions-heap gap or the DROP MATERIALIZED VIEW physical-storage leak
-just deferred above, both bounded single-loop items.
-
 ---
 
-**Tree A addendum (this same loop #11, written after the note above —
-Tree A here = this session).** Landed M0122-0003's BUFFERS FORMAT
-JSON/XML/YAML slice, committed+pushed `96f390a3`:
-`planToJSONWithStats` now sets `obj["Shared Hit Blocks"]`/`obj["Shared
-Read Blocks"]` from the existing `nodeStats.bufHit`/`bufRead`
-whenever `opts.Buffers` is set, unconditionally (even zero) — matches
-`explain.c`'s non-TEXT `show_buffer_usage` branch (flat sibling
-properties, confirmed by reading the upstream source directly — an
-earlier ledger note's guess at a nested `"Buffers"` wrapper key was
-wrong and is corrected in a new ledger row). No XML/YAML-specific code
-needed (generic map renderer + `xmlTagName` already handle it). Tests:
-3 new cases in `explain_buffers_test.go`. Design doc + README updated.
-Gates: build/vet clean, `internal/executor` full package PASS, pgbench
-pre-commit smoke PASS. tpch-spotcheck.sh was NOT run clean (see the
-bloated-data-dir MAINT note above from Tree B — same root cause, hit
-independently from this side too: 2 startup-timeout FAILs + 1 mid-Q13
-`Killed`, Q12's row count was correct every time; relied on the
-targeted `internal/executor` suite instead since the diff never
-touches Q12/Q13's query path).
+**Loop #13 addendum (this session).** Concurrent `ralph_loop.sh` peer
+detected again at loop start (SessionStart hook); verified via `pgrep -af`
+before touching anything. `git status` showed the peer mid-edit on
+`internal/executor/pg18_user_catalog_rows.go`/`_test.go` (the
+reloptions-heap-encoder gap the prior loop's own addendum had pointed at —
+`CheckOption`/`SecurityBarrier`/`SecurityInvoker` round-tripping through
+`buildUserPGClassRow`'s `reloptions` column) plus `.ralph/progress.json`/
+`weekly_loc.{csv,png}`/an untracked `postgres` dir — none touched.
 
-**Hit the git-index race Tree B's note above warns about, the hard
-way — before reading this file's own advice.** Ran `git add <5
-explicit files>` then a plain `git commit -m ...` (no pathspec on the
-commit itself). Between those two commands Tree B staged its own new
-`internal/initdb/view_ddl_recovery.go`/`_test.go` into the SAME shared
-index; the pathspec-less `git commit` recorded the *entire* current
-index, so `96f390a3` absorbed those 2 foreign files too. Verified
-harmless before worrying further: `git diff HEAD -- <those 2 files>`
-was empty right after (their content was already final), and Tree B's
-own next commit (`71cab6e7`) correctly did not re-add them — no
-duplication, no data loss, just a cosmetic misattribution in
-`96f390a3`'s file list. Both commits were already pushed by the time
-this was noticed, so no history rewrite was attempted (rewriting a
-shared already-pushed branch to fix a cosmetic issue risks far worse
-damage to a live peer's next push than the misattribution itself).
-**Confirmed lesson, now doubly-validated:** under concurrent Ralph
-loops, always commit via `git commit -- <explicit pathspec list>`
-(records only the named paths' current content, ignores the rest of
-the index) — never `git add <files>` followed by a pathspec-less `git
-commit` (that commits the *entire* index, including anything a peer
-staged in between). Saved as a durable memory
-(`ralph_concurrent_commit_pathspec_required`) so this stops being
-rediscovered per-loop.
+Picked the *other* M0122-0003 sub-item instead (`pg_stat_io` real data) to
+avoid stepping on the peer's file. Landed + pushed `1cba48b9`:
+- `internal/executor/pgstat_io.go` (new): ports upstream's
+  `pgstat_tracks_io_bktype`/`_object`/`_op` predicates
+  (`postgres/src/backend/utils/activity/pgstat_io.c`) into Go
+  (`ioTracksObject`/`ioTracksOp`; `ioBackendType` enum lists only the 14
+  tracked types, folding `_bktype` in). Verified against a throwaway real
+  PostgreSQL 18.3 cluster (`postgres/local_install/bin/{initdb,pg_ctl,psql}`
+  against a temp unix-socket data dir — remember
+  `LD_LIBRARY_PATH=postgres/local_install/lib` or `psql` fails with a
+  `PQsendPipelineSync` symbol-lookup error) rather than derived from static
+  C reading alone: `SELECT * FROM pg_stat_io` on a fresh cluster returns 79
+  rows across 14 backend types. `fetchIOStatRows(ctx)` builds all 79 with
+  upstream's exact NULL-vs-tracked-zero cell shape, overriding only the one
+  cell goopg instruments (backend_type='client backend', object='relation',
+  context='normal': reads/read_bytes/hits) from the existing
+  `storage.Pool.BufferCounters()`. Wired into `valuesOp.Open`
+  (`internal/executor/operators.go`, `tbl.Name == "pg_stat_io"` case),
+  mirroring the `pg_stat_slru`/`fetchSLRURows` live-data pattern (NOT a
+  static `VirtualRows` closure — see [[per_connection_virtual_catalog_scoping]]).
+- The same real-PG probe caught a wrong pre-existing test assumption:
+  `internal/testport/client_tools_port_test.go`'s
+  `TestPort_PgWalsummary002Blocks` asserted 0 `walsummarizer` rows in
+  `pg_stat_io` with `summarize_wal=off`; real PG reports 2 (wal/init,
+  wal/normal, both all-zero) *unconditionally* —
+  `pgstat_tracks_io_bktype` gates on the BackendType enum value, not on
+  whether that process type ever actually ran. Fixed the assertion +
+  comment to expect 2; PASS.
+- Design: `docs/design/0122-0003-explain-format-xml-yaml.md` new
+  "pg_stat_io row shape" section + cluster-status table row updated;
+  `docs/design/README.md` index entry appended. `.ralph/fix_plan.md`
+  M0122-0003 banner updated (also retroactively noted BUFFERS FORMAT
+  JSON/XML/YAML as done — landed in an earlier loop, commit `96f390a3`,
+  but the banner text was stale).
+- New ledger row (status `-`): the other 7 upstream `pg_stat_io` I/O
+  counters (writes/extends/evictions/reuses/writebacks/fsyncs + all
+  `*_bytes`/`*_time` columns) still render a real 0, not tracked activity —
+  same root-cause gap as the BUFFERS `dirtied=`/`written=` rows (no
+  write/extend/evict/reuse/fsync instrumentation anywhere in goopg yet).
+  `track_io_timing`'s runtime-`SET` gap (recorded earlier) is unaffected.
+- Tests: `internal/executor/pgstat_io_test.go` (5 new: row count=79,
+  invalid-combination exclusion, NULL/tracked shape, walsummarizer 2-row
+  shape, live-counter wiring through `newVMFixture`/`runComposite`/
+  `runQueryRows`).
+- Gates: `go build ./...`/`go vet ./...` clean; `go test
+  ./internal/executor/... ./internal/catalog/...` PASS; `go test -run
+  TestPort_PgWalsummary002Blocks ./internal/testport/` PASS;
+  `scripts/tpch-spotcheck.sh` PASS this loop (Q12=2 rows/28.7s, Q13=33
+  rows/94.8s — the previously-reported hang against the bloated
+  `bench/tpch/runtime_goopg/data` dir did NOT reproduce; no action taken).
+  Pre-commit pgbench smoke hook PASS at commit time. `make
+  ralph-state-guard` found a stale status=running/progress=completed
+  mismatch from the *previous* loop's clean-exit marker and auto-repaired
+  it to in_progress; re-ran clean.
+- Committed via `git add -- <explicit 9 files>` + `git commit -- <same 9
+  files>` (never a bare `git add`/pathspec-less `git commit`), per
+  `ralph_concurrent_commit_pathspec_required`; verified via `git status`/
+  `git show --stat HEAD` before and after that the peer's
+  `pg18_user_catalog_rows*.go` files were untouched by this commit.
 
-Next step (Tree A): pick up `pg_stat_io` real data or `track_io_timing`
-runtime `SET` (both M0122-0003 sub-items, both block on the same
-storage-layer I/O-counter gap; `pg_stat_io` likely more tractable since
-`Pool.BufferCounters()` already exists and just needs pool-wide
-aggregation instead of per-node attribution).
-
----
-
-**Loop #12 addendum (this session).** A peer `ralph_loop.sh` was again
-detected running concurrently at loop start (SessionStart hook). Verified
-via `pgrep -af` before touching anything; `git status` showed no
-conflicting in-progress edits (peer's prior M0122-0003 work was already
-committed). Picked up deferred item (2) named in this file's own loop #11
-section above — `DROP MATERIALIZED VIEW` physical-storage leak — landed +
-pushed `a7f770b3`:
-- `execDropOneMatView` (`internal/executor/operators_ddl.go`) now mirrors
-  `dropTableByRefImmediate`'s `DROP TABLE` sequence for the matview's own
-  main-fork file: `o.ctx.Catalog.RelFileNode(tbl)` → `Pool.InvalidateRel` →
-  `Pool.Manager().DropRelation` (idempotent, safe even for an unmaterialized
-  `WITH NO DATA` matview) → `FSM.DropRelation`/`VM.DropRelation`, added
-  right after the existing catalog-heap xmax-stamp block.
-- Test: `internal/executor/operators_ddl_matview_storage_test.go`
-  (`TestDropMaterializedViewReleasesStorage`) — creates a populated matview,
-  confirms `Pool.Manager().Exists(rel)` is true, drops it, asserts the file/
-  FSM/VM are all cleared. PASS.
-- Design: `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up: DROP
-  MATERIALIZED VIEW physical-storage leak" section.
-- Ledger: appended a `resolved` row closing this item; deferred item (1)
-  (view reloptions round-trip: `CheckOption`/`SecurityBarrier`/
-  `SecurityInvoker` — `buildUserPGClassRow` hardcodes `reloptions="{}"`)
-  remains open, and a NEW narrower gap surfaced while scoping this fix:
-  indexes on a materialized view (if any exist) have their own, separate,
-  unexamined physical storage — not covered by this loop.
-- Gates: `go build`/`go vet` clean; `go test ./internal/executor/...` (full
-  package) PASS; `go test ./internal/initdb/... -run 'MatView|View'` PASS;
-  `make ralph-state-guard` OK (self-repaired a stale running/completed
-  mismatch, expected mid-loop); pre-commit pgbench smoke PASS at commit
-  time. tpch-spotcheck.sh NOT run — same pre-existing bloated-data-dir MAINT
-  issue noted above, still unresolved.
-- Committed via `git commit -m ... -- <explicit pathspec>` (message BEFORE
-  `--`, not after — `git commit -- <paths> -m msg` errors because pathspec
-  must be the trailing arg) to avoid absorbing any peer-staged files, per
-  the hard-won lesson in this same file's loop #11 addendum above.
-
-Next step: pick up the reloptions-heap-encoder gap (bounded, single-loop,
-`internal/executor/pg18_user_catalog_rows.go`'s `buildUserPGClassRow`) or
-another M0119-0004 slice from `.ralph/fix_plan.md`'s "Next up" banner /
-`.ralph/deferral_ledger.md`. Prefer a non-M0122-0003 item to avoid stepping
-on the peer tree, which appears to be actively working that milestone.
+Next step: pick up the next M0119/M0122 item once the peer's
+reloptions-heap-encoder fix lands (check `git log`/`.ralph/deferral_ledger.md`
+first — it may already be resolved by the time this file is next read).
+Otherwise a fresh `unimplemented_feat.json`/ledger `status=-` row not
+touching `pg18_user_catalog_rows.go` or the storage-instrumentation-layer
+gap (both `pg_stat_io`'s remaining counters and `track_io_timing` block on
+new write/extend/evict/fsync counters — a bigger multi-loop unit, better
+picked up deliberately rather than as a side effect of a smaller task).
