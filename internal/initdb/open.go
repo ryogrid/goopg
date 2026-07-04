@@ -2191,6 +2191,21 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 					continue
 				}
 				physicalRow = true
+				// DecodePGClassPhysicalRow only covers the fixed-offset
+				// prefix; reloptions (attnum 33) is a varlena column past
+				// it, so re-decode the full PG18-canonical row with the
+				// general PG-tuple decoder to recover it. A decode failure
+				// here just leaves RelOptions empty (best-effort — the
+				// fixed fields above already succeeded). M0119-0004.
+				natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+				cols := executor.PGClassColumnsPG18()
+				decoded := make(executor.Row, len(cols))
+				if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr == nil {
+					const reloptionsOrdinal = 32
+					if reloptionsOrdinal < len(decoded) && !decoded[reloptionsOrdinal].IsNull() {
+						row.RelOptions = decoded[reloptionsOrdinal].StringValue()
+					}
+				}
 			}
 			// Skip rows from uncommitted or crashed goopg transactions
 			// (M0030-0007). PG basebackup tuples come from a consistent
@@ -2329,6 +2344,13 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode
+		}
+		// Restore storage parameters (fillfactor, autovacuum_*, and for
+		// views security_barrier/security_invoker/check_option) from the
+		// heap-persisted reloptions column — otherwise they silently
+		// reverted to defaults across every restart. M0119-0004.
+		if tr.RelOptions != "" {
+			catalog.ApplyTableReloptions(tbl, tr.RelOptions)
 		}
 		if err := cat.TryRegisterUserTable(tbl); err != nil {
 			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)

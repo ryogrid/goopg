@@ -13117,6 +13117,20 @@ func quoteArrayElement(s string) string {
 // vacuum_max_eager_freeze_failure_rate, vacuum_index_cleanup, then (views
 // only) security_barrier, security_invoker, check_option.
 func BuildTableReloptions(t *Table) string {
+	relopts := TableReloptionsElements(t)
+	if len(relopts) == 0 {
+		return ""
+	}
+	return arrayTextLiteral(relopts)
+}
+
+// TableReloptionsElements is BuildTableReloptions's element-list form: the
+// raw "key=value" strings before joining into the text[] external literal.
+// Physical heap-tuple encoding needs the individual elements (to build a
+// proper PG ArrayType blob via pgTextArrayBytes), not the pre-joined
+// "{a,b}" string BuildTableReloptions returns for the live virtual pg_class
+// row and the planner's NULL-vs-non-empty check. M0119-0004.
+func TableReloptionsElements(t *Table) []string {
 	var relopts []string
 	if t.Fillfactor != 0 {
 		relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
@@ -13202,11 +13216,126 @@ func BuildTableReloptions(t *Table) string {
 	if t.CheckOption != "" {
 		relopts = append(relopts, "check_option="+t.CheckOption)
 	}
-	if len(relopts) == 0 {
-		return ""
-	}
-	return arrayTextLiteral(relopts)
+	return relopts
 }
+
+// ApplyTableReloptions is BuildTableReloptions's inverse: given a
+// pg_class.reloptions text[] external literal in the exact form
+// BuildTableReloptions itself produces (e.g. "{fillfactor=70,check_option=local}"),
+// it sets the corresponding fields on t. Used by loadUserTablesFromHeap to
+// restore a table's/view's storage parameters from the heap-persisted pg_class
+// row after a restart — without this, buildUserPGClassRow's reloptions column
+// was decoded and silently discarded, so e.g. `WITH (fillfactor=70)` or a
+// view's `WITH LOCAL CHECK OPTION` reverted to defaults across a restart
+// (M0119-0004). This is intentionally not a general PG array-literal parser
+// (no quote/escape handling): goopg only ever needs to round-trip its own
+// emitted content here, and every value BuildTableReloptions emits is a bare
+// number/bool/enum token that never needs quoting (quoteArrayElement).
+// Malformed/unknown keys are silently ignored so a forward-compatible reader
+// tolerates options written by a newer goopg version.
+func ApplyTableReloptions(t *Table, text string) {
+	if len(text) < 2 || text[0] != '{' || text[len(text)-1] != '}' {
+		return
+	}
+	inner := text[1 : len(text)-1]
+	if inner == "" {
+		return
+	}
+	for _, kv := range strings.Split(inner, ",") {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "fillfactor":
+			t.Fillfactor, _ = strconv.Atoi(val)
+		case "parallel_workers":
+			t.ParallelWorkers, _ = strconv.Atoi(val)
+			t.ParallelWorkersSet = true
+		case "autovacuum_enabled":
+			t.AutovacuumEnabled = val == "true"
+			t.AutovacuumEnabledSet = true
+		case "toast_tuple_target":
+			t.ToastTupleTarget, _ = strconv.Atoi(val)
+		case "autovacuum_vacuum_threshold":
+			t.AutovacuumVacuumThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumThresholdSet = true
+		case "autovacuum_vacuum_scale_factor":
+			t.AutovacuumVacuumScaleFactor, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumVacuumScaleFactorSet = true
+		case "autovacuum_analyze_scale_factor":
+			t.AutovacuumAnalyzeScaleFactor, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumAnalyzeScaleFactorSet = true
+		case "autovacuum_vacuum_insert_scale_factor":
+			t.AutovacuumVacuumInsertScaleFactor, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumVacuumInsertScaleFactorSet = true
+		case "autovacuum_vacuum_cost_delay":
+			t.AutovacuumVacuumCostDelay, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumVacuumCostDelaySet = true
+		case "autovacuum_analyze_threshold":
+			t.AutovacuumAnalyzeThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumAnalyzeThresholdSet = true
+		case "autovacuum_vacuum_insert_threshold":
+			t.AutovacuumVacuumInsertThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumInsertThresholdSet = true
+		case "vacuum_truncate":
+			t.VacuumTruncate = val == "true"
+			t.VacuumTruncateSet = true
+		case "log_autovacuum_min_duration":
+			t.LogAutovacuumMinDuration, _ = strconv.Atoi(val)
+			t.LogAutovacuumMinDurationSet = true
+		case "autovacuum_freeze_min_age":
+			t.AutovacuumFreezeMinAge, _ = strconv.Atoi(val)
+			t.AutovacuumFreezeMinAgeSet = true
+		case "autovacuum_freeze_max_age":
+			t.AutovacuumFreezeMaxAge, _ = strconv.Atoi(val)
+			t.AutovacuumFreezeMaxAgeSet = true
+		case "autovacuum_freeze_table_age":
+			t.AutovacuumFreezeTableAge, _ = strconv.Atoi(val)
+			t.AutovacuumFreezeTableAgeSet = true
+		case "autovacuum_multixact_freeze_min_age":
+			t.AutovacuumMultixactFreezeMinAge, _ = strconv.Atoi(val)
+			t.AutovacuumMultixactFreezeMinAgeSet = true
+		case "autovacuum_multixact_freeze_max_age":
+			t.AutovacuumMultixactFreezeMaxAge, _ = strconv.Atoi(val)
+			t.AutovacuumMultixactFreezeMaxAgeSet = true
+		case "autovacuum_multixact_freeze_table_age":
+			t.AutovacuumMultixactFreezeTableAge, _ = strconv.Atoi(val)
+			t.AutovacuumMultixactFreezeTableAgeSet = true
+		case "autovacuum_vacuum_cost_limit":
+			t.AutovacuumVacuumCostLimit, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumCostLimitSet = true
+		case "user_catalog_table":
+			t.UserCatalogTable = val == "true"
+			t.UserCatalogTableSet = true
+		case "autovacuum_vacuum_max_threshold":
+			t.AutovacuumVacuumMaxThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumMaxThresholdSet = true
+		case "vacuum_max_eager_freeze_failure_rate":
+			t.VacuumMaxEagerFreezeFailureRate, _ = strconv.ParseFloat(val, 64)
+			t.VacuumMaxEagerFreezeFailureRateSet = true
+		case "vacuum_index_cleanup":
+			t.VacuumIndexCleanup = val
+			t.VacuumIndexCleanupSet = true
+		case "security_barrier":
+			t.SecurityBarrier = val == "true"
+			t.SecurityBarrierSet = true
+		case "security_invoker":
+			t.SecurityInvoker = val == "true"
+			t.SecurityInvokerSet = true
+		case "check_option":
+			t.CheckOption = val
+		}
+	}
+}
+
+// ArrayTextLiteral exports arrayTextLiteral for executor's physical
+// text[]/ArrayType decoder (codec.go), which must join a decoded ArrayType
+// blob's elements back into the same "{elem,elem,…}" external-literal form
+// BuildTableReloptions/TableReloptionsElements produce, so a decoded
+// pg_class.reloptions round-trips byte-for-format-identical through
+// catalog.ApplyTableReloptions. M0119-0004.
+func ArrayTextLiteral(parts []string) string { return arrayTextLiteral(parts) }
 
 // arrayTextLiteral renders elements as a PostgreSQL text[] external literal
 // ("{elem,elem,…}"), quoting each element per array_out's rules (see

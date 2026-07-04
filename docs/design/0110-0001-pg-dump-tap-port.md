@@ -14168,3 +14168,112 @@ Gates: `go build ./...` clean; `go vet ./internal/executor/...` clean;
 Q13=33); pgbench smoke = pre-commit hook; `make ralph-state-guard` OK.
 No new deferral — this closes the ledger row in full for all three
 relation kinds sharing the code path.
+
+## Follow-up: reloptions never survived a restart (M0119-0004, this loop)
+
+Closes the deferred item named in the "plain CREATE VIEW restart persistence"
+follow-up above: "view `reloptions` (CheckOption/SecurityBarrier/
+SecurityInvoker) still don't round-trip through the heap-persisted pg_class
+row (`buildUserPGClassRow` hardcodes `reloptions="{}"` unconditionally —
+pre-existing, not view-specific)." The bug was general, not view-only: any
+table's `fillfactor`/`autovacuum_*`/etc. storage parameter set via `WITH
+(...)` or `ALTER TABLE ... SET (...)` also silently reverted to its default
+across every goopg restart, because `buildUserPGClassRow`
+(`internal/executor/pg18_user_catalog_rows.go`) — the row writer feeding the
+heap-persisted pg_class tuple, as opposed to `registerSystemTables`'s
+`VirtualRows` closure in `internal/catalog/catalog.go` that serves the live
+in-memory catalog — hardcoded the reloptions column to `"{}"` no matter what
+the table actually carried.
+
+Three separate, compounding gaps had to be fixed, in this order:
+
+1. **Duplicated builder logic.** The ~100-line reloptions-list-building
+   block (fillfactor, the 20-odd `autovacuum_*` settings,
+   `vacuum_index_cleanup`, and for views `security_barrier`/
+   `security_invoker`/`check_option`) lived only inline inside
+   `registerSystemTables`'s closure. Extracted to
+   `catalog.TableReloptionsElements(t *Table) []string` (the raw
+   `"key=value"` element list) with `catalog.BuildTableReloptions(t) string`
+   as a thin wrapper that joins via the existing `arrayTextLiteral`. Both the
+   live virtual pg_class row and `buildUserPGClassRow` now call the same
+   function, closing the sibling-path-drift risk
+   ([[pattern_sibling_paths_must_agree]]) that let `buildUserPGClassRow` fall
+   out of sync in the first place.
+
+2. **The write side silently discarded non-empty content.**
+   `pgClassColumnsPG18()` declares `reloptions` as the literal type name
+   `"text[]"` (matching `aclitem[]`/`pg_node_tree` — these are catalog-only
+   type-name conventions, distinct from a user column's `Type.IsArray` flag;
+   see [[goopg_array_column_isarray_codec]] for that separate mechanism).
+   `encodeValuePG`'s `"text[]"` case was written only for pre-built
+   `KindBytes` ArrayType blobs (the existing `proargnames`/`proconfig`
+   pattern, M0106-0010 Step 3dk) — for any other Datum kind (e.g. the
+   `NewStringDatum` this loop first tried) it silently substitutes
+   `emptyArrayTypeBytes(25)`, an empty array, discarding the content
+   entirely. This is why the bug was invisible before: `reloptions` was
+   always the empty string, so writing an empty array "by accident" looked
+   correct. `buildUserPGClassRow` now builds a real ArrayType blob via the
+   existing `pgTextArrayBytes(elements []string) []byte` helper and passes it
+   through `NewBytesDatum` (the same pattern already used for
+   `attacl`/`typacl`/`indkey`/`stavalues`).
+
+3. **The read side had no decoder for a populated `text[]` physical column.**
+   `internal/executor/codec.go`'s `decodePhysicalPGValueMctx` had no case for
+   `"text[]"`/`"_text"` at all — it fell to the generic `default` varlena
+   branch, which strips only the outer `vl_len_` header and returns the
+   *raw* ArrayType bytes (ndim/dataoffset/elemtype/dims/lbound + encoded
+   elements) as if they were plain text. Harmless while the array was always
+   empty (paired with `NullDatum` upstream, so this branch never even ran on
+   `reloptions` before); actively wrong once (2) started emitting real
+   content — `loadUserTablesFromHeap` would decode garbage bytes instead of
+   `"{fillfactor=70}"`. Added `decodePGTextArrayElements` (mirrors
+   `pgTextArrayBytes`'s exact element encoding: 4-byte length-prefixed,
+   4-byte-aligned; treats a 12-byte payload — no dims/lbound — as the empty
+   form `emptyArrayTypeBytes` produces) plus a `"text[]"`/`"_text"` case in
+   `decodePhysicalPGValueMctx` that joins the decoded elements back into the
+   `"{elem,elem,…}"` external-literal form via the newly-exported
+   `catalog.ArrayTextLiteral`, so the decoded value is
+   byte-for-format-identical with what `BuildTableReloptions` would have
+   produced live. This decoder is intentionally narrow — it round-trips only
+   goopg's own emitted content (no general PG array-literal escaping) — the
+   same scope discipline `ApplyTableReloptions` below documents.
+
+Finally, `catalog.ApplyTableReloptions(t *Table, text string)` — the mirror
+image of `TableReloptionsElements`, parsing a `"{k=v,k2=v2}"` literal back
+into the individual `Table` fields (`Fillfactor`, every `*Set`-guarded
+autovacuum field, `SecurityBarrier(Set)`/`SecurityInvoker(Set)`/
+`CheckOption`) — is wired into `loadUserTablesFromHeap`
+(`internal/initdb/open.go`) Pass 3, right before `TryRegisterUserTable`.
+Getting the reloptions column onto the heap correctly (points 1–3 above) was
+necessary but insufficient on its own: without this last step the value was
+decoded and then simply discarded, so the restored in-memory `Table` still
+reverted to defaults. Decoding requires the *full* 34-column PG18 schema
+(reloptions is attnum 33, past the fixed-offset prefix
+`catalog.DecodePGClassPhysicalRow` covers) via the already-existing general
+PG-tuple decoder `executor.DecodeRowIntoMctxPGTuple`; newly exported
+`executor.PGClassColumnsPG18()` supplies that schema to `initdb`, which
+already imports `executor` for other catalog-recovery paths.
+
+Tests: `internal/executor/pg18_user_catalog_rows_test.go` —
+`TestBuildUserPGClassRowReloptionsSurvivesHeapEncode` round-trips a plain
+table (NULL), a `fillfactor` table, and a `security_barrier`+`check_option`
+view through the real `EncodeRowPG` → `DecodeRowIntoMctxPGTuple` path (not
+just the pre-encode Datum, which would have missed gap 2/3 above).
+`internal/initdb/view_ddl_recovery_test.go` —
+`TestTableAndViewReloptionsSurviveRestart` is the full end-to-end
+Init/Open/DDL/Close/Open regression: a `WITH (fillfactor=70)` table and a
+`WITH LOCAL CHECK OPTION` view both keep their settings after a real restart.
+
+Scope note: `TableReloptionsElements`/`ApplyTableReloptions` cover every
+field `BuildTableReloptions` already produced before this loop. Two
+still-open, narrower gaps (unaffected by this fix, tracked separately in the
+ledger): `toast.*` reloptions (attach to the TOAST relation's own separate
+pg_class row, never part of the owning table's `reloptions` column) and
+index reloptions (`buildUserPGClassRowForIndex` still hardcodes `"{}"` —
+indexes support `fillfactor` too but were out of scope here, which targeted
+the table/view gap the ledger row named).
+
+Gates: `go build ./...` / `go vet ./...` clean; `go test
+./internal/catalog/...` PASS; `go test ./internal/executor/...` (full
+package) PASS; `go test ./internal/initdb/...` (full package) PASS;
+`make ralph-state-guard` OK; pgbench smoke = pre-commit hook.

@@ -24,6 +24,13 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// PGClassColumnsPG18 exports pgClassColumnsPG18 for initdb's
+// loadUserTablesFromHeap, which needs the full 34-column schema to decode a
+// pg_class physical row's varlena columns (e.g. reloptions) via
+// DecodeRowIntoMctxPGTuple — the hand-written DecodePGClassPhysicalRow in
+// package catalog only covers the fixed-offset prefix. M0119-0004.
+func PGClassColumnsPG18() []catalog.Column { return pgClassColumnsPG18() }
+
 // pgClassColumnsPG18 mirrors initdb.pgClassColDefs — the canonical PG18
 // pg_class row layout (34 columns, matching the Form_pg_class struct in
 // postgres/src/include/catalog/pg_class.h).
@@ -452,6 +459,19 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		relpartbound = catalog.FormatPartitionBound(tbl.PartitionBounds[0])
 	}
 	replIdent := catalog.ReplIdentOrDefault(tbl.ReplicaIdentity) // 'd' default; FULL/NOTHING via ALTER, DU-002 slice 305
+	// reloptions: shared builder with catalog.go's live VirtualRows pg_class
+	// path (catalog.TableReloptionsElements) so a table/view's storage
+	// parameters (fillfactor, autovacuum_*, and for views security_barrier/
+	// security_invoker/check_option) survive a restart instead of being
+	// silently dropped by a hardcoded "{}". The "text[]" physical column
+	// must carry a real PG ArrayType blob (pgTextArrayBytes) via KindBytes —
+	// encodeValuePG's "text[]" case silently discards a KindString and
+	// substitutes an empty array, so NewStringDatum here would round-trip
+	// as if no reloptions were ever set. M0119-0004.
+	reloptionsDatum := NullDatum
+	if relopts := catalog.TableReloptionsElements(tbl); len(relopts) > 0 {
+		reloptionsDatum = NewBytesDatum(pgTextArrayBytes(relopts))
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -485,7 +505,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(minFrozenXID),                                  // relfrozenxid
 		NewIntDatum(minFrozenMXID),                                 // relminmxid
 		NewStringDatum("{}"),                                       // relacl (encoded as empty aclitem[] ArrayType)
-		NewStringDatum("{}"),                                       // reloptions (encoded as empty text[] ArrayType)
+		reloptionsDatum,                                            // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
 		NewStringDatum(relpartbound),                               // relpartbound (FOR VALUES … for partition children)
 	}
 }

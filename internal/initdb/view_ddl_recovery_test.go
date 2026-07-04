@@ -162,3 +162,50 @@ func TestDropMatViewNotResurrectedAfterRestart(t *testing.T) {
 		t.Fatal("mv_dropped resurrected after restart — DROP MATERIALIZED VIEW heap cleanup failed")
 	}
 }
+
+// TestTableAndViewReloptionsSurviveRestart pins the read side of M0119-0004's
+// reloptions fix: buildUserPGClassRow now encodes a table's/view's storage
+// parameters into the heap-persisted pg_class row (catalog.BuildTableReloptions)
+// instead of hardcoding "{}", but that alone is not sufficient — without
+// loadUserTablesFromHeap also decoding the reloptions column back
+// (catalog.ApplyTableReloptions), every reloption would still silently revert
+// to its default across a restart. Covers a plain-table option (fillfactor)
+// and a view-only option (check_option).
+func TestTableAndViewReloptionsSurviveRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ro_src (id int4 NOT NULL, val int4) WITH (fillfactor=70)")
+	runDDL(t, rt1, "CREATE VIEW ro_view AS SELECT id, val FROM ro_src WHERE val > 0 WITH LOCAL CHECK OPTION")
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	src, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "ro_src"})
+	if !ok {
+		t.Fatal("ro_src not found after restart")
+	}
+	if src.Fillfactor != 70 {
+		t.Errorf("ro_src.Fillfactor after restart = %d, want 70", src.Fillfactor)
+	}
+
+	view, ok := rt2.Catalog.LookupTable(parser.ObjectName{Name: "ro_view"})
+	if !ok {
+		t.Fatal("ro_view not found after restart")
+	}
+	if view.CheckOption != "local" {
+		t.Errorf("ro_view.CheckOption after restart = %q, want %q", view.CheckOption, "local")
+	}
+}
