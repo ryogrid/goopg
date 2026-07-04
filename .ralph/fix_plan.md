@@ -516,6 +516,38 @@ mirroring M0119's ledger `status` column.
       `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
       section; `docs/design/README.md` row extended. Ledger:
       `.ralph/deferral_ledger.md` (2026-07-05, M0122-0004).
+      **dense_rank() removed from this bucket (2026-07-05, this loop):**
+      implemented as a window function — the last of the 11 standard
+      PostgreSQL window functions to land (its `WITHIN GROUP`
+      ordered-set-aggregate form, `pg_proc` OIDs 3992/3993, already
+      existed separately and is unaffected). Joins the `row_number`/
+      `rank` case in both `buildWindowFunc` (`internal/planner/
+      planner.go`) and `analyzeWindowFuncCall` (`internal/analyzer/
+      analyzer.go`) — same zero-arg/no-DISTINCT/no-star shape check,
+      `int8` return type. No catalog change needed (`pg_proc` OID 3102
+      `window_dense_rank` was already seeded, just never dispatched).
+      Executor (`internal/executor/operators_window.go`) gains a
+      `denseRank` counter alongside the existing `rank`/`rowNum` locals:
+      `rank` jumps to the current row's 1-based position on a peer-group
+      change; `denseRank` just increments by 1 at the same point, so it
+      never skips a value after a tie (matches `window_dense_rank` in
+      `postgres/src/backend/utils/adt/windowfuncs.c`). Tests:
+      `internal/analyzer/analyzer_test.go`
+      (`TestAnalyzeWindowRankingFunctionsAccepted` gains a `dense_rank()`
+      case, `TestAnalyzeWindowRankingFunctionsRejected` gains a
+      `dense_rank(1)` case; `TestAnalyzeWindowFunctionUnsupportedRejected`
+      repointed at `array_agg() OVER ()` since `dense_rank()` is no
+      longer a valid rejection case), `internal/executor/
+      window_compat_test.go`'s `TestCompatWindowDenseRankPeerGroups`
+      (same tie-then-gap fixture as `TestCompatWindowRankPeerGroups`,
+      cross-checked against upstream PostgreSQL 18.3: `rank` 1,1,3 vs.
+      `dense_rank` 1,1,2 on the same rows). Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
+      section; `docs/design/README.md` row extended;
+      `unimplemented_feat.json` entry annotated in place. Gates:
+      `go build ./...` clean; `go test ./internal/analyzer/...
+      ./internal/planner/... ./internal/executor/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
       **Still open in this bucket:** frame clause parsing/execution
       itself (ROWS/RANGE/GROUPS — now has three real consumers:
       `evalFrameAggFuncs`/`frameEnd`/`evalNtileFuncs` could generalize
@@ -524,10 +556,8 @@ mirroring M0119's ledger `status` column.
       the M0122-0004 series still assumes PostgreSQL's default frame.
       Combining forms (`OVER (win ORDER BY ...)`, a named window based on
       another named window) are also out of scope (real upstream syntax,
-      deferred — see design doc). `dense_rank()` as a window function
-      remains unimplemented (only its `WITHIN GROUP` ordered-set-aggregate
-      form exists). GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause parsing,
-      intervals also remain.
+      deferred — see design doc). GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
+      parsing, intervals also remain.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
@@ -562,9 +592,25 @@ mirroring M0119's ledger `status` column.
       `unimplemented_feat.json` entry updated in place (`status: resolved`).
       Residual (already ledgered, unaffected): negative-literal `Const` casts
       inside a domain CHECK (`VALUE < -5`) still diverge from PG's typed
-      `'-5'::integer` rendering (type-blind `defaultExprToSQL`). **Still open
-      in this bucket:** 1-byte `char` disambiguation, `pg_collation_for`,
-      `pg_ts_config` OIDs.
+      `'-5'::integer` rendering (type-blind `defaultExprToSQL`). **`pg_ts_config`
+      OIDs also removed from this bucket (2026-07-05, this loop,
+      verify-before-implement):** another stale entry — the audit misread
+      `mappedLocalCatalogPlaceholderOIDs`' deliberately-retained legacy
+      3764/3765 placeholder-file entries (internal/initdb/initdb.go:1301,
+      explicitly commented "stale") as a missing OID mapping. The actual
+      seeded OIDs already match PG18 verbatim: `pg_ts_config`=3602
+      (`pg_ts_config.h:30`), `pg_ts_config_map`=3603 (`pg_ts_config_map.h:30`),
+      both asserted in `internal/initdb/pg_ts_config_nailed_test.go` and
+      `pg_ts_config_map_nailed_test.go`. The legacy 3764/3765 entries only
+      make `bootstrapMappedLocalCatalogHeaps` stub an extra (unused, harmless)
+      relfilenode file — idempotent, no functional gap. No code change
+      needed. Verified at current HEAD:
+      `TestNailedLocalRelsContainsPgTsConfig{,Map}{,Indexes}`,
+      `TestPgTsConfig{,Map}IndexInitialEntries`, and
+      `TestPgTsConfig{,Map}AttrsTypeOIDsMatchPG18` all PASS.
+      `unimplemented_feat.json` entry updated in place (`status: resolved`).
+      **Still open in this bucket:** 1-byte `char` disambiguation,
+      `pg_collation_for`.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
       restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
