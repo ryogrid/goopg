@@ -117,6 +117,73 @@ func TestActivityRegistrySetCurrentGoroutine(t *testing.T) {
 }
 
 
+// TestActivityRegistryTrackIOTimingFastPath verifies M0122-0003's
+// runtime-SET follow-up: LookupTrackedGoroutine reports ok=false by
+// default (fast path off, matching track_io_timing's "off" bootval),
+// starts reporting ok=true only after UpdateTrackIOTiming(procNum, true)
+// latches the fast path AND the calling goroutine's own procNum has it
+// on — a second backend with the fast path latched but its own flag
+// still off must not be reported as tracked.
+func TestActivityRegistryTrackIOTimingFastPath(t *testing.T) {
+	r := NewActivityRegistry(16)
+	r.Register(&Backend{PID: "1", State: "active"}) // procNum 0
+	r.Register(&Backend{PID: "2", State: "active"}) // procNum 1
+	const onPN, offPN = int32(0), int32(1)
+
+	SetCurrentGoroutine(r, onPN)
+	defer ClearCurrentGoroutine()
+
+	if _, _, ok := r.LookupTrackedGoroutine(); ok {
+		t.Fatalf("LookupTrackedGoroutine before any SET = ok, want false")
+	}
+	if r.TrackIOTiming(onPN) {
+		t.Fatalf("TrackIOTiming(onPN) before SET = true, want false")
+	}
+
+	r.UpdateTrackIOTiming(onPN, true)
+	if !r.TrackIOTiming(onPN) {
+		t.Errorf("TrackIOTiming(onPN) after enabling = false, want true")
+	}
+	if r.TrackIOTiming(offPN) {
+		t.Errorf("TrackIOTiming(offPN) = true, want false (never enabled for this backend)")
+	}
+	reg, pn, ok := r.LookupTrackedGoroutine()
+	if !ok || reg != r || pn != onPN {
+		t.Fatalf("LookupTrackedGoroutine on the enabled backend = (%v, %d, %v), want (%v, %d, true)",
+			reg, pn, ok, r, onPN)
+	}
+
+	// Disabling this backend's own flag (independent of the latched
+	// fast path) must stop it from being reported as tracked.
+	r.UpdateTrackIOTiming(onPN, false)
+	if _, _, ok := r.LookupTrackedGoroutine(); ok {
+		t.Fatalf("LookupTrackedGoroutine after disabling this backend = ok, want false")
+	}
+}
+
+// TestActivityRegistryTrackIOTimingFastPathBoot verifies
+// EnableTrackIOTimingFastPath primes the process-wide flag (the
+// boot-time-config path in initdb.Open) without needing any specific
+// backend's UpdateTrackIOTiming call — the fast path alone is not
+// sufficient for a given backend to be reported as tracked, since
+// per-backend TrackIOTimingOn still defaults false.
+func TestActivityRegistryTrackIOTimingFastPathBoot(t *testing.T) {
+	r := NewActivityRegistry(16)
+	r.Register(&Backend{PID: "1", State: "active"})
+	pn := int32(0)
+	SetCurrentGoroutine(r, pn)
+	defer ClearCurrentGoroutine()
+
+	r.EnableTrackIOTimingFastPath()
+	if _, _, ok := r.LookupTrackedGoroutine(); ok {
+		t.Fatalf("LookupTrackedGoroutine after only priming the fast path = ok, want false")
+	}
+	r.UpdateTrackIOTiming(pn, true)
+	if _, _, ok := r.LookupTrackedGoroutine(); !ok {
+		t.Fatalf("LookupTrackedGoroutine after UpdateTrackIOTiming = not ok, want ok")
+	}
+}
+
 // TestActivityRegistryStateChangeIsWallClock verifies that the monotonic
 // nanos written by hot-path WaitEvent / Update paths are converted back
 // into a wall-clock RFC3339Nano timestamp by Snapshot — runtimeshim.Nanotime

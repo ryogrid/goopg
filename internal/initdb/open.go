@@ -604,22 +604,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	mgr.OnBlockWritten = func(rel storage.RelFileNode, blk storage.BlockNumber) {
 		pool.InvalidateBlock(storage.BufferTag{Rel: rel, Block: blk})
 	}
-	// M0092-0005: BufferPin wait-event hook gated by
-	// TrackIOTiming. Default off — saves the per-Pin
-	// runtime.Stack lookup on the hot read path.
+	// M0092-0005: BufferPin wait-event hook. Wired unconditionally (not
+	// gated on the boot-time TrackIOTiming value) so a runtime `SET
+	// track_io_timing` takes effect without a server restart; the hook
+	// body's LookupTrackedGoroutine call is itself gated on act's
+	// fast-path flag, keeping the default-off cost to a single atomic
+	// load rather than the goroutine-map lookup (M0122-0003 follow-up).
+	// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
+	// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
+	pool.OnPinWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+		}
+	}
+	pool.OnPinDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
+		}
+	}
 	if opts.TrackIOTiming {
-		// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
-		// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
-		pool.OnPinWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
-			}
-		}
-		pool.OnPinDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
-		}
+		act.EnableTrackIOTimingFastPath()
 	}
 	// Wire FlushAll goroutine assertion (M0042-0004): Pool.FlushAll and
 	// Pool.FlushAllPaced must only be called from the checkpointer goroutine
@@ -1621,62 +1625,69 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
-	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity
-	// can report blocking reasons. M0092-0005: gated by TrackIOTiming
-	// (default off). M0107-0005: use LookupCurrentGoroutine (procNum)
-	// for atomic WaitEventStart instead of LookupGoroutine (mutex).
+	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity can
+	// report blocking reasons. Wired unconditionally (not gated on the
+	// boot-time TrackIOTiming value) so a runtime `SET track_io_timing`
+	// takes effect without a server restart; each hook body's
+	// LookupTrackedGoroutine call is itself gated on act's fast-path
+	// flag, so the default-off cost stays a single atomic load rather
+	// than the goroutine-map lookup (M0092-0005 original rationale;
+	// M0122-0003 runtime-SET follow-up). M0107-0005: use
+	// LookupCurrentGoroutine (procNum) for atomic WaitEventStart instead
+	// of LookupGoroutine (mutex).
 	if opts.TrackIOTiming {
-		if aioEngine != nil {
-			aioEngine.OnWaitStart = func() {
-				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-					reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
-				}
-			}
-			aioEngine.OnWaitEnd = func() {
-				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-					reg.WaitEventEnd(procNum)
-				}
+		act.EnableTrackIOTimingFastPath()
+	}
+	if aioEngine != nil {
+		aioEngine.OnWaitStart = func() {
+			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
 			}
 		}
-		mgr.OnReadWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
-			}
-		}
-		mgr.OnReadDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		aioEngine.OnWaitEnd = func() {
+			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
 				reg.WaitEventEnd(procNum)
 			}
 		}
-		mgr.OnWriteWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
-			}
+	}
+	mgr.OnReadWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
 		}
-		mgr.OnWriteDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
+	}
+	mgr.OnReadDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
 		}
-		mgr.OnExtendWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
-			}
+	}
+	mgr.OnWriteWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
-		mgr.OnExtendDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
+	}
+	mgr.OnWriteDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
 		}
-		mgr.OnSyncWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
-			}
+	}
+	mgr.OnExtendWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
-		mgr.OnSyncDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
+	}
+	mgr.OnExtendDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
+		}
+	}
+	mgr.OnSyncWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
+		}
+	}
+	mgr.OnSyncDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
 		}
 	}
 

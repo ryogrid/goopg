@@ -111,7 +111,7 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
 | `pg_stat_io` | **partial** (later loop, 2026-07-04) — row shape (79 rows, upstream valid-combination NULL pattern) + the one instrumented cell (client backend/relation/normal reads/read_bytes/hits); see "pg_stat_io row shape" section below |
 | per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
-| `track_io_timing` runtime `SET` | open — GUC registered `ContextUserset` but only consulted once at process boot (`cmd/goopg/main.go`'s `boolGUC` → `initdb.OpenOptions.TrackIOTiming`), not re-checked per session/query |
+| `track_io_timing` runtime `SET` | **done** (later loop, 2026-07-05) — see "`track_io_timing` runtime SET" section below |
 
 Remaining items recorded in `.ralph/deferral_ledger.md` (2026-07-04,
 M0122-0003 rows) with resume points. The fix_plan checkbox stays unchecked
@@ -391,3 +391,78 @@ hits populated, reuses NULL), `TestPgStatIOWalSummarizerRows` (2 rows,
 matching the real-PG finding above), `TestPgStatIOLiveCounters` (end-to-end
 through a live query context). `internal/testport/client_tools_port_test.go`'s
 `TestPort_PgWalsummary002Blocks` updated to expect 2 walsummarizer rows.
+
+## `track_io_timing` runtime SET (later loop, 2026-07-05)
+
+**Problem.** `track_io_timing` is registered `ContextUserset` (session
+`SET`-able), but the value gating the per-I/O wait-event hooks (`Pool.
+OnPinWait`/`OnPinDone`, and the AIO/data-file `OnReadWait`/`OnWriteWait`/
+`OnExtendWait`/`OnSyncWait` pairs, all in `internal/initdb/open.go`) was
+read exactly once at process boot (`cmd/goopg/main.go`'s `boolGUC` →
+`initdb.OpenOptions.TrackIOTiming`) and baked into whether those hooks were
+installed *at all*. A live `SET track_io_timing = on` updated the GUC
+registry but nothing re-read it — the hooks, if never installed at boot,
+stayed permanently absent for the life of the process.
+
+**Fix.** Two changes make the setting live per session without
+reinstalling hooks or restarting:
+
+1. `internal/activity/registry.go`: `coldActivity` (the per-backend
+   mutable-field block) gains `TrackIOTimingOn atomic.Bool`, and
+   `ActivityRegistry` gains a process-wide `trackIOTimingFastPath
+   atomic.Bool` that latches `true` the first time *any* backend enables
+   the setting (via `UpdateTrackIOTiming(procNum, true)` or
+   `EnableTrackIOTimingFastPath()`) and is never reset — reverting it
+   would require tracking whether every backend has since turned it back
+   off, not worth the complexity for a rarely-toggled debug GUC. New
+   `LookupTrackedGoroutine()` is a drop-in replacement for
+   `LookupCurrentGoroutine()` that additionally requires the calling
+   backend's own flag to be on; it short-circuits on the fast-path flag
+   first, so the default-off case costs one atomic load, not the
+   goroutine-map lookup + mutex — preserving M0092-0005's original
+   rationale for gating these hooks in the first place, now enforced
+   per-call instead of per-process-boot.
+2. `internal/initdb/open.go`: the hooks above are now wired
+   **unconditionally** (the `if opts.TrackIOTiming { ... }` wrapper is
+   gone) and each closure calls `act.LookupTrackedGoroutine()` instead of
+   `activity.LookupCurrentGoroutine()`. `opts.TrackIOTiming` now only
+   primes the fast-path flag at boot (`act.EnableTrackIOTimingFastPath()`)
+   so a postgresql.conf-configured `on` is live from the very first
+   connection.
+3. `internal/server/server.go`'s `New()` registers a
+   `cfg.Registry.OnChange("track_io_timing", ...)` callback — the same
+   established pattern as the pre-existing `application_name` propagation
+   hook — that calls `UpdateTrackIOTiming` on the SET-ing backend's own
+   procNum (resolved via `activity.LookupCurrentGoroutine()`, since the
+   callback runs synchronously on that backend's own goroutine). The
+   per-connection setup seeds each new backend's flag immediately after
+   `config.NewSessionRegistry` from `sess.Get("track_io_timing")`, so a
+   session inherits the correct boot-configured default even before its
+   first `SET`.
+
+Background workers (checkpointer/autovacuum) were already unaffected by
+these hooks either way — they never call `activity.SetCurrentGoroutine`
+for their own goroutine (only real `client_backend` connections do, in
+`server.go`), so `LookupCurrentGoroutine`/`LookupTrackedGoroutine` already
+returns `ok=false` for them regardless of `track_io_timing`; no behavior
+change there.
+
+**Deferred (unaffected by this change, tracked in the rows above):** this
+closes only the "not re-checked per session/query" gap. It does not add
+any new timing *collection* — there is still no wall-clock instrumentation
+at the wait-event sites, so `EXPLAIN`'s `I/O Timings` and `pg_stat_io`'s
+six `*_time` columns remain unmeasured even with `track_io_timing=on`.
+That is the same storage-instrumentation-layer gap the BUFFERS/`pg_stat_io`
+rows above are blocked on; once real per-wait-event timing is added, it
+should gate itself on `act.LookupTrackedGoroutine()`/
+`ActivityRegistry.TrackIOTiming(procNum)` (now available) rather than
+re-deriving a boot-time bool the way the old code did.
+
+**Tests:** `internal/activity/registry_test.go` —
+`TestActivityRegistryTrackIOTimingFastPath` (per-backend flag independent
+of the latched process-wide fast path),
+`TestActivityRegistryTrackIOTimingFastPathBoot` (priming the fast path
+alone is not sufficient — a given backend still needs its own flag on).
+`internal/server/server_test.go` — `TestTrackIOTimingOnChangePropagatesToActivityRegistry`
+(exercises `New()`'s actual `OnChange` wiring end-to-end with a real
+`SessionRegistry.Set("track_io_timing", "on", false)`).

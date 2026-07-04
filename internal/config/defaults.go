@@ -269,10 +269,14 @@ func BuildDefaultRegistry() *Registry {
 
 	// track_io_timing gates per-I/O activity wait-event hooks
 	// (BufferPin / DataFileRead / Write / Extend / Sync / AIO).
-	// Default `off` mirrors upstream PG. M0092-0005: when off,
-	// the hooks are not installed at all, saving the per-Pin /
-	// per-Read `runtime.Stack` LookupGoroutine call on the hot
-	// read path. See
+	// Default `off` mirrors upstream PG. ContextUserset: `SET
+	// track_io_timing` takes effect immediately per session — the
+	// hooks (internal/initdb/open.go) are always installed and check
+	// the calling backend's live flag via
+	// activity.ActivityRegistry.LookupTrackedGoroutine, which itself
+	// short-circuits on a process-wide fast-path flag so the
+	// default-off case still costs only one atomic load (M0092-0005's
+	// original rationale; M0122-0003 runtime-SET follow-up). See
 	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "track_io_timing", Type: TypeBool, BootVal: "off",

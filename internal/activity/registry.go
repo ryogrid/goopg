@@ -76,6 +76,13 @@ type coldActivity struct {
 	BackendXID atomic.Uint64
 	BackendXMin atomic.Uint64
 	Query      atomic.Pointer[string] // nil = no active query
+
+	// TrackIOTimingOn is this backend's effective track_io_timing
+	// setting. Seeded at connection setup from the session's boot-time
+	// value and updated live by the GUC OnChange hook on `SET
+	// track_io_timing` (M0122-0003 runtime-SET follow-up). Zero value
+	// (false) matches the GUC's "off" bootval.
+	TrackIOTimingOn atomic.Bool
 }
 
 // backendStateCode enumerates the pg_stat_activity state values.
@@ -146,6 +153,16 @@ type ActivityRegistry struct {
 	// human consumption at second/millisecond resolution.
 	monoEpoch int64
 	wallEpoch int64
+
+	// trackIOTimingFastPath gates LookupTrackedGoroutine's expensive
+	// goroutine-map lookup. It starts false (matching track_io_timing's
+	// "off" bootval) and latches true the first time any backend enables
+	// track_io_timing (boot-time config or a runtime SET) — see
+	// UpdateTrackIOTiming / EnableTrackIOTimingFastPath. It is never reset
+	// back to false: reverting would require tracking whether every
+	// backend has since turned it back off, which isn't worth the
+	// complexity for a rarely-toggled debug GUC.
+	trackIOTimingFastPath atomic.Bool
 }
 
 // NewActivityRegistry creates an ActivityRegistry with nRegular slots for
@@ -489,6 +506,68 @@ func (r *ActivityRegistry) UpdateApplicationName(procNum int32, name string) {
 	}
 	n := name
 	c.ApplicationName.Store(&n)
+}
+
+// UpdateTrackIOTiming atomically updates the effective track_io_timing
+// setting for procNum. Called once at connection setup to seed the
+// session's boot-time value, and again from the GUC OnChange hook
+// whenever `SET track_io_timing` runs (M0122-0003 runtime-SET follow-up).
+// Turning it on also latches the registry's fast-path flag so
+// LookupTrackedGoroutine starts doing the per-backend check for every
+// caller, not just this procNum.
+func (r *ActivityRegistry) UpdateTrackIOTiming(procNum int32, on bool) {
+	if procNum < 0 || int(procNum) >= len(r.slots) {
+		return
+	}
+	c := r.slots[procNum].cold
+	if c == nil {
+		return
+	}
+	c.TrackIOTimingOn.Store(on)
+	if on {
+		r.trackIOTimingFastPath.Store(true)
+	}
+}
+
+// TrackIOTiming returns procNum's current effective track_io_timing
+// setting (false if procNum is out of range or the slot is unregistered).
+func (r *ActivityRegistry) TrackIOTiming(procNum int32) bool {
+	if procNum < 0 || int(procNum) >= len(r.slots) {
+		return false
+	}
+	c := r.slots[procNum].cold
+	if c == nil {
+		return false
+	}
+	return c.TrackIOTimingOn.Load()
+}
+
+// EnableTrackIOTimingFastPath latches the registry's process-wide
+// track_io_timing fast-path flag without touching any specific backend's
+// setting. Used to prime the flag from a boot-time config value (before
+// any backend has connected to trip it via UpdateTrackIOTiming).
+func (r *ActivityRegistry) EnableTrackIOTimingFastPath() {
+	r.trackIOTimingFastPath.Store(true)
+}
+
+// LookupTrackedGoroutine is like LookupCurrentGoroutine but only reports
+// ok=true when the calling goroutine's backend also has track_io_timing
+// on. Hot I/O-wait hooks (buffer pin, data-file read/write/extend/sync,
+// AIO wait) call this instead of LookupCurrentGoroutine so those hooks
+// can stay installed unconditionally — required for a runtime `SET
+// track_io_timing` to take effect without reinstalling hooks — while
+// keeping the default-off cost down to a single atomic load rather than
+// the goroutine-map lookup (mirrors M0092-0005's original perf
+// rationale for gating these hooks on track_io_timing at all).
+func (r *ActivityRegistry) LookupTrackedGoroutine() (*ActivityRegistry, int32, bool) {
+	if r == nil || !r.trackIOTimingFastPath.Load() {
+		return nil, 0, false
+	}
+	reg, procNum, ok := LookupCurrentGoroutine()
+	if !ok || reg != r || !reg.TrackIOTiming(procNum) {
+		return nil, 0, false
+	}
+	return reg, procNum, true
 }
 
 // formatNanos converts unix nanos to RFC3339Nano string.  0 → "".
