@@ -64,30 +64,24 @@ the general `updateViaIndex` residual-predicate gap — fix at its root
 (evaluate `o.pred` on the initial scan, not just EPQ recheck) is out of
 scope for a view-focused loop.
 
-Not yet committed/pushed — see "Next step".
+Committed (`26786b68`) and pushed to `align-data-structure-with-pg` this
+loop.
 
-Next step: `git add` the new/changed files (`internal/planner/view_dml.go`,
-`internal/planner/plan.go`, `internal/planner/planner.go`,
-`internal/executor/operators_fk.go`, `internal/executor/
-operators_storage.go`, `internal/executor/view_dml_test.go`,
-`docs/design/root-0025-updatable-views.md`, `docs/design/README.md`,
-`.ralph/fix_plan.md`, `.ralph/deferral_ledger.md`) and commit + push (the
-pgbench-smoke pre-commit hook runs at commit time — has NOT run yet this
-loop, only the manual gates below). After that: continue the M0119-0004
-pg_dump catalog-view parity battery (loop #107/#108's item 3 — FDW HANDLER/
-VALIDATOR function references parsed and discarded, `internal/parser/
-ddl.go:464`, likely entangled with a general regproc-OID-resolver gap —
-re-verify still open first, deferral-ledger triage has repeatedly found
-"open" rows already fixed), OR pick a fresh unresolved DU-002 slice, OR
-pursue deferred item (5) above (`updateViaIndex`'s residual-predicate gap)
-as a standalone correctness fix since it's general (would need the WAL/MVCC
-practice-card gates: race detector on internal/executor UPDATE paths).
+Next step: continue the M0119-0004 pg_dump catalog-view parity battery
+(loop #107/#108's item 3 — FDW HANDLER/VALIDATOR function references parsed
+and discarded, `internal/parser/ddl.go:464`, likely entangled with a
+general regproc-OID-resolver gap — re-verify still open first, deferral-
+ledger triage has repeatedly found "open" rows already fixed), OR pick a
+fresh unresolved DU-002 slice, OR pursue deferred item (5) above
+(`updateViaIndex`'s residual-predicate gap) as a standalone correctness fix
+since it's general (would need the WAL/MVCC practice-card gates: race
+detector on internal/executor UPDATE paths).
 
 Gates run this loop: `go build ./...` clean; `go test
 ./internal/planner/... ./internal/executor/... ./internal/parser/...
 ./internal/catalog/... ./internal/server/...` PASS (full suites, no
 regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pgbench
-smoke NOT yet run standalone (will run via `.githooks/pre-commit` at commit
-time); `make ralph-state-guard` OK (self-repaired the same recurring benign
+smoke PASS via `.githooks/pre-commit` at commit time; `make
+ralph-state-guard` OK (self-repaired the same recurring benign
 progress.json "completed" artifact noted in prior loops' carries — not a
 new issue).
