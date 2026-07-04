@@ -126,6 +126,8 @@ const (
 	KwLike        Keyword = "like"
 	KwIlike       Keyword = "ilike"
 	KwBetween     Keyword = "between"
+	KwSymmetric   Keyword = "symmetric"
+	KwAsymmetric  Keyword = "asymmetric"
 	// M0008 logical-replication DDL keywords. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
 	// Option names (publish / enabled / slot_name) intentionally
@@ -338,6 +340,8 @@ var keywords = map[string]Keyword{
 	"like":         KwLike,
 	"ilike":        KwIlike,
 	"between":      KwBetween,
+	"symmetric":    KwSymmetric,
+	"asymmetric":   KwAsymmetric,
 	"publication":  KwPublication,
 	"subscription": KwSubscription,
 	"connection":   KwConnection,

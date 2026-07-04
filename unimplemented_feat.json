@@ -590,7 +590,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0003-0013-between-operator.md:101 BETWEEN SYMMETRIC explicitly deferred"
+   "code_audit": "RESOLVED 2026-07-04 (M0122-0004): `SYMMETRIC`/`ASYMMETRIC` registered as reserved keywords (`internal/parser/token.go`, `internal/parser/keywords.go`); `p.acceptBetweenOrdering()`/`parseBetweenTail` in `internal/parser/select.go` desugar `expr BETWEEN SYMMETRIC low AND high` to `(expr>=low AND expr<=high) OR (expr>=high AND expr<=low)` at parse time (same no-new-AST-node strategy as plain BETWEEN). Tests: `internal/parser/between_test.go`. Design: `docs/design/0003-0013-between-operator.md` new Follow-up section."
   },
   {
    "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
@@ -2482,7 +2482,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: CommonTableExpr struct exists (ast.go:732) but aliases requirement unclear"
+   "code_audit": "RESOLVED 2026-07-04 (M0122-0004, verify-before-implement): stale entry — a FROM-subquery without an explicit alias (the exact uuid.sql:127-131 shape this entry's evidence cites) already generates a synthetic alias `__sq_<pos>` (`internal/parser/select.go:1211-1220`, landed by commit `8d281a1b`, 35 minutes after this entry's `first_deferred_commit`). The CTE column-alias list itself (`WITH cte AS (...)`) was already fully optional (`internal/parser/with.go:61-129`). Confirmed via a throwaway probe test reproducing the uuid.sql WITH/subquery-without-alias shape — parses cleanly. No code change needed; this audit missed the immediate follow-up commit."
   },
   {
    "feature": "PostgreSQL extensions (contrib modules) are out of scope and remain unimplemented",

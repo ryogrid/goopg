@@ -259,7 +259,7 @@ mirroring M0119's ledger `status` column.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, ANY/SOME/ALL, DEFAULT-clause
-      parsing, intervals, BETWEEN SYMMETRIC, CTE-without-alias. **WITH CHECK
+      parsing, intervals. **WITH CHECK
       OPTION removed from this bucket (2026-07-04, loop #14):** verify-before-
       implement caught that it was already fully resolved by the root-0025
       loop (enforcement, `44000`) plus prior `security_barrier`/
@@ -272,6 +272,23 @@ mirroring M0119's ledger `status` column.
       check_option/security_barrier/security_invoker) tracks under
       M0119-0004, not here — a concurrent loop was mid-flight on exactly that
       gap; check `git log`/the ledger before re-picking it up.
+      **BETWEEN SYMMETRIC removed from this bucket (2026-07-04, this loop):**
+      implemented — `SYMMETRIC`/`ASYMMETRIC` reserved keywords
+      (`internal/parser/token.go`/`keywords.go`), `p.acceptBetweenOrdering()`/
+      `parseBetweenTail` (`internal/parser/select.go`) desugar
+      `expr BETWEEN SYMMETRIC low AND high` to
+      `(expr>=low AND expr<=high) OR (expr>=high AND expr<=low)` at parse
+      time — no analyzer/planner/executor change (same strategy as plain
+      BETWEEN). Tests: `internal/parser/between_test.go`. Design:
+      `docs/design/0003-0013-between-operator.md` new Follow-up section;
+      `unimplemented_feat.json` entry updated in place.
+      **CTE-without-alias removed from this bucket (2026-07-04, this loop,
+      verify-before-implement):** stale entry — already resolved by commit
+      `8d281a1b` (FROM-subquery without alias gets synthetic `__sq_<pos>`
+      alias, `internal/parser/select.go:1211-1220`); confirmed via a
+      throwaway probe reproducing the uuid.sql shape the entry cited.
+      `unimplemented_feat.json` entry updated in place, no code change
+      needed.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

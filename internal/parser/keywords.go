@@ -191,6 +191,8 @@ var keywordCategory = map[Keyword]KeywordCategory{
 	KwDo:         KwCatReserved,
 	KwVariadic:   KwCatReserved,
 	KwOf:         KwCatReserved,
+	KwSymmetric:  KwCatReserved,
+	KwAsymmetric: KwCatReserved,
 }
 
 // IsColNameKeyword reports whether kw may appear unquoted as a column name,

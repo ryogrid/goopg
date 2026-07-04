@@ -1825,7 +1825,8 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwBetween {
 				pos := t.Pos
 				p.advance()
-				expanded, err := p.parseBetweenTail(left, pos, false)
+				symmetric := p.acceptBetweenOrdering()
+				expanded, err := p.parseBetweenTail(left, pos, false, symmetric)
 				if err != nil {
 					return nil, err
 				}
@@ -1837,7 +1838,8 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				pos := t.Pos
 				p.advance() // NOT
 				p.advance() // BETWEEN
-				expanded, err := p.parseBetweenTail(left, pos, true)
+				symmetric := p.acceptBetweenOrdering()
+				expanded, err := p.parseBetweenTail(left, pos, true, symmetric)
 				if err != nil {
 					return nil, err
 				}
@@ -2838,6 +2840,19 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 	return &InExpr{pos: pos, Operand: left, Negated: negated, List: list}, nil
 }
 
+// acceptBetweenOrdering consumes an optional SYMMETRIC/ASYMMETRIC keyword
+// following `[NOT] BETWEEN` and reports whether SYMMETRIC was present.
+// ASYMMETRIC is the (already-default) no-op spelling; both are accepted for
+// upstream compatibility since ASYMMETRIC is documented explicitly in PG's
+// grammar even though it changes nothing.
+func (p *parser) acceptBetweenOrdering() bool {
+	if p.acceptKeyword(KwSymmetric) {
+		return true
+	}
+	p.acceptKeyword(KwAsymmetric)
+	return false
+}
+
 // parseBetweenTail consumes `low AND high` after `[NOT] BETWEEN`
 // has been advanced and rewrites the construct as an AST tree of
 // existing comparison + boolean operators. We do this at parse
@@ -2849,9 +2864,17 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 //
 //	(expr >= low) AND (expr <= high)
 //
-// `expr NOT BETWEEN low AND high` becomes
+// `expr BETWEEN SYMMETRIC low AND high` becomes
 //
-//	NOT ((expr >= low) AND (expr <= high))
+//	(expr >= low AND expr <= high) OR (expr >= high AND expr <= low)
+//
+// since SYMMETRIC drops the requirement that low <= high (upstream
+// desugars identically, see gram.y's `a_expr BETWEEN SYMMETRIC`
+// production).
+//
+// `expr NOT BETWEEN [SYMMETRIC] low AND high` becomes
+//
+//	NOT (<the corresponding non-NOT expansion above>)
 //
 // so SQL three-valued logic flows through the same Kleene
 // evaluator as `expr >= low AND expr <= high`. The `low` and
@@ -2914,7 +2937,7 @@ func (p *parser) parseQualifiedOperator() (OpCode, bool) {
 	return OpUnknown, false
 }
 
-func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error) {
+func (p *parser) parseBetweenTail(left Expr, pos int, negated bool, symmetric bool) (Expr, error) {
 	low, err := p.parseExprPrec(precAnd + 1)
 	if err != nil {
 		return nil, err
@@ -2926,9 +2949,17 @@ func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error
 	if err != nil {
 		return nil, err
 	}
-	ge := &BinaryOp{pos: pos, Op: OpGe, Left: left, Right: low}
-	le := &BinaryOp{pos: pos, Op: OpLe, Left: left, Right: high}
-	combined := Expr(&BinaryOp{pos: pos, Op: OpAnd, Left: ge, Right: le})
+	rangeExpr := func(lo, hi Expr) Expr {
+		ge := &BinaryOp{pos: pos, Op: OpGe, Left: left, Right: lo}
+		le := &BinaryOp{pos: pos, Op: OpLe, Left: left, Right: hi}
+		return &BinaryOp{pos: pos, Op: OpAnd, Left: ge, Right: le}
+	}
+	var combined Expr
+	if symmetric {
+		combined = &BinaryOp{pos: pos, Op: OpOr, Left: rangeExpr(low, high), Right: rangeExpr(high, low)}
+	} else {
+		combined = rangeExpr(low, high)
+	}
 	if negated {
 		combined = &UnaryOp{pos: pos, Op: OpNot, Operand: combined}
 	}
