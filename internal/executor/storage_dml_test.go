@@ -220,3 +220,98 @@ func TestUpdateViaIndexScanPath(t *testing.T) {
 		}
 	}
 }
+
+// TestDMLRequiresTablePrivilege pins dmlPrivilegePermitted (M0097-0040): a
+// non-superuser role with no GRANT and no ownership on the target table gets
+// 42501 on INSERT/UPDATE/DELETE, gaining access once granted the matching
+// privilege; the table owner and the bootstrap superuser always pass without
+// any GRANT. Mirrors the TRUNCATE privilege check (M0118-0008
+// truncate-conflict) that the same internal/catalog tableACLs store already
+// backs for pg_dump round-tripping but was never consulted for plain DML.
+func TestDMLRequiresTablePrivilege(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	insertStmt := func() *planner.Insert {
+		return &planner.Insert{
+			Table:       tbl,
+			Source:      &planner.Values{Rows: [][]planner.Expr{{&planner.IntegerConst{Value: 4}, &planner.StringConst{Value: "delta"}}}},
+			ColumnIndex: []int{0, 1},
+		}
+	}
+	updateStmt := func() *planner.Update {
+		return &planner.Update{
+			Table: tbl,
+			Child: &planner.Filter{
+				Child:     &planner.SeqScan{Table: tbl},
+				Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &planner.IntegerConst{Value: 1}},
+			},
+			Set: []planner.Expr{nil, &planner.StringConst{Value: "updated"}},
+		}
+	}
+	deleteStmt := func() *planner.Delete {
+		return &planner.Delete{
+			Table: tbl,
+			Child: &planner.Filter{
+				Child:     &planner.SeqScan{Table: tbl},
+				Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &planner.IntegerConst{Value: 1}},
+			},
+		}
+	}
+
+	assertDenied := func(t *testing.T, plan planner.Node, priv string) {
+		t.Helper()
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = op.Open(ctx)
+		execErr, ok := err.(*ExecError)
+		if !ok || execErr.Code != "42501" {
+			t.Fatalf("%s: expected 42501 permission-denied, got %#v", priv, err)
+		}
+	}
+	assertAllowed := func(t *testing.T, plan planner.Node, priv string) {
+		t.Helper()
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("%s: expected success, got %v", priv, err)
+		}
+		if _, err := op.Next(); err != EOF {
+			t.Fatalf("%s: Next: %v", priv, err)
+		}
+		_ = op.Close()
+	}
+
+	// Unprivileged non-superuser role: every DML op is denied.
+	ctx.NonSuperuserRole = "alice"
+	assertDenied(t, insertStmt(), "INSERT")
+	assertDenied(t, updateStmt(), "UPDATE")
+	assertDenied(t, deleteStmt(), "DELETE")
+
+	// GRANT the matching privilege one at a time: each op starts passing.
+	im.GrantTablePrivilege(tbl.OID, "alice", "INSERT")
+	assertAllowed(t, insertStmt(), "INSERT")
+	assertDenied(t, updateStmt(), "UPDATE")
+	im.GrantTablePrivilege(tbl.OID, "alice", "UPDATE")
+	assertAllowed(t, updateStmt(), "UPDATE")
+	assertDenied(t, deleteStmt(), "DELETE")
+	im.GrantTablePrivilege(tbl.OID, "alice", "DELETE")
+	assertAllowed(t, deleteStmt(), "DELETE")
+
+	// The table owner passes without any GRANT.
+	ctx.NonSuperuserRole = "bob"
+	tbl.Owner = "bob"
+	assertAllowed(t, deleteStmt(), "DELETE (owner)")
+	tbl.Owner = ""
+
+	// The bootstrap superuser (no SET ROLE) always passes.
+	ctx.NonSuperuserRole = ""
+	assertAllowed(t, deleteStmt(), "DELETE (superuser)")
+}

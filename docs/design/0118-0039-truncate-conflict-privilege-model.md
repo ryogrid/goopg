@@ -161,3 +161,52 @@ partition ATTACH/DETACH specs, `reindex-concurrently-toast`,
 `vacuum-no-cleanup-lock`, `plpgsql-toast` remain deferred (ledger). A
 non-superuser role that *owns* a table, REVOKE, column-level grants, and
 `GRANT … TO PUBLIC` are unmodelled bounded follow-ups.
+
+## Follow-up (2026-07-05, M0097-0040): INSERT/UPDATE/DELETE privilege enforcement
+
+`GRANT`/`REVOKE INSERT|SELECT|UPDATE|DELETE` were already tracked in
+`tableACLs` (needed for byte-identical `pg_dump` `relacl` round-tripping,
+M0119-0004), but `HasTablePrivilege` was only ever *consulted* for `TRUNCATE`
+(above) and `MAINTAIN` (`operators_vacuum.go`'s `maintenancePermitted`) — plain
+DML never checked it, so `REVOKE INSERT ON t FROM role; SET ROLE role; INSERT
+INTO t …` incorrectly succeeded (confirmed-open `unimplemented_feat.json`
+entry `M0097-0040`, filed 2026-05-27).
+
+**Fix:** a new `dmlPrivilegePermitted(ctx, tbl, priv) bool` helper in
+`internal/executor/operators_storage.go` — mirrors `maintenancePermitted`'s
+three-tier shape (bootstrap superuser bypass → table-owner bypass → grant
+lookup via the existing `HasTablePrivilege`) rather than TRUNCATE's simpler
+grant-only check, so an owner who has never explicitly granted themselves a
+privilege still passes, matching PostgreSQL's implicit owner privileges.
+Called from `insertOp.Open`/`updateOp.Open`/`deleteOp.Open` before any lock is
+acquired (same pre-lock-check ordering as `execTruncate`), raising
+`ExecError{42501, "permission denied for table %s"}` on failure. No analyzer/
+planner change — the check is purely an executor-side gate keyed off the
+already-resolved `plan.Table`.
+
+**Verified non-interference with cascades:** `fkCascadeDelete`
+(`operators_fk.go`) manipulates heap pages directly (`Pool.Pin`/
+`PageGetHeapTuple`) rather than going through `deleteOp`, so an `ON DELETE
+CASCADE` firing from a parent-table `DELETE` the role *does* have privilege on
+is never blocked by a missing `DELETE` grant on the child — matching
+PostgreSQL, where FK-enforcement triggers are not subject to the invoking
+role's ordinary object ACL. The logical-replication apply worker
+(`applyworker.go`) does not construct `insertOp`/`updateOp`/`deleteOp` at all
+(it also writes heap pages directly), so it is unaffected.
+
+**Deliberately out of scope (see ledger):** `SELECT` privilege enforcement on
+`seqScanOp`/index-scan read paths — a much larger blast radius (every SELECT,
+including internal system-catalog scans issued on behalf of a non-superuser
+session) that needs its own bounded loop with a dedicated regression pass, not
+folded into this DML-write-path fix. Column-level privileges, `WITH GRANT
+OPTION` propagation, and `GRANT … TO PUBLIC` remain unmodelled, same as the
+TRUNCATE-era limitations above.
+
+Tests: `internal/executor/storage_dml_test.go`'s
+`TestDMLRequiresTablePrivilege` (unprivileged role denied on all three
+statements, incremental per-privilege GRANT unblocks each, table owner and
+bootstrap superuser always pass without a GRANT).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/server/... ./internal/catalog/...` PASS (no
+regressions); pre-commit pgbench smoke PASS.

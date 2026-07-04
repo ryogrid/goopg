@@ -353,6 +353,22 @@ mirroring M0119's ledger `status` column.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
+      **RBAC for INSERT/UPDATE/DELETE landed (2026-07-05, this loop,
+      M0097-0040):** `dmlPrivilegePermitted` (`internal/executor/
+      operators_storage.go`) checks the existing `tableACLs`/
+      `HasTablePrivilege` store (TRUNCATE/MAINTAIN already consulted it;
+      plain DML never did) pre-lock in `insertOp`/`updateOp`/
+      `deleteOp.Open`, raising `42501` for a non-superuser, non-owner role
+      missing the matching GRANT. FK-cascade deletes and the logical-
+      replication apply worker write heap pages directly and are
+      unaffected. Tests: `internal/executor/storage_dml_test.go`'s
+      `TestDMLRequiresTablePrivilege`. Design:
+      `docs/design/0118-0039-truncate-conflict-privilege-model.md` Follow-up
+      section; `unimplemented_feat.json` M0097-0040 updated in place.
+      **Still open in this bucket:** `SELECT` privilege enforcement (higher
+      blast radius — every read path including internal system-catalog
+      scans — needs its own bounded loop, ledger row), SASLprep/channel
+      binding/`scram_iterations`, encoding constraints.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).

@@ -1716,11 +1716,34 @@ func (o *insertOp) appendInsertRetRow(row Row) {
 	o.retRows = append(o.retRows, retRow)
 }
 
+// dmlPrivilegePermitted reports whether the session's effective role may run
+// an INSERT/UPDATE/DELETE against tbl. Mirrors PostgreSQL's ExecCheckRTPerms:
+// the bootstrap superuser — a session that has NOT done SET ROLE/SET SESSION
+// AUTHORIZATION to a non-superuser — always passes; a non-superuser role must
+// own tbl (Table.Owner, case-insensitive) or hold the named privilege via
+// GRANT (internal/catalog's tableACLs, the same store TRUNCATE/MAINTAIN
+// already consult). Checked before any lock is acquired, matching
+// PostgreSQL's pre-lock ACL check (M0118-0008 truncate-conflict precedent).
+// M0097-0040.
+func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
+	role := ctx.NonSuperuserRole
+	if role == "" {
+		return true // bootstrap superuser: full privileges
+	}
+	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, role) {
+		return true
+	}
+	return ctx.Catalog.HasTablePrivilege(tbl.OID, role, priv)
+}
+
 func (o *insertOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Insert requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	if !dmlPrivilegePermitted(ctx, o.plan.Table, "INSERT") {
+		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
@@ -3457,6 +3480,9 @@ func (o *updateOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Update requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	if !dmlPrivilegePermitted(ctx, o.plan.Table, "UPDATE") {
+		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
@@ -4906,6 +4932,9 @@ func (o *deleteOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Delete requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	if !dmlPrivilegePermitted(ctx, o.plan.Table, "DELETE") {
+		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
