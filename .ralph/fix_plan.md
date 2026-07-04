@@ -70,11 +70,27 @@ residual (enum/composite-type creation + TRUNCATE/DROP-in-savepoint
 tracking staying explicit-transaction-only for autocommit batches) remains
 open — it needs a dedicated `BasicSession` flag distinct from `inTx`, not
 this hand-off pattern, plus a broader audit of ~20 `InExplicitTransaction()`
-call sites. **Next up:** either continue the M0119-0004 pg_dump
-catalog-view parity battery (next gap found via
-`TestPort_PgDumpConnectionSetup`), or pick up `root-0024`'s remaining
-enum/composite-type-undo residual — neither is independently urgent, see
-each's own Deferred section.
+call sites. **This loop (2026-07-04, follow-up while scoping that residual)
+found and fixed a MORE SEVERE, previously-undocumented bug in root-0024's
+own mechanism:** `internal/server/conn_tx.go`'s `connTxState.Session()`
+returned a stale, permanently-reused session object (never reset to nil by
+`End()`, only `c.active` flips false) instead of nil once a connection had
+ever run one explicit transaction — so every LATER autocommit statement on
+that connection got the wrong (long-lived, undrained-on-success) session
+instead of a fresh message-scoped throwaway one, and a successful autocommit
+`CREATE TABLE` could be silently dropped as collateral damage by a WHOLLY
+UNRELATED later aborting autocommit batch on the same connection. Fixed by
+gating `Session()` on `c.active` (matching its own doc comment). Test:
+`TestConnTxSessionNilWhenNotExplicit`, confirmed RED pre-fix. Design doc
+`root-0024` new "Follow-up" section; ledger row appended. **Next up:** either
+continue the M0119-0004 pg_dump catalog-view parity battery (next gap found
+via `TestPort_PgDumpConnectionSetup`, currently PASS — no new gap surfaced
+this loop), or pick up `root-0024`'s remaining enum/composite-type-undo
+residual (now the more carefully-scoped of the two, since the write-back
+guard needed to do it safely — never letting a throwaway message's
+enum/composite tracking leak into `connTx` — is the same class of hazard
+just fixed here) — neither is independently urgent, see each's own Deferred
+section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

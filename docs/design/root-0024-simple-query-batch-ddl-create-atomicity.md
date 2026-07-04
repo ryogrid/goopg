@@ -180,3 +180,65 @@ flake in `internal/wal`'s `TestConcurrentAppendAcrossSegmentBoundariesNoOverflow
 reproduced identically on the pre-fix tree run in isolation and passed on
 rerun — not caused by this change); TPC-H spotcheck; pgbench smoke via the
 pre-commit hook.
+
+## Follow-up: `connTxState.Session()` returned a stale reused session, corrupting UNRELATED autocommit rollbacks (2026-07-04)
+
+Discovered while scoping the first residual above (enum/composite-creation
+tracking): a *more severe*, previously-undocumented bug in this fix's own
+message-scoped-throwaway-session mechanism. `connTxState.Session()`
+(`internal/server/conn_tx.go`) is documented to "return nil when no explicit
+transaction is active", but its implementation just returned `c.sess`
+unconditionally. `c.sess` is allocated lazily by `Begin()` and — critically —
+is **never reset to nil by `End()`** (only `c.active` flips back to `false`);
+it is reused as the backing object for the connection's *next* explicit
+transaction. So once a connection had run even one `BEGIN...COMMIT`/`ROLLBACK`
+in its lifetime, `Session()` kept returning that same (idle, but non-nil)
+object forever after — not nil.
+
+Consequence: dispatch.go's per-message wiring
+(`if sess := connTx.Session(); sess != nil { ectx.Session = sess } else {
+ectx.Session = <fresh message-scoped throwaway> }`, the root-0024 original
+fix) picked the **stale reused session** instead of a fresh throwaway one for
+every LATER autocommit statement on that connection. A successful, standalone
+autocommit `CREATE TABLE` then called `RecordDDLCreate` against that reused
+session, appending to its `pendingDDL` list — and nothing drains that list on
+a *successful* autocommit statement (only `ProcessRollbackUndos`, invoked on
+abort, or `EndExplicitTransaction`, invoked on COMMIT/ROLLBACK, ever call
+`TakePendingDDLCreates`). The stale entry sat there until a **wholly
+unrelated, later** aborting autocommit batch on the same connection ran
+`ProcessRollbackUndos` against that same reused session — draining and
+undoing the old entry too, **dropping an already-committed table as
+collateral damage**.
+
+Reproduced directly: `BEGIN; CREATE TABLE warm(...); COMMIT;` then, on the
+same connection, `CREATE TABLE survivor(...);` (succeeds) then
+`CREATE TABLE unrelated(...); SELECT * FROM missing;` (aborts) — `survivor`
+was incorrectly dropped by the second batch's rollback.
+
+Fix: `Session()` now gates on `c.active`, returning nil unless an explicit
+transaction is currently active — matching its own doc comment. All other
+`Session()` call sites (`dispatch.go`'s `TxBegin`/`TxCommit`/`TxRollback`
+cases, `twophase.go`) already run only after confirming `connTx.InExplicit()`
+(or immediately after `connTx.Begin()`), so `c.active` is already true at
+those call sites — this fix changes nothing there. It only changes the
+dispatch-entry wiring's behavior for autocommit statements on a connection
+that has previously run an explicit transaction, correctly giving them a
+fresh, message-scoped throwaway session (discarded at the end of the
+message) instead of the connection's stale reused one.
+
+Test: `TestConnTxSessionNilWhenNotExplicit`
+(`internal/server/conn_tx_session_reuse_test.go`) drives exactly the
+warm/survivor/unrelated sequence above over a real wire connection. Confirmed
+RED against the pre-fix tree (reverting only `conn_tx.go`): `survivor` is
+incorrectly dropped.
+
+This follow-up does not touch the still-open first residual (enum/composite-
+type creation and TRUNCATE/DROP-in-savepoint tracking remaining
+explicit-transaction-only for autocommit batches) — that still needs the
+dedicated `BasicSession` flag described above.
+
+Gates: `go build ./...` clean; `go test ./internal/server/...
+./internal/executor/... ./internal/catalog/...` PASS (full, no regressions);
+`go test -race ./internal/wal/... ./internal/mvcc/...` PASS;
+`TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke via the pre-commit hook.

@@ -413,9 +413,27 @@ func (c *connTxState) Tx() mvcc.Transaction {
 
 // Session returns the BasicSession associated with the active explicit
 // transaction. Returns nil when no explicit transaction is active.
+//
+// c.sess is allocated lazily by Begin() and, once allocated, is never reset
+// to nil by End() (only c.active flips back to false) — it is reused as the
+// backing session object for this connection's NEXT explicit transaction.
+// Session() must therefore gate on c.active, not on c.sess != nil: returning
+// the stale (but no-longer-current) session while no explicit transaction is
+// active would hand dispatch.go's message-scoped autocommit wiring
+// (dispatch.go's connTx.Session()-check at ectx construction) a
+// long-lived object instead of a fresh, message-scoped throwaway one. A
+// successful standalone autocommit CREATE TABLE would then leave its
+// RecordDDLCreate entry sitting in that reused session's pendingDDL list —
+// nothing drains it on success — where a LATER, wholly unrelated aborting
+// autocommit batch on the SAME connection would find it and incorrectly roll
+// it back too via ProcessRollbackUndos (root-0024 follow-up, 2026-07-04:
+// found while investigating the enum/composite-creation-tracking residual).
 func (c *connTxState) Session() *executor.BasicSession {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.active {
+		return nil
+	}
 	return c.sess
 }
 
