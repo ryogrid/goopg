@@ -5216,6 +5216,36 @@ func evalMakeTime(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 // evalIsFinite stubs isfinite(date/timestamp/interval). goopg v0 does not
 // store infinity values, so always returns TRUE for non-NULL input. M0097-0004.
+// regexpFirstMatchArray computes the text[] datum for the FIRST match of re
+// against s, mirroring PostgreSQL's regexp_match/regexp_matches element
+// semantics (postgres/src/backend/utils/adt/regexp.c setup_regexp_matches):
+// when the pattern has parenthesized capture groups, the array holds those
+// groups (NOT the overall match); with no groups, the array's sole element
+// is the whole match. A capture group that did not participate in the match
+// (e.g. the losing side of a `(a)|(b)` alternation) yields SQL NULL, not "".
+// Does not perform PG array-literal escaping/quoting of element contents
+// (pre-existing simplification, unchanged from this function's predecessor).
+func regexpFirstMatchArray(re *regexp.Regexp, s string) Datum {
+	idx := re.FindStringSubmatchIndex(s)
+	if idx == nil {
+		return NullDatum
+	}
+	var elems []string
+	if re.NumSubexp() == 0 {
+		elems = []string{s[idx[0]:idx[1]]}
+	} else {
+		for i := 1; i <= re.NumSubexp(); i++ {
+			lo, hi := idx[2*i], idx[2*i+1]
+			if lo < 0 {
+				elems = append(elems, "NULL")
+			} else {
+				elems = append(elems, s[lo:hi])
+			}
+		}
+	}
+	return NewStringDatum("{" + strings.Join(elems, ",") + "}")
+}
+
 func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
@@ -7467,10 +7497,16 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 
 	// ── POSIX regex functions (M0097-0011) ────────────────────────────────
-	case "regexp_match":
-		// regexp_match(string, pattern [, flags]) → text[]
-		// Returns first match as array or NULL if no match.
-		// Stub: return text[] with full match as first element, or NULL.
+	case "regexp_match", "regexp_matches":
+		// regexp_match(string, pattern [, flags]) → text[] (at most one match)
+		// regexp_matches(string, pattern [, flags]) → setof text[] (PG is an
+		// SRF that yields one row per match with the 'g' flag). goopg has no
+		// FROM-clause/target-list SRF wiring for regexp_matches (unlike
+		// generate_series/unnest/regexp_split_to_table, see
+		// operators_ddl_partition.go), so this scalar path always returns at
+		// most the FIRST match's capture-group array, matching regexp_match's
+		// existing (non-SRF) behavior; the 'g'-flag multi-row case is
+		// deferred (ledger M0122-0002/regexp_matches-srf).
 		if len(x.Args) >= 2 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			pat, e2 := evalExpr(x.Args[1], row, ctx)
@@ -7492,15 +7528,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil {
 				return NullDatum, nil
 			}
-			match := re.FindString(s.StringValue())
-			if match == "" && !re.MatchString(s.StringValue()) {
-				return NullDatum, nil
-			}
-			return NewStringDatum("{" + match + "}"), nil
+			return regexpFirstMatchArray(re, s.StringValue()), nil
 		}
-	case "regexp_matches":
-		// regexp_matches(string, pattern [, flags]) — SRF, stub returns NULL
-		return NullDatum, nil
 
 	// ── Sequence functions (M0097-0009) ───────────────────────────────────
 	case "nextval":

@@ -30,15 +30,13 @@ are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
 defer unless genuinely compelling (then record a ledger row); commit + push at
 every clean, green (build + pre-commit) checkpoint.
 
-**Next up:** the `updateViaIndex`/`indexScanOp` partition/inheritance-child
-fan-out discovery (root-0026) is now fully DONE, both sides (2026-07-04,
-design `docs/design/root-0026-update-via-index-inheritance-fanout.md`, both
-deferral-ledger rows flipped to `resolved`) — indexed `UPDATE parent SET ...
-WHERE indexed_col = X` and a bare `SELECT ... WHERE indexed_col = X` both now
-correctly fan out to partition/inheritance children instead of silently
-missing rows that live only in a child. Continue the M0119-0004 pg_dump
-catalog-view parity battery / next unresolved DU-002 slice from
-`.ralph/deferral_ledger.md`, or pick up an M0122 backlog item.
+**Next up:** M0122-0002 (catalog function quick wins) is now fully DONE
+(2026-07-04, loop #7) — `regexp_matches` was the one genuine gap among its ~9
+items, fixed; the rest were already implemented and re-verified against
+current HEAD. Continue the M0119-0004 pg_dump catalog-view parity battery /
+next unresolved DU-002 slice from `.ralph/deferral_ledger.md`, or pick up the
+next M0122 backlog item (M0122-0003 EXPLAIN/pg_stat instrumentation is the
+next unchecked one in list order).
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -174,9 +172,12 @@ mirroring M0119's ledger `status` column.
       `unclear`/no-audit + 61 `resolution_check.ledger=open` entries (7 overlap).
       Dedupe against M0119 + `.ralph/deferral_ledger.md` so nothing is worked
       twice. This task discharges the "may already be implemented" risk.
-- [ ] **M0122-0002 — Catalog system functions & pg_* view stubs** (~9). Quick wins:
-      `pg_relation_size`/`pg_total_relation_size`, `regexp_matches`, `pg_get_expr`,
-      `isfinite`, `justify_*`, `pg_get_serial_sequence`, `pg_get_indexdef` recon.
+- [x] **M0122-0002 — Catalog system functions & pg_* view stubs** (~9). Quick wins:
+      `pg_relation_size`/`pg_total_relation_size` (`f0b2bdb3`), `regexp_matches`
+      (2026-07-04 loop #7, scalar/first-match only — SRF `'g'`-flag multi-row
+      deferred, ledger row), `pg_get_expr`, `isfinite`, `justify_*`,
+      `pg_get_serial_sequence`, `pg_get_indexdef` (already implemented, verified
+      2026-07-04). Design: `docs/design/0122-0002-pg-relation-size-real-sizes.md`.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7). EXPLAIN
       FORMAT XML/YAML, SETTINGS/BUFFERS rendering, `pg_stat_io` virtual table,
       per-CTE stats, `track_io_timing` runtime SET.

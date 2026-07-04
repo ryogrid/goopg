@@ -4,6 +4,22 @@ Status: accepted, landed (`f0b2bdb3`). Source: `unimplemented_feat.json` entry
 97 (M0122-0002 cluster, "Catalog system functions & pg_* view stubs"),
 `.ralph/fix_plan.md` M0122-0002.
 
+**Cluster closure (2026-07-04, loop #7):** this doc's title covers only the
+`pg_relation_size` slice; the M0122-0002 fix_plan item bundles ~9 catalog
+function "quick wins" total. Re-verified the rest against current HEAD:
+`isfinite`, `justify_hours`/`justify_days`/`justify_interval`,
+`pg_get_expr`, `pg_get_serial_sequence` are all genuinely implemented (not
+stubs) in `internal/executor/expr.go`; `pg_get_indexdef` is implemented and
+under active, separately-tracked extension via the M0119-0004 DU-002 slices
+(not duplicated here, per the fix_plan's own M0122/M0119-0004 dedup rule).
+`regexp_matches` was the one real gap — its case in `evalExpr` unconditionally
+returned `NullDatum`. See `docs/design/README.md`'s `0122-0002` row and
+`.ralph/deferral_ledger.md` (2026-07-04, M0122-0002 row) for the fix
+(`regexpFirstMatchArray` in `internal/executor/expr.go`, merged into the
+`regexp_match` case arm) and its documented residual (no SRF/multi-row `'g'`
+flag support — `internal/executor/regexp_match_test.go` covers the
+now-correct scalar/first-match path). M0122-0002 is closed as of this loop.
+
 ## Problem
 
 `pg_relation_size`, `pg_total_relation_size`, `pg_indexes_size`, and
