@@ -371,6 +371,16 @@ func (o *transactionOp) clearCtxTransaction() {
 	o.ctx.PendingCreatedComposites = nil
 }
 
+// UndoEnumDDLOnAbort reverses enum/composite-type DDL (CREATE TYPE ... AS
+// ENUM/composite, ALTER TYPE ... ADD VALUE/RENAME TO) recorded in ctx.Pending*
+// for an aborting message-scoped autocommit batch. Exported so dispatch.go's
+// implicit-batch abort defer can call it alongside ProcessRollbackUndos, the
+// same way execRollback calls the unexported undoEnumDDLFromContext directly
+// (same package). root-0024 residual, M0110-0001.
+func UndoEnumDDLOnAbort(ctx *Context) {
+	undoEnumDDLFromContext(ctx)
+}
+
 // undoEnumDDLFromContext reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
 // recorded in ctx.  Must be called before clearCtxTransaction() on ROLLBACK.  M0097-0022.
 func undoEnumDDLFromContext(ctx *Context) {

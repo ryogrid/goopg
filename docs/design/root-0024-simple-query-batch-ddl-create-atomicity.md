@@ -119,23 +119,39 @@ end-to-end; only `RecordDDLCreate`/`ProcessRollbackUndos` were touched.
 
 ## Deferred
 
-- **Enum/composite-type creation and TRUNCATE/DROP-in-savepoint tracking are
-  NOT yet undo-aware for an autocommit multi-statement batch.** These are
-  gated by `Session.InExplicitTransaction()` (`inTx`), which — per "Why `inTx`
-  stays false" above — this fix deliberately leaves `false` on the throwaway
-  session to avoid a much wider blast radius (deferred-constraint-check
-  timing in particular) in one bounded change. A batch like
-  `CREATE TYPE mood AS ENUM ('a','b'); SELECT 1/0;` in one message still
-  leaks the enum registration today, the same bug class as the one this fix
-  closes for `CREATE TABLE`/`CREATE INDEX`. Resume point: introduce a
-  dedicated flag on `BasicSession` (not `inTx`) that `RecordDDLCreate`-style
-  call sites can share without perturbing the ~20 `InExplicitTransaction()`
-  call sites enumerated above; audit `deferred_unique.go`/
-  `deferred_exclusion.go`/`operators_fk.go` deferred-constraint-timing
-  behavior separately before touching `inTx` itself.
+- ~~**Enum/composite-type creation ... NOT yet undo-aware for an autocommit
+  multi-statement batch.**~~ **CLOSED for the single-message case — see
+  "Follow-up: enum/composite-type creation now undo-aware for a
+  single-message autocommit batch" below.** TRUNCATE/DROP-in-savepoint
+  tracking remains explicit-transaction-only (still gated on `inTx`,
+  untouched by that follow-up) — a batch like
+  `TRUNCATE t; SELECT 1/0;` in one autocommit message does not restore `t`'s
+  pre-truncate pages, and a `DROP TABLE`-inside-savepoint's undo tracking is
+  likewise still `inTx`-gated. Resume point if picked up: extend
+  `Session.TracksDDLUndo()` (added by the enum/composite follow-up) to also
+  gate `RecordTruncate`/`RecordDDLDrop`'s effective tracking, auditing
+  `deferred_unique.go`/`deferred_exclusion.go`/`operators_fk.go`
+  deferred-constraint-timing behavior separately first (still untouched,
+  still gated on the real `inTx`).
 - ~~**A `CREATE TABLE t1(...); BEGIN; CREATE TABLE t2(...); ROLLBACK;`
   compound batch still loses `t1`'s undo entry.**~~ **CLOSED — see
   "Follow-up" below.**
+- **The mid-batch-`BEGIN` compound-batch combination is NOT covered by the
+  enum/composite follow-up below.** A
+  `CREATE TYPE mood AS ENUM ('a','b'); BEGIN; ...; ROLLBACK;` batch (all one
+  message) still leaks `mood`: the write-back guard the follow-up adds
+  (`dispatch.go`, gated on `connTx.InExplicit()`) intentionally does NOT
+  write the autocommit-tracked `ectx.PendingCreatedEnums`/etc. into `connTx`
+  before the `BEGIN` promotes the session, so the `TxRollback`/`TxCommit`
+  shortcut cases (which read `connTx.Pending*`, not `ectx.Pending*`) never
+  see it — the same residual class `pendingDDL` needed a dedicated
+  drain-and-replay hand-off for (loop #103's "Follow-up" below), not yet
+  built for enum/composite. Resume point: either have the `planner.TxBegin`
+  case eagerly write `ectx.Pending*` into `connTx` before promoting (mirrors
+  the `pendingDDL` hand-off's spirit, simpler here since these fields already
+  live on `ctx` rather than the session), or have the `TxCommit`/`TxRollback`
+  shortcut cases consult `ectx.Pending*` directly instead of `connTx.Pending*`
+  when `ectx` is available.
 
 Deferral ledger: row appended (M0110-0001, resolved) cross-referencing this
 doc for both residuals.
@@ -242,3 +258,73 @@ Gates: `go build ./...` clean; `go test ./internal/server/...
 `go test -race ./internal/wal/... ./internal/mvcc/...` PASS;
 `TestPort_PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33); pgbench smoke via the pre-commit hook.
+
+## Follow-up: enum/composite-type creation now undo-aware for a single-message autocommit batch (2026-07-04)
+
+Closes the first residual above for the single-message case (the
+mid-batch-`BEGIN` combination is a separate, still-open residual — see
+"Deferred" above). Before this fix, `CREATE TYPE mood AS ENUM ('a','b');
+SELECT 1/0;` sent as one autocommit simple-query message left `mood`
+permanently registered despite the whole implicit batch transaction rolling
+back everywhere else — the same bug class this design closed for `CREATE
+TABLE`/`CREATE INDEX`, but enum/composite tracking was never reachable at all
+for an autocommit batch: the four record sites in
+`internal/executor/operators_ddl.go` (composite creation, enum creation,
+`ALTER TYPE ... RENAME TO`, `ALTER TYPE ... ADD VALUE`) all gated on
+`Session.InExplicitTransaction()`, which is `false` on the message-scoped
+throwaway session by design (see "Why `inTx` stays false" above).
+
+Fix, deliberately NOT touching `inTx`/`InExplicitTransaction()` itself (per
+this doc's own resume point, to avoid perturbing the ~20 unrelated call sites
+gated on it):
+
+- `internal/executor/session.go`: new `Session.TracksDDLUndo() bool`
+  interface method, implemented as `s.inTx || s.autocommitUndoScope` — true
+  for both a real explicit transaction and the new
+  `NewAutocommitUndoSession()` constructor (a thin wrapper over
+  `NewBasicSession()` that sets `autocommitUndoScope = true`, `inTx` still
+  `false`).
+- `internal/server/dispatch.go`'s autocommit-branch wiring now constructs
+  `executor.NewAutocommitUndoSession()` instead of `executor.NewBasicSession()`.
+- The four record sites in `operators_ddl.go` now gate on
+  `Session.TracksDDLUndo()` instead of `Session.InExplicitTransaction()`.
+- The abort defer in `dispatchSimpleQueryViaExecutor` now also calls the
+  newly-exported `executor.UndoEnumDDLOnAbort(ectx)` (a thin wrapper over the
+  existing unexported `undoEnumDDLFromContext`) alongside its existing
+  `ProcessRollbackUndos` call.
+
+**The write-back hazard this fix had to close in the same change:**
+`ectx.PendingCreatedEnums`/`PendingCreatedComposites`/`PendingEnumValues`/
+`PendingEnumRenames` are fields on `*executor.Context`, not on the session —
+`dispatch.go` already wrote them back into `connTx` unconditionally after
+every successful statement (so a real, multi-message explicit transaction
+carries its pending set across Query messages until its own COMMIT/ROLLBACK).
+Before this fix that write-back was harmless for autocommit because the old
+gate meant `ectx.PendingCreatedEnums` etc. stayed `nil` throughout an
+autocommit batch. Making the record sites unconditionally-tracking for the
+throwaway session meant the write-back would otherwise leak a *successfully
+committed* autocommit type's pending-set entry into `connTx` past the end of
+its own message — a later, wholly unrelated aborting autocommit batch on the
+same connection would then call `UndoEnumDDLOnAbort` and incorrectly **drop
+the already-committed type as collateral damage**, the identical bug class
+the `connTxState.Session()` staleness follow-up above just closed for
+`pendingDDL`. Closed by guarding the write-back with `connTx.InExplicit()`:
+it now only fires while a real explicit transaction is open, which is also
+the only case that still needs it (a single-message autocommit batch never
+needs `connTx` to remember anything past its own message — `ectx` already
+persists naturally across all statements within that one message without
+help from `connTx`).
+
+Test: `TestSimpleQueryBatchAbortUndoesEarlierCreateType`
+(`internal/server/dispatch_batch_atomicity_test.go`) drives
+`CREATE TYPE ... AS ENUM (...); SELECT * FROM <missing>;` over a real wire
+connection, asserts a `CREATE TYPE` CommandComplete followed by an
+ErrorResponse, then asserts the enum is **not** found in the live catalog
+afterward (confirmed RED without the fix — the type survived). A second
+assertion confirms a standalone (non-aborting) `CREATE TYPE` in its own
+message still persists normally.
+
+Gates: `go build ./...` clean; `go test ./internal/server/...
+./internal/executor/... ./internal/catalog/...` PASS (full, no regressions,
+`-count=1`); `go test -race -count=1 ./internal/wal/... ./internal/mvcc/...`
+PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench smoke via the pre-commit hook.

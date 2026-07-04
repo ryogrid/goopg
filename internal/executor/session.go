@@ -27,6 +27,16 @@ type Session interface {
 	// Used by BEGIN ISOLATION LEVEL and SET TRANSACTION ISOLATION LEVEL.
 	SetIsolationLevel(level mvcc.IsolationLevel) error
 	InExplicitTransaction() bool
+	// TracksDDLUndo reports whether enum/composite-type DDL (CREATE TYPE ... AS
+	// ENUM/composite, ALTER TYPE ... ADD VALUE/RENAME TO) should be tracked in
+	// ctx.Pending* for potential undo — true both for a real explicit
+	// transaction (InExplicitTransaction()) and for a message-scoped autocommit
+	// session (NewAutocommitUndoSession), whose batch can still abort mid-message
+	// and needs the same undo. Deliberately NOT the same as
+	// InExplicitTransaction(): flipping that would also perturb ~20 unrelated
+	// call sites (deferred FK/UNIQUE/EXCLUDE check timing, TRUNCATE/DROP-in-
+	// savepoint snapshotting, pg_stat scoping) — root-0024 residual, M0110-0001.
+	TracksDDLUndo() bool
 	IsReadOnlyTxn() bool // true when the current transaction was started with READ ONLY
 	SetReadOnlyTxn(v bool)
 	CurrentTransaction() (mvcc.Transaction, mvcc.Snapshot, bool)
@@ -191,12 +201,29 @@ type BasicSession struct {
 	constraintDeferral  map[string]bool            // SET CONSTRAINTS <name>: per-constraint override (0119-0004)
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
 	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
+	autocommitUndoScope bool                       // see NewAutocommitUndoSession / TracksDDLUndo (root-0024 residual, M0110-0001)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
 // holder with READ COMMITTED as default isolation.
 func NewBasicSession() *BasicSession {
 	return &BasicSession{isolation: mvcc.IsolationReadCommitted}
+}
+
+// NewAutocommitUndoSession constructs a message-scoped, throwaway session for
+// an autocommit multi-statement batch (dispatchSimpleQueryViaExecutor), like
+// NewBasicSession but with TracksDDLUndo() reporting true. inTx stays false —
+// this does NOT make the session an explicit transaction, so the ~20 call
+// sites gated on InExplicitTransaction() are unaffected — it only lets
+// CREATE TYPE ... AS ENUM/composite and ALTER TYPE ... ADD VALUE/RENAME TO
+// record into ctx.Pending* for the duration of this one Query message, so a
+// LATER statement's failure in the same message can undo them (mirrors
+// RecordDDLCreate's existing unconditional recording for CREATE TABLE/INDEX).
+// root-0024 residual, M0110-0001.
+func NewAutocommitUndoSession() *BasicSession {
+	s := NewBasicSession()
+	s.autocommitUndoScope = true
+	return s
 }
 
 // SetIsolationLevel updates the default isolation level used by BEGIN.
@@ -213,6 +240,8 @@ func (s *BasicSession) SetIsolationLevel(level mvcc.IsolationLevel) error {
 func (s *BasicSession) IsolationLevel() mvcc.IsolationLevel { return s.isolation }
 
 func (s *BasicSession) InExplicitTransaction() bool { return s.inTx }
+
+func (s *BasicSession) TracksDDLUndo() bool { return s.inTx || s.autocommitUndoScope }
 
 func (s *BasicSession) IsReadOnlyTxn() bool    { return s.txnReadOnly }
 func (s *BasicSession) SetReadOnlyTxn(v bool)  { s.txnReadOnly = v }

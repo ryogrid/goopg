@@ -258,6 +258,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				if bs, ok := ectx.Session.(*executor.BasicSession); ok {
 					executor.ProcessRollbackUndos(ectx, bs)
 				}
+				// Undo any CREATE TYPE .../ALTER TYPE ... enum/composite DDL this
+				// batch's throwaway session tracked (TracksDDLUndo(), above) — the
+				// same bug class ProcessRollbackUndos fixes for CREATE TABLE/INDEX.
+				// root-0024 residual, M0110-0001.
+				executor.UndoEnumDDLOnAbort(ectx)
 			}
 			_ = s.cfg.TxnMgr.Rollback(tx)
 			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
@@ -306,9 +311,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			// LATER statement in this same message fails. Message-scoped
 			// only — never shared with connTx, so it carries nothing across
 			// Query messages. InExplicitTransaction() stays false on it, so
-			// every other Session-gated code path (enum/composite pending
-			// tracking, TRUNCATE/DROP-in-savepoint snapshotting) is unaffected.
-			ectx.Session = executor.NewBasicSession()
+			// every other Session-gated code path (TRUNCATE/DROP-in-savepoint
+			// snapshotting, deferred FK/UNIQUE/EXCLUDE check timing) is
+			// unaffected — but TracksDDLUndo() reports true so CREATE TYPE
+			// .../ALTER TYPE ... enum/composite tracking also covers this
+			// batch (root-0024 residual, M0110-0001; see the write-back guard
+			// below for why this must never reach connTx).
+			ectx.Session = executor.NewAutocommitUndoSession()
 		}
 		// Share the per-connection TEMP TABLE shadow map so it persists
 		// across statements in the same connection. M0097-0003.
@@ -959,8 +968,22 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		if connTx != nil && ectx.TempTableShadows != nil {
 			connTx.TempTableShadows = ectx.TempTableShadows
 		}
-		// Write back pending enum values/renames/creates (including nil after COMMIT/ROLLBACK).
-		if connTx != nil {
+		// Write back pending enum values/renames/creates (including nil after
+		// COMMIT/ROLLBACK) — but ONLY while an explicit transaction is open.
+		// Since TracksDDLUndo() now also lets a message-scoped autocommit
+		// throwaway session (NewAutocommitUndoSession) populate
+		// ectx.PendingCreatedEnums/etc., writing those back unconditionally
+		// would leak them into connTx past the end of THIS Query message —
+		// the next, wholly unrelated autocommit message would then inherit a
+		// stale "pending" entry for an already-committed type and could have
+		// it incorrectly dropped by an unrelated abort (the same collateral-
+		// damage bug class conn_tx.go's Session() staleness fix closed for
+		// pendingDDL). A real explicit transaction still needs this write-back
+		// to carry the pending set across Query messages until its own
+		// COMMIT/ROLLBACK. root-0024 residual, M0110-0001 — the mid-batch
+		// (autocommit-then-BEGIN, same message) combination is a separate,
+		// still-open follow-up (see the design doc).
+		if connTx != nil && connTx.InExplicit() {
 			connTx.PendingEnumValues = ectx.PendingEnumValues
 			connTx.PendingEnumRenames = ectx.PendingEnumRenames
 			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums

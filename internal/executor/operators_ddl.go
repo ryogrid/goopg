@@ -16961,8 +16961,10 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			// enum branch below).  The heap rows written above carry the aborting
 			// transaction's XID, so they become MVCC-invisible after rollback;
 			// the in-memory catalog registration is the part ROLLBACK must undo.
-			// DU-002 slice 244.
-			if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			// DU-002 slice 244. TracksDDLUndo() (not InExplicitTransaction()) so a
+			// message-scoped autocommit batch also tracks this for a later
+			// statement's abort — root-0024 residual, M0110-0001.
+			if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 				if o.ctx.PendingCreatedComposites == nil {
 					o.ctx.PendingCreatedComposites = make(map[string]bool)
 				}
@@ -16980,8 +16982,10 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
 	// returns a match for the new type. M0097-0022.
 	syncEnumTypeToCatalogHeap(o.ctx, et)
-	// Track enum type creation so ROLLBACK can drop it.  M0097-0022.
-	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+	// Track enum type creation so ROLLBACK can drop it.  M0097-0022. TracksDDLUndo()
+	// so a message-scoped autocommit batch also tracks this (root-0024 residual,
+	// M0110-0001).
+	if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 		if o.ctx.PendingCreatedEnums == nil {
 			o.ctx.PendingCreatedEnums = make(map[string]bool)
 		}
@@ -17195,7 +17199,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
-		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 			oldK := strings.ToLower(s.Name)
 			newK := strings.ToLower(s.RenameTo)
 			o.ctx.PendingEnumRenames = append(o.ctx.PendingEnumRenames, EnumRenameEntry{OldName: oldK, NewName: newK})
@@ -17218,7 +17222,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
-		} else if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		} else if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 			// Value added inside an uncommitted transaction: mark as "unsafe" ONLY if
 			// the type was NOT created in the same transaction (newly-created enum values
 			// are immediately safe — only pre-existing-type additions need the guard).

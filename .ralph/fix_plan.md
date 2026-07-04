@@ -82,15 +82,34 @@ instead of a fresh message-scoped throwaway one, and a successful autocommit
 UNRELATED later aborting autocommit batch on the same connection. Fixed by
 gating `Session()` on `c.active` (matching its own doc comment). Test:
 `TestConnTxSessionNilWhenNotExplicit`, confirmed RED pre-fix. Design doc
-`root-0024` new "Follow-up" section; ledger row appended. **Next up:** either
-continue the M0119-0004 pg_dump catalog-view parity battery (next gap found
-via `TestPort_PgDumpConnectionSetup`, currently PASS — no new gap surfaced
-this loop), or pick up `root-0024`'s remaining enum/composite-type-undo
-residual (now the more carefully-scoped of the two, since the write-back
-guard needed to do it safely — never letting a throwaway message's
-enum/composite tracking leak into `connTx` — is the same class of hazard
-just fixed here) — neither is independently urgent, see each's own Deferred
-section.
+`root-0024` new "Follow-up" section; ledger row appended. **This loop
+(2026-07-04, #104) closed the single-message-autocommit half of `root-0024`'s
+first residual:** enum/composite-type creation (`CREATE TYPE ... AS
+ENUM/composite`, `ALTER TYPE ... ADD VALUE/RENAME TO`) is now undo-aware for
+an autocommit multi-statement batch that aborts within one Query message, via
+a new `Session.TracksDDLUndo()` (deliberately separate from
+`InExplicitTransaction()`/`inTx`, so the ~20 unrelated call sites gated on
+`inTx` — deferred FK/UNIQUE/EXCLUDE check timing chief among them — are
+untouched) plus a `NewAutocommitUndoSession()` constructor and an exported
+`executor.UndoEnumDDLOnAbort` the abort defer now calls. Had to also guard
+`dispatch.go`'s per-statement `ectx.Pending*`→`connTx` write-back on
+`connTx.InExplicit()` to avoid leaking a committed autocommit type's
+pending-set entry into a later unrelated aborting batch (the same
+collateral-damage hazard class the `connTxState.Session()` fix closed for
+`pendingDDL`). Test: `TestSimpleQueryBatchAbortUndoesEarlierCreateType`,
+confirmed RED pre-fix. Design doc `root-0024` new "Follow-up: enum/composite-
+type creation now undo-aware..." section; ledger row appended. **Two
+sub-parts remain open** (see the ledger row's `deferred`/`resume point`
+columns for both): (a) TRUNCATE/DROP-in-savepoint tracking is still
+`inTx`-gated, untouched by this loop; (b) the mid-batch-`BEGIN` compound-batch
+combination (autocommit `CREATE TYPE`, then `BEGIN`, then `ROLLBACK`, all one
+message) still leaks the type — needs the same drain-and-replay hand-off
+class `pendingDDL`'s mid-batch-`BEGIN` residual needed (loop #103), not yet
+built for the `ctx.Pending*`-based enum/composite mechanism. **Next up:**
+continue the M0119-0004 pg_dump catalog-view parity battery, or pick up
+either of the two enum/composite sub-parts above, or `root-0024`'s
+TRUNCATE/DROP-in-savepoint sibling gap — none is independently urgent, see
+each's own Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

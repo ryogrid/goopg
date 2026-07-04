@@ -117,3 +117,65 @@ func TestSimpleQueryBatchExplicitBeginUndoesEarlierAutocommitCreateTable(t *test
 		t.Fatalf("table %q (created inside the explicit block) survived the ROLLBACK; frames=%+v", t2Name, frames)
 	}
 }
+
+// TestSimpleQueryBatchAbortUndoesEarlierCreateType pins root-0024's first
+// documented residual (M0110-0001): enum/composite-type creation was not
+// undo-tracked for a message-scoped autocommit batch, the same bug class
+// TestSimpleQueryBatchAbortUndoesEarlierCreateTable fixed for CREATE
+// TABLE/INDEX. Before the fix, CREATE TYPE ... AS ENUM inside an autocommit
+// multi-statement batch was never recorded for undo at all (the record sites
+// in operators_ddl.go gated on Session.InExplicitTransaction(), which is
+// false for the message-scoped throwaway session) — so a LATER statement's
+// failure in the same message left the enum permanently registered despite
+// the whole implicit batch transaction rolling back everywhere else. The fix
+// adds Session.TracksDDLUndo() (true for both a real explicit transaction and
+// the autocommit throwaway session) and wires the abort defer to call the
+// existing undoEnumDDLFromContext machinery (exported as
+// executor.UndoEnumDDLOnAbort) alongside ProcessRollbackUndos.
+func TestSimpleQueryBatchAbortUndoesEarlierCreateType(t *testing.T) {
+	addr, cat, stop := startCopyExecServer(t)
+	defer stop()
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("catalog is not *catalog.InMemory")
+	}
+
+	conn := dialAndComplete(t, addr)
+	defer conn.Close()
+
+	const typeName = "zz_batch_atomicity_mood"
+	writeQuery(t, conn, "CREATE TYPE "+typeName+" AS ENUM ('sad','ok','happy'); SELECT * FROM zz_definitely_missing_relation;")
+	frames := readUntilReady(t, conn)
+
+	sawTypeCreateComplete := false
+	sawError := false
+	for _, f := range frames {
+		switch f.Type {
+		case 'C': // CommandComplete
+			if string(f.Payload) == "CREATE TYPE\x00" {
+				sawTypeCreateComplete = true
+			}
+		case 'E': // ErrorResponse
+			sawError = true
+		}
+	}
+	if !sawTypeCreateComplete {
+		t.Fatalf("expected CREATE TYPE CommandComplete before the batch-aborting error; frames=%+v", frames)
+	}
+	if !sawError {
+		t.Fatalf("expected an ErrorResponse for the invalid second statement; frames=%+v", frames)
+	}
+
+	if _, found := im.LookupEnum(typeName); found {
+		t.Fatalf("enum type %q survived the aborted implicit batch — CREATE TYPE was not rolled back", typeName)
+	}
+
+	// A fresh, single-statement CREATE TYPE in its own message must still
+	// succeed and persist normally — the fix must not make autocommit DDL
+	// always transient.
+	writeQuery(t, conn, "CREATE TYPE "+typeName+" AS ENUM ('sad','ok','happy');")
+	frames = readUntilReady(t, conn)
+	if _, found := im.LookupEnum(typeName); !found {
+		t.Fatalf("enum type %q was not created by a standalone (non-aborting) CREATE TYPE; frames=%+v", typeName, frames)
+	}
+}
