@@ -30,19 +30,13 @@ are CLOSED** (2026-07-04) and archived. Policy: fix blockers in place; do NOT
 defer unless genuinely compelling (then record a ledger row); commit + push at
 every clean, green (build + pre-commit) checkpoint.
 
-**Next up:** the `updateViaIndex` partition/inheritance-child fan-out
-discovery is DONE (2026-07-04, design `docs/design/root-0026-update-via-index-inheritance-fanout.md`,
-deferral-ledger row flipped to `resolved` — indexed `UPDATE parent SET ...
-WHERE indexed_col = X` now correctly falls through to the multi-table
-SeqScan path when `tbl` has partition/inheritance children, instead of
-silently missing rows that live only in a child). It surfaced a SELECT-side
-twin, still open: a bare `SELECT ... WHERE indexed_col = X` (planner
-`IndexScan`, `indexScanOp`) has the identical parent-vs-children fan-out gap
-(deferral ledger, task-id `M0119-0004 (root-0026 follow-up, this loop)`) —
-bound it with a plain two-table INHERITS regression test first, then either
-restrict the read-side IndexScan the same way this fix restricts
-`updateViaIndex`, or extend the planner's Append/child-probe machinery to
-the index-eligible case. Otherwise continue the M0119-0004 pg_dump
+**Next up:** the `updateViaIndex`/`indexScanOp` partition/inheritance-child
+fan-out discovery (root-0026) is now fully DONE, both sides (2026-07-04,
+design `docs/design/root-0026-update-via-index-inheritance-fanout.md`, both
+deferral-ledger rows flipped to `resolved`) — indexed `UPDATE parent SET ...
+WHERE indexed_col = X` and a bare `SELECT ... WHERE indexed_col = X` both now
+correctly fan out to partition/inheritance children instead of silently
+missing rows that live only in a child. Continue the M0119-0004 pg_dump
 catalog-view parity battery / next unresolved DU-002 slice from
 `.ralph/deferral_ledger.md`, or pick up an M0122 backlog item.
 

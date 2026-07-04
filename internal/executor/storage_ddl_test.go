@@ -1189,3 +1189,56 @@ func TestUpdateViaIndexFansOutToInheritanceChildWithParentRow(t *testing.T) {
 		t.Fatalf("child-row PK-equality UPDATE via parent name must still fan out: got %v", rows)
 	}
 }
+
+// TestSelectIndexScanFansOutToInheritanceChild closes the SELECT-side twin
+// of the updateViaIndex inheritance-child fan-out gap (root-0026 discovery,
+// M0119-0004): the planner's IndexScan path (planIndexScanFromWhere,
+// internal/planner/planner.go) opened exactly one B-tree scoped to the
+// named table's own storage whenever a WHERE clause matched an equality or
+// range predicate on an indexed column, with no awareness of plain-INHERITS
+// children — unlike the Filter+UNION ALL fallback planScanRangeVar already
+// builds for a non-indexed predicate. `SELECT ... FROM parent WHERE
+// indexed_col = X` (no ONLY) therefore silently returned zero rows for a
+// row that in fact lives only in a child's own heap file, while the
+// identical query against a non-indexed column correctly found it.
+func TestSelectIndexScanFansOutToInheritanceChild(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	must("CREATE TABLE sixc_parent (id int primary key, val int)")
+	must("CREATE TABLE sixc_child (extra text) INHERITS (sixc_parent)")
+	// This row lives ONLY in the child's own heap file.
+	must("INSERT INTO sixc_child (id, val, extra) VALUES (1, 20, 'x')")
+
+	// `WHERE id = 1` is an equality predicate on the PK — the planner used
+	// to pick an IndexScan here (planIndexScanFromWhere), which pre-fix
+	// never consulted inheritance children.
+	rows := runQueryRows(t, ctx, "SELECT val FROM sixc_parent WHERE id = 1")
+	if len(rows) != 1 {
+		t.Fatalf("indexed-predicate SELECT must fan out to inheritance children: got %d rows, want 1", len(rows))
+	}
+	if rows[0][0].Kind != KindInt || rows[0][0].Int != 20 {
+		t.Fatalf("val=%+v want 20", rows[0][0])
+	}
+
+	// A range predicate on the same indexed column must fan out too
+	// (tryRangeIndexScan, reached from the same planIndexScanFromWhere gate).
+	rows = runQueryRows(t, ctx, "SELECT val FROM sixc_parent WHERE id > 0 AND id < 5")
+	if len(rows) != 1 {
+		t.Fatalf("indexed range-predicate SELECT must fan out to inheritance children: got %d rows, want 1", len(rows))
+	}
+
+	// FROM ONLY must still exclude the child (PostgreSQL semantics) — the
+	// index path is safe to take here since there is nothing to fan out to.
+	rows = runQueryRows(t, ctx, "SELECT val FROM ONLY sixc_parent WHERE id = 1")
+	if len(rows) != 0 {
+		t.Fatalf("FROM ONLY must not see child rows: got %v", rows)
+	}
+}

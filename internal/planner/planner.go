@@ -782,6 +782,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	var node Node
 	var ctx *resolveContext
+	// fromOnly tracks whether the single-table FROM clause used `FROM ONLY`
+	// (set below in the isSimpleSingle branch); planIndexScanFromWhere uses
+	// it to decide whether an IndexScan may safely skip accessible
+	// inheritance children (root-0026 SELECT-side twin, M0119-0004).
+	var fromOnly bool
 
 	if len(s.ValuesRows) > 0 && len(s.From) == 0 && len(s.Targets) == 0 {
 		// Standalone VALUES statement: VALUES (r1), (r2), ...
@@ -800,6 +805,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	} else if isSimpleSingle {
 		rv := s.From[0]
+		fromOnly = rv.Only
 		// Delegate the simple-single-table case to
 		// planScanRangeVar so view substitution / virtual-rows
 		// dispatch live in one place. SourceTableIdx 1 — only
@@ -874,7 +880,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
 			whereForIndex := injectLikeRangePredicates(s.Where)
-			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat); err != nil {
+			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !fromOnly); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
@@ -6631,7 +6637,15 @@ func parserExprKey(e parser.Expr) string {
 	return fmt.Sprintf("expr:%T", e)
 }
 
-func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+// enforceInheritanceFanout, when true, additionally refuses IndexScan when
+// tbl has accessible plain-INHERITS children (mirroring the PartitionKey
+// check below): an IndexScan opens exactly one B-tree scoped to tbl's own
+// storage, so a row living only in a child would be silently missed unless
+// execution falls through to the Filter+UNION ALL fan-out planScanRangeVar
+// already builds (root-0026 SELECT-side twin, M0119-0004). The caller passes
+// false to preserve pre-existing behavior where a different layer already
+// handles (or is unaffected by) the child fan-out — see call sites.
+func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog, enforceInheritanceFanout bool) (Node, bool, error) {
 	if len(ctx.bindings) != 1 {
 		return nil, false, nil
 	}
@@ -6641,6 +6655,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	// which correctly scans the children via planScanRangeVar. M0100-0005.
 	if len(tbl.PartitionKey) > 0 {
 		return nil, false, nil
+	}
+	if enforceInheritanceFanout {
+		if im := inMemoryCat(cat); im != nil {
+			if len(catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), currentTempOwner(cat))) > 0 {
+				return nil, false, nil
+			}
+		}
 	}
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != parser.OpEq {
@@ -7895,7 +7916,11 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		// for `WHERE indexed_col = key` shapes. Mirrors planSelect's
 		// `if idxNode, ok, err := planIndexScanFromWhere(...)` arm.
 		// Falls through to Filter(SeqScan) on no index match.
-		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+		// enforceInheritanceFanout=false: updateOp.Next (operators_storage.go)
+		// already gates its own index fast path on the target having no
+		// partition/inheritance children (root-0025 item 5 follow-up,
+		// M0119-0004), so this plan-time check would be redundant here.
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat, false); err != nil {
 			return nil, err
 		} else if ok {
 			node = idxNode
@@ -8062,7 +8087,12 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		// M0021-0009 step 2d: index-driven probe for
 		// `WHERE indexed_col = key` shapes; falls through to
 		// Filter(SeqScan).
-		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+		// enforceInheritanceFanout=false: deleteOp.Next (operators_storage.go)
+		// never uses this plan node's index fast path for the fan-out
+		// decision at all — it always recomputes scanTables (parent +
+		// partition/inheritance children) itself, so this plan-time check
+		// would have no effect on DELETE's correctness either way.
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat, false); err != nil {
 			return nil, err
 		} else if ok {
 			node = idxNode
