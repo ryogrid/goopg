@@ -150,6 +150,57 @@ func TestCompatWindowRankPeerGroups(t *testing.T) {
 	}
 }
 
+// TestCompatWindowDenseRankPeerGroups pins the M0122-0004 dense_rank()
+// window function: unlike rank(), it never skips a value after a tie —
+// consecutive peer groups are numbered 1, 2, 3, ... with no gaps.
+// Expected values verified against upstream PostgreSQL 18.3.
+func TestCompatWindowDenseRankPeerGroups(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, dense_rank() OVER (PARTITION BY grp ORDER BY val) AS dr FROM t ORDER BY grp, val, dr")
+	want := []struct{ grp, val, dr int64 }{
+		{grp: 1, val: 10, dr: 1},
+		{grp: 1, val: 10, dr: 1},
+		{grp: 1, val: 20, dr: 2},
+		{grp: 2, val: 5, dr: 1},
+		{grp: 2, val: 5, dr: 1},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][0].Kind != KindInt || rows[i][0].Int != w.grp {
+			t.Fatalf("row[%d] grp=%+v want %d", i, rows[i][0], w.grp)
+		}
+		if rows[i][1].Kind != KindInt || rows[i][1].Int != w.val {
+			t.Fatalf("row[%d] val=%+v want %d", i, rows[i][1], w.val)
+		}
+		if rows[i][2].Kind != KindInt || rows[i][2].Int != w.dr {
+			t.Fatalf("row[%d] dr=%+v want %d", i, rows[i][2], w.dr)
+		}
+	}
+}
+
 // TestCompatWindowAggregatesDefaultFrame pins the M0122-0004
 // frame-consuming aggregate window functions (sum/count/avg/min/max)
 // against their default frame: RANGE UNBOUNDED PRECEDING (cumulative,

@@ -132,12 +132,13 @@ func TestAnalyzeWindowFunctionAccepted(t *testing.T) {
 func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
 	// count(*) OVER () and first_value/last_value/nth_value/ntile/
-	// cume_dist/percent_rank are now supported (M0122-0004) — dense_rank()
-	// as a window function is a real PostgreSQL window function still
-	// unimplemented in v0 (only its WITHIN GROUP ordered-set-aggregate
-	// form exists), so it remains the rejection case.
+	// cume_dist/percent_rank/dense_rank are now supported (M0122-0004) —
+	// array_agg() as a window function is a real PostgreSQL general
+	// aggregate still unimplemented as a window function in v0 (only
+	// sum/count/avg/min/max are wired to the frame-consuming path), so
+	// it remains the rejection case.
 	expectAnalyzeCode(t, cat,
-		"SELECT dense_rank() OVER () FROM pgbench_accounts",
+		"SELECT array_agg(aid) OVER () FROM pgbench_accounts",
 		"0A000")
 }
 
@@ -173,13 +174,14 @@ func TestAnalyzeWindowValueFunctionsRejected(t *testing.T) {
 }
 
 // TestAnalyzeWindowRankingFunctionsAccepted pins the M0122-0004
-// ntile/cume_dist/percent_rank window functions.
+// ntile/cume_dist/percent_rank/dense_rank window functions.
 func TestAnalyzeWindowRankingFunctionsAccepted(t *testing.T) {
 	cat := analyzerCatalog(t)
 	queries := []string{
 		"SELECT ntile(4) OVER (ORDER BY aid) FROM pgbench_accounts",
 		"SELECT cume_dist() OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts",
 		"SELECT percent_rank() OVER (ORDER BY aid) FROM pgbench_accounts",
+		"SELECT dense_rank() OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts",
 	}
 	for _, sql := range queries {
 		if err := Analyze(parseOne(t, sql), cat); err != nil {
@@ -203,6 +205,9 @@ func TestAnalyzeWindowRankingFunctionsRejected(t *testing.T) {
 		"42601")
 	expectAnalyzeCode(t, cat,
 		"SELECT percent_rank(*) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT dense_rank(1) OVER () FROM pgbench_accounts",
 		"42601")
 }
 

@@ -160,6 +160,7 @@ func (o *windowOp) evalWindowFuncs() error {
 		pEnd := pStarts[p+1]
 		rowNum := int64(0)
 		rank := int64(1)
+		denseRank := int64(1)
 
 		if err := o.evalFrameAggFuncs(aggHelper, colBase, pStart, pEnd); err != nil {
 			return err
@@ -197,6 +198,7 @@ func (o *windowOp) evalWindowFuncs() error {
 				}
 				if !peer {
 					rank = rowNum
+					denseRank++
 				}
 			}
 			localIdx := i - pStart // 0-based position within this partition
@@ -208,6 +210,8 @@ func (o *windowOp) evalWindowFuncs() error {
 					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: rowNum}
 				case "rank":
 					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: rank}
+				case "dense_rank":
+					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: denseRank}
 				case "lag", "lead":
 					offset := int64(1)
 					if len(fn.Args) >= 2 {

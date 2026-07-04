@@ -4910,7 +4910,7 @@ func inferExprType(e Expr) catalog.Type {
 func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggregateSurface) (WindowFunc, error) {
 	name := strings.ToLower(fc.Name.Name)
 	switch name {
-	case "row_number", "rank":
+	case "row_number", "rank", "dense_rank":
 		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
 			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
 		}

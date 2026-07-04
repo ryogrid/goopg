@@ -422,10 +422,61 @@ percent_rank/cume_dist cases pin exact values reasoned from upstream's
 algorithm, including the non-obvious "remainder buckets get the extra
 row, not the last bucket" rule.
 
-**Still open:** `dense_rank()` as a window function (only its `WITHIN
-GROUP` ordered-set-aggregate form exists) is now the only rejection
-case left for `TestAnalyzeWindowFunctionUnsupportedRejected`.
+**Still open (at the time of this section):** `dense_rank()` as a
+window function (only its `WITHIN GROUP` ordered-set-aggregate form
+exists) was the only rejection case left for
+`TestAnalyzeWindowFunctionUnsupportedRejected`.
 ROWS/RANGE/GROUPS frame-clause parsing/execution itself remains the
 largest item in this M0020 bucket — every ranking/value/aggregate
 window function implemented so far still assumes PostgreSQL's default
 frame; an explicit frame clause is not yet parseable at all.
+
+## Follow-up: dense_rank() as a window function (2026-07-05, M0122-0004)
+
+Implemented `dense_rank()` as a window function — the last remaining
+gap named by the previous Follow-up section, and the last of the 11
+standard PostgreSQL window functions
+(`row_number`/`rank`/`dense_rank`/`percent_rank`/`cume_dist`/`ntile`/
+`lag`/`lead`/`first_value`/`last_value`/`nth_value`) to land. Its
+`WITHIN GROUP` ordered-set-aggregate form (`pg_proc` OIDs 3992/3993)
+was already implemented separately and is unaffected.
+
+**AST/planner/analyzer:** `dense_rank` joins the `row_number`/`rank`
+case in both `buildWindowFunc` (`internal/planner/planner.go`) and
+`analyzeWindowFuncCall` (`internal/analyzer/analyzer.go`) — same
+zero-argument, no-DISTINCT/star shape check, same `int8` return type.
+No catalog change needed: `pg_proc` OID 3102 (`dense_rank`,
+`HandlerName: "window_dense_rank"`) was already seeded
+(`internal/initdb/pg_proc_seed_data.go`), just never dispatched by the
+executor's window-function switch.
+
+**Executor (`internal/executor/operators_window.go`):** `evalWindowFuncs`
+gains a `denseRank` counter alongside the existing `rank`/`rowNum`
+locals. `rank` jumps to the current row's 1-based position
+(`rowNum`) whenever the peer group changes — `dense_rank` instead
+just increments by 1 at the same peer-group-change point, so it never
+skips a value after a tie (matches `window_dense_rank` in
+`postgres/src/backend/utils/adt/windowfuncs.c`: `wfstate->rank++`
+vs. `rank()`'s jump to the current row number).
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowRankingFunctionsAccepted` gains a `dense_rank()`
+case; `TestAnalyzeWindowRankingFunctionsRejected` gains a
+`dense_rank(1)` arg-shape case; `TestAnalyzeWindowFunctionUnsupportedRejected`
+repointed at `array_agg() OVER ()` since `dense_rank()` is no longer a
+valid rejection case — general aggregates other than
+sum/count/avg/min/max are the next rejection case),
+`internal/executor/window_compat_test.go`'s
+`TestCompatWindowDenseRankPeerGroups` (same tie-then-gap fixture as
+`TestCompatWindowRankPeerGroups`, cross-checked against upstream
+PostgreSQL 18.3: `rank` 1,1,3 vs. `dense_rank` 1,1,2 on the same rows).
+
+**Now fully closed:** every standard PostgreSQL window function is
+implemented under the default frame. The only remaining item in this
+M0020/M0122-0004 bucket is ROWS/RANGE/GROUPS frame-clause
+parsing/execution itself (three real consumers now exist —
+`evalFrameAggFuncs`/`frameEnd`/`evalNtileFuncs` — that a future loop
+could generalize into arbitrary frame-bounds computation), plus
+combining named-window forms (`OVER (win ORDER BY ...)`, a named
+window based on another named window), which are real deferred
+upstream syntax, not implemented shortcuts.

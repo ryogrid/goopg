@@ -1326,7 +1326,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 	name := strings.ToLower(x.Name.Name)
 	var retType catalog.Type
 	switch name {
-	case "row_number", "rank":
+	case "row_number", "rank", "dense_rank":
 		if x.Star || x.Distinct || len(x.Args) != 0 {
 			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
 		}
