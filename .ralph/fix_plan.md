@@ -33,11 +33,11 @@ every clean, green (build + pre-commit) checkpoint.
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
 BUFFERS TEXT+JSON/XML/YAML rendering, `pg_stat_io` row shape + real
-reads/read_bytes/read_time/writes/write_bytes/write_time/hits/evictions/
-extends/extend_bytes, and `track_io_timing` runtime SET have all landed;
-see the M0122-0003 line item for detail. Remaining sub-items: `EXPLAIN
-(BUFFERS)` without ANALYZE (planning-time buffers), local/temp-buffer
-terms, `extend_time` + the 3 remaining `pg_stat_io` op counters
+reads/read_bytes/read_time/writes/write_bytes/write_time/extend_time/
+hits/evictions/extends/extend_bytes, and `track_io_timing` runtime SET
+have all landed; see the M0122-0003 line item for detail. Remaining
+sub-items: `EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers),
+local/temp-buffer terms, the 3 remaining `pg_stat_io` op counters
 (reuses/writebacks/fsyncs), EXPLAIN's `I/O Timings` line, a `CTEDMLPrefix`
 nested-node instrumentation residual. Pick up one of those next, or
 continue the M0119-0004 pg_dump catalog-view
@@ -340,12 +340,40 @@ mirroring M0119's ledger `status` column.
       (`TestBufferCountersEvictionAndExtend`), `internal/executor/
       pgstat_io_test.go` (`TestPgStatIOEvictionsAndExtendsRendered`).
       Design: `docs/design/0122-0003-explain-format-xml-yaml.md` new
-      "`evictions`/`extends` counters" section. Still open: `write_time`,
-      `extend_time`, and the remaining 3 op counters (reuses/writebacks/
+      "`evictions`/`extends` counters" section. `write_time` **done**
+      (2026-07-05, later loop): `storage.Pool` gains `sharedWriteTimeNanos`
+      + `AddWriteTimeNanos`/`WriteTimeNanos` (exact mirror of
+      `sharedReadTimeNanos`'s trio) plus a new `OnFlushWait`/`OnFlushDone`
+      hook pair bracketing `evictVictim`'s dirty-victim `flushSlot` call
+      (same `contentMu`-held span `OnPinWait`/`OnPinDone` brackets on the
+      read side); `internal/initdb/open.go` wires it the same
+      `WaitEventStart(..., WaitDataFileWrite)`/`WaitEventEnd` way, a
+      deliberately new `Pool`-level pair distinct from `storage.Manager`'s
+      existing `OnWriteWait`/`OnWriteDone` (those fire for every
+      `WriteBlock` call including background bgwriter/checkpointer
+      flushes). `fetchIOStatRows` renders it as `write_time` (col 8).
+      Tests: `TestPoolWriteTimeNanosAccumulates`,
+      `TestPoolOnFlushHooksFireOnDirtyVictimEviction`,
+      `TestPgStatIOWriteTimeRendered`. Design: new "`write_time` counter"
+      section. `extend_time` **done** (2026-07-05, later loop): same
+      pattern applied to `PinNew`'s `p.mgr.Extend` call — `storage.Pool`
+      gains `sharedExtendTimeNanos` + `AddExtendTimeNanos`/`ExtendTimeNanos`,
+      a new `OnExtendWait`/`OnExtendDone` pair (distinct from
+      `storage.Manager`'s own `OnExtendWait`/`OnExtendDone`, same
+      per-backend-attribution reasoning as `write_time` vs. `mgr`'s write
+      hooks), wired in `internal/initdb/open.go` via
+      `WaitEventStart(..., WaitDataFileExtend)`; `fetchIOStatRows` renders
+      it as `extend_time` (col 13). Tests:
+      `TestPoolExtendTimeNanosAccumulates`,
+      `TestPoolOnExtendHooksFireOnPinNewExtend`,
+      `TestPgStatIOExtendTimeRendered`. Design: new "`extend_time` counter"
+      section. Still open: the remaining 3 op counters (reuses/writebacks/
       fsyncs + their bytes/time columns) — each needs a genuinely new
       counting mechanism (strategy-ring reuse, bgwriter/checkpointer-scoped
       writeback attribution, fsync call-site instrumentation respectively),
-      not a mechanical extension of the eviction/extend pattern.
+      not a mechanical extension of the eviction/extend pattern; also
+      EXPLAIN's `I/O Timings` line (now renderable since both `write_time`
+      and `extend_time` exist) and `EXPLAIN (BUFFERS)` without ANALYZE.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
@@ -577,8 +605,58 @@ mirroring M0119's ledger `status` column.
       the M0122-0004 series still assumes PostgreSQL's default frame.
       Combining forms (`OVER (win ORDER BY ...)`, a named window based on
       another named window) are also out of scope (real upstream syntax,
-      deferred — see design doc). GROUPING SETS/ROLLUP/CUBE, intervals
-      also remain. **DEFAULT-clause parsing removed from this bucket
+      deferred — see design doc). Intervals also remain.
+      **GROUPING SETS/ROLLUP/CUBE removed from this bucket (2026-07-05,
+      this loop):** implemented real SQL:1999 §7.9 semantics — previously
+      the parser discarded the construct into a plain GROUP BY (an
+      `IntegerConst(0)` sentinel silently skipped in `buildAggregateStage`),
+      so no subtotal/grand-total rows were ever produced.
+      `internal/parser/select.go`'s rewritten `parseGroupByElems` (+
+      `parseGroupingUnitList`/`parseGroupingSetsList`/`rollupAlternatives`/
+      `cubeAlternatives`/`cartesianProductGroupingSets`) expands
+      ROLLUP/CUBE/explicit GROUPING SETS into `SelectStmt.GroupingSets
+      *GroupingSetsSpec` (`internal/parser/ast.go`), a fully materialized
+      `[][]Expr` set list (cross-multiplied against any plain GROUP BY
+      columns in the same clause, per upstream's cross-product rule).
+      `rewriteGroupingSets` (`internal/planner/planner.go`, hooked into
+      `planSelect` right after the indirection-star rewrite, before the
+      CTE preplan and the `s.SetOp != nil` check) expands this into a
+      synthetic UNION ALL chain of plain-GROUP-BY branches — falls
+      straight through into the pre-existing N-ary set-op planning code
+      (segment flattening, per-branch casts via `wrapSetOpBranchWithCasts`,
+      `wrapSetOpSortLimit`), completely unmodified. `substituteGroupingExpr`
+      replaces excluded-dimension references in each branch's target
+      list/HAVING with `NULL` (recursing through `BinaryOp`/`UnaryOp`/
+      `IsNullExpr`/`IsBoolExpr`/`IsDistinctFromExpr`/`CollateExpr`/
+      `CastExpr`/`RowExpr`/`CaseExpr`/non-aggregate `FuncCall`) and
+      resolves the new `GROUPING(...)` pseudo-function (dedicated
+      `*parser.GroupingCall` AST node, analyzer-typed `int4` in
+      `internal/analyzer/analyzer.go`) to a literal bitmask per branch —
+      its value depends only on which generated set produced the row, so
+      there's no runtime cost. No executor change was needed at all. Also
+      removed the now-dead `IntegerConst{Value:0}` sentinel-skip branch in
+      `buildAggregateStage` (a literal `GROUP BY 0` now correctly falls to
+      the generic "position not in select list" 42P10 error instead of
+      being silently ignored). Tests:
+      `internal/parser/select_test.go` (`TestParseGroupByRollupExpandsToPrefixSets`,
+      `TestParseGroupByCubeExpandsToAllSubsets`,
+      `TestParseGroupByMixedPlainAndRollupCrossMultiplies`,
+      `TestParseGroupingSetsExplicitList`, `TestParseGroupingFuncCall`),
+      `internal/executor/grouping_sets_compat_test.go`
+      (`TestCompatGroupByRollupGeneratesSubtotalsAndGrandTotal`,
+      `TestCompatGroupByCubeGeneratesAllSubsetTotals`,
+      `TestCompatGroupByExplicitGroupingSets`,
+      `TestCompatGroupingFuncReportsRolledUpColumns`). Design:
+      `docs/design/0122-0004-grouping-sets-rollup-cube.md`;
+      `docs/design/README.md` new row; `unimplemented_feat.json` entry
+      updated in place (`status: resolved`). Deferred (ledger row,
+      2026-07-05): the substitution walker doesn't cover every
+      `parser.Expr` variant (`InExpr`/`ExistsExpr`/array exprs) or
+      window-function `.Over.PartitionBy`/`.OrderBy`. Gates: `go build
+      ./...` clean; `go test ./internal/parser/... ./internal/analyzer/...
+      ./internal/planner/... ./internal/executor/...` PASS (no
+      regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **DEFAULT-clause parsing removed from this bucket
       (2026-07-05, this loop, verify-before-implement):** stale entry —
       the `unimplemented_feat.json` item ("DEFAULT clause in column
       definitions is skipped during parsing") predates 2026-05-12 and no

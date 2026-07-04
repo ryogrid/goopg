@@ -617,6 +617,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		return nil, err
 	}
 
+	// GROUPING SETS/ROLLUP/CUBE: expand into an equivalent UNION ALL chain
+	// of plain-GROUP-BY branches before anything else runs. Recursive
+	// planSelect calls (nested subqueries, and this rewrite's own
+	// UNION-branch replanning below) reach this same check, so nested
+	// grouping sets are handled the same way as the top-level query.
+	// M0122-0004.
+	if err := rewriteGroupingSets(s, cat); err != nil {
+		return nil, err
+	}
+
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
@@ -2912,6 +2922,194 @@ func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
 	return parser.RewriteIndirectionStarTargets(s, nil)
 }
 
+// rewriteGroupingSets expands a GROUP BY clause that used GROUPING
+// SETS/ROLLUP/CUBE (parser.SelectStmt.GroupingSets) into an equivalent
+// UNION ALL chain of ordinary single-GROUP-BY branches — exactly the
+// SQL:1999 §7.9 definition of grouping sets. s becomes the head of the
+// chain (its own GroupBy/Targets/Having become the first generated set);
+// remaining sets thread through s.SetOp as synthetic sibling SelectStmts.
+// planSelect's caller falls straight through to the pre-existing
+// N-ary-UNION-chain planning code (segment flattening, per-branch column
+// casts, wrapSetOpSortLimit for the original ORDER BY/LIMIT/OFFSET) — that
+// machinery is unchanged and unaware this chain was synthesized rather
+// than parsed.
+//
+// Per-branch SELECT-list/HAVING substitution (substituteGroupingExpr)
+// replaces any reference to a grouping expression that isn't part of the
+// *current* branch's set with a typed-by-UNION-cast NULL — the standard
+// semantics for a rolled-up-away dimension — and resolves GROUPING(...)
+// calls to a literal bitmask, since which bits are set depends only on
+// the active branch, never on data.
+func rewriteGroupingSets(s *parser.SelectStmt, cat catalog.Catalog) error {
+	spec := s.GroupingSets
+	if spec == nil {
+		return nil
+	}
+	s.GroupingSets = nil // consumed once; guards recursive planSelect re-entry
+	sets := spec.Sets
+	if len(sets) == 0 {
+		s.GroupBy = nil
+		return nil
+	}
+
+	universe := map[string]bool{}
+	for _, set := range sets {
+		for _, e := range set {
+			universe[parserExprKey(e)] = true
+		}
+	}
+
+	buildBranch := func(set []parser.Expr) *parser.SelectStmt {
+		active := map[string]bool{}
+		for _, e := range set {
+			active[parserExprKey(e)] = true
+		}
+		targets := make([]parser.ResTarget, len(s.Targets))
+		for i, t := range s.Targets {
+			nt := t
+			nt.Expr = substituteGroupingExpr(t.Expr, universe, active, cat)
+			targets[i] = nt
+		}
+		branch := &parser.SelectStmt{
+			Distinct:   s.Distinct,
+			DistinctOn: s.DistinctOn,
+			Targets:    targets,
+			From:       s.From,
+			FromExprs:  s.FromExprs,
+			Where:      s.Where,
+			GroupBy:    set,
+		}
+		if s.Having != nil {
+			branch.Having = substituteGroupingExpr(s.Having, universe, active, cat)
+		}
+		return branch
+	}
+
+	branches := make([]*parser.SelectStmt, len(sets))
+	for i, set := range sets {
+		branches[i] = buildBranch(set)
+	}
+
+	s.Distinct = branches[0].Distinct
+	s.DistinctOn = branches[0].DistinctOn
+	s.Targets = branches[0].Targets
+	s.GroupBy = branches[0].GroupBy
+	s.Having = branches[0].Having
+	cur := s
+	for _, b := range branches[1:] {
+		cur.SetOp = &parser.SetOpClause{Type: parser.SetOpUnion, All: true, Right: b}
+		cur = b
+	}
+	return nil
+}
+
+// substituteGroupingExpr rewrites e for one generated grouping-set branch:
+// any subexpression that is one of the grouping construct's "universe"
+// expressions (appears in at least one generated set) but is NOT part of
+// the current branch's active set is replaced with NULL — the SQL-standard
+// value for a dimension rolled up away at this grouping level. GROUPING(...)
+// calls resolve to a literal bitmask (bit i, counting from the rightmost
+// arg, is 1 iff Args[i] is excluded from the active set). Arguments of
+// aggregate function calls (built-in or user-defined) are left untouched,
+// since aggregates evaluate over the raw pre-grouping rows, not the
+// rolled-up output value. Unrecognised expression shapes are returned
+// unchanged rather than guessed at.
+func substituteGroupingExpr(e parser.Expr, universe, active map[string]bool, cat catalog.Catalog) parser.Expr {
+	if e == nil {
+		return nil
+	}
+	if gc, ok := e.(*parser.GroupingCall); ok {
+		return &parser.IntegerConst{Value: groupingBitmask(gc.Args, active)}
+	}
+	if universe[parserExprKey(e)] && !active[parserExprKey(e)] {
+		return &parser.NullConst{}
+	}
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		clone := *x
+		clone.Left = substituteGroupingExpr(x.Left, universe, active, cat)
+		clone.Right = substituteGroupingExpr(x.Right, universe, active, cat)
+		return &clone
+	case *parser.UnaryOp:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.IsNullExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.IsBoolExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.IsDistinctFromExpr:
+		clone := *x
+		clone.Left = substituteGroupingExpr(x.Left, universe, active, cat)
+		clone.Right = substituteGroupingExpr(x.Right, universe, active, cat)
+		return &clone
+	case *parser.CollateExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.CastExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.RowExpr:
+		clone := *x
+		elems := make([]parser.Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			elems[i] = substituteGroupingExpr(el, universe, active, cat)
+		}
+		clone.Elems = elems
+		return &clone
+	case *parser.CaseExpr:
+		clone := *x
+		if x.Operand != nil {
+			clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		}
+		whens := make([]parser.CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = parser.CaseWhen{
+				When: substituteGroupingExpr(w.When, universe, active, cat),
+				Then: substituteGroupingExpr(w.Then, universe, active, cat),
+			}
+		}
+		clone.Whens = whens
+		if x.Else != nil {
+			clone.Else = substituteGroupingExpr(x.Else, universe, active, cat)
+		}
+		return &clone
+	case *parser.FuncCall:
+		if isAggregateFunc(x) || isUserAggregateFunc(x, cat) {
+			return x
+		}
+		clone := *x
+		args := make([]parser.Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = substituteGroupingExpr(a, universe, active, cat)
+		}
+		clone.Args = args
+		return &clone
+	default:
+		return e
+	}
+}
+
+// groupingBitmask computes the SQL-standard GROUPING(...) result for one
+// branch: bit i (rightmost arg = least-significant bit) is 1 iff args[i]
+// is excluded from the active grouping set.
+func groupingBitmask(args []parser.Expr, active map[string]bool) int64 {
+	var mask int64
+	n := len(args)
+	for i, a := range args {
+		if !active[parserExprKey(a)] {
+			mask |= int64(1) << uint(n-1-i)
+		}
+	}
+	return mask
+}
+
 // projectSetCompositeSchema returns the expanded composite-row schema for a
 // supported set-returning function. nil means the SRF cannot be lowered into
 // ProjectSet from a `(srf(<agg>)).*` shape — currently only
@@ -5159,12 +5357,6 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		g = resolveOrderBySubstitution(g, s.Targets)
 		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
 		if ic, ok := g.(*parser.IntegerConst); ok {
-			// Position 0 is our placeholder for ROLLUP/CUBE/GROUPING SETS (parser stores them
-			// as IntegerConst{Value:0} after skipping the parens). Skip it silently so
-			// ROLLUP/CUBE don't error — they're handled as plain GROUP BY on the key columns.
-			if ic.Value == 0 {
-				continue
-			}
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",
 				Message: fmt.Sprintf("GROUP BY position %d is not in select list", ic.Value)}
 		}

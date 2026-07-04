@@ -132,6 +132,23 @@ type ExtractExpr struct {
 func (e *ExtractExpr) Pos() int { return e.pos }
 func (*ExtractExpr) exprNode()  {}
 
+// GroupingCall is the SQL-standard `GROUPING(expr [, ...])` pseudo-function,
+// valid only in the SELECT list / HAVING / ORDER BY of a query whose GROUP
+// BY used GROUPING SETS/ROLLUP/CUBE. Its value depends solely on which
+// generated grouping set produced the current row — bit i (counting from
+// the least-significant bit, rightmost arg) is 1 iff Args[i] is NOT part of
+// that set — so it never needs a runtime evaluation: the planner's
+// grouping-sets rewrite resolves each occurrence to a plain integer literal
+// once per generated branch. Stored separately from FuncCall (like
+// ExtractExpr) because it isn't a real catalog function. M0122-0004.
+type GroupingCall struct {
+	pos  int
+	Args []Expr
+}
+
+func (g *GroupingCall) Pos() int { return g.pos }
+func (*GroupingCall) exprNode()  {}
+
 // IntervalLit represents the SQL-standard `interval 'N' unit`
 // shape used heavily by TPC-H (Q1: `interval '90' day`, Q4:
 // `interval '3' month`, Q5/6/12/14: `interval '1' year`, etc.).

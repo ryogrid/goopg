@@ -183,6 +183,123 @@ func TestParseSelectGroupByHaving(t *testing.T) {
 	}
 }
 
+// TestParseGroupByRollupExpandsToPrefixSets pins ROLLUP(a, b)'s parse-time
+// expansion into its n+1 prefix sets ({a,b}, {a}, {}) — the planner rewrites
+// GroupingSets into a UNION ALL chain, so getting this expansion right at
+// parse time is load-bearing for M0122-0004's entire grouping-sets feature.
+func TestParseGroupByRollupExpandsToPrefixSets(t *testing.T) {
+	stmts, err := Parse("SELECT a, b, sum(c) FROM t GROUP BY ROLLUP(a, b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if s.GroupingSets == nil {
+		t.Fatal("GroupingSets = nil, want non-nil")
+	}
+	sets := s.GroupingSets.Sets
+	if len(sets) != 3 {
+		t.Fatalf("sets=%d want 3: %+v", len(sets), sets)
+	}
+	colNames := func(set []Expr) []string {
+		var names []string
+		for _, e := range set {
+			names = append(names, e.(*ColumnRef).Column)
+		}
+		return names
+	}
+	want := [][]string{{"a", "b"}, {"a"}, nil}
+	for i, w := range want {
+		got := colNames(sets[i])
+		if len(got) != len(w) {
+			t.Fatalf("sets[%d]=%v want %v", i, got, w)
+		}
+		for j := range w {
+			if got[j] != w[j] {
+				t.Fatalf("sets[%d]=%v want %v", i, got, w)
+			}
+		}
+	}
+	// GroupBy still holds the flattened union (both columns), unaffected
+	// shape for analyzer resolution / FOR UPDATE's GROUP BY check.
+	if len(s.GroupBy) != 2 {
+		t.Fatalf("GroupBy=%d want 2: %+v", len(s.GroupBy), s.GroupBy)
+	}
+}
+
+// TestParseGroupByCubeExpandsToAllSubsets pins CUBE(a, b)'s expansion into
+// all 2^2 = 4 subsets, distinguishing it from ROLLUP's strict-prefix chain.
+func TestParseGroupByCubeExpandsToAllSubsets(t *testing.T) {
+	stmts, err := Parse("SELECT a, b, sum(c) FROM t GROUP BY CUBE(a, b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if s.GroupingSets == nil || len(s.GroupingSets.Sets) != 4 {
+		t.Fatalf("sets=%+v want 4 entries", s.GroupingSets)
+	}
+}
+
+// TestParseGroupByMixedPlainAndRollupCrossMultiplies pins the SQL:1999
+// cross-product rule for multiple GROUP BY elements: `GROUP BY a,
+// ROLLUP(b, c)` must combine the always-present plain column `a` with each
+// of ROLLUP(b,c)'s 3 generated alternatives, yielding 1 x 3 = 3 sets, each
+// with `a` present.
+func TestParseGroupByMixedPlainAndRollupCrossMultiplies(t *testing.T) {
+	stmts, err := Parse("SELECT a, b, c, sum(d) FROM t GROUP BY a, ROLLUP(b, c)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if s.GroupingSets == nil || len(s.GroupingSets.Sets) != 3 {
+		t.Fatalf("sets=%+v want 3 entries", s.GroupingSets)
+	}
+	for i, set := range s.GroupingSets.Sets {
+		if len(set) == 0 || set[0].(*ColumnRef).Column != "a" {
+			t.Fatalf("sets[%d]=%+v want leading column a", i, set)
+		}
+	}
+}
+
+// TestParseGroupingSetsExplicitList pins the explicit `GROUPING SETS
+// ((a), (b), ())` form: sets are taken verbatim, no further expansion.
+func TestParseGroupingSetsExplicitList(t *testing.T) {
+	stmts, err := Parse("SELECT a, b, sum(c) FROM t GROUP BY GROUPING SETS ((a), (b), ())")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if s.GroupingSets == nil || len(s.GroupingSets.Sets) != 3 {
+		t.Fatalf("sets=%+v want 3 entries", s.GroupingSets)
+	}
+	if len(s.GroupingSets.Sets[0]) != 1 || s.GroupingSets.Sets[0][0].(*ColumnRef).Column != "a" {
+		t.Fatalf("sets[0]=%+v want [a]", s.GroupingSets.Sets[0])
+	}
+	if len(s.GroupingSets.Sets[1]) != 1 || s.GroupingSets.Sets[1][0].(*ColumnRef).Column != "b" {
+		t.Fatalf("sets[1]=%+v want [b]", s.GroupingSets.Sets[1])
+	}
+	if len(s.GroupingSets.Sets[2]) != 0 {
+		t.Fatalf("sets[2]=%+v want []", s.GroupingSets.Sets[2])
+	}
+}
+
+// TestParseGroupingFuncCall pins GROUPING(a, b)'s dedicated AST node (not a
+// generic FuncCall — it's resolved to a literal by the planner rewrite, not
+// executed).
+func TestParseGroupingFuncCall(t *testing.T) {
+	stmts, err := Parse("SELECT a, b, GROUPING(a, b) FROM t GROUP BY ROLLUP(a, b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	gc, ok := s.Targets[2].Expr.(*GroupingCall)
+	if !ok {
+		t.Fatalf("targets[2]=%+v want *GroupingCall", s.Targets[2].Expr)
+	}
+	if len(gc.Args) != 2 {
+		t.Fatalf("args=%d want 2", len(gc.Args))
+	}
+}
+
 func TestParseSelectSetOps(t *testing.T) {
 	stmts, err := Parse("SELECT 1 UNION ALL SELECT 2 INTERSECT SELECT 3")
 	if err != nil {

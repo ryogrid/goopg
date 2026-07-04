@@ -891,7 +891,34 @@ type SelectStmt struct {
 	// the analyzer resolves the reference by copying the matching
 	// definition's PartitionBy/OrderBy into the referencing WindowDef.
 	WindowClause []NamedWindowDef
+	// GroupingSets is non-nil when the GROUP BY clause used GROUPING
+	// SETS / ROLLUP / CUBE. GroupBy still holds the flattened union of
+	// every expression referenced by any generated set (so pre-existing
+	// consumers — analyzer resolution, FOR UPDATE's "not allowed with
+	// GROUP BY" check, positional GROUP BY — keep working unmodified);
+	// GroupingSets carries the actual expanded set list the planner
+	// rewrites into a UNION ALL of plain-GROUP-BY branches. M0122-0004.
+	GroupingSets *GroupingSetsSpec
 }
+
+// GroupingSetsSpec is the fully expanded form of a GROUP BY clause that
+// used GROUPING SETS / ROLLUP / CUBE. SQL:1999 §7.9 defines the result of
+// such a clause as equivalent to grouping by each listed set independently
+// and taking the UNION ALL of the results — which is exactly how the
+// planner executes it (see rewriteGroupingSets in internal/planner).
+type GroupingSetsSpec struct {
+	pos int
+	// Sets holds one entry per generated grouping set: the list of
+	// original GROUP BY expressions active in that set. ROLLUP(a,b,c)
+	// expands to the n+1 prefixes {a,b,c},{a,b},{a},{}; CUBE(a,b,c)
+	// expands to all 2^n subsets; an explicit GROUPING SETS(...) list is
+	// taken verbatim. Multiple comma-separated grouping elements (plain
+	// columns and/or constructs) combine via cross product, e.g.
+	// `GROUP BY a, ROLLUP(b, c)` = {a} x {[b,c],[b],[]}.
+	Sets [][]Expr
+}
+
+func (g *GroupingSetsSpec) Pos() int { return g.pos }
 
 // NamedWindowDef is one `name AS (window_definition)` item from a
 // SELECT statement's WINDOW clause.

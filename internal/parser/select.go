@@ -255,11 +255,12 @@ func (p *parser) parseSelect() (Stmt, error) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
 		}
-		list, err := p.parseGroupByElems()
+		flat, sets, err := p.parseGroupByElems()
 		if err != nil {
 			return nil, err
 		}
-		s.GroupBy = list
+		s.GroupBy = flat
+		s.GroupingSets = sets
 	}
 	if p.acceptKeyword(KwHaving) {
 		h, err := p.parseExpr()
@@ -646,74 +647,261 @@ func (p *parser) parseExprList() ([]Expr, error) {
 	return out, nil
 }
 
-// parseGroupByElems parses one or more GROUP BY elements separated by commas.
-// It handles GROUPING SETS (...), ROLLUP (...), and CUBE (...) by consuming
-// them and injecting a sentinel IntegerConst(0) so that len(GroupBy) > 0 remains
-// true — allowing downstream FOR UPDATE / HAVING checks to fire correctly.
-// Regular expressions are returned normally.
-func (p *parser) parseGroupByElems() ([]Expr, error) {
-	var out []Expr
+// maxGeneratedGroupingSets bounds ROLLUP/CUBE/GROUPING SETS expansion
+// (CUBE(n) yields 2^n sets, and multiple grouping elements cross-multiply)
+// against runaway memory from a large column list — e.g. CUBE of 20
+// columns would otherwise silently attempt to build a million-branch UNION.
+const maxGeneratedGroupingSets = 4096
+
+// parseGroupByElems parses one or more GROUP BY elements separated by
+// commas. flat is the flattened list of every expression that appears in
+// any grouping element (unaffected shape for a plain GROUP BY — existing
+// consumers such as analyzer resolution and the FOR-UPDATE/GROUP-BY check
+// keep working unmodified). sets is nil unless at least one element used
+// GROUPING SETS/ROLLUP/CUBE, in which case it holds the fully expanded,
+// cross-multiplied grouping-set list the planner rewrites into a UNION ALL
+// of plain-GROUP-BY branches (SQL:1999 §7.9). M0122-0004.
+func (p *parser) parseGroupByElems() (flat []Expr, sets *GroupingSetsSpec, err error) {
+	pos := p.cur().Pos
+	var components [][][]Expr
+	hasConstruct := false
+
 	for {
-		// GROUPING SETS / ROLLUP / CUBE: consume the grouping element and add a
-		// sentinel so the GROUP BY list is never empty after them.
-		if p.acceptIdentKeyword("grouping") {
-			sentPos := p.cur().Pos
-			p.acceptIdentKeyword("sets")
-			p.skipBalancedParens()
-			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
-		} else if p.acceptIdentKeyword("rollup") || p.acceptIdentKeyword("cube") {
-			// Parse ROLLUP(col1, col2, ...) / CUBE(col1, col2, ...) as if it were
-			// plain GROUP BY col1, col2, ... (ignoring the grand-total row semantics).
-			// The empty grouping set () from ROLLUP/CUBE is not generated; queries
-			// still aggregate correctly over the non-NULL grouping columns. M0097-0023.
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				p.advance() // consume '('
-				for p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-						p.advance() // consume ')'
-						break
-					}
-					// Each element in ROLLUP may itself be a list in parens like (a,b).
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-						// Parenthesised group: parse inner exprs.
-						p.advance() // consume '('
-						for p.cur().Kind != TokenEOF && !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
-							expr, err := p.parseExpr()
-							if err != nil {
-								break
-							}
-							out = append(out, expr)
-							if !p.acceptSymbol(",") {
-								break
-							}
-						}
-						if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-							p.advance() // consume ')'
-						}
-					} else {
-						expr, err := p.parseExpr()
-						if err != nil {
-							break
-						}
-						out = append(out, expr)
-					}
-					if !p.acceptSymbol(",") {
-						break
-					}
-				}
+		switch {
+		case p.acceptIdentKeyword("grouping"):
+			if !p.acceptIdentKeyword("sets") {
+				return nil, nil, p.errAtCur("expected SETS after GROUPING")
 			}
-		} else {
+			alts, err := p.parseGroupingSetsList()
+			if err != nil {
+				return nil, nil, err
+			}
+			hasConstruct = true
+			components = append(components, alts)
+			for _, s := range alts {
+				flat = append(flat, s...)
+			}
+		case p.acceptIdentKeyword("rollup"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, nil, err
+			}
+			alts := rollupAlternatives(units)
+			hasConstruct = true
+			components = append(components, alts)
+			for _, u := range units {
+				flat = append(flat, u...)
+			}
+		case p.acceptIdentKeyword("cube"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(units) > 20 {
+				return nil, nil, p.errAtCur("CUBE grouping list too large")
+			}
+			alts := cubeAlternatives(units)
+			if len(alts) > maxGeneratedGroupingSets {
+				return nil, nil, p.errAtCur("CUBE expands to too many grouping sets")
+			}
+			hasConstruct = true
+			components = append(components, alts)
+			for _, u := range units {
+				flat = append(flat, u...)
+			}
+		default:
 			expr, err := p.parseExpr()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			out = append(out, expr)
+			flat = append(flat, expr)
+			components = append(components, [][]Expr{{expr}})
 		}
 		if !p.acceptSymbol(",") {
 			break
 		}
 	}
+
+	if !hasConstruct {
+		return flat, nil, nil
+	}
+	expanded, err := cartesianProductGroupingSets(components)
+	if err != nil {
+		return nil, nil, p.errAtCur(err.Error())
+	}
+	return flat, &GroupingSetsSpec{pos: pos, Sets: expanded}, nil
+}
+
+// parseGroupingUnitList parses the parenthesised argument list of ROLLUP(...)
+// or CUBE(...): a comma-separated list of "units", each either a single
+// expression or a parenthesised sub-list `(e1, e2, ...)` that is tied
+// together — included or excluded from a generated set as one indivisible
+// group, matching upstream's multi-column ROLLUP/CUBE element semantics.
+func (p *parser) parseGroupingUnitList() ([][]Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after ROLLUP/CUBE")
+	}
+	var units [][]Expr
+	if p.acceptSymbol(")") {
+		return units, nil // ROLLUP()/CUBE() — degenerate, single empty set
+	}
+	for {
+		if p.acceptSymbol("(") {
+			var unit []Expr
+			if !p.acceptSymbol(")") {
+				for {
+					e, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					unit = append(unit, e)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			}
+			units = append(units, unit)
+		} else {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			units = append(units, []Expr{e})
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')'")
+	}
+	return units, nil
+}
+
+// parseGroupingSetsList parses the parenthesised body of GROUPING SETS
+// (...): a comma-separated list of grouping-set items, each an empty `()`,
+// a parenthesised expression list `(e1, e2, ...)`, a bare expression
+// (shorthand for a singleton set), or a nested ROLLUP(...)/CUBE(...) (which
+// itself expands to multiple sets, all folded into this GROUPING SETS'
+// result — upstream permits nesting these constructs). Returns the
+// flattened list of generated sets; unlike the cross-multiplied form used
+// for multiple GROUP BY elements, GROUPING SETS lists its own alternatives
+// verbatim (no further cross product across its own items).
+func (p *parser) parseGroupingSetsList() ([][]Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after GROUPING SETS")
+	}
+	var out [][]Expr
+	for {
+		switch {
+		case p.acceptIdentKeyword("rollup"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, rollupAlternatives(units)...)
+		case p.acceptIdentKeyword("cube"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, cubeAlternatives(units)...)
+		case p.cur().Kind == TokenSymbol && p.cur().Value == "(":
+			p.advance()
+			var set []Expr
+			if !p.acceptSymbol(")") {
+				for {
+					e, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					set = append(set, e)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			}
+			out = append(out, set)
+		default:
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, []Expr{e})
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+		if len(out) > maxGeneratedGroupingSets {
+			return nil, p.errAtCur("GROUPING SETS list too large")
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')'")
+	}
 	return out, nil
+}
+
+// rollupAlternatives expands ROLLUP(u1, u2, ..., un) into its n+1 prefix
+// sets — the full set, then each shorter prefix down to the empty set —
+// upstream's standard hierarchical rollup semantics.
+func rollupAlternatives(units [][]Expr) [][]Expr {
+	alts := make([][]Expr, 0, len(units)+1)
+	for i := len(units); i >= 0; i-- {
+		var set []Expr
+		for _, u := range units[:i] {
+			set = append(set, u...)
+		}
+		alts = append(alts, set)
+	}
+	return alts
+}
+
+// cubeAlternatives expands CUBE(u1, ..., un) into all 2^n subsets.
+func cubeAlternatives(units [][]Expr) [][]Expr {
+	n := len(units)
+	total := 1 << n
+	alts := make([][]Expr, 0, total)
+	for mask := 0; mask < total; mask++ {
+		var set []Expr
+		for j := 0; j < n; j++ {
+			if mask&(1<<j) != 0 {
+				set = append(set, units[j]...)
+			}
+		}
+		alts = append(alts, set)
+	}
+	return alts
+}
+
+// cartesianProductGroupingSets combines the alternative-set lists of every
+// comma-separated GROUP BY element into the final expanded grouping-set
+// list, per SQL:1999's cross-product rule for multiple grouping elements
+// (e.g. `GROUP BY a, ROLLUP(b, c)` = {a} x {[b,c],[b],[]}).
+func cartesianProductGroupingSets(components [][][]Expr) ([][]Expr, error) {
+	sets := [][]Expr{{}}
+	for _, alts := range components {
+		next := make([][]Expr, 0, len(sets)*len(alts))
+		for _, prefix := range sets {
+			for _, alt := range alts {
+				combined := make([]Expr, 0, len(prefix)+len(alt))
+				combined = append(combined, prefix...)
+				combined = append(combined, alt...)
+				next = append(next, combined)
+			}
+		}
+		sets = next
+		if len(sets) > maxGeneratedGroupingSets {
+			return nil, fmt.Errorf("GROUP BY expands to too many grouping sets")
+		}
+	}
+	return sets, nil
 }
 
 // skipBalancedParens consumes a parenthesised token sequence (including nested
@@ -3139,6 +3327,29 @@ func (p *parser) parseExtractExpr(pos int) (Expr, error) {
 	return &ExtractExpr{pos: pos, Field: field, Source: source}, nil
 }
 
+// parseGroupingCallExpr parses `GROUPING(expr [, ...])`. Requires at least
+// one argument (upstream rejects the bare `GROUPING()` form too).
+func (p *parser) parseGroupingCallExpr(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after GROUPING")
+	}
+	var args []Expr
+	for {
+		arg, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close GROUPING")
+	}
+	return &GroupingCall{pos: pos, Args: args}, nil
+}
+
 // parseSubstringFuncCall parses both SUBSTRING syntax forms:
 // (1) comma form: `SUBSTRING(str, start [, count])`
 // (2) SQL-standard form: `SUBSTRING(str FROM start [FOR count])`
@@ -3263,6 +3474,13 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		// Match case-insensitively on the bare ident form.
 		if len(parts) == 1 && strings.EqualFold(parts[0], "extract") {
 			return p.parseExtractExpr(startPos)
+		}
+		// GROUPING(expr [, ...]) — SQL-standard pseudo-function valid
+		// alongside GROUPING SETS/ROLLUP/CUBE. Not a real catalog
+		// function (like EXTRACT), so intercept before the generic
+		// call path. M0122-0004.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "grouping") {
+			return p.parseGroupingCallExpr(startPos)
 		}
 		if len(parts) == 1 && (strings.EqualFold(parts[0], "substring") || strings.EqualFold(parts[0], "substr")) {
 			return p.parseSubstringFuncCall(startPos, strings.ToLower(parts[0]))
