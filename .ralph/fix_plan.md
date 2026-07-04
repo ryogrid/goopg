@@ -341,6 +341,46 @@ mirroring M0119's ledger `status` column.
       (not fixed, matches a pre-existing ANY simplification kept
       consistent): NULL elements are skipped rather than fully
       three-valued (see design doc).
+      **Named windows removed from this bucket (2026-07-05, this loop):**
+      implemented `WINDOW name AS (PARTITION BY ... ORDER BY ...)` clauses
+      and the bare `OVER name` reference form (previously only the
+      anonymous `OVER (...)` form parsed). `parser.SelectStmt` gained
+      `WindowClause []NamedWindowDef`; `WindowDef` gained `RefName string`
+      for the bare-name form. `parseWindowDef`
+      (`internal/parser/select.go`) now branches on `(` vs. a bare
+      identifier after `OVER`; the shared partition/order body was
+      factored into `parseWindowSpecBody` so the anonymous and named forms
+      can't drift apart. `WINDOW` is parsed via `acceptIdentKeyword`
+      (mirrors the existing WITHIN/FILTER unreserved-keyword precedent,
+      no new reserved keyword). `isAliasStart` gained a `"window"`
+      exclusion alongside the pre-existing `"fetch"` one (otherwise
+      `sum(x) OVER w WINDOW w AS (...)` would swallow `window` as an
+      implicit column alias). All resolution happens in a new
+      `analyzer.resolveNamedWindowRefs`, which walks the same expression
+      positions `exprHasWindowFunc` already checks and copies a named
+      definition's PartitionBy/OrderBy into the referencing WindowDef
+      in-place before `analyzeTargets` runs — the planner and executor
+      needed **zero** changes since they only ever see the resolved AST.
+      Raises `42P20` for an undefined window name. Tests:
+      `internal/parser/window_test.go`
+      (`TestParseWindowClauseNamedWindow`,
+      `TestParseWindowClauseMultipleNamedWindows`),
+      `internal/analyzer/analyzer_test.go`
+      (`TestAnalyzeNamedWindowClauseAccepted`,
+      `TestAnalyzeNamedWindowUndefinedRejected`),
+      `internal/executor/window_compat_test.go`'s
+      `TestCompatWindowNamedWindowClause` (byte-identical output vs. the
+      same spec written inline twice). Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
+      section; `docs/design/README.md` row extended; `unimplemented_feat.json`
+      entry updated in place. **Still open in this bucket:** frame clauses
+      (ROWS/RANGE/GROUPS) — the only functions with executor support today
+      (row_number/rank/lag/lead) don't consult a frame, so implementing
+      frame execution has no consumer yet; combining forms (`OVER (win
+      ORDER BY ...)`, a named window based on another named window) are
+      also out of scope (real upstream syntax, deferred — see design doc).
+      GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause parsing, intervals also
+      remain.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

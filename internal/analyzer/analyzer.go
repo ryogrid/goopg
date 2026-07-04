@@ -299,6 +299,9 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		ctx.rels = rels
 	}
 
+	if err := resolveNamedWindowRefs(s); err != nil {
+		return err
+	}
 	if err := analyzeTargets(s.Targets, ctx); err != nil {
 		return err
 	}
@@ -756,6 +759,118 @@ func analyzeTargets(targets []parser.ResTarget, ctx *scope) error {
 		}
 	}
 	return nil
+}
+
+// resolveNamedWindowRefs resolves every bare `OVER window_name`
+// reference in s against s.WindowClause (M0020 named-window slice),
+// copying the matching definition's PartitionBy/OrderBy into the
+// referencing WindowDef in place. Downstream consumers (planner,
+// executor) read FuncCall.Over.PartitionBy/OrderBy directly and need
+// no awareness of RefName — this is the only place the reference is
+// resolved. Raises 42P20 ("window %q does not exist") for a name with
+// no matching WINDOW clause item.
+func resolveNamedWindowRefs(s *parser.SelectStmt) error {
+	defs := make(map[string]*parser.WindowDef, len(s.WindowClause))
+	for _, nw := range s.WindowClause {
+		defs[strings.ToLower(nw.Name)] = nw.Def
+	}
+	for _, rt := range s.Targets {
+		if err := resolveWindowRefsInExpr(rt.Expr, defs); err != nil {
+			return err
+		}
+	}
+	for _, g := range s.GroupBy {
+		if err := resolveWindowRefsInExpr(g, defs); err != nil {
+			return err
+		}
+	}
+	if s.Having != nil {
+		if err := resolveWindowRefsInExpr(s.Having, defs); err != nil {
+			return err
+		}
+	}
+	for _, sb := range s.OrderBy {
+		if err := resolveWindowRefsInExpr(sb.Expr, defs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveWindowRefsInExpr mirrors exprHasWindowFunc's traversal shape
+// (pattern_sibling_paths_must_agree) but resolves a bare `OVER name`
+// reference against defs instead of merely detecting a window func's
+// presence.
+func resolveWindowRefsInExpr(e parser.Expr, defs map[string]*parser.WindowDef) error {
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if err := resolveWindowRefsInExpr(x.Left, defs); err != nil {
+			return err
+		}
+		return resolveWindowRefsInExpr(x.Right, defs)
+	case *parser.UnaryOp:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.CastExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.ExtractExpr:
+		return resolveWindowRefsInExpr(x.Source, defs)
+	case *parser.CaseExpr:
+		if x.Operand != nil {
+			if err := resolveWindowRefsInExpr(x.Operand, defs); err != nil {
+				return err
+			}
+		}
+		for _, w := range x.Whens {
+			if err := resolveWindowRefsInExpr(w.When, defs); err != nil {
+				return err
+			}
+			if err := resolveWindowRefsInExpr(w.Then, defs); err != nil {
+				return err
+			}
+		}
+		if x.Else != nil {
+			return resolveWindowRefsInExpr(x.Else, defs)
+		}
+		return nil
+	case *parser.IsNullExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.IsBoolExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.CollateExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.IsDistinctFromExpr:
+		if err := resolveWindowRefsInExpr(x.Left, defs); err != nil {
+			return err
+		}
+		return resolveWindowRefsInExpr(x.Right, defs)
+	case *parser.InExpr:
+		if err := resolveWindowRefsInExpr(x.Operand, defs); err != nil {
+			return err
+		}
+		for _, v := range x.List {
+			if err := resolveWindowRefsInExpr(v, defs); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *parser.FuncCall:
+		if x.Over != nil && x.Over.RefName != "" {
+			def, ok := defs[strings.ToLower(x.Over.RefName)]
+			if !ok {
+				return analyzeError(x.Over.Pos(), "42P20", fmt.Sprintf("window %q does not exist", x.Over.RefName))
+			}
+			x.Over.PartitionBy = def.PartitionBy
+			x.Over.OrderBy = def.OrderBy
+		}
+		for _, a := range x.Args {
+			if err := resolveWindowRefsInExpr(a, defs); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 func exprHasWindowFunc(e parser.Expr) bool {

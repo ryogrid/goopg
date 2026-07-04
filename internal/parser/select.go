@@ -268,6 +268,13 @@ func (p *parser) parseSelect() (Stmt, error) {
 		}
 		s.Having = h
 	}
+	if p.acceptIdentKeyword("window") {
+		items, err := p.parseWindowClauseList()
+		if err != nil {
+			return nil, err
+		}
+		s.WindowClause = items
+	}
 	if p.acceptKeyword(KwOrder) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
@@ -1428,11 +1435,14 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 // a relation alias following a from-item without an AS keyword. It
 // excludes any keyword that would start the next clause, and the
 // SQL-standard unreserved idents that double as clause introducers
-// (`FETCH` for `FETCH FIRST n ROWS ONLY`).
+// (`FETCH` for `FETCH FIRST n ROWS ONLY`, `WINDOW` for a trailing
+// named-window clause — both are also reused for the same implicit-alias
+// check in parseTargetEntry, e.g. `sum(x) OVER w WINDOW w AS (...)` must
+// not swallow `window` as sum(x)'s column alias).
 func isAliasStart(t Token) bool {
 	if t.Kind == TokenIdent {
 		switch strings.ToLower(t.Value) {
-		case "fetch":
+		case "fetch", "window":
 			return false
 		}
 		return true
@@ -3516,18 +3526,35 @@ func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
 }
 
 // parseWindowDef parses the `OVER ( [PARTITION BY exprs]
-// [ORDER BY sortlist] )` body. Frame clauses (ROWS / RANGE /
-// GROUPS) are deferred — `parseWindowDef` errors on any token
+// [ORDER BY sortlist] )` body, or the bare `OVER window_name` form
+// (M0020 named-window slice) that defers PartitionBy/OrderBy to the
+// analyzer's WindowClause lookup. Frame clauses (ROWS / RANGE /
+// GROUPS) are deferred — `parseWindowSpecBody` errors on any token
 // that isn't `)` after the optional ORDER BY.
 func (p *parser) parseWindowDef() (*WindowDef, error) {
 	t, err := p.expectKeyword(KwOver)
 	if err != nil {
 		return nil, err
 	}
-	if !p.acceptSymbol("(") {
-		return nil, p.errAtCur("expected '(' after OVER")
+	if p.acceptSymbol("(") {
+		return p.parseWindowSpecBody(t.Pos)
 	}
-	wd := &WindowDef{pos: t.Pos}
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
+		name := p.cur().Value
+		p.advance()
+		return &WindowDef{pos: t.Pos, RefName: name}, nil
+	}
+	return nil, p.errAtCur("expected '(' or window name after OVER")
+}
+
+// parseWindowSpecBody parses the shared `[PARTITION BY exprs]
+// [ORDER BY sortlist] )` body used both by an anonymous `OVER (...)`
+// tail and by a named `WINDOW name AS (...)` clause item — the two
+// forms must stay byte-for-byte in sync (pattern_sibling_paths_must_agree),
+// so they share this single implementation. The caller has already
+// consumed the opening `(`; pos is the position to stamp on the result.
+func (p *parser) parseWindowSpecBody(pos int) (*WindowDef, error) {
+	wd := &WindowDef{pos: pos}
 	if p.acceptKeyword(KwPartition) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
@@ -3552,6 +3579,38 @@ func (p *parser) parseWindowDef() (*WindowDef, error) {
 		return nil, p.errAtCur("expected ')' after window definition (frame clauses are not supported in v0)")
 	}
 	return wd, nil
+}
+
+// parseWindowClauseList parses the comma-separated `name AS (...)`
+// items of a trailing SELECT `WINDOW` clause (M0020 named-window
+// slice). Each item's body is the same PARTITION BY/ORDER BY spec as
+// an anonymous OVER(...), parsed via the shared parseWindowSpecBody.
+func (p *parser) parseWindowClauseList() ([]NamedWindowDef, error) {
+	var items []NamedWindowDef
+	for {
+		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected window name")
+		}
+		name := p.cur().Value
+		namePos := p.cur().Pos
+		p.advance()
+		if !p.acceptKeyword(KwAs) {
+			return nil, p.errAtCur("expected AS after window name")
+		}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after AS in window definition")
+		}
+		wd, err := p.parseWindowSpecBody(namePos)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, NamedWindowDef{Name: name, Def: wd})
+		if p.acceptSymbol(",") {
+			continue
+		}
+		break
+	}
+	return items, nil
 }
 
 // parseIntLiteral converts a TokenIntLit value to int64, handling:

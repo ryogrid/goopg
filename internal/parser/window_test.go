@@ -118,6 +118,52 @@ func TestParseWindowFuncRejectsFrameClause(t *testing.T) {
 	}
 }
 
+// TestParseWindowClauseNamedWindow — the M0020 named-window slice:
+// a trailing `WINDOW name AS (...)` clause plus a bare `OVER name`
+// reference. Pins that the clause is captured on SelectStmt.WindowClause
+// and the referencing WindowDef carries RefName (not yet resolved —
+// that's the analyzer's job) rather than an empty PartitionBy/OrderBy.
+func TestParseWindowClauseNamedWindow(t *testing.T) {
+	stmts, err := Parse("SELECT rank() OVER w FROM pgbench_accounts WINDOW w AS (PARTITION BY bid ORDER BY aid)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.WindowClause) != 1 {
+		t.Fatalf("WindowClause = %+v, want 1 item", s.WindowClause)
+	}
+	if s.WindowClause[0].Name != "w" {
+		t.Errorf("WindowClause[0].Name = %q, want %q", s.WindowClause[0].Name, "w")
+	}
+	if len(s.WindowClause[0].Def.PartitionBy) != 1 || len(s.WindowClause[0].Def.OrderBy) != 1 {
+		t.Errorf("WindowClause[0].Def = %+v, want 1 PartitionBy + 1 OrderBy", s.WindowClause[0].Def)
+	}
+	fc := s.Targets[0].Expr.(*FuncCall)
+	if fc.Over == nil || fc.Over.RefName != "w" {
+		t.Fatalf("Over = %+v, want RefName %q", fc.Over, "w")
+	}
+	if len(fc.Over.PartitionBy) != 0 || len(fc.Over.OrderBy) != 0 {
+		t.Errorf("Over.PartitionBy/OrderBy = %+v/%+v, want both empty pre-resolution", fc.Over.PartitionBy, fc.Over.OrderBy)
+	}
+}
+
+// TestParseWindowClauseMultipleNamedWindows — a comma-separated
+// WINDOW clause defining more than one named window, each referenced
+// by a different function.
+func TestParseWindowClauseMultipleNamedWindows(t *testing.T) {
+	stmts, err := Parse("SELECT row_number() OVER w1, rank() OVER w2 FROM t WINDOW w1 AS (PARTITION BY a), w2 AS (ORDER BY b)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := stmts[0].(*SelectStmt)
+	if len(s.WindowClause) != 2 {
+		t.Fatalf("WindowClause len = %d, want 2", len(s.WindowClause))
+	}
+	if s.WindowClause[0].Name != "w1" || s.WindowClause[1].Name != "w2" {
+		t.Errorf("WindowClause names = %q, %q", s.WindowClause[0].Name, s.WindowClause[1].Name)
+	}
+}
+
 // TestParseWindowFuncWithoutOverUnchanged — rollout guardrail:
 // pre-M0020 FuncCalls (no OVER tail) produce nil Over, so
 // every existing parser/analyzer/planner test continues to

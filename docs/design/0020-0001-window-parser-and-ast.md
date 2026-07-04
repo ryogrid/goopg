@@ -155,3 +155,79 @@ Full `go test ./...` green.
 - Named-window references (`OVER win_name`) and named-window
   definitions (`WINDOW win AS (...)`).
 - LAG/LEAD-specific argument shapes (offset, default).
+
+## Follow-up: named windows (2026-07-05, M0122-0004)
+
+Implemented the two items this doc originally scoped out — `WINDOW
+name AS (...)` clauses and the bare `OVER name` reference form —
+without touching the planner or executor at all, by resolving the
+reference entirely inside the analyzer before either sees the AST.
+
+**AST:** `parser.SelectStmt` gained `WindowClause
+[]NamedWindowDef` (`internal/parser/ast.go`); `NamedWindowDef{Name
+string; Def *WindowDef}`. `WindowDef` (`internal/parser/expr.go`)
+gained `RefName string` — set instead of `PartitionBy`/`OrderBy` for
+the bare-name form, empty for the pre-existing anonymous
+`OVER (...)` form (byte-for-byte unchanged for every non-named
+query).
+
+**Parser:** `parseWindowDef` (`internal/parser/select.go`) now
+branches after consuming `OVER`: `(` → the existing anonymous body
+(factored into a new shared `parseWindowSpecBody`, used by both the
+anonymous and named forms so they can never drift apart — see
+`pattern_sibling_paths_must_agree`); a bare identifier → `RefName`.
+A new `WINDOW` clause is parsed via `acceptIdentKeyword("window")`
+(mirrors the existing `WITHIN`/`FILTER` unreserved-keyword
+precedent rather than adding a new reserved keyword token) between
+`HAVING` and `ORDER BY`, matching upstream's grammar position.
+`isAliasStart` gained a `"window"` exclusion alongside the
+pre-existing `"fetch"` one — without it, `sum(x) OVER w WINDOW w AS
+(...)` would swallow `window` as `sum(x)`'s implicit column alias
+before the parser ever reached the WINDOW-clause branch.
+
+**Analyzer:** a new `resolveNamedWindowRefs` (`internal/analyzer/
+analyzer.go`) runs once per `SELECT`, immediately before
+`analyzeTargets`. It builds a `name → *WindowDef` map from
+`s.WindowClause` and walks every expression tree a window function
+can legally appear in (Targets, GROUP BY, HAVING, ORDER BY — the
+same set `exprHasWindowFunc` already checks), and for any
+`FuncCall.Over.RefName != ""` copies the matching definition's
+`PartitionBy`/`OrderBy` in place, raising `42P20` ("window %q does
+not exist") for an unresolvable name. The traversal
+(`resolveWindowRefsInExpr`) deliberately mirrors
+`exprHasWindowFunc`'s node-type coverage — same sibling-consistency
+rationale as the parser change.
+
+Because the mutation happens on the *same* AST nodes the planner
+and executor already consume, `internal/planner/planner.go`'s
+`windowSpecKey`/window-grouping logic and
+`internal/executor/operators_window.go`'s evaluator needed **zero**
+changes — a named-window reference is indistinguishable from an
+equivalent inline anonymous one by the time either stage sees it,
+and functions sharing one named window correctly group into a
+single `WindowAgg` node (same as writing the spec out twice inline).
+
+**Tests:** `internal/parser/window_test.go`
+(`TestParseWindowClauseNamedWindow`,
+`TestParseWindowClauseMultipleNamedWindows`);
+`internal/analyzer/analyzer_test.go`
+(`TestAnalyzeNamedWindowClauseAccepted`,
+`TestAnalyzeNamedWindowUndefinedRejected` — both the wrong-name and
+right-name-not-defined-here cases); `internal/executor/
+window_compat_test.go`'s `TestCompatWindowNamedWindowClause` proves
+end-to-end that a named `OVER w` used by two different functions
+produces byte-identical output to writing the same spec inline
+twice.
+
+**Still deferred (unchanged from the original scope):** frame
+clauses, LAG/LEAD-specific default-shapes are already implemented
+elsewhere — only ROWS/RANGE/GROUPS frame execution remains open,
+tracked as its own `unimplemented_feat.json`/fix_plan M0122-0004
+item. Combining forms (`OVER (win_name ORDER BY ...)` extending a
+named window with additional clauses at the reference site, and a
+named window definition itself referencing another named window as
+its base) are **not** supported — only a bare `OVER name` and a
+self-contained `WINDOW name AS (...)` body. Both are real upstream
+syntax (see `postgres/src/test/regress/sql/window.sql`) not
+exercised by this loop's tests; deferred to a follow-up if a real
+query shape needs them.

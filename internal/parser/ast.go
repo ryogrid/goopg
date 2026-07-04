@@ -885,6 +885,19 @@ type SelectStmt struct {
 	// in FROM, e.g. `FROM (VALUES ...) t(col)`). When set, Targets
 	// and From are empty. M0097-0003.
 	ValuesRows [][]Expr
+	// WindowClause holds the named window definitions from a trailing
+	// `WINDOW name AS (...), ...` clause (M0020 named-window slice).
+	// Referenced from a FuncCall's `OVER name` tail via WindowDef.RefName;
+	// the analyzer resolves the reference by copying the matching
+	// definition's PartitionBy/OrderBy into the referencing WindowDef.
+	WindowClause []NamedWindowDef
+}
+
+// NamedWindowDef is one `name AS (window_definition)` item from a
+// SELECT statement's WINDOW clause.
+type NamedWindowDef struct {
+	Name string
+	Def  *WindowDef
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }

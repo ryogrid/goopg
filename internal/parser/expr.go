@@ -462,15 +462,22 @@ func (*FuncCall) exprNode()  {}
 
 // WindowDef is the parsed `OVER ( [PARTITION BY exprs]
 // [ORDER BY sortlist] )` tail attached to a FuncCall (M0020 step
-// 1). Frame clauses (ROWS / RANGE / GROUPS), frame exclusion, and
-// named-window references (`OVER win_name`) are deferred to a
-// later slice — they're optional in upstream and ROW_NUMBER /
-// RANK / LAG / LEAD don't need explicit frames at the SQL surface
-// (the executor uses default frames).
+// 1). Frame clauses (ROWS / RANGE / GROUPS) and frame exclusion
+// are deferred to a later slice — they're optional in upstream and
+// ROW_NUMBER / RANK / LAG / LEAD don't need explicit frames at the
+// SQL surface (the executor uses default frames).
+//
+// RefName is set instead of PartitionBy/OrderBy for the bare
+// `OVER window_name` form (M0020 named-window slice); the analyzer
+// resolves it against the enclosing SelectStmt.WindowClause and
+// copies the definition's PartitionBy/OrderBy in, so every
+// downstream consumer (planner, executor) only ever sees the
+// resolved form and needs no RefName-awareness of its own.
 type WindowDef struct {
 	pos         int
 	PartitionBy []Expr
 	OrderBy     []SortBy
+	RefName     string
 }
 
 // Pos returns the position of the leading `OVER` keyword.

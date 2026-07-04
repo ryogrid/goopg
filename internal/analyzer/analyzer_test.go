@@ -175,6 +175,38 @@ func TestAnalyzeWindowFunctionPlacementRejected(t *testing.T) {
 		"0A000")
 }
 
+// TestAnalyzeNamedWindowClauseAccepted pins the M0020 named-window
+// slice: a bare `OVER w` reference resolves against a trailing
+// `WINDOW w AS (...)` clause, including two functions sharing one
+// named window and two functions each with their own.
+func TestAnalyzeNamedWindowClauseAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT rank() OVER w FROM pgbench_accounts WINDOW w AS (PARTITION BY bid ORDER BY aid)",
+		"SELECT row_number() OVER w, rank() OVER w FROM pgbench_accounts WINDOW w AS (PARTITION BY bid ORDER BY aid)",
+		"SELECT row_number() OVER w1, rank() OVER w2 FROM pgbench_accounts WINDOW w1 AS (PARTITION BY bid), w2 AS (ORDER BY aid)",
+		"SELECT aid FROM pgbench_accounts WINDOW w AS (ORDER BY aid) ORDER BY row_number() OVER w",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeNamedWindowUndefinedRejected pins the 42P20 diagnostic
+// for `OVER name` with no matching WINDOW clause item — upstream's
+// "window %q does not exist".
+func TestAnalyzeNamedWindowUndefinedRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER missing FROM pgbench_accounts",
+		"42P20")
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER w FROM pgbench_accounts WINDOW w2 AS (PARTITION BY bid)",
+		"42P20")
+}
+
 // TestAnalyzeWithOrdinalityNamedColumn is the regression pin for the
 // WITH-ORDINALITY 42703 bug: tableFuncColumns never threaded
 // rv.TableFunc.WithOrdinality through, so the analyzer's synthetic FROM-item

@@ -649,7 +649,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/plan.go:784-790 WindowAgg lacks named window/frame fields"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): OVER window_name bare reference + trailing WINDOW name AS (...) clause now parse and resolve. parser.SelectStmt.WindowClause []NamedWindowDef + WindowDef.RefName (internal/parser/ast.go, expr.go, select.go); analyzer.resolveNamedWindowRefs copies the named definition's PartitionBy/OrderBy into the referencing WindowDef before analyzeTargets runs, so planner/executor need zero changes (internal/analyzer/analyzer.go). Raises 42P20 for an undefined name. Combining forms (OVER (win_name ORDER BY ...), a named window based on another named window) remain unsupported. Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go, internal/executor/window_compat_test.go's TestCompatWindowNamedWindowClause. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. Frame clauses (M0020's other still-open item) are unaffected/still open."
   },
   {
    "feature": "Implement per-row lock timestamp stamping during streaming execution to track exact lock timing.",
