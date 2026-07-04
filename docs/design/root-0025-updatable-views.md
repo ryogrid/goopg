@@ -433,21 +433,19 @@ untouched and a subsequent in-qual `UPDATE` still succeeds. (The
 inheritance-child case deliberately avoids a bare `WHERE <pk> = ...`, which
 would route through `updateViaIndex` instead — see the new discovery below.)
 
-**New discovery, not fixed, project-wide and independent of views:**
-`updateViaIndex` (`internal/executor/operators_storage.go`) only scans the
-exact target table's own B-tree index — it has no partition/inheritance-child
+**New discovery, project-wide and independent of views — RESOLVED
+(2026-07-04, follow-up loop, [root-0026](root-0026-update-via-index-inheritance-fanout.md)):**
+`updateViaIndex` (`internal/executor/operators_storage.go`) only scanned the
+exact target table's own B-tree index — it had no partition/inheritance-child
 fan-out at all, unlike `updateScanTables`/`updateWithFrom`. So `UPDATE parent
 SET ... WHERE indexed_col = X` (no `ONLY`), whenever the planner's
-`planIndexScanFromWhere` finds a usable index on `parent` itself, silently
-skips any matching row that lives only in an inheritance child's own storage
-— not just a CHECK OPTION gap, the actual write never happens. This is
-orthogonal to the CHECK OPTION fix above: it reproduces for *any* UPDATE
+`planIndexScanFromWhere` found a usable index on `parent` itself, silently
+skipped any matching row that lived only in an inheritance child's own
+storage — not just a CHECK OPTION gap, the actual write never happened. This
+was orthogonal to the CHECK OPTION fix above: it reproduced for *any* UPDATE
 (view or not) with an index-eligible WHERE clause over an inheritance
-hierarchy, and is unaffected by partitioning (a partitioned parent has no
-per-parent index of its own, so `planIndexScanFromWhere` never matches it,
-always falling through to `updateScanTables`, which DOES fan out — this is
-why the partition case in the new test above needed no such caveat while the
-inheritance case did). See the deferral ledger for the resume point.
+hierarchy. See [root-0026](root-0026-update-via-index-inheritance-fanout.md)
+for the fix, tests, and the SELECT-side twin bug it surfaced (still open).
 
 Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`;
 `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
@@ -512,8 +510,9 @@ no unique or exclusion constraint matching the ON CONFLICT specification`).
 
 **Root-0025 is now fully closed — no open items remain within this
 milestone's own scope.** The `updateViaIndex` inheritance-fan-out gap (item
-7 below) remains open but is project-wide and view-independent, not part of
-root-0025's own scope.
+7 below) is project-wide and view-independent, not part of root-0025's own
+scope; it was resolved in a follow-up loop — see
+[root-0026](root-0026-update-via-index-inheritance-fanout.md).
 
 Gates: `go build ./...` clean; `go vet ./internal/planner/... ./internal/executor/...`
 clean; `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/...
@@ -553,14 +552,11 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    through.
 6. **Restart persistence.** Unaffected by this change — the pre-existing
    in-memory-only view/catalog limitation (`0003-0009-views.md`).
-7. **`updateViaIndex` has no partition/inheritance-child fan-out at all
-   (new discovery, project-wide, not view-specific).** See the "New
-   discovery" note above and the matching deferral ledger row — a
-   project-wide gap, out of scope for a view-focused loop to fix at its
-   root. **This is the only item left open, and it is outside root-0025's
-   own scope** (items 1-5 above are all resolved, including the `ON
-   CONFLICT`-against-renamed-view residual from item 1 — root-0025 itself
-   is fully closed).
+7. ~~**`updateViaIndex` has no partition/inheritance-child fan-out at all
+   (new discovery, project-wide, not view-specific).**~~ — **RESOLVED**,
+   see [root-0026](root-0026-update-via-index-inheritance-fanout.md) (which
+   also documents a newly-discovered, still-open SELECT-side twin bug in
+   `indexScanOp` — tracked in the deferral ledger, not part of root-0025).
 
 ## Cross-references
 

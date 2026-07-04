@@ -4080,12 +4080,38 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		return o.updateWithFrom(rel, cols)
 	}
 
+	// Collect parent + partition/inheritance children up front. M0096-0013.
+	// For inheritance children, track a column-map so SET/WHERE/RETURNING
+	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
+	updateScanTables := []*catalog.Table{tbl}
+	var inheritChildOIDs map[uint32]bool
+	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
+		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
+		// Design 0118-0036 (M0118-0008 inherit-temp).
+		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
+		updateScanTables = append(updateScanTables, inheritChildren...)
+		if len(inheritChildren) > 0 {
+			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
+			for _, ic := range inheritChildren {
+				inheritChildOIDs[ic.OID] = true
+			}
+		}
+	}
+
 	// Use IndexScan (B-tree) when available — O(log n) instead of O(n).
-	if o.idxScan != nil {
+	// Only safe when tbl has no partition/inheritance children: updateViaIndex
+	// walks exactly one B-tree scoped to tbl's own storage, so a matching row
+	// living in a child would be silently skipped (M0119-0004 discovery,
+	// root-0025 item 5 follow-up — `.ralph/deferral_ledger.md`). With
+	// children present, fall through to the multi-table SeqScan path below,
+	// which already fans out correctly.
+	if o.idxScan != nil && len(updateScanTables) == 1 {
 		return o.updateViaIndex(rel, cols)
 	}
 
-	// Fallback: full SeqScan path.
+	// Fallback: full SeqScan path (also used for a parent table with
+	// partition/inheritance children, even when tbl itself has a usable index).
 
 	// Two passes: first collect (block, slot, newRow) tuples to
 	// rewrite, then issue the writes. Doing the writes in-line during
@@ -4107,24 +4133,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
-	// Scan parent + partition/inheritance children. M0096-0013.
-	// For inheritance children, track a column-map so SET/WHERE/RETURNING
-	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
-	updateScanTables := []*catalog.Table{tbl}
-	var inheritChildOIDs map[uint32]bool
-	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
-		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
-		// Design 0118-0036 (M0118-0008 inherit-temp).
-		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
-		updateScanTables = append(updateScanTables, inheritChildren...)
-		if len(inheritChildren) > 0 {
-			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
-			for _, ic := range inheritChildren {
-				inheritChildOIDs[ic.OID] = true
-			}
-		}
-	}
 	for _, scanTbl := range updateScanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
 		scanCols := scanTbl.Columns

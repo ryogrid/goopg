@@ -1103,3 +1103,89 @@ func TestDDLAlterTableDropColumn(t *testing.T) {
 		t.Fatalf("keep2=%+v want 42", rows[0][2])
 	}
 }
+
+// TestUpdateViaIndexFansOutToInheritanceChild closes the M0119-0004
+// discovery recorded in `.ralph/deferral_ledger.md` (root-0025 item 5
+// follow-up): updateOp.Next took the IndexScan fast path
+// (updateViaIndex) whenever the planner produced one, regardless of
+// whether the target table had partition/inheritance children.
+// updateViaIndex only ever walks a single B-tree scoped to the named
+// table's own storage, so a row that in fact lives in a plain-INHERITS
+// child was silently left untouched — `UPDATE parent SET ... WHERE id =
+// X` (id being the child's PK, hitting the index path) reported success
+// but performed no write. This mirrors PostgreSQL's requirement that an
+// UPDATE against an inheritance-parent target update every row in the
+// hierarchy that matches the WHERE clause, not just rows physically
+// stored in the named table.
+func TestUpdateViaIndexFansOutToInheritanceChild(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	must("CREATE TABLE uvix_parent (id int primary key, val int)")
+	must("CREATE TABLE uvix_child (extra text) INHERITS (uvix_parent)")
+	must("INSERT INTO uvix_child (id, val, extra) VALUES (1, 20, 'x')")
+
+	// WHERE id = 1 matches uvix_parent's PK index, so the planner picks
+	// an IndexScan and updateOp.Next takes the updateViaIndex fast path.
+	must("UPDATE uvix_parent SET val = 99 WHERE id = 1")
+
+	rows := runQueryRows(t, ctx, "SELECT val, extra FROM uvix_child WHERE id = 1")
+	if len(rows) != 1 {
+		t.Fatalf("uvix_child row count = %d, want 1 (row must survive the UPDATE)", len(rows))
+	}
+	if rows[0][0].Kind != KindInt || rows[0][0].Int != 99 {
+		t.Fatalf("uvix_child.val = %+v, want 99 (indexed UPDATE on the inheritance parent must fan out to the child)", rows[0][0])
+	}
+	if rows[0][1].Kind != KindString || rows[0][1].StringValue() != "x" {
+		t.Fatalf("uvix_child.extra = %+v, want unchanged 'x'", rows[0][1])
+	}
+
+	// The parent's own storage never had a row for id=1, so a direct
+	// SELECT against uvix_parent alone (not through the inheritance
+	// expansion) should still find nothing — confirms the row really
+	// lives only in the child, exercising the gap this test targets.
+	rows = runQueryRows(t, ctx, "SELECT val FROM ONLY uvix_parent WHERE id = 1")
+	if len(rows) != 0 {
+		t.Fatalf("ONLY uvix_parent unexpectedly has a row for id=1: %v", rows)
+	}
+}
+
+// TestUpdateViaIndexFansOutToInheritanceChildWithParentRow additionally
+// covers the case where the parent ALSO owns a row with a distinct key,
+// bounding that the fix above does not regress the (already-working)
+// direct-parent-row case while a sibling child row exists.
+func TestUpdateViaIndexFansOutToInheritanceChildWithParentRow(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	must("CREATE TABLE uvix2_parent (id int primary key, val int)")
+	must("CREATE TABLE uvix2_child (extra text) INHERITS (uvix2_parent)")
+	must("INSERT INTO uvix2_parent (id, val) VALUES (1, 10)")
+	must("INSERT INTO uvix2_child (id, val, extra) VALUES (2, 20, 'x')")
+
+	must("UPDATE uvix2_parent SET val = val + 1 WHERE id = 1")
+	must("UPDATE uvix2_parent SET val = val + 1 WHERE id = 2")
+
+	rows := runQueryRows(t, ctx, "SELECT val FROM uvix2_parent WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "11" {
+		t.Fatalf("direct parent-row PK-equality UPDATE regressed: got %v", rows)
+	}
+	rows = runQueryRows(t, ctx, "SELECT val FROM uvix2_child WHERE id = 2")
+	if len(rows) != 1 || rows[0][0].Format() != "21" {
+		t.Fatalf("child-row PK-equality UPDATE via parent name must still fan out: got %v", rows)
+	}
+}
