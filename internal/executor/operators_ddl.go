@@ -5036,6 +5036,24 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 			}
 		}
 	}
+	// Physical-storage cleanup: unlike DROP TABLE (dropTableByRefImmediate),
+	// DROP MATERIALIZED VIEW never released the matview's own heap file —
+	// it has real on-disk storage (populated by CREATE/REFRESH MATERIALIZED
+	// VIEW) despite living in the catalog's view-shaped Table entry. Without
+	// this the file leaks on every drop. DropRelation's os.IsNotExist guard
+	// makes this safe to call even for a never-materialized (WITH NO DATA)
+	// or restart-downgraded-to-virtual matview that has no backing file yet.
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
+	}
 	return nil
 }
 

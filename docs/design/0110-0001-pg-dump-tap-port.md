@@ -13662,6 +13662,35 @@ calls `o.ctx.Pool.Manager().DropRelation`/`InvalidateRel`/FSM/VM cleanup for
 the matview's own storage; this loop only closed the catalog-heap-row
 resurrection hole, not the physical-storage leak.
 
+## Follow-up: `DROP MATERIALIZED VIEW` physical-storage leak (M0119-0004, later loop)
+
+Closes deferred item (2) immediately above. A materialized view has real
+main-fork heap storage (populated by `CREATE`/`REFRESH MATERIALIZED VIEW`),
+unlike a plain view's `relfilenode=0`, but `execDropOneMatView`
+(`internal/executor/operators_ddl.go`) only ever removed the catalog entry
+and the on-disk pg_class/pg_attribute rows (the earlier restart-persistence
+fix above) — it never released the file itself, so every
+`DROP MATERIALIZED VIEW` leaked one heap file permanently.
+
+`execDropOneMatView` now mirrors `dropTableByRefImmediate`'s `DROP TABLE`
+cleanup for the matview's own relation, after the catalog-heap xmax stamp:
+`o.ctx.Catalog.RelFileNode(tbl)` (safe to call after `DropView`, since it
+reads only `tbl`'s own fields) is fed to `Pool.InvalidateRel`, then
+`Pool.Manager().DropRelation` (idempotent via its `os.IsNotExist` guard, so a
+never-materialized `WITH NO DATA` matview or a restart-downgraded-to-virtual
+one — no backing file yet — drops cleanly too), then `FSM.DropRelation`/
+`VM.DropRelation` when those maps are wired.
+
+Scope note: this only covers the matview's *own* main-fork file. Indexes
+created on a materialized view (if any exist) are a separate, unexamined gap
+— out of scope for this loop, which targeted exactly the leak the deferred
+item above named.
+
+Test: `internal/executor/operators_ddl_matview_storage_test.go` —
+`TestDropMaterializedViewReleasesStorage` creates a populated matview,
+confirms its heap file exists via `Pool.Manager().Exists(rel)`, drops it, and
+asserts the file, FSM entries, and VM bits are all gone.
+
 ## Follow-up: `ALTER VIEW` sub-forms complete the grammar (DU-002 slice 444)
 
 **2026-07-04.** Slice 440's deferral row left three `ALTER VIEW` sub-forms
