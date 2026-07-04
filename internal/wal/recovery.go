@@ -6425,6 +6425,23 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's collation registry.
 		return false, nil
+	case RecordKindCreateStatistics, RecordKindDropStatistics, RecordKindAlterStatisticsRename, RecordKindAlterStatisticsOwner, RecordKindAlterStatisticsSetSchema:
+		// CREATE/DROP/ALTER STATISTICS records (DU-002 restart-persistence
+		// follow-up) carry only pg_statistic_ext metadata; goopg has no
+		// per-statistics-object file namespace, so the physical replay path
+		// has nothing to do. The recovery driver in
+		// internal/initdb/statistics_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the catalog's
+		// statistics registry. Mirrors the RecordKindCreateCollation case
+		// above; CREATE/DROP STATISTICS (kinds 95/96) were missing this case
+		// entirely until this fix — falling to the switch's default
+		// "unsupported kind" error whenever ApplyRecord ran on a
+		// non-XLog-wrapped native record (the standby streaming-replication
+		// path, internal/wal/stream_replayer.go), even though startup
+		// crash-recovery on the primary never called ApplyRecord for these
+		// (internal/initdb/open.go invokes replayStatisticsDDLRecords
+		// directly) and so never observed the gap.
+		return false, nil
 	case RecordKindCreatePublication, RecordKindDropPublication, RecordKindAlterPublicationOwner,
 		RecordKindCreateSubscription, RecordKindDropSubscription, RecordKindAlterSubscriptionOwner:
 		// CREATE/DROP/ALTER PUBLICATION/SUBSCRIPTION records (DU-002

@@ -16,8 +16,9 @@ import (
 // opaque bytes and a dedicated logical recovery pass (replayStatisticsDDLRecords,
 // internal/initdb) applies them to the catalog after physical replay finishes.
 //
-// ALTER STATISTICS (RENAME/OWNER TO/SET SCHEMA) is not yet WAL-logged; that is
-// tracked as a separate follow-up in the deferral ledger, matching how ALTER
+// ALTER STATISTICS (RENAME/OWNER TO/SET SCHEMA) is now WAL-logged too
+// (RecordKindAlterStatisticsRename/Owner/SetSchema below), closing resume
+// point (1) of the slice-441/445 ledger rows — mirroring how ALTER
 // COLLATION's own three forms were added incrementally after CREATE/DROP
 // COLLATION landed.
 const (
@@ -38,6 +39,23 @@ const (
 	// Counterpart to RecordKindCreateStatistics.
 	// Format: kind(1) | nameLen(2) | name | schemaLen(2) | schema.
 	RecordKindDropStatistics byte = 96
+
+	// RecordKindAlterStatisticsRename records an `ALTER STATISTICS name RENAME
+	// TO newname` event (DU-002 restart-persistence follow-up to slice
+	// 441/445, resume point (1)). `name` is the (possibly schema-qualified)
+	// key execAlterStatistics already resolves via RenameStatisticsObject.
+	// Format: kind(1) | nameLen(2) | name | newNameLen(2) | newName.
+	RecordKindAlterStatisticsRename byte = 97
+
+	// RecordKindAlterStatisticsOwner records an `ALTER STATISTICS name OWNER
+	// TO ...` event. Mirrors RecordKindAlterCollationOwner.
+	// Format: kind(1) | ownerOID(4) | nameLen(2) | name.
+	RecordKindAlterStatisticsOwner byte = 98
+
+	// RecordKindAlterStatisticsSetSchema records an `ALTER STATISTICS name SET
+	// SCHEMA newschema` event. Mirrors RecordKindAlterCollationSetSchema.
+	// Format: kind(1) | nameLen(2) | name | newSchemaLen(2) | newSchema.
+	RecordKindAlterStatisticsSetSchema byte = 99
 )
 
 func encodeStatisticsStringSlice(out []byte, off int, elems []string) int {
@@ -201,4 +219,129 @@ func DecodeDropStatistics(payload []byte) (name, schema string, err error) {
 	}
 	schema = string(payload[off : off+schemaLen])
 	return name, schema, nil
+}
+
+// EncodeAlterStatisticsRename encodes an ALTER STATISTICS ... RENAME TO event
+// (DU-002 restart-persistence follow-up to slice 441/445, resume point (1)).
+// Format: kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) |
+// newName(newNameLen bytes).
+func EncodeAlterStatisticsRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newName))
+	out[0] = RecordKindAlterStatisticsRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterStatisticsRename decodes a RecordKindAlterStatisticsRename payload.
+func DecodeAlterStatisticsRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: alter-statistics-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterStatisticsRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-statistics-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-statistics-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", fmt.Errorf("wal: alter-statistics-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, newName, nil
+}
+
+// EncodeAlterStatisticsOwner encodes an ALTER STATISTICS ... OWNER TO event.
+// Format: kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes).
+func EncodeAlterStatisticsOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterStatisticsOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterStatisticsOwner decodes a RecordKindAlterStatisticsOwner payload.
+func DecodeAlterStatisticsOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-statistics-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterStatisticsOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-statistics-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-statistics-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	name = string(payload[7 : 7+nameLen])
+	return name, ownerOID, nil
+}
+
+// EncodeAlterStatisticsSetSchema encodes an ALTER STATISTICS ... SET SCHEMA
+// event. Format: kind(1) | nameLen(2) | name(nameLen bytes) |
+// newSchemaLen(2) | newSchema(newSchemaLen bytes).
+func EncodeAlterStatisticsSetSchema(name, newSchema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newSchema))
+	out[0] = RecordKindAlterStatisticsSetSchema
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newSchema)))
+	off += 2
+	copy(out[off:], newSchema)
+	return out
+}
+
+// DecodeAlterStatisticsSetSchema decodes a RecordKindAlterStatisticsSetSchema
+// payload.
+func DecodeAlterStatisticsSetSchema(payload []byte) (name, newSchema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: alter-statistics-set-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterStatisticsSetSchema {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-statistics-set-schema", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-statistics-set-schema payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newSchemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newSchemaLen {
+		return "", "", fmt.Errorf("wal: alter-statistics-set-schema payload truncated (need %d bytes)", off+newSchemaLen)
+	}
+	newSchema = string(payload[off : off+newSchemaLen])
+	return name, newSchema, nil
 }

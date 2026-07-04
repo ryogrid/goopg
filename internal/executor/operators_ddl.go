@@ -16056,10 +16056,12 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 // statistics at this granularity; a negative target -1 resets to the default
 // NULL, and pg_dump then emits no ALTER — DU-002 slice 317), or RENAME TO /
 // OWNER TO / SET SCHEMA (DU-002 slice 441, mirroring execAlterCollation).
-// RENAME/OWNER/SET SCHEMA are in-memory-only (not WAL-logged), matching the
-// pre-existing ALTER COLLATION RENAME/OWNER precedent — CREATE STATISTICS
-// itself is not yet WAL-logged either, so statistics objects as a whole do
-// not survive a restart (see deferral ledger).
+// RENAME/OWNER/SET SCHEMA are now WAL-logged (RecordKindAlterStatisticsRename/
+// Owner/SetSchema, resume point (1) of the slice-441/445 ledger rows) and
+// replayed by replayStatisticsDDLRecords alongside CREATE/DROP STATISTICS.
+// SET STATISTICS (the sample-target case below) remains in-memory-only —
+// upstream PG doesn't persist it as durable table state either beyond the
+// pg_statistic_ext catalog row, which goopg has no on-disk heap for.
 func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -16081,6 +16083,11 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		if !im.RenameStatisticsObject(name, s.NewName) {
 			return notFound()
 		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsRename(name, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-statistics-rename: %w", werr)
+			}
+		}
 		return nil
 	case "owner":
 		ownerOID := uint32(10) // bootstrap superuser, mirrors CreateStatisticsFull's default owner
@@ -16094,10 +16101,20 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 		if !im.SetStatisticsOwner(name, ownerOID) {
 			return notFound()
 		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsOwner(name, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-statistics-owner: %w", werr)
+			}
+		}
 		return nil
 	case "setschema":
 		if !im.SetStatisticsSchema(name, s.NewSchema) {
 			return notFound()
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterStatisticsSetSchema(name, s.NewSchema)); werr != nil {
+				return fmt.Errorf("wal alter-statistics-set-schema: %w", werr)
+			}
 		}
 		return nil
 	}

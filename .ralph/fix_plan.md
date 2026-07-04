@@ -48,15 +48,17 @@ report.md tallies `goopg-missing: 0`, and the one `goopg-bug` found (WP-02/WP-03
 one root cause) is fixed + regression-tested + ledger-resolved. **Resumed M0110
 next** (its M0119-0004/0005/0006/0007 spinoffs) per the paragraph above: this
 loop closed the M0110-0001 DU-002 slice 444 deferral (simple-query batch
-CREATE TABLE/INDEX atomicity on abort — design `root-0024`), and the
-following loop closed DU-002 slice 445 (`CREATE`/`DROP STATISTICS`
-WAL/restart persistence + new `DROP STATISTICS` support). **Next up:**
+CREATE TABLE/INDEX atomicity on abort — design `root-0024`), the following
+loop closed DU-002 slice 445 (`CREATE`/`DROP STATISTICS` WAL/restart
+persistence + new `DROP STATISTICS` support), and the loop after that closed
+resume point (1) of the slice-441/445 ledger rows (`ALTER STATISTICS
+RENAME/OWNER/SET SCHEMA` WAL persistence) — statistics restart durability is
+now fully closed, no open resume points remain on that thread. **Next up:**
 either continue the M0119-0004 pg_dump catalog-view parity battery (next gap
-found via `TestPort_PgDumpConnectionSetup`), pick up one of `root-0024`'s
+found via `TestPort_PgDumpConnectionSetup`), or pick up one of `root-0024`'s
 own two documented residuals (enum/composite-type undo + the mid-batch-BEGIN
-throwaway-session handoff), or close resume point (1) of the slice-441/445
-ledger rows (`ALTER STATISTICS RENAME/OWNER/SET SCHEMA` WAL persistence) —
-none is independently urgent, see each's own Deferred section.
+throwaway-session handoff) — neither is independently urgent, see each's own
+Deferred section.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
@@ -7873,6 +7875,54 @@ documentation-only and is exempt from the design-doc requirement.)
       in-memory-only — a restart reverts the object to its as-created
       name/owner/schema. Ledger row appended (new row, not flipping the
       slice-441 row `resolved` since resume point (1) remains open).
+
+- [x] **`ALTER STATISTICS ... RENAME TO/OWNER TO/SET SCHEMA` WAL/restart
+      persistence (M0110-0001, DU-002 slice 445 follow-up, closing resume
+      point (1) of the slice-441 ledger row).** **COMPLETE 2026-07-04:**
+      mirrors the `ALTER COLLATION` three-form precedent exactly. New
+      `internal/wal/statistics_ddl.go` record kinds
+      `RecordKindAlterStatisticsRename`/`...Owner`/`...SetSchema` (97/98/99)
+      + Encode/Decode pairs; `execAlterStatistics`'s three `Action` cases
+      each WAL-append after the in-memory mutation succeeds;
+      `catalog.InMemory` gains `RenameStatisticsObjectDuringRecovery`/
+      `SetStatisticsOwnerDuringRecovery`/`SetStatisticsSchemaDuringRecovery`;
+      `internal/initdb/statistics_ddl_recovery.go`'s
+      `statisticsRegistryRecovery` interface + `replayStatisticsDDLRecords`
+      gain the matching three cases. **Also fixed in the same loop** (found
+      while wiring these new kinds, not a separate slice): `CREATE`/`DROP
+      STATISTICS` (kinds 95/96, landed slice 445) were missing an explicit
+      case in `wal.ApplyRecord`'s physical-replay switch — every other
+      logical-only DDL kind (collation, publication/subscription, etc.) has
+      one that returns `(false, nil)` to opt out of physical redo; without
+      it, a 95/96/97/98/99 record hit the switch's `default: return false,
+      fmt.Errorf("unsupported kind %d", ...)`. This had no effect on the
+      primary's own crash recovery (`internal/initdb/open.go` calls
+      `replayStatisticsDDLRecords` directly, never through
+      `wal.ApplyRecord`), but would have broken standby/streaming-replication
+      replay (`internal/wal/stream_replayer.go`, the actual caller of
+      `wal.ApplyRecord`) for any of these five record kinds. Added one
+      combined case for all five, mirroring the `RecordKindCreateCollation,
+      RecordKindDropCollation, ...` case directly above it in
+      `internal/wal/recovery.go`. Tests:
+      `internal/wal/statistics_ddl_test.go` (round-trip + wrong-kind +
+      truncated-payload for all three new kinds),
+      `internal/initdb/statistics_ddl_recovery_test.go`'s
+      `TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema` (real
+      `Init`/`Open`/WAL.Append(create→rename→owner→set-schema)/`Close`/
+      re-`Open`, confirming the final identity survives and the original
+      name no longer resolves). Design doc
+      `docs/design/0110-0001-pg-dump-tap-port.md` "loop #97" section. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test -race
+      ./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+      `internal/catalog`+`internal/executor`+`internal/initdb`+
+      `internal/parser` suites PASS (full, no regression); TPC-H spotcheck
+      Q12=2/Q13=33 PASS; pgbench smoke = pre-commit hook. Both resume points
+      of the original slice-441 ledger row are now closed — statistics
+      restart durability (object + its ALTER mutations) is complete.
+      `ALTER STATISTICS ... SET STATISTICS n` remains intentionally
+      in-memory-only (matches upstream: no durable state beyond a catalog
+      column goopg has no heap for, same as the pre-existing slice-317
+      non-gap).
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

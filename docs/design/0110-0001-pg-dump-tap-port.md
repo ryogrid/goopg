@@ -13710,3 +13710,83 @@ CREATE/DROP template (or the ALTER COLLATION one directly). Gates: `go build
 `internal/wal`+`internal/catalog`+`internal/executor`+`internal/initdb`+
 `internal/parser` suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full
 pre-commit gate incl. pgbench TPC-B smoke PASS.
+
+### `ALTER STATISTICS ... RENAME TO / OWNER TO / SET SCHEMA` WAL/restart
+persistence (loop #97, DU-002 slice 445 follow-up, resume point (1) of the
+slice-441 row CLOSED)
+
+Closes resume point (1) of the slice-441 ledger row (the one remaining piece
+of the DU-002 statistics restart-durability gap after slice 445 landed
+CREATE/DROP): `ALTER STATISTICS name RENAME TO`/`OWNER TO`/`SET SCHEMA` were
+applied to the live `catalog.InMemory.statisticsObjs` registry correctly
+(slice 441) but never WAL-logged, so a restart between the `ALTER` and the
+next checkpoint reverted the object to its as-created name/owner/schema even
+though the object itself now survived (slice 445). Landed by mirroring the
+`ALTER COLLATION` three-form precedent exactly (`RecordKindAlterCollationRename`/
+`...Owner`/`...SetSchema`, slices 441-443):
+
+- `internal/wal/statistics_ddl.go`: three new record kinds —
+  `RecordKindAlterStatisticsRename`/`RecordKindAlterStatisticsOwner`/
+  `RecordKindAlterStatisticsSetSchema` (97/98/99, the first free values
+  after `RecordKindDropStatistics`=96) + their Encode/Decode pairs. The
+  rename/set-schema payloads carry the (possibly schema-qualified) `name`
+  key `execAlterStatistics` already resolves via `RenameStatisticsObject`/
+  `SetStatisticsSchema` (unlike collation's separate `name`+`schema`
+  fields — statistics' in-memory mutators take one combined key, so the
+  WAL format follows that shape rather than introducing a new one).
+- `internal/executor/operators_ddl.go`'s `execAlterStatistics`: each of the
+  three `Action` cases (`"rename"`/`"owner"`/`"setschema"`) now appends the
+  matching WAL record after the in-memory mutation succeeds, guarded by
+  `o.ctx.WAL != nil` exactly like the CREATE/DROP call sites.
+- `catalog.InMemory` gains three discard-result recovery counterparts
+  (`RenameStatisticsObjectDuringRecovery`/`SetStatisticsOwnerDuringRecovery`/
+  `SetStatisticsSchemaDuringRecovery`), mirroring
+  `RenameCollationDuringRecovery`/`SetCollationOwnerDuringRecovery`/
+  `SetCollationSchemaDuringRecovery`.
+- `internal/initdb/statistics_ddl_recovery.go`: `statisticsRegistryRecovery`
+  gains the three new interface methods; `replayStatisticsDDLRecords` gains
+  a decode+apply case for each new record kind, run in WAL order after the
+  existing CREATE/DROP cases so a `CREATE` → `RENAME` → `OWNER` → `SET
+  SCHEMA` sequence replays to the object's final identity.
+- **Found and fixed in the same loop, not a separate slice**: `CREATE`/
+  `DROP STATISTICS` (kinds 95/96, landed loop #96) were missing from
+  `wal.ApplyRecord`'s physical-replay switch entirely — every other
+  logical-only DDL record kind (collation, publication/subscription,
+  conversion, column-defaults, role) has an explicit case in that switch
+  returning `(false, nil)` to opt out of physical redo (the recovery driver
+  in `internal/initdb` applies these directly instead), but statistics'
+  case was never added when 95/96 landed. This had no observed effect on
+  the primary's own crash-recovery gates, because `internal/initdb/open.go`
+  calls `replayStatisticsDDLRecords` directly and never routes through
+  `wal.ApplyRecord` for local startup replay — but `wal.ApplyRecord` **is**
+  the entry point `internal/wal/stream_replayer.go` uses for
+  standby/streaming-replication replay, where a 95/96/97/98/99 record would
+  have hit the switch's `default: return false, fmt.Errorf("unsupported
+  kind %d", ...)` case and aborted replication. Added one combined case
+  (mirroring the `RecordKindCreateCollation, RecordKindDropCollation, ...`
+  case immediately above it in `internal/wal/recovery.go`) covering all
+  five statistics kinds.
+- Tests: `internal/wal/statistics_ddl_test.go` gains encode/decode
+  round-trip + wrong-kind + truncated-payload tests for all three new
+  record kinds (`TestEncodeDecodeAlterStatisticsRenameRoundTrip`/
+  `...OwnerRoundTrip`/`...SetSchemaRoundTrip`/
+  `TestDecodeAlterStatisticsRejectsWrongKind`/
+  `TestDecodeAlterStatisticsRejectsTruncatedPayload`).
+  `internal/initdb/statistics_ddl_recovery_test.go` gains
+  `TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema`: a real
+  `Init`/`Open`/WAL.Append(create+rename+owner+set-schema)/`Close`/re-`Open`
+  round trip confirming the post-restart registry reflects the final
+  renamed/re-owned/moved identity, not the as-created one, and that the
+  original name no longer resolves.
+
+**Nothing deferred by this slice** — both resume points of the original
+slice-441 ledger row (statistics restart durability as a whole) are now
+closed; `ALTER STATISTICS ... SET STATISTICS n` (the sample-target form)
+remains intentionally in-memory-only, matching upstream: PG itself has no
+durable state here beyond the `pg_statistic_ext.stxstattarget` catalog
+column, which goopg has no on-disk heap for (same non-gap already noted for
+slice 317). Gates: `go build ./...`/`go vet ./...` clean; `go test -race
+./internal/wal/... ./internal/mvcc/...` PASS; `internal/wal`+
+`internal/catalog`+`internal/executor`+`internal/initdb`+`internal/parser`
+suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
+pgbench TPC-B smoke PASS.

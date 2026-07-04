@@ -26,6 +26,9 @@ import (
 type statisticsRegistryRecovery interface {
 	RegisterStatisticsDuringRecovery(schema, name string, oid, tableOID, ownerOID uint32, kinds, columns, exprs []string, hasExpr bool)
 	DropStatisticsDuringRecovery(name, schema string)
+	RenameStatisticsObjectDuringRecovery(name, newName string)
+	SetStatisticsOwnerDuringRecovery(name string, ownerOID uint32)
+	SetStatisticsSchemaDuringRecovery(name, newSchema string)
 }
 
 // replayStatisticsDDLRecords reads every WAL record under walDir and applies
@@ -70,6 +73,24 @@ func replayStatisticsDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-statistics at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.DropStatisticsDuringRecovery(name, schema)
+		case wal.RecordKindAlterStatisticsRename:
+			name, newName, derr := wal.DecodeAlterStatisticsRename(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-statistics-rename at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.RenameStatisticsObjectDuringRecovery(name, newName)
+		case wal.RecordKindAlterStatisticsOwner:
+			name, ownerOID, derr := wal.DecodeAlterStatisticsOwner(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-statistics-owner at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetStatisticsOwnerDuringRecovery(name, ownerOID)
+		case wal.RecordKindAlterStatisticsSetSchema:
+			name, newSchema, derr := wal.DecodeAlterStatisticsSetSchema(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-statistics-set-schema at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetStatisticsSchemaDuringRecovery(name, newSchema)
 		}
 	}
 	return nil

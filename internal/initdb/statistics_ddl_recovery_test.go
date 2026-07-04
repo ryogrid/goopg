@@ -112,6 +112,67 @@ func TestStatisticsDDLRecoveryReplaysDropAfterCreate(t *testing.T) {
 	}
 }
 
+// TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema confirms resume
+// point (1) of the slice-441/445 ledger rows: ALTER STATISTICS ...
+// RENAME TO / OWNER TO / SET SCHEMA are now WAL-logged and replayed in order,
+// so the post-restart registry reflects the object's final identity, not its
+// as-created one.
+func TestStatisticsDDLRecoveryReplaysAlterRenameOwnerSetSchema(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOwnerOID = uint32(16384)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateStatistics("mystat", "public", 40970, 16502, 0, nil, []string{"a"}, nil, false)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterStatisticsRename("public.mystat", "mystat_renamed")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append rename: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterStatisticsOwner("public.mystat_renamed", wantOwnerOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append owner: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterStatisticsSetSchema("public.mystat_renamed", "myschema")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append set-schema: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	if _, ok := statisticsCatalog(t, rt2).LookupStatistics("public.mystat"); ok {
+		t.Error("after rename replay, original name \"public.mystat\" still resolves, want gone")
+	}
+	found, ok := statisticsCatalog(t, rt2).LookupStatistics("myschema.mystat_renamed")
+	if !ok {
+		t.Fatalf("after rename+owner+set-schema replay, \"myschema.mystat_renamed\" not found")
+	}
+	if found.Owner != wantOwnerOID {
+		t.Errorf("after owner replay, Owner = %d, want %d", found.Owner, wantOwnerOID)
+	}
+	if found.Schema != "myschema" {
+		t.Errorf("after set-schema replay, Schema = %q, want %q", found.Schema, "myschema")
+	}
+}
+
 // TestReplayStatisticsDDLRecordsHandlesMissingWalDir verifies the recovery
 // hook is idempotent when invoked against a missing pg_wal directory (brand
 // new initdb).

@@ -3149,6 +3149,26 @@ func (c *InMemory) SetStatisticsSchema(name, newSchema string) bool {
 	return true
 }
 
+// RenameStatisticsObjectDuringRecovery is the discard-result recovery
+// counterpart to RenameStatisticsObject, mirroring
+// RenameCollationDuringRecovery. DU-002 restart-persistence follow-up
+// (resume point (1) of the slice-441/445 ledger rows).
+func (c *InMemory) RenameStatisticsObjectDuringRecovery(name, newName string) {
+	c.RenameStatisticsObject(name, newName)
+}
+
+// SetStatisticsOwnerDuringRecovery is the discard-result recovery
+// counterpart to SetStatisticsOwner, mirroring SetCollationOwnerDuringRecovery.
+func (c *InMemory) SetStatisticsOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetStatisticsOwner(name, ownerOID)
+}
+
+// SetStatisticsSchemaDuringRecovery is the discard-result recovery
+// counterpart to SetStatisticsSchema, mirroring SetCollationSchemaDuringRecovery.
+func (c *InMemory) SetStatisticsSchemaDuringRecovery(name, newSchema string) {
+	c.SetStatisticsSchema(name, newSchema)
+}
+
 // AllStatistics returns a snapshot of all registered statistics objects. M0097-0023.
 func (c *InMemory) AllStatistics() []*StatisticsObject {
 	c.mu.RLock()

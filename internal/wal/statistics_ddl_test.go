@@ -104,3 +104,113 @@ func TestDecodeDropStatisticsRejectsTruncatedPayload(t *testing.T) {
 		t.Error("expected error decoding truncated drop-statistics payload, got nil")
 	}
 }
+
+// TestEncodeDecodeAlterStatisticsRenameRoundTrip pins the resume-point-(1)
+// follow-up (slice 441/445 ledger rows): ALTER STATISTICS ... RENAME TO.
+func TestEncodeDecodeAlterStatisticsRenameRoundTrip(t *testing.T) {
+	cases := []struct{ name, newName string }{
+		{"public.s1", "s1_renamed"},
+		{"s2", "s2_new"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterStatisticsRename(c.name, c.newName)
+		if raw[0] != RecordKindAlterStatisticsRename {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterStatisticsRename)
+		}
+		gotName, gotNewName, err := DecodeAlterStatisticsRename(raw)
+		if err != nil {
+			t.Fatalf("%q: Decode: %v", c.name, err)
+		}
+		if gotName != c.name || gotNewName != c.newName {
+			t.Errorf("%q: got (name=%q newName=%q)", c.name, gotName, gotNewName)
+		}
+	}
+}
+
+// TestEncodeDecodeAlterStatisticsOwnerRoundTrip is the OWNER TO counterpart.
+func TestEncodeDecodeAlterStatisticsOwnerRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		ownerOID uint32
+	}{
+		{"public.s1", 16384},
+		{"s2", 10},
+		{"", 0},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterStatisticsOwner(c.name, c.ownerOID)
+		if raw[0] != RecordKindAlterStatisticsOwner {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterStatisticsOwner)
+		}
+		gotName, gotOwnerOID, err := DecodeAlterStatisticsOwner(raw)
+		if err != nil {
+			t.Fatalf("%q: Decode: %v", c.name, err)
+		}
+		if gotName != c.name || gotOwnerOID != c.ownerOID {
+			t.Errorf("%q: got (name=%q ownerOID=%d)", c.name, gotName, gotOwnerOID)
+		}
+	}
+}
+
+// TestEncodeDecodeAlterStatisticsSetSchemaRoundTrip is the SET SCHEMA
+// counterpart.
+func TestEncodeDecodeAlterStatisticsSetSchemaRoundTrip(t *testing.T) {
+	cases := []struct{ name, newSchema string }{
+		{"public.s1", "myschema"},
+		{"s2", "public"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterStatisticsSetSchema(c.name, c.newSchema)
+		if raw[0] != RecordKindAlterStatisticsSetSchema {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterStatisticsSetSchema)
+		}
+		gotName, gotNewSchema, err := DecodeAlterStatisticsSetSchema(raw)
+		if err != nil {
+			t.Fatalf("%q: Decode: %v", c.name, err)
+		}
+		if gotName != c.name || gotNewSchema != c.newSchema {
+			t.Errorf("%q: got (name=%q newSchema=%q)", c.name, gotName, gotNewSchema)
+		}
+	}
+}
+
+// TestDecodeAlterStatisticsRejectsWrongKind confirms each new decoder
+// surfaces an error rather than silently misinterpreting a
+// differently-kinded payload.
+func TestDecodeAlterStatisticsRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropStatistics("s", "public")
+	if _, _, err := DecodeAlterStatisticsRename(bogus); err == nil {
+		t.Error("DecodeAlterStatisticsRename: expected error decoding drop-statistics payload, got nil")
+	}
+	if _, _, err := DecodeAlterStatisticsOwner(bogus); err == nil {
+		t.Error("DecodeAlterStatisticsOwner: expected error decoding drop-statistics payload, got nil")
+	}
+	if _, _, err := DecodeAlterStatisticsSetSchema(bogus); err == nil {
+		t.Error("DecodeAlterStatisticsSetSchema: expected error decoding drop-statistics payload, got nil")
+	}
+}
+
+// TestDecodeAlterStatisticsRejectsTruncatedPayload guards against silently
+// reading past the end of a truncated payload for each new decoder.
+func TestDecodeAlterStatisticsRejectsTruncatedPayload(t *testing.T) {
+	renameFull := EncodeAlterStatisticsRename("public.s1", "s1_new")
+	for _, n := range []int{0, 1, 4, len(renameFull) - 1} {
+		if _, _, err := DecodeAlterStatisticsRename(renameFull[:n]); err == nil {
+			t.Errorf("rename truncated to %d bytes: expected error, got nil", n)
+		}
+	}
+	ownerFull := EncodeAlterStatisticsOwner("public.s1", 16384)
+	for _, n := range []int{0, 1, 6, len(ownerFull) - 1} {
+		if _, _, err := DecodeAlterStatisticsOwner(ownerFull[:n]); err == nil {
+			t.Errorf("owner truncated to %d bytes: expected error, got nil", n)
+		}
+	}
+	setSchemaFull := EncodeAlterStatisticsSetSchema("public.s1", "myschema")
+	for _, n := range []int{0, 1, 4, len(setSchemaFull) - 1} {
+		if _, _, err := DecodeAlterStatisticsSetSchema(setSchemaFull[:n]); err == nil {
+			t.Errorf("set-schema truncated to %d bytes: expected error, got nil", n)
+		}
+	}
+}
