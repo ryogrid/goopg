@@ -34,7 +34,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/storage"
@@ -89,12 +88,18 @@ var pgAuthidPredefined = []struct {
 
 // decodedAuthidRow is one pg_authid heap row read back from global/1260.
 type DecodedAuthidRow struct {
-	OID       uint32
-	Rolname   string
-	Super     bool
-	CanLogin  bool
-	Password  string // "" when NULL/empty
-	HasPasswd bool
+	OID         uint32
+	Rolname     string
+	Super       bool
+	CanLogin    bool
+	CreateDB    bool
+	CreateRole  bool
+	Replication bool
+	BypassRLS   bool
+	ConnLimit   int32
+	Password    string // "" when NULL/empty
+	HasPasswd   bool
+	ValidUntil  string // "" when NULL (no expiration)
 }
 
 // readPgAuthidRows decodes every live tuple in global/1260. A missing file
@@ -130,14 +135,25 @@ func ReadPgAuthidRows(dataDir string) ([]DecodedAuthidRow, error) {
 				continue
 			}
 			d := DecodedAuthidRow{
-				OID:      uint32(row[0].Int),
-				Rolname:  row[1].StringValue(),
-				Super:    row[2].BoolValue(),
-				CanLogin: row[6].BoolValue(),
+				OID:         uint32(row[0].Int),
+				Rolname:     row[1].StringValue(),
+				Super:       row[2].BoolValue(),
+				CreateRole:  row[4].BoolValue(),
+				CreateDB:    row[5].BoolValue(),
+				CanLogin:    row[6].BoolValue(),
+				Replication: row[7].BoolValue(),
+				BypassRLS:   row[8].BoolValue(),
+				ConnLimit:   -1,
+			}
+			if !row[9].IsNull() {
+				d.ConnLimit = int32(row[9].Int)
 			}
 			if !row[10].IsNull() {
 				d.Password = row[10].StringValue()
 				d.HasPasswd = d.Password != ""
+			}
+			if !row[11].IsNull() {
+				d.ValidUntil = row[11].StringValue()
 			}
 			if d.Rolname == "" {
 				continue
@@ -149,21 +165,26 @@ func ReadPgAuthidRows(dataDir string) ([]DecodedAuthidRow, error) {
 }
 
 // buildAuthidUserRow builds a bootstrap-shaped (non-null, xmin=1) pg_authid
-// row for a runtime role. Mirrors buildBootstrapRow in initdb.go.
-func buildAuthidUserRow(oid int64, rolname string, super, canLogin bool, rolpassword string) Row {
+// row for a runtime role. Mirrors buildBootstrapRow in initdb.go. rolvaliduntil
+// is always NULL: goopg's role-DDL attribute set doesn't round-trip a real
+// timestamptz value through this heap file yet (VALID UNTIL is tracked in
+// the live RoleAttrs sidecar + WAL crash-tail only — see the deferral
+// ledger), so persisting anything other than NULL here would be worse than
+// the honest gap.
+func buildAuthidUserRow(oid int64, rolname string, super, canLogin, createDB, createRole, replication, bypassRLS bool, connLimit int32, rolpassword string) Row {
 	return Row{
 		NewIntDatum(oid),
 		NewStringDatum(rolname),
 		NewBoolDatum(super),
 		NewBoolDatum(true), // rolinherit — PG default
-		NewBoolDatum(false),
-		NewBoolDatum(false),
+		NewBoolDatum(createRole),
+		NewBoolDatum(createDB),
 		NewBoolDatum(canLogin),
-		NewBoolDatum(false),
-		NewBoolDatum(false),
-		NewIntDatum(-1),
+		NewBoolDatum(replication),
+		NewBoolDatum(bypassRLS),
+		NewIntDatum(int64(connLimit)),
 		NewStringDatum(rolpassword),
-		NewTimeDatum(time.Unix(0, 0).UTC()),
+		NullDatum,
 	}
 }
 
@@ -202,21 +223,33 @@ func SyncPgAuthidFile(dataDir string, cat *catalog.InMemory) error {
 		row    Row
 		frozen bool // predefined rows: null bitmap + frozen xmin
 	}
-	tuples := []encTuple{{row: buildAuthidUserRow(10, superName, true, true, superVerifier)}}
+	// Bootstrap superuser defaults (pg_authid.dat OID 10: every non-super
+	// attribute is 't', rolconnlimit -1) unless a live ALTER ROLE postgres
+	// sidecar entry overrides them.
+	superCreateDB, superCreateRole, superReplication, superBypassRLS := true, true, true, true
+	superConnLimit := int32(-1)
+	if a, ok := cat.LookupRoleAttrs("postgres"); ok {
+		superCreateDB, superCreateRole = a.CreateDB, a.CreateRole
+		superReplication, superBypassRLS = a.Replication, a.BypassRLS
+		superConnLimit = a.ConnLimit
+	}
+	tuples := []encTuple{{row: buildAuthidUserRow(10, superName, true, true,
+		superCreateDB, superCreateRole, superReplication, superBypassRLS, superConnLimit, superVerifier)}}
 	for _, rs := range cat.AllRoleStates() {
 		secret := ""
 		if rs.Attrs.CredType != 0 {
 			secret = rs.Attrs.Secret
 		}
 		tuples = append(tuples, encTuple{
-			row: buildAuthidUserRow(int64(rs.OID), rs.Name, rs.Attrs.Superuser, rs.Attrs.CanLogin, secret),
+			row: buildAuthidUserRow(int64(rs.OID), rs.Name, rs.Attrs.Superuser, rs.Attrs.CanLogin,
+				rs.Attrs.CreateDB, rs.Attrs.CreateRole, rs.Attrs.Replication, rs.Attrs.BypassRLS,
+				rs.Attrs.ConnLimit, secret),
 		})
 	}
 	for _, p := range pgAuthidPredefined {
-		row := buildAuthidUserRow(p.oid, p.name, false, false, "")
+		row := buildAuthidUserRow(p.oid, p.name, false, false, false, false, false, false, -1, "")
 		row[3] = NewBoolDatum(true) // rolinherit
 		row[10] = NullDatum         // rolpassword NULL
-		row[11] = NullDatum         // rolvaliduntil NULL
 		tuples = append(tuples, encTuple{row: row, frozen: true})
 	}
 

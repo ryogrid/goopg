@@ -70,10 +70,16 @@ func replayRoleDDLRecords(walDir string, cat catalog.Catalog) error {
 				im.RegisterRole(p.Name)
 			}
 			im.SetRoleAttrs(p.Name, catalog.RoleAttrs{
-				CanLogin:  p.CanLogin,
-				Superuser: p.Superuser,
-				CredType:  p.CredType,
-				Secret:    p.Secret,
+				CanLogin:    p.CanLogin,
+				Superuser:   p.Superuser,
+				CreateDB:    p.CreateDB,
+				CreateRole:  p.CreateRole,
+				Replication: p.Replication,
+				BypassRLS:   p.BypassRLS,
+				ConnLimit:   p.ConnLimit,
+				ValidUntil:  p.ValidUntil,
+				CredType:    p.CredType,
+				Secret:      p.Secret,
 			})
 		case wal.RecordKindDropRole:
 			name, derr := wal.DecodeDropRole(rec.Payload)

@@ -6155,11 +6155,13 @@ func (c *InMemory) registerSystemTables() {
 	// from the same live c.roles/c.roleAttrs state as pg_roles, not the
 	// on-disk global/1260 heap file: that file (pg_authid_sync.go) is a
 	// separate crash-recovery mirror for auth credentials, not a live SQL
-	// read path. Attributes goopg's role DDL never actually sets
-	// (rolinherit/rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
-	// rolconnlimit/rolvaliduntil) report PG's CREATE ROLE defaults, since
-	// nothing can diverge them from those defaults today (see deferral
-	// ledger).
+	// read path. rolinherit is never modelled (goopg's role DDL has no
+	// per-role NOINHERIT tracking) and always reports PG's CREATE ROLE
+	// default 't'. rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
+	// rolconnlimit/rolvaliduntil now reflect the RoleAttrs sidecar (DU-002
+	// slice 439 follow-up); a role with no sidecar entry (predefined pg_*
+	// roles, unregistered names) falls back to PG's own CREATE ROLE
+	// defaults.
 	pgAuthid := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_authid",
@@ -6183,7 +6185,10 @@ func (c *InMemory) registerSystemTables() {
 	pgAuthid.VirtualRows = func() [][]string {
 		rowFor := func(oidStr, name string, a *RoleAttrs) []string {
 			rolsuper, rolcanlogin := "f", "t"
+			rolcreaterole, rolcreatedb, rolreplication, rolbypassrls := "f", "f", "f", "f"
+			rolconnlimit := "-1"
 			rolpassword := VirtualNull
+			rolvaliduntil := VirtualNull
 			if a != nil {
 				if a.Superuser {
 					rolsuper = "t"
@@ -6191,21 +6196,31 @@ func (c *InMemory) registerSystemTables() {
 				if !a.CanLogin {
 					rolcanlogin = "f"
 				}
+				if a.CreateRole {
+					rolcreaterole = "t"
+				}
+				if a.CreateDB {
+					rolcreatedb = "t"
+				}
+				if a.Replication {
+					rolreplication = "t"
+				}
+				if a.BypassRLS {
+					rolbypassrls = "t"
+				}
+				rolconnlimit = fmt.Sprintf("%d", a.ConnLimit)
 				if a.CredType != 0 {
 					rolpassword = a.Secret
+				}
+				if a.ValidUntil != "" {
+					rolvaliduntil = a.ValidUntil
 				}
 			}
 			return []string{
 				oidStr, name, rolsuper,
 				"t", // rolinherit: PG default, never overridden by goopg's role DDL
-				"f", // rolcreaterole: not modelled
-				"f", // rolcreatedb: not modelled
-				rolcanlogin,
-				"f", // rolreplication: not modelled
-				"f", // rolbypassrls: not modelled
-				"-1", // rolconnlimit: PG default (no limit), not modelled
-				rolpassword,
-				VirtualNull, // rolvaliduntil: not modelled
+				rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls,
+				rolconnlimit, rolpassword, rolvaliduntil,
 			}
 		}
 		c.mu.RLock()
@@ -6221,16 +6236,17 @@ func (c *InMemory) registerSystemTables() {
 		}
 		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat), same
 		// gap/rationale as pg_roles above (0119-0004ch ledger discovery (a)):
-		// a zero-value RoleAttrs{} drives rowFor's defaults to exactly PG's
-		// predefined-role shape (rolsuper/rolcanlogin='f', rolpassword NULL),
-		// matching SyncPgAuthidFile's frozen rows.
+		// this RoleAttrs{ConnLimit: -1} drives rowFor's defaults to exactly
+		// PG's predefined-role shape (rolsuper/rolcanlogin='f', rolpassword
+		// NULL, rolconnlimit=-1), matching SyncPgAuthidFile's frozen rows and
+		// pg_authid.dat (every seeded role's rolconnlimit is -1, never 0).
 		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
 		for _, s := range predefinedRoleSeeds {
 			predefinedNames = append(predefinedNames, s.name)
 		}
 		sort.Strings(predefinedNames)
 		for _, name := range predefinedNames {
-			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{}))
+			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{ConnLimit: -1}))
 		}
 		return out
 	}
@@ -11514,11 +11530,29 @@ func (c *InMemory) RegisterRole(name string) {
 // the RecordKindRoleState WAL encoding (0=none, 1=plaintext, 2=md5,
 // 3=scram-sha-256); Secret is the stored verifier in the same shape as
 // pg_authid.rolpassword (SCRAM-SHA-256$… by default). root-0021.
+//
+// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit/ValidUntil mirror the
+// remaining CREATE/ALTER ROLE attribute-clause options (postgres/src/backend/
+// commands/user.c CreateRole's opt_* booleans) that were previously
+// accept-and-ignore (DU-002 slice 439 follow-up). ConnLimit's PG default is
+// -1 ("no limit", pg_authid.dat's rolconnlimit for every seeded role) — the
+// Go zero value 0 is a DIFFERENT, valid PG setting ("no new connections"), so
+// every RoleAttrs constructed as the "no attributes given yet" starting
+// point (as opposed to a real all-zero snapshot) MUST set ConnLimit: -1
+// explicitly; see tryHandleRoleDDL's two construction sites. ValidUntil is
+// the raw `VALID UNTIL '<literal>'` text (empty = NULL/no expiration, PG's
+// default); goopg does not evaluate it (no password-expiry enforcement).
 type RoleAttrs struct {
-	CanLogin  bool
-	Superuser bool
-	CredType  byte
-	Secret    string
+	CanLogin    bool
+	Superuser   bool
+	CreateDB    bool
+	CreateRole  bool
+	Replication bool
+	BypassRLS   bool
+	ConnLimit   int32
+	ValidUntil  string
+	CredType    byte
+	Secret      string
 }
 
 // RegisterRoleWithOID registers a role preserving a known OID — used by the

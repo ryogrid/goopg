@@ -150,9 +150,31 @@ TO` ... now reject an unknown role (loop #107)" section; ledger row
 appended (DU-002 slice 439 resume point (2) now fully closed on both its
 resume points). Gates: build/vet clean; `internal/executor` suite PASS
 (incl. `-race`); `internal/server` suite PASS; `scripts/tpch-spotcheck.sh`
-PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** continue
-the M0119-0004 pg_dump catalog-view parity battery, or pick the next
-unresolved DU-002 slice from the deferral ledger.
+PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **This loop (2026-07-04,
+#108) closed triage item 1 from loop #107's shortlist:** CREATE/ALTER ROLE
+attributes beyond LOGIN/PASSWORD/SUPERUSER (CREATEDB/CREATEROLE/REPLICATION/
+BYPASSRLS/CONNECTION LIMIT/VALID UNTIL) were accept-and-ignore
+(`internal/server/role_ddl.go` `applyRoleAttrOptions` + `catalog.RoleAttrs`,
+only had CanLogin/Superuser/CredType/Secret) — now fully parsed and threaded
+through `RoleAttrs`, the WAL crash-tail (`wal.RoleStatePayload`), the
+pg_authid heap file (`executor.SyncPgAuthidFile`/`ReadPgAuthidRows`/
+`initdb.LoadRolesFromAuthidHeap`, all but `ValidUntil` — see below), and the
+live `pg_authid` `VirtualRows` pg_dump/pg_dumpall actually query (previously
+hardcoded `f`/`f`/`f`/`f`/`-1`/NULL regardless of what was granted). New
+`internal/server/role_ddl_attrs_test.go` (CREATE/ALTER parse + pg_authid
+VirtualRows); `internal/wal/role_ddl_test.go` and
+`internal/initdb/role_ddl_recovery_test.go`'s `TestPgAuthidSyncLoadRoundTrip`
+extended for the new fields. Deferred: `VALID UNTIL` does not round-trip
+through the pg_authid heap file (stays WAL-tail + live-sidecar only) — needs
+a PG-timestamp-literal parser, out of scope; ledger row appended. Design doc
+`root-0021-role-auth-persistence.md` new "Follow-up" section;
+`docs/design/README.md`'s root-0021 row updated. Gates: `go build ./...`
+clean; `go vet` clean on touched packages; `internal/server`/`internal/
+catalog`/`internal/initdb`/`internal/executor` suites PASS; `go test -race
+./internal/wal/...` PASS. **Next up:** continue the M0119-0004 pg_dump
+catalog-view parity battery, item 2 from loop #107's shortlist (view `WITH
+CHECK OPTION` never enforced at runtime), or pick the next unresolved DU-002
+slice from the deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

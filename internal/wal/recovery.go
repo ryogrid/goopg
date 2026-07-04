@@ -1323,13 +1323,22 @@ func DecodeSequenceState(payload []byte) (SequenceStatePayload, error) {
 // RoleStatePayload is the decoded form of a RecordKindRoleState record: one
 // role's name, OID, attribute flags, and stored credential. See the
 // RecordKindRoleState constant for the on-disk format and emit policy.
+//
+// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit/ValidUntil mirror
+// catalog.RoleAttrs' identically-named fields (DU-002 slice 439 follow-up).
 type RoleStatePayload struct {
-	Name      string
-	OID       uint32 // registry OID — kept stable across restarts
-	CanLogin  bool
-	Superuser bool
-	CredType  byte   // 0=none, 1=plaintext, 2=md5, 3=scram-sha-256
-	Secret    string // stored verifier (or plaintext for CredType 1)
+	Name        string
+	OID         uint32 // registry OID — kept stable across restarts
+	CanLogin    bool
+	Superuser   bool
+	CreateDB    bool
+	CreateRole  bool
+	Replication bool
+	BypassRLS   bool
+	ConnLimit   int32
+	ValidUntil  string
+	CredType    byte   // 0=none, 1=plaintext, 2=md5, 3=scram-sha-256
+	Secret      string // stored verifier (or plaintext for CredType 1)
 }
 
 // EncodeRoleState encodes a RecordKindRoleState record.
@@ -1343,11 +1352,26 @@ func EncodeRoleState(p RoleStatePayload) []byte {
 	if p.Superuser {
 		flags |= 1 << 1
 	}
+	if p.CreateDB {
+		flags |= 1 << 2
+	}
+	if p.CreateRole {
+		flags |= 1 << 3
+	}
+	if p.Replication {
+		flags |= 1 << 4
+	}
+	if p.BypassRLS {
+		flags |= 1 << 5
+	}
 	buf.WriteByte(flags)
 	buf.WriteByte(p.CredType)
 	var oid [4]byte
 	binary.LittleEndian.PutUint32(oid[:], p.OID)
 	buf.Write(oid[:])
+	var connLimit [4]byte
+	binary.LittleEndian.PutUint32(connLimit[:], uint32(p.ConnLimit))
+	buf.Write(connLimit[:])
 	writeStr16 := func(s string) {
 		if len(s) > 0xFFFF {
 			s = s[:0xFFFF]
@@ -1359,13 +1383,14 @@ func EncodeRoleState(p RoleStatePayload) []byte {
 	}
 	writeStr16(p.Name)
 	writeStr16(p.Secret)
+	writeStr16(p.ValidUntil)
 	return buf.Bytes()
 }
 
 // DecodeRoleState decodes a RecordKindRoleState payload.
 func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
 	var p RoleStatePayload
-	if len(payload) < 7 {
+	if len(payload) < 11 {
 		return p, fmt.Errorf("wal: role-state payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindRoleState {
@@ -1374,9 +1399,14 @@ func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
 	flags := payload[1]
 	p.CanLogin = flags&(1<<0) != 0
 	p.Superuser = flags&(1<<1) != 0
+	p.CreateDB = flags&(1<<2) != 0
+	p.CreateRole = flags&(1<<3) != 0
+	p.Replication = flags&(1<<4) != 0
+	p.BypassRLS = flags&(1<<5) != 0
 	p.CredType = payload[2]
 	p.OID = binary.LittleEndian.Uint32(payload[3:7])
-	off := 7
+	p.ConnLimit = int32(binary.LittleEndian.Uint32(payload[7:11]))
+	off := 11
 	readStr16 := func() (string, error) {
 		if len(payload) < off+2 {
 			return "", fmt.Errorf("wal: role-state payload truncated at offset %d", off)
@@ -1395,6 +1425,9 @@ func DecodeRoleState(payload []byte) (RoleStatePayload, error) {
 		return p, err
 	}
 	if p.Secret, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.ValidUntil, err = readStr16(); err != nil {
 		return p, err
 	}
 	return p, nil
