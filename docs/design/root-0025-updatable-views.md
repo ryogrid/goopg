@@ -396,6 +396,64 @@ Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`
 `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
 `scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
 
+## Follow-up: CHECK OPTION on partition/inheritance-child-routed rows (closes deferred item 5)
+
+Both remaining `WITH CHECK OPTION` enforcement call sites gated the check to
+the base/parent table's own rows: `updateScanTables`'s per-row callback
+(`internal/executor/operators_storage.go`, the plain FROM-free `UPDATE` path)
+required `scanTbl == tbl`, and `updateWithFrom`'s FROM cross-product branch
+required `fst.tbl == o.plan.Table`. Both gates were unnecessarily
+conservative — in both functions a `parentNewRow` (or, for the FROM-free
+path's non-inheritance-child branch, `newRow` itself) is already computed in
+the *base table's own column ordinal space* before either gate is checked:
+
+- **True inheritance children** (`isInheritChild` / `fst.colMap != nil`):
+  `parentNewRow`/`tgtRow` is explicitly built by evaluating `SET` in parent
+  column space and only remapped to the child's (possibly reordered) layout
+  afterward, via `buildInheritColMap`/`remapChildRowToParent`/
+  `remapParentRowToChild` — the exact translation the old comments said was
+  missing was, in fact, already sitting one variable away.
+- **Partition children**: PostgreSQL requires a partition's columns to
+  exactly mirror the partitioned table's layout (`ALTER TABLE` on a partition
+  directly cannot add/drop/reorder columns independently of the parent — only
+  plain multiple-inheritance children can do that), so a partition-routed
+  row's `newRow` is already in the parent's ordinal space with no remap
+  needed at all.
+
+Fixed by lifting `parentNewRow` to always be populated (in
+`updateScanTables`'s per-row callback, the non-`isInheritChild` branch now
+sets `parentNewRow = newRow` since the ordinals already match) and checking
+it unconditionally in both functions — CHECK OPTION now enforces on the
+parent's own rows, partition-child rows, and inheritance-child rows alike.
+
+New test `TestViewCheckOptionEnforcedOnPartitionAndInheritanceChildRows`
+(`internal/executor/view_dml_test.go`) covers a partition-routed row via a
+plain `UPDATE` and via `UPDATE ... FROM`, and an inheritance-child row via a
+plain `UPDATE` — each confirms the rejected write leaves the child-routed row
+untouched and a subsequent in-qual `UPDATE` still succeeds. (The
+inheritance-child case deliberately avoids a bare `WHERE <pk> = ...`, which
+would route through `updateViaIndex` instead — see the new discovery below.)
+
+**New discovery, not fixed, project-wide and independent of views:**
+`updateViaIndex` (`internal/executor/operators_storage.go`) only scans the
+exact target table's own B-tree index — it has no partition/inheritance-child
+fan-out at all, unlike `updateScanTables`/`updateWithFrom`. So `UPDATE parent
+SET ... WHERE indexed_col = X` (no `ONLY`), whenever the planner's
+`planIndexScanFromWhere` finds a usable index on `parent` itself, silently
+skips any matching row that lives only in an inheritance child's own storage
+— not just a CHECK OPTION gap, the actual write never happens. This is
+orthogonal to the CHECK OPTION fix above: it reproduces for *any* UPDATE
+(view or not) with an index-eligible WHERE clause over an inheritance
+hierarchy, and is unaffected by partitioning (a partitioned parent has no
+per-parent index of its own, so `planIndexScanFromWhere` never matches it,
+always falling through to `updateScanTables`, which DOES fan out — this is
+why the partition case in the new test above needed no such caveat while the
+inheritance case did). See the deferral ledger for the resume point.
+
+Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`;
+`go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
+`scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
+
 ## Deferred
 
 See `.ralph/deferral_ledger.md` for the formal entry. Summary:
@@ -420,14 +478,21 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    "Follow-up" note above): `updateViaIndex` now evaluates `o.pred` on its
    initial scan, not just the EPQ recheck; the `planUpdate` workaround that
    skipped the index path for view-target UPDATEs is removed.
-5. **CHECK OPTION on partition/inheritance-child-routed rows.** The runtime
-   check is skipped for rows reached via `updateScanTables`'s partition/
-   inheritance-child branch (their `captureCols` can be reordered relative
-   to the base table `ViewCheckQual` was resolved against) — a CHECK OPTION
-   view over a partitioned/inherited base table only enforces on the
-   parent's own rows.
+5. ~~**CHECK OPTION on partition/inheritance-child-routed rows.**~~ —
+   **RESOLVED** (see the "Follow-up: CHECK OPTION on partition/
+   inheritance-child-routed rows" note above): both `updateScanTables` and
+   `updateWithFrom` now check `parentNewRow`, always in the base table's
+   column ordinal space regardless of which child the row was routed
+   through.
 6. **Restart persistence.** Unaffected by this change — the pre-existing
    in-memory-only view/catalog limitation (`0003-0009-views.md`).
+7. **`updateViaIndex` has no partition/inheritance-child fan-out at all
+   (new discovery, project-wide, not view-specific).** See the "New
+   discovery" note above and the matching deferral ledger row — a
+   project-wide gap, out of scope for a view-focused loop to fix at its
+   root, root-0025 itself is otherwise fully closed by item 5's resolution
+   plus items 1-4 above (only the narrow `ON CONFLICT`-against-renamed-view
+   residual from item 1 remains open within this milestone's own scope).
 
 ## Cross-references
 

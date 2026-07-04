@@ -663,3 +663,96 @@ func TestUpdatableViewUpdateFromDeleteUsing(t *testing.T) {
 		t.Fatalf("DELETE aggregate view USING: err=%v, want *planner.PlanError 55000", perr)
 	}
 }
+
+// TestViewCheckOptionEnforcedOnPartitionAndInheritanceChildRows closes
+// root-0025 deferred item 5. A plain (FROM-free) or FROM/USING UPDATE
+// against the parent of a partitioned or plain-inherited table also scans
+// the children (updateScanTables' partition/inheritance branch,
+// updateWithFrom's fromScanTargets) — those rows were previously invisible
+// to WITH CHECK OPTION entirely: the enforcement call was gated to
+// `scanTbl == tbl` / `fst.tbl == o.plan.Table`, so a CHECK OPTION view over
+// a partitioned or inherited base table let an UPDATE silently push a
+// child-routed row outside the view's own qual. Both `updateScanTables`
+// (operators_storage.go, the SeqScan per-row callback) and `updateWithFrom`
+// now check against `parentNewRow` (already in the base table's column
+// ordinal space for every child shape — remapped via
+// buildInheritColMap/remapChildRowToParent for true inheritance children;
+// identical layout by construction for partition children) unconditionally.
+func TestViewCheckOptionEnforcedOnPartitionAndInheritanceChildRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	// --- Partition-routed row, plain UPDATE (FROM-free). ---
+	must("CREATE TABLE pcp1 (id int primary key, val int) PARTITION BY RANGE (val)")
+	must("CREATE TABLE pcp1_lo PARTITION OF pcp1 FOR VALUES FROM (0) TO (100)")
+	must("INSERT INTO pcp1 VALUES (1, 20)") // routes to pcp1_lo
+	must("CREATE VIEW vpcp1 AS SELECT id, val FROM pcp1 WHERE val > 15 WITH CHECK OPTION")
+
+	err := runDDL(t, ctx, "UPDATE vpcp1 SET val = 1 WHERE id = 1")
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("UPDATE partition-routed row violating CHECK OPTION: err=%v, want ExecError 44000", err)
+	}
+	rows := runQueryRows(t, ctx, "SELECT val FROM pcp1 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "20" {
+		t.Fatalf("rejected UPDATE must leave the partition-routed row unchanged, got %v", rows)
+	}
+	must("UPDATE vpcp1 SET val = 21 WHERE id = 1")
+	rows = runQueryRows(t, ctx, "SELECT val FROM pcp1 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "21" {
+		t.Fatalf("valid UPDATE through CHECK OPTION view on a partitioned base: got %v", rows)
+	}
+
+	// --- Inheritance-child row, plain UPDATE (FROM-free). ---
+	must("CREATE TABLE pcp2 (id int primary key, val int)")
+	must("CREATE TABLE pcp2_child (extra text) INHERITS (pcp2)")
+	must("INSERT INTO pcp2_child (id, val, extra) VALUES (1, 20, 'x')")
+	must("CREATE VIEW vpcp2 AS SELECT id, val FROM pcp2 WHERE val > 15 WITH CHECK OPTION")
+
+	// No WHERE clause (relying solely on the view's own `val > 15` qual):
+	// `WHERE id = 1` would hit the PK-equality index path (updateViaIndex),
+	// which only scans the exact target table and never reaches
+	// updateScanTables' inheritance-child branch at all — a separate,
+	// pre-existing limitation (index-based UPDATE doesn't fan out to
+	// inheritance children) outside item 5's scope. This test targets the
+	// SeqScan+Filter path (newUpdateOp/updateScanTables) that item 5 fixes.
+	err = runDDL(t, ctx, "UPDATE vpcp2 SET val = 1")
+	ee, ok = err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("UPDATE inheritance-child row violating CHECK OPTION: err=%v, want ExecError 44000", err)
+	}
+	rows = runQueryRows(t, ctx, "SELECT val FROM pcp2_child WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "20" {
+		t.Fatalf("rejected UPDATE must leave the inheritance-child row unchanged, got %v", rows)
+	}
+	must("UPDATE vpcp2 SET val = 21")
+	rows = runQueryRows(t, ctx, "SELECT val FROM pcp2_child WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "21" {
+		t.Fatalf("valid UPDATE through CHECK OPTION view on an inherited base: got %v", rows)
+	}
+
+	// --- Partition-routed row, UPDATE ... FROM. ---
+	must("CREATE TABLE pcp3 (id int primary key, val int) PARTITION BY RANGE (val)")
+	must("CREATE TABLE pcp3_lo PARTITION OF pcp3 FOR VALUES FROM (0) TO (100)")
+	must("INSERT INTO pcp3 VALUES (1, 20)")
+	must("CREATE VIEW vpcp3 AS SELECT id, val FROM pcp3 WHERE val > 15 WITH CHECK OPTION")
+	must("CREATE TABLE pcp3_src (id int primary key, newval int)")
+	must("INSERT INTO pcp3_src VALUES (1, 1)")
+
+	err = runDDL(t, ctx, "UPDATE vpcp3 SET val = pcp3_src.newval FROM pcp3_src WHERE vpcp3.id = pcp3_src.id")
+	ee, ok = err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("UPDATE...FROM partition-routed row violating CHECK OPTION: err=%v, want ExecError 44000", err)
+	}
+	rows = runQueryRows(t, ctx, "SELECT val FROM pcp3 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "20" {
+		t.Fatalf("rejected UPDATE...FROM must leave the partition-routed row unchanged, got %v", rows)
+	}
+}

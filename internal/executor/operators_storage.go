@@ -4159,10 +4159,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 				}
 			}
-			var newRow Row
+			var newRow, parentNewRow Row
 			if isInheritChild {
 				// Evaluate SET exprs in parent column space, then map back to child.
-				parentNewRow := make(Row, len(cols))
+				parentNewRow = make(Row, len(cols))
 				for pi := range cols {
 					if pi < len(o.plan.Set) && o.plan.Set[pi] != nil {
 						v, err := evalExpr(o.plan.Set[pi], evalRow, o.ctx)
@@ -4192,19 +4192,22 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						}
 					}
 				}
+				// scanTbl==tbl or a partition child: PG requires a partition's
+				// columns to exactly mirror the partitioned table's layout (only
+				// traditional multiple-inheritance children can add/reorder
+				// columns), so newRow is already in the base table's ordinal
+				// space — no remap needed.
+				parentNewRow = newRow
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
 
-			// WITH CHECK OPTION enforcement: only the base/parent table's own
-			// rows are checked — ViewCheckQual was resolved against the base
-			// table's column layout, and a partition/inheritance child's
-			// captureCols can be reordered relative to it (M0096-0013), so
-			// checking those rows against it would compare the wrong columns.
-			// A CHECK OPTION view over a partitioned/inherited base table not
-			// enforcing on child-routed rows is a documented limitation.
-			// M0119-0004 slice-365 follow-up.
-			if o.plan.ViewCheckQual != nil && scanTbl == tbl {
-				if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, newRow); err != nil {
+			// WITH CHECK OPTION enforcement, checked against parentNewRow (the
+			// base table's own column ordinal space that ViewCheckQual was
+			// resolved against) so it applies uniformly to the parent's own
+			// rows, partition-child rows, and inheritance-child rows alike.
+			// M0119-0004 slice-365 / root-0025 deferred item 5.
+			if o.plan.ViewCheckQual != nil {
+				if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, parentNewRow); err != nil {
 					return err
 				}
 			}
@@ -5501,11 +5504,14 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						}
 					}
 					_ = computeGeneratedColumns(writeCols, actualNewRow)
-					// WITH CHECK OPTION enforcement — same rationale/restriction as
-					// the plain SeqScan path (line ~4206): only the base table's own
-					// rows are checked, not a partition/inheritance child's (those
-					// stay a documented limitation, root-0025 deferred items 4/5).
-					if o.plan.ViewCheckQual != nil && fst.tbl == o.plan.Table {
+					// WITH CHECK OPTION enforcement: parentNewRow is always in the
+					// base table's own column ordinal space regardless of fst
+					// (tgtRow was remapped from child to parent ordinals above for
+					// inheritance children; partition children and the base table
+					// itself already share that layout), so the check applies
+					// uniformly to parent, partition-child, and inheritance-child
+					// rows alike. root-0025 deferred item 5 closed.
+					if o.plan.ViewCheckQual != nil {
 						if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, parentNewRow); err != nil {
 							return err
 						}

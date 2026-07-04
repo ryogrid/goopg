@@ -250,11 +250,41 @@ renamed-view residual (item 1's "Known residual") — everything else in the
 milestone is closed.** Gates: `go build ./...` clean; `go vet` clean on
 touched packages; `go test ./internal/planner/... ./internal/executor/...
 ./internal/catalog/... ./internal/parser/... ./internal/server/...` PASS;
-`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook. **Next
-up:** CHECK OPTION on partition/inheritance-child-routed rows (item 5), the
-`ON CONFLICT`-against-renamed-view residual, or continue the M0119-0004
-pg_dump catalog-view parity battery / next unresolved DU-002 slice from the
-deferral ledger.
+`scripts/tpch-spotcheck.sh` PASS; pgbench smoke = pre-commit hook. **This
+loop (2026-07-04) closed root-0025 deferred item 5:** `updateScanTables`'s
+per-row callback (FROM-free UPDATE path) and `updateWithFrom`'s FROM
+cross-product branch both gated `checkViewCheckOption` to the base/parent
+table's own rows (`scanTbl == tbl` / `fst.tbl == o.plan.Table`), but each
+already computes a `parentNewRow` in the base table's own column ordinal
+space before that gate — true inheritance children remap through
+`buildInheritColMap`/`remapChildRowToParent`/`remapParentRowToChild`, and
+partition children need no remap at all (PG requires a partition's columns
+to exactly mirror the parent's). Removed both gates; CHECK OPTION now
+enforces uniformly on parent, partition-child, and inheritance-child rows.
+New test `TestViewCheckOptionEnforcedOnPartitionAndInheritanceChildRows`
+(`internal/executor/view_dml_test.go`), confirmed RED on the pre-fix tree.
+**New discovery, not fixed, project-wide and view-independent:**
+`updateOp.updateViaIndex` has no partition/inheritance-child fan-out at all
+(unlike `updateScanTables`/`updateWithFrom`) — an index-eligible `UPDATE
+parent SET ... WHERE indexed_col = X` (no `ONLY`) silently skips a matching
+row living only in a plain-inheritance child's own storage; deferral ledger
+row appended (resume point: mirror `updateScanTables`'s fan-out inside
+`updateViaIndex`). Design doc `root-0025-updatable-views.md` gained a
+"Follow-up: CHECK OPTION on partition/inheritance-child-routed rows"
+section (plus the new-discovery note); `docs/design/README.md` row updated;
+ledger rows appended (item 5 resolved + new discovery open).
+**Root-0025 is now fully closed except the narrow
+`ON CONFLICT`-against-renamed-view residual (item 1's "Known residual").**
+Gates: `go build ./...` clean; `go vet ./internal/planner/...
+./internal/executor/...` clean; `go test ./internal/planner/...
+./internal/executor/... ./internal/catalog/... ./internal/parser/...
+./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** the
+`ON CONFLICT`-against-renamed-view residual (item 1's known residual, the
+last item inside root-0025's own scope), the new `updateViaIndex`
+inheritance-fan-out discovery (project-wide, out of root-0025's scope), or
+continue the M0119-0004 pg_dump catalog-view parity battery / next
+unresolved DU-002 slice from the deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 
