@@ -279,12 +279,41 @@ Gates: `go build ./...` clean; `go vet ./internal/planner/...
 ./internal/executor/...` clean; `go test ./internal/planner/...
 ./internal/executor/... ./internal/catalog/... ./internal/parser/...
 ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS
-(Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** the
-`ON CONFLICT`-against-renamed-view residual (item 1's known residual, the
-last item inside root-0025's own scope), the new `updateViaIndex`
-inheritance-fan-out discovery (project-wide, out of root-0025's scope), or
-continue the M0119-0004 pg_dump catalog-view parity battery / next
-unresolved DU-002 slice from the deferral ledger.
+(Q12=2/Q13=33); pgbench smoke = pre-commit hook. **This loop (2026-07-04)
+closed root-0025 item 1's last "Known residual":** `INSERT ... ON CONFLICT`
+against a renaming auto-updatable view now resolves correctly. `planOnConflict`
+(`internal/planner/planner.go`) previously always resolved the conflict-target
+column list (`resolveArbiterIndex`), `DO UPDATE SET`/`WHERE`, and the
+`excluded` pseudo-relation against `tbl` (already reassigned from the view to
+`base` by the time `planInsert` calls it) instead of `resolveTbl`
+(`viewProxyTable`'s column-name proxy every other view-DML resolution site
+already substitutes) — a renamed arbiter column either failed to match its
+unique index (`42P10`) or a `DO UPDATE SET` against a renamed column raised a
+spurious `42703`. Fixed by threading `resolveTbl`/the view's pre-rewrite name
+into `planOnConflict` and `resolveArbiterIndex`, deriving a `scopeTbl`/
+`scopeAlias` pair used for the arbiter-expr context, the `plainWanted`
+column-name translation (view name → base name via
+`cat.LookupColumn(resolveTbl, name)`, before matching against `idx.Columns`
+which are always base names), and the DO-UPDATE 2-binding merged scope
+(primary + `excluded`) — `resolveDefaultDoNothingArbiter` needed no change
+(it resolves the chosen index's own stored `ColExprs`, already in base
+vocabulary). New test `TestUpdatableViewOnConflictRenamedColumn`
+(`internal/executor/view_dml_test.go`), confirmed RED on the pre-fix tree
+(`42P10`, reverted only `planner.go` and reran). Design doc
+`docs/design/root-0025-updatable-views.md` gained a "Follow-up: `INSERT ...
+ON CONFLICT` against a renamed view column" section; `docs/design/README.md`'s
+root-0025 row updated; deferral ledger row appended (`resolved`).
+**Root-0025 is now fully closed — no open items remain within this
+milestone's own scope.** Gates: `go build ./...` clean; `go vet
+./internal/planner/... ./internal/executor/...` clean; `go test
+./internal/planner/... ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench smoke = pre-commit hook. **Next up:** the
+`updateViaIndex` partition/inheritance-child fan-out discovery
+(project-wide, out of root-0025's scope — start with a plain non-view
+two-table INHERITS regression test to bound the gap before touching
+`updateViaIndex`), or continue the M0119-0004 pg_dump catalog-view parity
+battery / next unresolved DU-002 slice from the deferral ledger.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_008.md`)
 

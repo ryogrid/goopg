@@ -310,15 +310,14 @@ onto `outerColMap[i]` (the view's own ordinal order) rather than `base`'s
 physical order — `INSERT INTO v VALUES (...)` must supply values in the
 view's own column order, matching PostgreSQL's `transformInsertStmt`.
 
-Known residual, deliberately out of scope for this pass: `INSERT ... ON
-CONFLICT` arbiter-target and `DO UPDATE SET` resolution
-(`resolveArbiterIndex`/`planOnConflict`) still resolve against `base`
+Known residual at the time of this pass, **now closed** — see "Follow-up:
+`INSERT ... ON CONFLICT` against a renamed view column" below: `INSERT ...
+ON CONFLICT` arbiter-target and `DO UPDATE SET` resolution
+(`resolveArbiterIndex`/`planOnConflict`) originally resolved against `base`
 directly, not through the proxy — targeting a renamed view column in `ON
-CONFLICT (...)` or `DO UPDATE SET ...` fails `42703` rather than resolving.
-This is a safe failure (a clear error, not silent corruption), and combining
-`ON CONFLICT` with a renaming view is a narrow enough case that plumbing the
-proxy through arbiter-index resolution was left for a dedicated pass — see
-`.ralph/deferral_ledger.md`.
+CONFLICT (...)` or `DO UPDATE SET ...` failed `42703` (or, for the arbiter
+target specifically, could fail to match the intended unique index at all —
+`42P10`) rather than resolving.
 
 New tests in `internal/executor/view_dml_test.go`:
 `TestUpdatableViewColumnSubsetReorderRename` (rename via per-target alias,
@@ -454,6 +453,73 @@ Gates: `go build ./...`; `go vet ./internal/planner/... ./internal/executor/...`
 `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/... ./internal/server/...`;
 `scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
 
+## Follow-up: `INSERT ... ON CONFLICT` against a renamed view column (closes item 1's "Known residual")
+
+`planOnConflict` (`internal/planner/planner.go`) always resolved the
+conflict-target column list (`resolveArbiterIndex`), the `DO UPDATE SET`/
+`WHERE` clause, and the `excluded` pseudo-relation binding against `tbl` — by
+the time `planInsert` calls it, `tbl` has already been reassigned from the
+view to its base relation (see the top of this doc), so all three used the
+base table's *own* column names even when the original `INSERT` statement
+was written in a renaming view's vocabulary. This was the last item-1
+residual: every other view-DML SET/WHERE/RETURNING resolution site already
+substitutes `resolveTbl` (`viewProxyTable`'s column-name proxy over `base`),
+but `planOnConflict` was never given `resolveTbl` to substitute with.
+
+Fixed by threading `resolveTbl` (nil when the INSERT target was a real
+table) and the view's own pre-rewrite name through to `planOnConflict`,
+which now derives a `scopeTbl`/`scopeAlias` pair (`resolveTbl`/
+`viewResolveAlias(targetAlias, viewName)` when set, else `tbl`/`targetAlias`
+unchanged) and uses it everywhere a name needs to resolve against the
+statement's own vocabulary:
+
+- `resolveArbiterIndex` gained a `resolveTbl` parameter — when set, each
+  plain conflict-target column name is translated via
+  `cat.LookupColumn(resolveTbl, name)` to the matching base column
+  (`tbl.Columns[col.Ordinal].Name`) *before* entering the `plainWanted` set
+  matched against `idx.Columns` (always base names), instead of comparing
+  the raw view-vocabulary name directly against base index-column names. An
+  unresolvable name now correctly raises `42703` naming the column, instead
+  of silently falling through to a spurious `42P10` ("no unique or exclusion
+  constraint matching...") once no index's base column names happen to
+  match the raw view names.
+- The arbiter `ArbiterExprs` single-binding context, and the `DO UPDATE`
+  2-binding merged scope (primary + `excluded`, offsets/`sourceIdx` as
+  before) now bind `scopeTbl` under `scopeAlias` instead of unconditionally
+  `tbl`/`targetAlias` — `applyUpdateAssign`'s `cat.LookupColumn` and the
+  merged `Schema`'s column names both resolve in the view's vocabulary,
+  matching how `planUpdate`/`planDelete` already substitute `resolveScope`
+  for their own `SET`/`WHERE`. `viewProxyTable` preserves `base`'s physical
+  column count/ordinal layout exactly (only `Name` differs per view column),
+  so `scopeTbl`'s resolved ordinals remain valid indices into `out.UpdateSet`
+  (sized `len(tbl.Columns)`) with no other change needed.
+- `resolveDefaultDoNothingArbiter` (the bare `ON CONFLICT DO NOTHING` fallback
+  with no explicit target) is unaffected: it never parses user-typed column
+  names — it walks the chosen unique index's own stored `ColExprs`, which
+  were already written in the base table's vocabulary when the constraint/
+  index was created, so resolving them against `tbl` (base) was already
+  correct.
+
+New test `TestUpdatableViewOnConflictRenamedColumn`
+(`internal/executor/view_dml_test.go`): a view renaming both columns
+(`id AS rid, val AS rval`), with `INSERT ... ON CONFLICT (rid) DO UPDATE SET
+rval = voc1.rval + excluded.rval` (exercising the arbiter target, the
+primary-alias-qualified bare reference, and `excluded` together), a
+conflict-free insert through the same view, and `ON CONFLICT (rid) DO
+NOTHING` leaving the existing row untouched. Confirmed RED on the pre-fix
+tree (reverted `internal/planner/planner.go` only, reran — `42P10: there is
+no unique or exclusion constraint matching the ON CONFLICT specification`).
+
+**Root-0025 is now fully closed — no open items remain within this
+milestone's own scope.** The `updateViaIndex` inheritance-fan-out gap (item
+7 below) remains open but is project-wide and view-independent, not part of
+root-0025's own scope.
+
+Gates: `go build ./...` clean; `go vet ./internal/planner/... ./internal/executor/...`
+clean; `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pgbench smoke via the pre-commit hook.
+
 ## Deferred
 
 See `.ralph/deferral_ledger.md` for the formal entry. Summary:
@@ -462,8 +528,9 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    column subset/reorder/rename" note above): `viewColumnMap` +
    `viewProxyTable` replace the `tbl.Columns == base.Columns` positional-
    identity requirement with a per-column ordinal map. `INSERT ... ON
-   CONFLICT` against a renamed view column remains a narrower open residual
-   (see that section).
+   CONFLICT` against a renamed view column was a narrower open residual —
+   now **also RESOLVED**, see "Follow-up: `INSERT ... ON CONFLICT` against a
+   renamed view column" above.
 2. ~~**View-of-view chaining.**~~ — **RESOLVED** (see the "Follow-up" note
    above): `viewAutoUpdatableChain` recurses through a chain of simple
    updatable views, and CASCADED/LOCAL CHECK OPTION propagation now actually
@@ -490,9 +557,10 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    (new discovery, project-wide, not view-specific).** See the "New
    discovery" note above and the matching deferral ledger row — a
    project-wide gap, out of scope for a view-focused loop to fix at its
-   root, root-0025 itself is otherwise fully closed by item 5's resolution
-   plus items 1-4 above (only the narrow `ON CONFLICT`-against-renamed-view
-   residual from item 1 remains open within this milestone's own scope).
+   root. **This is the only item left open, and it is outside root-0025's
+   own scope** (items 1-5 above are all resolved, including the `ON
+   CONFLICT`-against-renamed-view residual from item 1 — root-0025 itself
+   is fully closed).
 
 ## Cross-references
 

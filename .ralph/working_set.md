@@ -1,69 +1,73 @@
 (idle — nothing in flight)
 
-Last completed (this loop, 2026-07-04): closed root-0025 deferred item 5
-(CHECK OPTION on partition/inheritance-child-routed rows).
-`updateScanTables`'s per-row callback (`internal/executor/operators_storage.go`,
-the FROM-free UPDATE path) gated `checkViewCheckOption` to `scanTbl == tbl`;
-`updateWithFrom`'s FROM cross-product branch gated it to
-`fst.tbl == o.plan.Table`. Both gates were unnecessarily conservative — each
-function already computes a `parentNewRow` in the base table's own column
-ordinal space before the gate: true inheritance children remap through
-`buildInheritColMap`/`remapChildRowToParent`/`remapParentRowToChild`, and
-partition children need no remap at all (PG requires a partition's columns
-to exactly mirror the parent's). Fixed by lifting `parentNewRow` to always
-be populated in `updateScanTables` (the non-`isInheritChild` branch now sets
-`parentNewRow = newRow`) and checking it unconditionally in both functions.
+Last completed (this loop, 2026-07-04): closed root-0025 item 1's last
+"Known residual" — `INSERT ... ON CONFLICT` against a renaming
+auto-updatable view.
 
-New test `TestViewCheckOptionEnforcedOnPartitionAndInheritanceChildRows`
-(`internal/executor/view_dml_test.go`): a partition-routed row via plain
-UPDATE and UPDATE...FROM, an inheritance-child row via plain UPDATE — each
-confirms the rejected write (44000) leaves the child-routed row unchanged
-and a subsequent in-qual UPDATE still succeeds. Verified RED on the pre-fix
-tree (git-diffed out just the operators_storage.go hunk, reran, confirmed
-`err=nil` instead of 44000, then reapplied via `git apply`).
+`planOnConflict` (`internal/planner/planner.go`) previously always resolved
+the conflict-target column list (`resolveArbiterIndex`), `DO UPDATE SET`/
+`WHERE`, and the `excluded` pseudo-relation against `tbl` — already
+reassigned from the view to `base` by the time `planInsert` calls it —
+instead of `resolveTbl` (`viewProxyTable`'s column-name proxy every other
+view-DML resolution site already substitutes). A renamed arbiter column
+either failed to match its unique index (42P10) or `DO UPDATE SET` against
+a renamed column raised a spurious 42703.
 
-Note: the inheritance-child sub-test deliberately avoids `WHERE <pk> = ...`
-(that routes through `updateViaIndex` instead of `updateScanTables`) —
-which surfaced a **new, unfixed, project-wide, view-independent discovery**:
-`updateOp.updateViaIndex` has NO partition/inheritance-child fan-out at all
-(unlike `updateScanTables`/`updateWithFrom`, which both build a scan-target
-list from `catalog.InMemory.PartitionChildren`/`InheritanceChildren`). So
-`UPDATE parent SET ... WHERE indexed_col = X` (no `ONLY`), whenever the
-planner finds a usable index on `parent` itself, silently skips a matching
-row that lives only in a plain-inheritance child's own storage — reproduces
-on any two plain tables joined by INHERITS, no views involved. Deferral
-ledger row appended (status `-`, open) with a resume point: mirror
-`updateScanTables`'s fan-out loop inside `updateViaIndex`, applying the same
-parent-ordinal remap helpers already proven out this loop.
+Fixed: `planOnConflict`/`resolveArbiterIndex` now take `resolveTbl` (nil for
+a real-table target) and the view's pre-rewrite name, deriving a
+`scopeTbl`/`scopeAlias` pair (`resolveTbl`/`viewResolveAlias(targetAlias,
+viewName)` when set, else unchanged) used for: the arbiter-expr context; the
+`plainWanted` column-name translation inside `resolveArbiterIndex` (view
+name → base name via `cat.LookupColumn(resolveTbl, name)`, *before* matching
+against `idx.Columns` which are always base names — an unresolvable name now
+raises 42703 naming the column instead of a spurious 42P10); and the
+DO-UPDATE 2-binding merged scope (primary + `excluded`).
+`resolveDefaultDoNothingArbiter` (bare `ON CONFLICT DO NOTHING`, no explicit
+target) needed no change — it resolves the chosen index's own stored
+`ColExprs`, already written in base vocabulary.
+
+New test `TestUpdatableViewOnConflictRenamedColumn`
+(`internal/executor/view_dml_test.go`): a view renaming both columns
+(`id AS rid, val AS rval`), `ON CONFLICT (rid) DO UPDATE SET rval =
+voc1.rval + excluded.rval` (arbiter target + primary-alias-qualified bare
+ref + `excluded`, together), a conflict-free insert through the same view,
+and `ON CONFLICT (rid) DO NOTHING` leaving the row untouched. Confirmed RED
+on the pre-fix tree (`git stash push -- internal/planner/planner.go`, reran,
+got `42P10: there is no unique or exclusion constraint matching the ON
+CONFLICT specification`, then `git stash pop`).
 
 Design doc `docs/design/root-0025-updatable-views.md` gained a "Follow-up:
-CHECK OPTION on partition/inheritance-child-routed rows" section (closing
-item 5) plus a "New discovery" note (the `updateViaIndex` gap, not fixed);
-`docs/design/README.md`'s root-0025 row updated. Deferral ledger gained two
-rows: one `resolved` (item 5) and one `-` (the new discovery).
-**Root-0025 is now fully closed except the narrow `ON CONFLICT`-against-
-renamed-view residual (item 1's "Known residual").**
+`INSERT ... ON CONFLICT` against a renamed view column" section (closing
+item 1's residual) plus updated the item-1 summary and the top-level
+"Known residual" note; `docs/design/README.md`'s root-0025 row updated.
+Deferral ledger gained one `resolved` row.
+
+**Root-0025 is now fully closed — no open items remain within this
+milestone's own scope.**
 
 Gates run this loop: `go build ./...` clean; `go vet ./internal/planner/...
 ./internal/executor/...` clean; `go test ./internal/planner/...
 ./internal/executor/... ./internal/catalog/... ./internal/parser/...
 ./internal/server/...` PASS (new test as above; all pre-existing
 view_dml_test.go tests re-verified passing); `scripts/tpch-spotcheck.sh`
-PASS (Q12=2/Q13=33); pgbench smoke via the pre-commit hook PASS (checked at
-commit time). `make ralph-state-guard` self-repaired the same recurring
-benign progress.json "completed" artifact noted in prior loops' carries
-(expected every loop, not a defect).
+PASS (Q12=2/Q13=33); pgbench smoke via the pre-commit hook (runs at commit
+time). `make ralph-state-guard` self-repaired the same recurring benign
+progress.json "completed" artifact noted in prior loops' carries (expected
+every loop, not a defect).
 
-Committed (`6aaae6cf`) and pushed to `align-data-structure-with-pg`.
+Committing and pushing immediately after this carry.
 
 Next step: no work in flight once committed/pushed. Pick the next item:
-(a) the `ON CONFLICT`-against-renamed-view residual — thread `resolveTbl`/
-colMap into `planOnConflict`'s `tbl` param and `resolveArbiterIndex`'s
-target-column lookup, translating back to base ordinals before the actual
-index lookup (`internal/planner/planner.go`) — this is root-0025's last
-internal-scope item; (b) the new `updateViaIndex` inheritance-fan-out
-discovery (project-wide, bigger, out of root-0025's scope — start with a
-plain non-view two-table INHERITS regression test to bound the gap before
-touching `updateViaIndex`); or (c) continue the M0119-0004 pg_dump
-catalog-view parity battery / next unresolved DU-002 slice from the
-deferral ledger.
+(a) the `updateViaIndex` inheritance-fan-out discovery (project-wide, out of
+root-0025's scope entirely now — start with a plain non-view two-table
+INHERITS regression test `UPDATE parent SET val=1 WHERE id=X` where id=X
+exists only in a child, to bound the gap before touching `updateViaIndex` in
+`internal/executor/operators_storage.go`; mirror `updateScanTables`'s
+fan-out loop over `catalog.InMemory.InheritanceChildren` + the
+`buildInheritColMap`/`remapChildRowToParent`/`remapParentRowToChild` helpers
+already proven out in root-0025's item-5 fix); or (b) continue the
+M0119-0004 pg_dump catalog-view parity battery / next unresolved DU-002
+slice from the deferral ledger; or (c) pick up one of the still-open
+top-level fix_plan items: M0095-0003 (pg_basebackup 010/011/020),
+M0110-0002/0003 (pg_waldump/pg_amcheck TAP server tier), M0119-0005/0006/0007
+(their M0119 promotions).

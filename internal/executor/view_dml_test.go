@@ -756,3 +756,54 @@ func TestViewCheckOptionEnforcedOnPartitionAndInheritanceChildRows(t *testing.T)
 		t.Fatalf("rejected UPDATE...FROM must leave the partition-routed row unchanged, got %v", rows)
 	}
 }
+
+// TestUpdatableViewOnConflictRenamedColumn closes root-0025 deferred item 1's
+// last "Known residual": INSERT ... ON CONFLICT against a view that
+// renames/reorders a base column. planOnConflict previously always resolved
+// the conflict-target column list, the DO UPDATE SET/WHERE clause, and the
+// `excluded` pseudo-relation against the raw base table (`tbl` — already
+// reassigned from the view to its base by the time planInsert calls
+// planOnConflict), never against the view's own column-name proxy
+// (`resolveTbl`/`viewProxyTable`) the way planUpdate/planDelete's SET/WHERE
+// resolution already does. A renamed arbiter column previously either failed
+// to match its unique index (42P10, arbiter not found) or resolved onto the
+// wrong catalog column outright; DO UPDATE SET against a renamed column
+// raised a spurious 42703.
+func TestUpdatableViewOnConflictRenamedColumn(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
+	must("CREATE TABLE toc1 (id int primary key, val int)")
+	must("INSERT INTO toc1 VALUES (1, 10)")
+	must("CREATE VIEW voc1 AS SELECT id AS rid, val AS rval FROM toc1")
+
+	// Arbiter target + DO UPDATE SET + excluded, all in the view's renamed
+	// vocabulary (rid/rval), against the base table's real names (id/val).
+	must("INSERT INTO voc1 (rid, rval) VALUES (1, 999) ON CONFLICT (rid) DO UPDATE SET rval = voc1.rval + excluded.rval")
+	rows := runQueryRows(t, ctx, "SELECT val FROM toc1 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "1009" {
+		t.Fatalf("ON CONFLICT DO UPDATE via renamed view columns: got %v, want val=1009 (10+999)", rows)
+	}
+
+	// A fresh conflict-free row still inserts normally through the same view.
+	must("INSERT INTO voc1 (rid, rval) VALUES (2, 20) ON CONFLICT (rid) DO UPDATE SET rval = excluded.rval")
+	rows = runQueryRows(t, ctx, "SELECT id, val FROM toc1 ORDER BY id")
+	if len(rows) != 2 || rows[1][0].Format() != "2" || rows[1][1].Format() != "20" {
+		t.Fatalf("ON CONFLICT DO UPDATE non-conflicting insert via view: got %v", rows)
+	}
+
+	// DO NOTHING with a renamed arbiter target still resolves the index and
+	// leaves the existing row untouched rather than erroring or re-inserting.
+	must("INSERT INTO voc1 (rid, rval) VALUES (1, -1) ON CONFLICT (rid) DO NOTHING")
+	rows = runQueryRows(t, ctx, "SELECT val FROM toc1 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "1009" {
+		t.Fatalf("ON CONFLICT DO NOTHING via renamed view column must leave row unchanged: got %v", rows)
+	}
+}

@@ -7322,7 +7322,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	}
 	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if s.OnConflict != nil {
-		oc, err := planOnConflict(s.OnConflict, tbl, s.Target.Alias, cat)
+		oc, err := planOnConflict(s.OnConflict, tbl, resolveTbl, viewName, s.Target.Alias, cat)
 		if err != nil {
 			return nil, err
 		}
@@ -7366,7 +7366,16 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 // the planner-side OnConflictPlan: arbiter-index selection from
 // the conflict target columns, plus expression resolution for the
 // DO UPDATE branch under a target+excluded scope. M0017-0002.
-func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias string, cat catalog.Catalog) (*OnConflictPlan, error) {
+//
+// resolveTbl is non-nil only when the INSERT target was a simple
+// auto-updatable view (see viewProxyTable in planInsert): the ON
+// CONFLICT target-column list, DO UPDATE SET/WHERE, and the
+// `excluded` pseudo-relation are all written in the view's own
+// (possibly renamed/reordered/subset) column vocabulary, so every
+// name-resolution scope below must bind against resolveTbl rather
+// than tbl (the real base relation) — root-0025 deferred item 1's
+// "Known residual".
+func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl *catalog.Table, viewName string, targetAlias string, cat catalog.Catalog) (*OnConflictPlan, error) {
 	out := &OnConflictPlan{}
 
 	switch oc.Action {
@@ -7378,12 +7387,19 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		return nil, &PlanError{Pos: oc.Pos(), Code: "XX000", Message: fmt.Sprintf("unexpected ON CONFLICT action %d", oc.Action)}
 	}
 
+	scopeTbl := tbl
+	scopeAlias := targetAlias
+	if resolveTbl != nil {
+		scopeTbl = resolveTbl
+		scopeAlias = viewResolveAlias(targetAlias, viewName)
+	}
+
 	// Arbiter-index selection. With a target, resolve explicitly.
 	// For the bare DO NOTHING form (no target), fall back to the
 	// primary key index so probeArbiterWaiting can detect
 	// in-progress conflicts (M0100-0002).
 	if oc.Target != nil {
-		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, cat)
+		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, resolveTbl, cat)
 		if err != nil {
 			return nil, err
 		}
@@ -7402,7 +7418,7 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 			if hasExpr {
 				// Build a single-binding resolve context for the target table
 				// so expression ColumnRefs resolve against the insert row.
-				exprCtx := singleBindingContext(tbl, targetAlias)
+				exprCtx := singleBindingContext(scopeTbl, scopeAlias)
 				exprCtx.cat = cat
 				out.ArbiterExprs = make([]Expr, len(ords))
 				for i, o2 := range ords {
@@ -7438,16 +7454,16 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 	// `excluded.col` resolves only via the alias path. Schema is
 	// 2N wide — the executor will arrange a merged tuple at
 	// runtime.
-	primaryAlias := targetAlias
+	primaryAlias := scopeAlias
 	if primaryAlias == "" {
-		primaryAlias = tbl.Name
+		primaryAlias = scopeTbl.Name
 	}
 	n := len(tbl.Columns)
 	// Primary at sourceIdx=1, excluded at sourceIdx=2 — both refer
 	// to the same catalog table but disambiguate by source so
 	// `excluded.col` and `<target>.col` rebind helpers don't
 	// collapse into the same Index.
-	primaryBinding := rangeBinding{table: tbl, alias: primaryAlias, offset: 0, sourceIdx: 1}
+	primaryBinding := rangeBinding{table: scopeTbl, alias: primaryAlias, offset: 0, sourceIdx: 1}
 	if targetAlias != "" {
 		// When the INSERT target has an alias, the original table name must
 		// not resolve the primary binding — only the alias is valid.
@@ -7457,17 +7473,17 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 	}
 	bindings := []rangeBinding{
 		primaryBinding,
-		{table: tbl, alias: "excluded", offset: n, qualifiedOnly: true, sourceIdx: 2},
+		{table: scopeTbl, alias: "excluded", offset: n, qualifiedOnly: true, sourceIdx: 2},
 	}
 	mergedSchema := make(Schema, 0, 2*n)
-	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
-	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 2)...)
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 1)...)
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 2)...)
 	ctx := newResolveContext(bindings, mergedSchema)
 	ctx.cat = cat
 
 	out.UpdateSet = make([]Expr, n)
 	for _, a := range oc.UpdateSet {
-		if err := applyUpdateAssign(a, tbl, out.UpdateSet, ctx, cat); err != nil {
+		if err := applyUpdateAssign(a, scopeTbl, out.UpdateSet, ctx, cat); err != nil {
 			return nil, err
 		}
 	}
@@ -7537,13 +7553,19 @@ func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat 
 // specification" rule: the user's columns must canonically match
 // some unique constraint.
 //
+// resolveTbl is non-nil only for a view target (see planOnConflict):
+// target.Columns are written in the view's own vocabulary, so each
+// plain column name is first translated to tbl's (the base
+// relation's) own column name via resolveTbl before being matched
+// against idx.Columns, which are always base names.
+//
 // Returns (idx, ordinals, nil) on a single match — ordinals are
 // `tbl.Columns` ordinals matching idx.Columns in catalog order so
 // the executor can extract the conflict key from a row tuple
 // without a name lookup. SQLSTATE 42P10 ("invalid_column_reference"
 // — upstream's "no unique or exclusion constraint matching the ON
 // CONFLICT specification") on no match.
-func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, cat catalog.Catalog) (*catalog.Index, []int, error) {
+func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, resolveTbl *catalog.Table, cat catalog.Catalog) (*catalog.Index, []int, error) {
 	// Constraint-name target form (M0017 Stage B). The named index
 	// must exist, must be a unique index, and must belong to the
 	// target table. The analyzer already enforces these but the
@@ -7583,6 +7605,16 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	for _, c := range target.Columns {
 		if c == "" {
 			exprCount++
+		} else if resolveTbl != nil {
+			// Translate the view's own column name to the base
+			// relation's real column name before it enters the
+			// wanted-set, since idx.Columns below are always base
+			// names.
+			col, ok := cat.LookupColumn(resolveTbl, c)
+			if !ok {
+				return nil, nil, &PlanError{Pos: target.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", c)}
+			}
+			plainWanted[strings.ToLower(tbl.Columns[col.Ordinal].Name)] = struct{}{}
 		} else {
 			plainWanted[strings.ToLower(c)] = struct{}{}
 		}
