@@ -618,8 +618,14 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 	pool.OnPinDone = func() {
+		// M0122-0003: WaitEventEnd's returned duration is real wall-clock
+		// time only when track_io_timing gated this pair on (the
+		// LookupTrackedGoroutine ok-branch), so accumulating it here
+		// unconditionally within this branch matches upstream's "zero
+		// unless track_io_timing is enabled" pg_stat_io.read_time semantics.
 		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
-			reg.WaitEventEnd(procNum)
+			d := reg.WaitEventEnd(procNum)
+			pool.AddReadTimeNanos(int64(d))
 		}
 	}
 	if opts.TrackIOTiming {

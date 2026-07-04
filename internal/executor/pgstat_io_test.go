@@ -1,6 +1,10 @@
 package executor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/storage"
+)
 
 // TestPgStatIORowCount asserts the pg_stat_io view emits upstream's exact
 // 79-row valid-combination shape (verified against a real PostgreSQL 18.3
@@ -103,5 +107,80 @@ func TestPgStatIOLiveCounters(t *testing.T) {
 	reads, hits := rows[0][0], rows[0][1]
 	if reads.IsNull() || hits.IsNull() {
 		t.Fatalf("reads/hits unexpectedly NULL: reads=%v hits=%v", reads, hits)
+	}
+}
+
+// TestPgStatIOReadTimeAndWritesRendered pins the M0122-0003 track_io_timing
+// follow-up: fetchIOStatRows must render real read_time (col 5, from
+// Pool.ReadTimeNanos, accumulated by the OnPinDone hook wired in
+// internal/initdb/open.go) and writes/write_bytes (cols 6/7, from
+// Pool.BufferCounters' pre-existing written tally) for the one row goopg
+// instruments, instead of the previous hardcoded "0"/unused write count.
+func TestPgStatIOReadTimeAndWritesRendered(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	// 2.5ms of accumulated read wait — mirrors what OnPinDone would add via
+	// a real track_io_timing-gated WaitEventEnd duration.
+	pool.AddReadTimeNanos(2_500_000)
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 1, Fork: storage.MainFork}
+	seedPage := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(seedPage); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := mgr.Extend(rel, seedPage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Force a backend-driven eviction so sharedWrittenCount advances: dirty
+	// one page, then pin enough cold pages in the 4-slot pool to evict it.
+	s, err := pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.MarkDirty(s)
+	pool.Unpin(s)
+	coldRel := storage.RelFileNode{DBOid: 1, RelOid: 2, Fork: storage.MainFork}
+	for i := 0; i < 8; i++ {
+		if _, err := mgr.Extend(coldRel, seedPage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for blk := storage.BlockNumber(0); blk < 8; blk++ {
+		cs, err := pool.Pin(storage.BufferTag{Rel: coldRel, Block: blk})
+		if err != nil {
+			continue
+		}
+		pool.Unpin(cs)
+	}
+	_, _, _, written := pool.BufferCounters()
+	if written == 0 {
+		t.Fatal("setup failed to force a backend-driven eviction (written count still 0)")
+	}
+
+	ctx := &Context{Pool: pool}
+	rows := fetchIOStatRows(ctx)
+	var found []string
+	for _, r := range rows {
+		if r[0] == "client backend" && r[1] == "relation" && r[2] == "normal" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no client backend/relation/normal row found")
+	}
+	if found[5] != "2.500" {
+		t.Errorf("read_time (col 5) = %q, want %q", found[5], "2.500")
+	}
+	if found[6] == "0" {
+		t.Errorf("writes (col 6) = %q, want a nonzero count reflecting the forced eviction", found[6])
 	}
 }

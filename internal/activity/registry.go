@@ -250,13 +250,28 @@ func (r *ActivityRegistry) WaitEventStart(procNum int32, waitTypeStr, waitEventS
 
 // WaitEventEnd clears the wait event for procNum.
 // O(1) atomic stores; no mutex.
-func (r *ActivityRegistry) WaitEventEnd(procNum int32) {
+// WaitEventEnd clears procNum's current wait and returns the elapsed wall-
+// clock duration since the matching WaitEventStart call (by reading the
+// mono-clock stateChange stamp WaitEventStart left behind, before
+// overwriting it). Callers that don't need the duration (most call sites)
+// may discard the return value. Used to back `track_io_timing`-gated
+// timing collection (M0122-0003 follow-up) — every caller that wants a real
+// duration only invokes WaitEventStart/WaitEventEnd via
+// LookupTrackedGoroutine, which already gates on the backend's
+// track_io_timing flag, so no separate gate is needed here.
+func (r *ActivityRegistry) WaitEventEnd(procNum int32) time.Duration {
 	if procNum < 0 || int(procNum) >= len(r.slots) {
-		return
+		return 0
 	}
 	s := &r.slots[procNum]
+	waitStart := s.stateChange.Load()
+	now := runtimeshim.Nanotime()
 	s.waitInfo.Store(0)
-	s.stateChange.Store(runtimeshim.Nanotime())
+	s.stateChange.Store(now)
+	if waitStart <= 0 || now <= waitStart {
+		return 0
+	}
+	return time.Duration(now - waitStart)
 }
 
 // ——— Cold-path update methods ————————————————————————————————————————————

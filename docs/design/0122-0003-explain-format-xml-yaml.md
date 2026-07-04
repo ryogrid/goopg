@@ -109,9 +109,10 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | FORMAT YAML | **done, this loop** |
 | SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
 | BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
-| `pg_stat_io` | **partial** (later loop, 2026-07-04) — row shape (79 rows, upstream valid-combination NULL pattern) + the one instrumented cell (client backend/relation/normal reads/read_bytes/hits); see "pg_stat_io row shape" section below |
+| `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits instrumented for the one cell goopg tracks; see "pg_stat_io row shape" + "real per-wait-event I/O timing" sections below |
 | per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
 | `track_io_timing` runtime `SET` | **done** (later loop, 2026-07-05) — see "`track_io_timing` runtime SET" section below |
+| real per-wait-event I/O timing | **partial** (later loop, 2026-07-05) — read_time only; see "real per-wait-event I/O timing" section below |
 
 Remaining items recorded in `.ralph/deferral_ledger.md` (2026-07-04,
 M0122-0003 rows) with resume points. The fix_plan checkbox stays unchecked
@@ -466,3 +467,74 @@ alone is not sufficient — a given backend still needs its own flag on).
 `internal/server/server_test.go` — `TestTrackIOTimingOnChangePropagatesToActivityRegistry`
 (exercises `New()`'s actual `OnChange` wiring end-to-end with a real
 `SessionRegistry.Set("track_io_timing", "on", false)`).
+
+## Real per-wait-event I/O timing (later loop, 2026-07-05)
+
+**Problem.** The section above wired `track_io_timing` so a live `SET`
+reaches the existing wait-event hooks, but those hooks (`Pool.OnPinWait`/
+`OnPinDone`) only ever recorded *that* a wait happened
+(`ActivityRegistry.WaitEventStart`/`WaitEventEnd`, which stamp
+`pg_stat_activity.wait_event`) — nothing measured *how long* it took.
+`pg_stat_io.read_time` and EXPLAIN's `I/O Timings` line therefore had no
+real signal to render even with `track_io_timing=on`.
+
+**Fix.** Three small, additive changes turn the existing hook pair into a
+real timer, reusing the mono-clock timestamp `WaitEventStart` already
+stores rather than adding a second clock read:
+
+1. `internal/activity/registry.go`'s `WaitEventEnd(procNum) time.Duration`
+   now returns the elapsed wall-clock time since the matching
+   `WaitEventStart` call, computed by reading the per-slot `stateChange`
+   mono-clock stamp *before* overwriting it with the current time. All
+   pre-existing callers that ignore the return value (most of them, across
+   `initdb`/`server`/`executor`) are unaffected — Go permits discarding a
+   return value at a statement-level call.
+2. `internal/storage/bufpool.go`'s `Pool` gains a `sharedReadTimeNanos`
+   atomic accumulator plus `AddReadTimeNanos(n int64)` / `ReadTimeNanos()
+   int64`, siblings of the pre-existing `sharedHitCount`/`sharedReadCount`/
+   `sharedDirtiedCount`/`sharedWrittenCount` counters that already back
+   EXPLAIN (BUFFERS) and `pg_stat_io`.
+3. `internal/initdb/open.go`'s pre-existing `pool.OnPinDone` closure — the
+   *only* place that currently calls `WaitEventEnd` after a real disk read
+   (`pinLoad`'s `mgr.ReadBlock` call, bracketed by `OnPinWait`/`OnPinDone`)
+   — now captures the returned duration and calls
+   `pool.AddReadTimeNanos(int64(d))`. No new gate was needed: the closure
+   body only executes when `act.LookupTrackedGoroutine()` succeeds, which
+   already requires the pinning backend's `track_io_timing` flag to be on
+   (see the section above) — so real time only ever accumulates exactly
+   when upstream's own "these will be zero if track_io_timing is not
+   enabled" rule says it should.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` renders
+`ReadTimeNanos()` as the `read_time` column (milliseconds, via the
+existing `operators_explain.go` `nsToMs` helper) for the one row goopg
+instruments (client backend/relation/normal). While touching this
+function, an unrelated pre-existing bug was also fixed: `BufferCounters()`'s
+4th return value (`written`, collected since the 2026-07-04 dirtied/written
+loop) was being discarded (`_`) instead of feeding the `writes`/
+`write_bytes` columns, which had rendered a hardcoded `0` despite a real
+counter already existing.
+
+**Deferred (tracked in `.ralph/deferral_ledger.md`, 2026-07-05):**
+`write_time` is not measured — `evictVictim`'s dirty-victim flush (the
+call site that increments `sharedWrittenCount`) has no `OnWait`/`OnDone`
+hook pair to time at all, unlike the read side's pre-existing
+`OnPinWait`/`OnPinDone`; adding one is a new hook, not a wiring gap. The
+other five `pg_stat_io` op counters (extends/evictions/reuses/writebacks/
+fsyncs, plus every one of their own `_bytes`/`_time` columns) still render
+upstream's real `0`/NULL shape, since goopg has no instrumentation for
+those operations at all. EXPLAIN's `I/O Timings` line itself is not
+rendered in any format yet — this loop only wired the underlying counter,
+not its EXPLAIN presentation (a separate, BUFFERS-rendering-style
+follow-up).
+
+**Tests:** `internal/activity/registry_test.go` —
+`TestWaitEventEndReturnsElapsedDuration` (a real `time.Sleep`-backed
+duration, not a stub), `TestWaitEventEndOutOfRangeProcNumReturnsZero`.
+`internal/storage/bufpool_counters_test.go` —
+`TestPoolReadTimeNanosAccumulates` (accumulation + non-positive-duration
+guard). `internal/executor/pgstat_io_test.go` —
+`TestPgStatIOReadTimeAndWritesRendered` (end-to-end: a real `storage.Pool`
+with a forced backend-driven eviction and injected read time, asserting
+both the `read_time` and `writes` columns render real, non-placeholder
+values).

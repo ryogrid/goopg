@@ -183,6 +183,18 @@ type Pool struct {
 	sharedDirtiedCount atomic.Int64
 	sharedWrittenCount atomic.Int64
 
+	// sharedReadTimeNanos accumulates real wall-clock time spent in the
+	// pinLoad disk read (the exact span OnPinWait/OnPinDone bracket),
+	// backing pg_stat_io's read_time / EXPLAIN's I/O Timings columns
+	// (M0122-0003 track_io_timing follow-up: "actual per-wait-event
+	// timing collection"). Only accumulated when the reading backend has
+	// track_io_timing on — see initdb.Open's OnPinDone wiring, which only
+	// calls AddReadTimeNanos when ActivityRegistry.LookupTrackedGoroutine
+	// reports ok (itself gated on the backend's flag), matching upstream's
+	// "these will be zero if track_io_timing is not enabled" semantics
+	// without this package needing to know about the activity registry.
+	sharedReadTimeNanos atomic.Int64
+
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.
 	bgwriterMu   sync.Mutex
@@ -478,6 +490,23 @@ func (p *Pool) Manager() *Manager { return p.mgr }
 // shared_blks_read (postgres/src/include/executor/instrument.h).
 func (p *Pool) BufferCounters() (hit, read, dirtied, written int64) {
 	return p.sharedHitCount.Load(), p.sharedReadCount.Load(), p.sharedDirtiedCount.Load(), p.sharedWrittenCount.Load()
+}
+
+// AddReadTimeNanos accumulates n nanoseconds of real disk-read wait time
+// into the pool-wide read-time tally. Called only from the OnPinDone hook
+// when the pinning backend has track_io_timing enabled (see
+// sharedReadTimeNanos's doc comment).
+func (p *Pool) AddReadTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedReadTimeNanos.Add(n)
+	}
+}
+
+// ReadTimeNanos returns the pool-wide cumulative real time spent in disk
+// reads by backends with track_io_timing on, backing pg_stat_io's
+// read_time column (milliseconds) and EXPLAIN's I/O Timings.
+func (p *Pool) ReadTimeNanos() int64 {
+	return p.sharedReadTimeNanos.Load()
 }
 
 // SyncAllDataFiles fdatasyncs every open data file.

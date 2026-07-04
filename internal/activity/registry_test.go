@@ -67,6 +67,33 @@ func TestActivityRegistryWaitEventAtomic(t *testing.T) {
 	}
 }
 
+// TestWaitEventEndReturnsElapsedDuration pins the M0122-0003 track_io_timing
+// follow-up: WaitEventEnd must return the real wall-clock time elapsed since
+// the matching WaitEventStart (read from the mono-clock stateChange stamp
+// before it's overwritten), so callers like Pool.OnPinDone can accumulate
+// genuine I/O timing instead of a synthetic zero.
+func TestWaitEventEndReturnsElapsedDuration(t *testing.T) {
+	r := NewActivityRegistry(16)
+	r.Register(&Backend{PID: "1", State: "active"})
+	pn := int32(0)
+	r.WaitEventStart(pn, WaitTypeIO, WaitDataFileRead)
+	time.Sleep(5 * time.Millisecond)
+	d := r.WaitEventEnd(pn)
+	if d < 3*time.Millisecond {
+		t.Errorf("WaitEventEnd duration = %v, want >= ~5ms (slept 5ms)", d)
+	}
+}
+
+// TestWaitEventEndOutOfRangeProcNumReturnsZero verifies the bounds-check
+// guard returns a zero duration rather than panicking or fabricating a
+// non-zero value for an unregistered/out-of-range procNum.
+func TestWaitEventEndOutOfRangeProcNumReturnsZero(t *testing.T) {
+	r := NewActivityRegistry(16)
+	if d := r.WaitEventEnd(999); d != 0 {
+		t.Errorf("WaitEventEnd(999) = %v, want 0", d)
+	}
+}
+
 // TestActivityRegistryBackgroundWorker verifies RegisterBackground assigns
 // a slot beyond the regular range and Release cleans it up.
 func TestActivityRegistryBackgroundWorker(t *testing.T) {

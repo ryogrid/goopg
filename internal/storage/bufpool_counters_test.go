@@ -81,3 +81,37 @@ func TestBufferCountersDirtiedAndWritten(t *testing.T) {
 		t.Errorf("writtenCount should advance once dirty hot pages are evicted to make room: %d -> %d", writtenAfterMark, writtenAfterEvict)
 	}
 }
+
+// TestPoolReadTimeNanosAccumulates pins the M0122-0003 track_io_timing
+// follow-up: Pool.AddReadTimeNanos/ReadTimeNanos back pg_stat_io's
+// read_time column. storage.Pool itself never calls AddReadTimeNanos
+// directly (that only happens from the OnPinDone closure wired in
+// internal/initdb/open.go, gated on the pinning backend's track_io_timing
+// flag) — this test exercises the counter in isolation, mirroring how
+// BufferCounters' hit/read/dirtied/written pairs are unit-tested apart from
+// their real call sites.
+func TestPoolReadTimeNanosAccumulates(t *testing.T) {
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	if got := pool.ReadTimeNanos(); got != 0 {
+		t.Fatalf("ReadTimeNanos before any accumulation = %d, want 0", got)
+	}
+	pool.AddReadTimeNanos(1_000_000)
+	pool.AddReadTimeNanos(2_000_000)
+	if got, want := pool.ReadTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("ReadTimeNanos after two adds = %d, want %d", got, want)
+	}
+	// Non-positive durations (WaitEventEnd's zero-guard for a mismatched or
+	// clock-skewed pair) must not be recorded.
+	pool.AddReadTimeNanos(0)
+	pool.AddReadTimeNanos(-5)
+	if got, want := pool.ReadTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("ReadTimeNanos after non-positive adds = %d, want unchanged %d", got, want)
+	}
+}
