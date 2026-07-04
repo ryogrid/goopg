@@ -280,12 +280,25 @@ mirroring M0119's ledger `status` column.
       `UPDATE` immediately after `INSERT` withholds `dirtied=` (page
       already dirty), then reports it correctly after an intervening
       `CHECKPOINT`.
+      `track_io_timing` runtime SET **done** (2026-07-04, later loop):
+      `internal/activity/registry.go` gains a per-backend `TrackIOTimingOn`
+      flag + a process-wide latching fast-path flag + `LookupTrackedGoroutine`
+      (drop-in for `LookupCurrentGoroutine` that also requires the calling
+      backend's flag on); `internal/initdb/open.go`'s buffer-pin and
+      AIO/data-file I/O wait-event hooks are now wired unconditionally
+      (previously skipped entirely unless the boot-time GUC was on) and
+      consult the new helper; `internal/server/server.go`'s `New()` gains a
+      `track_io_timing` `OnChange` hook (mirrors the pre-existing
+      `application_name` one) plus a per-connection seed from the session's
+      boot value. `SET track_io_timing` now takes effect live, no restart.
       Still open: `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time
       buffers — no planning-phase buffer counters exist), local/temp-buffer
       terms, `pg_stat_io`'s other 7 I/O counters (writes/extends/evictions/
-      reuses/writebacks/fsyncs + their bytes/time columns), `track_io_timing`
-      runtime SET (GUC registered but only consulted once at process boot).
-      Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
+      reuses/writebacks/fsyncs + their bytes/time columns), and actual
+      per-wait-event timing *collection* to back `track_io_timing`/
+      `I/O Timings` (the GUC now reaches the hooks live, but the hooks still
+      only track wait *occurrence*, not wall-clock duration).
+      Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
@@ -453,16 +466,41 @@ mirroring M0119's ledger `status` column.
       `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
       section; `docs/design/README.md` row extended;
       `unimplemented_feat.json` entry updated in place.
+      **ntile/cume_dist/percent_rank removed from this bucket
+      (2026-07-05, this loop):** implemented the three remaining ranking
+      window functions — none were a mechanical drop-in the way
+      first_value/last_value/nth_value were. `ntile(n)` reproduces
+      `window_ntile` (`postgres/src/backend/utils/adt/windowfuncs.c`)
+      exactly (n evaluated once per partition, `22014` for `n<=0`,
+      remainder rows go to the first buckets not the last) via new
+      `evalNtileFuncs`/`evalNtileFunc`; `percent_rank()` =
+      `(rank-1)/(total-1)`; `cume_dist()` = `NP/total` reusing the
+      existing `frameEnd[]` peer-group boundary (`hasFrameValueWindowFunc`
+      extended to also gate it for `cume_dist`). Tests:
+      `internal/analyzer/analyzer_test.go`
+      (`TestAnalyzeWindowRankingFunctionsAccepted`,
+      `TestAnalyzeWindowRankingFunctionsRejected`;
+      `TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+      `dense_rank()`), `internal/executor/window_compat_test.go`
+      (`TestCompatWindowNtileBuckets`,
+      `TestCompatWindowNtileMoreBucketsThanRows`,
+      `TestCompatWindowNtileInvalidArgument`,
+      `TestCompatWindowPercentRankAndCumeDist`). Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
+      section; `docs/design/README.md` row extended. Ledger:
+      `.ralph/deferral_ledger.md` (2026-07-05, M0122-0004).
       **Still open in this bucket:** frame clause parsing/execution
-      itself (ROWS/RANGE/GROUPS — now has two real consumers:
-      `evalFrameAggFuncs`/`frameEnd` computation could generalize into
-      an arbitrary frame-bounds function); combining forms (`OVER (win
-      ORDER BY ...)`, a named window based on another named window) are
-      also out of scope (real upstream syntax, deferred — see design doc);
-      `ntile`/`cume_dist`/`percent_rank` as window functions remain
-      unimplemented (they exist only as `WITHIN GROUP` ordered-set
-      aggregates today, a different code path). GROUPING
-      SETS/ROLLUP/CUBE, DEFAULT-clause parsing, intervals also remain.
+      itself (ROWS/RANGE/GROUPS — now has three real consumers:
+      `evalFrameAggFuncs`/`frameEnd`/`evalNtileFuncs` could generalize
+      into an arbitrary frame-bounds function) is now the only open
+      window-function item — every window function implemented across
+      the M0122-0004 series still assumes PostgreSQL's default frame.
+      Combining forms (`OVER (win ORDER BY ...)`, a named window based on
+      another named window) are also out of scope (real upstream syntax,
+      deferred — see design doc). `dense_rank()` as a window function
+      remains unimplemented (only its `WITHIN GROUP` ordered-set-aggregate
+      form exists). GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause parsing,
+      intervals also remain.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
