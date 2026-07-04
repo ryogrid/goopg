@@ -268,6 +268,65 @@ even when a counter is zero), `TestExplainBuffersJSONOmittedWithoutBuffersOption
 (gated on `opts.Buffers`), `TestExplainBuffersXMLTagSanitized` (tag-name
 sanitization).
 
+### `dirtied=`/`written=` counters (later loop, 2026-07-04)
+
+Closes the "Deferred" bullet from the BUFFERS-rendering section above for the
+two shared-buffer terms it named: `EXPLAIN (ANALYZE, BUFFERS)` now also
+reports `dirtied=`/`written=`, matching `show_buffer_usage`'s exact
+`shared_blks_dirtied`/`shared_blks_written` semantics
+(`postgres/src/backend/commands/explain.c:4122-4127`, confirmed by direct
+source read — the four shared terms share one `has_shared` gate and one
+term ordering: `hit= read= dirtied= written=`).
+
+**Counting at the source.** `internal/storage/bufpool.go`'s `Pool` gains
+`sharedDirtiedCount`/`sharedWrittenCount` (`atomic.Int64`, siblings of the
+existing `sharedHitCount`/`sharedReadCount`); `BufferCounters()` now returns
+all four. `sharedDirtiedCount` increments exactly once per clean→dirty
+transition — at every one of the 8 CAS-success sites across `MarkDirty`,
+`MarkDirtyHintBit`, `markDirtyWithLSNCommon` (shared by `MarkDirtyWithLSN`/
+`MarkDirtyWithLSNLocked`), the 3 early-return branches inside
+`MarkDirtyForceFPI`, `MarkDirtyChangeRecord`, and `MarkDirtyLogicalChange` —
+mirroring `bufmgr.c`'s "if the buffer was not dirty already, do vacuum
+accounting" comment at the `MarkBufferDirty`/`MarkBufferDirtyHint` call
+sites. `sharedWrittenCount` increments at exactly one site: `evictVictim`'s
+post-flush point, when a backend evicts a dirty victim slot to make room for
+its own `Pin`/`PinNew`. Deliberately **not** counted: `WriteDirtyPages`
+(bgwriter) and `FlushAll`/`FlushAllPaced`/`flushBatch` (checkpointer) — in
+upstream, `pgBufferUsage` is a per-backend global, so a checkpointer or
+bgwriter process flushing a page increments *its own* counter, never the
+querying backend's; since goopg's pool counters are process/pool-global
+(the same architectural approximation `sharedHitCount`/`sharedReadCount`
+already made), counting bgwriter/checkpointer writes here would misattribute
+background IO to whatever query happens to be running concurrently.
+
+**Rendering.** `formatBuffersLine` (TEXT) and `planToJSONWithStats`
+(JSON/XML/YAML) both extended with the same per-term positive-only /
+unconditional-once-requested rules the hit/read pair already followed;
+`nodeStats` gains `bufDirtied`/`bufWritten` + `bufBaseDirtied`/
+`bufBaseWritten`, rolled forward by `accountBuffers` identically to
+`bufHit`/`bufRead`.
+
+**Verified against a real running server**, not just the Go test suite: a
+fresh table's first `UPDATE` shows `dirtied=` withheld once the page is
+already dirty from the preceding `INSERT` in the same buffer (no flush in
+between — matches upstream: `shared_blks_dirtied` only counts *new*
+clean→dirty transitions during the current command); after `CHECKPOINT`
+clears the dirty bit, an immediate follow-up `UPDATE` on the same table
+correctly reports `Buffers: shared hit=12 read=1 dirtied=1`.
+
+**Tests:** `internal/storage/bufpool_counters_test.go`'s
+`TestBufferCountersDirtiedAndWritten` (small pool, forced dirty + forced
+eviction, double-`MarkDirty` non-double-count assertion);
+`internal/executor/explain_buffers_test.go`'s
+`TestFormatBuffersLineDirtiedWritten` (table-driven, all 4 zero/gating
+combinations) and `TestExplainBuffersJSONAlwaysIncludesDirtiedWrittenBlocks`.
+
+**Still deferred** (ledger row, same date): `EXPLAIN (BUFFERS)` without
+`ANALYZE` (planning-time buffers), local/temp-buffer terms, `I/O Timings`,
+and the two narrow `Pin()` call sites (`PinNew`, race-recovery re-pin)
+scoped out of the hit/read pair above — none of those needed touching for
+this slice.
+
 ## pg_stat_io row shape (later loop, 2026-07-04)
 
 `pg_stat_io` (PG 16+) had a table registered (`internal/catalog/catalog.go`,

@@ -167,6 +167,22 @@ type Pool struct {
 	sharedHitCount  atomic.Int64
 	sharedReadCount atomic.Int64
 
+	// sharedDirtiedCount / sharedWrittenCount extend the pair above to
+	// mirror PgBufferUsage's shared_blks_dirtied / shared_blks_written.
+	// dirtiedCount increments exactly once per clean->dirty transition,
+	// at every MarkDirty* call site (mirrors bufmgr.c's MarkBufferDirty /
+	// MarkBufferDirtyHint: "if the buffer was not dirty already, do
+	// vacuum accounting"). writtenCount increments only when evictVictim
+	// flushes a dirty victim to make room for this pool's own Pin/PinNew
+	// (the FlushBuffer() call site bufmgr.c increments from) — NOT the
+	// bgwriter's WriteDirtyPages or the checkpointer's FlushAll/
+	// FlushAllPaced, since upstream's pgBufferUsage is per-backend and
+	// those run as separate processes with their own counter instance;
+	// counting them here into this pool-wide counter would attribute
+	// background/checkpoint IO to whichever query happens to be running.
+	sharedDirtiedCount atomic.Int64
+	sharedWrittenCount atomic.Int64
+
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.
 	bgwriterMu   sync.Mutex
@@ -460,8 +476,8 @@ func (p *Pool) Manager() *Manager { return p.mgr }
 // pair per plan node (internal/executor/instrument.go) to render PG's
 // "Buffers: shared hit=N read=N" line — mirrors BufferUsage.shared_blks_hit /
 // shared_blks_read (postgres/src/include/executor/instrument.h).
-func (p *Pool) BufferCounters() (hit, read int64) {
-	return p.sharedHitCount.Load(), p.sharedReadCount.Load()
+func (p *Pool) BufferCounters() (hit, read, dirtied, written int64) {
+	return p.sharedHitCount.Load(), p.sharedReadCount.Load(), p.sharedDirtiedCount.Load(), p.sharedWrittenCount.Load()
 }
 
 // SyncAllDataFiles fdatasyncs every open data file.
@@ -674,6 +690,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		if flushErr != nil {
 			return flushErr
 		}
+		p.sharedWrittenCount.Add(1)
 	}
 	return nil
 }
@@ -1028,6 +1045,7 @@ func (p *Pool) MarkDirty(s *Slot) {
 			return // already dirty
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			return
 		}
 	}
@@ -1044,6 +1062,7 @@ func (p *Pool) MarkDirtyHintBit(s *Slot) {
 			return
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			return
 		}
 	}
@@ -1072,6 +1091,7 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}
@@ -1087,6 +1107,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 				return
 			}
 			if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+				p.sharedDirtiedCount.Add(1)
 				return
 			}
 		}
@@ -1103,6 +1124,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 				return
 			}
 			if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+				p.sharedDirtiedCount.Add(1)
 				return
 			}
 		}
@@ -1114,6 +1136,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}
@@ -1158,6 +1181,7 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}
@@ -1195,6 +1219,7 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}

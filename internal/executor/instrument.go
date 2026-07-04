@@ -33,17 +33,18 @@ type nodeStats struct {
 	// increments it directly via a pointer handed to it in maybeInstrument.
 	heapFetches int64
 
-	// bufHit / bufRead are the cumulative shared-buffer hit/read counts
-	// EXPLAIN (ANALYZE, BUFFERS) attributes to this node, inclusive of its
-	// children (same nested-stopwatch semantics as totalNs above — a
-	// parent's Next() call fully executes its child's Next() calls before
-	// returning, so the pool-counter delta since the last checkpoint
-	// naturally rolls up whatever the subtree touched). bufBaseHit/
-	// bufBaseRead hold the last-seen storage.Pool snapshot for delta
-	// computation; bufSeeded guards the very first checkpoint on Open.
-	bufHit, bufRead         int64
-	bufBaseHit, bufBaseRead int64
-	bufSeeded               bool
+	// bufHit / bufRead / bufDirtied / bufWritten are the cumulative
+	// shared-buffer hit/read/dirtied/written counts EXPLAIN (ANALYZE,
+	// BUFFERS) attributes to this node, inclusive of its children (same
+	// nested-stopwatch semantics as totalNs above — a parent's Next() call
+	// fully executes its child's Next() calls before returning, so the
+	// pool-counter delta since the last checkpoint naturally rolls up
+	// whatever the subtree touched). The bufBase* fields hold the
+	// last-seen storage.Pool snapshot for delta computation; bufSeeded
+	// guards the very first checkpoint on Open.
+	bufHit, bufRead, bufDirtied, bufWritten                 int64
+	bufBaseHit, bufBaseRead, bufBaseDirtied, bufBaseWritten int64
+	bufSeeded                                               bool
 }
 
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
@@ -73,7 +74,7 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 	if ctx != nil && ctx.Pool != nil {
 		o.pool = ctx.Pool
 		if !o.stats.bufSeeded {
-			o.stats.bufBaseHit, o.stats.bufBaseRead = o.pool.BufferCounters()
+			o.stats.bufBaseHit, o.stats.bufBaseRead, o.stats.bufBaseDirtied, o.stats.bufBaseWritten = o.pool.BufferCounters()
 			o.stats.bufSeeded = true
 		}
 	}
@@ -86,18 +87,22 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 	return o.inner.Open(ctx)
 }
 
-// accountBuffers rolls the storage.Pool's global hit/read counters forward
-// into this node's running total, attributing everything touched since the
-// last checkpoint (by this node or any descendant called from within it) to
-// this node — see the bufHit/bufRead doc comment on nodeStats.
+// accountBuffers rolls the storage.Pool's global hit/read/dirtied/written
+// counters forward into this node's running total, attributing everything
+// touched since the last checkpoint (by this node or any descendant called
+// from within it) to this node — see the bufHit/bufRead doc comment on
+// nodeStats.
 func (o *instrumentedOp) accountBuffers() {
 	if o.pool == nil {
 		return
 	}
-	hit, read := o.pool.BufferCounters()
+	hit, read, dirtied, written := o.pool.BufferCounters()
 	o.stats.bufHit += hit - o.stats.bufBaseHit
 	o.stats.bufRead += read - o.stats.bufBaseRead
+	o.stats.bufDirtied += dirtied - o.stats.bufBaseDirtied
+	o.stats.bufWritten += written - o.stats.bufBaseWritten
 	o.stats.bufBaseHit, o.stats.bufBaseRead = hit, read
+	o.stats.bufBaseDirtied, o.stats.bufBaseWritten = dirtied, written
 }
 
 // Next records the per-row delta into the running total and

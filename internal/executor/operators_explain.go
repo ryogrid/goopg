@@ -176,20 +176,27 @@ func addExplainSettingsGroup(ctx *Context, opts parser.ExplainOptions, root map[
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
-// formatBuffersLine renders the upstream "Buffers: shared hit=N read=N"
-// text (ExplainPropertyList's shared-buffer branch in explain.c's
-// show_buffer_usage), omitting the whole line when both counters are zero
-// and omitting each individual hit=/read= term when that counter is zero.
+// formatBuffersLine renders the upstream "Buffers: shared hit=N read=N
+// dirtied=N written=N" text (show_buffer_usage's has_shared/shared-buffer
+// branch in postgres/src/backend/commands/explain.c), omitting the whole
+// line when all four counters are zero and omitting each individual
+// hit=/read=/dirtied=/written= term when that counter is zero.
 func formatBuffersLine(s *nodeStats) string {
-	if s.bufHit == 0 && s.bufRead == 0 {
+	if s.bufHit == 0 && s.bufRead == 0 && s.bufDirtied == 0 && s.bufWritten == 0 {
 		return ""
 	}
-	parts := make([]string, 0, 2)
+	parts := make([]string, 0, 4)
 	if s.bufHit > 0 {
 		parts = append(parts, fmt.Sprintf("hit=%d", s.bufHit))
 	}
 	if s.bufRead > 0 {
 		parts = append(parts, fmt.Sprintf("read=%d", s.bufRead))
+	}
+	if s.bufDirtied > 0 {
+		parts = append(parts, fmt.Sprintf("dirtied=%d", s.bufDirtied))
+	}
+	if s.bufWritten > 0 {
+		parts = append(parts, fmt.Sprintf("written=%d", s.bufWritten))
 	}
 	return "Buffers: shared " + strings.Join(parts, " ")
 }
@@ -585,12 +592,14 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		// unconditionally once BUFFERS is requested, even when zero
 		// (explain.c's peek_buffer_usage: "when format is anything other
 		// than text, we print even if the counters are all zeroes"). Only
-		// the shared hit/read counters goopg actually tracks are emitted
-		// here; dirtied/written/local/temp/I-O-timing remain deferred
+		// the shared hit/read/dirtied/written counters goopg actually
+		// tracks are emitted here; local/temp/I-O-timing remain deferred
 		// (ledger, M0122-0003).
 		if opts.Buffers {
 			obj["Shared Hit Blocks"] = s.bufHit
 			obj["Shared Read Blocks"] = s.bufRead
+			obj["Shared Dirtied Blocks"] = s.bufDirtied
+			obj["Shared Written Blocks"] = s.bufWritten
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the

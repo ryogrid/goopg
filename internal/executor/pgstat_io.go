@@ -222,7 +222,7 @@ const pgStatIOColCount = 20
 func fetchIOStatRows(ctx *Context) [][]string {
 	var poolHit, poolRead int64
 	if ctx != nil && ctx.Pool != nil {
-		poolHit, poolRead = ctx.Pool.BufferCounters()
+		poolHit, poolRead, _, _ = ctx.Pool.BufferCounters()
 	}
 
 	var rows [][]string

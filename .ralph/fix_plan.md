@@ -250,12 +250,20 @@ mirroring M0119's ledger `status` column.
       other tracked cell is an honest 0, untracked cells are NULL. Also fixed
       a wrong test assumption in `TestPort_PgWalsummary002Blocks` (upstream
       does report 2 walsummarizer rows even with summarize_wal=off).
+      `dirtied=`/`written=` counters **done** (2026-07-04, later loop):
+      `storage.Pool` gains `sharedDirtiedCount`/`sharedWrittenCount`
+      (incremented at all 8 clean→dirty `MarkDirty*` CAS-success sites, and
+      at `evictVictim`'s post-flush point only, deliberately excluding
+      bgwriter/checkpointer flushes); rendered in TEXT and JSON/XML/YAML
+      alongside hit/read. Verified against a real running server: an
+      `UPDATE` immediately after `INSERT` withholds `dirtied=` (page
+      already dirty), then reports it correctly after an intervening
+      `CHECKPOINT`.
       Still open: `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time
-      buffers — no planning-phase buffer counters exist), `dirtied=`/
-      `written=`/local-temp-buffer terms, `pg_stat_io`'s other 7 I/O
-      counters (writes/extends/evictions/reuses/writebacks/fsyncs + their
-      bytes/time columns), `track_io_timing` runtime SET (GUC registered
-      but only consulted once at process boot).
+      buffers — no planning-phase buffer counters exist), local/temp-buffer
+      terms, `pg_stat_io`'s other 7 I/O counters (writes/extends/evictions/
+      reuses/writebacks/fsyncs + their bytes/time columns), `track_io_timing`
+      runtime SET (GUC registered but only consulted once at process boot).
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, ANY/SOME/ALL, DEFAULT-clause

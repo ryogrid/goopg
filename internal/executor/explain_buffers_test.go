@@ -10,7 +10,8 @@ import (
 // read=N" detail line (explain.c's show_buffer_usage), diffed from
 // storage.Pool.BufferCounters() around each node's Open/Next/Close calls
 // (internal/executor/instrument.go). Scope: shared-only, hit/read-only —
-// local/temp buffers and dirtied/written are a deferred follow-up.
+// local/temp buffers remain a deferred follow-up (dirtied/written now land
+// too — see TestFormatBuffersLineDirtiedWritten).
 func TestExplainBuffersAnalyzeTextLine(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
@@ -61,7 +62,7 @@ func TestExplainBuffersOffByDefault(t *testing.T) {
 // Blocks"/"Shared Read Blocks" unconditionally once BUFFERS is requested,
 // even when a counter is zero (explain.c's peek_buffer_usage comment: "when
 // format is anything other than text, we print even if the counters are all
-// zeroes"). Scope: shared-only — dirtied/written/local/temp remain deferred.
+// zeroes"). Scope: shared-only — local/temp remain deferred.
 func TestExplainBuffersJSONAlwaysIncludesSharedBlocks(t *testing.T) {
 	ctx, cleanup := newVMFixture(t)
 	defer cleanup()
@@ -94,6 +95,55 @@ func TestExplainBuffersJSONOmittedWithoutBuffersOption(t *testing.T) {
 	out := strings.Join(lines, "\n")
 	if strings.Contains(out, "Shared Hit Blocks") || strings.Contains(out, "Shared Read Blocks") {
 		t.Errorf("EXPLAIN (ANALYZE, FORMAT JSON) without BUFFERS unexpectedly reported shared blocks:\n%s", out)
+	}
+}
+
+// TestExplainBuffersJSONAlwaysIncludesDirtiedWrittenBlocks extends the
+// shared-blocks JSON slice above: "Shared Dirtied Blocks"/"Shared Written
+// Blocks" are also unconditional once BUFFERS is requested (same
+// peek_buffer_usage semantics — printed even when zero), closing the
+// dirtied/written gap the two rows above deferred.
+func TestExplainBuffersJSONAlwaysIncludesDirtiedWrittenBlocks(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf7 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM ebuf7")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Shared Dirtied Blocks"`) {
+		t.Errorf("expected \"Shared Dirtied Blocks\" key in JSON output:\n%s", out)
+	}
+	if !strings.Contains(out, `"Shared Written Blocks"`) {
+		t.Errorf("expected \"Shared Written Blocks\" key in JSON output:\n%s", out)
+	}
+}
+
+// TestFormatBuffersLineDirtiedWritten pins formatBuffersLine's TEXT rendering
+// of the dirtied=/written= terms directly (explain.c's show_buffer_usage
+// shared-block branch): each term is independently gated on its own counter
+// being positive, and the whole line is gated on any of the four being
+// nonzero.
+func TestFormatBuffersLineDirtiedWritten(t *testing.T) {
+	cases := []struct {
+		name string
+		s    nodeStats
+		want string
+	}{
+		{"all zero", nodeStats{}, ""},
+		{"dirtied only", nodeStats{bufDirtied: 3}, "Buffers: shared dirtied=3"},
+		{"written only", nodeStats{bufWritten: 2}, "Buffers: shared written=2"},
+		{"all four", nodeStats{bufHit: 1, bufRead: 2, bufDirtied: 3, bufWritten: 4},
+			"Buffers: shared hit=1 read=2 dirtied=3 written=4"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := formatBuffersLine(&c.s); got != c.want {
+				t.Errorf("formatBuffersLine(%+v) = %q, want %q", c.s, got, c.want)
+			}
+		})
 	}
 }
 
