@@ -2,79 +2,88 @@
 
 ---
 
-**Loop #32 (this session) — COMPLETE, committed + pushed.**
+**Loop #39 (this session) — COMPLETE, committed + pushed (`f2fb90db`).**
 
-Task: M0122-0003 — implement 2 of the 5 still-`0` `pg_stat_io` op counters
-named as open by the prior loop's ledger row: `evictions` and `extends`
-(+ `extend_bytes`).
+Task: M0122-0004 — implement real `GROUP BY GROUPING SETS / ROLLUP / CUBE`
+semantics (previously silently downgraded to a plain GROUP BY via an
+`IntegerConst(0)` sentinel, per the fix_plan's "still open" list and a
+confirmed-open `unimplemented_feat.json` entry, `task_id: M0097-regress`).
 
-Landed: `storage.Pool` (`internal/storage/bufpool.go`) gains
-`sharedEvictionCount`/`sharedExtendCount` atomic counters +
-`EvictionCount()`/`ExtendCount()` accessors — same pattern as the
-pre-existing `sharedDirtiedCount`/`sharedWrittenCount`/`sharedReadTimeNanos`
-trio (own accessor pair, not a wider `BufferCounters()` tuple, to avoid
-touching its 4 existing call sites). `sharedEvictionCount` increments once
-in `evictVictim`, right after the "slot was free" early-return check (only
-when a real, valid tag is displaced), regardless of dirty state — a strict
-superset of the dirty-only `sharedWrittenCount`. `sharedExtendCount`
-increments once in `PinNew` right after its `p.mgr.Extend` call succeeds —
-confirmed the pool's *only* smgr-Extend call site (grepped, no sibling).
-`internal/executor/pgstat_io.go`'s `fetchIOStatRows` wires both into the
-existing per-op `switch` for the one row goopg instruments (client
-backend/relation/normal); `extends` also renders `extend_bytes`
-(`count*8192`). Tests: `internal/storage/bufpool_counters_test.go`
-(`TestBufferCountersEvictionAndExtend` — 2-slot pool, fills to capacity
-with 0 evictions then forces N further evictions via N more `PinNew`
-calls), `internal/executor/pgstat_io_test.go`
-(`TestPgStatIOEvictionsAndExtendsRendered` — end-to-end rendered-cell
-assertion). Design: `docs/design/0122-0003-explain-format-xml-yaml.md`
-new "`evictions`/`extends` counters" section; `docs/design/README.md` row
-extended. Ledger row appended (`.ralph/deferral_ledger.md`, 2026-07-05,
-M0122-0003, narrows the prior read-timing row). `.ralph/fix_plan.md`'s
-M0122-0003 item + "Next up" banner updated to reflect current remaining
-scope. Committed as `e1e64c2b` (8 files, pathspec-scoped commit), pushed.
+Landed: parser (`internal/parser/select.go`'s rewritten
+`parseGroupByElems` + `parseGroupingUnitList`/`parseGroupingSetsList`/
+`rollupAlternatives`/`cubeAlternatives`/`cartesianProductGroupingSets`)
+expands ROLLUP/CUBE/explicit GROUPING SETS into `SelectStmt.GroupingSets
+*GroupingSetsSpec` (`internal/parser/ast.go`), a materialized `[][]Expr`
+set list cross-multiplied against plain GROUP BY columns per SQL:1999
+§7.9. Planner's `rewriteGroupingSets` (`internal/planner/planner.go`,
+hooked into `planSelect` right after the indirection-star rewrite, before
+the CTE preplan / `s.SetOp != nil` check) expands this into a synthetic
+UNION ALL chain of plain-GROUP-BY branches — falls straight through into
+the pre-existing N-ary set-op planning machinery (segment flattening,
+`wrapSetOpBranchWithCasts`, `wrapSetOpSortLimit`) completely unmodified.
+`substituteGroupingExpr` NULLs out excluded-dimension references per
+branch (recursing `BinaryOp`/`UnaryOp`/`IsNullExpr`/`IsBoolExpr`/
+`IsDistinctFromExpr`/`CollateExpr`/`CastExpr`/`RowExpr`/`CaseExpr`/
+non-aggregate `FuncCall`) and resolves the new `GROUPING(...)`
+pseudo-function (dedicated `*parser.GroupingCall` AST node, analyzer-typed
+`int4`) to a literal bitmask per branch. No executor change needed.
+Removed the now-dead `IntegerConst{Value:0}` sentinel-skip in
+`buildAggregateStage` (a literal `GROUP BY 0` now correctly 42P10s).
+Tests: `internal/parser/select_test.go` (5 parse-shape tests),
+`internal/executor/grouping_sets_compat_test.go` (4 end-to-end
+ROLLUP/CUBE/GROUPING-SETS/GROUPING() tests). Design:
+`docs/design/0122-0004-grouping-sets-rollup-cube.md`;
+`docs/design/README.md` new row; `unimplemented_feat.json` entry updated
+in place (`status: resolved`); `.ralph/deferral_ledger.md` row appended
+(2026-07-05) for the substitution walker's known-narrow gaps (doesn't
+cover every `parser.Expr` variant — `InExpr`/`ExistsExpr`/array exprs —
+or window-function `.Over.PartitionBy`/`.OrderBy`). Committed as
+`f2fb90db` (12 files, pathspec-scoped to stay disjoint from the peer's
+in-flight `internal/executor/pgstat_io.go`/`pgstat_io_test.go`/
+`internal/storage/bufpool.go`/`bufpool_counters_test.go`/
+`internal/initdb/open.go`/`docs/design/0122-0003-explain-format-xml-yaml.md`),
+pushed to `origin/align-data-structure-with-pg`.
 
-Concurrency note: a live peer `ralph_loop.sh` tree (own process tree,
-loop #38→#39 by the time this loop finished) was active throughout —
-confirmed via `pgrep -af ralph_loop.sh`/`ps -ef` showing two genuinely
-independent process trees (different parent PIDs), not the documented
-subshell-argv-duplication artifact. The peer's own loop-#38 carry note
-(overwritten by this entry) recorded that it saw this loop's in-flight
-edits to `pgstat_io.go`/`bufpool.go`/their tests and deliberately left
-them untouched, confirming disjointness from both sides before either
-committed. The peer landed 2 commits on fully disjoint files during this
-loop (`e1387bb1` DEFAULT-clause stale-entry closure + its `e5893325`
-working_set carry, both M0122-0004 `unimplemented_feat.json`/bookkeeping
-only) — confirmed via `git log`/`git diff --cached` before this loop's own
-commit, no functional overlap. This loop's own commit used an explicit
-pathspec covering only the files it exclusively owned (storage/executor
-source+tests, ledger, design docs, fix_plan.md) — never touching
-`.ralph/progress.json` (still shows a harmless timestamp-only diff from
-`make ralph-state-guard`'s auto-repair; left uncommitted, likely the
-driver's own bookkeeping to pick up) or `unimplemented_feat.json` (peer
-already committed it before this loop's own commit ran).
+Concurrency note: a live peer `ralph_loop.sh` tree was active throughout
+(confirmed via `pgrep -af ralph_loop.sh` at loop start — multiple
+independent loop processes). The peer landed its own M0122-0003
+`write_time` work as commit `13725c89` (pushed) *during* this loop —
+confirmed via `git status`/`git diff --stat` polling before staging; this
+loop's `git add`/`git commit` used an explicit pathspec covering only the
+12 grouping-sets files, so `13725c89` simply became this commit's parent
+(shared working tree, no rebase needed) and none of the peer's source
+files were ever staged here. `.ralph/fix_plan.md`/`.ralph/deferral_ledger.md`/
+`docs/design/README.md` (shared bookkeeping files both loops append to)
+picked up peer content in between reads — committed anyway per
+established precedent (loop #38's own note): these are
+continuously-appended shared logs, not source files; whoever commits next
+captures the current merged state, nothing is lost. This file
+(`working_set.md`) itself hit a stale-read conflict from the peer's own
+loop #33 completion note mid-write — resolved by re-reading before this
+overwrite (their detail is preserved in their own commit `13725c89` +
+design doc + ledger row, not lost).
 
-Next step: M0122-0003 remaining sub-items (per the fix_plan banner):
-`EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers — no
-planning-phase buffer counters exist), local/temp-buffer terms,
-`write_time`/`extend_time` + the 3 remaining `pg_stat_io` op counters
-(reuses/writebacks/fsyncs — each needs a genuinely new counting mechanism:
-strategy-ring reuse, bgwriter/checkpointer-scoped writeback attribution,
-fsync call-site instrumentation respectively — not mechanical extensions
-of the eviction/extend pattern), EXPLAIN's `I/O Timings` line, and a
-`CTEDMLPrefix` nested-node instrumentation residual. Alternatively:
-M0119-0004 pg_dump catalog-view parity, or the next unresolved M0122-0005
-sub-item (per the peer's own carry notes: 1-byte `char` OID
-disambiguation, `pg_collation_for()`). Re-check `git status` +
-`pgrep -af ralph_loop.sh` fresh at loop start — multiple independent
-loops may still be running concurrently on this tree.
+Next step: remaining M0122-0004 open items — frame clause parsing/
+execution (ROWS/RANGE/GROUPS — `evalFrameAggFuncs`/`frameEnd`/
+`evalNtileFuncs` have three real consumers to generalize against),
+combining named-window forms, and intervals (timestamp-timestamp
+arithmetic, sub-day units — `internal/parser/expr.go`'s `IntervalLit`
+only supports day/month/year). M0122-0003's remaining sub-items per the
+peer's own note: `extend_time`, `EXPLAIN (BUFFERS)` without ANALYZE,
+local/temp-buffer terms, 3 remaining `pg_stat_io` op counters
+(reuses/writebacks/fsyncs), EXPLAIN's `I/O Timings` line, a
+`CTEDMLPrefix` residual. M0122-0005 has two open sub-items: 1-byte
+`char`(OID 18) disambiguation (`internal/catalog/codec.go:1356`
+`TypeNameToOID`) and `pg_collation_for()` (large — no collation tracking
+in v0 by design). Re-check `git status` + `pgrep -af ralph_loop.sh` fresh
+at loop start — multiple independent loops are still running
+concurrently on this tree.
 
-Gates run: `go build ./...` clean; `go vet` clean on
-`internal/storage/... internal/executor/...`; `go test
-./internal/storage/... ./internal/executor/...` PASS (no regressions);
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench smoke
-PASS (machine-enforced hook, ~235-14365 TPS across TPC-B/update/
-select-only); `make ralph-state-guard` — found + auto-repaired a
-stale-`completed`-marker inconsistency in `.ralph/progress.json` (the
-peer's clean-exit marker from a prior loop, not a project-completion
-marker), consistent after repair.
+Gates run: `go build ./...` clean; `go vet ./internal/parser/...
+./internal/analyzer/... ./internal/planner/... ./internal/executor/...`
+clean; `go test ./internal/parser/... ./internal/analyzer/...
+./internal/planner/... ./internal/executor/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, elapsed 26.92s/95.96s);
+pre-commit pgbench smoke PASS (machine-enforced hook: 191/172/12450 TPS
+across TPC-B/update/select-only); `make ralph-state-guard` run next
+(before final status block).
