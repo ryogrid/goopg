@@ -257,3 +257,43 @@ func TestIndexReloptionsSurviveRestart(t *testing.T) {
 		t.Errorf("ro_idx.Fillfactor after restart = %d, want 60", idx.Fillfactor)
 	}
 }
+
+// TestPartitionChildIndexReloptionsSurviveRestart is the partition-child
+// sibling of TestIndexReloptionsSurviveRestart (M0119-0004 index-reloptions
+// follow-up): createPartitionChildIndexes previously never copied the
+// WITH-clause storage parameters onto an auto-created partition-child index,
+// so even once a plain index's reloptions survived a restart, a partitioned
+// parent's `WITH (fillfactor=N)` still silently vanished from every child —
+// both in memory and, because resyncIndexClassHeapRow was never called for
+// the child either, across a restart.
+func TestPartitionChildIndexReloptionsSurviveRestart(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runDDL(t, rt1, "CREATE TABLE ro_part (id int4 NOT NULL) PARTITION BY RANGE(id)")
+	runDDL(t, rt1, "CREATE TABLE ro_part_child PARTITION OF ro_part FOR VALUES FROM (1) TO (100)")
+	runDDL(t, rt1, "CREATE INDEX ro_part_idx ON ro_part (id) WITH (fillfactor=60)")
+	if err := rt1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 64})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt2.Close()
+
+	child, ok := rt2.Catalog.LookupIndex(parser.ObjectName{Schema: "public", Name: "ro_part_child_id_idx"})
+	if !ok {
+		t.Fatal("ro_part_child_id_idx not found after restart")
+	}
+	if child.Fillfactor != 60 {
+		t.Errorf("ro_part_child_id_idx.Fillfactor after restart = %d, want 60 (parent's WITH-clause value)", child.Fillfactor)
+	}
+}

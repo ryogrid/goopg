@@ -14404,3 +14404,46 @@ Gates: `go build ./...` clean; `go test ./internal/catalog/...
 ./internal/executor/... ./internal/initdb/...` (full packages) PASS,
 including the two new tests above; `make ralph-state-guard` OK; pgbench
 smoke = pre-commit hook.
+
+## Follow-up: partition-child index reloptions (M0119-0004, later loop)
+
+Closes the "Scope note" gap left open directly above:
+`createPartitionChildIndexes` (`internal/executor/operators_ddl.go`) copied
+`HasPredicate`/`Predicate`/`IncludeColumns`/expression-column strings onto
+each auto-created partition-child index, but never the WITH-clause storage
+parameters (`Fillfactor`/`DeduplicateItems`/`FastUpdate`/
+`GinPendingListLimit`/`PagesPerRange`/`AutoSummarize`) — so `CREATE INDEX ...
+WITH (fillfactor=N)` on a partitioned parent silently dropped the option on
+every partition child, in memory and therefore across a restart too (the
+child index's own heap row was never resynced either).
+
+Fix mirrors the parent-index WITH-clause block exactly: copy the six fields
+from `s` (the original `CreateIndexStmt`) onto `childIdx`, then call the
+pre-existing `resyncIndexClassHeapRow` when heap sync is available (the same
+function the parent-index fix above introduced). Since
+`createPartitionChildIndexes` recurses using the same top-level `s` for
+multi-level partition trees, a single WITH-clause application at the level
+`CREATE INDEX` is actually run at now propagates correctly to every
+descendant level, not just the immediate children.
+
+Considered and ruled out of scope: `ALTER INDEX parent ATTACH PARTITION
+child` (`internal/executor/operators_ddl.go`,
+`parser.AlterIndexAttachPartition` case) needs no equivalent fix — both
+indexes there are created independently via their own separate `CREATE
+INDEX` statements (each already carrying its own WITH-clause options via the
+main path above) before being attached, so there is no "inherit from parent"
+step to patch.
+
+Tests: `internal/executor/partition_create_index_recurse_test.go` —
+`TestCreateIndexRecursesPartitionTreeCarriesReloptions` (in-memory catalog
+copy, single partition level). `internal/initdb/view_ddl_recovery_test.go` —
+`TestPartitionChildIndexReloptionsSurviveRestart` (full Init/Open/DDL/
+Close/Open restart regression, sibling of `TestIndexReloptionsSurviveRestart`
+above).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/initdb/...` (full packages, `-count=1`)
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, after one transient
+failure/hang caused by a concurrently-running peer ralph loop's own
+build+test load — reproduced clean on retry, unrelated to this change:
+[[concurrent_ralph_loops_corrupt_tree]]); `make ralph-state-guard` OK.

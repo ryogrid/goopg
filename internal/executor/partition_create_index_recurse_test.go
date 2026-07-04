@@ -83,3 +83,33 @@ func indexNames(idxs []*catalog.Index) []string {
 	}
 	return out
 }
+
+// TestCreateIndexRecursesPartitionTreeCarriesReloptions is the partition-child
+// sibling of TestIndexReloptionsSurviveRestart (M0119-0004 index-reloptions
+// follow-up): createPartitionChildIndexes previously copied HasPredicate/
+// IncludeColumns/expression strings onto each auto-created child index but
+// silently dropped the WITH-clause storage parameters (fillfactor,
+// deduplicate_items, ...), so `CREATE INDEX ... WITH (fillfactor=N)` on a
+// partitioned parent lost the option on every partition.
+func TestCreateIndexRecursesPartitionTreeCarriesReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for _, s := range []string{
+		"CREATE TABLE part_ro (id int) PARTITION BY RANGE(id)",
+		"CREATE TABLE part_ro_child PARTITION OF part_ro FOR VALUES FROM (1) TO (100)",
+		"CREATE INDEX part_ro_idx ON part_ro(id) WITH (fillfactor=60)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("runDDL(%q): %v", s, err)
+		}
+	}
+
+	child, ok := cat.LookupIndex(parser.ObjectName{Name: "part_ro_child_id_idx"})
+	if !ok {
+		t.Fatal("expected child index part_ro_child_id_idx to exist after CREATE INDEX recursion")
+	}
+	if child.Fillfactor != 60 {
+		t.Errorf("part_ro_child_id_idx.Fillfactor = %d, want 60 (parent's WITH-clause value)", child.Fillfactor)
+	}
+}

@@ -6111,6 +6111,20 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 				childIdx.ColExprStrings[i] = str
 			}
 		}
+		// Carry the WITH-clause storage parameters too, so `CREATE INDEX ...
+		// WITH (fillfactor=N)` on a partitioned parent doesn't silently drop
+		// the option on every child (M0119-0004 index-reloptions follow-up).
+		childIdx.Fillfactor = s.Fillfactor
+		childIdx.DeduplicateItems = s.DeduplicateItems
+		childIdx.FastUpdate = s.FastUpdate
+		childIdx.GinPendingListLimit = s.GinPendingListLimit
+		childIdx.PagesPerRange = s.PagesPerRange
+		childIdx.AutoSummarize = s.AutoSummarize
+		if catalogHeapSyncAvailable(o.ctx) {
+			if err := resyncIndexClassHeapRow(o.ctx, childIdx); err != nil {
+				return err
+			}
+		}
 		// Intermediate partitioned partition: recurse into its own children,
 		// rooting each grandchild at this level's index.
 		if childTbl.PartitionMethod != "" {
