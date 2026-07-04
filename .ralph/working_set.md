@@ -121,3 +121,47 @@ runtime `SET` (both M0122-0003 sub-items, both block on the same
 storage-layer I/O-counter gap; `pg_stat_io` likely more tractable since
 `Pool.BufferCounters()` already exists and just needs pool-wide
 aggregation instead of per-node attribution).
+
+---
+
+**Loop #12 addendum (this session).** A peer `ralph_loop.sh` was again
+detected running concurrently at loop start (SessionStart hook). Verified
+via `pgrep -af` before touching anything; `git status` showed no
+conflicting in-progress edits (peer's prior M0122-0003 work was already
+committed). Picked up deferred item (2) named in this file's own loop #11
+section above — `DROP MATERIALIZED VIEW` physical-storage leak — landed +
+pushed `a7f770b3`:
+- `execDropOneMatView` (`internal/executor/operators_ddl.go`) now mirrors
+  `dropTableByRefImmediate`'s `DROP TABLE` sequence for the matview's own
+  main-fork file: `o.ctx.Catalog.RelFileNode(tbl)` → `Pool.InvalidateRel` →
+  `Pool.Manager().DropRelation` (idempotent, safe even for an unmaterialized
+  `WITH NO DATA` matview) → `FSM.DropRelation`/`VM.DropRelation`, added
+  right after the existing catalog-heap xmax-stamp block.
+- Test: `internal/executor/operators_ddl_matview_storage_test.go`
+  (`TestDropMaterializedViewReleasesStorage`) — creates a populated matview,
+  confirms `Pool.Manager().Exists(rel)` is true, drops it, asserts the file/
+  FSM/VM are all cleared. PASS.
+- Design: `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up: DROP
+  MATERIALIZED VIEW physical-storage leak" section.
+- Ledger: appended a `resolved` row closing this item; deferred item (1)
+  (view reloptions round-trip: `CheckOption`/`SecurityBarrier`/
+  `SecurityInvoker` — `buildUserPGClassRow` hardcodes `reloptions="{}"`)
+  remains open, and a NEW narrower gap surfaced while scoping this fix:
+  indexes on a materialized view (if any exist) have their own, separate,
+  unexamined physical storage — not covered by this loop.
+- Gates: `go build`/`go vet` clean; `go test ./internal/executor/...` (full
+  package) PASS; `go test ./internal/initdb/... -run 'MatView|View'` PASS;
+  `make ralph-state-guard` OK (self-repaired a stale running/completed
+  mismatch, expected mid-loop); pre-commit pgbench smoke PASS at commit
+  time. tpch-spotcheck.sh NOT run — same pre-existing bloated-data-dir MAINT
+  issue noted above, still unresolved.
+- Committed via `git commit -m ... -- <explicit pathspec>` (message BEFORE
+  `--`, not after — `git commit -- <paths> -m msg` errors because pathspec
+  must be the trailing arg) to avoid absorbing any peer-staged files, per
+  the hard-won lesson in this same file's loop #11 addendum above.
+
+Next step: pick up the reloptions-heap-encoder gap (bounded, single-loop,
+`internal/executor/pg18_user_catalog_rows.go`'s `buildUserPGClassRow`) or
+another M0119-0004 slice from `.ralph/fix_plan.md`'s "Next up" banner /
+`.ralph/deferral_ledger.md`. Prefer a non-M0122-0003 item to avoid stepping
+on the peer tree, which appears to be actively working that milestone.
