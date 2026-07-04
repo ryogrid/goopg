@@ -31,11 +31,13 @@ defer unless genuinely compelling (then record a ledger row); commit + push at
 every clean, green (build + pre-commit) checkpoint.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is partially done
-(2026-07-04, loop #8) — FORMAT XML/YAML and per-CTE ANALYZE stats both
-landed (two independent loop #8 slices; see the M0122-0003 line item for
-detail), 4 sub-items remain open (SETTINGS/BUFFERS rendering, `pg_stat_io`
-real data, `track_io_timing` runtime SET). Pick up one of those next, or
-continue the M0119-0004 pg_dump catalog-view parity battery / next
+(2026-07-04) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
+and BUFFERS TEXT rendering (shared hit/read, ANALYZE-only) have all
+landed; see the M0122-0003 line item for detail. Remaining sub-items:
+BUFFERS FORMAT JSON/XML/YAML + planning-only variant + dirtied/written
+counters, `pg_stat_io` real data, `track_io_timing` runtime SET. Pick up
+one of those next, or continue the M0119-0004 pg_dump catalog-view
+parity battery / next
 unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
@@ -203,8 +205,16 @@ mirroring M0119's ledger `status` column.
       `SessionRegistry.ExplainVariables()` + `Context.ExplainSettings`
       (wired in both dispatch.go and dispatch_extended.go) render
       `Settings: k = 'v', ...` (TEXT) / `"Settings": {...}` (JSON/XML/YAML).
-      Still open: BUFFERS rendering (parsed, never emitted — no buffer
-      hit/read counters exist), `pg_stat_io` (table registered, `VirtualRows`
+      BUFFERS rendering **partial** (2026-07-04, later loop): `storage.Pool`
+      gains `sharedHitCount`/`sharedReadCount` atomic counters (incremented
+      at `Pin()`'s hit/miss decision points); the existing per-node
+      `instrumentedOp` ANALYZE wrapper (`internal/executor/instrument.go`)
+      now also diffs `Pool.BufferCounters()` snapshots per node; TEXT
+      rendering only (`Buffers: shared hit=N read=N`), under ANALYZE only.
+      Still open: FORMAT JSON/XML/YAML BUFFERS rendering, `EXPLAIN
+      (BUFFERS)` without ANALYZE (PG 17+ planning-time buffers — no
+      planning-phase buffer counters exist), `dirtied=`/`written=`/local-
+      temp-buffer terms, `pg_stat_io` (table registered, `VirtualRows`
       always returns nil), `track_io_timing` runtime SET (GUC registered
       but only consulted once at process boot).
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04, M0122-0003).
