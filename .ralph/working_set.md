@@ -2,167 +2,152 @@
 
 ---
 
-**Loop #19 (this loop) — COMPLETE, committed + pushed (`97e7318c`).**
-Picked up the M0122-0004 backlog item "ANY/SOME/ALL" (confirmed via a
-background research agent + my own code reading that it was genuinely
-incomplete, not stale — unlike window frames/GROUPING SETS which are
-medium/large and GROUPING SETS/DEFAULT-clause/intervals which are
-already largely done or too big for one loop).
+**Loop #21 (this loop) — COMPLETE, committed + pushed (`aad61997`, on top
+of the peer's `40905365`).**
 
-Landed: `expr op ANY|SOME|ALL (array | subquery)` now works for every
-comparison operator (`=`,`!=`,`<>`,`<`,`>`,`<=`,`>=`) and all four POSIX
-regex operators. Previously only `=`/`!=`/`<>`/regex supported ANY
-(array/scalar only), `ALL` worked only for `=` (via a NOT-wrap hack),
-`SOME` wasn't a recognized keyword at all, and no operator accepted a
-`(SELECT ...)` subquery operand.
+Picked up the exact "Next step" left by loop #20: the SELECT-privilege
+follow-up to M0097-0040 (INSERT/UPDATE/DELETE ACL enforcement landed
+loop #20). Ran a background research agent FIRST (per the ledger's own
+warning that this is NOT a one-line mirror of the write-path check) to
+map: view inlining semantics, `tableACLs` default-seeding state, and
+every sibling scan operator — before writing any code.
 
-- `internal/parser/token.go`/`keywords.go`: new `KwSome` keyword
-  (unreserved, same class as the pre-existing `KwAny`).
-- `internal/parser/expr.go` / `internal/planner/plan.go`: `InExpr` gains
-  `AllOp bool` (AND semantics) beside the pre-existing `AnyOp` (element-
-  wise operator, OR semantics). Threaded through all planner construction
-  sites (`planner.go:5787,9513,10497,10726`, `foldconst.go:66`).
-  `internal/executor/expr.go`'s `evalInExpr` gained the ALL branch
-  (AND-short-circuit-false), placed before the existing ANY branch.
-- `internal/parser/select.go`: `parseAnyTail` now also accepts a `SELECT`
-  operand (mirrors `parseInTail`'s subquery detection) — previously only
-  `ARRAY[...]`/scalar. New `isAnyOrSomeTok`/`isAllTok` helpers. Extended
-  the pre-existing regex-ANY block and the `=`/`!=`/`<>` ANY block in
-  place to accept SOME/ALL; added ONE new dispatch block for the
-  previously-uncovered combos (`<,>,<=,>=` × ANY/SOME/ALL, `!=`/`<>` ALL).
-  Did NOT rewrite the pre-existing `= ALL` NotEqualAny/NOT-wrap path —
-  left it untouched to avoid regressing already-shipped behavior.
-- Subquery operand needed **zero new executor plumbing**: discovered
-  `collectInValues` (`internal/executor/expr.go`) already generically
-  drains an arbitrary single-column subquery plan (built for
-  `IN (subquery)`) and is read identically regardless of List vs Plan —
-  confirmed via `planInExpr` (`internal/planner/planner.go:9503`) already
-  threading `AnyOp` through both branches unconditionally.
-- Tests: `internal/parser/any_all_test.go` (AST-shape pins for all
-  operator×quantifier combos + subquery form), `internal/executor/any_all_test.go`
-  (end-to-end array + subquery evaluation, incl. `v > ALL (SELECT ...)`
-  shapes). Both new files, no existing tests modified.
-- Design: `docs/design/0003-0008-subqueries.md` new "Follow-up: ANY / SOME
-  / ALL" section (removed the doc's own stale "ANY/SOME/ALL... deferred"
-  out-of-scope line); `docs/design/README.md` row updated in place.
-  `.ralph/fix_plan.md` M0122-0004 banner updated (ANY/SOME/ALL struck from
-  open list, closure note appended). `unimplemented_feat.json`'s matching
-  entry ("ANY/SOME/ALL quantified subqueries") updated in place with
-  RESOLVED audit note. `.ralph/deferral_ledger.md` new row recording the
-  one deliberate known limitation below.
-- **Known limitation (recorded, not fixed):** NULL-element handling is
-  not fully three-valued — both ANY and ALL skip NULL elements and
-  return a definite true/false rather than propagating NULL per upstream
-  `ScalarArrayOpExpr` semantics. This predates this loop (the ANY branch,
-  M0097-0068); the new ALL branch deliberately mirrors the same
-  simplification for consistency rather than being asymmetrically "more
-  correct". Resume point in the ledger if a failing test ever demands it.
-- Gates: `go build ./...` clean; `go test ./internal/parser/...
-  ./internal/planner/... ./internal/executor/...` PASS (no regressions,
-  confirmed via a retry-loop around a transient build break — see
-  concurrency note below). Pre-commit pgbench smoke hook PASS (0 failed
-  transactions; ~227-247 TPS TPC-B/simple-update, ~14.1k TPS select-only).
-  `make ralph-state-guard`: found status/progress inconsistent
-  (status="running" vs progress="completed" from a prior loop's clean-exit
-  marker), auto-repaired to progress="in_progress", now OK.
+Landed: `seqScanOp.Open` (`operators_storage.go`), `indexScanOp.openPrep`
+(`operators_index.go`), and `indexOnlyScanOp.Open` (`operators_indexonly.go`)
+— the three raw-heap read operators — now call
+`dmlPrivilegePermitted(ctx, tbl, "SELECT")` pre-lock, raising `42501` for
+a non-superuser/non-owner role missing the grant. Added ONE new branch to
+`dmlPrivilegePermitted`: `priv == "SELECT" && catalog.IsSystemRelation(tbl.OID)`
+(OID < `FirstNormalObjectId`/16384) always permits SELECT — the research
+agent confirmed `tableACLs` is empty for every relation (catalog or user)
+until an explicit GRANT runs, so without this carve-out every psql `\d`,
+pg_dump run, and information_schema query from ANY non-superuser role would
+newly 42501 (zero existing test would have caught this — confirmed via
+grep across every role/SET-ROLE test file). INSERT/UPDATE/DELETE on system
+catalogs are unaffected by the carve-out (still need a real grant).
+
+Tests: `internal/executor/storage_dml_test.go`'s
+`TestSeqScanRequiresSelectPrivilege`, `TestIndexScansRequireSelectPrivilege`
+(sibling pin — a fix scoped to only `seqScanOp` would leave index-scan
+plans able to bypass the gate), `TestSystemCatalogSelectAlwaysPermitted`.
+Design: `docs/design/0118-0039-truncate-conflict-privilege-model.md` new
+Follow-up section; `docs/design/README.md` row extended.
+`.ralph/fix_plan.md` M0122-0008 banner updated. `unimplemented_feat.json`
+M0097-0040 entry updated in place. `.ralph/deferral_ledger.md`: flipped
+the prior loop's SELECT-deferral row to `resolved`, appended a new row
+recording the one remaining known limitation below.
+
+**Known limitation (recorded, not fixed):** views are inlined into the
+querying session's own plan at plan time (`planner.go`'s
+`if tbl.View != nil { inner, err := Plan(tbl.View, cat) }`) — there is no
+view-owner/security-definer identity anywhere in planner or executor
+(confirmed zero hits for `ViewOwner`/`expandView` etc.). PostgreSQL runs a
+view's underlying-table reads as the *view owner*, so `GRANT SELECT ON
+view` alone (no base-table grant) still works in PG but is now DENIED in
+goopg (the inlined scan checks the querying role, not the view owner). No
+existing test combines a non-superuser role with a view-only grant, so
+this is an un-caught scope boundary, not a regression. Fixing it needs a
+`ViewOwner`/definer-identity field threaded through `Plan()` — a
+materially larger change, deferred to its own loop.
+
+Gates: `go build ./...` clean; `go vet ./internal/executor/...
+./internal/planner/... ./internal/catalog/...` clean; `go test
+./internal/executor/... ./internal/planner/... ./internal/catalog/...
+./internal/server/...` PASS (no regressions); `go test
+./internal/testport/... -run
+'TestPort_IsolationTruncateConflict|TestPort_IsolationIntraGrantInplace'`
+PASS (role/GRANT-adjacent isolation specs unaffected);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench smoke
+PASS (0 failed, TPC-B ~181 TPS, simple-update ~239 TPS, select-only
+~13.5k TPS). `make ralph-state-guard`: auto-repaired the same routine
+running/completed progress-marker skew (a prior loop's clean-exit marker),
+exit 0.
 
 **Concurrency note:** the peer `ralph_loop.sh` tree (screen-rooted
-`2085426` chain, live PID `2652067` this loop) was actively writing to
-`internal/catalog/catalog.go`/`codec.go`, `internal/executor/codec.go`/
-`operators_storage.go`/`pg18_user_catalog_rows*.go`/`storage_dml_test.go`,
-`internal/initdb/open.go`/`view_ddl_recovery_test.go`,
-`docs/design/0110-0001-pg-dump-tap-port.md` throughout this loop — none of
-those files were touched. Mid-loop the peer's edit to
-`operators_storage.go` (calling a not-yet-defined `dmlPrivilegePermitted`)
-transiently broke `go test ./internal/executor/...` (NOT `go build ./...`,
-which doesn't compile `_test.go` files) for ~1 poll cycle; a retry-loop
-(`until go test ...; do sleep 5; done`) confirmed it self-resolved once the
-peer finished that edit — no action needed on my end beyond not panicking
-at a red build that isn't mine. Committed via explicit `git add -- <15
-files>` + `git commit -m ... -- <same 15 files>` (message BEFORE `--`,
-not after — `git commit -- <paths> -m msg` mis-parses the message as a
-pathspec), verified `git show --stat HEAD` touched only those 15 files
-and the peer's dirty set was byte-identical before and after. Fetched
-+ pushed clean fast-forward (`129f7be9..97e7318c`, ahead-1/behind-0 at
-fetch time).
+`2085426` chain, live PID `2692451`/`2709750` this loop) was actively
+writing `internal/catalog/catalog.go`/`codec.go`, `internal/executor/
+codec.go`/`pg18_user_catalog_rows*.go`, `internal/initdb/open.go`/
+`view_ddl_recovery_test.go`, `docs/design/0110-0001-pg-dump-tap-port.md`
+throughout this loop — none of those files were touched. Committed via
+explicit `git commit -m ... -- <9 files>` (message BEFORE `--`);
+`git show --stat HEAD` confirmed only those 9 files changed and the
+peer's dirty set was untouched before and after. Fetched + pushed clean
+fast-forward (`40905365..aad61997`, ahead-1/behind-0 at fetch time).
 
-Next step: pick M0122-0004's remaining open sub-items — window frames
-ROWS/RANGE/GROUPS (medium: needs new `WindowFrame` AST field + executor
-frame evaluation, `parseWindowDef` currently hard-errors on any frame
-clause, `internal/parser/select.go:3437`), GROUPING SETS/ROLLUP/CUBE
-(large: parser already accepts the syntax but the planner comment at
-`internal/planner/planner.go:5070-5072` says explicitly it's "handled as
-plain GROUP BY on the key columns" — no real multi-level grouping-set
-expansion, no NULL-substituted rows, likely no `GROUPING()` function;
-needs a probe to confirm `GROUPING()` status before scoping), or DEFAULT-
-clause/intervals (both already extensively implemented per this loop's
-research agent — would need a probe to find any real remaining gap before
-picking). Also still open: the comma/LATERAL-join `ctx.OuterRows` wiring
-gap (ledger row 480), and M0122-0003's `pg_stat_io`/`track_io_timing`
-remainder. Re-check `git status` first — the peer's dirty file set above
-may have changed by the time the next loop starts.
+Next step: the M0097-0040/M0122-0008 RBAC bucket's only remaining item is
+the view-owner gap just above (bounded: needs `catalog.Table` to carry a
+view-definer identity + `dmlPrivilegePermitted` to check it before falling
+back to the querying role — new regression test needed since none exist
+today). Otherwise resume M0122-0004's still-open window frames ROWS/RANGE/
+GROUPS or GROUPING SETS/ROLLUP/CUBE (`internal/planner/planner.go:5070-5072`
+comment confirms GROUP BY is NOT real multi-level grouping-set expansion;
+`internal/parser/select.go:3437` hard-errors on any window frame clause) —
+**re-check `git status` first**, the peer may be mid-flight on a different
+file set by the time the next loop starts. Or `M0122-0003`'s
+`pg_stat_io`/`track_io_timing` remainder (needs a new I/O-stats collection
+layer, architectural — see ledger). Or the comma/LATERAL-join
+`ctx.OuterRows` wiring gap (ledger row 480, still open).
 
 ---
 
-**Loop #20 (this loop, the "peer" referenced just above) — COMPLETE,
-committed + pushed (`46bd3f2a`, on top of the `97e7318c`/`6173ea86`
-ANY/SOME/ALL work above — same shared working tree/`.git`, not separate
-clones, so our two loops' commits interleave on one branch).**
+**Loop #22 (this loop, the "peer" referenced just above) — COMPLETE,
+committed + pushed (`a49d5656`, on top of the peer's `aad61997`/`40905365`
+above — same shared working tree/`.git`).**
 
-Started investigating the same M0122-0004 backlog (per loop #19's "Next
-step" above) but a live mid-investigation `git status` recheck caught the
-peer *already* writing `internal/parser/{select,keywords,token,expr}.go` +
-`internal/planner/{foldconst,plan,planner}.go` for exactly the ANY/SOME/ALL
-item — pivoted immediately, touched none of those files. (The peer's note
-above independently confirms this from their side: my own later edit to
-`operators_storage.go` transiently broke their `go test` for one poll
-cycle before I'd finished it.)
+This session had a coherent M0119-0004 reloptions-restart-persistence fix
+already fully written (code + tests + design-doc section + a matching
+`resolved` deferral-ledger row 478, dated 2026-07-04) sitting uncommitted
+in the working tree from before a context summarization boundary — no new
+implementation work was needed, only verification and committing:
+`buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go`) used
+to hardcode `reloptions="{}"` unconditionally, so `fillfactor`/every
+`autovacuum_*` setting/`vacuum_index_cleanup`, and for views
+`security_barrier`/`security_invoker`/`check_option`, silently reverted to
+defaults across every restart. Three compounding gaps: (1) the reloptions-
+list builder was extracted from `catalog.go`'s live virtual pg_class
+closure into shared `catalog.TableReloptionsElements`/`BuildTableReloptions`;
+(2) `encodeValuePG`'s `"text[]"` case silently discarded any non-`KindBytes`
+Datum as an empty array — fixed by encoding a real ArrayType blob via the
+existing `pgTextArrayBytes`; (3) `decodePhysicalPGValueMctx` had no
+`"text[]"`/`"_text"` case (fell to the generic default varlena branch,
+returning raw undecoded ArrayType bytes) — added `decodePGTextArrayElements`
++ newly-exported `catalog.ArrayTextLiteral`. New `catalog.ApplyTableReloptions`
+wires the read side into `loadUserTablesFromHeap` via newly-exported
+`executor.PGClassColumnsPG18()`.
 
-Picked up **M0097-0040** instead — a `unimplemented_feat.json` entry with
-`fix_plan: no-match` (not folded into any M0122 bucket): `GRANT/REVOKE
-INSERT|SELECT|UPDATE|DELETE` were already recorded in `catalog.tableACLs`
-(for `pg_dump` `relacl` fidelity) but only `TRUNCATE`/`MAINTAIN` ever
-consulted `HasTablePrivilege` — plain DML silently ignored REVOKEs.
+Verified (did not re-derive, just confirmed the pre-written diff was sound):
+`go build ./...` clean; `go vet ./...` clean; `go test
+./internal/catalog/... ./internal/executor/... ./internal/initdb/...`
+(full packages) PASS, incl. the two new tests
+`TestBuildUserPGClassRowReloptionsSurvivesHeapEncode` and
+`TestTableAndViewReloptionsSurviveRestart`; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); pre-commit pgbench smoke PASS (0 failed, TPC-B
+~186 TPS, simple-update ~246 TPS, select-only ~14.2k TPS). Committed via
+explicit `git commit -m ... -- <11 files>` (message BEFORE `--`);
+`git show --stat HEAD` confirmed only those 11 files changed
+(`.ralph/progress.json`, the `0110-0001-pg-dump-tap-port.md` design doc,
+`internal/catalog/{catalog,codec}.go`, `internal/executor/{codec,
+pg18_user_catalog_rows,pg18_user_catalog_rows_test}.go`,
+`internal/initdb/{open,view_ddl_recovery_test}.go`, `weekly_loc.{csv,png}`)
+and the peer's dirty set (`.ralph/working_set.md`, the `postgres` submodule's
+untracked GLOBAL-index/build noise) was untouched before and after. Fetched
+first and confirmed `aad61997` (the peer's just-landed SELECT-ACL commit)
+was already an ancestor of local HEAD (`git merge-base --is-ancestor`) before
+pushing — clean fast-forward (`aad61997..a49d5656`). `make ralph-state-guard`:
+auto-repaired the same routine running/completed progress-marker skew, exit 0.
 
-Landed: `internal/executor/operators_storage.go`'s new
-`dmlPrivilegePermitted(ctx, tbl, priv) bool` (bootstrap-superuser bypass →
-table-owner bypass → `HasTablePrivilege` lookup, mirrors
-`operators_vacuum.go`'s `maintenancePermitted`), called pre-lock from
-`insertOp`/`updateOp`/`deleteOp.Open` → `42501 permission denied for table
-%s`. Verified (read-only) that `fkCascadeDelete` and the logical-replication
-apply worker both write heap pages directly, bypassing `insertOp`/
-`updateOp`/`deleteOp` entirely — so FK CASCADE and replication apply are
-unaffected, matching PG (RI triggers aren't subject to the invoker's ACLs).
+No new deferral-ledger row needed — row 478 (2026-07-04) already documented
+this fix's landing and its two out-of-scope residuals (index reloptions via
+`buildUserPGClassRowForIndex`/`loadUserIndexesFromHeap`; `toast.*`
+reloptions) before this loop began; committing didn't change the scope.
 
-Tests: `internal/executor/storage_dml_test.go`'s
-`TestDMLRequiresTablePrivilege`. Design:
-`docs/design/0118-0039-truncate-conflict-privilege-model.md` new Follow-up
-section; `docs/design/README.md` row updated. `.ralph/fix_plan.md`
-M0122-0008 banner updated. `unimplemented_feat.json` M0097-0040 → resolved.
-`.ralph/deferral_ledger.md`: new row for the still-open `SELECT`-privilege
-gap (every read path incl. internal system-catalog scans — separate bounded
-loop, not folded in here).
-
-Gates: `go build ./...` clean; `go test ./internal/executor/...
-./internal/planner/... ./internal/server/... ./internal/catalog/...` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench smoke
-PASS (0 failed, TPC-B ~232-250 TPS, select-only ~14.2k TPS).
-`make ralph-state-guard`: auto-repaired the same routine running/completed
-progress-marker skew, exit 0. Committed via explicit `git commit -m ... --
-<7 files>`; `git show --stat HEAD` confirmed only those 7 files changed and
-the peer's dirty set (`catalog.go`/`catalog/codec.go`/`executor/codec.go`/
-`pg18_user_catalog_rows*.go`/`initdb/open.go`/
-`initdb/view_ddl_recovery_test.go`/`docs/design/0110-0001-*.md`) was
-untouched before and after. Push was a clean fast-forward.
-
-Next step: pick M0122-0004's still-open window frames ROWS/RANGE/GROUPS or
-GROUPING SETS/ROLLUP/CUBE (both confirmed genuinely unimplemented, see
-loop #19's notes above for exact file:line pointers) — **re-check
-`git status` first**, the peer may be mid-flight on one of them again.
-Or continue the SELECT-privilege follow-up this loop deferred (ledger row
-above): `seqScanOp.Open`/index-scan paths need the same
-`dmlPrivilegePermitted(ctx, tbl, "SELECT")` gate, but require a dedicated
-regression pass confirming internal system-catalog scans on behalf of a
-non-superuser session stay unaffected. Or the comma/LATERAL-join
-`ctx.OuterRows` wiring gap (ledger row 480, still open), or `M0122-0003`'s
-`pg_stat_io`/`track_io_timing` remainder.
+Next step: pick up the index-reloptions residual row 478 named
+(`internal/executor/pg18_user_catalog_rows.go`'s `buildUserPGClassRowForIndex`
+still hardcodes `reloptions="{}"` for every index — fillfactor and AM-specific
+params like `fastupdate`/`gin_pending_list_limit` would need the same
+builder+decode+apply pattern this loop's fix used for tables/views, wired
+into `loadUserIndexesFromHeap`), or return to loop #21's view-owner
+security-definer gap, or M0122-0004's window frames/GROUPING SETS backlog
+(see loop #21's notes above for exact file:line pointers). **Re-check
+`git status` first** — the screen-rooted peer loop may have new WIP by the
+time the next loop starts.
