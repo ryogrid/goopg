@@ -3038,8 +3038,15 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		arrExpr  parser.Expr
 		castType string // element-level cast type (e.g. "int4"); empty = no cast. M0097-0035.
 	}
+	type regexpMatchesEntry struct {
+		colIdx      int
+		stringExpr  parser.Expr
+		patternExpr parser.Expr
+		flagsExpr   parser.Expr // nil when not given
+	}
 	var srfs []srfEntry
 	var unnests []unnestEntry
+	var regexpMatchesEntries []regexpMatchesEntry
 	var userSrfs []userSrfEntry
 	var rs *catalog.Routines
 	if ctx != nil && ctx.cat != nil {
@@ -3081,6 +3088,21 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: fc.Args[0], castType: srfCastType})
 			continue
 		}
+		// regexp_matches(string, pattern[, flags]) → setof text[], one row
+		// per match with the 'g' flag (else at most one row). Target-list
+		// only — the FROM-clause form is unwired. M0122-0002.
+		if strings.EqualFold(fc.Name.Name, "regexp_matches") {
+			if len(fc.Args) < 2 || len(fc.Args) > 3 {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
+					Message: "regexp_matches requires 2 or 3 arguments"}
+			}
+			e := regexpMatchesEntry{colIdx: i, stringExpr: fc.Args[0], patternExpr: fc.Args[1]}
+			if len(fc.Args) == 3 {
+				e.flagsExpr = fc.Args[2]
+			}
+			regexpMatchesEntries = append(regexpMatchesEntries, e)
+			continue
+		}
 		// Check if the function is a user-defined SETOF SQL function. M0097-0020.
 		if rs != nil {
 			candidates := rs.LookupByName(fc.Name)
@@ -3095,11 +3117,14 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		}
 	}
 	// Build per-column resolved expressions.
-	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(userSrfs))
+	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(regexpMatchesEntries)+len(userSrfs))
 	for _, e := range srfs {
 		srfColMap[e.colIdx] = true
 	}
 	for _, e := range unnests {
+		srfColMap[e.colIdx] = true
+	}
+	for _, e := range regexpMatchesEntries {
 		srfColMap[e.colIdx] = true
 	}
 	for _, e := range userSrfs {
@@ -3151,7 +3176,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		wrapSlot++
 	}
 
-	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
+	if len(srfs) == 0 && len(unnests) == 0 && len(regexpMatchesEntries) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
 		return nil, nil
 	}
 
@@ -3222,6 +3247,13 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			for _, u := range userSrfs {
 				if u.colIdx == i {
 					retType = catalog.Type{Name: u.routine.ReturnType.Name}
+					break
+				}
+			}
+			// regexp_matches always returns text[]. M0122-0002.
+			for _, rm := range regexpMatchesEntries {
+				if rm.colIdx == i {
+					retType = catalog.Type{Name: "text[]"}
 					break
 				}
 			}
@@ -3313,6 +3345,27 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType}
 	}
 
+	// Resolve regexp_matches args against ctx. M0122-0002.
+	regexpMatchesCols := make([]RegexpMatchesCol, len(regexpMatchesEntries))
+	for k, e := range regexpMatchesEntries {
+		strResolved, err := resolveExpr(e.stringExpr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		patResolved, err := resolveExpr(e.patternExpr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		var flagsResolved Expr
+		if e.flagsExpr != nil {
+			flagsResolved, err = resolveExpr(e.flagsExpr, ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		regexpMatchesCols[k] = RegexpMatchesCol{ColIdx: e.colIdx, StringExpr: strResolved, PatternExpr: patResolved, FlagsExpr: flagsResolved}
+	}
+
 	// Resolve user SETOF function args against ctx. M0097-0020.
 	userSrfCols := make([]UserSrfCol, len(userSrfs))
 	for k, u := range userSrfs {
@@ -3341,16 +3394,17 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	}
 
 	return &ProjectSet{
-		pos:          s.Pos(),
-		Child:        child,
-		SrfCols:      srfCols,
-		UnnestCols:   unnestCols,
-		UserSrfCols:  userSrfCols,
-		OtherExprs:   otherExprs,
-		schema:       schema,
-		Wrappers:     wrappers,
-		ChildWidth:   childWidth,
-		EvalRowWidth: childWidth + wrapSlot,
+		pos:               s.Pos(),
+		Child:             child,
+		SrfCols:           srfCols,
+		UnnestCols:        unnestCols,
+		RegexpMatchesCols: regexpMatchesCols,
+		UserSrfCols:       userSrfCols,
+		OtherExprs:        otherExprs,
+		schema:            schema,
+		Wrappers:          wrappers,
+		ChildWidth:        childWidth,
+		EvalRowWidth:      childWidth + wrapSlot,
 	}, nil
 }
 

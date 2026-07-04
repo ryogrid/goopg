@@ -5230,6 +5230,14 @@ func regexpFirstMatchArray(re *regexp.Regexp, s string) Datum {
 	if idx == nil {
 		return NullDatum
 	}
+	return regexpMatchArrayDatum(re, s, idx)
+}
+
+// regexpMatchArrayDatum builds the text[] array-literal Datum for one match,
+// given a submatch index slice as returned by FindStringSubmatchIndex /
+// FindAllStringSubmatchIndex. Shared by regexpFirstMatchArray (single match)
+// and regexpAllMatchesArrays (SRF, one call per match).
+func regexpMatchArrayDatum(re *regexp.Regexp, s string, idx []int) Datum {
 	var elems []string
 	if re.NumSubexp() == 0 {
 		elems = []string{s[idx[0]:idx[1]]}
@@ -5244,6 +5252,53 @@ func regexpFirstMatchArray(re *regexp.Regexp, s string) Datum {
 		}
 	}
 	return NewStringDatum("{" + strings.Join(elems, ",") + "}")
+}
+
+// regexpAllMatchesArrays mirrors regexp_matches(string, pattern, 'g')'s SRF
+// semantics (postgres/src/backend/utils/adt/regexp.c setup_regexp_matches):
+// with the 'g' flag, one Datum per match against s; without it, PG's SRF form
+// still yields at most one row (the first match), same as the scalar case.
+// Returns nil (zero rows) when there is no match, matching PG's SRF row count
+// (unlike the scalar-position fallback, which returns SQL NULL for no match).
+func regexpAllMatchesArrays(re *regexp.Regexp, s string, global bool) []Datum {
+	if !global {
+		if d := regexpFirstMatchArray(re, s); !d.IsNull() {
+			return []Datum{d}
+		}
+		return nil
+	}
+	allIdx := re.FindAllStringSubmatchIndex(s, -1)
+	if len(allIdx) == 0 {
+		return nil
+	}
+	out := make([]Datum, len(allIdx))
+	for i, idx := range allIdx {
+		out[i] = regexpMatchArrayDatum(re, s, idx)
+	}
+	return out
+}
+
+// evalRegexpMatchesSRF evaluates regexp_matches(string, pattern[, flags]) in
+// SELECT-list SRF position (see projectSetOp.openSelectSrfMode). Invalid
+// patterns / NULL string or pattern args yield zero rows rather than an
+// error, matching the permissiveness of the pre-existing scalar case arm.
+func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
+	if sD.IsNull() || patD.IsNull() {
+		return nil
+	}
+	flags := ""
+	if !flagsD.IsNull() {
+		flags = flagsD.StringValue()
+	}
+	pattern := patD.StringValue()
+	if strings.Contains(flags, "i") {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+	return regexpAllMatchesArrays(re, sD.StringValue(), strings.Contains(flags, "g"))
 }
 
 func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
@@ -7500,13 +7555,18 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	case "regexp_match", "regexp_matches":
 		// regexp_match(string, pattern [, flags]) → text[] (at most one match)
 		// regexp_matches(string, pattern [, flags]) → setof text[] (PG is an
-		// SRF that yields one row per match with the 'g' flag). goopg has no
-		// FROM-clause/target-list SRF wiring for regexp_matches (unlike
-		// generate_series/unnest/regexp_split_to_table, see
-		// operators_ddl_partition.go), so this scalar path always returns at
-		// most the FIRST match's capture-group array, matching regexp_match's
-		// existing (non-SRF) behavior; the 'g'-flag multi-row case is
-		// deferred (ledger M0122-0002/regexp_matches-srf).
+		// SRF that yields one row per match with the 'g' flag). This scalar
+		// path handles regexp_match always, plus regexp_matches whenever it
+		// is NOT a bare SELECT-list target (e.g. nested in a larger
+		// expression, or in a context buildSelectSrfProjectSet doesn't cover
+		// such as WHERE/GROUP BY) — it returns at most the FIRST match's
+		// capture-group array, matching regexp_match's own behavior. A bare
+		// `regexp_matches(...)` SELECT-list target is instead planned as a
+		// RegexpMatchesCol and expanded per-match by projectSetOp (see
+		// operators_project_set.go / evalRegexpMatchesSRF), which is the only
+		// path that honours the 'g' flag's one-row-per-match semantics. The
+		// FROM-clause form (`FROM regexp_matches(...)`) is still unwired
+		// (ledger M0122-0002/regexp_matches-srf).
 		if len(x.Args) >= 2 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			pat, e2 := evalExpr(x.Args[1], row, ctx)

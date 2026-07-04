@@ -1090,6 +1090,20 @@ type UnnestCol struct {
 	Wrapped bool
 }
 
+// RegexpMatchesCol describes one regexp_matches(string, pattern[, flags])
+// call in the SELECT target list. Unlike UnnestCol (which flattens one
+// array's elements one-per-row), each row's value here is a WHOLE match's
+// capture-group array: one row per match when flags contains 'g', otherwise
+// at most one row — mirroring regexp_matches' own SRF semantics (PG's
+// setup_regexp_matches). The FROM-clause form (`FROM regexp_matches(...)`)
+// is not covered by this — target-list only. M0122-0002 (regexp_matches-srf).
+type RegexpMatchesCol struct {
+	ColIdx      int  // which output column this SRF fills
+	StringExpr  Expr // the subject string argument
+	PatternExpr Expr // the regex pattern argument
+	FlagsExpr   Expr // optional flags argument; nil when not given
+}
+
 // SrfWrapper applies an enclosing scalar expression to a set-returning function
 // nested inside a SELECT-list target (e.g. `generate_series(1,n) % 4`). Expr is
 // the resolved target expression with the SRF call replaced by a ColumnRef that
@@ -1122,10 +1136,11 @@ type ProjectSet struct {
 	// When non-empty, the operator expands the SRFs and zips them
 	// together, repeating OtherExprs for each step. The output schema
 	// covers both SRF and non-SRF columns.
-	SrfCols     []SrfCol     // one per generate_series call in target list
-	UnnestCols  []UnnestCol  // one per unnest(array) call in target list. M0097-0106.
-	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
-	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
+	SrfCols           []SrfCol           // one per generate_series call in target list
+	UnnestCols        []UnnestCol        // one per unnest(array) call in target list. M0097-0106.
+	RegexpMatchesCols []RegexpMatchesCol // one per regexp_matches call in target list. M0122-0002.
+	UserSrfCols       []UserSrfCol       // one per user-defined SETOF function call. M0097-0020.
+	OtherExprs        []Expr             // non-SRF target expressions; nil slot = SRF slot
 	// Wrappers hold enclosing scalar expressions over a nested SRF (e.g.
 	// `generate_series(1,n) % 4`). When non-empty the executor builds a
 	// per-step eval row of width EvalRowWidth (child row in [0:ChildWidth),

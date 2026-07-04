@@ -104,6 +104,72 @@ fixed `8 * 1024`.
   catalog-introspection functions never referenced by the TPC-H query set,
   and does not touch the planner, codec, or any row-producing operator.
 
+## Follow-up: `regexp_matches` SRF `'g'`-flag multi-row expansion (2026-07-04, later loop)
+
+The residual noted above — `regexp_matches`' real SRF semantics ("with the
+`'g'` flag, one row per match") — now lands for the SELECT-list/target-list
+position, the same position `generate_series`/`unnest` are already wired for:
+
+- `internal/planner/plan.go` gains `RegexpMatchesCol` (`ColIdx`, `StringExpr`,
+  `PatternExpr`, `FlagsExpr`) and `ProjectSet.RegexpMatchesCols`.
+- `internal/planner/planner.go`'s `buildSelectSrfProjectSet` detects a bare
+  `regexp_matches(string, pattern[, flags])` target exactly like it already
+  detects `unnest(...)`, resolves its args, and assigns the output column
+  type `text[]` (regexp_matches always returns an array, unlike
+  `generate_series`/`unnest`'s type-dependent output).
+- `internal/executor/operators_project_set.go`'s `projectSetOp.openSelectSrfMode`
+  gains a `regexpMatchesResults` branch that calls a new
+  `evalRegexpMatchesSRF` (`internal/executor/expr.go`), zipped into the output
+  exactly like `unnestResults`/`userResults` already are.
+- `internal/executor/expr.go` factors the pre-existing
+  `regexpFirstMatchArray` into a shared `regexpMatchArrayDatum` (one match's
+  array literal) plus a new `regexpAllMatchesArrays(re, s, global bool)`:
+  without `global` it still returns at most one match (mirrors the scalar
+  case), with `global` it returns one `Datum` per match via
+  `FindAllStringSubmatchIndex`.
+
+Unlike `unnest`'s "flatten one array's elements one-per-row" shape, each
+`regexp_matches` step's *value* is already a whole match's capture-group
+array — so `openSelectSrfMode` doesn't flatten anything further; it just
+zips one already-built array `Datum` per step, the same way
+`userSrfCols`/`unnestCols` results are zipped.
+
+**Verified against a real PostgreSQL 18.3 cluster** (not just derived from
+reading `postgres/src/backend/utils/adt/regexp.c`), byte-for-byte:
+
+```
+SELECT regexp_matches('foo bar baz', '\w+', 'g');   →  {foo} / {bar} / {baz}  (3 rows)
+SELECT regexp_matches('foo bar baz', '\w+');         →  {foo}                 (1 row)
+SELECT regexp_matches('---', '[0-9]+', 'g');         →  (0 rows)
+SELECT regexp_matches('2026-07-04 2027-01-02',
+       '([0-9]+)-([0-9]+)-([0-9]+)', 'g');           →  {2026,07,04} / {2027,01,02}  (2 rows)
+```
+
+The zero-row case is notable: a `regexp_matches` SRF call with no match
+yields **zero rows** (matches PG), which is different from the pre-existing
+scalar-position fallback (still used whenever `regexp_matches` is NOT a bare
+SELECT-list target, e.g. nested in a larger expression) that returns SQL
+`NULL` for no match — that asymmetry is real PG behavior, not a goopg bug
+(the scalar and SRF positions are genuinely different PG code paths).
+
+Tests: `internal/executor/regexp_matches_srf_test.go`
+(`TestRegexpMatchesSRF` — bare-target cases above; `TestRegexpMatchesSRFPerRow`
+— per-child-row zipping against a passthrough column over a real table, one
+source row with no match contributing zero output rows).
+
+Gates: `go build ./...`/`go vet ./...` clean; `go test
+./internal/executor/... ./internal/planner/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` run (Q12/Q13 spot-check) since this touches the
+shared `ProjectSet`/`buildSelectSrfProjectSet` planner path — see
+`.ralph/working_set.md` for the result recorded this loop.
+
+**Still deferred:** the FROM-clause form (`SELECT * FROM
+regexp_matches(...)`) is not wired — that needs a `planFromRegexpMatches`
+counterpart to `planFromUnnest`/`planFromGenerateSeries`
+(`internal/planner/planner.go`), analogous to how `unnest`/`generate_series`
+each have both a target-list path (this doc) and a FROM-clause path. Ledger
+row appended (`.ralph/deferral_ledger.md`, M0122-0002).
+
 ## Deferred / out of scope
 
 - The `fork` argument's `fsm`/`vm`/`init` cases are wired through correctly

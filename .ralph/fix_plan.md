@@ -180,6 +180,19 @@ mirroring M0119's ledger `status` column.
       deferred, ledger row), `pg_get_expr`, `isfinite`, `justify_*`,
       `pg_get_serial_sequence`, `pg_get_indexdef` (already implemented, verified
       2026-07-04). Design: `docs/design/0122-0002-pg-relation-size-real-sizes.md`.
+      **Follow-up (2026-07-04, later loop):** the deferred `'g'`-flag SRF
+      multi-row case now lands for the SELECT-list/target-list position —
+      `RegexpMatchesCol` in `internal/planner/plan.go`'s `ProjectSet`, detected
+      in `buildSelectSrfProjectSet` (`internal/planner/planner.go`) alongside
+      `generate_series`/`unnest`, expanded by `projectSetOp.openSelectSrfMode`
+      (`internal/executor/operators_project_set.go`) via a new
+      `evalRegexpMatchesSRF`/`regexpAllMatchesArrays` pair
+      (`internal/executor/expr.go`) — verified byte-for-byte against a real
+      PostgreSQL 18.3 cluster (`'g'` flag → one row per match, no flag → at
+      most the first match, no match → **zero** rows, unlike the scalar
+      fallback's NULL). Tests: `internal/executor/regexp_matches_srf_test.go`.
+      Still deferred: the FROM-clause form (`FROM regexp_matches(...)`) is
+      unwired — ledger row.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE
