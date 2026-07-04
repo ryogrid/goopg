@@ -190,6 +190,61 @@ Gates run: `go build ./...`; `go test ./internal/planner/... ./internal/executor
 `scripts/tpch-spotcheck.sh` (Q12=2/Q13=33); pgbench smoke via the pre-commit
 hook.
 
+## Follow-up: view-of-view chaining (closes deferred item 2)
+
+`viewAutoUpdatableChain` (`internal/planner/view_dml.go`, renamed from
+`viewAutoUpdatableBase`) now recurses when a simple auto-updatable view's
+single `FROM` relation is itself a simple auto-updatable view, walking down
+to the ultimate real base relation — PostgreSQL's `rewriteHandler.c` does the
+same recursive walk. This required one correction to the original eligibility
+check: `catalog.InMemory.CreateView` sets `Table.Virtual = true` on *every*
+view (it has no physical heap storage), not just goopg's system-catalog
+virtual relations — so the pre-existing single-level check's `b.Virtual`
+guard, which happened to also exclude views (since the separate `b.View !=
+nil` check already did that job), had to become `b.Virtual && b.View == nil`
+to admit a view as a valid intermediate relation while still excluding actual
+system catalogs (`pg_class` etc., `Virtual` with no `View`). Every level's
+target list is still required to be an unrenamed, in-order full-column-list
+passthrough (`viewTargetsPassthrough`, factored out of the old single-level
+function body unchanged), so column names and ordinals are identical at every
+level all the way down to `base` — a chain level's own `WHERE` therefore still
+resolves directly against `base` via the pre-existing `viewQualOnBase`, with
+no column-mapping translation needed.
+
+Two combination rules, both implemented in the new `viewChainQuals`:
+
+- **Row-visibility qual (UPDATE/DELETE), unconditional.** A chained view only
+  ever exposes rows visible through *every* level's own `WHERE` — the AND of
+  all levels' quals restricts which rows UPDATE/DELETE can touch, independent
+  of CHECK OPTION (mirrors PG: each level's SELECT filters its FROM in turn).
+- **CHECK OPTION (INSERT/UPDATE only), per rewriteHandler.c's CASCADED/LOCAL
+  propagation (~line 3791-3843).** A level is checked if it declares its own
+  `CHECK OPTION` (either mode) OR a `CASCADED` check option from an outer
+  level has propagated down to it; once triggered, `CASCADED` propagation
+  continues through every remaining inner level regardless of that level's
+  own setting. A `LOCAL` check option, by contrast, checks only levels that
+  themselves declare `CHECK OPTION` — it does not force an unchecked inner
+  view to be checked. `checked`'s per-level quals are AND'd together, same as
+  `all`. `viewCheckName` remains the outermost (DML-targeted) view's name —
+  goopg's `checkViewCheckOption` reports one combined violation rather than
+  PostgreSQL's per-level `WithCheckOption.relname`, a minor error-text fidelity
+  gap left as-is (out of scope — no behavior difference for the row itself).
+
+New tests in `internal/executor/view_dml_test.go`:
+`TestChainedViewInsertUpdateDeleteRewriteToBase` (chain rewrite + combined
+row-visibility qual for INSERT/UPDATE/DELETE),
+`TestChainedViewCheckOptionCascadeReachesInnerView` (default/explicit
+CASCADED forces the inner view's own qual even without its own CHECK
+OPTION), `TestChainedViewCheckOptionLocalDoesNotForceInnerCheck` (LOCAL does
+not), `TestChainedViewCheckOptionInnerEnforcedRegardlessOfOuter` (an inner
+view's own CHECK OPTION is enforced even when the outer view has none),
+`TestChainedViewInnerNotAutoUpdatableRejectsWholeChain` (a non-updatable
+inner view — e.g. one that aggregates — rejects the whole chain `55000`
+rather than silently rewriting past it).
+
+Gates: `go build ./...`; `go test ./internal/planner/... ./internal/executor/... ./internal/catalog/... ./internal/parser/...`;
+`scripts/tpch-spotcheck.sh`; pgbench smoke via the pre-commit hook.
+
 ## Deferred
 
 See `.ralph/deferral_ledger.md` for the formal entry. Summary:
@@ -199,9 +254,10 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    is rejected here (`55000`) rather than rewritten. Needs a `colMap []int`
    threaded through `Set`/`Returning`/row-assembly instead of relying on
    `tbl.Columns == base.Columns` positional identity.
-2. **View-of-view chaining.** A simple view defined `FROM` another simple
-   view is rejected; PG recurses. Needs the CASCADED/LOCAL distinction to
-   actually matter (currently moot, single-relation only).
+2. ~~**View-of-view chaining.**~~ — **RESOLVED** (see the "Follow-up" note
+   above): `viewAutoUpdatableChain` recurses through a chain of simple
+   updatable views, and CASCADED/LOCAL CHECK OPTION propagation now actually
+   matters (previously moot, single-relation only).
 3. **`UPDATE ... FROM` / `DELETE ... USING` a view.** Rejected
    unconditionally regardless of whether the base view would otherwise
    qualify. Needs the view qual threaded through the cross-product path

@@ -1,7 +1,8 @@
 package executor
 
 // view_dml_test.go pins the auto-updatable-view DML rewrite + WITH CHECK
-// OPTION enforcement fix (M0119-0004 slice-365 follow-up).
+// OPTION enforcement fix (M0119-0004 slice-365 follow-up), including
+// view-of-view chaining (root-0025 deferred item 2).
 //
 // Before this fix, INSERT/UPDATE/DELETE against ANY view (planInsert/
 // planUpdate/planDelete never checked catalog.Table.View) silently wrote
@@ -220,6 +221,220 @@ func TestUpdatableViewWhereQualEnforcedThroughIndexPath(t *testing.T) {
 	rows = runQueryRows(t, ctx, "SELECT val FROM t7 WHERE id = 2")
 	if len(rows) != 1 || rows[0][0].Format() != "25" {
 		t.Fatalf("row id=2 should be updated (visible through view qual), got %v", rows)
+	}
+}
+
+// TestChainedViewInsertUpdateDeleteRewriteToBase pins root-0025 deferred item
+// 2 (view-of-view chaining): a simple auto-updatable view defined FROM
+// another simple auto-updatable view rewrites INSERT/UPDATE/DELETE all the
+// way down to the real base table, and the row-visibility qual from EVERY
+// level in the chain (not just the outermost) restricts which rows
+// UPDATE/DELETE can touch — mirroring PostgreSQL's recursive
+// rewriteHandler.c walk.
+func TestChainedViewInsertUpdateDeleteRewriteToBase(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE tc (id int primary key, val int)")
+	must("INSERT INTO tc VALUES (1, 5), (2, 50), (3, 150)")
+	must("CREATE VIEW v_in AS SELECT id, val FROM tc WHERE val > 10")
+	must("CREATE VIEW v_out AS SELECT id, val FROM v_in WHERE val < 100")
+
+	// INSERT rewrites through both levels onto tc, regardless of whether the
+	// row satisfies either level's qual (no CHECK OPTION anywhere here).
+	must("INSERT INTO v_out VALUES (4, 20)")
+	rows := runQueryRows(t, ctx, "SELECT val FROM tc WHERE id = 4")
+	if len(rows) != 1 || rows[0][0].Format() != "20" {
+		t.Fatalf("after INSERT INTO v_out (chained): got %v, want val=20", rows)
+	}
+
+	// id=1 (val=5) fails v_in's own qual (val>10) -> excluded at the inner
+	// level even though it would pass v_out's own qual (val<100).
+	must("UPDATE v_out SET val = 999 WHERE id = 1")
+	rows = runQueryRows(t, ctx, "SELECT val FROM tc WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "5" {
+		t.Fatalf("row id=1 should be unchanged (excluded by inner view's qual), got %v", rows)
+	}
+
+	// id=3 (val=150) passes v_in's qual (150>10) but fails v_out's own qual
+	// (150<100) -> excluded at the outer level.
+	must("UPDATE v_out SET val = 999 WHERE id = 3")
+	rows = runQueryRows(t, ctx, "SELECT val FROM tc WHERE id = 3")
+	if len(rows) != 1 || rows[0][0].Format() != "150" {
+		t.Fatalf("row id=3 should be unchanged (excluded by outer view's qual), got %v", rows)
+	}
+
+	// id=2 (val=50) passes both levels' quals -> UPDATE/DELETE apply.
+	must("UPDATE v_out SET val = 60 WHERE id = 2")
+	rows = runQueryRows(t, ctx, "SELECT val FROM tc WHERE id = 2")
+	if len(rows) != 1 || rows[0][0].Format() != "60" {
+		t.Fatalf("row id=2 should be updated (visible through both levels), got %v", rows)
+	}
+	must("DELETE FROM v_out WHERE id = 2")
+	rows = runQueryRows(t, ctx, "SELECT id FROM tc WHERE id = 2")
+	if len(rows) != 0 {
+		t.Fatalf("row id=2 should be deleted (visible through both levels), got %v", rows)
+	}
+}
+
+// TestChainedViewCheckOptionCascadeReachesInnerView pins the CASCADED half of
+// root-0025 deferred item 2: an outer view's (default, or explicit CASCADED)
+// CHECK OPTION forces the inner view's own qual to be checked too, even
+// though the inner view declares no CHECK OPTION of its own — matching
+// rewriteHandler.c's "if the parent view has a cascaded check option, treat
+// this view as if it also had a cascaded check option" propagation.
+func TestChainedViewCheckOptionCascadeReachesInnerView(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE tc2 (id int primary key, val int)")
+	must("CREATE VIEW v_in2 AS SELECT id, val FROM tc2 WHERE val > 10")
+	// Default (unqualified WITH CHECK OPTION) is CASCADED.
+	must("CREATE VIEW v_out2 AS SELECT id, val FROM v_in2 WHERE val < 100 WITH CHECK OPTION")
+
+	// val=5 satisfies v_out2's own qual (5<100) but violates v_in2's qual
+	// (5 is not >10). Without cascading this loop's own single-level check
+	// would have wrongly accepted it; CASCADED must reject it.
+	err := runDDL(t, ctx, "INSERT INTO v_out2 VALUES (1, 5)")
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("INSERT violating cascaded inner qual: err=%v, want ExecError 44000", err)
+	}
+	rows := runQueryRows(t, ctx, "SELECT id FROM tc2")
+	if len(rows) != 0 {
+		t.Fatalf("rejected INSERT must not have written a row, got %v", rows)
+	}
+
+	// val=150 violates v_out2's own qual directly.
+	err = runDDL(t, ctx, "INSERT INTO v_out2 VALUES (2, 150)")
+	ee, ok = err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("INSERT violating outer qual: err=%v, want ExecError 44000", err)
+	}
+
+	// val=50 satisfies both levels.
+	must("INSERT INTO v_out2 VALUES (3, 50)")
+	rows = runQueryRows(t, ctx, "SELECT id, val FROM tc2")
+	if len(rows) != 1 || rows[0][1].Format() != "50" {
+		t.Fatalf("valid chained CHECK OPTION INSERT: got %v", rows)
+	}
+}
+
+// TestChainedViewCheckOptionLocalDoesNotForceInnerCheck pins the LOCAL half
+// of root-0025 deferred item 2: an outer view's WITH LOCAL CHECK OPTION only
+// checks its own qual — it must NOT force the inner view's qual to be
+// checked when the inner view has no CHECK OPTION of its own.
+func TestChainedViewCheckOptionLocalDoesNotForceInnerCheck(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE tc3 (id int primary key, val int)")
+	must("CREATE VIEW v_in3 AS SELECT id, val FROM tc3 WHERE val > 10")
+	must("CREATE VIEW v_out3 AS SELECT id, val FROM v_in3 WHERE val < 100 WITH LOCAL CHECK OPTION")
+
+	// val=5 violates v_in3's qual (not >10) but satisfies v_out3's own qual
+	// (5<100). LOCAL must NOT force the inner check, so this INSERT succeeds
+	// even though the row is immediately invisible through both views.
+	must("INSERT INTO v_out3 VALUES (1, 5)")
+	rows := runQueryRows(t, ctx, "SELECT val FROM tc3 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "5" {
+		t.Fatalf("LOCAL check option must not enforce inner qual, got %v", rows)
+	}
+
+	// val=150 violates v_out3's own qual directly -> still rejected.
+	err := runDDL(t, ctx, "INSERT INTO v_out3 VALUES (2, 150)")
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("INSERT violating outer's own LOCAL qual: err=%v, want ExecError 44000", err)
+	}
+}
+
+// TestChainedViewCheckOptionInnerEnforcedRegardlessOfOuter pins the other
+// direction: an inner view's OWN CHECK OPTION is enforced even when the
+// outer view (the one the DML statement actually names) has no CHECK OPTION
+// at all — PostgreSQL checks every view in the chain that itself declares
+// CHECK OPTION, independent of the outer view's setting.
+func TestChainedViewCheckOptionInnerEnforcedRegardlessOfOuter(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE tc4 (id int primary key, val int)")
+	must("CREATE VIEW v_in4 AS SELECT id, val FROM tc4 WHERE val > 10 WITH CHECK OPTION")
+	must("CREATE VIEW v_out4 AS SELECT id, val FROM v_in4 WHERE val < 100")
+
+	// val=5 violates v_in4's own CHECK OPTION qual — enforced even though
+	// v_out4 (the DML target) declares no CHECK OPTION itself.
+	err := runDDL(t, ctx, "INSERT INTO v_out4 VALUES (1, 5)")
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "44000" {
+		t.Fatalf("INSERT violating inner's own CHECK OPTION: err=%v, want ExecError 44000", err)
+	}
+	rows := runQueryRows(t, ctx, "SELECT id FROM tc4")
+	if len(rows) != 0 {
+		t.Fatalf("rejected INSERT must not have written a row, got %v", rows)
+	}
+
+	// val=200 satisfies v_in4's qual (200>10) but fails v_out4's own qual
+	// (200<100). v_out4 has no CHECK OPTION, so this is not enforced at
+	// INSERT time — the row is written even though it's invisible through
+	// v_out4 immediately afterward.
+	must("INSERT INTO v_out4 VALUES (2, 200)")
+	rows = runQueryRows(t, ctx, "SELECT val FROM tc4 WHERE id = 2")
+	if len(rows) != 1 || rows[0][0].Format() != "200" {
+		t.Fatalf("outer-unchecked qual violation should still write, got %v", rows)
+	}
+}
+
+// TestChainedViewInnerNotAutoUpdatableRejectsWholeChain confirms that when
+// the inner view of a chain falls outside the restricted auto-updatable
+// subset (e.g. it aggregates), the whole chain is rejected 55000 rather than
+// silently rewriting past it.
+func TestChainedViewInnerNotAutoUpdatableRejectsWholeChain(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE tc5 (id int primary key, val int)")
+	must("CREATE VIEW v_in5 AS SELECT id, count(*) AS val FROM tc5 GROUP BY id")
+	must("CREATE VIEW v_out5 AS SELECT id, val FROM v_in5")
+
+	stmts, err := parser.Parse("INSERT INTO v_out5 VALUES (1, 1)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	_, err = planner.Plan(stmts[0], cat)
+	pe, ok := err.(*planner.PlanError)
+	if !ok || pe.Code != "55000" {
+		t.Fatalf("INSERT through a chain with a non-updatable inner view: err=%v, want *planner.PlanError 55000", err)
 	}
 }
 

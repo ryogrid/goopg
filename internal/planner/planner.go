@@ -7185,7 +7185,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	}
 	// INSERT into a view: rewrite onto the view's auto-updatable base
 	// relation when the defining query is a simple single-table passthrough
-	// (viewAutoUpdatableBase); anything requiring INSTEAD OF trigger/rule
+	// (viewAutoUpdatableChain); anything requiring INSTEAD OF trigger/rule
 	// machinery goopg doesn't have stays rejected with 55000, matching
 	// PostgreSQL's error_view_not_updatable. From here on `tbl` is always a
 	// real heap relation, so the rest of this function needs no other view
@@ -7193,16 +7193,16 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 	var viewCheckQual Expr
 	var viewCheckName string
 	if tbl.View != nil {
-		base, autoOK := viewAutoUpdatableBase(tbl, cat)
+		chain, base, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdInsert)
 		}
-		if tbl.CheckOption != "" {
-			q, qerr := viewQualOnBase(tbl, base, cat)
-			if qerr != nil {
-				return nil, qerr
-			}
-			viewCheckQual = q
+		_, checked, qerr := viewChainQuals(s.Pos(), chain, base, cat)
+		if qerr != nil {
+			return nil, qerr
+		}
+		if checked != nil {
+			viewCheckQual = checked
 			viewCheckName = tbl.Name
 		}
 		tbl = base
@@ -7720,17 +7720,17 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		if len(s.From) > 0 {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
 		}
-		base, autoOK := viewAutoUpdatableBase(tbl, cat)
+		chain, base, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
 		}
-		q, qerr := viewQualOnBase(tbl, base, cat)
+		all, checked, qerr := viewChainQuals(s.Pos(), chain, base, cat)
 		if qerr != nil {
 			return nil, qerr
 		}
-		viewQual = q
-		if tbl.CheckOption != "" {
-			viewCheckQual = q
+		viewQual = all
+		if checked != nil {
+			viewCheckQual = checked
 			viewCheckName = tbl.Name
 		}
 		tbl = base
@@ -7888,15 +7888,15 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		if len(s.Using) > 0 {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
 		}
-		base, autoOK := viewAutoUpdatableBase(tbl, cat)
+		chain, base, autoOK := viewAutoUpdatableChain(tbl, cat)
 		if !autoOK {
 			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
 		}
-		q, qerr := viewQualOnBase(tbl, base, cat)
+		all, _, qerr := viewChainQuals(s.Pos(), chain, base, cat)
 		if qerr != nil {
 			return nil, qerr
 		}
-		viewQual = q
+		viewQual = all
 		tbl = base
 	}
 

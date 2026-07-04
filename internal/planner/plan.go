@@ -1255,7 +1255,7 @@ type Insert struct {
 
 	// ViewCheckQual/ViewCheckName are set when this INSERT's original target
 	// was a `WITH CHECK OPTION` view that was rewritten onto Table (its
-	// auto-updatable base relation, see viewAutoUpdatableBase). The executor
+	// auto-updatable base relation, see viewAutoUpdatableChain). The executor
 	// evaluates ViewCheckQual against each finalized row and raises 44000
 	// ("new row violates check option for view") when it isn't true — mirrors
 	// execMain.c's WCO_VIEW_CHECK. nil when the target wasn't a CHECK OPTION
