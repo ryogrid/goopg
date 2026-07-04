@@ -816,7 +816,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/plan.go:771-791 WindowFunc lacks frame clause structures"
+   "code_audit": "partially-resolved: named windows landed 2026-07-05 (M0122-0004, see the other window-function entry's code_audit + docs/design/0020-0001-window-parser-and-ast.md). Frame clauses remain confirmed-open — internal/planner/plan.go's WindowFunc still lacks frame-bounds structures. M0122-0004 also landed frame-consuming aggregate window functions (sum/count/avg/min/max OVER (...)) evaluated over PostgreSQL's *default* frame (no explicit ROWS/RANGE/GROUPS clause needed), which is the first real consumer for future frame-clause execution work — see docs/design/0020-0001-window-parser-and-ast.md's second Follow-up section."
   },
   {
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",

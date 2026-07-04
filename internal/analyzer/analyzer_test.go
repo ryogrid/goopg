@@ -131,9 +131,53 @@ func TestAnalyzeWindowFunctionAccepted(t *testing.T) {
 
 func TestAnalyzeWindowFunctionUnsupportedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
+	// count(*) OVER () is now supported (M0122-0004 frame-consuming
+	// aggregates) — first_value() is a real PostgreSQL window function
+	// still unimplemented in v0, so it remains the rejection case.
 	expectAnalyzeCode(t, cat,
-		"SELECT count(*) OVER () FROM pgbench_accounts",
+		"SELECT first_value(aid) OVER () FROM pgbench_accounts",
 		"0A000")
+}
+
+// TestAnalyzeWindowAggregateFunctionsAccepted pins the M0122-0004
+// frame-consuming aggregate window functions: sum/count/avg/min/max
+// used with OVER (...) rather than GROUP BY.
+func TestAnalyzeWindowAggregateFunctionsAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT count(*) OVER () FROM pgbench_accounts",
+		"SELECT sum(abalance) OVER (PARTITION BY bid ORDER BY aid) FROM pgbench_accounts",
+		"SELECT count(abalance) OVER () FROM pgbench_accounts",
+		"SELECT avg(abalance) OVER () FROM pgbench_accounts",
+		"SELECT min(abalance) OVER (PARTITION BY bid) FROM pgbench_accounts",
+		"SELECT max(abalance) OVER (PARTITION BY bid) FROM pgbench_accounts",
+		"SELECT sum(abalance) FILTER (WHERE aid > 1) OVER () FROM pgbench_accounts",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
+}
+
+// TestAnalyzeWindowAggregateFunctionsRejected pins the real PostgreSQL
+// restrictions on aggregate window functions (DISTINCT / ORDER BY in the
+// argument list), which parse_func.c's transformAggregateCall enforces
+// with ERRCODE_FEATURE_NOT_SUPPORTED (0A000) — not a v0 gap.
+func TestAnalyzeWindowAggregateFunctionsRejected(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(DISTINCT abalance) OVER () FROM pgbench_accounts",
+		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(abalance ORDER BY abalance) OVER () FROM pgbench_accounts",
+		"0A000")
+	expectAnalyzeCode(t, cat,
+		"SELECT sum(*) OVER () FROM pgbench_accounts",
+		"42601")
+	expectAnalyzeCode(t, cat,
+		"SELECT sum() OVER () FROM pgbench_accounts",
+		"42601")
 }
 
 // TestAnalyzeCreateFunctionPassesThrough pins M0015 Stage A step 3:

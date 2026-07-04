@@ -373,12 +373,64 @@ mirroring M0119's ledger `status` column.
       same spec written inline twice). Design:
       `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
       section; `docs/design/README.md` row extended; `unimplemented_feat.json`
-      entry updated in place. **Still open in this bucket:** frame clauses
-      (ROWS/RANGE/GROUPS) — the only functions with executor support today
-      (row_number/rank/lag/lead) don't consult a frame, so implementing
-      frame execution has no consumer yet; combining forms (`OVER (win
+      entry updated in place.
+      **Frame-consuming aggregate window functions removed from this
+      bucket (2026-07-05, this loop):** implemented `sum`/`count`/`avg`/
+      `min`/`max` as window functions (`sum(x) OVER (...)`,
+      `count(*) OVER (...)`, with `FILTER (WHERE ...)` support) —
+      the prerequisite the previous loop's note called out (frame
+      execution had no consumer since row_number/rank/lag/lead never
+      consult a frame). Deliberately implements PostgreSQL's *default*
+      frame (no explicit ROWS/RANGE/GROUPS clause needed: RANGE
+      UNBOUNDED PRECEDING, cumulative + peer-inclusive, when ORDER BY
+      is present; the whole partition otherwise) rather than general
+      frame-clause parsing — verified against upstream PostgreSQL 18.3
+      directly. `planner.WindowFunc` (`internal/planner/plan.go`) gained
+      `Star`/`Filter`/`InputType`; `buildWindowFunc`
+      (`internal/planner/planner.go`) gained a `sum/count/avg/min/max`
+      case reusing `buildAggregateCall`'s output-type rules; DISTINCT and
+      aggregate-internal ORDER BY are rejected with `0A000` (a genuine
+      PG restriction on aggregate window functions, not a v0 gap —
+      matches `parse_func.c`'s `transformAggregateCall` wording exactly).
+      `windowCallKey` gained a `filter:` component (latent bug fix: two
+      `sum(x) FILTER (WHERE a) OVER (w)` / `... FILTER (WHERE b) OVER
+      (w)` calls previously collided onto the same output column).
+      `analyzer.analyzeWindowFuncCall` mirrors the same validation.
+      Executor (`internal/executor/operators_window.go`) reuses the
+      *existing* GROUP BY aggregate accumulator
+      (`aggregateOp.applyAgg`/`finishAgg`) via a new
+      `windowFuncToAggregateCall` adapter and a bare `&aggregateOp{ctx:
+      o.ctx}` helper — no second aggregation implementation — so
+      numeric-exact sums and float4/float8 formatting come for free.
+      `evalFrameAggFuncs`/`peerGroupBounds` compute peer-group
+      boundaries per partition (reusing the same `samePeer` check
+      rank() already used) and walk groups in cumulative order; with no
+      ORDER BY, `samePeer` always returns true so this collapses to one
+      group spanning the whole partition — the "no ORDER BY" default
+      falls out with no special-casing. Tests:
+      `internal/analyzer/analyzer_test.go`
+      (`TestAnalyzeWindowAggregateFunctionsAccepted`,
+      `TestAnalyzeWindowAggregateFunctionsRejected`;
+      `TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+      `first_value()` since `count(*) OVER ()` is no longer a valid
+      rejection case), `internal/executor/window_compat_test.go`
+      (`TestCompatWindowAggregatesDefaultFrame`,
+      `TestCompatWindowAggregateNoOrderByWholePartition`,
+      `TestCompatWindowAggregateFilterClause` — all cross-checked
+      against a scratch upstream PostgreSQL 18.3 instance). Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new Follow-up
+      section; `docs/design/README.md` row extended;
+      `unimplemented_feat.json`'s frame-clause entry annotated in
+      place (frame clauses themselves remain confirmed-open — this
+      slice only gives them a real consumer for a future loop).
+      **Still open in this bucket:** frame clause parsing/execution
+      itself (ROWS/RANGE/GROUPS — now has a real consumer:
+      `evalFrameAggFuncs`'s `peerGroupBounds` could generalize into an
+      arbitrary frame-bounds function); combining forms (`OVER (win
       ORDER BY ...)`, a named window based on another named window) are
-      also out of scope (real upstream syntax, deferred — see design doc).
+      also out of scope (real upstream syntax, deferred — see design doc);
+      `first_value`/`last_value`/`nth_value`/`ntile`/`cume_dist`/
+      `percent_rank` as window functions remain unimplemented.
       GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause parsing, intervals also
       remain.
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).

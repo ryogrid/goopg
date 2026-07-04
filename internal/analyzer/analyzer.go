@@ -1353,6 +1353,61 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 				return catalog.Type{}, err
 			}
 		}
+	case "sum", "count", "avg", "min", "max":
+		// DISTINCT / ORDER BY within the aggregate's argument list are
+		// real PostgreSQL restrictions on aggregate window functions, not
+		// a v0 gap — see parse_func.c's transformAggregateCall for the
+		// exact wording/errcode this mirrors.
+		if x.Distinct {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "DISTINCT is not implemented for window functions")
+		}
+		if len(x.OrderBy) > 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "aggregate ORDER BY is not implemented for window functions")
+		}
+		if x.Filter != nil {
+			if _, err := analyzeExpr(x.Filter, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		if x.Star {
+			if name != "count" {
+				return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("%s(*) is not supported", name))
+			}
+			retType = catalog.Type{Name: "int8"}
+			break
+		}
+		if len(x.Args) != 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("%s() requires exactly one argument", name))
+		}
+		argTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		switch name {
+		case "count":
+			retType = catalog.Type{Name: "int8"}
+		case "sum":
+			if !isNumericLike(argTyp) {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", "sum() argument must be numeric")
+			}
+			if argTyp.Name == "unknown" {
+				retType = catalog.Type{Name: "int8"}
+			} else {
+				retType = argTyp
+			}
+		case "avg":
+			if !isNumericLike(argTyp) {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", "avg() argument must be numeric")
+			}
+			switch strings.ToLower(argTyp.Name) {
+			case "float4", "float8", "real", "double precision", "double", "float":
+				retType = catalog.Type{Name: "float8"}
+			default:
+				retType = catalog.Type{Name: "numeric"}
+			}
+		case "min", "max":
+			retType = argTyp
+		}
 	default:
 		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
 	}

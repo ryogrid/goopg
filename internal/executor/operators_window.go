@@ -147,12 +147,22 @@ func (o *windowOp) evalWindowFuncs() error {
 	}
 	pStarts = append(pStarts, len(o.rows)) // sentinel
 
+	// aggHelper reuses the ordinary GROUP BY aggregate accumulator
+	// (numeric-exact sums, float4/float8 formatting, NULL-skipping,
+	// FILTER support) for frame-consuming window aggregates. Its
+	// methods only touch o.ctx, so a bare instance is safe to share.
+	aggHelper := &aggregateOp{ctx: o.ctx}
+
 	// Evaluate each partition independently.
 	for p := 0; p < len(pStarts)-1; p++ {
 		pStart := pStarts[p]
 		pEnd := pStarts[p+1]
 		rowNum := int64(0)
 		rank := int64(1)
+
+		if err := o.evalFrameAggFuncs(aggHelper, colBase, pStart, pEnd); err != nil {
+			return err
+		}
 
 		for i := pStart; i < pEnd; i++ {
 			rowNum++
@@ -210,6 +220,8 @@ func (o *windowOp) evalWindowFuncs() error {
 						}
 						o.rows[i][colIdx] = v
 					}
+				case "sum", "count", "avg", "min", "max":
+					// Already computed per-frame in evalFrameAggFuncs above.
 				default:
 					return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
 				}
@@ -217,6 +229,109 @@ func (o *windowOp) evalWindowFuncs() error {
 		}
 	}
 	return nil
+}
+
+// isFrameAggWindowFunc reports whether name is one of the ordinary
+// aggregates usable as a window function (sum/count/avg/min/max).
+// These consume a frame rather than a fixed row offset like
+// row_number/rank/lag/lead.
+func isFrameAggWindowFunc(name string) bool {
+	switch strings.ToLower(name) {
+	case "sum", "count", "avg", "min", "max":
+		return true
+	}
+	return false
+}
+
+// evalFrameAggFuncs computes sum/count/avg/min/max window functions for
+// one partition ([pStart, pEnd) of o.rows) and writes the results
+// directly into o.rows. It reuses aggHelper (a bare *aggregateOp) to
+// share the ordinary GROUP BY accumulator, so formatting/NULL handling
+// matches non-window aggregates exactly.
+//
+// Frame semantics match PostgreSQL's default when no frame clause is
+// given: RANGE UNBOUNDED PRECEDING (cumulative, peer-inclusive) when
+// ORDER BY is present, otherwise the entire partition. Peer-group
+// boundaries are the same ones rank() uses, so peerGroupBounds
+// naturally collapses to a single group (the whole partition) when
+// there is no ORDER BY, since samePeer always returns true in that case.
+func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pEnd int) error {
+	hasAggFunc := false
+	for _, fn := range o.plan.Funcs {
+		if isFrameAggWindowFunc(fn.Name) {
+			hasAggFunc = true
+			break
+		}
+	}
+	if !hasAggFunc {
+		return nil
+	}
+
+	groupBounds, err := o.peerGroupBounds(pStart, pEnd)
+	if err != nil {
+		return err
+	}
+
+	for j, fn := range o.plan.Funcs {
+		if !isFrameAggWindowFunc(fn.Name) {
+			continue
+		}
+		colIdx := colBase + j
+		call := windowFuncToAggregateCall(fn)
+		var running aggRuntime
+		for g := 0; g < len(groupBounds)-1; g++ {
+			gStart, gEnd := groupBounds[g], groupBounds[g+1]
+			for i := gStart; i < gEnd; i++ {
+				if err := aggHelper.applyAgg(&running, call, asSlot(o.schema, o.rows[i])); err != nil {
+					return err
+				}
+			}
+			val := aggHelper.finishAgg(running, call)
+			for i := gStart; i < gEnd; i++ {
+				o.rows[i][colIdx] = val
+			}
+		}
+	}
+	return nil
+}
+
+// windowFuncToAggregateCall adapts a planner.WindowFunc (sum/count/avg/
+// min/max only) into the planner.AggregateCall shape applyAgg/finishAgg
+// expect, so window aggregates share the exact ordinary-aggregate
+// accumulator instead of a second implementation that could drift.
+func windowFuncToAggregateCall(fn planner.WindowFunc) planner.AggregateCall {
+	call := planner.AggregateCall{
+		Name:            fn.Name,
+		Star:            fn.Star,
+		Type:            fn.Type,
+		InputType:       fn.InputType,
+		Filter:          fn.Filter,
+		SharedStateSlot: -1,
+	}
+	if !fn.Star && len(fn.Args) > 0 {
+		call.Arg = fn.Args[0]
+	}
+	return call
+}
+
+// peerGroupBounds returns the peer-group start indices within
+// [pStart, pEnd), plus the pEnd sentinel — mirroring the transitions
+// evalWindowFuncs already tracks inline for rank(). When there is no
+// ORDER BY, samePeer always returns true, so this collapses to a
+// single group spanning the whole partition.
+func (o *windowOp) peerGroupBounds(pStart, pEnd int) ([]int, error) {
+	bounds := []int{pStart}
+	for i := pStart + 1; i < pEnd; i++ {
+		peer, err := o.samePeer(o.rows[i-1], o.rows[i])
+		if err != nil {
+			return nil, err
+		}
+		if !peer {
+			bounds = append(bounds, i)
+		}
+	}
+	bounds = append(bounds, pEnd)
+	return bounds, nil
 }
 
 func (o *windowOp) partitionKey(row Row) (string, error) {

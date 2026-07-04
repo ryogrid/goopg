@@ -231,3 +231,86 @@ self-contained `WINDOW name AS (...)` body. Both are real upstream
 syntax (see `postgres/src/test/regress/sql/window.sql`) not
 exercised by this loop's tests; deferred to a follow-up if a real
 query shape needs them.
+
+## Follow-up: frame-consuming aggregate window functions (2026-07-05, M0122-0004)
+
+Implemented `sum`/`count`/`avg`/`min`/`max` as window functions
+(`sum(x) OVER (...)`, `count(*) OVER (...)`, etc.) — the natural
+prerequisite this doc's own Follow-up section named for ROWS/RANGE/
+GROUPS frame execution: before this change the only window functions
+with executor support (row_number/rank/lag/lead) never consult a
+frame at all, so there was no consumer to validate frame execution
+against. This slice deliberately does **not** add frame-clause
+parsing/execution — it implements PostgreSQL's *default* frame
+instead (which needs no explicit ROWS/RANGE/GROUPS clause):
+`RANGE UNBOUNDED PRECEDING` (cumulative, peer-group-inclusive) when
+ORDER BY is present, otherwise the whole partition. Verified against
+upstream PostgreSQL 18.3 directly (`postgres/local_install`) rather
+than assumed.
+
+**AST/planner:** `planner.WindowFunc` (`internal/planner/plan.go`)
+gained `Star bool`, `Filter Expr`, and `InputType catalog.Type`
+alongside the existing `Args []Expr`, so an aggregate window call can
+carry the same shape `AggregateCall` needs. `buildWindowFunc`
+(`internal/planner/planner.go`) gained a `"sum", "count", "avg",
+"min", "max"` case that resolves the single argument (or `Star` for
+`count(*)`) and the optional `FILTER (WHERE ...)` predicate, deriving
+the output type with the same rules `buildAggregateCall` already uses
+for the non-window path (`sum`→arg type, `avg`→float8 for float
+input else numeric, `min`/`max`→arg type, `count`→int8). DISTINCT and
+aggregate-internal ORDER BY are rejected with `0A000` — this mirrors
+a genuine PostgreSQL restriction on aggregate window functions
+(`parse_func.c`'s `transformAggregateCall`: "DISTINCT/aggregate ORDER
+BY is not implemented for window functions"), not a v0 gap.
+`windowCallKey` gained a `filter:` component — without it, two
+`sum(x) FILTER (WHERE a) OVER (w)` / `sum(x) FILTER (WHERE b) OVER
+(w)` calls with otherwise-identical signatures would collide onto
+the same output column (latent bug in the pre-existing key, never
+exercised because none of row_number/rank/lag/lead take FILTER).
+
+**Analyzer:** `analyzeWindowFuncCall` (`internal/analyzer/
+analyzer.go`) gained the mirror-image validation (same DISTINCT/
+ORDER BY rejection, same output-type rules) — kept in sync with the
+planner per `pattern_sibling_paths_must_agree` since both type-check
+the same call independently.
+
+**Executor:** `internal/executor/operators_window.go` reuses the
+*existing* GROUP BY aggregate accumulator (`aggregateOp.applyAgg`/
+`finishAgg` in `operators_join_agg.go`) instead of a second
+implementation, via `windowFuncToAggregateCall` (adapts a
+`WindowFunc` into an `AggregateCall`) and a bare `&aggregateOp{ctx:
+o.ctx}` helper instance (its methods only touch `ctx`, verified by
+reading both method bodies in full). This gets numeric-exact sums,
+float4/float8 precision formatting, and NULL-skipping for free,
+identical to non-window aggregates. Frame evaluation
+(`evalFrameAggFuncs`) precomputes peer-group boundaries per partition
+with a new `peerGroupBounds` helper — reusing the same `samePeer`
+check `rank()` already used inline — then walks groups in order,
+accumulating into one running `aggRuntime` per function so the
+default cumulative frame falls out naturally: with no ORDER BY,
+`samePeer` always returns `true`, so `peerGroupBounds` collapses to
+a single group spanning the whole partition, giving the "whole
+partition" default with no special-casing.
+
+**Tests:** `internal/analyzer/analyzer_test.go`
+(`TestAnalyzeWindowAggregateFunctionsAccepted`,
+`TestAnalyzeWindowAggregateFunctionsRejected`;
+`TestAnalyzeWindowFunctionUnsupportedRejected` repointed at
+`first_value()`, a real still-unimplemented window function, since
+`count(*) OVER ()` is no longer a valid rejection case);
+`internal/executor/window_compat_test.go`
+(`TestCompatWindowAggregatesDefaultFrame`,
+`TestCompatWindowAggregateNoOrderByWholePartition`,
+`TestCompatWindowAggregateFilterClause`) — all three pin exact
+row values cross-checked against a scratch upstream PostgreSQL 18.3
+instance, not just "no error".
+
+**Still open:** ROWS/RANGE/GROUPS frame-clause parsing/execution
+itself (now has a real consumer — a future loop can wire an explicit
+frame clause into `evalFrameAggFuncs` by generalizing
+`peerGroupBounds` into an arbitrary frame-bounds function).
+`first_value`/`last_value`/`nth_value`/`ntile`/`cume_dist`/
+`percent_rank` as window functions remain unimplemented. Combining
+an explicit frame clause with row_number/rank/lag/lead (which
+PostgreSQL rejects — those functions cannot have a non-default
+frame) is not yet enforced since frame clauses aren't parsed at all.

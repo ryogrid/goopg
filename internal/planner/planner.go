@@ -4929,6 +4929,57 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		}
 		retType := inferExprType(args[0])
 		return WindowFunc{pos: fc.Pos(), Name: name, Type: retType, Args: args}, nil
+	case "sum", "count", "avg", "min", "max":
+		// DISTINCT / ORDER BY within the argument list mirror real
+		// PostgreSQL restrictions on aggregate window functions (see
+		// parse_func.c's transformAggregateCall), not a v0 gap.
+		if fc.Distinct {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "DISTINCT is not implemented for window functions"}
+		}
+		if len(fc.OrderBy) > 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "aggregate ORDER BY is not implemented for window functions"}
+		}
+		var filterExpr Expr
+		if fc.Filter != nil {
+			var ferr error
+			filterExpr, ferr = resolveExprForWindowInput(fc.Filter, inputCtx, agg)
+			if ferr != nil {
+				return WindowFunc{}, ferr
+			}
+		}
+		if fc.Star {
+			if name != "count" {
+				return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("%s(*) is not supported", name)}
+			}
+			return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}, Star: true, Filter: filterExpr}, nil
+		}
+		if len(fc.Args) != 1 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("%s() requires exactly one argument", name)}
+		}
+		argResolved, err := resolveExprForWindowInput(fc.Args[0], inputCtx, agg)
+		if err != nil {
+			return WindowFunc{}, err
+		}
+		inputTyp := exprType(argResolved)
+		var outTyp catalog.Type
+		switch name {
+		case "count":
+			outTyp = catalog.Type{Name: "int8"}
+		case "sum":
+			outTyp = inputTyp
+			if strings.EqualFold(outTyp.Name, "unknown") || outTyp.Name == "" {
+				outTyp = catalog.Type{Name: "int8"}
+			}
+		case "avg":
+			if isFloatTypeName(inputTyp.Name) {
+				outTyp = catalog.Type{Name: "float8"}
+			} else {
+				outTyp = catalog.Type{Name: "numeric"}
+			}
+		case "min", "max":
+			outTyp = inputTyp
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: outTyp, Args: []Expr{argResolved}, Filter: filterExpr, InputType: inputTyp}, nil
 	default:
 		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
 	}
@@ -4946,6 +4997,11 @@ func windowCallKey(fc *parser.FuncCall) string {
 	}
 	for _, a := range fc.Args {
 		b.WriteString(parserExprKey(a))
+		b.WriteString("|")
+	}
+	if fc.Filter != nil {
+		b.WriteString("filter:")
+		b.WriteString(parserExprKey(fc.Filter))
 		b.WriteString("|")
 	}
 	b.WriteString("over:")

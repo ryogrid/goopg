@@ -771,12 +771,24 @@ func (n *Aggregate) Output() Schema { return n.schema }
 // WindowFunc is one supported window-function invocation in a
 // WindowAgg node. Stage A supports row_number/rank (no args,
 // int8 return); Stage B adds lag/lead (1-3 args, return type
-// matches first arg).
+// matches first arg); Stage C adds the frame-consuming aggregates
+// sum/count/avg/min/max (0 or 1 args, evaluated over the default
+// frame — RANGE UNBOUNDED PRECEDING when ORDER BY is present,
+// otherwise the whole partition).
 type WindowFunc struct {
 	pos  int
 	Name string
 	Type catalog.Type
-	Args []Expr // lag/lead: [value, offset?, default?]
+	Args []Expr // lag/lead: [value, offset?, default?]; agg: [value] or empty for count(*)
+	// Star is true for count(*) OVER (...).
+	Star bool
+	// Filter is the resolved FILTER (WHERE ...) predicate, aggregate
+	// window functions only (e.g. sum(x) FILTER (WHERE c) OVER (...)).
+	Filter Expr
+	// InputType is the type of Args[0], used by the executor to reuse
+	// the ordinary-aggregate accumulator (precision-sensitive sum/avg
+	// formatting for float4/float8 inputs).
+	InputType catalog.Type
 }
 
 func (w WindowFunc) Pos() int { return w.pos }

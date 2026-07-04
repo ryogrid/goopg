@@ -148,6 +148,158 @@ func TestCompatWindowRankPeerGroups(t *testing.T) {
 	}
 }
 
+// TestCompatWindowAggregatesDefaultFrame pins the M0122-0004
+// frame-consuming aggregate window functions (sum/count/avg/min/max)
+// against their default frame: RANGE UNBOUNDED PRECEDING (cumulative,
+// peer-inclusive) when ORDER BY is present. Expected values verified
+// against upstream PostgreSQL 18.3 (see the Follow-up section of
+// docs/design/0020-0001-window-parser-and-ast.md).
+func TestCompatWindowAggregatesDefaultFrame(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, "+
+			"sum(val) OVER (PARTITION BY grp ORDER BY val) AS s, "+
+			"count(*) OVER (PARTITION BY grp ORDER BY val) AS c, "+
+			"min(val) OVER (PARTITION BY grp ORDER BY val) AS mn, "+
+			"max(val) OVER (PARTITION BY grp ORDER BY val) AS mx "+
+			"FROM t ORDER BY grp, val")
+	want := []struct{ grp, val, s, c, mn, mx int64 }{
+		{1, 10, 20, 2, 10, 10},
+		{1, 10, 20, 2, 10, 10},
+		{1, 20, 40, 3, 10, 20},
+		{2, 5, 10, 2, 5, 5},
+		{2, 5, 10, 2, 5, 5},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		got := []int64{rows[i][0].Int, rows[i][1].Int, rows[i][2].Int, rows[i][3].Int, rows[i][4].Int, rows[i][5].Int}
+		wantVals := []int64{w.grp, w.val, w.s, w.c, w.mn, w.mx}
+		for col, g := range got {
+			if rows[i][col].Kind != KindInt || g != wantVals[col] {
+				t.Fatalf("row[%d]=%+v want %v", i, rows[i], wantVals)
+			}
+		}
+	}
+}
+
+// TestCompatWindowAggregateNoOrderByWholePartition pins the other half
+// of the default-frame rule: with no ORDER BY, the frame is the entire
+// partition, so every row in a partition sees the same aggregate value.
+func TestCompatWindowAggregateNoOrderByWholePartition(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, sum(val) OVER (PARTITION BY grp) AS s FROM t ORDER BY grp, val")
+	want := []struct{ grp, val, s int64 }{
+		{1, 10, 40}, {1, 10, 40}, {1, 20, 40},
+		{2, 5, 10}, {2, 5, 10},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][0].Int != w.grp || rows[i][1].Int != w.val || rows[i][2].Kind != KindInt || rows[i][2].Int != w.s {
+			t.Fatalf("row[%d]=%+v want grp=%d val=%d s=%d", i, rows[i], w.grp, w.val, w.s)
+		}
+	}
+}
+
+// TestCompatWindowAggregateFilterClause pins sum(x) FILTER (WHERE ...)
+// OVER (...): rows failing the filter are excluded from the frame
+// entirely, same as an ordinary FILTER aggregate (M0097-0007).
+func TestCompatWindowAggregateFilterClause(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (grp int, val int)"); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := ctx.Catalog.LookupTable(parser.ObjectName{Name: "t"})
+	rel := ctx.Catalog.RelFileNode(tbl)
+	seed := []Row{
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 10}},
+		{{Kind: KindInt, Int: 1}, {Kind: KindInt, Int: 20}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+		{{Kind: KindInt, Int: 2}, {Kind: KindInt, Int: 5}},
+	}
+	for _, r := range seed {
+		if err := writeHeapRow(ctx, rel, tbl.Columns, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := runQuery(t, ctx,
+		"SELECT grp, val, sum(val) FILTER (WHERE val > 5) OVER (PARTITION BY grp ORDER BY val) AS sf FROM t ORDER BY grp, val")
+	want := []struct {
+		grp, val int64
+		sfNull   bool
+		sf       int64
+	}{
+		{1, 10, false, 20},
+		{1, 10, false, 20},
+		{1, 20, false, 40},
+		{2, 5, true, 0},
+		{2, 5, true, 0},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows=%d want %d", len(rows), len(want))
+	}
+	for i, w := range want {
+		if rows[i][0].Int != w.grp || rows[i][1].Int != w.val {
+			t.Fatalf("row[%d]=%+v want grp=%d val=%d", i, rows[i], w.grp, w.val)
+		}
+		if w.sfNull {
+			if !rows[i][2].IsNull() {
+				t.Fatalf("row[%d] sf=%+v want NULL", i, rows[i][2])
+			}
+		} else if rows[i][2].Kind != KindInt || rows[i][2].Int != w.sf {
+			t.Fatalf("row[%d] sf=%+v want %d", i, rows[i][2], w.sf)
+		}
+	}
+}
+
 func TestCompatWindowRankNullPeersAsc(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
