@@ -546,8 +546,24 @@ mirroring M0119's ledger `status` column.
       `TestParseCreateCastWithFunction`, `TestValidateCreateCast`, and
       `TestPort_PgDumpConnectionSetup`'s slice-397/404 assertions (real
       `pg_dump` 18.3 round-trip) all PASS. `unimplemented_feat.json` entry
-      updated in place (`status: resolved`). **Still open in this bucket:**
-      1-byte `char` disambiguation, `pg_collation_for`, domain CHECK renderer,
+      updated in place (`status: resolved`). **Domain CHECK renderer also
+      removed from this bucket (2026-07-05, this loop, verify-before-implement):**
+      another stale entry — already closed by DU-002 slice 363 (2026-06-30),
+      predating the 2026-07-02 snapshot. `renderDomainCheckPredicate`
+      (internal/executor/operators_ddl.go) re-parses a domain's raw CHECK
+      text and deparses it via the same fully-parenthesizing
+      `defaultExprToSQL` renderer the table-CHECK path uses (slice 362),
+      wired into the pg_constraint dump path (internal/executor/expr.go
+      `AllDomains` branch) for generic (non-IN) domain CHECKs; `CHECK (VALUE
+      IN (...))` keeps the pre-synthesized legacy wrap by design. No code
+      change needed. Verified at current HEAD: `TestRenderDomainCheckPredicate`,
+      `TestRenderCheckPredicate{,Fallback}`, and
+      `TestPort_PgDumpConnectionSetup`'s slice-362/363 assertions all PASS.
+      `unimplemented_feat.json` entry updated in place (`status: resolved`).
+      Residual (already ledgered, unaffected): negative-literal `Const` casts
+      inside a domain CHECK (`VALUE < -5`) still diverge from PG's typed
+      `'-5'::integer` rendering (type-blind `defaultExprToSQL`). **Still open
+      in this bucket:** 1-byte `char` disambiguation, `pg_collation_for`,
       `pg_ts_config` OIDs.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across

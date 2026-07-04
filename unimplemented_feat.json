@@ -3620,6 +3620,7 @@
    "feature": "Domain CHECK predicates still use legacy wrap instead of new fully-parenthesizing renderer.",
    "task_id": "DU-002",
    "resume_point": "slice 362",
+   "status": "resolved",
    "evidence": [
     "Deferred (ledgered): domain CHECK predicates still use the legacy wrap (own slice — domain path owns the VALUE IN ScalarArrayOp renderer)"
    ],
@@ -3633,8 +3634,8 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: Domain CHECK predicates exist but legacy vs new renderer status not verified"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, this loop, verify-before-implement): stale entry — already closed by commit from DU-002 slice 363 (2026-06-30), predating this backlog's 2026-07-02 snapshot. renderDomainCheckPredicate (internal/executor/operators_ddl.go) re-parses a domain's stored raw CHECK text and deparses it via the same fully-parenthesizing defaultExprToSQL renderer the table-CHECK path (renderCheckPredicate, slice 362) uses, with upcaseDomainValuePlaceholder restoring the uppercase `VALUE` keyword and a re-parse round-trip guard falling back to the legacy wrap when unsafe. Wired into the pg_constraint dump path at internal/executor/expr.go (AllDomains branch) for generic (non-IN) domain CHECKs; `CHECK (VALUE IN (...))` intentionally keeps the pre-synthesized legacy wrap (separate, already-tracked residual). No code change needed this loop. Verified live: TestRenderDomainCheckPredicate, TestRenderCheckPredicate{,Fallback}, and TestPort_PgDumpConnectionSetup (slice-362/363 chkand/chkor/chkfn/dchkand/dchkfn assertions, real pg_dump 18.3 round-trip) all PASS at current HEAD. Residual gaps (already ledgered, unaffected by this bookkeeping fix): negative-literal Const casts inside a domain CHECK (`VALUE < -5`) still diverge from PG's typed `'-5'::integer` rendering (type-blind defaultExprToSQL, same blocker as slice-360(a)/362 deferred-(b))."
   },
   {
    "feature": "User-defined function-based casts (WITH FUNCTION casts) are parsed but not dumped in pg_dump; only built-in binary-coercible casts are reachable.",
