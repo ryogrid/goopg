@@ -55,7 +55,7 @@ time). `make ralph-state-guard` self-repaired the same recurring benign
 progress.json "completed" artifact noted in prior loops' carries (expected
 every loop, not a defect).
 
-Committing and pushing immediately after this carry.
+Committed (`eb93403f`) and pushed to `align-data-structure-with-pg`.
 
 Next step: no work in flight once committed/pushed. Pick the next item:
 (a) the `updateViaIndex` inheritance-fan-out discovery (project-wide, out of
