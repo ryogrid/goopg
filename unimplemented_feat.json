@@ -1882,8 +1882,9 @@
   },
   {
    "feature": "DEFAULT clause in column definitions is skipped during parsing; default values are not stored or applied to new rows",
-   "task_id": null,
+   "task_id": "M0122-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "DEFAULT clause skip"
    ],
@@ -1898,7 +1899,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ast.go:1127 DefaultExpr parsed but not applied"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004, verify-before-implement): stale entry — the audit's own cited line (internal/parser/ast.go ColumnDef.DefaultExpr) has been a fully wired column-default pipeline for a long time, predating the 2026-05-12 snapshot. Parser: internal/parser/ddl.go:4208-4214 stores the DEFAULT expression into ColumnDef.DefaultExpr for every column definition. Planner: internal/planner/planner.go's defaultMarkerReplacement/rewriteInsertDefaultMarkers substitute catalog.Column.DefaultExpr (falling back to a synthesized nextval(...) for SERIAL/IDENTITY, else NULL) for both omitted INSERT columns and explicit DEFAULT markers/UPDATE SET col = DEFAULT. Executor: internal/executor/operators_ddl.go validates and persists DefaultExpr across CREATE TABLE, LIKE...INCLUDING DEFAULTS, ALTER TABLE ADD/ALTER COLUMN, and pg_dump's attrdef rendering (FormatExprForAttrdef). No code change needed. Verified at current HEAD: TestInsertFillsMissingColumnDefault, TestInsertDoesNotOverrideExplicitColumnDefault, TestInsertFillsMissingColumnDefaultCurrentTimestamp, TestInsertFillsMissingColumnDefaultCurrentDate, TestInsertFillsMissingColumnDefaultNextval, TestInsertFillsMissingColumnDefaultNextvalAutoCreates (internal/executor/storage_test.go) all PASS."
   },
   {
    "feature": "Subscriber setup with streaming and logical replication for replicating changes is not implemented in goopg v0.",

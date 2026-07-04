@@ -556,8 +556,29 @@ mirroring M0119's ledger `status` column.
       the M0122-0004 series still assumes PostgreSQL's default frame.
       Combining forms (`OVER (win ORDER BY ...)`, a named window based on
       another named window) are also out of scope (real upstream syntax,
-      deferred — see design doc). GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
-      parsing, intervals also remain.
+      deferred — see design doc). GROUPING SETS/ROLLUP/CUBE, intervals
+      also remain. **DEFAULT-clause parsing removed from this bucket
+      (2026-07-05, this loop, verify-before-implement):** stale entry —
+      the `unimplemented_feat.json` item ("DEFAULT clause in column
+      definitions is skipped during parsing") predates 2026-05-12 and no
+      longer matches the code: `internal/parser/ddl.go:4208-4214` stores
+      `ColumnDef.DefaultExpr`, `internal/planner/planner.go`'s
+      `defaultMarkerReplacement`/`rewriteInsertDefaultMarkers` substitute
+      it for omitted INSERT columns and explicit `DEFAULT` markers
+      (falling back to a synthesized `nextval(...)` for SERIAL/IDENTITY
+      columns, else NULL), and `internal/executor/operators_ddl.go`
+      persists/validates it across CREATE TABLE, `LIKE ... INCLUDING
+      DEFAULTS`, ALTER TABLE ADD/ALTER COLUMN, and pg_dump's attrdef
+      rendering. No code change needed. Verified at current HEAD:
+      `TestInsertFillsMissingColumnDefault`,
+      `TestInsertDoesNotOverrideExplicitColumnDefault`,
+      `TestInsertFillsMissingColumnDefaultCurrentTimestamp`,
+      `TestInsertFillsMissingColumnDefaultCurrentDate`,
+      `TestInsertFillsMissingColumnDefaultNextval`,
+      `TestInsertFillsMissingColumnDefaultNextvalAutoCreates`
+      (`internal/executor/storage_test.go`) all PASS.
+      `unimplemented_feat.json` entry updated in place (`status:
+      resolved`).
 - [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
