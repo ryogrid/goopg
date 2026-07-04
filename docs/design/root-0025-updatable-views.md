@@ -139,21 +139,33 @@ evaluates `o.pred` on that pass — `o.pred` is only consulted later, during an
 EPQ recheck after a concurrent modification. `extractScan`'s
 `Filter`-wrapping-`IndexScan` combining logic (which correctly folds the
 extra predicate into `o.pred`) is therefore silently ineffective for the
-*uncontended* case, which is the common one. This looks like a pre-existing
-latent gap independent of this feature (any future planner change that wraps
-an `IndexScan` result in a residual `Filter` for UPDATE would hit it too) —
-not something this loop's scope covers fixing at the `updateViaIndex` level.
-The workaround taken here: `planUpdate` skips the index fast-path entirely
-whenever `viewQual != nil`, always falling back to the plain `SeqScan` +
-`Filter` path (which `scanMatching` correctly filters by `o.pred` on every
-row). This trades the O(log n) index probe for O(n) scan-with-filter on
-view-target UPDATEs only — correctness over speed, and a narrow enough
-condition (`viewQual != nil`) that it can't regress ordinary
-(non-view) UPDATE performance. `planDelete`'s equivalent `Filter`-wrap did
-**not** need this workaround: `deleteOp.Next` always drives its scan through
-`scanMatching` with the full `o.pred`, regardless of whether the plan
-carries an `IndexScan` node — DELETE has no index-driven fast path to bypass
-in the first place.
+*uncontended* case, which is the common one. This is a pre-existing latent
+gap independent of this feature (any future planner change that wraps an
+`IndexScan` result in a residual `Filter` for UPDATE would hit it too).
+
+**Follow-up (same date, root-cause fix landed):** the workaround (`planUpdate`
+skipping the index fast-path whenever `viewQual != nil`) has been replaced by
+fixing `updateViaIndex` itself — it now evaluates `o.pred` against each
+decoded row immediately after the HOT-chain follow, before building the SET
+row, skipping (not erroring on) a non-matching or NULL result exactly like
+`scanMatching`'s per-row predicate check. `planUpdate` now takes the index
+path unconditionally for `WHERE <indexed-col> = ...` shapes regardless of
+`viewQual`, folding the view qual into the same `Filter` layer `extractScan`
+already merges with the index's synthesised equality predicate — recovering
+the O(log n) index probe for view-target UPDATEs that this loop's original
+workaround gave up. `planDelete`'s equivalent `Filter`-wrap never needed a
+workaround in the first place: `deleteOp.Next` always drives its scan through
+`scanMatching` with the full `o.pred`, regardless of whether the plan carries
+an `IndexScan` node — DELETE has no index-driven fast path to bypass.
+New regression test `TestUpdatableViewWhereQualEnforcedThroughIndexPath`
+(`internal/executor/view_dml_test.go`) asserts both that the planner actually
+chooses `Update{Child: Filter{Child: IndexScan}}` for this shape (so the test
+can't silently pass via an unrelated fallback path) and that the view qual is
+still enforced through it. Gates: `go build ./...`; `go test -race
+./internal/executor/...` (touches concurrent UPDATE/EPQ code); full
+`./internal/executor/... ./internal/planner/... ./internal/parser/...`;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). This closes deferred item 4
+below.
 
 ## Verification
 
@@ -194,11 +206,10 @@ See `.ralph/deferral_ledger.md` for the formal entry. Summary:
    unconditionally regardless of whether the base view would otherwise
    qualify. Needs the view qual threaded through the cross-product path
    (`FromPred`/`UsingPred`) instead of a plain `Filter`.
-4. **`updateViaIndex` residual-predicate gap** (see above) — a general latent
-   correctness gap, not view-specific; any future planner change producing
-   `Filter(IndexScan)` for UPDATE needs the same audit or a proper fix in
-   `updateViaIndex` itself (evaluate `o.pred` on the initial scan, not just
-   the EPQ recheck).
+4. ~~**`updateViaIndex` residual-predicate gap**~~ — **RESOLVED** (see the
+   "Follow-up" note above): `updateViaIndex` now evaluates `o.pred` on its
+   initial scan, not just the EPQ recheck; the `planUpdate` workaround that
+   skipped the index path for view-target UPDATEs is removed.
 5. **CHECK OPTION on partition/inheritance-child-routed rows.** The runtime
    check is skipped for rows reached via `updateScanTables`'s partition/
    inheritance-child branch (their `captureCols` can be reordered relative

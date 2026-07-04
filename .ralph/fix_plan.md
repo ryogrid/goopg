@@ -5978,6 +5978,33 @@ documentation-only and is exempt from the design-doc requirement.)
       SECURITY LABEL); item (3) is otherwise now closed to the extent it
       can meaningfully be — no further individual sub-form tests are
       needed since the remaining forms are unreachable.
+      **2026-07-04 (loop #110): `updateViaIndex` residual-predicate gap
+      RESOLVED at the root** — closes deferred item (5) of the root-0025
+      (updatable-views) deferral row. `updateOp.updateViaIndex`
+      (`internal/executor/operators_storage.go`) now evaluates `o.pred`
+      against each decoded row on its initial B-tree range-scan (skipping a
+      NULL/false result, matching `scanMatching`'s per-row semantics)
+      instead of only during an EPQ concurrent-update recheck; `planUpdate`
+      (`internal/planner/planner.go`) no longer skips the index fast-path
+      when a view qual is present — it takes the index path unconditionally
+      and folds the view qual into the same `Filter` layer `extractScan`
+      already merges with the index's synthesised equality predicate
+      (mirroring `planDelete`'s pre-existing unconditional-index-path
+      shape), recovering the O(log n) probe the prior workaround traded
+      away for every view-target UPDATE. New test
+      `TestUpdatableViewWhereQualEnforcedThroughIndexPath`
+      (`internal/executor/view_dml_test.go`) asserts the planner actually
+      picks `Update{Child: Filter{Child: IndexScan}}` for this shape (so
+      the test can't pass via an unrelated fallback) and that the qual is
+      enforced through it. Gates: `go build ./...` clean; `go test -race
+      ./internal/executor/...` PASS (full suite, concurrent UPDATE/EPQ
+      paths touched); `go test ./internal/executor/... ./internal/planner/...
+      ./internal/parser/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). Design doc `docs/design/root-0025-updatable-views.md`
+      updated (Follow-up section + Deferred item 4 struck through);
+      `docs/design/README.md` root-0025 row updated. Deferral ledger row
+      appended marking this resolved. No new deferrals — this was a
+      self-contained, previously-scoped fix.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). **`002_save_fullpage.pl` (WD-003) DONE.** **Remaining:**
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering)

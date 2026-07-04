@@ -3565,6 +3565,21 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		}
 		row := decRow
 
+		// The B-tree scan only matches the index's own equality key (ix.Key);
+		// a residual predicate (e.g. a view's WHERE qual wrapping the planned
+		// IndexScan in a Filter) must still be evaluated here — the EPQ
+		// recheck path below re-applies o.pred on a concurrent update, but the
+		// common uncontended case never reaches it. M0119-0004/root-0025.
+		if o.pred != nil {
+			v, err := evalExpr(o.pred, row, o.ctx)
+			if err != nil {
+				return false, err
+			}
+			if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+				return true, nil
+			}
+		}
+
 		// Build new row from SET expressions.
 		// Clear multi-column subquery cache so each row gets a fresh evaluation.
 		clear(o.ctx.MultiAssignSubqCache)

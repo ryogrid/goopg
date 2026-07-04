@@ -7823,26 +7823,18 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		// for `WHERE indexed_col = key` shapes. Mirrors planSelect's
 		// `if idxNode, ok, err := planIndexScanFromWhere(...)` arm.
 		// Falls through to Filter(SeqScan) on no index match.
-		//
-		// Skipped entirely when viewQual is set: updateViaIndex
-		// (operators_storage.go) only evaluates the index's own equality
-		// key on its initial scan pass — any *additional* AND'd predicate
-		// (the view's own WHERE qual) is silently unenforced there except
-		// during an EPQ concurrent-update recheck. Forcing the plain
-		// SeqScan+Filter path guarantees viewQual is actually evaluated
-		// (scanMatching always applies o.pred). Sacrifices the O(log n)
-		// index probe for view-target UPDATE; correctness over speed.
-		if viewQual == nil {
-			if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
-				return nil, err
-			} else if ok {
-				node = idxNode
-			} else {
-				pred, err := resolveExpr(s.Where, ctx)
-				if err != nil {
-					return nil, err
-				}
-				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+			return nil, err
+		} else if ok {
+			node = idxNode
+			// See planDelete's identical comment: merge into a single
+			// Filter layer, extractScan only unwraps one — updateViaIndex
+			// (operators_storage.go) now evaluates the combined predicate
+			// (index key AND this Filter) on its initial scan pass, so the
+			// view's own WHERE qual is enforced without giving up the
+			// index probe.
+			if viewQual != nil {
+				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: viewQual}
 			}
 		} else {
 			pred, err := resolveExpr(s.Where, ctx)

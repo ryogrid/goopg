@@ -154,6 +154,75 @@ func TestUpdateViewCheckOptionViolation(t *testing.T) {
 	}
 }
 
+// TestUpdatableViewWhereQualEnforcedThroughIndexPath pins the root-0025
+// follow-up fix: updateOp.updateViaIndex (operators_storage.go) previously
+// only evaluated the B-tree index's own equality key on its initial scan
+// pass and never consulted the residual predicate (o.pred) — so a view's own
+// WHERE qual, ANDed onto an IndexScan-eligible `WHERE <pk> = ...` UPDATE, was
+// silently unenforced outside of an EPQ concurrent-update recheck. The
+// original fix worked around this by forcing planUpdate to always fall back
+// to SeqScan+Filter whenever a view qual was present, giving up the index
+// probe. That workaround is gone: planUpdate now takes the index path
+// unconditionally and folds the view qual into the same Filter layer
+// extractScan already merges with the index's synthesised equality
+// predicate, and updateViaIndex evaluates the combined o.pred itself. This
+// test confirms both that the planner actually chooses the index path for
+// this shape and that the view qual is still enforced through it.
+func TestUpdatableViewWhereQualEnforcedThroughIndexPath(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	must := func(sql string) {
+		t.Helper()
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	must("CREATE TABLE t7 (id int primary key, val int)")
+	must("INSERT INTO t7 VALUES (1, 10), (2, 20)")
+	must("CREATE VIEW v7 AS SELECT id, val FROM t7 WHERE val > 15")
+
+	// Confirm the planner picked the index-driven path (Update.Child is a
+	// Filter wrapping an IndexScan, not a plain SeqScan) for this
+	// `WHERE <pk> = ...` shape — otherwise this test would not actually be
+	// exercising updateViaIndex.
+	stmts, err := parser.Parse("UPDATE v7 SET val = 999 WHERE id = 1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	plan, err := planner.Plan(stmts[0], cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	upd, ok := plan.(*planner.Update)
+	if !ok {
+		t.Fatalf("plan type = %T, want *planner.Update", plan)
+	}
+	filt, ok := upd.Child.(*planner.Filter)
+	if !ok {
+		t.Fatalf("Update.Child type = %T, want *planner.Filter (view qual)", upd.Child)
+	}
+	if _, ok := filt.Child.(*planner.IndexScan); !ok {
+		t.Fatalf("Filter.Child type = %T, want *planner.IndexScan — index path not chosen", filt.Child)
+	}
+
+	// id=1 (val=10) is not visible through v7's own qual — even though the
+	// PK equality lookup finds it via the index, the UPDATE must not apply.
+	must("UPDATE v7 SET val = 999 WHERE id = 1")
+	rows := runQueryRows(t, ctx, "SELECT val FROM t7 WHERE id = 1")
+	if len(rows) != 1 || rows[0][0].Format() != "10" {
+		t.Fatalf("row id=1 should be unchanged (excluded by view qual via index path), got %v", rows)
+	}
+
+	// id=2 (val=20) IS visible through v7 — the same index-path UPDATE must
+	// apply normally.
+	must("UPDATE v7 SET val = 25 WHERE id = 2")
+	rows = runQueryRows(t, ctx, "SELECT val FROM t7 WHERE id = 2")
+	if len(rows) != 1 || rows[0][0].Format() != "25" {
+		t.Fatalf("row id=2 should be updated (visible through view qual), got %v", rows)
+	}
+}
+
 // TestNonUpdatableViewDMLRejected confirms that views outside the restricted
 // auto-updatable subset (aggregates, joins, renamed columns) are rejected at
 // plan time with 55000 — never silently accepted with lost writes, which was
