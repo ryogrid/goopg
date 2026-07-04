@@ -108,7 +108,7 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | FORMAT XML | **done, this loop** |
 | FORMAT YAML | **done, this loop** |
 | SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
-| BUFFERS rendering | open — parsed (`opts.Buffers`), never read; `nodeStats` has no buffer hit/read counters |
+| BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
 | `pg_stat_io` | open — table registered (`internal/catalog/catalog.go:6798`, OID 8061) but `VirtualRows` always returns `nil`; no I/O stat collection exists |
 | per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
 | `track_io_timing` runtime `SET` | open — GUC registered `ContextUserset` but only consulted once at process boot (`cmd/goopg/main.go`'s `boolGUC` → `initdb.OpenOptions.TrackIOTiming`), not re-checked per session/query |
@@ -180,3 +180,67 @@ default-omitted, TEXT with/without modified GUCs, JSON always-present-group,
 JSON with modified GUCs, ANALYZE placement before Planning Time).
 `internal/config/guc_test.go`: `TestExplainVariablesEmptyByDefault`,
 `TestExplainVariablesReportsModifiedPlannerGUC`.
+
+## BUFFERS rendering (later loop, 2026-07-04)
+
+`EXPLAIN (ANALYZE, BUFFERS)` reports, per plan node, how many shared
+buffers were served from cache vs. read from disk (`show_buffer_usage` in
+`explain.c`, backed by `BufferUsage`/`pgBufferUsage` in `instrument.c`).
+goopg had zero buffer-hit/miss counters anywhere before this slice — the
+option parsed (`opts.Buffers`) but nothing ever read it.
+
+**Counting at the source.** `internal/storage/bufpool.go`'s `Pool` gains
+two `atomic.Int64` counters, `sharedHitCount`/`sharedReadCount`, plus a
+`BufferCounters() (hit, read int64)` accessor. They're incremented at the
+two `Pin()`/`pinSlow()` decision points that resolve to an
+already-cached slot (fast-path CAS success and the slow-path
+`tryPinSlot` success), and once per `pinLoad` call (the only place that
+issues a real `mgr.ReadBlock` disk read). **Scoped out, deferred:**
+`PinNew` (new-block allocation — conceptually closer to PG's
+`shared_blks_written`/extend accounting, not a "read") and the rare
+race-recovery `tryPinSlot` calls inside `PinNew`/`pinLoad` (another
+goroutine already loaded the tag while this one waited for `pinMu`) are
+not counted — see ledger row.
+
+**Per-node attribution via the existing instrumentation wrapper.**
+`internal/executor/instrument.go`'s `instrumentedOp` already wraps every
+node's `Open`/`Next`/`Close` for EXPLAIN ANALYZE's per-node timing/rowcount
+(`nodeStats.totalNs`/`rowsOut`), using a nested-stopwatch pattern: a
+parent's `Next()` call fully executes any child `Next()` calls before
+returning, so timing deltas measured at the parent level are inclusive of
+whatever the child subtree did. Buffers reuse the exact same pattern
+instead of inventing a second mechanism (sibling-paths rule) — `nodeStats`
+gains `bufHit`/`bufRead` (cumulative, inclusive-of-children, matching
+upstream's own per-node semantics) and `bufBaseHit`/`bufBaseRead` (the
+last-seen `Pool.BufferCounters()` snapshot). `instrumentedOp.Open` captures
+`ctx.Pool` and seeds the baseline once; `accountBuffers()` (called from
+`Next` and `Close`) diffs the pool's current counters against the baseline
+and rolls the delta into `bufHit`/`bufRead`. Because the pool counters are
+process-global, not per-node, this diffing-since-last-checkpoint approach
+is what makes per-node attribution correct at all — see the doc comment on
+`accountBuffers` for the full argument.
+
+**Rendering.** `internal/executor/operators_explain.go`'s
+`walkPlanAnalyzeFiltered` (the TEXT + ANALYZE path only) appends a
+`Buffers: shared hit=N read=N` detail line per node via
+`formatBuffersLine`, mirroring `show_buffer_usage`'s per-term omission
+rule: the whole line is omitted when both counters are zero, and each of
+`hit=`/`read=` is omitted individually when that counter is zero.
+
+**Deferred (ledger row, same date):**
+- FORMAT JSON/XML/YAML rendering (`planToJSONWithStats` doesn't add a
+  `Buffers` key yet) — TEXT was landed first since it needed no schema
+  changes to the structured-format tree.
+- `EXPLAIN (BUFFERS)` without `ANALYZE` (PG 17+ shows *planning-time*
+  buffer usage in this case) — goopg has no separate planning-phase buffer
+  counters; `walkPlan`/`walkPlanFiltered` (the non-ANALYZE path) never
+  calls into the buffer accounting at all.
+- `dirtied=`/`written=`/local- and temp-buffer terms.
+- The two narrow `Pin()` call sites scoped out above (new-block allocation,
+  race-recovery re-pin).
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainBuffersAnalyzeTextLine` (line present, at least one of
+hit=/read= populated), `TestExplainBuffersOffByDefault` (no BUFFERS ⇒ no
+line, even under ANALYZE), `TestExplainBuffersRepeatScanAccumulatesHits`
+(a second, warm-cache pass reports hit-only, no read=).

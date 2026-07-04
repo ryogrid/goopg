@@ -154,6 +154,19 @@ type Pool struct {
 	// clockHand is the atomic clock-sweep hand for victim selection.
 	clockHand atomic.Int64
 
+	// sharedHitCount / sharedReadCount tally shared-buffer cache hits vs.
+	// disk reads across the pool's lifetime, mirroring PgBufferUsage's
+	// shared_blks_hit / shared_blks_read (postgres/src/backend/utils/
+	// misc/pgstat_wal.c neighbour, actually tracked in executor/instrument.c
+	// BufferUsageAccumDiff). EXPLAIN (ANALYZE, BUFFERS) reads these via
+	// BufferCounters() and diffs a before/after snapshot per plan node
+	// (see internal/executor/instrument.go). Only Pin()'s two decision
+	// points increment these; PinNew (new-block allocation) and the rare
+	// tryPinSlot race-recovery calls inside pinLoad/PinNew are not counted
+	// here (deferred — see .ralph/deferral_ledger.md M0122-0003 BUFFERS row).
+	sharedHitCount  atomic.Int64
+	sharedReadCount atomic.Int64
+
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.
 	bgwriterMu   sync.Mutex
@@ -441,6 +454,15 @@ func (p *Pool) RelPath(rel RelFileNode) string {
 
 // Manager exposes the underlying storage manager.
 func (p *Pool) Manager() *Manager { return p.mgr }
+
+// BufferCounters returns the pool-wide cumulative shared-buffer hit/read
+// tallies. EXPLAIN (ANALYZE, BUFFERS) diffs a before/after snapshot of this
+// pair per plan node (internal/executor/instrument.go) to render PG's
+// "Buffers: shared hit=N read=N" line — mirrors BufferUsage.shared_blks_hit /
+// shared_blks_read (postgres/src/include/executor/instrument.h).
+func (p *Pool) BufferCounters() (hit, read int64) {
+	return p.sharedHitCount.Load(), p.sharedReadCount.Load()
+}
 
 // SyncAllDataFiles fdatasyncs every open data file.
 func (p *Pool) SyncAllDataFiles() error {
@@ -796,6 +818,7 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 				}
 				newSt := (old &^ (slotPinMask | slotUsageMask)) | (pinCount + 1) | (usage << slotUsageShift)
 				if s.state.CompareAndSwap(old, newSt) {
+					p.sharedHitCount.Add(1)
 					return s, nil
 				}
 				// CAS failed (concurrent pin/unpin); retry fast path.
@@ -843,6 +866,7 @@ func (p *Pool) pinSlow(tag BufferTag) (*Slot, error) {
 			if stateValid(old) && stateGen(old) == gen {
 				// Valid: try to pin.
 				if s2 := p.tryPinSlot(slotIdx, gen); s2 != nil {
+					p.sharedHitCount.Add(1)
 					return s2, nil
 				}
 				// tryPinSlot failed (race): retry
@@ -922,6 +946,7 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
+	p.sharedReadCount.Add(1)
 	return s, nil
 }
 

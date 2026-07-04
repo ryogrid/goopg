@@ -176,6 +176,24 @@ func addExplainSettingsGroup(ctx *Context, opts parser.ExplainOptions, root map[
 
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
 
+// formatBuffersLine renders the upstream "Buffers: shared hit=N read=N"
+// text (ExplainPropertyList's shared-buffer branch in explain.c's
+// show_buffer_usage), omitting the whole line when both counters are zero
+// and omitting each individual hit=/read= term when that counter is zero.
+func formatBuffersLine(s *nodeStats) string {
+	if s.bufHit == 0 && s.bufRead == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if s.bufHit > 0 {
+		parts = append(parts, fmt.Sprintf("hit=%d", s.bufHit))
+	}
+	if s.bufRead > 0 {
+		parts = append(parts, fmt.Sprintf("read=%d", s.bufRead))
+	}
+	return "Buffers: shared " + strings.Join(parts, " ")
+}
+
 func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -515,6 +533,18 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
 		if s, ok := stats[n]; ok && s != nil {
 			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Heap Fetches: %d", s.heapFetches))})
+		}
+	}
+
+	// EXPLAIN (ANALYZE, BUFFERS) emits a "Buffers: shared hit=N read=N"
+	// detail line per node (design 0122-0003 BUFFERS slice). Shared-only,
+	// hit/read-only for now — local/temp buffers and dirtied/written
+	// counts are a deferred follow-up (ledger).
+	if opts.Buffers {
+		if s, ok := stats[n]; ok && s != nil {
+			if line := formatBuffersLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
 		}
 	}
 
