@@ -54,9 +54,7 @@ commit time). `make ralph-state-guard` self-repaired the same recurring
 benign progress.json "completed" artifact noted in prior loops' carries
 (expected every loop, not a defect).
 
-Not yet committed at the time this file was written — commit is the very
-next action (message covering both the operators_storage.go fix and the
-docs/ledger/fix_plan updates), then push to `align-data-structure-with-pg`.
+Committed (`6aaae6cf`) and pushed to `align-data-structure-with-pg`.
 
 Next step: no work in flight once committed/pushed. Pick the next item:
 (a) the `ON CONFLICT`-against-renamed-view residual — thread `resolveTbl`/
