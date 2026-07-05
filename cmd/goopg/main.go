@@ -26,7 +26,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
@@ -727,21 +726,19 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	cpCtx, cpCancel := context.WithCancel(ctx)
 	cpDone := make(chan struct{})
 	if rt != nil && rt.Checkpointer != nil {
+		// The checkpointer's activity-registry background slot (its wait
+		// events, e.g. writeback DataFileWrite) is now registered by
+		// initdb.Open via RegisterBackground(CheckpointerIdx, ...) and
+		// tracked per-goroutine by CheckpointerConfig's OnLoopStart/
+		// OnLoopEnd hooks, invoked from inside Run() below — mirroring
+		// how the WAL writer's walProcNum is tracked. Registering it here
+		// too (as this used to) called the regular, numeric-PID-keyed
+		// act.Register path, which silently collided with the WAL
+		// writer's slot: procNumForPID treats every non-numeric PID as
+		// bgBase, the same fixed slot RegisterBackground(WalWriterIdx, ...)
+		// already claims (M0122-0003 writeback simplification 3 follow-up).
 		go func() {
 			defer close(cpDone)
-			// Register the checkpointer backend in the activity registry
-			// so its wait events (CheckpointerMain) are visible.
-			if act := rt.Activity; act != nil {
-				cpPID := "cp-0"
-				act.Register(&activity.Backend{
-					PID:          cpPID,
-					BackendType:  "checkpointer",
-					State:        "active",
-					BackendStart: time.Now().UTC().Format(time.RFC3339Nano),
-				})
-				activity.RegisterCurrentGoroutine(act, cpPID)
-				defer activity.ClearCurrentGoroutine()
-			}
 			_ = rt.Checkpointer.Run(cpCtx)
 		}()
 	} else {

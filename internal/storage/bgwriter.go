@@ -27,6 +27,17 @@ type Bgwriter struct {
 	stop     chan struct{}
 	done     chan struct{}
 	logger   *slog.Logger
+
+	// OnLoopStart/OnLoopEnd, when set, bracket the goroutine's entire run
+	// (called once each, not per-tick) so a caller can register this
+	// goroutine's identity with the activity registry the same way
+	// wal.Config's OnLoopStart/OnLoopEnd let initdb.Open track the WAL
+	// writer goroutine (walProcNum). Without this the bgwriter's dirty-page
+	// flushes (WriteDirtyPages → accountBgwriterWrite) have no registered
+	// goroutine to attribute a wait event to (M0122-0003 writeback
+	// simplification 3 follow-up).
+	OnLoopStart func()
+	OnLoopEnd   func()
 }
 
 // NewBgwriter creates a Bgwriter bound to pool. delay is the inter-tick
@@ -64,6 +75,12 @@ func (b *Bgwriter) run() {
 	defer close(b.done)
 	if b.delay <= 0 {
 		return
+	}
+	if b.OnLoopStart != nil {
+		b.OnLoopStart()
+	}
+	if b.OnLoopEnd != nil {
+		defer b.OnLoopEnd()
 	}
 	ticker := time.NewTicker(b.delay)
 	defer ticker.Stop()

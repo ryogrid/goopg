@@ -158,6 +158,21 @@ type CheckpointerConfig struct {
 	// marker is used. Set to true by initdb.Open; tests that do not need
 	// PG compatibility leave this false so legacy detection code works.
 	PGCompatCheckpoints bool
+
+	// OnLoopStart/OnLoopEnd, when set, bracket Run's entire timer/volume
+	// loop (called once each, not per-checkpoint) so a caller can register
+	// this goroutine's identity with the activity registry the same way
+	// wal.Config's OnLoopStart/OnLoopEnd let initdb.Open track the WAL
+	// writer goroutine (walProcNum). SQL-triggered checkpoints
+	// (CheckpointNow, called directly from a client backend's own
+	// goroutine) do not go through Run and so are unaffected — they keep
+	// attributing to the calling backend's own already-registered identity.
+	// Without this the timer/volume-driven checkpointer's dirty-page
+	// flushes (flushDirty → accountCheckpointerWrite) have no registered
+	// goroutine to attribute a wait event to (M0122-0003 writeback
+	// simplification 3 follow-up).
+	OnLoopStart func()
+	OnLoopEnd   func()
 }
 
 func (c *CheckpointerConfig) withDefaults() {
@@ -299,6 +314,12 @@ func (c *Checkpointer) SetCompletionTarget(t float64) {
 
 // Run starts the periodic checkpoint loop and returns when ctx is canceled.
 func (c *Checkpointer) Run(ctx context.Context) error {
+	if c.cfg.OnLoopStart != nil {
+		c.cfg.OnLoopStart()
+	}
+	if c.cfg.OnLoopEnd != nil {
+		defer c.cfg.OnLoopEnd()
+	}
 	ticker := time.NewTicker(c.cfg.Interval)
 	defer ticker.Stop()
 

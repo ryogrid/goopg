@@ -23,7 +23,8 @@ const (
 	WalWriterIdx    = 0
 	CheckpointerIdx = 1
 	AutovacuumIdx   = 2
-	// Indices 3–15 available for walsenders and future workers.
+	BgwriterIdx     = 3
+	// Indices 4–15 available for walsenders and future workers.
 )
 
 // activitySlot is a 64-byte cache-line-aligned per-backend state block.

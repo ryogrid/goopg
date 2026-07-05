@@ -53,15 +53,24 @@ both now emit all six `Shared/Local/Temp I/O Read/Write Time` keys
 per-session `PGC_USERSET` — also landed 2026-07-06 (later loop still): a
 per-backend `ActivityRegistry.BackendFlushAfterBlocks` + `storage.Pool`'s
 new `BackendFlushAfterOverride` hook mirror `track_io_timing`'s own
-runtime-SET wiring exactly (see deferral ledger 2026-07-06 row). Remaining
-sub-items: the last `pg_stat_io` op counter (`reuses` — needs a
-`BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
-doesn't have), plus the 3 still-open named writeback simplifications
-(single-relation-per-hint instead of coalesced ranges, bgwriter/
-checkpointer `writeback_time` gated on boot-time `track_io_timing` via
-plain `time.Since` rather than the activity-registry wait-event clock, and
-bgwriter/checkpointer `writes`/`write_bytes`/`write_time` staying an honest
-0 — see deferral ledger 2026-07-05 row). Pick up one of those next, or
+runtime-SET wiring exactly (see deferral ledger 2026-07-06 row). Writeback
+simplification (3) — bgwriter/checkpointer `writeback_time` gated via a
+plain `time.Since` pair instead of the activity-registry wait-event clock
+— also landed 2026-07-06 (later loop still): `activity.BgwriterIdx`
+(new) + `RegisterBackground(CheckpointerIdx/BgwriterIdx, ...)` in
+`initdb.Open`, `wal.CheckpointerConfig`/`storage.Bgwriter` gained
+`OnLoopStart`/`OnLoopEnd` hooks mirroring the WAL writer's, and
+`OnBgwriterWritebackWait/Done`/`OnCheckpointerWritebackWait/Done` now
+match `OnBackendWritebackWait/Done`'s `LookupTrackedGoroutine()` pattern
+exactly — this also fixed a real bug where the checkpointer's old
+`act.Register(&Backend{PID:"cp-0",...})` call silently collided with and
+clobbered the WAL writer's activitySlot (see deferral ledger 2026-07-06
+row). Remaining sub-items: the last `pg_stat_io` op counter (`reuses` —
+needs a `BufferAccessStrategy`-style ring-buffer storage-engine mechanism
+goopg doesn't have), plus 2 still-open named writeback simplifications
+(single-relation-per-hint instead of coalesced ranges, and bgwriter/
+checkpointer `writes`/`write_bytes`/`write_time` staying an honest 0 — see
+deferral ledger 2026-07-05 row). Pick up one of those next, or
 continue the M0119-0004 pg_dump catalog-view parity battery / next
 unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 

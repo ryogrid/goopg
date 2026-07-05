@@ -861,13 +861,15 @@ ledger, not hidden):**
    boot-time GUC value only). A `SET backend_flush_after` in one session
    would affect every session's accounting.~~ **Fixed 2026-07-06** (loop
    #9, see "Per-session `backend_flush_after`" section below).
-3. bgwriter/checkpointer `writeback_time` gating gates on the boot-time
+3. ~~bgwriter/checkpointer `writeback_time` gating gates on the boot-time
    `TrackIOTiming` value with a plain `time.Now()`/`time.Since` pair
    (`internal/initdb/open.go`), not the `ActivityRegistry` wait-event
    clock the backend path uses — these two singleton background
    goroutines have no registered `activity` background slot yet (unlike
    the WAL writer's `walProcNum`), so their writeback wait never surfaces
-   in `pg_stat_activity`, only in `pg_stat_io`.
+   in `pg_stat_activity`, only in `pg_stat_io`.~~ **Fixed 2026-07-06**
+   (loop #10, see "Registered bgwriter/checkpointer background slots"
+   section below).
 4. The background writer / checkpointer rows' own `writes`/`write_bytes`/
    `write_time` cells are still an honest 0 — goopg's only real write
    counter (`sharedWrittenCount`/`sharedWriteTimeNanos`) is deliberately
@@ -1194,3 +1196,101 @@ The BUFFERS/`pg_stat_io` cluster's only remaining open item is now the
 ring buffer goopg does not implement — feature-sized, not a counter
 tweak) plus the 4 named writeback simplifications-vs-upstream
 (2026-07-05 ledger row).
+
+## Registered bgwriter/checkpointer background slots (later loop, 2026-07-06)
+
+Closes simplification (3) named in the "`writeback`/`writeback_time`
+counters" section above: bgwriter/checkpointer `writeback_time` now uses
+the real `ActivityRegistry` wait-event clock instead of a plain
+`time.Now()`/`time.Since` pair, and their writeback waits are now visible
+in `pg_stat_activity`, not just `pg_stat_io`.
+
+**Bug found while closing this.** The checkpointer's activity-registry
+registration (`cmd/goopg/main.go`) called `act.Register(&activity.Backend{
+PID: "cp-0", ...})` — the regular, numeric-PID-keyed path
+(`procNumForPID`). For a non-numeric PID, `procNumForPID` always returns
+`r.bgBase`: exactly the slot `RegisterBackground(WalWriterIdx, ...)`
+already claims for the WAL writer at `initdb.Open` time. Every server run
+therefore had the checkpointer's `Register` call silently clobber the WAL
+writer's `activitySlot` (`acquire` unconditionally overwrites `s.cold`) —
+`pg_stat_activity` could show at most one of {walwriter, checkpointer} at
+that slot, whichever registered last. `internal/activity/activity_test.go`'s
+`TestRegisterCurrentGoroutineIsolatesPerGoroutine` already carried a
+comment flagging this ("Use `RegisterBackground` for non-numeric PIDs to
+guarantee distinct slots") but only in test code — production call sites
+never got the fix.
+
+**Fix.** `internal/activity/registry.go` gains a fourth reserved
+background-slot index, `BgwriterIdx = 3` (alongside the pre-existing
+`WalWriterIdx=0`/`CheckpointerIdx=1`/`AutovacuumIdx=2`, `CheckpointerIdx`
+was reserved but never actually used via `RegisterBackground` before this
+loop). `internal/initdb/open.go` now:
+- pre-registers the checkpointer via
+  `act.RegisterBackground(activity.CheckpointerIdx, &activity.Backend{PID:
+  "cp-0", BackendType: "checkpointer", ...})` right before constructing
+  `wal.NewCheckpointer`, seeding `act.UpdateTrackIOTiming(checkpointerProcNum,
+  opts.TrackIOTiming)` once (a background worker has no per-session `SET
+  track_io_timing` to react to — same "boot-time GUC value only" rationale
+  as before, just now expressed as a registry flag instead of a captured
+  bool);
+- pre-registers the bgwriter the same way when `BgwriterDelay > 0 &&
+  BgwriterMaxPages > 0`, using upstream's `"background writer"` (with a
+  space) `backend_type` literal (matches `executor/pgstat_io.go`'s
+  `ioBackendTypeNames` and this doc's own running "(background writer,
+  relation, normal)" row references) — previously the bgwriter had no
+  registered slot at all, so it never appeared in `pg_stat_activity`.
+
+`wal.CheckpointerConfig` and `storage.Bgwriter` each gain an
+`OnLoopStart`/`OnLoopEnd func()` pair, called once (not per-tick/per-
+checkpoint) at the top/bottom of `Checkpointer.Run`/`Bgwriter.run` —
+mirrors `wal.Config`'s pre-existing `OnLoopStart`/`OnLoopEnd` fields that
+track `walProcNum` for the WAL writer goroutine. `initdb.Open` wires these
+to `activity.SetCurrentGoroutine(act, <procNum>)` /
+`activity.ClearCurrentGoroutine()`, so `act.LookupTrackedGoroutine()` now
+resolves correctly from inside `WriteDirtyPages`/`flushDirty` — both run
+synchronously on their own dedicated background goroutine, never on a
+client backend's. SQL-triggered checkpoints (`CheckpointNow`, called
+directly from a client backend executing `CHECKPOINT`) don't go through
+`Run` and are unaffected — they keep attributing to the calling backend's
+own already-registered identity, exactly as before.
+
+`internal/storage/writeback.go`'s three writeback hook installs in
+`internal/initdb/open.go` (`OnBackendWritebackWait/Done`,
+`OnBgwriterWritebackWait/Done`, `OnCheckpointerWritebackWait/Done`) are now
+textually identical: all three call `act.LookupTrackedGoroutine()` →
+`WaitEventStart(..., WaitDataFileWrite)` / `WaitEventEnd()` →
+`Add*WritebackTimeNanos`. The bgwriter/checkpointer-specific
+`bgwriterWritebackStart`/`checkpointWritebackStart` local `time.Time` vars
+and their `opts.TrackIOTiming` closure-capture are gone.
+
+`cmd/goopg/main.go`'s checkpointer-goroutine launch no longer registers
+`"cp-0"` itself (that duplicate call would have re-collided the pidMap
+entry back onto `bgBase`, undoing the fix) — registration and per-
+goroutine tracking now live entirely behind `CheckpointerConfig`'s
+`OnLoopStart`/`OnLoopEnd`, invoked from inside `Run()`.
+
+**Tests:** `internal/initdb/background_activity_test.go` (new) —
+`TestOpenRegistersDistinctWalWriterAndCheckpointerSlots` (the direct
+M0122-0003 regression test: both `wal-writer-0` and `cp-0` coexist in
+`Activity.Snapshot()` with correct, un-clobbered `BackendType`s),
+`TestOpenRegistersBgwriterBackgroundSlotWhenEnabled` (`bgwriter-0` appears
+with `backend_type = "background writer"` when the bgwriter is enabled),
+`TestCheckpointerWritebackUsesActivityRegistryClock` /
+`TestBgwriterWritebackUsesActivityRegistryClock` (drive the `Pool` hooks
+from the registered background identity and confirm a real nonzero
+elapsed duration accumulates, proving the wait-event clock — not a
+`time.Now()`/`time.Since` pair — backs the counter).
+
+**Verification:** `go build ./...` clean; `go vet` clean on
+`internal/activity/... internal/storage/... internal/wal/...
+internal/initdb/... cmd/goopg/...`; `go test -race ./internal/activity/...
+./internal/storage/... ./internal/wal/...` PASS; `go test -count=1
+./internal/initdb/... ./cmd/goopg/... ./internal/executor/...
+./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS.
+
+This closes writeback simplification (3). The only named residual left in
+the M0122-0003 writeback bucket is simplification (4) (background writer /
+checkpointer rows' own `writes`/`write_bytes`/`write_time` cells staying an
+honest 0 — `sharedWrittenCount`/`sharedWriteTimeNanos` are deliberately
+backend-scoped) plus the still-open `reuses` `pg_stat_io` op counter
+(needs a `BufferAccessStrategy`-style ring buffer, feature-sized).

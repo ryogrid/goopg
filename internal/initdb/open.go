@@ -667,16 +667,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 	// writeback's OnFlushWait/OnFlushDone analogues, one per context
-	// (M0122-0003 pg_stat_io follow-up: writeback/writeback_time). The
-	// backend context is gated the same per-goroutine way as
-	// OnFlushWait/OnFlushDone above. bgwriter/checkpointer are singleton
-	// background goroutines with no per-session SET semantics to look
-	// up (unlike a client backend, a background process only ever sees
-	// the config-file GUC value), so their timing gate is simply the
-	// boot-time TrackIOTiming value; a plain time.Now()/time.Since pair
-	// stands in for the activity-registry wait-event clock those two
-	// contexts don't have a registered background slot for yet (a
-	// smaller, separately-tracked residual — see deferral ledger).
+	// (M0122-0003 pg_stat_io follow-up: writeback/writeback_time). All
+	// three contexts now share the identical act.LookupTrackedGoroutine()
+	// → WaitEventStart/WaitEventEnd pattern: bgwriter and checkpointer are
+	// registered background slots (BgwriterIdx/CheckpointerIdx below;
+	// checkpointerProcNum above) with their TrackIOTiming bit seeded once
+	// from the boot-time GUC value at registration (background workers
+	// have no per-session SET semantics to react to, unlike a client
+	// backend), so the gate reduces to the same boot-time value the
+	// previous plain time.Now()/time.Since pair used — but now backed by
+	// the real activity-registry wait-event clock, which also makes their
+	// writeback wait visible in pg_stat_activity (writeback simplification
+	// 3, resolved: see deferral ledger).
 	pool.OnBackendWritebackWait = func() {
 		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
 			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
@@ -688,27 +690,26 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			pool.AddBackendWritebackTimeNanos(int64(d))
 		}
 	}
-	var bgwriterWritebackStart, checkpointWritebackStart time.Time
 	pool.OnBgwriterWritebackWait = func() {
-		if opts.TrackIOTiming {
-			bgwriterWritebackStart = time.Now()
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	pool.OnBgwriterWritebackDone = func() {
-		if opts.TrackIOTiming && !bgwriterWritebackStart.IsZero() {
-			pool.AddBgwriterWritebackTimeNanos(int64(time.Since(bgwriterWritebackStart)))
-			bgwriterWritebackStart = time.Time{}
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddBgwriterWritebackTimeNanos(int64(d))
 		}
 	}
 	pool.OnCheckpointerWritebackWait = func() {
-		if opts.TrackIOTiming {
-			checkpointWritebackStart = time.Now()
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
 	}
 	pool.OnCheckpointerWritebackDone = func() {
-		if opts.TrackIOTiming && !checkpointWritebackStart.IsZero() {
-			pool.AddCheckpointWritebackTimeNanos(int64(time.Since(checkpointWritebackStart)))
-			checkpointWritebackStart = time.Time{}
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddCheckpointWritebackTimeNanos(int64(d))
 		}
 	}
 	pool.SetCheckpointFlushAfter(opts.CheckpointFlushAfter)
@@ -1396,11 +1397,37 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	syncRep := wal.NewSyncRep()
 
 	defaultGUC := wal.DefaultGUCParameters()
+	// Pre-register the checkpointer background slot (M0122-0003 writeback
+	// simplification 3 follow-up) so Run's OnLoopStart/OnLoopEnd hooks below
+	// can track its goroutine identity the same way walProcNum tracks the
+	// WAL writer's. TrackIOTiming is seeded once from the boot-time GUC and
+	// never updated afterward: unlike a client backend, a background
+	// worker has no per-session `SET track_io_timing` to react to.
+	//
+	// Previously cmd/goopg/main.go registered a "cp-0" backend via
+	// act.Register (the regular, numeric-PID-keyed path), which silently
+	// collided with walProcNum: procNumForPID treats every non-numeric PID
+	// as bgBase, the exact slot RegisterBackground(WalWriterIdx, ...)
+	// above already claims, so the checkpointer's Register call was
+	// clobbering the WAL writer's activitySlot. RegisterBackground(
+	// CheckpointerIdx, ...) claims its own reserved slot instead.
+	checkpointerProcNum := act.RegisterBackground(activity.CheckpointerIdx, &activity.Backend{
+		PID:         "cp-0",
+		BackendType: "checkpointer",
+		State:       "active",
+	})
+	act.UpdateTrackIOTiming(checkpointerProcNum, opts.TrackIOTiming)
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
 		DataDir:             abs,
 		SegmentSize:         walCfg.SegmentSize,
 		GUCParams:           defaultGUC,
 		PGCompatCheckpoints: true,
+		OnLoopStart: func() {
+			activity.SetCurrentGoroutine(act, checkpointerProcNum)
+		},
+		OnLoopEnd: func() {
+			activity.ClearCurrentGoroutine()
+		},
 		// M0106-0010 batched-45: refresh checkPointCopy.nextXid into
 		// pg_control at every checkpoint from the live mvcc manager.
 		// batched-47: DataDir above was previously unset on the runtime
@@ -1923,6 +1950,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// dirty buffer-pool pages so eviction rarely needs synchronous I/O.
 	if opts.BgwriterDelay > 0 && opts.BgwriterMaxPages > 0 {
 		rt.bgwriter = storage.NewBgwriter(pool, opts.BgwriterDelay, opts.BgwriterMaxPages)
+		// Pre-register the bgwriter background slot (M0122-0003 writeback
+		// simplification 3 follow-up) so OnLoopStart/OnLoopEnd below can
+		// track its goroutine identity the same way walProcNum/
+		// checkpointerProcNum track theirs. TrackIOTiming is seeded once
+		// from the boot-time GUC — a background worker has no
+		// per-session `SET track_io_timing` to react to.
+		bgwriterProcNum := act.RegisterBackground(activity.BgwriterIdx, &activity.Backend{
+			PID: "bgwriter-0",
+			// "background writer" (with a space) matches upstream's
+			// pg_stat_activity.backend_type / pg_stat_io backend_type
+			// literal for this process (see pgstat_io.go's
+			// ioBackendTypeNames).
+			BackendType: "background writer",
+			State:       "active",
+		})
+		act.UpdateTrackIOTiming(bgwriterProcNum, opts.TrackIOTiming)
+		rt.bgwriter.OnLoopStart = func() {
+			activity.SetCurrentGoroutine(act, bgwriterProcNum)
+		}
+		rt.bgwriter.OnLoopEnd = func() {
+			activity.ClearCurrentGoroutine()
+		}
 		rt.bgwriter.Start()
 	}
 
