@@ -1343,10 +1343,10 @@ func (p *parser) parseExplainOneOption(opts *ExplainOptions) error {
 	p.advance()
 
 	if name == "format" {
-		// FORMAT requires a value: TEXT or JSON.
+		// FORMAT requires a value: TEXT, XML, JSON, or YAML.
 		valTok := p.cur()
 		if valTok.Kind != TokenIdent && valTok.Kind != TokenKeyword && valTok.Kind != TokenStringLit && valTok.Kind != TokenQuotedIdent {
-			return &SyntaxError{Pos: valTok.Pos, Message: "FORMAT requires a value (TEXT or JSON)"}
+			return &SyntaxError{Pos: valTok.Pos, Message: "FORMAT requires a value (TEXT, XML, JSON, or YAML)"}
 		}
 		v := strings.ToLower(valTok.Value)
 		p.advance()
@@ -1355,8 +1355,12 @@ func (p *parser) parseExplainOneOption(opts *ExplainOptions) error {
 			opts.Format = ExplainFormatText
 		case "json":
 			opts.Format = ExplainFormatJSON
+		case "xml":
+			opts.Format = ExplainFormatXML
+		case "yaml":
+			opts.Format = ExplainFormatYAML
 		default:
-			return &SyntaxError{Pos: valTok.Pos, Message: fmt.Sprintf("unsupported FORMAT %q (TEXT or JSON only)", valTok.Value)}
+			return &SyntaxError{Pos: valTok.Pos, Message: fmt.Sprintf("unsupported FORMAT %q (TEXT, XML, JSON, or YAML only)", valTok.Value)}
 		}
 		opts.Set.Format = true
 		return nil

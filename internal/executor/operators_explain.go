@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -85,7 +84,7 @@ func (o *explainOp) Open(ctx *Context) error {
 		}
 		execNs = time.Since(execStart).Nanoseconds()
 
-		if opts.Format == parser.ExplainFormatJSON {
+		if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
 			// Upstream nests the plan tree under a top-level "Plan" key, with
 			// Planning Time / Execution Time as its siblings:
 			//   [ { "Plan": {...}, "Planning Time": .., "Execution Time": .. } ]
@@ -96,15 +95,17 @@ func (o *explainOp) Open(ctx *Context) error {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
 			}
-			out, err := json.MarshalIndent([]any{root}, "", "  ")
+			addExplainSettingsGroup(ctx, opts, root)
+			out, err := renderExplainTree(opts.Format, root)
 			if err != nil {
-				return fmt.Errorf("explain: marshal JSON: %w", err)
+				return err
 			}
-			o.rows = []Row{{NewStringDatum(string(out))}}
+			o.rows = []Row{{NewStringDatum(out)}}
 			return nil
 		}
 		var b strings.Builder
 		walkPlanAnalyze(&b, o.plan.Child, 0, &o.rows, opts, stats)
+		appendExplainSettingsRow(ctx, opts, &o.rows)
 		if summary {
 			o.rows = append(o.rows,
 				Row{NewStringDatum(fmt.Sprintf("Planning Time: %.3f ms", nsToMs(planNs)))},
@@ -114,25 +115,91 @@ func (o *explainOp) Open(ctx *Context) error {
 		return nil
 	}
 
-	if opts.Format == parser.ExplainFormatJSON {
-		// FORMAT JSON: emit one row whose cell is the JSON-
-		// encoded plan tree, nested under a top-level "Plan" key
+	if opts.Format == parser.ExplainFormatJSON || opts.Format == parser.ExplainFormatXML || opts.Format == parser.ExplainFormatYAML {
+		// FORMAT JSON/XML/YAML: emit one row whose cell is the
+		// serialized plan tree, nested under a top-level "Plan" key
 		// inside the single-element array, matching upstream's
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
 		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
-		out, err := json.MarshalIndent([]any{root}, "", "  ")
+		addExplainSettingsGroup(ctx, opts, root)
+		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
-			return fmt.Errorf("explain: marshal JSON: %w", err)
+			return err
 		}
-		o.rows = []Row{{NewStringDatum(string(out))}}
+		o.rows = []Row{{NewStringDatum(out)}}
 		return nil
 	}
 	var b strings.Builder
 	walkPlan(&b, o.plan.Child, 0, &o.rows, opts)
+	appendExplainSettingsRow(ctx, opts, &o.rows)
 	return nil
 }
 
+// appendExplainSettingsRow adds the upstream `Settings: k = 'v', ...` TEXT
+// line (ExplainPrintSettings in explain.c, non-JSON branch) when EXPLAIN
+// (SETTINGS) was requested and at least one FlagExplain-tagged GUC differs
+// from its built-in default. Unlike the structured formats, PG prints
+// nothing at all — not even an empty "Settings:" label — when the
+// modified-GUC list is empty.
+func appendExplainSettingsRow(ctx *Context, opts parser.ExplainOptions, rows *[]Row) {
+	if !opts.Settings || ctx == nil || ctx.ExplainSettings == nil {
+		return
+	}
+	vals := ctx.ExplainSettings()
+	if len(vals) == 0 {
+		return
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = fmt.Sprintf("%s = '%s'", v.Name, v.Value)
+	}
+	*rows = append(*rows, Row{NewStringDatum("Settings: " + strings.Join(parts, ", "))})
+}
+
+// addExplainSettingsGroup adds the "Settings" object that PG's structured
+// (JSON/XML/YAML) formats always include once SETTINGS is requested — unlike
+// TEXT, the group is present (as an empty object) even with zero modified
+// GUCs, mirroring ExplainPrintSettings's format != EXPLAIN_FORMAT_TEXT branch
+// which has no early return.
+func addExplainSettingsGroup(ctx *Context, opts parser.ExplainOptions, root map[string]any) {
+	if !opts.Settings {
+		return
+	}
+	settings := map[string]any{}
+	if ctx != nil && ctx.ExplainSettings != nil {
+		for _, v := range ctx.ExplainSettings() {
+			settings[v.Name] = v.Value
+		}
+	}
+	root["Settings"] = settings
+}
+
 func nsToMs(ns int64) float64 { return float64(ns) / 1e6 }
+
+// formatBuffersLine renders the upstream "Buffers: shared hit=N read=N
+// dirtied=N written=N" text (show_buffer_usage's has_shared/shared-buffer
+// branch in postgres/src/backend/commands/explain.c), omitting the whole
+// line when all four counters are zero and omitting each individual
+// hit=/read=/dirtied=/written= term when that counter is zero.
+func formatBuffersLine(s *nodeStats) string {
+	if s.bufHit == 0 && s.bufRead == 0 && s.bufDirtied == 0 && s.bufWritten == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 4)
+	if s.bufHit > 0 {
+		parts = append(parts, fmt.Sprintf("hit=%d", s.bufHit))
+	}
+	if s.bufRead > 0 {
+		parts = append(parts, fmt.Sprintf("read=%d", s.bufRead))
+	}
+	if s.bufDirtied > 0 {
+		parts = append(parts, fmt.Sprintf("dirtied=%d", s.bufDirtied))
+	}
+	if s.bufWritten > 0 {
+		parts = append(parts, fmt.Sprintf("written=%d", s.bufWritten))
+	}
+	return "Buffers: shared " + strings.Join(parts, " ")
+}
 
 func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
@@ -476,6 +543,18 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 		}
 	}
 
+	// EXPLAIN (ANALYZE, BUFFERS) emits a "Buffers: shared hit=N read=N"
+	// detail line per node (design 0122-0003 BUFFERS slice). Shared-only,
+	// hit/read-only for now — local/temp buffers and dirtied/written
+	// counts are a deferred follow-up (ledger).
+	if opts.Buffers {
+		if s, ok := stats[n]; ok && s != nil {
+			if line := formatBuffersLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
+		}
+	}
+
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			outline := indent + "  Output: " + strings.Join(cols, ", ")
@@ -506,6 +585,21 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		// ...->'Plan'->'Heap Fetches'.
 		if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
 			obj["Heap Fetches"] = s.heapFetches
+		}
+		// EXPLAIN (ANALYZE, BUFFERS, FORMAT {JSON,XML,YAML}): unlike TEXT's
+		// "Buffers:" line (formatBuffersLine, only printed when non-zero),
+		// upstream's non-text show_buffer_usage() prints these properties
+		// unconditionally once BUFFERS is requested, even when zero
+		// (explain.c's peek_buffer_usage: "when format is anything other
+		// than text, we print even if the counters are all zeroes"). Only
+		// the shared hit/read/dirtied/written counters goopg actually
+		// tracks are emitted here; local/temp/I-O-timing remain deferred
+		// (ledger, M0122-0003).
+		if opts.Buffers {
+			obj["Shared Hit Blocks"] = s.bufHit
+			obj["Shared Read Blocks"] = s.bufRead
+			obj["Shared Dirtied Blocks"] = s.bufDirtied
+			obj["Shared Written Blocks"] = s.bufWritten
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the

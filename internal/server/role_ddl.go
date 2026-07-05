@@ -33,6 +33,7 @@ package server
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/goopg/goopg/internal/auth"
@@ -69,7 +70,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// PG defaults: CREATE USER implies LOGIN; CREATE ROLE/GROUP imply
 		// NOLOGIN (postgres/src/backend/commands/user.c CreateRole).
 		// Explicit LOGIN/NOLOGIN below overrides.
-		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user ")}
+		attrs := catalog.RoleAttrs{CanLogin: strings.HasPrefix(norm, "create user "), ConnLimit: -1}
 		applyRoleAttrOptions(sql, norm, &attrs)
 		s.registerRole(name)
 		// Also register in catalog so executor-level DROP ROLE IF EXISTS can check.
@@ -112,7 +113,7 @@ func (s *Server) tryHandleRoleDDL(sql string, dbName string, resolveCurrent curr
 		// Start from the recorded attributes so an ALTER only changes what it
 		// names (PG semantics: unspecified attributes keep their value). The
 		// bootstrap superuser defaults to superuser+login.
-		attrs := catalog.RoleAttrs{CanLogin: isBootstrap, Superuser: isBootstrap}
+		attrs := catalog.RoleAttrs{CanLogin: isBootstrap, Superuser: isBootstrap, ConnLimit: -1}
 		im, isInMem := s.cfg.Catalog.(*catalog.InMemory)
 		if isInMem {
 			if cur, found := im.LookupRoleAttrs(name); found {
@@ -163,12 +164,18 @@ func (s *Server) persistRoleState(name string, attrs catalog.RoleAttrs) error {
 			oid, _ = im.RoleOID(name)
 		}
 		if _, _, werr := s.cfg.WAL.Append(wal.EncodeRoleState(wal.RoleStatePayload{
-			Name:      strings.ToLower(name),
-			OID:       oid,
-			CanLogin:  attrs.CanLogin,
-			Superuser: attrs.Superuser,
-			CredType:  attrs.CredType,
-			Secret:    attrs.Secret,
+			Name:        strings.ToLower(name),
+			OID:         oid,
+			CanLogin:    attrs.CanLogin,
+			Superuser:   attrs.Superuser,
+			CreateDB:    attrs.CreateDB,
+			CreateRole:  attrs.CreateRole,
+			Replication: attrs.Replication,
+			BypassRLS:   attrs.BypassRLS,
+			ConnLimit:   attrs.ConnLimit,
+			ValidUntil:  attrs.ValidUntil,
+			CredType:    attrs.CredType,
+			Secret:      attrs.Secret,
 		})); werr != nil {
 			return werr
 		}
@@ -253,10 +260,13 @@ func isReservedRoleName(name string) bool {
 // applyRoleAttrOptions scans the option list of a CREATE/ALTER ROLE statement
 // and folds the recognised attributes into attrs. norm is the lower-cased
 // normalised statement (keyword matching); sql is the ORIGINAL statement —
-// the password literal must be taken from it because normalizeCompatSQL
-// lower-cases the whole line and would corrupt a case-sensitive password.
-// Unrecognised options (CREATEDB, REPLICATION, VALID UNTIL, ...) are ignored,
-// matching the handler's historical accept-and-ignore behaviour.
+// the password literal (and the VALID UNTIL timestamp literal) must be taken
+// from it because normalizeCompatSQL lower-cases the whole line and would
+// corrupt a case-sensitive value. CREATEDB/CREATEROLE/REPLICATION/BYPASSRLS/
+// CONNECTION LIMIT/VALID UNTIL are recognised (DU-002 slice 439 follow-up);
+// IN ROLE/ADMIN/ROLE/USER/SYSID (membership + the legacy numeric-OID clause)
+// remain unrecognised and ignored, matching the handler's historical
+// accept-and-ignore behaviour for options outside RoleAttrs' scope.
 func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs) {
 	if strings.Contains(norm, " nosuperuser") {
 		attrs.Superuser = false
@@ -267,6 +277,32 @@ func applyRoleAttrOptions(sql, norm string, attrs *catalog.RoleAttrs) {
 		attrs.CanLogin = false
 	} else if strings.Contains(norm, " login") {
 		attrs.CanLogin = true
+	}
+	if strings.Contains(norm, " nocreatedb") {
+		attrs.CreateDB = false
+	} else if strings.Contains(norm, " createdb") {
+		attrs.CreateDB = true
+	}
+	if strings.Contains(norm, " nocreaterole") {
+		attrs.CreateRole = false
+	} else if strings.Contains(norm, " createrole") {
+		attrs.CreateRole = true
+	}
+	if strings.Contains(norm, " noreplication") {
+		attrs.Replication = false
+	} else if strings.Contains(norm, " replication") {
+		attrs.Replication = true
+	}
+	if strings.Contains(norm, " nobypassrls") {
+		attrs.BypassRLS = false
+	} else if strings.Contains(norm, " bypassrls") {
+		attrs.BypassRLS = true
+	}
+	if n, ok := extractRoleConnLimit(norm); ok {
+		attrs.ConnLimit = n
+	}
+	if v, ok := extractRoleValidUntil(sql, norm); ok {
+		attrs.ValidUntil = v
 	}
 	if pw, kind, ok := extractRolePassword(sql, norm); ok {
 		switch kind {
@@ -351,6 +387,73 @@ func extractRolePassword(sql, norm string) (secret string, kind rolePasswordKind
 		return secret, rolePasswordMD5, true
 	}
 	return secret, rolePasswordPlain, true
+}
+
+// extractRoleConnLimit finds `CONNECTION LIMIT <n>` in a CREATE/ALTER ROLE
+// statement's normalised text. n may be negative (PG allows CONNECTION LIMIT
+// -1 to mean "no limit", the default). ok is false when the clause is absent
+// or the following token is not an integer.
+func extractRoleConnLimit(norm string) (n int32, ok bool) {
+	idx := strings.Index(norm, " connection limit ")
+	if idx < 0 {
+		return 0, false
+	}
+	rest := strings.TrimSpace(norm[idx+len(" connection limit "):])
+	end := strings.IndexAny(rest, " \t\n\r;,")
+	if end >= 0 {
+		rest = rest[:end]
+	}
+	v, err := strconv.ParseInt(rest, 10, 32)
+	if err != nil {
+		return 0, false
+	}
+	return int32(v), true
+}
+
+// extractRoleValidUntil finds `VALID UNTIL '<literal>'` in a CREATE/ALTER
+// ROLE statement. The literal's bytes are read from the ORIGINAL sql
+// (case-preserved), matching extractRolePassword's approach; single-quote
+// doubling is unescaped the same way. `VALID UNTIL NULL` and `'infinity'`
+// are both recognised — goopg stores the raw literal text verbatim and never
+// evaluates it (no password-expiry enforcement), so both round-trip through
+// pg_authid.rolvaliduntil as the text pg_dump emitted.
+func extractRoleValidUntil(sql, norm string) (value string, ok bool) {
+	idx := strings.Index(norm, " valid until ")
+	if idx < 0 {
+		return "", false
+	}
+	rest := strings.TrimSpace(norm[idx+len(" valid until "):])
+	if rest == "null" || strings.HasPrefix(rest, "null ") || strings.HasPrefix(rest, "null;") {
+		return "", true // NULL clears any previously-set expiration
+	}
+	if !strings.HasPrefix(rest, "'") {
+		return "", false
+	}
+	lowSQL := strings.ToLower(sql)
+	kw := strings.Index(lowSQL, "valid")
+	if kw < 0 {
+		return "", false
+	}
+	open := strings.Index(sql[kw:], "'")
+	if open < 0 {
+		return "", false
+	}
+	start := kw + open + 1
+	var b strings.Builder
+	i := start
+	for i < len(sql) {
+		if sql[i] == '\'' {
+			if i+1 < len(sql) && sql[i+1] == '\'' {
+				b.WriteByte('\'')
+				i += 2
+				continue
+			}
+			break
+		}
+		b.WriteByte(sql[i])
+		i++
+	}
+	return b.String(), true
 }
 
 // applyRoleCredential mirrors the role's credential into the live auth

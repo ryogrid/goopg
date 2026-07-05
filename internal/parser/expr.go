@@ -132,6 +132,23 @@ type ExtractExpr struct {
 func (e *ExtractExpr) Pos() int { return e.pos }
 func (*ExtractExpr) exprNode()  {}
 
+// GroupingCall is the SQL-standard `GROUPING(expr [, ...])` pseudo-function,
+// valid only in the SELECT list / HAVING / ORDER BY of a query whose GROUP
+// BY used GROUPING SETS/ROLLUP/CUBE. Its value depends solely on which
+// generated grouping set produced the current row — bit i (counting from
+// the least-significant bit, rightmost arg) is 1 iff Args[i] is NOT part of
+// that set — so it never needs a runtime evaluation: the planner's
+// grouping-sets rewrite resolves each occurrence to a plain integer literal
+// once per generated branch. Stored separately from FuncCall (like
+// ExtractExpr) because it isn't a real catalog function. M0122-0004.
+type GroupingCall struct {
+	pos  int
+	Args []Expr
+}
+
+func (g *GroupingCall) Pos() int { return g.pos }
+func (*GroupingCall) exprNode()  {}
+
 // IntervalLit represents the SQL-standard `interval 'N' unit`
 // shape used heavily by TPC-H (Q1: `interval '90' day`, Q4:
 // `interval '3' month`, Q5/6/12/14: `interval '1' year`, etc.).
@@ -160,11 +177,15 @@ type InExpr struct {
 	Operand     Expr
 	Negated     bool // NOT IN
 	NotEqualAny bool // != ANY semantics (OR of != comparisons). M0097-0067.
-	// AnyOp, when non-zero, indicates `left op ANY(array)` with the given operator.
-	// Used for non-equality ANY predicates such as `col ~ ANY(ARRAY[...])`.
-	AnyOp    OpCode
-	Subquery *SelectStmt // populated for IN (subquery)
-	List     []Expr      // populated for IN (val_list)
+	// AnyOp, when non-zero, indicates `left op ANY|SOME|ALL(...)` with the
+	// given operator. Used for non-equality ANY/ALL predicates such as
+	// `col ~ ANY(ARRAY[...])` or `col < ALL(SELECT ...)`.
+	AnyOp OpCode
+	// AllOp selects ALL (AND of the per-element comparison) instead of the
+	// default ANY/SOME (OR) semantics when AnyOp is set. M0122-0004.
+	AllOp    bool
+	Subquery *SelectStmt // populated for IN/ANY/ALL (subquery)
+	List     []Expr      // populated for IN/ANY/ALL (val_list / array)
 }
 
 func (e *InExpr) Pos() int { return e.pos }
@@ -456,17 +477,81 @@ type FuncCall struct {
 func (e *FuncCall) Pos() int { return e.pos }
 func (*FuncCall) exprNode()  {}
 
+// FrameMode identifies which of ROWS/RANGE/GROUPS an explicit window
+// frame clause uses (SQL:2003 <window frame units>). WindowDef.Frame
+// stays nil when no explicit frame clause was written — the default
+// frame (RANGE UNBOUNDED PRECEDING, peer-inclusive) applies.
+type FrameMode int
+
+const (
+	FrameModeRows FrameMode = iota
+	FrameModeRange
+	FrameModeGroups
+)
+
+// FrameBoundKind identifies one endpoint of a window frame
+// (SQL:2003 <window frame bound>). Ordered UNBOUNDED PRECEDING <
+// OFFSET PRECEDING < CURRENT ROW < OFFSET FOLLOWING < UNBOUNDED
+// FOLLOWING to mirror gram.y's bound-ordering validation.
+type FrameBoundKind int
+
+const (
+	FrameBoundUnboundedPreceding FrameBoundKind = iota
+	FrameBoundOffsetPreceding
+	FrameBoundCurrentRow
+	FrameBoundOffsetFollowing
+	FrameBoundUnboundedFollowing
+)
+
+// FrameExclusion identifies an optional EXCLUDE clause
+// (SQL:2003 <window frame exclusion>). FrameExcludeNone covers both
+// an omitted clause and the explicit EXCLUDE NO OTHERS spelling —
+// both mean "exclude nothing".
+type FrameExclusion int
+
+const (
+	FrameExcludeNone FrameExclusion = iota
+	FrameExcludeCurrentRow
+	FrameExcludeGroup
+	FrameExcludeTies
+)
+
+// WindowFrame is the parsed `{ROWS|RANGE|GROUPS} BETWEEN bound AND
+// bound [EXCLUDE ...]` frame clause of a window definition. Only
+// FrameModeRows reaches the executor (M0122-0004 frame-clause slice);
+// RANGE/GROUPS parse structurally but are rejected by the analyzer
+// (0A000) — see docs/design/0020-0001-window-parser-and-ast.md.
+type WindowFrame struct {
+	Mode        FrameMode
+	StartKind   FrameBoundKind
+	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	EndKind     FrameBoundKind
+	EndOffset   Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	Exclusion   FrameExclusion
+	// HasBetween is true for the `BETWEEN bound AND bound` spelling
+	// and false for the single-bound `frame_bound` spelling (where
+	// EndKind defaults to FrameBoundCurrentRow). The analyzer's
+	// bound-ordering validation needs this to reproduce gram.y's
+	// distinct wording for the two forms (frame_extent productions).
+	HasBetween bool
+}
+
 // WindowDef is the parsed `OVER ( [PARTITION BY exprs]
-// [ORDER BY sortlist] )` tail attached to a FuncCall (M0020 step
-// 1). Frame clauses (ROWS / RANGE / GROUPS), frame exclusion, and
-// named-window references (`OVER win_name`) are deferred to a
-// later slice — they're optional in upstream and ROW_NUMBER /
-// RANK / LAG / LEAD don't need explicit frames at the SQL surface
-// (the executor uses default frames).
+// [ORDER BY sortlist] [frame clause] )` tail attached to a FuncCall
+// (M0020 step 1; frame clause added M0122-0004).
+//
+// RefName is set instead of PartitionBy/OrderBy/Frame for the bare
+// `OVER window_name` form (M0020 named-window slice); the analyzer
+// resolves it against the enclosing SelectStmt.WindowClause and
+// copies the definition's PartitionBy/OrderBy/Frame in, so every
+// downstream consumer (planner, executor) only ever sees the
+// resolved form and needs no RefName-awareness of its own.
 type WindowDef struct {
 	pos         int
 	PartitionBy []Expr
 	OrderBy     []SortBy
+	Frame       *WindowFrame
+	RefName     string
 }
 
 // Pos returns the position of the leading `OVER` keyword.

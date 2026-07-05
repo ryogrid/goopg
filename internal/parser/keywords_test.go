@@ -85,6 +85,8 @@ func TestIsColNameKeyword(t *testing.T) {
 		{KwAnalyze, false, "analyze"},
 		{KwAll, false, "all"},
 		{KwDefault, false, "default"},
+		{KwSymmetric, false, "symmetric"},
+		{KwAsymmetric, false, "asymmetric"},
 	}
 	for _, tc := range cases {
 		got := IsColNameKeyword(tc.kw)

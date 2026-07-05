@@ -584,6 +584,14 @@ type PGClassRow struct {
 	RelFileNode    uint32 // relfilenode (0 for virtual / view)
 	RelPersistence string // relpersistence: 'p'=permanent
 	RelIsShared    bool   // relisshared
+	// RelOptions holds the pg_class.reloptions text[] external literal (e.g.
+	// "{fillfactor=70}"), or "" when absent/NULL. Neither DecodePGClassRow
+	// nor DecodePGClassPhysicalRow populate this (reloptions is a varlena
+	// column past the fixed-offset prefix they decode); initdb's
+	// loadUserTablesFromHeap fills it in via executor.DecodeRowIntoMctxPGTuple
+	// (the general PG-tuple decoder) and feeds it to ApplyTableReloptions.
+	// M0119-0004.
+	RelOptions string
 }
 
 // PGAttributeRow is the v0 on-disk shape of one pg_attribute tuple.

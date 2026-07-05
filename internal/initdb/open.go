@@ -604,22 +604,58 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	mgr.OnBlockWritten = func(rel storage.RelFileNode, blk storage.BlockNumber) {
 		pool.InvalidateBlock(storage.BufferTag{Rel: rel, Block: blk})
 	}
-	// M0092-0005: BufferPin wait-event hook gated by
-	// TrackIOTiming. Default off — saves the per-Pin
-	// runtime.Stack lookup on the hot read path.
+	// M0092-0005: BufferPin wait-event hook. Wired unconditionally (not
+	// gated on the boot-time TrackIOTiming value) so a runtime `SET
+	// track_io_timing` takes effect without a server restart; the hook
+	// body's LookupTrackedGoroutine call is itself gated on act's
+	// fast-path flag, keeping the default-off cost to a single atomic
+	// load rather than the goroutine-map lookup (M0122-0003 follow-up).
+	// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
+	// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
+	pool.OnPinWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
+		}
+	}
+	pool.OnPinDone = func() {
+		// M0122-0003: WaitEventEnd's returned duration is real wall-clock
+		// time only when track_io_timing gated this pair on (the
+		// LookupTrackedGoroutine ok-branch), so accumulating it here
+		// unconditionally within this branch matches upstream's "zero
+		// unless track_io_timing is enabled" pg_stat_io.read_time semantics.
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddReadTimeNanos(int64(d))
+		}
+	}
+	// write_time's OnPinWait/OnPinDone analogue: brackets evictVictim's
+	// dirty-victim flushSlot call (M0122-0003 pg_stat_io follow-up).
+	pool.OnFlushWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnFlushDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddWriteTimeNanos(int64(d))
+		}
+	}
+	// extend_time's OnFlushWait/OnFlushDone analogue: brackets PinNew's
+	// mgr.Extend call (M0122-0003 pg_stat_io follow-up).
+	pool.OnExtendWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
+		}
+	}
+	pool.OnExtendDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddExtendTimeNanos(int64(d))
+		}
+	}
 	if opts.TrackIOTiming {
-		// M0107-0005: use LookupCurrentGoroutine (procNum) instead of
-		// LookupGoroutine (Registry+pid) so WaitEventStart is atomic.
-		pool.OnPinWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeBufferPin, activity.WaitBufferPin)
-			}
-		}
-		pool.OnPinDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
-		}
+		act.EnableTrackIOTimingFastPath()
 	}
 	// Wire FlushAll goroutine assertion (M0042-0004): Pool.FlushAll and
 	// Pool.FlushAllPaced must only be called from the checkpointer goroutine
@@ -1155,6 +1191,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: column-defaults replay: %w", err)
 	}
 
+	// Materialized-view query persistence (M0119-0004 follow-up): re-parse the
+	// defining-query snapshots emitted by syncTableToCatalogHeap onto the
+	// heap-reloaded matviews (View is an in-memory AST pg_class cannot carry).
+	// Must run AFTER loadUserTablesFromHeap.
+	if err := replayMatViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: matview replay: %w", err)
+	}
+
+	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
+	// matview replay above): re-parse the defining-query snapshots emitted by
+	// syncTableToCatalogHeap onto the heap-reloaded views (View is an
+	// in-memory AST pg_class cannot carry). Must run AFTER loadUserTablesFromHeap.
+	if err := replayViewRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: view replay: %w", err)
+	}
+
 	// Role/auth restart persistence (root-0021): load the durable BASE from
 	// the pg_authid heap file (global/1260 — rewritten on every role DDL by
 	// SyncPgAuthidFile, mirroring PostgreSQL's pg_authid-as-store model),
@@ -1599,62 +1657,69 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, err
 	}
 
-	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity
-	// can report blocking reasons. M0092-0005: gated by TrackIOTiming
-	// (default off). M0107-0005: use LookupCurrentGoroutine (procNum)
-	// for atomic WaitEventStart instead of LookupGoroutine (mutex).
+	// Wire AIO + data-file I/O wait-event hooks so pg_stat_activity can
+	// report blocking reasons. Wired unconditionally (not gated on the
+	// boot-time TrackIOTiming value) so a runtime `SET track_io_timing`
+	// takes effect without a server restart; each hook body's
+	// LookupTrackedGoroutine call is itself gated on act's fast-path
+	// flag, so the default-off cost stays a single atomic load rather
+	// than the goroutine-map lookup (M0092-0005 original rationale;
+	// M0122-0003 runtime-SET follow-up). M0107-0005: use
+	// LookupCurrentGoroutine (procNum) for atomic WaitEventStart instead
+	// of LookupGoroutine (mutex).
 	if opts.TrackIOTiming {
-		if aioEngine != nil {
-			aioEngine.OnWaitStart = func() {
-				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-					reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
-				}
-			}
-			aioEngine.OnWaitEnd = func() {
-				if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-					reg.WaitEventEnd(procNum)
-				}
+		act.EnableTrackIOTimingFastPath()
+	}
+	if aioEngine != nil {
+		aioEngine.OnWaitStart = func() {
+			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitAIO)
 			}
 		}
-		mgr.OnReadWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
-			}
-		}
-		mgr.OnReadDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
+		aioEngine.OnWaitEnd = func() {
+			if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
 				reg.WaitEventEnd(procNum)
 			}
 		}
-		mgr.OnWriteWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
-			}
+	}
+	mgr.OnReadWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileRead)
 		}
-		mgr.OnWriteDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
+	}
+	mgr.OnReadDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
 		}
-		mgr.OnExtendWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
-			}
+	}
+	mgr.OnWriteWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
 		}
-		mgr.OnExtendDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
+	}
+	mgr.OnWriteDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
 		}
-		mgr.OnSyncWait = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
-			}
+	}
+	mgr.OnExtendWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileExtend)
 		}
-		mgr.OnSyncDone = func() {
-			if reg, procNum, ok := activity.LookupCurrentGoroutine(); ok {
-				reg.WaitEventEnd(procNum)
-			}
+	}
+	mgr.OnExtendDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
+		}
+	}
+	mgr.OnSyncWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileSync)
+		}
+	}
+	mgr.OnSyncDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventEnd(procNum)
 		}
 	}
 
@@ -2060,7 +2125,8 @@ func appendCatalogRows(mgr *storage.Manager, rel storage.RelFileNode, tuples []s
 
 // loadUserTablesFromHeap loads the in-memory catalog with user tables
 // found in the pg_class and pg_attribute heap relfiles (M0030-0003). It scans
-// all live (xmin≠0, xmax=0) pg_class rows with relkind='r' and OID ≥ FirstUserOID,
+// all live (xmin≠0, xmax=0) pg_class rows with relkind='r' or 'm' (materialized
+// view — has physical storage like a table) and OID ≥ FirstUserOID,
 // then collects their column definitions from pg_attribute rows, and calls
 // TryRegisterUserTable for each.
 //
@@ -2168,6 +2234,21 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 					continue
 				}
 				physicalRow = true
+				// DecodePGClassPhysicalRow only covers the fixed-offset
+				// prefix; reloptions (attnum 33) is a varlena column past
+				// it, so re-decode the full PG18-canonical row with the
+				// general PG-tuple decoder to recover it. A decode failure
+				// here just leaves RelOptions empty (best-effort — the
+				// fixed fields above already succeeded). M0119-0004.
+				natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+				cols := executor.PGClassColumnsPG18()
+				decoded := make(executor.Row, len(cols))
+				if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr == nil {
+					const reloptionsOrdinal = 32
+					if reloptionsOrdinal < len(decoded) && !decoded[reloptionsOrdinal].IsNull() {
+						row.RelOptions = decoded[reloptionsOrdinal].StringValue()
+					}
+				}
 			}
 			// Skip rows from uncommitted or crashed goopg transactions
 			// (M0030-0007). PG basebackup tuples come from a consistent
@@ -2187,7 +2268,7 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			if !physicalRow && clog != nil && clog.GetStatus(ht.Header.Xmin) != mvcc.TxnStatusCommitted {
 				continue
 			}
-			if row.RelKind == "r" && row.OID >= catalog.FirstUserOID {
+			if (row.RelKind == "r" || row.RelKind == "m" || row.RelKind == "v") && row.OID >= catalog.FirstUserOID {
 				userTableRows = append(userTableRows, recoveredPGClassRow{row: row, physical: physicalRow})
 			}
 		}
@@ -2294,9 +2375,25 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			Columns:        cols,
 			OID:            tr.OID,
 			SmallDimension: tr.RelName == "region" || tr.RelName == "nation",
+			// IsMatView from relkind alone; View/ViewDef/IsPopulated are
+			// restored afterward by replayMatViewRecords (the AST/populated
+			// flag have no heap representation — see RecordKindCreateMatView).
+			IsMatView: tr.RelKind == "m",
+			// A plain view (relkind='v') has no physical heap storage — mirror
+			// catalog.InMemory.CreateView's Virtual=true. View/ViewDef are
+			// restored afterward by replayViewRecords (the AST has no heap
+			// representation — see RecordKindCreateView).
+			Virtual: tr.RelKind == "v",
 		}
 		if tr.RelFileNode != 0 && tr.RelFileNode != tr.OID {
 			tbl.RelFileNodeOID = tr.RelFileNode
+		}
+		// Restore storage parameters (fillfactor, autovacuum_*, and for
+		// views security_barrier/security_invoker/check_option) from the
+		// heap-persisted reloptions column — otherwise they silently
+		// reverted to defaults across every restart. M0119-0004.
+		if tr.RelOptions != "" {
+			catalog.ApplyTableReloptions(tbl, tr.RelOptions)
 		}
 		if err := cat.TryRegisterUserTable(tbl); err != nil {
 			return fmt.Errorf("loadUserTablesFromHeap: register %q: %w", tr.RelName, err)
@@ -2559,9 +2656,10 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 	page := make(storage.Page, storage.BlockSize)
 
 	type indexClassRow struct {
-		oid  uint32
-		name string
-		nsp  uint32
+		oid        uint32
+		name       string
+		nsp        uint32
+		relOptions string
 	}
 	var indexRows []indexClassRow
 
@@ -2589,7 +2687,24 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 				continue
 			}
 			if row.RelKind == "i" && row.OID >= catalog.FirstUserOID {
-				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace})
+				// reloptions (attnum 33) is a varlena column past the fixed-offset
+				// prefix DecodePGClassPhysicalRow decodes, same gap
+				// loadUserTablesFromHeap works around for tables/views — re-decode
+				// the full PG18-canonical row with the general PG-tuple decoder to
+				// recover an index's fillfactor/fastupdate/etc. (M0119-0004
+				// index-reloptions follow-up). Best-effort: a decode failure here
+				// just leaves relOptions empty.
+				relOptions := ""
+				natts := int(ht.Header.Infomask2 & storage.HeapNattsMask)
+				cols := executor.PGClassColumnsPG18()
+				decoded := make(executor.Row, len(cols))
+				if derr := executor.DecodeRowIntoMctxPGTuple(decoded, cols, ht.Data, ht.Bitmap, natts, nil); derr == nil {
+					const reloptionsOrdinal = 32
+					if reloptionsOrdinal < len(decoded) && !decoded[reloptionsOrdinal].IsNull() {
+						relOptions = decoded[reloptionsOrdinal].StringValue()
+					}
+				}
+				indexRows = append(indexRows, indexClassRow{oid: row.OID, name: row.RelName, nsp: row.RelNamespace, relOptions: relOptions})
 			}
 		}
 	}
@@ -2686,6 +2801,16 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			schema = name
 		}
 		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid)
+		// Restore fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
+		// pages_per_range/autosummarize from the heap-persisted pg_class row —
+		// without this they silently revert to defaults across every restart
+		// (M0119-0004 index-reloptions follow-up, sibling of loadUserTablesFromHeap's
+		// catalog.ApplyTableReloptions call for tables/views).
+		if ir.relOptions != "" {
+			if newIdx, ok := cat.LookupIndexByOID(ir.oid); ok {
+				catalog.ApplyIndexReloptions(newIdx, ir.relOptions)
+			}
+		}
 	}
 	return nil
 }

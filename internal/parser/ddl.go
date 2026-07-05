@@ -461,13 +461,16 @@ func (p *parser) parseCreate() (Stmt, error) {
 			// [VALIDATOR f | NO VALIDATOR] [OPTIONS (...)] — register as compat
 			// object. The OPTIONS clause (always last) round-trips through pg_dump
 			// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper). The
-			// HANDLER/VALIDATOR func references are skipped (goopg tracks no funcs).
-			// DU-002 slice 380.
+			// HANDLER/VALIDATOR func names are captured (FDWHandlerFunc/
+			// FDWValidatorFunc) so the executor can resolve them to real pg_proc
+			// OIDs (DU-002 M0119-0004, closing the "func references are skipped"
+			// gap slice 380 left open).
 			name, err := p.parseObjectName()
 			if err != nil {
 				return nil, err
 			}
 			var options []string
+			var handlerFunc, validatorFunc *ObjectName
 			for {
 				tok := p.cur()
 				if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -478,10 +481,23 @@ func (p *parser) parseCreate() (Stmt, error) {
 					options = p.scanFDWOptionsList()
 					continue
 				}
+				if kind, fn, consumed, err := p.scanFDWFuncClause(); consumed {
+					if err != nil {
+						return nil, err
+					}
+					if kind == "handler" {
+						handlerFunc = fn
+					} else {
+						validatorFunc = fn
+					}
+					continue
+				}
 				p.advance()
 			}
 			ns := &CompatNoopStmt{pos: t.Pos, Tag: "CREATE FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name}
 			ns.Options = options
+			ns.FDWHandlerFunc = handlerFunc
+			ns.FDWValidatorFunc = validatorFunc
 			return ns, nil
 		}
 		// Other CREATE FOREIGN ... → skip.
@@ -573,6 +589,47 @@ func (p *parser) scanUserMappingForServer() (user, server string, options []stri
 		p.advance()
 	}
 	return user, server, options
+}
+
+// scanFDWFuncClause recognises one `HANDLER handler_name | NO HANDLER` or
+// `VALIDATOR handler_name | NO VALIDATOR` clause of a CREATE/ALTER FOREIGN
+// DATA WRAPPER statement (gram.y's fdw_option), assuming the cursor is
+// positioned on the leading token. handler_name is a plain (possibly
+// schema-qualified) function name with no parenthesized arg list — PostgreSQL
+// resolves it via a fixed signature (LookupFuncName), mirrored by
+// resolveFDWHandlerFunc/resolveFDWValidatorFunc in the executor. Returns
+// consumed=false (and advances nothing) when the cursor is on neither form,
+// so the caller's generic skip-loop handles it. kind is "handler" or
+// "validator"; fn is nil for the `NO ...` form. DU-002 (M0119-0004).
+func (p *parser) scanFDWFuncClause() (kind string, fn *ObjectName, consumed bool, err error) {
+	tok := p.cur()
+	isHandler := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "handler")
+	isValidator := tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "validator")
+	if isHandler || isValidator {
+		p.advance()
+		name, perr := p.parseObjectName()
+		if perr != nil {
+			return "", nil, true, perr
+		}
+		if isHandler {
+			return "handler", &name, true, nil
+		}
+		return "validator", &name, true, nil
+	}
+	if tok.Kind == TokenIdent && strings.EqualFold(tok.Value, "no") {
+		next := p.peek(1)
+		nextIsHandler := next.Kind == TokenIdent && strings.EqualFold(next.Value, "handler")
+		nextIsValidator := next.Kind == TokenIdent && strings.EqualFold(next.Value, "validator")
+		if nextIsHandler || nextIsValidator {
+			p.advance() // NO
+			p.advance() // HANDLER|VALIDATOR
+			if nextIsHandler {
+				return "handler", nil, true, nil
+			}
+			return "validator", nil, true, nil
+		}
+	}
+	return "", nil, false, nil
 }
 
 // scanFDWOptionsList consumes an `OPTIONS ( name 'value' [, …] )` clause,
@@ -2305,9 +2362,9 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	}
 	// Optional WITH (view_option_name [= view_option_value] [, ...]) before AS.
 	// PostgreSQL supports security_invoker, security_barrier, check_option.
-	// goopg captures security_barrier (M0119-0004 slice 366) and security_invoker
-	// (slice 367) so they round-trip as pg_class.reloptions; the reloption form of
-	// check_option is still accepted-and-ignored.
+	// goopg captures security_barrier (M0119-0004 slice 366), security_invoker
+	// (slice 367), and check_option (M0122-0004 follow-up) so all three round-trip
+	// as pg_class.reloptions.
 	if p.acceptKeyword(KwWith) {
 		if !p.acceptSymbol("(") {
 			return nil, p.errAtCur("expected '(' after WITH in CREATE VIEW")
@@ -2349,6 +2406,24 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 				}
 				stmt.SecurityInvoker = &b
 			}
+			// check_option surfaces as the `check_option=<local|cascaded>`
+			// pg_class.reloption (view_reloptions' RELOPT_TYPE_ENUM entry,
+			// reloptions.c) — the reloption-form spelling of the trailing
+			// `WITH [CASCADED|LOCAL] CHECK OPTION` clause parsed below; both
+			// set the same stmt.CheckOption field, so whichever spelling
+			// appears (or a later one, if a statement absurdly used both)
+			// wins. PG compares the value case-insensitively and defaults an
+			// unrecognized/omitted value to cascaded — mirrored here rather
+			// than raising a semantic error, matching this loop's existing
+			// lenient handling of security_barrier/security_invoker above
+			// (neither validates its boolean token either).
+			if strings.EqualFold(optName.Value, "check_option") {
+				mode := "cascaded"
+				if hasVal && strings.EqualFold(strings.TrimSpace(optVal), "local") {
+					mode = "local"
+				}
+				stmt.CheckOption = mode
+			}
 			p.acceptSymbol(",")
 		}
 	}
@@ -2380,8 +2455,9 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 	stmt.RawDef = p.captureSrcSpan(cur.Pos, p.cur())
 	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause. The mode is
 	// captured into CheckOption ("cascaded" is the default when the qualifier is
-	// omitted) so it surfaces as the `check_option` pg_class.reloption for pg_dump.
-	// goopg does not yet ENFORCE the check at INSERT/UPDATE time (M0119-0004 slice 365).
+	// omitted) so it surfaces as the `check_option` pg_class.reloption for pg_dump
+	// AND is enforced at INSERT/UPDATE time via checkViewCheckOption
+	// (internal/executor/operators_fk.go, M0119-0004 slice-365 follow-up).
 	if p.acceptKeyword(KwWith) {
 		mode := "cascaded"
 		if p.acceptIdentKeyword("cascaded") {
@@ -7311,12 +7387,61 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return nil, p.errAtCur("expected DISABLE, ENABLE, RENAME TO, or OWNER TO in ALTER EVENT TRIGGER")
 	}
-	// ALTER SCHEMA / COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR /
-	// SYSTEM — compatibility stubs. Consume until end of statement. (ALTER
-	// VIEW has its own dedicated case above, DU-002 slice 440 — "view" is
-	// intentionally not in this list.)
+	// ALTER SCHEMA name RENAME TO newname / ALTER SCHEMA name OWNER TO role —
+	// real PostgreSQL's only two ALTER SCHEMA forms (schemacmds.c's
+	// RenameSchema/AlterSchemaOwner). Previously "schema" fell into the
+	// generic compat-stub loop below, which silently consumed and discarded
+	// both forms — a functional no-op, not merely a mistagging bug, the same
+	// class of gap ALTER VIEW had before DU-002 slice 440. DU-002 slice 440
+	// resume point (3) (M0110-0001).
+	if p.acceptIdentKeyword("schema") {
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		name := identText(nameTok)
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterSchemaStmt{pos: t.Pos, Name: name, Action: "rename", NewName: identText(newNameTok)}, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterSchemaStmt{pos: t.Pos, Name: name, Action: "owner"}
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.NewOwner = identText(tok)
+			} else {
+				ownerStmt.NewOwner = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		// Unmodelled ALTER SCHEMA form — consume to the terminator and
+		// return a no-op, mirroring the compat-stub loop's prior behavior.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
+	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
+	// its own dedicated case above, DU-002 slice 440 — "view" is
+	// intentionally not in this list; ALTER SCHEMA has its own dedicated
+	// case immediately above — DU-002 slice 440 resume point (3).)
 	for _, objIdent := range []string{
-		"schema",
 		"collation", "domain", "extension", "language",
 		"operator", "system",
 	} {
@@ -7336,11 +7461,12 @@ func (p *parser) parseAlter() (Stmt, error) {
 	// distinct statement from ALTER [FOREIGN] TABLE (no TABLE keyword, no
 	// relation actions), so it must be recognised BEFORE the FOREIGN-TABLE
 	// check below consumes FOREIGN expecting TABLE to follow. Mirrors CREATE
-	// FOREIGN DATA WRAPPER's parsing (skips HANDLER/VALIDATOR func references —
-	// goopg tracks no funcs — DU-002 slice 380) but captures the OPTIONS
-	// clause as a verb-tagged change list (ADD/SET/DROP), not a flat replace,
-	// since ALTER merges onto the existing fdwoptions (transformGenericOptions,
-	// gram.y AlterFdwStmt) rather than recreating it. DU-002 slice 421.
+	// FOREIGN DATA WRAPPER's parsing (captures HANDLER/VALIDATOR func names —
+	// DU-002 M0119-0004, closing the "goopg tracks no funcs" gap slice 380 left
+	// open) but captures the OPTIONS clause as a verb-tagged change list
+	// (ADD/SET/DROP), not a flat replace, since ALTER merges onto the existing
+	// fdwoptions (transformGenericOptions, gram.y AlterFdwStmt) rather than
+	// recreating it. DU-002 slice 421.
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign &&
 		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "data") {
 		p.advance() // consume FOREIGN
@@ -7351,6 +7477,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return nil, err
 		}
 		var changes []FDWOptionChange
+		var handlerFunc, validatorFunc *ObjectName
+		var handlerGiven, validatorGiven bool
 		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
@@ -7360,9 +7488,25 @@ func (p *parser) parseAlter() (Stmt, error) {
 				changes = p.scanAlterFDWOptionsList()
 				continue
 			}
+			if kind, fn, consumed, err := p.scanFDWFuncClause(); consumed {
+				if err != nil {
+					return nil, err
+				}
+				if kind == "handler" {
+					handlerFunc, handlerGiven = fn, true
+				} else {
+					validatorFunc, validatorGiven = fn, true
+				}
+				continue
+			}
 			p.advance()
 		}
-		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name, FDWOptionChanges: changes}, nil
+		return &CompatNoopStmt{
+			pos: t.Pos, Tag: "ALTER FOREIGN DATA WRAPPER", ObjType: "foreign-data wrapper", ObjName: name,
+			FDWOptionChanges: changes,
+			FDWHandlerFunc:   handlerFunc, FDWHandlerGiven: handlerGiven,
+			FDWValidatorFunc: validatorFunc, FDWValidatorGiven: validatorGiven,
+		}, nil
 	}
 	// ALTER FOREIGN TABLE ... shares the plain ALTER TABLE grammar below (IF
 	// EXISTS, ONLY, name, comma-separated actions) — FOREIGN is simply
@@ -8821,7 +8965,26 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// Any other ALTER TYPE variant (OWNER TO, etc.) — consume as stub.
+	// OWNER TO role — capture the new owner so the executor can update
+	// typowner instead of silently no-op'ing. M0122-0005 (m0097-0017
+	// follow-up). CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the
+	// bootstrap superuser sentinel, mirroring ALTER COLLATION ... OWNER TO.
+	if p.acceptIdentKeyword("owner") {
+		if _, err := p.expectKeyword(KwTo); err != nil {
+			return nil, err
+		}
+		if p.acceptIdentKeyword("current_user") ||
+			p.acceptIdentKeyword("session_user") ||
+			p.acceptIdentKeyword("current_role") {
+			stmt.NewOwner = "current_user"
+		} else if tok, err := p.parseIdent(); err == nil {
+			stmt.NewOwner = identText(tok)
+		} else {
+			stmt.NewOwner = "current_user"
+		}
+		return stmt, nil
+	}
+	// Any other ALTER TYPE variant — consume as stub.
 	for p.cur().Kind != TokenEOF {
 		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 			break

@@ -127,7 +127,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Only ANY with arrays found (expr.go:5146), no quantified subquery ANY/SOME/ALL support"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): expr op ANY|SOME|ALL now supported for arrays, scalars, AND (SELECT ...) subqueries, across =/!=/<>/</>/<=/>=/regex operators. New InExpr.AllOp (AND semantics) + KwSome keyword + parseAnyTail subquery form (internal/parser/select.go, internal/executor/expr.go). Tests: internal/parser/any_all_test.go, internal/executor/any_all_test.go. Design: docs/design/0003-0008-subqueries.md Follow-up section."
   },
   {
    "feature": "DML sub-plan rendering in EXPLAIN (showing plans for INSERT/UPDATE/DELETE statements)",
@@ -590,7 +590,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0003-0013-between-operator.md:101 BETWEEN SYMMETRIC explicitly deferred"
+   "code_audit": "RESOLVED 2026-07-04 (M0122-0004): `SYMMETRIC`/`ASYMMETRIC` registered as reserved keywords (`internal/parser/token.go`, `internal/parser/keywords.go`); `p.acceptBetweenOrdering()`/`parseBetweenTail` in `internal/parser/select.go` desugar `expr BETWEEN SYMMETRIC low AND high` to `(expr>=low AND expr<=high) OR (expr>=high AND expr<=low)` at parse time (same no-new-AST-node strategy as plain BETWEEN). Tests: `internal/parser/between_test.go`. Design: `docs/design/0003-0013-between-operator.md` new Follow-up section."
   },
   {
    "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
@@ -629,7 +629,8 @@
     "fix_plan": "no-match",
     "later_commits": "confirmed-open-code-audit: select.go:3439 frame clauses rejected by parser"
    },
-   "confidence": "high"
+   "confidence": "high",
+   "code_audit": "partially-resolved 2026-07-05 (M0122-0004): ROWS frame mode now parses and executes end-to-end. New parser.WindowFrame AST (internal/parser/expr.go/select.go's parseFrameClause/parseFrameBound/parseFrameExclusion); analyzer.validateWindowFrame rejects RANGE/GROUPS with 0A000 (deliberate v0 scope limit, not a bug) and validates ROWS bound ordering with 42P20; planner.WindowAgg.Frame carries the resolved frame through buildWindowStage/resolveWindowFrame; executor's evalExplicitFrameAggFuncs/frameBounds (internal/executor/operators_window.go) reproduce postgres/src/backend/executor/nodeWindowAgg.c's update_frameheadpos/update_frametailpos ROWS arithmetic exactly, including EXCLUDE CURRENT ROW/GROUP/TIES (frameRowExcluded) and frame-aware first_value/last_value/nth_value (cume_dist stays frame-independent per spec). Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go's TestAnalyzeWindowFrameRowsAccepted/TestAnalyzeWindowFrameRangeGroupsRejected/TestAnalyzeWindowFrameBoundOrderingRejected, internal/executor/window_compat_test.go's TestCompatWindowExplicitRowsFrameSliding/TestCompatWindowExplicitFrameExcludeCurrentRow/TestCompatWindowExplicitFrameExcludeGroupAndTies/TestCompatWindowFrameNegativeOffsetRejected. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. RANGE/GROUPS frame modes remain open (need per-ORDER-BY-column peer comparison / group-counting bounds, not just ROWS' row-index arithmetic) — see .ralph/deferral_ledger.md."
   },
   {
    "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
@@ -649,7 +650,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/plan.go:784-790 WindowAgg lacks named window/frame fields"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): OVER window_name bare reference + trailing WINDOW name AS (...) clause now parse and resolve. parser.SelectStmt.WindowClause []NamedWindowDef + WindowDef.RefName (internal/parser/ast.go, expr.go, select.go); analyzer.resolveNamedWindowRefs copies the named definition's PartitionBy/OrderBy into the referencing WindowDef before analyzeTargets runs, so planner/executor need zero changes (internal/analyzer/analyzer.go). Raises 42P20 for an undefined name. Combining forms (OVER (win_name ORDER BY ...), a named window based on another named window) remain unsupported. Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go, internal/executor/window_compat_test.go's TestCompatWindowNamedWindowClause. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. Frame clauses (M0020's other still-open item) are unaffected/still open."
   },
   {
    "feature": "Implement per-row lock timestamp stamping during streaming execution to track exact lock timing.",
@@ -816,7 +817,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/plan.go:771-791 WindowFunc lacks frame clause structures"
+   "code_audit": "partially-resolved: named windows landed 2026-07-05 (M0122-0004, see the other window-function entry's code_audit + docs/design/0020-0001-window-parser-and-ast.md). Frame clauses remain confirmed-open — internal/planner/plan.go's WindowFunc still lacks frame-bounds structures. M0122-0004 also landed frame-consuming aggregate window functions (sum/count/avg/min/max OVER (...)) evaluated over PostgreSQL's *default* frame (no explicit ROWS/RANGE/GROUPS clause needed), which is the first real consumer for future frame-clause execution work — see docs/design/0020-0001-window-parser-and-ast.md's second Follow-up section. first_value/last_value/nth_value window functions also landed on the same default-frame infra (internal/executor/operators_window.go's peerGroupBounds, reused via a new frameEnd-per-row precomputation); nth_value raises 22016 for a non-positive n, matching postgres/src/backend/utils/adt/windowfuncs.c's window_nth_value. 2026-07-05 (this loop): ntile/cume_dist/percent_rank also landed — ntile reproduces window_ntile's exact bucket-sizing algorithm (22014 for n<=0, remainder rows to the first buckets), percent_rank/cume_dist reuse the existing rank local and frameEnd[] peer-group boundary respectively. Every window function implemented across the M0122-0004 series still assumes PostgreSQL's default frame — ROWS/RANGE/GROUPS frame-clause parsing/execution itself is now the only remaining open item in this entry; see docs/design/0020-0001-window-parser-and-ast.md's fourth Follow-up section. 2026-07-05 (later loop): dense_rank() also landed as a window function (previously only its WITHIN GROUP ordered-set-aggregate form existed) — shares the row_number/rank code path (analyzer.analyzeWindowFuncCall, planner.buildWindowFunc), with a new denseRank counter in internal/executor/operators_window.go's evalWindowFuncs that increments once per peer-group boundary (rank's rowNum-based counter skips on ties; denseRank does not). All 11 standard PostgreSQL window functions (row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value) are now implemented under the default frame. 2026-07-05 (later loop): ROWS window frame clause landed too (see the other window-frame entry's code_audit for the full parser/analyzer/planner/executor breakdown) — RANGE/GROUPS frame modes are now the sole open item in this entry."
   },
   {
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
@@ -1882,8 +1883,9 @@
   },
   {
    "feature": "DEFAULT clause in column definitions is skipped during parsing; default values are not stored or applied to new rows",
-   "task_id": null,
+   "task_id": "M0122-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "DEFAULT clause skip"
    ],
@@ -1898,7 +1900,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ast.go:1127 DefaultExpr parsed but not applied"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004, verify-before-implement): stale entry — the audit's own cited line (internal/parser/ast.go ColumnDef.DefaultExpr) has been a fully wired column-default pipeline for a long time, predating the 2026-05-12 snapshot. Parser: internal/parser/ddl.go:4208-4214 stores the DEFAULT expression into ColumnDef.DefaultExpr for every column definition. Planner: internal/planner/planner.go's defaultMarkerReplacement/rewriteInsertDefaultMarkers substitute catalog.Column.DefaultExpr (falling back to a synthesized nextval(...) for SERIAL/IDENTITY, else NULL) for both omitted INSERT columns and explicit DEFAULT markers/UPDATE SET col = DEFAULT. Executor: internal/executor/operators_ddl.go validates and persists DefaultExpr across CREATE TABLE, LIKE...INCLUDING DEFAULTS, ALTER TABLE ADD/ALTER COLUMN, and pg_dump's attrdef rendering (FormatExprForAttrdef). No code change needed. Verified at current HEAD: TestInsertFillsMissingColumnDefault, TestInsertDoesNotOverrideExplicitColumnDefault, TestInsertFillsMissingColumnDefaultCurrentTimestamp, TestInsertFillsMissingColumnDefaultCurrentDate, TestInsertFillsMissingColumnDefaultNextval, TestInsertFillsMissingColumnDefaultNextvalAutoCreates (internal/executor/storage_test.go) all PASS."
   },
   {
    "feature": "Subscriber setup with streaming and logical replication for replicating changes is not implemented in goopg v0.",
@@ -1988,6 +1990,7 @@
    "feature": "ALTER TYPE RENAME and OWNER operations are no-ops; type names and ownership cannot be modified.",
    "task_id": "m0097-0017",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "RENAME/OWNER no-ops"
    ],
@@ -2002,7 +2005,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: operators_ddl.go:16198 ALTER TYPE OWNER TO returns nil—is no-op"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, docs/design/0122-0005-alter-type-owner-rename.md): ALTER TYPE ... OWNER TO now parses the target role (AlterTypeStmt.NewOwner, internal/parser/ddl.go) and the executor (execAlterType, internal/executor/operators_ddl.go) resolves it via cat.RoleOID and calls new SetEnumOwner/SetCompositeTypeOwner (internal/catalog/catalog.go), raising 42704 for an unknown type or role instead of silently no-op'ing. ALTER TYPE <composite> RENAME TO was ALSO found to be silently BROKEN (not just absent): it unconditionally called RenameEnum regardless of type kind, raising a spurious 42710 for a composite type; now dispatches by kind via a new RenameCompositeType. New EnumType.Owner/CompositeType.Owner + OwnerOrDefault() (mirrors StatisticsObject); pg_type typowner rendering for enum/composite base+array rows reads it instead of a hardcoded bootstrapSuperuserOID. Tests: TestAlterTypeOwnerToParsing (parser), TestAlterTypeOwnerTo/TestAlterTypeRenameToComposite (executor). Deferred (see ledger): restart persistence of Owner (enum/composite CREATE TYPE itself has no WAL/heap-reload durability path yet, independent of this change), and range/multirange/domain typowner (ALTER TYPE never routes ownership changes to those kinds today)."
   },
   {
    "feature": "regexp_matches() function is a set-returning function stub that returns NULL instead of match results.",
@@ -2426,8 +2429,9 @@
   },
   {
    "feature": "GROUP BY GROUPING SETS, ROLLUP, and CUBE syntax forms are not supported; they are parsed as sentinels but not executed.",
-   "task_id": "M0097-regress",
+   "task_id": "M0122-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "consumes unsupported grouping forms and injects an IntegerConst(0) sentinel"
    ],
@@ -2437,12 +2441,12 @@
     "4e8c0511e7aad119c2942169008820f45522efeb"
    ],
    "resolution_check": {
-    "ledger": "no-match",
+    "ledger": "open",
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/planner.go:4944 treats ROLLUP/CUBE as plain GROUP BY only"
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): implemented real SQL:1999 ss7.9 grouping-sets semantics. internal/parser/select.go's parseGroupByElems now expands ROLLUP/CUBE/explicit GROUPING SETS into SelectStmt.GroupingSets *GroupingSetsSpec (internal/parser/ast.go), a fully materialized [][]Expr set list. internal/planner/planner.go's rewriteGroupingSets (hooked into planSelect before anything else runs) expands this into a synthetic UNION ALL chain of plain-GROUP-BY branches, reusing the pre-existing N-ary set-op planning machinery unmodified; substituteGroupingExpr NULLs out excluded-dimension references per branch and resolves the new GROUPING(...) pseudo-function (*parser.GroupingCall AST node) to a literal bitmask per branch. Design docs/design/0122-0004-grouping-sets-rollup-cube.md. Tests: internal/parser/select_test.go (5 parse-shape tests), internal/executor/grouping_sets_compat_test.go (4 end-to-end ROLLUP/CUBE/GROUPING-SETS/GROUPING() tests), all PASS."
   },
   {
    "feature": "EXPLAIN output format is not fully implemented for UUID operations",
@@ -2482,7 +2486,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: CommonTableExpr struct exists (ast.go:732) but aliases requirement unclear"
+   "code_audit": "RESOLVED 2026-07-04 (M0122-0004, verify-before-implement): stale entry — a FROM-subquery without an explicit alias (the exact uuid.sql:127-131 shape this entry's evidence cites) already generates a synthetic alias `__sq_<pos>` (`internal/parser/select.go:1211-1220`, landed by commit `8d281a1b`, 35 minutes after this entry's `first_deferred_commit`). The CTE column-alias list itself (`WITH cte AS (...)`) was already fully optional (`internal/parser/with.go:61-129`). Confirmed via a throwaway probe test reproducing the uuid.sql WITH/subquery-without-alias shape — parses cleanly. No code change needed; this audit missed the immediate follow-up commit."
   },
   {
    "feature": "PostgreSQL extensions (contrib modules) are out of scope and remain unimplemented",
@@ -2517,12 +2521,12 @@
     "b5a4d394ab9e07305cb21b6558006a0eb9bdee14"
    ],
    "resolution_check": {
-    "ledger": "open",
+    "ledger": "resolved",
     "fix_plan": "no-match",
-    "later_commits": "superseded-by-code-audit"
+    "later_commits": "resolved-2026-07-05"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/query.go:230-287 tracks role but no INSERT permission enforcement"
+   "code_audit": "RESOLVED 2026-07-05: internal/executor/operators_storage.go's dmlPrivilegePermitted (bootstrap-superuser bypass, table-owner bypass, else catalog.HasTablePrivilege(oid, role, priv)) is checked pre-lock in insertOp/updateOp/deleteOp.Open, raising 42501 for INSERT/UPDATE/DELETE without the matching GRANT. Same-day follow-up loop extended the gate to SELECT: seqScanOp.Open, indexScanOp.openPrep, and indexOnlyScanOp.Open (the three raw-heap read paths) all call dmlPrivilegePermitted(ctx, tbl, \"SELECT\"), with a system-catalog carve-out (catalog.IsSystemRelation(tbl.OID), i.e. OID < FirstNormalObjectId) that always permits SELECT since goopg has no pg_init_privs-style default-ACL seeding for pg_catalog/information_schema. Tests: internal/executor/storage_dml_test.go TestDMLRequiresTablePrivilege, TestSeqScanRequiresSelectPrivilege, TestIndexScansRequireSelectPrivilege, TestSystemCatalogSelectAlwaysPermitted. Design: docs/design/0118-0039-truncate-conflict-privilege-model.md Follow-up section. Remaining known gap (deferral ledger): a role granted SELECT on a VIEW only (no direct grant on the underlying base table) is now denied, because goopg inlines views into the querying session's own SeqScan/IndexScan with no view-owner/security-definer identity switch — PostgreSQL runs view reads as the view owner. Untested by any existing suite; recorded as a deliberate scope boundary, not silently dropped."
   },
   {
    "feature": "Planner GUC stubs (enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, and others) registered to prevent unrecognized GUC errors but may not affect actual behavior.",
@@ -3155,6 +3159,7 @@
    "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",
    "task_id": "DU-002",
    "resume_point": "slice 365",
+   "status": "open",
    "evidence": [
     "Deferred (ledger): CHECK OPTION enforcement on INSERT/UPDATE through the view; the `WITH (check_option=...)` reloption form before AS + security_barrier/security_invoker stay parsed-and-ignored; restart persistence (in-memory only)."
    ],
@@ -3169,7 +3174,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_insert.go no CheckOption enforcement found"
+   "code_audit": "PARTIALLY RESOLVED 2026-07-04 (M0119-0004/M0122-0004): enforcement now lands `44000` on INSERT/UPDATE violation (`internal/executor/operators_fk.go:checkViewCheckOption`, design `docs/design/root-0025-updatable-views.md`); `WITH (security_barrier=...)`/`WITH (security_invoker=...)` reloption forms parse (`internal/parser/ddl.go` slices 366/367); `WITH (check_option=...)` reloption form now also parses (this loop, same file). Only remaining sub-item: restart persistence is still in-memory-only as of this entry's last audit — re-check `internal/initdb/open.go`'s `loadUserTablesFromHeap`/`ApplyTableReloptions` before re-flagging, a concurrent M0119-0004 loop was mid-flight on exactly that gap when this entry was last audited."
   },
   {
    "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",
@@ -3397,6 +3402,7 @@
    "feature": "Upstream catalog schema assignment for pg_ts_config_map and pg_ts_config (OID 3764 and 3765) not implemented; placeholder OIDs retained without mapping to official PostgreSQL catalog definitions.",
    "task_id": "M0106-0010",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Pre-existing stale 3764/3765 placeholders left in place (no upstream catalog assignment)"
    ],
@@ -3410,8 +3416,8 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: internal/initdb/pg_ts_config_nailed_test.go:13 pg_ts_config seeded as OID 3602, not 3765"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, this loop, verify-before-implement): stale entry — the original audit misread deliberately-retained legacy placeholder file entries as a missing mapping. Current code already seeds the authoritative PG18 OIDs verbatim: pg_ts_config=3602 (pg_ts_config.h:30 CATALOG(pg_ts_config,3602,...)) and pg_ts_config_map=3603 (pg_ts_config_map.h:30 CATALOG(pg_ts_config_map,3603,...)), both asserted byte-for-byte in internal/initdb/pg_ts_config_nailed_test.go and pg_ts_config_map_nailed_test.go. mappedLocalCatalogPlaceholderOIDs (internal/initdb/initdb.go:1301) additionally lists the old incorrect 3764/3765 placeholder OIDs alongside the correct ones (explicitly commented \"stale\") purely so bootstrapMappedLocalCatalogHeaps still stubs an (unused, harmless) relfilenode file at those legacy paths — idempotent, no functional effect, not a mapping gap. No code change needed this loop. Verified at current HEAD: TestNailedLocalRelsContainsPgTsConfig{,Map}{,Indexes}, TestPgTsConfig{,Map}IndexInitialEntries, and TestPgTsConfig{,Map}AttrsTypeOIDsMatchPG18 all PASS."
   },
   {
    "feature": "Schema mismatch between PG18 and goopg for index definitions (tgfoid/attnum derivation) needs to be reconciled in a future loop.",
@@ -3618,6 +3624,7 @@
    "feature": "Domain CHECK predicates still use legacy wrap instead of new fully-parenthesizing renderer.",
    "task_id": "DU-002",
    "resume_point": "slice 362",
+   "status": "resolved",
    "evidence": [
     "Deferred (ledgered): domain CHECK predicates still use the legacy wrap (own slice — domain path owns the VALUE IN ScalarArrayOp renderer)"
    ],
@@ -3631,13 +3638,14 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: Domain CHECK predicates exist but legacy vs new renderer status not verified"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, this loop, verify-before-implement): stale entry — already closed by commit from DU-002 slice 363 (2026-06-30), predating this backlog's 2026-07-02 snapshot. renderDomainCheckPredicate (internal/executor/operators_ddl.go) re-parses a domain's stored raw CHECK text and deparses it via the same fully-parenthesizing defaultExprToSQL renderer the table-CHECK path (renderCheckPredicate, slice 362) uses, with upcaseDomainValuePlaceholder restoring the uppercase `VALUE` keyword and a re-parse round-trip guard falling back to the legacy wrap when unsafe. Wired into the pg_constraint dump path at internal/executor/expr.go (AllDomains branch) for generic (non-IN) domain CHECKs; `CHECK (VALUE IN (...))` intentionally keeps the pre-synthesized legacy wrap (separate, already-tracked residual). No code change needed this loop. Verified live: TestRenderDomainCheckPredicate, TestRenderCheckPredicate{,Fallback}, and TestPort_PgDumpConnectionSetup (slice-362/363 chkand/chkor/chkfn/dchkand/dchkfn assertions, real pg_dump 18.3 round-trip) all PASS at current HEAD. Residual gaps (already ledgered, unaffected by this bookkeeping fix): negative-literal Const casts inside a domain CHECK (`VALUE < -5`) still diverge from PG's typed `'-5'::integer` rendering (type-blind defaultExprToSQL, same blocker as slice-360(a)/362 deferred-(b))."
   },
   {
    "feature": "User-defined function-based casts (WITH FUNCTION casts) are parsed but not dumped in pg_dump; only built-in binary-coercible casts are reachable.",
    "task_id": "M0119-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "WITH FUNCTION casts parsed but not dumped (castfunc=0 needs a pg_proc row for dumpCast findFuncByOid)"
    ],
@@ -3651,8 +3659,8 @@
     "fix_plan": "unchecked",
     "later_commits": "superseded-by-code-audit"
    },
-   "confidence": "medium",
-   "code_audit": "unclear: Casts exist but function-based cast dumping status not verified"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0005, this loop, verify-before-implement): stale entry — already closed by commit e12e573b (2026-07-01, DU-002 slice 397), predating this backlog's 2026-07-02 snapshot. dumpCast's COERCION_METHOD_FUNCTION arm renders `WITH FUNCTION <ns>.<signature>` via findFuncByOid(castfunc); the parser (parseCreateCastTail) captures the function name/args into CompatNoopStmt.CastFuncName/CastFuncArgs, the executor resolves the routine via Routines().Lookup and passes routine.OID as Cast.FuncOID, and pg_cast's virtual row surfaces it. No code change needed this loop. Verified live: TestParseCreateCastWithFunction (parser), TestValidateCreateCast (executor), and TestPort_PgDumpConnectionSetup's slice-397/404 assertions (real pg_dump 18.3 round-trip for both a user-defined WITH FUNCTION cast and a built-in-function WITH FUNCTION cast) all PASS at current HEAD."
   }
  ]
 }

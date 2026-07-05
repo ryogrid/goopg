@@ -1257,6 +1257,25 @@ func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) 
 			return Datum{}, 0, fmt.Errorf("decode %q as varlena: %w", t.Name, err)
 		}
 		return NewBytesDatum(append([]byte(nil), data[:n]...)), n, nil
+	case "text[]", "_text":
+		// A heap-backed catalog stores a text[] column (pg_class.reloptions)
+		// as a PG-native ArrayType varlena built by pgTextArrayBytes, NOT as
+		// plain text — the shared `default` varlena branch below would hand
+		// back the raw ArrayType header+element bytes as an opaque KindString,
+		// silently corrupting any reader (M0119-0004: this is what made
+		// loadUserTablesFromHeap read back garbage for a non-empty
+		// reloptions). Decode the elements and re-join them into the same
+		// "{elem,elem,…}" external-literal form BuildTableReloptions/
+		// arrayTextLiteral produce, via catalog.ArrayTextLiteral, so this
+		// stays byte-for-format-identical with the live virtual pg_class row.
+		elems, n, err := decodePGTextArrayElements(data)
+		if err != nil {
+			return Datum{}, 0, fmt.Errorf("decode %q as text[] ArrayType: %w", t.Name, err)
+		}
+		if len(elems) == 0 {
+			return NewStringDatum(""), n, nil
+		}
+		return NewStringDatum(catalog.ArrayTextLiteral(elems)), n, nil
 	default:
 		// Unknown type (e.g. "point", "path", custom types).  goopg's
 		// encodeValuePG stores them as PG varlena text (the default branch
@@ -1301,6 +1320,45 @@ func decodePhysicalPGVarlena(data []byte) ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("truncated 4-byte varlena")
 	}
 	return data[4:total], total, nil
+}
+
+// decodePGTextArrayElements parses a PG-native text[] ArrayType varlena
+// produced by pgTextArrayBytes (or the empty form from emptyArrayTypeBytes)
+// back into its element strings. Layout after the outer vl_len_ header:
+// ndim(4) dataoffset(4) elemtype(4) [dims(4) lbound(4) elem...] — the last
+// three are absent for an empty array (12-byte payload). Mirrors
+// pgTextArrayBytes's exact element encoding (4-byte length-prefixed,
+// 4-byte-aligned) rather than a general PG array decoder: goopg only ever
+// needs to round-trip its own emitted content here. M0119-0004.
+func decodePGTextArrayElements(data []byte) ([]string, int, error) {
+	payload, total, err := decodePhysicalPGVarlena(data)
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(payload) < 12 {
+		return nil, 0, fmt.Errorf("truncated ArrayType header")
+	}
+	if len(payload) == 12 {
+		return nil, total, nil // empty array (emptyArrayTypeBytes layout)
+	}
+	if len(payload) < 20 {
+		return nil, 0, fmt.Errorf("truncated ArrayType dims/lbound")
+	}
+	nElem := int(binary.LittleEndian.Uint32(payload[12:16]))
+	off := 20
+	elems := make([]string, 0, nElem)
+	for i := 0; i < nElem; i++ {
+		if off+4 > len(payload) {
+			return nil, 0, fmt.Errorf("truncated array element header")
+		}
+		n := int(binary.LittleEndian.Uint32(payload[off:off+4]) >> 2)
+		if n < 4 || off+n > len(payload) {
+			return nil, 0, fmt.Errorf("truncated array element")
+		}
+		elems = append(elems, string(payload[off+4:off+n]))
+		off += (n + 3) &^ 3
+	}
+	return elems, total, nil
 }
 
 // parseIntegerInput parses a string as an integer supporting:

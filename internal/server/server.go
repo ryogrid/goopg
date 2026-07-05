@@ -402,6 +402,17 @@ func New(cfg Config) *Server {
 			}
 			reg.UpdateApplicationName(procNum, effVal)
 		})
+		// M0122-0003 runtime-SET follow-up: propagate SET track_io_timing
+		// to the calling backend's per-session flag so the storage-layer
+		// I/O wait-event hooks (wired unconditionally in initdb.Open) pick
+		// up the change without a server restart.
+		cfg.Registry.OnChange("track_io_timing", func(effVal string) {
+			reg, procNum, ok := activity.LookupCurrentGoroutine()
+			if !ok {
+				return
+			}
+			reg.UpdateTrackIOTiming(procNum, effVal == "on")
+		})
 	}
 
 	// Build the apply-worker launcher when logical replication is
@@ -881,6 +892,15 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 
 	sess := config.NewSessionRegistry(s.cfg.Registry)
+	// Seed this backend's effective track_io_timing flag from the
+	// boot-time GUC default (postgresql.conf / registry bootval); the
+	// OnChange hook registered in New() keeps it live thereafter on
+	// `SET track_io_timing`. M0122-0003 runtime-SET follow-up.
+	if reg != nil {
+		if _, eff, ok := sess.Get("track_io_timing"); ok {
+			reg.UpdateTrackIOTiming(procNum, eff == "on")
+		}
+	}
 	// Echo StartupMessage values for variables clients commonly send.
 	// Failures are not fatal — clients send a wide variety of values
 	// and we want to keep the connection going.

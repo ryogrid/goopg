@@ -174,3 +174,47 @@ ok  internal/server    3.563s
 ok  internal/wal       3.128s
 ok  internal/catalog   1.020s
 ```
+
+## Follow-up: `tableFuncColumns` never threaded `WITH ORDINALITY` (2026-07-04)
+
+A later loop (M0122-0002's FROM-clause `regexp_matches` follow-up) discovered
+that `WITH ORDINALITY AS t(m, n)` raised `42703: column "n" does not exist`
+whenever *either* the element column or the ordinality column was named
+explicitly in the outer `SELECT` list, even though `SELECT *` over the same
+FROM item worked. An initial diagnosis pointed at the planner, but
+`wrapOrdinality`/`planFromUnnest`/`planFromRegexpMatches`
+(`internal/planner/planner.go`) were always correct and never even run
+before the failure — `planner.Plan()` calls `analyzer.Analyze()` first and
+returns on its error (`internal/planner/planner.go`).
+
+The real bug was in this design's own `tableFuncColumns`
+(`internal/analyzer/analyzer.go`, called from `lookupTable`): it took the
+bare function name and never received `rv.TableFunc.WithOrdinality` at all,
+and had no `unnest`/`regexp_matches` cases — both silently fell to the
+`default:` branch's single generic `int8` column named after the alias. The
+ordinality column and the SRF's real per-element columns therefore never
+existed in the analyzer's synthetic scope table, so naming either one
+explicitly hit `lookupColumn` → `42703`. `*` was unaffected only because
+`analyzeStar` returns immediately for an unqualified `*` with no
+column-existence check at all — the real columns used downstream come from
+`planSelect`, which the analyzer never cross-checks.
+
+Fixed by changing `tableFuncColumns`'s signature to take the whole
+`*parser.TableFuncRef` instead of a bare name string: it now strips the
+trailing ordinality alias before dispatch (mirroring
+`wrapOrdinality`/`planFromUnnest`'s `colAliases[:len-1]` slicing) and
+re-appends a real `int8` ordinality column afterward, and gained `unnest`
+(N-column zip sized to `len(tf.Args)`) and `regexp_matches` (`text[]`)
+cases that previously hit the wrong generic default. The `unnest` element
+type is a `text` placeholder rather than the array argument's real element
+type, since `lookupTable` runs during scope-*building* with no
+resolveContext/scope yet available to `analyzeExpr` the argument — recorded
+as a known imprecision in `.ralph/deferral_ledger.md`, not a fixed bug (no
+failing test currently depends on it; the pre-existing `default:` fallback
+was equally imprecise, returning `int8` instead of any real element type).
+
+Tests: `internal/analyzer/analyzer_test.go`'s
+`TestAnalyzeWithOrdinalityNamedColumn` (named-column resolution across
+`unnest`/`generate_series`/`regexp_matches`, single- and multi-arg
+`unnest`, plus a genuine `42703` case). Verified end-to-end against a live
+goopg server with a real PostgreSQL 18.3 `psql` binary.

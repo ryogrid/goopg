@@ -144,6 +144,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CommentOnStmt,
 		*parser.CreateStatisticsStmt,
 		*parser.AlterStatisticsStmt,
+		*parser.AlterSchemaStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
@@ -616,6 +617,16 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		return nil, err
 	}
 
+	// GROUPING SETS/ROLLUP/CUBE: expand into an equivalent UNION ALL chain
+	// of plain-GROUP-BY branches before anything else runs. Recursive
+	// planSelect calls (nested subqueries, and this rewrite's own
+	// UNION-branch replanning below) reach this same check, so nested
+	// grouping sets are handled the same way as the top-level query.
+	// M0122-0004.
+	if err := rewriteGroupingSets(s, cat); err != nil {
+		return nil, err
+	}
+
 	// Pre-plan WITH-list CTEs so FROM-clause references can
 	// substitute them in. Restorer pops the CTE scope back to
 	// the caller's view when this Plan call returns. nil-WITH
@@ -781,6 +792,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 
 	var node Node
 	var ctx *resolveContext
+	// fromOnly tracks whether the single-table FROM clause used `FROM ONLY`
+	// (set below in the isSimpleSingle branch); planIndexScanFromWhere uses
+	// it to decide whether an IndexScan may safely skip accessible
+	// inheritance children (root-0026 SELECT-side twin, M0119-0004).
+	var fromOnly bool
 
 	if len(s.ValuesRows) > 0 && len(s.From) == 0 && len(s.Targets) == 0 {
 		// Standalone VALUES statement: VALUES (r1), (r2), ...
@@ -799,6 +815,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		}
 	} else if isSimpleSingle {
 		rv := s.From[0]
+		fromOnly = rv.Only
 		// Delegate the simple-single-table case to
 		// planScanRangeVar so view substitution / virtual-rows
 		// dispatch live in one place. SourceTableIdx 1 — only
@@ -873,7 +890,7 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 			// M0051-0004: inject synthetic range predicates alongside any
 			// LIKE conjuncts so tryRangeIndexScan can activate a B-tree.
 			whereForIndex := injectLikeRangePredicates(s.Where)
-			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat); err != nil {
+			if idxNode, ok, err := planIndexScanFromWhere(whereForIndex, ctx, cat, !fromOnly); err != nil {
 				return nil, err
 			} else if ok {
 				node = idxNode
@@ -2905,6 +2922,194 @@ func rewriteIndirectionStarTargets(s *parser.SelectStmt) error {
 	return parser.RewriteIndirectionStarTargets(s, nil)
 }
 
+// rewriteGroupingSets expands a GROUP BY clause that used GROUPING
+// SETS/ROLLUP/CUBE (parser.SelectStmt.GroupingSets) into an equivalent
+// UNION ALL chain of ordinary single-GROUP-BY branches — exactly the
+// SQL:1999 §7.9 definition of grouping sets. s becomes the head of the
+// chain (its own GroupBy/Targets/Having become the first generated set);
+// remaining sets thread through s.SetOp as synthetic sibling SelectStmts.
+// planSelect's caller falls straight through to the pre-existing
+// N-ary-UNION-chain planning code (segment flattening, per-branch column
+// casts, wrapSetOpSortLimit for the original ORDER BY/LIMIT/OFFSET) — that
+// machinery is unchanged and unaware this chain was synthesized rather
+// than parsed.
+//
+// Per-branch SELECT-list/HAVING substitution (substituteGroupingExpr)
+// replaces any reference to a grouping expression that isn't part of the
+// *current* branch's set with a typed-by-UNION-cast NULL — the standard
+// semantics for a rolled-up-away dimension — and resolves GROUPING(...)
+// calls to a literal bitmask, since which bits are set depends only on
+// the active branch, never on data.
+func rewriteGroupingSets(s *parser.SelectStmt, cat catalog.Catalog) error {
+	spec := s.GroupingSets
+	if spec == nil {
+		return nil
+	}
+	s.GroupingSets = nil // consumed once; guards recursive planSelect re-entry
+	sets := spec.Sets
+	if len(sets) == 0 {
+		s.GroupBy = nil
+		return nil
+	}
+
+	universe := map[string]bool{}
+	for _, set := range sets {
+		for _, e := range set {
+			universe[parserExprKey(e)] = true
+		}
+	}
+
+	buildBranch := func(set []parser.Expr) *parser.SelectStmt {
+		active := map[string]bool{}
+		for _, e := range set {
+			active[parserExprKey(e)] = true
+		}
+		targets := make([]parser.ResTarget, len(s.Targets))
+		for i, t := range s.Targets {
+			nt := t
+			nt.Expr = substituteGroupingExpr(t.Expr, universe, active, cat)
+			targets[i] = nt
+		}
+		branch := &parser.SelectStmt{
+			Distinct:   s.Distinct,
+			DistinctOn: s.DistinctOn,
+			Targets:    targets,
+			From:       s.From,
+			FromExprs:  s.FromExprs,
+			Where:      s.Where,
+			GroupBy:    set,
+		}
+		if s.Having != nil {
+			branch.Having = substituteGroupingExpr(s.Having, universe, active, cat)
+		}
+		return branch
+	}
+
+	branches := make([]*parser.SelectStmt, len(sets))
+	for i, set := range sets {
+		branches[i] = buildBranch(set)
+	}
+
+	s.Distinct = branches[0].Distinct
+	s.DistinctOn = branches[0].DistinctOn
+	s.Targets = branches[0].Targets
+	s.GroupBy = branches[0].GroupBy
+	s.Having = branches[0].Having
+	cur := s
+	for _, b := range branches[1:] {
+		cur.SetOp = &parser.SetOpClause{Type: parser.SetOpUnion, All: true, Right: b}
+		cur = b
+	}
+	return nil
+}
+
+// substituteGroupingExpr rewrites e for one generated grouping-set branch:
+// any subexpression that is one of the grouping construct's "universe"
+// expressions (appears in at least one generated set) but is NOT part of
+// the current branch's active set is replaced with NULL — the SQL-standard
+// value for a dimension rolled up away at this grouping level. GROUPING(...)
+// calls resolve to a literal bitmask (bit i, counting from the rightmost
+// arg, is 1 iff Args[i] is excluded from the active set). Arguments of
+// aggregate function calls (built-in or user-defined) are left untouched,
+// since aggregates evaluate over the raw pre-grouping rows, not the
+// rolled-up output value. Unrecognised expression shapes are returned
+// unchanged rather than guessed at.
+func substituteGroupingExpr(e parser.Expr, universe, active map[string]bool, cat catalog.Catalog) parser.Expr {
+	if e == nil {
+		return nil
+	}
+	if gc, ok := e.(*parser.GroupingCall); ok {
+		return &parser.IntegerConst{Value: groupingBitmask(gc.Args, active)}
+	}
+	if universe[parserExprKey(e)] && !active[parserExprKey(e)] {
+		return &parser.NullConst{}
+	}
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		clone := *x
+		clone.Left = substituteGroupingExpr(x.Left, universe, active, cat)
+		clone.Right = substituteGroupingExpr(x.Right, universe, active, cat)
+		return &clone
+	case *parser.UnaryOp:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.IsNullExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.IsBoolExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.IsDistinctFromExpr:
+		clone := *x
+		clone.Left = substituteGroupingExpr(x.Left, universe, active, cat)
+		clone.Right = substituteGroupingExpr(x.Right, universe, active, cat)
+		return &clone
+	case *parser.CollateExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.CastExpr:
+		clone := *x
+		clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		return &clone
+	case *parser.RowExpr:
+		clone := *x
+		elems := make([]parser.Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			elems[i] = substituteGroupingExpr(el, universe, active, cat)
+		}
+		clone.Elems = elems
+		return &clone
+	case *parser.CaseExpr:
+		clone := *x
+		if x.Operand != nil {
+			clone.Operand = substituteGroupingExpr(x.Operand, universe, active, cat)
+		}
+		whens := make([]parser.CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = parser.CaseWhen{
+				When: substituteGroupingExpr(w.When, universe, active, cat),
+				Then: substituteGroupingExpr(w.Then, universe, active, cat),
+			}
+		}
+		clone.Whens = whens
+		if x.Else != nil {
+			clone.Else = substituteGroupingExpr(x.Else, universe, active, cat)
+		}
+		return &clone
+	case *parser.FuncCall:
+		if isAggregateFunc(x) || isUserAggregateFunc(x, cat) {
+			return x
+		}
+		clone := *x
+		args := make([]parser.Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = substituteGroupingExpr(a, universe, active, cat)
+		}
+		clone.Args = args
+		return &clone
+	default:
+		return e
+	}
+}
+
+// groupingBitmask computes the SQL-standard GROUPING(...) result for one
+// branch: bit i (rightmost arg = least-significant bit) is 1 iff args[i]
+// is excluded from the active grouping set.
+func groupingBitmask(args []parser.Expr, active map[string]bool) int64 {
+	var mask int64
+	n := len(args)
+	for i, a := range args {
+		if !active[parserExprKey(a)] {
+			mask |= int64(1) << uint(n-1-i)
+		}
+	}
+	return mask
+}
+
 // projectSetCompositeSchema returns the expanded composite-row schema for a
 // supported set-returning function. nil means the SRF cannot be lowered into
 // ProjectSet from a `(srf(<agg>)).*` shape — currently only
@@ -3031,8 +3236,15 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		arrExpr  parser.Expr
 		castType string // element-level cast type (e.g. "int4"); empty = no cast. M0097-0035.
 	}
+	type regexpMatchesEntry struct {
+		colIdx      int
+		stringExpr  parser.Expr
+		patternExpr parser.Expr
+		flagsExpr   parser.Expr // nil when not given
+	}
 	var srfs []srfEntry
 	var unnests []unnestEntry
+	var regexpMatchesEntries []regexpMatchesEntry
 	var userSrfs []userSrfEntry
 	var rs *catalog.Routines
 	if ctx != nil && ctx.cat != nil {
@@ -3074,6 +3286,21 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			unnests = append(unnests, unnestEntry{colIdx: i, arrExpr: fc.Args[0], castType: srfCastType})
 			continue
 		}
+		// regexp_matches(string, pattern[, flags]) → setof text[], one row
+		// per match with the 'g' flag (else at most one row). Target-list
+		// only — the FROM-clause form is unwired. M0122-0002.
+		if strings.EqualFold(fc.Name.Name, "regexp_matches") {
+			if len(fc.Args) < 2 || len(fc.Args) > 3 {
+				return nil, &PlanError{Pos: fc.Pos(), Code: "42883",
+					Message: "regexp_matches requires 2 or 3 arguments"}
+			}
+			e := regexpMatchesEntry{colIdx: i, stringExpr: fc.Args[0], patternExpr: fc.Args[1]}
+			if len(fc.Args) == 3 {
+				e.flagsExpr = fc.Args[2]
+			}
+			regexpMatchesEntries = append(regexpMatchesEntries, e)
+			continue
+		}
 		// Check if the function is a user-defined SETOF SQL function. M0097-0020.
 		if rs != nil {
 			candidates := rs.LookupByName(fc.Name)
@@ -3088,11 +3315,14 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		}
 	}
 	// Build per-column resolved expressions.
-	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(userSrfs))
+	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(regexpMatchesEntries)+len(userSrfs))
 	for _, e := range srfs {
 		srfColMap[e.colIdx] = true
 	}
 	for _, e := range unnests {
+		srfColMap[e.colIdx] = true
+	}
+	for _, e := range regexpMatchesEntries {
 		srfColMap[e.colIdx] = true
 	}
 	for _, e := range userSrfs {
@@ -3144,7 +3374,7 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		wrapSlot++
 	}
 
-	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
+	if len(srfs) == 0 && len(unnests) == 0 && len(regexpMatchesEntries) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
 		return nil, nil
 	}
 
@@ -3215,6 +3445,13 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			for _, u := range userSrfs {
 				if u.colIdx == i {
 					retType = catalog.Type{Name: u.routine.ReturnType.Name}
+					break
+				}
+			}
+			// regexp_matches always returns text[]. M0122-0002.
+			for _, rm := range regexpMatchesEntries {
+				if rm.colIdx == i {
+					retType = catalog.Type{Name: "text[]"}
 					break
 				}
 			}
@@ -3306,6 +3543,27 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		unnestCols[k] = UnnestCol{ColIdx: u.colIdx, ArrExpr: arrResolved, CastType: castType}
 	}
 
+	// Resolve regexp_matches args against ctx. M0122-0002.
+	regexpMatchesCols := make([]RegexpMatchesCol, len(regexpMatchesEntries))
+	for k, e := range regexpMatchesEntries {
+		strResolved, err := resolveExpr(e.stringExpr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		patResolved, err := resolveExpr(e.patternExpr, ctx)
+		if err != nil {
+			return nil, err
+		}
+		var flagsResolved Expr
+		if e.flagsExpr != nil {
+			flagsResolved, err = resolveExpr(e.flagsExpr, ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+		regexpMatchesCols[k] = RegexpMatchesCol{ColIdx: e.colIdx, StringExpr: strResolved, PatternExpr: patResolved, FlagsExpr: flagsResolved}
+	}
+
 	// Resolve user SETOF function args against ctx. M0097-0020.
 	userSrfCols := make([]UserSrfCol, len(userSrfs))
 	for k, u := range userSrfs {
@@ -3334,16 +3592,17 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 	}
 
 	return &ProjectSet{
-		pos:          s.Pos(),
-		Child:        child,
-		SrfCols:      srfCols,
-		UnnestCols:   unnestCols,
-		UserSrfCols:  userSrfCols,
-		OtherExprs:   otherExprs,
-		schema:       schema,
-		Wrappers:     wrappers,
-		ChildWidth:   childWidth,
-		EvalRowWidth: childWidth + wrapSlot,
+		pos:               s.Pos(),
+		Child:             child,
+		SrfCols:           srfCols,
+		UnnestCols:        unnestCols,
+		RegexpMatchesCols: regexpMatchesCols,
+		UserSrfCols:       userSrfCols,
+		OtherExprs:        otherExprs,
+		schema:            schema,
+		Wrappers:          wrappers,
+		ChildWidth:        childWidth,
+		EvalRowWidth:      childWidth + wrapSlot,
 	}, nil
 }
 
@@ -3477,6 +3736,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, sourceIdx, lateralCtx)
+	}
+	if strings.EqualFold(tf.Name, "regexp_matches") {
+		return planFromRegexpMatches(rv, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "generate_subscripts") {
 		return planGenerateSubscripts(rv, sourceIdx, lateralCtx)
@@ -3999,6 +4261,70 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 	}
 	tbl := &catalog.Table{Name: alias, Columns: tableCols}
 	node := &FromUnnest{pos: tf.Pos(), ArrExprs: arrExprs, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	if tf.WithOrdinality {
+		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
+		return node2, b2, nil
+	}
+	return node, b, nil
+}
+
+// planFromRegexpMatches plans FROM regexp_matches(string, pattern[, flags])
+// [AS alias(col)] [WITH ORDINALITY]. Produces a single text[] output column
+// (default name "regexp_matches", the same default PG uses); one row per
+// match when flags contains 'g', at most one row otherwise, zero rows on no
+// match — mirrors the SELECT-list RegexpMatchesCol SRF semantics. M0122-0002
+// follow-up (the FROM-clause form deferred by that earlier loop).
+func planFromRegexpMatches(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) < 2 || len(tf.Args) > 3 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "regexp_matches requires 2 or 3 arguments"}
+	}
+	// Build arg context: lateral siblings + outer-scope parent chain, mirrors
+	// planFromUnnest/planPgOptionsToTable so a correlated pattern/string
+	// argument resolves up the lexical scope.
+	ctx := &resolveContext{parent: planParent}
+	if lateralCtx != nil {
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			ctx = &cp
+		} else {
+			ctx = lateralCtx
+		}
+	}
+	stringExpr, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	patternExpr, err := resolveExpr(tf.Args[1], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var flagsExpr Expr
+	if len(tf.Args) == 3 {
+		flagsExpr, err = resolveExpr(tf.Args[2], ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "regexp_matches"
+	}
+	colAliases := rv.Columns
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		colAliases = colAliases[:len(colAliases)-1]
+	}
+	colName := alias
+	if len(colAliases) > 0 {
+		colName = colAliases[0]
+	}
+	colType := catalog.Type{Name: "text[]"}
+	tbl := &catalog.Table{Name: alias, Columns: []catalog.Column{{Name: colName, Type: colType, Ordinal: 0}}}
+	schema := Schema{SchemaColumn{Name: colName, Type: colType, SourceTableIdx: sourceIdx}}
+	node := &FromRegexpMatches{pos: tf.Pos(), StringExpr: stringExpr, PatternExpr: patternExpr, FlagsExpr: flagsExpr, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	if tf.WithOrdinality {
 		node2, b2 := wrapOrdinality(node, b, rv, sourceIdx)
@@ -4714,12 +5040,18 @@ func buildWindowStage(s *parser.SelectStmt, child Node, inputCtx *resolveContext
 		byKey[k] = windowBinding{index: idx, typ: wf.Type}
 	}
 
+	frame, err := resolveWindowFrame(calls[0].Over.Frame, inputCtx, agg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	windowNode := &WindowAgg{
 		pos:         s.Pos(),
 		Child:       child,
 		PartitionBy: partition,
 		OrderBy:     order,
 		Funcs:       funcs,
+		Frame:       frame,
 		schema:      outputSchema,
 	}
 	outCtx := newResolveContext(nil, outputSchema)
@@ -4779,10 +5111,40 @@ func inferExprType(e Expr) catalog.Type {
 	}
 }
 
+// resolveWindowFrame resolves a parser.WindowFrame's offset
+// expressions into planner Exprs, the same way buildWindowStage
+// resolves PARTITION BY/ORDER BY/FILTER expressions for the window's
+// input. Returns nil for a nil frame (default frame — unchanged
+// executor behavior). The analyzer has already rejected RANGE/GROUPS
+// and validated bound ordering, so this only needs to carry the
+// already-validated shape through — mode isn't even threaded since a
+// Frame reaching here is always ROWS.
+func resolveWindowFrame(fr *parser.WindowFrame, inputCtx *resolveContext, agg *aggregateSurface) (*WindowFrame, error) {
+	if fr == nil {
+		return nil, nil
+	}
+	out := &WindowFrame{StartKind: fr.StartKind, EndKind: fr.EndKind, Exclusion: fr.Exclusion}
+	if fr.StartOffset != nil {
+		r, err := resolveExprForWindowInput(fr.StartOffset, inputCtx, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.StartOffset = r
+	}
+	if fr.EndOffset != nil {
+		r, err := resolveExprForWindowInput(fr.EndOffset, inputCtx, agg)
+		if err != nil {
+			return nil, err
+		}
+		out.EndOffset = r
+	}
+	return out, nil
+}
+
 func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggregateSurface) (WindowFunc, error) {
 	name := strings.ToLower(fc.Name.Name)
 	switch name {
-	case "row_number", "rank":
+	case "row_number", "rank", "dense_rank":
 		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
 			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
 		}
@@ -4801,6 +5163,93 @@ func buildWindowFunc(fc *parser.FuncCall, inputCtx *resolveContext, agg *aggrega
 		}
 		retType := inferExprType(args[0])
 		return WindowFunc{pos: fc.Pos(), Name: name, Type: retType, Args: args}, nil
+	case "sum", "count", "avg", "min", "max":
+		// DISTINCT / ORDER BY within the argument list mirror real
+		// PostgreSQL restrictions on aggregate window functions (see
+		// parse_func.c's transformAggregateCall), not a v0 gap.
+		if fc.Distinct {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "DISTINCT is not implemented for window functions"}
+		}
+		if len(fc.OrderBy) > 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: "aggregate ORDER BY is not implemented for window functions"}
+		}
+		var filterExpr Expr
+		if fc.Filter != nil {
+			var ferr error
+			filterExpr, ferr = resolveExprForWindowInput(fc.Filter, inputCtx, agg)
+			if ferr != nil {
+				return WindowFunc{}, ferr
+			}
+		}
+		if fc.Star {
+			if name != "count" {
+				return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("%s(*) is not supported", name)}
+			}
+			return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int8"}, Star: true, Filter: filterExpr}, nil
+		}
+		if len(fc.Args) != 1 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("%s() requires exactly one argument", name)}
+		}
+		argResolved, err := resolveExprForWindowInput(fc.Args[0], inputCtx, agg)
+		if err != nil {
+			return WindowFunc{}, err
+		}
+		inputTyp := exprType(argResolved)
+		var outTyp catalog.Type
+		switch name {
+		case "count":
+			outTyp = catalog.Type{Name: "int8"}
+		case "sum":
+			outTyp = inputTyp
+			if strings.EqualFold(outTyp.Name, "unknown") || outTyp.Name == "" {
+				outTyp = catalog.Type{Name: "int8"}
+			}
+		case "avg":
+			if isFloatTypeName(inputTyp.Name) {
+				outTyp = catalog.Type{Name: "float8"}
+			} else {
+				outTyp = catalog.Type{Name: "numeric"}
+			}
+		case "min", "max":
+			outTyp = inputTyp
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: outTyp, Args: []Expr{argResolved}, Filter: filterExpr, InputType: inputTyp}, nil
+	case "first_value", "last_value":
+		if fc.Star || fc.Distinct || len(fc.Args) != 1 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() requires exactly one argument", name)}
+		}
+		argResolved, err := resolveExprForWindowInput(fc.Args[0], inputCtx, agg)
+		if err != nil {
+			return WindowFunc{}, err
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: inferExprType(argResolved), Args: []Expr{argResolved}}, nil
+	case "nth_value":
+		if fc.Star || fc.Distinct || len(fc.Args) != 2 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "window function nth_value() requires exactly two arguments"}
+		}
+		args := make([]Expr, 0, 2)
+		for _, a := range fc.Args {
+			resolved, err := resolveExprForWindowInput(a, inputCtx, agg)
+			if err != nil {
+				return WindowFunc{}, err
+			}
+			args = append(args, resolved)
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: inferExprType(args[0]), Args: args}, nil
+	case "cume_dist", "percent_rank":
+		if fc.Star || fc.Distinct || len(fc.Args) != 0 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name)}
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "float8"}}, nil
+	case "ntile":
+		if fc.Star || fc.Distinct || len(fc.Args) != 1 {
+			return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "42601", Message: "window function ntile() requires exactly one argument"}
+		}
+		argResolved, err := resolveExprForWindowInput(fc.Args[0], inputCtx, agg)
+		if err != nil {
+			return WindowFunc{}, err
+		}
+		return WindowFunc{pos: fc.Pos(), Name: name, Type: catalog.Type{Name: "int4"}, Args: []Expr{argResolved}}, nil
 	default:
 		return WindowFunc{}, &PlanError{Pos: fc.Pos(), Code: "0A000", Message: fmt.Sprintf("window function %q is not supported in v0 planner", name)}
 	}
@@ -4818,6 +5267,11 @@ func windowCallKey(fc *parser.FuncCall) string {
 	}
 	for _, a := range fc.Args {
 		b.WriteString(parserExprKey(a))
+		b.WriteString("|")
+	}
+	if fc.Filter != nil {
+		b.WriteString("filter:")
+		b.WriteString(parserExprKey(fc.Filter))
 		b.WriteString("|")
 	}
 	b.WriteString("over:")
@@ -4844,6 +5298,29 @@ func windowSpecKey(w *parser.WindowDef) string {
 			b.WriteString(":asc")
 		}
 		b.WriteString("|")
+	}
+	b.WriteString("f:")
+	b.WriteString(windowFrameKey(w.Frame))
+	return b.String()
+}
+
+// windowFrameKey renders a parser.WindowFrame into a comparison key
+// for windowSpecKey, so two window calls with different explicit
+// frame clauses (or one with a frame and one without) are correctly
+// treated as distinct window specifications rather than silently
+// sharing one WindowAgg node's Frame.
+func windowFrameKey(fr *parser.WindowFrame) string {
+	if fr == nil {
+		return ""
+	}
+	b := strings.Builder{}
+	fmt.Fprintf(&b, "%d:%d:%d:%d:", fr.Mode, fr.StartKind, fr.EndKind, fr.Exclusion)
+	if fr.StartOffset != nil {
+		b.WriteString(parserExprKey(fr.StartOffset))
+	}
+	b.WriteString("|")
+	if fr.EndOffset != nil {
+		b.WriteString(parserExprKey(fr.EndOffset))
 	}
 	return b.String()
 }
@@ -4939,12 +5416,6 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 		g = resolveOrderBySubstitution(g, s.Targets)
 		// Positional GROUP BY that wasn't substituted → out-of-range position. M0097-0003.
 		if ic, ok := g.(*parser.IntegerConst); ok {
-			// Position 0 is our placeholder for ROLLUP/CUBE/GROUPING SETS (parser stores them
-			// as IntegerConst{Value:0} after skipping the parens). Skip it silently so
-			// ROLLUP/CUBE don't error — they're handled as plain GROUP BY on the key columns.
-			if ic.Value == 0 {
-				continue
-			}
 			return nil, nil, nil, nil, &PlanError{Pos: g.Pos(), Code: "42P10",
 				Message: fmt.Sprintf("GROUP BY position %d is not in select list", ic.Value)}
 		}
@@ -5656,7 +6127,7 @@ func resolveExprAfterWindow(e parser.Expr, win *windowSurface) (Expr, error) {
 		if x.Subquery != nil {
 			return planInExpr(x, win.input)
 		}
-		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, List: list}, nil
+		return &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp, List: list}, nil
 	case *parser.IsNullExpr:
 		operand, err := resolveExprAfterWindow(x.Operand, win)
 		if err != nil {
@@ -6630,7 +7101,15 @@ func parserExprKey(e parser.Expr) string {
 	return fmt.Sprintf("expr:%T", e)
 }
 
-func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog) (Node, bool, error) {
+// enforceInheritanceFanout, when true, additionally refuses IndexScan when
+// tbl has accessible plain-INHERITS children (mirroring the PartitionKey
+// check below): an IndexScan opens exactly one B-tree scoped to tbl's own
+// storage, so a row living only in a child would be silently missed unless
+// execution falls through to the Filter+UNION ALL fan-out planScanRangeVar
+// already builds (root-0026 SELECT-side twin, M0119-0004). The caller passes
+// false to preserve pre-existing behavior where a different layer already
+// handles (or is unaffected by) the child fan-out — see call sites.
+func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.Catalog, enforceInheritanceFanout bool) (Node, bool, error) {
 	if len(ctx.bindings) != 1 {
 		return nil, false, nil
 	}
@@ -6640,6 +7119,13 @@ func planIndexScanFromWhere(where parser.Expr, ctx *resolveContext, cat catalog.
 	// which correctly scans the children via planScanRangeVar. M0100-0005.
 	if len(tbl.PartitionKey) > 0 {
 		return nil, false, nil
+	}
+	if enforceInheritanceFanout {
+		if im := inMemoryCat(cat); im != nil {
+			if len(catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), currentTempOwner(cat))) > 0 {
+				return nil, false, nil
+			}
+		}
 	}
 	b, ok := where.(*parser.BinaryOp)
 	if !ok || b.Op != parser.OpEq {
@@ -7182,25 +7668,68 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			Message: fmt.Sprintf("relation %q does not exist", s.Target.Name),
 		}
 	}
+	// INSERT into a view: rewrite onto the view's auto-updatable base
+	// relation when the defining query is a simple single-table passthrough
+	// (viewAutoUpdatableChain); anything requiring INSTEAD OF trigger/rule
+	// machinery goopg doesn't have stays rejected with 55000, matching
+	// PostgreSQL's error_view_not_updatable. From here on `tbl` is always a
+	// real heap relation, so the rest of this function needs no other view
+	// awareness. M0119-0004 slice-365 follow-up (WITH CHECK OPTION).
+	var viewCheckQual Expr
+	var viewCheckName string
+	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
+	var outerColMap []int         // view's own column ordinal -> base ordinal, only when resolveTbl != nil
+	viewName := tbl.Name
+	if tbl.View != nil {
+		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
+		if !autoOK {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdInsert)
+		}
+		_, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
+		if qerr != nil {
+			return nil, qerr
+		}
+		if checked != nil {
+			viewCheckQual = checked
+			viewCheckName = tbl.Name
+		}
+		outerColMap = colMaps[0]
+		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), outerColMap)
+		tbl = base
+	}
 	// Map source-row column index -> target table column ordinal.
 	// Generated columns are excluded from the mapping when no explicit
 	// column list is provided — they are computed by the executor. M0096-0008.
+	// For a view target, the source-row order is the VIEW's own column
+	// order (outerColMap), not base's physical order — root-0025 deferred
+	// item 1 (a view may subset/reorder/rename base's columns).
 	var colIndex []int
 	if len(s.Columns) == 0 {
-		colIndex = make([]int, 0, len(tbl.Columns))
-		for i, col := range tbl.Columns {
-			if col.GeneratedAlways {
-				continue // skip generated columns; executor fills them in
+		if resolveTbl != nil {
+			colIndex = make([]int, 0, len(outerColMap))
+			for _, baseOrd := range outerColMap {
+				if tbl.Columns[baseOrd].GeneratedAlways {
+					continue
+				}
+				colIndex = append(colIndex, baseOrd)
 			}
-			colIndex = append(colIndex, i)
-		}
-		if len(colIndex) == len(tbl.Columns) {
-			// No generated columns — keep original 1:1 mapping for compatibility.
+		} else {
+			colIndex = make([]int, 0, len(tbl.Columns))
+			for i, col := range tbl.Columns {
+				if col.GeneratedAlways {
+					continue // skip generated columns; executor fills them in
+				}
+				colIndex = append(colIndex, i)
+			}
 		}
 	} else {
+		lookupTbl := tbl
+		if resolveTbl != nil {
+			lookupTbl = resolveTbl
+		}
 		colIndex = make([]int, 0, len(s.Columns))
 		for _, name := range s.Columns {
-			col, ok := cat.LookupColumn(tbl, name)
+			col, ok := cat.LookupColumn(lookupTbl, name)
 			if !ok {
 				return nil, &PlanError{
 					Pos:     s.Target.Pos(),
@@ -7276,16 +7805,24 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		}
 		source = &Values{pos: s.Pos(), Rows: rows, schema: insertValuesSchema(tbl, colIndex)}
 	}
-	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex}
+	insert := &Insert{pos: s.Pos(), Table: tbl, Source: source, ColumnIndex: colIndex, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if s.OnConflict != nil {
-		oc, err := planOnConflict(s.OnConflict, tbl, s.Target.Alias, cat)
+		oc, err := planOnConflict(s.OnConflict, tbl, resolveTbl, viewName, s.Target.Alias, cat)
 		if err != nil {
 			return nil, err
 		}
 		insert.OnConflict = oc
 	}
 	if len(s.Returning) > 0 {
-		retCtx := singleBindingContext(tbl, s.Target.Alias)
+		retTbl := tbl
+		if resolveTbl != nil {
+			retTbl = resolveTbl
+		}
+		retAlias := s.Target.Alias
+		if resolveTbl != nil {
+			retAlias = viewResolveAlias(s.Target.Alias, viewName)
+		}
+		retCtx := singleBindingContext(retTbl, retAlias)
 		retCtx.cat = cat
 		// When this INSERT has ON CONFLICT DO UPDATE, add `excluded` to the
 		// RETURNING scope as notReferenceable. This lets resolveColumnRefAt
@@ -7294,7 +7831,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		// generic "missing FROM-clause entry" error.
 		if insert.OnConflict != nil && insert.OnConflict.Action == OnConflictActionUpdate {
 			retCtx.bindings = append(retCtx.bindings, rangeBinding{
-				table:            tbl,
+				table:            retTbl,
 				alias:            "excluded",
 				qualifiedOnly:    true,
 				notReferenceable: true,
@@ -7314,7 +7851,16 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 // the planner-side OnConflictPlan: arbiter-index selection from
 // the conflict target columns, plus expression resolution for the
 // DO UPDATE branch under a target+excluded scope. M0017-0002.
-func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias string, cat catalog.Catalog) (*OnConflictPlan, error) {
+//
+// resolveTbl is non-nil only when the INSERT target was a simple
+// auto-updatable view (see viewProxyTable in planInsert): the ON
+// CONFLICT target-column list, DO UPDATE SET/WHERE, and the
+// `excluded` pseudo-relation are all written in the view's own
+// (possibly renamed/reordered/subset) column vocabulary, so every
+// name-resolution scope below must bind against resolveTbl rather
+// than tbl (the real base relation) — root-0025 deferred item 1's
+// "Known residual".
+func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, resolveTbl *catalog.Table, viewName string, targetAlias string, cat catalog.Catalog) (*OnConflictPlan, error) {
 	out := &OnConflictPlan{}
 
 	switch oc.Action {
@@ -7326,12 +7872,19 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 		return nil, &PlanError{Pos: oc.Pos(), Code: "XX000", Message: fmt.Sprintf("unexpected ON CONFLICT action %d", oc.Action)}
 	}
 
+	scopeTbl := tbl
+	scopeAlias := targetAlias
+	if resolveTbl != nil {
+		scopeTbl = resolveTbl
+		scopeAlias = viewResolveAlias(targetAlias, viewName)
+	}
+
 	// Arbiter-index selection. With a target, resolve explicitly.
 	// For the bare DO NOTHING form (no target), fall back to the
 	// primary key index so probeArbiterWaiting can detect
 	// in-progress conflicts (M0100-0002).
 	if oc.Target != nil {
-		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, cat)
+		idx, ords, err := resolveArbiterIndex(oc.Target, tbl, resolveTbl, cat)
 		if err != nil {
 			return nil, err
 		}
@@ -7350,7 +7903,7 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 			if hasExpr {
 				// Build a single-binding resolve context for the target table
 				// so expression ColumnRefs resolve against the insert row.
-				exprCtx := singleBindingContext(tbl, targetAlias)
+				exprCtx := singleBindingContext(scopeTbl, scopeAlias)
 				exprCtx.cat = cat
 				out.ArbiterExprs = make([]Expr, len(ords))
 				for i, o2 := range ords {
@@ -7386,16 +7939,16 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 	// `excluded.col` resolves only via the alias path. Schema is
 	// 2N wide — the executor will arrange a merged tuple at
 	// runtime.
-	primaryAlias := targetAlias
+	primaryAlias := scopeAlias
 	if primaryAlias == "" {
-		primaryAlias = tbl.Name
+		primaryAlias = scopeTbl.Name
 	}
 	n := len(tbl.Columns)
 	// Primary at sourceIdx=1, excluded at sourceIdx=2 — both refer
 	// to the same catalog table but disambiguate by source so
 	// `excluded.col` and `<target>.col` rebind helpers don't
 	// collapse into the same Index.
-	primaryBinding := rangeBinding{table: tbl, alias: primaryAlias, offset: 0, sourceIdx: 1}
+	primaryBinding := rangeBinding{table: scopeTbl, alias: primaryAlias, offset: 0, sourceIdx: 1}
 	if targetAlias != "" {
 		// When the INSERT target has an alias, the original table name must
 		// not resolve the primary binding — only the alias is valid.
@@ -7405,17 +7958,17 @@ func planOnConflict(oc *parser.OnConflictClause, tbl *catalog.Table, targetAlias
 	}
 	bindings := []rangeBinding{
 		primaryBinding,
-		{table: tbl, alias: "excluded", offset: n, qualifiedOnly: true, sourceIdx: 2},
+		{table: scopeTbl, alias: "excluded", offset: n, qualifiedOnly: true, sourceIdx: 2},
 	}
 	mergedSchema := make(Schema, 0, 2*n)
-	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 1)...)
-	mergedSchema = append(mergedSchema, tableSchemaWithSource(tbl, 2)...)
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 1)...)
+	mergedSchema = append(mergedSchema, tableSchemaWithSource(scopeTbl, 2)...)
 	ctx := newResolveContext(bindings, mergedSchema)
 	ctx.cat = cat
 
 	out.UpdateSet = make([]Expr, n)
 	for _, a := range oc.UpdateSet {
-		if err := applyUpdateAssign(a, tbl, out.UpdateSet, ctx, cat); err != nil {
+		if err := applyUpdateAssign(a, scopeTbl, out.UpdateSet, ctx, cat); err != nil {
 			return nil, err
 		}
 	}
@@ -7485,13 +8038,19 @@ func resolveDefaultDoNothingArbiter(tbl *catalog.Table, targetAlias string, cat 
 // specification" rule: the user's columns must canonically match
 // some unique constraint.
 //
+// resolveTbl is non-nil only for a view target (see planOnConflict):
+// target.Columns are written in the view's own vocabulary, so each
+// plain column name is first translated to tbl's (the base
+// relation's) own column name via resolveTbl before being matched
+// against idx.Columns, which are always base names.
+//
 // Returns (idx, ordinals, nil) on a single match — ordinals are
 // `tbl.Columns` ordinals matching idx.Columns in catalog order so
 // the executor can extract the conflict key from a row tuple
 // without a name lookup. SQLSTATE 42P10 ("invalid_column_reference"
 // — upstream's "no unique or exclusion constraint matching the ON
 // CONFLICT specification") on no match.
-func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, cat catalog.Catalog) (*catalog.Index, []int, error) {
+func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, resolveTbl *catalog.Table, cat catalog.Catalog) (*catalog.Index, []int, error) {
 	// Constraint-name target form (M0017 Stage B). The named index
 	// must exist, must be a unique index, and must belong to the
 	// target table. The analyzer already enforces these but the
@@ -7531,6 +8090,16 @@ func resolveArbiterIndex(target *parser.OnConflictTarget, tbl *catalog.Table, ca
 	for _, c := range target.Columns {
 		if c == "" {
 			exprCount++
+		} else if resolveTbl != nil {
+			// Translate the view's own column name to the base
+			// relation's real column name before it enters the
+			// wanted-set, since idx.Columns below are always base
+			// names.
+			col, ok := cat.LookupColumn(resolveTbl, c)
+			if !ok {
+				return nil, nil, &PlanError{Pos: target.Pos(), Code: "42703", Message: fmt.Sprintf("column %q does not exist", c)}
+			}
+			plainWanted[strings.ToLower(tbl.Columns[col.Ordinal].Name)] = struct{}{}
 		} else {
 			plainWanted[strings.ToLower(c)] = struct{}{}
 		}
@@ -7684,6 +8253,41 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
+	// UPDATE against a view: rewrite onto the auto-updatable base relation,
+	// same restriction as planInsert. UPDATE … FROM a view is allowed for the
+	// same auto-updatable subset (root-0025 deferred item 3): resolveTbl's
+	// column-name proxy lets SET/WHERE/RETURNING resolve the view's own
+	// vocabulary, and the view's own qual (viewQual) is ANDed into FromPred
+	// so the cross-product path still restricts to rows the view itself
+	// exposes.
+	var viewQual Expr
+	var viewCheckQual Expr
+	var viewCheckName string
+	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
+	viewName := tbl.Name
+	if tbl.View != nil {
+		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
+		if !autoOK {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdUpdate)
+		}
+		all, checked, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
+		if qerr != nil {
+			return nil, qerr
+		}
+		viewQual = all
+		if checked != nil {
+			viewCheckQual = checked
+			viewCheckName = tbl.Name
+		}
+		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), colMaps[0])
+		tbl = base
+	}
+	resolveScope := tbl
+	targetAlias := s.Target.Alias
+	if resolveTbl != nil {
+		resolveScope = resolveTbl
+		targetAlias = viewResolveAlias(s.Target.Alias, viewName)
+	}
 
 	// Build resolve context.  When UPDATE … FROM is present, the FROM tables
 	// are appended as additional bindings so that SET and WHERE expressions can
@@ -7693,9 +8297,9 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 	var fromSchema Schema
 	if len(s.From) > 0 {
 		bindings := []rangeBinding{
-			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+			{table: resolveScope, alias: targetAlias, offset: 0, sourceIdx: 1},
 		}
-		sch := tableSchemaWithSource(tbl, 1)
+		sch := tableSchemaWithSource(resolveScope, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.From {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for FROM tables
@@ -7741,17 +8345,21 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		}
 		set := make([]Expr, len(tbl.Columns))
 		for _, a := range s.Set {
-			if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
+			if err := applyUpdateAssign(a, resolveScope, set, ctx, cat); err != nil {
 				return nil, err
 			}
 		}
 		// The target scan has NO filter; the executor does the nested-loop
 		// cross-product and applies FromPred against the combined row. M0097-0065.
-		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		// FromPred also carries the view's own qual (viewQual) when the
+		// target is a view, restricting the cross-product to rows the view
+		// itself would expose (root-0025 deferred item 3).
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		upd := &Update{
 			pos: s.Pos(), Table: tbl, Child: tgtScan, Set: set,
 			FromTables: fromTables, FromScans: fromScans, FromSchema: fromSchema,
-			FromPred: pred,
+			FromPred:      andExpr(s.Pos(), viewQual, pred),
+			ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName,
 		}
 		if len(s.Returning) > 0 {
 			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
@@ -7764,7 +8372,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(tbl, s.Target.Alias)
+	ctx := singleBindingContext(resolveScope, targetAlias)
 	ctx.cat = cat
 	var node Node = &SeqScan{pos: s.Pos(), Table: tbl, schema: ctx.schema}
 	if s.Where != nil {
@@ -7772,25 +8380,43 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		// for `WHERE indexed_col = key` shapes. Mirrors planSelect's
 		// `if idxNode, ok, err := planIndexScanFromWhere(...)` arm.
 		// Falls through to Filter(SeqScan) on no index match.
-		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+		// enforceInheritanceFanout=false: updateOp.Next (operators_storage.go)
+		// already gates its own index fast path on the target having no
+		// partition/inheritance children (root-0025 item 5 follow-up,
+		// M0119-0004), so this plan-time check would be redundant here.
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat, false); err != nil {
 			return nil, err
 		} else if ok {
 			node = idxNode
+			// See planDelete's identical comment: merge into a single
+			// Filter layer, extractScan only unwraps one — updateViaIndex
+			// (operators_storage.go) now evaluates the combined predicate
+			// (index key AND this Filter) on its initial scan pass, so the
+			// view's own WHERE qual is enforced without giving up the
+			// index probe.
+			if viewQual != nil {
+				node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: viewQual}
+			}
 		} else {
 			pred, err := resolveExpr(s.Where, ctx)
 			if err != nil {
 				return nil, err
 			}
-			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: andExpr(s.Where.Pos(), viewQual, pred)}
 		}
+	} else if viewQual != nil {
+		// Restrict candidate rows to those visible through the view — PG
+		// only lets UPDATE [through a view] touch rows its own WHERE
+		// qual would include.
+		node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
 	}
 	set := make([]Expr, len(tbl.Columns))
 	for _, a := range s.Set {
-		if err := applyUpdateAssign(a, tbl, set, ctx, cat); err != nil {
+		if err := applyUpdateAssign(a, resolveScope, set, ctx, cat); err != nil {
 			return nil, err
 		}
 	}
-	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set}
+	upd := &Update{pos: s.Pos(), Table: tbl, Child: node, Set: set, ViewCheckQual: viewCheckQual, ViewCheckName: viewCheckName}
 	if len(s.Returning) > 0 {
 		retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
 		if err != nil {
@@ -7812,6 +8438,35 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 	if !ok {
 		return nil, &PlanError{Pos: s.Target.Pos(), Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", s.Target.Name)}
 	}
+	// DELETE against a view: rewrite onto the auto-updatable base relation,
+	// same restriction as planInsert/planUpdate. DELETE … USING a view is
+	// allowed for the same auto-updatable subset (root-0025 deferred item 3),
+	// mirroring UPDATE … FROM: viewQual is ANDed into UsingPred. CHECK
+	// OPTION does not apply to DELETE (PostgreSQL only enforces it on
+	// INSERT/UPDATE — the row is leaving the view's underlying storage, not
+	// being written into it).
+	var viewQual Expr
+	var resolveTbl *catalog.Table // non-nil only when tbl was a view; see viewProxyTable
+	viewName := tbl.Name
+	if tbl.View != nil {
+		chain, base, colMaps, autoOK := viewAutoUpdatableChain(tbl, cat)
+		if !autoOK {
+			return nil, viewNotUpdatableError(s.Pos(), tbl.Name, viewCmdDelete)
+		}
+		all, _, qerr := viewChainQuals(s.Pos(), chain, colMaps, base, cat)
+		if qerr != nil {
+			return nil, qerr
+		}
+		viewQual = all
+		resolveTbl = viewProxyTable(base, viewColumnNames(tbl), colMaps[0])
+		tbl = base
+	}
+	resolveScope := tbl
+	targetAlias := s.Target.Alias
+	if resolveTbl != nil {
+		resolveScope = resolveTbl
+		targetAlias = viewResolveAlias(s.Target.Alias, viewName)
+	}
 
 	// DELETE … USING (M0097-0076): build a combined resolve context
 	// over the target plus all USING tables so that WHERE and
@@ -7822,9 +8477,9 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		var usingScans []Node
 		var usingSchema Schema
 		bindings := []rangeBinding{
-			{table: tbl, alias: s.Target.Alias, offset: 0, sourceIdx: 1},
+			{table: resolveScope, alias: targetAlias, offset: 0, sourceIdx: 1},
 		}
-		sch := tableSchemaWithSource(tbl, 1)
+		sch := tableSchemaWithSource(resolveScope, 1)
 		offset := len(tbl.Columns)
 		for idx, rv := range s.Using {
 			si := int16(idx + 2) // sourceIdx 2, 3, … for USING tables
@@ -7863,11 +8518,15 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 				return nil, err
 			}
 		}
-		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(tbl, 1)}
+		// The target scan has NO filter; the executor does the nested-loop
+		// cross-product and applies UsingPred against the combined row.
+		// UsingPred also carries the view's own qual (viewQual) when the
+		// target is a view (root-0025 deferred item 3).
+		tgtScan := &SeqScan{pos: s.Pos(), Table: tbl, schema: tableSchemaWithSource(resolveScope, 1)}
 		del := &Delete{
 			pos: s.Pos(), Table: tbl, Child: tgtScan,
 			UsingTables: usingTables, UsingScans: usingScans, UsingSchema: usingSchema,
-			UsingPred: pred,
+			UsingPred: andExpr(s.Pos(), viewQual, pred),
 		}
 		if len(s.Returning) > 0 {
 			retExprs, retSchema, err := resolveTargets(s.Returning, ctx)
@@ -7880,7 +8539,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		return wrapDMLCTEPrefix(del, dmlPlans), nil
 	}
 
-	ctx := singleBindingContext(tbl, s.Target.Alias)
+	ctx := singleBindingContext(resolveScope, targetAlias)
 	// When an explicit alias is set, using the original table name in WHERE
 	// must produce the PostgreSQL-specific error. M0097-0003.
 	if s.Target.Alias != "" {
@@ -7892,17 +8551,29 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		// M0021-0009 step 2d: index-driven probe for
 		// `WHERE indexed_col = key` shapes; falls through to
 		// Filter(SeqScan).
-		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat); err != nil {
+		// enforceInheritanceFanout=false: deleteOp.Next (operators_storage.go)
+		// never uses this plan node's index fast path for the fan-out
+		// decision at all — it always recomputes scanTables (parent +
+		// partition/inheritance children) itself, so this plan-time check
+		// would have no effect on DELETE's correctness either way.
+		if idxNode, ok, err := planIndexScanFromWhere(s.Where, ctx, cat, false); err != nil {
 			return nil, err
 		} else if ok {
 			node = idxNode
+			// See planUpdate's identical comment: merge into a single
+			// Filter layer, extractScan only unwraps one.
+			if viewQual != nil {
+				node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
+			}
 		} else {
 			pred, err := resolveExpr(s.Where, ctx)
 			if err != nil {
 				return nil, err
 			}
-			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: pred}
+			node = &Filter{pos: s.Where.Pos(), Child: node, Predicate: andExpr(s.Where.Pos(), viewQual, pred)}
 		}
+	} else if viewQual != nil {
+		node = &Filter{pos: s.Pos(), Child: node, Predicate: viewQual}
 	}
 	del := &Delete{pos: s.Pos(), Table: tbl, Child: node}
 	if len(s.Returning) > 0 {
@@ -9182,7 +9853,7 @@ func planInExpr(x *parser.InExpr, ctx *resolveContext) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp}
+	out := &InExpr{pos: x.Pos(), Operand: op, Negated: x.Negated, NotEqualAny: x.NotEqualAny, AnyOp: x.AnyOp, AllOp: x.AllOp}
 	if x.Subquery != nil {
 		if ctx == nil || ctx.cat == nil {
 			return nil, &PlanError{Pos: x.Pos(), Code: "0A000", Message: "IN (subquery) not supported in this context"}
@@ -10167,6 +10838,7 @@ func remapColumnRefsToSchema(e Expr, oldSchema Schema, newIndex map[string]int) 
 			Negated:         x.Negated,
 			NotEqualAny:     x.NotEqualAny,
 			AnyOp:           x.AnyOp,
+			AllOp:           x.AllOp,
 			Plan:            x.Plan,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,
@@ -10396,6 +11068,7 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 			Negated:         x.Negated,
 			NotEqualAny:     x.NotEqualAny,
 			AnyOp:           x.AnyOp,
+			AllOp:           x.AllOp,
 			Plan:            x.Plan,
 			List:            list,
 			IsNonCorrelated: x.IsNonCorrelated,

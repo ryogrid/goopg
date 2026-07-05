@@ -13532,6 +13532,165 @@ today (probably just `relkind='m'`, insufficient on its own — same shape of
 gap `RecordKindCreateIndex`'s doc comment describes for indexes, "goopg has
 no pg_index relation").
 
+## Follow-up: materialized-view restart persistence (M0119-0004, this loop)
+
+Closes the gap immediately above. The root cause was confirmed exactly as
+guessed: `buildUserPGClassRow` (`internal/executor/pg18_user_catalog_rows.go`)
+hardcoded `relkind` to `"r"`/`"p"` only — a matview's pg_class heap row was
+written as an ordinary table (`relkind='r'`), and `loadUserTablesFromHeap`
+(`internal/initdb/open.go`) filtered strictly on `row.RelKind == "r"`, so a
+restarted matview reloaded with `IsMatView=false`, `View=nil`: a silent
+downgrade to a plain table (its physical row data survived, since matviews —
+unlike plain views — have real heap storage, but the "this is a matview with
+this refresh query" metadata did not).
+
+Fix, mirroring `RecordKindCreateIndex`'s pattern (M0079-0001) exactly, since
+plain `CREATE VIEW` has no on-disk persistence at all today to model this on
+(views are runtime-only; a separate, larger, pre-existing gap, not touched
+here):
+
+- `buildUserPGClassRow` now emits `relkind='m'` when `tbl.IsMatView` (before
+  the partition check, since a matview can't be partitioned).
+- `loadUserTablesFromHeap`'s pg_class scan filter now accepts `relkind` `"r"`
+  **or** `"m"`; the reloaded `catalog.Table` sets `IsMatView = tr.RelKind ==
+  "m"` directly from the recovered row.
+- New `RecordKindCreateMatView` (`internal/wal/recovery.go`, byte 102 — the
+  next free byte at the time this landed; the design-doc-adjacent "byte 95"
+  guess above turned out taken by `RecordKindCreateStatistics`, defined in a
+  sibling file `statistics_ddl.go` that a plain grep of `recovery.go` alone
+  missed) carries `tableOID | populated(1) | queryLen(2) | querySQL` — the
+  view body as SQL text (`tbl.ViewDef`, already stored for `pg_get_viewdef`)
+  plus `tbl.IsPopulated` (the `WITH NO DATA` flag). Emitted from
+  `syncTableToCatalogHeap` (the same single funnel `RecordKindColumnDefaults`
+  uses) via `ctx.Pool.LogChangeRecord`, **not** `ctx.WAL.Append` — matching
+  `RecordKindCreateIndex`'s emission call, not `RecordKindColumnDefaults`'s,
+  because the initdb-level test harness (`runDDL` in
+  `internal/initdb/ddl_catalog_sync_test.go`) only wires `ctx.Pool`, not
+  `ctx.WAL`; using the same hook as the already-proven-testable `CREATE INDEX`
+  record made this change verifiable at the same layer.
+- New `internal/initdb/matview_ddl_recovery.go`'s `replayMatViewRecords`
+  (same shape as `column_defaults_recovery.go`): scans WAL after
+  `loadUserTablesFromHeap`, re-parses `p.Query` via `parser.Parse` into a
+  `*parser.SelectStmt`, and sets `tbl.View`/`tbl.ViewDef`/`tbl.IsMatView`/
+  `tbl.IsPopulated` on the reloaded table; last-record-wins, skips
+  (does not fail startup) on a decode/parse gap or a since-dropped table.
+
+Tests: `internal/initdb/matview_ddl_recovery_test.go` —
+`TestMatViewSurvivesRestartViaWAL` (populated case: `IsMatView`,
+`IsPopulated=true`, `View`, `Columns` all survive a Close-without-SaveCatalog
+restart) and `TestMatViewWithNoDataSurvivesRestartViaWAL` (`WITH NO DATA` →
+`IsPopulated=false` survives too). Both confirmed RED against the pre-fix
+tree (`git stash` of the 4 production files, rerun, reverted).
+
+Deferred (closed by the next follow-up below): plain `CREATE VIEW` has zero
+on-disk persistence — `execCreateView` never calls `syncTableToCatalogHeap`,
+so a non-materialized view does not survive a restart at all today (reloads
+as if it never existed, not merely as a plain table).
+
+## Follow-up: plain CREATE VIEW restart persistence (M0119-0004, later loop)
+
+Closes the "Deferred" gap immediately above. Structurally the same fix as the
+matview one, mirrored one level down (a plain view has no physical heap
+storage at all, whereas a matview does):
+
+- `buildUserPGClassRow` now emits `relkind='v'` when `tbl.View != nil` (and
+  the table isn't a matview), with `relfilenode=0` alongside partitioned
+  tables (`relkind='p'`) — a view has no physical storage to point at.
+- `loadUserTablesFromHeap`'s pg_class scan filter now also accepts
+  `relkind == "v"`; the reloaded `catalog.Table` sets `Virtual = tr.RelKind
+  == "v"` (mirroring `catalog.InMemory.CreateView`'s own `Virtual: true`) so
+  the reloaded relation is recognized as storage-less immediately, before
+  `replayViewRecords` runs.
+- New `RecordKindCreateView` (`internal/wal/recovery.go`, byte 103, the next
+  free byte after `RecordKindCreateMatView`=102) carries
+  `tableOID | queryLen(2) | querySQL` — no `populated` byte, since a plain
+  view has no `WITH NO DATA` analog. Emitted from `syncTableToCatalogHeap`
+  (the same funnel, right after the matview block) via
+  `ctx.Pool.LogChangeRecord`, gated on `tbl.View != nil && !tbl.IsMatView &&
+  tbl.ViewDef != ""` so the two emissions are mutually exclusive.
+- New `internal/initdb/view_ddl_recovery.go`'s `replayViewRecords` (near-copy
+  of `matview_ddl_recovery.go`'s `replayMatViewRecords`, minus the
+  `IsPopulated` field): scans WAL after `loadUserTablesFromHeap`, re-parses
+  `p.Query` into a `*parser.SelectStmt`, sets `tbl.View`/`tbl.ViewDef`.
+  Wired into `internal/initdb/open.go` right after `replayMatViewRecords`.
+- `execCreateView` (`internal/executor/operators_ddl.go`) now calls
+  `syncTableToCatalogHeap` (gated on `catalogHeapSyncAvailable`, same guard
+  every other DDL path uses) after setting `vt.ViewDef`/`CheckOption`/
+  `SecurityBarrier`/`SecurityInvoker` on the new table.
+- **OID-churn on `CREATE OR REPLACE VIEW`:** `catalog.InMemory.CreateView`
+  always assigns a fresh OID, even on replace (it does not reuse the old
+  view's OID). Without cleanup, replacing a view would leave the *old* OID's
+  pg_class/pg_attribute rows on disk, un-stamped, so a restart would register
+  the view twice — once under the stale OID (frozen at its pre-replace
+  definition) and once under the new one. `execCreateView` now captures the
+  pre-existing view's OID before the temporary `im.DropView` (used to break
+  circular-view planning), and after the new table's heap sync, stamps xmax
+  on the old OID's rows via `deleteCatalogRowsForOID` whenever the OID
+  changed.
+- **Drop-side cleanup, both for the new view case and as a fix to a
+  pre-existing matview gap:** neither `execDropOneView` nor
+  `execDropOneMatView` ever stamped xmax on the pg_class/pg_attribute rows
+  their own CREATE wrote — `replayMatViewRecords`'s own "matview dropped
+  since the snapshot" comment (written during the earlier matview loop)
+  anticipated a drop leaving no trace, but nothing was ever wired up to make
+  that true. Concretely: `DROP MATERIALIZED VIEW` (and, after this loop,
+  `DROP VIEW`) followed by a restart resurrected the dropped relation. Both
+  functions now capture the `*catalog.Table` from the pre-drop `LookupTable`
+  call and, on successful `catalog.DropView`, stamp xmax via the same
+  `deleteCatalogRowsForOID`/`catalogHeapSyncAvailable`/`MaterializeWriterXID`
+  pattern `dropTableByRefImmediate` uses for `DROP TABLE`.
+
+Tests: `internal/initdb/view_ddl_recovery_test.go` —
+`TestViewSurvivesRestartViaWAL` (a plain view's `View`/`Columns`/`Virtual`
+survive a Close-without-SaveCatalog restart), and covers both new hazards:
+`TestViewOrReplaceSurvivesRestartWithoutDuplicate` (a `CREATE OR REPLACE
+VIEW` body's columns reflect the *replacement*, not the original, after
+restart — the OID-churn cleanup) and `TestDropViewNotResurrectedAfterRestart`
+/ `TestDropMatViewNotResurrectedAfterRestart` (drop-then-restart does not
+resurrect either kind of view).
+
+Deferred (unchanged, separate, larger gaps — not attempted here): (1)
+`CheckOption`/`SecurityBarrier`/`SecurityInvoker` are not round-tripped
+through the heap-persisted pg_class row at all — `buildUserPGClassRow`
+hardcodes `reloptions` to `"{}"` unconditionally, so these three view
+storage options are lost across a restart even though the view body itself
+now survives (pre-existing, not introduced by this loop, and not
+view-specific — no reloption of any kind round-trips through the heap yet).
+(2) `DROP MATERIALIZED VIEW` still leaks the matview's physical heap file on
+disk — unlike `DROP TABLE`, neither `execDropOneMatView` nor this loop's fix
+calls `o.ctx.Pool.Manager().DropRelation`/`InvalidateRel`/FSM/VM cleanup for
+the matview's own storage; this loop only closed the catalog-heap-row
+resurrection hole, not the physical-storage leak.
+
+## Follow-up: `DROP MATERIALIZED VIEW` physical-storage leak (M0119-0004, later loop)
+
+Closes deferred item (2) immediately above. A materialized view has real
+main-fork heap storage (populated by `CREATE`/`REFRESH MATERIALIZED VIEW`),
+unlike a plain view's `relfilenode=0`, but `execDropOneMatView`
+(`internal/executor/operators_ddl.go`) only ever removed the catalog entry
+and the on-disk pg_class/pg_attribute rows (the earlier restart-persistence
+fix above) — it never released the file itself, so every
+`DROP MATERIALIZED VIEW` leaked one heap file permanently.
+
+`execDropOneMatView` now mirrors `dropTableByRefImmediate`'s `DROP TABLE`
+cleanup for the matview's own relation, after the catalog-heap xmax stamp:
+`o.ctx.Catalog.RelFileNode(tbl)` (safe to call after `DropView`, since it
+reads only `tbl`'s own fields) is fed to `Pool.InvalidateRel`, then
+`Pool.Manager().DropRelation` (idempotent via its `os.IsNotExist` guard, so a
+never-materialized `WITH NO DATA` matview or a restart-downgraded-to-virtual
+one — no backing file yet — drops cleanly too), then `FSM.DropRelation`/
+`VM.DropRelation` when those maps are wired.
+
+Scope note: this only covers the matview's *own* main-fork file. Indexes
+created on a materialized view (if any exist) are a separate, unexamined gap
+— out of scope for this loop, which targeted exactly the leak the deferred
+item above named.
+
+Test: `internal/executor/operators_ddl_matview_storage_test.go` —
+`TestDropMaterializedViewReleasesStorage` creates a populated matview,
+confirms its heap file exists via `Pool.Manager().Exists(rel)`, drops it, and
+asserts the file, FSM entries, and VM bits are all gone.
+
 ## Follow-up: `ALTER VIEW` sub-forms complete the grammar (DU-002 slice 444)
 
 **2026-07-04.** Slice 440's deferral row left three `ALTER VIEW` sub-forms
@@ -13790,3 +13949,501 @@ slice 317). Gates: `go build ./...`/`go vet ./...` clean; `go test -race
 `internal/catalog`+`internal/executor`+`internal/initdb`+`internal/parser`
 suites PASS; TPC-H spotcheck Q12=2/Q13=33 PASS; full pre-commit gate incl.
 pgbench TPC-B smoke PASS.
+
+## Follow-up: `ALTER SCHEMA name RENAME TO / OWNER TO` had no catalog mechanism at all (DU-002 slice 440 resume point (3))
+
+Closes the last open resume point of the slice-440 ledger row. Unlike ALTER
+SEQUENCE/VIEW (slices 439/440), a schema is not a relation and cannot be
+routed through `execAlterTable`; unlike ALTER STATISTICS/COLLATION (slices
+441/442), goopg had no schema-object registry mutators at all — `ALTER
+SCHEMA` fell into the same blanket "schema/view/collation/..." compat-stub
+loop in `parseAlter` that ALTER VIEW fell into before slice 440, silently
+consuming and discarding both `RENAME TO` and `OWNER TO`.
+
+Real PostgreSQL's `ALTER SCHEMA` only has these two forms
+(`postgres/src/backend/commands/schemacmds.c`'s `RenameSchema`/
+`AlterSchemaOwner`); there is no `SET SCHEMA` (schemas aren't nested) and no
+sample-target-style in-memory-only form like statistics' `SET STATISTICS n`.
+
+### The name-vs-OID mismatch that makes this harder than ALTER SEQUENCE/VIEW
+
+Real PostgreSQL's namespace rename is a single `pg_namespace` row update:
+every other catalog references a schema by OID (`relnamespace`), so renaming
+just changes `nspname` and every contained object's `relnamespace` is still
+valid. goopg's `catalog.InMemory.tables`/`.indexes` maps instead key directly
+by schema **name** (`"schema.name"`, see `key()`), and `Table.Schema`/
+`Index.Schema` store the name, not an OID. So a schema rename in goopg must
+cascade into every table/index whose `Schema` field names the old schema,
+re-keying both the map entry and the field — the exact complexity the
+slice-440 ledger row flagged as the reason this couldn't reuse the
+relation-level `SetSchema` mechanism.
+
+### What landed
+
+- `catalog.InMemory` gains `schemaOwners map[string]uint32` (lowercase
+  schema name → owner OID; absent = bootstrap superuser 10, matching
+  `pg_namespace.nspowner`'s previous hardcoded `"10"` literal, now wired
+  through `SchemaOwnerOID`) and:
+  - `SchemaOwnerOID(name) uint32` / `SetSchemaOwner(name, ownerOID) bool` /
+    `SetSchemaOwnerDuringRecovery`.
+  - `RenameSchema(old, new) ([]*Table, error)`: re-keys `schemas`/
+    `schemaOwners`, then iterates `c.tables` and `c.indexes` re-pointing
+    `Schema` + the map key for every entry whose `Schema` names the old
+    schema. Returns the subset of moved tables that are sequences (`Table.
+    IsSequence`) so the executor can additionally cascade the
+    executor-side `seqRegistry` (a `sync.Map` in `internal/executor`, which
+    `internal/catalog` cannot import). Errors mirror upstream: `schema
+    "old" does not exist` / `schema "new" already exists`.
+  - `RenameSchemaDuringRecovery` — discard-result idempotent wrapper.
+- `internal/parser/ast.go`: new `AlterSchemaStmt{Name, Action ("rename"|
+  "owner"), NewName, NewOwner}` node.
+- `internal/parser/ddl.go`'s `parseAlter`: dedicated `if
+  p.acceptIdentKeyword("schema")` case placed before the generic compat-stub
+  loop (which now only handles `collation`/`domain`/`extension`/`language`/
+  `operator`/`system` — "schema" removed from that list, same treatment
+  "view" got at slice 440), parsing `RENAME TO`/`OWNER TO` (with the
+  `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` → `"current_user"` sentinel,
+  matching every other OWNER TO site) and falling back to a no-op consume
+  for any other trailing tokens.
+- `internal/server/dispatch.go`'s `ddlTag`: `*parser.AlterSchemaStmt` →
+  `"ALTER SCHEMA"`.
+- `internal/planner/planner.go`: `*parser.AlterSchemaStmt` routed to the
+  generic `DDL` plan node (was missing entirely — surfaced as `unsupported
+  statement type *parser.AlterSchemaStmt` during live verification even
+  after the parser+executor sides were wired, since every other new
+  statement type needs this case too).
+- `internal/executor/operators_ddl.go`'s new `execAlterSchema`: `"rename"`
+  pre-checks `SchemaExists` both ways for the right SQLSTATE (`3F000`
+  undefined_schema / `42P06` duplicate_schema, matching upstream's
+  `ERRCODE_UNDEFINED_SCHEMA`/`ERRCODE_DUPLICATE_SCHEMA`), calls
+  `catalog.RenameSchema`, WAL-logs it, then for each returned sequence
+  mirrors `execAlterTable`'s SET SCHEMA-on-single-sequence cascade exactly
+  (`RenameSequence` the live `seqRegistry` entry, `WAL.Append
+  (EncodeDropSequence(old))` + `WALLogSequenceState(new)` so the sequence's
+  current value round-trips a restart under its new qualified name, and
+  refresh `Table.VirtualRows` to read from the new key). `"owner"` resolves
+  the target role via `im.RoleOID` (raising `42704 role "..." does not
+  exist` on a miss — the same role-existence-check pattern
+  `execAlterStatistics` already established, closing this specific instance
+  of the slice-439 resume-point-(2) gap for the schema OWNER TO site; the
+  shared `execAlterTable` OWNER TO branch used by TABLE/SEQUENCE/VIEW still
+  has no such check, unchanged) and calls `SetSchemaOwner` + WAL-logs it.
+- New WAL record kinds `RecordKindAlterSchemaRename`/`Owner` (100/101,
+  `internal/wal/schema_alter_ddl.go`, same wire format as the ALTER
+  STATISTICS rename/owner pair) with encode/decode pairs, a physical-replay
+  no-op case in `wal.ApplyRecord` (extends the existing `RecordKindCreate
+  Schema, RecordKindDropSchema` case rather than adding a new one, since
+  CREATE/DROP SCHEMA kinds 34/35 already had the "no per-schema file
+  namespace" no-op), and recovery replay wired into
+  `internal/initdb/schema_ddl_recovery.go`'s `schemaRegistryRecovery`
+  interface + `replaySchemaDDLRecords` switch (mirrors CREATE/DROP SCHEMA
+  exactly, run in WAL order after them).
+- Tests: `internal/executor/alter_schema_test.go`
+  (`TestAlterSchemaRenameOwner` — rename cascades a contained table's
+  `Schema` field and re-keys `LookupTable`, both SQLSTATEs, owner-role
+  validation, owner default); `internal/wal/schema_alter_ddl_test.go`
+  (round-trip + wrong-kind + truncated-payload for both new kinds);
+  `internal/initdb/schema_ddl_recovery_test.go`'s new
+  `TestSchemaDDLRecoveryReplaysAlterRenameOwner` (real `Init`/`Open`/
+  WAL.Append(create+rename+owner)/`Close`/re-`Open` round trip).
+- Live-verified end-to-end against goopg/psql beyond the unit tests: `CREATE
+  SCHEMA s1` → table + sequence inside it → `ALTER SCHEMA s1 RENAME TO s2`
+  → both the table and `nextval()` on the sequence resolve under `s2` and
+  not `s1` → `ALTER SCHEMA s2 OWNER TO alice` → `pg_namespace.nspowner`
+  reflects the new owner's OID → **full server restart** → schema name,
+  owner, table data, and sequence continuity (next `nextval()` still
+  monotonic, not reset) all survive.
+
+### Deferred (recorded in the ledger, not silently dropped)
+
+`RenameSchema`'s table/index/sequence cascade does **not** extend to every
+other schema-name-keyed registry in `catalog.InMemory` — `opClassSchemas`
+(operator classes) and `statisticsObjs` (extended-statistics objects, keyed
+`schema.name`) were not audited and will orphan under the old schema name if
+a schema containing one of these is renamed. `userCollations`/
+`userConversions` carry a `Schema` field but aren't stored in a schema-keyed
+map, so they're likely unaffected but weren't verified either way. See the
+deferral-ledger row appended this loop for the exact resume point (a shared
+"rekey entries whose Schema matches" helper, reused by `RenameSchema` for
+each additional registry).
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/initdb/...
+./internal/catalog/... ./internal/parser/... ./internal/executor/...
+./internal/planner/... ./internal/server/...` PASS; unit pre-commit gate
+(`RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`) PASS; TPC-H
+spotcheck PASS; live end-to-end verification against `psql` including a full
+server restart, described above.
+
+## Follow-up: `RenameSchema` cascades `opClassSchemas`/`statisticsObjs` (DU-002 slice 440 resume point (3) follow-up, loop #102)
+
+Closes the ledger row appended by the previous section: `RenameSchema`'s
+table/index/sequence cascade left two further schema-name-keyed registries
+un-cascaded, so an operator class or extended-statistics object defined
+inside a renamed schema became unreachable (or, for statistics, stayed
+wrongly reachable under the *old* schema-qualified key — the map key never
+moved even though nothing else referenced it).
+
+- `opClassSchemas` is keyed by **operator class name** with the schema as
+  the *value* (`map[string]string`), not a schema-qualified key — so its
+  cascade is a plain value rewrite: for every entry whose value equals the
+  old schema (case-insensitive), point it at the new schema. No re-keying
+  needed, unlike `tables`/`indexes`.
+- `statisticsObjs` is keyed `schema.name` (lowercase, via
+  `StatisticsObject.qualifiedKey()`) — cascaded with the exact same
+  delete-mutate-reinsert shape `RenameSchema` already uses for
+  `tables`/`indexes`: for every object whose `Schema` (defaulting to
+  `"public"` when empty, matching `qualifiedKey`'s own default) matches the
+  old schema, update `Schema` and re-key via `qualifiedKey()`.
+- Investigated whether `userCollations`/`userConversions` need the same
+  treatment: both structs reference their schema via `NamespaceOID`
+  (resolved once at CREATE time from the schema's OID), not a `Schema`
+  string field re-derived by name — the same OID-indirection real
+  PostgreSQL's `pg_namespace` uses. Since `RenameSchema` keeps a schema's
+  OID stable (only the `schemas` map's name→OID entry is re-keyed), any
+  pre-existing `NamespaceOID` reference is automatically still valid after
+  the rename. No cascade needed, confirmed by reading both struct
+  definitions (`internal/catalog/catalog.go`) rather than assumed.
+- Still unaudited: any schema-qualified function/type/domain registry
+  reached via a `LookupTable`-style schema-name key (none were found while
+  scoping this loop, but the catalog was not exhaustively grepped for every
+  possible schema-name-keyed map).
+
+Test: `TestAlterSchemaRenameCascadesOpClassAndStatistics`
+(`internal/executor/alter_schema_test.go`) — registers an operator class
+and an extended-statistics object inside a schema, renames the schema, and
+asserts the opclass's tracked schema follows the rename
+(`OpClassesInSchema`) and the statistics object re-keys to the new
+schema-qualified name (`LookupStatistics("s2.stat1")` succeeds,
+`LookupStatistics("s1.stat1")` no longer does).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/...` PASS (full, no regressions); `TestPort_
+PgDumpConnectionSetup` PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench
+smoke = pre-commit hook. No new deferral for the two registries fixed this
+loop; the "any other schema-qualified registry" caveat above remains open
+but is not newly discovered — it restates the prior row's own residual
+uncertainty.
+
+## Follow-up: `ALTER TABLE ... OWNER TO` (and the ALTER SEQUENCE/VIEW forms sharing its code path) now reject an unknown role (loop #107)
+
+Closes a standing ledger row: unlike every sibling OWNER TO site (`ALTER
+SCHEMA`, `ALTER STATISTICS`, `ALTER COLLATION`, `ALTER AGGREGATE`, `ALTER
+PUBLICATION`/`SUBSCRIPTION`, `ALTER EVENT TRIGGER` — all of which resolve
+the target role via `catalog.InMemory.RoleOID` and raise `42704 role "..."
+does not exist` for an unknown one, mirroring real PostgreSQL's
+`AlterTableOwner`/`get_role_oid(false)` in
+`postgres/src/backend/commands/tablecmds.c`), `execAlterTable`
+(`internal/executor/operators_ddl.go`, the `s.OwnerTo != ""` branch) wrote
+`tbl.Owner = s.OwnerTo` unconditionally — an `ALTER TABLE t OWNER TO
+typo_role` silently "succeeded" and left the table permanently owned by a
+nonexistent role.
+
+- Fix: the same `im.RoleOID(s.OwnerTo)` existence check (skipped only for
+  the `CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` sentinel, which maps to
+  the empty-string bootstrap-superuser convention) now gates the
+  assignment; the returned OID itself is discarded since `catalog.Table.Owner`
+  stores the role **name**, not an OID (unlike e.g.
+  `catalog.Publication.Owner`), so only the `found` bool is used.
+  `ALTER TABLE`/`ALTER SEQUENCE`/`ALTER VIEW` OWNER TO all route through
+  this one `execAlterTable` function (per the DU-002 slice 439/440 design
+  notes above), so the fix and its role-existence enforcement apply to all
+  three relation kinds at once — not a table-only fix.
+- The two pre-existing tests that exercised this path with an unregistered
+  role name (`TestAlterSequenceOwnerTo`, `TestAlterViewOwnerTo`, both
+  `OWNER TO alice` with no prior `CREATE ROLE alice`) now register the role
+  first (`cat.(*catalog.InMemory).RegisterRole("alice")`) since they
+  currently exercise the newly-enforced path; this is a same-loop
+  necessary correction, not a scope-creep change to unrelated behavior.
+
+New: `internal/executor/operators_alter_table_owner_test.go` —
+`TestAlterTableOwnerTo` (success with registered role),
+`TestAlterTableOwnerToCurrentUser` (sentinel unaffected), and
+`TestAlterTableOwnerToUnknownRoleErrors` (the actual regression guard:
+confirms 42704 and that `tbl.Owner` is left unchanged rather than set to
+the bogus name).
+
+Gates: `go build ./...` clean; `go vet ./internal/executor/...` clean;
+`go test ./internal/executor/...` PASS (full, incl. `-race`); `go test
+./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33); pgbench smoke = pre-commit hook; `make ralph-state-guard` OK.
+No new deferral — this closes the ledger row in full for all three
+relation kinds sharing the code path.
+
+## Follow-up: reloptions never survived a restart (M0119-0004, this loop)
+
+Closes the deferred item named in the "plain CREATE VIEW restart persistence"
+follow-up above: "view `reloptions` (CheckOption/SecurityBarrier/
+SecurityInvoker) still don't round-trip through the heap-persisted pg_class
+row (`buildUserPGClassRow` hardcodes `reloptions="{}"` unconditionally —
+pre-existing, not view-specific)." The bug was general, not view-only: any
+table's `fillfactor`/`autovacuum_*`/etc. storage parameter set via `WITH
+(...)` or `ALTER TABLE ... SET (...)` also silently reverted to its default
+across every goopg restart, because `buildUserPGClassRow`
+(`internal/executor/pg18_user_catalog_rows.go`) — the row writer feeding the
+heap-persisted pg_class tuple, as opposed to `registerSystemTables`'s
+`VirtualRows` closure in `internal/catalog/catalog.go` that serves the live
+in-memory catalog — hardcoded the reloptions column to `"{}"` no matter what
+the table actually carried.
+
+Three separate, compounding gaps had to be fixed, in this order:
+
+1. **Duplicated builder logic.** The ~100-line reloptions-list-building
+   block (fillfactor, the 20-odd `autovacuum_*` settings,
+   `vacuum_index_cleanup`, and for views `security_barrier`/
+   `security_invoker`/`check_option`) lived only inline inside
+   `registerSystemTables`'s closure. Extracted to
+   `catalog.TableReloptionsElements(t *Table) []string` (the raw
+   `"key=value"` element list) with `catalog.BuildTableReloptions(t) string`
+   as a thin wrapper that joins via the existing `arrayTextLiteral`. Both the
+   live virtual pg_class row and `buildUserPGClassRow` now call the same
+   function, closing the sibling-path-drift risk
+   ([[pattern_sibling_paths_must_agree]]) that let `buildUserPGClassRow` fall
+   out of sync in the first place.
+
+2. **The write side silently discarded non-empty content.**
+   `pgClassColumnsPG18()` declares `reloptions` as the literal type name
+   `"text[]"` (matching `aclitem[]`/`pg_node_tree` — these are catalog-only
+   type-name conventions, distinct from a user column's `Type.IsArray` flag;
+   see [[goopg_array_column_isarray_codec]] for that separate mechanism).
+   `encodeValuePG`'s `"text[]"` case was written only for pre-built
+   `KindBytes` ArrayType blobs (the existing `proargnames`/`proconfig`
+   pattern, M0106-0010 Step 3dk) — for any other Datum kind (e.g. the
+   `NewStringDatum` this loop first tried) it silently substitutes
+   `emptyArrayTypeBytes(25)`, an empty array, discarding the content
+   entirely. This is why the bug was invisible before: `reloptions` was
+   always the empty string, so writing an empty array "by accident" looked
+   correct. `buildUserPGClassRow` now builds a real ArrayType blob via the
+   existing `pgTextArrayBytes(elements []string) []byte` helper and passes it
+   through `NewBytesDatum` (the same pattern already used for
+   `attacl`/`typacl`/`indkey`/`stavalues`).
+
+3. **The read side had no decoder for a populated `text[]` physical column.**
+   `internal/executor/codec.go`'s `decodePhysicalPGValueMctx` had no case for
+   `"text[]"`/`"_text"` at all — it fell to the generic `default` varlena
+   branch, which strips only the outer `vl_len_` header and returns the
+   *raw* ArrayType bytes (ndim/dataoffset/elemtype/dims/lbound + encoded
+   elements) as if they were plain text. Harmless while the array was always
+   empty (paired with `NullDatum` upstream, so this branch never even ran on
+   `reloptions` before); actively wrong once (2) started emitting real
+   content — `loadUserTablesFromHeap` would decode garbage bytes instead of
+   `"{fillfactor=70}"`. Added `decodePGTextArrayElements` (mirrors
+   `pgTextArrayBytes`'s exact element encoding: 4-byte length-prefixed,
+   4-byte-aligned; treats a 12-byte payload — no dims/lbound — as the empty
+   form `emptyArrayTypeBytes` produces) plus a `"text[]"`/`"_text"` case in
+   `decodePhysicalPGValueMctx` that joins the decoded elements back into the
+   `"{elem,elem,…}"` external-literal form via the newly-exported
+   `catalog.ArrayTextLiteral`, so the decoded value is
+   byte-for-format-identical with what `BuildTableReloptions` would have
+   produced live. This decoder is intentionally narrow — it round-trips only
+   goopg's own emitted content (no general PG array-literal escaping) — the
+   same scope discipline `ApplyTableReloptions` below documents.
+
+Finally, `catalog.ApplyTableReloptions(t *Table, text string)` — the mirror
+image of `TableReloptionsElements`, parsing a `"{k=v,k2=v2}"` literal back
+into the individual `Table` fields (`Fillfactor`, every `*Set`-guarded
+autovacuum field, `SecurityBarrier(Set)`/`SecurityInvoker(Set)`/
+`CheckOption`) — is wired into `loadUserTablesFromHeap`
+(`internal/initdb/open.go`) Pass 3, right before `TryRegisterUserTable`.
+Getting the reloptions column onto the heap correctly (points 1–3 above) was
+necessary but insufficient on its own: without this last step the value was
+decoded and then simply discarded, so the restored in-memory `Table` still
+reverted to defaults. Decoding requires the *full* 34-column PG18 schema
+(reloptions is attnum 33, past the fixed-offset prefix
+`catalog.DecodePGClassPhysicalRow` covers) via the already-existing general
+PG-tuple decoder `executor.DecodeRowIntoMctxPGTuple`; newly exported
+`executor.PGClassColumnsPG18()` supplies that schema to `initdb`, which
+already imports `executor` for other catalog-recovery paths.
+
+Tests: `internal/executor/pg18_user_catalog_rows_test.go` —
+`TestBuildUserPGClassRowReloptionsSurvivesHeapEncode` round-trips a plain
+table (NULL), a `fillfactor` table, and a `security_barrier`+`check_option`
+view through the real `EncodeRowPG` → `DecodeRowIntoMctxPGTuple` path (not
+just the pre-encode Datum, which would have missed gap 2/3 above).
+`internal/initdb/view_ddl_recovery_test.go` —
+`TestTableAndViewReloptionsSurviveRestart` is the full end-to-end
+Init/Open/DDL/Close/Open regression: a `WITH (fillfactor=70)` table and a
+`WITH LOCAL CHECK OPTION` view both keep their settings after a real restart.
+
+Scope note: `TableReloptionsElements`/`ApplyTableReloptions` cover every
+field `BuildTableReloptions` already produced before this loop. Two
+still-open, narrower gaps (unaffected by this fix, tracked separately in the
+ledger): `toast.*` reloptions (attach to the TOAST relation's own separate
+pg_class row, never part of the owning table's `reloptions` column) and
+index reloptions (`buildUserPGClassRowForIndex` still hardcodes `"{}"` —
+indexes support `fillfactor` too but were out of scope here, which targeted
+the table/view gap the ledger row named).
+
+Gates: `go build ./...` / `go vet ./...` clean; `go test
+./internal/catalog/...` PASS; `go test ./internal/executor/...` (full
+package) PASS; `go test ./internal/initdb/...` (full package) PASS;
+`make ralph-state-guard` OK; pgbench smoke = pre-commit hook.
+
+## Follow-up: index reloptions never survived a restart either (M0119-0004, later loop)
+
+Closes the "index reloptions" item the "reloptions never survived a restart"
+follow-up above left explicitly out of scope: `buildUserPGClassRowForIndex`
+(`internal/executor/pg18_user_catalog_rows.go`) still hardcoded the index's
+own pg_class `reloptions` column to `"{}"` unconditionally, so `CREATE INDEX
+... WITH (fillfactor=N)` (and GIN's `fastupdate`/`gin_pending_list_limit`,
+BRIN's `pages_per_range`/`autosummarize`, btree's `deduplicate_items`) all
+silently reverted to defaults across a restart, mirroring the table/view bug
+above but for the sibling index-row builder.
+
+Mechanically this reused the same three-part fix (element-list builder +
+ArrayType-blob encode + decode/apply), extended by symmetry to indexes:
+`catalog.IndexReloptionsElements`/`BuildIndexReloptions`/
+`ApplyIndexReloptions` (`internal/catalog/catalog.go`) mirror the table
+versions exactly, built on top of the pre-existing (previously unexported)
+`idx.reloptionList()` the live virtual pg_class row already used — no new
+element-list logic needed, unlike the table case. The live virtual pg_class
+index row (`registerSystemTables`'s index branch) was refactored to call
+`BuildIndexReloptions` instead of its own inline copy of the same
+"key=value" join, closing a small duplication the table fix had already
+flagged as a risk ([[pattern_sibling_paths_must_agree]]).
+
+That alone was not sufficient — a real Init/Open/CREATE INDEX/Close/Open
+repro (mirroring `TestTableAndViewReloptionsSurviveRestart`) kept failing
+after the encode/decode plumbing was wired up, and root-causing why surfaced
+**two further, independent bugs**, both fixed in this loop:
+
+1. **Ordering bug: `createBTreeIndex` syncs the heap row before the
+   WITH-clause fields exist on `idx`.** The plain `CREATE INDEX` statement
+   handler calls `o.createBTreeIndex(...)` first, which internally calls
+   `syncIndexToCatalogHeap` (writing the pg_class/pg_index heap rows) as its
+   last step *before returning* — but the caller only copies
+   `s.Fillfactor`/`s.DeduplicateItems`/etc. onto the just-created `idx`
+   *after* `createBTreeIndex` returns (needed because `createBTreeIndex` is
+   shared by 14+ call sites, most of which have no WITH-clause options to
+   thread through its signature). So the very first heap-persisted pg_class
+   row for every btree index always captured a zero-value reloptions state,
+   even though the live in-memory `idx` (and therefore the live virtual
+   pg_class row, which reads `idx` directly) showed the WITH-clause values
+   correctly right up until the next restart. Fixed by adding
+   `resyncIndexClassHeapRow` (`internal/executor/operators_ddl.go`) — sibling
+   of the pre-existing `resyncIndexHeapRow` (which does the identical
+   stamp-old-row-then-rewrite pattern for pg_index, used elsewhere for
+   post-creation replica-identity/clustering flag changes) — and calling
+   both right after the WITH-clause field-setting block. Calling
+   `resyncIndexHeapRep` too (not just the new pg_class resync) was a small
+   deliberate scope extension: `idx.NullsNotDistinct`/`HasPredicate`/
+   `ColOpClasses`/`ColCollations` are set in that exact same block and suffer
+   the identical staleness bug on pg_index, and the fix was a zero-new-logic
+   reuse of an already-tested function directly adjacent to the code being
+   changed ([[pattern_sibling_paths_must_agree]]) — fixing only the
+   reloptions half while leaving this obviously-identical sibling bug in
+   place would have been a false economy.
+
+2. **`pg_index` was never mirrored to `PostgresDBOid`.**
+   `mirrorTouchedCatalogsToPostgresDB`
+   (`internal/executor/sys_catalog_postgres_db_mirror.go`) — which
+   `syncIndexToCatalogHeap`/`resyncIndexHeapRow`/`resyncIndexClassHeapRow`
+   all call at the end to propagate a catalog write from `DefaultDBOid` (1)
+   to `PostgresDBOid` (5, the "postgres" database PG clients actually
+   connect to) — mirrored `pg_class`/`pg_attribute` and their two secondary
+   btree indexes, but never `catalog.IndexRelationId` (2610, pg_index)
+   itself. Since a real running goopg server's catalog `DBOID()` is set at
+   startup to whatever OID the bootstrap "postgres" `pg_database` row uses
+   (`detectCatalogDBOID`, almost always 5, not the `DefaultDBOid`=1 every
+   sync function actually writes to), `loadUserIndexesFromHeap`'s Pass 2
+   heap scan — which reads from `cat.DBOID()` — has **never** found a live
+   `pg_index` row for any user-created index, in any goopg deployment,
+   since M0113 introduced heap-scan index recovery: every restart's index
+   recovery silently fell through entirely to the WAL-replay path
+   (`replayIndexDDLRecords`) instead. This was invisible because WAL replay
+   independently reconstructs the column list/unique/primary flags well
+   enough for ordinary use — but it carries none of the storage-parameter or
+   predicate/opclass/collation/nulls-not-distinct fields the CREATE INDEX WAL
+   record doesn't encode, so those were silently lost on *every* restart
+   regardless of this loop's reloptions fix. Fixed by adding
+   `catalog.IndexRelationId` to `mirroredOIDs`.
+
+**A third bug was found, and this one WAS fixed in this loop** (not deferred
+— it broke a pre-existing, previously-green test the moment bug 2's fix made
+heap-scan index recovery actually run): fixing bug 2 above exposed that an
+**unqualified** `CREATE INDEX name ON tbl (...)` (no explicit schema) ends up
+registered under **two different catalog map keys** after a restart —
+heap-scan recovery (`loadUserIndexesFromHeap` Pass 3) resolves and registers
+under the index's real schema (`"public.name"`), while WAL-replay recovery
+(`replayIndexDDLRecords` → `RegisterIndexDuringRecovery`) registers under the
+raw, unqualified `idxName.Schema` captured verbatim from the original DDL
+statement (bare `"name"`) — these are different `catalog.InMemory.indexes`
+map keys, so two independent `*Index` objects existed for the same physical
+index post-restart. `RegisterIndexDuringRecovery`'s dup-check and
+`UnregisterIndexDuringRecovery`'s lookup both did a bare `key(...)` map probe
+instead of the "" vs "public." collision-aware resolution `lookupIndexLocked`
+already implements for reads (and `RenameIndexDuringRecovery` already reused
+for writes) — so an `ALTER INDEX ... RENAME`/`DROP INDEX` replayed from WAL
+against an unqualified name could hit the *wrong* one of the two duplicate
+keys and silently no-op, observed concretely as
+`TestRenameIndexSurvivesRestartViaWAL` failing with "old index name
+resurrected after restart" once heap-scan recovery started actually
+registering indexes. Fixed by switching both functions to
+`lookupIndexLocked`, the same one-line-pattern fix `RenameIndexDuringRecovery`
+already demonstrated — no new resolution logic, just consistent reuse
+([[pattern_sibling_paths_must_agree]]).
+
+Tests: `internal/executor/pg18_user_catalog_rows_test.go` —
+`TestBuildUserPGClassRowForIndexReloptionsSurvivesHeapEncode` (sibling of the
+table version, same `EncodeRowPG`→`DecodeRowIntoMctxPGTuple` round-trip
+discipline). `internal/initdb/view_ddl_recovery_test.go` —
+`TestIndexReloptionsSurviveRestart`, the full Init/Open/DDL/Close/Open
+regression pinning `WITH (fillfactor=60)` surviving a real restart (looked up
+via a schema-qualified name — an unqualified lookup would still work now
+that the dual-registration bug is fixed, but qualifying makes the test
+assert the specific heap-scan-recovered object regardless). Re-verified
+green: `TestRenameIndexSurvivesRestartViaWAL`,
+`TestCreateIndexRecoveredOIDDoesNotCollide` (both pre-existing, full
+`internal/initdb` package run).
+
+Scope note: partition-child indexes are NOT covered by this fix —
+`createPartitionChildIndexes` never copies the parent's WITH-clause fields
+onto `childIdx` at all (a pre-existing, separate gap, recorded in the
+ledger, not touched here).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/initdb/...` (full packages) PASS,
+including the two new tests above; `make ralph-state-guard` OK; pgbench
+smoke = pre-commit hook.
+
+## Follow-up: partition-child index reloptions (M0119-0004, later loop)
+
+Closes the "Scope note" gap left open directly above:
+`createPartitionChildIndexes` (`internal/executor/operators_ddl.go`) copied
+`HasPredicate`/`Predicate`/`IncludeColumns`/expression-column strings onto
+each auto-created partition-child index, but never the WITH-clause storage
+parameters (`Fillfactor`/`DeduplicateItems`/`FastUpdate`/
+`GinPendingListLimit`/`PagesPerRange`/`AutoSummarize`) — so `CREATE INDEX ...
+WITH (fillfactor=N)` on a partitioned parent silently dropped the option on
+every partition child, in memory and therefore across a restart too (the
+child index's own heap row was never resynced either).
+
+Fix mirrors the parent-index WITH-clause block exactly: copy the six fields
+from `s` (the original `CreateIndexStmt`) onto `childIdx`, then call the
+pre-existing `resyncIndexClassHeapRow` when heap sync is available (the same
+function the parent-index fix above introduced). Since
+`createPartitionChildIndexes` recurses using the same top-level `s` for
+multi-level partition trees, a single WITH-clause application at the level
+`CREATE INDEX` is actually run at now propagates correctly to every
+descendant level, not just the immediate children.
+
+Considered and ruled out of scope: `ALTER INDEX parent ATTACH PARTITION
+child` (`internal/executor/operators_ddl.go`,
+`parser.AlterIndexAttachPartition` case) needs no equivalent fix — both
+indexes there are created independently via their own separate `CREATE
+INDEX` statements (each already carrying its own WITH-clause options via the
+main path above) before being attached, so there is no "inherit from parent"
+step to patch.
+
+Tests: `internal/executor/partition_create_index_recurse_test.go` —
+`TestCreateIndexRecursesPartitionTreeCarriesReloptions` (in-memory catalog
+copy, single partition level). `internal/initdb/view_ddl_recovery_test.go` —
+`TestPartitionChildIndexReloptionsSurviveRestart` (full Init/Open/DDL/
+Close/Open restart regression, sibling of `TestIndexReloptionsSurviveRestart`
+above).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/initdb/...` (full packages, `-count=1`)
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, after one transient
+failure/hang caused by a concurrently-running peer ralph loop's own
+build+test load — reproduced clean on retry, unrelated to this change:
+[[concurrent_ralph_loops_corrupt_tree]]); `make ralph-state-guard` OK.

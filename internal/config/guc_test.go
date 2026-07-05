@@ -265,6 +265,50 @@ func TestReportableVariablesSeedPlausibleSet(t *testing.T) {
 	}
 }
 
+// TestExplainVariablesEmptyByDefault: a freshly built registry has no
+// modified GUCs, so EXPLAIN (SETTINGS) has nothing to report — mirrors
+// upstream's get_explain_guc_options returning zero entries at server
+// startup before any SET.
+func TestExplainVariablesEmptyByDefault(t *testing.T) {
+	r := BuildDefaultRegistry()
+	sess := NewSessionRegistry(r)
+	if got := sess.ExplainVariables(); len(got) != 0 {
+		t.Fatalf("ExplainVariables() = %v, want empty", got)
+	}
+}
+
+// TestExplainVariablesReportsModifiedPlannerGUC: SET enable_seqscan = off
+// (a FlagExplain GUC) surfaces in ExplainVariables once it diverges from
+// its BootVal; an unmodified FlagExplain GUC (work_mem) and a modified
+// non-FlagExplain GUC (client_encoding) must not appear.
+func TestExplainVariablesReportsModifiedPlannerGUC(t *testing.T) {
+	r := BuildDefaultRegistry()
+	sess := NewSessionRegistry(r)
+	if err := sess.Set("enable_seqscan", "off", false); err != nil {
+		t.Fatalf("Set enable_seqscan: %v", err)
+	}
+	if err := sess.Set("client_encoding", "SQL_ASCII", false); err != nil {
+		t.Fatalf("Set client_encoding: %v", err)
+	}
+
+	got := sess.ExplainVariables()
+	var found *ReportableValue
+	for i := range got {
+		if got[i].Name == "enable_seqscan" {
+			found = &got[i]
+		}
+		if got[i].Name == "client_encoding" {
+			t.Errorf("client_encoding (not FlagExplain) leaked into ExplainVariables: %+v", got[i])
+		}
+		if got[i].Name == "work_mem" {
+			t.Errorf("unmodified work_mem leaked into ExplainVariables: %+v", got[i])
+		}
+	}
+	if found == nil || found.Value != "off" {
+		t.Fatalf("ExplainVariables() = %v, want enable_seqscan = off", got)
+	}
+}
+
 // TestCheckpointGUCDefaults pins the M0002 GUCs added to the
 // default registry. Names, units, ranges, and defaults must match
 // upstream's postgres/src/backend/utils/misc/guc_tables.c.

@@ -470,6 +470,8 @@ type ExplainFormat int
 const (
 	ExplainFormatText ExplainFormat = iota
 	ExplainFormatJSON
+	ExplainFormatXML
+	ExplainFormatYAML
 )
 
 // ExplainOptions carries the parsed EXPLAIN options (M0018-0001).
@@ -883,6 +885,46 @@ type SelectStmt struct {
 	// in FROM, e.g. `FROM (VALUES ...) t(col)`). When set, Targets
 	// and From are empty. M0097-0003.
 	ValuesRows [][]Expr
+	// WindowClause holds the named window definitions from a trailing
+	// `WINDOW name AS (...), ...` clause (M0020 named-window slice).
+	// Referenced from a FuncCall's `OVER name` tail via WindowDef.RefName;
+	// the analyzer resolves the reference by copying the matching
+	// definition's PartitionBy/OrderBy into the referencing WindowDef.
+	WindowClause []NamedWindowDef
+	// GroupingSets is non-nil when the GROUP BY clause used GROUPING
+	// SETS / ROLLUP / CUBE. GroupBy still holds the flattened union of
+	// every expression referenced by any generated set (so pre-existing
+	// consumers — analyzer resolution, FOR UPDATE's "not allowed with
+	// GROUP BY" check, positional GROUP BY — keep working unmodified);
+	// GroupingSets carries the actual expanded set list the planner
+	// rewrites into a UNION ALL of plain-GROUP-BY branches. M0122-0004.
+	GroupingSets *GroupingSetsSpec
+}
+
+// GroupingSetsSpec is the fully expanded form of a GROUP BY clause that
+// used GROUPING SETS / ROLLUP / CUBE. SQL:1999 §7.9 defines the result of
+// such a clause as equivalent to grouping by each listed set independently
+// and taking the UNION ALL of the results — which is exactly how the
+// planner executes it (see rewriteGroupingSets in internal/planner).
+type GroupingSetsSpec struct {
+	pos int
+	// Sets holds one entry per generated grouping set: the list of
+	// original GROUP BY expressions active in that set. ROLLUP(a,b,c)
+	// expands to the n+1 prefixes {a,b,c},{a,b},{a},{}; CUBE(a,b,c)
+	// expands to all 2^n subsets; an explicit GROUPING SETS(...) list is
+	// taken verbatim. Multiple comma-separated grouping elements (plain
+	// columns and/or constructs) combine via cross product, e.g.
+	// `GROUP BY a, ROLLUP(b, c)` = {a} x {[b,c],[b],[]}.
+	Sets [][]Expr
+}
+
+func (g *GroupingSetsSpec) Pos() int { return g.pos }
+
+// NamedWindowDef is one `name AS (window_definition)` item from a
+// SELECT statement's WINDOW clause.
+type NamedWindowDef struct {
+	Name string
+	Def  *WindowDef
 }
 
 func (s *SelectStmt) Pos() int  { return s.pos }
@@ -2098,6 +2140,19 @@ type CompatNoopStmt struct {
 	// Empty when the clause is absent. DU-002 slice 381.
 	ServerType    string
 	ServerVersion string
+	// FDWHandlerFunc / FDWValidatorFunc carry the possibly-schema-qualified
+	// function name from a `[CREATE|ALTER] FOREIGN DATA WRAPPER name [HANDLER
+	// f|NO HANDLER] [VALIDATOR f|NO VALIDATOR] ...` clause (Tag ==
+	// "CREATE FOREIGN DATA WRAPPER" or "ALTER FOREIGN DATA WRAPPER"). Nil means
+	// the clause named no function (`NO HANDLER`/`NO VALIDATOR`, or CREATE's
+	// default when the clause is absent entirely). The paired *Given flag
+	// disambiguates, for ALTER only, "clause absent → leave unchanged" (Given
+	// false) from "NO HANDLER/NO VALIDATOR → clear it" (Given true, Func nil);
+	// CREATE has no "unchanged" state so it ignores *Given. DU-002 (M0119-0004).
+	FDWHandlerFunc    *ObjectName
+	FDWHandlerGiven   bool
+	FDWValidatorFunc  *ObjectName
+	FDWValidatorGiven bool
 	// CastContext / CastMethod carry a CREATE CAST statement's pg_cast.castcontext
 	// and castmethod. Context is "e" explicit (default), "a" assignment, "i"
 	// implicit. Method is "b" binary (WITHOUT FUNCTION), "i" INOUT (WITH INOUT),
@@ -2412,6 +2467,27 @@ type AlterStatisticsStmt struct {
 
 func (s *AlterStatisticsStmt) Pos() int  { return s.pos }
 func (s *AlterStatisticsStmt) stmtNode() {}
+
+// AlterSchemaStmt represents `ALTER SCHEMA name RENAME TO newname` and
+// `ALTER SCHEMA name OWNER TO {new_owner | CURRENT_ROLE | CURRENT_USER |
+// SESSION_USER}` — the only two forms real PostgreSQL's grammar defines for
+// ALTER SCHEMA (schemacmds.c's RenameSchema / AlterSchemaOwner). Previously
+// goopg had no dedicated case at all: ALTER SCHEMA fell into the blanket
+// "schema/view/collation/..." compat-stub loop in parseAlter, which silently
+// consumed and discarded both forms — a functional no-op, not merely a
+// mistagging bug, the same class of gap ALTER VIEW had before DU-002 slice
+// 440. DU-002 slice 440 resume point (3) (M0110-0001).
+type AlterSchemaStmt struct {
+	pos  int
+	Name string // schema name (never qualified — schemas aren't nested)
+	// Action selects the form: "rename" | "owner".
+	Action   string
+	NewName  string // for Action == "rename"
+	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER TABLE
+}
+
+func (s *AlterSchemaStmt) Pos() int  { return s.pos }
+func (s *AlterSchemaStmt) stmtNode() {}
 
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
@@ -3295,6 +3371,11 @@ type AlterTypeStmt struct {
 	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
 	RenameNewValue string // RENAME VALUE: replacement label
 	RenameTo       string // RENAME TO: new type name (M0097-enum-rename)
+	// NewOwner holds the target role name for ALTER TYPE ... OWNER TO role
+	// (empty when not an OWNER TO statement). "current_user" is the sentinel
+	// for CURRENT_USER/SESSION_USER/CURRENT_ROLE, mirroring
+	// AlterCollationStmt.NewOwner. M0122-0005 (m0097-0017 follow-up).
+	NewOwner string
 	// ADD ATTRIBUTE col_name type — appends a field to a composite type.
 	// DU-002 slice 253.
 	AddAttrName string // new composite-type attribute name (empty when not ADD ATTRIBUTE)

@@ -262,11 +262,16 @@ func TestPort_PgWalsummary001Basic(t *testing.T) {
 // Adapted sub-cases (pass in v0):
 //   - cluster init (without summarize_wal = on — goopg rejects unknown GUCs at startup)
 //   - CREATE TABLE, INSERT rows, VACUUM, CHECKPOINT
+//   - pg_stat_io walsummarizer backend_type rows: verified against a real
+//     PostgreSQL 18.3 instance (M0122-0003) that pg_stat_io's row *shape* is
+//     unconditional on the BackendType enum (pgstat_tracks_io_bktype), not on
+//     whether that process ever ran — a fresh cluster with summarize_wal left
+//     at its default (off) still reports 2 all-zero walsummarizer rows
+//     (object='wal', context in ('init','normal')). goopg mirrors that shape.
 //
 // Deferred (requires WAL summarization not yet implemented in goopg v0):
 //   - summarize_wal GUC
 //   - pg_available_wal_summaries() built-in function
-//   - pg_stat_io walsummarizer backend_type rows
 //   - pg_walsummary -i <summary-file> block-level output
 //
 // Remove the t.Skip call and implement the full test once goopg supports
@@ -321,14 +326,16 @@ func TestPort_PgWalsummary002Blocks(t *testing.T) {
 		t.Errorf("pg_available_wal_summaries: want 0 rows, got %v", rows)
 	}
 
-	// pg_stat_io has no walsummarizer rows when summarize_wal = off.
+	// pg_stat_io reports 2 all-zero walsummarizer rows (wal/init, wal/normal)
+	// even with summarize_wal = off — the row shape is unconditional on the
+	// BackendType, only the counts stay zero because the process never ran.
 	rows2, err := c.Query(context.Background(),
 		`SELECT count(*) FROM pg_stat_io WHERE backend_type = 'walsummarizer'`)
 	if err != nil {
 		t.Fatalf("pg_stat_io walsummarizer query: %v", err)
 	}
-	if len(rows2) == 0 || rows2[0][0] != "0" {
-		t.Errorf("pg_stat_io walsummarizer rows: want 0, got %v", rows2)
+	if len(rows2) == 0 || rows2[0][0] != "2" {
+		t.Errorf("pg_stat_io walsummarizer rows: want 2, got %v", rows2)
 	}
 
 	// pg_walsummary -i <file> deferred: no WAL summary files exist when

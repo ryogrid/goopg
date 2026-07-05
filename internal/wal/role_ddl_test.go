@@ -18,6 +18,13 @@ func TestEncodeDecodeRoleStateRoundTrip(t *testing.T) {
 			CredType: 1, Secret: "パスワード'with quote"},
 		// OID 0 (unknown at emit time) round-trips as 0.
 		{Name: "noid", OID: 0, CanLogin: true},
+		// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit/ValidUntil
+		// (DU-002 slice 439 follow-up) — including a negative ConnLimit,
+		// which PG treats as a legitimate "no limit" override distinct from
+		// the Go zero value.
+		{Name: "attrsuser", OID: 20001, CanLogin: true, CreateDB: true, CreateRole: true,
+			Replication: true, BypassRLS: true, ConnLimit: -1,
+			ValidUntil: "2030-01-01 00:00:00+00", CredType: 3, Secret: "SCRAM-SHA-256$x"},
 	}
 	for _, want := range cases {
 		got, err := DecodeRoleState(EncodeRoleState(want))

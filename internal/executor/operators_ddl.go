@@ -173,6 +173,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateStatistics(s)
 	case *parser.AlterStatisticsStmt:
 		return nil, o.execAlterStatistics(s)
+	case *parser.AlterSchemaStmt:
+		return nil, o.execAlterSchema(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -956,6 +958,51 @@ func resolveAccessMethodHandlerFunc(rs *catalog.Routines, funcName parser.Object
 		return r.OID, nil
 	}
 	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(internal) does not exist", funcName.String())}
+}
+
+// resolveFDWHandlerFunc mirrors foreigncmds.c's lookup_fdw_handler_func: a
+// `HANDLER f` clause on CREATE/ALTER FOREIGN DATA WRAPPER must name a niladic
+// routine ("handlers have no arguments", LookupFuncName(name, 0, NULL,
+// false)) whose return type is fdw_handler. Only user-defined (CREATE
+// FUNCTION) routines are resolved — goopg has no builtin FDW handler
+// functions (postgres_fdw/file_fdw are contrib extensions goopg does not
+// implement), so a real handler name like postgres_fdw_handler will not
+// resolve; deferred, not needed for the dump-fidelity round-trip this closes.
+func resolveFDWHandlerFunc(rs *catalog.Routines, funcName parser.ObjectName) (uint32, error) {
+	for _, r := range rs.LookupByName(funcName) {
+		if len(r.ArgTypes) != 0 {
+			continue
+		}
+		if !strings.EqualFold(r.ReturnType.Name, "fdw_handler") {
+			return 0, &ExecError{Code: "42809", Message: fmt.Sprintf("function %s must return type fdw_handler", funcName.String())}
+		}
+		return r.OID, nil
+	}
+	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s() does not exist", funcName.String())}
+}
+
+// resolveFDWValidatorFunc mirrors lookup_fdw_validator_func: a `VALIDATOR f`
+// clause must name a routine taking exactly (text[], oid)
+// (LookupFuncName(name, 2, {TEXTARRAYOID, OIDOID}, false)); the validator's
+// return type is never checked (its result is ignored).
+func resolveFDWValidatorFunc(rs *catalog.Routines, funcName parser.ObjectName) (uint32, error) {
+	for _, r := range rs.LookupByName(funcName) {
+		if len(r.ArgTypes) != 2 {
+			continue
+		}
+		// execCreateFunction stores an array arg's "[]" suffix folded into
+		// Name (e.g. "text[]"), NOT via the column-Type IsArray flag —
+		// mirrors that argTypes[i].Name construction (operators_ddl.go
+		// execCreateFunction), not catalog.Column's convention.
+		if !strings.EqualFold(r.ArgTypes[0].Name, "text[]") {
+			continue
+		}
+		if !strings.EqualFold(r.ArgTypes[1].Name, "oid") {
+			continue
+		}
+		return r.OID, nil
+	}
+	return 0, &ExecError{Code: "42883", Message: fmt.Sprintf("function %s(text[], oid) does not exist", funcName.String())}
 }
 
 // resolveEventTriggerFunc looks up a niladic (0-argument) function by name,
@@ -4598,8 +4645,17 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// (circular-view stack overflow). The view is removed only for the
 	// duration of planning, then re-inserted when we call CreateView below.
 	var planSchema planner.Schema
+	// CreateView below always assigns a fresh OID, even on OR REPLACE — the
+	// old view's pg_class/pg_attribute heap rows (if any) would otherwise
+	// linger under the stale OID and resurrect a duplicate registration for
+	// the same name after a restart. Capture it here (before the temporary
+	// DropView) so the heap-sync block below can stamp its xmax.
+	var oldViewOID uint32
 	if s.OrReplace {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			if existing, ok2 := im.LookupTable(s.Name); ok2 && existing.View != nil {
+				oldViewOID = existing.OID
+			}
 			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
 		}
 	}
@@ -4684,6 +4740,31 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 		if s.SecurityInvoker != nil {
 			vt.SecurityInvoker = *s.SecurityInvoker
 			vt.SecurityInvokerSet = true
+		}
+	}
+	// Restart persistence (M0119-0004 follow-up, sibling of
+	// execCreateMatView's own heap-sync call): a plain view previously had
+	// zero on-disk footprint — CREATE VIEW never called
+	// syncTableToCatalogHeap — so it ceased to exist after any restart.
+	// syncTableToCatalogHeap writes the pg_class/pg_attribute rows
+	// (relkind='v', buildUserPGClassRow) and the RecordKindCreateView WAL
+	// snapshot of the defining query (replayed by
+	// internal/initdb/view_ddl_recovery.go).
+	if vt != nil && catalogHeapSyncAvailable(o.ctx) {
+		if syncErr := syncTableToCatalogHeap(o.ctx, vt); syncErr != nil {
+			return fmt.Errorf("DDL catalog sync: %w", syncErr)
+		}
+		// CREATE OR REPLACE VIEW assigns a fresh OID (catalog.CreateView), so
+		// the old view's now-orphaned pg_class/pg_attribute rows must be
+		// stamped deleted — otherwise loadUserTablesFromHeap would register
+		// both the old and new OID under the same name after a restart.
+		if oldViewOID != 0 && oldViewOID != vt.OID {
+			if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
+				xmax := o.ctx.Tx.XID
+				for _, dbOid := range catalogDBOids(o.ctx) {
+					deleteCatalogRowsForOID(o.ctx, dbOid, oldViewOID, xmax)
+				}
+			}
 		}
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
@@ -4809,7 +4890,8 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	if ifExists && o.dropSchemaQualifiedNotice(name) {
 		return nil
 	}
-	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
+	tbl, ok := o.ctx.Catalog.LookupTable(name)
+	if !ok {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("view %q does not exist, skipping", name.String()))
 			return nil
@@ -4854,6 +4936,20 @@ func (o *ddlOp) execDropOneView(name parser.ObjectName, ifExists bool, behavior 
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		im.UnregisterViewConstraintDeps(name.String())
 	}
+	// Restart persistence (M0119-0004 follow-up): stamp xmax on the on-disk
+	// pg_class/pg_attribute rows this view's own CREATE VIEW wrote via
+	// syncTableToCatalogHeap. Without this, the in-memory drop is not
+	// reflected in the heap, and a subsequent restart would resurrect the
+	// dropped view via loadUserTablesFromHeap + replayViewRecords — mirrors
+	// dropTableByRefImmediate's identical DROP TABLE cleanup.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+	}
 	return nil
 }
 
@@ -4869,7 +4965,8 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 	if ifExists && o.dropSchemaQualifiedNotice(name) {
 		return nil
 	}
-	if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
+	tbl, ok := o.ctx.Catalog.LookupTable(name)
+	if !ok {
 		if ifExists {
 			o.ctx.AddNotice(fmt.Sprintf("materialized view %q does not exist, skipping", name.String()))
 			return nil
@@ -4922,6 +5019,40 @@ func (o *ddlOp) execDropOneMatView(name parser.ObjectName, ifExists bool, behavi
 			return nil
 		}
 		return &ExecError{Code: "42P01", Pos: pos, Message: err.Error()}
+	}
+	// Restart persistence: stamp xmax on the on-disk pg_class/pg_attribute
+	// rows this matview's own CREATE MATERIALIZED VIEW wrote via
+	// syncTableToCatalogHeap (M0119-0004's matview-persistence loop added the
+	// write side but never the drop-side cleanup — replayMatViewRecords's own
+	// "matview dropped since the snapshot" comment already anticipated this;
+	// it was simply never wired up). Without this, DROP MATERIALIZED VIEW
+	// followed by a restart resurrects the matview. Mirrors
+	// dropTableByRefImmediate / execDropOneView's identical cleanup.
+	if catalogHeapSyncAvailable(o.ctx) {
+		if xidErr := o.ctx.MaterializeWriterXID(); xidErr == nil {
+			xmax := o.ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(o.ctx) {
+				deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+			}
+		}
+	}
+	// Physical-storage cleanup: unlike DROP TABLE (dropTableByRefImmediate),
+	// DROP MATERIALIZED VIEW never released the matview's own heap file —
+	// it has real on-disk storage (populated by CREATE/REFRESH MATERIALIZED
+	// VIEW) despite living in the catalog's view-shaped Table entry. Without
+	// this the file leaks on every drop. DropRelation's os.IsNotExist guard
+	// makes this safe to call even for a never-materialized (WITH NO DATA)
+	// or restart-downgraded-to-virtual matview that has no backing file yet.
+	rel := o.ctx.Catalog.RelFileNode(tbl)
+	o.ctx.Pool.InvalidateRel(rel)
+	if err := o.ctx.Pool.Manager().DropRelation(rel); err != nil {
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if o.ctx.FSM != nil {
+		o.ctx.FSM.DropRelation(rel)
+	}
+	if o.ctx.VM != nil {
+		o.ctx.VM.DropRelation(rel)
 	}
 	return nil
 }
@@ -5866,6 +5997,19 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				}
 				idx.ColCollations = coll
 			}
+			// Flush the just-set fields (reloptions on pg_class, everything else
+			// on pg_index) to the heap-persisted catalog rows — createBTreeIndex's
+			// own sync ran before any of these fields existed on idx, so without
+			// this resync they all silently reverted to defaults across a restart
+			// (M0119-0004 index-reloptions follow-up).
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := resyncIndexClassHeapRow(o.ctx, idx); err != nil {
+					return err
+				}
+				if err := resyncIndexHeapRow(o.ctx, idx); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	// CREATE INDEX on a partitioned table recurses into every existing partition
@@ -5965,6 +6109,20 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 		for i, str := range parentIdx.ColExprStrings {
 			if str != "" && i < len(childIdx.ColExprStrings) {
 				childIdx.ColExprStrings[i] = str
+			}
+		}
+		// Carry the WITH-clause storage parameters too, so `CREATE INDEX ...
+		// WITH (fillfactor=N)` on a partitioned parent doesn't silently drop
+		// the option on every child (M0119-0004 index-reloptions follow-up).
+		childIdx.Fillfactor = s.Fillfactor
+		childIdx.DeduplicateItems = s.DeduplicateItems
+		childIdx.FastUpdate = s.FastUpdate
+		childIdx.GinPendingListLimit = s.GinPendingListLimit
+		childIdx.PagesPerRange = s.PagesPerRange
+		childIdx.AutoSummarize = s.AutoSummarize
+		if catalogHeapSyncAvailable(o.ctx) {
+			if err := resyncIndexClassHeapRow(o.ctx, childIdx); err != nil {
+				return err
 			}
 		}
 		// Intermediate partitioned partition: recurse into its own children,
@@ -6578,6 +6736,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		if strings.EqualFold(s.OwnerTo, "current_user") {
 			tbl.Owner = ""
 		} else {
+			// Mirror the role-existence check every other OWNER TO site already
+			// makes (schema/sequence/view/collation/statistics — see
+			// grep for "role %q does not exist" in this file); table owner is
+			// stored as a name not an OID here, so RoleOID's bool is only used
+			// for the existence check, not to replace tbl.Owner.
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				if _, found := im.RoleOID(s.OwnerTo); !found {
+					return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.OwnerTo)}
+				}
+			}
 			tbl.Owner = s.OwnerTo
 		}
 		return nil
@@ -10436,7 +10604,11 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 
 	// Snapshot pages before truncation for transactional rollback support.
-	if sess, isBas := o.ctx.Session.(*BasicSession); isBas && sess.InExplicitTransaction() {
+	// TracksDDLUndo() (not InExplicitTransaction()) so a message-scoped
+	// autocommit-batch throwaway session (NewAutocommitUndoSession) also
+	// records this for undo if a LATER statement in the same batch aborts —
+	// root-0024 residual (1), TRUNCATE half, M0110-0001.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas && sess.TracksDDLUndo() {
 		entry := TruncateUndoEntry{
 			Heap: snapshotRelPages(o.ctx, rel),
 		}
@@ -12247,6 +12419,43 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		}
 	}
 
+	// Materialized-view query persistence: pg_class.relkind='m' (set above by
+	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a matview, but
+	// the defining SELECT lives only in tbl.View (an in-memory AST) — goopg
+	// writes no pg_rewrite-equivalent heap rows, so it must be snapshotted as
+	// SQL text the same way M0079-0001's CREATE INDEX record is. Emitted from
+	// this single funnel keeps CREATE and any future ALTER MATERIALIZED VIEW
+	// ... RENAME/SET SCHEMA in sync automatically. Replay:
+	// internal/initdb/matview_ddl_recovery.go.
+	if ctx.Pool != nil && tbl.IsMatView && tbl.ViewDef != "" {
+		payload := wal.EncodeMatView(wal.MatViewPayload{
+			TableOID:    tbl.OID,
+			IsPopulated: tbl.IsPopulated,
+			Query:       tbl.ViewDef,
+		})
+		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
+			return fmt.Errorf("matview WAL record: %w", err)
+		}
+	}
+
+	// Plain-view query persistence (M0119-0004 follow-up, sibling of the
+	// matview record above): pg_class.relkind='v' (set above by
+	// buildUserPGClassRow) tells loadUserTablesFromHeap this is a plain view,
+	// but the defining SELECT lives only in tbl.View (an in-memory AST) — same
+	// gap as matviews, snapshotted as SQL text the same way. Emitted from this
+	// single funnel keeps CREATE VIEW and any future ALTER VIEW ...
+	// RENAME/SET SCHEMA in sync automatically. Replay:
+	// internal/initdb/view_ddl_recovery.go.
+	if ctx.Pool != nil && tbl.View != nil && !tbl.IsMatView && tbl.ViewDef != "" {
+		payload := wal.EncodeView(wal.ViewPayload{
+			TableOID: tbl.OID,
+			Query:    tbl.ViewDef,
+		})
+		if _, err := ctx.Pool.LogChangeRecord(payload); err != nil {
+			return fmt.Errorf("view WAL record: %w", err)
+		}
+	}
+
 	// Signal that this transaction wrote to nailed catalog relations (pg_class
 	// and pg_attribute). The xact-marker hook in open.go reads this flag at
 	// commit time to emit RecordKindXactCommitInval and unlink both
@@ -12321,6 +12530,58 @@ func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName str
 		}
 	}
 	return idx, nil
+}
+
+// resyncIndexClassHeapRow rewrites the pg_class HEAP row for a single index
+// from its current catalog.Index state (buildUserPGClassRowForIndex).
+// createBTreeIndex's initial syncIndexToCatalogHeap call (invoked from inside
+// createBTreeIndex, before the WITH-clause storage-parameter fields —
+// Fillfactor/DeduplicateItems/FastUpdate/GinPendingListLimit/PagesPerRange/
+// AutoSummarize — are copied onto idx by the CREATE INDEX caller) always saw
+// a zero-value idx, so the heap-persisted pg_class row's reloptions column
+// was silently empty/NULL: a plain `CREATE INDEX … WITH (fillfactor=N)`
+// round-tripped correctly through the live virtual pg_class row (which reads
+// idx directly) but reverted to no reloptions across a restart (M0119-0004
+// index-reloptions follow-up, sibling of resyncIndexHeapRow below which does
+// the same delete-old-row + rewrite pattern for pg_index).
+func resyncIndexClassHeapRow(ctx *Context, idx *catalog.Index) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range catalogDBOids(ctx) {
+			classRel := storage.RelFileNode{
+				DBOid:  dbOid,
+				RelOid: catalog.RelationRelationId,
+				Fork:   storage.MainFork,
+			}
+			stampCatalogRows(ctx, classRel, xmax, func(data []byte) bool {
+				row, derr := catalog.DecodePGClassPhysicalRow(data)
+				return derr == nil && row.OID == idx.OID
+			})
+		}
+	}
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
+	if err != nil {
+		return fmt.Errorf("pg_class reloptions resync for index: %w", err)
+	}
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
+	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
+		return fmt.Errorf("pg_class_oid_index resync for index: %w", err)
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, idx.Name, relnamespace, classTID); err != nil {
+		return fmt.Errorf("pg_class_relname_nsp_index resync for index: %w", err)
+	}
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
+	return nil
 }
 
 // resyncIndexHeapRow rewrites the pg_index HEAP row for a single index from its
@@ -14825,6 +15086,30 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(),
 				Message: fmt.Sprintf("foreign-data wrapper %q does not exist", fdwName)}
 		}
+		// HANDLER/VALIDATOR are resolved (and any 42883/42809 error raised)
+		// before the OPTIONS merge, mirroring foreigncmds.c's
+		// AlterForeignDataWrapper (parse_func_options runs before the
+		// def_list_append_merge OPTIONS pass). *Given false means the clause
+		// was absent — leave the existing OID unchanged; Given true with a nil
+		// Func means `NO HANDLER`/`NO VALIDATOR` — clear it.
+		if s.FDWHandlerGiven {
+			if s.FDWHandlerFunc == nil {
+				fdw.HandlerOID = 0
+			} else if oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc); rerr != nil {
+				return rerr
+			} else {
+				fdw.HandlerOID = oid
+			}
+		}
+		if s.FDWValidatorGiven {
+			if s.FDWValidatorFunc == nil {
+				fdw.ValidatorOID = 0
+			} else if oid, rerr := resolveFDWValidatorFunc(im.Routines(), *s.FDWValidatorFunc); rerr != nil {
+				return rerr
+			} else {
+				fdw.ValidatorOID = oid
+			}
+		}
 		merged, mergeErr := applyFDWOptionChanges(fdw.Options, s.FDWOptionChanges)
 		if mergeErr != nil {
 			return &ExecError{Code: mergeErr.code, Pos: s.Pos(), Message: mergeErr.message}
@@ -14852,8 +15137,28 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// repeated VirtualRows calls return the same identity. Options threads
 		// the OPTIONS (...) clause so fdwoptions round-trips
 		// (pg_foreign_data_wrapper.fdwoptions → dumpForeignDataWrapper).
-		// DU-002 slice 375 (options: slice 380).
-		im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+		// DU-002 slice 375 (options: slice 380). HandlerOID/ValidatorOID are
+		// resolved before registering (mirrors CreateForeignDataWrapper's
+		// parse_func_options running before the catalog insert) so a bad
+		// HANDLER/VALIDATOR name raises 42883/42809 without creating the FDW.
+		var handlerOID, validatorOID uint32
+		if s.FDWHandlerFunc != nil {
+			oid, rerr := resolveFDWHandlerFunc(im.Routines(), *s.FDWHandlerFunc)
+			if rerr != nil {
+				return rerr
+			}
+			handlerOID = oid
+		}
+		if s.FDWValidatorFunc != nil {
+			oid, rerr := resolveFDWValidatorFunc(im.Routines(), *s.FDWValidatorFunc)
+			if rerr != nil {
+				return rerr
+			}
+			validatorOID = oid
+		}
+		fdw := im.RegisterForeignDataWrapper(s.ObjName.String(), s.Options)
+		fdw.HandlerOID = handlerOID
+		fdw.ValidatorOID = validatorOID
 	case "user mapping":
 		// Register the user mapping (CREATE USER MAPPING FOR <user> SERVER <srv>)
 		// so it round-trips through pg_dump (pg_user_mappings virtual view →
@@ -16130,6 +16435,90 @@ func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
 	return nil
 }
 
+// execAlterSchema implements ALTER SCHEMA name RENAME TO / OWNER TO (DU-002
+// slice 440 resume point (3), M0110-0001). Unlike ALTER SEQUENCE/VIEW (slices
+// 439/440), a schema is not a relation, so it cannot be routed through
+// execAlterTable — it needs the dedicated catalog.RenameSchema/SetSchemaOwner
+// mechanism. RENAME cascades into every table/view/sequence/index whose
+// Schema names the old schema (goopg keys those catalogs by schema NAME, not
+// OID like real PostgreSQL's relnamespace) and, for any moved sequence,
+// mirrors the SET SCHEMA-on-single-sequence cascade in execAlterTable so
+// nextval()/currval() keep resolving under the sequence's new qualified name.
+func (o *ddlOp) execAlterSchema(s *parser.AlterSchemaStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	switch s.Action {
+	case "rename":
+		if !im.SchemaExists(s.Name) {
+			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
+		}
+		if im.SchemaExists(s.NewName) {
+			return &ExecError{Code: "42P06", Pos: s.Pos(), Message: fmt.Sprintf("schema %q already exists", s.NewName)}
+		}
+		moved, err := im.RenameSchema(s.Name, s.NewName)
+		if err != nil {
+			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaRename(s.Name, s.NewName)); werr != nil {
+				return fmt.Errorf("wal alter-schema-rename: %w", werr)
+			}
+		}
+		for _, tbl := range moved {
+			if !tbl.IsSequence {
+				continue
+			}
+			oldFull := s.Name + "." + tbl.Name
+			newFull := s.NewName + "." + tbl.Name
+			if RenameSequence(oldFull, newFull) || RenameSequence(tbl.Name, newFull) {
+				if o.ctx.WAL != nil {
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(oldFull))))
+					_, _, _ = o.ctx.WAL.Append(wal.EncodeDropSequence(strings.ToLower(strings.TrimSpace(tbl.Name))))
+				}
+				WALLogSequenceState(o.ctx, newFull)
+				capturedNewFull := newFull
+				tbl.VirtualRows = func() [][]string {
+					lv, lc, called, ok2 := SequenceRowData(capturedNewFull)
+					if !ok2 {
+						return nil
+					}
+					calledStr := "f"
+					if called {
+						calledStr = "t"
+					}
+					return [][]string{{
+						fmt.Sprintf("%d", lv),
+						fmt.Sprintf("%d", lc),
+						calledStr,
+					}}
+				}
+			}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors pg_namespace.nspowner's prior hardcoded default
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !im.SetSchemaOwner(s.Name, ownerOID) {
+			return &ExecError{Code: "3F000", Pos: s.Pos(), Message: fmt.Sprintf("schema %q does not exist", s.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterSchemaOwner(s.Name, ownerOID)); werr != nil {
+				return fmt.Errorf("wal alter-schema-owner: %w", werr)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
 // dropCompatCanonicalType maps PostgreSQL short type names to their canonical
 // names used in error messages (e.g. "int4" → "integer", "float4" → "real").
 // Returns "" for unknown/invalid type names.
@@ -16867,6 +17256,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType, Collation: f.Collation}
 			}
 			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			ct.Owner = o.currentDDLOwnerOID()
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
 			// composite type is visible to pg_dump's getTypes and catalog
 			// queries. DU-002 slice 242.
@@ -16875,8 +17265,10 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			// enum branch below).  The heap rows written above carry the aborting
 			// transaction's XID, so they become MVCC-invisible after rollback;
 			// the in-memory catalog registration is the part ROLLBACK must undo.
-			// DU-002 slice 244.
-			if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+			// DU-002 slice 244. TracksDDLUndo() (not InExplicitTransaction()) so a
+			// message-scoped autocommit batch also tracks this for a later
+			// statement's abort — root-0024 residual, M0110-0001.
+			if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 				if o.ctx.PendingCreatedComposites == nil {
 					o.ctx.PendingCreatedComposites = make(map[string]bool)
 				}
@@ -16884,6 +17276,9 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 		} else {
 			cat.RegisterCompositeType(s.Name)
+			if ct := cat.LookupCompositeType(s.Name); ct != nil {
+				ct.Owner = o.currentDDLOwnerOID()
+			}
 		}
 		return nil
 	}
@@ -16891,11 +17286,14 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	et.Owner = o.currentDDLOwnerOID()
 	// Write a pg_type heap row so `SELECT 1 FROM pg_type WHERE oid = enumtypid`
 	// returns a match for the new type. M0097-0022.
 	syncEnumTypeToCatalogHeap(o.ctx, et)
-	// Track enum type creation so ROLLBACK can drop it.  M0097-0022.
-	if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+	// Track enum type creation so ROLLBACK can drop it.  M0097-0022. TracksDDLUndo()
+	// so a message-scoped autocommit batch also tracks this (root-0024 residual,
+	// M0110-0001).
+	if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 		if o.ctx.PendingCreatedEnums == nil {
 			o.ctx.PendingCreatedEnums = make(map[string]bool)
 		}
@@ -17103,13 +17501,24 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
 	}
-	// RENAME TO new_name — rename the enum type. Track for ROLLBACK.  M0097-0022.
+	// RENAME TO new_name — rename the type. Track enum renames for ROLLBACK.
+	// M0097-0022. Dispatched by type kind: a composite type's Name is only
+	// registered in cat.compositeTypes, not cat.enumTypes, so unconditionally
+	// calling RenameEnum previously raised a spurious "type does not exist"
+	// (42710) for `ALTER TYPE <composite> RENAME TO ...`. M0122-0005
+	// (m0097-0017 follow-up).
 	if s.RenameTo != "" {
+		if cat.LookupCompositeType(s.Name) != nil {
+			if err := cat.RenameCompositeType(s.Name, s.RenameTo); err != nil {
+				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+			}
+			return nil
+		}
 		err := cat.RenameEnum(s.Name, s.RenameTo)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 		}
-		if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 			oldK := strings.ToLower(s.Name)
 			newK := strings.ToLower(s.RenameTo)
 			o.ctx.PendingEnumRenames = append(o.ctx.PendingEnumRenames, EnumRenameEntry{OldName: oldK, NewName: newK})
@@ -17124,15 +17533,36 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		return nil
 	}
+	// OWNER TO role — update typowner on the enum or composite type. Was
+	// previously a complete no-op regardless of whether the target type
+	// existed. M0122-0005 (m0097-0017 follow-up).
+	if s.NewOwner != "" {
+		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterCollation's default
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := cat.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if cat.LookupCompositeType(s.Name) != nil {
+			cat.SetCompositeTypeOwner(s.Name, ownerOID)
+			return nil
+		}
+		if !cat.SetEnumOwner(s.Name, ownerOID) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	}
 	if s.AddValue == "" {
-		return nil // OWNER TO — no-op
+		return nil // unmodelled ALTER TYPE variant — no-op
 	}
 	skipped, err := cat.AddEnumValueResult(s.Name, s.AddValue, s.IfNotExists, s.Before, s.After)
 	if err == nil {
 		if skipped {
 			// IF NOT EXISTS with existing label: emit NOTICE, continue.
 			o.ctx.AddNotice(fmt.Sprintf("enum label %q already exists, skipping", s.AddValue))
-		} else if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		} else if o.ctx.Session != nil && o.ctx.Session.TracksDDLUndo() {
 			// Value added inside an uncommitted transaction: mark as "unsafe" ONLY if
 			// the type was NOT created in the same transaction (newly-created enum values
 			// are immediately safe — only pre-existing-type additions need the guard).

@@ -207,9 +207,13 @@ type InExpr struct {
 	// Distinct from Negated which means NOT IN (AND of != comparisons).
 	// M0097-0067.
 	NotEqualAny bool
-	// AnyOp, when non-zero, indicates `left op ANY(array)` with the given operator.
-	// Used for non-equality ANY predicates such as `col ~ ANY(ARRAY[...])`.
-	AnyOp           parser.OpCode
+	// AnyOp, when non-zero, indicates `left op ANY|SOME|ALL(...)` with the
+	// given operator. Used for non-equality ANY/ALL predicates such as
+	// `col ~ ANY(ARRAY[...])` or `col < ALL(SELECT ...)`.
+	AnyOp parser.OpCode
+	// AllOp selects ALL (AND) instead of ANY/SOME (OR) semantics when AnyOp
+	// is set. M0122-0004.
+	AllOp           bool
 	Plan            Node // populated when the source is a subquery
 	List            []Expr
 	IsNonCorrelated bool
@@ -767,12 +771,24 @@ func (n *Aggregate) Output() Schema { return n.schema }
 // WindowFunc is one supported window-function invocation in a
 // WindowAgg node. Stage A supports row_number/rank (no args,
 // int8 return); Stage B adds lag/lead (1-3 args, return type
-// matches first arg).
+// matches first arg); Stage C adds the frame-consuming aggregates
+// sum/count/avg/min/max (0 or 1 args, evaluated over the default
+// frame — RANGE UNBOUNDED PRECEDING when ORDER BY is present,
+// otherwise the whole partition).
 type WindowFunc struct {
 	pos  int
 	Name string
 	Type catalog.Type
-	Args []Expr // lag/lead: [value, offset?, default?]
+	Args []Expr // lag/lead: [value, offset?, default?]; agg: [value] or empty for count(*)
+	// Star is true for count(*) OVER (...).
+	Star bool
+	// Filter is the resolved FILTER (WHERE ...) predicate, aggregate
+	// window functions only (e.g. sum(x) FILTER (WHERE c) OVER (...)).
+	Filter Expr
+	// InputType is the type of Args[0], used by the executor to reuse
+	// the ordinary-aggregate accumulator (precision-sensitive sum/avg
+	// formatting for float4/float8 inputs).
+	InputType catalog.Type
 }
 
 func (w WindowFunc) Pos() int { return w.pos }
@@ -787,7 +803,29 @@ type WindowAgg struct {
 	PartitionBy []Expr
 	OrderBy     []SortKey
 	Funcs       []WindowFunc
-	schema      Schema
+	// Frame is the resolved ROWS window frame clause shared by every
+	// func in this node (nil when no explicit frame clause was
+	// written — the executor's default frame applies). The analyzer
+	// already rejected RANGE/GROUPS and validated bound ordering, so
+	// by the time a Frame reaches the planner it is always ROWS-mode
+	// and well-formed (M0122-0004 frame-clause slice).
+	Frame  *WindowFrame
+	schema Schema
+}
+
+// WindowFrame is the planner-resolved form of parser.WindowFrame:
+// StartOffset/EndOffset are planner Exprs (resolved against the
+// window's input schema, mirroring how Limit.Limit/Offset are
+// resolved) instead of raw parser.Expr. StartKind/EndKind/Exclusion
+// reuse the parser package's small bound-kind enums directly rather
+// than duplicating them, matching the existing convention of BinaryOp/
+// UnaryOp.Op reusing parser.OpCode.
+type WindowFrame struct {
+	StartKind   parser.FrameBoundKind
+	StartOffset Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	EndKind     parser.FrameBoundKind
+	EndOffset   Expr // non-nil only for FrameBoundOffsetPreceding/Following
+	Exclusion   parser.FrameExclusion
 }
 
 func (n *WindowAgg) Pos() int       { return n.pos }
@@ -1090,6 +1128,20 @@ type UnnestCol struct {
 	Wrapped bool
 }
 
+// RegexpMatchesCol describes one regexp_matches(string, pattern[, flags])
+// call in the SELECT target list. Unlike UnnestCol (which flattens one
+// array's elements one-per-row), each row's value here is a WHOLE match's
+// capture-group array: one row per match when flags contains 'g', otherwise
+// at most one row — mirroring regexp_matches' own SRF semantics (PG's
+// setup_regexp_matches). The FROM-clause form (`FROM regexp_matches(...)`)
+// is not covered by this — target-list only. M0122-0002 (regexp_matches-srf).
+type RegexpMatchesCol struct {
+	ColIdx      int  // which output column this SRF fills
+	StringExpr  Expr // the subject string argument
+	PatternExpr Expr // the regex pattern argument
+	FlagsExpr   Expr // optional flags argument; nil when not given
+}
+
 // SrfWrapper applies an enclosing scalar expression to a set-returning function
 // nested inside a SELECT-list target (e.g. `generate_series(1,n) % 4`). Expr is
 // the resolved target expression with the SRF call replaced by a ColumnRef that
@@ -1122,10 +1174,11 @@ type ProjectSet struct {
 	// When non-empty, the operator expands the SRFs and zips them
 	// together, repeating OtherExprs for each step. The output schema
 	// covers both SRF and non-SRF columns.
-	SrfCols     []SrfCol     // one per generate_series call in target list
-	UnnestCols  []UnnestCol  // one per unnest(array) call in target list. M0097-0106.
-	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
-	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
+	SrfCols           []SrfCol           // one per generate_series call in target list
+	UnnestCols        []UnnestCol        // one per unnest(array) call in target list. M0097-0106.
+	RegexpMatchesCols []RegexpMatchesCol // one per regexp_matches call in target list. M0122-0002.
+	UserSrfCols       []UserSrfCol       // one per user-defined SETOF function call. M0097-0020.
+	OtherExprs        []Expr             // non-SRF target expressions; nil slot = SRF slot
 	// Wrappers hold enclosing scalar expressions over a nested SRF (e.g.
 	// `generate_series(1,n) % 4`). When non-empty the executor builds a
 	// per-step eval row of width EvalRowWidth (child row in [0:ChildWidth),
@@ -1217,6 +1270,23 @@ type PgOptionsToTable struct {
 func (n *PgOptionsToTable) Pos() int       { return n.pos }
 func (n *PgOptionsToTable) Output() Schema { return n.schema }
 
+// FromRegexpMatches is the FROM-clause SRF plan node for
+// FROM regexp_matches(string, pattern[, flags]). Unlike RegexpMatchesCol
+// (SELECT-list position), this produces its own range-table entry with a
+// single text[] output column — one row per match when flags contains 'g',
+// otherwise at most one row, zero rows on no match (matches PG's SRF
+// row-count semantics, not the scalar fallback's NULL). M0122-0002 follow-up.
+type FromRegexpMatches struct {
+	pos         int
+	StringExpr  Expr
+	PatternExpr Expr
+	FlagsExpr   Expr // nil when not given
+	schema      Schema
+}
+
+func (n *FromRegexpMatches) Pos() int       { return n.pos }
+func (n *FromRegexpMatches) Output() Schema { return n.schema }
+
 // VerifyHeapam is the FROM-clause SRF plan node for amcheck's
 // verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries
 // the relation argument plus the optional startblock / endblock block-range
@@ -1252,6 +1322,16 @@ type Insert struct {
 	OnConflict      *OnConflictPlan
 	Returning       []Expr // per-target RETURNING expressions (nil = no RETURNING)
 	ReturningSchema Schema // output schema when Returning is non-nil
+
+	// ViewCheckQual/ViewCheckName are set when this INSERT's original target
+	// was a `WITH CHECK OPTION` view that was rewritten onto Table (its
+	// auto-updatable base relation, see viewAutoUpdatableChain). The executor
+	// evaluates ViewCheckQual against each finalized row and raises 44000
+	// ("new row violates check option for view") when it isn't true — mirrors
+	// execMain.c's WCO_VIEW_CHECK. nil when the target wasn't a CHECK OPTION
+	// view. M0119-0004 slice-365 follow-up.
+	ViewCheckQual Expr
+	ViewCheckName string
 }
 
 func (n *Insert) Pos() int       { return n.pos }
@@ -1430,6 +1510,11 @@ type Update struct {
 	FromScans  []Node // one per FROM table (may be SeqScan or subquery node)
 	FromSchema Schema // combined schema of all FROM tables
 	FromPred   Expr   // WHERE predicate over combined row (nil = no filter)
+
+	// ViewCheckQual/ViewCheckName — see Insert.ViewCheckQual. Evaluated
+	// against the post-SET row before it is written back.
+	ViewCheckQual Expr
+	ViewCheckName string
 }
 
 func (n *Update) Pos() int       { return n.pos }

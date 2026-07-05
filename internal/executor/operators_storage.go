@@ -1032,6 +1032,9 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
+	if o.tbl != nil && !dmlPrivilegePermitted(ctx, o.tbl, "SELECT") {
+		return &ExecError{Code: "42501", Pos: o.pos, Message: fmt.Sprintf("permission denied for table %s", o.tbl.Name)}
+	}
 	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
 	if o.tbl != nil && o.tbl.IsMatView && !o.tbl.IsPopulated {
 		return &ExecError{Code: "55000", Pos: o.pos,
@@ -1716,11 +1719,43 @@ func (o *insertOp) appendInsertRetRow(row Row) {
 	o.retRows = append(o.retRows, retRow)
 }
 
+// dmlPrivilegePermitted reports whether the session's effective role may run
+// an INSERT/UPDATE/DELETE against tbl. Mirrors PostgreSQL's ExecCheckRTPerms:
+// the bootstrap superuser — a session that has NOT done SET ROLE/SET SESSION
+// AUTHORIZATION to a non-superuser — always passes; a non-superuser role must
+// own tbl (Table.Owner, case-insensitive) or hold the named privilege via
+// GRANT (internal/catalog's tableACLs, the same store TRUNCATE/MAINTAIN
+// already consult). Checked before any lock is acquired, matching
+// PostgreSQL's pre-lock ACL check (M0118-0008 truncate-conflict precedent).
+// M0097-0040.
+func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
+	role := ctx.NonSuperuserRole
+	if role == "" {
+		return true // bootstrap superuser: full privileges
+	}
+	if priv == "SELECT" && tbl != nil && catalog.IsSystemRelation(tbl.OID) {
+		// PostgreSQL seeds every system catalog/view with an implicit PUBLIC
+		// SELECT grant at initdb time (pg_init_privs) so any role can read
+		// pg_catalog/information_schema for introspection (psql \d, pg_dump,
+		// driver metadata queries). goopg has no per-catalog default-ACL
+		// seeding, so mirror that outcome by always permitting SELECT on
+		// relations below FirstNormalObjectId. M0097-0040 SELECT follow-up.
+		return true
+	}
+	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, role) {
+		return true
+	}
+	return ctx.Catalog.HasTablePrivilege(tbl.OID, role, priv)
+}
+
 func (o *insertOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Insert requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	if !dmlPrivilegePermitted(ctx, o.plan.Table, "INSERT") {
+		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
@@ -1890,6 +1925,14 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// CHECK constraint enforcement (M0097-0014).
 		if len(o.plan.Table.CheckConstraints) > 0 {
 			if err := checkConstraints(o.ctx, o.plan.Table, row); err != nil {
+				return nil, err
+			}
+		}
+
+		// WITH CHECK OPTION enforcement: the INSERT's original target was a
+		// CHECK OPTION view rewritten onto Table. M0119-0004 slice-365 follow-up.
+		if o.plan.ViewCheckQual != nil {
+			if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, row); err != nil {
 				return nil, err
 			}
 		}
@@ -3449,6 +3492,9 @@ func (o *updateOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Update requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	if !dmlPrivilegePermitted(ctx, o.plan.Table, "UPDATE") {
+		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
@@ -3557,6 +3603,21 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		}
 		row := decRow
 
+		// The B-tree scan only matches the index's own equality key (ix.Key);
+		// a residual predicate (e.g. a view's WHERE qual wrapping the planned
+		// IndexScan in a Filter) must still be evaluated here — the EPQ
+		// recheck path below re-applies o.pred on a concurrent update, but the
+		// common uncontended case never reaches it. M0119-0004/root-0025.
+		if o.pred != nil {
+			v, err := evalExpr(o.pred, row, o.ctx)
+			if err != nil {
+				return false, err
+			}
+			if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+				return true, nil
+			}
+		}
+
 		// Build new row from SET expressions.
 		// Clear multi-column subquery cache so each row gets a fresh evaluation.
 		clear(o.ctx.MultiAssignSubqCache)
@@ -3578,6 +3639,13 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		for i, c := range cols {
 			if c.GeneratedExpr == "" && newRow[i].IsNull() && !row[i].IsNull() {
 				newRow[i] = row[i]
+			}
+		}
+		// WITH CHECK OPTION enforcement — see the identical check in the
+		// SeqScan path's per-row callback for the rationale.
+		if o.plan.ViewCheckQual != nil {
+			if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, newRow); err != nil {
+				return false, err
 			}
 		}
 		pending = append(pending, pendingUpdate{
@@ -4050,12 +4118,38 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		return o.updateWithFrom(rel, cols)
 	}
 
+	// Collect parent + partition/inheritance children up front. M0096-0013.
+	// For inheritance children, track a column-map so SET/WHERE/RETURNING
+	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
+	updateScanTables := []*catalog.Table{tbl}
+	var inheritChildOIDs map[uint32]bool
+	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
+		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
+		// Design 0118-0036 (M0118-0008 inherit-temp).
+		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
+		updateScanTables = append(updateScanTables, inheritChildren...)
+		if len(inheritChildren) > 0 {
+			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
+			for _, ic := range inheritChildren {
+				inheritChildOIDs[ic.OID] = true
+			}
+		}
+	}
+
 	// Use IndexScan (B-tree) when available — O(log n) instead of O(n).
-	if o.idxScan != nil {
+	// Only safe when tbl has no partition/inheritance children: updateViaIndex
+	// walks exactly one B-tree scoped to tbl's own storage, so a matching row
+	// living in a child would be silently skipped (M0119-0004 discovery,
+	// root-0025 item 5 follow-up — `.ralph/deferral_ledger.md`). With
+	// children present, fall through to the multi-table SeqScan path below,
+	// which already fans out correctly.
+	if o.idxScan != nil && len(updateScanTables) == 1 {
 		return o.updateViaIndex(rel, cols)
 	}
 
-	// Fallback: full SeqScan path.
+	// Fallback: full SeqScan path (also used for a parent table with
+	// partition/inheritance children, even when tbl itself has a usable index).
 
 	// Two passes: first collect (block, slot, newRow) tuples to
 	// rewrite, then issue the writes. Doing the writes in-line during
@@ -4077,24 +4171,6 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	}
 	pending := make([]pendingUpdate, 0, 1)
 
-	// Scan parent + partition/inheritance children. M0096-0013.
-	// For inheritance children, track a column-map so SET/WHERE/RETURNING
-	// expressions (resolved against parent ordinals) work on child rows. M0097-0078.
-	updateScanTables := []*catalog.Table{tbl}
-	var inheritChildOIDs map[uint32]bool
-	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
-		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
-		// Design 0118-0036 (M0118-0008 inherit-temp).
-		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
-		updateScanTables = append(updateScanTables, inheritChildren...)
-		if len(inheritChildren) > 0 {
-			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
-			for _, ic := range inheritChildren {
-				inheritChildOIDs[ic.OID] = true
-			}
-		}
-	}
 	for _, scanTbl := range updateScanTables {
 		scanRel := o.ctx.Catalog.RelFileNode(scanTbl)
 		scanCols := scanTbl.Columns
@@ -4129,10 +4205,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 				}
 			}
-			var newRow Row
+			var newRow, parentNewRow Row
 			if isInheritChild {
 				// Evaluate SET exprs in parent column space, then map back to child.
-				parentNewRow := make(Row, len(cols))
+				parentNewRow = make(Row, len(cols))
 				for pi := range cols {
 					if pi < len(o.plan.Set) && o.plan.Set[pi] != nil {
 						v, err := evalExpr(o.plan.Set[pi], evalRow, o.ctx)
@@ -4162,8 +4238,25 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						}
 					}
 				}
+				// scanTbl==tbl or a partition child: PG requires a partition's
+				// columns to exactly mirror the partitioned table's layout (only
+				// traditional multiple-inheritance children can add/reorder
+				// columns), so newRow is already in the base table's ordinal
+				// space — no remap needed.
+				parentNewRow = newRow
 			}
 			_ = computeGeneratedColumns(captureCols, newRow)
+
+			// WITH CHECK OPTION enforcement, checked against parentNewRow (the
+			// base table's own column ordinal space that ViewCheckQual was
+			// resolved against) so it applies uniformly to the parent's own
+			// rows, partition-child rows, and inheritance-child rows alike.
+			// M0119-0004 slice-365 / root-0025 deferred item 5.
+			if o.plan.ViewCheckQual != nil {
+				if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, parentNewRow); err != nil {
+					return err
+				}
+			}
 
 			// M0100-0011: Phase 1 EPQ for all isolation levels — wait for any
 			// in-progress xmax before processing the next row, so BEFORE trigger
@@ -4851,6 +4944,9 @@ func (o *deleteOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "Delete requires storage handles in Context"}
 	}
 	o.ctx = ctx
+	if !dmlPrivilegePermitted(ctx, o.plan.Table, "DELETE") {
+		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
+	}
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
@@ -5457,6 +5553,18 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						}
 					}
 					_ = computeGeneratedColumns(writeCols, actualNewRow)
+					// WITH CHECK OPTION enforcement: parentNewRow is always in the
+					// base table's own column ordinal space regardless of fst
+					// (tgtRow was remapped from child to parent ordinals above for
+					// inheritance children; partition children and the base table
+					// itself already share that layout), so the check applies
+					// uniformly to parent, partition-child, and inheritance-child
+					// rows alike. root-0025 deferred item 5 closed.
+					if o.plan.ViewCheckQual != nil {
+						if err := checkViewCheckOption(o.ctx, o.plan.ViewCheckQual, o.plan.ViewCheckName, parentNewRow); err != nil {
+							return err
+						}
+					}
 					var fromPortion Row
 					if needFromForReturning && len(combinedRow) > tgtColCount {
 						fromPortion = cloneRow(combinedRow[tgtColCount:])

@@ -34,7 +34,16 @@ func LoadRolesFromAuthidHeap(dataDir string, cat catalog.Catalog) error {
 	}
 	for _, d := range rows {
 		lower := strings.ToLower(d.Rolname)
-		attrs := catalog.RoleAttrs{CanLogin: d.CanLogin, Superuser: d.Super}
+		attrs := catalog.RoleAttrs{
+			CanLogin:    d.CanLogin,
+			Superuser:   d.Super,
+			CreateDB:    d.CreateDB,
+			CreateRole:  d.CreateRole,
+			Replication: d.Replication,
+			BypassRLS:   d.BypassRLS,
+			ConnLimit:   d.ConnLimit,
+			ValidUntil:  d.ValidUntil,
+		}
 		if d.HasPasswd {
 			switch {
 			case strings.HasPrefix(d.Password, "SCRAM-SHA-256$"):

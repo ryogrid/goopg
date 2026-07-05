@@ -126,6 +126,8 @@ const (
 	KwLike        Keyword = "like"
 	KwIlike       Keyword = "ilike"
 	KwBetween     Keyword = "between"
+	KwSymmetric   Keyword = "symmetric"
+	KwAsymmetric  Keyword = "asymmetric"
 	// M0008 logical-replication DDL keywords. See
 	// docs/design/0008-0003-publication-subscription-ddl.md.
 	// Option names (publish / enabled / slot_name) intentionally
@@ -218,6 +220,9 @@ const (
 	KwParallel Keyword = "parallel"
 	KwLateral  Keyword = "lateral"
 	KwAny      Keyword = "any"
+	// M0122-0004: SOME is a synonym for ANY in scalar-array comparisons
+	// (`expr op SOME (...)`); accepted everywhere KwAny is.
+	KwSome Keyword = "some"
 
 	// M0095-0005: REINDEX statement stub.
 	KwReindex Keyword = "reindex"
@@ -338,6 +343,8 @@ var keywords = map[string]Keyword{
 	"like":         KwLike,
 	"ilike":        KwIlike,
 	"between":      KwBetween,
+	"symmetric":    KwSymmetric,
+	"asymmetric":   KwAsymmetric,
 	"publication":  KwPublication,
 	"subscription": KwSubscription,
 	"connection":   KwConnection,
@@ -378,6 +385,7 @@ var keywords = map[string]Keyword{
 	"parallel":     KwParallel,
 	"lateral":      KwLateral,
 	"any":          KwAny,
+	"some":         KwSome,
 	"reindex":      KwReindex,
 	"cluster":      KwCluster,
 	"prepare":      KwPrepare,

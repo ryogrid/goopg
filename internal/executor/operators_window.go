@@ -1,9 +1,12 @@
 package executor
 
 import (
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
 
@@ -18,6 +21,15 @@ type windowOp struct {
 	ctx  *Context
 	rows []Row
 	idx  int
+
+	// frameStartOff/frameEndOff are o.plan.Frame's offset expressions
+	// evaluated once (mirroring LIMIT/OFFSET's once-per-query
+	// evaluation, not per-row — PG disallows column/aggregate/window
+	// references in a frame offset for exactly this reason). Only
+	// meaningful when the corresponding bound kind is
+	// FrameBoundOffsetPreceding/Following.
+	frameStartOff int64
+	frameEndOff   int64
 }
 
 func newWindowOp(plan *planner.WindowAgg, child Operator) *windowOp {
@@ -147,12 +159,76 @@ func (o *windowOp) evalWindowFuncs() error {
 	}
 	pStarts = append(pStarts, len(o.rows)) // sentinel
 
+	// aggHelper reuses the ordinary GROUP BY aggregate accumulator
+	// (numeric-exact sums, float4/float8 formatting, NULL-skipping,
+	// FILTER support) for frame-consuming window aggregates. Its
+	// methods only touch o.ctx, so a bare instance is safe to share.
+	aggHelper := &aggregateOp{ctx: o.ctx}
+
+	// A frame's offset expressions are evaluated once per query, not
+	// per row or per partition (PG forbids column/aggregate/window
+	// references in them for exactly this reason) — mirrors
+	// limitOp.Open's once-per-query LIMIT/OFFSET evaluation.
+	if fr := o.plan.Frame; fr != nil {
+		if fr.StartOffset != nil {
+			v, err := o.resolveFrameOffset(fr.StartOffset, "starting")
+			if err != nil {
+				return err
+			}
+			o.frameStartOff = v
+		}
+		if fr.EndOffset != nil {
+			v, err := o.resolveFrameOffset(fr.EndOffset, "ending")
+			if err != nil {
+				return err
+			}
+			o.frameEndOff = v
+		}
+	}
+
 	// Evaluate each partition independently.
 	for p := 0; p < len(pStarts)-1; p++ {
 		pStart := pStarts[p]
 		pEnd := pStarts[p+1]
 		rowNum := int64(0)
 		rank := int64(1)
+		denseRank := int64(1)
+
+		if err := o.evalFrameAggFuncs(aggHelper, colBase, pStart, pEnd); err != nil {
+			return err
+		}
+		if err := o.evalNtileFuncs(colBase, pStart, pEnd); err != nil {
+			return err
+		}
+
+		// frameEnd[i-pStart] is the exclusive end of the peer group
+		// containing row i — the default-frame end (RANGE UNBOUNDED
+		// PRECEDING AND CURRENT ROW) that first_value/last_value/
+		// nth_value/cume_dist fall back to. cume_dist always uses this
+		// array even under an explicit frame clause: per PG spec,
+		// cume_dist (like row_number/rank/lag/lead/ntile/percent_rank)
+		// is frame-independent — only aggregates and first_value/
+		// last_value/nth_value respect an explicit frame. Only
+		// computed when one of those functions is actually present.
+		var frameEnd []int
+		var valueGroupBounds []int
+		needsValueGroupBounds := o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone && hasFrameValueWindowFunc(o.plan.Funcs)
+		if hasFrameValueWindowFunc(o.plan.Funcs) {
+			groupBounds, err := o.peerGroupBounds(pStart, pEnd)
+			if err != nil {
+				return err
+			}
+			frameEnd = make([]int, pEnd-pStart)
+			for g := 0; g < len(groupBounds)-1; g++ {
+				gStart, gEnd := groupBounds[g], groupBounds[g+1]
+				for i := gStart; i < gEnd; i++ {
+					frameEnd[i-pStart] = gEnd
+				}
+			}
+			if needsValueGroupBounds {
+				valueGroupBounds = groupBounds
+			}
+		}
 
 		for i := pStart; i < pEnd; i++ {
 			rowNum++
@@ -163,6 +239,7 @@ func (o *windowOp) evalWindowFuncs() error {
 				}
 				if !peer {
 					rank = rowNum
+					denseRank++
 				}
 			}
 			localIdx := i - pStart // 0-based position within this partition
@@ -174,6 +251,8 @@ func (o *windowOp) evalWindowFuncs() error {
 					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: rowNum}
 				case "rank":
 					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: rank}
+				case "dense_rank":
+					o.rows[i][colIdx] = Datum{Kind: KindInt, Int: denseRank}
 				case "lag", "lead":
 					offset := int64(1)
 					if len(fn.Args) >= 2 {
@@ -210,6 +289,96 @@ func (o *windowOp) evalWindowFuncs() error {
 						}
 						o.rows[i][colIdx] = v
 					}
+				case "sum", "count", "avg", "min", "max":
+					// Already computed per-frame in evalFrameAggFuncs above.
+				case "ntile":
+					// Already computed per-partition in evalNtileFuncs above.
+				case "percent_rank":
+					total := int64(pEnd - pStart)
+					if total <= 1 {
+						o.rows[i][colIdx] = NewStringDatum("0")
+					} else {
+						result := float64(rank-1) / float64(total-1)
+						o.rows[i][colIdx] = NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+					}
+				case "cume_dist":
+					total := int64(pEnd - pStart)
+					np := int64(frameEnd[localIdx] - pStart)
+					result := float64(np) / float64(total)
+					o.rows[i][colIdx] = NewStringDatum(strconv.FormatFloat(result, 'g', 15, 64))
+				case "first_value":
+					start, end := pStart, frameEnd[localIdx]
+					if o.plan.Frame != nil {
+						start, end = o.frameBounds(pStart, pEnd, i)
+					}
+					idx := start
+					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+						peerStart, peerEnd := peerBoundsOf(valueGroupBounds, i)
+						idx = firstInFrame(start, end, i, peerStart, peerEnd, o.plan.Frame.Exclusion)
+					}
+					if idx < 0 || idx >= end {
+						o.rows[i][colIdx] = NullDatum
+						continue
+					}
+					v, err := evalExpr(fn.Args[0], o.rows[idx], o.ctx)
+					if err != nil {
+						return err
+					}
+					o.rows[i][colIdx] = v
+				case "last_value":
+					start, end := pStart, frameEnd[localIdx]
+					if o.plan.Frame != nil {
+						start, end = o.frameBounds(pStart, pEnd, i)
+					}
+					idx := end - 1
+					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+						peerStart, peerEnd := peerBoundsOf(valueGroupBounds, i)
+						idx = lastInFrame(start, end, i, peerStart, peerEnd, o.plan.Frame.Exclusion)
+					}
+					if idx < start {
+						o.rows[i][colIdx] = NullDatum
+						continue
+					}
+					v, err := evalExpr(fn.Args[0], o.rows[idx], o.ctx)
+					if err != nil {
+						return err
+					}
+					o.rows[i][colIdx] = v
+				case "nth_value":
+					nVal, err := evalExpr(fn.Args[1], o.rows[i], o.ctx)
+					if err != nil {
+						return err
+					}
+					if nVal.IsNull() {
+						o.rows[i][colIdx] = NullDatum
+						continue
+					}
+					if nVal.Kind != KindInt || nVal.Int <= 0 {
+						return &ExecError{Code: "22016", Pos: fn.Pos(), Message: "argument of nth_value must be greater than zero"}
+					}
+					start, end := pStart, frameEnd[localIdx]
+					if o.plan.Frame != nil {
+						start, end = o.frameBounds(pStart, pEnd, i)
+					}
+					var target int
+					if o.plan.Frame != nil && o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+						peerStart, peerEnd := peerBoundsOf(valueGroupBounds, i)
+						target = nthInFrame(start, end, i, peerStart, peerEnd, o.plan.Frame.Exclusion, int(nVal.Int))
+					} else {
+						target = start + int(nVal.Int) - 1 // offset from frame head
+						if target >= end {
+							target = -1
+						}
+					}
+					if target < 0 {
+						o.rows[i][colIdx] = NullDatum
+						continue
+					}
+					v, err := evalExpr(fn.Args[0], o.rows[target], o.ctx)
+					if err != nil {
+						return err
+					}
+					o.rows[i][colIdx] = v
 				default:
 					return &ExecError{Code: "0A000", Pos: fn.Pos(), Message: "window function is not supported in v0 executor"}
 				}
@@ -217,6 +386,379 @@ func (o *windowOp) evalWindowFuncs() error {
 		}
 	}
 	return nil
+}
+
+// isFrameAggWindowFunc reports whether name is one of the ordinary
+// aggregates usable as a window function (sum/count/avg/min/max).
+// These consume a frame rather than a fixed row offset like
+// row_number/rank/lag/lead.
+func isFrameAggWindowFunc(name string) bool {
+	switch strings.ToLower(name) {
+	case "sum", "count", "avg", "min", "max":
+		return true
+	}
+	return false
+}
+
+// hasFrameValueWindowFunc reports whether fns contains first_value,
+// last_value, nth_value, or cume_dist — functions that need the
+// default-frame end (peer-group boundary) computed per row.
+func hasFrameValueWindowFunc(fns []planner.WindowFunc) bool {
+	for _, fn := range fns {
+		switch strings.ToLower(fn.Name) {
+		case "first_value", "last_value", "nth_value", "cume_dist":
+			return true
+		}
+	}
+	return false
+}
+
+// evalNtileFuncs computes ntile() bucket numbers for every ntile() call in
+// o.plan.Funcs across one partition, writing results directly into o.rows —
+// mirroring how evalFrameAggFuncs pre-computes sum/count/avg/min/max so the
+// per-row switch in evalWindowFuncs only has to skip already-filled columns.
+func (o *windowOp) evalNtileFuncs(colBase, pStart, pEnd int) error {
+	for j, fn := range o.plan.Funcs {
+		if strings.ToLower(fn.Name) != "ntile" {
+			continue
+		}
+		if err := o.evalNtileFunc(fn, colBase+j, pStart, pEnd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// evalNtileFunc computes ntile()'s bucket assignment for one partition,
+// reproducing window_ntile's exact bucket-sizing algorithm
+// (postgres/src/backend/utils/adt/windowfuncs.c): the first `total %
+// nbuckets` buckets get one extra row so the remainder isn't concentrated
+// in the last bucket. The bucket-count argument is evaluated once, from the
+// partition's first row, matching PostgreSQL's WinGetFuncArgCurrent-on-
+// first-call semantics.
+func (o *windowOp) evalNtileFunc(fn planner.WindowFunc, colIdx, pStart, pEnd int) error {
+	total := int64(pEnd - pStart)
+	if total == 0 {
+		return nil
+	}
+	nArg, err := evalExpr(fn.Args[0], o.rows[pStart], o.ctx)
+	if err != nil {
+		return err
+	}
+	if nArg.IsNull() {
+		for i := pStart; i < pEnd; i++ {
+			o.rows[i][colIdx] = NullDatum
+		}
+		return nil
+	}
+	if nArg.Kind != KindInt || nArg.Int <= 0 {
+		return &ExecError{Code: "22014", Pos: fn.Pos(), Message: "argument of ntile must be greater than zero"}
+	}
+	nbuckets := nArg.Int
+
+	ntile := int64(1)
+	rowsPerBucket := int64(0)
+	boundary := total / nbuckets
+	remainder := int64(0)
+	if boundary <= 0 {
+		boundary = 1
+	} else {
+		remainder = total % nbuckets
+		if remainder != 0 {
+			boundary++
+		}
+	}
+	for i := pStart; i < pEnd; i++ {
+		rowsPerBucket++
+		if boundary < rowsPerBucket {
+			if remainder != 0 && ntile == remainder {
+				remainder = 0
+				boundary--
+			}
+			ntile++
+			rowsPerBucket = 1
+		}
+		o.rows[i][colIdx] = NewIntDatum(ntile)
+	}
+	return nil
+}
+
+// evalFrameAggFuncs computes sum/count/avg/min/max window functions for
+// one partition ([pStart, pEnd) of o.rows) and writes the results
+// directly into o.rows. It reuses aggHelper (a bare *aggregateOp) to
+// share the ordinary GROUP BY accumulator, so formatting/NULL handling
+// matches non-window aggregates exactly.
+//
+// Frame semantics match PostgreSQL's default when no frame clause is
+// given: RANGE UNBOUNDED PRECEDING (cumulative, peer-inclusive) when
+// ORDER BY is present, otherwise the entire partition. Peer-group
+// boundaries are the same ones rank() uses, so peerGroupBounds
+// naturally collapses to a single group (the whole partition) when
+// there is no ORDER BY, since samePeer always returns true in that case.
+func (o *windowOp) evalFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pEnd int) error {
+	hasAggFunc := false
+	for _, fn := range o.plan.Funcs {
+		if isFrameAggWindowFunc(fn.Name) {
+			hasAggFunc = true
+			break
+		}
+	}
+	if !hasAggFunc {
+		return nil
+	}
+
+	if o.plan.Frame != nil {
+		return o.evalExplicitFrameAggFuncs(aggHelper, colBase, pStart, pEnd)
+	}
+
+	groupBounds, err := o.peerGroupBounds(pStart, pEnd)
+	if err != nil {
+		return err
+	}
+
+	for j, fn := range o.plan.Funcs {
+		if !isFrameAggWindowFunc(fn.Name) {
+			continue
+		}
+		colIdx := colBase + j
+		call := windowFuncToAggregateCall(fn)
+		var running aggRuntime
+		for g := 0; g < len(groupBounds)-1; g++ {
+			gStart, gEnd := groupBounds[g], groupBounds[g+1]
+			for i := gStart; i < gEnd; i++ {
+				if err := aggHelper.applyAgg(&running, call, asSlot(o.schema, o.rows[i])); err != nil {
+					return err
+				}
+			}
+			val := aggHelper.finishAgg(running, call)
+			for i := gStart; i < gEnd; i++ {
+				o.rows[i][colIdx] = val
+			}
+		}
+	}
+	return nil
+}
+
+// evalExplicitFrameAggFuncs computes sum/count/avg/min/max for an
+// explicit ROWS frame clause. Unlike the default-frame path above (one
+// running total per peer group, since the default frame only ever
+// grows), an explicit frame's bounds can both grow and shrink from one
+// row to the next (e.g. `ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING`
+// slides rather than accumulates), so there is no valid single running
+// total to share across rows — each row's frame is recomputed from
+// scratch via the same aggregate accumulator. This is a new feature
+// with no prior consumer, so correctness-first O(partition size ×
+// average frame size) is the deliberate v0 tradeoff; TPC-H doesn't use
+// frame clauses, so this doesn't touch the spot-check gate.
+func (o *windowOp) evalExplicitFrameAggFuncs(aggHelper *aggregateOp, colBase, pStart, pEnd int) error {
+	var groupBounds []int
+	if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+		gb, err := o.peerGroupBounds(pStart, pEnd)
+		if err != nil {
+			return err
+		}
+		groupBounds = gb
+	}
+
+	for j, fn := range o.plan.Funcs {
+		if !isFrameAggWindowFunc(fn.Name) {
+			continue
+		}
+		colIdx := colBase + j
+		call := windowFuncToAggregateCall(fn)
+		for i := pStart; i < pEnd; i++ {
+			start, end := o.frameBounds(pStart, pEnd, i)
+			peerStart, peerEnd := 0, 0
+			if o.plan.Frame.Exclusion != parser.FrameExcludeNone {
+				peerStart, peerEnd = peerBoundsOf(groupBounds, i)
+			}
+			var running aggRuntime
+			for k := start; k < end; k++ {
+				if frameRowExcluded(o.plan.Frame.Exclusion, k, i, peerStart, peerEnd) {
+					continue
+				}
+				if err := aggHelper.applyAgg(&running, call, asSlot(o.schema, o.rows[k])); err != nil {
+					return err
+				}
+			}
+			o.rows[i][colIdx] = aggHelper.finishAgg(running, call)
+		}
+	}
+	return nil
+}
+
+// windowFuncToAggregateCall adapts a planner.WindowFunc (sum/count/avg/
+// min/max only) into the planner.AggregateCall shape applyAgg/finishAgg
+// expect, so window aggregates share the exact ordinary-aggregate
+// accumulator instead of a second implementation that could drift.
+func windowFuncToAggregateCall(fn planner.WindowFunc) planner.AggregateCall {
+	call := planner.AggregateCall{
+		Name:            fn.Name,
+		Star:            fn.Star,
+		Type:            fn.Type,
+		InputType:       fn.InputType,
+		Filter:          fn.Filter,
+		SharedStateSlot: -1,
+	}
+	if !fn.Star && len(fn.Args) > 0 {
+		call.Arg = fn.Args[0]
+	}
+	return call
+}
+
+// peerGroupBounds returns the peer-group start indices within
+// [pStart, pEnd), plus the pEnd sentinel — mirroring the transitions
+// evalWindowFuncs already tracks inline for rank(). When there is no
+// ORDER BY, samePeer always returns true, so this collapses to a
+// single group spanning the whole partition.
+func (o *windowOp) peerGroupBounds(pStart, pEnd int) ([]int, error) {
+	bounds := []int{pStart}
+	for i := pStart + 1; i < pEnd; i++ {
+		peer, err := o.samePeer(o.rows[i-1], o.rows[i])
+		if err != nil {
+			return nil, err
+		}
+		if !peer {
+			bounds = append(bounds, i)
+		}
+	}
+	bounds = append(bounds, pEnd)
+	return bounds, nil
+}
+
+// resolveFrameOffset evaluates a frame's PRECEDING/FOLLOWING offset
+// expression once (mirrors limitOp.Open's LIMIT/OFFSET evaluation —
+// PG disallows column/aggregate/window-function references in a frame
+// offset for exactly this reason: it's a constant for the whole
+// query, not a per-row value). label is "starting" or "ending" to
+// match nodeWindowAgg.c's exact error wording.
+func (o *windowOp) resolveFrameOffset(expr planner.Expr, label string) (int64, error) {
+	v, err := evalExpr(expr, nil, o.ctx)
+	if err != nil {
+		return 0, err
+	}
+	if v.IsNull() {
+		return 0, &ExecError{Code: "22004", Pos: expr.Pos(), Message: fmt.Sprintf("frame %s offset must not be null", label)}
+	}
+	if v.Kind != KindInt {
+		return 0, &ExecError{Code: "42804", Pos: expr.Pos(), Message: fmt.Sprintf("frame %s offset must be integer", label)}
+	}
+	if v.Int < 0 {
+		return 0, &ExecError{Code: "22013", Pos: expr.Pos(), Message: fmt.Sprintf("frame %s offset must not be negative", label)}
+	}
+	return v.Int, nil
+}
+
+// frameBounds returns the absolute [start, end) row-index bounds of
+// row i's ROWS window frame within partition [pStart, pEnd),
+// reproducing update_frameheadpos/update_frametailpos's ROWS-mode
+// arithmetic (postgres/src/backend/executor/nodeWindowAgg.c) exactly:
+// both bounds are clamped to the partition, and an out-of-order result
+// (e.g. a FOLLOWING start past a PRECEDING end) collapses to an empty
+// frame rather than erroring, matching upstream.
+func (o *windowOp) frameBounds(pStart, pEnd, i int) (int, int) {
+	fr := o.plan.Frame
+	local := i - pStart
+	n := pEnd - pStart
+	clamp := func(v int) int {
+		if v < 0 {
+			return 0
+		}
+		if v > n {
+			return n
+		}
+		return v
+	}
+	var start, end int
+	switch fr.StartKind {
+	case parser.FrameBoundUnboundedPreceding:
+		start = 0
+	case parser.FrameBoundCurrentRow:
+		start = local
+	case parser.FrameBoundOffsetPreceding:
+		start = clamp(local - int(o.frameStartOff))
+	case parser.FrameBoundOffsetFollowing:
+		start = clamp(local + int(o.frameStartOff))
+	}
+	switch fr.EndKind {
+	case parser.FrameBoundUnboundedFollowing:
+		end = n
+	case parser.FrameBoundCurrentRow:
+		end = local + 1
+	case parser.FrameBoundOffsetPreceding:
+		end = clamp(local - int(o.frameEndOff) + 1)
+	case parser.FrameBoundOffsetFollowing:
+		end = clamp(local + int(o.frameEndOff) + 1)
+	}
+	if end < start {
+		end = start
+	}
+	return pStart + start, pStart + end
+}
+
+// peerBoundsOf returns the [start, end) peer-group bounds containing
+// absolute row index i, given groupBounds as returned by
+// peerGroupBounds (ascending group-start indices plus a trailing pEnd
+// sentinel).
+func peerBoundsOf(groupBounds []int, i int) (int, int) {
+	k := sort.Search(len(groupBounds)-1, func(k int) bool { return groupBounds[k+1] > i })
+	return groupBounds[k], groupBounds[k+1]
+}
+
+// frameRowExcluded reports whether row k is excluded from row i's
+// frame by an EXCLUDE clause, given i's peer-group bounds
+// [peerStart, peerEnd) — mirrors nodeWindowAgg.c's row_is_in_frame
+// exclusion check (frame bounds themselves are computed without
+// regard to EXCLUDE; only membership within those bounds is filtered
+// here).
+func frameRowExcluded(excl parser.FrameExclusion, k, i, peerStart, peerEnd int) bool {
+	switch excl {
+	case parser.FrameExcludeCurrentRow:
+		return k == i
+	case parser.FrameExcludeGroup:
+		return k >= peerStart && k < peerEnd
+	case parser.FrameExcludeTies:
+		return k != i && k >= peerStart && k < peerEnd
+	default:
+		return false
+	}
+}
+
+// firstInFrame/lastInFrame/nthInFrame return the absolute row index of
+// the first/last/nth row in [start, end) that isn't excluded by excl
+// relative to current row i (peer bounds peerStart/peerEnd), or -1 if
+// there is no such row (an all-excluded or empty frame — first_value/
+// last_value/nth_value return NULL in that case).
+func firstInFrame(start, end, i, peerStart, peerEnd int, excl parser.FrameExclusion) int {
+	for k := start; k < end; k++ {
+		if !frameRowExcluded(excl, k, i, peerStart, peerEnd) {
+			return k
+		}
+	}
+	return -1
+}
+
+func lastInFrame(start, end, i, peerStart, peerEnd int, excl parser.FrameExclusion) int {
+	for k := end - 1; k >= start; k-- {
+		if !frameRowExcluded(excl, k, i, peerStart, peerEnd) {
+			return k
+		}
+	}
+	return -1
+}
+
+func nthInFrame(start, end, i, peerStart, peerEnd int, excl parser.FrameExclusion, n int) int {
+	count := 0
+	for k := start; k < end; k++ {
+		if frameRowExcluded(excl, k, i, peerStart, peerEnd) {
+			continue
+		}
+		count++
+		if count == n {
+			return k
+		}
+	}
+	return -1
 }
 
 func (o *windowOp) partitionKey(row Row) (string, error) {

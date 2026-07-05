@@ -95,11 +95,69 @@ WordPress instance) are unaffected.
 
 - `SET`/`RESET` forms keep the legacy compat no-op path (hasAttrs=false in
   `roleNameFromAlter`). `RENAME TO` is now handled — see the follow-up below.
-- Membership (`GRANT role TO role`), `CREATEDB`/`REPLICATION`/`VALID UNTIL`
-  attributes remain accept-and-ignore, as before.
+- Membership (`GRANT role TO role`) remains accept-and-ignore, as before.
+  `CREATEDB`/`CREATEROLE`/`REPLICATION`/`BYPASSRLS`/`CONNECTION LIMIT`/`VALID
+  UNTIL` are now modelled — see the follow-up below.
 - The `pg_roles` virtual view reports real `rolsuper`/`rolcanlogin` for roles
   with recorded attributes; roles registered through other paths keep the
-  historical `f`/`t` defaults.
+  historical `f`/`t` defaults. `pg_roles` itself is NOT extended with the new
+  attribute columns (it only ever exposed 4 of PG's ~15 `pg_roles` columns,
+  a pre-existing intentionally-minimal shape for HammerDB probing — out of
+  scope here); `pg_authid`, which `pg_dump`/`pg_dumpall` actually query for
+  these attributes, is fully extended (see below).
+
+## Follow-up: `CREATEDB`/`CREATEROLE`/`REPLICATION`/`BYPASSRLS`/`CONNECTION
+LIMIT`/`VALID UNTIL` now modelled (DU-002 slice 439 follow-up)
+
+Closes the "Known bounds" accept-and-ignore gap above (deferral-ledger item 1
+of the loop-#107 triage shortlist). `catalog.RoleAttrs` gained `CreateDB`,
+`CreateRole`, `Replication`, `BypassRLS` (bool), `ConnLimit` (int32, PG
+default `-1` — the Go zero value `0` is a DIFFERENT, valid PG setting, so
+every "fresh attrs" construction site in `role_ddl.go` sets `ConnLimit: -1`
+explicitly, mirroring how `CanLogin`'s default already varies by call site),
+and `ValidUntil` (string, the raw `VALID UNTIL '<literal>'` text — goopg
+stores it verbatim and never evaluates it; no password-expiry enforcement).
+
+`applyRoleAttrOptions` (`internal/server/role_ddl.go`) recognises
+`[NO]CREATEDB`/`[NO]CREATEROLE`/`[NO]REPLICATION`/`[NO]BYPASSRLS` (same
+boolean-toggle shape as the pre-existing `LOGIN`/`SUPERUSER` handling),
+`CONNECTION LIMIT <n>` (new `extractRoleConnLimit`, allows negative — PG's
+own `-1` "no limit" sentinel), and `VALID UNTIL '<literal>'` / `VALID UNTIL
+NULL` (new `extractRoleValidUntil`, mirrors `extractRolePassword`'s
+case-preserving literal extraction from the ORIGINAL sql, since
+`normalizeCompatSQL` lower-cases the whole statement).
+
+Persistence follows the same heap-base/WAL-tail split as every other
+attribute in this design, with one exception:
+- `wal.RoleStatePayload` gained 4 new flag bits (`CreateDB`/`CreateRole`/
+  `Replication`/`BypassRLS`), a 4-byte `ConnLimit` field, and a `str16`
+  `ValidUntil` field — the WAL crash-tail (`persistRoleState` →
+  `EncodeRoleState`/`DecodeRoleState`, replayed by
+  `internal/initdb/role_ddl_recovery.go`) carries ALL six new fields.
+- `executor.SyncPgAuthidFile`/`ReadPgAuthidRows`/`initdb.LoadRolesFromAuthidHeap`
+  (the durable base, `global/1260`) carry the four bools + `ConnLimit`
+  through `buildAuthidUserRow`'s expanded signature. `ValidUntil` originally
+  did **NOT** round-trip through the heap column (it stayed unconditionally
+  `NULL`, previously it was, oddly, Unix epoch `1970-01-01` for every
+  non-predefined row — an unrelated latent bug fixed in the same pass since
+  it's the exact field this change touches) — **closed by the "Follow-up:
+  `VALID UNTIL` heap round-trip" section below.**
+
+`catalog.go`'s `pg_authid` `VirtualRows` (the live SQL-visible table
+`pg_dump`/`pg_dumpall` actually query — not the heap file, see the file's own
+header comment) now renders `rolcreaterole`/`rolcreatedb`/`rolreplication`/
+`rolbypassrls`/`rolconnlimit`/`rolvaliduntil` from the `RoleAttrs` sidecar
+instead of the old hardcoded `'f'`/`'f'`/`'f'`/`'f'`/`'-1'`/`NULL` literals;
+the 16 predefined `pg_*` roles keep reporting PG's own predefined-role
+defaults (`ConnLimit: -1` passed explicitly, not the zero-value struct, for
+the same reason as above).
+
+Tests: `internal/server/role_ddl_attrs_test.go` (parse → `RoleAttrs` sidecar
+→ `pg_authid` `VirtualRows`, incl. `ALTER ROLE` negation/override and
+unspecified-attribute-survives-ALTER semantics); `internal/wal/role_ddl_test.go`
+(round-trip incl. the new fields); `internal/initdb/role_ddl_recovery_test.go`
+(`TestPgAuthidSyncLoadRoundTrip` extended to assert the four bools + ConnLimit
+survive a real heap-file round trip across `Open` cycles).
 
 ## Follow-up: `ALTER ROLE/USER … RENAME TO` restart persistence
 
@@ -135,3 +193,41 @@ Tests: `internal/server/role_ddl_rename_test.go` (parsing +
 preservation) + case (e) added to `TestPort_CreateRoleSurvivesRestart`
 (`internal/testport/role_auth_durability_test.go`: rename survives a real
 cluster restart, old name gone, attributes carried to the new name).
+
+## Follow-up: `VALID UNTIL` heap round-trip (DU-002 slice 439 triage item 1
+follow-up)
+
+Closes the residual named above — `rolvaliduntil` was unconditionally
+written as `NULL` to the pg_authid heap file, so a `VALID UNTIL` value set
+by `ALTER ROLE` reverted to no-expiration after a clean restart once the WAL
+segment carrying its crash-tail record was pruned by a checkpoint.
+
+The blocker the original row cited — no PG-timestamp-literal parser exists —
+turned out to be already solved elsewhere: `parseCopyTimestamp`
+(`internal/executor/copy_text.go`) already parses every layout PG's own
+`timestamptz_in` commonly produces (used today for `COPY` text input and
+generic `timestamptz`-column literal coercion, `codec.go`'s `encodeValuePG`
+switch). `buildAuthidUserRow` (`internal/executor/pg_authid_sync.go`) now
+parses `validUntil` with it and, on success, writes a real `timestamptz`
+column value (`NewTimeDatum`) instead of `NullDatum`; `ReadPgAuthidRows`
+decodes it back via a new `formatValidUntilText` helper that renders the
+same `"YYYY-MM-DD HH:MM:SS[.ffffff]+00"` text shape
+`extractRoleValidUntil` (`internal/server/role_ddl.go`) captures from the
+original `VALID UNTIL '...'` literal (goopg stores the column as UTC
+internally, so the zone suffix is always `+00`).
+
+**Deliberately still deferred, narrower than the original gap:** PG's
+`infinity`/`-infinity` timestamptz sentinels (and any other literal
+`parseCopyTimestamp` can't parse) still fall back to `NULL` in the heap
+file — goopg's `timestamptz` type has no infinity representation anywhere
+in the engine yet (encode/decode, comparison, arithmetic), so teaching just
+this one column about it would be an inconsistent, narrow carve-out. A
+`VALID UNTIL 'infinity'` role still round-trips correctly through the WAL
+crash-tail + live `RoleAttrs` sidecar (unchanged), only the heap-file base
+loses it across a checkpoint-pruned clean restart — see the deferral
+ledger for the resume point (full engine-wide timestamptz infinity support).
+
+Tests: `internal/initdb/role_ddl_recovery_test.go`'s
+`TestPgAuthidSyncLoadRoundTrip` extended to set and assert a `ValidUntil`
+value survives a real heap-file round trip across `Open` cycles (previously
+explicitly NOT asserted, per the stale comment this loop removed).

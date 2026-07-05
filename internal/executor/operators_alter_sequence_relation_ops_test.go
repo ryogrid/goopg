@@ -16,6 +16,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -51,6 +52,7 @@ func TestAlterSequenceOwnerTo(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
 
+	cat.(*catalog.InMemory).RegisterRole("alice")
 	if err := runDDL(t, ctx, "CREATE SEQUENCE seqown"); err != nil {
 		t.Fatalf("CREATE SEQUENCE: %v", err)
 	}

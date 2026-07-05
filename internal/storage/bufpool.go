@@ -154,6 +154,75 @@ type Pool struct {
 	// clockHand is the atomic clock-sweep hand for victim selection.
 	clockHand atomic.Int64
 
+	// sharedHitCount / sharedReadCount tally shared-buffer cache hits vs.
+	// disk reads across the pool's lifetime, mirroring PgBufferUsage's
+	// shared_blks_hit / shared_blks_read (postgres/src/backend/utils/
+	// misc/pgstat_wal.c neighbour, actually tracked in executor/instrument.c
+	// BufferUsageAccumDiff). EXPLAIN (ANALYZE, BUFFERS) reads these via
+	// BufferCounters() and diffs a before/after snapshot per plan node
+	// (see internal/executor/instrument.go). Only Pin()'s two decision
+	// points increment these; PinNew (new-block allocation) and the rare
+	// tryPinSlot race-recovery calls inside pinLoad/PinNew are not counted
+	// here (deferred — see .ralph/deferral_ledger.md M0122-0003 BUFFERS row).
+	sharedHitCount  atomic.Int64
+	sharedReadCount atomic.Int64
+
+	// sharedDirtiedCount / sharedWrittenCount extend the pair above to
+	// mirror PgBufferUsage's shared_blks_dirtied / shared_blks_written.
+	// dirtiedCount increments exactly once per clean->dirty transition,
+	// at every MarkDirty* call site (mirrors bufmgr.c's MarkBufferDirty /
+	// MarkBufferDirtyHint: "if the buffer was not dirty already, do
+	// vacuum accounting"). writtenCount increments only when evictVictim
+	// flushes a dirty victim to make room for this pool's own Pin/PinNew
+	// (the FlushBuffer() call site bufmgr.c increments from) — NOT the
+	// bgwriter's WriteDirtyPages or the checkpointer's FlushAll/
+	// FlushAllPaced, since upstream's pgBufferUsage is per-backend and
+	// those run as separate processes with their own counter instance;
+	// counting them here into this pool-wide counter would attribute
+	// background/checkpoint IO to whichever query happens to be running.
+	sharedDirtiedCount atomic.Int64
+	sharedWrittenCount atomic.Int64
+
+	// sharedReadTimeNanos accumulates real wall-clock time spent in the
+	// pinLoad disk read (the exact span OnPinWait/OnPinDone bracket),
+	// backing pg_stat_io's read_time / EXPLAIN's I/O Timings columns
+	// (M0122-0003 track_io_timing follow-up: "actual per-wait-event
+	// timing collection"). Only accumulated when the reading backend has
+	// track_io_timing on — see initdb.Open's OnPinDone wiring, which only
+	// calls AddReadTimeNanos when ActivityRegistry.LookupTrackedGoroutine
+	// reports ok (itself gated on the backend's flag), matching upstream's
+	// "these will be zero if track_io_timing is not enabled" semantics
+	// without this package needing to know about the activity registry.
+	sharedReadTimeNanos atomic.Int64
+
+	// sharedWriteTimeNanos is sharedReadTimeNanos's write-side sibling: real
+	// wall-clock time spent in evictVictim's dirty-victim flushSlot call
+	// (the exact span the OnFlushWait/OnFlushDone bracket covers), backing
+	// pg_stat_io's write_time column. Only accumulated when the evicting
+	// backend has track_io_timing on (see initdb.Open's OnFlushDone wiring,
+	// which mirrors OnPinDone's AddReadTimeNanos call exactly).
+	sharedWriteTimeNanos atomic.Int64
+
+	// sharedEvictionCount / sharedExtendCount back pg_stat_io's evictions /
+	// extends columns (M0122-0003 follow-up: "the remaining five op
+	// counters"). evictionCount increments once per real victim eviction
+	// (evictVictim, only when a valid tag is actually displaced — an empty
+	// slot is not an eviction), regardless of whether the victim was dirty,
+	// mirroring pgBufferUsage's shared_blks_evicted accounting in bufmgr.c's
+	// StrategyGetBuffer/BufferAlloc. extendCount increments once per
+	// successful PinNew relation extension (the pool's sole smgr Extend
+	// call site), mirroring shared_blks_extend.
+	sharedEvictionCount atomic.Int64
+	sharedExtendCount   atomic.Int64
+
+	// sharedExtendTimeNanos is sharedWriteTimeNanos's relation-extension
+	// sibling: real wall-clock time spent in PinNew's mgr.Extend call (the
+	// exact span the OnExtendWait/OnExtendDone bracket covers), backing
+	// pg_stat_io's extend_time column. Only accumulated when the extending
+	// backend has track_io_timing on (see initdb.Open's OnExtendDone
+	// wiring, which mirrors OnFlushDone's AddWriteTimeNanos call exactly).
+	sharedExtendTimeNanos atomic.Int64
+
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.
 	bgwriterMu   sync.Mutex
@@ -181,6 +250,28 @@ type Pool struct {
 
 	// OnPinDone is called after the disk read finishes.
 	OnPinDone func()
+
+	// OnFlushWait is called when evictVictim is about to flush a dirty
+	// victim's page to disk (write_time's OnPinWait analogue).
+	OnFlushWait func()
+
+	// OnFlushDone is called after that flush finishes.
+	OnFlushDone func()
+
+	// OnExtendWait is called when PinNew is about to extend rel via the
+	// pool's sole smgr Extend call (extend_time's OnFlushWait analogue).
+	// Deliberately a distinct pair from storage.Manager's own
+	// OnExtendWait/OnExtendDone (smgr.go) rather than a reuse: the
+	// Manager-level hooks fire for every Extend/ExtendBatch call
+	// regardless of caller, while this pool-level pair — like
+	// OnFlushWait/OnFlushDone versus Manager.OnWriteWait/OnWriteDone —
+	// exists to attribute IO time to pg_stat_io's per-backend-type
+	// extend_time column, which upstream's pgBufferUsage tracks
+	// per-backend, not per-smgr-call.
+	OnExtendWait func()
+
+	// OnExtendDone is called after that extend finishes.
+	OnExtendDone func()
 
 	// OnBufferIOWait is called when a goroutine waits for an in-flight read.
 	OnBufferIOWait func()
@@ -442,6 +533,78 @@ func (p *Pool) RelPath(rel RelFileNode) string {
 // Manager exposes the underlying storage manager.
 func (p *Pool) Manager() *Manager { return p.mgr }
 
+// BufferCounters returns the pool-wide cumulative shared-buffer hit/read
+// tallies. EXPLAIN (ANALYZE, BUFFERS) diffs a before/after snapshot of this
+// pair per plan node (internal/executor/instrument.go) to render PG's
+// "Buffers: shared hit=N read=N" line — mirrors BufferUsage.shared_blks_hit /
+// shared_blks_read (postgres/src/include/executor/instrument.h).
+func (p *Pool) BufferCounters() (hit, read, dirtied, written int64) {
+	return p.sharedHitCount.Load(), p.sharedReadCount.Load(), p.sharedDirtiedCount.Load(), p.sharedWrittenCount.Load()
+}
+
+// AddReadTimeNanos accumulates n nanoseconds of real disk-read wait time
+// into the pool-wide read-time tally. Called only from the OnPinDone hook
+// when the pinning backend has track_io_timing enabled (see
+// sharedReadTimeNanos's doc comment).
+func (p *Pool) AddReadTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedReadTimeNanos.Add(n)
+	}
+}
+
+// ReadTimeNanos returns the pool-wide cumulative real time spent in disk
+// reads by backends with track_io_timing on, backing pg_stat_io's
+// read_time column (milliseconds) and EXPLAIN's I/O Timings.
+func (p *Pool) ReadTimeNanos() int64 {
+	return p.sharedReadTimeNanos.Load()
+}
+
+// AddWriteTimeNanos accumulates n nanoseconds of real dirty-victim flush
+// wait time into the pool-wide write-time tally. Called only from the
+// OnFlushDone hook when the evicting backend has track_io_timing enabled
+// (see sharedWriteTimeNanos's doc comment).
+func (p *Pool) AddWriteTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedWriteTimeNanos.Add(n)
+	}
+}
+
+// WriteTimeNanos returns the pool-wide cumulative real time spent flushing
+// dirty victims by backends with track_io_timing on, backing pg_stat_io's
+// write_time column (milliseconds).
+func (p *Pool) WriteTimeNanos() int64 {
+	return p.sharedWriteTimeNanos.Load()
+}
+
+// EvictionCount returns the pool-wide cumulative count of real victim
+// evictions (backs pg_stat_io's evictions column).
+func (p *Pool) EvictionCount() int64 {
+	return p.sharedEvictionCount.Load()
+}
+
+// ExtendCount returns the pool-wide cumulative count of relation extensions
+// (backs pg_stat_io's extends / extend_bytes columns).
+func (p *Pool) ExtendCount() int64 {
+	return p.sharedExtendCount.Load()
+}
+
+// AddExtendTimeNanos accumulates n nanoseconds of real relation-extension
+// wait time into the pool-wide extend-time tally. Called only from the
+// OnExtendDone hook when the extending backend has track_io_timing enabled
+// (see sharedExtendTimeNanos's doc comment).
+func (p *Pool) AddExtendTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedExtendTimeNanos.Add(n)
+	}
+}
+
+// ExtendTimeNanos returns the pool-wide cumulative real time spent
+// extending relations by backends with track_io_timing on, backing
+// pg_stat_io's extend_time column (milliseconds).
+func (p *Pool) ExtendTimeNanos() int64 {
+	return p.sharedExtendTimeNanos.Load()
+}
+
 // SyncAllDataFiles fdatasyncs every open data file.
 func (p *Pool) SyncAllDataFiles() error {
 	if p.mgr == nil {
@@ -637,6 +800,7 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 	if oldTag == (BufferTag{}) {
 		return nil // slot was free
 	}
+	p.sharedEvictionCount.Add(1)
 	// Delete from bufmap BEFORE flushing to ensure no stale lookups.
 	p.bm.Delete(oldTag, int32(victimIdx))
 	p.tombstones.Add(1)
@@ -646,12 +810,19 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		// Release pinMu while doing IO so other goroutines can proceed.
 		p.pinMu.Unlock()
 		s.contentMu.Lock()
+		if p.OnFlushWait != nil {
+			p.OnFlushWait()
+		}
 		flushErr := p.flushSlot(oldTag, s.page)
+		if p.OnFlushDone != nil {
+			p.OnFlushDone()
+		}
 		s.contentMu.Unlock()
 		p.pinMu.Lock()
 		if flushErr != nil {
 			return flushErr
 		}
+		p.sharedWrittenCount.Add(1)
 	}
 	return nil
 }
@@ -684,7 +855,13 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
+	if p.OnExtendWait != nil {
+		p.OnExtendWait()
+	}
 	blk, err := p.mgr.Extend(rel, s.page)
+	if p.OnExtendDone != nil {
+		p.OnExtendDone()
+	}
 	s.contentMu.Unlock()
 	if err != nil {
 		p.pinMu.Lock()
@@ -692,6 +869,7 @@ func (p *Pool) PinNew(rel RelFileNode) (*Slot, BlockNumber, error) {
 		p.pinMu.Unlock()
 		return nil, InvalidBlockNumber, err
 	}
+	p.sharedExtendCount.Add(1)
 	p.pinMu.Lock()
 
 	// Emit SmgrCreate WAL record on first block creation.
@@ -796,6 +974,7 @@ func (p *Pool) Pin(tag BufferTag) (*Slot, error) {
 				}
 				newSt := (old &^ (slotPinMask | slotUsageMask)) | (pinCount + 1) | (usage << slotUsageShift)
 				if s.state.CompareAndSwap(old, newSt) {
+					p.sharedHitCount.Add(1)
 					return s, nil
 				}
 				// CAS failed (concurrent pin/unpin); retry fast path.
@@ -843,6 +1022,7 @@ func (p *Pool) pinSlow(tag BufferTag) (*Slot, error) {
 			if stateValid(old) && stateGen(old) == gen {
 				// Valid: try to pin.
 				if s2 := p.tryPinSlot(slotIdx, gen); s2 != nil {
+					p.sharedHitCount.Add(1)
 					return s2, nil
 				}
 				// tryPinSlot failed (race): retry
@@ -922,6 +1102,7 @@ func (p *Pool) pinLoad(tag BufferTag) (*Slot, error) {
 	for i := int32(0); i < n; i++ {
 		runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 	}
+	p.sharedReadCount.Add(1)
 	return s, nil
 }
 
@@ -1003,6 +1184,7 @@ func (p *Pool) MarkDirty(s *Slot) {
 			return // already dirty
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			return
 		}
 	}
@@ -1019,6 +1201,7 @@ func (p *Pool) MarkDirtyHintBit(s *Slot) {
 			return
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			return
 		}
 	}
@@ -1047,6 +1230,7 @@ func (p *Pool) markDirtyWithLSNCommon(s *Slot) {
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}
@@ -1062,6 +1246,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 				return
 			}
 			if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+				p.sharedDirtiedCount.Add(1)
 				return
 			}
 		}
@@ -1078,6 +1263,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 				return
 			}
 			if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+				p.sharedDirtiedCount.Add(1)
 				return
 			}
 		}
@@ -1089,6 +1275,7 @@ func (p *Pool) MarkDirtyForceFPI(s *Slot) {
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}
@@ -1133,6 +1320,7 @@ func (p *Pool) MarkDirtyChangeRecord(s *Slot, emitter func() (LSN, error)) error
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}
@@ -1170,6 +1358,7 @@ func (p *Pool) MarkDirtyLogicalChange(s *Slot, emitter func() (LSN, error)) erro
 			break
 		}
 		if s.state.CompareAndSwap(old, old|slotDirtyBit) {
+			p.sharedDirtiedCount.Add(1)
 			break
 		}
 	}

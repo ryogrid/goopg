@@ -94,3 +94,64 @@ func TestExplainCTEScanRecursesIntoChild(t *testing.T) {
 		t.Errorf("CTE Scan label not found:\n%s", strings.Join(lines, "\n"))
 	}
 }
+
+// TestExplainCTEScanAnalyzeReportsActualRows: M0122-0003. Build()'s
+// CTEScan/CTEDMLPrefix/MaterializedCTEScan cases previously skipped
+// maybeInstrument, so `EXPLAIN ANALYZE` over a CTE reported cost-only
+// estimates for the CTE Scan node itself (its inlined child still
+// showed actual stats, since the child is Built recursively inside
+// newCteScanOp — only the wrapping CTEScan node was uninstrumented).
+func TestExplainCTEScanAnalyzeReportsActualRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE WITH a AS (SELECT 1) SELECT * FROM a")
+	joined := strings.Join(lines, "\n")
+	cteLine := ""
+	for _, l := range lines {
+		if strings.Contains(l, "CTE Scan on a") {
+			cteLine = l
+			break
+		}
+	}
+	if cteLine == "" {
+		t.Fatalf("CTE Scan label not found:\n%s", joined)
+	}
+	if !strings.Contains(cteLine, "actual time=") || !strings.Contains(cteLine, "rows=1.00") {
+		t.Errorf("CTE Scan node missing actual rows/time instrumentation:\n%s", cteLine)
+	}
+}
+
+// TestExplainCTEDMLPrefixAnalyzeReportsActualRows: the "CTE DML"
+// summary node (wrapping data-modifying CTEs run before the outer
+// query) now reports actual rows/time too. Note: the DML plans
+// themselves and the outer body are Built lazily inside
+// cteDMLPrefixOp.Open() (after execution ordering requires the
+// write-then-snapshot-restore dance), which falls outside the
+// withInstrumentation() scope explainOp.Open() establishes around
+// the top-level Build() call — so nested nodes under "CTE DML"
+// (e.g. "Insert on t") do not yet get their own actual-rows
+// annotation. Deferred; see .ralph/deferral_ledger.md M0122-0003.
+func TestExplainCTEDMLPrefixAnalyzeReportsActualRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE WITH ins AS (INSERT INTO t VALUES (1),(2) RETURNING id) SELECT * FROM ins")
+	joined := strings.Join(lines, "\n")
+	dmlLine := ""
+	for _, l := range lines {
+		if strings.Contains(l, "CTE DML") {
+			dmlLine = l
+			break
+		}
+	}
+	if dmlLine == "" {
+		t.Fatalf("CTE DML label not found:\n%s", joined)
+	}
+	if !strings.Contains(dmlLine, "actual time=") || !strings.Contains(dmlLine, "rows=2.00") {
+		t.Errorf("CTE DML node missing actual rows/time instrumentation:\n%s", dmlLine)
+	}
+}

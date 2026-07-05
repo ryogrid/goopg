@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // nodeStats holds the per-Node runtime counters EXPLAIN ANALYZE
@@ -31,6 +32,19 @@ type nodeStats struct {
 	// ANALYZE as the "Heap Fetches" line / JSON key. The IOS operator
 	// increments it directly via a pointer handed to it in maybeInstrument.
 	heapFetches int64
+
+	// bufHit / bufRead / bufDirtied / bufWritten are the cumulative
+	// shared-buffer hit/read/dirtied/written counts EXPLAIN (ANALYZE,
+	// BUFFERS) attributes to this node, inclusive of its children (same
+	// nested-stopwatch semantics as totalNs above — a parent's Next() call
+	// fully executes its child's Next() calls before returning, so the
+	// pool-counter delta since the last checkpoint naturally rolls up
+	// whatever the subtree touched). The bufBase* fields hold the
+	// last-seen storage.Pool snapshot for delta computation; bufSeeded
+	// guards the very first checkpoint on Open.
+	bufHit, bufRead, bufDirtied, bufWritten                 int64
+	bufBaseHit, bufBaseRead, bufBaseDirtied, bufBaseWritten int64
+	bufSeeded                                               bool
 }
 
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
@@ -39,6 +53,7 @@ type instrumentedOp struct {
 	inner Operator
 	plan  planner.Node
 	stats *nodeStats
+	pool  *storage.Pool // captured from ctx.Pool in Open; nil-safe (BUFFERS off / no ctx.Pool)
 }
 
 // underlying lets `setChildBorrow` (M0054-0005a-followup) reach
@@ -56,6 +71,13 @@ func (o *instrumentedOp) Schema() planner.Schema { return o.inner.Schema() }
 // rescan produces fresh numbers.
 func (o *instrumentedOp) Open(ctx *Context) error {
 	o.stats.loops++
+	if ctx != nil && ctx.Pool != nil {
+		o.pool = ctx.Pool
+		if !o.stats.bufSeeded {
+			o.stats.bufBaseHit, o.stats.bufBaseRead, o.stats.bufBaseDirtied, o.stats.bufBaseWritten = o.pool.BufferCounters()
+			o.stats.bufSeeded = true
+		}
+	}
 	if o.stats.timing {
 		now := time.Now()
 		o.stats.openTime = now
@@ -65,11 +87,30 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 	return o.inner.Open(ctx)
 }
 
+// accountBuffers rolls the storage.Pool's global hit/read/dirtied/written
+// counters forward into this node's running total, attributing everything
+// touched since the last checkpoint (by this node or any descendant called
+// from within it) to this node — see the bufHit/bufRead doc comment on
+// nodeStats.
+func (o *instrumentedOp) accountBuffers() {
+	if o.pool == nil {
+		return
+	}
+	hit, read, dirtied, written := o.pool.BufferCounters()
+	o.stats.bufHit += hit - o.stats.bufBaseHit
+	o.stats.bufRead += read - o.stats.bufBaseRead
+	o.stats.bufDirtied += dirtied - o.stats.bufBaseDirtied
+	o.stats.bufWritten += written - o.stats.bufBaseWritten
+	o.stats.bufBaseHit, o.stats.bufBaseRead = hit, read
+	o.stats.bufBaseDirtied, o.stats.bufBaseWritten = dirtied, written
+}
+
 // Next records the per-row delta into the running total and
 // (on the first non-EOF row of this Open cycle) records the
 // startup time.
 func (o *instrumentedOp) Next() (TupleSlot, error) {
 	slot, err := o.inner.Next()
+	o.accountBuffers()
 	if err == EOF {
 		return nil, EOF
 	}
@@ -93,7 +134,9 @@ func (o *instrumentedOp) Next() (TupleSlot, error) {
 // via type-assertion so `INSERT N` still reaches the wire layer
 // when the operator is wrapped.
 func (o *instrumentedOp) Close() error {
-	return o.inner.Close()
+	err := o.inner.Close()
+	o.accountBuffers()
+	return err
 }
 
 // RowsAffected delegates so wrapped DML operators continue to

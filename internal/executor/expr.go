@@ -27,6 +27,7 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/sqlkeywords"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 // sessionPRNG is the per-process random-number generator used by random(),
@@ -3249,6 +3250,188 @@ func parsePgSnapshotValid(s string) bool {
 	return true
 }
 
+// resolveRegclassOID evaluates a regclass/oid argument to its underlying OID.
+// A regclass value already carries its OID once evaluated (or, less
+// commonly, arrives as the textual OID from an explicit ::regclass cast) —
+// same pattern already used by pg_get_indexdef/pg_get_statisticsobjdef.
+func resolveRegclassOID(argExpr planner.Expr, row Row, ctx *Context) (uint32, bool) {
+	arg, err := evalExpr(argExpr, row, ctx)
+	if err != nil || arg.IsNull() {
+		return 0, false
+	}
+	if arg.Kind == KindInt {
+		return uint32(arg.Int), true
+	}
+	v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+	if perr != nil {
+		return 0, false
+	}
+	return uint32(v), true
+}
+
+// parseForkName maps a pg_relation_size fork-name argument to storage's
+// ForkNumber, matching PG's forkname_to_number (relfilenodemap.c/relpath.h).
+func parseForkName(s string) (storage.ForkNumber, bool) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "main":
+		return storage.MainFork, true
+	case "fsm":
+		return storage.FSMFork, true
+	case "vm", "visibilitymap":
+		return storage.VisibilityMapFork, true
+	case "init":
+		return storage.InitFork, true
+	default:
+		return 0, false
+	}
+}
+
+// relationForkSize returns the byte size of one fork of rel, or 0 if that
+// fork's file has never been created. Checking Pool.Exists first is load-
+// bearing: calling NBlocks on a fork that doesn't exist would silently
+// create it (smgr O_CREATE semantics) — pg_relation_size must never do
+// that as a side effect of merely being called.
+func relationForkSize(pool *storage.Pool, rel storage.RelFileNode, fork storage.ForkNumber) int64 {
+	rel.Fork = fork
+	if !pool.Exists(rel) {
+		return 0
+	}
+	n, err := pool.NBlocks(rel)
+	if err != nil {
+		return 0
+	}
+	return int64(n) * storage.BlockSize
+}
+
+// relationAllForksSize sums the main/fsm/vm forks of rel — goopg never
+// materializes FSM/VM as separate on-disk forks, so those two always
+// contribute 0 via relationForkSize's Exists check (an accurate "never
+// created" answer, not a stub value).
+func relationAllForksSize(pool *storage.Pool, rel storage.RelFileNode) int64 {
+	return relationForkSize(pool, rel, storage.MainFork) +
+		relationForkSize(pool, rel, storage.FSMFork) +
+		relationForkSize(pool, rel, storage.VisibilityMapFork)
+}
+
+// relationFileNodeForOID resolves a regclass OID to its RelFileNode, for
+// either an ordinary table or an index — pg_relation_size accepts both.
+func relationFileNodeForOID(cat *catalog.InMemory, oid uint32) (storage.RelFileNode, bool) {
+	if tbl, ok := cat.LookupTableByOID(oid); ok {
+		return cat.RelFileNode(tbl), true
+	}
+	if idx, ok := cat.LookupIndexByOID(oid); ok {
+		return cat.IndexRelFileNode(idx), true
+	}
+	return storage.RelFileNode{}, false
+}
+
+// evalPgRelationSize implements pg_relation_size(relation [, fork]) → bigint,
+// mirroring PG's calculate_relation_size (dbsize.c): the byte size of one
+// named fork (default "main") of the relation's own storage. M0122-0002.
+func evalPgRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationFileNodeForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	fork := storage.MainFork
+	if len(x.Args) >= 2 {
+		forkArg, err := evalExpr(x.Args[1], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if forkArg.IsNull() {
+			return NullDatum, nil
+		}
+		f, ok := parseForkName(forkArg.StringValue())
+		if !ok {
+			return Datum{}, &ExecError{Code: "22023", Message: fmt.Sprintf("invalid fork name %q", forkArg.StringValue())}
+		}
+		fork = f
+	}
+	return Datum{Kind: KindInt, Int: relationForkSize(ctx.Pool, rel, fork)}, nil
+}
+
+// evalPgTableSize implements pg_table_size(relation) → bigint, mirroring
+// PG's calculate_table_size: the table's own main/fsm/vm forks plus its
+// TOAST relation's forks (but not its indexes — pg_indexes_size covers
+// those separately). M0122-0002.
+func evalPgTableSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	rel, ok := relationFileNodeForOID(cat, oid)
+	if !ok {
+		return NullDatum, nil
+	}
+	total := relationAllForksSize(ctx.Pool, rel)
+	if toastRel, ok := cat.ToastRelFileNode(rel); ok {
+		total += relationAllForksSize(ctx.Pool, toastRel)
+	}
+	return Datum{Kind: KindInt, Int: total}, nil
+}
+
+// evalPgIndexesSize implements pg_indexes_size(relation) → bigint: the
+// summed size of every index belonging to the named table. M0122-0002.
+func evalPgIndexesSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) < 1 {
+		return NullDatum, nil
+	}
+	oid, ok := resolveRegclassOID(x.Args[0], row, ctx)
+	if !ok {
+		return NullDatum, nil
+	}
+	cat, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return NullDatum, nil
+	}
+	var total int64
+	for _, idx := range cat.AllIndexes() {
+		if idx.Table == nil || idx.Table.OID != oid {
+			continue
+		}
+		total += relationAllForksSize(ctx.Pool, cat.IndexRelFileNode(idx))
+	}
+	return Datum{Kind: KindInt, Int: total}, nil
+}
+
+// evalPgTotalRelationSize implements pg_total_relation_size(relation) →
+// bigint: pg_table_size + pg_indexes_size, matching PG's
+// calculate_total_relation_size. M0122-0002.
+func evalPgTotalRelationSize(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	tableSize, err := evalPgTableSize(x, row, ctx)
+	if err != nil || tableSize.IsNull() {
+		return tableSize, err
+	}
+	idxSize, err := evalPgIndexesSize(x, row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	total := tableSize.Int
+	if !idxSize.IsNull() {
+		total += idxSize.Int
+	}
+	return Datum{Kind: KindInt, Int: total}, nil
+}
+
 // sizePretty formats a byte count as a human-readable size string, matching
 // PostgreSQL's pg_size_pretty() output. Uses 1024-based units. M0097-0018.
 //
@@ -5033,6 +5216,91 @@ func evalMakeTime(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 
 // evalIsFinite stubs isfinite(date/timestamp/interval). goopg v0 does not
 // store infinity values, so always returns TRUE for non-NULL input. M0097-0004.
+// regexpFirstMatchArray computes the text[] datum for the FIRST match of re
+// against s, mirroring PostgreSQL's regexp_match/regexp_matches element
+// semantics (postgres/src/backend/utils/adt/regexp.c setup_regexp_matches):
+// when the pattern has parenthesized capture groups, the array holds those
+// groups (NOT the overall match); with no groups, the array's sole element
+// is the whole match. A capture group that did not participate in the match
+// (e.g. the losing side of a `(a)|(b)` alternation) yields SQL NULL, not "".
+// Does not perform PG array-literal escaping/quoting of element contents
+// (pre-existing simplification, unchanged from this function's predecessor).
+func regexpFirstMatchArray(re *regexp.Regexp, s string) Datum {
+	idx := re.FindStringSubmatchIndex(s)
+	if idx == nil {
+		return NullDatum
+	}
+	return regexpMatchArrayDatum(re, s, idx)
+}
+
+// regexpMatchArrayDatum builds the text[] array-literal Datum for one match,
+// given a submatch index slice as returned by FindStringSubmatchIndex /
+// FindAllStringSubmatchIndex. Shared by regexpFirstMatchArray (single match)
+// and regexpAllMatchesArrays (SRF, one call per match).
+func regexpMatchArrayDatum(re *regexp.Regexp, s string, idx []int) Datum {
+	var elems []string
+	if re.NumSubexp() == 0 {
+		elems = []string{s[idx[0]:idx[1]]}
+	} else {
+		for i := 1; i <= re.NumSubexp(); i++ {
+			lo, hi := idx[2*i], idx[2*i+1]
+			if lo < 0 {
+				elems = append(elems, "NULL")
+			} else {
+				elems = append(elems, s[lo:hi])
+			}
+		}
+	}
+	return NewStringDatum("{" + strings.Join(elems, ",") + "}")
+}
+
+// regexpAllMatchesArrays mirrors regexp_matches(string, pattern, 'g')'s SRF
+// semantics (postgres/src/backend/utils/adt/regexp.c setup_regexp_matches):
+// with the 'g' flag, one Datum per match against s; without it, PG's SRF form
+// still yields at most one row (the first match), same as the scalar case.
+// Returns nil (zero rows) when there is no match, matching PG's SRF row count
+// (unlike the scalar-position fallback, which returns SQL NULL for no match).
+func regexpAllMatchesArrays(re *regexp.Regexp, s string, global bool) []Datum {
+	if !global {
+		if d := regexpFirstMatchArray(re, s); !d.IsNull() {
+			return []Datum{d}
+		}
+		return nil
+	}
+	allIdx := re.FindAllStringSubmatchIndex(s, -1)
+	if len(allIdx) == 0 {
+		return nil
+	}
+	out := make([]Datum, len(allIdx))
+	for i, idx := range allIdx {
+		out[i] = regexpMatchArrayDatum(re, s, idx)
+	}
+	return out
+}
+
+// evalRegexpMatchesSRF evaluates regexp_matches(string, pattern[, flags]) in
+// SELECT-list SRF position (see projectSetOp.openSelectSrfMode). Invalid
+// patterns / NULL string or pattern args yield zero rows rather than an
+// error, matching the permissiveness of the pre-existing scalar case arm.
+func evalRegexpMatchesSRF(sD, patD, flagsD Datum) []Datum {
+	if sD.IsNull() || patD.IsNull() {
+		return nil
+	}
+	flags := ""
+	if !flagsD.IsNull() {
+		flags = flagsD.StringValue()
+	}
+	pattern := patD.StringValue()
+	if strings.Contains(flags, "i") {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+	return regexpAllMatchesArrays(re, sD.StringValue(), strings.Contains(flags, "g"))
+}
+
 func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
@@ -5156,6 +5424,26 @@ func evalInExpr(x *planner.InExpr, slot SlotView, ctx *Context) (Datum, error) {
 	values, err := collectInValues(x, row, ctx)
 	if err != nil {
 		return Datum{}, err
+	}
+	// op ALL semantics (ScalarArrayOpExpr, useOr=false): `left op ALL(...)` —
+	// AND of (left op elem) for each element; false as soon as one element
+	// fails the comparison. NULL elements are skipped (same simplification
+	// as the ANY branch below, not full three-valued NULL propagation).
+	// M0122-0004.
+	if x.AnyOp != 0 && x.AllOp {
+		for _, v := range values {
+			if v.IsNull() {
+				continue
+			}
+			res, err := evalBinary(x.AnyOp, operand, v, 0)
+			if err != nil {
+				return Datum{}, err
+			}
+			if res.Kind == KindBool && !res.BoolValue() {
+				return NewBoolDatum(false), nil
+			}
+		}
+		return NewBoolDatum(true), nil
 	}
 	// op ANY semantics (ScalarArrayOpExpr): `left op ANY(array)` — OR of
 	// (left op elem) for each element. Used for non-equality operators like
@@ -7192,13 +7480,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// Stub: return 8 MB. M0097-0018.
 		return Datum{Kind: KindInt, Int: 8 * 1024 * 1024}, nil
 
-	case "pg_relation_size", "pg_total_relation_size", "pg_indexes_size":
-		// Stub: return 8 kB. M0097-0018.
-		return Datum{Kind: KindInt, Int: 8 * 1024}, nil
+	case "pg_relation_size":
+		return evalPgRelationSize(x, row, ctx)
+
+	case "pg_total_relation_size":
+		return evalPgTotalRelationSize(x, row, ctx)
+
+	case "pg_indexes_size":
+		return evalPgIndexesSize(x, row, ctx)
 
 	case "pg_table_size":
-		// Stub: return 8 kB. M0097-0018.
-		return Datum{Kind: KindInt, Int: 8 * 1024}, nil
+		return evalPgTableSize(x, row, ctx)
 
 	// ── xid8 comparison function (M0097-0018) ─────────────────────────────
 	case "xid8cmp":
@@ -7280,10 +7572,21 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 
 	// ── POSIX regex functions (M0097-0011) ────────────────────────────────
-	case "regexp_match":
-		// regexp_match(string, pattern [, flags]) → text[]
-		// Returns first match as array or NULL if no match.
-		// Stub: return text[] with full match as first element, or NULL.
+	case "regexp_match", "regexp_matches":
+		// regexp_match(string, pattern [, flags]) → text[] (at most one match)
+		// regexp_matches(string, pattern [, flags]) → setof text[] (PG is an
+		// SRF that yields one row per match with the 'g' flag). This scalar
+		// path handles regexp_match always, plus regexp_matches whenever it
+		// is NOT a bare SELECT-list target (e.g. nested in a larger
+		// expression, or in a context buildSelectSrfProjectSet doesn't cover
+		// such as WHERE/GROUP BY) — it returns at most the FIRST match's
+		// capture-group array, matching regexp_match's own behavior. A bare
+		// `regexp_matches(...)` SELECT-list target is instead planned as a
+		// RegexpMatchesCol and expanded per-match by projectSetOp (see
+		// operators_project_set.go / evalRegexpMatchesSRF), which is the only
+		// path that honours the 'g' flag's one-row-per-match semantics. The
+		// FROM-clause form (`FROM regexp_matches(...)`) is still unwired
+		// (ledger M0122-0002/regexp_matches-srf).
 		if len(x.Args) >= 2 {
 			s, e1 := evalExpr(x.Args[0], row, ctx)
 			pat, e2 := evalExpr(x.Args[1], row, ctx)
@@ -7305,15 +7608,8 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil {
 				return NullDatum, nil
 			}
-			match := re.FindString(s.StringValue())
-			if match == "" && !re.MatchString(s.StringValue()) {
-				return NullDatum, nil
-			}
-			return NewStringDatum("{" + match + "}"), nil
+			return regexpFirstMatchArray(re, s.StringValue()), nil
 		}
-	case "regexp_matches":
-		// regexp_matches(string, pattern [, flags]) — SRF, stub returns NULL
-		return NullDatum, nil
 
 	// ── Sequence functions (M0097-0009) ───────────────────────────────────
 	case "nextval":

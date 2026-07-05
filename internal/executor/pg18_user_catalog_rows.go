@@ -24,6 +24,13 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// PGClassColumnsPG18 exports pgClassColumnsPG18 for initdb's
+// loadUserTablesFromHeap, which needs the full 34-column schema to decode a
+// pg_class physical row's varlena columns (e.g. reloptions) via
+// DecodeRowIntoMctxPGTuple — the hand-written DecodePGClassPhysicalRow in
+// package catalog only covers the fixed-offset prefix. M0119-0004.
+func PGClassColumnsPG18() []catalog.Column { return pgClassColumnsPG18() }
+
 // pgClassColumnsPG18 mirrors initdb.pgClassColDefs — the canonical PG18
 // pg_class row layout (34 columns, matching the Form_pg_class struct in
 // postgres/src/include/catalog/pg_class.h).
@@ -422,10 +429,14 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	relkind := "r"
 	if tbl.PartitionMethod != "" {
 		relkind = "p" // partitioned table
+	} else if tbl.IsMatView {
+		relkind = "m" // materialized view (has physical storage, unlike a plain view)
+	} else if tbl.View != nil {
+		relkind = "v" // plain view (no physical storage — the SELECT substitutes at reference time)
 	}
 	relfilenode := int64(tbl.OID)
-	if relkind == "p" {
-		relfilenode = 0 // partitioned tables have no physical storage
+	if relkind == "p" || relkind == "v" {
+		relfilenode = 0 // partitioned tables and plain views have no physical storage
 	}
 	isPartition := tbl.PartitionParentOID != 0
 	// relpersistence: 'u' for UNLOGGED tables, 'p' for permanent. pg_dump keys
@@ -448,6 +459,19 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		relpartbound = catalog.FormatPartitionBound(tbl.PartitionBounds[0])
 	}
 	replIdent := catalog.ReplIdentOrDefault(tbl.ReplicaIdentity) // 'd' default; FULL/NOTHING via ALTER, DU-002 slice 305
+	// reloptions: shared builder with catalog.go's live VirtualRows pg_class
+	// path (catalog.TableReloptionsElements) so a table/view's storage
+	// parameters (fillfactor, autovacuum_*, and for views security_barrier/
+	// security_invoker/check_option) survive a restart instead of being
+	// silently dropped by a hardcoded "{}". The "text[]" physical column
+	// must carry a real PG ArrayType blob (pgTextArrayBytes) via KindBytes —
+	// encodeValuePG's "text[]" case silently discards a KindString and
+	// substitutes an empty array, so NewStringDatum here would round-trip
+	// as if no reloptions were ever set. M0119-0004.
+	reloptionsDatum := NullDatum
+	if relopts := catalog.TableReloptionsElements(tbl); len(relopts) > 0 {
+		reloptionsDatum = NewBytesDatum(pgTextArrayBytes(relopts))
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -481,7 +505,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(minFrozenXID),                                  // relfrozenxid
 		NewIntDatum(minFrozenMXID),                                 // relminmxid
 		NewStringDatum("{}"),                                       // relacl (encoded as empty aclitem[] ArrayType)
-		NewStringDatum("{}"),                                       // reloptions (encoded as empty text[] ArrayType)
+		reloptionsDatum,                                            // reloptions (fillfactor/autovacuum_*/security_*/check_option, or NULL)
 		NewStringDatum(relpartbound),                               // relpartbound (FOR VALUES … for partition children)
 	}
 }
@@ -501,6 +525,16 @@ func indexPersistence(idx *catalog.Index) string {
 // pg_class row for a user-defined index.
 func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 	natts := int64(len(idx.Columns))
+	// reloptions: shared builder with catalog.go's live VirtualRows pg_class
+	// path (catalog.IndexReloptionsElements) so an index's storage parameters
+	// (fillfactor, deduplicate_items, fastupdate, gin_pending_list_limit,
+	// pages_per_range, autosummarize) survive a restart instead of being
+	// silently dropped by a hardcoded "{}" — mirrors buildUserPGClassRow's
+	// table/view fix (M0119-0004 index-reloptions follow-up).
+	idxReloptionsDatum := NullDatum
+	if relopts := catalog.IndexReloptionsElements(idx); len(relopts) > 0 {
+		idxReloptionsDatum = NewBytesDatum(pgTextArrayBytes(relopts))
+	}
 	return Row{
 		NewIntDatum(int64(idx.OID)),
 		NewStringDatum(idx.Name),
@@ -534,7 +568,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(minFrozenXID),             // relfrozenxid
 		NewIntDatum(minFrozenMXID),            // relminmxid
 		NewStringDatum("{}"),                  // relacl
-		NewStringDatum("{}"),                  // reloptions
+		idxReloptionsDatum,                    // reloptions (fillfactor/fastupdate/… or NULL)
 		NewStringDatum(""),                    // relpartbound
 	}
 }
@@ -1322,7 +1356,7 @@ func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
 		NewIntDatum(int64(et.OID)),                     // oid
 		NewStringDatum(et.Name),                        // typname (name type)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(et.OwnerOrDefault())),        // typowner
 		NewIntDatum(4),                                 // typlen (enum = 4 bytes, like oid)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("e"),                            // typtype = 'e' (enum)
@@ -1369,7 +1403,7 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NewIntDatum(int64(et.ArrayOID)),                // oid
 		NewStringDatum("_" + et.Name),                  // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(et.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                // typlen (varlena array)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("b"),                            // typtype = 'b' (base)
@@ -1413,7 +1447,7 @@ func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
 		NewIntDatum(int64(ct.OID)),                     // oid
 		NewStringDatum(ct.Name),                        // typname (name type)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(ct.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                // typlen (varlena composite)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("c"),                            // typtype = 'c' (composite)
@@ -1453,7 +1487,7 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NewIntDatum(int64(ct.ArrayOID)),                // oid
 		NewStringDatum("_" + ct.Name),                  // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(ct.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                // typlen (varlena array)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("b"),                            // typtype = 'b' (base)

@@ -299,6 +299,9 @@ func analyzeSelectWithParent(s *parser.SelectStmt, cat catalog.Catalog, parent *
 		ctx.rels = rels
 	}
 
+	if err := resolveNamedWindowRefs(s); err != nil {
+		return err
+	}
 	if err := analyzeTargets(s.Targets, ctx); err != nil {
 		return err
 	}
@@ -758,6 +761,119 @@ func analyzeTargets(targets []parser.ResTarget, ctx *scope) error {
 	return nil
 }
 
+// resolveNamedWindowRefs resolves every bare `OVER window_name`
+// reference in s against s.WindowClause (M0020 named-window slice),
+// copying the matching definition's PartitionBy/OrderBy into the
+// referencing WindowDef in place. Downstream consumers (planner,
+// executor) read FuncCall.Over.PartitionBy/OrderBy directly and need
+// no awareness of RefName — this is the only place the reference is
+// resolved. Raises 42P20 ("window %q does not exist") for a name with
+// no matching WINDOW clause item.
+func resolveNamedWindowRefs(s *parser.SelectStmt) error {
+	defs := make(map[string]*parser.WindowDef, len(s.WindowClause))
+	for _, nw := range s.WindowClause {
+		defs[strings.ToLower(nw.Name)] = nw.Def
+	}
+	for _, rt := range s.Targets {
+		if err := resolveWindowRefsInExpr(rt.Expr, defs); err != nil {
+			return err
+		}
+	}
+	for _, g := range s.GroupBy {
+		if err := resolveWindowRefsInExpr(g, defs); err != nil {
+			return err
+		}
+	}
+	if s.Having != nil {
+		if err := resolveWindowRefsInExpr(s.Having, defs); err != nil {
+			return err
+		}
+	}
+	for _, sb := range s.OrderBy {
+		if err := resolveWindowRefsInExpr(sb.Expr, defs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// resolveWindowRefsInExpr mirrors exprHasWindowFunc's traversal shape
+// (pattern_sibling_paths_must_agree) but resolves a bare `OVER name`
+// reference against defs instead of merely detecting a window func's
+// presence.
+func resolveWindowRefsInExpr(e parser.Expr, defs map[string]*parser.WindowDef) error {
+	switch x := e.(type) {
+	case *parser.BinaryOp:
+		if err := resolveWindowRefsInExpr(x.Left, defs); err != nil {
+			return err
+		}
+		return resolveWindowRefsInExpr(x.Right, defs)
+	case *parser.UnaryOp:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.CastExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.ExtractExpr:
+		return resolveWindowRefsInExpr(x.Source, defs)
+	case *parser.CaseExpr:
+		if x.Operand != nil {
+			if err := resolveWindowRefsInExpr(x.Operand, defs); err != nil {
+				return err
+			}
+		}
+		for _, w := range x.Whens {
+			if err := resolveWindowRefsInExpr(w.When, defs); err != nil {
+				return err
+			}
+			if err := resolveWindowRefsInExpr(w.Then, defs); err != nil {
+				return err
+			}
+		}
+		if x.Else != nil {
+			return resolveWindowRefsInExpr(x.Else, defs)
+		}
+		return nil
+	case *parser.IsNullExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.IsBoolExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.CollateExpr:
+		return resolveWindowRefsInExpr(x.Operand, defs)
+	case *parser.IsDistinctFromExpr:
+		if err := resolveWindowRefsInExpr(x.Left, defs); err != nil {
+			return err
+		}
+		return resolveWindowRefsInExpr(x.Right, defs)
+	case *parser.InExpr:
+		if err := resolveWindowRefsInExpr(x.Operand, defs); err != nil {
+			return err
+		}
+		for _, v := range x.List {
+			if err := resolveWindowRefsInExpr(v, defs); err != nil {
+				return err
+			}
+		}
+		return nil
+	case *parser.FuncCall:
+		if x.Over != nil && x.Over.RefName != "" {
+			def, ok := defs[strings.ToLower(x.Over.RefName)]
+			if !ok {
+				return analyzeError(x.Over.Pos(), "42P20", fmt.Sprintf("window %q does not exist", x.Over.RefName))
+			}
+			x.Over.PartitionBy = def.PartitionBy
+			x.Over.OrderBy = def.OrderBy
+			x.Over.Frame = def.Frame
+		}
+		for _, a := range x.Args {
+			if err := resolveWindowRefsInExpr(a, defs); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+}
+
 func exprHasWindowFunc(e parser.Expr) bool {
 	switch x := e.(type) {
 	case *parser.BinaryOp:
@@ -870,6 +986,18 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{}, err
 		}
 		return catalog.Type{Name: "int8"}, nil
+	case *parser.GroupingCall:
+		// GROUPING(a, b, ...) — its value depends only on which grouping
+		// set produced the current row (resolved to a literal by the
+		// planner's grouping-sets rewrite, M0122-0004), but the args still
+		// need scope resolution here so an unknown-column reference is
+		// caught the same way it would be for a plain SELECT-list column.
+		for _, a := range x.Args {
+			if _, err := analyzeExpr(a, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		return catalog.Type{Name: "int4"}, nil
 	case *parser.CaseExpr:
 		return analyzeCaseExpr(x, ctx)
 	case *parser.CollateExpr:
@@ -1211,7 +1339,7 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 	name := strings.ToLower(x.Name.Name)
 	var retType catalog.Type
 	switch name {
-	case "row_number", "rank":
+	case "row_number", "rank", "dense_rank":
 		if x.Star || x.Distinct || len(x.Args) != 0 {
 			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
 		}
@@ -1238,6 +1366,95 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 				return catalog.Type{}, err
 			}
 		}
+	case "sum", "count", "avg", "min", "max":
+		// DISTINCT / ORDER BY within the aggregate's argument list are
+		// real PostgreSQL restrictions on aggregate window functions, not
+		// a v0 gap — see parse_func.c's transformAggregateCall for the
+		// exact wording/errcode this mirrors.
+		if x.Distinct {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "DISTINCT is not implemented for window functions")
+		}
+		if len(x.OrderBy) > 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "0A000", "aggregate ORDER BY is not implemented for window functions")
+		}
+		if x.Filter != nil {
+			if _, err := analyzeExpr(x.Filter, ctx); err != nil {
+				return catalog.Type{}, err
+			}
+		}
+		if x.Star {
+			if name != "count" {
+				return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("%s(*) is not supported", name))
+			}
+			retType = catalog.Type{Name: "int8"}
+			break
+		}
+		if len(x.Args) != 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("%s() requires exactly one argument", name))
+		}
+		argTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		switch name {
+		case "count":
+			retType = catalog.Type{Name: "int8"}
+		case "sum":
+			if !isNumericLike(argTyp) {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", "sum() argument must be numeric")
+			}
+			if argTyp.Name == "unknown" {
+				retType = catalog.Type{Name: "int8"}
+			} else {
+				retType = argTyp
+			}
+		case "avg":
+			if !isNumericLike(argTyp) {
+				return catalog.Type{}, analyzeError(x.Pos(), "42804", "avg() argument must be numeric")
+			}
+			switch strings.ToLower(argTyp.Name) {
+			case "float4", "float8", "real", "double precision", "double", "float":
+				retType = catalog.Type{Name: "float8"}
+			default:
+				retType = catalog.Type{Name: "numeric"}
+			}
+		case "min", "max":
+			retType = argTyp
+		}
+	case "first_value", "last_value":
+		if x.Star || x.Distinct || len(x.Args) != 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() requires exactly one argument", name))
+		}
+		valueTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		retType = valueTyp
+	case "nth_value":
+		if x.Star || x.Distinct || len(x.Args) != 2 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", "window function nth_value() requires exactly two arguments")
+		}
+		valueTyp, err := analyzeExpr(x.Args[0], ctx)
+		if err != nil {
+			return catalog.Type{}, err
+		}
+		if _, err := analyzeExpr(x.Args[1], ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		retType = valueTyp
+	case "cume_dist", "percent_rank":
+		if x.Star || x.Distinct || len(x.Args) != 0 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", fmt.Sprintf("window function %s() does not accept arguments, DISTINCT, or * in v0", name))
+		}
+		retType = catalog.Type{Name: "float8"}
+	case "ntile":
+		if x.Star || x.Distinct || len(x.Args) != 1 {
+			return catalog.Type{}, analyzeError(x.Pos(), "42601", "window function ntile() requires exactly one argument")
+		}
+		if _, err := analyzeExpr(x.Args[0], ctx); err != nil {
+			return catalog.Type{}, err
+		}
+		retType = catalog.Type{Name: "int4"}
 	default:
 		return catalog.Type{}, analyzeError(x.Pos(), "0A000", fmt.Sprintf("window function %q is not supported in v0 analyzer", name))
 	}
@@ -1257,7 +1474,56 @@ func analyzeWindowFuncCall(x *parser.FuncCall, ctx *scope) (catalog.Type, error)
 			return catalog.Type{}, err
 		}
 	}
+	if err := validateWindowFrame(x.Over.Frame, x.Over.Pos(), ctx); err != nil {
+		return catalog.Type{}, err
+	}
 	return retType, nil
+}
+
+// validateWindowFrame validates a parsed window frame clause's mode
+// and bound ordering (SQL:2003 <window frame clause>), mirroring
+// gram.y's frame_extent/frame_bound reduce-time checks — all
+// ERRCODE_WINDOWING_ERROR (42P20) — plus this v0's RANGE/GROUPS scope
+// limitation (0A000). Returns nil for a nil frame (no explicit frame
+// clause was written — the default frame applies). Also type-checks
+// (but does not range-check) any offset expressions; the executor
+// mirrors LIMIT's pattern of range/null-checking a once-evaluated
+// constant expression at runtime (22004/22013), since an offset can't
+// be validated until it's evaluated.
+func validateWindowFrame(fr *parser.WindowFrame, pos int, ctx *scope) error {
+	if fr == nil {
+		return nil
+	}
+	if fr.Mode != parser.FrameModeRows {
+		return analyzeError(pos, "0A000", "RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented")
+	}
+	if fr.StartKind == parser.FrameBoundUnboundedFollowing {
+		return analyzeError(pos, "42P20", "frame start cannot be UNBOUNDED FOLLOWING")
+	}
+	if fr.HasBetween {
+		if fr.EndKind == parser.FrameBoundUnboundedPreceding {
+			return analyzeError(pos, "42P20", "frame end cannot be UNBOUNDED PRECEDING")
+		}
+		if fr.StartKind == parser.FrameBoundCurrentRow && fr.EndKind == parser.FrameBoundOffsetPreceding {
+			return analyzeError(pos, "42P20", "frame starting from current row cannot have preceding rows")
+		}
+		if fr.StartKind == parser.FrameBoundOffsetFollowing && (fr.EndKind == parser.FrameBoundOffsetPreceding || fr.EndKind == parser.FrameBoundCurrentRow) {
+			return analyzeError(pos, "42P20", "frame starting from following row cannot have preceding rows")
+		}
+	} else if fr.StartKind == parser.FrameBoundOffsetFollowing {
+		return analyzeError(pos, "42P20", "frame starting from following row cannot end with current row")
+	}
+	if fr.StartOffset != nil {
+		if _, err := analyzeExpr(fr.StartOffset, ctx); err != nil {
+			return err
+		}
+	}
+	if fr.EndOffset != nil {
+		if _, err := analyzeExpr(fr.EndOffset, ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resolveColumnRefType(x *parser.ColumnRef, ctx *scope) (catalog.Type, error) {
@@ -1486,7 +1752,7 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 		if alias == "" {
 			alias = rv.TableFunc.Name
 		}
-		cols := tableFuncColumns(rv.TableFunc.Name, alias, rv.Columns)
+		cols := tableFuncColumns(rv.TableFunc, alias, rv.Columns)
 		return &catalog.Table{Name: alias, Columns: cols}, nil
 	}
 	tbl, ok := cat.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name})
@@ -1502,8 +1768,29 @@ func lookupTable(cat catalog.Catalog, rv parser.RangeVar) (*catalog.Table, error
 // column list the planner will produce at execution time. Unknown
 // functions fall back to a single column named after the alias (the
 // pre-M0103-0008 behaviour, sufficient for generate_series).
-func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Column {
-	switch strings.ToLower(funcName) {
+//
+// WITH ORDINALITY appends a trailing int8 column, named from the last
+// explicit column alias when given (else "ordinality") — mirrors
+// wrapOrdinality (internal/planner/planner.go). The trailing alias is
+// stripped before dispatch so per-function cases below see only the
+// base-column aliases, same as the planner's colAliases[:len-1] slices.
+func tableFuncColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	ordColName := "ordinality"
+	if tf.WithOrdinality && len(colAliases) > 0 {
+		ordColName = colAliases[len(colAliases)-1]
+		colAliases = colAliases[:len(colAliases)-1]
+	}
+	cols := tableFuncBaseColumns(tf, alias, colAliases)
+	if tf.WithOrdinality {
+		cols = append(cols, catalog.Column{Name: ordColName, Type: catalog.Type{Name: "int8"}, Ordinal: len(cols)})
+	}
+	return cols
+}
+
+// tableFuncBaseColumns dispatches on function name for tableFuncColumns,
+// before any WITH ORDINALITY column is appended.
+func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []string) []catalog.Column {
+	switch strings.ToLower(tf.Name) {
 	case "pg_get_publication_tables":
 		names := []string{"relid", "attrs", "qual"}
 		types := []string{"oid", "text", "text"}
@@ -1601,6 +1888,37 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
 		}
 		return cols
+	case "unnest":
+		// unnest(arr1[, arr2, ...]) zips N arrays into N columns. Mirrors
+		// planFromUnnest; the analyzer has no expression-type resolution
+		// available yet at this point in scope-building (lookupTable runs
+		// before the FROM scope exists), so element types fall back to
+		// "text" rather than the array's real element type — sufficient
+		// for column-name resolution (42703), imprecise for typing.
+		n := len(tf.Args)
+		if n == 0 {
+			n = 1
+		}
+		cols := make([]catalog.Column, n)
+		for i := 0; i < n; i++ {
+			name := "unnest"
+			if n == 1 {
+				name = alias
+			}
+			if i < len(colAliases) && colAliases[i] != "" {
+				name = colAliases[i]
+			}
+			cols[i] = catalog.Column{Name: name, Type: catalog.Type{Name: "text"}, Ordinal: i}
+		}
+		return cols
+	case "regexp_matches":
+		// regexp_matches(string, pattern[, flags]) → single text[] column.
+		// Mirrors planFromRegexpMatches. M0122-0004 WITH-ORDINALITY fix.
+		colName := alias
+		if len(colAliases) > 0 && colAliases[0] != "" {
+			colName = colAliases[0]
+		}
+		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "text[]"}, Ordinal: 0}}
 	default:
 		// generate_series and unknown SRFs: 1 int8 column named after
 		// the alias. Preserves pre-M0103-0008 behaviour.

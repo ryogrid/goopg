@@ -2185,6 +2185,13 @@ type InMemory struct {
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
 	schemas map[string]uint32
 
+	// schemaOwners maps lowercase schema name → owning role OID, set by
+	// `ALTER SCHEMA name OWNER TO role` (DU-002 slice 440 resume point (3),
+	// M0110-0001). A schema absent from this map has no explicit owner
+	// change recorded and defaults to the bootstrap superuser (OID 10),
+	// matching pg_namespace.nspowner's previous hardcoded literal.
+	schemaOwners map[string]uint32
+
 	// tempNamespaces maps a session's temp-owner token ("s<id>", see
 	// executor.sessionTempOwner) → the OID of that session's temporary
 	// namespace (pg_temp_<id>). In PostgreSQL every backend that creates a
@@ -2638,6 +2645,20 @@ type EnumType struct {
 	// `public.mood[]` rather than `text[]`. DU-002 slice 89.
 	ArrayOID uint32
 	Values   []EnumValue // ordered by SortOrder; each element stores its own sortorder
+	// Owner is the typowner role OID, settable via `ALTER TYPE ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
+	Owner uint32
+}
+
+// OwnerOrDefault returns et.Owner, falling back to the bootstrap superuser OID
+// (10) for enum types that never had OWNER TO applied. Mirrors
+// StatisticsObject.OwnerOrDefault.
+func (et *EnumType) OwnerOrDefault() uint32 {
+	if et.Owner == 0 {
+		return 10
+	}
+	return et.Owner
 }
 
 // Domain holds one user-defined domain type. M0097-0017.
@@ -2749,6 +2770,20 @@ type CompositeType struct {
 	ArrayOID uint32           // OID of the auto-generated `_name` array type
 	RelOID   uint32           // pg_class.oid of the implicit relation (relkind='c')
 	Fields   []CompositeField // ordered field list
+	// Owner is the typowner role OID, settable via `ALTER TYPE ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (m0097-0017 follow-up).
+	Owner uint32
+}
+
+// OwnerOrDefault returns ct.Owner, falling back to the bootstrap superuser OID
+// (10) for composite types that never had OWNER TO applied. Mirrors
+// StatisticsObject.OwnerOrDefault.
+func (ct *CompositeType) OwnerOrDefault() uint32 {
+	if ct.Owner == 0 {
+		return 10
+	}
+	return ct.Owner
 }
 
 // RangeType describes a user-defined range type created via
@@ -2947,6 +2982,7 @@ func NewInMemory() *InMemory {
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
+		schemaOwners:       make(map[string]uint32),
 		roles:              make(map[string]uint32),
 		predefinedRoles:    newPredefinedRoleMap(),
 		roleAttrs:          make(map[string]*RoleAttrs),
@@ -4902,14 +4938,31 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 		// replaying CREATE INDEX records.
 		return
 	}
-	k := key(parser.ObjectName{Schema: schema, Name: name})
-	if existing, dup := c.indexes[k]; dup {
-		// JSON snapshot or earlier WAL pass already registered
+	// Dup-check via lookupIndexLocked (not a bare key(...) map probe): this
+	// recovery hook is called from two independent drivers that can disagree
+	// on `schema` for the exact same physical index — loadUserIndexesFromHeap
+	// resolves the index's real schema from its pg_class namespace OID
+	// (e.g. "public"), while replayIndexDDLRecords passes the raw, often
+	// unqualified schema captured verbatim in the original CREATE INDEX WAL
+	// record (""). A bare key(...) probe treats those as different indexes
+	// and registers a second, divergent *Index for the same OID; whichever
+	// key a later ALTER INDEX RENAME/DROP recovery call happens to hit then
+	// silently misses the other one (an unqualified rename could leave the
+	// old name "resurrected" under the untouched duplicate — caught by
+	// TestRenameIndexSurvivesRestartViaWAL once loadUserIndexesFromHeap
+	// started actually finding pg_index rows, M0119-0004 index-reloptions
+	// follow-up). lookupIndexLocked already implements the same "" vs
+	// "public." collision fallback reads rely on, so reusing it here keeps
+	// recovery's notion of "same index" consistent with LookupIndex's.
+	if existing, existingKey, dup := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name}); dup {
+		// JSON snapshot or earlier recovery pass already registered
 		// this index. Idempotent no-op.
 		_ = existing
+		_ = existingKey
 		c.advanceNextOIDLocked(oid)
 		return
 	}
+	k := key(parser.ObjectName{Schema: schema, Name: name})
 	idx := &Index{
 		Schema:  schema,
 		Name:    name,
@@ -4934,8 +4987,12 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 func (c *InMemory) UnregisterIndexDuringRecovery(schema, name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	k := key(parser.ObjectName{Schema: schema, Name: name})
-	idx, ok := c.indexes[k]
+	// Resolve via lookupIndexLocked, not a bare key(...) probe — same "" vs
+	// "public." collision rationale as RegisterIndexDuringRecovery above: a
+	// DROP INDEX WAL record's raw (often unqualified) schema must resolve to
+	// whatever key the index actually lives under, or the drop silently
+	// no-ops and the index is "resurrected" after restart.
+	idx, k, ok := c.lookupIndexLocked(parser.ObjectName{Schema: schema, Name: name})
 	if !ok {
 		return
 	}
@@ -5291,121 +5348,10 @@ func (c *InMemory) registerSystemTables() {
 			// array literal (`{fillfactor=70}`). Empty → "" → planner maps it to
 			// SQL NULL (DU-002 slice 47), so a plain table emits no WITH clause;
 			// a non-empty one round-trips through pg_dump as `WITH
-			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). Multiple options
-			// (e.g. fillfactor + parallel_workers, slice 195) join in a fixed
-			// order as `{fillfactor=70,parallel_workers=4}`; autovacuum_enabled
-			// (slice 196) follows as a boolean element, then toast_tuple_target
-			// (slice 197) and autovacuum_vacuum_threshold (slice 198) as trailing
-			// integer elements, then autovacuum_vacuum_scale_factor (slice 199),
-			// autovacuum_analyze_scale_factor (slice 200),
-			// autovacuum_vacuum_insert_scale_factor (slice 201) and
-			// autovacuum_vacuum_cost_delay (slice 202) as REAL-typed elements,
-			// then autovacuum_analyze_threshold (slice 203) as a trailing integer
-			// element.
-			var relopts []string
-			if t.Fillfactor != 0 {
-				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
-			}
-			if t.ParallelWorkersSet {
-				relopts = append(relopts, "parallel_workers="+strconv.Itoa(t.ParallelWorkers))
-			}
-			if t.AutovacuumEnabledSet {
-				relopts = append(relopts, "autovacuum_enabled="+strconv.FormatBool(t.AutovacuumEnabled))
-			}
-			if t.ToastTupleTarget != 0 {
-				relopts = append(relopts, "toast_tuple_target="+strconv.Itoa(t.ToastTupleTarget))
-			}
-			if t.AutovacuumVacuumThresholdSet {
-				relopts = append(relopts, "autovacuum_vacuum_threshold="+strconv.Itoa(t.AutovacuumVacuumThreshold))
-			}
-			if t.AutovacuumVacuumScaleFactorSet {
-				relopts = append(relopts, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumScaleFactor, 'g', -1, 64))
-			}
-			if t.AutovacuumAnalyzeScaleFactorSet {
-				relopts = append(relopts, "autovacuum_analyze_scale_factor="+strconv.FormatFloat(t.AutovacuumAnalyzeScaleFactor, 'g', -1, 64))
-			}
-			if t.AutovacuumVacuumInsertScaleFactorSet {
-				relopts = append(relopts, "autovacuum_vacuum_insert_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumInsertScaleFactor, 'g', -1, 64))
-			}
-			if t.AutovacuumVacuumCostDelaySet {
-				relopts = append(relopts, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(t.AutovacuumVacuumCostDelay, 'g', -1, 64))
-			}
-			if t.AutovacuumAnalyzeThresholdSet {
-				relopts = append(relopts, "autovacuum_analyze_threshold="+strconv.Itoa(t.AutovacuumAnalyzeThreshold))
-			}
-			if t.AutovacuumVacuumInsertThresholdSet {
-				relopts = append(relopts, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(t.AutovacuumVacuumInsertThreshold))
-			}
-			if t.VacuumTruncateSet {
-				relopts = append(relopts, "vacuum_truncate="+strconv.FormatBool(t.VacuumTruncate))
-			}
-			if t.LogAutovacuumMinDurationSet {
-				relopts = append(relopts, "log_autovacuum_min_duration="+strconv.Itoa(t.LogAutovacuumMinDuration))
-			}
-			if t.AutovacuumFreezeMinAgeSet {
-				relopts = append(relopts, "autovacuum_freeze_min_age="+strconv.Itoa(t.AutovacuumFreezeMinAge))
-			}
-			if t.AutovacuumFreezeMaxAgeSet {
-				relopts = append(relopts, "autovacuum_freeze_max_age="+strconv.Itoa(t.AutovacuumFreezeMaxAge))
-			}
-			if t.AutovacuumFreezeTableAgeSet {
-				relopts = append(relopts, "autovacuum_freeze_table_age="+strconv.Itoa(t.AutovacuumFreezeTableAge))
-			}
-			if t.AutovacuumMultixactFreezeMinAgeSet {
-				relopts = append(relopts, "autovacuum_multixact_freeze_min_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMinAge))
-			}
-			if t.AutovacuumMultixactFreezeMaxAgeSet {
-				relopts = append(relopts, "autovacuum_multixact_freeze_max_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMaxAge))
-			}
-			if t.AutovacuumMultixactFreezeTableAgeSet {
-				relopts = append(relopts, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(t.AutovacuumMultixactFreezeTableAge))
-			}
-			if t.AutovacuumVacuumCostLimitSet {
-				relopts = append(relopts, "autovacuum_vacuum_cost_limit="+strconv.Itoa(t.AutovacuumVacuumCostLimit))
-			}
-			if t.UserCatalogTableSet {
-				relopts = append(relopts, "user_catalog_table="+strconv.FormatBool(t.UserCatalogTable))
-			}
-			if t.AutovacuumVacuumMaxThresholdSet {
-				relopts = append(relopts, "autovacuum_vacuum_max_threshold="+strconv.Itoa(t.AutovacuumVacuumMaxThreshold))
-			}
-			if t.VacuumMaxEagerFreezeFailureRateSet {
-				relopts = append(relopts, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(t.VacuumMaxEagerFreezeFailureRate, 'g', -1, 64))
-			}
-			if t.VacuumIndexCleanupSet {
-				relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
-			}
-			// A view's `WITH (security_barrier=<bool>)` is stored by PostgreSQL as
-			// the `security_barrier=<bool>` pg_class.reloption. Unlike check_option,
-			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
-			// the `WITH (security_barrier='true')` clause after the view name
-			// (appendReloptionsArray). Placed before check_option so a view carrying
-			// both surfaces as `{security_barrier=...,check_option=...}`, matching
-			// PostgreSQL's stored order. M0119-0004 (slice 366).
-			if t.SecurityBarrierSet {
-				relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
-			}
-			// A view's `WITH (security_invoker=<bool>)` is stored by PostgreSQL as
-			// the `security_invoker=<bool>` pg_class.reloption. Like security_barrier,
-			// pg_dump's getTables keeps it in the reloptions array and re-emits it as
-			// the `WITH (security_invoker='true')` clause after the view name
-			// (appendReloptionsArray). Placed after security_barrier and before
-			// check_option so a view carrying several options surfaces in PG's stored
-			// WITH-clause order. M0119-0004 (slice 367).
-			if t.SecurityInvokerSet {
-				relopts = append(relopts, "security_invoker="+strconv.FormatBool(t.SecurityInvoker))
-			}
-			// A view's `WITH [CASCADED|LOCAL] CHECK OPTION` is stored by PostgreSQL
-			// as the `check_option=<mode>` pg_class.reloption. pg_dump's getTables
-			// then strips it from the reloptions array (array_remove) and re-emits
-			// it as the `WITH <MODE> CHECK OPTION` view suffix. M0119-0004 (slice 365).
-			if t.CheckOption != "" {
-				relopts = append(relopts, "check_option="+t.CheckOption)
-			}
-			reloptions := ""
-			if len(relopts) > 0 {
-				reloptions = arrayTextLiteral(relopts)
-			}
+			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). BuildTableReloptions
+			// is the single source of truth (shared with executor.buildUserPGClassRow's
+			// heap-persisted row, M0119-0004) so the two never drift apart.
+			reloptions := BuildTableReloptions(t)
 			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
 			// table / materialized view with at least one toastable (varlena)
 			// column (needs_toast_table, src/backend/catalog/toasting.c), plus
@@ -5654,14 +5600,7 @@ func (c *InMemory) registerSystemTables() {
 			// (NULL) when unset so a plain index dumps byte-identically. Options
 			// are joined in declaration-stable order (fillfactor first), mirroring
 			// the array order PG stores. DU-002 slices 218/219.
-			idxReloptions := ""
-			if opts := idx.reloptionList(); len(opts) > 0 {
-				parts := make([]string, len(opts))
-				for i, kv := range opts {
-					parts[i] = kv[0] + "=" + kv[1]
-				}
-				idxReloptions = arrayTextLiteral(parts)
-			}
+			idxReloptions := BuildIndexReloptions(idx)
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
 				idx.Name,                    // 1:  relname
@@ -5827,10 +5766,10 @@ func (c *InMemory) registerSystemTables() {
 				continue // skip internal alias
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(s.oid)),  // oid
-				s.name,                    // nspname
-				"10",                      // nspowner
-				c.NamespaceACLText(s.oid), // nspacl (NULL until a schema GRANT, slice 335)
+				strconv.Itoa(int(s.oid)), // oid
+				s.name,                   // nspname
+				strconv.Itoa(int(c.SchemaOwnerOID(s.name))), // nspowner (ALTER SCHEMA ... OWNER TO, DU-002 slice 440 resume point (3); defaults to bootstrap superuser)
+				c.NamespaceACLText(s.oid),                   // nspacl (NULL until a schema GRANT, slice 335)
 			})
 		}
 		return out
@@ -6147,11 +6086,13 @@ func (c *InMemory) registerSystemTables() {
 	// from the same live c.roles/c.roleAttrs state as pg_roles, not the
 	// on-disk global/1260 heap file: that file (pg_authid_sync.go) is a
 	// separate crash-recovery mirror for auth credentials, not a live SQL
-	// read path. Attributes goopg's role DDL never actually sets
-	// (rolinherit/rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
-	// rolconnlimit/rolvaliduntil) report PG's CREATE ROLE defaults, since
-	// nothing can diverge them from those defaults today (see deferral
-	// ledger).
+	// read path. rolinherit is never modelled (goopg's role DDL has no
+	// per-role NOINHERIT tracking) and always reports PG's CREATE ROLE
+	// default 't'. rolcreaterole/rolcreatedb/rolreplication/rolbypassrls/
+	// rolconnlimit/rolvaliduntil now reflect the RoleAttrs sidecar (DU-002
+	// slice 439 follow-up); a role with no sidecar entry (predefined pg_*
+	// roles, unregistered names) falls back to PG's own CREATE ROLE
+	// defaults.
 	pgAuthid := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_authid",
@@ -6175,7 +6116,10 @@ func (c *InMemory) registerSystemTables() {
 	pgAuthid.VirtualRows = func() [][]string {
 		rowFor := func(oidStr, name string, a *RoleAttrs) []string {
 			rolsuper, rolcanlogin := "f", "t"
+			rolcreaterole, rolcreatedb, rolreplication, rolbypassrls := "f", "f", "f", "f"
+			rolconnlimit := "-1"
 			rolpassword := VirtualNull
+			rolvaliduntil := VirtualNull
 			if a != nil {
 				if a.Superuser {
 					rolsuper = "t"
@@ -6183,21 +6127,31 @@ func (c *InMemory) registerSystemTables() {
 				if !a.CanLogin {
 					rolcanlogin = "f"
 				}
+				if a.CreateRole {
+					rolcreaterole = "t"
+				}
+				if a.CreateDB {
+					rolcreatedb = "t"
+				}
+				if a.Replication {
+					rolreplication = "t"
+				}
+				if a.BypassRLS {
+					rolbypassrls = "t"
+				}
+				rolconnlimit = fmt.Sprintf("%d", a.ConnLimit)
 				if a.CredType != 0 {
 					rolpassword = a.Secret
+				}
+				if a.ValidUntil != "" {
+					rolvaliduntil = a.ValidUntil
 				}
 			}
 			return []string{
 				oidStr, name, rolsuper,
 				"t", // rolinherit: PG default, never overridden by goopg's role DDL
-				"f", // rolcreaterole: not modelled
-				"f", // rolcreatedb: not modelled
-				rolcanlogin,
-				"f", // rolreplication: not modelled
-				"f", // rolbypassrls: not modelled
-				"-1", // rolconnlimit: PG default (no limit), not modelled
-				rolpassword,
-				VirtualNull, // rolvaliduntil: not modelled
+				rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls,
+				rolconnlimit, rolpassword, rolvaliduntil,
 			}
 		}
 		c.mu.RLock()
@@ -6213,16 +6167,17 @@ func (c *InMemory) registerSystemTables() {
 		}
 		// PG18's 16 built-in "pg_*" predefined roles (pg_authid.dat), same
 		// gap/rationale as pg_roles above (0119-0004ch ledger discovery (a)):
-		// a zero-value RoleAttrs{} drives rowFor's defaults to exactly PG's
-		// predefined-role shape (rolsuper/rolcanlogin='f', rolpassword NULL),
-		// matching SyncPgAuthidFile's frozen rows.
+		// this RoleAttrs{ConnLimit: -1} drives rowFor's defaults to exactly
+		// PG's predefined-role shape (rolsuper/rolcanlogin='f', rolpassword
+		// NULL, rolconnlimit=-1), matching SyncPgAuthidFile's frozen rows and
+		// pg_authid.dat (every seeded role's rolconnlimit is -1, never 0).
 		predefinedNames := make([]string, 0, len(predefinedRoleSeeds))
 		for _, s := range predefinedRoleSeeds {
 			predefinedNames = append(predefinedNames, s.name)
 		}
 		sort.Strings(predefinedNames)
 		for _, name := range predefinedNames {
-			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{}))
+			out = append(out, rowFor(fmt.Sprintf("%d", c.predefinedRoles[name]), name, &RoleAttrs{ConnLimit: -1}))
 		}
 		return out
 	}
@@ -6772,9 +6727,13 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_stat_wal"] = pgStatWal
 
 	// pg_stat_io — per-backend-type I/O statistics (PG 16+, OID 8061).
-	// goopg v0 does not track I/O statistics; all counters are 0 and no
-	// rows are returned. The table exists so queries filtering by
-	// backend_type (e.g. 'walsummarizer') succeed and return 0 rows.
+	// The static VirtualRows fallback below returns no rows; the real,
+	// live row set (upstream's exact 79-row valid-combination shape, with
+	// goopg's one instrumented cell filled in) is built by
+	// executor.fetchIOStatRows and swapped in at Open time — see
+	// valuesOp.Open's "pg_stat_io" case (M0122-0003). This fallback only
+	// fires for code paths that read VirtualRows() directly (bypassing the
+	// executor), e.g. pg_dump's catalog introspection.
 	pgStatIO := &Table{
 		Schema: "pg_catalog", Name: "pg_stat_io", Virtual: true,
 		Columns: []Column{
@@ -8487,12 +8446,15 @@ func (c *InMemory) registerSystemTables() {
 		OID: 2328,
 	}
 	// Surface user-created FDWs (CREATE FOREIGN DATA WRAPPER) so they round-trip.
-	// fdwhandler/fdwvalidator are 0 (no handler) — the query's `::regproc` cast
-	// renders 0 as '-', so dumpForeignDataWrapper omits HANDLER/VALIDATOR.
-	// fdwoptions is NULL (empty string) absent an OPTIONS clause, so the OPTIONS
-	// clause is skipped. fdwacl materializes via ForeignDataWrapperACLText so a
-	// `GRANT … ON FOREIGN DATA WRAPPER …` round-trips (DU-002 slice 428);
-	// DU-002 slice 375.
+	// fdwhandler/fdwvalidator hold the real pg_proc OID resolved at CREATE/ALTER
+	// time (0 when no HANDLER/VALIDATOR clause was given) — the query's
+	// `::regproc` cast renders 0 as '-' (so dumpForeignDataWrapper omits the
+	// clause) and a non-zero OID as the resolved function name (DU-002
+	// M0119-0004, closing the "HANDLER/VALIDATOR discarded" gap slices
+	// 375/380/421 left open). fdwoptions is NULL (empty string) absent an
+	// OPTIONS clause, so the OPTIONS clause is skipped. fdwacl materializes via
+	// ForeignDataWrapperACLText so a `GRANT … ON FOREIGN DATA WRAPPER …`
+	// round-trips (DU-002 slice 428); DU-002 slice 375.
 	pgForeignDataWrapper.VirtualRows = func() [][]string {
 		fdws := c.ListForeignDataWrappers()
 		if len(fdws) == 0 {
@@ -8505,13 +8467,13 @@ func (c *InMemory) registerSystemTables() {
 				owner = 10 // bootstrap superuser (postgres); getRoleName(10) → "postgres"
 			}
 			out = append(out, []string{
-				strconv.FormatUint(uint64(f.OID), 10), // oid
-				f.Name,                                // fdwname
-				strconv.FormatUint(uint64(owner), 10), // fdwowner
-				"0",                                   // fdwhandler (regproc 0 → '-')
-				"0",                                   // fdwvalidator (regproc 0 → '-')
-				c.ForeignDataWrapperACLText(f.OID),    // fdwacl
-				optionsArrayLiteral(f.Options),        // fdwoptions text[] ("{name=value,…}" or "" for NULL)
+				strconv.FormatUint(uint64(f.OID), 10),          // oid
+				f.Name,                                         // fdwname
+				strconv.FormatUint(uint64(owner), 10),          // fdwowner
+				strconv.FormatUint(uint64(f.HandlerOID), 10),   // fdwhandler
+				strconv.FormatUint(uint64(f.ValidatorOID), 10), // fdwvalidator
+				c.ForeignDataWrapperACLText(f.OID),             // fdwacl
+				optionsArrayLiteral(f.Options),                 // fdwoptions text[] ("{name=value,…}" or "" for NULL)
 			})
 		}
 		return out
@@ -10368,6 +10330,131 @@ func (c *InMemory) UnregisterSchema(name string) {
 	delete(c.schemas, strings.ToLower(name))
 }
 
+// SchemaOwnerOID returns the owning role OID recorded for the given schema
+// (ALTER SCHEMA ... OWNER TO), or the bootstrap superuser (10) — the
+// long-standing pg_namespace.nspowner default — when no explicit owner
+// change has been recorded. DU-002 slice 440 resume point (3) (M0110-0001).
+func (c *InMemory) SchemaOwnerOID(name string) uint32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if oid, ok := c.schemaOwners[strings.ToLower(name)]; ok {
+		return oid
+	}
+	return 10
+}
+
+// SetSchemaOwner records the owning role OID for a schema (ALTER SCHEMA ...
+// OWNER TO). Returns false if the schema does not exist. DU-002 slice 440
+// resume point (3) (M0110-0001).
+func (c *InMemory) SetSchemaOwner(name string, ownerOID uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.schemas[lc]; !ok {
+		return false
+	}
+	c.schemaOwners[lc] = ownerOID
+	return true
+}
+
+// SetSchemaOwnerDuringRecovery is the discard-result recovery counterpart to
+// SetSchemaOwner, mirroring SetStatisticsOwnerDuringRecovery.
+func (c *InMemory) SetSchemaOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetSchemaOwner(name, ownerOID)
+}
+
+// RenameSchema renames a user schema (ALTER SCHEMA ... RENAME TO). Real
+// PostgreSQL's namespace rename is a single pg_namespace row update because
+// every other catalog references a schema by OID (relnamespace); goopg's
+// Table/Index catalog instead keys directly by schema NAME (see key()), so a
+// schema rename must cascade into every table/view/sequence/index/operator
+// class/statistics object whose Schema field names the old schema, re-keying
+// their map entries too. Returns the tables that were sequences (so the
+// caller can additionally cascade the executor-side seqRegistry, mirroring
+// the SET SCHEMA-on-single-sequence cascade in execAlterTable) and an error
+// if old does not exist or new already exists (mirrors upstream
+// RenameSchema, postgres/src/backend/commands/schemacmds.c). DU-002 slice 440
+// resume point (3) (M0110-0001); the opClassSchemas/statisticsObjs cascades
+// close the slice-440-resume-point(3) ledger row's own follow-up (schema-
+// name-keyed registries left un-cascaded). Still not audited/cascaded here:
+// userCollations/userConversions (carry a Schema field but aren't in a
+// schema-keyed map, so likely unaffected — not verified) and any
+// schema-qualified function/type/domain registries.
+func (c *InMemory) RenameSchema(old, new string) ([]*Table, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lcOld := strings.ToLower(old)
+	lcNew := strings.ToLower(new)
+	oid, ok := c.schemas[lcOld]
+	if !ok {
+		return nil, fmt.Errorf("schema %q does not exist", old)
+	}
+	if _, exists := c.schemas[lcNew]; exists {
+		return nil, fmt.Errorf("schema %q already exists", new)
+	}
+	delete(c.schemas, lcOld)
+	c.schemas[lcNew] = oid
+	if owner, ok := c.schemaOwners[lcOld]; ok {
+		delete(c.schemaOwners, lcOld)
+		c.schemaOwners[lcNew] = owner
+	}
+	var movedSequences []*Table
+	for k, tbl := range c.tables {
+		if !strings.EqualFold(tbl.Schema, old) {
+			continue
+		}
+		tbl.Schema = new
+		newK := key(parser.ObjectName{Schema: new, Name: tbl.Name})
+		if newK != k {
+			delete(c.tables, k)
+			c.tables[newK] = tbl
+		}
+		if tbl.IsSequence {
+			movedSequences = append(movedSequences, tbl)
+		}
+	}
+	for k, idx := range c.indexes {
+		if !strings.EqualFold(idx.Schema, old) {
+			continue
+		}
+		idx.Schema = new
+		newK := key(parser.ObjectName{Schema: new, Name: idx.Name})
+		if newK != k {
+			delete(c.indexes, k)
+			c.indexes[newK] = idx
+		}
+	}
+	for name, schema := range c.opClassSchemas {
+		if strings.EqualFold(schema, old) {
+			c.opClassSchemas[name] = new
+		}
+	}
+	for k, obj := range c.statisticsObjs {
+		objSchema := obj.Schema
+		if objSchema == "" {
+			objSchema = "public"
+		}
+		if !strings.EqualFold(objSchema, old) {
+			continue
+		}
+		obj.Schema = new
+		newK := obj.qualifiedKey()
+		if newK != k {
+			delete(c.statisticsObjs, k)
+			c.statisticsObjs[newK] = obj
+		}
+	}
+	return movedSequences, nil
+}
+
+// RenameSchemaDuringRecovery is the idempotent, discard-result recovery
+// counterpart to RenameSchema used by the WAL-replay driver. Errors (e.g. a
+// stale record replaying after a later drop) are swallowed, mirroring
+// RenameStatisticsObjectDuringRecovery.
+func (c *InMemory) RenameSchemaDuringRecovery(old, new string) {
+	_, _ = c.RenameSchema(old, new)
+}
+
 // RegisterSchemaDuringRecovery is the idempotent version of RegisterSchema
 // used by the WAL-replay driver. Unlike RegisterSchema it takes the OID from
 // the WAL record (so the recovered registry matches what the pre-crash server
@@ -11381,11 +11468,29 @@ func (c *InMemory) RegisterRole(name string) {
 // the RecordKindRoleState WAL encoding (0=none, 1=plaintext, 2=md5,
 // 3=scram-sha-256); Secret is the stored verifier in the same shape as
 // pg_authid.rolpassword (SCRAM-SHA-256$… by default). root-0021.
+//
+// CreateDB/CreateRole/Replication/BypassRLS/ConnLimit/ValidUntil mirror the
+// remaining CREATE/ALTER ROLE attribute-clause options (postgres/src/backend/
+// commands/user.c CreateRole's opt_* booleans) that were previously
+// accept-and-ignore (DU-002 slice 439 follow-up). ConnLimit's PG default is
+// -1 ("no limit", pg_authid.dat's rolconnlimit for every seeded role) — the
+// Go zero value 0 is a DIFFERENT, valid PG setting ("no new connections"), so
+// every RoleAttrs constructed as the "no attributes given yet" starting
+// point (as opposed to a real all-zero snapshot) MUST set ConnLimit: -1
+// explicitly; see tryHandleRoleDDL's two construction sites. ValidUntil is
+// the raw `VALID UNTIL '<literal>'` text (empty = NULL/no expiration, PG's
+// default); goopg does not evaluate it (no password-expiry enforcement).
 type RoleAttrs struct {
-	CanLogin  bool
-	Superuser bool
-	CredType  byte
-	Secret    string
+	CanLogin    bool
+	Superuser   bool
+	CreateDB    bool
+	CreateRole  bool
+	Replication bool
+	BypassRLS   bool
+	ConnLimit   int32
+	ValidUntil  string
+	CredType    byte
+	Secret      string
 }
 
 // RegisterRoleWithOID registers a role preserving a known OID — used by the
@@ -12591,6 +12696,14 @@ type ForeignDataWrapper struct {
 	// dumpForeignDataWrapper re-emits an `OPTIONS (name 'value', …)` clause.
 	// Nil/empty → no OPTIONS clause. DU-002 slice 380.
 	Options []string
+	// HandlerOID / ValidatorOID are pg_foreign_data_wrapper.fdwhandler/
+	// fdwvalidator — the pg_proc OIDs of a `HANDLER f`/`VALIDATOR f` clause,
+	// resolved by the executor (resolveFDWHandlerFunc/resolveFDWValidatorFunc)
+	// at CREATE/ALTER time. 0 (InvalidOid) means no handler/validator; the
+	// `::regproc` cast pg_dump's getForeignDataWrappers applies renders 0 as
+	// '-', so dumpForeignDataWrapper omits the clause. DU-002 (M0119-0004).
+	HandlerOID   uint32
+	ValidatorOID uint32
 }
 
 // RegisterForeignDataWrapper records an FDW, allocating a stable OID on first
@@ -13027,6 +13140,329 @@ func quoteArrayElement(s string) string {
 	b.WriteByte('"')
 	return b.String()
 }
+
+// BuildTableReloptions renders a table's or view's storage parameters as the
+// PostgreSQL pg_class.reloptions text[] external literal (e.g.
+// "{fillfactor=70}"), or "" when the table carries none (planner/heap-encode
+// callers must map "" to SQL NULL themselves — see arrayTextLiteral's
+// contract). This is the single source of truth for reloptions so the live
+// virtual pg_class row (registerSystemTables' VirtualRows) and the
+// heap-persisted row written for restart durability (executor's
+// buildUserPGClassRow) never drift apart (M0119-0004: buildUserPGClassRow
+// used to hardcode "{}", silently losing every reloption across a restart).
+//
+// Element order matches PostgreSQL's own stored order exactly: fillfactor,
+// parallel_workers, autovacuum_enabled, toast_tuple_target, then the
+// autovacuum_* family, vacuum_truncate, log_autovacuum_min_duration, the
+// autovacuum_*freeze* family, autovacuum_vacuum_cost_limit,
+// user_catalog_table, autovacuum_vacuum_max_threshold,
+// vacuum_max_eager_freeze_failure_rate, vacuum_index_cleanup, then (views
+// only) security_barrier, security_invoker, check_option.
+func BuildTableReloptions(t *Table) string {
+	relopts := TableReloptionsElements(t)
+	if len(relopts) == 0 {
+		return ""
+	}
+	return arrayTextLiteral(relopts)
+}
+
+// TableReloptionsElements is BuildTableReloptions's element-list form: the
+// raw "key=value" strings before joining into the text[] external literal.
+// Physical heap-tuple encoding needs the individual elements (to build a
+// proper PG ArrayType blob via pgTextArrayBytes), not the pre-joined
+// "{a,b}" string BuildTableReloptions returns for the live virtual pg_class
+// row and the planner's NULL-vs-non-empty check. M0119-0004.
+func TableReloptionsElements(t *Table) []string {
+	var relopts []string
+	if t.Fillfactor != 0 {
+		relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
+	}
+	if t.ParallelWorkersSet {
+		relopts = append(relopts, "parallel_workers="+strconv.Itoa(t.ParallelWorkers))
+	}
+	if t.AutovacuumEnabledSet {
+		relopts = append(relopts, "autovacuum_enabled="+strconv.FormatBool(t.AutovacuumEnabled))
+	}
+	if t.ToastTupleTarget != 0 {
+		relopts = append(relopts, "toast_tuple_target="+strconv.Itoa(t.ToastTupleTarget))
+	}
+	if t.AutovacuumVacuumThresholdSet {
+		relopts = append(relopts, "autovacuum_vacuum_threshold="+strconv.Itoa(t.AutovacuumVacuumThreshold))
+	}
+	if t.AutovacuumVacuumScaleFactorSet {
+		relopts = append(relopts, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumScaleFactor, 'g', -1, 64))
+	}
+	if t.AutovacuumAnalyzeScaleFactorSet {
+		relopts = append(relopts, "autovacuum_analyze_scale_factor="+strconv.FormatFloat(t.AutovacuumAnalyzeScaleFactor, 'g', -1, 64))
+	}
+	if t.AutovacuumVacuumInsertScaleFactorSet {
+		relopts = append(relopts, "autovacuum_vacuum_insert_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumInsertScaleFactor, 'g', -1, 64))
+	}
+	if t.AutovacuumVacuumCostDelaySet {
+		relopts = append(relopts, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(t.AutovacuumVacuumCostDelay, 'g', -1, 64))
+	}
+	if t.AutovacuumAnalyzeThresholdSet {
+		relopts = append(relopts, "autovacuum_analyze_threshold="+strconv.Itoa(t.AutovacuumAnalyzeThreshold))
+	}
+	if t.AutovacuumVacuumInsertThresholdSet {
+		relopts = append(relopts, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(t.AutovacuumVacuumInsertThreshold))
+	}
+	if t.VacuumTruncateSet {
+		relopts = append(relopts, "vacuum_truncate="+strconv.FormatBool(t.VacuumTruncate))
+	}
+	if t.LogAutovacuumMinDurationSet {
+		relopts = append(relopts, "log_autovacuum_min_duration="+strconv.Itoa(t.LogAutovacuumMinDuration))
+	}
+	if t.AutovacuumFreezeMinAgeSet {
+		relopts = append(relopts, "autovacuum_freeze_min_age="+strconv.Itoa(t.AutovacuumFreezeMinAge))
+	}
+	if t.AutovacuumFreezeMaxAgeSet {
+		relopts = append(relopts, "autovacuum_freeze_max_age="+strconv.Itoa(t.AutovacuumFreezeMaxAge))
+	}
+	if t.AutovacuumFreezeTableAgeSet {
+		relopts = append(relopts, "autovacuum_freeze_table_age="+strconv.Itoa(t.AutovacuumFreezeTableAge))
+	}
+	if t.AutovacuumMultixactFreezeMinAgeSet {
+		relopts = append(relopts, "autovacuum_multixact_freeze_min_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMinAge))
+	}
+	if t.AutovacuumMultixactFreezeMaxAgeSet {
+		relopts = append(relopts, "autovacuum_multixact_freeze_max_age="+strconv.Itoa(t.AutovacuumMultixactFreezeMaxAge))
+	}
+	if t.AutovacuumMultixactFreezeTableAgeSet {
+		relopts = append(relopts, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(t.AutovacuumMultixactFreezeTableAge))
+	}
+	if t.AutovacuumVacuumCostLimitSet {
+		relopts = append(relopts, "autovacuum_vacuum_cost_limit="+strconv.Itoa(t.AutovacuumVacuumCostLimit))
+	}
+	if t.UserCatalogTableSet {
+		relopts = append(relopts, "user_catalog_table="+strconv.FormatBool(t.UserCatalogTable))
+	}
+	if t.AutovacuumVacuumMaxThresholdSet {
+		relopts = append(relopts, "autovacuum_vacuum_max_threshold="+strconv.Itoa(t.AutovacuumVacuumMaxThreshold))
+	}
+	if t.VacuumMaxEagerFreezeFailureRateSet {
+		relopts = append(relopts, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(t.VacuumMaxEagerFreezeFailureRate, 'g', -1, 64))
+	}
+	if t.VacuumIndexCleanupSet {
+		relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
+	}
+	// Views: security_barrier / security_invoker / check_option. See the
+	// per-field comments at their catalog.Table struct definitions for why
+	// this order matches PostgreSQL's stored order.
+	if t.SecurityBarrierSet {
+		relopts = append(relopts, "security_barrier="+strconv.FormatBool(t.SecurityBarrier))
+	}
+	if t.SecurityInvokerSet {
+		relopts = append(relopts, "security_invoker="+strconv.FormatBool(t.SecurityInvoker))
+	}
+	if t.CheckOption != "" {
+		relopts = append(relopts, "check_option="+t.CheckOption)
+	}
+	return relopts
+}
+
+// ApplyTableReloptions is BuildTableReloptions's inverse: given a
+// pg_class.reloptions text[] external literal in the exact form
+// BuildTableReloptions itself produces (e.g. "{fillfactor=70,check_option=local}"),
+// it sets the corresponding fields on t. Used by loadUserTablesFromHeap to
+// restore a table's/view's storage parameters from the heap-persisted pg_class
+// row after a restart — without this, buildUserPGClassRow's reloptions column
+// was decoded and silently discarded, so e.g. `WITH (fillfactor=70)` or a
+// view's `WITH LOCAL CHECK OPTION` reverted to defaults across a restart
+// (M0119-0004). This is intentionally not a general PG array-literal parser
+// (no quote/escape handling): goopg only ever needs to round-trip its own
+// emitted content here, and every value BuildTableReloptions emits is a bare
+// number/bool/enum token that never needs quoting (quoteArrayElement).
+// Malformed/unknown keys are silently ignored so a forward-compatible reader
+// tolerates options written by a newer goopg version.
+func ApplyTableReloptions(t *Table, text string) {
+	if len(text) < 2 || text[0] != '{' || text[len(text)-1] != '}' {
+		return
+	}
+	inner := text[1 : len(text)-1]
+	if inner == "" {
+		return
+	}
+	for _, kv := range strings.Split(inner, ",") {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "fillfactor":
+			t.Fillfactor, _ = strconv.Atoi(val)
+		case "parallel_workers":
+			t.ParallelWorkers, _ = strconv.Atoi(val)
+			t.ParallelWorkersSet = true
+		case "autovacuum_enabled":
+			t.AutovacuumEnabled = val == "true"
+			t.AutovacuumEnabledSet = true
+		case "toast_tuple_target":
+			t.ToastTupleTarget, _ = strconv.Atoi(val)
+		case "autovacuum_vacuum_threshold":
+			t.AutovacuumVacuumThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumThresholdSet = true
+		case "autovacuum_vacuum_scale_factor":
+			t.AutovacuumVacuumScaleFactor, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumVacuumScaleFactorSet = true
+		case "autovacuum_analyze_scale_factor":
+			t.AutovacuumAnalyzeScaleFactor, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumAnalyzeScaleFactorSet = true
+		case "autovacuum_vacuum_insert_scale_factor":
+			t.AutovacuumVacuumInsertScaleFactor, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumVacuumInsertScaleFactorSet = true
+		case "autovacuum_vacuum_cost_delay":
+			t.AutovacuumVacuumCostDelay, _ = strconv.ParseFloat(val, 64)
+			t.AutovacuumVacuumCostDelaySet = true
+		case "autovacuum_analyze_threshold":
+			t.AutovacuumAnalyzeThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumAnalyzeThresholdSet = true
+		case "autovacuum_vacuum_insert_threshold":
+			t.AutovacuumVacuumInsertThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumInsertThresholdSet = true
+		case "vacuum_truncate":
+			t.VacuumTruncate = val == "true"
+			t.VacuumTruncateSet = true
+		case "log_autovacuum_min_duration":
+			t.LogAutovacuumMinDuration, _ = strconv.Atoi(val)
+			t.LogAutovacuumMinDurationSet = true
+		case "autovacuum_freeze_min_age":
+			t.AutovacuumFreezeMinAge, _ = strconv.Atoi(val)
+			t.AutovacuumFreezeMinAgeSet = true
+		case "autovacuum_freeze_max_age":
+			t.AutovacuumFreezeMaxAge, _ = strconv.Atoi(val)
+			t.AutovacuumFreezeMaxAgeSet = true
+		case "autovacuum_freeze_table_age":
+			t.AutovacuumFreezeTableAge, _ = strconv.Atoi(val)
+			t.AutovacuumFreezeTableAgeSet = true
+		case "autovacuum_multixact_freeze_min_age":
+			t.AutovacuumMultixactFreezeMinAge, _ = strconv.Atoi(val)
+			t.AutovacuumMultixactFreezeMinAgeSet = true
+		case "autovacuum_multixact_freeze_max_age":
+			t.AutovacuumMultixactFreezeMaxAge, _ = strconv.Atoi(val)
+			t.AutovacuumMultixactFreezeMaxAgeSet = true
+		case "autovacuum_multixact_freeze_table_age":
+			t.AutovacuumMultixactFreezeTableAge, _ = strconv.Atoi(val)
+			t.AutovacuumMultixactFreezeTableAgeSet = true
+		case "autovacuum_vacuum_cost_limit":
+			t.AutovacuumVacuumCostLimit, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumCostLimitSet = true
+		case "user_catalog_table":
+			t.UserCatalogTable = val == "true"
+			t.UserCatalogTableSet = true
+		case "autovacuum_vacuum_max_threshold":
+			t.AutovacuumVacuumMaxThreshold, _ = strconv.Atoi(val)
+			t.AutovacuumVacuumMaxThresholdSet = true
+		case "vacuum_max_eager_freeze_failure_rate":
+			t.VacuumMaxEagerFreezeFailureRate, _ = strconv.ParseFloat(val, 64)
+			t.VacuumMaxEagerFreezeFailureRateSet = true
+		case "vacuum_index_cleanup":
+			t.VacuumIndexCleanup = val
+			t.VacuumIndexCleanupSet = true
+		case "security_barrier":
+			t.SecurityBarrier = val == "true"
+			t.SecurityBarrierSet = true
+		case "security_invoker":
+			t.SecurityInvoker = val == "true"
+			t.SecurityInvokerSet = true
+		case "check_option":
+			t.CheckOption = val
+		}
+	}
+}
+
+// BuildIndexReloptions renders an index's storage parameters as the
+// PostgreSQL pg_class.reloptions text[] external literal (e.g.
+// "{fillfactor=70,fastupdate=off}"), or "" when the index carries none. This
+// is the single source of truth for index reloptions so the live virtual
+// pg_class row (registerSystemTables' VirtualRows, via idx.reloptionList())
+// and the heap-persisted row written for restart durability
+// (executor.buildUserPGClassRowForIndex) never drift apart — mirrors
+// BuildTableReloptions/TableReloptionsElements for tables/views (M0119-0004
+// index-reloptions follow-up: buildUserPGClassRowForIndex used to hardcode
+// "{}", silently losing fillfactor/fastupdate/gin_pending_list_limit/
+// pages_per_range/autosummarize/deduplicate_items across a restart).
+func BuildIndexReloptions(idx *Index) string {
+	relopts := IndexReloptionsElements(idx)
+	if len(relopts) == 0 {
+		return ""
+	}
+	return arrayTextLiteral(relopts)
+}
+
+// IndexReloptionsElements is BuildIndexReloptions's element-list form: the
+// raw "key=value" strings before joining into the text[] external literal.
+// Physical heap-tuple encoding needs the individual elements (to build a
+// proper PG ArrayType blob via pgTextArrayBytes), not the pre-joined "{a,b}"
+// string BuildIndexReloptions returns — matches TableReloptionsElements's
+// contract for tables.
+func IndexReloptionsElements(idx *Index) []string {
+	opts := idx.reloptionList()
+	if len(opts) == 0 {
+		return nil
+	}
+	relopts := make([]string, len(opts))
+	for i, kv := range opts {
+		relopts[i] = kv[0] + "=" + kv[1]
+	}
+	return relopts
+}
+
+// ApplyIndexReloptions is BuildIndexReloptions's inverse: given a
+// pg_class.reloptions text[] external literal in the exact form
+// BuildIndexReloptions itself produces (e.g.
+// "{fillfactor=70,fastupdate=off}"), it sets the corresponding fields on idx.
+// Used by loadUserIndexesFromHeap to restore an index's storage parameters
+// from the heap-persisted pg_class row after a restart — without this, an
+// index's fillfactor/deduplicate_items/fastupdate/gin_pending_list_limit/
+// pages_per_range/autosummarize silently reverted to defaults across every
+// restart (the index-reloptions residual left open by M0119-0004's
+// table/view reloptions fix). Mirrors ApplyTableReloptions's contract: no
+// general array-literal parsing — goopg only ever needs to round-trip its
+// own emitted content here, and every value BuildIndexReloptions emits is a
+// bare number/on/off token that never needs quoting. Malformed/unknown keys
+// are silently ignored so a forward-compatible reader tolerates options
+// written by a newer goopg version.
+func ApplyIndexReloptions(idx *Index, text string) {
+	if len(text) < 2 || text[0] != '{' || text[len(text)-1] != '}' {
+		return
+	}
+	inner := text[1 : len(text)-1]
+	if inner == "" {
+		return
+	}
+	for _, kv := range strings.Split(inner, ",") {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "fillfactor":
+			idx.Fillfactor, _ = strconv.Atoi(val)
+		case "deduplicate_items":
+			v := val == "on"
+			idx.DeduplicateItems = &v
+		case "fastupdate":
+			v := val == "on"
+			idx.FastUpdate = &v
+		case "gin_pending_list_limit":
+			idx.GinPendingListLimit, _ = strconv.Atoi(val)
+		case "pages_per_range":
+			idx.PagesPerRange, _ = strconv.Atoi(val)
+		case "autosummarize":
+			v := val == "on"
+			idx.AutoSummarize = &v
+		}
+	}
+}
+
+// ArrayTextLiteral exports arrayTextLiteral for executor's physical
+// text[]/ArrayType decoder (codec.go), which must join a decoded ArrayType
+// blob's elements back into the same "{elem,elem,…}" external-literal form
+// BuildTableReloptions/TableReloptionsElements produce, so a decoded
+// pg_class.reloptions round-trips byte-for-format-identical through
+// catalog.ApplyTableReloptions. M0119-0004.
+func ArrayTextLiteral(parts []string) string { return arrayTextLiteral(parts) }
 
 // arrayTextLiteral renders elements as a PostgreSQL text[] external literal
 // ("{elem,elem,…}"), quoting each element per array_out's rules (see
@@ -15865,6 +16301,63 @@ func (c *InMemory) RenameEnum(oldName, newName string) error {
 	et.Name = nk
 	c.enumTypes[nk] = et
 	return nil
+}
+
+// SetEnumOwner records the typowner role OID for an existing enum type.
+// Returns false if no such enum is registered. Mirrors SetCollationOwner.
+// M0122-0005 (m0097-0017 follow-up).
+func (c *InMemory) SetEnumOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	et, ok := c.enumTypes[k]
+	if !ok {
+		return false
+	}
+	et.Owner = ownerOID
+	return true
+}
+
+// RenameCompositeType renames a composite type from oldName to newName,
+// mirroring RenameEnum. M0122-0005 (m0097-0017 follow-up): ALTER TYPE ...
+// RENAME TO previously always called RenameEnum regardless of the target
+// type's kind, so renaming a composite type raised a spurious "type does not
+// exist" (42710) instead of renaming it.
+func (c *InMemory) RenameCompositeType(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ct, found := c.compositeTypes[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.compositeTypes[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.compositeTypes, ok)
+	delete(c.compositeTypeNames, ok)
+	delete(c.compositeTypeFields, ok)
+	ct.Name = nk
+	c.compositeTypes[nk] = ct
+	c.compositeTypeNames[nk] = true
+	c.compositeTypeFields[nk] = ct.Fields
+	return nil
+}
+
+// SetCompositeTypeOwner records the typowner role OID for an existing
+// composite type. Returns false if no such composite type is registered.
+// Mirrors SetEnumOwner. M0122-0005 (m0097-0017 follow-up).
+func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ct, ok := c.compositeTypes[k]
+	if !ok {
+		return false
+	}
+	ct.Owner = ownerOID
+	return true
 }
 
 // AddEnumValue appends a new label to an existing enum. before/after are

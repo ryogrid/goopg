@@ -11,10 +11,12 @@ import (
 // merges onto the registered ForeignDataWrapper.Options exactly like PG's
 // transformGenericOptions: ADD appends, SET replaces an existing value, DROP
 // removes, mirroring the identical ALTER FOREIGN TABLE ... OPTIONS (...)
-// mechanism. Also confirms a HANDLER/VALIDATOR clause is accepted and
-// discarded (goopg tracks no functions) without disturbing the options.
-// Closes the loop #57 deferral-ledger resume point ("ALTER FOREIGN DATA
-// WRAPPER remains entirely unparseable"). DU-002 slice 421.
+// mechanism. Also confirms a `NO HANDLER` clause (no matching function to
+// resolve) is accepted without disturbing the options — see
+// TestAlterForeignDataWrapperHandlerValidatorSetAndClear for HANDLER/
+// VALIDATOR resolution itself. Closes the loop #57 deferral-ledger resume
+// point ("ALTER FOREIGN DATA WRAPPER remains entirely unparseable").
+// DU-002 slice 421.
 func TestAlterForeignDataWrapperOptionsRoundtrip(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()

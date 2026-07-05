@@ -42,8 +42,8 @@ func (o *projectSetOp) Open(ctx *Context) error {
 		return err
 	}
 
-	// SELECT-list SRF mode: generate_series() / unnest() / user SETOF functions in target list.
-	if len(o.plan.SrfCols) > 0 || len(o.plan.UnnestCols) > 0 || len(o.plan.UserSrfCols) > 0 {
+	// SELECT-list SRF mode: generate_series() / unnest() / regexp_matches() / user SETOF functions in target list.
+	if len(o.plan.SrfCols) > 0 || len(o.plan.UnnestCols) > 0 || len(o.plan.RegexpMatchesCols) > 0 || len(o.plan.UserSrfCols) > 0 {
 		return o.openSelectSrfMode(ctx)
 	}
 
@@ -188,6 +188,38 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 			}
 		}
 
+		// Evaluate regexp_matches(string, pattern[, flags]) SRF columns. Each
+		// step's value is one WHOLE match's capture-group array (not one
+		// flattened element like unnest), one row per match with the 'g'
+		// flag. M0122-0002.
+		type regexpMatchesResult struct {
+			colIdx int
+			vals   []Datum
+		}
+		regexpMatchesResults := make([]regexpMatchesResult, len(o.plan.RegexpMatchesCols))
+		for k, rc := range o.plan.RegexpMatchesCols {
+			sD, err := evalExpr(rc.StringExpr, childRow, ctx)
+			if err != nil {
+				return err
+			}
+			patD, err := evalExpr(rc.PatternExpr, childRow, ctx)
+			if err != nil {
+				return err
+			}
+			var flagsD Datum
+			if rc.FlagsExpr != nil {
+				flagsD, err = evalExpr(rc.FlagsExpr, childRow, ctx)
+				if err != nil {
+					return err
+				}
+			}
+			vals := evalRegexpMatchesSRF(sD, patD, flagsD)
+			regexpMatchesResults[k] = regexpMatchesResult{colIdx: rc.ColIdx, vals: vals}
+			if len(vals) > maxLen {
+				maxLen = len(vals)
+			}
+		}
+
 		// Evaluate user-defined SETOF SQL functions. M0097-0020.
 		type userSrfResult struct {
 			colIdx int
@@ -258,6 +290,13 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					outRow[ur.colIdx] = ur.vals[step]
 				} else {
 					outRow[ur.colIdx] = Datum{} // NULL
+				}
+			}
+			for _, rmr := range regexpMatchesResults {
+				if step < len(rmr.vals) {
+					outRow[rmr.colIdx] = rmr.vals[step]
+				} else {
+					outRow[rmr.colIdx] = Datum{} // NULL
 				}
 			}
 			// Apply nested-SRF wrappers: each reads its SRF's per-step value

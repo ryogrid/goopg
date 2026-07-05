@@ -269,10 +269,14 @@ func BuildDefaultRegistry() *Registry {
 
 	// track_io_timing gates per-I/O activity wait-event hooks
 	// (BufferPin / DataFileRead / Write / Extend / Sync / AIO).
-	// Default `off` mirrors upstream PG. M0092-0005: when off,
-	// the hooks are not installed at all, saving the per-Pin /
-	// per-Read `runtime.Stack` LookupGoroutine call on the hot
-	// read path. See
+	// Default `off` mirrors upstream PG. ContextUserset: `SET
+	// track_io_timing` takes effect immediately per session — the
+	// hooks (internal/initdb/open.go) are always installed and check
+	// the calling backend's live flag via
+	// activity.ActivityRegistry.LookupTrackedGoroutine, which itself
+	// short-circuits on a process-wide fast-path flag so the
+	// default-off case still costs only one atomic load (M0092-0005's
+	// original rationale; M0122-0003 runtime-SET follow-up). See
 	// docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md.
 	r.MustRegister(NewVariable(Variable{
 		Name: "track_io_timing", Type: TypeBool, BootVal: "off",
@@ -285,6 +289,7 @@ func BuildDefaultRegistry() *Registry {
 		Name: "jit", Type: TypeBool, BootVal: "off",
 		Context: ContextUserset,
 		Scope:   ScopeServer,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name:        "compute_query_id",
@@ -299,6 +304,7 @@ func BuildDefaultRegistry() *Registry {
 		Type:        TypeEnum,
 		BootVal:     "auto",
 		EnumOptions: []string{"auto", "force_generic_plan", "force_custom_plan"},
+		Flags:       FlagExplain,
 		Context:     ContextUserset,
 		Scope:       ScopeServer,
 	}))
@@ -458,6 +464,7 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: 0, MaxVal: 1024,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "max_parallel_maintenance_workers", Type: TypeInt, BootVal: "2",
@@ -470,12 +477,14 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: 0, MaxVal: 715827882,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "min_parallel_index_scan_size", Type: TypeInt, Unit: UnitKB, BootVal: "524288",
 		MinVal: 0, MaxVal: 715827882,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_min_messages", Type: TypeEnum, BootVal: "notice",
@@ -494,6 +503,7 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: 64, MaxVal: 1 << 40,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "extra_float_digits", Type: TypeInt, BootVal: "1",
@@ -517,12 +527,14 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "effective_cache_size", Type: TypeInt, Unit: UnitKB, BootVal: "4GB",
 		MinVal: 1, MaxVal: 1 << 40,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	// Planner cost GUCs — goopg ignores them but SET succeeds so test
 	// scripts that adjust them don't fail with "unrecognized parameter".
@@ -532,18 +544,21 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: -1, MaxVal: 1e15,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "parallel_setup_cost", Type: TypeReal, BootVal: "1000",
 		MinVal: 0, MaxVal: 1e15,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "parallel_tuple_cost", Type: TypeReal, BootVal: "0.1",
 		MinVal: 0, MaxVal: 1e15,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	// debug_parallel_query (renamed from force_parallel_mode) — a developer
 	// GUC that forces a parallel plan for testing. goopg has no parallel
@@ -556,11 +571,13 @@ func BuildDefaultRegistry() *Registry {
 		EnumOptions: []string{"off", "on", "regress"},
 		Context:     ContextUserset,
 		Scope:       ScopeSession | ScopeTransaction,
+		Flags:       FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 
 	// transaction_isolation is what JDBC's getTransactionIsolation()
@@ -665,6 +682,7 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	// Per-tuple / per-operator planner cost estimates (guc_tables.c). goopg's
 	// planner does not consume these yet, but they must be registered so
@@ -675,18 +693,21 @@ func BuildDefaultRegistry() *Registry {
 		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_index_tuple_cost", Type: TypeReal, BootVal: "0.005",
 		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "cpu_operator_cost", Type: TypeReal, BootVal: "0.0025",
 		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+		Flags:   FlagExplain,
 	}))
 
 	// Tuple-freeze age thresholds (M0046-0005). vacuum_freeze_min_age is
@@ -742,6 +763,10 @@ func BuildDefaultRegistry() *Registry {
 			Name: name, Type: TypeBool, BootVal: "on",
 			Context: ContextUserset,
 			Scope:   ScopeSession | ScopeTransaction,
+			// All upstream enable_* planner-method GUCs are GUC_EXPLAIN
+			// (guc_tables.c); goopg's invented enable_nestloop_index
+			// follows the same convention since it too gates a plan shape.
+			Flags: FlagExplain,
 		}))
 	}
 
@@ -750,21 +775,25 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "parallel_leader_participation", Type: TypeBool, BootVal: "on",
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "from_collapse_limit", Type: TypeInt, BootVal: "8",
 		MinVal: 1, MaxVal: 2147483647,
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "join_collapse_limit", Type: TypeInt, BootVal: "8",
 		MinVal: 1, MaxVal: 2147483647,
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "hash_mem_multiplier", Type: TypeReal, BootVal: "2.0",
 		MinVal: 1, MaxVal: 1000,
 		Context: ContextUserset, Scope: ScopeSession | ScopeTransaction,
+		Flags: FlagExplain,
 	}))
 
 	// Time-bounded session GUCs commonly issued by JDBC / pgbouncer.

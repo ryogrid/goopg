@@ -255,11 +255,12 @@ func (p *parser) parseSelect() (Stmt, error) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
 		}
-		list, err := p.parseGroupByElems()
+		flat, sets, err := p.parseGroupByElems()
 		if err != nil {
 			return nil, err
 		}
-		s.GroupBy = list
+		s.GroupBy = flat
+		s.GroupingSets = sets
 	}
 	if p.acceptKeyword(KwHaving) {
 		h, err := p.parseExpr()
@@ -267,6 +268,13 @@ func (p *parser) parseSelect() (Stmt, error) {
 			return nil, err
 		}
 		s.Having = h
+	}
+	if p.acceptIdentKeyword("window") {
+		items, err := p.parseWindowClauseList()
+		if err != nil {
+			return nil, err
+		}
+		s.WindowClause = items
 	}
 	if p.acceptKeyword(KwOrder) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
@@ -639,74 +647,261 @@ func (p *parser) parseExprList() ([]Expr, error) {
 	return out, nil
 }
 
-// parseGroupByElems parses one or more GROUP BY elements separated by commas.
-// It handles GROUPING SETS (...), ROLLUP (...), and CUBE (...) by consuming
-// them and injecting a sentinel IntegerConst(0) so that len(GroupBy) > 0 remains
-// true — allowing downstream FOR UPDATE / HAVING checks to fire correctly.
-// Regular expressions are returned normally.
-func (p *parser) parseGroupByElems() ([]Expr, error) {
-	var out []Expr
+// maxGeneratedGroupingSets bounds ROLLUP/CUBE/GROUPING SETS expansion
+// (CUBE(n) yields 2^n sets, and multiple grouping elements cross-multiply)
+// against runaway memory from a large column list — e.g. CUBE of 20
+// columns would otherwise silently attempt to build a million-branch UNION.
+const maxGeneratedGroupingSets = 4096
+
+// parseGroupByElems parses one or more GROUP BY elements separated by
+// commas. flat is the flattened list of every expression that appears in
+// any grouping element (unaffected shape for a plain GROUP BY — existing
+// consumers such as analyzer resolution and the FOR-UPDATE/GROUP-BY check
+// keep working unmodified). sets is nil unless at least one element used
+// GROUPING SETS/ROLLUP/CUBE, in which case it holds the fully expanded,
+// cross-multiplied grouping-set list the planner rewrites into a UNION ALL
+// of plain-GROUP-BY branches (SQL:1999 §7.9). M0122-0004.
+func (p *parser) parseGroupByElems() (flat []Expr, sets *GroupingSetsSpec, err error) {
+	pos := p.cur().Pos
+	var components [][][]Expr
+	hasConstruct := false
+
 	for {
-		// GROUPING SETS / ROLLUP / CUBE: consume the grouping element and add a
-		// sentinel so the GROUP BY list is never empty after them.
-		if p.acceptIdentKeyword("grouping") {
-			sentPos := p.cur().Pos
-			p.acceptIdentKeyword("sets")
-			p.skipBalancedParens()
-			out = append(out, &IntegerConst{pos: sentPos, Value: 0})
-		} else if p.acceptIdentKeyword("rollup") || p.acceptIdentKeyword("cube") {
-			// Parse ROLLUP(col1, col2, ...) / CUBE(col1, col2, ...) as if it were
-			// plain GROUP BY col1, col2, ... (ignoring the grand-total row semantics).
-			// The empty grouping set () from ROLLUP/CUBE is not generated; queries
-			// still aggregate correctly over the non-NULL grouping columns. M0097-0023.
-			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				p.advance() // consume '('
-				for p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-						p.advance() // consume ')'
-						break
-					}
-					// Each element in ROLLUP may itself be a list in parens like (a,b).
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-						// Parenthesised group: parse inner exprs.
-						p.advance() // consume '('
-						for p.cur().Kind != TokenEOF && !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
-							expr, err := p.parseExpr()
-							if err != nil {
-								break
-							}
-							out = append(out, expr)
-							if !p.acceptSymbol(",") {
-								break
-							}
-						}
-						if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-							p.advance() // consume ')'
-						}
-					} else {
-						expr, err := p.parseExpr()
-						if err != nil {
-							break
-						}
-						out = append(out, expr)
-					}
-					if !p.acceptSymbol(",") {
-						break
-					}
-				}
+		switch {
+		case p.acceptIdentKeyword("grouping"):
+			if !p.acceptIdentKeyword("sets") {
+				return nil, nil, p.errAtCur("expected SETS after GROUPING")
 			}
-		} else {
+			alts, err := p.parseGroupingSetsList()
+			if err != nil {
+				return nil, nil, err
+			}
+			hasConstruct = true
+			components = append(components, alts)
+			for _, s := range alts {
+				flat = append(flat, s...)
+			}
+		case p.acceptIdentKeyword("rollup"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, nil, err
+			}
+			alts := rollupAlternatives(units)
+			hasConstruct = true
+			components = append(components, alts)
+			for _, u := range units {
+				flat = append(flat, u...)
+			}
+		case p.acceptIdentKeyword("cube"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, nil, err
+			}
+			if len(units) > 20 {
+				return nil, nil, p.errAtCur("CUBE grouping list too large")
+			}
+			alts := cubeAlternatives(units)
+			if len(alts) > maxGeneratedGroupingSets {
+				return nil, nil, p.errAtCur("CUBE expands to too many grouping sets")
+			}
+			hasConstruct = true
+			components = append(components, alts)
+			for _, u := range units {
+				flat = append(flat, u...)
+			}
+		default:
 			expr, err := p.parseExpr()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			out = append(out, expr)
+			flat = append(flat, expr)
+			components = append(components, [][]Expr{{expr}})
 		}
 		if !p.acceptSymbol(",") {
 			break
 		}
 	}
+
+	if !hasConstruct {
+		return flat, nil, nil
+	}
+	expanded, err := cartesianProductGroupingSets(components)
+	if err != nil {
+		return nil, nil, p.errAtCur(err.Error())
+	}
+	return flat, &GroupingSetsSpec{pos: pos, Sets: expanded}, nil
+}
+
+// parseGroupingUnitList parses the parenthesised argument list of ROLLUP(...)
+// or CUBE(...): a comma-separated list of "units", each either a single
+// expression or a parenthesised sub-list `(e1, e2, ...)` that is tied
+// together — included or excluded from a generated set as one indivisible
+// group, matching upstream's multi-column ROLLUP/CUBE element semantics.
+func (p *parser) parseGroupingUnitList() ([][]Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after ROLLUP/CUBE")
+	}
+	var units [][]Expr
+	if p.acceptSymbol(")") {
+		return units, nil // ROLLUP()/CUBE() — degenerate, single empty set
+	}
+	for {
+		if p.acceptSymbol("(") {
+			var unit []Expr
+			if !p.acceptSymbol(")") {
+				for {
+					e, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					unit = append(unit, e)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			}
+			units = append(units, unit)
+		} else {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			units = append(units, []Expr{e})
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')'")
+	}
+	return units, nil
+}
+
+// parseGroupingSetsList parses the parenthesised body of GROUPING SETS
+// (...): a comma-separated list of grouping-set items, each an empty `()`,
+// a parenthesised expression list `(e1, e2, ...)`, a bare expression
+// (shorthand for a singleton set), or a nested ROLLUP(...)/CUBE(...) (which
+// itself expands to multiple sets, all folded into this GROUPING SETS'
+// result — upstream permits nesting these constructs). Returns the
+// flattened list of generated sets; unlike the cross-multiplied form used
+// for multiple GROUP BY elements, GROUPING SETS lists its own alternatives
+// verbatim (no further cross product across its own items).
+func (p *parser) parseGroupingSetsList() ([][]Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after GROUPING SETS")
+	}
+	var out [][]Expr
+	for {
+		switch {
+		case p.acceptIdentKeyword("rollup"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, rollupAlternatives(units)...)
+		case p.acceptIdentKeyword("cube"):
+			units, err := p.parseGroupingUnitList()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, cubeAlternatives(units)...)
+		case p.cur().Kind == TokenSymbol && p.cur().Value == "(":
+			p.advance()
+			var set []Expr
+			if !p.acceptSymbol(")") {
+				for {
+					e, err := p.parseExpr()
+					if err != nil {
+						return nil, err
+					}
+					set = append(set, e)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if !p.acceptSymbol(")") {
+					return nil, p.errAtCur("expected ')'")
+				}
+			}
+			out = append(out, set)
+		default:
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, []Expr{e})
+		}
+		if !p.acceptSymbol(",") {
+			break
+		}
+		if len(out) > maxGeneratedGroupingSets {
+			return nil, p.errAtCur("GROUPING SETS list too large")
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')'")
+	}
 	return out, nil
+}
+
+// rollupAlternatives expands ROLLUP(u1, u2, ..., un) into its n+1 prefix
+// sets — the full set, then each shorter prefix down to the empty set —
+// upstream's standard hierarchical rollup semantics.
+func rollupAlternatives(units [][]Expr) [][]Expr {
+	alts := make([][]Expr, 0, len(units)+1)
+	for i := len(units); i >= 0; i-- {
+		var set []Expr
+		for _, u := range units[:i] {
+			set = append(set, u...)
+		}
+		alts = append(alts, set)
+	}
+	return alts
+}
+
+// cubeAlternatives expands CUBE(u1, ..., un) into all 2^n subsets.
+func cubeAlternatives(units [][]Expr) [][]Expr {
+	n := len(units)
+	total := 1 << n
+	alts := make([][]Expr, 0, total)
+	for mask := 0; mask < total; mask++ {
+		var set []Expr
+		for j := 0; j < n; j++ {
+			if mask&(1<<j) != 0 {
+				set = append(set, units[j]...)
+			}
+		}
+		alts = append(alts, set)
+	}
+	return alts
+}
+
+// cartesianProductGroupingSets combines the alternative-set lists of every
+// comma-separated GROUP BY element into the final expanded grouping-set
+// list, per SQL:1999's cross-product rule for multiple grouping elements
+// (e.g. `GROUP BY a, ROLLUP(b, c)` = {a} x {[b,c],[b],[]}).
+func cartesianProductGroupingSets(components [][][]Expr) ([][]Expr, error) {
+	sets := [][]Expr{{}}
+	for _, alts := range components {
+		next := make([][]Expr, 0, len(sets)*len(alts))
+		for _, prefix := range sets {
+			for _, alt := range alts {
+				combined := make([]Expr, 0, len(prefix)+len(alt))
+				combined = append(combined, prefix...)
+				combined = append(combined, alt...)
+				next = append(next, combined)
+			}
+		}
+		sets = next
+		if len(sets) > maxGeneratedGroupingSets {
+			return nil, fmt.Errorf("GROUP BY expands to too many grouping sets")
+		}
+	}
+	return sets, nil
 }
 
 // skipBalancedParens consumes a parenthesised token sequence (including nested
@@ -1428,11 +1623,14 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 // a relation alias following a from-item without an AS keyword. It
 // excludes any keyword that would start the next clause, and the
 // SQL-standard unreserved idents that double as clause introducers
-// (`FETCH` for `FETCH FIRST n ROWS ONLY`).
+// (`FETCH` for `FETCH FIRST n ROWS ONLY`, `WINDOW` for a trailing
+// named-window clause — both are also reused for the same implicit-alias
+// check in parseTargetEntry, e.g. `sum(x) OVER w WINDOW w AS (...)` must
+// not swallow `window` as sum(x)'s column alias).
 func isAliasStart(t Token) bool {
 	if t.Kind == TokenIdent {
 		switch strings.ToLower(t.Value) {
-		case "fetch":
+		case "fetch", "window":
 			return false
 		}
 		return true
@@ -1778,17 +1976,20 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				if op != OpUnknown {
 					pos := t.Pos
 					p.advance() // consume the operator token
-					// `expr ~ ANY(array)` / `expr ~* ANY(array)` etc. — ScalarArrayOpExpr.
-					// Desugar to InExpr with AnyOp set so the executor applies the
-					// operator element-wise and OR-s the results. M0097-0068.
-					if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAny {
-						p.advance() // ANY
+					// `expr ~ ANY|SOME(array)` / `expr ~* ALL(subquery)` etc. —
+					// ScalarArrayOpExpr. Desugar to InExpr with AnyOp set so the
+					// executor applies the operator element-wise and OR-s
+					// (ANY/SOME) or AND-s (ALL) the results. M0097-0068, M0122-0004.
+					if isAnyOrSomeTok(p.cur()) || isAllTok(p.cur()) {
+						allQuant := isAllTok(p.cur())
+						p.advance() // ANY / SOME / ALL
 						inExpr, err := p.parseAnyTail(left, pos)
 						if err != nil {
 							return nil, err
 						}
 						if ie, ok := inExpr.(*InExpr); ok {
 							ie.AnyOp = op
+							ie.AllOp = allQuant
 						}
 						left = inExpr
 						continue
@@ -1825,7 +2026,8 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			if t := p.cur(); t.Kind == TokenKeyword && t.Keyword == KwBetween {
 				pos := t.Pos
 				p.advance()
-				expanded, err := p.parseBetweenTail(left, pos, false)
+				symmetric := p.acceptBetweenOrdering()
+				expanded, err := p.parseBetweenTail(left, pos, false, symmetric)
 				if err != nil {
 					return nil, err
 				}
@@ -1837,7 +2039,8 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				pos := t.Pos
 				p.advance() // NOT
 				p.advance() // BETWEEN
-				expanded, err := p.parseBetweenTail(left, pos, true)
+				symmetric := p.acceptBetweenOrdering()
+				expanded, err := p.parseBetweenTail(left, pos, true, symmetric)
 				if err != nil {
 					return nil, err
 				}
@@ -1898,17 +2101,17 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 			}
 		}
 
-		// `expr = ANY (array[...])` — desugar to `expr IN (...)`.
-		// `expr != ANY (array[...])` / `expr <> ANY (...)` — desugar to
+		// `expr = ANY|SOME (array[...])` — desugar to `expr IN (...)`.
+		// `expr != ANY|SOME (array[...])` / `expr <> ANY|SOME (...)` — desugar to
 		// `expr NOT IN (...)` (semantically "at least one element is !=",
 		// which for a finite non-null list equals NOT IN). M0097-0067.
 		if precCompare >= min {
 			if t := p.cur(); t.Kind == TokenOperator && (t.Value == "=" || t.Value == "!=" || t.Value == "<>") &&
-				p.peek(1).Kind == TokenKeyword && p.peek(1).Keyword == KwAny {
+				isAnyOrSomeTok(p.peek(1)) {
 				notEq := t.Value != "="
 				pos := t.Pos
 				p.advance() // = / != / <>
-				p.advance() // ANY
+				p.advance() // ANY / SOME
 				inExpr, err := p.parseAnyTail(left, pos)
 				if err != nil {
 					return nil, err
@@ -1945,6 +2148,48 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				}
 				left = &UnaryOp{pos: pos, Op: OpNot, Operand: inExpr}
 				continue
+			}
+		}
+
+		// `expr <op> ANY|SOME|ALL (array[...] | subquery)` for the ordering
+		// comparisons (< > <= >=) and `!=`/`<>` ALL — the remaining operator
+		// x quantifier combinations not covered by the `=`/`!=`/`<>` ANY and
+		// `=` ALL forms above. Generalizes via InExpr.AnyOp/AllOp: ANY/SOME
+		// ORs the per-element comparison, ALL ANDs it (evalInExpr,
+		// internal/executor/expr.go). M0122-0004.
+		if precCompare >= min {
+			var ordOp OpCode
+			if t := p.cur(); t.Kind == TokenOperator {
+				switch t.Value {
+				case "<":
+					ordOp = OpLt
+				case ">":
+					ordOp = OpGt
+				case "<=":
+					ordOp = OpLe
+				case ">=":
+					ordOp = OpGe
+				case "!=", "<>":
+					ordOp = OpNe
+				}
+			}
+			if ordOp != OpUnknown {
+				isAll := isAllTok(p.peek(1))
+				if isAll || (ordOp != OpNe && isAnyOrSomeTok(p.peek(1))) {
+					pos := p.cur().Pos
+					p.advance() // the operator
+					p.advance() // ANY / SOME / ALL
+					inExpr, err := p.parseAnyTail(left, pos)
+					if err != nil {
+						return nil, err
+					}
+					if ie, ok := inExpr.(*InExpr); ok {
+						ie.AnyOp = ordOp
+						ie.AllOp = isAll
+					}
+					left = inExpr
+					continue
+				}
 			}
 		}
 
@@ -2073,11 +2318,47 @@ func (p *parser) peekQualifiedOp() (OpCode, int) {
 	return OpUnknown, 0
 }
 
-// parseAnyTail parses `ANY (array[e1, e2, ...])` after `=` has been consumed.
-// Returns an InExpr equivalent to `left IN (e1, e2, ...)`.
+// isAnyOrSomeTok reports whether t is the ANY or SOME keyword. SOME is an
+// accepted synonym for ANY in scalar-array/subquery comparisons
+// (`expr op SOME (...)`). M0122-0004.
+func isAnyOrSomeTok(t Token) bool {
+	return t.Kind == TokenKeyword && (t.Keyword == KwAny || t.Keyword == KwSome)
+}
+
+// isAllTok reports whether t is the ALL keyword used as a comparison
+// quantifier (`expr op ALL (...)`).
+func isAllTok(t Token) bool {
+	return t.Kind == TokenKeyword && t.Keyword == KwAll
+}
+
+// parseAnyTail parses the parenthesised operand of `ANY|SOME|ALL (...)`
+// after the quantifier keyword has been consumed: either
+// `ANY (array[e1, e2, ...])`, a bare value list, or a `(SELECT ...)`
+// subquery. The caller sets AnyOp/AllOp on the returned InExpr to select
+// the comparison operator and ANY-vs-ALL semantics; a bare `IN`-style
+// equality check leaves both zero/false.
 func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 	if !p.acceptSymbol("(") {
-		return nil, p.errAtCur("expected '(' after ANY")
+		return nil, p.errAtCur("expected '(' after ANY/SOME/ALL")
+	}
+	// `expr op ANY|ALL (SELECT ...)` — subquery form, mirroring parseInTail.
+	if p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwSelect || p.cur().Keyword == KwValues) {
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
+		inner, err := p.parseSelect()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' to close ANY/ALL subquery")
+		}
+		sel, ok := inner.(*SelectStmt)
+		if !ok {
+			return nil, &SyntaxError{Pos: pos, Message: "ANY/ALL subquery did not produce SELECT"}
+		}
+		return &InExpr{pos: pos, Operand: left, Negated: false, Subquery: sel}, nil
 	}
 	var elems []Expr
 	// array[e1, e2, ...] constructor form.
@@ -2838,6 +3119,19 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 	return &InExpr{pos: pos, Operand: left, Negated: negated, List: list}, nil
 }
 
+// acceptBetweenOrdering consumes an optional SYMMETRIC/ASYMMETRIC keyword
+// following `[NOT] BETWEEN` and reports whether SYMMETRIC was present.
+// ASYMMETRIC is the (already-default) no-op spelling; both are accepted for
+// upstream compatibility since ASYMMETRIC is documented explicitly in PG's
+// grammar even though it changes nothing.
+func (p *parser) acceptBetweenOrdering() bool {
+	if p.acceptKeyword(KwSymmetric) {
+		return true
+	}
+	p.acceptKeyword(KwAsymmetric)
+	return false
+}
+
 // parseBetweenTail consumes `low AND high` after `[NOT] BETWEEN`
 // has been advanced and rewrites the construct as an AST tree of
 // existing comparison + boolean operators. We do this at parse
@@ -2849,9 +3143,17 @@ func (p *parser) parseInTail(left Expr, pos int, negated bool) (Expr, error) {
 //
 //	(expr >= low) AND (expr <= high)
 //
-// `expr NOT BETWEEN low AND high` becomes
+// `expr BETWEEN SYMMETRIC low AND high` becomes
 //
-//	NOT ((expr >= low) AND (expr <= high))
+//	(expr >= low AND expr <= high) OR (expr >= high AND expr <= low)
+//
+// since SYMMETRIC drops the requirement that low <= high (upstream
+// desugars identically, see gram.y's `a_expr BETWEEN SYMMETRIC`
+// production).
+//
+// `expr NOT BETWEEN [SYMMETRIC] low AND high` becomes
+//
+//	NOT (<the corresponding non-NOT expansion above>)
 //
 // so SQL three-valued logic flows through the same Kleene
 // evaluator as `expr >= low AND expr <= high`. The `low` and
@@ -2914,7 +3216,7 @@ func (p *parser) parseQualifiedOperator() (OpCode, bool) {
 	return OpUnknown, false
 }
 
-func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error) {
+func (p *parser) parseBetweenTail(left Expr, pos int, negated bool, symmetric bool) (Expr, error) {
 	low, err := p.parseExprPrec(precAnd + 1)
 	if err != nil {
 		return nil, err
@@ -2926,9 +3228,17 @@ func (p *parser) parseBetweenTail(left Expr, pos int, negated bool) (Expr, error
 	if err != nil {
 		return nil, err
 	}
-	ge := &BinaryOp{pos: pos, Op: OpGe, Left: left, Right: low}
-	le := &BinaryOp{pos: pos, Op: OpLe, Left: left, Right: high}
-	combined := Expr(&BinaryOp{pos: pos, Op: OpAnd, Left: ge, Right: le})
+	rangeExpr := func(lo, hi Expr) Expr {
+		ge := &BinaryOp{pos: pos, Op: OpGe, Left: left, Right: lo}
+		le := &BinaryOp{pos: pos, Op: OpLe, Left: left, Right: hi}
+		return &BinaryOp{pos: pos, Op: OpAnd, Left: ge, Right: le}
+	}
+	var combined Expr
+	if symmetric {
+		combined = &BinaryOp{pos: pos, Op: OpOr, Left: rangeExpr(low, high), Right: rangeExpr(high, low)}
+	} else {
+		combined = rangeExpr(low, high)
+	}
 	if negated {
 		combined = &UnaryOp{pos: pos, Op: OpNot, Operand: combined}
 	}
@@ -3015,6 +3325,29 @@ func (p *parser) parseExtractExpr(pos int) (Expr, error) {
 		return nil, p.errAtCur("expected ')' to close EXTRACT")
 	}
 	return &ExtractExpr{pos: pos, Field: field, Source: source}, nil
+}
+
+// parseGroupingCallExpr parses `GROUPING(expr [, ...])`. Requires at least
+// one argument (upstream rejects the bare `GROUPING()` form too).
+func (p *parser) parseGroupingCallExpr(pos int) (Expr, error) {
+	if !p.acceptSymbol("(") {
+		return nil, p.errAtCur("expected '(' after GROUPING")
+	}
+	var args []Expr
+	for {
+		arg, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, arg)
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	if !p.acceptSymbol(")") {
+		return nil, p.errAtCur("expected ')' to close GROUPING")
+	}
+	return &GroupingCall{pos: pos, Args: args}, nil
 }
 
 // parseSubstringFuncCall parses both SUBSTRING syntax forms:
@@ -3141,6 +3474,13 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 		// Match case-insensitively on the bare ident form.
 		if len(parts) == 1 && strings.EqualFold(parts[0], "extract") {
 			return p.parseExtractExpr(startPos)
+		}
+		// GROUPING(expr [, ...]) — SQL-standard pseudo-function valid
+		// alongside GROUPING SETS/ROLLUP/CUBE. Not a real catalog
+		// function (like EXTRACT), so intercept before the generic
+		// call path. M0122-0004.
+		if len(parts) == 1 && strings.EqualFold(parts[0], "grouping") {
+			return p.parseGroupingCallExpr(startPos)
 		}
 		if len(parts) == 1 && (strings.EqualFold(parts[0], "substring") || strings.EqualFold(parts[0], "substr")) {
 			return p.parseSubstringFuncCall(startPos, strings.ToLower(parts[0]))
@@ -3404,18 +3744,33 @@ func (p *parser) maybeWindowTail(fc *FuncCall) (Expr, error) {
 }
 
 // parseWindowDef parses the `OVER ( [PARTITION BY exprs]
-// [ORDER BY sortlist] )` body. Frame clauses (ROWS / RANGE /
-// GROUPS) are deferred — `parseWindowDef` errors on any token
-// that isn't `)` after the optional ORDER BY.
+// [ORDER BY sortlist] [frame clause] )` body, or the bare `OVER
+// window_name` form (M0020 named-window slice) that defers
+// PartitionBy/OrderBy/Frame to the analyzer's WindowClause lookup.
 func (p *parser) parseWindowDef() (*WindowDef, error) {
 	t, err := p.expectKeyword(KwOver)
 	if err != nil {
 		return nil, err
 	}
-	if !p.acceptSymbol("(") {
-		return nil, p.errAtCur("expected '(' after OVER")
+	if p.acceptSymbol("(") {
+		return p.parseWindowSpecBody(t.Pos)
 	}
-	wd := &WindowDef{pos: t.Pos}
+	if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent {
+		name := p.cur().Value
+		p.advance()
+		return &WindowDef{pos: t.Pos, RefName: name}, nil
+	}
+	return nil, p.errAtCur("expected '(' or window name after OVER")
+}
+
+// parseWindowSpecBody parses the shared `[PARTITION BY exprs]
+// [ORDER BY sortlist] )` body used both by an anonymous `OVER (...)`
+// tail and by a named `WINDOW name AS (...)` clause item — the two
+// forms must stay byte-for-byte in sync (pattern_sibling_paths_must_agree),
+// so they share this single implementation. The caller has already
+// consumed the opening `(`; pos is the position to stamp on the result.
+func (p *parser) parseWindowSpecBody(pos int) (*WindowDef, error) {
+	wd := &WindowDef{pos: pos}
 	if p.acceptKeyword(KwPartition) {
 		if _, err := p.expectKeyword(KwBy); err != nil {
 			return nil, err
@@ -3436,10 +3791,165 @@ func (p *parser) parseWindowDef() (*WindowDef, error) {
 		}
 		wd.OrderBy = sl
 	}
+	frame, err := p.parseFrameClause()
+	if err != nil {
+		return nil, err
+	}
+	wd.Frame = frame
 	if !p.acceptSymbol(")") {
-		return nil, p.errAtCur("expected ')' after window definition (frame clauses are not supported in v0)")
+		return nil, p.errAtCur("expected ')' after window definition")
 	}
 	return wd, nil
+}
+
+// parseFrameClause parses the optional `{ROWS|RANGE|GROUPS} frame_extent
+// [frame_exclusion]` window frame clause trailing a window spec's
+// PARTITION BY/ORDER BY (M0122-0004). Returns nil, nil when no frame
+// clause is present — the default frame applies (see
+// internal/executor/operators_window.go). Mirrors gram.y's
+// opt_frame_clause/frame_extent productions; ROWS/RANGE/GROUPS,
+// UNBOUNDED, PRECEDING, FOLLOWING, CURRENT, EXCLUDE, TIES, and OTHERS
+// are all soft (unreserved) keywords like WITHIN/FILTER/WINDOW, so no
+// lexer/token-table change is needed. Bound-ordering validation
+// (SQLSTATE 42P20) and the RANGE/GROUPS scope limitation are left to
+// the analyzer, which is the only place in this codebase that raises
+// non-syntax SQLSTATEs.
+func (p *parser) parseFrameClause() (*WindowFrame, error) {
+	var mode FrameMode
+	switch {
+	case p.acceptIdentKeyword("rows"):
+		mode = FrameModeRows
+	case p.acceptIdentKeyword("range"):
+		mode = FrameModeRange
+	case p.acceptIdentKeyword("groups"):
+		mode = FrameModeGroups
+	default:
+		return nil, nil
+	}
+	fr := &WindowFrame{Mode: mode, EndKind: FrameBoundCurrentRow}
+	if p.acceptKeyword(KwBetween) {
+		startKind, startOffset, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwAnd); err != nil {
+			return nil, err
+		}
+		endKind, endOffset, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		fr.StartKind, fr.StartOffset = startKind, startOffset
+		fr.EndKind, fr.EndOffset = endKind, endOffset
+		fr.HasBetween = true
+	} else {
+		startKind, startOffset, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		fr.StartKind, fr.StartOffset = startKind, startOffset
+		// frame_extent: frame_bound (single-bound form) — end defaults
+		// to CURRENT ROW (already set above).
+	}
+	excl, err := p.parseFrameExclusion()
+	if err != nil {
+		return nil, err
+	}
+	fr.Exclusion = excl
+	return fr, nil
+}
+
+// parseFrameBound parses one `UNBOUNDED PRECEDING|FOLLOWING`,
+// `CURRENT ROW`, or `<expr> PRECEDING|FOLLOWING` frame bound.
+func (p *parser) parseFrameBound() (FrameBoundKind, Expr, error) {
+	switch {
+	case p.acceptIdentKeyword("unbounded"):
+		switch {
+		case p.acceptIdentKeyword("preceding"):
+			return FrameBoundUnboundedPreceding, nil, nil
+		case p.acceptIdentKeyword("following"):
+			return FrameBoundUnboundedFollowing, nil, nil
+		default:
+			return 0, nil, p.errAtCur("expected PRECEDING or FOLLOWING after UNBOUNDED")
+		}
+	case p.acceptIdentKeyword("current"):
+		if !p.acceptIdentKeyword("row") {
+			return 0, nil, p.errAtCur("expected ROW after CURRENT")
+		}
+		return FrameBoundCurrentRow, nil, nil
+	default:
+		offset, err := p.parseExpr()
+		if err != nil {
+			return 0, nil, err
+		}
+		switch {
+		case p.acceptIdentKeyword("preceding"):
+			return FrameBoundOffsetPreceding, offset, nil
+		case p.acceptIdentKeyword("following"):
+			return FrameBoundOffsetFollowing, offset, nil
+		default:
+			return 0, nil, p.errAtCur("expected PRECEDING or FOLLOWING after frame bound offset")
+		}
+	}
+}
+
+// parseFrameExclusion parses the optional `EXCLUDE {CURRENT ROW |
+// GROUP | TIES | NO OTHERS}` clause. Returns FrameExcludeNone (which
+// also represents the omitted clause) when EXCLUDE isn't present.
+func (p *parser) parseFrameExclusion() (FrameExclusion, error) {
+	if !p.acceptIdentKeyword("exclude") {
+		return FrameExcludeNone, nil
+	}
+	switch {
+	case p.acceptIdentKeyword("current"):
+		if !p.acceptIdentKeyword("row") {
+			return 0, p.errAtCur("expected ROW after EXCLUDE CURRENT")
+		}
+		return FrameExcludeCurrentRow, nil
+	case p.acceptKeyword(KwGroup):
+		return FrameExcludeGroup, nil
+	case p.acceptIdentKeyword("ties"):
+		return FrameExcludeTies, nil
+	case p.acceptIdentKeyword("no"):
+		if !p.acceptIdentKeyword("others") {
+			return 0, p.errAtCur("expected OTHERS after EXCLUDE NO")
+		}
+		return FrameExcludeNone, nil
+	default:
+		return 0, p.errAtCur("expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE")
+	}
+}
+
+// parseWindowClauseList parses the comma-separated `name AS (...)`
+// items of a trailing SELECT `WINDOW` clause (M0020 named-window
+// slice). Each item's body is the same PARTITION BY/ORDER BY spec as
+// an anonymous OVER(...), parsed via the shared parseWindowSpecBody.
+func (p *parser) parseWindowClauseList() ([]NamedWindowDef, error) {
+	var items []NamedWindowDef
+	for {
+		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected window name")
+		}
+		name := p.cur().Value
+		namePos := p.cur().Pos
+		p.advance()
+		if !p.acceptKeyword(KwAs) {
+			return nil, p.errAtCur("expected AS after window name")
+		}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after AS in window definition")
+		}
+		wd, err := p.parseWindowSpecBody(namePos)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, NamedWindowDef{Name: name, Def: wd})
+		if p.acceptSymbol(",") {
+			continue
+		}
+		break
+	}
+	return items, nil
 }
 
 // parseIntLiteral converts a TokenIntLit value to int64, handling:

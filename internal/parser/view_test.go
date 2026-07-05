@@ -94,6 +94,43 @@ func TestParseCreateViewCheckOption(t *testing.T) {
 	}
 }
 
+// TestParseCreateViewCheckOptionReloptionForm pins that the pre-AS
+// `WITH (check_option = <local|cascaded>)` storage option is captured into
+// CreateViewStmt.CheckOption exactly like the trailing `WITH [CASCADED|LOCAL]
+// CHECK OPTION` clause does (both spellings are the same PG reloption —
+// view.c folds the trailing clause into a `check_option` DefElem internally),
+// so a dump/reload round-trip using either syntax lands on the same
+// pg_class.reloption. An unrecognized/omitted value defaults to cascaded,
+// matching PG's default and this parser's existing lenient (non-erroring)
+// handling of the sibling security_barrier/security_invoker reloptions.
+// M0122-0004 follow-up.
+func TestParseCreateViewCheckOptionReloptionForm(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{"CREATE VIEW v WITH (check_option=local) AS SELECT id FROM d", "local"},
+		{"CREATE VIEW v WITH (check_option = cascaded) AS SELECT id FROM d", "cascaded"},
+		{"CREATE VIEW v WITH (check_option='local') AS SELECT id FROM d", "local"},
+		{"CREATE VIEW v WITH (check_option) AS SELECT id FROM d", "cascaded"},
+		{"CREATE VIEW v WITH (security_barrier=true) AS SELECT id FROM d", ""},
+		{"CREATE VIEW v AS SELECT id FROM d", ""},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.src, err)
+		}
+		cv, ok := stmts[0].(*CreateViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateViewStmt", tc.src, stmts[0])
+		}
+		if cv.CheckOption != tc.want {
+			t.Errorf("Parse(%q): CheckOption=%q want %q", tc.src, cv.CheckOption, tc.want)
+		}
+	}
+}
+
 // TestParseCreateViewSecurityBarrier pins that a pre-AS
 // `WITH (security_barrier = <bool>)` storage option is captured into
 // CreateViewStmt.SecurityBarrier (nil when unspecified; a bare option defaults

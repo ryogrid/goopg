@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -224,6 +225,116 @@ func TestUserPGClassRowFixedFieldsOID(t *testing.T) {
 	}
 	if name[9] != 0 {
 		t.Errorf("relname[9] = %d, want 0 (NUL padding)", name[9])
+	}
+}
+
+// TestBuildUserPGClassRowReloptionsSurvivesHeapEncode pins M0119-0004:
+// buildUserPGClassRow used to hardcode reloptions="{}" unconditionally, so a
+// table's/view's storage parameters were silently dropped from the
+// heap-persisted pg_class row and lost across a restart. It must instead
+// reuse catalog.TableReloptionsElements — the same builder the live virtual
+// pg_class row uses — encode a real PG ArrayType blob (not a bare string,
+// which encodeValuePG's "text[]" case silently discards in favor of an empty
+// array), and emit SQL NULL when the relation carries no reloptions at all,
+// matching real PostgreSQL. Round-trips through EncodeRowPG +
+// decodePhysicalPGValueMctx (the same path loadUserTablesFromHeap uses) to
+// pin the full physical-tuple encoding, not just the pre-encode Datum.
+func TestBuildUserPGClassRowReloptionsSurvivesHeapEncode(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	decodeReloptions := func(t *testing.T, tbl *catalog.Table) Datum {
+		t.Helper()
+		row := buildUserPGClassRow(nil, tbl)
+		body, err := EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("EncodeRowPG: %v", err)
+		}
+		bitmap := NullBitmapPG(row)
+		tuple := storage.NewHeapTupleWithNulls(1, storage.InvalidTransactionID, bitmap, body)
+		tuple.Header.SetNatts(len(cols))
+		natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, tuple.Data, tuple.Bitmap, natts, nil); err != nil {
+			t.Fatalf("DecodeRowIntoMctxPGTuple: %v", err)
+		}
+		return decoded[32]
+	}
+
+	plain := &catalog.Table{Schema: "public", Name: "plain_tbl", OID: 16401}
+	if got := decodeReloptions(t, plain); !got.IsNull() {
+		t.Errorf("plain table reloptions = %q, want NULL", got.StringValue())
+	}
+
+	withOpts := &catalog.Table{
+		Schema:     "public",
+		Name:       "opts_tbl",
+		OID:        16402,
+		Fillfactor: 70,
+	}
+	if got, want := decodeReloptions(t, withOpts).StringValue(), "{fillfactor=70}"; got != want {
+		t.Errorf("opts_tbl reloptions = %q, want %q", got, want)
+	}
+
+	view := &catalog.Table{
+		Schema:             "public",
+		Name:               "co_view",
+		OID:                16403,
+		View:                &parser.SelectStmt{},
+		CheckOption:        "cascaded",
+		SecurityBarrierSet: true,
+		SecurityBarrier:    true,
+	}
+	if got, want := decodeReloptions(t, view).StringValue(), "{security_barrier=true,check_option=cascaded}"; got != want {
+		t.Errorf("co_view reloptions = %q, want %q", got, want)
+	}
+}
+
+// TestBuildUserPGClassRowForIndexReloptionsSurvivesHeapEncode pins the
+// index-reloptions follow-up to M0119-0004: buildUserPGClassRowForIndex used
+// to hardcode reloptions="{}" unconditionally, so an index's fillfactor/
+// fastupdate/etc. storage parameters were silently dropped from the
+// heap-persisted pg_class row and lost across a restart. It must instead
+// reuse catalog.IndexReloptionsElements — the same builder the live virtual
+// pg_class row uses — encode a real PG ArrayType blob, and emit SQL NULL
+// when the index carries no reloptions at all, matching real PostgreSQL
+// (sibling of TestBuildUserPGClassRowReloptionsSurvivesHeapEncode for
+// tables/views).
+func TestBuildUserPGClassRowForIndexReloptionsSurvivesHeapEncode(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	decodeReloptions := func(t *testing.T, idx *catalog.Index) Datum {
+		t.Helper()
+		row := buildUserPGClassRowForIndex(nil, idx)
+		body, err := EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("EncodeRowPG: %v", err)
+		}
+		bitmap := NullBitmapPG(row)
+		tuple := storage.NewHeapTupleWithNulls(1, storage.InvalidTransactionID, bitmap, body)
+		tuple.Header.SetNatts(len(cols))
+		natts := int(tuple.Header.Infomask2 & storage.HeapNattsMask)
+		decoded := make(Row, len(cols))
+		if err := DecodeRowIntoMctxPGTuple(decoded, cols, tuple.Data, tuple.Bitmap, natts, nil); err != nil {
+			t.Fatalf("DecodeRowIntoMctxPGTuple: %v", err)
+		}
+		return decoded[32]
+	}
+
+	plain := &catalog.Index{Schema: "public", Name: "plain_idx", OID: 16411, Columns: []string{"id"}}
+	if got := decodeReloptions(t, plain); !got.IsNull() {
+		t.Errorf("plain index reloptions = %q, want NULL", got.StringValue())
+	}
+
+	fastUpdateOff := false
+	withOpts := &catalog.Index{
+		Schema:              "public",
+		Name:                "opts_idx",
+		OID:                 16412,
+		Columns:             []string{"id"},
+		Fillfactor:          70,
+		FastUpdate:          &fastUpdateOff,
+		GinPendingListLimit: 8192,
+	}
+	if got, want := decodeReloptions(t, withOpts).StringValue(), "{fillfactor=70,fastupdate=off,gin_pending_list_limit=8192}"; got != want {
+		t.Errorf("opts_idx reloptions = %q, want %q", got, want)
 	}
 }
 

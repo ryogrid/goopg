@@ -220,3 +220,205 @@ func TestUpdateViaIndexScanPath(t *testing.T) {
 		}
 	}
 }
+
+// TestDMLRequiresTablePrivilege pins dmlPrivilegePermitted (M0097-0040): a
+// non-superuser role with no GRANT and no ownership on the target table gets
+// 42501 on INSERT/UPDATE/DELETE, gaining access once granted the matching
+// privilege; the table owner and the bootstrap superuser always pass without
+// any GRANT. Mirrors the TRUNCATE privilege check (M0118-0008
+// truncate-conflict) that the same internal/catalog tableACLs store already
+// backs for pg_dump round-tripping but was never consulted for plain DML.
+func TestDMLRequiresTablePrivilege(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	insertStmt := func() *planner.Insert {
+		return &planner.Insert{
+			Table:       tbl,
+			Source:      &planner.Values{Rows: [][]planner.Expr{{&planner.IntegerConst{Value: 4}, &planner.StringConst{Value: "delta"}}}},
+			ColumnIndex: []int{0, 1},
+		}
+	}
+	updateStmt := func() *planner.Update {
+		return &planner.Update{
+			Table: tbl,
+			Child: &planner.Filter{
+				Child:     &planner.SeqScan{Table: tbl},
+				Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &planner.IntegerConst{Value: 1}},
+			},
+			Set: []planner.Expr{nil, &planner.StringConst{Value: "updated"}},
+		}
+	}
+	deleteStmt := func() *planner.Delete {
+		return &planner.Delete{
+			Table: tbl,
+			Child: &planner.Filter{
+				Child:     &planner.SeqScan{Table: tbl},
+				Predicate: &planner.BinaryOp{Op: parser.OpEq, Left: &planner.ColumnRef{Index: 0, Name: "id", Type: catalog.Type{Name: "int4"}}, Right: &planner.IntegerConst{Value: 1}},
+			},
+		}
+	}
+
+	assertDenied := func(t *testing.T, plan planner.Node, priv string) {
+		t.Helper()
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = op.Open(ctx)
+		execErr, ok := err.(*ExecError)
+		if !ok || execErr.Code != "42501" {
+			t.Fatalf("%s: expected 42501 permission-denied, got %#v", priv, err)
+		}
+	}
+	assertAllowed := func(t *testing.T, plan planner.Node, priv string) {
+		t.Helper()
+		op, err := Build(plan)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("%s: expected success, got %v", priv, err)
+		}
+		if _, err := op.Next(); err != EOF {
+			t.Fatalf("%s: Next: %v", priv, err)
+		}
+		_ = op.Close()
+	}
+
+	// Unprivileged non-superuser role: every DML op is denied.
+	ctx.NonSuperuserRole = "alice"
+	assertDenied(t, insertStmt(), "INSERT")
+	assertDenied(t, updateStmt(), "UPDATE")
+	assertDenied(t, deleteStmt(), "DELETE")
+
+	// GRANT the matching privilege one at a time: each op starts passing.
+	im.GrantTablePrivilege(tbl.OID, "alice", "INSERT")
+	assertAllowed(t, insertStmt(), "INSERT")
+	assertDenied(t, updateStmt(), "UPDATE")
+	im.GrantTablePrivilege(tbl.OID, "alice", "UPDATE")
+	assertAllowed(t, updateStmt(), "UPDATE")
+	assertDenied(t, deleteStmt(), "DELETE")
+	im.GrantTablePrivilege(tbl.OID, "alice", "DELETE")
+	assertAllowed(t, deleteStmt(), "DELETE")
+
+	// The table owner passes without any GRANT.
+	ctx.NonSuperuserRole = "bob"
+	tbl.Owner = "bob"
+	assertAllowed(t, deleteStmt(), "DELETE (owner)")
+	tbl.Owner = ""
+
+	// The bootstrap superuser (no SET ROLE) always passes.
+	ctx.NonSuperuserRole = ""
+	assertAllowed(t, deleteStmt(), "DELETE (superuser)")
+}
+
+// TestSeqScanRequiresSelectPrivilege extends M0097-0040 to SELECT: a
+// non-superuser role with no GRANT and no ownership gets 42501 reading a
+// user table via SeqScan, gaining access once granted SELECT; the owner
+// and the bootstrap superuser always pass. Sibling coverage for
+// IndexScan/IndexOnlyScan lives in TestIndexScansRequireSelectPrivilege
+// below — a naive fix to only seqScanOp would leave an index-scan-chosen
+// plan able to bypass the gate entirely.
+func TestSeqScanRequiresSelectPrivilege(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+
+	scanStmt := func() *planner.SeqScan { return &planner.SeqScan{Table: tbl} }
+
+	assertDenied := func(t *testing.T) {
+		t.Helper()
+		op, err := Build(scanStmt())
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = op.Open(ctx)
+		execErr, ok := err.(*ExecError)
+		if !ok || execErr.Code != "42501" {
+			t.Fatalf("expected 42501 permission-denied, got %#v", err)
+		}
+	}
+	assertAllowed := func(t *testing.T) {
+		t.Helper()
+		op, err := Build(scanStmt())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := op.Open(ctx); err != nil {
+			t.Fatalf("expected success, got %v", err)
+		}
+		_ = op.Close()
+	}
+
+	ctx.NonSuperuserRole = "alice"
+	assertDenied(t)
+
+	im.GrantTablePrivilege(tbl.OID, "alice", "SELECT")
+	assertAllowed(t)
+
+	// The table owner passes without any GRANT.
+	ctx.NonSuperuserRole = "bob"
+	tbl.Owner = "bob"
+	assertAllowed(t)
+	tbl.Owner = ""
+
+	// The bootstrap superuser (no SET ROLE) always passes.
+	ctx.NonSuperuserRole = ""
+	assertAllowed(t)
+}
+
+// TestIndexScansRequireSelectPrivilege pins the IndexScan/IndexOnlyScan
+// sibling of TestSeqScanRequiresSelectPrivilege's SeqScan gate directly at
+// the dmlPrivilegePermitted layer both operators call — a regression that
+// only re-checks SeqScan would miss an index-scan-chosen plan silently
+// reading a table the role has no SELECT grant on.
+func TestIndexScansRequireSelectPrivilege(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	ctx.NonSuperuserRole = "alice"
+	if dmlPrivilegePermitted(ctx, tbl, "SELECT") {
+		t.Fatal("expected SELECT denied with no grant")
+	}
+	idxOp := &indexScanOp{plan: &planner.IndexScan{Table: tbl}}
+	if err := idxOp.openPrep(ctx); err == nil {
+		t.Fatal("indexScanOp.openPrep: expected 42501, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
+		t.Fatalf("indexScanOp.openPrep: expected 42501, got %#v", err)
+	}
+	ionOp := &indexOnlyScanOp{plan: &planner.IndexOnlyScan{Table: tbl}}
+	if err := ionOp.Open(ctx); err == nil {
+		t.Fatal("indexOnlyScanOp.Open: expected 42501, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
+		t.Fatalf("indexOnlyScanOp.Open: expected 42501, got %#v", err)
+	}
+}
+
+// TestSystemCatalogSelectAlwaysPermitted pins the dmlPrivilegePermitted
+// carve-out that keeps pg_catalog/information_schema readable by any role
+// even though goopg has no per-catalog default-ACL (pg_init_privs)
+// seeding — without it, gating SELECT would 42501 every psql `\d`,
+// pg_dump, and information_schema query issued by a non-superuser role.
+func TestSystemCatalogSelectAlwaysPermitted(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	_ = cat
+	ctx.NonSuperuserRole = "alice"
+
+	sysTbl := &catalog.Table{OID: 1259, Name: "pg_class", Owner: "postgres"} // < FirstUserOID (16384)
+	if !dmlPrivilegePermitted(ctx, sysTbl, "SELECT") {
+		t.Fatal("expected system catalog SELECT to always be permitted")
+	}
+	// INSERT/UPDATE/DELETE on a system catalog are unaffected by the
+	// SELECT carve-out — a non-superuser role still needs a real grant.
+	if dmlPrivilegePermitted(ctx, sysTbl, "INSERT") {
+		t.Fatal("expected system catalog INSERT to still require a grant")
+	}
+}

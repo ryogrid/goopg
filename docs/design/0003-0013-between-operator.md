@@ -98,10 +98,29 @@ critical precedence-handling case.
 
 ## Out of scope (deferred)
 
-- `BETWEEN SYMMETRIC` (no required ordering of low/high). Upstream
-  supports it; v0 doesn't yet — TPC-H doesn't use it.
 - A dedicated `BetweenExpr` node. Desugaring at parse time is
   cheaper and re-uses every downstream operator path; the AST
   shape stays standard-comparison.
 - KindDate carrier with date-only Format() — see "Date codec
   coverage" above.
+
+## Follow-up: `BETWEEN SYMMETRIC` / `ASYMMETRIC` (2026-07-04, M0122-0004)
+
+Closed the gap noted above. `SYMMETRIC`/`ASYMMETRIC` are registered as
+reserved keywords (`internal/parser/token.go`, category `KwCatReserved`
+in `internal/parser/keywords.go`, matching upstream's kwlist.h
+`RESERVED_KEYWORD` classification for both).
+
+`p.acceptBetweenOrdering()` (`internal/parser/select.go`) consumes the
+optional keyword right after `[NOT] BETWEEN`. `ASYMMETRIC` is a no-op
+(it's the existing default ordering); `SYMMETRIC` flows a bool into
+`parseBetweenTail`, which now desugars
+
+- `expr BETWEEN SYMMETRIC low AND high` →
+  `(expr>=low AND expr<=high) OR (expr>=high AND expr<=low)`
+
+still entirely inside the parser — no `BetweenExpr` node, no
+analyzer/planner/executor changes, same as the plain-BETWEEN desugar.
+Tests: `TestParseBetweenSymmetricDesugar`,
+`TestParseNotBetweenSymmetricDesugar`,
+`TestParseBetweenAsymmetricDesugar` (`internal/parser/between_test.go`).

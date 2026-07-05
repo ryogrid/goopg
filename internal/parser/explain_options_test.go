@@ -130,12 +130,25 @@ func TestParseExplainRejectsEmptyOptionList(t *testing.T) {
 	}
 }
 
-// TestParseExplainRejectsBadFormat: FORMAT XML is upstream-valid
-// but goopg doesn't support it; should error cleanly.
+// TestParseExplainAcceptsXMLFormat: FORMAT XML is upstream-valid and
+// (M0122-0003) goopg now renders it; the parser must accept it.
+func TestParseExplainAcceptsXMLFormat(t *testing.T) {
+	stmts, err := Parse("EXPLAIN (FORMAT XML) SELECT 1")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	opts := stmts[0].(*ExplainStmt).Options
+	if opts.Format != ExplainFormatXML {
+		t.Errorf("Format = %v, want ExplainFormatXML", opts.Format)
+	}
+}
+
+// TestParseExplainRejectsBadFormat: a value that isn't one of
+// TEXT/JSON/XML/YAML should error cleanly.
 func TestParseExplainRejectsBadFormat(t *testing.T) {
-	_, err := Parse("EXPLAIN (FORMAT XML) SELECT 1")
+	_, err := Parse("EXPLAIN (FORMAT BOGUS) SELECT 1")
 	if err == nil {
-		t.Fatal("Parse returned nil for FORMAT XML")
+		t.Fatal("Parse returned nil for FORMAT BOGUS")
 	}
 	if !strings.Contains(err.Error(), "unsupported FORMAT") {
 		t.Errorf("err = %v; want mention of unsupported FORMAT", err)

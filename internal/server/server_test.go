@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/protocol"
 )
 
@@ -277,4 +279,53 @@ func splitParamStatus(t *testing.T, p []byte) (string, string) {
 	}
 	t.Fatalf("ParameterStatus payload missing key terminator: %v", p)
 	return "", ""
+}
+
+// TestTrackIOTimingOnChangePropagatesToActivityRegistry verifies M0122-0003's
+// runtime-SET follow-up: New() wires a GUC OnChange hook so `SET
+// track_io_timing` immediately updates the calling backend's flag in the
+// activity registry (which the always-installed I/O wait-event hooks in
+// internal/initdb/open.go consult via LookupTrackedGoroutine), without
+// requiring a server restart or hook reinstallation.
+func TestTrackIOTimingOnChangePropagatesToActivityRegistry(t *testing.T) {
+	reg := config.BuildDefaultRegistry()
+	act := activity.NewActivityRegistry(4)
+	// New() registers the OnChange hook against cfg.Registry as a side
+	// effect; it doesn't need to be Run() for that wiring to take effect.
+	New(Config{
+		Address:  "127.0.0.1:0",
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Registry: reg,
+		Activity: act,
+	})
+
+	act.Register(&activity.Backend{PID: "1", State: "active"})
+	procNum := int32(0)
+	activity.SetCurrentGoroutine(act, procNum)
+	defer activity.ClearCurrentGoroutine()
+
+	if act.TrackIOTiming(procNum) {
+		t.Fatalf("TrackIOTiming before any SET = true, want false")
+	}
+	if _, _, ok := act.LookupTrackedGoroutine(); ok {
+		t.Fatalf("LookupTrackedGoroutine before any SET = ok, want false")
+	}
+
+	sess := config.NewSessionRegistry(reg)
+	if err := sess.Set("track_io_timing", "on", false); err != nil {
+		t.Fatalf("SET track_io_timing = on: %v", err)
+	}
+	if !act.TrackIOTiming(procNum) {
+		t.Errorf("TrackIOTiming after SET on = false, want true")
+	}
+	if _, pn, ok := act.LookupTrackedGoroutine(); !ok || pn != procNum {
+		t.Errorf("LookupTrackedGoroutine after SET on = (_, %d, %v), want (_, %d, true)", pn, ok, procNum)
+	}
+
+	if err := sess.Set("track_io_timing", "off", false); err != nil {
+		t.Fatalf("SET track_io_timing = off: %v", err)
+	}
+	if act.TrackIOTiming(procNum) {
+		t.Errorf("TrackIOTiming after SET off = true, want false")
+	}
 }

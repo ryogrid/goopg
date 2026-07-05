@@ -1730,3 +1730,25 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 	}
 	return nil
 }
+
+// checkViewCheckOption evaluates a `WITH CHECK OPTION` view's defining WHERE
+// qual (already resolved against the view's auto-updatable base relation by
+// viewQualOnBase, so it evaluates directly against a base-table-shaped row —
+// no reparse needed, unlike checkConstraints' text-based CHECK constraints)
+// against a row about to be written through it: the row being INSERTed, or
+// the row an UPDATE's SET produced. Mirrors execMain.c's ExecWCOQual /
+// WCO_VIEW_CHECK — NULL or FALSE is a violation, matching the same truthiness
+// rule filterOp already uses. M0119-0004 slice-365 follow-up.
+func checkViewCheckOption(ctx *Context, qual planner.Expr, viewName string, row Row) error {
+	v, err := evalExpr(qual, row, ctx)
+	if err != nil {
+		return err
+	}
+	if !v.IsNull() && v.Kind == KindBool && v.BoolValue() {
+		return nil
+	}
+	return &ExecError{
+		Code:    "44000",
+		Message: fmt.Sprintf("new row violates check option for view %q", viewName),
+	}
+}

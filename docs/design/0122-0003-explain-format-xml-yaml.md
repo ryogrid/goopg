@@ -1,0 +1,685 @@
+# 0122-0003 — `EXPLAIN (FORMAT XML|YAML)`
+
+Status: accepted, landed (loop #8, 2026-07-04). Source: `.ralph/fix_plan.md`
+M0122-0003 ("EXPLAIN output & pg_stat instrumentation", ~7 items — this doc
+covers the FORMAT XML/YAML slice only; the item stays unchecked, see
+"Cluster status" below).
+
+## Problem
+
+`EXPLAIN`'s FORMAT option only accepted `TEXT`/`JSON`
+(`internal/parser/parser.go`'s `parseExplainOneOption`); `FORMAT XML` and
+`FORMAT YAML` — both upstream-valid (`postgres/src/backend/commands/
+explain_format.c`) — hit the `default:` arm and returned a `SyntaxError`.
+`internal/parser/ast.go`'s `ExplainFormat` enum had no XML/YAML members at
+all, so there was no representation to render even if the parser accepted
+the keyword.
+
+A background survey (this loop) also flagged per-CTE `EXPLAIN ANALYZE` stats
+as missing: `Build()`'s `CTEScan`/`CTEDMLPrefix`/`MaterializedCTEScan` cases
+returned their operator directly instead of through `maybeInstrument`, so
+those nodes never got a `nodeStats` entry and rendered with no
+`(actual time=.. rows=.. loops=..)` suffix under ANALYZE. This was a real,
+independent gap — it landed in the same shared working tree as this loop's
+FORMAT XML/YAML work via a concurrently-running sibling Ralph loop iteration
+(both loops on the same tree, no worktree isolation; see
+`[[concurrent_ralph_loops_corrupt_tree]]`) before this loop reached the
+commit step. Verified non-conflicting (disjoint files/hunks from the
+FORMAT XML/YAML change below) and correct (build/vet clean,
+`TestExplainCTEScanAnalyzeReportsActualRows` /
+`TestExplainCTEDMLPrefixAnalyzeReportsActualRows` pass) before folding into
+this loop's commits alongside the FORMAT work, per the root-0026 precedent
+for reconciling two loops that land in the same tree.
+
+## Fix
+
+**Per-CTE stats** (landed concurrently, see "Problem" above):
+`internal/executor/executor.go`'s `Build()` now routes `CTEScan`,
+`CTEDMLPrefix`, and `MaterializedCTEScan` through `maybeInstrument` like
+every other node type. Known residual (documented in the sibling loop's own
+test comment, carried into the ledger below): `CTEDMLPrefix`'s DML plans and
+outer body are Built lazily inside `cteDMLPrefixOp.Open()`, after
+`explainOp.Open()`'s `withInstrumentation()` scope around the top-level
+`Build()` call has already closed — so nested nodes under `"CTE DML"` (e.g.
+`"Insert on t"`) don't yet get their own actual-rows annotation, only the
+`"CTE DML"` summary node itself does.
+
+**FORMAT XML/YAML** (this loop's own work):
+`internal/parser/ast.go`: `ExplainFormat` gains `ExplainFormatXML` /
+`ExplainFormatYAML`. `internal/parser/parser.go`: `parseExplainOneOption`
+accepts `xml`/`yaml` alongside `text`/`json`.
+
+`internal/executor/operators_explain_format.go` (new file): both new formats
+reuse the *same* generic `map[string]any` tree `planToJSON`/
+`planToJSONWithStats` already build for FORMAT JSON — no new tree-walking
+logic, just two alternate serializations of it:
+
+- `renderExplainTree(format, root)` — single dispatch point; replaces the
+  three previous `if opts.Format == parser.ExplainFormatJSON { ... }` call
+  sites in `operators_explain.go`'s `explainOp.Open` (ANALYZE and
+  non-ANALYZE branches) with one call each.
+- `renderExplainXML` — mirrors `explain_format.c`'s `ExplainOpenGroup`/
+  `ExplainProperty`/`ExplainXMLTag` family: root wrapped in
+  `<explain xmlns="http://www.postgresql.org/2009/explain">`, each object
+  key becomes a sanitized tag (`xmlTagName`: chars outside
+  `[A-Za-z0-9-_.]` → `-`, e.g. `"Node Type"` → `Node-Type`, matching
+  upstream's `ExplainXMLTag` comment about `"I/O Read Time"` →
+  `"I-O-Read-Time"`), a `[]map[string]any` (currently only the `"Plans"`
+  key) opens a group whose children use the singularized tag
+  (`xmlSingularTag`: `"Plans"` → `"Plan"`, mirroring upstream's
+  `ExplainOpenGroup("Plans", "Plans", false, es)` wrapping per-child
+  `ExplainOpenGroup("Plan", ...)`), and a `[]string` (VERBOSE's `"Output"`
+  column list) renders as unlabeled `<Item>` children
+  (`ExplainPropertyList`'s XML branch).
+- `renderExplainYAML` — upstream's `escape_yaml` literally delegates to
+  `escape_json` (YAML is a JSON superset; the PG comment calls YAML's own
+  quoting rules "ridiculously complicated" and opts out), so string leaves
+  are rendered via `json.Marshal` and reused verbatim. The one YAML-specific
+  piece of state worth preserving is `ExplainYAMLLineStarting`'s inline-vs-
+  own-line rule: an **unlabeled** group (a list item introduced by `"- "`)
+  puts its *first* property on the same line as the dash and every
+  subsequent property on its own indented line; a **labeled** group (a
+  `"key:"` line) puts *all* its properties — including the first — on
+  their own indented line. `writeYAMLObjectBody`'s `firstInline` parameter
+  encodes exactly this rule instead of porting upstream's `grouping_stack`
+  int-list machinery.
+
+Field order is alphabetical (`sortedKeys`, `sort.Strings`) rather than
+upstream's fixed per-node-type field order — this matches the pre-existing
+FORMAT JSON behavior (`json.Marshal` on a `map[string]any` already sorts
+keys), so this is not a new divergence; no caller depends on key order.
+
+## Tests
+
+`internal/executor/explain_format_xml_yaml_test.go`: well-formedness of the
+`<explain><Query><Plan>...` tree, join child-plan nesting
+(`<Plans><Plan>...</Plan><Plan>...</Plan></Plans>`), VERBOSE's `<Item>` list,
+ANALYZE's `Actual-Rows`/`Actual-Loops`/`Planning-Time`/`Execution-Time`
+properties (XML) and their YAML/bare-numeric-token equivalents, and the
+`xmlTagName` sanitization rule directly. `internal/parser/
+explain_options_test.go`'s `TestParseExplainRejectsBadFormat` — which had
+pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLFormat`
+(pins acceptance) plus a renamed bad-format case using a truly bogus value.
+
+## Cluster status (M0122-0003, ~7 items)
+
+| item | status |
+|---|---|
+| FORMAT XML | **done, this loop** |
+| FORMAT YAML | **done, this loop** |
+| SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
+| BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
+| `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits instrumented for the one cell goopg tracks; see "pg_stat_io row shape" + "real per-wait-event I/O timing" sections below |
+| per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
+| `track_io_timing` runtime `SET` | **done** (later loop, 2026-07-05) — see "`track_io_timing` runtime SET" section below |
+| real per-wait-event I/O timing | **partial** (later loop, 2026-07-05) — read_time only; see "real per-wait-event I/O timing" section below |
+
+Remaining items recorded in `.ralph/deferral_ledger.md` (2026-07-04,
+M0122-0003 rows) with resume points. The fix_plan checkbox stays unchecked
+until the rest of the cluster lands.
+
+## SETTINGS rendering (later loop, 2026-07-04)
+
+`EXPLAIN (SETTINGS)` lists GUCs affecting query planning whose value
+differs from their built-in default (`explain.sgml`), mirroring upstream's
+`get_explain_guc_options` (`guc.c`) + `ExplainPrintSettings` (`explain.c`).
+
+**GUC tagging.** `internal/config/guc.go` gains a `FlagExplain` bit
+(mirrors `guc_tables.c`'s `GUC_EXPLAIN`). A full extraction of every
+`GUC_EXPLAIN`-flagged struct in `postgres/src/backend/utils/misc/
+guc_tables.c` found 62 names; `internal/config/defaults.go` tags the 45
+that goopg registers at all (all 24 `enable_*` planner-method toggles —
+including the goopg-only `enable_nestloop_index` for consistency — plus
+`work_mem`, `random_page_cost`, `effective_cache_size`, the four per-tuple
+cost GUCs, `hash_mem_multiplier`, `search_path`, `plan_cache_mode`,
+`jit`/`jit_above_cost`, the two collapse-limit GUCs, `parallel_setup_cost`/
+`parallel_tuple_cost`/`max_parallel_workers_per_gather`/
+`min_parallel_{table,index}_scan_size`/`parallel_leader_participation`,
+`debug_parallel_query`). The other 17 (`geqo*`, `temp_buffers`,
+`maintenance_io_concurrency`, `constraint_exclusion`, etc.) have no goopg
+registry entry at all and are simply unreachable — ledger row below.
+
+**Boot-value comparison bug.** `Variable.BootVal` is the raw author-facing
+literal (e.g. `"512MB"`); `Variable.Value`/the effective value is always
+canonicalized (e.g. `"524288"`) by `NewVariable`/`Set`. A first-draft
+`ExplainVariables()` compared the canonical effective value directly
+against the raw `BootVal` string, which made nearly every unit-bearing
+GUC (`work_mem`, `effective_cache_size`, `random_page_cost`, ...) appear
+"modified" even on a freshly built registry with zero `SET` statements —
+caught by `TestExplainVariablesEmptyByDefault`. Fixed by canonicalizing
+`BootVal` the same way (`v.canonicalize(v.BootVal)`) before comparing.
+
+**Wiring.** `internal/config/session.go`'s `SessionRegistry.
+ExplainVariables()` returns the FlagExplain vars whose session-layered
+effective value differs from the canonicalized boot value, sorted by name
+(deterministic; upstream's `guc_nondef_list` order instead reflects
+modification history, which this codebase doesn't track). A new
+`executor.Context.ExplainSettings func() []SettingValue` field is wired in
+**both** `internal/server/dispatch.go` (simple protocol) and
+`dispatch_extended.go` (extended protocol) to `sess.ExplainVariables()`,
+matching the existing `AllSettings`/`AllSettingsDisplay` wiring pattern.
+
+**Rendering.** `internal/executor/operators_explain.go` adds two helpers
+called from all four `explainOp.Open` branches (ANALYZE/non-ANALYZE ×
+TEXT/structured):
+- `appendExplainSettingsRow` — TEXT: one `Settings: k = 'v', k2 = 'v2'`
+  row appended after the plan (and, under ANALYZE, before the Planning/
+  Execution Time rows — mirrors `ExplainPrintSettings` running inside
+  `ExplainPrintPlan`, itself called before the timing summary in
+  `ExplainOnePlan`). Omitted entirely when the modified-GUC list is empty,
+  matching `ExplainPrintSettings`'s TEXT-branch `if (num <= 0) return`.
+- `addExplainSettingsGroup` — JSON/XML/YAML: a `"Settings"` key sibling
+  to `"Plan"` at the top level, always present (as `{}` when nothing is
+  modified) once SETTINGS is requested — the structured-format branch of
+  `ExplainPrintSettings` has no early return, unlike TEXT. No format-
+  specific code needed: `writeXMLKeyedValue`/`writeYAMLKeyedValue` already
+  handle a `map[string]any` leaf generically (existing FORMAT XML/YAML
+  infra from the section above).
+
+**Tests:** `internal/executor/explain_settings_test.go` (TEXT
+default-omitted, TEXT with/without modified GUCs, JSON always-present-group,
+JSON with modified GUCs, ANALYZE placement before Planning Time).
+`internal/config/guc_test.go`: `TestExplainVariablesEmptyByDefault`,
+`TestExplainVariablesReportsModifiedPlannerGUC`.
+
+## BUFFERS rendering (later loop, 2026-07-04)
+
+`EXPLAIN (ANALYZE, BUFFERS)` reports, per plan node, how many shared
+buffers were served from cache vs. read from disk (`show_buffer_usage` in
+`explain.c`, backed by `BufferUsage`/`pgBufferUsage` in `instrument.c`).
+goopg had zero buffer-hit/miss counters anywhere before this slice — the
+option parsed (`opts.Buffers`) but nothing ever read it.
+
+**Counting at the source.** `internal/storage/bufpool.go`'s `Pool` gains
+two `atomic.Int64` counters, `sharedHitCount`/`sharedReadCount`, plus a
+`BufferCounters() (hit, read int64)` accessor. They're incremented at the
+two `Pin()`/`pinSlow()` decision points that resolve to an
+already-cached slot (fast-path CAS success and the slow-path
+`tryPinSlot` success), and once per `pinLoad` call (the only place that
+issues a real `mgr.ReadBlock` disk read). **Scoped out, deferred:**
+`PinNew` (new-block allocation — conceptually closer to PG's
+`shared_blks_written`/extend accounting, not a "read") and the rare
+race-recovery `tryPinSlot` calls inside `PinNew`/`pinLoad` (another
+goroutine already loaded the tag while this one waited for `pinMu`) are
+not counted — see ledger row.
+
+**Per-node attribution via the existing instrumentation wrapper.**
+`internal/executor/instrument.go`'s `instrumentedOp` already wraps every
+node's `Open`/`Next`/`Close` for EXPLAIN ANALYZE's per-node timing/rowcount
+(`nodeStats.totalNs`/`rowsOut`), using a nested-stopwatch pattern: a
+parent's `Next()` call fully executes any child `Next()` calls before
+returning, so timing deltas measured at the parent level are inclusive of
+whatever the child subtree did. Buffers reuse the exact same pattern
+instead of inventing a second mechanism (sibling-paths rule) — `nodeStats`
+gains `bufHit`/`bufRead` (cumulative, inclusive-of-children, matching
+upstream's own per-node semantics) and `bufBaseHit`/`bufBaseRead` (the
+last-seen `Pool.BufferCounters()` snapshot). `instrumentedOp.Open` captures
+`ctx.Pool` and seeds the baseline once; `accountBuffers()` (called from
+`Next` and `Close`) diffs the pool's current counters against the baseline
+and rolls the delta into `bufHit`/`bufRead`. Because the pool counters are
+process-global, not per-node, this diffing-since-last-checkpoint approach
+is what makes per-node attribution correct at all — see the doc comment on
+`accountBuffers` for the full argument.
+
+**Rendering.** `internal/executor/operators_explain.go`'s
+`walkPlanAnalyzeFiltered` (the TEXT + ANALYZE path only) appends a
+`Buffers: shared hit=N read=N` detail line per node via
+`formatBuffersLine`, mirroring `show_buffer_usage`'s per-term omission
+rule: the whole line is omitted when both counters are zero, and each of
+`hit=`/`read=` is omitted individually when that counter is zero.
+
+**Deferred (ledger row, same date):**
+- `EXPLAIN (BUFFERS)` without `ANALYZE` (PG 17+ shows *planning-time*
+  buffer usage in this case) — goopg has no separate planning-phase buffer
+  counters; `walkPlan`/`walkPlanFiltered` (the non-ANALYZE path) never
+  calls into the buffer accounting at all.
+- `dirtied=`/`written=`/local- and temp-buffer terms, and `I/O Timings`
+  (gated on `track_io_timing`, itself only read at process boot).
+- The two narrow `Pin()` call sites scoped out above (new-block allocation,
+  race-recovery re-pin).
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainBuffersAnalyzeTextLine` (line present, at least one of
+hit=/read= populated), `TestExplainBuffersOffByDefault` (no BUFFERS ⇒ no
+line, even under ANALYZE), `TestExplainBuffersRepeatScanAccumulatesHits`
+(a second, warm-cache pass reports hit-only, no read=).
+
+### FORMAT JSON/XML/YAML (later loop, 2026-07-04)
+
+Upstream's `show_buffer_usage` non-TEXT branch prints `"Shared Hit
+Blocks"`/`"Shared Read Blocks"`/... as flat sibling properties on the plan
+node object — **not** nested under a `"Buffers"` key as an earlier ledger
+note had guessed — and, per `peek_buffer_usage`'s comment ("when format is
+anything other than text, we print even if the counters are all
+zeroes"), unconditionally once BUFFERS is requested, unlike TEXT's
+positive-only gating. `planToJSONWithStats` (`internal/executor/
+operators_explain.go`) now sets `obj["Shared Hit Blocks"]`/`obj["Shared
+Read Blocks"]` from the same per-node `nodeStats.bufHit`/`bufRead` the
+TEXT line already reads, whenever `opts.Buffers` is set — scoped to the
+two counters goopg actually tracks; the other 8 upstream properties
+(`Shared Dirtied/Written Blocks`, all four `Local *`, both `Temp *`) are
+not emitted at all (an always-zero stub would misrepresent untracked
+dirty/write activity as "confirmed zero"). No XML/YAML-specific code
+needed — both formats already render an arbitrary `map[string]any` leaf
+generically (`xmlTagName` sanitizes `"Shared Hit Blocks"` to
+`Shared-Hit-Blocks`; the YAML renderer keys off the same map).
+
+**Tests:** `TestExplainBuffersJSONAlwaysIncludesSharedBlocks` (present
+even when a counter is zero), `TestExplainBuffersJSONOmittedWithoutBuffersOption`
+(gated on `opts.Buffers`), `TestExplainBuffersXMLTagSanitized` (tag-name
+sanitization).
+
+### `dirtied=`/`written=` counters (later loop, 2026-07-04)
+
+Closes the "Deferred" bullet from the BUFFERS-rendering section above for the
+two shared-buffer terms it named: `EXPLAIN (ANALYZE, BUFFERS)` now also
+reports `dirtied=`/`written=`, matching `show_buffer_usage`'s exact
+`shared_blks_dirtied`/`shared_blks_written` semantics
+(`postgres/src/backend/commands/explain.c:4122-4127`, confirmed by direct
+source read — the four shared terms share one `has_shared` gate and one
+term ordering: `hit= read= dirtied= written=`).
+
+**Counting at the source.** `internal/storage/bufpool.go`'s `Pool` gains
+`sharedDirtiedCount`/`sharedWrittenCount` (`atomic.Int64`, siblings of the
+existing `sharedHitCount`/`sharedReadCount`); `BufferCounters()` now returns
+all four. `sharedDirtiedCount` increments exactly once per clean→dirty
+transition — at every one of the 8 CAS-success sites across `MarkDirty`,
+`MarkDirtyHintBit`, `markDirtyWithLSNCommon` (shared by `MarkDirtyWithLSN`/
+`MarkDirtyWithLSNLocked`), the 3 early-return branches inside
+`MarkDirtyForceFPI`, `MarkDirtyChangeRecord`, and `MarkDirtyLogicalChange` —
+mirroring `bufmgr.c`'s "if the buffer was not dirty already, do vacuum
+accounting" comment at the `MarkBufferDirty`/`MarkBufferDirtyHint` call
+sites. `sharedWrittenCount` increments at exactly one site: `evictVictim`'s
+post-flush point, when a backend evicts a dirty victim slot to make room for
+its own `Pin`/`PinNew`. Deliberately **not** counted: `WriteDirtyPages`
+(bgwriter) and `FlushAll`/`FlushAllPaced`/`flushBatch` (checkpointer) — in
+upstream, `pgBufferUsage` is a per-backend global, so a checkpointer or
+bgwriter process flushing a page increments *its own* counter, never the
+querying backend's; since goopg's pool counters are process/pool-global
+(the same architectural approximation `sharedHitCount`/`sharedReadCount`
+already made), counting bgwriter/checkpointer writes here would misattribute
+background IO to whatever query happens to be running concurrently.
+
+**Rendering.** `formatBuffersLine` (TEXT) and `planToJSONWithStats`
+(JSON/XML/YAML) both extended with the same per-term positive-only /
+unconditional-once-requested rules the hit/read pair already followed;
+`nodeStats` gains `bufDirtied`/`bufWritten` + `bufBaseDirtied`/
+`bufBaseWritten`, rolled forward by `accountBuffers` identically to
+`bufHit`/`bufRead`.
+
+**Verified against a real running server**, not just the Go test suite: a
+fresh table's first `UPDATE` shows `dirtied=` withheld once the page is
+already dirty from the preceding `INSERT` in the same buffer (no flush in
+between — matches upstream: `shared_blks_dirtied` only counts *new*
+clean→dirty transitions during the current command); after `CHECKPOINT`
+clears the dirty bit, an immediate follow-up `UPDATE` on the same table
+correctly reports `Buffers: shared hit=12 read=1 dirtied=1`.
+
+**Tests:** `internal/storage/bufpool_counters_test.go`'s
+`TestBufferCountersDirtiedAndWritten` (small pool, forced dirty + forced
+eviction, double-`MarkDirty` non-double-count assertion);
+`internal/executor/explain_buffers_test.go`'s
+`TestFormatBuffersLineDirtiedWritten` (table-driven, all 4 zero/gating
+combinations) and `TestExplainBuffersJSONAlwaysIncludesDirtiedWrittenBlocks`.
+
+**Still deferred** (ledger row, same date): `EXPLAIN (BUFFERS)` without
+`ANALYZE` (planning-time buffers), local/temp-buffer terms, `I/O Timings`,
+and the two narrow `Pin()` call sites (`PinNew`, race-recovery re-pin)
+scoped out of the hit/read pair above — none of those needed touching for
+this slice.
+
+## pg_stat_io row shape (later loop, 2026-07-04)
+
+`pg_stat_io` (PG 16+) had a table registered (`internal/catalog/catalog.go`,
+OID 8061) but a `VirtualRows` stub returning `nil` unconditionally — zero
+rows for every query, regardless of `backend_type`/`object`/`context` filter.
+
+**Ground truth over static analysis.** Upstream's row shape is generated by
+`pg_stat_get_io` → `pg_stat_io_build_tuples` (`postgres/src/backend/utils/
+adt/pgstatfuncs.c`), gated by three boolean predicates in
+`postgres/src/backend/utils/activity/pgstat_io.c`:
+`pgstat_tracks_io_bktype` (which `BackendType`s participate at all — 14 of
+the 18 enum values), `pgstat_tracks_io_object` (which `(IOObject, IOContext)`
+combinations a tracked type can emit a row for — a row is omitted entirely
+when false), and `pgstat_tracks_io_op` (which of the 8 `IOOp`s get a real
+count vs. a NULL cell within an emitted row). Rather than trust a pure
+reading of that C logic, this loop stood up a throwaway real PostgreSQL 18.3
+cluster (`postgres/local_install/bin/{initdb,pg_ctl,psql}`, a fresh unix-socket
+data dir under `/tmp`) and ran `SELECT * FROM pg_stat_io` directly — 79 rows,
+confirming the row/NULL shape (and, incidentally, that `pgstat_tracks_io_bktype`
+gating is unconditional on whether that process type ever actually ran: a
+freshly initdb'd cluster with `summarize_wal` at its default `off` still
+reports 2 all-zero `walsummarizer` rows). `internal/testport/
+client_tools_port_test.go`'s `TestPort_PgWalsummary002Blocks` had asserted
+the opposite (0 walsummarizer rows) before this loop — a plausible-looking
+but factually wrong assumption, corrected alongside this change.
+
+**Implementation.** `internal/executor/pgstat_io.go` is a direct Go port of
+the three predicate functions (`ioTracksObject`/`ioTracksOp`, `ioTracksBktype`
+folded into the `ioBackendType` enum only listing the 14 tracked types) plus
+a column-index table (`ioOpColumns`) mirroring `pgstat_get_io_op_index`/
+`_byte_index`/`_time_index`. `fetchIOStatRows(ctx *Context) [][]string`
+walks backend type × object × context in upstream's own emission order,
+skips combinations `ioTracksObject` rejects, and fills every column with
+`catalog.VirtualNull` (SQL NULL) except columns `ioTracksOp` says are
+tracked, which get `"0"` — a real, honest zero (goopg has performed none of
+that IO), not a fabricated stand-in for an untracked cell. The single cell
+goopg actually instruments — backend_type='client backend', object=
+'relation', context='normal', columns reads/read_bytes/hits — is overridden
+from `ctx.Pool.BufferCounters()` (the same pool-wide shared-buffer counters
+BUFFERS rendering above uses), converting to bytes via `storage.BlockSize`.
+Wired into the SELECT path via `valuesOp.Open` (`internal/executor/
+operators.go`) with a `tbl.Name == "pg_stat_io"` case, following the
+established `pg_stat_slru`/`pg_prepared_statements` per-connection-live-data
+pattern (see [[per_connection_virtual_catalog_scoping]] memory /
+`fetchSLRURows`) rather than a static `VirtualRows` closure, since the row
+set depends on live pool state.
+
+**Deferred (ledger rows, unchanged from the prior entry):** the other seven
+upstream I/O counters (`writes`/`extends`/`evictions`/`reuses`/`writebacks`/
+`fsyncs` and all `*_time`/`*_bytes` columns beyond reads/read_bytes) stay a
+real `0` rather than tracking actual activity — goopg has no write/extend/
+evict/reuse/fsync counters anywhere yet, and `track_io_timing` remains
+unwired (open, separate ledger row). Populating those requires the same
+storage-layer instrumentation work the BUFFERS `dirtied=`/`written=` gap
+above is blocked on; this loop only extended the *existing* single counter
+pair to `pg_stat_io`'s exact row shape rather than inventing new collection.
+
+**Tests:** `internal/executor/pgstat_io_test.go` — `TestPgStatIORowCount`
+(79 rows), `TestPgStatIOExcludesInvalidCombination` (wal/vacuum never
+appears), `TestPgStatIOClientBackendRelationNormalShape` (reads/read_bytes/
+hits populated, reuses NULL), `TestPgStatIOWalSummarizerRows` (2 rows,
+matching the real-PG finding above), `TestPgStatIOLiveCounters` (end-to-end
+through a live query context). `internal/testport/client_tools_port_test.go`'s
+`TestPort_PgWalsummary002Blocks` updated to expect 2 walsummarizer rows.
+
+## `track_io_timing` runtime SET (later loop, 2026-07-05)
+
+**Problem.** `track_io_timing` is registered `ContextUserset` (session
+`SET`-able), but the value gating the per-I/O wait-event hooks (`Pool.
+OnPinWait`/`OnPinDone`, and the AIO/data-file `OnReadWait`/`OnWriteWait`/
+`OnExtendWait`/`OnSyncWait` pairs, all in `internal/initdb/open.go`) was
+read exactly once at process boot (`cmd/goopg/main.go`'s `boolGUC` →
+`initdb.OpenOptions.TrackIOTiming`) and baked into whether those hooks were
+installed *at all*. A live `SET track_io_timing = on` updated the GUC
+registry but nothing re-read it — the hooks, if never installed at boot,
+stayed permanently absent for the life of the process.
+
+**Fix.** Two changes make the setting live per session without
+reinstalling hooks or restarting:
+
+1. `internal/activity/registry.go`: `coldActivity` (the per-backend
+   mutable-field block) gains `TrackIOTimingOn atomic.Bool`, and
+   `ActivityRegistry` gains a process-wide `trackIOTimingFastPath
+   atomic.Bool` that latches `true` the first time *any* backend enables
+   the setting (via `UpdateTrackIOTiming(procNum, true)` or
+   `EnableTrackIOTimingFastPath()`) and is never reset — reverting it
+   would require tracking whether every backend has since turned it back
+   off, not worth the complexity for a rarely-toggled debug GUC. New
+   `LookupTrackedGoroutine()` is a drop-in replacement for
+   `LookupCurrentGoroutine()` that additionally requires the calling
+   backend's own flag to be on; it short-circuits on the fast-path flag
+   first, so the default-off case costs one atomic load, not the
+   goroutine-map lookup + mutex — preserving M0092-0005's original
+   rationale for gating these hooks in the first place, now enforced
+   per-call instead of per-process-boot.
+2. `internal/initdb/open.go`: the hooks above are now wired
+   **unconditionally** (the `if opts.TrackIOTiming { ... }` wrapper is
+   gone) and each closure calls `act.LookupTrackedGoroutine()` instead of
+   `activity.LookupCurrentGoroutine()`. `opts.TrackIOTiming` now only
+   primes the fast-path flag at boot (`act.EnableTrackIOTimingFastPath()`)
+   so a postgresql.conf-configured `on` is live from the very first
+   connection.
+3. `internal/server/server.go`'s `New()` registers a
+   `cfg.Registry.OnChange("track_io_timing", ...)` callback — the same
+   established pattern as the pre-existing `application_name` propagation
+   hook — that calls `UpdateTrackIOTiming` on the SET-ing backend's own
+   procNum (resolved via `activity.LookupCurrentGoroutine()`, since the
+   callback runs synchronously on that backend's own goroutine). The
+   per-connection setup seeds each new backend's flag immediately after
+   `config.NewSessionRegistry` from `sess.Get("track_io_timing")`, so a
+   session inherits the correct boot-configured default even before its
+   first `SET`.
+
+Background workers (checkpointer/autovacuum) were already unaffected by
+these hooks either way — they never call `activity.SetCurrentGoroutine`
+for their own goroutine (only real `client_backend` connections do, in
+`server.go`), so `LookupCurrentGoroutine`/`LookupTrackedGoroutine` already
+returns `ok=false` for them regardless of `track_io_timing`; no behavior
+change there.
+
+**Deferred (unaffected by this change, tracked in the rows above):** this
+closes only the "not re-checked per session/query" gap. It does not add
+any new timing *collection* — there is still no wall-clock instrumentation
+at the wait-event sites, so `EXPLAIN`'s `I/O Timings` and `pg_stat_io`'s
+six `*_time` columns remain unmeasured even with `track_io_timing=on`.
+That is the same storage-instrumentation-layer gap the BUFFERS/`pg_stat_io`
+rows above are blocked on; once real per-wait-event timing is added, it
+should gate itself on `act.LookupTrackedGoroutine()`/
+`ActivityRegistry.TrackIOTiming(procNum)` (now available) rather than
+re-deriving a boot-time bool the way the old code did.
+
+**Tests:** `internal/activity/registry_test.go` —
+`TestActivityRegistryTrackIOTimingFastPath` (per-backend flag independent
+of the latched process-wide fast path),
+`TestActivityRegistryTrackIOTimingFastPathBoot` (priming the fast path
+alone is not sufficient — a given backend still needs its own flag on).
+`internal/server/server_test.go` — `TestTrackIOTimingOnChangePropagatesToActivityRegistry`
+(exercises `New()`'s actual `OnChange` wiring end-to-end with a real
+`SessionRegistry.Set("track_io_timing", "on", false)`).
+
+## Real per-wait-event I/O timing (later loop, 2026-07-05)
+
+**Problem.** The section above wired `track_io_timing` so a live `SET`
+reaches the existing wait-event hooks, but those hooks (`Pool.OnPinWait`/
+`OnPinDone`) only ever recorded *that* a wait happened
+(`ActivityRegistry.WaitEventStart`/`WaitEventEnd`, which stamp
+`pg_stat_activity.wait_event`) — nothing measured *how long* it took.
+`pg_stat_io.read_time` and EXPLAIN's `I/O Timings` line therefore had no
+real signal to render even with `track_io_timing=on`.
+
+**Fix.** Three small, additive changes turn the existing hook pair into a
+real timer, reusing the mono-clock timestamp `WaitEventStart` already
+stores rather than adding a second clock read:
+
+1. `internal/activity/registry.go`'s `WaitEventEnd(procNum) time.Duration`
+   now returns the elapsed wall-clock time since the matching
+   `WaitEventStart` call, computed by reading the per-slot `stateChange`
+   mono-clock stamp *before* overwriting it with the current time. All
+   pre-existing callers that ignore the return value (most of them, across
+   `initdb`/`server`/`executor`) are unaffected — Go permits discarding a
+   return value at a statement-level call.
+2. `internal/storage/bufpool.go`'s `Pool` gains a `sharedReadTimeNanos`
+   atomic accumulator plus `AddReadTimeNanos(n int64)` / `ReadTimeNanos()
+   int64`, siblings of the pre-existing `sharedHitCount`/`sharedReadCount`/
+   `sharedDirtiedCount`/`sharedWrittenCount` counters that already back
+   EXPLAIN (BUFFERS) and `pg_stat_io`.
+3. `internal/initdb/open.go`'s pre-existing `pool.OnPinDone` closure — the
+   *only* place that currently calls `WaitEventEnd` after a real disk read
+   (`pinLoad`'s `mgr.ReadBlock` call, bracketed by `OnPinWait`/`OnPinDone`)
+   — now captures the returned duration and calls
+   `pool.AddReadTimeNanos(int64(d))`. No new gate was needed: the closure
+   body only executes when `act.LookupTrackedGoroutine()` succeeds, which
+   already requires the pinning backend's `track_io_timing` flag to be on
+   (see the section above) — so real time only ever accumulates exactly
+   when upstream's own "these will be zero if track_io_timing is not
+   enabled" rule says it should.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` renders
+`ReadTimeNanos()` as the `read_time` column (milliseconds, via the
+existing `operators_explain.go` `nsToMs` helper) for the one row goopg
+instruments (client backend/relation/normal). While touching this
+function, an unrelated pre-existing bug was also fixed: `BufferCounters()`'s
+4th return value (`written`, collected since the 2026-07-04 dirtied/written
+loop) was being discarded (`_`) instead of feeding the `writes`/
+`write_bytes` columns, which had rendered a hardcoded `0` despite a real
+counter already existing.
+
+**Deferred (tracked in `.ralph/deferral_ledger.md`, 2026-07-05):**
+`write_time` is not measured — `evictVictim`'s dirty-victim flush (the
+call site that increments `sharedWrittenCount`) has no `OnWait`/`OnDone`
+hook pair to time at all, unlike the read side's pre-existing
+`OnPinWait`/`OnPinDone`; adding one is a new hook, not a wiring gap. The
+other five `pg_stat_io` op counters (extends/evictions/reuses/writebacks/
+fsyncs, plus every one of their own `_bytes`/`_time` columns) still render
+upstream's real `0`/NULL shape, since goopg has no instrumentation for
+those operations at all. EXPLAIN's `I/O Timings` line itself is not
+rendered in any format yet — this loop only wired the underlying counter,
+not its EXPLAIN presentation (a separate, BUFFERS-rendering-style
+follow-up).
+
+**Tests:** `internal/activity/registry_test.go` —
+`TestWaitEventEndReturnsElapsedDuration` (a real `time.Sleep`-backed
+duration, not a stub), `TestWaitEventEndOutOfRangeProcNumReturnsZero`.
+`internal/storage/bufpool_counters_test.go` —
+`TestPoolReadTimeNanosAccumulates` (accumulation + non-positive-duration
+guard). `internal/executor/pgstat_io_test.go` —
+`TestPgStatIOReadTimeAndWritesRendered` (end-to-end: a real `storage.Pool`
+with a forced backend-driven eviction and injected read time, asserting
+both the `read_time` and `writes` columns render real, non-placeholder
+values).
+
+## `evictions` / `extends` counters (later loop, 2026-07-05)
+
+Two of the five still-`0` `pg_stat_io` op counters named in the section
+above now render real values, closing part of that gap (`write_time` and
+the remaining three op counters — reuses/writebacks/fsyncs — are still
+open, see the updated ledger row).
+
+`storage.Pool` gains `sharedEvictionCount`/`sharedExtendCount`
+(`internal/storage/bufpool.go`), following the exact pattern of the
+pre-existing `sharedDirtiedCount`/`sharedWrittenCount` pair (own atomic
+counters, own `EvictionCount()`/`ExtendCount()` accessors — a new method
+pair rather than widening `BufferCounters()`'s 4-value return, to avoid
+touching its four existing call sites): `sharedEvictionCount` increments
+once in `evictVictim`, immediately after the "slot was free" early return
+(i.e. only when a *valid* tag is actually displaced — mirrors
+`bufmgr.c`'s `shared_blks_evicted` accounting), regardless of whether the
+victim was dirty (the dirty-only `sharedWrittenCount` increments
+separately, further down the same function, only on a successful flush).
+`sharedExtendCount` increments once in `PinNew`, right after its sole
+`p.mgr.Extend` call succeeds — this is the pool's only relation-extension
+call site (verified: no other `Extend(` caller exists in the package),
+so no sibling site needed updating.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` wires both into the
+`ioOpEvict`/`ioOpExtend` cases of the existing per-op `switch` (same
+"client backend/relation/normal" cell the other real counters already
+populate) — `extends` also gets `extend_bytes` (`count * 8192`, matching
+the `reads`/`writes` byte-column convention); `extend_time` is left at the
+existing default `"0"` (no per-extend timing hook exists yet, same
+"count wired, time not yet" partial state `read_time` was in before its
+own follow-up).
+
+**Tests:** `internal/storage/bufpool_counters_test.go` —
+`TestBufferCountersEvictionAndExtend` (a 2-slot pool: fills exactly to
+capacity via `PinNew` with zero evictions, then forces N further evictions
+via N more `PinNew` calls, asserting both counters independently).
+`internal/executor/pgstat_io_test.go` —
+`TestPgStatIOEvictionsAndExtendsRendered` (end-to-end: asserts the
+rendered `evictions`/`extends`/`extend_bytes` cells match the underlying
+counters after a controlled fill-then-evict sequence).
+
+## `write_time` counter (later loop, 2026-07-05)
+
+`write_time` — the last resume point the `evictions`/`extends` section
+above left open — now renders a real value, backed by a genuinely new
+timing hook (unlike `evictions`/`extends`, which reused the pre-existing
+counter-pattern with no new hook needed).
+
+`storage.Pool` gains `sharedWriteTimeNanos` (`internal/storage/bufpool.go`),
+`read_time`'s (`sharedReadTimeNanos`) write-side sibling, plus a matching
+`OnFlushWait`/`OnFlushDone` hook pair — the write-side analogue of the
+pre-existing `OnPinWait`/`OnPinDone` bracket around `pinLoad`'s disk read.
+The new pair brackets `evictVictim`'s dirty-victim `flushSlot` call exactly
+(same `contentMu`-held span `OnPinWait`/`OnPinDone` brackets on the read
+side), so accumulated time reflects only the same foreground,
+backend-driven flushes `sharedWrittenCount` already counts — not
+bgwriter/checkpointer background flushes (consistent with that counter's
+own documented per-backend-attribution rationale). New
+`AddWriteTimeNanos`/`WriteTimeNanos` accessor pair mirrors
+`AddReadTimeNanos`/`ReadTimeNanos` exactly, including the non-positive-
+duration guard.
+
+`internal/initdb/open.go` wires `pool.OnFlushWait`/`pool.OnFlushDone`
+immediately after the pre-existing `pool.OnPinWait`/`pool.OnPinDone` block,
+using the identical `act.LookupTrackedGoroutine()` → `WaitEventStart(...,
+WaitDataFileWrite)` / `WaitEventEnd()` → `AddWriteTimeNanos` pattern (same
+`WaitDataFileWrite` wait event `mgr.OnWriteWait`/`OnWriteDone` already use
+at the lower `storage.Manager.WriteBlock` layer for `pg_stat_activity`
+purposes — this new pair is a separate, `Pool`-level bracket scoped to
+exactly the foreground-eviction span, deliberately not reusing `mgr`'s
+existing hooks since those fire for every `WriteBlock` call including
+background flushes this counter must exclude).
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` reads
+`Pool.WriteTimeNanos()` and renders it (via the existing `nsToMs` helper)
+as the `write_time` column (col 8) alongside the pre-existing
+`writes`/`write_bytes` cells, for the same "client backend/relation/normal"
+row.
+
+**Tests:** `internal/storage/bufpool_counters_test.go` —
+`TestPoolWriteTimeNanosAccumulates` (accumulation + non-positive-duration
+guard, mirrors `TestPoolReadTimeNanosAccumulates`),
+`TestPoolOnFlushHooksFireOnDirtyVictimEviction` (installs counting
+`OnFlushWait`/`OnFlushDone` closures directly on a real `Pool`, confirms
+they fire exactly once per forced dirty-victim eviction and not at all
+during a clean fill — mirrors `bm_io_in_progress_test.go`'s `OnPinWait`
+hook-invocation pattern). `internal/executor/pgstat_io_test.go` —
+`TestPgStatIOWriteTimeRendered` (end-to-end rendered-cell assertion,
+mirrors `TestPgStatIOReadTimeAndWritesRendered`).
+
+## `extend_time` counter (later loop, 2026-07-05)
+
+`extend_time` — the resume point the `write_time` section above left open
+— now renders a real value, via the same new-hook-pair pattern
+`write_time` used (not a reuse of an existing counter).
+
+`storage.Pool` gains `sharedExtendTimeNanos` (`internal/storage/bufpool.go`),
+`write_time`'s (`sharedWriteTimeNanos`) relation-extension sibling, plus a
+matching `OnExtendWait`/`OnExtendDone` hook pair — the extend-side analogue
+of `OnFlushWait`/`OnFlushDone`. The new pair brackets `PinNew`'s
+`p.mgr.Extend(rel, s.page)` call exactly — the pool's sole smgr `Extend`
+call site, the same span the pre-existing `sharedExtendCount` counter
+already attributes to (`extends`/`extend_bytes`). New
+`AddExtendTimeNanos`/`ExtendTimeNanos` accessor pair mirrors
+`AddWriteTimeNanos`/`WriteTimeNanos` exactly, including the non-positive-
+duration guard.
+
+`internal/initdb/open.go` wires `pool.OnExtendWait`/`pool.OnExtendDone`
+immediately after the pre-existing `pool.OnFlushWait`/`pool.OnFlushDone`
+block, using the identical `act.LookupTrackedGoroutine()` →
+`WaitEventStart(..., WaitDataFileExtend)` / `WaitEventEnd()` →
+`AddExtendTimeNanos` pattern — deliberately a new `Pool`-level pair, not a
+reuse of `storage.Manager`'s existing `mgr.OnExtendWait`/`mgr.OnExtendDone`
+(`internal/storage/smgr.go`), for the same per-backend-attribution reason
+`write_time` documented for `mgr.OnWriteWait`/`OnWriteDone`: the
+`Manager`-level hooks fire for every `Extend`/`ExtendBatch` call regardless
+of caller, while this `Pool`-level pair is scoped to exactly the `PinNew`
+foreground-extension span pg_stat_io's per-backend-type `extend_time`
+column needs.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` reads
+`Pool.ExtendTimeNanos()` and renders it (via the existing `nsToMs` helper)
+as the `extend_time` column (col 13) alongside the pre-existing
+`extends`/`extend_bytes` cells, for the same "client backend/relation/normal"
+row.
+
+**Tests:** `internal/storage/bufpool_counters_test.go` —
+`TestPoolExtendTimeNanosAccumulates` (accumulation + non-positive-duration
+guard, mirrors `TestPoolWriteTimeNanosAccumulates`),
+`TestPoolOnExtendHooksFireOnPinNewExtend` (installs counting
+`OnExtendWait`/`OnExtendDone` closures directly on a real `Pool`, confirms
+they fire exactly once per `PinNew` call across several calls — mirrors
+`TestPoolOnFlushHooksFireOnDirtyVictimEviction`'s hook-invocation pattern).
+`internal/executor/pgstat_io_test.go` — `TestPgStatIOExtendTimeRendered`
+(end-to-end rendered-cell assertion, mirrors `TestPgStatIOWriteTimeRendered`).
+
+Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
+ANALYZE (planning-time buffers), local/temp-buffer terms, the 3 remaining
+`pg_stat_io` op counters (reuses/writebacks/fsyncs — each needs a genuinely
+new counting mechanism: strategy-ring reuse, bgwriter/checkpointer-scoped
+writeback attribution, fsync call-site instrumentation respectively),
+EXPLAIN's `I/O Timings` line (now renderable since both `write_time` and
+`extend_time` exist), and the `CTEDMLPrefix` nested-node instrumentation
+residual.
