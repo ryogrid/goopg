@@ -11497,6 +11497,48 @@ func (c *InMemory) SetTSConfigSchema(name, schema, newSchema string) bool {
 	return false
 }
 
+// AlterTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name ALTER
+// MAPPING FOR tokenType WITH dictOIDs — replaces tokenType's entire mapping
+// entry with the new dictionary list wholesale, mirroring
+// MakeConfigurationMapping's override=true path in tsearchcmds.c (which
+// deletes any existing pg_ts_config_map rows for the token type before
+// inserting the new list). Unlike AddTSConfigMapping this never reports a
+// duplicate — overriding an already-mapped token type is the entire point of
+// this form, so there is no unique_violation to raise; if tokenType has no
+// existing entry yet, it is simply appended (same as ADD MAPPING would).
+// Returns the matched configuration (nil if no configuration with the given
+// schema-resolved name exists). DU-002 slice 446 follow-up (M0119-0004).
+func (c *InMemory) AlterTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			newDicts := append([]uint32(nil), dictOIDs...)
+			for i, m := range uc.Mappings {
+				if strings.EqualFold(m.TokenType, tokenType) {
+					uc.Mappings[i].DictOIDs = newDicts
+					return uc
+				}
+			}
+			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: newDicts})
+			return uc
+		}
+	}
+	return nil
+}
+
+// AlterTSConfigMappingDuringRecovery is the discard-result recovery
+// counterpart to AlterTSConfigMapping, mirroring
+// ReplaceTSConfigMappingDictDuringRecovery. DU-002 slice 446 follow-up
+// (M0119-0004).
+func (c *InMemory) AlterTSConfigMappingDuringRecovery(name, schema, tokenType string, dictOIDs []uint32) {
+	c.AlterTSConfigMapping(name, schema, tokenType, dictOIDs)
+}
+
 // ReplaceTSConfigMappingDict implements ALTER TEXT SEARCH CONFIGURATION name
 // ALTER MAPPING [FOR tokenTypes [, ...]] REPLACE oldOID WITH newOID —
 // substitutes newOID for oldOID in every matched pg_ts_config_map entry,

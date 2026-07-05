@@ -1214,6 +1214,18 @@ const (
 	//   oldOID(4) | newOID(4)
 	RecordKindReplaceTSConfigMappingDict byte = 112
 
+	// RecordKindAlterTSConfigMapping records an `ALTER TEXT SEARCH
+	// CONFIGURATION name ALTER MAPPING FOR tok [, ...] WITH dict [, ...]`
+	// override event — one record per named token type, each carrying that
+	// token type's complete replacement dictionary list, mirroring
+	// RecordKindAddTSConfigMapping's shape exactly (the two forms only differ
+	// in whether an existing entry is overwritten or 23505s). DU-002 slice
+	// 446 follow-up (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | tokenTypeLen(2) |
+	//   tokenType(tokenTypeLen bytes) | dictCount(2) | dictOID(4) * dictCount.
+	RecordKindAlterTSConfigMapping byte = 113
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -3572,6 +3584,93 @@ func DecodeAddTSConfigMapping(payload []byte) (name, schema, tokenType string, d
 	off += 2
 	if len(payload) < off+4*count {
 		return "", "", "", nil, fmt.Errorf("wal: add-tsconfig-mapping payload truncated (need %d bytes)", off+4*count)
+	}
+	dictOIDs = make([]uint32, count)
+	for i := 0; i < count; i++ {
+		dictOIDs[i] = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	return name, schema, tokenType, dictOIDs, nil
+}
+
+// EncodeAlterTSConfigMapping encodes an ALTER TEXT SEARCH CONFIGURATION name
+// ALTER MAPPING FOR tok WITH dict [, ...] override event for one token type.
+// Same wire shape as EncodeAddTSConfigMapping (see RecordKindAlterTSConfigMapping).
+func EncodeAlterTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(tokenType) > 0xFFFF {
+		tokenType = tokenType[:0xFFFF]
+	}
+	if len(dictOIDs) > 0xFFFF {
+		dictOIDs = dictOIDs[:0xFFFF]
+	}
+	out := make([]byte, 1+6+len(name)+len(schema)+len(tokenType)+2+4*len(dictOIDs))
+	out[0] = RecordKindAlterTSConfigMapping
+	off := 1
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tokenType)))
+	off += 2
+	copy(out[off:], tokenType)
+	off += len(tokenType)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(dictOIDs)))
+	off += 2
+	for _, d := range dictOIDs {
+		binary.LittleEndian.PutUint32(out[off:off+4], d)
+		off += 4
+	}
+	return out
+}
+
+// DecodeAlterTSConfigMapping decodes a RecordKindAlterTSConfigMapping payload.
+func DecodeAlterTSConfigMapping(payload []byte) (name, schema, tokenType string, dictOIDs []uint32, err error) {
+	if len(payload) < 1 {
+		return "", "", "", nil, fmt.Errorf("wal: alter-tsconfig-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterTSConfigMapping {
+		return "", "", "", nil, fmt.Errorf("wal: record kind %d is not alter-tsconfig-mapping", payload[0])
+	}
+	off := 1
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: alter-tsconfig-mapping payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: alter-tsconfig-mapping payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", nil, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", nil, err
+	}
+	if tokenType, err = readStr(); err != nil {
+		return "", "", "", nil, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", nil, fmt.Errorf("wal: alter-tsconfig-mapping payload truncated (need %d bytes)", off+2)
+	}
+	count := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+4*count {
+		return "", "", "", nil, fmt.Errorf("wal: alter-tsconfig-mapping payload truncated (need %d bytes)", off+4*count)
 	}
 	dictOIDs = make([]uint32, count)
 	for i := 0; i < count; i++ {
@@ -7284,7 +7383,8 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// catalog's conversion registry.
 		return false, nil
 	case RecordKindCreateTSDict, RecordKindDropTSDict, RecordKindCreateTSConfig, RecordKindAddTSConfigMapping, RecordKindDropTSConfig,
-		RecordKindDropTSConfigMapping, RecordKindRenameTSConfig, RecordKindSetTSConfigSchema, RecordKindReplaceTSConfigMappingDict:
+		RecordKindDropTSConfigMapping, RecordKindRenameTSConfig, RecordKindSetTSConfigSchema, RecordKindReplaceTSConfigMappingDict,
+		RecordKindAlterTSConfigMapping:
 		// CREATE/DROP TEXT SEARCH DICTIONARY and CREATE/ADD MAPPING/DROP TEXT
 		// SEARCH CONFIGURATION records (DU-002 restart-persistence follow-up
 		// to slices 437/446, M0119-0004) carry only pg_ts_dict/pg_ts_config

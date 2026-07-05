@@ -126,6 +126,23 @@ and the `CONFIGURATION = source_config` copy-from-existing form of
 form, the CREATE COPY form, or survey the deferral ledger for a fresh
 DU-002 slice.
 
+**2026-07-06 (still yet later loop):** landed the `ALTER MAPPING FOR tok
+[, ...] WITH dict [, ...]` override form (`ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN`
+— no `REPLACE` keyword; wholesale-replaces a token type's entire dictionary
+list, never 23505s on an already-mapped token type) — `internal/parser/
+ast.go`/`ddl.go` ("altermapping" action), `catalog.AlterTSConfigMapping`,
+`executor.execAlterTSConfigAlterMapping`, WAL record kind 113
+(`Encode`/`DecodeAlterTSConfigMapping`), restart-persistence replay wired
+into `internal/initdb/tsconfig_ddl_recovery.go`. See the `0110-0001` design
+doc's new "Slice 446 follow-up: `ALTER MAPPING FOR tok WITH dict` override
+form" section. This closes every `ALTER TEXT SEARCH CONFIGURATION` sub-form
+named in `gram.y`'s `AlterTSConfigurationStmt` production. Remaining DU-002
+items for this statement family: `OWNER TO` (no-op, likely fine — pg_dump
+derives ownership from `cfgowner` at CREATE time) and the
+`CONFIGURATION = source_config` copy-from-existing form of `CREATE TEXT
+SEARCH CONFIGURATION`. Next candidate: pick up the CREATE COPY form, or
+survey the deferral ledger for a fresh DU-002 slice.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

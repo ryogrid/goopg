@@ -391,3 +391,51 @@ func TestDecodeReplaceTSConfigMappingDictRejectsTruncatedPayload(t *testing.T) {
 		t.Error("expected error decoding truncated replace-tsconfig-mapping-dict payload")
 	}
 }
+
+// TestEncodeDecodeAlterTSConfigMappingRoundTrip pins the ALTER MAPPING FOR
+// tok WITH dict [, ...] override form's wire format (RecordKindAlterTSConfigMapping,
+// same shape as RecordKindAddTSConfigMapping). DU-002 slice 446 follow-up
+// (M0119-0004).
+func TestEncodeDecodeAlterTSConfigMappingRoundTrip(t *testing.T) {
+	cases := []struct {
+		name, schema, tokenType string
+		dictOIDs                []uint32
+	}{
+		{"myconfig", "public", "asciiword", []uint32{3765}},
+		{"myconfig", "public", "word", []uint32{3765, 16384, 16385}},
+		{"emptymap", "myschema", "email", []uint32{}},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterTSConfigMapping(c.name, c.schema, c.tokenType, c.dictOIDs)
+		if raw[0] != RecordKindAlterTSConfigMapping {
+			t.Errorf("%q/%q: kind byte = %d, want %d", c.name, c.tokenType, raw[0], RecordKindAlterTSConfigMapping)
+			continue
+		}
+		gotName, gotSchema, gotTokenType, gotDictOIDs, err := DecodeAlterTSConfigMapping(raw)
+		if err != nil {
+			t.Errorf("%q/%q: decode err: %v", c.name, c.tokenType, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotTokenType != c.tokenType || !reflect.DeepEqual(gotDictOIDs, c.dictOIDs) {
+			t.Errorf("%q/%q: decoded (%q, %q, %q, %v)", c.name, c.tokenType, gotName, gotSchema, gotTokenType, gotDictOIDs)
+		}
+	}
+}
+
+// TestDecodeAlterTSConfigMappingRejectsWrongKind mirrors the add-mapping case.
+func TestDecodeAlterTSConfigMappingRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSConfig("myconfig", "public")
+	if _, _, _, _, err := DecodeAlterTSConfigMapping(bogus); err == nil {
+		t.Error("expected error decoding non-alter-tsconfig-mapping payload")
+	}
+}
+
+// TestDecodeAlterTSConfigMappingRejectsTruncatedPayload guards against
+// silently returning empty/zero fields when the on-disk record is corrupt.
+func TestDecodeAlterTSConfigMappingRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeAlterTSConfigMapping("myconfig", "public", "asciiword", []uint32{3765, 16384})
+	truncated := raw[:len(raw)-1]
+	if _, _, _, _, err := DecodeAlterTSConfigMapping(truncated); err == nil {
+		t.Error("expected error decoding truncated alter-tsconfig-mapping payload")
+	}
+}

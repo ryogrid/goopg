@@ -6543,9 +6543,29 @@ func (p *parser) parseAlter() (Stmt, error) {
 					}
 					return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "replacedict", TokenTypes: tokenTypes, OldDict: oldDict, NewDict: newDict}, nil
 				}
-				// ALTER MAPPING FOR tok WITH dict [, ...] override form —
-				// unimplemented compat no-op; discard the rest of the
-				// statement.
+				// ALTER MAPPING FOR tok [, ...] WITH dict [, ...] override
+				// form (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN) — replaces
+				// each named token type's entire dictionary list. Unlike
+				// REPLACE, gram.y requires the FOR token-type list for this
+				// form (there is no bare "ALTER MAPPING WITH dict" rule), so
+				// only dispatch here when tokenTypes was actually parsed.
+				// DU-002 slice 446 follow-up (M0119-0004).
+				if len(tokenTypes) > 0 && p.acceptKeyword(KwWith) {
+					var dicts []ObjectName
+					for {
+						dn, err := p.parseObjectName()
+						if err != nil {
+							return nil, err
+						}
+						dicts = append(dicts, dn)
+						if !p.acceptSymbol(",") {
+							break
+						}
+					}
+					return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "altermapping", TokenTypes: tokenTypes, Dictionaries: dicts}, nil
+				}
+				// OWNER TO (or any other unrecognized trailer) — unimplemented
+				// compat no-op; discard the rest of the statement.
 				stmt, err := p.parseSkipToSemicolon(t.Pos)
 				if err != nil {
 					return nil, err

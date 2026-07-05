@@ -422,3 +422,80 @@ func TestTSConfigDDLRecoveryReplaysReplaceMappingDict(t *testing.T) {
 		}
 	}
 }
+
+// TestTSConfigDDLRecoveryReplaysAlterMapping guards the ALTER MAPPING FOR tok
+// WITH dict [, ...] override follow-up to M0119-0004 slice 446: the
+// wholesale dictionary-list replacement for an already-mapped token type
+// (and the plain insert for a not-yet-mapped one) must survive a restart
+// exactly like the sibling ADD/DROP/RENAME/SET SCHEMA/REPLACE forms already
+// do.
+func TestTSConfigDDLRecoveryReplaysAlterMapping(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40465)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSConfig("altercfg", "public", wantOID, 10, 3722)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-tsconfig: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("altercfg", "public", "asciiword", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping asciiword: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("altercfg", "public", "word", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping word: %v", werr)
+	}
+	// Override asciiword's entire dictionary list wholesale.
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterTSConfigMapping("altercfg", "public", "asciiword", []uint32{16410, 16411})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append alter-mapping asciiword: %v", werr)
+	}
+	// Override a not-yet-mapped token type — same effect as ADD MAPPING.
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterTSConfigMapping("altercfg", "public", "numword", []uint32{16412})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append alter-mapping numword: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat, ok := rt2.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("Catalog is %T, expected *catalog.InMemory", rt2.Catalog)
+	}
+
+	cfg := findUserTSConfig(cat, "altercfg", "public")
+	if cfg == nil {
+		t.Fatalf("after WAL replay, configuration \"altercfg\" not found; registry = %+v", cat.ListUserTSConfigs())
+	}
+	seen := map[string][]uint32{}
+	for _, m := range cfg.Mappings {
+		seen[m.TokenType] = m.DictOIDs
+	}
+	if got := seen["asciiword"]; len(got) != 2 || got[0] != 16410 || got[1] != 16411 {
+		t.Errorf("altercfg asciiword DictOIDs = %v, want [16410 16411] (overridden)", got)
+	}
+	if got := seen["word"]; len(got) != 1 || got[0] != 3765 {
+		t.Errorf("altercfg word DictOIDs = %v, want [3765] (untouched)", got)
+	}
+	if got := seen["numword"]; len(got) != 1 || got[0] != 16412 {
+		t.Errorf("altercfg numword DictOIDs = %v, want [16412] (newly created via override)", got)
+	}
+}

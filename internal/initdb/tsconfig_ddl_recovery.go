@@ -1,12 +1,12 @@
 package initdb
 
 // CREATE TEXT SEARCH CONFIGURATION / ADD MAPPING / DROP / DROP MAPPING /
-// RENAME / SET SCHEMA / ALTER MAPPING REPLACE WAL replay (DU-002
-// restart-persistence follow-up to slice 446, M0119-0004).
+// RENAME / SET SCHEMA / ALTER MAPPING REPLACE / ALTER MAPPING (override) WAL
+// replay (DU-002 restart-persistence follow-up to slice 446, M0119-0004).
 //
 // Physical WAL replay (`wal.ReplayFromDirWithMgr`) ignores the
-// CREATE/ADD-MAPPING/DROP/DROP-MAPPING/RENAME/SET-SCHEMA/REPLACE-MAPPING-DICT
-// TEXT SEARCH CONFIGURATION record kinds (106-112) because goopg has no
+// CREATE/ADD-MAPPING/DROP/DROP-MAPPING/RENAME/SET-SCHEMA/REPLACE-MAPPING-DICT/
+// ALTER-MAPPING TEXT SEARCH CONFIGURATION record kinds (106-113) because goopg has no
 // per-configuration file namespace — there is no page-level state to
 // reconstruct. The catalog's configuration registry,
 // however, is the in-memory source of truth that backs the pg_ts_config /
@@ -38,6 +38,7 @@ type tsConfigRegistryRecovery interface {
 	RenameTSConfigDuringRecovery(name, schema, newName string)
 	SetTSConfigSchemaDuringRecovery(name, schema, newSchema string)
 	ReplaceTSConfigMappingDictDuringRecovery(name, schema string, tokenTypes []string, oldOID, newOID uint32)
+	AlterTSConfigMappingDuringRecovery(name, schema, tokenType string, dictOIDs []uint32)
 }
 
 // replayTSConfigDDLRecords reads every WAL record under walDir and applies
@@ -124,6 +125,12 @@ func replayTSConfigDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode replace-tsconfig-mapping-dict at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.ReplaceTSConfigMappingDictDuringRecovery(name, schema, tokenTypes, oldOID, newOID)
+		case wal.RecordKindAlterTSConfigMapping:
+			name, schema, tokenType, dictOIDs, derr := wal.DecodeAlterTSConfigMapping(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-tsconfig-mapping at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.AlterTSConfigMappingDuringRecovery(name, schema, tokenType, dictOIDs)
 		}
 	}
 	return nil

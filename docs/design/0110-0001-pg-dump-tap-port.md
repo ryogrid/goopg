@@ -15091,3 +15091,79 @@ Gates: `go build ./...` clean; `go vet` on all touched packages clean;
 ./internal/initdb/... ./internal/server/...` PASS; `go test -race -count=1
 ./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `ALTER MAPPING FOR tok WITH dict` override form (2026-07-06)
+
+Closes the last named-and-deferred sub-form of `ALTER TEXT SEARCH
+CONFIGURATION ... ALTER MAPPING`: the `ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN`
+production in `gram.y` (`ALTER MAPPING FOR tok [, ...] WITH dict [, ...]`, no
+`REPLACE` keyword) previously fell through to the discarded compat no-op
+inside the `ALTER MAPPING` branch added by the REPLACE follow-up.
+
+`MakeConfigurationMapping`'s `stmt->override` path (`tsearchcmds.c`) confirms
+the semantics: for every named token type, any existing `pg_ts_config_map`
+rows are deleted first, then the new dictionary list is inserted — a
+wholesale replacement of that token type's *entire* mapping, as opposed to
+ADD MAPPING's append (which 23505s if the token type is already mapped — see
+the earlier slice 446 follow-up row) or REPLACE's single-OID substitution
+within the existing list. Because goopg's in-memory `TSConfigMapping` already
+models one token type as a single entry holding an ordered `DictOIDs` list
+(not one row per dictionary), the delete-then-insert collapses to a plain
+"replace-in-place-or-append" — no separate delete step is needed.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `AlterTSConfigStmt` gained an `"altermapping"`
+  action, reusing the existing `Dictionaries` field (same shape as
+  `"addmapping"`).
+- `internal/parser/ddl.go`: the `ALTER MAPPING` branch (added by the REPLACE
+  follow-up) now checks `len(tokenTypes) > 0 && p.acceptKeyword(KwWith)`
+  after the `REPLACE` check fails, building the `"altermapping"` statement.
+  `gram.y` requires `FOR` for this form (there is no bare
+  `ALTER MAPPING WITH dict` production, unlike REPLACE's optional `FOR`), so
+  gating on a non-empty `tokenTypes` mirrors the grammar exactly; anything
+  else (in practice, just `OWNER TO`) still falls through to the discarded
+  compat no-op.
+- `internal/catalog/catalog.go`: new `AlterTSConfigMapping` — looks up the
+  matching `TokenType` entry and overwrites its `DictOIDs` wholesale (or
+  appends a new entry if the token type wasn't mapped yet, matching what ADD
+  MAPPING would have produced), plus `AlterTSConfigMappingDuringRecovery`.
+  Never errors on an already-mapped token type (unlike `AddTSConfigMapping`)
+  since overriding an existing mapping is the entire point of this form.
+- `internal/executor/operators_ddl.go`: new `execAlterTSConfigAlterMapping`,
+  reusing the `resolveTSDictOID` helper (42704 on an unresolvable dictionary
+  or configuration name), looping `s.TokenTypes` the same way
+  `execAlterTSConfigAddMapping` does.
+- Restart persistence landed in the same loop (not deferred): new WAL record
+  kind `RecordKindAlterTSConfigMapping` (113) — identical wire shape to
+  `RecordKindAddTSConfigMapping` (one record per token type: tokenType +
+  full replacement `DictOIDs` list) — with
+  `EncodeAlterTSConfigMapping`/`DecodeAlterTSConfigMapping`, wired into
+  `ApplyRecord`'s existing catalog-only `(false, nil)` case alongside its 7
+  siblings, and into `internal/initdb/tsconfig_ddl_recovery.go`'s replay
+  switch (extending `tsConfigRegistryRecovery` with
+  `AlterTSConfigMappingDuringRecovery`).
+
+**Tests**: `internal/executor/tsconfig_altermapping_test.go`
+(`TestAlterTSConfigAlterMapping`, covering: overriding an already-mapped
+token type without a 23505, the untouched-sibling-token-type assertion,
+creating a mapping for a previously-unmapped token type, and the 42704
+unknown-configuration/unknown-dictionary cases).
+`internal/wal/tsdict_tsconfig_ddl_test.go` gained round-trip/wrong-kind/
+truncated-payload cases for the new record kind.
+`internal/initdb/tsdict_tsconfig_ddl_recovery_test.go` gained
+`TestTSConfigDDLRecoveryReplaysAlterMapping` (override of an existing mapping
++ creation of a new one in the same WAL stream, through a real
+`Init`→`Open`→WAL append→`Close`→`Open` cycle).
+
+**Still deferred**: `OWNER TO` (no-op, likely fine per the earlier ledger
+row's rationale — pg_dump derives ownership from `cfgowner` at CREATE time,
+never from a replayed ALTER OWNER TO) and the `CONFIGURATION = source_config`
+copy-from-existing-configuration form of `CREATE TEXT SEARCH CONFIGURATION`.
+With this follow-up, every `ALTER TEXT SEARCH CONFIGURATION` sub-form named
+in `gram.y`'s `AlterTSConfigurationStmt` production is now implemented.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
+./internal/catalog/... ./internal/parser/... ./internal/wal/...
+./internal/initdb/...` PASS (see below for the full run); `scripts/
+tpch-spotcheck.sh` PASS; pgbench pre-commit smoke via git hook.

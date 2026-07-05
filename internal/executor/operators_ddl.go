@@ -15719,9 +15719,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 }
 
 // execAlterTSConfig implements the ALTER TEXT SEARCH CONFIGURATION forms
-// goopg models: ADD MAPPING, DROP MAPPING, RENAME TO, and SET SCHEMA.
+// goopg models: ADD MAPPING, DROP MAPPING, RENAME TO, SET SCHEMA, ALTER
+// MAPPING REPLACE, and the ALTER MAPPING FOR tok WITH dict override form.
 // DU-002 slice 446 (M0119-0004); dropmapping/rename/setschema added as a
-// slice 446 follow-up.
+// slice 446 follow-up; replacedict and altermapping added as further
+// follow-ups.
 func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -15738,6 +15740,8 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		return o.execAlterTSConfigDropMapping(im, s, schema)
 	case "replacedict":
 		return o.execAlterTSConfigReplaceDict(im, s, schema)
+	case "altermapping":
+		return o.execAlterTSConfigAlterMapping(im, s, schema)
 	case "rename":
 		if err := im.RenameTSConfig(s.ConfigName.Name, schema, s.NewName); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
@@ -15867,6 +15871,41 @@ func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.Alt
 	if o.ctx.WAL != nil {
 		if _, _, werr := o.ctx.WAL.Append(wal.EncodeReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)); werr != nil {
 			return fmt.Errorf("wal replace-tsconfig-mapping-dict: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterTSConfigAlterMapping implements ALTER TEXT SEARCH CONFIGURATION
+// name ALTER MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — the
+// override form (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN, no REPLACE
+// keyword). Unlike ADD MAPPING it never 23505s on an already-mapped token
+// type: real PG's MakeConfigurationMapping deletes any existing
+// pg_ts_config_map rows for the token type first when override=true, then
+// inserts the new list, so re-pointing an existing mapping is exactly what
+// this statement is for. DU-002 slice 446 follow-up (M0119-0004).
+func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
+	for _, dn := range s.Dictionaries {
+		oid, err := resolveTSDictOID(im, dn)
+		if err != nil {
+			return err
+		}
+		dictOIDs = append(dictOIDs, oid)
+	}
+	for _, tt := range s.TokenTypes {
+		uc := im.AlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
+		if uc == nil {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event per token type so the override survives a restart, replayed
+		// by internal/initdb/tsconfig_ddl_recovery.go after the
+		// configuration's own CREATE record.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
+				return fmt.Errorf("wal alter-tsconfig-mapping: %w", werr)
+			}
 		}
 	}
 	return nil

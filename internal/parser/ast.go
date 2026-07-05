@@ -2395,23 +2395,27 @@ type TSDictOption struct {
 //     bare form, which substitutes the dictionary across every token type
 //     the configuration maps (tsearchcmds.c's MakeConfigurationMapping
 //     replace path treats an empty token list as "match all").
+//   - "altermapping": ALTER MAPPING FOR tokentype [, ...] WITH dictionary
+//     [, ...] (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN, override=true).
+//     Replaces each named token type's entire dictionary list wholesale
+//     (delete-then-insert in MakeConfigurationMapping's override path), as
+//     opposed to ADD MAPPING's append (which 23505s on an existing token
+//     type) or REPLACE's single-OID substitution. Reuses the Dictionaries
+//     field, same shape as "addmapping".
 //
-// The ALTER MAPPING FOR tokentype [, ...] WITH dict [, ...] override form
-// (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN — replaces a token type's entire
-// dictionary list, as opposed to ADD MAPPING's append or REPLACE's
-// single-OID substitution) and OWNER TO stay unimplemented
-// parsed-and-discarded compat no-ops — OWNER TO in particular needs no
-// dedicated parse path since pg_dump always derives it from the config's
-// cfgowner catalog column (set at CREATE time), never from a separate ALTER
-// OWNER TO statement having been replayed.
+// OWNER TO stays an unimplemented parsed-and-discarded compat no-op — it
+// needs no dedicated parse path since pg_dump always derives it from the
+// config's cfgowner catalog column (set at CREATE time), never from a
+// separate ALTER OWNER TO statement having been replayed.
 // DU-002 slice 446 (M0119-0004); rename/setschema/dropmapping added as a
-// slice 446 follow-up; replacedict added as a further follow-up.
+// slice 446 follow-up; replacedict added as a further follow-up; altermapping
+// added as a further follow-up still.
 type AlterTSConfigStmt struct {
 	pos          int
 	ConfigName   ObjectName
 	Action       string // "addmapping" | "dropmapping" | "rename" | "setschema" | "replacedict"
 	TokenTypes   []string
-	Dictionaries []ObjectName // for Action == "addmapping"
+	Dictionaries []ObjectName // for Action == "addmapping" | "altermapping"
 	IfExists     bool         // for Action == "dropmapping"
 	NewName      string       // for Action == "rename"
 	NewSchema    string       // for Action == "setschema"
