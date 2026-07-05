@@ -93,7 +93,7 @@ func (o *explainOp) Open(ctx *Context) error {
 			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
 			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats, trackIOTiming)}
 			if opts.Buffers {
-				root["Planning"] = planningBufferUsageJSON()
+				root["Planning"] = planningBufferUsageJSON(trackIOTiming)
 			}
 			if summary {
 				root["Planning Time"] = nsToMs(planNs)
@@ -126,7 +126,8 @@ func (o *explainOp) Open(ctx *Context) error {
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
 		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
 		if opts.Buffers {
-			root["Planning"] = planningBufferUsageJSON()
+			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
+			root["Planning"] = planningBufferUsageJSON(trackIOTiming)
 		}
 		addExplainSettingsGroup(ctx, opts, root)
 		out, err := renderExplainTree(opts.Format, root)
@@ -229,8 +230,8 @@ func formatBuffersLine(s *nodeStats) string {
 // there is no counter to accumulate into in the first place — a real
 // architectural fact mirroring the Shared comment above, not a narrower
 // stub than the Shared fields.
-func planningBufferUsageJSON() map[string]any {
-	return map[string]any{
+func planningBufferUsageJSON(trackIOTiming bool) map[string]any {
+	m := map[string]any{
 		"Shared Hit Blocks":     int64(0),
 		"Shared Read Blocks":    int64(0),
 		"Shared Dirtied Blocks": int64(0),
@@ -242,6 +243,21 @@ func planningBufferUsageJSON() map[string]any {
 		"Temp Read Blocks":      int64(0),
 		"Temp Written Blocks":   int64(0),
 	}
+	// Mirrors show_buffer_usage's non-text branch: once track_io_timing
+	// is on, all six *_blk_read/write_time properties are emitted even
+	// when zero (peek_buffer_usage: "we print even if the counters are
+	// all zeroes"). goopg's planner never touches the buffer pool during
+	// cost estimation, so these are architecturally-zero constants, not
+	// a narrower stub (same rationale as the Blocks fields above).
+	if trackIOTiming {
+		m["Shared I/O Read Time"] = float64(0)
+		m["Shared I/O Write Time"] = float64(0)
+		m["Local I/O Read Time"] = float64(0)
+		m["Local I/O Write Time"] = float64(0)
+		m["Temp I/O Read Time"] = float64(0)
+		m["Temp I/O Write Time"] = float64(0)
+	}
+	return m
 }
 
 // formatIOTimingsLine renders the upstream "I/O Timings: shared read=X.XXX
@@ -688,18 +704,26 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 			obj["Local Written Blocks"] = int64(0)
 			obj["Temp Read Blocks"] = int64(0)
 			obj["Temp Written Blocks"] = int64(0)
-			// "Shared I/O Read/Write Time" (upstream's show_buffer_usage
-			// non-text branch, ExplainPropertyFloat calls gated on the live
-			// track_io_timing GUC — emitted even when the accumulated value
-			// is zero, matching explain.c's peek_buffer_usage comment: "when
-			// format is anything other than text, we print even if the
-			// counters are all zeroes"). TEXT's formatIOTimingsLine keeps its
-			// own nonzero gate (a line with nothing to report is simply
-			// omitted; there's no upstream text-format precedent for an
-			// explicit "I/O Timings: " line at all-zero).
+			// "Shared/Local/Temp I/O Read/Write Time" (upstream's
+			// show_buffer_usage non-text branch, ExplainPropertyFloat calls
+			// gated on the live track_io_timing GUC — emitted even when the
+			// accumulated value is zero, matching explain.c's
+			// peek_buffer_usage comment: "when format is anything other
+			// than text, we print even if the counters are all zeroes").
+			// Shared is real (nsToMs of the live counters); Local/Temp are
+			// constant zeros for the same reason the Blocks fields above
+			// are — no local-buffer-manager/temp-buffer concept to time.
+			// TEXT's formatIOTimingsLine keeps its own nonzero gate (a line
+			// with nothing to report is simply omitted; there's no upstream
+			// text-format precedent for an explicit "I/O Timings: " line at
+			// all-zero).
 			if trackIOTiming {
 				obj["Shared I/O Read Time"] = nsToMs(s.bufReadTimeNs)
 				obj["Shared I/O Write Time"] = nsToMs(s.bufWriteTimeNs)
+				obj["Local I/O Read Time"] = float64(0)
+				obj["Local I/O Write Time"] = float64(0)
+				obj["Temp I/O Read Time"] = float64(0)
+				obj["Temp I/O Write Time"] = float64(0)
 			}
 		}
 	}

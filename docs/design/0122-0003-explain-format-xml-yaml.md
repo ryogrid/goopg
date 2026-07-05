@@ -1079,3 +1079,55 @@ remaining open item in the BUFFERS-rendering cluster. The cluster's last
 open item is now only the `reuses` `pg_stat_io` op counter (needs a
 `BufferAccessStrategy`-style ring buffer goopg does not implement) plus
 the Local/Temp/Planning-time I/O timing terms just named above.
+
+## Local/Temp/Planning-time I/O timing terms (later loop, 2026-07-06)
+
+**Problem:** upstream's `show_buffer_usage` non-TEXT branch, once the live
+`track_io_timing` GUC is on, renders all **six** `Shared/Local/Temp I/O
+Read/Write Time` properties unconditionally (even at zero) — not just the
+`Shared` pair. Two gaps existed:
+1. `planToJSONWithStats`'s per-node `trackIOTiming` block only emitted
+   `Shared I/O Read/Write Time`; `Local I/O Read/Write Time` and `Temp I/O
+   Read/Write Time` were entirely missing.
+2. `planningBufferUsageJSON()` (the "Planning" group, used by both the
+   ANALYZE-JSON root and the BUFFERS-without-ANALYZE root) took no
+   `trackIOTiming` parameter at all — it never emitted *any* of the six
+   I/O timing keys, even when the GUC was on and the caller already had
+   `trackIOTiming` computed one line above the ANALYZE call site.
+
+**Fix:**
+- `planningBufferUsageJSON` now takes a `trackIOTiming bool` parameter and,
+  when true, adds all six keys as `float64(0)` constants (same
+  architectural-zero rationale as the Blocks terms: goopg's planner never
+  touches the buffer pool, and there is no local/temp buffer manager to
+  time). Both call sites in `explainOp.Open` — the ANALYZE-JSON branch
+  (reusing the `trackIOTiming` already computed for
+  `planToJSONWithStats`) and the plain BUFFERS-without-ANALYZE branch
+  (computing its own `trackIOTiming` from `ctx.Activity`/`ctx.ProcNum`,
+  since that branch has no other need for it) — now pass it through.
+- `planToJSONWithStats`'s `trackIOTiming` block gained `Local I/O
+  Read/Write Time` and `Temp I/O Read/Write Time` as `float64(0)`
+  constants alongside the real `Shared I/O Read/Write Time` values.
+
+TEXT format needs no change: local/temp timing is always zero, so
+upstream's own `has_local_timing`/`has_temp_timing` gates in
+`show_buffer_usage`'s TEXT branch would also suppress those clauses.
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn` /
+`TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff` (per-node),
+`TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn` /
+`TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff` (Planning group).
+
+**Verification:** `go build ./...` clean; `go test -count=1
+./internal/executor/... ./internal/storage/... ./internal/planner/...
+./internal/parser/... ./internal/server/... ./internal/config/...
+./internal/activity/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33).
+
+This closes the "Local/Temp/Planning-time I/O timing terms" sub-item.
+The BUFFERS/`pg_stat_io` cluster's only remaining open item is now the
+`reuses` `pg_stat_io` op counter (needs a `BufferAccessStrategy`-style
+ring buffer goopg does not implement — feature-sized, not a counter
+tweak) plus the 4 named writeback simplifications-vs-upstream
+(2026-07-05 ledger row).

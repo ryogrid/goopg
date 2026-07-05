@@ -43,14 +43,18 @@ planner never touches the buffer pool during cost estimation) also landed
 2026-07-06, as did the local/temp-buffer `* Blocks` terms (also always-zero
 constants, same loop-later) — both the per-node and Planning-time JSON/XML/
 YAML groups now carry `Local Hit/Read/Dirtied/Written Blocks` and `Temp
-Read/Written Blocks`. Remaining sub-items: the last `pg_stat_io` op counter
-(`reuses` — needs a `BufferAccessStrategy`-style ring-buffer storage-engine
-mechanism goopg doesn't have), Local/Temp/Planning-time I/O timing terms
-(no collection code path exists for any of the three), plus the 4 named
-writeback simplifications-vs-upstream (see deferral ledger 2026-07-05
-row). Pick up one of those next, or continue the M0119-0004 pg_dump
-catalog-view parity battery / next unresolved DU-002 slice from
-`.ralph/deferral_ledger.md`.
+Read/Written Blocks`. The Local/Temp/Planning-time I/O timing terms
+(`Local/Temp I/O Read/Write Time`, plus threading `trackIOTiming` into
+`planningBufferUsageJSON`) also landed 2026-07-06 (later loop still) —
+`planningBufferUsageJSON(trackIOTiming bool)` and `planToJSONWithStats`
+both now emit all six `Shared/Local/Temp I/O Read/Write Time` keys
+(constant-zero for Local/Temp) once the GUC is on. Remaining sub-items:
+the last `pg_stat_io` op counter (`reuses` — needs a
+`BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
+doesn't have), plus the 4 named writeback simplifications-vs-upstream
+(see deferral ledger 2026-07-05 row). Pick up one of those next, or
+continue the M0119-0004 pg_dump catalog-view parity battery / next
+unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

@@ -486,6 +486,82 @@ func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
 	}
 }
 
+
+// TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn closes
+// the Local/Temp I/O timing gap named by the M0122-0003 deferral-ledger
+// follow-up: upstream's non-text show_buffer_usage() renders all six
+// Shared/Local/Temp I/O Read/Write Time properties once track_io_timing is
+// on, not just the Shared pair — goopg has no local-buffer-manager or
+// temp-buffer concept, so Local/Temp stay constant zero, same rationale as
+// their Blocks counterparts (TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks).
+func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	for _, key := range []string{
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		got, ok := obj[key].(float64)
+		if !ok || got != 0 {
+			t.Errorf("%s = %v, want 0 (present)", key, obj[key])
+		}
+	}
+}
+
+// TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff is the
+// mirror of the above: with track_io_timing off, the Local/Temp terms stay
+// absent alongside the Shared ones.
+func TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	for _, key := range []string{
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		if _, ok := obj[key]; ok {
+			t.Errorf("%s present with trackIOTiming=false, want absent", key)
+		}
+	}
+}
+
+// TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn pins
+// planningBufferUsageJSON's new trackIOTiming parameter: the "Planning"
+// group (planning-time buffer usage, always zero — goopg's planner never
+// touches the buffer pool during cost estimation) must also gain the six
+// Shared/Local/Temp I/O Read/Write Time properties once track_io_timing is
+// on, matching the per-node behavior pinned above.
+func TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn(t *testing.T) {
+	obj := planningBufferUsageJSON(true)
+	for _, key := range []string{
+		"Shared I/O Read Time", "Shared I/O Write Time",
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		got, ok := obj[key].(float64)
+		if !ok || got != 0 {
+			t.Errorf("%s = %v, want 0 (present)", key, obj[key])
+		}
+	}
+}
+
+// TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff is the mirror
+// of the above: with track_io_timing off, none of the six I/O timing
+// properties appear in the "Planning" group.
+func TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff(t *testing.T) {
+	obj := planningBufferUsageJSON(false)
+	for _, key := range []string{
+		"Shared I/O Read Time", "Shared I/O Write Time",
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		if _, ok := obj[key]; ok {
+			t.Errorf("%s present with trackIOTiming=false, want absent", key)
+		}
+	}
+}
+
 // TestExplainBuffersRepeatScanAccumulatesHits runs the same query twice so
 // the second pass's pages are guaranteed resident, exercising the hit-only
 // branch of formatBuffersLine (no read= term once nothing needs a disk
