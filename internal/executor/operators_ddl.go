@@ -111,6 +111,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterEventTrigger(s)
 	case *parser.CreateAccessMethodStmt:
 		return nil, o.execCreateAccessMethod(s)
+	case *parser.AlterDefaultPrivilegesStmt:
+		return nil, o.execAlterDefaultPrivileges(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:

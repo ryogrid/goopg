@@ -456,6 +456,135 @@ func buildParameterACLChange(revoke bool, toks []Token) *ParameterACLChange {
 	return pac
 }
 
+// defaclObjTypeFromTarget maps a defacl_privilege_target keyword run (the
+// token(s) right after `ON` in a DefACLAction) to the AlterDefaultPrivilegesStmt
+// ObjType string, and reports how many tokens it consumed (1, or 2 for the
+// two-word "LARGE OBJECTS" form). Mirrors gram.y's defacl_privilege_target
+// production; an unrecognized keyword yields ("", 0). M0110-0001 (DU-002
+// slice 438 follow-up).
+func defaclObjTypeFromTarget(toks []Token, at int) (string, int) {
+	if at >= len(toks) {
+		return "", 0
+	}
+	switch strings.ToLower(toks[at].Value) {
+	case "tables":
+		return "table", 1
+	case "sequences":
+		return "sequence", 1
+	case "functions", "routines":
+		return "function", 1
+	case "types":
+		return "type", 1
+	case "schemas":
+		return "schema", 1
+	case "large":
+		if at+1 < len(toks) && strings.EqualFold(toks[at+1].Value, "objects") {
+			return "largeobject", 2
+		}
+	}
+	return "", 0
+}
+
+// buildAlterDefaultPrivileges parses the token run of an `ALTER DEFAULT
+// PRIVILEGES [FOR ROLE|USER role_list] [IN SCHEMA schema_list]
+// {GRANT|REVOKE} ...` statement (everything after the "PRIVILEGES" keyword,
+// trailing ';' already excluded) into an AlterDefaultPrivilegesStmt. Unlike
+// the GRANT/REVOKE-family builders above (buildDatabaseACLChange et al.),
+// which discriminate the object class from an ambiguous `ON <name-or-class>`
+// clause, ALTER DEFAULT PRIVILEGES has an unambiguous, linear grammar
+// (gram.y's DefACLOptionList DefACLAction), so this scans forward
+// deterministically rather than searching for a fixed marker token.
+// M0110-0001 (DU-002 slice 438 follow-up).
+func buildAlterDefaultPrivileges(toks []Token) (*AlterDefaultPrivilegesStmt, error) {
+	i := 0
+	kwAt := func(idx int, kw string) bool {
+		return idx < len(toks) && strings.EqualFold(toks[idx].Value, kw)
+	}
+	// nextBoundary finds the next top-level option/action keyword starting a
+	// new DefACLOption or the DefACLAction itself, bounding a role/schema list.
+	nextBoundary := func(from int) int {
+		for j := from; j < len(toks); j++ {
+			switch strings.ToLower(toks[j].Value) {
+			case "for", "in", "grant", "revoke":
+				return j
+			}
+		}
+		return len(toks)
+	}
+	stmt := &AlterDefaultPrivilegesStmt{}
+	// DefACLOptionList: any mix of "FOR ROLE|USER role_list" and
+	// "IN SCHEMA schema_list", in either order, zero or more times (PG's
+	// grammar allows repeats; the last one wins, matching a plain list
+	// accumulation — goopg simply overwrites, which is what a single
+	// occurrence — the overwhelmingly common case — does either way).
+	for {
+		if kwAt(i, "for") && (kwAt(i+1, "role") || kwAt(i+1, "user")) {
+			i += 2
+			end := nextBoundary(i)
+			stmt.Roles = splitTokRoles(toks[i:end])
+			i = end
+			continue
+		}
+		if kwAt(i, "in") && kwAt(i+1, "schema") {
+			i += 2
+			end := nextBoundary(i)
+			stmt.Schemas = splitTokRoles(toks[i:end])
+			i = end
+			continue
+		}
+		break
+	}
+	if !kwAt(i, "grant") && !kwAt(i, "revoke") {
+		return nil, &SyntaxError{Pos: 0, Message: "ALTER DEFAULT PRIVILEGES requires a GRANT or REVOKE action"}
+	}
+	stmt.Revoke = kwAt(i, "revoke")
+	i++
+	if stmt.Revoke && kwAt(i, "grant") && kwAt(i+1, "option") && kwAt(i+2, "for") {
+		stmt.GrantOptionFor = true
+		i += 3
+	}
+	onIdx := tokIndexOf(toks, i, "on")
+	if onIdx < 0 {
+		return nil, &SyntaxError{Pos: 0, Message: "ALTER DEFAULT PRIVILEGES requires ON TABLES|SEQUENCES|FUNCTIONS|ROUTINES|TYPES|SCHEMAS|LARGE OBJECTS"}
+	}
+	stmt.Privileges = splitTokPrivileges(toks[i:onIdx])
+	objType, consumed := defaclObjTypeFromTarget(toks, onIdx+1)
+	if consumed == 0 {
+		return nil, &SyntaxError{Pos: 0, Message: "ALTER DEFAULT PRIVILEGES requires ON TABLES|SEQUENCES|FUNCTIONS|ROUTINES|TYPES|SCHEMAS|LARGE OBJECTS"}
+	}
+	stmt.ObjType = objType
+	i = onIdx + 1 + consumed
+	sep := "to"
+	if stmt.Revoke {
+		sep = "from"
+	}
+	if !kwAt(i, sep) {
+		return nil, &SyntaxError{Pos: 0, Message: "ALTER DEFAULT PRIVILEGES requires " + strings.ToUpper(sep) + " <role_list>"}
+	}
+	i++
+	roleStart := i
+	roleEnd := len(toks)
+	for j := roleStart; j < len(toks); j++ {
+		switch strings.ToLower(toks[j].Value) {
+		case "with":
+			if j+2 < len(toks) && strings.EqualFold(toks[j+1].Value, "grant") && strings.EqualFold(toks[j+2].Value, "option") {
+				stmt.WithGrantOption = true
+			}
+			roleEnd = j
+		case "cascade", "restrict":
+			roleEnd = j
+		default:
+			continue
+		}
+		break
+	}
+	stmt.Grantees = splitTokRoles(toks[roleStart:roleEnd])
+	if len(stmt.Privileges) == 0 || len(stmt.Grantees) == 0 {
+		return nil, &SyntaxError{Pos: 0, Message: "ALTER DEFAULT PRIVILEGES: empty privilege or grantee list"}
+	}
+	return stmt, nil
+}
+
 // buildRoleMembershipChange parses the token run of a `GRANT <role>[, ...]
 // TO <role>[, ...] [WITH ADMIN OPTION] [GRANTED BY <role>]` or `REVOKE
 // [{ADMIN|INHERIT|SET} OPTION FOR] <role>[, ...] FROM <role>[, ...] [GRANTED

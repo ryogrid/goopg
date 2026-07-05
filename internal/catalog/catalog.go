@@ -2339,6 +2339,29 @@ type InMemory struct {
 	// M0119-0004-ACLHEAP (parameter ACL half).
 	parameterACLNames map[uint32]string
 
+	// defaultACLOIDs assigns a synthetic pg_default_acl.oid to each
+	// `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] ...` target
+	// triple (defaclrole, defaclnamespace-or-0, defaclobjtype), keyed by
+	// defaultACLKey — mirrors parameterACLOIDs' lazy-minting pattern (real
+	// PostgreSQL only rows a pg_default_acl tuple once a GRANT/REVOKE
+	// materializes one, and deletes it again once the ACL returns to its
+	// implicit default; SetDefaultACL, aclchk.c). defaultACLKeys is the
+	// reverse lookup, so pg_default_acl's VirtualRows can project every
+	// minted triple. M0110-0001 (DU-002 slice 438 follow-up).
+	defaultACLOIDs map[defaultACLKey]uint32
+	defaultACLKeys map[uint32]defaultACLKey
+
+	// defaultACLGlobal records, per minted OID, whether the entry is a
+	// global default (no IN SCHEMA — defaclnamespace = 0) or a
+	// schema-scoped one. A global entry's implicit baseline is the target
+	// role's full acldefault() rights for the object type (merged in via the
+	// shared tableACLs/relaclTextLockedFor owner-injection machinery, exactly
+	// like pg_class.relacl); a schema-scoped entry's baseline is empty (no
+	// implicit owner entry at all) — real PostgreSQL's SetDefaultACL seeds
+	// `old_acl` from acldefault(objtype, roleid) only when nspid is invalid
+	// (aclchk.c). M0110-0001 (DU-002 slice 438 follow-up).
+	defaultACLGlobal map[uint32]bool
+
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
@@ -2996,6 +3019,9 @@ func NewInMemory() *InMemory {
 		attrACLOrder:       make(map[attrACLKey][]string),
 		parameterACLOIDs:   make(map[string]uint32),
 		parameterACLNames:  make(map[uint32]string),
+		defaultACLOIDs:     make(map[defaultACLKey]uint32),
+		defaultACLKeys:     make(map[uint32]defaultACLKey),
+		defaultACLGlobal:   make(map[uint32]bool),
 		comments:           make(map[commentKey]string),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
@@ -8610,11 +8636,17 @@ func (c *InMemory) registerSystemTables() {
 	//   defaclacl, CASE WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN
 	//   defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END, defaclrole)
 	//   ELSE '{}' END AS acldefault FROM pg_default_acl
-	// goopg defines no default-ACL entries (no ALTER DEFAULT PRIVILEGES), so this
-	// view is correctly empty (0 rows); the CASE/acldefault projection is never
-	// evaluated. Schema matches PG's pg_default_acl (pg_default_acl.h):
-	// oid, defaclrole oid, defaclnamespace oid, defaclobjtype "char",
-	// defaclacl aclitem[]. M0110-0001 (DU-002 slice 20).
+	// Rows are projected from the defaultACLOIDs registry, populated by
+	// execAlterDefaultPrivileges on `ALTER DEFAULT PRIVILEGES ... GRANT/REVOKE
+	// ...` (mirrors pg_parameter_acl's lazy-materialization pattern above) —
+	// empty until the first such statement, exactly like real PostgreSQL never
+	// rowing a pg_default_acl tuple until SetDefaultACL first materializes one.
+	// The acldefault CASE projection above is evaluated by the executor's
+	// existing evalAclDefault (expr.go) against this row's own
+	// defaclrole/defaclobjtype, not computed here. Schema matches PG's
+	// pg_default_acl (pg_default_acl.h): oid, defaclrole oid, defaclnamespace
+	// oid, defaclobjtype "char", defaclacl aclitem[]. M0110-0001 (DU-002 slice
+	// 20 / slice 438 follow-up).
 	pgDefaultACL := &Table{
 		Schema: "pg_catalog", Name: "pg_default_acl", Virtual: true,
 		Columns: []Column{
@@ -8626,7 +8658,27 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 826,
 	}
-	pgDefaultACL.VirtualRows = func() [][]string { return nil }
+	pgDefaultACL.VirtualRows = func() [][]string {
+		entries := c.DefaultACLEntries()
+		if len(entries) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(entries))
+		for _, e := range entries {
+			acl := VirtualNull
+			if aclText := c.DefaultACLText(e.OID, e.ObjType); aclText != "" {
+				acl = aclText
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(e.OID), 10),
+				strconv.FormatUint(uint64(e.RoleOID), 10),
+				strconv.FormatUint(uint64(e.SchemaOID), 10),
+				string(e.ObjType),
+				acl,
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
 
 	// pg_conversion — encoding-conversion catalog (OID 2607). After

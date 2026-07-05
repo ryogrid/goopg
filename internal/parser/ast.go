@@ -2361,6 +2361,43 @@ type ParameterACLChange struct {
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
 }
 
+// AlterDefaultPrivilegesStmt represents `ALTER DEFAULT PRIVILEGES [FOR ROLE|USER
+// role_list] [IN SCHEMA schema_list] {GRANT ...} | {REVOKE ...}` — sets the
+// privileges automatically granted on objects created later by the target
+// role(s), materialized as pg_default_acl rows (executor →
+// execAlterDefaultPrivileges). Mirrors gram.y's AlterDefaultPrivilegesStmt/
+// DefACLAction. M0110-0001 (DU-002 slice 438 follow-up).
+type AlterDefaultPrivilegesStmt struct {
+	pos int
+	// Roles is the FOR ROLE|USER role_list target; empty means the current
+	// user (goopg: "postgres", matching current_user's hardcoded resolution
+	// elsewhere in this codebase).
+	Roles []string
+	// Schemas is the IN SCHEMA schema_list target; empty means a global
+	// default (defaclnamespace = 0). PostgreSQL rejects IN SCHEMA combined
+	// with ObjType "schema"/"largeobject" (0LP01) — validated by the
+	// executor, not here.
+	Schemas []string
+	// Revoke is true for the REVOKE form, false for GRANT.
+	Revoke bool
+	// GrantOptionFor is true for "REVOKE GRANT OPTION FOR ...".
+	GrantOptionFor bool
+	// ObjType is one of "table"|"sequence"|"function"|"type"|"schema"|
+	// "largeobject" (ROUTINES/PROCEDURES fold into "function", matching real
+	// PG's defacl_privilege_target production).
+	ObjType string
+	// Privileges is the raw (upper-cased) privilege keyword list, or
+	// ["ALL"]/["ALL PRIVILEGES"] — left unexpanded for the executor.
+	Privileges []string
+	// Grantees is the TO|FROM role list ("PUBLIC" preserved verbatim).
+	Grantees []string
+	// WithGrantOption is GRANT ... WITH GRANT OPTION.
+	WithGrantOption bool
+}
+
+func (s *AlterDefaultPrivilegesStmt) Pos() int { return s.pos }
+func (s *AlterDefaultPrivilegesStmt) stmtNode() {}
+
 // ColumnPrivilege pairs a single column-grantable privilege keyword with the
 // parenthesised column list it applies to, e.g. `SELECT (a, b)`. PostgreSQL's
 // column-grant grammar attaches an independent column list to each privilege

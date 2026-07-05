@@ -2485,6 +2485,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "ALTER OPERATOR FAMILY"
 	case *parser.CreateOpClassStmt:
 		return "CREATE OPERATOR CLASS"
+	case *parser.AlterDefaultPrivilegesStmt:
+		return "ALTER DEFAULT PRIVILEGES"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {

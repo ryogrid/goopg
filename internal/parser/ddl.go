@@ -6275,10 +6275,48 @@ func (p *parser) parseDropTail() (bool, []ObjectName, DropBehavior, error) {
 // Pgbench emits `alter table pgbench_branches add primary key (bid)`
 // to install primary keys after CREATE TABLE; that's the load-bearing
 // shape this function unblocks.
+//
+// parseAlterDefaultPrivileges parses `ALTER DEFAULT PRIVILEGES
+// [FOR ROLE|USER role_list] [IN SCHEMA schema_list] {GRANT|REVOKE} ...`
+// (gram.y's AlterDefaultPrivilegesStmt). The "default"/"privileges" tokens
+// have already been peeked (not consumed) by the caller; every remaining
+// token through the trailing ';' is captured and handed to
+// buildAlterDefaultPrivileges, mirroring how GRANT/REVOKE ON DATABASE/TYPE/
+// PARAMETER are parsed elsewhere in this file (capture-then-postprocess,
+// reusing splitTokRoles/splitTokPrivileges). M0110-0001 (DU-002 slice 438
+// follow-up).
+func (p *parser) parseAlterDefaultPrivileges(pos int) (Stmt, error) {
+	p.advance() // "default"
+	p.advance() // "privileges"
+	var toks []Token
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+			break
+		}
+		toks = append(toks, p.cur())
+		p.advance()
+	}
+	stmt, err := buildAlterDefaultPrivileges(toks)
+	if err != nil {
+		return nil, err
+	}
+	stmt.pos = pos
+	return stmt, nil
+}
+
 func (p *parser) parseAlter() (Stmt, error) {
 	t, err := p.expectKeyword(KwAlter)
 	if err != nil {
 		return nil, err
+	}
+	// ALTER DEFAULT PRIVILEGES [FOR ROLE|USER ...] [IN SCHEMA ...]
+	// {GRANT|REVOKE} ... — a distinct top-level form (gram.y's
+	// AlterDefaultPrivilegesStmt), not a relation/sequence/etc ALTER, so it is
+	// detected and dispatched before any of the object-keyword branches
+	// below. M0110-0001 (DU-002 slice 438 follow-up).
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault &&
+		strings.EqualFold(p.peek(1).Value, "privileges") {
+		return p.parseAlterDefaultPrivileges(t.Pos)
 	}
 	// ALTER SEQUENCE — consume options as a compat stub. M0097-0009.
 	if p.acceptIdentKeyword("sequence") {

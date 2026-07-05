@@ -156,7 +156,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateOpClassStmt, *parser.AlterOperatorSetStmt, *parser.AlterOpFamilyAddStmt,
 		*parser.AlterOpFamilyDropStmt,
 		*parser.CreateEventTriggerStmt, *parser.AlterEventTriggerStmt,
-		*parser.CreateAccessMethodStmt:
+		*parser.CreateAccessMethodStmt,
+		*parser.AlterDefaultPrivilegesStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
