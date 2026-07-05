@@ -4253,6 +4253,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table moody: %v", err)
 	}
 
+	// Slice 436: ALTER TYPE ... ADD VALUE [BEFORE|AFTER] and RENAME VALUE must
+	// be reflected in the dumped CREATE TYPE ... AS ENUM label list/order, even
+	// though pg_dump never re-emits the ALTER TYPE statements themselves.
+	// Verified against real PG 18.3: dumpEnumType (pg_dump.c) has no
+	// "--binary-upgrade" flag here, so getEnumLabels' `SELECT enumlabel FROM
+	// pg_enum WHERE enumtypid = $1 ORDER BY enumsortorder` is folded straight
+	// into one CREATE TYPE statement carrying the FINAL label set in
+	// enumsortorder order — a BEFORE/AFTER-inserted value's midpoint sort order
+	// (and a renamed label's new spelling) must show up in the right slot, with
+	// no separate ALTER TYPE trailer. goopg's catalog.AddEnumValueResult
+	// (internal/catalog/catalog.go) already computes float4 midpoint sort
+	// orders and splices the new EnumValue into et.Values at the right index,
+	// and pg_enum.VirtualRows projects enumsortorder from that slice — this is
+	// the first end-to-end pg_dump guard exercising that path (previously only
+	// unit-tested at the parser layer). 'meh' is inserted BEFORE 'ok' (an
+	// interior midpoint), 'ecstatic' AFTER 'happy' (the tail case), then 'meh'
+	// is renamed to 'blah' in place — matching real PG's observed dump order
+	// exactly: sad, blah, ok, happy, ecstatic.
+	if err := runSQLSimple(t, c, "ALTER TYPE public.mood ADD VALUE 'meh' BEFORE 'ok'"); err != nil {
+		t.Fatalf("alter type mood add value meh before ok: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE public.mood ADD VALUE 'ecstatic' AFTER 'happy'"); err != nil {
+		t.Fatalf("alter type mood add value ecstatic after happy: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE public.mood RENAME VALUE 'meh' TO 'blah'"); err != nil {
+		t.Fatalf("alter type mood rename value meh to blah: %v", err)
+	}
+
 	// Slice 243: a stand-alone composite type (`CREATE TYPE x AS (...)`) must
 	// round-trip. Slice 242 made the type visible to pg_dump's getTypes via the
 	// pg_type row (typtype='c'), but left typrelid=0 so dumpCompositeType found no
@@ -10925,6 +10953,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Slice 89: the enum ARRAY column renders via the enum's
 			// auto-generated array OID, not the text[] fallback.
 			"feelings public.mood[]",
+			// Slice 436: ADD VALUE 'meh' BEFORE 'ok' + ADD VALUE 'ecstatic' AFTER
+			// 'happy' + RENAME VALUE 'meh' TO 'blah' must land in enumsortorder
+			// order: sad, blah, ok, happy, ecstatic — verified against real PG 18.3.
+			"'blah'",
+			"'ecstatic'",
 		}
 		for _, sub := range enumDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -10944,6 +10977,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// typarray points back at it) and suppresses it. Slice 89.
 		if strings.Contains(res.Stdout, "CREATE TYPE public._mood") {
 			t.Errorf("pg_dump emitted the auto-generated enum array type as a separate CREATE TYPE (slice-89 isarray suppression regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 436 (asserted):** the enum's label ORDER must reflect the
+		// ADD VALUE BEFORE/AFTER + RENAME VALUE edits above, not just their
+		// presence. Real PG 18.3 dumps `sad, blah, ok, happy, ecstatic` — a
+		// wrong midpoint sort order (or a rename that lost its slot) would pass
+		// the substring-only check above but fail this exact-sequence check.
+		if !strings.Contains(res.Stdout,
+			"CREATE TYPE public.mood AS ENUM (\n    'sad',\n    'blah',\n    'ok',\n    'happy',\n    'ecstatic'\n);") {
+			t.Errorf("pg_dump mis-ordered the mood enum labels after ADD VALUE/RENAME VALUE (want sad, blah, ok, happy, ecstatic)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 243 (asserted):** a stand-alone composite type round-trips. PG's
 		// dumpCompositeType walks pg_type.typrelid → pg_class (relkind='c') →

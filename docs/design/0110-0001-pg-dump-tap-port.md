@@ -14505,3 +14505,88 @@ Gates: `go build ./...` clean; `go test -count=1 ./internal/config/...
 ./internal/parser/... ./internal/catalog/... ./internal/server/...
 ./internal/executor/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
 (Q12=2/Q13=33).
+
+## Slice 436: `ALTER TYPE ... ADD VALUE [BEFORE|AFTER]` + `RENAME VALUE` enum-label order (2026-07-06)
+
+The `mood` enum fixture (`CREATE TYPE public.mood AS ENUM ('sad', 'ok',
+'happy')`, slice 88/89) had never been mutated after creation, so the
+`ADD VALUE`/`RENAME VALUE` label-reordering path of `pg_enum.enumsortorder`
+had zero end-to-end pg_dump coverage — only parser-level unit tests existed
+(`internal/parser/m0097_0017_test.go`).
+
+Added three statements to the fixture, run in this order:
+
+```sql
+ALTER TYPE public.mood ADD VALUE 'meh' BEFORE 'ok';
+ALTER TYPE public.mood ADD VALUE 'ecstatic' AFTER 'happy';
+ALTER TYPE public.mood RENAME VALUE 'meh' TO 'blah';
+```
+
+**Verified against real PG 18.3 first** (`postgres/local_install/bin`, scratch
+`initdb`+`pg_ctl`+`psql`+`pg_dump` run against the identical DDL sequence):
+`pg_dump --schema-only` never re-emits `ALTER TYPE ... ADD VALUE`/`RENAME
+VALUE` for a plain (non `--binary-upgrade`) dump. `dumpEnumType`
+(`pg_dump.c`) instead reads `getEnumLabels`'s `SELECT enumlabel FROM pg_enum
+WHERE enumtypid = $1 ORDER BY enumsortorder` and folds the FINAL label set,
+in `enumsortorder` order, straight into one `CREATE TYPE ... AS ENUM (...)`
+statement. Real output for the sequence above:
+
+```
+CREATE TYPE public.mood AS ENUM (
+    'sad',
+    'blah',
+    'ok',
+    'happy',
+    'ecstatic'
+);
+```
+
+(`'meh'` was inserted at a BEFORE-midpoint sort order between `'sad'` and
+`'ok'`, then renamed in place to `'blah'` without moving; `'ecstatic'` was
+appended after `'happy'` via an AFTER-tail sort order.)
+
+**goopg already matches this byte-for-byte — no engine bug found.**
+`catalog.AddEnumValueResult` (`internal/catalog/catalog.go`, ~line 16442)
+already implements PG's exact algorithm: BEFORE/AFTER each compute a float4
+midpoint `SortOrder` between the two adjacent `EnumValue.SortOrder`s (falling
+back to `renumberEnumValues` — PG's `RenumberEnumType` equivalent — when
+float4 precision between two neighbors is exhausted), and splice the new
+`EnumValue` into `EnumType.Values` at the correct index rather than merely
+appending. `RenameEnumValue` (same file, ~line 16314) changes only the label
+in place, leaving `SortOrder` untouched — exactly matching the observed real
+output ('blah' stays where 'meh' was). `pg_enum`'s `VirtualRows` closure
+(same file, ~line 6425) projects `enumsortorder` straight from
+`EnumValue.SortOrder`, so the guest `SELECT ... ORDER BY enumsortorder`
+returns the fixture's final label order and `dumpEnumType`'s CREATE TYPE
+reproduces it verbatim.
+
+Added two assertions to the existing enum-round-trip block: a
+presence-only check for `'blah'`/`'ecstatic'` (mirroring the existing
+`'sad'`/`'ok'`/`'happy'` checks) and a new exact-sequence check for the
+literal `CREATE TYPE public.mood AS ENUM (\n    'sad',\n    'blah',\n
+'ok',\n    'happy',\n    'ecstatic'\n);` block — the latter is the guard that
+actually exercises the ordering logic; the substring-only checks alone would
+pass even with every label present but shuffled.
+
+Slice-selection due diligence — candidates surveyed and ruled out as *not*
+new gaps (all already covered or not applicable): `MATCH PARTIAL` foreign
+keys (real PG's own parser rejects `MATCH PARTIAL` as not yet implemented,
+so there is nothing to round-trip); `CREATE TABLE t (LIKE src INCLUDING
+…)` (PG expands the LIKE clause into plain columns/constraints at parse
+time — pg_dump has no LIKE-specific output path to exercise, and the
+resulting column/constraint shapes are already covered by the many
+per-feature slices that dump those same shapes directly). Two candidates
+were surfaced but deliberately deferred rather than bundled into this slice
+(see the 2026-07-06 M0119-0004 deferral-ledger row): `GRANT ... WITH GRANT
+OPTION GRANTED BY <role>` (grantor round-trip, not yet probed against real
+PG), and user-defined `CREATE TEXT SEARCH {PARSER,TEMPLATE,DICTIONARY,
+CONFIGURATION}` (only the empty-catalog-view case for built-ins is covered
+today, via slices 12-15; no slice yet exercises a user-defined TS object's
+own CREATE+dump).
+
+Gates: `go build ./...` clean; `go test -count=1 -run
+TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
+-count=1 ./internal/executor/... ./internal/planner/... ./internal/parser/...
+./internal/catalog/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33,
+run for due diligence though this slice touches only the pg_dump-facing test
+file — zero production-code changes).
