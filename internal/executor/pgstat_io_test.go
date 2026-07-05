@@ -352,3 +352,65 @@ func TestPgStatIOWalFsyncsRendered(t *testing.T) {
 		t.Errorf("fsync_time (col 18) = %q, want %q", found[18], "0.500")
 	}
 }
+
+// TestPgStatIOWritebackRendered pins the M0122-0003 pg_stat_io follow-up:
+// (client backend, relation, normal)'s writeback/writeback_time cells must
+// reflect storage.Pool's real sync_file_range(2) hint count/time (see
+// internal/storage/writeback.go) once backend_flush_after pages have been
+// written, not the previous hardcoded "0".
+func TestPgStatIOWritebackRendered(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	pool.SetBackendFlushAfter(1)
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 1, Fork: storage.MainFork}
+	// Fill both slots, then dirty and evict one via a 3rd PinNew: one
+	// dirty write crosses the threshold=1 backend writeback trigger.
+	s1, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.MarkDirty(s1)
+	pool.Unpin(s1)
+	s2, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s2)
+	s3, _, err := pool.PinNew(rel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.Unpin(s3)
+	if got := pool.BackendWritebackCount(); got == 0 {
+		t.Fatal("setup: BackendWritebackCount() = 0 after evicting a dirty page with backend_flush_after=1")
+	}
+	// 0.25ms of accumulated writeback wait — mirrors what
+	// OnBackendWritebackDone would add via a real
+	// track_io_timing-gated WaitEventEnd duration.
+	pool.AddBackendWritebackTimeNanos(250_000)
+
+	ctx := &Context{Pool: pool}
+	rows := fetchIOStatRows(ctx)
+	var found []string
+	for _, r := range rows {
+		if r[0] == "client backend" && r[1] == "relation" && r[2] == "normal" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no client backend/relation/normal row found")
+	}
+	if found[9] != "1" {
+		t.Errorf("writebacks (col 9) = %q, want %q", found[9], "1")
+	}
+	if found[10] != "0.250" {
+		t.Errorf("writeback_time (col 10) = %q, want %q", found[10], "0.250")
+	}
+}

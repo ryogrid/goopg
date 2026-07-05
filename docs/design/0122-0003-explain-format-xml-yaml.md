@@ -791,3 +791,106 @@ nested-node instrumentation residual.
 
 **Verification:** `go build ./...` clean; `go test ./internal/wal/...
 ./internal/executor/... ./internal/initdb/... ./internal/server/...` PASS.
+
+## `writeback` / `writeback_time` counters (later loop, 2026-07-05)
+
+Of the two `pg_stat_io` op counters the `fsyncs` section above left open
+(reuses/writebacks), `writebacks` is now real too. Unlike `reuses` (needs a
+`BufferAccessStrategy`-style ring buffer goopg does not implement anywhere
+— sequential-scan/VACUUM/COPY buffer reuse is architecturally absent), a
+writeback hint only needs (a) something that writes dirty pages — goopg
+already has three such call sites (`evictVictim`'s dirty-victim flush,
+`WriteDirtyPages` (bgwriter), `flushBatch`/`FlushAllPaced` (checkpointer))
+— and (b) a kernel write-behind hint to issue once enough pages accumulate,
+which Linux's `sync_file_range(2)` provides directly.
+
+**Design.** New `internal/storage/writeback.go`: `Pool.accountBackendWrite`
+/ `accountBgwriterWrite` / `accountCheckpointerWrite`, one call added right
+after each of the three write call sites above. Each maintains a running
+pending-page counter (`pendingBackendFlushBlocks` etc., `atomic.Int64`)
+against a configurable threshold (`backendFlushAfterBlocks` etc.,
+`atomic.Int32`, set via `SetBackendFlushAfter`/`SetBgwriterFlushAfter`/
+`SetCheckpointFlushAfter`); crossing the threshold resets the pending
+counter to 0 and calls the new `Manager.SyncFileRangeHint(rel)`
+(`internal/storage/smgr.go`), bracketed by a per-context `On*WritebackWait`/
+`On*WritebackDone` hook pair (mirrors `OnFlushWait`/`OnFlushDone`). A
+successful hint increments `shared{Backend,Bgwriter,Checkpoint}WritebackCount`;
+`ErrWritebackUnsupported` or any other error does not (no real IO happened,
+so nothing is counted — matches this doc's running "honest zero, not
+fabricated" rule). Three GUCs — `checkpoint_flush_after` (default 32),
+`bgwriter_flush_after` (default 64), `backend_flush_after` (default 0,
+"never enabled by default") — mirror upstream's exact defaults
+(`postgres/src/include/pg_config_manual.h`'s `DEFAULT_CHECKPOINT_FLUSH_AFTER`/
+`DEFAULT_BGWRITER_FLUSH_AFTER`/`DEFAULT_BACKEND_FLUSH_AFTER`, 0-256 range
+mirroring `WRITEBACK_MAX_PENDING_FLUSHES`=256), threaded through
+`initdb.OpenOptions`→`cmd/goopg/main.go`'s `intGUC` the same way
+`BgwriterMaxPages` already is (boot-time only, like most of this codebase's
+storage-tuning GUCs — no SIGHUP live-reload wiring in this slice).
+
+`Manager.SyncFileRangeHint` (`internal/storage/smgr.go`) delegates to a new
+platform-split `syncFileRangeHint(f *os.File)`:
+`internal/storage/writeback_linux.go` calls the real
+`unix.SyncFileRange(fd, 0, 0, SYNC_FILE_RANGE_WRITE)` (offset/nbytes 0 means
+"the whole file to current EOF"; `SYNC_FILE_RANGE_WRITE` alone starts
+async writeback without waiting or promising durability — `fsync` still
+owns that, exactly matching upstream's `pg_flush_data` contract);
+`internal/storage/writeback_other.go` (`!linux`) returns
+`ErrWritebackUnsupported` unconditionally, mirroring upstream's behaviour
+on platforms without `HAVE_SYNC_FILE_RANGE` (writeback is simply
+unavailable, not approximated by a full `fsync`, which would silently
+change the durability/blocking contract this hint deliberately lacks).
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` wires the three new
+counter pairs into the `writeback`/`writeback_time` cells of three rows:
+`(client backend, relation, normal)`, `(background writer, relation,
+normal)`, and `(checkpointer, relation, normal)` — the first real
+instrumentation for the latter two rows, which previously rendered all
+zeros for every column.
+
+**Deliberate simplifications vs. upstream (recorded here + deferral
+ledger, not hidden):**
+1. Upstream's `WritebackContext` coalesces up to `WRITEBACK_MAX_PENDING_FLUSHES`
+   (256) per-relation-segment block ranges before issuing one
+   `sync_file_range` per range; goopg tracks one running page count per
+   context and, on threshold-crossing, issues a single hint over
+   *whichever relation was just written*, not a coalesced multi-relation
+   batch. Real kernel behaviour, real GUC-driven cadence, simpler
+   bookkeeping.
+2. `backend_flush_after` is `PGC_USERSET` upstream (a per-session GUC);
+   goopg applies it as one process-wide threshold (`initdb.Open` wires the
+   boot-time GUC value only). A `SET backend_flush_after` in one session
+   would affect every session's accounting.
+3. bgwriter/checkpointer `writeback_time` gating gates on the boot-time
+   `TrackIOTiming` value with a plain `time.Now()`/`time.Since` pair
+   (`internal/initdb/open.go`), not the `ActivityRegistry` wait-event
+   clock the backend path uses — these two singleton background
+   goroutines have no registered `activity` background slot yet (unlike
+   the WAL writer's `walProcNum`), so their writeback wait never surfaces
+   in `pg_stat_activity`, only in `pg_stat_io`.
+4. The background writer / checkpointer rows' own `writes`/`write_bytes`/
+   `write_time` cells are still an honest 0 — goopg's only real write
+   counter (`sharedWrittenCount`/`sharedWriteTimeNanos`) is deliberately
+   backend-scoped (see this doc's earlier `dirtied=`/`written=` section);
+   attributing bgwriter/checkpointer's own writes to their own rows is a
+   smaller, separate residual not required for writeback's own threshold
+   accounting.
+
+**Tests:** `internal/storage/writeback_test.go` —
+`TestPoolBackendWritebackTriggersAtThreshold` /
+`TestPoolBgwriterWritebackTriggersAtThreshold` /
+`TestPoolCheckpointerWritebackTriggersAtThreshold` (each context's
+threshold-crossing triggers a real writeback via a live temp-file-backed
+`Manager`), `TestSyncFileRangeHintOnRealFile` (raw platform-hook smoke
+test). `internal/executor/pgstat_io_test.go` —
+`TestPgStatIOWritebackRendered` (end-to-end rendered-cell assertion,
+mirrors `TestPgStatIOExtendTimeRendered`).
+
+Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
+ANALYZE (planning-time buffers), local/temp-buffer terms, `pg_stat_io`'s
+`reuses` op counter (needs the `BufferAccessStrategy` ring buffer), the
+`CTEDMLPrefix` nested-node instrumentation residual, and the four
+simplifications named above.
+
+**Verification:** `go build ./...` clean; `go test ./internal/storage/...
+./internal/executor/... ./internal/config/...` PASS (see also the
+initdb/cmd build check run this loop).

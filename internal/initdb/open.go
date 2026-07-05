@@ -184,6 +184,18 @@ type OpenOptions struct {
 	// bgwriter_lru_maxpages GUC.
 	BgwriterMaxPages int
 
+	// CheckpointFlushAfter / BgwriterFlushAfter / BackendFlushAfter set
+	// each context's pg_stat_io writeback threshold, in BLCKSZ pages (0
+	// disables writeback for that context — see storage/writeback.go).
+	// Mirror upstream's checkpoint_flush_after / bgwriter_flush_after /
+	// backend_flush_after GUCs; like BgwriterMaxPages above, a caller
+	// that leaves these at the Go zero value gets writeback disabled
+	// (cmd/goopg always passes the live GUC value, whose own registered
+	// default is checkpoint=32/bgwriter=64/backend=0).
+	CheckpointFlushAfter int
+	BgwriterFlushAfter   int
+	BackendFlushAfter    int
+
 	// TrackIOTiming gates the per-I/O activity.LookupGoroutine
 	// wait-event hooks (BufferPin / DataFileRead / Write / Extend
 	// / Sync / AIO). Default false (matches upstream PG's
@@ -654,6 +666,54 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			pool.AddExtendTimeNanos(int64(d))
 		}
 	}
+	// writeback's OnFlushWait/OnFlushDone analogues, one per context
+	// (M0122-0003 pg_stat_io follow-up: writeback/writeback_time). The
+	// backend context is gated the same per-goroutine way as
+	// OnFlushWait/OnFlushDone above. bgwriter/checkpointer are singleton
+	// background goroutines with no per-session SET semantics to look
+	// up (unlike a client backend, a background process only ever sees
+	// the config-file GUC value), so their timing gate is simply the
+	// boot-time TrackIOTiming value; a plain time.Now()/time.Since pair
+	// stands in for the activity-registry wait-event clock those two
+	// contexts don't have a registered background slot for yet (a
+	// smaller, separately-tracked residual — see deferral ledger).
+	pool.OnBackendWritebackWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnBackendWritebackDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddBackendWritebackTimeNanos(int64(d))
+		}
+	}
+	var bgwriterWritebackStart, checkpointWritebackStart time.Time
+	pool.OnBgwriterWritebackWait = func() {
+		if opts.TrackIOTiming {
+			bgwriterWritebackStart = time.Now()
+		}
+	}
+	pool.OnBgwriterWritebackDone = func() {
+		if opts.TrackIOTiming && !bgwriterWritebackStart.IsZero() {
+			pool.AddBgwriterWritebackTimeNanos(int64(time.Since(bgwriterWritebackStart)))
+			bgwriterWritebackStart = time.Time{}
+		}
+	}
+	pool.OnCheckpointerWritebackWait = func() {
+		if opts.TrackIOTiming {
+			checkpointWritebackStart = time.Now()
+		}
+	}
+	pool.OnCheckpointerWritebackDone = func() {
+		if opts.TrackIOTiming && !checkpointWritebackStart.IsZero() {
+			pool.AddCheckpointWritebackTimeNanos(int64(time.Since(checkpointWritebackStart)))
+			checkpointWritebackStart = time.Time{}
+		}
+	}
+	pool.SetCheckpointFlushAfter(opts.CheckpointFlushAfter)
+	pool.SetBgwriterFlushAfter(opts.BgwriterFlushAfter)
+	pool.SetBackendFlushAfter(opts.BackendFlushAfter)
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}

@@ -9151,6 +9151,57 @@ func pgTypeofDisplayName(t catalog.Type) string {
 	}
 }
 
+// foldPgCollationFor computes the plan-time-constant result of
+// pg_collation_for(arg), mirroring postgres/src/backend/utils/adt/misc.c's
+// pg_collation_for: typeid via the static argument type, collid via the
+// collation actually assigned to the argument. goopg has no per-expression
+// collation-derivation pass (parse_collate.c's assign_expr_collations is not
+// implemented — see M0122-0005 deferral ledger), so this only resolves the
+// two cases goopg CAN determine precisely — an explicit `expr COLLATE name`
+// and a bare untyped literal (no collation) — and otherwise falls back to
+// the database default collation for collatable types. A column with an
+// explicit COLLATE clause that isn't restated inline still reports "default"
+// rather than its true declared collation (deferred: catalog.Column.Collation
+// is dropped during planning, never reaching ColumnRef).
+// Returns (result-expr, nil) on success, or (nil, *PlanError) for the
+// ERRCODE_DATATYPE_MISMATCH (42804) case PG raises for non-collatable types.
+func foldPgCollationFor(arg Expr, cat catalog.Catalog, pos int) (Expr, *PlanError) {
+	// `expr COLLATE name` states its own collation unambiguously — no need to
+	// approximate.
+	if ce, ok := arg.(*CollateExpr); ok {
+		return &StringConst{Value: catalog.QuoteCollationIdent(ce.CollationName)}, nil
+	}
+	// A bare untyped string literal (no cast, no COLLATE) carries PostgreSQL's
+	// UNKNOWNOID pseudo-type, which has no collation. PG returns NULL here
+	// (verified against postgres/src/test/regress/expected/collate.out), not
+	// an error — UNKNOWNOID is explicitly exempted from the type-mismatch
+	// check in pg_collation_for's C implementation.
+	if _, ok := arg.(*StringConst); ok {
+		return &NullConst{pos: pos}, nil
+	}
+	baseName := strings.ToLower(exprType(arg).Name)
+	// A domain over a collatable base type is exactly as collatable as its
+	// base type (PostgreSQL's type_is_collatable follows typbasetype).
+	if cat != nil {
+		if dom, ok := cat.LookupDomain(exprType(arg).Name); ok {
+			baseName = strings.ToLower(dom.Base.Name)
+		}
+	}
+	switch baseName {
+	case "text", "varchar", "character varying", "bpchar", "character":
+		// Every collatable base type goopg models seeds pg_type.typcollation
+		// as "default" (postgres/src/include/catalog/pg_type.dat).
+		return &StringConst{Value: "default"}, nil
+	case "name":
+		// pg_type.dat pins name's typcollation to "C" specifically.
+		return &StringConst{Value: "C"}, nil
+	case "unknown", "":
+		return &NullConst{pos: pos}, nil
+	}
+	return nil, &PlanError{Pos: pos, Code: "42804", Message: fmt.Sprintf(
+		"collations are not supported by type %s", pgTypeofDisplayName(catalog.Type{Name: baseName}))}
+}
+
 // compatibleTypeRank returns a numeric rank for anycompatible type resolution.
 // Higher rank wins (numeric > float8 > float4 > int8 > int4 > int2 > text).
 func compatibleTypeRank(name string) int {
@@ -10256,6 +10307,23 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			}
 			typName := pgTypeofDisplayName(exprType(arg))
 			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+		}
+		// pg_collation_for(expr): PostgreSQL resolves the collation OID during
+		// parse analysis (exprCollation), so the result is a static property of
+		// the argument's declared type/collation, never row data. Fold it here
+		// for the same reason as pg_typeof above — goopg's executor has no
+		// per-row expression-collation model to consult. Oracle:
+		// postgres/src/backend/utils/adt/misc.c pg_collation_for. M0122-0005.
+		if strings.ToLower(x.Name.String()) == "pg_collation_for" && len(x.Args) == 1 {
+			arg, err := resolveExpr(x.Args[0], ctx)
+			if err != nil {
+				return nil, err
+			}
+			result, perr := foldPgCollationFor(arg, ctx.cat, x.Pos())
+			if perr != nil {
+				return nil, perr
+			}
+			return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {

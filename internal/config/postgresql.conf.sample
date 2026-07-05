@@ -61,6 +61,8 @@
 #bgwriter_lru_maxpages = 100            # 0-1000 max buffers written/round;
                                         # 0 disables background writing
                                         # (change requires restart)
+#bgwriter_flush_after = 64              # 0-256 pages; 0 disables writeback
+                                        # (SIGHUP to apply)
 
 # - Asynchronous Behavior -
 
@@ -72,6 +74,7 @@
                                         # (change requires restart)
 #io_max_concurrency = 0                 # 0-1024; 0 = let the method decide
                                         # (change requires restart)
+#backend_flush_after = 0                # 0-256 pages; 0 disables writeback (default)
 #max_parallel_workers_per_gather = 2    # 0-1024; taken into account by SET-only;
                                         # planner currently ignores it
 #min_parallel_table_scan_size = 8388608 # 0-715827882 kB
@@ -111,6 +114,8 @@
 #max_wal_size = 1024                    # 2-2147483647 MB
                                         # (SIGHUP to apply)
 #min_wal_size = 80                      # 2-2147483647 MB
+                                        # (SIGHUP to apply)
+#checkpoint_flush_after = 32            # 0-256 pages; 0 disables writeback
                                         # (SIGHUP to apply)
 
 # - Archive Recovery -

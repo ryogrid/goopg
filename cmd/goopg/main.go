@@ -418,6 +418,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
 		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
 		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
+		checkpointFlushAfter := intGUC(registry, "checkpoint_flush_after", 32)
+		bgwriterFlushAfter := intGUC(registry, "bgwriter_flush_after", 64)
+		backendFlushAfter := intGUC(registry, "backend_flush_after", 0)
 		aioMethod := stringGUC(registry, "io_method", "")
 		aioWorkers := intGUC(registry, "io_workers", 0)
 		aioMax := intGUC(registry, "io_max_concurrency", 0)
@@ -440,6 +443,9 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
+			CheckpointFlushAfter:  checkpointFlushAfter,
+			BgwriterFlushAfter:    bgwriterFlushAfter,
+			BackendFlushAfter:     backendFlushAfter,
 			AIOMethod:             aioMethod,
 			AIOWorkers:            aioWorkers,
 			AIOMaxConcurrency:     aioMax,

@@ -34,16 +34,17 @@ every clean, green (build + pre-commit) checkpoint.
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
 BUFFERS TEXT+JSON/XML/YAML rendering, `pg_stat_io` row shape + real
 reads/read_bytes/read_time/writes/write_bytes/write_time/extend_time/
-hits/evictions/extends/extend_bytes/fsyncs/fsync_time, `track_io_timing`
-runtime SET, and EXPLAIN's `I/O Timings` line have all landed; see the
-M0122-0003 line item for detail. Remaining sub-items: `EXPLAIN (BUFFERS)`
-without ANALYZE (planning-time buffers), local/temp-buffer terms, the 2
-remaining `pg_stat_io` op counters (reuses/writebacks — each needs a new
-storage-engine mechanism goopg doesn't have, see deferral ledger 2026-07-05
-row), a `CTEDMLPrefix` nested-node instrumentation residual. Pick up one of
-those next, or continue the M0119-0004 pg_dump catalog-view
-parity battery / next
-unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
+hits/evictions/extends/extend_bytes/fsyncs/fsync_time/writeback/
+writeback_time, `track_io_timing` runtime SET, and EXPLAIN's `I/O Timings`
+line have all landed; see the M0122-0003 line item for detail. Remaining
+sub-items: `EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers),
+local/temp-buffer terms, the last `pg_stat_io` op counter (`reuses` — needs
+a `BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
+doesn't have), a `CTEDMLPrefix` nested-node instrumentation residual, plus
+the 4 named writeback simplifications-vs-upstream (see deferral ledger
+2026-07-05 row). Pick up one of those next, or continue the M0119-0004
+pg_dump catalog-view parity battery / next unresolved DU-002 slice from
+`.ralph/deferral_ledger.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -385,13 +386,37 @@ mirroring M0119's ledger `status` column.
       `TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero`,
       `TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff`. Design:
       `docs/design/0122-0003-explain-format-xml-yaml.md` updated in place.
-      Still open: the remaining 3 op counters (reuses/writebacks/fsyncs +
-      their bytes/time columns) — each needs a genuinely new counting
-      mechanism (strategy-ring reuse, bgwriter/checkpointer-scoped writeback
-      attribution, fsync call-site instrumentation respectively), not a
-      mechanical extension of the eviction/extend pattern; also
-      `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time buffers) and
-      local/temp-buffer terms.
+      `fsyncs`/`fsync_time` **done** (2026-07-05, later loop): `wal.Writer`
+      gained real `FsyncCount()`/`FsyncTimeNanos()` (incremented once per
+      real `fdatasync(2)` call in `state.flushUpTo`), wired into a new
+      `(client backend, wal, normal)` `fetchIOStatRows` cell.
+      `writeback`/`writeback_time` **done** (2026-07-05, later loop): new
+      `internal/storage/writeback.go` issues a real `sync_file_range(2)`
+      hint (`internal/storage/writeback_linux.go`, `!linux` stub returns
+      `ErrWritebackUnsupported`) once a context's running write count
+      crosses its new `checkpoint_flush_after`(32)/`bgwriter_flush_after`(64)/
+      `backend_flush_after`(0) GUC threshold (upstream's exact defaults),
+      called from `evictVictim` (backend)/`WriteDirtyPages` (bgwriter)/
+      `flushBatch`+`FlushAllPaced` (checkpointer); `fetchIOStatRows` renders
+      it into 3 rows — (client backend|background writer|checkpointer,
+      relation, normal) — the first real instrumentation for the latter
+      two rows. Simplifications recorded (single-relation-per-hint not
+      upstream's coalesced ranges, `backend_flush_after` process-wide not
+      per-session, bgwriter/checkpointer timing gated on boot-time
+      `track_io_timing` via plain `time.Since` not the activity-registry
+      wait-event clock, bgwriter/checkpointer `writes`/`write_time` still
+      an honest 0). Tests: `internal/storage/writeback_test.go` (3
+      threshold-crossing tests + 1 raw-hook smoke test),
+      `internal/executor/pgstat_io_test.go`'s
+      `TestPgStatIOWritebackRendered`. Design: `docs/design/
+      0122-0003-explain-format-xml-yaml.md`'s new "`writeback` /
+      `writeback_time` counters" section.
+      Still open: the remaining op counter (`reuses` + its bytes/time
+      columns) needs a genuinely new counting mechanism (a
+      `BufferAccessStrategy`-style ring buffer goopg does not implement);
+      also `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time
+      buffers), local/temp-buffer terms, and the `CTEDMLPrefix` nested-node
+      instrumentation residual.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
       **`fsyncs`/`fsync_time` done (2026-07-05, this loop):** `wal.Writer`
       gains real `FsyncCount()`/`FsyncTimeNanos()` — count increments once

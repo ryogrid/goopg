@@ -6558,10 +6558,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewStringDatum(def + ";"), nil
 	case "pg_collation_for":
-		// Return "POSIX" to match the C/POSIX locale used in regression tests.
-		// PG regression databases are created with --locale=C, so text values
-		// have POSIX collation. M0097-0115.
-		return NewStringDatum(`"POSIX"`), nil
+		if len(x.Args) == 1 {
+			switch arg := x.Args[0].(type) {
+			case *planner.StringConst:
+				// Fast path: the planner's foldPgCollationFor already computed the
+				// final answer at plan time (mirrors pg_typeof's fold). M0122-0005.
+				return NewStringDatum(arg.Value), nil
+			case *planner.NullConst:
+				return NullDatum, nil
+			case *planner.CollateExpr:
+				// Runtime path (reached only if some resolver other than the main
+				// planner.resolveExpr — e.g. plpgsql's expression compiler —
+				// produced this call without going through the plan-time fold):
+				// an explicit `expr COLLATE name` states its own collation.
+				return NewStringDatum(catalog.QuoteCollationIdent(arg.CollationName)), nil
+			}
+			// Runtime path, no static fold available: approximate from the
+			// evaluated Datum kind. A collatable (string) result defaults to
+			// "default"; anything else is conservatively reported as having no
+			// determinable collation rather than guessing a name PG wouldn't use.
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if v.Kind == KindString {
+				return NewStringDatum("default"), nil
+			}
+		}
+		return NullDatum, nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":

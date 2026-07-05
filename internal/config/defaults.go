@@ -406,6 +406,36 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// checkpoint_flush_after / bgwriter_flush_after / backend_flush_after
+	// set the writeback threshold (in BLCKSZ pages) for the checkpointer /
+	// bgwriter / an individual backend's own dirty-victim-eviction writes;
+	// once a context's running total crosses its threshold, goopg issues
+	// a real sync_file_range(2) write-behind hint (0 disables it — see
+	// storage/writeback.go, M0122-0003 pg_stat_io writeback/writeback_time
+	// follow-up). Defaults (32/64/0) and max (256) mirror upstream's
+	// DEFAULT_CHECKPOINT_FLUSH_AFTER/DEFAULT_BGWRITER_FLUSH_AFTER/
+	// DEFAULT_BACKEND_FLUSH_AFTER and WRITEBACK_MAX_PENDING_FLUSHES
+	// (pg_config_manual.h). backend_flush_after is PGC_USERSET upstream
+	// (per-session); goopg applies it as a single process-wide threshold
+	// instead (see deferral ledger).
+	r.MustRegister(NewVariable(Variable{
+		Name: "checkpoint_flush_after", Type: TypeInt, BootVal: "32",
+		MinVal: 0, MaxVal: 256,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "bgwriter_flush_after", Type: TypeInt, BootVal: "64",
+		MinVal: 0, MaxVal: 256,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "backend_flush_after", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 256,
+		Context: ContextUserset,
+	}))
+
 	// bgwriter_lru_maxpages caps how many dirty pages the background
 	// writer flushes per tick. 0 disables the bgwriter. Default 100
 	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).

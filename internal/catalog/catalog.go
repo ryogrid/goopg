@@ -15470,6 +15470,10 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 	return out
 }
 
+// QuoteCollationIdent is the exported form of quoteCollationIdent, for callers
+// outside this package (e.g. the planner's pg_collation_for fold, M0122-0005).
+func QuoteCollationIdent(s string) string { return quoteCollationIdent(s) }
+
 // BuildIndexDef reconstructs the CREATE INDEX DDL string for an index.
 // Used by pg_indexes.indexdef and pg_get_indexdef(). M0097-0023.
 // quoteCollationIdent renders a collation name the way ruleutils.c
