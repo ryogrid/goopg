@@ -216,6 +216,54 @@ Both are cross-cutting FROM-list/target-list resolution gaps shared by every
 FROM-clause SRF, not specific to `regexp_matches` — out of scope for this
 loop's bounded pick; see `.ralph/deferral_ledger.md` for resume points.
 
+**Follow-up (2026-07-06, later loop): comma-join / LATERAL correlation gap
+(item 2 above) fixed.** Root cause was *not* that `ctx.OuterRows` is unwired
+for the top-level multi-item `FROM a, b` nested loop — `joinOp.openLateral`
+(`internal/executor/operators_join_agg.go`) already pushes the current left
+row onto `ctx.OuterRows` for exactly this case, and `fromUnnestOp`/
+`fromRegexpMatchesOp` already read `ctx.OuterRows[len-1]` as their "outer
+row" when evaluating their argument expressions. The actual bug was one
+layer up: `internal/planner/planner.go`'s `nodeReferencesOuter` — which
+decides whether the wrapping `Join` even routes through `openLateral` at
+all — had a hardcoded switch covering only `*PgGetPublicationTables`,
+`*VerifyHeapam`, and `*PgGetSequenceData`. `*FromUnnest` and
+`*FromRegexpMatches` fell through to the generic fallback,
+`planHasOuterRef`, which only detects `*OuterColumnRef` nodes (the
+*different* correlation mechanism used by nested-subquery correlation, e.g.
+`pg_options_to_table`). But `planFromUnnest`/`planFromRegexpMatches` resolve
+a lateral-sibling argument as a plain `*ColumnRef` (matching how
+`fromUnnestOp`/`fromRegexpMatchesOp` read it), so the generic fallback never
+saw it: the join silently took the "materialise both sides once,
+non-lateral" fast path, `ctx.OuterRows` stayed empty for the entire scan,
+and evaluating the SRF's arg against a nil outer row produced exactly the
+reported `XX000: column ref arr/1 on nil slot`.
+
+Fix: added `*FromUnnest` / `*FromRegexpMatches` cases to
+`nodeReferencesOuter` (checking `ArrExpr`/`ArrExprs` and
+`StringExpr`/`PatternExpr`/`FlagsExpr` respectively via the existing
+`exprContainsColumnRef` helper — the same test the `PgGetSequenceData` case
+already used), plus a `*OrdinalityWrap` case that unwraps to `x.Child`
+before testing, so `WITH ORDINALITY` doesn't defeat detection. No executor
+change was needed — both operators' `ctx.OuterRows` read path and
+`joinOp.openLateral`'s push/pop were already correct; only the routing
+decision was missing the two node types.
+
+Tests: `internal/executor/from_srf_lateral_correlation_test.go` —
+`TestFromSRFLateralCorrelation_UnnestCommaJoin` (plain comma-join and
+explicit `LATERAL`), `TestFromSRFLateralCorrelation_RegexpMatchesCommaJoin`,
+`TestFromSRFLateralCorrelation_UnnestWithOrdinality`. All three reproduce
+the exact `XX000` error against pre-fix code (verified by stashing the
+`planner.go` change and re-running) and pass after the fix.
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/analyzer/... ./internal/parser/...` PASS
+(no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2 rows, Q13=33
+rows).
+
+Item 1 (`WITH ORDINALITY AS t(m, n)` explicit dual-column naming) was
+already fixed by a separate, later loop — see the M0122-0004 ledger row
+(`TestAnalyzeWithOrdinalityNamedColumn`) — and is unrelated to this fix.
+
 ## Deferred / out of scope
 
 - The `fork` argument's `fsm`/`vm`/`init` cases are wired through correctly

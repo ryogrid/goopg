@@ -1781,6 +1781,33 @@ func nodeReferencesOuter(n Node) bool {
 			}
 		}
 		return false
+	case *FromUnnest:
+		// `FROM tbl, unnest(tbl.arr_col) AS t(m)` (or the explicit-LATERAL
+		// spelling): the array argument resolves to a plain *ColumnRef against
+		// the left sibling's schema (fromUnnestOp.Open reads ctx.OuterRows
+		// itself, same driver as openLateral's general per-outer-row path —
+		// unlike PgGetPublicationTables/VerifyHeapam/PgGetSequenceData above,
+		// which use the separate BindLateralOuter mechanism). Ledger row
+		// 2026-07-04 (M0122-0002 FROM-clause follow-up).
+		if exprContainsColumnRef(x.ArrExpr) {
+			return true
+		}
+		for _, a := range x.ArrExprs {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
+	case *FromRegexpMatches:
+		// Same driver as *FromUnnest above (fromRegexpMatchesOp.Open also
+		// reads ctx.OuterRows directly).
+		return exprContainsColumnRef(x.StringExpr) ||
+			exprContainsColumnRef(x.PatternExpr) ||
+			exprContainsColumnRef(x.FlagsExpr)
+	case *OrdinalityWrap:
+		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
+		// correlated argument is still detected under the wrapper.
+		return nodeReferencesOuter(x.Child)
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
