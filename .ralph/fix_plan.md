@@ -143,6 +143,29 @@ derives ownership from `cfgowner` at CREATE time) and the
 SEARCH CONFIGURATION`. Next candidate: pick up the CREATE COPY form, or
 survey the deferral ledger for a fresh DU-002 slice.
 
+**2026-07-06 (final loop, this one):** landed `CREATE TEXT SEARCH
+CONFIGURATION name (COPY = source_config)` — the last named-and-deferred
+sub-form of `CREATE TEXT SEARCH CONFIGURATION`. Mutually exclusive with
+`PARSER` (42601, mirroring `DefineTSConfiguration`'s own
+`ERRCODE_SYNTAX_ERROR`); resolves the source (42704 if unresolvable via
+`im.ListUserTSConfigs()`), takes its parser, and copies its full mapping list
+via the existing `AddTSConfigMapping`/`EncodeAddTSConfigMapping` path (no new
+WAL record kind needed — restart persistence falls out for free).
+`internal/parser/ast.go`'s `CompatNoopStmt` gained `TSConfigCopySource`;
+`internal/parser/ddl.go` gained a `copy` option-key case; `internal/executor/
+operators_ddl.go`'s `"text search configuration"` case branches on it. Test:
+`internal/executor/tsconfig_copy_test.go` (`TestCreateTSConfigCopy`). See the
+`0110-0001` design doc's new "Slice 446 follow-up: `COPY = source_config`
+form" section. **This closes every option named in `gram.y`'s `DefineStmt`
+production for `OBJECT_TSCONFIGURATION`** — only `OWNER TO` on `ALTER TEXT
+SEARCH CONFIGURATION` remains deferred (no-op, considered fine per the prior
+row's rationale). The entire `CREATE`/`ALTER TEXT SEARCH
+CONFIGURATION`/`DICTIONARY` DU-002 slice 437/446 family is now closed. Next
+candidate: survey the deferral ledger for a fresh open (`status = -`) row —
+the `regexp_matches` multi-row SRF-expansion gap (2026-07-04 row, `'g'`-flag
+set-returning semantics) or the M0110-0001 pg_dump 002-010 broader
+per-database catalog-isolation blocker are both plausible next picks.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

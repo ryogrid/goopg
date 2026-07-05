@@ -15635,19 +15635,39 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// (PARSER = parser_name)) so it round-trips through pg_dump (pg_ts_config
 		// view → getTSConfigurations / dumpTSConfig). DU-002 slice 446.
 		//
-		// PARSER is required, mirroring DefineTSConfiguration's own
-		// ERRCODE_INVALID_OBJECT_DEFINITION check (tsearchcmds.c) — goopg only
+		// Either PARSER or COPY must be given (never both — mirrors
+		// DefineTSConfiguration's ERRCODE_SYNTAX_ERROR check, tsearchcmds.c). The
+		// COPY = source_config form (DU-002 slice 446 follow-up) resolves an
+		// existing configuration, takes its parser, and copies its
+		// pg_ts_config_map rows into the new one; the bare PARSER form leaves
+		// mappings empty (added afterward via ALTER ... ADD MAPPING). goopg only
 		// resolves the one real built-in parser (BuiltinTSParserOID); CREATE TEXT
-		// SEARCH PARSER stays unimplemented (a C-function-loading feature with no
-		// analog here), so no user-defined parser can ever be named. Unlike real
-		// PG's `CONFIGURATION = source_config` COPY form (which prepopulates the
-		// mapping from an existing configuration's pg_ts_config_map rows), only
-		// the bare `PARSER = ...` form is supported; mappings are always added
-		// afterward via ALTER ... ADD MAPPING.
+		// SEARCH PARSER is unimplemented (a C-function-loading feature with no
+		// analog here), so no user-defined parser can ever be named.
 		parserName := strings.ToLower(s.TSConfigParser.Name)
-		parserOID, ok := catalog.BuiltinTSParserOID[parserName]
-		if !ok || parserName == "" {
-			return &ExecError{Code: "42704", Message: "text search parser is required"}
+		copySourceName := s.TSConfigCopySource.Name
+		if parserName != "" && copySourceName != "" {
+			return &ExecError{Code: "42601", Message: "cannot specify both PARSER and COPY options"}
+		}
+		var parserOID uint32
+		var copySource *catalog.UserTSConfig
+		if copySourceName != "" {
+			for _, existing := range im.ListUserTSConfigs() {
+				if strings.EqualFold(existing.Name, copySourceName) {
+					copySource = existing
+					break
+				}
+			}
+			if copySource == nil {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", copySourceName)}
+			}
+			parserOID = copySource.Parser
+		} else {
+			oid, ok := catalog.BuiltinTSParserOID[parserName]
+			if !ok || parserName == "" {
+				return &ExecError{Code: "42704", Message: "text search parser is required"}
+			}
+			parserOID = oid
 		}
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 		schema := s.ObjName.Schema
@@ -15671,6 +15691,24 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if o.ctx.WAL != nil {
 			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSConfig(uc.Name, schema, uc.OID, uc.Owner, uc.Parser)); werr != nil {
 				return fmt.Errorf("wal create-tsconfig: %w", werr)
+			}
+		}
+		if copySource != nil {
+			// Copy the source configuration's token-type→dictionary mappings,
+			// mirroring DefineTSConfiguration's post-insert pg_ts_config_map
+			// copy loop (tsearchcmds.c). Each mapping is applied and WAL-logged
+			// through the same AddTSConfigMapping/EncodeAddTSConfigMapping path
+			// ALTER ... ADD MAPPING uses, so restart replay needs no new WAL
+			// record kind.
+			for _, m := range copySource.Mappings {
+				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs); uc2 == nil || dup {
+					return fmt.Errorf("internal error: copying tsconfig mapping %q for new configuration %q", m.TokenType, uc.Name)
+				}
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs)); werr != nil {
+						return fmt.Errorf("wal add-tsconfig-mapping (copy): %w", werr)
+					}
+				}
 			}
 		}
 	case "transform":

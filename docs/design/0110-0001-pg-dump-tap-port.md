@@ -15167,3 +15167,88 @@ Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
 ./internal/catalog/... ./internal/parser/... ./internal/wal/...
 ./internal/initdb/...` PASS (see below for the full run); `scripts/
 tpch-spotcheck.sh` PASS; pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `CREATE TEXT SEARCH CONFIGURATION` `COPY = source_config` form (2026-07-06)
+
+Closes the last named-and-deferred sub-form of `CREATE TEXT SEARCH
+CONFIGURATION`: real PG's `DefineTSConfiguration` (`tsearchcmds.c`) accepts
+either a bare `PARSER = parser_name` clause or a `COPY = source_config`
+clause, never both. `COPY` takes the source configuration's `cfgparser` and
+copies its entire `pg_ts_config_map` mapping list into the new row; goopg
+previously tokenized and silently discarded the `copy` key (only `template`
+and `parser` were special-cased in the option-parsing loop), so a
+`COPY = ...` clause always produced an empty-mapping configuration with no
+error.
+
+`DefineTSConfiguration`'s validation order confirmed by reading
+`tsearchcmds.c`: `ERRCODE_SYNTAX_ERROR` (`"cannot specify both PARSER and
+COPY options"`) if both `prsOid` and `sourceOid` resolve; otherwise, if a
+source is given, its `cfgparser` becomes the new row's parser (the `PARSER`
+required-check is skipped entirely in that branch); the mapping-copy loop
+scans `pg_ts_config_map` for the source OID and inserts one row per
+`(token type, dictionary)` pair — which is exactly what
+`ALTER ... ADD MAPPING FOR t1, t2 WITH d1, d2` already does per token type in
+goopg's model (`TSConfigMapping{TokenType, DictOIDs}` — one entry per token
+type holding the whole ordered dictionary list), so no new copy machinery was
+needed beyond re-invoking the same `AddTSConfigMapping` catalog call and
+`EncodeAddTSConfigMapping` WAL record `execAlterTSConfigAddMapping` already
+uses.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `CompatNoopStmt` gained `TSConfigCopySource
+  ObjectName`, alongside the existing `TSConfigParser`.
+- `internal/parser/ddl.go`: the CREATE TEXT SEARCH CONFIGURATION option loop
+  gained a `key == "copy"` case (scoped to `tsType == "text search
+  configuration"` — DICTIONARY's `TEMPLATE = ...` has no COPY analog),
+  resolved via the existing `parseTSObjectNameLoose` helper, propagated to
+  the new AST field.
+- `internal/executor/operators_ddl.go`'s `"text search configuration"` case:
+  if both `TSConfigParser` and `TSConfigCopySource` are non-empty, raises
+  42601 with PG's exact message text. If only `TSConfigCopySource` is set,
+  resolves the source by scanning `im.ListUserTSConfigs()` for a
+  case-insensitive name match (mirroring `resolveTSDictOID`'s existing
+  schema-oblivious lookup pattern for TS objects — there is no
+  schema-qualified `LookupTSConfig` helper, consistent with how dictionary
+  names are already resolved), raising 42704 if unresolvable, and takes its
+  `Parser` OID (skipping the `BuiltinTSParserOID` lookup and the "parser
+  required" check, matching `DefineTSConfiguration`'s branch structure).
+  After the new configuration is created (and its own `CreateTSConfig` WAL
+  record appended, unchanged from before), a copy loop iterates the source's
+  `Mappings` and, for each, calls `im.AddTSConfigMapping` + appends an
+  `EncodeAddTSConfigMapping` WAL record — the identical mechanism
+  `execAlterTSConfigAddMapping` uses per token type, so restart replay needed
+  no new WAL record kind and no `internal/initdb/tsconfig_ddl_recovery.go`
+  change.
+- Confirmed non-aliasing: `AddTSConfigMapping` already defensive-copies its
+  `dictOIDs` argument into a fresh backing array (fixed for a different
+  reason during the REPLACE follow-up), so the copied `TSConfigMapping`
+  entries in the new configuration never share a backing array with the
+  source's — a post-CREATE `ALTER MAPPING` mutation on the copy cannot
+  perturb the source.
+
+**Tests**: `internal/executor/tsconfig_copy_test.go`
+(`TestCreateTSConfigCopy`) — parser and mapping copied correctly (multi-token
+multi-dict `ADD MAPPING` on the source, verifying the copy's per-token-type
+dictionary list order matches), the new configuration gets a distinct OID
+(not aliased), a post-copy mutation via `ALTER MAPPING` on the destination
+does not perturb the source, the 42601 both-PARSER-and-COPY case, and 42704
+on an unresolvable source configuration name.
+
+**Not touched (pg_dump never emits this form)**: `dumpTSConfig`
+(`pg_dump.c`) always materializes a configuration as a bare `PARSER = ...`
+CREATE plus one `ALTER ... ADD MAPPING` statement per mapping row — it never
+re-emits `COPY = ...`, even for a configuration originally created that way,
+since the mapping is dumped from the live catalog snapshot, not from
+provenance. No dumper-side change was needed or made.
+
+**Still deferred**: `OWNER TO` remains a no-op (pg_dump reads `cfgowner` from
+the catalog row set at CREATE time, not from a replayed ALTER OWNER TO —
+considered acceptable, not a gap per the earlier ledger row's rationale).
+`CREATE TEXT SEARCH PARSER`/`CREATE TEXT SEARCH TEMPLATE` remain fully
+unimplemented (C-function-loading features with no analog in goopg). With
+this follow-up, every option named in `gram.y`'s `DefineStmt` production for
+`OBJECT_TSCONFIGURATION` is now implemented.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
+./internal/parser/... ./internal/catalog/... ./internal/wal/...` PASS.

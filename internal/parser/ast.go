@@ -2202,6 +2202,14 @@ type CompatNoopStmt struct {
 	// when the statement is not a CREATE TEXT SEARCH CONFIGURATION. DU-002
 	// slice 446 (M0119-0004).
 	TSConfigParser ObjectName
+	// TSConfigCopySource carries a CREATE TEXT SEARCH CONFIGURATION
+	// statement's `( COPY = source_config )` clause — mutually exclusive
+	// with TSConfigParser (DefineTSConfiguration, tsearchcmds.c, raises
+	// ERRCODE_SYNTAX_ERROR if both are given). The executor resolves the
+	// named configuration, takes its parser, and copies its
+	// pg_ts_config_map rows into the new configuration. Zero value when the
+	// statement has no COPY clause. DU-002 slice 446 follow-up (M0119-0004).
+	TSConfigCopySource ObjectName
 	// TransformType / TransformLang carry a CREATE TRANSFORM statement's
 	// `FOR <type>` and `LANGUAGE <lang>` clauses. TransformFromFunc /
 	// TransformFromArgs and TransformToFunc / TransformToArgs carry the `FROM

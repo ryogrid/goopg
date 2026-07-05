@@ -398,7 +398,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 		// just skipped) — they round-trip through pg_dump (pg_ts_dict →
 		// dumpTSDictionary, pg_ts_config → dumpTSConfig); PARSER/TEMPLATE stay
 		// parsed-and-discarded compat no-ops. DU-002 slices 437, 446.
-		var tmplName, parserName ObjectName
+		var tmplName, parserName, copySourceName ObjectName
 		var dictOptions []TSDictOption
 		if (tsType == "text search dictionary" || tsType == "text search configuration") &&
 			p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
@@ -434,6 +434,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 					}
 					continue
 				}
+				if key == "copy" && tsType == "text search configuration" {
+					if fn, ferr := p.parseTSObjectNameLoose(); ferr == nil {
+						copySourceName = fn
+					}
+					continue
+				}
 				v := p.cur()
 				switch v.Kind {
 				case TokenIntLit, TokenNumericLit:
@@ -462,6 +468,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 			}
 			if tsType == "text search configuration" {
 				ns.TSConfigParser = parserName
+				ns.TSConfigCopySource = copySourceName
 			}
 		}
 		return stmt, nil
