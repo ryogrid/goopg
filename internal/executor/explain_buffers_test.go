@@ -3,7 +3,22 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
+
+// fakeIOTimingOp is a minimal Operator stub for
+// TestInstrumentedOpAccountsIOTime: it produces zero rows, existing purely
+// so instrumentedOp has something to wrap while exercising the real
+// Open/Next/Close accountBuffers diffing path.
+type fakeIOTimingOp struct{}
+
+func (fakeIOTimingOp) Schema() planner.Schema  { return nil }
+func (fakeIOTimingOp) Open(*Context) error     { return nil }
+func (fakeIOTimingOp) Next() (TupleSlot, error) { return nil, EOF }
+func (fakeIOTimingOp) Close() error            { return nil }
 
 // TestExplainBuffersAnalyzeTextLine pins the M0122-0003 BUFFERS slice: under
 // EXPLAIN (ANALYZE, BUFFERS) each scan node gets a "Buffers: shared hit=N
@@ -161,6 +176,139 @@ func TestExplainBuffersXMLTagSanitized(t *testing.T) {
 	out := strings.Join(lines, "\n")
 	if !strings.Contains(out, "<Shared-Hit-Blocks>") || !strings.Contains(out, "<Shared-Read-Blocks>") {
 		t.Errorf("expected <Shared-Hit-Blocks>/<Shared-Read-Blocks> tags in XML output:\n%s", out)
+	}
+}
+
+// TestFormatIOTimingsLine pins formatIOTimingsLine's TEXT rendering
+// (explain.c's show_buffer_usage has_shared_timing branch): each term is
+// independently gated on its own counter being positive, and the whole line
+// is gated on either being nonzero. There is no "extend=" term — extend time
+// folds into "write=" (see nodeStats.bufWriteTimeNs's doc comment).
+func TestFormatIOTimingsLine(t *testing.T) {
+	cases := []struct {
+		name string
+		s    nodeStats
+		want string
+	}{
+		{"all zero", nodeStats{}, ""},
+		{"read only", nodeStats{bufReadTimeNs: 2_500_000}, "I/O Timings: shared read=2.500"},
+		{"write only", nodeStats{bufWriteTimeNs: 1_250_000}, "I/O Timings: shared write=1.250"},
+		{"both", nodeStats{bufReadTimeNs: 500_000, bufWriteTimeNs: 750_000},
+			"I/O Timings: shared read=0.500 write=0.750"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := formatIOTimingsLine(&c.s); got != c.want {
+				t.Errorf("formatIOTimingsLine(%+v) = %q, want %q", c.s, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExplainIOTimingsOffByDefault confirms the "I/O Timings:" line stays
+// absent when track_io_timing never accumulated any time (the default —
+// matches upstream, where the times stay zero and has_shared_timing is
+// false).
+func TestExplainIOTimingsOffByDefault(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx,
+		"CREATE TABLE eiot1 (data int)",
+		"INSERT INTO eiot1 VALUES (1)",
+	)
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS) SELECT data FROM eiot1")
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "I/O Timings:") {
+		t.Errorf("EXPLAIN (ANALYZE, BUFFERS) unexpectedly emitted an I/O Timings line with no accumulated time:\n%s", joined)
+	}
+}
+
+// TestInstrumentedOpAccountsIOTime exercises the real
+// instrumentedOp.accountBuffers diffing added for I/O Timings: adding
+// wall-clock time to a Pool between a node's Open and Close — mirroring what
+// a real track_io_timing-gated wait-event hook (OnPinDone/OnFlushDone/
+// OnExtendDone) would do mid-execution — must roll into that node's
+// bufReadTimeNs/bufWriteTimeNs, and formatIOTimingsLine must render it. This
+// runs below the SQL layer (unlike TestExplainBuffersAnalyzeTextLine)
+// because pre-seeding time via Pool.AddReadTimeNanos before a full EXPLAIN
+// call would land inside instrumentedOp.Open's baseline snapshot and diff to
+// zero — there is no hook to inject time mid-query from outside a single SQL
+// round trip in this test harness.
+func TestInstrumentedOpAccountsIOTime(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	stats := &nodeStats{}
+	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &planner.Values{}, stats: stats}
+
+	if err := op.Open(&Context{Pool: pool}); err != nil {
+		t.Fatal(err)
+	}
+
+	pool.AddReadTimeNanos(3_000_000)
+	pool.AddWriteTimeNanos(1_000_000)
+
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Next() err = %v, want EOF", err)
+	}
+	if err := op.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if stats.bufReadTimeNs != 3_000_000 {
+		t.Errorf("bufReadTimeNs = %d, want 3000000", stats.bufReadTimeNs)
+	}
+	if stats.bufWriteTimeNs != 1_000_000 {
+		t.Errorf("bufWriteTimeNs = %d, want 1000000", stats.bufWriteTimeNs)
+	}
+	if line := formatIOTimingsLine(stats); line != "I/O Timings: shared read=3.000 write=1.000" {
+		t.Errorf("formatIOTimingsLine = %q, want 'I/O Timings: shared read=3.000 write=1.000'", line)
+	}
+}
+
+// TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime mirrors
+// TestExplainBuffersJSONOmittedWithoutBuffersOption for the new I/O timing
+// properties: with no accumulated time, "Shared I/O Read Time"/"Shared I/O
+// Write Time" stay absent (goopg's nonzero gate — see formatIOTimingsLine's
+// doc comment on the accepted deviation from upstream's GUC-only gate).
+func TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE eiot3 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM eiot3")
+	out := strings.Join(lines, "\n")
+	if strings.Contains(out, "Shared I/O Read Time") || strings.Contains(out, "Shared I/O Write Time") {
+		t.Errorf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) unexpectedly reported I/O timing with no accumulated time:\n%s", out)
+	}
+}
+
+// TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero is the FORMAT
+// JSON/XML/YAML sibling of TestInstrumentedOpAccountsIOTime: pins
+// planToJSONWithStats's "Shared I/O Read Time"/"Shared I/O Write Time"
+// properties directly against a synthetic stats table, avoiding the same
+// pre-seeding-lands-in-the-baseline problem a full SQL round trip would hit.
+func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats)
+	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 2.0 {
+		t.Errorf("Shared I/O Read Time = %v, want 2.0", obj["Shared I/O Read Time"])
+	}
+	if got, ok := obj["Shared I/O Write Time"].(float64); !ok || got != 0.5 {
+		t.Errorf("Shared I/O Write Time = %v, want 0.5", obj["Shared I/O Write Time"])
 	}
 }
 

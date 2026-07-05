@@ -683,3 +683,45 @@ writeback attribution, fsync call-site instrumentation respectively),
 EXPLAIN's `I/O Timings` line (now renderable since both `write_time` and
 `extend_time` exist), and the `CTEDMLPrefix` nested-node instrumentation
 residual.
+
+## Follow-up: EXPLAIN `I/O Timings` line
+
+Closes the "next presentation-layer gap" this doc's `extend_time` section
+predicted. `nodeStats` (`internal/executor/instrument.go`) gains
+`bufReadTimeNs`/`bufWriteTimeNs` (plus `bufBase*` snapshot pairs), diffed the
+same nested-stopwatch way `bufHit`/`bufRead`/etc. already are;
+`bufWriteTimeNs` folds `Pool.ExtendTimeNanos()` in alongside
+`Pool.WriteTimeNanos()`, mirroring upstream's `pgstat_count_io_op_time`
+(`postgres/src/backend/utils/activity/pgstat_io.c`), which buckets
+`IOOP_EXTEND` under the same shared-buffer write-time counter — real PG's
+"I/O Timings:" line has no separate `extend=` term either.
+
+`formatIOTimingsLine` (`internal/executor/operators_explain.go`) renders
+upstream's `show_buffer_usage` `has_shared_timing` branch
+(`postgres/src/backend/commands/explain.c`): `"I/O Timings: shared
+read=X.XXX write=Y.YYY"`, omitting the whole line when both counters are
+zero and each individual `read=`/`write=` term when that counter alone is
+zero. Wired into the TEXT walker (`walkPlanAnalyzeFiltered`, right after the
+existing `Buffers:` line) and the JSON renderer (`planToJSONWithStats`,
+`"Shared I/O Read/Write Time"` keys, right after the existing
+`"Shared ... Blocks"` keys).
+
+**Accepted simplification (deferred, not a correctness bug in the tested
+case):** real PostgreSQL's non-TEXT (JSON/XML/YAML) branch gates the
+`ExplainPropertyFloat` I/O-timing calls on the live `track_io_timing` GUC,
+not on whether the accumulated values are nonzero. goopg gates both the TEXT
+and non-TEXT paths on "value nonzero" instead — behaviorally identical
+whenever the GUC is on and at least one touched block incurred real I/O
+(the tested/common case) or the GUC is off (both counters are naturally
+zero, since the underlying `Pool` accumulators never advance without the
+hooks that `track_io_timing` gates), and differing only in the edge case of
+GUC-on-but-zero-blocks-touched, where upstream would still emit an explicit
+`0.000` and goopg omits the line/key entirely. Ledger row appended.
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainIOTimingsOffByDefault`,
+`TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime`.
+
+**Verification:** `go build ./...` clean; `go test ./internal/executor/...`
+PASS (includes the two new cases above plus the full pre-existing EXPLAIN
+suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).

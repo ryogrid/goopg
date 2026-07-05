@@ -201,6 +201,35 @@ func formatBuffersLine(s *nodeStats) string {
 	return "Buffers: shared " + strings.Join(parts, " ")
 }
 
+// formatIOTimingsLine renders the upstream "I/O Timings: shared read=X.XXX
+// write=Y.YYY" text (show_buffer_usage's has_shared_timing branch in
+// postgres/src/backend/commands/explain.c), omitting the whole line when
+// both counters are zero and each individual read=/write= term when that
+// counter is zero. bufWriteTimeNs already folds extend time in (see the
+// nodeStats doc comment), matching upstream's single "write=" term — there
+// is no separate "extend=" term in real PG's I/O Timings line either. The
+// times are naturally zero whenever track_io_timing is off, so no extra
+// gate is needed beyond the nonzero check here — unlike TEXT's "Buffers:"
+// line this happens to also match the non-text (JSON/XML/YAML) property
+// gate goopg uses below, though upstream's non-text branch actually gates
+// on the track_io_timing GUC rather than on the values being nonzero
+// (goopg's simplification is behaviorally identical in the tested case:
+// GUC on and I/O occurred vs. GUC off, differing only when the GUC is on
+// but a node touched zero blocks — deferred, ledger).
+func formatIOTimingsLine(s *nodeStats) string {
+	if s.bufReadTimeNs == 0 && s.bufWriteTimeNs == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if s.bufReadTimeNs > 0 {
+		parts = append(parts, fmt.Sprintf("read=%.3f", nsToMs(s.bufReadTimeNs)))
+	}
+	if s.bufWriteTimeNs > 0 {
+		parts = append(parts, fmt.Sprintf("write=%.3f", nsToMs(s.bufWriteTimeNs)))
+	}
+	return "I/O Timings: shared " + strings.Join(parts, " ")
+}
+
 func (o *explainOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
 		return nil, EOF
@@ -552,6 +581,9 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 			if line := formatBuffersLine(s); line != "" {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
 			}
+			if line := formatIOTimingsLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
 		}
 	}
 
@@ -600,6 +632,15 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 			obj["Shared Read Blocks"] = s.bufRead
 			obj["Shared Dirtied Blocks"] = s.bufDirtied
 			obj["Shared Written Blocks"] = s.bufWritten
+			// "Shared I/O Read/Write Time" (upstream's show_buffer_usage
+			// non-text branch, ExplainPropertyFloat calls gated on
+			// track_io_timing). goopg gates on nonzero instead of the live
+			// GUC (see formatIOTimingsLine's doc comment) — same accepted
+			// simplification, still deferred as a ledger nuance.
+			if s.bufReadTimeNs > 0 || s.bufWriteTimeNs > 0 {
+				obj["Shared I/O Read Time"] = nsToMs(s.bufReadTimeNs)
+				obj["Shared I/O Write Time"] = nsToMs(s.bufWriteTimeNs)
+			}
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the
