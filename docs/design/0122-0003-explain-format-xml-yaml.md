@@ -706,22 +706,28 @@ existing `Buffers:` line) and the JSON renderer (`planToJSONWithStats`,
 `"Shared I/O Read/Write Time"` keys, right after the existing
 `"Shared ... Blocks"` keys).
 
-**Accepted simplification (deferred, not a correctness bug in the tested
-case):** real PostgreSQL's non-TEXT (JSON/XML/YAML) branch gates the
-`ExplainPropertyFloat` I/O-timing calls on the live `track_io_timing` GUC,
-not on whether the accumulated values are nonzero. goopg gates both the TEXT
-and non-TEXT paths on "value nonzero" instead — behaviorally identical
-whenever the GUC is on and at least one touched block incurred real I/O
-(the tested/common case) or the GUC is off (both counters are naturally
-zero, since the underlying `Pool` accumulators never advance without the
-hooks that `track_io_timing` gates), and differing only in the edge case of
-GUC-on-but-zero-blocks-touched, where upstream would still emit an explicit
-`0.000` and goopg omits the line/key entirely. Ledger row appended.
+**Accepted simplification (fixed for non-TEXT, 2026-07-05, this loop):** real
+PostgreSQL's non-TEXT (JSON/XML/YAML) branch gates the `ExplainPropertyFloat`
+I/O-timing calls on the live `track_io_timing` GUC, not on whether the
+accumulated values are nonzero — `planToJSONWithStats` now takes a
+`trackIOTiming bool` parameter (the caller's `ctx.Activity.TrackIOTiming(ctx.
+ProcNum)` snapshot, threaded unchanged through the recursive `Plans`
+re-render from `explainOp.Open`) and emits `"Shared I/O Read Time"`/`"Shared
+I/O Write Time"` whenever it's true, even when both accumulators are exactly
+zero — matching `explain.c`'s `peek_buffer_usage` comment ("when format is
+anything other than text, we print even if the counters are all zeroes")
+exactly. The TEXT path (`formatIOTimingsLine`) deliberately keeps its
+original nonzero gate: there is no upstream precedent for an explicit
+`I/O Timings: shared read=0.000 write=0.000` TEXT line at all, so matching
+non-TEXT's unconditional-emit behavior there would invent new TEXT output
+upstream never produces.
 
 **Tests:** `internal/executor/explain_buffers_test.go` —
 `TestExplainIOTimingsOffByDefault`,
-`TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime`.
+`TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime`,
+`TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero`,
+`TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff`.
 
 **Verification:** `go build ./...` clean; `go test ./internal/executor/...`
-PASS (includes the two new cases above plus the full pre-existing EXPLAIN
+PASS (includes the four cases above plus the full pre-existing EXPLAIN
 suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).

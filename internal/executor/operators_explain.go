@@ -90,7 +90,8 @@ func (o *explainOp) Open(ctx *Context) error {
 			//   [ { "Plan": {...}, "Planning Time": .., "Execution Time": .. } ]
 			// horizons.spec reads ...->0->'Plan'->'Heap Fetches', so the
 			// wrapper is load-bearing (design 0118-0102).
-			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats)}
+			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
+			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats, trackIOTiming)}
 			if summary {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
@@ -603,7 +604,11 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 // node object grows Actual Rows / Actual Loops / Actual Startup
 // Time / Actual Total Time fields keyed by the instrumented
 // node's identity. Mirrors upstream's JSON ANALYZE shape.
-func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeStatsTable) map[string]any {
+//
+// trackIOTiming is the caller's track_io_timing GUC snapshot (see the
+// "Shared I/O Read/Write Time" gating below) and is threaded unchanged
+// through the recursive Plans re-render.
+func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
 	obj := planToJSON(n, opts)
 	if s, ok := stats[n]; ok && s != nil {
 		obj["Actual Rows"] = s.rowsOut
@@ -633,11 +638,15 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 			obj["Shared Dirtied Blocks"] = s.bufDirtied
 			obj["Shared Written Blocks"] = s.bufWritten
 			// "Shared I/O Read/Write Time" (upstream's show_buffer_usage
-			// non-text branch, ExplainPropertyFloat calls gated on
-			// track_io_timing). goopg gates on nonzero instead of the live
-			// GUC (see formatIOTimingsLine's doc comment) — same accepted
-			// simplification, still deferred as a ledger nuance.
-			if s.bufReadTimeNs > 0 || s.bufWriteTimeNs > 0 {
+			// non-text branch, ExplainPropertyFloat calls gated on the live
+			// track_io_timing GUC — emitted even when the accumulated value
+			// is zero, matching explain.c's peek_buffer_usage comment: "when
+			// format is anything other than text, we print even if the
+			// counters are all zeroes"). TEXT's formatIOTimingsLine keeps its
+			// own nonzero gate (a line with nothing to report is simply
+			// omitted; there's no upstream text-format precedent for an
+			// explicit "I/O Timings: " line at all-zero).
+			if trackIOTiming {
 				obj["Shared I/O Read Time"] = nsToMs(s.bufReadTimeNs)
 				obj["Shared I/O Write Time"] = nsToMs(s.bufWriteTimeNs)
 			}
@@ -649,7 +658,7 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSONWithStats(c, opts, stats))
+			plans = append(plans, planToJSONWithStats(c, opts, stats, trackIOTiming))
 		}
 		obj["Plans"] = plans
 	}

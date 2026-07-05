@@ -367,13 +367,30 @@ mirroring M0119's ledger `status` column.
       `TestPoolExtendTimeNanosAccumulates`,
       `TestPoolOnExtendHooksFireOnPinNewExtend`,
       `TestPgStatIOExtendTimeRendered`. Design: new "`extend_time` counter"
-      section. Still open: the remaining 3 op counters (reuses/writebacks/
-      fsyncs + their bytes/time columns) — each needs a genuinely new
-      counting mechanism (strategy-ring reuse, bgwriter/checkpointer-scoped
-      writeback attribution, fsync call-site instrumentation respectively),
-      not a mechanical extension of the eviction/extend pattern; also
-      EXPLAIN's `I/O Timings` line (now renderable since both `write_time`
-      and `extend_time` exist) and `EXPLAIN (BUFFERS)` without ANALYZE.
+      section. EXPLAIN `I/O Timings` line **done** (2026-07-05, later loop):
+      TEXT (`formatIOTimingsLine`) + JSON (`"Shared I/O Read/Write Time"`
+      keys) both render now that `write_time`/`extend_time` are real
+      counters; `nodeStats.bufReadTimeNs`/`bufWriteTimeNs`
+      (`internal/executor/instrument.go`) diff the same nested-stopwatch way
+      as the buffer-hit/read counters. **Non-TEXT GUC-vs-nonzero gating
+      fixed (2026-07-05, this loop):** `planToJSONWithStats` now takes a
+      `trackIOTiming bool` (the caller's `ctx.Activity.TrackIOTiming(ctx.
+      ProcNum)` snapshot) and gates `"Shared I/O Read/Write Time"` on the
+      live GUC rather than on accumulated-nonzero, matching upstream's
+      `peek_buffer_usage` ("print even if the counters are all zeroes" for
+      non-TEXT formats) exactly; TEXT's `formatIOTimingsLine` deliberately
+      keeps its nonzero gate (no upstream precedent for an explicit
+      all-zero TEXT line). Tests:
+      `TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero`,
+      `TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff`. Design:
+      `docs/design/0122-0003-explain-format-xml-yaml.md` updated in place.
+      Still open: the remaining 3 op counters (reuses/writebacks/fsyncs +
+      their bytes/time columns) — each needs a genuinely new counting
+      mechanism (strategy-ring reuse, bgwriter/checkpointer-scoped writeback
+      attribution, fsync call-site instrumentation respectively), not a
+      mechanical extension of the eviction/extend pattern; also
+      `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time buffers) and
+      local/temp-buffer terms.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause

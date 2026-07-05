@@ -303,12 +303,49 @@ func TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime(t *testing.T) {
 func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
 	n := &planner.Values{}
 	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
-	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats)
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
 	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 2.0 {
 		t.Errorf("Shared I/O Read Time = %v, want 2.0", obj["Shared I/O Read Time"])
 	}
 	if got, ok := obj["Shared I/O Write Time"].(float64); !ok || got != 0.5 {
 		t.Errorf("Shared I/O Write Time = %v, want 0.5", obj["Shared I/O Write Time"])
+	}
+}
+
+// TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero pins
+// the fix for the GUC-vs-nonzero gating gap this loop closes (ledger row
+// 2026-07-05, M0122-0003): upstream's non-text show_buffer_usage() gates
+// "Shared I/O Read/Write Time" on the live track_io_timing GUC and prints
+// it even when the accumulated value is exactly zero — unlike the
+// nonzero-only gate the TEXT "I/O Timings:" line (formatIOTimingsLine)
+// still uses.
+func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 0 {
+		t.Errorf("Shared I/O Read Time = %v, want 0 (present)", obj["Shared I/O Read Time"])
+	}
+	if got, ok := obj["Shared I/O Write Time"].(float64); !ok || got != 0 {
+		t.Errorf("Shared I/O Write Time = %v, want 0 (present)", obj["Shared I/O Write Time"])
+	}
+}
+
+// TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff is the mirror
+// of the above: when the caller's track_io_timing snapshot is false, the
+// properties stay absent even though the node accumulated a nonzero value
+// (matches upstream: the accumulator itself never advances with the GUC
+// off, so a nonzero reading with the GUC off shouldn't happen in practice,
+// but the gate must key off the GUC, not the value, to match explain.c).
+func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	if _, ok := obj["Shared I/O Read Time"]; ok {
+		t.Errorf("Shared I/O Read Time present with trackIOTiming=false, want absent")
+	}
+	if _, ok := obj["Shared I/O Write Time"]; ok {
+		t.Errorf("Shared I/O Write Time present with trackIOTiming=false, want absent")
 	}
 }
 
