@@ -714,6 +714,10 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	pool.SetCheckpointFlushAfter(opts.CheckpointFlushAfter)
 	pool.SetBgwriterFlushAfter(opts.BgwriterFlushAfter)
 	pool.SetBackendFlushAfter(opts.BackendFlushAfter)
+	// backend_flush_after is PGC_USERSET upstream: a connected backend's
+	// own `SET backend_flush_after` takes precedence over the process-wide
+	// default above (M0122-0003 writeback follow-up).
+	pool.BackendFlushAfterOverride = act.BackendFlushAfterOverride
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}

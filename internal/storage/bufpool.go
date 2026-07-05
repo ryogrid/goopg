@@ -231,6 +231,10 @@ type Pool struct {
 	// DEFAULT_BACKEND_FLUSH_AFTER (32/64/0) so a Pool built without server
 	// wiring (e.g. tests) still exhibits real Linux behaviour; overridden
 	// from the live GUC values at startup (initdb.Open).
+	// backendFlushAfterBlocks specifically is the process-wide fallback for
+	// accountBackendWrite — a per-session `SET backend_flush_after` value
+	// (upstream's GUC is PGC_USERSET) takes precedence via
+	// BackendFlushAfterOverride when the calling backend has one.
 	checkpointFlushAfterBlocks atomic.Int32
 	bgwriterFlushAfterBlocks   atomic.Int32
 	backendFlushAfterBlocks    atomic.Int32
@@ -277,6 +281,17 @@ type Pool struct {
 	OnBgwriterWritebackDone     func()
 	OnBackendWritebackWait      func()
 	OnBackendWritebackDone      func()
+
+	// BackendFlushAfterOverride, when set, resolves the calling backend's
+	// own per-session backend_flush_after value (upstream's GUC is
+	// PGC_USERSET — independently settable per session via `SET
+	// backend_flush_after`), returning ok=false when the caller isn't a
+	// tracked backend (e.g. the bgwriter/checkpointer goroutines, or a
+	// Pool used without server wiring in tests) so accountBackendWrite
+	// falls back to backendFlushAfterBlocks (initdb.Open's wiring: see
+	// deferral ledger's "backend_flush_after applied process-wide, not
+	// per-session" simplification, now closed).
+	BackendFlushAfterOverride func() (int32, bool)
 
 	// bgwriterHand is the bgwriter's independent scan cursor.
 	// Protected by bgwriterMu.

@@ -856,10 +856,11 @@ ledger, not hidden):**
    *whichever relation was just written*, not a coalesced multi-relation
    batch. Real kernel behaviour, real GUC-driven cadence, simpler
    bookkeeping.
-2. `backend_flush_after` is `PGC_USERSET` upstream (a per-session GUC);
+2. ~~`backend_flush_after` is `PGC_USERSET` upstream (a per-session GUC);
    goopg applies it as one process-wide threshold (`initdb.Open` wires the
    boot-time GUC value only). A `SET backend_flush_after` in one session
-   would affect every session's accounting.
+   would affect every session's accounting.~~ **Fixed 2026-07-06** (loop
+   #9, see "Per-session `backend_flush_after`" section below).
 3. bgwriter/checkpointer `writeback_time` gating gates on the boot-time
    `TrackIOTiming` value with a plain `time.Now()`/`time.Since` pair
    (`internal/initdb/open.go`), not the `ActivityRegistry` wait-event
@@ -893,6 +894,68 @@ four simplifications named above.
 **Verification:** `go build ./...` clean; `go test ./internal/storage/...
 ./internal/executor/... ./internal/config/...` PASS (see also the
 initdb/cmd build check run this loop).
+
+## Per-session `backend_flush_after` (later loop, 2026-07-06)
+
+Closes simplification (2) above: `backend_flush_after` is `PGC_USERSET`
+upstream, so each session may independently `SET` its own writeback
+threshold without affecting any other session's accounting. goopg
+previously applied it as a single process-wide `storage.Pool` atomic set
+once at boot (`SetBackendFlushAfter`), identical for every backend.
+
+**Design.** Mirrors the exact mechanism `track_io_timing`'s own
+runtime-`SET` follow-up already established (same doc, "SETTINGS
+rendering"/`track_io_timing` sections): a per-backend
+`activity.coldActivity.BackendFlushAfterBlocks atomic.Int32`, seeded at
+connection setup from the session's boot-time GUC value and kept live by a
+new `cfg.Registry.OnChange("backend_flush_after", ...)` hook in
+`server.New()` — both call the new `ActivityRegistry.UpdateBackendFlushAfter
+(procNum, n)`. `storage.Pool` gains a `BackendFlushAfterOverride func()
+(int32, bool)` hook (alongside `OnFlushWait`/`OnExtendWait`'s existing
+hook-injection pattern), wired in `initdb.Open` to
+`act.BackendFlushAfterOverride` directly (a plain method value — safe even
+if `act` happened to be nil, since the method's own nil-receiver guard runs
+first). `writeback.go`'s `accountBackendWrite` now resolves `threshold` by
+calling the override first and falling back to the pre-existing
+process-wide `backendFlushAfterBlocks.Load()` only when the override
+reports `ok=false` (untracked caller — the bgwriter/checkpointer
+goroutines, or a bare `Pool` exercised in tests without server wiring).
+
+Deliberately **no fast-path gate** unlike `TrackIOTimingOn`/
+`trackIOTimingFastPath`: that gate exists because `LookupTrackedGoroutine`
+is consulted on the buffer-pin hot path (every tuple read/write touches
+`Pin`), so the common all-off case must cost one atomic load, not a
+goroutine-map lookup (M0092-0005's original perf rationale).
+`accountBackendWrite`'s only caller is `evictVictim`'s dirty-victim path —
+gated on the pool actually needing to evict a slot, several orders of
+magnitude rarer than a buffer pin — so `BackendFlushAfterOverride` always
+does the `LookupCurrentGoroutine` map lookup unconditionally; the extra cost
+is immaterial next to the disk write it's bracketing.
+
+`accountWrite`'s signature changed from `thresholdBlocks *atomic.Int32` to
+a plain `threshold int32`, since the per-backend case no longer has a
+single `Pool`-owned atomic to hand it a pointer to — each of the three
+call sites (`accountCheckpointerWrite`/`accountBgwriterWrite`/
+`accountBackendWrite`) now resolves its own threshold value first
+(`.Load()`, or the override-then-fallback logic above for the backend
+case) and passes the resolved `int32` in.
+
+**Tests:** `internal/activity/registry_test.go`'s
+`TestActivityRegistryBackendFlushAfterOverride` (per-backend independence,
+live updates, untracked-goroutine `ok=false`); `internal/server/
+server_test.go`'s `TestBackendFlushAfterOnChangePropagatesToActivityRegistry`
+(mirrors `TestTrackIOTimingOnChangePropagatesToActivityRegistry` — `SET
+backend_flush_after` takes effect without a restart);
+`internal/storage/writeback_test.go`'s
+`TestPoolBackendWritebackOverrideTakesPrecedence` (three subcases: override
+enables what the process-wide default disables, override disables what the
+process-wide default enables, a not-ok override falls back to the
+process-wide default).
+
+**Verification:** `go build ./...` clean; `go vet`/`go test -race
+./internal/storage/... ./internal/activity/...` PASS; `go test
+./internal/server/... ./internal/executor/... ./internal/initdb/...
+./internal/config/...` PASS (full packages, no regressions).
 
 ## `CTEDMLPrefix` nested-node instrumentation (later loop, 2026-07-06)
 

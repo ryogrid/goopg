@@ -83,6 +83,17 @@ type coldActivity struct {
 	// track_io_timing` (M0122-0003 runtime-SET follow-up). Zero value
 	// (false) matches the GUC's "off" bootval.
 	TrackIOTimingOn atomic.Bool
+
+	// BackendFlushAfterBlocks is this backend's effective
+	// backend_flush_after setting (in BLCKSZ-page units), mirrored the
+	// same way as TrackIOTimingOn: seeded at connection setup from the
+	// session's boot-time value, updated live by the GUC OnChange hook on
+	// `SET backend_flush_after` (upstream's GUC is PGC_USERSET, so it is
+	// independently settable per session — M0122-0003 writeback
+	// follow-up, closes the "applied process-wide, not per-session"
+	// simplification). Zero value (0) matches the GUC's "disabled"
+	// bootval.
+	BackendFlushAfterBlocks atomic.Int32
 }
 
 // backendStateCode enumerates the pg_stat_activity state values.
@@ -583,6 +594,46 @@ func (r *ActivityRegistry) LookupTrackedGoroutine() (*ActivityRegistry, int32, b
 		return nil, 0, false
 	}
 	return reg, procNum, true
+}
+
+// UpdateBackendFlushAfter atomically updates procNum's effective
+// backend_flush_after setting. Called once at connection setup to seed the
+// session's boot-time value, and again from the GUC OnChange hook whenever
+// `SET backend_flush_after` runs (M0122-0003 writeback follow-up). Unlike
+// UpdateTrackIOTiming there is no fast-path flag to latch: dirty-victim
+// eviction (accountBackendWrite's only caller) is far rarer than the
+// per-tuple buffer-pin hot path track_io_timing gates, so
+// BackendFlushAfterOverride below always does the goroutine-map lookup.
+func (r *ActivityRegistry) UpdateBackendFlushAfter(procNum int32, n int32) {
+	if procNum < 0 || int(procNum) >= len(r.slots) {
+		return
+	}
+	c := r.slots[procNum].cold
+	if c == nil {
+		return
+	}
+	c.BackendFlushAfterBlocks.Store(n)
+}
+
+// BackendFlushAfterOverride returns the calling goroutine's backend's
+// current effective backend_flush_after setting. ok is false when the
+// caller isn't a registered backend (background goroutines like the
+// bgwriter/checkpointer, or a Pool exercised directly in tests without
+// server wiring) — storage.Pool.accountBackendWrite falls back to its own
+// process-wide default in that case.
+func (r *ActivityRegistry) BackendFlushAfterOverride() (int32, bool) {
+	if r == nil {
+		return 0, false
+	}
+	reg, procNum, ok := LookupCurrentGoroutine()
+	if !ok || reg != r {
+		return 0, false
+	}
+	c := reg.slots[procNum].cold
+	if c == nil {
+		return 0, false
+	}
+	return c.BackendFlushAfterBlocks.Load(), true
 }
 
 // formatNanos converts unix nanos to RFC3339Nano string.  0 → "".

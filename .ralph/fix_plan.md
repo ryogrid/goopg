@@ -48,11 +48,20 @@ Read/Written Blocks`. The Local/Temp/Planning-time I/O timing terms
 `planningBufferUsageJSON`) also landed 2026-07-06 (later loop still) —
 `planningBufferUsageJSON(trackIOTiming bool)` and `planToJSONWithStats`
 both now emit all six `Shared/Local/Temp I/O Read/Write Time` keys
-(constant-zero for Local/Temp) once the GUC is on. Remaining sub-items:
-the last `pg_stat_io` op counter (`reuses` — needs a
+(constant-zero for Local/Temp) once the GUC is on. Writeback simplification
+(2) — `backend_flush_after` applied process-wide instead of upstream's
+per-session `PGC_USERSET` — also landed 2026-07-06 (later loop still): a
+per-backend `ActivityRegistry.BackendFlushAfterBlocks` + `storage.Pool`'s
+new `BackendFlushAfterOverride` hook mirror `track_io_timing`'s own
+runtime-SET wiring exactly (see deferral ledger 2026-07-06 row). Remaining
+sub-items: the last `pg_stat_io` op counter (`reuses` — needs a
 `BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
-doesn't have), plus the 4 named writeback simplifications-vs-upstream
-(see deferral ledger 2026-07-05 row). Pick up one of those next, or
+doesn't have), plus the 3 still-open named writeback simplifications
+(single-relation-per-hint instead of coalesced ranges, bgwriter/
+checkpointer `writeback_time` gated on boot-time `track_io_timing` via
+plain `time.Since` rather than the activity-registry wait-event clock, and
+bgwriter/checkpointer `writes`/`write_bytes`/`write_time` staying an honest
+0 — see deferral ledger 2026-07-05 row). Pick up one of those next, or
 continue the M0119-0004 pg_dump catalog-view parity battery / next
 unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 

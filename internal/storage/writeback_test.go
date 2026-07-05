@@ -66,6 +66,100 @@ func TestPoolBackendWritebackTriggersAtThreshold(t *testing.T) {
 	}
 }
 
+// TestPoolBackendWritebackOverrideTakesPrecedence pins the M0122-0003
+// writeback follow-up: a non-nil BackendFlushAfterOverride hook (wired from
+// the calling backend's own per-session `backend_flush_after`, since
+// upstream's GUC is PGC_USERSET) must win over the process-wide
+// SetBackendFlushAfter default set at boot, in both directions — a
+// per-session override can enable writeback the process-wide default
+// disables, and vice versa.
+func TestPoolBackendWritebackOverrideTakesPrecedence(t *testing.T) {
+	const poolSlots = 4
+	const hotPages = 4
+
+	newRig := func(t *testing.T) (*Pool, RelFileNode) {
+		dir := t.TempDir()
+		mgr := NewManager(ManagerConfig{DataDir: dir})
+		pool, err := NewPool(mgr, PoolConfig{Slots: poolSlots})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = pool.Close(); _ = mgr.Close() })
+
+		rel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+		seedPage := make(Page, BlockSize)
+		if err := InitPage(seedPage); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < hotPages; i++ {
+			if _, err := mgr.Extend(rel, seedPage); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return pool, rel
+	}
+	dirtyAndEvictAll := func(t *testing.T, pool *Pool, rel RelFileNode) {
+		for blk := BlockNumber(0); blk < BlockNumber(hotPages); blk++ {
+			s, err := pool.Pin(BufferTag{Rel: rel, Block: blk})
+			if err != nil {
+				t.Fatalf("pin %d: %v", blk, err)
+			}
+			pool.MarkDirty(s)
+			pool.Unpin(s)
+		}
+		// Evict everything by pinning a second, disjoint relation's worth of
+		// cold pages through the same small pool (mirrors
+		// TestPoolBackendWritebackTriggersAtThreshold's hot/cold setup).
+		coldRel := RelFileNode{DBOid: 1, RelOid: 99, Fork: MainFork}
+		seedPage := make(Page, BlockSize)
+		_ = InitPage(seedPage)
+		mgr := pool.mgr
+		for i := 0; i < poolSlots*2; i++ {
+			if _, err := mgr.Extend(coldRel, seedPage); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for blk := BlockNumber(0); blk < BlockNumber(poolSlots*2); blk++ {
+			s, err := pool.Pin(BufferTag{Rel: coldRel, Block: blk})
+			if err != nil {
+				continue
+			}
+			pool.Unpin(s)
+		}
+	}
+
+	t.Run("override enables what the process-wide default disables", func(t *testing.T) {
+		pool, rel := newRig(t)
+		// Process-wide default stays 0 (disabled, upstream's own default);
+		// only the per-session override turns writeback on.
+		pool.BackendFlushAfterOverride = func() (int32, bool) { return 2, true }
+		dirtyAndEvictAll(t, pool, rel)
+		if got := pool.BackendWritebackCount(); got == 0 {
+			t.Errorf("BackendWritebackCount() = 0 with an override of 2, want > 0")
+		}
+	})
+
+	t.Run("override disables what the process-wide default enables", func(t *testing.T) {
+		pool, rel := newRig(t)
+		pool.SetBackendFlushAfter(2)
+		pool.BackendFlushAfterOverride = func() (int32, bool) { return 0, true }
+		dirtyAndEvictAll(t, pool, rel)
+		if got := pool.BackendWritebackCount(); got != 0 {
+			t.Errorf("BackendWritebackCount() = %d with an override of 0 overriding process-wide 2, want 0", got)
+		}
+	})
+
+	t.Run("not-ok override falls back to the process-wide default", func(t *testing.T) {
+		pool, rel := newRig(t)
+		pool.SetBackendFlushAfter(2)
+		pool.BackendFlushAfterOverride = func() (int32, bool) { return 99, false }
+		dirtyAndEvictAll(t, pool, rel)
+		if got := pool.BackendWritebackCount(); got == 0 {
+			t.Errorf("BackendWritebackCount() = 0 with a not-ok override (should fall back to process-wide 2), want > 0")
+		}
+	})
+}
+
 // TestPoolBgwriterWritebackTriggersAtThreshold mirrors the backend test
 // above for the bgwriter's WriteDirtyPages path.
 func TestPoolBgwriterWritebackTriggersAtThreshold(t *testing.T) {
