@@ -712,6 +712,33 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			pool.AddCheckpointWritebackTimeNanos(int64(d))
 		}
 	}
+	// write_time's OnCheckpointerWritebackWait/Done analogue: brackets
+	// flushBatch's real dirty-page AIO write (M0122-0003 writeback
+	// simplification (4), closed: checkpointer/bgwriter writes/write_bytes/
+	// write_time cells were an honest 0; now real counters, same
+	// LookupTrackedGoroutine pattern as every other On* pair above).
+	pool.OnCheckpointerWriteWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnCheckpointerWriteDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddCheckpointWriteTimeNanos(int64(d))
+		}
+	}
+	pool.OnBgwriterWriteWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnBgwriterWriteDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddBgwriterWriteTimeNanos(int64(d))
+		}
+	}
 	pool.SetCheckpointFlushAfter(opts.CheckpointFlushAfter)
 	pool.SetBgwriterFlushAfter(opts.BgwriterFlushAfter)
 	pool.SetBackendFlushAfter(opts.BackendFlushAfter)

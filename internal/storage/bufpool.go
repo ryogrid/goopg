@@ -269,6 +269,24 @@ type Pool struct {
 	sharedBackendWritebackCount        atomic.Int64
 	sharedBackendWritebackTimeNanos    atomic.Int64
 
+	// sharedCheckpointWrittenCount / sharedBgwriterWrittenCount back
+	// pg_stat_io's writes column for the (checkpointer|background writer,
+	// relation, normal) rows — the background-writer/checkpointer sibling
+	// of sharedWrittenCount above, which upstream's per-backend
+	// pgBufferUsage deliberately excludes (M0122-0003 writeback follow-up,
+	// "background writer / checkpointer rows' own writes/write_bytes/
+	// write_time cells are still an honest 0" simplification, now closed).
+	// Incremented once per real dirty-slot write each context performs:
+	// checkpointer in flushBatch (FlushAllPaced, also driven by Pool.Close's
+	// final shutdown flush — upstream attributes a shutdown checkpoint's
+	// writes to the checkpointer too), bgwriter in WriteDirtyPages.
+	// *WriteTimeNanos are their real wall-clock time siblings (write_time),
+	// gated on track_io_timing exactly like the writeback counters above.
+	sharedCheckpointWrittenCount     atomic.Int64
+	sharedCheckpointWriteTimeNanos   atomic.Int64
+	sharedBgwriterWrittenCount       atomic.Int64
+	sharedBgwriterWriteTimeNanos     atomic.Int64
+
 	// OnCheckpointerWritebackWait/Done, OnBgwriterWritebackWait/Done, and
 	// OnBackendWritebackWait/Done bracket each context's real
 	// SyncFileRangeHint call (mirrors OnFlushWait/OnFlushDone), one
@@ -281,6 +299,15 @@ type Pool struct {
 	OnBgwriterWritebackDone     func()
 	OnBackendWritebackWait      func()
 	OnBackendWritebackDone      func()
+
+	// OnCheckpointerWriteWait/Done and OnBgwriterWriteWait/Done bracket
+	// each context's real dirty-page write (mirrors OnFlushWait/OnFlushDone,
+	// the backend-eviction analogue), backing write_time for the
+	// (checkpointer|background writer, relation, normal) rows.
+	OnCheckpointerWriteWait func()
+	OnCheckpointerWriteDone func()
+	OnBgwriterWriteWait     func()
+	OnBgwriterWriteDone     func()
 
 	// BackendFlushAfterOverride, when set, resolves the calling backend's
 	// own per-session backend_flush_after value (upstream's GUC is
@@ -742,6 +769,35 @@ func (p *Pool) AddBgwriterWritebackTimeNanos(n int64) {
 func (p *Pool) AddBackendWritebackTimeNanos(n int64) {
 	if n > 0 {
 		p.sharedBackendWritebackTimeNanos.Add(n)
+	}
+}
+
+// CheckpointWrittenCount / CheckpointWriteTimeNanos back pg_stat_io's
+// (checkpointer, relation, normal) writes / write_time cells.
+func (p *Pool) CheckpointWrittenCount() int64 { return p.sharedCheckpointWrittenCount.Load() }
+func (p *Pool) CheckpointWriteTimeNanos() int64 {
+	return p.sharedCheckpointWriteTimeNanos.Load()
+}
+
+// BgwriterWrittenCount / BgwriterWriteTimeNanos back pg_stat_io's
+// (background writer, relation, normal) writes / write_time cells.
+func (p *Pool) BgwriterWrittenCount() int64 { return p.sharedBgwriterWrittenCount.Load() }
+func (p *Pool) BgwriterWriteTimeNanos() int64 {
+	return p.sharedBgwriterWriteTimeNanos.Load()
+}
+
+// AddCheckpointWriteTimeNanos / AddBgwriterWriteTimeNanos accumulate real
+// wall-clock time spent in a context's dirty-page write. Called only from
+// the matching On*WriteDone hook (see initdb.Open's wiring).
+func (p *Pool) AddCheckpointWriteTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedCheckpointWriteTimeNanos.Add(n)
+	}
+}
+
+func (p *Pool) AddBgwriterWriteTimeNanos(n int64) {
+	if n > 0 {
+		p.sharedBgwriterWriteTimeNanos.Add(n)
 	}
 }
 
@@ -1609,12 +1665,18 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		}
 	}
 
+	if p.OnCheckpointerWriteWait != nil {
+		p.OnCheckpointerWriteWait()
+	}
 	handles := make([]AIOHandle, len(slots))
 	for i, s := range slots {
 		h, err := p.mgr.WriteBlockAIO(tags[i].Rel, tags[i].Block, s.page)
 		if err != nil {
 			for j := 0; j < i; j++ {
 				_, _ = handles[j].Wait()
+			}
+			if p.OnCheckpointerWriteDone != nil {
+				p.OnCheckpointerWriteDone()
 			}
 			return err
 		}
@@ -1626,6 +1688,9 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 		if _, err := h.Wait(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+	}
+	if p.OnCheckpointerWriteDone != nil {
+		p.OnCheckpointerWriteDone()
 	}
 	if firstErr != nil {
 		return firstErr
@@ -1643,6 +1708,7 @@ func (p *Pool) flushBatch(slots []*Slot, tags []BufferTag) error {
 					break
 				}
 			}
+			p.sharedCheckpointWrittenCount.Add(1)
 			p.accountCheckpointerWrite(tags[i].Rel)
 		}
 	}
@@ -1734,7 +1800,14 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 		stillValid := stateValid(st) && s.tag == v.tag && stateDirty(st) && statePin(st) == 0
 
 		if stillValid {
-			if err := p.flushSlot(v.tag, s.page); err == nil {
+			if p.OnBgwriterWriteWait != nil {
+				p.OnBgwriterWriteWait()
+			}
+			err := p.flushSlot(v.tag, s.page)
+			if p.OnBgwriterWriteDone != nil {
+				p.OnBgwriterWriteDone()
+			}
+			if err == nil {
 				if s.tag == v.tag {
 					for {
 						old := s.state.Load()
@@ -1746,6 +1819,7 @@ func (p *Pool) WriteDirtyPages(maxPages int) int {
 						}
 					}
 					written++
+					p.sharedBgwriterWrittenCount.Add(1)
 					p.accountBgwriterWrite(v.tag.Rel)
 				}
 			}

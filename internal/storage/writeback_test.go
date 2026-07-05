@@ -248,6 +248,71 @@ func TestPoolCheckpointerWritebackTriggersAtThreshold(t *testing.T) {
 	}
 }
 
+// TestPoolBgwriterAndCheckpointerWrittenCountsAreTracked covers writeback
+// simplification (4) (closed): the background writer's WriteDirtyPages and
+// the checkpointer's FlushAllPaced each now maintain their own real
+// writes/write_time counters (pg_stat_io's (background writer|checkpointer,
+// relation, normal) rows), distinct from the pool-wide, backend-attributed
+// sharedWrittenCount these two paths deliberately never touch.
+func TestPoolBgwriterAndCheckpointerWrittenCountsAreTracked(t *testing.T) {
+	const poolSlots = 8
+	const dirtyPages = 4
+
+	dir := t.TempDir()
+	mgr := NewManager(ManagerConfig{DataDir: dir})
+	pool, err := NewPool(mgr, PoolConfig{Slots: poolSlots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	dirtyRel := func(rel RelFileNode) {
+		seedPage := make(Page, BlockSize)
+		if err := InitPage(seedPage); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < dirtyPages; i++ {
+			if _, err := mgr.Extend(rel, seedPage); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for blk := BlockNumber(0); blk < BlockNumber(dirtyPages); blk++ {
+			s, err := pool.Pin(BufferTag{Rel: rel, Block: blk})
+			if err != nil {
+				t.Fatalf("pin %d: %v", blk, err)
+			}
+			pool.MarkDirty(s)
+			pool.Unpin(s)
+		}
+	}
+
+	bgRel := RelFileNode{DBOid: 1, RelOid: 1, Fork: MainFork}
+	dirtyRel(bgRel)
+	if n := pool.WriteDirtyPages(dirtyPages); n != dirtyPages {
+		t.Fatalf("WriteDirtyPages wrote %d, want %d", n, dirtyPages)
+	}
+	if got := pool.BgwriterWrittenCount(); got != dirtyPages {
+		t.Errorf("BgwriterWrittenCount() = %d, want %d", got, dirtyPages)
+	}
+	if got := pool.CheckpointWrittenCount(); got != 0 {
+		t.Errorf("CheckpointWrittenCount() = %d before any checkpointer flush, want 0", got)
+	}
+
+	cpRel := RelFileNode{DBOid: 1, RelOid: 2, Fork: MainFork}
+	dirtyRel(cpRel)
+	if err := pool.FlushAllPaced(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := pool.CheckpointWrittenCount(); got != dirtyPages {
+		t.Errorf("CheckpointWrittenCount() = %d, want %d", got, dirtyPages)
+	}
+	// The backend-attributed pool-wide counter must stay untouched by
+	// either background path (see sharedWrittenCount's doc comment).
+	if _, _, _, backendWritten := pool.BufferCounters(); backendWritten != 0 {
+		t.Errorf("BufferCounters() written = %d, want 0 (bgwriter/checkpointer writes must not attribute to the backend counter)", backendWritten)
+	}
+}
+
 // TestSyncFileRangeHintOnRealFile is a narrow smoke test for the raw
 // platform hook itself, independent of the Pool-level threshold logic.
 func TestSyncFileRangeHintOnRealFile(t *testing.T) {

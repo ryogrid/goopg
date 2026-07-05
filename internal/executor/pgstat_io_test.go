@@ -414,3 +414,72 @@ func TestPgStatIOWritebackRendered(t *testing.T) {
 		t.Errorf("writeback_time (col 10) = %q, want %q", found[10], "0.250")
 	}
 }
+
+// TestPgStatIOBgwriterCheckpointerWritesRendered pins writeback
+// simplification (4) (closed): the (background writer|checkpointer,
+// relation, normal) rows' writes/write_bytes/write_time cells must reflect
+// storage.Pool's real per-context written counters (WriteDirtyPages /
+// FlushAllPaced), not the previous hardcoded "0".
+func TestPgStatIOBgwriterCheckpointerWritesRendered(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	rel := storage.RelFileNode{DBOid: 1, RelOid: 1, Fork: storage.MainFork}
+	seedPage := make(storage.Page, storage.BlockSize)
+	if err := storage.InitPage(seedPage); err != nil {
+		t.Fatal(err)
+	}
+	const dirtyPages = 3
+	for i := 0; i < dirtyPages; i++ {
+		if _, err := mgr.Extend(rel, seedPage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for blk := storage.BlockNumber(0); blk < storage.BlockNumber(dirtyPages); blk++ {
+		s, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			t.Fatalf("pin %d: %v", blk, err)
+		}
+		pool.MarkDirty(s)
+		pool.Unpin(s)
+	}
+	if n := pool.WriteDirtyPages(dirtyPages); n != dirtyPages {
+		t.Fatalf("WriteDirtyPages wrote %d, want %d", n, dirtyPages)
+	}
+	pool.AddBgwriterWriteTimeNanos(500_000)
+
+	ctx := &Context{Pool: pool}
+	rows := fetchIOStatRows(ctx)
+	var bgRow, cpRow []string
+	for _, r := range rows {
+		if r[0] == "background writer" && r[1] == "relation" && r[2] == "normal" {
+			bgRow = r
+		}
+		if r[0] == "checkpointer" && r[1] == "relation" && r[2] == "normal" {
+			cpRow = r
+		}
+	}
+	if bgRow == nil {
+		t.Fatal("no background writer/relation/normal row found")
+	}
+	if cpRow == nil {
+		t.Fatal("no checkpointer/relation/normal row found")
+	}
+	if bgRow[6] != "3" {
+		t.Errorf("bgwriter writes (col 6) = %q, want %q", bgRow[6], "3")
+	}
+	if bgRow[7] != "24576" {
+		t.Errorf("bgwriter write_bytes (col 7) = %q, want %q", bgRow[7], "24576")
+	}
+	if bgRow[8] != "0.500" {
+		t.Errorf("bgwriter write_time (col 8) = %q, want %q", bgRow[8], "0.500")
+	}
+	if cpRow[6] != "0" {
+		t.Errorf("checkpointer writes (col 6) = %q, want %q before any FlushAllPaced call", cpRow[6], "0")
+	}
+}

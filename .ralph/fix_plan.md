@@ -65,14 +65,24 @@ match `OnBackendWritebackWait/Done`'s `LookupTrackedGoroutine()` pattern
 exactly — this also fixed a real bug where the checkpointer's old
 `act.Register(&Backend{PID:"cp-0",...})` call silently collided with and
 clobbered the WAL writer's activitySlot (see deferral ledger 2026-07-06
-row). Remaining sub-items: the last `pg_stat_io` op counter (`reuses` —
-needs a `BufferAccessStrategy`-style ring-buffer storage-engine mechanism
-goopg doesn't have), plus 2 still-open named writeback simplifications
-(single-relation-per-hint instead of coalesced ranges, and bgwriter/
-checkpointer `writes`/`write_bytes`/`write_time` staying an honest 0 — see
-deferral ledger 2026-07-05 row). Pick up one of those next, or
-continue the M0119-0004 pg_dump catalog-view parity battery / next
-unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
+row). Writeback simplification (4) — background writer/checkpointer
+`writes`/`write_bytes`/`write_time` staying an honest 0 — also landed
+2026-07-06 (later loop still): `storage.Pool` gained
+`sharedBgwriterWrittenCount`/`sharedCheckpointWrittenCount` (+ time
+siblings), incremented in `WriteDirtyPages`/`flushBatch` respectively and
+bracketed by new `OnBgwriterWriteWait/Done`/`OnCheckpointerWriteWait/Done`
+hooks mirroring `evictVictim`'s own `OnFlushWait/OnFlushDone`;
+`pgstat_io.go`'s `fetchIOStatRows` now renders real values for those two
+rows' writes/write_bytes/write_time (see deferral ledger 2026-07-06 row).
+Remaining sub-item: the last `pg_stat_io` op counter (`reuses` — needs a
+`BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
+doesn't have; feature-sized, not a bounded slice). Also the
+single-relation-per-hint-vs-coalesced-ranges writeback simplification (1)
+remains open (recorded, not required for correctness). Pick up the
+M0119-0004 pg_dump catalog-view parity battery / next unresolved DU-002
+slice from `.ralph/deferral_ledger.md` next, since the M0122-0003 writeback/
+pg_stat_io bucket's only remaining items are each feature-sized or a
+recorded-not-required simplification.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

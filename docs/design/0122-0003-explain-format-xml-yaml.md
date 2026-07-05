@@ -1294,3 +1294,88 @@ checkpointer rows' own `writes`/`write_bytes`/`write_time` cells staying an
 honest 0 — `sharedWrittenCount`/`sharedWriteTimeNanos` are deliberately
 backend-scoped) plus the still-open `reuses` `pg_stat_io` op counter
 (needs a `BufferAccessStrategy`-style ring buffer, feature-sized).
+
+## Background writer / checkpointer `writes` counters (later loop, 2026-07-06)
+
+Closes writeback simplification (4), the last named residual in the
+writeback bucket besides the feature-sized `reuses` gap.
+
+**Root cause.** `storage.Pool`'s only write counter,
+`sharedWrittenCount`/`sharedWriteTimeNanos`, is deliberately scoped to
+`evictVictim`'s dirty-victim flush — the path a client backend's own
+`Pin`/`PinNew` takes when it needs to evict a dirty buffer to make room for
+itself (mirrors upstream's per-backend `pgBufferUsage.shared_blks_written`,
+which the bgwriter and checkpointer, as separate processes with their own
+`pgBufferUsage` instance, never touch). `WriteDirtyPages` (bgwriter) and
+`flushBatch`/`FlushAllPaced` (checkpointer) therefore never incremented
+*any* write counter — upstream's own `pg_stat_io` rows for these two
+backend types report real, independently-collected write activity, but
+goopg rendered a hardcoded `0`.
+
+**Fix.** Two new context-scoped counter pairs in `internal/storage/
+bufpool.go`, following the exact pattern the pre-existing writeback
+counters (`sharedBgwriterWritebackCount`/`sharedCheckpointWritebackCount`)
+already established one loop prior:
+- `sharedBgwriterWrittenCount`/`sharedBgwriterWriteTimeNanos`, incremented
+  in `WriteDirtyPages` once per slot successfully flushed, bracketed by new
+  `OnBgwriterWriteWait`/`OnBgwriterWriteDone` hooks around the per-victim
+  `flushSlot` call (mirrors `evictVictim`'s own `OnFlushWait`/`OnFlushDone`
+  bracket, now one hook pair per context instead of a single shared pair).
+- `sharedCheckpointWrittenCount`/`sharedCheckpointWriteTimeNanos`,
+  incremented in `flushBatch`'s per-tag postprocessing loop (once per tag
+  whose dirty bit was actually cleared), bracketed by new
+  `OnCheckpointerWriteWait`/`OnCheckpointerWriteDone` hooks around the
+  batch's AIO write-and-wait section (`WriteBlockAIO` issue + `Wait` loop)
+  — one wait/done pair per batch, not per block, since the whole batch's
+  writes are outstanding concurrently via AIO; this is the same
+  once-per-operation (not once-per-page) granularity `extend_time`/
+  `writeback_time` already use elsewhere in this file.
+
+New accessors `Pool.BgwriterWrittenCount()`/`BgwriterWriteTimeNanos()`/
+`CheckpointWrittenCount()`/`CheckpointWriteTimeNanos()` and mutators
+`AddBgwriterWriteTimeNanos`/`AddCheckpointWriteTimeNanos` mirror the
+writeback counters' accessor/mutator shape exactly.
+
+`internal/initdb/open.go` wires the four new hooks right after the
+existing `OnCheckpointerWritebackWait/Done` pair, using the identical
+`act.LookupTrackedGoroutine()` → `WaitEventStart(..., WaitDataFileWrite)` /
+`WaitEventEnd()` → `Add*WriteTimeNanos` shape every other `On*Wait/Done`
+pair in that function already follows — no new gating logic, since
+`LookupTrackedGoroutine` already resolves correctly from inside
+`WriteDirtyPages`/`flushBatch` (both run on their own registered background
+goroutine per the "Registered bgwriter/checkpointer background slots"
+section above).
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` reads the four new
+counters into local `poolBgwriterWritten(TimeNanos)`/
+`poolCheckpointWritten(TimeNanos)` variables and renders them into the
+`(background writer|checkpointer, relation, normal)` rows' `writes`/
+`write_bytes`/`write_time` cells (`write_bytes = writes * 8192`, matching
+the existing client-backend/read/extend cells' byte-derivation), switching
+those two `case` arms from a single `if op == ioOpWriteback` check to a
+`switch op { case ioOpWriteback: ...; case ioOpWrite: ... }` to add the new
+op without duplicating the row-match condition.
+
+**Tests:** `internal/storage/writeback_test.go`'s
+`TestPoolBgwriterAndCheckpointerWrittenCountsAreTracked` (drives both
+`WriteDirtyPages` and `FlushAllPaced` against separate dirty relations and
+asserts each context's counter increments independently, while
+`BufferCounters()`'s backend-scoped `written` stays exactly 0 throughout —
+the invariant this whole simplification protects); `internal/executor/
+pgstat_io_test.go`'s `TestPgStatIOBgwriterCheckpointerWritesRendered`
+(end-to-end: dirty 3 pages, `WriteDirtyPages`, assert the rendered
+`writes`/`write_bytes`/`write_time` cells on the background-writer row and
+that the checkpointer row's `writes` cell is still `0` since
+`FlushAllPaced` was never called in that test).
+
+**Verification:** `go build ./...` clean; `go vet` clean on
+`internal/storage/... internal/executor/... internal/initdb/...`; `go test
+-race ./internal/storage/...` PASS; `go test -count=1
+./internal/executor/... ./internal/initdb/... ./internal/wal/...
+./cmd/goopg/... ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS.
+
+This closes writeback simplification (4) — the writeback bucket's only
+remaining open item is the feature-sized `reuses` `pg_stat_io` op counter
+(needs a `BufferAccessStrategy`-style ring buffer goopg does not
+implement).

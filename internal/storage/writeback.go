@@ -19,7 +19,12 @@ import "sync/atomic"
 // GUC-configured cadence, not a fabricated counter. The simplification
 // (one relation per hint instead of a coalesced batch across whichever
 // relations were touched since the last hint) is recorded in the deferral
-// ledger. writeback_time is added separately by the caller's
+// ledger. (The sibling "background writer/checkpointer writes/write_bytes/
+// write_time stay 0" simplification this file's doc comment used to name is
+// now closed — see Pool.sharedBgwriterWrittenCount/sharedCheckpointWrittenCount
+// in bufpool.go and their OnBgwriterWriteWait/Done/OnCheckpointerWriteWait/Done
+// hooks, a distinct real counter from this file's writeback-hint accounting.)
+// writeback_time is added separately by the caller's
 // On*WritebackDone hook (initdb.Open), which measures the real elapsed
 // time around SyncFileRangeHint the same way OnFlushDone/OnExtendDone
 // measure write_time/extend_time.
