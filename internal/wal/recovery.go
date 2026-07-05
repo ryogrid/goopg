@@ -1127,6 +1127,56 @@ const (
 	// Format: kind(1) | tableOID(4) | queryLen(2) | querySQL
 	RecordKindCreateView byte = 103
 
+	// RecordKindCreateTSDict records a `CREATE TEXT SEARCH DICTIONARY name
+	// (TEMPLATE = tmpl [, opt = val, ...])` event (DU-002 restart-persistence
+	// follow-up to slice 437, M0119-0004). goopg has no per-dictionary file
+	// namespace, so the physical redo path is a no-op (ApplyRecord returns
+	// (false, nil)); the recovery driver in
+	// internal/initdb/tsdict_ddl_recovery.go scans the WAL for these records
+	// after physical replay (must run after replaySchemaDDLRecords — a
+	// dictionary is schema-scoped) and re-registers each dictionary with its
+	// original OID. Mirrors RecordKindCreateConversion.
+	// Format: kind(1) | oid(4) | ownerOID(4) | template(4) | nameLen(2) |
+	//   name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+	//   initOptionLen(2) | initOption(initOptionLen bytes)
+	RecordKindCreateTSDict byte = 104
+
+	// RecordKindDropTSDict records a `DROP TEXT SEARCH DICTIONARY <name>`
+	// event. Counterpart to RecordKindCreateTSDict; the recovery driver
+	// removes the (schema, name) pair from the catalog instead of adding it.
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes)
+	RecordKindDropTSDict byte = 105
+
+	// RecordKindCreateTSConfig records a `CREATE TEXT SEARCH CONFIGURATION
+	// name (PARSER = parser_name)` event (DU-002 restart-persistence
+	// follow-up to slice 446, M0119-0004). Like RecordKindCreateTSDict, this
+	// is a catalog-only event with no physical page state; the recovery
+	// driver in internal/initdb/tsconfig_ddl_recovery.go re-applies it after
+	// schema replay. The configuration's ADD MAPPING entries are recorded
+	// separately by RecordKindAddTSConfigMapping (one record per ALTER ...
+	// ADD MAPPING statement, replayed in WAL order after the CREATE record).
+	// Format: kind(1) | oid(4) | ownerOID(4) | parser(4) | nameLen(2) |
+	//   name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes)
+	RecordKindCreateTSConfig byte = 106
+
+	// RecordKindAddTSConfigMapping records an `ALTER TEXT SEARCH
+	// CONFIGURATION name ADD MAPPING FOR tok [, ...] WITH dict [, ...]`
+	// event. Replayed after its configuration's RecordKindCreateTSConfig
+	// record (WAL is scanned in order).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | tokenTypeLen(2) | tokenType(tokenTypeLen bytes) |
+	//   dictCount(2) | dictOID(4) * dictCount
+	RecordKindAddTSConfigMapping byte = 107
+
+	// RecordKindDropTSConfig records a `DROP TEXT SEARCH CONFIGURATION
+	// <name>` event. Counterpart to RecordKindCreateTSConfig; the recovery
+	// driver removes the (schema, name) pair (and its mappings) from the
+	// catalog instead of adding it.
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes)
+	RecordKindDropTSConfig byte = 108
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -3221,6 +3271,319 @@ func DecodeDropConversion(payload []byte) (name, schema string, err error) {
 	off += 2
 	if len(payload) < off+schemaLen {
 		return "", "", fmt.Errorf("wal: drop-conversion payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, nil
+}
+
+// EncodeCreateTSDict encodes a CREATE TEXT SEARCH DICTIONARY event (DU-002
+// restart-persistence follow-up to slice 437, M0119-0004). The OID and
+// resolved template OID are carried so recovery re-registers the dictionary
+// identically to the live server.
+// Format: kind(1) | oid(4) | ownerOID(4) | template(4) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// initOptionLen(2) | initOption(initOptionLen bytes).
+func EncodeCreateTSDict(name, schema, initOption string, oid, ownerOID, template uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(initOption) > 0xFFFF {
+		initOption = initOption[:0xFFFF]
+	}
+	out := make([]byte, 13+6+len(name)+len(schema)+len(initOption))
+	out[0] = RecordKindCreateTSDict
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], template)
+	off := 13
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(initOption)))
+	off += 2
+	copy(out[off:], initOption)
+	return out
+}
+
+// DecodeCreateTSDict decodes a RecordKindCreateTSDict payload.
+func DecodeCreateTSDict(payload []byte) (name, schema, initOption string, oid, ownerOID, template uint32, err error) {
+	if len(payload) < 13 {
+		return "", "", "", 0, 0, 0, fmt.Errorf("wal: create-tsdict payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateTSDict {
+		return "", "", "", 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-tsdict", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	template = binary.LittleEndian.Uint32(payload[9:13])
+	off := 13
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-tsdict payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-tsdict payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, err
+	}
+	if initOption, err = readStr(); err != nil {
+		return "", "", "", 0, 0, 0, err
+	}
+	return name, schema, initOption, oid, ownerOID, template, nil
+}
+
+// EncodeDropTSDict encodes a DROP TEXT SEARCH DICTIONARY event. Format:
+// kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeDropTSDict(name, schema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(schema))
+	out[0] = RecordKindDropTSDict
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeDropTSDict decodes a RecordKindDropTSDict payload.
+func DecodeDropTSDict(payload []byte) (name, schema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-tsdict payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTSDict {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-tsdict", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: drop-tsdict payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", fmt.Errorf("wal: drop-tsdict payload truncated (need %d bytes)", off+schemaLen)
+	}
+	schema = string(payload[off : off+schemaLen])
+	return name, schema, nil
+}
+
+// EncodeCreateTSConfig encodes a CREATE TEXT SEARCH CONFIGURATION event
+// (DU-002 restart-persistence follow-up to slice 446, M0119-0004).
+// Format: kind(1) | oid(4) | ownerOID(4) | parser(4) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeCreateTSConfig(name, schema string, oid, ownerOID, parser uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 13+4+len(name)+len(schema))
+	out[0] = RecordKindCreateTSConfig
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint32(out[5:9], ownerOID)
+	binary.LittleEndian.PutUint32(out[9:13], parser)
+	off := 13
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeCreateTSConfig decodes a RecordKindCreateTSConfig payload.
+func DecodeCreateTSConfig(payload []byte) (name, schema string, oid, ownerOID, parser uint32, err error) {
+	if len(payload) < 13 {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: create-tsconfig payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateTSConfig {
+		return "", "", 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-tsconfig", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	ownerOID = binary.LittleEndian.Uint32(payload[5:9])
+	parser = binary.LittleEndian.Uint32(payload[9:13])
+	off := 13
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-tsconfig payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-tsconfig payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", 0, 0, 0, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", 0, 0, 0, err
+	}
+	return name, schema, oid, ownerOID, parser, nil
+}
+
+// EncodeAddTSConfigMapping encodes an ALTER TEXT SEARCH CONFIGURATION name
+// ADD MAPPING event. Format: kind(1) | nameLen(2) | name(nameLen bytes) |
+// schemaLen(2) | schema(schemaLen bytes) | tokenTypeLen(2) |
+// tokenType(tokenTypeLen bytes) | dictCount(2) | dictOID(4) * dictCount.
+func EncodeAddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(tokenType) > 0xFFFF {
+		tokenType = tokenType[:0xFFFF]
+	}
+	if len(dictOIDs) > 0xFFFF {
+		dictOIDs = dictOIDs[:0xFFFF]
+	}
+	out := make([]byte, 1+6+len(name)+len(schema)+len(tokenType)+2+4*len(dictOIDs))
+	out[0] = RecordKindAddTSConfigMapping
+	off := 1
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(name)))
+	off += 2
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tokenType)))
+	off += 2
+	copy(out[off:], tokenType)
+	off += len(tokenType)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(dictOIDs)))
+	off += 2
+	for _, d := range dictOIDs {
+		binary.LittleEndian.PutUint32(out[off:off+4], d)
+		off += 4
+	}
+	return out
+}
+
+// DecodeAddTSConfigMapping decodes a RecordKindAddTSConfigMapping payload.
+func DecodeAddTSConfigMapping(payload []byte) (name, schema, tokenType string, dictOIDs []uint32, err error) {
+	if len(payload) < 1 {
+		return "", "", "", nil, fmt.Errorf("wal: add-tsconfig-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAddTSConfigMapping {
+		return "", "", "", nil, fmt.Errorf("wal: record kind %d is not add-tsconfig-mapping", payload[0])
+	}
+	off := 1
+	readStr := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: add-tsconfig-mapping payload truncated (need %d bytes)", off+2)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: add-tsconfig-mapping payload truncated (need %d bytes)", off+l)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	if name, err = readStr(); err != nil {
+		return "", "", "", nil, err
+	}
+	if schema, err = readStr(); err != nil {
+		return "", "", "", nil, err
+	}
+	if tokenType, err = readStr(); err != nil {
+		return "", "", "", nil, err
+	}
+	if len(payload) < off+2 {
+		return "", "", "", nil, fmt.Errorf("wal: add-tsconfig-mapping payload truncated (need %d bytes)", off+2)
+	}
+	count := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+4*count {
+		return "", "", "", nil, fmt.Errorf("wal: add-tsconfig-mapping payload truncated (need %d bytes)", off+4*count)
+	}
+	dictOIDs = make([]uint32, count)
+	for i := 0; i < count; i++ {
+		dictOIDs[i] = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+	}
+	return name, schema, tokenType, dictOIDs, nil
+}
+
+// EncodeDropTSConfig encodes a DROP TEXT SEARCH CONFIGURATION event. Format:
+// kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes).
+func EncodeDropTSConfig(name, schema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(schema))
+	out[0] = RecordKindDropTSConfig
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	return out
+}
+
+// DecodeDropTSConfig decodes a RecordKindDropTSConfig payload.
+func DecodeDropTSConfig(payload []byte) (name, schema string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: drop-tsconfig payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTSConfig {
+		return "", "", fmt.Errorf("wal: record kind %d is not drop-tsconfig", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: drop-tsconfig payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen {
+		return "", "", fmt.Errorf("wal: drop-tsconfig payload truncated (need %d bytes)", off+schemaLen)
 	}
 	schema = string(payload[off : off+schemaLen])
 	return name, schema, nil
@@ -6588,6 +6951,17 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/conversion_ddl_recovery.go scans the WAL for
 		// these records after physical replay and re-applies them to the
 		// catalog's conversion registry.
+		return false, nil
+	case RecordKindCreateTSDict, RecordKindDropTSDict, RecordKindCreateTSConfig, RecordKindAddTSConfigMapping, RecordKindDropTSConfig:
+		// CREATE/DROP TEXT SEARCH DICTIONARY and CREATE/ADD MAPPING/DROP TEXT
+		// SEARCH CONFIGURATION records (DU-002 restart-persistence follow-up
+		// to slices 437/446, M0119-0004) carry only pg_ts_dict/pg_ts_config
+		// metadata; goopg has no per-dictionary/per-configuration file
+		// namespace, so the physical replay path has nothing to do. The
+		// recovery drivers in internal/initdb/tsdict_ddl_recovery.go and
+		// internal/initdb/tsconfig_ddl_recovery.go scan the WAL for these
+		// records after physical replay and re-apply them to the catalog's
+		// text-search registries.
 		return false, nil
 	case RecordKindCreateCollation, RecordKindDropCollation, RecordKindAlterCollationRename, RecordKindAlterCollationOwner, RecordKindAlterCollationSetSchema:
 		// CREATE/DROP/ALTER COLLATION records (DU-002 restart-persistence

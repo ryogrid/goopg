@@ -1096,6 +1096,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: conversion DDL replay: %w", err)
 	}
+	// DU-002 restart-persistence follow-up: restore CREATE/DROP TEXT SEARCH
+	// DICTIONARY objects (pg_ts_dict) and CREATE/ADD MAPPING/DROP TEXT
+	// SEARCH CONFIGURATION objects (pg_ts_config/pg_ts_config_map) from the
+	// WAL the same way. Like conversion/collation, both are schema-scoped
+	// (keyed by namespace OID + name), so this must run after
+	// replaySchemaDDLRecords above has repopulated the schema OID map.
+	if err := replayTSDictDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: text search dictionary DDL replay: %w", err)
+	}
+	if err := replayTSConfigDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: text search configuration DDL replay: %w", err)
+	}
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP COLLATION
 	// objects (pg_collation) from the WAL the same way. Like a conversion, a
 	// collation is schema-scoped (keyed by namespace OID + name), so this

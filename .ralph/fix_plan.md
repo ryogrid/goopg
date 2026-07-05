@@ -84,6 +84,16 @@ slice from `.ralph/deferral_ledger.md` next, since the M0122-0003 writeback/
 pg_stat_io bucket's only remaining items are each feature-sized or a
 recorded-not-required simplification.
 
+**2026-07-06 (later loop):** landed the slice-437/446 restart-persistence
+follow-up (TEXT SEARCH DICTIONARY/CONFIGURATION now survive a restart via 5
+new WAL record kinds + two recovery drivers, see deferral ledger + the
+`0110-0001` design doc's new section). Next unresolved DU-002 items per the
+same ledger row: 42710 duplicate-mapping detection in
+`execAlterTSConfigAddMapping`, or the `ALTER TEXT SEARCH CONFIGURATION
+RENAME TO/SET SCHEMA/DROP MAPPING` forms (parser dispatch in
+`internal/parser/ddl.go` currently falls through to a discarded compat
+no-op for all of these).
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

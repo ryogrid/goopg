@@ -14810,3 +14810,63 @@ Gates: `go build ./...` clean; `go test -count=1 -run
 TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
 -count=1 ./internal/catalog/... ./internal/parser/... ./internal/executor/...
 ./internal/planner/... ./internal/analyzer/...` PASS.
+
+## Slice 437/446 follow-up: TEXT SEARCH DICTIONARY/CONFIGURATION restart persistence (2026-07-06)
+
+Closes the restart/WAL-persistence deferral both slice 437 (DICTIONARY) and
+slice 446 (CONFIGURATION) recorded: a `CREATE TEXT SEARCH DICTIONARY`/
+`CREATE TEXT SEARCH CONFIGURATION`/`ALTER TEXT SEARCH CONFIGURATION ... ADD
+MAPPING` created before a crash or restart previously vanished from
+`pg_ts_dict`/`pg_ts_config`/`pg_ts_config_map` afterward — a pg_dump taken
+post-restart would silently omit the object, with no error. Mirrors the
+`CREATE CAST`/`CREATE TRANSFORM`/`CREATE CONVERSION`/`CREATE COLLATION`
+restart-persistence precedent exactly (catalog-only side effect, no
+per-object on-disk file namespace, so the physical WAL redo path is a no-op
+and a post-replay recovery pass reapplies the event to the catalog).
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateTSDict`
+(104), `RecordKindDropTSDict` (105), `RecordKindCreateTSConfig` (106),
+`RecordKindAddTSConfigMapping` (107), `RecordKindDropTSConfig` (108) — plus
+their `Encode`/`Decode` pairs, each tested round-trip in
+`internal/wal/tsdict_tsconfig_ddl_test.go` (mirrors
+`conversion_ddl_test.go`). `ApplyRecord`'s dispatcher gained one case
+returning `(false, nil)` for all five kinds (no physical page state).
+`RecordKindAddTSConfigMapping`'s payload carries the full resolved
+`dictOIDs` list (not just the token type), so replay does not need to
+re-resolve dictionary names against the (possibly since-changed) catalog.
+
+**Catalog recovery hooks** (`internal/catalog/catalog.go`):
+`CreateTSDictDuringRecovery`/`DropTSDictDuringRecovery` and
+`CreateTSConfigDuringRecovery`/`AddTSConfigMappingDuringRecovery`/
+`DropTSConfigDuringRecovery` mirror `CreateConversionDuringRecovery`'s
+idempotent overwrite-by-OID semantics (a partial-then-full replay may see the
+same record twice).
+
+**Recovery drivers**: new `internal/initdb/tsdict_ddl_recovery.go` and
+`internal/initdb/tsconfig_ddl_recovery.go` (mirroring
+`conversion_ddl_recovery.go`), both wired into `internal/initdb/open.go`
+immediately after `replayConversionDDLRecords` — schema-scoped like
+conversion/collation, so they must run after `replaySchemaDDLRecords`. A
+configuration's `ADD MAPPING` records replay in WAL order after their own
+`CREATE` record with no extra bookkeeping, since the WAL is scanned in
+order. Tests: `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go` (6 new
+tests: create/drop-after-create/missing-wal-dir × {DICTIONARY,
+CONFIGURATION-with-mapping}, mirroring `conversion_ddl_recovery_test.go`).
+
+**WAL emission sites** (`internal/executor/operators_ddl.go`): the existing
+`"text search dictionary"`/`"text search configuration"` CREATE cases and
+`execAlterTSConfigAddMapping` now append the corresponding WAL record after
+each successful catalog mutation (previously they only mutated the
+in-memory registry); the shared DROP fallthrough's `DropTSDict`/`DropTSConfig`
+calls now also emit `EncodeDropTSDict`/`EncodeDropTSConfig`.
+
+**Still deferred** (unchanged from slice 446's own list — out of scope for
+this restart-persistence-only follow-up): duplicate-mapping 42710 detection,
+every other `ALTER TEXT SEARCH CONFIGURATION` form (`ALTER MAPPING REPLACE`,
+`DROP MAPPING`, `RENAME TO`, `SET SCHEMA`), and the `CONFIGURATION =
+source_config` COPY-from-existing-configuration form of CREATE.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/wal/...
+./internal/catalog/... ./internal/initdb/...` PASS (new tests above);
+`go test -count=1 -run TestPort_PgDumpConnectionSetup ./internal/testport/
+-v` PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench pre-commit smoke PASS.

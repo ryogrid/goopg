@@ -11281,6 +11281,45 @@ func (c *InMemory) ListUserTSDicts() []*UserTSDict {
 	return out
 }
 
+// CreateTSDictDuringRecovery is the idempotent version of CreateTSDict used
+// by the WAL-replay driver (internal/initdb/tsdict_ddl_recovery.go). Unlike
+// CreateTSDict it takes the OID from the WAL record (so the recovered
+// dictionary matches the pre-crash OID exactly) and overwrites rather than
+// erroring when an entry with the same OID is already present (replay may
+// see the same record more than once across a partial-then-full replay).
+// Mirrors CreateConversionDuringRecovery. DU-002 restart-persistence
+// follow-up to slice 437.
+func (c *InMemory) CreateTSDictDuringRecovery(ud *UserTSDict, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	ud.NamespaceOID = nsOID
+	for i, existing := range c.userTSDicts {
+		if existing.OID == ud.OID {
+			c.userTSDicts[i] = ud
+			if ud.OID >= c.nextOID {
+				c.nextOID = ud.OID + 1
+			}
+			return
+		}
+	}
+	c.userTSDicts = append(c.userTSDicts, ud)
+	if ud.OID >= c.nextOID {
+		c.nextOID = ud.OID + 1
+	}
+}
+
+// DropTSDictDuringRecovery is the idempotent counterpart used for replaying
+// RecordKindDropTSDict. Identical to DropTSDict but discards the
+// found/not-found result — replay does not care whether the dictionary was
+// still present. DU-002 restart-persistence follow-up to slice 437.
+func (c *InMemory) DropTSDictDuringRecovery(name, schema string) {
+	c.DropTSDict(name, schema)
+}
+
 // CreateTSConfig records a CREATE TEXT SEARCH CONFIGURATION in the runtime
 // pg_ts_config registry so pg_dump's getTSConfigurations / dumpTSConfig
 // re-emit it. `schema` is the (already-resolved) schema name the
@@ -11360,6 +11399,49 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 		}
 	}
 	return false
+}
+
+// CreateTSConfigDuringRecovery is the idempotent version of CreateTSConfig
+// used by the WAL-replay driver (internal/initdb/tsconfig_ddl_recovery.go).
+// Unlike CreateTSConfig it takes the OID from the WAL record and overwrites
+// rather than erroring when an entry with the same OID is already present.
+// Mirrors CreateTSDictDuringRecovery. DU-002 restart-persistence follow-up
+// to slice 446.
+func (c *InMemory) CreateTSConfigDuringRecovery(uc *UserTSConfig, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	uc.NamespaceOID = nsOID
+	for i, existing := range c.userTSConfigs {
+		if existing.OID == uc.OID {
+			c.userTSConfigs[i] = uc
+			if uc.OID >= c.nextOID {
+				c.nextOID = uc.OID + 1
+			}
+			return
+		}
+	}
+	c.userTSConfigs = append(c.userTSConfigs, uc)
+	if uc.OID >= c.nextOID {
+		c.nextOID = uc.OID + 1
+	}
+}
+
+// AddTSConfigMappingDuringRecovery is the discard-result recovery
+// counterpart to AddTSConfigMapping, mirroring DropTSDictDuringRecovery.
+// DU-002 restart-persistence follow-up to slice 446.
+func (c *InMemory) AddTSConfigMappingDuringRecovery(name, schema, tokenType string, dictOIDs []uint32) {
+	c.AddTSConfigMapping(name, schema, tokenType, dictOIDs)
+}
+
+// DropTSConfigDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropTSConfig. DU-002 restart-persistence follow-up to
+// slice 446.
+func (c *InMemory) DropTSConfigDuringRecovery(name, schema string) {
+	c.DropTSConfig(name, schema)
 }
 
 // CollationAttrsByName resolves a collation's dump-relevant attributes

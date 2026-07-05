@@ -14520,19 +14520,26 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				if objType == "text search dictionary" {
 					// Drop the dump-visible pg_ts_dict registry entry too so a
 					// dropped dictionary stops round-tripping through pg_dump
-					// (DU-002 slice 437). No WAL emission yet — CREATE TEXT
-					// SEARCH DICTIONARY itself is not restart-durable this
-					// slice either (see catalog.CreateTSDict's doc comment /
-					// the deferral ledger row for this slice).
-					im.DropTSDict(s.Names[0].Name, s.Names[0].Schema)
+					// (DU-002 slice 437). WAL-emit the drop so it survives a
+					// restart, mirroring DROP CONVERSION above.
+					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSDict(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
+							return fmt.Errorf("wal drop-tsdict: %w", werr)
+						}
+					}
 				}
 				if objType == "text search configuration" {
 					// Drop the dump-visible pg_ts_config registry entry (and its
 					// pg_ts_config_map rows, held inline on the same struct) too
 					// so a dropped configuration stops round-tripping through
-					// pg_dump (DU-002 slice 446). No WAL emission yet, mirroring
-					// text search dictionary.
-					im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema)
+					// pg_dump (DU-002 slice 446). WAL-emit the drop so it
+					// survives a restart, mirroring DROP TEXT SEARCH DICTIONARY
+					// above.
+					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfig(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
+							return fmt.Errorf("wal drop-tsconfig: %w", werr)
+						}
+					}
 				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
@@ -15614,10 +15621,15 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateTSDict(ud, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): unlike CREATE
-		// CONVERSION/CAST/TRANSFORM, this slice records no WAL event — a
-		// dictionary created this session does not survive a restart. See
-		// the deferral ledger row for this slice.
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event the recovery driver (internal/initdb/tsdict_ddl_recovery.go)
+		// replays into the dictionary registry on the next startup. Mirrors
+		// CREATE CONVERSION/CAST/TRANSFORM.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSDict(ud.Name, schema, ud.InitOption, ud.OID, ud.Owner, ud.Template)); werr != nil {
+				return fmt.Errorf("wal create-tsdict: %w", werr)
+			}
+		}
 	case "text search configuration":
 		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
 		// (PARSER = parser_name)) so it round-trips through pg_dump (pg_ts_config
@@ -15650,10 +15662,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if _, err := im.CreateTSConfig(uc, schema); err != nil {
 			return &ExecError{Code: "42710", Message: err.Error()}
 		}
-		// DU-002 restart-persistence follow-up (M0119-0004): like CREATE TEXT
-		// SEARCH DICTIONARY, this slice records no WAL event — a configuration
-		// created this session does not survive a restart. See the deferral
-		// ledger row for this slice.
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event the recovery driver
+		// (internal/initdb/tsconfig_ddl_recovery.go) replays into the
+		// configuration registry on the next startup, mirroring CREATE TEXT
+		// SEARCH DICTIONARY. ADD MAPPING statements record their own
+		// follow-up WAL event (execAlterTSConfigAddMapping below).
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSConfig(uc.Name, schema, uc.OID, uc.Owner, uc.Parser)); werr != nil {
+				return fmt.Errorf("wal create-tsconfig: %w", werr)
+			}
+		}
 	case "transform":
 		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang
 		// (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] | ...)) so it
@@ -15742,6 +15761,15 @@ func (o *ddlOp) execAlterTSConfigAddMapping(s *parser.AlterTSConfigAddMappingStm
 	for _, tt := range s.TokenTypes {
 		if !im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs) {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event per token type so the mapping survives a restart, replayed
+		// by internal/initdb/tsconfig_ddl_recovery.go after the
+		// configuration's own CREATE record.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
+				return fmt.Errorf("wal add-tsconfig-mapping: %w", werr)
+			}
 		}
 	}
 	return nil
