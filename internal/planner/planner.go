@@ -5902,7 +5902,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			// of the aggregate's output column. Keep FuncCall wrapper for column label.
 			// M0097-0035.
 			if strings.ToLower(x.Name.String()) == "pg_typeof" {
-				typName := pgTypeofDisplayName(b.typ.Name)
+				typName := pgTypeofDisplayName(b.typ)
 				return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 			}
 			return &ColumnRef{pos: x.Pos(), Index: b.index, Name: agg.output.schema[b.index].Name, Type: b.typ}, nil
@@ -5913,7 +5913,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg).Name)
+			typName := pgTypeofDisplayName(exprType(arg))
 			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
@@ -9093,8 +9093,8 @@ func castTargetLabel(t string) string {
 
 // pgTypeofDisplayName maps a planner type name to the display name pg_typeof returns.
 // Mirrors PostgreSQL's format_type_be for common types. M0097-0035.
-func pgTypeofDisplayName(name string) string {
-	switch strings.ToLower(name) {
+func pgTypeofDisplayName(t catalog.Type) string {
+	switch strings.ToLower(t.Name) {
 	case "int4", "int", "integer", "serial":
 		return "integer"
 	case "int2", "smallint", "smallserial":
@@ -9111,7 +9111,16 @@ func pgTypeofDisplayName(name string) string {
 		return "text"
 	case "varchar", "character varying":
 		return "character varying"
-	case "char", "character", "bpchar":
+	case "char":
+		// Quoted `"char"` (pg_type OID 18) never carries a typmod; the bare
+		// CHAR keyword always does (parser-synthesized length 1 if none was
+		// written). See exprType's *CastExpr case. format_type_be quotes
+		// OID 18's name since "char" collides with the reserved keyword.
+		if len(t.Args) == 0 {
+			return `"char"`
+		}
+		return "character"
+	case "character", "bpchar":
 		return "character"
 	case "numeric", "decimal":
 		return "numeric"
@@ -9138,7 +9147,7 @@ func pgTypeofDisplayName(name string) string {
 	case "oid":
 		return "oid"
 	default:
-		return name
+		return t.Name
 	}
 }
 
@@ -9248,7 +9257,19 @@ func exprType(e Expr) catalog.Type {
 	case *CastExpr:
 		// CastExpr carries the declared target type. M0097-0003.
 		if x.TargetType != "" {
-			return catalog.Type{Name: x.TargetType}
+			t := catalog.Type{Name: x.TargetType}
+			// "char" is ambiguous: PostgreSQL's grammar maps the bare CHAR
+			// keyword to bpchar with an implicit length, but the quoted
+			// identifier "char" names a distinct type (pg_type OID 18, a
+			// 1-byte internal type) that never carries a typmod. The parser
+			// (select.go's synthesizeBareCharTypmod) synthesizes Typmod=1 for
+			// the bare form and leaves it 0 for the quoted form, so Typmod's
+			// presence is the signal for disambiguating downstream (wire
+			// TypeOID in typeOIDFor, pg_typeof's pgTypeofDisplayName).
+			if strings.EqualFold(x.TargetType, "char") && x.Typmod > 0 {
+				t.Args = []int64{x.Typmod}
+			}
+			return t
 		}
 		return exprType(x.Operand)
 	case *BinaryOp:
@@ -10233,7 +10254,7 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg).Name)
+			typName := pgTypeofDisplayName(exprType(arg))
 			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))

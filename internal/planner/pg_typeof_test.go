@@ -77,6 +77,51 @@ func TestPgTypeofFoldsToCompileTimeType(t *testing.T) {
 	}
 }
 
+// TestPgTypeofCharDisambiguation covers M0122-0005's "1-byte char (OID 18)
+// disambiguation" gap: pg_typeof must report the quoted identifier "char"
+// (with literal quotes, mirroring PostgreSQL's format_type_be for pg_type
+// OID 18) distinctly from the bare CHAR keyword (which the grammar maps to
+// bpchar, displayed as "character"). Both share Type.Name=="char" downstream
+// of the parser; only the CastExpr's Typmod (synthesized 1 for bare char,
+// left 0 for quoted "char" — see select.go's synthesizeBareCharTypmod)
+// distinguishes them.
+func TestPgTypeofCharDisambiguation(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"quoted char is OID 18", `SELECT pg_typeof('x'::"char")`, `"char"`},
+		{"bare char is bpchar", `SELECT pg_typeof('x'::char)`, "character"},
+		{"explicit-length char is bpchar", `SELECT pg_typeof('x'::char(3))`, "character"},
+	}
+	cat := pgbenchCatalog(t)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stmt := parseOne(t, tc.sql)
+			plan, err := Plan(stmt, cat)
+			if err != nil {
+				t.Fatalf("Plan: %v", err)
+			}
+			proj, ok := plan.(*Project)
+			if !ok {
+				t.Fatalf("plan=%T want *Project", plan)
+			}
+			fc, ok := proj.Targets[0].(*FuncCall)
+			if !ok || fc.Name != "pg_typeof" || len(fc.Args) != 1 {
+				t.Fatalf("target=%#v want pg_typeof(*StringConst)", proj.Targets[0])
+			}
+			sc, ok := fc.Args[0].(*StringConst)
+			if !ok {
+				t.Fatalf("pg_typeof arg=%T want *StringConst (folded)", fc.Args[0])
+			}
+			if sc.Value != tc.want {
+				t.Errorf("pg_typeof = %q, want %q", sc.Value, tc.want)
+			}
+		})
+	}
+}
+
 // TestResolvePolyAggOutputType verifies that user-defined aggregates with
 // anycompatible/anyelement SType resolve to the actual input-derived type
 // rather than retaining the polymorphic type name. M0097-0035.

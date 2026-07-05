@@ -2265,7 +2265,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type.Name)
+			oid := typeOIDFor(sc.Type)
 			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
 			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
 			// rather than a scalar int4. M0118-0002.
@@ -2822,8 +2822,8 @@ func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 // typeOIDFor maps a goopg type name to a pg_type.oid the wire
 // protocol can advertise. Unknown types fall back to text (25),
 // which is wire-compatible with libpq's text-format reader.
-func typeOIDFor(name string) uint32 {
-	switch strings.ToLower(name) {
+func typeOIDFor(t catalog.Type) uint32 {
+	switch strings.ToLower(t.Name) {
 	case "int2", "smallint", "smallserial":
 		return 21
 	case "int4", "integer", "int", "serial":
@@ -2860,7 +2860,15 @@ func typeOIDFor(name string) uint32 {
 		return 25
 	case "varchar":
 		return 1043
-	case "char", "bpchar":
+	case "char":
+		// Quoted `"char"` (pg_type OID 18) never carries a typmod, unlike the
+		// bare CHAR keyword which the parser always gives an implicit or
+		// explicit length. See planner.exprType's *CastExpr case. M0122-0005.
+		if len(t.Args) == 0 {
+			return catalog.OIDChar
+		}
+		return 1042
+	case "bpchar":
 		return 1042
 	case "numeric", "decimal":
 		return 1700
@@ -2886,7 +2894,7 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type.Name)
+			oid := typeOIDFor(sc.Type)
 			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
 			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
 			// rather than a scalar int4. M0118-0002.

@@ -652,7 +652,7 @@ func (s *Server) describeViaPlanner(query string) ([]protocol.FieldDescription, 
 	for i, sc := range schema {
 		fields[i] = protocol.FieldDescription{
 			Name:         sc.Name,
-			TypeOID:      typeOIDFor(sc.Type.Name),
+			TypeOID:      typeOIDFor(sc.Type),
 			TypeSize:     -1,
 			TypeModifier: -1,
 			Format:       0,

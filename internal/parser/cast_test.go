@@ -71,3 +71,49 @@ func TestParseCastChained(t *testing.T) {
 		t.Errorf("inner type=%q want int8", inner.Type.Name)
 	}
 }
+
+// TestParseCastCharDisambiguation covers M0122-0005's "1-byte char (OID 18)
+// disambiguation" gap: the parser must distinguish the bare CHAR keyword
+// (PostgreSQL's grammar maps it to bpchar with an implicit length of 1) from
+// the quoted identifier "char" (pg_type OID 18, a distinct 1-byte internal
+// type that never carries a typmod). Since both produce Type.Name=="char",
+// an explicit typmod is the only signal later stages (exprType, typeOIDFor,
+// pgTypeofDisplayName) have to tell them apart — bare char must synthesize
+// typmod 1 (like the existing ddl.go:parseColumnType path already does for
+// column declarations), while quoted "char" must have none.
+func TestParseCastCharDisambiguation(t *testing.T) {
+	cases := []struct {
+		name    string
+		sql     string
+		typmods []int64
+	}{
+		{"bare unquoted char", `SELECT 'x'::char`, []int64{1}},
+		{"bare char with explicit length", `SELECT 'x'::char(3)`, []int64{3}},
+		{"quoted char", `SELECT 'x'::"char"`, nil},
+		{"CAST(...AS char)", `SELECT CAST('x' AS char)`, []int64{1}},
+		{`CAST(...AS "char")`, `SELECT CAST('x' AS "char")`, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cast, ok := stmts[0].(*SelectStmt).Targets[0].Expr.(*CastExpr)
+			if !ok {
+				t.Fatalf("target=%T want *CastExpr", stmts[0].(*SelectStmt).Targets[0].Expr)
+			}
+			if cast.Type.Name != "char" {
+				t.Errorf("type=%q want char", cast.Type.Name)
+			}
+			if len(cast.Typmods) != len(tc.typmods) {
+				t.Fatalf("typmods=%v want %v", cast.Typmods, tc.typmods)
+			}
+			for i := range tc.typmods {
+				if cast.Typmods[i] != tc.typmods[i] {
+					t.Errorf("typmods=%v want %v", cast.Typmods, tc.typmods)
+				}
+			}
+		})
+	}
+}

@@ -2416,11 +2416,28 @@ func (p *parser) parseAnyTail(left Expr, pos int) (Expr, error) {
 	return &InExpr{pos: pos, Operand: left, Negated: false, List: elems}, nil
 }
 
+// synthesizeBareCharTypmod mirrors parseColumnType's handling of the bare
+// `char`/CHARACTER keyword (internal/parser/ddl.go), which PostgreSQL's
+// grammar always resolves to bpchar with an implicit length of 1. The
+// quoted identifier `"char"` names a distinct type (pg_type OID 18, a
+// 1-byte internal type) and never takes a typmod. Because the parser
+// otherwise discards whether the type-name token was quoted, an explicit
+// (possibly synthesized) typmod is the only signal later stages have to
+// tell the two apart — so a bare, typmod-less `char` gets length 1
+// synthesized here, exactly as the column-type path already does.
+func synthesizeBareCharTypmod(quoted bool, name string, typmods []int64) []int64 {
+	if !quoted && len(typmods) == 0 && strings.EqualFold(name, "char") {
+		return []int64{1}
+	}
+	return typmods
+}
+
 // parseCastTail consumes a single `:: typename [(typmods)]` after the
 // caller has already produced the operand expression. Returns the
 // CastExpr; the caller chains by re-checking for `::` after.
 func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 	tok := p.advance() // consumes "::"
+	firstTok := p.cur()
 	name, err := p.parseTypeNameAfterCast()
 	if err != nil {
 		return nil, err
@@ -2458,6 +2475,7 @@ func (p *parser) parseCastTail(operand Expr) (Expr, error) {
 		}
 		p.advance()
 	}
+	typmods = synthesizeBareCharTypmod(firstTok.Kind == TokenQuotedIdent, name.Name, typmods)
 	return &CastExpr{pos: tok.Pos, Operand: operand, Type: name, Typmods: typmods}, nil
 }
 
@@ -2511,6 +2529,7 @@ func (p *parser) parseCastFuncExpr(pos int) (Expr, error) {
 		return nil, p.errAtCur("expected AS in CAST(expr AS type)")
 	}
 	// Parse the target type using the same shared type-name parser as ::.
+	firstTok := p.cur()
 	name, err := p.parseTypeNameAfterCast()
 	if err != nil {
 		return nil, err
@@ -2549,6 +2568,7 @@ func (p *parser) parseCastFuncExpr(pos int) (Expr, error) {
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')' to close CAST()")
 	}
+	typmods = synthesizeBareCharTypmod(firstTok.Kind == TokenQuotedIdent, name.Name, typmods)
 	return &CastExpr{pos: pos, Operand: expr, Type: name, Typmods: typmods}, nil
 }
 

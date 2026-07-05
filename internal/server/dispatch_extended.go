@@ -267,7 +267,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		for i, sc := range schema {
 			res.Fields[i] = protocol.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeOID:      typeOIDFor(sc.Type),
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,
