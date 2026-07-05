@@ -364,7 +364,14 @@ mirroring M0119's ledger `status` column.
       `TestAnalyzeWithOrdinalityNamedColumn`. Verified end-to-end against
       a live server + real `psql` (`unnest`/`generate_series`/
       `regexp_matches`, single- and multi-arg `unnest`). The comma/LATERAL
-      `ctx.OuterRows` gap (ledger row 480) is separate and still open.
+      `ctx.OuterRows` gap (ledger row 480) was **also since fixed**
+      (2026-07-06, commit `d09ddff0`): root cause was
+      `planner.nodeReferencesOuter` not special-casing
+      `*FromUnnest`/`*FromRegexpMatches`, so `FROM tbl, unnest(tbl.arr) AS
+      t(m)`-shaped comma-joins/LATERAL never routed through
+      `joinOp.openLateral` and the SRF's arg evaluated against a nil outer
+      row (`XX000: column ref arr/1 on nil slot`). No FROM-clause
+      SRF-correlation gap is known open now.
 - [ ] **M0122-0003 — EXPLAIN output & pg_stat instrumentation** (~7, partial).
       FORMAT XML/YAML **done** (2026-07-04, loop #8) — design:
       `docs/design/0122-0003-explain-format-xml-yaml.md`. Per-CTE ANALYZE
@@ -599,6 +606,27 @@ mirroring M0119's ledger `status` column.
       ./internal/parser/... ./internal/server/... ./internal/config/...`
       all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Only
       `reuses` and local/temp-buffer terms remain open in this cluster.
+      **2026-07-06 (later loop):** fixed an independent, unrelated
+      `planChildren` gap surfaced by `unimplemented_feat.json`:
+      `*planner.Update`/`*planner.Delete` had no case in
+      `internal/executor/operators_explain.go`'s `planChildren` (unlike
+      `*planner.Insert`'s `p.Source`), so `EXPLAIN`/`EXPLAIN ANALYZE` on
+      an UPDATE/DELETE silently dropped the target scan (and any
+      `FROM`/`USING` join scans) — confirmed against real PG 18.3, which
+      always nests them under `Update on t`/`Delete on t`. Added cases
+      returning `p.Child` + `p.FromScans`/`p.UsingScans`. `EXPLAIN
+      ANALYZE`'s actual-stats for that child remain absent (the executor
+      drives it via `extractScan`, not a nested `Build()`+`maybeInstrument`'d
+      operator) — degrades gracefully to a cost-estimate-only line, not a
+      crash; recorded as a residual in the design doc, not blocking since
+      the actually-reported gap (plain EXPLAIN) is now fully correct.
+      Tests: `internal/executor/explain_update_delete_children_test.go`.
+      Design: `docs/design/0122-0003-explain-format-xml-yaml.md` new
+      "Follow-up: `Update`/`Delete` plan-tree children" section + README
+      index row extended. Gates: `go build ./...` clean; `go test
+      ./internal/executor/... ./internal/planner/...` PASS (full EXPLAIN
+      suite, no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+      Q13=33).
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

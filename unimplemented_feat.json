@@ -147,7 +147,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_explain.go:746 UPDATE/DELETE missing from planChildren"
+   "code_audit": "RESOLVED 2026-07-06 (M0122): internal/executor/operators_explain.go's planChildren gained *planner.Update/*planner.Delete cases (p.Child + p.FromScans/p.UsingScans), so EXPLAIN/EXPLAIN ANALYZE on UPDATE/DELETE now shows the target scan (and FROM/USING join scans) under 'Update on t'/'Delete on t', matching real PG 18.3. ANALYZE actual-stats for that child remain absent (executor drives it via extractScan, not a nested instrumented Operator) — degrades to a cost-estimate-only line, not a crash. Tests: internal/executor/explain_update_delete_children_test.go. Design: docs/design/0122-0003-explain-format-xml-yaml.md Follow-up section."
   },
   {
    "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",

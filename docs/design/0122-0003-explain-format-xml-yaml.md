@@ -1379,3 +1379,52 @@ This closes writeback simplification (4) — the writeback bucket's only
 remaining open item is the feature-sized `reuses` `pg_stat_io` op counter
 (needs a `BufferAccessStrategy`-style ring buffer goopg does not
 implement).
+
+## Follow-up: `Update`/`Delete` plan-tree children (2026-07-06, later loop)
+
+**Problem:** `internal/executor/operators_explain.go`'s `planChildren` —
+the single dispatch point every TEXT/JSON/ANALYZE render path (`walkPlan`,
+`walkPlanAnalyze`, `planToJSON`, `planToJSONWithStats`) recurses through —
+had cases for `*planner.Insert` (`p.Source`) but none for `*planner.Update`
+or `*planner.Delete`, so both fell through to the `nil`-leaf default. A
+plain `EXPLAIN UPDATE t SET ... WHERE ...` therefore rendered only the bare
+`Update on t` label with no child scan line at all — dropping the target
+table's `Seq Scan`/`Index Scan` (and, for `UPDATE ... FROM`/`DELETE ...
+USING`, every joined-table scan too). Confirmed against a real PostgreSQL
+18.3 instance: upstream always nests the underlying scan(s) under
+`Update on t` / `Delete on t`. Flagged in `unimplemented_feat.json`
+(`internal/executor/operators_explain.go:746 UPDATE/DELETE missing from
+planChildren`).
+
+**Fix:** added `*planner.Update`/`*planner.Delete` cases to `planChildren`
+returning `p.Child` (the target-table scan) followed by `p.FromScans`/
+`p.UsingScans` (the `UPDATE ... FROM`/`DELETE ... USING` join-side scans,
+M0097-0065/-0076) — mirroring the existing `Insert`/`p.Source` case and the
+`MultiHashJoin`/`p.Tables` multi-child pattern.
+
+**Known limitation (not a regression):** the executor does not `Build()`
+`p.Child` as a nested, independently-instrumented `Operator` the way
+`Insert` does for `p.Source` — `newUpdateOp`/`newDeleteOp` call
+`extractScan(p.Child)` to pull the `SeqScan`/`IndexScan`/`Filter` shape
+directly and drive it by hand, bypassing `maybeInstrument`. So under
+`EXPLAIN ANALYZE`, the newly-visible child line has no `nodeStatsTable`
+entry and renders as a cost-estimate-only line (no `actual time=...`
+bracket) — `walkPlanAnalyzeFiltered`'s pre-existing `stats[n]` miss path
+already handles this gracefully (same degradation any leaf without an
+instrumented operator would show), so this is a lesser-fidelity ANALYZE
+line, not a crash or wrong answer. Giving the child real ANALYZE stats
+would require routing `updateOp`/`deleteOp`'s scan through `Build()` +
+`maybeInstrument` instead of `extractScan`, a larger executor-internals
+change out of scope here — recorded as a residual, not blocking, since the
+plain (non-ANALYZE) `EXPLAIN` case — the actually-reported gap — is now
+fully correct.
+
+**Tests:** `internal/executor/explain_update_delete_children_test.go` —
+`TestExplainUpdateShowsScanChild`/`TestExplainDeleteShowsScanChild` (bare
+UPDATE/DELETE surface a `Scan on <table>` child line) and
+`TestExplainUpdateFromShowsFromScanChildren` (`UPDATE ... FROM` surfaces
+scans on *both* the target and the FROM table).
+
+**Gates:** `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/...` PASS (no regressions across the full EXPLAIN
+suite); `scripts/tpch-spotcheck.sh` PASS.

@@ -941,9 +941,14 @@ func joinTypeName(t planner.JoinType) string {
 
 // planChildren returns the child plan nodes EXPLAIN should
 // recurse into. Limited to the subset of node types whose
-// children are public Node fields; storage-side internals
-// (Update/Delete/Insert source plans) report their own scan
-// children. Returns nil for leaf nodes.
+// children are public Node fields. Update/Delete additionally
+// walk their FROM/USING scans (M0097-0065/-0076) alongside the
+// target-table Child; note the executor extracts their Child's
+// scan info directly (extractScan) rather than Build()-ing it as
+// a nested instrumented Operator, so EXPLAIN ANALYZE won't have
+// per-node actual-rows/time stats for it (falls back to the
+// cost-estimate-only line — see walkPlanAnalyzeFiltered's
+// `stats[n]` miss path). Returns nil for leaf nodes.
 func planChildren(n planner.Node) []planner.Node {
 	switch p := n.(type) {
 	case *planner.Project:
@@ -964,6 +969,16 @@ func planChildren(n planner.Node) []planner.Node {
 		return []planner.Node{p.Left, p.Right}
 	case *planner.Insert:
 		return []planner.Node{p.Source}
+	case *planner.Update:
+		out := make([]planner.Node, 0, 1+len(p.FromScans))
+		out = append(out, p.Child)
+		out = append(out, p.FromScans...)
+		return out
+	case *planner.Delete:
+		out := make([]planner.Node, 0, 1+len(p.UsingScans))
+		out = append(out, p.Child)
+		out = append(out, p.UsingScans...)
+		return out
 	case *planner.CTEScan:
 		return []planner.Node{p.Child}
 	case *planner.LockRows:
