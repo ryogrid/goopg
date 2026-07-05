@@ -11411,6 +11411,83 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 	return nil, false
 }
 
+// DropTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name DROP
+// MAPPING FOR tokenType — removes the pg_ts_config_map entry for tokenType,
+// mirroring DropConfigurationMapping in tsearchcmds.c. Returns the matched
+// configuration (nil if no configuration with the given schema-resolved name
+// exists) and whether a mapping for tokenType was found and removed.
+// DU-002 slice 446 follow-up (M0119-0004).
+func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string) (cfg *UserTSConfig, found bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			for i, m := range uc.Mappings {
+				if strings.EqualFold(m.TokenType, tokenType) {
+					uc.Mappings = append(uc.Mappings[:i], uc.Mappings[i+1:]...)
+					return uc, true
+				}
+			}
+			return uc, false
+		}
+	}
+	return nil, false
+}
+
+// RenameTSConfig implements ALTER TEXT SEARCH CONFIGURATION name RENAME TO
+// newName, mirroring RenameCollation. DU-002 slice 446 follow-up
+// (M0119-0004).
+func (c *InMemory) RenameTSConfig(name, schema, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserTSConfig
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			target = uc
+			continue
+		}
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, newName) {
+			return fmt.Errorf("text search configuration %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("text search configuration %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetTSConfigSchema implements ALTER TEXT SEARCH CONFIGURATION name SET
+// SCHEMA newSchema, mirroring SetCollationSchema. Returns false if no such
+// configuration is registered. DU-002 slice 446 follow-up (M0119-0004).
+func (c *InMemory) SetTSConfigSchema(name, schema, newSchema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
 // CreateTSConfigDuringRecovery is the idempotent version of CreateTSConfig
 // used by the WAL-replay driver (internal/initdb/tsconfig_ddl_recovery.go).
 // Unlike CreateTSConfig it takes the OID from the WAL record and overwrites
@@ -11452,6 +11529,29 @@ func (c *InMemory) AddTSConfigMappingDuringRecovery(name, schema, tokenType stri
 // slice 446.
 func (c *InMemory) DropTSConfigDuringRecovery(name, schema string) {
 	c.DropTSConfig(name, schema)
+}
+
+// DropTSConfigMappingDuringRecovery is the discard-result recovery
+// counterpart to DropTSConfigMapping, mirroring AddTSConfigMappingDuringRecovery.
+// DU-002 restart-persistence follow-up to the slice 446 RENAME/SET
+// SCHEMA/DROP MAPPING follow-up.
+func (c *InMemory) DropTSConfigMappingDuringRecovery(name, schema, tokenType string) {
+	c.DropTSConfigMapping(name, schema, tokenType)
+}
+
+// RenameTSConfigDuringRecovery is the discard-error recovery counterpart to
+// RenameTSConfig, mirroring RenameCollationDuringRecovery. DU-002
+// restart-persistence follow-up to the slice 446 RENAME/SET SCHEMA/DROP
+// MAPPING follow-up.
+func (c *InMemory) RenameTSConfigDuringRecovery(name, schema, newName string) {
+	_ = c.RenameTSConfig(name, schema, newName)
+}
+
+// SetTSConfigSchemaDuringRecovery is the discard-result recovery counterpart
+// to SetTSConfigSchema. DU-002 restart-persistence follow-up to the slice
+// 446 RENAME/SET SCHEMA/DROP MAPPING follow-up.
+func (c *InMemory) SetTSConfigSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetTSConfigSchema(name, schema, newSchema)
 }
 
 // CollationAttrsByName resolves a collation's dump-relevant attributes

@@ -6396,6 +6396,27 @@ func (p *parser) parseAlterDefaultPrivileges(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
+// parseTSMappingTokenTypeList parses the `FOR tok [, tok ...]` token-type
+// list shared by ALTER TEXT SEARCH CONFIGURATION's ADD MAPPING and DROP
+// MAPPING forms. DU-002 slice 446 follow-up (M0119-0004).
+func parseTSMappingTokenTypeList(p *parser) ([]string, error) {
+	if _, err := p.expectKeyword(KwFor); err != nil {
+		return nil, err
+	}
+	var tokenTypes []string
+	for {
+		tok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		tokenTypes = append(tokenTypes, strings.ToLower(identText(tok)))
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return tokenTypes, nil
+}
+
 func (p *parser) parseAlter() (Stmt, error) {
 	t, err := p.expectKeyword(KwAlter)
 	if err != nil {
@@ -6410,15 +6431,15 @@ func (p *parser) parseAlter() (Stmt, error) {
 		strings.EqualFold(p.peek(1).Value, "privileges") {
 		return p.parseAlterDefaultPrivileges(t.Pos)
 	}
-	// ALTER TEXT SEARCH CONFIGURATION name ADD MAPPING FOR tok [, ...] WITH
-	// dict [, ...] — the only ALTER TEXT SEARCH * form goopg actually applies
-	// (it is how a config's pg_ts_config_map rows get populated, which
-	// dumpTSConfig's own ADD MAPPING re-emission depends on). Every other
-	// ALTER TEXT SEARCH * form (CONFIGURATION's RENAME TO/OWNER TO/SET
-	// SCHEMA/ALTER MAPPING/DROP MAPPING, and DICTIONARY/PARSER/TEMPLATE
-	// entirely) falls through to the generic skip-to-semicolon compat no-op
-	// below, matching CREATE TEXT SEARCH's existing pattern. DU-002 slice 446
-	// (M0119-0004).
+	// ALTER TEXT SEARCH CONFIGURATION name {ADD MAPPING|DROP MAPPING|RENAME
+	// TO|SET SCHEMA} — the ALTER TEXT SEARCH * forms goopg actually applies
+	// (ADD/DROP MAPPING is how a config's pg_ts_config_map rows get
+	// populated/removed, which dumpTSConfig's own ADD MAPPING re-emission
+	// depends on). ALTER MAPPING REPLACE, OWNER TO, and DICTIONARY/PARSER/
+	// TEMPLATE entirely fall through to the generic skip-to-semicolon compat
+	// no-op below, matching CREATE TEXT SEARCH's existing pattern. DU-002
+	// slice 446 (M0119-0004); RENAME TO/SET SCHEMA/DROP MAPPING added as a
+	// slice 446 follow-up.
 	if p.acceptIdentKeyword("text") {
 		_ = p.acceptIdentKeyword("search") // consume "search"
 		if p.acceptIdentKeyword("configuration") {
@@ -6427,19 +6448,9 @@ func (p *parser) parseAlter() (Stmt, error) {
 				return nil, err
 			}
 			if p.acceptKeyword(KwAdd) && p.acceptIdentKeyword("mapping") {
-				if _, err := p.expectKeyword(KwFor); err != nil {
+				tokenTypes, err := parseTSMappingTokenTypeList(p)
+				if err != nil {
 					return nil, err
-				}
-				var tokenTypes []string
-				for {
-					tok, err := p.parseIdent()
-					if err != nil {
-						return nil, err
-					}
-					tokenTypes = append(tokenTypes, strings.ToLower(identText(tok)))
-					if !p.acceptSymbol(",") {
-						break
-					}
 				}
 				if _, err := p.expectKeyword(KwWith); err != nil {
 					return nil, err
@@ -6455,10 +6466,42 @@ func (p *parser) parseAlter() (Stmt, error) {
 						break
 					}
 				}
-				return &AlterTSConfigAddMappingStmt{pos: t.Pos, ConfigName: cfgName, TokenTypes: tokenTypes, Dictionaries: dicts}, nil
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "addmapping", TokenTypes: tokenTypes, Dictionaries: dicts}, nil
 			}
-			// RENAME TO / OWNER TO / SET SCHEMA / ALTER MAPPING / DROP MAPPING —
-			// unimplemented compat no-op; discard the rest of the statement.
+			if p.acceptKeyword(KwDrop) && p.acceptIdentKeyword("mapping") {
+				ifExists := false
+				if p.acceptKeyword(KwIf) {
+					if _, err := p.expectKeyword(KwExists); err != nil {
+						return nil, err
+					}
+					ifExists = true
+				}
+				tokenTypes, err := parseTSMappingTokenTypeList(p)
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "dropmapping", TokenTypes: tokenTypes, IfExists: ifExists}, nil
+			}
+			if p.acceptIdentKeyword("rename") {
+				if _, err := p.expectKeyword(KwTo); err != nil {
+					return nil, err
+				}
+				newNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "rename", NewName: identText(newNameTok)}, nil
+			}
+			if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+				p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+				p.advance() // SET
+				p.advance() // SCHEMA
+				schemaTok := p.cur()
+				p.advance()
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "setschema", NewSchema: identText(schemaTok)}, nil
+			}
+			// ALTER MAPPING REPLACE / OWNER TO — unimplemented compat no-op;
+			// discard the rest of the statement.
 			stmt, err := p.parseSkipToSemicolon(t.Pos)
 			if err != nil {
 				return nil, err

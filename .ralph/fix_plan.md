@@ -94,6 +94,23 @@ RENAME TO/SET SCHEMA/DROP MAPPING` forms (parser dispatch in
 `internal/parser/ddl.go` currently falls through to a discarded compat
 no-op for all of these).
 
+**2026-07-06 (still later loop):** landed the duplicate-mapping 23505 fix
+(not 42710, verified against real PG), then in this loop landed `ALTER TEXT
+SEARCH CONFIGURATION RENAME TO/SET SCHEMA/DROP MAPPING [IF EXISTS] FOR ...`
+— all three now parse and apply, with restart persistence via 3 new WAL
+record kinds (109-111), mirroring the CREATE/ADD MAPPING/DROP precedent.
+Also fixed a latent `ddlTag` gap: this statement type had no case at all
+and silently returned `"OK"` instead of PG's real command tag. See the
+`0110-0001` design doc's new "Slice 446 follow-up: RENAME TO / SET SCHEMA /
+DROP MAPPING" section and the matching deferral ledger row. Remaining
+DU-002 items for this statement family: `ALTER MAPPING REPLACE` (unparsed),
+`OWNER TO` (no-op, likely fine to leave as-is per the ledger row's
+rationale), and the `CONFIGURATION = source_config` copy-from-existing form
+of `CREATE TEXT SEARCH CONFIGURATION`. Next candidate: pick up
+`ALTER MAPPING REPLACE`, the CREATE COPY form, or survey the deferral
+ledger for a fresh DU-002 slice (e.g. `GRANT ... WITH GRANT OPTION GRANTED
+BY` probed-not-picked candidate from the slice 436 row).
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

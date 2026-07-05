@@ -14924,3 +14924,91 @@ Gates: `go build ./...` clean; `go vet ./internal/catalog/...
 ./internal/executor/...` clean; `go test -count=1 ./internal/catalog/...
 ./internal/executor/... ./internal/wal/... ./internal/initdb/...` PASS;
 `scripts/tpch-spotcheck.sh` PASS; pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `RENAME TO` / `SET SCHEMA` / `DROP MAPPING` (2026-07-06)
+
+Closes the next item named by both the slice 446 row and its duplicate-mapping
+follow-up: `ALTER TEXT SEARCH CONFIGURATION name {RENAME TO|SET SCHEMA|DROP
+MAPPING [IF EXISTS] FOR tok [, ...]}` previously fell through to the
+discarded compat no-op — the parser consumed and threw away the whole
+statement, so none of these three forms had any observable effect.
+
+`DropConfigurationMapping` (`tsearchcmds.c`) confirms the DROP MAPPING error
+shape: a token type with no mapping raises `42704` (`ERRCODE_UNDEFINED_OBJECT`)
+`mapping for token type "%s" does not exist` unless `IF EXISTS` is given, in
+which case it is a `NOTICE` (`... does not exist, skipping`), matching the
+per-clause (not per-statement) `IF EXISTS` semantics already used by other
+ALTER forms in this codebase.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `AlterTSConfigAddMappingStmt` generalized to
+  `AlterTSConfigStmt` with an `Action` field (`"addmapping"` |
+  `"dropmapping"` | `"rename"` | `"setschema"`), mirroring `AlterCollationStmt`'s
+  shape. `TokenTypes`/`Dictionaries` stay addmapping-only fields; new
+  `IfExists` (dropmapping), `NewName` (rename), `NewSchema` (setschema).
+- `internal/parser/ddl.go`: the `ALTER TEXT SEARCH CONFIGURATION` dispatch
+  block gained three new branches (DROP MAPPING, RENAME TO, SET SCHEMA)
+  alongside the existing ADD MAPPING one, sharing a new
+  `parseTSMappingTokenTypeList` helper for the `FOR tok [, ...]` list common
+  to ADD/DROP MAPPING. `ALTER MAPPING REPLACE` and `OWNER TO` remain
+  discarded compat no-ops (OWNER TO needs no dedicated path — `pg_dump`
+  reads `cfgowner` from the catalog row set at CREATE time, never from a
+  replayed ALTER OWNER TO statement).
+- `internal/catalog/catalog.go`: three new `InMemory` methods —
+  `DropTSConfigMapping` (removes one `Mappings` entry, returns the matched
+  config + whether an entry was actually removed), `RenameTSConfig` (mirrors
+  `RenameCollation`'s name-collision check), `SetTSConfigSchema` (mirrors
+  `SetCollationSchema`) — plus their `*DuringRecovery` counterparts
+  (`DropTSConfigMappingDuringRecovery`/`RenameTSConfigDuringRecovery`/
+  `SetTSConfigSchemaDuringRecovery`) for WAL replay.
+- `internal/executor/operators_ddl.go`: `execAlterTSConfigAddMapping` is now
+  a private helper called from a new top-level `execAlterTSConfig` dispatcher
+  (keyed on `s.Action`), alongside a new `execAlterTSConfigDropMapping`
+  sibling implementing the 42704/NOTICE distinction above.
+- Restart persistence, matching the slice 437/446 CREATE/ADD MAPPING/DROP
+  precedent exactly (not left as a fresh gap this time): three new WAL record
+  kinds (`internal/wal/recovery.go`) —
+  `RecordKindDropTSConfigMapping`(109)/`RecordKindRenameTSConfig`(110)/
+  `RecordKindSetTSConfigSchema`(111), each with `Encode`/`Decode` pairs
+  (`EncodeDropTSConfigMapping`/`EncodeRenameTSConfig`/
+  `EncodeSetTSConfigSchema` + `Decode*` counterparts), a
+  `RecordKindCreateTSDict, ..., RecordKindSetTSConfigSchema` case added to
+  the `ApplyRecord` dispatcher's existing catalog-only `(false, nil)`
+  branch, and three new cases wired into
+  `internal/initdb/tsconfig_ddl_recovery.go`'s replay switch (extending
+  `tsConfigRegistryRecovery`'s interface with the three new
+  `*DuringRecovery` methods).
+- `internal/server/dispatch.go`'s `ddlTag`: added a missing
+  `*parser.AlterTSConfigStmt` case returning `"ALTER TEXT SEARCH
+  CONFIGURATION"` (`cmdtaglist.h`'s `CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION`)
+  — this statement type had **no** `ddlTag` case at all before this loop, so
+  every one of its forms (including the pre-existing ADD MAPPING) silently
+  fell through to the generic `"OK"` command tag. Bug found and fixed as a
+  byproduct of generalizing the AST node, not a new deferral.
+
+**Tests**: `internal/executor/tsconfig_rename_setschema_dropmapping_test.go`
+(`TestAlterTSConfigRenameTo`/`TestAlterTSConfigSetSchema`/
+`TestAlterTSConfigDropMapping`, each covering the success path plus the
+42704 not-found case; DROP MAPPING additionally covers the IF-EXISTS-skips
+vs without-IF-EXISTS-errors distinction). `internal/wal/
+tsdict_tsconfig_ddl_test.go` gained round-trip/wrong-kind/truncated-payload
+cases for all three new record kinds. `internal/initdb/
+tsdict_tsconfig_ddl_recovery_test.go` gained
+`TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping` (create → add two
+mappings → drop one → rename → move schema, then a real `Init`→`Open`→WAL
+append→`Close`→`Open` cycle asserting only the survived mapping and final
+name/schema).
+
+**Still deferred** (unchanged from the slice 446 follow-up row): `ALTER
+MAPPING REPLACE` (both the token-type-scoped and bare-old-dictionary forms),
+`OWNER TO` (parses as a no-op; not expected to ever need a dedicated path per
+the note above), and the `CONFIGURATION = source_config`
+copy-from-existing-configuration form of `CREATE TEXT SEARCH CONFIGURATION`.
+
+Gates: `go build ./...` clean; `go vet` on all touched packages clean;
+`go test -count=1 ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/planner/... ./internal/wal/...
+./internal/initdb/... ./internal/server/...` PASS; `go test -race -count=1
+./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench pre-commit smoke via git hook.

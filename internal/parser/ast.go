@@ -2377,27 +2377,39 @@ type TSDictOption struct {
 	IsNumeric bool
 }
 
-// AlterTSConfigAddMappingStmt is `ALTER TEXT SEARCH CONFIGURATION name ADD
-// MAPPING FOR tokentype [, ...] WITH dictionary [, ...]` (tsearchcmds.c's
-// ALTER_TSCONFIG_ADD_MAPPING). Each named token type gets its own ordered
-// dictionary list; re-adding a token type already mapped is a 42710 error in
-// real PG (goopg does not enforce this — see this slice's deferral ledger
-// row). Every other ALTER TEXT SEARCH CONFIGURATION form (ALTER MAPPING
-// REPLACE, DROP MAPPING, RENAME TO, OWNER TO, SET SCHEMA) stays an
-// unimplemented parsed-and-discarded compat no-op — OWNER TO in particular
-// needs no dedicated parse path since pg_dump always derives it from the
-// config's cfgowner catalog column (set at CREATE time), never from a
-// separate ALTER OWNER TO statement having been replayed. DU-002 slice 446
-// (M0119-0004).
-type AlterTSConfigAddMappingStmt struct {
+// AlterTSConfigStmt is `ALTER TEXT SEARCH CONFIGURATION name <action>`
+// (tsearchcmds.c's AlterTSConfigurationStmt). Action is one of:
+//   - "addmapping": ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...]
+//     (ALTER_TSCONFIG_ADD_MAPPING). Each named token type gets its own
+//     ordered dictionary list; re-adding a token type already mapped is a
+//     23505 unique-violation in real PG (MakeConfigurationMapping's mapseqno
+//     restarts at 1 per call), enforced by the executor.
+//   - "dropmapping": DROP MAPPING [IF EXISTS] FOR tokentype [, ...]
+//     (ALTER_TSCONFIG_DROP_MAPPING); IfExists suppresses the "mapping...does
+//     not exist" error PG raises via drop_tsconfig_mapping.
+//   - "rename": RENAME TO newname.
+//   - "setschema": SET SCHEMA newschema.
+//
+// Every other ALTER TEXT SEARCH CONFIGURATION form (ALTER MAPPING REPLACE,
+// OWNER TO) stays an unimplemented parsed-and-discarded compat no-op —
+// OWNER TO in particular needs no dedicated parse path since pg_dump always
+// derives it from the config's cfgowner catalog column (set at CREATE time),
+// never from a separate ALTER OWNER TO statement having been replayed.
+// DU-002 slice 446 (M0119-0004); rename/setschema/dropmapping added as a
+// slice 446 follow-up.
+type AlterTSConfigStmt struct {
 	pos          int
 	ConfigName   ObjectName
+	Action       string // "addmapping" | "dropmapping" | "rename" | "setschema"
 	TokenTypes   []string
-	Dictionaries []ObjectName
+	Dictionaries []ObjectName // for Action == "addmapping"
+	IfExists     bool         // for Action == "dropmapping"
+	NewName      string       // for Action == "rename"
+	NewSchema    string       // for Action == "setschema"
 }
 
-func (s *AlterTSConfigAddMappingStmt) Pos() int  { return s.pos }
-func (s *AlterTSConfigAddMappingStmt) stmtNode() {}
+func (s *AlterTSConfigStmt) Pos() int  { return s.pos }
+func (s *AlterTSConfigStmt) stmtNode() {}
 
 // ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON
 // PARAMETER … statement (pg_parameter_acl, GUC-level ACLs) so the executor

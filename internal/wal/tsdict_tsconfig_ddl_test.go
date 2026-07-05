@@ -202,3 +202,133 @@ func TestDecodeDropTSConfigRejectsTruncatedPayload(t *testing.T) {
 		t.Error("expected error decoding truncated drop-tsconfig payload")
 	}
 }
+
+// TestEncodeDecodeDropTSConfigMappingRoundTrip pins the DU-002
+// restart-persistence follow-up (M0119-0004, slice 446 RENAME/SET
+// SCHEMA/DROP MAPPING follow-up) DROP MAPPING WAL record format.
+func TestEncodeDecodeDropTSConfigMappingRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, tokenType string }{
+		{"myconfig", "public", "word"},
+		{"otherconfig", "myschema", "asciiword"},
+	}
+	for _, c := range cases {
+		raw := EncodeDropTSConfigMapping(c.name, c.schema, c.tokenType)
+		if raw[0] != RecordKindDropTSConfigMapping {
+			t.Errorf("%q/%q: kind byte = %d, want %d", c.name, c.tokenType, raw[0], RecordKindDropTSConfigMapping)
+			continue
+		}
+		gotName, gotSchema, gotTokenType, err := DecodeDropTSConfigMapping(raw)
+		if err != nil {
+			t.Errorf("%q/%q: decode err: %v", c.name, c.tokenType, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotTokenType != c.tokenType {
+			t.Errorf("%q/%q: decoded (%q, %q, %q)", c.name, c.tokenType, gotName, gotSchema, gotTokenType)
+		}
+	}
+}
+
+// TestEncodeDecodeRenameTSConfigRoundTrip pins the RENAME TO WAL record
+// format (DU-002 restart-persistence follow-up, slice 446 follow-up,
+// M0119-0004).
+func TestEncodeDecodeRenameTSConfigRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, newName string }{
+		{"myconfig", "public", "renamedconfig"},
+		{"日本語config", "myschema", "新config"}, // multi-byte UTF-8
+	}
+	for _, c := range cases {
+		raw := EncodeRenameTSConfig(c.name, c.schema, c.newName)
+		if raw[0] != RecordKindRenameTSConfig {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindRenameTSConfig)
+			continue
+		}
+		gotName, gotSchema, gotNewName, err := DecodeRenameTSConfig(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotNewName != c.newName {
+			t.Errorf("%q: decoded (%q, %q, %q)", c.name, gotName, gotSchema, gotNewName)
+		}
+	}
+}
+
+// TestEncodeDecodeSetTSConfigSchemaRoundTrip pins the SET SCHEMA WAL record
+// format (DU-002 restart-persistence follow-up, slice 446 follow-up,
+// M0119-0004).
+func TestEncodeDecodeSetTSConfigSchemaRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, newSchema string }{
+		{"myconfig", "public", "otherschema"},
+		{"otherconfig", "schema1", "schema2"},
+	}
+	for _, c := range cases {
+		raw := EncodeSetTSConfigSchema(c.name, c.schema, c.newSchema)
+		if raw[0] != RecordKindSetTSConfigSchema {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindSetTSConfigSchema)
+			continue
+		}
+		gotName, gotSchema, gotNewSchema, err := DecodeSetTSConfigSchema(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotNewSchema != c.newSchema {
+			t.Errorf("%q: decoded (%q, %q, %q)", c.name, gotName, gotSchema, gotNewSchema)
+		}
+	}
+}
+
+// TestDecodeDropTSConfigMappingRejectsWrongKind confirms the decoder
+// surfaces a clear error when handed a record of a different kind.
+func TestDecodeDropTSConfigMappingRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSConfig("myconfig", "public")
+	if _, _, _, err := DecodeDropTSConfigMapping(bogus); err == nil {
+		t.Error("expected error decoding non-drop-tsconfig-mapping payload")
+	}
+}
+
+// TestDecodeRenameTSConfigRejectsWrongKind mirrors the drop-mapping case.
+func TestDecodeRenameTSConfigRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSConfig("myconfig", "public")
+	if _, _, _, err := DecodeRenameTSConfig(bogus); err == nil {
+		t.Error("expected error decoding non-rename-tsconfig payload")
+	}
+}
+
+// TestDecodeSetTSConfigSchemaRejectsWrongKind mirrors the drop-mapping case.
+func TestDecodeSetTSConfigSchemaRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSConfig("myconfig", "public")
+	if _, _, _, err := DecodeSetTSConfigSchema(bogus); err == nil {
+		t.Error("expected error decoding non-set-tsconfig-schema payload")
+	}
+}
+
+// TestDecodeDropTSConfigMappingRejectsTruncatedPayload guards against
+// silently returning empty/zero fields when the on-disk record is corrupt.
+func TestDecodeDropTSConfigMappingRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeDropTSConfigMapping("myconfig", "public", "word")
+	truncated := raw[:len(raw)-1]
+	if _, _, _, err := DecodeDropTSConfigMapping(truncated); err == nil {
+		t.Error("expected error decoding truncated drop-tsconfig-mapping payload")
+	}
+}
+
+// TestDecodeRenameTSConfigRejectsTruncatedPayload mirrors the drop-mapping
+// case for RENAME TO.
+func TestDecodeRenameTSConfigRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeRenameTSConfig("myconfig", "public", "renamedconfig")
+	truncated := raw[:len(raw)-1]
+	if _, _, _, err := DecodeRenameTSConfig(truncated); err == nil {
+		t.Error("expected error decoding truncated rename-tsconfig payload")
+	}
+}
+
+// TestDecodeSetTSConfigSchemaRejectsTruncatedPayload mirrors the
+// drop-mapping case for SET SCHEMA.
+func TestDecodeSetTSConfigSchemaRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeSetTSConfigSchema("myconfig", "public", "otherschema")
+	truncated := raw[:len(raw)-1]
+	if _, _, _, err := DecodeSetTSConfigSchema(truncated); err == nil {
+		t.Error("expected error decoding truncated set-tsconfig-schema payload")
+	}
+}

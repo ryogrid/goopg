@@ -191,8 +191,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateDomain(s)
 	case *parser.DropDomainStmt:
 		return nil, o.execDropDomain(s)
-	case *parser.AlterTSConfigAddMappingStmt:
-		return nil, o.execAlterTSConfigAddMapping(s)
+	case *parser.AlterTSConfigStmt:
+		return nil, o.execAlterTSConfig(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -15718,15 +15718,11 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	return nil
 }
 
-// execAlterTSConfigAddMapping implements ALTER TEXT SEARCH CONFIGURATION name
-// ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — appends one
-// pg_ts_config_map entry per named token type so pg_dump's dumpTSConfig
-// re-emits the mapping (its own direct `pg_ts_config_map` query, not the
-// getTSConfigurations dump-list query). Each dictionary name resolves against
-// the one built-in dictionary (catalog.BuiltinTSDictOID — "simple") first,
-// then user-created dictionaries (CREATE TEXT SEARCH DICTIONARY) in the same
-// schema as the configuration. DU-002 slice 446 (M0119-0004).
-func (o *ddlOp) execAlterTSConfigAddMapping(s *parser.AlterTSConfigAddMappingStmt) error {
+// execAlterTSConfig implements the ALTER TEXT SEARCH CONFIGURATION forms
+// goopg models: ADD MAPPING, DROP MAPPING, RENAME TO, and SET SCHEMA.
+// DU-002 slice 446 (M0119-0004); dropmapping/rename/setschema added as a
+// slice 446 follow-up.
+func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return &ExecError{Code: "XX000", Message: "ALTER TEXT SEARCH CONFIGURATION requires InMemory catalog"}
@@ -15735,6 +15731,48 @@ func (o *ddlOp) execAlterTSConfigAddMapping(s *parser.AlterTSConfigAddMappingStm
 	if schema == "" {
 		schema = "public"
 	}
+	switch s.Action {
+	case "addmapping":
+		return o.execAlterTSConfigAddMapping(im, s, schema)
+	case "dropmapping":
+		return o.execAlterTSConfigDropMapping(im, s, schema)
+	case "rename":
+		if err := im.RenameTSConfig(s.ConfigName.Name, schema, s.NewName); err != nil {
+			return &ExecError{Code: "42704", Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSConfig(s.ConfigName.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal rename-tsconfig: %w", werr)
+			}
+		}
+		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetTSConfigSchema(s.ConfigName.Name, schema, newSchema) {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSConfigSchema(s.ConfigName.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal set-tsconfig-schema: %w", werr)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+// execAlterTSConfigAddMapping implements ALTER TEXT SEARCH CONFIGURATION name
+// ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — appends one
+// pg_ts_config_map entry per named token type so pg_dump's dumpTSConfig
+// re-emits the mapping (its own direct `pg_ts_config_map` query, not the
+// getTSConfigurations dump-list query). Each dictionary name resolves against
+// the one built-in dictionary (catalog.BuiltinTSDictOID — "simple") first,
+// then user-created dictionaries (CREATE TEXT SEARCH DICTIONARY) in the same
+// schema as the configuration. DU-002 slice 446 (M0119-0004).
+func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
 	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
 	for _, dn := range s.Dictionaries {
 		dictSchema := dn.Schema
@@ -15784,6 +15822,38 @@ func (o *ddlOp) execAlterTSConfigAddMapping(s *parser.AlterTSConfigAddMappingStm
 		if o.ctx.WAL != nil {
 			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
 				return fmt.Errorf("wal add-tsconfig-mapping: %w", werr)
+			}
+		}
+	}
+	return nil
+}
+
+// execAlterTSConfigDropMapping implements ALTER TEXT SEARCH CONFIGURATION
+// name DROP MAPPING [IF EXISTS] FOR tokentype [, ...] — removes the
+// pg_ts_config_map entry for each named token type, mirroring
+// DropConfigurationMapping in tsearchcmds.c (real PG raises 42704
+// "mapping for token type \"%s\" does not exist" unless IF EXISTS is given,
+// in which case it is a NOTICE). DU-002 slice 446 follow-up (M0119-0004).
+func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	for _, tt := range s.TokenTypes {
+		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt)
+		if uc == nil {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		if !found {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("mapping for token type %q does not exist, skipping", tt))
+				continue
+			}
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("mapping for token type %q does not exist", tt)}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event per token type so the removal survives a restart, replayed
+		// by internal/initdb/tsconfig_ddl_recovery.go after the
+		// configuration's own CREATE record.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfigMapping(s.ConfigName.Name, schema, tt)); werr != nil {
+				return fmt.Errorf("wal drop-tsconfig-mapping: %w", werr)
 			}
 		}
 	}

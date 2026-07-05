@@ -1,44 +1,57 @@
 (idle — nothing in flight)
 
-Loop #22 landed the M0119-0004 slice-437/446 restart-persistence follow-up:
-`CREATE TEXT SEARCH DICTIONARY` and `CREATE TEXT SEARCH CONFIGURATION` /
-`ALTER ... ADD MAPPING` now survive a server restart (previously vanished —
-recorded as a deferral in both slice 437 and 446's own ledger rows).
-Mirrors the CAST/TRANSFORM/CONVERSION/COLLATION restart-persistence
-precedent exactly.
+Loop #25 landed `ALTER TEXT SEARCH CONFIGURATION name {RENAME TO|SET SCHEMA|
+DROP MAPPING [IF EXISTS] FOR tok [, ...]}` — the slice 446 follow-up named by
+the prior loop's working_set/ledger row. All three forms previously fell
+through to a discarded compat no-op; now parsed, applied to the catalog, and
+persisted across restart via 3 new WAL record kinds.
 
-Files: `internal/wal/recovery.go` (5 new record kinds 104-108 + Encode/Decode
-pairs + ApplyRecord case), `internal/catalog/catalog.go` (5 new
-`*DuringRecovery` hooks), new `internal/initdb/tsdict_ddl_recovery.go` +
-`internal/initdb/tsconfig_ddl_recovery.go` (wired into `open.go` right after
-`replayConversionDDLRecords`), `internal/executor/operators_ddl.go` (WAL
-emission at all 5 mutation sites: CREATE TSDict/TSConfig, ADD MAPPING, DROP
-TSDict/TSConfig). New tests: `internal/wal/tsdict_tsconfig_ddl_test.go` (16
-encode/decode cases), `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go`
-(6 end-to-end Init→Open→WAL-append→Close→Open cycles). Design doc:
-`docs/design/0110-0001-pg-dump-tap-port.md` new "Slice 437/446 follow-up"
-section; `docs/design/README.md` row updated. Deferral ledger: new resolved
-row closing both slices' restart-persistence deferral in full (other
-deferred items from those rows — 42710 duplicate-mapping, other ALTER TEXT
-SEARCH CONFIGURATION forms, option validation, PARSER/TEMPLATE — remain
-open, untouched this loop).
+Files: `internal/parser/ast.go` (`AlterTSConfigAddMappingStmt` generalized to
+`AlterTSConfigStmt` with an `Action` field: "addmapping"/"dropmapping"/
+"rename"/"setschema", mirroring `AlterCollationStmt`), `internal/parser/
+ddl.go` (3 new dispatch branches + shared `parseTSMappingTokenTypeList`
+helper), `internal/catalog/catalog.go` (`DropTSConfigMapping`/
+`RenameTSConfig`/`SetTSConfigSchema` + `*DuringRecovery` counterparts),
+`internal/executor/operators_ddl.go` (`execAlterTSConfigAddMapping` now a
+private helper under new `execAlterTSConfig` action dispatcher; new
+`execAlterTSConfigDropMapping` implements PG's 42704-vs-NOTICE IF EXISTS
+distinction), `internal/wal/recovery.go` (3 new record kinds 109-111 +
+Encode/Decode pairs), `internal/initdb/tsconfig_ddl_recovery.go` (3 new
+replay cases + interface methods), `internal/planner/planner.go` +
+`internal/server/dispatch.go` (renamed-type reference; also fixed a latent
+bug — this statement type had NO `ddlTag` case at all, silently returning
+"OK" instead of "ALTER TEXT SEARCH CONFIGURATION" for every form including
+the pre-existing ADD MAPPING). New tests: `internal/executor/
+tsconfig_rename_setschema_dropmapping_test.go` (3 funcs), `internal/wal/
+tsdict_tsconfig_ddl_test.go` (+9 funcs for the 3 new record kinds),
+`internal/initdb/tsdict_tsconfig_ddl_recovery_test.go`
+(`TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping`). Design doc:
+`docs/design/0110-0001-pg-dump-tap-port.md` new "Slice 446 follow-up: RENAME
+TO / SET SCHEMA / DROP MAPPING" section; `docs/design/README.md` row
+extended. Deferral ledger: new `-` row (ALTER MAPPING REPLACE / OWNER TO /
+CONFIGURATION=source_config COPY form remain deferred).
 
-Gates this loop: `go build ./...` clean; `go test -race ./internal/wal/...`
-PASS; `go test -count=1 ./internal/wal/... ./internal/catalog/...
-./internal/initdb/...` PASS (all new tests green); `go test -count=1
-./internal/executor/... ./internal/parser/... ./internal/planner/...
-./internal/analyzer/...` PASS; `go test -count=1 -run
-TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS;
-`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `make ralph-state-guard`
-OK (auto-repaired the running/completed status mismatch, as every loop
-does). pgbench pre-commit smoke runs via the git hook at commit time.
+Gates this loop: `go build ./...` clean; `go vet` on all touched packages
+clean; `go test -count=1 ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/planner/... ./internal/wal/...
+./internal/initdb/... ./internal/server/...` all PASS; `go test -race
+-count=1 ./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `make ralph-state-guard` OK (auto-repaired the
+running/completed status mismatch, as every loop does). About to commit
+(pre-commit pgbench smoke runs via git hook) and push to
+`origin/align-data-structure-with-pg`.
 
-Next candidate (not started): per the fix_plan "Next up" addendum, either
-(a) 42710 duplicate-mapping detection in `execAlterTSConfigAddMapping`
-(`internal/executor/operators_ddl.go` — needs a pre-check against
-`UserTSConfig.Mappings` for an existing `TokenType` before appending), or
-(b) the `ALTER TEXT SEARCH CONFIGURATION RENAME TO/SET SCHEMA/DROP MAPPING`
-forms (parser dispatch in `internal/parser/ddl.go` currently discards all
-non-ADD-MAPPING forms as a compat no-op) — check `.ralph/fix_plan.md` and
-re-scan the deferral ledger first in case a concurrent loop already picked
-one up.
+Next candidate (not started): per this loop's deferral ledger row, pick up
+`ALTER MAPPING REPLACE` (both `FOR tok REPLACE old WITH new` and bare
+`REPLACE old WITH new` forms — needs a 4th `AlterTSConfigStmt` action plus a
+catalog method substituting one dictionary OID for another across matched
+mapping entries), the `CONFIGURATION = source_config` copy-from-existing
+form of `CREATE TEXT SEARCH CONFIGURATION`, or survey the deferral ledger
+for a fresh DU-002 slice (e.g. the slice-436 row's unpicked `GRANT ... WITH
+GRANT OPTION GRANTED BY` candidate). Re-check the ledger first in case a
+concurrent loop already picked one up. Note: `postgres/` shows as an
+untracked (`??`) top-level dir in `git status` despite `.gitignore`'s
+`/postgres/` entry (`git check-ignore` returns exit 1, not ignored) — this
+predates this loop, is the read-only upstream PG reference clone per its own
+`.gitignore` comment, and was NOT modified; leave it alone, do not `git add`
+it, and flag to the user if it becomes a recurring point of confusion.

@@ -1177,6 +1177,32 @@ const (
 	//   schema(schemaLen bytes)
 	RecordKindDropTSConfig byte = 108
 
+	// RecordKindDropTSConfigMapping records an `ALTER TEXT SEARCH
+	// CONFIGURATION name DROP MAPPING FOR tokenType` event. Replayed after
+	// its configuration's own RecordKindCreateTSConfig. DU-002
+	// restart-persistence follow-up to the slice 446 RENAME/SET SCHEMA/DROP
+	// MAPPING follow-up (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | tokenTypeLen(2) | tokenType(tokenTypeLen bytes)
+	RecordKindDropTSConfigMapping byte = 109
+
+	// RecordKindRenameTSConfig records an `ALTER TEXT SEARCH CONFIGURATION
+	// name RENAME TO newName` event, mirroring RecordKindAlterCollationRename.
+	// DU-002 restart-persistence follow-up to the slice 446 RENAME/SET
+	// SCHEMA/DROP MAPPING follow-up (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newNameLen(2) | newName(newNameLen bytes)
+	RecordKindRenameTSConfig byte = 110
+
+	// RecordKindSetTSConfigSchema records an `ALTER TEXT SEARCH
+	// CONFIGURATION name SET SCHEMA newSchema` event, mirroring
+	// RecordKindAlterCollationSetSchema. DU-002 restart-persistence
+	// follow-up to the slice 446 RENAME/SET SCHEMA/DROP MAPPING follow-up
+	// (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
+	RecordKindSetTSConfigSchema byte = 111
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -3587,6 +3613,194 @@ func DecodeDropTSConfig(payload []byte) (name, schema string, err error) {
 	}
 	schema = string(payload[off : off+schemaLen])
 	return name, schema, nil
+}
+
+// EncodeDropTSConfigMapping encodes an ALTER TEXT SEARCH CONFIGURATION name
+// DROP MAPPING FOR tokenType event (DU-002 restart-persistence follow-up to
+// the slice 446 RENAME/SET SCHEMA/DROP MAPPING follow-up, M0119-0004).
+// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+// schema(schemaLen bytes) | tokenTypeLen(2) | tokenType(tokenTypeLen bytes).
+func EncodeDropTSConfigMapping(name, schema, tokenType string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(tokenType) > 0xFFFF {
+		tokenType = tokenType[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(tokenType))
+	out[0] = RecordKindDropTSConfigMapping
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(tokenType)))
+	off += 2
+	copy(out[off:], tokenType)
+	return out
+}
+
+// DecodeDropTSConfigMapping decodes a RecordKindDropTSConfigMapping payload.
+func DecodeDropTSConfigMapping(payload []byte) (name, schema, tokenType string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: drop-tsconfig-mapping payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropTSConfigMapping {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not drop-tsconfig-mapping", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: drop-tsconfig-mapping payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: drop-tsconfig-mapping payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	tokenTypeLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+tokenTypeLen {
+		return "", "", "", fmt.Errorf("wal: drop-tsconfig-mapping payload truncated (need %d bytes)", off+tokenTypeLen)
+	}
+	tokenType = string(payload[off : off+tokenTypeLen])
+	return name, schema, tokenType, nil
+}
+
+// EncodeRenameTSConfig encodes an ALTER TEXT SEARCH CONFIGURATION name
+// RENAME TO newName event, mirroring EncodeAlterCollationRename. DU-002
+// restart-persistence follow-up to the slice 446 RENAME/SET SCHEMA/DROP
+// MAPPING follow-up (M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeRenameTSConfig(name, schema, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newName))
+	out[0] = RecordKindRenameTSConfig
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeRenameTSConfig decodes a RecordKindRenameTSConfig payload.
+func DecodeRenameTSConfig(payload []byte) (name, schema, newName string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: rename-tsconfig payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRenameTSConfig {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not rename-tsconfig", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: rename-tsconfig payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: rename-tsconfig payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", "", fmt.Errorf("wal: rename-tsconfig payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, schema, newName, nil
+}
+
+// EncodeSetTSConfigSchema encodes an ALTER TEXT SEARCH CONFIGURATION name
+// SET SCHEMA newSchema event, mirroring EncodeAlterCollationSetSchema.
+// DU-002 restart-persistence follow-up to the slice 446 RENAME/SET
+// SCHEMA/DROP MAPPING follow-up (M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newSchemaLen(2) | newSchema(newSchemaLen bytes).
+func EncodeSetTSConfigSchema(name, schema, newSchema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newSchema))
+	out[0] = RecordKindSetTSConfigSchema
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newSchema)))
+	off += 2
+	copy(out[off:], newSchema)
+	return out
+}
+
+// DecodeSetTSConfigSchema decodes a RecordKindSetTSConfigSchema payload.
+func DecodeSetTSConfigSchema(payload []byte) (name, schema, newSchema string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: set-tsconfig-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindSetTSConfigSchema {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not set-tsconfig-schema", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: set-tsconfig-schema payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: set-tsconfig-schema payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newSchemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newSchemaLen {
+		return "", "", "", fmt.Errorf("wal: set-tsconfig-schema payload truncated (need %d bytes)", off+newSchemaLen)
+	}
+	newSchema = string(payload[off : off+newSchemaLen])
+	return name, schema, newSchema, nil
 }
 
 // EncodeCreateCollation encodes a CREATE COLLATION event (DU-002
@@ -6952,7 +7166,8 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// catalog's conversion registry.
 		return false, nil
-	case RecordKindCreateTSDict, RecordKindDropTSDict, RecordKindCreateTSConfig, RecordKindAddTSConfigMapping, RecordKindDropTSConfig:
+	case RecordKindCreateTSDict, RecordKindDropTSDict, RecordKindCreateTSConfig, RecordKindAddTSConfigMapping, RecordKindDropTSConfig,
+		RecordKindDropTSConfigMapping, RecordKindRenameTSConfig, RecordKindSetTSConfigSchema:
 		// CREATE/DROP TEXT SEARCH DICTIONARY and CREATE/ADD MAPPING/DROP TEXT
 		// SEARCH CONFIGURATION records (DU-002 restart-persistence follow-up
 		// to slices 437/446, M0119-0004) carry only pg_ts_dict/pg_ts_config

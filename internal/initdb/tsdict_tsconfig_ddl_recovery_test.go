@@ -241,3 +241,83 @@ func TestReplayTSConfigDDLRecordsHandlesMissingWalDir(t *testing.T) {
 		t.Errorf("no-op replay should not register any configuration, got %+v", cat.ListUserTSConfigs())
 	}
 }
+
+// TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping guards the
+// M0119-0004 slice 446 follow-up: a configuration's RENAME TO / SET SCHEMA /
+// DROP MAPPING must survive a restart exactly like its CREATE/ADD MAPPING
+// already do (TestTSConfigDDLRecoveryReplaysCreateAndMapping).
+func TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40461)
+	const wantSchemaOID = uint32(40462)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("myschema", wantSchemaOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-schema: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSConfig("myconfig2", "public", wantOID, 10, 3722)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-tsconfig: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("myconfig2", "public", "asciiword", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("myconfig2", "public", "word", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping (word): %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeDropTSConfigMapping("myconfig2", "public", "word")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append drop-mapping: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeRenameTSConfig("myconfig2", "public", "myconfig2_renamed")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append rename-tsconfig: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeSetTSConfigSchema("myconfig2_renamed", "public", "myschema")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append set-tsconfig-schema: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat, ok := rt2.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("Catalog is %T, expected *catalog.InMemory", rt2.Catalog)
+	}
+	if uc := findUserTSConfig(cat, "myconfig2", "public"); uc != nil {
+		t.Errorf("old name/schema still resolves after RENAME+SET SCHEMA replay: %+v", uc)
+	}
+	if uc := findUserTSConfig(cat, "myconfig2_renamed", "public"); uc != nil {
+		t.Errorf("renamed configuration still in old schema after SET SCHEMA replay: %+v", uc)
+	}
+	uc := findUserTSConfig(cat, "myconfig2_renamed", "myschema")
+	if uc == nil {
+		t.Fatalf("after WAL replay, renamed+moved configuration not found; registry = %+v", cat.ListUserTSConfigs())
+	}
+	if uc.OID != wantOID {
+		t.Errorf("after WAL replay, configuration OID = %d, want %d", uc.OID, wantOID)
+	}
+	if len(uc.Mappings) != 1 || uc.Mappings[0].TokenType != "asciiword" {
+		t.Errorf("after WAL replay, mappings = %+v, want only the surviving asciiword entry (word was dropped)", uc.Mappings)
+	}
+}

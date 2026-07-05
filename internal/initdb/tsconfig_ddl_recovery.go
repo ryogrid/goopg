@@ -1,12 +1,14 @@
 package initdb
 
-// CREATE TEXT SEARCH CONFIGURATION / ADD MAPPING / DROP WAL replay (DU-002
-// restart-persistence follow-up to slice 446, M0119-0004).
+// CREATE TEXT SEARCH CONFIGURATION / ADD MAPPING / DROP / DROP MAPPING /
+// RENAME / SET SCHEMA WAL replay (DU-002 restart-persistence follow-up to
+// slice 446, M0119-0004).
 //
 // Physical WAL replay (`wal.ReplayFromDirWithMgr`) ignores the
-// CREATE/ADD-MAPPING/DROP TEXT SEARCH CONFIGURATION record kinds (106, 107,
-// 108) because goopg has no per-configuration file namespace — there is no
-// page-level state to reconstruct. The catalog's configuration registry,
+// CREATE/ADD-MAPPING/DROP/DROP-MAPPING/RENAME/SET-SCHEMA TEXT SEARCH
+// CONFIGURATION record kinds (106-111) because goopg has no per-configuration
+// file namespace — there is no page-level state to reconstruct. The
+// catalog's configuration registry,
 // however, is the in-memory source of truth that backs the pg_ts_config /
 // pg_ts_config_map virtual views (pg_dump's getTSConfigurations/
 // dumpTSConfig). This recovery pass walks the WAL once after physical replay
@@ -32,11 +34,15 @@ type tsConfigRegistryRecovery interface {
 	CreateTSConfigDuringRecovery(uc *catalog.UserTSConfig, schema string)
 	AddTSConfigMappingDuringRecovery(name, schema, tokenType string, dictOIDs []uint32)
 	DropTSConfigDuringRecovery(name, schema string)
+	DropTSConfigMappingDuringRecovery(name, schema, tokenType string)
+	RenameTSConfigDuringRecovery(name, schema, newName string)
+	SetTSConfigSchemaDuringRecovery(name, schema, newSchema string)
 }
 
 // replayTSConfigDDLRecords reads every WAL record under walDir and applies
-// CREATE / ADD MAPPING / DROP TEXT SEARCH CONFIGURATION entries to the
-// catalog. A missing walDir means "freshly initdb'd cluster" and is treated
+// CREATE / ADD MAPPING / DROP / DROP MAPPING / RENAME / SET SCHEMA TEXT
+// SEARCH CONFIGURATION entries to the catalog. A missing walDir means
+// "freshly initdb'd cluster" and is treated
 // as a no-op. The catalog argument may be nil (some embedded test setups),
 // in which case the function returns nil without doing any I/O.
 func replayTSConfigDDLRecords(walDir string, cat catalog.Catalog) error {
@@ -93,6 +99,24 @@ func replayTSConfigDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode drop-tsconfig at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.DropTSConfigDuringRecovery(name, schema)
+		case wal.RecordKindDropTSConfigMapping:
+			name, schema, tokenType, derr := wal.DecodeDropTSConfigMapping(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode drop-tsconfig-mapping at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.DropTSConfigMappingDuringRecovery(name, schema, tokenType)
+		case wal.RecordKindRenameTSConfig:
+			name, schema, newName, derr := wal.DecodeRenameTSConfig(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode rename-tsconfig at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.RenameTSConfigDuringRecovery(name, schema, newName)
+		case wal.RecordKindSetTSConfigSchema:
+			name, schema, newSchema, derr := wal.DecodeSetTSConfigSchema(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode set-tsconfig-schema at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.SetTSConfigSchemaDuringRecovery(name, schema, newSchema)
 		}
 	}
 	return nil
