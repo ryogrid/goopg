@@ -14870,3 +14870,57 @@ Gates: `go build ./...` clean; `go test -count=1 ./internal/wal/...
 ./internal/catalog/... ./internal/initdb/...` PASS (new tests above);
 `go test -count=1 -run TestPort_PgDumpConnectionSetup ./internal/testport/
 -v` PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench pre-commit smoke PASS.
+
+## Slice 446 follow-up: duplicate-mapping detection is 23505, not 42710 (2026-07-06)
+
+Closes the "duplicate-mapping 42710 detection" item both the slice 446 and
+the restart-persistence-follow-up rows above deferred. Before implementing,
+this loop verified real PostgreSQL 18.3's actual behavior against a scratch
+instance rather than trusting the ledger's guess:
+
+```sql
+CREATE TEXT SEARCH CONFIGURATION my_cfg (PARSER = default);
+ALTER TEXT SEARCH CONFIGURATION my_cfg ADD MAPPING FOR word WITH simple;
+ALTER TEXT SEARCH CONFIGURATION my_cfg ADD MAPPING FOR word WITH english_stem;
+-- ERROR:  duplicate key value violates unique constraint "pg_ts_config_map_index"
+-- DETAIL:  Key (mapcfg, maptokentype, mapseqno)=(16384, 2, 1) already exists.
+```
+
+`MakeConfigurationMapping`'s plain-ADD path (`tsearchcmds.c`, `stmt->override
+== false`) never checks for an existing mapping before inserting — it simply
+assigns `mapseqno = j + 1` counting only the dictionaries named in *this*
+statement, starting at 1 every time. A second `ADD MAPPING FOR word` therefore
+always produces a `(mapcfg, maptokentype, mapseqno) = (cfgOid, wordTokId, 1)`
+tuple that collides with the row the first call already inserted, so the
+unique index (`pg_ts_config_map_index`) is what actually raises the error —
+`23505` unique_violation, not `42710` duplicate_object as this milestone's
+deferral rows had assumed (42710 is what `CREATE TEXT SEARCH CONFIGURATION`
+itself raises for a duplicate *configuration* name, a different check
+entirely: `catalog.InMemory.CreateTSConfig`'s existing name-collision path).
+
+**Landed**: `catalog.InMemory.AddTSConfigMapping` (`internal/catalog/
+catalog.go`) now scans the target configuration's existing `Mappings` for the
+named token type before appending, returning `(*UserTSConfig, duplicate
+bool)` instead of a bare `bool` — `nil` config means "configuration not
+found" (unchanged 42704 case), `duplicate == true` means the token type is
+already mapped. `internal/executor/operators_ddl.go`'s
+`execAlterTSConfigAddMapping` raises `23505` with PG's exact message text and
+a `Detail` reproducing the real `(mapcfg, maptokentype, mapseqno)` key tuple
+(config OID + `catalog.DefaultParserTokenTypes` token-type lookup + hardcoded
+`, 1)`, since every plain ADD MAPPING call collides at seqno 1). A distinct
+token type in the same configuration is unaffected (verified by test).
+
+**Test**: `internal/executor/tsconfig_duplicate_mapping_test.go`
+(`TestAlterTSConfigAddMappingDuplicateRaises23505`) — create a configuration,
+add a mapping, re-add the same token type (expect 23505 with the exact
+message/detail text), then add a distinct token type (expect success).
+
+**Still deferred** (unchanged): every other `ALTER TEXT SEARCH CONFIGURATION`
+form (`ALTER MAPPING REPLACE`, `DROP MAPPING`, `RENAME TO`, `SET SCHEMA`), and
+the `CONFIGURATION = source_config` COPY-from-existing-configuration form of
+CREATE.
+
+Gates: `go build ./...` clean; `go vet ./internal/catalog/...
+./internal/executor/...` clean; `go test -count=1 ./internal/catalog/...
+./internal/executor/... ./internal/wal/... ./internal/initdb/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench pre-commit smoke via git hook.

@@ -15759,8 +15759,23 @@ func (o *ddlOp) execAlterTSConfigAddMapping(s *parser.AlterTSConfigAddMappingStm
 		}
 	}
 	for _, tt := range s.TokenTypes {
-		if !im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs) {
+		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
+		if uc == nil {
 			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		if dup {
+			tokID := -1
+			for _, t := range catalog.DefaultParserTokenTypes {
+				if strings.EqualFold(t.Alias, tt) {
+					tokID = t.TokID
+					break
+				}
+			}
+			return &ExecError{
+				Code:    "23505",
+				Message: `duplicate key value violates unique constraint "pg_ts_config_map_index"`,
+				Detail:  fmt.Sprintf("Key (mapcfg, maptokentype, mapseqno)=(%d, %d, 1) already exists.", uc.OID, tokID),
+			}
 		}
 		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
 		// event per token type so the mapping survives a restart, replayed

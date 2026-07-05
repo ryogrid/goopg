@@ -11379,13 +11379,18 @@ func (c *InMemory) ListUserTSConfigs() []*UserTSConfig {
 }
 
 // AddTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name ADD
-// MAPPING FOR tokenType WITH dictOIDs — appends one pg_ts_config_map entry
-// (mirroring MakeConfigurationMapping's ADD behavior: repeating an
-// already-mapped token type in real PG is a 42710 error, which goopg does
-// not enforce — see this slice's deferral ledger row). Returns false if no
-// configuration with the given (schema-resolved) name exists.
+// MAPPING FOR tokenType WITH dictOIDs — appends one pg_ts_config_map entry.
+// mapseqno restarts at 1 for every plain ADD MAPPING call (MakeConfigurationMapping's
+// non-override insert path in tsearchcmds.c), so re-adding an already-mapped
+// token type collides with the existing seqno-1 row on the
+// (mapcfg, maptokentype, mapseqno) unique index — verified against real PG
+// 18.3, this raises a 23505 unique_violation, NOT the 42710 this slice's
+// original deferral-ledger row guessed. Returns the matched configuration
+// (nil if no configuration with the given schema-resolved name exists) and
+// whether tokenType already had a mapping entry (the caller must not append
+// in that case).
 // DU-002 slice 446 (M0119-0004).
-func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) bool {
+func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig, duplicate bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	nsOID := c.schemas[strings.ToLower(schema)]
@@ -11394,11 +11399,16 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 	}
 	for _, uc := range c.userTSConfigs {
 		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			for _, m := range uc.Mappings {
+				if strings.EqualFold(m.TokenType, tokenType) {
+					return uc, true
+				}
+			}
 			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: dictOIDs})
-			return true
+			return uc, false
 		}
 	}
-	return false
+	return nil, false
 }
 
 // CreateTSConfigDuringRecovery is the idempotent version of CreateTSConfig
