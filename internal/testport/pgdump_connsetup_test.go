@@ -4294,6 +4294,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create text search dictionary simple_dict: %v", err)
 	}
 
+	// Slice 446: a CREATE TEXT SEARCH CONFIGURATION plus its ADD MAPPING
+	// entries must round-trip through pg_dump. Verified byte-for-byte against
+	// real PG 18.3's own dump of the identical fixture: CREATE (PARSER =
+	// pg_catalog.default) followed by one ALTER ... ADD MAPPING per distinct
+	// token type. Unlike DICTIONARY (slice 437), this needed two new catalog
+	// dependencies to resolve: a live pg_ts_parser row for the built-in
+	// "default" parser (BuiltinTSParserOID, dumpTSConfig's own nspname/prsname
+	// lookup) and a live pg_ts_dict row for the built-in "simple" dictionary
+	// (BuiltinTSDictOID, the mapdict::regdictionary cast) — both previously
+	// absent, since goopg surfaced neither pg_ts_parser nor pg_ts_dict rows for
+	// anything but user-created objects.
+	if err := runSQLSimple(t, c, "CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (PARSER = pg_catalog.default)"); err != nil {
+		t.Fatalf("create text search configuration simple_cfg: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TEXT SEARCH CONFIGURATION public.simple_cfg ADD MAPPING FOR asciiword, word WITH simple"); err != nil {
+		t.Fatalf("alter text search configuration simple_cfg add mapping: %v", err)
+	}
+
 	// Slice 243: a stand-alone composite type (`CREATE TYPE x AS (...)`) must
 	// round-trip. Slice 242 made the type visible to pg_dump's getTypes via the
 	// pg_type row (typtype='c'), but left typrelid=0 so dumpCompositeType found no
@@ -11014,6 +11032,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER TEXT SEARCH DICTIONARY public.simple_dict OWNER TO postgres;") {
 			t.Errorf("pg_dump dropped the text search dictionary's OWNER TO clause\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 446 (asserted):** CREATE TEXT SEARCH CONFIGURATION plus its ADD
+		// MAPPING entries must round-trip through pg_dump. Verified byte-for-byte
+		// against real PG 18.3's own pg_dump output for the identical DDL: the
+		// PARSER clause resolves the bare `pg_catalog."default"` name via the
+		// built-in pg_ts_parser row (catalog.BuiltinTSParserOID), and dumpTSConfig
+		// re-emits the two-token ADD MAPPING as two separate ALTER statements (one
+		// per distinct token type, even though both were added in a single input
+		// ALTER ... FOR asciiword, word WITH simple statement here) because it
+		// groups pg_ts_config_map rows by maptokentype, not by how they were
+		// originally added.
+		if !strings.Contains(res.Stdout,
+			"CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (\n    PARSER = pg_catalog.\"default\" );") {
+			t.Errorf("pg_dump dropped/mangled the text search configuration round-trip\n  full stdout=%q", res.Stdout)
+		}
+		tsConfigMappings := []string{
+			"ALTER TEXT SEARCH CONFIGURATION public.simple_cfg\n    ADD MAPPING FOR asciiword WITH simple;",
+			"ALTER TEXT SEARCH CONFIGURATION public.simple_cfg\n    ADD MAPPING FOR word WITH simple;",
+		}
+		for _, sub := range tsConfigMappings {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled a text search configuration ADD MAPPING; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if !strings.Contains(res.Stdout, "ALTER TEXT SEARCH CONFIGURATION public.simple_cfg OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the text search configuration's OWNER TO clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 243 (asserted):** a stand-alone composite type round-trips. PG's
 		// dumpCompositeType walks pg_type.typrelid → pg_class (relkind='c') →

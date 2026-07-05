@@ -5,6 +5,35 @@ import (
 	"strings"
 )
 
+// parseTSObjectNameLoose parses a possibly schema-qualified `[schema.]name`
+// like parseObjectName, but accepts ANY keyword token (not just
+// col_name-class ones) as a bare identifier component. It exists for the
+// `PARSER = ...` / `TEMPLATE = ...` clause values of CREATE TEXT SEARCH
+// CONFIGURATION/DICTIONARY: real PG's grammar lets these name a reserved
+// keyword unquoted (`PARSER = pg_catalog.default` is valid DDL, even though
+// "default" is IsColNameKeyword-false and would otherwise fail
+// parseObjectName's parseIdent). There is no ambiguity to guard against in
+// this position — the value is always immediately followed by `,`/`)`.
+// DU-002 slice 446 (M0119-0004).
+func (p *parser) parseTSObjectNameLoose() (ObjectName, error) {
+	first := p.cur()
+	if first.Kind != TokenIdent && first.Kind != TokenQuotedIdent && first.Kind != TokenKeyword {
+		return ObjectName{}, p.errAtCur("expected identifier")
+	}
+	p.advance()
+	o := ObjectName{pos: first.Pos, Name: identText(first)}
+	if p.acceptSymbol(".") {
+		second := p.cur()
+		if second.Kind != TokenIdent && second.Kind != TokenQuotedIdent && second.Kind != TokenKeyword {
+			return ObjectName{}, p.errAtCur("expected identifier")
+		}
+		p.advance()
+		o.Schema = o.Name
+		o.Name = identText(second)
+	}
+	return o, nil
+}
+
 // parseCreate dispatches on the next keyword after CREATE.
 func (p *parser) parseCreate() (Stmt, error) {
 	t, err := p.expectKeyword(KwCreate)
@@ -364,13 +393,15 @@ func (p *parser) parseCreate() (Stmt, error) {
 			tsName, _ = p.parseObjectName()
 		}
 		// CREATE TEXT SEARCH DICTIONARY name ( TEMPLATE = tmpl [, key = value, ...] )
-		// is the only TS object kind whose option list is actually parsed (not
-		// just skipped) — it round-trips through pg_dump (pg_ts_dict →
-		// dumpTSDictionary); CONFIGURATION/PARSER/TEMPLATE stay parsed-and-
-		// discarded compat no-ops. DU-002 slice 437.
-		var tmplName ObjectName
+		// and CREATE TEXT SEARCH CONFIGURATION name ( PARSER = parser_name ) are
+		// the only TS object kinds whose option list is actually parsed (not
+		// just skipped) — they round-trip through pg_dump (pg_ts_dict →
+		// dumpTSDictionary, pg_ts_config → dumpTSConfig); PARSER/TEMPLATE stay
+		// parsed-and-discarded compat no-ops. DU-002 slices 437, 446.
+		var tmplName, parserName ObjectName
 		var dictOptions []TSDictOption
-		if tsType == "text search dictionary" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+		if (tsType == "text search dictionary" || tsType == "text search configuration") &&
+			p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 			p.advance() // consume '('
 			for {
 				c := p.cur()
@@ -392,8 +423,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 				}
 				p.advance() // consume '='
 				if key == "template" {
-					if fn, ferr := p.parseObjectName(); ferr == nil {
+					if fn, ferr := p.parseTSObjectNameLoose(); ferr == nil {
 						tmplName = fn
+					}
+					continue
+				}
+				if key == "parser" {
+					if fn, ferr := p.parseTSObjectNameLoose(); ferr == nil {
+						parserName = fn
 					}
 					continue
 				}
@@ -422,6 +459,9 @@ func (p *parser) parseCreate() (Stmt, error) {
 			if tsType == "text search dictionary" {
 				ns.TSDictTemplate = tmplName
 				ns.TSDictOptions = dictOptions
+			}
+			if tsType == "text search configuration" {
+				ns.TSConfigParser = parserName
 			}
 		}
 		return stmt, nil
@@ -6369,6 +6409,74 @@ func (p *parser) parseAlter() (Stmt, error) {
 	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault &&
 		strings.EqualFold(p.peek(1).Value, "privileges") {
 		return p.parseAlterDefaultPrivileges(t.Pos)
+	}
+	// ALTER TEXT SEARCH CONFIGURATION name ADD MAPPING FOR tok [, ...] WITH
+	// dict [, ...] — the only ALTER TEXT SEARCH * form goopg actually applies
+	// (it is how a config's pg_ts_config_map rows get populated, which
+	// dumpTSConfig's own ADD MAPPING re-emission depends on). Every other
+	// ALTER TEXT SEARCH * form (CONFIGURATION's RENAME TO/OWNER TO/SET
+	// SCHEMA/ALTER MAPPING/DROP MAPPING, and DICTIONARY/PARSER/TEMPLATE
+	// entirely) falls through to the generic skip-to-semicolon compat no-op
+	// below, matching CREATE TEXT SEARCH's existing pattern. DU-002 slice 446
+	// (M0119-0004).
+	if p.acceptIdentKeyword("text") {
+		_ = p.acceptIdentKeyword("search") // consume "search"
+		if p.acceptIdentKeyword("configuration") {
+			cfgName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			if p.acceptKeyword(KwAdd) && p.acceptIdentKeyword("mapping") {
+				if _, err := p.expectKeyword(KwFor); err != nil {
+					return nil, err
+				}
+				var tokenTypes []string
+				for {
+					tok, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					tokenTypes = append(tokenTypes, strings.ToLower(identText(tok)))
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				if _, err := p.expectKeyword(KwWith); err != nil {
+					return nil, err
+				}
+				var dicts []ObjectName
+				for {
+					dn, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					dicts = append(dicts, dn)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				return &AlterTSConfigAddMappingStmt{pos: t.Pos, ConfigName: cfgName, TokenTypes: tokenTypes, Dictionaries: dicts}, nil
+			}
+			// RENAME TO / OWNER TO / SET SCHEMA / ALTER MAPPING / DROP MAPPING —
+			// unimplemented compat no-op; discard the rest of the statement.
+			stmt, err := p.parseSkipToSemicolon(t.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if ns, ok := stmt.(*CompatNoopStmt); ok {
+				ns.Tag = "ALTER TEXT SEARCH CONFIGURATION"
+				ns.ObjType = "text search configuration"
+				ns.ObjName = cfgName
+			}
+			return stmt, nil
+		}
+		// ALTER TEXT SEARCH DICTIONARY|PARSER|TEMPLATE — unimplemented compat
+		// no-op.
+		stmt, err := p.parseSkipToSemicolon(t.Pos)
+		if err != nil {
+			return nil, err
+		}
+		return stmt, nil
 	}
 	// ALTER SEQUENCE — consume options as a compat stub. M0097-0009.
 	if p.acceptIdentKeyword("sequence") {

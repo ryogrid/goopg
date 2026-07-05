@@ -148,6 +148,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
+		*parser.AlterTSConfigAddMappingStmt,
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt,
 		*parser.CreateExtensionStmt,
@@ -3669,6 +3670,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "ts_token_type") {
+		return planTSTokenType(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "verify_heapam") {
 		return planVerifyHeapam(rv, sourceIdx, lateralCtx)
 	}
@@ -4519,6 +4523,51 @@ func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planTSTokenType routes a FROM-clause invocation of ts_token_type(oid) into
+// a TSTokenType plan node. pg_dump's dumpTSConfig calls it with a literal
+// `'%u'::pg_catalog.oid` argument (not lateral), but the arg is still
+// resolved against lateralCtx (falling back to an empty context) to accept
+// either shape, mirroring planPgGetSequenceData. DU-002 slice 446
+// (M0119-0004).
+func planTSTokenType(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) != 1 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "ts_token_type requires 1 argument"}
+	}
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "ts_token_type"
+	}
+	colNames := []string{"tokid", "alias", "description"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"int4", "text", "text"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &TSTokenType{pos: tf.Pos(), Arg: arg, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

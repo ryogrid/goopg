@@ -14698,3 +14698,115 @@ TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
 -count=1 ./internal/executor/... ./internal/parser/... ./internal/catalog/...`
 PASS; `scripts/tpch-spotcheck.sh` (background-verified, see working_set/loop
 status for the result recorded at commit time).
+
+## Slice 446: `CREATE TEXT SEARCH CONFIGURATION` + `ADD MAPPING` round-trip (2026-07-06)
+
+The CONFIGURATION candidate slice 437 deliberately deferred (it needed its
+own catalog, `pg_ts_config_map`, for the `ADD MAPPING` clause). This slice
+implements it: `CREATE TEXT SEARCH CONFIGURATION name (PARSER = parser_name)`
+followed by `ALTER TEXT SEARCH CONFIGURATION name ADD MAPPING FOR tok [, ...]
+WITH dict [, ...]` now round-trips through `pg_dump`.
+
+**Verified against real PG 18.3 first**:
+
+```sql
+CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (PARSER = pg_catalog.default);
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg ADD MAPPING FOR asciiword, word WITH simple;
+```
+
+dumps as:
+
+```
+CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (
+    PARSER = pg_catalog."default" );
+
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg
+    ADD MAPPING FOR asciiword WITH simple;
+
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg
+    ADD MAPPING FOR word WITH simple;
+
+
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg OWNER TO postgres;
+```
+
+Two things worth noting: (1) `dumpTSConfig` groups `pg_ts_config_map` rows by
+`maptokentype` and re-emits **one `ALTER ... ADD MAPPING` per distinct token
+type**, even though both were added by a single input statement here — it
+does not remember how the mapping was originally batched; (2) the bare
+`default` parser name is quoted (`pg_catalog."default"`) in the dump because
+it collides with the `DEFAULT` reserved keyword.
+
+**Implementation** required two new catalog dependencies `dumpTSConfig`
+resolves by OID, mirroring the `BuiltinTSTemplateOID` precedent from slice
+437:
+
+- `catalog.BuiltinTSParserOID` (`{"default": 3722}`) backs a now-non-empty
+  `pg_ts_parser.VirtualRows` — needed for `dumpTSConfig`'s own
+  `SELECT nspname, prsname FROM pg_ts_parser ... WHERE oid = '<cfgparser>'`
+  lookup of the CONFIGURATION's `PARSER = ...` clause.
+- `catalog.BuiltinTSDictOID` (`{"simple": 3765}`) backs a `pg_ts_dict` row for
+  the built-in "simple" dictionary — needed for `dumpTSConfig`'s
+  `mapdict::regdictionary` cast when re-emitting `ADD MAPPING ... WITH
+  simple`. Both views still filter these built-ins out of their own
+  *dump-list* queries via namespace dumpability (pg_catalog is never
+  dumped) — only the FK-lookup path gained real data, same pattern as 437's
+  `pg_ts_template` fix.
+- `catalog.TSTokenType`/`DefaultParserTokenTypes` — the fixed 23-row token
+  type table for the "default" parser (tokid/alias/description), verified
+  byte-for-byte against `SELECT * FROM ts_token_type(3722)` on real PG 18.3.
+  Backs the new `ts_token_type(oid)` FROM-clause SRF (`planner.TSTokenType` +
+  `executor.newTSTokenTypeOp`, mirroring the existing `pg_get_sequence_data`
+  SRF plumbing) — `dumpTSConfig` selects the `alias` column from a correlated
+  scalar subquery over it to resolve `pg_ts_config_map.maptokentype` back to
+  a name for the `ADD MAPPING FOR <alias>` clause.
+- `catalog.UserTSConfig`/`TSConfigMapping` + `InMemory.CreateTSConfig`/
+  `DropTSConfig`/`AddTSConfigMapping`/`ListUserTSConfigs`
+  (`internal/catalog/catalog.go`) mirror `UserTSDict`, with `Mappings
+  []TSConfigMapping` holding the ordered per-token-type dictionary list.
+  Backs new `pg_ts_config`/`pg_ts_config_map` (OID 3603) virtual views —
+  `pg_ts_config_map` is read directly by `dumpTSConfig`'s own query, not via
+  the `getTSConfigurations` dump-list query.
+- `internal/parser/ddl.go`: `CREATE TEXT SEARCH CONFIGURATION`'s `(PARSER =
+  ...)` clause now parses (reusing the option-list scanner slice 437 added,
+  extended with a `parser` key branch); a new `parseTSObjectNameLoose` helper
+  accepts a bare reserved-keyword identifier (`pg_catalog.default`) in this
+  position, which `parseObjectName` cannot (PG's grammar allows it here; there
+  is no ambiguity to guard against). A new top-level `ALTER TEXT SEARCH
+  CONFIGURATION ... ADD MAPPING FOR ... WITH ...` parse path produces
+  `parser.AlterTSConfigAddMappingStmt`; every other `ALTER TEXT SEARCH *` form
+  (RENAME/OWNER TO/SET SCHEMA/ALTER MAPPING/DROP MAPPING, and
+  DICTIONARY/PARSER/TEMPLATE entirely) stays a discarded compat no-op.
+- `internal/executor/operators_ddl.go`: new `"text search configuration"`
+  CREATE case (42704 if PARSER is missing/unresolvable, mirroring
+  `DefineTSConfiguration`'s check in `tsearchcmds.c`) and
+  `execAlterTSConfigAddMapping` (resolves each dictionary name against the
+  built-in `simple` first, then user-created dictionaries in the
+  configuration's schema, 42704 if neither matches). DROP fallthrough gained
+  a `DropTSConfig` call alongside the existing `DropTSDict` one.
+- `internal/executor/expr.go`: a new `int → regdictionary` cast branch
+  (mirroring the existing `int → regclass` one) resolves a `pg_ts_dict` OID
+  back to a bare name, checking `BuiltinTSDictOID` then
+  `ListUserTSDicts` — needed for the `mapdict::regdictionary` cast in
+  `dumpTSConfig`'s query.
+
+**Deliberately left out this slice** (deferral-ledger row, same date):
+restart/WAL persistence (mirroring the DICTIONARY gap from slice 437 — a
+configuration and its mappings vanish on server restart), duplicate-mapping
+detection (real PG raises 42710 re-adding a token type already mapped; goopg
+silently appends), and every other `ALTER TEXT SEARCH CONFIGURATION` form
+(`ALTER MAPPING REPLACE`, `DROP MAPPING`, `RENAME TO`, `SET SCHEMA` — only
+`ADD MAPPING` is applied). `CONFIGURATION = source_config` (the COPY-from-
+existing-configuration form of CREATE) is also unimplemented — only the bare
+`PARSER = ...` form is accepted.
+
+New assertions added to the existing TS-dictionary fixture block (same guard
+test, same connection): the fixture creates `simple_cfg` right after
+`simple_dict`, and the exact-block/ADD-MAPPING/OWNER-TO assertions land
+alongside the existing DICTIONARY ones near the end of the dump-comparison
+section, matching the established slice pattern.
+
+Gates: `go build ./...` clean; `go test -count=1 -run
+TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
+-count=1 ./internal/catalog/... ./internal/parser/... ./internal/executor/...
+./internal/planner/... ./internal/analyzer/...` PASS.

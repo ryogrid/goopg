@@ -1217,6 +1217,25 @@ type PgGetSequenceData struct {
 func (n *PgGetSequenceData) Pos() int       { return n.pos }
 func (n *PgGetSequenceData) Output() Schema { return n.schema }
 
+// TSTokenType implements ts_token_type(parser_oid) as a FROM-clause SRF:
+// (tokid int4, alias text, description text). pg_dump's dumpTSConfig issues
+// `FROM pg_catalog.ts_token_type('%u'::oid) AS t` (a literal argument, not
+// lateral) to resolve a pg_ts_config_map row's maptokentype back to its
+// alias. goopg models only the one built-in "default" parser
+// (catalog.BuiltinTSParserOID), so the operator returns
+// catalog.DefaultParserTokenTypes when Args[0] evaluates to that parser's
+// OID, and 0 rows for any other input (including a user-defined parser,
+// which cannot exist — CREATE TEXT SEARCH PARSER is unimplemented). DU-002
+// slice 446 (M0119-0004).
+type TSTokenType struct {
+	pos    int
+	Arg    Expr
+	schema Schema
+}
+
+func (n *TSTokenType) Pos() int       { return n.pos }
+func (n *TSTokenType) Output() Schema { return n.schema }
+
 // PgAvailableWalSummaries implements pg_available_wal_summaries() as a
 // FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
 // for each available WAL summary file. goopg v0 has no WAL summarizer

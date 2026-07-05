@@ -191,6 +191,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateDomain(s)
 	case *parser.DropDomainStmt:
 		return nil, o.execDropDomain(s)
+	case *parser.AlterTSConfigAddMappingStmt:
+		return nil, o.execAlterTSConfigAddMapping(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -14524,6 +14526,14 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 					// the deferral ledger row for this slice).
 					im.DropTSDict(s.Names[0].Name, s.Names[0].Schema)
 				}
+				if objType == "text search configuration" {
+					// Drop the dump-visible pg_ts_config registry entry (and its
+					// pg_ts_config_map rows, held inline on the same struct) too
+					// so a dropped configuration stops round-tripping through
+					// pg_dump (DU-002 slice 446). No WAL emission yet, mirroring
+					// text search dictionary.
+					im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema)
+				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
 				}
@@ -15608,6 +15618,42 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// CONVERSION/CAST/TRANSFORM, this slice records no WAL event — a
 		// dictionary created this session does not survive a restart. See
 		// the deferral ledger row for this slice.
+	case "text search configuration":
+		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
+		// (PARSER = parser_name)) so it round-trips through pg_dump (pg_ts_config
+		// view → getTSConfigurations / dumpTSConfig). DU-002 slice 446.
+		//
+		// PARSER is required, mirroring DefineTSConfiguration's own
+		// ERRCODE_INVALID_OBJECT_DEFINITION check (tsearchcmds.c) — goopg only
+		// resolves the one real built-in parser (BuiltinTSParserOID); CREATE TEXT
+		// SEARCH PARSER stays unimplemented (a C-function-loading feature with no
+		// analog here), so no user-defined parser can ever be named. Unlike real
+		// PG's `CONFIGURATION = source_config` COPY form (which prepopulates the
+		// mapping from an existing configuration's pg_ts_config_map rows), only
+		// the bare `PARSER = ...` form is supported; mappings are always added
+		// afterward via ALTER ... ADD MAPPING.
+		parserName := strings.ToLower(s.TSConfigParser.Name)
+		parserOID, ok := catalog.BuiltinTSParserOID[parserName]
+		if !ok || parserName == "" {
+			return &ExecError{Code: "42704", Message: "text search parser is required"}
+		}
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		uc := &catalog.UserTSConfig{
+			Name:   s.ObjName.Name,
+			Owner:  uint32(10), // bootstrap superuser (postgres)
+			Parser: parserOID,
+		}
+		if _, err := im.CreateTSConfig(uc, schema); err != nil {
+			return &ExecError{Code: "42710", Message: err.Error()}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): like CREATE TEXT
+		// SEARCH DICTIONARY, this slice records no WAL event — a configuration
+		// created this session does not survive a restart. See the deferral
+		// ledger row for this slice.
 	case "transform":
 		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang
 		// (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] | ...)) so it
@@ -15649,6 +15695,54 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	default:
 		// text search dictionary/configuration/parser/template, language, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+	}
+	return nil
+}
+
+// execAlterTSConfigAddMapping implements ALTER TEXT SEARCH CONFIGURATION name
+// ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — appends one
+// pg_ts_config_map entry per named token type so pg_dump's dumpTSConfig
+// re-emits the mapping (its own direct `pg_ts_config_map` query, not the
+// getTSConfigurations dump-list query). Each dictionary name resolves against
+// the one built-in dictionary (catalog.BuiltinTSDictOID — "simple") first,
+// then user-created dictionaries (CREATE TEXT SEARCH DICTIONARY) in the same
+// schema as the configuration. DU-002 slice 446 (M0119-0004).
+func (o *ddlOp) execAlterTSConfigAddMapping(s *parser.AlterTSConfigAddMappingStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "XX000", Message: "ALTER TEXT SEARCH CONFIGURATION requires InMemory catalog"}
+	}
+	schema := s.ConfigName.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
+	for _, dn := range s.Dictionaries {
+		dictSchema := dn.Schema
+		if dictSchema == "" {
+			dictSchema = schema
+		}
+		dictNameLower := strings.ToLower(dn.Name)
+		if oid, ok := catalog.BuiltinTSDictOID[dictNameLower]; ok {
+			dictOIDs = append(dictOIDs, oid)
+			continue
+		}
+		found := false
+		for _, ud := range im.ListUserTSDicts() {
+			if strings.EqualFold(ud.Name, dn.Name) {
+				dictOIDs = append(dictOIDs, ud.OID)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", dn.Name)}
+		}
+	}
+	for _, tt := range s.TokenTypes {
+		if !im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs) {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
 	}
 	return nil
 }

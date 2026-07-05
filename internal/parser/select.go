@@ -1480,7 +1480,7 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 		case "generate_series", "pg_input_error_info", "parse_ident",
 			"pg_get_publication_tables", "pg_available_wal_summaries",
 			"verify_heapam", "unnest", "generate_subscripts",
-			"pg_options_to_table":
+			"pg_options_to_table", "ts_token_type":
 			isKnownBuiltin = true
 		}
 		switch {

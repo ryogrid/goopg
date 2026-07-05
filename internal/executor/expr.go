@@ -750,6 +750,28 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
+		if strings.EqualFold(x.TargetType, "regdictionary") && ctx != nil && ctx.Catalog != nil {
+			// int → regdictionary resolves a pg_ts_dict OID to its bare name
+			// (no schema qualification, mirroring the regclass branch above).
+			// pg_dump's dumpTSConfig casts pg_ts_config_map.mapdict this way to
+			// re-emit ADD MAPPING's `WITH <dictname>` clause. DU-002 slice 446
+			// (M0119-0004).
+			if v.Kind == KindInt {
+				oid := uint32(v.Int)
+				for name, builtinOID := range catalog.BuiltinTSDictOID {
+					if builtinOID == oid {
+						return NewStringDatum(name), nil
+					}
+				}
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					for _, ud := range im.ListUserTSDicts() {
+						if ud.OID == oid {
+							return NewStringDatum(ud.Name), nil
+						}
+					}
+				}
+			}
+		}
 		// ── Enum cast validation ─────────────────────────────────────────
 		// If the target type is a user-defined enum and the input is a
 		// non-NULL, non-array string, verify the value is a valid enum label.

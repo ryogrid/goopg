@@ -2186,6 +2186,13 @@ type InMemory struct {
 	// dumpTSDictionary round-trip them. DU-002 slice 437 (M0119-0004).
 	userTSDicts []*UserTSDict
 
+	// userTSConfigs holds text search configurations created via CREATE TEXT
+	// SEARCH CONFIGURATION (+ their ADD MAPPING entries), in creation order.
+	// Surfaced as rows in the virtual pg_ts_config / pg_ts_config_map views so
+	// pg_dump's getTSConfigurations / dumpTSConfig round-trip them. DU-002
+	// slice 446 (M0119-0004).
+	userTSConfigs []*UserTSConfig
+
 	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
@@ -2956,6 +2963,98 @@ type UserTSDict struct {
 	// at CREATE time so dumpTSDictionary can re-emit it verbatim. "" (no options)
 	// means the pg_ts_dict.dictinitoption column is NULL.
 	InitOption string
+}
+
+// BuiltinTSParserOID maps the fixed real-PG OID (pg_ts_parser.dat) of the one
+// built-in text search parser goopg models, keyed by lower-case parser name.
+// dumpTSConfig's own query (`SELECT nspname, prsname FROM pg_ts_parser p,
+// pg_namespace n WHERE p.oid = '<cfgparser>' ...`) needs a live pg_ts_parser
+// row to resolve a configuration's PARSER = ... clause by OID — CREATE TEXT
+// SEARCH PARSER is unimplemented (a C-function-loading feature with no
+// analog here), so no user-defined parser can ever be named. DU-002 slice 446
+// (M0119-0004).
+var BuiltinTSParserOID = map[string]uint32{
+	"default": 3722,
+}
+
+// BuiltinTSDictOID maps the fixed real-PG OID (pg_ts_dict.dat) of the one
+// built-in text search dictionary goopg surfaces in pg_ts_dict, keyed by
+// lower-case dictionary name. A CREATE TEXT SEARCH CONFIGURATION's ADD
+// MAPPING ... WITH simple clause names this dictionary; dumpTSConfig's
+// mapdict::regdictionary cast needs a live pg_ts_dict row (by OID) to
+// resolve it back to a bare name. Only "simple" is modeled — it is the only
+// dictionary with no external data-file dependency, and the overwhelmingly
+// common default in practice. DU-002 slice 446 (M0119-0004).
+var BuiltinTSDictOID = map[string]uint32{
+	"simple": 3765,
+}
+
+// TSTokenType is one row of ts_token_type()'s fixed output for the "default"
+// parser: (tokid, alias, description). Mirrors wparser_def.c's static
+// lex_descr table (the only parser goopg models). Order matches upstream's
+// tokid assignment (prsd_headline.c's lextype array), which is NOT
+// alphabetical or otherwise derivable — it is a fixed historical numbering
+// pg_dump's dumpTSConfig depends on to resolve a pg_ts_config_map row's
+// maptokentype back to its alias. DU-002 slice 446 (M0119-0004).
+type TSTokenType struct {
+	TokID       int
+	Alias       string
+	Description string
+}
+
+// DefaultParserTokenTypes is the fixed 23-row token-type table for the
+// built-in "default" parser (BuiltinTSParserOID["default"] = 3722). Verified
+// byte-for-byte against `SELECT * FROM ts_token_type(3722)` on real PG 18.3.
+var DefaultParserTokenTypes = []TSTokenType{
+	{1, "asciiword", "Word, all ASCII"},
+	{2, "word", "Word, all letters"},
+	{3, "numword", "Word, letters and digits"},
+	{4, "email", "Email address"},
+	{5, "url", "URL"},
+	{6, "host", "Host"},
+	{7, "sfloat", "Scientific notation"},
+	{8, "version", "Version number"},
+	{9, "hword_numpart", "Hyphenated word part, letters and digits"},
+	{10, "hword_part", "Hyphenated word part, all letters"},
+	{11, "hword_asciipart", "Hyphenated word part, all ASCII"},
+	{12, "blank", "Space symbols"},
+	{13, "tag", "XML tag"},
+	{14, "protocol", "Protocol head"},
+	{15, "numhword", "Hyphenated word, letters and digits"},
+	{16, "asciihword", "Hyphenated word, all ASCII"},
+	{17, "hword", "Hyphenated word, all letters"},
+	{18, "url_path", "URL path"},
+	{19, "file", "File or path name"},
+	{20, "float", "Decimal notation"},
+	{21, "int", "Signed integer"},
+	{22, "uint", "Unsigned integer"},
+	{23, "entity", "XML entity"},
+}
+
+// TSConfigMapping is one `ADD MAPPING FOR <tokentype> WITH <dict1>[, ...]`
+// entry — the ordered dictionary list a text search configuration applies to
+// tokens of the given type. Mirrors a run of pg_ts_config_map rows sharing a
+// maptokentype (mapseqno = the entry's index in Dicts). DU-002 slice 446
+// (M0119-0004).
+type TSConfigMapping struct {
+	TokenType string   // e.g. "asciiword" (validated against DefaultParserTokenTypes)
+	DictOIDs  []uint32 // pg_ts_dict.oid values, in mapseqno order
+}
+
+// UserTSConfig records a CREATE TEXT SEARCH CONFIGURATION (+ its ADD MAPPING
+// entries) so pg_dump's getTSConfigurations / dumpTSConfig re-emit it. goopg
+// performs no actual text-search tokenization — only the schema-dump
+// round-trip is modeled, mirroring UserTSDict. Stored in
+// InMemory.userTSConfigs and surfaced as rows in the virtual pg_ts_config /
+// pg_ts_config_map views. Mirrors PG pg_ts_config.h / pg_ts_config_map.h.
+// DU-002 slice 446 (M0119-0004).
+type UserTSConfig struct {
+	OID          uint32 // pg_ts_config.oid (allocated from the catalog OID counter)
+	Name         string // cfgname (bare, no schema)
+	NamespaceOID uint32 // cfgnamespace (resolved from the schema)
+	Owner        uint32 // cfgowner (role OID; 10 = postgres superuser)
+	Parser       uint32 // cfgparser (FK into the built-in pg_ts_parser row)
+	Mappings     []TSConfigMapping
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -8410,7 +8509,37 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3601,
 	}
-	pgTSParser.VirtualRows = func() [][]string { return nil }
+	// As of DU-002 slice 446 this view is no longer unconditionally empty: it
+	// surfaces the one real built-in parser (BuiltinTSParserOID["default"]) in
+	// the pg_catalog namespace, because dumpTSConfig's own query (`SELECT
+	// nspname, prsname FROM pg_ts_parser p, pg_namespace n WHERE p.oid =
+	// '<cfgparser>' ...`) needs a live row to resolve a user-created
+	// configuration's PARSER = ... clause by OID — namespace dumpability
+	// still filters it out of getTSParsers' own dump list, matching the
+	// previous "always empty" behavior for that query. goopg has no real
+	// start/token/end/headline/lextype routines behind this built-in, so all
+	// four surface as OID 0 (InvalidOid) — never read by dumpTSConfig.
+	pgTSParser.VirtualRows = func() [][]string {
+		names := make([]string, 0, len(BuiltinTSParserOID))
+		for name := range BuiltinTSParserOID {
+			names = append(names, name)
+		}
+		sort.Strings(names) // deterministic row order
+		rows := make([][]string, 0, len(names))
+		for _, name := range names {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(BuiltinTSParserOID[name]), 10), // oid
+				name, // prsname
+				"11", // prsnamespace (pg_catalog OID=11)
+				"0",  // prsstart
+				"0",  // prstoken
+				"0",  // prsend
+				"0",  // prsheadline
+				"0",  // prslextype
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
 
 	// pg_ts_template — text-search template catalog (OID 3764). pg_dump's
@@ -8492,10 +8621,22 @@ func (c *InMemory) registerSystemTables() {
 	}
 	pgTSDict.VirtualRows = func() [][]string {
 		dicts := c.ListUserTSDicts()
-		if len(dicts) == 0 {
-			return nil
-		}
-		rows := make([][]string, 0, len(dicts))
+		// As of DU-002 slice 446, this view also surfaces the one built-in
+		// dictionary (BuiltinTSDictOID["simple"]) in the pg_catalog namespace:
+		// a CREATE TEXT SEARCH CONFIGURATION's ADD MAPPING ... WITH simple
+		// clause names it, and dumpTSConfig's mapdict::regdictionary cast
+		// needs a live row (by OID) to resolve it back to a bare "simple".
+		// Namespace dumpability still filters it out of getTSDictionaries'
+		// own dump list, matching the previous "always empty" behavior there.
+		rows := make([][]string, 0, len(dicts)+1)
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(BuiltinTSDictOID["simple"]), 10),   // oid
+			"simple", // dictname
+			"11",     // dictnamespace (pg_catalog OID=11)
+			"10",     // dictowner (bootstrap superuser)
+			strconv.FormatUint(uint64(BuiltinTSTemplateOID["simple"]), 10), // dicttemplate
+			VirtualNull, // dictinitoption
+		})
 		for _, ud := range dicts {
 			initOpt := VirtualNull
 			if ud.InitOption != "" {
@@ -8518,10 +8659,11 @@ func (c *InMemory) registerSystemTables() {
 	// getTSConfigurations runs `SELECT tableoid, oid, cfgname, cfgnamespace,
 	// cfgowner, cfgparser FROM pg_ts_config` — it reads ALL TS configurations
 	// and filters out system-defined ones at dump-out time by namespace
-	// dumpability. goopg defines no user TS configurations, and the built-ins
-	// live in pg_catalog (never dumped), so this view is correctly empty (0
-	// rows). cfgparser is an oid FK to pg_ts_parser. Schema matches PG's
-	// pg_ts_config (pg_ts_config.h). M0110-0001 (DU-002 slice 15).
+	// dumpability. cfgparser is an oid FK to pg_ts_parser. Schema matches PG's
+	// pg_ts_config (pg_ts_config.h). M0110-0001 (DU-002 slice 15). As of DU-002
+	// slice 446 this view surfaces user-created configurations (CREATE TEXT
+	// SEARCH CONFIGURATION), stored in InMemory.userTSConfigs, so pg_dump's
+	// getTSConfigurations / dumpTSConfig round-trip them.
 	pgTSConfig := &Table{
 		Schema: "pg_catalog", Name: "pg_ts_config", Virtual: true,
 		Columns: []Column{
@@ -8533,8 +8675,73 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3602,
 	}
-	pgTSConfig.VirtualRows = func() [][]string { return nil }
+	pgTSConfig.VirtualRows = func() [][]string {
+		cfgs := c.ListUserTSConfigs()
+		if len(cfgs) == 0 {
+			return nil
+		}
+		rows := make([][]string, 0, len(cfgs))
+		for _, uc := range cfgs {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(uc.OID), 10), // oid
+				uc.Name,                                // cfgname
+				strconv.FormatUint(uint64(uc.NamespaceOID), 10), // cfgnamespace
+				strconv.FormatUint(uint64(uc.Owner), 10),        // cfgowner
+				strconv.FormatUint(uint64(uc.Parser), 10),       // cfgparser
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
+
+	// pg_ts_config_map — per-token-type dictionary mapping for a text search
+	// configuration (OID 3603). dumpTSConfig's own query (`SELECT ... FROM
+	// pg_catalog.pg_ts_config_map AS m WHERE m.mapcfg = '<cfgoid>' ORDER BY
+	// m.mapcfg, m.maptokentype, m.mapseqno`) reads this directly (not via
+	// getTSConfigurations' dump-list query), so it must carry live rows for
+	// every ALTER TEXT SEARCH CONFIGURATION ... ADD MAPPING applied to a
+	// user-created configuration. Schema matches PG's pg_ts_config_map
+	// (pg_ts_config_map.h); the on-disk heap-catalog metadata for this
+	// relation was already nailed in internal/initdb/relcache_init.go
+	// (pgTsConfigMapAttrs, OID 3603) for standby pg_class/pg_attribute
+	// parity — this is the query-serving counterpart. DU-002 slice 446
+	// (M0119-0004).
+	pgTSConfigMap := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_config_map", Virtual: true,
+		Columns: []Column{
+			{Name: "mapcfg", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "maptokentype", Type: Type{Name: "int4"}, Ordinal: 1},
+			{Name: "mapseqno", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "mapdict", Type: Type{Name: "oid"}, Ordinal: 3},
+		},
+		OID: 3603,
+	}
+	pgTSConfigMap.VirtualRows = func() [][]string {
+		cfgs := c.ListUserTSConfigs()
+		var rows [][]string
+		for _, uc := range cfgs {
+			tokIDByName := make(map[string]int, len(DefaultParserTokenTypes))
+			for _, tt := range DefaultParserTokenTypes {
+				tokIDByName[tt.Alias] = tt.TokID
+			}
+			for _, m := range uc.Mappings {
+				tokID, ok := tokIDByName[m.TokenType]
+				if !ok {
+					continue
+				}
+				for seq, dictOID := range m.DictOIDs {
+					rows = append(rows, []string{
+						strconv.FormatUint(uint64(uc.OID), 10), // mapcfg
+						strconv.Itoa(tokID),                    // maptokentype
+						strconv.Itoa(seq + 1),                  // mapseqno (1-based)
+						strconv.FormatUint(uint64(dictOID), 10), // mapdict
+					})
+				}
+			}
+		}
+		return rows
+	}
+	c.tables["pg_catalog.pg_ts_config_map"] = pgTSConfigMap
 
 	// pg_foreign_data_wrapper — foreign-data wrapper catalog (OID 2328).
 	// pg_dump's getForeignDataWrappers runs `SELECT tableoid, oid, fdwname,
@@ -11072,6 +11279,87 @@ func (c *InMemory) ListUserTSDicts() []*UserTSDict {
 	out := make([]*UserTSDict, len(c.userTSDicts))
 	copy(out, c.userTSDicts)
 	return out
+}
+
+// CreateTSConfig records a CREATE TEXT SEARCH CONFIGURATION in the runtime
+// pg_ts_config registry so pg_dump's getTSConfigurations / dumpTSConfig
+// re-emit it. `schema` is the (already-resolved) schema name the
+// configuration lives in; an unknown schema resolves to the public
+// namespace OID. Returns the new OID, or 0 with an error if a same-named
+// configuration already exists in the same namespace (PG enforces a unique
+// (cfgname, cfgnamespace)). DU-002 slice 446 (M0119-0004).
+func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userTSConfigs {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+			return 0, fmt.Errorf("text search configuration %q already exists", uc.Name)
+		}
+	}
+	uc.OID = c.allocOIDLocked()
+	uc.NamespaceOID = nsOID
+	c.userTSConfigs = append(c.userTSConfigs, uc)
+	return uc.OID, nil
+}
+
+// DropTSConfig removes the user-created text search configuration with the
+// given bare name in the given schema from the registry. Returns true if one
+// was found and removed. `schema` resolves like CreateTSConfig (unknown →
+// public). DU-002 slice 446.
+func (c *InMemory) DropTSConfig(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			c.userTSConfigs = append(c.userTSConfigs[:i], c.userTSConfigs[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ListUserTSConfigs returns the user-created text search configurations in
+// creation order. DU-002 slice 446.
+func (c *InMemory) ListUserTSConfigs() []*UserTSConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userTSConfigs) == 0 {
+		return nil
+	}
+	out := make([]*UserTSConfig, len(c.userTSConfigs))
+	copy(out, c.userTSConfigs)
+	return out
+}
+
+// AddTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name ADD
+// MAPPING FOR tokenType WITH dictOIDs — appends one pg_ts_config_map entry
+// (mirroring MakeConfigurationMapping's ADD behavior: repeating an
+// already-mapped token type in real PG is a 42710 error, which goopg does
+// not enforce — see this slice's deferral ledger row). Returns false if no
+// configuration with the given (schema-resolved) name exists.
+// DU-002 slice 446 (M0119-0004).
+func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: dictOIDs})
+			return true
+		}
+	}
+	return false
 }
 
 // CollationAttrsByName resolves a collation's dump-relevant attributes

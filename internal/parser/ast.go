@@ -2194,6 +2194,14 @@ type CompatNoopStmt struct {
 	// no-ops). DU-002 slice 437.
 	TSDictTemplate ObjectName
 	TSDictOptions  []TSDictOption
+	// TSConfigParser carries a CREATE TEXT SEARCH CONFIGURATION statement's
+	// `( PARSER = parsername )` clause. goopg resolves only the one real
+	// built-in parser (catalog.BuiltinTSParserOID — "default"); CREATE TEXT
+	// SEARCH PARSER is unimplemented (a C-function-loading feature with no
+	// analog here), so no user-defined parser can ever be named. Zero value
+	// when the statement is not a CREATE TEXT SEARCH CONFIGURATION. DU-002
+	// slice 446 (M0119-0004).
+	TSConfigParser ObjectName
 	// TransformType / TransformLang carry a CREATE TRANSFORM statement's
 	// `FOR <type>` and `LANGUAGE <lang>` clauses. TransformFromFunc /
 	// TransformFromArgs and TransformToFunc / TransformToArgs carry the `FROM
@@ -2368,6 +2376,28 @@ type TSDictOption struct {
 	Value     string
 	IsNumeric bool
 }
+
+// AlterTSConfigAddMappingStmt is `ALTER TEXT SEARCH CONFIGURATION name ADD
+// MAPPING FOR tokentype [, ...] WITH dictionary [, ...]` (tsearchcmds.c's
+// ALTER_TSCONFIG_ADD_MAPPING). Each named token type gets its own ordered
+// dictionary list; re-adding a token type already mapped is a 42710 error in
+// real PG (goopg does not enforce this — see this slice's deferral ledger
+// row). Every other ALTER TEXT SEARCH CONFIGURATION form (ALTER MAPPING
+// REPLACE, DROP MAPPING, RENAME TO, OWNER TO, SET SCHEMA) stays an
+// unimplemented parsed-and-discarded compat no-op — OWNER TO in particular
+// needs no dedicated parse path since pg_dump always derives it from the
+// config's cfgowner catalog column (set at CREATE time), never from a
+// separate ALTER OWNER TO statement having been replayed. DU-002 slice 446
+// (M0119-0004).
+type AlterTSConfigAddMappingStmt struct {
+	pos          int
+	ConfigName   ObjectName
+	TokenTypes   []string
+	Dictionaries []ObjectName
+}
+
+func (s *AlterTSConfigAddMappingStmt) Pos() int  { return s.pos }
+func (s *AlterTSConfigAddMappingStmt) stmtNode() {}
 
 // ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON
 // PARAMETER … statement (pg_parameter_acl, GUC-level ACLs) so the executor
