@@ -171,6 +171,22 @@ func (o *instrumentedOp) RowsAffected() int64 {
 	return 0
 }
 
+// instrumentScopeCarrier is implemented by operators whose child-plan
+// Build() calls happen lazily, inside their own Open(), rather than
+// during the original Build() dispatch that constructed them (e.g.
+// cteDMLPrefixOp — see operators_cte_dml.go). By the time such an
+// Open() runs, withInstrumentation's deferred restore has already put
+// the package-global instrumentScope back to its outer value (often
+// nil, once the top-level EXPLAIN ANALYZE Build() call has returned),
+// so a nested Build() call from inside Open() would see no active
+// scope and skip wrapping entirely — the nested nodes would report
+// plan-only estimates with no actual rows/time. maybeInstrument hands
+// such operators the instrumenter active on their OWN Build() call so
+// they can reinstate it (save/restore) around their nested Build()s.
+type instrumentScopeCarrier interface {
+	setInstrumentScope(*instrumenter)
+}
+
 // heapFetchCounter is implemented by operators that fetch heap tuples
 // behind an index-only scan and want EXPLAIN ANALYZE to report a "Heap
 // Fetches" count (design 0118-0102). maybeInstrument hands the operator
@@ -233,6 +249,9 @@ func maybeInstrument(plan planner.Node, op Operator) Operator {
 	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)
 	if hf, ok := op.(heapFetchCounter); ok {
 		hf.setHeapFetchCounter(&stats.heapFetches)
+	}
+	if sc, ok := op.(instrumentScopeCarrier); ok {
+		sc.setInstrumentScope(instrumentScope)
 	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
 }

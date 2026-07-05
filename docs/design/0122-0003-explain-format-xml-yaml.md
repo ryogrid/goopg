@@ -110,7 +110,7 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
 | BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
 | `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits/evictions/extends/extend_bytes/extend_time instrumented for (client backend, relation, normal), fsyncs/fsync_time instrumented for (client backend, wal, normal); reuses/writebacks still open; see "pg_stat_io row shape" + "`fsyncs` / `fsync_time` counters" sections below |
-| per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
+| per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above), including the `CTEDMLPrefix` nested-node residual (later loop, 2026-07-06) — see "`CTEDMLPrefix` nested-node instrumentation" section below |
 | `track_io_timing` runtime `SET` | **done** (later loop, 2026-07-05) — see "`track_io_timing` runtime SET" section below |
 | real per-wait-event I/O timing | **partial** (later loop, 2026-07-05) — read_time only; see "real per-wait-event I/O timing" section below |
 
@@ -887,10 +887,80 @@ mirrors `TestPgStatIOExtendTimeRendered`).
 
 Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
 ANALYZE (planning-time buffers), local/temp-buffer terms, `pg_stat_io`'s
-`reuses` op counter (needs the `BufferAccessStrategy` ring buffer), the
-`CTEDMLPrefix` nested-node instrumentation residual, and the four
-simplifications named above.
+`reuses` op counter (needs the `BufferAccessStrategy` ring buffer), and the
+four simplifications named above.
 
 **Verification:** `go build ./...` clean; `go test ./internal/storage/...
 ./internal/executor/... ./internal/config/...` PASS (see also the
 initdb/cmd build check run this loop).
+
+## `CTEDMLPrefix` nested-node instrumentation (later loop, 2026-07-06)
+
+The per-CTE ANALYZE stats section above fixed the `CTE DML` summary line
+itself (`Build()`'s `*planner.CTEDMLPrefix` case now runs through
+`maybeInstrument`), but left the nodes it wraps — the INSERT/UPDATE/DELETE/
+MERGE plan(s) and the outer query body — reporting cost-only estimates
+under `EXPLAIN ANALYZE`, even though they demonstrably ran and produced
+rows.
+
+**Root cause.** `cteDMLPrefixOp.Open()` (`internal/executor/
+operators_cte_dml.go`) cannot `Build()` its DML plans and outer body ahead
+of time the way every other operator's children are built — CTE write-then-
+read ordering requires executing each DML CTE to completion, restoring the
+statement-start snapshot, *then* building the outer query so it sees
+pre-CTE state. So those `Build()` calls happen lazily inside `Open()`, long
+after `explainOp.Open()`'s `withInstrumentation(timing, func() { return
+Build(o.plan.Child) })` call has returned. `withInstrumentation`'s `defer`
+resets the package-global `instrumentScope` back to its outer value (nil,
+at the top level) the moment its `fn` returns — which happens as soon as
+the *outermost* `Build()` call constructs `cteDMLPrefixOp` itself, well
+before `inner.Open(ctx)` (and therefore `cteDMLPrefixOp.Open`) ever runs.
+So the nested `Build(dml)` / `Build(o.plan.Body)` calls always saw
+`instrumentScope == nil`, and `maybeInstrument` skipped wrapping — the
+renderer's `nodeStatsTable` simply had no entry for those nodes.
+
+**Fix.** Rather than widening `withInstrumentation`'s scope (which would
+require holding it open across the entire DML-execution dance, coupling an
+EXPLAIN-only concern into core CTE execution ordering), `cteDMLPrefixOp`
+now carries forward the specific `*instrumenter` that was active on its
+*own* `Build()` call and reinstates it locally around its two lazy
+`Build()` sites:
+
+- New `instrumentScopeCarrier` interface (`internal/executor/
+  instrument.go`), mirroring the existing `heapFetchCounter` hand-off
+  pattern (0118-0102): `maybeInstrument` now also checks
+  `op.(instrumentScopeCarrier)` and, if implemented, calls
+  `setInstrumentScope(instrumentScope)` — handing the operator the
+  instrumenter alive at the moment `maybeInstrument` wrapped it (which is
+  non-nil precisely when under `EXPLAIN ANALYZE`).
+- `cteDMLPrefixOp` implements it (stores the pointer in a new `scope`
+  field) and gained `buildUnderScope(n planner.Node) (Operator, error)`: a
+  thin save/restore wrapper — `prev := instrumentScope; instrumentScope =
+  o.scope; defer func() { instrumentScope = prev }(); return Build(n)`.
+  `Open()`'s DML loop (`Build(dml)`) and outer-body build (`Build(o.plan.
+  Body)`) now call `o.buildUnderScope(...)` instead of the bare package
+  function. When not under EXPLAIN ANALYZE, `o.scope` is nil, so this is a
+  no-op — identical to the pre-fix code path.
+- Because `instrumentScope.table` is a single shared map for the whole
+  EXPLAIN ANALYZE invocation, reinstating the same `*instrumenter` means
+  the nested nodes' stats land in the *same* `nodeStatsTable` the renderer
+  already reads — no new plumbing needed on the render side.
+  `planChildren`'s existing `*planner.CTEDMLPrefix` case (returns
+  `p.DMls` + `p.Body`, `internal/executor/operators_explain.go`) already
+  walks into these nodes; it previously found no stats because none had
+  ever been recorded, not because the walk was wrong.
+
+**Tests:** `internal/executor/with_explain_test.go`'s
+`TestExplainCTEDMLPrefixNestedInsertReportsActualRows` asserts the nested
+`Insert on t` line specifically shows `actual time=`/`rows=2.00` (not just
+the `CTE DML` summary line, which the pre-existing
+`TestExplainCTEDMLPrefixAnalyzeReportsActualRows` already covered — its
+stale "deferred, see ledger" doc comment was removed since the gap it
+described is now closed).
+
+**Verification:** `go build ./...` clean; `go vet ./internal/executor/...`
+clean; `go test -count=1 ./internal/executor/... ./internal/storage/...
+./internal/planner/... ./internal/parser/... ./internal/server/...
+./internal/config/...` all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33). Ledger: `.ralph/deferral_ledger.md` (2026-07-06 row, closes rows
+467/468).

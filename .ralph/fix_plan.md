@@ -36,15 +36,15 @@ BUFFERS TEXT+JSON/XML/YAML rendering, `pg_stat_io` row shape + real
 reads/read_bytes/read_time/writes/write_bytes/write_time/extend_time/
 hits/evictions/extends/extend_bytes/fsyncs/fsync_time/writeback/
 writeback_time, `track_io_timing` runtime SET, and EXPLAIN's `I/O Timings`
-line have all landed; see the M0122-0003 line item for detail. Remaining
-sub-items: `EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers),
+line, and the `CTEDMLPrefix` nested-node instrumentation residual, have all
+landed; see the M0122-0003 line item for detail. Remaining sub-items:
+`EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers),
 local/temp-buffer terms, the last `pg_stat_io` op counter (`reuses` — needs
 a `BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
-doesn't have), a `CTEDMLPrefix` nested-node instrumentation residual, plus
-the 4 named writeback simplifications-vs-upstream (see deferral ledger
-2026-07-05 row). Pick up one of those next, or continue the M0119-0004
-pg_dump catalog-view parity battery / next unresolved DU-002 slice from
-`.ralph/deferral_ledger.md`.
+doesn't have), plus the 4 named writeback simplifications-vs-upstream (see
+deferral ledger 2026-07-05 row). Pick up one of those next, or continue the
+M0119-0004 pg_dump catalog-view parity battery / next unresolved DU-002
+slice from `.ralph/deferral_ledger.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -415,9 +415,19 @@ mirroring M0119's ledger `status` column.
       columns) needs a genuinely new counting mechanism (a
       `BufferAccessStrategy`-style ring buffer goopg does not implement);
       also `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time
-      buffers), local/temp-buffer terms, and the `CTEDMLPrefix` nested-node
-      instrumentation residual.
-      Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
+      buffers) and local/temp-buffer terms.
+      **`CTEDMLPrefix` nested-node instrumentation done (2026-07-06):**
+      nodes nested under a `CTE DML` line (e.g. `Insert on t`) now report
+      `actual time=`/`rows=` too — `cteDMLPrefixOp` implements a new
+      `instrumentScopeCarrier` interface (`internal/executor/instrument.go`)
+      so `maybeInstrument` hands it the `*instrumenter` active on its own
+      `Build()` call, and `Open()`'s two lazy `Build()` sites now run
+      through a `buildUnderScope` helper that reinstates the package-global
+      `instrumentScope` around them. New test:
+      `TestExplainCTEDMLPrefixNestedInsertReportsActualRows`
+      (`internal/executor/with_explain_test.go`). Ledger row (2026-07-06)
+      closes rows 467/468.
+      Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-06, M0122-0003).
       **`fsyncs`/`fsync_time` done (2026-07-05, this loop):** `wal.Writer`
       gains real `FsyncCount()`/`FsyncTimeNanos()` — count increments once
       per real `fdatasync(2)` call in `state.flushUpTo`, time gated on the

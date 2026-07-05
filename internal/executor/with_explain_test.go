@@ -124,14 +124,7 @@ func TestExplainCTEScanAnalyzeReportsActualRows(t *testing.T) {
 
 // TestExplainCTEDMLPrefixAnalyzeReportsActualRows: the "CTE DML"
 // summary node (wrapping data-modifying CTEs run before the outer
-// query) now reports actual rows/time too. Note: the DML plans
-// themselves and the outer body are Built lazily inside
-// cteDMLPrefixOp.Open() (after execution ordering requires the
-// write-then-snapshot-restore dance), which falls outside the
-// withInstrumentation() scope explainOp.Open() establishes around
-// the top-level Build() call — so nested nodes under "CTE DML"
-// (e.g. "Insert on t") do not yet get their own actual-rows
-// annotation. Deferred; see .ralph/deferral_ledger.md M0122-0003.
+// query) reports actual rows/time.
 func TestExplainCTEDMLPrefixAnalyzeReportsActualRows(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -153,5 +146,36 @@ func TestExplainCTEDMLPrefixAnalyzeReportsActualRows(t *testing.T) {
 	}
 	if !strings.Contains(dmlLine, "actual time=") || !strings.Contains(dmlLine, "rows=2.00") {
 		t.Errorf("CTE DML node missing actual rows/time instrumentation:\n%s", dmlLine)
+	}
+}
+
+// TestExplainCTEDMLPrefixNestedInsertReportsActualRows: the DML plans
+// nested under "CTE DML" (e.g. "Insert on t") are Built lazily inside
+// cteDMLPrefixOp.Open(), after the top-level withInstrumentation()
+// scope established around explainOp's Build() call has already been
+// torn down. Without reinstating that scope around the nested Build()
+// calls, those nodes would report plan-only estimates with no actual
+// rows/time even though the DML genuinely ran and produced rows.
+func TestExplainCTEDMLPrefixNestedInsertReportsActualRows(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := runExplainRows(t, ctx, "EXPLAIN ANALYZE WITH ins AS (INSERT INTO t VALUES (1),(2) RETURNING id) SELECT * FROM ins")
+	joined := strings.Join(lines, "\n")
+	insertLine := ""
+	for _, l := range lines {
+		if strings.Contains(l, "Insert on t") {
+			insertLine = l
+			break
+		}
+	}
+	if insertLine == "" {
+		t.Fatalf("Insert on t label not found:\n%s", joined)
+	}
+	if !strings.Contains(insertLine, "actual time=") || !strings.Contains(insertLine, "rows=2.00") {
+		t.Errorf("nested Insert node missing actual rows/time instrumentation:\n%s", insertLine)
 	}
 }
