@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     if: github.actor == github.repository_owner
 
     steps:
@@ -87,7 +87,7 @@ jobs:
       # Build goopg binary (needed for pgbench steps)
       # ------------------------------------------------------------------ #
       - name: Build goopg
-        run: go build -o bin/goopg ./cmd/goopg
+        run: go build -buildvcs=false -o bin/goopg ./cmd/goopg
 
       # ------------------------------------------------------------------ #
       # Unit and component tests (no live server required)
@@ -107,6 +107,7 @@ jobs:
                    |internal/testutil/cluster|internal/testutil/replcluster
                    |internal/testutil/pgcluster|internal/testutil/pubsubcluster
                    |internal/testutil/tpch|/bench/'
+          go env -w GOFLAGS=-buildvcs=false
           go test -timeout 10m $(go list ./... | grep -vE "$EXCLUDE")
 
       # ------------------------------------------------------------------ #
@@ -165,6 +166,7 @@ jobs:
       # ------------------------------------------------------------------ #
       - name: HammerDB TPC-H load runs (smoke + baseline)
         run: |
+          go env -w GOFLAGS=-buildvcs=false
           go test -v \
             -timeout 30m \
             ./bench/tpch/cmd/hammerdb_load/...
@@ -187,6 +189,7 @@ jobs:
       # ------------------------------------------------------------------ #
       - name: TPC-H query run (~SF 0.5 / 750,000 orders)
         run: |
+          go env -w GOFLAGS=-buildvcs=false
           go test -v \
             -run TestTPCHScaleLoadAndQueryRun \
             -timeout 120m \

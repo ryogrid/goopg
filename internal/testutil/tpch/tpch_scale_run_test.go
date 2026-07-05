@@ -92,11 +92,11 @@ func TestTPCHScaleLoadAndQueryRun(t *testing.T) {
 	}
 	// Size the buffer pool for the SF~0.5 working set. The value is
 	// appended after init (which writes postgresql.conf) and before
-	// start, so the server boots with it. "6GB" is PG's memory-unit
+	// start, so the server boots with it. "5GB" is PG's memory-unit
 	// notation: a plain integer with a case-insensitive GB suffix and no
 	// space — goopg's GUC parser converts it to shared_buffers' native
 	// kB unit (see internal/config guc.go unitFromSuffix).
-	if err := c.AppendPostgresqlConf("shared_buffers = 6GB"); err != nil {
+	if err := c.AppendPostgresqlConf("shared_buffers = 5GB"); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.Start(); err != nil {
