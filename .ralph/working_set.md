@@ -1,63 +1,63 @@
 (idle — nothing in flight)
 
-Loop #7 landed and committed the Local/Temp/Planning-time I/O timing
-terms for `EXPLAIN (BUFFERS)` (M0122-0003), closing the resume point
-named by loop #6's deferral-ledger row, at commit `1ef465b8` (pushed to
-origin/align-data-structure-with-pg).
+Loop #8 landed and committed the DU-002 dump+restore round-trip probe at
+commit `97584262` (pushed to origin/align-data-structure-with-pg).
 
-Fix: `internal/executor/operators_explain.go`'s `planningBufferUsageJSON`
-now takes a `trackIOTiming bool` parameter — both call sites in
-`explainOp.Open` (ANALYZE-JSON branch reusing its existing
-`trackIOTiming` local; the plain BUFFERS-without-ANALYZE branch
-computing its own from `ctx.Activity`/`ctx.ProcNum`) pass it through.
-When true it adds all six `Shared/Local/Temp I/O Read/Write Time` keys
-as `float64(0)` constants to the "Planning" group (mirrors upstream's
-non-text `show_buffer_usage`, which renders all six once track_io_timing
-is on, even at zero). `planToJSONWithStats`'s existing `trackIOTiming`
-block gained `Local I/O Read/Write Time`/`Temp I/O Read/Write Time`
-(constant zero) next to its pre-existing real `Shared I/O Read/Write
-Time` values. TEXT format needed no change (local/temp timing is always
-zero, so upstream's own has_local_timing/has_temp_timing TEXT gates
-would also suppress those clauses). New tests in
-`internal/executor/explain_buffers_test.go`:
-`TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn`,
-`TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff`,
-`TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn`,
-`TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff`.
+Task: M0110-0001 (pg_dump TAP, DU-002 slice-by-slice advancement via the
+self-promoting `TestPort_PgDumpConnectionSetup` guard). E-002's stated close
+condition for 002-010 is "a dump+restore round-trip against a live goopg
+server", but the guard test only ever checked that `pg_dump` itself exits 0
+— it never actually restored the dump anywhere. Added that missing step.
+
+Files: `internal/testport/pgdump_connsetup_test.go` (round-trip probe added
+at the tail of the `res.ExitCode == 0` block, right before its `return`);
+`internal/config/defaults.go` + `internal/config/postgresql.conf.sample`
+(new `xmloption` GUC registration); `.ralph/deferral_ledger.md` (new
+2026-07-06 row), `.ralph/fix_plan.md` (M0110-0001 item updated),
+`docs/design/0110-0001-pg-dump-tap-port.md` (new "DU-002 round-trip probe"
+section) + `docs/design/README.md` (one-line addendum on the existing huge
+row).
+
+Key symbols: `TestPort_PgDumpConnectionSetup` (the round-trip step: `CREATE
+DATABASE dumprestore_du002` then pipe `pg_dump`'s stdout into `psql -v
+ON_ERROR_STOP=1` against it); `catalog.InMemory.CreateDatabase`
+(`internal/catalog/catalog.go:4231` — the root cause below).
+
+Findings:
+1. FIXED: every `pg_dump` archive opens with an unconditional `SET xmloption
+   = content;` preamble; goopg didn't recognize the GUC. Registered it
+   (enum content/document, default content, PGC_USERSET) — no-op beyond
+   accepting SET/SHOW, since goopg's XML codec has no document-mode parsing.
+2. FOUND, NOT FIXED (milestone-scale, do not attempt in one loop): the
+   round-trip immediately then hits `ERROR: collation "builtin_coll" already
+   exists`. Confirmed via a throwaway probe (deleted after use) that
+   `catalog.InMemory` has NO per-database namespace at all — `CreateDatabase`
+   only sets a boolean in `c.databases[name]`; every real object store
+   (`c.tables`, `c.schemas`, `c.userCollations`, etc.) is one flat
+   server-wide map with no DBOid/DBName key. A table created in "postgres"
+   is visible from, and collides with, any other "database" name on the
+   same server. This blocks ANY dump-into-fresh-database round trip, not
+   just this one collation. Full writeup + resume point in the
+   2026-07-06 deferral-ledger row and the design doc's new section.
+
+Next step: pick the next M0119-0004/M0110-000x item — do NOT attempt real
+per-database catalog isolation as a single loop (it's milestone-scale: every
+`catalog.InMemory` object map needs a DBOid key threaded through create/
+lookup/drop/rename, plus auditing whether `storage.RelFileNode.DBOid` /
+`InMemory.dbOid` is ever actually multi-tenant). The round-trip probe stays
+a soft `t.Logf` (not a hard assertion) so it's a ready-made regression
+signal once/if that milestone lands. Otherwise continue advancing DU-002 via
+further catalog-view-parity slices, or pick up the M0122-0003 `reuses`
+pg_stat_io counter / 4 writeback simplifications (both larger/fuzzier, per
+loop #7's note), or another M0119-0004 ledger row.
 
 Gates run: `go build ./...` clean; `go test -count=1
-./internal/executor/... ./internal/storage/... ./internal/planner/...
-./internal/parser/... ./internal/server/... ./internal/config/...
-./internal/activity/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
-(Q12=2/Q13=33); pgbench pre-commit smoke PASS (auto-run by hook); `make
-ralph-state-guard` (repaired stale completed-marker→in_progress, same
-recurring pattern as every recent loop, now consistent).
-
-Docs updated same loop: `.ralph/fix_plan.md` (M0122-0003 banner),
-`.ralph/deferral_ledger.md` (new resolved row closing the prior row's
-resume point),
-`docs/design/0122-0003-explain-format-xml-yaml.md` (new "Local/Temp/
-Planning-time I/O timing terms" section) + `docs/design/README.md`
-index row extended.
-
-Next step: the M0122-0003 BUFFERS/`pg_stat_io` cluster's only remaining
-open items are (1) the `reuses` `pg_stat_io` op counter (needs a
-`BufferAccessStrategy`-style ring buffer goopg does not implement —
-feature-sized, not a counter tweak, likely a full milestone-scale item
-rather than a bounded slice), and (2) the 4 named writeback
-simplifications-vs-upstream (2026-07-05 ledger row: single-relation-per-
-hint instead of coalesced ranges, `backend_flush_after` applied
-process-wide not per-session, bgwriter/checkpointer writeback timing
-gated on boot-time track_io_timing via plain time.Since rather than the
-activity-registry wait-event clock, and bgwriter/checkpointer
-writes/write_bytes/write_time still zero). Both remaining items are
-larger/fuzzier than the last several bounded slices. Recommend pivoting
-away from M0122-0003 to the M0119-0004 pg_dump catalog-view parity
-battery / next unresolved DU-002 slice from `.ralph/deferral_ledger.md`
-(M0110-0001's self-promoting `TestPort_PgDumpConnectionSetup` guard),
-per the Current Priority banner's stated work order, unless a future
-loop decides `reuses` or the writeback simplifications are worth
-tackling as their own multi-loop milestone.
+./internal/config/... ./internal/parser/... ./internal/catalog/...
+./internal/server/... ./internal/executor/...` all PASS; full
+`scripts/ralph-precommit-test.sh` (unit suite minus cluster-backed packages
++ pgbench smoke) PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`make ralph-state-guard` OK (auto-repaired the usual stale completed-marker
+pattern, same as every recent loop).
 
 Note: an untracked `postgres` directory/submodule shows build-artifact
 content (GNUmakefile, config.log, etc.) — pre-existing, not touched or
