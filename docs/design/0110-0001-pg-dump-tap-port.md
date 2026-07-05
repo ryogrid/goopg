@@ -14590,3 +14590,111 @@ TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
 ./internal/catalog/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33,
 run for due diligence though this slice touches only the pg_dump-facing test
 file — zero production-code changes).
+
+## Slice 437: `CREATE TEXT SEARCH DICTIONARY` round-trip (2026-07-06)
+
+The second of slice 436's two surfaced-but-deferred candidates: user-defined
+`CREATE TEXT SEARCH {DICTIONARY,CONFIGURATION,PARSER,TEMPLATE}` objects.
+Unlike slice 436 (a zero-production-code test-only slice), this one is a
+genuine engine gap: `CREATE TEXT SEARCH DICTIONARY` was a parsed-and-
+discarded `CompatNoopStmt` (parser comment: "parse name for compat
+registry") that never touched the catalog at all, and all four `pg_ts_*`
+virtual views (`pg_ts_parser`/`pg_ts_template`/`pg_ts_dict`/`pg_ts_config`)
+unconditionally returned `nil` — correct for the "no user object exists"
+case (slices 12-15), but meaning a user-created dictionary could never
+round-trip.
+
+**Scope for this slice: DICTIONARY only**, the most common real-world TS
+object kind (used to attach STOPWORDS/synonym lists to a built-in template).
+CONFIGURATION carries an ordered mapping-entry list backed by its own
+catalog (`pg_ts_config_map`) and PARSER/TEMPLATE are C-function-loading
+features with no analog in goopg (TEMPLATE in particular can never be
+user-created here) — each would need its own real-PG-verified probe and is
+non-trivially larger, so they remain untouched compat no-ops this slice.
+
+**Verified against real PG 18.3 first** (`postgres/local_install/bin`,
+scratch `initdb`+`pg_ctl`+`psql`+`pg_dump` run):
+
+```sql
+CREATE TEXT SEARCH DICTIONARY public.simple_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english);
+```
+
+dumps as:
+
+```
+CREATE TEXT SEARCH DICTIONARY public.simple_dict (
+    TEMPLATE = pg_catalog.simple,
+    stopwords = 'english' );
+
+
+ALTER TEXT SEARCH DICTIONARY public.simple_dict OWNER TO postgres;
+```
+
+Two things worth noting from the real output: (1) `STOPWORDS` was given
+unquoted (identifier-shaped) but dumps lower-cased and single-quoted —
+PG's `DefElem`/`serialize_deflist` (`tsearchcmds.c`) folds every non-numeric
+option value to a string regardless of how it was written; (2) the
+generic per-object `ALTER ... OWNER TO` trailer (already exercised for
+FDW/SERVER/PUBLICATION/SUBSCRIPTION in earlier slices) applies here too.
+
+**Implementation** (genuine new code, not a "no bug found" slice like 436):
+
+- `catalog.BuiltinTSTemplateOID` (`internal/catalog/catalog.go`) seeds the
+  four real built-in template OIDs verbatim from upstream's
+  `pg_ts_template.dat`: `simple=3727`, `synonym=3730`, `ispell=3733`,
+  `thesaurus=3742`. `pg_ts_template.VirtualRows` now returns these four rows
+  (namespace = pg_catalog OID 11) instead of unconditionally `nil` — needed
+  because `dumpTSDictionary` (`pg_dump.c`) runs its own live query,
+  `SELECT nspname, tmplname FROM pg_ts_template p, pg_namespace n WHERE
+  p.oid = '<dicttemplate>' AND n.oid = tmplnamespace`, against the target
+  server to resolve a dictionary's TEMPLATE clause by OID — with zero rows
+  this query would fail outright (`ExecuteSqlQueryForSingleRow` expects
+  exactly one row), not just under-dump. `getTSTemplates`' own dump-output
+  query still filters these to zero rows via namespace dumpability (they
+  live in pg_catalog), so slice 13's "always empty is correct" dump-output
+  behavior is unchanged — only the FK-lookup path gained real data.
+- `catalog.UserTSDict` + `InMemory.CreateTSDict`/`DropTSDict`/
+  `ListUserTSDicts` (`internal/catalog/catalog.go`) mirror `UserConversion`
+  (slice 399) exactly: OID-keyed, unique per (name, namespace), backing
+  `pg_ts_dict.VirtualRows` (also previously unconditionally `nil`).
+- `internal/parser/ddl.go`'s `CREATE TEXT SEARCH ...` case now actually
+  scans the `( TEMPLATE = tmpl [, key = value, ...] )` paren list (mirroring
+  the existing `CREATE OPERATOR` option-list scanner in the same file)
+  instead of only capturing the object name and skipping to `;`. New
+  `parser.TSDictOption{Key, Value, IsNumeric}` + `CompatNoopStmt.
+  TSDictTemplate`/`TSDictOptions` fields carry the parsed clause; this
+  scanning only activates for the DICTIONARY kind — CONFIGURATION/PARSER/
+  TEMPLATE keep discarding their entire tail unchanged.
+- `internal/executor/operators_ddl.go`'s new `"text search dictionary"`
+  CREATE case resolves the template name against `BuiltinTSTemplateOID`
+  (`42704` "text search template is required" if unresolvable, mirroring
+  `DefineTSDictionary`'s own check in `tsearchcmds.c`), calls the new
+  `serializeTSDictOptions` helper — a direct port of PG's
+  `serialize_deflist` (numeric literals bare, everything else single-quoted
+  with `'`-doubling, keys `quote_identifier`'d via the existing
+  `pgQuoteIdent`) — to build `dictinitoption`, and registers the result via
+  `CreateTSDict`. The existing generic DROP-registry fallthrough (shared by
+  every `CompatNoopStmt`-backed object type) gained a parallel `DropTSDict`
+  call alongside its existing `DropConversion` call.
+
+**Deliberately left out this slice** (deferral-ledger row, same date):
+restart/WAL persistence (a dictionary vanishes on server restart — unlike
+CREATE CONVERSION/CAST/TRANSFORM, which each replay via an
+`internal/initdb/*_ddl_recovery.go` driver), `verify_dictoptions`
+template-specific option-name validation (any option name is accepted
+verbatim), and `ALTER TEXT SEARCH DICTIONARY` (rename/owner/set-schema/
+option changes — only CREATE+DROP exist).
+
+New assertions added to the existing enum-round-trip block (same guard
+test, same fixture connection) rather than a new subtest, matching the
+established slice pattern: an exact-block match for the full `CREATE TEXT
+SEARCH DICTIONARY public.simple_dict (...)` statement (catching a wrong
+template resolution, a dropped/mis-cased option name, or wrong quoting) and
+a separate check for the `ALTER TEXT SEARCH DICTIONARY ... OWNER TO
+postgres;` trailer.
+
+Gates: `go build ./...` clean; `go test -count=1 -run
+TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
+-count=1 ./internal/executor/... ./internal/parser/... ./internal/catalog/...`
+PASS; `scripts/tpch-spotcheck.sh` (background-verified, see working_set/loop
+status for the result recorded at commit time).

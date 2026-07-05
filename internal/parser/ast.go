@@ -2181,6 +2181,19 @@ type CompatNoopStmt struct {
 	ConvToEncoding  string
 	ConvFuncName    ObjectName
 	ConvDefault     bool
+	// TSDictTemplate / TSDictOptions carry a CREATE TEXT SEARCH DICTIONARY
+	// statement's `( TEMPLATE = tmplname [, key = value, ...] )` clause.
+	// TSDictTemplate is the (possibly schema-qualified) template name; every
+	// other `key = value` pair lands in TSDictOptions, in the order written.
+	// The executor resolves the template to one of the four real built-in
+	// pg_ts_template rows (goopg implements no user-defined TS templates) and
+	// records the dictionary in the catalog registry so pg_dump's
+	// getTSDictionaries / dumpTSDictionary re-emit the statement. Both zero
+	// value when the statement is not a CREATE TEXT SEARCH DICTIONARY (or is
+	// CONFIGURATION/PARSER/TEMPLATE, which stay parsed-and-discarded compat
+	// no-ops). DU-002 slice 437.
+	TSDictTemplate ObjectName
+	TSDictOptions  []TSDictOption
 	// TransformType / TransformLang carry a CREATE TRANSFORM statement's
 	// `FOR <type>` and `LANGUAGE <lang>` clauses. TransformFromFunc /
 	// TransformFromArgs and TransformToFunc / TransformToArgs carry the `FROM
@@ -2341,6 +2354,19 @@ type RoleMembershipChange struct {
 	// that ADMIN OPTION) errors unless CASCADE is given. Meaningless for
 	// GRANT (never set).
 	Cascade bool
+}
+
+// TSDictOption is a single `key = value` pair from a CREATE TEXT SEARCH
+// DICTIONARY statement's option list, excluding the TEMPLATE clause (captured
+// separately on CompatNoopStmt.TSDictTemplate). Value is the literal text as
+// written (unquoted for a string/identifier value, digits-only for a numeric
+// one); IsNumeric distinguishes the two so the executor's serialization
+// (mirroring PG's serialize_deflist) knows whether to re-quote it. DU-002
+// slice 437.
+type TSDictOption struct {
+	Key       string
+	Value     string
+	IsNumeric bool
 }
 
 // ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON

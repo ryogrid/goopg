@@ -2180,6 +2180,12 @@ type InMemory struct {
 	// round-trip them. DU-002 slice 399 (M0119-0004).
 	userConversions []*UserConversion
 
+	// userTSDicts holds text search dictionaries created via CREATE TEXT SEARCH
+	// DICTIONARY, in creation order (deterministic pg_dump output). Surfaced as
+	// rows in the virtual pg_ts_dict view so pg_dump's getTSDictionaries /
+	// dumpTSDictionary round-trip them. DU-002 slice 437 (M0119-0004).
+	userTSDicts []*UserTSDict
+
 	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
@@ -2918,6 +2924,38 @@ type UserConversion struct {
 	// deferral).
 	FuncOID uint32
 	Default bool // condefault (CREATE DEFAULT CONVERSION)
+}
+
+// BuiltinTSTemplateOID maps the fixed real-PG OIDs (pg_ts_template.dat) of the
+// four built-in text search templates, keyed by lower-case template name. Only
+// these are resolvable by CREATE TEXT SEARCH DICTIONARY ... TEMPLATE = ...;
+// goopg implements no CREATE TEXT SEARCH TEMPLATE (a C-function-loading
+// feature with no analog here). DU-002 slice 437 (M0119-0004).
+var BuiltinTSTemplateOID = map[string]uint32{
+	"simple":    3727,
+	"synonym":   3730,
+	"ispell":    3733,
+	"thesaurus": 3742,
+}
+
+// UserTSDict records a CREATE TEXT SEARCH DICTIONARY so pg_dump's
+// getTSDictionaries / dumpTSDictionary re-emit it. goopg performs no actual
+// text-search lexing — only the schema-dump round-trip is modeled, mirroring
+// UserConversion. Stored in InMemory.userTSDicts and surfaced as rows in the
+// virtual pg_ts_dict view. Mirrors PG pg_ts_dict.h. DU-002 slice 437
+// (M0119-0004).
+type UserTSDict struct {
+	OID          uint32 // pg_ts_dict.oid (allocated from the catalog OID counter)
+	Name         string // dictname (bare, no schema)
+	NamespaceOID uint32 // dictnamespace (resolved from the schema)
+	Owner        uint32 // dictowner (role OID; 10 = postgres superuser)
+	Template     uint32 // dicttemplate (FK into the built-in pg_ts_template rows)
+	// InitOption is the already-serialized dictinitoption text (PG's
+	// serialize_deflist form: `"key1" = 'val1', "key2" = 42`, quote_identifier'd
+	// keys, numeric literals bare, everything else single-quoted) — computed once
+	// at CREATE time so dumpTSDictionary can re-emit it verbatim. "" (no options)
+	// means the pg_ts_dict.dictinitoption column is NULL.
+	InitOption string
 }
 
 // Fixed OIDs for the three core system catalog heap tables.
@@ -8379,11 +8417,24 @@ func (c *InMemory) registerSystemTables() {
 	// getTSTemplates runs `SELECT tableoid, oid, tmplname, tmplnamespace,
 	// tmplinit::oid, tmpllexize::oid FROM pg_ts_template` — it reads ALL TS
 	// templates and filters out system-defined ones at dump-out time by
-	// namespace dumpability. goopg defines no user TS templates, and the
-	// built-ins live in pg_catalog (never dumped), so this view is correctly
-	// empty (0 rows). The ::oid casts in the query are no-ops since the tmpl*
-	// columns are regproc (oid-compatible). Schema matches PG's pg_ts_template
-	// (pg_ts_template.h). M0110-0001 (DU-002 slice 13).
+	// namespace dumpability. goopg defines no user TS templates (CREATE TEXT
+	// SEARCH TEMPLATE stays a parsed-and-discarded compat no-op — a
+	// C-function-loading feature with no analog here), so getTSTemplates'
+	// own dump output is correctly empty either way. As of DU-002 slice 437
+	// this view is no longer unconditionally empty, though: it now surfaces
+	// the four real built-in templates (BuiltinTSTemplateOID) in the
+	// pg_catalog namespace, because dumpTSDictionary's own query
+	// (`SELECT nspname, tmplname FROM pg_ts_template p, pg_namespace n WHERE
+	// p.oid = '<dicttemplate>' ...`) needs a live row to resolve a
+	// user-created dictionary's TEMPLATE = ... clause by OID — namespace
+	// dumpability still filters all four out of getTSTemplates' own dump
+	// list, matching the previous "always empty" behavior for that query.
+	// The ::oid casts in the query are no-ops since the tmpl* columns are
+	// regproc (oid-compatible); goopg has no init/lexize routines behind
+	// these built-ins, so both surface as OID 0 (InvalidOid) — never read by
+	// dumpTSDictionary, only tmplname/tmplnamespace are. Schema matches PG's
+	// pg_ts_template (pg_ts_template.h). M0110-0001 (DU-002 slice 13, slice
+	// 437 follow-up).
 	pgTSTemplate := &Table{
 		Schema: "pg_catalog", Name: "pg_ts_template", Virtual: true,
 		Columns: []Column{
@@ -8395,18 +8446,38 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3764,
 	}
-	pgTSTemplate.VirtualRows = func() [][]string { return nil }
+	pgTSTemplate.VirtualRows = func() [][]string {
+		names := make([]string, 0, len(BuiltinTSTemplateOID))
+		for name := range BuiltinTSTemplateOID {
+			names = append(names, name)
+		}
+		sort.Strings(names) // deterministic row order
+		rows := make([][]string, 0, len(names))
+		for _, name := range names {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(BuiltinTSTemplateOID[name]), 10), // oid
+				name, // tmplname
+				"11", // tmplnamespace (pg_catalog OID=11)
+				"0",  // tmplinit (no real init routine)
+				"0",  // tmpllexize (no real lexize routine)
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
 
 	// pg_ts_dict — text-search dictionary catalog (OID 3600). pg_dump's
 	// getTSDictionaries runs `SELECT tableoid, oid, dictname, dictnamespace,
 	// dictowner, dicttemplate, dictinitoption FROM pg_ts_dict` — it reads ALL
 	// TS dictionaries and filters out system-defined ones at dump-out time by
-	// namespace dumpability. goopg defines no user TS dictionaries, and the
-	// built-ins live in pg_catalog (never dumped), so this view is correctly
-	// empty (0 rows). dicttemplate is an oid FK to pg_ts_template (not a
-	// regproc); dictinitoption is text. Schema matches PG's pg_ts_dict
-	// (pg_ts_dict.h). M0110-0001 (DU-002 slice 14).
+	// namespace dumpability. goopg defines no built-in TS dictionaries so this
+	// view was previously always empty (0 rows); as of DU-002 slice 437 it
+	// surfaces user-created dictionaries (CREATE TEXT SEARCH DICTIONARY),
+	// stored in InMemory.userTSDicts, so pg_dump's getTSDictionaries /
+	// dumpTSDictionary round-trip them. dicttemplate is an oid FK to
+	// pg_ts_template (not a regproc); dictinitoption is text (NULL when no
+	// options were given). Schema matches PG's pg_ts_dict (pg_ts_dict.h).
+	// M0110-0001 (DU-002 slice 14, slice 437 follow-up).
 	pgTSDict := &Table{
 		Schema: "pg_catalog", Name: "pg_ts_dict", Virtual: true,
 		Columns: []Column{
@@ -8419,7 +8490,28 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3600,
 	}
-	pgTSDict.VirtualRows = func() [][]string { return nil }
+	pgTSDict.VirtualRows = func() [][]string {
+		dicts := c.ListUserTSDicts()
+		if len(dicts) == 0 {
+			return nil
+		}
+		rows := make([][]string, 0, len(dicts))
+		for _, ud := range dicts {
+			initOpt := VirtualNull
+			if ud.InitOption != "" {
+				initOpt = ud.InitOption
+			}
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(ud.OID), 10), // oid
+				ud.Name,                                // dictname
+				strconv.FormatUint(uint64(ud.NamespaceOID), 10), // dictnamespace
+				strconv.FormatUint(uint64(ud.Owner), 10),        // dictowner
+				strconv.FormatUint(uint64(ud.Template), 10),     // dicttemplate
+				initOpt, // dictinitoption
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
 
 	// pg_ts_config — text-search configuration catalog (OID 3602). pg_dump's
@@ -10921,6 +11013,64 @@ func (c *InMemory) ListUserConversions() []*UserConversion {
 	}
 	out := make([]*UserConversion, len(c.userConversions))
 	copy(out, c.userConversions)
+	return out
+}
+
+// CreateTSDict records a CREATE TEXT SEARCH DICTIONARY in the runtime
+// pg_ts_dict registry so pg_dump's getTSDictionaries / dumpTSDictionary
+// re-emit it. `schema` is the (already-resolved) schema name the dictionary
+// lives in; an unknown schema resolves to the public namespace OID. Returns
+// the new OID, or 0 with an error if a same-named dictionary already exists in
+// the same namespace (PG enforces a unique (dictname, dictnamespace)). DU-002
+// slice 437 (M0119-0004).
+func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userTSDicts {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, ud.Name) {
+			return 0, fmt.Errorf("text search dictionary %q already exists", ud.Name)
+		}
+	}
+	ud.OID = c.allocOIDLocked()
+	ud.NamespaceOID = nsOID
+	c.userTSDicts = append(c.userTSDicts, ud)
+	return ud.OID, nil
+}
+
+// DropTSDict removes the user-created text search dictionary with the given
+// bare name in the given schema from the registry. Returns true if one was
+// found and removed. `schema` resolves like CreateTSDict (unknown → public).
+// DU-002 slice 437.
+func (c *InMemory) DropTSDict(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			c.userTSDicts = append(c.userTSDicts[:i], c.userTSDicts[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ListUserTSDicts returns the user-created text search dictionaries in
+// creation order. DU-002 slice 437.
+func (c *InMemory) ListUserTSDicts() []*UserTSDict {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userTSDicts) == 0 {
+		return nil
+	}
+	out := make([]*UserTSDict, len(c.userTSDicts))
+	copy(out, c.userTSDicts)
 	return out
 }
 

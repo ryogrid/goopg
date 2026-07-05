@@ -14515,6 +14515,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						}
 					}
 				}
+				if objType == "text search dictionary" {
+					// Drop the dump-visible pg_ts_dict registry entry too so a
+					// dropped dictionary stops round-tripping through pg_dump
+					// (DU-002 slice 437). No WAL emission yet — CREATE TEXT
+					// SEARCH DICTIONARY itself is not restart-durable this
+					// slice either (see catalog.CreateTSDict's doc comment /
+					// the deferral ledger row for this slice).
+					im.DropTSDict(s.Names[0].Name, s.Names[0].Schema)
+				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
 				}
@@ -14642,6 +14651,40 @@ func validateCreateConversionEncodings(forName, toName string) (forEnc, toEnc in
 		return 0, 0, &ExecError{Code: "42P17", Message: `encoding conversion to or from "SQL_ASCII" is not supported`}
 	}
 	return forEnc, toEnc, nil
+}
+
+// serializeTSDictOptions reconstructs a CREATE TEXT SEARCH DICTIONARY's
+// dictinitoption text exactly as PostgreSQL's serialize_deflist
+// (tsearchcmds.c) does: each option is rendered `"key" = <val>` (the key
+// quote_identifier'd), entries joined by ", ", and the value either emitted
+// bare (an integer/numeric literal — TSDictOption.IsNumeric) or single-quoted
+// with embedded quotes doubled (every other value, matching PG's
+// SQL_STR_DOUBLE escaping — DefElem values are never backslash-escaped here
+// since the parser only ever captures a plain literal/identifier token, so
+// the E'' fallback in serialize_deflist for a literal backslash is not
+// reachable). Returns "" (NULL dictinitoption) when there are no options,
+// mirroring PG's nulls[Anum_pg_ts_dict_dictinitoption-1] = true branch.
+// DU-002 slice 437.
+func serializeTSDictOptions(opts []parser.TSDictOption) string {
+	if len(opts) == 0 {
+		return ""
+	}
+	var buf strings.Builder
+	for i, opt := range opts {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(pgQuoteIdent(opt.Key))
+		buf.WriteString(" = ")
+		if opt.IsNumeric {
+			buf.WriteString(opt.Value)
+			continue
+		}
+		buf.WriteByte('\'')
+		buf.WriteString(strings.ReplaceAll(opt.Value, "'", "''"))
+		buf.WriteByte('\'')
+	}
+	return buf.String()
 }
 
 // resolveConversionFunc mirrors the FROM-function checks PostgreSQL performs in
@@ -15529,6 +15572,42 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				return fmt.Errorf("wal create-conversion: %w", werr)
 			}
 		}
+	case "text search dictionary":
+		// Register the dictionary (CREATE TEXT SEARCH DICTIONARY name (TEMPLATE =
+		// tmpl [, opt = val, ...])) so it round-trips through pg_dump (pg_ts_dict
+		// view → getTSDictionaries / dumpTSDictionary). DU-002 slice 437.
+		//
+		// TEMPLATE is required, mirroring DefineTSDictionary's own
+		// ERRCODE_INVALID_OBJECT_DEFINITION check (tsearchcmds.c) — goopg only
+		// resolves the four real built-in templates (BuiltinTSTemplateOID);
+		// CREATE TEXT SEARCH TEMPLATE stays unimplemented (a C-function-loading
+		// feature with no analog here), so no user-defined template can ever be
+		// named. verify_dictoptions' template-specific option validation (e.g.
+		// simple's STOPWORDS/ACCEPT) is not performed — any option name is
+		// accepted verbatim, see this slice's deferral ledger row.
+		tmplName := strings.ToLower(s.TSDictTemplate.Name)
+		templOID, ok := catalog.BuiltinTSTemplateOID[tmplName]
+		if !ok || tmplName == "" {
+			return &ExecError{Code: "42704", Message: "text search template is required"}
+		}
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		ud := &catalog.UserTSDict{
+			Name:       s.ObjName.Name,
+			Owner:      uint32(10), // bootstrap superuser (postgres)
+			Template:   templOID,
+			InitOption: serializeTSDictOptions(s.TSDictOptions),
+		}
+		if _, err := im.CreateTSDict(ud, schema); err != nil {
+			return &ExecError{Code: "42710", Message: err.Error()}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): unlike CREATE
+		// CONVERSION/CAST/TRANSFORM, this slice records no WAL event — a
+		// dictionary created this session does not survive a restart. See
+		// the deferral ledger row for this slice.
 	case "transform":
 		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang
 		// (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] | ...)) so it

@@ -363,6 +363,54 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if tsType != "" {
 			tsName, _ = p.parseObjectName()
 		}
+		// CREATE TEXT SEARCH DICTIONARY name ( TEMPLATE = tmpl [, key = value, ...] )
+		// is the only TS object kind whose option list is actually parsed (not
+		// just skipped) — it round-trips through pg_dump (pg_ts_dict →
+		// dumpTSDictionary); CONFIGURATION/PARSER/TEMPLATE stay parsed-and-
+		// discarded compat no-ops. DU-002 slice 437.
+		var tmplName ObjectName
+		var dictOptions []TSDictOption
+		if tsType == "text search dictionary" && p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			for {
+				c := p.cur()
+				if c.Kind == TokenEOF || (c.Kind == TokenSymbol && c.Value == ")") {
+					break
+				}
+				if c.Kind == TokenSymbol && c.Value == "," {
+					p.advance()
+					continue
+				}
+				if c.Kind != TokenIdent && c.Kind != TokenKeyword {
+					p.advance()
+					continue
+				}
+				key := strings.ToLower(c.Value)
+				p.advance()
+				if !((p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=") {
+					continue
+				}
+				p.advance() // consume '='
+				if key == "template" {
+					if fn, ferr := p.parseObjectName(); ferr == nil {
+						tmplName = fn
+					}
+					continue
+				}
+				v := p.cur()
+				switch v.Kind {
+				case TokenIntLit, TokenNumericLit:
+					dictOptions = append(dictOptions, TSDictOption{Key: key, Value: v.Value, IsNumeric: true})
+					p.advance()
+				case TokenStringLit, TokenIdent, TokenKeyword:
+					dictOptions = append(dictOptions, TSDictOption{Key: key, Value: v.Value})
+					p.advance()
+				}
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance()
+			}
+		}
 		stmt, err := p.parseSkipToSemicolon(t.Pos)
 		if err != nil {
 			return nil, err
@@ -371,6 +419,10 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.Tag = "CREATE " + strings.ToUpper(tsType)
 			ns.ObjType = tsType
 			ns.ObjName = tsName
+			if tsType == "text search dictionary" {
+				ns.TSDictTemplate = tmplName
+				ns.TSDictOptions = dictOptions
+			}
 		}
 		return stmt, nil
 	// CREATE SERVER name ... FOREIGN DATA WRAPPER fdwname [OPTIONS (...)] — register as compat object. M0097-0071.

@@ -4281,6 +4281,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter type mood rename value meh to blah: %v", err)
 	}
 
+	// Slice 437: a CREATE TEXT SEARCH DICTIONARY must round-trip through
+	// pg_dump. Unlike CONFIGURATION/PARSER/TEMPLATE (still parsed-and-discarded
+	// compat no-ops — TEMPLATE in particular has no user-definable analog in
+	// goopg), DICTIONARY is registered in the catalog (InMemory.userTSDicts)
+	// because dumpTSDictionary's own catalog query needs a live pg_ts_dict row
+	// to find, plus a resolvable pg_ts_template row (the four built-ins,
+	// catalog.BuiltinTSTemplateOID) to name the template. STOPWORDS is passed
+	// as an unquoted identifier-shaped value; real PG's DefElem parsing folds
+	// it to a string regardless, so dictinitoption serializes it quoted.
+	if err := runSQLSimple(t, c, "CREATE TEXT SEARCH DICTIONARY public.simple_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english)"); err != nil {
+		t.Fatalf("create text search dictionary simple_dict: %v", err)
+	}
+
 	// Slice 243: a stand-alone composite type (`CREATE TYPE x AS (...)`) must
 	// round-trip. Slice 242 made the type visible to pg_dump's getTypes via the
 	// pg_type row (typtype='c'), but left typrelid=0 so dumpCompositeType found no
@@ -10986,6 +10999,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout,
 			"CREATE TYPE public.mood AS ENUM (\n    'sad',\n    'blah',\n    'ok',\n    'happy',\n    'ecstatic'\n);") {
 			t.Errorf("pg_dump mis-ordered the mood enum labels after ADD VALUE/RENAME VALUE (want sad, blah, ok, happy, ecstatic)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 437 (asserted):** CREATE TEXT SEARCH DICTIONARY must round-trip
+		// through pg_dump. Verified byte-for-byte against real PG 18.3's own
+		// pg_dump output for the identical DDL: the TEMPLATE clause resolves the
+		// bare `pg_catalog.simple` name via the built-in pg_ts_template row
+		// (catalog.BuiltinTSTemplateOID), and STOPWORDS (given unquoted) folds to
+		// a quoted `stopwords = 'english'` dictinitoption — PG's DefElem/
+		// serialize_deflist folds any option value to a string, quoted, unless it
+		// parses as a bare numeric literal.
+		if !strings.Contains(res.Stdout,
+			"CREATE TEXT SEARCH DICTIONARY public.simple_dict (\n    TEMPLATE = pg_catalog.simple,\n    stopwords = 'english' );") {
+			t.Errorf("pg_dump dropped/mangled the text search dictionary round-trip\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TEXT SEARCH DICTIONARY public.simple_dict OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the text search dictionary's OWNER TO clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 243 (asserted):** a stand-alone composite type round-trips. PG's
 		// dumpCompositeType walks pg_type.typrelid → pg_class (relkind='c') →
