@@ -2274,6 +2274,21 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
+	case KindInterval:
+		// Mirrors PostgreSQL's interval_cmp_value (timestamp.c): months are
+		// widened to days at a fixed 30-day rate, then combined with the day
+		// field into a single linear day count. v0's interval has no
+		// sub-day/time component (always 0), so the microsecond widening
+		// upstream does on top of this is a no-op here. M0122-0004.
+		at := int64(a.IntervalMonthsValue())*30 + int64(a.IntervalDaysValue())
+		bt := int64(b.IntervalMonthsValue())*30 + int64(b.IntervalDaysValue())
+		switch {
+		case at < bt:
+			return -1, nil
+		case at > bt:
+			return 1, nil
+		}
+		return 0, nil
 	}
 	return 0, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("comparison not supported for kind %d", a.Kind)}
 }

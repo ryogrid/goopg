@@ -947,6 +947,32 @@ mirroring M0119's ledger `status` column.
       ./internal/parser/... ./internal/analyzer/... ./internal/planner/...
       ./internal/executor/... ./internal/storage/...` PASS (no
       regressions).
+      **Interval ordering comparisons landed (2026-07-06, this loop):**
+      `compareDatum` (`internal/executor/expr.go`) had no `case
+      KindInterval`, so `<`/`>`/`<=`/`>=`/`ORDER BY`/`MIN`/`MAX` over
+      interval values all raised `42883` even though interval *equality*
+      already worked (`datumKey`, used by GROUP BY/DISTINCT hashing,
+      already had a correct `KindInterval` case). Fix mirrors upstream's
+      `interval_cmp_value` (`postgres/src/backend/utils/adt/timestamp.c`):
+      linearize months*30+days into a single day count and compare —
+      upstream's further widening to microseconds via the interval's
+      `time` field is a no-op since v0's interval has no sub-day
+      component. Verified byte-for-byte against real PostgreSQL 18.3
+      (including the `3 months == 90 days` tie case and negative months).
+      Tests: `internal/executor/interval_compare_test.go`
+      (`TestIntervalOrderingOperators`, `TestIntervalOrderByAndMinMax`).
+      Design: `docs/design/0003-0006-date-interval-arithmetic.md` new
+      Follow-up section; `docs/design/README.md` row extended. Deferred
+      (ledger row, 2026-07-06): sub-day interval units, `CAST(... AS
+      interval)` string parsing, and `Datum.Format()`'s `KindInterval`
+      text rendering (`"%d months %d days"`, doesn't match PG's
+      `intervalout` — real PG prints `"3 mons"`) remain open. Gates: `go
+      build ./...` clean; `go test -count=1 ./internal/executor/...
+      ./internal/planner/... ./internal/analyzer/... ./internal/parser/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **Still open in this bucket:** RANGE/GROUPS window frame modes
+      (documented v0 scope limit), combining window forms, sub-day
+      intervals, `CAST(... AS interval)`, interval text output formatting.
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.

@@ -186,6 +186,38 @@ SELECT o_orderdate FROM orders
 - `interval '1 month' + interval '1 day'` (interval +
   interval).
 
+## Follow-up: interval ordering comparisons (M0122-0004, 2026-07-06)
+
+`compareDatum` (`internal/executor/expr.go`) had cases for every `Datum.Kind`
+used in `<`/`>`/`<=`/`>=`/`ORDER BY`/`MIN`/`MAX` **except `KindInterval`** —
+any of those over an interval value raised `42883` ("comparison not
+supported for kind ..."), even though interval *equality* already worked
+correctly via `datumKey` (`internal/executor/operators_join_agg.go`, used by
+GROUP BY/DISTINCT hashing). Confirmed as a genuine gap by grepping
+`unimplemented_feat.json` for `interval` and cross-checking against a real
+PostgreSQL 18.3 instance.
+
+Fix mirrors upstream's `interval_cmp_value` (`postgres/src/backend/utils/
+adt/timestamp.c`): months are widened to days at a fixed 30-day rate, added
+to the day field, and the results linearized as a single `int64` day count
+before comparing (`at := months*30 + days`). Upstream widens further to
+microseconds via the interval's `time` field; v0's interval has no sub-day
+component (always 0), so that extra step is a no-op here and the two
+representations agree exactly. Verified against real PostgreSQL 18.3
+byte-for-byte, including the tie case (`interval '3' month = interval '90'
+day` — both linearize to 90) and negative months.
+
+Tests: `internal/executor/interval_compare_test.go`
+(`TestIntervalOrderingOperators` — 6 comparison-operator cases;
+`TestIntervalOrderByAndMinMax` — `ORDER BY`/`MIN`/`MAX` over
+interval-valued expressions).
+
+Deferred (ledger row, unchanged from this doc's original "Out of scope"
+list): sub-day interval units, `CAST(... AS interval)` string parsing, and
+`Datum.Format()`'s `KindInterval` text rendering (`"%d months %d days"`,
+which does not match PostgreSQL's `intervalout` — e.g. real PG prints `"3
+mons"` not `"3 months 0 days"`) all remain open, independent gaps.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
