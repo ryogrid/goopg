@@ -11673,6 +11673,78 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, acFKNotEnforcedDef) {
 			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on an ALTER CONSTRAINT-flipped foreign key; missing %q\n  full stdout=%q", acFKNotEnforcedDef, res.Stdout)
 		}
+
+		// DU-002 round-trip probe: E-002's stated close condition is "a dump+
+		// restore round-trip against a live goopg server", not merely a
+		// non-erroring `pg_dump`. Feed the captured dump SQL straight into
+		// `psql` against a brand-new, empty database in the same cluster —
+		// the same shape real pg_dump TAP tests (002_pg_dump.pl's
+		// restore_test) exercise — and record whether the restore itself
+		// applies cleanly. This is intentionally a soft (t.Logf) probe, not a
+		// hard assertion.
+		//
+		// KNOWN, ARCHITECTURAL blocker (not a bounded per-statement bug like
+		// the ones this file's slices otherwise fix): goopg's
+		// `catalog.InMemory` has no per-database namespace at all —
+		// `CREATE DATABASE` only registers a name in `c.databases` (a plain
+		// existence map for identity/`\l`/duplicate-name checks); every
+		// object map (`c.tables`, `c.schemas`, `c.userCollations`, …) is one
+		// flat, server-wide store with no DBOid/DBName key. A table or
+		// collation created while connected to "postgres" is visible from,
+		// and collides with, any other "database" name on the same server
+		// (confirmed empirically: a table stays visible and a same-named
+		// CREATE TABLE from a second database fails "already exists").
+		// Restoring a dump into a genuinely separate, empty database
+		// therefore cannot pass today — the dump's very first schema-level
+		// object (the `builtin_coll` collation from slice ~300-something)
+		// collides with the original database's copy of itself. This is a
+		// milestone-scale gap (per-database catalog + per-database on-disk
+		// storage/RelFileNode scoping throughout the executor/planner/catalog,
+		// not a slice), tracked in the deferral ledger; the probe stays a
+		// soft t.Logf so it doesn't block this file's otherwise-green guard
+		// and so a future loop that lands real multi-database isolation gets
+		// an immediate, already-wired regression signal.
+		if err := runSQLSimple(t, c, "CREATE DATABASE dumprestore_du002"); err != nil {
+			t.Fatalf("create restore-target database: %v", err)
+		}
+		restoreEnv := amcheckEnv(t, c)
+		for i, e := range restoreEnv {
+			if strings.HasPrefix(e, "PGDATABASE=") {
+				restoreEnv[i] = "PGDATABASE=dumprestore_du002"
+			}
+		}
+		restoreRes, err := util.RunCommand(util.CommandSpec{
+			Name:    clientToolBin(t, "psql"),
+			Args:    []string{"-v", "ON_ERROR_STOP=1", "-q"},
+			Env:     restoreEnv,
+			Stdin:   res.Stdout,
+			Timeout: 30 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("run psql restore: %v", err)
+		}
+		if restoreRes.ExitCode != 0 {
+			t.Logf("DU-002 round-trip restore FAILS (expected — see the multi-database "+
+				"catalog-isolation gap noted above; not a bounded per-statement fix): "+
+				"exit=%d stderr=%q", restoreRes.ExitCode, strings.TrimSpace(restoreRes.Stderr))
+		} else {
+			// The restore applied cleanly end to end. Assert the restored
+			// database actually has the table (a silently-empty restore
+			// would pass ON_ERROR_STOP=1 vacuously if every statement were
+			// skipped rather than applied).
+			checkRes, err := util.RunCommand(util.CommandSpec{
+				Name:    clientToolBin(t, "psql"),
+				Args:    []string{"-tA", "-c", "SELECT count(*) FROM public.foo"},
+				Env:     restoreEnv,
+				Timeout: 30 * time.Second,
+			})
+			if err != nil || checkRes.ExitCode != 0 || strings.TrimSpace(checkRes.Stdout) == "" {
+				t.Errorf("DU-002 round-trip restore reported success but public.foo is not queryable in the restored database: exit=%d stderr=%q stdout=%q",
+					checkRes.ExitCode, checkRes.Stderr, checkRes.Stdout)
+			} else {
+				t.Logf("DU-002 round-trip restore PASSES: dump applied cleanly to a fresh database (public.foo count=%s)", strings.TrimSpace(checkRes.Stdout))
+			}
+		}
 		return
 	}
 

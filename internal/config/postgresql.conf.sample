@@ -258,6 +258,7 @@
 #transaction_timeout = 0                 # 0-2147483647 ms; 0 disables
 #synchronize_seqscans = on              # accepted; goopg has no synchronized scans
 #row_security = on                      # accepted; goopg has no row-level security
+#xmloption = 'content'                  # content | document; accepted, no document-mode parsing
 #client_min_messages = 'notice'         # debug5..debug1 | log | notice |
                                         # warning | error
 #default_transaction_isolation = 'read committed'

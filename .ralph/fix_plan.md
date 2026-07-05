@@ -99,8 +99,19 @@ prev-link fixes.
       connstr) DEFERRED on broad catalog-view parity + round-trip; being advanced
       one catalog gap at a time via the self-promoting
       `TestPort_PgDumpConnectionSetup` guard (CSV row DU-002, slice-by-slice).
-      Design `0110-0001-pg-dump-tap-port.md`. Resume = next gap in pg_dump's
-      getter battery (latest blocker tracked in `.ralph/working_set.md` / ledger).
+      Design `0110-0001-pg-dump-tap-port.md`. **2026-07-06:** the guard now also
+      probes the actual dump+restore round trip (pipe `pg_dump`'s stdout into
+      `psql` against a fresh `CREATE DATABASE`). Found + fixed the `xmloption`
+      GUC gap (every pg_dump archive opens with `SET xmloption = content;`).
+      That probe then surfaced the REAL remaining blocker for 002–010: goopg's
+      `catalog.InMemory` has no per-database namespace at all (`CreateDatabase`
+      only registers a name; every object store — tables/schemas/collations/
+      etc. — is one flat server-wide map), so a dump can never restore into a
+      genuinely separate database. This is milestone-scale (per-database
+      catalog + storage isolation throughout `internal/catalog`), not a slice
+      — see the 2026-07-06 deferral-ledger row for the resume point. Until that
+      lands, further DU-002 slices should keep targeting catalog-view parity
+      (the round-trip probe stays a soft `t.Logf`, not a hard gate).
 - [ ] **M0110-0002 — pg_waldump TAP** — `001_basic` CLI tier ported (WD-001);
       WAL-format readability guarded by W-001 (`TestPort_WALPgWaldumpCompat`).
       **Remaining (WD-002, deferred):** `002_save_fullpage` — needs goopg to emit

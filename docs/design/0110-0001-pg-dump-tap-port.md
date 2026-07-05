@@ -14447,3 +14447,61 @@ PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, after one transient
 failure/hang caused by a concurrently-running peer ralph loop's own
 build+test load — reproduced clean on retry, unrelated to this change:
 [[concurrent_ralph_loops_corrupt_tree]]); `make ralph-state-guard` OK.
+
+## DU-002 round-trip probe: `xmloption` GUC fixed, multi-database isolation gap found (2026-07-06)
+
+`TestPort_PgDumpConnectionSetup` (`internal/testport/pgdump_connsetup_test.go`)
+had grown to 433 dump-side slices with a fully-succeeding `pg_dump` (exit 0
+against the accumulated test schema), but E-002's stated close condition for
+002–010 is "a dump+restore round-trip against a live goopg server", which the
+test never actually exercised. Added a round-trip step at the tail of the
+`res.ExitCode == 0` block: `CREATE DATABASE dumprestore_du002`, then pipe the
+captured `pg_dump` stdout into `psql -v ON_ERROR_STOP=1` against it — the same
+shape real pg_dump TAP tests' restore_test exercises.
+
+**Found and fixed:** every `pg_dump` archive opens with an unconditional `SET
+xmloption = content;` preamble statement (`postgres/src/bin/pg_dump/pg_dump.c`
+`setup_connection`-adjacent dump preamble, not gated on the dump containing
+any XML columns), which goopg rejected with `unrecognized configuration
+parameter "xmloption"`. Fixed by registering `xmloption` in
+`internal/config/defaults.go` (enum `content`/`document`, default `content`,
+`PGC_USERSET`/`ContextUserset`), mirroring `guc_tables.c`'s entry exactly.
+goopg has no document-vs-content XML parsing distinction (its XML codec
+always treats a value as a content fragment), so this is a no-op
+registration — the point is only that `SET`/`SHOW xmloption` must succeed.
+Added the entry to `postgresql.conf.sample` alongside the neighboring
+`row_security`/`synchronize_seqscans` no-op GUCs.
+
+**Found, NOT fixed (milestone-scale):** after the `xmloption` fix, the same
+probe immediately hit `ERROR: collation "builtin_coll" already exists`. A
+throwaway diagnostic test (`TestZZProbeMultiDatabaseIsolation`, deleted after
+confirming the finding) proved the root cause is architectural, not a
+per-statement bug: `catalog.InMemory` has **no per-database namespace**.
+`CreateDatabase` (`internal/catalog/catalog.go:4231`) only sets
+`c.databases[name] = true`, a flat existence map used for identity/`\l`/
+duplicate-name checks; every real object store (`c.tables`, `c.schemas`,
+`c.userCollations`, `c.userConversions`, sequences, types, …) is one flat,
+server-wide map/slice with no DBOid/DBName key anywhere. A table created
+while connected to "postgres" is immediately visible from — and blocks
+re-creation from — any other "database" name on the same goopg server. This
+means a dump can never restore cleanly into a genuinely separate, empty
+database: the dump's first schema-level object collides with the original
+database's own copy of itself. By extension, most of DU-002/E-002's
+remaining scope (a real, isolated dump+restore round-trip) is gated on this,
+not solely on further catalog-view parity as the CSV rationale for E-002
+currently implies.
+
+This is a full milestone (per-database catalog object stores *and* auditing
+whether `storage.RelFileNode.DBOid` — already plumbed through
+`c.dbOid`/`SetDBOID`, but as one mutable server-wide field, not a per-
+connection value — is ever actually multi-tenant), not a boundable slice, so
+it is recorded in the deferral ledger (2026-07-06 row) rather than attempted
+here. The round-trip probe stays a soft `t.Logf`, not a hard assertion, so it
+becomes a ready-made regression/progress signal for whichever future loop
+takes on real multi-database isolation, without blocking this file's
+otherwise-green 433-slice guard today.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/config/...
+./internal/parser/... ./internal/catalog/... ./internal/server/...
+./internal/executor/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33).

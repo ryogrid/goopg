@@ -877,6 +877,21 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// xmloption. Every pg_dump archive opens with `SET xmloption = content;`
+	// (dumpDatabase's standard preamble, unconditional — not gated on the
+	// dump containing any xml columns), so a round-trip restore hits this
+	// before touching any user object. goopg's xml codec always parses/
+	// serializes as content fragments regardless of the setting (no
+	// document-vs-content XML parsing distinction is implemented), so this
+	// is a no-op registration, but SET/SHOW must succeed. Mirrors
+	// guc_tables.c's "xmloption" entry (PGC_USERSET, enum content/document,
+	// default content).
+	r.MustRegister(NewVariable(Variable{
+		Name: "xmloption", Type: TypeEnum, BootVal: "content",
+		EnumOptions: []string{"content", "document"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
 
 	// Logging GUCs. Stubs so `SET log_statement = 'all'` and
 	// related psql / connection-pool wrappers don't trip.
