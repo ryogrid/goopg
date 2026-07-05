@@ -1024,8 +1024,58 @@ ANALYZE-independence), `TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup
 `.ralph/deferral_ledger.md` (2026-07-06 row, closes gap (2) from rows
 471/481/497/498).
 
-Local/temp-buffer terms remain the only sub-item still open in the
-BUFFERS-rendering cluster (goopg has no local-buffer-manager concept —
-every relation goes through the one shared `storage.Pool`); it is a
-materially larger architectural addition than a counter tweak and stays
-deferred.
+Local/temp-buffer terms were the only sub-item still open in the
+BUFFERS-rendering cluster after this fix — see the next section, which
+closes them the same loop-later.
+
+## Local/Temp `* Blocks` terms (later loop, 2026-07-06)
+
+**Problem (ledger row 508's own resume point):** upstream's
+`show_buffer_usage`'s non-`EXPLAIN_FORMAT_TEXT` branch always renders
+`Local Hit/Read/Dirtied/Written Blocks` and `Temp Read/Written Blocks`
+alongside the `Shared *` terms, unconditionally once `BUFFERS` was
+requested — the exact same "print even if all zeroes" rule the prior
+`Shared *`/`Planning` fixes already implement. goopg had never emitted
+these six keys anywhere (neither per-node ANALYZE stats nor the
+planning-time group), even though they are always legitimately zero:
+goopg has no local-buffer-manager or temp-buffer concept at all — every
+relation, including temp tables, is resolved through the one shared
+`storage.Pool` — so, exactly like the planning-time `Shared *` terms
+before them, "always zero" here is architecturally correct, not a
+narrower stub.
+
+**Fix:** both non-TEXT buffer-rendering sites gained the same six
+constant-zero keys:
+- `planningBufferUsageJSON()` (`internal/executor/operators_explain.go`)
+  now returns `Local Hit/Read/Dirtied/Written Blocks` and `Temp
+  Read/Written Blocks` alongside the four pre-existing `Shared *` keys.
+- `planToJSONWithStats`'s per-node `opts.Buffers` block sets the same six
+  keys to `int64(0)` next to the live `s.bufHit`/`s.bufRead`/
+  `s.bufDirtied`/`s.bufWritten` shared counters.
+
+TEXT format again needs no change: `formatBuffersLine` only ever emits
+the `shared` clause today, and since local/temp are always zero,
+upstream's own `has_local`/`has_temp` gates would also suppress those
+clauses — there is no TEXT-visible difference to produce. I/O timing
+terms (`Local/Temp I/O Read/Write Time`) remain out of scope for this
+slice — they are a separate deferred gap (goopg has no per-node local/
+temp *or* planning-time I/O timing collection at all yet, tracked
+alongside the existing `Shared I/O Read/Write Time` per-node-only gap).
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks` (per-node,
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, asserts all six keys present),
+`TestExplainBuffersPlanningGroupIncludesLocalTempBlocks` (bare `EXPLAIN
+(BUFFERS, FORMAT JSON)`, asserts the `"Planning"` group also carries all
+six keys).
+
+**Verification:** `go build ./...` clean; `go test -count=1
+./internal/executor/... ./internal/storage/... ./internal/planner/...
+./internal/parser/... ./internal/server/... ./internal/config/...` all
+PASS; `scripts/tpch-spotcheck.sh` PASS.
+
+This closes the local/temp-buffer-terms sub-item named as the only
+remaining open item in the BUFFERS-rendering cluster. The cluster's last
+open item is now only the `reuses` `pg_stat_io` op counter (needs a
+`BufferAccessStrategy`-style ring buffer goopg does not implement) plus
+the Local/Temp/Planning-time I/O timing terms just named above.

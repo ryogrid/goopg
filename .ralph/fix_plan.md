@@ -40,9 +40,13 @@ line, and the `CTEDMLPrefix` nested-node instrumentation residual, have all
 landed; see the M0122-0003 line item for detail. `EXPLAIN (BUFFERS)`
 without ANALYZE (planning-time "Planning" group, all-zero — goopg's
 planner never touches the buffer pool during cost estimation) also landed
-2026-07-06. Remaining sub-items: local/temp-buffer terms, the last
-`pg_stat_io` op counter (`reuses` — needs a `BufferAccessStrategy`-style
-ring-buffer storage-engine mechanism goopg doesn't have), plus the 4 named
+2026-07-06, as did the local/temp-buffer `* Blocks` terms (also always-zero
+constants, same loop-later) — both the per-node and Planning-time JSON/XML/
+YAML groups now carry `Local Hit/Read/Dirtied/Written Blocks` and `Temp
+Read/Written Blocks`. Remaining sub-items: the last `pg_stat_io` op counter
+(`reuses` — needs a `BufferAccessStrategy`-style ring-buffer storage-engine
+mechanism goopg doesn't have), Local/Temp/Planning-time I/O timing terms
+(no collection code path exists for any of the three), plus the 4 named
 writeback simplifications-vs-upstream (see deferral ledger 2026-07-05
 row). Pick up one of those next, or continue the M0119-0004 pg_dump
 catalog-view parity battery / next unresolved DU-002 slice from

@@ -222,12 +222,25 @@ func formatBuffersLine(s *nodeStats) string {
 // catalog and never calls into storage.Pool, so these counters are always
 // zero — that's a real architectural fact, not a stub: there is currently
 // no planning-phase code path that could produce a nonzero value here.
+//
+// The Local/Temp terms are likewise always zero: goopg has no
+// local-buffer-manager or temp-buffer concept at all (every relation,
+// including temp tables, goes through the one shared storage.Pool), so
+// there is no counter to accumulate into in the first place — a real
+// architectural fact mirroring the Shared comment above, not a narrower
+// stub than the Shared fields.
 func planningBufferUsageJSON() map[string]any {
 	return map[string]any{
 		"Shared Hit Blocks":     int64(0),
 		"Shared Read Blocks":    int64(0),
 		"Shared Dirtied Blocks": int64(0),
 		"Shared Written Blocks": int64(0),
+		"Local Hit Blocks":      int64(0),
+		"Local Read Blocks":     int64(0),
+		"Local Dirtied Blocks":  int64(0),
+		"Local Written Blocks":  int64(0),
+		"Temp Read Blocks":      int64(0),
+		"Temp Written Blocks":   int64(0),
 	}
 }
 
@@ -657,15 +670,24 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		// upstream's non-text show_buffer_usage() prints these properties
 		// unconditionally once BUFFERS is requested, even when zero
 		// (explain.c's peek_buffer_usage: "when format is anything other
-		// than text, we print even if the counters are all zeroes"). Only
-		// the shared hit/read/dirtied/written counters goopg actually
-		// tracks are emitted here; local/temp/I-O-timing remain deferred
-		// (ledger, M0122-0003).
+		// than text, we print even if the counters are all zeroes"). The
+		// shared hit/read/dirtied/written counters goopg actually tracks
+		// are emitted from live nodeStats; Local/Temp Blocks are emitted
+		// as constant zeros (mirrors planningBufferUsageJSON's own
+		// Local/Temp comment — goopg has no local-buffer-manager or
+		// temp-buffer concept, so there is no counter to read). Shared/
+		// Local/Temp I/O timing remain deferred (ledger, M0122-0003).
 		if opts.Buffers {
 			obj["Shared Hit Blocks"] = s.bufHit
 			obj["Shared Read Blocks"] = s.bufRead
 			obj["Shared Dirtied Blocks"] = s.bufDirtied
 			obj["Shared Written Blocks"] = s.bufWritten
+			obj["Local Hit Blocks"] = int64(0)
+			obj["Local Read Blocks"] = int64(0)
+			obj["Local Dirtied Blocks"] = int64(0)
+			obj["Local Written Blocks"] = int64(0)
+			obj["Temp Read Blocks"] = int64(0)
+			obj["Temp Written Blocks"] = int64(0)
 			// "Shared I/O Read/Write Time" (upstream's show_buffer_usage
 			// non-text branch, ExplainPropertyFloat calls gated on the live
 			// track_io_timing GUC — emitted even when the accumulated value

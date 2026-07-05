@@ -136,6 +136,34 @@ func TestExplainBuffersJSONAlwaysIncludesDirtiedWrittenBlocks(t *testing.T) {
 	}
 }
 
+// TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks closes the local/temp
+// gap named by the M0122-0003 deferral-ledger row: goopg has no
+// local-buffer-manager or temp-buffer concept (every relation, including
+// temp tables, goes through the one shared storage.Pool), so these terms are
+// always zero — but upstream's non-text show_buffer_usage() still renders
+// them unconditionally once BUFFERS is requested (peek_buffer_usage: "when
+// format is anything other than text, we print even if the counters are all
+// zeroes"), same as the Shared terms above.
+func TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf12 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM ebuf12")
+	out := strings.Join(lines, "\n")
+	for _, key := range []string{
+		`"Local Hit Blocks"`, `"Local Read Blocks"`, `"Local Dirtied Blocks"`, `"Local Written Blocks"`,
+		`"Temp Read Blocks"`, `"Temp Written Blocks"`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("expected %s key in JSON output:\n%s", key, out)
+		}
+	}
+}
+
 // TestFormatBuffersLineDirtiedWritten pins formatBuffersLine's TEXT rendering
 // of the dirtied=/written= terms directly (explain.c's show_buffer_usage
 // shared-block branch): each term is independently gated on its own counter
@@ -239,6 +267,33 @@ func TestExplainBuffersAnalyzeJSONIncludesPlanningGroup(t *testing.T) {
 	out := strings.Join(lines, "\n")
 	if !strings.Contains(out, `"Planning"`) {
 		t.Fatalf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) missing \"Planning\" group:\n%s", out)
+	}
+}
+
+// TestExplainBuffersPlanningGroupIncludesLocalTempBlocks extends the
+// "Planning" group coverage above: the Local/Temp Blocks terms
+// (planningBufferUsageJSON) are also always-zero-but-present, same rationale
+// as TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks's per-node case.
+func TestExplainBuffersPlanningGroupIncludesLocalTempBlocks(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf13 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (BUFFERS, FORMAT JSON) SELECT data FROM ebuf13")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Planning"`) {
+		t.Fatalf("EXPLAIN (BUFFERS, FORMAT JSON) without ANALYZE missing \"Planning\" group:\n%s", out)
+	}
+	for _, key := range []string{
+		`"Local Hit Blocks"`, `"Local Read Blocks"`, `"Local Dirtied Blocks"`, `"Local Written Blocks"`,
+		`"Temp Read Blocks"`, `"Temp Written Blocks"`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("Planning group missing %s:\n%s", key, out)
+		}
 	}
 }
 
