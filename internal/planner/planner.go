@@ -9263,6 +9263,16 @@ func foldPgCollationFor(arg Expr, cat catalog.Catalog, pos int) (Expr, *PlanErro
 			baseName = strings.ToLower(dom.Base.Name)
 		}
 	}
+	// An array type is exactly as collatable as its element type
+	// (type_is_collatable follows the array's typcollation, which
+	// PostgreSQL derives from the element type at CREATE TYPE time).
+	// Cast-expression array types carry the "[]" suffix directly in the
+	// name (see castTargetLabel); real table-column arrays instead set
+	// Type.IsArray with an unsuffixed element Name, which already falls
+	// through the switch below unchanged.
+	for strings.HasSuffix(baseName, "[]") {
+		baseName = baseName[:len(baseName)-2]
+	}
 	switch baseName {
 	case "text", "varchar", "character varying", "bpchar", "character":
 		// Every collatable base type goopg models seeds pg_type.typcollation

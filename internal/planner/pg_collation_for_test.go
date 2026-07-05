@@ -30,6 +30,9 @@ func TestPgCollationForFolds(t *testing.T) {
 		{name: "explicit COLLATE simple lowercase name is bare", sql: `SELECT pg_collation_for('x' COLLATE "ucs_basic")`, wantValue: "ucs_basic"},
 		{name: "domain over text is collatable like its base", sql: `SELECT pg_collation_for('x'::text_domain)`, wantValue: "default"},
 		{name: "non-collatable type errors 42804", sql: `SELECT pg_collation_for(aid) FROM pgbench_accounts`, wantErr: "42804"},
+		{name: "array of text is collatable like its element", sql: `SELECT pg_collation_for('{a,b}'::text[])`, wantValue: "default"},
+		{name: "array of name follows name's C collation", sql: `SELECT pg_collation_for(ARRAY['a','b']::name[])`, wantValue: "C"},
+		{name: "array of non-collatable element type errors 42804", sql: `SELECT pg_collation_for('{1,2}'::int4[])`, wantErr: "42804"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

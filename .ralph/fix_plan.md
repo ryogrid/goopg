@@ -947,7 +947,7 @@ mirroring M0119's ledger `status` column.
       ./internal/parser/... ./internal/analyzer/... ./internal/planner/...
       ./internal/executor/... ./internal/storage/...` PASS (no
       regressions).
-- [ ] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
+- [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
       **ALTER TYPE RENAME/OWNER landed (2026-07-05, this loop, m0097-0017):**
@@ -1016,7 +1016,28 @@ mirroring M0119's ledger `status` column.
       already works; only the bare `SELECT 'xyz'::"char"` cast-expression
       path doesn't truncate), and an unrelated pre-existing
       `pg_typeof(...)::oid` cast gap affecting every type, not just `"char"`.
-      **Still open in this bucket:** `pg_collation_for`.
+      **`pg_collation_for` array-type support landed (2026-07-06, this
+      loop):** `pg_collation_for('{a,b}'::text[])` no longer raises `42804`
+      — `foldPgCollationFor` (`internal/planner/planner.go`) now strips a
+      trailing `"[]"` suffix from the base type name before the collatable
+      switch (cast-expression array types carry it literally in `Type.Name`;
+      real table-column arrays already worked via the separate `IsArray`
+      representation). Verified against a scratch PostgreSQL 18.3 instance:
+      `text[]` → `"default"`, `name[]` → `"C"`, `int4[]` → `42804`. Tests:
+      `internal/planner/pg_collation_for_test.go`'s `TestPgCollationForFolds`
+      (+3 cases). Design: `docs/design/0122-0005-pg-collation-for-array-types.md`;
+      `docs/design/README.md` new row; ledger row appended. Deferred
+      (unchanged, pre-existing, out of scope for this bounded follow-up): no
+      real per-expression collation-derivation pass (a column's declared
+      `COLLATE` not restated inline still reports `"default"`), and
+      `resolveExprAfterAggregate` has no matching plan-time fold. Gates:
+      `go build ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2, Q13=33). **This bucket (M0122-0005) is now fully closed** —
+      every named item (1-byte `char` OID 18, `pg_collation_for`,
+      function-based cast dumping, ALTER TYPE RENAME/OWNER, domain CHECK
+      renderer, `pg_ts_config` OIDs) has landed or was verified already
+      resolved.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
       restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
