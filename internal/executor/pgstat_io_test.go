@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/goopg/goopg/internal/storage"
+	"github.com/goopg/goopg/internal/wal"
 )
 
 // TestPgStatIORowCount asserts the pg_stat_io view emits upstream's exact
@@ -305,5 +307,48 @@ func TestPgStatIOExtendTimeRendered(t *testing.T) {
 	}
 	if found[13] != "0.750" {
 		t.Errorf("extend_time (col 13) = %q, want %q", found[13], "0.750")
+	}
+}
+
+// TestPgStatIOWalFsyncsRendered pins the M0122-0003 pg_stat_io follow-up:
+// (client backend, wal, normal)'s fsyncs/fsync_time cells must reflect
+// wal.Writer's real fdatasync(2) count/time, not the generic zero every
+// other untouched wal-object cell still renders.
+func TestPgStatIOWalFsyncsRendered(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := wal.NewWriter(wal.Config{WALDir: walDir, SegmentSize: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	_, end, err := w.Append([]byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end); err != nil {
+		t.Fatal(err)
+	}
+	// 0.5ms of accumulated fsync wait — mirrors what OnWALSyncDone would add
+	// via a real track_io_timing-gated WaitEventEnd duration.
+	w.AddFsyncTimeNanos(500_000)
+
+	ctx := &Context{WAL: w}
+	rows := fetchIOStatRows(ctx)
+	var found []string
+	for _, r := range rows {
+		if r[0] == "client backend" && r[1] == "wal" && r[2] == "normal" {
+			found = r
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("no client backend/wal/normal row found")
+	}
+	if found[17] != "1" {
+		t.Errorf("fsyncs (col 17) = %q, want %q", found[17], "1")
+	}
+	if found[18] != "0.500" {
+		t.Errorf("fsync_time (col 18) = %q, want %q", found[18], "0.500")
 	}
 }

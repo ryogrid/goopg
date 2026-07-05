@@ -109,7 +109,7 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | FORMAT YAML | **done, this loop** |
 | SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
 | BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
-| `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits instrumented for the one cell goopg tracks; see "pg_stat_io row shape" + "real per-wait-event I/O timing" sections below |
+| `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits/evictions/extends/extend_bytes/extend_time instrumented for (client backend, relation, normal), fsyncs/fsync_time instrumented for (client backend, wal, normal); reuses/writebacks still open; see "pg_stat_io row shape" + "`fsyncs` / `fsync_time` counters" sections below |
 | per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
 | `track_io_timing` runtime `SET` | **done** (later loop, 2026-07-05) — see "`track_io_timing` runtime SET" section below |
 | real per-wait-event I/O timing | **partial** (later loop, 2026-07-05) — read_time only; see "real per-wait-event I/O timing" section below |
@@ -731,3 +731,63 @@ upstream never produces.
 **Verification:** `go build ./...` clean; `go test ./internal/executor/...`
 PASS (includes the four cases above plus the full pre-existing EXPLAIN
 suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+## `fsyncs` / `fsync_time` counters (later loop, 2026-07-05)
+
+Of the three `pg_stat_io` op counters this doc's `extends`/`evictions`
+section left open (reuses/writebacks/fsyncs), `fsyncs` is the tractable one:
+unlike `reuses` (needs a `BufferAccessStrategy`-style ring buffer goopg does
+not implement) or `writebacks` (needs bgwriter/checkpointer async-writeback
+issuance goopg does not implement), goopg's `wal.Writer` already performs a
+real `fdatasync(2)` per dirty WAL segment in `state.flushUpTo`
+(`internal/wal/writer.go`) — an existing, genuinely-real signal that was
+simply never counted.
+
+`walBufferCounters` (shared between `Writer` and `state`, the same struct
+backing `wal_buffers_*`) gains a `fsyncCount stats.Counter`, incremented
+once per segment actually `dataSync`'d inside `flushUpTo`'s dirty-segment
+loop — unconditional, matching upstream's "count columns are never gated on
+`track_io_timing`" semantics (only the `_time` sibling is). `Writer` gains a
+plain `sharedFsyncTimeNanos atomic.Int64` (not sharded — WAL fsyncs are
+already serialised through group commit, unlike per-buffer pool ops) plus
+`AddFsyncTimeNanos`/`FsyncTimeNanos` accessors mirroring `storage.Pool`'s
+`AddExtendTimeNanos`/`ExtendTimeNanos` exactly, and `FsyncCount()`.
+
+Timing gate: the pre-existing `OnWALSync`/`OnWALSyncDone` hook pair
+(`internal/initdb/open.go`) already brackets `Writer.FlushUpTo` using a
+*fixed* `walProcNum` background slot (for `pg_stat_activity`'s `wait_event`
+display, shared by every committing backend) — that slot's own
+`track_io_timing` flag is never set by any session, so gating
+`AddFsyncTimeNanos` on it would leave `fsync_time` permanently zero.
+Instead, `OnWALSyncDone` now separately calls
+`act.LookupTrackedGoroutine()`: because `FlushUpTo` runs synchronously on
+the *calling backend's own goroutine* (that goroutine's `(registry,
+procNum)` was set once at connection setup — `server.go`'s
+`activity.SetCurrentGoroutine`), this correctly resolves to the committing
+backend's own `track_io_timing` setting — the same gating mechanism
+`storage.Pool`'s `OnPinDone`/`OnFlushDone`/`OnExtendDone` already use, just
+applied via a second, independent registry lookup rather than reusing
+`walProcNum`.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` gains a second
+instrumented cell — `(client backend, wal, normal)` — alongside the
+pre-existing `(client backend, relation, normal)` one; only `ioOpFsync` is
+wired (`Writer.FsyncCount()`/`FsyncTimeNanos()`, rendered via the existing
+`nsToMs` helper), since goopg tracks no other real WAL read/write counters
+yet.
+
+**Tests:** `internal/wal/wal_test.go` — `TestWriterFsyncCountRealSignal`
+(count increments once per real flush, not per no-op re-flush),
+`TestWriterFsyncTimeNanosAccumulates` (accumulator + non-positive-duration
+guard, mirrors `TestPoolWriteTimeNanosAccumulates`).
+`internal/executor/pgstat_io_test.go` — `TestPgStatIOWalFsyncsRendered`
+(end-to-end rendered-cell assertion, mirrors `TestPgStatIOExtendTimeRendered`).
+
+Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
+ANALYZE (planning-time buffers), local/temp-buffer terms, the 2 remaining
+`pg_stat_io` op counters (reuses/writebacks — each needs a genuinely new
+buffering mechanism goopg does not have, see above), and the `CTEDMLPrefix`
+nested-node instrumentation residual.
+
+**Verification:** `go build ./...` clean; `go test ./internal/wal/...
+./internal/executor/... ./internal/initdb/... ./internal/server/...` PASS.

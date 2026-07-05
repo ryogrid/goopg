@@ -1732,8 +1732,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
-			if act != nil {
-				act.WaitEventEnd(walProcNum)
+			if act == nil {
+				return
+			}
+			d := act.WaitEventEnd(walProcNum)
+			// fsync_time (pg_stat_io): FlushUpTo runs synchronously on the
+			// calling backend's own goroutine (SetCurrentGoroutine was
+			// called for it at connection setup — server.go), so
+			// LookupTrackedGoroutine correctly reports *that backend's*
+			// own track_io_timing setting, unlike walProcNum above (a
+			// fixed background slot shared by every committing backend,
+			// only suitable for the wait_event display, not per-session
+			// gating). Mirrors storage.Pool's OnPinDone gating exactly.
+			if _, _, ok := act.LookupTrackedGoroutine(); ok {
+				walWriter.AddFsyncTimeNanos(int64(d))
 			}
 		}
 	}

@@ -34,13 +34,14 @@ every clean, green (build + pre-commit) checkpoint.
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
 BUFFERS TEXT+JSON/XML/YAML rendering, `pg_stat_io` row shape + real
 reads/read_bytes/read_time/writes/write_bytes/write_time/extend_time/
-hits/evictions/extends/extend_bytes, and `track_io_timing` runtime SET
-have all landed; see the M0122-0003 line item for detail. Remaining
-sub-items: `EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers),
-local/temp-buffer terms, the 3 remaining `pg_stat_io` op counters
-(reuses/writebacks/fsyncs), EXPLAIN's `I/O Timings` line, a `CTEDMLPrefix`
-nested-node instrumentation residual. Pick up one of those next, or
-continue the M0119-0004 pg_dump catalog-view
+hits/evictions/extends/extend_bytes/fsyncs/fsync_time, `track_io_timing`
+runtime SET, and EXPLAIN's `I/O Timings` line have all landed; see the
+M0122-0003 line item for detail. Remaining sub-items: `EXPLAIN (BUFFERS)`
+without ANALYZE (planning-time buffers), local/temp-buffer terms, the 2
+remaining `pg_stat_io` op counters (reuses/writebacks — each needs a new
+storage-engine mechanism goopg doesn't have, see deferral ledger 2026-07-05
+row), a `CTEDMLPrefix` nested-node instrumentation residual. Pick up one of
+those next, or continue the M0119-0004 pg_dump catalog-view
 parity battery / next
 unresolved DU-002 slice from `.ralph/deferral_ledger.md`.
 
@@ -392,6 +393,25 @@ mirroring M0119's ledger `status` column.
       `EXPLAIN (BUFFERS)` without ANALYZE (PG 17+ planning-time buffers) and
       local/temp-buffer terms.
       Ledger rows: `.ralph/deferral_ledger.md` (2026-07-04/2026-07-05, M0122-0003).
+      **`fsyncs`/`fsync_time` done (2026-07-05, this loop):** `wal.Writer`
+      gains real `FsyncCount()`/`FsyncTimeNanos()` — count increments once
+      per real `fdatasync(2)` call in `state.flushUpTo`, time gated on the
+      calling backend's own `track_io_timing` via a new
+      `act.LookupTrackedGoroutine()` check in `OnWALSyncDone` (the
+      pre-existing `walProcNum`-based wait-event hook is a fixed slot shared
+      by every committing backend, unsuitable for per-session gating);
+      `fetchIOStatRows` gains a second instrumented cell — (client backend,
+      wal, normal). Tests: `internal/wal/wal_test.go`
+      `TestWriterFsyncCountRealSignal`/`TestWriterFsyncTimeNanosAccumulates`,
+      `internal/executor/pgstat_io_test.go` `TestPgStatIOWalFsyncsRendered`.
+      Design: `docs/design/0122-0003-explain-format-xml-yaml.md` new
+      "`fsyncs` / `fsync_time` counters" section + README index updated.
+      Still open: `reuses`/`writebacks` — each needs a genuinely new
+      storage-engine mechanism (`BufferAccessStrategy`-style ring buffer /
+      bgwriter-checkpointer async-writeback issuance) goopg does not have at
+      all, not a wiring slice like the other counters were; see the ledger
+      row appended this loop for the concrete resume points. Also still
+      open: `EXPLAIN (BUFFERS)` without ANALYZE and local/temp-buffer terms.
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK
@@ -763,8 +783,25 @@ mirroring M0119's ledger `status` column.
       `TestPgTsConfig{,Map}IndexInitialEntries`, and
       `TestPgTsConfig{,Map}AttrsTypeOIDsMatchPG18` all PASS.
       `unimplemented_feat.json` entry updated in place (`status: resolved`).
-      **Still open in this bucket:** 1-byte `char` disambiguation,
-      `pg_collation_for`.
+      **1-byte `char` (OID 18) disambiguation landed (2026-07-05, this
+      loop):** the `::`/`CAST()` expression-cast path now distinguishes the
+      bare `CHAR` keyword (bpchar, implicit length 1) from the quoted
+      identifier `"char"` (pg_type OID 18), mirroring the fix already in
+      place for CREATE TABLE column declarations. `internal/parser/
+      select.go`'s new `synthesizeBareCharTypmod` synthesizes an implicit
+      typmod for the bare form only; `planner.exprType()`'s *CastExpr case
+      turns that into `catalog.Type.Args`; `typeOIDFor` (wire `RowDescription`
+      TypeOID, `internal/server/dispatch.go`) and `pgTypeofDisplayName`
+      (`pg_typeof()` display) both now report OID 18/`"char"` correctly for
+      the quoted form (also fixes real table columns declared `"char"`, not
+      just cast expressions, since `typeOIDFor` is shared). Verified
+      byte-for-byte against a real PostgreSQL 18.3 instance. Design:
+      `docs/design/0122-0005-char-oid18-disambiguation.md`. Deferred (ledger
+      row): inline-cast value truncation to 1 byte (INSERT-path truncation
+      already works; only the bare `SELECT 'xyz'::"char"` cast-expression
+      path doesn't truncate), and an unrelated pre-existing
+      `pg_typeof(...)::oid` cast gap affecting every type, not just `"char"`.
+      **Still open in this bucket:** `pg_collation_for`.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
       restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.

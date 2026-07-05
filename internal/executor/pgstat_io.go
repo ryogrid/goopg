@@ -27,14 +27,21 @@ package executor
 // track_io_timing flag). Those real signals are wired into the one cell
 // they correspond to — backend_type='client backend', object='relation',
 // context='normal', columns reads/read_bytes/read_time/writes/write_bytes/
-// write_time/hits/evictions/extends/extend_bytes/extend_time —
-// everything else that upstream *tracks* renders as a real 0 (goopg has not
-// performed that IO, which is true), and every untracked cell still renders
-// NULL, matching upstream's row *shape* exactly even though most of its
-// counts are not yet collected. This is a deliberate, bounded slice of the
-// wider IO-instrumentation gap (see .ralph/deferral_ledger.md, M0122-0003):
-// the remaining three op counters (reuses/writebacks/fsyncs, plus their
-// _bytes/_time siblings) remain future work and are NOT fabricated here.
+// write_time/hits/evictions/extends/extend_bytes/extend_time. A second real
+// signal — wal.Writer's lifetime fdatasync(2) count/time against WAL
+// segments (Writer.FsyncCount/FsyncTimeNanos, incremented in
+// state.flushUpTo, time gated the same way via initdb.Open's
+// OnWALSyncDone) — backs backend_type='client backend', object='wal',
+// context='normal', column fsyncs/fsync_time. Everything else that
+// upstream *tracks* renders as a real 0 (goopg has not performed that IO,
+// which is true), and every untracked cell still renders NULL, matching
+// upstream's row *shape* exactly even though most of its counts are not yet
+// collected. This is a deliberate, bounded slice of the wider
+// IO-instrumentation gap (see .ralph/deferral_ledger.md, M0122-0003): the
+// remaining two op counters (reuses/writebacks, plus their _bytes/_time
+// siblings) need a BufferAccessStrategy-style ring-buffer implementation
+// (reuses) and async-writeback issuance (writebacks) goopg does not have,
+// and remain future work — NOT fabricated here.
 
 import (
 	"strconv"
@@ -238,6 +245,11 @@ func fetchIOStatRows(ctx *Context) [][]string {
 		poolExtends = ctx.Pool.ExtendCount()
 		poolExtendTimeNanos = ctx.Pool.ExtendTimeNanos()
 	}
+	var walFsyncCount, walFsyncTimeNanos int64
+	if ctx != nil && ctx.WAL != nil {
+		walFsyncCount = ctx.WAL.FsyncCount()
+		walFsyncTimeNanos = ctx.WAL.FsyncTimeNanos()
+	}
 
 	var rows [][]string
 	for bt := ioBackendType(0); bt < ioBktNumTypes; bt++ {
@@ -262,7 +274,8 @@ func fetchIOStatRows(ctx *Context) [][]string {
 					countCol, byteCol, timeCol := ioOpColumns(op)
 					count, bytes := int64(0), int64(0)
 					timeMillis := "0"
-					if bt == ioBktClientBackend && obj == ioObjRelation && ctxIdx == ioCtxNormal {
+					switch {
+					case bt == ioBktClientBackend && obj == ioObjRelation && ctxIdx == ioCtxNormal:
 						switch op {
 						case ioOpHit:
 							count = poolHit
@@ -280,6 +293,11 @@ func fetchIOStatRows(ctx *Context) [][]string {
 							count = poolExtends
 							bytes = poolExtends * 8192
 							timeMillis = strconv.FormatFloat(nsToMs(poolExtendTimeNanos), 'f', 3, 64)
+						}
+					case bt == ioBktClientBackend && obj == ioObjWal && ctxIdx == ioCtxNormal:
+						if op == ioOpFsync {
+							count = walFsyncCount
+							timeMillis = strconv.FormatFloat(nsToMs(walFsyncTimeNanos), 'f', 3, 64)
 						}
 					}
 					cells[countCol] = strconv.FormatInt(count, 10)
