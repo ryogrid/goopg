@@ -15736,6 +15736,8 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 		return o.execAlterTSConfigAddMapping(im, s, schema)
 	case "dropmapping":
 		return o.execAlterTSConfigDropMapping(im, s, schema)
+	case "replacedict":
+		return o.execAlterTSConfigReplaceDict(im, s, schema)
 	case "rename":
 		if err := im.RenameTSConfig(s.ConfigName.Name, schema, s.NewName); err != nil {
 			return &ExecError{Code: "42704", Message: err.Error()}
@@ -15775,26 +15777,11 @@ func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
 func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
 	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
 	for _, dn := range s.Dictionaries {
-		dictSchema := dn.Schema
-		if dictSchema == "" {
-			dictSchema = schema
+		oid, err := resolveTSDictOID(im, dn)
+		if err != nil {
+			return err
 		}
-		dictNameLower := strings.ToLower(dn.Name)
-		if oid, ok := catalog.BuiltinTSDictOID[dictNameLower]; ok {
-			dictOIDs = append(dictOIDs, oid)
-			continue
-		}
-		found := false
-		for _, ud := range im.ListUserTSDicts() {
-			if strings.EqualFold(ud.Name, dn.Name) {
-				dictOIDs = append(dictOIDs, ud.OID)
-				found = true
-				break
-			}
-		}
-		if !found {
-			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", dn.Name)}
-		}
+		dictOIDs = append(dictOIDs, oid)
 	}
 	for _, tt := range s.TokenTypes {
 		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
@@ -15823,6 +15810,63 @@ func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.Alte
 			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
 				return fmt.Errorf("wal add-tsconfig-mapping: %w", werr)
 			}
+		}
+	}
+	return nil
+}
+
+// resolveTSDictOID resolves an ALTER TEXT SEARCH CONFIGURATION dictionary
+// reference to its pg_ts_dict OID: the one built-in dictionary
+// (catalog.BuiltinTSDictOID — "simple") first, then user-created
+// dictionaries (CREATE TEXT SEARCH DICTIONARY) by name. Raises 42704 if
+// neither resolves, mirroring get_ts_dict_oid(names, missing_ok=false) in
+// tsearchcmds.c. Shared by execAlterTSConfigAddMapping and
+// execAlterTSConfigReplaceDict's old/new dictionary lookups. DU-002 slice
+// 446 (M0119-0004); factored out as a replacedict follow-up.
+func resolveTSDictOID(im *catalog.InMemory, dn parser.ObjectName) (uint32, error) {
+	dictNameLower := strings.ToLower(dn.Name)
+	if oid, ok := catalog.BuiltinTSDictOID[dictNameLower]; ok {
+		return oid, nil
+	}
+	for _, ud := range im.ListUserTSDicts() {
+		if strings.EqualFold(ud.Name, dn.Name) {
+			return ud.OID, nil
+		}
+	}
+	return 0, &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", dn.Name)}
+}
+
+// execAlterTSConfigReplaceDict implements ALTER TEXT SEARCH CONFIGURATION
+// name ALTER MAPPING [FOR tokentype [, ...]] REPLACE olddict WITH
+// newdict — substitutes newdict for olddict across every matched
+// pg_ts_config_map entry, mirroring MakeConfigurationMapping's replace path
+// in tsearchcmds.c. An empty TokenTypes matches every token type the
+// configuration maps (the bare REPLACE form). Unlike ADD/DROP MAPPING, real
+// PG raises no error when the replacement matches zero rows — it is an
+// unconditional UPDATE-style scan, not a lookup — so this never surfaces a
+// "not found" ExecError for the token/dict pair itself, only for an
+// unresolvable dictionary name or configuration. DU-002 replacedict
+// follow-up (M0119-0004).
+func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	oldOID, err := resolveTSDictOID(im, s.OldDict)
+	if err != nil {
+		return err
+	}
+	newOID, err := resolveTSDictOID(im, s.NewDict)
+	if err != nil {
+		return err
+	}
+	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)
+	if uc == nil {
+		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+	}
+	// DU-002 replacedict follow-up (M0119-0004): record a WAL event so the
+	// substitution survives a restart, replayed by
+	// internal/initdb/tsconfig_ddl_recovery.go after the configuration's
+	// own CREATE record.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)); werr != nil {
+			return fmt.Errorf("wal replace-tsconfig-mapping-dict: %w", werr)
 		}
 	}
 	return nil

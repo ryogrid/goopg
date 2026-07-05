@@ -321,3 +321,104 @@ func TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping(t *testing.T) {
 		t.Errorf("after WAL replay, mappings = %+v, want only the surviving asciiword entry (word was dropped)", uc.Mappings)
 	}
 }
+
+// TestTSConfigDDLRecoveryReplaysReplaceMappingDict guards the ALTER MAPPING
+// REPLACE follow-up to M0119-0004 slice 446: the dictionary substitution
+// must survive a restart exactly like RENAME/SET SCHEMA/DROP MAPPING
+// already do (TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping).
+// Covers both the token-type-scoped and bare replace forms across two
+// separate configurations in the same WAL stream.
+func TestTSConfigDDLRecoveryReplaysReplaceMappingDict(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID1 = uint32(40463)
+	const wantOID2 = uint32(40464)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSConfig("scopedcfg", "public", wantOID1, 10, 3722)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-tsconfig scopedcfg: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("scopedcfg", "public", "asciiword", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping asciiword: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("scopedcfg", "public", "word", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping word: %v", werr)
+	}
+	// Scoped REPLACE: only asciiword's dictionary is substituted.
+	if _, _, werr := rt1.WAL.Append(wal.EncodeReplaceTSConfigMappingDict("scopedcfg", "public", []string{"asciiword"}, 3765, 16400)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append replace-mapping-dict (scoped): %v", werr)
+	}
+
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSConfig("barecfg", "public", wantOID2, 10, 3722)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-tsconfig barecfg: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("barecfg", "public", "asciiword", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping barecfg asciiword: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAddTSConfigMapping("barecfg", "public", "word", []uint32{3765})); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append add-mapping barecfg word: %v", werr)
+	}
+	// Bare REPLACE (no token-type list): every mapped token type is
+	// substituted.
+	if _, _, werr := rt1.WAL.Append(wal.EncodeReplaceTSConfigMappingDict("barecfg", "public", nil, 3765, 16401)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append replace-mapping-dict (bare): %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat, ok := rt2.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("Catalog is %T, expected *catalog.InMemory", rt2.Catalog)
+	}
+
+	scoped := findUserTSConfig(cat, "scopedcfg", "public")
+	if scoped == nil {
+		t.Fatalf("after WAL replay, configuration \"scopedcfg\" not found; registry = %+v", cat.ListUserTSConfigs())
+	}
+	for _, m := range scoped.Mappings {
+		switch m.TokenType {
+		case "asciiword":
+			if len(m.DictOIDs) != 1 || m.DictOIDs[0] != 16400 {
+				t.Errorf("scopedcfg asciiword DictOIDs = %v, want [16400] (replaced)", m.DictOIDs)
+			}
+		case "word":
+			if len(m.DictOIDs) != 1 || m.DictOIDs[0] != 3765 {
+				t.Errorf("scopedcfg word DictOIDs = %v, want [3765] (untouched by scoped REPLACE)", m.DictOIDs)
+			}
+		}
+	}
+
+	bare := findUserTSConfig(cat, "barecfg", "public")
+	if bare == nil {
+		t.Fatalf("after WAL replay, configuration \"barecfg\" not found; registry = %+v", cat.ListUserTSConfigs())
+	}
+	for _, m := range bare.Mappings {
+		if len(m.DictOIDs) != 1 || m.DictOIDs[0] != 16401 {
+			t.Errorf("barecfg %s DictOIDs = %v, want [16401] (bare REPLACE touches every mapped token type)", m.TokenType, m.DictOIDs)
+		}
+	}
+}

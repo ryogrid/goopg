@@ -6396,13 +6396,12 @@ func (p *parser) parseAlterDefaultPrivileges(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
-// parseTSMappingTokenTypeList parses the `FOR tok [, tok ...]` token-type
-// list shared by ALTER TEXT SEARCH CONFIGURATION's ADD MAPPING and DROP
-// MAPPING forms. DU-002 slice 446 follow-up (M0119-0004).
-func parseTSMappingTokenTypeList(p *parser) ([]string, error) {
-	if _, err := p.expectKeyword(KwFor); err != nil {
-		return nil, err
-	}
+// parseTSTokenTypeCommaList parses a bare `tok [, tok ...]` comma-separated
+// token-type list (no leading FOR keyword — the caller consumes that,
+// conditionally in ALTER MAPPING's case since its REPLACE form's token-type
+// list is optional). DU-002 slice 446 follow-up (M0119-0004); split out of
+// parseTSMappingTokenTypeList for the replacedict follow-up.
+func parseTSTokenTypeCommaList(p *parser) ([]string, error) {
 	var tokenTypes []string
 	for {
 		tok, err := p.parseIdent()
@@ -6415,6 +6414,16 @@ func parseTSMappingTokenTypeList(p *parser) ([]string, error) {
 		}
 	}
 	return tokenTypes, nil
+}
+
+// parseTSMappingTokenTypeList parses the `FOR tok [, tok ...]` token-type
+// list shared by ALTER TEXT SEARCH CONFIGURATION's ADD MAPPING and DROP
+// MAPPING forms. DU-002 slice 446 follow-up (M0119-0004).
+func parseTSMappingTokenTypeList(p *parser) ([]string, error) {
+	if _, err := p.expectKeyword(KwFor); err != nil {
+		return nil, err
+	}
+	return parseTSTokenTypeCommaList(p)
 }
 
 func (p *parser) parseAlter() (Stmt, error) {
@@ -6432,14 +6441,16 @@ func (p *parser) parseAlter() (Stmt, error) {
 		return p.parseAlterDefaultPrivileges(t.Pos)
 	}
 	// ALTER TEXT SEARCH CONFIGURATION name {ADD MAPPING|DROP MAPPING|RENAME
-	// TO|SET SCHEMA} — the ALTER TEXT SEARCH * forms goopg actually applies
-	// (ADD/DROP MAPPING is how a config's pg_ts_config_map rows get
-	// populated/removed, which dumpTSConfig's own ADD MAPPING re-emission
-	// depends on). ALTER MAPPING REPLACE, OWNER TO, and DICTIONARY/PARSER/
+	// TO|SET SCHEMA|ALTER MAPPING REPLACE} — the ALTER TEXT SEARCH * forms
+	// goopg actually applies (ADD/DROP MAPPING is how a config's
+	// pg_ts_config_map rows get populated/removed, which dumpTSConfig's own
+	// ADD MAPPING re-emission depends on). The ALTER MAPPING FOR tok WITH
+	// dict override form (no REPLACE), OWNER TO, and DICTIONARY/PARSER/
 	// TEMPLATE entirely fall through to the generic skip-to-semicolon compat
 	// no-op below, matching CREATE TEXT SEARCH's existing pattern. DU-002
 	// slice 446 (M0119-0004); RENAME TO/SET SCHEMA/DROP MAPPING added as a
-	// slice 446 follow-up.
+	// slice 446 follow-up; ALTER MAPPING REPLACE added as a further
+	// follow-up.
 	if p.acceptIdentKeyword("text") {
 		_ = p.acceptIdentKeyword("search") // consume "search"
 		if p.acceptIdentKeyword("configuration") {
@@ -6500,8 +6511,54 @@ func (p *parser) parseAlter() (Stmt, error) {
 				p.advance()
 				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "setschema", NewSchema: identText(schemaTok)}, nil
 			}
-			// ALTER MAPPING REPLACE / OWNER TO — unimplemented compat no-op;
-			// discard the rest of the statement.
+			if p.acceptKeyword(KwAlter) && p.acceptIdentKeyword("mapping") {
+				// ALTER MAPPING [FOR tok [, ...]] REPLACE olddict WITH
+				// newdict — ALTER_TSCONFIG_REPLACE_DICT(_FOR_TOKEN) in
+				// gram.y. The FOR token-type list is optional (its absence
+				// means "replace across every mapped token type"), which is
+				// why it can't reuse parseTSMappingTokenTypeList directly
+				// (that helper requires FOR). The sibling
+				// ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN form (`FOR tok
+				// WITH dict [, ...]`, no REPLACE) stays an unimplemented
+				// no-op, falling through below.
+				var tokenTypes []string
+				if p.acceptKeyword(KwFor) {
+					tt, err := parseTSTokenTypeCommaList(p)
+					if err != nil {
+						return nil, err
+					}
+					tokenTypes = tt
+				}
+				if p.acceptKeyword(KwReplace) {
+					oldDict, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					if _, err := p.expectKeyword(KwWith); err != nil {
+						return nil, err
+					}
+					newDict, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "replacedict", TokenTypes: tokenTypes, OldDict: oldDict, NewDict: newDict}, nil
+				}
+				// ALTER MAPPING FOR tok WITH dict [, ...] override form —
+				// unimplemented compat no-op; discard the rest of the
+				// statement.
+				stmt, err := p.parseSkipToSemicolon(t.Pos)
+				if err != nil {
+					return nil, err
+				}
+				if ns, ok := stmt.(*CompatNoopStmt); ok {
+					ns.Tag = "ALTER TEXT SEARCH CONFIGURATION"
+					ns.ObjType = "text search configuration"
+					ns.ObjName = cfgName
+				}
+				return stmt, nil
+			}
+			// OWNER TO — unimplemented compat no-op; discard the rest of
+			// the statement.
 			stmt, err := p.parseSkipToSemicolon(t.Pos)
 			if err != nil {
 				return nil, err

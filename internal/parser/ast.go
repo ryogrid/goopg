@@ -2389,23 +2389,34 @@ type TSDictOption struct {
 //     not exist" error PG raises via drop_tsconfig_mapping.
 //   - "rename": RENAME TO newname.
 //   - "setschema": SET SCHEMA newschema.
+//   - "replacedict": ALTER MAPPING [FOR tokentype [, ...]] REPLACE olddict
+//     WITH newdict (ALTER_TSCONFIG_REPLACE_DICT /
+//     ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN). An empty TokenTypes means the
+//     bare form, which substitutes the dictionary across every token type
+//     the configuration maps (tsearchcmds.c's MakeConfigurationMapping
+//     replace path treats an empty token list as "match all").
 //
-// Every other ALTER TEXT SEARCH CONFIGURATION form (ALTER MAPPING REPLACE,
-// OWNER TO) stays an unimplemented parsed-and-discarded compat no-op —
-// OWNER TO in particular needs no dedicated parse path since pg_dump always
-// derives it from the config's cfgowner catalog column (set at CREATE time),
-// never from a separate ALTER OWNER TO statement having been replayed.
+// The ALTER MAPPING FOR tokentype [, ...] WITH dict [, ...] override form
+// (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN — replaces a token type's entire
+// dictionary list, as opposed to ADD MAPPING's append or REPLACE's
+// single-OID substitution) and OWNER TO stay unimplemented
+// parsed-and-discarded compat no-ops — OWNER TO in particular needs no
+// dedicated parse path since pg_dump always derives it from the config's
+// cfgowner catalog column (set at CREATE time), never from a separate ALTER
+// OWNER TO statement having been replayed.
 // DU-002 slice 446 (M0119-0004); rename/setschema/dropmapping added as a
-// slice 446 follow-up.
+// slice 446 follow-up; replacedict added as a further follow-up.
 type AlterTSConfigStmt struct {
 	pos          int
 	ConfigName   ObjectName
-	Action       string // "addmapping" | "dropmapping" | "rename" | "setschema"
+	Action       string // "addmapping" | "dropmapping" | "rename" | "setschema" | "replacedict"
 	TokenTypes   []string
 	Dictionaries []ObjectName // for Action == "addmapping"
 	IfExists     bool         // for Action == "dropmapping"
 	NewName      string       // for Action == "rename"
 	NewSchema    string       // for Action == "setschema"
+	OldDict      ObjectName   // for Action == "replacedict"
+	NewDict      ObjectName   // for Action == "replacedict"
 }
 
 func (s *AlterTSConfigStmt) Pos() int  { return s.pos }

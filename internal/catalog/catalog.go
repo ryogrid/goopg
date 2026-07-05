@@ -11404,7 +11404,16 @@ func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs [
 					return uc, true
 				}
 			}
-			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: dictOIDs})
+			// Defensive copy: execAlterTSConfigAddMapping reuses the same
+			// dictOIDs backing array across every token type named in a
+			// single multi-token ADD MAPPING FOR t1, t2 WITH d1, d2
+			// statement (one call per token type). Without copying here,
+			// the resulting TSConfigMapping entries alias one array, so an
+			// in-place mutation of one entry's DictOIDs (e.g.
+			// ReplaceTSConfigMappingDict) silently corrupts every sibling
+			// entry from the same statement. Found via the replacedict
+			// follow-up (M0119-0004).
+			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: append([]uint32(nil), dictOIDs...)})
 			return uc, false
 		}
 	}
@@ -11486,6 +11495,62 @@ func (c *InMemory) SetTSConfigSchema(name, schema, newSchema string) bool {
 		}
 	}
 	return false
+}
+
+// ReplaceTSConfigMappingDict implements ALTER TEXT SEARCH CONFIGURATION name
+// ALTER MAPPING [FOR tokenTypes [, ...]] REPLACE oldOID WITH newOID —
+// substitutes newOID for oldOID in every matched pg_ts_config_map entry,
+// mirroring MakeConfigurationMapping's replace path in tsearchcmds.c. An
+// empty tokenTypes means "match every mapped token type" (the bare REPLACE
+// form). Unlike AddTSConfigMapping/DropTSConfigMapping this never errors
+// when nothing matches — real PG's replace loop is an unconditional scan
+// with no missing-match check, so a REPLACE that touches zero rows silently
+// succeeds. Returns the matched configuration (nil if no configuration with
+// the given schema-resolved name exists) and whether any entry was actually
+// replaced. DU-002 replacedict follow-up (M0119-0004).
+func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []string, oldOID, newOID uint32) (cfg *UserTSConfig, replaced bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID != nsOID || !strings.EqualFold(uc.Name, name) {
+			continue
+		}
+		for mi := range uc.Mappings {
+			m := &uc.Mappings[mi]
+			if len(tokenTypes) > 0 {
+				matched := false
+				for _, tt := range tokenTypes {
+					if strings.EqualFold(m.TokenType, tt) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			for di, d := range m.DictOIDs {
+				if d == oldOID {
+					m.DictOIDs[di] = newOID
+					replaced = true
+				}
+			}
+		}
+		return uc, replaced
+	}
+	return nil, false
+}
+
+// ReplaceTSConfigMappingDictDuringRecovery is the discard-result recovery
+// counterpart to ReplaceTSConfigMappingDict, mirroring
+// AddTSConfigMappingDuringRecovery. DU-002 replacedict follow-up
+// (M0119-0004).
+func (c *InMemory) ReplaceTSConfigMappingDictDuringRecovery(name, schema string, tokenTypes []string, oldOID, newOID uint32) {
+	c.ReplaceTSConfigMappingDict(name, schema, tokenTypes, oldOID, newOID)
 }
 
 // CreateTSConfigDuringRecovery is the idempotent version of CreateTSConfig

@@ -332,3 +332,62 @@ func TestDecodeSetTSConfigSchemaRejectsTruncatedPayload(t *testing.T) {
 		t.Error("expected error decoding truncated set-tsconfig-schema payload")
 	}
 }
+
+// TestEncodeDecodeReplaceTSConfigMappingDictRoundTrip pins the ALTER MAPPING
+// REPLACE WAL record format, covering both the token-type-scoped and bare
+// (nil/empty TokenTypes) forms. DU-002 replacedict follow-up (M0119-0004).
+func TestEncodeDecodeReplaceTSConfigMappingDictRoundTrip(t *testing.T) {
+	cases := []struct {
+		name, schema   string
+		tokenTypes     []string
+		oldOID, newOID uint32
+	}{
+		{"myconfig", "public", []string{"asciiword"}, 3765, 16384},
+		{"myconfig", "public", []string{"asciiword", "word"}, 3765, 16385},
+		{"otherconfig", "myschema", nil, 3765, 16384}, // bare REPLACE form
+	}
+	for _, c := range cases {
+		raw := EncodeReplaceTSConfigMappingDict(c.name, c.schema, c.tokenTypes, c.oldOID, c.newOID)
+		if raw[0] != RecordKindReplaceTSConfigMappingDict {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindReplaceTSConfigMappingDict)
+			continue
+		}
+		gotName, gotSchema, gotTokenTypes, gotOldOID, gotNewOID, err := DecodeReplaceTSConfigMappingDict(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotOldOID != c.oldOID || gotNewOID != c.newOID {
+			t.Errorf("%q: decoded (%q, %q, oldOID=%d, newOID=%d)", c.name, gotName, gotSchema, gotOldOID, gotNewOID)
+		}
+		if len(gotTokenTypes) != len(c.tokenTypes) {
+			t.Errorf("%q: decoded TokenTypes = %v, want %v", c.name, gotTokenTypes, c.tokenTypes)
+			continue
+		}
+		for i := range c.tokenTypes {
+			if gotTokenTypes[i] != c.tokenTypes[i] {
+				t.Errorf("%q: decoded TokenTypes = %v, want %v", c.name, gotTokenTypes, c.tokenTypes)
+				break
+			}
+		}
+	}
+}
+
+// TestDecodeReplaceTSConfigMappingDictRejectsWrongKind mirrors the
+// drop-mapping case.
+func TestDecodeReplaceTSConfigMappingDictRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSConfig("myconfig", "public")
+	if _, _, _, _, _, err := DecodeReplaceTSConfigMappingDict(bogus); err == nil {
+		t.Error("expected error decoding non-replace-tsconfig-mapping-dict payload")
+	}
+}
+
+// TestDecodeReplaceTSConfigMappingDictRejectsTruncatedPayload guards against
+// silently returning empty/zero fields when the on-disk record is corrupt.
+func TestDecodeReplaceTSConfigMappingDictRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeReplaceTSConfigMappingDict("myconfig", "public", []string{"asciiword"}, 3765, 16384)
+	truncated := raw[:len(raw)-1]
+	if _, _, _, _, _, err := DecodeReplaceTSConfigMappingDict(truncated); err == nil {
+		t.Error("expected error decoding truncated replace-tsconfig-mapping-dict payload")
+	}
+}

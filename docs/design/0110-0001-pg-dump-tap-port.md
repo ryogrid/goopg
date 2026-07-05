@@ -15012,3 +15012,82 @@ Gates: `go build ./...` clean; `go vet` on all touched packages clean;
 ./internal/initdb/... ./internal/server/...` PASS; `go test -race -count=1
 ./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
 pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `ALTER MAPPING REPLACE` (2026-07-06)
+
+Closes the `ALTER MAPPING REPLACE` item named as the next candidate by both
+the RENAME/SET SCHEMA/DROP MAPPING follow-up row and this row's own
+predecessor ledger row: `ALTER TEXT SEARCH CONFIGURATION name ALTER MAPPING
+[FOR tok [, ...]] REPLACE olddict WITH newdict` previously fell through to
+the discarded compat no-op alongside `OWNER TO`.
+
+`MakeConfigurationMapping`'s replace path (`tsearchcmds.c`) confirms the
+shape: unlike ADD/DROP MAPPING this is an unconditional scan-and-substitute
+over the existing `pg_ts_config_map` rows, not a lookup — replacing a
+dictionary OID that matches zero mapping entries is a silent no-op, no error.
+An empty/absent `FOR` token-type list means "substitute across every token
+type the configuration maps" (the bare form); a present list scopes the
+substitution to only those token types.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `AlterTSConfigStmt` gained a `"replacedict"`
+  action plus `OldDict`/`NewDict` (`ObjectName`) fields.
+- `internal/parser/ddl.go`: new `parseTSTokenTypeCommaList` factored out of
+  `parseTSMappingTokenTypeList` (the latter now a thin `FOR` + comma-list
+  wrapper) since REPLACE's token-type list has no leading `FOR` requirement
+  — it's entirely optional. The `ALTER TEXT SEARCH CONFIGURATION` dispatch
+  gained an `ALTER MAPPING` branch: `[FOR tok [, ...]] REPLACE olddict WITH
+  newdict` builds the new `AlterTSConfigStmt`; the sibling
+  `ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN` form (`FOR tok WITH dict [, ...]`,
+  no `REPLACE`, which *overrides* a token type's whole dictionary list
+  rather than substituting one dictionary) still falls through to the
+  discarded compat no-op, now scoped under the new `ALTER MAPPING` branch
+  instead of the outer statement-level fallthrough.
+- `internal/catalog/catalog.go`: new `ReplaceTSConfigMappingDict` (scans
+  every matched mapping's `DictOIDs` for `oldOID`, substitutes `newOID` in
+  place, returns the matched configuration + whether anything was replaced —
+  no error on zero matches per the note above) plus
+  `ReplaceTSConfigMappingDictDuringRecovery`. Also fixed a latent aliasing
+  bug found while writing this: `AddTSConfigMapping` appended the *same*
+  `dictOIDs` backing array to every token type in a multi-token `ADD MAPPING
+  FOR t1, t2 WITH d1, d2` statement, so an in-place `DictOIDs` mutation via
+  the new REPLACE path on one token type silently corrupted every sibling
+  token type from that same ADD MAPPING call. Fixed with a defensive copy
+  (`append([]uint32(nil), dictOIDs...)`).
+- `internal/executor/operators_ddl.go`: new `execAlterTSConfigReplaceDict`,
+  plus a `resolveTSDictOID` helper factored out of
+  `execAlterTSConfigAddMapping` (both now share the same built-in/user
+  dictionary name → OID resolution, raising `42704` if neither resolves).
+- Restart persistence landed in the same loop (not deferred): new WAL record
+  kind `RecordKindReplaceTSConfigMappingDict`(112) with
+  `EncodeReplaceTSConfigMappingDict`/`DecodeReplaceTSConfigMappingDict`,
+  wired into `ApplyRecord`'s existing catalog-only `(false, nil)` case
+  alongside its 6 siblings, and into
+  `internal/initdb/tsconfig_ddl_recovery.go`'s replay switch (extending
+  `tsConfigRegistryRecovery` with `ReplaceTSConfigMappingDictDuringRecovery`).
+
+**Tests**: `internal/executor/tsconfig_replacedict_test.go`
+(`TestAlterTSConfigReplaceDictForToken`/`TestAlterTSConfigReplaceDictBare`,
+covering the token-scoped and bare forms, the untouched-sibling-token-type
+assertion, the 42704 unknown-configuration/unknown-dictionary cases, and the
+zero-match silent-no-op case). `internal/wal/tsdict_tsconfig_ddl_test.go`
+gained round-trip/wrong-kind/truncated-payload cases for the new record
+kind. `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go` gained
+`TestTSConfigDDLRecoveryReplaysReplaceMappingDict` (two configurations in one
+WAL stream — one scoped REPLACE, one bare REPLACE — through a real
+`Init`→`Open`→WAL append→`Close`→`Open` cycle).
+
+**Still deferred** (unchanged from the RENAME/SET SCHEMA/DROP MAPPING
+follow-up row, minus the item this row closes): the `ALTER MAPPING FOR tok
+WITH dict [, ...]` override form (no `REPLACE` keyword — replaces a token
+type's entire dictionary list rather than substituting one OID), `OWNER TO`,
+and the `CONFIGURATION = source_config` copy-from-existing-configuration
+form of `CREATE TEXT SEARCH CONFIGURATION`.
+
+Gates: `go build ./...` clean; `go vet` on all touched packages clean;
+`go test -count=1 ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/planner/... ./internal/wal/...
+./internal/initdb/... ./internal/server/...` PASS; `go test -race -count=1
+./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench pre-commit smoke via git hook.

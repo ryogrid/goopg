@@ -1,14 +1,14 @@
 package initdb
 
 // CREATE TEXT SEARCH CONFIGURATION / ADD MAPPING / DROP / DROP MAPPING /
-// RENAME / SET SCHEMA WAL replay (DU-002 restart-persistence follow-up to
-// slice 446, M0119-0004).
+// RENAME / SET SCHEMA / ALTER MAPPING REPLACE WAL replay (DU-002
+// restart-persistence follow-up to slice 446, M0119-0004).
 //
 // Physical WAL replay (`wal.ReplayFromDirWithMgr`) ignores the
-// CREATE/ADD-MAPPING/DROP/DROP-MAPPING/RENAME/SET-SCHEMA TEXT SEARCH
-// CONFIGURATION record kinds (106-111) because goopg has no per-configuration
-// file namespace — there is no page-level state to reconstruct. The
-// catalog's configuration registry,
+// CREATE/ADD-MAPPING/DROP/DROP-MAPPING/RENAME/SET-SCHEMA/REPLACE-MAPPING-DICT
+// TEXT SEARCH CONFIGURATION record kinds (106-112) because goopg has no
+// per-configuration file namespace — there is no page-level state to
+// reconstruct. The catalog's configuration registry,
 // however, is the in-memory source of truth that backs the pg_ts_config /
 // pg_ts_config_map virtual views (pg_dump's getTSConfigurations/
 // dumpTSConfig). This recovery pass walks the WAL once after physical replay
@@ -37,6 +37,7 @@ type tsConfigRegistryRecovery interface {
 	DropTSConfigMappingDuringRecovery(name, schema, tokenType string)
 	RenameTSConfigDuringRecovery(name, schema, newName string)
 	SetTSConfigSchemaDuringRecovery(name, schema, newSchema string)
+	ReplaceTSConfigMappingDictDuringRecovery(name, schema string, tokenTypes []string, oldOID, newOID uint32)
 }
 
 // replayTSConfigDDLRecords reads every WAL record under walDir and applies
@@ -117,6 +118,12 @@ func replayTSConfigDDLRecords(walDir string, cat catalog.Catalog) error {
 				return fmt.Errorf("decode set-tsconfig-schema at lsn %d: %w", rec.StartLSN, derr)
 			}
 			reg.SetTSConfigSchemaDuringRecovery(name, schema, newSchema)
+		case wal.RecordKindReplaceTSConfigMappingDict:
+			name, schema, tokenTypes, oldOID, newOID, derr := wal.DecodeReplaceTSConfigMappingDict(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode replace-tsconfig-mapping-dict at lsn %d: %w", rec.StartLSN, derr)
+			}
+			reg.ReplaceTSConfigMappingDictDuringRecovery(name, schema, tokenTypes, oldOID, newOID)
 		}
 	}
 	return nil
