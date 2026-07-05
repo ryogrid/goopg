@@ -92,6 +92,9 @@ func (o *explainOp) Open(ctx *Context) error {
 			// wrapper is load-bearing (design 0118-0102).
 			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
 			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats, trackIOTiming)}
+			if opts.Buffers {
+				root["Planning"] = planningBufferUsageJSON()
+			}
 			if summary {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
@@ -122,6 +125,9 @@ func (o *explainOp) Open(ctx *Context) error {
 		// inside the single-element array, matching upstream's
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
 		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
+		if opts.Buffers {
+			root["Planning"] = planningBufferUsageJSON()
+		}
 		addExplainSettingsGroup(ctx, opts, root)
 		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
@@ -200,6 +206,29 @@ func formatBuffersLine(s *nodeStats) string {
 		parts = append(parts, fmt.Sprintf("written=%d", s.bufWritten))
 	}
 	return "Buffers: shared " + strings.Join(parts, " ")
+}
+
+// planningBufferUsageJSON builds the non-TEXT-format "Planning" group
+// upstream's ExplainOnePlan always emits once BUFFERS is requested,
+// independent of ANALYZE (explain.c's peek_buffer_usage: for any
+// non-EXPLAIN_FORMAT_TEXT format it returns true whenever `bufusage` is
+// non-NULL, i.e. whenever es->buffers is set, even when every counter is
+// zero — unlike TEXT's show_buffer_usage, which suppresses the whole
+// "Planning:\n  Buffers: ..." block when nothing was touched).
+//
+// Upstream's BufferUsage here reflects I/O the *planner* itself performed
+// (catalog/relcache/statistics lookups during pg_plan_query). goopg's
+// planner (internal/planner) resolves everything against the in-memory
+// catalog and never calls into storage.Pool, so these counters are always
+// zero — that's a real architectural fact, not a stub: there is currently
+// no planning-phase code path that could produce a nonzero value here.
+func planningBufferUsageJSON() map[string]any {
+	return map[string]any{
+		"Shared Hit Blocks":     int64(0),
+		"Shared Read Blocks":    int64(0),
+		"Shared Dirtied Blocks": int64(0),
+		"Shared Written Blocks": int64(0),
+	}
 }
 
 // formatIOTimingsLine renders the upstream "I/O Timings: shared read=X.XXX

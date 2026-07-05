@@ -964,3 +964,68 @@ clean; `go test -count=1 ./internal/executor/... ./internal/storage/...
 ./internal/config/...` all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
 Q13=33). Ledger: `.ralph/deferral_ledger.md` (2026-07-06 row, closes rows
 467/468).
+
+## `EXPLAIN (BUFFERS)` without `ANALYZE` — planning-time "Planning" group
+
+**Problem (ledger rows 471/472/481/497/498, "gap (2)"):** upstream's
+`ExplainOnePlan` (`postgres/src/backend/commands/explain.c`) always calls
+`show_buffer_usage(es, &bufusage, true)` with a *planning-time*
+`BufferUsage` snapshot whenever `es->buffers` is set, regardless of
+whether `ANALYZE` was also requested. `show_buffer_usage`'s own
+`peek_buffer_usage` helper returns true for any non-`EXPLAIN_FORMAT_TEXT`
+format as soon as buffer tracking was requested, even when every counter
+is zero (TEXT instead suppresses the whole block when nothing was
+touched — the existing per-node `Buffers: shared ...` TEXT line already
+mirrors this positive-only gate correctly). Before this fix, goopg's
+`explainOp.Open` never populated a "Planning" group at all for bare
+`EXPLAIN (BUFFERS)` (no `ANALYZE`) in FORMAT JSON/XML/YAML — the key was
+simply absent, not present-and-zero.
+
+**Fix:** `internal/executor/operators_explain.go` gains
+`planningBufferUsageJSON()`, returning a flat
+`{"Shared Hit Blocks": 0, "Shared Read Blocks": 0, "Shared Dirtied
+Blocks": 0, "Shared Written Blocks": 0}` map. `explainOp.Open`'s two
+non-TEXT render sites (the ANALYZE/summary path and the plan-only path)
+both set `root["Planning"] = planningBufferUsageJSON()` whenever
+`opts.Buffers` is true, independent of `ANALYZE` — matching upstream's
+independence of the "Planning" group from the ANALYZE flag exactly. The
+generic XML/YAML renderer (already reused for the plan tree and the
+existing "Buffers"/"Settings" groups) needs no changes: `xmlTagName`
+passes `"Planning"` through unchanged (no whitespace to sanitize) and
+nests the four `Shared * Blocks` children the same way it already
+sanitizes `"Shared Hit Blocks"` → `Shared-Hit-Blocks` for the per-node
+groups.
+
+goopg's planner (`internal/planner`) resolves every relation against the
+in-memory `catalog.Catalog` and never calls into `storage.Pool` during
+cost estimation — there is no planning-phase code path that could
+produce a nonzero counter here, so the all-zero stub is not an
+approximation of a real value, it is the actually-correct value given
+goopg's architecture. TEXT format is intentionally left unchanged: since
+planning buffers are always zero, TEXT's existing positive-only gate
+already produces upstream-correct output (no "Planning:" block) without
+any new code.
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup` (bare
+`EXPLAIN (BUFFERS, FORMAT JSON)`, no `ANALYZE`, must show `"Planning"`
+with hit/read keys), `TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup`
+(plain `EXPLAIN (FORMAT JSON)`, no `BUFFERS`, must NOT show it — pins the
+opt-in gate), `TestExplainBuffersAnalyzeJSONIncludesPlanningGroup`
+(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` also shows it, confirming
+ANALYZE-independence), `TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup`
+(XML sibling, asserts `<Planning>`/`<Shared-Hit-Blocks>0</Shared-Hit-Blocks>`).
+
+**Verification:** `go build ./...` clean; `go test -count=1
+./internal/executor/...` (full package) and
+`./internal/storage/... ./internal/planner/... ./internal/parser/...
+./internal/server/... ./internal/config/...` all PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Ledger:
+`.ralph/deferral_ledger.md` (2026-07-06 row, closes gap (2) from rows
+471/481/497/498).
+
+Local/temp-buffer terms remain the only sub-item still open in the
+BUFFERS-rendering cluster (goopg has no local-buffer-manager concept —
+every relation goes through the one shared `storage.Pool`); it is a
+materially larger architectural addition than a counter tweak and stays
+deferred.

@@ -37,14 +37,16 @@ reads/read_bytes/read_time/writes/write_bytes/write_time/extend_time/
 hits/evictions/extends/extend_bytes/fsyncs/fsync_time/writeback/
 writeback_time, `track_io_timing` runtime SET, and EXPLAIN's `I/O Timings`
 line, and the `CTEDMLPrefix` nested-node instrumentation residual, have all
-landed; see the M0122-0003 line item for detail. Remaining sub-items:
-`EXPLAIN (BUFFERS)` without ANALYZE (planning-time buffers),
-local/temp-buffer terms, the last `pg_stat_io` op counter (`reuses` — needs
-a `BufferAccessStrategy`-style ring-buffer storage-engine mechanism goopg
-doesn't have), plus the 4 named writeback simplifications-vs-upstream (see
-deferral ledger 2026-07-05 row). Pick up one of those next, or continue the
-M0119-0004 pg_dump catalog-view parity battery / next unresolved DU-002
-slice from `.ralph/deferral_ledger.md`.
+landed; see the M0122-0003 line item for detail. `EXPLAIN (BUFFERS)`
+without ANALYZE (planning-time "Planning" group, all-zero — goopg's
+planner never touches the buffer pool during cost estimation) also landed
+2026-07-06. Remaining sub-items: local/temp-buffer terms, the last
+`pg_stat_io` op counter (`reuses` — needs a `BufferAccessStrategy`-style
+ring-buffer storage-engine mechanism goopg doesn't have), plus the 4 named
+writeback simplifications-vs-upstream (see deferral ledger 2026-07-05
+row). Pick up one of those next, or continue the M0119-0004 pg_dump
+catalog-view parity battery / next unresolved DU-002 slice from
+`.ralph/deferral_ledger.md`.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
@@ -447,6 +449,27 @@ mirroring M0119's ledger `status` column.
       all, not a wiring slice like the other counters were; see the ledger
       row appended this loop for the concrete resume points. Also still
       open: `EXPLAIN (BUFFERS)` without ANALYZE and local/temp-buffer terms.
+      **`EXPLAIN (BUFFERS)` without `ANALYZE` done (2026-07-06, this
+      loop):** non-TEXT formats now always render a `"Planning"` group
+      (`Shared {Hit,Read,Dirtied,Written} Blocks`, all zero) whenever
+      `opts.Buffers` is set, independent of `ANALYZE` — matches upstream's
+      `peek_buffer_usage` (non-TEXT formats show the group unconditionally;
+      TEXT's existing positive-only gate is already correct since goopg's
+      planner never touches the buffer pool, so the value is genuinely
+      always zero). New `planningBufferUsageJSON()` in
+      `internal/executor/operators_explain.go`. Tests:
+      `internal/executor/explain_buffers_test.go`'s
+      `TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup`/
+      `TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup`/
+      `TestExplainBuffersAnalyzeJSONIncludesPlanningGroup`/
+      `TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup`. Design:
+      `docs/design/0122-0003-explain-format-xml-yaml.md` new "`EXPLAIN
+      (BUFFERS)` without `ANALYZE`" section + README index row extended.
+      Gates: `go build ./...` clean; `go test -count=1
+      ./internal/executor/... ./internal/storage/... ./internal/planner/...
+      ./internal/parser/... ./internal/server/... ./internal/config/...`
+      all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Only
+      `reuses` and local/temp-buffer terms remain open in this cluster.
 - [ ] **M0122-0004 — SQL language / executor features** (~21). Window frame
       ROWS/RANGE/GROUPS, GROUPING SETS/ROLLUP/CUBE, DEFAULT-clause
       parsing, intervals. **WITH CHECK

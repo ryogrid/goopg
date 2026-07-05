@@ -179,6 +179,88 @@ func TestExplainBuffersXMLTagSanitized(t *testing.T) {
 	}
 }
 
+// TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup pins the
+// remaining M0122-0003 BUFFERS gap: upstream's ExplainOnePlan always shows a
+// "Planning" group (buffer usage incurred by the planner itself) whenever
+// BUFFERS is requested for a non-text format, independent of ANALYZE
+// (explain.c's peek_buffer_usage returns true for any non-text format as
+// soon as BUFFERS was requested, even with every counter at zero). Without
+// ANALYZE, goopg previously rendered no "Planning" key at all.
+func TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf8 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (BUFFERS, FORMAT JSON) SELECT data FROM ebuf8")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Planning"`) {
+		t.Fatalf("EXPLAIN (BUFFERS, FORMAT JSON) without ANALYZE missing \"Planning\" group:\n%s", out)
+	}
+	if !strings.Contains(out, `"Shared Hit Blocks"`) || !strings.Contains(out, `"Shared Read Blocks"`) {
+		t.Errorf("Planning group missing Shared Hit/Read Blocks:\n%s", out)
+	}
+}
+
+// TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup confirms the
+// "Planning" group added above stays opt-in: plain EXPLAIN (FORMAT JSON),
+// no BUFFERS, never emits it.
+func TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf9 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (FORMAT JSON) SELECT data FROM ebuf9")
+	out := strings.Join(lines, "\n")
+	if strings.Contains(out, `"Planning"`) {
+		t.Errorf("EXPLAIN (FORMAT JSON) without BUFFERS unexpectedly emitted a \"Planning\" group:\n%s", out)
+	}
+}
+
+// TestExplainBuffersAnalyzeJSONIncludesPlanningGroup extends the coverage
+// to the ANALYZE case: the "Planning" group is independent of ANALYZE, so
+// EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) must show it too, alongside the
+// per-node execution buffer counters already covered by
+// TestExplainBuffersJSONAlwaysIncludesSharedBlocks.
+func TestExplainBuffersAnalyzeJSONIncludesPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf10 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM ebuf10")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Planning"`) {
+		t.Fatalf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) missing \"Planning\" group:\n%s", out)
+	}
+}
+
+// TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup is the XML sibling
+// of TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup, pinning
+// xmlTagName's sanitization of the nested group ("Planning" has no
+// whitespace so it passes through unchanged, unlike "Shared Hit Blocks").
+func TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf11 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (BUFFERS, FORMAT XML) SELECT data FROM ebuf11")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, "<Planning>") || !strings.Contains(out, "<Shared-Hit-Blocks>0</Shared-Hit-Blocks>") {
+		t.Errorf("expected <Planning> group with <Shared-Hit-Blocks>0</Shared-Hit-Blocks> in XML output:\n%s", out)
+	}
+}
+
 // TestFormatIOTimingsLine pins formatIOTimingsLine's TEXT rendering
 // (explain.c's show_buffer_usage has_shared_timing branch): each term is
 // independently gated on its own counter being positive, and the whole line
