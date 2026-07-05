@@ -111,6 +111,21 @@ of `CREATE TEXT SEARCH CONFIGURATION`. Next candidate: pick up
 ledger for a fresh DU-002 slice (e.g. `GRANT ... WITH GRANT OPTION GRANTED
 BY` probed-not-picked candidate from the slice 436 row).
 
+**2026-07-06 (yet later loop):** landed `ALTER TEXT SEARCH CONFIGURATION
+name ALTER MAPPING [FOR tok [, ...]] REPLACE olddict WITH newdict`
+(`internal/parser/ast.go`/`ddl.go`, `catalog.ReplaceTSConfigMappingDict`,
+`executor.execAlterTSConfigReplaceDict`, WAL record kind 112), plus fixed a
+latent `DictOIDs` aliasing bug in `AddTSConfigMapping` found while
+implementing REPLACE. See the `0110-0001` design doc's new "Slice 446
+follow-up: `ALTER MAPPING REPLACE`" section and the matching deferral
+ledger row. Remaining DU-002 items for this statement family: the
+`ALTER MAPPING FOR tok WITH dict [, ...]` override form (no `REPLACE`
+keyword), `OWNER TO` (no-op, likely fine per the ledger row's rationale),
+and the `CONFIGURATION = source_config` copy-from-existing form of
+`CREATE TEXT SEARCH CONFIGURATION`. Next candidate: pick up the override
+form, the CREATE COPY form, or survey the deferral ledger for a fresh
+DU-002 slice.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
