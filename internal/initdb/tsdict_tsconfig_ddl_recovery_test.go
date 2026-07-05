@@ -322,6 +322,78 @@ func TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping(t *testing.T) {
 	}
 }
 
+// TestTSDictDDLRecoveryReplaysRenameSetSchemaOptions guards the DU-002 ALTER
+// TEXT SEARCH DICTIONARY follow-up (M0119-0004): RENAME TO/SET SCHEMA/the
+// ( key [= value], ... ) options-merge form must survive a restart, mirroring
+// TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping.
+func TestTSDictDDLRecoveryReplaysRenameSetSchemaOptions(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	if err := Init(Options{DataDir: dir}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	rt1, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	const wantOID = uint32(40470)
+	const wantSchemaOID = uint32(40471)
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateSchema("mydictschema", wantSchemaOID)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-schema: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeCreateTSDict("simple_dict2", "public", "stopwords = 'english'", wantOID, 10, 3727)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append create-tsdict: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterTSDictOptions("simple_dict2", "public", "stopwords = 'english', accept = 'false'")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append alter-tsdict-options: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeRenameTSDict("simple_dict2", "public", "simple_dict2_renamed")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append rename-tsdict: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeSetTSDictSchema("simple_dict2_renamed", "public", "mydictschema")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append set-tsdict-schema: %v", werr)
+	}
+	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
+		_ = rt1.Close()
+		t.Fatalf("FlushUpTo: %v", ferr)
+	}
+	if err := rt1.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+
+	rt2, err := Open(OpenOptions{DataDir: dir, PoolSlots: 4})
+	if err != nil {
+		t.Fatalf("second Open: %v", err)
+	}
+	defer rt2.Close()
+
+	cat, ok := rt2.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatalf("Catalog is %T, expected *catalog.InMemory", rt2.Catalog)
+	}
+	if ud := findUserTSDict(cat, "simple_dict2", "public"); ud != nil {
+		t.Errorf("old name/schema still resolves after RENAME+SET SCHEMA replay: %+v", ud)
+	}
+	if ud := findUserTSDict(cat, "simple_dict2_renamed", "public"); ud != nil {
+		t.Errorf("renamed dictionary still in old schema after SET SCHEMA replay: %+v", ud)
+	}
+	ud := findUserTSDict(cat, "simple_dict2_renamed", "mydictschema")
+	if ud == nil {
+		t.Fatalf("after WAL replay, renamed+moved dictionary not found; registry = %+v", cat.ListUserTSDicts())
+	}
+	if ud.OID != wantOID {
+		t.Errorf("after WAL replay, dictionary OID = %d, want %d", ud.OID, wantOID)
+	}
+	if want := "stopwords = 'english', accept = 'false'"; ud.InitOption != want {
+		t.Errorf("after WAL replay, InitOption = %q, want %q", ud.InitOption, want)
+	}
+}
+
 // TestTSConfigDDLRecoveryReplaysReplaceMappingDict guards the ALTER MAPPING
 // REPLACE follow-up to M0119-0004 slice 446: the dictionary substitution
 // must survive a restart exactly like RENAME/SET SCHEMA/DROP MAPPING

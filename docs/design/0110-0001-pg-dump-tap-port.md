@@ -15250,5 +15250,112 @@ unimplemented (C-function-loading features with no analog in goopg). With
 this follow-up, every option named in `gram.y`'s `DefineStmt` production for
 `OBJECT_TSCONFIGURATION` is now implemented.
 
+## Slice 437 follow-up: `ALTER TEXT SEARCH DICTIONARY` RENAME TO / SET SCHEMA / options-merge form (2026-07-06)
+
+Closes the slice 437 (`CREATE TEXT SEARCH DICTIONARY`) row's deferred `ALTER
+TEXT SEARCH DICTIONARY` gap: real PG's grammar (`gram.y`'s
+`AlterTSDictionaryStmt`/`RenameStmt`/`AlterObjectSchemaStmt` for
+`OBJECT_TSDICTIONARY`) supports `RENAME TO newname`, `SET SCHEMA newschema`,
+`OWNER TO newowner`, and `( key [= value] [, ...] )` — a merge onto the
+dictionary's existing `dictinitoption`. Previously ALTER TEXT SEARCH
+DICTIONARY fell through entirely to the discarded compat no-op (only CREATE
+and DROP were implemented). This follow-up lands `RENAME TO`/`SET SCHEMA`/
+the options-merge form, mirroring the ALTER TEXT SEARCH CONFIGURATION
+RENAME/SET SCHEMA precedent (slice 446 follow-up) exactly; `OWNER TO` stays a
+no-op for the same reason as the CONFIGURATION case (pg_dump reads
+`dictowner` from the catalog row set at CREATE time).
+
+**`AlterTSDictionary`'s options-merge semantics** (`tsearchcmds.c`, read via
+the MCP PG-source tools): the statement's option list is a plain
+`DefElem` list (`gram.y`'s `definition` production, the same one CREATE
+uses), not a diff format. For each named option, `AlterTSDictionary`
+unconditionally scans and removes any existing `dictoptions` entry with a
+matching `defname` — then re-adds the new `DefElem` only `if (defel->arg)`.
+So a bare `key` (no `= value`) is a delete-only directive; a `key = value`
+entry replaces (or adds) that key. `verify_dictoptions`' template-specific
+option validation is skipped here exactly as it already is for CREATE (see
+the slice 437 row's own deferral) — any option name/value is accepted
+verbatim.
+
+**Why `InitOption` (a pre-serialized string) needed a
+serialize/deserialize pair, not just a setter**: `catalog.UserTSDict` only
+ever stored the CREATE-time already-serialized `dictinitoption` text (no
+parallel structured option list), because CREATE never needed to inspect an
+existing value. ALTER's merge does need to inspect the existing value, so a
+`DeserializeTSDictOptions` (mirrors `deserialize_deflist`) was added
+alongside the existing serializer — which was itself promoted from a
+private `internal/executor` helper to an exported
+`catalog.SerializeTSDictOptions`, since `catalog.AlterTSDictOptions` (below)
+needs to call it and `catalog` cannot import `executor` (the reverse import
+already exists). The executor's one CREATE-time call site now delegates to
+the catalog version via a same-named wrapper, so behavior is unchanged.
+`pgQuoteIdentForTSDict` (a byte-for-byte copy of the executor's own
+`pgQuoteIdent`, including the `sqlkeywords.IsReservedForQuoting` reserved-word
+check) was duplicated into `catalog` for the same import-direction reason —
+flagged here rather than silently accepted, since duplicated quoting logic
+is exactly the kind of sibling-path drift risk this project tracks; if
+`pgQuoteIdent` is ever forked away from `quote_identifier`'s real behavior, this
+copy needs the same fix.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `TSDictOption` gained a `HasValue bool` field
+  (CREATE never sets it; only ALTER's parser produces `HasValue == false`
+  entries, meaning "remove this key"). New `AlterTSDictStmt` (`DictName`,
+  `Action` — `"rename"`/`"setschema"`/`"options"` — `NewName`, `NewSchema`,
+  `Options`).
+- `internal/parser/ddl.go`: `parseAlter`'s `text search` branch gained a
+  `dictionary` case (previously every ALTER TEXT SEARCH DICTIONARY form fell
+  through to the generic PARSER/TEMPLATE unimplemented-no-op path) dispatching
+  RENAME TO/SET SCHEMA/the paren option list, plus `OWNER TO` falling through
+  to the compat no-op exactly like the CONFIGURATION case. New
+  `parseAlterTSDictOptionList` helper reuses the same token-scanning shape as
+  CREATE's option-list parse but records a bare key (`HasValue: false`)
+  instead of skipping it.
+- `internal/catalog/catalog.go`: `SerializeTSDictOptions`/
+  `DeserializeTSDictOptions` (moved/added, exported), `AlterTSDictOptions`
+  (locks, deserializes the target's `InitOption`, applies each directive's
+  remove-then-maybe-add, reserializes, stores, returns the new text for the
+  caller's WAL record) + `AlterTSDictOptionsDuringRecovery` (plain overwrite
+  — replay carries the already-merged final text, not the raw directives, so
+  it never re-runs the merge), `RenameTSDict`/`SetTSDictSchema` +
+  `*DuringRecovery` counterparts (byte-for-byte mirrors of
+  `RenameTSConfig`/`SetTSConfigSchema`).
+- `internal/wal/recovery.go`: three new record kinds —
+  `RecordKindRenameTSDict` (114), `RecordKindSetTSDictSchema` (115),
+  `RecordKindAlterTSDictOptions` (116, carries the final serialized
+  `dictinitoption` text, not the directive list) — with `Encode`/`Decode`
+  pairs mirroring `RenameTSConfig`/`SetTSConfigSchema`'s wire shape exactly;
+  added to the physical-replay ignore-list switch alongside the existing
+  TSDict/TSConfig kinds (catalog-only, no page state).
+- `internal/initdb/tsdict_ddl_recovery.go`: `tsDictRegistryRecovery` gained
+  the three new `*DuringRecovery` methods; `replayTSDictDDLRecords`'s switch
+  gained the three new cases.
+- `internal/executor/operators_ddl.go`: new `execAlterTSDict` dispatcher
+  (mirrors `execAlterTSConfig`'s shape) wired into the top-level DDL switch;
+  `internal/planner/planner.go`'s generic DDL passthrough list and
+  `internal/server/dispatch.go`'s `ddlTag` both gained an `AlterTSDictStmt`
+  case (`"ALTER TEXT SEARCH DICTIONARY"`).
+
+**Tests**: `internal/executor/tsdict_alter_test.go`
+(`TestAlterTSDictRenameTo`/`TestAlterTSDictSetSchema`/`TestAlterTSDictOptions`
+— the last covers add/replace/bare-key-remove/remove-to-empty, each verified
+against the real PG-derived serialized-text shape, e.g. an unquoted
+`STOPWORDS` key folds to lower-case `stopwords` in `dictinitoption`, matching
+`pgdump_connsetup_test.go`'s slice 437 real-PG-verified expectation — an
+initial draft of this test wrongly assumed double-quoting and was corrected
+against that existing fixture); `internal/wal/tsdict_tsconfig_ddl_test.go`
+gained round-trip + wrong-kind + truncated-payload cases for all three new
+record kinds; `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go`'s new
+`TestTSDictDDLRecoveryReplaysRenameSetSchemaOptions` exercises a real
+`Init`→`Open`→WAL-append(create, alter-options, rename, set-schema)→`Close`→
+`Open` cycle.
+
+**Still deferred**: `OWNER TO` stays a no-op (same rationale as
+CONFIGURATION's). `verify_dictoptions` template-specific option validation
+(e.g. `simple`'s `STOPWORDS`/`ACCEPT` being the only valid keys) is not
+performed on ALTER either, matching the CREATE-side deferral — any option
+name/value is accepted verbatim on both paths.
+
 Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
 ./internal/parser/... ./internal/catalog/... ./internal/wal/...` PASS.

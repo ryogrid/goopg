@@ -6433,6 +6433,58 @@ func parseTSMappingTokenTypeList(p *parser) ([]string, error) {
 	return parseTSTokenTypeCommaList(p)
 }
 
+// parseAlterTSDictOptionList parses ALTER TEXT SEARCH DICTIONARY name's
+// `( key [= value] [, ...] )` option list (gram.y's `definition`
+// production), assuming the caller has already confirmed the current token
+// is "(". A bare `key` (no `= value`) sets HasValue=false on its
+// TSDictOption — a delete-only directive, mirroring
+// AlterTSDictionary's `if (defel->arg)` check (tsearchcmds.c). Reuses the
+// same token-scanning shape as CREATE TEXT SEARCH DICTIONARY's option-list
+// parse (ddl.go's `text search dictionary` CREATE-tail), which never
+// records a bare option at all since ALTER is the only form that needs
+// delete-only semantics. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func parseAlterTSDictOptionList(p *parser) ([]TSDictOption, error) {
+	p.advance() // consume "("
+	var opts []TSDictOption
+	for {
+		c := p.cur()
+		if c.Kind == TokenEOF || (c.Kind == TokenSymbol && c.Value == ")") {
+			break
+		}
+		if c.Kind == TokenSymbol && c.Value == "," {
+			p.advance()
+			continue
+		}
+		if c.Kind != TokenIdent && c.Kind != TokenKeyword {
+			p.advance()
+			continue
+		}
+		key := strings.ToLower(c.Value)
+		p.advance()
+		if !((p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=") {
+			opts = append(opts, TSDictOption{Key: key})
+			continue
+		}
+		p.advance() // consume '='
+		v := p.cur()
+		switch v.Kind {
+		case TokenIntLit, TokenNumericLit:
+			opts = append(opts, TSDictOption{Key: key, Value: v.Value, IsNumeric: true, HasValue: true})
+			p.advance()
+		case TokenStringLit, TokenIdent, TokenKeyword:
+			opts = append(opts, TSDictOption{Key: key, Value: v.Value, HasValue: true})
+			p.advance()
+		default:
+			opts = append(opts, TSDictOption{Key: key})
+		}
+	}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+		p.advance()
+	}
+	return opts, nil
+}
+
 func (p *parser) parseAlter() (Stmt, error) {
 	t, err := p.expectKeyword(KwAlter)
 	if err != nil {
@@ -6597,8 +6649,55 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return stmt, nil
 		}
-		// ALTER TEXT SEARCH DICTIONARY|PARSER|TEMPLATE — unimplemented compat
-		// no-op.
+		// ALTER TEXT SEARCH DICTIONARY name {RENAME TO|SET SCHEMA|( key
+		// [= value] [, ...] )} — DU-002 ALTER TEXT SEARCH DICTIONARY
+		// follow-up (M0119-0004). OWNER TO and PARSER/TEMPLATE fall through
+		// to the generic skip-to-semicolon compat no-op below, matching the
+		// ALTER TEXT SEARCH CONFIGURATION precedent.
+		if p.acceptIdentKeyword("dictionary") {
+			dictName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			if p.acceptIdentKeyword("rename") {
+				if _, err := p.expectKeyword(KwTo); err != nil {
+					return nil, err
+				}
+				newNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSDictStmt{pos: t.Pos, DictName: dictName, Action: "rename", NewName: identText(newNameTok)}, nil
+			}
+			if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+				p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+				p.advance() // SET
+				p.advance() // SCHEMA
+				schemaTok := p.cur()
+				p.advance()
+				return &AlterTSDictStmt{pos: t.Pos, DictName: dictName, Action: "setschema", NewSchema: identText(schemaTok)}, nil
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				opts, err := parseAlterTSDictOptionList(p)
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSDictStmt{pos: t.Pos, DictName: dictName, Action: "options", Options: opts}, nil
+			}
+			// OWNER TO (or any other unrecognized trailer) — unimplemented
+			// compat no-op; discard the rest of the statement.
+			stmt, err := p.parseSkipToSemicolon(t.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if ns, ok := stmt.(*CompatNoopStmt); ok {
+				ns.Tag = "ALTER TEXT SEARCH DICTIONARY"
+				ns.ObjType = "text search dictionary"
+				ns.ObjName = dictName
+			}
+			return stmt, nil
+		}
+		// ALTER TEXT SEARCH PARSER|TEMPLATE — unimplemented compat no-op.
 		stmt, err := p.parseSkipToSemicolon(t.Pos)
 		if err != nil {
 			return nil, err

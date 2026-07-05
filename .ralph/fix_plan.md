@@ -159,12 +159,35 @@ operators_ddl.go`'s `"text search configuration"` case branches on it. Test:
 form" section. **This closes every option named in `gram.y`'s `DefineStmt`
 production for `OBJECT_TSCONFIGURATION`** — only `OWNER TO` on `ALTER TEXT
 SEARCH CONFIGURATION` remains deferred (no-op, considered fine per the prior
-row's rationale). The entire `CREATE`/`ALTER TEXT SEARCH
-CONFIGURATION`/`DICTIONARY` DU-002 slice 437/446 family is now closed. Next
-candidate: survey the deferral ledger for a fresh open (`status = -`) row —
-the `regexp_matches` multi-row SRF-expansion gap (2026-07-04 row, `'g'`-flag
-set-returning semantics) or the M0110-0001 pg_dump 002-010 broader
-per-database catalog-isolation blocker are both plausible next picks.
+row's rationale).
+
+**2026-07-06 (yet another later loop):** that "entire family is closed" note
+above was premature — `ALTER TEXT SEARCH DICTIONARY` itself (as opposed to
+CONFIGURATION) still fell through entirely to the discarded compat no-op
+(only CREATE/DROP TEXT SEARCH DICTIONARY were ever implemented). This loop
+closed that gap: `RENAME TO`/`SET SCHEMA`/the `( key [= value], ... )`
+options-merge form all now work, mirroring `AlterTSDictionary`'s real
+remove-then-maybe-add-per-key semantics (verified against real PG 18.3
+source via the MCP `pg_symbol_source` tool) and the ALTER TEXT SEARCH
+CONFIGURATION RENAME/SET SCHEMA precedent. Needed a new
+`catalog.SerializeTSDictOptions`/`DeserializeTSDictOptions` pair (promoted/
+added, exported) since `UserTSDict.InitOption` only ever stored a
+pre-serialized string with no parallel structured option list for ALTER's
+merge to read. 3 new WAL record kinds (114-116) give full restart
+persistence. See the `0110-0001` design doc's new "Slice 437 follow-up:
+`ALTER TEXT SEARCH DICTIONARY`..." section and the matching deferral ledger
+row. **With this, the entire `CREATE`/`ALTER TEXT SEARCH
+CONFIGURATION`/`DICTIONARY` DU-002 slice 437/446 family is now actually
+closed** — only `OWNER TO` (both statement families) and
+`verify_dictoptions` template-specific option validation remain deferred
+(both considered acceptable, not gaps). Next candidate: survey the deferral
+ledger for a fresh open (`status = -`) row — the `regexp_matches` multi-row
+SRF-expansion family is now fully closed (SELECT-list + FROM-clause forms,
+plus the comma-join/LATERAL correlation gap, all resolved in earlier
+2026-07-04/2026-07-06 rows), so the most promising remaining lead is the
+M0110-0001 pg_dump 002-010 broader per-database catalog-isolation blocker
+(milestone-scale — see that row's 2026-07-06 resume point) or another
+narrower DU-002 slice surfaced while probing it.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

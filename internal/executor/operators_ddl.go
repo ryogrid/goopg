@@ -193,6 +193,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropDomain(s)
 	case *parser.AlterTSConfigStmt:
 		return nil, o.execAlterTSConfig(s)
+	case *parser.AlterTSDictStmt:
+		return nil, o.execAlterTSDict(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -14672,36 +14674,14 @@ func validateCreateConversionEncodings(forName, toName string) (forEnc, toEnc in
 
 // serializeTSDictOptions reconstructs a CREATE TEXT SEARCH DICTIONARY's
 // dictinitoption text exactly as PostgreSQL's serialize_deflist
-// (tsearchcmds.c) does: each option is rendered `"key" = <val>` (the key
-// quote_identifier'd), entries joined by ", ", and the value either emitted
-// bare (an integer/numeric literal — TSDictOption.IsNumeric) or single-quoted
-// with embedded quotes doubled (every other value, matching PG's
-// SQL_STR_DOUBLE escaping — DefElem values are never backslash-escaped here
-// since the parser only ever captures a plain literal/identifier token, so
-// the E'' fallback in serialize_deflist for a literal backslash is not
-// reachable). Returns "" (NULL dictinitoption) when there are no options,
-// mirroring PG's nulls[Anum_pg_ts_dict_dictinitoption-1] = true branch.
-// DU-002 slice 437.
+// (tsearchcmds.c) does. Thin wrapper over catalog.SerializeTSDictOptions
+// (moved there as an ALTER TEXT SEARCH DICTIONARY follow-up, M0119-0004, so
+// AlterTSDictOptions can reuse the identical serialization without an
+// executor->catalog import cycle) — kept as a same-name alias here so this
+// package's one call site (the CREATE TEXT SEARCH DICTIONARY case below)
+// didn't need a rename. DU-002 slice 437.
 func serializeTSDictOptions(opts []parser.TSDictOption) string {
-	if len(opts) == 0 {
-		return ""
-	}
-	var buf strings.Builder
-	for i, opt := range opts {
-		if i > 0 {
-			buf.WriteString(", ")
-		}
-		buf.WriteString(pgQuoteIdent(opt.Key))
-		buf.WriteString(" = ")
-		if opt.IsNumeric {
-			buf.WriteString(opt.Value)
-			continue
-		}
-		buf.WriteByte('\'')
-		buf.WriteString(strings.ReplaceAll(opt.Value, "'", "''"))
-		buf.WriteByte('\'')
-	}
-	return buf.String()
+	return catalog.SerializeTSDictOptions(opts)
 }
 
 // resolveConversionFunc mirrors the FROM-function checks PostgreSQL performs in
@@ -15977,6 +15957,59 @@ func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.Alt
 				return fmt.Errorf("wal drop-tsconfig-mapping: %w", werr)
 			}
 		}
+	}
+	return nil
+}
+
+// execAlterTSDict dispatches ALTER TEXT SEARCH DICTIONARY name's
+// RENAME TO / SET SCHEMA / ( key [= value], ... ) forms, mirroring
+// execAlterTSConfig's shape. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "XX000", Message: "ALTER TEXT SEARCH DICTIONARY requires InMemory catalog"}
+	}
+	schema := s.DictName.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	switch s.Action {
+	case "rename":
+		if err := im.RenameTSDict(s.DictName.Name, schema, s.NewName); err != nil {
+			return &ExecError{Code: "42704", Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSDict(s.DictName.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal rename-tsdict: %w", werr)
+			}
+		}
+		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetTSDictSchema(s.DictName.Name, schema, newSchema) {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", s.DictName.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSDictSchema(s.DictName.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal set-tsdict-schema: %w", werr)
+			}
+		}
+		return nil
+	case "options":
+		newInitOption, err := im.AlterTSDictOptions(s.DictName.Name, schema, s.Options)
+		if err != nil {
+			return &ExecError{Code: "42704", Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSDictOptions(s.DictName.Name, schema, newInitOption)); werr != nil {
+				return fmt.Errorf("wal alter-tsdict-options: %w", werr)
+			}
+		}
+		return nil
 	}
 	return nil
 }

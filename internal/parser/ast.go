@@ -2379,11 +2379,45 @@ type RoleMembershipChange struct {
 // one); IsNumeric distinguishes the two so the executor's serialization
 // (mirroring PG's serialize_deflist) knows whether to re-quote it. DU-002
 // slice 437.
+// HasValue distinguishes a `key = value` entry from a bare `key` entry in an
+// ALTER TEXT SEARCH DICTIONARY option list (gram.y's `definition` production
+// allows a DefElem with no arg). CREATE TEXT SEARCH DICTIONARY's option
+// parsing never produces a bare entry (see ddl.go's `text search dictionary`
+// CREATE-tail parse, which only records an option once it has seen the `=`),
+// so this field is unused/false there; ALTER's option-list parser
+// (parseAlterTSDictOptionList) is the only producer of HasValue=false
+// entries, meaning "remove this key without adding a new value" — mirroring
+// AlterTSDictionary's `if (defel->arg)` check (tsearchcmds.c).
 type TSDictOption struct {
 	Key       string
 	Value     string
 	IsNumeric bool
+	HasValue  bool
 }
+
+// AlterTSDictStmt is `ALTER TEXT SEARCH DICTIONARY name <action>`
+// (tsearchcmds.c's AlterTSDictionaryStmt/RenameStmt/AlterObjectSchemaStmt for
+// OBJECT_TSDICTIONARY). Action is one of:
+//   - "rename": RENAME TO newname
+//   - "setschema": SET SCHEMA newschema
+//   - "options": ( key [= value] [, ...] ) — merges the option list into the
+//     dictionary's existing dictinitoption, per-key remove-then-maybe-add
+//     (catalog.InMemory.AlterTSDictOptions).
+//
+// OWNER TO stays an unimplemented compat no-op (pg_dump reads dictowner from
+// the catalog row set at CREATE time), matching the ALTER TEXT SEARCH
+// CONFIGURATION precedent.
+type AlterTSDictStmt struct {
+	pos       int
+	DictName  ObjectName
+	Action    string
+	NewName   string
+	NewSchema string
+	Options   []TSDictOption // for Action == "options"
+}
+
+func (s *AlterTSDictStmt) Pos() int  { return s.pos }
+func (s *AlterTSDictStmt) stmtNode() {}
 
 // AlterTSConfigStmt is `ALTER TEXT SEARCH CONFIGURATION name <action>`
 // (tsearchcmds.c's AlterTSConfigurationStmt). Action is one of:

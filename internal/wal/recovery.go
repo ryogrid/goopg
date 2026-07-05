@@ -1226,6 +1226,34 @@ const (
 	//   tokenType(tokenTypeLen bytes) | dictCount(2) | dictOID(4) * dictCount.
 	RecordKindAlterTSConfigMapping byte = 113
 
+	// RecordKindRenameTSDict records an `ALTER TEXT SEARCH DICTIONARY name
+	// RENAME TO newName` event, mirroring RecordKindRenameTSConfig. DU-002
+	// ALTER TEXT SEARCH DICTIONARY follow-up (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newNameLen(2) | newName(newNameLen bytes).
+	RecordKindRenameTSDict byte = 114
+
+	// RecordKindSetTSDictSchema records an `ALTER TEXT SEARCH DICTIONARY
+	// name SET SCHEMA newSchema` event, mirroring
+	// RecordKindSetTSConfigSchema. DU-002 ALTER TEXT SEARCH DICTIONARY
+	// follow-up (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | newSchemaLen(2) | newSchema(newSchemaLen bytes).
+	RecordKindSetTSDictSchema byte = 115
+
+	// RecordKindAlterTSDictOptions records an `ALTER TEXT SEARCH DICTIONARY
+	// name ( key [= value] [, ...] )` event. Unlike the CREATE-time
+	// dictinitoption, replaying this record does not re-run the
+	// remove-then-maybe-add merge (catalog.InMemory.AlterTSDictOptions) —
+	// it carries the already-computed final serialized dictinitoption text
+	// (mirroring how RecordKindCreateTSDict itself stores a pre-serialized
+	// string rather than a structured option list), so replay is a plain
+	// overwrite via AlterTSDictOptionsDuringRecovery. DU-002 ALTER TEXT
+	// SEARCH DICTIONARY follow-up (M0119-0004).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | schemaLen(2) |
+	//   schema(schemaLen bytes) | initOptionLen(2) | initOption(initOptionLen bytes).
+	RecordKindAlterTSDictOptions byte = 116
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -3911,6 +3939,197 @@ func DecodeSetTSConfigSchema(payload []byte) (name, schema, newSchema string, er
 	}
 	newSchema = string(payload[off : off+newSchemaLen])
 	return name, schema, newSchema, nil
+}
+
+// EncodeRenameTSDict encodes an ALTER TEXT SEARCH DICTIONARY name RENAME TO
+// newName event, mirroring EncodeRenameTSConfig. DU-002 ALTER TEXT SEARCH
+// DICTIONARY follow-up (M0119-0004). Format: kind(1) | nameLen(2) |
+// name(nameLen bytes) | schemaLen(2) | schema(schemaLen bytes) |
+// newNameLen(2) | newName(newNameLen bytes).
+func EncodeRenameTSDict(name, schema, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newName))
+	out[0] = RecordKindRenameTSDict
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeRenameTSDict decodes a RecordKindRenameTSDict payload.
+func DecodeRenameTSDict(payload []byte) (name, schema, newName string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: rename-tsdict payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindRenameTSDict {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not rename-tsdict", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: rename-tsdict payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: rename-tsdict payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", "", fmt.Errorf("wal: rename-tsdict payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, schema, newName, nil
+}
+
+// EncodeSetTSDictSchema encodes an ALTER TEXT SEARCH DICTIONARY name SET
+// SCHEMA newSchema event, mirroring EncodeSetTSConfigSchema. DU-002 ALTER
+// TEXT SEARCH DICTIONARY follow-up (M0119-0004). Format: kind(1) |
+// nameLen(2) | name(nameLen bytes) | schemaLen(2) | schema(schemaLen
+// bytes) | newSchemaLen(2) | newSchema(newSchemaLen bytes).
+func EncodeSetTSDictSchema(name, schema, newSchema string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(newSchema))
+	out[0] = RecordKindSetTSDictSchema
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newSchema)))
+	off += 2
+	copy(out[off:], newSchema)
+	return out
+}
+
+// DecodeSetTSDictSchema decodes a RecordKindSetTSDictSchema payload.
+func DecodeSetTSDictSchema(payload []byte) (name, schema, newSchema string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: set-tsdict-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindSetTSDictSchema {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not set-tsdict-schema", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: set-tsdict-schema payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: set-tsdict-schema payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	newSchemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newSchemaLen {
+		return "", "", "", fmt.Errorf("wal: set-tsdict-schema payload truncated (need %d bytes)", off+newSchemaLen)
+	}
+	newSchema = string(payload[off : off+newSchemaLen])
+	return name, schema, newSchema, nil
+}
+
+// EncodeAlterTSDictOptions encodes an ALTER TEXT SEARCH DICTIONARY name
+// ( key [= value] [, ...] ) event. Carries the already-merged final
+// dictinitoption text (computed once by catalog.InMemory.AlterTSDictOptions
+// at original-execution time), not the raw option-list directives — replay
+// (DecodeAlterTSDictOptions + AlterTSDictOptionsDuringRecovery) is a plain
+// overwrite, mirroring how RecordKindCreateTSDict itself stores a
+// pre-serialized string. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004). Format: kind(1) | nameLen(2) | name(nameLen bytes) |
+// schemaLen(2) | schema(schemaLen bytes) | initOptionLen(2) |
+// initOption(initOptionLen bytes).
+func EncodeAlterTSDictOptions(name, schema, initOption string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(schema) > 0xFFFF {
+		schema = schema[:0xFFFF]
+	}
+	if len(initOption) > 0xFFFF {
+		initOption = initOption[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name)+len(schema)+len(initOption))
+	out[0] = RecordKindAlterTSDictOptions
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(schema)))
+	off += 2
+	copy(out[off:], schema)
+	off += len(schema)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(initOption)))
+	off += 2
+	copy(out[off:], initOption)
+	return out
+}
+
+// DecodeAlterTSDictOptions decodes a RecordKindAlterTSDictOptions payload.
+func DecodeAlterTSDictOptions(payload []byte) (name, schema, initOption string, err error) {
+	if len(payload) < 7 {
+		return "", "", "", fmt.Errorf("wal: alter-tsdict-options payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterTSDictOptions {
+		return "", "", "", fmt.Errorf("wal: record kind %d is not alter-tsdict-options", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-tsdict-options payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	schemaLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+schemaLen+2 {
+		return "", "", "", fmt.Errorf("wal: alter-tsdict-options payload truncated (need %d bytes)", off+schemaLen+2)
+	}
+	schema = string(payload[off : off+schemaLen])
+	off += schemaLen
+	initOptionLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+initOptionLen {
+		return "", "", "", fmt.Errorf("wal: alter-tsdict-options payload truncated (need %d bytes)", off+initOptionLen)
+	}
+	initOption = string(payload[off : off+initOptionLen])
+	return name, schema, initOption, nil
 }
 
 // EncodeReplaceTSConfigMappingDict encodes an ALTER TEXT SEARCH CONFIGURATION
@@ -7384,7 +7603,7 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		return false, nil
 	case RecordKindCreateTSDict, RecordKindDropTSDict, RecordKindCreateTSConfig, RecordKindAddTSConfigMapping, RecordKindDropTSConfig,
 		RecordKindDropTSConfigMapping, RecordKindRenameTSConfig, RecordKindSetTSConfigSchema, RecordKindReplaceTSConfigMappingDict,
-		RecordKindAlterTSConfigMapping:
+		RecordKindAlterTSConfigMapping, RecordKindRenameTSDict, RecordKindSetTSDictSchema, RecordKindAlterTSDictOptions:
 		// CREATE/DROP TEXT SEARCH DICTIONARY and CREATE/ADD MAPPING/DROP TEXT
 		// SEARCH CONFIGURATION records (DU-002 restart-persistence follow-up
 		// to slices 437/446, M0119-0004) carry only pg_ts_dict/pg_ts_config

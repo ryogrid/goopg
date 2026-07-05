@@ -11320,6 +11320,301 @@ func (c *InMemory) DropTSDictDuringRecovery(name, schema string) {
 	c.DropTSDict(name, schema)
 }
 
+// SerializeTSDictOptions reconstructs a text search dictionary's
+// dictinitoption text exactly as PostgreSQL's serialize_deflist
+// (tsearchcmds.c) does: each option is rendered `"key" = <val>` (the key
+// quote_identifier'd — see pgQuoteIdent in the executor package, applied by
+// the caller since it lives there), entries joined by ", ", and the value
+// either emitted bare (an integer/numeric literal — TSDictOption.IsNumeric)
+// or single-quoted with embedded quotes doubled (every other value,
+// matching PG's SQL_STR_DOUBLE escaping). Returns "" (NULL dictinitoption)
+// when there are no options. Shared by CREATE TEXT SEARCH DICTIONARY and
+// ALTER TEXT SEARCH DICTIONARY's option-merge form (AlterTSDictOptions
+// below) so both round-trip through the identical serialized form. DU-002
+// slice 437; moved here from the executor package as an ALTER TEXT SEARCH
+// DICTIONARY follow-up (M0119-0004) so AlterTSDictOptions can call it
+// without an executor->catalog import cycle.
+func SerializeTSDictOptions(opts []parser.TSDictOption) string {
+	if len(opts) == 0 {
+		return ""
+	}
+	var buf strings.Builder
+	for i, opt := range opts {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(pgQuoteIdentForTSDict(opt.Key))
+		buf.WriteString(" = ")
+		if opt.IsNumeric {
+			buf.WriteString(opt.Value)
+			continue
+		}
+		buf.WriteByte('\'')
+		buf.WriteString(strings.ReplaceAll(opt.Value, "'", "''"))
+		buf.WriteByte('\'')
+	}
+	return buf.String()
+}
+
+// pgQuoteIdentForTSDict mirrors the executor package's own pgQuoteIdent
+// (expr.go) byte-for-byte — quote_identifier(): unquoted only when the
+// identifier is all-lowercase letters/digits/underscore starting with a
+// letter/underscore AND not a reserved keyword (sqlkeywords.
+// IsReservedForQuoting), otherwise double-quoted with embedded quotes
+// doubled. Duplicated here (rather than exported from the executor package)
+// because catalog cannot import executor (executor already imports
+// catalog); kept byte-identical to expr.go's pgQuoteIdent so
+// SerializeTSDictOptions's output is unchanged from before this function
+// moved from the executor package. DU-002 ALTER TEXT SEARCH DICTIONARY
+// follow-up (M0119-0004).
+func pgQuoteIdentForTSDict(s string) string {
+	if s == "" {
+		return `""`
+	}
+	safe := true
+	for i, c := range s {
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || c == '_') {
+				safe = false
+				break
+			}
+		} else {
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+				safe = false
+				break
+			}
+		}
+	}
+	if safe && sqlkeywords.IsReservedForQuoting(s) {
+		safe = false
+	}
+	if safe {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// DeserializeTSDictOptions is the inverse of SerializeTSDictOptions,
+// mirroring deserialize_deflist (tsearchcmds.c): splits a comma-separated
+// `"key" = 'value'` / `"key" = 42` list back into structured options.
+// InitOption is the only place a dictionary's options are stored (there is
+// no parallel structured field on UserTSDict), so ALTER TEXT SEARCH
+// DICTIONARY's (key[=value],...) merge form (AlterTSDictOptions below) must
+// round-trip through this to remove/replace individual keys without
+// discarding the rest. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func DeserializeTSDictOptions(s string) []parser.TSDictOption {
+	if s == "" {
+		return nil
+	}
+	var out []parser.TSDictOption
+	i := 0
+	for i < len(s) {
+		for i < len(s) && (s[i] == ' ' || s[i] == ',') {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+		var key string
+		if s[i] == '"' {
+			j := i + 1
+			var b strings.Builder
+			for j < len(s) {
+				if s[j] == '"' {
+					if j+1 < len(s) && s[j+1] == '"' {
+						b.WriteByte('"')
+						j += 2
+						continue
+					}
+					break
+				}
+				b.WriteByte(s[j])
+				j++
+			}
+			key = b.String()
+			i = j + 1
+		} else {
+			j := i
+			for j < len(s) && s[j] != ' ' && s[j] != '=' {
+				j++
+			}
+			key = s[i:j]
+			i = j
+		}
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i < len(s) && s[i] == '=' {
+			i++
+		}
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i >= len(s) {
+			out = append(out, parser.TSDictOption{Key: key, HasValue: true})
+			break
+		}
+		if s[i] == '\'' {
+			j := i + 1
+			var b strings.Builder
+			for j < len(s) {
+				if s[j] == '\'' {
+					if j+1 < len(s) && s[j+1] == '\'' {
+						b.WriteByte('\'')
+						j += 2
+						continue
+					}
+					break
+				}
+				b.WriteByte(s[j])
+				j++
+			}
+			out = append(out, parser.TSDictOption{Key: key, Value: b.String(), HasValue: true})
+			i = j + 1
+		} else {
+			j := i
+			for j < len(s) && s[j] != ',' {
+				j++
+			}
+			out = append(out, parser.TSDictOption{Key: key, Value: strings.TrimSpace(s[i:j]), IsNumeric: true, HasValue: true})
+			i = j
+		}
+	}
+	return out
+}
+
+// AlterTSDictOptions implements ALTER TEXT SEARCH DICTIONARY name
+// ( key [= value] [, ...] ), mirroring AlterTSDictionary (tsearchcmds.c):
+// each named option is first removed from the existing list (regardless of
+// whether it currently exists), then re-added only if the directive carries
+// a value (HasValue) — a bare `key` in the option list is therefore a
+// delete-only directive. verify_dictoptions' template-specific option
+// validation is not performed (matching the CREATE-side deferral): any
+// option name/value is accepted verbatim. Returns the newly-serialized
+// dictinitoption text (for the caller's WAL record) and an error if no such
+// dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.TSDictOption) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserTSDict
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			target = ud
+			break
+		}
+	}
+	if target == nil {
+		return "", fmt.Errorf("text search dictionary %q does not exist", name)
+	}
+	opts := DeserializeTSDictOptions(target.InitOption)
+	for _, directive := range directives {
+		kept := opts[:0]
+		for _, existing := range opts {
+			if !strings.EqualFold(existing.Key, directive.Key) {
+				kept = append(kept, existing)
+			}
+		}
+		opts = kept
+		if directive.HasValue {
+			opts = append(opts, parser.TSDictOption{Key: directive.Key, Value: directive.Value, IsNumeric: directive.IsNumeric, HasValue: true})
+		}
+	}
+	target.InitOption = SerializeTSDictOptions(opts)
+	return target.InitOption, nil
+}
+
+// AlterTSDictOptionsDuringRecovery is the idempotent recovery counterpart to
+// AlterTSDictOptions: replay carries the already-computed final
+// dictinitoption text (recorded once at original-execution time via the WAL
+// record), so it just overwrites the field rather than re-running the
+// merge. Discards a not-found result, mirroring RenameTSDictDuringRecovery.
+// DU-002 ALTER TEXT SEARCH DICTIONARY follow-up (M0119-0004).
+func (c *InMemory) AlterTSDictOptionsDuringRecovery(name, schema, initOption string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			ud.InitOption = initOption
+			return
+		}
+	}
+}
+
+// RenameTSDict implements ALTER TEXT SEARCH DICTIONARY name RENAME TO
+// newName, mirroring RenameTSConfig. DU-002 ALTER TEXT SEARCH DICTIONARY
+// follow-up (M0119-0004).
+func (c *InMemory) RenameTSDict(name, schema, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserTSDict
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			target = ud
+			continue
+		}
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, newName) {
+			return fmt.Errorf("text search dictionary %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("text search dictionary %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetTSDictSchema implements ALTER TEXT SEARCH DICTIONARY name SET SCHEMA
+// newSchema, mirroring SetTSConfigSchema. Returns false if no such
+// dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func (c *InMemory) SetTSDictSchema(name, schema, newSchema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			ud.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
+// RenameTSDictDuringRecovery is the discard-error recovery counterpart to
+// RenameTSDict, mirroring RenameTSConfigDuringRecovery. DU-002 ALTER TEXT
+// SEARCH DICTIONARY follow-up (M0119-0004).
+func (c *InMemory) RenameTSDictDuringRecovery(name, schema, newName string) {
+	_ = c.RenameTSDict(name, schema, newName)
+}
+
+// SetTSDictSchemaDuringRecovery is the discard-result recovery counterpart
+// to SetTSDictSchema, mirroring SetTSConfigSchemaDuringRecovery. DU-002
+// ALTER TEXT SEARCH DICTIONARY follow-up (M0119-0004).
+func (c *InMemory) SetTSDictSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetTSDictSchema(name, schema, newSchema)
+}
+
 // CreateTSConfig records a CREATE TEXT SEARCH CONFIGURATION in the runtime
 // pg_ts_config registry so pg_dump's getTSConfigurations / dumpTSConfig
 // re-emit it. `schema` is the (already-resolved) schema name the

@@ -439,3 +439,140 @@ func TestDecodeAlterTSConfigMappingRejectsTruncatedPayload(t *testing.T) {
 		t.Error("expected error decoding truncated alter-tsconfig-mapping payload")
 	}
 }
+
+// TestEncodeDecodeRenameTSDictRoundTrip pins the ALTER TEXT SEARCH
+// DICTIONARY name RENAME TO WAL record format (DU-002 ALTER TEXT SEARCH
+// DICTIONARY follow-up, M0119-0004), mirroring
+// TestEncodeDecodeRenameTSConfigRoundTrip.
+func TestEncodeDecodeRenameTSDictRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, newName string }{
+		{"mydict", "public", "renameddict"},
+		{"日本語dict", "myschema", "新dict"}, // multi-byte UTF-8
+	}
+	for _, c := range cases {
+		raw := EncodeRenameTSDict(c.name, c.schema, c.newName)
+		if raw[0] != RecordKindRenameTSDict {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindRenameTSDict)
+			continue
+		}
+		gotName, gotSchema, gotNewName, err := DecodeRenameTSDict(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotNewName != c.newName {
+			t.Errorf("%q: decoded (%q, %q, %q)", c.name, gotName, gotSchema, gotNewName)
+		}
+	}
+}
+
+// TestEncodeDecodeSetTSDictSchemaRoundTrip pins the ALTER TEXT SEARCH
+// DICTIONARY name SET SCHEMA WAL record format (DU-002 ALTER TEXT SEARCH
+// DICTIONARY follow-up, M0119-0004), mirroring
+// TestEncodeDecodeSetTSConfigSchemaRoundTrip.
+func TestEncodeDecodeSetTSDictSchemaRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, newSchema string }{
+		{"mydict", "public", "otherschema"},
+		{"otherdict", "schema1", "schema2"},
+	}
+	for _, c := range cases {
+		raw := EncodeSetTSDictSchema(c.name, c.schema, c.newSchema)
+		if raw[0] != RecordKindSetTSDictSchema {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindSetTSDictSchema)
+			continue
+		}
+		gotName, gotSchema, gotNewSchema, err := DecodeSetTSDictSchema(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotNewSchema != c.newSchema {
+			t.Errorf("%q: decoded (%q, %q, %q)", c.name, gotName, gotSchema, gotNewSchema)
+		}
+	}
+}
+
+// TestEncodeDecodeAlterTSDictOptionsRoundTrip pins the ALTER TEXT SEARCH
+// DICTIONARY name ( key [= value], ... ) WAL record format (DU-002 ALTER
+// TEXT SEARCH DICTIONARY follow-up, M0119-0004). Unlike RENAME/SET SCHEMA
+// this record carries the already-merged final dictinitoption text, not
+// the raw option-list directives (see RecordKindAlterTSDictOptions's own
+// doc comment).
+func TestEncodeDecodeAlterTSDictOptionsRoundTrip(t *testing.T) {
+	cases := []struct{ name, schema, initOption string }{
+		{"mydict", "public", "stopwords = 'english'"},
+		{"otherdict", "myschema", ""}, // all options removed -> NULL dictinitoption
+	}
+	for _, c := range cases {
+		raw := EncodeAlterTSDictOptions(c.name, c.schema, c.initOption)
+		if raw[0] != RecordKindAlterTSDictOptions {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterTSDictOptions)
+			continue
+		}
+		gotName, gotSchema, gotInitOption, err := DecodeAlterTSDictOptions(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotSchema != c.schema || gotInitOption != c.initOption {
+			t.Errorf("%q: decoded (%q, %q, %q)", c.name, gotName, gotSchema, gotInitOption)
+		}
+	}
+}
+
+// TestDecodeRenameTSDictRejectsWrongKind mirrors
+// TestDecodeRenameTSConfigRejectsWrongKind.
+func TestDecodeRenameTSDictRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSDict("mydict", "public")
+	if _, _, _, err := DecodeRenameTSDict(bogus); err == nil {
+		t.Error("expected error decoding non-rename-tsdict payload")
+	}
+}
+
+// TestDecodeSetTSDictSchemaRejectsWrongKind mirrors
+// TestDecodeSetTSConfigSchemaRejectsWrongKind.
+func TestDecodeSetTSDictSchemaRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSDict("mydict", "public")
+	if _, _, _, err := DecodeSetTSDictSchema(bogus); err == nil {
+		t.Error("expected error decoding non-set-tsdict-schema payload")
+	}
+}
+
+// TestDecodeAlterTSDictOptionsRejectsWrongKind mirrors the RENAME/SET SCHEMA
+// wrong-kind cases above.
+func TestDecodeAlterTSDictOptionsRejectsWrongKind(t *testing.T) {
+	bogus := EncodeDropTSDict("mydict", "public")
+	if _, _, _, err := DecodeAlterTSDictOptions(bogus); err == nil {
+		t.Error("expected error decoding non-alter-tsdict-options payload")
+	}
+}
+
+// TestDecodeRenameTSDictRejectsTruncatedPayload guards against silently
+// returning empty/zero fields when the on-disk record is corrupt.
+func TestDecodeRenameTSDictRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeRenameTSDict("mydict", "public", "renameddict")
+	truncated := raw[:len(raw)-1]
+	if _, _, _, err := DecodeRenameTSDict(truncated); err == nil {
+		t.Error("expected error decoding truncated rename-tsdict payload")
+	}
+}
+
+// TestDecodeSetTSDictSchemaRejectsTruncatedPayload mirrors the rename case
+// for SET SCHEMA.
+func TestDecodeSetTSDictSchemaRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeSetTSDictSchema("mydict", "public", "otherschema")
+	truncated := raw[:len(raw)-1]
+	if _, _, _, err := DecodeSetTSDictSchema(truncated); err == nil {
+		t.Error("expected error decoding truncated set-tsdict-schema payload")
+	}
+}
+
+// TestDecodeAlterTSDictOptionsRejectsTruncatedPayload mirrors the rename
+// case for the options-merge form.
+func TestDecodeAlterTSDictOptionsRejectsTruncatedPayload(t *testing.T) {
+	raw := EncodeAlterTSDictOptions("mydict", "public", "stopwords = 'english'")
+	truncated := raw[:len(raw)-1]
+	if _, _, _, err := DecodeAlterTSDictOptions(truncated); err == nil {
+		t.Error("expected error decoding truncated alter-tsdict-options payload")
+	}
+}
