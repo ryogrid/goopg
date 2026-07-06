@@ -323,6 +323,68 @@ every clean, green (build + pre-commit) checkpoint.
       documented crash-recovery contract for `BTIncompleteSplit` —
       confirmed via grep, not yet confirmed exploitable. Full repro
       recipe + evidence in today's deferral ledger row.
+      2026-07-07 updates #7-#9 (9th-11th consecutive investigation
+      loops; see the matching deferral ledger rows for full detail):
+      refuted the incomplete-split-fast-path lead as independently
+      exploitable (splitMu already excludes the race); refuted the
+      internal-page fast-path hypothesis (all internal-page mutation
+      is provably splitMu-guarded); then, on the pure insert-only
+      `TestMultiWriterStress_M0055_Phase_C` repro (empty-internal-page
+      symptom, not pgbench's keyLen-mismatch symptom), built a ring-
+      buffer + enriched-error diagnostic and captured 3 clean
+      reproductions proving the failing page's content is a byte-for-
+      byte virgin `storage.InitPage` signature (`flags=0x0 lower=24
+      upper=8192 next=0 prev=0`) even for a block that had already
+      been legitimately split-and-repopulated 5 times before — ruling
+      out a write-path logic bug and pointing at the buffer pool's
+      tag/slot resolution machinery (bufmap/claimVictim/evictVictim)
+      as the next thing to instrument.
+      2026-07-07 update #10 (12th consecutive investigation loop; see
+      today's deferral ledger row for the full instrumentation recipe
+      and exact trace excerpts): executed that instrumentation (bufmap
+      Insert/Delete traces, claimVictim/PinNew/pinLoad/Pin/pinSlow
+      traces, all gated on `GOOPG_SLOTTRACE=1`) plus two NEW call-site
+      markers (`SITE_NEW_ROOT` in `createNewRoot`, `SITE_SPLIT_RIGHT`
+      in `pinNewLocked`). Running with `GOMAXPROCS=4` measurably raised
+      the repro rate (0/850 unconstrained vs. 11 failures across two
+      400-iteration GOMAXPROCS=4 runs) — worth keeping for future
+      repro attempts. REFUTED the duplicate-tag-mapping and stale-
+      slot/tag-mismatch hypotheses (zero `BM_INSERT_DUP_REFUSED` or
+      `*_TAG_MISMATCH` events near any failing block across 11
+      captures). NEW CONCLUSIVE FINDING: all 10 attributable failures
+      show `SITE_SPLIT_RIGHT` — ZERO show `SITE_NEW_ROOT` — pinning the
+      bug to `insertIntoBlock`'s split-right-page allocation
+      specifically, not `createNewRoot` (whose raw-`PinNew`-then-
+      separate-`.Lock()` gap was re-examined and confirmed NOT
+      exploitable: the creating goroutine holds the only pin
+      throughout, and nothing can reach the new root before the
+      metapage update, which happens strictly after full population).
+      Every failure shows the SAME 3-phase signature: PinNew creates
+      the block → `claimVictim` legitimately evicts it (only possible
+      once the split writer's own `Unpin` has already run, i.e. after
+      the split's code path has, by construction, fully populated +
+      MarkDirty'd + WAL-logged + unlocked it) → a cache-miss reload
+      reads back virgin content. This means the corruption survives a
+      real evict-then-reload roundtrip through the smgr layer — the
+      bug is either (a) upstream, inside the split's own populate-
+      then-unlock window (a stale/aliased byte-slice write silently
+      reverting the page before eviction), or (b) in the disk I/O
+      roundtrip itself (`relFile.writeBlock`/`extend`/`readBlock`,
+      smgr.go). NOT yet localized between (a)/(b) — next loop's
+      highest-value single measurement: sample the in-memory page's
+      line-pointer count immediately before `evictVictim`'s
+      `flushSlot` call, and a byte-checksum of the buffer immediately
+      after `relFile.writeBlock`'s `WriteAt` and again after the
+      subsequent `relFile.readBlock`'s `ReadAt`, keyed by block number
+      — whichever of these three checkpoints first shows empty content
+      localizes the bug to that boundary. All instrumentation reverted
+      this loop (`git diff --stat` clean). Also flagged, not yet fixed
+      (independent, low-risk cleanups): `insertIntoBlock`'s dedup-
+      avoids-split branch (btree.go:1531-1547) permanently leaks an
+      allocated-but-never-linked block every time it fires; and
+      `createNewRoot` should call `bt.pinNewLocked()` instead of raw
+      `PinNew()`+separate `.Lock()` for consistency with
+      `pinNewOrRecycled`, even though it's confirmed not exploitable.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
