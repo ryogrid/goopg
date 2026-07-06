@@ -445,6 +445,46 @@ every clean, green (build + pre-commit) checkpoint.
       that DB, `pgbench -c 100 -j 20 -T 25 -P 5` — reproduces in ~10s)
       — that lead was never executed because loops 9-12 pivoted onto
       the (now-resolved) empty-internal-page thread instead.
+      2026-07-07 update #12 (14th consecutive investigation loop; see
+      today's deferral ledger row for full byte-level detail): executed
+      update #11's next step for the first time (prior loops 9-13
+      pivoted onto the empty-internal-page thread instead) — instrumented
+      every `parseItem`/`readPageItem` error branch in `btree.go` with a
+      forensic page dump (decoded opaque + full line-pointer table + hex,
+      gated `GOOPG_BTREE_PARSE_ERR_DUMP=1`) and ran update #6's cheap
+      repro (`pgbench -i -s 50` once, `pgbench -c 100 -j 20 -T 25 -P 5`).
+      Reproduced in ~10s, captured 96 forensic dumps. **New finding**:
+      the corruption is confirmed genuinely ON-DISK (a direct `dd` of the
+      raw file at several reported blocks matches the buffer pool's
+      decoded content byte-for-byte — ruling out a read-time/aliasing
+      artifact). Every corrupted page's ~185 line pointers uniformly
+      report `Length=37` with a constant 40-byte offset stride between
+      items — exactly `MAXALIGN(37)=40`, the alignment scheme
+      `PageAddHeapTuple` (heap.go) applies to HEAP tuples, NOT the
+      btree package's own deliberately-unaligned item layout. The
+      decoded opaque header is also structurally impossible for this
+      tree (`Level=262144`, `Flags=0x802` with an undefined `0x800` bit).
+      One item's key bytes were found to contain, byte-for-byte, the same
+      anomalous Prev/Next/Level/Flags/HighKeyLen quintuple as the page's
+      own opaque header. Leading hypothesis for next loop: heap-relation
+      content (or some other MAXALIGN'd foreign structure) is landing in
+      the index relation's on-disk blocks — materially narrower than any
+      prior row in this thread, but the write-path mechanism is not yet
+      located. Audited and cleared as NOT the mechanism: `Manager.relFile`
+      (correctly keyed per-RelFileNode, no cross-relation fd sharing);
+      `bufmap.go`'s Lookup/Insert/Delete (exact key match required, no
+      collision false-positive path); `PinNew`'s pinMu-released window
+      before `pinNewLocked`'s `slot.Lock()` (content there is a legitimate
+      blank page, not heap-shaped). NOT yet audited: the executor's
+      combined heap-insert + pkey-index-maintenance call site for a
+      shared/reused relation-identity bug under concurrency; whether
+      logical change-record WAL emission/replay could cross-contaminate.
+      All instrumentation reverted this loop (`git status` clean except
+      ledger/fix_plan/working_set). Next step: reconstruct the dump
+      helper (full source in the ledger row), re-run the repro, and
+      byte-compare the item content against `heap.go`'s actual heap-tuple
+      marshal output for a `pgbench_accounts` row — a match is the
+      smoking-gun confirmation.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
