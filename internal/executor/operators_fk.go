@@ -1808,6 +1808,36 @@ func checkDomainConstraintsForRow(ctx *Context, cols []catalog.Column, row Row) 
 	return nil
 }
 
+// checkRowConstraintsForWrite enforces column NOT NULL, table CHECK, and
+// domain NOT NULL/CHECK constraints against a fully-materialized row before it
+// is written by an UPDATE (or upsert DO UPDATE). insertOp.Next already runs
+// this same trio inline for INSERT; UPDATE's several write paths
+// (updateOp.Next, updateViaIndex, updateWithFrom) previously ran none of them,
+// silently allowing NULLs into NOT NULL columns and values violating
+// CHECK/domain constraints on UPDATE. M0122-0005 follow-up (deferral ledger
+// 2026-07-06 "UPDATE enforces no table-level NOT NULL/CHECK constraints").
+// cols/tbl must describe the row's own ordinal layout (the destination
+// partition's columns for a partition-routed write, matching how
+// checkDomainConstraintsForRow is already called at INSERT's leaf-partition
+// site).
+func checkRowConstraintsForWrite(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row) error {
+	for i, col := range cols {
+		if col.NotNull && i < len(row) && row[i].IsNull() {
+			return &ExecError{
+				Code:    "23502",
+				Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, tbl.Name),
+				Detail:  formatRowForDetail(cols, row),
+			}
+		}
+	}
+	if len(tbl.CheckConstraints) > 0 {
+		if err := checkConstraints(ctx, tbl, row); err != nil {
+			return err
+		}
+	}
+	return checkDomainConstraintsForRow(ctx, cols, row)
+}
+
 // evalDomainCheckExpr evaluates a generic (non `VALUE IN (...)`) domain CHECK
 // predicate against a single coerced value, mirroring checkConstraints' mini-query
 // approach: `SELECT (expr) FROM (VALUES (value::basetype)) AS _chk(value)`. The

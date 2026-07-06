@@ -782,3 +782,84 @@ mirroring `insertOp.Next`'s ordering; PG oracle: `execMain.c`'s
 lands, thread the same two calls into `operators_upsert.go`'s
 `applyInsert`/`applyUpdate` (the `ON CONFLICT DO UPDATE` path bypasses
 `insertOp`/`updateOp` entirely).
+
+## Follow-up: UPDATE / upsert NOT NULL, CHECK, and domain constraint enforcement (2026-07-06, later loop)
+
+**Gap:** resolves both resume points from the previous follow-up. UPDATE (via
+any of its three independent write paths) and `INSERT ... ON CONFLICT` wrote
+the new row with zero NOT NULL / CHECK / domain constraint enforcement —
+verified live, `UPDATE t_pos SET p = -1` and `INSERT ... ON CONFLICT (id) DO
+UPDATE SET p = -1` both silently succeeded against a `CHECK (VALUE > 0)`
+domain column.
+
+**Fix:** factored the trio insertOp.Next already ran (NOT NULL loop +
+`checkConstraints` + `checkDomainConstraintsForRow`) into one shared
+`checkRowConstraintsForWrite(ctx, tbl, cols, row)`
+(`internal/executor/operators_fk.go`, beside `checkDomainConstraintsForRow`),
+and wired a call into every UPDATE/upsert write path in
+`internal/executor/operators_storage.go` / `operators_upsert.go`:
+
+- `updateOp.Next` — the SeqScan fallback.
+- `updateOp.updateViaIndex` — the B-tree point-lookup fast path chosen when
+  the WHERE clause matches a PK/unique index.
+- `updateOp.updateWithFrom` — `UPDATE ... FROM`.
+- `upsertOp.applyInsert` / `upsertOp.applyUpdate` — the plain-insert and
+  DO-UPDATE arms of `INSERT ... ON CONFLICT`, which never go through
+  `insertOp`/`updateOp` at all.
+
+Each of the three `updateOp` sites required checking the row **before**
+attempting `tryApplyHOTUpdate`, not only in the pre-existing `!used`
+(non-HOT) fallback branch: `hotUpdateEligible` is a plan-level decision (true
+whenever the SET list touches no indexed column) independent of whether the
+computed new value violates a constraint, so a HOT update — the common case
+for any UPDATE that doesn't touch an indexed column — would otherwise never
+reach the check at all.
+
+**Latent bug found via this loop's own test, fixed alongside:**
+`updateViaIndex`'s two write sites (the main B-tree scan and its EPQ-retry
+re-evaluation branch) each carried an "M0111-0001: restore columns that
+became null during decode→rebuild" loop:
+
+```go
+for i, c := range cols {
+    if c.GeneratedExpr == "" && newRow[i].IsNull() && !row[i].IsNull() {
+        newRow[i] = row[i]
+    }
+}
+```
+
+For any column with **no** SET expression, `newRow[i]` is assigned directly
+from `row[i]` a few lines above, so the two can never differ — meaning this
+loop can only ever fire on a column that **was** explicitly assigned by SET,
+which is exactly the one case it must not touch. The practical effect: `UPDATE
+t SET col = NULL WHERE <indexed-column> = x` silently reverted `col` to its
+old, non-NULL value on the indexed fast path only (the SeqScan and `UPDATE
+... FROM` paths never carried this workaround and were unaffected). This is
+what caused `TestUpdateViaIndexEnforcesNotNull` to initially fail with no
+error at all rather than the expected `23502` — the row never actually went
+NULL. Removed both occurrences; per `docs/design/README.md`, the underlying
+decode-format drift M0111-0001 was presumably compensating for was
+independently fixed by the later 0111-0002..0111-0007 codec-parity passes.
+
+**Known residual (not a regression, same shape as the pre-existing insertOp
+gap):** for a cross-partition-move UPDATE, the check runs against the
+*source* table (`pu.scanTbl` / `idxTbl` / `pu.tbl`), not the destination leaf
+partition, since the destination isn't resolved until after the
+HOT-eligibility gate the check must precede. `insertOp.Next` already has the
+same shape of gap — its CHECK-constraint check runs against the parent
+(pre-routing) table for every insert. A CHECK/domain constraint that exists
+only on a destination leaf partition (not the source/parent) would still go
+unenforced on a moving UPDATE; resolving it needs the HOT-eligibility gate
+restructured to resolve partition routing first, a larger, separately-scoped
+change.
+
+Tests: `internal/executor/update_constraint_enforcement_test.go` (new) — one
+test per independent write path:
+`TestUpdateSeqScanEnforcesNotNull`/`TestUpdateSeqScanEnforcesCheckConstraint`/
+`TestUpdateViaIndexEnforcesNotNull`/`TestUpdateFromEnforcesNotNull`/
+`TestUpsertInsertArmEnforcesCheckConstraint`/`TestUpsertUpdateArmEnforcesNotNull`.
+Gates: `go build ./...` clean; `go test ./internal/executor/...` full package
+PASS (no regressions, including from removing the M0111-0001 workaround);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `scripts/ralph-precommit-test.sh`
+PASS (full unit suite + pgbench TPC-B/simple-update/select-only smoke, 0
+failed transactions).

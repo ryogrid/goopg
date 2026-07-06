@@ -1,22 +1,28 @@
 (idle — nothing in flight)
 
-Loop #54 completed and committed/pushed: domain NOT NULL/CHECK constraint
-enforcement on INSERT (M0122-0005, closed deferral ledger row 542 from
-2026-07-06). New `checkDomainConstraintsForRow`/`evalDomainCheckExpr`
-(internal/executor/operators_fk.go), wired into insertOp.Next() (both
-non-partitioned and partitioned-leaf paths, operators_storage.go). CHECK now
-covers generic predicates (`CHECK (VALUE > 0)`) via a mini-query evaluator,
-not just the `VALUE IN (...)` fast path. Also fixed a latent
-StringValue()-vs-Format() bug (int-domain IN-checks always rejected every
-value). Verified against a real running server (all 3 ledger repro cases:
-nn_int/pos_int/small_num) + new unit tests + tpch-spotcheck (Q12=2/Q13=33).
+Loop #12 completed and committed: UPDATE / upsert NOT NULL, CHECK, and domain
+constraint enforcement (M0122-0005 follow-up, closes the 2026-07-06 deferral
+ledger row "UPDATE enforces no table-level NOT NULL/CHECK constraints at
+all"). New shared `checkRowConstraintsForWrite` (internal/executor/
+operators_fk.go), wired into all 3 updateOp write paths (Next/SeqScan,
+updateViaIndex, updateWithFrom) in operators_storage.go, plus upsertOp's
+applyInsert/applyUpdate in operators_upsert.go. Each updateOp site had to
+check BEFORE tryApplyHOTUpdate (hotUpdateEligible is plan-level, independent
+of constraint violations) — a check only in the "!used" branch would miss
+every HOT update. Also found+fixed a latent independent bug: updateViaIndex's
+"M0111-0001" restore-loop unconditionally reverted any explicit `SET col =
+NULL` back to the old value on the indexed fast path (removed both
+occurrences). New tests: internal/executor/update_constraint_enforcement_test.go
+(6 tests, one per write path). Verified: go build clean; full
+`go test ./internal/executor/...` PASS; tpch-spotcheck PASS (Q12=2/Q13=33);
+ralph-precommit-test.sh PASS (full suite + pgbench TPC-B/simple-update/
+select-only smoke, 0 failed). Design doc + README updated; ledger row
+appended (status=resolved) with one residual noted (cross-partition-move
+UPDATE checks source table not destination leaf — same shape as insertOp's
+pre-existing parent-level CHECK gap, bounded/deferred).
 
-Next candidate (pick ONE): the freshly recorded "UPDATE enforces no
-table-level NOT NULL/CHECK constraints at all" gap (deferral ledger
-2026-07-06 tail row — bigger than domains, affects every table; resume point:
-mirror insertOp.Next's NOT NULL + checkConstraints + checkDomainConstraintsForRow
-sequence into updateOp.Next/updateWithFrom in operators_storage.go, then
-operators_upsert.go's applyInsert/applyUpdate for the ON CONFLICT DO UPDATE
-path), or resume the M0110-0001 multi-database isolation survey (see
-fix_plan.md "Current Priority" banner), or survey .ralph/deferral_ledger.md
-for another fresh open (`status = -`) row.
+Next candidate (pick ONE): resume the M0110-0001 multi-database isolation
+survey (fix_plan.md "Current Priority" banner), or survey
+.ralph/deferral_ledger.md for another fresh open (`status = -`) row — e.g.
+the cross-partition-move residual just noted above, or the "views inline
+with no view-owner identity" RBAC gap noted under M0122-0008.

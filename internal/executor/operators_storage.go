@@ -3649,12 +3649,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		}
 		// Recompute GENERATED ALWAYS AS … STORED columns after SET. M0096-0008.
 		_ = computeGeneratedColumns(cols, newRow)
-		// M0111-0001: restore columns that became null during decode→rebuild.
-		for i, c := range cols {
-			if c.GeneratedExpr == "" && newRow[i].IsNull() && !row[i].IsNull() {
-				newRow[i] = row[i]
-			}
-		}
 		// WITH CHECK OPTION enforcement — see the identical check in the
 		// SeqScan path's per-row callback for the rationale.
 		if o.plan.ViewCheckQual != nil {
@@ -3717,6 +3711,15 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// row. M0118-0008 (detach-partition-concurrently-4).
 		if err := o.recheckChildFKs(fksToRecheckIdx, pu.newRow, idxTbl); err != nil {
 			return nil, err
+		}
+		// NOT NULL / CHECK / domain constraint enforcement on the finalized
+		// new row, before attempting either write path below (M0122-0005
+		// follow-up — UPDATE previously enforced none of these). Checked
+		// here — rather than only in the "!used" non-HOT branch further
+		// down — so a HOT update (which never reaches that branch) cannot
+		// bypass it.
+		if cerr := checkRowConstraintsForWrite(o.ctx, idxTbl, cols, pu.newRow); cerr != nil {
+			return nil, cerr
 		}
 		used := false
 		if hotEligible {
@@ -3873,12 +3876,6 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 						}
 					}
 					_ = computeGeneratedColumns(cols, pu.newRow)
-			// M0111-0001: restore columns that became null during decode→rebuild.
-			for i, c := range cols {
-				if c.GeneratedExpr == "" && pu.newRow[i].IsNull() && !pu.oldRow[i].IsNull() {
-					pu.newRow[i] = pu.oldRow[i]
-				}
-			}
 					pu.blk = newBlk
 					pu.slot = newSlot
 					continue // re-run loop to stamp xmax on new slot
@@ -4472,6 +4469,20 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		puCols := pu.cols
 		if puCols == nil {
 			puCols = cols
+		}
+		// NOT NULL / CHECK / domain constraint enforcement on the finalized
+		// new row, before attempting either write path below (M0122-0005
+		// follow-up — UPDATE previously enforced none of these). Checked here
+		// — rather than only in the "!used" non-HOT branch further down — so
+		// a HOT update (which never reaches that branch) cannot bypass it.
+		{
+			chkTblSeq := pu.scanTbl
+			if chkTblSeq == nil {
+				chkTblSeq = tbl
+			}
+			if cerr := checkRowConstraintsForWrite(o.ctx, chkTblSeq, puCols, pu.newRow); cerr != nil {
+				return nil, cerr
+			}
 		}
 		used := false
 		if hotEligibleSeq && puRel == rel {
@@ -5663,6 +5674,22 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 		// row. M0118-0008 (detach-partition-concurrently-4).
 		if err := o.recheckChildFKs(fksToRecheckFrom, pu.newRow, pu.tbl); err != nil {
 			return nil, err
+		}
+		// NOT NULL / CHECK / domain constraint enforcement on the finalized
+		// new row, before attempting either write path below (M0122-0005
+		// follow-up — UPDATE previously enforced none of these). Checked
+		// here — rather than only in the "!used" non-HOT branch further down
+		// — so a HOT update (which never reaches that branch) cannot bypass
+		// it. puCols/pu.tbl already describe the destination (partition-
+		// routed) relation's own column layout.
+		{
+			chkTblFrom := pu.tbl
+			if chkTblFrom == nil {
+				chkTblFrom = o.plan.Table
+			}
+			if cerr := checkRowConstraintsForWrite(o.ctx, chkTblFrom, puCols, pu.newRow); cerr != nil {
+				return nil, cerr
+			}
 		}
 		used := false
 		if hotEligible && puSrcRel == rel && puRel == rel {
