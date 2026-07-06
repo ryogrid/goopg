@@ -3143,6 +3143,26 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewTimeDatum(ts), nil
 		}
 		return d, nil
+	case "interval":
+		// Cast to interval: parse the v0-supported "<n> <unit>" string shape
+		// (unit ∈ day(s)/month(s)/year(s)), mirroring the `INTERVAL '<n>
+		// <unit>'` typed-literal grammar (evalIntervalLit/splitEmbeddedInterval)
+		// so `'<n> <unit>'::interval` and `CAST('<n> <unit>' AS interval)`
+		// accept exactly the same strings instead of silently passing the
+		// string through unparsed. Multi-component/sub-day interval strings
+		// remain a documented v0 scope limit. M0122-0004.
+		if d.Kind == KindInterval {
+			return d, nil
+		}
+		if d.Kind == KindString {
+			months, days, ok := parseIntervalCastString(d.StringValue())
+			if !ok {
+				return Datum{}, &ExecError{Code: "22007", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
+			}
+			return NewIntervalDatum(months, days), nil
+		}
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to interval"}
 	case "tid":
 		// Cast to tid: parse/validate "(block,offset)" and re-emit the
 		// canonical form. PostgreSQL's tidin treats block as an unsigned
@@ -5434,6 +5454,35 @@ func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		bucket = ((diff - stepDur + 1) / stepDur) * stepDur
 	}
 	return NewTimeDatum(origin.Add(bucket)), nil
+}
+
+// parseIntervalCastString parses a runtime interval-cast string (the
+// `::interval` / `CAST(... AS interval)` path, as opposed to the
+// parse-time `INTERVAL '...'` typed-literal syntax handled by
+// splitEmbeddedInterval/evalIntervalLit). Accepts the same "<n> <unit>"
+// shape (unit day(s)/month(s)/year(s), case-insensitive) since that is
+// the only interval grammar v0 supports; anything else fails so the
+// caller can raise 22007 rather than silently pass the string through.
+// M0122-0004.
+func parseIntervalCastString(s string) (months, days int32, ok bool) {
+	parts := strings.Fields(strings.TrimSpace(s))
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	n, err := strconv.ParseInt(parts[0], 10, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	switch strings.ToLower(strings.TrimSuffix(parts[1], "s")) {
+	case "day":
+		return 0, int32(n), true
+	case "month":
+		return int32(n), 0, true
+	case "year":
+		return int32(n) * 12, 0, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // evalIntervalLit parses the integer body of an `interval 'N' unit`

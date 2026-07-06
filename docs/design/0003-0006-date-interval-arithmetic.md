@@ -251,6 +251,50 @@ interval)` string parsing (this v0 interval type has no time-of-day
 component to parse into or format, so PG's `HH:MM:SS` suffix never
 appears except via the zero-interval special case above).
 
+## Follow-up: `CAST(... AS interval)` string parsing (M0122-0004, 2026-07-06)
+
+Closes the `CAST(... AS interval)` string-parsing gap the two follow-ups
+above both listed as still open. `evalCast` (`internal/executor/expr.go`) had
+no `"interval"` case at all, so `'3 days'::interval` / `CAST('3 days' AS
+interval)` fell to the function's final `return d, nil` ("pass-through for
+unknown types") — the value silently stayed a `KindString` holding the raw
+text instead of becoming a real `KindInterval`, so e.g. `now() +
+'3 days'::interval` would misbehave (adding a string to a timestamp, not an
+interval) instead of computing correctly or erroring cleanly.
+
+The new `"interval"` case accepts only the same "`<n> <unit>`" shape the
+`INTERVAL '<n> <unit>'` typed-literal grammar already supports (unit ∈
+day(s)/month(s)/year(s), case-insensitive) — deliberately not the full
+PostgreSQL `interval_in` grammar (multi-component strings, sub-day
+`HH:MM:SS`, ISO-8601 durations), which remains the documented "sub-day
+intervals" v0 scope limit this doc's "Out of scope" section already names.
+New `parseIntervalCastString(s string) (months, days int32, ok bool)`
+(`internal/executor/expr.go`, next to `evalIntervalLit`) mirrors
+`splitEmbeddedInterval`'s two-token split + `evalIntervalLit`'s
+unit-to-months/days mapping so the cast path and the typed-literal path
+accept exactly the same strings. An unparseable string raises `22007`
+("invalid input syntax for type interval"), matching real PostgreSQL's
+`interval_in` SQLSTATE for the same failure mode (verified: real PG raises
+`22007` for a garbage interval string too, even though v0's *accepted*
+grammar is narrower than upstream's).
+
+Tests: `internal/executor/interval_cast_test.go`
+(`TestIntervalCastFromString` — `::interval`/`CAST(...)` forms across
+day/month/year, singular/plural units, negative magnitudes, cross-checked
+against the equivalent `INTERVAL '<n>' <unit>` typed literal via
+`compareDatum`'s existing interval-ordering support;
+`TestIntervalCastFromStringInvalidSyntax` — garbage, unsupported unit, and
+two shapes real PG accepts but v0 deliberately doesn't yet
+(`'1 year 2 months'`, `'01:02:03'`) all raise `22007`). Gates: `go build
+./...` clean; `go test ./internal/executor/... ./internal/planner/...
+./internal/parser/... ./internal/analyzer/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+Still deferred, unchanged: sub-day interval units and multi-component
+interval strings (`'1 year 2 months 3 days'`, `'01:02:03'`) — both the typed
+literal and the cast path reject them identically now, so there is no
+remaining asymmetry between the two entry points for this v0 interval type.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

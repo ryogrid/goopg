@@ -1,0 +1,121 @@
+package executor
+
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
+)
+
+// runQueryErr mirrors runQuery but returns the first error encountered
+// (parse/plan/build/open/drain) instead of failing the test, so callers can
+// assert on the specific error produced by an intentionally-invalid query.
+func runQueryErr(t *testing.T, ctx *Context, sql string) ([]Row, error) {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	op, err := Build(plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := op.Open(ctx); err != nil {
+		return nil, err
+	}
+	rows, err := drainScan(op)
+	_ = op.Close()
+	return rows, err
+}
+
+// TestIntervalCastFromString pins the `::interval` / `CAST(... AS interval)`
+// runtime cast path (M0122-0004): before this fix, evalCast had no "interval"
+// case, so a string cast silently fell through to the generic pass-through
+// and stayed a KindString instead of becoming a real interval value (e.g.
+// arithmetic against it would misbehave instead of erroring or computing
+// correctly). The accepted grammar mirrors the existing `INTERVAL '<n>
+// <unit>'` typed-literal syntax (day/month/year only — sub-day and
+// multi-component interval strings remain a documented v0 scope limit).
+func TestIntervalCastFromString(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	scalarBool := func(sql string) bool {
+		t.Helper()
+		rows := runQuery(t, ctx, sql)
+		if len(rows) != 1 {
+			t.Fatalf("%s: got %d rows, want 1", sql, len(rows))
+		}
+		return rows[0][0].BoolValue()
+	}
+
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"SELECT '3 days'::interval = interval '3' day FROM t", true},
+		{"SELECT '1 year'::interval = interval '1' year FROM t", true},
+		{"SELECT '3 month'::interval = interval '3' month FROM t", true},
+		{"SELECT '3 months'::interval = interval '3' month FROM t", true},
+		{"SELECT '-1 day'::interval < interval '0' day FROM t", true},
+		{"SELECT CAST('90 day' AS interval) = interval '1' year FROM t", false},
+		{"SELECT CAST('90 day' AS interval) < interval '1' year FROM t", true},
+	}
+	for _, c := range cases {
+		t.Run(c.sql, func(t *testing.T) {
+			if got := scalarBool(c.sql); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestIntervalCastFromStringInvalidSyntax pins the 22007 error PostgreSQL's
+// interval_in raises for a string that isn't a valid interval body — v0
+// deliberately only accepts the single "<n> <unit>" shape, so anything else
+// (unsupported unit, multi-component strings, garbage) must error instead of
+// silently passing the raw string through unparsed.
+func TestIntervalCastFromStringInvalidSyntax(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (id int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatalf("INSERT: %v", err)
+	}
+
+	cases := []string{
+		"SELECT 'garbage'::interval FROM t",
+		"SELECT '1 fortnight'::interval FROM t",
+		"SELECT '1 year 2 months'::interval FROM t",
+		"SELECT '01:02:03'::interval FROM t",
+	}
+	for _, sql := range cases {
+		t.Run(sql, func(t *testing.T) {
+			_, err := runQueryErr(t, ctx, sql)
+			if err == nil {
+				t.Fatalf("%s: expected error, got none", sql)
+			}
+			if execErr, ok := err.(*ExecError); ok {
+				if execErr.Code != "22007" {
+					t.Errorf("%s: got SQLSTATE %s, want 22007", sql, execErr.Code)
+				}
+			} else {
+				t.Errorf("%s: expected *ExecError, got %T: %v", sql, err, err)
+			}
+		})
+	}
+}

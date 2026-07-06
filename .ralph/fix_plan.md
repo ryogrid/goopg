@@ -1609,9 +1609,31 @@ mirroring M0119's ledger `status` column.
       ./...` clean; `go test -count=1 ./internal/executor/...
       ./internal/planner/... ./internal/analyzer/... ./internal/parser/...`
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **`CAST(... AS interval)` string parsing landed (2026-07-06, loop
+      #19):** `evalCast` gained an `"interval"` case — previously entirely
+      absent, so `'3 days'::interval`/`CAST('3 days' AS interval)` fell to
+      the function's final pass-through and silently stayed a `KindString`
+      instead of a real `KindInterval`. New `parseIntervalCastString`
+      (`internal/executor/expr.go`, next to `evalIntervalLit`) accepts the
+      same "`<n> <unit>`" shape (day/month/year, case-insensitive,
+      singular/plural) the `INTERVAL '<n> <unit>'` typed-literal grammar
+      already supports, raising `22007` for anything else — matching real
+      PostgreSQL's `interval_in` SQLSTATE for invalid interval syntax, and
+      closing the specific asymmetry between the typed-literal and cast
+      entry points (both now reject sub-day/multi-component strings
+      identically). Tests: `internal/executor/interval_cast_test.go`
+      (`TestIntervalCastFromString`, `TestIntervalCastFromStringInvalidSyntax`).
+      Design: `docs/design/0003-0006-date-interval-arithmetic.md`'s new
+      "Follow-up: `CAST(... AS interval)` string parsing" section;
+      `docs/design/README.md` row extended; ledger row appended. Gates: `go
+      build ./...` clean; `go test ./internal/executor/...
+      ./internal/planner/... ./internal/parser/... ./internal/analyzer/...`
+      PASS (no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
       **Still open in this bucket:** RANGE/GROUPS window frame modes
       (documented v0 scope limit), combining window forms, sub-day
-      intervals, `CAST(... AS interval)` string parsing.
+      intervals + multi-component interval strings (both the typed-literal
+      and cast paths now reject them identically, but neither supports
+      them — v0's `KindInterval` Datum has no sub-day field at all).
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
