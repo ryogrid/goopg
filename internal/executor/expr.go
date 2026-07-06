@@ -10045,31 +10045,48 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{Kind: KindInt, Int: int64(cnt)}, nil
 	case "pg_typeof":
 		if len(x.Args) == 1 {
-			// Fast path: planner folded pg_typeof(expr) to a StringConst holding
-			// the pre-computed type name — return it without evaluating. M0097-0035.
+			var cat catalog.Catalog
+			if ctx != nil {
+				cat = ctx.Catalog
+			}
+			// pg_typeof's declared SQL return type is regtype, whose wire/
+			// binary representation IS the type's OID (mirrors regclass/
+			// regproc) — resolve the display name to its OID here rather than
+			// returning display text, so a further `::oid` cast is a plain
+			// identity reinterpretation instead of misparsing display text
+			// through oidin(). The wire/display layer (planner.exprType's
+			// FuncCall case + dispatch.go's typeOIDFor/appendTypedCellText)
+			// renders the OID back to the display name for a plain
+			// `SELECT pg_typeof(...)`. M0122-0005 pg_typeof()::oid follow-up.
+			//
+			// Fast path: planner folded pg_typeof(expr) to a StringConst
+			// holding the pre-computed type name — resolve it without
+			// evaluating. M0097-0035.
 			if sc, ok := x.Args[0].(*planner.StringConst); ok {
-				return NewStringDatum(sc.Value), nil
+				return NewIntDatum(int64(pgTypeofOIDForName(cat, sc.Value))), nil
 			}
 			// Runtime path: evaluate arg and map Datum kind to PG type name.
-			// KindString must map to "text" here (NOT return the string value).
+			// KindString must map to "text" here (NOT the string value).
 			v, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || v.IsNull() {
-				return NewStringDatum("unknown"), nil
+				return NewIntDatum(int64(pgTypeofOIDForName(cat, "unknown"))), nil
 			}
+			var typName string
 			switch v.Kind {
 			case KindString:
-				return NewStringDatum("text"), nil
+				typName = "text"
 			case KindInt:
-				return NewStringDatum("integer"), nil
+				typName = "integer"
 			case KindBool:
-				return NewStringDatum("boolean"), nil
+				typName = "boolean"
 			case KindNumeric:
-				return NewStringDatum("numeric"), nil
+				typName = "numeric"
 			case KindTime:
-				return NewStringDatum("timestamp without time zone"), nil
+				typName = "timestamp without time zone"
 			default:
-				return NewStringDatum("text"), nil
+				typName = "text"
 			}
+			return NewIntDatum(int64(pgTypeofOIDForName(cat, typName))), nil
 		}
 	case "format_type":
 		// format_type(oid, typemod) — returns the SQL name of a data type given
@@ -12202,6 +12219,67 @@ func userTypeOIDForName(cat catalog.Catalog, name string) (uint32, bool) {
 		return rt.MultirangeOID, true
 	}
 	return 0, false
+}
+
+// unknownPseudoTypeOID is pg_type's row OID for the "unknown" pseudo-type
+// (postgres/src/include/catalog/pg_type_d.h's UNKNOWNOID) — pg_typeof(NULL)
+// reports this, not any real type.
+const unknownPseudoTypeOID = 705
+
+// pgTypeofOIDForName resolves a PostgreSQL type display name (as produced by
+// planner.pgTypeofDisplayName, or this file's own Kind-to-name runtime
+// fallback above) to its pg_type OID, so pg_typeof() can return a regtype
+// value backed by the real OID instead of display text. Covers the quoted
+// `"char"`/OID-18 special case, the "unknown" pseudo-type, every built-in
+// type TypeNameToOID knows, and user-defined enum/domain/composite/range/
+// multirange types via a live catalog lookup (mirroring the `::regtype`
+// cast's own string->OID resolution). M0122-0005 pg_typeof()::oid follow-up.
+func pgTypeofOIDForName(cat catalog.Catalog, name string) uint32 {
+	if name == `"char"` {
+		return catalog.OIDChar
+	}
+	if strings.EqualFold(name, "unknown") {
+		return unknownPseudoTypeOID
+	}
+	if oid := catalog.TypeNameToOID(name); oid != catalog.OIDText || strings.EqualFold(name, "text") {
+		return oid
+	}
+	// TypeNameToOID falls back to OIDText for any name it doesn't
+	// recognize (the check above already handled genuine "text"), most
+	// likely a user-defined type — pgTypeofDisplayName's default case
+	// returns such a name unchanged (bare, unqualified).
+	if cat != nil {
+		if oid, ok := userTypeOIDForName(cat, strings.ToLower(name)); ok {
+			return oid
+		}
+	}
+	return catalog.OIDText
+}
+
+// RegtypeName renders a pg_type OID as PostgreSQL's canonical display name
+// (regtypeout/format_type_be), covering built-in types plus user-defined
+// enum/domain/composite/range/multirange types. Used by the wire-output
+// layer (internal/server/dispatch.go's appendTypedCellText) to render a
+// regtype-typed result column, e.g. pg_typeof()'s result or an
+// `<oid>::regtype` cast — mirrors RegprocName/RegprocedureName's role for
+// regproc/regprocedure. InvalidOid (0) renders "-", matching regtypeout.
+// M0122-0005 pg_typeof()::oid follow-up.
+func RegtypeName(cat catalog.Catalog, oid uint32) string {
+	if oid == 0 {
+		return "-"
+	}
+	if oid == unknownPseudoTypeOID {
+		return "unknown"
+	}
+	if name := oidToBuiltinTypeName(oid); name != "" {
+		return name
+	}
+	if cat != nil {
+		if uname, ok := userTypeNameForOID(cat, oid); ok {
+			return uname
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
 }
 
 // formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.

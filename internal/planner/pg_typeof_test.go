@@ -122,6 +122,22 @@ func TestPgTypeofCharDisambiguation(t *testing.T) {
 	}
 }
 
+// TestExprTypePgTypeofIsRegtype pins the M0122-0005 pg_typeof()::oid
+// follow-up: pg_typeof(expr)'s declared SQL return type is regtype (its
+// wire/binary representation is the type's OID, like regclass/regproc), not
+// the "unknown"/text default a plain FuncCall would otherwise get. This
+// feeds both the wire TypeOID (dispatch.go's typeOIDFor) and the cell
+// rendering (appendTypedCellText), and is what lets a further `::oid` cast
+// be a binary-compatible reinterpretation instead of misparsing display
+// text through oidin().
+func TestExprTypePgTypeofIsRegtype(t *testing.T) {
+	fc := &FuncCall{Name: "pg_typeof", Args: []Expr{&StringConst{Value: "integer"}}}
+	got := exprType(fc)
+	if got.Name != "regtype" {
+		t.Errorf("exprType(pg_typeof(...)) = %+v, want Name=\"regtype\"", got)
+	}
+}
+
 // TestResolvePolyAggOutputType verifies that user-defined aggregates with
 // anycompatible/anyelement SType resolve to the actual input-derived type
 // rather than retaining the polymorphic type name. M0097-0035.

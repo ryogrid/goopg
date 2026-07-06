@@ -9517,6 +9517,16 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: x.ReturnType}
 		}
 		switch strings.ToLower(x.Name) {
+		// pg_typeof(expr) declares SQL return type regtype, whose wire/
+		// binary representation is the type's OID (executor/expr.go's
+		// "pg_typeof" case now returns a KindInt OID Datum, not display
+		// text) — advertise the real TypeOID so a further `::oid` cast is a
+		// binary-compatible reinterpretation, and dispatch.go's
+		// typeOIDFor/appendTypedCellText render the OID back to the display
+		// name for a plain `SELECT pg_typeof(...)`. M0122-0005 pg_typeof()::oid
+		// follow-up.
+		case "pg_typeof":
+			return catalog.Type{Name: "regtype"}
 		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
 		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
 		case "float8", "double precision", "double", "float":

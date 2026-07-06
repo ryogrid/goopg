@@ -2682,6 +2682,15 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			}
 		}
 		return d.AppendValueText(dst)
+	case "regtype":
+		// OID values with type regtype display as type names (regtypeout),
+		// matching a direct SELECT of pg_typeof(...) or an <oid>::regtype
+		// cast. Mirrors the regclass/regproc cases above. M0122-0005
+		// pg_typeof()::oid follow-up.
+		if d.Kind == executor.KindInt {
+			return append(dst, executor.RegtypeName(s.cfg.Catalog, uint32(d.Int))...)
+		}
+		return d.AppendValueText(dst)
 	default:
 		return d.AppendValueText(dst)
 	}
@@ -2880,6 +2889,10 @@ func typeOIDFor(t catalog.Type) uint32 {
 		return 1700
 	case "pg_lsn":
 		return 3220
+	case "regtype":
+		// pg_typeof()'s declared SQL return type; also `<oid>::regtype`/
+		// `<name>::regtype` casts. M0122-0005 pg_typeof()::oid follow-up.
+		return catalog.OIDRegtype
 	}
 	return 25
 }

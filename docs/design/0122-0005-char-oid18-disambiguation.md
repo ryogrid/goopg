@@ -218,3 +218,93 @@ Gates: `go build ./...` clean; `go test ./internal/executor/...
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33); `make ralph-state-guard`
 OK (after auto-repair of a stale status/progress marker unrelated to this
 change).
+
+## Follow-up: `pg_typeof(...)::oid` cast (2026-07-06)
+
+Closes deferred item (2) from the original 2026-07-05 row: `pg_typeof(1)::oid`
+(and every other type, not just `"char"`) raised `invalid input syntax for
+type oid: "..."` instead of returning the argument's real pg_type OID.
+
+**Root cause:** PostgreSQL declares `pg_typeof()`'s SQL return type as
+`regtype`, and `regtype`'s C-level representation *is* an `Oid` — real PG's
+`pg_typeof(x)::oid` is a binary-coercible relabeling cast (no parsing
+involved at all), exactly like the pre-existing `regclass`/`regproc` values
+this codebase already represents as a `KindInt` OID internally (only
+rendered to a name string at wire-output time — see the `regclass`/`regproc`
+cases in `internal/server/dispatch.go`'s `appendTypedCellText`).
+`internal/executor/expr.go`'s `"pg_typeof"` case instead returned a
+`KindString` holding the *display text* (e.g. `"integer"`), so a further
+`::oid` cast fell through to the generic `"oid"` cast branch and tried (and
+failed) to `strconv.ParseInt` the display name.
+
+**Fix:** made `pg_typeof()` evaluate to a `KindInt` Datum holding the
+resolved type's real OID, mirroring `regclass`/`regproc`'s existing
+representation, so `::oid` becomes the same identity pass-through those
+already get from the generic `"oid"` cast's `KindInt` branch — no change to
+that branch was needed.
+
+- New `internal/executor/expr.go` helper `pgTypeofOIDForName(cat, name)`
+  resolves a display name (as produced by `planner.pgTypeofDisplayName`'s
+  plan-time fold, or this same file's own Kind→name runtime fallback) to its
+  OID: the quoted `"char"` special case (OID 18), the `"unknown"`
+  pseudo-type (`UNKNOWNOID` = 705, per
+  `postgres/src/include/catalog/pg_type_d.h` — verified, not guessed), every
+  built-in name via the pre-existing `catalog.TypeNameToOID`, and
+  user-defined enum/domain/composite/range/multirange types via the
+  pre-existing `userTypeOIDForName` catalog lookup (the same one the
+  `::regtype` string→OID cast direction already uses).
+- Both the fast path (planner already folded the arg to a `StringConst`
+  holding the display name) and the runtime fallback path (Kind→name
+  mapping, used when the planner couldn't fold statically) now route through
+  `pgTypeofOIDForName` instead of returning the name directly.
+- New exported `internal/executor/expr.go` helper `RegtypeName(cat, oid)` is
+  the reverse (OID→display name) — built-ins via the pre-existing
+  `oidToBuiltinTypeName`, user types via `userTypeNameForOID`, `0`→`"-"`,
+  `705`→`"unknown"`. Mirrors `catalog.RegprocName`/`RegprocedureName`'s role
+  for the `regproc`/`regprocedure` wire-rendering cases.
+- `internal/planner/planner.go`'s `exprType`'s `*FuncCall` case gained a
+  `"pg_typeof"` branch returning `catalog.Type{Name: "regtype"}` (previously
+  fell through to the unknown/text default) — this is what feeds the
+  correct wire `TypeOID` and rendering function to a plain
+  `SELECT pg_typeof(...)` with no cast at all.
+- `internal/server/dispatch.go` gained a `"regtype"` case in both
+  `typeOIDFor` (reports `catalog.OIDRegtype` = 2206) and
+  `appendTypedCellText` (renders the `KindInt` OID back to its display name
+  via the new `executor.RegtypeName`), mirroring the pre-existing
+  `regclass`/`regproc` cases in the same two functions.
+
+Verified against a real running PostgreSQL 18.3 instance side-by-side (ports
+5545 goopg / 5546 real PG): `pg_typeof(1)::oid`,
+`pg_typeof(1.5)::oid`→1700, `pg_typeof('x'::text)::oid`→25,
+`pg_typeof(true)::oid`→16, `pg_typeof(NULL)::oid`→705,
+`pg_typeof(1::"char")::oid`→18, and `pg_typeof(count(*))::oid` (the
+M0097-0035 aggregate-fold path) all now resolve to the correct OID instead of
+erroring; a plain `SELECT pg_typeof(...)` (no cast) still displays the exact
+same text as before, and `\gdesc` now correctly reports the column's static
+type as `regtype`.
+
+**Newly observed, pre-existing, out of scope:** `userTypeNameForOID` (used
+by both this fix's `RegtypeName` and the pre-existing `::regtype` int→string
+CastExpr branch) unconditionally prefixes user-defined type names with
+`"public."`, diverging from real PG's `regtypeout`, which only schema-qualifies
+when the type isn't visible under the current `search_path` (mirroring the
+more careful `regObjectSchemaVisible` check already used by the
+`regproc`/`regoperator` paths). Reproduced identically via the pre-existing,
+untouched `'mood'::regtype` cast — not introduced or worsened by this fix,
+just newly exercised by a second call site. Recorded in the ledger, not
+fixed here (broader, cross-cutting schema-visibility change affecting every
+`userTypeNameForOID` caller, not a `pg_typeof`-specific follow-up).
+
+Tests: `internal/executor/pg_typeof_oid_test.go`'s `TestPgTypeofOIDCast`
+(builtin/numeric/text/bool/char/unknown OIDs) and
+`TestPgTypeofPlainDisplayUnaffected` (uncast display text unchanged);
+`internal/planner/pg_typeof_test.go`'s `TestExprTypePgTypeofIsRegtype`;
+`internal/server/regtype_output_test.go`'s `TestTypeOIDForRegtype` and
+`TestAppendTypedCellTextRegtypeRendersName` (invalid-OID/unknown/builtin/
+user-enum cases).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/server/... ./internal/catalog/...
+./internal/parser/...` all PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2, Q13=33); live side-by-side verification against real PostgreSQL
+18.3 (see above).

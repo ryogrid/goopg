@@ -652,6 +652,62 @@ M0110-0001 multi-database isolation survey above, or survey the deferral
 ledger for a fresh open (`status = -`) row — the bpchar/varchar
 typmod-truncation lead named above is now closed.
 
+**2026-07-06 (loop #16):** picked up the `pg_typeof(...)::oid` cast gap
+named in the 2026-07-05 OID-18-disambiguation row's deferred item (2)
+(unrelated to `"char"` specifically — it affected every type). Real PG
+declares `pg_typeof()`'s SQL return type as `regtype`, whose C-level
+representation IS an `Oid` — `pg_typeof(x)::oid` is a binary-coercible
+relabeling cast, not a text parse. `internal/executor/expr.go`'s
+`"pg_typeof"` case previously returned a `KindString` holding display text
+(e.g. `"integer"`), so `::oid` fell through to the generic `"oid"` cast
+branch and failed to `strconv.ParseInt` it. Fixed by making `pg_typeof()`
+evaluate to a `KindInt` Datum holding the argument's real OID, mirroring the
+pre-existing `regclass`/`regproc` representation (display text only
+rendered at wire-output time) — the existing generic `"oid"` cast's
+`KindInt` branch then handles `::oid` as a plain identity pass-through with
+no changes needed there. New `pgTypeofOIDForName`/`RegtypeName` helpers
+(`internal/executor/expr.go`) resolve name<->OID for the quoted `"char"`
+(OID 18) and `"unknown"` (`UNKNOWNOID`=705, verified via
+`postgres/src/include/catalog/pg_type_d.h`) special cases, every built-in
+(`catalog.TypeNameToOID`/`oidToBuiltinTypeName`), and user-defined
+enum/domain/composite/range/multirange types (the pre-existing
+`userTypeOIDForName`/`userTypeNameForOID` catalog lookups, same ones the
+`::regtype` cast's string<->OID direction already uses).
+`internal/planner/planner.go`'s `exprType`'s `*FuncCall` case gained a
+`"pg_typeof"` branch returning `catalog.Type{Name:"regtype"}` (previously
+fell through to the unknown/text default), feeding the correct wire TypeOID
+and rendering function to an uncast `SELECT pg_typeof(...)`.
+`internal/server/dispatch.go` gained matching `"regtype"` cases in
+`typeOIDFor`/`appendTypedCellText`, mirroring the pre-existing
+`regclass`/`regproc` cases. Verified live against a real running PostgreSQL
+18.3 instance side-by-side (ports 5545 goopg / 5546 real PG): builtin
+scalar types, `pg_typeof(NULL)::oid`→705, `pg_typeof(1::"char")::oid`→18,
+and the M0097-0035 `pg_typeof(count(*))::oid` aggregate-fold path all now
+resolve correctly; a plain uncast `SELECT pg_typeof(...)` still displays
+identical text to before, `\gdesc` now correctly reports the column's
+static type as `regtype`. Tests:
+`internal/executor/pg_typeof_oid_test.go` (`TestPgTypeofOIDCast`,
+`TestPgTypeofPlainDisplayUnaffected`),
+`internal/planner/pg_typeof_test.go`'s `TestExprTypePgTypeofIsRegtype`,
+`internal/server/regtype_output_test.go` (`TestTypeOIDForRegtype`,
+`TestAppendTypedCellTextRegtypeRendersName`). Design:
+`docs/design/0122-0005-char-oid18-disambiguation.md`'s new "Follow-up:
+`pg_typeof(...)::oid` cast" section; `docs/design/README.md` row extended;
+ledger row appended (status `-`). Gates: `go build ./...` clean; `go test
+./internal/executor/... ./internal/planner/... ./internal/server/...
+./internal/catalog/... ./internal/parser/...` all PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); live side-by-side
+verification against real PostgreSQL 18.3. **Newly deferred (ledger row,
+pre-existing, not introduced by this fix):** `userTypeNameForOID`
+unconditionally prefixes user-defined type names with `"public."`
+regardless of `search_path` visibility (reproduced identically via the
+untouched, pre-existing `'mood'::regtype` cast) — needs the same
+`regObjectSchemaVisible`-style check the `regproc`/`regoperator` paths
+already have, a separate, broader change. Next candidate: the view's-own-ACL
+gap from M0122-0008, the `userTypeNameForOID` schema-visibility gap just
+recorded, resume the M0110-0001 multi-database isolation survey above, or
+survey the deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
