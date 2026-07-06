@@ -388,16 +388,18 @@ func TestAlterDomainSetDropDefault(t *testing.T) {
 
 // TestAlterDomainUnmodelledFormsAreNoop guards a regression discovered while
 // implementing SET/DROP DEFAULT: the parser's shared "unmodelled ALTER
-// DOMAIN form" fallback (SET/DROP NOT NULL, SET SCHEMA — none of which
-// goopg tracks yet) used to return a bare, nameless *parser.AlterTableStmt,
-// which the executor's generic ALTER TABLE path tried to resolve as a
-// relation lookup and rejected with a spurious 42P01 "relation \"\" does not
-// exist" — even though the statement was meant to be a harmless no-op, same
-// as every other not-yet-modelled ALTER ... tail in this file. The same
-// fallback shape (return &AlterTableStmt{pos} with no Name) existed at 12
-// sites across internal/parser/ddl.go for other ALTER object kinds; this
-// test pins the ALTER DOMAIN instance of the fix (routing through
-// CompatNoopStmt instead, which short-circuits before any lookup).
+// DOMAIN form" fallback (SET SCHEMA — the last form goopg doesn't track yet)
+// used to return a bare, nameless *parser.AlterTableStmt, which the
+// executor's generic ALTER TABLE path tried to resolve as a relation lookup
+// and rejected with a spurious 42P01 "relation \"\" does not exist" — even
+// though the statement was meant to be a harmless no-op, same as every other
+// not-yet-modelled ALTER ... tail in this file. The same fallback shape
+// (return &AlterTableStmt{pos} with no Name) existed at 12 sites across
+// internal/parser/ddl.go for other ALTER object kinds; this test pins the
+// ALTER DOMAIN instance of the fix (routing through CompatNoopStmt instead,
+// which short-circuits before any lookup). SET/DROP NOT NULL used to be
+// covered here too, until the SET/DROP NOT NULL follow-up gave them real
+// behavior — see TestAlterDomainSetDropNotNull.
 func TestAlterDomainUnmodelledFormsAreNoop(t *testing.T) {
 	ctx, cat, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -410,12 +412,74 @@ func TestAlterDomainUnmodelledFormsAreNoop(t *testing.T) {
 	}
 
 	for _, sql := range []string{
-		`ALTER DOMAIN unmodelledtest_domain SET NOT NULL`,
-		`ALTER DOMAIN unmodelledtest_domain DROP NOT NULL`,
 		`ALTER DOMAIN unmodelledtest_domain SET SCHEMA other_schema`,
 	} {
 		if err := runDDL(t, ctx, sql); err != nil {
 			t.Errorf("%s: got error %v, want no-op success", sql, err)
 		}
+	}
+}
+
+// TestAlterDomainSetDropNotNull guards the SET/DROP NOT NULL follow-up:
+// `ALTER DOMAIN name SET NOT NULL` / `ALTER DOMAIN name DROP NOT NULL`.
+// Mirrors real PG's AlterDomainNotNull (toggles typnotnull) and
+// TestAlterDomainSetDropDefault's error-code conventions. Unlike real PG,
+// SET NOT NULL does not scan existing table columns of this domain type for
+// already-present NULL values — see SetDomainNotNull's doc comment — so this
+// test only asserts the flag toggle and its effect on freshly-inserted rows,
+// not a validation scan over pre-existing data.
+func TestAlterDomainSetDropNotNull(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE DOMAIN setnotnulltest_domain AS int`); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+	d, found := im.LookupDomain("setnotnulltest_domain")
+	if !found {
+		t.Fatal("domain not found via LookupDomain")
+	}
+	if d.NotNull {
+		t.Fatal("NotNull before SET NOT NULL = true, want false")
+	}
+
+	if err := runDDL(t, ctx, `ALTER DOMAIN setnotnulltest_domain SET NOT NULL`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... SET NOT NULL: %v", err)
+	}
+	if !d.NotNull {
+		t.Error("NotNull after SET NOT NULL = false, want true")
+	}
+
+	if err := runDDL(t, ctx, `ALTER DOMAIN setnotnulltest_domain DROP NOT NULL`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... DROP NOT NULL: %v", err)
+	}
+	if d.NotNull {
+		t.Error("NotNull after DROP NOT NULL = true, want false")
+	}
+
+	// DROP NOT NULL on a domain that isn't NOT NULL is a harmless no-op.
+	if err := runDDL(t, ctx, `ALTER DOMAIN setnotnulltest_domain DROP NOT NULL`); err != nil {
+		t.Errorf("ALTER DOMAIN ... DROP NOT NULL (already false) should not error: %v", err)
+	}
+
+	// An unknown domain raises 42704 for both forms.
+	err := runDDL(t, ctx, `ALTER DOMAIN nosuchdomain SET NOT NULL`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... SET NOT NULL on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+	err = runDDL(t, ctx, `ALTER DOMAIN nosuchdomain DROP NOT NULL`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... DROP NOT NULL on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
 	}
 }

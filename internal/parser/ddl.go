@@ -7866,19 +7866,18 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER SCHEMA"}, nil
 	}
-	// ALTER DOMAIN name RENAME TO newname / ALTER DOMAIN name OWNER TO role /
-	// ALTER DOMAIN name RENAME CONSTRAINT old TO new — the three ALTER DOMAIN
-	// forms goopg models so far. Previously "domain" fell entirely into the
-	// generic collation/domain/extension/... compat-stub loop below, a
-	// silent no-op for every form including these — the same class of gap
-	// ALTER SCHEMA's dedicated case (immediately above) closed for schemas.
-	// Every other AlterDomainStmt sub-form (SET/DROP DEFAULT, SET/DROP NOT
-	// NULL, ADD/DROP CONSTRAINT, SET SCHEMA) still falls through to a no-op
-	// below, matching this loop's bounded scope (deferral ledger 2026-07-06
-	// row). M0122-0005 (domain follow-up); RENAME CONSTRAINT added in a
-	// later follow-up (real PG's gram.y models it as a RenameStmt with
-	// renameType == OBJECT_DOMCONSTRAINT, not part of AlterDomainStmt, but
-	// goopg groups every ALTER DOMAIN form under one AST node).
+	// ALTER DOMAIN name RENAME TO newname / OWNER TO role / RENAME CONSTRAINT
+	// old TO new / ADD-DROP CONSTRAINT / SET-DROP DEFAULT / SET-DROP NOT
+	// NULL — the ALTER DOMAIN forms goopg models so far. Previously "domain"
+	// fell entirely into the generic collation/domain/extension/... compat-
+	// stub loop below, a silent no-op for every form including these — the
+	// same class of gap ALTER SCHEMA's dedicated case (immediately above)
+	// closed for schemas. Only SET SCHEMA still falls through to a no-op
+	// below. M0122-0005 (domain follow-up); RENAME CONSTRAINT/ADD-DROP
+	// CONSTRAINT/SET-DROP DEFAULT/SET-DROP NOT NULL added in later
+	// follow-ups (real PG's gram.y models RENAME CONSTRAINT as a RenameStmt
+	// with renameType == OBJECT_DOMCONSTRAINT, not part of AlterDomainStmt,
+	// but goopg groups every ALTER DOMAIN form under one AST node).
 	if p.acceptIdentKeyword("domain") {
 		name, err := p.parseObjectName()
 		if err != nil {
@@ -7962,20 +7961,27 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return addStmt, nil
 		}
 		if p.acceptKeyword(KwSet) {
-			// ALTER DOMAIN name SET DEFAULT expr — reuses parseExpr the same
-			// way CREATE DOMAIN's own DEFAULT clause does, so the stored AST
-			// round-trips through pg_dump identically either way. `SET` alone
-			// (without a following DEFAULT, e.g. `SET NOT NULL`) falls through
-			// to the generic no-op below — SET is already consumed by then,
-			// which is harmless since that loop just discards tokens to the
-			// statement terminator. M0122-0005 domain follow-up (SET/DROP
-			// DEFAULT).
+			// ALTER DOMAIN name SET DEFAULT expr / SET NOT NULL — reuses
+			// parseExpr the same way CREATE DOMAIN's own DEFAULT clause does,
+			// so the stored AST round-trips through pg_dump identically
+			// either way. `SET` alone (without a following DEFAULT/NOT NULL)
+			// falls through to the generic no-op below — SET is already
+			// consumed by then, which is harmless since that loop just
+			// discards tokens to the statement terminator. M0122-0005 domain
+			// follow-up (SET/DROP DEFAULT; SET/DROP NOT NULL added in a later
+			// follow-up).
 			if p.acceptKeyword(KwDefault) {
 				expr, err := p.parseExpr()
 				if err != nil {
 					return nil, err
 				}
 				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "setdefault", DefaultExpr: expr}, nil
+			}
+			if p.acceptKeyword(KwNot) {
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "setnotnull"}, nil
 			}
 		}
 		if p.acceptKeyword(KwDrop) {
@@ -8005,11 +8011,15 @@ func (p *parser) parseAlter() (Stmt, error) {
 				// ALTER DOMAIN name DROP DEFAULT. M0122-0005 domain follow-up.
 				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropdefault"}, nil
 			}
-			// DROP NOT NULL falls through to the generic no-op below — DROP
-			// is already consumed by then, same harmless-discard rationale as
-			// the SET branch above.
+			if p.acceptKeyword(KwNot) {
+				// ALTER DOMAIN name DROP NOT NULL. M0122-0005 domain follow-up.
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropnotnull"}, nil
+			}
 		}
-		// Unmodelled ALTER DOMAIN form (SET/DROP NOT NULL, SET SCHEMA) —
+		// Unmodelled ALTER DOMAIN form (SET SCHEMA) —
 		// consume to the terminator and return a no-op, mirroring the
 		// compat-stub loop's prior behavior for this statement family.
 		for p.cur().Kind != TokenEOF {

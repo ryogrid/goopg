@@ -863,3 +863,49 @@ PASS (no regressions, including from removing the M0111-0001 workaround);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `scripts/ralph-precommit-test.sh`
 PASS (full unit suite + pgbench TPC-B/simple-update/select-only smoke, 0
 failed transactions).
+
+## Follow-up: `ALTER DOMAIN ... SET NOT NULL` / `DROP NOT NULL` (2026-07-06, later loop)
+
+**Gap:** the last two ALTER DOMAIN sub-forms goopg's `AlterDomainStmt`
+production didn't model — `SET NOT NULL`/`DROP NOT NULL` fell through to the
+parser's generic "unmodelled ALTER DOMAIN form" no-op (same fallback SET
+SCHEMA still uses), so `domain.NotNull` could only ever be set at `CREATE
+DOMAIN` time. Now that domain `NOT NULL` is actually enforced at DML time
+(`checkDomainConstraintsForRow`, the follow-up two sections above), a
+post-CREATE toggle has a real, observable effect worth wiring up.
+
+**Fix:** `internal/parser/ddl.go`'s domain branch of `parseAlter` gained a
+`p.acceptKeyword(KwNot)` arm inside both the existing `SET` and `DROP`
+sub-branches (mirroring the real `gram.y` `AlterDomainStmt` production's
+`SET NOT NULL`/`DROP NOT NULL` alternatives), producing
+`AlterDomainStmt{Action: "setnotnull"}` / `{Action: "dropnotnull"}`. New
+`catalog.InMemory.SetDomainNotNull(name string, notNull bool) bool` (mirrors
+`SetDomainDefault`'s shape) toggles `Domain.NotNull` in place;
+`execAlterDomain` (`internal/executor/operators_ddl.go`) gained the matching
+two switch cases, both raising `42704` for an unknown domain like every
+sibling case.
+
+**Deliberate simplification (matches existing goopg precedent, not a new
+gap):** real PG's `AlterDomainNotNull` (`typecmds.c`) validates SET NOT NULL
+against every existing table column of the domain type via
+`validateDomainNotNullConstraint`'s cross-table walk, raising `23502` if any
+already-stored value is NULL. goopg's `SetDomainNotNull` does not perform
+this scan — it only flips the in-memory flag, which the DML-time
+`checkDomainConstraintsForRow` enforcement layer then applies to *future*
+writes. This exactly mirrors the simplification goopg's own `ALTER TABLE
+... ALTER COLUMN SET NOT NULL` already makes for plain (non-domain) columns
+(`internal/executor/operators_ddl.go`'s `AlterTableSetNotNull` case never
+scans existing rows either) — so this follow-up is consistent with, not a
+regression from, established behavior. Also unchanged: no restart
+persistence (no ALTER DOMAIN sub-form WAL-logs yet, see the "domain restart
+persistence" follow-up above's resume point 2), and `SET SCHEMA` (needs a new
+`Domain.Schema` field, still undecided).
+
+Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainSetDropNotNull` (flag toggle both directions, idempotent
+DROP NOT NULL, unknown-domain 42704 for both forms);
+`TestAlterDomainUnmodelledFormsAreNoop` narrowed to just `SET SCHEMA` now
+that `SET`/`DROP NOT NULL` have real behavior. Gates: `go build ./...`
+clean; `go test ./internal/catalog/... ./internal/executor/...
+./internal/parser/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33).

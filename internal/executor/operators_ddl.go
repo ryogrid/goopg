@@ -18389,13 +18389,13 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	return nil
 }
 
-// execAlterDomain drives the three `ALTER DOMAIN` forms goopg models so far —
-// RENAME TO, OWNER TO, and RENAME CONSTRAINT — mirroring execAlterSchema's
-// Action-switch shape. Every other AlterDomainStmt sub-form (SET/DROP
-// DEFAULT, SET/DROP NOT NULL, ADD/DROP CONSTRAINT, SET SCHEMA) is parsed as a
-// no-op (see parseAlter's "domain" branch) and never reaches here. M0122-0005
-// (domain follow-up, closing the ledger's "ALTER DOMAIN wholly unparsed" gap
-// for RENAME TO/OWNER TO); RENAME CONSTRAINT added in a later follow-up.
+// execAlterDomain drives every ALTER DOMAIN form goopg models — RENAME TO,
+// OWNER TO, RENAME CONSTRAINT, ADD/DROP CONSTRAINT, SET/DROP DEFAULT, and
+// SET/DROP NOT NULL — mirroring execAlterSchema's Action-switch shape. Only
+// SET SCHEMA is still parsed as a no-op (see parseAlter's "domain" branch)
+// and never reaches here. M0122-0005 (domain follow-up, closing the ledger's
+// "ALTER DOMAIN wholly unparsed" gap for RENAME TO/OWNER TO); every other
+// case added in later follow-ups.
 func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -18460,6 +18460,20 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		return nil
 	case "dropdefault":
 		if !cat.SetDomainDefault(s.Name, nil) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "setnotnull":
+		// SET NOT NULL — unlike real PG's AlterDomainNotNull, this does not
+		// scan existing table columns of this domain type for already-present
+		// NULL values (validateDomainNotNullConstraint's cross-table walk);
+		// see SetDomainNotNull's doc comment. M0122-0005 domain follow-up.
+		if !cat.SetDomainNotNull(s.Name, true) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "dropnotnull":
+		if !cat.SetDomainNotNull(s.Name, false) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
 		}
 		return nil

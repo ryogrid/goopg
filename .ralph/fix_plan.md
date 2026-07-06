@@ -1725,6 +1725,33 @@ mirroring M0119's ledger `status` column.
       function-based cast dumping, ALTER TYPE RENAME/OWNER, domain CHECK
       renderer, `pg_ts_config` OIDs) has landed or was verified already
       resolved.
+
+      **2026-07-06 (loop #50, ALTER DOMAIN sub-form thread continued under
+      the same M0122-0005 tag):** landed `ALTER DOMAIN ... SET NOT NULL` /
+      `DROP NOT NULL` — the last remaining named sub-form besides `SET
+      SCHEMA`. New `catalog.InMemory.SetDomainNotNull` toggles
+      `Domain.NotNull`; `parser.AlterDomainStmt` gained `"setnotnull"`/
+      `"dropnotnull"` actions (mirrors real `gram.y`'s `AlterDomainStmt` SET/
+      DROP NOT NULL alternatives); `execAlterDomain` gained the matching
+      cases, both `42704` for an unknown domain. Since domain `NOT NULL` is
+      already enforced at DML time (`checkDomainConstraintsForRow`, an
+      earlier loop), the toggle has real effect on future writes.
+      Deliberately does not scan existing table columns for already-present
+      NULLs (real PG's `validateDomainNotNullConstraint`) — mirrors goopg's
+      own pre-existing `ALTER TABLE ... SET NOT NULL` simplification, not a
+      new gap. Tests: `TestAlterDomainSetDropNotNull`; narrowed
+      `TestAlterDomainUnmodelledFormsAreNoop` to just `SET SCHEMA`. See
+      `docs/design/0122-0005-alter-type-owner-rename.md`'s new "Follow-up:
+      `ALTER DOMAIN ... SET NOT NULL` / `DROP NOT NULL`" section and the
+      matching deferral ledger row. Gates: `go build ./...` clean; `go test
+      ./internal/catalog/... ./internal/executor/... ./internal/parser/...`
+      PASS (no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      Only `SET SCHEMA` remains unparsed for `ALTER DOMAIN` (needs a new
+      `Domain.Schema` field decision); no `ALTER DOMAIN` sub-form WAL-logs
+      yet (restart persistence gap, unchanged from prior rows). Next
+      candidate: resume the M0110-0001 multi-database isolation survey
+      above, pick up `Domain.Schema`/`SET SCHEMA`, or survey the deferral
+      ledger for a fresh open (`status = -`) row.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
       restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.

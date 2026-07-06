@@ -18741,6 +18741,26 @@ func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
 	return true
 }
 
+// SetDomainNotNull sets or clears a domain's NOT NULL flag (`ALTER DOMAIN
+// name SET NOT NULL` / `DROP NOT NULL`), mirroring AlterDomainNotNull.
+// Returns false if no such domain is registered. Unlike real PG's
+// AlterDomainNotNull, SET NOT NULL does not scan existing table columns of
+// this domain type for NULL values already present (validateDomainNotNull
+// Constraint's cross-table walk) — the same simplification goopg's
+// ALTER TABLE ... SET NOT NULL already makes for plain columns. M0122-0005
+// domain follow-up (SET/DROP NOT NULL).
+func (c *InMemory) SetDomainNotNull(name string, notNull bool) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return false
+	}
+	d.NotNull = notNull
+	return true
+}
+
 // TablesWithColumnOfType returns all non-virtual tables that have at least one
 // column whose declared type name matches typeName (case-insensitive). Used by
 // execDropDomain to detect dependent objects before dropping. M0097-0023.
