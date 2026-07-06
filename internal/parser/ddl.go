@@ -7860,22 +7860,39 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
-	// ALTER DOMAIN name RENAME TO newname / ALTER DOMAIN name OWNER TO role —
-	// the two ALTER DOMAIN forms goopg models so far. Previously "domain" fell
-	// entirely into the generic collation/domain/extension/... compat-stub
-	// loop below, a silent no-op for every form including these two — the
-	// same class of gap ALTER SCHEMA's dedicated case (immediately above)
-	// closed for schemas. Every other AlterDomainStmt sub-form (SET/DROP
-	// DEFAULT, SET/DROP NOT NULL, ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET
-	// SCHEMA) still falls through to a no-op below, matching this loop's
-	// bounded scope (deferral ledger 2026-07-06 row). M0122-0005 (domain
-	// follow-up).
+	// ALTER DOMAIN name RENAME TO newname / ALTER DOMAIN name OWNER TO role /
+	// ALTER DOMAIN name RENAME CONSTRAINT old TO new — the three ALTER DOMAIN
+	// forms goopg models so far. Previously "domain" fell entirely into the
+	// generic collation/domain/extension/... compat-stub loop below, a
+	// silent no-op for every form including these — the same class of gap
+	// ALTER SCHEMA's dedicated case (immediately above) closed for schemas.
+	// Every other AlterDomainStmt sub-form (SET/DROP DEFAULT, SET/DROP NOT
+	// NULL, ADD/DROP CONSTRAINT, SET SCHEMA) still falls through to a no-op
+	// below, matching this loop's bounded scope (deferral ledger 2026-07-06
+	// row). M0122-0005 (domain follow-up); RENAME CONSTRAINT added in a
+	// later follow-up (real PG's gram.y models it as a RenameStmt with
+	// renameType == OBJECT_DOMCONSTRAINT, not part of AlterDomainStmt, but
+	// goopg groups every ALTER DOMAIN form under one AST node).
 	if p.acceptIdentKeyword("domain") {
 		name, err := p.parseObjectName()
 		if err != nil {
 			return nil, err
 		}
 		if p.acceptIdentKeyword("rename") {
+			if p.acceptKeyword(KwConstraint) {
+				oldNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.expectKeyword(KwTo); err != nil {
+					return nil, err
+				}
+				newConNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "renameconstraint", ConstraintName: identText(oldNameTok), NewConstraintName: identText(newConNameTok)}, nil
+			}
 			if _, err := p.expectKeyword(KwTo); err != nil {
 				return nil, err
 			}
@@ -7902,9 +7919,9 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return ownerStmt, nil
 		}
 		// Unmodelled ALTER DOMAIN form (SET/DROP DEFAULT, SET/DROP NOT NULL,
-		// ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET SCHEMA) — consume to the
-		// terminator and return a no-op, mirroring the compat-stub loop's
-		// prior behavior for this statement family.
+		// ADD/DROP CONSTRAINT, SET SCHEMA) — consume to the terminator and
+		// return a no-op, mirroring the compat-stub loop's prior behavior for
+		// this statement family.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

@@ -307,3 +307,62 @@ would be dead code until domain *definitions* themselves survive a restart
 first — that is a materially larger, separate task (the domain analogue of
 the enum/composite restart-durability gap noted in the original Deferred
 section above), not a follow-up to this one.
+
+## Follow-up: `ALTER DOMAIN ... RENAME CONSTRAINT` (2026-07-06, later loop)
+
+Closes one more of the "rest" sub-forms named above:
+`ALTER DOMAIN name RENAME CONSTRAINT old TO new`. Unlike the domain's other
+sub-forms, real PostgreSQL does **not** model this under `AlterDomainStmt` in
+`gram.y` at all — `RENAME CONSTRAINT` on a domain shares the generic
+`RenameStmt` production with `renameType = OBJECT_DOMCONSTRAINT`
+(`postgres/src/backend/parser/gram.y` line ~9436), resolved at execution time
+by `RenameConstraint`'s `stmt->renameType == OBJECT_DOMCONSTRAINT` branch
+(`postgres/src/backend/commands/tablecmds.c`), which calls
+`get_domain_constraint_oid`/`RenameConstraintById`
+(`postgres/src/backend/catalog/pg_constraint.c`). goopg groups every `ALTER
+DOMAIN` sub-form under the one `AlterDomainStmt` AST node instead (simpler
+given the existing `Action`-switch shape), so this is modelled as a third
+`Action` value rather than a new statement type.
+
+1. **Parser**: `parser.AlterDomainStmt` gains `ConstraintName`/
+   `NewConstraintName` (for `Action == "renameconstraint"`). The "domain"
+   branch's existing `if p.acceptIdentKeyword("rename")` arm now checks for a
+   following `CONSTRAINT` keyword (`p.acceptKeyword(KwConstraint)` — a real
+   lexer keyword, not an identifier, unlike `"rename"`/`"owner"`/`"domain"`
+   themselves) before falling into the plain `RENAME TO` parse, and if found
+   parses `old_name TO new_name`.
+2. **Catalog**: new `InMemory.RenameDomainConstraint(domainName, oldName,
+   newName string) error`, mirroring PG's exact two error messages so the
+   executor can distinguish them by content: `"constraint %q for domain %s
+   does not exist"` (covers both an unknown domain and an unknown constraint
+   name on an existing one — `get_domain_constraint_oid`'s `missing_ok=false`
+   path) and `"constraint %q for domain %s already exists"` (collision with
+   another `CHECK` already on the same domain — `RenameConstraintById`'s
+   `ConstraintNameIsUsed(CONSTRAINT_DOMAIN, ...)` guard). Domains have no
+   separate constraint-name index (`Domain.Checks []DomainCheck` is a plain
+   slice), so both lookups are linear scans, consistent with
+   `domainCheckNameTaken`'s existing style.
+3. **Executor**: `execAlterDomain`'s switch gains a `"renameconstraint"` case
+   that maps the error to `42704` (`ERRCODE_UNDEFINED_OBJECT`) by default,
+   `42710` (`ERRCODE_DUPLICATE_OBJECT`) when the message contains "already
+   exists" — this exactly matches real PG's two distinct error codes for this
+   statement (unlike the `RENAME TO`/`OWNER TO` follow-up above, which
+   collapsed both cases to `42710` for consistency with the range-type/enum
+   precedent; `RENAME CONSTRAINT` had no such precedent to match, so it
+   follows real PG directly instead).
+
+Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainRenameConstraint` — renames one of two named `CHECK`s
+declared at `CREATE DOMAIN` time (multi-CHECK, DU-002 slice 385; `ALTER
+DOMAIN ADD CONSTRAINT` itself is still unimplemented, so the second CHECK
+needed for the collision case has to come from `CREATE DOMAIN`), asserts the
+renamed check's expression and its sibling are otherwise untouched, and
+covers all three failure modes (unknown constraint → `42704`, unknown domain
+→ `42704`, name collision → `42710`). Gates: `go build ./...` clean; `go test
+./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/planner/... ./internal/server/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+**Still deferred:** `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, `ADD`/`DROP
+CONSTRAINT`, `SET SCHEMA` remain no-ops, and domain restart persistence is
+still entirely unbuilt (both unchanged from the note above).

@@ -374,6 +374,44 @@ candidate: resume the M0110-0001 multi-database isolation survey above, pick
 up one of the ALTER DOMAIN sub-forms, or survey the deferral ledger for a
 fresh open (`status = -`) row.
 
+**2026-07-06 (loop #49):** picked up the `RENAME CONSTRAINT` sub-form named
+above — `ALTER DOMAIN name RENAME CONSTRAINT old TO new`. Real PG models this
+via the generic `RenameStmt`/`OBJECT_DOMCONSTRAINT` production (not
+`AlterDomainStmt`'s own `gram.y` production), but goopg adds it as a third
+`AlterDomainStmt.Action` value (`"renameconstraint"`) instead of a new
+statement type, reusing the existing Action-switch shape. New
+`ConstraintName`/`NewConstraintName` fields on `parser.AlterDomainStmt`; the
+domain branch's RENAME handling in `parseAlter` (`internal/parser/ddl.go`)
+now checks for a following `CONSTRAINT` keyword before the plain `RENAME TO`
+parse (needed `p.acceptKeyword(KwConstraint)`, not `acceptIdentKeyword` —
+`CONSTRAINT` is a real lexer keyword). New
+`catalog.InMemory.RenameDomainConstraint` (linear scan over
+`Domain.Checks`, mirrors real PG's two exact error messages);
+`execAlterDomain`'s new case maps them to `42704`/`42710` matching real PG's
+`get_domain_constraint_oid`/`RenameConstraintById` directly (no prior
+same-loop precedent to collapse against, unlike RENAME TO/OWNER TO's
+42710-for-both simplification). Tests:
+`internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainRenameConstraint` (rename preserves the sibling CHECK +
+expression; unknown-constraint/unknown-domain both 42704; name-collision
+42710 — the collision fixture uses two named CHECKs declared at `CREATE
+DOMAIN` time, since `ALTER DOMAIN ADD CONSTRAINT` itself is still
+unimplemented). See `docs/design/0122-0005-alter-type-owner-rename.md`'s new
+"Follow-up: `ALTER DOMAIN ... RENAME CONSTRAINT`" section and the matching
+ledger row. Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33). Remaining `ALTER DOMAIN` sub-forms: `SET`/`DROP
+DEFAULT`, `SET`/`DROP NOT NULL` (needs a `checkDomainNotNull`-style
+cross-table scan, feature-sized), `ADD`/`DROP CONSTRAINT` (`ADD` could likely
+reuse the existing `AddDomainCheck` catalog method modulo real PG's
+existing-data validation step), `SET SCHEMA` (domains have no `Schema`
+field at all today — unclear whether to add one or treat as a no-op like the
+flat catalog does elsewhere). Domain restart persistence is still entirely
+unbuilt. Next candidate: resume the M0110-0001 multi-database isolation
+survey above, pick up one of the remaining ALTER DOMAIN sub-forms, or survey
+the deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

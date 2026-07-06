@@ -18524,6 +18524,42 @@ func (c *InMemory) RenameDomain(oldName, newName string) error {
 	return nil
 }
 
+// RenameDomainConstraint renames one of a domain's CHECK constraints
+// (`ALTER DOMAIN name RENAME CONSTRAINT old TO new`), mirroring real PG's
+// rename_constraint_internal's domain branch (get_domain_constraint_oid +
+// RenameConstraintById): "constraint %q for domain %s does not exist" when
+// oldName isn't found (also covers an unknown domain), "constraint %q for
+// domain %s already exists" when newName collides with another CHECK already
+// on the same domain. M0122-0005 domain follow-up (RENAME CONSTRAINT).
+func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string) error {
+	k := strings.ToLower(domainName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return fmt.Errorf("constraint %q for domain %s does not exist", oldName, domainName)
+	}
+	idx := -1
+	for i, ck := range d.Checks {
+		if ck.Name == oldName {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return fmt.Errorf("constraint %q for domain %s does not exist", oldName, d.Name)
+	}
+	if oldName != newName {
+		for _, ck := range d.Checks {
+			if ck.Name == newName {
+				return fmt.Errorf("constraint %q for domain %s already exists", newName, d.Name)
+			}
+		}
+	}
+	d.Checks[idx].Name = newName
+	return nil
+}
+
 // SetDomainOwner records the typowner role OID for an existing domain.
 // Returns false if no such domain is registered. Mirrors
 // SetRangeTypeOwner/SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (domain

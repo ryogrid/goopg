@@ -18333,13 +18333,13 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	return nil
 }
 
-// execAlterDomain drives the two `ALTER DOMAIN` forms goopg models so far —
-// RENAME TO and OWNER TO — mirroring execAlterSchema's Action-switch shape.
-// Every other AlterDomainStmt sub-form (SET/DROP DEFAULT, SET/DROP NOT NULL,
-// ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET SCHEMA) is parsed as a no-op
-// (see parseAlter's "domain" branch) and never reaches here. M0122-0005
+// execAlterDomain drives the three `ALTER DOMAIN` forms goopg models so far —
+// RENAME TO, OWNER TO, and RENAME CONSTRAINT — mirroring execAlterSchema's
+// Action-switch shape. Every other AlterDomainStmt sub-form (SET/DROP
+// DEFAULT, SET/DROP NOT NULL, ADD/DROP CONSTRAINT, SET SCHEMA) is parsed as a
+// no-op (see parseAlter's "domain" branch) and never reaches here. M0122-0005
 // (domain follow-up, closing the ledger's "ALTER DOMAIN wholly unparsed" gap
-// for these two forms).
+// for RENAME TO/OWNER TO); RENAME CONSTRAINT added in a later follow-up.
 func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -18362,6 +18362,15 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 		}
 		if !cat.SetDomainOwner(s.Name, ownerOID) {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "renameconstraint":
+		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName); err != nil {
+			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain/constraint, matches real PG
+			if strings.Contains(err.Error(), "already exists") {
+				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG
+			}
+			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 		}
 		return nil
 	}

@@ -2655,19 +2655,21 @@ type AlterSchemaStmt struct {
 func (s *AlterSchemaStmt) Pos() int  { return s.pos }
 func (s *AlterSchemaStmt) stmtNode() {}
 
-// AlterDomainStmt — ALTER DOMAIN name RENAME TO newname / OWNER TO role. Real
-// PostgreSQL's AlterDomainStmt production covers more sub-forms (SET/DROP
-// DEFAULT, SET/DROP NOT NULL, ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET
-// SCHEMA) — only RENAME TO / OWNER TO are modelled so far (M0122-0005 domain
-// follow-up); everything else still parses as a no-op (see parseAlter's
-// "domain" branch).
+// AlterDomainStmt — ALTER DOMAIN name RENAME TO newname / OWNER TO role /
+// RENAME CONSTRAINT old TO new. Real PostgreSQL's AlterDomainStmt production
+// covers more sub-forms (SET/DROP DEFAULT, SET/DROP NOT NULL, ADD/DROP
+// CONSTRAINT, SET SCHEMA) — those still parse as a no-op (see parseAlter's
+// "domain" branch). M0122-0005 domain follow-up (RENAME TO/OWNER TO); RENAME
+// CONSTRAINT added in a later follow-up.
 type AlterDomainStmt struct {
 	pos  int
 	Name string
-	// Action selects the form: "rename" | "owner".
-	Action   string
-	NewName  string // for Action == "rename"
-	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER SCHEMA
+	// Action selects the form: "rename" | "owner" | "renameconstraint".
+	Action            string
+	NewName           string // for Action == "rename"
+	NewOwner          string // for Action == "owner"; "current_user" sentinel like ALTER SCHEMA
+	ConstraintName    string // for Action == "renameconstraint": the existing constraint name
+	NewConstraintName string // for Action == "renameconstraint": the new constraint name
 }
 
 func (s *AlterDomainStmt) Pos() int  { return s.pos }

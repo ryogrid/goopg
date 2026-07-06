@@ -105,3 +105,76 @@ func TestAlterDomainRenameTo(t *testing.T) {
 		t.Errorf("err = %v, want *ExecError{Code: 42710}", err)
 	}
 }
+
+// TestAlterDomainRenameConstraint guards the RENAME CONSTRAINT follow-up:
+// `ALTER DOMAIN name RENAME CONSTRAINT old TO new` was previously wholly
+// unparsed (fell into the same discarded compat no-op as RENAME TO/OWNER TO
+// once had). Mirrors real PG's error codes: 42704 (undefined constraint,
+// including an unknown domain) and 42710 (name collision with another CHECK
+// on the same domain) — see rename_constraint_internal/RenameConstraintById
+// in postgres/src/backend/commands/tablecmds.c and pg_constraint.c.
+func TestAlterDomainRenameConstraint(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	// Two named CHECKs declared at CREATE time (multi-CHECK, DU-002 slice
+	// 385) — ALTER DOMAIN ADD CONSTRAINT is a separate, not-yet-implemented
+	// sub-form (see the deferral ledger row this loop closes against), so
+	// the collision-target constraint must come from CREATE DOMAIN itself.
+	if err := runDDL(t, ctx, `CREATE DOMAIN renamecontest_domain AS int CONSTRAINT positive_check CHECK (VALUE > 0) CONSTRAINT second_check CHECK (VALUE < 1000)`); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+	d, found := im.LookupDomain("renamecontest_domain")
+	if !found {
+		t.Fatal("domain not found via LookupDomain")
+	}
+	if len(d.Checks) != 2 {
+		t.Fatalf("Checks after CREATE DOMAIN = %+v, want exactly 2", d.Checks)
+	}
+	origExpr := d.Checks[0].Expr
+
+	if err := runDDL(t, ctx, `ALTER DOMAIN renamecontest_domain RENAME CONSTRAINT positive_check TO renamed_check`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... RENAME CONSTRAINT: %v", err)
+	}
+	if d.Checks[0].Name != "renamed_check" {
+		t.Errorf("Checks after rename = %+v, want first CHECK named renamed_check", d.Checks)
+	}
+	if d.Checks[0].Expr != origExpr {
+		t.Errorf("CHECK expression changed across constraint rename: got %q, want %q", d.Checks[0].Expr, origExpr)
+	}
+	if d.Checks[1].Name != "second_check" {
+		t.Errorf("Checks after rename = %+v, sibling CHECK must be untouched", d.Checks)
+	}
+
+	// A nonexistent constraint on an existing domain raises 42704.
+	err := runDDL(t, ctx, `ALTER DOMAIN renamecontest_domain RENAME CONSTRAINT nosuchcheck TO whatever`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... RENAME CONSTRAINT on an unknown constraint should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+
+	// A nonexistent domain also raises 42704.
+	err = runDDL(t, ctx, `ALTER DOMAIN nosuchdomain RENAME CONSTRAINT foo TO bar`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... RENAME CONSTRAINT on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+
+	// Renaming to an already-used name on the same domain raises 42710.
+	err = runDDL(t, ctx, `ALTER DOMAIN renamecontest_domain RENAME CONSTRAINT second_check TO renamed_check`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... RENAME CONSTRAINT to a colliding name should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42710" {
+		t.Errorf("err = %v, want *ExecError{Code: 42710}", err)
+	}
+}
