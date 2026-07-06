@@ -324,6 +324,29 @@ candidate: resume the M0110-0001 multi-database isolation survey above
 (pg_dump 002-010 broader per-database catalog-isolation blocker), or survey
 the deferral ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #47):** picked up the range-type `Owner` restart-persistence
+follow-up named in the 2026-07-06 M0122-0005 ledger row (resume point (1)).
+`wal.EncodeCreateRangeType`/`DecodeCreateRangeType` gained a 10th `ownerOID`
+field; two new WAL record kinds `RecordKindAlterRangeTypeRename`/
+`RecordKindAlterRangeTypeOwner` (117/118, mirroring
+`RecordKindAlterCollationRename`/`Owner` minus the schema field) let a
+post-CREATE `ALTER TYPE <range> RENAME TO`/`OWNER TO` survive a restart too,
+via new `RenameRangeTypeDuringRecovery`/`SetRangeTypeOwnerDuringRecovery`
+catalog hooks wired into `replayRangeTypeDDLRecords`. Tests:
+`internal/wal/range_type_ddl_test.go`'s new rename/owner round-trip tests;
+`internal/initdb/range_type_ddl_recovery_test.go`'s
+`TestRangeTypeDDLRecoveryReplaysRenameAndOwner`. See
+`docs/design/0122-0005-alter-type-owner-rename.md`'s new "Follow-up:
+range-type `Owner` restart persistence" section and the matching ledger row
+(which also flips the prior 2026-07-06 range-type row to `resolved`). Gates:
+`go build ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+./internal/wal/... ./internal/initdb/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Only remaining deferred item
+from that bucket: domain typowner (`ALTER DOMAIN` isn't parsed at all yet —
+materially larger, separate task). Next candidate: resume the M0110-0001
+multi-database isolation survey above, or survey the deferral ledger for a
+fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

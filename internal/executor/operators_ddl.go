@@ -17721,7 +17721,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
 			// METHOD.
 			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID)); werr != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID, rt.Owner)); werr != nil {
 					return fmt.Errorf("wal create-range-type: %w", werr)
 				}
 			}
@@ -18005,6 +18005,15 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			if err := cat.RenameRangeType(s.Name, s.RenameTo); err != nil {
 				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 			}
+			// M0122-0005 restart-persistence follow-up (deferral ledger
+			// 2026-07-06 row, resume point (1)): mirrors execAlterCollation's
+			// RENAME TO WAL logging so a range-type rename survives a
+			// restart.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeRename(s.Name, s.RenameTo)); werr != nil {
+					return fmt.Errorf("wal alter-range-type-rename: %w", werr)
+				}
+			}
 			return nil
 		}
 		err := cat.RenameEnum(s.Name, s.RenameTo)
@@ -18044,6 +18053,15 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		if _, ok := cat.LookupRangeType(s.Name); ok {
 			cat.SetRangeTypeOwner(s.Name, ownerOID)
+			// M0122-0005 restart-persistence follow-up (deferral ledger
+			// 2026-07-06 row, resume point (1)): mirrors
+			// execAlterCollation's OWNER TO WAL logging so a range-type
+			// owner change survives a restart.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeOwner(s.Name, ownerOID)); werr != nil {
+					return fmt.Errorf("wal alter-range-type-owner: %w", werr)
+				}
+			}
 			return nil
 		}
 		if !cat.SetEnumOwner(s.Name, ownerOID) {

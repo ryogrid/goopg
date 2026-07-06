@@ -165,3 +165,58 @@ with no way to ever set it. This is a materially larger, separate task
   `bootstrapSuperuserOID` constant did when `Owner` is unset), so regression
   risk on existing dump fixtures is low, but a non-default owner's ACL
   rendering has not been end-to-end verified.
+
+## Follow-up: range-type `Owner` restart persistence (2026-07-06, later loop)
+
+Closes deferred item (1) from the range-type follow-up section above: a
+range type's `Owner` now survives a restart, matching the type definition
+itself (which already had a WAL record). `wal.EncodeCreateRangeType`/
+`DecodeCreateRangeType` gained a 10th `ownerOID uint32` parameter (written
+as a fixed field right after `collationOID`, before the variable-length
+name strings); `execCreateType`'s range branch now passes `rt.Owner` at
+CREATE time and `internal/initdb/range_type_ddl_recovery.go`'s CREATE case
+threads the decoded `ownerOID` into the reconstructed `catalog.RangeType`.
+
+A post-CREATE `ALTER TYPE <range> RENAME TO`/`OWNER TO` needed its own new
+WAL records, since — unlike composite/enum's ALTER forms, which still have
+no restart persistence at all today — range types are the one type kind
+whose ALTER-TYPE-addressable mutations are worth making durable now that the
+CREATE record exists. Two new record kinds mirror
+`RecordKindAlterCollationRename`/`RecordKindAlterCollationOwner` exactly,
+minus the schema field (range types are keyed by name only, like access
+methods, not schema-scoped):
+
+- `RecordKindAlterRangeTypeRename` (117) /
+  `wal.Encode`/`DecodeAlterRangeTypeRename` —
+  `kind(1) | nameLen(2) | name | newNameLen(2) | newName`.
+- `RecordKindAlterRangeTypeOwner` (118) /
+  `wal.Encode`/`DecodeAlterRangeTypeOwner` —
+  `kind(1) | ownerOID(4) | nameLen(2) | name`.
+
+`execAlterType`'s range RENAME TO / OWNER TO branches (`internal/executor/
+operators_ddl.go`) now call `o.ctx.WAL.Append` with these after the catalog
+mutation succeeds, exactly like `execAlterCollation`. New catalog replay
+hooks `RenameRangeTypeDuringRecovery`/`SetRangeTypeOwnerDuringRecovery`
+(idempotent wrappers mirroring `RenameCollationDuringRecovery`/
+`SetCollationOwnerDuringRecovery`) are called from two new cases in
+`replayRangeTypeDDLRecords`. Both new record kinds are also added to the
+physical-replay skip-list (`internal/wal/recovery.go`'s
+`shouldSkipPhysicalReplay`-style switch) alongside `RecordKindCreateRangeType`/
+`RecordKindDropRangeType`, since they carry only in-memory registry state
+with no page-level effect, identical reasoning to the collation records.
+
+Tests: `internal/wal/range_type_ddl_test.go` gained
+`TestEncodeDecodeAlterRangeTypeRenameRoundTrip`/
+`TestEncodeDecodeAlterRangeTypeOwnerRoundTrip` (plus the pre-existing CREATE
+round-trip test now also asserts `ownerOID`); `internal/initdb/
+range_type_ddl_recovery_test.go` gained
+`TestRangeTypeDDLRecoveryReplaysRenameAndOwner` (CREATE + RENAME + OWNER TO
+across a restart, mirroring `TestRangeTypeDDLRecoveryReplaysCreate`). Gates:
+`go build ./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+./internal/wal/... ./internal/initdb/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33).
+
+**Still deferred:** domain typowner (unchanged — see above, needs `ALTER
+DOMAIN` grammar first); grant-option delegation-chain resolution is
+unrelated to this row. The `pg_dump` ACL-default live-verification gap noted
+above is also unchanged (out of scope for a WAL-persistence follow-up).

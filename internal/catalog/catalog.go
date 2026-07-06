@@ -18316,6 +18316,20 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 	c.advanceNextOIDLocked(rt.MultirangeArrayOID)
 }
 
+// RenameRangeTypeDuringRecovery is the idempotent version of RenameRangeType
+// for WAL replay, mirroring RenameCollationDuringRecovery. M0122-0005
+// restart-persistence follow-up.
+func (c *InMemory) RenameRangeTypeDuringRecovery(oldName, newName string) {
+	_ = c.RenameRangeType(oldName, newName)
+}
+
+// SetRangeTypeOwnerDuringRecovery is the idempotent version of
+// SetRangeTypeOwner for WAL replay, mirroring SetCollationOwnerDuringRecovery.
+// M0122-0005 restart-persistence follow-up.
+func (c *InMemory) SetRangeTypeOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetRangeTypeOwner(name, ownerOID)
+}
+
 // DropRangeTypeDuringRecovery is the idempotent counterpart used for
 // replaying RecordKindDropRangeType. Identical to DropRangeType but discards
 // the found/not-found result — replay does not care whether the range type

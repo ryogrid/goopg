@@ -1254,6 +1254,24 @@ const (
 	//   schema(schemaLen bytes) | initOptionLen(2) | initOption(initOptionLen bytes).
 	RecordKindAlterTSDictOptions byte = 116
 
+	// RecordKindAlterRangeTypeRename records an `ALTER TYPE name RENAME TO
+	// newName` event for a user-defined range type, mirroring
+	// RecordKindAlterCollationRename. Range types are not schema-scoped
+	// (keyed by name only, like an access method), so unlike the collation
+	// record there is no schema field. M0122-0005 restart-persistence
+	// follow-up (deferral ledger 2026-07-06 row, resume point (1)).
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes) | newNameLen(2) |
+	//   newName(newNameLen bytes).
+	RecordKindAlterRangeTypeRename byte = 117
+
+	// RecordKindAlterRangeTypeOwner records an `ALTER TYPE name OWNER TO
+	// role` event for a user-defined range type, mirroring
+	// RecordKindAlterCollationOwner (no schema field, same reasoning as
+	// RecordKindAlterRangeTypeRename). M0122-0005 restart-persistence
+	// follow-up (deferral ledger 2026-07-06 row, resume point (1)).
+	// Format: kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes).
+	RecordKindAlterRangeTypeOwner byte = 118
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -2273,7 +2291,7 @@ func DecodeDropAccessMethod(payload []byte) (name string, err error) {
 // restarted server doesn't silently drop that resolution back to the
 // unconditional default. Format documented at the RecordKindCreateRangeType
 // constant.
-func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID uint32) []byte {
+func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, ownerOID uint32) []byte {
 	if len(subtypeName) > 0xFFFF {
 		subtypeName = subtypeName[:0xFFFF]
 	}
@@ -2283,7 +2301,7 @@ func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayO
 	if len(multirangeName) > 0xFFFF {
 		multirangeName = multirangeName[:0xFFFF]
 	}
-	out := make([]byte, 31+len(subtypeName)+len(name)+len(multirangeName))
+	out := make([]byte, 35+len(subtypeName)+len(name)+len(multirangeName))
 	out[0] = RecordKindCreateRangeType
 	binary.LittleEndian.PutUint32(out[1:5], oid)
 	binary.LittleEndian.PutUint32(out[5:9], multirangeOID)
@@ -2291,7 +2309,8 @@ func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayO
 	binary.LittleEndian.PutUint32(out[13:17], arrayOID)
 	binary.LittleEndian.PutUint32(out[17:21], multirangeArrayOID)
 	binary.LittleEndian.PutUint32(out[21:25], collationOID)
-	off := 25
+	binary.LittleEndian.PutUint32(out[25:29], ownerOID)
+	off := 29
 	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(subtypeName)))
 	off += 2
 	copy(out[off:], subtypeName)
@@ -2307,12 +2326,12 @@ func EncodeCreateRangeType(name, subtypeName, multirangeName string, oid, arrayO
 }
 
 // DecodeCreateRangeType decodes a RecordKindCreateRangeType payload.
-func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID uint32, err error) {
-	if len(payload) < 27 {
-		return "", "", "", 0, 0, 0, 0, 0, 0, fmt.Errorf("wal: create-range-type payload too short (%d bytes)", len(payload))
+func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName string, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, ownerOID uint32, err error) {
+	if len(payload) < 31 {
+		return "", "", "", 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("wal: create-range-type payload too short (%d bytes)", len(payload))
 	}
 	if payload[0] != RecordKindCreateRangeType {
-		return "", "", "", 0, 0, 0, 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-range-type", payload[0])
+		return "", "", "", 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("wal: record kind %d is not create-range-type", payload[0])
 	}
 	oid = binary.LittleEndian.Uint32(payload[1:5])
 	multirangeOID = binary.LittleEndian.Uint32(payload[5:9])
@@ -2320,7 +2339,8 @@ func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName st
 	arrayOID = binary.LittleEndian.Uint32(payload[13:17])
 	multirangeArrayOID = binary.LittleEndian.Uint32(payload[17:21])
 	collationOID = binary.LittleEndian.Uint32(payload[21:25])
-	off := 25
+	ownerOID = binary.LittleEndian.Uint32(payload[25:29])
+	off := 29
 	readStr := func() (string, error) {
 		if len(payload) < off+2 {
 			return "", fmt.Errorf("wal: create-range-type payload truncated (length prefix)")
@@ -2335,15 +2355,15 @@ func DecodeCreateRangeType(payload []byte) (name, subtypeName, multirangeName st
 		return s, nil
 	}
 	if subtypeName, err = readStr(); err != nil {
-		return "", "", "", 0, 0, 0, 0, 0, 0, err
+		return "", "", "", 0, 0, 0, 0, 0, 0, 0, err
 	}
 	if name, err = readStr(); err != nil {
-		return "", "", "", 0, 0, 0, 0, 0, 0, err
+		return "", "", "", 0, 0, 0, 0, 0, 0, 0, err
 	}
 	if multirangeName, err = readStr(); err != nil {
-		return "", "", "", 0, 0, 0, 0, 0, 0, err
+		return "", "", "", 0, 0, 0, 0, 0, 0, 0, err
 	}
-	return name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, nil
+	return name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, ownerOID, nil
 }
 
 // EncodeDropRangeType encodes a DROP TYPE event for a user-defined range
@@ -2374,6 +2394,85 @@ func DecodeDropRangeType(payload []byte) (name string, err error) {
 		return "", fmt.Errorf("wal: drop-range-type payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeAlterRangeTypeRename encodes an `ALTER TYPE name RENAME TO newName`
+// event for a user-defined range type. Format documented at the
+// RecordKindAlterRangeTypeRename constant.
+func EncodeAlterRangeTypeRename(name, newName string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	if len(newName) > 0xFFFF {
+		newName = newName[:0xFFFF]
+	}
+	out := make([]byte, 5+len(name)+len(newName))
+	out[0] = RecordKindAlterRangeTypeRename
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	off := 3
+	copy(out[off:], name)
+	off += len(name)
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(newName)))
+	off += 2
+	copy(out[off:], newName)
+	return out
+}
+
+// DecodeAlterRangeTypeRename decodes a RecordKindAlterRangeTypeRename
+// payload.
+func DecodeAlterRangeTypeRename(payload []byte) (name, newName string, err error) {
+	if len(payload) < 5 {
+		return "", "", fmt.Errorf("wal: alter-range-type-rename payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRangeTypeRename {
+		return "", "", fmt.Errorf("wal: record kind %d is not alter-range-type-rename", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	off := 3
+	if len(payload) < off+nameLen+2 {
+		return "", "", fmt.Errorf("wal: alter-range-type-rename payload truncated (need %d bytes)", off+nameLen+2)
+	}
+	name = string(payload[off : off+nameLen])
+	off += nameLen
+	newNameLen := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if len(payload) < off+newNameLen {
+		return "", "", fmt.Errorf("wal: alter-range-type-rename payload truncated (need %d bytes)", off+newNameLen)
+	}
+	newName = string(payload[off : off+newNameLen])
+	return name, newName, nil
+}
+
+// EncodeAlterRangeTypeOwner encodes an `ALTER TYPE name OWNER TO role` event
+// for a user-defined range type. Format documented at the
+// RecordKindAlterRangeTypeOwner constant.
+func EncodeAlterRangeTypeOwner(name string, ownerOID uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindAlterRangeTypeOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeAlterRangeTypeOwner decodes a RecordKindAlterRangeTypeOwner payload.
+func DecodeAlterRangeTypeOwner(payload []byte) (name string, ownerOID uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: alter-range-type-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterRangeTypeOwner {
+		return "", 0, fmt.Errorf("wal: record kind %d is not alter-range-type-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: alter-range-type-owner payload truncated (need %d bytes)", 7+nameLen)
+	}
+	name = string(payload[7 : 7+nameLen])
+	return name, ownerOID, nil
 }
 
 // CreateOperatorPayload carries the metadata needed to fully reconstruct a
@@ -7672,12 +7771,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// these records after physical replay and re-applies them to the
 		// access method registry.
 		return false, nil
-	case RecordKindCreateRangeType, RecordKindDropRangeType:
+	case RecordKindCreateRangeType, RecordKindDropRangeType, RecordKindAlterRangeTypeRename, RecordKindAlterRangeTypeOwner:
 		// CREATE/DROP TYPE ... AS RANGE records (DU-002 restart-persistence
 		// follow-up, M0110-0001 DU-002 slice 429 ledger resume point,
-		// sub-item (c)) carry only catalog.InMemory's rangeTypes registry
-		// metadata; goopg has no per-range-type file namespace, so the
-		// physical replay path has nothing to do. The recovery driver in
+		// sub-item (c)) and the ALTER TYPE ... RENAME TO/OWNER TO follow-up
+		// (M0122-0005 restart-persistence follow-up) carry only
+		// catalog.InMemory's rangeTypes registry metadata; goopg has no
+		// per-range-type file namespace, so the physical replay path has
+		// nothing to do. The recovery driver in
 		// internal/initdb/range_type_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the range
 		// type registry.
