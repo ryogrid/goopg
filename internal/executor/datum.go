@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -537,7 +538,7 @@ func (d Datum) Format() string {
 		}
 		return d.TimeValue().Format("2006-01-02 15:04:05.000000")
 	case KindInterval:
-		return fmt.Sprintf("%d months %d days", d.IntervalMonthsValue(), d.IntervalDaysValue())
+		return formatInterval(d.IntervalMonthsValue(), d.IntervalDaysValue())
 	case KindNumeric:
 		if d.Flags&flagBigNumeric != 0 {
 			return formatNumericBig(d.NumericBigValue(), d.Scale)
@@ -545,6 +546,47 @@ func (d Datum) Format() string {
 		return formatNumeric(d.Int, d.Scale)
 	}
 	return fmt.Sprintf("?datum kind=%d?", d.Kind)
+}
+
+// formatInterval renders (months, days) the way upstream PG's
+// interval_out does under the default 'postgres' IntervalStyle:
+// months split into years + remainder months, each nonzero
+// year/mon/day component printed as "<n> <unit>" (singular unit
+// text iff n == 1 exactly; -1 still takes the plural form, matching
+// EncodeInterval), space-separated, sign carried per-component. A
+// fully-zero interval prints "00:00:00" (v0 has no time component,
+// but PG always renders the zero interval this way). Verified
+// byte-for-byte against real PostgreSQL 18.3 (see
+// docs/design/0003-0006-date-interval-arithmetic.md).
+func formatInterval(months, days int32) string {
+	years := months / 12
+	remMonths := months % 12
+	var parts []string
+	if years != 0 {
+		unit := "years"
+		if years == 1 {
+			unit = "year"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", years, unit))
+	}
+	if remMonths != 0 {
+		unit := "mons"
+		if remMonths == 1 {
+			unit = "mon"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", remMonths, unit))
+	}
+	if days != 0 {
+		unit := "days"
+		if days == 1 {
+			unit = "day"
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", days, unit))
+	}
+	if len(parts) == 0 {
+		return "00:00:00"
+	}
+	return strings.Join(parts, " ")
 }
 
 // formatNumeric renders mantissa * 10^-scale as the decimal string

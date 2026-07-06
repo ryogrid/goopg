@@ -218,6 +218,39 @@ list): sub-day interval units, `CAST(... AS interval)` string parsing, and
 which does not match PostgreSQL's `intervalout` — e.g. real PG prints `"3
 mons"` not `"3 months 0 days"`) all remain open, independent gaps.
 
+## Follow-up: `Datum.Format()` interval text rendering (M0122-0004, 2026-07-06)
+
+Closes the `Datum.Format()`/`intervalout` gap the prior follow-up named.
+`formatInterval(months, days int32) string` (`internal/executor/datum.go`)
+replaces the old unconditional `"%d months %d days"` with upstream's actual
+`interval_out` shape under the default `'postgres'` `IntervalStyle`, verified
+live against a real PostgreSQL 18.3 instance
+(`postgres/local_install/bin/psql`) rather than derived from the C source:
+
+- Total months split into `years := months/12`, `remMonths := months%12`
+  (Go's truncating integer division/modulo already matches C's, so this is a
+  direct port — no special-casing for negative months needed).
+- Each of years/remMonths/days is rendered only if nonzero, as `"<n>
+  <unit>"` with the *plural* unit text unless the value is *exactly* `1`
+  (empirically, `-1` still takes the plural form, e.g. `"-1 mons"` not `"-1
+  mon"` — confirmed against real PG, not assumed).
+- Components are space-joined in years → months → days order; a
+  fully-zero interval (0 months, 0 days) prints PG's special-cased
+  `"00:00:00"` rather than an empty string.
+
+Verified cases (each cross-checked against real PG 18.3): `14,3 → "1 year 2
+mons 3 days"`; `-1,0 → "-1 mons"`; `0,0 → "00:00:00"`; `13,0 → "1 year 1
+mon"` (total-months normalization, not a pre-split year/month field);
+`-15,0 → "-1 years -3 mons"`; `-12,0 → "-1 years"` (zero remainder omitted);
+`11,0 → "11 mons"` and `-11,0 → "-11 mons"` (zero years omitted). Test:
+`internal/executor/interval_format_test.go`
+(`TestFormatIntervalMatchesPGIntervalOut`, 18 cases).
+
+Still deferred, unchanged: sub-day interval units and `CAST(... AS
+interval)` string parsing (this v0 interval type has no time-of-day
+component to parse into or format, so PG's `HH:MM:SS` suffix never
+appears except via the zero-interval special case above).
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream

@@ -1128,9 +1128,28 @@ mirroring M0119's ledger `status` column.
       build ./...` clean; `go test -count=1 ./internal/executor/...
       ./internal/planner/... ./internal/analyzer/... ./internal/parser/...`
       PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **Interval text formatting landed (2026-07-06, later loop):**
+      `Datum.Format()`'s `KindInterval` case rendered the placeholder
+      `"%d months %d days"` (e.g. `"3 months 0 days"`) instead of
+      upstream's `intervalout` shape. New `formatInterval(months, days
+      int32) string` (`internal/executor/datum.go`) splits total months
+      into years + remainder months, prints each nonzero
+      year/month/day component as `"<n> <unit>"` (plural unit unless
+      the value is exactly `1`; `-1` still takes the plural form, e.g.
+      `"-1 mons"`, confirmed against real PG not assumed), space-joins
+      the parts, and special-cases the fully-zero interval as
+      `"00:00:00"` — all verified live against a real PostgreSQL 18.3
+      instance (`postgres/local_install/bin/psql`), not derived from
+      the C source. Test: `internal/executor/interval_format_test.go`
+      (`TestFormatIntervalMatchesPGIntervalOut`, 18 cases). Design:
+      `docs/design/0003-0006-date-interval-arithmetic.md` new Follow-up
+      section. Ledger row flipped to `resolved`. Gates: `go build
+      ./...` clean; `go test -count=1 ./internal/executor/...
+      ./internal/planner/... ./internal/analyzer/... ./internal/parser/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
       **Still open in this bucket:** RANGE/GROUPS window frame modes
       (documented v0 scope limit), combining window forms, sub-day
-      intervals, `CAST(... AS interval)`, interval text output formatting.
+      intervals, `CAST(... AS interval)` string parsing.
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
