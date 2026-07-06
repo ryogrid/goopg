@@ -216,6 +216,34 @@ every clean, green (build + pre-commit) checkpoint.
       data dirs, logs) removed; test skip restored via `git checkout
       --`; `go build ./...` clean; `go test -count=1 ./internal/
       storage/... ./internal/access/btree/...` PASS after revert.
+      2026-07-07 update #4 (6th loop; see deferral ledger row appended
+      today): pivoted from buffer-pool tracing to auditing
+      `btree_vacuum.go`'s structural mutations for missing `splitMu`
+      coverage. **Found and FIXED a real bug** (landed, not deferred):
+      `unlinkEmptyLeaf`'s WAL-emitter branch captures the parent's
+      downlink slot INDEX via `resolveParentDownlink`, then removes by
+      that index via `applyParentDownlinkRemoval` several statements
+      later — with no `splitMu` held across the gap, so a concurrent
+      Insert-driven split on the same parent can shift the index and
+      make vacuum delete the WRONG (unrelated, still-live) child's
+      downlink while leaving `leaf.blk`'s own downlink dangling after
+      `recycleBlock` returns it to the free list. Fixed by wrapping
+      `unlinkEmptyLeaf`'s whole body in `bt.splitMu.Lock()`/`Unlock()`.
+      Gates: build clean, `go test ./internal/access/btree/...
+      ./internal/amcheck/... ./internal/executor/... -run Vacuum` PASS.
+      **This fix alone does NOT close the nightly item** — re-ran the
+      authoritative repro post-fix, still fails (now on command 1, not
+      5). Built a cheap scale=10/c=20/T=30 manual repro (see ledger row)
+      that reproduces a DIFFERENT symptom, "btree: empty internal page",
+      within 30s — traced to a SECOND, separate root cause: no code in
+      `btree_vacuum.go` ever cascades an internal page's OWN deletion
+      when its downlink count is vacuumed down to 0 (PG's `_bt_pagedel`
+      recurses up the parent chain; goopg's `applyParentDownlinkRemoval`/
+      `removeDownlinkFromParent` just leave a 0-item internal page in
+      place). Next step: implement that recursive internal-page deletion
+      cascade (resume point + rationale for deferring it this loop are in
+      today's ledger row) — use the cheap scale=10 recipe, not the
+      15-min nightly-scale one, to iterate.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,

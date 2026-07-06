@@ -207,6 +207,28 @@ func (bt *BTree) findLeftmostLeaf() (storage.BlockNumber, error) {
 // back to the per-page FPI path when the hook is unset (test
 // harnesses without a WAL writer).
 func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
+	// M-NIGHTLY (AI-20260706-201855-001): resolveParentDownlink
+	// below captures the parent's downlink SLOT INDEX, and
+	// applyParentDownlinkRemoval later removes-by-index against
+	// that same slot. Between the two, a concurrent Insert-driven
+	// split (Insert/finishSplit, both under splitMu) can insert a
+	// new downlink into the SAME parent page ahead of the captured
+	// slot, shifting every later index right — so the later
+	// removal deletes whatever now sits at that index (some OTHER
+	// live child's downlink), not leaf.blk's. The orphaned live
+	// child stays reachable (nothing pointed it out of the tree),
+	// but leaf.blk's own downlink is never removed, so it survives
+	// in the parent even after recycleBlock() below returns
+	// leaf.blk to the free list for reuse by an unrelated split —
+	// a later reader following the parent's stale downlink lands
+	// on whatever new content that split wrote, surfacing as
+	// "btree: item length mismatch". Splits already serialise
+	// every OTHER structural mutation through splitMu; taking it
+	// here too closes the gap so the parent's slot layout cannot
+	// shift between resolve and remove.
+	bt.splitMu.Lock()
+	defer bt.splitMu.Unlock()
+
 	emitter := bt.pool.LogBtreeUnlinkPage()
 	if emitter == nil {
 		return bt.unlinkEmptyLeafFPI(leaf)

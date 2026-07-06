@@ -1,127 +1,118 @@
 Task: M-NIGHTLY (AI-20260706-201855-001) — pgbench/nightly btree
-"item length mismatch keyLen=9 total=37" / "empty internal page"
-recurrence investigation (NOT resolved; 5th consecutive investigation
-loop, investigation-only, no functional change landed). MAJOR
-REDIRECTION this loop — see Hypothesis/Findings below.
+corruption. 6th consecutive loop. LANDED a real, verified concurrency
+fix this loop (kept, committed) — but it does NOT fully close the
+nightly item; a SECOND, separate root cause was found and is the
+clear next step.
 
-Files: none changed in the final commit besides `.ralph/fix_plan.md`
-and `.ralph/deferral_ledger.md` (bookkeeping). Temporarily built and
-FULLY REMOVED this loop: `bin/goopg-race` (`go build -race
-./cmd/goopg`), a scratch data dir under `tmp/goopg-race-diag-<pid>`,
-`/tmp/race_pgbench/*` logs, a `-race`-compiled test binary
-(`/tmp/btree_race.test`). `internal/access/btree/
-multi_writer_stress_test.go`'s `t.Skip` was removed then restored via
-`git checkout --` (confirmed clean via `git status`/`git diff`).
+Files changed (committed): `internal/access/btree/btree_vacuum.go`
+(`unlinkEmptyLeaf` now holds `bt.splitMu` across its whole body).
+`.ralph/fix_plan.md` + `.ralph/deferral_ledger.md` bookkeeping.
 
-Key symbols touched only for reading/verification this loop:
-`internal/storage/bufpool.go` `Pin`/`pinSlow`/`pinLoad`/`tryPinSlot`/
-`PinNew`/`claimVictim`/`evictVictim` (re-audited statically, no bug
-found — eviction protocol looks correct: IO bit + gen bump in
-claimVictim excludes concurrent re-claim, tag publish to bufmap always
-happens AFTER content population in every caller checked).
-`internal/access/btree/btree.go` `insertIntoBlock` (1421-1662),
-`createNewRoot` (1818-1908), `finishSplit` (1727-1776) — all properly
-re-`.Lock()` the slot returned by `PinNew`/`pinNewOrRecycled` before
-writing btree content; no missing-lock write site found by static
-read. `internal/storage/arena.go` (`newArena`/`slot`) — verified no
-aliasing/overlap bug (each slot gets a disjoint, cap-bounded
-`BlockSize` sub-slice). `internal/access/btree/posting.go` —
-`appendTIDToPosting`/`promoteSingleToPosting` flagged `unusedfunc` by
-`go vet` during this loop's test runs; NOT yet investigated whether
-that's dead code or a real gap in dedup-consolidation reachability.
+Key symbols: `unlinkEmptyLeaf` (btree_vacuum.go:209, FIXED),
+`resolveParentDownlink` (:354), `applyParentDownlinkRemoval` (:478,
+removes by captured SLOT INDEX — the bug this loop fixed by adding
+splitMu), `removeDownlinkFromParent` (:691, removes by BLOCK NUMBER
+match — NOT affected by the index-drift bug, used by the FPI-fallback
+path `unlinkEmptyLeafFPI`). `VacuumIndexPages` (:31) — never had
+`splitMu` coverage at all before this loop's fix.
 
-Hypothesis/Findings: **The last 4 loops' central hypothesis (a
-genuine "unlocked write" data race in the buffer pool / btree layer,
-"confirmed" via custom `GOOPG_PINTRACE` instrumentation) is now in
-serious doubt.** This loop ran the SAME fast repro
-(`TestMultiWriterStress_M0055_Phase_C`, `t.Skip` removed) ~1180 times
-total this session — 100+300+500 in-process `go test -race -count=N`
-runs, 80 separate-process invocations of a `go test -c -race`-built
-binary (matching the earlier loops' own "loop `go test -count=1`"
-recipe), and 200 plain (non-race) runs — on a 16-core box. **Zero
-failures, zero race-detector reports**, across all of them. This
-directly contradicts the previous loop's claim of a reproducible
-unlocked-write race (that capture may have been an artifact of the
-custom trace instrumentation's own synchronization, or the bug is
-real but far rarer than the "~100% at -count=200 with tracing" claim
-suggested — a Heisenbug specific to that instrumentation's own
-overhead shape, not reproduced by -race's differently-shaped
-overhead).
+Findings this loop:
+1. FIXED: `unlinkEmptyLeaf`'s WAL-emitter branch captured a parent
+   downlink's slot INDEX, then removed-by-index several statements
+   later with no lock held across the gap — a concurrent Insert split
+   on the same parent shifts the index, so vacuum deletes the WRONG
+   live child's downlink while `leaf.blk`'s own downlink survives and
+   gets its block recycled anyway → a later reader follows the stale
+   downlink into reused/foreign content → "item length mismatch".
+   Fix: wrap `unlinkEmptyLeaf`'s body in `bt.splitMu.Lock()/Unlock()`
+   (matches the existing "splitMu serialises all structural changes"
+   invariant, which previously didn't actually cover vacuum). No
+   deadlock risk: `VacuumIndexPages`'s only production caller
+   (`internal/executor/operators_vacuum.go` `vacuumIndexes`) never
+   runs from inside `Insert`/`finishSplit`.
+2. NOT FIXED — this fix alone does not close the nightly gate. Re-ran
+   `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) NIGHTLY_PGBENCH_PORT=5570 bash
+   ci/batch/stages/stage-pgbench.sh` post-fix: still fails, now on
+   command 1 (pgbench_accounts UPDATE) instead of command 5, same
+   "item length mismatch keyLen=0/9 total=37" signature.
+3. Built and validated a MUCH CHEAPER manual repro (~1-2 min instead
+   of ~15 min) that narrows this to a SECOND, distinct root cause:
+   ```
+   go build -o /tmp/goopg-diag ./cmd/goopg
+   /tmp/goopg-diag init -D /tmp/diag-data
+   /tmp/goopg-diag start -D /tmp/diag-data --listen 127.0.0.1:5590 \
+     --hba /tmp/diag-data/pg_hba.conf &
+   export PATH="$PWD/postgres/local_install/bin:$PATH"
+   export LD_LIBRARY_PATH="$PWD/postgres/local_install/lib:$LD_LIBRARY_PATH"
+   pgbench -i -s 10 -h 127.0.0.1 -p 5590 -U postgres postgres   # ~60s
+   pgbench -c 20 -j 8 -T 30 -h 127.0.0.1 -p 5590 -U postgres postgres
+   ```
+   A single-client SELECT-only pass immediately after load is CLEAN
+   (ruling out a deterministic bulk-load-time bug in `BulkCreate`/
+   `deduplicateToRawItems`, which was this loop's first alternate
+   hypothesis given "keyLen=9 total=37" exactly matches a 4-TID
+   posting item per M0118-0130's math — `marshalPosting` is ONLY ever
+   called from `bulkload.go`, since the steady-state insert path's
+   `appendTIDToPosting`/`promoteSingleToPosting` in posting.go are
+   confirmed dead code, unused per `go vet`). But `-c 20 -j 8 -T 30`
+   reproduces within 30s — with a DIFFERENT symptom: "btree: empty
+   internal page" (`findChildBlockDirect`'s `count == 0` check,
+   btree.go) on the pgbench_branches UPDATE (10 rows — matches the
+   long-standing "no-HOT → constant duplicate-key churn on tiny
+   tables" theory from loop 5).
 
-Per fix_plan rule 3 ("re-run the item's repro at HEAD before
-investigating"), then ran the ACTUAL authoritative nightly repro:
-`REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash
-ci/batch/stages/stage-pgbench.sh` (s=50 c=100 j=20 T=180). **This
-still fails immediately and reliably** — dozens of clients hit `btree:
-item length mismatch keyLen=9/keyLen=0 total=37` within ~30s of the
-very first TPC-B workload starting. Built `bin/goopg-race` (`go build
--race -o bin/goopg-race ./cmd/goopg`), manually loaded a matching
-scale=50 pgbench dataset (a scale=5 attempt first did NOT reproduce in
-60s — very likely because it fits entirely in the buffer pool and
-never exercises `claimVictim`/`evictVictim` eviction at all — scale
-matters for reproduction), then ran the real TPC-B workload (`pgbench
--T 80 -c 100 -j 20 -P 5`) against the race-instrumented server with
-`GORACE="log_path=... exitcode=0 halt_on_error=0"`. **The corruption
-reproduced again** (25 client aborts, `keyLen=47460`/`keyLen=0
-total=37`) but **the race detector logged ZERO "DATA RACE" reports**
-for the entire run, despite Go's race detector being known to catch
-syscall-buffer writes too (`os.File` methods wrap reads/writes with
-`runtime.RaceWriteRange`). A clean -race run through an ACTUAL, live
-reproduction of the real bug is strong evidence this is **not a
-classic memory data race** — it's a logic bug in code that IS
-correctly synchronized (right lock held, wrong bytes/offsets
-computed), not a torn/unsynchronized write.
+Hypothesis for the SECOND bug (empty internal page): audited
+`btree_vacuum.go` for internal-page cascade deletion (mirroring PG's
+`_bt_pagedel` walking up the parent chain when a page's last child is
+removed) — there is NONE. `applyParentDownlinkRemoval`/
+`removeDownlinkFromParent` both happily leave a parent internal page
+with 0 items once every one of its leaf children has been individually
+vacuum-unlinked (very plausible for a tiny, heavily-churned 10-row
+branches index that's split enough times to grow a multi-level tree).
+Nothing ever re-checks or deletes/merges a 0-item internal page, so
+the next descent through it deterministically raises "empty internal
+page" — independent of any race, a missing FEATURE not a bug.
 
-Combined with never having reproduced via the pure-insert, disjoint-
-key btree-only unit test (0/1180 this session), the working theory is
-now: **the real bug requires the full heap+index+MVCC stack under
-UPDATE-heavy contention on tiny, heavily-shared tables** —
-`pgbench_branches` (50 rows at scale=50) and `pgbench_tellers` (500
-rows) are hammered by all 100 concurrent clients every transaction.
-Per `[[goopg_no_hot_update_index_reeval]]` memory, goopg has NO HOT
-update — every UPDATE inserts a brand-new index entry — so TPC-B's
-per-transaction UPDATE on these tiny tables produces a rapid-fire,
-duplicate-key-heavy insert/thrash pattern into a handful of btree leaf
-pages that `TestMultiWriterStress_M0055_Phase_C`'s 32-writer/disjoint-
-key/insert-only workload (btree.go — no updates, no deletes, no
-VACUUM, no shared-row contention) structurally cannot model.
+Next step: implement recursive internal-page deletion in
+`internal/access/btree/btree_vacuum.go` — when a downlink removal
+(`applyParentDownlinkRemoval` or `removeDownlinkFromParent`) drops a
+parent's item count to 0 AND that parent is not the root, the parent
+page itself must be unlinked from ITS OWN parent too (recursively),
+analogous to `unlinkEmptyLeaf`'s handling for leaves. The tree-becomes-
+fully-empty case is already handled separately (`isTreeEmpty`/
+`resetToEmptyRoot` in `VacuumIndexPages`). Use the cheap scale=10/c=20
+repro above (NOT the 15-min nightly-scale one) to iterate quickly:
+first write a focused unit test proving an internal page CAN reach 0
+downlinks under repeated leaf-level vacuum unlinking (probably needs a
+tight page-fill / many-small-leaves setup, or drive it via the manual
+repro + amcheck), then implement the cascade, matching PG's
+`_bt_pagedel` (`postgres/src/backend/access/nbtree/nbtpage.c`) for the
+recursion shape. Budget real care here — this is genuine new
+structural-deletion logic in a subsystem with a documented history of
+rushed fixes causing new panics (`M0055-0004-followup-stage2-splitmu-
+removal` comment, btree.go:601-613) — do not rush it in a single loop
+if it starts looking risky; a clean partial (e.g. detect-and-log
+rather than auto-cascade) is better than a broken cascade.
 
-Next step: **stop chasing `TestMultiWriterStress_M0055_Phase_C`** —
-it has not reproduced anything in 1180 attempts across 3 repro styles
-this session. Instead use the manual pgbench-against-a-`-race`-server
-recipe this loop verified works and is CHEAP (~15 min total: ~5 min
-build+init, ~11 min load at s=50, ~80s workload, fails on the first
-attempt):
-```
-go build -race -o bin/goopg-race ./cmd/goopg
-./bin/goopg-race init -D <datadir>
-GORACE="log_path=<path> exitcode=0 halt_on_error=0" \
-  ./bin/goopg-race start -D <datadir> --listen 127.0.0.1:<port> &
-pgbench -i -s 50 -h 127.0.0.1 -p <port> -U postgres postgres
-pgbench -T 80 -c 100 -j 20 -P 5 -h 127.0.0.1 -p <port> -U postgres postgres
-```
-With a live failing server, instead of more -race iterations (already
-shown fruitless), dump the actual corrupted page's raw line-pointer
-directory + the specific item's byte range at the exact call site that
-raises "item length mismatch" (grep btree.go) to see whether the
-recorded length is wrong AT REST (confirms logic bug) — and check
-whether `dedupConsolidate`/posting-list code
-(`internal/access/btree/posting.go`'s `appendTIDToPosting`/
-`promoteSingleToPosting`, flagged `unusedfunc` by `go vet` this loop)
-is actually reachable/exercised on TPC-B's duplicate-heavy UPDATE
-pattern, or is dead code masking a real dedup-consolidation gap.
+Gates run this loop: `go build ./...` clean; `go test -count=1
+./internal/access/btree/... ./internal/amcheck/...` PASS; `go test
+-count=1 ./internal/executor/... -run Vacuum` PASS; `make
+ralph-state-guard` — run before finalizing, see status block for
+result. Full nightly-scale pgbench repro run twice post-fix (both
+failed, as documented above — expected, since this loop's fix doesn't
+address the empty-internal-page cause). No executor/planner/codec
+change, so no TPC-H spotcheck required beyond the above.
 
-Gates run this loop: `go build ./...` clean (before AND after full
-revert); `go test -count=1 ./internal/storage/...
-./internal/access/btree/...` PASS (baseline, after revert); `make
-ralph-state-guard` OK. No executor/planner/codec changes landed, so no
-TPC-H spotcheck required (investigation + docs only).
-
-In-flight: none — the race-mode server, its data dir, the `-race`
-test binary, and all `/tmp/race_pgbench` logs were fully removed
-before this loop ended; `multi_writer_stress_test.go` restored via
-`git checkout --` (confirmed clean). A separate, unrelated live
-nightly CI batch (`ci/batch/run-nightly.sh`, started ~00:12 today) was
-observed running concurrently during this loop — NOT touched, left
-running (memory: nightly runs are designed to coexist via port
-separation).
+In-flight: none. All diagnostic artifacts removed this loop: `/tmp/
+goopg-diag` binary, `/tmp/diag-data` datadir (server force-killed then
+directory rm -rf'd, confirmed gone), `/tmp/diag-*.log` files. The
+nightly-scale repro's own `RUN_DIR`/datadir under `tmp/goopg-nightly-
+pgbench-data-*` were cleaned up by the stage script's own teardown
+(confirmed absent). The separate, unrelated live nightly CI batch
+(`ci/batch/run-nightly.sh`, started ~00:13 today, currently on its
+tpch stage at port 65434) was observed running concurrently — NOT
+touched, left running; a stale `goopg-nightly-pgbench.scope` systemd
+unit left over from an earlier session attempt was cleared via
+`systemctl reset-failed` before this loop's own manual pgbench-stage
+runs (safe — distinct from the live nightly's own, different-named
+scope).
