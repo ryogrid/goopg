@@ -120,16 +120,52 @@ Two residual gaps surfaced during verification, both pre-existing and
 confirmed unaffected (neither introduced nor worsened) by this change — see
 `.ralph/deferral_ledger.md`'s 2026-07-05 M0122-0005 row for full detail:
 
-1. **Value-truncation semantics**: `SELECT 'xyz'::"char"` returns the full
-   string unchanged instead of truncating to the first byte the way real
-   PG's `charin()` does. `internal/executor/expr.go`'s `evalCast` only
-   applies octal-escape parsing when the input already matches a `\NNN`
-   pattern; it never truncates a plain multi-byte string. The
-   column-assignment path (`INSERT`) already truncates correctly — this gap
-   is specific to the inline cast-expression evaluator.
+1. ~~**Value-truncation semantics**~~ — **closed 2026-07-06**, see "Follow-up:
+   inline-cast value truncation" below.
 2. **`pg_typeof(...)::oid` fails for every type**, not just `"char"` (e.g.
    `pg_typeof(1)::oid` also errors) — `pg_typeof()`'s folded result is a
    plain display-string `StringConst`, not an OID-backed `regtype` datum.
+   Still open; independently scoped, orthogonal to the OID-18
+   disambiguation this change lands.
 
-Both are independently scoped follow-ups, orthogonal to the OID-18
-disambiguation this change lands.
+## Follow-up: inline-cast value truncation (2026-07-06)
+
+Closes deferred item (1) above. Real PostgreSQL's `charin()`
+(`postgres/src/backend/utils/adt/char.c`) takes the first byte of any input
+that is not exactly a `\NNN` octal escape and silently discards the rest.
+`internal/executor/expr.go`'s `evalCast` "char" branch only handled the
+octal-escape form; a plain multi-byte string (`'xyz'::"char"`) passed
+through unchanged instead of truncating to `'x'`.
+
+Fixed by extending that same branch: after the octal-escape check fails,
+take the first byte of the input (or `0` for an empty string) and render it
+through the existing `charTypeDisplayForm` helper — identical rendering
+rules PostgreSQL's `charout()` uses (empty string for byte 0, plain ASCII
+for printable bytes, `\NNN` octal for the rest).
+
+The tricky part is that `evalCast`'s "char" branch must NOT fire for the
+bare `char`/CHARACTER keyword form — grammar-synthesized to the *same*
+`TargetType=="char"` string with `Typmod==1` (a distinct bpchar(1) cast;
+see the base design above), whose own typmod-truncation/padding semantics
+are a separate, broader, still-unimplemented gap. Since `evalCast`'s shared
+signature takes only a type-name string (no typmod), the disambiguation
+happens at the one call site that has `Typmod` in scope
+(`internal/executor/expr.go`'s `*planner.CastExpr` case in `evalExpr`,
+mirroring `exprType()`'s own `x.Typmod` check in the base design): when
+`x.TargetType == "char" && x.Typmod > 0` the call renames the target type to
+`"bpchar"` for that one `evalCastTyped` invocation only (still matches the
+shared `"text","varchar","bpchar","char"` switch case, but skips the
+inner OID-18-specific branch) — leaving genuine OID-18 casts (`Typmod == 0`)
+untouched.
+
+Tests: `internal/executor/char_oid18_truncation_test.go`'s
+`TestEvalCastCharTruncatesToFirstByte` (direct `evalCast` unit coverage,
+including the octal-escape precedence case) and
+`TestCastExprCharTypmodDisambiguation` (full parse→plan→eval pipeline,
+pinning that `SELECT 'xyz'::"char"` truncates to `"x"` while
+`SELECT 'xyz'::char` stays unchanged at `"xyz"`).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/parser/... ./internal/server/...
+./internal/catalog/...` all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2,
+Q13=33).

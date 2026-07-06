@@ -587,6 +587,36 @@ RTE-style permission pass, planning has no session-role visibility today),
 resume the M0110-0001 multi-database isolation survey above, or survey the
 deferral ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #14):** picked up the "inline-cast `\"char\"` value-
+truncation" residual named by the 2026-07-05 M0122-0005 OID-18-
+disambiguation row (deferred item (1)). Real PG's `charin()` takes the
+first byte of any non-`\NNN`-escape input and silently discards the rest;
+`internal/executor/expr.go`'s `evalCast` `"char"` branch only handled the
+octal-escape form, leaving a plain multi-byte string unchanged. Fixed by
+truncating to the first byte via the existing `charTypeDisplayForm`
+renderer. The one wrinkle: the bare `char`/CHARACTER keyword is
+grammar-synthesized to the *same* `TargetType=="char"` string with
+`Typmod==1` (a distinct bpchar(1) cast, per the base design doc) — so the
+fix is gated at the one call site with `Typmod` in scope
+(`evalExpr`'s `*planner.CastExpr` case), renaming the target type to
+`"bpchar"` for that call only when `Typmod>0`, leaving genuine OID-18 casts
+(`Typmod==0`) as the only ones truncated; `evalCast`'s shared signature is
+unchanged. Tests: `internal/executor/char_oid18_truncation_test.go`'s
+`TestEvalCastCharTruncatesToFirstByte`, `TestCastExprCharTypmodDisambiguation`
+(full pipeline, pins `SELECT 'xyz'::"char"` → `"x"` vs. `SELECT 'xyz'::char`
+unchanged). Design: `docs/design/0122-0005-char-oid18-disambiguation.md`'s
+new "Follow-up: inline-cast value truncation" section;
+`docs/design/README.md` row updated; ledger row appended (status `-`,
+newly deferred: generic bpchar/varchar typmod truncation/padding in the
+inline-cast evaluator, materially broader; the pre-existing `pg_typeof(...)
+::oid` gap is unaffected, still open). Gates: `go build ./...` clean; `go
+test ./internal/executor/... ./internal/planner/... ./internal/parser/...
+./internal/server/... ./internal/catalog/...` all PASS; `scripts/tpch-
+spotcheck.sh` PASS (Q12=2/Q13=33). Next candidate: bpchar/varchar typmod
+truncation in the inline-cast evaluator (small, same-shape follow-up),
+resume the M0110-0001 multi-database isolation survey above, or survey the
+deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

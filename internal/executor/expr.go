@@ -810,7 +810,19 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
-		result, err := evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
+		// Bare `char`/CHARACTER (no explicit length) is grammar-synthesized to
+		// TargetType=="char" with Typmod==1 by the planner (mirroring bpchar's
+		// implicit length-1 default), which is indistinguishable at the string
+		// level from the quoted `"char"` identifier (pg_type OID 18, Typmod==0,
+		// a genuinely different fixed 1-byte internal type). Rename the former
+		// to "bpchar" for this call only so evalCast's OID-18-specific
+		// octal-escape/truncation branch fires solely for the true OID-18 form.
+		// M0122-0005.
+		castTargetType := x.TargetType
+		if castTargetType == "char" && x.Typmod > 0 {
+			castTargetType = "bpchar"
+		}
+		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos())
 		if err != nil {
 			return Datum{}, err
 		}
@@ -2917,6 +2929,13 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				if b, ok := charTypeParseOctalEscape(s); ok {
 					return NewStringDatum(charTypeDisplayForm(b)), nil
 				}
+				// PostgreSQL's charin() takes the first byte of any non-\NNN
+				// input and silently discards the rest (char.c). M0122-0005.
+				var b byte
+				if len(s) > 0 {
+					b = s[0]
+				}
+				return NewStringDatum(charTypeDisplayForm(b)), nil
 			}
 			return d, nil
 		default:
