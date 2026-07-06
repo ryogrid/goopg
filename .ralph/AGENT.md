@@ -191,6 +191,12 @@ not run; it MUST pass cleanly before you commit:
 RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh   # unit/component suite only
 ```
 
+**Headless loop note:** run every gate above in the FOREGROUND (Bash timeouts
+are raised to 15 min default / 60 min max in loop sessions). Never start a gate
+with `run_in_background` and end your turn "waiting for the notification" — in
+headless `-p` mode the task is killed at turn end and the result is lost, so the
+next loop re-runs it. See "Headless Execution Reality" in `.ralph/PROMPT.md`.
+
 Division of labour: `units` (you, once per change) + the hook's `smoke` (every
 commit) = full CI parity, each part run once. Run the `full` scope
 (`scripts/ralph-precommit-test.sh`, unit suite + pgbench) only when you want to

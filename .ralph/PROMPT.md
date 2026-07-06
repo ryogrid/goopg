@@ -44,8 +44,34 @@ wasted turns).
   - `Hypothesis/Findings:` current diagnosis state, ruled-out causes
   - `Next step:` the single concrete next action
   - `Gates run:` which verification gates passed/failed this loop
+  - `In-flight:` any gate/process you had to abandon: exact command, log/output
+    path, PID state when killed, and what result was still needed (write `none`
+    when nothing was abandoned)
 - If the task is fully COMPLETE and committed, replace the contents with just
   `(idle — nothing in flight)` so the next loop starts clean.
+
+## Headless Execution Reality — background tasks DIE at turn end (CRITICAL)
+You run in headless `-p` mode. When you emit your final message the session
+process exits and every `run_in_background` Bash task is KILLED ~5 s later.
+Background-task completion notifications NEVER arrive in this mode — "waiting
+for the notification" ends the session, loses the gate result, and forces the
+next loop to re-run the same gates (this once burned 4 consecutive loops on the
+identical `go test`/`tpch-spotcheck` command).
+- Run test/verification gates (`ralph-precommit-test.sh`, `tpch-spotcheck.sh`,
+  `make race-gate`, pgbench) in the FOREGROUND. Bash timeouts are raised for
+  loop sessions: 15 min default, up to 60 min with an explicit `timeout`
+  parameter on the Bash call.
+- `run_in_background: true` is allowed ONLY if you consume the result in the
+  SAME turn: start it, do other work, then wait with a foreground command
+  (`tail --pid=<PID> -f /dev/null`, large timeout) and READ its output file
+  before your final message.
+- NEVER emit the `---RALPH_STATUS---` block while a gate is still running.
+- If you must abandon a running gate: kill it, then record command + log path +
+  PID state under `In-flight:` in `.ralph/working_set.md` so the next loop
+  resumes instead of re-running from scratch.
+- A Stop guard (`bg_task_guard.py`) will block your finish attempt while gate
+  processes are still alive; when blocked, wait for the named PID in the
+  foreground and read its result — do NOT simply retry finishing.
 
 ## Deferral Ledger
 

@@ -60,3 +60,12 @@ CLAUDE_AUTO_UPDATE=true
 # variables or PATH entries defined in a non-bash shell config (e.g. ~/.zshrc).
 # Leave commented out unless needed.
 #RALPH_SHELL_INIT_FILE="~/.zshrc"
+
+# kaizen (2026-07-06): headless -p mode kills run_in_background tasks ~5s after
+# the final result, so test gates MUST run in the FOREGROUND. Raise the Bash
+# tool timeouts for loop sessions only (this file is sourced by ralph_loop.sh, so
+# the exports reach the claude child). Interactive sessions get only the ceiling
+# via .claude/settings.local.json "env". See "Headless Execution Reality" in
+# .ralph/PROMPT.md and analysis/ralph-loop-kaizen/practice-cards/bg_task_guard.py.
+export BASH_DEFAULT_TIMEOUT_MS=900000    # 15 min default per Bash call
+export BASH_MAX_TIMEOUT_MS=3600000       # 60 min ceiling (race-gate + spotcheck)
