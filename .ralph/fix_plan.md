@@ -61,6 +61,43 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [ ] pgbench/nightly — pgbench nightly stage aborted: `btree: item length
+      mismatch keyLen=9 total=37` at c=100 (AI-20260706-201855-001; repro:
+      `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
+      with s=50 c=100 j=20 T=180). Same error message as the 2026-06-26
+      `M0118-0130` ledger row (recycled-page zeroing moved inside
+      `slot.Lock()`/`slot.Unlock()` in `pinNewOrRecycled`, btree.go:655) — that
+      fix landed but the ledger row's `status` was never flipped to `resolved`
+      because of unresolved sibling items (multi-writer stress flake, Lehman-Yao
+      lock coupling, BTIncompleteSplit-at-descent, splitMu removal); this nightly
+      recurrence suggests the fix was incomplete or a related race, not fully
+      closed. Investigate whether this is a regression of the same root cause
+      or a new one before assuming the June fix regressed.
+      2026-07-06 update (see deferral ledger row appended today, task-id
+      `M-NIGHTLY (AI-20260706-201855-001)`): found a FAST local repro —
+      un-skip `TestMultiWriterStress_M0055_Phase_C` (multi_writer_stress_test.go:40)
+      and loop `go test -run TestMultiWriterStress_M0055_Phase_C -count=1
+      ./internal/access/btree/...`; reproduces a sibling "btree: empty
+      internal page" error in ~2/40 single runs (seconds, not 180s×3).
+      Diagnostic capture showed the failing block's opaque reads as the
+      Go zero value (`level=0 isRoot=false`) while `meta.Root` pointed
+      elsewhere — i.e. a reader reached a page that only went through
+      `storage.InitPage` (`Pool.PinNew`, bufpool.go:1048) but not yet the
+      btree layer's populate step. Root cause localized to
+      `internal/storage/bufpool.go`'s `PinNew` (bufpool.go:1029-1104):
+      it publishes the new block into `bm` + flips `slotValidBit` BEFORE
+      the caller (`pinNewOrRecycled`/`createNewRoot`) gets to `.Lock()`
+      and populate real content — NOT yet proven exactly how a concurrent
+      reader names this slot early (happens-before analysis rules out
+      plain torn-content-read via the per-page mutexes), so the buffer
+      pool's tag/slot bookkeeping itself (claimVictim/evictVictim/
+      tryPinSlot generation handling) is the next thing to instrument.
+      This is the SAME keystone blocker M0118-0130 already flagged as
+      item (4) "buffer-pool eviction protocol concurrency" — still not
+      fixed, still needs its own dedicated, non-rushed investigation
+      loop (previous rushed splitMu-removal attempt already caused a
+      different panic class, per btree.go:601-613). Do not attempt a
+      quick fix here without re-running the fast repro to confirm.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
