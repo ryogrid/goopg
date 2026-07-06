@@ -8,6 +8,7 @@ Every invocation (scheduled or manual) creates one timestamped directory:
 ci/logs/
   scheduler.log                  # the resident daemon's own log (append-only; daemon lines only)
   launch.log                     # scheduled firings' bootstrap stdout/stderr (only pre-run-dir failures land here)
+  action-items.md                # agent-facing failure feed, regenerated every run (doc 07; stable path)
   latest -> 20260707-000012/     # symlink, updated at run start
   20260707-000012/
     progress.log                 # REAL-TIME batch progress (see §B)
@@ -127,6 +128,11 @@ design. The policy:
 table (empty = green), promotable list, TPC-H per-query table (elapsed vs
 20260526 baseline, rows vs anchors), skip/env-drift list, resource-kill
 forensics if any.
+
+`ci/logs/action-items.md` is derived from the same `summary.json` in the same
+S3 pass: every gating failure becomes an `AI-<run>-<seq>` item with a
+copy-pasteable repro command and evidence paths; non-gating notices go to its
+bottom section. Full format and the fix_plan consumption contract: doc 07.
 
 **Exit code contract (normative):** `run-nightly.sh` exits
 - **0** — `status == "pass"`;

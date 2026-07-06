@@ -33,10 +33,13 @@ inside its own cgroup memory cap) →
 barrier → **S2 TPC-H solo** (spotcheck → EXPLAIN capture → 22 queries under a
 2-hour total budget) → **S3 summary** (`summary.md`/`summary.json`, non-zero
 exit on any must-pass failure). Every run writes to
-`ci/logs/<YYYYMMDD-HHMMSS>/` with a real-time `progress.log`. A resident
-scheduler (`ci/batch/nightly-scheduler.sh`), spawned once from
-`~/.ralph/ralph_loop.sh` and guarded by `flock` against duplicates, fires the
-batch daily at ~00:00 local time.
+`ci/logs/<YYYYMMDD-HHMMSS>/` with a real-time `progress.log`, and regenerates
+the agent-facing `ci/logs/action-items.md`, which the Ralph loop consumes as
+its highest-priority work source (standing `M-NIGHTLY` milestone in
+`.ralph/fix_plan.md` — doc 07). A resident scheduler
+(`ci/batch/nightly-scheduler.sh`), spawned once from `~/.ralph/ralph_loop.sh`
+and guarded by `flock` against duplicates, fires the batch daily at ~00:00
+local time.
 
 ## Document map
 
@@ -48,6 +51,7 @@ batch daily at ~00:00 local time.
 | [04-logging-and-reporting.md](04-logging-and-reporting.md) | `ci/logs/<ts>/` layout, progress log, summary schema, perf-tolerance policy, retention |
 | [05-tpch-stage.md](05-tpch-stage.md) | The 2-hour-bounded TPC-H sweep: budget algorithm, EXPLAIN capture, comparisons |
 | [06-scheduler.md](06-scheduler.md) | Resident daemon, `flock` single-instance control, the `ralph_loop.sh` hook patch |
+| [07-ralph-feedback.md](07-ralph-feedback.md) | Failures → `ci/logs/action-items.md` → standing top-priority `M-NIGHTLY` milestone in `.ralph/fix_plan.md` |
 
 ## Design invariants (the short list)
 
@@ -62,3 +66,6 @@ batch daily at ~00:00 local time.
    baselines, and 0-failed-transactions gate; elapsed time only flags on
    drastic events (timeout, budget exhaustion, >2× total baseline).
 5. **One command starts everything**; the scheduler is idempotent to respawn.
+6. **Failures flow back to the loop one-way** — batch writes
+   `ci/logs/action-items.md`; the in-loop agent (never the batch) turns items
+   into top-priority fix_plan tasks (doc 07).

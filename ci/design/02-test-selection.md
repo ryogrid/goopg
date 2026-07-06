@@ -138,6 +138,10 @@ joined against three data sources **at run time** (never hard-coded):
 | test SKIPs (binary/data missing) | skip; `env-drift` if newly skipped | none |
 | process dies by signal 9, no panic | **resource-kill** — check the stage scope's cgroup-OOM events (`dmesg`/`journalctl`; doc 03 §C) | batch marked `inconclusive` (exit 3), not regression |
 
+Every observation classified **regression** (and `perf-drastic`/`fail(build)`)
+also becomes an `AI-` item in `ci/logs/action-items.md`, which feeds the Ralph
+loop's standing top-priority triage milestone — doc 07.
+
 ## C. What is deliberately NOT run nightly
 
 - The 8 `defer` rows of port-status.csv (recovery/subscription remainders

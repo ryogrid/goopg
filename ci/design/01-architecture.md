@@ -126,7 +126,9 @@ cap, so nothing else from the batch may be running. Full design in doc 05.
 
 Aggregates per-stage status files into `summary.md` + `summary.json`,
 classifies failures (regression / expected-fail / resource-kill / skip),
-prunes old run dirs, sets the batch exit code. Schema in doc 04.
+**regenerates `ci/logs/action-items.md`** (the agent-facing feedback file the
+Ralph loop's standing M-NIGHTLY milestone consumes — doc 07), prunes old run
+dirs, sets the batch exit code. Schema in doc 04.
 
 ## Reuse-vs-consolidate table (requirement 10)
 
