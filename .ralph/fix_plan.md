@@ -520,6 +520,78 @@ every clean, green (build + pre-commit) checkpoint.
       tool plus new executor-side `(heap RelOid, index RelOid, blk)` logging
       to catch the exact moment a write meant for one relation lands on the
       other's file.
+      2026-07-07 nightly run (20260707-000712) recurred with the same
+      signature (AI-20260707-000712-004) — folded into this task, no new
+      bullet per the "same subject" rule.
+      2026-07-07 update #7 (16th consecutive loop; see deferral ledger row
+      appended today): executed the prior loop's handoff — read
+      `insertOp.Next` and `updateOp.updateViaIndex` (the index-driven UPDATE
+      path pgbench's `UPDATE ... WHERE aid=:aid` actually takes) end-to-end
+      in `operators_storage.go`. REFUTES the heap-vs-index RelFileNode-
+      crossing hypothesis for these two call sites: `rel`/`idxRel` are
+      always freshly, independently derived from distinct OIDs (no
+      caching); `updateViaIndex`'s `RangeScan` callback only collects
+      matches into a `pendingUpdate` slice and defers all writes until
+      after `RangeScan` fully returns (pins released) — honouring, not
+      violating, the "none re-enter the btree" contract at btree.go:2358;
+      every Pin/RLock/RUnlock/Unpin pairing in both operators is tightly
+      scoped with nothing retained across an Unpin boundary. Also re-derived
+      (not just re-cited) that `claimVictim`/`tryPinSlot`/`Unpin`/`PinNew`/
+      `pinLoad` are correct lock-free CAS state machines and that
+      `storage.InitPage` unconditionally zeroes all 8192 bytes before any
+      btree opaque stamping. NEW proof (upgraded from "assumed" to
+      "certain"): `BTree.freeList`/`pinNewOrRecycled`'s recycle branch is
+      structurally UNREACHABLE in this workload — every `btree.Open()` call
+      site allocates a brand-new `*BTree` Go struct, so `freeList` starts
+      empty every call and can only be populated+drained within the SAME
+      long-lived handle, which only `VacuumIndexPages` bridges; no VACUUM
+      runs during the 25s pgbench window. Also confirmed `BTree.rel` is
+      immutable per-instance (no cross-instance aliasing) and
+      `upsertOp.leafTrees` is operator-instance-scoped and irrelevant to
+      plain TPC-B (no ON CONFLICT). No fix landed; no new mechanism found.
+      Next step (two options, priority order): (1) loop 12's still-
+      outstanding checksum/line-pointer-sample instrumentation immediately
+      before `evictVictim`'s `flushSlot` and immediately after
+      `relFile.writeBlock`/`readBlock`'s WriteAt/ReadAt (never actually run
+      — loops 13-15 pivoted onto other threads); (2) audit
+      `emitCanonicalHeapInsert`/`emitCanonicalHeapDelete` and their shared
+      `MarkDirtyChangeRecord`/`MarkDirtyLogicalChange` plumbing for a
+      mis-routed logical-record replay path (flagged unaudited by loop 14).
+      Full detail in today's deferral ledger row (16th consecutive loop).
+
+- [ ] race/internal/wal — race suite failed in package
+      `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
+      `go test -race -timeout 15m ./internal/wal/`; evidence:
+      `ci/logs/20260707-000712/race/go-test.log`).
+- [ ] testport/TestPort_IsolationEvalPlanQual — FAILed
+      (AI-20260707-000712-002; repro: `go test -v -run
+      '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`; evidence:
+      `ci/logs/20260707-000712/testport/go-test.log`).
+- [ ] testport/TestPort_IsolationEvalPlanQualTrigger — FAILed
+      (AI-20260707-000712-003; repro: `go test -v -run
+      '^TestPort_IsolationEvalPlanQualTrigger$' ./internal/testport/`;
+      evidence: `ci/logs/20260707-000712/testport/go-test.log`).
+- [ ] tpch/Q21-error — Q21 errored during the sweep (AI-20260707-000712-005;
+      repro: `tmp/tpch-nightly-runner -port 65433 -db postgres -user
+      <superuser> -queries 21 -per-query-timeout 1200s` against a server on
+      `bench/tpch/runtime_goopg/data`, port 65433 when free, or a copy first
+      — `ci/design/05-tpch-stage.md` §A; evidence:
+      `ci/logs/20260707-000712/tpch/run.log`).
+- [ ] tpch/Q15b-MAIN-explain — EXPLAIN Q15b-MAIN errored during the
+      plan-capture pass (AI-20260707-000712-006; repro: `tmp/tpch-nightly-
+      runner -port 65433 -db postgres -user <superuser> -queries 15 -explain
+      -per-query-timeout 60s`, same server setup as above; evidence:
+      `ci/logs/20260707-000712/tpch/explain-run.log`).
+- [ ] tpch/Q9-timeout — Q9 hit its per-query budget (57014/cancel)
+      (AI-20260707-000712-007; repro: `tmp/tpch-nightly-runner -port 65433
+      -db postgres -user <superuser> -queries 9 -per-query-timeout 1200s`,
+      same server setup as above; evidence:
+      `ci/logs/20260707-000712/tpch/run.log`).
+- [ ] tpch/Q20-timeout — Q20 hit its per-query budget (57014/cancel)
+      (AI-20260707-000712-008; repro: `tmp/tpch-nightly-runner -port 65433
+      -db postgres -user <superuser> -queries 20 -per-query-timeout 1200s`,
+      same server setup as above; evidence:
+      `ci/logs/20260707-000712/tpch/run.log`).
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
