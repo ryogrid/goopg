@@ -541,6 +541,15 @@ type SeqScan struct {
 	// inheritance-child scan. M0118-0008 (alter-table-4 perm 4: concurrent
 	// `ALTER TABLE c1 ALTER COLUMN a TYPE float`).
 	InheritParentOID uint32
+	// PrivilegeCheckRole / PrivilegeCheckRoleSet override which role's SELECT
+	// grant the executor checks against Table: set by tagViewOwnerScans when
+	// this scan sits inside an inlined, non-security_invoker view (PostgreSQL
+	// runs a view's underlying-table reads as the view owner, not the
+	// querying role). Unset (PrivilegeCheckRoleSet == false) means "use the
+	// querying session's own role", the direct-table-scan default. M0122-0008
+	// (view-owner privilege gap).
+	PrivilegeCheckRole    string
+	PrivilegeCheckRoleSet bool
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }
@@ -572,6 +581,10 @@ type IndexScan struct {
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	schema  Schema
+	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
+	// same name. M0122-0008 (view-owner privilege gap).
+	PrivilegeCheckRole    string
+	PrivilegeCheckRoleSet bool
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -624,6 +637,10 @@ type IndexOnlyScan struct {
 	// contains (a subset of Index.Columns, in projection order).
 	Covered []catalog.Column
 	schema  Schema
+	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
+	// same name. M0122-0008 (view-owner privilege gap).
+	PrivilegeCheckRole    string
+	PrivilegeCheckRoleSet bool
 }
 
 func (n *IndexOnlyScan) Pos() int       { return n.pos }

@@ -4659,10 +4659,12 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// the same name after a restart. Capture it here (before the temporary
 	// DropView) so the heap-sync block below can stamp its xmax.
 	var oldViewOID uint32
+	var oldViewOwner string
 	if s.OrReplace {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 			if existing, ok2 := im.LookupTable(s.Name); ok2 && existing.View != nil {
 				oldViewOID = existing.OID
+				oldViewOwner = existing.Owner
 			}
 			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
 		}
@@ -4730,6 +4732,20 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	}
 	// Preserve the raw view body so pg_get_viewdef can echo it for pg_dump.
 	if vt != nil {
+		// Stamp the creating role as owner — PostgreSQL's CREATE VIEW makes
+		// the invoking role the owner (GetUserId(), like every other CREATE),
+		// and the view-owner is what dmlPrivilegePermittedAs checks against
+		// once a query is planned through the view (M0122-0008). Without
+		// this every view is silently "owned" by the bootstrap superuser
+		// regardless of who ran CREATE VIEW. CREATE OR REPLACE keeps the
+		// old view's owner (only ALTER VIEW ... OWNER TO changes it in real
+		// PostgreSQL, not a replacing CREATE OR REPLACE) rather than
+		// re-stamping the replacing role's identity.
+		if s.OrReplace && oldViewOID != 0 {
+			vt.Owner = oldViewOwner
+		} else {
+			vt.Owner = o.ctx.NonSuperuserRole
+		}
 		vt.ViewDef = s.RawDef
 		// A `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
 		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the

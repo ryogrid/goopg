@@ -2147,6 +2147,15 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		if err != nil {
 			return nil, rangeBinding{}, err
 		}
+		// PostgreSQL runs a view's underlying-table reads as the view owner
+		// (security-definer-like), not the querying role, unless the view
+		// opted into `WITH (security_invoker = true)` — in which case the
+		// querying role's own privileges apply straight through, so leave
+		// every scan's PrivilegeCheckRole unset. M0122-0008 (view-owner
+		// privilege gap).
+		if !(tbl.SecurityInvokerSet && tbl.SecurityInvoker) {
+			tagViewOwnerScans(inner, tbl.Owner)
+		}
 		innerSchema := inner.Output()
 		if len(innerSchema) != len(tbl.Columns) {
 			return nil, rangeBinding{}, &PlanError{

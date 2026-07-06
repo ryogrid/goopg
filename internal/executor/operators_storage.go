@@ -696,6 +696,13 @@ type seqScanOp struct {
 	// (alter-table-4 perm 3).
 	skipIfVanished bool
 
+	// privilegeCheckRole / privilegeCheckRoleSet override which role's SELECT
+	// grant is checked against tbl: set when this scan sits inside an inlined,
+	// non-security_invoker view (planner.SeqScan.PrivilegeCheckRole/Set).
+	// M0122-0008 (view-owner privilege gap).
+	privilegeCheckRole    string
+	privilegeCheckRoleSet bool
+
 	// inheritParentOID is the inheritance parent this child scan was expanded
 	// from (0 for a non-inheritance scan). After the child's lock is acquired
 	// (a concurrent ALTER on the child has committed) the child's column types
@@ -964,13 +971,15 @@ func canonicalTypeClass(im *catalog.InMemory, t catalog.Type) string {
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{
-		schema:           p.Output(),
-		tbl:              p.Table,
-		pos:              p.Pos(),
-		cols:             p.Table.Columns,
-		lockParentOID:    p.LockParentOID,
-		skipIfVanished:   p.SkipIfVanished,
-		inheritParentOID: p.InheritParentOID,
+		schema:                p.Output(),
+		tbl:                   p.Table,
+		pos:                   p.Pos(),
+		cols:                  p.Table.Columns,
+		lockParentOID:         p.LockParentOID,
+		skipIfVanished:        p.SkipIfVanished,
+		inheritParentOID:      p.InheritParentOID,
+		privilegeCheckRole:    p.PrivilegeCheckRole,
+		privilegeCheckRoleSet: p.PrivilegeCheckRoleSet,
 	}
 }
 
@@ -1032,7 +1041,7 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
 	}
-	if o.tbl != nil && !dmlPrivilegePermitted(ctx, o.tbl, "SELECT") {
+	if o.tbl != nil && !dmlPrivilegePermittedAs(ctx, o.tbl, "SELECT", selectPrivilegeCheckRole(ctx, o.privilegeCheckRoleSet, o.privilegeCheckRole)) {
 		return &ExecError{Code: "42501", Pos: o.pos, Message: fmt.Sprintf("permission denied for table %s", o.tbl.Name)}
 	}
 	// Reject scans of unpopulated materialized views (WITH NO DATA / before REFRESH). M0097-0025.
@@ -1729,9 +1738,26 @@ func (o *insertOp) appendInsertRetRow(row Row) {
 // PostgreSQL's pre-lock ACL check (M0118-0008 truncate-conflict precedent).
 // M0097-0040.
 func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
-	role := ctx.NonSuperuserRole
-	if role == "" {
-		return true // bootstrap superuser: full privileges
+	return dmlPrivilegePermittedAs(ctx, tbl, priv, ctx.NonSuperuserRole)
+}
+
+// dmlPrivilegePermittedAs is dmlPrivilegePermitted with an explicit
+// checkRole: the three SELECT-gated scan operators (seqScanOp, indexScanOp,
+// indexOnlyScanOp) pass the *view owner* here instead of ctx.NonSuperuserRole
+// when the scan sits inside an inlined, non-security_invoker view —
+// PostgreSQL runs a view's underlying-table reads as the view owner, not the
+// querying role (planner.tagViewOwnerScans stamps the override at plan
+// time), so `GRANT SELECT ON view TO role` alone (no matching base-table
+// grant) still lets role query through it. The querying session's own
+// superuser bypass always wins regardless of checkRole — a superuser
+// session runs everything as itself, view-owner semantics or not.
+// M0122-0008 (view-owner privilege gap).
+func dmlPrivilegePermittedAs(ctx *Context, tbl *catalog.Table, priv, checkRole string) bool {
+	if ctx.NonSuperuserRole == "" {
+		return true // bootstrap superuser session: full privileges
+	}
+	if checkRole == "" {
+		return true // effective role is the bootstrap superuser (e.g. a superuser-owned view)
 	}
 	if priv == "SELECT" && tbl != nil && catalog.IsSystemRelation(tbl.OID) {
 		// PostgreSQL seeds every system catalog/view with an implicit PUBLIC
@@ -1742,10 +1768,21 @@ func dmlPrivilegePermitted(ctx *Context, tbl *catalog.Table, priv string) bool {
 		// relations below FirstNormalObjectId. M0097-0040 SELECT follow-up.
 		return true
 	}
-	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, role) {
+	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, checkRole) {
 		return true
 	}
-	return ctx.Catalog.HasTablePrivilege(tbl.OID, role, priv)
+	return ctx.Catalog.HasTablePrivilege(tbl.OID, checkRole, priv)
+}
+
+// selectPrivilegeCheckRole resolves the role whose SELECT grant a scan
+// operator should check: the view owner when the scan was tagged by
+// planner.tagViewOwnerScans (roleSet), otherwise the querying session's own
+// role. M0122-0008 (view-owner privilege gap).
+func selectPrivilegeCheckRole(ctx *Context, roleSet bool, role string) string {
+	if roleSet {
+		return role
+	}
+	return ctx.NonSuperuserRole
 }
 
 func (o *insertOp) Open(ctx *Context) error {

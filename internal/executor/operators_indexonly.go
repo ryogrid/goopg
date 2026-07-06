@@ -53,7 +53,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: "IndexOnlyScan requires storage handles"}
 	}
-	if o.plan.Table != nil && !dmlPrivilegePermitted(ctx, o.plan.Table, "SELECT") {
+	if o.plan.Table != nil && !dmlPrivilegePermittedAs(ctx, o.plan.Table, "SELECT", selectPrivilegeCheckRole(ctx, o.plan.PrivilegeCheckRoleSet, o.plan.PrivilegeCheckRole)) {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	o.ctx = ctx

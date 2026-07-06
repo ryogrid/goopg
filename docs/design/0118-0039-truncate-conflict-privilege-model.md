@@ -269,3 +269,118 @@ Gates: `go build ./...` clean; `go vet` clean; `go test
 'TestPort_IsolationTruncateConflict|TestPort_IsolationIntraGrantInplace'`
 PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); pre-commit pgbench
 smoke PASS.
+
+## Follow-up (2026-07-06): view-owner privilege check (M0122-0008)
+
+Closes the "Remaining gap" from the SELECT-enforcement follow-up above:
+`GRANT SELECT ON view TO role` alone (no matching grant on the view's base
+table) was wrongly denied with 42501, because the view's underlying scans
+were checked against the *querying* role instead of the *view owner* —
+PostgreSQL's default (non-`security_invoker`) view semantics run a view's
+underlying-table reads as the view owner.
+
+**Root cause, part 1 (the real bug):** `catalog.InMemory.CreateView`
+(`internal/catalog/catalog.go`) never set `Owner` on the new `Table` at
+all — `execCreateView` (`internal/executor/operators_ddl.go`) never assigned
+it either. So every view was silently "owned" by the bootstrap superuser
+(`Owner == ""`) regardless of who ran `CREATE VIEW`, even though
+`ALTER VIEW ... OWNER TO` (the shared table/view code path,
+`operators_ddl.go`'s `s.OwnerTo != ""` branch) correctly *changes* an
+existing owner — there was just no initial creator-owner to change.
+`execCreateView` now stamps `vt.Owner = o.ctx.NonSuperuserRole` right after
+`CreateView` returns (mirroring `currentDDLOwnerOID`'s
+"current role, or bootstrap superuser" convention used elsewhere), except
+on `CREATE OR REPLACE VIEW`, which keeps the replaced view's existing owner
+(captured before the temporary `DropView`) — matching real PostgreSQL, where
+only `ALTER VIEW ... OWNER TO` changes an existing view's owner, not a
+replacing `CREATE OR REPLACE`. Owner changes here (like `ALTER ... OWNER TO`
+elsewhere in this file) are in-memory only; restart persistence for
+`Table.Owner` is a pre-existing, broader gap that applies uniformly to
+tables and views alike (ledger row), not something this loop's scope
+touches.
+
+**Root cause, part 2 (the plumbing):** views are inlined at plan time
+(`planner.go`'s `if tbl.View != nil { inner, err := Plan(tbl.View, cat) }`)
+with the substituted plan's scans carrying no notion of "which role's
+privileges apply here" — `dmlPrivilegePermitted` always read
+`ctx.NonSuperuserRole`, the querying session's own role. Fixed with:
+
+- `planner.SeqScan`/`IndexScan`/`IndexOnlyScan` gain a
+  `PrivilegeCheckRole string` / `PrivilegeCheckRoleSet bool` pair (unset by
+  default — "use the querying session's own role", the direct-table-scan
+  case).
+- New `tagViewOwnerScans(n Node, owner string)`
+  (`internal/planner/view_privilege.go`): walks every container node type in
+  the inlined plan tree (`Project`/`Filter`/`Sort`/`Limit`/`Distinct`/
+  `DistinctOn`/`Aggregate`/`WindowAgg`/`ProjectSet`/`CTEScan`/`LockRows`/
+  `Join`/`NestedLoopIndexJoin`/`MultiHashJoin`/`SetOp`) and tags every
+  `SeqScan`/`IndexScan`/`IndexOnlyScan` leaf whose `PrivilegeCheckRoleSet` is
+  still `false` with the view's owner. Called from `planScanRangeVar`
+  (`planner.go`) right after `Plan(tbl.View, cat)` returns, **unless** the
+  view opted into `WITH (security_invoker = true)`
+  (`tbl.SecurityInvokerSet && tbl.SecurityInvoker`) — PG 15+'s escape hatch
+  that runs a view's reads as the querying role instead, which
+  `SecurityInvoker`/`SecurityInvokerSet` already carried on `catalog.Table`
+  but (per its doc comment) had never actually been enforced anywhere before
+  this loop. Leaving already-tagged scans alone is what makes nested views
+  (view-of-view) correct: `Plan(tbl.View, cat)` recurses depth-first, so a
+  nested view's own `tagViewOwnerScans` call (from its own frame) completes
+  and stamps its immediate underlying scans with *its own* owner before the
+  outer frame regains control and tags whatever is still untagged with the
+  outer view's owner — each nesting level keeps its own owner instead of
+  collapsing to the outermost one.
+- `dmlPrivilegePermitted(ctx, tbl, priv)` is now a thin wrapper around new
+  `dmlPrivilegePermittedAs(ctx, tbl, priv, checkRole string)`
+  (`internal/executor/operators_storage.go`), which takes the checking role
+  as an explicit parameter instead of always reading `ctx.NonSuperuserRole`.
+  The querying session's own superuser bypass (`ctx.NonSuperuserRole == ""`)
+  still wins unconditionally — a superuser session runs everything as
+  itself regardless of view-owner semantics — checked *before* the
+  `checkRole`-based owner/grant lookup. A `checkRole == ""` (the effective
+  role is itself the bootstrap superuser, e.g. a superuser-owned view) also
+  short-circuits to permitted. New `selectPrivilegeCheckRole(ctx, roleSet,
+  role)` resolves which role each of the three SELECT-gated scan operators
+  passes as `checkRole`: the tagged role when `PrivilegeCheckRoleSet`,
+  otherwise `ctx.NonSuperuserRole` (unchanged behavior for direct table
+  scans). `seqScanOp` extracts `PrivilegeCheckRole`/`Set` into its own struct
+  fields at construction time (Phase C.3 migration: it no longer keeps a
+  `*planner.SeqScan` pointer); `indexScanOp`/`indexOnlyScanOp` read them
+  straight off the `*planner.IndexScan`/`*planner.IndexOnlyScan` they
+  already hold.
+
+**Still open (recorded, not fixed here):** the view's *own* ACL is never
+checked against the querying role at all — there is no plan/operator node
+representing "scan the view itself" (it disappears entirely into its
+inlined expansion), so a role with **zero** grants anywhere (not even on the
+view) can still read through a view whose owner happens to have base-table
+access. This is not a regression introduced by this loop — it was already
+true before the view-owner fix landed (the base-table-only check that
+existed then never consulted the view's ACL either) — but it means `GRANT
+SELECT ON view` is not yet a hard prerequisite for view access the way real
+PostgreSQL's `ExecCheckRTPerms` (which walks the whole range table,
+including the view's own un-inlined RTE) makes it. Fixing it needs a
+preliminary per-statement permission pass over the plan tree (planning has
+no `Context`/session-role visibility today — only the executor operators
+do), a materially larger, separately-scoped change. Ledger row filed.
+
+Tests: `internal/planner/view_privilege_test.go`'s
+`TestPlanViewInliningTagsScanWithOwnerRole` (view inlining tags the SeqScan
+with the view's owner) and `TestPlanViewInliningSecurityInvokerSkipsOwnerTag`
+(security_invoker view leaves the scan untagged);
+`internal/executor/storage_dml_test.go`'s
+`TestScanOperatorsUseViewOwnerPrivilegeOverride` (all three SELECT-gated scan
+operators honor the tagged override role, both allow and deny directions,
+including a grant-based allow distinct from ownership);
+`internal/executor/view_owner_privilege_test.go`'s
+`TestCreateViewStampsCreatingRoleAsOwner` (CREATE VIEW stamps the creating
+role, CREATE OR REPLACE VIEW preserves the existing owner) and
+`TestViewOwnerPrivilegeGrantsThroughView` (full end-to-end: a role with
+SELECT on a view only, no base-table grant, is denied until the view owner
+gains SELECT on the base table, then succeeds — the reported bug's exact
+scenario).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/catalog/... ./internal/parser/...
+./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+`scripts/ralph-precommit-test.sh` PASS (full suite + pgbench TPC-B/
+simple-update/select-only smoke, 0 failed).

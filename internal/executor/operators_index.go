@@ -204,7 +204,7 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "IndexScan requires storage handles in Context"}
 	}
-	if o.plan.Table != nil && !dmlPrivilegePermitted(ctx, o.plan.Table, "SELECT") {
+	if o.plan.Table != nil && !dmlPrivilegePermittedAs(ctx, o.plan.Table, "SELECT", selectPrivilegeCheckRole(ctx, o.plan.PrivilegeCheckRoleSet, o.plan.PrivilegeCheckRole)) {
 		return &ExecError{Code: "42501", Pos: o.plan.Pos(), Message: fmt.Sprintf("permission denied for table %s", o.plan.Table.Name)}
 	}
 	o.ctx = ctx

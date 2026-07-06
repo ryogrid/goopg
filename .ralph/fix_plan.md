@@ -563,6 +563,30 @@ domain-constraint-enforcement gap, resume the M0110-0001 multi-database
 isolation survey above, or survey the deferral ledger for a fresh open
 (`status = -`) row.
 
+**2026-07-06 (loop #13):** picked up the domain-constraint-enforcement gap
+named above across two loops (INSERT then UPDATE/upsert), then this loop
+picked up the "views inline with no view-owner identity" gap flagged under
+M0122-0008 since 2026-07-05. `CREATE VIEW` now stamps the creating role as
+`Owner` (it never had before — every view was silently owned by the
+bootstrap superuser); the planner's new `tagViewOwnerScans`
+(`internal/planner/view_privilege.go`) tags every scan inside an inlined
+view's plan tree with the view owner's role, honoring `WITH
+(security_invoker = true)` (now actually enforced for the first time —
+previously parsed/round-tripped but never consulted); the executor's
+`dmlPrivilegePermitted` gained an explicit-checkRole variant
+(`dmlPrivilegePermittedAs`) the three SELECT-gated scan operators call with
+the tagged role. `GRANT SELECT ON view TO role` alone (no base-table grant)
+now works, closing the reported false-negative without opening a new
+false-positive (the symmetric "view's own ACL is never checked" gap already
+existed before this fix and is recorded, not newly introduced). See
+`docs/design/0118-0039-truncate-conflict-privilege-model.md`'s new
+"Follow-up (2026-07-06): view-owner privilege check" section and the
+matching ledger row for full detail. Next candidate: the just-recorded
+view's-own-ACL gap (materially larger — needs a preliminary per-statement
+RTE-style permission pass, planning has no session-role visibility today),
+resume the M0110-0001 multi-database isolation survey above, or survey the
+deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
@@ -1510,12 +1534,29 @@ mirroring M0119's ledger `status` column.
       `TestSeqScanRequiresSelectPrivilege`,
       `TestIndexScansRequireSelectPrivilege`,
       `TestSystemCatalogSelectAlwaysPermitted`. Design doc Follow-up section
-      extended; `unimplemented_feat.json` updated in place. **Still open in
-      this bucket:** views inline into the querying role's own scan with no
-      view-owner identity, so `GRANT SELECT ON view` alone (no base-table
-      grant) is now denied (ledger, scope boundary — untested by any
-      existing suite). SASLprep/channel binding/`scram_iterations`, encoding
-      constraints.
+      extended; `unimplemented_feat.json` updated in place.
+      **View-owner privilege check landed (2026-07-06):** `execCreateView`
+      now stamps the creating role as `Owner` (previously every view was
+      silently owned by the bootstrap superuser); new
+      `planner.tagViewOwnerScans` (`internal/planner/view_privilege.go`)
+      tags every scan inside an inlined view's plan tree with the view
+      owner's role (skipped under `WITH (security_invoker = true)`, now
+      actually enforced for the first time); `dmlPrivilegePermittedAs`
+      lets the three SELECT-gated scan operators check that tagged role
+      instead of the querying session's own. `GRANT SELECT ON view TO
+      role` alone (no base-table grant) now works. Tests:
+      `internal/planner/view_privilege_test.go`,
+      `internal/executor/storage_dml_test.go`'s
+      `TestScanOperatorsUseViewOwnerPrivilegeOverride`,
+      `internal/executor/view_owner_privilege_test.go`. Design:
+      `docs/design/0118-0039-truncate-conflict-privilege-model.md` Follow-up
+      section; ledger row (resolved). **Still open (ledger, scope
+      boundary):** the view's own ACL is never checked against the
+      querying role (no plan node represents "scan the view itself"), so a
+      role with zero grants anywhere can still read a view whose owner has
+      base-table access — needs a preliminary per-statement RTE-style
+      permission pass, materially larger than this follow-up.
+      SASLprep/channel binding/`scram_iterations`, encoding constraints.
 - [ ] **M0122-0009 — WAL / recovery / crash-consistency infra** (~16). WAL segment
       recycling, `WALInsertLock` array (parallel inserts), MultiXact WAL,
       `pg_subtrans` truncation. Gate: `-race` + recovery E2E (WAL practice card).
