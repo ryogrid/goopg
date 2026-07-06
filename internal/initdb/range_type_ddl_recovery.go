@@ -58,7 +58,7 @@ func replayRangeTypeDDLRecords(walDir string, cat *catalog.InMemory) error {
 		}
 		switch rec.Payload[0] {
 		case wal.RecordKindCreateRangeType:
-			name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, derr := wal.DecodeCreateRangeType(rec.Payload)
+			name, subtypeName, multirangeName, oid, arrayOID, multirangeOID, multirangeArrayOID, opclassOID, collationOID, ownerOID, derr := wal.DecodeCreateRangeType(rec.Payload)
 			if derr != nil {
 				return fmt.Errorf("decode create-range-type at lsn %d: %w", rec.StartLSN, derr)
 			}
@@ -72,6 +72,7 @@ func replayRangeTypeDDLRecords(walDir string, cat *catalog.InMemory) error {
 				MultirangeOID:      multirangeOID,
 				MultirangeArrayOID: multirangeArrayOID,
 				MultirangeName:     multirangeName,
+				Owner:              ownerOID,
 			})
 		case wal.RecordKindDropRangeType:
 			name, derr := wal.DecodeDropRangeType(rec.Payload)
@@ -79,6 +80,18 @@ func replayRangeTypeDDLRecords(walDir string, cat *catalog.InMemory) error {
 				return fmt.Errorf("decode drop-range-type at lsn %d: %w", rec.StartLSN, derr)
 			}
 			cat.DropRangeTypeDuringRecovery(name)
+		case wal.RecordKindAlterRangeTypeRename:
+			name, newName, derr := wal.DecodeAlterRangeTypeRename(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-range-type-rename at lsn %d: %w", rec.StartLSN, derr)
+			}
+			cat.RenameRangeTypeDuringRecovery(name, newName)
+		case wal.RecordKindAlterRangeTypeOwner:
+			name, ownerOID, derr := wal.DecodeAlterRangeTypeOwner(rec.Payload)
+			if derr != nil {
+				return fmt.Errorf("decode alter-range-type-owner at lsn %d: %w", rec.StartLSN, derr)
+			}
+			cat.SetRangeTypeOwnerDuringRecovery(name, ownerOID)
 		}
 	}
 	return nil

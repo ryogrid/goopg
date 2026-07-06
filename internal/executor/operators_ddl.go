@@ -111,6 +111,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterEventTrigger(s)
 	case *parser.CreateAccessMethodStmt:
 		return nil, o.execCreateAccessMethod(s)
+	case *parser.AlterDefaultPrivilegesStmt:
+		return nil, o.execAlterDefaultPrivileges(s)
 	case *parser.CreateFunctionStmt:
 		return nil, o.execCreateFunction(s)
 	case *parser.AlterFunctionStmt:
@@ -189,6 +191,12 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateDomain(s)
 	case *parser.DropDomainStmt:
 		return nil, o.execDropDomain(s)
+	case *parser.AlterDomainStmt:
+		return nil, o.execAlterDomain(s)
+	case *parser.AlterTSConfigStmt:
+		return nil, o.execAlterTSConfig(s)
+	case *parser.AlterTSDictStmt:
+		return nil, o.execAlterTSDict(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
 }
@@ -4651,10 +4659,12 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	// the same name after a restart. Capture it here (before the temporary
 	// DropView) so the heap-sync block below can stamp its xmax.
 	var oldViewOID uint32
+	var oldViewOwner string
 	if s.OrReplace {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 			if existing, ok2 := im.LookupTable(s.Name); ok2 && existing.View != nil {
 				oldViewOID = existing.OID
+				oldViewOwner = existing.Owner
 			}
 			_ = im.DropView(s.Name, true) // remove old def so plan can't cycle back to it
 		}
@@ -4722,6 +4732,20 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 	}
 	// Preserve the raw view body so pg_get_viewdef can echo it for pg_dump.
 	if vt != nil {
+		// Stamp the creating role as owner — PostgreSQL's CREATE VIEW makes
+		// the invoking role the owner (GetUserId(), like every other CREATE),
+		// and the view-owner is what dmlPrivilegePermittedAs checks against
+		// once a query is planned through the view (M0122-0008). Without
+		// this every view is silently "owned" by the bootstrap superuser
+		// regardless of who ran CREATE VIEW. CREATE OR REPLACE keeps the
+		// old view's owner (only ALTER VIEW ... OWNER TO changes it in real
+		// PostgreSQL, not a replacing CREATE OR REPLACE) rather than
+		// re-stamping the replacing role's identity.
+		if s.OrReplace && oldViewOID != 0 {
+			vt.Owner = oldViewOwner
+		} else {
+			vt.Owner = o.ctx.NonSuperuserRole
+		}
 		vt.ViewDef = s.RawDef
 		// A `WITH [CASCADED|LOCAL] CHECK OPTION` clause surfaces as the
 		// `check_option=<mode>` pg_class.reloption; pg_dump re-emits it as the
@@ -14513,6 +14537,30 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 						}
 					}
 				}
+				if objType == "text search dictionary" {
+					// Drop the dump-visible pg_ts_dict registry entry too so a
+					// dropped dictionary stops round-tripping through pg_dump
+					// (DU-002 slice 437). WAL-emit the drop so it survives a
+					// restart, mirroring DROP CONVERSION above.
+					if im.DropTSDict(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSDict(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
+							return fmt.Errorf("wal drop-tsdict: %w", werr)
+						}
+					}
+				}
+				if objType == "text search configuration" {
+					// Drop the dump-visible pg_ts_config registry entry (and its
+					// pg_ts_config_map rows, held inline on the same struct) too
+					// so a dropped configuration stops round-tripping through
+					// pg_dump (DU-002 slice 446). WAL-emit the drop so it
+					// survives a restart, mirroring DROP TEXT SEARCH DICTIONARY
+					// above.
+					if im.DropTSConfig(s.Names[0].Name, s.Names[0].Schema) && o.ctx.WAL != nil {
+						if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfig(s.Names[0].Name, s.Names[0].Schema)); werr != nil {
+							return fmt.Errorf("wal drop-tsconfig: %w", werr)
+						}
+					}
+				}
 				if im.DropCompatObject(objType, s.Names[0].String()) {
 					return nil
 				}
@@ -14640,6 +14688,18 @@ func validateCreateConversionEncodings(forName, toName string) (forEnc, toEnc in
 		return 0, 0, &ExecError{Code: "42P17", Message: `encoding conversion to or from "SQL_ASCII" is not supported`}
 	}
 	return forEnc, toEnc, nil
+}
+
+// serializeTSDictOptions reconstructs a CREATE TEXT SEARCH DICTIONARY's
+// dictinitoption text exactly as PostgreSQL's serialize_deflist
+// (tsearchcmds.c) does. Thin wrapper over catalog.SerializeTSDictOptions
+// (moved there as an ALTER TEXT SEARCH DICTIONARY follow-up, M0119-0004, so
+// AlterTSDictOptions can reuse the identical serialization without an
+// executor->catalog import cycle) — kept as a same-name alias here so this
+// package's one call site (the CREATE TEXT SEARCH DICTIONARY case below)
+// didn't need a rename. DU-002 slice 437.
+func serializeTSDictOptions(opts []parser.TSDictOption) string {
+	return catalog.SerializeTSDictOptions(opts)
 }
 
 // resolveConversionFunc mirrors the FROM-function checks PostgreSQL performs in
@@ -15527,6 +15587,131 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				return fmt.Errorf("wal create-conversion: %w", werr)
 			}
 		}
+	case "text search dictionary":
+		// Register the dictionary (CREATE TEXT SEARCH DICTIONARY name (TEMPLATE =
+		// tmpl [, opt = val, ...])) so it round-trips through pg_dump (pg_ts_dict
+		// view → getTSDictionaries / dumpTSDictionary). DU-002 slice 437.
+		//
+		// TEMPLATE is required, mirroring DefineTSDictionary's own
+		// ERRCODE_INVALID_OBJECT_DEFINITION check (tsearchcmds.c) — goopg only
+		// resolves the four real built-in templates (BuiltinTSTemplateOID);
+		// CREATE TEXT SEARCH TEMPLATE stays unimplemented (a C-function-loading
+		// feature with no analog here), so no user-defined template can ever be
+		// named.
+		tmplName := strings.ToLower(s.TSDictTemplate.Name)
+		templOID, ok := catalog.BuiltinTSTemplateOID[tmplName]
+		if !ok || tmplName == "" {
+			return &ExecError{Code: "42704", Message: "text search template is required"}
+		}
+		// verify_dictoptions (tsearchcmds.c): reject any option name the
+		// chosen template's own init function doesn't recognize.
+		if verr := catalog.ValidateTSDictOptions(tmplName, s.TSDictOptions); verr != nil {
+			return &ExecError{Code: "22023", Message: verr.Error()}
+		}
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		ud := &catalog.UserTSDict{
+			Name:       s.ObjName.Name,
+			Owner:      uint32(10), // bootstrap superuser (postgres)
+			Template:   templOID,
+			InitOption: serializeTSDictOptions(s.TSDictOptions),
+		}
+		if _, err := im.CreateTSDict(ud, schema); err != nil {
+			return &ExecError{Code: "42710", Message: err.Error()}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event the recovery driver (internal/initdb/tsdict_ddl_recovery.go)
+		// replays into the dictionary registry on the next startup. Mirrors
+		// CREATE CONVERSION/CAST/TRANSFORM.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSDict(ud.Name, schema, ud.InitOption, ud.OID, ud.Owner, ud.Template)); werr != nil {
+				return fmt.Errorf("wal create-tsdict: %w", werr)
+			}
+		}
+	case "text search configuration":
+		// Register the configuration (CREATE TEXT SEARCH CONFIGURATION name
+		// (PARSER = parser_name)) so it round-trips through pg_dump (pg_ts_config
+		// view → getTSConfigurations / dumpTSConfig). DU-002 slice 446.
+		//
+		// Either PARSER or COPY must be given (never both — mirrors
+		// DefineTSConfiguration's ERRCODE_SYNTAX_ERROR check, tsearchcmds.c). The
+		// COPY = source_config form (DU-002 slice 446 follow-up) resolves an
+		// existing configuration, takes its parser, and copies its
+		// pg_ts_config_map rows into the new one; the bare PARSER form leaves
+		// mappings empty (added afterward via ALTER ... ADD MAPPING). goopg only
+		// resolves the one real built-in parser (BuiltinTSParserOID); CREATE TEXT
+		// SEARCH PARSER is unimplemented (a C-function-loading feature with no
+		// analog here), so no user-defined parser can ever be named.
+		parserName := strings.ToLower(s.TSConfigParser.Name)
+		copySourceName := s.TSConfigCopySource.Name
+		if parserName != "" && copySourceName != "" {
+			return &ExecError{Code: "42601", Message: "cannot specify both PARSER and COPY options"}
+		}
+		var parserOID uint32
+		var copySource *catalog.UserTSConfig
+		if copySourceName != "" {
+			for _, existing := range im.ListUserTSConfigs() {
+				if strings.EqualFold(existing.Name, copySourceName) {
+					copySource = existing
+					break
+				}
+			}
+			if copySource == nil {
+				return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", copySourceName)}
+			}
+			parserOID = copySource.Parser
+		} else {
+			oid, ok := catalog.BuiltinTSParserOID[parserName]
+			if !ok || parserName == "" {
+				return &ExecError{Code: "42704", Message: "text search parser is required"}
+			}
+			parserOID = oid
+		}
+		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+		schema := s.ObjName.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		uc := &catalog.UserTSConfig{
+			Name:   s.ObjName.Name,
+			Owner:  uint32(10), // bootstrap superuser (postgres)
+			Parser: parserOID,
+		}
+		if _, err := im.CreateTSConfig(uc, schema); err != nil {
+			return &ExecError{Code: "42710", Message: err.Error()}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event the recovery driver
+		// (internal/initdb/tsconfig_ddl_recovery.go) replays into the
+		// configuration registry on the next startup, mirroring CREATE TEXT
+		// SEARCH DICTIONARY. ADD MAPPING statements record their own
+		// follow-up WAL event (execAlterTSConfigAddMapping below).
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateTSConfig(uc.Name, schema, uc.OID, uc.Owner, uc.Parser)); werr != nil {
+				return fmt.Errorf("wal create-tsconfig: %w", werr)
+			}
+		}
+		if copySource != nil {
+			// Copy the source configuration's token-type→dictionary mappings,
+			// mirroring DefineTSConfiguration's post-insert pg_ts_config_map
+			// copy loop (tsearchcmds.c). Each mapping is applied and WAL-logged
+			// through the same AddTSConfigMapping/EncodeAddTSConfigMapping path
+			// ALTER ... ADD MAPPING uses, so restart replay needs no new WAL
+			// record kind.
+			for _, m := range copySource.Mappings {
+				if uc2, dup := im.AddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs); uc2 == nil || dup {
+					return fmt.Errorf("internal error: copying tsconfig mapping %q for new configuration %q", m.TokenType, uc.Name)
+				}
+				if o.ctx.WAL != nil {
+					if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(uc.Name, schema, m.TokenType, m.DictOIDs)); werr != nil {
+						return fmt.Errorf("wal add-tsconfig-mapping (copy): %w", werr)
+					}
+				}
+			}
+		}
 	case "transform":
 		// Register the transform (CREATE TRANSFORM FOR type LANGUAGE lang
 		// (FROM SQL WITH FUNCTION f1 [, TO SQL WITH FUNCTION f2] | ...)) so it
@@ -15568,6 +15753,291 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	default:
 		// text search dictionary/configuration/parser/template, language, etc.
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
+	}
+	return nil
+}
+
+// execAlterTSConfig implements the ALTER TEXT SEARCH CONFIGURATION forms
+// goopg models: ADD MAPPING, DROP MAPPING, RENAME TO, SET SCHEMA, ALTER
+// MAPPING REPLACE, and the ALTER MAPPING FOR tok WITH dict override form.
+// DU-002 slice 446 (M0119-0004); dropmapping/rename/setschema added as a
+// slice 446 follow-up; replacedict and altermapping added as further
+// follow-ups.
+func (o *ddlOp) execAlterTSConfig(s *parser.AlterTSConfigStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "XX000", Message: "ALTER TEXT SEARCH CONFIGURATION requires InMemory catalog"}
+	}
+	schema := s.ConfigName.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	switch s.Action {
+	case "addmapping":
+		return o.execAlterTSConfigAddMapping(im, s, schema)
+	case "dropmapping":
+		return o.execAlterTSConfigDropMapping(im, s, schema)
+	case "replacedict":
+		return o.execAlterTSConfigReplaceDict(im, s, schema)
+	case "altermapping":
+		return o.execAlterTSConfigAlterMapping(im, s, schema)
+	case "rename":
+		if err := im.RenameTSConfig(s.ConfigName.Name, schema, s.NewName); err != nil {
+			return &ExecError{Code: "42704", Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSConfig(s.ConfigName.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal rename-tsconfig: %w", werr)
+			}
+		}
+		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetTSConfigSchema(s.ConfigName.Name, schema, newSchema) {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSConfigSchema(s.ConfigName.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal set-tsconfig-schema: %w", werr)
+			}
+		}
+		return nil
+	}
+	return nil
+}
+
+// execAlterTSConfigAddMapping implements ALTER TEXT SEARCH CONFIGURATION name
+// ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — appends one
+// pg_ts_config_map entry per named token type so pg_dump's dumpTSConfig
+// re-emits the mapping (its own direct `pg_ts_config_map` query, not the
+// getTSConfigurations dump-list query). Each dictionary name resolves against
+// the one built-in dictionary (catalog.BuiltinTSDictOID — "simple") first,
+// then user-created dictionaries (CREATE TEXT SEARCH DICTIONARY) in the same
+// schema as the configuration. DU-002 slice 446 (M0119-0004).
+func (o *ddlOp) execAlterTSConfigAddMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
+	for _, dn := range s.Dictionaries {
+		oid, err := resolveTSDictOID(im, dn)
+		if err != nil {
+			return err
+		}
+		dictOIDs = append(dictOIDs, oid)
+	}
+	for _, tt := range s.TokenTypes {
+		uc, dup := im.AddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
+		if uc == nil {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		if dup {
+			tokID := -1
+			for _, t := range catalog.DefaultParserTokenTypes {
+				if strings.EqualFold(t.Alias, tt) {
+					tokID = t.TokID
+					break
+				}
+			}
+			return &ExecError{
+				Code:    "23505",
+				Message: `duplicate key value violates unique constraint "pg_ts_config_map_index"`,
+				Detail:  fmt.Sprintf("Key (mapcfg, maptokentype, mapseqno)=(%d, %d, 1) already exists.", uc.OID, tokID),
+			}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event per token type so the mapping survives a restart, replayed
+		// by internal/initdb/tsconfig_ddl_recovery.go after the
+		// configuration's own CREATE record.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAddTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
+				return fmt.Errorf("wal add-tsconfig-mapping: %w", werr)
+			}
+		}
+	}
+	return nil
+}
+
+// resolveTSDictOID resolves an ALTER TEXT SEARCH CONFIGURATION dictionary
+// reference to its pg_ts_dict OID: the one built-in dictionary
+// (catalog.BuiltinTSDictOID — "simple") first, then user-created
+// dictionaries (CREATE TEXT SEARCH DICTIONARY) by name. Raises 42704 if
+// neither resolves, mirroring get_ts_dict_oid(names, missing_ok=false) in
+// tsearchcmds.c. Shared by execAlterTSConfigAddMapping and
+// execAlterTSConfigReplaceDict's old/new dictionary lookups. DU-002 slice
+// 446 (M0119-0004); factored out as a replacedict follow-up.
+func resolveTSDictOID(im *catalog.InMemory, dn parser.ObjectName) (uint32, error) {
+	dictNameLower := strings.ToLower(dn.Name)
+	if oid, ok := catalog.BuiltinTSDictOID[dictNameLower]; ok {
+		return oid, nil
+	}
+	for _, ud := range im.ListUserTSDicts() {
+		if strings.EqualFold(ud.Name, dn.Name) {
+			return ud.OID, nil
+		}
+	}
+	return 0, &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", dn.Name)}
+}
+
+// execAlterTSConfigReplaceDict implements ALTER TEXT SEARCH CONFIGURATION
+// name ALTER MAPPING [FOR tokentype [, ...]] REPLACE olddict WITH
+// newdict — substitutes newdict for olddict across every matched
+// pg_ts_config_map entry, mirroring MakeConfigurationMapping's replace path
+// in tsearchcmds.c. An empty TokenTypes matches every token type the
+// configuration maps (the bare REPLACE form). Unlike ADD/DROP MAPPING, real
+// PG raises no error when the replacement matches zero rows — it is an
+// unconditional UPDATE-style scan, not a lookup — so this never surfaces a
+// "not found" ExecError for the token/dict pair itself, only for an
+// unresolvable dictionary name or configuration. DU-002 replacedict
+// follow-up (M0119-0004).
+func (o *ddlOp) execAlterTSConfigReplaceDict(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	oldOID, err := resolveTSDictOID(im, s.OldDict)
+	if err != nil {
+		return err
+	}
+	newOID, err := resolveTSDictOID(im, s.NewDict)
+	if err != nil {
+		return err
+	}
+	uc, _ := im.ReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)
+	if uc == nil {
+		return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+	}
+	// DU-002 replacedict follow-up (M0119-0004): record a WAL event so the
+	// substitution survives a restart, replayed by
+	// internal/initdb/tsconfig_ddl_recovery.go after the configuration's
+	// own CREATE record.
+	if o.ctx.WAL != nil {
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeReplaceTSConfigMappingDict(s.ConfigName.Name, schema, s.TokenTypes, oldOID, newOID)); werr != nil {
+			return fmt.Errorf("wal replace-tsconfig-mapping-dict: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterTSConfigAlterMapping implements ALTER TEXT SEARCH CONFIGURATION
+// name ALTER MAPPING FOR tokentype [, ...] WITH dictionary [, ...] — the
+// override form (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN, no REPLACE
+// keyword). Unlike ADD MAPPING it never 23505s on an already-mapped token
+// type: real PG's MakeConfigurationMapping deletes any existing
+// pg_ts_config_map rows for the token type first when override=true, then
+// inserts the new list, so re-pointing an existing mapping is exactly what
+// this statement is for. DU-002 slice 446 follow-up (M0119-0004).
+func (o *ddlOp) execAlterTSConfigAlterMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	dictOIDs := make([]uint32, 0, len(s.Dictionaries))
+	for _, dn := range s.Dictionaries {
+		oid, err := resolveTSDictOID(im, dn)
+		if err != nil {
+			return err
+		}
+		dictOIDs = append(dictOIDs, oid)
+	}
+	for _, tt := range s.TokenTypes {
+		uc := im.AlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)
+		if uc == nil {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event per token type so the override survives a restart, replayed
+		// by internal/initdb/tsconfig_ddl_recovery.go after the
+		// configuration's own CREATE record.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSConfigMapping(s.ConfigName.Name, schema, tt, dictOIDs)); werr != nil {
+				return fmt.Errorf("wal alter-tsconfig-mapping: %w", werr)
+			}
+		}
+	}
+	return nil
+}
+
+// execAlterTSConfigDropMapping implements ALTER TEXT SEARCH CONFIGURATION
+// name DROP MAPPING [IF EXISTS] FOR tokentype [, ...] — removes the
+// pg_ts_config_map entry for each named token type, mirroring
+// DropConfigurationMapping in tsearchcmds.c (real PG raises 42704
+// "mapping for token type \"%s\" does not exist" unless IF EXISTS is given,
+// in which case it is a NOTICE). DU-002 slice 446 follow-up (M0119-0004).
+func (o *ddlOp) execAlterTSConfigDropMapping(im *catalog.InMemory, s *parser.AlterTSConfigStmt, schema string) error {
+	for _, tt := range s.TokenTypes {
+		uc, found := im.DropTSConfigMapping(s.ConfigName.Name, schema, tt)
+		if uc == nil {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search configuration %q does not exist", s.ConfigName.Name)}
+		}
+		if !found {
+			if s.IfExists {
+				o.ctx.AddNotice(fmt.Sprintf("mapping for token type %q does not exist, skipping", tt))
+				continue
+			}
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("mapping for token type %q does not exist", tt)}
+		}
+		// DU-002 restart-persistence follow-up (M0119-0004): record a WAL
+		// event per token type so the removal survives a restart, replayed
+		// by internal/initdb/tsconfig_ddl_recovery.go after the
+		// configuration's own CREATE record.
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropTSConfigMapping(s.ConfigName.Name, schema, tt)); werr != nil {
+				return fmt.Errorf("wal drop-tsconfig-mapping: %w", werr)
+			}
+		}
+	}
+	return nil
+}
+
+// execAlterTSDict dispatches ALTER TEXT SEARCH DICTIONARY name's
+// RENAME TO / SET SCHEMA / ( key [= value], ... ) forms, mirroring
+// execAlterTSConfig's shape. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return &ExecError{Code: "XX000", Message: "ALTER TEXT SEARCH DICTIONARY requires InMemory catalog"}
+	}
+	schema := s.DictName.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	switch s.Action {
+	case "rename":
+		if err := im.RenameTSDict(s.DictName.Name, schema, s.NewName); err != nil {
+			return &ExecError{Code: "42704", Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeRenameTSDict(s.DictName.Name, schema, s.NewName)); werr != nil {
+				return fmt.Errorf("wal rename-tsdict: %w", werr)
+			}
+		}
+		return nil
+	case "setschema":
+		newSchema := s.NewSchema
+		if newSchema == "" {
+			newSchema = "public"
+		}
+		if !im.SetTSDictSchema(s.DictName.Name, schema, newSchema) {
+			return &ExecError{Code: "42704", Message: fmt.Sprintf("text search dictionary %q does not exist", s.DictName.Name)}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeSetTSDictSchema(s.DictName.Name, schema, newSchema)); werr != nil {
+				return fmt.Errorf("wal set-tsdict-schema: %w", werr)
+			}
+		}
+		return nil
+	case "options":
+		newInitOption, err := im.AlterTSDictOptions(s.DictName.Name, schema, s.Options)
+		if err != nil {
+			// verify_dictoptions' rejection (ValidateTSDictOptions) surfaces as
+			// ERRCODE_INVALID_PARAMETER_VALUE (22023); any other failure here is
+			// the pre-existing "dictionary does not exist" lookup miss (42704).
+			code := "42704"
+			if strings.Contains(err.Error(), "unrecognized") {
+				code = "22023"
+			}
+			return &ExecError{Code: code, Message: err.Error()}
+		}
+		if o.ctx.WAL != nil {
+			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSDictOptions(s.DictName.Name, schema, newInitOption)); werr != nil {
+				return fmt.Errorf("wal alter-tsdict-options: %w", werr)
+			}
+		}
+		return nil
 	}
 	return nil
 }
@@ -15713,13 +16183,48 @@ func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind
 	return 0, typeKindNone
 }
 
+// checkGrantedByCurrentUser mirrors PostgreSQL's aclchk.c InternalGrant check
+// (shared by every object-privilege GRANT/REVOKE variant — tables, types,
+// databases, parameters, …): an explicit GRANTED BY clause is SQL-standard
+// grammar accepted only for compatibility, and is rejected unless it names
+// the role actually executing the statement. actingRole is the session's
+// current effective role (o.ctx.NonSuperuserRole, "" for the bootstrap
+// superuser "postgres"); grantedBy is the parsed clause's role name ("" when
+// the clause was absent, in which case there is nothing to check). Duplicates
+// server/grant_ddl.go's identically-behaved errGrantorMustBeCurrentUser check
+// for the table-ACL path, since the executor package cannot import server (it
+// would create an import cycle). M0119-0004-ACLHEAP.
+func checkGrantedByCurrentUser(actingRole, grantedBy string) error {
+	if grantedBy == "" {
+		return nil
+	}
+	acting := strings.ToLower(strings.TrimSpace(actingRole))
+	if acting == "" {
+		acting = "postgres"
+	}
+	if !strings.EqualFold(strings.Trim(grantedBy, `"`), acting) {
+		return &ExecError{Code: "0A000", Message: "grantor must be current user"}
+	}
+	return nil
+}
+
 // execTypeACLChange applies a GRANT/REVOKE … ON TYPE|DOMAIN … to the OID-keyed
 // ACL store and re-syncs the heap-backed pg_type.typacl. A type's only grantable
 // privilege is USAGE, and acldefault('T', owner) grants USAGE to BOTH the owner
 // and PUBLIC (structurally identical to the function EXECUTE default), so the
 // store update mirrors recordFunctionGrant / recordFunctionRevoke verbatim with
-// USAGE. Unknown type names are a successful no-op. M0119-0004-ACLHEAP.
+// USAGE. Unknown type names are a successful no-op. The grantor stamped on each
+// grant is the session's current effective role (o.ctx.NonSuperuserRole, empty
+// meaning the bootstrap superuser), mirroring tryRecordTableGrant's grantor
+// attribution for relacl/nspacl/proacl — typacl shares the same tableACLs/
+// tableACLGrantor store via relaclTextLockedFor, so no separate grantor map was
+// needed here. An explicit GRANTED BY clause naming a role other than the
+// acting one is rejected 0A000 (checkGrantedByCurrentUser), mirroring
+// grant_ddl.go's table-ACL check. M0119-0004-ACLHEAP.
 func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, tc.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -15747,7 +16252,7 @@ func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 			// by the renderer's owner branch (TypeACLText / relaclTextLockedFor).
 			im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
 			for _, role := range tc.Grantees {
-				im.GrantTablePrivilegeWithGrantOption(oid, role, "USAGE", tc.WithGrantOption)
+				im.GrantTablePrivilegeAs(oid, role, "USAGE", tc.WithGrantOption, o.ctx.NonSuperuserRole)
 			}
 		}
 		if err := o.resyncTypeACLHeapRow(im, oid, kind); err != nil {
@@ -15869,8 +16374,17 @@ func columnAttNum(tbl *catalog.Table, colName string) int16 {
 // execTypeACLChange — there is no implicit owner/PUBLIC seeding: a plain GRANT
 // adds exactly the granted grantee→priv entries and a REVOKE removes exactly
 // them, with attacl returning to NULL once the last column privilege is revoked.
-// Unknown table/column names are a successful no-op. M0119-0004-ACLHEAP.
+// Unknown table/column names are a successful no-op. The grantor stamped on
+// each grant is the session's current effective role (o.ctx.NonSuperuserRole,
+// empty meaning the bootstrap superuser), mirroring tryRecordTableGrant's
+// grantor attribution for relacl/nspacl/proacl/typacl/datacl. An explicit
+// GRANTED BY clause naming a role other than the acting one is rejected 0A000
+// (checkGrantedByCurrentUser), mirroring execTypeACLChange's table/type/
+// database/parameter check. M0119-0004-ACLHEAP (attacl grantor half).
 func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, ac.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -15897,7 +16411,7 @@ func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
 						if ac.Revoke {
 							im.RevokeColumnPrivilege(tbl.OID, attNum, role, priv)
 						} else {
-							im.GrantColumnPrivilegeWithGrantOption(tbl.OID, attNum, role, priv, ac.WithGrantOption)
+							im.GrantColumnPrivilegeAs(tbl.OID, attNum, role, priv, ac.WithGrantOption, o.ctx.NonSuperuserRole)
 						}
 					}
 				}
@@ -17229,12 +17743,13 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				}
 				return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 			}
+			rt.Owner = o.currentDDLOwnerOID()
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
 			// METHOD.
 			if o.ctx.WAL != nil {
-				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID)); werr != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateRangeType(rt.Name, rt.SubtypeName, rt.MultirangeName, rt.OID, rt.ArrayOID, rt.MultirangeOID, rt.MultirangeArrayOID, rt.OpclassOID, rt.CollationOID, rt.Owner)); werr != nil {
 					return fmt.Errorf("wal create-range-type: %w", werr)
 				}
 			}
@@ -17514,6 +18029,21 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
+		if _, ok := cat.LookupRangeType(s.Name); ok {
+			if err := cat.RenameRangeType(s.Name, s.RenameTo); err != nil {
+				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+			}
+			// M0122-0005 restart-persistence follow-up (deferral ledger
+			// 2026-07-06 row, resume point (1)): mirrors execAlterCollation's
+			// RENAME TO WAL logging so a range-type rename survives a
+			// restart.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeRename(s.Name, s.RenameTo)); werr != nil {
+					return fmt.Errorf("wal alter-range-type-rename: %w", werr)
+				}
+			}
+			return nil
+		}
 		err := cat.RenameEnum(s.Name, s.RenameTo)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -17547,6 +18077,19 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		if cat.LookupCompositeType(s.Name) != nil {
 			cat.SetCompositeTypeOwner(s.Name, ownerOID)
+			return nil
+		}
+		if _, ok := cat.LookupRangeType(s.Name); ok {
+			cat.SetRangeTypeOwner(s.Name, ownerOID)
+			// M0122-0005 restart-persistence follow-up (deferral ledger
+			// 2026-07-06 row, resume point (1)): mirrors
+			// execAlterCollation's OWNER TO WAL logging so a range-type
+			// owner change survives a restart.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterRangeTypeOwner(s.Name, ownerOID)); werr != nil {
+					return fmt.Errorf("wal alter-range-type-owner: %w", werr)
+				}
+			}
 			return nil
 		}
 		if !cat.SetEnumOwner(s.Name, ownerOID) {
@@ -17777,6 +18320,9 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// "Creator becomes owner" convention, mirroring execCreateType's range
+	// branch. M0122-0005 (domain follow-up).
+	d.Owner = o.currentDDLOwnerOID()
 	// Resolve a user-defined enum base type's dynamically-allocated OID and
 	// record it on the domain. TypeNameToOID falls back to text for enum names,
 	// so without this the pg_type row would carry typbasetype=text and pg_dump
@@ -17810,6 +18356,128 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
 	syncDomainTypeToCatalogHeap(o.ctx, d)
+	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06
+	// row: "domains have no restart persistence at all"): snapshot the full
+	// domain definition (base type, NOT NULL, DEFAULT, CHECKs, owner) so a
+	// restarted server rediscovers it, mirroring CREATE TYPE ... AS RANGE.
+	if o.ctx.WAL != nil {
+		checks := make([]wal.DomainCheckPayload, 0, len(d.Checks))
+		for _, c := range d.Checks {
+			checks = append(checks, wal.DomainCheckPayload{
+				OID:      c.OID,
+				Name:     c.Name,
+				Expr:     c.Expr,
+				InValues: c.InValues,
+			})
+		}
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateDomain(wal.CreateDomainPayload{
+			Name:       d.Name,
+			OID:        d.OID,
+			ArrayOID:   d.ArrayOID,
+			BaseName:   d.Base.Name,
+			BaseArgs:   d.Base.Args,
+			BaseOID:    d.BaseOID,
+			BaseIsEnum: d.BaseIsEnum,
+			NotNull:    d.NotNull,
+			Owner:      d.Owner,
+			DefaultSQL: catalog.FormatExprForAttrdef(d.Default),
+			Checks:     checks,
+		})); werr != nil {
+			return fmt.Errorf("wal create-domain: %w", werr)
+		}
+	}
+	return nil
+}
+
+// execAlterDomain drives every ALTER DOMAIN form goopg models — RENAME TO,
+// OWNER TO, RENAME CONSTRAINT, ADD/DROP CONSTRAINT, SET/DROP DEFAULT, and
+// SET/DROP NOT NULL — mirroring execAlterSchema's Action-switch shape. Only
+// SET SCHEMA is still parsed as a no-op (see parseAlter's "domain" branch)
+// and never reaches here. M0122-0005 (domain follow-up, closing the ledger's
+// "ALTER DOMAIN wholly unparsed" gap for RENAME TO/OWNER TO); every other
+// case added in later follow-ups.
+func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	switch s.Action {
+	case "rename":
+		if err := cat.RenameDomain(s.Name, s.NewName); err != nil {
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterSchema/execAlterType's default
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := cat.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !cat.SetDomainOwner(s.Name, ownerOID) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "renameconstraint":
+		if err := cat.RenameDomainConstraint(s.Name, s.ConstraintName, s.NewConstraintName); err != nil {
+			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain/constraint, matches real PG
+			if strings.Contains(err.Error(), "already exists") {
+				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG
+			}
+			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	case "addconstraint":
+		d, found := cat.LookupDomain(s.Name)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		expr := s.CheckExpr
+		if len(s.CheckInValues) > 0 {
+			// Synthesize the deparsed ScalarArrayOpExpr text, same as CREATE
+			// DOMAIN's CHECK (VALUE IN (...)) shortcut form.
+			expr = domainInValuesCheckExpr(d.Base.Name, s.CheckInValues, cat)
+		}
+		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues); err != nil {
+			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain, matches real PG's typenameTypeId
+			if strings.Contains(err.Error(), "already exists") {
+				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG's domainAddCheckConstraint
+			}
+			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	case "dropconstraint":
+		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists); err != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
+		}
+		return nil
+	case "setdefault":
+		if !cat.SetDomainDefault(s.Name, s.DefaultExpr) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "dropdefault":
+		if !cat.SetDomainDefault(s.Name, nil) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "setnotnull":
+		// SET NOT NULL — unlike real PG's AlterDomainNotNull, this does not
+		// scan existing table columns of this domain type for already-present
+		// NULL values (validateDomainNotNullConstraint's cross-table walk);
+		// see SetDomainNotNull's doc comment. M0122-0005 domain follow-up.
+		if !cat.SetDomainNotNull(s.Name, true) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "dropnotnull":
+		if !cat.SetDomainNotNull(s.Name, false) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	}
 	return nil
 }
 
@@ -18161,6 +18829,11 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
 		names, err := cat.DropDomain(name.Name, false, s.Cascade)
 		if err == nil {
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropDomain(name.Name)); werr != nil {
+					return fmt.Errorf("wal drop-domain: %w", werr)
+				}
+			}
 			for _, tblName := range names {
 				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
 			}

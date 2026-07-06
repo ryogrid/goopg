@@ -90,7 +90,11 @@ func (o *explainOp) Open(ctx *Context) error {
 			//   [ { "Plan": {...}, "Planning Time": .., "Execution Time": .. } ]
 			// horizons.spec reads ...->0->'Plan'->'Heap Fetches', so the
 			// wrapper is load-bearing (design 0118-0102).
-			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats)}
+			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
+			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats, trackIOTiming)}
+			if opts.Buffers {
+				root["Planning"] = planningBufferUsageJSON(trackIOTiming)
+			}
 			if summary {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
@@ -121,6 +125,10 @@ func (o *explainOp) Open(ctx *Context) error {
 		// inside the single-element array, matching upstream's
 		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
 		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
+		if opts.Buffers {
+			trackIOTiming := ctx.Activity != nil && ctx.Activity.TrackIOTiming(ctx.ProcNum)
+			root["Planning"] = planningBufferUsageJSON(trackIOTiming)
+		}
 		addExplainSettingsGroup(ctx, opts, root)
 		out, err := renderExplainTree(opts.Format, root)
 		if err != nil {
@@ -199,6 +207,86 @@ func formatBuffersLine(s *nodeStats) string {
 		parts = append(parts, fmt.Sprintf("written=%d", s.bufWritten))
 	}
 	return "Buffers: shared " + strings.Join(parts, " ")
+}
+
+// planningBufferUsageJSON builds the non-TEXT-format "Planning" group
+// upstream's ExplainOnePlan always emits once BUFFERS is requested,
+// independent of ANALYZE (explain.c's peek_buffer_usage: for any
+// non-EXPLAIN_FORMAT_TEXT format it returns true whenever `bufusage` is
+// non-NULL, i.e. whenever es->buffers is set, even when every counter is
+// zero — unlike TEXT's show_buffer_usage, which suppresses the whole
+// "Planning:\n  Buffers: ..." block when nothing was touched).
+//
+// Upstream's BufferUsage here reflects I/O the *planner* itself performed
+// (catalog/relcache/statistics lookups during pg_plan_query). goopg's
+// planner (internal/planner) resolves everything against the in-memory
+// catalog and never calls into storage.Pool, so these counters are always
+// zero — that's a real architectural fact, not a stub: there is currently
+// no planning-phase code path that could produce a nonzero value here.
+//
+// The Local/Temp terms are likewise always zero: goopg has no
+// local-buffer-manager or temp-buffer concept at all (every relation,
+// including temp tables, goes through the one shared storage.Pool), so
+// there is no counter to accumulate into in the first place — a real
+// architectural fact mirroring the Shared comment above, not a narrower
+// stub than the Shared fields.
+func planningBufferUsageJSON(trackIOTiming bool) map[string]any {
+	m := map[string]any{
+		"Shared Hit Blocks":     int64(0),
+		"Shared Read Blocks":    int64(0),
+		"Shared Dirtied Blocks": int64(0),
+		"Shared Written Blocks": int64(0),
+		"Local Hit Blocks":      int64(0),
+		"Local Read Blocks":     int64(0),
+		"Local Dirtied Blocks":  int64(0),
+		"Local Written Blocks":  int64(0),
+		"Temp Read Blocks":      int64(0),
+		"Temp Written Blocks":   int64(0),
+	}
+	// Mirrors show_buffer_usage's non-text branch: once track_io_timing
+	// is on, all six *_blk_read/write_time properties are emitted even
+	// when zero (peek_buffer_usage: "we print even if the counters are
+	// all zeroes"). goopg's planner never touches the buffer pool during
+	// cost estimation, so these are architecturally-zero constants, not
+	// a narrower stub (same rationale as the Blocks fields above).
+	if trackIOTiming {
+		m["Shared I/O Read Time"] = float64(0)
+		m["Shared I/O Write Time"] = float64(0)
+		m["Local I/O Read Time"] = float64(0)
+		m["Local I/O Write Time"] = float64(0)
+		m["Temp I/O Read Time"] = float64(0)
+		m["Temp I/O Write Time"] = float64(0)
+	}
+	return m
+}
+
+// formatIOTimingsLine renders the upstream "I/O Timings: shared read=X.XXX
+// write=Y.YYY" text (show_buffer_usage's has_shared_timing branch in
+// postgres/src/backend/commands/explain.c), omitting the whole line when
+// both counters are zero and each individual read=/write= term when that
+// counter is zero. bufWriteTimeNs already folds extend time in (see the
+// nodeStats doc comment), matching upstream's single "write=" term — there
+// is no separate "extend=" term in real PG's I/O Timings line either. The
+// times are naturally zero whenever track_io_timing is off, so no extra
+// gate is needed beyond the nonzero check here — unlike TEXT's "Buffers:"
+// line this happens to also match the non-text (JSON/XML/YAML) property
+// gate goopg uses below, though upstream's non-text branch actually gates
+// on the track_io_timing GUC rather than on the values being nonzero
+// (goopg's simplification is behaviorally identical in the tested case:
+// GUC on and I/O occurred vs. GUC off, differing only when the GUC is on
+// but a node touched zero blocks — deferred, ledger).
+func formatIOTimingsLine(s *nodeStats) string {
+	if s.bufReadTimeNs == 0 && s.bufWriteTimeNs == 0 {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if s.bufReadTimeNs > 0 {
+		parts = append(parts, fmt.Sprintf("read=%.3f", nsToMs(s.bufReadTimeNs)))
+	}
+	if s.bufWriteTimeNs > 0 {
+		parts = append(parts, fmt.Sprintf("write=%.3f", nsToMs(s.bufWriteTimeNs)))
+	}
+	return "I/O Timings: shared " + strings.Join(parts, " ")
 }
 
 func (o *explainOp) Next() (TupleSlot, error) {
@@ -552,6 +640,9 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 			if line := formatBuffersLine(s); line != "" {
 				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
 			}
+			if line := formatIOTimingsLine(s); line != "" {
+				*rows = append(*rows, Row{NewStringDatum(detailIndent + line)})
+			}
 		}
 	}
 
@@ -571,7 +662,11 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 // node object grows Actual Rows / Actual Loops / Actual Startup
 // Time / Actual Total Time fields keyed by the instrumented
 // node's identity. Mirrors upstream's JSON ANALYZE shape.
-func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeStatsTable) map[string]any {
+//
+// trackIOTiming is the caller's track_io_timing GUC snapshot (see the
+// "Shared I/O Read/Write Time" gating below) and is threaded unchanged
+// through the recursive Plans re-render.
+func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeStatsTable, trackIOTiming bool) map[string]any {
 	obj := planToJSON(n, opts)
 	if s, ok := stats[n]; ok && s != nil {
 		obj["Actual Rows"] = s.rowsOut
@@ -591,15 +686,45 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		// upstream's non-text show_buffer_usage() prints these properties
 		// unconditionally once BUFFERS is requested, even when zero
 		// (explain.c's peek_buffer_usage: "when format is anything other
-		// than text, we print even if the counters are all zeroes"). Only
-		// the shared hit/read/dirtied/written counters goopg actually
-		// tracks are emitted here; local/temp/I-O-timing remain deferred
-		// (ledger, M0122-0003).
+		// than text, we print even if the counters are all zeroes"). The
+		// shared hit/read/dirtied/written counters goopg actually tracks
+		// are emitted from live nodeStats; Local/Temp Blocks are emitted
+		// as constant zeros (mirrors planningBufferUsageJSON's own
+		// Local/Temp comment — goopg has no local-buffer-manager or
+		// temp-buffer concept, so there is no counter to read). Shared/
+		// Local/Temp I/O timing remain deferred (ledger, M0122-0003).
 		if opts.Buffers {
 			obj["Shared Hit Blocks"] = s.bufHit
 			obj["Shared Read Blocks"] = s.bufRead
 			obj["Shared Dirtied Blocks"] = s.bufDirtied
 			obj["Shared Written Blocks"] = s.bufWritten
+			obj["Local Hit Blocks"] = int64(0)
+			obj["Local Read Blocks"] = int64(0)
+			obj["Local Dirtied Blocks"] = int64(0)
+			obj["Local Written Blocks"] = int64(0)
+			obj["Temp Read Blocks"] = int64(0)
+			obj["Temp Written Blocks"] = int64(0)
+			// "Shared/Local/Temp I/O Read/Write Time" (upstream's
+			// show_buffer_usage non-text branch, ExplainPropertyFloat calls
+			// gated on the live track_io_timing GUC — emitted even when the
+			// accumulated value is zero, matching explain.c's
+			// peek_buffer_usage comment: "when format is anything other
+			// than text, we print even if the counters are all zeroes").
+			// Shared is real (nsToMs of the live counters); Local/Temp are
+			// constant zeros for the same reason the Blocks fields above
+			// are — no local-buffer-manager/temp-buffer concept to time.
+			// TEXT's formatIOTimingsLine keeps its own nonzero gate (a line
+			// with nothing to report is simply omitted; there's no upstream
+			// text-format precedent for an explicit "I/O Timings: " line at
+			// all-zero).
+			if trackIOTiming {
+				obj["Shared I/O Read Time"] = nsToMs(s.bufReadTimeNs)
+				obj["Shared I/O Write Time"] = nsToMs(s.bufWriteTimeNs)
+				obj["Local I/O Read Time"] = float64(0)
+				obj["Local I/O Write Time"] = float64(0)
+				obj["Temp I/O Read Time"] = float64(0)
+				obj["Temp I/O Write Time"] = float64(0)
+			}
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the
@@ -608,7 +733,7 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 	if len(children) > 0 {
 		plans := make([]map[string]any, 0, len(children))
 		for _, c := range children {
-			plans = append(plans, planToJSONWithStats(c, opts, stats))
+			plans = append(plans, planToJSONWithStats(c, opts, stats, trackIOTiming))
 		}
 		obj["Plans"] = plans
 	}
@@ -816,9 +941,14 @@ func joinTypeName(t planner.JoinType) string {
 
 // planChildren returns the child plan nodes EXPLAIN should
 // recurse into. Limited to the subset of node types whose
-// children are public Node fields; storage-side internals
-// (Update/Delete/Insert source plans) report their own scan
-// children. Returns nil for leaf nodes.
+// children are public Node fields. Update/Delete additionally
+// walk their FROM/USING scans (M0097-0065/-0076) alongside the
+// target-table Child; note the executor extracts their Child's
+// scan info directly (extractScan) rather than Build()-ing it as
+// a nested instrumented Operator, so EXPLAIN ANALYZE won't have
+// per-node actual-rows/time stats for it (falls back to the
+// cost-estimate-only line — see walkPlanAnalyzeFiltered's
+// `stats[n]` miss path). Returns nil for leaf nodes.
 func planChildren(n planner.Node) []planner.Node {
 	switch p := n.(type) {
 	case *planner.Project:
@@ -839,6 +969,16 @@ func planChildren(n planner.Node) []planner.Node {
 		return []planner.Node{p.Left, p.Right}
 	case *planner.Insert:
 		return []planner.Node{p.Source}
+	case *planner.Update:
+		out := make([]planner.Node, 0, 1+len(p.FromScans))
+		out = append(out, p.Child)
+		out = append(out, p.FromScans...)
+		return out
+	case *planner.Delete:
+		out := make([]planner.Node, 0, 1+len(p.UsingScans))
+		out = append(out, p.Child)
+		out = append(out, p.UsingScans...)
+		return out
 	case *planner.CTEScan:
 		return []planner.Node{p.Child}
 	case *planner.LockRows:

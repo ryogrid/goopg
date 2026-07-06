@@ -1873,6 +1873,23 @@ func tableFuncBaseColumns(tf *parser.TableFuncRef, alias string, colAliases []st
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
 		}
 		return cols
+	case "ts_token_type":
+		// ts_token_type(parser_oid) → (tokid int4, alias text, description
+		// text). Mirrors planTSTokenType; pg_dump's dumpTSConfig selects the
+		// bare `alias` column from a correlated scalar subquery over this SRF.
+		// DU-002 slice 446 (M0119-0004).
+		names := []string{"tokid", "alias", "description"}
+		types := []string{"int4", "text", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	case "verify_heapam":
 		// verify_heapam(regclass, ...) → (blkno int8, offnum int8, attnum int4,
 		// msg text). Mirrors planVerifyHeapam. M0110-0003.

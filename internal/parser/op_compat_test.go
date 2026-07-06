@@ -794,8 +794,13 @@ func TestParseAlterOperatorOwnerToIsNoop(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q: Parse error: %v", sql, err)
 		}
-		if _, ok := stmts[0].(*AlterTableStmt); !ok {
-			t.Errorf("%q: Expected *AlterTableStmt (no-op stub), got %T", sql, stmts[0])
+		// A bare *AlterTableStmt no-op stub (no Name) used to reach the
+		// executor's generic ALTER TABLE path, which tried to resolve the
+		// empty relation name and raised a spurious 42P01 instead of
+		// succeeding silently — CompatNoopStmt short-circuits before any
+		// lookup happens.
+		if _, ok := stmts[0].(*CompatNoopStmt); !ok {
+			t.Errorf("%q: Expected *CompatNoopStmt (no-op stub), got %T", sql, stmts[0])
 		}
 	}
 }

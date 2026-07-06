@@ -8,7 +8,7 @@ import "testing"
 // must return the original name/subtypeName/multirangeName/OID/arrayOID/
 // multirangeOID/multirangeArrayOID/opclassOID/collationOID (the array OIDs
 // were added by the array-type follow-up; collationOID by the sub-item (a)
-// follow-up).
+// follow-up) and ownerOID (M0122-0005 restart-persistence follow-up).
 func TestEncodeDecodeCreateRangeTypeRoundTrip(t *testing.T) {
 	cases := []struct {
 		name               string
@@ -20,29 +20,31 @@ func TestEncodeDecodeCreateRangeTypeRoundTrip(t *testing.T) {
 		multirangeArrayOID uint32
 		opclassOID         uint32
 		collationOID       uint32
+		ownerOID           uint32
 	}{
-		{"myrange", "int4", "mymultirange", 16384, 16385, 16386, 16387, 1978, 0},
-		{"tsrange", "timestamp with time zone", "tsmultirange", 16388, 16389, 16390, 16391, 3127, 0},
-		{"textrange", "text", "textmultirange", 16392, 16393, 16394, 16395, 3126, 950},             // explicit `collation = "C"`
-		{"日本語レンジ", "text", "日本語マルチレンジ", 4294967295, 4294967294, 4294967293, 4294967292, 3125, 100}, // multi-byte UTF-8, max OID
+		{"myrange", "int4", "mymultirange", 16384, 16385, 16386, 16387, 1978, 0, 10},
+		{"tsrange", "timestamp with time zone", "tsmultirange", 16388, 16389, 16390, 16391, 3127, 0, 16400},
+		{"textrange", "text", "textmultirange", 16392, 16393, 16394, 16395, 3126, 950, 10},             // explicit `collation = "C"`
+		{"日本語レンジ", "text", "日本語マルチレンジ", 4294967295, 4294967294, 4294967293, 4294967292, 3125, 100, 4294967291}, // multi-byte UTF-8, max OID
 	}
 	for _, c := range cases {
-		raw := EncodeCreateRangeType(c.name, c.subtypeName, c.multirangeName, c.oid, c.arrayOID, c.multirangeOID, c.multirangeArrayOID, c.opclassOID, c.collationOID)
+		raw := EncodeCreateRangeType(c.name, c.subtypeName, c.multirangeName, c.oid, c.arrayOID, c.multirangeOID, c.multirangeArrayOID, c.opclassOID, c.collationOID, c.ownerOID)
 		if raw[0] != RecordKindCreateRangeType {
 			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindCreateRangeType)
 			continue
 		}
-		gotName, gotSubtype, gotMR, gotOID, gotArrayOID, gotMROID, gotMRArrayOID, gotOpclass, gotCollation, err := DecodeCreateRangeType(raw)
+		gotName, gotSubtype, gotMR, gotOID, gotArrayOID, gotMROID, gotMRArrayOID, gotOpclass, gotCollation, gotOwner, err := DecodeCreateRangeType(raw)
 		if err != nil {
 			t.Errorf("%q: decode err: %v", c.name, err)
 			continue
 		}
 		if gotName != c.name || gotSubtype != c.subtypeName || gotMR != c.multirangeName ||
 			gotOID != c.oid || gotArrayOID != c.arrayOID || gotMROID != c.multirangeOID ||
-			gotMRArrayOID != c.multirangeArrayOID || gotOpclass != c.opclassOID || gotCollation != c.collationOID {
-			t.Errorf("%q: decoded (%q, %q, %q, %d, %d, %d, %d, %d, %d), want (%q, %q, %q, %d, %d, %d, %d, %d, %d)",
-				c.name, gotName, gotSubtype, gotMR, gotOID, gotArrayOID, gotMROID, gotMRArrayOID, gotOpclass, gotCollation,
-				c.name, c.subtypeName, c.multirangeName, c.oid, c.arrayOID, c.multirangeOID, c.multirangeArrayOID, c.opclassOID, c.collationOID)
+			gotMRArrayOID != c.multirangeArrayOID || gotOpclass != c.opclassOID || gotCollation != c.collationOID ||
+			gotOwner != c.ownerOID {
+			t.Errorf("%q: decoded (%q, %q, %q, %d, %d, %d, %d, %d, %d, %d), want (%q, %q, %q, %d, %d, %d, %d, %d, %d, %d)",
+				c.name, gotName, gotSubtype, gotMR, gotOID, gotArrayOID, gotMROID, gotMRArrayOID, gotOpclass, gotCollation, gotOwner,
+				c.name, c.subtypeName, c.multirangeName, c.oid, c.arrayOID, c.multirangeOID, c.multirangeArrayOID, c.opclassOID, c.collationOID, c.ownerOID)
 		}
 	}
 }
@@ -66,17 +68,74 @@ func TestEncodeDecodeDropRangeTypeRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeDecodeAlterRangeTypeRenameRoundTrip pins the M0122-0005
+// restart-persistence follow-up's RENAME TO WAL record format.
+func TestEncodeDecodeAlterRangeTypeRenameRoundTrip(t *testing.T) {
+	cases := []struct{ name, newName string }{
+		{"myrange", "myrange2"},
+		{"日本語レンジ", "renamed_日本語レンジ"},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterRangeTypeRename(c.name, c.newName)
+		if raw[0] != RecordKindAlterRangeTypeRename {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterRangeTypeRename)
+			continue
+		}
+		gotName, gotNewName, err := DecodeAlterRangeTypeRename(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotNewName != c.newName {
+			t.Errorf("decoded (%q, %q), want (%q, %q)", gotName, gotNewName, c.name, c.newName)
+		}
+	}
+}
+
+// TestEncodeDecodeAlterRangeTypeOwnerRoundTrip pins the M0122-0005
+// restart-persistence follow-up's OWNER TO WAL record format.
+func TestEncodeDecodeAlterRangeTypeOwnerRoundTrip(t *testing.T) {
+	cases := []struct {
+		name     string
+		ownerOID uint32
+	}{
+		{"myrange", 16400},
+		{"日本語レンジ", 4294967295},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterRangeTypeOwner(c.name, c.ownerOID)
+		if raw[0] != RecordKindAlterRangeTypeOwner {
+			t.Errorf("%q: kind byte = %d, want %d", c.name, raw[0], RecordKindAlterRangeTypeOwner)
+			continue
+		}
+		gotName, gotOwner, err := DecodeAlterRangeTypeOwner(raw)
+		if err != nil {
+			t.Errorf("%q: decode err: %v", c.name, err)
+			continue
+		}
+		if gotName != c.name || gotOwner != c.ownerOID {
+			t.Errorf("decoded (%q, %d), want (%q, %d)", gotName, gotOwner, c.name, c.ownerOID)
+		}
+	}
+}
+
 // TestDecodeRangeTypeRejectsWrongKindAndTruncatedPayload guards the decoders
 // against a mismatched kind byte and a corrupt/truncated on-disk record, for
-// both range type record kinds.
+// every range type record kind.
 func TestDecodeRangeTypeRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 	bogus := EncodeDropRangeType("x")
 
-	if _, _, _, _, _, _, _, _, _, err := DecodeCreateRangeType(bogus); err == nil {
+	if _, _, _, _, _, _, _, _, _, _, err := DecodeCreateRangeType(bogus); err == nil {
 		t.Error("DecodeCreateRangeType: expected error on wrong kind")
 	}
-	if _, err := DecodeDropRangeType(EncodeCreateRangeType("x", "int4", "xmr", 1, 2, 3, 4, 1978, 0)); err == nil {
+	if _, err := DecodeDropRangeType(EncodeCreateRangeType("x", "int4", "xmr", 1, 2, 3, 4, 1978, 0, 10)); err == nil {
 		t.Error("DecodeDropRangeType: expected error on wrong kind")
+	}
+	if _, _, err := DecodeAlterRangeTypeRename(bogus); err == nil {
+		t.Error("DecodeAlterRangeTypeRename: expected error on wrong kind")
+	}
+	if _, _, err := DecodeAlterRangeTypeOwner(bogus); err == nil {
+		t.Error("DecodeAlterRangeTypeOwner: expected error on wrong kind")
 	}
 
 	truncCases := []struct {
@@ -85,17 +144,25 @@ func TestDecodeRangeTypeRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 		decode  func([]byte) error
 	}{
 		{"CreateRangeType", []byte{RecordKindCreateRangeType, 0, 0, 0, 0}, func(p []byte) error {
-			_, _, _, _, _, _, _, _, _, err := DecodeCreateRangeType(p)
+			_, _, _, _, _, _, _, _, _, _, err := DecodeCreateRangeType(p)
 			return err
 		}},
-		{"CreateRangeTypeTruncatedString", append(append([]byte{RecordKindCreateRangeType}, make([]byte, 24)...), 5, 0), func(p []byte) error {
-			// header (25 bytes) + a 2-byte length prefix declaring 5 bytes of
+		{"CreateRangeTypeTruncatedString", append(append([]byte{RecordKindCreateRangeType}, make([]byte, 28)...), 5, 0), func(p []byte) error {
+			// header (29 bytes) + a 2-byte length prefix declaring 5 bytes of
 			// subtype name that are never appended.
-			_, _, _, _, _, _, _, _, _, err := DecodeCreateRangeType(p)
+			_, _, _, _, _, _, _, _, _, _, err := DecodeCreateRangeType(p)
 			return err
 		}},
 		{"DropRangeType", []byte{RecordKindDropRangeType, 10, 0}, func(p []byte) error {
 			_, err := DecodeDropRangeType(p)
+			return err
+		}},
+		{"AlterRangeTypeRename", []byte{RecordKindAlterRangeTypeRename, 10, 0}, func(p []byte) error {
+			_, _, err := DecodeAlterRangeTypeRename(p)
+			return err
+		}},
+		{"AlterRangeTypeOwner", []byte{RecordKindAlterRangeTypeOwner, 0, 0, 0, 0, 10, 0}, func(p []byte) error {
+			_, _, err := DecodeAlterRangeTypeOwner(p)
 			return err
 		}},
 	}

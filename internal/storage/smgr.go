@@ -273,6 +273,30 @@ func (m *Manager) WriteBlockAIO(rel RelFileNode, blk BlockNumber, buf []byte) (A
 	}), nil
 }
 
+// ErrWritebackUnsupported is returned by SyncFileRangeHint on platforms
+// without a kernel write-behind hint (upstream's !HAVE_SYNC_FILE_RANGE
+// case). Callers must not count a writeback op when they see this error —
+// no real IO happened.
+var ErrWritebackUnsupported = errors.New("storage: writeback hint unsupported on this platform")
+
+// SyncFileRangeHint issues a kernel write-behind hint (sync_file_range(2)
+// on Linux) covering rel's whole current file extent, asking the kernel to
+// start flushing rel's dirty page-cache pages to disk without blocking the
+// caller and without the metadata sync fsync(2) would also perform. This
+// mirrors upstream's pg_flush_data / ScheduleBufferTagForWriteback +
+// IssuePendingWritebacks (postgres/src/backend/storage/file/fd.c,
+// storage/buffer/bufmgr.c), simplified to one call per (context,
+// threshold-crossing) event over the file's current extent rather than
+// upstream's coalesced multi-range WritebackContext — see
+// docs/design/0122-0003-explain-format-xml-yaml.md "writeback" section.
+func (m *Manager) SyncFileRangeHint(rel RelFileNode) error {
+	f, err := m.relFile(rel)
+	if err != nil {
+		return err
+	}
+	return syncFileRangeHint(f.f)
+}
+
 // ReadBlock reads block #blk of rel into buf. buf must be exactly
 // BlockSize bytes. Returns ErrShortRead if the file ends before the
 // block (i.e. blk is beyond the current relation size).

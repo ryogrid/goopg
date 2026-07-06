@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard nightly-batch
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -423,3 +423,12 @@ race-gate:
 # ---------------------------------------------------------------
 parity-dashboard:
 	@bash "$(REPO_ROOT)/scripts/gen-parity-dashboard.sh"
+
+# ---------------------------------------------------------------
+# nightly-batch: run the whole-suite nightly regression batch
+# (ci/batch/run-nightly.sh; design in ci/design/).  Single manual
+# entrypoint; the scheduled firing uses the same script and the
+# same run lock, so overlaps exit 5 immediately.
+# ---------------------------------------------------------------
+nightly-batch:
+	@bash "$(REPO_ROOT)/ci/batch/run-nightly.sh"

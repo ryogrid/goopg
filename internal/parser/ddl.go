@@ -5,6 +5,35 @@ import (
 	"strings"
 )
 
+// parseTSObjectNameLoose parses a possibly schema-qualified `[schema.]name`
+// like parseObjectName, but accepts ANY keyword token (not just
+// col_name-class ones) as a bare identifier component. It exists for the
+// `PARSER = ...` / `TEMPLATE = ...` clause values of CREATE TEXT SEARCH
+// CONFIGURATION/DICTIONARY: real PG's grammar lets these name a reserved
+// keyword unquoted (`PARSER = pg_catalog.default` is valid DDL, even though
+// "default" is IsColNameKeyword-false and would otherwise fail
+// parseObjectName's parseIdent). There is no ambiguity to guard against in
+// this position — the value is always immediately followed by `,`/`)`.
+// DU-002 slice 446 (M0119-0004).
+func (p *parser) parseTSObjectNameLoose() (ObjectName, error) {
+	first := p.cur()
+	if first.Kind != TokenIdent && first.Kind != TokenQuotedIdent && first.Kind != TokenKeyword {
+		return ObjectName{}, p.errAtCur("expected identifier")
+	}
+	p.advance()
+	o := ObjectName{pos: first.Pos, Name: identText(first)}
+	if p.acceptSymbol(".") {
+		second := p.cur()
+		if second.Kind != TokenIdent && second.Kind != TokenQuotedIdent && second.Kind != TokenKeyword {
+			return ObjectName{}, p.errAtCur("expected identifier")
+		}
+		p.advance()
+		o.Schema = o.Name
+		o.Name = identText(second)
+	}
+	return o, nil
+}
+
 // parseCreate dispatches on the next keyword after CREATE.
 func (p *parser) parseCreate() (Stmt, error) {
 	t, err := p.expectKeyword(KwCreate)
@@ -363,6 +392,68 @@ func (p *parser) parseCreate() (Stmt, error) {
 		if tsType != "" {
 			tsName, _ = p.parseObjectName()
 		}
+		// CREATE TEXT SEARCH DICTIONARY name ( TEMPLATE = tmpl [, key = value, ...] )
+		// and CREATE TEXT SEARCH CONFIGURATION name ( PARSER = parser_name ) are
+		// the only TS object kinds whose option list is actually parsed (not
+		// just skipped) — they round-trip through pg_dump (pg_ts_dict →
+		// dumpTSDictionary, pg_ts_config → dumpTSConfig); PARSER/TEMPLATE stay
+		// parsed-and-discarded compat no-ops. DU-002 slices 437, 446.
+		var tmplName, parserName, copySourceName ObjectName
+		var dictOptions []TSDictOption
+		if (tsType == "text search dictionary" || tsType == "text search configuration") &&
+			p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance() // consume '('
+			for {
+				c := p.cur()
+				if c.Kind == TokenEOF || (c.Kind == TokenSymbol && c.Value == ")") {
+					break
+				}
+				if c.Kind == TokenSymbol && c.Value == "," {
+					p.advance()
+					continue
+				}
+				if c.Kind != TokenIdent && c.Kind != TokenKeyword {
+					p.advance()
+					continue
+				}
+				key := strings.ToLower(c.Value)
+				p.advance()
+				if !((p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=") {
+					continue
+				}
+				p.advance() // consume '='
+				if key == "template" {
+					if fn, ferr := p.parseTSObjectNameLoose(); ferr == nil {
+						tmplName = fn
+					}
+					continue
+				}
+				if key == "parser" {
+					if fn, ferr := p.parseTSObjectNameLoose(); ferr == nil {
+						parserName = fn
+					}
+					continue
+				}
+				if key == "copy" && tsType == "text search configuration" {
+					if fn, ferr := p.parseTSObjectNameLoose(); ferr == nil {
+						copySourceName = fn
+					}
+					continue
+				}
+				v := p.cur()
+				switch v.Kind {
+				case TokenIntLit, TokenNumericLit:
+					dictOptions = append(dictOptions, TSDictOption{Key: key, Value: v.Value, IsNumeric: true})
+					p.advance()
+				case TokenStringLit, TokenIdent, TokenKeyword:
+					dictOptions = append(dictOptions, TSDictOption{Key: key, Value: v.Value})
+					p.advance()
+				}
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+				p.advance()
+			}
+		}
 		stmt, err := p.parseSkipToSemicolon(t.Pos)
 		if err != nil {
 			return nil, err
@@ -371,6 +462,14 @@ func (p *parser) parseCreate() (Stmt, error) {
 			ns.Tag = "CREATE " + strings.ToUpper(tsType)
 			ns.ObjType = tsType
 			ns.ObjName = tsName
+			if tsType == "text search dictionary" {
+				ns.TSDictTemplate = tmplName
+				ns.TSDictOptions = dictOptions
+			}
+			if tsType == "text search configuration" {
+				ns.TSConfigParser = parserName
+				ns.TSConfigCopySource = copySourceName
+			}
 		}
 		return stmt, nil
 	// CREATE SERVER name ... FOREIGN DATA WRAPPER fdwname [OPTIONS (...)] — register as compat object. M0097-0071.
@@ -1541,7 +1640,9 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 // unrecognized form) keeps the pre-existing *AlterTableStmt no-op stub.
 // DU-002 (M0119-0004).
 func (p *parser) parseAlterOpFamilyTail(pos int) (Stmt, error) {
-	noop := func() (Stmt, error) { return parseSkipToSemicolonHelper(p, &AlterTableStmt{pos: pos}) }
+	noop := func() (Stmt, error) {
+		return parseSkipToSemicolonHelper(p, &CompatNoopStmt{pos: pos, Tag: "ALTER OPERATOR FAMILY"})
+	}
 	name, err := p.parseObjectName()
 	if err != nil {
 		return noop()
@@ -6275,10 +6376,335 @@ func (p *parser) parseDropTail() (bool, []ObjectName, DropBehavior, error) {
 // Pgbench emits `alter table pgbench_branches add primary key (bid)`
 // to install primary keys after CREATE TABLE; that's the load-bearing
 // shape this function unblocks.
+//
+// parseAlterDefaultPrivileges parses `ALTER DEFAULT PRIVILEGES
+// [FOR ROLE|USER role_list] [IN SCHEMA schema_list] {GRANT|REVOKE} ...`
+// (gram.y's AlterDefaultPrivilegesStmt). The "default"/"privileges" tokens
+// have already been peeked (not consumed) by the caller; every remaining
+// token through the trailing ';' is captured and handed to
+// buildAlterDefaultPrivileges, mirroring how GRANT/REVOKE ON DATABASE/TYPE/
+// PARAMETER are parsed elsewhere in this file (capture-then-postprocess,
+// reusing splitTokRoles/splitTokPrivileges). M0110-0001 (DU-002 slice 438
+// follow-up).
+func (p *parser) parseAlterDefaultPrivileges(pos int) (Stmt, error) {
+	p.advance() // "default"
+	p.advance() // "privileges"
+	var toks []Token
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+			break
+		}
+		toks = append(toks, p.cur())
+		p.advance()
+	}
+	stmt, err := buildAlterDefaultPrivileges(toks)
+	if err != nil {
+		return nil, err
+	}
+	stmt.pos = pos
+	return stmt, nil
+}
+
+// parseTSTokenTypeCommaList parses a bare `tok [, tok ...]` comma-separated
+// token-type list (no leading FOR keyword — the caller consumes that,
+// conditionally in ALTER MAPPING's case since its REPLACE form's token-type
+// list is optional). DU-002 slice 446 follow-up (M0119-0004); split out of
+// parseTSMappingTokenTypeList for the replacedict follow-up.
+func parseTSTokenTypeCommaList(p *parser) ([]string, error) {
+	var tokenTypes []string
+	for {
+		tok, err := p.parseIdent()
+		if err != nil {
+			return nil, err
+		}
+		tokenTypes = append(tokenTypes, strings.ToLower(identText(tok)))
+		if !p.acceptSymbol(",") {
+			break
+		}
+	}
+	return tokenTypes, nil
+}
+
+// parseTSMappingTokenTypeList parses the `FOR tok [, tok ...]` token-type
+// list shared by ALTER TEXT SEARCH CONFIGURATION's ADD MAPPING and DROP
+// MAPPING forms. DU-002 slice 446 follow-up (M0119-0004).
+func parseTSMappingTokenTypeList(p *parser) ([]string, error) {
+	if _, err := p.expectKeyword(KwFor); err != nil {
+		return nil, err
+	}
+	return parseTSTokenTypeCommaList(p)
+}
+
+// parseAlterTSDictOptionList parses ALTER TEXT SEARCH DICTIONARY name's
+// `( key [= value] [, ...] )` option list (gram.y's `definition`
+// production), assuming the caller has already confirmed the current token
+// is "(". A bare `key` (no `= value`) sets HasValue=false on its
+// TSDictOption — a delete-only directive, mirroring
+// AlterTSDictionary's `if (defel->arg)` check (tsearchcmds.c). Reuses the
+// same token-scanning shape as CREATE TEXT SEARCH DICTIONARY's option-list
+// parse (ddl.go's `text search dictionary` CREATE-tail), which never
+// records a bare option at all since ALTER is the only form that needs
+// delete-only semantics. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func parseAlterTSDictOptionList(p *parser) ([]TSDictOption, error) {
+	p.advance() // consume "("
+	var opts []TSDictOption
+	for {
+		c := p.cur()
+		if c.Kind == TokenEOF || (c.Kind == TokenSymbol && c.Value == ")") {
+			break
+		}
+		if c.Kind == TokenSymbol && c.Value == "," {
+			p.advance()
+			continue
+		}
+		if c.Kind != TokenIdent && c.Kind != TokenKeyword {
+			p.advance()
+			continue
+		}
+		key := strings.ToLower(c.Value)
+		p.advance()
+		if !((p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=") {
+			opts = append(opts, TSDictOption{Key: key})
+			continue
+		}
+		p.advance() // consume '='
+		v := p.cur()
+		switch v.Kind {
+		case TokenIntLit, TokenNumericLit:
+			opts = append(opts, TSDictOption{Key: key, Value: v.Value, IsNumeric: true, HasValue: true})
+			p.advance()
+		case TokenStringLit, TokenIdent, TokenKeyword:
+			opts = append(opts, TSDictOption{Key: key, Value: v.Value, HasValue: true})
+			p.advance()
+		default:
+			opts = append(opts, TSDictOption{Key: key})
+		}
+	}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+		p.advance()
+	}
+	return opts, nil
+}
+
 func (p *parser) parseAlter() (Stmt, error) {
 	t, err := p.expectKeyword(KwAlter)
 	if err != nil {
 		return nil, err
+	}
+	// ALTER DEFAULT PRIVILEGES [FOR ROLE|USER ...] [IN SCHEMA ...]
+	// {GRANT|REVOKE} ... — a distinct top-level form (gram.y's
+	// AlterDefaultPrivilegesStmt), not a relation/sequence/etc ALTER, so it is
+	// detected and dispatched before any of the object-keyword branches
+	// below. M0110-0001 (DU-002 slice 438 follow-up).
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault &&
+		strings.EqualFold(p.peek(1).Value, "privileges") {
+		return p.parseAlterDefaultPrivileges(t.Pos)
+	}
+	// ALTER TEXT SEARCH CONFIGURATION name {ADD MAPPING|DROP MAPPING|RENAME
+	// TO|SET SCHEMA|ALTER MAPPING REPLACE} — the ALTER TEXT SEARCH * forms
+	// goopg actually applies (ADD/DROP MAPPING is how a config's
+	// pg_ts_config_map rows get populated/removed, which dumpTSConfig's own
+	// ADD MAPPING re-emission depends on). The ALTER MAPPING FOR tok WITH
+	// dict override form (no REPLACE), OWNER TO, and DICTIONARY/PARSER/
+	// TEMPLATE entirely fall through to the generic skip-to-semicolon compat
+	// no-op below, matching CREATE TEXT SEARCH's existing pattern. DU-002
+	// slice 446 (M0119-0004); RENAME TO/SET SCHEMA/DROP MAPPING added as a
+	// slice 446 follow-up; ALTER MAPPING REPLACE added as a further
+	// follow-up.
+	if p.acceptIdentKeyword("text") {
+		_ = p.acceptIdentKeyword("search") // consume "search"
+		if p.acceptIdentKeyword("configuration") {
+			cfgName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			if p.acceptKeyword(KwAdd) && p.acceptIdentKeyword("mapping") {
+				tokenTypes, err := parseTSMappingTokenTypeList(p)
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.expectKeyword(KwWith); err != nil {
+					return nil, err
+				}
+				var dicts []ObjectName
+				for {
+					dn, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					dicts = append(dicts, dn)
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "addmapping", TokenTypes: tokenTypes, Dictionaries: dicts}, nil
+			}
+			if p.acceptKeyword(KwDrop) && p.acceptIdentKeyword("mapping") {
+				ifExists := false
+				if p.acceptKeyword(KwIf) {
+					if _, err := p.expectKeyword(KwExists); err != nil {
+						return nil, err
+					}
+					ifExists = true
+				}
+				tokenTypes, err := parseTSMappingTokenTypeList(p)
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "dropmapping", TokenTypes: tokenTypes, IfExists: ifExists}, nil
+			}
+			if p.acceptIdentKeyword("rename") {
+				if _, err := p.expectKeyword(KwTo); err != nil {
+					return nil, err
+				}
+				newNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "rename", NewName: identText(newNameTok)}, nil
+			}
+			if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+				p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+				p.advance() // SET
+				p.advance() // SCHEMA
+				schemaTok := p.cur()
+				p.advance()
+				return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "setschema", NewSchema: identText(schemaTok)}, nil
+			}
+			if p.acceptKeyword(KwAlter) && p.acceptIdentKeyword("mapping") {
+				// ALTER MAPPING [FOR tok [, ...]] REPLACE olddict WITH
+				// newdict — ALTER_TSCONFIG_REPLACE_DICT(_FOR_TOKEN) in
+				// gram.y. The FOR token-type list is optional (its absence
+				// means "replace across every mapped token type"), which is
+				// why it can't reuse parseTSMappingTokenTypeList directly
+				// (that helper requires FOR). The sibling
+				// ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN form (`FOR tok
+				// WITH dict [, ...]`, no REPLACE) stays an unimplemented
+				// no-op, falling through below.
+				var tokenTypes []string
+				if p.acceptKeyword(KwFor) {
+					tt, err := parseTSTokenTypeCommaList(p)
+					if err != nil {
+						return nil, err
+					}
+					tokenTypes = tt
+				}
+				if p.acceptKeyword(KwReplace) {
+					oldDict, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					if _, err := p.expectKeyword(KwWith); err != nil {
+						return nil, err
+					}
+					newDict, err := p.parseObjectName()
+					if err != nil {
+						return nil, err
+					}
+					return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "replacedict", TokenTypes: tokenTypes, OldDict: oldDict, NewDict: newDict}, nil
+				}
+				// ALTER MAPPING FOR tok [, ...] WITH dict [, ...] override
+				// form (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN) — replaces
+				// each named token type's entire dictionary list. Unlike
+				// REPLACE, gram.y requires the FOR token-type list for this
+				// form (there is no bare "ALTER MAPPING WITH dict" rule), so
+				// only dispatch here when tokenTypes was actually parsed.
+				// DU-002 slice 446 follow-up (M0119-0004).
+				if len(tokenTypes) > 0 && p.acceptKeyword(KwWith) {
+					var dicts []ObjectName
+					for {
+						dn, err := p.parseObjectName()
+						if err != nil {
+							return nil, err
+						}
+						dicts = append(dicts, dn)
+						if !p.acceptSymbol(",") {
+							break
+						}
+					}
+					return &AlterTSConfigStmt{pos: t.Pos, ConfigName: cfgName, Action: "altermapping", TokenTypes: tokenTypes, Dictionaries: dicts}, nil
+				}
+				// OWNER TO (or any other unrecognized trailer) — unimplemented
+				// compat no-op; discard the rest of the statement.
+				stmt, err := p.parseSkipToSemicolon(t.Pos)
+				if err != nil {
+					return nil, err
+				}
+				if ns, ok := stmt.(*CompatNoopStmt); ok {
+					ns.Tag = "ALTER TEXT SEARCH CONFIGURATION"
+					ns.ObjType = "text search configuration"
+					ns.ObjName = cfgName
+				}
+				return stmt, nil
+			}
+			// OWNER TO — unimplemented compat no-op; discard the rest of
+			// the statement.
+			stmt, err := p.parseSkipToSemicolon(t.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if ns, ok := stmt.(*CompatNoopStmt); ok {
+				ns.Tag = "ALTER TEXT SEARCH CONFIGURATION"
+				ns.ObjType = "text search configuration"
+				ns.ObjName = cfgName
+			}
+			return stmt, nil
+		}
+		// ALTER TEXT SEARCH DICTIONARY name {RENAME TO|SET SCHEMA|( key
+		// [= value] [, ...] )} — DU-002 ALTER TEXT SEARCH DICTIONARY
+		// follow-up (M0119-0004). OWNER TO and PARSER/TEMPLATE fall through
+		// to the generic skip-to-semicolon compat no-op below, matching the
+		// ALTER TEXT SEARCH CONFIGURATION precedent.
+		if p.acceptIdentKeyword("dictionary") {
+			dictName, err := p.parseObjectName()
+			if err != nil {
+				return nil, err
+			}
+			if p.acceptIdentKeyword("rename") {
+				if _, err := p.expectKeyword(KwTo); err != nil {
+					return nil, err
+				}
+				newNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSDictStmt{pos: t.Pos, DictName: dictName, Action: "rename", NewName: identText(newNameTok)}, nil
+			}
+			if (p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSet || p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "set")) &&
+				p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "schema") {
+				p.advance() // SET
+				p.advance() // SCHEMA
+				schemaTok := p.cur()
+				p.advance()
+				return &AlterTSDictStmt{pos: t.Pos, DictName: dictName, Action: "setschema", NewSchema: identText(schemaTok)}, nil
+			}
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				opts, err := parseAlterTSDictOptionList(p)
+				if err != nil {
+					return nil, err
+				}
+				return &AlterTSDictStmt{pos: t.Pos, DictName: dictName, Action: "options", Options: opts}, nil
+			}
+			// OWNER TO (or any other unrecognized trailer) — unimplemented
+			// compat no-op; discard the rest of the statement.
+			stmt, err := p.parseSkipToSemicolon(t.Pos)
+			if err != nil {
+				return nil, err
+			}
+			if ns, ok := stmt.(*CompatNoopStmt); ok {
+				ns.Tag = "ALTER TEXT SEARCH DICTIONARY"
+				ns.ObjType = "text search dictionary"
+				ns.ObjName = dictName
+			}
+			return stmt, nil
+		}
+		// ALTER TEXT SEARCH PARSER|TEMPLATE — unimplemented compat no-op.
+		stmt, err := p.parseSkipToSemicolon(t.Pos)
+		if err != nil {
+			return nil, err
+		}
+		return stmt, nil
 	}
 	// ALTER SEQUENCE — consume options as a compat stub. M0097-0009.
 	if p.acceptIdentKeyword("sequence") {
@@ -6601,7 +7027,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER AGGREGATE"}, nil
 	}
 	// ALTER COLLATION [IF EXISTS] name RENAME TO newname | OWNER TO role |
 	// REFRESH VERSION. M0119-0004 (DU-002, loop #50 ledger follow-up).
@@ -6789,7 +7215,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER INDEX"}, nil
 	}
 
 	// ALTER FUNCTION / PROCEDURE / ROUTINE — may update volatile/security/leakproof/strict attrs.
@@ -6954,7 +7380,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER MATERIALIZED VIEW"}, nil
 	}
 	// ALTER VIEW name RENAME TO / OWNER TO / SET SCHEMA — same treatment as
 	// ALTER SEQUENCE (DU-002 slice 439): a view is just a relation
@@ -7123,7 +7549,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER VIEW"}, nil
 		}
 		// Other ALTER VIEW forms not yet modeled — consume as a no-op like the
 		// pre-existing compat stub did for everything (see deferral ledger).
@@ -7133,7 +7559,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER VIEW"}, nil
 	}
 	// ALTER OPERATOR name (left_type, right_type) SET (option = value, ...) —
 	// PG's post-creation attribute-edit form (AlterOperator, operatorcmds.c).
@@ -7159,7 +7585,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER OPERATOR CLASS"}, nil
 		}
 		opName, err := p.parseOperatorName()
 		if err != nil {
@@ -7204,7 +7630,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER OPERATOR"}, nil
 		}
 		p.advance() // SET
 		p.advance() // '('
@@ -7329,7 +7755,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		tag := "ALTER PUBLICATION"
+		if pubSubKind == KwSubscription {
+			tag = "ALTER SUBSCRIPTION"
+		}
+		return &CompatNoopStmt{pos: t.Pos, Tag: tag}, nil
 	}
 	// ALTER EVENT TRIGGER name {DISABLE | ENABLE [REPLICA|ALWAYS] | RENAME TO
 	// newname | OWNER TO newowner} — the only ALTER EVENT TRIGGER forms goopg
@@ -7434,15 +7864,181 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER SCHEMA"}, nil
 	}
-	// ALTER COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
+	// ALTER DOMAIN name RENAME TO newname / OWNER TO role / RENAME CONSTRAINT
+	// old TO new / ADD-DROP CONSTRAINT / SET-DROP DEFAULT / SET-DROP NOT
+	// NULL — the ALTER DOMAIN forms goopg models so far. Previously "domain"
+	// fell entirely into the generic collation/domain/extension/... compat-
+	// stub loop below, a silent no-op for every form including these — the
+	// same class of gap ALTER SCHEMA's dedicated case (immediately above)
+	// closed for schemas. Only SET SCHEMA still falls through to a no-op
+	// below. M0122-0005 (domain follow-up); RENAME CONSTRAINT/ADD-DROP
+	// CONSTRAINT/SET-DROP DEFAULT/SET-DROP NOT NULL added in later
+	// follow-ups (real PG's gram.y models RENAME CONSTRAINT as a RenameStmt
+	// with renameType == OBJECT_DOMCONSTRAINT, not part of AlterDomainStmt,
+	// but goopg groups every ALTER DOMAIN form under one AST node).
+	if p.acceptIdentKeyword("domain") {
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if p.acceptIdentKeyword("rename") {
+			if p.acceptKeyword(KwConstraint) {
+				oldNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				if _, err := p.expectKeyword(KwTo); err != nil {
+					return nil, err
+				}
+				newConNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "renameconstraint", ConstraintName: identText(oldNameTok), NewConstraintName: identText(newConNameTok)}, nil
+			}
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "rename", NewName: identText(newNameTok)}, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "owner"}
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.NewOwner = identText(tok)
+			} else {
+				ownerStmt.NewOwner = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		if p.acceptKeyword(KwAdd) {
+			// ALTER DOMAIN name ADD [CONSTRAINT constraint_name] CHECK (expr)
+			// [NOT VALID] — the only DomainConstraintElem real PG's grammar
+			// allows (CHECK; a domain NOT NULL constraint is set via SET NOT
+			// NULL, not ADD). Reuses tryParseCheckInValues/parseDomainCheckExpr,
+			// the same helpers CREATE DOMAIN's CHECK clause uses, so the stored
+			// Expr/InValues shape matches exactly. M0122-0005 domain follow-up.
+			var cname string
+			if p.acceptKeyword(KwConstraint) {
+				nameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				cname = identText(nameTok)
+			}
+			if _, err := p.expectKeyword(KwCheck); err != nil {
+				return nil, err
+			}
+			addStmt := &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "addconstraint", ConstraintName: cname}
+			if vals := p.tryParseCheckInValues(); vals != nil {
+				addStmt.CheckInValues = vals
+			} else {
+				expr, err := p.parseDomainCheckExpr()
+				if err != nil {
+					return nil, err
+				}
+				addStmt.CheckExpr = expr
+			}
+			// Optional NOT VALID trailer (ConstraintAttributeSpec). Parsed and
+			// discarded: goopg's DomainCheck has no convalidated flag, and
+			// (unlike real PG) never scans existing column data when a CHECK is
+			// added either way, NOT VALID or not — see deferral ledger.
+			if p.acceptKeyword(KwNot) {
+				p.acceptIdentKeyword("valid")
+			}
+			return addStmt, nil
+		}
+		if p.acceptKeyword(KwSet) {
+			// ALTER DOMAIN name SET DEFAULT expr / SET NOT NULL — reuses
+			// parseExpr the same way CREATE DOMAIN's own DEFAULT clause does,
+			// so the stored AST round-trips through pg_dump identically
+			// either way. `SET` alone (without a following DEFAULT/NOT NULL)
+			// falls through to the generic no-op below — SET is already
+			// consumed by then, which is harmless since that loop just
+			// discards tokens to the statement terminator. M0122-0005 domain
+			// follow-up (SET/DROP DEFAULT; SET/DROP NOT NULL added in a later
+			// follow-up).
+			if p.acceptKeyword(KwDefault) {
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "setdefault", DefaultExpr: expr}, nil
+			}
+			if p.acceptKeyword(KwNot) {
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "setnotnull"}, nil
+			}
+		}
+		if p.acceptKeyword(KwDrop) {
+			if p.acceptKeyword(KwConstraint) {
+				// ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] constraint_name
+				// [RESTRICT | CASCADE]. M0122-0005 domain follow-up.
+				ifExists := false
+				if p.acceptKeyword(KwIf) {
+					if _, err := p.expectKeyword(KwExists); err != nil {
+						return nil, err
+					}
+					ifExists = true
+				}
+				conNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				// Optional RESTRICT/CASCADE drop-behavior trailer — parsed and
+				// discarded; goopg tracks no dependents on a domain CHECK to
+				// cascade over.
+				if !p.acceptKeyword(KwCascade) {
+					p.acceptKeyword(KwRestrict)
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropconstraint", ConstraintName: identText(conNameTok), IfExists: ifExists}, nil
+			}
+			if p.acceptKeyword(KwDefault) {
+				// ALTER DOMAIN name DROP DEFAULT. M0122-0005 domain follow-up.
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropdefault"}, nil
+			}
+			if p.acceptKeyword(KwNot) {
+				// ALTER DOMAIN name DROP NOT NULL. M0122-0005 domain follow-up.
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropnotnull"}, nil
+			}
+		}
+		// Unmodelled ALTER DOMAIN form (SET SCHEMA) —
+		// consume to the terminator and return a no-op, mirroring the
+		// compat-stub loop's prior behavior for this statement family.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER DOMAIN"}, nil
+	}
+	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
 	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
 	// its own dedicated case above, DU-002 slice 440 — "view" is
 	// intentionally not in this list; ALTER SCHEMA has its own dedicated
-	// case immediately above — DU-002 slice 440 resume point (3).)
+	// case immediately above — DU-002 slice 440 resume point (3); ALTER
+	// DOMAIN has its own dedicated case immediately above too — M0122-0005
+	// domain follow-up.)
 	for _, objIdent := range []string{
-		"collation", "domain", "extension", "language",
+		"collation", "extension", "language",
 		"operator", "system",
 	} {
 		if p.acceptIdentKeyword(objIdent) {
@@ -7453,7 +8049,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER " + strings.ToUpper(objIdent)}, nil
 		}
 	}
 	// ALTER FOREIGN DATA WRAPPER name [HANDLER h|NO HANDLER] [VALIDATOR h|NO

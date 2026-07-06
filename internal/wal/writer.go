@@ -327,6 +327,18 @@ type Writer struct {
 	// and signals fg.signal; the writer goroutine drains the entire
 	// batch in one fdatasync. M0098-0002.
 	fg *flushGroup
+
+	// sharedFsyncTimeNanos accumulates real wall-clock time spent inside
+	// FlushUpTo's fdatasync wait, backing pg_stat_io's (client backend,
+	// wal, normal) fsync_time column (M0122-0003 track_io_timing
+	// follow-up). initdb.Open's OnWALSyncDone hook calls
+	// AddFsyncTimeNanos only when the calling backend's own
+	// track_io_timing is on (via ActivityRegistry.LookupTrackedGoroutine),
+	// mirroring storage.Pool's OnPinDone/AddReadTimeNanos gating exactly —
+	// see AddFsyncTimeNanos's doc comment. Plain atomic.Int64 (not a
+	// sharded stats.Counter) because fsyncs are already serialised through
+	// group commit, unlike per-buffer read/write/extend ops.
+	sharedFsyncTimeNanos atomic.Int64
 }
 
 type state struct {
@@ -436,6 +448,14 @@ type state struct {
 type walBufferCounters struct {
 	overflowDrainBytes stats.Counter
 	flushDrainBytes    stats.Counter
+
+	// fsyncCount is the lifetime count of real fdatasync(2) calls made by
+	// state.flushUpTo against WAL segment files — pg_stat_io's
+	// (client backend, wal, normal, fsyncs) cell (M0122-0003 follow-up).
+	// Incremented once per segment actually synced, unconditionally (real
+	// op counts are never gated on track_io_timing, only their _time
+	// siblings are — see Writer.sharedFsyncTimeNanos).
+	fsyncCount stats.Counter
 }
 
 // drainReason classifies which counter a drainBufferBytes call
@@ -568,6 +588,37 @@ func (w *Writer) WALBuffersFlushDrainBytes() uint64 {
 		return 0
 	}
 	return uint64(w.walBufferCounters.flushDrainBytes.Sum())
+}
+
+// FsyncCount returns the lifetime count of real fdatasync(2) calls the
+// writer has made against WAL segment files, backing pg_stat_io's
+// (client backend, wal, normal) fsyncs column (M0122-0003 follow-up).
+// Atomic load — does not enqueue an op.
+func (w *Writer) FsyncCount() int64 {
+	if w.walBufferCounters == nil {
+		return 0
+	}
+	return w.walBufferCounters.fsyncCount.Sum()
+}
+
+// AddFsyncTimeNanos accumulates n nanoseconds of real wall-clock time
+// spent waiting on a WAL fdatasync, backing pg_stat_io's fsync_time
+// column. Callers must only add real elapsed time measured while the
+// calling backend has track_io_timing enabled (see initdb.Open's
+// OnWALSyncDone wiring, which mirrors storage.Pool's OnPinDone /
+// AddReadTimeNanos gating exactly — "zero unless track_io_timing is
+// enabled" pg_stat_io.*_time semantics). Non-positive n is ignored.
+func (w *Writer) AddFsyncTimeNanos(n int64) {
+	if n > 0 {
+		w.sharedFsyncTimeNanos.Add(n)
+	}
+}
+
+// FsyncTimeNanos returns the cumulative real time spent in WAL
+// fdatasync calls by backends with track_io_timing on, backing
+// pg_stat_io's fsync_time column. Atomic load.
+func (w *Writer) FsyncTimeNanos() int64 {
+	return w.sharedFsyncTimeNanos.Load()
 }
 
 // WrittenLSN returns the LSN of the last byte the writer has
@@ -1687,6 +1738,9 @@ func (s *state) flushUpTo(lsn uint64) error {
 		// docs/design/0007-0002-fdatasync-commit-path.md.
 		if err := dataSync(f); err != nil {
 			return fmt.Errorf("wal: fdatasync %s: %w", f.Name(), err)
+		}
+		if s.walBufferCounters != nil {
+			s.walBufferCounters.fsyncCount.Add(1)
 		}
 		delete(s.dirty, seg)
 	}

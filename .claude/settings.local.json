@@ -8,6 +8,9 @@
       "Bash(systemctl --user reset-failed goopg-wp.scope)"
     ]
   },
+  "env": {
+    "BASH_MAX_TIMEOUT_MS": "3600000"
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -62,6 +65,11 @@
           {
             "type": "command",
             "command": "uv run --directory /home/ryo/work/goopg/goopg/serena serena-hooks cleanup --client=claude-code"
+          },
+          {
+            "type": "command",
+            "command": "python3 /home/ryo/work/goopg/goopg/analysis/ralph-loop-kaizen/practice-cards/bg_task_guard.py",
+            "timeout": 30
           }
         ]
       }

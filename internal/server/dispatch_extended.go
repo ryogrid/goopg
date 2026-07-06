@@ -267,7 +267,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		for i, sc := range schema {
 			res.Fields[i] = protocol.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeOID:      typeOIDFor(sc.Type),
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,
@@ -300,7 +300,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 				// fallback. M0119-0004 (dispatch_extended vs dispatch
 				// type-switch divergence).
 				if i < len(schema) {
-					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type)
+					cells[i] = s.appendTypedCellText(nil, d, schema[i].Type, ectx.GetSetting)
 					continue
 				}
 				cells[i] = d.AppendValueText(nil)

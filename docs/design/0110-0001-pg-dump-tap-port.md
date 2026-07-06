@@ -14447,3 +14447,986 @@ PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33, after one transient
 failure/hang caused by a concurrently-running peer ralph loop's own
 build+test load — reproduced clean on retry, unrelated to this change:
 [[concurrent_ralph_loops_corrupt_tree]]); `make ralph-state-guard` OK.
+
+## DU-002 round-trip probe: `xmloption` GUC fixed, multi-database isolation gap found (2026-07-06)
+
+`TestPort_PgDumpConnectionSetup` (`internal/testport/pgdump_connsetup_test.go`)
+had grown to 433 dump-side slices with a fully-succeeding `pg_dump` (exit 0
+against the accumulated test schema), but E-002's stated close condition for
+002–010 is "a dump+restore round-trip against a live goopg server", which the
+test never actually exercised. Added a round-trip step at the tail of the
+`res.ExitCode == 0` block: `CREATE DATABASE dumprestore_du002`, then pipe the
+captured `pg_dump` stdout into `psql -v ON_ERROR_STOP=1` against it — the same
+shape real pg_dump TAP tests' restore_test exercises.
+
+**Found and fixed:** every `pg_dump` archive opens with an unconditional `SET
+xmloption = content;` preamble statement (`postgres/src/bin/pg_dump/pg_dump.c`
+`setup_connection`-adjacent dump preamble, not gated on the dump containing
+any XML columns), which goopg rejected with `unrecognized configuration
+parameter "xmloption"`. Fixed by registering `xmloption` in
+`internal/config/defaults.go` (enum `content`/`document`, default `content`,
+`PGC_USERSET`/`ContextUserset`), mirroring `guc_tables.c`'s entry exactly.
+goopg has no document-vs-content XML parsing distinction (its XML codec
+always treats a value as a content fragment), so this is a no-op
+registration — the point is only that `SET`/`SHOW xmloption` must succeed.
+Added the entry to `postgresql.conf.sample` alongside the neighboring
+`row_security`/`synchronize_seqscans` no-op GUCs.
+
+**Found, NOT fixed (milestone-scale):** after the `xmloption` fix, the same
+probe immediately hit `ERROR: collation "builtin_coll" already exists`. A
+throwaway diagnostic test (`TestZZProbeMultiDatabaseIsolation`, deleted after
+confirming the finding) proved the root cause is architectural, not a
+per-statement bug: `catalog.InMemory` has **no per-database namespace**.
+`CreateDatabase` (`internal/catalog/catalog.go:4231`) only sets
+`c.databases[name] = true`, a flat existence map used for identity/`\l`/
+duplicate-name checks; every real object store (`c.tables`, `c.schemas`,
+`c.userCollations`, `c.userConversions`, sequences, types, …) is one flat,
+server-wide map/slice with no DBOid/DBName key anywhere. A table created
+while connected to "postgres" is immediately visible from — and blocks
+re-creation from — any other "database" name on the same goopg server. This
+means a dump can never restore cleanly into a genuinely separate, empty
+database: the dump's first schema-level object collides with the original
+database's own copy of itself. By extension, most of DU-002/E-002's
+remaining scope (a real, isolated dump+restore round-trip) is gated on this,
+not solely on further catalog-view parity as the CSV rationale for E-002
+currently implies.
+
+This is a full milestone (per-database catalog object stores *and* auditing
+whether `storage.RelFileNode.DBOid` — already plumbed through
+`c.dbOid`/`SetDBOID`, but as one mutable server-wide field, not a per-
+connection value — is ever actually multi-tenant), not a boundable slice, so
+it is recorded in the deferral ledger (2026-07-06 row) rather than attempted
+here. The round-trip probe stays a soft `t.Logf`, not a hard assertion, so it
+becomes a ready-made regression/progress signal for whichever future loop
+takes on real multi-database isolation, without blocking this file's
+otherwise-green 433-slice guard today.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/config/...
+./internal/parser/... ./internal/catalog/... ./internal/server/...
+./internal/executor/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33).
+
+## Slice 436: `ALTER TYPE ... ADD VALUE [BEFORE|AFTER]` + `RENAME VALUE` enum-label order (2026-07-06)
+
+The `mood` enum fixture (`CREATE TYPE public.mood AS ENUM ('sad', 'ok',
+'happy')`, slice 88/89) had never been mutated after creation, so the
+`ADD VALUE`/`RENAME VALUE` label-reordering path of `pg_enum.enumsortorder`
+had zero end-to-end pg_dump coverage — only parser-level unit tests existed
+(`internal/parser/m0097_0017_test.go`).
+
+Added three statements to the fixture, run in this order:
+
+```sql
+ALTER TYPE public.mood ADD VALUE 'meh' BEFORE 'ok';
+ALTER TYPE public.mood ADD VALUE 'ecstatic' AFTER 'happy';
+ALTER TYPE public.mood RENAME VALUE 'meh' TO 'blah';
+```
+
+**Verified against real PG 18.3 first** (`postgres/local_install/bin`, scratch
+`initdb`+`pg_ctl`+`psql`+`pg_dump` run against the identical DDL sequence):
+`pg_dump --schema-only` never re-emits `ALTER TYPE ... ADD VALUE`/`RENAME
+VALUE` for a plain (non `--binary-upgrade`) dump. `dumpEnumType`
+(`pg_dump.c`) instead reads `getEnumLabels`'s `SELECT enumlabel FROM pg_enum
+WHERE enumtypid = $1 ORDER BY enumsortorder` and folds the FINAL label set,
+in `enumsortorder` order, straight into one `CREATE TYPE ... AS ENUM (...)`
+statement. Real output for the sequence above:
+
+```
+CREATE TYPE public.mood AS ENUM (
+    'sad',
+    'blah',
+    'ok',
+    'happy',
+    'ecstatic'
+);
+```
+
+(`'meh'` was inserted at a BEFORE-midpoint sort order between `'sad'` and
+`'ok'`, then renamed in place to `'blah'` without moving; `'ecstatic'` was
+appended after `'happy'` via an AFTER-tail sort order.)
+
+**goopg already matches this byte-for-byte — no engine bug found.**
+`catalog.AddEnumValueResult` (`internal/catalog/catalog.go`, ~line 16442)
+already implements PG's exact algorithm: BEFORE/AFTER each compute a float4
+midpoint `SortOrder` between the two adjacent `EnumValue.SortOrder`s (falling
+back to `renumberEnumValues` — PG's `RenumberEnumType` equivalent — when
+float4 precision between two neighbors is exhausted), and splice the new
+`EnumValue` into `EnumType.Values` at the correct index rather than merely
+appending. `RenameEnumValue` (same file, ~line 16314) changes only the label
+in place, leaving `SortOrder` untouched — exactly matching the observed real
+output ('blah' stays where 'meh' was). `pg_enum`'s `VirtualRows` closure
+(same file, ~line 6425) projects `enumsortorder` straight from
+`EnumValue.SortOrder`, so the guest `SELECT ... ORDER BY enumsortorder`
+returns the fixture's final label order and `dumpEnumType`'s CREATE TYPE
+reproduces it verbatim.
+
+Added two assertions to the existing enum-round-trip block: a
+presence-only check for `'blah'`/`'ecstatic'` (mirroring the existing
+`'sad'`/`'ok'`/`'happy'` checks) and a new exact-sequence check for the
+literal `CREATE TYPE public.mood AS ENUM (\n    'sad',\n    'blah',\n
+'ok',\n    'happy',\n    'ecstatic'\n);` block — the latter is the guard that
+actually exercises the ordering logic; the substring-only checks alone would
+pass even with every label present but shuffled.
+
+Slice-selection due diligence — candidates surveyed and ruled out as *not*
+new gaps (all already covered or not applicable): `MATCH PARTIAL` foreign
+keys (real PG's own parser rejects `MATCH PARTIAL` as not yet implemented,
+so there is nothing to round-trip); `CREATE TABLE t (LIKE src INCLUDING
+…)` (PG expands the LIKE clause into plain columns/constraints at parse
+time — pg_dump has no LIKE-specific output path to exercise, and the
+resulting column/constraint shapes are already covered by the many
+per-feature slices that dump those same shapes directly). Two candidates
+were surfaced but deliberately deferred rather than bundled into this slice
+(see the 2026-07-06 M0119-0004 deferral-ledger row): `GRANT ... WITH GRANT
+OPTION GRANTED BY <role>` (grantor round-trip, not yet probed against real
+PG), and user-defined `CREATE TEXT SEARCH {PARSER,TEMPLATE,DICTIONARY,
+CONFIGURATION}` (only the empty-catalog-view case for built-ins is covered
+today, via slices 12-15; no slice yet exercises a user-defined TS object's
+own CREATE+dump).
+
+Gates: `go build ./...` clean; `go test -count=1 -run
+TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
+-count=1 ./internal/executor/... ./internal/planner/... ./internal/parser/...
+./internal/catalog/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33,
+run for due diligence though this slice touches only the pg_dump-facing test
+file — zero production-code changes).
+
+## Slice 437: `CREATE TEXT SEARCH DICTIONARY` round-trip (2026-07-06)
+
+The second of slice 436's two surfaced-but-deferred candidates: user-defined
+`CREATE TEXT SEARCH {DICTIONARY,CONFIGURATION,PARSER,TEMPLATE}` objects.
+Unlike slice 436 (a zero-production-code test-only slice), this one is a
+genuine engine gap: `CREATE TEXT SEARCH DICTIONARY` was a parsed-and-
+discarded `CompatNoopStmt` (parser comment: "parse name for compat
+registry") that never touched the catalog at all, and all four `pg_ts_*`
+virtual views (`pg_ts_parser`/`pg_ts_template`/`pg_ts_dict`/`pg_ts_config`)
+unconditionally returned `nil` — correct for the "no user object exists"
+case (slices 12-15), but meaning a user-created dictionary could never
+round-trip.
+
+**Scope for this slice: DICTIONARY only**, the most common real-world TS
+object kind (used to attach STOPWORDS/synonym lists to a built-in template).
+CONFIGURATION carries an ordered mapping-entry list backed by its own
+catalog (`pg_ts_config_map`) and PARSER/TEMPLATE are C-function-loading
+features with no analog in goopg (TEMPLATE in particular can never be
+user-created here) — each would need its own real-PG-verified probe and is
+non-trivially larger, so they remain untouched compat no-ops this slice.
+
+**Verified against real PG 18.3 first** (`postgres/local_install/bin`,
+scratch `initdb`+`pg_ctl`+`psql`+`pg_dump` run):
+
+```sql
+CREATE TEXT SEARCH DICTIONARY public.simple_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english);
+```
+
+dumps as:
+
+```
+CREATE TEXT SEARCH DICTIONARY public.simple_dict (
+    TEMPLATE = pg_catalog.simple,
+    stopwords = 'english' );
+
+
+ALTER TEXT SEARCH DICTIONARY public.simple_dict OWNER TO postgres;
+```
+
+Two things worth noting from the real output: (1) `STOPWORDS` was given
+unquoted (identifier-shaped) but dumps lower-cased and single-quoted —
+PG's `DefElem`/`serialize_deflist` (`tsearchcmds.c`) folds every non-numeric
+option value to a string regardless of how it was written; (2) the
+generic per-object `ALTER ... OWNER TO` trailer (already exercised for
+FDW/SERVER/PUBLICATION/SUBSCRIPTION in earlier slices) applies here too.
+
+**Implementation** (genuine new code, not a "no bug found" slice like 436):
+
+- `catalog.BuiltinTSTemplateOID` (`internal/catalog/catalog.go`) seeds the
+  four real built-in template OIDs verbatim from upstream's
+  `pg_ts_template.dat`: `simple=3727`, `synonym=3730`, `ispell=3733`,
+  `thesaurus=3742`. `pg_ts_template.VirtualRows` now returns these four rows
+  (namespace = pg_catalog OID 11) instead of unconditionally `nil` — needed
+  because `dumpTSDictionary` (`pg_dump.c`) runs its own live query,
+  `SELECT nspname, tmplname FROM pg_ts_template p, pg_namespace n WHERE
+  p.oid = '<dicttemplate>' AND n.oid = tmplnamespace`, against the target
+  server to resolve a dictionary's TEMPLATE clause by OID — with zero rows
+  this query would fail outright (`ExecuteSqlQueryForSingleRow` expects
+  exactly one row), not just under-dump. `getTSTemplates`' own dump-output
+  query still filters these to zero rows via namespace dumpability (they
+  live in pg_catalog), so slice 13's "always empty is correct" dump-output
+  behavior is unchanged — only the FK-lookup path gained real data.
+- `catalog.UserTSDict` + `InMemory.CreateTSDict`/`DropTSDict`/
+  `ListUserTSDicts` (`internal/catalog/catalog.go`) mirror `UserConversion`
+  (slice 399) exactly: OID-keyed, unique per (name, namespace), backing
+  `pg_ts_dict.VirtualRows` (also previously unconditionally `nil`).
+- `internal/parser/ddl.go`'s `CREATE TEXT SEARCH ...` case now actually
+  scans the `( TEMPLATE = tmpl [, key = value, ...] )` paren list (mirroring
+  the existing `CREATE OPERATOR` option-list scanner in the same file)
+  instead of only capturing the object name and skipping to `;`. New
+  `parser.TSDictOption{Key, Value, IsNumeric}` + `CompatNoopStmt.
+  TSDictTemplate`/`TSDictOptions` fields carry the parsed clause; this
+  scanning only activates for the DICTIONARY kind — CONFIGURATION/PARSER/
+  TEMPLATE keep discarding their entire tail unchanged.
+- `internal/executor/operators_ddl.go`'s new `"text search dictionary"`
+  CREATE case resolves the template name against `BuiltinTSTemplateOID`
+  (`42704` "text search template is required" if unresolvable, mirroring
+  `DefineTSDictionary`'s own check in `tsearchcmds.c`), calls the new
+  `serializeTSDictOptions` helper — a direct port of PG's
+  `serialize_deflist` (numeric literals bare, everything else single-quoted
+  with `'`-doubling, keys `quote_identifier`'d via the existing
+  `pgQuoteIdent`) — to build `dictinitoption`, and registers the result via
+  `CreateTSDict`. The existing generic DROP-registry fallthrough (shared by
+  every `CompatNoopStmt`-backed object type) gained a parallel `DropTSDict`
+  call alongside its existing `DropConversion` call.
+
+**Deliberately left out this slice** (deferral-ledger row, same date):
+restart/WAL persistence (a dictionary vanishes on server restart — unlike
+CREATE CONVERSION/CAST/TRANSFORM, which each replay via an
+`internal/initdb/*_ddl_recovery.go` driver), `verify_dictoptions`
+template-specific option-name validation (any option name is accepted
+verbatim), and `ALTER TEXT SEARCH DICTIONARY` (rename/owner/set-schema/
+option changes — only CREATE+DROP exist).
+
+New assertions added to the existing enum-round-trip block (same guard
+test, same fixture connection) rather than a new subtest, matching the
+established slice pattern: an exact-block match for the full `CREATE TEXT
+SEARCH DICTIONARY public.simple_dict (...)` statement (catching a wrong
+template resolution, a dropped/mis-cased option name, or wrong quoting) and
+a separate check for the `ALTER TEXT SEARCH DICTIONARY ... OWNER TO
+postgres;` trailer.
+
+Gates: `go build ./...` clean; `go test -count=1 -run
+TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
+-count=1 ./internal/executor/... ./internal/parser/... ./internal/catalog/...`
+PASS; `scripts/tpch-spotcheck.sh` (background-verified, see working_set/loop
+status for the result recorded at commit time).
+
+## Slice 446: `CREATE TEXT SEARCH CONFIGURATION` + `ADD MAPPING` round-trip (2026-07-06)
+
+The CONFIGURATION candidate slice 437 deliberately deferred (it needed its
+own catalog, `pg_ts_config_map`, for the `ADD MAPPING` clause). This slice
+implements it: `CREATE TEXT SEARCH CONFIGURATION name (PARSER = parser_name)`
+followed by `ALTER TEXT SEARCH CONFIGURATION name ADD MAPPING FOR tok [, ...]
+WITH dict [, ...]` now round-trips through `pg_dump`.
+
+**Verified against real PG 18.3 first**:
+
+```sql
+CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (PARSER = pg_catalog.default);
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg ADD MAPPING FOR asciiword, word WITH simple;
+```
+
+dumps as:
+
+```
+CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (
+    PARSER = pg_catalog."default" );
+
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg
+    ADD MAPPING FOR asciiword WITH simple;
+
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg
+    ADD MAPPING FOR word WITH simple;
+
+
+ALTER TEXT SEARCH CONFIGURATION public.simple_cfg OWNER TO postgres;
+```
+
+Two things worth noting: (1) `dumpTSConfig` groups `pg_ts_config_map` rows by
+`maptokentype` and re-emits **one `ALTER ... ADD MAPPING` per distinct token
+type**, even though both were added by a single input statement here — it
+does not remember how the mapping was originally batched; (2) the bare
+`default` parser name is quoted (`pg_catalog."default"`) in the dump because
+it collides with the `DEFAULT` reserved keyword.
+
+**Implementation** required two new catalog dependencies `dumpTSConfig`
+resolves by OID, mirroring the `BuiltinTSTemplateOID` precedent from slice
+437:
+
+- `catalog.BuiltinTSParserOID` (`{"default": 3722}`) backs a now-non-empty
+  `pg_ts_parser.VirtualRows` — needed for `dumpTSConfig`'s own
+  `SELECT nspname, prsname FROM pg_ts_parser ... WHERE oid = '<cfgparser>'`
+  lookup of the CONFIGURATION's `PARSER = ...` clause.
+- `catalog.BuiltinTSDictOID` (`{"simple": 3765}`) backs a `pg_ts_dict` row for
+  the built-in "simple" dictionary — needed for `dumpTSConfig`'s
+  `mapdict::regdictionary` cast when re-emitting `ADD MAPPING ... WITH
+  simple`. Both views still filter these built-ins out of their own
+  *dump-list* queries via namespace dumpability (pg_catalog is never
+  dumped) — only the FK-lookup path gained real data, same pattern as 437's
+  `pg_ts_template` fix.
+- `catalog.TSTokenType`/`DefaultParserTokenTypes` — the fixed 23-row token
+  type table for the "default" parser (tokid/alias/description), verified
+  byte-for-byte against `SELECT * FROM ts_token_type(3722)` on real PG 18.3.
+  Backs the new `ts_token_type(oid)` FROM-clause SRF (`planner.TSTokenType` +
+  `executor.newTSTokenTypeOp`, mirroring the existing `pg_get_sequence_data`
+  SRF plumbing) — `dumpTSConfig` selects the `alias` column from a correlated
+  scalar subquery over it to resolve `pg_ts_config_map.maptokentype` back to
+  a name for the `ADD MAPPING FOR <alias>` clause.
+- `catalog.UserTSConfig`/`TSConfigMapping` + `InMemory.CreateTSConfig`/
+  `DropTSConfig`/`AddTSConfigMapping`/`ListUserTSConfigs`
+  (`internal/catalog/catalog.go`) mirror `UserTSDict`, with `Mappings
+  []TSConfigMapping` holding the ordered per-token-type dictionary list.
+  Backs new `pg_ts_config`/`pg_ts_config_map` (OID 3603) virtual views —
+  `pg_ts_config_map` is read directly by `dumpTSConfig`'s own query, not via
+  the `getTSConfigurations` dump-list query.
+- `internal/parser/ddl.go`: `CREATE TEXT SEARCH CONFIGURATION`'s `(PARSER =
+  ...)` clause now parses (reusing the option-list scanner slice 437 added,
+  extended with a `parser` key branch); a new `parseTSObjectNameLoose` helper
+  accepts a bare reserved-keyword identifier (`pg_catalog.default`) in this
+  position, which `parseObjectName` cannot (PG's grammar allows it here; there
+  is no ambiguity to guard against). A new top-level `ALTER TEXT SEARCH
+  CONFIGURATION ... ADD MAPPING FOR ... WITH ...` parse path produces
+  `parser.AlterTSConfigAddMappingStmt`; every other `ALTER TEXT SEARCH *` form
+  (RENAME/OWNER TO/SET SCHEMA/ALTER MAPPING/DROP MAPPING, and
+  DICTIONARY/PARSER/TEMPLATE entirely) stays a discarded compat no-op.
+- `internal/executor/operators_ddl.go`: new `"text search configuration"`
+  CREATE case (42704 if PARSER is missing/unresolvable, mirroring
+  `DefineTSConfiguration`'s check in `tsearchcmds.c`) and
+  `execAlterTSConfigAddMapping` (resolves each dictionary name against the
+  built-in `simple` first, then user-created dictionaries in the
+  configuration's schema, 42704 if neither matches). DROP fallthrough gained
+  a `DropTSConfig` call alongside the existing `DropTSDict` one.
+- `internal/executor/expr.go`: a new `int → regdictionary` cast branch
+  (mirroring the existing `int → regclass` one) resolves a `pg_ts_dict` OID
+  back to a bare name, checking `BuiltinTSDictOID` then
+  `ListUserTSDicts` — needed for the `mapdict::regdictionary` cast in
+  `dumpTSConfig`'s query.
+
+**Deliberately left out this slice** (deferral-ledger row, same date):
+restart/WAL persistence (mirroring the DICTIONARY gap from slice 437 — a
+configuration and its mappings vanish on server restart), duplicate-mapping
+detection (real PG raises 42710 re-adding a token type already mapped; goopg
+silently appends), and every other `ALTER TEXT SEARCH CONFIGURATION` form
+(`ALTER MAPPING REPLACE`, `DROP MAPPING`, `RENAME TO`, `SET SCHEMA` — only
+`ADD MAPPING` is applied). `CONFIGURATION = source_config` (the COPY-from-
+existing-configuration form of CREATE) is also unimplemented — only the bare
+`PARSER = ...` form is accepted.
+
+New assertions added to the existing TS-dictionary fixture block (same guard
+test, same connection): the fixture creates `simple_cfg` right after
+`simple_dict`, and the exact-block/ADD-MAPPING/OWNER-TO assertions land
+alongside the existing DICTIONARY ones near the end of the dump-comparison
+section, matching the established slice pattern.
+
+Gates: `go build ./...` clean; `go test -count=1 -run
+TestPort_PgDumpConnectionSetup ./internal/testport/ -v` PASS; `go test
+-count=1 ./internal/catalog/... ./internal/parser/... ./internal/executor/...
+./internal/planner/... ./internal/analyzer/...` PASS.
+
+## Slice 437/446 follow-up: TEXT SEARCH DICTIONARY/CONFIGURATION restart persistence (2026-07-06)
+
+Closes the restart/WAL-persistence deferral both slice 437 (DICTIONARY) and
+slice 446 (CONFIGURATION) recorded: a `CREATE TEXT SEARCH DICTIONARY`/
+`CREATE TEXT SEARCH CONFIGURATION`/`ALTER TEXT SEARCH CONFIGURATION ... ADD
+MAPPING` created before a crash or restart previously vanished from
+`pg_ts_dict`/`pg_ts_config`/`pg_ts_config_map` afterward — a pg_dump taken
+post-restart would silently omit the object, with no error. Mirrors the
+`CREATE CAST`/`CREATE TRANSFORM`/`CREATE CONVERSION`/`CREATE COLLATION`
+restart-persistence precedent exactly (catalog-only side effect, no
+per-object on-disk file namespace, so the physical WAL redo path is a no-op
+and a post-replay recovery pass reapplies the event to the catalog).
+
+**New WAL record kinds** (`internal/wal/recovery.go`): `RecordKindCreateTSDict`
+(104), `RecordKindDropTSDict` (105), `RecordKindCreateTSConfig` (106),
+`RecordKindAddTSConfigMapping` (107), `RecordKindDropTSConfig` (108) — plus
+their `Encode`/`Decode` pairs, each tested round-trip in
+`internal/wal/tsdict_tsconfig_ddl_test.go` (mirrors
+`conversion_ddl_test.go`). `ApplyRecord`'s dispatcher gained one case
+returning `(false, nil)` for all five kinds (no physical page state).
+`RecordKindAddTSConfigMapping`'s payload carries the full resolved
+`dictOIDs` list (not just the token type), so replay does not need to
+re-resolve dictionary names against the (possibly since-changed) catalog.
+
+**Catalog recovery hooks** (`internal/catalog/catalog.go`):
+`CreateTSDictDuringRecovery`/`DropTSDictDuringRecovery` and
+`CreateTSConfigDuringRecovery`/`AddTSConfigMappingDuringRecovery`/
+`DropTSConfigDuringRecovery` mirror `CreateConversionDuringRecovery`'s
+idempotent overwrite-by-OID semantics (a partial-then-full replay may see the
+same record twice).
+
+**Recovery drivers**: new `internal/initdb/tsdict_ddl_recovery.go` and
+`internal/initdb/tsconfig_ddl_recovery.go` (mirroring
+`conversion_ddl_recovery.go`), both wired into `internal/initdb/open.go`
+immediately after `replayConversionDDLRecords` — schema-scoped like
+conversion/collation, so they must run after `replaySchemaDDLRecords`. A
+configuration's `ADD MAPPING` records replay in WAL order after their own
+`CREATE` record with no extra bookkeeping, since the WAL is scanned in
+order. Tests: `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go` (6 new
+tests: create/drop-after-create/missing-wal-dir × {DICTIONARY,
+CONFIGURATION-with-mapping}, mirroring `conversion_ddl_recovery_test.go`).
+
+**WAL emission sites** (`internal/executor/operators_ddl.go`): the existing
+`"text search dictionary"`/`"text search configuration"` CREATE cases and
+`execAlterTSConfigAddMapping` now append the corresponding WAL record after
+each successful catalog mutation (previously they only mutated the
+in-memory registry); the shared DROP fallthrough's `DropTSDict`/`DropTSConfig`
+calls now also emit `EncodeDropTSDict`/`EncodeDropTSConfig`.
+
+**Still deferred** (unchanged from slice 446's own list — out of scope for
+this restart-persistence-only follow-up): duplicate-mapping 42710 detection,
+every other `ALTER TEXT SEARCH CONFIGURATION` form (`ALTER MAPPING REPLACE`,
+`DROP MAPPING`, `RENAME TO`, `SET SCHEMA`), and the `CONFIGURATION =
+source_config` COPY-from-existing-configuration form of CREATE.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/wal/...
+./internal/catalog/... ./internal/initdb/...` PASS (new tests above);
+`go test -count=1 -run TestPort_PgDumpConnectionSetup ./internal/testport/
+-v` PASS; `scripts/tpch-spotcheck.sh` PASS; pgbench pre-commit smoke PASS.
+
+## Slice 446 follow-up: duplicate-mapping detection is 23505, not 42710 (2026-07-06)
+
+Closes the "duplicate-mapping 42710 detection" item both the slice 446 and
+the restart-persistence-follow-up rows above deferred. Before implementing,
+this loop verified real PostgreSQL 18.3's actual behavior against a scratch
+instance rather than trusting the ledger's guess:
+
+```sql
+CREATE TEXT SEARCH CONFIGURATION my_cfg (PARSER = default);
+ALTER TEXT SEARCH CONFIGURATION my_cfg ADD MAPPING FOR word WITH simple;
+ALTER TEXT SEARCH CONFIGURATION my_cfg ADD MAPPING FOR word WITH english_stem;
+-- ERROR:  duplicate key value violates unique constraint "pg_ts_config_map_index"
+-- DETAIL:  Key (mapcfg, maptokentype, mapseqno)=(16384, 2, 1) already exists.
+```
+
+`MakeConfigurationMapping`'s plain-ADD path (`tsearchcmds.c`, `stmt->override
+== false`) never checks for an existing mapping before inserting — it simply
+assigns `mapseqno = j + 1` counting only the dictionaries named in *this*
+statement, starting at 1 every time. A second `ADD MAPPING FOR word` therefore
+always produces a `(mapcfg, maptokentype, mapseqno) = (cfgOid, wordTokId, 1)`
+tuple that collides with the row the first call already inserted, so the
+unique index (`pg_ts_config_map_index`) is what actually raises the error —
+`23505` unique_violation, not `42710` duplicate_object as this milestone's
+deferral rows had assumed (42710 is what `CREATE TEXT SEARCH CONFIGURATION`
+itself raises for a duplicate *configuration* name, a different check
+entirely: `catalog.InMemory.CreateTSConfig`'s existing name-collision path).
+
+**Landed**: `catalog.InMemory.AddTSConfigMapping` (`internal/catalog/
+catalog.go`) now scans the target configuration's existing `Mappings` for the
+named token type before appending, returning `(*UserTSConfig, duplicate
+bool)` instead of a bare `bool` — `nil` config means "configuration not
+found" (unchanged 42704 case), `duplicate == true` means the token type is
+already mapped. `internal/executor/operators_ddl.go`'s
+`execAlterTSConfigAddMapping` raises `23505` with PG's exact message text and
+a `Detail` reproducing the real `(mapcfg, maptokentype, mapseqno)` key tuple
+(config OID + `catalog.DefaultParserTokenTypes` token-type lookup + hardcoded
+`, 1)`, since every plain ADD MAPPING call collides at seqno 1). A distinct
+token type in the same configuration is unaffected (verified by test).
+
+**Test**: `internal/executor/tsconfig_duplicate_mapping_test.go`
+(`TestAlterTSConfigAddMappingDuplicateRaises23505`) — create a configuration,
+add a mapping, re-add the same token type (expect 23505 with the exact
+message/detail text), then add a distinct token type (expect success).
+
+**Still deferred** (unchanged): every other `ALTER TEXT SEARCH CONFIGURATION`
+form (`ALTER MAPPING REPLACE`, `DROP MAPPING`, `RENAME TO`, `SET SCHEMA`), and
+the `CONFIGURATION = source_config` COPY-from-existing-configuration form of
+CREATE.
+
+Gates: `go build ./...` clean; `go vet ./internal/catalog/...
+./internal/executor/...` clean; `go test -count=1 ./internal/catalog/...
+./internal/executor/... ./internal/wal/... ./internal/initdb/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS; pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `RENAME TO` / `SET SCHEMA` / `DROP MAPPING` (2026-07-06)
+
+Closes the next item named by both the slice 446 row and its duplicate-mapping
+follow-up: `ALTER TEXT SEARCH CONFIGURATION name {RENAME TO|SET SCHEMA|DROP
+MAPPING [IF EXISTS] FOR tok [, ...]}` previously fell through to the
+discarded compat no-op — the parser consumed and threw away the whole
+statement, so none of these three forms had any observable effect.
+
+`DropConfigurationMapping` (`tsearchcmds.c`) confirms the DROP MAPPING error
+shape: a token type with no mapping raises `42704` (`ERRCODE_UNDEFINED_OBJECT`)
+`mapping for token type "%s" does not exist` unless `IF EXISTS` is given, in
+which case it is a `NOTICE` (`... does not exist, skipping`), matching the
+per-clause (not per-statement) `IF EXISTS` semantics already used by other
+ALTER forms in this codebase.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `AlterTSConfigAddMappingStmt` generalized to
+  `AlterTSConfigStmt` with an `Action` field (`"addmapping"` |
+  `"dropmapping"` | `"rename"` | `"setschema"`), mirroring `AlterCollationStmt`'s
+  shape. `TokenTypes`/`Dictionaries` stay addmapping-only fields; new
+  `IfExists` (dropmapping), `NewName` (rename), `NewSchema` (setschema).
+- `internal/parser/ddl.go`: the `ALTER TEXT SEARCH CONFIGURATION` dispatch
+  block gained three new branches (DROP MAPPING, RENAME TO, SET SCHEMA)
+  alongside the existing ADD MAPPING one, sharing a new
+  `parseTSMappingTokenTypeList` helper for the `FOR tok [, ...]` list common
+  to ADD/DROP MAPPING. `ALTER MAPPING REPLACE` and `OWNER TO` remain
+  discarded compat no-ops (OWNER TO needs no dedicated path — `pg_dump`
+  reads `cfgowner` from the catalog row set at CREATE time, never from a
+  replayed ALTER OWNER TO statement).
+- `internal/catalog/catalog.go`: three new `InMemory` methods —
+  `DropTSConfigMapping` (removes one `Mappings` entry, returns the matched
+  config + whether an entry was actually removed), `RenameTSConfig` (mirrors
+  `RenameCollation`'s name-collision check), `SetTSConfigSchema` (mirrors
+  `SetCollationSchema`) — plus their `*DuringRecovery` counterparts
+  (`DropTSConfigMappingDuringRecovery`/`RenameTSConfigDuringRecovery`/
+  `SetTSConfigSchemaDuringRecovery`) for WAL replay.
+- `internal/executor/operators_ddl.go`: `execAlterTSConfigAddMapping` is now
+  a private helper called from a new top-level `execAlterTSConfig` dispatcher
+  (keyed on `s.Action`), alongside a new `execAlterTSConfigDropMapping`
+  sibling implementing the 42704/NOTICE distinction above.
+- Restart persistence, matching the slice 437/446 CREATE/ADD MAPPING/DROP
+  precedent exactly (not left as a fresh gap this time): three new WAL record
+  kinds (`internal/wal/recovery.go`) —
+  `RecordKindDropTSConfigMapping`(109)/`RecordKindRenameTSConfig`(110)/
+  `RecordKindSetTSConfigSchema`(111), each with `Encode`/`Decode` pairs
+  (`EncodeDropTSConfigMapping`/`EncodeRenameTSConfig`/
+  `EncodeSetTSConfigSchema` + `Decode*` counterparts), a
+  `RecordKindCreateTSDict, ..., RecordKindSetTSConfigSchema` case added to
+  the `ApplyRecord` dispatcher's existing catalog-only `(false, nil)`
+  branch, and three new cases wired into
+  `internal/initdb/tsconfig_ddl_recovery.go`'s replay switch (extending
+  `tsConfigRegistryRecovery`'s interface with the three new
+  `*DuringRecovery` methods).
+- `internal/server/dispatch.go`'s `ddlTag`: added a missing
+  `*parser.AlterTSConfigStmt` case returning `"ALTER TEXT SEARCH
+  CONFIGURATION"` (`cmdtaglist.h`'s `CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION`)
+  — this statement type had **no** `ddlTag` case at all before this loop, so
+  every one of its forms (including the pre-existing ADD MAPPING) silently
+  fell through to the generic `"OK"` command tag. Bug found and fixed as a
+  byproduct of generalizing the AST node, not a new deferral.
+
+**Tests**: `internal/executor/tsconfig_rename_setschema_dropmapping_test.go`
+(`TestAlterTSConfigRenameTo`/`TestAlterTSConfigSetSchema`/
+`TestAlterTSConfigDropMapping`, each covering the success path plus the
+42704 not-found case; DROP MAPPING additionally covers the IF-EXISTS-skips
+vs without-IF-EXISTS-errors distinction). `internal/wal/
+tsdict_tsconfig_ddl_test.go` gained round-trip/wrong-kind/truncated-payload
+cases for all three new record kinds. `internal/initdb/
+tsdict_tsconfig_ddl_recovery_test.go` gained
+`TestTSConfigDDLRecoveryReplaysRenameSetSchemaDropMapping` (create → add two
+mappings → drop one → rename → move schema, then a real `Init`→`Open`→WAL
+append→`Close`→`Open` cycle asserting only the survived mapping and final
+name/schema).
+
+**Still deferred** (unchanged from the slice 446 follow-up row): `ALTER
+MAPPING REPLACE` (both the token-type-scoped and bare-old-dictionary forms),
+`OWNER TO` (parses as a no-op; not expected to ever need a dedicated path per
+the note above), and the `CONFIGURATION = source_config`
+copy-from-existing-configuration form of `CREATE TEXT SEARCH CONFIGURATION`.
+
+Gates: `go build ./...` clean; `go vet` on all touched packages clean;
+`go test -count=1 ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/planner/... ./internal/wal/...
+./internal/initdb/... ./internal/server/...` PASS; `go test -race -count=1
+./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `ALTER MAPPING REPLACE` (2026-07-06)
+
+Closes the `ALTER MAPPING REPLACE` item named as the next candidate by both
+the RENAME/SET SCHEMA/DROP MAPPING follow-up row and this row's own
+predecessor ledger row: `ALTER TEXT SEARCH CONFIGURATION name ALTER MAPPING
+[FOR tok [, ...]] REPLACE olddict WITH newdict` previously fell through to
+the discarded compat no-op alongside `OWNER TO`.
+
+`MakeConfigurationMapping`'s replace path (`tsearchcmds.c`) confirms the
+shape: unlike ADD/DROP MAPPING this is an unconditional scan-and-substitute
+over the existing `pg_ts_config_map` rows, not a lookup — replacing a
+dictionary OID that matches zero mapping entries is a silent no-op, no error.
+An empty/absent `FOR` token-type list means "substitute across every token
+type the configuration maps" (the bare form); a present list scopes the
+substitution to only those token types.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `AlterTSConfigStmt` gained a `"replacedict"`
+  action plus `OldDict`/`NewDict` (`ObjectName`) fields.
+- `internal/parser/ddl.go`: new `parseTSTokenTypeCommaList` factored out of
+  `parseTSMappingTokenTypeList` (the latter now a thin `FOR` + comma-list
+  wrapper) since REPLACE's token-type list has no leading `FOR` requirement
+  — it's entirely optional. The `ALTER TEXT SEARCH CONFIGURATION` dispatch
+  gained an `ALTER MAPPING` branch: `[FOR tok [, ...]] REPLACE olddict WITH
+  newdict` builds the new `AlterTSConfigStmt`; the sibling
+  `ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN` form (`FOR tok WITH dict [, ...]`,
+  no `REPLACE`, which *overrides* a token type's whole dictionary list
+  rather than substituting one dictionary) still falls through to the
+  discarded compat no-op, now scoped under the new `ALTER MAPPING` branch
+  instead of the outer statement-level fallthrough.
+- `internal/catalog/catalog.go`: new `ReplaceTSConfigMappingDict` (scans
+  every matched mapping's `DictOIDs` for `oldOID`, substitutes `newOID` in
+  place, returns the matched configuration + whether anything was replaced —
+  no error on zero matches per the note above) plus
+  `ReplaceTSConfigMappingDictDuringRecovery`. Also fixed a latent aliasing
+  bug found while writing this: `AddTSConfigMapping` appended the *same*
+  `dictOIDs` backing array to every token type in a multi-token `ADD MAPPING
+  FOR t1, t2 WITH d1, d2` statement, so an in-place `DictOIDs` mutation via
+  the new REPLACE path on one token type silently corrupted every sibling
+  token type from that same ADD MAPPING call. Fixed with a defensive copy
+  (`append([]uint32(nil), dictOIDs...)`).
+- `internal/executor/operators_ddl.go`: new `execAlterTSConfigReplaceDict`,
+  plus a `resolveTSDictOID` helper factored out of
+  `execAlterTSConfigAddMapping` (both now share the same built-in/user
+  dictionary name → OID resolution, raising `42704` if neither resolves).
+- Restart persistence landed in the same loop (not deferred): new WAL record
+  kind `RecordKindReplaceTSConfigMappingDict`(112) with
+  `EncodeReplaceTSConfigMappingDict`/`DecodeReplaceTSConfigMappingDict`,
+  wired into `ApplyRecord`'s existing catalog-only `(false, nil)` case
+  alongside its 6 siblings, and into
+  `internal/initdb/tsconfig_ddl_recovery.go`'s replay switch (extending
+  `tsConfigRegistryRecovery` with `ReplaceTSConfigMappingDictDuringRecovery`).
+
+**Tests**: `internal/executor/tsconfig_replacedict_test.go`
+(`TestAlterTSConfigReplaceDictForToken`/`TestAlterTSConfigReplaceDictBare`,
+covering the token-scoped and bare forms, the untouched-sibling-token-type
+assertion, the 42704 unknown-configuration/unknown-dictionary cases, and the
+zero-match silent-no-op case). `internal/wal/tsdict_tsconfig_ddl_test.go`
+gained round-trip/wrong-kind/truncated-payload cases for the new record
+kind. `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go` gained
+`TestTSConfigDDLRecoveryReplaysReplaceMappingDict` (two configurations in one
+WAL stream — one scoped REPLACE, one bare REPLACE — through a real
+`Init`→`Open`→WAL append→`Close`→`Open` cycle).
+
+**Still deferred** (unchanged from the RENAME/SET SCHEMA/DROP MAPPING
+follow-up row, minus the item this row closes): the `ALTER MAPPING FOR tok
+WITH dict [, ...]` override form (no `REPLACE` keyword — replaces a token
+type's entire dictionary list rather than substituting one OID), `OWNER TO`,
+and the `CONFIGURATION = source_config` copy-from-existing-configuration
+form of `CREATE TEXT SEARCH CONFIGURATION`.
+
+Gates: `go build ./...` clean; `go vet` on all touched packages clean;
+`go test -count=1 ./internal/executor/... ./internal/catalog/...
+./internal/parser/... ./internal/planner/... ./internal/wal/...
+./internal/initdb/... ./internal/server/...` PASS; `go test -race -count=1
+./internal/wal/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `ALTER MAPPING FOR tok WITH dict` override form (2026-07-06)
+
+Closes the last named-and-deferred sub-form of `ALTER TEXT SEARCH
+CONFIGURATION ... ALTER MAPPING`: the `ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN`
+production in `gram.y` (`ALTER MAPPING FOR tok [, ...] WITH dict [, ...]`, no
+`REPLACE` keyword) previously fell through to the discarded compat no-op
+inside the `ALTER MAPPING` branch added by the REPLACE follow-up.
+
+`MakeConfigurationMapping`'s `stmt->override` path (`tsearchcmds.c`) confirms
+the semantics: for every named token type, any existing `pg_ts_config_map`
+rows are deleted first, then the new dictionary list is inserted — a
+wholesale replacement of that token type's *entire* mapping, as opposed to
+ADD MAPPING's append (which 23505s if the token type is already mapped — see
+the earlier slice 446 follow-up row) or REPLACE's single-OID substitution
+within the existing list. Because goopg's in-memory `TSConfigMapping` already
+models one token type as a single entry holding an ordered `DictOIDs` list
+(not one row per dictionary), the delete-then-insert collapses to a plain
+"replace-in-place-or-append" — no separate delete step is needed.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `AlterTSConfigStmt` gained an `"altermapping"`
+  action, reusing the existing `Dictionaries` field (same shape as
+  `"addmapping"`).
+- `internal/parser/ddl.go`: the `ALTER MAPPING` branch (added by the REPLACE
+  follow-up) now checks `len(tokenTypes) > 0 && p.acceptKeyword(KwWith)`
+  after the `REPLACE` check fails, building the `"altermapping"` statement.
+  `gram.y` requires `FOR` for this form (there is no bare
+  `ALTER MAPPING WITH dict` production, unlike REPLACE's optional `FOR`), so
+  gating on a non-empty `tokenTypes` mirrors the grammar exactly; anything
+  else (in practice, just `OWNER TO`) still falls through to the discarded
+  compat no-op.
+- `internal/catalog/catalog.go`: new `AlterTSConfigMapping` — looks up the
+  matching `TokenType` entry and overwrites its `DictOIDs` wholesale (or
+  appends a new entry if the token type wasn't mapped yet, matching what ADD
+  MAPPING would have produced), plus `AlterTSConfigMappingDuringRecovery`.
+  Never errors on an already-mapped token type (unlike `AddTSConfigMapping`)
+  since overriding an existing mapping is the entire point of this form.
+- `internal/executor/operators_ddl.go`: new `execAlterTSConfigAlterMapping`,
+  reusing the `resolveTSDictOID` helper (42704 on an unresolvable dictionary
+  or configuration name), looping `s.TokenTypes` the same way
+  `execAlterTSConfigAddMapping` does.
+- Restart persistence landed in the same loop (not deferred): new WAL record
+  kind `RecordKindAlterTSConfigMapping` (113) — identical wire shape to
+  `RecordKindAddTSConfigMapping` (one record per token type: tokenType +
+  full replacement `DictOIDs` list) — with
+  `EncodeAlterTSConfigMapping`/`DecodeAlterTSConfigMapping`, wired into
+  `ApplyRecord`'s existing catalog-only `(false, nil)` case alongside its 7
+  siblings, and into `internal/initdb/tsconfig_ddl_recovery.go`'s replay
+  switch (extending `tsConfigRegistryRecovery` with
+  `AlterTSConfigMappingDuringRecovery`).
+
+**Tests**: `internal/executor/tsconfig_altermapping_test.go`
+(`TestAlterTSConfigAlterMapping`, covering: overriding an already-mapped
+token type without a 23505, the untouched-sibling-token-type assertion,
+creating a mapping for a previously-unmapped token type, and the 42704
+unknown-configuration/unknown-dictionary cases).
+`internal/wal/tsdict_tsconfig_ddl_test.go` gained round-trip/wrong-kind/
+truncated-payload cases for the new record kind.
+`internal/initdb/tsdict_tsconfig_ddl_recovery_test.go` gained
+`TestTSConfigDDLRecoveryReplaysAlterMapping` (override of an existing mapping
++ creation of a new one in the same WAL stream, through a real
+`Init`→`Open`→WAL append→`Close`→`Open` cycle).
+
+**Still deferred**: `OWNER TO` (no-op, likely fine per the earlier ledger
+row's rationale — pg_dump derives ownership from `cfgowner` at CREATE time,
+never from a replayed ALTER OWNER TO) and the `CONFIGURATION = source_config`
+copy-from-existing-configuration form of `CREATE TEXT SEARCH CONFIGURATION`.
+With this follow-up, every `ALTER TEXT SEARCH CONFIGURATION` sub-form named
+in `gram.y`'s `AlterTSConfigurationStmt` production is now implemented.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
+./internal/catalog/... ./internal/parser/... ./internal/wal/...
+./internal/initdb/...` PASS (see below for the full run); `scripts/
+tpch-spotcheck.sh` PASS; pgbench pre-commit smoke via git hook.
+
+## Slice 446 follow-up: `CREATE TEXT SEARCH CONFIGURATION` `COPY = source_config` form (2026-07-06)
+
+Closes the last named-and-deferred sub-form of `CREATE TEXT SEARCH
+CONFIGURATION`: real PG's `DefineTSConfiguration` (`tsearchcmds.c`) accepts
+either a bare `PARSER = parser_name` clause or a `COPY = source_config`
+clause, never both. `COPY` takes the source configuration's `cfgparser` and
+copies its entire `pg_ts_config_map` mapping list into the new row; goopg
+previously tokenized and silently discarded the `copy` key (only `template`
+and `parser` were special-cased in the option-parsing loop), so a
+`COPY = ...` clause always produced an empty-mapping configuration with no
+error.
+
+`DefineTSConfiguration`'s validation order confirmed by reading
+`tsearchcmds.c`: `ERRCODE_SYNTAX_ERROR` (`"cannot specify both PARSER and
+COPY options"`) if both `prsOid` and `sourceOid` resolve; otherwise, if a
+source is given, its `cfgparser` becomes the new row's parser (the `PARSER`
+required-check is skipped entirely in that branch); the mapping-copy loop
+scans `pg_ts_config_map` for the source OID and inserts one row per
+`(token type, dictionary)` pair — which is exactly what
+`ALTER ... ADD MAPPING FOR t1, t2 WITH d1, d2` already does per token type in
+goopg's model (`TSConfigMapping{TokenType, DictOIDs}` — one entry per token
+type holding the whole ordered dictionary list), so no new copy machinery was
+needed beyond re-invoking the same `AddTSConfigMapping` catalog call and
+`EncodeAddTSConfigMapping` WAL record `execAlterTSConfigAddMapping` already
+uses.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `CompatNoopStmt` gained `TSConfigCopySource
+  ObjectName`, alongside the existing `TSConfigParser`.
+- `internal/parser/ddl.go`: the CREATE TEXT SEARCH CONFIGURATION option loop
+  gained a `key == "copy"` case (scoped to `tsType == "text search
+  configuration"` — DICTIONARY's `TEMPLATE = ...` has no COPY analog),
+  resolved via the existing `parseTSObjectNameLoose` helper, propagated to
+  the new AST field.
+- `internal/executor/operators_ddl.go`'s `"text search configuration"` case:
+  if both `TSConfigParser` and `TSConfigCopySource` are non-empty, raises
+  42601 with PG's exact message text. If only `TSConfigCopySource` is set,
+  resolves the source by scanning `im.ListUserTSConfigs()` for a
+  case-insensitive name match (mirroring `resolveTSDictOID`'s existing
+  schema-oblivious lookup pattern for TS objects — there is no
+  schema-qualified `LookupTSConfig` helper, consistent with how dictionary
+  names are already resolved), raising 42704 if unresolvable, and takes its
+  `Parser` OID (skipping the `BuiltinTSParserOID` lookup and the "parser
+  required" check, matching `DefineTSConfiguration`'s branch structure).
+  After the new configuration is created (and its own `CreateTSConfig` WAL
+  record appended, unchanged from before), a copy loop iterates the source's
+  `Mappings` and, for each, calls `im.AddTSConfigMapping` + appends an
+  `EncodeAddTSConfigMapping` WAL record — the identical mechanism
+  `execAlterTSConfigAddMapping` uses per token type, so restart replay needed
+  no new WAL record kind and no `internal/initdb/tsconfig_ddl_recovery.go`
+  change.
+- Confirmed non-aliasing: `AddTSConfigMapping` already defensive-copies its
+  `dictOIDs` argument into a fresh backing array (fixed for a different
+  reason during the REPLACE follow-up), so the copied `TSConfigMapping`
+  entries in the new configuration never share a backing array with the
+  source's — a post-CREATE `ALTER MAPPING` mutation on the copy cannot
+  perturb the source.
+
+**Tests**: `internal/executor/tsconfig_copy_test.go`
+(`TestCreateTSConfigCopy`) — parser and mapping copied correctly (multi-token
+multi-dict `ADD MAPPING` on the source, verifying the copy's per-token-type
+dictionary list order matches), the new configuration gets a distinct OID
+(not aliased), a post-copy mutation via `ALTER MAPPING` on the destination
+does not perturb the source, the 42601 both-PARSER-and-COPY case, and 42704
+on an unresolvable source configuration name.
+
+**Not touched (pg_dump never emits this form)**: `dumpTSConfig`
+(`pg_dump.c`) always materializes a configuration as a bare `PARSER = ...`
+CREATE plus one `ALTER ... ADD MAPPING` statement per mapping row — it never
+re-emits `COPY = ...`, even for a configuration originally created that way,
+since the mapping is dumped from the live catalog snapshot, not from
+provenance. No dumper-side change was needed or made.
+
+**Still deferred**: `OWNER TO` remains a no-op (pg_dump reads `cfgowner` from
+the catalog row set at CREATE time, not from a replayed ALTER OWNER TO —
+considered acceptable, not a gap per the earlier ledger row's rationale).
+`CREATE TEXT SEARCH PARSER`/`CREATE TEXT SEARCH TEMPLATE` remain fully
+unimplemented (C-function-loading features with no analog in goopg). With
+this follow-up, every option named in `gram.y`'s `DefineStmt` production for
+`OBJECT_TSCONFIGURATION` is now implemented.
+
+## Slice 437 follow-up: `ALTER TEXT SEARCH DICTIONARY` RENAME TO / SET SCHEMA / options-merge form (2026-07-06)
+
+Closes the slice 437 (`CREATE TEXT SEARCH DICTIONARY`) row's deferred `ALTER
+TEXT SEARCH DICTIONARY` gap: real PG's grammar (`gram.y`'s
+`AlterTSDictionaryStmt`/`RenameStmt`/`AlterObjectSchemaStmt` for
+`OBJECT_TSDICTIONARY`) supports `RENAME TO newname`, `SET SCHEMA newschema`,
+`OWNER TO newowner`, and `( key [= value] [, ...] )` — a merge onto the
+dictionary's existing `dictinitoption`. Previously ALTER TEXT SEARCH
+DICTIONARY fell through entirely to the discarded compat no-op (only CREATE
+and DROP were implemented). This follow-up lands `RENAME TO`/`SET SCHEMA`/
+the options-merge form, mirroring the ALTER TEXT SEARCH CONFIGURATION
+RENAME/SET SCHEMA precedent (slice 446 follow-up) exactly; `OWNER TO` stays a
+no-op for the same reason as the CONFIGURATION case (pg_dump reads
+`dictowner` from the catalog row set at CREATE time).
+
+**`AlterTSDictionary`'s options-merge semantics** (`tsearchcmds.c`, read via
+the MCP PG-source tools): the statement's option list is a plain
+`DefElem` list (`gram.y`'s `definition` production, the same one CREATE
+uses), not a diff format. For each named option, `AlterTSDictionary`
+unconditionally scans and removes any existing `dictoptions` entry with a
+matching `defname` — then re-adds the new `DefElem` only `if (defel->arg)`.
+So a bare `key` (no `= value`) is a delete-only directive; a `key = value`
+entry replaces (or adds) that key. `verify_dictoptions`' template-specific
+option validation is skipped here exactly as it already is for CREATE (see
+the slice 437 row's own deferral) — any option name/value is accepted
+verbatim.
+
+**Why `InitOption` (a pre-serialized string) needed a
+serialize/deserialize pair, not just a setter**: `catalog.UserTSDict` only
+ever stored the CREATE-time already-serialized `dictinitoption` text (no
+parallel structured option list), because CREATE never needed to inspect an
+existing value. ALTER's merge does need to inspect the existing value, so a
+`DeserializeTSDictOptions` (mirrors `deserialize_deflist`) was added
+alongside the existing serializer — which was itself promoted from a
+private `internal/executor` helper to an exported
+`catalog.SerializeTSDictOptions`, since `catalog.AlterTSDictOptions` (below)
+needs to call it and `catalog` cannot import `executor` (the reverse import
+already exists). The executor's one CREATE-time call site now delegates to
+the catalog version via a same-named wrapper, so behavior is unchanged.
+`pgQuoteIdentForTSDict` (a byte-for-byte copy of the executor's own
+`pgQuoteIdent`, including the `sqlkeywords.IsReservedForQuoting` reserved-word
+check) was duplicated into `catalog` for the same import-direction reason —
+flagged here rather than silently accepted, since duplicated quoting logic
+is exactly the kind of sibling-path drift risk this project tracks; if
+`pgQuoteIdent` is ever forked away from `quote_identifier`'s real behavior, this
+copy needs the same fix.
+
+**Landed**:
+
+- `internal/parser/ast.go`: `TSDictOption` gained a `HasValue bool` field
+  (CREATE never sets it; only ALTER's parser produces `HasValue == false`
+  entries, meaning "remove this key"). New `AlterTSDictStmt` (`DictName`,
+  `Action` — `"rename"`/`"setschema"`/`"options"` — `NewName`, `NewSchema`,
+  `Options`).
+- `internal/parser/ddl.go`: `parseAlter`'s `text search` branch gained a
+  `dictionary` case (previously every ALTER TEXT SEARCH DICTIONARY form fell
+  through to the generic PARSER/TEMPLATE unimplemented-no-op path) dispatching
+  RENAME TO/SET SCHEMA/the paren option list, plus `OWNER TO` falling through
+  to the compat no-op exactly like the CONFIGURATION case. New
+  `parseAlterTSDictOptionList` helper reuses the same token-scanning shape as
+  CREATE's option-list parse but records a bare key (`HasValue: false`)
+  instead of skipping it.
+- `internal/catalog/catalog.go`: `SerializeTSDictOptions`/
+  `DeserializeTSDictOptions` (moved/added, exported), `AlterTSDictOptions`
+  (locks, deserializes the target's `InitOption`, applies each directive's
+  remove-then-maybe-add, reserializes, stores, returns the new text for the
+  caller's WAL record) + `AlterTSDictOptionsDuringRecovery` (plain overwrite
+  — replay carries the already-merged final text, not the raw directives, so
+  it never re-runs the merge), `RenameTSDict`/`SetTSDictSchema` +
+  `*DuringRecovery` counterparts (byte-for-byte mirrors of
+  `RenameTSConfig`/`SetTSConfigSchema`).
+- `internal/wal/recovery.go`: three new record kinds —
+  `RecordKindRenameTSDict` (114), `RecordKindSetTSDictSchema` (115),
+  `RecordKindAlterTSDictOptions` (116, carries the final serialized
+  `dictinitoption` text, not the directive list) — with `Encode`/`Decode`
+  pairs mirroring `RenameTSConfig`/`SetTSConfigSchema`'s wire shape exactly;
+  added to the physical-replay ignore-list switch alongside the existing
+  TSDict/TSConfig kinds (catalog-only, no page state).
+- `internal/initdb/tsdict_ddl_recovery.go`: `tsDictRegistryRecovery` gained
+  the three new `*DuringRecovery` methods; `replayTSDictDDLRecords`'s switch
+  gained the three new cases.
+- `internal/executor/operators_ddl.go`: new `execAlterTSDict` dispatcher
+  (mirrors `execAlterTSConfig`'s shape) wired into the top-level DDL switch;
+  `internal/planner/planner.go`'s generic DDL passthrough list and
+  `internal/server/dispatch.go`'s `ddlTag` both gained an `AlterTSDictStmt`
+  case (`"ALTER TEXT SEARCH DICTIONARY"`).
+
+**Tests**: `internal/executor/tsdict_alter_test.go`
+(`TestAlterTSDictRenameTo`/`TestAlterTSDictSetSchema`/`TestAlterTSDictOptions`
+— the last covers add/replace/bare-key-remove/remove-to-empty, each verified
+against the real PG-derived serialized-text shape, e.g. an unquoted
+`STOPWORDS` key folds to lower-case `stopwords` in `dictinitoption`, matching
+`pgdump_connsetup_test.go`'s slice 437 real-PG-verified expectation — an
+initial draft of this test wrongly assumed double-quoting and was corrected
+against that existing fixture); `internal/wal/tsdict_tsconfig_ddl_test.go`
+gained round-trip + wrong-kind + truncated-payload cases for all three new
+record kinds; `internal/initdb/tsdict_tsconfig_ddl_recovery_test.go`'s new
+`TestTSDictDDLRecoveryReplaysRenameSetSchemaOptions` exercises a real
+`Init`→`Open`→WAL-append(create, alter-options, rename, set-schema)→`Close`→
+`Open` cycle.
+
+**Still deferred**: `OWNER TO` stays a no-op (same rationale as
+CONFIGURATION's). `verify_dictoptions` template-specific option validation
+(e.g. `simple`'s `STOPWORDS`/`ACCEPT` being the only valid keys) is not
+performed on ALTER either, matching the CREATE-side deferral — any option
+name/value is accepted verbatim on both paths.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
+./internal/parser/... ./internal/catalog/... ./internal/wal/...` PASS.
+
+## Slice 437 follow-up: `verify_dictoptions` template-specific option validation (2026-07-06)
+
+Closes the "still deferred" item both the slice 437 (CREATE) and its ALTER
+follow-up row recorded: `CREATE`/`ALTER TEXT SEARCH DICTIONARY` accepted any
+option name/value verbatim for any of the four built-in templates, whereas
+real PG's `verify_dictoptions` (`tsearchcmds.c`) calls the template's own
+init function — `dsimple_init` (`dict_simple.c`), `dsynonym_init`
+(`dict_synonym.c`), `dispell_init` (`dict_ispell.c`), `thesaurus_init`
+(`dict_thesaurus.c`) — which rejects any option key it doesn't recognize
+with `ERRCODE_INVALID_PARAMETER_VALUE` (`22023`) and a template-specific
+message. Read all four `*_init` functions directly from
+`./postgres/src/backend/tsearch/` to pin the exact allowed-key sets and
+message text (they are not a single shared format string):
+
+| template  | allowed keys                    | message fragment                             |
+|-----------|----------------------------------|-----------------------------------------------|
+| simple    | `stopwords`, `accept`            | `unrecognized simple dictionary parameter: "%s"` |
+| synonym   | `synonyms`, `casesensitive`      | `unrecognized synonym parameter: "%s"`        |
+| ispell    | `dictfile`, `afffile`, `stopwords` | `unrecognized Ispell parameter: "%s"`       |
+| thesaurus | `dictfile`, `dictionary`         | `unrecognized Thesaurus parameter: "%s"`      |
+
+**Validated list, not just the incoming directives**: real PG's
+`AlterTSDictionary` calls `verify_dictoptions` on the *post-merge*
+`dictoptions` list, not the statement's raw directives — a bare (delete-only)
+directive naming a key that was never real is never re-added to the merged
+list (`if (defel->arg)`), so it never reaches validation and is a silent
+no-op, not an error. `catalog.AlterTSDictOptions` (`internal/catalog/
+catalog.go`) mirrors this exactly: validation runs after the remove/re-add
+merge loop builds the final `opts` slice, before it's serialized and stored.
+
+**Landed**:
+
+- `internal/catalog/catalog.go`: new `tsDictTemplateOptionSpec` (the table
+  above), `ValidateTSDictOptions(tmplName string, opts []parser.TSDictOption)
+  error` (checks each option's key against the template's allowed set via
+  `slices.Contains`, returning the exact PG message text on the first miss;
+  a no-op for any `tmplName` not in the map, since CREATE/ALTER already
+  reject an unresolved template name earlier), and
+  `builtinTSTemplateNameForOID` (a 4-entry reverse lookup of
+  `BuiltinTSTemplateOID`, needed because `AlterTSDictOptions` only has the
+  dictionary's already-stored `Template` OID, not the name given at CREATE
+  time). `AlterTSDictOptions` calls `ValidateTSDictOptions` on the merged
+  `opts` list right before persisting; a validation failure returns without
+  mutating `target.InitOption` (the mutation runs strictly after the check).
+- `internal/executor/operators_ddl.go`: the CREATE TEXT SEARCH DICTIONARY
+  case now calls `catalog.ValidateTSDictOptions(tmplName, s.TSDictOptions)`
+  right after resolving `templOID`, returning `&ExecError{Code: "22023"}` on
+  failure. `execAlterTSDict`'s `"options"` case maps `AlterTSDictOptions`'s
+  error to `22023` when the message contains `"unrecognized"` (the
+  validation path) and keeps the pre-existing `42704` for the "dictionary
+  does not exist" lookup miss — following this file's own `execAlterDomain`
+  precedent (`RenameDomainConstraint`'s `strings.Contains(err.Error(), ...)`
+  dispatch) rather than introducing a typed catalog error, since `catalog`
+  cannot import the executor package's `ExecError` type.
+
+**Tests**: `internal/executor/tsdict_option_validation_test.go`'s new
+`TestCreateTSDictOptionValidation` (table-driven — valid/invalid option for
+each of the four templates, asserting both the `22023` code and the exact PG
+message text) and `TestAlterTSDictOptionValidation` (a rejected ALTER leaves
+`InitOption` unchanged; a bare delete-only directive for a never-set,
+unrecognized key is confirmed to be a silent no-op, not an error, matching
+the `if (defel->arg)` merge-order requirement above).
+
+**Still deferred**: `OWNER TO` remains a no-op (unchanged, unrelated to this
+follow-up). No further known gap in this bucket.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
+./internal/catalog/... ./internal/parser/... ./internal/server/...
+./internal/initdb/... ./internal/wal/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33).

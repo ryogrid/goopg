@@ -406,6 +406,36 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// checkpoint_flush_after / bgwriter_flush_after / backend_flush_after
+	// set the writeback threshold (in BLCKSZ pages) for the checkpointer /
+	// bgwriter / an individual backend's own dirty-victim-eviction writes;
+	// once a context's running total crosses its threshold, goopg issues
+	// a real sync_file_range(2) write-behind hint (0 disables it — see
+	// storage/writeback.go, M0122-0003 pg_stat_io writeback/writeback_time
+	// follow-up). Defaults (32/64/0) and max (256) mirror upstream's
+	// DEFAULT_CHECKPOINT_FLUSH_AFTER/DEFAULT_BGWRITER_FLUSH_AFTER/
+	// DEFAULT_BACKEND_FLUSH_AFTER and WRITEBACK_MAX_PENDING_FLUSHES
+	// (pg_config_manual.h). backend_flush_after is PGC_USERSET upstream
+	// (per-session); goopg applies it as a single process-wide threshold
+	// instead (see deferral ledger).
+	r.MustRegister(NewVariable(Variable{
+		Name: "checkpoint_flush_after", Type: TypeInt, BootVal: "32",
+		MinVal: 0, MaxVal: 256,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "bgwriter_flush_after", Type: TypeInt, BootVal: "64",
+		MinVal: 0, MaxVal: 256,
+		Context: ContextSigHup,
+		Scope:   ScopeServer,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "backend_flush_after", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: 256,
+		Context: ContextUserset,
+	}))
+
 	// bgwriter_lru_maxpages caps how many dirty pages the background
 	// writer flushes per tick. 0 disables the bgwriter. Default 100
 	// mirrors upstream's bgwriter_lru_maxpages GUC (M0048-0003).
@@ -846,6 +876,21 @@ func BuildDefaultRegistry() *Registry {
 		Name: "row_security", Type: TypeBool, BootVal: "on",
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// xmloption. Every pg_dump archive opens with `SET xmloption = content;`
+	// (dumpDatabase's standard preamble, unconditional — not gated on the
+	// dump containing any xml columns), so a round-trip restore hits this
+	// before touching any user object. goopg's xml codec always parses/
+	// serializes as content fragments regardless of the setting (no
+	// document-vs-content XML parsing distinction is implemented), so this
+	// is a no-op registration, but SET/SHOW must succeed. Mirrors
+	// guc_tables.c's "xmloption" entry (PGC_USERSET, enum content/document,
+	// default content).
+	r.MustRegister(NewVariable(Variable{
+		Name: "xmloption", Type: TypeEnum, BootVal: "content",
+		EnumOptions: []string{"content", "document"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
 	}))
 
 	// Logging GUCs. Stubs so `SET log_statement = 'all'` and

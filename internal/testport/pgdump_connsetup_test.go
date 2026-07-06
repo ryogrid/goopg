@@ -4253,6 +4253,65 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table moody: %v", err)
 	}
 
+	// Slice 436: ALTER TYPE ... ADD VALUE [BEFORE|AFTER] and RENAME VALUE must
+	// be reflected in the dumped CREATE TYPE ... AS ENUM label list/order, even
+	// though pg_dump never re-emits the ALTER TYPE statements themselves.
+	// Verified against real PG 18.3: dumpEnumType (pg_dump.c) has no
+	// "--binary-upgrade" flag here, so getEnumLabels' `SELECT enumlabel FROM
+	// pg_enum WHERE enumtypid = $1 ORDER BY enumsortorder` is folded straight
+	// into one CREATE TYPE statement carrying the FINAL label set in
+	// enumsortorder order — a BEFORE/AFTER-inserted value's midpoint sort order
+	// (and a renamed label's new spelling) must show up in the right slot, with
+	// no separate ALTER TYPE trailer. goopg's catalog.AddEnumValueResult
+	// (internal/catalog/catalog.go) already computes float4 midpoint sort
+	// orders and splices the new EnumValue into et.Values at the right index,
+	// and pg_enum.VirtualRows projects enumsortorder from that slice — this is
+	// the first end-to-end pg_dump guard exercising that path (previously only
+	// unit-tested at the parser layer). 'meh' is inserted BEFORE 'ok' (an
+	// interior midpoint), 'ecstatic' AFTER 'happy' (the tail case), then 'meh'
+	// is renamed to 'blah' in place — matching real PG's observed dump order
+	// exactly: sad, blah, ok, happy, ecstatic.
+	if err := runSQLSimple(t, c, "ALTER TYPE public.mood ADD VALUE 'meh' BEFORE 'ok'"); err != nil {
+		t.Fatalf("alter type mood add value meh before ok: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE public.mood ADD VALUE 'ecstatic' AFTER 'happy'"); err != nil {
+		t.Fatalf("alter type mood add value ecstatic after happy: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE public.mood RENAME VALUE 'meh' TO 'blah'"); err != nil {
+		t.Fatalf("alter type mood rename value meh to blah: %v", err)
+	}
+
+	// Slice 437: a CREATE TEXT SEARCH DICTIONARY must round-trip through
+	// pg_dump. Unlike CONFIGURATION/PARSER/TEMPLATE (still parsed-and-discarded
+	// compat no-ops — TEMPLATE in particular has no user-definable analog in
+	// goopg), DICTIONARY is registered in the catalog (InMemory.userTSDicts)
+	// because dumpTSDictionary's own catalog query needs a live pg_ts_dict row
+	// to find, plus a resolvable pg_ts_template row (the four built-ins,
+	// catalog.BuiltinTSTemplateOID) to name the template. STOPWORDS is passed
+	// as an unquoted identifier-shaped value; real PG's DefElem parsing folds
+	// it to a string regardless, so dictinitoption serializes it quoted.
+	if err := runSQLSimple(t, c, "CREATE TEXT SEARCH DICTIONARY public.simple_dict (TEMPLATE = pg_catalog.simple, STOPWORDS = english)"); err != nil {
+		t.Fatalf("create text search dictionary simple_dict: %v", err)
+	}
+
+	// Slice 446: a CREATE TEXT SEARCH CONFIGURATION plus its ADD MAPPING
+	// entries must round-trip through pg_dump. Verified byte-for-byte against
+	// real PG 18.3's own dump of the identical fixture: CREATE (PARSER =
+	// pg_catalog.default) followed by one ALTER ... ADD MAPPING per distinct
+	// token type. Unlike DICTIONARY (slice 437), this needed two new catalog
+	// dependencies to resolve: a live pg_ts_parser row for the built-in
+	// "default" parser (BuiltinTSParserOID, dumpTSConfig's own nspname/prsname
+	// lookup) and a live pg_ts_dict row for the built-in "simple" dictionary
+	// (BuiltinTSDictOID, the mapdict::regdictionary cast) — both previously
+	// absent, since goopg surfaced neither pg_ts_parser nor pg_ts_dict rows for
+	// anything but user-created objects.
+	if err := runSQLSimple(t, c, "CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (PARSER = pg_catalog.default)"); err != nil {
+		t.Fatalf("create text search configuration simple_cfg: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TEXT SEARCH CONFIGURATION public.simple_cfg ADD MAPPING FOR asciiword, word WITH simple"); err != nil {
+		t.Fatalf("alter text search configuration simple_cfg add mapping: %v", err)
+	}
+
 	// Slice 243: a stand-alone composite type (`CREATE TYPE x AS (...)`) must
 	// round-trip. Slice 242 made the type visible to pg_dump's getTypes via the
 	// pg_type row (typtype='c'), but left typrelid=0 so dumpCompositeType found no
@@ -10925,6 +10984,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Slice 89: the enum ARRAY column renders via the enum's
 			// auto-generated array OID, not the text[] fallback.
 			"feelings public.mood[]",
+			// Slice 436: ADD VALUE 'meh' BEFORE 'ok' + ADD VALUE 'ecstatic' AFTER
+			// 'happy' + RENAME VALUE 'meh' TO 'blah' must land in enumsortorder
+			// order: sad, blah, ok, happy, ecstatic — verified against real PG 18.3.
+			"'blah'",
+			"'ecstatic'",
 		}
 		for _, sub := range enumDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -10944,6 +11008,56 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// typarray points back at it) and suppresses it. Slice 89.
 		if strings.Contains(res.Stdout, "CREATE TYPE public._mood") {
 			t.Errorf("pg_dump emitted the auto-generated enum array type as a separate CREATE TYPE (slice-89 isarray suppression regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 436 (asserted):** the enum's label ORDER must reflect the
+		// ADD VALUE BEFORE/AFTER + RENAME VALUE edits above, not just their
+		// presence. Real PG 18.3 dumps `sad, blah, ok, happy, ecstatic` — a
+		// wrong midpoint sort order (or a rename that lost its slot) would pass
+		// the substring-only check above but fail this exact-sequence check.
+		if !strings.Contains(res.Stdout,
+			"CREATE TYPE public.mood AS ENUM (\n    'sad',\n    'blah',\n    'ok',\n    'happy',\n    'ecstatic'\n);") {
+			t.Errorf("pg_dump mis-ordered the mood enum labels after ADD VALUE/RENAME VALUE (want sad, blah, ok, happy, ecstatic)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 437 (asserted):** CREATE TEXT SEARCH DICTIONARY must round-trip
+		// through pg_dump. Verified byte-for-byte against real PG 18.3's own
+		// pg_dump output for the identical DDL: the TEMPLATE clause resolves the
+		// bare `pg_catalog.simple` name via the built-in pg_ts_template row
+		// (catalog.BuiltinTSTemplateOID), and STOPWORDS (given unquoted) folds to
+		// a quoted `stopwords = 'english'` dictinitoption — PG's DefElem/
+		// serialize_deflist folds any option value to a string, quoted, unless it
+		// parses as a bare numeric literal.
+		if !strings.Contains(res.Stdout,
+			"CREATE TEXT SEARCH DICTIONARY public.simple_dict (\n    TEMPLATE = pg_catalog.simple,\n    stopwords = 'english' );") {
+			t.Errorf("pg_dump dropped/mangled the text search dictionary round-trip\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TEXT SEARCH DICTIONARY public.simple_dict OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the text search dictionary's OWNER TO clause\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 446 (asserted):** CREATE TEXT SEARCH CONFIGURATION plus its ADD
+		// MAPPING entries must round-trip through pg_dump. Verified byte-for-byte
+		// against real PG 18.3's own pg_dump output for the identical DDL: the
+		// PARSER clause resolves the bare `pg_catalog."default"` name via the
+		// built-in pg_ts_parser row (catalog.BuiltinTSParserOID), and dumpTSConfig
+		// re-emits the two-token ADD MAPPING as two separate ALTER statements (one
+		// per distinct token type, even though both were added in a single input
+		// ALTER ... FOR asciiword, word WITH simple statement here) because it
+		// groups pg_ts_config_map rows by maptokentype, not by how they were
+		// originally added.
+		if !strings.Contains(res.Stdout,
+			"CREATE TEXT SEARCH CONFIGURATION public.simple_cfg (\n    PARSER = pg_catalog.\"default\" );") {
+			t.Errorf("pg_dump dropped/mangled the text search configuration round-trip\n  full stdout=%q", res.Stdout)
+		}
+		tsConfigMappings := []string{
+			"ALTER TEXT SEARCH CONFIGURATION public.simple_cfg\n    ADD MAPPING FOR asciiword WITH simple;",
+			"ALTER TEXT SEARCH CONFIGURATION public.simple_cfg\n    ADD MAPPING FOR word WITH simple;",
+		}
+		for _, sub := range tsConfigMappings {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled a text search configuration ADD MAPPING; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if !strings.Contains(res.Stdout, "ALTER TEXT SEARCH CONFIGURATION public.simple_cfg OWNER TO postgres;") {
+			t.Errorf("pg_dump dropped the text search configuration's OWNER TO clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 243 (asserted):** a stand-alone composite type round-trips. PG's
 		// dumpCompositeType walks pg_type.typrelid → pg_class (relkind='c') →
@@ -11672,6 +11786,78 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		acFKNotEnforcedDef := "ADD CONSTRAINT acfknenf_fk FOREIGN KEY (pid) REFERENCES public.acfknenf_parent(id) NOT ENFORCED;"
 		if !strings.Contains(res.Stdout, acFKNotEnforcedDef) {
 			t.Errorf("pg_dump dropped the NOT ENFORCED suffix on an ALTER CONSTRAINT-flipped foreign key; missing %q\n  full stdout=%q", acFKNotEnforcedDef, res.Stdout)
+		}
+
+		// DU-002 round-trip probe: E-002's stated close condition is "a dump+
+		// restore round-trip against a live goopg server", not merely a
+		// non-erroring `pg_dump`. Feed the captured dump SQL straight into
+		// `psql` against a brand-new, empty database in the same cluster —
+		// the same shape real pg_dump TAP tests (002_pg_dump.pl's
+		// restore_test) exercise — and record whether the restore itself
+		// applies cleanly. This is intentionally a soft (t.Logf) probe, not a
+		// hard assertion.
+		//
+		// KNOWN, ARCHITECTURAL blocker (not a bounded per-statement bug like
+		// the ones this file's slices otherwise fix): goopg's
+		// `catalog.InMemory` has no per-database namespace at all —
+		// `CREATE DATABASE` only registers a name in `c.databases` (a plain
+		// existence map for identity/`\l`/duplicate-name checks); every
+		// object map (`c.tables`, `c.schemas`, `c.userCollations`, …) is one
+		// flat, server-wide store with no DBOid/DBName key. A table or
+		// collation created while connected to "postgres" is visible from,
+		// and collides with, any other "database" name on the same server
+		// (confirmed empirically: a table stays visible and a same-named
+		// CREATE TABLE from a second database fails "already exists").
+		// Restoring a dump into a genuinely separate, empty database
+		// therefore cannot pass today — the dump's very first schema-level
+		// object (the `builtin_coll` collation from slice ~300-something)
+		// collides with the original database's copy of itself. This is a
+		// milestone-scale gap (per-database catalog + per-database on-disk
+		// storage/RelFileNode scoping throughout the executor/planner/catalog,
+		// not a slice), tracked in the deferral ledger; the probe stays a
+		// soft t.Logf so it doesn't block this file's otherwise-green guard
+		// and so a future loop that lands real multi-database isolation gets
+		// an immediate, already-wired regression signal.
+		if err := runSQLSimple(t, c, "CREATE DATABASE dumprestore_du002"); err != nil {
+			t.Fatalf("create restore-target database: %v", err)
+		}
+		restoreEnv := amcheckEnv(t, c)
+		for i, e := range restoreEnv {
+			if strings.HasPrefix(e, "PGDATABASE=") {
+				restoreEnv[i] = "PGDATABASE=dumprestore_du002"
+			}
+		}
+		restoreRes, err := util.RunCommand(util.CommandSpec{
+			Name:    clientToolBin(t, "psql"),
+			Args:    []string{"-v", "ON_ERROR_STOP=1", "-q"},
+			Env:     restoreEnv,
+			Stdin:   res.Stdout,
+			Timeout: 30 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("run psql restore: %v", err)
+		}
+		if restoreRes.ExitCode != 0 {
+			t.Logf("DU-002 round-trip restore FAILS (expected — see the multi-database "+
+				"catalog-isolation gap noted above; not a bounded per-statement fix): "+
+				"exit=%d stderr=%q", restoreRes.ExitCode, strings.TrimSpace(restoreRes.Stderr))
+		} else {
+			// The restore applied cleanly end to end. Assert the restored
+			// database actually has the table (a silently-empty restore
+			// would pass ON_ERROR_STOP=1 vacuously if every statement were
+			// skipped rather than applied).
+			checkRes, err := util.RunCommand(util.CommandSpec{
+				Name:    clientToolBin(t, "psql"),
+				Args:    []string{"-tA", "-c", "SELECT count(*) FROM public.foo"},
+				Env:     restoreEnv,
+				Timeout: 30 * time.Second,
+			})
+			if err != nil || checkRes.ExitCode != 0 || strings.TrimSpace(checkRes.Stdout) == "" {
+				t.Errorf("DU-002 round-trip restore reported success but public.foo is not queryable in the restored database: exit=%d stderr=%q stdout=%q",
+					checkRes.ExitCode, checkRes.Stderr, checkRes.Stdout)
+			} else {
+				t.Logf("DU-002 round-trip restore PASSES: dump applied cleanly to a fresh database (public.foo count=%s)", strings.TrimSpace(checkRes.Stdout))
+			}
 		}
 		return
 	}

@@ -1731,6 +1731,164 @@ func checkConstraints(ctx *Context, tbl *catalog.Table, row Row) error {
 	return nil
 }
 
+// checkDomainConstraintsForRow enforces the NOT NULL and CHECK constraints
+// declared on a domain type against every domain-typed column in row.
+// PostgreSQL wraps every domain-typed column assignment in a CoerceToDomain
+// execution node that re-validates the domain's constraints on every
+// INSERT/UPDATE (execExprInterp.c ExecEvalConstraintNotNull /
+// ExecEvalConstraintCheck), not merely at CREATE TABLE time or on an
+// explicit `::domain` cast (expr.go's CastExpr arm already covers the latter,
+// but a column simply *declared* with a domain type bypassed both). M0122-0005
+// (deferral ledger 2026-07-06 "domain constraint enforcement gap").
+func checkDomainConstraintsForRow(ctx *Context, cols []catalog.Column, row Row) error {
+	if ctx == nil || ctx.Catalog == nil {
+		return nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for i, col := range cols {
+		if col.DeclaredTypeName == "" || i >= len(row) {
+			continue
+		}
+		dom, isDomain := im.LookupDomain(col.DeclaredTypeName)
+		if !isDomain {
+			continue
+		}
+		v := row[i]
+		if v.IsNull() {
+			if dom.NotNull {
+				return &ExecError{
+					Code:    "23502",
+					Message: fmt.Sprintf("domain %s does not allow null values", strings.ToLower(dom.Name)),
+				}
+			}
+			continue
+		}
+		if len(dom.Checks) == 0 {
+			continue
+		}
+		// Format() (not StringValue(), which only extracts KindString's Buf
+		// payload) renders every Kind's canonical text form, e.g. KindInt's
+		// Int field as a decimal string.
+		label := v.Format()
+		for _, ck := range dom.Checks {
+			if len(ck.InValues) > 0 {
+				found := false
+				for _, allowed := range ck.InValues {
+					if strings.EqualFold(label, allowed) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return &ExecError{
+						Code:    "23514",
+						Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
+					}
+				}
+				continue
+			}
+			if ck.Expr == "" {
+				continue
+			}
+			passed, err := evalDomainCheckExpr(ctx, ck.Expr, v, col.Type.Name)
+			if err != nil {
+				return err
+			}
+			if !passed {
+				return &ExecError{
+					Code:    "23514",
+					Message: fmt.Sprintf("value for domain %s violates check constraint %q", strings.ToLower(dom.Name), ck.Name),
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkRowConstraintsForWrite enforces column NOT NULL, table CHECK, and
+// domain NOT NULL/CHECK constraints against a fully-materialized row before it
+// is written by an UPDATE (or upsert DO UPDATE). insertOp.Next already runs
+// this same trio inline for INSERT; UPDATE's several write paths
+// (updateOp.Next, updateViaIndex, updateWithFrom) previously ran none of them,
+// silently allowing NULLs into NOT NULL columns and values violating
+// CHECK/domain constraints on UPDATE. M0122-0005 follow-up (deferral ledger
+// 2026-07-06 "UPDATE enforces no table-level NOT NULL/CHECK constraints").
+// cols/tbl must describe the row's own ordinal layout (the destination
+// partition's columns for a partition-routed write, matching how
+// checkDomainConstraintsForRow is already called at INSERT's leaf-partition
+// site).
+func checkRowConstraintsForWrite(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row) error {
+	for i, col := range cols {
+		if col.NotNull && i < len(row) && row[i].IsNull() {
+			return &ExecError{
+				Code:    "23502",
+				Message: fmt.Sprintf("null value in column %q of relation %q violates not-null constraint", col.Name, tbl.Name),
+				Detail:  formatRowForDetail(cols, row),
+			}
+		}
+	}
+	if len(tbl.CheckConstraints) > 0 {
+		if err := checkConstraints(ctx, tbl, row); err != nil {
+			return err
+		}
+	}
+	return checkDomainConstraintsForRow(ctx, cols, row)
+}
+
+// evalDomainCheckExpr evaluates a generic (non `VALUE IN (...)`) domain CHECK
+// predicate against a single coerced value, mirroring checkConstraints' mini-query
+// approach: `SELECT (expr) FROM (VALUES (value::basetype)) AS _chk(value)`. The
+// domain CHECK expression's only column reference is the `VALUE` placeholder,
+// which the lexer case-folds to the identifier `value` on parse — matching the
+// synthetic column name here, so no VALUE-specific rewriting is needed. Parse/
+// plan/build failures are treated as a pass (matches checkConstraints' leniency)
+// rather than blocking the DML statement on an internal evaluation gap.
+func evalDomainCheckExpr(ctx *Context, exprSQL string, v Datum, baseType string) (bool, error) {
+	valSQL := "NULL::" + baseType
+	if !v.IsNull() {
+		valSQL = "'" + strings.ReplaceAll(v.Format(), "'", "''") + "'::" + baseType
+	}
+	fullSQL := "SELECT (" + exprSQL + ") FROM (VALUES (" + valSQL + ")) AS _chk(value)"
+	stmts, err := parser.Parse(fullSQL)
+	if err != nil || len(stmts) == 0 {
+		return true, nil
+	}
+	plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+	if err != nil {
+		return true, nil
+	}
+	op, err := Build(plan)
+	if err != nil {
+		return true, nil
+	}
+	synthCtx := *ctx
+	if err := op.Open(&synthCtx); err != nil {
+		op.Close()
+		return true, nil
+	}
+	slot, err2 := op.Next()
+	var result Datum
+	hasResult := false
+	if err2 == nil && slot != nil {
+		sr := slotRow(slot)
+		if len(sr) > 0 {
+			result = sr[0]
+			hasResult = true
+		}
+	}
+	op.Close()
+	if !hasResult || result.IsNull() {
+		return true, nil
+	}
+	if result.Kind == KindBool && !result.BoolValue() {
+		return false, nil
+	}
+	return true, nil
+}
+
 // checkViewCheckOption evaluates a `WITH CHECK OPTION` view's defining WHERE
 // qual (already resolved against the view's auto-updatable base relation by
 // viewQualOnBase, so it evaluates directly against a base-table-shaped row —

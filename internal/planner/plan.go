@@ -541,6 +541,15 @@ type SeqScan struct {
 	// inheritance-child scan. M0118-0008 (alter-table-4 perm 4: concurrent
 	// `ALTER TABLE c1 ALTER COLUMN a TYPE float`).
 	InheritParentOID uint32
+	// PrivilegeCheckRole / PrivilegeCheckRoleSet override which role's SELECT
+	// grant the executor checks against Table: set by tagViewOwnerScans when
+	// this scan sits inside an inlined, non-security_invoker view (PostgreSQL
+	// runs a view's underlying-table reads as the view owner, not the
+	// querying role). Unset (PrivilegeCheckRoleSet == false) means "use the
+	// querying session's own role", the direct-table-scan default. M0122-0008
+	// (view-owner privilege gap).
+	PrivilegeCheckRole    string
+	PrivilegeCheckRoleSet bool
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }
@@ -572,6 +581,10 @@ type IndexScan struct {
 	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
 	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	schema  Schema
+	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
+	// same name. M0122-0008 (view-owner privilege gap).
+	PrivilegeCheckRole    string
+	PrivilegeCheckRoleSet bool
 }
 
 func (n *IndexScan) Pos() int       { return n.pos }
@@ -624,6 +637,10 @@ type IndexOnlyScan struct {
 	// contains (a subset of Index.Columns, in projection order).
 	Covered []catalog.Column
 	schema  Schema
+	// PrivilegeCheckRole / PrivilegeCheckRoleSet — see SeqScan's field of the
+	// same name. M0122-0008 (view-owner privilege gap).
+	PrivilegeCheckRole    string
+	PrivilegeCheckRoleSet bool
 }
 
 func (n *IndexOnlyScan) Pos() int       { return n.pos }
@@ -1216,6 +1233,25 @@ type PgGetSequenceData struct {
 
 func (n *PgGetSequenceData) Pos() int       { return n.pos }
 func (n *PgGetSequenceData) Output() Schema { return n.schema }
+
+// TSTokenType implements ts_token_type(parser_oid) as a FROM-clause SRF:
+// (tokid int4, alias text, description text). pg_dump's dumpTSConfig issues
+// `FROM pg_catalog.ts_token_type('%u'::oid) AS t` (a literal argument, not
+// lateral) to resolve a pg_ts_config_map row's maptokentype back to its
+// alias. goopg models only the one built-in "default" parser
+// (catalog.BuiltinTSParserOID), so the operator returns
+// catalog.DefaultParserTokenTypes when Args[0] evaluates to that parser's
+// OID, and 0 rows for any other input (including a user-defined parser,
+// which cannot exist — CREATE TEXT SEARCH PARSER is unimplemented). DU-002
+// slice 446 (M0119-0004).
+type TSTokenType struct {
+	pos    int
+	Arg    Expr
+	schema Schema
+}
+
+func (n *TSTokenType) Pos() int       { return n.pos }
+func (n *TSTokenType) Output() Schema { return n.schema }
 
 // PgAvailableWalSummaries implements pg_available_wal_summaries() as a
 // FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)

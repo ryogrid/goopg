@@ -413,6 +413,22 @@ func New(cfg Config) *Server {
 			}
 			reg.UpdateTrackIOTiming(procNum, effVal == "on")
 		})
+		// M0122-0003 writeback follow-up: propagate SET backend_flush_after
+		// to the calling backend's per-session threshold (upstream's GUC is
+		// PGC_USERSET) so storage.Pool.accountBackendWrite's
+		// BackendFlushAfterOverride hook picks up the change without a
+		// server restart.
+		cfg.Registry.OnChange("backend_flush_after", func(effVal string) {
+			reg, procNum, ok := activity.LookupCurrentGoroutine()
+			if !ok {
+				return
+			}
+			n, err := strconv.Atoi(effVal)
+			if err != nil {
+				return
+			}
+			reg.UpdateBackendFlushAfter(procNum, int32(n))
+		})
 	}
 
 	// Build the apply-worker launcher when logical replication is
@@ -899,6 +915,15 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	if reg != nil {
 		if _, eff, ok := sess.Get("track_io_timing"); ok {
 			reg.UpdateTrackIOTiming(procNum, eff == "on")
+		}
+		// Seed this backend's effective backend_flush_after threshold from
+		// the boot-time GUC default; the OnChange hook registered in New()
+		// keeps it live thereafter on `SET backend_flush_after` (M0122-0003
+		// writeback follow-up).
+		if _, eff, ok := sess.Get("backend_flush_after"); ok {
+			if n, err := strconv.Atoi(eff); err == nil {
+				reg.UpdateBackendFlushAfter(procNum, int32(n))
+			}
 		}
 	}
 	// Echo StartupMessage values for variables clients commonly send.

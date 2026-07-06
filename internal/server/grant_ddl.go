@@ -19,6 +19,7 @@ package server
 // reports success, it just records nothing. REVOKE is likewise left as a no-op.
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
@@ -72,29 +73,46 @@ var allForeignDataWrapperPrivileges = []string{"USAGE"}
 // must first materialize the owner's implicit default ACL. DU-002 slice 340.
 const aclOwnerRole = "postgres"
 
+// errGrantorMustBeCurrentUser mirrors PostgreSQL's aclchk.c ExecuteGrantStmt
+// check on an object-privilege GRANT/REVOKE's optional GRANTED BY clause: the
+// clause exists only for SQL-standard compatibility and is rejected unless it
+// names the role that is actually executing the statement.
+var errGrantorMustBeCurrentUser = errors.New("grantor must be current user")
+
 // tryRecordTableGrant parses a table-level GRANT and records its privileges in
 // the catalog ACL store. It is a best-effort side effect: on any form it does
-// not recognise it simply returns, leaving the statement as a successful no-op.
-func (s *Server) tryRecordTableGrant(stmt string) {
+// not recognise it simply returns nil, leaving the statement as a successful
+// no-op. actingRole is the session's current effective role (connTx.
+// NonSuperuserRole, or "" for the bootstrap superuser) — the role attributed
+// as the aclitem's grantor, and the only role an explicit GRANTED BY clause
+// may legally name (see errGrantorMustBeCurrentUser). Only a non-nil error
+// return (a GRANTED BY mismatch) should abort the statement; every other early
+// return is an intentional silent no-op.
+func (s *Server) tryRecordTableGrant(stmt string, actingRole string) error {
 	if s.cfg.Catalog == nil {
-		return
+		return nil
 	}
 	lower := strings.ToLower(stmt)
 	if !strings.HasPrefix(lower, "grant ") {
-		return
+		return nil
 	}
 	// A column-level grant carries a parenthesised column list before ON; we do
 	// not model column privileges, so bail.
 	onIdx := strings.Index(lower, " on ")
 	toIdx := strings.LastIndex(lower, " to ")
 	if onIdx < 0 || toIdx < 0 || toIdx <= onIdx {
-		return
+		return nil
 	}
 	privPart := strings.TrimSpace(stmt[len("grant "):onIdx])
 	objPart := strings.TrimSpace(stmt[onIdx+len(" on ") : toIdx])
 	rolePart := strings.TrimSpace(stmt[toIdx+len(" to "):])
 	if strings.ContainsRune(privPart, '(') {
-		return // column-level grant
+		return nil // column-level grant
+	}
+
+	grantor := strings.ToLower(strings.TrimSpace(actingRole))
+	if grantor == "" {
+		grantor = aclOwnerRole
 	}
 
 	// Strip a trailing WITH GRANT OPTION / GRANTED BY clause from the role list,
@@ -109,7 +127,11 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		rolePart = strings.TrimSpace(rolePart[:i])
 	}
 	if i := strings.Index(strings.ToLower(rolePart), " granted by "); i >= 0 {
+		named := strings.ToLower(strings.Trim(strings.TrimSpace(rolePart[i+len(" granted by "):]), `"`))
 		rolePart = strings.TrimSpace(rolePart[:i])
+		if named != "" && named != grantor {
+			return errGrantorMustBeCurrentUser
+		}
 	}
 
 	// Optional leading TABLE / SEQUENCE keyword on the object list, or a required
@@ -127,30 +149,30 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		// GRANT … ON SCHEMA <names> TO <roles>. Schemas live in pg_namespace and
 		// share the OID-keyed ACL store with relations; record under each schema's
 		// OID so pg_dump's getNamespaces/dumpACL re-emits the GRANT from nspacl.
-		s.recordSchemaGrant(rest, rolePart, privPart, withGrantOption)
-		return
+		s.recordSchemaGrant(rest, rolePart, privPart, withGrantOption, grantor)
+		return nil
 	} else if rest, ok := cutLeadingKeyword(objPart, "function"); ok {
 		// GRANT EXECUTE ON FUNCTION <signature> TO <roles>. Functions live in
 		// pg_proc and share the OID-keyed ACL store; record under each routine's
 		// OID so pg_dump's getFuncs/dumpACL re-emits the GRANT from proacl.
-		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
-		return
+		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption, grantor)
+		return nil
 	} else if rest, ok := cutLeadingKeyword(objPart, "procedure"); ok {
 		// GRANT EXECUTE ON PROCEDURE … shares the routine ACL path with FUNCTION.
-		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
-		return
+		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption, grantor)
+		return nil
 	} else if rest, ok := cutLeadingKeyword(objPart, "routine"); ok {
 		// GRANT EXECUTE ON ROUTINE … shares the routine ACL path with FUNCTION.
-		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
-		return
+		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption, grantor)
+		return nil
 	} else if rest, ok := cutLeadingKeyword(objPart, "foreign"); ok {
 		if rest2, ok2 := cutLeadingKeyword(rest, "server"); ok2 {
 			// GRANT USAGE ON FOREIGN SERVER <name> TO <roles>. Foreign servers live
 			// in pg_foreign_server and share the OID-keyed ACL store; record under
 			// each server's OID so pg_dump's getForeignServers/dumpACL re-emits the
 			// GRANT from srvacl.
-			s.recordForeignServerGrant(rest2, rolePart, privPart, withGrantOption)
-			return
+			s.recordForeignServerGrant(rest2, rolePart, privPart, withGrantOption, grantor)
+			return nil
 		}
 		if rest2, ok2 := cutLeadingKeyword(rest, "data"); ok2 {
 			if rest3, ok3 := cutLeadingKeyword(rest2, "wrapper"); ok3 {
@@ -158,14 +180,14 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 				// pg_foreign_data_wrapper and share the OID-keyed ACL store; record
 				// under each FDW's OID so pg_dump's getForeignDataWrappers/dumpACL
 				// re-emits the GRANT from fdwacl. DU-002 slice 428.
-				s.recordForeignDataWrapperGrant(rest3, rolePart, privPart, withGrantOption)
-				return
+				s.recordForeignDataWrapperGrant(rest3, rolePart, privPart, withGrantOption, grantor)
+				return nil
 			}
 		}
 	}
 	// Bail on non-table object classes (ON DATABASE …, etc.).
 	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
-		return
+		return nil
 	}
 
 	allPrivs := allTablePrivileges
@@ -174,7 +196,7 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 	}
 	privs := parseGrantPrivileges(privPart, allPrivs)
 	if len(privs) == 0 {
-		return
+		return nil
 	}
 	tables := splitGrantList(objPart)
 	roles := splitGrantList(rolePart)
@@ -186,10 +208,11 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		}
 		for _, role := range roles {
 			for _, p := range privs {
-				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(tbl.OID, role, p, withGrantOption)
+				s.cfg.Catalog.GrantTablePrivilegeAs(tbl.OID, role, p, withGrantOption, grantor)
 			}
 		}
 	}
+	return nil
 }
 
 // tryRecordTableRevoke parses an autocommit table/sequence-level REVOKE and
@@ -321,7 +344,7 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 // the catalog ACL store, keyed by each schema's pg_namespace OID. Unknown
 // schemas and an empty/unparseable privilege list are skipped, leaving the
 // statement as a successful no-op. DU-002 slice 335.
-func (s *Server) recordSchemaGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+func (s *Server) recordSchemaGrant(objPart, rolePart, privPart string, withGrantOption bool, grantor string) {
 	privs := parseGrantPrivileges(privPart, allSchemaPrivileges)
 	if len(privs) == 0 {
 		return
@@ -335,7 +358,7 @@ func (s *Server) recordSchemaGrant(objPart, rolePart, privPart string, withGrant
 		}
 		for _, role := range roles {
 			for _, p := range privs {
-				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
+				s.cfg.Catalog.GrantTablePrivilegeAs(oid, role, p, withGrantOption, grantor)
 			}
 		}
 	}
@@ -385,7 +408,7 @@ func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
 // implicit PUBLIC entry is seeded here — mirroring recordSchemaGrant, not
 // recordFunctionGrant. Unknown servers and an empty/unparseable privilege list
 // are skipped, leaving the statement a successful no-op. DU-002 slice 427.
-func (s *Server) recordForeignServerGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+func (s *Server) recordForeignServerGrant(objPart, rolePart, privPart string, withGrantOption bool, grantor string) {
 	privs := parseGrantPrivileges(privPart, allForeignServerPrivileges)
 	if len(privs) == 0 {
 		return
@@ -399,7 +422,7 @@ func (s *Server) recordForeignServerGrant(objPart, rolePart, privPart string, wi
 		}
 		for _, role := range roles {
 			for _, p := range privs {
-				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
+				s.cfg.Catalog.GrantTablePrivilegeAs(oid, role, p, withGrantOption, grantor)
 			}
 		}
 	}
@@ -448,7 +471,7 @@ func (s *Server) recordForeignServerRevoke(objPart, rolePart, privPart string) {
 // recordForeignServerGrant. Unknown FDWs and an empty/unparseable privilege
 // list are skipped, leaving the statement a successful no-op. DU-002 slice
 // 428.
-func (s *Server) recordForeignDataWrapperGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+func (s *Server) recordForeignDataWrapperGrant(objPart, rolePart, privPart string, withGrantOption bool, grantor string) {
 	privs := parseGrantPrivileges(privPart, allForeignDataWrapperPrivileges)
 	if len(privs) == 0 {
 		return
@@ -462,7 +485,7 @@ func (s *Server) recordForeignDataWrapperGrant(objPart, rolePart, privPart strin
 		}
 		for _, role := range roles {
 			for _, p := range privs {
-				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
+				s.cfg.Catalog.GrantTablePrivilegeAs(oid, role, p, withGrantOption, grantor)
 			}
 		}
 	}
@@ -519,7 +542,7 @@ func (s *Server) recordForeignDataWrapperRevoke(objPart, rolePart, privPart stri
 // re-emits the trailing `WITH GRANT OPTION` (DU-002 slice 348). The implicit
 // owner/PUBLIC default entries are always plain (acldefault carries no grant
 // option). DU-002 slice 345.
-func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string, withGrantOption bool, grantor string) {
 	privs := parseGrantPrivileges(privPart, allFunctionPrivileges)
 	hasExecute := false
 	for _, p := range privs {
@@ -545,7 +568,7 @@ func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string, withGra
 		// "PUBLIC" to the reserved pseudo-role and renders it as the empty grantee).
 		s.cfg.Catalog.GrantTablePrivilege(oid, "PUBLIC", "EXECUTE")
 		for _, role := range roles {
-			s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, "EXECUTE", withGrantOption)
+			s.cfg.Catalog.GrantTablePrivilegeAs(oid, role, "EXECUTE", withGrantOption, grantor)
 		}
 	}
 }

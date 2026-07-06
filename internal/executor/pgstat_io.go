@@ -27,14 +27,36 @@ package executor
 // track_io_timing flag). Those real signals are wired into the one cell
 // they correspond to — backend_type='client backend', object='relation',
 // context='normal', columns reads/read_bytes/read_time/writes/write_bytes/
-// write_time/hits/evictions/extends/extend_bytes/extend_time —
-// everything else that upstream *tracks* renders as a real 0 (goopg has not
-// performed that IO, which is true), and every untracked cell still renders
-// NULL, matching upstream's row *shape* exactly even though most of its
-// counts are not yet collected. This is a deliberate, bounded slice of the
-// wider IO-instrumentation gap (see .ralph/deferral_ledger.md, M0122-0003):
-// the remaining three op counters (reuses/writebacks/fsyncs, plus their
-// _bytes/_time siblings) remain future work and are NOT fabricated here.
+// write_time/hits/evictions/extends/extend_bytes/extend_time. A second real
+// signal — wal.Writer's lifetime fdatasync(2) count/time against WAL
+// segments (Writer.FsyncCount/FsyncTimeNanos, incremented in
+// state.flushUpTo, time gated the same way via initdb.Open's
+// OnWALSyncDone) — backs backend_type='client backend', object='wal',
+// context='normal', column fsyncs/fsync_time. A third real signal —
+// storage.Pool's writeback/writeback_time (M0122-0003 follow-up:
+// accountBackendWrite/accountBgwriterWrite/accountCheckpointerWrite in
+// storage/writeback.go issue a real sync_file_range(2) hint once the
+// context's checkpoint_flush_after/bgwriter_flush_after/backend_flush_after
+// threshold is crossed) — backs the writeback/writeback_time cell of THREE
+// rows: backend_type='client backend'/'background writer'/'checkpointer',
+// object='relation', context='normal'. A fourth real signal — the background
+// writer's WriteDirtyPages and the checkpointer's flushBatch (FlushAllPaced)
+// each now increment their own sharedBgwriterWrittenCount/
+// sharedCheckpointWrittenCount (writeback simplification (4), closed:
+// storage.Pool's OnBgwriterWriteWait/Done and OnCheckpointerWriteWait/Done
+// bracket the real dirty-page write the same way OnFlushWait/OnFlushDone
+// brackets the backend-eviction path) — backs the writes/write_bytes/
+// write_time cells of the background writer / checkpointer rows, which were
+// previously an honest 0 because goopg only tracked writes in the pool-wide,
+// backend-attributed counter. Everything else that upstream *tracks* renders
+// as a real 0 (goopg has not performed that IO, which is true), and every
+// untracked cell still renders NULL, matching upstream's row *shape* exactly
+// even though most of its counts are not yet collected. This is a
+// deliberate, bounded slice of the wider IO-instrumentation gap (see
+// .ralph/deferral_ledger.md, M0122-0003): the remaining op counter (reuses,
+// plus its _bytes/_time siblings) needs a BufferAccessStrategy-style
+// ring-buffer implementation goopg does not have and remains future work —
+// NOT fabricated here.
 
 import (
 	"strconv"
@@ -230,6 +252,11 @@ const pgStatIOColCount = 20
 // of that IO), not a guess.
 func fetchIOStatRows(ctx *Context) [][]string {
 	var poolHit, poolRead, poolWritten, poolReadTimeNanos, poolWriteTimeNanos, poolEvictions, poolExtends, poolExtendTimeNanos int64
+	var poolBackendWriteback, poolBackendWritebackTimeNanos int64
+	var poolBgwriterWriteback, poolBgwriterWritebackTimeNanos int64
+	var poolCheckpointWriteback, poolCheckpointWritebackTimeNanos int64
+	var poolBgwriterWritten, poolBgwriterWriteTimeNanos int64
+	var poolCheckpointWritten, poolCheckpointWriteTimeNanos int64
 	if ctx != nil && ctx.Pool != nil {
 		poolHit, poolRead, _, poolWritten = ctx.Pool.BufferCounters()
 		poolReadTimeNanos = ctx.Pool.ReadTimeNanos()
@@ -237,6 +264,21 @@ func fetchIOStatRows(ctx *Context) [][]string {
 		poolEvictions = ctx.Pool.EvictionCount()
 		poolExtends = ctx.Pool.ExtendCount()
 		poolExtendTimeNanos = ctx.Pool.ExtendTimeNanos()
+		poolBackendWriteback = ctx.Pool.BackendWritebackCount()
+		poolBackendWritebackTimeNanos = ctx.Pool.BackendWritebackTimeNanos()
+		poolBgwriterWriteback = ctx.Pool.BgwriterWritebackCount()
+		poolBgwriterWritebackTimeNanos = ctx.Pool.BgwriterWritebackTimeNanos()
+		poolCheckpointWriteback = ctx.Pool.CheckpointWritebackCount()
+		poolCheckpointWritebackTimeNanos = ctx.Pool.CheckpointWritebackTimeNanos()
+		poolBgwriterWritten = ctx.Pool.BgwriterWrittenCount()
+		poolBgwriterWriteTimeNanos = ctx.Pool.BgwriterWriteTimeNanos()
+		poolCheckpointWritten = ctx.Pool.CheckpointWrittenCount()
+		poolCheckpointWriteTimeNanos = ctx.Pool.CheckpointWriteTimeNanos()
+	}
+	var walFsyncCount, walFsyncTimeNanos int64
+	if ctx != nil && ctx.WAL != nil {
+		walFsyncCount = ctx.WAL.FsyncCount()
+		walFsyncTimeNanos = ctx.WAL.FsyncTimeNanos()
 	}
 
 	var rows [][]string
@@ -262,7 +304,8 @@ func fetchIOStatRows(ctx *Context) [][]string {
 					countCol, byteCol, timeCol := ioOpColumns(op)
 					count, bytes := int64(0), int64(0)
 					timeMillis := "0"
-					if bt == ioBktClientBackend && obj == ioObjRelation && ctxIdx == ioCtxNormal {
+					switch {
+					case bt == ioBktClientBackend && obj == ioObjRelation && ctxIdx == ioCtxNormal:
 						switch op {
 						case ioOpHit:
 							count = poolHit
@@ -280,6 +323,34 @@ func fetchIOStatRows(ctx *Context) [][]string {
 							count = poolExtends
 							bytes = poolExtends * 8192
 							timeMillis = strconv.FormatFloat(nsToMs(poolExtendTimeNanos), 'f', 3, 64)
+						case ioOpWriteback:
+							count = poolBackendWriteback
+							timeMillis = strconv.FormatFloat(nsToMs(poolBackendWritebackTimeNanos), 'f', 3, 64)
+						}
+					case bt == ioBktClientBackend && obj == ioObjWal && ctxIdx == ioCtxNormal:
+						if op == ioOpFsync {
+							count = walFsyncCount
+							timeMillis = strconv.FormatFloat(nsToMs(walFsyncTimeNanos), 'f', 3, 64)
+						}
+					case bt == ioBktBgWriter && obj == ioObjRelation && ctxIdx == ioCtxNormal:
+						switch op {
+						case ioOpWriteback:
+							count = poolBgwriterWriteback
+							timeMillis = strconv.FormatFloat(nsToMs(poolBgwriterWritebackTimeNanos), 'f', 3, 64)
+						case ioOpWrite:
+							count = poolBgwriterWritten
+							bytes = poolBgwriterWritten * 8192
+							timeMillis = strconv.FormatFloat(nsToMs(poolBgwriterWriteTimeNanos), 'f', 3, 64)
+						}
+					case bt == ioBktCheckpointer && obj == ioObjRelation && ctxIdx == ioCtxNormal:
+						switch op {
+						case ioOpWriteback:
+							count = poolCheckpointWriteback
+							timeMillis = strconv.FormatFloat(nsToMs(poolCheckpointWritebackTimeNanos), 'f', 3, 64)
+						case ioOpWrite:
+							count = poolCheckpointWritten
+							bytes = poolCheckpointWritten * 8192
+							timeMillis = strconv.FormatFloat(nsToMs(poolCheckpointWriteTimeNanos), 'f', 3, 64)
 						}
 					}
 					cells[countCol] = strconv.FormatInt(count, 10)

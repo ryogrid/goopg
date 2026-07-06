@@ -401,6 +401,71 @@ func TestIndexScansRequireSelectPrivilege(t *testing.T) {
 	}
 }
 
+// TestScanOperatorsUseViewOwnerPrivilegeOverride pins the view-owner
+// privilege fix (M0122-0008): a scan tagged by the planner's
+// tagViewOwnerScans (PrivilegeCheckRoleSet) must check the SELECT grant of
+// the *tagged* role, not the querying session's own ctx.NonSuperuserRole —
+// this is how `GRANT SELECT ON view TO role` alone (no base-table grant)
+// still lets role query through an inlined view (PostgreSQL's default,
+// non-security_invoker view semantics: reads run as the view owner).
+// Covers all three SELECT-gated scan operators (M0097-0040's sibling
+// trio) since each extracts/reads the plan's PrivilegeCheckRole
+// independently.
+func TestScanOperatorsUseViewOwnerPrivilegeOverride(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	tbl.Owner = "bob"
+
+	// The querying session is "alice", who holds no grant on items at all —
+	// direct access would be denied. tagViewOwnerScans has stamped the scan
+	// with "bob" (the view's owner and items' owner), so it must succeed.
+	ctx.NonSuperuserRole = "alice"
+
+	seqOp := &seqScanOp{tbl: tbl, cols: tbl.Columns, privilegeCheckRole: "bob", privilegeCheckRoleSet: true}
+	if err := seqOp.Open(ctx); err != nil {
+		t.Fatalf("seqScanOp.Open: expected success via owner override, got %v", err)
+	}
+	_ = seqOp.Close()
+
+	// indexScanOp/indexOnlyScanOp check the same override before touching
+	// any index/lock state (mirrors TestIndexScansRequireSelectPrivilege,
+	// which likewise only drives these two through the denial path — a
+	// bare *planner.IndexScan{Table: tbl} with no real Index/btree can't
+	// proceed past the privilege gate). A tagged role that is neither the
+	// owner nor a grantee must be denied regardless of the querying
+	// session's own privileges — proves checkRole REPLACES the querying
+	// role rather than merely supplementing it.
+	idxOpDenied := &indexScanOp{plan: &planner.IndexScan{Table: tbl, PrivilegeCheckRole: "carol", PrivilegeCheckRoleSet: true}}
+	if err := idxOpDenied.openPrep(ctx); err == nil {
+		t.Fatal("indexScanOp.openPrep: expected 42501 for untagged non-owner role, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
+		t.Fatalf("indexScanOp.openPrep: expected 42501, got %#v", err)
+	}
+	ionOpDenied := &indexOnlyScanOp{plan: &planner.IndexOnlyScan{Table: tbl, PrivilegeCheckRole: "carol", PrivilegeCheckRoleSet: true}}
+	if err := ionOpDenied.Open(ctx); err == nil {
+		t.Fatal("indexOnlyScanOp.Open: expected 42501 for untagged non-owner role, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
+		t.Fatalf("indexOnlyScanOp.Open: expected 42501, got %#v", err)
+	}
+
+	seqOpDenied := &seqScanOp{tbl: tbl, cols: tbl.Columns, privilegeCheckRole: "carol", privilegeCheckRoleSet: true}
+	if err := seqOpDenied.Open(ctx); err == nil {
+		t.Fatal("seqScanOp.Open: expected 42501 for untagged non-owner role, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "42501" {
+		t.Fatalf("seqScanOp.Open: expected 42501, got %#v", err)
+	}
+
+	// A GRANT to the tagged role (rather than ownership) is honored too.
+	im.GrantTablePrivilege(tbl.OID, "carol", "SELECT")
+	seqOpGranted := &seqScanOp{tbl: tbl, cols: tbl.Columns, privilegeCheckRole: "carol", privilegeCheckRoleSet: true}
+	if err := seqOpGranted.Open(ctx); err != nil {
+		t.Fatalf("seqScanOp.Open: expected success via tagged-role grant, got %v", err)
+	}
+	_ = seqOpGranted.Close()
+}
+
 // TestSystemCatalogSelectAlwaysPermitted pins the dmlPrivilegePermitted
 // carve-out that keeps pg_catalog/information_schema readable by any role
 // even though goopg has no per-catalog default-ACL (pg_init_privs)

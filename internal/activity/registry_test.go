@@ -211,6 +211,46 @@ func TestActivityRegistryTrackIOTimingFastPathBoot(t *testing.T) {
 	}
 }
 
+// TestActivityRegistryBackendFlushAfterOverride verifies M0122-0003's
+// writeback follow-up: BackendFlushAfterOverride reports ok=false for an
+// untracked goroutine (mirrors LookupCurrentGoroutine's own ok=false), and
+// once a backend is the current goroutine, reports its own
+// BackendFlushAfterBlocks value (independent of any other backend's),
+// updated live by UpdateBackendFlushAfter — with no fast-path gate, unlike
+// TrackIOTiming, since this only backs the rare dirty-victim-eviction path.
+func TestActivityRegistryBackendFlushAfterOverride(t *testing.T) {
+	r := NewActivityRegistry(16)
+	r.Register(&Backend{PID: "1", State: "active"}) // procNum 0
+	r.Register(&Backend{PID: "2", State: "active"}) // procNum 1
+	const pnA, pnB = int32(0), int32(1)
+
+	if n, ok := r.BackendFlushAfterOverride(); ok {
+		t.Fatalf("BackendFlushAfterOverride before SetCurrentGoroutine = (%d, true), want ok=false", n)
+	}
+
+	SetCurrentGoroutine(r, pnA)
+	defer ClearCurrentGoroutine()
+
+	if n, ok := r.BackendFlushAfterOverride(); !ok || n != 0 {
+		t.Fatalf("BackendFlushAfterOverride before any Update = (%d, %v), want (0, true)", n, ok)
+	}
+
+	r.UpdateBackendFlushAfter(pnA, 16)
+	if n, ok := r.BackendFlushAfterOverride(); !ok || n != 16 {
+		t.Errorf("BackendFlushAfterOverride after UpdateBackendFlushAfter(pnA, 16) = (%d, %v), want (16, true)", n, ok)
+	}
+	// A different backend's own setting is independent.
+	r.UpdateBackendFlushAfter(pnB, 99)
+	if n, ok := r.BackendFlushAfterOverride(); !ok || n != 16 {
+		t.Errorf("BackendFlushAfterOverride for pnA after pnB's own Update = (%d, %v), want (16, true) (unaffected)", n, ok)
+	}
+
+	r.UpdateBackendFlushAfter(pnA, 0)
+	if n, ok := r.BackendFlushAfterOverride(); !ok || n != 0 {
+		t.Errorf("BackendFlushAfterOverride after resetting to 0 = (%d, %v), want (0, true)", n, ok)
+	}
+}
+
 // TestActivityRegistryStateChangeIsWallClock verifies that the monotonic
 // nanos written by hot-path WaitEvent / Update paths are converted back
 // into a wall-clock RFC3339Nano timestamp by Snapshot — runtimeshim.Nanotime

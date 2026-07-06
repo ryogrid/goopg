@@ -147,7 +147,13 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	// explicit transaction we fall through to the executor's no-op path so
 	// transaction state and the protocol response are handled normally.
 	if strings.HasPrefix(upper, "GRANT ") && !isHeapACLObject && (connTx == nil || !connTx.InExplicit()) {
-		s.tryRecordTableGrant(matchable)
+		actingRole := ""
+		if connTx != nil {
+			actingRole = connTx.NonSuperuserRole
+		}
+		if err := s.tryRecordTableGrant(matchable, actingRole); err != nil {
+			return s.writeQueryError(w, sqlstate.FeatureNotSupported, err.Error())
+		}
 		if err := w.WriteCommandComplete("GRANT"); err != nil {
 			return err
 		}

@@ -109,8 +109,8 @@ pinned FORMAT XML as a rejection case — is now `TestParseExplainAcceptsXMLForm
 | FORMAT YAML | **done, this loop** |
 | SETTINGS rendering | **done** (later loop, 2026-07-04) — see "SETTINGS rendering" section below |
 | BUFFERS rendering | **partial** (later loop, 2026-07-04) — TEXT + JSON/XML/YAML, ANALYZE only, shared hit/read only; see "BUFFERS rendering" section below |
-| `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits instrumented for the one cell goopg tracks; see "pg_stat_io row shape" + "real per-wait-event I/O timing" sections below |
-| per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above); `CTEDMLPrefix` nested-node residual still open, ledger row below |
+| `pg_stat_io` | **partial** (later loop, 2026-07-05) — row shape (79 rows, upstream valid-combination NULL pattern) + reads/read_bytes/read_time/writes/write_bytes/hits/evictions/extends/extend_bytes/extend_time instrumented for (client backend, relation, normal), fsyncs/fsync_time instrumented for (client backend, wal, normal); reuses/writebacks still open; see "pg_stat_io row shape" + "`fsyncs` / `fsync_time` counters" sections below |
+| per-CTE ANALYZE stats | **done** (landed concurrently in the shared tree, folded in this loop — see "Problem"/"Fix" above), including the `CTEDMLPrefix` nested-node residual (later loop, 2026-07-06) — see "`CTEDMLPrefix` nested-node instrumentation" section below |
 | `track_io_timing` runtime `SET` | **done** (later loop, 2026-07-05) — see "`track_io_timing` runtime SET" section below |
 | real per-wait-event I/O timing | **partial** (later loop, 2026-07-05) — read_time only; see "real per-wait-event I/O timing" section below |
 
@@ -683,3 +683,748 @@ writeback attribution, fsync call-site instrumentation respectively),
 EXPLAIN's `I/O Timings` line (now renderable since both `write_time` and
 `extend_time` exist), and the `CTEDMLPrefix` nested-node instrumentation
 residual.
+
+## Follow-up: EXPLAIN `I/O Timings` line
+
+Closes the "next presentation-layer gap" this doc's `extend_time` section
+predicted. `nodeStats` (`internal/executor/instrument.go`) gains
+`bufReadTimeNs`/`bufWriteTimeNs` (plus `bufBase*` snapshot pairs), diffed the
+same nested-stopwatch way `bufHit`/`bufRead`/etc. already are;
+`bufWriteTimeNs` folds `Pool.ExtendTimeNanos()` in alongside
+`Pool.WriteTimeNanos()`, mirroring upstream's `pgstat_count_io_op_time`
+(`postgres/src/backend/utils/activity/pgstat_io.c`), which buckets
+`IOOP_EXTEND` under the same shared-buffer write-time counter — real PG's
+"I/O Timings:" line has no separate `extend=` term either.
+
+`formatIOTimingsLine` (`internal/executor/operators_explain.go`) renders
+upstream's `show_buffer_usage` `has_shared_timing` branch
+(`postgres/src/backend/commands/explain.c`): `"I/O Timings: shared
+read=X.XXX write=Y.YYY"`, omitting the whole line when both counters are
+zero and each individual `read=`/`write=` term when that counter alone is
+zero. Wired into the TEXT walker (`walkPlanAnalyzeFiltered`, right after the
+existing `Buffers:` line) and the JSON renderer (`planToJSONWithStats`,
+`"Shared I/O Read/Write Time"` keys, right after the existing
+`"Shared ... Blocks"` keys).
+
+**Accepted simplification (fixed for non-TEXT, 2026-07-05, this loop):** real
+PostgreSQL's non-TEXT (JSON/XML/YAML) branch gates the `ExplainPropertyFloat`
+I/O-timing calls on the live `track_io_timing` GUC, not on whether the
+accumulated values are nonzero — `planToJSONWithStats` now takes a
+`trackIOTiming bool` parameter (the caller's `ctx.Activity.TrackIOTiming(ctx.
+ProcNum)` snapshot, threaded unchanged through the recursive `Plans`
+re-render from `explainOp.Open`) and emits `"Shared I/O Read Time"`/`"Shared
+I/O Write Time"` whenever it's true, even when both accumulators are exactly
+zero — matching `explain.c`'s `peek_buffer_usage` comment ("when format is
+anything other than text, we print even if the counters are all zeroes")
+exactly. The TEXT path (`formatIOTimingsLine`) deliberately keeps its
+original nonzero gate: there is no upstream precedent for an explicit
+`I/O Timings: shared read=0.000 write=0.000` TEXT line at all, so matching
+non-TEXT's unconditional-emit behavior there would invent new TEXT output
+upstream never produces.
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainIOTimingsOffByDefault`,
+`TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime`,
+`TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero`,
+`TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff`.
+
+**Verification:** `go build ./...` clean; `go test ./internal/executor/...`
+PASS (includes the four cases above plus the full pre-existing EXPLAIN
+suite); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+## `fsyncs` / `fsync_time` counters (later loop, 2026-07-05)
+
+Of the three `pg_stat_io` op counters this doc's `extends`/`evictions`
+section left open (reuses/writebacks/fsyncs), `fsyncs` is the tractable one:
+unlike `reuses` (needs a `BufferAccessStrategy`-style ring buffer goopg does
+not implement) or `writebacks` (needs bgwriter/checkpointer async-writeback
+issuance goopg does not implement), goopg's `wal.Writer` already performs a
+real `fdatasync(2)` per dirty WAL segment in `state.flushUpTo`
+(`internal/wal/writer.go`) — an existing, genuinely-real signal that was
+simply never counted.
+
+`walBufferCounters` (shared between `Writer` and `state`, the same struct
+backing `wal_buffers_*`) gains a `fsyncCount stats.Counter`, incremented
+once per segment actually `dataSync`'d inside `flushUpTo`'s dirty-segment
+loop — unconditional, matching upstream's "count columns are never gated on
+`track_io_timing`" semantics (only the `_time` sibling is). `Writer` gains a
+plain `sharedFsyncTimeNanos atomic.Int64` (not sharded — WAL fsyncs are
+already serialised through group commit, unlike per-buffer pool ops) plus
+`AddFsyncTimeNanos`/`FsyncTimeNanos` accessors mirroring `storage.Pool`'s
+`AddExtendTimeNanos`/`ExtendTimeNanos` exactly, and `FsyncCount()`.
+
+Timing gate: the pre-existing `OnWALSync`/`OnWALSyncDone` hook pair
+(`internal/initdb/open.go`) already brackets `Writer.FlushUpTo` using a
+*fixed* `walProcNum` background slot (for `pg_stat_activity`'s `wait_event`
+display, shared by every committing backend) — that slot's own
+`track_io_timing` flag is never set by any session, so gating
+`AddFsyncTimeNanos` on it would leave `fsync_time` permanently zero.
+Instead, `OnWALSyncDone` now separately calls
+`act.LookupTrackedGoroutine()`: because `FlushUpTo` runs synchronously on
+the *calling backend's own goroutine* (that goroutine's `(registry,
+procNum)` was set once at connection setup — `server.go`'s
+`activity.SetCurrentGoroutine`), this correctly resolves to the committing
+backend's own `track_io_timing` setting — the same gating mechanism
+`storage.Pool`'s `OnPinDone`/`OnFlushDone`/`OnExtendDone` already use, just
+applied via a second, independent registry lookup rather than reusing
+`walProcNum`.
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` gains a second
+instrumented cell — `(client backend, wal, normal)` — alongside the
+pre-existing `(client backend, relation, normal)` one; only `ioOpFsync` is
+wired (`Writer.FsyncCount()`/`FsyncTimeNanos()`, rendered via the existing
+`nsToMs` helper), since goopg tracks no other real WAL read/write counters
+yet.
+
+**Tests:** `internal/wal/wal_test.go` — `TestWriterFsyncCountRealSignal`
+(count increments once per real flush, not per no-op re-flush),
+`TestWriterFsyncTimeNanosAccumulates` (accumulator + non-positive-duration
+guard, mirrors `TestPoolWriteTimeNanosAccumulates`).
+`internal/executor/pgstat_io_test.go` — `TestPgStatIOWalFsyncsRendered`
+(end-to-end rendered-cell assertion, mirrors `TestPgStatIOExtendTimeRendered`).
+
+Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
+ANALYZE (planning-time buffers), local/temp-buffer terms, the 2 remaining
+`pg_stat_io` op counters (reuses/writebacks — each needs a genuinely new
+buffering mechanism goopg does not have, see above), and the `CTEDMLPrefix`
+nested-node instrumentation residual.
+
+**Verification:** `go build ./...` clean; `go test ./internal/wal/...
+./internal/executor/... ./internal/initdb/... ./internal/server/...` PASS.
+
+## `writeback` / `writeback_time` counters (later loop, 2026-07-05)
+
+Of the two `pg_stat_io` op counters the `fsyncs` section above left open
+(reuses/writebacks), `writebacks` is now real too. Unlike `reuses` (needs a
+`BufferAccessStrategy`-style ring buffer goopg does not implement anywhere
+— sequential-scan/VACUUM/COPY buffer reuse is architecturally absent), a
+writeback hint only needs (a) something that writes dirty pages — goopg
+already has three such call sites (`evictVictim`'s dirty-victim flush,
+`WriteDirtyPages` (bgwriter), `flushBatch`/`FlushAllPaced` (checkpointer))
+— and (b) a kernel write-behind hint to issue once enough pages accumulate,
+which Linux's `sync_file_range(2)` provides directly.
+
+**Design.** New `internal/storage/writeback.go`: `Pool.accountBackendWrite`
+/ `accountBgwriterWrite` / `accountCheckpointerWrite`, one call added right
+after each of the three write call sites above. Each maintains a running
+pending-page counter (`pendingBackendFlushBlocks` etc., `atomic.Int64`)
+against a configurable threshold (`backendFlushAfterBlocks` etc.,
+`atomic.Int32`, set via `SetBackendFlushAfter`/`SetBgwriterFlushAfter`/
+`SetCheckpointFlushAfter`); crossing the threshold resets the pending
+counter to 0 and calls the new `Manager.SyncFileRangeHint(rel)`
+(`internal/storage/smgr.go`), bracketed by a per-context `On*WritebackWait`/
+`On*WritebackDone` hook pair (mirrors `OnFlushWait`/`OnFlushDone`). A
+successful hint increments `shared{Backend,Bgwriter,Checkpoint}WritebackCount`;
+`ErrWritebackUnsupported` or any other error does not (no real IO happened,
+so nothing is counted — matches this doc's running "honest zero, not
+fabricated" rule). Three GUCs — `checkpoint_flush_after` (default 32),
+`bgwriter_flush_after` (default 64), `backend_flush_after` (default 0,
+"never enabled by default") — mirror upstream's exact defaults
+(`postgres/src/include/pg_config_manual.h`'s `DEFAULT_CHECKPOINT_FLUSH_AFTER`/
+`DEFAULT_BGWRITER_FLUSH_AFTER`/`DEFAULT_BACKEND_FLUSH_AFTER`, 0-256 range
+mirroring `WRITEBACK_MAX_PENDING_FLUSHES`=256), threaded through
+`initdb.OpenOptions`→`cmd/goopg/main.go`'s `intGUC` the same way
+`BgwriterMaxPages` already is (boot-time only, like most of this codebase's
+storage-tuning GUCs — no SIGHUP live-reload wiring in this slice).
+
+`Manager.SyncFileRangeHint` (`internal/storage/smgr.go`) delegates to a new
+platform-split `syncFileRangeHint(f *os.File)`:
+`internal/storage/writeback_linux.go` calls the real
+`unix.SyncFileRange(fd, 0, 0, SYNC_FILE_RANGE_WRITE)` (offset/nbytes 0 means
+"the whole file to current EOF"; `SYNC_FILE_RANGE_WRITE` alone starts
+async writeback without waiting or promising durability — `fsync` still
+owns that, exactly matching upstream's `pg_flush_data` contract);
+`internal/storage/writeback_other.go` (`!linux`) returns
+`ErrWritebackUnsupported` unconditionally, mirroring upstream's behaviour
+on platforms without `HAVE_SYNC_FILE_RANGE` (writeback is simply
+unavailable, not approximated by a full `fsync`, which would silently
+change the durability/blocking contract this hint deliberately lacks).
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` wires the three new
+counter pairs into the `writeback`/`writeback_time` cells of three rows:
+`(client backend, relation, normal)`, `(background writer, relation,
+normal)`, and `(checkpointer, relation, normal)` — the first real
+instrumentation for the latter two rows, which previously rendered all
+zeros for every column.
+
+**Deliberate simplifications vs. upstream (recorded here + deferral
+ledger, not hidden):**
+1. Upstream's `WritebackContext` coalesces up to `WRITEBACK_MAX_PENDING_FLUSHES`
+   (256) per-relation-segment block ranges before issuing one
+   `sync_file_range` per range; goopg tracks one running page count per
+   context and, on threshold-crossing, issues a single hint over
+   *whichever relation was just written*, not a coalesced multi-relation
+   batch. Real kernel behaviour, real GUC-driven cadence, simpler
+   bookkeeping.
+2. ~~`backend_flush_after` is `PGC_USERSET` upstream (a per-session GUC);
+   goopg applies it as one process-wide threshold (`initdb.Open` wires the
+   boot-time GUC value only). A `SET backend_flush_after` in one session
+   would affect every session's accounting.~~ **Fixed 2026-07-06** (loop
+   #9, see "Per-session `backend_flush_after`" section below).
+3. ~~bgwriter/checkpointer `writeback_time` gating gates on the boot-time
+   `TrackIOTiming` value with a plain `time.Now()`/`time.Since` pair
+   (`internal/initdb/open.go`), not the `ActivityRegistry` wait-event
+   clock the backend path uses — these two singleton background
+   goroutines have no registered `activity` background slot yet (unlike
+   the WAL writer's `walProcNum`), so their writeback wait never surfaces
+   in `pg_stat_activity`, only in `pg_stat_io`.~~ **Fixed 2026-07-06**
+   (loop #10, see "Registered bgwriter/checkpointer background slots"
+   section below).
+4. The background writer / checkpointer rows' own `writes`/`write_bytes`/
+   `write_time` cells are still an honest 0 — goopg's only real write
+   counter (`sharedWrittenCount`/`sharedWriteTimeNanos`) is deliberately
+   backend-scoped (see this doc's earlier `dirtied=`/`written=` section);
+   attributing bgwriter/checkpointer's own writes to their own rows is a
+   smaller, separate residual not required for writeback's own threshold
+   accounting.
+
+**Tests:** `internal/storage/writeback_test.go` —
+`TestPoolBackendWritebackTriggersAtThreshold` /
+`TestPoolBgwriterWritebackTriggersAtThreshold` /
+`TestPoolCheckpointerWritebackTriggersAtThreshold` (each context's
+threshold-crossing triggers a real writeback via a live temp-file-backed
+`Manager`), `TestSyncFileRangeHintOnRealFile` (raw platform-hook smoke
+test). `internal/executor/pgstat_io_test.go` —
+`TestPgStatIOWritebackRendered` (end-to-end rendered-cell assertion,
+mirrors `TestPgStatIOExtendTimeRendered`).
+
+Remaining M0122-0003 sub-items after this loop: `EXPLAIN (BUFFERS)` without
+ANALYZE (planning-time buffers), local/temp-buffer terms, `pg_stat_io`'s
+`reuses` op counter (needs the `BufferAccessStrategy` ring buffer), and the
+four simplifications named above.
+
+**Verification:** `go build ./...` clean; `go test ./internal/storage/...
+./internal/executor/... ./internal/config/...` PASS (see also the
+initdb/cmd build check run this loop).
+
+## Per-session `backend_flush_after` (later loop, 2026-07-06)
+
+Closes simplification (2) above: `backend_flush_after` is `PGC_USERSET`
+upstream, so each session may independently `SET` its own writeback
+threshold without affecting any other session's accounting. goopg
+previously applied it as a single process-wide `storage.Pool` atomic set
+once at boot (`SetBackendFlushAfter`), identical for every backend.
+
+**Design.** Mirrors the exact mechanism `track_io_timing`'s own
+runtime-`SET` follow-up already established (same doc, "SETTINGS
+rendering"/`track_io_timing` sections): a per-backend
+`activity.coldActivity.BackendFlushAfterBlocks atomic.Int32`, seeded at
+connection setup from the session's boot-time GUC value and kept live by a
+new `cfg.Registry.OnChange("backend_flush_after", ...)` hook in
+`server.New()` — both call the new `ActivityRegistry.UpdateBackendFlushAfter
+(procNum, n)`. `storage.Pool` gains a `BackendFlushAfterOverride func()
+(int32, bool)` hook (alongside `OnFlushWait`/`OnExtendWait`'s existing
+hook-injection pattern), wired in `initdb.Open` to
+`act.BackendFlushAfterOverride` directly (a plain method value — safe even
+if `act` happened to be nil, since the method's own nil-receiver guard runs
+first). `writeback.go`'s `accountBackendWrite` now resolves `threshold` by
+calling the override first and falling back to the pre-existing
+process-wide `backendFlushAfterBlocks.Load()` only when the override
+reports `ok=false` (untracked caller — the bgwriter/checkpointer
+goroutines, or a bare `Pool` exercised in tests without server wiring).
+
+Deliberately **no fast-path gate** unlike `TrackIOTimingOn`/
+`trackIOTimingFastPath`: that gate exists because `LookupTrackedGoroutine`
+is consulted on the buffer-pin hot path (every tuple read/write touches
+`Pin`), so the common all-off case must cost one atomic load, not a
+goroutine-map lookup (M0092-0005's original perf rationale).
+`accountBackendWrite`'s only caller is `evictVictim`'s dirty-victim path —
+gated on the pool actually needing to evict a slot, several orders of
+magnitude rarer than a buffer pin — so `BackendFlushAfterOverride` always
+does the `LookupCurrentGoroutine` map lookup unconditionally; the extra cost
+is immaterial next to the disk write it's bracketing.
+
+`accountWrite`'s signature changed from `thresholdBlocks *atomic.Int32` to
+a plain `threshold int32`, since the per-backend case no longer has a
+single `Pool`-owned atomic to hand it a pointer to — each of the three
+call sites (`accountCheckpointerWrite`/`accountBgwriterWrite`/
+`accountBackendWrite`) now resolves its own threshold value first
+(`.Load()`, or the override-then-fallback logic above for the backend
+case) and passes the resolved `int32` in.
+
+**Tests:** `internal/activity/registry_test.go`'s
+`TestActivityRegistryBackendFlushAfterOverride` (per-backend independence,
+live updates, untracked-goroutine `ok=false`); `internal/server/
+server_test.go`'s `TestBackendFlushAfterOnChangePropagatesToActivityRegistry`
+(mirrors `TestTrackIOTimingOnChangePropagatesToActivityRegistry` — `SET
+backend_flush_after` takes effect without a restart);
+`internal/storage/writeback_test.go`'s
+`TestPoolBackendWritebackOverrideTakesPrecedence` (three subcases: override
+enables what the process-wide default disables, override disables what the
+process-wide default enables, a not-ok override falls back to the
+process-wide default).
+
+**Verification:** `go build ./...` clean; `go vet`/`go test -race
+./internal/storage/... ./internal/activity/...` PASS; `go test
+./internal/server/... ./internal/executor/... ./internal/initdb/...
+./internal/config/...` PASS (full packages, no regressions).
+
+## `CTEDMLPrefix` nested-node instrumentation (later loop, 2026-07-06)
+
+The per-CTE ANALYZE stats section above fixed the `CTE DML` summary line
+itself (`Build()`'s `*planner.CTEDMLPrefix` case now runs through
+`maybeInstrument`), but left the nodes it wraps — the INSERT/UPDATE/DELETE/
+MERGE plan(s) and the outer query body — reporting cost-only estimates
+under `EXPLAIN ANALYZE`, even though they demonstrably ran and produced
+rows.
+
+**Root cause.** `cteDMLPrefixOp.Open()` (`internal/executor/
+operators_cte_dml.go`) cannot `Build()` its DML plans and outer body ahead
+of time the way every other operator's children are built — CTE write-then-
+read ordering requires executing each DML CTE to completion, restoring the
+statement-start snapshot, *then* building the outer query so it sees
+pre-CTE state. So those `Build()` calls happen lazily inside `Open()`, long
+after `explainOp.Open()`'s `withInstrumentation(timing, func() { return
+Build(o.plan.Child) })` call has returned. `withInstrumentation`'s `defer`
+resets the package-global `instrumentScope` back to its outer value (nil,
+at the top level) the moment its `fn` returns — which happens as soon as
+the *outermost* `Build()` call constructs `cteDMLPrefixOp` itself, well
+before `inner.Open(ctx)` (and therefore `cteDMLPrefixOp.Open`) ever runs.
+So the nested `Build(dml)` / `Build(o.plan.Body)` calls always saw
+`instrumentScope == nil`, and `maybeInstrument` skipped wrapping — the
+renderer's `nodeStatsTable` simply had no entry for those nodes.
+
+**Fix.** Rather than widening `withInstrumentation`'s scope (which would
+require holding it open across the entire DML-execution dance, coupling an
+EXPLAIN-only concern into core CTE execution ordering), `cteDMLPrefixOp`
+now carries forward the specific `*instrumenter` that was active on its
+*own* `Build()` call and reinstates it locally around its two lazy
+`Build()` sites:
+
+- New `instrumentScopeCarrier` interface (`internal/executor/
+  instrument.go`), mirroring the existing `heapFetchCounter` hand-off
+  pattern (0118-0102): `maybeInstrument` now also checks
+  `op.(instrumentScopeCarrier)` and, if implemented, calls
+  `setInstrumentScope(instrumentScope)` — handing the operator the
+  instrumenter alive at the moment `maybeInstrument` wrapped it (which is
+  non-nil precisely when under `EXPLAIN ANALYZE`).
+- `cteDMLPrefixOp` implements it (stores the pointer in a new `scope`
+  field) and gained `buildUnderScope(n planner.Node) (Operator, error)`: a
+  thin save/restore wrapper — `prev := instrumentScope; instrumentScope =
+  o.scope; defer func() { instrumentScope = prev }(); return Build(n)`.
+  `Open()`'s DML loop (`Build(dml)`) and outer-body build (`Build(o.plan.
+  Body)`) now call `o.buildUnderScope(...)` instead of the bare package
+  function. When not under EXPLAIN ANALYZE, `o.scope` is nil, so this is a
+  no-op — identical to the pre-fix code path.
+- Because `instrumentScope.table` is a single shared map for the whole
+  EXPLAIN ANALYZE invocation, reinstating the same `*instrumenter` means
+  the nested nodes' stats land in the *same* `nodeStatsTable` the renderer
+  already reads — no new plumbing needed on the render side.
+  `planChildren`'s existing `*planner.CTEDMLPrefix` case (returns
+  `p.DMls` + `p.Body`, `internal/executor/operators_explain.go`) already
+  walks into these nodes; it previously found no stats because none had
+  ever been recorded, not because the walk was wrong.
+
+**Tests:** `internal/executor/with_explain_test.go`'s
+`TestExplainCTEDMLPrefixNestedInsertReportsActualRows` asserts the nested
+`Insert on t` line specifically shows `actual time=`/`rows=2.00` (not just
+the `CTE DML` summary line, which the pre-existing
+`TestExplainCTEDMLPrefixAnalyzeReportsActualRows` already covered — its
+stale "deferred, see ledger" doc comment was removed since the gap it
+described is now closed).
+
+**Verification:** `go build ./...` clean; `go vet ./internal/executor/...`
+clean; `go test -count=1 ./internal/executor/... ./internal/storage/...
+./internal/planner/... ./internal/parser/... ./internal/server/...
+./internal/config/...` all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/
+Q13=33). Ledger: `.ralph/deferral_ledger.md` (2026-07-06 row, closes rows
+467/468).
+
+## `EXPLAIN (BUFFERS)` without `ANALYZE` — planning-time "Planning" group
+
+**Problem (ledger rows 471/472/481/497/498, "gap (2)"):** upstream's
+`ExplainOnePlan` (`postgres/src/backend/commands/explain.c`) always calls
+`show_buffer_usage(es, &bufusage, true)` with a *planning-time*
+`BufferUsage` snapshot whenever `es->buffers` is set, regardless of
+whether `ANALYZE` was also requested. `show_buffer_usage`'s own
+`peek_buffer_usage` helper returns true for any non-`EXPLAIN_FORMAT_TEXT`
+format as soon as buffer tracking was requested, even when every counter
+is zero (TEXT instead suppresses the whole block when nothing was
+touched — the existing per-node `Buffers: shared ...` TEXT line already
+mirrors this positive-only gate correctly). Before this fix, goopg's
+`explainOp.Open` never populated a "Planning" group at all for bare
+`EXPLAIN (BUFFERS)` (no `ANALYZE`) in FORMAT JSON/XML/YAML — the key was
+simply absent, not present-and-zero.
+
+**Fix:** `internal/executor/operators_explain.go` gains
+`planningBufferUsageJSON()`, returning a flat
+`{"Shared Hit Blocks": 0, "Shared Read Blocks": 0, "Shared Dirtied
+Blocks": 0, "Shared Written Blocks": 0}` map. `explainOp.Open`'s two
+non-TEXT render sites (the ANALYZE/summary path and the plan-only path)
+both set `root["Planning"] = planningBufferUsageJSON()` whenever
+`opts.Buffers` is true, independent of `ANALYZE` — matching upstream's
+independence of the "Planning" group from the ANALYZE flag exactly. The
+generic XML/YAML renderer (already reused for the plan tree and the
+existing "Buffers"/"Settings" groups) needs no changes: `xmlTagName`
+passes `"Planning"` through unchanged (no whitespace to sanitize) and
+nests the four `Shared * Blocks` children the same way it already
+sanitizes `"Shared Hit Blocks"` → `Shared-Hit-Blocks` for the per-node
+groups.
+
+goopg's planner (`internal/planner`) resolves every relation against the
+in-memory `catalog.Catalog` and never calls into `storage.Pool` during
+cost estimation — there is no planning-phase code path that could
+produce a nonzero counter here, so the all-zero stub is not an
+approximation of a real value, it is the actually-correct value given
+goopg's architecture. TEXT format is intentionally left unchanged: since
+planning buffers are always zero, TEXT's existing positive-only gate
+already produces upstream-correct output (no "Planning:" block) without
+any new code.
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup` (bare
+`EXPLAIN (BUFFERS, FORMAT JSON)`, no `ANALYZE`, must show `"Planning"`
+with hit/read keys), `TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup`
+(plain `EXPLAIN (FORMAT JSON)`, no `BUFFERS`, must NOT show it — pins the
+opt-in gate), `TestExplainBuffersAnalyzeJSONIncludesPlanningGroup`
+(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` also shows it, confirming
+ANALYZE-independence), `TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup`
+(XML sibling, asserts `<Planning>`/`<Shared-Hit-Blocks>0</Shared-Hit-Blocks>`).
+
+**Verification:** `go build ./...` clean; `go test -count=1
+./internal/executor/...` (full package) and
+`./internal/storage/... ./internal/planner/... ./internal/parser/...
+./internal/server/... ./internal/config/...` all PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Ledger:
+`.ralph/deferral_ledger.md` (2026-07-06 row, closes gap (2) from rows
+471/481/497/498).
+
+Local/temp-buffer terms were the only sub-item still open in the
+BUFFERS-rendering cluster after this fix — see the next section, which
+closes them the same loop-later.
+
+## Local/Temp `* Blocks` terms (later loop, 2026-07-06)
+
+**Problem (ledger row 508's own resume point):** upstream's
+`show_buffer_usage`'s non-`EXPLAIN_FORMAT_TEXT` branch always renders
+`Local Hit/Read/Dirtied/Written Blocks` and `Temp Read/Written Blocks`
+alongside the `Shared *` terms, unconditionally once `BUFFERS` was
+requested — the exact same "print even if all zeroes" rule the prior
+`Shared *`/`Planning` fixes already implement. goopg had never emitted
+these six keys anywhere (neither per-node ANALYZE stats nor the
+planning-time group), even though they are always legitimately zero:
+goopg has no local-buffer-manager or temp-buffer concept at all — every
+relation, including temp tables, is resolved through the one shared
+`storage.Pool` — so, exactly like the planning-time `Shared *` terms
+before them, "always zero" here is architecturally correct, not a
+narrower stub.
+
+**Fix:** both non-TEXT buffer-rendering sites gained the same six
+constant-zero keys:
+- `planningBufferUsageJSON()` (`internal/executor/operators_explain.go`)
+  now returns `Local Hit/Read/Dirtied/Written Blocks` and `Temp
+  Read/Written Blocks` alongside the four pre-existing `Shared *` keys.
+- `planToJSONWithStats`'s per-node `opts.Buffers` block sets the same six
+  keys to `int64(0)` next to the live `s.bufHit`/`s.bufRead`/
+  `s.bufDirtied`/`s.bufWritten` shared counters.
+
+TEXT format again needs no change: `formatBuffersLine` only ever emits
+the `shared` clause today, and since local/temp are always zero,
+upstream's own `has_local`/`has_temp` gates would also suppress those
+clauses — there is no TEXT-visible difference to produce. I/O timing
+terms (`Local/Temp I/O Read/Write Time`) remain out of scope for this
+slice — they are a separate deferred gap (goopg has no per-node local/
+temp *or* planning-time I/O timing collection at all yet, tracked
+alongside the existing `Shared I/O Read/Write Time` per-node-only gap).
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks` (per-node,
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)`, asserts all six keys present),
+`TestExplainBuffersPlanningGroupIncludesLocalTempBlocks` (bare `EXPLAIN
+(BUFFERS, FORMAT JSON)`, asserts the `"Planning"` group also carries all
+six keys).
+
+**Verification:** `go build ./...` clean; `go test -count=1
+./internal/executor/... ./internal/storage/... ./internal/planner/...
+./internal/parser/... ./internal/server/... ./internal/config/...` all
+PASS; `scripts/tpch-spotcheck.sh` PASS.
+
+This closes the local/temp-buffer-terms sub-item named as the only
+remaining open item in the BUFFERS-rendering cluster. The cluster's last
+open item is now only the `reuses` `pg_stat_io` op counter (needs a
+`BufferAccessStrategy`-style ring buffer goopg does not implement) plus
+the Local/Temp/Planning-time I/O timing terms just named above.
+
+## Local/Temp/Planning-time I/O timing terms (later loop, 2026-07-06)
+
+**Problem:** upstream's `show_buffer_usage` non-TEXT branch, once the live
+`track_io_timing` GUC is on, renders all **six** `Shared/Local/Temp I/O
+Read/Write Time` properties unconditionally (even at zero) — not just the
+`Shared` pair. Two gaps existed:
+1. `planToJSONWithStats`'s per-node `trackIOTiming` block only emitted
+   `Shared I/O Read/Write Time`; `Local I/O Read/Write Time` and `Temp I/O
+   Read/Write Time` were entirely missing.
+2. `planningBufferUsageJSON()` (the "Planning" group, used by both the
+   ANALYZE-JSON root and the BUFFERS-without-ANALYZE root) took no
+   `trackIOTiming` parameter at all — it never emitted *any* of the six
+   I/O timing keys, even when the GUC was on and the caller already had
+   `trackIOTiming` computed one line above the ANALYZE call site.
+
+**Fix:**
+- `planningBufferUsageJSON` now takes a `trackIOTiming bool` parameter and,
+  when true, adds all six keys as `float64(0)` constants (same
+  architectural-zero rationale as the Blocks terms: goopg's planner never
+  touches the buffer pool, and there is no local/temp buffer manager to
+  time). Both call sites in `explainOp.Open` — the ANALYZE-JSON branch
+  (reusing the `trackIOTiming` already computed for
+  `planToJSONWithStats`) and the plain BUFFERS-without-ANALYZE branch
+  (computing its own `trackIOTiming` from `ctx.Activity`/`ctx.ProcNum`,
+  since that branch has no other need for it) — now pass it through.
+- `planToJSONWithStats`'s `trackIOTiming` block gained `Local I/O
+  Read/Write Time` and `Temp I/O Read/Write Time` as `float64(0)`
+  constants alongside the real `Shared I/O Read/Write Time` values.
+
+TEXT format needs no change: local/temp timing is always zero, so
+upstream's own `has_local_timing`/`has_temp_timing` gates in
+`show_buffer_usage`'s TEXT branch would also suppress those clauses.
+
+**Tests:** `internal/executor/explain_buffers_test.go` —
+`TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn` /
+`TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff` (per-node),
+`TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn` /
+`TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff` (Planning group).
+
+**Verification:** `go build ./...` clean; `go test -count=1
+./internal/executor/... ./internal/storage/... ./internal/planner/...
+./internal/parser/... ./internal/server/... ./internal/config/...
+./internal/activity/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33).
+
+This closes the "Local/Temp/Planning-time I/O timing terms" sub-item.
+The BUFFERS/`pg_stat_io` cluster's only remaining open item is now the
+`reuses` `pg_stat_io` op counter (needs a `BufferAccessStrategy`-style
+ring buffer goopg does not implement — feature-sized, not a counter
+tweak) plus the 4 named writeback simplifications-vs-upstream
+(2026-07-05 ledger row).
+
+## Registered bgwriter/checkpointer background slots (later loop, 2026-07-06)
+
+Closes simplification (3) named in the "`writeback`/`writeback_time`
+counters" section above: bgwriter/checkpointer `writeback_time` now uses
+the real `ActivityRegistry` wait-event clock instead of a plain
+`time.Now()`/`time.Since` pair, and their writeback waits are now visible
+in `pg_stat_activity`, not just `pg_stat_io`.
+
+**Bug found while closing this.** The checkpointer's activity-registry
+registration (`cmd/goopg/main.go`) called `act.Register(&activity.Backend{
+PID: "cp-0", ...})` — the regular, numeric-PID-keyed path
+(`procNumForPID`). For a non-numeric PID, `procNumForPID` always returns
+`r.bgBase`: exactly the slot `RegisterBackground(WalWriterIdx, ...)`
+already claims for the WAL writer at `initdb.Open` time. Every server run
+therefore had the checkpointer's `Register` call silently clobber the WAL
+writer's `activitySlot` (`acquire` unconditionally overwrites `s.cold`) —
+`pg_stat_activity` could show at most one of {walwriter, checkpointer} at
+that slot, whichever registered last. `internal/activity/activity_test.go`'s
+`TestRegisterCurrentGoroutineIsolatesPerGoroutine` already carried a
+comment flagging this ("Use `RegisterBackground` for non-numeric PIDs to
+guarantee distinct slots") but only in test code — production call sites
+never got the fix.
+
+**Fix.** `internal/activity/registry.go` gains a fourth reserved
+background-slot index, `BgwriterIdx = 3` (alongside the pre-existing
+`WalWriterIdx=0`/`CheckpointerIdx=1`/`AutovacuumIdx=2`, `CheckpointerIdx`
+was reserved but never actually used via `RegisterBackground` before this
+loop). `internal/initdb/open.go` now:
+- pre-registers the checkpointer via
+  `act.RegisterBackground(activity.CheckpointerIdx, &activity.Backend{PID:
+  "cp-0", BackendType: "checkpointer", ...})` right before constructing
+  `wal.NewCheckpointer`, seeding `act.UpdateTrackIOTiming(checkpointerProcNum,
+  opts.TrackIOTiming)` once (a background worker has no per-session `SET
+  track_io_timing` to react to — same "boot-time GUC value only" rationale
+  as before, just now expressed as a registry flag instead of a captured
+  bool);
+- pre-registers the bgwriter the same way when `BgwriterDelay > 0 &&
+  BgwriterMaxPages > 0`, using upstream's `"background writer"` (with a
+  space) `backend_type` literal (matches `executor/pgstat_io.go`'s
+  `ioBackendTypeNames` and this doc's own running "(background writer,
+  relation, normal)" row references) — previously the bgwriter had no
+  registered slot at all, so it never appeared in `pg_stat_activity`.
+
+`wal.CheckpointerConfig` and `storage.Bgwriter` each gain an
+`OnLoopStart`/`OnLoopEnd func()` pair, called once (not per-tick/per-
+checkpoint) at the top/bottom of `Checkpointer.Run`/`Bgwriter.run` —
+mirrors `wal.Config`'s pre-existing `OnLoopStart`/`OnLoopEnd` fields that
+track `walProcNum` for the WAL writer goroutine. `initdb.Open` wires these
+to `activity.SetCurrentGoroutine(act, <procNum>)` /
+`activity.ClearCurrentGoroutine()`, so `act.LookupTrackedGoroutine()` now
+resolves correctly from inside `WriteDirtyPages`/`flushDirty` — both run
+synchronously on their own dedicated background goroutine, never on a
+client backend's. SQL-triggered checkpoints (`CheckpointNow`, called
+directly from a client backend executing `CHECKPOINT`) don't go through
+`Run` and are unaffected — they keep attributing to the calling backend's
+own already-registered identity, exactly as before.
+
+`internal/storage/writeback.go`'s three writeback hook installs in
+`internal/initdb/open.go` (`OnBackendWritebackWait/Done`,
+`OnBgwriterWritebackWait/Done`, `OnCheckpointerWritebackWait/Done`) are now
+textually identical: all three call `act.LookupTrackedGoroutine()` →
+`WaitEventStart(..., WaitDataFileWrite)` / `WaitEventEnd()` →
+`Add*WritebackTimeNanos`. The bgwriter/checkpointer-specific
+`bgwriterWritebackStart`/`checkpointWritebackStart` local `time.Time` vars
+and their `opts.TrackIOTiming` closure-capture are gone.
+
+`cmd/goopg/main.go`'s checkpointer-goroutine launch no longer registers
+`"cp-0"` itself (that duplicate call would have re-collided the pidMap
+entry back onto `bgBase`, undoing the fix) — registration and per-
+goroutine tracking now live entirely behind `CheckpointerConfig`'s
+`OnLoopStart`/`OnLoopEnd`, invoked from inside `Run()`.
+
+**Tests:** `internal/initdb/background_activity_test.go` (new) —
+`TestOpenRegistersDistinctWalWriterAndCheckpointerSlots` (the direct
+M0122-0003 regression test: both `wal-writer-0` and `cp-0` coexist in
+`Activity.Snapshot()` with correct, un-clobbered `BackendType`s),
+`TestOpenRegistersBgwriterBackgroundSlotWhenEnabled` (`bgwriter-0` appears
+with `backend_type = "background writer"` when the bgwriter is enabled),
+`TestCheckpointerWritebackUsesActivityRegistryClock` /
+`TestBgwriterWritebackUsesActivityRegistryClock` (drive the `Pool` hooks
+from the registered background identity and confirm a real nonzero
+elapsed duration accumulates, proving the wait-event clock — not a
+`time.Now()`/`time.Since` pair — backs the counter).
+
+**Verification:** `go build ./...` clean; `go vet` clean on
+`internal/activity/... internal/storage/... internal/wal/...
+internal/initdb/... cmd/goopg/...`; `go test -race ./internal/activity/...
+./internal/storage/... ./internal/wal/...` PASS; `go test -count=1
+./internal/initdb/... ./cmd/goopg/... ./internal/executor/...
+./internal/server/...` PASS; `scripts/tpch-spotcheck.sh` PASS.
+
+This closes writeback simplification (3). The only named residual left in
+the M0122-0003 writeback bucket is simplification (4) (background writer /
+checkpointer rows' own `writes`/`write_bytes`/`write_time` cells staying an
+honest 0 — `sharedWrittenCount`/`sharedWriteTimeNanos` are deliberately
+backend-scoped) plus the still-open `reuses` `pg_stat_io` op counter
+(needs a `BufferAccessStrategy`-style ring buffer, feature-sized).
+
+## Background writer / checkpointer `writes` counters (later loop, 2026-07-06)
+
+Closes writeback simplification (4), the last named residual in the
+writeback bucket besides the feature-sized `reuses` gap.
+
+**Root cause.** `storage.Pool`'s only write counter,
+`sharedWrittenCount`/`sharedWriteTimeNanos`, is deliberately scoped to
+`evictVictim`'s dirty-victim flush — the path a client backend's own
+`Pin`/`PinNew` takes when it needs to evict a dirty buffer to make room for
+itself (mirrors upstream's per-backend `pgBufferUsage.shared_blks_written`,
+which the bgwriter and checkpointer, as separate processes with their own
+`pgBufferUsage` instance, never touch). `WriteDirtyPages` (bgwriter) and
+`flushBatch`/`FlushAllPaced` (checkpointer) therefore never incremented
+*any* write counter — upstream's own `pg_stat_io` rows for these two
+backend types report real, independently-collected write activity, but
+goopg rendered a hardcoded `0`.
+
+**Fix.** Two new context-scoped counter pairs in `internal/storage/
+bufpool.go`, following the exact pattern the pre-existing writeback
+counters (`sharedBgwriterWritebackCount`/`sharedCheckpointWritebackCount`)
+already established one loop prior:
+- `sharedBgwriterWrittenCount`/`sharedBgwriterWriteTimeNanos`, incremented
+  in `WriteDirtyPages` once per slot successfully flushed, bracketed by new
+  `OnBgwriterWriteWait`/`OnBgwriterWriteDone` hooks around the per-victim
+  `flushSlot` call (mirrors `evictVictim`'s own `OnFlushWait`/`OnFlushDone`
+  bracket, now one hook pair per context instead of a single shared pair).
+- `sharedCheckpointWrittenCount`/`sharedCheckpointWriteTimeNanos`,
+  incremented in `flushBatch`'s per-tag postprocessing loop (once per tag
+  whose dirty bit was actually cleared), bracketed by new
+  `OnCheckpointerWriteWait`/`OnCheckpointerWriteDone` hooks around the
+  batch's AIO write-and-wait section (`WriteBlockAIO` issue + `Wait` loop)
+  — one wait/done pair per batch, not per block, since the whole batch's
+  writes are outstanding concurrently via AIO; this is the same
+  once-per-operation (not once-per-page) granularity `extend_time`/
+  `writeback_time` already use elsewhere in this file.
+
+New accessors `Pool.BgwriterWrittenCount()`/`BgwriterWriteTimeNanos()`/
+`CheckpointWrittenCount()`/`CheckpointWriteTimeNanos()` and mutators
+`AddBgwriterWriteTimeNanos`/`AddCheckpointWriteTimeNanos` mirror the
+writeback counters' accessor/mutator shape exactly.
+
+`internal/initdb/open.go` wires the four new hooks right after the
+existing `OnCheckpointerWritebackWait/Done` pair, using the identical
+`act.LookupTrackedGoroutine()` → `WaitEventStart(..., WaitDataFileWrite)` /
+`WaitEventEnd()` → `Add*WriteTimeNanos` shape every other `On*Wait/Done`
+pair in that function already follows — no new gating logic, since
+`LookupTrackedGoroutine` already resolves correctly from inside
+`WriteDirtyPages`/`flushBatch` (both run on their own registered background
+goroutine per the "Registered bgwriter/checkpointer background slots"
+section above).
+
+`internal/executor/pgstat_io.go`'s `fetchIOStatRows` reads the four new
+counters into local `poolBgwriterWritten(TimeNanos)`/
+`poolCheckpointWritten(TimeNanos)` variables and renders them into the
+`(background writer|checkpointer, relation, normal)` rows' `writes`/
+`write_bytes`/`write_time` cells (`write_bytes = writes * 8192`, matching
+the existing client-backend/read/extend cells' byte-derivation), switching
+those two `case` arms from a single `if op == ioOpWriteback` check to a
+`switch op { case ioOpWriteback: ...; case ioOpWrite: ... }` to add the new
+op without duplicating the row-match condition.
+
+**Tests:** `internal/storage/writeback_test.go`'s
+`TestPoolBgwriterAndCheckpointerWrittenCountsAreTracked` (drives both
+`WriteDirtyPages` and `FlushAllPaced` against separate dirty relations and
+asserts each context's counter increments independently, while
+`BufferCounters()`'s backend-scoped `written` stays exactly 0 throughout —
+the invariant this whole simplification protects); `internal/executor/
+pgstat_io_test.go`'s `TestPgStatIOBgwriterCheckpointerWritesRendered`
+(end-to-end: dirty 3 pages, `WriteDirtyPages`, assert the rendered
+`writes`/`write_bytes`/`write_time` cells on the background-writer row and
+that the checkpointer row's `writes` cell is still `0` since
+`FlushAllPaced` was never called in that test).
+
+**Verification:** `go build ./...` clean; `go vet` clean on
+`internal/storage/... internal/executor/... internal/initdb/...`; `go test
+-race ./internal/storage/...` PASS; `go test -count=1
+./internal/executor/... ./internal/initdb/... ./internal/wal/...
+./cmd/goopg/... ./internal/server/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS.
+
+This closes writeback simplification (4) — the writeback bucket's only
+remaining open item is the feature-sized `reuses` `pg_stat_io` op counter
+(needs a `BufferAccessStrategy`-style ring buffer goopg does not
+implement).
+
+## Follow-up: `Update`/`Delete` plan-tree children (2026-07-06, later loop)
+
+**Problem:** `internal/executor/operators_explain.go`'s `planChildren` —
+the single dispatch point every TEXT/JSON/ANALYZE render path (`walkPlan`,
+`walkPlanAnalyze`, `planToJSON`, `planToJSONWithStats`) recurses through —
+had cases for `*planner.Insert` (`p.Source`) but none for `*planner.Update`
+or `*planner.Delete`, so both fell through to the `nil`-leaf default. A
+plain `EXPLAIN UPDATE t SET ... WHERE ...` therefore rendered only the bare
+`Update on t` label with no child scan line at all — dropping the target
+table's `Seq Scan`/`Index Scan` (and, for `UPDATE ... FROM`/`DELETE ...
+USING`, every joined-table scan too). Confirmed against a real PostgreSQL
+18.3 instance: upstream always nests the underlying scan(s) under
+`Update on t` / `Delete on t`. Flagged in `unimplemented_feat.json`
+(`internal/executor/operators_explain.go:746 UPDATE/DELETE missing from
+planChildren`).
+
+**Fix:** added `*planner.Update`/`*planner.Delete` cases to `planChildren`
+returning `p.Child` (the target-table scan) followed by `p.FromScans`/
+`p.UsingScans` (the `UPDATE ... FROM`/`DELETE ... USING` join-side scans,
+M0097-0065/-0076) — mirroring the existing `Insert`/`p.Source` case and the
+`MultiHashJoin`/`p.Tables` multi-child pattern.
+
+**Known limitation (not a regression):** the executor does not `Build()`
+`p.Child` as a nested, independently-instrumented `Operator` the way
+`Insert` does for `p.Source` — `newUpdateOp`/`newDeleteOp` call
+`extractScan(p.Child)` to pull the `SeqScan`/`IndexScan`/`Filter` shape
+directly and drive it by hand, bypassing `maybeInstrument`. So under
+`EXPLAIN ANALYZE`, the newly-visible child line has no `nodeStatsTable`
+entry and renders as a cost-estimate-only line (no `actual time=...`
+bracket) — `walkPlanAnalyzeFiltered`'s pre-existing `stats[n]` miss path
+already handles this gracefully (same degradation any leaf without an
+instrumented operator would show), so this is a lesser-fidelity ANALYZE
+line, not a crash or wrong answer. Giving the child real ANALYZE stats
+would require routing `updateOp`/`deleteOp`'s scan through `Build()` +
+`maybeInstrument` instead of `extractScan`, a larger executor-internals
+change out of scope here — recorded as a residual, not blocking, since the
+plain (non-ANALYZE) `EXPLAIN` case — the actually-reported gap — is now
+fully correct.
+
+**Tests:** `internal/executor/explain_update_delete_children_test.go` —
+`TestExplainUpdateShowsScanChild`/`TestExplainDeleteShowsScanChild` (bare
+UPDATE/DELETE surface a `Scan on <table>` child line) and
+`TestExplainUpdateFromShowsFromScanChildren` (`UPDATE ... FROM` surfaces
+scans on *both* the target and the FROM table).
+
+**Gates:** `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/...` PASS (no regressions across the full EXPLAIN
+suite); `scripts/tpch-spotcheck.sh` PASS.

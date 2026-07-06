@@ -1348,6 +1348,32 @@ func searchPathSchemas(sess *config.SessionRegistry) []string {
 	return parseSearchPathSchemas(eff)
 }
 
+// publicSchemaVisible reports whether "public" is visible on the effective
+// search_path, mirroring internal/executor/expr.go's regObjectSchemaVisible
+// (used there to decide regproc/regoperator/regtype schema-qualification).
+// Unlike searchPathSchemas above, an explicitly empty search_path (pg_dump's
+// search_path='', ALWAYS_SECURE_SEARCH_PATH_SQL) is NOT defaulted back to
+// public here — it correctly yields no visible schemas, forcing
+// RegtypeName's caller to schema-qualify a user-defined type name.
+// getSetting is nil-safe (a nil executor.Context.GetSetting, or no session
+// at all) and falls back to the same default search_path executor/expr.go's
+// searchPathSchemas uses. M0122-0005 pg_typeof()::oid follow-up.
+func publicSchemaVisible(getSetting func(name string) (string, bool)) bool {
+	sp := `"$user", public`
+	if getSetting != nil {
+		if eff, ok := getSetting("search_path"); ok {
+			sp = eff
+		}
+	}
+	for _, raw := range strings.Split(sp, ",") {
+		s := strings.TrimSpace(strings.Trim(strings.TrimSpace(raw), `"'`))
+		if strings.EqualFold(s, "public") {
+			return true
+		}
+	}
+	return false
+}
+
 func compatNoopCommandTag(sql string) (string, bool) {
 	norm := normalizeCompatSQL(sql)
 	switch {
@@ -2265,7 +2291,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type.Name)
+			oid := typeOIDFor(sc.Type)
 			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
 			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
 			// rather than a scalar int4. M0118-0002.
@@ -2312,7 +2338,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				start := len(valueBuf)
 				if i < len(schema) {
-					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type)
+					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type, ctx.GetSetting)
 				} else {
 					valueBuf = d.AppendValueText(valueBuf)
 				}
@@ -2461,12 +2487,18 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE DOMAIN"
 	case *parser.DropDomainStmt:
 		return "DROP DOMAIN"
+	case *parser.AlterDomainStmt:
+		return "ALTER DOMAIN"
 	case *parser.CreateExtensionStmt:
 		return "CREATE EXTENSION"
 	case *parser.CreateCollationStmt:
 		return "CREATE COLLATION"
 	case *parser.AlterCollationStmt:
 		return "ALTER COLLATION"
+	case *parser.AlterTSConfigStmt:
+		return "ALTER TEXT SEARCH CONFIGURATION"
+	case *parser.AlterTSDictStmt:
+		return "ALTER TEXT SEARCH DICTIONARY"
 	case *parser.CreateAggregateStmt:
 		return "CREATE AGGREGATE"
 	case *parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt:
@@ -2485,6 +2517,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "ALTER OPERATOR FAMILY"
 	case *parser.CreateOpClassStmt:
 		return "CREATE OPERATOR CLASS"
+	case *parser.AlterDefaultPrivilegesStmt:
+		return "ALTER DEFAULT PRIVILEGES"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {
@@ -2573,7 +2607,7 @@ func rowsAffected(op executor.Operator) int64 {
 // type identically — the extended path previously only special-cased
 // float4/float8 and fell back to AppendValueText for everything else,
 // diverging from simple-query on date/time/timetz/bytea/regclass columns.
-func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type, getSetting func(name string) (string, bool)) []byte {
 	switch strings.ToLower(typ.Name) {
 	case "float4", "real":
 		// float4/real uses float32 precision (~7 significant digits).
@@ -2672,6 +2706,19 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 			if sig, ok := catalog.RegprocedureName(oid, routines); ok {
 				return append(dst, sig...)
 			}
+		}
+		return d.AppendValueText(dst)
+	case "regtype":
+		// OID values with type regtype display as type names (regtypeout),
+		// matching a direct SELECT of pg_typeof(...) or an <oid>::regtype
+		// cast. Mirrors the regclass/regproc cases above. A resolved
+		// user-defined type name is only schema-qualified when "public" is
+		// not visible on the session's effective search_path (e.g. pg_dump's
+		// search_path=''), matching real PostgreSQL's regtypeout instead of
+		// unconditionally prefixing "public.". M0122-0005 pg_typeof()::oid
+		// follow-up.
+		if d.Kind == executor.KindInt {
+			return append(dst, executor.RegtypeName(s.cfg.Catalog, uint32(d.Int), !publicSchemaVisible(getSetting))...)
 		}
 		return d.AppendValueText(dst)
 	default:
@@ -2820,8 +2867,8 @@ func appendTimeTZOffset(dst []byte, offsetSecs int) []byte {
 // typeOIDFor maps a goopg type name to a pg_type.oid the wire
 // protocol can advertise. Unknown types fall back to text (25),
 // which is wire-compatible with libpq's text-format reader.
-func typeOIDFor(name string) uint32 {
-	switch strings.ToLower(name) {
+func typeOIDFor(t catalog.Type) uint32 {
+	switch strings.ToLower(t.Name) {
 	case "int2", "smallint", "smallserial":
 		return 21
 	case "int4", "integer", "int", "serial":
@@ -2858,12 +2905,24 @@ func typeOIDFor(name string) uint32 {
 		return 25
 	case "varchar":
 		return 1043
-	case "char", "bpchar":
+	case "char":
+		// Quoted `"char"` (pg_type OID 18) never carries a typmod, unlike the
+		// bare CHAR keyword which the parser always gives an implicit or
+		// explicit length. See planner.exprType's *CastExpr case. M0122-0005.
+		if len(t.Args) == 0 {
+			return catalog.OIDChar
+		}
+		return 1042
+	case "bpchar":
 		return 1042
 	case "numeric", "decimal":
 		return 1700
 	case "pg_lsn":
 		return 3220
+	case "regtype":
+		// pg_typeof()'s declared SQL return type; also `<oid>::regtype`/
+		// `<name>::regtype` casts. M0122-0005 pg_typeof()::oid follow-up.
+		return catalog.OIDRegtype
 	}
 	return 25
 }
@@ -2884,7 +2943,7 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
-			oid := typeOIDFor(sc.Type.Name)
+			oid := typeOIDFor(sc.Type)
 			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
 			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
 			// rather than a scalar int4. M0118-0002.

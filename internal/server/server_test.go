@@ -329,3 +329,45 @@ func TestTrackIOTimingOnChangePropagatesToActivityRegistry(t *testing.T) {
 		t.Errorf("TrackIOTiming after SET off = true, want false")
 	}
 }
+
+// TestBackendFlushAfterOnChangePropagatesToActivityRegistry mirrors
+// TestTrackIOTimingOnChangePropagatesToActivityRegistry for M0122-0003's
+// writeback follow-up: `SET backend_flush_after` (upstream's GUC is
+// PGC_USERSET) must immediately update the calling backend's own
+// per-session threshold in the activity registry, which
+// storage.Pool.accountBackendWrite consults via BackendFlushAfterOverride,
+// without requiring a server restart.
+func TestBackendFlushAfterOnChangePropagatesToActivityRegistry(t *testing.T) {
+	reg := config.BuildDefaultRegistry()
+	act := activity.NewActivityRegistry(4)
+	New(Config{
+		Address:  "127.0.0.1:0",
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Registry: reg,
+		Activity: act,
+	})
+
+	act.Register(&activity.Backend{PID: "1", State: "active"})
+	procNum := int32(0)
+	activity.SetCurrentGoroutine(act, procNum)
+	defer activity.ClearCurrentGoroutine()
+
+	if n, ok := act.BackendFlushAfterOverride(); !ok || n != 0 {
+		t.Fatalf("BackendFlushAfterOverride before any SET = (%d, %v), want (0, true)", n, ok)
+	}
+
+	sess := config.NewSessionRegistry(reg)
+	if err := sess.Set("backend_flush_after", "16", false); err != nil {
+		t.Fatalf("SET backend_flush_after = 16: %v", err)
+	}
+	if n, ok := act.BackendFlushAfterOverride(); !ok || n != 16 {
+		t.Errorf("BackendFlushAfterOverride after SET 16 = (%d, %v), want (16, true)", n, ok)
+	}
+
+	if err := sess.Set("backend_flush_after", "0", false); err != nil {
+		t.Fatalf("SET backend_flush_after = 0: %v", err)
+	}
+	if n, ok := act.BackendFlushAfterOverride(); !ok || n != 0 {
+		t.Errorf("BackendFlushAfterOverride after SET 0 = (%d, %v), want (0, true)", n, ok)
+	}
+}

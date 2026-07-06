@@ -56,6 +56,81 @@ func TestAppendFlushAndReadAll(t *testing.T) {
 	}
 }
 
+// TestWriterFsyncCountRealSignal pins the M0122-0003 pg_stat_io follow-up:
+// Writer.FsyncCount() must reflect real fdatasync(2) calls made by
+// FlushUpTo, one per segment actually synced — not a fabricated value.
+func TestWriterFsyncCountRealSignal(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if got := w.FsyncCount(); got != 0 {
+		t.Fatalf("FsyncCount before any flush = %d, want 0", got)
+	}
+
+	_, end1, err := w.Append([]byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end1); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.FsyncCount(); got != 1 {
+		t.Fatalf("FsyncCount after first flush = %d, want 1", got)
+	}
+
+	_, end2, err := w.Append([]byte("world"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushUpTo(end2); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.FsyncCount(); got != 2 {
+		t.Fatalf("FsyncCount after second flush = %d, want 2", got)
+	}
+
+	// A no-op flush (nothing new written) must not fdatasync again.
+	if err := w.FlushUpTo(end2); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.FsyncCount(); got != 2 {
+		t.Fatalf("FsyncCount after redundant flush = %d, want unchanged 2", got)
+	}
+}
+
+// TestWriterFsyncTimeNanosAccumulates is AddFsyncTimeNanos/FsyncTimeNanos's
+// pg_stat_io.fsync_time analogue of storage.Pool's
+// TestPoolReadTimeNanosAccumulates (M0122-0003 track_io_timing follow-up).
+// Writer itself never calls AddFsyncTimeNanos — initdb.Open's
+// OnWALSyncDone hook does, gated on the calling backend's track_io_timing —
+// so this only exercises the accumulator in isolation.
+func TestWriterFsyncTimeNanosAccumulates(t *testing.T) {
+	walDir := filepath.Join(t.TempDir(), "pg_wal")
+	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if got := w.FsyncTimeNanos(); got != 0 {
+		t.Fatalf("FsyncTimeNanos before any accumulation = %d, want 0", got)
+	}
+	w.AddFsyncTimeNanos(1_000_000)
+	w.AddFsyncTimeNanos(2_000_000)
+	if got, want := w.FsyncTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("FsyncTimeNanos after two adds = %d, want %d", got, want)
+	}
+	w.AddFsyncTimeNanos(0)
+	w.AddFsyncTimeNanos(-5)
+	if got, want := w.FsyncTimeNanos(), int64(3_000_000); got != want {
+		t.Errorf("FsyncTimeNanos after non-positive adds = %d, want unchanged %d", got, want)
+	}
+}
+
 func TestFlushUpToRejectsUnwrittenLSN(t *testing.T) {
 	walDir := filepath.Join(t.TempDir(), "pg_wal")
 	w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 128})

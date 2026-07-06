@@ -2181,6 +2181,35 @@ type CompatNoopStmt struct {
 	ConvToEncoding  string
 	ConvFuncName    ObjectName
 	ConvDefault     bool
+	// TSDictTemplate / TSDictOptions carry a CREATE TEXT SEARCH DICTIONARY
+	// statement's `( TEMPLATE = tmplname [, key = value, ...] )` clause.
+	// TSDictTemplate is the (possibly schema-qualified) template name; every
+	// other `key = value` pair lands in TSDictOptions, in the order written.
+	// The executor resolves the template to one of the four real built-in
+	// pg_ts_template rows (goopg implements no user-defined TS templates) and
+	// records the dictionary in the catalog registry so pg_dump's
+	// getTSDictionaries / dumpTSDictionary re-emit the statement. Both zero
+	// value when the statement is not a CREATE TEXT SEARCH DICTIONARY (or is
+	// CONFIGURATION/PARSER/TEMPLATE, which stay parsed-and-discarded compat
+	// no-ops). DU-002 slice 437.
+	TSDictTemplate ObjectName
+	TSDictOptions  []TSDictOption
+	// TSConfigParser carries a CREATE TEXT SEARCH CONFIGURATION statement's
+	// `( PARSER = parsername )` clause. goopg resolves only the one real
+	// built-in parser (catalog.BuiltinTSParserOID — "default"); CREATE TEXT
+	// SEARCH PARSER is unimplemented (a C-function-loading feature with no
+	// analog here), so no user-defined parser can ever be named. Zero value
+	// when the statement is not a CREATE TEXT SEARCH CONFIGURATION. DU-002
+	// slice 446 (M0119-0004).
+	TSConfigParser ObjectName
+	// TSConfigCopySource carries a CREATE TEXT SEARCH CONFIGURATION
+	// statement's `( COPY = source_config )` clause — mutually exclusive
+	// with TSConfigParser (DefineTSConfiguration, tsearchcmds.c, raises
+	// ERRCODE_SYNTAX_ERROR if both are given). The executor resolves the
+	// named configuration, takes its parser, and copies its
+	// pg_ts_config_map rows into the new configuration. Zero value when the
+	// statement has no COPY clause. DU-002 slice 446 follow-up (M0119-0004).
+	TSConfigCopySource ObjectName
 	// TransformType / TransformLang carry a CREATE TRANSFORM statement's
 	// `FOR <type>` and `LANGUAGE <lang>` clauses. TransformFromFunc /
 	// TransformFromArgs and TransformToFunc / TransformToArgs carry the `FROM
@@ -2283,6 +2312,7 @@ type TypeACLChange struct {
 	TypeNames       []ObjectName
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
 
 // DatabaseACLChange carries the parsed pieces of a GRANT/REVOKE … ON DATABASE …
@@ -2301,6 +2331,7 @@ type DatabaseACLChange struct {
 	DatabaseNames   []string
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
 
 // RoleMembershipChange carries the parsed pieces of a `GRANT <role>[, ...]
@@ -2343,6 +2374,102 @@ type RoleMembershipChange struct {
 	Cascade bool
 }
 
+// TSDictOption is a single `key = value` pair from a CREATE TEXT SEARCH
+// DICTIONARY statement's option list, excluding the TEMPLATE clause (captured
+// separately on CompatNoopStmt.TSDictTemplate). Value is the literal text as
+// written (unquoted for a string/identifier value, digits-only for a numeric
+// one); IsNumeric distinguishes the two so the executor's serialization
+// (mirroring PG's serialize_deflist) knows whether to re-quote it. DU-002
+// slice 437.
+// HasValue distinguishes a `key = value` entry from a bare `key` entry in an
+// ALTER TEXT SEARCH DICTIONARY option list (gram.y's `definition` production
+// allows a DefElem with no arg). CREATE TEXT SEARCH DICTIONARY's option
+// parsing never produces a bare entry (see ddl.go's `text search dictionary`
+// CREATE-tail parse, which only records an option once it has seen the `=`),
+// so this field is unused/false there; ALTER's option-list parser
+// (parseAlterTSDictOptionList) is the only producer of HasValue=false
+// entries, meaning "remove this key without adding a new value" — mirroring
+// AlterTSDictionary's `if (defel->arg)` check (tsearchcmds.c).
+type TSDictOption struct {
+	Key       string
+	Value     string
+	IsNumeric bool
+	HasValue  bool
+}
+
+// AlterTSDictStmt is `ALTER TEXT SEARCH DICTIONARY name <action>`
+// (tsearchcmds.c's AlterTSDictionaryStmt/RenameStmt/AlterObjectSchemaStmt for
+// OBJECT_TSDICTIONARY). Action is one of:
+//   - "rename": RENAME TO newname
+//   - "setschema": SET SCHEMA newschema
+//   - "options": ( key [= value] [, ...] ) — merges the option list into the
+//     dictionary's existing dictinitoption, per-key remove-then-maybe-add
+//     (catalog.InMemory.AlterTSDictOptions).
+//
+// OWNER TO stays an unimplemented compat no-op (pg_dump reads dictowner from
+// the catalog row set at CREATE time), matching the ALTER TEXT SEARCH
+// CONFIGURATION precedent.
+type AlterTSDictStmt struct {
+	pos       int
+	DictName  ObjectName
+	Action    string
+	NewName   string
+	NewSchema string
+	Options   []TSDictOption // for Action == "options"
+}
+
+func (s *AlterTSDictStmt) Pos() int  { return s.pos }
+func (s *AlterTSDictStmt) stmtNode() {}
+
+// AlterTSConfigStmt is `ALTER TEXT SEARCH CONFIGURATION name <action>`
+// (tsearchcmds.c's AlterTSConfigurationStmt). Action is one of:
+//   - "addmapping": ADD MAPPING FOR tokentype [, ...] WITH dictionary [, ...]
+//     (ALTER_TSCONFIG_ADD_MAPPING). Each named token type gets its own
+//     ordered dictionary list; re-adding a token type already mapped is a
+//     23505 unique-violation in real PG (MakeConfigurationMapping's mapseqno
+//     restarts at 1 per call), enforced by the executor.
+//   - "dropmapping": DROP MAPPING [IF EXISTS] FOR tokentype [, ...]
+//     (ALTER_TSCONFIG_DROP_MAPPING); IfExists suppresses the "mapping...does
+//     not exist" error PG raises via drop_tsconfig_mapping.
+//   - "rename": RENAME TO newname.
+//   - "setschema": SET SCHEMA newschema.
+//   - "replacedict": ALTER MAPPING [FOR tokentype [, ...]] REPLACE olddict
+//     WITH newdict (ALTER_TSCONFIG_REPLACE_DICT /
+//     ALTER_TSCONFIG_REPLACE_DICT_FOR_TOKEN). An empty TokenTypes means the
+//     bare form, which substitutes the dictionary across every token type
+//     the configuration maps (tsearchcmds.c's MakeConfigurationMapping
+//     replace path treats an empty token list as "match all").
+//   - "altermapping": ALTER MAPPING FOR tokentype [, ...] WITH dictionary
+//     [, ...] (ALTER_TSCONFIG_ALTER_MAPPING_FOR_TOKEN, override=true).
+//     Replaces each named token type's entire dictionary list wholesale
+//     (delete-then-insert in MakeConfigurationMapping's override path), as
+//     opposed to ADD MAPPING's append (which 23505s on an existing token
+//     type) or REPLACE's single-OID substitution. Reuses the Dictionaries
+//     field, same shape as "addmapping".
+//
+// OWNER TO stays an unimplemented parsed-and-discarded compat no-op — it
+// needs no dedicated parse path since pg_dump always derives it from the
+// config's cfgowner catalog column (set at CREATE time), never from a
+// separate ALTER OWNER TO statement having been replayed.
+// DU-002 slice 446 (M0119-0004); rename/setschema/dropmapping added as a
+// slice 446 follow-up; replacedict added as a further follow-up; altermapping
+// added as a further follow-up still.
+type AlterTSConfigStmt struct {
+	pos          int
+	ConfigName   ObjectName
+	Action       string // "addmapping" | "dropmapping" | "rename" | "setschema" | "replacedict"
+	TokenTypes   []string
+	Dictionaries []ObjectName // for Action == "addmapping" | "altermapping"
+	IfExists     bool         // for Action == "dropmapping"
+	NewName      string       // for Action == "rename"
+	NewSchema    string       // for Action == "setschema"
+	OldDict      ObjectName   // for Action == "replacedict"
+	NewDict      ObjectName   // for Action == "replacedict"
+}
+
+func (s *AlterTSConfigStmt) Pos() int  { return s.pos }
+func (s *AlterTSConfigStmt) stmtNode() {}
+
 // ParameterACLChange carries the parsed pieces of a GRANT/REVOKE … ON
 // PARAMETER … statement (pg_parameter_acl, GUC-level ACLs) so the executor
 // can update the synthetic-OID-keyed ACL store. Unlike TypeACLChange/
@@ -2359,7 +2486,45 @@ type ParameterACLChange struct {
 	ParamNames      []string // lower-cased dotted GUC names
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
+
+// AlterDefaultPrivilegesStmt represents `ALTER DEFAULT PRIVILEGES [FOR ROLE|USER
+// role_list] [IN SCHEMA schema_list] {GRANT ...} | {REVOKE ...}` — sets the
+// privileges automatically granted on objects created later by the target
+// role(s), materialized as pg_default_acl rows (executor →
+// execAlterDefaultPrivileges). Mirrors gram.y's AlterDefaultPrivilegesStmt/
+// DefACLAction. M0110-0001 (DU-002 slice 438 follow-up).
+type AlterDefaultPrivilegesStmt struct {
+	pos int
+	// Roles is the FOR ROLE|USER role_list target; empty means the current
+	// user (goopg: "postgres", matching current_user's hardcoded resolution
+	// elsewhere in this codebase).
+	Roles []string
+	// Schemas is the IN SCHEMA schema_list target; empty means a global
+	// default (defaclnamespace = 0). PostgreSQL rejects IN SCHEMA combined
+	// with ObjType "schema"/"largeobject" (0LP01) — validated by the
+	// executor, not here.
+	Schemas []string
+	// Revoke is true for the REVOKE form, false for GRANT.
+	Revoke bool
+	// GrantOptionFor is true for "REVOKE GRANT OPTION FOR ...".
+	GrantOptionFor bool
+	// ObjType is one of "table"|"sequence"|"function"|"type"|"schema"|
+	// "largeobject" (ROUTINES/PROCEDURES fold into "function", matching real
+	// PG's defacl_privilege_target production).
+	ObjType string
+	// Privileges is the raw (upper-cased) privilege keyword list, or
+	// ["ALL"]/["ALL PRIVILEGES"] — left unexpanded for the executor.
+	Privileges []string
+	// Grantees is the TO|FROM role list ("PUBLIC" preserved verbatim).
+	Grantees []string
+	// WithGrantOption is GRANT ... WITH GRANT OPTION.
+	WithGrantOption bool
+}
+
+func (s *AlterDefaultPrivilegesStmt) Pos() int { return s.pos }
+func (s *AlterDefaultPrivilegesStmt) stmtNode() {}
 
 // ColumnPrivilege pairs a single column-grantable privilege keyword with the
 // parenthesised column list it applies to, e.g. `SELECT (a, b)`. PostgreSQL's
@@ -2386,6 +2551,7 @@ type AttrACLChange struct {
 	TableNames      []ObjectName      // relation(s) after ON [TABLE]
 	Grantees        []string          // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool              // GRANT … WITH GRANT OPTION
+	GrantedBy       string            // optional explicit grantor; "" = current session role
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }
@@ -2488,6 +2654,32 @@ type AlterSchemaStmt struct {
 
 func (s *AlterSchemaStmt) Pos() int  { return s.pos }
 func (s *AlterSchemaStmt) stmtNode() {}
+
+// AlterDomainStmt — ALTER DOMAIN name RENAME TO newname / OWNER TO role /
+// RENAME CONSTRAINT old TO new / SET DEFAULT expr / DROP DEFAULT. Real
+// PostgreSQL's AlterDomainStmt production also covers SET/DROP NOT NULL and
+// SET SCHEMA — those still parse as a no-op (see parseAlter's "domain"
+// branch). M0122-0005 domain follow-up (RENAME TO/OWNER TO); RENAME
+// CONSTRAINT, ADD/DROP CONSTRAINT, and SET/DROP DEFAULT added in later
+// follow-ups.
+type AlterDomainStmt struct {
+	pos  int
+	Name string
+	// Action selects the form: "rename" | "owner" | "renameconstraint" |
+	// "addconstraint" | "dropconstraint" | "setdefault" | "dropdefault".
+	Action            string
+	NewName           string // for Action == "rename"
+	NewOwner          string // for Action == "owner"; "current_user" sentinel like ALTER SCHEMA
+	ConstraintName    string // for Action == "renameconstraint": the existing constraint name; also the (optional) explicit name for "addconstraint", and the target name for "dropconstraint"
+	NewConstraintName string // for Action == "renameconstraint": the new constraint name
+	CheckExpr         string   // for Action == "addconstraint": raw CHECK predicate text (e.g. "VALUE > 0"), mirrors DomainCheckClause.Expr
+	CheckInValues     []string // for Action == "addconstraint": VALUE IN (...) shortcut form, mirrors DomainCheckClause.InValues
+	IfExists          bool     // for Action == "dropconstraint": IF EXISTS
+	DefaultExpr       Expr     // for Action == "setdefault": the new DEFAULT expression AST, mirrors CreateDomainStmt.Default
+}
+
+func (s *AlterDomainStmt) Pos() int  { return s.pos }
+func (s *AlterDomainStmt) stmtNode() {}
 
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {

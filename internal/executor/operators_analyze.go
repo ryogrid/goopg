@@ -194,6 +194,11 @@ func persistStatsToPGStatistic(ctx *Context, tbl *catalog.Table, stats *catalog.
 			break
 		}
 		col := tbl.Columns[i]
+		if col.StatTarget != nil && *col.StatTarget == 0 {
+			// SET STATISTICS 0 disables collection for this column
+			// (examine_attribute returns NULL upstream); write no row.
+			continue
+		}
 		attNum := int16(col.Ordinal + 1)
 		row := buildUserPGStatisticRow(tbl.OID, attNum, cs)
 		if _, err := writeHeapRowCanonical(ctx, statRel, cols, row); err != nil {
@@ -343,9 +348,30 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 	}
 
 	for i := range tbl.Columns {
-		stats.Columns[i] = computeColumnStats(reservoir, i, target)
+		colTarget, ok := columnStatsTarget(&tbl.Columns[i], target)
+		if !ok {
+			continue
+		}
+		stats.Columns[i] = computeColumnStats(reservoir, i, colTarget)
 	}
 	return stats, nil
+}
+
+// columnStatsTarget resolves the effective sampling target for one column,
+// honoring `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS n`
+// (catalog.Column.StatTarget) over the table-wide target. Mirrors
+// examine_attribute (postgres/src/backend/commands/analyze.c): an unset
+// override (nil) falls back to tableTarget, an override of 0 means "don't
+// analyze this column" (ok=false — the caller must not emit a
+// pg_statistic row either), and a positive override is used verbatim.
+func columnStatsTarget(col *catalog.Column, tableTarget int) (target int, ok bool) {
+	if col.StatTarget == nil {
+		return tableTarget, true
+	}
+	if *col.StatTarget == 0 {
+		return 0, false
+	}
+	return *col.StatTarget, true
 }
 
 // computeColumnStats derives the per-column NDistinct / NullFrac

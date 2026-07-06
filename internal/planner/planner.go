@@ -147,7 +147,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.AlterSchemaStmt,
 		*parser.LockTableStmt,
 		*parser.CreateTypeStmt, *parser.AlterTypeStmt, *parser.DropTypeStmt,
-		*parser.CreateDomainStmt, *parser.DropDomainStmt,
+		*parser.CreateDomainStmt, *parser.DropDomainStmt, *parser.AlterDomainStmt,
+		*parser.AlterTSConfigStmt, *parser.AlterTSDictStmt,
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt, *parser.AlterAggregateOwnerStmt,
 		*parser.CreateExtensionStmt,
@@ -156,7 +157,8 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateOpClassStmt, *parser.AlterOperatorSetStmt, *parser.AlterOpFamilyAddStmt,
 		*parser.AlterOpFamilyDropStmt,
 		*parser.CreateEventTriggerStmt, *parser.AlterEventTriggerStmt,
-		*parser.CreateAccessMethodStmt:
+		*parser.CreateAccessMethodStmt,
+		*parser.AlterDefaultPrivilegesStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.CreatePublicationStmt, *parser.DropPublicationStmt,
@@ -1779,6 +1781,33 @@ func nodeReferencesOuter(n Node) bool {
 			}
 		}
 		return false
+	case *FromUnnest:
+		// `FROM tbl, unnest(tbl.arr_col) AS t(m)` (or the explicit-LATERAL
+		// spelling): the array argument resolves to a plain *ColumnRef against
+		// the left sibling's schema (fromUnnestOp.Open reads ctx.OuterRows
+		// itself, same driver as openLateral's general per-outer-row path —
+		// unlike PgGetPublicationTables/VerifyHeapam/PgGetSequenceData above,
+		// which use the separate BindLateralOuter mechanism). Ledger row
+		// 2026-07-04 (M0122-0002 FROM-clause follow-up).
+		if exprContainsColumnRef(x.ArrExpr) {
+			return true
+		}
+		for _, a := range x.ArrExprs {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
+	case *FromRegexpMatches:
+		// Same driver as *FromUnnest above (fromRegexpMatchesOp.Open also
+		// reads ctx.OuterRows directly).
+		return exprContainsColumnRef(x.StringExpr) ||
+			exprContainsColumnRef(x.PatternExpr) ||
+			exprContainsColumnRef(x.FlagsExpr)
+	case *OrdinalityWrap:
+		// WITH ORDINALITY wraps the underlying SRF node; unwrap so a
+		// correlated argument is still detected under the wrapper.
+		return nodeReferencesOuter(x.Child)
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -2117,6 +2146,15 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		inner, err := Plan(tbl.View, cat)
 		if err != nil {
 			return nil, rangeBinding{}, err
+		}
+		// PostgreSQL runs a view's underlying-table reads as the view owner
+		// (security-definer-like), not the querying role, unless the view
+		// opted into `WITH (security_invoker = true)` — in which case the
+		// querying role's own privileges apply straight through, so leave
+		// every scan's PrivilegeCheckRole unset. M0122-0008 (view-owner
+		// privilege gap).
+		if !(tbl.SecurityInvokerSet && tbl.SecurityInvoker) {
+			tagViewOwnerScans(inner, tbl.Owner)
 		}
 		innerSchema := inner.Output()
 		if len(innerSchema) != len(tbl.Columns) {
@@ -3668,6 +3706,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
 		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
 	}
+	if strings.EqualFold(tf.Name, "ts_token_type") {
+		return planTSTokenType(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "verify_heapam") {
 		return planVerifyHeapam(rv, sourceIdx, lateralCtx)
 	}
@@ -4518,6 +4559,51 @@ func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *reso
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planTSTokenType routes a FROM-clause invocation of ts_token_type(oid) into
+// a TSTokenType plan node. pg_dump's dumpTSConfig calls it with a literal
+// `'%u'::pg_catalog.oid` argument (not lateral), but the arg is still
+// resolved against lateralCtx (falling back to an empty context) to accept
+// either shape, mirroring planPgGetSequenceData. DU-002 slice 446
+// (M0119-0004).
+func planTSTokenType(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) != 1 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "ts_token_type requires 1 argument"}
+	}
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "ts_token_type"
+	}
+	colNames := []string{"tokid", "alias", "description"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"int4", "text", "text"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &TSTokenType{pos: tf.Pos(), Arg: arg, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -5901,7 +5987,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			// of the aggregate's output column. Keep FuncCall wrapper for column label.
 			// M0097-0035.
 			if strings.ToLower(x.Name.String()) == "pg_typeof" {
-				typName := pgTypeofDisplayName(b.typ.Name)
+				typName := pgTypeofDisplayName(b.typ)
 				return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 			}
 			return &ColumnRef{pos: x.Pos(), Index: b.index, Name: agg.output.schema[b.index].Name, Type: b.typ}, nil
@@ -5912,7 +5998,7 @@ func resolveExprAfterAggregate(e parser.Expr, agg *aggregateSurface) (Expr, erro
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg).Name)
+			typName := pgTypeofDisplayName(exprType(arg))
 			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
@@ -9092,8 +9178,8 @@ func castTargetLabel(t string) string {
 
 // pgTypeofDisplayName maps a planner type name to the display name pg_typeof returns.
 // Mirrors PostgreSQL's format_type_be for common types. M0097-0035.
-func pgTypeofDisplayName(name string) string {
-	switch strings.ToLower(name) {
+func pgTypeofDisplayName(t catalog.Type) string {
+	switch strings.ToLower(t.Name) {
 	case "int4", "int", "integer", "serial":
 		return "integer"
 	case "int2", "smallint", "smallserial":
@@ -9110,7 +9196,16 @@ func pgTypeofDisplayName(name string) string {
 		return "text"
 	case "varchar", "character varying":
 		return "character varying"
-	case "char", "character", "bpchar":
+	case "char":
+		// Quoted `"char"` (pg_type OID 18) never carries a typmod; the bare
+		// CHAR keyword always does (parser-synthesized length 1 if none was
+		// written). See exprType's *CastExpr case. format_type_be quotes
+		// OID 18's name since "char" collides with the reserved keyword.
+		if len(t.Args) == 0 {
+			return `"char"`
+		}
+		return "character"
+	case "character", "bpchar":
 		return "character"
 	case "numeric", "decimal":
 		return "numeric"
@@ -9137,8 +9232,69 @@ func pgTypeofDisplayName(name string) string {
 	case "oid":
 		return "oid"
 	default:
-		return name
+		return t.Name
 	}
+}
+
+// foldPgCollationFor computes the plan-time-constant result of
+// pg_collation_for(arg), mirroring postgres/src/backend/utils/adt/misc.c's
+// pg_collation_for: typeid via the static argument type, collid via the
+// collation actually assigned to the argument. goopg has no per-expression
+// collation-derivation pass (parse_collate.c's assign_expr_collations is not
+// implemented — see M0122-0005 deferral ledger), so this only resolves the
+// two cases goopg CAN determine precisely — an explicit `expr COLLATE name`
+// and a bare untyped literal (no collation) — and otherwise falls back to
+// the database default collation for collatable types. A column with an
+// explicit COLLATE clause that isn't restated inline still reports "default"
+// rather than its true declared collation (deferred: catalog.Column.Collation
+// is dropped during planning, never reaching ColumnRef).
+// Returns (result-expr, nil) on success, or (nil, *PlanError) for the
+// ERRCODE_DATATYPE_MISMATCH (42804) case PG raises for non-collatable types.
+func foldPgCollationFor(arg Expr, cat catalog.Catalog, pos int) (Expr, *PlanError) {
+	// `expr COLLATE name` states its own collation unambiguously — no need to
+	// approximate.
+	if ce, ok := arg.(*CollateExpr); ok {
+		return &StringConst{Value: catalog.QuoteCollationIdent(ce.CollationName)}, nil
+	}
+	// A bare untyped string literal (no cast, no COLLATE) carries PostgreSQL's
+	// UNKNOWNOID pseudo-type, which has no collation. PG returns NULL here
+	// (verified against postgres/src/test/regress/expected/collate.out), not
+	// an error — UNKNOWNOID is explicitly exempted from the type-mismatch
+	// check in pg_collation_for's C implementation.
+	if _, ok := arg.(*StringConst); ok {
+		return &NullConst{pos: pos}, nil
+	}
+	baseName := strings.ToLower(exprType(arg).Name)
+	// A domain over a collatable base type is exactly as collatable as its
+	// base type (PostgreSQL's type_is_collatable follows typbasetype).
+	if cat != nil {
+		if dom, ok := cat.LookupDomain(exprType(arg).Name); ok {
+			baseName = strings.ToLower(dom.Base.Name)
+		}
+	}
+	// An array type is exactly as collatable as its element type
+	// (type_is_collatable follows the array's typcollation, which
+	// PostgreSQL derives from the element type at CREATE TYPE time).
+	// Cast-expression array types carry the "[]" suffix directly in the
+	// name (see castTargetLabel); real table-column arrays instead set
+	// Type.IsArray with an unsuffixed element Name, which already falls
+	// through the switch below unchanged.
+	for strings.HasSuffix(baseName, "[]") {
+		baseName = baseName[:len(baseName)-2]
+	}
+	switch baseName {
+	case "text", "varchar", "character varying", "bpchar", "character":
+		// Every collatable base type goopg models seeds pg_type.typcollation
+		// as "default" (postgres/src/include/catalog/pg_type.dat).
+		return &StringConst{Value: "default"}, nil
+	case "name":
+		// pg_type.dat pins name's typcollation to "C" specifically.
+		return &StringConst{Value: "C"}, nil
+	case "unknown", "":
+		return &NullConst{pos: pos}, nil
+	}
+	return nil, &PlanError{Pos: pos, Code: "42804", Message: fmt.Sprintf(
+		"collations are not supported by type %s", pgTypeofDisplayName(catalog.Type{Name: baseName}))}
 }
 
 // compatibleTypeRank returns a numeric rank for anycompatible type resolution.
@@ -9247,7 +9403,19 @@ func exprType(e Expr) catalog.Type {
 	case *CastExpr:
 		// CastExpr carries the declared target type. M0097-0003.
 		if x.TargetType != "" {
-			return catalog.Type{Name: x.TargetType}
+			t := catalog.Type{Name: x.TargetType}
+			// "char" is ambiguous: PostgreSQL's grammar maps the bare CHAR
+			// keyword to bpchar with an implicit length, but the quoted
+			// identifier "char" names a distinct type (pg_type OID 18, a
+			// 1-byte internal type) that never carries a typmod. The parser
+			// (select.go's synthesizeBareCharTypmod) synthesizes Typmod=1 for
+			// the bare form and leaves it 0 for the quoted form, so Typmod's
+			// presence is the signal for disambiguating downstream (wire
+			// TypeOID in typeOIDFor, pg_typeof's pgTypeofDisplayName).
+			if strings.EqualFold(x.TargetType, "char") && x.Typmod > 0 {
+				t.Args = []int64{x.Typmod}
+			}
+			return t
 		}
 		return exprType(x.Operand)
 	case *BinaryOp:
@@ -9349,6 +9517,16 @@ func exprType(e Expr) catalog.Type {
 			return catalog.Type{Name: x.ReturnType}
 		}
 		switch strings.ToLower(x.Name) {
+		// pg_typeof(expr) declares SQL return type regtype, whose wire/
+		// binary representation is the type's OID (executor/expr.go's
+		// "pg_typeof" case now returns a KindInt OID Datum, not display
+		// text) — advertise the real TypeOID so a further `::oid` cast is a
+		// binary-compatible reinterpretation, and dispatch.go's
+		// typeOIDFor/appendTypedCellText render the OID back to the display
+		// name for a plain `SELECT pg_typeof(...)`. M0122-0005 pg_typeof()::oid
+		// follow-up.
+		case "pg_typeof":
+			return catalog.Type{Name: "regtype"}
 		// Type-cast functions: single-arg calls like float8(expr) act as explicit casts.
 		// Return the target type so downstream type inference (BinaryOp, wire) is correct.
 		case "float8", "double precision", "double", "float":
@@ -10232,8 +10410,25 @@ func resolveExpr(e parser.Expr, ctx *resolveContext) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			typName := pgTypeofDisplayName(exprType(arg).Name)
+			typName := pgTypeofDisplayName(exprType(arg))
 			return &FuncCall{pos: x.Pos(), Name: "pg_typeof", Args: []Expr{&StringConst{Value: typName}}}, nil
+		}
+		// pg_collation_for(expr): PostgreSQL resolves the collation OID during
+		// parse analysis (exprCollation), so the result is a static property of
+		// the argument's declared type/collation, never row data. Fold it here
+		// for the same reason as pg_typeof above — goopg's executor has no
+		// per-row expression-collation model to consult. Oracle:
+		// postgres/src/backend/utils/adt/misc.c pg_collation_for. M0122-0005.
+		if strings.ToLower(x.Name.String()) == "pg_collation_for" && len(x.Args) == 1 {
+			arg, err := resolveExpr(x.Args[0], ctx)
+			if err != nil {
+				return nil, err
+			}
+			result, perr := foldPgCollationFor(arg, ctx.cat, x.Pos())
+			if perr != nil {
+				return nil, perr
+			}
+			return &FuncCall{pos: x.Pos(), Name: "pg_collation_for", Args: []Expr{result}}, nil
 		}
 		args := make([]Expr, 0, len(x.Args))
 		for _, a := range x.Args {

@@ -1853,6 +1853,12 @@ type Catalog interface {
 	// letter with a trailing `*` and pg_dump re-emits the WITH GRANT OPTION
 	// clause. DU-002 slice 332.
 	GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool)
+	// GrantTablePrivilegeAs is GrantTablePrivilegeWithGrantOption plus an
+	// explicit grantor role name, recorded as the aclitem's true "/grantor"
+	// component (default "postgres", the object owner, when grantor is empty)
+	// instead of always attributing the grant to the owner. M0119-0004-ACLHEAP
+	// (grantor half).
+	GrantTablePrivilegeAs(relOID uint32, role, priv string, withGrantOption bool, grantor string)
 	// RevokeTablePrivilege removes a single privilege (priv, upper-cased keyword)
 	// for role on relOID from the ACL store. When the role's privilege set
 	// becomes empty its entry is dropped entirely, so the materialized relacl no
@@ -1906,6 +1912,10 @@ type Catalog interface {
 	// privilege is revoked. M0119-0004-ACLHEAP (attacl half).
 	GrantColumnPrivilege(relOID uint32, attNum int16, role, priv string)
 	GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool)
+	// GrantColumnPrivilegeAs is GrantColumnPrivilegeWithGrantOption plus an
+	// explicit grantor, the column analogue of GrantTablePrivilegeAs.
+	// M0119-0004-ACLHEAP (attacl grantor half).
+	GrantColumnPrivilegeAs(relOID uint32, attNum int16, role, priv string, withGrantOption bool, grantor string)
 	RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv string)
 	AttrACLText(relOID uint32, attNum int16) string
 	// DropTableACL forgets all privileges recorded for relOID (called when the
@@ -2180,6 +2190,19 @@ type InMemory struct {
 	// round-trip them. DU-002 slice 399 (M0119-0004).
 	userConversions []*UserConversion
 
+	// userTSDicts holds text search dictionaries created via CREATE TEXT SEARCH
+	// DICTIONARY, in creation order (deterministic pg_dump output). Surfaced as
+	// rows in the virtual pg_ts_dict view so pg_dump's getTSDictionaries /
+	// dumpTSDictionary round-trip them. DU-002 slice 437 (M0119-0004).
+	userTSDicts []*UserTSDict
+
+	// userTSConfigs holds text search configurations created via CREATE TEXT
+	// SEARCH CONFIGURATION (+ their ADD MAPPING entries), in creation order.
+	// Surfaced as rows in the virtual pg_ts_config / pg_ts_config_map views so
+	// pg_dump's getTSConfigurations / dumpTSConfig round-trip them. DU-002
+	// slice 446 (M0119-0004).
+	userTSConfigs []*UserTSConfig
+
 	// schemas tracks user-created schemas (CREATE SCHEMA). Pre-populated
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
@@ -2253,6 +2276,25 @@ type InMemory struct {
 	// privilege granted". M0118-0008; grant-option DU-002 slice 332.
 	tableACLs map[uint32]map[string]map[string]bool
 
+	// tableACLGrantor records, per relOID, the grantor role that performed each
+	// non-owner grantee's most recent GRANT — the real PostgreSQL aclitem's
+	// trailing "/grantor" component, which goopg otherwise hardcodes to the
+	// object owner ("postgres") in relaclTextLockedFor. A role reachable only
+	// via SET ROLE / SET SESSION AUTHORIZATION (connTx.NonSuperuserRole) can
+	// legitimately GRANT a privilege it holds WITH GRANT OPTION to a further
+	// grantee, and real PG's pg_dump wraps that grant in `SET SESSION
+	// AUTHORIZATION <grantor>; GRANT ...; RESET SESSION AUTHORIZATION;`
+	// (dumputils.c buildACLCommands) once the aclitem's grantor differs from
+	// the owner — but that only round-trips if goopg's own relacl string
+	// carries the true grantor to begin with. Keyed like tableACLs (lower-cased
+	// role name); an absent entry means "granted by the object owner", the
+	// pre-existing default. Does not model PostgreSQL's full grant-option
+	// delegation chain (select_best_grantor, acl.c) — the recorded grantor is
+	// simply whichever role executed the GRANT statement, not the specific
+	// upstream role whose grant option was exercised. M0119-0004-ACLHEAP
+	// (grantor half).
+	tableACLGrantor map[uint32]map[string]string
+
 	// tableACLOrder records, per relOID, the order in which non-owner grantee
 	// roles first appeared in a GRANT — PostgreSQL appends a new grantee's
 	// aclitem to the end of pg_class.relacl (aclupdate in src/backend/utils/adt/
@@ -2321,6 +2363,12 @@ type InMemory struct {
 	// when its column privilege set is fully revoked. M0119-0004-ACLHEAP.
 	attrACLOrder map[attrACLKey][]string
 
+	// attrACLGrantor records, per column, the grantor role that performed each
+	// grantee's most recent column-level GRANT — the column analogue of
+	// tableACLGrantor. An absent entry means "granted by the object owner", the
+	// pre-existing default. M0119-0004-ACLHEAP (attacl grantor half).
+	attrACLGrantor map[attrACLKey]map[string]string
+
 	// parameterACLOIDs assigns a synthetic pg_parameter_acl.oid to each
 	// GUC-level `GRANT SET|ALTER SYSTEM ON PARAMETER <name> ...` target, keyed
 	// by the lower-cased dotted parameter name (mirroring
@@ -2338,6 +2386,29 @@ type InMemory struct {
 	// every GUC that has ever been granted, in a stable order.
 	// M0119-0004-ACLHEAP (parameter ACL half).
 	parameterACLNames map[uint32]string
+
+	// defaultACLOIDs assigns a synthetic pg_default_acl.oid to each
+	// `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] ...` target
+	// triple (defaclrole, defaclnamespace-or-0, defaclobjtype), keyed by
+	// defaultACLKey — mirrors parameterACLOIDs' lazy-minting pattern (real
+	// PostgreSQL only rows a pg_default_acl tuple once a GRANT/REVOKE
+	// materializes one, and deletes it again once the ACL returns to its
+	// implicit default; SetDefaultACL, aclchk.c). defaultACLKeys is the
+	// reverse lookup, so pg_default_acl's VirtualRows can project every
+	// minted triple. M0110-0001 (DU-002 slice 438 follow-up).
+	defaultACLOIDs map[defaultACLKey]uint32
+	defaultACLKeys map[uint32]defaultACLKey
+
+	// defaultACLGlobal records, per minted OID, whether the entry is a
+	// global default (no IN SCHEMA — defaclnamespace = 0) or a
+	// schema-scoped one. A global entry's implicit baseline is the target
+	// role's full acldefault() rights for the object type (merged in via the
+	// shared tableACLs/relaclTextLockedFor owner-injection machinery, exactly
+	// like pg_class.relacl); a schema-scoped entry's baseline is empty (no
+	// implicit owner entry at all) — real PostgreSQL's SetDefaultACL seeds
+	// `old_acl` from acldefault(objtype, roleid) only when nspid is invalid
+	// (aclchk.c). M0110-0001 (DU-002 slice 438 follow-up).
+	defaultACLGlobal map[uint32]bool
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
@@ -2692,6 +2763,20 @@ type Domain struct {
 	// this replaced the former single CheckExpr/CheckName/CheckInValues fields.
 	// DU-002 slice 385 (multi-CHECK; single-CHECK was slices 96/97).
 	Checks []DomainCheck
+	// Owner is the typowner role OID, settable via `ALTER DOMAIN ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (domain follow-up).
+	Owner uint32
+}
+
+// OwnerOrDefault returns d.Owner, falling back to the bootstrap superuser OID
+// (10) for domains that never had OWNER TO applied. Mirrors
+// EnumType.OwnerOrDefault / RangeType.OwnerOrDefault.
+func (d *Domain) OwnerOrDefault() uint32 {
+	if d.Owner == 0 {
+		return 10
+	}
+	return d.Owner
 }
 
 // DomainCheck is one CHECK constraint on a domain. Name is the resolved
@@ -2804,6 +2889,21 @@ type RangeType struct {
 	MultirangeOID      uint32 // pg_type.oid of the auto-generated multirange type
 	MultirangeArrayOID uint32 // pg_type.oid of the multirange's auto-generated `_name` array type
 	MultirangeName     string // lower-case multirange type name
+	// Owner is the typowner role OID, settable via `ALTER TYPE ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (range-type follow-up to the enum/composite
+	// ALTER TYPE OWNER TO/RENAME TO work).
+	Owner uint32
+}
+
+// OwnerOrDefault returns rt.Owner, falling back to the bootstrap superuser OID
+// (10) for range types that never had OWNER TO applied. Mirrors
+// EnumType.OwnerOrDefault / CompositeType.OwnerOrDefault.
+func (rt *RangeType) OwnerOrDefault() uint32 {
+	if rt.Owner == 0 {
+		return 10
+	}
+	return rt.Owner
 }
 
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
@@ -2897,6 +2997,181 @@ type UserConversion struct {
 	Default bool // condefault (CREATE DEFAULT CONVERSION)
 }
 
+// BuiltinTSTemplateOID maps the fixed real-PG OIDs (pg_ts_template.dat) of the
+// four built-in text search templates, keyed by lower-case template name. Only
+// these are resolvable by CREATE TEXT SEARCH DICTIONARY ... TEMPLATE = ...;
+// goopg implements no CREATE TEXT SEARCH TEMPLATE (a C-function-loading
+// feature with no analog here). DU-002 slice 437 (M0119-0004).
+var BuiltinTSTemplateOID = map[string]uint32{
+	"simple":    3727,
+	"synonym":   3730,
+	"ispell":    3733,
+	"thesaurus": 3742,
+}
+
+// tsDictTemplateOptionSpec mirrors each built-in template's own init
+// function's option-name whitelist — dsimple_init (dict_simple.c),
+// dsynonym_init (dict_synonym.c), dispell_init (dict_ispell.c), and
+// thesaurus_init (dict_thesaurus.c) — the target of verify_dictoptions
+// (tsearchcmds.c). Both the allowed key set and the literal "unrecognized
+// ... parameter" message text differ per template in real PG; there is no
+// shared format string to derive this from. DU-002 CREATE/ALTER TEXT SEARCH
+// DICTIONARY option-validation follow-up (M0119-0004).
+var tsDictTemplateOptionSpec = map[string]struct {
+	allowed []string
+	label   string
+}{
+	"simple":    {allowed: []string{"stopwords", "accept"}, label: "simple dictionary"},
+	"synonym":   {allowed: []string{"synonyms", "casesensitive"}, label: "synonym"},
+	"ispell":    {allowed: []string{"dictfile", "afffile", "stopwords"}, label: "Ispell"},
+	"thesaurus": {allowed: []string{"dictfile", "dictionary"}, label: "Thesaurus"},
+}
+
+// ValidateTSDictOptions mirrors verify_dictoptions (tsearchcmds.c): rejects
+// any option key the named template's own init function doesn't recognize,
+// using the exact same message text real PG's four init functions raise
+// (e.g. dsimple_init's `unrecognized simple dictionary parameter: "%s"`).
+// tmplName is a no-op key (returns nil) for any name not in
+// tsDictTemplateOptionSpec — CREATE/ALTER already reject an unresolved
+// template name earlier, so this only ever sees the four built-ins here.
+func ValidateTSDictOptions(tmplName string, opts []parser.TSDictOption) error {
+	spec, ok := tsDictTemplateOptionSpec[tmplName]
+	if !ok {
+		return nil
+	}
+	for _, opt := range opts {
+		if !slices.Contains(spec.allowed, opt.Key) {
+			return fmt.Errorf("unrecognized %s parameter: %q", spec.label, opt.Key)
+		}
+	}
+	return nil
+}
+
+// builtinTSTemplateNameForOID reverse-looks-up BuiltinTSTemplateOID (only 4
+// entries, so a linear scan is simplest) — used by AlterTSDictOptions, which
+// only has the dictionary's stored Template OID, not the name given at
+// CREATE time.
+func builtinTSTemplateNameForOID(oid uint32) (string, bool) {
+	for name, o := range BuiltinTSTemplateOID {
+		if o == oid {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// UserTSDict records a CREATE TEXT SEARCH DICTIONARY so pg_dump's
+// getTSDictionaries / dumpTSDictionary re-emit it. goopg performs no actual
+// text-search lexing — only the schema-dump round-trip is modeled, mirroring
+// UserConversion. Stored in InMemory.userTSDicts and surfaced as rows in the
+// virtual pg_ts_dict view. Mirrors PG pg_ts_dict.h. DU-002 slice 437
+// (M0119-0004).
+type UserTSDict struct {
+	OID          uint32 // pg_ts_dict.oid (allocated from the catalog OID counter)
+	Name         string // dictname (bare, no schema)
+	NamespaceOID uint32 // dictnamespace (resolved from the schema)
+	Owner        uint32 // dictowner (role OID; 10 = postgres superuser)
+	Template     uint32 // dicttemplate (FK into the built-in pg_ts_template rows)
+	// InitOption is the already-serialized dictinitoption text (PG's
+	// serialize_deflist form: `"key1" = 'val1', "key2" = 42`, quote_identifier'd
+	// keys, numeric literals bare, everything else single-quoted) — computed once
+	// at CREATE time so dumpTSDictionary can re-emit it verbatim. "" (no options)
+	// means the pg_ts_dict.dictinitoption column is NULL.
+	InitOption string
+}
+
+// BuiltinTSParserOID maps the fixed real-PG OID (pg_ts_parser.dat) of the one
+// built-in text search parser goopg models, keyed by lower-case parser name.
+// dumpTSConfig's own query (`SELECT nspname, prsname FROM pg_ts_parser p,
+// pg_namespace n WHERE p.oid = '<cfgparser>' ...`) needs a live pg_ts_parser
+// row to resolve a configuration's PARSER = ... clause by OID — CREATE TEXT
+// SEARCH PARSER is unimplemented (a C-function-loading feature with no
+// analog here), so no user-defined parser can ever be named. DU-002 slice 446
+// (M0119-0004).
+var BuiltinTSParserOID = map[string]uint32{
+	"default": 3722,
+}
+
+// BuiltinTSDictOID maps the fixed real-PG OID (pg_ts_dict.dat) of the one
+// built-in text search dictionary goopg surfaces in pg_ts_dict, keyed by
+// lower-case dictionary name. A CREATE TEXT SEARCH CONFIGURATION's ADD
+// MAPPING ... WITH simple clause names this dictionary; dumpTSConfig's
+// mapdict::regdictionary cast needs a live pg_ts_dict row (by OID) to
+// resolve it back to a bare name. Only "simple" is modeled — it is the only
+// dictionary with no external data-file dependency, and the overwhelmingly
+// common default in practice. DU-002 slice 446 (M0119-0004).
+var BuiltinTSDictOID = map[string]uint32{
+	"simple": 3765,
+}
+
+// TSTokenType is one row of ts_token_type()'s fixed output for the "default"
+// parser: (tokid, alias, description). Mirrors wparser_def.c's static
+// lex_descr table (the only parser goopg models). Order matches upstream's
+// tokid assignment (prsd_headline.c's lextype array), which is NOT
+// alphabetical or otherwise derivable — it is a fixed historical numbering
+// pg_dump's dumpTSConfig depends on to resolve a pg_ts_config_map row's
+// maptokentype back to its alias. DU-002 slice 446 (M0119-0004).
+type TSTokenType struct {
+	TokID       int
+	Alias       string
+	Description string
+}
+
+// DefaultParserTokenTypes is the fixed 23-row token-type table for the
+// built-in "default" parser (BuiltinTSParserOID["default"] = 3722). Verified
+// byte-for-byte against `SELECT * FROM ts_token_type(3722)` on real PG 18.3.
+var DefaultParserTokenTypes = []TSTokenType{
+	{1, "asciiword", "Word, all ASCII"},
+	{2, "word", "Word, all letters"},
+	{3, "numword", "Word, letters and digits"},
+	{4, "email", "Email address"},
+	{5, "url", "URL"},
+	{6, "host", "Host"},
+	{7, "sfloat", "Scientific notation"},
+	{8, "version", "Version number"},
+	{9, "hword_numpart", "Hyphenated word part, letters and digits"},
+	{10, "hword_part", "Hyphenated word part, all letters"},
+	{11, "hword_asciipart", "Hyphenated word part, all ASCII"},
+	{12, "blank", "Space symbols"},
+	{13, "tag", "XML tag"},
+	{14, "protocol", "Protocol head"},
+	{15, "numhword", "Hyphenated word, letters and digits"},
+	{16, "asciihword", "Hyphenated word, all ASCII"},
+	{17, "hword", "Hyphenated word, all letters"},
+	{18, "url_path", "URL path"},
+	{19, "file", "File or path name"},
+	{20, "float", "Decimal notation"},
+	{21, "int", "Signed integer"},
+	{22, "uint", "Unsigned integer"},
+	{23, "entity", "XML entity"},
+}
+
+// TSConfigMapping is one `ADD MAPPING FOR <tokentype> WITH <dict1>[, ...]`
+// entry — the ordered dictionary list a text search configuration applies to
+// tokens of the given type. Mirrors a run of pg_ts_config_map rows sharing a
+// maptokentype (mapseqno = the entry's index in Dicts). DU-002 slice 446
+// (M0119-0004).
+type TSConfigMapping struct {
+	TokenType string   // e.g. "asciiword" (validated against DefaultParserTokenTypes)
+	DictOIDs  []uint32 // pg_ts_dict.oid values, in mapseqno order
+}
+
+// UserTSConfig records a CREATE TEXT SEARCH CONFIGURATION (+ its ADD MAPPING
+// entries) so pg_dump's getTSConfigurations / dumpTSConfig re-emit it. goopg
+// performs no actual text-search tokenization — only the schema-dump
+// round-trip is modeled, mirroring UserTSDict. Stored in
+// InMemory.userTSConfigs and surfaced as rows in the virtual pg_ts_config /
+// pg_ts_config_map views. Mirrors PG pg_ts_config.h / pg_ts_config_map.h.
+// DU-002 slice 446 (M0119-0004).
+type UserTSConfig struct {
+	OID          uint32 // pg_ts_config.oid (allocated from the catalog OID counter)
+	Name         string // cfgname (bare, no schema)
+	NamespaceOID uint32 // cfgnamespace (resolved from the schema)
+	Owner        uint32 // cfgowner (role OID; 10 = postgres superuser)
+	Parser       uint32 // cfgparser (FK into the built-in pg_ts_parser row)
+	Mappings     []TSConfigMapping
+}
+
 // Fixed OIDs for the three core system catalog heap tables.
 // Values match upstream's pg_class.h / pg_attribute.h / pg_type.h
 // so tools that query OID columns by numeric value (e.g. ODBC metadata
@@ -2988,14 +3263,19 @@ func NewInMemory() *InMemory {
 		roleAttrs:          make(map[string]*RoleAttrs),
 		tempNamespaces:     make(map[string]uint32),
 		tableACLs:          make(map[uint32]map[string]map[string]bool),
+		tableACLGrantor:    make(map[uint32]map[string]string),
 		tableACLOrder:      make(map[uint32][]string),
 		roleACLDisplay:     make(map[string]string),
 		relACLEmptied:      make(map[uint32]bool),
 		relACLOwnerRevoked: make(map[uint32]bool),
 		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
 		attrACLOrder:       make(map[attrACLKey][]string),
+		attrACLGrantor:     make(map[attrACLKey]map[string]string),
 		parameterACLOIDs:   make(map[string]uint32),
 		parameterACLNames:  make(map[uint32]string),
+		defaultACLOIDs:     make(map[defaultACLKey]uint32),
+		defaultACLKeys:     make(map[uint32]defaultACLKey),
+		defaultACLGlobal:   make(map[uint32]bool),
 		comments:           make(map[commentKey]string),
 		statisticsObjs:     make(map[string]*StatisticsObject),
 		extensions:         make(map[string]*extensionRow),
@@ -8346,18 +8626,61 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3601,
 	}
-	pgTSParser.VirtualRows = func() [][]string { return nil }
+	// As of DU-002 slice 446 this view is no longer unconditionally empty: it
+	// surfaces the one real built-in parser (BuiltinTSParserOID["default"]) in
+	// the pg_catalog namespace, because dumpTSConfig's own query (`SELECT
+	// nspname, prsname FROM pg_ts_parser p, pg_namespace n WHERE p.oid =
+	// '<cfgparser>' ...`) needs a live row to resolve a user-created
+	// configuration's PARSER = ... clause by OID — namespace dumpability
+	// still filters it out of getTSParsers' own dump list, matching the
+	// previous "always empty" behavior for that query. goopg has no real
+	// start/token/end/headline/lextype routines behind this built-in, so all
+	// four surface as OID 0 (InvalidOid) — never read by dumpTSConfig.
+	pgTSParser.VirtualRows = func() [][]string {
+		names := make([]string, 0, len(BuiltinTSParserOID))
+		for name := range BuiltinTSParserOID {
+			names = append(names, name)
+		}
+		sort.Strings(names) // deterministic row order
+		rows := make([][]string, 0, len(names))
+		for _, name := range names {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(BuiltinTSParserOID[name]), 10), // oid
+				name, // prsname
+				"11", // prsnamespace (pg_catalog OID=11)
+				"0",  // prsstart
+				"0",  // prstoken
+				"0",  // prsend
+				"0",  // prsheadline
+				"0",  // prslextype
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
 
 	// pg_ts_template — text-search template catalog (OID 3764). pg_dump's
 	// getTSTemplates runs `SELECT tableoid, oid, tmplname, tmplnamespace,
 	// tmplinit::oid, tmpllexize::oid FROM pg_ts_template` — it reads ALL TS
 	// templates and filters out system-defined ones at dump-out time by
-	// namespace dumpability. goopg defines no user TS templates, and the
-	// built-ins live in pg_catalog (never dumped), so this view is correctly
-	// empty (0 rows). The ::oid casts in the query are no-ops since the tmpl*
-	// columns are regproc (oid-compatible). Schema matches PG's pg_ts_template
-	// (pg_ts_template.h). M0110-0001 (DU-002 slice 13).
+	// namespace dumpability. goopg defines no user TS templates (CREATE TEXT
+	// SEARCH TEMPLATE stays a parsed-and-discarded compat no-op — a
+	// C-function-loading feature with no analog here), so getTSTemplates'
+	// own dump output is correctly empty either way. As of DU-002 slice 437
+	// this view is no longer unconditionally empty, though: it now surfaces
+	// the four real built-in templates (BuiltinTSTemplateOID) in the
+	// pg_catalog namespace, because dumpTSDictionary's own query
+	// (`SELECT nspname, tmplname FROM pg_ts_template p, pg_namespace n WHERE
+	// p.oid = '<dicttemplate>' ...`) needs a live row to resolve a
+	// user-created dictionary's TEMPLATE = ... clause by OID — namespace
+	// dumpability still filters all four out of getTSTemplates' own dump
+	// list, matching the previous "always empty" behavior for that query.
+	// The ::oid casts in the query are no-ops since the tmpl* columns are
+	// regproc (oid-compatible); goopg has no init/lexize routines behind
+	// these built-ins, so both surface as OID 0 (InvalidOid) — never read by
+	// dumpTSDictionary, only tmplname/tmplnamespace are. Schema matches PG's
+	// pg_ts_template (pg_ts_template.h). M0110-0001 (DU-002 slice 13, slice
+	// 437 follow-up).
 	pgTSTemplate := &Table{
 		Schema: "pg_catalog", Name: "pg_ts_template", Virtual: true,
 		Columns: []Column{
@@ -8369,18 +8692,38 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3764,
 	}
-	pgTSTemplate.VirtualRows = func() [][]string { return nil }
+	pgTSTemplate.VirtualRows = func() [][]string {
+		names := make([]string, 0, len(BuiltinTSTemplateOID))
+		for name := range BuiltinTSTemplateOID {
+			names = append(names, name)
+		}
+		sort.Strings(names) // deterministic row order
+		rows := make([][]string, 0, len(names))
+		for _, name := range names {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(BuiltinTSTemplateOID[name]), 10), // oid
+				name, // tmplname
+				"11", // tmplnamespace (pg_catalog OID=11)
+				"0",  // tmplinit (no real init routine)
+				"0",  // tmpllexize (no real lexize routine)
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
 
 	// pg_ts_dict — text-search dictionary catalog (OID 3600). pg_dump's
 	// getTSDictionaries runs `SELECT tableoid, oid, dictname, dictnamespace,
 	// dictowner, dicttemplate, dictinitoption FROM pg_ts_dict` — it reads ALL
 	// TS dictionaries and filters out system-defined ones at dump-out time by
-	// namespace dumpability. goopg defines no user TS dictionaries, and the
-	// built-ins live in pg_catalog (never dumped), so this view is correctly
-	// empty (0 rows). dicttemplate is an oid FK to pg_ts_template (not a
-	// regproc); dictinitoption is text. Schema matches PG's pg_ts_dict
-	// (pg_ts_dict.h). M0110-0001 (DU-002 slice 14).
+	// namespace dumpability. goopg defines no built-in TS dictionaries so this
+	// view was previously always empty (0 rows); as of DU-002 slice 437 it
+	// surfaces user-created dictionaries (CREATE TEXT SEARCH DICTIONARY),
+	// stored in InMemory.userTSDicts, so pg_dump's getTSDictionaries /
+	// dumpTSDictionary round-trip them. dicttemplate is an oid FK to
+	// pg_ts_template (not a regproc); dictinitoption is text (NULL when no
+	// options were given). Schema matches PG's pg_ts_dict (pg_ts_dict.h).
+	// M0110-0001 (DU-002 slice 14, slice 437 follow-up).
 	pgTSDict := &Table{
 		Schema: "pg_catalog", Name: "pg_ts_dict", Virtual: true,
 		Columns: []Column{
@@ -8393,17 +8736,51 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3600,
 	}
-	pgTSDict.VirtualRows = func() [][]string { return nil }
+	pgTSDict.VirtualRows = func() [][]string {
+		dicts := c.ListUserTSDicts()
+		// As of DU-002 slice 446, this view also surfaces the one built-in
+		// dictionary (BuiltinTSDictOID["simple"]) in the pg_catalog namespace:
+		// a CREATE TEXT SEARCH CONFIGURATION's ADD MAPPING ... WITH simple
+		// clause names it, and dumpTSConfig's mapdict::regdictionary cast
+		// needs a live row (by OID) to resolve it back to a bare "simple".
+		// Namespace dumpability still filters it out of getTSDictionaries'
+		// own dump list, matching the previous "always empty" behavior there.
+		rows := make([][]string, 0, len(dicts)+1)
+		rows = append(rows, []string{
+			strconv.FormatUint(uint64(BuiltinTSDictOID["simple"]), 10),   // oid
+			"simple", // dictname
+			"11",     // dictnamespace (pg_catalog OID=11)
+			"10",     // dictowner (bootstrap superuser)
+			strconv.FormatUint(uint64(BuiltinTSTemplateOID["simple"]), 10), // dicttemplate
+			VirtualNull, // dictinitoption
+		})
+		for _, ud := range dicts {
+			initOpt := VirtualNull
+			if ud.InitOption != "" {
+				initOpt = ud.InitOption
+			}
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(ud.OID), 10), // oid
+				ud.Name,                                // dictname
+				strconv.FormatUint(uint64(ud.NamespaceOID), 10), // dictnamespace
+				strconv.FormatUint(uint64(ud.Owner), 10),        // dictowner
+				strconv.FormatUint(uint64(ud.Template), 10),     // dicttemplate
+				initOpt, // dictinitoption
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
 
 	// pg_ts_config — text-search configuration catalog (OID 3602). pg_dump's
 	// getTSConfigurations runs `SELECT tableoid, oid, cfgname, cfgnamespace,
 	// cfgowner, cfgparser FROM pg_ts_config` — it reads ALL TS configurations
 	// and filters out system-defined ones at dump-out time by namespace
-	// dumpability. goopg defines no user TS configurations, and the built-ins
-	// live in pg_catalog (never dumped), so this view is correctly empty (0
-	// rows). cfgparser is an oid FK to pg_ts_parser. Schema matches PG's
-	// pg_ts_config (pg_ts_config.h). M0110-0001 (DU-002 slice 15).
+	// dumpability. cfgparser is an oid FK to pg_ts_parser. Schema matches PG's
+	// pg_ts_config (pg_ts_config.h). M0110-0001 (DU-002 slice 15). As of DU-002
+	// slice 446 this view surfaces user-created configurations (CREATE TEXT
+	// SEARCH CONFIGURATION), stored in InMemory.userTSConfigs, so pg_dump's
+	// getTSConfigurations / dumpTSConfig round-trip them.
 	pgTSConfig := &Table{
 		Schema: "pg_catalog", Name: "pg_ts_config", Virtual: true,
 		Columns: []Column{
@@ -8415,8 +8792,73 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3602,
 	}
-	pgTSConfig.VirtualRows = func() [][]string { return nil }
+	pgTSConfig.VirtualRows = func() [][]string {
+		cfgs := c.ListUserTSConfigs()
+		if len(cfgs) == 0 {
+			return nil
+		}
+		rows := make([][]string, 0, len(cfgs))
+		for _, uc := range cfgs {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(uc.OID), 10), // oid
+				uc.Name,                                // cfgname
+				strconv.FormatUint(uint64(uc.NamespaceOID), 10), // cfgnamespace
+				strconv.FormatUint(uint64(uc.Owner), 10),        // cfgowner
+				strconv.FormatUint(uint64(uc.Parser), 10),       // cfgparser
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
+
+	// pg_ts_config_map — per-token-type dictionary mapping for a text search
+	// configuration (OID 3603). dumpTSConfig's own query (`SELECT ... FROM
+	// pg_catalog.pg_ts_config_map AS m WHERE m.mapcfg = '<cfgoid>' ORDER BY
+	// m.mapcfg, m.maptokentype, m.mapseqno`) reads this directly (not via
+	// getTSConfigurations' dump-list query), so it must carry live rows for
+	// every ALTER TEXT SEARCH CONFIGURATION ... ADD MAPPING applied to a
+	// user-created configuration. Schema matches PG's pg_ts_config_map
+	// (pg_ts_config_map.h); the on-disk heap-catalog metadata for this
+	// relation was already nailed in internal/initdb/relcache_init.go
+	// (pgTsConfigMapAttrs, OID 3603) for standby pg_class/pg_attribute
+	// parity — this is the query-serving counterpart. DU-002 slice 446
+	// (M0119-0004).
+	pgTSConfigMap := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_config_map", Virtual: true,
+		Columns: []Column{
+			{Name: "mapcfg", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "maptokentype", Type: Type{Name: "int4"}, Ordinal: 1},
+			{Name: "mapseqno", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "mapdict", Type: Type{Name: "oid"}, Ordinal: 3},
+		},
+		OID: 3603,
+	}
+	pgTSConfigMap.VirtualRows = func() [][]string {
+		cfgs := c.ListUserTSConfigs()
+		var rows [][]string
+		for _, uc := range cfgs {
+			tokIDByName := make(map[string]int, len(DefaultParserTokenTypes))
+			for _, tt := range DefaultParserTokenTypes {
+				tokIDByName[tt.Alias] = tt.TokID
+			}
+			for _, m := range uc.Mappings {
+				tokID, ok := tokIDByName[m.TokenType]
+				if !ok {
+					continue
+				}
+				for seq, dictOID := range m.DictOIDs {
+					rows = append(rows, []string{
+						strconv.FormatUint(uint64(uc.OID), 10), // mapcfg
+						strconv.Itoa(tokID),                    // maptokentype
+						strconv.Itoa(seq + 1),                  // mapseqno (1-based)
+						strconv.FormatUint(uint64(dictOID), 10), // mapdict
+					})
+				}
+			}
+		}
+		return rows
+	}
+	c.tables["pg_catalog.pg_ts_config_map"] = pgTSConfigMap
 
 	// pg_foreign_data_wrapper — foreign-data wrapper catalog (OID 2328).
 	// pg_dump's getForeignDataWrappers runs `SELECT tableoid, oid, fdwname,
@@ -8610,11 +9052,17 @@ func (c *InMemory) registerSystemTables() {
 	//   defaclacl, CASE WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN
 	//   defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END, defaclrole)
 	//   ELSE '{}' END AS acldefault FROM pg_default_acl
-	// goopg defines no default-ACL entries (no ALTER DEFAULT PRIVILEGES), so this
-	// view is correctly empty (0 rows); the CASE/acldefault projection is never
-	// evaluated. Schema matches PG's pg_default_acl (pg_default_acl.h):
-	// oid, defaclrole oid, defaclnamespace oid, defaclobjtype "char",
-	// defaclacl aclitem[]. M0110-0001 (DU-002 slice 20).
+	// Rows are projected from the defaultACLOIDs registry, populated by
+	// execAlterDefaultPrivileges on `ALTER DEFAULT PRIVILEGES ... GRANT/REVOKE
+	// ...` (mirrors pg_parameter_acl's lazy-materialization pattern above) —
+	// empty until the first such statement, exactly like real PostgreSQL never
+	// rowing a pg_default_acl tuple until SetDefaultACL first materializes one.
+	// The acldefault CASE projection above is evaluated by the executor's
+	// existing evalAclDefault (expr.go) against this row's own
+	// defaclrole/defaclobjtype, not computed here. Schema matches PG's
+	// pg_default_acl (pg_default_acl.h): oid, defaclrole oid, defaclnamespace
+	// oid, defaclobjtype "char", defaclacl aclitem[]. M0110-0001 (DU-002 slice
+	// 20 / slice 438 follow-up).
 	pgDefaultACL := &Table{
 		Schema: "pg_catalog", Name: "pg_default_acl", Virtual: true,
 		Columns: []Column{
@@ -8626,7 +9074,27 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 826,
 	}
-	pgDefaultACL.VirtualRows = func() [][]string { return nil }
+	pgDefaultACL.VirtualRows = func() [][]string {
+		entries := c.DefaultACLEntries()
+		if len(entries) == 0 {
+			return nil
+		}
+		out := make([][]string, 0, len(entries))
+		for _, e := range entries {
+			acl := VirtualNull
+			if aclText := c.DefaultACLText(e.OID, e.ObjType); aclText != "" {
+				acl = aclText
+			}
+			out = append(out, []string{
+				strconv.FormatUint(uint64(e.OID), 10),
+				strconv.FormatUint(uint64(e.RoleOID), 10),
+				strconv.FormatUint(uint64(e.SchemaOID), 10),
+				string(e.ObjType),
+				acl,
+			})
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
 
 	// pg_conversion — encoding-conversion catalog (OID 2607). After
@@ -10872,6 +11340,746 @@ func (c *InMemory) ListUserConversions() []*UserConversion {
 	return out
 }
 
+// CreateTSDict records a CREATE TEXT SEARCH DICTIONARY in the runtime
+// pg_ts_dict registry so pg_dump's getTSDictionaries / dumpTSDictionary
+// re-emit it. `schema` is the (already-resolved) schema name the dictionary
+// lives in; an unknown schema resolves to the public namespace OID. Returns
+// the new OID, or 0 with an error if a same-named dictionary already exists in
+// the same namespace (PG enforces a unique (dictname, dictnamespace)). DU-002
+// slice 437 (M0119-0004).
+func (c *InMemory) CreateTSDict(ud *UserTSDict, schema string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userTSDicts {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, ud.Name) {
+			return 0, fmt.Errorf("text search dictionary %q already exists", ud.Name)
+		}
+	}
+	ud.OID = c.allocOIDLocked()
+	ud.NamespaceOID = nsOID
+	c.userTSDicts = append(c.userTSDicts, ud)
+	return ud.OID, nil
+}
+
+// DropTSDict removes the user-created text search dictionary with the given
+// bare name in the given schema from the registry. Returns true if one was
+// found and removed. `schema` resolves like CreateTSDict (unknown → public).
+// DU-002 slice 437.
+func (c *InMemory) DropTSDict(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			c.userTSDicts = append(c.userTSDicts[:i], c.userTSDicts[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ListUserTSDicts returns the user-created text search dictionaries in
+// creation order. DU-002 slice 437.
+func (c *InMemory) ListUserTSDicts() []*UserTSDict {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userTSDicts) == 0 {
+		return nil
+	}
+	out := make([]*UserTSDict, len(c.userTSDicts))
+	copy(out, c.userTSDicts)
+	return out
+}
+
+// CreateTSDictDuringRecovery is the idempotent version of CreateTSDict used
+// by the WAL-replay driver (internal/initdb/tsdict_ddl_recovery.go). Unlike
+// CreateTSDict it takes the OID from the WAL record (so the recovered
+// dictionary matches the pre-crash OID exactly) and overwrites rather than
+// erroring when an entry with the same OID is already present (replay may
+// see the same record more than once across a partial-then-full replay).
+// Mirrors CreateConversionDuringRecovery. DU-002 restart-persistence
+// follow-up to slice 437.
+func (c *InMemory) CreateTSDictDuringRecovery(ud *UserTSDict, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	ud.NamespaceOID = nsOID
+	for i, existing := range c.userTSDicts {
+		if existing.OID == ud.OID {
+			c.userTSDicts[i] = ud
+			if ud.OID >= c.nextOID {
+				c.nextOID = ud.OID + 1
+			}
+			return
+		}
+	}
+	c.userTSDicts = append(c.userTSDicts, ud)
+	if ud.OID >= c.nextOID {
+		c.nextOID = ud.OID + 1
+	}
+}
+
+// DropTSDictDuringRecovery is the idempotent counterpart used for replaying
+// RecordKindDropTSDict. Identical to DropTSDict but discards the
+// found/not-found result — replay does not care whether the dictionary was
+// still present. DU-002 restart-persistence follow-up to slice 437.
+func (c *InMemory) DropTSDictDuringRecovery(name, schema string) {
+	c.DropTSDict(name, schema)
+}
+
+// SerializeTSDictOptions reconstructs a text search dictionary's
+// dictinitoption text exactly as PostgreSQL's serialize_deflist
+// (tsearchcmds.c) does: each option is rendered `"key" = <val>` (the key
+// quote_identifier'd — see pgQuoteIdent in the executor package, applied by
+// the caller since it lives there), entries joined by ", ", and the value
+// either emitted bare (an integer/numeric literal — TSDictOption.IsNumeric)
+// or single-quoted with embedded quotes doubled (every other value,
+// matching PG's SQL_STR_DOUBLE escaping). Returns "" (NULL dictinitoption)
+// when there are no options. Shared by CREATE TEXT SEARCH DICTIONARY and
+// ALTER TEXT SEARCH DICTIONARY's option-merge form (AlterTSDictOptions
+// below) so both round-trip through the identical serialized form. DU-002
+// slice 437; moved here from the executor package as an ALTER TEXT SEARCH
+// DICTIONARY follow-up (M0119-0004) so AlterTSDictOptions can call it
+// without an executor->catalog import cycle.
+func SerializeTSDictOptions(opts []parser.TSDictOption) string {
+	if len(opts) == 0 {
+		return ""
+	}
+	var buf strings.Builder
+	for i, opt := range opts {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(pgQuoteIdentForTSDict(opt.Key))
+		buf.WriteString(" = ")
+		if opt.IsNumeric {
+			buf.WriteString(opt.Value)
+			continue
+		}
+		buf.WriteByte('\'')
+		buf.WriteString(strings.ReplaceAll(opt.Value, "'", "''"))
+		buf.WriteByte('\'')
+	}
+	return buf.String()
+}
+
+// pgQuoteIdentForTSDict mirrors the executor package's own pgQuoteIdent
+// (expr.go) byte-for-byte — quote_identifier(): unquoted only when the
+// identifier is all-lowercase letters/digits/underscore starting with a
+// letter/underscore AND not a reserved keyword (sqlkeywords.
+// IsReservedForQuoting), otherwise double-quoted with embedded quotes
+// doubled. Duplicated here (rather than exported from the executor package)
+// because catalog cannot import executor (executor already imports
+// catalog); kept byte-identical to expr.go's pgQuoteIdent so
+// SerializeTSDictOptions's output is unchanged from before this function
+// moved from the executor package. DU-002 ALTER TEXT SEARCH DICTIONARY
+// follow-up (M0119-0004).
+func pgQuoteIdentForTSDict(s string) string {
+	if s == "" {
+		return `""`
+	}
+	safe := true
+	for i, c := range s {
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || c == '_') {
+				safe = false
+				break
+			}
+		} else {
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+				safe = false
+				break
+			}
+		}
+	}
+	if safe && sqlkeywords.IsReservedForQuoting(s) {
+		safe = false
+	}
+	if safe {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// DeserializeTSDictOptions is the inverse of SerializeTSDictOptions,
+// mirroring deserialize_deflist (tsearchcmds.c): splits a comma-separated
+// `"key" = 'value'` / `"key" = 42` list back into structured options.
+// InitOption is the only place a dictionary's options are stored (there is
+// no parallel structured field on UserTSDict), so ALTER TEXT SEARCH
+// DICTIONARY's (key[=value],...) merge form (AlterTSDictOptions below) must
+// round-trip through this to remove/replace individual keys without
+// discarding the rest. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func DeserializeTSDictOptions(s string) []parser.TSDictOption {
+	if s == "" {
+		return nil
+	}
+	var out []parser.TSDictOption
+	i := 0
+	for i < len(s) {
+		for i < len(s) && (s[i] == ' ' || s[i] == ',') {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+		var key string
+		if s[i] == '"' {
+			j := i + 1
+			var b strings.Builder
+			for j < len(s) {
+				if s[j] == '"' {
+					if j+1 < len(s) && s[j+1] == '"' {
+						b.WriteByte('"')
+						j += 2
+						continue
+					}
+					break
+				}
+				b.WriteByte(s[j])
+				j++
+			}
+			key = b.String()
+			i = j + 1
+		} else {
+			j := i
+			for j < len(s) && s[j] != ' ' && s[j] != '=' {
+				j++
+			}
+			key = s[i:j]
+			i = j
+		}
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i < len(s) && s[i] == '=' {
+			i++
+		}
+		for i < len(s) && s[i] == ' ' {
+			i++
+		}
+		if i >= len(s) {
+			out = append(out, parser.TSDictOption{Key: key, HasValue: true})
+			break
+		}
+		if s[i] == '\'' {
+			j := i + 1
+			var b strings.Builder
+			for j < len(s) {
+				if s[j] == '\'' {
+					if j+1 < len(s) && s[j+1] == '\'' {
+						b.WriteByte('\'')
+						j += 2
+						continue
+					}
+					break
+				}
+				b.WriteByte(s[j])
+				j++
+			}
+			out = append(out, parser.TSDictOption{Key: key, Value: b.String(), HasValue: true})
+			i = j + 1
+		} else {
+			j := i
+			for j < len(s) && s[j] != ',' {
+				j++
+			}
+			out = append(out, parser.TSDictOption{Key: key, Value: strings.TrimSpace(s[i:j]), IsNumeric: true, HasValue: true})
+			i = j
+		}
+	}
+	return out
+}
+
+// AlterTSDictOptions implements ALTER TEXT SEARCH DICTIONARY name
+// ( key [= value] [, ...] ), mirroring AlterTSDictionary (tsearchcmds.c):
+// each named option is first removed from the existing list (regardless of
+// whether it currently exists), then re-added only if the directive carries
+// a value (HasValue) — a bare `key` in the option list is therefore a
+// delete-only directive. The resulting merged list is validated via
+// ValidateTSDictOptions, mirroring AlterTSDictionary's own
+// verify_dictoptions call on the post-merge list (tsearchcmds.c) — a
+// delete-only directive is never validated since it never re-enters the
+// merged list, matching real PG exactly. Returns the newly-serialized
+// dictinitoption text (for the caller's WAL record) and an error if no such
+// dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.TSDictOption) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserTSDict
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			target = ud
+			break
+		}
+	}
+	if target == nil {
+		return "", fmt.Errorf("text search dictionary %q does not exist", name)
+	}
+	opts := DeserializeTSDictOptions(target.InitOption)
+	for _, directive := range directives {
+		kept := opts[:0]
+		for _, existing := range opts {
+			if !strings.EqualFold(existing.Key, directive.Key) {
+				kept = append(kept, existing)
+			}
+		}
+		opts = kept
+		if directive.HasValue {
+			opts = append(opts, parser.TSDictOption{Key: directive.Key, Value: directive.Value, IsNumeric: directive.IsNumeric, HasValue: true})
+		}
+	}
+	if tmplName, ok := builtinTSTemplateNameForOID(target.Template); ok {
+		if verr := ValidateTSDictOptions(tmplName, opts); verr != nil {
+			return "", verr
+		}
+	}
+	target.InitOption = SerializeTSDictOptions(opts)
+	return target.InitOption, nil
+}
+
+// AlterTSDictOptionsDuringRecovery is the idempotent recovery counterpart to
+// AlterTSDictOptions: replay carries the already-computed final
+// dictinitoption text (recorded once at original-execution time via the WAL
+// record), so it just overwrites the field rather than re-running the
+// merge. Discards a not-found result, mirroring RenameTSDictDuringRecovery.
+// DU-002 ALTER TEXT SEARCH DICTIONARY follow-up (M0119-0004).
+func (c *InMemory) AlterTSDictOptionsDuringRecovery(name, schema, initOption string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			ud.InitOption = initOption
+			return
+		}
+	}
+}
+
+// RenameTSDict implements ALTER TEXT SEARCH DICTIONARY name RENAME TO
+// newName, mirroring RenameTSConfig. DU-002 ALTER TEXT SEARCH DICTIONARY
+// follow-up (M0119-0004).
+func (c *InMemory) RenameTSDict(name, schema, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserTSDict
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			target = ud
+			continue
+		}
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, newName) {
+			return fmt.Errorf("text search dictionary %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("text search dictionary %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetTSDictSchema implements ALTER TEXT SEARCH DICTIONARY name SET SCHEMA
+// newSchema, mirroring SetTSConfigSchema. Returns false if no such
+// dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
+// (M0119-0004).
+func (c *InMemory) SetTSDictSchema(name, schema, newSchema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, ud := range c.userTSDicts {
+		if ud.NamespaceOID == nsOID && strings.EqualFold(ud.Name, name) {
+			ud.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
+// RenameTSDictDuringRecovery is the discard-error recovery counterpart to
+// RenameTSDict, mirroring RenameTSConfigDuringRecovery. DU-002 ALTER TEXT
+// SEARCH DICTIONARY follow-up (M0119-0004).
+func (c *InMemory) RenameTSDictDuringRecovery(name, schema, newName string) {
+	_ = c.RenameTSDict(name, schema, newName)
+}
+
+// SetTSDictSchemaDuringRecovery is the discard-result recovery counterpart
+// to SetTSDictSchema, mirroring SetTSConfigSchemaDuringRecovery. DU-002
+// ALTER TEXT SEARCH DICTIONARY follow-up (M0119-0004).
+func (c *InMemory) SetTSDictSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetTSDictSchema(name, schema, newSchema)
+}
+
+// CreateTSConfig records a CREATE TEXT SEARCH CONFIGURATION in the runtime
+// pg_ts_config registry so pg_dump's getTSConfigurations / dumpTSConfig
+// re-emit it. `schema` is the (already-resolved) schema name the
+// configuration lives in; an unknown schema resolves to the public
+// namespace OID. Returns the new OID, or 0 with an error if a same-named
+// configuration already exists in the same namespace (PG enforces a unique
+// (cfgname, cfgnamespace)). DU-002 slice 446 (M0119-0004).
+func (c *InMemory) CreateTSConfig(uc *UserTSConfig, schema string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, existing := range c.userTSConfigs {
+		if existing.NamespaceOID == nsOID && strings.EqualFold(existing.Name, uc.Name) {
+			return 0, fmt.Errorf("text search configuration %q already exists", uc.Name)
+		}
+	}
+	uc.OID = c.allocOIDLocked()
+	uc.NamespaceOID = nsOID
+	c.userTSConfigs = append(c.userTSConfigs, uc)
+	return uc.OID, nil
+}
+
+// DropTSConfig removes the user-created text search configuration with the
+// given bare name in the given schema from the registry. Returns true if one
+// was found and removed. `schema` resolves like CreateTSConfig (unknown →
+// public). DU-002 slice 446.
+func (c *InMemory) DropTSConfig(name, schema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for i, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			c.userTSConfigs = append(c.userTSConfigs[:i], c.userTSConfigs[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// ListUserTSConfigs returns the user-created text search configurations in
+// creation order. DU-002 slice 446.
+func (c *InMemory) ListUserTSConfigs() []*UserTSConfig {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.userTSConfigs) == 0 {
+		return nil
+	}
+	out := make([]*UserTSConfig, len(c.userTSConfigs))
+	copy(out, c.userTSConfigs)
+	return out
+}
+
+// AddTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name ADD
+// MAPPING FOR tokenType WITH dictOIDs — appends one pg_ts_config_map entry.
+// mapseqno restarts at 1 for every plain ADD MAPPING call (MakeConfigurationMapping's
+// non-override insert path in tsearchcmds.c), so re-adding an already-mapped
+// token type collides with the existing seqno-1 row on the
+// (mapcfg, maptokentype, mapseqno) unique index — verified against real PG
+// 18.3, this raises a 23505 unique_violation, NOT the 42710 this slice's
+// original deferral-ledger row guessed. Returns the matched configuration
+// (nil if no configuration with the given schema-resolved name exists) and
+// whether tokenType already had a mapping entry (the caller must not append
+// in that case).
+// DU-002 slice 446 (M0119-0004).
+func (c *InMemory) AddTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig, duplicate bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			for _, m := range uc.Mappings {
+				if strings.EqualFold(m.TokenType, tokenType) {
+					return uc, true
+				}
+			}
+			// Defensive copy: execAlterTSConfigAddMapping reuses the same
+			// dictOIDs backing array across every token type named in a
+			// single multi-token ADD MAPPING FOR t1, t2 WITH d1, d2
+			// statement (one call per token type). Without copying here,
+			// the resulting TSConfigMapping entries alias one array, so an
+			// in-place mutation of one entry's DictOIDs (e.g.
+			// ReplaceTSConfigMappingDict) silently corrupts every sibling
+			// entry from the same statement. Found via the replacedict
+			// follow-up (M0119-0004).
+			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: append([]uint32(nil), dictOIDs...)})
+			return uc, false
+		}
+	}
+	return nil, false
+}
+
+// DropTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name DROP
+// MAPPING FOR tokenType — removes the pg_ts_config_map entry for tokenType,
+// mirroring DropConfigurationMapping in tsearchcmds.c. Returns the matched
+// configuration (nil if no configuration with the given schema-resolved name
+// exists) and whether a mapping for tokenType was found and removed.
+// DU-002 slice 446 follow-up (M0119-0004).
+func (c *InMemory) DropTSConfigMapping(name, schema, tokenType string) (cfg *UserTSConfig, found bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			for i, m := range uc.Mappings {
+				if strings.EqualFold(m.TokenType, tokenType) {
+					uc.Mappings = append(uc.Mappings[:i], uc.Mappings[i+1:]...)
+					return uc, true
+				}
+			}
+			return uc, false
+		}
+	}
+	return nil, false
+}
+
+// RenameTSConfig implements ALTER TEXT SEARCH CONFIGURATION name RENAME TO
+// newName, mirroring RenameCollation. DU-002 slice 446 follow-up
+// (M0119-0004).
+func (c *InMemory) RenameTSConfig(name, schema, newName string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	var target *UserTSConfig
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			target = uc
+			continue
+		}
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, newName) {
+			return fmt.Errorf("text search configuration %q already exists", newName)
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("text search configuration %q does not exist", name)
+	}
+	target.Name = newName
+	return nil
+}
+
+// SetTSConfigSchema implements ALTER TEXT SEARCH CONFIGURATION name SET
+// SCHEMA newSchema, mirroring SetCollationSchema. Returns false if no such
+// configuration is registered. DU-002 slice 446 follow-up (M0119-0004).
+func (c *InMemory) SetTSConfigSchema(name, schema, newSchema string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	newNsOID := c.schemas[strings.ToLower(newSchema)]
+	if newNsOID == 0 {
+		newNsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			uc.NamespaceOID = newNsOID
+			return true
+		}
+	}
+	return false
+}
+
+// AlterTSConfigMapping implements ALTER TEXT SEARCH CONFIGURATION name ALTER
+// MAPPING FOR tokenType WITH dictOIDs — replaces tokenType's entire mapping
+// entry with the new dictionary list wholesale, mirroring
+// MakeConfigurationMapping's override=true path in tsearchcmds.c (which
+// deletes any existing pg_ts_config_map rows for the token type before
+// inserting the new list). Unlike AddTSConfigMapping this never reports a
+// duplicate — overriding an already-mapped token type is the entire point of
+// this form, so there is no unique_violation to raise; if tokenType has no
+// existing entry yet, it is simply appended (same as ADD MAPPING would).
+// Returns the matched configuration (nil if no configuration with the given
+// schema-resolved name exists). DU-002 slice 446 follow-up (M0119-0004).
+func (c *InMemory) AlterTSConfigMapping(name, schema, tokenType string, dictOIDs []uint32) (cfg *UserTSConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID == nsOID && strings.EqualFold(uc.Name, name) {
+			newDicts := append([]uint32(nil), dictOIDs...)
+			for i, m := range uc.Mappings {
+				if strings.EqualFold(m.TokenType, tokenType) {
+					uc.Mappings[i].DictOIDs = newDicts
+					return uc
+				}
+			}
+			uc.Mappings = append(uc.Mappings, TSConfigMapping{TokenType: tokenType, DictOIDs: newDicts})
+			return uc
+		}
+	}
+	return nil
+}
+
+// AlterTSConfigMappingDuringRecovery is the discard-result recovery
+// counterpart to AlterTSConfigMapping, mirroring
+// ReplaceTSConfigMappingDictDuringRecovery. DU-002 slice 446 follow-up
+// (M0119-0004).
+func (c *InMemory) AlterTSConfigMappingDuringRecovery(name, schema, tokenType string, dictOIDs []uint32) {
+	c.AlterTSConfigMapping(name, schema, tokenType, dictOIDs)
+}
+
+// ReplaceTSConfigMappingDict implements ALTER TEXT SEARCH CONFIGURATION name
+// ALTER MAPPING [FOR tokenTypes [, ...]] REPLACE oldOID WITH newOID —
+// substitutes newOID for oldOID in every matched pg_ts_config_map entry,
+// mirroring MakeConfigurationMapping's replace path in tsearchcmds.c. An
+// empty tokenTypes means "match every mapped token type" (the bare REPLACE
+// form). Unlike AddTSConfigMapping/DropTSConfigMapping this never errors
+// when nothing matches — real PG's replace loop is an unconditional scan
+// with no missing-match check, so a REPLACE that touches zero rows silently
+// succeeds. Returns the matched configuration (nil if no configuration with
+// the given schema-resolved name exists) and whether any entry was actually
+// replaced. DU-002 replacedict follow-up (M0119-0004).
+func (c *InMemory) ReplaceTSConfigMappingDict(name, schema string, tokenTypes []string, oldOID, newOID uint32) (cfg *UserTSConfig, replaced bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	for _, uc := range c.userTSConfigs {
+		if uc.NamespaceOID != nsOID || !strings.EqualFold(uc.Name, name) {
+			continue
+		}
+		for mi := range uc.Mappings {
+			m := &uc.Mappings[mi]
+			if len(tokenTypes) > 0 {
+				matched := false
+				for _, tt := range tokenTypes {
+					if strings.EqualFold(m.TokenType, tt) {
+						matched = true
+						break
+					}
+				}
+				if !matched {
+					continue
+				}
+			}
+			for di, d := range m.DictOIDs {
+				if d == oldOID {
+					m.DictOIDs[di] = newOID
+					replaced = true
+				}
+			}
+		}
+		return uc, replaced
+	}
+	return nil, false
+}
+
+// ReplaceTSConfigMappingDictDuringRecovery is the discard-result recovery
+// counterpart to ReplaceTSConfigMappingDict, mirroring
+// AddTSConfigMappingDuringRecovery. DU-002 replacedict follow-up
+// (M0119-0004).
+func (c *InMemory) ReplaceTSConfigMappingDictDuringRecovery(name, schema string, tokenTypes []string, oldOID, newOID uint32) {
+	c.ReplaceTSConfigMappingDict(name, schema, tokenTypes, oldOID, newOID)
+}
+
+// CreateTSConfigDuringRecovery is the idempotent version of CreateTSConfig
+// used by the WAL-replay driver (internal/initdb/tsconfig_ddl_recovery.go).
+// Unlike CreateTSConfig it takes the OID from the WAL record and overwrites
+// rather than erroring when an entry with the same OID is already present.
+// Mirrors CreateTSDictDuringRecovery. DU-002 restart-persistence follow-up
+// to slice 446.
+func (c *InMemory) CreateTSConfigDuringRecovery(uc *UserTSConfig, schema string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	nsOID := c.schemas[strings.ToLower(schema)]
+	if nsOID == 0 {
+		nsOID = c.schemas["public"]
+	}
+	uc.NamespaceOID = nsOID
+	for i, existing := range c.userTSConfigs {
+		if existing.OID == uc.OID {
+			c.userTSConfigs[i] = uc
+			if uc.OID >= c.nextOID {
+				c.nextOID = uc.OID + 1
+			}
+			return
+		}
+	}
+	c.userTSConfigs = append(c.userTSConfigs, uc)
+	if uc.OID >= c.nextOID {
+		c.nextOID = uc.OID + 1
+	}
+}
+
+// AddTSConfigMappingDuringRecovery is the discard-result recovery
+// counterpart to AddTSConfigMapping, mirroring DropTSDictDuringRecovery.
+// DU-002 restart-persistence follow-up to slice 446.
+func (c *InMemory) AddTSConfigMappingDuringRecovery(name, schema, tokenType string, dictOIDs []uint32) {
+	c.AddTSConfigMapping(name, schema, tokenType, dictOIDs)
+}
+
+// DropTSConfigDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropTSConfig. DU-002 restart-persistence follow-up to
+// slice 446.
+func (c *InMemory) DropTSConfigDuringRecovery(name, schema string) {
+	c.DropTSConfig(name, schema)
+}
+
+// DropTSConfigMappingDuringRecovery is the discard-result recovery
+// counterpart to DropTSConfigMapping, mirroring AddTSConfigMappingDuringRecovery.
+// DU-002 restart-persistence follow-up to the slice 446 RENAME/SET
+// SCHEMA/DROP MAPPING follow-up.
+func (c *InMemory) DropTSConfigMappingDuringRecovery(name, schema, tokenType string) {
+	c.DropTSConfigMapping(name, schema, tokenType)
+}
+
+// RenameTSConfigDuringRecovery is the discard-error recovery counterpart to
+// RenameTSConfig, mirroring RenameCollationDuringRecovery. DU-002
+// restart-persistence follow-up to the slice 446 RENAME/SET SCHEMA/DROP
+// MAPPING follow-up.
+func (c *InMemory) RenameTSConfigDuringRecovery(name, schema, newName string) {
+	_ = c.RenameTSConfig(name, schema, newName)
+}
+
+// SetTSConfigSchemaDuringRecovery is the discard-result recovery counterpart
+// to SetTSConfigSchema. DU-002 restart-persistence follow-up to the slice
+// 446 RENAME/SET SCHEMA/DROP MAPPING follow-up.
+func (c *InMemory) SetTSConfigSchemaDuringRecovery(name, schema, newSchema string) {
+	c.SetTSConfigSchema(name, schema, newSchema)
+}
+
 // CollationAttrsByName resolves a collation's dump-relevant attributes
 // (provider, collate, ctype, locale, encoding, deterministic) by its bare name,
 // searching the built-in collations and then user-created ones. Used by
@@ -11736,11 +12944,30 @@ func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
 // (matching PostgreSQL, which retains the grant option until REVOKE GRANT
 // OPTION FOR). See the Catalog interface doc. DU-002 slice 332.
 func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool) {
+	c.GrantTablePrivilegeAs(relOID, role, priv, withGrantOption, aclOwnerRole)
+}
+
+// GrantTablePrivilegeAs is GrantTablePrivilegeWithGrantOption plus an explicit
+// grantor — the role that executed the GRANT (aclOwnerRole/"postgres" for the
+// common owner/superuser case, or a SET ROLE-impersonated role's name).
+// Recorded in tableACLGrantor so relaclTextLockedFor renders the true
+// "grantee=privs/grantor" aclitem instead of hardcoding the owner. A later
+// GRANT to the same grantee (with any grantor, including the default) always
+// overwrites the stored grantor — matching PostgreSQL, where re-granting
+// updates the existing aclitem's grantor to whoever issued that GRANT.
+// M0119-0004-ACLHEAP (grantor half).
+func (c *InMemory) GrantTablePrivilegeAs(relOID uint32, role, priv string, withGrantOption bool, grantor string) {
 	display := strings.TrimSpace(role)
 	role = strings.ToLower(display)
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
 		return
+	}
+	grantorDisplay := strings.TrimSpace(grantor)
+	grantor = strings.ToLower(grantorDisplay)
+	if grantor == "" {
+		grantor = aclOwnerRole
+		grantorDisplay = aclOwnerRole
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -11750,6 +12977,9 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 	// all-lowercase case needs no override. DU-002 slice 337.
 	if display != role {
 		c.roleACLDisplay[role] = display
+	}
+	if grantorDisplay != grantor {
+		c.roleACLDisplay[grantor] = grantorDisplay
 	}
 	// A GRANT to the owner re-materializes an explicit owner aclitem, so the
 	// owner is no longer the zero-privilege (absent) entry an earlier owner-side
@@ -11781,6 +13011,17 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 		}
 	}
 	privs[priv] = privs[priv] || withGrantOption
+	// Every GRANT to this grantee — even a repeat one carrying the default
+	// owner grantor — restamps the grantor: PostgreSQL's aclupdate updates an
+	// existing aclitem's grantor to whoever issued the latest GRANT.
+	if role != aclOwnerRole {
+		grantors := c.tableACLGrantor[relOID]
+		if grantors == nil {
+			grantors = make(map[string]string)
+			c.tableACLGrantor[relOID] = grantors
+		}
+		grantors[role] = grantor
+	}
 }
 
 // dropTableACLOrderRole removes role from relOID's grant-order list, keeping the
@@ -11827,6 +13068,12 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	if len(privs) == 0 {
 		delete(byRole, role)
 		c.dropTableACLOrderRole(relOID, role)
+		if grantors := c.tableACLGrantor[relOID]; grantors != nil {
+			delete(grantors, role)
+			if len(grantors) == 0 {
+				delete(c.tableACLGrantor, relOID)
+			}
+		}
 		if role == aclOwnerRole {
 			// The owner's implicit default aclitem has been fully revoked. Record
 			// this regardless of whether other grantees survive: an object whose
@@ -11867,11 +13114,27 @@ func (c *InMemory) GrantColumnPrivilege(relOID uint32, attNum int16, role, priv 
 // option flag, OR-ed in exactly as GrantTablePrivilegeWithGrantOption does (a
 // later plain GRANT does not clear a previously set option). M0119-0004-ACLHEAP.
 func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool) {
+	c.GrantColumnPrivilegeAs(relOID, attNum, role, priv, withGrantOption, aclOwnerRole)
+}
+
+// GrantColumnPrivilegeAs is GrantColumnPrivilegeWithGrantOption plus an
+// explicit grantor — the role that executed the GRANT (aclOwnerRole/"postgres"
+// for the common owner/superuser case, or a SET ROLE-impersonated role's
+// name). Recorded in attrACLGrantor so AttrACLText renders the true
+// "grantee=privs/grantor" aclitem instead of hardcoding the owner. The column
+// analogue of GrantTablePrivilegeAs. M0119-0004-ACLHEAP (attacl grantor half).
+func (c *InMemory) GrantColumnPrivilegeAs(relOID uint32, attNum int16, role, priv string, withGrantOption bool, grantor string) {
 	display := strings.TrimSpace(role)
 	role = strings.ToLower(display)
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
 		return
+	}
+	grantorDisplay := strings.TrimSpace(grantor)
+	grantor = strings.ToLower(grantorDisplay)
+	if grantor == "" {
+		grantor = aclOwnerRole
+		grantorDisplay = aclOwnerRole
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -11879,6 +13142,9 @@ func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int
 	// true name (shared with the relacl store; DU-002 slice 337).
 	if display != role {
 		c.roleACLDisplay[role] = display
+	}
+	if grantorDisplay != grantor {
+		c.roleACLDisplay[grantor] = grantorDisplay
 	}
 	key := attrACLKey{relOID: relOID, attNum: attNum}
 	byRole := c.attrACLs[key]
@@ -11893,6 +13159,15 @@ func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int
 		c.attrACLOrder[key] = append(c.attrACLOrder[key], role)
 	}
 	privs[priv] = privs[priv] || withGrantOption
+	// Every GRANT to this grantee — even a repeat one carrying the default
+	// owner grantor — restamps the grantor: PostgreSQL's aclupdate updates an
+	// existing aclitem's grantor to whoever issued the latest GRANT.
+	grantors := c.attrACLGrantor[key]
+	if grantors == nil {
+		grantors = make(map[string]string)
+		c.attrACLGrantor[key] = grantors
+	}
+	grantors[role] = grantor
 }
 
 // RevokeColumnPrivilege removes a single column-level priv for role on column
@@ -11932,10 +13207,17 @@ func (c *InMemory) RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv
 				delete(c.attrACLOrder, key)
 			}
 		}
+		if grantors := c.attrACLGrantor[key]; grantors != nil {
+			delete(grantors, role)
+			if len(grantors) == 0 {
+				delete(c.attrACLGrantor, key)
+			}
+		}
 	}
 	if len(byRole) == 0 {
 		delete(c.attrACLs, key)
 		delete(c.attrACLOrder, key)
+		delete(c.attrACLGrantor, key)
 	}
 }
 
@@ -11996,6 +13278,7 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
+	delete(c.tableACLGrantor, relOID)
 	delete(c.tableACLOrder, relOID)
 	delete(c.relACLEmptied, relOID)
 	delete(c.relACLOwnerRevoked, relOID)
@@ -12350,6 +13633,17 @@ func (c *InMemory) relaclTextLocked(relOID uint32) string {
 	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString)
 }
 
+// RelaclText renders the materialized pg_class.relacl text for the table
+// identified by relOID, or "" (SQL NULL) when no privileges have been granted
+// away. Exported for callers outside the virtual pg_class row builder (which
+// calls relaclTextLocked directly while already holding c.mu), such as tests
+// that need to inspect relacl without executing a full pg_class SELECT.
+func (c *InMemory) RelaclText(relOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLocked(relOID)
+}
+
 // relaclTextLockedSeq is relaclTextLocked for a sequence (relkind 'S'): it
 // renders with the sequence privilege order (USAGE/SELECT/UPDATE) and the
 // sequence owner-default string "rwU", which is what pg_dump diffs against via
@@ -12461,7 +13755,7 @@ func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
 		if letters == "" {
 			continue // role holds only non-column privileges
 		}
-		// PUBLIC renders as an empty grantee ("=<privs>/postgres"); a mixed-case
+		// PUBLIC renders as an empty grantee ("=<privs>/grantor"); a mixed-case
 		// role restores its original spelling; an unsafe name is double-quoted —
 		// identical to relaclTextLockedFor's grantee handling.
 		grantee := role
@@ -12470,7 +13764,17 @@ func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
 		} else if disp, ok := c.roleACLDisplay[role]; ok {
 			grantee = disp
 		}
-		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+		// The grantor defaults to the object owner absent an explicit stamp —
+		// identical fallback to relaclTextLockedFor's grantor handling.
+		// M0119-0004-ACLHEAP (attacl grantor half).
+		grantor := aclOwnerRole
+		if g, ok := c.attrACLGrantor[key][role]; ok && g != "" {
+			grantor = g
+		}
+		if disp, ok := c.roleACLDisplay[grantor]; ok {
+			grantor = disp
+		}
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/"+aclQuoteName(grantor))
 	}
 	return "{" + strings.Join(items, ",") + "}"
 }
@@ -12575,7 +13879,14 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		// parser stops at the first unsafe char and mis-reads the grantee. The
 		// empty PUBLIC grantee and the all-alnum common case are returned
 		// unchanged. DU-002 slice 336.
-		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+		grantor := aclOwnerRole
+		if g, ok := c.tableACLGrantor[relOID][role]; ok && g != "" {
+			grantor = g
+		}
+		if disp, ok := c.roleACLDisplay[grantor]; ok {
+			grantor = disp
+		}
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/"+aclQuoteName(grantor))
 	}
 	return "{" + strings.Join(items, ",") + "}"
 }
@@ -15418,6 +16729,10 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 	return out
 }
 
+// QuoteCollationIdent is the exported form of quoteCollationIdent, for callers
+// outside this package (e.g. the planner's pg_collation_for fold, M0122-0005).
+func QuoteCollationIdent(s string) string { return quoteCollationIdent(s) }
+
 // BuildIndexDef reconstructs the CREATE INDEX DDL string for an index.
 // Used by pg_indexes.indexdef and pg_get_indexdef(). M0097-0023.
 // quoteCollationIdent renders a collation name the way ruleutils.c
@@ -16360,6 +17675,47 @@ func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
 	return true
 }
 
+// RenameRangeType renames a range type from oldName to newName, mirroring
+// RenameCompositeType/RenameEnum. `ALTER TYPE ... RENAME TO` previously always
+// dispatched to RenameEnum regardless of kind, so renaming a range type raised
+// a spurious "type does not exist" (42710) instead of renaming it — the same
+// dispatch-by-kind gap RenameCompositeType closed for composite types. The
+// auto-generated multirange name is left untouched (it is a distinct pg_type
+// row with its own name, unaffected by renaming the range type itself, mirroring
+// real PostgreSQL). M0122-0005 (range-type follow-up).
+func (c *InMemory) RenameRangeType(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt, found := c.rangeTypes[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.rangeTypes[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.rangeTypes, ok)
+	rt.Name = nk
+	c.rangeTypes[nk] = rt
+	return nil
+}
+
+// SetRangeTypeOwner records the typowner role OID for an existing range type.
+// Returns false if no such range type is registered. Mirrors
+// SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (range-type follow-up).
+func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt, ok := c.rangeTypes[k]
+	if !ok {
+		return false
+	}
+	rt.Owner = ownerOID
+	return true
+}
+
 // AddEnumValue appends a new label to an existing enum. before/after are
 // reference labels (empty = append at end). Returns an error if label already
 // exists unless ifNotExists is true, in which case it is a no-op (returns nil).
@@ -17032,6 +18388,20 @@ func (c *InMemory) RegisterRangeTypeDuringRecovery(rt *RangeType) {
 	c.advanceNextOIDLocked(rt.MultirangeArrayOID)
 }
 
+// RenameRangeTypeDuringRecovery is the idempotent version of RenameRangeType
+// for WAL replay, mirroring RenameCollationDuringRecovery. M0122-0005
+// restart-persistence follow-up.
+func (c *InMemory) RenameRangeTypeDuringRecovery(oldName, newName string) {
+	_ = c.RenameRangeType(oldName, newName)
+}
+
+// SetRangeTypeOwnerDuringRecovery is the idempotent version of
+// SetRangeTypeOwner for WAL replay, mirroring SetCollationOwnerDuringRecovery.
+// M0122-0005 restart-persistence follow-up.
+func (c *InMemory) SetRangeTypeOwnerDuringRecovery(name string, ownerOID uint32) {
+	c.SetRangeTypeOwner(name, ownerOID)
+}
+
 // DropRangeTypeDuringRecovery is the idempotent counterpart used for
 // replaying RecordKindDropRangeType. Identical to DropRangeType but discards
 // the found/not-found result — replay does not care whether the range type
@@ -17100,6 +18470,38 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain
 	return d, nil
 }
 
+// RegisterDomainDuringRecovery re-registers a domain (including every CHECK
+// constraint) reconstructed from a RecordKindCreateDomain WAL record,
+// preserving its original OID/ArrayOID/CHECK OIDs and advancing nextOID past
+// them so subsequent allocations don't collide. Mirrors
+// RegisterRangeTypeDuringRecovery. M0122-0005 restart-persistence follow-up.
+func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.domains == nil {
+		c.domains = make(map[string]*Domain)
+	}
+	out := *d
+	c.domains[strings.ToLower(d.Name)] = &out
+	c.advanceNextOIDLocked(d.OID)
+	c.advanceNextOIDLocked(d.ArrayOID)
+	for _, chk := range d.Checks {
+		c.advanceNextOIDLocked(chk.OID)
+	}
+}
+
+// DropDomainDuringRecovery removes a domain reconstructed during WAL replay,
+// mirroring DropRangeTypeDuringRecovery. Unlike the live DropDomain path, it
+// does not scan for or cascade to dependent tables — a WAL replay drop
+// record is only ever emitted after the live DROP DOMAIN already succeeded
+// (and any CASCADE-dropped tables have their own drop records), so re-running
+// that dependency check here is unnecessary.
+func (c *InMemory) DropDomainDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.domains, strings.ToLower(name))
+}
+
 // AddDomainCheck appends a CHECK constraint to a domain and allocates its
 // pg_constraint OID. expr is the conbin source text (the deparsed predicate);
 // inValues is non-nil for the `CHECK (VALUE IN (...))` form. No-op when expr is
@@ -17114,6 +18516,12 @@ func (c *InMemory) AddDomainCheck(d *Domain, name, expr string, inValues []strin
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.addDomainCheckLocked(d, name, expr, inValues)
+}
+
+// addDomainCheckLocked is the shared body of AddDomainCheck/AddDomainConstraint.
+// Caller holds c.mu.
+func (c *InMemory) addDomainCheckLocked(d *Domain, name, expr string, inValues []string) {
 	if name == "" {
 		base := d.Name + "_check"
 		name = base
@@ -17128,6 +18536,58 @@ func (c *InMemory) AddDomainCheck(d *Domain, name, expr string, inValues []strin
 		InValues: inValues,
 	})
 	c.nextOID++
+}
+
+// AddDomainConstraint adds a named CHECK constraint to an already-registered
+// domain (`ALTER DOMAIN name ADD [CONSTRAINT name] CHECK (expr)`), mirroring
+// AlterDomainAddConstraint's domainAddCheckConstraint call: an explicit name
+// colliding with an existing CHECK on the same domain is a duplicate-object
+// error, matching real PG's `constraint "%s" for domain "%s" already exists`
+// (typecmds.c); an unnamed constraint gets the same `<domain>_check`/
+// `_check1`/... auto-naming AddDomainCheck already does. Existing-column-data
+// validation (real PG's `!skip_validation` scan of every table column typed
+// with this domain) is not performed — see deferral ledger. M0122-0005 domain
+// follow-up (ADD CONSTRAINT).
+func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues []string) error {
+	k := strings.ToLower(domainName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", domainName)
+	}
+	if name != "" && c.domainCheckNameTaken(d, name) {
+		return fmt.Errorf("constraint %q for domain %q already exists", name, d.Name)
+	}
+	c.addDomainCheckLocked(d, name, expr, inValues)
+	return nil
+}
+
+// DropDomainConstraint removes a named CHECK constraint from an existing
+// domain (`ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] name [RESTRICT |
+// CASCADE]`), mirroring AlterDomainDropConstraint. ifExists suppresses the
+// "constraint does not exist" error into a silent no-op, matching DropDomain's
+// own ifExists convention (goopg's catalog layer has no per-command NOTICE
+// channel to emit real PG's "skipping" notice through instead). M0122-0005
+// domain follow-up (DROP CONSTRAINT).
+func (c *InMemory) DropDomainConstraint(domainName, constrName string, ifExists bool) error {
+	k := strings.ToLower(domainName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", domainName)
+	}
+	for i, ck := range d.Checks {
+		if ck.Name == constrName {
+			d.Checks = append(d.Checks[:i], d.Checks[i+1:]...)
+			return nil
+		}
+	}
+	if ifExists {
+		return nil
+	}
+	return fmt.Errorf("constraint %q of domain %q does not exist", constrName, d.Name)
 }
 
 // domainCheckNameTaken reports whether the domain already has a CHECK with the
@@ -17189,6 +18649,116 @@ func (c *InMemory) LookupDomainByArrayOID(oid uint32) (*Domain, bool) {
 		}
 	}
 	return nil, false
+}
+
+// RenameDomain renames a domain from oldName to newName, mirroring
+// RenameRangeType/RenameCompositeType/RenameEnum. M0122-0005 (domain
+// follow-up).
+func (c *InMemory) RenameDomain(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, found := c.domains[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.domains[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.domains, ok)
+	d.Name = nk
+	c.domains[nk] = d
+	return nil
+}
+
+// RenameDomainConstraint renames one of a domain's CHECK constraints
+// (`ALTER DOMAIN name RENAME CONSTRAINT old TO new`), mirroring real PG's
+// rename_constraint_internal's domain branch (get_domain_constraint_oid +
+// RenameConstraintById): "constraint %q for domain %s does not exist" when
+// oldName isn't found (also covers an unknown domain), "constraint %q for
+// domain %s already exists" when newName collides with another CHECK already
+// on the same domain. M0122-0005 domain follow-up (RENAME CONSTRAINT).
+func (c *InMemory) RenameDomainConstraint(domainName, oldName, newName string) error {
+	k := strings.ToLower(domainName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return fmt.Errorf("constraint %q for domain %s does not exist", oldName, domainName)
+	}
+	idx := -1
+	for i, ck := range d.Checks {
+		if ck.Name == oldName {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		return fmt.Errorf("constraint %q for domain %s does not exist", oldName, d.Name)
+	}
+	if oldName != newName {
+		for _, ck := range d.Checks {
+			if ck.Name == newName {
+				return fmt.Errorf("constraint %q for domain %s already exists", newName, d.Name)
+			}
+		}
+	}
+	d.Checks[idx].Name = newName
+	return nil
+}
+
+// SetDomainOwner records the typowner role OID for an existing domain.
+// Returns false if no such domain is registered. Mirrors
+// SetRangeTypeOwner/SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (domain
+// follow-up).
+func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return false
+	}
+	d.Owner = ownerOID
+	return true
+}
+
+// SetDomainDefault sets or clears an existing domain's DEFAULT expression
+// (`ALTER DOMAIN name SET DEFAULT expr` / `ALTER DOMAIN name DROP DEFAULT`,
+// the latter passing a nil expr), mirroring AlterDomainDefault. Returns false
+// if no such domain is registered. M0122-0005 domain follow-up (SET/DROP
+// DEFAULT).
+func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return false
+	}
+	d.Default = expr
+	return true
+}
+
+// SetDomainNotNull sets or clears a domain's NOT NULL flag (`ALTER DOMAIN
+// name SET NOT NULL` / `DROP NOT NULL`), mirroring AlterDomainNotNull.
+// Returns false if no such domain is registered. Unlike real PG's
+// AlterDomainNotNull, SET NOT NULL does not scan existing table columns of
+// this domain type for NULL values already present (validateDomainNotNull
+// Constraint's cross-table walk) — the same simplification goopg's
+// ALTER TABLE ... SET NOT NULL already makes for plain columns. M0122-0005
+// domain follow-up (SET/DROP NOT NULL).
+func (c *InMemory) SetDomainNotNull(name string, notNull bool) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return false
+	}
+	d.NotNull = notNull
+	return true
 }
 
 // TablesWithColumnOfType returns all non-virtual tables that have at least one

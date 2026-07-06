@@ -50,8 +50,16 @@ func normalizeDatabasePriv(priv string) []string {
 // detectCatalogDBOID) — GRANT ON DATABASE naming any OTHER database name (a
 // legitimately different db in real multi-database PG) is a silent no-op,
 // mirroring persistDatFrozenXID's identical "v0 scope: only the live
-// database's row" restriction. M0119-0004-ACLHEAP (datacl half).
+// database's row" restriction. The grantor stamped on each grant is the
+// session's current effective role (o.ctx.NonSuperuserRole, empty meaning the
+// bootstrap superuser), mirroring tryRecordTableGrant's/execTypeACLChange's
+// grantor attribution — datacl shares the same tableACLs/tableACLGrantor
+// store via relaclTextLockedFor, so no separate grantor map was needed here.
+// M0119-0004-ACLHEAP (datacl half).
 func (o *ddlOp) execDatabaseACLChange(dc *parser.DatabaseACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, dc.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil
@@ -103,7 +111,7 @@ func (o *ddlOp) execDatabaseACLChange(dc *parser.DatabaseACLChange) error {
 		}
 		for _, role := range dc.Grantees {
 			for _, p := range privs {
-				im.GrantTablePrivilegeWithGrantOption(dbOid, role, p, dc.WithGrantOption)
+				im.GrantTablePrivilegeAs(dbOid, role, p, dc.WithGrantOption, o.ctx.NonSuperuserRole)
 			}
 		}
 	}

@@ -45,6 +45,20 @@ type nodeStats struct {
 	bufHit, bufRead, bufDirtied, bufWritten                 int64
 	bufBaseHit, bufBaseRead, bufBaseDirtied, bufBaseWritten int64
 	bufSeeded                                               bool
+
+	// bufReadTimeNs / bufWriteTimeNs are the cumulative real wall-clock
+	// nanoseconds EXPLAIN (ANALYZE, BUFFERS)'s "I/O Timings:" line
+	// attributes to this node, diffed the same nested-stopwatch way as
+	// bufHit/bufRead above. bufWriteTimeNs folds storage.Pool's extend
+	// time in alongside write time, mirroring upstream's
+	// pgstat_count_io_op_time (postgres/src/backend/utils/activity/
+	// pgstat_io.c), which buckets IOOP_EXTEND under
+	// pgstat_count_buffer_write_time / shared_blk_write_time — EXPLAIN has
+	// no separate "extend=" term. Both stay zero when track_io_timing is
+	// off (the Pool accumulators never advance), so no extra gate is
+	// needed beyond the nonzero check formatIOTimingsLine already does.
+	bufReadTimeNs, bufWriteTimeNs         int64
+	bufBaseReadTimeNs, bufBaseWriteTimeNs int64
 }
 
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
@@ -75,6 +89,8 @@ func (o *instrumentedOp) Open(ctx *Context) error {
 		o.pool = ctx.Pool
 		if !o.stats.bufSeeded {
 			o.stats.bufBaseHit, o.stats.bufBaseRead, o.stats.bufBaseDirtied, o.stats.bufBaseWritten = o.pool.BufferCounters()
+			o.stats.bufBaseReadTimeNs = o.pool.ReadTimeNanos()
+			o.stats.bufBaseWriteTimeNs = o.pool.WriteTimeNanos() + o.pool.ExtendTimeNanos()
 			o.stats.bufSeeded = true
 		}
 	}
@@ -103,6 +119,12 @@ func (o *instrumentedOp) accountBuffers() {
 	o.stats.bufWritten += written - o.stats.bufBaseWritten
 	o.stats.bufBaseHit, o.stats.bufBaseRead = hit, read
 	o.stats.bufBaseDirtied, o.stats.bufBaseWritten = dirtied, written
+
+	readTimeNs := o.pool.ReadTimeNanos()
+	writeTimeNs := o.pool.WriteTimeNanos() + o.pool.ExtendTimeNanos()
+	o.stats.bufReadTimeNs += readTimeNs - o.stats.bufBaseReadTimeNs
+	o.stats.bufWriteTimeNs += writeTimeNs - o.stats.bufBaseWriteTimeNs
+	o.stats.bufBaseReadTimeNs, o.stats.bufBaseWriteTimeNs = readTimeNs, writeTimeNs
 }
 
 // Next records the per-row delta into the running total and
@@ -147,6 +169,22 @@ func (o *instrumentedOp) RowsAffected() int64 {
 		return rc.RowsAffected()
 	}
 	return 0
+}
+
+// instrumentScopeCarrier is implemented by operators whose child-plan
+// Build() calls happen lazily, inside their own Open(), rather than
+// during the original Build() dispatch that constructed them (e.g.
+// cteDMLPrefixOp — see operators_cte_dml.go). By the time such an
+// Open() runs, withInstrumentation's deferred restore has already put
+// the package-global instrumentScope back to its outer value (often
+// nil, once the top-level EXPLAIN ANALYZE Build() call has returned),
+// so a nested Build() call from inside Open() would see no active
+// scope and skip wrapping entirely — the nested nodes would report
+// plan-only estimates with no actual rows/time. maybeInstrument hands
+// such operators the instrumenter active on their OWN Build() call so
+// they can reinstate it (save/restore) around their nested Build()s.
+type instrumentScopeCarrier interface {
+	setInstrumentScope(*instrumenter)
 }
 
 // heapFetchCounter is implemented by operators that fetch heap tuples
@@ -211,6 +249,9 @@ func maybeInstrument(plan planner.Node, op Operator) Operator {
 	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)
 	if hf, ok := op.(heapFetchCounter); ok {
 		hf.setHeapFetchCounter(&stats.heapFetches)
+	}
+	if sc, ok := op.(instrumentScopeCarrier); ok {
+		sc.setInstrumentScope(instrumentScope)
 	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
 }

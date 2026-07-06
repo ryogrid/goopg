@@ -10,12 +10,13 @@ import (
 // grant-option flag. M0119-0004-ACLHEAP (parameter ACL half).
 func TestParseGrantParameterACL(t *testing.T) {
 	cases := []struct {
-		sql        string
-		wantRevoke bool
-		wantPrivs  []string
-		wantNames  []string
-		wantRoles  []string
-		wantWGO    bool
+		sql           string
+		wantRevoke    bool
+		wantPrivs     []string
+		wantNames     []string
+		wantRoles     []string
+		wantWGO       bool
+		wantGrantedBy string
 	}{
 		{
 			sql:       "GRANT SET ON PARAMETER work_mem TO r",
@@ -83,10 +84,19 @@ func TestParseGrantParameterACL(t *testing.T) {
 			wantRoles:  []string{"r"},
 		},
 		{
-			sql:       "GRANT SET ON PARAMETER work_mem TO r GRANTED BY postgres",
-			wantPrivs: []string{"SET"},
-			wantNames: []string{"work_mem"},
-			wantRoles: []string{"r"},
+			sql:           "GRANT SET ON PARAMETER work_mem TO r GRANTED BY postgres",
+			wantPrivs:     []string{"SET"},
+			wantNames:     []string{"work_mem"},
+			wantRoles:     []string{"r"},
+			wantGrantedBy: "postgres",
+		},
+		{
+			sql:           "GRANT SET ON PARAMETER work_mem TO r WITH GRANT OPTION GRANTED BY postgres",
+			wantPrivs:     []string{"SET"},
+			wantNames:     []string{"work_mem"},
+			wantRoles:     []string{"r"},
+			wantWGO:       true,
+			wantGrantedBy: "postgres",
 		},
 		// A mixed-case GUC name must be folded to lower case, mirroring
 		// convert_GUC_name_for_parameter_acl.
@@ -115,6 +125,9 @@ func TestParseGrantParameterACL(t *testing.T) {
 		}
 		if got.WithGrantOption != tc.wantWGO {
 			t.Errorf("%q: WithGrantOption = %v, want %v", tc.sql, got.WithGrantOption, tc.wantWGO)
+		}
+		if got.GrantedBy != tc.wantGrantedBy {
+			t.Errorf("%q: GrantedBy = %q, want %q", tc.sql, got.GrantedBy, tc.wantGrantedBy)
 		}
 		if !eqStrs(got.Privileges, tc.wantPrivs) {
 			t.Errorf("%q: Privileges = %v, want %v", tc.sql, got.Privileges, tc.wantPrivs)

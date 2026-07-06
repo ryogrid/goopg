@@ -184,6 +184,18 @@ type OpenOptions struct {
 	// bgwriter_lru_maxpages GUC.
 	BgwriterMaxPages int
 
+	// CheckpointFlushAfter / BgwriterFlushAfter / BackendFlushAfter set
+	// each context's pg_stat_io writeback threshold, in BLCKSZ pages (0
+	// disables writeback for that context — see storage/writeback.go).
+	// Mirror upstream's checkpoint_flush_after / bgwriter_flush_after /
+	// backend_flush_after GUCs; like BgwriterMaxPages above, a caller
+	// that leaves these at the Go zero value gets writeback disabled
+	// (cmd/goopg always passes the live GUC value, whose own registered
+	// default is checkpoint=32/bgwriter=64/backend=0).
+	CheckpointFlushAfter int
+	BgwriterFlushAfter   int
+	BackendFlushAfter    int
+
 	// TrackIOTiming gates the per-I/O activity.LookupGoroutine
 	// wait-event hooks (BufferPin / DataFileRead / Write / Extend
 	// / Sync / AIO). Default false (matches upstream PG's
@@ -654,6 +666,86 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			pool.AddExtendTimeNanos(int64(d))
 		}
 	}
+	// writeback's OnFlushWait/OnFlushDone analogues, one per context
+	// (M0122-0003 pg_stat_io follow-up: writeback/writeback_time). All
+	// three contexts now share the identical act.LookupTrackedGoroutine()
+	// → WaitEventStart/WaitEventEnd pattern: bgwriter and checkpointer are
+	// registered background slots (BgwriterIdx/CheckpointerIdx below;
+	// checkpointerProcNum above) with their TrackIOTiming bit seeded once
+	// from the boot-time GUC value at registration (background workers
+	// have no per-session SET semantics to react to, unlike a client
+	// backend), so the gate reduces to the same boot-time value the
+	// previous plain time.Now()/time.Since pair used — but now backed by
+	// the real activity-registry wait-event clock, which also makes their
+	// writeback wait visible in pg_stat_activity (writeback simplification
+	// 3, resolved: see deferral ledger).
+	pool.OnBackendWritebackWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnBackendWritebackDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddBackendWritebackTimeNanos(int64(d))
+		}
+	}
+	pool.OnBgwriterWritebackWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnBgwriterWritebackDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddBgwriterWritebackTimeNanos(int64(d))
+		}
+	}
+	pool.OnCheckpointerWritebackWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnCheckpointerWritebackDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddCheckpointWritebackTimeNanos(int64(d))
+		}
+	}
+	// write_time's OnCheckpointerWritebackWait/Done analogue: brackets
+	// flushBatch's real dirty-page AIO write (M0122-0003 writeback
+	// simplification (4), closed: checkpointer/bgwriter writes/write_bytes/
+	// write_time cells were an honest 0; now real counters, same
+	// LookupTrackedGoroutine pattern as every other On* pair above).
+	pool.OnCheckpointerWriteWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnCheckpointerWriteDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddCheckpointWriteTimeNanos(int64(d))
+		}
+	}
+	pool.OnBgwriterWriteWait = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			reg.WaitEventStart(procNum, activity.WaitTypeIO, activity.WaitDataFileWrite)
+		}
+	}
+	pool.OnBgwriterWriteDone = func() {
+		if reg, procNum, ok := act.LookupTrackedGoroutine(); ok {
+			d := reg.WaitEventEnd(procNum)
+			pool.AddBgwriterWriteTimeNanos(int64(d))
+		}
+	}
+	pool.SetCheckpointFlushAfter(opts.CheckpointFlushAfter)
+	pool.SetBgwriterFlushAfter(opts.BgwriterFlushAfter)
+	pool.SetBackendFlushAfter(opts.BackendFlushAfter)
+	// backend_flush_after is PGC_USERSET upstream: a connected backend's
+	// own `SET backend_flush_after` takes precedence over the process-wide
+	// default above (M0122-0003 writeback follow-up).
+	pool.BackendFlushAfterOverride = act.BackendFlushAfterOverride
 	if opts.TrackIOTiming {
 		act.EnableTrackIOTimingFastPath()
 	}
@@ -1004,6 +1096,24 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: conversion DDL replay: %w", err)
 	}
+	// DU-002 restart-persistence follow-up: restore CREATE/DROP TEXT SEARCH
+	// DICTIONARY objects (pg_ts_dict) and CREATE/ADD MAPPING/DROP TEXT
+	// SEARCH CONFIGURATION objects (pg_ts_config/pg_ts_config_map) from the
+	// WAL the same way. Like conversion/collation, both are schema-scoped
+	// (keyed by namespace OID + name), so this must run after
+	// replaySchemaDDLRecords above has repopulated the schema OID map.
+	if err := replayTSDictDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: text search dictionary DDL replay: %w", err)
+	}
+	if err := replayTSConfigDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: text search configuration DDL replay: %w", err)
+	}
 	// DU-002 restart-persistence follow-up: restore CREATE/DROP COLLATION
 	// objects (pg_collation) from the WAL the same way. Like a conversion, a
 	// collation is schema-scoped (keyed by namespace OID + name), so this
@@ -1332,11 +1442,37 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	syncRep := wal.NewSyncRep()
 
 	defaultGUC := wal.DefaultGUCParameters()
+	// Pre-register the checkpointer background slot (M0122-0003 writeback
+	// simplification 3 follow-up) so Run's OnLoopStart/OnLoopEnd hooks below
+	// can track its goroutine identity the same way walProcNum tracks the
+	// WAL writer's. TrackIOTiming is seeded once from the boot-time GUC and
+	// never updated afterward: unlike a client backend, a background
+	// worker has no per-session `SET track_io_timing` to react to.
+	//
+	// Previously cmd/goopg/main.go registered a "cp-0" backend via
+	// act.Register (the regular, numeric-PID-keyed path), which silently
+	// collided with walProcNum: procNumForPID treats every non-numeric PID
+	// as bgBase, the exact slot RegisterBackground(WalWriterIdx, ...)
+	// above already claims, so the checkpointer's Register call was
+	// clobbering the WAL writer's activitySlot. RegisterBackground(
+	// CheckpointerIdx, ...) claims its own reserved slot instead.
+	checkpointerProcNum := act.RegisterBackground(activity.CheckpointerIdx, &activity.Backend{
+		PID:         "cp-0",
+		BackendType: "checkpointer",
+		State:       "active",
+	})
+	act.UpdateTrackIOTiming(checkpointerProcNum, opts.TrackIOTiming)
 	cp := wal.NewCheckpointer(pool, walWriter, wal.CheckpointerConfig{
 		DataDir:             abs,
 		SegmentSize:         walCfg.SegmentSize,
 		GUCParams:           defaultGUC,
 		PGCompatCheckpoints: true,
+		OnLoopStart: func() {
+			activity.SetCurrentGoroutine(act, checkpointerProcNum)
+		},
+		OnLoopEnd: func() {
+			activity.ClearCurrentGoroutine()
+		},
 		// M0106-0010 batched-45: refresh checkPointCopy.nextXid into
 		// pg_control at every checkpoint from the live mvcc manager.
 		// batched-47: DataDir above was previously unset on the runtime
@@ -1602,6 +1738,17 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: range type DDL replay: %w", err)
 	}
 
+	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06
+	// row: "domains have no restart persistence at all"): restore CREATE/DROP
+	// DOMAIN objects from the WAL. Like range types, domains are keyed by a
+	// plain name string, so order relative to schema replay does not matter.
+	if err := replayDomainDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: domain DDL replay: %w", err)
+	}
+
 	// DU-002 restart-persistence follow-up (M0119-0004/M0110-0001,
 	// discovered while verifying the loop #64 CREATE TYPE ... AS RANGE
 	// opclass/collation follow-up — see ledger): restore CREATE/DROP
@@ -1732,8 +1879,20 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			}
 		}
 		walWriter.OnWALSyncDone = func() {
-			if act != nil {
-				act.WaitEventEnd(walProcNum)
+			if act == nil {
+				return
+			}
+			d := act.WaitEventEnd(walProcNum)
+			// fsync_time (pg_stat_io): FlushUpTo runs synchronously on the
+			// calling backend's own goroutine (SetCurrentGoroutine was
+			// called for it at connection setup — server.go), so
+			// LookupTrackedGoroutine correctly reports *that backend's*
+			// own track_io_timing setting, unlike walProcNum above (a
+			// fixed background slot shared by every committing backend,
+			// only suitable for the wait_event display, not per-session
+			// gating). Mirrors storage.Pool's OnPinDone gating exactly.
+			if _, _, ok := act.LookupTrackedGoroutine(); ok {
+				walWriter.AddFsyncTimeNanos(int64(d))
 			}
 		}
 	}
@@ -1847,6 +2006,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// dirty buffer-pool pages so eviction rarely needs synchronous I/O.
 	if opts.BgwriterDelay > 0 && opts.BgwriterMaxPages > 0 {
 		rt.bgwriter = storage.NewBgwriter(pool, opts.BgwriterDelay, opts.BgwriterMaxPages)
+		// Pre-register the bgwriter background slot (M0122-0003 writeback
+		// simplification 3 follow-up) so OnLoopStart/OnLoopEnd below can
+		// track its goroutine identity the same way walProcNum/
+		// checkpointerProcNum track theirs. TrackIOTiming is seeded once
+		// from the boot-time GUC — a background worker has no
+		// per-session `SET track_io_timing` to react to.
+		bgwriterProcNum := act.RegisterBackground(activity.BgwriterIdx, &activity.Backend{
+			PID: "bgwriter-0",
+			// "background writer" (with a space) matches upstream's
+			// pg_stat_activity.backend_type / pg_stat_io backend_type
+			// literal for this process (see pgstat_io.go's
+			// ioBackendTypeNames).
+			BackendType: "background writer",
+			State:       "active",
+		})
+		act.UpdateTrackIOTiming(bgwriterProcNum, opts.TrackIOTiming)
+		rt.bgwriter.OnLoopStart = func() {
+			activity.SetCurrentGoroutine(act, bgwriterProcNum)
+		}
+		rt.bgwriter.OnLoopEnd = func() {
+			activity.ClearCurrentGoroutine()
+		}
 		rt.bgwriter.Start()
 	}
 

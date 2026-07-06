@@ -15,10 +15,32 @@ type cteDMLPrefixOp struct {
 	plan  *planner.CTEDMLPrefix
 	ctx   *Context
 	inner Operator // outer query operator
+
+	// scope is the instrumenter active on this op's own Build() call,
+	// handed over by maybeInstrument (instrumentScopeCarrier). The DML
+	// plans and the outer body below are only Build() at Open() time —
+	// after the top-level withInstrumentation() call has already
+	// restored the package-global instrumentScope — so Open()
+	// reinstates it around each nested Build() to keep those nodes
+	// under EXPLAIN ANALYZE's instrumentation.
+	scope *instrumenter
 }
 
 func newCTEDMLPrefixOp(p *planner.CTEDMLPrefix) *cteDMLPrefixOp {
 	return &cteDMLPrefixOp{plan: p}
+}
+
+func (o *cteDMLPrefixOp) setInstrumentScope(s *instrumenter) { o.scope = s }
+
+// buildUnderScope runs Build(n) with the package-global instrumentScope
+// temporarily set to o.scope, so maybeInstrument wraps n's operator (and
+// records its stats in the same nodeStatsTable the EXPLAIN renderer
+// reads) exactly as if it had been Build() during the original dispatch.
+func (o *cteDMLPrefixOp) buildUnderScope(n planner.Node) (Operator, error) {
+	prev := instrumentScope
+	instrumentScope = o.scope
+	defer func() { instrumentScope = prev }()
+	return Build(n)
 }
 
 func (o *cteDMLPrefixOp) Schema() planner.Schema { return o.plan.Body.Output() }
@@ -43,7 +65,7 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 
 	// Execute each DML CTE in order, collecting RETURNING rows.
 	for i, dml := range o.plan.DMls {
-		op, err := Build(dml)
+		op, err := o.buildUnderScope(dml)
 		if err != nil {
 			ctx.InDMLCTE = false
 			ctx.Snap = savedSnap
@@ -84,7 +106,7 @@ func (o *cteDMLPrefixOp) Open(ctx *Context) error {
 	ctx.Snap = savedSnap
 
 	// Now build and open the outer query plan.
-	inner, err := Build(o.plan.Body)
+	inner, err := o.buildUnderScope(o.plan.Body)
 	if err != nil {
 		return err
 	}

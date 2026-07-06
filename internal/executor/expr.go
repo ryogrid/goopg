@@ -639,7 +639,7 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if name := oidToBuiltinTypeName(uint32(oid)); name != "" {
 						return NewStringDatum(name), nil
 					}
-					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid)); ok {
+					if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(oid), !regObjectSchemaVisible(ctx, "public")); ok {
 						return NewStringDatum(uname), nil
 					}
 					return NewStringDatum(typName), nil
@@ -665,10 +665,12 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				// only knows PG's static OIDs, so resolve it here — previously
 				// this rendered the bare numeric OID (e.g. `atttypid::regtype`
 				// for a range-typed column showed "16422" instead of
-				// "myrange"), diverging from PG's regtypeout (regproc.c),
-				// which always renders the schema-qualified name. DU-002
-				// (M0110-0001) regtype/format_type unification follow-up.
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int)); ok {
+				// "myrange"), diverging from PG's regtypeout (regproc.c). The
+				// name is only schema-qualified when "public" is not visible
+				// on the effective search_path (matches regproc/regoperator's
+				// own regObjectSchemaVisible check above). DU-002 (M0110-0001)
+				// regtype/format_type unification follow-up.
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(v.Int), !regObjectSchemaVisible(ctx, "public")); ok {
 					return NewStringDatum(uname), nil
 				}
 				return NewStringDatum(fmt.Sprintf("%d", v.Int)), nil
@@ -750,6 +752,28 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
+		if strings.EqualFold(x.TargetType, "regdictionary") && ctx != nil && ctx.Catalog != nil {
+			// int → regdictionary resolves a pg_ts_dict OID to its bare name
+			// (no schema qualification, mirroring the regclass branch above).
+			// pg_dump's dumpTSConfig casts pg_ts_config_map.mapdict this way to
+			// re-emit ADD MAPPING's `WITH <dictname>` clause. DU-002 slice 446
+			// (M0119-0004).
+			if v.Kind == KindInt {
+				oid := uint32(v.Int)
+				for name, builtinOID := range catalog.BuiltinTSDictOID {
+					if builtinOID == oid {
+						return NewStringDatum(name), nil
+					}
+				}
+				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+					for _, ud := range im.ListUserTSDicts() {
+						if ud.OID == oid {
+							return NewStringDatum(ud.Name), nil
+						}
+					}
+				}
+			}
+		}
 		// ── Enum cast validation ─────────────────────────────────────────
 		// If the target type is a user-defined enum and the input is a
 		// non-NULL, non-array string, verify the value is a valid enum label.
@@ -788,7 +812,19 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
-		result, err := evalCastTyped(v, x.TargetType, x.SourceType, x.Pos())
+		// Bare `char`/CHARACTER (no explicit length) is grammar-synthesized to
+		// TargetType=="char" with Typmod==1 by the planner (mirroring bpchar's
+		// implicit length-1 default), which is indistinguishable at the string
+		// level from the quoted `"char"` identifier (pg_type OID 18, Typmod==0,
+		// a genuinely different fixed 1-byte internal type). Rename the former
+		// to "bpchar" for this call only so evalCast's OID-18-specific
+		// octal-escape/truncation branch fires solely for the true OID-18 form.
+		// M0122-0005.
+		castTargetType := x.TargetType
+		if castTargetType == "char" && x.Typmod > 0 {
+			castTargetType = "bpchar"
+		}
+		result, err := evalCastTyped(v, castTargetType, x.SourceType, x.Pos())
 		if err != nil {
 			return Datum{}, err
 		}
@@ -798,13 +834,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain {
-					// Get the string label of the value being cast.
-					var label string
-					if result.Kind == KindEnum {
-						label = string(result.Buf)
-					} else {
-						label = result.StringValue()
-					}
+					// Get the string label of the value being cast. Format()
+					// (not StringValue(), which only extracts KindString's Buf
+					// payload) renders every Kind's canonical text form, e.g.
+					// KindInt's Int field as a decimal string. M0122-0005.
+					label := result.Format()
 					for _, ck := range dom.Checks {
 						if len(ck.InValues) == 0 {
 							continue
@@ -824,6 +858,28 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 							}
 						}
 					}
+				}
+			}
+		}
+		// Apply varchar(n)/bpchar(n)/char(n) typmod: truncate to the declared
+		// length. PostgreSQL's explicit (::) cast truncates silently rather
+		// than raising 22001 (that error is assignment/INSERT-coercion-only,
+		// already enforced separately by codec.go's coerceTextLikeDatum) —
+		// verified against real PG 18.3: `'abcdef'::varchar(3)` → 'abc', no
+		// error. bpchar/char additionally right-pad short values with spaces
+		// in real PG; goopg's Datum has no distinct padded representation for
+		// bpchar (coerceTextLikeDatum stores it trimmed too), so padding is a
+		// separate, broader gap left deferred. castTargetType (not
+		// x.TargetType) is used so the bare-`char`-synthesized-to-"bpchar"
+		// rename above is truncated too, while the quoted OID-18 `"char"`
+		// form (Typmod==0, already handled above) is unaffected. M0122-0005.
+		if x.Typmod > 0 && result.Kind == KindString {
+			switch castTargetType {
+			case "varchar", "bpchar", "char", "character":
+				n := int(x.Typmod)
+				runes := []rune(result.StringValue())
+				if len(runes) > n {
+					result = NewStringDatum(string(runes[:n]))
 				}
 			}
 		}
@@ -2252,6 +2308,21 @@ func compareDatum(a, b Datum, pos int) (int, error) {
 			return 1, nil
 		}
 		return 0, nil
+	case KindInterval:
+		// Mirrors PostgreSQL's interval_cmp_value (timestamp.c): months are
+		// widened to days at a fixed 30-day rate, then combined with the day
+		// field into a single linear day count. v0's interval has no
+		// sub-day/time component (always 0), so the microsecond widening
+		// upstream does on top of this is a no-op here. M0122-0004.
+		at := int64(a.IntervalMonthsValue())*30 + int64(a.IntervalDaysValue())
+		bt := int64(b.IntervalMonthsValue())*30 + int64(b.IntervalDaysValue())
+		switch {
+		case at < bt:
+			return -1, nil
+		case at > bt:
+			return 1, nil
+		}
+		return 0, nil
 	}
 	return 0, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("comparison not supported for kind %d", a.Kind)}
 }
@@ -2882,6 +2953,13 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 				if b, ok := charTypeParseOctalEscape(s); ok {
 					return NewStringDatum(charTypeDisplayForm(b)), nil
 				}
+				// PostgreSQL's charin() takes the first byte of any non-\NNN
+				// input and silently discards the rest (char.c). M0122-0005.
+				var b byte
+				if len(s) > 0 {
+					b = s[0]
+				}
+				return NewStringDatum(charTypeDisplayForm(b)), nil
 			}
 			return d, nil
 		default:
@@ -3065,6 +3143,26 @@ func evalCast(d Datum, targetType string, pos int) (Datum, error) {
 			return NewTimeDatum(ts), nil
 		}
 		return d, nil
+	case "interval":
+		// Cast to interval: parse the v0-supported "<n> <unit>" string shape
+		// (unit ∈ day(s)/month(s)/year(s)), mirroring the `INTERVAL '<n>
+		// <unit>'` typed-literal grammar (evalIntervalLit/splitEmbeddedInterval)
+		// so `'<n> <unit>'::interval` and `CAST('<n> <unit>' AS interval)`
+		// accept exactly the same strings instead of silently passing the
+		// string through unparsed. Multi-component/sub-day interval strings
+		// remain a documented v0 scope limit. M0122-0004.
+		if d.Kind == KindInterval {
+			return d, nil
+		}
+		if d.Kind == KindString {
+			months, days, ok := parseIntervalCastString(d.StringValue())
+			if !ok {
+				return Datum{}, &ExecError{Code: "22007", Pos: pos,
+					Message: fmt.Sprintf("invalid input syntax for type interval: %q", d.StringValue())}
+			}
+			return NewIntervalDatum(months, days), nil
+		}
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos, Message: "cannot cast to interval"}
 	case "tid":
 		// Cast to tid: parse/validate "(block,offset)" and re-emit the
 		// canonical form. PostgreSQL's tidin treats block as an unsigned
@@ -5358,6 +5456,35 @@ func evalDateBin(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	return NewTimeDatum(origin.Add(bucket)), nil
 }
 
+// parseIntervalCastString parses a runtime interval-cast string (the
+// `::interval` / `CAST(... AS interval)` path, as opposed to the
+// parse-time `INTERVAL '...'` typed-literal syntax handled by
+// splitEmbeddedInterval/evalIntervalLit). Accepts the same "<n> <unit>"
+// shape (unit day(s)/month(s)/year(s), case-insensitive) since that is
+// the only interval grammar v0 supports; anything else fails so the
+// caller can raise 22007 rather than silently pass the string through.
+// M0122-0004.
+func parseIntervalCastString(s string) (months, days int32, ok bool) {
+	parts := strings.Fields(strings.TrimSpace(s))
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	n, err := strconv.ParseInt(parts[0], 10, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	switch strings.ToLower(strings.TrimSuffix(parts[1], "s")) {
+	case "day":
+		return 0, int32(n), true
+	case "month":
+		return int32(n), 0, true
+	case "year":
+		return int32(n) * 12, 0, true
+	default:
+		return 0, 0, false
+	}
+}
+
 // evalIntervalLit parses the integer body of an `interval 'N' unit`
 // literal. The parser already normalised plurals so Unit is one
 // of day / month / year.
@@ -6558,10 +6685,34 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NewStringDatum(def + ";"), nil
 	case "pg_collation_for":
-		// Return "POSIX" to match the C/POSIX locale used in regression tests.
-		// PG regression databases are created with --locale=C, so text values
-		// have POSIX collation. M0097-0115.
-		return NewStringDatum(`"POSIX"`), nil
+		if len(x.Args) == 1 {
+			switch arg := x.Args[0].(type) {
+			case *planner.StringConst:
+				// Fast path: the planner's foldPgCollationFor already computed the
+				// final answer at plan time (mirrors pg_typeof's fold). M0122-0005.
+				return NewStringDatum(arg.Value), nil
+			case *planner.NullConst:
+				return NullDatum, nil
+			case *planner.CollateExpr:
+				// Runtime path (reached only if some resolver other than the main
+				// planner.resolveExpr — e.g. plpgsql's expression compiler —
+				// produced this call without going through the plan-time fold):
+				// an explicit `expr COLLATE name` states its own collation.
+				return NewStringDatum(catalog.QuoteCollationIdent(arg.CollationName)), nil
+			}
+			// Runtime path, no static fold available: approximate from the
+			// evaluated Datum kind. A collatable (string) result defaults to
+			// "default"; anything else is conservatively reported as having no
+			// determinable collation rather than guessing a name PG wouldn't use.
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err != nil {
+				return NullDatum, err
+			}
+			if v.Kind == KindString {
+				return NewStringDatum("default"), nil
+			}
+		}
+		return NullDatum, nil
 	case "to_char":
 		return evalToChar(x, row, ctx)
 	case "age":
@@ -9945,31 +10096,48 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return Datum{Kind: KindInt, Int: int64(cnt)}, nil
 	case "pg_typeof":
 		if len(x.Args) == 1 {
-			// Fast path: planner folded pg_typeof(expr) to a StringConst holding
-			// the pre-computed type name — return it without evaluating. M0097-0035.
+			var cat catalog.Catalog
+			if ctx != nil {
+				cat = ctx.Catalog
+			}
+			// pg_typeof's declared SQL return type is regtype, whose wire/
+			// binary representation IS the type's OID (mirrors regclass/
+			// regproc) — resolve the display name to its OID here rather than
+			// returning display text, so a further `::oid` cast is a plain
+			// identity reinterpretation instead of misparsing display text
+			// through oidin(). The wire/display layer (planner.exprType's
+			// FuncCall case + dispatch.go's typeOIDFor/appendTypedCellText)
+			// renders the OID back to the display name for a plain
+			// `SELECT pg_typeof(...)`. M0122-0005 pg_typeof()::oid follow-up.
+			//
+			// Fast path: planner folded pg_typeof(expr) to a StringConst
+			// holding the pre-computed type name — resolve it without
+			// evaluating. M0097-0035.
 			if sc, ok := x.Args[0].(*planner.StringConst); ok {
-				return NewStringDatum(sc.Value), nil
+				return NewIntDatum(int64(pgTypeofOIDForName(cat, sc.Value))), nil
 			}
 			// Runtime path: evaluate arg and map Datum kind to PG type name.
-			// KindString must map to "text" here (NOT return the string value).
+			// KindString must map to "text" here (NOT the string value).
 			v, err := evalExpr(x.Args[0], row, ctx)
 			if err != nil || v.IsNull() {
-				return NewStringDatum("unknown"), nil
+				return NewIntDatum(int64(pgTypeofOIDForName(cat, "unknown"))), nil
 			}
+			var typName string
 			switch v.Kind {
 			case KindString:
-				return NewStringDatum("text"), nil
+				typName = "text"
 			case KindInt:
-				return NewStringDatum("integer"), nil
+				typName = "integer"
 			case KindBool:
-				return NewStringDatum("boolean"), nil
+				typName = "boolean"
 			case KindNumeric:
-				return NewStringDatum("numeric"), nil
+				typName = "numeric"
 			case KindTime:
-				return NewStringDatum("timestamp without time zone"), nil
+				typName = "timestamp without time zone"
 			default:
-				return NewStringDatum("text"), nil
+				typName = "text"
 			}
+			return NewIntDatum(int64(pgTypeofOIDForName(cat, typName))), nil
 		}
 	case "format_type":
 		// format_type(oid, typemod) — returns the SQL name of a data type given
@@ -9995,11 +10163,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// so formatTypeOID (built-ins only) returns the unknown
 				// sentinel; resolve it via the shared enum/domain/composite/
 				// range/multirange lookup (also used by the ::regtype cast).
-				// pg_dump runs with search_path='', under which format_type
-				// qualifies a non-visible type with its namespace; goopg's
-				// user types all live in public, hence the public. prefix.
+				// format_type only schema-qualifies when the type's schema
+				// (always public, for goopg's user types) is not visible on
+				// the effective search_path — e.g. pg_dump's search_path=''
+				// (ALWAYS_SECURE_SEARCH_PATH_SQL) makes public always
+				// non-visible, forcing the public. prefix, while a plain
+				// session's default search_path leaves it unqualified.
 				// DU-002 slices 88-90/249-251/(M0110-0001).
-				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID)); ok {
+				if uname, ok := userTypeNameForOID(ctx.Catalog, uint32(typeOID), !regObjectSchemaVisible(ctx, "public")); ok {
 					name = uname
 				}
 			}
@@ -12038,43 +12209,53 @@ func pgFormatTypeName(t string) string {
 
 // userTypeNameForOID resolves a dynamically-allocated pg_type OID (one goopg
 // itself assigned to a user-defined enum/domain/composite/range/multirange
-// type, or one of their auto-generated array types) to its schema-qualified
-// name. Shared by format_type's built-in-fallback path and the `::regtype`
-// cast, since both need the identical resolution across all four user-type
-// kinds — goopg enums/domains/composites/ranges all live in public, hence the
-// public. prefix (matches pg_dump's search_path='' visibility). Returns
-// ("", false) if oid does not match any user type. DU-002 (M0110-0001)
-// regtype/format_type unification follow-up.
-func userTypeNameForOID(cat catalog.Catalog, oid uint32) (string, bool) {
+// type, or one of their auto-generated array types) to its name. Shared by
+// format_type's built-in-fallback path, the `::regtype` cast, and
+// RegtypeName, since all three need the identical resolution across all four
+// user-type kinds. goopg enums/domains/composites/ranges all live in public;
+// qualify controls whether the "public." prefix is added, mirroring
+// regObjectSchemaVisible's role for the regproc/regoperator casts — callers
+// pass qualify=true only when "public" is NOT visible on the effective
+// search_path (e.g. pg_dump's search_path=''), matching real PostgreSQL's
+// regtypeout/format_type, which only schema-qualifies when necessary rather
+// than unconditionally. Returns ("", false) if oid does not match any user
+// type. DU-002 (M0110-0001) regtype/format_type unification follow-up;
+// qualify param added as the M0122-0005 pg_typeof()::oid follow-up's
+// schema-visibility fix.
+func userTypeNameForOID(cat catalog.Catalog, oid uint32, qualify bool) (string, bool) {
+	prefix := ""
+	if qualify {
+		prefix = "public."
+	}
 	if et, ok := cat.LookupEnumByOID(oid); ok {
-		return "public." + et.Name, true
+		return prefix + et.Name, true
 	}
 	if et, ok := cat.LookupEnumByArrayOID(oid); ok {
-		return "public." + et.Name + "[]", true
+		return prefix + et.Name + "[]", true
 	}
 	if dom, ok := cat.LookupDomainByOID(oid); ok {
-		return "public." + dom.Name, true
+		return prefix + dom.Name, true
 	}
 	if dom, ok := cat.LookupDomainByArrayOID(oid); ok {
-		return "public." + dom.Name + "[]", true
+		return prefix + dom.Name + "[]", true
 	}
 	if ct, ok := cat.LookupCompositeTypeByOID(oid); ok {
-		return "public." + ct.Name, true
+		return prefix + ct.Name, true
 	}
 	if ct, ok := cat.LookupCompositeTypeByArrayOID(oid); ok {
-		return "public." + ct.Name + "[]", true
+		return prefix + ct.Name + "[]", true
 	}
 	if rt, ok := cat.LookupRangeTypeByOID(oid); ok {
-		return "public." + rt.Name, true
+		return prefix + rt.Name, true
 	}
 	if rt, ok := cat.LookupRangeTypeByMultirangeOID(oid); ok {
-		return "public." + rt.MultirangeName, true
+		return prefix + rt.MultirangeName, true
 	}
 	if rt, ok := cat.LookupRangeTypeByArrayOID(oid); ok {
-		return "public." + rt.Name + "[]", true
+		return prefix + rt.Name + "[]", true
 	}
 	if rt, ok := cat.LookupRangeTypeByMultirangeArrayOID(oid); ok {
-		return "public." + rt.MultirangeName + "[]", true
+		return prefix + rt.MultirangeName + "[]", true
 	}
 	return "", false
 }
@@ -12102,6 +12283,71 @@ func userTypeOIDForName(cat catalog.Catalog, name string) (uint32, bool) {
 		return rt.MultirangeOID, true
 	}
 	return 0, false
+}
+
+// unknownPseudoTypeOID is pg_type's row OID for the "unknown" pseudo-type
+// (postgres/src/include/catalog/pg_type_d.h's UNKNOWNOID) — pg_typeof(NULL)
+// reports this, not any real type.
+const unknownPseudoTypeOID = 705
+
+// pgTypeofOIDForName resolves a PostgreSQL type display name (as produced by
+// planner.pgTypeofDisplayName, or this file's own Kind-to-name runtime
+// fallback above) to its pg_type OID, so pg_typeof() can return a regtype
+// value backed by the real OID instead of display text. Covers the quoted
+// `"char"`/OID-18 special case, the "unknown" pseudo-type, every built-in
+// type TypeNameToOID knows, and user-defined enum/domain/composite/range/
+// multirange types via a live catalog lookup (mirroring the `::regtype`
+// cast's own string->OID resolution). M0122-0005 pg_typeof()::oid follow-up.
+func pgTypeofOIDForName(cat catalog.Catalog, name string) uint32 {
+	if name == `"char"` {
+		return catalog.OIDChar
+	}
+	if strings.EqualFold(name, "unknown") {
+		return unknownPseudoTypeOID
+	}
+	if oid := catalog.TypeNameToOID(name); oid != catalog.OIDText || strings.EqualFold(name, "text") {
+		return oid
+	}
+	// TypeNameToOID falls back to OIDText for any name it doesn't
+	// recognize (the check above already handled genuine "text"), most
+	// likely a user-defined type — pgTypeofDisplayName's default case
+	// returns such a name unchanged (bare, unqualified).
+	if cat != nil {
+		if oid, ok := userTypeOIDForName(cat, strings.ToLower(name)); ok {
+			return oid
+		}
+	}
+	return catalog.OIDText
+}
+
+// RegtypeName renders a pg_type OID as PostgreSQL's canonical display name
+// (regtypeout/format_type_be), covering built-in types plus user-defined
+// enum/domain/composite/range/multirange types. Used by the wire-output
+// layer (internal/server/dispatch.go's appendTypedCellText) to render a
+// regtype-typed result column, e.g. pg_typeof()'s result or an
+// `<oid>::regtype` cast — mirrors RegprocName/RegprocedureName's role for
+// regproc/regprocedure. InvalidOid (0) renders "-", matching regtypeout.
+// qualify controls whether a resolved user-defined type name is prefixed
+// with "public." — the caller determines this from the session's effective
+// search_path (see internal/server/dispatch.go's publicSchemaVisible),
+// mirroring userTypeNameForOID's own schema-visibility contract.
+// M0122-0005 pg_typeof()::oid follow-up.
+func RegtypeName(cat catalog.Catalog, oid uint32, qualify bool) string {
+	if oid == 0 {
+		return "-"
+	}
+	if oid == unknownPseudoTypeOID {
+		return "unknown"
+	}
+	if name := oidToBuiltinTypeName(oid); name != "" {
+		return name
+	}
+	if cat != nil {
+		if uname, ok := userTypeNameForOID(cat, oid, qualify); ok {
+			return uname
+		}
+	}
+	return strconv.FormatUint(uint64(oid), 10)
 }
 
 // formatTypeOID implements PostgreSQL's format_type(oid, typemod) built-in.

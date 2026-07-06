@@ -3,7 +3,22 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
+
+// fakeIOTimingOp is a minimal Operator stub for
+// TestInstrumentedOpAccountsIOTime: it produces zero rows, existing purely
+// so instrumentedOp has something to wrap while exercising the real
+// Open/Next/Close accountBuffers diffing path.
+type fakeIOTimingOp struct{}
+
+func (fakeIOTimingOp) Schema() planner.Schema  { return nil }
+func (fakeIOTimingOp) Open(*Context) error     { return nil }
+func (fakeIOTimingOp) Next() (TupleSlot, error) { return nil, EOF }
+func (fakeIOTimingOp) Close() error            { return nil }
 
 // TestExplainBuffersAnalyzeTextLine pins the M0122-0003 BUFFERS slice: under
 // EXPLAIN (ANALYZE, BUFFERS) each scan node gets a "Buffers: shared hit=N
@@ -121,6 +136,34 @@ func TestExplainBuffersJSONAlwaysIncludesDirtiedWrittenBlocks(t *testing.T) {
 	}
 }
 
+// TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks closes the local/temp
+// gap named by the M0122-0003 deferral-ledger row: goopg has no
+// local-buffer-manager or temp-buffer concept (every relation, including
+// temp tables, goes through the one shared storage.Pool), so these terms are
+// always zero — but upstream's non-text show_buffer_usage() still renders
+// them unconditionally once BUFFERS is requested (peek_buffer_usage: "when
+// format is anything other than text, we print even if the counters are all
+// zeroes"), same as the Shared terms above.
+func TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf12 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM ebuf12")
+	out := strings.Join(lines, "\n")
+	for _, key := range []string{
+		`"Local Hit Blocks"`, `"Local Read Blocks"`, `"Local Dirtied Blocks"`, `"Local Written Blocks"`,
+		`"Temp Read Blocks"`, `"Temp Written Blocks"`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("expected %s key in JSON output:\n%s", key, out)
+		}
+	}
+}
+
 // TestFormatBuffersLineDirtiedWritten pins formatBuffersLine's TEXT rendering
 // of the dirtied=/written= terms directly (explain.c's show_buffer_usage
 // shared-block branch): each term is independently gated on its own counter
@@ -161,6 +204,361 @@ func TestExplainBuffersXMLTagSanitized(t *testing.T) {
 	out := strings.Join(lines, "\n")
 	if !strings.Contains(out, "<Shared-Hit-Blocks>") || !strings.Contains(out, "<Shared-Read-Blocks>") {
 		t.Errorf("expected <Shared-Hit-Blocks>/<Shared-Read-Blocks> tags in XML output:\n%s", out)
+	}
+}
+
+// TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup pins the
+// remaining M0122-0003 BUFFERS gap: upstream's ExplainOnePlan always shows a
+// "Planning" group (buffer usage incurred by the planner itself) whenever
+// BUFFERS is requested for a non-text format, independent of ANALYZE
+// (explain.c's peek_buffer_usage returns true for any non-text format as
+// soon as BUFFERS was requested, even with every counter at zero). Without
+// ANALYZE, goopg previously rendered no "Planning" key at all.
+func TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf8 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (BUFFERS, FORMAT JSON) SELECT data FROM ebuf8")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Planning"`) {
+		t.Fatalf("EXPLAIN (BUFFERS, FORMAT JSON) without ANALYZE missing \"Planning\" group:\n%s", out)
+	}
+	if !strings.Contains(out, `"Shared Hit Blocks"`) || !strings.Contains(out, `"Shared Read Blocks"`) {
+		t.Errorf("Planning group missing Shared Hit/Read Blocks:\n%s", out)
+	}
+}
+
+// TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup confirms the
+// "Planning" group added above stays opt-in: plain EXPLAIN (FORMAT JSON),
+// no BUFFERS, never emits it.
+func TestExplainBuffersJSONWithoutBuffersOmitsPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf9 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (FORMAT JSON) SELECT data FROM ebuf9")
+	out := strings.Join(lines, "\n")
+	if strings.Contains(out, `"Planning"`) {
+		t.Errorf("EXPLAIN (FORMAT JSON) without BUFFERS unexpectedly emitted a \"Planning\" group:\n%s", out)
+	}
+}
+
+// TestExplainBuffersAnalyzeJSONIncludesPlanningGroup extends the coverage
+// to the ANALYZE case: the "Planning" group is independent of ANALYZE, so
+// EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) must show it too, alongside the
+// per-node execution buffer counters already covered by
+// TestExplainBuffersJSONAlwaysIncludesSharedBlocks.
+func TestExplainBuffersAnalyzeJSONIncludesPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf10 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM ebuf10")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Planning"`) {
+		t.Fatalf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) missing \"Planning\" group:\n%s", out)
+	}
+}
+
+// TestExplainBuffersPlanningGroupIncludesLocalTempBlocks extends the
+// "Planning" group coverage above: the Local/Temp Blocks terms
+// (planningBufferUsageJSON) are also always-zero-but-present, same rationale
+// as TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks's per-node case.
+func TestExplainBuffersPlanningGroupIncludesLocalTempBlocks(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf13 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (BUFFERS, FORMAT JSON) SELECT data FROM ebuf13")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, `"Planning"`) {
+		t.Fatalf("EXPLAIN (BUFFERS, FORMAT JSON) without ANALYZE missing \"Planning\" group:\n%s", out)
+	}
+	for _, key := range []string{
+		`"Local Hit Blocks"`, `"Local Read Blocks"`, `"Local Dirtied Blocks"`, `"Local Written Blocks"`,
+		`"Temp Read Blocks"`, `"Temp Written Blocks"`,
+	} {
+		if !strings.Contains(out, key) {
+			t.Errorf("Planning group missing %s:\n%s", key, out)
+		}
+	}
+}
+
+// TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup is the XML sibling
+// of TestExplainBuffersJSONWithoutAnalyzeIncludesPlanningGroup, pinning
+// xmlTagName's sanitization of the nested group ("Planning" has no
+// whitespace so it passes through unchanged, unlike "Shared Hit Blocks").
+func TestExplainBuffersXMLWithoutAnalyzeIncludesPlanningGroup(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE ebuf11 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (BUFFERS, FORMAT XML) SELECT data FROM ebuf11")
+	out := strings.Join(lines, "\n")
+	if !strings.Contains(out, "<Planning>") || !strings.Contains(out, "<Shared-Hit-Blocks>0</Shared-Hit-Blocks>") {
+		t.Errorf("expected <Planning> group with <Shared-Hit-Blocks>0</Shared-Hit-Blocks> in XML output:\n%s", out)
+	}
+}
+
+// TestFormatIOTimingsLine pins formatIOTimingsLine's TEXT rendering
+// (explain.c's show_buffer_usage has_shared_timing branch): each term is
+// independently gated on its own counter being positive, and the whole line
+// is gated on either being nonzero. There is no "extend=" term — extend time
+// folds into "write=" (see nodeStats.bufWriteTimeNs's doc comment).
+func TestFormatIOTimingsLine(t *testing.T) {
+	cases := []struct {
+		name string
+		s    nodeStats
+		want string
+	}{
+		{"all zero", nodeStats{}, ""},
+		{"read only", nodeStats{bufReadTimeNs: 2_500_000}, "I/O Timings: shared read=2.500"},
+		{"write only", nodeStats{bufWriteTimeNs: 1_250_000}, "I/O Timings: shared write=1.250"},
+		{"both", nodeStats{bufReadTimeNs: 500_000, bufWriteTimeNs: 750_000},
+			"I/O Timings: shared read=0.500 write=0.750"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := formatIOTimingsLine(&c.s); got != c.want {
+				t.Errorf("formatIOTimingsLine(%+v) = %q, want %q", c.s, got, c.want)
+			}
+		})
+	}
+}
+
+// TestExplainIOTimingsOffByDefault confirms the "I/O Timings:" line stays
+// absent when track_io_timing never accumulated any time (the default —
+// matches upstream, where the times stay zero and has_shared_timing is
+// false).
+func TestExplainIOTimingsOffByDefault(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx,
+		"CREATE TABLE eiot1 (data int)",
+		"INSERT INTO eiot1 VALUES (1)",
+	)
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS) SELECT data FROM eiot1")
+	joined := strings.Join(lines, "\n")
+	if strings.Contains(joined, "I/O Timings:") {
+		t.Errorf("EXPLAIN (ANALYZE, BUFFERS) unexpectedly emitted an I/O Timings line with no accumulated time:\n%s", joined)
+	}
+}
+
+// TestInstrumentedOpAccountsIOTime exercises the real
+// instrumentedOp.accountBuffers diffing added for I/O Timings: adding
+// wall-clock time to a Pool between a node's Open and Close — mirroring what
+// a real track_io_timing-gated wait-event hook (OnPinDone/OnFlushDone/
+// OnExtendDone) would do mid-execution — must roll into that node's
+// bufReadTimeNs/bufWriteTimeNs, and formatIOTimingsLine must render it. This
+// runs below the SQL layer (unlike TestExplainBuffersAnalyzeTextLine)
+// because pre-seeding time via Pool.AddReadTimeNanos before a full EXPLAIN
+// call would land inside instrumentedOp.Open's baseline snapshot and diff to
+// zero — there is no hook to inject time mid-query from outside a single SQL
+// round trip in this test harness.
+func TestInstrumentedOpAccountsIOTime(t *testing.T) {
+	dir := t.TempDir()
+	mgr := storage.NewManager(storage.ManagerConfig{DataDir: dir})
+	pool, err := storage.NewPool(mgr, storage.PoolConfig{Slots: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close(); _ = mgr.Close() }()
+
+	stats := &nodeStats{}
+	op := &instrumentedOp{inner: fakeIOTimingOp{}, plan: &planner.Values{}, stats: stats}
+
+	if err := op.Open(&Context{Pool: pool}); err != nil {
+		t.Fatal(err)
+	}
+
+	pool.AddReadTimeNanos(3_000_000)
+	pool.AddWriteTimeNanos(1_000_000)
+
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Next() err = %v, want EOF", err)
+	}
+	if err := op.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if stats.bufReadTimeNs != 3_000_000 {
+		t.Errorf("bufReadTimeNs = %d, want 3000000", stats.bufReadTimeNs)
+	}
+	if stats.bufWriteTimeNs != 1_000_000 {
+		t.Errorf("bufWriteTimeNs = %d, want 1000000", stats.bufWriteTimeNs)
+	}
+	if line := formatIOTimingsLine(stats); line != "I/O Timings: shared read=3.000 write=1.000" {
+		t.Errorf("formatIOTimingsLine = %q, want 'I/O Timings: shared read=3.000 write=1.000'", line)
+	}
+}
+
+// TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime mirrors
+// TestExplainBuffersJSONOmittedWithoutBuffersOption for the new I/O timing
+// properties: with no accumulated time, "Shared I/O Read Time"/"Shared I/O
+// Write Time" stay absent (goopg's nonzero gate — see formatIOTimingsLine's
+// doc comment on the accepted deviation from upstream's GUC-only gate).
+func TestExplainIOTimingsJSONOmittedWithoutAccumulatedTime(t *testing.T) {
+	ctx, cleanup := newVMFixture(t)
+	defer cleanup()
+
+	runComposite(t, ctx, "CREATE TABLE eiot3 (data int)")
+	commitTx(t, ctx)
+	beginTx(t, ctx)
+
+	lines := runExplainRows(t, ctx, "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT data FROM eiot3")
+	out := strings.Join(lines, "\n")
+	if strings.Contains(out, "Shared I/O Read Time") || strings.Contains(out, "Shared I/O Write Time") {
+		t.Errorf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) unexpectedly reported I/O timing with no accumulated time:\n%s", out)
+	}
+}
+
+// TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero is the FORMAT
+// JSON/XML/YAML sibling of TestInstrumentedOpAccountsIOTime: pins
+// planToJSONWithStats's "Shared I/O Read Time"/"Shared I/O Write Time"
+// properties directly against a synthetic stats table, avoiding the same
+// pre-seeding-lands-in-the-baseline problem a full SQL round trip would hit.
+func TestPlanToJSONWithStatsRendersIOTimingsWhenNonzero(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 2.0 {
+		t.Errorf("Shared I/O Read Time = %v, want 2.0", obj["Shared I/O Read Time"])
+	}
+	if got, ok := obj["Shared I/O Write Time"].(float64); !ok || got != 0.5 {
+		t.Errorf("Shared I/O Write Time = %v, want 0.5", obj["Shared I/O Write Time"])
+	}
+}
+
+// TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero pins
+// the fix for the GUC-vs-nonzero gating gap this loop closes (ledger row
+// 2026-07-05, M0122-0003): upstream's non-text show_buffer_usage() gates
+// "Shared I/O Read/Write Time" on the live track_io_timing GUC and prints
+// it even when the accumulated value is exactly zero — unlike the
+// nonzero-only gate the TEXT "I/O Timings:" line (formatIOTimingsLine)
+// still uses.
+func TestPlanToJSONWithStatsRendersIOTimingsWhenTrackIOTimingOnEvenAtZero(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	if got, ok := obj["Shared I/O Read Time"].(float64); !ok || got != 0 {
+		t.Errorf("Shared I/O Read Time = %v, want 0 (present)", obj["Shared I/O Read Time"])
+	}
+	if got, ok := obj["Shared I/O Write Time"].(float64); !ok || got != 0 {
+		t.Errorf("Shared I/O Write Time = %v, want 0 (present)", obj["Shared I/O Write Time"])
+	}
+}
+
+// TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff is the mirror
+// of the above: when the caller's track_io_timing snapshot is false, the
+// properties stay absent even though the node accumulated a nonzero value
+// (matches upstream: the accumulator itself never advances with the GUC
+// off, so a nonzero reading with the GUC off shouldn't happen in practice,
+// but the gate must key off the GUC, not the value, to match explain.c).
+func TestPlanToJSONWithStatsOmitsIOTimingsWhenTrackIOTimingOff(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {bufReadTimeNs: 2_000_000, bufWriteTimeNs: 500_000}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	if _, ok := obj["Shared I/O Read Time"]; ok {
+		t.Errorf("Shared I/O Read Time present with trackIOTiming=false, want absent")
+	}
+	if _, ok := obj["Shared I/O Write Time"]; ok {
+		t.Errorf("Shared I/O Write Time present with trackIOTiming=false, want absent")
+	}
+}
+
+
+// TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn closes
+// the Local/Temp I/O timing gap named by the M0122-0003 deferral-ledger
+// follow-up: upstream's non-text show_buffer_usage() renders all six
+// Shared/Local/Temp I/O Read/Write Time properties once track_io_timing is
+// on, not just the Shared pair — goopg has no local-buffer-manager or
+// temp-buffer concept, so Local/Temp stay constant zero, same rationale as
+// their Blocks counterparts (TestExplainBuffersJSONAlwaysIncludesLocalTempBlocks).
+func TestPlanToJSONWithStatsIncludesLocalTempIOTimingWhenTrackIOTimingOn(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, true)
+	for _, key := range []string{
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		got, ok := obj[key].(float64)
+		if !ok || got != 0 {
+			t.Errorf("%s = %v, want 0 (present)", key, obj[key])
+		}
+	}
+}
+
+// TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff is the
+// mirror of the above: with track_io_timing off, the Local/Temp terms stay
+// absent alongside the Shared ones.
+func TestPlanToJSONWithStatsOmitsLocalTempIOTimingWhenTrackIOTimingOff(t *testing.T) {
+	n := &planner.Values{}
+	stats := nodeStatsTable{n: {}}
+	obj := planToJSONWithStats(n, parser.ExplainOptions{Buffers: true}, stats, false)
+	for _, key := range []string{
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		if _, ok := obj[key]; ok {
+			t.Errorf("%s present with trackIOTiming=false, want absent", key)
+		}
+	}
+}
+
+// TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn pins
+// planningBufferUsageJSON's new trackIOTiming parameter: the "Planning"
+// group (planning-time buffer usage, always zero — goopg's planner never
+// touches the buffer pool during cost estimation) must also gain the six
+// Shared/Local/Temp I/O Read/Write Time properties once track_io_timing is
+// on, matching the per-node behavior pinned above.
+func TestPlanningBufferUsageJSONIncludesIOTimingWhenTrackIOTimingOn(t *testing.T) {
+	obj := planningBufferUsageJSON(true)
+	for _, key := range []string{
+		"Shared I/O Read Time", "Shared I/O Write Time",
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		got, ok := obj[key].(float64)
+		if !ok || got != 0 {
+			t.Errorf("%s = %v, want 0 (present)", key, obj[key])
+		}
+	}
+}
+
+// TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff is the mirror
+// of the above: with track_io_timing off, none of the six I/O timing
+// properties appear in the "Planning" group.
+func TestPlanningBufferUsageJSONOmitsIOTimingWhenTrackIOTimingOff(t *testing.T) {
+	obj := planningBufferUsageJSON(false)
+	for _, key := range []string{
+		"Shared I/O Read Time", "Shared I/O Write Time",
+		"Local I/O Read Time", "Local I/O Write Time",
+		"Temp I/O Read Time", "Temp I/O Write Time",
+	} {
+		if _, ok := obj[key]; ok {
+			t.Errorf("%s present with trackIOTiming=false, want absent", key)
+		}
 	}
 }
 

@@ -963,6 +963,12 @@ func (o *upsertOp) applyInsert(rel storage.RelFileNode, tbl *catalog.Table, cols
 		}
 		phaseBKey = key
 	}
+	// NOT NULL / CHECK / domain constraint enforcement on the finalized
+	// inserted row, mirroring insertOp.Next (M0122-0005 follow-up — the
+	// INSERT arm of ON CONFLICT previously enforced none of these).
+	if cerr := checkRowConstraintsForWrite(o.ctx, tbl, cols, insertedLeaf); cerr != nil {
+		return storage.ItemPointer{}, cerr
+	}
 	ptr, err := writeHeapRowReturning(o.ctx, rel, cols, insertedLeaf)
 	if err != nil {
 		return storage.ItemPointer{}, err
@@ -1069,6 +1075,13 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	o.ctx.Pool.Unpin(pinned)
 	if derr != nil {
 		return derr
+	}
+	// NOT NULL / CHECK / domain constraint enforcement on the finalized
+	// updated row, mirroring the plain-UPDATE write paths (M0122-0005
+	// follow-up — the DO UPDATE arm of ON CONFLICT previously enforced none
+	// of these).
+	if cerr := checkRowConstraintsForWrite(o.ctx, tbl, cols, updatedLeaf); cerr != nil {
+		return cerr
 	}
 	newPtr, err := writeHeapRowReturning(o.ctx, rel, cols, updatedLeaf)
 	if err != nil {

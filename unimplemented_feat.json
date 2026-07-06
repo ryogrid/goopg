@@ -147,7 +147,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_explain.go:746 UPDATE/DELETE missing from planChildren"
+   "code_audit": "RESOLVED 2026-07-06 (M0122): internal/executor/operators_explain.go's planChildren gained *planner.Update/*planner.Delete cases (p.Child + p.FromScans/p.UsingScans), so EXPLAIN/EXPLAIN ANALYZE on UPDATE/DELETE now shows the target scan (and FROM/USING join scans) under 'Update on t'/'Delete on t', matching real PG 18.3. ANALYZE actual-stats for that child remain absent (executor drives it via extractScan, not a nested instrumented Operator) — degrades to a cost-estimate-only line, not a crash. Tests: internal/executor/explain_update_delete_children_test.go. Design: docs/design/0122-0003-explain-format-xml-yaml.md Follow-up section."
   },
   {
    "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
@@ -3140,6 +3140,7 @@
    "feature": "Runtime enforcement of ALTER STATISTICS SET STATISTICS target during DDL operations",
    "task_id": "M0119-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Dump-fidelity only; new field defaults nil"
    ],
@@ -3153,7 +3154,8 @@
     "fix_plan": "unchecked",
     "later_commits": "confirmed-open-code-audit: operators_ddl.go:15258 catalog-only, not enforced"
    },
-   "confidence": "high"
+   "confidence": "high",
+   "code_audit": "RESOLVED 2026-07-06 (M0119-0004, this loop): new columnStatsTarget (internal/executor/operators_analyze.go) mirrors examine_attribute/do_analyze_rel (postgres/src/backend/commands/analyze.c) — a per-column ALTER TABLE ... ALTER COLUMN ... SET STATISTICS n override now caps that column's MCV/histogram sampling target independent of the table-wide default_statistics_target, and SET STATISTICS 0 excludes the column from ANALYZE entirely (no pg_statistic row), matching attstattarget == 0. Tests: TestAnalyzeRespectsPerColumnStatTarget, TestAnalyzeSetStatisticsZeroDisablesColumn (internal/executor/operators_analyze_test.go), both PASS at current HEAD. Design: docs/design/0006-0005-per-column-stats-target-enforcement.md. Note: this entry is about per-column ANALYZE targets (catalog.Column.StatTarget), distinct from the separately-tracked extended-statistics-object ALTER STATISTICS ... SET STATISTICS (pg_statistic_ext.stxstattarget, docs/design/0119-0004-alter-statistics-set-statistics.md), which remains dump-fidelity only by design (no extended-statistics computation exists to enforce a target against)."
   },
   {
    "feature": "VIEW WITH CHECK OPTION is not enforced on INSERT/UPDATE operations; WITH (check_option=...) reloption form is parsed but ignored; restart persistence is in-memory only, not persisted.",

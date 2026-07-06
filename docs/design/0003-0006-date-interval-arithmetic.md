@@ -186,6 +186,115 @@ SELECT o_orderdate FROM orders
 - `interval '1 month' + interval '1 day'` (interval +
   interval).
 
+## Follow-up: interval ordering comparisons (M0122-0004, 2026-07-06)
+
+`compareDatum` (`internal/executor/expr.go`) had cases for every `Datum.Kind`
+used in `<`/`>`/`<=`/`>=`/`ORDER BY`/`MIN`/`MAX` **except `KindInterval`** —
+any of those over an interval value raised `42883` ("comparison not
+supported for kind ..."), even though interval *equality* already worked
+correctly via `datumKey` (`internal/executor/operators_join_agg.go`, used by
+GROUP BY/DISTINCT hashing). Confirmed as a genuine gap by grepping
+`unimplemented_feat.json` for `interval` and cross-checking against a real
+PostgreSQL 18.3 instance.
+
+Fix mirrors upstream's `interval_cmp_value` (`postgres/src/backend/utils/
+adt/timestamp.c`): months are widened to days at a fixed 30-day rate, added
+to the day field, and the results linearized as a single `int64` day count
+before comparing (`at := months*30 + days`). Upstream widens further to
+microseconds via the interval's `time` field; v0's interval has no sub-day
+component (always 0), so that extra step is a no-op here and the two
+representations agree exactly. Verified against real PostgreSQL 18.3
+byte-for-byte, including the tie case (`interval '3' month = interval '90'
+day` — both linearize to 90) and negative months.
+
+Tests: `internal/executor/interval_compare_test.go`
+(`TestIntervalOrderingOperators` — 6 comparison-operator cases;
+`TestIntervalOrderByAndMinMax` — `ORDER BY`/`MIN`/`MAX` over
+interval-valued expressions).
+
+Deferred (ledger row, unchanged from this doc's original "Out of scope"
+list): sub-day interval units, `CAST(... AS interval)` string parsing, and
+`Datum.Format()`'s `KindInterval` text rendering (`"%d months %d days"`,
+which does not match PostgreSQL's `intervalout` — e.g. real PG prints `"3
+mons"` not `"3 months 0 days"`) all remain open, independent gaps.
+
+## Follow-up: `Datum.Format()` interval text rendering (M0122-0004, 2026-07-06)
+
+Closes the `Datum.Format()`/`intervalout` gap the prior follow-up named.
+`formatInterval(months, days int32) string` (`internal/executor/datum.go`)
+replaces the old unconditional `"%d months %d days"` with upstream's actual
+`interval_out` shape under the default `'postgres'` `IntervalStyle`, verified
+live against a real PostgreSQL 18.3 instance
+(`postgres/local_install/bin/psql`) rather than derived from the C source:
+
+- Total months split into `years := months/12`, `remMonths := months%12`
+  (Go's truncating integer division/modulo already matches C's, so this is a
+  direct port — no special-casing for negative months needed).
+- Each of years/remMonths/days is rendered only if nonzero, as `"<n>
+  <unit>"` with the *plural* unit text unless the value is *exactly* `1`
+  (empirically, `-1` still takes the plural form, e.g. `"-1 mons"` not `"-1
+  mon"` — confirmed against real PG, not assumed).
+- Components are space-joined in years → months → days order; a
+  fully-zero interval (0 months, 0 days) prints PG's special-cased
+  `"00:00:00"` rather than an empty string.
+
+Verified cases (each cross-checked against real PG 18.3): `14,3 → "1 year 2
+mons 3 days"`; `-1,0 → "-1 mons"`; `0,0 → "00:00:00"`; `13,0 → "1 year 1
+mon"` (total-months normalization, not a pre-split year/month field);
+`-15,0 → "-1 years -3 mons"`; `-12,0 → "-1 years"` (zero remainder omitted);
+`11,0 → "11 mons"` and `-11,0 → "-11 mons"` (zero years omitted). Test:
+`internal/executor/interval_format_test.go`
+(`TestFormatIntervalMatchesPGIntervalOut`, 18 cases).
+
+Still deferred, unchanged: sub-day interval units and `CAST(... AS
+interval)` string parsing (this v0 interval type has no time-of-day
+component to parse into or format, so PG's `HH:MM:SS` suffix never
+appears except via the zero-interval special case above).
+
+## Follow-up: `CAST(... AS interval)` string parsing (M0122-0004, 2026-07-06)
+
+Closes the `CAST(... AS interval)` string-parsing gap the two follow-ups
+above both listed as still open. `evalCast` (`internal/executor/expr.go`) had
+no `"interval"` case at all, so `'3 days'::interval` / `CAST('3 days' AS
+interval)` fell to the function's final `return d, nil` ("pass-through for
+unknown types") — the value silently stayed a `KindString` holding the raw
+text instead of becoming a real `KindInterval`, so e.g. `now() +
+'3 days'::interval` would misbehave (adding a string to a timestamp, not an
+interval) instead of computing correctly or erroring cleanly.
+
+The new `"interval"` case accepts only the same "`<n> <unit>`" shape the
+`INTERVAL '<n> <unit>'` typed-literal grammar already supports (unit ∈
+day(s)/month(s)/year(s), case-insensitive) — deliberately not the full
+PostgreSQL `interval_in` grammar (multi-component strings, sub-day
+`HH:MM:SS`, ISO-8601 durations), which remains the documented "sub-day
+intervals" v0 scope limit this doc's "Out of scope" section already names.
+New `parseIntervalCastString(s string) (months, days int32, ok bool)`
+(`internal/executor/expr.go`, next to `evalIntervalLit`) mirrors
+`splitEmbeddedInterval`'s two-token split + `evalIntervalLit`'s
+unit-to-months/days mapping so the cast path and the typed-literal path
+accept exactly the same strings. An unparseable string raises `22007`
+("invalid input syntax for type interval"), matching real PostgreSQL's
+`interval_in` SQLSTATE for the same failure mode (verified: real PG raises
+`22007` for a garbage interval string too, even though v0's *accepted*
+grammar is narrower than upstream's).
+
+Tests: `internal/executor/interval_cast_test.go`
+(`TestIntervalCastFromString` — `::interval`/`CAST(...)` forms across
+day/month/year, singular/plural units, negative magnitudes, cross-checked
+against the equivalent `INTERVAL '<n>' <unit>` typed literal via
+`compareDatum`'s existing interval-ordering support;
+`TestIntervalCastFromStringInvalidSyntax` — garbage, unsupported unit, and
+two shapes real PG accepts but v0 deliberately doesn't yet
+(`'1 year 2 months'`, `'01:02:03'`) all raise `22007`). Gates: `go build
+./...` clean; `go test ./internal/executor/... ./internal/planner/...
+./internal/parser/... ./internal/analyzer/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+Still deferred, unchanged: sub-day interval units and multi-component
+interval strings (`'1 year 2 months 3 days'`, `'01:02:03'`) — both the typed
+literal and the cast path reject them identically now, so there is no
+remaining asymmetry between the two entry points for this v0 interval type.
+
 ## Cross-references
 
 - TPC-H query bodies: HammerDB upstream
