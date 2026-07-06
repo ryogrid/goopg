@@ -1807,3 +1807,19 @@ mirroring M0119's ledger `status` column.
 > means it need not be complete at filing. Small/residual entries (TOAST
 > compression, autovacuum, FDW/HANDLER stub, GIST, LANGUAGE C) fold into the
 > nearest cluster by the triage.
+
+## Infra (non-milestone; does not gate M0122 PG-compat work)
+
+- [ ] **Nightly whole-suite regression batch — implementation** (~6). Design is
+      DONE and committed: `analysis/tests-overview-260706/` (test-landscape
+      snapshot) → `ci/design/` (6-doc architecture: S0 preflight → S1 two
+      parallel lanes [units+race / testport+pgbench-smoke] → S2 solo TPC-H →
+      S3 summary, plus a `flock`-guarded resident scheduler hooked from
+      `~/.ralph/ralph_loop.sh`). Indexed in `docs/design/README.md` (Design
+      Bundles). **Nothing under `ci/batch/` exists yet** — next step is to
+      implement `ci/batch/run-nightly.sh` + `lib/common.sh` + the `stage-*.sh`
+      scripts per `ci/design/01-architecture.md`'s layout, starting with S0
+      preflight (cheapest to verify standalone) before wiring the two S1
+      lanes. Low priority relative to the M0122 PG-compat buckets above — pick
+      up only when no M0122/M0119 item is in flight, since this is
+      Ralph-tooling, not user-facing PG compatibility.
