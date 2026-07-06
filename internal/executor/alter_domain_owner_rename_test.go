@@ -321,3 +321,67 @@ func TestAlterDomainDropConstraint(t *testing.T) {
 		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
 	}
 }
+
+// TestAlterDomainSetDropDefault guards the SET/DROP DEFAULT follow-up: `ALTER
+// DOMAIN name SET DEFAULT expr` / `ALTER DOMAIN name DROP DEFAULT`. Mirrors
+// CREATE DOMAIN's own DEFAULT clause (same parseExpr + DefaultBin render
+// path), and TestAlterDomainAddConstraint/TestAlterDomainDropConstraint's
+// error-code conventions.
+func TestAlterDomainSetDropDefault(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE DOMAIN setdefaulttest_domain AS int`); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+	d, found := im.LookupDomain("setdefaulttest_domain")
+	if !found {
+		t.Fatal("domain not found via LookupDomain")
+	}
+	if d.Default != nil {
+		t.Fatalf("Default before SET DEFAULT = %v, want nil", d.Default)
+	}
+
+	if err := runDDL(t, ctx, `ALTER DOMAIN setdefaulttest_domain SET DEFAULT 42`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... SET DEFAULT: %v", err)
+	}
+	if d.Default == nil || d.DefaultBin() != "42" {
+		t.Errorf("DefaultBin() after SET DEFAULT = %q, want 42", d.DefaultBin())
+	}
+
+	// A later SET DEFAULT replaces the prior expression outright.
+	if err := runDDL(t, ctx, `ALTER DOMAIN setdefaulttest_domain SET DEFAULT 7`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... SET DEFAULT (replace): %v", err)
+	}
+	if d.DefaultBin() != "7" {
+		t.Errorf("DefaultBin() after replacing SET DEFAULT = %q, want 7", d.DefaultBin())
+	}
+
+	if err := runDDL(t, ctx, `ALTER DOMAIN setdefaulttest_domain DROP DEFAULT`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... DROP DEFAULT: %v", err)
+	}
+	if d.Default != nil {
+		t.Errorf("Default after DROP DEFAULT = %v, want nil", d.Default)
+	}
+
+	// An unknown domain raises 42704 for both forms.
+	err := runDDL(t, ctx, `ALTER DOMAIN nosuchdomain SET DEFAULT 1`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... SET DEFAULT on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+	err = runDDL(t, ctx, `ALTER DOMAIN nosuchdomain DROP DEFAULT`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... DROP DEFAULT on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+}

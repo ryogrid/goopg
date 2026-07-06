@@ -462,3 +462,66 @@ to distinguish. `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, `SET SCHEMA`
 remain no-ops, and domain restart persistence is still entirely unbuilt
 (all unchanged from the notes above). See the matching 2026-07-06 deferral
 ledger row for the full resume-point detail.
+
+## Follow-up: `ALTER DOMAIN ... SET DEFAULT` / `DROP DEFAULT`
+
+Picked up the `SET`/`DROP DEFAULT` item from the prior row's "remaining
+`ALTER DOMAIN` sub-forms" list — the only one of the three left (`SET`/`DROP
+NOT NULL`, `SET SCHEMA`) that is purely mechanical: it reuses the exact
+`Default parser.Expr` field and `DefaultBin()` render path `CREATE DOMAIN
+... DEFAULT expr` already populates, with no cross-table scan and no new
+catalog field.
+
+1. **Parser**: `AlterDomainStmt` gained a `DefaultExpr Expr` field. The
+   domain branch in `parseAlter` (`internal/parser/ddl.go`) gained a `SET`
+   arm (`p.acceptKeyword(KwSet)`) that, on a following `DEFAULT`, calls the
+   same `p.parseExpr()` CREATE DOMAIN's own DEFAULT clause uses, and a `DROP`
+   arm restructured to a single `p.acceptKeyword(KwDrop)` guarding nested
+   `CONSTRAINT`/`DEFAULT` checks (previously `DROP CONSTRAINT` was matched by
+   `p.acceptKeyword(KwDrop) && p.acceptKeyword(KwConstraint)` in one
+   expression — harmless on its own, but a naive `DROP DEFAULT` arm added the
+   same way would have been unreachable: Go still evaluates and consumes the
+   left `KwDrop` operand even when the right operand fails to match, so by
+   the time a second `p.acceptKeyword(KwDrop) && p.acceptKeyword(KwDefault)`
+   ran, `DROP` would already have been eaten by the first failed attempt).
+   `SET NOT NULL`/`DROP NOT NULL`/`SET SCHEMA` still fall through to the
+   pre-existing generic no-op token-discard loop — consuming `SET`/`DROP`
+   before falling through is harmless since that loop only discards tokens up
+   to the statement terminator regardless of what's already gone.
+2. **Catalog**: new `InMemory.SetDomainDefault(name string, expr parser.Expr)
+   bool` sets (or, given a nil `expr`, clears) `Domain.Default` directly —
+   no validation needed since any `Expr` value round-trips through
+   `DefaultBin()` unconditionally, unlike `AddDomainConstraint`'s name-collision
+   check.
+3. **Executor**: `execAlterDomain` gained `"setdefault"`/`"dropdefault"`
+   cases, both just looking the domain up via `SetDomainDefault` and mapping
+   "not found" to `42704`, mirroring `"owner"`'s own not-found handling.
+
+Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainSetDropDefault` (SET DEFAULT populates `Default`/renders via
+`DefaultBin()`, a later SET DEFAULT replaces the prior expression outright,
+DROP DEFAULT clears it back to nil, both forms raise `42704` on an unknown
+domain). Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33).
+
+**Newly discovered (not this loop's scope, recorded for a future loop):**
+while verifying `SET NOT NULL`/`DROP NOT NULL`/`SET SCHEMA` still parse as
+no-ops after the `DROP` restructuring above, found they actually do NOT
+silently no-op as every prior row in this bucket assumed — the shared
+"unmodelled form" fallback (`return &AlterTableStmt{pos: t.Pos}, nil` with no
+`Table` set) dispatches to `execAlterTable`, which immediately raises
+`42P01: relation "" does not exist` on the empty target. Confirmed
+pre-existing at HEAD before this loop's change (same failure via `git
+stash`), not a regression introduced here, and not unique to domains — the
+same `&AlterTableStmt{pos: t.Pos}` fallback pattern appears at 12 sites
+across `internal/parser/ddl.go` for other unimplemented sub-forms. **Remaining:**
+`SET`/`DROP NOT NULL` still needs the `checkDomainNotNull`-style cross-table
+scan (feature-sized, unchanged); `SET SCHEMA` still needs a `Schema` field
+decision on `catalog.Domain` (unchanged); and separately, whichever of the 12
+fallback call sites are actually reachable by a real client statement (as
+opposed to already covered by a more specific branch) should either return a
+true no-op (e.g. a dedicated `NoopStmt`) or be audited case-by-case — needs a
+survey of all 12 sites first, not a one-line fix. Domain restart persistence
+remains entirely unbuilt.

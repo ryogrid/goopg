@@ -18634,6 +18634,23 @@ func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
 	return true
 }
 
+// SetDomainDefault sets or clears an existing domain's DEFAULT expression
+// (`ALTER DOMAIN name SET DEFAULT expr` / `ALTER DOMAIN name DROP DEFAULT`,
+// the latter passing a nil expr), mirroring AlterDomainDefault. Returns false
+// if no such domain is registered. M0122-0005 domain follow-up (SET/DROP
+// DEFAULT).
+func (c *InMemory) SetDomainDefault(name string, expr parser.Expr) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return false
+	}
+	d.Default = expr
+	return true
+}
+
 // TablesWithColumnOfType returns all non-virtual tables that have at least one
 // column whose declared type name matches typeName (case-insensitive). Used by
 // execDropDomain to detect dependent objects before dropping. M0097-0023.

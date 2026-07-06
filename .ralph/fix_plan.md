@@ -449,6 +449,47 @@ candidate: resume the M0110-0001 multi-database isolation survey above, pick
 up one of the remaining ALTER DOMAIN sub-forms, or survey the deferral
 ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #51):** picked up the `SET`/`DROP DEFAULT` sub-form named
+above — the last purely mechanical remaining `ALTER DOMAIN` sub-form (`SET`/
+`DROP NOT NULL` and `SET SCHEMA` both still need a design decision or a
+cross-table scan). `ALTER DOMAIN name SET DEFAULT expr` / `ALTER DOMAIN name
+DROP DEFAULT` now both work, reusing the exact `Domain.Default parser.Expr`/
+`DefaultBin()` field and render path `CREATE DOMAIN ... DEFAULT` already
+populates — no new catalog field needed. `AlterDomainStmt` gained a
+`DefaultExpr Expr` field; new `catalog.InMemory.SetDomainDefault(name,
+expr)`; `execAlterDomain` gained `"setdefault"`/`"dropdefault"` cases, both
+mapping an unknown domain to `42704`. Required restructuring the domain
+branch's `DROP` handling in `parseAlter` (`internal/parser/ddl.go`) from a
+flat `p.acceptKeyword(KwDrop) && p.acceptKeyword(KwConstraint)` into a nested
+`if p.acceptKeyword(KwDrop) { if ...CONSTRAINT...; if ...DEFAULT... }` — Go
+still evaluates and consumes the left `KwDrop` even when the right operand
+fails to match, so a second flat `DROP DEFAULT` arm added the naive way
+would have been unreachable (`DROP` already eaten by the failed `CONSTRAINT`
+check). Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainSetDropDefault`. See
+`docs/design/0122-0005-alter-type-owner-rename.md`'s new "Follow-up: `ALTER
+DOMAIN ... SET DEFAULT` / `DROP DEFAULT`" section and the matching ledger
+row. Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33). **Newly discovered, out of this loop's scope (ledger
+row):** while verifying `SET NOT NULL`/`DROP NOT NULL`/`SET SCHEMA` still
+parse as harmless no-ops after the `DROP` restructuring, found they actually
+raise a spurious `42P01: relation "" does not exist` instead — the shared
+"unmodelled ALTER DOMAIN form" fallback returns `&AlterTableStmt{pos:
+t.Pos}` with no `Table` set, and `execAlterTable` fails the empty-name
+lookup immediately. Confirmed pre-existing at HEAD before this loop (`git
+stash` reproduction), not a regression from this loop's parser change, and
+not domain-specific — 12 sites in `internal/parser/ddl.go` share the
+identical fallback pattern for other unimplemented DDL sub-forms. Remaining
+`ALTER DOMAIN` sub-forms: `SET`/`DROP NOT NULL` (cross-table scan,
+feature-sized), `SET SCHEMA` (no `Schema` field on `catalog.Domain` yet).
+Domain restart persistence is still entirely unbuilt. Next candidate:
+survey the 12 `&AlterTableStmt{pos: t.Pos}` fallback sites for the
+false-no-op bug (bounded, mechanical once scoped), resume the M0110-0001
+multi-database isolation survey above, or survey the deferral ledger for a
+fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

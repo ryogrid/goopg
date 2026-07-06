@@ -18397,6 +18397,16 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
 		}
 		return nil
+	case "setdefault":
+		if !cat.SetDomainDefault(s.Name, s.DefaultExpr) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	case "dropdefault":
+		if !cat.SetDomainDefault(s.Name, nil) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
 	}
 	return nil
 }

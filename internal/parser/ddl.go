@@ -7955,32 +7955,57 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return addStmt, nil
 		}
-		if p.acceptKeyword(KwDrop) && p.acceptKeyword(KwConstraint) {
-			// ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] constraint_name
-			// [RESTRICT | CASCADE]. M0122-0005 domain follow-up.
-			ifExists := false
-			if p.acceptKeyword(KwIf) {
-				if _, err := p.expectKeyword(KwExists); err != nil {
+		if p.acceptKeyword(KwSet) {
+			// ALTER DOMAIN name SET DEFAULT expr — reuses parseExpr the same
+			// way CREATE DOMAIN's own DEFAULT clause does, so the stored AST
+			// round-trips through pg_dump identically either way. `SET` alone
+			// (without a following DEFAULT, e.g. `SET NOT NULL`) falls through
+			// to the generic no-op below — SET is already consumed by then,
+			// which is harmless since that loop just discards tokens to the
+			// statement terminator. M0122-0005 domain follow-up (SET/DROP
+			// DEFAULT).
+			if p.acceptKeyword(KwDefault) {
+				expr, err := p.parseExpr()
+				if err != nil {
 					return nil, err
 				}
-				ifExists = true
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "setdefault", DefaultExpr: expr}, nil
 			}
-			conNameTok, err := p.parseIdent()
-			if err != nil {
-				return nil, err
-			}
-			// Optional RESTRICT/CASCADE drop-behavior trailer — parsed and
-			// discarded; goopg tracks no dependents on a domain CHECK to
-			// cascade over.
-			if !p.acceptKeyword(KwCascade) {
-				p.acceptKeyword(KwRestrict)
-			}
-			return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropconstraint", ConstraintName: identText(conNameTok), IfExists: ifExists}, nil
 		}
-		// Unmodelled ALTER DOMAIN form (SET/DROP DEFAULT, SET/DROP NOT NULL,
-		// SET SCHEMA) — consume to the terminator and return a no-op,
-		// mirroring the compat-stub loop's prior behavior for this statement
-		// family.
+		if p.acceptKeyword(KwDrop) {
+			if p.acceptKeyword(KwConstraint) {
+				// ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] constraint_name
+				// [RESTRICT | CASCADE]. M0122-0005 domain follow-up.
+				ifExists := false
+				if p.acceptKeyword(KwIf) {
+					if _, err := p.expectKeyword(KwExists); err != nil {
+						return nil, err
+					}
+					ifExists = true
+				}
+				conNameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				// Optional RESTRICT/CASCADE drop-behavior trailer — parsed and
+				// discarded; goopg tracks no dependents on a domain CHECK to
+				// cascade over.
+				if !p.acceptKeyword(KwCascade) {
+					p.acceptKeyword(KwRestrict)
+				}
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropconstraint", ConstraintName: identText(conNameTok), IfExists: ifExists}, nil
+			}
+			if p.acceptKeyword(KwDefault) {
+				// ALTER DOMAIN name DROP DEFAULT. M0122-0005 domain follow-up.
+				return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropdefault"}, nil
+			}
+			// DROP NOT NULL falls through to the generic no-op below — DROP
+			// is already consumed by then, same harmless-discard rationale as
+			// the SET branch above.
+		}
+		// Unmodelled ALTER DOMAIN form (SET/DROP NOT NULL, SET SCHEMA) —
+		// consume to the terminator and return a no-op, mirroring the
+		// compat-stub loop's prior behavior for this statement family.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
