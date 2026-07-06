@@ -278,6 +278,51 @@ every clean, green (build + pre-commit) checkpoint.
       repro, NOT the insert-only unit test), now that both the splitMu
       race and the missing-cascade bug are confirmed fixed and ruled out
       as the cause of this recurrence.
+      2026-07-07 update #6 (8th loop; see deferral ledger row appended
+      today): LANDED a real, previously-flagged fix (not the third root
+      cause, but closes a genuine gap): `pinNewOrRecycled` (btree.go)
+      now returns its slot still content-locked in BOTH branches
+      (recycled and fresh-`PinNew`, via a new `pinNewLocked` helper),
+      instead of unlocking a zeroed/transitional page before the
+      caller re-locks to stamp real content — verified via build +
+      `go test -race ./internal/access/btree/...` (clean) that this
+      doesn't regress anything, but a fresh authoritative
+      `stage-pgbench.sh` re-run confirms it does NOT fix the nightly
+      item (still fails identically). Also RULED OUT two hypotheses
+      empirically: posting-list re-encoding (`appendTIDToPosting`/
+      `promoteSingleToPosting` are dead code outside tests;
+      `dedupConsolidate` never re-marshals as posting bytes in the
+      live insert/split path — postings only exist from `BulkCreate`),
+      and the `rightmostLeafBlk` insert fast-path cache
+      (`tryInsertOnCachedRightmost`) — confirmed via a throwaway probe
+      test that this whole path is 100% dead code today: its
+      populate/staleness checks (btree.go:1299/1998) compare
+      `op.Next` against `0` instead of the actual "no right sibling"
+      sentinel `storage.InvalidBlockNumber` used everywhere else in
+      the file, so the cache never populates. NOT fixed (activating a
+      dormant path deserves its own dedicated loop). **Most valuable
+      finding**: a much cheaper repro. `pgbench -i -s 50` once
+      (single-threaded, confirmed CLEAN via `bt_index_check`/
+      `bt_index_parent_check` on all 3 pkey indexes — corruption is
+      NOT present at load time), then reusing that same loaded DB,
+      `pgbench -c 100 -j 20 -T 25 -P 5` reproduces the exact
+      `keyLen=9 total=37` failure in ~10s (vs. 15-30+ min for the full
+      authoritative gate). Post-failure `bt_index_check` on
+      `pgbench_accounts_pkey` shows WIDESPREAD "item order invariant
+      violated" across hundreds of leaf blocks (as low as block 5) plus
+      one genuinely byte-corrupt page (block 1096, same keyLen=9/
+      total=37 signature) — a single mis-split's effects likely cascade
+      across the sibling chain, or multiple independent occurrences.
+      Next step: instrument the SPLIT path (`insertIntoBlock`,
+      btree.go:~1420-1660, under `bt.splitMu`) using the new cheap
+      repro — pgbench_accounts has 5M rows at scale=50 so splits are
+      frequent/constant, unlike the tiny branches/tellers tables. One
+      concrete, NOT-yet-proven lead: `tryInsertNoSplit`/
+      `tryInsertOnCachedRightmost` (the no-splitMu fast path) never
+      check `op.HasIncompleteSplit()`/call `finishSplit`, unlike the
+      documented crash-recovery contract for `BTIncompleteSplit` —
+      confirmed via grep, not yet confirmed exploitable. Full repro
+      recipe + evidence in today's deferral ledger row.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
