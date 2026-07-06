@@ -240,12 +240,26 @@ column-level (`pg_attribute.attacl`) grantor tracking" section and the
 matching 2026-07-06 ledger row. **Newly deferred (ledger row):** column-level
 `GRANT ... GRANTED BY <role>` is parsed-and-discarded, not validated against
 the acting role (unlike the object-privilege path's
-`errGrantorMustBeCurrentUser` check) — a narrower gap than before. Next
-candidate: the one remaining mechanical follow-up from the 2026-07-06
-grantor-tracking row — `TYPE`/`DOMAIN`/`DATABASE`/`PARAMETER` ACL grantor
-wiring (thread `ectx.NonSuperuserRole` into `execTypeACLChange`/
-`execDatabaseACLChange`/`execParameterACLChange`, same shape as both grantor
-fixes) — or resume the M0110-0001 multi-database isolation survey above.
+`errGrantorMustBeCurrentUser` check) — a narrower gap than before.
+
+**2026-07-06 (yet another later loop, this one):** picked up the last
+remaining mechanical follow-up from the grantor-tracking row —
+`TYPE`/`DOMAIN`/`DATABASE`/`PARAMETER` ACL grantor wiring. `typacl`/`datacl`/
+`paracl` already shared `tableACLs`/`tableACLGrantor` with `relacl` (unlike
+`attacl`'s separate store), so the fix was purely three call-site edits:
+`execTypeACLChange`/`execDatabaseACLChange`/`execParameterACLChange` now call
+`GrantTablePrivilegeAs(..., o.ctx.NonSuperuserRole)` instead of the
+grantor-blind `GrantTablePrivilegeWithGrantOption` wrapper. Tests:
+`internal/executor/operators_ddl_acl_grantor_test.go` (3 new tests). See the
+`0119-0004-table-acl-grantor-tracking.md` design doc's new "Follow-up:
+`TYPE`/`DATABASE`/`PARAMETER` ACL grantor wiring" section and the matching
+deferral ledger row. **This closes every named mechanical follow-up from the
+2026-07-06 object-privilege ACL grantor tracking slice** — only `GRANTED BY`
+validation for these three statement kinds (needs new parser AST plumbing, a
+distinct follow-up) and grant-option delegation-chain resolution
+(feature-sized) remain deferred. Next candidate: resume the M0110-0001
+multi-database isolation survey above, or survey the deferral ledger for a
+fresh open (`status = -`) row.
 
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 

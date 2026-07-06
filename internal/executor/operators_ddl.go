@@ -16160,7 +16160,12 @@ func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind
 // privilege is USAGE, and acldefault('T', owner) grants USAGE to BOTH the owner
 // and PUBLIC (structurally identical to the function EXECUTE default), so the
 // store update mirrors recordFunctionGrant / recordFunctionRevoke verbatim with
-// USAGE. Unknown type names are a successful no-op. M0119-0004-ACLHEAP.
+// USAGE. Unknown type names are a successful no-op. The grantor stamped on each
+// grant is the session's current effective role (o.ctx.NonSuperuserRole, empty
+// meaning the bootstrap superuser), mirroring tryRecordTableGrant's grantor
+// attribution for relacl/nspacl/proacl — typacl shares the same tableACLs/
+// tableACLGrantor store via relaclTextLockedFor, so no separate grantor map was
+// needed here. M0119-0004-ACLHEAP.
 func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -16189,7 +16194,7 @@ func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
 			// by the renderer's owner branch (TypeACLText / relaclTextLockedFor).
 			im.GrantTablePrivilege(oid, "PUBLIC", "USAGE")
 			for _, role := range tc.Grantees {
-				im.GrantTablePrivilegeWithGrantOption(oid, role, "USAGE", tc.WithGrantOption)
+				im.GrantTablePrivilegeAs(oid, role, "USAGE", tc.WithGrantOption, o.ctx.NonSuperuserRole)
 			}
 		}
 		if err := o.resyncTypeACLHeapRow(im, oid, kind); err != nil {

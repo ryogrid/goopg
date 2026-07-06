@@ -223,4 +223,59 @@ regressions); `scripts/tpch-spotcheck.sh` PASS.
   equivalent for `AttrACLChange`) — a narrower gap than the object-privilege
   path, which does validate it.
 - `TYPE`/`DOMAIN`/`DATABASE`/`PARAMETER` ACL grantor wiring (the second
-  original deferred item above) remains open.
+  original deferred item above) remains open. **Landed as a follow-up, see
+  below.**
+
+## Follow-up: `TYPE`/`DATABASE`/`PARAMETER` ACL grantor wiring (2026-07-06)
+
+The second deferred item above is now closed. Unlike `attacl`, `typacl`/
+`datacl`/`pg_parameter_acl.paracl` were never a structurally separate store —
+they already share `tableACLs`/`tableACLGrantor` via the common
+`relaclTextLockedFor` renderer (types/databases/parameters mint their ACL OID
+from the same `nextOID` counter as relations), so `GrantTablePrivilegeAs` was
+already fully generic and grantor-aware. The gap was purely that the three
+executor call sites still called the grantor-blind
+`GrantTablePrivilegeWithGrantOption` wrapper (which always defaults the
+grantor to the object owner):
+
+- `execTypeACLChange` (`internal/executor/operators_ddl.go`)
+- `execDatabaseACLChange` (`internal/executor/operators_ddl_database_acl.go`)
+- `execParameterACLChange` (`internal/executor/operators_ddl_parameter_acl.go`)
+
+Each GRANT-branch call now reads `im.GrantTablePrivilegeAs(oid, role, priv,
+withGrantOption, o.ctx.NonSuperuserRole)` instead, stamping the session's
+current effective role as grantor exactly as `tryRecordTableGrant`/
+`execAttrACLChange` already do for `relacl`/`nspacl`/`proacl`/`attacl`. No new
+grantor map, catalog method, or heap-render change was needed — the fix is
+confined to the three call sites, since `relaclTextLockedFor`/`TypeACLText`/
+`DatabaseACLText`/`ParameterACLText` already read `tableACLGrantor` per
+grantee.
+
+Tests: `internal/executor/operators_ddl_acl_grantor_test.go`
+(`TestExecTypeACLChangeStampsActingRoleAsGrantor`,
+`TestExecDatabaseACLChangeStampsActingRoleAsGrantor`,
+`TestExecParameterACLChangeStampsActingRoleAsGrantor`), each mirroring
+`TestRelaclTextGrantor`'s shape but driving the change through the executor
+entry point instead of the catalog primitive directly.
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+### Newly deferred (this follow-up)
+
+- The object-privilege `GRANTED BY <role>` validation
+  (`errGrantorMustBeCurrentUser`) that guards `relacl`/`nspacl`/`proacl`/
+  `srvacl`/`fdwacl` grants is **not** mirrored for `TYPE`/`DATABASE`/
+  `PARAMETER` grants: the parser's shared clause-stripper
+  (`internal/parser/parser.go:283`) discards `GRANTED BY <role>` for these
+  three statement kinds without capturing it into the AST at all (unlike
+  `RoleMembershipChange`, whose `GrantedBy` field the parser does populate) —
+  so there is nothing yet for the executor to validate against. Adding that
+  would need a parser-level `GrantedBy` field on `TypeACLChange`/
+  `DatabaseACLChange`/`ParameterACLChange` first; out of scope for this
+  grantor-*storage* slice, which only had to thread the already-resolved
+  acting role into an already-generic catalog primitive.
+- No PostgreSQL grant-option delegation-chain resolution
+  (`select_best_grantor`) for these three object kinds either — same
+  accepted simplification as the original table-ACL fix.

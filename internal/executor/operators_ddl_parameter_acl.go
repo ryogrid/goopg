@@ -82,7 +82,12 @@ func (o *ddlOp) checkParameterACLName(name string) error {
 // already-materialized name again); REVOKE also just looks up — a REVOKE
 // naming a GUC with no ACL entry has nothing to remove and is a pure no-op,
 // never creating a row (goopg previously materialized one unconditionally,
-// a divergence fixed alongside this validation).
+// a divergence fixed alongside this validation). The grantor stamped on each
+// grant is the session's current effective role (o.ctx.NonSuperuserRole,
+// empty meaning the bootstrap superuser), mirroring tryRecordTableGrant's/
+// execTypeACLChange's grantor attribution — paracl shares the same
+// tableACLs/tableACLGrantor store via relaclTextLockedFor, so no separate
+// grantor map was needed here.
 // M0119-0004-ACLHEAP (parameter ACL half).
 func (o *ddlOp) execParameterACLChange(pc *parser.ParameterACLChange) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
@@ -124,7 +129,7 @@ func (o *ddlOp) execParameterACLChange(pc *parser.ParameterACLChange) error {
 			oid := im.ParameterACLOID(name)
 			for _, role := range pc.Grantees {
 				for _, p := range privs {
-					im.GrantTablePrivilegeWithGrantOption(oid, role, p, pc.WithGrantOption)
+					im.GrantTablePrivilegeAs(oid, role, p, pc.WithGrantOption, o.ctx.NonSuperuserRole)
 				}
 			}
 		}
