@@ -1272,6 +1272,28 @@ const (
 	// Format: kind(1) | ownerOID(4) | nameLen(2) | name(nameLen bytes).
 	RecordKindAlterRangeTypeOwner byte = 118
 
+	// RecordKindCreateDomain records a `CREATE DOMAIN name AS basetype ...`
+	// event so a domain survives a restart. catalog.InMemory's domains map is
+	// a pure in-memory registry (no per-domain on-disk file namespace, like
+	// range types/access methods), so the physical redo path is a no-op; the
+	// recovery driver in internal/initdb/domain_ddl_recovery.go re-registers
+	// the domain (including every CHECK constraint and its OID) after
+	// physical replay. Domains are not schema-scoped (keyed by name only,
+	// like a range type). M0122-0005 restart-persistence follow-up (deferral
+	// ledger 2026-07-06 row: "domains have no restart persistence at all").
+	// Format: kind(1) | oid(4) | arrayOID(4) | baseOID(4) | ownerOID(4) |
+	//   flags(1: bit0=NotNull bit1=BaseIsEnum) | nameLen(2)+name |
+	//   baseNameLen(2)+baseName | baseArgsCount(2) + baseArgsCount×int64(8) |
+	//   defaultLen(2)+defaultSQL | checksCount(2) + checksCount× (
+	//     checkOID(4) | checkNameLen(2)+checkName | exprLen(2)+expr |
+	//     inValuesCount(2) + inValuesCount×(len(2)+value) ).
+	RecordKindCreateDomain byte = 119
+
+	// RecordKindDropDomain records a `DROP DOMAIN name` event. Counterpart to
+	// RecordKindCreateDomain; same no-op physical redo path.
+	// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+	RecordKindDropDomain byte = 120
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -2473,6 +2495,214 @@ func DecodeAlterRangeTypeOwner(payload []byte) (name string, ownerOID uint32, er
 	}
 	name = string(payload[7 : 7+nameLen])
 	return name, ownerOID, nil
+}
+
+// DomainCheckPayload is one CHECK constraint carried by a
+// RecordKindCreateDomain record, mirroring catalog.DomainCheck.
+type DomainCheckPayload struct {
+	OID      uint32
+	Name     string
+	Expr     string
+	InValues []string
+}
+
+// CreateDomainPayload carries the metadata needed to fully reconstruct a
+// catalog.Domain during WAL replay. Format documented at the
+// RecordKindCreateDomain constant.
+type CreateDomainPayload struct {
+	Name       string
+	OID        uint32
+	ArrayOID   uint32
+	BaseName   string
+	BaseArgs   []int64
+	BaseOID    uint32
+	BaseIsEnum bool
+	NotNull    bool
+	Owner      uint32
+	DefaultSQL string // "" means no DEFAULT
+	Checks     []DomainCheckPayload
+}
+
+// EncodeCreateDomain encodes a CREATE DOMAIN event (M0122-0005
+// restart-persistence follow-up). Format documented at the
+// RecordKindCreateDomain constant.
+func EncodeCreateDomain(p CreateDomainPayload) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte(RecordKindCreateDomain)
+	var b4 [4]byte
+	binary.LittleEndian.PutUint32(b4[:], p.OID)
+	buf.Write(b4[:])
+	binary.LittleEndian.PutUint32(b4[:], p.ArrayOID)
+	buf.Write(b4[:])
+	binary.LittleEndian.PutUint32(b4[:], p.BaseOID)
+	buf.Write(b4[:])
+	binary.LittleEndian.PutUint32(b4[:], p.Owner)
+	buf.Write(b4[:])
+	var flags byte
+	if p.NotNull {
+		flags |= 1
+	}
+	if p.BaseIsEnum {
+		flags |= 2
+	}
+	buf.WriteByte(flags)
+	var b2 [2]byte
+	writeStr16 := func(s string) {
+		if len(s) > 0xFFFF {
+			s = s[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(b2[:], uint16(len(s)))
+		buf.Write(b2[:])
+		buf.WriteString(s)
+	}
+	writeStr16(p.Name)
+	writeStr16(p.BaseName)
+	if len(p.BaseArgs) > 0xFFFF {
+		p.BaseArgs = p.BaseArgs[:0xFFFF]
+	}
+	binary.LittleEndian.PutUint16(b2[:], uint16(len(p.BaseArgs)))
+	buf.Write(b2[:])
+	var b8 [8]byte
+	for _, a := range p.BaseArgs {
+		binary.LittleEndian.PutUint64(b8[:], uint64(a))
+		buf.Write(b8[:])
+	}
+	writeStr16(p.DefaultSQL)
+	if len(p.Checks) > 0xFFFF {
+		p.Checks = p.Checks[:0xFFFF]
+	}
+	binary.LittleEndian.PutUint16(b2[:], uint16(len(p.Checks)))
+	buf.Write(b2[:])
+	for _, c := range p.Checks {
+		binary.LittleEndian.PutUint32(b4[:], c.OID)
+		buf.Write(b4[:])
+		writeStr16(c.Name)
+		writeStr16(c.Expr)
+		if len(c.InValues) > 0xFFFF {
+			c.InValues = c.InValues[:0xFFFF]
+		}
+		binary.LittleEndian.PutUint16(b2[:], uint16(len(c.InValues)))
+		buf.Write(b2[:])
+		for _, v := range c.InValues {
+			writeStr16(v)
+		}
+	}
+	return buf.Bytes()
+}
+
+// DecodeCreateDomain decodes a RecordKindCreateDomain payload.
+func DecodeCreateDomain(payload []byte) (CreateDomainPayload, error) {
+	var p CreateDomainPayload
+	if len(payload) < 18 {
+		return p, fmt.Errorf("wal: create-domain payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateDomain {
+		return p, fmt.Errorf("wal: record kind %d is not create-domain", payload[0])
+	}
+	p.OID = binary.LittleEndian.Uint32(payload[1:5])
+	p.ArrayOID = binary.LittleEndian.Uint32(payload[5:9])
+	p.BaseOID = binary.LittleEndian.Uint32(payload[9:13])
+	p.Owner = binary.LittleEndian.Uint32(payload[13:17])
+	flags := payload[17]
+	p.NotNull = flags&1 != 0
+	p.BaseIsEnum = flags&2 != 0
+	off := 18
+	readStr16 := func() (string, error) {
+		if len(payload) < off+2 {
+			return "", fmt.Errorf("wal: create-domain payload truncated at offset %d", off)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if len(payload) < off+l {
+			return "", fmt.Errorf("wal: create-domain string truncated (need %d bytes at %d)", l, off)
+		}
+		s := string(payload[off : off+l])
+		off += l
+		return s, nil
+	}
+	var err error
+	if p.Name, err = readStr16(); err != nil {
+		return p, err
+	}
+	if p.BaseName, err = readStr16(); err != nil {
+		return p, err
+	}
+	if len(payload) < off+2 {
+		return p, fmt.Errorf("wal: create-domain payload truncated at offset %d (base args count)", off)
+	}
+	argCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	for i := 0; i < argCount; i++ {
+		if len(payload) < off+8 {
+			return p, fmt.Errorf("wal: create-domain payload truncated (base arg at %d)", off)
+		}
+		p.BaseArgs = append(p.BaseArgs, int64(binary.LittleEndian.Uint64(payload[off:off+8])))
+		off += 8
+	}
+	if p.DefaultSQL, err = readStr16(); err != nil {
+		return p, err
+	}
+	if len(payload) < off+2 {
+		return p, fmt.Errorf("wal: create-domain payload truncated at offset %d (checks count)", off)
+	}
+	checkCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+	off += 2
+	for i := 0; i < checkCount; i++ {
+		var c DomainCheckPayload
+		if len(payload) < off+4 {
+			return p, fmt.Errorf("wal: create-domain payload truncated (check oid at %d)", off)
+		}
+		c.OID = binary.LittleEndian.Uint32(payload[off : off+4])
+		off += 4
+		if c.Name, err = readStr16(); err != nil {
+			return p, err
+		}
+		if c.Expr, err = readStr16(); err != nil {
+			return p, err
+		}
+		if len(payload) < off+2 {
+			return p, fmt.Errorf("wal: create-domain payload truncated (invalues count at %d)", off)
+		}
+		inCount := int(binary.LittleEndian.Uint16(payload[off : off+2]))
+		off += 2
+		for j := 0; j < inCount; j++ {
+			v, verr := readStr16()
+			if verr != nil {
+				return p, verr
+			}
+			c.InValues = append(c.InValues, v)
+		}
+		p.Checks = append(p.Checks, c)
+	}
+	return p, nil
+}
+
+// EncodeDropDomain encodes a DROP DOMAIN event. Format documented at the
+// RecordKindDropDomain constant.
+func EncodeDropDomain(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropDomain
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropDomain decodes a RecordKindDropDomain payload.
+func DecodeDropDomain(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-domain payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropDomain {
+		return "", fmt.Errorf("wal: record kind %d is not drop-domain", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-domain payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
 }
 
 // CreateOperatorPayload carries the metadata needed to fully reconstruct a
@@ -7782,6 +8012,16 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// internal/initdb/range_type_ddl_recovery.go scans the WAL for these
 		// records after physical replay and re-applies them to the range
 		// type registry.
+		return false, nil
+	case RecordKindCreateDomain, RecordKindDropDomain:
+		// CREATE/DROP DOMAIN records (M0122-0005 restart-persistence
+		// follow-up, deferral ledger 2026-07-06 row) carry only
+		// catalog.InMemory's domains registry metadata; goopg has no
+		// per-domain file namespace, so the physical replay path has nothing
+		// to do. The recovery driver in
+		// internal/initdb/domain_ddl_recovery.go scans the WAL for these
+		// records after physical replay and re-applies them to the domain
+		// registry.
 		return false, nil
 	case RecordKindCreateOperator, RecordKindDropOperator, RecordKindGrantRoleMembership, RecordKindRevokeRoleMembership:
 		// CREATE/DROP OPERATOR (DU-002 restart-persistence follow-up,

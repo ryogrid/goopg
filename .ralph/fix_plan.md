@@ -528,6 +528,41 @@ above, pick up domain restart persistence or one of the remaining
 feature-sized `ALTER DOMAIN` gaps, or survey the deferral ledger for a
 fresh open (`status = -`) row.
 
+**2026-07-06 (loop #53):** picked up domain restart persistence, the last
+named resume point in the M0122-0005 domain bucket. Two new WAL record
+kinds, `RecordKindCreateDomain`/`RecordKindDropDomain` (119/120, buffer-based
+encoding mirroring `EncodeColumnDefaults` rather than range type's
+fixed-offset layout, since `Checks`/`InValues` are nested variable-length
+lists), carry the full domain definition (base type, NOT NULL, DEFAULT text,
+every CHECK constraint + OID, owner). New `internal/initdb/
+domain_ddl_recovery.go`'s `replayDomainDDLRecords` (wired into `Open` right
+after `replayRangeTypeDDLRecords`) and `catalog.InMemory.
+RegisterDomainDuringRecovery`/`DropDomainDuringRecovery` mirror the
+range-type recovery precedent. `execCreateDomain`/`execDropDomain` append
+the records. Verified against a real running server (not just unit tests):
+`CREATE DOMAIN us_zip AS varchar(10) NOT NULL DEFAULT '00000' CHECK
+(length(VALUE::text) = 5)`, full `stop`/`start` restart, `\dD`/
+`pg_get_expr(typdefaultbin,0)`/`pg_get_constraintdef` all identical
+before/after. Tests: `internal/wal/domain_ddl_test.go`,
+`internal/initdb/domain_ddl_recovery_test.go`. See `docs/design/
+0122-0005-alter-type-owner-rename.md`'s new "Follow-up: domain restart
+persistence" section, `docs/design/README.md`'s updated row, and the
+matching deferral ledger row. Gates: `go build ./...` clean; `go test
+./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/planner/... ./internal/wal/... ./internal/initdb/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33). **Newly discovered, out of scope (separate fresh
+ledger row):** domain NOT NULL/CHECK constraints are not enforced at all on
+table columns — reproduced with no restart involved, so it predates this
+loop and is a DML-path validation gap, not a persistence one. Remaining
+`ALTER DOMAIN` gaps (unchanged): `SET`/`DROP NOT NULL` (cross-table scan),
+`SET SCHEMA` (no `Schema` field yet), and WAL records for the later ALTER
+DOMAIN sub-forms (rename/owner/etc. — only the state as of CREATE DOMAIN
+survives a restart today). Next candidate: pick up the newly discovered
+domain-constraint-enforcement gap, resume the M0110-0001 multi-database
+isolation survey above, or survey the deferral ledger for a fresh open
+(`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

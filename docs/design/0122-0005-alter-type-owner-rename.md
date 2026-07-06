@@ -589,3 +589,96 @@ domain still needs the `checkDomainNotNull`-style cross-table scan;
 domain restart persistence remains entirely unbuilt. This follow-up only
 fixed the *no-op mechanism* (wrong error where none should occur), not any
 of the underlying feature-sized gaps.
+
+## Follow-up: domain restart persistence (`CREATE`/`DROP DOMAIN` WAL records)
+
+**Gap:** unlike every other user-defined type kind (enum, composite, range),
+`catalog.Domain` had no WAL record and no `internal/initdb/*_ddl_recovery.go`
+replay driver at all — `CREATE DOMAIN` never wrote anything to the WAL, so a
+server restart silently forgot every domain: its base type, `NOT NULL`,
+`DEFAULT`, every `CHECK` constraint, and its owner. This was the last named
+resume point in the M0122-0005 domain bucket (every prior follow-up in this
+section — RENAME TO/OWNER TO, RENAME CONSTRAINT, ADD/DROP CONSTRAINT, SET/DROP
+DEFAULT — explicitly deferred it).
+
+**Fix:** two new WAL record kinds, mirroring the `RangeType` precedent
+(`RecordKindCreateRangeType`/`RecordKindDropRangeType`):
+
+- `RecordKindCreateDomain` (119): carries the domain's OID/ArrayOID, base type
+  name + typmod args, resolved enum `BaseOID`/`BaseIsEnum`, `NotNull`, owner,
+  the `DEFAULT` expression as SQL text (`catalog.FormatExprForAttrdef` — the
+  same base-form-no-domain-decoration text `RecordKindColumnDefaults` already
+  uses for column defaults, re-parsed via `parser.ParseExpr` on replay; the
+  domain-specific `::type` cast suffix `Domain.DefaultBin()` adds is computed
+  dynamically from `Base.Name` at render time, so it must *not* be baked into
+  the persisted text or it would double up after a `parser.ParseExpr` round
+  trip), and every `CHECK` constraint (name, expr text, OID, `InValues` for
+  the `IN (...)` shortcut form).
+- `RecordKindDropDomain` (120): name only, mirroring `RecordKindDropRangeType`.
+
+New `wal.EncodeCreateDomain`/`DecodeCreateDomain` (buffer-based, mirroring
+`EncodeColumnDefaults`'s style rather than range type's fixed-offset layout,
+since the nested variable-length `Checks`/`InValues` lists don't fit a flat
+offset scheme) and `wal.EncodeDropDomain`/`DecodeDropDomain`. New
+`catalog.InMemory.RegisterDomainDuringRecovery`/`DropDomainDuringRecovery`
+(mirror `RegisterRangeTypeDuringRecovery`/`DropRangeTypeDuringRecovery`) —
+the register hook also advances `nextOID` past the domain's OID, ArrayOID,
+and every CHECK constraint OID so recovery doesn't reallocate them. New
+`internal/initdb/domain_ddl_recovery.go`'s `replayDomainDDLRecords`, wired
+into `Open` (`internal/initdb/open.go`) right after
+`replayRangeTypeDDLRecords` — domains, like range types, are keyed by a plain
+name string, so ordering relative to schema replay doesn't matter. Both new
+record kinds were added to the physical-replay no-op skip-list
+(`internal/wal/recovery.go`), same as every other catalog-registry-only kind.
+
+`execCreateDomain` (`internal/executor/operators_ddl.go`) now appends a
+`RecordKindCreateDomain` record right after `syncDomainTypeToCatalogHeap`;
+`execDropDomain` appends a `RecordKindDropDomain` record right after a
+successful `cat.DropDomain` call.
+
+Verified against a real running server (not just the unit/recovery tests
+below): `CREATE DOMAIN us_zip AS varchar(10) NOT NULL DEFAULT '00000' CHECK
+(length(VALUE::text) = 5)`, then a full `stop`/`start` restart — `\dD`,
+`pg_get_expr(typdefaultbin, 0)`, and `pg_get_constraintdef` all rendered
+identically before and after the restart.
+
+**Newly discovered, out of scope for this follow-up:** domain `NOT NULL` and
+`CHECK` constraints are not enforced at all on table columns of a domain
+type — `INSERT INTO t (z) VALUES (NULL)` into a `NOT NULL` domain column, and
+`INSERT INTO t (p) VALUES (-5)` into a `CHECK (VALUE > 0)` domain column, both
+silently succeed (reproduced against a *freshly created* domain in the same
+live session, with no restart involved at all — this is not a persistence
+gap, it is runtime DML-path validation that was never wired for domain-typed
+columns in the first place). This is unrelated to the restart-persistence gap
+this follow-up closes (which is only about the domain *definition* surviving
+a restart) and is a materially larger, separate task — real PG enforces this
+via `domain_check`/`ExecEvalConstraintNotNull` coercion nodes wrapped around
+every domain-typed column's INSERT/UPDATE value at plan time
+(`postgres/src/backend/executor/execExprInterp.c`), which goopg's expression
+evaluator has no equivalent for today.
+
+Tests: `internal/wal/domain_ddl_test.go`'s
+`TestEncodeDecodeCreateDomainRoundTrip`/`TestEncodeDecodeDropDomainRoundTrip`/
+`TestDecodeDomainRejectsWrongKindAndTruncatedPayload`;
+`internal/initdb/domain_ddl_recovery_test.go`'s
+`TestDomainDDLRecoveryReplaysCreate`/`TestDomainDDLRecoveryReplaysDropAfterCreate`/
+`TestReplayDomainDDLRecordsHandlesMissingWalDir`/
+`TestReplayDomainDDLRecordsHandlesNilCatalog`. Gates: `go build ./...` clean;
+`go test ./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/planner/... ./internal/wal/... ./internal/initdb/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); manual restart verification against a real running
+server (above).
+
+**Deferred:** `SET`/`DROP NOT NULL` cross-table scan and `SET SCHEMA`'s
+`Domain.Schema` field decision remain open (unchanged, feature-sized). The
+newly discovered domain-constraint-enforcement gap above is recorded in the
+deferral ledger as a fresh, separate item. None of the later `ALTER DOMAIN`
+sub-forms (RENAME TO/OWNER TO/RENAME CONSTRAINT/ADD-DROP CONSTRAINT/SET-DROP
+DEFAULT) got their own WAL records in this follow-up — only the state as of
+`CREATE DOMAIN` (plus whatever ended up folded into the domain by the time it
+was created) survives a restart; a post-CREATE `ALTER DOMAIN` mutation is
+still lost on restart, mirroring the gap the range-type rename/owner-restart
+follow-up closed for that type but which this loop did not extend to domains
+(separate, smaller follow-up: mirror `RecordKindAlterRangeTypeRename`/`Owner`
+(117/118) for domains at kinds 121+).

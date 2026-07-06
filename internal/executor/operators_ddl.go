@@ -18330,6 +18330,36 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
 	syncDomainTypeToCatalogHeap(o.ctx, d)
+	// M0122-0005 restart-persistence follow-up (deferral ledger 2026-07-06
+	// row: "domains have no restart persistence at all"): snapshot the full
+	// domain definition (base type, NOT NULL, DEFAULT, CHECKs, owner) so a
+	// restarted server rediscovers it, mirroring CREATE TYPE ... AS RANGE.
+	if o.ctx.WAL != nil {
+		checks := make([]wal.DomainCheckPayload, 0, len(d.Checks))
+		for _, c := range d.Checks {
+			checks = append(checks, wal.DomainCheckPayload{
+				OID:      c.OID,
+				Name:     c.Name,
+				Expr:     c.Expr,
+				InValues: c.InValues,
+			})
+		}
+		if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateDomain(wal.CreateDomainPayload{
+			Name:       d.Name,
+			OID:        d.OID,
+			ArrayOID:   d.ArrayOID,
+			BaseName:   d.Base.Name,
+			BaseArgs:   d.Base.Args,
+			BaseOID:    d.BaseOID,
+			BaseIsEnum: d.BaseIsEnum,
+			NotNull:    d.NotNull,
+			Owner:      d.Owner,
+			DefaultSQL: catalog.FormatExprForAttrdef(d.Default),
+			Checks:     checks,
+		})); werr != nil {
+			return fmt.Errorf("wal create-domain: %w", werr)
+		}
+	}
 	return nil
 }
 
@@ -18759,6 +18789,11 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
 		names, err := cat.DropDomain(name.Name, false, s.Cascade)
 		if err == nil {
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropDomain(name.Name)); werr != nil {
+					return fmt.Errorf("wal drop-domain: %w", werr)
+				}
+			}
 			for _, tblName := range names {
 				o.ctx.AddNotice(fmt.Sprintf("drop cascades to table %s", tblName))
 			}

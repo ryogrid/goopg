@@ -18412,6 +18412,38 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool) (*Domain
 	return d, nil
 }
 
+// RegisterDomainDuringRecovery re-registers a domain (including every CHECK
+// constraint) reconstructed from a RecordKindCreateDomain WAL record,
+// preserving its original OID/ArrayOID/CHECK OIDs and advancing nextOID past
+// them so subsequent allocations don't collide. Mirrors
+// RegisterRangeTypeDuringRecovery. M0122-0005 restart-persistence follow-up.
+func (c *InMemory) RegisterDomainDuringRecovery(d *Domain) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.domains == nil {
+		c.domains = make(map[string]*Domain)
+	}
+	out := *d
+	c.domains[strings.ToLower(d.Name)] = &out
+	c.advanceNextOIDLocked(d.OID)
+	c.advanceNextOIDLocked(d.ArrayOID)
+	for _, chk := range d.Checks {
+		c.advanceNextOIDLocked(chk.OID)
+	}
+}
+
+// DropDomainDuringRecovery removes a domain reconstructed during WAL replay,
+// mirroring DropRangeTypeDuringRecovery. Unlike the live DropDomain path, it
+// does not scan for or cascade to dependent tables — a WAL replay drop
+// record is only ever emitted after the live DROP DOMAIN already succeeded
+// (and any CASCADE-dropped tables have their own drop records), so re-running
+// that dependency check here is unnecessary.
+func (c *InMemory) DropDomainDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.domains, strings.ToLower(name))
+}
+
 // AddDomainCheck appends a CHECK constraint to a domain and allocates its
 // pg_constraint OID. expr is the conbin source text (the deparsed predicate);
 // inValues is non-nil for the `CHECK (VALUE IN (...))` form. No-op when expr is
