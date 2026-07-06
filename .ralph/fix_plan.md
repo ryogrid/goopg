@@ -98,6 +98,43 @@ every clean, green (build + pre-commit) checkpoint.
       loop (previous rushed splitMu-removal attempt already caused a
       different panic class, per btree.go:601-613). Do not attempt a
       quick fix here without re-running the fast repro to confirm.
+      2026-07-07 update (see deferral ledger row appended today,
+      task-id `M-NIGHTLY (AI-20260706-201855-001)`): the above
+      "publish-before-populate in PinNew" hypothesis is now REDIRECTED,
+      not confirmed. Built a full instrumentation harness (temporary,
+      reverted — see ledger row for the exact diff shape) and got 3
+      clean single-process reproductions with full lifecycle tracing.
+      Result: (a) a `bufmap` duplicate-live-entry check on every
+      `bm.Insert` never fired across 2 repros — rules out "two
+      concurrent PinNew publish the same tag" (also independently
+      confirmed unreachable: `relFile.extend`/`Manager.relFile` are
+      both fully mutex-serialized, so block numbers can't collide).
+      (b) a tag-match assertion at all 3 successful-pin return sites
+      (`Pin` fast-path, `pinSlow`'s `tryPinSlot`, and `tryPinSlot`
+      itself, covering `pinLoad`'s internal re-check too) never fired
+      across several 200-500-iteration repros — rules out "reader
+      pins the wrong physical slot for its tag" (stale-gen ABA).
+      (c) full lifecycle trace of the actual failing block each time:
+      created via PinNew, read successfully ~50-200x (real, valid,
+      tag-matched content), evicted DIRTY (flushed), reloaded clean,
+      evicted a SECOND time CLEAN (no flush) — and after that second
+      eviction NO further Pin/pinLoad/tryPinSlot trace event for that
+      tag appears, even though `descendToLeaf`'s own failure-branch
+      trace (in the SAME failing call) proves `bt.pinR()` on that
+      exact block DID return successfully, moments later, with zero
+      content. This means the corrupted read is evading all 4
+      instrumented "successful pin" code paths — the new leading
+      hypothesis is a CALLER-SIDE (btree.go) stale slot/page-handle
+      reuse (a `*storage.Slot`/`.Page()` byte-slice read again without
+      a fresh `Pin()` round-trip) rather than a bufmap/eviction-protocol
+      bug. Next step: instrument `bt.pinR` (btree.go:907) itself plus
+      the top of `descendToLeaf`'s loop body to confirm whether `Pin()`
+      is even re-invoked for the failing block's last access; if not,
+      audit `finishSplit`/`CompleteDeferredSplits` (not reviewed yet,
+      more complex multi-pin choreography) for a stale-handle path.
+      Full instrumentation recipe + exact resume steps in the deferral
+      ledger's 2026-07-07 row. Still investigation-only — do not attempt
+      a fix without re-deriving this evidence first.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
