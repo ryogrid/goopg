@@ -163,6 +163,29 @@ explicit `Sync(tag)` is requested.
   layer their own row-level locking on top.
 - Pin/unpin is goroutine-safe; multiple goroutines may pin the same
   page simultaneously and read it concurrently.
+- **Implementation note (2026-07):** the pool described above (a
+  single `poolMu` + `byTag map`) is the v0 shape; the shipped
+  implementation (`internal/storage/bufpool.go` + `bufmap.go`) has
+  since moved to a lock-free hash map (`bufmap`) plus a per-slot
+  atomic state word (pin count / usage count / valid / dirty /
+  IO-inflight / generation, all packed into one `atomic.Uint64`) so
+  the fast pin/unpin path never takes a lock. `pinMu` still
+  serialises the slow paths (cache-miss load, eviction, new-page
+  allocation). This doc's mutex-based sketch is otherwise still
+  accurate in spirit and is not being rewritten here.
+- **Eviction/flush-vs-reload ordering invariant (found the hard way,
+  M-NIGHTLY loop 13):** a victim slot's tag must stay in `bufmap`
+  until its dirty flush (`flushSlot`, under the slot's IO-inflight
+  bit) has completed, not before. Removing the tag first lets a
+  concurrent `Pin` of the same tag see a bufmap miss instead of
+  correctly blocking on the slot's IO-inflight semaphore, so it takes
+  its own unordered fresh disk read via `pinLoad` — which can win the
+  race against the still-in-flight write and permanently cache
+  pre-flush (stale/virgin) content under a different slot. Any future
+  change to `evictVictim`'s ordering must preserve "flush completes,
+  THEN tag is deleted, THEN queued waiters are released" — see
+  `internal/storage/bufpool.go`'s `evictVictim` for the current,
+  fixed sequence.
 
 ### Sizing and alignment
 

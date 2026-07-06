@@ -1352,7 +1352,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 		child, err := findChildBlockDirect(slot.Page(), key)
 		bt.unpinR(slot)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, fmt.Errorf("%w (blk=%d rel=%+v)", err, cur, bt.rel)
 		}
 		path = append(path, cur)
 		cur = child

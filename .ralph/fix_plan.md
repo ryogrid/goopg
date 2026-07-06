@@ -385,6 +385,66 @@ every clean, green (build + pre-commit) checkpoint.
       `createNewRoot` should call `bt.pinNewLocked()` instead of raw
       `PinNew()`+separate `.Lock()` for consistency with
       `pinNewOrRecycled`, even though it's confirmed not exploitable.
+      2026-07-07 update #11 (13th consecutive investigation loop; see
+      today's deferral ledger row): executed update #10's exact next
+      step (checksum/line-pointer sampling at the 3 candidate
+      boundaries) and found the root cause of the EMPTY-INTERNAL-PAGE
+      symptom (the insert-only `TestMultiWriterStress_M0055_Phase_C`
+      repro) — **and FIXED it, landed**. `evictVictim`
+      (`internal/storage/bufpool.go`) called `p.bm.Delete(oldTag, ...)`
+      BEFORE flushing the dirty victim page to disk (comment literally
+      said "BEFORE flushing to ensure no stale lookups" — backwards).
+      This let a concurrent `Pin(oldTag)` for a block whose flush was
+      still in flight see a bufmap cache MISS (instead of correctly
+      waiting on the slot's IO-inflight semaphore, which is what
+      happens when the tag is still mapped), so it took an independent,
+      unordered fresh disk read via `pinLoad` — which could win the
+      race against the still-in-flight `WriteAt` and cache the PRE-
+      flush (virgin, zero-tuple) page content under a different slot,
+      permanently. Slot-index-level tracing (`CLAIM_VICTIM`/
+      `BM_DELETE`/`BM_INSERT`/`READ_AFTER_READAT`/`WRITE_AFTER_WRITEAT`,
+      all keyed by slot index) caught it directly: `BM_INSERT` (new
+      slot 19) and `READ_AFTER_READAT` (empty, virgin checksum) both
+      landed BEFORE the original slot's `WRITE_AFTER_WRITEAT` (valid,
+      332-tuple checksum) completed. Fix: move `bm.Delete`(+tombstone
+      accounting) to AFTER `flushSlot` returns, and release any
+      waiters queued on the slot's semaphore at that point (mirrors
+      `pinLoad`'s own IO-inflight-then-release pattern, reusing the
+      existing wait mechanism — no new synchronization primitive
+      needed). Validated: 400/400 + 300/300 plain runs and 60/60 +
+      40/40 `-race` runs of the (now permanently un-skipped)
+      `TestMultiWriterStress_M0055_Phase_C` with ZERO failures
+      (pre-fix: failed at iteration 9 and iteration 20 in two separate
+      20-run samples using the identical recipe); full
+      `go test ./internal/access/btree/... ./internal/storage/...
+      ./internal/amcheck/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). All forensic tracing reverted; `git diff --stat`
+      shows only the real fix (bufpool.go) + the permanent un-skip
+      (multi_writer_stress_test.go) + a small enriched-error message
+      in `descendToLeaf` (btree.go, includes blk/rel on "empty internal
+      page" for future diagnosis).
+      **This does NOT close the nightly item.** Manually re-ran the
+      authoritative repro post-fix (own build, not the shared stage
+      script, to save time): fresh datadir, `pgbench -i -s 50`, then
+      `pgbench -T 120 -c 100 -j 20` against the SAME fixed binary —
+      FAILS IDENTICALLY, same `btree: item length mismatch keyLen=9
+      total=37` signature (and a `keyLen=2272/2265/2267 total=37`
+      variant, plus one `short read at block`), ~100 of 100 clients
+      aborting within seconds of workload start. This is now the 4th
+      distinct root cause confirmed NOT responsible for the nightly
+      symptom (after: update #6's splitMu-vs-vacuum race, update #7's
+      missing internal-page-deletion cascade, update #8's
+      `pinNewOrRecycled` unlock gap — all real bugs, all fixed, none
+      closing this item). The empty-internal-page thread (updates #7-
+      #11, 5 loops) is now fully resolved as its own bug with its own
+      regression test; do NOT resume it. Next loop should resume the
+      keyLen-mismatch-specific thread instead, from update #6's
+      unexecuted next step: instrument the SPLIT path itself
+      (`insertIntoBlock`, btree.go:~1420-1660, under `bt.splitMu`)
+      using update #6's cheap repro (`pgbench -i -s 50` once, reuse
+      that DB, `pgbench -c 100 -j 20 -T 25 -P 5` — reproduces in ~10s)
+      — that lead was never executed because loops 9-12 pivoted onto
+      the (now-resolved) empty-internal-page thread instead.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,

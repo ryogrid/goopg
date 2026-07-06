@@ -997,30 +997,49 @@ func (p *Pool) evictVictim(victimIdx int, wasDirty bool, oldTag BufferTag) error
 		return nil // slot was free
 	}
 	p.sharedEvictionCount.Add(1)
-	// Delete from bufmap BEFORE flushing to ensure no stale lookups.
+	if !wasDirty {
+		// Nothing to flush: the on-disk content already matches, so it's
+		// safe to retire the tag immediately.
+		p.bm.Delete(oldTag, int32(victimIdx))
+		p.tombstones.Add(1)
+		p.maybeCompact()
+		return nil
+	}
+	s := &p.slots[victimIdx]
+	// Release pinMu while doing IO so other goroutines can proceed.
+	p.pinMu.Unlock()
+	s.contentMu.Lock()
+	if p.OnFlushWait != nil {
+		p.OnFlushWait()
+	}
+	flushErr := p.flushSlot(oldTag, s.page)
+	if p.OnFlushDone != nil {
+		p.OnFlushDone()
+	}
+	s.contentMu.Unlock()
+	p.pinMu.Lock()
+	// Delete from bufmap only AFTER the flush has durably landed: the
+	// slot's IO-inflight bit (set by claimVictim) keeps a concurrent
+	// Pin(oldTag) waiting on this slot's semaphore for the whole flush,
+	// so deleting earlier let such a waiter fall through to a bufmap
+	// miss and race its own fresh disk read against this write — often
+	// winning and caching the pre-flush (stale/virgin) page forever
+	// under a different slot (M-NIGHTLY loop 13 root cause). Any
+	// waiters that queued up during the flush are released below, by
+	// which point the delete is already visible to them.
 	p.bm.Delete(oldTag, int32(victimIdx))
 	p.tombstones.Add(1)
 	p.maybeCompact()
-	if wasDirty {
-		s := &p.slots[victimIdx]
-		// Release pinMu while doing IO so other goroutines can proceed.
-		p.pinMu.Unlock()
-		s.contentMu.Lock()
-		if p.OnFlushWait != nil {
-			p.OnFlushWait()
+	if n := p.slotWaiters[victimIdx].Load(); n > 0 {
+		for i := int32(0); i < n; i++ {
+			runtimeshim.SemaRelease(&p.slotSema[victimIdx])
 		}
-		flushErr := p.flushSlot(oldTag, s.page)
-		if p.OnFlushDone != nil {
-			p.OnFlushDone()
-		}
-		s.contentMu.Unlock()
-		p.pinMu.Lock()
-		if flushErr != nil {
-			return flushErr
-		}
-		p.sharedWrittenCount.Add(1)
-		p.accountBackendWrite(oldTag.Rel)
 	}
+	if flushErr != nil {
+		return flushErr
+	}
+	p.sharedWrittenCount.Add(1)
+	p.accountBackendWrite(oldTag.Rel)
 	return nil
 }
 
