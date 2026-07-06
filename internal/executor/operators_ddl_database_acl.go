@@ -57,6 +57,9 @@ func normalizeDatabasePriv(priv string) []string {
 // store via relaclTextLockedFor, so no separate grantor map was needed here.
 // M0119-0004-ACLHEAP (datacl half).
 func (o *ddlOp) execDatabaseACLChange(dc *parser.DatabaseACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, dc.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil

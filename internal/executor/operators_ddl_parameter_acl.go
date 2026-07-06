@@ -90,6 +90,9 @@ func (o *ddlOp) checkParameterACLName(name string) error {
 // grantor map was needed here.
 // M0119-0004-ACLHEAP (parameter ACL half).
 func (o *ddlOp) execParameterACLChange(pc *parser.ParameterACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, pc.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil

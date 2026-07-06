@@ -262,6 +262,71 @@ Gates: `go build ./...` clean; `go test ./internal/catalog/...
 ./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
 regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 
+## Follow-up: `TYPE`/`DATABASE`/`PARAMETER` GRANTED BY validation (2026-07-06)
+
+The GRANTED BY gap named at the end of the previous follow-up section — the
+parser discarded `GRANTED BY <role>` for `TypeACLChange`/`DatabaseACLChange`/
+`ParameterACLChange` without capturing it, so there was nothing for the
+executor to validate — is now closed, mirroring `relacl`/`nspacl`/`proacl`/
+`srvacl`'s existing `errGrantorMustBeCurrentUser` check (`grant_ddl.go`) and
+real PostgreSQL's shared `InternalGrant` check (`aclchk.c:394-412`, verified
+via the PG-source MCP tools): `if (stmt->grantor) { ... if (grantor !=
+GetUserId()) ereport(ERROR, errcode(ERRCODE_FEATURE_NOT_SUPPORTED), errmsg
+("grantor must be current user")); }`. This check is grammar-shared by every
+object-privilege GRANT/REVOKE variant in PG, not just tables — goopg's
+per-object-kind builders had simply never threaded the clause through for
+these three kinds.
+
+- `TypeACLChange`/`DatabaseACLChange`/`ParameterACLChange` (`internal/parser/ast.go`)
+  each gained a `GrantedBy string` field (`"" ` = current session role,
+  matching `RoleMembershipChange.GrantedBy`'s existing convention).
+- `internal/parser/parser.go`'s three token-scanning builders
+  (`buildTypeACLChange`/`buildDatabaseACLChange`/`buildParameterACLChange`)
+  shared one exact inline loop that stopped at a `GRANTED BY`/`CASCADE`/
+  `RESTRICT` token without capturing the role name. Factored into a new shared
+  `scanGrantTrailingClause(toks, roleStart)` helper (one fix point instead of
+  three copies) that captures the grantor. Fixed a latent bug while
+  generalizing: the original loop's `"with"` case (`WITH GRANT OPTION`)
+  unconditionally `break`s, so a `GRANTED BY` clause following `WITH GRANT
+  OPTION` (gram.y's `opt_grant_grant_option opt_granted_by` order, the only
+  order the GRANT grammar allows) was never reached. The helper now
+  `continue`s scanning past a consumed `WITH GRANT OPTION` clause, mirroring
+  `buildRoleMembershipChange`'s own post-`WITH`-clause continuation. Test:
+  `internal/parser/op_grant_typeacl_test.go` /
+  `op_grant_databaseacl_test.go` / `op_grant_parameteracl_test.go` each gained
+  a `GRANTED BY` case and a combined `WITH GRANT OPTION ... GRANTED BY` case
+  (the latter regression-pins the `WITH`-continuation fix).
+- `internal/executor/operators_ddl.go` gained a shared
+  `checkGrantedByCurrentUser(actingRole, grantedBy string) error` helper
+  (duplicated rather than imported from `internal/server/grant_ddl.go`'s
+  `errGrantorMustBeCurrentUser`, since `executor` cannot import `server` — the
+  dependency runs the other way — mirroring how `attacl`'s `GRANTED BY`
+  parsing gap was left as a distinct, smaller-scoped follow-up rather than
+  solved here). `execTypeACLChange`, `execDatabaseACLChange`
+  (`operators_ddl_database_acl.go`), and `execParameterACLChange`
+  (`operators_ddl_parameter_acl.go`) each call it first and return the 0A000
+  `ExecError` on a mismatch, before touching the ACL store — an aborted
+  statement leaves no partial grant, matching
+  `TestTryRecordTableGrantGrantedByOtherRoleErrors`'s no-partial-effect
+  assertion for the table-ACL path.
+
+Tests: `internal/executor/operators_ddl_acl_grantor_test.go`'s
+`TestExecACLChangeGrantedByCurrentUserIsNoop` (an explicit `GRANTED BY <acting
+role>` is accepted, matching omission) and
+`TestExecACLChangeGrantedByOtherRoleErrors` (all three call sites reject a
+mismatched grantor with 0A000 and leave the ACL store untouched).
+
+Still open, unchanged by this loop: column-level `attacl`'s `GRANTED BY`
+parsing gap (`buildAttrACLChange`, `internal/parser/parser.go` — the role name
+is scanned past but discarded, unvalidated); no grant-option delegation-chain
+resolution (`select_best_grantor`, `acl.c`) for any of the four object kinds —
+the recorded/validated grantor is simply whichever role executed the
+statement, not a resolved delegation-chain member.
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
 ### Newly deferred (this follow-up)
 
 - The object-privilege `GRANTED BY <role>` validation

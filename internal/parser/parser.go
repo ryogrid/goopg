@@ -275,14 +275,67 @@ func grantNonTableClass(word string) bool {
 	return false
 }
 
+// scanGrantTrailingClause scans a grantee list starting at roleStart for the
+// shared trailing-clause grammar every object-privilege GRANT/REVOKE variant
+// (TYPE/DOMAIN, DATABASE, PARAMETER — gram.y's GrantStmt/RevokeStmt) allows
+// after the role list: GRANT's `opt_grant_grant_option opt_granted_by` or
+// REVOKE's `opt_granted_by opt_drop_behavior`. Mirrors
+// buildRoleMembershipChange's inline scan, generalized across the three
+// builders below so a fix (e.g. this function's own continue-after-WITH,
+// needed so GRANTED BY is still found when it follows WITH GRANT OPTION) only
+// needs to land once. Returns the role-list end index, whether WITH GRANT
+// OPTION was seen, and the GRANTED BY role name (quote-stripped, "" if
+// absent). M0119-0004-ACLHEAP.
+func scanGrantTrailingClause(toks []Token, roleStart int) (roleEnd int, withGrantOption bool, grantedBy string) {
+	roleEnd = len(toks)
+	for i := roleStart; i < len(toks); i++ {
+		switch strings.ToLower(toks[i].Value) {
+		case "with":
+			// WITH GRANT OPTION — record the flag, end the role list, and keep
+			// scanning: GRANT's grammar allows a following GRANTED BY clause.
+			if roleEnd > i {
+				roleEnd = i
+			}
+			if i+2 < len(toks) &&
+				strings.EqualFold(toks[i+1].Value, "grant") &&
+				strings.EqualFold(toks[i+2].Value, "option") {
+				withGrantOption = true
+				i += 2
+			}
+			continue
+		case "granted":
+			// GRANTED BY <role> — record the explicit grantor, end the role
+			// list, and keep scanning (REVOKE's opt_drop_behavior follows
+			// opt_granted_by, so a trailing CASCADE/RESTRICT can still appear).
+			if roleEnd > i {
+				roleEnd = i
+			}
+			if i+2 < len(toks) && strings.EqualFold(toks[i+1].Value, "by") {
+				grantedBy = strings.Trim(toks[i+2].Value, `"`)
+				i += 2
+			}
+			continue
+		case "cascade", "restrict":
+			if roleEnd > i {
+				roleEnd = i
+			}
+		default:
+			continue
+		}
+		break
+	}
+	return roleEnd, withGrantOption, grantedBy
+}
+
 // buildTypeACLChange parses the token run of a GRANT/REVOKE … ON TYPE|DOMAIN …
 // statement into a TypeACLChange. toks is every token after the GRANT/REVOKE
 // keyword with the trailing ';' already excluded. It mirrors the server-side
 // string recorder (grant_ddl.go) — privilege list before ON, type names between
 // the TYPE/DOMAIN keyword and TO|FROM, and the role list after TO|FROM, with a
-// trailing WITH GRANT OPTION / GRANTED BY / CASCADE / RESTRICT clause stripped.
-// Returns nil when any of the three lists is empty (an unparseable form the
-// caller leaves as a successful no-op). M0119-0004-ACLHEAP.
+// trailing WITH GRANT OPTION / GRANTED BY / CASCADE / RESTRICT clause captured
+// via scanGrantTrailingClause. Returns nil when any of the three lists is
+// empty (an unparseable form the caller leaves as a successful no-op).
+// M0119-0004-ACLHEAP.
 func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 	onIdx := tokIndexOf(toks, 0, "on")
 	if onIdx < 0 || onIdx+2 > len(toks) {
@@ -298,25 +351,7 @@ func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 		return nil
 	}
 	roleStart := sepIdx + 1
-	roleEnd := len(toks)
-	withGrantOption := false
-	for i := roleStart; i < len(toks); i++ {
-		switch strings.ToLower(toks[i].Value) {
-		case "with":
-			// WITH GRANT OPTION — record the flag and end the role list.
-			if i+2 < len(toks) &&
-				strings.EqualFold(toks[i+1].Value, "grant") &&
-				strings.EqualFold(toks[i+2].Value, "option") {
-				withGrantOption = true
-			}
-			roleEnd = i
-		case "granted", "cascade", "restrict":
-			roleEnd = i
-		default:
-			continue
-		}
-		break
-	}
+	roleEnd, withGrantOption, grantedBy := scanGrantTrailingClause(toks, roleStart)
 	tac := &TypeACLChange{
 		Revoke:          revoke,
 		IsDomain:        isDomain,
@@ -324,6 +359,7 @@ func buildTypeACLChange(revoke, isDomain bool, toks []Token) *TypeACLChange {
 		TypeNames:       splitTokObjectNames(toks[nameStart:sepIdx]),
 		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
 		WithGrantOption: withGrantOption,
+		GrantedBy:       grantedBy,
 	}
 	if len(tac.Privileges) == 0 || len(tac.TypeNames) == 0 || len(tac.Grantees) == 0 {
 		return nil
@@ -352,30 +388,14 @@ func buildDatabaseACLChange(revoke bool, toks []Token) *DatabaseACLChange {
 		return nil
 	}
 	roleStart := sepIdx + 1
-	roleEnd := len(toks)
-	withGrantOption := false
-	for i := roleStart; i < len(toks); i++ {
-		switch strings.ToLower(toks[i].Value) {
-		case "with":
-			if i+2 < len(toks) &&
-				strings.EqualFold(toks[i+1].Value, "grant") &&
-				strings.EqualFold(toks[i+2].Value, "option") {
-				withGrantOption = true
-			}
-			roleEnd = i
-		case "granted", "cascade", "restrict":
-			roleEnd = i
-		default:
-			continue
-		}
-		break
-	}
+	roleEnd, withGrantOption, grantedBy := scanGrantTrailingClause(toks, roleStart)
 	dac := &DatabaseACLChange{
 		Revoke:          revoke,
 		Privileges:      splitTokPrivileges(toks[:onIdx]),
 		DatabaseNames:   splitTokRoles(toks[nameStart:sepIdx]),
 		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
 		WithGrantOption: withGrantOption,
+		GrantedBy:       grantedBy,
 	}
 	if len(dac.Privileges) == 0 || len(dac.DatabaseNames) == 0 || len(dac.Grantees) == 0 {
 		return nil
@@ -425,30 +445,14 @@ func buildParameterACLChange(revoke bool, toks []Token) *ParameterACLChange {
 		return nil
 	}
 	roleStart := sepIdx + 1
-	roleEnd := len(toks)
-	withGrantOption := false
-	for i := roleStart; i < len(toks); i++ {
-		switch strings.ToLower(toks[i].Value) {
-		case "with":
-			if i+2 < len(toks) &&
-				strings.EqualFold(toks[i+1].Value, "grant") &&
-				strings.EqualFold(toks[i+2].Value, "option") {
-				withGrantOption = true
-			}
-			roleEnd = i
-		case "granted", "cascade", "restrict":
-			roleEnd = i
-		default:
-			continue
-		}
-		break
-	}
+	roleEnd, withGrantOption, grantedBy := scanGrantTrailingClause(toks, roleStart)
 	pac := &ParameterACLChange{
 		Revoke:          revoke,
 		Privileges:      splitTokPrivileges(toks[:onIdx]),
 		ParamNames:      splitTokDottedNames(toks[nameStart:sepIdx]),
 		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
 		WithGrantOption: withGrantOption,
+		GrantedBy:       grantedBy,
 	}
 	if len(pac.Privileges) == 0 || len(pac.ParamNames) == 0 || len(pac.Grantees) == 0 {
 		return nil

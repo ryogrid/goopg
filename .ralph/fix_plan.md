@@ -261,6 +261,38 @@ distinct follow-up) and grant-option delegation-chain resolution
 multi-database isolation survey above, or survey the deferral ledger for a
 fresh open (`status = -`) row.
 
+**2026-07-06 (loop #45):** picked up the `GRANTED BY` validation follow-up
+named above for `TYPE`/`DATABASE`/`PARAMETER` ACL changes. `parser.TypeACLChange`/
+`DatabaseACLChange`/`ParameterACLChange` now carry a `GrantedBy` field, captured
+by a new shared `scanGrantTrailingClause` helper (`internal/parser/parser.go`,
+replacing three copies of an identical inline loop across
+`buildTypeACLChange`/`buildDatabaseACLChange`/`buildParameterACLChange`) —
+which also fixed a latent bug where a `GRANTED BY` clause following `WITH
+GRANT OPTION` (the only order gram.y allows) was never reached. New
+`internal/executor/operators_ddl.go`'s `checkGrantedByCurrentUser` (a
+duplicate of `grant_ddl.go`'s `errGrantorMustBeCurrentUser` check, since
+executor cannot import server) is now called first by `execTypeACLChange`,
+`execDatabaseACLChange`, and `execParameterACLChange`, rejecting a mismatched
+grantor with `0A000` before any ACL mutation — matching real PG 18.3's
+`InternalGrant` check verified via the PG-source MCP tools
+(`aclchk.c:394-412`). Tests: 3 parser test files gained `GRANTED BY` +
+combined `WITH GRANT OPTION ... GRANTED BY` cases;
+`internal/executor/operators_ddl_acl_grantor_test.go` gained
+`TestExecACLChangeGrantedByCurrentUserIsNoop`/`TestExecACLChangeGrantedByOtherRoleErrors`.
+See `docs/design/0119-0004-table-acl-grantor-tracking.md`'s new "Follow-up:
+`TYPE`/`DATABASE`/`PARAMETER` GRANTED BY validation" section and the matching
+ledger row. Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). **This closes
+the object-privilege ACL grantor tracking bucket's final named mechanical
+follow-up.** Only deferred: column-level `attacl`'s `GRANTED BY` clause is
+still parsed-and-discarded (`buildAttrACLChange`, needs its own small
+`GrantedBy` field + `execAttrACLChange` check, same shape as this loop), and
+grant-option delegation-chain resolution (`select_best_grantor`,
+feature-sized) for all four object kinds. Next candidate: pick up the attacl
+`GRANTED BY` follow-up (small, mechanical), or resume the M0110-0001
+multi-database isolation survey above.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

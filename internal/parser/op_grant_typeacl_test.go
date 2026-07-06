@@ -11,13 +11,14 @@ import (
 // leaves TypeACL nil. M0119-0004-ACLHEAP.
 func TestParseGrantTypeACL(t *testing.T) {
 	cases := []struct {
-		sql        string
-		wantRevoke bool
-		wantDomain bool
-		wantPrivs  []string
-		wantNames  []ObjectName
-		wantRoles  []string
-		wantWGO    bool
+		sql           string
+		wantRevoke    bool
+		wantDomain    bool
+		wantPrivs     []string
+		wantNames     []ObjectName
+		wantRoles     []string
+		wantWGO       bool
+		wantGrantedBy string
 	}{
 		{
 			sql:       "GRANT USAGE ON TYPE public.t TO r",
@@ -78,10 +79,22 @@ func TestParseGrantTypeACL(t *testing.T) {
 			wantRoles:  []string{"r"},
 		},
 		{
-			sql:       "GRANT USAGE ON TYPE t TO r GRANTED BY postgres",
-			wantPrivs: []string{"USAGE"},
-			wantNames: []ObjectName{{Name: "t"}},
-			wantRoles: []string{"r"},
+			sql:           "GRANT USAGE ON TYPE t TO r GRANTED BY postgres",
+			wantPrivs:     []string{"USAGE"},
+			wantNames:     []ObjectName{{Name: "t"}},
+			wantRoles:     []string{"r"},
+			wantGrantedBy: "postgres",
+		},
+		{
+			// GRANTED BY following WITH GRANT OPTION (gram.y's
+			// opt_grant_grant_option opt_granted_by order) — regression case
+			// for scanGrantTrailingClause's continue-after-WITH fix.
+			sql:           "GRANT USAGE ON TYPE t TO r WITH GRANT OPTION GRANTED BY postgres",
+			wantPrivs:     []string{"USAGE"},
+			wantNames:     []ObjectName{{Name: "t"}},
+			wantRoles:     []string{"r"},
+			wantWGO:       true,
+			wantGrantedBy: "postgres",
 		},
 	}
 	for _, tc := range cases {
@@ -109,6 +122,9 @@ func TestParseGrantTypeACL(t *testing.T) {
 		}
 		if got.WithGrantOption != tc.wantWGO {
 			t.Errorf("%q: WithGrantOption = %v, want %v", tc.sql, got.WithGrantOption, tc.wantWGO)
+		}
+		if got.GrantedBy != tc.wantGrantedBy {
+			t.Errorf("%q: GrantedBy = %q, want %q", tc.sql, got.GrantedBy, tc.wantGrantedBy)
 		}
 		if !eqStrs(got.Privileges, tc.wantPrivs) {
 			t.Errorf("%q: Privileges = %v, want %v", tc.sql, got.Privileges, tc.wantPrivs)

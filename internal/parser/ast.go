@@ -2312,6 +2312,7 @@ type TypeACLChange struct {
 	TypeNames       []ObjectName
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
 
 // DatabaseACLChange carries the parsed pieces of a GRANT/REVOKE … ON DATABASE …
@@ -2330,6 +2331,7 @@ type DatabaseACLChange struct {
 	DatabaseNames   []string
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
 
 // RoleMembershipChange carries the parsed pieces of a `GRANT <role>[, ...]
@@ -2484,6 +2486,7 @@ type ParameterACLChange struct {
 	ParamNames      []string // lower-cased dotted GUC names
 	Grantees        []string // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool     // GRANT … WITH GRANT OPTION
+	GrantedBy       string   // optional explicit grantor; "" = current session role
 }
 
 // AlterDefaultPrivilegesStmt represents `ALTER DEFAULT PRIVILEGES [FOR ROLE|USER

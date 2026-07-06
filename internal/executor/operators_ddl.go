@@ -16155,6 +16155,31 @@ func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind
 	return 0, typeKindNone
 }
 
+// checkGrantedByCurrentUser mirrors PostgreSQL's aclchk.c InternalGrant check
+// (shared by every object-privilege GRANT/REVOKE variant — tables, types,
+// databases, parameters, …): an explicit GRANTED BY clause is SQL-standard
+// grammar accepted only for compatibility, and is rejected unless it names
+// the role actually executing the statement. actingRole is the session's
+// current effective role (o.ctx.NonSuperuserRole, "" for the bootstrap
+// superuser "postgres"); grantedBy is the parsed clause's role name ("" when
+// the clause was absent, in which case there is nothing to check). Duplicates
+// server/grant_ddl.go's identically-behaved errGrantorMustBeCurrentUser check
+// for the table-ACL path, since the executor package cannot import server (it
+// would create an import cycle). M0119-0004-ACLHEAP.
+func checkGrantedByCurrentUser(actingRole, grantedBy string) error {
+	if grantedBy == "" {
+		return nil
+	}
+	acting := strings.ToLower(strings.TrimSpace(actingRole))
+	if acting == "" {
+		acting = "postgres"
+	}
+	if !strings.EqualFold(strings.Trim(grantedBy, `"`), acting) {
+		return &ExecError{Code: "0A000", Message: "grantor must be current user"}
+	}
+	return nil
+}
+
 // execTypeACLChange applies a GRANT/REVOKE … ON TYPE|DOMAIN … to the OID-keyed
 // ACL store and re-syncs the heap-backed pg_type.typacl. A type's only grantable
 // privilege is USAGE, and acldefault('T', owner) grants USAGE to BOTH the owner
@@ -16165,8 +16190,13 @@ func resolveUserTypeOID(im *catalog.InMemory, name string) (uint32, userTypeKind
 // meaning the bootstrap superuser), mirroring tryRecordTableGrant's grantor
 // attribution for relacl/nspacl/proacl — typacl shares the same tableACLs/
 // tableACLGrantor store via relaclTextLockedFor, so no separate grantor map was
-// needed here. M0119-0004-ACLHEAP.
+// needed here. An explicit GRANTED BY clause naming a role other than the
+// acting one is rejected 0A000 (checkGrantedByCurrentUser), mirroring
+// grant_ddl.go's table-ACL check. M0119-0004-ACLHEAP.
 func (o *ddlOp) execTypeACLChange(tc *parser.TypeACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, tc.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil

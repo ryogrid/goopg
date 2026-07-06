@@ -11,12 +11,13 @@ import (
 // M0118-0098) stays set unconditionally. M0119-0004-ACLHEAP (datacl half).
 func TestParseGrantDatabaseACL(t *testing.T) {
 	cases := []struct {
-		sql        string
-		wantRevoke bool
-		wantPrivs  []string
-		wantNames  []string
-		wantRoles  []string
-		wantWGO    bool
+		sql           string
+		wantRevoke    bool
+		wantPrivs     []string
+		wantNames     []string
+		wantRoles     []string
+		wantWGO       bool
+		wantGrantedBy string
 	}{
 		{
 			sql:       "GRANT CREATE ON DATABASE postgres TO r",
@@ -70,10 +71,19 @@ func TestParseGrantDatabaseACL(t *testing.T) {
 			wantRoles:  []string{"r"},
 		},
 		{
-			sql:       "GRANT CREATE ON DATABASE postgres TO r GRANTED BY postgres",
-			wantPrivs: []string{"CREATE"},
-			wantNames: []string{"postgres"},
-			wantRoles: []string{"r"},
+			sql:           "GRANT CREATE ON DATABASE postgres TO r GRANTED BY postgres",
+			wantPrivs:     []string{"CREATE"},
+			wantNames:     []string{"postgres"},
+			wantRoles:     []string{"r"},
+			wantGrantedBy: "postgres",
+		},
+		{
+			sql:           "GRANT TEMP ON DATABASE postgres TO r WITH GRANT OPTION GRANTED BY postgres",
+			wantPrivs:     []string{"TEMP"},
+			wantNames:     []string{"postgres"},
+			wantRoles:     []string{"r"},
+			wantWGO:       true,
+			wantGrantedBy: "postgres",
 		},
 	}
 	for _, tc := range cases {
@@ -97,6 +107,9 @@ func TestParseGrantDatabaseACL(t *testing.T) {
 		}
 		if got.WithGrantOption != tc.wantWGO {
 			t.Errorf("%q: WithGrantOption = %v, want %v", tc.sql, got.WithGrantOption, tc.wantWGO)
+		}
+		if got.GrantedBy != tc.wantGrantedBy {
+			t.Errorf("%q: GrantedBy = %q, want %q", tc.sql, got.GrantedBy, tc.wantGrantedBy)
 		}
 		if !eqStrs(got.Privileges, tc.wantPrivs) {
 			t.Errorf("%q: Privileges = %v, want %v", tc.sql, got.Privileges, tc.wantPrivs)
