@@ -485,6 +485,41 @@ every clean, green (build + pre-commit) checkpoint.
       byte-compare the item content against `heap.go`'s actual heap-tuple
       marshal output for a `pgbench_accounts` row — a match is the
       smoking-gun confirmation.
+      2026-07-07 update #13 (15th consecutive investigation loop; see today's
+      deferral ledger row for full byte-level detail): reconstructed update
+      #12's forensic dump helper (`internal/access/btree/parse_err_dump.go`,
+      `maybeDumpPageOnParseErr`, gated `GOOPG_BTREE_PARSE_ERR_DUMP=1`, wired
+      into all 6 `perr != nil` branches) and — unlike loops 12/14 — KEPT it
+      committed instead of reverting (env-gated, zero-risk when unset; two
+      prior loops had to rebuild an equivalent tool from scratch). Reproduced
+      fresh on an isolated port-5561 server (`pgbench -i -s 50` once, then
+      `pgbench -c 100 -j 20 -T 25 -P 5`, ~10s to failure), captured 100 dumps.
+      Executed the exact handed-off next step — byte-compared the full 37-byte
+      item against `heap.go`'s `HeapTupleHeader`/`MarshalBinary` layout — and
+      got a CONCLUSIVE match (upgrading loop 14's "consistent with" to
+      "confirmed"): `Xmin=9`, `Xmax=0`, `Xvac=0`,
+      `CTID={InvalidBlockNumber,0}` (exactly `NewHeapTuple`'s pre-insert
+      default), `Infomask2` natts=4 (pgbench_accounts's exact column count),
+      `Hoff=24` (exactly `MAXALIGN(SizeOfHeapTupleHeaderData=23)`), followed by
+      data decoding as `aid=3706034`/`bid=38` — both in-range for scale=50.
+      Five independent structural fields all correct simultaneously rules out
+      coincidence: this is genuine on-disk `pgbench_accounts` HEAP tuple
+      content physically present inside `pgbench_accounts_pkey`'s B-TREE
+      pages. Also noted the corrupted line pointer's offset+length place the
+      item entirely INSIDE the page's special/opaque region
+      (`btSpecialOffset`=7920..8192), consistent with a heap-insert routine
+      writing into a page whose `pd_special` was 8192 (bare/heap-shaped)
+      rather than btree's 7920 at write time — the page's type was wrong when
+      written, not just misread later. `go build ./...` clean; full
+      `./internal/access/btree/...` suite (2.0s) PASS. Next step: audit
+      `internal/executor/operators_storage.go`/`operators_upsert.go`'s INSERT
+      path end-to-end for where the heap-file vs. pkey-index-file
+      `RelFileNode`/handle are each obtained, looking for any route a
+      heap-target reference could leak into the `bt.Insert` call (or vice
+      versa) under concurrency; re-run the cheap repro with the now-kept dump
+      tool plus new executor-side `(heap RelOid, index RelOid, blk)` logging
+      to catch the exact moment a write meant for one relation lands on the
+      other's file.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,

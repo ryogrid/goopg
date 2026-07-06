@@ -1071,6 +1071,7 @@ func pageItems(p storage.Page) ([]item, error) {
 		if isPostingRaw(raw) {
 			key, tids, perr := parsePostingRaw(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItems: parsePostingRaw")
 				return nil, perr
 			}
 			for _, tid := range tids {
@@ -1079,6 +1080,7 @@ func pageItems(p storage.Page) ([]item, error) {
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItems: parseItem")
 				return nil, perr
 			}
 			out = append(out, it)
@@ -1114,12 +1116,14 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 		if isPostingRaw(raw) {
 			key, _, perr := parsePostingRaw(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageItemKeys: parsePostingRaw")
 				return nil, perr
 			}
 			out = append(out, key)
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageItemKeys: parseItem")
 				return nil, perr
 			}
 			out = append(out, it.key)
@@ -1167,6 +1171,7 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 		if isPostingRaw(raw) {
 			key, tids, perr := parsePostingRaw(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageLeafEntries: parsePostingRaw")
 				return nil, perr
 			}
 			for _, tid := range tids {
@@ -1175,6 +1180,7 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageLeafEntries: parseItem")
 				return nil, perr
 			}
 			out = append(out, LeafEntry{Key: it.key, TID: it.ptr})
@@ -1218,6 +1224,7 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 		}
 		it, perr := parseItem(raw)
 		if perr != nil {
+			maybeDumpPageOnParseErr(p, "PageDownlinks: parseItem")
 			return nil, perr
 		}
 		out = append(out, Downlink{Key: it.key, Child: it.ptr.Block})
@@ -1285,6 +1292,7 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 	}
 	it, err := parseItem(raw)
 	if err != nil {
+		maybeDumpPageOnParseErr(p, "findChildBlockDirect: parseItem")
 		return 0, err
 	}
 	return it.ptr.Block, nil
@@ -2213,6 +2221,7 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 	if isPostingRaw(raw) {
 		key, tids, perr := parsePostingRaw(raw)
 		if perr != nil {
+			maybeDumpPageOnParseErr(p, "readPageItem: parsePostingRaw")
 			return item{}, perr
 		}
 		var ptr storage.ItemPointer
@@ -2221,7 +2230,11 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 		}
 		return item{keyLen: uint16(len(key)), ptr: ptr, key: key}, nil
 	}
-	return parseItem(raw)
+	it, perr := parseItem(raw)
+	if perr != nil {
+		maybeDumpPageOnParseErr(p, "readPageItem: parseItem")
+	}
+	return it, perr
 }
 
 func appendSorted(items []item, it item) []item {
