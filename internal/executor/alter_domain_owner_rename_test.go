@@ -178,3 +178,146 @@ func TestAlterDomainRenameConstraint(t *testing.T) {
 		t.Errorf("err = %v, want *ExecError{Code: 42710}", err)
 	}
 }
+
+// TestAlterDomainAddConstraint guards the ADD CONSTRAINT follow-up named in
+// TestAlterDomainRenameConstraint's comment above: `ALTER DOMAIN name ADD
+// [CONSTRAINT name] CHECK (expr)` previously fell into the discarded
+// compat no-op alongside every other unmodelled ALTER DOMAIN form. Mirrors
+// real PG's AlterDomainAddConstraint/domainAddCheckConstraint: an explicit
+// name colliding with an existing CHECK on the same domain is 42710; an
+// unknown domain is 42704.
+func TestAlterDomainAddConstraint(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE DOMAIN addconstest_domain AS int`); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+	d, found := im.LookupDomain("addconstest_domain")
+	if !found {
+		t.Fatal("domain not found via LookupDomain")
+	}
+	if len(d.Checks) != 0 {
+		t.Fatalf("Checks before ADD CONSTRAINT = %+v, want none", d.Checks)
+	}
+
+	// Named CHECK.
+	if err := runDDL(t, ctx, `ALTER DOMAIN addconstest_domain ADD CONSTRAINT positive_check CHECK (VALUE > 0)`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... ADD CONSTRAINT: %v", err)
+	}
+	if len(d.Checks) != 1 || d.Checks[0].Name != "positive_check" || d.Checks[0].Expr != "VALUE > 0" {
+		t.Errorf("Checks after named ADD CONSTRAINT = %+v, want [{positive_check VALUE > 0}]", d.Checks)
+	}
+
+	// Unnamed CHECK gets PG's auto-generated `<domain>_check` name.
+	if err := runDDL(t, ctx, `ALTER DOMAIN addconstest_domain ADD CHECK (VALUE < 1000)`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... ADD CHECK: %v", err)
+	}
+	if len(d.Checks) != 2 || d.Checks[1].Name != "addconstest_domain_check" {
+		t.Errorf("Checks after unnamed ADD CHECK = %+v, want second entry named addconstest_domain_check", d.Checks)
+	}
+
+	// CHECK (VALUE IN (...)) shortcut form synthesizes the ScalarArrayOpExpr
+	// text, same as CREATE DOMAIN's own IN-list handling.
+	if err := runDDL(t, ctx, `ALTER DOMAIN addconstest_domain ADD CONSTRAINT allowed_check CHECK (VALUE IN (1, 2, 3))`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... ADD CONSTRAINT ... IN: %v", err)
+	}
+	if len(d.Checks) != 3 || d.Checks[2].Expr != "VALUE = ANY (ARRAY[1, 2, 3])" {
+		t.Errorf("Checks after IN-list ADD CONSTRAINT = %+v, want third entry's Expr = VALUE = ANY (ARRAY[1, 2, 3])", d.Checks)
+	}
+
+	// NOT VALID is parsed and discarded (no existing-data validation either way).
+	if err := runDDL(t, ctx, `ALTER DOMAIN addconstest_domain ADD CONSTRAINT skip_check CHECK (VALUE <> 0) NOT VALID`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID: %v", err)
+	}
+	if len(d.Checks) != 4 || d.Checks[3].Name != "skip_check" {
+		t.Errorf("Checks after NOT VALID ADD CONSTRAINT = %+v, want fourth entry named skip_check", d.Checks)
+	}
+
+	// A colliding explicit name raises 42710.
+	err := runDDL(t, ctx, `ALTER DOMAIN addconstest_domain ADD CONSTRAINT positive_check CHECK (VALUE > 5)`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... ADD CONSTRAINT with a colliding name should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42710" {
+		t.Errorf("err = %v, want *ExecError{Code: 42710}", err)
+	}
+
+	// An unknown domain raises 42704.
+	err = runDDL(t, ctx, `ALTER DOMAIN nosuchdomain ADD CONSTRAINT c CHECK (VALUE > 0)`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... ADD CONSTRAINT on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+}
+
+// TestAlterDomainDropConstraint guards the DROP CONSTRAINT follow-up:
+// `ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] name [RESTRICT|CASCADE]`.
+// Mirrors real PG's AlterDomainDropConstraint: an unknown constraint without
+// IF EXISTS is 42704; IF EXISTS silently no-ops instead.
+func TestAlterDomainDropConstraint(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE DOMAIN dropconstest_domain AS int CONSTRAINT positive_check CHECK (VALUE > 0) CONSTRAINT second_check CHECK (VALUE < 1000)`); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+	d, found := im.LookupDomain("dropconstest_domain")
+	if !found {
+		t.Fatal("domain not found via LookupDomain")
+	}
+	if len(d.Checks) != 2 {
+		t.Fatalf("Checks after CREATE DOMAIN = %+v, want exactly 2", d.Checks)
+	}
+
+	if err := runDDL(t, ctx, `ALTER DOMAIN dropconstest_domain DROP CONSTRAINT positive_check`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... DROP CONSTRAINT: %v", err)
+	}
+	if len(d.Checks) != 1 || d.Checks[0].Name != "second_check" {
+		t.Errorf("Checks after DROP CONSTRAINT = %+v, want only second_check left", d.Checks)
+	}
+
+	// RESTRICT/CASCADE trailer is accepted.
+	if err := runDDL(t, ctx, `ALTER DOMAIN dropconstest_domain DROP CONSTRAINT second_check RESTRICT`); err != nil {
+		t.Fatalf("ALTER DOMAIN ... DROP CONSTRAINT ... RESTRICT: %v", err)
+	}
+	if len(d.Checks) != 0 {
+		t.Errorf("Checks after second DROP CONSTRAINT = %+v, want none left", d.Checks)
+	}
+
+	// An unknown constraint without IF EXISTS raises 42704.
+	err := runDDL(t, ctx, `ALTER DOMAIN dropconstest_domain DROP CONSTRAINT nosuchcheck`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... DROP CONSTRAINT on an unknown constraint should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+
+	// IF EXISTS silently no-ops instead.
+	if err := runDDL(t, ctx, `ALTER DOMAIN dropconstest_domain DROP CONSTRAINT IF EXISTS nosuchcheck`); err != nil {
+		t.Errorf("ALTER DOMAIN ... DROP CONSTRAINT IF EXISTS on an unknown constraint should not error: %v", err)
+	}
+
+	// An unknown domain raises 42704 regardless of IF EXISTS (mirrors real PG:
+	// missing_ok only covers the named constraint, not the domain lookup).
+	err = runDDL(t, ctx, `ALTER DOMAIN nosuchdomain DROP CONSTRAINT IF EXISTS c`)
+	if err == nil {
+		t.Fatal("ALTER DOMAIN ... DROP CONSTRAINT on an unknown domain should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
+	}
+}

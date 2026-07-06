@@ -18426,6 +18426,12 @@ func (c *InMemory) AddDomainCheck(d *Domain, name, expr string, inValues []strin
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.addDomainCheckLocked(d, name, expr, inValues)
+}
+
+// addDomainCheckLocked is the shared body of AddDomainCheck/AddDomainConstraint.
+// Caller holds c.mu.
+func (c *InMemory) addDomainCheckLocked(d *Domain, name, expr string, inValues []string) {
 	if name == "" {
 		base := d.Name + "_check"
 		name = base
@@ -18440,6 +18446,58 @@ func (c *InMemory) AddDomainCheck(d *Domain, name, expr string, inValues []strin
 		InValues: inValues,
 	})
 	c.nextOID++
+}
+
+// AddDomainConstraint adds a named CHECK constraint to an already-registered
+// domain (`ALTER DOMAIN name ADD [CONSTRAINT name] CHECK (expr)`), mirroring
+// AlterDomainAddConstraint's domainAddCheckConstraint call: an explicit name
+// colliding with an existing CHECK on the same domain is a duplicate-object
+// error, matching real PG's `constraint "%s" for domain "%s" already exists`
+// (typecmds.c); an unnamed constraint gets the same `<domain>_check`/
+// `_check1`/... auto-naming AddDomainCheck already does. Existing-column-data
+// validation (real PG's `!skip_validation` scan of every table column typed
+// with this domain) is not performed — see deferral ledger. M0122-0005 domain
+// follow-up (ADD CONSTRAINT).
+func (c *InMemory) AddDomainConstraint(domainName, name, expr string, inValues []string) error {
+	k := strings.ToLower(domainName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", domainName)
+	}
+	if name != "" && c.domainCheckNameTaken(d, name) {
+		return fmt.Errorf("constraint %q for domain %q already exists", name, d.Name)
+	}
+	c.addDomainCheckLocked(d, name, expr, inValues)
+	return nil
+}
+
+// DropDomainConstraint removes a named CHECK constraint from an existing
+// domain (`ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] name [RESTRICT |
+// CASCADE]`), mirroring AlterDomainDropConstraint. ifExists suppresses the
+// "constraint does not exist" error into a silent no-op, matching DropDomain's
+// own ifExists convention (goopg's catalog layer has no per-command NOTICE
+// channel to emit real PG's "skipping" notice through instead). M0122-0005
+// domain follow-up (DROP CONSTRAINT).
+func (c *InMemory) DropDomainConstraint(domainName, constrName string, ifExists bool) error {
+	k := strings.ToLower(domainName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return fmt.Errorf("type %q does not exist", domainName)
+	}
+	for i, ck := range d.Checks {
+		if ck.Name == constrName {
+			d.Checks = append(d.Checks[:i], d.Checks[i+1:]...)
+			return nil
+		}
+	}
+	if ifExists {
+		return nil
+	}
+	return fmt.Errorf("constraint %q of domain %q does not exist", constrName, d.Name)
 }
 
 // domainCheckNameTaken reports whether the domain already has a CHECK with the

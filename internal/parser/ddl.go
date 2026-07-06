@@ -7918,10 +7918,69 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			return ownerStmt, nil
 		}
+		if p.acceptKeyword(KwAdd) {
+			// ALTER DOMAIN name ADD [CONSTRAINT constraint_name] CHECK (expr)
+			// [NOT VALID] — the only DomainConstraintElem real PG's grammar
+			// allows (CHECK; a domain NOT NULL constraint is set via SET NOT
+			// NULL, not ADD). Reuses tryParseCheckInValues/parseDomainCheckExpr,
+			// the same helpers CREATE DOMAIN's CHECK clause uses, so the stored
+			// Expr/InValues shape matches exactly. M0122-0005 domain follow-up.
+			var cname string
+			if p.acceptKeyword(KwConstraint) {
+				nameTok, err := p.parseIdent()
+				if err != nil {
+					return nil, err
+				}
+				cname = identText(nameTok)
+			}
+			if _, err := p.expectKeyword(KwCheck); err != nil {
+				return nil, err
+			}
+			addStmt := &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "addconstraint", ConstraintName: cname}
+			if vals := p.tryParseCheckInValues(); vals != nil {
+				addStmt.CheckInValues = vals
+			} else {
+				expr, err := p.parseDomainCheckExpr()
+				if err != nil {
+					return nil, err
+				}
+				addStmt.CheckExpr = expr
+			}
+			// Optional NOT VALID trailer (ConstraintAttributeSpec). Parsed and
+			// discarded: goopg's DomainCheck has no convalidated flag, and
+			// (unlike real PG) never scans existing column data when a CHECK is
+			// added either way, NOT VALID or not — see deferral ledger.
+			if p.acceptKeyword(KwNot) {
+				p.acceptIdentKeyword("valid")
+			}
+			return addStmt, nil
+		}
+		if p.acceptKeyword(KwDrop) && p.acceptKeyword(KwConstraint) {
+			// ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] constraint_name
+			// [RESTRICT | CASCADE]. M0122-0005 domain follow-up.
+			ifExists := false
+			if p.acceptKeyword(KwIf) {
+				if _, err := p.expectKeyword(KwExists); err != nil {
+					return nil, err
+				}
+				ifExists = true
+			}
+			conNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			// Optional RESTRICT/CASCADE drop-behavior trailer — parsed and
+			// discarded; goopg tracks no dependents on a domain CHECK to
+			// cascade over.
+			if !p.acceptKeyword(KwCascade) {
+				p.acceptKeyword(KwRestrict)
+			}
+			return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "dropconstraint", ConstraintName: identText(conNameTok), IfExists: ifExists}, nil
+		}
 		// Unmodelled ALTER DOMAIN form (SET/DROP DEFAULT, SET/DROP NOT NULL,
-		// ADD/DROP CONSTRAINT, SET SCHEMA) — consume to the terminator and
-		// return a no-op, mirroring the compat-stub loop's prior behavior for
-		// this statement family.
+		// SET SCHEMA) — consume to the terminator and return a no-op,
+		// mirroring the compat-stub loop's prior behavior for this statement
+		// family.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

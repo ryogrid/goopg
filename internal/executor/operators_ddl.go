@@ -18373,6 +18373,30 @@ func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
 			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 		}
 		return nil
+	case "addconstraint":
+		d, found := cat.LookupDomain(s.Name)
+		if !found {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		expr := s.CheckExpr
+		if len(s.CheckInValues) > 0 {
+			// Synthesize the deparsed ScalarArrayOpExpr text, same as CREATE
+			// DOMAIN's CHECK (VALUE IN (...)) shortcut form.
+			expr = domainInValuesCheckExpr(d.Base.Name, s.CheckInValues, cat)
+		}
+		if err := cat.AddDomainConstraint(s.Name, s.ConstraintName, expr, s.CheckInValues); err != nil {
+			code := "42704" // ERRCODE_UNDEFINED_OBJECT — missing domain, matches real PG's typenameTypeId
+			if strings.Contains(err.Error(), "already exists") {
+				code = "42710" // ERRCODE_DUPLICATE_OBJECT, matches real PG's domainAddCheckConstraint
+			}
+			return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	case "dropconstraint":
+		if err := cat.DropDomainConstraint(s.Name, s.ConstraintName, s.IfExists); err != nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: err.Error()} // ERRCODE_UNDEFINED_OBJECT, matches real PG
+		}
+		return nil
 	}
 	return nil
 }

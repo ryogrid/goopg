@@ -366,3 +366,99 @@ covers all three failure modes (unknown constraint → `42704`, unknown domain
 **Still deferred:** `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, `ADD`/`DROP
 CONSTRAINT`, `SET SCHEMA` remain no-ops, and domain restart persistence is
 still entirely unbuilt (both unchanged from the note above).
+
+## Follow-up: `ALTER DOMAIN ... ADD`/`DROP CONSTRAINT` (2026-07-06, later loop)
+
+Closes the `ADD`/`DROP CONSTRAINT` item named as still-deferred above. Real
+PG's `gram.y` `AlterDomainStmt` production models both directly (unlike
+`RENAME CONSTRAINT`'s generic `RenameStmt` detour): `ADD [CONSTRAINT name]
+CHECK (expr) [NOT VALID]` (`DomainConstraint`/`DomainConstraintElem`, only
+`CHECK` is legal there — a domain-level `NOT NULL` constraint is set via
+`SET NOT NULL`, not `ADD`) and `DROP CONSTRAINT [IF EXISTS] name [RESTRICT |
+CASCADE]`, executed by `AlterDomainAddConstraint`/`AlterDomainDropConstraint`
+(`postgres/src/backend/commands/typecmds.c`).
+
+1. **Parser**: `parser.AlterDomainStmt` gains `Action == "addconstraint"` /
+   `"dropconstraint"`, plus `CheckExpr`/`CheckInValues` (mirroring
+   `DomainCheckClause.Expr`/`InValues`) and `IfExists`. The domain branch in
+   `parseAlter` gained two new arms:
+   - `ADD [CONSTRAINT name] CHECK (expr) [NOT VALID]` reuses
+     `tryParseCheckInValues`/`parseDomainCheckExpr` — the exact same helpers
+     `CREATE DOMAIN`'s `CHECK` clause already uses — so a constraint added via
+     `ALTER DOMAIN` stores byte-identical `Expr`/`InValues` shape to one
+     declared at `CREATE DOMAIN` time. A trailing `NOT VALID` is accepted and
+     discarded (see "Deferred" below).
+   - `DROP CONSTRAINT [IF EXISTS] name [RESTRICT | CASCADE]` follows the
+     standard `IF EXISTS`/drop-behavior parsing shape used elsewhere in this
+     file (e.g. `DROP SCHEMA`); `RESTRICT`/`CASCADE` is accepted and discarded
+     since goopg tracks no dependents on a domain `CHECK` to cascade over.
+
+   **Pitfall caught by the tests**: unlike `"rename"`/`"owner"`/`"domain"`
+   themselves (parsed via `acceptIdentKeyword`, since they're not reserved
+   keywords in goopg's lexer), `ADD` and `DROP` **are** real keyword tokens
+   (`KwAdd`/`KwDrop`) — the first pass used `acceptIdentKeyword("add"/"drop")`,
+   which never matched, so the unconsumed `ADD`/`DROP` fell through into the
+   generic compat-stub no-op loop and every ADD/DROP CONSTRAINT statement
+   silently no-op'd (surfaced immediately by `TestAlterDomainAddConstraint`/
+   `TestAlterDomainDropConstraint` as a bogus `42P01: relation "" does not
+   exist`, since the swallowed statement parsed as an empty `AlterTableStmt`).
+   Fixed by switching both arms to `p.acceptKeyword(KwAdd)`/
+   `p.acceptKeyword(KwDrop)`, matching the existing `ALTER TABLE ADD ...`
+   call sites' own convention (`ddl.go:9396` et al.).
+2. **Catalog**: `AddDomainCheck`'s body was extracted into a new
+   `addDomainCheckLocked(d *Domain, name, expr string, inValues []string)`
+   (caller holds `c.mu`), since `AddDomainCheck` locks internally and can't be
+   called from within another already-locked method without deadlocking
+   (`sync.Mutex` isn't reentrant). Two new methods share it:
+   - `AddDomainConstraint(domainName, name, expr string, inValues []string)
+     error` looks the domain up by name (unlike `AddDomainCheck`, which takes
+     an already-resolved `*Domain`), and — when an explicit name is given —
+     checks it against `domainCheckNameTaken` first, returning `"constraint %q
+     for domain %q already exists"` on collision (matches real PG's
+     `domainAddCheckConstraint`'s `constraint "%s" for domain "%s" already
+     exists"` message shape exactly, both names quoted — a different
+     convention from `RenameDomainConstraint`'s message, which mirrors
+     `RenameConstraintById`'s `format_type_be`-based unquoted domain name;
+     the two call sites in real PG genuinely use different message shapes).
+   - `DropDomainConstraint(domainName, constrName string, ifExists bool)
+     error` mirrors `DropDomain`'s own `ifExists` convention: an unknown
+     domain always errors regardless of `ifExists` (matches real PG —
+     `missing_ok` only ever gates the constraint-name lookup, not the
+     `typenameTypeId` domain lookup that happens first), an unknown
+     constraint on a known domain errors unless `ifExists` (silent no-op
+     instead), matching `"constraint %q of domain %q does not exist"`
+     (`AlterDomainDropConstraint`'s message shape — "of domain", not "for
+     domain", matching real PG's own wording split between the two call
+     sites).
+3. **Executor**: `execAlterDomain` gains `"addconstraint"`/`"dropconstraint"`
+   cases. `"addconstraint"` looks the domain up first (for its `Base.Name`,
+   needed to synthesize the `IN (...)`-shortcut expr text via the existing
+   `domainInValuesCheckExpr` helper — the same one `execCreateDomain` already
+   calls), then calls `AddDomainConstraint`, mapping `"already exists"` → 
+   `42710` and everything else → `42704` (mirrors `"renameconstraint"`'s own
+   error-code dispatch). `"dropconstraint"` calls `DropDomainConstraint`
+   directly, mapping any error to `42704`.
+
+Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainAddConstraint` (named CHECK, unnamed CHECK gets the
+`<domain>_check` auto-name, `IN (...)` shortcut synthesizes the
+`VALUE = ANY (ARRAY[...])` text, `NOT VALID` is accepted, name collision →
+`42710`, unknown domain → `42704`) and `TestAlterDomainDropConstraint`
+(plain drop, `RESTRICT` trailer accepted, unknown constraint → `42704`,
+`IF EXISTS` no-ops instead, unknown domain → `42704` even with `IF EXISTS`).
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33).
+
+**Deferred:** existing-column-data validation (real PG's
+`AlterDomainAddConstraint`'s `!skip_validation` scan of every table column
+typed with this domain, via `validateDomainCheckConstraint`) is not
+performed — a newly `ADD`'d CHECK is accepted even when existing rows already
+violate it. `NOT VALID` is parsed-and-discarded with no `convalidated`-style
+flag recorded on `DomainCheck`, so there is nothing yet for a future
+`VALIDATE CONSTRAINT` (itself still wholly unparsed, not even a no-op arm)
+to distinguish. `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, `SET SCHEMA`
+remain no-ops, and domain restart persistence is still entirely unbuilt
+(all unchanged from the notes above). See the matching 2026-07-06 deferral
+ledger row for the full resume-point detail.

@@ -412,6 +412,43 @@ unbuilt. Next candidate: resume the M0110-0001 multi-database isolation
 survey above, pick up one of the remaining ALTER DOMAIN sub-forms, or survey
 the deferral ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #50):** picked up the `ADD`/`DROP CONSTRAINT` sub-form
+named above. `ALTER DOMAIN name ADD [CONSTRAINT name] CHECK (expr) [NOT
+VALID]` reuses CREATE DOMAIN's own `tryParseCheckInValues`/
+`parseDomainCheckExpr` helpers so a constraint added via ALTER stores the
+identical `Expr`/`InValues` shape a `CREATE DOMAIN ... CHECK` clause would.
+`ALTER DOMAIN name DROP CONSTRAINT [IF EXISTS] name [RESTRICT|CASCADE]`
+mirrors `DropDomain`'s own `ifExists` no-op convention. Caught a real bug in
+the first pass: `ADD`/`DROP` were parsed via `acceptIdentKeyword`, which
+never matches since both are real keyword tokens (`KwAdd`/`KwDrop`), unlike
+`rename`/`owner`/`domain` themselves — every ADD/DROP CONSTRAINT statement
+silently no-op'd until switched to `acceptKeyword(KwAdd)`/
+`acceptKeyword(KwDrop)`, exactly the bug class the new tests were written to
+catch. New `catalog.InMemory.AddDomainConstraint`/`DropDomainConstraint`
+(shared `addDomainCheckLocked` extracted from the pre-existing
+`AddDomainCheck`, since that method self-locks and can't be called from
+another already-locked method without deadlocking); `execAlterDomain` gained
+matching cases, synthesizing the `IN (...)`-shortcut expr text via the
+existing `domainInValuesCheckExpr` helper (same one `execCreateDomain` already
+uses). Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainAddConstraint`/`TestAlterDomainDropConstraint` (named/unnamed/
+IN-list/NOT-VALID ADD forms, RESTRICT trailer, IF EXISTS no-op, 42704/42710
+error-code cases). See `docs/design/0122-0005-alter-type-owner-rename.md`'s
+new "Follow-up: `ALTER DOMAIN ... ADD`/`DROP CONSTRAINT`" section and the
+matching ledger row. Gates: `go build ./...` clean; `go test
+./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/planner/... ./internal/server/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Remaining `ALTER DOMAIN`
+sub-forms: `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL` (feature-sized
+cross-table scan), `SET SCHEMA` (domains have no `Schema` field at all
+today), and `VALIDATE CONSTRAINT` (wholly unparsed — needs a
+`DomainCheck.Validated`/`NotValid` flag ADD CONSTRAINT's own NOT VALID
+handling didn't add either, since existing-data validation itself is
+deferred). Domain restart persistence is still entirely unbuilt. Next
+candidate: resume the M0110-0001 multi-database isolation survey above, pick
+up one of the remaining ALTER DOMAIN sub-forms, or survey the deferral
+ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

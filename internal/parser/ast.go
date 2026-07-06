@@ -2657,19 +2657,23 @@ func (s *AlterSchemaStmt) stmtNode() {}
 
 // AlterDomainStmt — ALTER DOMAIN name RENAME TO newname / OWNER TO role /
 // RENAME CONSTRAINT old TO new. Real PostgreSQL's AlterDomainStmt production
-// covers more sub-forms (SET/DROP DEFAULT, SET/DROP NOT NULL, ADD/DROP
-// CONSTRAINT, SET SCHEMA) — those still parse as a no-op (see parseAlter's
-// "domain" branch). M0122-0005 domain follow-up (RENAME TO/OWNER TO); RENAME
-// CONSTRAINT added in a later follow-up.
+// covers more sub-forms (SET/DROP DEFAULT, SET/DROP NOT NULL, SET SCHEMA) —
+// those still parse as a no-op (see parseAlter's "domain" branch). M0122-0005
+// domain follow-up (RENAME TO/OWNER TO); RENAME CONSTRAINT and ADD/DROP
+// CONSTRAINT added in later follow-ups.
 type AlterDomainStmt struct {
 	pos  int
 	Name string
-	// Action selects the form: "rename" | "owner" | "renameconstraint".
+	// Action selects the form: "rename" | "owner" | "renameconstraint" |
+	// "addconstraint" | "dropconstraint".
 	Action            string
 	NewName           string // for Action == "rename"
 	NewOwner          string // for Action == "owner"; "current_user" sentinel like ALTER SCHEMA
-	ConstraintName    string // for Action == "renameconstraint": the existing constraint name
+	ConstraintName    string // for Action == "renameconstraint": the existing constraint name; also the (optional) explicit name for "addconstraint", and the target name for "dropconstraint"
 	NewConstraintName string // for Action == "renameconstraint": the new constraint name
+	CheckExpr         string   // for Action == "addconstraint": raw CHECK predicate text (e.g. "VALUE > 0"), mirrors DomainCheckClause.Expr
+	CheckInValues     []string // for Action == "addconstraint": VALUE IN (...) shortcut form, mirrors DomainCheckClause.InValues
+	IfExists          bool     // for Action == "dropconstraint": IF EXISTS
 }
 
 func (s *AlterDomainStmt) Pos() int  { return s.pos }
