@@ -385,3 +385,37 @@ func TestAlterDomainSetDropDefault(t *testing.T) {
 		t.Errorf("err = %v, want *ExecError{Code: 42704}", err)
 	}
 }
+
+// TestAlterDomainUnmodelledFormsAreNoop guards a regression discovered while
+// implementing SET/DROP DEFAULT: the parser's shared "unmodelled ALTER
+// DOMAIN form" fallback (SET/DROP NOT NULL, SET SCHEMA — none of which
+// goopg tracks yet) used to return a bare, nameless *parser.AlterTableStmt,
+// which the executor's generic ALTER TABLE path tried to resolve as a
+// relation lookup and rejected with a spurious 42P01 "relation \"\" does not
+// exist" — even though the statement was meant to be a harmless no-op, same
+// as every other not-yet-modelled ALTER ... tail in this file. The same
+// fallback shape (return &AlterTableStmt{pos} with no Name) existed at 12
+// sites across internal/parser/ddl.go for other ALTER object kinds; this
+// test pins the ALTER DOMAIN instance of the fix (routing through
+// CompatNoopStmt instead, which short-circuits before any lookup).
+func TestAlterDomainUnmodelledFormsAreNoop(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if _, ok := cat.(*catalog.InMemory); !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+	if err := runDDL(t, ctx, `CREATE DOMAIN unmodelledtest_domain AS int`); err != nil {
+		t.Fatalf("CREATE DOMAIN: %v", err)
+	}
+
+	for _, sql := range []string{
+		`ALTER DOMAIN unmodelledtest_domain SET NOT NULL`,
+		`ALTER DOMAIN unmodelledtest_domain DROP NOT NULL`,
+		`ALTER DOMAIN unmodelledtest_domain SET SCHEMA other_schema`,
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Errorf("%s: got error %v, want no-op success", sql, err)
+		}
+	}
+}

@@ -525,3 +525,67 @@ opposed to already covered by a more specific branch) should either return a
 true no-op (e.g. a dedicated `NoopStmt`) or be audited case-by-case — needs a
 survey of all 12 sites first, not a one-line fix. Domain restart persistence
 remains entirely unbuilt.
+
+## Follow-up: the 12-site `&AlterTableStmt{pos}` fallback bug (2026-07-06, later loop)
+
+Surveyed and fixed all 12 sites named above (`internal/parser/ddl.go`). Every
+one shares the same shape: a statement family's `parseAlter*` branch
+recognizes its modelled sub-forms (RENAME TO, OWNER TO, SET (...), etc.) via
+dedicated `if` arms, then falls through to a generic "consume the rest of the
+statement, succeed as a no-op" tail for anything else it doesn't model. That
+tail used to build the no-op via a bare, nameless
+`&AlterTableStmt{pos: t.Pos}` (11 sites use the inline
+`for ... p.advance() ... return &AlterTableStmt{...}` shape;
+`parseAlterOpFamilyTail`'s `noop` closure at ddl.go:1643 is the 12th, routed
+through the shared `parseSkipToSemicolonHelper`). Dispatching that empty
+statement to `execAlterTable` (`internal/executor/operators_ddl.go:6634`)
+reaches its final fallback (`operators_ddl.go:6878`), which unconditionally
+raises `42P01: relation "" does not exist` — a real, reachable regression:
+`ALTER DOMAIN d SET NOT NULL`, `ALTER AGGREGATE agg(int) SET SCHEMA s`,
+`ALTER PUBLICATION p SET (publish = 'insert')`, etc. all errored instead of
+silently succeeding, even though every one of these forms was *intended* to
+be a no-op (per each site's own comment).
+
+**Fix:** route all 12 sites through `parser.CompatNoopStmt{Tag: "<PG command
+tag>"}` instead — the same no-op vehicle already used for GRANT/REVOKE/COMMENT
+ON/etc. (`execCompatNoop`, `operators_ddl.go:14988`) — which short-circuits at
+its very first check (`if s.ObjType == "" { return nil }`, `operators_ddl.go`
+~15111) before any relation lookup, and whose `Tag` drives the
+`CommandComplete` reply tag directly (`internal/server/dispatch.go:2498`)
+instead of the misleading `"ALTER TABLE"` tag the old stub produced. Tags
+assigned per site: `ALTER AGGREGATE`, `ALTER INDEX`, `ALTER MATERIALIZED
+VIEW`, `ALTER VIEW` (3 sites — the two ALTER-COLUMN-on-a-view arms plus the
+top-level ALTER VIEW tail), `ALTER OPERATOR`, `ALTER OPERATOR CLASS`, `ALTER
+OPERATOR FAMILY` (the `parseAlterOpFamilyTail` closure), `ALTER
+PUBLICATION`/`ALTER SUBSCRIPTION` (picked dynamically from the loop's
+`pubSubKind` variable), `ALTER SCHEMA`, `ALTER DOMAIN`, and the generic
+`collation`/`extension`/`language`/`operator`/`system` compat-stub loop
+(`"ALTER " + strings.ToUpper(objIdent)` — `operator`/`collation` are
+practically unreachable there since both have their own dedicated branches
+earlier, but fixed for consistency/defense-in-depth).
+
+Two pre-existing tests asserted the *old*, buggy behavior as the expected
+shape and had to be corrected alongside the fix (not just the production
+code): `TestParseAlterOperatorOwnerToIsNoop`
+(`internal/parser/op_compat_test.go`) and
+`TestParseAlterPublicationOtherFormsStillNoop`
+(`internal/parser/alter_pubsub_owner_test.go`) both asserted
+`stmts[0].(*AlterTableStmt)` for these exact no-op forms — updated to assert
+`*CompatNoopStmt` instead, with a comment explaining why the old assertion
+was itself pinning the bug.
+
+New test: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainUnmodelledFormsAreNoop` exercises the concrete
+executor-level regression end to end (`SET NOT NULL`/`DROP NOT
+NULL`/`SET SCHEMA` on a real domain now succeed instead of raising
+`42P01`). Gates: `go build ./...` clean; `go test ./internal/parser/...
+./internal/catalog/... ./internal/executor/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33).
+
+**Deferred (unchanged from the prior row):** `SET`/`DROP NOT NULL` on a
+domain still needs the `checkDomainNotNull`-style cross-table scan;
+`SET SCHEMA` still needs a `Schema` field decision on `catalog.Domain`;
+domain restart persistence remains entirely unbuilt. This follow-up only
+fixed the *no-op mechanism* (wrong error where none should occur), not any
+of the underlying feature-sized gaps.

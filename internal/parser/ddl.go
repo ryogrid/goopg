@@ -1640,7 +1640,9 @@ func (p *parser) parseCreateOpClassTail(pos int) (Stmt, error) {
 // unrecognized form) keeps the pre-existing *AlterTableStmt no-op stub.
 // DU-002 (M0119-0004).
 func (p *parser) parseAlterOpFamilyTail(pos int) (Stmt, error) {
-	noop := func() (Stmt, error) { return parseSkipToSemicolonHelper(p, &AlterTableStmt{pos: pos}) }
+	noop := func() (Stmt, error) {
+		return parseSkipToSemicolonHelper(p, &CompatNoopStmt{pos: pos, Tag: "ALTER OPERATOR FAMILY"})
+	}
 	name, err := p.parseObjectName()
 	if err != nil {
 		return noop()
@@ -7025,7 +7027,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER AGGREGATE"}, nil
 	}
 	// ALTER COLLATION [IF EXISTS] name RENAME TO newname | OWNER TO role |
 	// REFRESH VERSION. M0119-0004 (DU-002, loop #50 ledger follow-up).
@@ -7213,7 +7215,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER INDEX"}, nil
 	}
 
 	// ALTER FUNCTION / PROCEDURE / ROUTINE — may update volatile/security/leakproof/strict attrs.
@@ -7378,7 +7380,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER MATERIALIZED VIEW"}, nil
 	}
 	// ALTER VIEW name RENAME TO / OWNER TO / SET SCHEMA — same treatment as
 	// ALTER SEQUENCE (DU-002 slice 439): a view is just a relation
@@ -7547,7 +7549,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER VIEW"}, nil
 		}
 		// Other ALTER VIEW forms not yet modeled — consume as a no-op like the
 		// pre-existing compat stub did for everything (see deferral ledger).
@@ -7557,7 +7559,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER VIEW"}, nil
 	}
 	// ALTER OPERATOR name (left_type, right_type) SET (option = value, ...) —
 	// PG's post-creation attribute-edit form (AlterOperator, operatorcmds.c).
@@ -7583,7 +7585,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER OPERATOR CLASS"}, nil
 		}
 		opName, err := p.parseOperatorName()
 		if err != nil {
@@ -7628,7 +7630,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER OPERATOR"}, nil
 		}
 		p.advance() // SET
 		p.advance() // '('
@@ -7753,7 +7755,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		tag := "ALTER PUBLICATION"
+		if pubSubKind == KwSubscription {
+			tag = "ALTER SUBSCRIPTION"
+		}
+		return &CompatNoopStmt{pos: t.Pos, Tag: tag}, nil
 	}
 	// ALTER EVENT TRIGGER name {DISABLE | ENABLE [REPLICA|ALWAYS] | RENAME TO
 	// newname | OWNER TO newowner} — the only ALTER EVENT TRIGGER forms goopg
@@ -7858,7 +7864,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER SCHEMA"}, nil
 	}
 	// ALTER DOMAIN name RENAME TO newname / ALTER DOMAIN name OWNER TO role /
 	// ALTER DOMAIN name RENAME CONSTRAINT old TO new — the three ALTER DOMAIN
@@ -8012,7 +8018,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 			p.advance()
 		}
-		return &AlterTableStmt{pos: t.Pos}, nil
+		return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER DOMAIN"}, nil
 	}
 	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
 	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
@@ -8033,7 +8039,7 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 				p.advance()
 			}
-			return &AlterTableStmt{pos: t.Pos}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: "ALTER " + strings.ToUpper(objIdent)}, nil
 		}
 	}
 	// ALTER FOREIGN DATA WRAPPER name [HANDLER h|NO HANDLER] [VALIDATOR h|NO

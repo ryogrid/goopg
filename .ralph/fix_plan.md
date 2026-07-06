@@ -490,6 +490,44 @@ false-no-op bug (bounded, mechanical once scoped), resume the M0110-0001
 multi-database isolation survey above, or survey the deferral ledger for a
 fresh open (`status = -`) row.
 
+**2026-07-06 (loop #52):** picked up the "survey the 12 `&AlterTableStmt{pos:
+t.Pos}` fallback sites" candidate named above. All 12 sites in
+`internal/parser/ddl.go` (11 inline `return &AlterTableStmt{pos: t.Pos},
+nil` sites plus `parseAlterOpFamilyTail`'s `noop` closure at ddl.go:1643,
+which routes through the shared `parseSkipToSemicolonHelper` instead — why
+it didn't match the other 11's literal grep pattern) now return
+`parser.CompatNoopStmt{Tag: "<PG command tag>"}` instead of a bare, nameless
+`AlterTableStmt` — the same no-op vehicle GRANT/REVOKE/COMMENT ON already
+use, which short-circuits in `execCompatNoop` (`if s.ObjType == "" { return
+nil }`) before any relation lookup, instead of reaching `execAlterTable`'s
+final fallback and raising a spurious `42P01: relation "" does not exist`.
+Covers: `ALTER AGGREGATE`, `ALTER INDEX`, `ALTER MATERIALIZED VIEW`, `ALTER
+VIEW` (3 call sites), `ALTER OPERATOR`, `ALTER OPERATOR CLASS`, `ALTER
+OPERATOR FAMILY`, `ALTER PUBLICATION`/`ALTER SUBSCRIPTION` (dynamic per the
+loop's own `pubSubKind`), `ALTER SCHEMA`, `ALTER DOMAIN`, and the generic
+collation/extension/language/operator/system compat-stub loop. Fixed 2
+pre-existing tests that had pinned the buggy `*AlterTableStmt` shape as the
+expected no-op result (`TestParseAlterOperatorOwnerToIsNoop`,
+`TestParseAlterPublicationOtherFormsStillNoop`) to assert `*CompatNoopStmt`
+instead. New test: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainUnmodelledFormsAreNoop` pins the concrete executor-level
+regression (`ALTER DOMAIN ... SET NOT NULL`/`DROP NOT NULL`/`SET SCHEMA` now
+succeed instead of erroring). See
+`docs/design/0122-0005-alter-type-owner-rename.md`'s new "Follow-up: the
+12-site `&AlterTableStmt{pos}` fallback bug" section, `docs/design/
+README.md`'s updated row, and the matching (now-resolved) deferral ledger
+rows. Gates: `go build ./...` clean; `go test ./internal/parser/...
+./internal/catalog/... ./internal/executor/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33). **This closes the false-no-op fallback-dispatch bug
+across all 12 sites.** Remaining `ALTER DOMAIN` gaps (unaffected, still
+feature-sized): `SET`/`DROP NOT NULL` (cross-table scan), `SET SCHEMA` (no
+`Schema` field on `catalog.Domain` yet), and domain restart persistence.
+Next candidate: resume the M0110-0001 multi-database isolation survey
+above, pick up domain restart persistence or one of the remaining
+feature-sized `ALTER DOMAIN` gaps, or survey the deferral ledger for a
+fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
