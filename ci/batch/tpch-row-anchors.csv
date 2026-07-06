@@ -1,0 +1,13 @@
+query,rows,kind,dataset,source
+Q1,4,structural,any,GROUP BY returnflag/linestatus = 4 groups on any loaded data
+Q5,5,structural,any,GROUP BY n_name over ASIA region = 5 nations
+Q9,175,structural,any,nation x year groups (25 x 7)
+Q12,2,structural,any,GROUP BY l_shipmode IN (MAIL;SHIP) = 2 rows (spotcheck invariant)
+Q22,7,structural,any,7 country-code groups
+Q13,33,pinned,20260613,bench/tpch/spotcheck_expected.env (re-pinned 2026-06-13; load-dependent — re-pin after every reload)
+Q3,11686,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (PRE-reload dataset; informational until re-pinned)
+Q10,20412,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
+Q11,791,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
+Q16,18360,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
+Q18,9,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)
+Q21,397,load-dependent,20260511,analysis/tpch/m0093-q1-q22-regression-sweep.md (informational until re-pinned)

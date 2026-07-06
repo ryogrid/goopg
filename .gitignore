@@ -98,3 +98,7 @@ bench/tpch/runtime_goopg/data/
 bench/tpch/runtime_goopg/*.pid
 bench/tpch/runtime_goopg/*.log
 bench/tpch/runtime_goopg/tmp/
+
+# Nightly CI batch run outputs (ci/design/04)
+ci/logs/
+__pycache__/

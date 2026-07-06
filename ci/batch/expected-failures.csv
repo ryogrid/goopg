@@ -1,0 +1,2 @@
+case_id,scope,reason,since,tracking
+deadlock-parallel.spec,isolation,known-fail per upstream-isolation-coverage (120/121 pass),2026-07-06,docs/test-port/upstream-isolation-coverage.md

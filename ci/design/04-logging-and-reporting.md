@@ -23,7 +23,9 @@ ci/logs/
     testport/
       go-test.log                # full -v output (regress+isolation subtests included)
       results.csv                # parsed per-test: name,status(pass|fail|skip),elapsed
-    pgbench/smoke.log
+    pgbench/
+      pgbench.log                # -i -s 50 load + standard/-N/-S runs (c=100 j=20 T=180)
+      server.log
     tpch/
       spotcheck.log
       explain-run.log            # raw tpch-runner -explain output (source of explain/)
@@ -69,7 +71,8 @@ design. The policy:
 - any must-pass test failure (doc 02 §B);
 - a baseline-`pass` regress case reporting an output-mismatch skip (the
   doc 02 §A join rule — regress divergence surfaces as SKIP, not FAIL);
-- pgbench smoke: any failed transaction (functional gate — TPS is NOT gating);
+- pgbench nightly run (s=50 c=100 j=20 T=180×3): any failed transaction
+  (functional gate — TPS is NOT gating);
 - TPC-H: spotcheck row-count mismatch (Q12/Q13 vs
   `bench/tpch/spotcheck_expected.env`), a query returning wrong row counts vs
   the anchors table, or a query erroring;
@@ -85,7 +88,7 @@ design. The policy:
 **Recorded but NEVER flagged:**
 - per-query elapsed drift below the above (written to `timings.csv`, compared
   in `summary.md` against the 20260526 per-query column for the human eye);
-- pgbench smoke TPS;
+- pgbench nightly TPS;
 - stage durations (units/race/testport) — tracked in `summary.json` as the
   batch's own trend series.
 

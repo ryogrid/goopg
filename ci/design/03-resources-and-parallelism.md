@@ -22,7 +22,7 @@ and `MemoryHigh` reclaim/throttling engages well before `MemoryMax`.
 | Lane L units | `scripts/goopg-test-run.sh` (capping works for server-less commands too) | `GOOPG_CG_UNIT=goopg-nightly-units`, `GOOPG_MEM_HIGH=6G`, `GOOPG_MEM_MAX=8G`, `GOOPG_MEM_SWAP_MAX=0`, `GOMEMLIMIT=5GiB`, `GOFLAGS=-p=4` |
 | Lane L race | `scripts/goopg-test-run.sh` | same caps, `GOOPG_CG_UNIT=goopg-nightly-race` |
 | Lane H testport | `scripts/goopg-test-run.sh` | `GOOPG_CG_UNIT=goopg-nightly-testport`, `GOOPG_MEM_HIGH=6G`, `GOOPG_MEM_MAX=8G`, `GOOPG_MEM_SWAP_MAX=0`, `GOMEMLIMIT=5GiB` |
-| Lane H pgbench smoke | `ralph-precommit-test.sh` self-caps with its per-PID unit `ralph-precommit-goopg-$$` | orchestrator exports `GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G` so the tool's internal wrapper inherits the nightly caps instead of the 20G/24G defaults |
+| Lane H pgbench nightly (s=50 c=100 j=20 T=180×3) | `scripts/goopg-test-run.sh` | `GOOPG_CG_UNIT=goopg-nightly-pgbench`, `GOOPG_MEM_HIGH=6G`, `GOOPG_MEM_MAX=8G`, `GOOPG_MEM_SWAP_MAX=0`, `GOMEMLIMIT=5GiB`; free-port probe from 5555; throwaway per-run data dir |
 | S2 TPC-H server + runner | `scripts/goopg-test-run.sh` | `GOOPG_CG_UNIT=goopg-nightly-tpch`, `GOOPG_MEM_HIGH=10G`, `GOOPG_MEM_MAX=12G`, `GOOPG_MEM_SWAP_MAX=0`, `GOMEMLIMIT=9GiB` |
 
 Notes:
@@ -110,29 +110,33 @@ Consequences for the design:
 
 Reserved lanes already in use on this host (survey doc 03): 5432 (make
 start/CI), 5433/5434 (pgbench-compare), 5533/5534 (perf), 5535+ (precommit
-probes upward), 65433 (TPC-H bench), 15435 (regress runner).
+probes upward), 65433 (TPC-H bench / loop spotcheck), 65434 (nightly TPC-H
+clone), 15435 (regress runner).
 
 Batch policy:
 
 | Batch stage | Port | Data dir | Rationale |
 |-------------|------|----------|-----------|
 | testport suite | framework-chosen ephemeral ports | per-test temp dirs | the harness already isolates itself |
-| pgbench smoke | 5535-upward probe (existing behavior) | `tmp/ralph-precommit-goopg-data-$$` | reuses the tool's per-PID isolation; probe-upward already tolerates a concurrent loop holding 5535 |
-| TPC-H | **65433** (must reuse — the loaded data dir lives there) | `bench/tpch/runtime_goopg/data` | see busy-port rule below |
+| pgbench nightly | 5555-upward probe | `tmp/goopg-nightly-pgbench-data-$$` | out of the precommit tool's 5535+ probe range; probe-upward tolerates any holder |
+| TPC-H | **65434** (batch-reserved; `NIGHTLY_TPCH_PORT`) | snapshot copy `tmp/goopg-nightly-tpch-data` (cloned from `bench/tpch/runtime_goopg/data`) | canonical 65433 stays the loop's spotcheck lane; see below |
 
-**Busy-resource rule:** before S2 the orchestrator probes 65433. If busy
-(e.g. the loop is mid-`tpch-spotcheck`), wait up to `NIGHTLY_PORT_WAIT`
-(default 900 s) polling every 15 s; still busy ⇒ S2 = `skip(port-busy)` with
-a note. Never kill the holder, never `pkill -f goopg` (self-match hazard,
-and it would hit the loop's servers). Server shutdown is always
-`goopg stop -D <datadir>` (or kill of the exact PID from `postmaster.pid`)
-plus scope stop — the pattern `ralph-precommit-test.sh` already uses.
+**Busy-resource rule:** the batch touches the canonical 65433 lane ONLY
+during the snapshot-copy window (doc 05 §A.2): wait up to `NIGHTLY_PORT_WAIT`
+(default 900 s, polling every 15 s) for 65433 to be server-free, `cp -a` the
+data dir, verify 65433 stayed free (retry ×3 on interference); never
+obtainable ⇒ S2 = `skip(port-busy)` with a note. Never kill a holder, never
+`pkill -f goopg` (self-match hazard, and it would hit the loop's servers).
+Server shutdown is always `goopg stop -D <datadir>` (or kill of the exact PID
+from `postmaster.pid`) plus scope stop — the pattern
+`ralph-precommit-test.sh` already uses.
 
-**Data-dir sharing note:** the TPC-H data dir is shared state with the loop's
-occasional spotcheck runs. The batch takes it exclusively for the S2 window
-(the port probe *is* the mutex — one server per data dir) and leaves the
-server stopped afterward, which is the state every other consumer expects to
-find.
+**Concurrency with the loop's spotcheck (requirement):** `tpch-spotcheck.sh`
+unconditionally stops whatever server runs on the canonical dir, and it is
+light (~3–4 min). By running S2 on a clone at 65434, a spotcheck fired by the
+loop at ANY point during the batch's multi-hour TPC-H stage proceeds
+undisturbed on 65433, and vice versa — the two are fully concurrent except
+for the copy window, which fits between spotcheck runs.
 
 ## E. Disk
 

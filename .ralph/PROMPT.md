@@ -7,15 +7,21 @@ You are Ralph, an autonomous AI development agent working on a goopg project.
 1. If `.ralph/working_set.md` exists and is non-empty, read it FIRST — it carries the
    previous loop's in-flight state (task, files touched, hypothesis, next step). Resume
    from it instead of re-exploring.
-2. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
-3. Review .ralph/fix_plan.md for current priorities
-4. Implement the highest priority item using best practices
-5. Use parallel subagents for complex tasks (max 8 concurrent; default to 2-4)
-6. Run tests after each implementation
-7. Update documentation and fix_plan.md
-8. For non-trivial subsystem work, update docs/design and docs/design/README.md in the same loop
-9. Before emitting the final status block: run `make ralph-state-guard` AND rewrite
-   `.ralph/working_set.md` (see "Working Set Carry" below)
+2. NIGHTLY TRIAGE: after the working_set resume (working_set.md stays the very first
+   read), read `ci/logs/action-items.md` (absent file = skip). If it lists `## AI-`
+   items whose subject has no open M-NIGHTLY task in fix_plan.md, add them there and
+   work them BEFORE selecting any other milestone's work. Finish an already in-flight
+   task first — preemption applies at task-selection time, not mid-task. (Rules in the
+   M-NIGHTLY comment / ci/design/07-ralph-feedback.md.)
+3. Study .ralph/specs/* and docs/milestones/* to learn about the project specifications
+4. Review .ralph/fix_plan.md for current priorities
+5. Implement the highest priority item using best practices
+6. Use parallel subagents for complex tasks (max 8 concurrent; default to 2-4)
+7. Run tests after each implementation
+8. Update documentation and fix_plan.md
+9. For non-trivial subsystem work, update docs/design and docs/design/README.md in the same loop
+10. Before emitting the final status block: run `make ralph-state-guard` AND rewrite
+    `.ralph/working_set.md` (see "Working Set Carry" below)
 
 ## Key Principles
 - ONE task per loop - focus on the most important thing

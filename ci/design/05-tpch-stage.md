@@ -7,20 +7,34 @@ Hence: runs solo, memory-capped, and under a **2-hour total wall-clock limit**
 
 ## A. Preconditions & setup
 
-1. **Data check** — `bench/tpch/runtime_goopg/data` exists and ≥ 100 MB
-   (mirrors `TPCH_SPOTCHECK_MIN_MB`); else stage = `skip(no-data)`, exit 0.
+**Isolation from the loop's `tpch-spotcheck.sh` (requirement):** the loop's
+spotcheck unconditionally `goopg stop`s whatever server runs on the canonical
+bench data dir (`bench/tpch/runtime_goopg/data`, port 65433) — so the batch
+must NOT hold that dir/port for a multi-hour stage, and the two must be able
+to run concurrently (spotcheck is light: ~3–4 min, small footprint). The
+batch therefore runs on a **snapshot copy** of the data dir at its own port:
+
+1. **Data check** — canonical dir exists and ≥ 100 MB (mirrors
+   `TPCH_SPOTCHECK_MIN_MB`); else stage = `skip(no-data)`, exit 0.
    The nightly never (re)loads data — the HammerDB load is hours-long and a
    reload would invalidate the Q13 row-count pin (Q13 is load-dependent;
    re-pinned to 33 on the 2026-06-13 dataset).
-2. **Port 65433 probe** — the data dir's canonical port
-   (`bench/tpch/env_goopg.sh`). Busy ⇒ bounded wait then `skip(port-busy)`
-   (doc 03 §D).
-3. **Fresh capped server start** — via `scripts/goopg-test-run.sh` with
-   `GOOPG_CG_UNIT=goopg-nightly-tpch`, `GOOPG_MEM_HIGH=10G`,
-   `GOOPG_MEM_MAX=12G`, `GOOPG_MEM_SWAP_MAX=0`, `GOMEMLIMIT=9GiB`; readiness
-   wait ≤ 120 s (spotcheck's `TPCH_SPOTCHECK_READY_TIMEOUT` precedent — SLRU
-   backfill can make startup slow). Fresh restart is mandatory: stale server
-   state hides regressions (the established pre-commit-gate rule).
+2. **Snapshot copy** — the copy is only consistent while no server writes the
+   source, so: wait for 65433 to be server-free (≤ `NIGHTLY_PORT_WAIT`),
+   `cp -a` the dir to `tmp/goopg-nightly-tpch-data` (~2.2 GB, tens of
+   seconds), then verify 65433 stayed free; a server appearing mid-copy ⇒
+   redo (3 attempts, then `skip(port-busy)`). After the copy the canonical
+   dir/port are released — a loop spotcheck can run at any time during the
+   rest of the stage.
+3. **Fresh capped server start ON THE COPY** at
+   `${NIGHTLY_TPCH_PORT:-65434}` (batch-reserved lane) — via
+   `scripts/goopg-test-run.sh` with `GOOPG_CG_UNIT=goopg-nightly-tpch`,
+   `GOOPG_MEM_HIGH=10G`, `GOOPG_MEM_MAX=12G`, `GOOPG_MEM_SWAP_MAX=0`,
+   `GOMEMLIMIT=9GiB`; readiness wait ≤ 120 s (spotcheck's
+   `TPCH_SPOTCHECK_READY_TIMEOUT` precedent — SLRU backfill can make startup
+   slow). The copy IS the fresh state (never touched by a server since the
+   snapshot), satisfying the fresh-restart rule; the clone is deleted in the
+   stage's cleanup trap.
 4. Ensure the runner binary: `go build -o tmp/tpch-runner ./cmd/tpch-runner`
    (cheap, part of the stage).
 5. **Connection identity after a fresh restart:** goopg roles/databases are
@@ -38,14 +52,15 @@ Stage-local `trap EXIT`: stop the server (`postmaster.pid` PID →
 
 ## B. Step 1 — spotcheck tripwire
 
-Run Q12 and Q13 **directly against the stage's already-started server** and
+Run Q12 and Q13 **directly against the stage's clone server (65434)** and
 compare with `bench/tpch/spotcheck_expected.env` (**Q12=2 structural, Q13=33
 pinned**) — the same semantics as `scripts/tpch-spotcheck.sh`, without
-invoking it. Invoking the script here would not work: it performs its *own*
-capped fresh start on the same port/data dir, colliding with the server §A
-already started (and a duplicate `GOOPG_CG_UNIT` would be refused). The
-stage reuses the script's expected-values file and its superuser@`postgres`
-connection fallback (§A.5), not its server lifecycle.
+invoking it. Invoking the script here would be wrong twice over: it runs its
+own fresh server on the CANONICAL dir/port (65433) — re-entering the lane the
+clone strategy exists to leave to the loop — and it would validate that
+server, not the clone the sweep actually runs on. The stage reuses the
+script's expected-values file and its superuser@`postgres` connection
+fallback (§A.5), not its server lifecycle.
 
 - **Mismatch ⇒ the stage is FAILED immediately and the 22-query sweep is
   skipped.** Rationale: the spotcheck failing means correctness is already
@@ -60,7 +75,7 @@ connection fallback (§A.5), not its server lifecycle.
 Before executing queries, capture all 22 plans:
 
 ```bash
-tmp/tpch-runner -port 65433 -db postgres -user "$SUPERUSER" \
+tmp/tpch-runner -port 65434 -db postgres -user "$SUPERUSER" \
   -explain -per-query-timeout 60s \
   | tee "$RUN_DIR/tpch/explain-run.log"
 # split per query into tpch/explain/qNN.txt
@@ -110,7 +125,7 @@ for q in order:
     if remaining <= RESERVE:
         mark q..rest = not-run(budget); break
     per_q = min(1200s, remaining - RESERVE)
-    tmp/tpch-runner -port 65433 -db postgres -user "$SUPERUSER" \
+    tmp/tpch-runner -port 65434 -db postgres -user "$SUPERUSER" \
         -queries q -per-query-timeout ${per_q}s
     parse elapsed/rows/status → tpch/timings.csv; progress.log line
 ```
@@ -153,5 +168,5 @@ note it).
 | server OOM-killed by its own cgroup (12G MemoryMax) | current query errors; runner marks it, sweep aborts (connection gone) ⇒ stage `fail`; scope log names the kill — clearly distinguished from host OOM |
 | host memory pressure → Linux OOM killer takes the runner or server (the batch is OUTSIDE `mem_guard.py`'s watch tree — doc 03 §C) | signal 9, no panic ⇒ `resource-kill`, run `inconclusive`; forensics via `dmesg`/`journalctl` (doc 02/03) |
 | startup exceeds ready-timeout | stage `fail(startup)`; fsync-storm history says check SLRU backfill first |
-| port 65433 held all night | `skip(port-busy)` — never kill the holder |
+| canonical 65433 busy through every copy attempt | `skip(port-busy)` — never kill the holder; the copy window is the only 65433 touchpoint |
 | data dir absent/small | `skip(no-data)` |

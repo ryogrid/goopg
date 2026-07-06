@@ -49,7 +49,7 @@ S0 preflight  (sequential)
    ▼                ▼                 │
 S1 Lane L        S1 Lane H            │  (two lanes in parallel)
   units            testport suite     │
-  race-gate        pgbench smoke      │
+  race-gate        pgbench nightly    │
    └────────────────┴─────────────────┘
    ▼  (barrier: both lanes complete)
 S2 TPC-H (solo — nothing else running)
@@ -94,10 +94,12 @@ server processes and OOM surface for little gain. See doc 03 for the caps.
 **Lane L (server-less), sequential within lane** — both stages run inside a
 `scripts/goopg-test-run.sh` cgroup scope of their own (doc 03 §A), so every
 batch stage is memory-capped, not only the server-based ones:
-1. `stage-units.sh` → `RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh`
-   — the CI-parity unit/component set (~10 min, `-timeout 10m`).
-2. `stage-race.sh` → `make race-gate` (~15 min, `-timeout 15m`, same EXCLUDE
-   list with `-race`).
+1. `stage-units.sh` → the CI-parity unit/component set, run directly
+   (`go test -timeout ${NIGHTLY_UNITS_TIMEOUT:-30m}` over the CI EXCLUDE
+   list; the precommit tool's hard-coded 10m is too tight under nightly
+   co-load — see doc 02 §A).
+2. `stage-race.sh` → `make race-gate RACE_TIMEOUT=${NIGHTLY_RACE_TIMEOUT:-45m}`
+   (same EXCLUDE list with `-race`).
 
 **Lane H (server-based), sequential within lane:**
 1. `stage-testport.sh` → the oracle-port suite: the **whole
@@ -109,8 +111,11 @@ batch stage is memory-capped, not only the server-based ones:
    60 must-pass oracle rows *and* the regress (232 cases) and isolation
    (121 specs) sub-suites — they are subtests of `TestPort_RegressSuite` /
    `TestPort_IsolationSuite`, not separate stages (dedup rule, doc 02).
-2. `stage-pgbench.sh` → `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`
-   — the functional pgbench smoke (~2–3 min, 0-failed-transactions gate).
+2. `stage-pgbench.sh` → self-contained nightly pgbench run (scale 50,
+   100 clients, 20 threads, 180 s × the standard/-N/-S trio; ~12–15 min;
+   0-failed-transactions gate). Deliberately NOT `ralph-precommit-test.sh`:
+   the nightly parameters differ from the per-commit smoke, and changing the
+   shared tool would alter the git-hook gate for every commit.
 
 Lane implementation: the orchestrator backgrounds each lane's runner
 (`lane_l.pid`, `lane_h.pid`), `wait`s on both, and merges statuses. A lane
@@ -134,7 +139,8 @@ dirs, sets the batch exit code. Schema in doc 04.
 
 | Function | Reused as-is (established tool) | New, lives in `ci/batch/` |
 |----------|--------------------------------|---------------------------|
-| Unit + smoke suites | `scripts/ralph-precommit-test.sh` (SCOPE=units/smoke) | stage wrappers only |
+| Unit suite | (CI EXCLUDE list mirrored) | `stage-units.sh` — direct `go test`, nightly timeout |
+| pgbench nightly run | (server plumbing pattern mirrored from `ralph-precommit-test.sh`) | `stage-pgbench.sh` — own params s=50/c=100/j=20/T=180 |
 | Race detector | `make race-gate` | — |
 | cgroup capping | `scripts/goopg-test-run.sh` | per-stage unit naming |
 | TPC-H spotcheck | `scripts/tpch-spotcheck.sh` | — |

@@ -28,7 +28,8 @@ The test landscape this design draws from was surveyed in
 A single entrypoint (`ci/batch/run-nightly.sh`, wrapped by `make
 nightly-batch`) runs: **S0 preflight** (build + environment checks) → **S1 two
 parallel lanes** (Lane L: server-less unit + race tests; Lane H: server-based
-testport/regress/isolation + pgbench smoke — every stage in both lanes runs
+testport/regress/isolation + pgbench (s=50, c=100, j=20, 180 s × 3 workloads)
+— every stage in both lanes runs
 inside its own cgroup memory cap) →
 barrier → **S2 TPC-H solo** (spotcheck → EXPLAIN capture → 22 queries under a
 2-hour total budget) → **S3 summary** (`summary.md`/`summary.json`, non-zero

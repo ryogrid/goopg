@@ -9,15 +9,16 @@ promoted into the must-pass set. Grounded in
 
 ### Lane L step 1 — CI unit/component set (`stage-units.sh`)
 
-Exactly the CI bar, via the established tool:
+Exactly the CI bar (same package set), with a nightly-sized timeout:
 
 ```bash
 GOOPG_CG_UNIT=goopg-nightly-units GOOPG_MEM_HIGH=6G GOOPG_MEM_MAX=8G \
-  scripts/goopg-test-run.sh \
-  env RALPH_PRECOMMIT_SCOPE=units GOFLAGS=-p=4 scripts/ralph-precommit-test.sh
-# inner suite == go test -timeout 10m $(go list ./... | grep -vE \
-#    'internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/')
-# (functionally identical to the CI workflow's multi-line EXCLUDE string)
+  scripts/goopg-test-run.sh env GOFLAGS=-p=4 \
+  go test -timeout ${NIGHTLY_UNITS_TIMEOUT:-30m} $(go list ./... | grep -vE \
+    'internal/testport|internal/server|internal/testutil/cluster|internal/testutil/replcluster|internal/testutil/pgcluster|internal/testutil/pubsubcluster|internal/testutil/tpch|/bench/')
+# (the exact CI package set / EXCLUDE, run DIRECTLY: the precommit tool
+#  hard-codes -timeout 10m, which internal/initdb was observed blowing under
+#  nightly co-load — pgbench SF50 + the TPC-H data copy share the disk)
 ```
 
 Note the wrapper env vars sit **before** `goopg-test-run.sh` — the wrapper
@@ -31,9 +32,10 @@ per-commit bar the Ralph loop already enforces).
 
 ### Lane L step 2 — race detector (`stage-race.sh`)
 
-`make race-gate` (same EXCLUDE list, `-race -timeout 15m`), wrapped the same
-way with `GOOPG_CG_UNIT=goopg-nightly-race`. Also no-expected-fail. Race
-findings are regressions by definition.
+`make race-gate RACE_TIMEOUT=${NIGHTLY_RACE_TIMEOUT:-45m}` (same EXCLUDE
+list, `-race`; timeout raised from the 15m default for nightly co-load),
+wrapped the same way with `GOOPG_CG_UNIT=goopg-nightly-race`. Also
+no-expected-fail. Race findings are regressions by definition.
 
 ### Lane H step 1 — oracle-port suite (`stage-testport.sh`)
 
@@ -90,12 +92,26 @@ parses `--- SKIP` lines and reports a per-run skip count; a *new* skip for a
 tool that was present the previous night is surfaced as `env-drift`
 (informational, not a failure).
 
-### Lane H step 2 — pgbench smoke (`stage-pgbench.sh`)
+### Lane H step 2 — pgbench nightly run (`stage-pgbench.sh`)
 
-`RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` — build →
-initdb → pgbench standard / `-N` / `-S`, each `-T 30 -c 2 -j 2`. Gate:
-**0 failed transactions** on all three workloads. TPS is recorded but never
-gates (doc 04).
+Self-contained stage (server plumbing mirrored from
+`scripts/ralph-precommit-test.sh`: free-port probe from 5555, throwaway
+per-run data dir, capped server `goopg-nightly-pgbench` 6G/8G, pinned PG 18.3
+client tools, SIGKILL teardown): build → initdb → `pgbench -i -s 50` →
+standard / `-N` / `-S`, each **`-c 100 -j 20 -T 180`** (env-overridable via
+`NIGHTLY_PGBENCH_SCALE/CLIENTS/THREADS/T`). Gate: **0 failed transactions**
+on all three workloads. TPS is recorded but never gates (doc 04).
+
+Every pgbench invocation runs under an outer `timeout -k 30 --signal=INT`
+clamp (load 1800 s; workloads T+600 s): at c=100 a server bug can leave all
+clients hung on never-returning queries, and pgbench then ignores its own
+`-T` deadline indefinitely (observed live 2026-07-06 — 0.0 tps for 56 min).
+A clamped workload is recorded FAILED and the remaining workloads still run.
+
+Deliberately NOT delegated to `ralph-precommit-test.sh`: the nightly
+parameters differ from the per-commit smoke (`-s 1 -c 2 -j 2 -T 30`), and
+parameterizing the shared tool would risk changing the git-hook gate that
+runs on every commit.
 
 ### S2 — TPC-H
 
@@ -183,10 +199,10 @@ Unchanged from the established process; the batch is a pure consumer:
 | Stage | Expected wall clock |
 |-------|---------------------|
 | S0 preflight + build | ~2–4 min |
-| Lane L units | ~10 min (CI `-timeout 10m`) |
-| Lane L race | ~15 min (`RACE_TIMEOUT=15m`) |
+| Lane L units | ~10 min uncontended; up to `NIGHTLY_UNITS_TIMEOUT` (30m) under co-load |
+| Lane L race | ~15 min uncontended; `RACE_TIMEOUT` raised to 45m for the nightly |
 | Lane H testport (incl. regress+isolation) | not yet measured as one run; budget `-timeout 120m`, record actual on first nights |
-| Lane H pgbench smoke | ~2–3 min |
+| Lane H pgbench nightly (s=50, c=100, j=20, T=180×3) | ~12–15 min |
 | S2 TPC-H | sweep ≤ 2 h hard + ≤ ~35 min setup/spotcheck/EXPLAIN overhead (doc 05 §D scope note); baseline full pass 1469 s |
 | **Total** | ~2.5–5 h, dominated by testport + TPC-H |
 
