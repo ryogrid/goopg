@@ -30,8 +30,38 @@ Current empty-leaf handling is intentionally simplified and does not yet provide
 
 ### 2.4 Internal cleanup scope
 
-- Define when internal ancestors are collapsed.
-- Preserve root invariants and fast-root metadata consistency.
+- **Implemented 2026-07-07** (M-NIGHTLY AI-20260706-201855-001,
+  `internal/access/btree/btree_vacuum.go`): a non-root internal page is
+  collapsed the moment a downlink removal drops its own item count to
+  0. `maybeCascadeEmptyInternal` is invoked after every leaf unlink
+  (from both `unlinkEmptyLeaf` and `unlinkEmptyLeafFPI`) with the
+  `ancestorPath` (root..parent, captured before the parent's item
+  count could reach 0 and its key-based lookup became impossible) and
+  loops upward: it unlinks the empty internal page from its own parent
+  via `unlinkEmptyInternalPage`/`unlinkEmptyInternalPageFPI` (relink
+  live level-siblings, remove the downlink one level up, flag
+  `BTDeleted`, recycle the block — mirroring `unlinkEmptyLeaf`'s shape
+  and reusing the same WAL emitter/replay records, which are page-
+  structure-agnostic), then repeats one level higher if that removal
+  also emptied the grandparent. Stops at the root (root emptiness is a
+  distinct, pre-existing case: `VacuumIndexPages`'s `isTreeEmpty`/
+  `resetToEmptyRoot` collapse the whole tree to a single empty leaf
+  root once every leaf is gone).
+- Before this, an internal page vacuumed down to 0 items stayed
+  linked-but-contentless in the tree; any later descent whose
+  separator range still routed through it hit
+  `findChildBlockDirect`'s `count == 0` guard and raised "btree: empty
+  internal page" — reproducible via repeated small-table
+  insert/delete/vacuum churn (e.g. `pgbench_branches` at scale=10, no
+  crash needed).
+- **Known gap (deferred, see `.ralph/deferral_ledger.md` 2026-07-07):**
+  the cascade is not crash-safe across its own recursion levels — it
+  has no phase-1 (`BTHalfDead`-style) marker of its own, unlike leaf
+  deletion's two-phase protocol (§2.1), so a crash between cascading
+  level N and N+1 can leave level N's now-empty page exposed to the
+  same bug one level higher. `CompleteDeferredDeletions` does not yet
+  scan for this case. Root invariants and fast-root metadata are
+  unaffected by this gap (cascading never touches the root itself).
 
 ## 3. Tests
 

@@ -244,6 +244,40 @@ every clean, green (build + pre-commit) checkpoint.
       cascade (resume point + rationale for deferring it this loop are in
       today's ledger row) — use the cheap scale=10 recipe, not the
       15-min nightly-scale one, to iterate.
+      2026-07-07 update #5 (7th loop; see deferral ledger row appended
+      today): implemented and landed the recursive internal-page-deletion
+      cascade from the previous update's next step
+      (`btree_vacuum.go`: `maybeCascadeEmptyInternal` +
+      `unlinkEmptyInternalPage`/`unlinkEmptyInternalPageFPI`, wired from
+      both `unlinkEmptyLeaf` and `unlinkEmptyLeafFPI` via a threaded
+      `ancestorPath`). New regression test
+      `TestVacuumIndexPagesCascadesEmptyInternalPage` builds a genuine
+      3-level tree (n=900000 int4 keys), empties one whole non-root
+      internal page's leaf subtree in one `VacuumIndexPages` call, and
+      asserts the tree stays fully readable — confirmed it FAILS on
+      pre-fix code (`git stash` the fix, rerun: fails with "cascaded
+      internal page ... still live") and PASSES post-fix, so it is a real
+      regression test, not vacuous. Re-ran the cheap scale=10/c=20-then-
+      c=20/T=60 manual repro from the previous loop: 0 failed
+      transactions across 90s total, no "empty internal page" or
+      "item length mismatch" in the server log (previously failed within
+      30s) — **this closes the SECOND root cause.**
+      **Still does NOT close the nightly item**: re-ran the full
+      authoritative repro (`stage-pgbench.sh`, s=50 c=100 j=20 T=180x3)
+      post-fix — FAILS AGAIN, same original signature (`btree: item
+      length mismatch keyLen=9 total=37`, occasionally keyLen=0/7460) on
+      the very first workload, ~78 of 100 clients aborting within ~30s.
+      This means a THIRD root cause exists — the c=100/j=20/s=50 scale
+      exercises something the c=20/j=8/s=10 manual repro does not (higher
+      concurrency and/or bigger shared tables produce more downlink-slot
+      churn per parent page). Since this is the SAME symptom the 5th/6th
+      loops already spent 4+ loops narrowing (buffer-pool tracing →
+      "unlocked write" → refuted → "logic bug in the UPDATE-heavy
+      TPC-B path" per the 2026-07-07-update-#3 entry above), the next
+      loop should resume THAT investigation thread (small-hot-key/UPDATE
+      repro, NOT the insert-only unit test), now that both the splitMu
+      race and the missing-cascade bug are confirmed fixed and ruled out
+      as the cause of this recurrence.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
