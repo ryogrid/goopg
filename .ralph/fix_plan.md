@@ -173,6 +173,49 @@ every clean, green (build + pre-commit) checkpoint.
       catch the exact unlocked mutation against block 83's slot. Note:
       repro rate is ~100% at `-count=200` WITH tracing (vs. ~1/150-500
       without) — budget only `-count=50` or so per attempt.
+      2026-07-07 update #3 (5th loop; see the 3rd 2026-07-07 deferral
+      ledger row): MAJOR REDIRECTION, refuting the prior loop's
+      "unlocked write" hypothesis with direct negative evidence rather
+      than more static audit. Ran the btree-only fast repro
+      (`TestMultiWriterStress_M0055_Phase_C`) for ~1180 total iterations
+      this session (in-process `-race -count=100/300/500`, 80
+      separate-process `-race` binary runs, 200 plain runs) — ZERO
+      failures, ZERO race-detector reports, on a 16-core box. This
+      contradicts the previous loop's claimed reproducible unlocked
+      write. Then re-ran the REAL authoritative repro (fix_plan rule 3):
+      `bash ci/batch/stages/stage-pgbench.sh` at HEAD reproduces
+      instantly and reliably (dozens of clients hit the keyLen mismatch
+      within ~30s of the first workload, every time). Built
+      `bin/goopg-race` (`go build -race ./cmd/goopg`), ran it manually
+      against a real scale=50 pgbench dataset under the real TPC-B
+      workload: corruption reproduced again (confirmed twice, once at
+      c=100/T=180 via the stage script, once manually at c=100/T=80) —
+      but the race detector found **zero DATA RACE reports** either
+      time. Conclusion: this is very likely NOT a classic memory data
+      race — it is a logic bug in properly-synchronized code (wrong
+      length/offset computed, not a torn/unsynchronized write), and the
+      real trigger requires the FULL heap+index+MVCC stack under
+      UPDATE-heavy contention on tiny shared tables (TPC-B's
+      `pgbench_branches`/`pgbench_tellers`, 50/500 rows at scale=50) —
+      something the insert-only, disjoint-key unit test structurally
+      cannot exercise (no updates, no shared-row contention; goopg has
+      no HOT update per `[[goopg_no_hot_update_index_reeval]]` memory,
+      so every UPDATE in TPC-B inserts a fresh index entry into the SAME
+      few hot pages). Do **not** keep chasing
+      `TestMultiWriterStress_M0055_Phase_C` — retire or replace it with
+      a small-hot-key/UPDATE-modeling repro. New cheap (~15 min,
+      first-try) repro recipe recorded in the ledger: build
+      `bin/goopg-race`, init, start with `GORACE=log_path=...`, `pgbench
+      -i -s 50`, then `pgbench -T 80 -c 100 -j 20 -P 5` — fails
+      immediately. Next candidates to inspect: `dedupConsolidate`/
+      posting-list code (`internal/access/btree/posting.go` —
+      `appendTIDToPosting`/`promoteSingleToPosting` flagged `unusedfunc`
+      by `go vet` this loop, worth checking if dead), and the item/
+      line-pointer length encoding in `insertItemSorted`/`pageItems`/
+      `findChildBlockDirect`. All temporary artifacts (race binary, race
+      data dirs, logs) removed; test skip restored via `git checkout
+      --`; `go build ./...` clean; `go test -count=1 ./internal/
+      storage/... ./internal/access/btree/...` PASS after revert.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
