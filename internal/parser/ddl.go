@@ -7860,13 +7860,68 @@ func (p *parser) parseAlter() (Stmt, error) {
 		}
 		return &AlterTableStmt{pos: t.Pos}, nil
 	}
-	// ALTER COLLATION / DOMAIN / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
+	// ALTER DOMAIN name RENAME TO newname / ALTER DOMAIN name OWNER TO role —
+	// the two ALTER DOMAIN forms goopg models so far. Previously "domain" fell
+	// entirely into the generic collation/domain/extension/... compat-stub
+	// loop below, a silent no-op for every form including these two — the
+	// same class of gap ALTER SCHEMA's dedicated case (immediately above)
+	// closed for schemas. Every other AlterDomainStmt sub-form (SET/DROP
+	// DEFAULT, SET/DROP NOT NULL, ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET
+	// SCHEMA) still falls through to a no-op below, matching this loop's
+	// bounded scope (deferral ledger 2026-07-06 row). M0122-0005 (domain
+	// follow-up).
+	if p.acceptIdentKeyword("domain") {
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			return &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "rename", NewName: identText(newNameTok)}, nil
+		}
+		if p.acceptIdentKeyword("owner") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			ownerStmt := &AlterDomainStmt{pos: t.Pos, Name: name.Name, Action: "owner"}
+			if p.acceptIdentKeyword("current_user") ||
+				p.acceptIdentKeyword("session_user") ||
+				p.acceptIdentKeyword("current_role") {
+				ownerStmt.NewOwner = "current_user"
+			} else if tok, err := p.parseIdent(); err == nil {
+				ownerStmt.NewOwner = identText(tok)
+			} else {
+				ownerStmt.NewOwner = "current_user"
+			}
+			return ownerStmt, nil
+		}
+		// Unmodelled ALTER DOMAIN form (SET/DROP DEFAULT, SET/DROP NOT NULL,
+		// ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET SCHEMA) — consume to the
+		// terminator and return a no-op, mirroring the compat-stub loop's
+		// prior behavior for this statement family.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return &AlterTableStmt{pos: t.Pos}, nil
+	}
+	// ALTER COLLATION / EXTENSION / LANGUAGE / OPERATOR / SYSTEM —
 	// compatibility stubs. Consume until end of statement. (ALTER VIEW has
 	// its own dedicated case above, DU-002 slice 440 — "view" is
 	// intentionally not in this list; ALTER SCHEMA has its own dedicated
-	// case immediately above — DU-002 slice 440 resume point (3).)
+	// case immediately above — DU-002 slice 440 resume point (3); ALTER
+	// DOMAIN has its own dedicated case immediately above too — M0122-0005
+	// domain follow-up.)
 	for _, objIdent := range []string{
-		"collation", "domain", "extension", "language",
+		"collation", "extension", "language",
 		"operator", "system",
 	} {
 		if p.acceptIdentKeyword(objIdent) {

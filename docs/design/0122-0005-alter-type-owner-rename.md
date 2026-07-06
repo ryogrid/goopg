@@ -220,3 +220,90 @@ PASS (Q12=2/Q13=33).
 DOMAIN` grammar first); grant-option delegation-chain resolution is
 unrelated to this row. The `pg_dump` ACL-default live-verification gap noted
 above is also unchanged (out of scope for a WAL-persistence follow-up).
+
+## Follow-up: `ALTER DOMAIN RENAME TO` / `OWNER TO` (2026-07-06, later loop)
+
+Closes the "domain typowner remains completely untouched" deferred item
+above — the first two of `AlterDomainStmt`'s named sub-forms (`RENAME TO`,
+`OWNER TO`); the rest (`SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, `ADD`/
+`DROP CONSTRAINT`, `RENAME CONSTRAINT`, `SET SCHEMA`) remain out of scope,
+per the "materially larger, separate task" note above and this bucket's
+"ONE task per loop" rule.
+
+Unlike range types, `ALTER DOMAIN` had **no dispatch to piggyback on at
+all** — it fell entirely into `parseAlter`'s generic "collation / domain /
+extension / language / operator / system" compat-stub loop
+(`internal/parser/ddl.go`), which consumes tokens to `;`/EOF and returns a
+bare `&AlterTableStmt{}` no-op with no AST capturing the target name, let
+alone the sub-form. So this follow-up needed a new AST node, not just a new
+field on an existing one (`AlterTypeStmt` doesn't apply — real PostgreSQL's
+`RenameType`/`AlterTypeOwner` explicitly reject `ALTER TYPE` on a domain via
+`objecttype == OBJECT_DOMAIN && typTup->typtype != TYPTYPE_DOMAIN"` — domains
+are a structurally distinct statement, `AlterDomainStmt`/`RenameStmt` with
+`renameType=OBJECT_DOMAIN` in `gram.y`, not `AlterTypeStmt` on a shared
+production, verified against `postgres/src/backend/commands/typecmds.c`'s
+`RenameType`/`AlterTypeOwner`).
+
+1. **Parser**: new `parser.AlterDomainStmt{Name, Action ("rename"|"owner"),
+   NewName, NewOwner}` (`internal/parser/ast.go`), mirroring
+   `AlterSchemaStmt`'s shape exactly. A dedicated `if
+   p.acceptIdentKeyword("domain")` branch in `parseAlter`
+   (`internal/parser/ddl.go`), inserted immediately before the generic
+   compat-stub loop (which had `"domain"` removed from its object-ident
+   list, the same "carve out a dedicated case before the catch-all" pattern
+   `ALTER SCHEMA` used), parses `RENAME TO`/`OWNER TO` (including the
+   `current_user`/`session_user`/`current_role` owner sentinels) and falls
+   back to the same token-consuming no-op for every other sub-form.
+2. **Catalog**: `catalog.Domain` gains `Owner uint32` +
+   `OwnerOrDefault()` (identical shape to `EnumType`/`RangeType`'s). New
+   `RenameDomain`/`SetDomainOwner` methods mirror
+   `RenameRangeType`/`SetRangeTypeOwner` exactly — domains are keyed by
+   lowercased name only in `c.domains` (no separate OID-indexed map to
+   re-key), so rename is a straight delete-old-key/re-insert-under-new-key.
+3. **Executor**: `execCreateDomain` stamps `d.Owner =
+   o.currentDDLOwnerOID()` at CREATE time (the same "creator becomes owner"
+   convention as range types). New `execAlterDomain`
+   (`internal/executor/operators_ddl.go`) switches on `s.Action`: `"rename"`
+   calls `RenameDomain`, raising `42710` on failure (not-found or
+   name-collision — matches the existing enum/range-type RENAME TO
+   simplification of one shared code for both cases, not real PG's
+   `42704`/`42710` split, for consistency with those sibling paths);
+   `"owner"` resolves the role (or `current_user`) via `RoleOID`, raising
+   `42704` for an unknown role, then calls `SetDomainOwner`, raising `42704`
+   if the domain itself doesn't exist (matches real PG's `AlterTypeOwner`
+   exactly for the not-found case). Wired into the DDL dispatch switch and
+   `planner.go`'s DDL-statement-kind list; `internal/server/dispatch.go`'s
+   command-tag switch gains `*parser.AlterDomainStmt` → `"ALTER DOMAIN"`
+   (the `cmdtag_table.go` entry already existed, unused until now).
+4. **`pg_type` rendering**: the two `bootstrapSuperuserOID` typowner
+   literals in `buildUserPGTypeRowForDomain`/`ForDomainArray`
+   (`internal/executor/pg18_user_catalog_rows.go`) now read
+   `d.OwnerOrDefault()`, mirroring the range-type array-row precedent (the
+   auto-generated array type shares the domain's owner; there is no
+   independent array `Owner` field).
+
+Tests: `internal/executor/alter_domain_owner_rename_test.go`'s
+`TestAlterDomainOwnerTo` (default-owner assertion, OWNER TO updates it,
+unknown-domain and unknown-role both raise `42704`) and
+`TestAlterDomainRenameTo` (rename preserves `Base`/`Checks`, unknown-domain
+raises `42710`). Gates: `go build ./...` clean; `go test
+./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/planner/... ./internal/server/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+**Still deferred:** every other `AlterDomainStmt` sub-form (`SET`/`DROP
+DEFAULT`, `SET`/`DROP NOT NULL`, `ADD`/`DROP CONSTRAINT`, `RENAME
+CONSTRAINT`, `SET SCHEMA`) still parses as a no-op — each would need its own
+catalog mutation (`SET`/`DROP NOT NULL` in particular needs a
+`checkDomainNotNull`-style scan of every column of the domain's type across
+every table, real PG's `AlterDomainNotNull` in `typecmds.c`, not a bounded
+mechanical change like RENAME TO/OWNER TO). Also unchanged: **domains have
+no restart persistence at all** — `CREATE DOMAIN` itself has no WAL record
+and no heap-reload path in `internal/initdb` (confirmed by grep: no
+`EncodeCreateDomain`/domain recovery driver exists), unlike range types
+which already had a CREATE record before this bucket started. Threading
+`Owner`/rename into a hypothetical `EncodeAlterDomainRename`/`...Owner` pair
+would be dead code until domain *definitions* themselves survive a restart
+first — that is a materially larger, separate task (the domain analogue of
+the enum/composite restart-durability gap noted in the original Deferred
+section above), not a follow-up to this one.

@@ -2763,6 +2763,20 @@ type Domain struct {
 	// this replaced the former single CheckExpr/CheckName/CheckInValues fields.
 	// DU-002 slice 385 (multi-CHECK; single-CHECK was slices 96/97).
 	Checks []DomainCheck
+	// Owner is the typowner role OID, settable via `ALTER DOMAIN ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (domain follow-up).
+	Owner uint32
+}
+
+// OwnerOrDefault returns d.Owner, falling back to the bootstrap superuser OID
+// (10) for domains that never had OWNER TO applied. Mirrors
+// EnumType.OwnerOrDefault / RangeType.OwnerOrDefault.
+func (d *Domain) OwnerOrDefault() uint32 {
+	if d.Owner == 0 {
+		return 10
+	}
+	return d.Owner
 }
 
 // DomainCheck is one CHECK constraint on a domain. Name is the resolved
@@ -18487,6 +18501,43 @@ func (c *InMemory) LookupDomainByArrayOID(oid uint32) (*Domain, bool) {
 		}
 	}
 	return nil, false
+}
+
+// RenameDomain renames a domain from oldName to newName, mirroring
+// RenameRangeType/RenameCompositeType/RenameEnum. M0122-0005 (domain
+// follow-up).
+func (c *InMemory) RenameDomain(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, found := c.domains[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.domains[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.domains, ok)
+	d.Name = nk
+	c.domains[nk] = d
+	return nil
+}
+
+// SetDomainOwner records the typowner role OID for an existing domain.
+// Returns false if no such domain is registered. Mirrors
+// SetRangeTypeOwner/SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (domain
+// follow-up).
+func (c *InMemory) SetDomainOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.domains[k]
+	if !ok {
+		return false
+	}
+	d.Owner = ownerOID
+	return true
 }
 
 // TablesWithColumnOfType returns all non-virtual tables that have at least one

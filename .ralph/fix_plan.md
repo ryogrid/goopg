@@ -347,6 +347,33 @@ materially larger, separate task). Next candidate: resume the M0110-0001
 multi-database isolation survey above, or survey the deferral ledger for a
 fresh open (`status = -`) row.
 
+**2026-07-06 (loop #48):** picked up the domain-typowner follow-up named
+above — `ALTER DOMAIN` was wholly unparsed (fell into the generic
+collation/domain/extension/... compat-stub loop, a silent no-op). Landed
+`ALTER DOMAIN name RENAME TO newname` / `ALTER DOMAIN name OWNER TO role`:
+new `parser.AlterDomainStmt` (mirrors `AlterSchemaStmt`) + a dedicated
+`parseAlter` branch carved out before the compat-stub loop;
+`catalog.Domain` gained `Owner uint32`/`OwnerOrDefault()` (mirrors
+`RangeType`'s) plus `RenameDomain`/`SetDomainOwner` catalog methods; new
+`execAlterDomain` wired into the DDL dispatch switch, `planner.go`'s DDL
+list, and `internal/server/dispatch.go`'s command-tag switch; the domain/
+domain-array `pg_type` rows now render the real owner via
+`d.OwnerOrDefault()`. Tests: `internal/executor/
+alter_domain_owner_rename_test.go`'s `TestAlterDomainOwnerTo`/
+`TestAlterDomainRenameTo`. See `docs/design/0122-0005-alter-type-owner-rename.md`'s
+new "Follow-up: `ALTER DOMAIN RENAME TO` / `OWNER TO`" section and the
+matching ledger row (which also flips the prior 2026-07-06 row to
+`resolved`). Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/planner/...
+./internal/server/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33). Every other `ALTER DOMAIN` sub-form (SET/DROP DEFAULT,
+SET/DROP NOT NULL, ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET SCHEMA)
+remains deferred, as does all domain restart persistence (`CREATE DOMAIN`
+itself has no WAL record yet — a separate, larger prerequisite). Next
+candidate: resume the M0110-0001 multi-database isolation survey above, pick
+up one of the ALTER DOMAIN sub-forms, or survey the deferral ledger for a
+fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

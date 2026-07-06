@@ -2655,6 +2655,24 @@ type AlterSchemaStmt struct {
 func (s *AlterSchemaStmt) Pos() int  { return s.pos }
 func (s *AlterSchemaStmt) stmtNode() {}
 
+// AlterDomainStmt — ALTER DOMAIN name RENAME TO newname / OWNER TO role. Real
+// PostgreSQL's AlterDomainStmt production covers more sub-forms (SET/DROP
+// DEFAULT, SET/DROP NOT NULL, ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET
+// SCHEMA) — only RENAME TO / OWNER TO are modelled so far (M0122-0005 domain
+// follow-up); everything else still parses as a no-op (see parseAlter's
+// "domain" branch).
+type AlterDomainStmt struct {
+	pos  int
+	Name string
+	// Action selects the form: "rename" | "owner".
+	Action   string
+	NewName  string // for Action == "rename"
+	NewOwner string // for Action == "owner"; "current_user" sentinel like ALTER SCHEMA
+}
+
+func (s *AlterDomainStmt) Pos() int  { return s.pos }
+func (s *AlterDomainStmt) stmtNode() {}
+
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
 	Schema string

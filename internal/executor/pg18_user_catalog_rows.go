@@ -1937,7 +1937,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(int64(d.OID)),                      // oid
 		NewStringDatum(d.Name),                         // typname (name type)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(d.OwnerOrDefault())),         // typowner
 		NewIntDatum(int64(attrs.TypLen)),               // typlen (inherit base)
 		NewBoolDatum(attrs.TypByVal),                   // typbyval (inherit base)
 		NewStringDatum("d"),                            // typtype = 'd' (domain)
@@ -1992,7 +1992,7 @@ func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
 		NewIntDatum(int64(d.ArrayOID)),                 // oid
 		NewStringDatum("_" + d.Name),                   // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(d.OwnerOrDefault())),         // typowner
 		NewIntDatum(-1),                                // typlen (varlena array)
 		NewBoolDatum(false),                            // typbyval
 		NewStringDatum("b"),                            // typtype = 'b' (base)

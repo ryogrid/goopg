@@ -191,6 +191,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateDomain(s)
 	case *parser.DropDomainStmt:
 		return nil, o.execDropDomain(s)
+	case *parser.AlterDomainStmt:
+		return nil, o.execAlterDomain(s)
 	case *parser.AlterTSConfigStmt:
 		return nil, o.execAlterTSConfig(s)
 	case *parser.AlterTSDictStmt:
@@ -18292,6 +18294,9 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// "Creator becomes owner" convention, mirroring execCreateType's range
+	// branch. M0122-0005 (domain follow-up).
+	d.Owner = o.currentDDLOwnerOID()
 	// Resolve a user-defined enum base type's dynamically-allocated OID and
 	// record it on the domain. TypeNameToOID falls back to text for enum names,
 	// so without this the pg_type row would carry typbasetype=text and pg_dump
@@ -18325,6 +18330,41 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
 	syncDomainTypeToCatalogHeap(o.ctx, d)
+	return nil
+}
+
+// execAlterDomain drives the two `ALTER DOMAIN` forms goopg models so far —
+// RENAME TO and OWNER TO — mirroring execAlterSchema's Action-switch shape.
+// Every other AlterDomainStmt sub-form (SET/DROP DEFAULT, SET/DROP NOT NULL,
+// ADD/DROP CONSTRAINT, RENAME CONSTRAINT, SET SCHEMA) is parsed as a no-op
+// (see parseAlter's "domain" branch) and never reaches here. M0122-0005
+// (domain follow-up, closing the ledger's "ALTER DOMAIN wholly unparsed" gap
+// for these two forms).
+func (o *ddlOp) execAlterDomain(s *parser.AlterDomainStmt) error {
+	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	switch s.Action {
+	case "rename":
+		if err := cat.RenameDomain(s.Name, s.NewName); err != nil {
+			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+		}
+		return nil
+	case "owner":
+		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterSchema/execAlterType's default
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			oid, found := cat.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		if !cat.SetDomainOwner(s.Name, ownerOID) {
+			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		return nil
+	}
 	return nil
 }
 

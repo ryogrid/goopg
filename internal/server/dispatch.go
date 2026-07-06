@@ -2461,6 +2461,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE DOMAIN"
 	case *parser.DropDomainStmt:
 		return "DROP DOMAIN"
+	case *parser.AlterDomainStmt:
+		return "ALTER DOMAIN"
 	case *parser.CreateExtensionStmt:
 		return "CREATE EXTENSION"
 	case *parser.CreateCollationStmt:
