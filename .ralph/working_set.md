@@ -1,107 +1,111 @@
 Task: M-NIGHTLY (AI-20260706-201855-001) — pgbench/nightly btree
-"item length mismatch keyLen=9 total=37" recurrence investigation
-(NOT resolved; investigation-only loop, no functional change landed;
-2nd consecutive investigation loop on this item).
+"item length mismatch keyLen=9 total=37" / "empty internal page"
+recurrence investigation (NOT resolved; 4th consecutive investigation
+loop on this item, investigation-only, no functional change landed).
 
-Files: none changed in the final commit besides `.ralph/fix_plan.md` and
-`.ralph/deferral_ledger.md` (bookkeeping). Temporarily edited and
-REVERTED via `git checkout --` (not committed): `internal/storage/
-bufpool.go` (unbounded debug trace ring buffer + tag-match panics at
-all successful-pin sites + trace calls in claimVictim/evictVictim/
-PinNew/pinLoad/tryPinSlot), `internal/storage/bufmap.go`
-(`debugCountLive` duplicate-entry checker), `internal/access/btree/
-btree.go` (trace calls bracketing insertIntoBlock/createNewRoot's
-populate step + descendToLeaf's failure branch), `internal/access/
-btree/multi_writer_stress_test.go` (un-skipped
-`TestMultiWriterStress_M0055_Phase_C`, enabled tracing, dump-on-error).
+Files: none changed in the final commit besides `.ralph/fix_plan.md`
+and `.ralph/deferral_ledger.md` (bookkeeping). Temporarily added and
+FULLY REVERTED this loop (new file deleted, symbol bodies restored via
+Serena `replace_symbol_body`, confirmed byte-identical via `git diff`):
+`internal/storage/debugtrace_temp.go` (new file, deleted) providing
+`DebugPinTrace`/`DebugPinTraceDump`/`DebugAllZero`, env-gated by
+`GOOPG_PINTRACE=1`; call sites added then removed in
+`internal/storage/bufpool.go`'s `Pin`/`pinSlow`/`pinLoad`/`tryPinSlot`/
+`PinNew` (one trace call at each of the 5 success-return points) and
+`internal/access/btree/btree.go`'s `pinR`/`descendToLeaf` (call/return/
+loop-top/failure-branch-dump); `multi_writer_stress_test.go`'s
+`TestMultiWriterStress_M0055_Phase_C` `t.Skip` removed then re-added.
 
-Key symbols: `internal/storage/bufpool.go` `Pool.Pin`/`pinSlow`/
-`pinLoad`/`tryPinSlot`/`claimVictim`/`evictVictim`/`PinNew` (all
-re-read fully this loop, exhaustively). `internal/access/btree/
-btree.go` `bt.pinR` (907, NOT YET instrumented — next step),
-`descendToLeaf` (1272), `insertIntoBlock` (1426, right-sibling
-creation via `pinNewOrRecycled`), `createNewRoot` (1822), `pinNewOrRecycled`
-(646). `internal/storage/bufmap.go` (`Insert`/`Delete`/`Lookup`,
-re-read fully, no bug found despite initial suspicion of Insert's
-early-stop-at-first-tombstone loop — see Hypothesis/Findings).
+Key symbols: `internal/access/btree/btree.go` `bt.pinR` (907),
+`descendToLeaf` (1271), `pinNewOrRecycled` (645, recycle-zero-fill
+lock-gap noted but NOT this bug's cause), `insertIntoBlock` (1422).
+`internal/storage/bufpool.go` `Pool.Pin` (1153, fast-path CAS),
+`pinSlow` (1194), `pinLoad` (1239, has TWO returns: early-tryPinSlot-
+hit and final post-ReadBlock — the 2nd was never traced before this
+loop), `tryPinSlot` (899), `PinNew` (1028, has 2 returns: collision-
+fallback and fresh-publish). `internal/storage/smgr.go` `relFile.
+extend` (720, confirmed properly `r.mu`-serialized, not the bug).
 
-Hypothesis/Findings: PREVIOUS loop's hypothesis ("PinNew publishes
-valid+dirty into bm BEFORE the caller populates real content, letting
-a concurrent reader reach a blank page") is REFUTED by direct dynamic
-evidence, not just static reasoning. Built and ran 3 rounds of
-instrumentation (all reverted before loop end):
-1. `bufmap.debugCountLive(tag)` after every successful `bm.Insert` in
-   PinNew+pinLoad, panic if count!=1 — NEVER fired across 2 repros.
-   Rules out "duplicate live bufmap entry for the same tag". Also
-   statically confirmed unreachable: `relFile.extend`/`Manager.relFile`
-   are fully mutex-serialized (r.mu / m.mu), so two concurrent PinNew
-   calls for the same rel CANNOT get the same block number — PinNew's
-   own "another goroutine published this block while we were in
-   Extend" fallback branch (bufpool.go ~1089) is dead code in practice.
-2. Tag-match assertion (`s.tag != tag → panic`) at Pin's fast-path CAS,
-   pinSlow's tryPinSlot call, AND inside tryPinSlot itself (covers
-   pinLoad's internal re-check branch too) — NEVER fired across
-   several 200-500-iteration repros (single-process AND 4-way
-   parallel). Rules out "reader resolves to the wrong physical slot
-   for its tag" (stale slotIdx/gen ABA via bufmap or claimVictim).
-3. Unbounded cross-layer trace (storage.DebugTraceEvent, callable from
-   btree.go too) capturing claimVictim/evictVictim/PinNew-publish/
-   pinLoad-publish/tryPinSlot-hit, PLUS btree.go-side markers bracketing
-   insertIntoBlock/createNewRoot's populate step and descendToLeaf's
-   failure branch (logs cur/meta.Root/op.Level/op.IsRoot/op.Next).
-   Got 3 CLEAN single-process reproductions (single-process only — a
-   4-way-parallel run mixed logs across OS processes and gave
-   misleading data on the first attempt, since dump-once fires
-   per-process; don't reuse the same /tmp path across parallel `go
-   test` processes). Full lifecycle every time: block created via
-   PinNew (traced), read successfully 50-200x via fast-path (tag
-   matched, content valid — traced), evicted DIRTY (flushed to disk),
-   reloaded into a new slot cleanly, evicted a SECOND time CLEAN
-   (dirty=false, no flush) — and after that second eviction, NO
-   further PinNew/pinLoad/tryPinSlot/Pin-fast-path trace event for
-   that tag EVER appears (checked against the full remaining trace,
-   not just a truncated window), yet descendToLeaf's OWN failure-branch
-   trace (fired from inside the SAME failing call, using the SAME
-   `op`/`slot` that `bt.pinR(cur)` returned moments earlier) proves
-   `bt.pinR()` on that exact block DID return successfully with ZERO
-   content. This means the corrupted read evades all 4 instrumented
-   "successful pin" return points in Pin/pinSlow/pinLoad/tryPinSlot —
-   either there's a 5th un-instrumented return path (searched
-   exhaustively, believed complete), or — the new leading hypothesis —
-   btree.go itself reuses a STALE `*storage.Slot`/`.Page()` byte-slice
-   handle from an earlier, legitimately-successful pin, without a
-   fresh `Pin()` round-trip, when it reaches the failing block again.
-   This REDIRECTS focus from "buffer-pool bufmap/eviction protocol"
-   (M0118-0130 blocker (4)) toward "btree.go caller-side stale-handle
-   reuse", a smaller/more-tractable subsystem.
+Hypothesis/Findings: PREVIOUS loop's hypothesis ("btree.go reuses a
+stale *storage.Slot/.Page() handle from an earlier pin without a fresh
+Pin() round-trip") is now MOOT/REDIRECTED by this loop's direct
+dynamic evidence — the bug is NOT a stale reference to old content,
+it's the SAME live, currently-RLock'd slot's content changing in
+place. Built temporary instrumentation (GOOPG_PINTRACE=1-gated, fully
+reverted after) covering ALL 5 success-return paths in Pin/pinSlow/
+pinLoad/tryPinSlot/PinNew (previous loops only covered 4; pinLoad's
+final post-ReadBlock return was never distinctly traced before) plus
+pinR call/return and descendToLeaf loop-top. Ran
+`GOOPG_PINTRACE=1 go test -run TestMultiWriterStress_M0055_Phase_C
+-count=200 ./internal/access/btree/...` (repro rate jumped to ~100%
+under tracing, vs. untraced ~1/150-500 — tracing itself perturbs
+timing, a Heisenbug; budget -count=50 next time, not 200). Captured
+one clean single-process failure (block 83, /tmp/pintrace-<pid>.log,
+NOT preserved — re-capture needed):
+  BTREE-PINR-RETURN blk=83 allzero=false   [seq 75631224]
+  ... (descendToLeaf's very next line, `op := readOpaque(slot.Page())`,
+      executes here, SAME goroutine, SAME still-held contentMu.RLock()
+      from pinR — no unpinR call in between) ...
+  BTREE-DESCEND-FAIL blk=83 err="btree: empty internal page"
+      op={Prev:0 Next:0 Level:0 Flags:0 HighKey:[]}   [seq 75631247]
+Only 23 trace-sequence-numbers apart, same goroutine, same call, same
+continuously-held RLock. A sync.RWMutex cannot let a Lock()-holding
+writer run concurrently with an active RLock() holder — so this PROVES
+some code path mutates a pinned, RLock'd slot's `.page` byte array
+WITHOUT ever acquiring `contentMu`. Audited every known locked-mutation
+path this loop and found none that bypasses the lock:
+`pinNewOrRecycled`'s zero-fill (confirmed NOT exercised at all by this
+test — it's insert-only, no deletes/vacuum ever populate `bt.freeList`,
+so `popRecycledBlock` always returns false and `pinNewOrRecycled`
+always falls through to fresh `PinNew`), `PinNew`'s InitPage/Extend/
+publish sequence, `relFile.extend`'s `r.mu`-serialized block-number
+assignment (rules out duplicate block numbers), `claimVictim`/
+`evictVictim`'s `statePin(old) != 0` pinned-slot exclusion (a pinned
+slot can never be claimed as a victim), `InvalidateBlock`/
+`InvalidateRel`'s same pinned-slot check, `bufmap.Delete`/`Lookup`'s
+seqlock-style bucket protocol (looks correct). The actual unlocked-
+write call site is still unidentified — this loop's contribution is
+proving WHAT class of bug it is (unlocked write to a live pinned
+slot), ruling out the prior loop's "stale handle" theory, not WHERE.
+Separately noted (NOT this bug, latent/lower-priority): (a)
+`pinNewOrRecycled` releases `slot.Lock()` after its zero-fill and the
+caller (`insertIntoBlock`) only re-`Lock()`s several lines later before
+`initPage` — a real gap once a VACUUM-concurrent-with-insert repro
+exists; (b) `recycleBlock` has no PG-style safe-recycle deferral
+(compare `_bt_pendingfsm_add`/`_bt_pendingfsm_finalize` in
+postgres/src/backend/access/nbtree/nbtpage.c) before a page-deleted
+block re-enters `bt.freeList`.
 
-Next step: instrument `bt.pinR` (btree.go:907) itself — log every
-call with its `blk` argument — cross-referenced against a trace at
-the TOP of `descendToLeaf`'s loop body (before `bt.pinR(cur)` is
-called), using the SAME repro (`TestMultiWriterStress_M0055_Phase_C`,
-un-skip `t.Skip`, `go test -run ... -count=400..500` SINGLE PROCESS,
-~200-270s per run, ~1/150-500 failure rate, HIGHLY variable — some
-400-iteration runs show zero failures, budget for several reruns).
-This will show definitively whether `Pin()` is even being re-invoked
-for the failing block's last access, or whether it's reusing an old
-handle. If stale-handle reuse is confirmed, audit `finishSplit`/
-`CompleteDeferredSplits` next (NOT reviewed this loop, time-boxed out
-— more complex multi-pin choreography than insertIntoBlock/
-descendToLeaf, a more probable location for such a bug). Do NOT
-attempt a fix without this next instrumentation pass — still
-investigation-only per the hard-won rule (a rushed buffer-pool/
-btree-concurrency fix already caused a new panic class once, see
-btree.go:601-613).
+Next step: re-apply the SAME env-gated (`GOOPG_PINTRACE=1`)
+instrumentation (recipe: this file's "Files:" section above + the 2nd
+2026-07-07 deferral ledger row has the exact diff shape) to
+`internal/storage/bufpool.go`'s 5 success-return points +
+`internal/access/btree/btree.go`'s pinR/descendToLeaf, but ALSO add
+trace calls to every WRITE-side page mutator: `insertItemSorted`,
+`resetPageItems`, `writeOpaque`, `initPage` (btree.go), `InitPage`
+(storage/page.go), and the `pinNewOrRecycled` zero-fill loop — each
+logging slotIdx + calling-goroutine identity (use a per-goroutine
+counter/tag if `runtime.Goexit`-style IDs aren't available; a simple
+approach: pass a unique per-writer-goroutine int down through the
+stress test's `wid` isn't visible from btree.go, so tag by a
+monotonically increasing call-sequence number and correlate by
+timing/slotIdx instead). Cross-reference against the confirmed zeroing
+window on block 83 (this loop's session only — the /tmp/pintrace log
+was deleted, not committed; re-capture is required, it reproduces
+easily). Budget `-count=50`, not 200-500, since tracing inflates the
+failure rate. If a specific unlocked writer is found, THEN it's safe to
+attempt a fix (lock it properly) — do not fix blind.
 
-Gates run this loop: go build ./... clean (before AND after revert);
-go test -count=1 ./internal/storage/... ./internal/access/btree/...
-PASS (baseline, after full revert); make ralph-state-guard OK. No
-executor/planner/codec changes this loop, so no TPC-H spotcheck
-required (investigation + docs only).
+Gates run this loop: go build ./... clean (before AND after full
+revert); go test -count=1 ./internal/storage/... ./internal/access/
+btree/... PASS (baseline, after revert); make ralph-state-guard OK. No
+executor/planner/codec changes, so no TPC-H spotcheck required
+(investigation + docs only).
 
-In-flight: none — all temporary instrumentation to
-internal/storage/{bufpool.go,bufmap.go} and internal/access/btree/
-{btree.go,multi_writer_stress_test.go} was reverted via `git checkout
---` before this loop ended; only `.ralph/fix_plan.md` and
+In-flight: none — all temporary instrumentation was fully reverted
+(new file deleted; 7 symbol bodies restored to their pre-loop content
+in internal/storage/bufpool.go and internal/access/btree/btree.go,
+confirmed via `git diff` showing zero changes to either file; test
+skip re-added) before this loop ended. Only `.ralph/fix_plan.md` and
 `.ralph/deferral_ledger.md` carry real changes this loop, both to be
 committed.

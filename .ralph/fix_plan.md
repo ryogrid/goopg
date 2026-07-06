@@ -135,6 +135,44 @@ every clean, green (build + pre-commit) checkpoint.
       Full instrumentation recipe + exact resume steps in the deferral
       ledger's 2026-07-07 row. Still investigation-only — do not attempt
       a fix without re-deriving this evidence first.
+      2026-07-07 update #2 (see the second 2026-07-07 deferral ledger
+      row): executed the above next step. Instrumented `bt.pinR` +
+      `descendToLeaf`'s loop top plus ALL FIVE `Pool.Pin`/`pinSlow`/
+      `pinLoad`/`tryPinSlot`/`PinNew` success-return paths (the 5th,
+      `pinLoad`'s final post-`ReadBlock` return, was never traced
+      before). Captured a clean single-process failure: `bt.pinR(83)`
+      returned successfully with valid, non-zero content while holding
+      `contentMu.RLock()` — then, in the SAME goroutine, under the SAME
+      still-held RLock (no intervening `unpinR`), `descendToLeaf`'s very
+      next statement read that same page as fully zeroed. A `sync.
+      RWMutex` cannot let a `Lock()`-holding writer run concurrently with
+      an active `RLock()` holder, so this PROVES an unlocked writer
+      mutated the slot's `.page` bytes outside `contentMu` entirely —
+      REDIRECTING away from last loop's "stale slot/handle reuse"
+      hypothesis (the SAME live slot's content changed, not a stale
+      reference) toward "an unlocked write path exists somewhere in the
+      buffer pool or btree layer". Audited every already-known locked-
+      mutation path this loop (`pinNewOrRecycled`'s recycle zero-fill —
+      confirmed NOT exercised by this insert-only test, `freeList` never
+      populated; `PinNew`'s Init/Extend/publish; `relFile.extend`'s
+      block-number assignment; `claimVictim`/`evictVictim`'s pinned-slot
+      exclusion; `InvalidateBlock`/`InvalidateRel`; `bufmap.Delete`/
+      `Lookup`) — none show a bypass; the actual unlocked-write call site
+      is still unidentified. Also flagged (separate, NOT this bug's
+      cause): `pinNewOrRecycled` releases its content lock before the
+      caller re-locks to populate real content — a real gap once VACUUM-
+      concurrent-with-insert repros exist — and `recycleBlock` has no
+      PG-style safe-recycle deferral (real `_bt_pendingfsm_add`/
+      `_bt_pendingfsm_finalize` semantics). All instrumentation reverted
+      (temp file deleted, symbol bodies restored, confirmed byte-
+      identical via `git diff`); test re-skipped. Next step: re-apply
+      the same `GOOPG_PINTRACE=1`-gated instrumentation (recipe in the
+      2nd 2026-07-07 ledger row) PLUS trace every WRITE path
+      (`insertItemSorted`/`resetPageItems`/`writeOpaque`/`initPage`/
+      `InitPage`/the recycle zero-fill loop) with slotIdx+goroutine, to
+      catch the exact unlocked mutation against block 83's slot. Note:
+      repro rate is ~100% at `-count=200` WITH tracing (vs. ~1/150-500
+      without) — budget only `-count=50` or so per attempt.
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
