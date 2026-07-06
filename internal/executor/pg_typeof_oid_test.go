@@ -59,7 +59,7 @@ func TestPgTypeofPlainDisplayUnaffected(t *testing.T) {
 		if len(rows) != 1 || rows[0][0].Kind != KindInt {
 			t.Fatalf("%s = %v, want a single KindInt (OID-backed regtype) row", c.query, rows)
 		}
-		got := RegtypeName(nil, uint32(rows[0][0].Int))
+		got := RegtypeName(nil, uint32(rows[0][0].Int), true)
 		if got != c.want {
 			t.Errorf("%s render = %q, want %q", c.query, got, c.want)
 		}

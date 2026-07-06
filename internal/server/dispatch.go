@@ -1348,6 +1348,32 @@ func searchPathSchemas(sess *config.SessionRegistry) []string {
 	return parseSearchPathSchemas(eff)
 }
 
+// publicSchemaVisible reports whether "public" is visible on the effective
+// search_path, mirroring internal/executor/expr.go's regObjectSchemaVisible
+// (used there to decide regproc/regoperator/regtype schema-qualification).
+// Unlike searchPathSchemas above, an explicitly empty search_path (pg_dump's
+// search_path='', ALWAYS_SECURE_SEARCH_PATH_SQL) is NOT defaulted back to
+// public here — it correctly yields no visible schemas, forcing
+// RegtypeName's caller to schema-qualify a user-defined type name.
+// getSetting is nil-safe (a nil executor.Context.GetSetting, or no session
+// at all) and falls back to the same default search_path executor/expr.go's
+// searchPathSchemas uses. M0122-0005 pg_typeof()::oid follow-up.
+func publicSchemaVisible(getSetting func(name string) (string, bool)) bool {
+	sp := `"$user", public`
+	if getSetting != nil {
+		if eff, ok := getSetting("search_path"); ok {
+			sp = eff
+		}
+	}
+	for _, raw := range strings.Split(sp, ",") {
+		s := strings.TrimSpace(strings.Trim(strings.TrimSpace(raw), `"'`))
+		if strings.EqualFold(s, "public") {
+			return true
+		}
+	}
+	return false
+}
+
 func compatNoopCommandTag(sql string) (string, bool) {
 	norm := normalizeCompatSQL(sql)
 	switch {
@@ -2312,7 +2338,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				}
 				start := len(valueBuf)
 				if i < len(schema) {
-					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type)
+					valueBuf = s.appendTypedCellText(valueBuf, d, schema[i].Type, ctx.GetSetting)
 				} else {
 					valueBuf = d.AppendValueText(valueBuf)
 				}
@@ -2581,7 +2607,7 @@ func rowsAffected(op executor.Operator) int64 {
 // type identically — the extended path previously only special-cased
 // float4/float8 and fell back to AppendValueText for everything else,
 // diverging from simple-query on date/time/timetz/bytea/regclass columns.
-func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type) []byte {
+func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.Type, getSetting func(name string) (string, bool)) []byte {
 	switch strings.ToLower(typ.Name) {
 	case "float4", "real":
 		// float4/real uses float32 precision (~7 significant digits).
@@ -2685,10 +2711,14 @@ func (s *Server) appendTypedCellText(dst []byte, d executor.Datum, typ catalog.T
 	case "regtype":
 		// OID values with type regtype display as type names (regtypeout),
 		// matching a direct SELECT of pg_typeof(...) or an <oid>::regtype
-		// cast. Mirrors the regclass/regproc cases above. M0122-0005
-		// pg_typeof()::oid follow-up.
+		// cast. Mirrors the regclass/regproc cases above. A resolved
+		// user-defined type name is only schema-qualified when "public" is
+		// not visible on the session's effective search_path (e.g. pg_dump's
+		// search_path=''), matching real PostgreSQL's regtypeout instead of
+		// unconditionally prefixing "public.". M0122-0005 pg_typeof()::oid
+		// follow-up.
 		if d.Kind == executor.KindInt {
-			return append(dst, executor.RegtypeName(s.cfg.Catalog, uint32(d.Int))...)
+			return append(dst, executor.RegtypeName(s.cfg.Catalog, uint32(d.Int), !publicSchemaVisible(getSetting))...)
 		}
 		return d.AppendValueText(dst)
 	default:

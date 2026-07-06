@@ -49,7 +49,7 @@ func TestAppendTypedCellTextRegprocRendersName(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(tt.oid), regType))
+			got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(tt.oid), regType, nil))
 			if got != tt.want {
 				t.Errorf("appendTypedCellText(oid=%d, regproc) = %q, want %q", tt.oid, got, tt.want)
 			}
@@ -59,14 +59,14 @@ func TestAppendTypedCellTextRegprocRendersName(t *testing.T) {
 	// regprocedure additionally renders the INPUT argument-type list
 	// (format_procedure/regprocedureout): int4out(int4) -> "int4out(integer)".
 	regProcedureType := catalog.Type{Name: "regprocedure"}
-	if got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(43), regProcedureType)); got != "int4out(integer)" {
+	if got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(43), regProcedureType, nil)); got != "int4out(integer)" {
 		t.Errorf("appendTypedCellText(oid=43, regprocedure) = %q, want %q", got, "int4out(integer)")
 	}
 
 	// An OID unresolvable by either source falls back to the raw numeric
 	// text (defensive; every OID a real BKI column references is present
 	// in the generated index, mirroring aggBuiltinFuncName's fallback).
-	if got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(999999999), regType)); got != "999999999" {
+	if got := string(srv.appendTypedCellText(nil, executor.NewIntDatum(999999999), regType, nil)); got != "999999999" {
 		t.Errorf("appendTypedCellText(unresolvable oid) = %q, want %q", got, "999999999")
 	}
 }

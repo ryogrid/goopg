@@ -308,3 +308,63 @@ Gates: `go build ./...` clean; `go test ./internal/executor/...
 ./internal/parser/...` all PASS (no regressions); `scripts/tpch-spotcheck.sh`
 PASS (Q12=2, Q13=33); live side-by-side verification against real PostgreSQL
 18.3 (see above).
+
+## Follow-up: `userTypeNameForOID` schema-visibility (2026-07-06, loop #17)
+
+Closes the "newly observed, pre-existing, out of scope" gap recorded in the
+`pg_typeof(...)::oid` follow-up above: `userTypeNameForOID`
+(`internal/executor/expr.go`) unconditionally prefixed every user-defined
+type name with `"public."`, regardless of whether `"public"` was actually
+visible on the effective `search_path` — diverging from real PostgreSQL's
+`regtypeout`/`format_type`, which only schema-qualifies when the type isn't
+visible unqualified (mirroring `regproc`/`regoperator`'s existing
+`regObjectSchemaVisible` check).
+
+**Fix:** `userTypeNameForOID(cat, oid, qualify bool)` gained a `qualify`
+parameter — the `"public."` prefix is added only when the caller determines
+`"public"` is not visible. All three executor-package callers now pass
+`!regObjectSchemaVisible(ctx, "public")`:
+
+- the `::regtype` cast's OID→name direction (`CastExpr`'s `KindString` and
+  `KindInt` cases, `internal/executor/expr.go`)
+- `format_type`'s built-in-fallback path
+- `RegtypeName(cat, oid, qualify bool)` (also gained the parameter) — used by
+  the wire-output layer for a plain `SELECT pg_typeof(...)`/regtype-typed
+  column
+
+Since `internal/server/dispatch.go`'s `appendTypedCellText` has no
+`executor.Context` (only a `getSetting func(name string) (string, bool)`
+threaded in from the caller's session — `ctx.GetSetting` in the simple-query
+path, `ectx.GetSetting` in the extended-query path), it gained a new
+`publicSchemaVisible(getSetting)` helper mirroring
+`regObjectSchemaVisible`'s search_path-parsing logic (an explicitly empty
+search_path, as pg_dump always uses, correctly yields "not visible" rather
+than defaulting back to `public`, unlike the pre-existing
+`searchPathSchemas(sess)` used for table-name resolution).
+
+Verified live against a real running PostgreSQL 18.3 instance side-by-side
+(real PG on a throwaway `initdb`, goopg on a throwaway data dir, both torn
+down after the session): for a public-schema `CREATE TYPE mood AS ENUM (...)`,
+both `'mood'::regtype` and `format_type(<oid>, -1)` render bare `mood` under
+the default search_path, `public.mood` under `search_path=''`, and
+`public.mood` under `search_path=other_schema` (public not on the path) —
+byte-identical between goopg and real PG in all three cases; `pg_typeof(...)`
+plain display and `SET`/`RESET search_path` round-tripping unaffected.
+
+Tests: `internal/executor/user_type_oid_name_test.go`'s
+`TestUserTypeNameForOIDAllKinds` extended to cover both `qualify=true` and
+`qualify=false` across all ten OID forms; new
+`internal/executor/regtype_format_type_schema_visibility_test.go`'s
+`TestRegtypeFormatTypeSchemaVisibility` (live `::regtype`/`format_type` query
+execution across three search_path scenarios); new
+`internal/server/regtype_output_test.go`'s
+`TestAppendTypedCellTextRegtypeSchemaQualification` (wire-output layer, same
+three scenarios); `TestAppendTypedCellTextRegtypeRendersName`'s existing
+user-enum case updated from `"public.mood"` to `"mood"` (nil `getSetting`
+now correctly means "default search_path", not "always qualify").
+
+Gates: `go build ./...` clean; `go vet ./...` clean on touched packages;
+`go test ./internal/executor/... ./internal/server/... ./internal/catalog/...
+./internal/planner/... ./internal/parser/...` all PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33); live side-by-side
+verification against real PostgreSQL 18.3 (see above).

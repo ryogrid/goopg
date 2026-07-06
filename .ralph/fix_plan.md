@@ -708,6 +708,42 @@ gap from M0122-0008, the `userTypeNameForOID` schema-visibility gap just
 recorded, resume the M0110-0001 multi-database isolation survey above, or
 survey the deferral ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #17):** closed the `userTypeNameForOID` schema-visibility
+gap recorded just above. `userTypeNameForOID(cat, oid, qualify bool)` and
+`RegtypeName(cat, oid, qualify bool)` (`internal/executor/expr.go`) gained a
+`qualify` parameter; all three executor-package callers (`::regtype` cast's
+`KindString`/`KindInt` branches, `format_type`'s built-in-fallback path) now
+pass `!regObjectSchemaVisible(ctx, "public")` instead of unconditionally
+qualifying. `internal/server/dispatch.go`'s `appendTypedCellText` (no
+`executor.Context` available there) gained a new
+`publicSchemaVisible(getSetting func(name string) (string, bool)) bool`
+helper and a new `getSetting` parameter (threaded from `ctx.GetSetting` /
+`ectx.GetSetting` at its two real call sites). Verified live against a real
+running PostgreSQL 18.3 instance side-by-side (both on throwaway data dirs,
+torn down after the session): `'mood'::regtype`/`format_type(<oid>, -1)` for
+a public-schema enum now render bare `mood` under the default search_path
+and `public.mood` under `search_path=''`/a search_path without `public` —
+byte-identical to real PG in all three scenarios (previously always
+`public.mood`). Tests: `TestUserTypeNameForOIDAllKinds` extended to both
+qualify states; new `TestRegtypeFormatTypeSchemaVisibility`
+(`internal/executor/regtype_format_type_schema_visibility_test.go`, live
+query execution); new `TestAppendTypedCellTextRegtypeSchemaQualification`
+(`internal/server/regtype_output_test.go`); the pre-existing
+`TestAppendTypedCellTextRegtypeRendersName` user-enum case updated from
+`"public.mood"` to `"mood"`. Design:
+`docs/design/0122-0005-char-oid18-disambiguation.md`'s new "Follow-up:
+`userTypeNameForOID` schema-visibility" section; `docs/design/README.md` row
+extended; ledger row appended (status `resolved`). Gates: `go build ./...`
+clean; `go vet ./...` clean on touched packages; `go test
+./internal/executor/... ./internal/server/... ./internal/catalog/...
+./internal/planner/... ./internal/parser/...` all PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); live side-by-side
+verification against real PostgreSQL 18.3. Next candidate: the view's-own-ACL
+gap from M0122-0008 (materially larger — needs a preliminary per-statement
+RTE-style permission pass, planning currently has no session-role
+visibility), resume the M0110-0001 multi-database isolation survey above, or
+survey the deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
