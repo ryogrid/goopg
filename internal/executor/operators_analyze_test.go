@@ -233,3 +233,111 @@ func TestAnalyzeRespectsStatsTarget(t *testing.T) {
 		t.Errorf("with default statsTarget, NDistinct(id)=%d want 400", fullStats.Columns[0].NDistinct)
 	}
 }
+
+// TestAnalyzeRespectsPerColumnStatTarget pins that
+// `ALTER TABLE ... ALTER COLUMN ... SET STATISTICS n`
+// (catalog.Column.StatTarget) overrides the table-wide target for that one
+// column, mirroring upstream's examine_attribute/do_analyze_rel
+// (postgres/src/backend/commands/analyze.c): the histogram bucket count for
+// the overridden column tracks the override, not the ambient table-wide
+// target, and a sibling column with no override still uses the table-wide
+// target.
+func TestAnalyzeRespectsPerColumnStatTarget(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	// SET STATISTICS 5 on column 0 ("id"); column 1 ("label") keeps the
+	// table-wide target of 100.
+	override := 5
+	tbl.Columns[0].StatTarget = &override
+
+	rows := make([][]planner.Expr, 1000)
+	for i := 0; i < 1000; i++ {
+		rows[i] = []planner.Expr{
+			&planner.IntegerConst{Value: int64(i + 1)}, // 1..1000, unique
+			&planner.StringConst{Value: "x"},
+		}
+	}
+	insertPlan := &planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	if err != nil {
+		t.Fatalf("analyzeRelationWith: %v", err)
+	}
+
+	// Column 0's histogram is capped by the override (5 buckets ⇒ at most
+	// 6 boundaries), not the table-wide target of 100.
+	if hist := stats.Columns[0].Histogram; len(hist) > 6 {
+		t.Errorf("id histogram len=%d want <=6 (SET STATISTICS 5 override)", len(hist))
+	}
+
+	// Column 1 (uniform single value "x", no override) is unaffected by
+	// the override on column 0; NDistinct must still reflect the sample.
+	if got := stats.Columns[1].NDistinct; got != 1 {
+		t.Errorf("label NDistinct=%d want 1", got)
+	}
+}
+
+// TestAnalyzeSetStatisticsZeroDisablesColumn pins that
+// `SET STATISTICS 0` (catalog.Column.StatTarget == 0) excludes the column
+// from ANALYZE entirely, mirroring upstream's examine_attribute returning
+// NULL for attstattarget == 0: the column's ColumnStats stays the zero
+// value.
+func TestAnalyzeSetStatisticsZeroDisablesColumn(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+
+	zero := 0
+	tbl.Columns[1].StatTarget = &zero // disable stats on "label"
+
+	rows := make([][]planner.Expr, 10)
+	for i := 0; i < 10; i++ {
+		rows[i] = []planner.Expr{
+			&planner.IntegerConst{Value: int64(i + 1)},
+			&planner.StringConst{Value: "a"},
+		}
+	}
+	insertPlan := &planner.Insert{Table: tbl, Source: &planner.Values{Rows: rows}, ColumnIndex: []int{0, 1}}
+	op, err := Build(insertPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := op.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.Next(); err != EOF {
+		t.Fatalf("Insert.Next: %v", err)
+	}
+	_ = op.Close()
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	stats, err := analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(42)), ctx.MultiXact)
+	if err != nil {
+		t.Fatalf("analyzeRelationWith: %v", err)
+	}
+	if got := stats.Columns[1]; got.NDistinct != 0 || got.NullFrac != 0 || len(got.MCV) != 0 || len(got.Histogram) != 0 {
+		t.Errorf("label ColumnStats=%+v want zero value (SET STATISTICS 0)", got)
+	}
+	// Column 0 (no override) still gets real stats.
+	if got := stats.Columns[0].NDistinct; got != 10 {
+		t.Errorf("id NDistinct=%d want 10", got)
+	}
+}
