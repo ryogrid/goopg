@@ -155,7 +155,8 @@ real PostgreSQL 18.3.
 ## Deferred (ledger row appended)
 
 - Column-level ACL (`pg_attribute.attacl`) grantor tracking — the `attrACLs`
-  store still hardcodes the owner, unchanged by this fix.
+  store still hardcodes the owner, unchanged by this fix. **Landed as a
+  follow-up, see below.**
 - `TYPE`/`DOMAIN`/`DATABASE`/`PARAMETER` ACL grants, which route through the
   executor (`execTypeACLChange`/`execDatabaseACLChange`/
   `execParameterACLChange`) rather than `grant_ddl.go`'s string-level recorder,
@@ -167,3 +168,59 @@ real PostgreSQL 18.3.
   not necessarily the specific upstream role whose grant option was actually
   exercised in a multi-hop chain. Sufficient for the common single-hop
   delegation case this fix targets.
+
+## Follow-up: column-level (`pg_attribute.attacl`) grantor tracking (2026-07-06)
+
+The first deferred item above is now closed. `attacl` lives in a structurally
+separate store from `tableACLs` (`attrACLs map[attrACLKey]map[string]
+map[string]bool`, keyed by `(relOID, attnum)` — a column has no owner/PUBLIC
+default entry, unlike every object kind `relaclTextLockedFor` covers), so it
+needed its own mirrored mechanism rather than a change to the shared renderer:
+
+- New `catalog.InMemory.attrACLGrantor map[attrACLKey]map[string]string`,
+  keyed identically to `attrACLs`.
+- New `GrantColumnPrivilegeAs(relOID uint32, attNum int16, role, priv string,
+  withGrantOption bool, grantor string)` — the column analogue of
+  `GrantTablePrivilegeAs`; `GrantColumnPrivilegeWithGrantOption` becomes a thin
+  wrapper (`GrantColumnPrivilegeAs(..., aclOwnerRole)`), so every pre-existing
+  caller is unaffected. `RevokeColumnPrivilege` cleans up the grantor entry
+  alongside the privilege entry, identically to `RevokeTablePrivilege`.
+- `AttrACLText` now looks up the real grantor per grantee (falling back to the
+  owner when absent) instead of hardcoding `"/postgres"`, following the exact
+  pattern `relaclTextLockedFor` already uses.
+- `internal/executor/operators_ddl.go`'s `execAttrACLChange` — the column
+  GRANT/REVOKE applier reached via `execCompatNoop` — now calls
+  `GrantColumnPrivilegeAs(tbl.OID, attNum, role, priv, ac.WithGrantOption,
+  o.ctx.NonSuperuserRole)` instead of `GrantColumnPrivilegeWithGrantOption`,
+  stamping the session's current effective role as grantor exactly as
+  `tryRecordTableGrant` does for `relacl`/siblings. Column grants take a
+  different code path than table grants: `internal/server/grant_ddl.go`'s
+  `tryRecordTableGrant` explicitly bails out on any column-level grant
+  (`strings.ContainsRune(privPart, '(')`) and defers entirely to the
+  parser/executor route (`parser.AttrACLChange` → `execAttrACLChange`), so this
+  fix's call site is in the executor, not the string-level recorder.
+
+Note: unlike the object-privilege `GRANTED BY` clause (validated via
+`errGrantorMustBeCurrentUser` in `grant_ddl.go`), a column-level GRANT's
+`GRANTED BY` clause is parsed only far enough to find the end of the role
+list (`buildAttrACLChange` in `internal/parser/parser.go`) and the named role
+itself is discarded, unvalidated — this was already true before this fix and
+is out of scope for the grantor-attribution slice; recorded as a further
+deferred item below rather than silently left unmentioned.
+
+Tests: `internal/catalog/relacl_test.go`'s `TestAttrACLTextGrantor` (storage +
+rendering + revoke cleanup + mixed-case grantor, mirroring
+`TestRelaclTextGrantor` exactly).
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS.
+
+### Newly deferred
+
+- Column-level `GRANT ... GRANTED BY <role>` is parsed-and-discarded, not
+  validated against the acting role (no `errGrantorMustBeCurrentUser`
+  equivalent for `AttrACLChange`) — a narrower gap than the object-privilege
+  path, which does validate it.
+- `TYPE`/`DOMAIN`/`DATABASE`/`PARAMETER` ACL grantor wiring (the second
+  original deferred item above) remains open.

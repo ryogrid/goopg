@@ -16311,7 +16311,11 @@ func columnAttNum(tbl *catalog.Table, colName string) int16 {
 // execTypeACLChange — there is no implicit owner/PUBLIC seeding: a plain GRANT
 // adds exactly the granted grantee→priv entries and a REVOKE removes exactly
 // them, with attacl returning to NULL once the last column privilege is revoked.
-// Unknown table/column names are a successful no-op. M0119-0004-ACLHEAP.
+// Unknown table/column names are a successful no-op. The grantor stamped on
+// each grant is the session's current effective role (o.ctx.NonSuperuserRole,
+// empty meaning the bootstrap superuser), mirroring tryRecordTableGrant's
+// grantor attribution for relacl/nspacl/proacl/typacl/datacl.
+// M0119-0004-ACLHEAP (attacl grantor half).
 func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -16339,7 +16343,7 @@ func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
 						if ac.Revoke {
 							im.RevokeColumnPrivilege(tbl.OID, attNum, role, priv)
 						} else {
-							im.GrantColumnPrivilegeWithGrantOption(tbl.OID, attNum, role, priv, ac.WithGrantOption)
+							im.GrantColumnPrivilegeAs(tbl.OID, attNum, role, priv, ac.WithGrantOption, o.ctx.NonSuperuserRole)
 						}
 					}
 				}

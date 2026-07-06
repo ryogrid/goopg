@@ -217,6 +217,36 @@ one of those two small mechanical follow-ups (attacl or TYPE/DATABASE/
 PARAMETER grantor wiring — same shape as this loop's fix), or resume the
 M0110-0001 multi-database isolation survey above.
 
+**2026-07-06 (yet another later loop):** picked up the "attacl" half of the
+two remaining mechanical follow-ups named above. Column-level
+`pg_attribute.attacl` now carries the true grantor too, mirroring the
+table-level fix onto the structurally separate `attrACLs` store (a column has
+no owner/PUBLIC acldefault, so it never shared `tableACLs`/
+`relaclTextLockedFor` to begin with). New `catalog.attrACLGrantor`/
+`GrantColumnPrivilegeAs` (column analogue of `tableACLGrantor`/
+`GrantTablePrivilegeAs`); `GrantColumnPrivilegeWithGrantOption` becomes a thin
+owner-defaulting wrapper so every existing caller is unaffected;
+`RevokeColumnPrivilege` cleans up the grantor entry alongside the privilege
+one. `internal/executor/operators_ddl.go`'s `execAttrACLChange` (the column
+GRANT/REVOKE applier — column grants route through the parser/executor, not
+`grant_ddl.go`'s string recorder, which explicitly bails on any column-level
+grant) now stamps `o.ctx.NonSuperuserRole` as grantor. Test:
+`internal/catalog/relacl_test.go`'s `TestAttrACLTextGrantor`, mirroring
+`TestRelaclTextGrantor`. Gates: `go build ./...` clean, `go test
+./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/server/...` PASS, `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+See `docs/design/0119-0004-table-acl-grantor-tracking.md`'s new "Follow-up:
+column-level (`pg_attribute.attacl`) grantor tracking" section and the
+matching 2026-07-06 ledger row. **Newly deferred (ledger row):** column-level
+`GRANT ... GRANTED BY <role>` is parsed-and-discarded, not validated against
+the acting role (unlike the object-privilege path's
+`errGrantorMustBeCurrentUser` check) — a narrower gap than before. Next
+candidate: the one remaining mechanical follow-up from the 2026-07-06
+grantor-tracking row — `TYPE`/`DOMAIN`/`DATABASE`/`PARAMETER` ACL grantor
+wiring (thread `ectx.NonSuperuserRole` into `execTypeACLChange`/
+`execDatabaseACLChange`/`execParameterACLChange`, same shape as both grantor
+fixes) — or resume the M0110-0001 multi-database isolation survey above.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

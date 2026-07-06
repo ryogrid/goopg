@@ -1279,6 +1279,57 @@ func TestAttrACLGranteeNameRendering(t *testing.T) {
 	})
 }
 
+// TestAttrACLTextGrantor is the column analogue of TestRelaclTextGrantor: it
+// pins that a column-level GRANT's aclitem carries the acting grantor, not a
+// hardcoded owner, mirroring GrantTablePrivilegeAs/tableACLGrantor's
+// relaclTextLockedFor fix onto the separate attrACLs store.
+// M0119-0004-ACLHEAP (attacl grantor half).
+func TestAttrACLTextGrantor(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16605
+	const attNum int16 = 1
+
+	// GrantColumnPrivilegeWithGrantOption (no explicit grantor) keeps the
+	// pre-existing default: the owner.
+	c.GrantColumnPrivilegeWithGrantOption(relOID, attNum, "bob", "SELECT", true)
+	want := "{bob=r*/postgres}"
+	if got := c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after default-grantor GRANT = %q; want %q", got, want)
+	}
+
+	// bob (holding SELECT WITH GRANT OPTION) grants onward to charlie: the new
+	// aclitem's grantor is bob, not the owner.
+	c.GrantColumnPrivilegeAs(relOID, attNum, "charlie", "SELECT", false, "bob")
+	want = "{bob=r*/postgres,charlie=r/bob}"
+	if got := c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after delegated GRANT = %q; want %q", got, want)
+	}
+
+	// An empty grantor argument falls back to the owner.
+	c.GrantColumnPrivilegeAs(relOID, attNum, "dave", "SELECT", false, "")
+	want = "{bob=r*/postgres,charlie=r/bob,dave=r/postgres}"
+	if got := c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after empty-grantor GRANT = %q; want %q", got, want)
+	}
+
+	// A full REVOKE of charlie's only privilege drops its grantor entry too —
+	// re-granting charlie afterward must not resurrect the stale "bob" grantor.
+	c.RevokeColumnPrivilege(relOID, attNum, "charlie", "SELECT")
+	c.GrantColumnPrivilege(relOID, attNum, "charlie", "INSERT")
+	want = "{bob=r*/postgres,dave=r/postgres,charlie=a/postgres}"
+	if got := c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl after revoke+re-grant of charlie = %q; want %q (grantor reset to owner)", got, want)
+	}
+
+	// A mixed-case grantor renders with its original spelling preserved and
+	// quoted like any other role name.
+	c.GrantColumnPrivilegeAs(relOID, attNum, "erin", "SELECT", false, "MixedGrantor")
+	want = "{bob=r*/postgres,dave=r/postgres,charlie=a/postgres,erin=r/MixedGrantor}"
+	if got := c.AttrACLText(relOID, attNum); got != want {
+		t.Fatalf("attacl with mixed-case grantor = %q; want %q", got, want)
+	}
+}
+
 // TestDatabaseACLText pins the pg_database.datacl projection that the
 // GRANT-on-DATABASE round-trip needs (M0119-0004-ACLHEAP, datacl half). A
 // database's acldefault('d', owner) is "{postgres=CTc/postgres,=Tc/postgres}"

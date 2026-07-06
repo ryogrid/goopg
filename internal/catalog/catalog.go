@@ -1912,6 +1912,10 @@ type Catalog interface {
 	// privilege is revoked. M0119-0004-ACLHEAP (attacl half).
 	GrantColumnPrivilege(relOID uint32, attNum int16, role, priv string)
 	GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool)
+	// GrantColumnPrivilegeAs is GrantColumnPrivilegeWithGrantOption plus an
+	// explicit grantor, the column analogue of GrantTablePrivilegeAs.
+	// M0119-0004-ACLHEAP (attacl grantor half).
+	GrantColumnPrivilegeAs(relOID uint32, attNum int16, role, priv string, withGrantOption bool, grantor string)
 	RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv string)
 	AttrACLText(relOID uint32, attNum int16) string
 	// DropTableACL forgets all privileges recorded for relOID (called when the
@@ -2358,6 +2362,12 @@ type InMemory struct {
 	// alphabetical order — the column analogue of tableACLOrder. A role is removed
 	// when its column privilege set is fully revoked. M0119-0004-ACLHEAP.
 	attrACLOrder map[attrACLKey][]string
+
+	// attrACLGrantor records, per column, the grantor role that performed each
+	// grantee's most recent column-level GRANT — the column analogue of
+	// tableACLGrantor. An absent entry means "granted by the object owner", the
+	// pre-existing default. M0119-0004-ACLHEAP (attacl grantor half).
+	attrACLGrantor map[attrACLKey]map[string]string
 
 	// parameterACLOIDs assigns a synthetic pg_parameter_acl.oid to each
 	// GUC-level `GRANT SET|ALTER SYSTEM ON PARAMETER <name> ...` target, keyed
@@ -3180,6 +3190,7 @@ func NewInMemory() *InMemory {
 		relACLOwnerRevoked: make(map[uint32]bool),
 		attrACLs:           make(map[attrACLKey]map[string]map[string]bool),
 		attrACLOrder:       make(map[attrACLKey][]string),
+		attrACLGrantor:     make(map[attrACLKey]map[string]string),
 		parameterACLOIDs:   make(map[string]uint32),
 		parameterACLNames:  make(map[uint32]string),
 		defaultACLOIDs:     make(map[defaultACLKey]uint32),
@@ -13016,11 +13027,27 @@ func (c *InMemory) GrantColumnPrivilege(relOID uint32, attNum int16, role, priv 
 // option flag, OR-ed in exactly as GrantTablePrivilegeWithGrantOption does (a
 // later plain GRANT does not clear a previously set option). M0119-0004-ACLHEAP.
 func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int16, role, priv string, withGrantOption bool) {
+	c.GrantColumnPrivilegeAs(relOID, attNum, role, priv, withGrantOption, aclOwnerRole)
+}
+
+// GrantColumnPrivilegeAs is GrantColumnPrivilegeWithGrantOption plus an
+// explicit grantor — the role that executed the GRANT (aclOwnerRole/"postgres"
+// for the common owner/superuser case, or a SET ROLE-impersonated role's
+// name). Recorded in attrACLGrantor so AttrACLText renders the true
+// "grantee=privs/grantor" aclitem instead of hardcoding the owner. The column
+// analogue of GrantTablePrivilegeAs. M0119-0004-ACLHEAP (attacl grantor half).
+func (c *InMemory) GrantColumnPrivilegeAs(relOID uint32, attNum int16, role, priv string, withGrantOption bool, grantor string) {
 	display := strings.TrimSpace(role)
 	role = strings.ToLower(display)
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
 		return
+	}
+	grantorDisplay := strings.TrimSpace(grantor)
+	grantor = strings.ToLower(grantorDisplay)
+	if grantor == "" {
+		grantor = aclOwnerRole
+		grantorDisplay = aclOwnerRole
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -13028,6 +13055,9 @@ func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int
 	// true name (shared with the relacl store; DU-002 slice 337).
 	if display != role {
 		c.roleACLDisplay[role] = display
+	}
+	if grantorDisplay != grantor {
+		c.roleACLDisplay[grantor] = grantorDisplay
 	}
 	key := attrACLKey{relOID: relOID, attNum: attNum}
 	byRole := c.attrACLs[key]
@@ -13042,6 +13072,15 @@ func (c *InMemory) GrantColumnPrivilegeWithGrantOption(relOID uint32, attNum int
 		c.attrACLOrder[key] = append(c.attrACLOrder[key], role)
 	}
 	privs[priv] = privs[priv] || withGrantOption
+	// Every GRANT to this grantee — even a repeat one carrying the default
+	// owner grantor — restamps the grantor: PostgreSQL's aclupdate updates an
+	// existing aclitem's grantor to whoever issued the latest GRANT.
+	grantors := c.attrACLGrantor[key]
+	if grantors == nil {
+		grantors = make(map[string]string)
+		c.attrACLGrantor[key] = grantors
+	}
+	grantors[role] = grantor
 }
 
 // RevokeColumnPrivilege removes a single column-level priv for role on column
@@ -13081,10 +13120,17 @@ func (c *InMemory) RevokeColumnPrivilege(relOID uint32, attNum int16, role, priv
 				delete(c.attrACLOrder, key)
 			}
 		}
+		if grantors := c.attrACLGrantor[key]; grantors != nil {
+			delete(grantors, role)
+			if len(grantors) == 0 {
+				delete(c.attrACLGrantor, key)
+			}
+		}
 	}
 	if len(byRole) == 0 {
 		delete(c.attrACLs, key)
 		delete(c.attrACLOrder, key)
+		delete(c.attrACLGrantor, key)
 	}
 }
 
@@ -13622,7 +13668,7 @@ func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
 		if letters == "" {
 			continue // role holds only non-column privileges
 		}
-		// PUBLIC renders as an empty grantee ("=<privs>/postgres"); a mixed-case
+		// PUBLIC renders as an empty grantee ("=<privs>/grantor"); a mixed-case
 		// role restores its original spelling; an unsafe name is double-quoted —
 		// identical to relaclTextLockedFor's grantee handling.
 		grantee := role
@@ -13631,7 +13677,17 @@ func (c *InMemory) AttrACLText(relOID uint32, attNum int16) string {
 		} else if disp, ok := c.roleACLDisplay[role]; ok {
 			grantee = disp
 		}
-		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+		// The grantor defaults to the object owner absent an explicit stamp —
+		// identical fallback to relaclTextLockedFor's grantor handling.
+		// M0119-0004-ACLHEAP (attacl grantor half).
+		grantor := aclOwnerRole
+		if g, ok := c.attrACLGrantor[key][role]; ok && g != "" {
+			grantor = g
+		}
+		if disp, ok := c.roleACLDisplay[grantor]; ok {
+			grantor = disp
+		}
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/"+aclQuoteName(grantor))
 	}
 	return "{" + strings.Join(items, ",") + "}"
 }
