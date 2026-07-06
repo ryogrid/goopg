@@ -17715,6 +17715,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 				}
 				return &ExecError{Code: code, Pos: s.Pos(), Message: err.Error()}
 			}
+			rt.Owner = o.currentDDLOwnerOID()
 			syncRangeTypeToCatalogHeap(o.ctx, rt)
 			// DU-002 restart-persistence follow-up (M0110-0001, DU-002 slice
 			// 429 ledger resume point, sub-item (c)): mirrors CREATE ACCESS
@@ -18000,6 +18001,12 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 			}
 			return nil
 		}
+		if _, ok := cat.LookupRangeType(s.Name); ok {
+			if err := cat.RenameRangeType(s.Name, s.RenameTo); err != nil {
+				return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+			}
+			return nil
+		}
 		err := cat.RenameEnum(s.Name, s.RenameTo)
 		if err != nil {
 			return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
@@ -18033,6 +18040,10 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		if cat.LookupCompositeType(s.Name) != nil {
 			cat.SetCompositeTypeOwner(s.Name, ownerOID)
+			return nil
+		}
+		if _, ok := cat.LookupRangeType(s.Name); ok {
+			cat.SetRangeTypeOwner(s.Name, ownerOID)
 			return nil
 		}
 		if !cat.SetEnumOwner(s.Name, ownerOID) {

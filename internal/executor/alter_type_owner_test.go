@@ -110,3 +110,76 @@ func TestAlterTypeRenameToComposite(t *testing.T) {
 		t.Errorf("Fields after rename = %+v, want [{x ...}] (rename must preserve fields)", ct.Fields)
 	}
 }
+
+// TestAlterTypeOwnerToRange guards the range-type follow-up to M0122-0005:
+// `ALTER TYPE <range> OWNER TO` previously fell through to SetEnumOwner (the
+// final fallback in execAlterType's OWNER TO branch), which raised a spurious
+// 42704 "type does not exist" for a range type even though it does exist —
+// the same dispatch-by-kind gap TestAlterTypeOwnerTo's composite case closed
+// earlier. Mirrors TestAlterTypeOwnerTo but for catalog.RangeType.
+func TestAlterTypeOwnerToRange(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE TYPE ownertest_range AS RANGE (subtype = int4)`); err != nil {
+		t.Fatalf("CREATE TYPE ... AS RANGE: %v", err)
+	}
+
+	rt, found := im.LookupRangeType("ownertest_range")
+	if !found {
+		t.Fatal("range type not found via LookupRangeType")
+	}
+	if rt.OwnerOrDefault() != 10 {
+		t.Errorf("range OwnerOrDefault() before OWNER TO = %d, want 10 (bootstrap superuser default)", rt.OwnerOrDefault())
+	}
+
+	im.RegisterRole("rangeowner")
+	wantOID, found := im.RoleOID("rangeowner")
+	if !found {
+		t.Fatal("RoleOID(\"rangeowner\") not found after RegisterRole")
+	}
+
+	if err := runDDL(t, ctx, `ALTER TYPE ownertest_range OWNER TO rangeowner`); err != nil {
+		t.Fatalf("ALTER TYPE ... OWNER TO (range): %v", err)
+	}
+	if rt.OwnerOrDefault() != wantOID {
+		t.Errorf("range OwnerOrDefault() after OWNER TO = %d, want %d", rt.OwnerOrDefault(), wantOID)
+	}
+}
+
+// TestAlterTypeRenameToRange guards the same range-type follow-up: `ALTER
+// TYPE <range> RENAME TO` previously always called catalog.RenameEnum
+// regardless of kind, so renaming a range type raised a spurious "type does
+// not exist" (42710) instead of renaming it — the same bug class
+// TestAlterTypeRenameToComposite closed for composite types.
+func TestAlterTypeRenameToRange(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+
+	if err := runDDL(t, ctx, `CREATE TYPE renametest_range AS RANGE (subtype = int4)`); err != nil {
+		t.Fatalf("CREATE TYPE ... AS RANGE: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TYPE renametest_range RENAME TO renamedrange`); err != nil {
+		t.Fatalf("ALTER TYPE ... RENAME TO (range): %v", err)
+	}
+	if _, ok := im.LookupRangeType("renametest_range"); ok {
+		t.Error("old range type name still resolves after RENAME TO")
+	}
+	rt, found := im.LookupRangeType("renamedrange")
+	if !found {
+		t.Fatal("renamed range type not found via LookupRangeType")
+	}
+	if rt.SubtypeName != "int4" {
+		t.Errorf("SubtypeName after rename = %q, want %q (rename must preserve subtype)", rt.SubtypeName, "int4")
+	}
+}

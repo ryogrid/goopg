@@ -97,6 +97,53 @@ defaults to the bootstrap superuser (OID 10) at render time."
 - Full `go build ./...` and `go test ./internal/parser/... ./internal/catalog/... ./internal/executor/...`
   (whole packages, not just the new tests) — clean, no regressions.
 
+## Follow-up: range-type `OWNER TO` / `RENAME TO` (2026-07-06)
+
+`catalog.RangeType` gained the same `Owner uint32` / `OwnerOrDefault()` pair
+as enum/composite (defaulting to the bootstrap superuser, OID 10). New
+catalog methods `SetRangeTypeOwner`/`RenameRangeType` mirror
+`SetCompositeTypeOwner`/`RenameCompositeType` exactly (`RenameRangeType`
+leaves `MultirangeName` untouched — the auto-generated multirange type is a
+distinct pg_type row with its own name, unaffected by renaming the range type
+itself, matching real PostgreSQL). `execCreateType`'s `IsRange` branch now
+stamps `rt.Owner = o.currentDDLOwnerOID()` at creation (the same
+"creator becomes owner" convention as enum/composite). `execAlterType`'s
+RENAME TO and OWNER TO branches each gained a `cat.LookupRangeType(s.Name)`
+check (after the composite check, before the enum fallback) — previously
+`ALTER TYPE <range> RENAME TO`/`OWNER TO` silently mis-dispatched into
+`RenameEnum`/`SetEnumOwner`, raising a spurious `42704`/`42710` "type does not
+exist" for a range type that does exist, the identical dispatch-by-kind bug
+class this design doc's original composite fix closed. The four
+`bootstrapSuperuserOID` typowner literals in
+`internal/executor/pg18_user_catalog_rows.go`
+(`buildUserPGTypeRowForRange`/`ForMultirange`/`ForRangeArray`/
+`ForMultirangeArray`) now read `rt.OwnerOrDefault()` instead — the multirange
+and both auto-generated array types share the base range type's owner (there
+is no independent multirange/array `Owner` field, mirroring the enum/
+composite array-type precedent).
+
+Tests: `internal/executor/alter_type_owner_test.go`'s
+`TestAlterTypeOwnerToRange`/`TestAlterTypeRenameToRange`. Gates: `go build
+./...` clean; `go test ./internal/catalog/... ./internal/executor/...
+./internal/parser/...` PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+**Deferred (unchanged from before, plus one new item):** restart persistence
+of `Owner` (range types already have a WAL record for `CREATE TYPE ... AS
+RANGE`, unlike enum/composite, but `Owner` was added purely in-memory this
+loop and is not yet threaded into `wal.EncodeCreateRangeType`/
+`DecodeCreateRangeType` — a range type's owner reverts to the bootstrap
+superuser default across a restart even though the type definition itself
+survives). **Domain typowner remains untouched**: unlike range types, there is
+no working `ALTER TYPE`-style dispatch to piggyback on — `ALTER DOMAIN` is a
+wholly distinct, unparsed statement today (`internal/parser/ddl.go`'s
+`parseAlter` discards it via the generic "collation / domain / extension /
+language / operator / system" compatibility-stub loop, consuming tokens to
+`;`/EOF with no AST at all), so adding `Domain.Owner` now would be dead code
+with no way to ever set it. This is a materially larger, separate task
+(parsing `ALTER DOMAIN`'s full grammar: `RENAME TO`, `SET`/`DROP DEFAULT`,
+`SET`/`DROP NOT NULL`, `ADD`/`DROP CONSTRAINT`, `RENAME CONSTRAINT`,
+`OWNER TO`, `SET SCHEMA`), not a bounded mechanical follow-up like this one.
+
 ## Deferred
 
 - **Restart persistence of `Owner`.** Enum/composite `CREATE TYPE` has no WAL
@@ -105,11 +152,10 @@ defaults to the bootstrap superuser (OID 10) at render time."
   are not yet restart-durable independent of this change, so `Owner` inherits
   that same gap rather than introducing a new one. See ledger row for the
   resume point once enum/composite restart durability is tackled.
-- **Range/multirange/domain typowner** stay hardcoded to the bootstrap
-  superuser; `ALTER TYPE`/`ALTER DOMAIN` don't route ownership changes to
-  them. A future slice can extend the same `Owner`/`OwnerOrDefault` pattern to
-  `catalog.RangeType`/`catalog.Domain` if `ALTER DOMAIN ... OWNER TO` or a
-  range-type OWNER TO is ever exercised.
+- **Domain typowner** stays hardcoded to the bootstrap superuser; `ALTER
+  DOMAIN` isn't parsed at all today, so there is nothing to route an
+  ownership change through yet (see the range-type follow-up section above
+  for the full scope of what building `ALTER DOMAIN` would take).
 - **`pg_dump` ACL default (`acldefault('T', typowner)`) interaction** with a
   non-default owner was not separately verified against a live `pg_dump`
   round-trip this loop (the external-binary TAP suite, `TestPort_

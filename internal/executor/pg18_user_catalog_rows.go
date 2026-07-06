@@ -2042,7 +2042,7 @@ func buildUserPGTypeRowForRange(rt *catalog.RangeType) Row {
 		NewIntDatum(int64(rt.OID)),                     // oid
 		NewStringDatum(rt.Name),                        // typname
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
-		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                 // typlen (always varlena)
 		NewBoolDatum(false),                             // typbyval
 		NewStringDatum("r"),                             // typtype = 'r' (range)
@@ -2090,7 +2090,7 @@ func buildUserPGTypeRowForMultirange(rt *catalog.RangeType) Row {
 		NewIntDatum(int64(rt.MultirangeOID)),           // oid
 		NewStringDatum(rt.MultirangeName),              // typname
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace
-		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                 // typlen (always varlena)
 		NewBoolDatum(false),                             // typbyval
 		NewStringDatum("m"),                             // typtype = 'm' (multirange)
@@ -2137,7 +2137,7 @@ func buildUserPGTypeRowForRangeArray(rt *catalog.RangeType) Row {
 		NewIntDatum(int64(rt.ArrayOID)),                // oid
 		NewStringDatum("_" + rt.Name),                  // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                 // typlen (varlena array)
 		NewBoolDatum(false),                             // typbyval
 		NewStringDatum("b"),                             // typtype = 'b' (base)
@@ -2183,7 +2183,7 @@ func buildUserPGTypeRowForMultirangeArray(rt *catalog.RangeType) Row {
 		NewIntDatum(int64(rt.MultirangeArrayOID)),      // oid
 		NewStringDatum("_" + rt.MultirangeName),        // typname (array type name)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),              // typowner
+		NewIntDatum(int64(rt.OwnerOrDefault())),        // typowner
 		NewIntDatum(-1),                                 // typlen (varlena array)
 		NewBoolDatum(false),                             // typbyval
 		NewStringDatum("b"),                             // typtype = 'b' (base)

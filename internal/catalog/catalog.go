@@ -2875,6 +2875,21 @@ type RangeType struct {
 	MultirangeOID      uint32 // pg_type.oid of the auto-generated multirange type
 	MultirangeArrayOID uint32 // pg_type.oid of the multirange's auto-generated `_name` array type
 	MultirangeName     string // lower-case multirange type name
+	// Owner is the typowner role OID, settable via `ALTER TYPE ... OWNER TO`.
+	// 0 means "unset, defaults to the bootstrap superuser" — see
+	// OwnerOrDefault. M0122-0005 (range-type follow-up to the enum/composite
+	// ALTER TYPE OWNER TO/RENAME TO work).
+	Owner uint32
+}
+
+// OwnerOrDefault returns rt.Owner, falling back to the bootstrap superuser OID
+// (10) for range types that never had OWNER TO applied. Mirrors
+// EnumType.OwnerOrDefault / CompositeType.OwnerOrDefault.
+func (rt *RangeType) OwnerOrDefault() uint32 {
+	if rt.Owner == 0 {
+		return 10
+	}
+	return rt.Owner
 }
 
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
@@ -17585,6 +17600,47 @@ func (c *InMemory) SetCompositeTypeOwner(name string, ownerOID uint32) bool {
 		return false
 	}
 	ct.Owner = ownerOID
+	return true
+}
+
+// RenameRangeType renames a range type from oldName to newName, mirroring
+// RenameCompositeType/RenameEnum. `ALTER TYPE ... RENAME TO` previously always
+// dispatched to RenameEnum regardless of kind, so renaming a range type raised
+// a spurious "type does not exist" (42710) instead of renaming it — the same
+// dispatch-by-kind gap RenameCompositeType closed for composite types. The
+// auto-generated multirange name is left untouched (it is a distinct pg_type
+// row with its own name, unaffected by renaming the range type itself, mirroring
+// real PostgreSQL). M0122-0005 (range-type follow-up).
+func (c *InMemory) RenameRangeType(oldName, newName string) error {
+	ok := strings.ToLower(oldName)
+	nk := strings.ToLower(newName)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt, found := c.rangeTypes[ok]
+	if !found {
+		return fmt.Errorf("type %q does not exist", oldName)
+	}
+	if _, exists := c.rangeTypes[nk]; exists {
+		return fmt.Errorf("type %q already exists", newName)
+	}
+	delete(c.rangeTypes, ok)
+	rt.Name = nk
+	c.rangeTypes[nk] = rt
+	return nil
+}
+
+// SetRangeTypeOwner records the typowner role OID for an existing range type.
+// Returns false if no such range type is registered. Mirrors
+// SetCompositeTypeOwner/SetEnumOwner. M0122-0005 (range-type follow-up).
+func (c *InMemory) SetRangeTypeOwner(name string, ownerOID uint32) bool {
+	k := strings.ToLower(name)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	rt, ok := c.rangeTypes[k]
+	if !ok {
+		return false
+	}
+	rt.Owner = ownerOID
 	return true
 }
 
