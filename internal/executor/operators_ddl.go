@@ -16349,9 +16349,14 @@ func columnAttNum(tbl *catalog.Table, colName string) int16 {
 // Unknown table/column names are a successful no-op. The grantor stamped on
 // each grant is the session's current effective role (o.ctx.NonSuperuserRole,
 // empty meaning the bootstrap superuser), mirroring tryRecordTableGrant's
-// grantor attribution for relacl/nspacl/proacl/typacl/datacl.
-// M0119-0004-ACLHEAP (attacl grantor half).
+// grantor attribution for relacl/nspacl/proacl/typacl/datacl. An explicit
+// GRANTED BY clause naming a role other than the acting one is rejected 0A000
+// (checkGrantedByCurrentUser), mirroring execTypeACLChange's table/type/
+// database/parameter check. M0119-0004-ACLHEAP (attacl grantor half).
 func (o *ddlOp) execAttrACLChange(ac *parser.AttrACLChange) error {
+	if err := checkGrantedByCurrentUser(o.ctx.NonSuperuserRole, ac.GrantedBy); err != nil {
+		return err
+	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
 		return nil

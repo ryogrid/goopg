@@ -277,7 +277,8 @@ func grantNonTableClass(word string) bool {
 
 // scanGrantTrailingClause scans a grantee list starting at roleStart for the
 // shared trailing-clause grammar every object-privilege GRANT/REVOKE variant
-// (TYPE/DOMAIN, DATABASE, PARAMETER — gram.y's GrantStmt/RevokeStmt) allows
+// (TABLE column-level, TYPE/DOMAIN, DATABASE, PARAMETER — gram.y's
+// GrantStmt/RevokeStmt) allows
 // after the role list: GRANT's `opt_grant_grant_option opt_granted_by` or
 // REVOKE's `opt_granted_by opt_drop_behavior`. Mirrors
 // buildRoleMembershipChange's inline scan, generalized across the three
@@ -748,9 +749,11 @@ func grantHasColumnList(toks []Token) bool {
 }
 
 // buildAttrACLChange parses the token run of a column-level GRANT/REVOKE —
-// `GRANT <priv>(<cols>) ON [TABLE] <names> TO|FROM <roles> [WITH GRANT OPTION]` —
-// into an AttrACLChange. toks is every token after the GRANT/REVOKE keyword with
-// the trailing ';' excluded. Returns nil when any required list is empty (an
+// `GRANT <priv>(<cols>) ON [TABLE] <names> TO|FROM <roles> [WITH GRANT OPTION]
+// [GRANTED BY <role>]` — into an AttrACLChange, sharing the trailing-clause
+// scan (scanGrantTrailingClause) with the table/type/database/parameter ACL
+// builders. toks is every token after the GRANT/REVOKE keyword with the
+// trailing ';' excluded. Returns nil when any required list is empty (an
 // unparseable form the caller leaves as a successful no-op). M0119-0004-ACLHEAP.
 func buildAttrACLChange(revoke bool, toks []Token) *AttrACLChange {
 	onIdx := tokIndexOf(toks, 0, "on")
@@ -770,30 +773,14 @@ func buildAttrACLChange(revoke bool, toks []Token) *AttrACLChange {
 		return nil
 	}
 	roleStart := sepIdx + 1
-	roleEnd := len(toks)
-	withGrantOption := false
-	for i := roleStart; i < len(toks); i++ {
-		switch strings.ToLower(toks[i].Value) {
-		case "with":
-			if i+2 < len(toks) &&
-				strings.EqualFold(toks[i+1].Value, "grant") &&
-				strings.EqualFold(toks[i+2].Value, "option") {
-				withGrantOption = true
-			}
-			roleEnd = i
-		case "granted", "cascade", "restrict":
-			roleEnd = i
-		default:
-			continue
-		}
-		break
-	}
+	roleEnd, withGrantOption, grantedBy := scanGrantTrailingClause(toks, roleStart)
 	aac := &AttrACLChange{
 		Revoke:          revoke,
 		Privileges:      splitTokColumnPrivileges(toks[:onIdx]),
 		TableNames:      splitTokObjectNames(toks[nameStart:sepIdx]),
 		Grantees:        splitTokRoles(toks[roleStart:roleEnd]),
 		WithGrantOption: withGrantOption,
+		GrantedBy:       grantedBy,
 	}
 	if len(aac.Privileges) == 0 || len(aac.TableNames) == 0 || len(aac.Grantees) == 0 {
 		return nil

@@ -12,12 +12,13 @@ import (
 // M0119-0004-ACLHEAP (attacl half).
 func TestParseGrantAttrACL(t *testing.T) {
 	cases := []struct {
-		sql        string
-		wantRevoke bool
-		wantPrivs  []ColumnPrivilege
-		wantTables []ObjectName
-		wantRoles  []string
-		wantWGO    bool
+		sql           string
+		wantRevoke    bool
+		wantPrivs     []ColumnPrivilege
+		wantTables    []ObjectName
+		wantRoles     []string
+		wantWGO       bool
+		wantGrantedBy string
 	}{
 		{
 			sql:        "GRANT SELECT (a) ON TABLE t TO r",
@@ -75,6 +76,24 @@ func TestParseGrantAttrACL(t *testing.T) {
 			wantTables: []ObjectName{{Name: "t"}},
 			wantRoles:  []string{"r1", "r2"},
 		},
+		{
+			sql:           "GRANT SELECT (a) ON TABLE t TO r GRANTED BY postgres",
+			wantPrivs:     []ColumnPrivilege{{Privilege: "SELECT", Columns: []string{"a"}}},
+			wantTables:    []ObjectName{{Name: "t"}},
+			wantRoles:     []string{"r"},
+			wantGrantedBy: "postgres",
+		},
+		{
+			// GRANTED BY following WITH GRANT OPTION (gram.y's
+			// opt_grant_grant_option opt_granted_by order) — regression case
+			// for scanGrantTrailingClause's continue-after-WITH fix.
+			sql:           "GRANT SELECT (a) ON TABLE t TO r WITH GRANT OPTION GRANTED BY postgres",
+			wantPrivs:     []ColumnPrivilege{{Privilege: "SELECT", Columns: []string{"a"}}},
+			wantTables:    []ObjectName{{Name: "t"}},
+			wantRoles:     []string{"r"},
+			wantWGO:       true,
+			wantGrantedBy: "postgres",
+		},
 	}
 	for _, tc := range cases {
 		stmts, err := Parse(tc.sql)
@@ -98,6 +117,9 @@ func TestParseGrantAttrACL(t *testing.T) {
 		}
 		if got.WithGrantOption != tc.wantWGO {
 			t.Errorf("%q: WithGrantOption = %v, want %v", tc.sql, got.WithGrantOption, tc.wantWGO)
+		}
+		if got.GrantedBy != tc.wantGrantedBy {
+			t.Errorf("%q: GrantedBy = %q, want %q", tc.sql, got.GrantedBy, tc.wantGrantedBy)
 		}
 		if !eqStrs(got.Grantees, tc.wantRoles) {
 			t.Errorf("%q: Grantees = %v, want %v", tc.sql, got.Grantees, tc.wantRoles)

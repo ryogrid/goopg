@@ -2551,6 +2551,7 @@ type AttrACLChange struct {
 	TableNames      []ObjectName      // relation(s) after ON [TABLE]
 	Grantees        []string          // role list after TO|FROM ("PUBLIC" preserved verbatim)
 	WithGrantOption bool              // GRANT … WITH GRANT OPTION
+	GrantedBy       string            // optional explicit grantor; "" = current session role
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

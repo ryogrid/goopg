@@ -293,6 +293,37 @@ feature-sized) for all four object kinds. Next candidate: pick up the attacl
 `GRANTED BY` follow-up (small, mechanical), or resume the M0110-0001
 multi-database isolation survey above.
 
+**2026-07-06 (loop #46):** picked up the attacl `GRANTED BY` follow-up named
+above — the last remaining named gap in the object-privilege ACL grantor
+tracking bucket. `parser.AttrACLChange` (`internal/parser/ast.go`) gained a
+`GrantedBy` field; `buildAttrACLChange` (`internal/parser/parser.go`) now
+shares `scanGrantTrailingClause` (its fourth and final caller across the
+table/type/database/parameter/attacl family) instead of its own copy of the
+stop-token loop that discarded the clause. `execAttrACLChange`
+(`internal/executor/operators_ddl.go`) now calls the existing
+`checkGrantedByCurrentUser` first, rejecting a mismatched grantor with
+`0A000` before any column-ACL mutation, exactly like
+`execTypeACLChange`/`execDatabaseACLChange`/`execParameterACLChange`. Tests:
+`internal/parser/op_grant_attracl_test.go` gained a `GRANTED BY` case and a
+combined `WITH GRANT OPTION ... GRANTED BY` case;
+`internal/executor/operators_ddl_acl_grantor_test.go` gained
+`TestExecAttrACLChangeGrantedByCurrentUserIsNoop`/
+`TestExecAttrACLChangeGrantedByOtherRoleErrors`. See
+`docs/design/0119-0004-table-acl-grantor-tracking.md`'s new "Follow-up:
+column-level `attacl` `GRANTED BY` validation" section and the matching
+ledger row. Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). **This closes
+every named `GRANTED BY` validation gap across all four object-privilege ACL
+kinds (table/type/database/parameter, plus the column-level attacl
+variant) — the entire object-privilege ACL grantor tracking bucket opened
+2026-07-06 is now closed.** Only remaining deferred item: grant-option
+delegation-chain resolution (`select_best_grantor`, `acl.c`), a feature-sized
+item for all object kinds, not a bounded mechanical follow-up. Next
+candidate: resume the M0110-0001 multi-database isolation survey above
+(pg_dump 002-010 broader per-database catalog-isolation blocker), or survey
+the deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

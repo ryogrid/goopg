@@ -7,6 +7,20 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// attrACLTestTable creates a minimal one-column table for execAttrACLChange
+// tests, mirroring the CreateTable fixture shape used across the executor
+// package (e.g. applyworker_test.go's TestPrimaryKeyOnlyRow).
+func attrACLTestTable(t *testing.T, cat *catalog.InMemory, name string) *catalog.Table {
+	t.Helper()
+	tbl, err := cat.CreateTable(parser.ObjectName{Name: name}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	return tbl
+}
+
 // TestExecTypeACLChangeStampsActingRoleAsGrantor confirms execTypeACLChange's
 // grantor-wiring follow-up (M0119-0004-ACLHEAP): a GRANT ON TYPE issued while
 // impersonating a non-superuser role (o.ctx.NonSuperuserRole, the SET
@@ -169,5 +183,54 @@ func TestExecACLChangeGrantedByOtherRoleErrors(t *testing.T) {
 		t.Fatal("execParameterACLChange with GRANTED BY alice (as bob): want error, got nil")
 	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "0A000" {
 		t.Fatalf("execParameterACLChange error = %v; want 0A000 ExecError", err)
+	}
+}
+
+// TestExecAttrACLChangeGrantedByCurrentUserIsNoop is the column-ACL (attacl)
+// analogue of TestExecACLChangeGrantedByCurrentUserIsNoop: an explicit
+// `GRANTED BY <acting role>` clause on a column GRANT is accepted as a no-op
+// confirmation exactly like omitting the clause.
+func TestExecAttrACLChangeGrantedByCurrentUserIsNoop(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl := attrACLTestTable(t, cat, "attracl_grantedby_noop")
+	op := &ddlOp{ctx: &Context{Catalog: cat, NonSuperuserRole: "bob"}}
+
+	ac := &parser.AttrACLChange{
+		Privileges: []parser.ColumnPrivilege{{Privilege: "SELECT", Columns: []string{"a"}}},
+		TableNames: []parser.ObjectName{{Name: "attracl_grantedby_noop"}},
+		Grantees:   []string{"charlie"},
+		GrantedBy:  "bob",
+	}
+	if err := op.execAttrACLChange(ac); err != nil {
+		t.Fatalf("execAttrACLChange with GRANTED BY bob (as bob): %v", err)
+	}
+	want := "{charlie=r/bob}"
+	if got := cat.AttrACLText(tbl.OID, 1); got != want {
+		t.Fatalf("attacl = %q; want %q", got, want)
+	}
+}
+
+// TestExecAttrACLChangeGrantedByOtherRoleErrors is the column-ACL (attacl)
+// analogue of TestExecACLChangeGrantedByOtherRoleErrors: a GRANTED BY clause
+// naming a role other than the acting one is rejected 0A000, never silently
+// substituted as the recorded grantor.
+func TestExecAttrACLChangeGrantedByOtherRoleErrors(t *testing.T) {
+	cat := catalog.NewInMemory()
+	tbl := attrACLTestTable(t, cat, "attracl_grantedby_err")
+	op := &ddlOp{ctx: &Context{Catalog: cat, NonSuperuserRole: "bob"}}
+
+	ac := &parser.AttrACLChange{
+		Privileges: []parser.ColumnPrivilege{{Privilege: "SELECT", Columns: []string{"a"}}},
+		TableNames: []parser.ObjectName{{Name: "attracl_grantedby_err"}},
+		Grantees:   []string{"charlie"},
+		GrantedBy:  "alice",
+	}
+	if err := op.execAttrACLChange(ac); err == nil {
+		t.Fatal("execAttrACLChange with GRANTED BY alice (as bob): want error, got nil")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "0A000" {
+		t.Fatalf("execAttrACLChange error = %v; want 0A000 ExecError", err)
+	}
+	if got := cat.AttrACLText(tbl.OID, 1); got != "" {
+		t.Fatalf("attacl after rejected GRANT = %q; want \"\" (NULL)", got)
 	}
 }

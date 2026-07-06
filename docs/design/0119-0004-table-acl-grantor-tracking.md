@@ -344,3 +344,43 @@ regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
 - No PostgreSQL grant-option delegation-chain resolution
   (`select_best_grantor`) for these three object kinds either — same
   accepted simplification as the original table-ACL fix.
+
+## Follow-up: column-level `attacl` `GRANTED BY` validation (2026-07-06)
+
+Closes the last remaining named gap from the previous follow-up: column-level
+`GRANT/REVOKE ... (cols) ON TABLE ...` accepted a `GRANTED BY <role>` clause
+but discarded it unvalidated, unlike every object-privilege call site above.
+
+- `AttrACLChange` (`internal/parser/ast.go`) gained a `GrantedBy string`
+  field, matching `TypeACLChange`/`DatabaseACLChange`/`ParameterACLChange`'s
+  convention.
+- `buildAttrACLChange` (`internal/parser/parser.go`) now shares
+  `scanGrantTrailingClause` instead of its own fourth copy of the same
+  inline stop-token loop the previous follow-up already collapsed into one
+  helper for the other three builders — so this closes the last of the four
+  originally-duplicated scans and gets the `WITH GRANT OPTION ...  GRANTED
+  BY` ordering fix (the `continue`-after-`WITH` behavior) for free.
+- `execAttrACLChange` (`internal/executor/operators_ddl.go`) calls the
+  existing `checkGrantedByCurrentUser` helper first, exactly like
+  `execTypeACLChange`/`execDatabaseACLChange`/`execParameterACLChange`,
+  rejecting a mismatched grantor with `0A000` before touching the column ACL
+  store.
+
+Tests: `internal/parser/op_grant_attracl_test.go` gained a `GRANTED BY` case
+and a combined `WITH GRANT OPTION ... GRANTED BY` case (mirroring the type-ACL
+test); `internal/executor/operators_ddl_acl_grantor_test.go` gained
+`TestExecAttrACLChangeGrantedByCurrentUserIsNoop` /
+`TestExecAttrACLChangeGrantedByOtherRoleErrors`.
+
+Gates: `go build ./...` clean; `go test ./internal/catalog/...
+./internal/executor/... ./internal/parser/... ./internal/server/...` PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+
+**This closes every named `GRANTED BY` validation gap across all four
+object-privilege ACL kinds (table/type/database/parameter, plus the
+column-level attacl variant).** Only remaining deferred item, unchanged: no
+PostgreSQL grant-option delegation-chain resolution (`select_best_grantor`,
+`acl.c`) for any object kind — the recorded/validated grantor is whichever
+role executed the statement, not a resolved delegation-chain member. This is a
+feature-sized item (tracking who-granted-whom transitively), not a bounded
+mechanical follow-up like the ones closed in this design doc so far.
