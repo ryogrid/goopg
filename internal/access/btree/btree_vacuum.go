@@ -46,7 +46,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		return 0, err
 	}
 
-	var emptyLeaves []emptyLeafInfo
+	unlinkedAny := false
 	totalRemoved := 0
 
 	for cur := leftmostBlk; cur != storage.InvalidBlockNumber; {
@@ -84,6 +84,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 
 		next := op.Next
 
+		var justEmptied *emptyLeafInfo
 		if len(kept) < len(items) {
 			resetPageItems(slot.Page())
 			keptRaw := make([][]byte, 0, len(kept))
@@ -107,12 +108,12 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 				// we left off.
 				op.Flags |= BTDeleted | BTHalfDead
 				writeOpaque(slot.Page(), op)
-				emptyLeaves = append(emptyLeaves, emptyLeafInfo{
+				justEmptied = &emptyLeafInfo{
 					blk:      cur,
 					firstKey: firstKey,
 					prev:     op.Prev,
 					next:     op.Next,
-				})
+				}
 			}
 			// M0079-0002: emit a logical btree-vacuum record
 			// carrying the kept-items projection + post-vacuum
@@ -135,20 +136,34 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		}
 
 		bt.unpinW(slot)
-		cur = next
-	}
 
-	// Unlink empty leaves from the sibling chain and remove their
-	// downlinks from parent internal pages.
-	for _, leaf := range emptyLeaves {
-		if err := bt.unlinkEmptyLeaf(leaf); err != nil {
-			return totalRemoved, err
+		// M-NIGHTLY (AI-20260706-201855-001, loop 9): unlink the
+		// now-empty leaf IMMEDIATELY, in this same iteration,
+		// rather than deferring it to a second pass over a batch
+		// collected across the WHOLE leftmost-to-rightmost scan.
+		// The old batched design left a leaf flagged
+		// BTHalfDead|BTDeleted — with its parent downlink still
+		// live — for as long as the rest of the (possibly
+		// thousand-leaf) scan took, wide open for a concurrent
+		// fast-path insert (tryInsertNoSplit never checks
+		// BTHalfDead/BTDeleted) to land on it before the deferred
+		// unlink discarded it. Unlinking here shrinks that window
+		// to the handful of instructions inside unlinkEmptyLeaf
+		// itself, which now also re-verifies emptiness under
+		// splitMu before doing anything destructive.
+		if justEmptied != nil {
+			if err := bt.unlinkEmptyLeaf(*justEmptied); err != nil {
+				return totalRemoved, err
+			}
+			unlinkedAny = true
 		}
+
+		cur = next
 	}
 
 	// If the entire tree is now empty, reset it to a single empty root so
 	// that subsequent Inserts work without needing a full rebuild.
-	if len(emptyLeaves) > 0 {
+	if unlinkedAny {
 		empty, err := bt.isTreeEmpty()
 		if err != nil {
 			return totalRemoved, err
@@ -228,6 +243,46 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// shift between resolve and remove.
 	bt.splitMu.Lock()
 	defer bt.splitMu.Unlock()
+
+	// M-NIGHTLY (AI-20260706-201855-001, loop 9): the caller
+	// (VacuumIndexPages) marks a leaf BTHalfDead|BTDeleted while
+	// scanning it, then unpins it and moves on — it does NOT hold
+	// splitMu or any lock spanning the marking and this unlink
+	// call. The fast, non-split Insert path (tryInsertNoSplit)
+	// never checks BTHalfDead/BTDeleted before writing: it only
+	// checks keyExceedsHighKey/pageHasSpaceFor, and the leaf's
+	// parent downlink is still intact at this point (removed only
+	// below), so a concurrent insert can land on this exact leaf
+	// and add a live tuple before we get here. Blindly proceeding
+	// would silently discard that tuple (unlinkEmptyLeaf's steps
+	// below never re-read the item area) and then hand the block
+	// to recycleBlock for a completely unrelated split to reuse —
+	// this is a real, independently confirmed corruption source,
+	// not merely a defensive check. Re-verify the leaf is still
+	// physically empty before doing anything destructive; if a
+	// racing insert repopulated it, revert the phase-1 marking and
+	// leave the (now live again) page alone instead of unlinking it.
+	recheckSlot, err := bt.pinW(leaf.blk)
+	if err != nil {
+		return err
+	}
+	recheckOp := readOpaque(recheckSlot.Page())
+	count, cerr := storage.PageLinePointerCount(recheckSlot.Page())
+	if cerr != nil {
+		bt.unpinW(recheckSlot)
+		return cerr
+	}
+	if count > 0 {
+		recheckOp.Flags &^= BTDeleted | BTHalfDead
+		writeOpaque(recheckSlot.Page(), recheckOp)
+		if err := bt.markDirtyWithPageRecord(recheckSlot, leaf.blk); err != nil {
+			bt.unpinW(recheckSlot)
+			return err
+		}
+		bt.unpinW(recheckSlot)
+		return nil
+	}
+	bt.unpinW(recheckSlot)
 
 	emitter := bt.pool.LogBtreeUnlinkPage()
 	if emitter == nil {

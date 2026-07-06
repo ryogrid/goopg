@@ -1,109 +1,96 @@
 Task: M-NIGHTLY (AI-20260706-201855-001) — pgbench/nightly btree
-corruption. 8th consecutive loop. LANDED a small, verified, safe fix
-(pinNewOrRecycled lock-gap hardening) and ruled out two hypotheses
-empirically, but the nightly item is STILL open — the third root
-cause (active since loop 5/update #3) is not yet identified.
+corruption. 9th consecutive loop. LANDED a real, independently-verified
+fix (vacuum's two-phase-unlink TOCTOU race) and refuted the prior loop's
+leading lead, but the nightly item is STILL open — found a NEW, cheaper,
+STILL-FAILING repro that proves a distinct bug survives.
 
-Files changed (committed): `internal/access/btree/btree.go`
-(`pinNewOrRecycled` now returns its slot still content-locked in both
-branches via a new `pinNewLocked` helper; single call site in
-`insertIntoBlock` no longer re-`Lock()`s). `.ralph/fix_plan.md` +
-`.ralph/deferral_ledger.md` bookkeeping (2026-07-07 update #6 + new
-ledger row).
+Files changed (committed): `internal/access/btree/btree_vacuum.go` —
+`VacuumIndexPages` now calls `unlinkEmptyLeaf` INLINE per scan-loop
+iteration (was: batched into an `emptyLeaves` slice, unlinked only after
+scanning the WHOLE index); `unlinkEmptyLeaf` re-verifies the leaf is
+still physically empty (line-pointer count == 0) immediately after
+acquiring `splitMu`, reverting the Phase-1 BTDeleted|BTHalfDead marking
+if a concurrent insert repopulated it, instead of blindly unlinking and
+discarding the new tuple. `.ralph/deferral_ledger.md` (2026-07-07, 9th
+loop row, appended at end in correct chronological order).
 
-Key symbols: `pinNewOrRecycled`/`pinNewLocked` (btree.go, ~line 641)
-— the fix. `tryInsertOnCachedRightmost`/`descendToLeaf`'s cache-populate
-branch (btree.go:1299, 1998) — found dead-code sentinel bug
-(`op.Next == 0` should be `op.Next == storage.InvalidBlockNumber`),
-NOT fixed (confirmed via probe test this whole fast path never
-engages today; fixing it activates a dormant path and deserves its
-own dedicated verification loop, not a tail-end change).
-`insertIntoBlock` (btree.go ~1420-1660, the split path under
-`bt.splitMu`) — next investigation target, see below.
+Key symbols: `VacuumIndexPages`/`unlinkEmptyLeaf` (btree_vacuum.go) —
+this loop's fix. `tryInsertNoSplit` (btree.go ~1400) — confirmed the
+fast insert path never checks `BTHalfDead`/`BTDeleted` (that's WHY the
+vacuum race was exploitable) nor `HasIncompleteSplit()` (refuted lead,
+see below). `TestMultiWriterStress_M0055_Phase_C`
+(multi_writer_stress_test.go:24, currently `t.Skip`'d at line 40) — THE
+cheap repro for next loop: pure 32-writer/1000-inserts-each disjoint-key
+stress, NO vacuum/delete at all, ~180s for `-count=400`, failed once
+this loop with "btree: empty internal page" / `inserts ok=31199, want
+32000` even AFTER this loop's fix and loop 8's `pinNewOrRecycled` fix.
 
 Findings this loop:
-1. LANDED: `pinNewOrRecycled`'s recycled-block branch used to zero a
-   page under `slot.Lock()` then `Unlock()` *before* the caller
-   re-`Lock()`'d to stamp real opaque/header — a real, previously-
-   flagged (ledger, 2nd 2026-07-07 row) gap. Now both branches
-   (recycled + fresh-PinNew via new `pinNewLocked`) return the slot
-   still locked; caller no longer double-locks. Verified: build clean,
-   `go test -count=1 ./internal/access/btree/... ./internal/amcheck/...
-   ./internal/executor/... -run Vacuum` PASS, `go test -race -count=1
-   ./internal/access/btree/...` PASS (18.2s, zero races). Re-ran the
-   full authoritative `stage-pgbench.sh` (s=50 c=100 j=20 T=180x3)
-   post-fix: STILL FAILS identically (`keyLen=9 total=37` etc. on the
-   very first workload) — this fix does NOT close the nightly item,
-   it just closes an adjacent, real gap.
-2. RULED OUT (empirically, not just by static read): (a) posting-list
-   re-encoding in the live insert/split path —
-   `appendTIDToPosting`/`promoteSingleToPosting` (posting.go) are dead
-   code outside tests; `dedupConsolidate` (btree.go) only drops exact
-   (key,ptr) dupes, never re-marshals as posting bytes — postings only
-   ever get written by `BulkCreate`. (b) `rightmostLeafBlk` insert
-   fast-path cache — wrote a throwaway probe test (5000 sequential
-   `bt.Insert` calls forcing many splits, then read
-   `bt.rightmostLeafBlk.Load()`) and confirmed it stays 0 forever: the
-   cache-populate/staleness checks (btree.go:1299/1998) compare
-   `op.Next` against `0` instead of the real "no right sibling"
-   sentinel `storage.InvalidBlockNumber` (confirmed via every
-   `BTPageOpaque{Next: ...}` write site in btree.go/bulkload.go/
-   btree_vacuum.go) — so this whole fast path is 100% dormant today.
-   Left unfixed (see "Next step").
-3. NEW, HIGH-VALUE FINDING — a much cheaper repro, and proof the
-   corruption is concurrency-triggered (not load-time): built a local
-   server, ran a single-threaded `pgbench -i -s 50` (no concurrent
-   clients), then `bt_index_check`/`bt_index_parent_check` on all 3
-   pkey indexes — ALL CLEAN. Reusing that SAME loaded DB, ran
-   `pgbench -c 100 -j 20 -T 25 -P 5` (just 25s) — reproduced the exact
-   `keyLen=9 total=37` failure within ~10s (vs. 15-30+ min for the
-   full authoritative gate). Post-failure `bt_index_check` on
-   `pgbench_accounts_pkey` shows WIDESPREAD "item order invariant
-   violated" across hundreds of distinct leaf blocks (as low as block
-   5) PLUS one genuinely byte-corrupt page (block 1096, same
-   keyLen=9/total=37 signature) — suggests one structural mis-split's
-   effects cascade across the whole sibling chain (amcheck's order
-   check compares HighKey/sibling links), or multiple independent
-   occurrences. All diagnostic artifacts removed (binary, data dir,
-   server killed, RUN_DIR removed).
+1. REFUTED (not just re-flagged) the 8th loop's "high-value lead":
+   `tryInsertNoSplit`/`tryInsertOnCachedRightmost` never calling
+   `HasIncompleteSplit()`/`finishSplit` IS a real gap vs. real PostgreSQL
+   (verified: `postgres/src/backend/access/nbtree/nbtinsert.c:1146`
+   `Assert(!P_INCOMPLETE_SPLIT(opaque))`, enforced by `_bt_moveright`'s
+   `forupdate` branch in `nbtsearch.c:290-302`) — but is NOT
+   independently exploitable today because `bt.splitMu` is held for the
+   ENTIRE structural window of both `Insert`'s split path and
+   `finishSplit` (through the parent-insert recursion and final
+   `clearIncompleteSplit`), so no second split-needing insert on the
+   SAME page can ever observe the flag mid-flight. Real risk only if a
+   split's parent-insert recursion errors out before clearing the flag
+   (permanently stuck; no `CompleteDeferredSplits`-analogue exists to
+   repair it — confirmed absent despite a comment claiming one was
+   planned). Recorded as a latent gap, not the active bug.
+2. LANDED: found and fixed a genuine, independently-confirmed TOCTOU in
+   `VacuumIndexPages`'s two-phase design (see Files changed above) — a
+   concrete, real bug regardless of whether it's THE nightly root cause.
+   Verified: `go build ./...` clean; `go test -count=1
+   ./internal/access/btree/...` PASS (1.9s); `go test -count=1
+   ./internal/amcheck/... ./internal/executor/... -run
+   "Vacuum|Btree|Index"` PASS; `go test -race -count=1
+   ./internal/access/btree/...` PASS (17.0s, zero races); `go vet
+   ./internal/access/btree/...` clean.
+3. NEW FINDING (unresolved, high value): temporarily un-skipped
+   `TestMultiWriterStress_M0055_Phase_C` and ran `-count=400` AFTER
+   landing this loop's fix — still failed once ("btree: empty internal
+   page"). Since this test never calls `VacuumIndexPages` at all (pure
+   disjoint-key inserts, no deletes), this PROVES a third, still-open
+   bug lives purely in the concurrent split/root-lift/parent-downlink-
+   insert machinery, independent of both loop 8's and this loop's fixes.
+   Test file fully reverted to its original skipped state before
+   finishing (confirmed via `git status`/`git diff --stat` showing zero
+   diff on `multi_writer_stress_test.go`).
 
-Next step: use the NEW cheap repro (not the 15-30 min authoritative
-gate, not the unreliable btree-only unit test) to instrument the
-SPLIT path specifically: `insertIntoBlock` (btree.go ~1420-1660,
-under `bt.splitMu`) — pgbench_accounts has 5M rows at scale=50 so
-splits are frequent/constant during the workload, unlike the tiny
-branches/tellers tables (which may never split at all). One concrete,
-NOT-yet-proven lead: `tryInsertNoSplit`/`tryInsertOnCachedRightmost`
-(the no-`splitMu` fast path) never check `op.HasIncompleteSplit()` or
-call `finishSplit`, unlike the documented crash-recovery contract for
-`BTIncompleteSplit` (confirmed via grep — no such check exists in
-either function) — a page mid-split (flag set, HighKey/Next already
-updated, but parent downlink not yet inserted, and briefly UNLOCKED
-between `bt.unpinW(slot)` and the parent insert a few lines later,
-lines ~1638-1657) could be reached by a concurrent fast-path insert;
-not yet confirmed this actually produces the observed corruption
-signature — verify by instrumenting/logging around that exact window
-using the cheap repro before attempting a fix. Full repro recipe (build
-path, PATH/LD_LIBRARY_PATH setup, exact pgbench invocations) + full
-evidence is in `.ralph/deferral_ledger.md`'s 2026-07-07 (8th loop) row.
+Next step: use `TestMultiWriterStress_M0055_Phase_C` as the repro (NOT
+pgbench — this one needs no server/cluster setup, just `go test`).
+Un-skip it (remove the `t.Skip(...)` at multi_writer_stress_test.go:40),
+run `go test -run TestMultiWriterStress_M0055_Phase_C -count=400
+./internal/access/btree/...` (~180s, observed failure rate 1/400).
+Since it's insert-only with disjoint keys, the bug must be in
+`insertIntoBlock`'s root-lift branch (btree.go ~1636-1652),
+`createNewRoot`, `clearRootFlag`, or `finishSplit`'s independent
+parent-insert path — NOT vacuum- or duplicate-key-related. First
+question to answer: does every internal-page mutation really go through
+`insertIntoBlock` under `splitMu`, or is there some non-splitMu-guarded
+path that can touch an internal page (mirroring the leaf-level
+`tryInsertNoSplit` gap from finding 1)? Re-add `t.Skip` before
+committing until actually fixed. Full recipe + all analysis is in
+`.ralph/deferral_ledger.md`'s 2026-07-07 (9th loop) row.
 
 Gates run this loop: `go build ./...` clean. `go test -count=1
 ./internal/access/btree/... ./internal/amcheck/... ./internal/executor/...
 -run "Vacuum|Btree|Index"` PASS. `go test -race -count=1
-./internal/access/btree/...` PASS (no race reports). Full authoritative
-`stage-pgbench.sh` re-run post-fix: still RED (expected — third root
-cause not yet found, not a regression). `make ralph-state-guard` — run
-before finalizing; auto-repaired a pre-existing stale progress.json
-marker (unrelated to this loop's changes), reports consistent. No
-executor/planner/codec change, so no TPC-H spotcheck required beyond
-the above.
+./internal/access/btree/...` PASS (no race reports). `go vet
+./internal/access/btree/...` clean (pre-existing unusedfunc diagnostics
+on posting.go/btree.go unrelated to this loop's changes). `make
+ralph-state-guard` — run before finalizing. Pre-commit hook will run the
+pgbench smoke gate (`scripts/ralph-precommit-test.sh`) automatically at
+commit time. No executor/planner/codec change, so no separate TPC-H
+spotcheck required beyond the above.
 
-In-flight: none. All diagnostic artifacts removed: `/tmp/goopg-diag2`
-binary + `/tmp/diag-data2` datadir (server force-killed via captured
-PID, directory rm -rf'd, confirmed gone), `/tmp/tmp.1ONIVLHqDV`
-(stage-pgbench.sh RUN_DIR from the authoritative re-run, rm -rf'd
-after extracting log excerpts — its own teardown already killed the
-port-5571 server and removed the nightly data dir). The separate,
-unrelated live nightly CI batch (`ci/batch/run-nightly.sh`, PID
-264733) was observed still running on port 65434 throughout this
-loop — NOT touched, left running.
+In-flight: none. All diagnostic artifacts removed: the un-skipped
+`multi_writer_stress_test.go` was restored from `/tmp/multi_writer_stress_test.go.bak`
+(itself removable, not needed further). No servers, data dirs, or
+background processes started this loop. The separate, unrelated live
+nightly CI batch (`ci/batch/run-nightly.sh`) was not checked this loop —
+not touched either way.
