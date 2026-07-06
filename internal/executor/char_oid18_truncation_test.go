@@ -34,10 +34,11 @@ func TestEvalCastCharTruncatesToFirstByte(t *testing.T) {
 // CastExpr evaluation call site: the quoted `"char"` identifier (Typmod==0)
 // must truncate to its first byte (real PG's charin() semantics), while the
 // bare `char`/CHARACTER keyword (grammar-synthesized Typmod==1, a distinct
-// bpchar(1) type sharing the same TargetType=="char" string) must NOT be
-// routed through that OID-18-specific truncation — it falls through
-// unchanged, same as before this fix (bpchar's own typmod truncation/padding
-// is a separate, broader gap, out of scope here).
+// bpchar(1) type sharing the same TargetType=="char" string) is routed
+// through the bpchar(n) typmod-truncation path instead (verified against
+// real PG 18.3: `SELECT 'xyz'::char` → 'x', i.e. bpchar(1) truncation, not
+// OID-18's charin() first-byte rule — the two happen to agree at length 1,
+// but arrive via distinct code paths).
 func TestCastExprCharTypmodDisambiguation(t *testing.T) {
 	ctx, _, cleanup := newDDLFixture(t)
 	defer cleanup()
@@ -49,11 +50,40 @@ func TestCastExprCharTypmodDisambiguation(t *testing.T) {
 	}
 
 	// Bare char (bpchar with implicit length 1, Typmod==1 at the AST level):
-	// must not gain the OID-18 truncation behavior from this fix — the
-	// generic cast path still passes the string through unchanged (a
-	// pre-existing, separately-scoped bpchar-typmod gap).
+	// truncated to 1 character via the bpchar(n) typmod path.
 	rows = runQuery(t, ctx, `SELECT 'xyz'::char`)
-	if len(rows) != 1 || rows[0][0].StringValue() != "xyz" {
-		t.Errorf(`SELECT 'xyz'::char = %v, want "xyz" (unchanged pass-through)`, rows)
+	if len(rows) != 1 || rows[0][0].StringValue() != "x" {
+		t.Errorf(`SELECT 'xyz'::char = %v, want "x" (bpchar(1) truncation)`, rows)
+	}
+}
+
+// TestInlineCastVarcharBpcharTypmodTruncation pins the M0122-0005 follow-up:
+// explicit `::varchar(n)`/`::bpchar(n)`/`::char(n)` casts must truncate an
+// over-length value to n characters. Verified against real PG 18.3: this is
+// silent truncation (no 22001 error), unlike assignment/INSERT coercion —
+// e.g. `SELECT 'abcdef'::varchar(3)` returns 'abc' with no error. Real PG
+// additionally right-pads bpchar/char short values with spaces; goopg has no
+// distinct padded representation for bpchar (matching the existing
+// coerceTextLikeDatum storage-path convention), so padding stays deferred.
+func TestInlineCastVarcharBpcharTypmodTruncation(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	cases := []struct {
+		query string
+		want  string
+	}{
+		{`SELECT 'abcdef'::varchar(3)`, "abc"},
+		{`SELECT 'abcdef'::char(3)`, "abc"},
+		{`SELECT 'abcdef'::character(3)`, "abc"},
+		{`SELECT 'abc'::varchar(3)`, "abc"},   // exact fit: no truncation
+		{`SELECT 'ab'::varchar(5)`, "ab"},     // shorter than n: unchanged (no padding)
+		{`SELECT ''::bpchar(3)`, ""},          // empty input: unchanged
+	}
+	for _, c := range cases {
+		rows := runQuery(t, ctx, c.query)
+		if len(rows) != 1 || rows[0][0].StringValue() != c.want {
+			t.Errorf("%s = %v, want %q", c.query, rows, c.want)
+		}
 	}
 }

@@ -859,6 +859,28 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 				}
 			}
 		}
+		// Apply varchar(n)/bpchar(n)/char(n) typmod: truncate to the declared
+		// length. PostgreSQL's explicit (::) cast truncates silently rather
+		// than raising 22001 (that error is assignment/INSERT-coercion-only,
+		// already enforced separately by codec.go's coerceTextLikeDatum) —
+		// verified against real PG 18.3: `'abcdef'::varchar(3)` → 'abc', no
+		// error. bpchar/char additionally right-pad short values with spaces
+		// in real PG; goopg's Datum has no distinct padded representation for
+		// bpchar (coerceTextLikeDatum stores it trimmed too), so padding is a
+		// separate, broader gap left deferred. castTargetType (not
+		// x.TargetType) is used so the bare-`char`-synthesized-to-"bpchar"
+		// rename above is truncated too, while the quoted OID-18 `"char"`
+		// form (Typmod==0, already handled above) is unaffected. M0122-0005.
+		if x.Typmod > 0 && result.Kind == KindString {
+			switch castTargetType {
+			case "varchar", "bpchar", "char", "character":
+				n := int(x.Typmod)
+				runes := []rune(result.StringValue())
+				if len(runes) > n {
+					result = NewStringDatum(string(runes[:n]))
+				}
+			}
+		}
 		// Apply numeric(P,S) typmod: round to S decimal places.
 		// Typmod is encoded as (P<<16)|S by the planner's encodeTypmod.
 		if x.Typmod > 0 {

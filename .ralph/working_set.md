@@ -1,41 +1,43 @@
 (idle — nothing in flight)
 
-Loop #14 completed and committed: closed the M0122-0005 "inline-cast
-`\"char\"` value-truncation" residual (deferred item (1) from the
-2026-07-05 OID-18-disambiguation row). `internal/executor/expr.go`'s
-`evalCast` `"char"` branch now truncates any non-octal-escape input to its
-first byte (matching real PG's `charin()`), rendered via the existing
-`charTypeDisplayForm`. Disambiguated at the `evalExpr` `*planner.CastExpr`
-call site (the only place `Typmod` is in scope): when `TargetType=="char"
-&& Typmod>0` (bare `char`/CHARACTER, grammar-synthesized to a distinct
-bpchar(1) cast sharing the same TargetType string) the call renames the
-target to `"bpchar"` for that one `evalCastTyped` invocation only, so
-genuine OID-18 casts (`Typmod==0`) are the sole ones truncated —
-`evalCast`'s shared signature untouched. New
-`internal/executor/char_oid18_truncation_test.go`:
-`TestEvalCastCharTruncatesToFirstByte` (direct unit, incl. octal-escape
-precedence) + `TestCastExprCharTypmodDisambiguation` (full parse→plan→eval
-pipeline via `runQuery`/`newDDLFixture`). Verified: go build/vet clean;
-`go test ./internal/executor/... ./internal/planner/... ./internal/parser/...
-./internal/server/... ./internal/catalog/...` all PASS (no regressions,
-one server-package flake reproduced as pre-existing/unrelated — passed on
-rerun); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). Design doc
+Loop #15 completed and committed: closed the "bpchar/varchar typmod
+truncation in the inline-cast evaluator" candidate named by loop #14's
+working set. `internal/executor/expr.go`'s `*planner.CastExpr` case in
+`evalExpr` (same call site as the OID-18 `"char"` fix, since `x.Typmod` is
+only in scope there) now truncates a `KindString` cast result to
+`x.Typmod` runes whenever `castTargetType` (post bare-char→bpchar rename)
+is `varchar`/`bpchar`/`char`/`character` — silent truncation, no `22001`
+(verified against real, unmodified PostgreSQL 18.3 via
+`postgres/local_install`: explicit `::type(n)` casts truncate without
+error, unlike assignment/INSERT coercion). Deliberately did NOT implement
+bpchar/char space-padding (also real-PG behavior, verified via
+`octet_length`): goopg's `Datum`/storage path (`coerceTextLikeDatum`)
+already stores bpchar trimmed, not padded, and padding only the inline-cast
+path would make the two paths disagree — recorded as a new, separate,
+cross-cutting deferral instead. This closed a side stale-test-expectation
+too: `TestCastExprCharTypmodDisambiguation`'s `SELECT 'xyz'::char` now
+correctly expects `"x"` (bpchar(1) truncation), not the old unchanged
+`"xyz"`. New test: `TestInlineCastVarcharBpcharTypmodTruncation`
+(`internal/executor/char_oid18_truncation_test.go`). Verified: go build
+clean; `go test ./internal/executor/... ./internal/planner/...
+./internal/parser/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `make ralph-state-guard` OK (auto-repaired an unrelated
+stale status/progress marker). Design doc
 (`docs/design/0122-0005-char-oid18-disambiguation.md`) new "Follow-up:
-inline-cast value truncation" section + README row updated. Ledger row
-appended (status `-`): newly deferred is generic bpchar/varchar typmod
-truncation/padding in the inline-cast evaluator (materially broader — e.g.
-`'xyzzy'::varchar(3)` still passes through unchanged), plus the
-pre-existing unrelated `pg_typeof(...)::oid` gap (still open, untouched).
+varchar(n)/bpchar(n)/char(n) inline-cast truncation" section + README row
+extended. Ledger row appended (status `-`): newly deferred is bpchar/char
+right-padding of short values (needs a project-wide decision on how to
+represent padded fixed-width values — a new Datum flag/kind, or padding
+applied consistently at both cast-eval and storage-coercion sites plus
+every comparison/length/concat call site — materially larger and
+cross-cutting, not a one-branch follow-up).
 
-Next candidate (pick ONE): bpchar/varchar typmod truncation in the
-inline-cast evaluator (small, same-shape follow-up — resume point:
-`internal/executor/expr.go`'s `*planner.CastExpr` case has `x.Typmod` in
-scope, same call site as this loop's fix; add a truncate/pad helper for
-the `"varchar","bpchar"` cases mirroring the existing numeric/time typmod
-block ~L850-879), the view's-own-ACL gap from M0122-0008 (materially
-larger — needs a preliminary per-statement RTE-style permission pass),
+Next candidate (pick ONE): the view's-own-ACL gap from M0122-0008
+(materially larger — needs a preliminary per-statement RTE-style
+permission pass, planning currently has no session-role visibility),
 resume the M0110-0001 multi-database isolation survey (fix_plan "Current
 Priority" banner — per-database catalog/storage isolation, milestone-scale,
-repeatedly deferred across many loops as too large for one loop), or
-survey `.ralph/deferral_ledger.md` for another fresh open (`status = -`)
-row.
+repeatedly deferred across many loops as too large for one loop), the
+bpchar/char right-padding gap just recorded (large/cross-cutting — probably
+still too big for one loop; would need scoping first), or survey
+`.ralph/deferral_ledger.md` for another fresh open (`status = -`) row.

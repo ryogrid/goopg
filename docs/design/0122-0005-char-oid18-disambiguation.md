@@ -169,3 +169,52 @@ Gates: `go build ./...` clean; `go test ./internal/executor/...
 ./internal/planner/... ./internal/parser/... ./internal/server/...
 ./internal/catalog/...` all PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2,
 Q13=33).
+
+## Follow-up: varchar(n)/bpchar(n)/char(n) inline-cast truncation (2026-07-06)
+
+Closes the "bpchar's own typmod truncation/padding" gap called out in the
+previous follow-up above — `'xyzzy'::varchar(3)` and `'xyzzy'::char(3)`
+previously passed through the `evalCast` "text/varchar/bpchar/char" branch
+unchanged, with no length enforcement at all.
+
+Verified against real, unmodified PostgreSQL 18.3 (`psql`/`initdb` under
+`postgres/local_install`): an explicit `::type(n)` cast truncates a
+too-long value **silently** (no `22001` error) — that error code is
+assignment/INSERT-coercion-only, already enforced separately by
+`internal/executor/codec.go`'s `coerceTextLikeDatum` (the column-storage
+path). Real PG's `bpchar`/`char` additionally right-pads short values with
+spaces up to `n` (verified via `octet_length`), which `varchar` does not do.
+
+Fixed in `internal/executor/expr.go`'s `*planner.CastExpr` case in
+`evalExpr` (same call site as the OID-18 fix above, since `x.Typmod` is only
+in scope there): after `evalCastTyped` returns, if `x.Typmod > 0` and the
+result is `KindString`, `castTargetType` (not `x.TargetType`, so the
+bare-`char`→`"bpchar"` rename from the OID-18 fix is truncated too) is
+matched against `varchar`/`bpchar`/`char`/`character` and the value is
+truncated to `x.Typmod` runes (rune-based, matching the rune-aware
+`length()`/`substr()` convention used elsewhere in `expr.go`, rather than
+`coerceTextLikeDatum`'s byte-based convention). No error is raised, matching
+explicit-cast semantics. This closed the disambiguation test's stale
+pinned behavior too: `SELECT 'xyz'::char` (bare, `Typmod==1`) now correctly
+returns `"x"` via this bpchar(1) truncation path, not unchanged `"xyz"`.
+
+**Deferred (not implemented):** bpchar/char right-padding of short values.
+goopg's `Datum` has no representation distinct from plain `KindString` for
+"padded fixed-width" values, and the column-storage path
+(`coerceTextLikeDatum`) already stores bpchar values trimmed rather than
+padded — implementing padding only in the inline-cast path (and not in
+storage) would make the two paths disagree on what a `bpchar(n)` value
+looks like, which is worse than the current shared no-padding convention.
+Padding both paths consistently is a separate, broader piece of work,
+recorded in the ledger.
+
+Tests: `internal/executor/char_oid18_truncation_test.go`'s
+`TestInlineCastVarcharBpcharTypmodTruncation` (varchar/char/character,
+exact-fit, shorter-than-n, and empty-string cases), plus the updated
+`TestCastExprCharTypmodDisambiguation` expectation above.
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/planner/... ./internal/parser/...` all PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33); `make ralph-state-guard`
+OK (after auto-repair of a stale status/progress marker unrelated to this
+change).

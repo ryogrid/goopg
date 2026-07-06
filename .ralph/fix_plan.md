@@ -617,6 +617,41 @@ truncation in the inline-cast evaluator (small, same-shape follow-up),
 resume the M0110-0001 multi-database isolation survey above, or survey the
 deferral ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #15):** picked up the "bpchar/varchar typmod truncation
+in the inline-cast evaluator" candidate named above. Verified against real
+PG 18.3 (`psql`/`initdb` under `postgres/local_install`) that an explicit
+`::varchar(n)`/`::bpchar(n)`/`::char(n)` cast truncates a too-long value
+silently (no `22001` — that error is assignment/INSERT-coercion-only,
+already enforced by `codec.go`'s `coerceTextLikeDatum`), and that
+bpchar/char additionally right-pad short values (varchar does not).
+`internal/executor/expr.go`'s `*planner.CastExpr` case (same call site as
+loop #14's OID-18 fix) now truncates a `KindString` result to `x.Typmod`
+runes whenever `castTargetType` is `varchar`/`bpchar`/`char`/`character`.
+Deliberately did NOT implement bpchar/char padding: goopg's `Datum` has no
+padded-fixed-width representation distinct from plain `KindString`, and the
+storage path (`coerceTextLikeDatum`) already stores bpchar trimmed rather
+than padded — padding only the inline-cast path would make the two paths
+disagree, so padding is left as a separate, larger, cross-cutting follow-up
+(new ledger row). This also closed the disambiguation test's stale pinned
+expectation: `SELECT 'xyz'::char` now correctly returns `"x"` (bpchar(1)
+truncation) instead of unchanged `"xyz"`. Tests:
+`internal/executor/char_oid18_truncation_test.go`'s new
+`TestInlineCastVarcharBpcharTypmodTruncation` plus the updated
+`TestCastExprCharTypmodDisambiguation`. Design:
+`docs/design/0122-0005-char-oid18-disambiguation.md`'s new "Follow-up:
+varchar(n)/bpchar(n)/char(n) inline-cast truncation" section;
+`docs/design/README.md` row extended; ledger row appended (status `-`,
+newly deferred: bpchar/char right-padding, cross-cutting). Gates: `go build
+./...` clean; `go test ./internal/executor/... ./internal/planner/...
+./internal/parser/...` all PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2/Q13=33); `make ralph-state-guard` OK (auto-repaired a stale
+status/progress marker unrelated to this change). Next candidate: the
+view's-own-ACL gap from M0122-0008 (materially larger — needs a
+preliminary per-statement RTE-style permission pass), resume the
+M0110-0001 multi-database isolation survey above, or survey the deferral
+ledger for a fresh open (`status = -`) row — the bpchar/varchar
+typmod-truncation lead named above is now closed.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
