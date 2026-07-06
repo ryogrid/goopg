@@ -15597,13 +15597,16 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// resolves the four real built-in templates (BuiltinTSTemplateOID);
 		// CREATE TEXT SEARCH TEMPLATE stays unimplemented (a C-function-loading
 		// feature with no analog here), so no user-defined template can ever be
-		// named. verify_dictoptions' template-specific option validation (e.g.
-		// simple's STOPWORDS/ACCEPT) is not performed — any option name is
-		// accepted verbatim, see this slice's deferral ledger row.
+		// named.
 		tmplName := strings.ToLower(s.TSDictTemplate.Name)
 		templOID, ok := catalog.BuiltinTSTemplateOID[tmplName]
 		if !ok || tmplName == "" {
 			return &ExecError{Code: "42704", Message: "text search template is required"}
+		}
+		// verify_dictoptions (tsearchcmds.c): reject any option name the
+		// chosen template's own init function doesn't recognize.
+		if verr := catalog.ValidateTSDictOptions(tmplName, s.TSDictOptions); verr != nil {
+			return &ExecError{Code: "22023", Message: verr.Error()}
 		}
 		im.RegisterCompatObject(s.ObjType, s.ObjName.String())
 		schema := s.ObjName.Schema
@@ -16020,7 +16023,14 @@ func (o *ddlOp) execAlterTSDict(s *parser.AlterTSDictStmt) error {
 	case "options":
 		newInitOption, err := im.AlterTSDictOptions(s.DictName.Name, schema, s.Options)
 		if err != nil {
-			return &ExecError{Code: "42704", Message: err.Error()}
+			// verify_dictoptions' rejection (ValidateTSDictOptions) surfaces as
+			// ERRCODE_INVALID_PARAMETER_VALUE (22023); any other failure here is
+			// the pre-existing "dictionary does not exist" lookup miss (42704).
+			code := "42704"
+			if strings.Contains(err.Error(), "unrecognized") {
+				code = "22023"
+			}
+			return &ExecError{Code: code, Message: err.Error()}
 		}
 		if o.ctx.WAL != nil {
 			if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterTSDictOptions(s.DictName.Name, schema, newInitOption)); werr != nil {

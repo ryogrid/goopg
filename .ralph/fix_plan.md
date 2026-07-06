@@ -744,6 +744,48 @@ RTE-style permission pass, planning currently has no session-role
 visibility), resume the M0110-0001 multi-database isolation survey above, or
 survey the deferral ledger for a fresh open (`status = -`) row.
 
+**2026-07-06 (loop #18):** picked up the `verify_dictoptions` template-option
+validation gap the slice-437 CREATE row and its ALTER follow-up row both
+recorded as deferred ("any option name/value is accepted verbatim").
+`CREATE`/`ALTER TEXT SEARCH DICTIONARY` now reject an option key the chosen
+template's own init function doesn't recognize, mirroring real PG's
+`verify_dictoptions` (`tsearchcmds.c`), which delegates to
+`dsimple_init`/`dsynonym_init`/`dispell_init`/`thesaurus_init`
+(`postgres/src/backend/tsearch/dict_*.c`) — read all four directly to pin
+the exact allowed-key sets (simple: stopwords/accept; synonym:
+synonyms/casesensitive; ispell: dictfile/afffile/stopwords; thesaurus:
+dictfile/dictionary) and each one's distinct "unrecognized ... parameter"
+message text. New `catalog.tsDictTemplateOptionSpec`/`ValidateTSDictOptions`/
+`builtinTSTemplateNameForOID` (`internal/catalog/catalog.go`);
+`AlterTSDictOptions` now validates the post-merge option list (not just the
+incoming ALTER directives) before persisting, matching `AlterTSDictionary`'s
+own validate-then-persist order — a bare delete-only directive naming a
+never-real key stays a silent no-op, exactly like real PG, since it's never
+re-added to the merged list. `internal/executor/operators_ddl.go`'s CREATE
+case calls the validator before `im.CreateTSDict` (raises `22023`);
+`execAlterTSDict`'s `"options"` case maps a validation failure to `22023` via
+`strings.Contains(err.Error(), "unrecognized")`, reusing the same
+string-dispatch shape `execAlterDomain`'s `RenameDomainConstraint` call
+already established (`catalog` cannot import the executor package's
+`ExecError` type, so a typed error wasn't an option). Tests:
+`internal/executor/tsdict_option_validation_test.go`'s new
+`TestCreateTSDictOptionValidation` (table-driven across all 4 templates,
+asserting both the SQLSTATE and the exact PG message text) and
+`TestAlterTSDictOptionValidation` (rejected ALTER leaves `InitOption`
+unchanged; a bare unrecognized-key directive is confirmed to be a no-op, not
+an error). See `docs/design/0110-0001-pg-dump-tap-port.md`'s new "Slice 437
+follow-up: `verify_dictoptions` template-specific option validation" section,
+`docs/design/README.md`'s extended row, and the matching ledger row (status
+`resolved` — closes both named deferrals). Gates: `go build ./...` clean;
+`go test ./internal/catalog/... ./internal/executor/... ./internal/parser/...
+./internal/server/... ./internal/initdb/... ./internal/wal/...` all PASS (no
+regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33). No further
+known gap in this specific bucket — only `OWNER TO` remains deferred for
+TEXT SEARCH DICTIONARY, for the same already-accepted reason CONFIGURATION's
+is. Next candidate: the view's-own-ACL gap from M0122-0008 (materially
+larger), resume the M0110-0001 multi-database isolation survey above, or
+survey the deferral ledger for a fresh open (`status = -`) row.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec

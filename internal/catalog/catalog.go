@@ -3009,6 +3009,57 @@ var BuiltinTSTemplateOID = map[string]uint32{
 	"thesaurus": 3742,
 }
 
+// tsDictTemplateOptionSpec mirrors each built-in template's own init
+// function's option-name whitelist — dsimple_init (dict_simple.c),
+// dsynonym_init (dict_synonym.c), dispell_init (dict_ispell.c), and
+// thesaurus_init (dict_thesaurus.c) — the target of verify_dictoptions
+// (tsearchcmds.c). Both the allowed key set and the literal "unrecognized
+// ... parameter" message text differ per template in real PG; there is no
+// shared format string to derive this from. DU-002 CREATE/ALTER TEXT SEARCH
+// DICTIONARY option-validation follow-up (M0119-0004).
+var tsDictTemplateOptionSpec = map[string]struct {
+	allowed []string
+	label   string
+}{
+	"simple":    {allowed: []string{"stopwords", "accept"}, label: "simple dictionary"},
+	"synonym":   {allowed: []string{"synonyms", "casesensitive"}, label: "synonym"},
+	"ispell":    {allowed: []string{"dictfile", "afffile", "stopwords"}, label: "Ispell"},
+	"thesaurus": {allowed: []string{"dictfile", "dictionary"}, label: "Thesaurus"},
+}
+
+// ValidateTSDictOptions mirrors verify_dictoptions (tsearchcmds.c): rejects
+// any option key the named template's own init function doesn't recognize,
+// using the exact same message text real PG's four init functions raise
+// (e.g. dsimple_init's `unrecognized simple dictionary parameter: "%s"`).
+// tmplName is a no-op key (returns nil) for any name not in
+// tsDictTemplateOptionSpec — CREATE/ALTER already reject an unresolved
+// template name earlier, so this only ever sees the four built-ins here.
+func ValidateTSDictOptions(tmplName string, opts []parser.TSDictOption) error {
+	spec, ok := tsDictTemplateOptionSpec[tmplName]
+	if !ok {
+		return nil
+	}
+	for _, opt := range opts {
+		if !slices.Contains(spec.allowed, opt.Key) {
+			return fmt.Errorf("unrecognized %s parameter: %q", spec.label, opt.Key)
+		}
+	}
+	return nil
+}
+
+// builtinTSTemplateNameForOID reverse-looks-up BuiltinTSTemplateOID (only 4
+// entries, so a linear scan is simplest) — used by AlterTSDictOptions, which
+// only has the dictionary's stored Template OID, not the name given at
+// CREATE time.
+func builtinTSTemplateNameForOID(oid uint32) (string, bool) {
+	for name, o := range BuiltinTSTemplateOID {
+		if o == oid {
+			return name, true
+		}
+	}
+	return "", false
+}
+
 // UserTSDict records a CREATE TEXT SEARCH DICTIONARY so pg_dump's
 // getTSDictionaries / dumpTSDictionary re-emit it. goopg performs no actual
 // text-search lexing — only the schema-dump round-trip is modeled, mirroring
@@ -11555,9 +11606,11 @@ func DeserializeTSDictOptions(s string) []parser.TSDictOption {
 // each named option is first removed from the existing list (regardless of
 // whether it currently exists), then re-added only if the directive carries
 // a value (HasValue) — a bare `key` in the option list is therefore a
-// delete-only directive. verify_dictoptions' template-specific option
-// validation is not performed (matching the CREATE-side deferral): any
-// option name/value is accepted verbatim. Returns the newly-serialized
+// delete-only directive. The resulting merged list is validated via
+// ValidateTSDictOptions, mirroring AlterTSDictionary's own
+// verify_dictoptions call on the post-merge list (tsearchcmds.c) — a
+// delete-only directive is never validated since it never re-enters the
+// merged list, matching real PG exactly. Returns the newly-serialized
 // dictinitoption text (for the caller's WAL record) and an error if no such
 // dictionary is registered. DU-002 ALTER TEXT SEARCH DICTIONARY follow-up
 // (M0119-0004).
@@ -11589,6 +11642,11 @@ func (c *InMemory) AlterTSDictOptions(name, schema string, directives []parser.T
 		opts = kept
 		if directive.HasValue {
 			opts = append(opts, parser.TSDictOption{Key: directive.Key, Value: directive.Value, IsNumeric: directive.IsNumeric, HasValue: true})
+		}
+	}
+	if tmplName, ok := builtinTSTemplateNameForOID(target.Template); ok {
+		if verr := ValidateTSDictOptions(tmplName, opts); verr != nil {
+			return "", verr
 		}
 	}
 	target.InitOption = SerializeTSDictOptions(opts)

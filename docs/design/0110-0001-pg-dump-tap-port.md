@@ -15359,3 +15359,74 @@ name/value is accepted verbatim on both paths.
 
 Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
 ./internal/parser/... ./internal/catalog/... ./internal/wal/...` PASS.
+
+## Slice 437 follow-up: `verify_dictoptions` template-specific option validation (2026-07-06)
+
+Closes the "still deferred" item both the slice 437 (CREATE) and its ALTER
+follow-up row recorded: `CREATE`/`ALTER TEXT SEARCH DICTIONARY` accepted any
+option name/value verbatim for any of the four built-in templates, whereas
+real PG's `verify_dictoptions` (`tsearchcmds.c`) calls the template's own
+init function — `dsimple_init` (`dict_simple.c`), `dsynonym_init`
+(`dict_synonym.c`), `dispell_init` (`dict_ispell.c`), `thesaurus_init`
+(`dict_thesaurus.c`) — which rejects any option key it doesn't recognize
+with `ERRCODE_INVALID_PARAMETER_VALUE` (`22023`) and a template-specific
+message. Read all four `*_init` functions directly from
+`./postgres/src/backend/tsearch/` to pin the exact allowed-key sets and
+message text (they are not a single shared format string):
+
+| template  | allowed keys                    | message fragment                             |
+|-----------|----------------------------------|-----------------------------------------------|
+| simple    | `stopwords`, `accept`            | `unrecognized simple dictionary parameter: "%s"` |
+| synonym   | `synonyms`, `casesensitive`      | `unrecognized synonym parameter: "%s"`        |
+| ispell    | `dictfile`, `afffile`, `stopwords` | `unrecognized Ispell parameter: "%s"`       |
+| thesaurus | `dictfile`, `dictionary`         | `unrecognized Thesaurus parameter: "%s"`      |
+
+**Validated list, not just the incoming directives**: real PG's
+`AlterTSDictionary` calls `verify_dictoptions` on the *post-merge*
+`dictoptions` list, not the statement's raw directives — a bare (delete-only)
+directive naming a key that was never real is never re-added to the merged
+list (`if (defel->arg)`), so it never reaches validation and is a silent
+no-op, not an error. `catalog.AlterTSDictOptions` (`internal/catalog/
+catalog.go`) mirrors this exactly: validation runs after the remove/re-add
+merge loop builds the final `opts` slice, before it's serialized and stored.
+
+**Landed**:
+
+- `internal/catalog/catalog.go`: new `tsDictTemplateOptionSpec` (the table
+  above), `ValidateTSDictOptions(tmplName string, opts []parser.TSDictOption)
+  error` (checks each option's key against the template's allowed set via
+  `slices.Contains`, returning the exact PG message text on the first miss;
+  a no-op for any `tmplName` not in the map, since CREATE/ALTER already
+  reject an unresolved template name earlier), and
+  `builtinTSTemplateNameForOID` (a 4-entry reverse lookup of
+  `BuiltinTSTemplateOID`, needed because `AlterTSDictOptions` only has the
+  dictionary's already-stored `Template` OID, not the name given at CREATE
+  time). `AlterTSDictOptions` calls `ValidateTSDictOptions` on the merged
+  `opts` list right before persisting; a validation failure returns without
+  mutating `target.InitOption` (the mutation runs strictly after the check).
+- `internal/executor/operators_ddl.go`: the CREATE TEXT SEARCH DICTIONARY
+  case now calls `catalog.ValidateTSDictOptions(tmplName, s.TSDictOptions)`
+  right after resolving `templOID`, returning `&ExecError{Code: "22023"}` on
+  failure. `execAlterTSDict`'s `"options"` case maps `AlterTSDictOptions`'s
+  error to `22023` when the message contains `"unrecognized"` (the
+  validation path) and keeps the pre-existing `42704` for the "dictionary
+  does not exist" lookup miss — following this file's own `execAlterDomain`
+  precedent (`RenameDomainConstraint`'s `strings.Contains(err.Error(), ...)`
+  dispatch) rather than introducing a typed catalog error, since `catalog`
+  cannot import the executor package's `ExecError` type.
+
+**Tests**: `internal/executor/tsdict_option_validation_test.go`'s new
+`TestCreateTSDictOptionValidation` (table-driven — valid/invalid option for
+each of the four templates, asserting both the `22023` code and the exact PG
+message text) and `TestAlterTSDictOptionValidation` (a rejected ALTER leaves
+`InitOption` unchanged; a bare delete-only directive for a never-set,
+unrecognized key is confirmed to be a silent no-op, not an error, matching
+the `if (defel->arg)` merge-order requirement above).
+
+**Still deferred**: `OWNER TO` remains a no-op (unchanged, unrelated to this
+follow-up). No further known gap in this bucket.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
+./internal/catalog/... ./internal/parser/... ./internal/server/...
+./internal/initdb/... ./internal/wal/...` PASS (no regressions);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33).
