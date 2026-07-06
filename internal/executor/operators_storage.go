@@ -1929,6 +1929,15 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			}
 		}
 
+		// Domain NOT NULL / CHECK constraint enforcement for domain-typed
+		// columns (M0122-0005). Deferred for partitioned tables until after
+		// routing, matching the NOT NULL check above.
+		if !isPartitioned {
+			if err := checkDomainConstraintsForRow(o.ctx, cols, row); err != nil {
+				return nil, err
+			}
+		}
+
 		// WITH CHECK OPTION enforcement: the INSERT's original target was a
 		// CHECK OPTION view rewritten onto Table. M0119-0004 slice-365 follow-up.
 		if o.plan.ViewCheckQual != nil {
@@ -2007,6 +2016,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 						Detail:  formatRowForDetail(partTable.Columns, partRow),
 					}
 				}
+			}
+			// Domain NOT NULL / CHECK constraint enforcement at the leaf
+			// partition level (PG names the child table). M0122-0005.
+			if err := checkDomainConstraintsForRow(o.ctx, partTable.Columns, partRow); err != nil {
+				return nil, err
 			}
 			// Recompute generated columns using partition child's schema.
 			_ = computeGeneratedColumns(partTable.Columns, partRow)

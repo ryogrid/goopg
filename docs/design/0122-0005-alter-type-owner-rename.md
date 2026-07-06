@@ -682,3 +682,103 @@ still lost on restart, mirroring the gap the range-type rename/owner-restart
 follow-up closed for that type but which this loop did not extend to domains
 (separate, smaller follow-up: mirror `RecordKindAlterRangeTypeRename`/`Owner`
 (117/118) for domains at kinds 121+).
+
+## Follow-up: domain NOT NULL / CHECK enforcement on INSERT (2026-07-06, later loop)
+
+**Gap:** the previous follow-up's newly-discovered item — a domain's `NOT
+NULL`/`CHECK` constraints were never enforced against a table column simply
+*declared* with that domain type. The existing enforcement (`expr.go`'s
+`CastExpr` arm) only fired for an explicit `::domain` cast, and only handled
+the `CHECK (VALUE IN (...))` fast-path form; a generic predicate like `CHECK
+(VALUE > 0)` was never evaluated anywhere, on any path.
+
+**Fix:** new `checkDomainConstraintsForRow(ctx, cols, row)`
+(`internal/executor/operators_fk.go`, next to the existing table-level
+`checkConstraints`). For every column with `Column.DeclaredTypeName != ""`
+(a domain-typed column), it looks the domain up and:
+
+- raises `23502` (`"domain %s does not allow null values"`, matching
+  `domains.c`'s `domain_check_input` wording) when the value is NULL and
+  `dom.NotNull` is set;
+- for each `dom.Checks` entry, either runs the existing string-membership
+  fast path (`ck.InValues`, populated for the `VALUE IN (...)` shortcut), or
+  — new — evaluates the constraint's raw predicate text generically via
+  `evalDomainCheckExpr`, which mirrors `checkConstraints`' own mini-query
+  trick: build `SELECT (<ck.Expr>) FROM (VALUES (val::basetype)) AS
+  _chk(value)` and run it through the full parse/plan/build/`Open`/`Next`
+  executor stack. This works because a domain CHECK's only column reference
+  is the `VALUE` placeholder, which the lexer case-folds to the plain
+  identifier `value` on parse (see `renderDomainCheckPredicate`'s comment in
+  `operators_ddl.go`) — exactly the synthetic column name the mini-query
+  binds, so no VALUE-specific rewriting is needed at evaluation time (only
+  at pg_dump deparse time, which is what `renderDomainCheckPredicate`/
+  `upcaseDomainValuePlaceholder` are for). Parse/plan/build failures are
+  treated as a pass, matching `checkConstraints`' existing leniency.
+
+Wired into `insertOp.Next()` (`internal/executor/operators_storage.go`) at
+the two places the existing table-level NOT NULL check already lives: the
+non-partitioned path (gated `!isPartitioned`) and the partitioned leaf path
+(after `remapRowForPartition`, alongside the leaf-level NOT NULL check).
+Domain error messages don't name the table, so — unlike the parent/leaf NOT
+NULL wording split — no partition-aware message variant was needed; the
+check runs once, at the leaf's resolved columns.
+
+**Bug found and fixed while building this:** both the pre-existing cast-time
+enforcement (`expr.go`) and this change's first draft stringified the value
+for `ck.InValues` comparison with `Datum.StringValue()`, which only extracts
+`KindString`'s `Buf` payload. For a `KindInt` datum — e.g. `CHECK (VALUE IN
+(1,2,3))` on a plain `int` domain — `StringValue()` silently returns `""`,
+so the membership test compared an empty label against `"1"`/`"2"`/`"3"`
+and rejected *every* value, including valid ones. The only pre-existing test
+of the `IN (...)` form (`TestDomainCheckConstraintEnforced`,
+`enum_seqscan_test.go`) happened to use an enum-backed domain, whose
+`Kind == KindEnum` branch worked correctly, so this was never caught. Both
+call sites now use `Datum.Format()`, which renders every `Kind`'s canonical
+text form (including `KindEnum`, making the old special-case unnecessary —
+dropped).
+
+Verified against a real running server: all three of the repro statements
+from the previous follow-up now behave correctly —
+
+```sql
+CREATE DOMAIN nn_int AS int NOT NULL;
+CREATE TABLE t_nn (p nn_int);
+INSERT INTO t_nn VALUES (NULL);   -- ERROR: domain nn_int does not allow null values
+
+CREATE DOMAIN pos_int AS int CHECK (VALUE > 0);
+CREATE TABLE t_pos (p pos_int);
+INSERT INTO t_pos VALUES (-5);    -- ERROR: value for domain pos_int violates check constraint "pos_int_check"
+
+CREATE DOMAIN small_num AS int CHECK (VALUE IN (1,2,3));
+CREATE TABLE t_small (p small_num);
+INSERT INTO t_small VALUES (9);   -- ERROR: value for domain small_num violates check constraint "small_num_check"
+```
+
+— while valid values (`5`, `2`) continue to insert successfully.
+
+Tests: `internal/executor/domain_column_constraint_test.go`'s
+`TestDomainColumnNotNullEnforced`/`TestDomainColumnGenericCheckEnforced`/
+`TestDomainColumnInCheckEnforced` (new); `TestDomainCheckConstraintEnforced`
+(`enum_seqscan_test.go`, pre-existing) re-verified green after the
+`StringValue()`→`Format()` fix. Gates: `go build ./...` clean; `go test
+./internal/executor/... ./internal/catalog/... ./internal/planner/...
+./internal/parser/...` PASS (no regressions); `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); manual verification against a real running server
+(above).
+
+**Deferred:** UPDATE does not call `checkDomainConstraintsForRow` at all —
+verified live, `UPDATE t_pos SET p = -1` silently succeeds. This is because
+**UPDATE in goopg enforces no table-level NOT NULL or CHECK constraints at
+all**, not just domain ones (`checkConstraints(` and the NOT NULL error
+message have call sites only in `insertOp.Next`, none in `updateOp.Next`/
+`updateWithFrom`/`upsertOp.applyUpdate`) — a materially larger, pre-existing,
+cross-cutting gap unrelated to domains specifically, out of scope for this
+follow-up. Recorded in the deferral ledger as a fresh item with two resume
+points: (1) general UPDATE constraint enforcement (add the same NOT NULL +
+`checkConstraints` + `checkDomainConstraintsForRow` sequence to `updateOp`,
+mirroring `insertOp.Next`'s ordering; PG oracle: `execMain.c`'s
+`ExecConstraints` is called identically from both `ExecInsert` and
+`ExecUpdateAct`, so upstream treats these symmetrically), then (2) once (1)
+lands, thread the same two calls into `operators_upsert.go`'s
+`applyInsert`/`applyUpdate` (the `ON CONFLICT DO UPDATE` path bypasses
+`insertOp`/`updateOp` entirely).

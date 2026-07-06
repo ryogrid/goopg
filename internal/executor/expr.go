@@ -820,13 +820,11 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if ctx != nil && ctx.Catalog != nil {
 			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 				if dom, isDomain := im.LookupDomain(x.TargetType); isDomain {
-					// Get the string label of the value being cast.
-					var label string
-					if result.Kind == KindEnum {
-						label = string(result.Buf)
-					} else {
-						label = result.StringValue()
-					}
+					// Get the string label of the value being cast. Format()
+					// (not StringValue(), which only extracts KindString's Buf
+					// payload) renders every Kind's canonical text form, e.g.
+					// KindInt's Int field as a decimal string. M0122-0005.
+					label := result.Format()
 					for _, ck := range dom.Checks {
 						if len(ck.InValues) == 0 {
 							continue
