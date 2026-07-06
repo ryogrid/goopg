@@ -240,6 +240,63 @@ func TestRelaclTextGrantOption(t *testing.T) {
 	}
 }
 
+// TestRelaclTextGrantor pins the grantor-tracking fix (M0119-0004-ACLHEAP):
+// GrantTablePrivilegeAs records the actual role that executed the GRANT as
+// the aclitem's trailing "/grantor" component instead of always hardcoding
+// the object owner. This is the real, reachable PostgreSQL divergence path —
+// a WITH GRANT OPTION delegation chain, not the no-op GRANTED BY clause —
+// verified against real PG 18.3: an intermediate grantee who received WITH
+// GRANT OPTION and grants onward produces an aclitem whose grantor is that
+// intermediate role (e.g. "charlie=r/bob"), which pg_dump's buildACLCommands
+// (dumputils.c) wraps in `SET SESSION AUTHORIZATION bob; GRANT ...; RESET
+// SESSION AUTHORIZATION;`.
+func TestRelaclTextGrantor(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16800
+
+	// GrantTablePrivilegeWithGrantOption (no explicit grantor) keeps the
+	// pre-existing default: the owner.
+	c.GrantTablePrivilegeWithGrantOption(relOID, "bob", "SELECT", true)
+	want := "{postgres=arwdDxtm/postgres,bob=r*/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after default-grantor GRANT = %q; want %q", got, want)
+	}
+
+	// bob (holding SELECT WITH GRANT OPTION) grants onward to charlie: the new
+	// aclitem's grantor is bob, not the owner.
+	c.GrantTablePrivilegeAs(relOID, "charlie", "SELECT", false, "bob")
+	want = "{postgres=arwdDxtm/postgres,bob=r*/postgres,charlie=r/bob}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after delegated GRANT = %q; want %q", got, want)
+	}
+
+	// An empty grantor argument falls back to the owner (the zero-value/
+	// unspecified case every non-grantor-aware caller passes implicitly via
+	// GrantTablePrivilegeWithGrantOption).
+	c.GrantTablePrivilegeAs(relOID, "dave", "SELECT", false, "")
+	want = "{postgres=arwdDxtm/postgres,bob=r*/postgres,charlie=r/bob,dave=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after empty-grantor GRANT = %q; want %q", got, want)
+	}
+
+	// A full REVOKE of charlie's only privilege drops its grantor entry too —
+	// re-granting charlie afterward must not resurrect the stale "bob" grantor.
+	c.RevokeTablePrivilege(relOID, "charlie", "SELECT")
+	c.GrantTablePrivilege(relOID, "charlie", "INSERT")
+	want = "{postgres=arwdDxtm/postgres,bob=r*/postgres,dave=r/postgres,charlie=a/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after revoke+re-grant of charlie = %q; want %q (grantor reset to owner)", got, want)
+	}
+
+	// A mixed-case grantor renders with its original spelling preserved and
+	// quoted like any other role name (DU-002 slice 337/336).
+	c.GrantTablePrivilegeAs(relOID, "erin", "SELECT", false, "MixedGrantor")
+	want = "{postgres=arwdDxtm/postgres,bob=r*/postgres,dave=r/postgres,charlie=a/postgres,erin=r/MixedGrantor}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl with mixed-case grantor = %q; want %q", got, want)
+	}
+}
+
 // TestRelaclTextPublic pins the PUBLIC pseudo-role projection that lets a
 // GRANT … TO PUBLIC round-trip through pg_dump (DU-002 slice 334). PostgreSQL
 // stores a grant to PUBLIC with an empty grantee in the aclitem

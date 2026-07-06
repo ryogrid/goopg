@@ -1853,6 +1853,12 @@ type Catalog interface {
 	// letter with a trailing `*` and pg_dump re-emits the WITH GRANT OPTION
 	// clause. DU-002 slice 332.
 	GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool)
+	// GrantTablePrivilegeAs is GrantTablePrivilegeWithGrantOption plus an
+	// explicit grantor role name, recorded as the aclitem's true "/grantor"
+	// component (default "postgres", the object owner, when grantor is empty)
+	// instead of always attributing the grant to the owner. M0119-0004-ACLHEAP
+	// (grantor half).
+	GrantTablePrivilegeAs(relOID uint32, role, priv string, withGrantOption bool, grantor string)
 	// RevokeTablePrivilege removes a single privilege (priv, upper-cased keyword)
 	// for role on relOID from the ACL store. When the role's privilege set
 	// becomes empty its entry is dropped entirely, so the materialized relacl no
@@ -2265,6 +2271,25 @@ type InMemory struct {
 	// superuser bypasses this map entirely; an empty/absent entry means "no
 	// privilege granted". M0118-0008; grant-option DU-002 slice 332.
 	tableACLs map[uint32]map[string]map[string]bool
+
+	// tableACLGrantor records, per relOID, the grantor role that performed each
+	// non-owner grantee's most recent GRANT — the real PostgreSQL aclitem's
+	// trailing "/grantor" component, which goopg otherwise hardcodes to the
+	// object owner ("postgres") in relaclTextLockedFor. A role reachable only
+	// via SET ROLE / SET SESSION AUTHORIZATION (connTx.NonSuperuserRole) can
+	// legitimately GRANT a privilege it holds WITH GRANT OPTION to a further
+	// grantee, and real PG's pg_dump wraps that grant in `SET SESSION
+	// AUTHORIZATION <grantor>; GRANT ...; RESET SESSION AUTHORIZATION;`
+	// (dumputils.c buildACLCommands) once the aclitem's grantor differs from
+	// the owner — but that only round-trips if goopg's own relacl string
+	// carries the true grantor to begin with. Keyed like tableACLs (lower-cased
+	// role name); an absent entry means "granted by the object owner", the
+	// pre-existing default. Does not model PostgreSQL's full grant-option
+	// delegation chain (select_best_grantor, acl.c) — the recorded grantor is
+	// simply whichever role executed the GRANT statement, not the specific
+	// upstream role whose grant option was exercised. M0119-0004-ACLHEAP
+	// (grantor half).
+	tableACLGrantor map[uint32]map[string]string
 
 	// tableACLOrder records, per relOID, the order in which non-owner grantee
 	// roles first appeared in a GRANT — PostgreSQL appends a new grantee's
@@ -3148,6 +3173,7 @@ func NewInMemory() *InMemory {
 		roleAttrs:          make(map[string]*RoleAttrs),
 		tempNamespaces:     make(map[string]uint32),
 		tableACLs:          make(map[uint32]map[string]map[string]bool),
+		tableACLGrantor:    make(map[uint32]map[string]string),
 		tableACLOrder:      make(map[uint32][]string),
 		roleACLDisplay:     make(map[string]string),
 		relACLEmptied:      make(map[uint32]bool),
@@ -12820,11 +12846,30 @@ func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
 // (matching PostgreSQL, which retains the grant option until REVOKE GRANT
 // OPTION FOR). See the Catalog interface doc. DU-002 slice 332.
 func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool) {
+	c.GrantTablePrivilegeAs(relOID, role, priv, withGrantOption, aclOwnerRole)
+}
+
+// GrantTablePrivilegeAs is GrantTablePrivilegeWithGrantOption plus an explicit
+// grantor — the role that executed the GRANT (aclOwnerRole/"postgres" for the
+// common owner/superuser case, or a SET ROLE-impersonated role's name).
+// Recorded in tableACLGrantor so relaclTextLockedFor renders the true
+// "grantee=privs/grantor" aclitem instead of hardcoding the owner. A later
+// GRANT to the same grantee (with any grantor, including the default) always
+// overwrites the stored grantor — matching PostgreSQL, where re-granting
+// updates the existing aclitem's grantor to whoever issued that GRANT.
+// M0119-0004-ACLHEAP (grantor half).
+func (c *InMemory) GrantTablePrivilegeAs(relOID uint32, role, priv string, withGrantOption bool, grantor string) {
 	display := strings.TrimSpace(role)
 	role = strings.ToLower(display)
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
 		return
+	}
+	grantorDisplay := strings.TrimSpace(grantor)
+	grantor = strings.ToLower(grantorDisplay)
+	if grantor == "" {
+		grantor = aclOwnerRole
+		grantorDisplay = aclOwnerRole
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -12834,6 +12879,9 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 	// all-lowercase case needs no override. DU-002 slice 337.
 	if display != role {
 		c.roleACLDisplay[role] = display
+	}
+	if grantorDisplay != grantor {
+		c.roleACLDisplay[grantor] = grantorDisplay
 	}
 	// A GRANT to the owner re-materializes an explicit owner aclitem, so the
 	// owner is no longer the zero-privilege (absent) entry an earlier owner-side
@@ -12865,6 +12913,17 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 		}
 	}
 	privs[priv] = privs[priv] || withGrantOption
+	// Every GRANT to this grantee — even a repeat one carrying the default
+	// owner grantor — restamps the grantor: PostgreSQL's aclupdate updates an
+	// existing aclitem's grantor to whoever issued the latest GRANT.
+	if role != aclOwnerRole {
+		grantors := c.tableACLGrantor[relOID]
+		if grantors == nil {
+			grantors = make(map[string]string)
+			c.tableACLGrantor[relOID] = grantors
+		}
+		grantors[role] = grantor
+	}
 }
 
 // dropTableACLOrderRole removes role from relOID's grant-order list, keeping the
@@ -12911,6 +12970,12 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	if len(privs) == 0 {
 		delete(byRole, role)
 		c.dropTableACLOrderRole(relOID, role)
+		if grantors := c.tableACLGrantor[relOID]; grantors != nil {
+			delete(grantors, role)
+			if len(grantors) == 0 {
+				delete(c.tableACLGrantor, relOID)
+			}
+		}
 		if role == aclOwnerRole {
 			// The owner's implicit default aclitem has been fully revoked. Record
 			// this regardless of whether other grantees survive: an object whose
@@ -13080,6 +13145,7 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
+	delete(c.tableACLGrantor, relOID)
 	delete(c.tableACLOrder, relOID)
 	delete(c.relACLEmptied, relOID)
 	delete(c.relACLOwnerRevoked, relOID)
@@ -13434,6 +13500,17 @@ func (c *InMemory) relaclTextLocked(relOID uint32) string {
 	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString)
 }
 
+// RelaclText renders the materialized pg_class.relacl text for the table
+// identified by relOID, or "" (SQL NULL) when no privileges have been granted
+// away. Exported for callers outside the virtual pg_class row builder (which
+// calls relaclTextLocked directly while already holding c.mu), such as tests
+// that need to inspect relacl without executing a full pg_class SELECT.
+func (c *InMemory) RelaclText(relOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLocked(relOID)
+}
+
 // relaclTextLockedSeq is relaclTextLocked for a sequence (relkind 'S'): it
 // renders with the sequence privilege order (USAGE/SELECT/UPDATE) and the
 // sequence owner-default string "rwU", which is what pg_dump diffs against via
@@ -13659,7 +13736,14 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		// parser stops at the first unsafe char and mis-reads the grantee. The
 		// empty PUBLIC grantee and the all-alnum common case are returned
 		// unchanged. DU-002 slice 336.
-		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
+		grantor := aclOwnerRole
+		if g, ok := c.tableACLGrantor[relOID][role]; ok && g != "" {
+			grantor = g
+		}
+		if disp, ok := c.roleACLDisplay[grantor]; ok {
+			grantor = disp
+		}
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/"+aclQuoteName(grantor))
 	}
 	return "{" + strings.Join(items, ",") + "}"
 }

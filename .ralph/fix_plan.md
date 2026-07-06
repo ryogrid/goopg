@@ -189,6 +189,34 @@ M0110-0001 pg_dump 002-010 broader per-database catalog-isolation blocker
 (milestone-scale — see that row's 2026-07-06 resume point) or another
 narrower DU-002 slice surfaced while probing it.
 
+**2026-07-06 (later loop):** picked up the "`GRANT ... WITH GRANT OPTION
+GRANTED BY <role>` — probe against real PG's pg_dump" candidate the
+2026-07-06 slice-436 row named but didn't investigate. Landed
+object-privilege ACL grantor tracking: `pg_class.relacl` (and every sibling
+sharing `relaclTextLockedFor` — nspacl/proacl/typacl/datacl/parameter/srvacl/
+fdwacl) previously hardcoded every aclitem's grantor to the object owner,
+which is a real, reachable divergence from PostgreSQL via a `WITH GRANT
+OPTION` delegation chain (`SET SESSION AUTHORIZATION bob; GRANT ... TO
+charlie` → real PG's `charlie=r/bob`), not the SQL-standard `GRANTED BY`
+clause itself (empirically confirmed real PG restricts that clause to naming
+only the current user, rejecting anything else with `0A000`/"grantor must be
+current user" — goopg now matches this exactly too). New
+`catalog.tableACLGrantor`/`GrantTablePrivilegeAs`; `grant_ddl.go`'s
+`tryRecordTableGrant` stamps `connTx.NonSuperuserRole` as grantor. Live A/B
+verified against real, unmodified PostgreSQL 18.3 `psql`/`pg_dump` — no
+goopg-side dump-rendering change was needed, since `pg_dump`'s
+`buildACLCommands` reconstructs the `SET SESSION AUTHORIZATION` wrap
+client-side from the raw relacl string alone. See
+`docs/design/0119-0004-table-acl-grantor-tracking.md` and the matching
+2026-07-06 ledger row. **Deferred (ledger row):** column-level `attacl`
+grantor tracking (separate `attrACLs` store); `TYPE`/`DATABASE`/`PARAMETER`
+ACL grants (executor-routed, separate call sites from `grant_ddl.go`) still
+stamp the default owner grantor even under `SET ROLE`; no grant-option
+delegation-chain resolution (`select_best_grantor`). Next candidate: pick up
+one of those two small mechanical follow-ups (attacl or TYPE/DATABASE/
+PARAMETER grantor wiring — same shape as this loop's fix), or resume the
+M0110-0001 multi-database isolation survey above.
+
 ## Archived — complete (see `completed_milestones/completed_fix_plan_009.md`)
 
 M0117 (CLOG ↔ PostgreSQL subsystem alignment), M0118 (Upstream Isolation Spec
