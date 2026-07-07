@@ -3143,7 +3143,7 @@
    "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
    "task_id": "M0110-0001",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "RESET (...) left as the pre-existing no-op (pg_dump never emits it)"
    ],
@@ -3158,7 +3158,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:7217 ALTER COLUMN RESET not parsed"
+   "code_audit": "RESOLVED 2026-07-08: AlterTableAlterColumnReset action kind added (internal/parser/ast.go, internal/parser/ddl.go RESET (opt, …) branch reusing parseColumnSetOptions) + executor case in internal/executor/operators_ddl.go merging named keys out of catalog.Column.Options (mirrors ATExecResetOptions) with the same pg_attribute heap-resync path SET already uses. Tests: TestParseAlterTableAlterColumnReset (internal/parser/ddl_test.go), TestAlterColumnResetOptionsClearsNamedEntriesOnly (internal/executor/operators_ddl_alter_column_reset_test.go). Design: docs/design/0110-0001-pg-dump-tap-port.md 2026-07-08 follow-up."
   },
   {
    "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",

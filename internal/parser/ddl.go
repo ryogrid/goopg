@@ -8548,6 +8548,21 @@ func (p *parser) parseAlter() (Stmt, error) {
 				return stmt, nil
 			}
 		}
+		// RESET (opt, …) — clear the named per-column attribute options set by
+		// the SET (...) form above. Unlike SET, RESET has no STORAGE/COMPRESSION/
+		// STATISTICS/DEFAULT/NOT NULL counterparts in upstream grammar — only the
+		// parenthesized attribute-option list is valid here.
+		if p.acceptIdentKeyword("reset") || p.acceptKeyword(KwReset) {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+				opts := p.parseColumnSetOptions()
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableAlterColumnReset,
+					ColumnName: colName,
+					SetOptions: opts,
+				})
+				return stmt, nil
+			}
+		}
 		// DROP DEFAULT / DROP NOT NULL — clear the column's DEFAULT expression or
 		// NOT NULL flag. Other DROP forms (DROP IDENTITY, …) fall through to the
 		// no-op consume below for now. DU-002 slices 269, 270.

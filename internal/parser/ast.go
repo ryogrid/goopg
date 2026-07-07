@@ -2895,6 +2895,12 @@ const (
 	// For heap tables this is a no-op in goopg v0; for indexes it raises
 	// an appropriate error (M0097-0023 btree_index parity).
 	AlterTableAlterColumnSet
+	// AlterTableAlterColumnReset — `ALTER COLUMN name RESET (options)`.
+	// Clears the named per-column attribute options (e.g. n_distinct) from
+	// catalog.Column.Options; unnamed options are left untouched. Mirrors
+	// AlterTableAlterColumnSet's dump-fidelity-only scope. SetOptions holds
+	// the option names to clear.
+	AlterTableAlterColumnReset
 	// AlterTableAlterColumnType — `ALTER COLUMN name TYPE newtype`.
 	// Changes the column type in the catalog and rewrites existing heap rows
 	// to re-encode them with the new type. M0097-0022.
@@ -3169,7 +3175,9 @@ type AlterTableAction struct {
 	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
 	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").
 	// Recorded on catalog.Column.Options so pg_dump re-emits the clause via
-	// pg_attribute.attoptions. DU-002 slice 185.
+	// pg_attribute.attoptions. DU-002 slice 185. Also holds the bare option
+	// names to clear for AlterTableAlterColumnReset (`ALTER COLUMN name RESET
+	// (opt, …)`).
 	SetOptions []string
 	// With holds the table-level storage parameters for AlterTableSetReloptions
 	// (name→value) and the option names for AlterTableResetReloptions (names as

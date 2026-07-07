@@ -3394,6 +3394,34 @@ mirroring M0119's ledger `status` column.
       FUNCTION work — confirmed-open at ddl.go per `unimplemented_feat.json`),
       planner/jit GUC stubs, plus the ALTER FUNCTION `SET`-value comma-list
       gap this loop's own follow-up deferral ledger row just recorded.
+      **`ALTER TABLE ... ALTER COLUMN col RESET (...)` FIXED (2026-07-08,
+      later loop):** new `AlterTableAlterColumnReset` action kind
+      (`internal/parser/ast.go`), parsed in `internal/parser/ddl.go`'s ALTER
+      COLUMN dispatch right after the existing `SET (opt=value, …)` branch,
+      reusing `parseColumnSetOptions` (already accepts bare names, exactly
+      RESET's grammar). Executor case (`internal/executor/operators_ddl.go`)
+      merges the named keys OUT of `catalog.Column.Options` (mirrors upstream
+      `ATExecResetOptions` — a partial clear, not a wholesale wipe), reusing
+      the same pg_attribute heap-resync path the `SET` case already uses so
+      pg_dump observes the cleared `attoptions` immediately. Also extended the
+      "not supported for indexes" `0A000` guard to cover `RESET` (previously
+      only `SET`). Tests: `TestParseAlterTableAlterColumnReset`
+      (`internal/parser/ddl_test.go`),
+      `TestAlterColumnResetOptionsClearsNamedEntriesOnly`
+      (`internal/executor/operators_ddl_alter_column_reset_test.go`,
+      confirmed non-vacuous via `git stash`). `unimplemented_feat.json`'s
+      matching entry flipped to `resolved`. Design:
+      `docs/design/0110-0001-pg-dump-tap-port.md` new "Follow-up:
+      `ALTER TABLE ... ALTER COLUMN col RESET (...)`" section;
+      `docs/design/README.md` row updated. Gates: `go build ./...` clean;
+      `go test ./internal/parser/... ./internal/executor/...
+      ./internal/planner/... ./internal/catalog/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **Still open** (this bucket, ~10 remaining
+      items): CREATE/DROP DATABASE full DDL, REINDEX physical rebuild,
+      tablespaces, planner/jit GUC stubs, the ALTER FUNCTION `SET`-value
+      comma-list gap.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
