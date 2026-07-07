@@ -55,12 +55,26 @@ type Routine struct {
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	IsReturnForm    bool   // PG14 RETURN expr body (stored as "SELECT expr" internally)
 	KindChar        string // prokind: 'f'=function, 'p'=procedure, 'w'=window, 'a'=aggregate
+	// Owner is pg_proc.proowner (role OID), settable via ALTER FUNCTION/
+	// PROCEDURE/ROUTINE ... OWNER TO. 0 means "unset, defaults to the
+	// bootstrap superuser" — see OwnerOrDefault. M0097-0150.
+	Owner uint32
 
 	// Dependency tracking populated at CREATE FUNCTION time for information_schema views.
 	SequenceDeps    []RoutineSeqDep   // sequences referenced via nextval/currval
 	RoutineCallOIDs []uint32          // OIDs of routines called in body/defaults
 	TableDeps       []RoutineTableRef // tables referenced in FROM clauses
 	ColumnDeps      []RoutineColRef   // columns referenced in SELECT/WHERE clauses
+}
+
+// OwnerOrDefault returns r.Owner, falling back to the bootstrap superuser OID
+// (10) for routines created before ALTER FUNCTION ... OWNER TO ever ran.
+// Mirrors UserAggregate.OwnerOrDefault. M0097-0150.
+func (r *Routine) OwnerOrDefault() uint32 {
+	if r.Owner == 0 {
+		return 10
+	}
+	return r.Owner
 }
 
 // RoutineSeqDep records a sequence dependency of a routine.
@@ -663,6 +677,70 @@ func (rs *Routines) RenameRoutine(r *Routine, newName string) error {
 	rs.byKey[newKey] = r
 	rs.byName[newNK] = append(rs.byName[newNK], newKey)
 	return nil
+}
+
+// SetSchema changes the Schema of a routine (ALTER FUNCTION/PROCEDURE/
+// ROUTINE ... SET SCHEMA). Schema is part of both indices' keys, so this
+// re-keys byKey/byName exactly like RenameRoutine, just on Schema instead of
+// Name. M0097-0150.
+func (rs *Routines) SetSchema(r *Routine, newSchema string) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	oldKey := routineKey(r.Schema, r.Name, r.Signature())
+	if _, ok := rs.byKey[oldKey]; !ok {
+		return fmt.Errorf("routine %s.%s not found in registry", r.Schema, r.Name)
+	}
+	oldNK := nameKey(r.Schema, r.Name)
+	delete(rs.byKey, oldKey)
+	oldList := rs.byName[oldNK]
+	for i, k := range oldList {
+		if k == oldKey {
+			rs.byName[oldNK] = append(oldList[:i], oldList[i+1:]...)
+			break
+		}
+	}
+	if len(rs.byName[oldNK]) == 0 {
+		delete(rs.byName, oldNK)
+	}
+	r.Schema = newSchema
+	newKey := routineKey(r.Schema, r.Name, r.Signature())
+	newNK := nameKey(r.Schema, r.Name)
+	rs.byKey[newKey] = r
+	rs.byName[newNK] = append(rs.byName[newNK], newKey)
+	return nil
+}
+
+// SetSchemaByOIDDuringRecovery is the recovery counterpart to SetSchema used
+// for replaying an ALTER FUNCTION ... SET SCHEMA record. Mirrors
+// RenameByOIDDuringRecovery: a missing OID is a silent no-op. M0097-0150.
+func (rs *Routines) SetSchemaByOIDDuringRecovery(oid uint32, newSchema string) {
+	rs.mu.RLock()
+	var r *Routine
+	for _, cand := range rs.byKey {
+		if cand.OID == oid {
+			r = cand
+			break
+		}
+	}
+	rs.mu.RUnlock()
+	if r != nil {
+		_ = rs.SetSchema(r, newSchema)
+	}
+}
+
+// SetOwnerByOIDDuringRecovery is the recovery counterpart used for replaying
+// an ALTER FUNCTION/PROCEDURE/ROUTINE ... OWNER TO record. Owner is not part
+// of either index key, so this is a direct field write. Mirrors
+// SetFlagsByOIDDuringRecovery. M0097-0150.
+func (rs *Routines) SetOwnerByOIDDuringRecovery(oid, ownerOID uint32) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	for _, r := range rs.byKey {
+		if r.OID == oid {
+			r.Owner = ownerOID
+			return
+		}
+	}
 }
 
 func (rs *Routines) List() []*Routine {

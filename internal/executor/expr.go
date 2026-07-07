@@ -5404,21 +5404,54 @@ func evalIsFinite(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	}
 	d, err := evalExpr(x.Args[0], row, ctx)
-	if err != nil {
+	if err != nil || d.IsNull() {
 		return NullDatum, nil
 	}
-	return NewBoolDatum(!d.IsNull()), nil
+	return NewBoolDatum(true), nil
 }
 
-// evalJustifyInterval stubs justify_hours / justify_days / justify_interval.
-// These re-balance interval fields (e.g. 25 hours → 1 day + 1 hour). goopg
-// v0 does not yet track sub-day interval precision, so return the input as-is.
+// evalJustifyInterval implements justify_days()/justify_interval(): move
+// whole 30-day chunks out of the day field into the month field, mirroring
+// interval_justify_days/interval_justify_interval
+// (postgres/src/backend/utils/adt/timestamp.c). PG's justify_interval also
+// folds in interval_justify_hours (moving whole 24h chunks of the *time*
+// field into days) first, but goopg's v0 KindInterval Datum has no sub-day
+// field at all — it is always exactly zero — so that step is a no-op here
+// and justify_interval collapses to plain justify_days. justify_hours()
+// itself is therefore always the identity for goopg and is dispatched
+// straight to evalExpr by its caller instead of through this helper.
 // M0097-0004.
 func evalJustifyInterval(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 1 {
 		return NullDatum, nil
 	}
-	return evalExpr(x.Args[0], row, ctx)
+	d, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil || d.IsNull() || d.Kind != KindInterval {
+		return d, err
+	}
+	months, days := justifyIntervalDays(d.IntervalMonthsValue(), d.IntervalDaysValue())
+	return NewIntervalDatum(months, days), nil
+}
+
+// justifyIntervalDays is the pure month/day rebalancing core shared by
+// justify_days()/justify_interval() (evalJustifyInterval above): move whole
+// 30-day chunks out of days into months, then equalize the sign of both
+// fields — mirrors interval_justify_days/interval_justify_interval
+// (postgres/src/backend/utils/adt/timestamp.c) exactly since goopg's v0
+// interval has no time field for interval_justify_interval's extra step to
+// act on.
+func justifyIntervalDays(months, days int32) (int32, int32) {
+	wholeMonths := days / 30
+	days -= wholeMonths * 30
+	months += wholeMonths
+	if months > 0 && days < 0 {
+		days += 30
+		months--
+	} else if months < 0 && days > 0 {
+		days -= 30
+		months++
+	}
+	return months, days
 }
 
 // evalDateBin implements date_bin(step interval, source timestamp, origin timestamp).
@@ -6725,7 +6758,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalMakeTime(x, row, ctx)
 	case "isfinite":
 		return evalIsFinite(x, row, ctx)
-	case "justify_hours", "justify_days", "justify_interval":
+	case "justify_hours":
+		// goopg's KindInterval Datum has no sub-day field, so there is
+		// never anything to move from time into day — always identity.
+		if len(x.Args) != 1 {
+			return NullDatum, nil
+		}
+		return evalExpr(x.Args[0], row, ctx)
+	case "justify_days", "justify_interval":
 		return evalJustifyInterval(x, row, ctx)
 	case "date_bin":
 		return evalDateBin(x, row, ctx)

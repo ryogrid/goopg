@@ -604,6 +604,17 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 		return nil, conjuncts, nil
 	}
 
+	// TPC-H Q9's partsupp<->lineitem pair is connected by TWO
+	// equalities (ps_suppkey=l_suppkey AND ps_partkey=l_partkey);
+	// the DP loop above only ever wires ONE such edge into a
+	// join's canonical LeftKey/RightKey, leaving the other
+	// unattached anywhere in the winning tree. Attach any
+	// still-unused edge onto the lowest *Join that first
+	// co-locates both of its tables, using RAW (global, unremapped)
+	// key expressions — see attachUnusedCrossEdges's doc comment
+	// for why this coordinate choice matters.
+	attachUnusedCrossEdges(fullEntry.plan, g, edgeUsed)
+
 	// Build residual conjuncts. A conjunct is consumed only if the
 	// SPECIFIC edge that carries its predicate was used by the DP
 	// — checking by table-pair alone over‑consumes when two
@@ -639,6 +650,65 @@ func enumerateBushyPlans(g *joinGraph, conjuncts []Expr, relInfos []baseRelInfo,
 		}
 	}
 	return fullEntry.plan, residual, nil
+}
+
+// attachUnusedCrossEdges walks the winning bushy-DP tree bottom-up
+// and ANDs any equality edge that DP left unused (edgeUsed[i] ==
+// false) onto the lowest *Join node that first co-locates both of
+// the edge's two tables — i.e. the join whose Left/Right children
+// each contain exactly one side of the edge. See
+// enumerateBushyPlans's call site for the motivating TPC-H Q9 shape.
+//
+// The attached predicate is the edge's RAW, unremapped
+// `*BinaryOp` (`joinEdge.predicate`, still carrying the original
+// global FROM-order ColumnRef indices) rather than a copy remapped
+// into the Join's own local Left/Right subset coordinates (the
+// convention `LeftKey`/`RightKey` use). This is deliberate: a join
+// built here may later be folded into a `*MultiHashJoin` by
+// rewriteMultiWayChain, whose `collectMultiHashTables` already
+// expects any AND'd-on "extra" conjunct beyond the canonical
+// equality to be in that same global coordinate space (see its
+// `extraInScans`-guarded capture, added to handle exactly this
+// query shape). `collectCrossSideEquiKeys` (nl_index_join.go) is
+// taught a name-based fallback so the NestedLoopIndexJoin rewrite
+// can also consume a global-coordinate extra conjunct correctly.
+// Returns the subtree's table mask (bit i set ⇔ g.scans[i] is a
+// leaf of plan) so callers can recurse.
+func attachUnusedCrossEdges(plan Node, g *joinGraph, edgeUsed []bool) uint16 {
+	if plan == nil {
+		return 0
+	}
+	for i, s := range g.scans {
+		if s == plan {
+			return uint16(1) << i
+		}
+	}
+	j, ok := plan.(*Join)
+	if !ok {
+		return 0
+	}
+	leftMask := attachUnusedCrossEdges(j.Left, g, edgeUsed)
+	rightMask := attachUnusedCrossEdges(j.Right, g, edgeUsed)
+	for i := range g.edges {
+		if edgeUsed[i] {
+			continue
+		}
+		e := &g.edges[i]
+		lBit := uint16(1) << e.leftTable
+		rBit := uint16(1) << e.rightTable
+		spans := (leftMask&lBit != 0 && rightMask&rBit != 0) ||
+			(leftMask&rBit != 0 && rightMask&lBit != 0)
+		if !spans {
+			continue
+		}
+		if j.Predicate == nil {
+			j.Predicate = e.predicate
+		} else {
+			j.Predicate = &BinaryOp{pos: e.predicate.Pos(), Op: parser.OpAnd, Left: j.Predicate, Right: e.predicate}
+		}
+		edgeUsed[i] = true
+	}
+	return leftMask | rightMask
 }
 
 func buildCumOffsets(g *joinGraph) []int {
@@ -1594,7 +1664,68 @@ func remapByPosMap(e *Expr, posMap func(int) int) {
 		if x.Else != nil {
 			remapByPosMap(&x.Else, posMap)
 		}
+	case *ExistsExpr:
+		// Unlike InExpr, EXISTS/NOT EXISTS subqueries are never
+		// unnested into a join by this point (M0071-0009's Semi/Anti
+		// unnesting only fires for equality-correlated IN/=ANY
+		// shapes) — the inner Plan is evaluated in place at
+		// filter/leaf time with the outer row supplied via
+		// ctx.OuterRows, indexed by the correlated OuterColumnRef's
+		// Index. That Index was resolved against the PRE-rewrite
+		// (OID-sorted) outer schema; after the MultiHashJoin rewrite
+		// reorders columns, it must be translated through the same
+		// posMap or it silently reads the wrong outer column
+		// (AI-20260707-000712-005 / TPC-H Q21: read l_comment where
+		// l_suppkey was meant, producing a numeric-cast error on
+		// text).
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+	case *SubqueryExpr:
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
+	case *ArraySubqueryExpr:
+		remapOuterRefsInSubplan(x.Plan, 1, posMap)
 	}
+}
+
+// remapOuterRefsInSubplan walks a correlated subquery's inner plan
+// (ExistsExpr.Plan / SubqueryExpr.Plan / ArraySubqueryExpr.Plan) and
+// translates any OuterColumnRef whose Level places it at the scope
+// currently being remapped (depth) through posMap. depth starts at 1
+// for the subquery's immediate outer scope (the plan node that owns
+// the Filter/Project/Sort/Aggregate currently being remapped by
+// remapByPosMap) and increases by one for each further level of
+// subquery nesting encountered, matching the ctx.OuterRows stack
+// depth `Level` indexes against at evaluation time (see
+// executor/expr.go's OuterColumnRef case).
+//
+// remapByPosMap only rewrites the ColumnRef/BinaryOp/etc. skeleton of
+// the predicate/target it is given; it does not otherwise descend
+// into a correlated subquery's own plan tree, so without this an
+// EXISTS or scalar subquery referencing the outer row would silently
+// keep stale pre-MultiHashJoin-rewrite indices.
+func remapOuterRefsInSubplan(node Node, depth int, posMap func(int) int) {
+	if node == nil {
+		return
+	}
+	var visit func(Expr)
+	visit = func(e Expr) {
+		switch x := e.(type) {
+		case *OuterColumnRef:
+			if x.Level == depth {
+				x.Index = posMap(x.Index)
+			}
+		case *ExistsExpr:
+			remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+		case *SubqueryExpr:
+			remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+		case *ArraySubqueryExpr:
+			remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+		case *InExpr:
+			if x.Plan != nil {
+				remapOuterRefsInSubplan(x.Plan, depth+1, posMap)
+			}
+		}
+	}
+	walkPlanExprs(node, visit)
 }
 
 // buildMHJPosMap returns a position map from old (FROM‑order

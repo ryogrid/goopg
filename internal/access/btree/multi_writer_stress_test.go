@@ -37,7 +37,9 @@ func TestMultiWriterStress_M0055_Phase_C(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping multi-writer stress in short mode")
 	}
-	t.Skip("M0056-followup-multiwriter-flake: skipping pending root-cause; passes deterministically under sequential workload")
+	// M0056-followup-multiwriter-flake root cause found and fixed in
+	// M-NIGHTLY loop 13 (evictVictim's bufmap.Delete-before-flush race,
+	// storage/bufpool.go): un-skipped as this bug's regression guard.
 	bt, _, cleanup := newTestTree(t)
 	defer cleanup()
 	bt.ResetStats()

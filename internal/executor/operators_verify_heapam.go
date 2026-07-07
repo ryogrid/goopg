@@ -88,6 +88,21 @@ func (o *verifyHeapamOp) Open(ctx *Context) error {
 	}
 	tbl, ok := verifyHeapamResolveTable(argVal, im)
 	if !ok {
+		if argVal.Kind == KindInt {
+			if _, isToast := im.ToastParentTable(uint32(argVal.Int)); isToast {
+				// Synthetic TOAST relation OID (catalog.go's toastRelidOffset
+				// scheme): goopg exposes pg_toast_<oid> only as a pg_class/
+				// pg_dump join target with no real backing heap (see
+				// tableHasToastRelation's doc comment) — no value is ever
+				// actually stored there, so it is vacuously always a healthy,
+				// empty relation. Report no findings instead of erroring, so
+				// pg_amcheck's default whole-table walk (which checks every
+				// table's TOAST relation alongside the table itself) does not
+				// treat every table as corrupt just because its TOAST
+				// relation cannot be opened.
+				return nil
+			}
+		}
 		return &ExecError{Code: "42P01", Pos: o.plan.Pos(),
 			Message: "could not open relation: relation does not exist"}
 	}

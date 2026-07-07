@@ -222,9 +222,8 @@ func BuildDefaultRegistry() *Registry {
 	// and defaults mirror upstream's
 	// postgres/src/backend/utils/misc/guc_tables.c entries.
 	// PGC_SIGHUP -> ContextSigHup so a goopg reload (control-socket
-	// RELOAD) will be able to pick them up once the reload path
-	// observes the registry; today the reload is a no-op but the
-	// gating is in place.
+	// RELOAD, or SIGHUP) picks up a changed value on the running
+	// server via Registry.ApplyReloadEntries.
 	r.MustRegister(NewVariable(Variable{
 		Name: "checkpoint_timeout", Type: TypeInt, Unit: UnitS, BootVal: "300",
 		MinVal: 30, MaxVal: 86400,

@@ -227,6 +227,14 @@ func TestFunctionDDLRecoveryReplaysAlterAfterCreate(t *testing.T) {
 		_ = rt1.Close()
 		t.Fatalf("WAL.Append flags: %v", werr)
 	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterFunctionOwner(wantOID, 16400)); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append owner: %v", werr)
+	}
+	if _, _, werr := rt1.WAL.Append(wal.EncodeAlterFunctionSetSchema(wantOID, "app")); werr != nil {
+		_ = rt1.Close()
+		t.Fatalf("WAL.Append set-schema: %v", werr)
+	}
 	if ferr := rt1.WAL.FlushUpTo(rt1.WAL.WrittenLSN()); ferr != nil {
 		_ = rt1.Close()
 		t.Fatalf("FlushUpTo: %v", ferr)
@@ -244,7 +252,7 @@ func TestFunctionDDLRecoveryReplaysAlterAfterCreate(t *testing.T) {
 	rs := functionCatalog(t, rt2).Routines()
 	r := rs.LookupByOID(wantOID)
 	if r == nil {
-		t.Fatalf("after CREATE+RENAME+FLAGS replay, OID %d not found", wantOID)
+		t.Fatalf("after CREATE+RENAME+FLAGS+OWNER+SET SCHEMA replay, OID %d not found", wantOID)
 	}
 	if r.Name != "renamedfunc" {
 		t.Errorf("after replay, Name = %q, want \"renamedfunc\"", r.Name)
@@ -252,6 +260,15 @@ func TestFunctionDDLRecoveryReplaysAlterAfterCreate(t *testing.T) {
 	if r.Volatile != "i" || !r.SecurityDefiner || !r.Leakproof || !r.Strict {
 		t.Errorf("after replay, attrs = Volatile=%q SecurityDefiner=%v Leakproof=%v Strict=%v, want i/true/true/true",
 			r.Volatile, r.SecurityDefiner, r.Leakproof, r.Strict)
+	}
+	if r.Owner != 16400 {
+		t.Errorf("after replay, Owner = %d, want 16400", r.Owner)
+	}
+	if r.Schema != "app" {
+		t.Errorf("after replay, Schema = %q, want \"app\"", r.Schema)
+	}
+	if rs.LookupByOID(wantOID) != r {
+		t.Fatal("LookupByOID should still resolve the same routine pointer after SET SCHEMA re-keying")
 	}
 }
 

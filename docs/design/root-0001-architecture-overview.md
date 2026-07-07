@@ -96,6 +96,26 @@ Detailed wire format and authentication for that socket are deferred to a
 later design doc; for the v0 scaffold the subcommand stubs only document
 the flag surface.
 
+**`goopg restart` (2026-07-08):** since v0's server always runs in the
+foreground (no postmaster fork/daemonize — see the constraint list above),
+`restart` cannot spawn a background replacement the way `pg_ctl restart`
+does. `runRestart` (`cmd/goopg/main.go`) instead stops whatever instance
+owns `-D`'s `postmaster.pid` (skipping the stop step entirely if the pidfile
+is absent or stale — no live process at that PID), waits for it to exit,
+then hands off to the same startup path `goopg start` uses, so the CLI
+process itself becomes the new server. `-config`/`-hba` keep `goopg
+start`'s existing `<datadir>/postgresql.conf` / `<datadir>/pg_hba.conf`
+auto-discovery; `-listen` additionally defaults to the stopped instance's
+own listen address (read from its `postmaster.pid`) when not given
+explicitly, since — unlike PostgreSQL, where the listen address lives in
+`postgresql.conf` — goopg's is a start-time CLI flag with nothing else to
+recover it from. Tested via `TestRunRestartWithStarter`
+(`cmd/goopg/main_test.go`), which injects a fake starter so the
+stop-then-start orchestration can be verified without blocking on a real
+foreground listener, plus a live e2e run of the real binary (stop the
+running instance, confirm the PID changes and the listen address carries
+over unchanged).
+
 ### 4. Upstream-reference policy
 
 The clone at `./postgres/` is read-only reference material. Concretely:

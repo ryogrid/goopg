@@ -406,6 +406,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		cfg.Registry = registry
+		cfg.ConfigPath = *confPath
 		logger.Info("loaded postgresql.conf", "path", *confPath, "entries", len(entries))
 	}
 	var rt *initdb.Runtime
@@ -1134,19 +1135,86 @@ func runStop(args []string, stdout, stderr io.Writer) int {
 	return 1
 }
 
+// runRestart is runRestartWithStarter wired to the real runStart. Split out
+// so tests can inject a fake starter and verify the stop-then-start
+// orchestration without blocking on a real foreground server.
 func runRestart(args []string, stdout, stderr io.Writer) int {
+	return runRestartWithStarter(args, stdout, stderr, runStart)
+}
+
+// runRestartWithStarter stops whatever instance owns -D's postmaster.pid (if
+// any is actually alive), waits for it to exit, then hands off to start,
+// exactly like the real runStart. Since v0's server always runs in the
+// foreground (no postmaster fork/daemonize), a "restart" cannot spawn a
+// background replacement the way pg_ctl does — instead the CLI process
+// itself becomes the new server, matching the `stop` then `start` sequence
+// an operator would otherwise run by hand.
+func runRestartWithStarter(args []string, stdout, stderr io.Writer, start func([]string, io.Writer, io.Writer) int) int {
 	fs := flag.NewFlagSet("restart", flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	dataDir := fs.String("D", "", "data directory (required)")
+	confPath := fs.String("config", "", "path to postgresql.conf (default: <datadir>/postgresql.conf, then built-in defaults)")
+	addr := fs.String("listen", "", "TCP listen address (host:port); default: the stopped instance's own address, else 127.0.0.1:5432")
+	hbaPath := fs.String("hba", "", "path to pg_hba.conf (default: <datadir>/pg_hba.conf, then built-in loopback-trust policy)")
+	mode := fs.String("mode", "fast", "shutdown mode for the running instance, if any: smart|fast (graceful) | immediate")
+	timeoutSec := fs.Int("t", 30, "seconds to wait for the running instance to stop")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	// Restarting a foreground-supervised server is the supervisor's
-	// job (systemd, container runtime); v0's `goopg restart` is
-	// effectively the same as `goopg stop`. Documenting this here
-	// rather than removing the subcommand keeps the CLI shape
-	// matching pg_ctl for muscle memory.
-	fmt.Fprintln(stderr, "goopg restart: not yet implemented; use 'goopg stop -D ...' then 'goopg start -D ...' (v0 runs in the foreground; the operator's supervisor restarts the process)")
-	return 1
+	if *dataDir == "" {
+		fmt.Fprintln(stderr, "goopg restart: -D <data-directory> is required")
+		return 2
+	}
+
+	pf, err := control.ParsePIDFile(*dataDir)
+	switch {
+	case err == nil && control.ProcessAlive(pf.PID):
+		stopCmd := "STOP"
+		if strings.EqualFold(*mode, "immediate") {
+			stopCmd = "STOPIMMEDIATE"
+		}
+		reply, sendErr := control.Send(pf.SocketPath, stopCmd, time.Duration(*timeoutSec)*time.Second)
+		if sendErr != nil {
+			fmt.Fprintf(stderr, "goopg restart: stop failed: %v\n", sendErr)
+			return 1
+		}
+		if reply != "OK" {
+			fmt.Fprintf(stderr, "goopg restart: stop failed: unexpected reply %q\n", reply)
+			return 1
+		}
+		deadline := time.Now().Add(time.Duration(*timeoutSec) * time.Second)
+		for time.Now().Before(deadline) && control.ProcessAlive(pf.PID) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		if control.ProcessAlive(pf.PID) {
+			fmt.Fprintf(stderr, "goopg restart: server did not stop within %ds\n", *timeoutSec)
+			return 1
+		}
+		if *addr == "" {
+			*addr = pf.ListenAddr
+		}
+		fmt.Fprintln(stdout, "goopg restart: server stopped")
+	case err == nil, errors.Is(err, os.ErrNotExist):
+		// Either no postmaster.pid at all, or a stale one left behind by a
+		// process that's already gone — nothing to stop, matches pg_ctl
+		// restart's behavior when the server isn't running.
+	default:
+		fmt.Fprintf(stderr, "goopg restart: %v\n", err)
+		return 1
+	}
+	if *addr == "" {
+		*addr = "127.0.0.1:5432"
+	}
+
+	fmt.Fprintln(stdout, "goopg restart: starting new instance")
+	startArgs := []string{"-D", *dataDir, "-listen", *addr}
+	if *confPath != "" {
+		startArgs = append(startArgs, "-config", *confPath)
+	}
+	if *hbaPath != "" {
+		startArgs = append(startArgs, "-hba", *hbaPath)
+	}
+	return start(startArgs, stdout, stderr)
 }
 
 func runReload(args []string, stdout, stderr io.Writer) int {
@@ -1178,7 +1246,7 @@ func runReload(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "goopg reload: unexpected reply %q\n", reply)
 		return 1
 	}
-	fmt.Fprintln(stdout, "goopg reload: configuration reload signalled (v0 no-op)")
+	fmt.Fprintln(stdout, "goopg reload: configuration reload signalled")
 	return 0
 }
 

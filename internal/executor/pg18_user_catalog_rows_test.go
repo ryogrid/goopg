@@ -2397,3 +2397,50 @@ func TestUserPGIndexRowReplicaIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildUserPGIndexRowIndoptionRoundTrip pins M0122-0006: a CREATE INDEX
+// with non-default per-column ASC/DESC + NULLS FIRST/LAST ordering must
+// write a real `indoption` bitmask into the physical pg_index heap row
+// (previously always zero regardless of the declared ordering), and that
+// bitmask must decode back correctly via catalog.DecodePGIndexPhysicalRow —
+// the exact path `loadUserIndexesFromHeap` uses to restore
+// catalog.Index.ColDescending/ColNullsFirst after a restart.
+func TestBuildUserPGIndexRowIndoptionRoundTrip(t *testing.T) {
+	tbl := &catalog.Table{
+		Schema: "public", Name: "orderby_idx_tbl", OID: 16700,
+		Columns: []catalog.Column{
+			{Name: "a", Type: catalog.Type{Name: "int4"}, Ordinal: 0},
+			{Name: "b", Type: catalog.Type{Name: "int4"}, Ordinal: 1},
+			{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 2},
+		},
+	}
+	idx := &catalog.Index{
+		Schema: "public", Name: "orderby_idx", Table: tbl, OID: 16701,
+		Columns: []string{"a", "b", "c"},
+		// a DESC NULLS LAST (default nulls for desc, explicit here as false
+		// meaning NOT nulls-first), b ASC NULLS FIRST, c plain ASC NULLS LAST.
+		ColDescending: []bool{true, false, false},
+		ColNullsFirst: []bool{false, true, false},
+	}
+
+	row := buildUserPGIndexRow(idx)
+	cols := pgIndexColumnsPG18()
+	data, err := EncodeRowPG(cols, row)
+	if err != nil {
+		t.Fatalf("EncodeRowPG: %v", err)
+	}
+
+	decoded, err := catalog.DecodePGIndexPhysicalRow(data)
+	if err != nil {
+		t.Fatalf("DecodePGIndexPhysicalRow: %v", err)
+	}
+	want := []int16{0x0001, 0x0002, 0x0000}
+	if len(decoded.IndOption) != len(want) {
+		t.Fatalf("IndOption length = %d, want %d (got %v)", len(decoded.IndOption), len(want), decoded.IndOption)
+	}
+	for i := range want {
+		if decoded.IndOption[i] != want[i] {
+			t.Errorf("IndOption[%d] = %#x, want %#x", i, decoded.IndOption[i], want[i])
+		}
+	}
+}

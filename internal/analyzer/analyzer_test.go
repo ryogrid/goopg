@@ -310,17 +310,83 @@ func TestAnalyzeNamedWindowClauseAccepted(t *testing.T) {
 	}
 }
 
-// TestAnalyzeNamedWindowUndefinedRejected pins the 42P20 diagnostic
-// for `OVER name` with no matching WINDOW clause item — upstream's
-// "window %q does not exist".
+// TestAnalyzeNamedWindowBareRefToFramedWindowAccepted pins a real-PG-verified
+// distinction the M0122-0004 combining-forms merge validation must NOT
+// trip over: a parenthesis-free `OVER w` reference is a transparent alias
+// (parse_agg.c's transformWindowFuncCall bare-name lookup, never routed
+// through transformWindowDefinitions/mergeWindowDef) even when `w` itself
+// declares a frame clause — only the parenthesized `OVER (w ...)` combining
+// form is subject to "cannot copy window ... because it has a frame
+// clause". Confirmed against a live PostgreSQL 18.3 instance.
+func TestAnalyzeNamedWindowBareRefToFramedWindowAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	sql := "SELECT sum(abalance) OVER w FROM pgbench_accounts " +
+		"WINDOW w AS (PARTITION BY bid ORDER BY aid ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
+	if err := Analyze(parseOne(t, sql), cat); err != nil {
+		t.Fatalf("Analyze(%q): %v", sql, err)
+	}
+}
+
+// TestAnalyzeNamedWindowUndefinedRejected pins the 42704
+// (ERRCODE_UNDEFINED_OBJECT) diagnostic for `OVER name` with no matching
+// WINDOW clause item — upstream's "window %q does not exist"
+// (transformWindowFuncCall, parse_agg.c), confirmed against a live
+// PostgreSQL 18.3 instance (M0122-0004 combining-forms follow-up; this
+// was previously misclassified as 42P20, the windowing_error code
+// upstream reserves for the "already defined"/override-validation
+// errors pinned by TestAnalyzeNamedWindowCombiningFormErrors below).
 func TestAnalyzeNamedWindowUndefinedRejected(t *testing.T) {
 	cat := analyzerCatalog(t)
 	expectAnalyzeCode(t, cat,
 		"SELECT rank() OVER missing FROM pgbench_accounts",
-		"42P20")
+		"42704")
 	expectAnalyzeCode(t, cat,
 		"SELECT rank() OVER w FROM pgbench_accounts WINDOW w2 AS (PARTITION BY bid)",
+		"42704")
+}
+
+// TestAnalyzeNamedWindowCombiningFormErrors pins the SQL:2008 7.11
+// <window clause> combining-form validations (parse_clause.c's
+// transformWindowDefinitions), each confirmed byte-for-byte against a
+// live PostgreSQL 18.3 instance: a duplicate WINDOW name, an inline
+// `OVER (win_name PARTITION BY ...)` trying to override the referenced
+// window's PARTITION BY, an ORDER BY override when the referenced window
+// already has one, and copying a window that already has a frame clause.
+func TestAnalyzeNamedWindowCombiningFormErrors(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER w FROM pgbench_accounts WINDOW w AS (PARTITION BY bid), w AS (ORDER BY aid)",
 		"42P20")
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER (w PARTITION BY aid) FROM pgbench_accounts WINDOW w AS (PARTITION BY bid)",
+		"42P20")
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER (w ORDER BY aid) FROM pgbench_accounts WINDOW w AS (ORDER BY bid)",
+		"42P20")
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER (w ROWS UNBOUNDED PRECEDING) FROM pgbench_accounts WINDOW w AS (ORDER BY aid ROWS UNBOUNDED PRECEDING)",
+		"42P20")
+	expectAnalyzeCode(t, cat,
+		"SELECT rank() OVER w2 FROM pgbench_accounts WINDOW w1 AS (ORDER BY aid ROWS UNBOUNDED PRECEDING), w2 AS (w1)",
+		"42P20")
+}
+
+// TestAnalyzeNamedWindowCombiningFormAccepted pins the successful merge
+// paths: an inline OVER inheriting a referenced window's PARTITION BY
+// while adding its own ORDER BY, and a named window built on top of
+// another named window, both confirmed against a live PostgreSQL 18.3
+// instance.
+func TestAnalyzeNamedWindowCombiningFormAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	queries := []string{
+		"SELECT rank() OVER (w ORDER BY aid) FROM pgbench_accounts WINDOW w AS (PARTITION BY bid)",
+		"SELECT row_number() OVER w2 FROM pgbench_accounts WINDOW w1 AS (PARTITION BY bid), w2 AS (w1 ORDER BY aid)",
+	}
+	for _, sql := range queries {
+		if err := Analyze(parseOne(t, sql), cat); err != nil {
+			t.Fatalf("Analyze(%q): %v", sql, err)
+		}
+	}
 }
 
 // TestAnalyzeWindowFrameRowsAccepted pins that a ROWS frame clause

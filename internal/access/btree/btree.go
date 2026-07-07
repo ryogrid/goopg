@@ -643,28 +643,59 @@ type BTree struct {
 // the free list before extending the file. The page bytes are
 // re-initialised so the caller sees a clean page (matching the
 // post-PinNew contract).
+//
+// The returned slot is ALWAYS still content-locked (Lock held, not
+// Unlock'd) — the caller must populate the real opaque/header and
+// MarkDirty, then Unlock itself. This closes a gap found while
+// investigating the recurring nightly "btree: item length mismatch
+// keyLen=9 total=37" corruption: the recycled-block branch used to
+// zero the page and then Unlock before the caller re-Locked to
+// stamp real content, leaving a window where any other writer
+// racing to pinW this same (already-tagged, already-reachable-once-
+// recycled-block-numbers-get-reused) block could observe and insert
+// into the transitional all-zero page, which the split path then
+// unconditionally overwrites via initPage — silently discarding that
+// writer's insert and leaving the tree structurally inconsistent.
+// Keeping the lock held end-to-end across both branches (recycled
+// and fresh-PinNew) removes the window entirely.
 func (bt *BTree) pinNewOrRecycled() (*storage.Slot, storage.BlockNumber, error) {
 	if blk, ok := bt.popRecycledBlock(); ok {
 		slot, err := bt.pool.Pin(storage.BufferTag{Rel: bt.rel, Block: blk})
 		if err != nil {
 			// Could not re-pin; fall back to fresh allocation.
-			return bt.pool.PinNew(bt.rel)
+			return bt.pinNewLocked()
 		}
 		// Re-initialise the page bytes so the recycled slot looks
 		// like a fresh PinNew result. The page must be zeroed under
 		// the content lock so a concurrent reader never observes a
 		// partially-zeroed page (M0118-0130: "btree: item length
-		// mismatch keyLen=9 total=37").
+		// mismatch keyLen=9 total=37"). The lock is intentionally
+		// NOT released here — see the function doc.
 		slot.Lock()
 		page := slot.Page()
 		for i := range page {
 			page[i] = 0
 		}
-		slot.Unlock()
-		// Caller will write opaque/header before MarkDirty.
+		// Caller will write opaque/header before MarkDirty + Unlock.
 		return slot, blk, nil
 	}
-	return bt.pool.PinNew(bt.rel)
+	return bt.pinNewLocked()
+}
+
+// pinNewLocked wraps storage.Pool.PinNew so its result matches
+// pinNewOrRecycled's locked-return contract: Pool.PinNew itself
+// returns an already-unlocked, already-publicly-pinnable slot (its
+// tag is inserted into the buffer map before the caller ever sees
+// it), so without this, a fresh (non-recycled) allocation would
+// reopen the exact same populate-before-lock gap the recycled branch
+// closes.
+func (bt *BTree) pinNewLocked() (*storage.Slot, storage.BlockNumber, error) {
+	slot, blk, err := bt.pool.PinNew(bt.rel)
+	if err != nil {
+		return nil, storage.InvalidBlockNumber, err
+	}
+	slot.Lock()
+	return slot, blk, nil
 }
 
 // recycleBlock (M0055-0005 Phase D) marks a block as available
@@ -1040,6 +1071,7 @@ func pageItems(p storage.Page) ([]item, error) {
 		if isPostingRaw(raw) {
 			key, tids, perr := parsePostingRaw(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItems: parsePostingRaw")
 				return nil, perr
 			}
 			for _, tid := range tids {
@@ -1048,6 +1080,7 @@ func pageItems(p storage.Page) ([]item, error) {
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "pageItems: parseItem")
 				return nil, perr
 			}
 			out = append(out, it)
@@ -1083,12 +1116,14 @@ func PageItemKeys(p storage.Page) ([][]byte, error) {
 		if isPostingRaw(raw) {
 			key, _, perr := parsePostingRaw(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageItemKeys: parsePostingRaw")
 				return nil, perr
 			}
 			out = append(out, key)
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageItemKeys: parseItem")
 				return nil, perr
 			}
 			out = append(out, it.key)
@@ -1136,6 +1171,7 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 		if isPostingRaw(raw) {
 			key, tids, perr := parsePostingRaw(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageLeafEntries: parsePostingRaw")
 				return nil, perr
 			}
 			for _, tid := range tids {
@@ -1144,6 +1180,7 @@ func PageLeafEntries(p storage.Page) ([]LeafEntry, error) {
 		} else {
 			it, perr := parseItem(raw)
 			if perr != nil {
+				maybeDumpPageOnParseErr(p, "PageLeafEntries: parseItem")
 				return nil, perr
 			}
 			out = append(out, LeafEntry{Key: it.key, TID: it.ptr})
@@ -1187,6 +1224,7 @@ func PageDownlinks(p storage.Page) ([]Downlink, error) {
 		}
 		it, perr := parseItem(raw)
 		if perr != nil {
+			maybeDumpPageOnParseErr(p, "PageDownlinks: parseItem")
 			return nil, perr
 		}
 		out = append(out, Downlink{Key: it.key, Child: it.ptr.Block})
@@ -1254,6 +1292,7 @@ func findChildBlockDirect(p storage.Page, key []byte) (storage.BlockNumber, erro
 	}
 	it, err := parseItem(raw)
 	if err != nil {
+		maybeDumpPageOnParseErr(p, "findChildBlockDirect: parseItem")
 		return 0, err
 	}
 	return it.ptr.Block, nil
@@ -1321,7 +1360,7 @@ func (bt *BTree) descendToLeaf(key []byte) (leafBlk storage.BlockNumber, path []
 		child, err := findChildBlockDirect(slot.Page(), key)
 		bt.unpinR(slot)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, fmt.Errorf("%w (blk=%d rel=%+v)", err, cur, bt.rel)
 		}
 		path = append(path, cur)
 		cur = child
@@ -1464,7 +1503,8 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		bt.unpinW(slot)
 		return err
 	}
-	rightSlot.Lock()
+	// rightSlot is already content-locked by pinNewOrRecycled (its
+	// locked-return contract) — no separate Lock() here.
 
 	// The right sibling inherits the original page's high key
 	// (or has none, if this was the rightmost page on its level).
@@ -2181,6 +2221,7 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 	if isPostingRaw(raw) {
 		key, tids, perr := parsePostingRaw(raw)
 		if perr != nil {
+			maybeDumpPageOnParseErr(p, "readPageItem: parsePostingRaw")
 			return item{}, perr
 		}
 		var ptr storage.ItemPointer
@@ -2189,7 +2230,11 @@ func readPageItem(p storage.Page, idx int) (item, error) {
 		}
 		return item{keyLen: uint16(len(key)), ptr: ptr, key: key}, nil
 	}
-	return parseItem(raw)
+	it, perr := parseItem(raw)
+	if perr != nil {
+		maybeDumpPageOnParseErr(p, "readPageItem: parseItem")
+	}
+	return it, perr
 }
 
 func appendSorted(items []item, it item) []item {

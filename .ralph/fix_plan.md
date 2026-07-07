@@ -61,6 +61,952 @@ every clean, green (build + pre-commit) checkpoint.
      placeholder is a comment, not a checkbox, so the plan-complete exit
      heuristic stays live.) -->
 
+- [x] pgbench/nightly — pgbench nightly stage aborted: `btree: item length
+      mismatch keyLen=9 total=37` at c=100 (AI-20260706-201855-001; repro:
+      `REPO_ROOT=$PWD RUN_DIR=$(mktemp -d) bash ci/batch/stages/stage-pgbench.sh`
+      with s=50 c=100 j=20 T=180). Same error message as the 2026-06-26
+      `M0118-0130` ledger row (recycled-page zeroing moved inside
+      `slot.Lock()`/`slot.Unlock()` in `pinNewOrRecycled`, btree.go:655) — that
+      fix landed but the ledger row's `status` was never flipped to `resolved`
+      because of unresolved sibling items (multi-writer stress flake, Lehman-Yao
+      lock coupling, BTIncompleteSplit-at-descent, splitMu removal); this nightly
+      recurrence suggests the fix was incomplete or a related race, not fully
+      closed. Investigate whether this is a regression of the same root cause
+      or a new one before assuming the June fix regressed.
+      2026-07-06 update (see deferral ledger row appended today, task-id
+      `M-NIGHTLY (AI-20260706-201855-001)`): found a FAST local repro —
+      un-skip `TestMultiWriterStress_M0055_Phase_C` (multi_writer_stress_test.go:40)
+      and loop `go test -run TestMultiWriterStress_M0055_Phase_C -count=1
+      ./internal/access/btree/...`; reproduces a sibling "btree: empty
+      internal page" error in ~2/40 single runs (seconds, not 180s×3).
+      Diagnostic capture showed the failing block's opaque reads as the
+      Go zero value (`level=0 isRoot=false`) while `meta.Root` pointed
+      elsewhere — i.e. a reader reached a page that only went through
+      `storage.InitPage` (`Pool.PinNew`, bufpool.go:1048) but not yet the
+      btree layer's populate step. Root cause localized to
+      `internal/storage/bufpool.go`'s `PinNew` (bufpool.go:1029-1104):
+      it publishes the new block into `bm` + flips `slotValidBit` BEFORE
+      the caller (`pinNewOrRecycled`/`createNewRoot`) gets to `.Lock()`
+      and populate real content — NOT yet proven exactly how a concurrent
+      reader names this slot early (happens-before analysis rules out
+      plain torn-content-read via the per-page mutexes), so the buffer
+      pool's tag/slot bookkeeping itself (claimVictim/evictVictim/
+      tryPinSlot generation handling) is the next thing to instrument.
+      This is the SAME keystone blocker M0118-0130 already flagged as
+      item (4) "buffer-pool eviction protocol concurrency" — still not
+      fixed, still needs its own dedicated, non-rushed investigation
+      loop (previous rushed splitMu-removal attempt already caused a
+      different panic class, per btree.go:601-613). Do not attempt a
+      quick fix here without re-running the fast repro to confirm.
+      2026-07-07 update (see deferral ledger row appended today,
+      task-id `M-NIGHTLY (AI-20260706-201855-001)`): the above
+      "publish-before-populate in PinNew" hypothesis is now REDIRECTED,
+      not confirmed. Built a full instrumentation harness (temporary,
+      reverted — see ledger row for the exact diff shape) and got 3
+      clean single-process reproductions with full lifecycle tracing.
+      Result: (a) a `bufmap` duplicate-live-entry check on every
+      `bm.Insert` never fired across 2 repros — rules out "two
+      concurrent PinNew publish the same tag" (also independently
+      confirmed unreachable: `relFile.extend`/`Manager.relFile` are
+      both fully mutex-serialized, so block numbers can't collide).
+      (b) a tag-match assertion at all 3 successful-pin return sites
+      (`Pin` fast-path, `pinSlow`'s `tryPinSlot`, and `tryPinSlot`
+      itself, covering `pinLoad`'s internal re-check too) never fired
+      across several 200-500-iteration repros — rules out "reader
+      pins the wrong physical slot for its tag" (stale-gen ABA).
+      (c) full lifecycle trace of the actual failing block each time:
+      created via PinNew, read successfully ~50-200x (real, valid,
+      tag-matched content), evicted DIRTY (flushed), reloaded clean,
+      evicted a SECOND time CLEAN (no flush) — and after that second
+      eviction NO further Pin/pinLoad/tryPinSlot trace event for that
+      tag appears, even though `descendToLeaf`'s own failure-branch
+      trace (in the SAME failing call) proves `bt.pinR()` on that
+      exact block DID return successfully, moments later, with zero
+      content. This means the corrupted read is evading all 4
+      instrumented "successful pin" code paths — the new leading
+      hypothesis is a CALLER-SIDE (btree.go) stale slot/page-handle
+      reuse (a `*storage.Slot`/`.Page()` byte-slice read again without
+      a fresh `Pin()` round-trip) rather than a bufmap/eviction-protocol
+      bug. Next step: instrument `bt.pinR` (btree.go:907) itself plus
+      the top of `descendToLeaf`'s loop body to confirm whether `Pin()`
+      is even re-invoked for the failing block's last access; if not,
+      audit `finishSplit`/`CompleteDeferredSplits` (not reviewed yet,
+      more complex multi-pin choreography) for a stale-handle path.
+      Full instrumentation recipe + exact resume steps in the deferral
+      ledger's 2026-07-07 row. Still investigation-only — do not attempt
+      a fix without re-deriving this evidence first.
+      2026-07-07 update #2 (see the second 2026-07-07 deferral ledger
+      row): executed the above next step. Instrumented `bt.pinR` +
+      `descendToLeaf`'s loop top plus ALL FIVE `Pool.Pin`/`pinSlow`/
+      `pinLoad`/`tryPinSlot`/`PinNew` success-return paths (the 5th,
+      `pinLoad`'s final post-`ReadBlock` return, was never traced
+      before). Captured a clean single-process failure: `bt.pinR(83)`
+      returned successfully with valid, non-zero content while holding
+      `contentMu.RLock()` — then, in the SAME goroutine, under the SAME
+      still-held RLock (no intervening `unpinR`), `descendToLeaf`'s very
+      next statement read that same page as fully zeroed. A `sync.
+      RWMutex` cannot let a `Lock()`-holding writer run concurrently with
+      an active `RLock()` holder, so this PROVES an unlocked writer
+      mutated the slot's `.page` bytes outside `contentMu` entirely —
+      REDIRECTING away from last loop's "stale slot/handle reuse"
+      hypothesis (the SAME live slot's content changed, not a stale
+      reference) toward "an unlocked write path exists somewhere in the
+      buffer pool or btree layer". Audited every already-known locked-
+      mutation path this loop (`pinNewOrRecycled`'s recycle zero-fill —
+      confirmed NOT exercised by this insert-only test, `freeList` never
+      populated; `PinNew`'s Init/Extend/publish; `relFile.extend`'s
+      block-number assignment; `claimVictim`/`evictVictim`'s pinned-slot
+      exclusion; `InvalidateBlock`/`InvalidateRel`; `bufmap.Delete`/
+      `Lookup`) — none show a bypass; the actual unlocked-write call site
+      is still unidentified. Also flagged (separate, NOT this bug's
+      cause): `pinNewOrRecycled` releases its content lock before the
+      caller re-locks to populate real content — a real gap once VACUUM-
+      concurrent-with-insert repros exist — and `recycleBlock` has no
+      PG-style safe-recycle deferral (real `_bt_pendingfsm_add`/
+      `_bt_pendingfsm_finalize` semantics). All instrumentation reverted
+      (temp file deleted, symbol bodies restored, confirmed byte-
+      identical via `git diff`); test re-skipped. Next step: re-apply
+      the same `GOOPG_PINTRACE=1`-gated instrumentation (recipe in the
+      2nd 2026-07-07 ledger row) PLUS trace every WRITE path
+      (`insertItemSorted`/`resetPageItems`/`writeOpaque`/`initPage`/
+      `InitPage`/the recycle zero-fill loop) with slotIdx+goroutine, to
+      catch the exact unlocked mutation against block 83's slot. Note:
+      repro rate is ~100% at `-count=200` WITH tracing (vs. ~1/150-500
+      without) — budget only `-count=50` or so per attempt.
+      2026-07-07 update #3 (5th loop; see the 3rd 2026-07-07 deferral
+      ledger row): MAJOR REDIRECTION, refuting the prior loop's
+      "unlocked write" hypothesis with direct negative evidence rather
+      than more static audit. Ran the btree-only fast repro
+      (`TestMultiWriterStress_M0055_Phase_C`) for ~1180 total iterations
+      this session (in-process `-race -count=100/300/500`, 80
+      separate-process `-race` binary runs, 200 plain runs) — ZERO
+      failures, ZERO race-detector reports, on a 16-core box. This
+      contradicts the previous loop's claimed reproducible unlocked
+      write. Then re-ran the REAL authoritative repro (fix_plan rule 3):
+      `bash ci/batch/stages/stage-pgbench.sh` at HEAD reproduces
+      instantly and reliably (dozens of clients hit the keyLen mismatch
+      within ~30s of the first workload, every time). Built
+      `bin/goopg-race` (`go build -race ./cmd/goopg`), ran it manually
+      against a real scale=50 pgbench dataset under the real TPC-B
+      workload: corruption reproduced again (confirmed twice, once at
+      c=100/T=180 via the stage script, once manually at c=100/T=80) —
+      but the race detector found **zero DATA RACE reports** either
+      time. Conclusion: this is very likely NOT a classic memory data
+      race — it is a logic bug in properly-synchronized code (wrong
+      length/offset computed, not a torn/unsynchronized write), and the
+      real trigger requires the FULL heap+index+MVCC stack under
+      UPDATE-heavy contention on tiny shared tables (TPC-B's
+      `pgbench_branches`/`pgbench_tellers`, 50/500 rows at scale=50) —
+      something the insert-only, disjoint-key unit test structurally
+      cannot exercise (no updates, no shared-row contention; goopg has
+      no HOT update per `[[goopg_no_hot_update_index_reeval]]` memory,
+      so every UPDATE in TPC-B inserts a fresh index entry into the SAME
+      few hot pages). Do **not** keep chasing
+      `TestMultiWriterStress_M0055_Phase_C` — retire or replace it with
+      a small-hot-key/UPDATE-modeling repro. New cheap (~15 min,
+      first-try) repro recipe recorded in the ledger: build
+      `bin/goopg-race`, init, start with `GORACE=log_path=...`, `pgbench
+      -i -s 50`, then `pgbench -T 80 -c 100 -j 20 -P 5` — fails
+      immediately. Next candidates to inspect: `dedupConsolidate`/
+      posting-list code (`internal/access/btree/posting.go` —
+      `appendTIDToPosting`/`promoteSingleToPosting` flagged `unusedfunc`
+      by `go vet` this loop, worth checking if dead), and the item/
+      line-pointer length encoding in `insertItemSorted`/`pageItems`/
+      `findChildBlockDirect`. All temporary artifacts (race binary, race
+      data dirs, logs) removed; test skip restored via `git checkout
+      --`; `go build ./...` clean; `go test -count=1 ./internal/
+      storage/... ./internal/access/btree/...` PASS after revert.
+      2026-07-07 update #4 (6th loop; see deferral ledger row appended
+      today): pivoted from buffer-pool tracing to auditing
+      `btree_vacuum.go`'s structural mutations for missing `splitMu`
+      coverage. **Found and FIXED a real bug** (landed, not deferred):
+      `unlinkEmptyLeaf`'s WAL-emitter branch captures the parent's
+      downlink slot INDEX via `resolveParentDownlink`, then removes by
+      that index via `applyParentDownlinkRemoval` several statements
+      later — with no `splitMu` held across the gap, so a concurrent
+      Insert-driven split on the same parent can shift the index and
+      make vacuum delete the WRONG (unrelated, still-live) child's
+      downlink while leaving `leaf.blk`'s own downlink dangling after
+      `recycleBlock` returns it to the free list. Fixed by wrapping
+      `unlinkEmptyLeaf`'s whole body in `bt.splitMu.Lock()`/`Unlock()`.
+      Gates: build clean, `go test ./internal/access/btree/...
+      ./internal/amcheck/... ./internal/executor/... -run Vacuum` PASS.
+      **This fix alone does NOT close the nightly item** — re-ran the
+      authoritative repro post-fix, still fails (now on command 1, not
+      5). Built a cheap scale=10/c=20/T=30 manual repro (see ledger row)
+      that reproduces a DIFFERENT symptom, "btree: empty internal page",
+      within 30s — traced to a SECOND, separate root cause: no code in
+      `btree_vacuum.go` ever cascades an internal page's OWN deletion
+      when its downlink count is vacuumed down to 0 (PG's `_bt_pagedel`
+      recurses up the parent chain; goopg's `applyParentDownlinkRemoval`/
+      `removeDownlinkFromParent` just leave a 0-item internal page in
+      place). Next step: implement that recursive internal-page deletion
+      cascade (resume point + rationale for deferring it this loop are in
+      today's ledger row) — use the cheap scale=10 recipe, not the
+      15-min nightly-scale one, to iterate.
+      2026-07-07 update #5 (7th loop; see deferral ledger row appended
+      today): implemented and landed the recursive internal-page-deletion
+      cascade from the previous update's next step
+      (`btree_vacuum.go`: `maybeCascadeEmptyInternal` +
+      `unlinkEmptyInternalPage`/`unlinkEmptyInternalPageFPI`, wired from
+      both `unlinkEmptyLeaf` and `unlinkEmptyLeafFPI` via a threaded
+      `ancestorPath`). New regression test
+      `TestVacuumIndexPagesCascadesEmptyInternalPage` builds a genuine
+      3-level tree (n=900000 int4 keys), empties one whole non-root
+      internal page's leaf subtree in one `VacuumIndexPages` call, and
+      asserts the tree stays fully readable — confirmed it FAILS on
+      pre-fix code (`git stash` the fix, rerun: fails with "cascaded
+      internal page ... still live") and PASSES post-fix, so it is a real
+      regression test, not vacuous. Re-ran the cheap scale=10/c=20-then-
+      c=20/T=60 manual repro from the previous loop: 0 failed
+      transactions across 90s total, no "empty internal page" or
+      "item length mismatch" in the server log (previously failed within
+      30s) — **this closes the SECOND root cause.**
+      **Still does NOT close the nightly item**: re-ran the full
+      authoritative repro (`stage-pgbench.sh`, s=50 c=100 j=20 T=180x3)
+      post-fix — FAILS AGAIN, same original signature (`btree: item
+      length mismatch keyLen=9 total=37`, occasionally keyLen=0/7460) on
+      the very first workload, ~78 of 100 clients aborting within ~30s.
+      This means a THIRD root cause exists — the c=100/j=20/s=50 scale
+      exercises something the c=20/j=8/s=10 manual repro does not (higher
+      concurrency and/or bigger shared tables produce more downlink-slot
+      churn per parent page). Since this is the SAME symptom the 5th/6th
+      loops already spent 4+ loops narrowing (buffer-pool tracing →
+      "unlocked write" → refuted → "logic bug in the UPDATE-heavy
+      TPC-B path" per the 2026-07-07-update-#3 entry above), the next
+      loop should resume THAT investigation thread (small-hot-key/UPDATE
+      repro, NOT the insert-only unit test), now that both the splitMu
+      race and the missing-cascade bug are confirmed fixed and ruled out
+      as the cause of this recurrence.
+      2026-07-07 update #6 (8th loop; see deferral ledger row appended
+      today): LANDED a real, previously-flagged fix (not the third root
+      cause, but closes a genuine gap): `pinNewOrRecycled` (btree.go)
+      now returns its slot still content-locked in BOTH branches
+      (recycled and fresh-`PinNew`, via a new `pinNewLocked` helper),
+      instead of unlocking a zeroed/transitional page before the
+      caller re-locks to stamp real content — verified via build +
+      `go test -race ./internal/access/btree/...` (clean) that this
+      doesn't regress anything, but a fresh authoritative
+      `stage-pgbench.sh` re-run confirms it does NOT fix the nightly
+      item (still fails identically). Also RULED OUT two hypotheses
+      empirically: posting-list re-encoding (`appendTIDToPosting`/
+      `promoteSingleToPosting` are dead code outside tests;
+      `dedupConsolidate` never re-marshals as posting bytes in the
+      live insert/split path — postings only exist from `BulkCreate`),
+      and the `rightmostLeafBlk` insert fast-path cache
+      (`tryInsertOnCachedRightmost`) — confirmed via a throwaway probe
+      test that this whole path is 100% dead code today: its
+      populate/staleness checks (btree.go:1299/1998) compare
+      `op.Next` against `0` instead of the actual "no right sibling"
+      sentinel `storage.InvalidBlockNumber` used everywhere else in
+      the file, so the cache never populates. NOT fixed (activating a
+      dormant path deserves its own dedicated loop). **Most valuable
+      finding**: a much cheaper repro. `pgbench -i -s 50` once
+      (single-threaded, confirmed CLEAN via `bt_index_check`/
+      `bt_index_parent_check` on all 3 pkey indexes — corruption is
+      NOT present at load time), then reusing that same loaded DB,
+      `pgbench -c 100 -j 20 -T 25 -P 5` reproduces the exact
+      `keyLen=9 total=37` failure in ~10s (vs. 15-30+ min for the full
+      authoritative gate). Post-failure `bt_index_check` on
+      `pgbench_accounts_pkey` shows WIDESPREAD "item order invariant
+      violated" across hundreds of leaf blocks (as low as block 5) plus
+      one genuinely byte-corrupt page (block 1096, same keyLen=9/
+      total=37 signature) — a single mis-split's effects likely cascade
+      across the sibling chain, or multiple independent occurrences.
+      Next step: instrument the SPLIT path (`insertIntoBlock`,
+      btree.go:~1420-1660, under `bt.splitMu`) using the new cheap
+      repro — pgbench_accounts has 5M rows at scale=50 so splits are
+      frequent/constant, unlike the tiny branches/tellers tables. One
+      concrete, NOT-yet-proven lead: `tryInsertNoSplit`/
+      `tryInsertOnCachedRightmost` (the no-splitMu fast path) never
+      check `op.HasIncompleteSplit()`/call `finishSplit`, unlike the
+      documented crash-recovery contract for `BTIncompleteSplit` —
+      confirmed via grep, not yet confirmed exploitable. Full repro
+      recipe + evidence in today's deferral ledger row.
+      2026-07-07 updates #7-#9 (9th-11th consecutive investigation
+      loops; see the matching deferral ledger rows for full detail):
+      refuted the incomplete-split-fast-path lead as independently
+      exploitable (splitMu already excludes the race); refuted the
+      internal-page fast-path hypothesis (all internal-page mutation
+      is provably splitMu-guarded); then, on the pure insert-only
+      `TestMultiWriterStress_M0055_Phase_C` repro (empty-internal-page
+      symptom, not pgbench's keyLen-mismatch symptom), built a ring-
+      buffer + enriched-error diagnostic and captured 3 clean
+      reproductions proving the failing page's content is a byte-for-
+      byte virgin `storage.InitPage` signature (`flags=0x0 lower=24
+      upper=8192 next=0 prev=0`) even for a block that had already
+      been legitimately split-and-repopulated 5 times before — ruling
+      out a write-path logic bug and pointing at the buffer pool's
+      tag/slot resolution machinery (bufmap/claimVictim/evictVictim)
+      as the next thing to instrument.
+      2026-07-07 update #10 (12th consecutive investigation loop; see
+      today's deferral ledger row for the full instrumentation recipe
+      and exact trace excerpts): executed that instrumentation (bufmap
+      Insert/Delete traces, claimVictim/PinNew/pinLoad/Pin/pinSlow
+      traces, all gated on `GOOPG_SLOTTRACE=1`) plus two NEW call-site
+      markers (`SITE_NEW_ROOT` in `createNewRoot`, `SITE_SPLIT_RIGHT`
+      in `pinNewLocked`). Running with `GOMAXPROCS=4` measurably raised
+      the repro rate (0/850 unconstrained vs. 11 failures across two
+      400-iteration GOMAXPROCS=4 runs) — worth keeping for future
+      repro attempts. REFUTED the duplicate-tag-mapping and stale-
+      slot/tag-mismatch hypotheses (zero `BM_INSERT_DUP_REFUSED` or
+      `*_TAG_MISMATCH` events near any failing block across 11
+      captures). NEW CONCLUSIVE FINDING: all 10 attributable failures
+      show `SITE_SPLIT_RIGHT` — ZERO show `SITE_NEW_ROOT` — pinning the
+      bug to `insertIntoBlock`'s split-right-page allocation
+      specifically, not `createNewRoot` (whose raw-`PinNew`-then-
+      separate-`.Lock()` gap was re-examined and confirmed NOT
+      exploitable: the creating goroutine holds the only pin
+      throughout, and nothing can reach the new root before the
+      metapage update, which happens strictly after full population).
+      Every failure shows the SAME 3-phase signature: PinNew creates
+      the block → `claimVictim` legitimately evicts it (only possible
+      once the split writer's own `Unpin` has already run, i.e. after
+      the split's code path has, by construction, fully populated +
+      MarkDirty'd + WAL-logged + unlocked it) → a cache-miss reload
+      reads back virgin content. This means the corruption survives a
+      real evict-then-reload roundtrip through the smgr layer — the
+      bug is either (a) upstream, inside the split's own populate-
+      then-unlock window (a stale/aliased byte-slice write silently
+      reverting the page before eviction), or (b) in the disk I/O
+      roundtrip itself (`relFile.writeBlock`/`extend`/`readBlock`,
+      smgr.go). NOT yet localized between (a)/(b) — next loop's
+      highest-value single measurement: sample the in-memory page's
+      line-pointer count immediately before `evictVictim`'s
+      `flushSlot` call, and a byte-checksum of the buffer immediately
+      after `relFile.writeBlock`'s `WriteAt` and again after the
+      subsequent `relFile.readBlock`'s `ReadAt`, keyed by block number
+      — whichever of these three checkpoints first shows empty content
+      localizes the bug to that boundary. All instrumentation reverted
+      this loop (`git diff --stat` clean). Also flagged, not yet fixed
+      (independent, low-risk cleanups): `insertIntoBlock`'s dedup-
+      avoids-split branch (btree.go:1531-1547) permanently leaks an
+      allocated-but-never-linked block every time it fires; and
+      `createNewRoot` should call `bt.pinNewLocked()` instead of raw
+      `PinNew()`+separate `.Lock()` for consistency with
+      `pinNewOrRecycled`, even though it's confirmed not exploitable.
+      2026-07-07 update #11 (13th consecutive investigation loop; see
+      today's deferral ledger row): executed update #10's exact next
+      step (checksum/line-pointer sampling at the 3 candidate
+      boundaries) and found the root cause of the EMPTY-INTERNAL-PAGE
+      symptom (the insert-only `TestMultiWriterStress_M0055_Phase_C`
+      repro) — **and FIXED it, landed**. `evictVictim`
+      (`internal/storage/bufpool.go`) called `p.bm.Delete(oldTag, ...)`
+      BEFORE flushing the dirty victim page to disk (comment literally
+      said "BEFORE flushing to ensure no stale lookups" — backwards).
+      This let a concurrent `Pin(oldTag)` for a block whose flush was
+      still in flight see a bufmap cache MISS (instead of correctly
+      waiting on the slot's IO-inflight semaphore, which is what
+      happens when the tag is still mapped), so it took an independent,
+      unordered fresh disk read via `pinLoad` — which could win the
+      race against the still-in-flight `WriteAt` and cache the PRE-
+      flush (virgin, zero-tuple) page content under a different slot,
+      permanently. Slot-index-level tracing (`CLAIM_VICTIM`/
+      `BM_DELETE`/`BM_INSERT`/`READ_AFTER_READAT`/`WRITE_AFTER_WRITEAT`,
+      all keyed by slot index) caught it directly: `BM_INSERT` (new
+      slot 19) and `READ_AFTER_READAT` (empty, virgin checksum) both
+      landed BEFORE the original slot's `WRITE_AFTER_WRITEAT` (valid,
+      332-tuple checksum) completed. Fix: move `bm.Delete`(+tombstone
+      accounting) to AFTER `flushSlot` returns, and release any
+      waiters queued on the slot's semaphore at that point (mirrors
+      `pinLoad`'s own IO-inflight-then-release pattern, reusing the
+      existing wait mechanism — no new synchronization primitive
+      needed). Validated: 400/400 + 300/300 plain runs and 60/60 +
+      40/40 `-race` runs of the (now permanently un-skipped)
+      `TestMultiWriterStress_M0055_Phase_C` with ZERO failures
+      (pre-fix: failed at iteration 9 and iteration 20 in two separate
+      20-run samples using the identical recipe); full
+      `go test ./internal/access/btree/... ./internal/storage/...
+      ./internal/amcheck/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33). All forensic tracing reverted; `git diff --stat`
+      shows only the real fix (bufpool.go) + the permanent un-skip
+      (multi_writer_stress_test.go) + a small enriched-error message
+      in `descendToLeaf` (btree.go, includes blk/rel on "empty internal
+      page" for future diagnosis).
+      **This does NOT close the nightly item.** Manually re-ran the
+      authoritative repro post-fix (own build, not the shared stage
+      script, to save time): fresh datadir, `pgbench -i -s 50`, then
+      `pgbench -T 120 -c 100 -j 20` against the SAME fixed binary —
+      FAILS IDENTICALLY, same `btree: item length mismatch keyLen=9
+      total=37` signature (and a `keyLen=2272/2265/2267 total=37`
+      variant, plus one `short read at block`), ~100 of 100 clients
+      aborting within seconds of workload start. This is now the 4th
+      distinct root cause confirmed NOT responsible for the nightly
+      symptom (after: update #6's splitMu-vs-vacuum race, update #7's
+      missing internal-page-deletion cascade, update #8's
+      `pinNewOrRecycled` unlock gap — all real bugs, all fixed, none
+      closing this item). The empty-internal-page thread (updates #7-
+      #11, 5 loops) is now fully resolved as its own bug with its own
+      regression test; do NOT resume it. Next loop should resume the
+      keyLen-mismatch-specific thread instead, from update #6's
+      unexecuted next step: instrument the SPLIT path itself
+      (`insertIntoBlock`, btree.go:~1420-1660, under `bt.splitMu`)
+      using update #6's cheap repro (`pgbench -i -s 50` once, reuse
+      that DB, `pgbench -c 100 -j 20 -T 25 -P 5` — reproduces in ~10s)
+      — that lead was never executed because loops 9-12 pivoted onto
+      the (now-resolved) empty-internal-page thread instead.
+      2026-07-07 update #12 (14th consecutive investigation loop; see
+      today's deferral ledger row for full byte-level detail): executed
+      update #11's next step for the first time (prior loops 9-13
+      pivoted onto the empty-internal-page thread instead) — instrumented
+      every `parseItem`/`readPageItem` error branch in `btree.go` with a
+      forensic page dump (decoded opaque + full line-pointer table + hex,
+      gated `GOOPG_BTREE_PARSE_ERR_DUMP=1`) and ran update #6's cheap
+      repro (`pgbench -i -s 50` once, `pgbench -c 100 -j 20 -T 25 -P 5`).
+      Reproduced in ~10s, captured 96 forensic dumps. **New finding**:
+      the corruption is confirmed genuinely ON-DISK (a direct `dd` of the
+      raw file at several reported blocks matches the buffer pool's
+      decoded content byte-for-byte — ruling out a read-time/aliasing
+      artifact). Every corrupted page's ~185 line pointers uniformly
+      report `Length=37` with a constant 40-byte offset stride between
+      items — exactly `MAXALIGN(37)=40`, the alignment scheme
+      `PageAddHeapTuple` (heap.go) applies to HEAP tuples, NOT the
+      btree package's own deliberately-unaligned item layout. The
+      decoded opaque header is also structurally impossible for this
+      tree (`Level=262144`, `Flags=0x802` with an undefined `0x800` bit).
+      One item's key bytes were found to contain, byte-for-byte, the same
+      anomalous Prev/Next/Level/Flags/HighKeyLen quintuple as the page's
+      own opaque header. Leading hypothesis for next loop: heap-relation
+      content (or some other MAXALIGN'd foreign structure) is landing in
+      the index relation's on-disk blocks — materially narrower than any
+      prior row in this thread, but the write-path mechanism is not yet
+      located. Audited and cleared as NOT the mechanism: `Manager.relFile`
+      (correctly keyed per-RelFileNode, no cross-relation fd sharing);
+      `bufmap.go`'s Lookup/Insert/Delete (exact key match required, no
+      collision false-positive path); `PinNew`'s pinMu-released window
+      before `pinNewLocked`'s `slot.Lock()` (content there is a legitimate
+      blank page, not heap-shaped). NOT yet audited: the executor's
+      combined heap-insert + pkey-index-maintenance call site for a
+      shared/reused relation-identity bug under concurrency; whether
+      logical change-record WAL emission/replay could cross-contaminate.
+      All instrumentation reverted this loop (`git status` clean except
+      ledger/fix_plan/working_set). Next step: reconstruct the dump
+      helper (full source in the ledger row), re-run the repro, and
+      byte-compare the item content against `heap.go`'s actual heap-tuple
+      marshal output for a `pgbench_accounts` row — a match is the
+      smoking-gun confirmation.
+      2026-07-07 update #13 (15th consecutive investigation loop; see today's
+      deferral ledger row for full byte-level detail): reconstructed update
+      #12's forensic dump helper (`internal/access/btree/parse_err_dump.go`,
+      `maybeDumpPageOnParseErr`, gated `GOOPG_BTREE_PARSE_ERR_DUMP=1`, wired
+      into all 6 `perr != nil` branches) and — unlike loops 12/14 — KEPT it
+      committed instead of reverting (env-gated, zero-risk when unset; two
+      prior loops had to rebuild an equivalent tool from scratch). Reproduced
+      fresh on an isolated port-5561 server (`pgbench -i -s 50` once, then
+      `pgbench -c 100 -j 20 -T 25 -P 5`, ~10s to failure), captured 100 dumps.
+      Executed the exact handed-off next step — byte-compared the full 37-byte
+      item against `heap.go`'s `HeapTupleHeader`/`MarshalBinary` layout — and
+      got a CONCLUSIVE match (upgrading loop 14's "consistent with" to
+      "confirmed"): `Xmin=9`, `Xmax=0`, `Xvac=0`,
+      `CTID={InvalidBlockNumber,0}` (exactly `NewHeapTuple`'s pre-insert
+      default), `Infomask2` natts=4 (pgbench_accounts's exact column count),
+      `Hoff=24` (exactly `MAXALIGN(SizeOfHeapTupleHeaderData=23)`), followed by
+      data decoding as `aid=3706034`/`bid=38` — both in-range for scale=50.
+      Five independent structural fields all correct simultaneously rules out
+      coincidence: this is genuine on-disk `pgbench_accounts` HEAP tuple
+      content physically present inside `pgbench_accounts_pkey`'s B-TREE
+      pages. Also noted the corrupted line pointer's offset+length place the
+      item entirely INSIDE the page's special/opaque region
+      (`btSpecialOffset`=7920..8192), consistent with a heap-insert routine
+      writing into a page whose `pd_special` was 8192 (bare/heap-shaped)
+      rather than btree's 7920 at write time — the page's type was wrong when
+      written, not just misread later. `go build ./...` clean; full
+      `./internal/access/btree/...` suite (2.0s) PASS. Next step: audit
+      `internal/executor/operators_storage.go`/`operators_upsert.go`'s INSERT
+      path end-to-end for where the heap-file vs. pkey-index-file
+      `RelFileNode`/handle are each obtained, looking for any route a
+      heap-target reference could leak into the `bt.Insert` call (or vice
+      versa) under concurrency; re-run the cheap repro with the now-kept dump
+      tool plus new executor-side `(heap RelOid, index RelOid, blk)` logging
+      to catch the exact moment a write meant for one relation lands on the
+      other's file.
+      2026-07-07 nightly run (20260707-000712) recurred with the same
+      signature (AI-20260707-000712-004) — folded into this task, no new
+      bullet per the "same subject" rule.
+      2026-07-07 update #7 (16th consecutive loop; see deferral ledger row
+      appended today): executed the prior loop's handoff — read
+      `insertOp.Next` and `updateOp.updateViaIndex` (the index-driven UPDATE
+      path pgbench's `UPDATE ... WHERE aid=:aid` actually takes) end-to-end
+      in `operators_storage.go`. REFUTES the heap-vs-index RelFileNode-
+      crossing hypothesis for these two call sites: `rel`/`idxRel` are
+      always freshly, independently derived from distinct OIDs (no
+      caching); `updateViaIndex`'s `RangeScan` callback only collects
+      matches into a `pendingUpdate` slice and defers all writes until
+      after `RangeScan` fully returns (pins released) — honouring, not
+      violating, the "none re-enter the btree" contract at btree.go:2358;
+      every Pin/RLock/RUnlock/Unpin pairing in both operators is tightly
+      scoped with nothing retained across an Unpin boundary. Also re-derived
+      (not just re-cited) that `claimVictim`/`tryPinSlot`/`Unpin`/`PinNew`/
+      `pinLoad` are correct lock-free CAS state machines and that
+      `storage.InitPage` unconditionally zeroes all 8192 bytes before any
+      btree opaque stamping. NEW proof (upgraded from "assumed" to
+      "certain"): `BTree.freeList`/`pinNewOrRecycled`'s recycle branch is
+      structurally UNREACHABLE in this workload — every `btree.Open()` call
+      site allocates a brand-new `*BTree` Go struct, so `freeList` starts
+      empty every call and can only be populated+drained within the SAME
+      long-lived handle, which only `VacuumIndexPages` bridges; no VACUUM
+      runs during the 25s pgbench window. Also confirmed `BTree.rel` is
+      immutable per-instance (no cross-instance aliasing) and
+      `upsertOp.leafTrees` is operator-instance-scoped and irrelevant to
+      plain TPC-B (no ON CONFLICT). No fix landed; no new mechanism found.
+      Next step (two options, priority order): (1) loop 12's still-
+      outstanding checksum/line-pointer-sample instrumentation immediately
+      before `evictVictim`'s `flushSlot` and immediately after
+      `relFile.writeBlock`/`readBlock`'s WriteAt/ReadAt (never actually run
+      — loops 13-15 pivoted onto other threads); (2) audit
+      `emitCanonicalHeapInsert`/`emitCanonicalHeapDelete` and their shared
+      `MarkDirtyChangeRecord`/`MarkDirtyLogicalChange` plumbing for a
+      mis-routed logical-record replay path (flagged unaudited by loop 14).
+      Full detail in today's deferral ledger row (16th consecutive loop).
+      2026-07-07 update #8 (17th consecutive loop; see today's deferral
+      ledger row): **ROOT CAUSE FOUND AND FIXED.** Executed update #7's
+      handoff option (1) — instrumented `evictVictim`'s pre-flush point and
+      `relFile.writeBlock`/`readBlock`'s post-I/O points with a content-hash
+      trace (`internal/storage/io_trace.go`, `GOOPG_IO_TRACE=1`-gated, kept
+      committed like the loop-13 dump tool) and correlated it against the
+      forensic dump tool at crash time. First result: the corrupted page's
+      exact byte content had a `postRead` trace match but never a matching
+      `preFlush`/`postWrite` — meaning the write that produced the corrupted
+      on-disk bytes bypassed both instrumented paths. Extended the trace to
+      `relFile.extend`/`extendBatch` (also never matched) and added a
+      recent-activity dump (all tags, last 2s, uncapped by hash) to see the
+      block's full write history regardless of which path touched it. A
+      fresh repro's dump for block 2464 of `pgbench_accounts_pkey` showed:
+      `preFlush` (valid btree content, 247 line pointers) → `postWrite`
+      (same content, checksummed copy) → **270ms gap with zero recorded
+      write/extend events** → `postRead` (corrupted content, 185 line
+      pointers) at crash time. The only write path never instrumented was
+      `Pool.flushBatch`'s `Manager.WriteBlockAIO` call (bufpool.go:1693) —
+      the checkpointer/bgwriter's batched-flush path (`FlushAllPaced`).
+      Read `FlushAllPaced` (bufpool.go:1619) end-to-end: it scans every
+      slot ONCE up front, capturing `(idx, tag)` pairs via an **unlocked**
+      `state.Load()` + `p.slots[i].tag` read, then processes the resulting
+      worklist in later batches via `flushBatch`. Between that scan and a
+      given slot's batch actually running, ordinary buffer-pool churn
+      (`claimVictim`/`evictVictim`/`PinNew`/`pinLoad`) can fully evict and
+      repurpose that exact slot for a **different relation** (e.g. a heap
+      page) — `flushBatch` then takes `contentMu.RLock()` (correctly
+      synchronized, no data race — this is why 1180+ race-detector
+      iterations across loops 9-15 never caught it) and writes whatever the
+      slot NOW holds under the STALE captured tag via `WriteBlockAIO`. The
+      existing `if s.tag == tags[i] { clear dirty bit }` guard after the
+      write already silently acknowledged this staleness window (to avoid
+      corrupting dirty-bit bookkeeping) but did nothing to stop the
+      wrong-content write itself — the exact "logic bug in properly-
+      synchronized code" loop update #3 predicted from race-detector-clean
+      real-workload repros. Fixed `flushBatch` (bufpool.go:1665) to
+      recompute `stale[i] := s.tag != tags[i]` once, immediately after all
+      slots' `contentMu.RLock()`s are held (race-free for the rest of the
+      call since a write-lock repopulation would block on that RLock), and
+      skip `WriteBlockAIO`/WAL-LSN accounting/dirty-bit-clear for any stale
+      slot instead of writing its new content to the old tag's (rel,
+      block). Gates: `go build ./...` clean; `go vet ./...` clean;
+      `go test ./internal/storage/... ./internal/access/btree/...
+      ./internal/wal/...` PASS. Verification (not just unit tests): built a
+      fixed binary, fresh `pgbench -i -s 50` init, then **two consecutive**
+      `pgbench -c 100 -j 20 -T 25 -P 5` runs (the exact authoritative
+      nightly repro, previously ~100% reproducing within seconds every
+      single time across all 17 loops) — **0 failed transactions, 0 errors,
+      both runs**, with checkpoints confirmed firing during the run (server
+      log shows multiple `checkpoint start/complete` events, one spanning
+      4061ms — the exact scan-then-batch window the bug needed). Mandatory
+      `scripts/ralph-precommit-test.sh` (`RALPH_PRECOMMIT_SCOPE=smoke`)
+      also PASS (0 failed across all three CI workloads). Kept
+      `internal/storage/io_trace.go` committed (env-gated, single cached
+      bool check when unset, same precedent as the loop-13 dump tool) since
+      it was decisive here and may be useful for any future buffer-pool
+      investigation. Also added `TestFlushBatchSkipsStaleTag`
+      (`internal/storage/storage_test.go`) as a fast, deterministic
+      regression guard (white-box repurpose of a dirtied slot's tag mid-
+      flight, no pgbench/checkpoint needed) — confirmed non-vacuous via
+      `git stash`-ing just the fix and watching it fail as predicted, then
+      restoring. Leaving this task checked but NOT archived from
+      M-NIGHTLY — the next nightly run is the real confirmation; if
+      tonight's run is clean, drop this bullet per the standing rule.
+      2026-07-07 ledger reconciliation (this loop, no code changed):
+      audited every `status = -` deferral-ledger row from this
+      investigation thread (the 17-loop pgbench keyLen-mismatch chase plus
+      its overlapping empty-internal-page/Q13/Q9-timeout tangents) against
+      the now-landed root-cause fixes. Flipped 15 rows from `-` to
+      `resolved` where the row's own `deferred` column described exactly
+      the mechanism `8ebb71cd`'s `flushBatch` stale-tag fix, `510615b4`'s
+      `evictVictim` bufmap-delete-before-flush fix, or the Q13/`o_comment`
+      LEFT JOIN fix (`75394478`) subsequently closed — dead-end hypotheses
+      and superseded investigation notes, not new scope. Left open the 3
+      rows in the same span that flag genuinely distinct, still-unaddressed
+      gaps found along the way: the cascade-delete's cross-recursion-level
+      crash-safety gap (2026-07-07, cascade row), the fast-path's
+      unenforced "no insert on an incomplete-split page" invariant
+      (2026-07-07, 9th-loop row), and the pre-existing M0122-0005 ALTER
+      DOMAIN NOT NULL scope note — none of those were touched by any
+      landed fix. No `.ralph/deferral_ledger.md` row's `landed`/`deferred`/
+      `resume point`/`why` text content was altered, only the leading
+      `status` cell.
+
+- [x] race/internal/wal — race suite failed in package
+      `github.com/goopg/goopg/internal/wal` (AI-20260707-000712-001; repro:
+      `go test -race -timeout 15m ./internal/wal/`; evidence:
+      `ci/logs/20260707-000712/race/go-test.log`). ROOT CAUSE FOUND AND FIXED.
+      The nightly log showed a plain `--- FAIL` (no DATA RACE report) on
+      `TestConcurrentAppendAcrossSegmentBoundariesNoOverflow` — did not
+      reproduce at HEAD under plain `-race` (5/5 pass), but reproduces
+      reliably with `GOMAXPROCS=2 -cpu=2` (more scheduling contention among
+      the test's 8 writer goroutines): failed 1/5 single runs, then
+      confirmed at `-count=15` under the same flags (real bug, not nightly-
+      host flakiness). Root cause: `state.appendPGCompat`'s Path B (the
+      state-loop's stripe-B buffered-append path, used when `tryAppend`'s
+      fast path falls back to the slow path) computed its pre-
+      `AppendXLogPayload` headroom check as `need := reserveSize -
+      walBuf.free()` — omitting the `walBuf.reservedBytes.Load()`
+      subtraction that the Path A/B gate (`needsDrain`, a few lines above)
+      already applies. `tryAppend`'s fast path (RLock, runs fully
+      concurrently with Path B — only Path A takes `appendMu.Lock()`) claims
+      `reserveSize` bytes via `walBuf.tryReserve` (CAS-protected
+      `reservedBytes`) before its own `AppendXLogPayload` call; those claimed
+      bytes are not yet reflected in `resident()`/`free()` until
+      `PublishUpTo` advances `tail`. So Path B's stale `free()`-only check
+      could conclude "enough room" while a concurrent `tryAppend` claim
+      pushed the combined footprint past `cap`, and the subsequent
+      `writeReserved` returned `errWALBufferReservedOutOfRange` — the exact
+      symptom this test guards, reached via slow-path/fast-path racing
+      rather than the fast-path/fast-path racing the original 0107-0007aj
+      fix analyzed. Fixed (`internal/wal/writer.go`, `state.appendPGCompat`)
+      by having Path B claim/release its `reserveSize` via the same
+      `tryReserve`/`releaseReservation` CAS pair `tryAppend` uses (looping
+      drain-then-claim until the reservation succeeds, mirroring the gate's
+      `free() - reservedBytes` formula for the drain amount) instead of a
+      plain `free()` comparison. Verified non-vacuous: reverted the fix and
+      reran `-count=15` at `GOMAXPROCS=2`/`-cpu=2` — fails within the batch
+      (same `errWALBufferReservedOutOfRange`); restored the fix — 15/15 pass,
+      plus a separate clean 8/8 at `-count=1`. Gates: `go build ./...`
+      clean; full `go test -race ./internal/wal/` PASS (3 fresh `-count=1`
+      runs); `RALPH_PRECOMMIT_SCOPE=smoke
+      bash scripts/ralph-precommit-test.sh` (pgbench standard/simple-
+      update/select-only smoke) PASS, 0 failed transactions. Design doc
+      updated: `docs/design/0107-0007aj-wal-segment-cross-reservation.md`
+      "2026-07-07 update" section + `docs/design/README.md` index entry.
+- [x] testport/TestPort_IsolationEvalPlanQual — FAILed
+      (AI-20260707-000712-002; repro: `go test -v -run
+      '^TestPort_IsolationEvalPlanQual$' ./internal/testport/`; evidence:
+      `ci/logs/20260707-000712/testport/go-test.log`). ROOT CAUSE FOUND AND
+      FIXED — same root cause as -003 below (shared plpgsql RAISE NOTICE
+      helper both specs use). Diff showed hundreds of `NOTICE` line
+      mismatches like `upid: 25 checking = 25 checking: t` (goopg) vs
+      `upid: text checking = text checking: t` (PG): `pg_typeof(p_a)` and
+      `pg_typeof(p_b)` render the raw pg_type OID instead of the type
+      display name inside a `RAISE NOTICE '%: % % ...'` format string. Root
+      cause: the M0122-0005 `pg_typeof()::oid` follow-up
+      (`docs/design/0122-0005-char-oid18-disambiguation.md`) made
+      `pg_typeof(x)`/`x::regtype` evaluate to a `KindInt` Datum holding the
+      type's pg_type OID (mirroring `regclass`/`regproc`) — the SQL
+      wire-output layer (`dispatch.go`'s `appendTypedCellText` regtype case)
+      already knew to map that OID back to a display name for a plain
+      `SELECT pg_typeof(...)`, but plpgsql's `RAISE`/format-arg substitution
+      (`internal/executor/plpgsql_runtime.go`'s `evalRaiseMsg`) still called
+      the raw `Datum.Format()` on every arg, printing the bare OID for this
+      one Datum kind. Fixed by adding `isRegtypeExpr(e planner.Expr) bool`
+      (recognizes a `*planner.FuncCall` named `pg_typeof` or a
+      `*planner.CastExpr` with `TargetType=="regtype"` — `planner.exprType`
+      is unexported so the executor package can't query the general static-
+      type resolver, but both call sites already hold the lowered
+      `planner.Expr` per arg) and routing matching `KindInt` args through
+      `RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx,
+      "public"))` instead of `val.Format()`. Verified non-vacuous: reverted
+      just the `plpgsql_runtime.go` hunk and confirmed both isolation specs
+      fail again plus a new dedicated regression test
+      (`TestNoticeRaisePgTypeofRendersTypeName`,
+      `internal/server/notice_test.go`, real client/server round-trip via
+      `pq`'s notice handler) fails with the exact bare-OID symptom
+      (`"23: 25 text"` instead of `"integer: text text"`, covering both the
+      `pg_typeof()` call and a literal `::regtype` cast in one format
+      string); restored the fix — all pass. Gates: `go build ./...` clean;
+      `go test ./internal/executor/... ./internal/server/...` PASS (full
+      packages, no regressions); `go test -v -run
+      '^TestPort_IsolationEvalPlanQual$|^TestPort_IsolationEvalPlanQualTrigger$'
+      ./internal/testport/` PASS (both specs back to byte-for-byte PG
+      parity); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions,
+      standard/simple-update/select-only). Design doc updated:
+      `docs/design/0122-0005-char-oid18-disambiguation.md` new tail section
+      + `docs/design/README.md` 0122-0005 row appended.
+- [x] testport/TestPort_IsolationEvalPlanQualTrigger — FAILed
+      (AI-20260707-000712-003; repro: `go test -v -run
+      '^TestPort_IsolationEvalPlanQualTrigger$' ./internal/testport/`;
+      evidence: `ci/logs/20260707-000712/testport/go-test.log`). Same root
+      cause and fix as AI-20260707-000712-002 above (both specs' shared
+      plpgsql helper hits the identical `evalRaiseMsg`/`pg_typeof` gap) —
+      see that bullet for the full writeup. Verified independently:
+      `go test -v -run '^TestPort_IsolationEvalPlanQualTrigger$'
+      ./internal/testport/` PASS (byte-for-byte match across all 38 active
+      permutations, matching the design 0118-0095 promotion's original bar).
+- [x] tpch/Q21-error — Q21 errored during the sweep (AI-20260707-000712-005;
+      repro: `tmp/tpch-nightly-runner -port 65433 -db postgres -user
+      <superuser> -queries 21 -per-query-timeout 1200s` against a server on
+      `bench/tpch/runtime_goopg/data`, port 65433 when free, or a copy first
+      — `ci/design/05-tpch-stage.md` §A; evidence:
+      `ci/logs/20260707-000712/tpch/run.log`). **FIXED 2026-07-07**: root
+      cause was `internal/planner/bushy.go`'s `remapByPosMap` — used to
+      translate `ColumnRef.Index` values above a `MultiHashJoin` (≥3-table
+      chain rewrite, §4 of `docs/design/0038-0001-multi-way-hash-join.md`)
+      from the pre-rewrite (OID-sorted) schema to the MHJ's own table order
+      — had no case for `*ExistsExpr`/`*SubqueryExpr`/`*ArraySubqueryExpr`.
+      Both evaluate their inner plan inline at filter/leaf time against the
+      *current* (post-rewrite) outer row via `ctx.OuterRows` +
+      `OuterColumnRef.Index` (`internal/executor/expr.go`), so an
+      un-translated index silently read the wrong outer column — Q21's
+      correlated `l1.l_suppkey` reference landed on `l_comment` a few
+      columns off, blowing up the numeric comparison it fed into
+      (`pq: invalid input syntax for type numeric: "slyly bold packages
+      haggle against the instructions"`). Added
+      `remapOuterRefsInSubplan(node, depth, posMap)` (walks the subquery's
+      inner plan via the existing `walkPlanExprs` node-tree walker,
+      remapping any `OuterColumnRef` whose `.Level` matches the current
+      nesting depth) and wired it in for all three expr types;
+      deliberately left `InExpr` alone (already correctly a no-op here —
+      correlated IN/=ANY is unnested into a Semi/Anti join by
+      `unnestExistsExpr` *before* bushy DP runs, per the existing comment).
+      Verified: minimal repro (3-way join + correlated EXISTS/NOT EXISTS)
+      and a correlated-scalar-subquery variant both previously errored, now
+      pass; `scripts/pg-oracle-diff.sh` byte-for-byte match against vanilla
+      PostgreSQL 18.3 on a small synthetic dataset built with the exact
+      `l_comment` string that broke Q21 (rules out coincidental
+      correctness); full Q21 via `tmp/tpch-runner -queries 21`: `OK
+      elapsed=91.97s rows=370` (was: hard error); reverting just this hunk
+      (`git stash push -- internal/planner/bushy.go`) reproduces the
+      original failure exactly, confirming the fix is load-bearing. Gates:
+      `go build ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/...` PASS (no regressions); `RALPH_PRECOMMIT_SCOPE=
+      smoke bash scripts/ralph-precommit-test.sh` PASS (0 failed
+      transactions, standard/simple-update/select-only). Design doc:
+      `docs/design/0038-0001-multi-way-hash-join.md` new §8 (already
+      indexed in `docs/design/README.md`). **Newly discovered while
+      validating via `scripts/tpch-spotcheck.sh` (out of this loop's
+      scope, filed as a new item below):** TPC-H Q13 fails independently
+      of this fix (confirmed via `git stash` — reproduces identically with
+      this hunk removed) with `operator NOT LIKE requires string operands
+      (got left.Kind=5 right.Kind=3)` — see the new `tpch/Q13-regression`
+      item below.
+- [x] tpch/Q13-regression — **RESOLVED 2026-07-07.** Discovered 2026-07-06
+      while verifying the Q21 fix (AI-20260707-000712-005); fixed this loop
+      as its own follow-up task. Two independent, previously-latent bugs,
+      both exposed by the same `customer LEFT JOIN orders ON c_custkey =
+      o_custkey AND o_comment NOT LIKE '%special%requests%'` shape
+      (`internal/testutil/tpch/tpch.go`'s Q13):
+      **(1) crash** — `planFromItem`'s LEFT JOIN inner-only-conjunct split
+      (`internal/planner/planner.go` ~line 1899, the M0063-0005 design)
+      wraps `o_comment NOT LIKE ...` in a `Filter` over the inner (orders)
+      plan and correctly shifts its `ColumnRef.Index` to inner-local
+      coordinates, but never marked that Filter `LeafLocal: true` (the
+      M0077-0001 convention on the `Filter` struct in `plan.go`). Two
+      post-rewrite passes that run later in the same `Plan()` call
+      (`remapWithBindings`→`applyJoinTreePosMap` and
+      `remapExprRefsToMHJ`→`remapPosMapAfterRewrite`, both `bushy.go`)
+      mistake the already-local index for a stale FROM-cumulative offset
+      and remap it a second time — with this goopg TPC-H dataset's
+      non-canonical orders column order (`o_orderdate` first, `o_comment`
+      last at local index 8), the correct index 8 got remapped to 0,
+      silently resolving `o_comment` to `o_orderdate` (a `Time` value) and
+      producing `operator NOT LIKE requires string operands (got
+      left.Kind=5 right.Kind=3)` (42883). Fix: set `LeafLocal: true` on
+      that Filter at construction. **(2) silent row loss** — found
+      immediately after fixing (1), via the mandatory
+      `scripts/tpch-spotcheck.sh` re-run: Q13 now completed but returned 32
+      rows instead of 33, missing exactly the `c_count=0` bucket (the
+      ~50,000 of 150,000 TPC-H SF=1 customers with zero orders, or zero
+      orders passing the filter — confirmed via
+      `customer where c_custkey not in (select o_custkey from orders)`).
+      Root cause: `internal/planner/nl_index_join.go`'s `tryBuildNLI` /
+      `pickInnerSide` prefers `j.Right` (orders) as the NLI's indexed inner
+      side but falls back to `j.Left` (customer) whenever `j.Right` is not
+      a bare `*SeqScan` — exactly what fix (1)'s Filter wrapper produces.
+      That fallback makes customer the INNER (indexed, null-extended-on-
+      miss) side and orders the OUTER (loop-driving) side without
+      adjusting `j.Type`; for INNER joins this swap is harmless, but for
+      LEFT JOIN (and Semi/Anti) it silently flips which side is preserved
+      — once orders drives the loop, a customer with zero matching orders
+      is never visited and vanishes from the output. Reproduced
+      minimally: `zz_a(id pk) LEFT JOIN zz_b ON id = a_id AND cmt NOT LIKE
+      '%special%'` picked `Nested Loop (LEFT)` with `zz_b` as the SeqScan
+      driver and `Index Scan using zz_a_pkey` as the (wrongly) inner side,
+      returning `zz_b`'s own rows under `a`'s column names. Fix:
+      `pickInnerSide` now declines the `j.Left`-as-inner branch whenever
+      `j.Type != JoinTypeInner`, falling back to Hash/Merge join (which
+      correctly keeps customer as the preserved probe side). Verified: at
+      TPC-H scale the real Q13 query now plans as `Hash Join (LEFT)` (not
+      NLI) exactly per the M0063-0005 design, with `Filter: (o_comment NOT
+      LIKE ...)` correctly attached to the `orders` scan. Regression test:
+      `internal/planner/left_join_inner_only_leaflocal_test.go`
+      (`TestLeftJoinInnerOnlyConjunctFilterIsLeafLocal`, pins fix 1;
+      verified it fails without the fix, both on the `LeafLocal` flag and
+      on the resulting wrong `o_comment`→`o_orderdate` resolution). Gates:
+      `go build ./...` clean; `go test ./internal/planner/...
+      ./internal/executor/...` PASS; full `go test -short ./...` (excluding
+      `internal/testutil/tpch` and `internal/testport`, both explicitly
+      excluded from the default suite per their own doc comments /
+      `.ralph/PROMPT.md`) PASS with no regressions; `scripts/
+      tpch-spotcheck.sh` PASS (Q12=2 rows, Q13=33 rows — full 33-bucket
+      parity restored, including the previously-missing `c_count=0,
+      custdist=50000` row). Design doc: `docs/design/0063-0005-q13-left-
+      join-not-like-rewrite.md` new §8 (status flipped draft→accepted;
+      already indexed in `docs/design/README.md`).
+- [x] tpch/Q15b-MAIN-explain — **FIXED 2026-07-07.** EXPLAIN Q15b-MAIN errored
+      during the plan-capture pass (AI-20260707-000712-006; repro:
+      `tmp/tpch-nightly-runner -port 65433 -db postgres -user <superuser>
+      -queries 15 -explain -per-query-timeout 60s`; evidence:
+      `ci/logs/20260707-000712/tpch/explain-run.log` —
+      `pq: relation "revenue0" does not exist (42P01)`). Root cause was a bug
+      in the benchmark tool itself (`cmd/tpch-runner/main.go`), not the goopg
+      engine: `runQ15WithCancel`/`runQ15` (the HammerDB Q15
+      CREATE-VIEW/SELECT/DROP-VIEW three-statement special case) both guarded
+      the `Q15-CREATEVIEW` and final `drop view` steps behind `if
+      !doExplain`, intending only to skip wrapping the DDL itself in `EXPLAIN`
+      (which doesn't apply to DDL) — but this also skipped *running* the
+      CREATE VIEW as a real statement under `-explain`, so `revenue0` never
+      existed when `EXPLAIN <Q15MainSelect>` tried to resolve it. Fixed by
+      making CREATE VIEW / DROP VIEW run unconditionally (never wrapped in
+      EXPLAIN) in both functions, while `Q15a-VIEWBODY`/`Q15b-MAIN` still
+      honor `doExplain` as before. Verified: fresh server on
+      `bench/tpch/runtime_goopg/data` (port 65433, `--hba` flag, memory-capped
+      via `scripts/goopg-test-run.sh`), full 22-query `-explain` sweep now
+      completes with zero errors (previously failed at Q15b-MAIN); `-queries
+      15` without `-explain` still produces the correct real result (`Q15a
+      rows=10000`, `Q15b rows=1`) confirming the non-explain path is
+      unaffected; `scripts/tpch-spotcheck.sh`-equivalent Q12/Q13 check (run
+      manually against the same server) still PASS (Q12=2, Q13=33). `go build
+      ./...` clean. No dedicated automated regression test added — the
+      function drives real `*sql.DB` queries against a live server with no
+      existing seam for a pure unit test, and this loop's manual run
+      reproduced the exact nightly failure command byte-for-byte then
+      confirmed the fix against it, which is the authoritative repro per the
+      M-NIGHTLY rules.
+- [x] tpch/Q9-timeout — Q9 hit its per-query budget (57014/cancel)
+      (AI-20260707-000712-007; repro: `tmp/tpch-nightly-runner -port 65433
+      -db postgres -user <superuser> -queries 9 -per-query-timeout 1200s`,
+      same server setup as above; evidence:
+      `ci/logs/20260707-000712/tpch/run.log`).
+      2026-07-07 update (investigation-only, no code landed — see today's
+      deferral ledger row for full detail): root cause found — the NLI join
+      against `partsupp` uses only the single-column FK index
+      `partsupp_supplier_fkidx (ps_suppkey)` even though `partsupp_pk
+      (ps_partkey, ps_suppkey)` exists and the WHERE clause has BOTH
+      `ps_suppkey=l_suppkey` AND `ps_partkey=l_partkey`; `bushy.go`'s DP only
+      wires one such edge into a join's canonical Predicate, leaving the
+      other as a whole-plan residual Filter checked only after every later
+      join — ~80x row amplification per probe. Prototyped a fix
+      (`attachCrossConjunctsToTree`, ANDs the unused edge onto the lowest
+      join that first co-locates both tables) that WORKED for the real Q9
+      shape: composite `partsupp_pk` chosen, `tmp/tpch-runner -queries 9`
+      280s+ timeout → `OK elapsed=87.19s rows=175` (175 verified correct
+      against a fresh real-PostgreSQL-18.3 run). **REVERTED**: the same
+      mechanism corrupts results when the join instead gets folded into a
+      `*planner.MultiHashJoin` chain (DP's alternative to NLI) — proven via a
+      minimal 3-table toy repro returning 0 rows instead of 1, traced to a
+      coordinate-space conflict between `nl_index_join.go`'s NLI index
+      picker (needs local bushy-DP-subset coordinates on the extra
+      predicate) and `bushy.go`'s `collectMultiHashTables`/
+      `applyJoinTreePosMap` MHJ-Filters pipeline (needs global FROM-order
+      coordinates, applies its own remap unconditionally, double-shifting
+      whatever coordinate space is fed in). All three touched files reverted
+      to HEAD via `git checkout --`; `go build ./...` clean;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33) confirming the
+      reverted tree is healthy. Next step (two options, both fully specified
+      in the ledger row): (A) make `collectCrossSideEquiKeys` fall back to
+      name-based side classification for out-of-local-range refs, then
+      attach the RAW unremapped (genuinely global-coordinate) edge predicate
+      instead of a locally-remapped one, so both downstream consumers get
+      the coordinate convention they each already expect; or (B) move the
+      attachment pass to run after `rewriteMultiWayChain` but before
+      `rewriteJoinsToNLI` so MHJ-folded joins are structurally unreachable
+      by it. Either way, add a permanent regression test pinning the toy
+      3-table repro before landing.
+      2026-07-07 update #2 (FIXED, landed): implemented option (A). New
+      `attachUnusedCrossEdges` (bushy.go), called from `enumerateBushyPlans`
+      right after the winning tree is selected, walks that tree bottom-up
+      and ANDs any still-unused edge (RAW, unremapped `joinEdge.predicate`
+      — global FROM-order ColumnRef indices, no `remapKeyToSubset` call)
+      onto the lowest `*Join` that first co-locates both of its tables, then
+      marks it used so the residual-Filter computation excludes it. This
+      deliberately keeps the SAME global coordinate convention
+      `collectMultiHashTables`'s pre-existing `extraInScans`-guarded extras
+      capture already expects for a join later folded into a
+      `*MultiHashJoin` (its own comment already anticipated this exact Q9
+      shape) — sidestepping the coordinate conflict that sank the reverted
+      prototype entirely, rather than reconciling it after the fact.
+      `collectCrossSideEquiKeys` (nl_index_join.go) gained a name-based
+      side-classification fallback (via `collectScanOutputNames`) for when
+      an AND'd conjunct's ColumnRef indices don't fall inside this Join's
+      local Left/Right width split, so the NestedLoopIndexJoin rewrite can
+      also consume a global-coordinate extra conjunct; `tryBuildNLI`'s
+      final by-name fallback rebind was hardened to also fix an
+      in-range-but-wrong-name `.Index` (previously only rebound when the
+      index was out of range), closing a latent gap the new global-coordinate
+      keys could otherwise hit for a plain (non-MHJ/NLI/Join) outer.
+      Verified end-to-end against `bench/tpch/runtime_goopg/data` (fresh
+      server restart): EXPLAIN confirms `Index Scan using partsupp_pk ...
+      Index Cond: (ps_partkey = l_partkey AND ps_suppkey = l_suppkey)`;
+      `tmp/tpch-runner -queries 9` went from a 1200s+ timeout to `OK
+      elapsed=88.32s rows=175` (175 matches the prototype's real-PostgreSQL-
+      18.3-verified anchor). Full 22-query EXPLAIN sweep clean (no errors).
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33). `go test
+      ./internal/planner/... ./internal/executor/...` PASS; the wider
+      `go test ./internal/...` run surfaced 4 unrelated pre-existing
+      failures (`internal/initdb`, `internal/testport`
+      TestE2E_FailoverPGtoGoopg, `internal/testutil/cluster`
+      TestKillKillRecovery, `internal/testutil/tpch`
+      TestTPCHScaleLoadAndQueryRun) — confirmed identical on HEAD with this
+      loop's planner changes stashed (resource-contention/timeout flakiness
+      under full-suite parallelism, not a regression from this change).
+      Added `internal/executor/bushy_dp_cross_conjunct_test.go`
+      (`TestBushyDPAttachesUnusedCrossEdge`) as a permanent regression guard
+      — see its doc comment for the honest caveat that at this toy scale
+      the pre-existing `pushdown.go` `pushOneConjunct` mechanism also
+      happens to reattach the conjunct on its own (bushy-DP local
+      coordinates coincide with global ones at small N), so this test alone
+      does not prove `attachUnusedCrossEdges` is necessary — only the real
+      Q9-scale verification above does — but it does guard the new code's
+      correctness whenever it fires.
+- [x] tpch/Q20-timeout — Q20 hit its per-query budget (57014/cancel)
+      (AI-20260707-000712-008; repro: `tmp/tpch-nightly-runner -port 65433
+      -db postgres -user <superuser> -queries 20 -per-query-timeout 1200s`,
+      same server setup as above; evidence:
+      `ci/logs/20260707-000712/tpch/run.log`).
+      2026-07-07 RESOLVED (two independent planner bugs, both fixed — full
+      detail in today's deferral ledger row): (1) `planHasOuterRef`
+      (planner.go) treated ANY `OuterColumnRef` inside a nested subquery as
+      escaping the tested plan, ignoring the `Level` hop-count field that
+      `bushy.go`'s `remapOuterRefsInSubplan` already uses correctly — Q20's
+      partsupp-scoped scalar subquery (`ps_availqty > (select 0.5*sum(...)
+      from lineitem where l_partkey=ps_partkey and l_suppkey=ps_suppkey
+      ...)`) has `Level=1` refs that resolve fully inside partsupp's own
+      scope, one nesting level below where the outer `s_suppkey IN (...)`'s
+      `IsNonCorrelated` was being computed; the false "correlated" verdict
+      blocked M0069-0005's SemiJoin fast path, leaving the outer IN as a raw
+      per-row `InExpr` that re-executed the entire partsupp+lineitem
+      subtree once per supplier row (10000 rows at SF1). Fixed via a new
+      depth-tracked `planHasEscapingOuterRef(node, depth)` worker (depth
+      starts at 1, +1 per subquery-nesting recursion, same convention
+      `remapOuterRefsInSubplan` already established) that only counts
+      `Level >= depth` as escaping. (2) `splitEqualityForHash` (used by
+      `planFromClause`'s explicit `JOIN ... ON` path) only recognised a bare
+      single equality; an AND-of-equalities predicate (e.g. `partsupp JOIN
+      (SELECT ... GROUP BY l_partkey, l_suppkey) agg ON ps_partkey=
+      agg.l_partkey AND ps_suppkey=agg.l_suppkey`) fell through to Nested
+      Loop, recomputing the GROUP BY once per outer row against an
+      expensive derived-table side with no usable index. Fixed by iterating
+      `splitAnd(pred)`'s conjuncts and hashing on the first one that
+      decomposes into disjoint sides, leaving the full `Predicate` for the
+      executor's existing residual-recheck-per-hash-match (same mechanism
+      TPC-H Q9 already relies on). Verified end-to-end: `tmp/tpch-runner
+      -queries 20` went from `ERROR after 1200.13s (57014)` to `OK
+      elapsed=2.55s rows=92` on a fresh server restart against
+      `bench/tpch/runtime_goopg/data`; row count cross-checked against a
+      freshly-started real PostgreSQL 18.3 instance on an independently
+      generated SF1 dataset — both return exactly 92 rows.
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33); full `go test ./...`
+      green. Regression tests: `TestPlanHasOuterRef_NestedSubqueryResolvesLocally`
+      (fails without the `planHasOuterRef` fix), `TestSplitEqualityForHashMultiKey`
+      (fails without the `splitEqualityForHash` fix), `TestPlanQ20OuterInFullyUnnested`
+      (asserts no raw `InExpr` survives in Q20's planned tree).
 
 **Next up:** M0122-0003 (EXPLAIN/pg_stat instrumentation) is mostly done
 (2026-07-05) — FORMAT XML/YAML, per-CTE ANALYZE stats, SETTINGS rendering,
@@ -883,8 +1829,17 @@ prev-link fixes.
       (AC-002) ported; CREATE SCHEMA + user-schema table restart-durability enablers
       landed. **Remaining (AC-003, deferred):** `003_check`, `004_verify_heapam`,
       `005_opclass_damage` — need `verify_heapam()` SRF + opclass catalog parity +
-      index AMs. (One 002 sub-section deferred: `datconnlimit=-2` invalid-DB filter —
-      runtime shared-catalog write.) Design `0110-0003-*`.
+      index AMs. (2026-07-07: the `datconnlimit=-2` invalid-DB filter sub-section is
+      now fully closed, both its SQL-visibility half — M0119-0006 AC-002 — and its
+      connect-time-enforcement half — M0119-0006 AC-002 residual #1 follow-up;
+      **2026-07-07, same day:** positive `datconnlimit` connection-count throttling
+      (residual #2) is also now closed — `activity.ActivityRegistry.CountByDatName`
+      + a `Server.handleStartup` check reject a non-superuser connection once a
+      database's live connection count exceeds its configured limit, mirroring
+      `postinit.c`'s `CheckMyDatabase`/`CountDBConnections` (FATAL `53300`). AC-002
+      now has zero remaining residuals; per-role `rolconnlimit` throttling (a
+      separate PG mechanism) remains untracked, per the matching ledger row.) Design
+      `0110-0003-*`.
 
 ## M0119 — Deferral-Ledger Backlog Consumption (filed 2026-06-29)
 
@@ -915,6 +1870,35 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `.ralph/working_set.md` / ledger). Two general SQL-engine gaps surfaced here
       remain: deferred-constraint *checking at COMMIT* (goopg checks immediately)
       and any residual dump-fidelity items.
+      **2026-07-07 slice (executor-level, not catalog-level — FIXED):** the guard
+      failed with `pg_dump: error: invalid column numbering in table "pnnl_1"` on
+      the LIST-partitioned-table fixture (`pnnl`/`pnnl_1`, per-column NOT NULL
+      override). Root cause was NOT a catalog gap but a genuine LEFT JOIN
+      correctness bug in `internal/executor/operators_join_agg.go`'s lazy hash
+      join (`nextLazy`): `getTableAttrs`'s `pg_attribute a LEFT JOIN pg_constraint
+      co ON (a.attrelid = co.conrelid AND co.contype = 'n' AND co.conkey =
+      array[a.attnum])` silently dropped the outer row for any column whose
+      hash-join key (`attrelid=conrelid`) matched a `pg_constraint` row shared
+      with a sibling column, but whose own residual conjunct (`conkey =
+      array[attnum]`) did not — `nextLazy` only null-padded on a hash-level miss
+      (`len(matches)==0`), never on "hash key matched, but every candidate failed
+      the residual `Predicate`". Fixed by tracking a new `lazyProbeMatched bool`
+      per probe row (set when any candidate passes `Predicate`) and null-padding
+      when the match loop exhausts with it still false. See
+      `docs/design/0036-0001-lazy-hash-join-materialization.md` §7 for full
+      detail; regression test
+      `internal/executor/leftjoin_hash_residual_dropped_row_test.go`
+      (`TestLeftJoinHashResidualFilterPreservesUnmatchedRow`, confirmed
+      non-vacuous via `git stash`). Guard now advances past this gap to the
+      next (already-known, milestone-scale) blocker: `TestPort_PgDumpConnectionSetup`
+      logs `DU-002 round-trip restore FAILS ... collation "builtin_coll" already
+      exists` — the same per-database catalog-isolation limitation this bullet's
+      first paragraph already documents (soft `t.Logf`, not a hard gate). Gates:
+      `go build ./...` clean; `go test ./internal/executor/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `TestPort_IsolationEvalPlanQual`/`TestPort_IsolationEvalPlanQualTrigger` PASS;
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed,
+      all 3 workloads).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002). `002_save_fullpage`
       (WD-003) + live `pg_waldump --rmgr=Heap2` round-trip DONE. **Still open:** only
       `001_basic.pl`'s server-dependent tier (per-rmgr/relation/block filtering) —
@@ -923,8 +1907,204 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       … `005_opclass_damage`; `CREATE EXTENSION amcheck` + `verify_heapam()` SRF on
       top of `internal/amcheck` + opclass catalog parity. Largest open cluster
       (~29 ledger rows): index AMs, `box`/`int4range`/`int4[]` types, STORAGE
-      EXTERNAL TOAST corruption, the heapallindexed heap-scan producer, and the
-      `datconnlimit = -2` invalid-DB filter (runtime shared-catalog write).
+      EXTERNAL TOAST corruption, and the heapallindexed heap-scan producer.
+      **2026-07-07: 002_nonesuch's last residual (`datconnlimit = -2` invalid-DB
+      filter) FIXED and PORTED** (M-NIGHTLY AI-20260707-000712-004 follow-up):
+      `catalog.InMemory` gained a runtime `datconnlimit` override —
+      `databaseConnLimit map[string]int32` +
+      `SetDatabaseConnLimit`/`DatabaseConnLimit` (catalog.go), read by
+      `pg_database`'s `VirtualRows` builder instead of the old hard-coded `"0"`.
+      The write side needed more than the catalog method: `UPDATE pg_database
+      SET datconnlimit = ...` planned through the ordinary `planUpdate`/`*planner.
+      Update` path with no error (WHERE/SET resolve fine against `pg_database`'s
+      column list even though it's `Virtual`), but `updateOp.Next()`'s physical
+      path always reported 0 rows affected — pg_database has no RelFileNode/heap
+      pages to scan, so the normal SeqScan-based child found nothing. Added
+      `updateOp.nextVirtualPgDatabase()` (`internal/executor/operators_storage.go`):
+      when `Table.Virtual && Schema=="pg_catalog" && Name=="pg_database"`,
+      `Next()` routes here instead of the ~1300-line physical-heap path — reads
+      current rows straight from `tbl.VirtualRows()` (typed via the same
+      `planner.TypedVirtualCell` helper the SELECT-side `Values`/`VirtualSource`
+      path already uses), evaluates the extracted `o.pred`/`o.plan.Set` against
+      them exactly like the physical path would, and persists via
+      `SetDatabaseConnLimit`. Scoped deliberately narrow (pg_database only, not
+      every `Virtual` table) to keep blast radius low; any `SET` column other
+      than `datconnlimit` errors 0A000 rather than silently discarding the
+      write. Ported the previously-deferred 002_nonesuch.pl section
+      (`internal/testport/pgamcheck002_port_test.go`, "Invalid / partially
+      dropped database won't be targeted") — both `command_checks_all` cases
+      (bare `--database regression_invalid` and `--table
+      regression_invalid.public.foo`) now assert the real upstream `no
+      connectable databases to check matching ...` error via the live
+      `pg_amcheck` binary. **002_nonesuch.pl (AC-002) is now FULLY ported, no
+      residuals remain.** Confirmed non-vacuous via `git stash` (fails with the
+      pre-fix `skipping database ... amcheck is not installed` symptom without
+      the two impl files). CSV row AC-002 rationale updated (also fixed a
+      latent CSV-quoting bug this same edit would have introduced —
+      unescaped commas in an unquoted rationale field broke `encoding/csv`
+      field-count parsing; rewrote with em-dashes, matching the row's existing
+      house style) + regenerated `postgres-oracle-port-status.md`. Gates: `go
+      build ./...`/`go vet` clean; `go test ./internal/executor/...
+      ./internal/catalog/... ./internal/planner/... ./internal/initdb/...`
+      PASS; `TestPort_PgAmcheck002Nonesuch`/`TestPort_PgAmcheck001Basic` PASS
+      (other `TestPort_PgAmcheck0*` tests skip on a pre-existing, unrelated
+      TOAST-file gap); `TestPort_PgDumpConnectionSetup`/
+      `TestPort_IsolationEvalPlanQual`/`TestPort_IsolationEvalPlanQualTrigger`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads).
+      **2026-07-07 follow-up (connect-time enforcement, AC-002 residual #1
+      part 2):** landed the "still deferred" connect-time half named above —
+      a real client can no longer open a session against a `datconnlimit =
+      -2` database. `catalog.DatconnlimitInvalidDB` (new exported `-2`
+      constant) + a new `databaseConnLimitRegistry` interface
+      (`internal/server/database_ddl.go`, kept separate from
+      `databaseRegistry` so a catalog fake missing this one method doesn't
+      silently disable the unrelated role/database-existence FATAL checks
+      that share that type assertion) + a new check in
+      `Server.handleStartup` (`internal/server/server.go`), right after the
+      existing `HasDatabase` gate, rejects with the real PG FATAL `55000`
+      `cannot connect to invalid database "%s"` (mirrors `postinit.c`'s
+      `database_is_invalid_form`/`InitPostgres` check). Test:
+      `TestConnectInvalidDatconnlimitDatabaseRejected`
+      (`internal/server/database_exists_test.go`), mirroring the existing
+      `TestConnectNonexistentDatabaseRejected`; confirmed non-vacuous via
+      `git stash` on `server.go` alone (fails with `unexpected frame S
+      before ErrorResponse` — handshake proceeds to AuthenticationOk instead
+      of rejecting). Design doc updated:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md`'s new "Follow-up:
+      connect-time `datconnlimit = -2` rejection" section +
+      `docs/design/README.md` row updated. Gates: `go build ./...` clean;
+      `go vet ./internal/server/... ./internal/catalog/...` clean; `go test
+      ./internal/server/... ./internal/catalog/... ./internal/executor/...`
+      PASS; `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). **Still deferred** (new 2026-07-07 ledger row): positive
+      `datconnlimit` values (real per-database connection-count throttling)
+      remain entirely unimplemented — needs a live active-connection counter
+      keyed by database name, a materially larger change than this loop's
+      sentinel-only check.
+      **2026-07-07 (AC-003 cluster): 3 of the 7 previously-fully-skipped
+      003/004/005 tests now genuinely PASS.** All 7 were skipping at an
+      identical "pre-corruption baseline is clean" gate, with the exact same
+      evidence every time: `pg_amcheck` erroring `could not open relation:
+      relation does not exist` on `postgres.pg_toast.pg_toast_<oid>` (heap)
+      and `pg_toast_<oid>_index` (btree) — goopg's synthetic TOAST-relation
+      catalog rows (`catalog.go`'s `tableHasToastRelation`) are pg_class/
+      pg_index join targets only, with NO real backing heap/index file by
+      design (goopg never routes out-of-line values through a physical TOAST
+      relation), and real `pg_amcheck`'s default whole-table walk always
+      checks a table's TOAST relation alongside it. Fixed:
+      `verifyHeapamResolveTable`'s call site
+      (`internal/executor/operators_verify_heapam.go`) and
+      `btIndexResolve`'s call site
+      (`internal/executor/operators_bt_index_check.go`) now fall back to the
+      pre-existing `catalog.InMemory.ToastParentTable(oid)` helper (previously
+      only used by REINDEX CONCURRENTLY lock routing) when a `regclass` OID
+      doesn't resolve — a synthetic TOAST OID reports zero findings (healthy,
+      vacuously-empty) instead of raising 42P01. `TestPort_PgAmcheck004VerifyHeapam`,
+      `TestPort_PgAmcheckAllTables`, `TestPort_PgAmcheckBtreeIndexCheck` now
+      PASS. Gates: `go build ./...` clean; `go test ./internal/executor/...
+      ./internal/catalog/... ./internal/amcheck/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). Design:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
+      (2026-07-07): AC-003 cluster unblocked" section;
+      `docs/design/README.md` row updated. **Still open (new discovery, see
+      today's deferral ledger row):** the remaining 4 corruption-injection
+      tests (`TestPort_PgAmcheck003CombinedCorruption`, `003MissingIndexFork`,
+      `003MissingHeapFile`, `003SchemaScoped` — the ones that remove a
+      heap/index main-fork file to simulate corruption, matching real
+      `003_check.pl`) advance past the TOAST gate but hit a NEW blocker:
+      restarting the goopg cluster after the file removal times out after 20s
+      — `pg_amcheck` never runs against the corrupted cluster at all. Uniform
+      across all 4 (same symptom regardless of which file is removed). Root
+      cause not yet localized — leading candidate is an eager per-relation
+      file open/scan somewhere in `internal/initdb/open.go`'s startup
+      sequence (unlike real PG's lazy per-relation open), but this is
+      unconfirmed; see the ledger row for the exact resume point (each
+      blocked test already has a reusable removal-then-restart repro built
+      in, no new harness needed).
+      **2026-07-07 update: restart-timeout blocker CLOSED, AC-003/AC-004
+      cluster fully unblocked.** Root-caused via CPU profiling
+      (`pprof.StartCPUProfile` around a throwaway `initdb.Open` probe on the
+      exact stop→remove-file→restart repro, not the eager-file-open
+      hypothesis above — that was refuted: `go tool pprof -top` showed no
+      `openat`/file-scan cost at all, 70% of samples were in
+      `runtime.memclrNoHeapPointers`). Root cause:
+      `internal/wal/xlog_emit.go`'s `extractRecordBytes(stream, streamStart,
+      segSize, wantBytes)` allocated `make([]byte, 0, len(stream))` — the
+      entire REMAINING input (callers pass `stream[off:]`, so this is close
+      to the full WAL segment size, e.g. 16 MB, for records near the file
+      start) — regardless of `wantBytes` (a single record's 24-byte header or
+      padded body). `readAllPageAware` calls this twice per record, and
+      `initdb.Open` runs several independent full-WAL replay passes
+      (`replayEventTriggerDDLRecords`/`replayOperatorClassDDLRecords`/
+      `replayCLogFromWAL`/`replayRangeTypeDDLRecords`/`replayViewRecords`/
+      more, each via `wal.ReadAll`), so a handful of small DDL/heap records
+      multiplied into 20-40s of allocation+memclr — not specific to the
+      missing-file scenario per se (any startup with enough real WAL pays
+      this), but the AC-003 corruption tests are the first path in the port
+      suite with both non-trivial WAL and a tight (20s) restart budget. Fix:
+      allocate `make([]byte, 0, min(wantBytes, len(stream)))` instead — a
+      strict reduction, safe because the loop's own `len(recordBytes) <
+      wantBytes` guard means it can never append past `wantBytes`. Verified
+      via the exact profiling repro: `initdb.Open` on the broken data dir
+      dropped from 23.57s to 0.18s. New regression test
+      `TestExtractRecordBytesCapBoundedByWantBytes`
+      (`internal/wal/xlog_emit_test.go`), confirmed non-vacuous via `git
+      stash` on `xlog_emit.go` alone (fails with `cap=16777216`). All four
+      previously-blocked tests
+      (`TestPort_PgAmcheck003CombinedCorruption`/`003MissingIndexFork`/
+      `003MissingHeapFile`/`003SchemaScoped`) now PASS — **AC-003/AC-004 have
+      no open blockers remaining.** Gates: `go build ./...` clean; `go test
+      ./internal/wal/... ./internal/initdb/... ./internal/executor/...
+      ./internal/amcheck/... ./internal/catalog/...` PASS; `go test -v -run
+      '^TestPort_PgAmcheck003' ./internal/testport/` PASS (4/4);
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). Design:
+      `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
+      (2026-07-07): AC-003 restart-timeout blocker closed" section;
+      `docs/design/README.md` row updated.
+      **2026-07-07 correction (M0122-0001 triage pass, doc-only, no code
+      changed): this bullet's opening line ("`005_opclass_damage`; ... needs
+      `verify_heapam()` SRF + opclass catalog parity") is stale.**
+      `CREATE OPERATOR CLASS`/`CREATE OPERATOR FAMILY` + `pg_amop`/`pg_amproc`
+      member catalog registration + WAL persistence are already fully
+      implemented (`execCreateOpClass`/`registerOpClassMembers`,
+      `internal/executor/operators_ddl.go`; `RegisterUserOperatorClass`/
+      `RegisterAmProcMember`/`RegisterAmOpMember`, `internal/catalog/
+      catalog.go`) — landed under M0119-0004's DU-002 pg_dump slices but never
+      back-referenced here. What's actually still missing for
+      `005_opclass_damage.pl` (see `.ralph/deferral_ledger.md`'s 2026-07-07
+      M0122-0001 row for the full writeup): (1) `pg_amproc` is Virtual but has
+      no Virtual-UPDATE path (only `pg_database` has one), so the test's
+      `UPDATE pg_amproc SET amproc = ...` corruption-injection step currently
+      affects 0 rows; (2) `internal/access/btree` has zero opclass/comparator-
+      function call sites — the AM never dispatches through a per-index
+      `FUNCTION 1` comparator, so a custom opclass is cataloged but inert.
+      Both remain genuinely open, index-AM-level, not a single-loop slice.
+- [ ] **M0119-0006-DATCONNLIMIT-DEFAULT — URGENT, pick next** (found 2026-07-08
+      live-verifying an unrelated ALTER FUNCTION parser fix; see today's
+      deferral ledger "CRITICAL" row for the full write-up and exact fix).
+      `catalog.InMemory.DatabaseConnLimit(name)` returns the Go zero-value `0`
+      for any database that never had an explicit `SetDatabaseConnLimit` call
+      (i.e. every database in a fresh cluster) — but real PG's default is `-1`
+      (unlimited), not `0` ("reject all"). Combined with M0119-0006's
+      already-landed positive-datconnlimit enforcement
+      (`internal/server/server.go` ~line 959), this means **every
+      non-superuser role's first-ever connection to any database is
+      rejected** with `too many connections`. Zero test coverage today —
+      every existing datconnlimit test connects as the hardcoded superuser
+      name `"postgres"`, which bypasses the check. Fix: `DatabaseConnLimit`
+      should return `-1` (not the map's zero value) when no override was set
+      (comma-ok map lookup); also fix the stale "0 (PG's no limit default)"
+      comment at catalog.go:2059-2060 and check `pg_database`'s `VirtualRows`
+      builder for the same wrong-default assumption on the SELECT-side
+      render. Add a regression test: a fresh non-superuser role's first
+      connection to a never-limited database must succeed.
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
@@ -957,12 +2137,59 @@ reviewed design doc exists. (The triage task M0122-0001 is doc-only, exempt.)
 Tracking field = a per-entry `status` (`open`/`resolved`) added by M0122-0001,
 mirroring M0119's ledger `status` column.
 
-- [ ] **M0122-0001 — Backlog triage / re-verification pass** (doc-only, exempt).
+- [x] **M0122-0001 — Backlog triage / re-verification pass** (doc-only, exempt).
       Re-audit all 181 entries vs current HEAD; add the `status` field (init
       `open`/`resolved`); resolve the already-done ones — start with the 24
       `unclear`/no-audit + 61 `resolution_check.ledger=open` entries (7 overlap).
       Dedupe against M0119 + `.ralph/deferral_ledger.md` so nothing is worked
       twice. This task discharges the "may already be implemented" risk.
+      **2026-07-07 (this loop): first triage batch landed — 35/181 entries now
+      carry a `status` field** (15 `resolved`, 20 `open`; 146 remain untouched).
+      Covered: (a) 6 entries whose `code_audit` already said `RESOLVED ...` but
+      lacked the `status` field (ANY/SOME/ALL, EXPLAIN DML sub-plan rendering,
+      BETWEEN SYMMETRIC, named windows, alias-less CTEs, DML RBAC) — mechanical
+      flip, no new investigation; (b) the ~20-entry `unclear`/no-`code_audit`
+      batch — fresh verification via Serena symbol search + targeted reads.
+      Biggest finding: `CREATE OPERATOR CLASS`/`CREATE OPERATOR FAMILY` +
+      `pg_amop`/`pg_amproc` member catalog registration + WAL persistence are
+      now FULLY implemented (`execCreateOpClass`/`registerOpClassMembers`,
+      `internal/executor/operators_ddl.go`; `RegisterUserOperatorClass`/
+      `RegisterAmProcMember`/`RegisterAmOpMember`, `internal/catalog/
+      catalog.go`) — this milestone's own M0119-0006 bullet above still
+      described this as unbuilt (stale, landed under M0119-0004 DU-002 slices
+      instead and never back-referenced). Only `005_opclass_damage.pl` remains
+      genuinely open in the pg_amcheck AC-003 cluster, for two concrete
+      reasons: `pg_amproc` is Virtual (`VirtualRows` from `ListAmProcMembers`)
+      but has no Virtual-UPDATE path (unlike `pg_database`'s
+      `nextVirtualPgDatabase`), so `UPDATE pg_amproc SET amproc=...` currently
+      affects 0 rows; and `internal/access/btree` has zero opclass/comparator-
+      function call sites at all — the AM never dispatches through a per-index
+      `FUNCTION 1` comparator, so even a corrupted `pg_amproc` row can't
+      actually corrupt anything observable. Both are real, index-AM-level
+      gaps, not a single-loop slice — see the `pg_amcheck server-dependent
+      test tiers` entry in `unimplemented_feat.json` for the full writeup.
+      One `open`→`resolved` flip corrected a misfiled entry ("H2 efficiency
+      fix: fix_plan split/PROMPT trim" — Ralph-tooling, not an engine
+      feature; `completed_milestones/completed_fix_plan_00{1..9}.md` already
+      exist). Next batch: continue through the remaining `resolution_check.
+      ledger=open` entries not yet covered.
+      **2026-07-08 (final batch): all 181/181 entries now carry a `status`
+      field** (64 `resolved` / 117 `open`, 0 remaining untagged) — the
+      re-verification pass this task exists for is complete. Last 16-entry
+      cluster (planner/perf: TPC-H Q9/Q15b/Q21 NLI shapes, NOT-IN anti-semi,
+      vectorized FilterOp/SeqScanOp wiring, spill-path activity-lookup
+      cost, plan-snapshot nondeterminism) all confirmed genuinely still
+      `open` via fresh code_audit — none flipped to `resolved` this batch
+      (contrast with earlier batches that were ~40-60% resolved; this
+      cluster skewed toward architectural/perf follow-ups nobody has picked
+      up yet, mostly already tracked at milestone granularity — e.g.
+      M0122-0012 covers the vectorization pair, `.ralph/deferral_ledger.md`
+      already covers the Q21/Q15b NLI shapes — so no new ledger rows were
+      added). M0122-0001 is now COMPLETE: every backlog entry has a final
+      `open`/`resolved` verdict backed by a dated `code_audit`. Remaining
+      work is no longer "triage" — it is picking up individual `open`
+      entries as their own M0122-00NN implementation tasks (each needs its
+      own design doc per the per-task rule above).
 - [x] **M0122-0002 — Catalog system functions & pg_* view stubs** (~9). Quick wins:
       `pg_relation_size`/`pg_total_relation_size` (`f0b2bdb3`), `regexp_matches`
       (2026-07-04 loop #7, scalar/first-match only — SRF `'g'`-flag multi-row
@@ -1661,11 +2888,89 @@ mirroring M0119's ledger `status` column.
       build ./...` clean; `go test ./internal/executor/...
       ./internal/planner/... ./internal/parser/... ./internal/analyzer/...`
       PASS (no regressions); `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33).
+      **Combining window forms landed (2026-07-07, this loop):**
+      `OVER (win_name ORDER BY ...)` and `WINDOW w2 AS (w1 ...)` now
+      implement SQL:2008 7.11's override rules (own PARTITION BY when
+      referencing a window is an error; own ORDER BY only allowed when
+      the referenced window has none; own frame clause always kept but
+      the referenced window having any frame clause at all is an error)
+      via a new `mergeWindowDef` (`internal/analyzer/analyzer.go`),
+      every case confirmed against a live PostgreSQL 18.3 instance
+      before being encoded as a test. Parser: `parseWindowSpecBody`
+      (`internal/parser/select.go`) now recognises an optional leading
+      `existing_window_name`, excluding the bare `rows`/`range`/`groups`
+      frame-mode words so `OVER (ROWS ...)` still parses as anonymous
+      (mirrors gram.y's IDENT-precedence disambiguation). Caught by the
+      pre-existing `TestCompatWindowExplicitRowsFrameSliding` compat
+      test (not a new one written for this slice): a parenthesis-free
+      `OVER name` is a *different* upstream shape (gram.y's `OVER ColId`)
+      resolved by direct winref alias with **no** override validation at
+      all, even when the referenced window has a frame clause — only
+      the parenthesized `OVER (name ...)` form goes through
+      `mergeWindowDef`. New `parser.WindowDef.IsBareRef bool`
+      distinguishes the two so the analyzer applies the right path.
+      Also fixed a bug the new merge path surfaced: the
+      undefined-window-name diagnostic was `42P20`
+      (`ERRCODE_WINDOWING_ERROR`); upstream uses `42704`
+      (`ERRCODE_UNDEFINED_OBJECT`) for that specific message — confirmed
+      against PostgreSQL 18.3, `TestAnalyzeNamedWindowUndefinedRejected`
+      updated accordingly. Also added a duplicate-WINDOW-name check
+      (`42P20`, previously entirely unchecked). Tests:
+      `internal/parser/window_test.go`'s
+      `TestParseWindowClauseOverCombiningForm`/
+      `TestParseWindowClauseNamedWindowBasedOnNamedWindow`/
+      `TestParseWindowClauseRefNameExcludesFrameModeWords`;
+      `internal/analyzer/analyzer_test.go`'s
+      `TestAnalyzeNamedWindowCombiningFormAccepted`/
+      `TestAnalyzeNamedWindowCombiningFormErrors`/
+      `TestAnalyzeNamedWindowBareRefToFramedWindowAccepted`;
+      `internal/executor/window_compat_test.go`'s
+      `TestCompatWindowCombiningForms`. Design:
+      `docs/design/0020-0001-window-parser-and-ast.md` new "Follow-up:
+      combining window forms" section; `docs/design/README.md` row
+      extended. Gates: `go build ./...`/`go vet` clean; `go test
+      ./internal/parser/... ./internal/analyzer/... ./internal/executor/...
+      ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **`justify_hours`/`justify_days`/`justify_interval` landed (2026-07-07,
+      this loop, m0097-0004):** all three were stubs returning their argument
+      unchanged. `justify_days`/`justify_interval` now normalize whole 30-day
+      chunks of the day field into the month field via a new
+      `justifyIntervalDays(months, days int32) (int32, int32)` helper
+      (`internal/executor/expr.go`), mirroring upstream's
+      `interval_justify_days`/`interval_justify_interval`
+      (`postgres/src/backend/utils/adt/timestamp.c`) exactly — upstream's
+      `justify_interval` also folds in `interval_justify_hours` (moving whole
+      24h chunks of the *time* field into days) as a pre-step, but since v0's
+      `KindInterval` Datum has no time field at all (always exactly zero),
+      that step is permanently a no-op and `justify_interval` collapses to
+      plain `justify_days`. `justify_hours()` itself is therefore always the
+      identity for goopg (matches upstream exactly for this v0 representation,
+      not an approximation) and is dispatched straight to `evalExpr` rather
+      than through `evalJustifyInterval`. Verified live against real
+      PostgreSQL 18.3 (`postgres/local_install`): `justify_days('35 days')` =
+      `'1 mon 5 days'`, `justify_interval('5 mons -33 days')` = `'3 mons 27
+      days'`, `justify_interval('-5 mons 33 days')` = `'-3 mons -27 days'`.
+      Tests: `internal/executor/interval_justify_test.go`
+      (`TestJustifyIntervalFunctions` — SQL-level; `TestJustifyIntervalDaysSignReconciliation`
+      — direct calls into `justifyIntervalDays` for the mixed-sign
+      reconciliation branches, since goopg has no `interval + interval`
+      operator to build such a value from SQL typed literals). Confirmed
+      non-vacuous via `git stash` (test file fails to compile without the new
+      helper). `unimplemented_feat.json`'s `m0097-0004` entry marked
+      `resolved`. Design: `docs/design/0003-0006-date-interval-arithmetic.md`
+      new Follow-up section; `docs/design/README.md` row extended. Gates: `go
+      build ./...` clean; `go test ./internal/executor/... ./internal/planner/...
+      ./internal/analyzer/... ./internal/parser/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 workloads).
       **Still open in this bucket:** RANGE/GROUPS window frame modes
-      (documented v0 scope limit), combining window forms, sub-day
-      intervals + multi-component interval strings (both the typed-literal
-      and cast paths now reject them identically, but neither supports
-      them — v0's `KindInterval` Datum has no sub-day field at all).
+      (documented v0 scope limit), sub-day intervals + multi-component
+      interval strings (both the typed-literal and cast paths now
+      reject them identically, but neither supports them — v0's
+      `KindInterval` Datum has no sub-day field at all).
 - [x] **M0122-0005 — Types / opclasses / casts / collation / domains** (~11).
       1-byte `char`(OID 18) disambiguation, `pg_collation_for`, function-based cast
       dumping, ALTER TYPE RENAME/OWNER, domain CHECK renderer, `pg_ts_config` OIDs.
@@ -1786,10 +3091,316 @@ mirroring M0119's ledger `status` column.
       ledger for a fresh open (`status = -`) row.
 - [ ] **M0122-0006 — On-disk catalog persistence & shared catalogs** (~8).
       Persistent `pg_index` heap, index column order (ASC/DESC/NULLS) across
-      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write.
+      restart, `pg_tablespace` visibility, `pg_database.datconnlimit` write
+      (the last **done**, M0119-0006 2026-07-07 note above).
+      **Index column order (ASC/DESC/NULLS) across restart — done
+      (2026-07-08, this loop):** fixed a 3-part gap (live `pg_index.
+      indoption` virtual builder, heap-persisted shadow row encode+decode,
+      and — the actual crash-durability bug, only reproducible via a true
+      uncheckpointed `SIGKILL` — the CREATE INDEX WAL record being emitted
+      before the ordering was set on the in-memory index). Design:
+      `docs/design/0122-0006-index-column-order-restart-persistence.md`;
+      `docs/design/README.md` new row. Deferred (ledger row, 2026-07-08):
+      `wal.CreateIndexPayload` still doesn't carry predicate/INCLUDE
+      columns/opclass/collation/fillfactor/dedup, a wider version of the
+      same bug for those fields. Gates: `go build ./...`/`go vet ./...`
+      clean; `go test ./internal/wal/... ./internal/initdb/...
+      ./internal/catalog/... ./internal/executor/... ./internal/planner/...
+      ./internal/analyzer/... ./internal/parser/...` PASS; `go test -short
+      ./...` (excluding tpch/testport) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33 — also the regression test for the WAL
+      backward-compat fix, which failed before it against
+      `bench/tpch/runtime_goopg/data`'s pre-existing WAL history);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads); live end-to-end verification against the
+      real `cmd/goopg` binary with an actual `kill -9` crash. Still open in
+      this cluster: `pg_index` persistent heap (partially covered by the
+      above but the bullet's original framing — a fuller pg_index heap
+      story — may still have residuals), `pg_tablespace` visibility.
+      **2026-07-08 follow-up (index properties beyond ordering — done):**
+      fixed the sibling gap the above investigation flagged (ledger row,
+      2026-07-08): `wal.CreateIndexPayload` gained `HasPredicate`/
+      `PredicateString`/`IncludeColumns`/`ColOpClasses`/`ColCollations`/
+      `Fillfactor`/`DeduplicateItems`/`NullsNotDistinct`, encoded as a new
+      optional trailing "extension" block (omitted for a plain index — no
+      byte-format change to existing WAL/tests) after the ColDescending/
+      ColNullsFirst blocks. `createBTreeIndex` gained an optional
+      `btreeIndexProps` struct parameter (replacing the old bare
+      `predExpr ...planner.Expr` variadic) set on `idx` before its WAL
+      emission — the exact same durability-ordering fix as the ordering
+      bullet above, for a wider field set. `RegisterIndexDuringRecovery` +
+      interface gained the same 8 params. Design:
+      `docs/design/0122-0006-index-column-order-restart-persistence.md`
+      "Follow-up (2026-07-08)" section; `docs/design/README.md` row
+      updated. Tests: `TestEncodeCreateIndexExtensionRoundTrip`/
+      `TestEncodeCreateIndexOmitsExtensionBlockWhenDefault`/
+      `TestDecodeCreateIndexBackwardCompatOrderBlocksOnlyNoExtension`/
+      `TestDecodeCreateIndexRejectsTruncatedExtension` (wal),
+      `TestCreateIndexExtendedPropertiesSurviveRestartViaWAL` (initdb,
+      true-crash pattern, confirmed non-vacuous via a temporary revert).
+      Live-verified against the real `cmd/goopg` binary with an actual
+      `kill -9`: `pg_get_indexdef`/`pg_index` correct post-restart for a
+      `WHERE`/`INCLUDE`/opclass/collation/fillfactor/dedup/`NULLS NOT
+      DISTINCT` index. Gates: `go build ./...`/`go vet ./...` clean; `go
+      test ./internal/wal/... ./internal/catalog/... ./internal/executor/...
+      ./internal/initdb/... ./internal/planner/... ./internal/analyzer/...
+      ./internal/parser/... ./internal/server/...` PASS; `go test -short
+      ./...` (excluding tpch/testport) PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Still deferred** (new 2026-07-08 ledger row): the heap-recovery
+      driver (`loadUserIndexesFromHeap`) still can't restore any of these 8
+      fields after a *checkpointed* restart — `pg_index`'s `indclass`/
+      `indcollation`/`indexprs`/`indpred` heap content is never decoded
+      (`DecodePGIndexPhysicalRow`/`buildUserPGIndexRow`), and there's no
+      `indnullsnotdistinct` heap field either. Only the uncheckpointed-crash
+      path (fixed here) is covered; see the ledger row for the resume
+      point. `pg_tablespace` visibility remains a separate open item in
+      this cluster.
+      **2026-07-08 follow-up 2 (checkpointed-restart heap decode — 3 of 5
+      fields done):** closed the "still deferred" heap-decode gap above
+      for predicate/INCLUDE columns/NULLS NOT DISTINCT.
+      `buildUserPGIndexRow` (`internal/executor/pg18_user_catalog_rows.go`)
+      now writes real `indnatts`/`indnkeyatts` (previously always equal —
+      INCLUDE columns were silently dropped from `indkey`), appends
+      INCLUDE-column attnums to `indkey`, and writes `indpred` as the
+      predicate's SQL text when `HasPredicate` (`indexprs` stays NULL —
+      goopg has no expression-index support, so nothing can populate it).
+      `catalog.PGIndexRow`/`DecodePGIndexPhysicalRow`
+      (`internal/catalog/codec.go`) gained `IndNKeyAtts`/
+      `IndNullsNotDistinct`/`IndHasPred`/`IndPred`; `indpred`'s
+      NULL-vs-present state is inferred from data length alone (safe
+      because `indexprs`, the column before it, is proven always NULL, and
+      `encodeRowPG` writes zero bytes for NULL columns) via a new
+      `decodePGIndexVarlenaText` helper. `loadUserIndexesFromHeap`
+      (`internal/initdb/open.go`) splits decoded `indkey` at `indnkeyatts`
+      into key columns vs `IncludeColumns` and threads
+      `HasPredicate`/`PredicateString`/`NullsNotDistinct` through to
+      `RegisterIndexDuringRecovery`. Test:
+      `TestCreateIndexPredicateAndIncludeColumnsSurviveCheckpointedRestart`
+      (`internal/initdb/index_ddl_recovery_test.go`, graceful `Close()`,
+      confirmed non-vacuous via `git stash`). Live-verified against the
+      real `cmd/goopg` binary with a graceful `stop`/`start`. Design:
+      `docs/design/0122-0006-index-column-order-restart-persistence.md`
+      "Follow-up 2 (2026-07-08)" section; `docs/design/README.md` row
+      updated. Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/wal/... ./internal/catalog/... ./internal/executor/...
+      ./internal/initdb/... ./internal/planner/... ./internal/analyzer/...
+      ./internal/parser/... ./internal/server/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **Still open** (new 2026-07-08 ledger row,
+      "follow-up 2 of 2"): `ColOpClasses`/`ColCollations`
+      (`indclass`/`indcollation` real OID resolution) — a materially
+      larger, separate gap that also affects the *live* (non-restart)
+      `pg_index` rendering (`catalog.go`'s `VirtualRows` builder ignores
+      `ColOpClasses`/`ColCollations` too, using a hard-coded per-type
+      default-opclass switch and always-zero `indcollation`); needs a full
+      opclass/collation name↔OID registry, not just heap-decode plumbing.
+      `pg_tablespace` visibility remains a separate open item in this
+      cluster.
 - [ ] **M0122-0007 — DDL / admin commands / ctl / GUC config** (~14). CREATE/DROP
-      DATABASE full DDL, `goopg ctl restart`, REINDEX, SIGHUP config reload,
-      tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC stubs.
+      DATABASE full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN,
+      planner/jit GUC stubs. (`goopg reload`/SIGHUP and `goopg restart` done,
+      see below.)
+      **SIGHUP config reload — done (2026-07-08):** `startControlPlane`'s
+      `OnReload` (`internal/server/server.go`) was a logged-only "v0
+      no-op" — neither `goopg reload` nor a literal `kill -HUP <pid>`
+      changed anything on a running server. Both now call the same new
+      `Server.reloadConfig`, which re-parses the new `Config.ConfigPath`
+      (the postgresql.conf `cfg.Registry` was loaded from at boot, now
+      threaded from `cmd/goopg`) and applies it via a new
+      `Registry.ApplyReloadEntries` (`internal/config/guc.go`) — unlike
+      boot's `ApplyConfigEntries`, this gates by `Context`:
+      `ContextPostmaster`/`ContextInternal` entries are left untouched
+      with a "cannot be changed without restarting the server" warning
+      (matching upstream `ProcessConfigFile`), everything else applies
+      with `SourceConfigFile` AND fires the registry's `OnChange` bridge
+      (boot's bypass doesn't, since nothing has read the registry yet at
+      that point — but a reload changes a *live* value, so process-global
+      toggles like `enable_nestloop_index` must observe it immediately).
+      A malformed/unknown entry is reported as a warning, never aborts
+      the reload or crashes the server. SIGHUP wiring added a
+      `signal.Notify(syscall.SIGHUP)` goroutine in `startControlPlane`
+      calling the identical `reloadConfig` path. Tests:
+      `TestApplyReloadEntriesAppliesSigHupSkipsPostmaster`,
+      `TestApplyReloadEntriesFiresOnChange` (`internal/config/
+      guc_test.go`), `TestReloadConfigAppliesSigHupSkipsPostmaster`,
+      `TestReloadConfigNoPathIsNoop` (`internal/server/reload_test.go`).
+      Live-verified against the real `cmd/goopg` binary via both
+      `goopg reload -D <datadir>` and `kill -HUP <pid>`: edited
+      `checkpoint_timeout` (PGC_SIGHUP) from 600→900 in postgresql.conf
+      plus added `max_connections = 5` (PGC_POSTMASTER); post-reload
+      `SHOW checkpoint_timeout` moved 10min→15min while `SHOW
+      max_connections` stayed at the unchanged 100, with the expected
+      restart-required warning in the server log for the latter. Design:
+      `docs/design/root-0004-configuration-and-guc.md` "Hot reload
+      (2026-07-08)" section; `docs/design/README.md` row updated. Gates:
+      `go build ./...`/`go vet ./internal/config/... ./internal/server/...
+      ./cmd/goopg/...` clean; `go test ./internal/config/...
+      ./internal/server/... ./internal/control/... ./cmd/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads). **Still open** (this bucket, ~13
+      remaining items): a true restart-the-listener reload for
+      `ContextPostmaster` GUCs is out of scope (matches upstream — those
+      need a real process restart; goopg's reload only warns about them),
+      plus the rest of M0122-0007's named items (CREATE/DROP DATABASE
+      full DDL, REINDEX, tablespaces, ALTER FUNCTION/COLUMN, planner/jit GUC
+      stubs).
+      **`goopg restart` — done (2026-07-08):** was a hard stub (`runRestart`
+      always printed "not yet implemented" and returned exit 1, telling the
+      operator to run `stop`/`start` by hand). Since v0's server always runs
+      in the foreground (no postmaster fork/daemonize), a real restart can't
+      spawn a background replacement the way `pg_ctl restart` does — instead
+      `runRestart` (`cmd/goopg/main.go`) stops whatever instance owns `-D`'s
+      `postmaster.pid` (skipped entirely if the pidfile is absent or stale —
+      `control.ProcessAlive` says no live process at that PID, matching
+      `pg_ctl restart`'s not-running behavior), waits for it to exit, then
+      hands off to the exact same start path `goopg start` uses, so the CLI
+      process itself becomes the new server. `-config`/`-hba` keep reusing
+      `goopg start`'s existing `<datadir>/postgresql.conf`/`pg_hba.conf`
+      auto-discovery; `-listen` additionally defaults to the stopped
+      instance's own listen address (from its `postmaster.pid`) when not
+      given explicitly — goopg's listen address is a start-time CLI flag
+      with no config-file home to recover it from otherwise, unlike
+      upstream's `listen_addresses`/`port` GUCs. Split into
+      `runRestartWithStarter(args, stdout, stderr, start)` so tests can
+      inject a fake starter and verify the stop-then-start orchestration
+      (missing `-D`, no pidfile, stale pidfile, live-and-stopped) without
+      blocking on a real foreground listener. Tests: 4 subtests under
+      `TestRunRestartWithStarter` (`cmd/goopg/main_test.go`), the live one
+      spinning up a real `control.Listener` + a real killable child process
+      to exercise the actual stop-wait-then-start sequence end to end (not
+      mocked at the control-socket layer); `TestSubcommandStubsAreReachable`
+      updated (`restart` now requires `-D` like `stop`/`reload`/`status`,
+      exit 2 not the old stub's exit 1). Live-verified against the real
+      `cmd/goopg` binary: started on `127.0.0.1:65498`, ran `goopg restart -D
+      <datadir>` with no `-listen`, confirmed the PID changed (new server
+      process) while `goopg status` still reported the same
+      `127.0.0.1:65498` address, unchanged. Design:
+      `docs/design/root-0001-architecture-overview.md` "`goopg restart`
+      (2026-07-08)" section; `docs/design/README.md` row updated. Gates:
+      `go build ./...` clean; `go vet ./cmd/... ./internal/control/...`
+      clean; `go test ./cmd/... ./internal/control/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads).
+      **`ALTER FUNCTION/PROCEDURE/ROUTINE OWNER TO`/`SET SCHEMA` — done
+      (2026-07-08, M0097-0150):** both previously parsed but were silently
+      discarded no-ops (`RENAME TO` already worked). New `catalog.Routine.Owner`/
+      `OwnerOrDefault()` (mirrors every other `OwnerOrDefault`-style object in
+      this codebase) and `Routines.SetSchema` (re-keys `byKey`/`byName`,
+      mirroring `RenameRoutine`'s re-keying on `Schema` instead of `Name`), plus
+      OID-based recovery counterparts (`SetOwnerByOIDDuringRecovery`/
+      `SetSchemaByOIDDuringRecovery`). Surfaced and fixed a real pre-existing
+      parser bug along the way: the ALTER FUNCTION attribute loop's SET-clause
+      detection matched `TokenIdent` value `"set"`, but `SET` lexes as the real
+      keyword `KwSet` — so it never matched and **every** `ALTER FUNCTION ...
+      SET ...` form was a syntax error, not the documented no-op (fixed for the
+      `SET SCHEMA` sub-form; the generic `SET config = value`/`RESET` sub-forms
+      remain broken for two more small, now-isolated reasons — see the deferral
+      ledger row appended today). `execAlterFunction` gains OWNER TO/SET SCHEMA
+      branches mirroring `RenameTo`'s early-return shape (real PG grammar treats
+      these as separate top-level forms, not clauses combinable with
+      VOLATILE/etc, confirmed against `postgres/src/backend/parser/gram.y`'s
+      `AlterOwnerStmt`/`RenameStmt` vs `alterfunc_opt_list`). `pg_proc.proowner`
+      for user routines now reads `r.OwnerOrDefault()` instead of a hardcoded
+      `"10"`; `pronamespace` already read `r.Schema` live so SET SCHEMA
+      round-trips with no view change. New WAL record kinds 121/122
+      (`RecordKindAlterFunctionOwner`/`RecordKindAlterFunctionSetSchema`),
+      replayed by `replayFunctionDDLRecords`. Verified live against the real
+      `cmd/goopg` binary: `ALTER FUNCTION add_one(int) OWNER TO func_owner` +
+      `SET SCHEMA app` changed `pg_proc.proowner`/`pronamespace` to the real
+      role/schema OIDs, `app.add_one(41)` still executed correctly, and both
+      the ownership and the schema move survived a `goopg restart`. Tests:
+      `TestParseAlterFunctionOwner`/`TestParseAlterFunctionSetSchema`/
+      `TestParseAlterFunctionRenameAndVolatileStillWork` (parser, new
+      `alter_function_owner_schema_test.go`); `TestExecAlterFunctionOwner`/
+      `TestExecAlterFunctionSetSchema` (executor, `operators_function_test.go`);
+      `TestPgProcViewRendersRoutineOwner` (initdb); `TestEncodeDecodeAlterFunctionOwnerRoundTrip`/
+      `TestEncodeDecodeAlterFunctionSetSchemaRoundTrip` (wal); `TestFunctionDDLRecoveryReplaysAlterAfterCreate`
+      extended to cover both new record kinds end-to-end through a real WAL
+      flush + reopen. `unimplemented_feat.json`'s M0097-0150 entry flipped to
+      `resolved`. Design: `docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md`
+      new "`ALTER FUNCTION/PROCEDURE/ROUTINE OWNER TO`/`SET SCHEMA` (2026-07-08,
+      M0097-0150)" section; `docs/design/README.md` row updated. Gates:
+      `go build ./...`/`go vet ./...` clean; `go test ./internal/parser/...
+      ./internal/catalog/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/... ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh`
+      PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+      scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Generic `ALTER FUNCTION ... SET config_param {TO|=} value` / `SET
+      config_param FROM CURRENT` / `RESET` — done (2026-07-08 follow-up,
+      M0097-0150):** closed the resume point the row above deferred.
+      `internal/parser/ddl.go`'s ALTER FUNCTION `SET` branch widened its
+      `=`-acceptance check to also match `TokenOperator` (previously only
+      `TokenSymbol`, but `=` actually lexes as `TokenOperator` in this
+      lexer — the established `(Kind == TokenSymbol || Kind ==
+      TokenOperator) && Value == "="` idiom used elsewhere in the file was
+      missing here), and restructured so the config-param name is always
+      parsed BEFORE checking for `TO`/`=`/`FROM CURRENT`, matching real
+      `gram.y`'s `var_name {TO|=} var_value | var_name FROM CURRENT`
+      grammar order (the old code checked for a literal `"from"` token
+      immediately after `SET`, as if `FROM` could itself be the param
+      name — a form that doesn't exist in PG's grammar). All forms remain
+      parse-only no-ops (goopg has no per-function GUC-override storage),
+      matching the pre-existing `RESET` behavior. New test
+      `TestParseAlterFunctionGenericSetReset` (parser,
+      `alter_function_owner_schema_test.go`) covers `SET name TO value`,
+      `SET name = value`, `SET name FROM CURRENT`, `SET name TO DEFAULT`,
+      `RESET name`, `RESET ALL`, and a VOLATILE-combined form; confirmed
+      non-vacuous via `git stash` on `ddl.go` alone (3/7 cases fail
+      pre-fix with the exact predicted syntax errors). Verified live
+      against the real `cmd/goopg` binary: all 5 previously-broken forms
+      now return `ALTER FUNCTION` instead of a syntax error, function
+      stayed callable throughout. Discovered live (new, narrower,
+      pre-existing gap — see today's second deferral ledger row): a
+      comma-separated value list (`SET search_path = app, public`, real
+      PG `var_list` grammar) still errors — the no-op branch only ever
+      consumed a single value token, unchanged from before this fix.
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/parser/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads).
+      **`SET config_param = value1, value2` var_list form — done (2026-07-08
+      follow-up 2, M0097-0150):** closed the resume point named just above.
+      `internal/parser/ddl.go`'s ALTER FUNCTION `SET` branch now calls the
+      same `p.parseSetValueAtoms()` helper the generic `SET` statement
+      (`parser.go`'s `parseSet`) already uses for comma-separated GUC values,
+      discarding the parsed list (still a no-op — no per-function
+      GUC-override storage). Two new cases in the same
+      `TestParseAlterFunctionGenericSetReset` table (`SET search_path = app,
+      public`, `SET search_path TO app, public, pg_catalog`); confirmed
+      non-vacuous via `git stash` on `ddl.go` alone (both fail pre-fix with a
+      syntax error at the comma). Verified live against `cmd/goopg` (real
+      `postgres` superuser session): both forms now return `ALTER FUNCTION`,
+      function stayed callable throughout. **M0097-0150's ALTER
+      FUNCTION/PROCEDURE/ROUTINE cluster (OWNER TO/RENAME TO/SET SCHEMA/
+      generic SET-RESET incl. var_list) now has no known open residuals.**
+      Gates: `go build ./...` clean; `go test ./internal/parser/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0
+      failed, all 3 workloads). **Unrelated discovery while live-verifying
+      this fix (NOT part of M0122-0007's scope, filed as its own urgent
+      M0119-0006-DATCONNLIMIT-DEFAULT task above and a new "CRITICAL"
+      deferral ledger row instead of fixed here, per one-task-per-loop):**
+      a non-superuser role's very first connection to any database is
+      currently rejected with "too many connections" — `catalog.InMemory.
+      DatabaseConnLimit`'s unset-default is the Go zero-value `0` (PG's
+      real default is `-1`/unlimited), and M0119-0006's already-landed
+      positive-datconnlimit enforcement treats `0` as an active hard limit.
+      **Still open** (this bucket, ~11 remaining items): CREATE/DROP DATABASE
+      full DDL (architecturally larger — goopg is currently single-database;
+      `DROP DATABASE` always reports does-not-exist by design), REINDEX
+      (validation + CONCURRENTLY lock/wait semantics already real; physical
+      index rebuild remains a no-op — separately-scoped, larger), tablespaces,
+      `ALTER TABLE ... ALTER COLUMN RESET (...)` (unrelated to today's ALTER
+      FUNCTION work — confirmed-open at ddl.go per `unimplemented_feat.json`),
+      planner/jit GUC stubs, plus the ALTER FUNCTION `SET`-value comma-list
+      gap this loop's own follow-up deferral ledger row just recorded.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
@@ -1859,6 +3470,75 @@ mirroring M0119's ledger `status` column.
       `verify_heapam()` SRF + opclass parity, AC-002..005, pg_dump 002-010.
       **Overlaps M0119-0004/0006 — the triage assigns each item to ONE milestone;
       do not double-work.**
+- [x] **M0122-0016 — Autovacuum: honor `autovacuum_enabled` reloption** (~1;
+      `unimplemented_feat.json` task `M0086`). `internal/autovacuum.Launcher.
+      needsVacuum` always returned true whenever `RowCount > 0`, ignoring the
+      `WITH (autovacuum_enabled=false)` storage parameter already tracked on
+      `catalog.Table` (`AutovacuumEnabled`/`AutovacuumEnabledSet`, populated
+      since M0110-0001 but catalog/dump-only until now — its own doc comment
+      said "goopg has no autovacuum ... runtime unaffected", stale since
+      `internal/autovacuum` has existed since M0019). Fixed: both
+      `needsVacuum` and `needsAnalyze` (`internal/autovacuum/launcher.go`) now
+      return `false` when `AutovacuumEnabledSet && !AutovacuumEnabled`,
+      mirroring `postgres/src/backend/postmaster/autovacuum.c`'s
+      `relation_needs_vacanalyze` (`av_enabled`/`force_vacuum` gate) — the
+      pre-existing anti-wraparound (`RelFrozenXID`/`autovacuumFreezeMaxAge`)
+      check still runs first and overrides the disable, matching upstream's
+      "ignore [the disable] if at risk" comment. Tests:
+      `TestNeedsVacuumRespectsAutovacuumEnabledReloption`,
+      `TestNeedsVacuumAntiWraparoundOverridesDisabledReloption`
+      (`internal/autovacuum/launcher_test.go`), confirmed non-vacuous via
+      `git stash` on `launcher.go` alone. Gates: `go build ./...` clean;
+      `go test ./internal/autovacuum/...` PASS (3/3);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, standard/simple-update/select-only). Design:
+      `docs/design/0122-0016-autovacuum-enabled-reloption.md`,
+      `docs/design/README.md` row added. `unimplemented_feat.json`'s `M0086`
+      entry flipped `open`→`resolved` (65/181 resolved, 116 open).
+- [x] **M0122-0017 — Analyzer: reject bare aggregate in FOR UPDATE target
+      list** (~1; `unimplemented_feat.json` task `M0021-0002`). `SELECT
+      count(*) FROM t FOR UPDATE` (no `GROUP BY`) silently passed analysis —
+      `analyzeLockingClauses` only rejected `GROUP BY`/`HAVING` combined with
+      locking, not a bare aggregate in the target list, matching upstream's
+      `CheckSelectLocking`'s `qry->hasAggs` branch
+      (`postgres/src/backend/parser/analyze.c`) which was still unimplemented.
+      Fixed: new `targetHasBareAggregate`/`isAnalyzerAggregateName`
+      (`internal/analyzer/analyzer.go`) walk every target-list expression
+      (mirrors `parser.exprContainsAggregateCall`'s FuncCall/BinaryOp/UnaryOp/
+      CastExpr/IsNullExpr/IsBoolExpr/IndirectionStar case set) and reject with
+      `0A000 "FOR UPDATE is not allowed with aggregate functions"` — verified
+      against `postgres/src/test/regress/expected/portals.out`'s `SELECT
+      MIN(f1) FROM uctest FOR UPDATE` case for both SQLSTATE and message text.
+      Tests: `TestAnalyzeForUpdateRejectsBareAggregate`,
+      `TestAnalyzeForUpdateRejectsAggregateInExpr`
+      (`internal/analyzer/locking_test.go`), confirmed non-vacuous via `git
+      stash` on `analyzer.go` alone. Gates: `go build ./...` clean; `go test
+      ./internal/analyzer/... ./internal/parser/... ./internal/planner/...`
+      PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+      (0 failed transactions, all 3 workloads). Design:
+      `docs/design/0021-0001-for-update-parser-analysis-and-ast.md` updated
+      (2026-07-08 section), `docs/design/README.md` row updated.
+      `unimplemented_feat.json`'s `M0021-0002`/aggregate-detection entry
+      flipped `open`→`resolved` (66/181 resolved, 115 open).
+- [x] **M0122-0018 — `isfinite()` NULL propagation** (~1; found while
+      surveying `unimplemented_feat.json`'s `m0097-0004` cluster, not itself a
+      backlog entry). `evalIsFinite` (`internal/executor/expr.go`) computed
+      `NewBoolDatum(!d.IsNull())` directly, so `isfinite(NULL::date)` etc.
+      returned `FALSE` instead of SQL `NULL` — `isfinite` has no `NotStrict`
+      marker on any of its 4 wired `pg_proc_seed_data.go` OIDs (1373/1389/
+      1390/2048), so like every other strict PostgreSQL function it must
+      propagate NULL rather than evaluate it. Fixed: check `d.IsNull()` first
+      and return `NullDatum`; non-NULL case unchanged (always `TRUE`, goopg v0
+      stores no infinity values). Tests: `TestIsFiniteNullPropagates`
+      (`internal/executor/isfinite_test.go`), confirmed non-vacuous via `git
+      stash` on `expr.go` alone. Gates: `go build ./...` clean; `go test
+      ./internal/executor/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+      (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+      scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+      workloads). Design: `docs/design/0003-0006-date-interval-arithmetic.md`
+      updated (2026-07-08 follow-up section), `docs/design/README.md` row
+      updated.
 
 > This task list is **seeded, not exhaustive.** The M0122-0001 triage plus every
 > future feature deferral appended to `unimplemented_feat.json` (any new `open`

@@ -415,6 +415,12 @@ func analyzeLockingClauses(s *parser.SelectStmt, ctx *scope) error {
 		return analyzeError(first.Pos(), "0A000",
 			"FOR UPDATE/SHARE is not allowed with HAVING clause")
 	}
+	for _, t := range s.Targets {
+		if targetHasBareAggregate(t.Expr) {
+			return analyzeError(first.Pos(), "0A000",
+				"FOR UPDATE is not allowed with aggregate functions")
+		}
+	}
 	for _, lc := range s.Locking {
 		for _, name := range lc.Targets {
 			if !lockingTargetMatches(name, ctx.rels) {
@@ -444,6 +450,62 @@ func lockingTargetMatches(name string, rels []scopeRel) bool {
 		if strings.EqualFold(name, rel.table.Name) {
 			return true
 		}
+	}
+	return false
+}
+
+// targetHasBareAggregate reports whether expr contains a call to a
+// standard PostgreSQL aggregate function that is not itself a window
+// function (OVER-less). Used by analyzeLockingClauses to reject
+// `SELECT count(*) FROM t FOR UPDATE`-style queries the way upstream's
+// CheckSelectLocking does via qry->hasAggs — mirrors
+// parser.exprContainsAggregateCall / planner.isAggregateFunc; kept
+// local since the analyzer does not otherwise know "aggregate" as a
+// category. M0021-0002.
+func targetHasBareAggregate(e parser.Expr) bool {
+	switch x := e.(type) {
+	case *parser.FuncCall:
+		if x.Over == nil && isAnalyzerAggregateName(x.Name.Name) {
+			return true
+		}
+		for _, a := range x.Args {
+			if targetHasBareAggregate(a) {
+				return true
+			}
+		}
+	case *parser.BinaryOp:
+		return targetHasBareAggregate(x.Left) || targetHasBareAggregate(x.Right)
+	case *parser.UnaryOp:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.CastExpr:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.IsNullExpr:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.IsBoolExpr:
+		return targetHasBareAggregate(x.Operand)
+	case *parser.IndirectionStar:
+		return targetHasBareAggregate(x.Source)
+	}
+	return false
+}
+
+// isAnalyzerAggregateName mirrors parser.isParserAggregateName /
+// planner.isAggregateFunc's standard-aggregate name set.
+func isAnalyzerAggregateName(name string) bool {
+	switch strings.ToLower(name) {
+	case "count", "sum", "avg", "min", "max",
+		"var_pop", "var_samp", "variance", "stddev_pop", "stddev_samp", "stddev",
+		"corr", "covar_pop", "covar_samp",
+		"regr_count", "regr_sxx", "regr_syy", "regr_sxy",
+		"regr_avgx", "regr_avgy", "regr_r2", "regr_slope", "regr_intercept",
+		"bool_and", "bool_or", "every",
+		"bit_and", "bit_or", "bit_xor",
+		"string_agg", "array_agg", "json_agg", "jsonb_agg",
+		"json_object_agg", "jsonb_object_agg",
+		"xmlagg", "any_value",
+		"percentile_cont", "percentile_disc", "mode",
+		"rank", "dense_rank", "cume_dist", "percent_rank":
+		return true
 	}
 	return false
 }
@@ -761,18 +823,43 @@ func analyzeTargets(targets []parser.ResTarget, ctx *scope) error {
 	return nil
 }
 
-// resolveNamedWindowRefs resolves every bare `OVER window_name`
-// reference in s against s.WindowClause (M0020 named-window slice),
-// copying the matching definition's PartitionBy/OrderBy into the
-// referencing WindowDef in place. Downstream consumers (planner,
-// executor) read FuncCall.Over.PartitionBy/OrderBy directly and need
-// no awareness of RefName — this is the only place the reference is
-// resolved. Raises 42P20 ("window %q does not exist") for a name with
-// no matching WINDOW clause item.
+// resolveNamedWindowRefs resolves every window reference in s — both a
+// bare `OVER window_name` and a combining `OVER (window_name ...)` /
+// `WINDOW w2 AS (w1 ...)` form — against s.WindowClause (M0020 named-window
+// slice plus M0122-0004's combining-forms follow-up), merging the
+// referenced definition into the referencing WindowDef in place via
+// mergeWindowDef. s.WindowClause is processed in order so a later entry may
+// reference an earlier one (chained named windows); each entry's Def is
+// mutated to hold its final, fully-merged PartitionBy/OrderBy/Frame before
+// being registered, so a third-level reference sees the resolved values,
+// not the raw parsed ones. Downstream consumers (planner, executor) read
+// FuncCall.Over.PartitionBy/OrderBy/Frame directly and need no awareness of
+// RefName — this is the only place any reference is resolved. Raises 42704
+// ("window %q does not exist") for a name with no matching (already
+// registered) WINDOW clause item, and 42P20 for a duplicate name or an
+// invalid override (see mergeWindowDef).
 func resolveNamedWindowRefs(s *parser.SelectStmt) error {
 	defs := make(map[string]*parser.WindowDef, len(s.WindowClause))
 	for _, nw := range s.WindowClause {
-		defs[strings.ToLower(nw.Name)] = nw.Def
+		lname := strings.ToLower(nw.Name)
+		if _, dup := defs[lname]; dup {
+			return analyzeError(nw.Def.Pos(), "42P20", fmt.Sprintf("window %q is already defined", nw.Name))
+		}
+		if nw.Def.RefName != "" {
+			// A WINDOW-clause entry may only reference an EARLIER entry in
+			// the same clause (mirrors parse_clause.c's transformWindowDefinitions,
+			// which looks up refname in the windows already processed) — a
+			// forward or self reference reports the same "does not exist"
+			// a genuinely undefined name would.
+			refwc, ok := defs[strings.ToLower(nw.Def.RefName)]
+			if !ok {
+				return analyzeError(nw.Def.Pos(), "42704", fmt.Sprintf("window %q does not exist", nw.Def.RefName))
+			}
+			if err := mergeWindowDef(nw.Def, refwc, true); err != nil {
+				return err
+			}
+		}
+		defs[lname] = nw.Def
 	}
 	for _, rt := range s.Targets {
 		if err := resolveWindowRefsInExpr(rt.Expr, defs); err != nil {
@@ -793,6 +880,43 @@ func resolveNamedWindowRefs(s *parser.SelectStmt) error {
 		if err := resolveWindowRefsInExpr(sb.Expr, defs); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// mergeWindowDef applies windef's reference to refwc (SQL:2008 7.11 <window
+// clause> syntax rule 10 / general rule 1, parse_clause.c's
+// transformWindowDefinitions): windef inherits refwc's PARTITION BY outright
+// — declaring its own is a hard error — may add its own ORDER BY only if
+// refwc has none, and always keeps its own frame clause (never inherited),
+// but refwc having any non-default frame clause is itself an error even
+// though windef isn't asking to inherit it (SQL:2008's asymmetric windowing
+// rule: "OVER foo" must throw if foo has a frame clause). isNamedWindow
+// distinguishes a `WINDOW name AS (...)` entry from an inline `OVER (...)`
+// clause, matching upstream's differing wording/hint for the latter's bare
+// `OVER (foo)` shape.
+func mergeWindowDef(windef *parser.WindowDef, refwc *parser.WindowDef, isNamedWindow bool) error {
+	ownOrderBy := len(windef.OrderBy) > 0
+	ownFrame := windef.Frame != nil
+	if len(windef.PartitionBy) > 0 {
+		return analyzeError(windef.Pos(), "42P20",
+			fmt.Sprintf("cannot override PARTITION BY clause of window %q", windef.RefName))
+	}
+	windef.PartitionBy = refwc.PartitionBy
+	if ownOrderBy {
+		if len(refwc.OrderBy) > 0 {
+			return analyzeError(windef.Pos(), "42P20",
+				fmt.Sprintf("cannot override ORDER BY clause of window %q", windef.RefName))
+		}
+	} else {
+		windef.OrderBy = refwc.OrderBy
+	}
+	if refwc.Frame != nil {
+		msg := fmt.Sprintf("cannot copy window %q because it has a frame clause", windef.RefName)
+		if isNamedWindow || ownOrderBy || ownFrame {
+			return analyzeError(windef.Pos(), "42P20", msg)
+		}
+		return analyzeErrorWithHint(windef.Pos(), "42P20", msg, "Omit the parentheses in this OVER clause.")
 	}
 	return nil
 }
@@ -857,11 +981,22 @@ func resolveWindowRefsInExpr(e parser.Expr, defs map[string]*parser.WindowDef) e
 		if x.Over != nil && x.Over.RefName != "" {
 			def, ok := defs[strings.ToLower(x.Over.RefName)]
 			if !ok {
-				return analyzeError(x.Over.Pos(), "42P20", fmt.Sprintf("window %q does not exist", x.Over.RefName))
+				return analyzeError(x.Over.Pos(), "42704", fmt.Sprintf("window %q does not exist", x.Over.RefName))
 			}
-			x.Over.PartitionBy = def.PartitionBy
-			x.Over.OrderBy = def.OrderBy
-			x.Over.Frame = def.Frame
+			if x.Over.IsBareRef {
+				// Bare `OVER name` (no parens) is a transparent alias —
+				// parser guarantees no own PartitionBy/OrderBy/Frame, so
+				// this reuses def's fully-merged fields wholesale with none
+				// of mergeWindowDef's override validation (matches
+				// parse_agg.c's transformWindowFuncCall bare-name lookup,
+				// which never calls transformWindowDefinitions for this
+				// case at all).
+				x.Over.PartitionBy = def.PartitionBy
+				x.Over.OrderBy = def.OrderBy
+				x.Over.Frame = def.Frame
+			} else if err := mergeWindowDef(x.Over, def, false); err != nil {
+				return err
+			}
 		}
 		for _, a := range x.Args {
 			if err := resolveWindowRefsInExpr(a, defs); err != nil {

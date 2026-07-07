@@ -2,7 +2,7 @@
 
 | field      | value |
 | ---------- | ----- |
-| status     | draft |
+| status     | accepted |
 | date       | 2026-05-07 |
 | milestone  | 0063 — TPC-H residual long-tail v2 |
 | supersedes | — |
@@ -143,3 +143,77 @@ side and eliminating per-pair LIKE eval.
   (handled by M0061-0001 / M0063-0003).
 - The outer GROUP BY + count(*) in the Q13 outer wrapper —
   unaffected by the join shape.
+
+## 8. tpch/Q13-regression post-mortem (2026-07-07, M-NIGHTLY)
+
+The rewrite proposed above landed correctly and worked for a long
+time (`Q13=33` pinned in `bench/tpch/spotcheck_expected.env` since
+the 2026-06-13 reload), but a nightly CI batch run
+(`ci/logs/20260707-000712`) surfaced Q13 failing again — first as a
+hard error, then (after the first fix below) as a silent row-count
+regression. Two independent, previously-latent bugs in the code
+paths this design describes were found and fixed in the same loop:
+
+**Bug 1 — inner-only Filter not marked `LeafLocal` (crash).**
+`planFromItem`'s LEFT JOIN conjunct-partition step (§4.1 above,
+`internal/planner/planner.go` ~line 1899) wraps the single-table
+`o_comment NOT LIKE ...` conjunct in a `Filter` over the inner
+(orders) plan and shifts its `ColumnRef.Index` from FROM-cumulative
+to inner-local coordinates (`shiftColumnRefsBy(c, -leftWidth)`) —
+exactly as designed. But that `Filter` was never marked
+`LeafLocal: true` (the M0077-0001 convention documented on the
+`Filter` struct in `plan.go`). Two post-rewrite passes that run
+later in the same `Plan()` call — `remapWithBindings` →
+`applyJoinTreePosMap` and `remapExprRefsToMHJ` →
+`remapPosMapAfterRewrite` (both in `bushy.go`) — walk every
+non-`LeafLocal` `Filter.Predicate` and reinterpret its ColumnRef
+index as a stale FROM-cumulative offset needing correction. Applied
+to an already-local index, this remaps it a second time. Concretely,
+with `customer`(8 cols) and a non-canonical `orders` column order
+(`o_orderdate` first, `o_comment` last at local index 8), the
+already-correct index 8 got remapped down to 0, silently resolving
+`o_comment` to `o_orderdate` (a `Time` value) at runtime and
+producing `operator NOT LIKE requires string operands (got
+left.Kind=5 right.Kind=3)` (42883). Fix: mark the Filter
+`LeafLocal: true` at construction, matching every other leaf-local
+Filter site in the planner.
+
+**Bug 2 — NLI's `pickInnerSide` flips LEFT JOIN preservation
+(silent row loss, found while re-verifying Bug 1's fix).** Once the
+crash above was fixed, `scripts/tpch-spotcheck.sh` still failed:
+Q13 ran to completion but returned 32 rows instead of 33 — missing
+exactly the `c_count = 0` bucket (the ~50,000 of 150,000 TPC-H SF=1
+customers with zero orders, or zero orders passing the NOT LIKE
+filter). Root cause: `internal/planner/nl_index_join.go`'s
+`tryBuildNLI` prefers `j.Right` as the NLI's indexed inner side, but
+falls back to `j.Left` (`pickInnerSide`'s `lss` branch) whenever
+`j.Right` is not a bare `*SeqScan` — which is exactly what Bug 1's
+Filter wrapper produces once `o_comment NOT LIKE` is split onto the
+orders side. That fallback makes `j.Left` (customer) the INNER
+(indexed, probed, null-extended-on-miss) side and `j.Right`
+(orders) the OUTER (loop-driving) side, without adjusting `j.Type`.
+For an INNER join this swap is a harmless no-op (either side may
+drive). For LEFT JOIN (and Semi/Anti) it silently changes which
+side is preserved: only rows visited by the OUTER loop can ever
+appear, so once `orders` drives the loop, a customer with zero
+matching orders is simply never visited and vanishes from the
+output — the exact missing `c_count = 0` bucket. Fix: `pickInnerSide`
+now declines the `j.Left`-as-inner branch whenever `j.Type !=
+JoinTypeInner`, falling back to the Hash/Merge join path (which
+correctly keeps customer as the preserved probe side, per §3/§4.2
+above) instead of silently corrupting LEFT/Semi/Anti semantics.
+
+Both fixes are pinned by regression tests:
+`internal/planner/left_join_inner_only_leaflocal_test.go`
+(`TestLeftJoinInnerOnlyConjunctFilterIsLeafLocal`, Bug 1) and the
+existing `internal/planner/nl_index_join_test.go` suite plus a new
+guard in `pickInnerSide` (Bug 2 — no dedicated NLI-flip test was
+added since the fix is a one-line type guard covered by the
+existing `TestNLIRulePromotesEquiJoinOnIndexedInner`-style suite
+plus the end-to-end `tpch-spotcheck.sh` gate). Verified via
+`scripts/tpch-spotcheck.sh` (Q12=2, Q13=33) and a fresh-server
+`go test ./...` sweep (excluding the two packages that are
+deliberately excluded from the default suite:
+`internal/testutil/tpch` — heavy scale-load tests gated behind
+`-short`/explicit `-run`; `internal/testport` — ported oracle tests
+that must be invoked explicitly per `.ralph/PROMPT.md`).

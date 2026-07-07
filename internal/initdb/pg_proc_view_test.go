@@ -103,6 +103,35 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	}
 }
 
+// TestPgProcViewRendersRoutineOwner pins proowner reflecting an ALTER
+// FUNCTION ... OWNER TO change (M0097-0150): previously every user routine's
+// proowner hard-coded "10" regardless of Routine.Owner (which didn't exist).
+func TestPgProcViewRendersRoutineOwner(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	r, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "add",
+		ArgTypes:   []catalog.Type{{Name: "int"}, {Name: "int"}},
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "plpgsql",
+		Body:       "BEGIN RETURN $1 + $2; END",
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Owner = 16400
+
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	row := rows[len(builtinProcs)]
+	if row[8] != "16400" {
+		t.Errorf("proowner = %q, want 16400", row[8])
+	}
+}
+
 // TestPgProcViewRecordReturnType pins prorettype for a function declared
 // `RETURNS record` (DU-002 slice 164): the pseudo-type record resolves to OID
 // 2249 (and record[] to 2287). Before this slice typeNameToOIDStr had no record

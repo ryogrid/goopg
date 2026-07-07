@@ -368,3 +368,60 @@ Gates: `go build ./...` clean; `go vet ./...` clean on touched packages;
 ./internal/planner/... ./internal/parser/...` all PASS (no regressions);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33); live side-by-side
 verification against real PostgreSQL 18.3 (see above).
+
+## Follow-up: RAISE NOTICE format-arg substitution never learned about the
+## OID-backed representation (2026-07-07, M-NIGHTLY loop #19)
+
+Sibling-path gap in the original `pg_typeof()`/`::regtype` OID-backed-Datum
+change above: it updated the SQL wire-output layer
+(`internal/server/dispatch.go`'s `appendTypedCellText` regtype case, added by
+this same design) to map the OID back to a display name, but missed
+plpgsql's `RAISE`/format-arg substitution path
+(`internal/executor/plpgsql_runtime.go`'s `evalRaiseMsg`), which formats each
+`%`-substituted argument via the raw `Datum.Format()` — for a `KindInt`
+Datum that's just the decimal number. Since `pg_typeof(x)` and `x::regtype`
+now evaluate to `KindInt` OIDs (per the change above), any
+`RAISE NOTICE '... %', pg_typeof(x)` printed the bare `pg_type` OID (e.g.
+`25`) instead of the type name (`text`) real PostgreSQL prints.
+
+Surfaced by tonight's nightly regression triage as two isolation-spec
+failures previously promoted to strict/pass-required (both specs' shared
+plpgsql helper does `RAISE NOTICE '%: % ...', ..., pg_typeof(p_a), p_a, ...`):
+`AI-20260707-000712-002` (`eval-plan-qual.spec`) and
+`AI-20260707-000712-003` (`eval-plan-qual-trigger.spec`, see
+`docs/design/0118-0095-eval-plan-qual-trigger-promotion.md`) — both regressed
+from byte-for-byte PG parity to hundreds of `NOTICE` line mismatches
+(`upid: 25 checking` instead of `upid: text checking`) purely from this gap;
+no other executor behavior changed.
+
+**Fix:** new `isRegtypeExpr(e planner.Expr) bool` helper in
+`plpgsql_runtime.go` recognizes the two regtype-producing expression shapes
+syntactically (a `*planner.FuncCall` named `pg_typeof`, or a
+`*planner.CastExpr` with `TargetType == "regtype"`) — `planner.exprType` is
+unexported so the executor package cannot query the general-purpose static
+type resolver, but both of `evalRaiseMsg`'s callers already have direct
+access to the lowered `planner.Expr` for each format arg, so a narrow
+syntactic check is sufficient (mirrors this file's own `expr.go` switch on
+`x.Name.String() == "pg_typeof"` used elsewhere in this design's change).
+When the evaluated arg is `KindInt` and `isRegtypeExpr` holds, `evalRaiseMsg`
+now calls `RegtypeName(cat, uint32(val.Int), !regObjectSchemaVisible(ctx,
+"public"))` — the same helper and qualify-visibility contract the wire-output
+layer uses — instead of `val.Format()`.
+
+Verified non-vacuous: reverting just the `plpgsql_runtime.go` hunk reproduces
+both the isolation-spec failures and a dedicated regression test failing with
+the exact bare-OID symptom (`"23: 25 text"` instead of `"integer: text
+text"`, proving both the `pg_typeof()` and `::regtype`-cast code paths were
+broken); restoring the fix passes all three.
+
+Tests: `internal/server/notice_test.go`'s new
+`TestNoticeRaisePgTypeofRendersTypeName` (real client/server round-trip via
+`pq`'s notice handler, covers both `pg_typeof(x)` and a literal `::regtype`
+cast in one `RAISE NOTICE` format string).
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/server/...` PASS; `go test -v -run
+'^TestPort_IsolationEvalPlanQual$|^TestPort_IsolationEvalPlanQualTrigger$'
+./internal/testport/` PASS (both specs back to byte-for-byte PG parity);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS (0
+failed transactions, standard/simple-update/select-only).

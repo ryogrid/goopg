@@ -44,7 +44,9 @@ import (
 	"time"
 
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/auth"
@@ -114,6 +116,13 @@ type Config struct {
 	// config.BuildDefaultRegistry() — the seeded set of variables we
 	// already advertise. See docs/design/0004-configuration-and-guc.md.
 	Registry *config.Registry
+
+	// ConfigPath is the postgresql.conf path Registry was originally
+	// loaded from (cmd/goopg's -config / auto-discovered
+	// <DataDir>/postgresql.conf). RELOAD (`goopg reload` or SIGHUP)
+	// re-parses this file and re-applies it to Registry. Empty means
+	// there is no file to re-read, so RELOAD is a no-op.
+	ConfigPath string
 
 	// Catalog / Pool / TxnMgr are the storage handles the executor
 	// needs for table-form COPY (and, in future loops, every other
@@ -572,9 +581,11 @@ func (s *Server) Run(ctx context.Context) error {
 
 // startControlPlane writes the pidfile and binds the Unix-domain
 // command socket. STOP cancels runCancel so the accept loop drains.
-// RELOAD is a v0 no-op — the GUC system can already absorb a new
-// postgresql.conf via SET, but a true restart-the-listener reload
-// is deferred.
+// RELOAD (control-socket command or SIGHUP) re-parses cfg.ConfigPath
+// and re-applies it to cfg.Registry via reloadConfig; a true
+// restart-the-listener reload (for PGC_POSTMASTER-context changes)
+// is still deferred — those are reported as warnings and require an
+// actual process restart.
 func (s *Server) startControlPlane(runCtx context.Context, runCancel context.CancelFunc, ln net.Listener) error {
 	dir := s.cfg.DataDir
 	socketPath := filepath.Join(dir, control.SocketName)
@@ -632,7 +643,8 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 		return nil
 	}
 	cl.OnReload = func() error {
-		s.cfg.Logger.Info("control: reload requested (v0 no-op)")
+		s.cfg.Logger.Info("control: reload requested")
+		s.reloadConfig()
 		return nil
 	}
 	cl.OnCheckpoint = func() error {
@@ -656,8 +668,55 @@ func (s *Server) startControlPlane(runCtx context.Context, runCancel context.Can
 			s.cfg.Logger.Debug("control listener serve returned", "err", err)
 		}
 	}()
-	_ = runCtx // referenced for future cancellation hooks
+	// A bare `kill -HUP <pid>` is upstream's other reload trigger
+	// besides `pg_ctl reload` (which itself just sends SIGHUP to the
+	// postmaster) — wire it to the same reloadConfig path as the
+	// control-socket RELOAD command above so both routes agree.
+	hupCh := make(chan os.Signal, 1)
+	signal.Notify(hupCh, syscall.SIGHUP)
+	go func() {
+		defer signal.Stop(hupCh)
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-hupCh:
+				s.cfg.Logger.Info("SIGHUP received, reloading configuration")
+				s.reloadConfig()
+			}
+		}
+	}()
 	return nil
+}
+
+// reloadConfig re-parses cfg.ConfigPath (if set) and re-applies its
+// entries to cfg.Registry, logging a summary of what changed and any
+// entries that could not be applied. Invoked by the control-socket
+// RELOAD command (`goopg reload`) and by SIGHUP — the same two
+// triggers upstream `pg_ctl reload` and `kill -HUP <postmaster-pid>`
+// offer. A malformed or missing file never crashes the server; it
+// only fails to update the running configuration, matching
+// ProcessConfigFile's "log and keep the old values" behaviour.
+func (s *Server) reloadConfig() {
+	if s.cfg.ConfigPath == "" {
+		s.cfg.Logger.Info("control: reload requested but no config file was loaded at startup, nothing to do")
+		return
+	}
+	registry := s.cfg.Registry
+	if registry == nil {
+		s.cfg.Logger.Warn("control: reload requested but no GUC registry is configured")
+		return
+	}
+	entries, err := config.ParseConfigFile(s.cfg.ConfigPath)
+	if err != nil {
+		s.cfg.Logger.Error("control: reload failed to parse config file", "path", s.cfg.ConfigPath, "err", err)
+		return
+	}
+	result := registry.ApplyReloadEntries(entries)
+	for _, w := range result.Warnings {
+		s.cfg.Logger.Warn("control: reload", "issue", w)
+	}
+	s.cfg.Logger.Info("control: reload complete", "path", s.cfg.ConfigPath, "changed", result.Changed, "warnings", len(result.Warnings))
 }
 
 func (s *Server) stopControlPlane() {
@@ -835,6 +894,20 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			logger.Info("connection rejected: unknown database", "database", db)
 			return
 		}
+
+		// M0119-0006 (AC-002 residual #1): reject a connection to a database
+		// marked `datconnlimit = -2` (left partway through DROP DATABASE),
+		// mirroring PG's InitPostgres FATAL 55000 "cannot connect to invalid
+		// database" (postinit.c). Only the -2 sentinel is enforced here —
+		// positive datconnlimit throttling needs a live per-database
+		// connection counter and is a separate, untested-here feature (see
+		// the matching deferral ledger row).
+		if reg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok && reg.DatabaseConnLimit(db) == catalog.DatconnlimitInvalidDB {
+			s.writeFatal(w, sqlstate.ObjectNotInPrerequisiteState,
+				fmt.Sprintf("cannot connect to invalid database %q", db))
+			logger.Info("connection rejected: invalid database", "database", db)
+			return
+		}
 	}
 
 	logger.Info("connection established")
@@ -881,6 +954,30 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 			reg.Unregister(pidStr)
 		}
 	}()
+
+	// M0119-0006 (AC-002 residual #2): reject a non-superuser connection once
+	// the database's live connection count exceeds a positive `datconnlimit`,
+	// mirroring PG's InitPostgres/CheckMyDatabase FATAL 53300 "too many
+	// connections for database" (postinit.c). Placed after reg.Register above
+	// so CountByDatName's scan already includes this connection's own slot,
+	// matching CountDBConnections' self-inclusive count (postinit.c's own
+	// comment: "we create our PGPROC before checking for other PGPROCs").
+	// Superuser connections are still counted (matching CountDBConnections
+	// having no role filter) but skip the reject check itself, exactly like
+	// upstream's `!am_superuser` gate.
+	if db := params["database"]; db != "" && !isReplication && reg != nil {
+		if limReg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok {
+			if limit := limReg.DatabaseConnLimit(db); limit >= 0 && !isSuperuserRoleName(user) {
+				if count := reg.CountByDatName(db); count > limit {
+					s.writeFatal(w, sqlstate.TooManyConnections,
+						fmt.Sprintf("too many connections for database %q", db))
+					logger.Info("connection rejected: too many connections",
+						"database", db, "limit", limit, "count", count)
+					return
+				}
+			}
+		}
+	}
 
 	// Wire client-I/O wait-event hooks on the frame reader/writer.
 	// M0107-0005: capture reg + procNum (int32); WaitEventStart/End are

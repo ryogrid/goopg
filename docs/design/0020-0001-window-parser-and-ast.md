@@ -232,6 +232,103 @@ syntax (see `postgres/src/test/regress/sql/window.sql`) not
 exercised by this loop's tests; deferred to a follow-up if a real
 query shape needs them.
 
+## Follow-up: combining window forms (2026-07-07, M0122-0004)
+
+Implemented the two combining forms the previous follow-up scoped
+out: `OVER (existing_window_name ...)` extending a named window at
+the reference site, and a `WINDOW w2 AS (w1 ...)` entry basing itself
+on an earlier named window. Both are governed by SQL:2008 7.11
+`<window clause>` syntax rule 10 / general rule 1 (upstream:
+`transformWindowDefinitions`, `postgres/src/backend/parser/parse_clause.c`),
+confirmed field-for-field against a live PostgreSQL 18.3 instance
+before implementing (see `.ralph/deferral_ledger.md`'s 2026-07-07 row
+for the exact probe transcript): the referencing side inherits the
+referenced window's `PARTITION BY` outright (declaring its own is an
+error), may add its own `ORDER BY` only if the referenced window has
+none, and always keeps its own frame clause (never inherited) — but
+the referenced window having *any* frame clause at all is itself an
+error, regardless of what the referencing side declares.
+
+**Crucial distinction this loop's own first implementation attempt
+got wrong** (caught by the pre-existing `TestCompatWindowExplicitRowsFrameSliding`
+compat test, not by a new test written for this slice): a
+parenthesis-free `OVER name` reference is a *different* upstream AST
+shape from `OVER (name)` — gram.y's `over_clause: OVER ColId` sets
+`WindowDef.name` (not `.refname`) and is resolved by
+`transformWindowFuncCall` (`parse_agg.c`) via a direct name-indexed
+alias into `pstate->p_windowdefs`, entirely bypassing
+`transformWindowDefinitions`'s override validation — so `OVER w`
+referencing a `w` that itself has a frame clause is always legal,
+while the *parenthesized* `OVER (w)` (and any `OVER (w ...)` variant)
+goes through the override checks and would raise "cannot copy window
+\"w\" because it has a frame clause" for the same `w`. Confirmed
+against real PostgreSQL 18.3 both ways. `parser.WindowDef` gained
+`IsBareRef bool`, set only by the parenthesis-free identifier branch
+of `parseWindowDef`; the analyzer skips override validation entirely
+for that case (wholesale field copy, matching the original
+pre-combining-forms behavior byte-for-byte) and only runs it for the
+parenthesized shape.
+
+**Parser (`internal/parser/select.go`):** `parseWindowSpecBody` now
+recognises an optional leading `existing_window_name` — a bare or
+quoted identifier immediately after `(`, excluding the bare (unquoted)
+words `rows`/`range`/`groups` so `OVER (ROWS BETWEEN ...)` still
+parses as an anonymous frame clause rather than misreading `ROWS` as
+a window name (mirrors gram.y's documented precedence trick giving
+`PARTITION`/`RANGE`/`ROWS`/`GROUPS` the same precedence as `IDENT` so
+the empty-`opt_existing_window_name` production wins the shift/reduce
+conflict). `KwPartition`/`KwOrder` are already distinct keyword tokens
+in this lexer, so no analogous exclusion is needed for those.
+
+**Analyzer (`internal/analyzer/analyzer.go`):** `resolveNamedWindowRefs`
+now processes `s.WindowClause` in list order (matching
+`pstate->p_windowdefs`'s append order upstream), building the
+`name → *WindowDef` map incrementally so a later entry may reference
+an earlier one — a forward or undefined reference reports the same
+"does not exist" a genuinely unknown name would (a self-reference is
+necessarily "forward" too, since a name isn't registered until after
+its own entry is processed) — and rejects a duplicate name with
+`42P20` ("window %q is already defined", previously entirely
+unchecked). Each entry is mutated in place to hold its final merged
+`PartitionBy`/`OrderBy`/`Frame` via the new `mergeWindowDef` helper
+before being registered, so a third-level reference
+(`w3 AS (w2 ...)` where `w2 AS (w1 ...)`) sees already-resolved
+values. The same helper is reused for a `FuncCall`'s own inline
+`OVER (name ...)` in `resolveWindowRefsInExpr`, guarded by
+`!x.Over.IsBareRef`.
+
+**Bug fixed in passing:** the undefined-window-name diagnostic
+(`window %q does not exist`) was raising `42P20`
+(`ERRCODE_WINDOWING_ERROR`) — upstream's `parse_agg.c`/`parse_clause.c`
+both use `42704` (`ERRCODE_UNDEFINED_OBJECT`) for this specific
+message, confirmed against PostgreSQL 18.3
+(`TestAnalyzeNamedWindowUndefinedRejected` updated accordingly). `42P20`
+is upstream's code for the override/duplicate-name errors this
+follow-up newly added, not for a missing name.
+
+**Tests:** `internal/parser/window_test.go`
+(`TestParseWindowClauseOverCombiningForm`,
+`TestParseWindowClauseNamedWindowBasedOnNamedWindow`,
+`TestParseWindowClauseRefNameExcludesFrameModeWords`);
+`internal/analyzer/analyzer_test.go`
+(`TestAnalyzeNamedWindowCombiningFormAccepted`,
+`TestAnalyzeNamedWindowCombiningFormErrors`,
+`TestAnalyzeNamedWindowBareRefToFramedWindowAccepted` — pins the
+bare-vs-parenthesized distinction above); `internal/executor/
+window_compat_test.go`'s `TestCompatWindowCombiningForms`. All error
+shapes and the accepted-merge shapes were independently confirmed
+against a live PostgreSQL 18.3 instance before being encoded as Go
+test expectations. Gates: `go build ./...`/`go vet` clean; `go test
+./internal/parser/... ./internal/analyzer/... ./internal/executor/...
+./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke bash
+scripts/ralph-precommit-test.sh` PASS (0 failed transactions, all 3
+workloads).
+
+**Still out of scope:** `RANGE`/`GROUPS` frame modes remain an
+unrelated, larger deferred item (tracked above); combining forms
+involving those modes are moot until that lands.
+
 ## Follow-up: frame-consuming aggregate window functions (2026-07-05, M0122-0004)
 
 Implemented `sum`/`count`/`avg`/`min`/`max` as window functions

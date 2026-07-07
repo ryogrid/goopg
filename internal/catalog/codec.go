@@ -1123,12 +1123,17 @@ func decodePGBool(v byte, field string) (bool, error) {
 
 // PGIndexRow holds the fields from pg_index needed for catalog recovery.
 type PGIndexRow struct {
-	IndexRelid   uint32  // indexrelid
-	IndRelid     uint32  // indrelid (owning table OID)
-	IndNAtts     int16   // indnatts
-	IndKey       []int16 // attnum values for each indexed column
-	IndIsUnique  bool    // indisunique
-	IndIsPrimary bool    // indisprimary
+	IndexRelid          uint32  // indexrelid
+	IndRelid            uint32  // indrelid (owning table OID)
+	IndNAtts            int16   // indnatts (key columns + INCLUDE columns)
+	IndNKeyAtts         int16   // indnkeyatts (key columns only; the rest of IndKey is INCLUDE columns)
+	IndKey              []int16 // attnum values: key columns first, then INCLUDE columns
+	IndIsUnique         bool    // indisunique
+	IndNullsNotDistinct bool    // indnullsnotdistinct
+	IndIsPrimary        bool    // indisprimary
+	IndOption           []int16 // per-key ASC/DESC + NULLS FIRST/LAST bitmask (INDOPTION_DESC=0x1, INDOPTION_NULLS_FIRST=0x2)
+	IndHasPred          bool    // true if indpred is non-NULL (partial index)
+	IndPred             string  // indpred's WHERE-clause SQL text (goopg stores pg_node_tree columns as SQL text; see column_defaults_recovery.go)
 }
 
 const (
@@ -1136,12 +1141,14 @@ const (
 	// pg_index physical heap tuple up to (and including) the padding byte
 	// before indkey. Layout: indexrelid[4] + indrelid[4] + indnatts[2] +
 	// indnkeyatts[2] + 11 bool fields[11] + 1 pad = 24 bytes.
-	pgIndexFixedSize       = 24
-	pgIndexOffIndexRelid   = 0
-	pgIndexOffIndRelid     = 4
-	pgIndexOffIndNAtts     = 8
-	pgIndexOffIndIsUnique  = 12
-	pgIndexOffIndIsPrimary = 14
+	pgIndexFixedSize              = 24
+	pgIndexOffIndexRelid          = 0
+	pgIndexOffIndRelid            = 4
+	pgIndexOffIndNAtts            = 8
+	pgIndexOffIndNKeyAtts         = 10
+	pgIndexOffIndIsUnique         = 12
+	pgIndexOffIndNullsNotDistinct = 13
+	pgIndexOffIndIsPrimary        = 14
 	// indkey int2vector starts at offset 24 after the 1-byte alignment pad.
 	pgIndexOffIndKey = 24
 )
@@ -1157,7 +1164,9 @@ func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
 	r.IndexRelid = binary.LittleEndian.Uint32(data[pgIndexOffIndexRelid : pgIndexOffIndexRelid+4])
 	r.IndRelid = binary.LittleEndian.Uint32(data[pgIndexOffIndRelid : pgIndexOffIndRelid+4])
 	r.IndNAtts = int16(binary.LittleEndian.Uint16(data[pgIndexOffIndNAtts : pgIndexOffIndNAtts+2]))
+	r.IndNKeyAtts = int16(binary.LittleEndian.Uint16(data[pgIndexOffIndNKeyAtts : pgIndexOffIndNKeyAtts+2]))
 	r.IndIsUnique = data[pgIndexOffIndIsUnique] != 0
+	r.IndNullsNotDistinct = data[pgIndexOffIndNullsNotDistinct] != 0
 	r.IndIsPrimary = data[pgIndexOffIndIsPrimary] != 0
 
 	// Decode indkey int2vector (ArrayType varlena) at fixed offset 24.
@@ -1180,7 +1189,115 @@ func DecodePGIndexPhysicalRow(data []byte) (PGIndexRow, error) {
 	for i := range r.IndKey {
 		r.IndKey[i] = int16(binary.LittleEndian.Uint16(blob[vectorHdrSize+2*i : vectorHdrSize+2*i+2]))
 	}
+
+	// indcollation, indclass, and indoption follow indkey as three more
+	// 4-byte-aligned varlena columns (oidvector, oidvector, int2vector —
+	// see pgIndexColumnsPG18). Walk past the first two (their content
+	// isn't needed here) to reach indoption, which carries the per-key
+	// ASC/DESC + NULLS FIRST/LAST ordering (INDOPTION_DESC=0x1,
+	// INDOPTION_NULLS_FIRST=0x2) — without decoding it, an index's
+	// declared column ordering silently reverted to all-ascending on
+	// every restart (M0122-0006). Any decode failure below is treated as
+	// "no indoption available" rather than a hard error, since the fields
+	// already decoded above remain valid on their own.
+	off := pgIndexAlign4(pgIndexOffIndKey + needed)
+	for i := 0; i < 2; i++ { // indcollation, indclass
+		total, ok := pgVarlenaTotalLen(data, off)
+		if !ok {
+			return r, nil
+		}
+		off = pgIndexAlign4(off + total)
+	}
+	if len(data) < off+vectorHdrSize {
+		return r, nil
+	}
+	optBlob := data[off:]
+	m := int(binary.LittleEndian.Uint32(optBlob[16:20]))
+	if m < 0 || m > 1024 || len(optBlob) < vectorHdrSize+2*m {
+		return r, nil
+	}
+	r.IndOption = make([]int16, m)
+	for i := range r.IndOption {
+		r.IndOption[i] = int16(binary.LittleEndian.Uint16(optBlob[vectorHdrSize+2*i : vectorHdrSize+2*i+2]))
+	}
+
+	// indexprs follows indoption but is always NULL in practice: goopg has
+	// no expression-index support (catalog.Index.Columns holds only plain
+	// column names), so buildUserPGIndexRow (internal/executor/
+	// pg18_user_catalog_rows.go) never writes it. A NULL varlena column
+	// consumes zero bytes in a physical heap tuple (see encodeRowPG), so any
+	// bytes remaining after indoption belong entirely to indpred — the
+	// WHERE-clause predicate, stored as SQL text (mirroring
+	// column_defaults_recovery.go's expression-as-text round-trip). This
+	// lets indpred's presence be inferred from data length alone, without
+	// needing the tuple's null bitmap (some callers, e.g.
+	// operators_ddl.go's stampCatalogRows, only have the data bytes handy).
+	// If expression-index support is ever added, this assumption breaks and
+	// indexprs/indpred will need real null-bitmap-aware decoding.
+	predOff := pgIndexAlign4(off + vectorHdrSize + 2*m)
+	if predOff < len(data) {
+		if text, ok := decodePGIndexVarlenaText(data[predOff:]); ok {
+			r.IndHasPred = true
+			r.IndPred = text
+		}
+	}
 	return r, nil
+}
+
+// decodePGIndexVarlenaText decodes a PG varlena text payload (either the
+// 1-byte short header or 4-byte uncompressed header form — see
+// internal/executor/codec.go's varlenaTextBytes, which this mirrors) at
+// data[0:]. Returns ok=false for anything that doesn't look like a valid,
+// uncompressed, non-external varlena, so callers can treat it as "absent"
+// rather than surfacing a hard error.
+func decodePGIndexVarlenaText(data []byte) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	header := data[0]
+	if header&0x01 == 0x01 {
+		if header == 0x01 {
+			return "", false // external (TOAST) varlena — not expected here
+		}
+		total := int(header >> 1)
+		if total < 2 || total > len(data) {
+			return "", false
+		}
+		return string(data[1:total]), true
+	}
+	if len(data) < 4 {
+		return "", false
+	}
+	hdr4 := binary.LittleEndian.Uint32(data[:4])
+	if hdr4&0x03 == 0x02 {
+		return "", false // compressed varlena — not expected here
+	}
+	total := int(hdr4 >> 2)
+	if total < 4 || total > len(data) {
+		return "", false
+	}
+	return string(data[4:total]), true
+}
+
+// pgIndexAlign4 rounds off up to the next 4-byte boundary, matching
+// PostgreSQL's 'i' (int) alignment applied between successive varlena
+// attributes (oidvector/int2vector) in a physical heap tuple.
+func pgIndexAlign4(off int) int {
+	return (off + 3) &^ 3
+}
+
+// pgVarlenaTotalLen reads a 4-byte-uncompressed varlena header's total
+// byte length (vl_len_>>2) at data[off:], returning ok=false if the
+// header is out of range or the header itself doesn't fit.
+func pgVarlenaTotalLen(data []byte, off int) (int, bool) {
+	if off < 0 || len(data) < off+4 {
+		return 0, false
+	}
+	total := int(binary.LittleEndian.Uint32(data[off:off+4]) >> 2)
+	if total < 4 || off+total > len(data) {
+		return 0, false
+	}
+	return total, true
 }
 
 // PGStatisticRow holds the fields from pg_statistic needed for in-memory

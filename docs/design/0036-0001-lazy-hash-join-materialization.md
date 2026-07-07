@@ -174,6 +174,58 @@ Total 2 files changed. No planner changes.
 - Q2 on partial SF=1 data: completes, peak RSS < 15 GB.
 - All 22 queries: no regressions from lazy output.
 
+## 7. 2026-07-07 update: residual-filter-only misses dropped LEFT JOIN rows (M0119-0004)
+
+**Symptom:** `pg_dump`'s `getTableAttrs` (`pg_attribute a LEFT JOIN pg_constraint co ON
+(a.attrelid = co.conrelid AND co.contype = 'n' AND co.conkey = array[a.attnum])`)
+failed with `invalid column numbering in table "pnnl_1"` — pg_dump's client-side
+sequential-attnum check (`pg_dump.c:9370`) tripped because goopg's query silently
+omitted the row for the table's first column whenever that column had no matching
+`pg_constraint` row and a *different* column of the same table did (two rows sharing
+the hash-join key `attrelid=conrelid`, only one of them also satisfying the residual
+`conkey = array[attnum]` conjunct).
+
+**Root cause:** `nextLazy`'s hash-match loop (§4.3) iterates every candidate in
+`lazyMatches` and applies the join's full `Predicate` — necessary because the hash
+key alone (`LeftKey`/`RightKey`) doesn't cover residual conjuncts the planner ANDed on
+via `pushOneConjunct` (see the loop's own comment, e.g. TPC-H Q9's
+`ps_partkey=l_partkey`). But the loop only recognised two outcomes: "yield a match"
+(a candidate passes `Predicate`) or "the whole probe row has zero hash-level
+candidates" (`len(matches) == 0`, handled separately below the loop, which correctly
+null-pads for LEFT JOIN). It never handled the third case — **the hash key matched,
+`lazyMatches` is non-empty, but every candidate fails the residual `Predicate`** — the
+inner loop just exhausts, `lazyActive` goes false, and control falls straight into
+"pull next probe row", silently dropping the outer row instead of null-padding it.
+This is a genuine correctness bug (not restricted to system catalogs — reproduces with
+plain user tables, e.g. `outer_t(id,k) LEFT JOIN inner_t(rid,k2) ON id=rid AND k=k2`
+where two `outer_t` rows share the same `id` but only one shares `k`).
+
+**Fix** (`internal/executor/operators_join_agg.go`): added a `lazyProbeMatched bool`
+field, set `true` the moment any candidate in the current probe's `lazyMatches` passes
+`Predicate`, and reset to `false` each time a new probe row's `lazyMatches`/`lazyActive`
+are set up. When the per-match loop exhausts (`lazyActive` was true, now nothing left),
+check `!lazyProbeMatched`: if the join is `LEFT` and `!BuildLeft` (the same direction
+the pre-existing `len(matches)==0` branch already covers), emit the null-padded row for
+`lazyRow` exactly as that branch does, instead of continuing to the next probe row.
+`BuildLeft=true` LEFT JOINs are untouched (nextLazy's existing "preserve unmatched"
+logic was already scoped to `!BuildLeft` before this fix; extending it to the
+build-left direction needs the classic "track consumed build rows, emit leftovers at
+EOF" algorithm, a separate, larger change, not attempted here since the planner does
+not appear to combine `BuildLeft` with `JoinTypeLeft` in the reachable query shapes —
+Semi/Anti already force `BuildLeft=false` a few lines above).
+
+**Verification:** `internal/executor/leftjoin_hash_residual_dropped_row_test.go`
+(`TestLeftJoinHashResidualFilterPreservesUnmatchedRow`) pins the minimal user-table
+shape; confirmed non-vacuous via `git stash` on just this file (fails pre-fix with
+"got 1 rows, want 2", passes post-fix). `internal/testport`'s
+`TestPort_PgDumpConnectionSetup` DU-002 guard advances past the `invalid column
+numbering` gap to the next (already-documented, milestone-scale) blocker. Full
+`go test ./internal/executor/... ./internal/planner/...` PASS;
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `TestPort_IsolationEvalPlanQual`/
+`TestPort_IsolationEvalPlanQualTrigger` PASS (both exercise LEFT JOIN-heavy plpgsql
+paths); `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS (0 failed
+transactions, all three pgbench workloads).
+
 ## 6. Reference
 
 - `internal/executor/operators_join_agg.go:20-29` — `joinOp` struct

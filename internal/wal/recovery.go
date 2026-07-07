@@ -744,6 +744,16 @@ const (
 	//   bit2=Strict) | volatileLen(2) | volatile(volatileLen bytes)
 	RecordKindAlterFunctionFlags byte = 64
 
+	// RecordKindAlterFunctionOwner records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE name(args) OWNER TO newowner` event (M0097-0150). Format:
+	//   kind(1) | ownerOID(4) | oid(4)
+	RecordKindAlterFunctionOwner byte = 121
+
+	// RecordKindAlterFunctionSetSchema records an `ALTER FUNCTION/PROCEDURE/
+	// ROUTINE name(args) SET SCHEMA newschema` event (M0097-0150). Format:
+	//   kind(1) | oid(4) | newSchemaLen(2) | newSchema(newSchemaLen bytes)
+	RecordKindAlterFunctionSetSchema byte = 122
+
 	// RecordKindSequenceState records the FULL state of one sequence
 	// (definition + current counter) so sequences — including the implicit
 	// sequences backing SERIAL/IDENTITY columns — survive a restart. goopg's
@@ -6114,6 +6124,62 @@ func DecodeAlterFunctionFlags(payload []byte) (oid uint32, volatile string, secu
 	return oid, string(payload[8 : 8+volLen]), securityDefiner, leakproof, strict, nil
 }
 
+// EncodeAlterFunctionOwner encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// OWNER TO event (M0097-0150). Format documented at the
+// RecordKindAlterFunctionOwner constant.
+func EncodeAlterFunctionOwner(oid, ownerOID uint32) []byte {
+	out := make([]byte, 9)
+	out[0] = RecordKindAlterFunctionOwner
+	binary.LittleEndian.PutUint32(out[1:5], ownerOID)
+	binary.LittleEndian.PutUint32(out[5:9], oid)
+	return out
+}
+
+// DecodeAlterFunctionOwner decodes a RecordKindAlterFunctionOwner payload.
+func DecodeAlterFunctionOwner(payload []byte) (oid, ownerOID uint32, err error) {
+	if len(payload) < 9 {
+		return 0, 0, fmt.Errorf("wal: alter-function-owner payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionOwner {
+		return 0, 0, fmt.Errorf("wal: record kind %d is not alter-function-owner", payload[0])
+	}
+	ownerOID = binary.LittleEndian.Uint32(payload[1:5])
+	oid = binary.LittleEndian.Uint32(payload[5:9])
+	return oid, ownerOID, nil
+}
+
+// EncodeAlterFunctionSetSchema encodes an ALTER FUNCTION/PROCEDURE/ROUTINE
+// SET SCHEMA event (M0097-0150). Format documented at the
+// RecordKindAlterFunctionSetSchema constant.
+func EncodeAlterFunctionSetSchema(oid uint32, newSchema string) []byte {
+	if len(newSchema) > 0xFFFF {
+		newSchema = newSchema[:0xFFFF]
+	}
+	out := make([]byte, 7+len(newSchema))
+	out[0] = RecordKindAlterFunctionSetSchema
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(newSchema)))
+	copy(out[7:], newSchema)
+	return out
+}
+
+// DecodeAlterFunctionSetSchema decodes a RecordKindAlterFunctionSetSchema
+// payload.
+func DecodeAlterFunctionSetSchema(payload []byte) (oid uint32, newSchema string, err error) {
+	if len(payload) < 7 {
+		return 0, "", fmt.Errorf("wal: alter-function-set-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindAlterFunctionSetSchema {
+		return 0, "", fmt.Errorf("wal: record kind %d is not alter-function-set-schema", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	schemaLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+schemaLen {
+		return 0, "", fmt.Errorf("wal: alter-function-set-schema payload truncated (need %d bytes)", 7+schemaLen)
+	}
+	return oid, string(payload[7 : 7+schemaLen]), nil
+}
+
 // CreateIndexPayload carries the metadata needed to fully
 // reconstruct a btree index in the in-memory catalog during
 // recovery. Order of fields mirrors `catalog.Index`'s exported
@@ -6127,13 +6193,49 @@ type CreateIndexPayload struct {
 	Columns  []string
 	Unique   bool
 	Primary  bool
+	// ColDescending / ColNullsFirst carry the per-key-column ASC/DESC +
+	// NULLS FIRST/LAST ordering (mirrors upstream's pg_index.indoption
+	// bitmask) so a restart-triggered replay of this record restores the
+	// exact same catalog.Index.ColDescending/ColNullsFirst state the live
+	// CREATE INDEX produced, instead of silently defaulting every column
+	// to ascending/NULLS LAST. Parallel to Columns; index i describes
+	// Columns[i].
+	ColDescending []bool
+	ColNullsFirst []bool
+	// --- M0122-0006 follow-up: index properties beyond column ordering.
+	// Carried in a self-describing, OPTIONAL trailing "extension" block
+	// (see encodeCreateIndexExtension/decodeCreateIndexExtension) appended
+	// after the ColDescending/ColNullsFirst blocks. Omitted entirely when
+	// every field below is at its zero value, so a plain index's WAL record
+	// stays byte-identical to a pre-this-follow-up record — mirroring
+	// catalog.Index's own "zero means unset, dumps byte-identically"
+	// discipline for these same fields.
+	HasPredicate     bool
+	PredicateString  string
+	IncludeColumns   []string
+	ColOpClasses     []string // parallel to Columns; "" = default opclass
+	ColCollations    []string // parallel to Columns; "" = default collation
+	Fillfactor       int
+	DeduplicateItems *bool
+	NullsNotDistinct bool
 }
 
 // EncodeCreateIndex encodes a CREATE INDEX event (M0079-0001).
 // Format documented at the RecordKindCreateIndex constant.
+//
+// ColDescending/ColNullsFirst (M0122-0006) are appended as two trailing
+// numCols-byte blocks AFTER the column name list, deliberately NOT
+// interleaved with each column's bytes: this keeps the format
+// append-only, so DecodeCreateIndex can still read a pre-M0122-0006 WAL
+// record (which simply lacks the trailing blocks — e.g. an existing
+// on-disk cluster's history) without misparsing column name bytes as
+// order flags.
+//
+// A further optional "extension" block (M0122-0006 follow-up) may follow
+// the order blocks — see hasCreateIndexExtension/encodeCreateIndexExtension.
 func EncodeCreateIndex(p CreateIndexPayload) []byte {
 	const headerSize = 1 + 4 + 4 + 1 + 1 + 2 + 2 + 2 + 2
-	totalLen := headerSize + len(p.Schema) + len(p.Name) + len(p.Method)
+	totalLen := headerSize + len(p.Schema) + len(p.Name) + len(p.Method) + 2*len(p.Columns)
 	for _, c := range p.Columns {
 		totalLen += 2 + len(c)
 	}
@@ -6160,7 +6262,241 @@ func EncodeCreateIndex(p CreateIndexPayload) []byte {
 		off += 2
 		off += copy(out[off:], c)
 	}
+	for i := range p.Columns {
+		if i < len(p.ColDescending) && p.ColDescending[i] {
+			out[off] = 1
+		}
+		off++
+	}
+	for i := range p.Columns {
+		if i < len(p.ColNullsFirst) && p.ColNullsFirst[i] {
+			out[off] = 1
+		}
+		off++
+	}
+	if hasCreateIndexExtension(p) {
+		out = append(out, encodeCreateIndexExtension(p)...)
+	}
 	return out
+}
+
+// Bit layout for encodeCreateIndexExtension's leading flags byte.
+const (
+	ciExtHasPredicate     = 1 << 0
+	ciExtDedupSpecified   = 1 << 1
+	ciExtDedupValue       = 1 << 2
+	ciExtHasOpClasses     = 1 << 3
+	ciExtHasCollations    = 1 << 4
+	ciExtNullsNotDistinct = 1 << 5
+)
+
+// hasCreateIndexExtension reports whether p carries any of the M0122-0006
+// follow-up fields at a non-zero value. When false, EncodeCreateIndex omits
+// the extension block entirely so a plain index's WAL record is unaffected
+// by this follow-up.
+func hasCreateIndexExtension(p CreateIndexPayload) bool {
+	if p.HasPredicate || len(p.IncludeColumns) > 0 || p.Fillfactor != 0 ||
+		p.DeduplicateItems != nil || p.NullsNotDistinct {
+		return true
+	}
+	for _, s := range p.ColOpClasses {
+		if s != "" {
+			return true
+		}
+	}
+	for _, s := range p.ColCollations {
+		if s != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// encodeCreateIndexExtension encodes the M0122-0006 follow-up "index
+// properties" block: a leading flags byte (ciExt* bits), a fillfactor
+// int32, the partial-index predicate string (when present), the INCLUDE
+// column list, and — parallel to p.Columns — per-column opclass/collation
+// overrides (only when at least one column has a non-default value, mirroring
+// the ColOpClasses/ColCollations "empty means all default" catalog contract).
+// Self-terminating: DecodeCreateIndex parses it to end-of-payload and
+// verifies nothing is left over.
+func encodeCreateIndexExtension(p CreateIndexPayload) []byte {
+	var flags byte
+	if p.HasPredicate {
+		flags |= ciExtHasPredicate
+	}
+	if p.DeduplicateItems != nil {
+		flags |= ciExtDedupSpecified
+		if *p.DeduplicateItems {
+			flags |= ciExtDedupValue
+		}
+	}
+	if p.NullsNotDistinct {
+		flags |= ciExtNullsNotDistinct
+	}
+	numCols := len(p.Columns)
+	hasOpClasses := false
+	for _, s := range p.ColOpClasses {
+		if s != "" {
+			hasOpClasses = true
+			break
+		}
+	}
+	hasCollations := false
+	for _, s := range p.ColCollations {
+		if s != "" {
+			hasCollations = true
+			break
+		}
+	}
+	if hasOpClasses {
+		flags |= ciExtHasOpClasses
+	}
+	if hasCollations {
+		flags |= ciExtHasCollations
+	}
+
+	size := 1 + 4 // flags + fillfactor
+	if p.HasPredicate {
+		size += 2 + len(p.PredicateString)
+	}
+	size += 2 // numInclude
+	for _, c := range p.IncludeColumns {
+		size += 2 + len(c)
+	}
+	if hasOpClasses {
+		for i := 0; i < numCols; i++ {
+			size += 2 + len(stringAt(p.ColOpClasses, i))
+		}
+	}
+	if hasCollations {
+		for i := 0; i < numCols; i++ {
+			size += 2 + len(stringAt(p.ColCollations, i))
+		}
+	}
+
+	out := make([]byte, size)
+	off := 0
+	out[off] = flags
+	off++
+	binary.LittleEndian.PutUint32(out[off:off+4], uint32(int32(p.Fillfactor)))
+	off += 4
+	if p.HasPredicate {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(p.PredicateString)))
+		off += 2
+		off += copy(out[off:], p.PredicateString)
+	}
+	binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(p.IncludeColumns)))
+	off += 2
+	for _, c := range p.IncludeColumns {
+		binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
+		off += 2
+		off += copy(out[off:], c)
+	}
+	if hasOpClasses {
+		for i := 0; i < numCols; i++ {
+			c := stringAt(p.ColOpClasses, i)
+			binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
+			off += 2
+			off += copy(out[off:], c)
+		}
+	}
+	if hasCollations {
+		for i := 0; i < numCols; i++ {
+			c := stringAt(p.ColCollations, i)
+			binary.LittleEndian.PutUint16(out[off:off+2], uint16(len(c)))
+			off += 2
+			off += copy(out[off:], c)
+		}
+	}
+	return out
+}
+
+func stringAt(s []string, i int) string {
+	if i < len(s) {
+		return s[i]
+	}
+	return ""
+}
+
+// decodeCreateIndexExtension parses the M0122-0006 follow-up block written by
+// encodeCreateIndexExtension, starting at *off, and advances *off past it.
+// Callers must verify *off == len(payload) afterward (nothing left over).
+func decodeCreateIndexExtension(payload []byte, off *int, numCols int, p *CreateIndexPayload) error {
+	if len(payload) < *off+5 {
+		return fmt.Errorf("wal: create-index payload truncated in extension header")
+	}
+	flags := payload[*off]
+	*off++
+	p.Fillfactor = int(int32(binary.LittleEndian.Uint32(payload[*off : *off+4])))
+	*off += 4
+	if flags&ciExtHasPredicate != 0 {
+		if len(payload) < *off+2 {
+			return fmt.Errorf("wal: create-index payload truncated in predicate length")
+		}
+		predLen := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
+		*off += 2
+		if len(payload) < *off+predLen {
+			return fmt.Errorf("wal: create-index payload truncated in predicate body")
+		}
+		p.HasPredicate = true
+		p.PredicateString = string(payload[*off : *off+predLen])
+		*off += predLen
+	}
+	if len(payload) < *off+2 {
+		return fmt.Errorf("wal: create-index payload truncated in include-columns count")
+	}
+	numInclude := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
+	*off += 2
+	p.IncludeColumns = make([]string, 0, numInclude)
+	for i := 0; i < numInclude; i++ {
+		if len(payload) < *off+2 {
+			return fmt.Errorf("wal: create-index payload truncated at include column %d header", i)
+		}
+		l := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
+		*off += 2
+		if len(payload) < *off+l {
+			return fmt.Errorf("wal: create-index payload truncated at include column %d body", i)
+		}
+		p.IncludeColumns = append(p.IncludeColumns, string(payload[*off:*off+l]))
+		*off += l
+	}
+	if flags&ciExtHasOpClasses != 0 {
+		p.ColOpClasses = make([]string, numCols)
+		for i := 0; i < numCols; i++ {
+			if len(payload) < *off+2 {
+				return fmt.Errorf("wal: create-index payload truncated at opclass %d header", i)
+			}
+			l := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
+			*off += 2
+			if len(payload) < *off+l {
+				return fmt.Errorf("wal: create-index payload truncated at opclass %d body", i)
+			}
+			p.ColOpClasses[i] = string(payload[*off : *off+l])
+			*off += l
+		}
+	}
+	if flags&ciExtHasCollations != 0 {
+		p.ColCollations = make([]string, numCols)
+		for i := 0; i < numCols; i++ {
+			if len(payload) < *off+2 {
+				return fmt.Errorf("wal: create-index payload truncated at collation %d header", i)
+			}
+			l := int(binary.LittleEndian.Uint16(payload[*off : *off+2]))
+			*off += 2
+			if len(payload) < *off+l {
+				return fmt.Errorf("wal: create-index payload truncated at collation %d body", i)
+			}
+			p.ColCollations[i] = string(payload[*off : *off+l])
+			*off += l
+		}
+	}
+	if flags&ciExtDedupSpecified != 0 {
+		v := flags&ciExtDedupValue != 0
+		p.DeduplicateItems = &v
+	}
+	p.NullsNotDistinct = flags&ciExtNullsNotDistinct != 0
+	return nil
 }
 
 // DecodeCreateIndex decodes a RecordKindCreateIndex payload.
@@ -6204,6 +6540,43 @@ func DecodeCreateIndex(payload []byte) (CreateIndexPayload, error) {
 		}
 		p.Columns = append(p.Columns, string(payload[off:off+colLen]))
 		off += colLen
+	}
+	// ColDescending/ColNullsFirst (M0122-0006) are two trailing numCols-byte
+	// blocks appended AFTER the column list — append-only so a pre-existing
+	// on-disk WAL record predating this field (which simply ends here, with
+	// no trailing blocks) still decodes: every column defaults to
+	// ascending/NULLS LAST, matching its actual pre-M0122-0006 behavior.
+	p.ColDescending = make([]bool, numCols)
+	p.ColNullsFirst = make([]bool, numCols)
+	switch remaining := len(payload) - off; {
+	case remaining == 0:
+		// Pre-M0122-0006 record: no trailing blocks at all. Valid — every
+		// column defaults to ascending/NULLS LAST, matching its actual
+		// pre-M0122-0006 behavior.
+	case remaining < 2*numCols:
+		return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload truncated in trailing order blocks (have %d trailing bytes, want 0 or at least %d)", remaining, 2*numCols)
+	default:
+		for i := 0; i < numCols; i++ {
+			p.ColDescending[i] = payload[off] != 0
+			off++
+		}
+		for i := 0; i < numCols; i++ {
+			p.ColNullsFirst[i] = payload[off] != 0
+			off++
+		}
+		// M0122-0006 follow-up: an optional "extension" block (predicate/
+		// INCLUDE/opclass/collation/fillfactor/dedup/NULLS NOT DISTINCT) may
+		// follow the order blocks — present iff bytes remain. A record with
+		// remaining == 2*numCols exactly (no extension) is the prior
+		// M0122-0006 format and needs no further parsing here.
+		if off < len(payload) {
+			if err := decodeCreateIndexExtension(payload, &off, numCols, &p); err != nil {
+				return CreateIndexPayload{}, err
+			}
+			if off != len(payload) {
+				return CreateIndexPayload{}, fmt.Errorf("wal: create-index payload has %d unexpected trailing bytes after extension block", len(payload)-off)
+			}
+		}
 	}
 	return p, nil
 }

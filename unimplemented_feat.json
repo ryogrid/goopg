@@ -13,6 +13,7 @@
    "feature": "Optimize WAL logical change record storage to reduce write-ahead log volume growth during database initialization.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Logical change records to restore the optimisation are deferred to a post-M0002 milestone"
    ],
@@ -27,12 +28,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No WAL logical change record optimization found in codebase"
+   "code_audit": "RESOLVED 2026-07-07: Logical change-record WAL optimization is implemented — see `docs/design/0002-0003-redo-records.md` (all sub-loops a-d landed) and `internal/wal/recovery.go:31-63` (RecordKindHeapInsert/BtreeInsert/HeapDelete/HeapVacuum) + `internal/storage/bufpool.go:1502` (Pool.MarkDirtyChangeRecord). pgbench-i WAL volume documented as dropping from ~1.6GB to ~21MB. Note: the design doc's own Status field and docs/design/README.md:67 still literally say \"draft\" despite the code being landed and exercised — a docs-hygiene gap, not a code gap."
   },
   {
    "feature": "Implement signal-based configuration refresh (SIGHUP-style) for the reload command so configuration changes take effect without restarting the server.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "v0 server-side handler is a no-op until per-GUC SIGHUP-style refresh wires up"
    ],
@@ -47,12 +49,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: cmd/goopg/main.go:1171 reload command prints configuration reload no-op"
+   "code_audit": "confirmed-open 2026-07-07: cmd/goopg/main.go:1181 runReload prints 'configuration reload signalled (v0 no-op)'; server-side internal/server/server.go:634-637 OnReload callback logs 'reload requested (v0 no-op)' and returns nil. Control-socket RELOAD plumbing (internal/control/control.go:286-293) is fully wired end-to-end, but the callback itself does no GUC re-read/config-file re-parse. Old line citation (main.go:1171) was stale from file drift; substance unchanged."
   },
   {
    "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "restart: documented stub since v0 runs in the foreground"
    ],
@@ -73,6 +76,7 @@
    "feature": "Implement tablespace support for directing table and index storage to different physical locations.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "v0 deliberately defers — tablespaces"
    ],
@@ -93,6 +97,7 @@
    "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "v0 deliberately defers — multi-database"
    ],
@@ -113,6 +118,7 @@
    "feature": "ANY/SOME/ALL quantified subqueries",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Correlated subqueries / initplan caching / ANY-SOME-ALL stay documented as deferred"
    ],
@@ -133,6 +139,7 @@
    "feature": "DML sub-plan rendering in EXPLAIN (showing plans for INSERT/UPDATE/DELETE statements)",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "deferred items (EXPLAIN ANALYZE, FORMAT JSON, COSTS, the DML sub-plan rendering)"
    ],
@@ -153,6 +160,7 @@
    "feature": "Timestamp-timestamp interval arithmetic (subtracting timestamps produces intervals)",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -167,12 +175,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/expr.go:1294 comment says timestamp-timestamp subtraction scope-deferred"
+   "code_audit": "confirmed-open 2026-07-07: internal/executor/expr.go:1359-1366 (evalBinary, OpAdd/OpSub case) still routes only KindTime+KindInterval through addTimeInterval; comment explicitly states 'timestamp - timestamp (returns interval upstream; scope-deferred until the type system)' — no KindTime-KindTime path exists anywhere in expr.go (only the unrelated equality helper at line 6495 compares KindTime==KindTime for `=`). timestamp1 - timestamp2 still falls through to the integer-arithmetic path and errors. No test exercises timestamp-timestamp interval subtraction."
   },
   {
    "feature": "Sub-day interval units (hours, minutes, seconds, milliseconds) for interval arithmetic",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out of scope (deferred): EXTRACT (its own grammar), timestamp-timestamp interval, sub-day units, multi-field intervals"
    ],
@@ -187,12 +196,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/expr.go:141 IntervalLit only supports day/month/year units"
+   "code_audit": "confirmed-open 2026-07-07: internal/parser/select.go:3009-3016 (Form 1, trailing-unit interval '<N>' <unit>) and :3089-3092 (splitEmbeddedInterval, Form 2 interval '<N> <unit>') both switch only on day/days, month/months, year/years — no hour/minute/second/millisecond/microsecond cases exist in internal/parser (grep for hour|minute|millisecond|microsecond in parser/*.go hits only a comment at expr.go:119-121 noting 'sub-second fields wait'). internal/executor's KindInterval carrier (datum.go:28-37) also only packs months+days, explicitly 'drops sub-day precision.' Both parser and storage layer remain day-granularity only."
   },
   {
    "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "the deferred items (SASLprep, channel binding, scram_iterations GUC)"
    ],
@@ -207,12 +217,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/scram.go:857 channel binding not supported, SASLprep absent"
+   "code_audit": "confirmed-open: internal/auth/scram.go:45,75,150 scramDefaultIterations hardcoded (scram_iterations GUC registered in internal/config/defaults.go:184 but never consulted); scram.go:279-289 channel binding explicitly rejected; no SASLprep anywhere — GUC registration is cosmetic only"
   },
   {
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Lehman/Yao crab-walk is deferred"
    ],
@@ -227,12 +238,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:585 Lehman-Yao right-link only, crab-walk staged"
+   "code_audit": "confirmed-open 2026-07-07: internal/access/btree/btree.go:578-614 still documents only Landing 2 of milestone 0002 — readers use Lehman-Yao right-link recovery (descendToLeaf, btree.go:1301-1332) but writers serialize all split-path inserts through a single tree-wide splitMu sync.Mutex (btree.go:614), not per-level lock-coupling/crab-walk descent. The struct comment explicitly states 'Landing 3's full writer-coupling protocol is still staged' and M0055-0004-followup-stage2-splitmu-removal's attempt to drop splitMu caused buffer-pool 'unpin underflow' races (fixed for PinNew only in M0056-0001), so splitMu itself remains in place. No grep hits for 'crab' or 'coupled' anywhere in the package."
   },
   {
    "feature": "EXPLAIN ANALYZE output rendering of BUFFERS and SETTINGS options with Pool-level instrumentation for page-pin and page-read counter metrics.",
    "task_id": null,
    "resume_point": "Pool-level page-pin/page-read instrumentation",
+   "status": "resolved",
    "evidence": [
     "BUFFERS / SETTINGS counter rendering is queued as a Pool-level page-pin/page-read instrumentation follow-up"
    ],
@@ -247,12 +259,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0018-0004 lines 123-125 defer BUFFERS/SETTINGS to future work"
+   "code_audit": "RESOLVED 2026-07-07: docs/design/0122-0003-explain-format-xml-yaml.md:110-115 status table shows SETTINGS rendering done, BUFFERS rendering partial (TEXT+JSON/XML/YAML, ANALYZE-only, shared hit/read(+dirtied/written) only). Landed via internal/storage/bufpool.go (sharedHitCount/sharedReadCount/sharedDirtiedCount/sharedWrittenCount counters) + internal/executor/operators_explain.go (appendExplainSettingsRow/addExplainSettingsGroup/formatBuffersLine), tests internal/executor/explain_buffers_test.go + explain_settings_test.go. Old citation (docs/design/0018-0004:123-125) still literally says out-of-scope — that text was never edited — but the follow-up landed in the later 0122-0003 doc (2026-07-04) instead. BUFFERS remains partial (no planning-time buffers when ANALYZE off, no local/temp terms) — resolving as the core ask (BUFFERS+SETTINGS rendering with Pool instrumentation) is met, partial-BUFFERS residual noted for any future audit."
   },
   {
    "feature": "Support for EXPLAIN FORMAT XML and FORMAT YAML options to output query plans in XML or YAML format.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "FORMAT XML/YAML -> \"unsupported FORMAT\""
    ],
@@ -267,12 +280,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/explain_options_test.go:136 confirms FORMAT XML unsupported"
+   "code_audit": "RESOLVED 2026-07-07: internal/parser/ast.go:473-474 adds ExplainFormatXML/ExplainFormatYAML; internal/parser/parser.go:1479,1481 sets opts.Format for xml/yaml keywords. internal/parser/explain_options_test.go:133-144's test flipped from rejects-XML to TestParseExplainAcceptsXMLFormat (old citation's line 136 still exists but its assertion changed). Rendering in internal/executor/operators_explain_format.go (renderExplainXML/renderExplainYAML), tests internal/executor/explain_format_xml_yaml_test.go. Landed 2026-07-04 per docs/design/0122-0003-explain-format-xml-yaml.md:52-90."
   },
   {
    "feature": "Per-CTE execution statistics tracking in PostgreSQL's pg_stat_* system catalogs for individual CTE performance visibility.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "per-CTE pg_stat_* counters"
    ],
@@ -287,12 +301,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No per-CTE execution statistics found in codebase"
+   "code_audit": "confirmed-open 2026-07-07: no pg_stat_statements/per-CTE grep hits in internal/catalog/catalog.go; existing pg_stat_* virtual tables (pg_stat_slru:6995, pg_stat_wal:7031, pg_stat_io:7061) are all whole-relation/whole-backend granularity, none CTE-keyed. Real PostgreSQL has no such catalog either (CTEs aren't persistent objects with an OID to key stats by) — gap expected to stay open by design. Note: goopg did add unrelated per-CTE EXPLAIN ANALYZE node annotations (docs/design/0122-0003...md:36-45), but that's transient per-query-plan instrumentation, not a pg_stat_* catalog — doesn't satisfy this entry."
   },
   {
    "feature": "DELETE row identification when pgoutput emits empty K body; row identity unavailable for xmax stamping",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pgoutput emits an empty K body so the row to stamp xmax on isn't identifiable; tracked as a wire-format extension follow-up"
    ],
@@ -307,12 +322,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/pgoutput.go:17 states v0 DELETE has no pre-image"
+   "code_audit": "RESOLVED 2026-07-07: pre-image capture + 'O' full-old-tuple pgoutput DELETE encoding is implemented end-to-end (internal/wal/recovery.go:6593-6637, internal/executor/operators_storage.go:5469-5493, internal/wal/pgoutput.go:231-251). The only stale artifact is the file-header comment at internal/wal/pgoutput.go:17 (\"D Delete (no pre-image in v0; tuple body is 0 attrs)\"), which no longer reflects the code below it. Residual gap: capture is unconditional (always full old row) rather than gated by each table's configured REPLICA IDENTITY (DEFAULT/NOTHING/USING INDEX), so it over-sends compared to strict PG semantics — not a functional regression, but worth a follow-up note."
   },
   {
    "feature": "MESSAGE message type ('M') in pgoutput",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "'Y' TYPE / 'M' MESSAGE / 2PC / streaming v2: out of scope"
    ],
@@ -334,6 +350,7 @@
    "feature": "Per-slot catalog-xmin retention hook in vacuum and pruning operations",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "the per-slot catalog-xmin retention hook in vacuum / pruning remain deferred"
    ],
@@ -348,12 +365,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No per-slot catalog-xmin retention hook in vacuum operations"
+   "code_audit": "confirmed-open: internal/mvcc/manager.go:586-602 (OldestXmin) never consults wal.Slots/Slot.CatalogXmin (internal/wal/slots.go:70-76); internal/vacuum/*.go has no slot-awareness at all. Design doc docs/design/0008-0001-logical-decoding-pipeline.md:131-144 self-documents the gap as unresolved."
   },
   {
    "feature": "EXPLAIN SETTINGS option rendering to display configuration settings; currently parsed but produces no output.",
    "task_id": "M0018-0004",
    "resume_point": "M0018-0004",
+   "status": "resolved",
    "evidence": [
     "BUFFERS ... parsed-but-no-op until M0018-0004",
     "SETTINGS ... parsed-but-no-op until M0018-0004"
@@ -370,12 +388,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0018-0004:123 defers SETTINGS rendering to future work"
+   "code_audit": "RESOLVED 2026-07-07: docs/design/0122-0003-explain-format-xml-yaml.md:121-183 'SETTINGS rendering (later loop, 2026-07-04)' section — internal/config/guc.go FlagExplain, internal/config/session.go ExplainVariables(), internal/executor/operators_explain.go appendExplainSettingsRow/addExplainSettingsGroup, tests internal/executor/explain_settings_test.go. Duplicate of the entry-1 SETTINGS half — both this entry (M0018-0004) and entry 1 pointed at the stale 0018-0004 doc section, superseded by 0122-0003."
   },
   {
    "feature": "Optimize performance by deferring Wait across sequential Appends in the WAL writer loop to enable true pipelining",
    "task_id": "m0009",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Real perf-pipelining waits on a loop redesign that defers Wait across Appends"
    ],
@@ -396,6 +415,7 @@
    "feature": "Handling schema changes during a logical slot's lifetime (currently surfaces as decoder errors)",
    "task_id": "M0008",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Schema changes during the slot's life surface as decoder errors when they bite — out of scope for the M0008 first acceptance bar"
    ],
@@ -416,6 +436,7 @@
    "feature": "wal_sync_method GUC selector to configure WAL synchronization method.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "wal_sync_method GUC selector ... remain deferred"
    ],
@@ -436,6 +457,7 @@
    "feature": "WAL segment recycling to reuse old segments instead of unlinking.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "`wal_recycle` ... remain deferred"
    ],
@@ -456,6 +478,7 @@
    "feature": "Eager next-segment lookahead for WAL preallocation optimization.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "eager next-segment lookahead ... remain deferred"
    ],
@@ -470,12 +493,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go: WAL preallocation optimization not found"
+   "code_audit": "PARTIAL: WAL segment preallocation of the current segment on first open is implemented (internal/wal/writer.go:1896-1961, wal_init_zero GUC), landed via docs/design/0007-0001-wal-segment-preallocation.md. Still missing: eager next-segment lookahead (pre-creating segment N+1 in the background before the write head reaches it) — state.openSegment (writer.go:1896) only preallocates synchronously when a segment is first needed."
   },
   {
    "feature": "Counters for WAL preallocation metrics and monitoring.",
    "task_id": "M0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "counters ... remain deferred"
    ],
@@ -496,6 +520,7 @@
    "feature": "parsePrimaryConninfo does not parse user, sslmode, password, and other libpq parameters beyond host and port",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "user / sslmode / etc. follow in later loops"
    ],
@@ -510,12 +535,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: cmd/goopg/main.go:975-984 parsePrimaryConninfoFull omits sslmode password"
+   "code_audit": "PARTIAL: cmd/goopg/main.go:971-1000 parsePrimaryConninfoFull now parses host/port/application_name/user (user landed since the old audit); sslmode and password are still unparsed/unused anywhere in the conninfo path — stale doc comment at line 958 still claims all three are deferred."
   },
   {
    "feature": "Multi-timeline WAL operations are not implemented",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out-of-scope: multi-timeline operation"
    ],
@@ -530,12 +556,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Commit message explicitly lists multi-timeline operation as out-of-scope"
+   "code_audit": "confirmed-open: internal/server/replication.go:407-408,427 rejects non-current TIMELINE on START_REPLICATION (\"START_REPLICATION TIMELINE %d not supported (v0 is single-timeline)\"); docs/design/0005-0001-streaming-replication-architecture.md:305-307 lists \"Multi-timeline operation\" out of scope."
   },
   {
    "feature": "Cascading replication (standby replicating to other standby instances) is not implemented",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Out-of-scope: cascading replication"
    ],
@@ -550,12 +577,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/replication.go:1-11 START_REPLICATION deferred, cascading not found"
+   "code_audit": "confirmed-open: docs/design/0005-0001-streaming-replication-architecture.md:308 \"Cascading replication (standby-of-standby). Single-hop only.\" — no forwarding code found in internal/server/replication.go (note: the old audit's premise that START_REPLICATION itself is deferred is stale; START_REPLICATION is implemented at internal/server/replication.go:400-680, only cascading/forwarding is missing)."
   },
   {
    "feature": "Streaming replication implementation is deferred across approximately 25 follow-up items spanning wire protocol, WAL streaming machinery, replication slots, standby side features, configuration surface, and promotion logic",
    "task_id": "m0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "fix_plan.md decomposed into ~25 follow-up items grouped under: architecture, wire protocol, WAL streaming machinery, replication slots, standby side, configuration surface, promotion"
    ],
@@ -570,12 +598,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0005-0001-streaming-replication-architecture.md deferral noted"
+   "code_audit": "PARTIAL: docs/design/README.md:87-93 (0005-0001..0005-0007, all accepted) + :324-333 (M0102-0001..0005, all accepted) show roughly 15 of the original ~25 follow-up items landed (wire protocol, WAL streaming, slots+retention, standby replay, observability, promotion, BASE_BACKUP, sync rep, failover E2E harness); .ralph/fix_plan.md:3121-3123 (M0122-0013, unchecked, ~10 items) tracks the remainder: cascading replication, multi-timeline operation, STANDBY_SNAPSHOT_READY transition (still only a comment at internal/wal/format.go:239), plus misc hardening items."
   },
   {
    "feature": "BETWEEN SYMMETRIC operator variant that allows reversed range endpoints",
    "task_id": "m0003",
    "resume_point": "0003-0013",
+   "status": "resolved",
    "evidence": [
     "BETWEEN SYMMETRIC"
    ],
@@ -596,6 +625,7 @@
    "feature": "KindDate carrier type for proper date-specific BETWEEN codec semantics",
    "task_id": "m0003",
    "resume_point": "0003-0013",
+   "status": "open",
    "evidence": [
     "KindDate carrier"
    ],
@@ -610,12 +640,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/design/0003-0013-between-operator.md:106 KindDate carrier explicitly deferred"
+   "code_audit": "confirmed-open 2026-07-07: no KindDate carrier exists — internal/executor/datum.go:21-64 DatumKind enum lists KindNull/KindBool/KindInt/KindString/KindBytes/KindTime/KindInterval/KindNumeric/KindToastPointer/KindEnum only; date and timestamp values both still share KindTime. Repo-wide grep for KindDate hits only docs/design/0003-0013-between-operator.md:104-106 (which still lists it under 'Out of scope (deferred)') and backlog/tooling artifacts — zero hits in any .go source file. Gap is unaddressed."
   },
   {
    "feature": "Implement window frame clause semantics for ROWS, RANGE, GROUPS frame modes and frame exclusion options.",
    "task_id": "M0020",
    "resume_point": "implement frame clause execution logic",
+   "status": "open",
    "evidence": [
     "Frame clauses (ROWS / RANGE / GROUPS / frame-exclusion) parse but error explicitly with 'frame clauses are not supported in v0'"
    ],
@@ -630,12 +661,13 @@
     "later_commits": "confirmed-open-code-audit: select.go:3439 frame clauses rejected by parser"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved 2026-07-05 (M0122-0004): ROWS frame mode now parses and executes end-to-end. New parser.WindowFrame AST (internal/parser/expr.go/select.go's parseFrameClause/parseFrameBound/parseFrameExclusion); analyzer.validateWindowFrame rejects RANGE/GROUPS with 0A000 (deliberate v0 scope limit, not a bug) and validates ROWS bound ordering with 42P20; planner.WindowAgg.Frame carries the resolved frame through buildWindowStage/resolveWindowFrame; executor's evalExplicitFrameAggFuncs/frameBounds (internal/executor/operators_window.go) reproduce postgres/src/backend/executor/nodeWindowAgg.c's update_frameheadpos/update_frametailpos ROWS arithmetic exactly, including EXCLUDE CURRENT ROW/GROUP/TIES (frameRowExcluded) and frame-aware first_value/last_value/nth_value (cume_dist stays frame-independent per spec). Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go's TestAnalyzeWindowFrameRowsAccepted/TestAnalyzeWindowFrameRangeGroupsRejected/TestAnalyzeWindowFrameBoundOrderingRejected, internal/executor/window_compat_test.go's TestCompatWindowExplicitRowsFrameSliding/TestCompatWindowExplicitFrameExcludeCurrentRow/TestCompatWindowExplicitFrameExcludeGroupAndTies/TestCompatWindowFrameNegativeOffsetRejected. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. RANGE/GROUPS frame modes remain open (need per-ORDER-BY-column peer comparison / group-counting bounds, not just ROWS' row-index arithmetic) — see .ralph/deferral_ledger.md."
+   "code_audit": "partially-resolved 2026-07-07 (re-verified, no change since M0122-0004): ROWS frame mode remains the only implemented frame unit — internal/analyzer/analyzer.go:1570-1571 still hard-rejects RANGE/GROUPS with 0A000 ('RANGE and GROUPS window frame units are not supported in v0; only ROWS is implemented'). ROWS-frame tests still pass at HEAD: TestCompatWindowExplicitRowsFrameSliding, TestCompatWindowExplicitFrameExcludeCurrentRow, TestCompatWindowExplicitFrameExcludeGroupAndTies, TestCompatWindowFrameNegativeOffsetRejected all PASS (go test ./internal/executor/ -run 'TestCompatWindowExplicit...'). RANGE/GROUPS peer-comparison / group-counting bounds still unimplemented — core gap remains OPEN. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section; see .ralph/deferral_ledger.md."
   },
   {
    "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
    "task_id": "M0020",
    "resume_point": "support named window references and definitions",
+   "status": "resolved",
    "evidence": [
     "Named-window references (`OVER win_name`) and WINDOW definition clauses also deferred"
    ],
@@ -650,12 +682,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): OVER window_name bare reference + trailing WINDOW name AS (...) clause now parse and resolve. parser.SelectStmt.WindowClause []NamedWindowDef + WindowDef.RefName (internal/parser/ast.go, expr.go, select.go); analyzer.resolveNamedWindowRefs copies the named definition's PartitionBy/OrderBy into the referencing WindowDef before analyzeTargets runs, so planner/executor need zero changes (internal/analyzer/analyzer.go). Raises 42P20 for an undefined name. Combining forms (OVER (win_name ORDER BY ...), a named window based on another named window) remain unsupported. Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go, internal/executor/window_compat_test.go's TestCompatWindowNamedWindowClause. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. Frame clauses (M0020's other still-open item) are unaffected/still open."
+   "code_audit": "RESOLVED 2026-07-05 (M0122-0004): OVER window_name bare reference + trailing WINDOW name AS (...) clause now parse and resolve. parser.SelectStmt.WindowClause []NamedWindowDef + WindowDef.RefName (internal/parser/ast.go, expr.go, select.go); analyzer.resolveNamedWindowRefs copies the named definition's PartitionBy/OrderBy into the referencing WindowDef before analyzeTargets runs, so planner/executor need zero changes (internal/analyzer/analyzer.go). Raises 42P20 for an undefined name. Combining forms (OVER (win_name ORDER BY ...), a named window based on another named window) remain unsupported. Tests: internal/parser/window_test.go, internal/analyzer/analyzer_test.go, internal/executor/window_compat_test.go's TestCompatWindowNamedWindowClause. Design: docs/design/0020-0001-window-parser-and-ast.md Follow-up section. Frame clauses (M0020's other still-open item) are unaffected/still open. FOLLOW-UP RESOLVED 2026-07-07 (M0122-0004 combining-forms slice): both previously-open combining forms now work, matching parse_clause.c's transformWindowDefinitions/parse_agg.c's transformWindowFuncCall byte-for-byte against a live PostgreSQL 18.3 instance. parser.WindowDef gained IsBareRef (true only for the parenthesis-free OVER name alias, which skips override validation entirely per upstream's separate bare-name winref lookup) plus parseWindowSpecBody's leading opt_existing_window_name recognition (excludes the ROWS/RANGE/GROUPS frame-mode words, mirroring gram.y's IDENT-precedence trick). analyzer.mergeWindowDef implements the SQL:2008 7.11 override rules: inherits PARTITION BY outright (own is 42P20), may add ORDER BY only if the referenced window has none (else 42P20), always keeps its own frame clause but errors 42P20 if the referenced window has any frame clause at all. Also fixed a latent bug the new merge path surfaced: the undefined-window-name diagnostic was wrongly 42P20 (windowing_error); upstream uses 42704 (ERRCODE_UNDEFINED_OBJECT) for this specific message. Tests: internal/parser/window_test.go's TestParseWindowClauseOverCombiningForm/TestParseWindowClauseNamedWindowBasedOnNamedWindow/TestParseWindowClauseRefNameExcludesFrameModeWords; internal/analyzer/analyzer_test.go's TestAnalyzeNamedWindowCombiningFormAccepted/TestAnalyzeNamedWindowCombiningFormErrors/TestAnalyzeNamedWindowBareRefToFramedWindowAccepted; internal/executor/window_compat_test.go's TestCompatWindowCombiningForms. Design: docs/design/0020-0001-window-parser-and-ast.md new Follow-up section."
   },
   {
    "feature": "Implement per-row lock timestamp stamping during streaming execution to track exact lock timing.",
    "task_id": "M0021",
    "resume_point": "refactor for per-row streaming stamping",
+   "status": "open",
    "evidence": [
     "Per-row streaming stamping needs a seqScanOp Pin/RLock-per-row refactor and is deferred",
     "streaming per-row stamping ... all stay deferred",
@@ -677,12 +710,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_window.go lacks lock timestamp stamping logic"
+   "code_audit": "confirmed-open 2026-07-07 (old citation was mislabeled — operators_window.go is the window-function operator, 0 lock-related lines). Real row-locking lives in internal/executor/operators_lockrows.go (lockRowsOp.stampLock/stampLockInner, ~lines 843-1100+), which stamps HeapXmax* lock-mode infomask bits + a real XID onto the tuple header (M0021-0003 Stage A, extended through M0118-0003/0009). No wall-clock 'lock timestamp' is recorded per row anywhere — only XID/infomask state; grep for 'lock timestamp'/'LockTimestamp' across the repo returns nothing. Genuinely unimplemented; unclear this is even a real PG-compat concept (PG has no per-row lock-acquisition timestamp)."
   },
   {
    "feature": "Detection of aggregate functions in SELECT ... FOR UPDATE target lists to enforce proper locking constraints when aggregates appear in the target.",
    "task_id": "M0021-0002",
    "resume_point": "planner slice",
+   "status": "resolved",
    "evidence": [
     "Aggregate-functions-in-target detection and locking-inside-subqueries deferred"
    ],
@@ -697,12 +731,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/locking_test.go:11-98 no aggregate detection in FOR UPDATE"
+   "code_audit": "RESOLVED 2026-07-08: internal/analyzer/analyzer.go's analyzeLockingClauses now scans every target-list expression via new targetHasBareAggregate (mirrors parser.exprContainsAggregateCall's FuncCall/BinaryOp/UnaryOp/CastExpr/IsNullExpr/IsBoolExpr/IndirectionStar walk + isAnalyzerAggregateName's standard-aggregate name set) and rejects a bare aggregate with no GROUP BY (e.g. SELECT count(*) FROM t FOR UPDATE) via 0A000 \"FOR UPDATE is not allowed with aggregate functions\", matching upstream's CheckSelectLocking qry->hasAggs branch (postgres/src/backend/parser/analyze.c) in both SQLSTATE and message text (verified against postgres/src/test/regress/expected/portals.out's SELECT MIN(f1) FROM uctest FOR UPDATE case). New tests TestAnalyzeForUpdateRejectsBareAggregate / TestAnalyzeForUpdateRejectsAggregateInExpr in internal/analyzer/locking_test.go (confirmed non-vacuous via git stash). See docs/design/0021-0001-for-update-parser-analysis-and-ast.md 2026-07-08 update."
   },
   {
    "feature": "Optimize per-row writeHeapRow operations by pinning heap data to improve memory locality during bulk writes.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "per-row writeHeapRow pinning + statement-cache deferred"
    ],
@@ -717,12 +752,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/ no pinning/locality optimization found"
+   "code_audit": "confirmed-open 2026-07-07: internal/executor/operators_storage.go:7595-7720 (writeHeapRow/writeHeapRowReturning) and internal/executor/heap_insert_select.go (FSM candidate selection, hotPinThreshold, batchExtendAndRegisterFSM) show real M0107-0007 perf work — but it's about page selection to avoid pin contention, not pinning heap data for memory locality. Each row-write still does a plain Pool.Pin/Unpin per tuple; no locality/prefetch optimization found anywhere in internal/executor or internal/storage."
   },
   {
    "feature": "Implement statement-level caching to reduce preparation overhead across repeated query executions.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "per-row writeHeapRow pinning + statement-cache deferred"
    ],
@@ -737,12 +773,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/dispatch.go:803 only query-scoped cache not statement-level"
+   "code_audit": "RESOLVED 2026-07-07: cross-session 16-shard plan cache landed commit 5c17297d 'feat(m0098-0005)' (internal/server/plancache.go, 2026-05-12), wired into both the simple-query path (internal/server/dispatch.go:906-925) and extended Parse/Bind/Execute path (internal/server/dispatch_extended.go:79-97), keyed by normalized SQL text so repeated executions across sessions skip re-planning. Old citation (dispatch.go:803) no longer contains cache logic (now cursor-declare code) — stale line, but substance superseded. Caveat: SQL-level PREPARE/EXECUTE sets disablePlanCache=true (dispatch.go:731) and always re-plans, so that sub-path still lacks caching — noted as residual, not blocking resolution of the primary ask."
   },
   {
    "feature": "Rename XLogInsert/XLogFlush API methods to align with PostgreSQL conventions",
    "task_id": "M0042-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "XLogInsert/XLogFlush API rename deferred"
    ],
@@ -763,6 +800,7 @@
    "feature": "Implement WALInsertLock array to support parallel WAL inserts",
    "task_id": "M0042-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "WALInsertLock array for parallel inserts deferred"
    ],
@@ -777,12 +815,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/wal_buffer.go no WALInsertLock array implementation"
+   "code_audit": "PARTIAL: foundation infrastructure for an 8-stripe WALInsertLock array is built (internal/wal/padded_mutex.go appendLockSet, internal/wal/insertion_tracker.go, internal/wal/stripe_writer_core.go, internal/wal/stripe_append.go) but explicitly marked dead code awaiting a \"slice B call-site rewrite\"; the production Writer (internal/wal/writer.go:392 appendMu sync.RWMutex) still serializes all WAL appends behind a single lock, so parallel WAL inserts are not yet actually enabled."
   },
   {
    "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
    "task_id": "M0030-0005",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pg_index as a real heap table deferred (index metadata remains in Go structs)"
    ],
@@ -797,12 +836,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:6424 pg_index Virtual:true not persistent"
+   "code_audit": "RESOLVED 2026-07-07 (M0113 follow-up, confirmed via M0122-0001 re-audit): syncIndexToCatalogHeap (internal/executor/operators_ddl.go, ~line 12653) writes a real pg_index heap row via writeHeapRowCanonical on catalog.IndexRelationId, and loadUserIndexesFromHeap (internal/initdb/open.go:2815) recovers index indrelid/indkey from that heap table on restart. The catalog.go:6424 Virtual:true note and initdb/index_ddl_recovery.go:4 comment cited by the earlier audit are stale documentation predating this landing."
   },
   {
    "feature": "Window function frame clauses and named windows are not yet implemented.",
    "task_id": "M0020",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Frame clauses and named windows remain deferred"
    ],
@@ -817,12 +857,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "partially-resolved: named windows landed 2026-07-05 (M0122-0004, see the other window-function entry's code_audit + docs/design/0020-0001-window-parser-and-ast.md). Frame clauses remain confirmed-open — internal/planner/plan.go's WindowFunc still lacks frame-bounds structures. M0122-0004 also landed frame-consuming aggregate window functions (sum/count/avg/min/max OVER (...)) evaluated over PostgreSQL's *default* frame (no explicit ROWS/RANGE/GROUPS clause needed), which is the first real consumer for future frame-clause execution work — see docs/design/0020-0001-window-parser-and-ast.md's second Follow-up section. first_value/last_value/nth_value window functions also landed on the same default-frame infra (internal/executor/operators_window.go's peerGroupBounds, reused via a new frameEnd-per-row precomputation); nth_value raises 22016 for a non-positive n, matching postgres/src/backend/utils/adt/windowfuncs.c's window_nth_value. 2026-07-05 (this loop): ntile/cume_dist/percent_rank also landed — ntile reproduces window_ntile's exact bucket-sizing algorithm (22014 for n<=0, remainder rows to the first buckets), percent_rank/cume_dist reuse the existing rank local and frameEnd[] peer-group boundary respectively. Every window function implemented across the M0122-0004 series still assumes PostgreSQL's default frame — ROWS/RANGE/GROUPS frame-clause parsing/execution itself is now the only remaining open item in this entry; see docs/design/0020-0001-window-parser-and-ast.md's fourth Follow-up section. 2026-07-05 (later loop): dense_rank() also landed as a window function (previously only its WITHIN GROUP ordered-set-aggregate form existed) — shares the row_number/rank code path (analyzer.analyzeWindowFuncCall, planner.buildWindowFunc), with a new denseRank counter in internal/executor/operators_window.go's evalWindowFuncs that increments once per peer-group boundary (rank's rowNum-based counter skips on ties; denseRank does not). All 11 standard PostgreSQL window functions (row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value) are now implemented under the default frame. 2026-07-05 (later loop): ROWS window frame clause landed too (see the other window-frame entry's code_audit for the full parser/analyzer/planner/executor breakdown) — RANGE/GROUPS frame modes are now the sole open item in this entry."
+   "code_audit": "partially-resolved 2026-07-07 (re-verified, no change since 2026-07-05): named windows and ROWS frame clause remain landed and working — TestCompatWindowNamedWindowClause PASSes (parser supports WINDOW w AS (...), internal/parser/select.go), plus the ROWS-frame test set (TestCompatWindowExplicitRowsFrameSliding, TestCompatWindowExplicitFrameExcludeCurrentRow/GroupAndTies) all PASS. RANGE/GROUPS frame modes are still the sole open item: internal/analyzer/analyzer.go:1570-1571 rejects them with 0A000. No RANGE/GROUPS implementation found anywhere in internal/executor or internal/analyzer. Verdict unchanged from the 2026-07-05 audit — still OPEN on RANGE/GROUPS. All 11 standard PostgreSQL window functions are implemented under the default frame (see prior audit history); design: docs/design/0020-0001-window-parser-and-ast.md Follow-up sections."
   },
   {
    "feature": "Implement full Borrow-semantics architectural rewrite for comprehensive allocation optimization (current stage only addresses specific call sites without the architectural change).",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "The full Borrow-semantics rewrite (design doc 0054-0002 §5.2) is split into a follow-up"
    ],
@@ -837,12 +878,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/slot.go:14 only incremental BorrowSemantics removal noted"
+   "code_audit": "RESOLVED 2026-07-07 (via superseding architecture): internal/executor/slot.go:1-17 explicitly states the TupleSlot pipeline (M0069-0001, docs/design/0068-0002-tuple-slot-pipeline.md) removes the row-level BorrowSemantics contract entirely. Repo-wide grep for BorrowSemantics/Borrowable (the literal interface proposed in docs/design/0054-0002-executor-tuple-copy-reduction.md §5.2) returns zero hits — it was never built as specified. Instead the comprehensive allocation-optimization goal was achieved via TupleSlot/MaterializedSlot/VirtualSlot, now present across 57 files in internal/executor (nearly every operator) — the 'comprehensive architectural rewrite' the entry envisioned, just under a different name (cross-referenced in the M0073-M0077 arena/Datum series). Old citation's 'only incremental removal noted' is stale — the removal was completed and replaced wholesale."
   },
   {
    "feature": "Empirical TPC-H verification that index-build column projection achieves DecodeRow cumulative cost ≤ 15% of total query execution time.",
    "task_id": "M0054-0007-followup-resume",
    "resume_point": "next HammerDB SF=1 run",
+   "status": "open",
    "evidence": [
     "Empirical TPC-H verification (DecodeRow cum ≤ 15 % per the M0054-0005c-followup acceptance) is bundled into the next HammerDB SF=1 run"
    ],
@@ -857,12 +899,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0054: empirical TPC-H verification not completed"
+   "code_audit": "PARTIAL 2026-07-08: the underlying optimization (DecodeRowProjectionIntoArena) landed at M0074-0004 (commit 4906451) and the dependent TPC-H query set now runs clean 22/22 end-to-end (docs/handover/2026-05-11-tpch-status-phase9.md:33-56); but the specific empirical measurement asked for — DecodeRow cumulative cost <=15% of total execution time via pprof — was never captured/recorded post-deferral, so this narrow verification artifact is still missing even though the feature it measures is done"
   },
   {
    "feature": "Complete HammerDB SF=1 power test after Q9 regression fix (test was aborted after Q9, Q20 and remaining queries were not executed).",
    "task_id": "M0054-0007-followup-resume",
    "resume_point": "After M0054-0006-followup-Q9-composite is fixed",
+   "status": "resolved",
    "evidence": [
     "M0054-0007-followup-resume: new sub-task for the NLI-re-enabled retry, blocked by Q9-composite landing first"
    ],
@@ -877,12 +920,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: analysis/: HammerDB SF=1 test execution incomplete/aborted"
+   "code_audit": "RESOLVED 2026-07-08: docs/handover/2026-05-11-tpch-status-phase9.md:33-56 shows a full 22-query SF=1 power sweep, all OK including Q9 (66.26s, 175 rows) and Q20 (16.40s, 99 rows) — the run that previously aborted at Q20 completed cleanly. Q9/Q20 independently regressed and were re-fixed again 2026-07-07 per .ralph/deferral_ledger.md:572-573, both with permanent regression tests; HEAD is clean"
   },
   {
    "feature": "Extend equi-key extractor to handle view-inlined join shapes for Nested-Loop Index Join (TPC-H Q15b not yet supported).",
    "task_id": "M0054-0006-followup-Q15b",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "the equi-key extractor doesn't yet handle Q15b's view-inlined join shape"
    ],
@@ -897,12 +941,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join_test.go:254 Q15b disabled: row-layout-flip unfixed"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/nl_index_join_test.go:254-278 (TestNLIRuleSkipsIsolatedScopeOuter) still explicitly asserts NLI must NOT fire when the outer is an isolated-scope/view-wrapped Project (Q15b's shape), comment says 'Re-enable when the row-layout-flip is fixed at the nliRewrite substitution level'. A different Q15b shape (Filter->CrossJoin) was fixed in commit 1e0c21c4, but this isolated-scope-Project-wrapper case remains deliberately gated off, unchanged since M0063-0001 (2e6e9f9e)"
   },
   {
    "feature": "Implement buffer reuse for rows returned by concatRows() to reduce allocations (currently not reused because callers may retain rows).",
    "task_id": "0005b-followup",
    "resume_point": "After Borrow contract is implemented",
+   "status": "open",
    "evidence": [
     "rows returned by `concatRows(m, lazyRow)` are intentionally NOT buffer-reused: callers may retain them, and the safe alternative needs the Borrow contract (deferred to 0005b-followup)"
    ],
@@ -917,12 +962,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:1960 insertItemSorted dedup-grow abandoned due to page-fragment garbage"
+   "code_audit": "confirmed-open 2026-07-08 (prior code_audit citation was mismatched to btree.go, unrelated to concatRows): internal/executor/operators_join_agg.go:2899 concatRows(a, b Row) Row still does out := make(Row, 0, len(a)+len(b)) on every call, no pooling; internal/executor/row_pool.go acquireRow/releaseRow (M0068-0004) added sync.Pool-backed row reuse used elsewhere (e.g. operators_index.go:149) but concatRows was never wired to it. The 'Borrow contract' from the old resume_point was implemented then removed (internal/executor/operator.go:49-50, M0071-0015 Stage E) in favor of slot-based Materialize() lifetime semantics — a different mechanism superseded it, but concatRows buffer reuse itself was never delivered"
   },
   {
    "feature": "IN-list IndexScan optimization requiring Append/Union plan node and cost model for query plan optimization",
    "task_id": "M0054",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "M0053-0003 (IN-list IndexScan) scope-reduced — requires Append/Union plan node + cost model, deferred to M0054"
    ],
@@ -937,12 +983,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/in_list_test.go:14 OR-of-IndexScan plan node not yet implemented"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/in_list_test.go:14-45 (TestInListSeqScanCorrectness) still pins IN-list to SeqScan with comment 'no OR-IndexScan rule yet... update the assertion when that lands'; grep for AppendNode/UnionNode/Append/Union plan-node types across internal/planner/*.go returns zero hits — no Append/Union plan node exists anywhere in the planner"
   },
   {
    "feature": "Posting growth helper functions are implemented but not integrated into the steady-state B-tree insert path, causing in-place insert operations to leak page bytes during memory growth.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "NOT wired into the steady-state insert path — the in-place grow leaks page bytes"
    ],
@@ -957,12 +1004,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:1960 posting growth helpers defined but deferred from steady-state insert"
+   "code_audit": "confirmed-open 2026-07-07: internal/access/btree/posting.go:89-109 appendTIDToPosting and promoteSingleToPosting (both dated M0055-0003, doc-commented as 'Used by the steady-state insert path to grow a posting in place') have zero callers anywhere in the package — grep for both names matches only their own definitions in posting.go, not btree.go's insert path nor any test in posting_test.go. Confirmed still dead code; btree.go:2000-2004 explicitly notes the in-place dedup-grow path 'was tried but produces page-fragment garbage' and was reverted in favor of a separate pre-split dedupPageBeforeSplit compaction path, so steady-state inserts still allocate fresh line pointers/leak page bytes rather than growing postings in place."
   },
   {
    "feature": "Re-enable race condition detector (-race) for concurrent write stress tests",
    "task_id": "M0056-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -977,12 +1025,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/multi_writer_stress_test.go:40 skip blocks race re-enable"
+   "code_audit": "RESOLVED 2026-07-07 (M0056-followup, confirmed via M0122-0001 re-audit): the multi-writer-stress race no longer gates on raceEnabled; nightly race-gate run 20260707-000712 shows `ok github.com/goopg/goopg/internal/access/btree 18.142s` with zero DATA RACE hits (ci/logs/20260707-000712/race/go-test.log). See deferral_ledger.md 2026-07-07 M0056-followup-multiwriter-flake row for the root-cause fix (bufpool evictVictim bufmap.Delete-before-flush race)."
   },
   {
    "feature": "Remove splitMu lock from btree operations for concurrency optimization",
    "task_id": "M0056-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -1003,6 +1052,7 @@
    "feature": "End-to-end validation of btree concurrent write protocol",
    "task_id": "M0056-0004",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -1023,6 +1073,7 @@
    "feature": "Investigate and fix intermittent TestMultiWriterStress flake causing ~20% test failures",
    "task_id": "M0056-followup-multiwriter-flake",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "root cause not yet identified. Tracked as `M0056-followup-multiwriter-flake`"
    ],
@@ -1037,12 +1088,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/multi_writer_stress_test.go:40 test skipped"
+   "code_audit": "RESOLVED 2026-07-07 (M0056-followup, confirmed via M0122-0001 re-audit): root cause found and fixed — evictVictim's bufmap.Delete-before-flush race in internal/storage/bufpool.go. Regression-guard test (multi_writer_stress_test.go) permanently un-skipped; see deferral_ledger.md 2026-07-07 M0056-followup-multiwriter-flake row. Remaining skip in that file is routine testing.Short() gating, unrelated to this flake."
   },
   {
    "feature": "Full splitMu removal from btree Insert slow path (Stage 2 splitMu lifting via writer-coupling)",
    "task_id": "M0055-0004-followup-stage2-splitmu-removal",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "lands two of three Stage 2 deliverables... DEFERRED (blocked on a storage-layer prerequisite)"
    ],
@@ -1063,6 +1115,7 @@
    "feature": "Fix storage pool per-slot pinCount accounting race condition in buffer management",
    "task_id": "M0055-bufpool-pin-race",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "The bug is in the storage pool's per-slot pinCount accounting and is tracked as a separate sub-task `M0055-bufpool-pin-race` for the storage layer to fix"
    ],
@@ -1077,12 +1130,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0056: Phase A PinNew race (M0056-0001) in progress, not completed"
+   "code_audit": "RESOLVED 2026-07-07 (M0122-0001, this loop, verify-before-implement): M0056-0001 landed in commit 6a88492e ('fix(storage,btree): M0056-0001 PinNew slot reservation race') — Pool.PinNew (internal/storage/bufpool.go:1049-1124) now reserves the victim slot's pinCount before releasing the pool lock and holds it across the InitPage/Extend I/O window, eliminating the race where a concurrent Pin's evictLocked could steal the same slot. The design has since evolved further (M0098-0003 128-partition locking, then M0099-0002/M0107-0008 to a fully lock-free per-slot atomic state atomic.Uint64 packing pinCount/usageCount/dirty/valid, bufpool.go:55-57) — the cache-hit Pin fast path is now lock-free CAS with no mutex at all, and pinMu only serializes the cache-miss/eviction slow path. The milestone doc docs/milestones/0056-... still says 'Status: in progress' (stale — Phase B/C/D splitMu-removal work is separately tracked/blocked on an unrelated flake per the commit message) but the specific per-slot pinCount accounting race this item describes is fixed and superseded by a stronger lock-free design."
   },
   {
    "feature": "Replay-safe WAL log handling for two-phase delete operations to ensure crash recovery consistency in B-tree indices.",
    "task_id": "M0055-0005-followup-two-phase-del",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Two-phase deletion + replay-safe WAL coverage tracked as M0055-0005-followup-two-phase-del"
    ],
@@ -1097,12 +1151,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/btree.go:6 WAL records for deletes deferred"
+   "code_audit": "RESOLVED 2026-07-07: M0055-0005-followup-two-phase-del landed — btree two-phase delete (PHASE 1 mark-half-dead via EncodeBtreeVacuum/replayBtreeVacuum, PHASE 2 unlink via EncodeBtreeUnlinkPage/replayBtreeUnlinkPage, both internal/wal/recovery.go) is WAL-logged and crash-replay restores half-dead state (internal/access/btree/btree_vacuum.go:100-224). Only the top-of-file package doc comment (internal/access/btree/btree.go:6) is stale and should be updated to stop saying WAL for inserts/deletes is deferred."
   },
   {
    "feature": "Empirical TPC-H Q20 wall-clock validation using HammerDB SF=1 resume run to confirm performance improvements from multi-parameter correlation unnesting.",
    "task_id": "M0054-0007",
    "resume_point": "next HammerDB SF=1 resume run",
+   "status": "resolved",
    "evidence": [
     "Empirical TPC-H Q20 wall-clock validation requires a HammerDB SF=1 resume run, which is out of scope for this loop"
    ],
@@ -1117,12 +1172,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Deferral marked: resume point needs HammerDB SF=1 run"
+   "code_audit": "RESOLVED 2026-07-08: .ralph/deferral_ledger.md:572 (resolved 2026-07-07, tpch/Q20-timeout) — planHasEscapingOuterRef depth-fix + splitEqualityForHash multi-key fix; tmp/tpch-runner -queries 20 went from a 1200.13s cancel to OK elapsed=2.55s rows=92, cross-checked row-for-row against real PostgreSQL 18.3; regression tests internal/planner/non_correlated_subquery_test.go:TestPlanHasOuterRef_NestedSubqueryResolvesLocally and internal/planner/q20_unnest_test.go:TestPlanQ20OuterInFullyUnnested added"
   },
   {
    "feature": "Full verification of all 22 close criteria for M0054-0007 milestone, deferred as a partial milestone to be resumed after M0054-0008 completion.",
    "task_id": "M0054-0007-followup-resume",
    "resume_point": "after M0054-0008 lands",
+   "status": "resolved",
    "evidence": [
     "M0054-0007-followup-resume is marked PARTIAL/DEFERRED"
    ],
@@ -1137,12 +1193,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Deferral marked: resume point after M0054-0008 completion"
+   "code_audit": "RESOLVED-by-supersession 2026-07-08: the practical 22/22 close criterion was met under M0077, not a standalone M0054-0008 — docs/handover/2026-05-11-tpch-status-phase9.md:30-58 'Every query executed without error; every gated row count holds.' M0054-0008 itself was never landed as its own milestone (only a forward-pointer in docs/design/0054-0003-magic-set-decorrelation.md:3,69; docs/milestones/README.md:91 still says 'planned' — stale metadata); its scope was absorbed into the M0063/M0075-M0077/M0122 Q5/Q9/Q20 fix series"
   },
   {
    "feature": "Q21 Anti-NLI currently uses hash variant because lifting conjuncts to outer Predicate breaks negation semantics (returns 0 rows instead of ~411); the inner-Filter conjunct lift is deferred.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "lifting those conjuncts to the outer Predicate broke Anti's negation semantics (returned 0 rows vs canonical ~411 in a probe), so deferred as a follow-up"
    ],
@@ -1157,12 +1214,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:290 shows semi-join uses hash algo, NLI prohibited for semantics"
+   "code_audit": "PARTIAL 2026-07-08: the correctness bug is RESOLVED — Q21 returned 0 rows pre-fix, now returns 397 rows in the latest regression sweep (1eb3a168, 'M0071-0009 0->381 rows regression remains fixed'), via SourceTableIdx-aware column resolution (internal/planner/unnest.go:2078-2090), not the originally-planned conjunct-lift. But the Anti-NLI promotion described in this entry is still not used for this shape: internal/planner/q21_live_test.go:163,176 explicitly requires the AntiJoin stay a plain *Join (hash) with the inner-only conjunct (l_receiptdate > l_commitdate) left in the inner Filter rather than lifted to the join Predicate — the 'lift' approach was abandoned as a design decision, not completed. internal/planner/nl_index_join.go:302-316 shows residualPred is only populated for the Q19 OR-of-ANDs path, not the general Semi/Anti inner-conjunct case"
   },
   {
    "feature": "Q21 build-phase cancel requires proper NLI rewrite for derived-table outer inputs; the fix is deferred out of M0062 scope.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The proper fix is in NLI rewrite for derived-table outers — symmetric to but distinct from the M0062-0006 MHJ fix. Filed as a follow-up; out of M0062 scope."
    ],
@@ -1177,12 +1235,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:140 defers derived-table NLI rewrite to M0068"
+   "code_audit": "PARTIAL 2026-07-08: the literal 'Q21 build-phase cancel' claim is RESOLVED per commit 977ff220 ('Q21 build-phase cancel lag RESOLVED... explicit ctx.Err() check... in joinOp.openLazyHashJoin') — a simple cancellation fix, not an NLI rewrite. The bundled 'derived-table NLI rewrite' half remains open (same gap as the Q15b entry above) — same commit 977ff220 explicitly deferred that part 'out of M0062 scope', still gated off at HEAD. Prior code_audit's nl_index_join.go:140 citation now points at unrelated text (a reverted Q9 composite-index hoist, also 'Defer to M0068' — coincidental phrase reuse, confirmed by reading current lines 120-160)"
   },
   {
    "feature": "SASLprep pre-processing for SASL authentication username normalization",
    "task_id": null,
    "resume_point": "see maybe_not_completed_tasks.md for deferred details",
+   "status": "open",
    "evidence": [
     "Tasks include deferred features such as: Authentication: SASLprep"
    ],
@@ -1197,12 +1256,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No SASLprep implementation found in auth package"
+   "code_audit": "confirmed-open: internal/auth/exchange.go:151-243 + scram.go:149-160 pass username/password raw with zero SASLprep/stringprep normalization anywhere in repo; docs/design/root-0003-authentication.md:232-235 self-documents SASLprep not applied in v0"
   },
   {
    "feature": "Channel binding support for SASL authentication to validate client-server channel integrity",
    "task_id": null,
    "resume_point": "see maybe_not_completed_tasks.md for deferred details",
+   "status": "open",
    "evidence": [
     "Authentication: SASLprep, channel binding"
    ],
@@ -1217,12 +1277,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/scram.go:287 channel binding not yet supported"
+   "code_audit": "confirmed-open: internal/auth/scram.go:279-289 handleClientFirst hard-rejects any p=... (channel binding) gs2-cbind-flag; exchange.go:156 only advertises SCRAM-SHA-256 (never -PLUS)"
   },
   {
    "feature": "Optimize Q14 query performance (regressed from 29s baseline to 600s timeout)",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q14 cancel at 600 s — regression vs prior 29 s baseline"
    ],
@@ -1237,12 +1298,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:373 mentions Q14 but no performance regression fix found"
+   "code_audit": "RESOLVED 2026-07-08: docs/handover/2026-05-11-tpch-status-phase9.md:46 shows 'Q14: OK 19.49s 1 row' — well under both the original 29s baseline and the 600s timeout regression cited in the deferral. internal/planner/nl_index_join.go:373 is a design-rationale comment (NLI gate scoping for SeqScan vs Project outers), not evidence of an unfixed regression; re-read at current lines 340-399, still accurate but unrelated to a perf bug"
   },
   {
    "feature": "Implement range-correlation support for EXISTS with non-equijoin predicates (e.g., l_suppkey <> ...)",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q21 non-equijoin EXISTS correlation; out-of-scope for M0061-0001",
     "Q21 still cancels: non-equijoin correlation (l_suppkey <> ...) is documented out-of-scope; needs range-correlation EXISTS."
@@ -1259,12 +1321,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/unnest_test.go:274 non-equijoin should NOT unnest"
+   "code_audit": "RESOLVED 2026-07-08: Q21's mixed-correlation EXISTS pattern (equijoin l_orderkey AND non-equijoin l_suppkey <>) IS unnested into a Semi/Anti join whose non-equijoin residual is lifted into the join's Predicate — mechanism 'M0062-0005', landed commit 0a417306, internal/planner/unnest.go:2044-2095; pinned by internal/planner/q21_live_test.go (TestPlanQ21LiveSQL, TestM0070Q21InnerOnlyConjunctsStay). Prior citation internal/planner/unnest_test.go:245 (TestCannotUnnestNonEquijoinSubquery) was a mislabel: that test covers an unrelated scalar-aggregate subquery shape requiring an equijoin probe key, not EXISTS/Semi-Anti — working as designed, not this gap"
   },
   {
    "feature": "Q21 Anti-NLI optimization attempt corrupted NLI outer-key probe logic; partial state remains unresolved",
    "task_id": "M0065",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q21 Anti-NLI lift attempt corrupted the NLI outer-key probe"
    ],
@@ -1279,12 +1342,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/bushy.go:1836 references M0065-Q21-walker with unsolved NLI key issues"
+   "code_audit": "RESOLVED/moot 2026-07-08: internal/planner/bushy.go:1961-1968 still carries the M0065-era comment ('Q21's mismatching Anti-NLI keys are a separate problem tracked under M0065-Q21-walker') but this refers to the walker deliberately not touching NLI keys, a conservative guard, not corruption. The actual Q21 correctness bug (0 rows vs canonical ~411/381) was root-caused and fixed via SchemaColumn.SourceTableIdx-aware re-resolution (internal/planner/unnest.go:2071-2079, findColumnIndexByNameAndSource), landed commit e8c37796 (M0071-0009, 'Q21 0->381 rows'); q21_live_test.go end-to-end tests currently pass. The stale comment predates the real fix and is superseded, not a live corruption"
   },
   {
    "feature": "Q5 query optimization and correctness testing is not yet addressed.",
    "task_id": "M0063-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "M0063-0002 (Q5) and M0063-0003 (Q20) deferred"
    ],
@@ -1299,12 +1363,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0062-tpch-residual-long-tail.md:41 Q5 optimization pending"
+   "code_audit": "RESOLVED 2026-07-08: full slice-by-slice fix landed under M0077 (commits 174cb902 Slice A, 71eeba32 Slice B, da260d1c Slice C 'Q5 unlock', 5d8bd431 Slice D 'Q5 26s'), closed in 1998881e ('close M0077 — Phase 9 handover'); Q5 went from 600s+/cancel to 26s with a documented cost-model root cause (missing build-side memory term in estimateJoinCost, see [[m0076_q5_cost_model_root_cause]] and [[m0077_q5_unlocked_4_slice]] memory notes). commit 1eb3a168 ('22/22 OK') confirms Q5 in the full TPC-H sweep; docs/design has a Q5 planner design bundle (commit 5760dc93)"
   },
   {
    "feature": "Q8 still returns 0 rows; the full fix requires complete IndexScan-alias plumbing that is currently in progress.",
    "task_id": "M0062-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "The IndexScan-alias plumbing is a prerequisite for the full Q8 fix, which is tracked in the M0062-0002 follow-up"
    ],
@@ -1319,12 +1384,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0062-tpch-residual-long-tail.md:46 Q8 0-rows pending"
+   "code_audit": "RESOLVED (M0062-0002/M0063-0001, confirmed via M0122-0001 re-audit): outer-column-resolution fix for NLI derived tables landed; Q8 returns 2 rows as of commit 2e6e9f9 (completed_milestones/completed_fix_plan_004.md:1831-1889), also confirmed in analysis/tpch-sf0.5-query-timings-20260616.md:46. The 0062-tpch-residual-long-tail.md:46 \"0-rows pending\" note cited by the earlier audit predates this fix."
   },
   {
    "feature": "Q21 EXISTS unnest residual zero-rows bug fix deferred to slot pipeline",
    "task_id": "M0071-0005",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Q21 residual zero-rows is therefore documented as slot-pipeline-blocked"
    ],
@@ -1339,12 +1405,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/q21_live_test.go:112 references M0070-0001 but no zero-rows bug fix code"
+   "code_audit": "RESOLVED 2026-07-08 (same bug as [[m0071_0009_q21_path_b_landed]], reconfirmed): internal/planner/q21_live_test.go:112 (TestM0070Q21InnerOnlyConjunctsStay) pins a different, narrower invariant (inner-only conjuncts stay in Filter, not join Predicate) — not itself the zero-rows bug. The zero-rows bug is documented and fixed at internal/planner/unnest.go:2050-2065: without the re-resolve, Q21's residual l1.l_suppkey index pointed at the wrong outer column so AntiJoin's Predicate evaluated against an unrelated value, causing silent over-match (rows=0 vs canonical ~411); fixed via commit e8c37796 (M0071-0009)"
   },
   {
    "feature": "Q9 composite-NLI follow-up (second half of M0070-0001 fix) deferred to TupleSlot pipeline phase",
    "task_id": "M0070-0003",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "folded into Phase 3 (M0070-0003 TupleSlot pipeline)"
    ],
@@ -1359,12 +1426,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/planner/nl_index_join.go:140 Q9 composite-NLI hoist reverted, deferred to M0068"
+   "code_audit": "RESOLVED 2026-07-08: internal/planner/nl_index_join.go:133-140 still has the stale M0067-0003 comment ('Reverted... Defer to M0068') but M0068 never touched this (M0068 was a GC/row-pool refactor). The composite-NLI hoist for Q9 (ps_partkey=l_partkey alongside ps_suppkey=l_suppkey so partsupp_pk composite index fires) was solved 2026-07-07 via attachUnusedCrossEdges in bushy.go (global-coordinate cross-table edge attachment) plus a name-based fallback in collectCrossSideEquiKeys (nl_index_join.go:552-570, 'M0122 TPC-H Q9-timeout'); commit 2a9eade5, documented .ralph/deferral_ledger.md:573 ('FULLY LANDED'). EXPLAIN now shows Index Scan using partsupp_pk with both index conds; Q9 went from 1200s+ timeout to 88s — not a TupleSlot-pipeline deferral, solved directly in the planner"
   },
   {
    "feature": "Connection pool mutex partitioning to reduce lock contention",
    "task_id": "M0070-0006",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "poolMu partitioning DEFERRED → M0070-0006"
    ],
@@ -1379,12 +1447,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no grep matches for mutex partitioning; connection pool lacks partition"
+   "code_audit": "RESOLVED 2026-07-07 (M0122-0001, this loop, verify-before-implement): 'Connection pool' in the feature text is a mislabeling of the storage buffer-pool's poolMu (source commit e4ee8a28's changelog: 'M0069-0008 poolMu partitioning DEFERRED → M0070-0006', referring to internal/storage/bufpool.go's Pool type, not a network/session connection pool — no connection-pool struct exists anywhere in the repo). poolMu partitioning landed in commit 3f1de667 ('feat(m0098-0003): buffer pool 128-partition locking' — 128 FNV-1a hash-partitioned mutexes replacing the single poolMu) and was subsequently superseded by an even finer-grained lock-free design (M0099-0002 'atomic pinCount + RWMutex evictMu', now fully lock-free per-slot atomic state in bufpool.go:55-57): the Pin cache-hit fast path takes no mutex at all (lock-free CAS), and only cache-miss/eviction uses a single pinMu slow-path lock. The original contention-reduction goal is met and exceeded."
   },
   {
    "feature": "Anti-semi-join optimization for NOT IN subqueries not implemented; planner rejects negated IN conditions",
    "task_id": "M0069-0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "in.Negated=true (NOT IN) is rejected — anti-semi-join semantics out of scope"
    ],
@@ -1399,12 +1468,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: unnest.go:1200 negated IN rejected for non-correlated case only"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1200 (isUnnestableNonCorrelatedIn) still hard-rejects negated IN — 'if in.Negated { return false }', comment 'NOT IN requires anti-semi-join semantics which are out of scope for M0069-0005'; git log --all --grep=anti-semi/AntiJoin finds no later commit converting NOT IN to an AntiJoin plan. Unchanged since ebb267d6"
   },
   {
    "feature": "Non-trivial expressions on IN-subquery LHS not optimized to SemiJoin; falls back to runtime cache path",
    "task_id": "M0069-0005",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "in.Operand must be a ColumnRef — non-trivial expressions on the LHS keep the runtime cache path"
    ],
@@ -1419,12 +1489,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: unnest.go:1203 LHS must be ColumnRef; complex exprs rejected"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/unnest.go:1203 (same isUnnestableNonCorrelatedIn function) unchanged — 'if _, ok := in.Operand.(*ColumnRef); !ok { return false }'; no commit relaxes this to accept arbitrary expressions (BinaryExpr, FuncCall, etc.) as IN-subquery LHS. Still restricted to plain ColumnRef"
   },
   {
    "feature": "Schema-vs-runtime layout mismatch in walker implementation causes incorrect results; blocks multiple optimization attempts",
    "task_id": "M0068",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "same schema-vs-runtime layout mismatch from M0064/M0065 walker attempts. Reverted; deferred to M0068"
    ],
@@ -1439,12 +1510,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: nl_index_join.go:133 M0067-0003 reverted due to schema/layout mismatch"
+   "code_audit": "confirmed-open 2026-07-08: internal/planner/nl_index_join.go:133-141 still carries the exact original comment ('M0067-0003 attempt: Q9 composite-NLI hoist. Reverted — ... surfaces the schema-annotation-vs-runtime-layout mismatch... Defer to M0068'). M0068 commits (aef72b7c, e9080ac2, d79ebdab, 965c2a07) did Datum compact layout / row-pool / external sort — did NOT touch this walker or fix the mismatch; per M0074/M0071-0009 commit notes, 'Q9 stays at 7 rows; SourceTableIdx alone doesn't cover the chained-NLI schema-runtime layout mismatch... Carry-forward to Phase 3 slot pipeline'. The reverted hoist was worked around for the simpler Q21 case (SourceTableIdx fix) but never itself re-attempted or fixed for Q9's chained-NLI shape"
   },
   {
    "feature": "Q5 CPU performance profiling of the OpCode optimization is deferred to the final sweep stage combined with arena work.",
    "task_id": "M0073-0005",
    "resume_point": "combined capture with arena work in M0073-0001..4",
+   "status": "resolved",
    "evidence": [
     "Q5 CPU pprof verification deferred to M0073-0005's final sweep"
    ],
@@ -1459,12 +1531,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: slot.go:14 slot pipeline Stage A done; profiling deferred"
+   "code_audit": "RESOLVED 2026-07-08: docs/handover/2026-05-10-tpch-status-phase5.md:33-38 contains the actual before/after CPU pprof table for M0073-final (evalExprSlot flat 26.11%->25.83%, cum 68.68%), cited downstream in docs/design/0074-0001-vectorised-binary-and-columnref-inline.md:13-16 as the baseline for the next milestone; commit 1e338014 ('M0073 closes') lands this. Unlike the DecodeRow<=15% metric (a still-partial sibling entry in this backlog), this empirical capture was actually produced and documented — the numeric target (<=60% cum) wasn't hit, but the profiling activity itself (the actual ask) was completed"
   },
   {
    "feature": "NLI semi/anti joins with partsupp_pk-style index may not correctly emit outer rows; root cause and fix deferred.",
    "task_id": "M0071-0005",
    "resume_point": "Stage D follow-up",
+   "status": "open",
    "evidence": [
     "to be investigated in M0071-0005 Stage D follow-up"
    ],
@@ -1479,12 +1552,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no grep evidence; NLI semi/anti join issue still deferred"
+   "code_audit": "unverifiable/vague 2026-07-08: the claim originates from commit b0226c37's message speculating Q21's 0-row bug was 'a separate issue in the NLI Semi (... may not be emitting outer rows correctly), to be investigated in M0071-0005 Stage D follow-up'. Q21 was later fixed 0->381 rows (commit e8c37796, M0071-0009), but the root cause found was a hash-join Semi/Anti schema-merge bug (reresolveJoinByName widening schema + missing residual-predicate eval in nextLazy), not an NLI/partsupp_pk-index-specific bug — Q21 doesn't even use partsupp. Current NLI Semi/Anti outer-row handling (internal/planner/nl_index_join.go:286,518-522, 'M0063-0004: Semi/Anti emit only [outer]') is live with no TODO/known-broken markers. 'M0071-0005 Stage D' as a literal task is never referenced again in any commit/doc (M0071-0005 maps to 'TupleSlot pipeline Stages B-E', an unrelated structural track) — too vague to force a resolved/open verdict; kept open pending a concrete reproduction"
   },
   {
    "feature": "Q9 chained-NLI rebind logic requires slot pipeline implementation; planner-only approach infeasible",
    "task_id": "M0071-0005",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "defer Q9 chained-NLI rebind to slot pipeline; DEFERRED → M0071-0005"
    ],
@@ -1499,12 +1573,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: slot.go:16 slot pipeline partially migrated; full impl incomplete"
+   "code_audit": "RESOLVED 2026-07-08: slot pipeline (planner/slot.go) was never built and is not required — Q9's chained-NLI/rebind defect is fixed via a different mechanism, bushy.go's attachUnusedCrossEdges (2a9eade5, after reverted prototype a3a74cc4), which ANDs a bushy-DP tree's unused cross-table edge onto the join predicate in global FROM-order coords so both nl_index_join.go's NLI picker and bushy.go's MultiHashJoin-Filters remap agree. Per .ralph/deferral_ledger.md:573 (FULLY LANDED): EXPLAIN now shows Index Scan using partsupp_pk with composite Index Cond; tmp/tpch-runner -queries 9 went from 1200s+ cancel to OK elapsed=88.32s rows=175 (matches PG 18.3). Regression test internal/executor/bushy_dp_cross_conjunct_test.go added."
   },
   {
    "feature": "Q5 optimization fix deferred due to empirical regression",
    "task_id": "M0076-0001",
    "resume_point": "M0077",
+   "status": "resolved",
    "evidence": [
     "defer Q5 fix to M0077 — empirical regression"
    ],
@@ -1519,12 +1594,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no code evidence; Q5 optimization fix deferred per commit"
+   "code_audit": "RESOLVED 2026-07-08: landed under M0077's 4-slice refactor — Slice A 174cb902 (leaf-local filter attachment + NLI rebind robustness), Slice B 71eeba32 (post-filter base-row estimates), Slice C da260d1c (build-side-aware hash-join cost), Slice D 5d8bd431 (anchored equality synthesis); closed 1998881e. Q5 now reaches expected binary hash-join family (filtered region+orders below join tree, no 6-table MultiHashJoin) in 16-26s, was cancel@1100s+ in M0076-final; Q3=11462/Q12=2/Q13=35/Q21=381/Q22=7 held. docs/design/fix-for-q5/ is authoritative bundle."
   },
   {
    "feature": "Root-cause investigation of planner nondeterminism vs pool-state behavior in plan-snapshot regression harness",
    "task_id": "M0077",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Root-cause investigation (planner nondeterminism vs pool-state) deferred to M0077"
    ],
@@ -1539,12 +1615,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no harness/investigation code; diagnostic work deferred"
+   "code_audit": "confirmed-open 2026-07-08: the plan-snapshot harness itself landed (cmd/plan-snapshot/main.go, b27869c7/M0076-0006), but the root-cause investigation this entry names — planner-side nondeterminism vs connection-pool state behind batch-mode plan-diff false positives — was never performed. docs/design/0076-0006-plan-snapshot-harness.md:15-17 defers it to M0077; docs/handover/2026-05-11-tpch-status-phase9.md:186-189 shows M0077 closing with only a workaround ('batch mode remains best-effort', use --queries=N per-query mode) not a diagnosis. No commit/doc/ledger entry since phase9 revisits it."
   },
   {
    "feature": "Diagnose and isolate individual build optimization flag (PGO / GOAMD64=v3 / ldflags) causing +9.5% wall-time regression",
    "task_id": "M0076-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The optimisation flags produced a net +9.5 % wall-time regression on this workload"
    ],
@@ -1559,12 +1636,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: no diagnostics; regression investigation deferred"
+   "code_audit": "PARTIAL/moot 2026-07-08: per-knob A/B isolation was never performed (M0076-0003 absent from .ralph/fix_plan.md entirely; docs/handover/2026-05-10-tpch-status-phase7.md:287-290 stated the intent but no follow-up isolates PGO vs GOAMD64=v3 vs ldflags vs trimpath individually). M0098-0007 (7b919821, docs/design/0098-0007-pgo-goamd64-runtime-knobs.md) later made GOAMD64=v3 + conditional PGO the unconditional default build (Makefile:84-94) WITHOUT ldflags='-s -w'/-trimpath (those stay opt-in in bench-build-optimized, Makefile:235-252) — the +9.5% finding was superseded by a default-flag decision, not diagnosed; no measurement confirms the narrower bundle is regression-free."
   },
   {
    "feature": "FilterOp predicate batch wiring (integration of vectorized expression evaluation into filterOp call-site)",
    "task_id": "M0076-0002",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "only the wiring into filterOp is the deferred piece"
    ],
@@ -1579,12 +1657,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: operators.go:224-253 uses row-by-row evalExprSlot; design 0075-0004 defers vectorized filterOp wiring to M0076"
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators.go's filterOp.Next() (lines 229-258) still evaluates the predicate one slot at a time via evalExprSlot(o.pred, slot, o.ctx) in a per-row loop; no vectorized/batch path was ever wired in (grep for vectoriz/batch near filterOp in internal/executor/*.go: no hits). .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness (~19, ARCHITECTURAL)... vectorized FilterOp/SeqScanOp' as an open, unchecked backlog item — docs/design/0075-0004-filter-batch-wiring.md's original defer-to-M0076 note is unaddressed."
   },
   {
    "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
    "task_id": "M0076",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "status flipped to DEFERRED with failure note"
    ],
@@ -1599,12 +1678,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Datum struct flip was reverted; current datum.go:110 still has Buf []byte"
+   "code_audit": "RESOLVED (M0107-0002, confirmed via M0122-0001 re-audit): the specific M0075/M0076 packed-Datum flip attempt was reverted, but a later, differently-scoped flip landed as M0107-0002 (docs/design/0107-0002-datum-48b-arena-id-merge.md) — internal/executor/datum.go now uses a 48B layout (DatumKind uint8, ArenaID uint16 replacing *mctx.Context, *big.Int removed), cutting hot-path Datums to 0 GC-traced pointers. Landed 2026-05-20. The earlier audit's \"Buf []byte still present\" note is a narrow/stale reading — Buf remains only as an intentional cold-path fallback."
   },
   {
    "feature": "SeqScanOp predicate batch wiring (vectorized predicate evaluation in sequential scan)",
    "task_id": "M0075",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "seqScanOp predicate batch wiring deferred"
    ],
@@ -1619,12 +1699,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: operators_storage.go has no vectorized batch predicate evaluation in SeqScanOp; row-by-row processing only"
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/operators_storage.go's seqScanOp.Next() (line 1316) still decodes and yields one heap tuple per iteration with no batch/vectorized path; grep for vectoriz/batch near seqScanOp: zero hits. Predicate evaluation itself lives entirely in the separate filterOp (operators.go:229-258, evalExprSlot row-by-row, same unresolved gap as the sibling FilterOp entry) — no pushdown into SeqScanOp exists either. .ralph/fix_plan.md:3118-3120 still lists 'M0122-0012 — Perf infra: vectorization/slot-pipeline/harness ... vectorized FilterOp/SeqScanOp' as an open, unchecked item"
   },
   {
    "feature": "Runtime SET for track_io_timing GUC is not yet wired. Currently only static session-level configuration via postgresql.conf is supported.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Runtime SET is not yet wired (M0093 candidate)"
    ],
@@ -1639,7 +1720,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: track_io_timing GUC registered but no runtime SET handler found; claim that it's not wired appears correct"
+   "code_audit": "RESOLVED: runtime SET track_io_timing now wired live via OnChange hook (internal/server/server.go:405-409,949-954) updating activity.ActivityRegistry (internal/activity/registry.go:556-624); pinned by server_test.go:290-330 TestTrackIOTimingOnChangePropagatesToActivityRegistry, no restart required"
   },
   {
    "feature": "M0091 performance goal (TPS ≥ 1,000) remains unmet after optimization attempts. Further performance work is filed as a candidate for M0093.",
@@ -1658,13 +1739,15 @@
     "fix_plan": "no-match",
     "later_commits": "superseded-by-code-audit"
    },
+   "status": "resolved",
    "confidence": "high",
-   "code_audit": "confirmed-open: Performance goal TPS≥1000 claimed unmet; no optimization closed the gap since commit"
+   "code_audit": "RESOLVED 2026-07-08: M0093 (read-only commit-skip-WAL + lazy XID) closed the M0091 TPS>=1,000 goal — commit 514bdf6e 'bench(m0093-0003 + m0093-0004): pgbench post-M0093 — 317 -> 2,740 TPS (8.6x)' measured 2,740 TPS, ~2.7x the M0091 bar. docs/design/0093-0002-pgbench-remeasurement-target.md line 50 explicitly ties its acceptance criterion to 'M0091's original acceptance (TPS >= 1,000)'. All M0093 sub-milestones marked complete in fix_plan.md (commit 92954445); TPC-H Q1-Q22 regression swept clean (commit 1eb3a168)."
   },
   {
    "feature": "PostgreSQL features pg_multixact, pg_twophase, and pg_commit_ts are not implemented at the executor level and therefore have no WAL persistence",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The remaining N/A entries (`pg_multixact`, `pg_twophase`, `pg_commit_ts`) correspond to features goopg has not yet implemented at the executor level"
    ],
@@ -1679,12 +1762,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: pg_multixact, pg_twophase, pg_commit_ts absent from catalog; not implemented at executor level"
+   "code_audit": "PARTIAL: pg_twophase's SQL-level 2PC (PREPARE/COMMIT/ROLLBACK PREPARED) IS implemented in-memory at the executor level (internal/server/twophase.go), so \"not implemented at executor level\" is now false for that piece — but on-disk crash-restart persistence for all three remains absent: pg_twophase state is never written to disk (internal/server/twophase.go:38-40 deferred note), pg_multixact has no runtime SLRU writes (directories are initdb placeholders only, internal/initdb/initdb.go:96-98), and pg_commit_ts has no executor implementation at all behind its registered pg_proc entries (internal/catalog/pg_proc_names_generated.go:2413)."
   },
   {
    "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "`MarkPageHalfDead` infrastructure stays in place for future use (no current producer outside the BtreeVacuum flag-trailer path)"
    ],
@@ -1704,6 +1788,7 @@
    "feature": "Client-driven Pool/Manager/AIO hooks closure-capture optimization for activity-tracking overhead reduction, pending post-fix measurement",
    "task_id": "m0091-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Client-driven Pool / Manager / AIO hooks (lines 478-895) are left as-is for this commit... Plumbing fix is deferred"
    ],
@@ -1723,6 +1808,7 @@
    "feature": "Spill-path hooks closure-capture optimization (cold-path, left unoptimized)",
    "task_id": "m0091-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Spill-path hooks (executor/spill.go) are cold-path and left"
    ],
@@ -1737,12 +1823,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Spill-path closure-capture optimization described as deferred, left unoptimized cold path"
+   "code_audit": "confirmed-open 2026-07-08: internal/executor/spill.go's spillWriter.WriteRow and spillReader.ReadRowInto still call activity.LookupCurrentGoroutine() unconditionally on every spilled row (1x in WriteRow, 2x in ReadRowInto) — the exact cold-path lookup docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md:117-126 decided to drop ('Decision: drop these calls'). Commit 5653b1d9 (M0107-0005 loop-10) only swapped the call signature (LookupGoroutine()->LookupCurrentGoroutine()) as part of a wholesale ActivityRegistry rewrite; the per-row call itself was never removed, and LookupCurrentGoroutine still runs goroutineID() (runtime.Stack-based, internal/activity/activity.go:186-207) every call. Unlike the sibling Pool/Manager/AIO hooks (below), spill.go was never migrated to the fast-path-gated LookupTrackedGoroutine (internal/activity/registry.go:607) built later for track_io_timing. Unoptimized as of HEAD."
   },
   {
    "feature": "Client-driven Pool/Manager/AIO hooks optimization (larger refactor scope deferred from M0091)",
    "task_id": "m0091",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Client-driven Pool/Manager/AIO hooks are deferred (smaller share + larger refactor)"
    ],
@@ -1757,12 +1844,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Client-driven Pool/Manager/AIO hooks optimization deferred from M0091 scope"
+   "code_audit": "RESOLVED 2026-07-08: commit da7224d7 'fix(m0092-0005): gate client-driven I/O hooks behind track_io_timing' implemented the deferred optimization named in docs/design/0092-0005-lookup-goroutine-io-hooks-guc.md: Pool.OnPinWait/OnPinDone, Manager.OnReadWait/OnReadDone, OnWriteWait/OnWriteDone, OnExtendWait/OnExtendDone, AIO.OnWaitStart/OnWaitEnd (internal/initdb/open.go ~lines 627-1852) are now no-ops unless track_io_timing is on, eliminating LookupGoroutine cost on the hot Pin/Read/Write/Extend path. Follow-up M0122-0003 (commit e8874a08 'track_io_timing runtime SET') made the GUC live per-session via a fast-path atomic flag + LookupTrackedGoroutine (internal/activity/registry.go:607-616), superseding the design doc's own 'M0093 candidate for proper per-session wiring' caveat. deferral_ledger.md row dated 2026-07-05 (M0122-0003) confirms closure."
   },
   {
    "feature": "Spill-path per-row lookups optimization (cold path, dropped from scope)",
    "task_id": "m0091",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Spill-path per-row lookups dropped (cold path)"
    ],
@@ -1777,12 +1865,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Spill-path per-row lookups optimization dropped from scope, cold path left unoptimized"
+   "code_audit": "confirmed-open 2026-07-08: same gap as the sibling m0091-0001 spill entry above — internal/executor/spill.go's per-row activity.LookupCurrentGoroutine() calls in WriteRow/ReadRowInto (the 'per-row lookups... dropped from scope' cold path referenced by docs/design/0091-0001-activity-tracking-goroutineid-fastpath.md:117-126) were never removed or gated. git log --follow internal/executor/spill.go shows only a mechanical rename in 5653b1d9 (M0107-0005), no elimination; no design doc or .ralph/fix_plan.md entry documents spill.go being revisited since 3bdc1adc/5c34192379. This entry and the sibling m0091-0001 spill entry describe the identical unresolved gap from two angles (closure-capture vs. per-row-lookup framing) — worth de-duplicating in a future cleanup pass."
   },
   {
    "feature": "Audit of dirty-tracking behavior in Pool.PinNew and Extend operations to identify buffer durability issues",
    "task_id": "m0089-0002",
    "resume_point": "docs/design/0089-0002-buffer-pool-dirty-tracking-on-extend.md",
+   "status": "resolved",
    "evidence": [
     "dirty-tracking audit on `Pool.PinNew` / `Extend` is deferred to a follow-up",
     "m0089-0002 audit still required; follow-up session is needed to do the audit"
@@ -1799,12 +1888,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Design doc 0089-0002-buffer-pool-dirty-tracking-on-extend.md does not exist; audit undocumented"
+   "code_audit": "still-open 2026-07-07 (re-verified): docs/design/0089-0002-buffer-pool-dirty-tracking-on-extend.md still does not exist -- note the milestone id was reused/collided: a DIFFERENT M0089-0002 (final checkpoint in Runtime.Close, commit 4c661e88) landed and is unrelated to this dirty-tracking audit. Pool.PinNew (internal/storage/bufpool.go:1049-1124) does correctly publish new slots as dirty (slotDirtyBit set at line 1104), so no obvious bug is visible by inspection. The scale-100 pgbench symptom that originally motivated this audit was later root-caused to two unrelated bugs (stale FSM after TRUNCATE, concurrent-UPDATE xmax races) fixed under M0090-0001/0002 with passing e2e pgbench verification at scale 100. The audit itself was never performed/documented, but no evidence of a real dirty-tracking bug remains either -- low priority to actually do the audit now."
   },
   {
    "feature": "Plan cache implementation is deferred. Design document M0092-0008 explains why a plan cache won't help pgbench with client-side literal substitution patterns.",
    "task_id": "M0092-0008",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "0092-0008 plan-cache-feasibility.md (DEFERRED, no code change)"
    ],
@@ -1819,12 +1909,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Plan cache deferred; design M0092-0008 explains why caching won't help pgbench patterns"
+   "code_audit": "still-open 2026-07-07 (re-verified, not stale despite M0098-0005 landing a real cache): internal/server/plancache.go (16-shard cross-session plan cache) is wired into both the simple-query path (dispatch.go:911) and extended path (dispatch_extended.go:94), but its cache key is normalizeCompatSQL(sql) (dispatch.go:1502) which lowercases/collapses whitespace while explicitly preserving literal values verbatim (normalizeSQLPreservingLiterals, comment at dispatch.go:1508-1509 citing M0097-0003 to avoid literal-value key collisions). pgbench's classic client-side-literal-substituted simple-query traffic (WHERE aid = 42 vs WHERE aid = 9999) therefore still produces a distinct cache key per query -> 0% hit rate, exactly the failure mode 0092-0008 predicted. The cache does help real extended-protocol prepared statements reusing identical SQL text with $1/Bind params (0092-0008's 'future use-case'), but the specific pgbench-literal-substitution skepticism this entry describes is unresolved by M0098-0005."
   },
   {
    "feature": "Structural fix for select-only performance is deferred to M0092. The initial audit is complete but the implementation is left for the next milestone.",
    "task_id": "M0091-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "M0091-0004 ✓ audit complete; structural fix deferred to M0092"
    ],
@@ -1845,6 +1936,7 @@
    "feature": "The needsVacuum function always returns true when RowCount > 0 and does not respect autovacuum reloptions like autovacuum_enabled = off",
    "task_id": "M0086",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "needsVacuum currently returns true whenever RowCount > 0"
    ],
@@ -1859,12 +1951,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/autovacuum/launcher.go:204 ignores autovacuum_enabled reloptions"
+   "code_audit": "RESOLVED 2026-07-08 (M0122-0016): internal/autovacuum/launcher.go's needsVacuum/needsAnalyze now gate on tbl.AutovacuumEnabledSet/AutovacuumEnabled (WITH (autovacuum_enabled=false) suppresses both, anti-wraparound forcing still overrides), mirroring autovacuum.c's relation_needs_vacanalyze. See docs/design/0122-0016-autovacuum-enabled-reloption.md."
   },
   {
    "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",
    "task_id": "M0087",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "loadTables uses a *catalog.InMemory type assertion and silently no-ops on any other catalog implementation"
    ],
@@ -1906,6 +1999,7 @@
    "feature": "Subscriber setup with streaming and logical replication for replicating changes is not implemented in goopg v0.",
    "task_id": null,
    "resume_point": "BB-020",
+   "status": "resolved",
    "evidence": [
     "Logical streaming deferred: logical replication protocol not in goopg v0",
     "Subscriber setup deferred: streaming + logical replication not in goopg v0",
@@ -1924,12 +2018,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Logical replication exists but subscriber setup incomplete"
+   "code_audit": "RESOLVED 2026-07-07: CREATE/DROP SUBSCRIPTION implemented in internal/executor/operators_ddl.go:641-665 (execCreateSubscription/execDropSubscription), writing WAL via wal.EncodeCreateSubscription. Full apply pipeline landed: internal/server/tablesync_manager.go (RunTableSyncManager/syncOneRel table-sync), internal/executor/applyworker.go (per-subscription logical-apply loop for INSERT/UPDATE/DELETE pgoutput messages), internal/server/applylauncher.go (auto-launcher, commit cf310c79). Commit f31b4772 closed Scenario B (goopg primary + PG subscriber E2E); commit 57105dad delivered the CREATE SUBSCRIPTION round-trip. D-004's remaining unported TAP tests are deferred detail scenarios, not the core subscriber-setup gap this entry described."
   },
   {
    "feature": "min_parallel_table_scan_size and min_parallel_index_scan_size GUCs are accepted but not acted upon; query planner ignores these settings.",
    "task_id": "m0097-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "no-op stubs (values accepted but not acted upon)"
    ],
@@ -1944,12 +2039,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go:469+ GUCs registered as no-ops"
+   "code_audit": "confirmed-open: min_parallel_{table,index}_scan_size registered in internal/config/defaults.go:506,513 + surfaced in pg_settings; zero references in internal/planner and no parallel-scan/Gather executor exists to act on them — moot until real parallel query execution lands"
   },
   {
    "feature": "evictMu lock serializes MarkDirty and WAL operations; should allow concurrent execution for better write performance.",
    "task_id": "m0099-0005",
    "resume_point": "m0099_matrix_summary.md",
+   "status": "open",
    "evidence": [
     "evictMu still serialises MarkDirty/WAL"
    ],
@@ -1970,6 +2066,7 @@
    "feature": "pg_relation_size, pg_total_relation_size, pg_indexes_size, and pg_table_size are stubbed; do not return actual relation sizes.",
    "task_id": "m0097-0018",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pg_relation_size/pg_total_relation_size/pg_indexes_size/pg_table_size: stubs"
    ],
@@ -1984,7 +2081,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: pg_relation_size functions found but stubbed verification needed"
+   "code_audit": "RESOLVED (M0122-0002): pg_relation_size/pg_table_size/pg_total_relation_size/pg_indexes_size compute real fork byte-sizes via storage.Pool (internal/executor/expr.go:3400-3461 relationForkSize/relationAllForksSize, dispatch expr.go:7674-7683), pinned by pg_relation_size_test.go and docs/design/0122-0002-pg-relation-size-real-sizes.md"
   },
   {
    "feature": "ALTER TYPE RENAME and OWNER operations are no-ops; type names and ownership cannot be modified.",
@@ -2011,6 +2108,7 @@
    "feature": "regexp_matches() function is a set-returning function stub that returns NULL instead of match results.",
    "task_id": "m0097-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "regexp_matches stub (SRF, returns NULL)"
    ],
@@ -2025,12 +2123,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: expr.go:7288 regexp_matches() stub returns NULL instead of match results"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/executor/expr.go (regexpFirstMatchArray/regexpAllMatchesArrays/evalRegexpMatchesSRF, ~line 5326) actually compiles and runs the regex via Go's regexp package and returns real capture-group arrays (or the whole match with no groups), with correct 'g'-flag SRF row semantics and unmatched-group NULL handling. The expr.go:7288 \"stub returns NULL\" note cited by the earlier audit is stale — that line range no longer matches current code."
   },
   {
    "feature": "pg_get_serial_sequence() is a stub that returns a convention-based sequence name instead of the actual sequence.",
    "task_id": "m0097-0009",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "pg_get_serial_sequence stub (returns table_col_seq convention)"
    ],
@@ -2051,6 +2150,7 @@
    "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",
    "task_id": "m0097-0004",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "isfinite(x): stub"
    ],
@@ -2071,6 +2171,7 @@
    "feature": "justify_hours(), justify_days(), and justify_interval() functions are stubs that return input unchanged.",
    "task_id": "m0097-0004",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "justify_hours / justify_days / justify_interval: stubs — return input as-is"
    ],
@@ -2091,6 +2192,7 @@
    "feature": "Add pg_stat_io walsummarizer backend_type rows to track WAL summarizer process statistics.",
    "task_id": "m0095-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pg_stat_io walsummarizer backend_type rows (not implemented)"
    ],
@@ -2105,12 +2207,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No walsummarizer backend_type rows found in replication_views.go"
+   "code_audit": "RESOLVED 2026-07-07: internal/executor/pgstat_io.go:107-140 (ioBktWalSummarizer enum + \"walsummarizer\" name) wired into fetchIOStatRows/ioTracksObject; internal/executor/pgstat_io_test.go:66-80 pins 2 walsummarizer rows (wal/init, wal/normal) in pg_stat_io. Landed as part of the M0122-0003 pg_stat_io row-shape closure (docs/design/README.md:891)."
   },
   {
    "feature": "Implement CREATE/DROP DATABASE commands with full DDL support.",
    "task_id": "m0095-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "0007: CREATE/DROP DATABASE stubs"
    ],
@@ -2125,12 +2228,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/database_ddl.go:71-104 — CREATE/DROP DATABASE implemented but trailing options (TEMPLATE, ENCODING, OWNER) ignored"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/server/database_ddl.go (tryHandleDatabaseDDL/classifyDatabaseDDL) performs real catalog mutation (catalog.CreateDatabase/DropDatabase), WAL-logs RecordKindCreateDatabase/RecordKindDropDatabase for crash recovery, and maps proper SQLSTATEs; internal/server/database_exists_test.go confirms created databases are connectable/queryable. Caveat: trailing DDL options (TEMPLATE/ENCODING/OWNER) are still ignored and there is no per-database file namespace, so per-item resolution is about the DDL command itself, not full multi-database storage isolation (tracked separately, see IDX 4 / \"Real multi-database and multi-role isolation boundaries\")."
   },
   {
    "feature": "No dual-process logical-replication test harness; replcluster currently supports physical replication only",
    "task_id": "M0103",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "No dual-process logical-replication test harness (replcluster is physical-only)"
    ],
@@ -2145,12 +2249,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: replcluster.go states v0 physical replication only, no logical harness"
+   "code_audit": "RESOLVED 2026-07-07: a dual-real-process logical-replication test harness exists at internal/testutil/pubsubcluster/cluster.go (since 4d7bee68) and is exercised by internal/testport/pgoutput_interop_test.go for goopg<->PG logical replication over the wire (CREATE PUBLICATION/SUBSCRIPTION). replcluster.go itself remains physical-only, but that is no longer the only harness in the tree; caveat: no test currently pairs two goopg processes specifically through pubsubcluster (only mixed goopg/PG combos are run)."
   },
   {
    "feature": "SlotDecoder.Classify must handle RecordKindPageImage records instead of dropping them",
    "task_id": "M0103-0008",
    "resume_point": "rung 12",
+   "status": "resolved",
    "evidence": [
     "first-INSERT-into-fresh-page (RecordKindPageImage kind=1) records are still dropped at the SlotDecoder.Classify stage — rung 12"
    ],
@@ -2165,12 +2270,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: classifier.go:141-144 explicitly skips PageImage records, not handled"
+   "code_audit": "RESOLVED 2026-07-07: Classify still doesn't special-case RecordKindPageImage (internal/wal/classifier.go:141-144), but that's now correct — Pool.MarkDirtyLogicalChange (internal/storage/bufpool.go:1549, wired at internal/executor/operators_storage.go:8094,8118) guarantees every heap mutation emits its own logical record independent of any FPI, per docs/design/0103-0018-heap-fpi-and-logical-record-coexistence.md. No further change needed for the heap-DML path; index/metapage paths intentionally still use FPI-only MarkDirtyChangeRecord since they carry no user-row-level logical events."
   },
   {
    "feature": "Protocol version 2 streaming subxacts with Y/A frames and parent-XID linkage (requires apply-worker subxact tracking)",
    "task_id": "M0103-0007",
    "resume_point": "Implement apply-worker subxact tracking in future rung",
+   "status": "open",
    "evidence": [
     "proto_version=2 streaming subxacts (Y/A frames + parent-XID linkage) is out of scope; promoting the default ... stays a future rung"
    ],
@@ -2191,6 +2297,7 @@
    "feature": "TOAST (out-of-line) large value storage replication",
    "task_id": "M0103-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "TOAST"
    ],
@@ -2211,6 +2318,7 @@
    "feature": "DDL replication (schema changes) in various shapes and scenarios",
    "task_id": "M0103-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "DDL replication shapes"
    ],
@@ -2225,12 +2333,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No DDL replication code found in initdb/relcache_init.go search"
+   "code_audit": "confirmed-open: no DDL-replication code exists anywhere in internal/wal (no DDL message kind in pgoutput.go) or internal/executor; explicitly documented as out-of-scope at docs/milestones/0008-logical-replication-support.md:161-163. (Note: this matches vanilla upstream PostgreSQL's own built-in limitation — DDL isn't natively replicated by pgoutput even in real PG — so closing this gap would be a net-new capability beyond PG parity, not a compat bug fix.)"
   },
   {
    "feature": "Standby recovery doesn't transition standbyState to STANDBY_SNAPSHOT_READY, causing pg_ctl timeout during recovery initialization.",
    "task_id": "M0105-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "standbyState doesn't transition to STANDBY_SNAPSHOT_READY (causes pg_ctl timeout)"
    ],
@@ -2245,12 +2354,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No standbyState or STANDBY_SNAPSHOT_READY implementation found in codebase"
+   "code_audit": "PARTIAL: goopg-primary to real-PG-standby now functionally reaches a queryable hot-standby state (proven by passing TestE2E_FailoverGoopgToPG, internal/testport/e2e_failover_goopg_to_pg_test.go) via the M0105-0009 shutdown-checkpoint fix (commit c8e0a444) and WAL compat fixes (M0106-0010). However the literal claim survives: real PG's postmaster.pid PMStatus field never transitions to \"ready\"/\"standby\" during recovery off a goopg-produced backup, so pg_ctl -w genuinely still times out — the test harness works around this by launching postgres directly and TCP-polling instead of using pg_ctl (internal/testutil/pgcluster/cluster.go:231-241). Root-caused but not fixed."
   },
   {
    "feature": "Standby process doesn't report PM_STATUS_STANDBY status within 120 seconds, causing pg_ctl to timeout.",
    "task_id": "M0105-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "standby doesn't report PM_STATUS_STANDBY within 120s"
    ],
@@ -2265,12 +2375,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: PM_STATUS_STANDBY status reporting not found in codebase"
+   "code_audit": "PARTIAL: goopg's WAL/checkpoint output now lets a real PG standby reach a functionally-queryable hot-standby state (verified: TestE2E_FailoverGoopgToPG passes live), but PM_STATUS_STANDBY is still never actually reported through postmaster.pid within the pg_ctl-visible window — internal/testutil/pgcluster/cluster.go:231-235 documents this explicitly and bypasses pg_ctl (raw postgres exec + TCP port poll) as the workaround. The narrow \"pg_ctl times out waiting for standby status\" symptom is unresolved by design, not fixed."
   },
   {
    "feature": "WAL sender closes the replication connection before pg_basebackup considers the WAL stream complete.",
    "task_id": "M0105-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "WAL sender to close the connection before pg_basebackup considers the stream complete"
    ],
@@ -2285,12 +2396,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/replication.go:61-62 START_REPLICATION WAL sender marked for future implementation"
+   "code_audit": "RESOLVED (M0095-0003, confirmed via M0122-0001 re-audit): commit e45ffb6a implemented `pg_basebackup -X stream`; TestPort_PgBasebackup010StreamWAL (internal/testport/pgbasebackup_port_test.go:221) runs real pg_basebackup -X stream against goopg and passes, asserting the streamed WAL segment completes cleanly. The server.go:61-62 \"marked fallback\" note cited by the earlier audit is stale."
   },
   {
    "feature": "PG standby startup fails due to timeline mismatch and invalid WAL records at the redo LSN position.",
    "task_id": "M0102-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "PG standby startup still fails (timeline mismatch / invalid record at redo LSN)"
    ],
@@ -2305,12 +2417,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Timeline mismatch handling during standby startup not detected"
+   "code_audit": "RESOLVED 2026-07-07: PG-standby startup against a goopg primary no longer fails on timeline mismatch or invalid-record decoding. Fixed via checkPointCopy.PrevTimeLineID correction (commit ca818b71) and RmgrXLog-with-unknown-info routing for goopg-internal WAL payloads (internal/wal/format.go:245-254, comment cites a prior segfault this replaced). Verified live: TestE2E_FailoverGoopgToPG (internal/testport/e2e_failover_goopg_to_pg_test.go) passes both async and sync_remote_apply modes. Note: this is distinct from the still-open PM_STATUS_STANDBY/pg_ctl reporting gap — standby startup itself succeeds even though pg_ctl -w can't observe it."
   },
   {
    "feature": "Expression-based ON CONFLICT targets (e.g., lower(key)) require expression-index evaluation support, which is deferred as a separate scope beyond this testport parser fix.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "expression-based ON CONFLICT (lower(key)) targets require expression-index evaluation support (separate scope)"
    ],
@@ -2325,12 +2438,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/dml.go:148 ON CONFLICT targets only support col_name, not expressions"
+   "code_audit": "RESOLVED 2026-07-07: internal/parser/dml.go:267-279 (parseConflictTargetColumnList) now explicitly parses expression columns like lower(fruit) into a parallel Exprs slice on OnConflictTarget. internal/executor/operators_upsert.go encodeExprIndexKey (line 1204/1242) and collectExprColumnNames (line 1293) evaluate expression-index keys for conflict matching (M0100-0006b). Old line-148 citation is stale."
   },
   {
    "feature": "Full SeqScan/Project plan node migration from opTreeSlab is deferred to a future loop; plannode.go establishes only the foundation.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "plannode.go establishes the foundation for full SeqScan/Project migration in a future loop"
    ],
@@ -2345,12 +2459,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/plannode.go:14 states SeqScan/Project not yet migrated"
+   "code_audit": "PARTIALLY-RESOLVED 2026-07-07, still open: internal/executor/plannode.go:16-22 (Migration status Phase C.3 header) shows PlanSeqScan is now fully concrete (seqScanOp holds schema/tbl/pos/rel directly, no orig planner.Node pointer; landed via commit 1953872c 'SeqScan plan pointer elimination'). PlanProject remains an adapter keeping orig planner.Node for future migration -- that half of the original claim is still genuinely open."
   },
   {
    "feature": "Splitting state.appendMu's four invariants to enable independent granular locking.",
    "task_id": "M0107-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "splitting state.appendMu's four invariants"
    ],
@@ -2365,12 +2480,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/wal/stripe_writer_core.go:11 mentions as design, no implementation"
+   "code_audit": "confirmed-open 2026-07-07: internal/wal/stripe_writer_core.go:5-40 (stripeWriterCore, 'Foundation 15 for M0107-0007 slice B') explicitly states the call-site rewrite that 'lifts state.appendMu's four invariants into per-stripe local state plus shared stripeWriterCore state ... is multi-loop scope and is NOT in this loop.' At HEAD, internal/wal/writer.go still declares a single appendMu sync.RWMutex (writer.go:392) guarding all append/drain/publish paths, with 30+ Lock/RLock call sites across writer.go (e.g. writer.go:636,1235,1272,1325,1461,1505,1568,1623) — no independent granular locks have replaced it; only the unused/unmounted primitives (appendLockSet, insertPosTracker, insertionTracker, tailPublisher) exist as a staged foundation."
   },
   {
    "feature": "pg_waldump TAP test suite portions (2 tests with mixed BUG_FIX and UNIMPLEMENTED sections)",
    "task_id": "M0110-0002",
    "resume_point": "pg_waldump unimplemented test portions",
+   "status": "open",
    "evidence": [
     "BUG_FIX + UNIMPLEMENTED"
    ],
@@ -2385,12 +2501,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/testport/pgwaldump_port_test.go:15-23 — CLI tier ported, server tier deferred due to missing hash/gin/gist/spgist/brin index support"
+   "code_audit": "PARTIAL: hash is no longer a blocker — it is physically B-tree-backed (real WAL-generating storage) since the predicate-hash slice (internal/executor/operators_ddl.go:5877-5885, 5959). gin, gist, spgist and brin remain catalog-metadata-only with zero physical storage (operators_ddl.go:5886-5917: register catalog metadata only, no physical storage, no actual index acceleration), so no AM-specific WAL records exist for pg_waldump's server-tier filtering test to exercise. internal/testport/pgwaldump_port_test.go's server-tier deferral should be narrowed from 5 access methods to 4 (gin/gist/spgist/brin); CSV row WD-002 still correctly deferred."
   },
   {
    "feature": "GIST index support (required for index_including_gist regress test)",
    "task_id": "M0097-0002",
    "resume_point": "GIST index implementation",
+   "status": "open",
    "evidence": [
     "requires GIST index support, excluded per M0097-0002 policy"
    ],
@@ -2411,6 +2528,7 @@
    "feature": "SELECT * star-expansion within set operation branches (UNION/INTERSECT/EXCEPT)",
    "task_id": null,
    "resume_point": "star-expansion in set-op branches",
+   "status": "resolved",
    "evidence": [
     "copyselect still defers on a separate SELECT *-in-set-op-branch star-expansion bug"
    ],
@@ -2425,7 +2543,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No evidence of star expansion in set op branches; each branch planned separately"
+   "code_audit": "RESOLVED 2026-07-07 (not-a-real-gap): internal/analyzer/analyzer.go analyzeSelectWithParent (lines 234-281) recurses into s.SetOp.Right then the left side (SetOp cleared) so each UNION/INTERSECT/EXCEPT branch runs the full normal SELECT-analysis path independently, including analyzeTargets -> analyzeStar (lines 749-754, 1006) against its own FROM-list. Each branch gets independent * expansion; the original audit missed this recursive per-branch structure."
   },
   {
    "feature": "GROUP BY GROUPING SETS, ROLLUP, and CUBE syntax forms are not supported; they are parsed as sentinels but not executed.",
@@ -2452,6 +2570,7 @@
    "feature": "EXPLAIN output format is not fully implemented for UUID operations",
    "task_id": "M0097-0029",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Remaining: EXPLAIN format"
    ],
@@ -2466,12 +2585,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No UUID-specific EXPLAIN output formatting found in codebase"
+   "code_audit": "RESOLVED 2026-07-07 (not-a-real-gap): no UUID-specific code exists or is needed in internal/executor/operators_explain.go / operators_explain_format.go; EXPLAIN renders plan constants via the generic Datum-formatting path, and UUID's codec (commit 3770b2af) already produces PG-accurate text. Commit 0b503761 brought the uuid regress suite to 0 diff lines. No EXPLAIN-specific fix was ever needed for UUID; original entry was a misdiagnosis."
   },
   {
    "feature": "CTEs (Common Table Expressions) without explicit aliases are not recognized by the parser",
    "task_id": "M0097-0029",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "CTE subquery-without-alias parser gap"
    ],
@@ -2492,6 +2612,7 @@
    "feature": "PostgreSQL extensions (contrib modules) are out of scope and remain unimplemented",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Extensions remain out of scope"
    ],
@@ -2512,6 +2633,7 @@
    "feature": "Role-based access control for INSERT operations is not implemented; SET SESSION AUTHORIZATION remains a no-op so server stays in superuser mode",
    "task_id": "M0097-0040",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "requires real role-based INSERT permission checking; SET SESSION AUTHORIZATION is a no-op"
    ],
@@ -2532,6 +2654,7 @@
    "feature": "Planner GUC stubs (enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, and others) registered to prevent unrecognized GUC errors but may not affect actual behavior.",
    "task_id": "M0097-0069",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "register missing planner GUC stubs so that SET enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, etc. no longer produce 'unrecognized'"
    ],
@@ -2546,12 +2669,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go:722-768 registers enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation as pure stubs"
+   "code_audit": "confirmed-open: enable_parallel_hash/hash_mem_multiplier/from_collapse_limit/parallel_leader_participation registered internal/config/defaults.go:785-823 + pg_settings catalog.go:9945-9988; zero references in internal/planner (the only cost/plan package) — pure accepted-and-ignored stubs"
   },
   {
    "feature": "I/O statistics tracking not implemented; pg_stat_io virtual table always returns empty rows.",
    "task_id": "M0095-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "returns 0 rows (no I/O stats tracked in goopg v0)"
    ],
@@ -2566,12 +2690,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:5591 - pg_stat_io VirtualRows returns nil"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/executor/pgstat_io.go fetchIOStatRows builds the real 79-row PG-shaped table and fills real counters from storage.Pool (hits/reads/writes/evictions/extends + timings) and wal.Writer fsync counts/timings, wired into valuesOp.Open. TestPgStatIORowCount confirms it is no longer the empty stub cited by the earlier audit (catalog.go:5591)."
   },
   {
    "feature": "WAL summarization not running; pg_available_wal_summaries() always returns empty rows.",
    "task_id": "M0095-0002",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "always returns 0 rows (no WAL summarizer running since summarize_wal=off)"
    ],
@@ -2592,6 +2717,7 @@
    "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
    "task_id": "M0097-0073",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "GUC stubs added"
    ],
@@ -2606,12 +2732,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go:283-304 registers jit, compute_query_id, plan_cache_mode as compatibility stubs only"
+   "code_audit": "confirmed-open: jit/compute_query_id/plan_cache_mode are compat stubs only (internal/config/defaults.go:288-310, comment 'Compatibility stubs for GUCs checked by pg_regress tests'), no functional consumers found repo-wide"
   },
   {
    "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "LANGUAGE C functions accepted as stubs"
    ],
@@ -2632,6 +2759,7 @@
    "feature": "pg_collation_for() function returns hardcoded 'default' string; collation tracking throughout catalog and query execution is not implemented",
    "task_id": "M0097-0035",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "pg_collation_for() stub: returns \"default\" (no collation tracking in v0)"
    ],
@@ -2651,7 +2779,8 @@
   {
    "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",
    "task_id": "M0097-0150",
-   "resume_point": "Implement actual ownership/schema/name changes for ALTER FUNCTION/PROCEDURE",
+   "resume_point": "RESOLVED 2026-07-08: OWNER TO and SET SCHEMA now enforced (Routine.Owner/OwnerOrDefault, Routines.SetSchema, execAlterFunction, WAL record kinds 121/122); RENAME TO was already enforced. Verified live against cmd/goopg + restart persistence. See docs/design/0015-0002-pg-proc-catalog-and-routine-registry.md.",
+   "status": "resolved",
    "evidence": [
     "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA: no-op"
    ],
@@ -2671,6 +2800,7 @@
    "feature": "WITH [CASCADED|LOCAL] CHECK OPTION clause enforcement (syntax accepted but not enforced)",
    "task_id": null,
    "resume_point": "Implement CHECK OPTION enforcement",
+   "status": "resolved",
    "evidence": [
     "Check enforcement is not yet implemented; the clause is accepted and ignored."
    ],
@@ -2685,12 +2815,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:329 view CheckOption stored but not enforced"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): checkViewCheckOption (internal/executor/operators_fk.go:1900) raises SQLSTATE 44000 on CHECK OPTION violation, wired via plan.ViewCheckQual at all INSERT/UPDATE sites (internal/executor/operators_storage.go:1980-1984,3772-3773,4393-4394,5715-5716) — real enforcement, not the stored-but-unenforced state the earlier audit (catalog.go:329) described."
   },
   {
    "feature": "Foreign Data Wrapper (FDW) functionality stubbed; CREATE FOREIGN DATA WRAPPER and CREATE SERVER create compat registry entries only, without actual FDW implementation.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "FDW stubs: CREATE FOREIGN DATA WRAPPER + CREATE SERVER → compat registry with FDW-server association"
    ],
@@ -2711,6 +2842,7 @@
    "feature": "REINDEX INDEX/TABLE command is unimplemented; operates as a no-op stub.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "no-op rebuild (v0 stub)"
    ],
@@ -2731,6 +2863,7 @@
    "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "pg_get_expr stub (→ \"\")"
    ],
@@ -2751,6 +2884,7 @@
    "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "MVCC/attribute tier... deferred"
    ],
@@ -2771,6 +2905,7 @@
    "feature": "Four pg_amcheck TAP tests (AC-002: 002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) remain deferred as keystone blockers pending higher tiers.",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Keystone blocker for the four deferred pg_amcheck TAP tests (AC-002: 002_nonesuch/003_check/004_verify_heapam/005_opclass_damage)"
    ],
@@ -2791,6 +2926,7 @@
    "feature": "User schemas should be discoverable via pg_namespace heap rows during PG-standby replication, matching PostgreSQL's schema visibility model.",
    "task_id": "AC-003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "PG-standby user-schema visibility stays out of scope."
    ],
@@ -2811,6 +2947,7 @@
    "feature": "Schema definitions should be queryable via pg_namespace heap rows and indexes (2684/2685), enabling PostgreSQL standby replication to resolve schemas.",
    "task_id": "AC-003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "PG-standby visibility (pg_namespace heap row + 2684/2685 indexes) is out of scope"
    ],
@@ -2831,6 +2968,7 @@
    "feature": "The AC-002 through AC-005 PostgreSQL amcheck TAP test suite has not been ported to goopg.",
    "task_id": "M0110-0003",
    "resume_point": "S5",
+   "status": "open",
    "evidence": [
     "AC-002..AC-005 TAP port...deferred to rest of S5"
    ],
@@ -2851,6 +2989,7 @@
    "feature": "Runtime pg_database shared-catalog write for datconnlimit invalid-database filtering",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "blocked on a runtime pg_database shared-catalog write goopg lacks",
     "needs a runtime pg_database shared-catalog write goopg lacks"
@@ -2867,12 +3006,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/testport/pgamcheck002_port_test.go:118 datconnlimit write requires runtime pg_database"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/server/server.go:846 rejects connections where DatabaseConnLimit(db)==catalog.DatconnlimitInvalidDB, and updateOp.nextVirtualPgDatabase (internal/executor/operators_storage.go:3585) + catalog.InMemory.SetDatabaseConnLimit persist UPDATE pg_database SET datconnlimit=-2 via the Virtual-UPDATE path; pgamcheck002_port_test.go:454-478 exercises the full invalid-database filter end-to-end and passes. Landed as commit 17fea598 (M0119-0006 AC-002 residual #2), after the earlier audit was recorded."
   },
   {
    "feature": "Opclass damage detection test suite (005_opclass_damage)",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "005_opclass_damage remain",
     "AC-003 stays defer (003_check + 005_opclass_damage remain)",
@@ -2898,6 +3038,7 @@
    "feature": "Opclass parity test suite (005_opclass_damage)",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "new AC-003 carries the deferred 003/004/005 remainder (real corruption injection + opclass parity)"
    ],
@@ -2918,6 +3059,7 @@
    "feature": "On-disk pg_tablespace heap visibility management for shared catalog operations",
    "task_id": "M0095-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "on-disk pg_tablespace heap visibility (shared-catalog runtime write)"
    ],
@@ -2938,6 +3080,7 @@
    "feature": "The 1-byte 'char' type (OID 18) cannot be disambiguated from bpchar because the parser folds both to the same internal representation",
    "task_id": "DU-002",
    "resume_point": "Modify parser to distinguish literal 'char' from bpchar during type parsing",
+   "status": "resolved",
    "evidence": [
     "\"char\" (18) is deferred: the parser folds both quoted \"char\" and bare char to ct.Name=\"char\", so disambiguating the 1-byte internal char from bpchar needs a parser change, not just a codec entry."
    ],
@@ -2952,12 +3095,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/codec.go:1356 TypeNameToOID folds char to bpchar"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): synthesizeBareCharTypmod (internal/parser/select.go:2428) and ddl.go:4598 now disambiguate bare char (→typmod=1) from quoted \"char\" (→no typmod); pg18_user_catalog_rows.go:624 and expr.go:12343 consume that signal to report atttypid=18 vs 1042. Verified by TestParseCastCharDisambiguation (internal/parser/cast_test.go). The codec.go:1356 \"folds char to bpchar\" note cited by the earlier audit is stale."
   },
   {
    "feature": "Index column ordering (ASC/DESC/NULLS FIRST/NULLS LAST) is not persisted to disk; ordering is lost across server restart despite faithful dumps within a session",
    "task_id": "DU-002",
    "resume_point": "Persist indoption bits to on-disk pg_index heap to enable cross-restart index ordering preservation",
+   "status": "open",
    "evidence": [
     "indoption bits are not persisted to the on-disk pg_index heap, so ordering is lost across a restart"
    ],
@@ -2978,6 +3122,7 @@
    "feature": "Per-function SET configuration parameters are not tracked; all functions report NULL for the proconfig column.",
    "task_id": "DU-002",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg tracks no per-function SET clauses"
    ],
@@ -2992,12 +3137,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: initdb/pg_proc_view.go:220 - proconfig always NULL in views"
+   "code_audit": "confirmed-open: CREATE FUNCTION SET clause parsed-then-discarded (internal/parser/function.go:898-909, comment 'SET guc TO value — skip to end of clause'); proconfig hardcoded NULL at every emission site (internal/initdb/pg_proc_view.go:220,307,409,450,493; initdb.go:2625)"
   },
   {
    "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "RESET (...) left as the pre-existing no-op (pg_dump never emits it)"
    ],
@@ -3018,6 +3164,7 @@
    "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg does not act on n_distinct planner hints"
    ],
@@ -3038,6 +3185,7 @@
    "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "No CREATE TABLE threading (SET STATISTICS is ALTER-only)"
    ],
@@ -3058,6 +3206,7 @@
    "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",
    "task_id": "DU-002 slice 183",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Dump-fidelity only: goopg does not TOAST/compress."
    ],
@@ -3078,6 +3227,7 @@
    "feature": "Autovacuum functionality is not implemented; autovacuum_vacuum_scale_factor values are stored and dumped for compatibility but do not trigger automatic vacuuming",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg has no autovacuum, so the value is advisory catalog/dump-only"
    ],
@@ -3092,12 +3242,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:1626 goopg has no autovacuum"
+   "code_audit": "PARTIAL, still open: real tick-based launcher exists (internal/autovacuum/launcher.go:83-222, dispatches VacuumWithOptions/Analyze incl. anti-wraparound XID-age forcing) but is unwired in cmd/goopg/main.go (server.Config.AutovacuumLauncher, internal/server/server.go:198,551-554, never set outside launcher_test.go); needsVacuum/needsAnalyze (launcher.go:204-222) ignore autovacuum_vacuum_scale_factor entirely, using a hardcoded RowCount>0 / XID-age check instead"
   },
   {
    "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "COLLATE/USING accepted but ignored"
    ],
@@ -3118,6 +3269,7 @@
    "feature": "Write-Ahead Logging (WAL) for MultiXact operations, enabling creation, modification, and deletion of MultiXact records to be logged and recovered after crashes.",
    "task_id": "M0118-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "4-way lock-strength members + WAL persistence + spec promotion remain deferred",
     "Updater-bearing multi + WAL persistence + spec promotion deferred"
@@ -3182,6 +3334,7 @@
    "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",
    "task_id": "DU-002-380",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "HANDLER/VALIDATOR refs"
    ],
@@ -3196,12 +3349,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:462 HANDLER/VALIDATOR func references skipped"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): resolveFDWHandlerFunc/resolveFDWValidatorFunc (internal/executor/operators_ddl.go:971-1010) now real-resolve HANDLER/VALIDATOR names against pg_proc (signature-checked, raises 42883/42809 on failure) and store HandlerOID/ValidatorOID (operators_ddl.go:15155-15218), used by both CREATE and ALTER FOREIGN DATA WRAPPER. The ddl.go:462 \"skipped\" note cited by the earlier audit is stale."
   },
   {
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-378",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3222,6 +3376,7 @@
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-376",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3242,6 +3397,7 @@
    "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",
    "task_id": "DU-002-374",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "per-column `OF type (col WITH OPTIONS ...)` form rejected"
    ],
@@ -3262,6 +3418,7 @@
    "feature": "Typed table support for composite types in non-public schemas",
    "task_id": "DU-002-374",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "non-public-schema composite OF uncovered"
    ],
@@ -3282,6 +3439,7 @@
    "feature": "HammerDB Power Test at Scale Factor 1.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "HammerDB Power Test at SF1 ... as DEFERRED"
    ],
@@ -3301,7 +3459,8 @@
   {
    "feature": "Real multi-database and multi-role isolation boundaries with proper tracking across sessions",
    "task_id": "m0003",
-   "resume_point": null,
+   "resume_point": "M0110-0001: catalog.InMemory has no per-database namespace at all (every object store is one flat server-wide map) — confirmed still fully open 2026-07-06, milestone-scale (per-database catalog + storage isolation throughout internal/catalog), see deferral ledger",
+   "status": "open",
    "evidence": [
     "real multi-database/multi-role tracking"
    ],
@@ -3322,6 +3481,7 @@
    "feature": "Index definition and tablespace information reconstruction in pg_catalog queries",
    "task_id": "m0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "indexdef / tablespace reconstruction",
     "indexdef/tablespace reconstruction"
@@ -3344,6 +3504,7 @@
    "feature": "WITH OPTIONS clause in column definitions implemented as no-op; column-level options are not processed or applied",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "WITH OPTIONS no-op"
    ],
@@ -3364,6 +3525,7 @@
    "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
    "task_id": "m0097",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg does not currently emit"
    ],
@@ -3384,6 +3546,7 @@
    "feature": "Resolve subscriber apply stall issue during logical replication",
    "task_id": "M0103-0008",
    "resume_point": "rung 9",
+   "status": "open",
    "evidence": [
     "rung 9 (subscriber apply stall) deferred to its own design doc"
    ],
@@ -3425,6 +3588,7 @@
    "feature": "Schema mismatch between PG18 and goopg for index definitions (tgfoid/attnum derivation) needs to be reconciled in a future loop.",
    "task_id": "m0106-0010",
    "resume_point": "Reconcile both schema definitions; currently masked by OID default fallback.",
+   "status": "open",
    "evidence": [
     "a future loop should reconcile both definitions"
    ],
@@ -3445,6 +3609,7 @@
    "feature": "Join-based execution path for aggregate sublink promotion to enable faster execution on large inner result sets (currently exceeds statement timeout with 100M ops)",
    "task_id": null,
    "resume_point": "Implement join-based execution path for aggregate sublinking",
+   "status": "open",
    "evidence": [
     "A join-based execution path would be needed to make this fast enough; deferred."
    ],
@@ -3465,6 +3630,7 @@
    "feature": "H2 efficiency fix: fix_plan split and PROMPT trimming to reduce build_loop_context injection size",
    "task_id": null,
    "resume_point": "Implement fix_plan split / PROMPT trim optimization",
+   "status": "resolved",
    "evidence": [
     "H2 (fix_plan split / PROMPT trim) skipped — build_loop_context injects only a task count, not fix_plan content"
    ],
@@ -3479,12 +3645,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: H2 efficiency fix logic not found in executor or planner subsystems"
+   "code_audit": "RESOLVED (M0122-0001 triage, 2026-07-07): this is Ralph-tooling context-budget work, not an engine feature (prior audit searched the wrong subsystems). fix_plan.md is now actively split — completed_milestones/completed_fix_plan_00{1..9}.md exist at repo root, matching the entry's own cited evidence that build_loop_context() only injects a task count rather than the full fix_plan body."
   },
   {
    "feature": "EXCLUDE USING constraints bypass btree type validation for non-compatible types (box, point); stored as catalog-only without enforcing physical index.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "createExclusionIndexStub bypasses btree type-validation (box/point columns not btree-compatible); catalog-entry-only"
    ],
@@ -3505,6 +3672,7 @@
    "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
    "task_id": "M0100-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "deferred duplicate-source error"
    ],
@@ -3525,6 +3693,7 @@
    "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "No server-side encoding enforcement (on-disk PG-compat)"
    ],
@@ -3544,7 +3713,8 @@
   {
    "feature": "pg_dump test tiers 002-010 requiring broad catalog-view parity and dump/restore round-trip validation",
    "task_id": null,
-   "resume_point": null,
+   "resume_point": "M0119-0004 (source M0110-0001): confirmed still fully open 2026-07-06 — catalog.InMemory has no per-database namespace at all, blocking any real dump+restore round trip; see deferral ledger for the exact resume point",
+   "status": "open",
    "evidence": [
     "002-010 stay deferred pending broad catalog-view parity + a dump/restore round-trip"
    ],
@@ -3564,7 +3734,8 @@
   {
    "feature": "pg_amcheck server-dependent test tiers (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage), blocked on verify_heapam() SRF implementation and operator-class catalog parity",
    "task_id": "AC-002",
-   "resume_point": null,
+   "resume_point": "M0119-0006 (source M0110-0003): 002_nonesuch and 003_check/004_verify_heapam's page-structural + combined-corruption tiers are now FULLY PASSING as of 2026-07-07 (datconnlimit=-2/positive-limit residuals closed, synthetic-TOAST-relation open-failure fixed, restart-after-file-removal WAL allocation blocker fixed). CREATE OPERATOR CLASS/FAMILY + pg_amop/pg_amproc member catalog registration + WAL persistence are also now implemented (internal/executor/operators_ddl.go's execCreateOpClass/registerOpClassMembers, internal/catalog/catalog.go's RegisterUserOperatorClass/RegisterAmProcMember/RegisterAmOpMember). Only 005_opclass_damage remains open: it needs (a) UPDATE pg_catalog.pg_amproc SET amproc=... — pg_amproc is Virtual-backed (VirtualRows from ListAmProcMembers) but has no updateOp Virtual-UPDATE path (unlike pg_database's nextVirtualPgDatabase), so the corruption-injection UPDATE currently affects 0 rows; and (b) the btree access method does not dispatch comparisons through a per-index opclass FUNCTION at all (internal/access/btree has zero opclass/comparator-function call sites) — CREATE INDEX ... USING btree (col custom_opclass) is cataloged but the AM always uses its hardcoded native-type comparison, so a corrupted pg_amproc entry cannot actually corrupt anything observable. (b) is index-AM-level architecture work, materially larger than a single bounded loop.",
+   "status": "open",
    "evidence": [
     "the four server-dependent tests (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) deferred under AC-002 pending the verify_heapam() SRF + operator-class catalog parity"
    ],
@@ -3585,6 +3756,7 @@
    "feature": "MVCC/HOT-chain corruption verification in verify_heapam (004) - not faithfully portable due to on-disk varatt_external layout divergence",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The MVCC/attribute + TOAST tiers of 004... are not faithfully portable"
    ],
@@ -3606,6 +3778,7 @@
    "feature": "pg_subtrans truncation (cleanup of subtransaction ancestry records) is deferred.",
    "task_id": "M0117-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "no pg_subtrans truncation yet"
    ],

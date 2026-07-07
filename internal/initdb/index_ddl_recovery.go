@@ -38,7 +38,7 @@ import (
 // indexRegistryRecovery is the catalog-side surface this
 // recovery pass needs. `*catalog.InMemory` satisfies it.
 type indexRegistryRecovery interface {
-	RegisterIndexDuringRecovery(schema, name string, tableOID uint32, cols []string, unique bool, method string, primary bool, oid uint32)
+	RegisterIndexDuringRecovery(schema, name string, tableOID uint32, cols []string, unique bool, method string, primary bool, oid uint32, colDescending, colNullsFirst []bool, hasPredicate bool, predicateString string, includeColumns, colOpClasses, colCollations []string, fillfactor int, deduplicateItems *bool, nullsNotDistinct bool)
 	UnregisterIndexDuringRecovery(schema, name string)
 	RenameIndexDuringRecovery(schema, oldName, newName string)
 }
@@ -95,6 +95,16 @@ func replayIndexDDLRecords(walDir string, cat catalog.Catalog) error {
 				p.Method,
 				p.Primary,
 				p.OID,
+				p.ColDescending,
+				p.ColNullsFirst,
+				p.HasPredicate,
+				p.PredicateString,
+				p.IncludeColumns,
+				p.ColOpClasses,
+				p.ColCollations,
+				p.Fillfactor,
+				p.DeduplicateItems,
+				p.NullsNotDistinct,
 			)
 		case wal.RecordKindDropIndex:
 			p, derr := wal.DecodeDropIndex(rec.Payload)

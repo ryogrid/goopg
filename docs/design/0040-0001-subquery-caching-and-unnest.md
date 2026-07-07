@@ -257,3 +257,89 @@ side and probing.
 - `internal/executor/operators_join_agg.go` — hash join, semi‑join
 - `internal/planner/plan.go:106‑115` — `InExpr`
 - `analysis/tpch-q20-bottleneck-analysis.md` — Q20 complexity analysis
+
+## 7. Follow-up (2026-07-07, M-NIGHTLY tpch/Q20-timeout): outer-IN unnest blocked by an over-eager correlation check
+
+This section's §4's `unnestNonCorrelatedInExpr` (M0069-0005) landed and
+correctly handles the STRUCTURAL side of unnesting a non-correlated
+`IN` into a SemiJoin. Q20 still hit its 1200s query budget in the
+2026-07-07 nightly run — not because the unnest rewrite was missing,
+but because `IsNonCorrelated` (computed once at bind time via
+`planHasOuterRef`, `internal/planner/planner.go`) was WRONG for Q20's
+outermost `s_suppkey IN (SELECT ps_suppkey FROM partsupp WHERE ...)`.
+
+`planHasOuterRef` descends into every nested `SubqueryExpr`/`InExpr`/
+`ExistsExpr`'s own `.Plan` looking for `OuterColumnRef` nodes, but
+treated ANY hit as "the tested plan escapes its own scope" — without
+consulting `OuterColumnRef.Level` (a hop-count field: 1 = the
+reference's own immediate parent scope, 2 = grandparent, ...; see
+`resolveColumnRefAt`). Q20's partsupp subquery embeds a further-nested
+scalar subquery (`ps_availqty > (SELECT 0.5*sum(l_quantity) FROM
+lineitem WHERE l_partkey=ps_partkey AND l_suppkey=ps_suppkey ...)`)
+whose `Level=1` `OuterColumnRef`s resolve entirely within partsupp's
+OWN scope — not an escape past partsupp at all. The old code counted
+this as "partsupp-subquery is correlated to whatever contains it",
+so the OUTERMOST `s_suppkey IN (...)` was marked correlated and never
+got the fast-path SemiJoin rewrite; it was left as a raw `InExpr` in
+the outer Filter (visible in `EXPLAIN` as literally `Filter:
+(<*planner.InExpr> AND (n_name = 'CANADA'))`), forcing the executor to
+re-run the entire partsupp+lineitem-aggregate subtree once per
+`supplier` row (10000 rows at SF1) instead of building it once as a
+hash-join probe side.
+
+Fix: `planHasOuterRef` now delegates to a depth-tracked
+`planHasEscapingOuterRef(node, depth)` — `depth` starts at 1 and
+increments by one for each subquery level recursed into (the same
+convention `bushy.go`'s `remapOuterRefsInSubplan` already established
+for the analogous problem of remapping `OuterColumnRef.Index` after a
+`MultiHashJoin` rewrite). Only `Level >= depth` counts as an escaping
+reference; a `Level=1` ref found one subquery level deep (`depth=2`)
+correctly reads as "resolves within the tested plan's own scope",
+matching Q9/Q21-style nested-correlation precedent elsewhere in the
+planner.
+
+A second, independent bug was found and fixed in the same
+investigation: `splitEqualityForHash` (`planner.go`, used by
+`planFromClause`'s explicit `JOIN ... ON` handling — a different code
+path than this doc's bushy-DP-adjacent unnest machinery) only
+recognised a bare single equality predicate. An AND-of-equalities
+predicate (e.g. `partsupp JOIN (SELECT ... GROUP BY l_partkey,
+l_suppkey) agg ON ps_partkey=agg.l_partkey AND ps_suppkey=
+agg.l_suppkey`) fell through to the Nested-Loop default, which against
+an expensive derived-table side with no usable index recomputes the
+`GROUP BY` once per outer row. Fixed by iterating the predicate's
+`splitAnd` conjuncts and hashing on the first one that decomposes into
+disjoint sides, leaving the full `Predicate` untouched for the
+executor's existing residual-recheck-per-hash-match mechanism
+(`joinPredicateMatchSlot`) — the same mechanism TPC-H Q9's bushy DP
+already relies on for a two-equality join between base relations.
+
+**Verification:** `tmp/tpch-runner -queries 20` went from `ERROR after
+1200.13s (57014)` to `OK elapsed=2.55s rows=92` on a fresh server
+restart against `bench/tpch/runtime_goopg/data`; row count
+cross-checked against a freshly-started real PostgreSQL 18.3 instance
+on an independently-generated SF1 dataset (`bench/tpch/runtime/pgdata`)
+— both return exactly 92 rows. `scripts/tpch-spotcheck.sh` PASS
+(Q12=2, Q13=33); full `go test ./...` green.
+
+**Regression tests:**
+- `internal/planner/non_correlated_subquery_test.go`'s
+  `TestPlanHasOuterRef_NestedSubqueryResolvesLocally` — the minimal,
+  precise repro (fails without the `planHasOuterRef` fix, passes with
+  it); its sibling `TestPlanHasOuterRef_NestedSubquery` was updated to
+  use `Level=2` (a genuinely escaping reference) instead of the
+  `Level=1` value it previously used to pin the old, over-eager
+  behaviour.
+- `internal/planner/multikey_hash_join_test.go`'s
+  `TestSplitEqualityForHashMultiKey` — fails without the
+  `splitEqualityForHash` fix.
+- `internal/planner/q20_unnest_test.go`'s
+  `TestPlanQ20OuterInFullyUnnested` — asserts no raw `*InExpr` survives
+  anywhere in Q20's planned tree. Note: this one does NOT reproduce
+  the bug against a minimal synthetic `catalog.NewInMemory()` Q20
+  catalog (tried bare columns and added PK/composite-PK indexes; both
+  show correct unnesting even with `planHasOuterRef` un-fixed) — some
+  structural difference in the real HammerDB-generated bench schema
+  changes which code path handles the outer IN, not yet isolated. It
+  is kept as an end-state assertion guarding future regressions of
+  this shape, not as the bug's original repro.

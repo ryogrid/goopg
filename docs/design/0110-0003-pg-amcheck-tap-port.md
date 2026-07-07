@@ -470,12 +470,371 @@ anti-join runs to completion. Both `--all --exclude-schema …` cases (`.pl`
 `no relations to check`) and stand as the end-to-end regression guard for the
 planner fix.
 
-### One deferred residual
+### Former deferred residual — now closed (2026-07-07)
 
 **`datconnlimit = -2` invalid-database filter.** The `.pl` marks a database
 invalid via `UPDATE pg_database SET datconnlimit = -2` and asserts pg_amcheck's
-database-resolution query filters it out. goopg has no runtime in-place update
-of on-disk shared catalogs (`pg_database` is initdb-only; the in-memory catalog
-exposes no `datconnlimit` write path), so the UPDATE is a silent no-op and the
-database stays connectable. Blocked on the runtime shared-catalog-write
-capability, not an amcheck concern.
+database-resolution query filters it out. This was blocked on a runtime write
+path for `pg_database.datconnlimit` — goopg has no on-disk, generically
+UPDATE-able heap for `pg_database` (it is `catalog.Table{Virtual: true}`,
+computed entirely by `VirtualRows()`), so the write needed a dedicated
+mechanism rather than falling out of the generic UPDATE executor for free.
+
+**Read side.** `catalog.InMemory` gained `databaseConnLimit map[string]int32`
+plus `SetDatabaseConnLimit(name string, limit int32) bool` /
+`DatabaseConnLimit(name string) int32` (catalog.go) — the same "runtime
+InMemory truth, no on-disk write" pattern `CreateCollation`/`CreateExtension`
+already use for other per-object runtime state. `pg_database`'s `VirtualRows`
+closure now renders `strconv.FormatInt(int64(c.DatabaseConnLimit(n)), 10)`
+instead of the old hard-coded `"0"`.
+
+**Write side.** This is the interesting half. `planUpdate` (`internal/planner/
+planner.go`) already resolves `UPDATE pg_database SET datconnlimit = ... WHERE
+...` without complaint — `pg_database.View == nil`, so it never enters the
+view-rewrite branch, and nothing in the generic single-table UPDATE path
+checks `Table.Virtual`. The WHERE/SET expressions resolve against
+`pg_database`'s ordinary `Columns` list exactly like a real table's. The
+problem was purely on the *execution* side: `updateOp.Next()`
+(`internal/executor/operators_storage.go`) unconditionally calls
+`ctx.Catalog.RelFileNode(tbl)` and scans physical heap pages through that
+relation file — `pg_database` has none, so the scan silently produced zero
+matching rows (`UPDATE 0`, no error) and the SET never ran.
+
+Fixed by adding `updateOp.nextVirtualPgDatabase()`: `Next()` now checks
+`tbl.Virtual && tbl.Schema == "pg_catalog" && tbl.Name == "pg_database"` right
+after setting `o.done = true`, and if true routes here instead of the ~1300
+lines of physical-heap logic below (`MaterializeWriterXID`, `RelFileNode`,
+B-tree/SeqScan matching, WAL emission, MVCC tuple headers — none of it applies
+to a table with no storage). The helper:
+
+1. Reads `tbl.VirtualRows()` — the exact same rows a `SELECT * FROM
+   pg_database` would see.
+2. Decodes each cell into a typed `Row` via `planner.TypedVirtualCell` (the
+   identical helper `rematerialiseVirtualRows` uses for the SELECT-side
+   `Values`/`VirtualSource` path in `operators.go`), so `evalExpr` can run
+   the already-extracted `o.pred` (the WHERE clause `extractScan` pulled out
+   of the plan's `Child` at construction time) against real typed values —
+   the WHERE-matching logic is not duplicated, only its data source changes.
+3. For matched rows, evaluates `o.plan.Set[connLimitOrdinal]` (also already
+   resolved by the generic planner path — no special planner code needed) and
+   calls `SetDatabaseConnLimit`.
+4. Rejects (`0A000`) any `SET` targeting a column other than `datconnlimit` —
+   silently discarding an unsupported column's write would be worse than
+   refusing it outright.
+
+The special-case is scoped to `pg_database` specifically, not every `Virtual`
+table — generalizing the Child-scan/write substitution to arbitrary system
+catalogs was avoided to keep blast radius low; other Virtual tables' `UPDATE`
+statements keep today's existing (silent, 0-rows-affected) behavior unchanged.
+
+**Test.** `TestPort_PgAmcheck002Nonesuch`'s "Invalid / partially dropped
+database" section is now ported (was `NOT PORTED`/deferred) — both
+`command_checks_all` cases (`--database regression_invalid` and `--table
+regression_invalid.public.foo`) run against the real `pg_amcheck` binary and
+assert the exact upstream `no connectable databases to check matching "..."`
+error. Confirmed non-vacuous via `git stash` on the catalog/executor changes
+(fails with the pre-fix `skipping database "regression_invalid": amcheck is
+not installed` symptom). **002_nonesuch.pl (AC-002) is now fully ported with
+no remaining residuals.**
+
+**Still deferred** (recorded in `.ralph/deferral_ledger.md`, M0119-0006 AC-002
+residual #1 row): (1) connect-time enforcement — a client can still actually
+open a session against a `datconnlimit = -2` database; goopg's connection
+startup never consults `DatabaseConnLimit`, only database registration/
+`datallowconn`. Real PG rejects the connection itself. (2) Positive
+`datconnlimit` values (real per-database connection-count throttling) are
+entirely unimplemented — only the `-2` sentinel's SQL-visibility half was
+needed for AC-002.
+
+### Follow-up: connect-time `datconnlimit = -2` rejection (2026-07-07)
+
+Picked up residual #1 above. PG's `InitPostgres` (postinit.c) rechecks
+`pg_database` after authentication and calls `database_is_invalid_form`,
+which is just `datform->datconnlimit == DATCONNLIMIT_INVALID_DB` (pg_database.h
+defines the sentinel as `-2`, "a database is set to invalid partway through
+being dropped"). A match is a FATAL `55000`
+(`ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE`) `cannot connect to invalid
+database "%s"`, raised before the session is otherwise established — distinct
+from the connection-count check a few lines below it (`ERRCODE_TOO_MANY_
+CONNECTIONS`), which only applies to non-negative limits and is out of scope
+here (needs a live per-database connection counter — residual #2, still
+deferred, untouched by this loop).
+
+goopg's connection-startup handshake (`Server.handleStartup`,
+`internal/server/server.go`) already had the sibling "database does not
+exist" gate (`databaseRegistry.HasDatabase`, M0110-0003 AC-002 gap #3) right
+after authentication — the natural place to add the `-2` check too. Added:
+
+- `catalog.DatconnlimitInvalidDB` (`internal/catalog/catalog.go`), an exported
+  `-2` constant mirroring PG's `DATCONNLIMIT_INVALID_DB` name, so the sentinel
+  isn't a magic number at the call site.
+- `databaseConnLimitRegistry` (`internal/server/database_ddl.go`), a new
+  single-method interface (`DatabaseConnLimit(name string) int32`) satisfied
+  by `catalog.InMemory`. Deliberately kept separate from the existing
+  `databaseRegistry` interface (`CreateDatabase`/`DropDatabase`/`HasDatabase`)
+  rather than adding the method there: `databaseRegistry` gates the
+  unrelated unknown-role and unknown-database FATAL checks via the same type
+  assertion, so widening it would silently disable those checks for any
+  catalog fake that implements the first three methods but not this one.
+  This mirrors the existing `databaseConfigRegistry` precedent (added for
+  `ALTER DATABASE ... SET`) in the same file.
+- A new check in `Server.handleStartup`, right after the existing
+  `HasDatabase` gate (so it only runs once the database is confirmed to
+  exist): if `DatabaseConnLimit(db) == catalog.DatconnlimitInvalidDB`, write
+  the FATAL `55000` `cannot connect to invalid database "%s"` ErrorResponse
+  and close the connection, exactly like the sibling check above it.
+
+Deliberately scoped to the `-2` sentinel only, per the ledger row's own
+scoping rationale — positive-limit connection *counting* needs new state
+(an active-connection registry keyed by database) and remains residual #2,
+untouched.
+
+**Test.** `TestConnectInvalidDatconnlimitDatabaseRejected`
+(`internal/server/database_exists_test.go`), mirroring the existing
+`TestConnectNonexistentDatabaseRejected`/`TestConnectBootstrapDatabasesAccepted`
+pair exactly: creates a database, marks it `datconnlimit = -2` via
+`SetDatabaseConnLimit`, dials the real wire protocol, and asserts the FATAL
+frame's SQLSTATE and message text. Confirmed non-vacuous via `git stash` on
+`server.go` alone (fails with `unexpected frame S before ErrorResponse` — the
+handshake proceeds to `AuthenticationOk` instead of rejecting — without the
+fix).
+
+Gates: `go build ./...` clean; `go vet ./internal/server/... ./internal/catalog/...`
+clean; `go test ./internal/server/... ./internal/catalog/... ./internal/executor/...`
+PASS; `RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+(0 failed transactions, standard/simple-update/select-only).
+
+### Follow-up: residual #2 — positive `datconnlimit` connection-count throttling (2026-07-07)
+
+The previous follow-up deliberately scoped out the "too many connections"
+check (`CheckMyDatabase`, `postgres/src/backend/utils/init/postinit.c:392-399`):
+
+```c
+if (dbform->datconnlimit >= 0 &&
+    AmRegularBackendProcess() &&
+    !am_superuser &&
+    CountDBConnections(MyDatabaseId) > dbform->datconnlimit)
+    ereport(FATAL,
+            (errcode(ERRCODE_TOO_MANY_CONNECTIONS),
+             errmsg("too many connections for database \"%s\"", name)));
+```
+
+Two properties of the upstream check matter for the port:
+
+1. **The count includes the connecting backend itself.** The comment right
+   above it says so explicitly: "we create our PGPROC before checking for
+   other PGPROCs... the connection limit is approximate." `CountDBConnections`
+   scans `ProcArray` for every backend (any role) whose `databaseId` matches,
+   with no self-exclusion — unlike its cousin `CountOtherDBBackends` (used by
+   `DROP DATABASE`), which explicitly skips `MyProc`. So the comparison is
+   `count > limit`, not `count >= limit`, and the counter must be incremented
+   *before* the comparison runs.
+2. **Superuser connections are still counted, only the check is skipped for
+   them.** `!am_superuser` gates the `ereport`, not the count — a superuser
+   session occupies a slot that counts against everyone else's limit exactly
+   like a regular one does, since `CountDBConnections` has no role filter.
+
+goopg has no `ProcArray`; the closest existing analogue that already tracks
+one entry per live backend, keyed by database name, is
+`activity.ActivityRegistry` (`internal/activity/registry.go`), populated by
+`Server.handleStartup`'s existing `reg.Register(&activity.Backend{DatName:
+params["database"], ...})` call (line ~875) and released by the existing
+teardown `defer` calling `reg.Unregister(pidStr)` (line ~895). Since that
+`Register` call already happens before any point this check could run, no
+new mutable state or lifecycle is needed: a slot-scan count taken *after*
+`Register` already has the self-inclusive property `CountDBConnections`
+relies on, and `Unregister`'s existing cleanup already keeps it accurate on
+every teardown path (including the reject path added here) with zero new
+increment/decrement pairing to get wrong. (An earlier draft of this section
+proposed a dedicated `dbConnMu`/`dbConnCounts` counter incremented/decremented
+around a `connLimitDB` closure variable; per-review, that added a second
+piece of state and a new leak surface across every future early-return in
+`handleStartup` for no benefit — `handleStartup` runs once per TCP connection,
+not the per-frame hot path, so the O(slot-count) scan below costs nothing
+that matters.)
+
+Add one read-only method to `ActivityRegistry`:
+
+```go
+// CountByDatName returns the number of currently registered backend slots
+// (regular + background) whose DatName equals name, INCLUDING a backend
+// that has already Register()'d itself for this same connection — mirrors
+// PG's CountDBConnections (postinit.c / procarray.c), which counts the
+// calling backend's own PGPROC alongside every other backend's, unlike its
+// self-excluding cousin CountOtherDBBackends (used by DROP DATABASE).
+// O(len(slots)); intended for connect-time use (once per TCP connection),
+// not the per-frame WaitEvent hot path.
+func (r *ActivityRegistry) CountByDatName(name string) int32 {
+    var n int32
+    for i := range r.slots {
+        if c := r.slots[i].cold; c != nil && c.DatName == name {
+            n++
+        }
+    }
+    return n
+}
+```
+
+And one new check in `Server.handleStartup`, placed right after the existing
+`reg.Register(...)` / `activity.SetCurrentGoroutine(...)` block (so `db`'s
+own just-registered slot is already counted) — either before or after the
+teardown `defer` is fine now, since there is no new state for the defer to
+release:
+
+```go
+if db := params["database"]; db != "" && !isReplication && reg != nil {
+    if limReg, ok := s.cfg.Catalog.(databaseConnLimitRegistry); ok {
+        if limit := limReg.DatabaseConnLimit(db); limit >= 0 && !isSuperuserRoleName(user) {
+            if count := reg.CountByDatName(db); count > limit {
+                s.writeFatal(w, sqlstate.TooManyConnections,
+                    fmt.Sprintf("too many connections for database %q", db))
+                logger.Info("connection rejected: too many connections",
+                    "database", db, "limit", limit, "count", count)
+                return
+            }
+        }
+    }
+}
+```
+
+Reused as-is, no new plumbing needed: `databaseConnLimitRegistry.
+DatabaseConnLimit` (already returns any configured limit, not just the `-2`
+sentinel), `isSuperuserRoleName` (existing bootstrap-`postgres`-is-the-only-
+superuser convention, already used for `is_superuser` GUC reporting a few
+lines below), and `sqlstate.TooManyConnections` (`53300`, already defined,
+previously unused). The existing teardown `defer` (`reg.Unregister(pidStr)`)
+needs no change: rejecting here still runs it via the normal `return` path,
+removing this backend's slot exactly like any other disconnect.
+
+Deliberately NOT done: replication connections stay excluded from the
+count (matching `AmRegularBackendProcess()`'s exclusion of walsenders — goopg
+routes those to a separate path before reaching this block, via the
+pre-existing `isReplication` guard); background/internal connections that
+never go through `handleStartup` (there are none reaching user databases
+today) are out of scope; per-role connection limits (`pg_authid.rolconnlimit`,
+a separate PG mechanism) are a different, untracked feature.
+
+**Test plan.** Extend `internal/server/database_exists_test.go`:
+`startServerWithCatalog`'s signature grows an `act *activity.Registry`
+parameter (nil-safe passthrough into `Config.Activity`; existing callers pass
+`nil`, preserving today's behaviour where this whole block is skipped).
+`TestConnectExceedsPositiveDatconnlimitRejected` wires a real
+`activity.NewActivityRegistry(N)`, sets `SetDatabaseConnLimit(db, 1)`, opens
+and keeps one connection alive, then dials a second and asserts the FATAL
+`53300` `too many connections for database "%s"` ErrorResponse.
+`TestConnectPositiveDatconnlimitSuperuserBypasses` mirrors it connecting as
+`postgres` past the same limit to confirm the bypass (still counted, not
+rejected). `TestActivityRegistryCountByDatName`
+(`internal/activity/registry_test.go`) unit-tests `CountByDatName` directly
+(multiple databases, zero/one/many matching slots, post-`Unregister` count
+drop) without a real server.
+
+Gates: `go build ./...`; `go vet ./internal/server/... ./internal/activity/...`;
+`go test ./internal/server/... ./internal/activity/... ./internal/catalog/...`;
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh`.
+
+## Follow-up (2026-07-07): AC-003 cluster unblocked — synthetic TOAST relations report as healthy-empty instead of erroring
+
+All six AC-003/AC-004 tests (`TestPort_PgAmcheck003CombinedCorruption`,
+`003MissingIndexFork`, `003MissingHeapFile`, `003SchemaScoped`,
+`004VerifyHeapam`, `AllTables`, `BtreeIndexCheck`) were unconditionally
+`t.Skip`ing at their "pre-corruption baseline is clean" gate, all with the
+identical evidence:
+
+```
+heap table "postgres.pg_toast.pg_toast_16404": ERROR: could not open relation: relation does not exist
+btree index "postgres.pg_toast.pg_toast_16404_index": ERROR: could not open relation: relation does not exist
+```
+
+Root cause: `catalog.go`'s TOAST-exposure scheme (`toastRelidOffset`,
+`tableHasToastRelation`, doc comment at `tableHasToastRelation` ~line 990)
+deliberately emits a synthetic `pg_class`/`pg_index` row for every toastable
+table's `pg_toast_<oid>` relation and `pg_toast_<oid>_index` — but with **no
+real backing heap or index file**, since goopg never actually routes
+out-of-line values through a physical TOAST relation. Real `pg_amcheck`, by
+default, walks every table's TOAST relation alongside the table itself (it
+resolves `reltoastrelid` and checks it too) — so `verify_heapam(oid)` /
+`bt_index_check(oid)` on a synthetic TOAST OID always 42P01'd, and pg_amcheck
+reported the *whole database* as dirty before any real corruption was ever
+injected, permanently blocking the "confirm a clean baseline first" gate every
+one of these tests requires.
+
+Fix: `verifyHeapamResolveTable`'s call site (`operators_verify_heapam.go`) and
+`btIndexResolve`'s call site (`operators_bt_index_check.go`) both gained a
+fallback when the OID fails to resolve to a real table/index: check
+`catalog.InMemory.ToastParentTable(oid)` (pre-existing helper, previously used
+only by REINDEX CONCURRENTLY lock routing) — if the OID is a synthetic TOAST
+relation/index OID whose parent still owns an auto-exposed TOAST relation,
+report **no findings** (`nil`/`NullDatum, nil`) instead of raising 42P01. This
+is semantically correct, not a workaround: since no value is ever actually
+stored in goopg's synthetic TOAST relation, it is vacuously always empty and
+healthy — exactly the report real `pg_amcheck` gives for a genuinely empty
+TOAST table.
+
+Result: `TestPort_PgAmcheck004VerifyHeapam`, `TestPort_PgAmcheckAllTables`, and
+`TestPort_PgAmcheckBtreeIndexCheck` now genuinely PASS (previously always
+skipped). The four corruption-injection tests
+(`003CombinedCorruption`/`003MissingIndexFork`/`003MissingHeapFile`/
+`003SchemaScoped`) advance past the same gate but now hit a **new, distinct**
+blocker: after the test manually removes a heap/index file to simulate
+corruption, restarting the goopg cluster times out after 20s
+(`start timeout after 20s`, no corruption-check ever runs). This is a fresh
+discovery, not a regression from this fix (the old code never reached the
+restart step) — see the deferral ledger's 2026-07-07 AC-003 row for the exact
+repro and resume point.
+
+Gates: `go build ./...` clean; `go test ./internal/executor/...
+./internal/catalog/... ./internal/amcheck/...` PASS; `scripts/tpch-spotcheck.sh`
+PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+
+## Follow-up (2026-07-07): AC-003 restart-timeout blocker closed — `extractRecordBytes` was allocating a whole WAL segment per record
+
+Root-caused the "restart cluster after removal: start timeout after 20s"
+blocker the previous follow-up left open, via CPU profiling
+(`pprof.StartCPUProfile` around a throwaway `initdb.Open` probe against the
+exact stop→remove-file→restart repro) rather than more static tracing —
+`go tool pprof -top` showed 70% of all samples in `runtime.memclrNoHeapPointers`
+reached through `wal.extractRecordBytes`'s `make([]byte, 0, len(stream))`
+(`internal/wal/xlog_emit.go:163`, pre-fix).
+
+Bug: `extractRecordBytes(stream, streamStart, segSize, wantBytes)` is called
+twice per WAL record by `readAllPageAware` (once for the 24-byte
+`xlogRecordHeaderSize` header, once for the record's own `paddedTotal` body)
+and by the writer's equivalent scan path. Every call allocated capacity
+`len(stream)` — the entire **remaining** input, since callers pass
+`stream[off:]` — regardless of `wantBytes`. For a record near the start of a
+16 MB WAL segment, extracting a 24-byte header allocated and zero-filled
+~16 MB. `initdb.Open` runs several independent full-WAL replay passes
+(`replayEventTriggerDDLRecords`, `replayOperatorClassDDLRecords`,
+`replayCLogFromWAL`, `replayRangeTypeDDLRecords`, `replayViewRecords`, and
+more via `wal.ReadAll`/`ReplayFromDirWithMgr`), so even a handful of small
+DDL/heap records multiplied into tens of seconds of allocation+memclr —
+comfortably blowing the 20s `cluster.Start()` budget every corruption test in
+this file relies on. Not specific to the missing-file scenario itself: any
+startup with enough real WAL content pays this cost, but the corruption tests
+are the first path in the port suite that both (a) has non-trivial WAL to
+replay and (b) restarts under a tight harness timeout, which is why it
+surfaced here.
+
+Fix: `extractRecordBytes` now allocates `make([]byte, 0, min(wantBytes,
+len(stream)))` — the loop can never append more than `wantBytes` bytes (its
+own `len(recordBytes) < wantBytes` guard), so this is a strict reduction in
+over-allocation, not a behavior change. Verified via the exact profiling
+repro: `initdb.Open` on the broken data dir dropped from 23.57s to 0.18s.
+
+Regression test: `TestExtractRecordBytesCapBoundedByWantBytes`
+(`internal/wal/xlog_emit_test.go`) asserts `cap(recordBytes) <= wantBytes`
+against a 16 MiB synthetic stream with `wantBytes=24`; confirmed non-vacuous
+via `git stash` on `xlog_emit.go` alone (fails with `cap=16777216`).
+
+Result: all four previously-blocked AC-003 corruption tests
+(`TestPort_PgAmcheck003CombinedCorruption`, `003MissingIndexFork`,
+`003MissingHeapFile`, `003SchemaScoped`) now PASS. **AC-003/AC-004 are fully
+unblocked — no open blockers remain in this cluster.**
+
+Gates: `go build ./...` clean; `go test ./internal/wal/... ./internal/initdb/...
+./internal/executor/... ./internal/amcheck/... ./internal/catalog/...` PASS;
+`go test -v -run '^TestPort_PgAmcheck003' ./internal/testport/` PASS (4/4);
+`scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
+scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).

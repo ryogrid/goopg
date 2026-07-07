@@ -208,6 +208,73 @@ func TestNoticeCaptureUpdateTrigger(t *testing.T) {
 }
 
 
+// TestNoticeRaisePgTypeofRendersTypeName pins a regression surfaced by the
+// M-NIGHTLY eval-plan-qual(-trigger) isolation spec failures
+// (AI-20260707-000712-002/-003): once pg_typeof()/::regtype started
+// evaluating to an OID-backed Datum (M0122-0005), plpgsql's RAISE NOTICE
+// format-arg substitution printed the bare pg_type OID (e.g. "25") instead
+// of resolving it to the display name ("text") the way a plain `SELECT
+// pg_typeof(...)` does.
+func TestNoticeRaisePgTypeofRendersTypeName(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	dsn := "host=" + addr[:strings.LastIndex(addr, ":")] + " port=" + addr[strings.LastIndex(addr, ":")+1:] + " user=postgres dbname=postgres sslmode=disable"
+	base, err := pq.NewConnector(dsn)
+	if err != nil {
+		t.Skipf("pq.NewConnector: %v", err)
+	}
+	var noticeMu sync.Mutex
+	var notices []string
+	withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
+		noticeMu.Lock()
+		notices = append(notices, n.Message)
+		noticeMu.Unlock()
+	})
+	db := sql.OpenDB(withNotice)
+	defer db.Close()
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	setup := `CREATE FUNCTION pg_typeof_raise_probe() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE NOTICE '%: % %', pg_typeof(1::int4), pg_typeof('x'::text), 'text'::regtype;
+END
+$$`
+	rows, err := conn.QueryContext(ctx, setup)
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	rows.Close()
+
+	noticeMu.Lock()
+	notices = nil
+	noticeMu.Unlock()
+
+	rows, err = conn.QueryContext(ctx, `SELECT pg_typeof_raise_probe()`)
+	if err != nil {
+		t.Fatalf("SELECT pg_typeof_raise_probe(): %v", err)
+	}
+	rows.Close()
+
+	noticeMu.Lock()
+	got := append([]string(nil), notices...)
+	noticeMu.Unlock()
+
+	if len(got) != 1 {
+		t.Fatalf("notices = %v, want exactly 1", got)
+	}
+	want := "integer: text text"
+	if got[0] != want {
+		t.Errorf("notice = %q, want %q (pg_typeof()/::regtype must render the type name, not the raw pg_type OID, inside RAISE NOTICE format args)", got[0], want)
+	}
+}
+
 // TestPartitionChildTriggerFiresOnParentUpdate (M0100-0005o) verifies that
 // when a BEFORE UPDATE trigger is defined on a partition child but the UPDATE
 // statement targets the partitioned parent, the child's trigger still fires

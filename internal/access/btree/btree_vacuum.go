@@ -46,7 +46,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		return 0, err
 	}
 
-	var emptyLeaves []emptyLeafInfo
+	unlinkedAny := false
 	totalRemoved := 0
 
 	for cur := leftmostBlk; cur != storage.InvalidBlockNumber; {
@@ -84,6 +84,7 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 
 		next := op.Next
 
+		var justEmptied *emptyLeafInfo
 		if len(kept) < len(items) {
 			resetPageItems(slot.Page())
 			keptRaw := make([][]byte, 0, len(kept))
@@ -107,12 +108,12 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 				// we left off.
 				op.Flags |= BTDeleted | BTHalfDead
 				writeOpaque(slot.Page(), op)
-				emptyLeaves = append(emptyLeaves, emptyLeafInfo{
+				justEmptied = &emptyLeafInfo{
 					blk:      cur,
 					firstKey: firstKey,
 					prev:     op.Prev,
 					next:     op.Next,
-				})
+				}
 			}
 			// M0079-0002: emit a logical btree-vacuum record
 			// carrying the kept-items projection + post-vacuum
@@ -135,20 +136,34 @@ func (bt *BTree) VacuumIndexPages(deadTIDs []storage.ItemPointer) (int, error) {
 		}
 
 		bt.unpinW(slot)
-		cur = next
-	}
 
-	// Unlink empty leaves from the sibling chain and remove their
-	// downlinks from parent internal pages.
-	for _, leaf := range emptyLeaves {
-		if err := bt.unlinkEmptyLeaf(leaf); err != nil {
-			return totalRemoved, err
+		// M-NIGHTLY (AI-20260706-201855-001, loop 9): unlink the
+		// now-empty leaf IMMEDIATELY, in this same iteration,
+		// rather than deferring it to a second pass over a batch
+		// collected across the WHOLE leftmost-to-rightmost scan.
+		// The old batched design left a leaf flagged
+		// BTHalfDead|BTDeleted — with its parent downlink still
+		// live — for as long as the rest of the (possibly
+		// thousand-leaf) scan took, wide open for a concurrent
+		// fast-path insert (tryInsertNoSplit never checks
+		// BTHalfDead/BTDeleted) to land on it before the deferred
+		// unlink discarded it. Unlinking here shrinks that window
+		// to the handful of instructions inside unlinkEmptyLeaf
+		// itself, which now also re-verifies emptiness under
+		// splitMu before doing anything destructive.
+		if justEmptied != nil {
+			if err := bt.unlinkEmptyLeaf(*justEmptied); err != nil {
+				return totalRemoved, err
+			}
+			unlinkedAny = true
 		}
+
+		cur = next
 	}
 
 	// If the entire tree is now empty, reset it to a single empty root so
 	// that subsequent Inserts work without needing a full rebuild.
-	if len(emptyLeaves) > 0 {
+	if unlinkedAny {
 		empty, err := bt.isTreeEmpty()
 		if err != nil {
 			return totalRemoved, err
@@ -207,6 +222,68 @@ func (bt *BTree) findLeftmostLeaf() (storage.BlockNumber, error) {
 // back to the per-page FPI path when the hook is unset (test
 // harnesses without a WAL writer).
 func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
+	// M-NIGHTLY (AI-20260706-201855-001): resolveParentDownlink
+	// below captures the parent's downlink SLOT INDEX, and
+	// applyParentDownlinkRemoval later removes-by-index against
+	// that same slot. Between the two, a concurrent Insert-driven
+	// split (Insert/finishSplit, both under splitMu) can insert a
+	// new downlink into the SAME parent page ahead of the captured
+	// slot, shifting every later index right — so the later
+	// removal deletes whatever now sits at that index (some OTHER
+	// live child's downlink), not leaf.blk's. The orphaned live
+	// child stays reachable (nothing pointed it out of the tree),
+	// but leaf.blk's own downlink is never removed, so it survives
+	// in the parent even after recycleBlock() below returns
+	// leaf.blk to the free list for reuse by an unrelated split —
+	// a later reader following the parent's stale downlink lands
+	// on whatever new content that split wrote, surfacing as
+	// "btree: item length mismatch". Splits already serialise
+	// every OTHER structural mutation through splitMu; taking it
+	// here too closes the gap so the parent's slot layout cannot
+	// shift between resolve and remove.
+	bt.splitMu.Lock()
+	defer bt.splitMu.Unlock()
+
+	// M-NIGHTLY (AI-20260706-201855-001, loop 9): the caller
+	// (VacuumIndexPages) marks a leaf BTHalfDead|BTDeleted while
+	// scanning it, then unpins it and moves on — it does NOT hold
+	// splitMu or any lock spanning the marking and this unlink
+	// call. The fast, non-split Insert path (tryInsertNoSplit)
+	// never checks BTHalfDead/BTDeleted before writing: it only
+	// checks keyExceedsHighKey/pageHasSpaceFor, and the leaf's
+	// parent downlink is still intact at this point (removed only
+	// below), so a concurrent insert can land on this exact leaf
+	// and add a live tuple before we get here. Blindly proceeding
+	// would silently discard that tuple (unlinkEmptyLeaf's steps
+	// below never re-read the item area) and then hand the block
+	// to recycleBlock for a completely unrelated split to reuse —
+	// this is a real, independently confirmed corruption source,
+	// not merely a defensive check. Re-verify the leaf is still
+	// physically empty before doing anything destructive; if a
+	// racing insert repopulated it, revert the phase-1 marking and
+	// leave the (now live again) page alone instead of unlinking it.
+	recheckSlot, err := bt.pinW(leaf.blk)
+	if err != nil {
+		return err
+	}
+	recheckOp := readOpaque(recheckSlot.Page())
+	count, cerr := storage.PageLinePointerCount(recheckSlot.Page())
+	if cerr != nil {
+		bt.unpinW(recheckSlot)
+		return cerr
+	}
+	if count > 0 {
+		recheckOp.Flags &^= BTDeleted | BTHalfDead
+		writeOpaque(recheckSlot.Page(), recheckOp)
+		if err := bt.markDirtyWithPageRecord(recheckSlot, leaf.blk); err != nil {
+			bt.unpinW(recheckSlot)
+			return err
+		}
+		bt.unpinW(recheckSlot)
+		return nil
+	}
+	bt.unpinW(recheckSlot)
+
 	emitter := bt.pool.LogBtreeUnlinkPage()
 	if emitter == nil {
 		return bt.unlinkEmptyLeafFPI(leaf)
@@ -215,7 +292,7 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// Resolve the parent block + the slot index of leaf's
 	// downlink BEFORE any mutation so the WAL record carries
 	// the control fields.
-	parentBlk, parentSlot, hasParent, err := bt.resolveParentDownlink(leaf)
+	parentBlk, parentSlot, hasParent, ancestorPath, err := bt.resolveParentDownlink(leaf)
 	if err != nil {
 		return err
 	}
@@ -304,6 +381,21 @@ func (bt *BTree) unlinkEmptyLeaf(leaf emptyLeafInfo) error {
 	// no longer referenced by parent or siblings; its block can
 	// be reused by future allocations on this tree.
 	bt.recycleBlock(leaf.blk)
+
+	// M-NIGHTLY (AI-20260706-201855-001): removing leaf.blk's
+	// downlink above may have dropped req.ParentBlk's item count
+	// to 0. An empty non-root internal page left in the tree is a
+	// live, linked, contentless node — the next descent that
+	// routes through it (its separator range in ITS OWN parent is
+	// untouched) hits findChildBlockDirect's `count == 0` guard
+	// and raises "btree: empty internal page", independent of any
+	// race. Cascade the same unlink one level up for as long as
+	// removing a downlink keeps emptying the next ancestor.
+	if req.HasParent {
+		if err := bt.maybeCascadeEmptyInternal(req.ParentBlk, ancestorPath[:len(ancestorPath)-1]); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -352,72 +444,84 @@ func (bt *BTree) liveSibling(start storage.BlockNumber, forward bool) (storage.B
 // 1-based pageItems-order slot index of its downlink. Returns
 // `hasParent=false` for the single-page-tree case where the
 // leaf is also the root. (M0079-0003.)
-func (bt *BTree) resolveParentDownlink(leaf emptyLeafInfo) (storage.BlockNumber, uint16, bool, error) {
+//
+// The returned ancestorPath is the full root..parent chain
+// (inclusive of the parent, i.e. ancestorPath[len-1] == the
+// returned parent block) — M-NIGHTLY (AI-20260706-201855-001)
+// threads this through so a caller whose downlink removal empties
+// the parent can keep cascading upward (maybeCascadeEmptyInternal)
+// without re-deriving the chain, which would no longer be possible
+// once the parent itself holds zero items.
+func (bt *BTree) resolveParentDownlink(leaf emptyLeafInfo) (storage.BlockNumber, uint16, bool, []storage.BlockNumber, error) {
 	if leaf.firstKey == nil {
 		// Leftmost leaf with no keys: walk down from root
 		// finding the internal page that downlinks to leaf.blk.
-		parent, ok, err := bt.findParentDownlinkByBlock(leaf.blk)
+		parent, ancestorPath, ok, err := bt.findParentDownlinkByBlock(leaf.blk)
 		if err != nil {
-			return 0, 0, false, err
+			return 0, 0, false, nil, err
 		}
 		if !ok {
 			// Single-page tree (leaf is the root).
-			return 0, 0, false, nil
+			return 0, 0, false, nil, nil
 		}
 		slot, err := bt.findDownlinkSlotInParent(parent, leaf.blk)
 		if err != nil {
-			return 0, 0, false, err
+			return 0, 0, false, nil, err
 		}
-		return parent, slot, slot != 0, nil
+		return parent, slot, slot != 0, ancestorPath, nil
 	}
 	_, path, err := bt.descendToLeaf(leaf.firstKey)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, false, nil, err
 	}
 	if len(path) == 0 {
-		return 0, 0, false, nil
+		return 0, 0, false, nil, nil
 	}
 	parent := path[len(path)-1]
 	slot, err := bt.findDownlinkSlotInParent(parent, leaf.blk)
 	if err != nil {
-		return 0, 0, false, err
+		return 0, 0, false, nil, err
 	}
-	return parent, slot, slot != 0, nil
+	return parent, slot, slot != 0, path, nil
 }
 
 // findParentDownlinkByBlock walks the tree from the root and
-// returns the internal page that holds a downlink to childBlk.
-// Used for the leftmost-leaf case where leaf.firstKey is nil.
-// (M0079-0003.)
-func (bt *BTree) findParentDownlinkByBlock(childBlk storage.BlockNumber) (storage.BlockNumber, bool, error) {
+// returns the internal page that holds a downlink to childBlk,
+// together with the full root..parent ancestor chain (inclusive
+// of the returned parent — M-NIGHTLY cascade support, see
+// resolveParentDownlink). Used for the leftmost-leaf case where
+// leaf.firstKey is nil. (M0079-0003.)
+func (bt *BTree) findParentDownlinkByBlock(childBlk storage.BlockNumber) (storage.BlockNumber, []storage.BlockNumber, bool, error) {
 	meta, err := bt.readMeta()
 	if err != nil {
-		return 0, false, err
+		return 0, nil, false, err
 	}
+	var path []storage.BlockNumber
 	cur := meta.Root
 	for {
 		slot, err := bt.pinR(cur)
 		if err != nil {
-			return 0, false, err
+			return 0, nil, false, err
 		}
 		op := readOpaque(slot.Page())
 		if op.IsLeaf() {
 			bt.unpinR(slot)
-			return 0, false, nil
+			return 0, nil, false, nil
 		}
 		items, perr := pageItems(slot.Page())
 		bt.unpinR(slot)
 		if perr != nil {
-			return 0, false, perr
+			return 0, nil, false, perr
 		}
 		for _, it := range items {
 			if it.ptr.Block == childBlk {
-				return cur, true, nil
+				return cur, append(path, cur), true, nil
 			}
 		}
 		if len(items) == 0 {
-			return 0, false, nil
+			return 0, nil, false, nil
 		}
+		path = append(path, cur)
 		cur = items[0].ptr.Block
 	}
 }
@@ -566,7 +670,16 @@ func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 	// leaf.blk's parent chain.
 	if leaf.firstKey == nil {
 		// Leftmost leaf with no keys — use right sibling to find parent.
-		return bt.removeParentDownlinkByBlock(leaf.blk)
+		// M-NIGHTLY (AI-20260706-201855-001): pre-existing gap,
+		// left as-is — this branch has never called clearHalfDead
+		// / recycleBlock (only removeParentDownlinkByBlock runs),
+		// so it is bug-compatible with prior behaviour; only the
+		// cascade attempt is new.
+		parentBlk, ancestorPath, hasParent, err := bt.removeParentDownlinkByBlock(leaf.blk)
+		if err != nil || !hasParent {
+			return err
+		}
+		return bt.maybeCascadeEmptyInternal(parentBlk, ancestorPath[:len(ancestorPath)-1])
 	}
 	_, path, err := bt.descendToLeaf(leaf.firstKey)
 	if err != nil {
@@ -592,7 +705,9 @@ func (bt *BTree) unlinkEmptyLeafFPI(leaf emptyLeafInfo) error {
 	// no longer referenced by parent or siblings; its block can
 	// be reused by future allocations on this tree.
 	bt.recycleBlock(leaf.blk)
-	return nil
+	// M-NIGHTLY (AI-20260706-201855-001): see the WAL-path twin in
+	// unlinkEmptyLeaf for the full rationale.
+	return bt.maybeCascadeEmptyInternal(parentBlk, path[:len(path)-1])
 }
 
 // clearHalfDead (M0055-0005-followup-two-phase-del) clears the
@@ -613,6 +728,226 @@ func (bt *BTree) clearHalfDead(blk storage.BlockNumber) error {
 	err = bt.markDirtyWithPageRecord(slot, blk)
 	bt.unpinW(slot)
 	return err
+}
+
+// maybeCascadeEmptyInternal is invoked after a downlink removal from
+// blk potentially dropped its item count to 0. When that happens and
+// blk is not the tree root, blk itself must be unlinked from ITS OWN
+// parent the same way an empty leaf is unlinked — otherwise a live
+// routing key whose separator range still points through blk hits a
+// linked-but-contentless internal page and findChildBlockDirect
+// raises "btree: empty internal page". This is a real bug surfaced
+// by nightly pgbench churn on tiny, heavily-vacuumed indexes
+// (M-NIGHTLY AI-20260706-201855-001): repeated single-row
+// insert/delete/vacuum cycles on a small table build up enough
+// b-tree levels that an entire non-root internal page's leaf
+// children can all be vacuum-unlinked in one pass, emptying it.
+//
+// ancestorPath is the root..parent-of-blk chain (blk itself already
+// popped off) captured by the caller before blk's own downlink was
+// removed — once blk holds zero items it no longer has a key to
+// re-derive its parent chain by descent, so this must be threaded
+// through rather than recomputed.
+//
+// Loops upward: a single VacuumIndexPages pass that empties an
+// entire multi-level subtree cascades level by level until it hits a
+// still-populated ancestor or the root.
+//
+// NOT crash-safe across cascade steps: unlike leaf unlinking (which
+// marks BTHalfDead in a separate PHASE 1 pass before any structural
+// mutation, so CompleteDeferredDeletions can finish an interrupted
+// unlink after a crash), this cascade detects-and-unlinks an internal
+// page synchronously with no phase-1 marker of its own. A crash
+// between cascading level N and N+1 leaves level N's now-empty,
+// still-linked parent exposed to the same "empty internal page" bug
+// one level higher. Each individual cascade step is still atomically
+// WAL-logged (same emitter/replay path as a leaf unlink), so this is
+// a narrower gap than the original bug, not a new corruption source —
+// deferred to `.ralph/deferral_ledger.md` (M-NIGHTLY) rather than
+// solved in this pass: extend CompleteDeferredDeletions to also scan
+// for and cascade non-root internal pages left with zero items.
+func (bt *BTree) maybeCascadeEmptyInternal(blk storage.BlockNumber, ancestorPath []storage.BlockNumber) error {
+	for {
+		slot, err := bt.pinR(blk)
+		if err != nil {
+			return err
+		}
+		op := readOpaque(slot.Page())
+		if op.IsRoot() || op.IsDeleted() {
+			bt.unpinR(slot)
+			return nil
+		}
+		count, cerr := storage.PageLinePointerCount(slot.Page())
+		prev, next := op.Prev, op.Next
+		bt.unpinR(slot)
+		if cerr != nil {
+			return cerr
+		}
+		if count > 0 {
+			return nil
+		}
+		if len(ancestorPath) == 0 {
+			return fmt.Errorf("btree: cascade found empty non-root internal page %d with no recorded ancestor", blk)
+		}
+		parentBlk := ancestorPath[len(ancestorPath)-1]
+		if err := bt.unlinkEmptyInternalPage(blk, prev, next, parentBlk); err != nil {
+			return err
+		}
+		blk = parentBlk
+		ancestorPath = ancestorPath[:len(ancestorPath)-1]
+	}
+}
+
+// unlinkEmptyInternalPage unlinks a non-root internal page that has
+// just reached zero items: it relinks the nearest live level
+// siblings around blk, removes blk's downlink from parentBlk, flags
+// blk BTDeleted, and recycles its block. Mirrors unlinkEmptyLeaf /
+// unlinkEmptyLeafFPI's structural-mutation shape (M-NIGHTLY,
+// AI-20260706-201855-001); kept as a separate, page-agnostic
+// implementation rather than folded into the leaf path because the
+// leaf path's PHASE 1 (BTHalfDead) marking has no analogue here (see
+// maybeCascadeEmptyInternal's crash-safety note).
+func (bt *BTree) unlinkEmptyInternalPage(blk, prev, next, parentBlk storage.BlockNumber) error {
+	parentSlot, err := bt.findDownlinkSlotInParent(parentBlk, blk)
+	if err != nil {
+		return err
+	}
+	if parentSlot == 0 {
+		// Already removed — idempotent no-op.
+		return nil
+	}
+
+	leftLive, err := bt.liveSibling(prev, false)
+	if err != nil {
+		return err
+	}
+	rightLive, err := bt.liveSibling(next, true)
+	if err != nil {
+		return err
+	}
+
+	emitter := bt.pool.LogBtreeUnlinkPage()
+	if emitter == nil {
+		return bt.unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive)
+	}
+
+	flagsAfter, err := bt.readInternalFlagsAfterUnlink(blk)
+	if err != nil {
+		return err
+	}
+	req := storage.BtreeUnlinkPageRequest{
+		LeafBlk:          blk,
+		LeafFlagsAfter:   flagsAfter,
+		HasLeftSib:       leftLive != storage.InvalidBlockNumber,
+		LeftSibBlk:       leftLive,
+		LeftSibNewNext:   rightLive,
+		HasRightSib:      rightLive != storage.InvalidBlockNumber,
+		RightSibBlk:      rightLive,
+		RightSibNewPrev:  leftLive,
+		HasParent:        true,
+		ParentBlk:        parentBlk,
+		ParentRemoveSlot: parentSlot,
+	}
+	lsn, err := emitter(bt.rel, req)
+	if err != nil {
+		return fmt.Errorf("btree: emit internal-page unlink record: %w", err)
+	}
+	if req.HasLeftSib {
+		if err := bt.applyOpaqueMutation(req.LeftSibBlk, lsn, func(p storage.Page) {
+			op := readOpaque(p)
+			op.Next = req.LeftSibNewNext
+			writeOpaque(p, op)
+		}); err != nil {
+			return err
+		}
+	}
+	if req.HasRightSib {
+		if err := bt.applyOpaqueMutation(req.RightSibBlk, lsn, func(p storage.Page) {
+			op := readOpaque(p)
+			op.Prev = req.RightSibNewPrev
+			writeOpaque(p, op)
+		}); err != nil {
+			return err
+		}
+	}
+	if err := bt.applyParentDownlinkRemoval(req.ParentBlk, req.ParentRemoveSlot, lsn); err != nil {
+		return err
+	}
+	if err := bt.applyOpaqueMutation(req.LeafBlk, lsn, func(p storage.Page) {
+		op := readOpaque(p)
+		op.Flags = req.LeafFlagsAfter
+		writeOpaque(p, op)
+	}); err != nil {
+		return err
+	}
+	bt.recycleBlock(blk)
+	return nil
+}
+
+// unlinkEmptyInternalPageFPI is the legacy per-page FPI fallback for
+// unlinkEmptyInternalPage, used when LogBtreeUnlinkPage is unwired
+// (test harnesses without a WAL writer) — mirrors
+// unlinkEmptyLeafFPI's shape.
+func (bt *BTree) unlinkEmptyInternalPageFPI(blk, parentBlk, leftLive, rightLive storage.BlockNumber) error {
+	if leftLive != storage.InvalidBlockNumber {
+		s, err := bt.pinW(leftLive)
+		if err != nil {
+			return err
+		}
+		op := readOpaque(s.Page())
+		op.Next = rightLive
+		writeOpaque(s.Page(), op)
+		err = bt.markDirtyWithPageRecord(s, leftLive)
+		bt.unpinW(s)
+		if err != nil {
+			return err
+		}
+	}
+	if rightLive != storage.InvalidBlockNumber {
+		s, err := bt.pinW(rightLive)
+		if err != nil {
+			return err
+		}
+		op := readOpaque(s.Page())
+		op.Prev = leftLive
+		writeOpaque(s.Page(), op)
+		err = bt.markDirtyWithPageRecord(s, rightLive)
+		bt.unpinW(s)
+		if err != nil {
+			return err
+		}
+	}
+	if err := bt.removeDownlinkFromParent(parentBlk, blk); err != nil {
+		return err
+	}
+	s, err := bt.pinW(blk)
+	if err != nil {
+		return err
+	}
+	op := readOpaque(s.Page())
+	op.Flags |= BTDeleted
+	writeOpaque(s.Page(), op)
+	err = bt.markDirtyWithPageRecord(s, blk)
+	bt.unpinW(s)
+	if err != nil {
+		return err
+	}
+	bt.recycleBlock(blk)
+	return nil
+}
+
+// readInternalFlagsAfterUnlink computes the post-unlink Flags value
+// for a cascaded internal page: existing flags plus BTDeleted. Unlike
+// readLeafFlagsAfterUnlink, there is no BTHalfDead to clear — the
+// cascade has no phase-1 marker (see maybeCascadeEmptyInternal).
+func (bt *BTree) readInternalFlagsAfterUnlink(blk storage.BlockNumber) (uint16, error) {
+	slot, err := bt.pinR(blk)
+	if err != nil {
+		return 0, err
+	}
+	op := readOpaque(slot.Page())
+	bt.unpinR(slot)
+	return op.Flags | BTDeleted, nil
 }
 
 // CompleteDeferredDeletions (M0055-0005-followup-two-phase-del)
@@ -651,40 +986,18 @@ func (bt *BTree) CompleteDeferredDeletions() (int, error) {
 // removeParentDownlinkByBlock finds the parent of blk by walking the
 // tree and removes the corresponding downlink. Used when the leaf has
 // no saved firstKey (e.g. it was the leftmost leaf with no items).
-func (bt *BTree) removeParentDownlinkByBlock(blk storage.BlockNumber) error {
-	meta, err := bt.readMeta()
-	if err != nil {
-		return err
+// Returns hasParent=false when blk is the root (nothing to remove).
+// The returned ancestorPath is root..parent inclusive, for cascading
+// (M-NIGHTLY, see resolveParentDownlink).
+func (bt *BTree) removeParentDownlinkByBlock(blk storage.BlockNumber) (parentBlk storage.BlockNumber, ancestorPath []storage.BlockNumber, hasParent bool, err error) {
+	parent, path, ok, err := bt.findParentDownlinkByBlock(blk)
+	if err != nil || !ok {
+		return 0, nil, false, err
 	}
-	cur := meta.Root
-	for {
-		slot, err := bt.pinR(cur)
-		if err != nil {
-			return err
-		}
-		op := readOpaque(slot.Page())
-		if op.IsLeaf() {
-			bt.unpinR(slot)
-			return nil // shouldn't reach leaf when searching for internal
-		}
-		items, pageErr := pageItems(slot.Page())
-		bt.unpinR(slot)
-		if pageErr != nil {
-			return pageErr
-		}
-		for _, it := range items {
-			if it.ptr.Block == blk {
-				// Found it — remove downlink here.
-				return bt.removeDownlinkFromParent(cur, blk)
-			}
-		}
-		// Descend into any child that might contain blk.
-		if len(items) > 0 {
-			cur = items[0].ptr.Block
-		} else {
-			return nil
-		}
+	if err := bt.removeDownlinkFromParent(parent, blk); err != nil {
+		return 0, nil, false, err
 	}
+	return parent, path, true, nil
 }
 
 // removeDownlinkFromParent removes the item with ptr.Block == childBlk

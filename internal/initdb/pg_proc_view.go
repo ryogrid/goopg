@@ -396,8 +396,8 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
 				fmt.Sprintf("%d", len(r.ArgTypes)), // pronargs
-				cat.ProcACLText(r.OID),             // proacl: materialized from the GRANT store (NULL until first GRANT). DU-002 slice 345.
-				"10",                               // proowner: bootstrap superuser
+				cat.ProcACLText(r.OID), // proacl: materialized from the GRANT store (NULL until first GRANT). DU-002 slice 345.
+				fmt.Sprintf("%d", r.OwnerOrDefault()), // proowner: ALTER FUNCTION/PROCEDURE ... OWNER TO, else bootstrap superuser. M0097-0150.
 				r.Body,
 				volatile,
 				secdef,

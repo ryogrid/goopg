@@ -160,7 +160,19 @@ func buildPageHeader(pos int64, segSize int64, sysID uint64, tli uint32, contRec
 // caller wants the whole stream they pass len(stream) — the helper
 // stops at end-of-stream or the first all-zero page header (EOS).
 func extractRecordBytes(stream []byte, streamStart int64, segSize int64, wantBytes int) (recordBytes []byte, consumed int) {
-	recordBytes = make([]byte, 0, len(stream))
+	// Capacity must only cover what the loop below can ever append —
+	// bounded by wantBytes (the loop's `len(recordBytes) < wantBytes`
+	// guard) and by len(stream) (can't extract more than is available).
+	// Previously allocated cap(stream) (the entire REMAINING stream,
+	// often most of a 16MB WAL segment) even when wantBytes was as
+	// small as xlogRecordHeaderSize (24 bytes) — every header/body
+	// extraction during a WAL replay pass paid an O(segment size)
+	// allocation+zero-fill, and Open() runs several independent
+	// full-WAL replay passes, turning a handful of small records into
+	// tens of seconds of memclr (surfaced via the M-NIGHTLY AC-003
+	// restart-after-file-removal investigation, deferral ledger
+	// 2026-07-07).
+	recordBytes = make([]byte, 0, min(wantBytes, len(stream)))
 	for consumed < len(stream) && len(recordBytes) < wantBytes {
 		pos := streamStart + int64(consumed)
 		if pos%XLOGBlockSize == 0 {

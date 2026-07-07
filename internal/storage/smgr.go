@@ -697,6 +697,7 @@ func (r *relFile) readBlock(blk BlockNumber, buf []byte) error {
 	if n != BlockSize {
 		return fmt.Errorf("read %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
+	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postRead", buf)
 	return r.verifyOnRead(blk, buf)
 }
 
@@ -707,13 +708,15 @@ func (r *relFile) writeBlock(blk BlockNumber, buf []byte) error {
 		return fmt.Errorf("write %s blk %d: out of range (nblocks=%d)", r.path, blk, r.nblocks)
 	}
 	off := int64(blk) * BlockSize
-	n, err := r.f.WriteAt(r.checksummedForWrite(blk, buf), off)
+	written := r.checksummedForWrite(blk, buf)
+	n, err := r.f.WriteAt(written, off)
 	if err != nil {
 		return fmt.Errorf("write %s blk %d: %w", r.path, blk, err)
 	}
 	if n != BlockSize {
 		return fmt.Errorf("write %s blk %d: short %d of %d", r.path, blk, n, BlockSize)
 	}
+	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postWrite", written)
 	return nil
 }
 
@@ -722,7 +725,8 @@ func (r *relFile) extend(buf []byte) (BlockNumber, error) {
 	defer r.mu.Unlock()
 	blk := r.nblocks
 	off := int64(blk) * BlockSize
-	n, err := r.f.WriteAt(r.checksummedForWrite(blk, buf), off)
+	written := r.checksummedForWrite(blk, buf)
+	n, err := r.f.WriteAt(written, off)
 	if err != nil {
 		return InvalidBlockNumber, fmt.Errorf("extend %s: %w", r.path, err)
 	}
@@ -730,6 +734,7 @@ func (r *relFile) extend(buf []byte) (BlockNumber, error) {
 		return InvalidBlockNumber, fmt.Errorf("extend %s: short %d of %d", r.path, n, BlockSize)
 	}
 	r.nblocks++
+	recordIOTrace(BufferTag{Rel: r.rel, Block: blk}, "postExtend", written)
 	return blk, nil
 }
 
@@ -775,6 +780,9 @@ func (r *relFile) extendBatch(buf []byte, n int) (BlockNumber, error) {
 		return InvalidBlockNumber, fmt.Errorf("extendBatch %s: short %d of %d", r.path, w, len(big))
 	}
 	r.nblocks += BlockNumber(n)
+	for i := 0; i < n; i++ {
+		recordIOTrace(BufferTag{Rel: r.rel, Block: first + BlockNumber(i)}, "postExtendBatch", big[i*BlockSize:(i+1)*BlockSize])
+	}
 	return first, nil
 }
 

@@ -163,3 +163,99 @@ Full `go test ./...` green.
   resolver path) — step 6.
 - Numerical type-OID columns in `pg_proc` — paired with the wider
   type-system work that swaps every text-OID surface to integer.
+
+## `ALTER FUNCTION/PROCEDURE/ROUTINE OWNER TO` / `SET SCHEMA` (2026-07-08, M0097-0150)
+
+Closes the last two named forms of the M0097-0150 unimplemented-feature
+entry — `RENAME TO` already worked (loop #71 ledger follow-up); `OWNER TO`
+and `SET SCHEMA` parsed but were silently discarded no-ops, so `pg_proc`'s
+`proowner`/`pronamespace` never reflected an ALTER.
+
+**Catalog:** `Routine` gains `Owner uint32` (0 = unset → bootstrap superuser,
+mirrors every other `OwnerOrDefault`-style object in this codebase —
+`UserAggregate`, `UserCollation`, `UserOperator`, etc.) and `OwnerOrDefault()`.
+`Routines.SetSchema(r, newSchema)` re-keys both `byKey`/`byName` indices
+(schema is part of both keys) — mirrors `RenameRoutine`'s re-keying, just on
+`Schema` instead of `Name`. `SetSchemaByOIDDuringRecovery`/
+`SetOwnerByOIDDuringRecovery` are the WAL-replay counterparts (owner isn't
+part of either key, so its recovery path is a direct field write, mirroring
+`SetFlagsByOIDDuringRecovery`).
+
+**Parser:** `AlterFunctionStmt` gains `NewOwner`/`NewSchema` fields. A real
+pre-existing bug surfaced here: the attribute-consuming loop's SET-clause
+detection matched `TokenIdent` with value `"set"`, but `SET` lexes as the
+real keyword token `KwSet` — so the condition never matched and **every**
+`ALTER FUNCTION ... SET ...` form (not just `SET SCHEMA`) was a syntax
+error, not merely the documented no-op. Fixed by matching `TokenKeyword{Keyword:
+KwSet}` (and `KwFrom` for the `SET x FROM CURRENT` sub-form) instead of
+`TokenIdent`.
+
+**Executor:** `execAlterFunction` gains two early-return branches (mirroring
+`RenameTo`'s existing early return — real PostgreSQL grammar treats `OWNER
+TO`/`SET SCHEMA`/`RENAME TO` as three separate top-level `AlterFunctionStmt`-
+adjacent forms, not clauses combinable with `VOLATILE`/`STRICT`/etc, per
+`gram.y`'s `AlterOwnerStmt`/`RenameStmt` vs. `alterfunc_opt_list`):
+`OWNER TO` resolves the new owner via `catalog.RoleOID` (42704 if unknown,
+`CURRENT_USER`/`SESSION_USER`/`CURRENT_ROLE` resolve to the bootstrap-
+superuser sentinel exactly like `execAlterAggregateOwner`/`execAlterCollation`)
+and WAL-logs `RecordKindAlterFunctionOwner`; `SET SCHEMA` calls the new
+`Routines.SetSchema` and WAL-logs `RecordKindAlterFunctionSetSchema`.
+
+**`pg_proc` rendering:** the user-routine row builder's `proowner` column
+was a hardcoded `"10"` — now `r.OwnerOrDefault()`. `pronamespace` already
+read `r.Schema` live, so `SET SCHEMA` round-trips with no view change.
+
+**WAL/restart persistence:** new record kinds 121 (`RecordKindAlterFunctionOwner`,
+`kind|ownerOID|oid`) and 122 (`RecordKindAlterFunctionSetSchema`,
+`kind|oid|newSchemaLen|newSchema`), replayed by `replayFunctionDDLRecords`
+(`internal/initdb/function_ddl_recovery.go`).
+
+**Verified against a live `cmd/goopg` binary** (not just unit tests): created
+a role and a function, ran `ALTER FUNCTION add_one(int) OWNER TO func_owner`
++ `ALTER FUNCTION add_one(int) SET SCHEMA app`, confirmed `pg_proc.proowner`/
+`pronamespace` changed to the real role/schema OIDs and `app.add_one(41)`
+still executed correctly — then `goopg restart`'d the same data directory and
+confirmed both the ownership and the schema move survived, with the function
+still callable under its new schema.
+
+Tests: `TestParseAlterFunctionOwner`/`TestParseAlterFunctionSetSchema`/
+`TestParseAlterFunctionRenameAndVolatileStillWork` (parser); `TestExecAlterFunctionOwner`/
+`TestExecAlterFunctionSetSchema` (executor); `TestPgProcViewRendersRoutineOwner`
+(initdb); `TestEncodeDecodeAlterFunctionOwnerRoundTrip`/
+`TestEncodeDecodeAlterFunctionSetSchemaRoundTrip` (wal); `TestFunctionDDLRecoveryReplaysAlterAfterCreate`
+extended to cover both new record kinds end-to-end through a real WAL
+flush + reopen (initdb).
+
+**Was still open, now closed (2026-07-08 follow-up):** the generic `SET
+config_param {TO|=} value` / `SET config_param FROM CURRENT` / `RESET`
+clauses on `ALTER FUNCTION` (legitimate PostgreSQL grammar per `gram.y`'s
+`common_func_opt_item: FunctionSetResetClause`, combinable with
+`VOLATILE`/etc in the same statement, unlike `OWNER TO`/`RENAME TO`/`SET
+SCHEMA`) were unreachable dead code before the row above's loop (same
+`KwSet`-vs-`TokenIdent` bug) and remained broken after it — that fix only
+repaired the `SET SCHEMA` sub-branch inside the block. This follow-up widened
+the `=`-acceptance check to also match `TokenOperator` (`=` doesn't lex as
+`TokenSymbol` in this lexer) and restructured the branch so the
+config-parameter name is always parsed before checking for `TO`/`=`/`FROM
+CURRENT`, matching `gram.y`'s actual `var_name {TO|=} var_value | var_name
+FROM CURRENT` order (the old code incorrectly checked for a literal `"from"`
+token immediately after `SET`, as if `FROM` itself could be the parameter
+name). All forms remain parse-only no-ops (goopg has no per-function
+GUC-override storage) — same as `RESET` already was. Verified live: all 5
+previously-broken forms (`SET x TO v`, `SET x = v`, `SET x FROM CURRENT`,
+`SET x TO DEFAULT`, `RESET x`, `RESET ALL`) now return `ALTER FUNCTION`
+instead of a syntax error. Test: `TestParseAlterFunctionGenericSetReset`
+(parser).
+
+**Was still open, now closed (2026-07-08 follow-up 2):** the comma-separated
+`var_list` value form (`SET search_path = app, public`, real PG `gram.y`
+grammar) still errored after the follow-up above — the no-op branch only
+ever consumed a single value token. Fixed by reusing the same
+`p.parseSetValueAtoms()` helper the generic `SET` statement
+(`parser.go`'s `parseSet`) already uses for comma-separated GUC values,
+discarding the parsed list (still a no-op). Verified live: `SET search_path
+= app, public` / `SET search_path TO app, public, pg_catalog` now both
+return `ALTER FUNCTION`. Test: two new cases in
+`TestParseAlterFunctionGenericSetReset` (parser). **The ALTER
+FUNCTION/PROCEDURE/ROUTINE cluster (OWNER TO/RENAME TO/SET SCHEMA/generic
+SET-RESET incl. var_list) has no known open residuals.**

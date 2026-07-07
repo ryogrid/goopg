@@ -587,9 +587,11 @@ type Table struct {
 	// carries no default that a zero check could detect, so AutovacuumEnabledSet
 	// guards whether the option was specified. When set, pg_class.reloptions
 	// gains the text[] element `autovacuum_enabled=true|false`, which pg_dump
-	// renders back as `WITH (autovacuum_enabled='true'|'false')`. goopg has no
-	// autovacuum, so the value is catalog/dump-only (advisory; runtime
-	// unaffected). M0110-0001 (DU-002 slice 196).
+	// renders back as `WITH (autovacuum_enabled='true'|'false')`. Also consumed
+	// at runtime by internal/autovacuum.Launcher.needsVacuum/needsAnalyze (M0086),
+	// mirroring autovacuum.c's relation_needs_vacanalyze: an explicit `false`
+	// disables both, except anti-wraparound forcing still overrides it.
+	// M0110-0001 (DU-002 slice 196).
 	AutovacuumEnabled    bool
 	AutovacuumEnabledSet bool
 
@@ -2051,6 +2053,12 @@ type InMemory struct {
 	// recovered databases succeed after a crash, NOT for
 	// per-database storage isolation (that lands later).
 	databases map[string]bool
+	// databaseConnLimit holds runtime `pg_database.datconnlimit` overrides
+	// written via `UPDATE pg_database SET datconnlimit = ... WHERE datname =
+	// ...` (M-NIGHTLY AI-20260707-000712-004 follow-up / AC-002 residual #1).
+	// Absent entries report 0 (PG's "no limit" default), matching the
+	// hard-coded value pg_database.VirtualRows used before this map existed.
+	databaseConnLimit map[string]int32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
 	// ROLE ... SET / ALTER ROLE ... IN DATABASE ... SET are a separate,
@@ -3234,6 +3242,7 @@ func NewInMemory() *InMemory {
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
+		databaseConnLimit:      make(map[string]int32),
 		dbRoleSettings:         make(map[uint32][]string),
 		roleSettings:           make(map[roleSettingKey][]string),
 		roleMembers:            make(map[roleMembershipKey]*RoleMembership),
@@ -4501,7 +4510,40 @@ func (c *InMemory) DropDatabase(name string) error {
 		return ErrDatabaseNotFound
 	}
 	delete(c.databases, name)
+	delete(c.databaseConnLimit, name)
 	return nil
+}
+
+// DatconnlimitInvalidDB mirrors PG's DATCONNLIMIT_INVALID_DB sentinel
+// (pg_database.h): a database left partway through DROP DATABASE is marked
+// with this datconnlimit value so it's excluded from client-side filters
+// (pg_amcheck/vacuumdb) and rejected at connect time (postinit.c's
+// "cannot connect to invalid database" FATAL).
+const DatconnlimitInvalidDB int32 = -2
+
+// DatabaseConnLimit returns the runtime `pg_database.datconnlimit` override
+// recorded for name via SetDatabaseConnLimit, or 0 (PG's "no limit" default)
+// if none was ever set. M-NIGHTLY AI-20260707-000712-004 / AC-002 residual #1.
+func (c *InMemory) DatabaseConnLimit(name string) int32 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.databaseConnLimit[name]
+}
+
+// SetDatabaseConnLimit records a runtime `datconnlimit` override for an
+// existing database — the target of `UPDATE pg_database SET datconnlimit =
+// ... WHERE datname = ...` (goopg has no physical, generically-writable
+// pg_database heap; this is the same "runtime InMemory truth, no on-disk
+// write" pattern CreateCollation/CreateExtension already use). Returns false
+// if name is not a registered database (caller reports 0 rows affected).
+func (c *InMemory) SetDatabaseConnLimit(name string, limit int32) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.databases[name] {
+		return false
+	}
+	c.databaseConnLimit[name] = limit
+	return true
 }
 
 // RegisterDatabaseDuringRecovery is the idempotent version of
@@ -5208,6 +5250,16 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	method string,
 	primary bool,
 	oid uint32,
+	colDescending []bool,
+	colNullsFirst []bool,
+	hasPredicate bool,
+	predicateString string,
+	includeColumns []string,
+	colOpClasses []string,
+	colCollations []string,
+	fillfactor int,
+	deduplicateItems *bool,
+	nullsNotDistinct bool,
 ) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -5244,14 +5296,31 @@ func (c *InMemory) RegisterIndexDuringRecovery(
 	}
 	k := key(parser.ObjectName{Schema: schema, Name: name})
 	idx := &Index{
-		Schema:  schema,
-		Name:    name,
-		Table:   tbl,
-		Columns: append([]string(nil), cols...),
-		Unique:  unique,
-		Method:  strings.ToLower(method),
-		Primary: primary,
-		OID:     oid,
+		Schema:        schema,
+		Name:          name,
+		Table:         tbl,
+		Columns:       append([]string(nil), cols...),
+		Unique:        unique,
+		Method:        strings.ToLower(method),
+		Primary:       primary,
+		OID:           oid,
+		ColDescending: append([]bool(nil), colDescending...),
+		ColNullsFirst: append([]bool(nil), colNullsFirst...),
+		// --- M0122-0006 follow-up: index properties beyond ordering, carried
+		// through the CREATE INDEX WAL record the same way ColDescending/
+		// ColNullsFirst are (see wal.CreateIndexPayload's extension block).
+		// The heap-recovery driver (loadUserIndexesFromHeap) does not yet
+		// decode these from pg_index's heap row, so it always passes the
+		// zero values here — a separate, already-documented residual, not a
+		// regression introduced by this call.
+		HasPredicate:     hasPredicate,
+		PredicateString:  predicateString,
+		IncludeColumns:   append([]string(nil), includeColumns...),
+		ColOpClasses:     append([]string(nil), colOpClasses...),
+		ColCollations:    append([]string(nil), colCollations...),
+		Fillfactor:       fillfactor,
+		DeduplicateItems: deduplicateItems,
+		NullsNotDistinct: nullsNotDistinct,
 	}
 	c.indexes[k] = idx
 	if c.byTable[tbl.OID] == nil {
@@ -6265,10 +6334,13 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",          // datdba: OID of owner (10 = postgres superuser)
-				"6",           // encoding: 6 = UTF8
-				datallowconn,  // datallowconn: allow connections
-				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				"10",         // datdba: OID of owner (10 = postgres superuser)
+				"6",          // encoding: 6 = UTF8
+				datallowconn, // datallowconn: allow connections
+				// datconnlimit: runtime override via `UPDATE pg_database SET
+				// datconnlimit = ...` (SetDatabaseConnLimit), default 0 = no
+				// limit. vacuumdb/pg_amcheck filter on `datconnlimit <> -2`.
+				strconv.FormatInt(int64(c.DatabaseConnLimit(n)), 10),
 				datistemplate, // datistemplate: true for template0/template1
 				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
 				"1",           // datminmxid: FirstMultiXactId bootstrap floor
@@ -7634,7 +7706,7 @@ func (c *InMemory) registerSystemTables() {
 			}
 			natts := len(idx.Columns) + len(idx.IncludeColumns)
 			nkeyatts := len(idx.Columns)
-			// Build space-separated zero-vector for indcollation/indoption.
+			// Build space-separated zero-vector for indcollation.
 			buildZeroVec := func(n int) string {
 				if n <= 0 {
 					return ""
@@ -7645,6 +7717,23 @@ func (c *InMemory) registerSystemTables() {
 				}
 				return strings.Join(parts, " ")
 			}
+			// indoption: per-key ASC/DESC + NULLS FIRST/LAST bitmask, mirroring
+			// upstream's INDOPTION_DESC (0x1) / INDOPTION_NULLS_FIRST (0x2).
+			// M0122-0006: this live pg_index query path previously always
+			// rendered an all-zero vector (buildZeroVec) regardless of the
+			// index's declared column ordering.
+			indoptionParts := make([]string, nkeyatts)
+			for i := range indoptionParts {
+				var bits int
+				if i < len(idx.ColDescending) && idx.ColDescending[i] {
+					bits |= 0x0001
+				}
+				if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
+					bits |= 0x0002
+				}
+				indoptionParts[i] = fmt.Sprintf("%d", bits)
+			}
+			indoption := strings.Join(indoptionParts, " ")
 			out = append(out, []string{
 				fmt.Sprintf("%d", idx.OID),       // indexrelid
 				fmt.Sprintf("%d", idx.Table.OID), // indrelid
@@ -7664,7 +7753,7 @@ func (c *InMemory) registerSystemTables() {
 				indkey,                           // indkey
 				buildZeroVec(nkeyatts),           // indcollation
 				indclass,                         // indclass
-				buildZeroVec(nkeyatts),           // indoption
+				indoption,                        // indoption
 				"",                               // indexprs (NULL)
 				"",                               // indpred (NULL)
 				"",                               // indcoloptions (NULL)

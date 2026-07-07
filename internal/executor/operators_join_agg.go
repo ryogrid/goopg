@@ -44,6 +44,13 @@ type joinOp struct {
 	lazyMatches  []Row            // matches for current probe row (borrowed from lazyHash)
 	lazyMatchIdx int
 	lazyActive   bool // true between probeRow and last match
+	// lazyProbeMatched tracks whether the current probe row has already
+	// emitted at least one hash-match that also passed the residual
+	// Predicate (see nextLazy). A hash-key match alone isn't sufficient
+	// for LEFT JOIN null-padding purposes: every entry in lazyMatches can
+	// fail the residual filter, which must still be treated as "no match"
+	// for the outer row.
+	lazyProbeMatched bool
 	lazyLW       int  // left schema width
 	lazyRW       int  // right schema width
 
@@ -880,6 +887,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			if !ok {
 				continue
 			}
+			o.lazyProbeMatched = true
 			// M0118-0009 (eval-plan-qual): stamp the matched build row's heap
 			// ctid onto the emitted slot so a downstream LockRows can recover
 			// the TID of a locked relation on the build side (whose scan was
@@ -895,7 +903,22 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			}
 			return o.lazyVirtualOut, nil
 		}
-		o.lazyActive = false
+		if o.lazyActive {
+			// Exhausted every hash-bucket candidate for this probe row
+			// without any of them passing the residual Predicate (the
+			// hash key matched, but a residual conjunct like
+			// `attnum = conkey[1]` didn't). The len(matches)==0 branch
+			// below only covers the hash-level miss, not this
+			// predicate-level one, so without this check the outer row
+			// is silently dropped instead of null-padded.
+			o.lazyActive = false
+			if o.plan.Type == planner.JoinTypeLeft && !o.plan.BuildLeft && !o.lazyProbeMatched {
+				o.lazyProbeSlot.row = o.lazyRow
+				o.lazyBuildSlot.row = nullRight
+				o.lazyRow = nil
+				return o.lazyVirtualOut, nil
+			}
+		}
 		// Pull next probe row.
 		probeSlot, err := o.lazyProbe.Next()
 		if err == EOF {
@@ -1003,6 +1026,7 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			o.lazyMatchCTIDs = o.lazyHashCTID[key]
 		}
 		o.lazyMatchIdx = 0
+		o.lazyProbeMatched = false
 		o.lazyActive = true
 		// Continue loop to yield first match.
 	}

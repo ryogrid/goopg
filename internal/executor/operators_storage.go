@@ -3570,6 +3570,87 @@ func (o *updateOp) Close() error {
 	return nil
 }
 
+// nextVirtualPgDatabase implements `UPDATE pg_database SET ... WHERE ...`
+// against the Virtual (no physical heap) pg_database table. goopg's
+// pg_database is entirely computed by VirtualRows() — there is no
+// RelFileNode/heap-tuple machinery to scan or rewrite, so this reads the
+// current rows straight from VirtualRows(), evaluates o.pred/o.plan.Set
+// against them exactly like the physical path would, and persists the one
+// writable column (datconnlimit) through catalog.InMemory.SetDatabaseConnLimit
+// — the same "runtime InMemory truth, no on-disk write" precedent
+// CreateCollation/CreateExtension already use. Any SET column other than
+// datconnlimit errors rather than silently discarding the write, since
+// pretending an unsupported column persisted would be worse than refusing it.
+// M-NIGHTLY AI-20260707-000712-004 follow-up / AC-002 residual #1.
+func (o *updateOp) nextVirtualPgDatabase() (TupleSlot, error) {
+	tbl := o.plan.Table
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "pg_database UPDATE requires an InMemory catalog"}
+	}
+	datnameOrd, connLimitOrd := -1, -1
+	for i, c := range tbl.Columns {
+		switch {
+		case strings.EqualFold(c.Name, "datname"):
+			datnameOrd = i
+		case strings.EqualFold(c.Name, "datconnlimit"):
+			connLimitOrd = i
+		}
+	}
+	for i, setExpr := range o.plan.Set {
+		if setExpr != nil && i != connLimitOrd {
+			colName := "?"
+			if i < len(tbl.Columns) {
+				colName = tbl.Columns[i].Name
+			}
+			return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(),
+				Message: fmt.Sprintf("UPDATE pg_database is only supported for the datconnlimit column (got %q)", colName)}
+		}
+	}
+	for _, rawRow := range tbl.VirtualRows() {
+		row := make(Row, len(tbl.Columns))
+		for j := range tbl.Columns {
+			cell := ""
+			if j < len(rawRow) {
+				cell = rawRow[j]
+			}
+			v, err := evalExpr(planner.TypedVirtualCell(o.plan.Pos(), cell, tbl.Columns[j].Type.Name), nil, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			row[j] = v
+		}
+		if o.pred != nil {
+			v, err := evalExpr(o.pred, row, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			if v.IsNull() || v.Kind != KindBool || !v.BoolValue() {
+				continue
+			}
+		}
+		o.rowsAffected++
+		if connLimitOrd >= 0 && o.plan.Set[connLimitOrd] != nil {
+			newVal, err := evalExpr(o.plan.Set[connLimitOrd], row, o.ctx)
+			if err != nil {
+				return nil, err
+			}
+			if newVal.IsNull() {
+				return nil, &ExecError{Code: "23502", Pos: o.plan.Pos(),
+					Message: "null value in column \"datconnlimit\" violates not-null constraint"}
+			}
+			datname := ""
+			if datnameOrd >= 0 && datnameOrd < len(rawRow) {
+				datname = rawRow[datnameOrd]
+			}
+			im.SetDatabaseConnLimit(datname, int32(newVal.Int))
+			row[connLimitOrd] = newVal
+		}
+		o.appendUpdateRetRow(row)
+	}
+	return nil, EOF
+}
+
 // updateViaIndex uses the B-tree to find the tuple to update (O(log n))
 // instead of scanning all pages. Falls back to the path in Next() when
 // no IndexScan is available.
@@ -4142,6 +4223,15 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		return SlotFromRow(o.plan.ReturningSchema, row), nil
 	}
 	o.done = true
+	// pg_database has no physical heap backing (Table.Virtual, rows come
+	// from VirtualRows()) — route through a dedicated read/match/write path
+	// instead of the physical-heap machinery below. Scoped to pg_database
+	// specifically (not every Virtual table) to keep this a narrow,
+	// low-blast-radius addition. M-NIGHTLY AI-20260707-000712-004 follow-up
+	// / AC-002 residual #1 (`UPDATE pg_database SET datconnlimit = ...`).
+	if tbl := o.plan.Table; tbl.Virtual && tbl.Schema == "pg_catalog" && tbl.Name == "pg_database" {
+		return o.nextVirtualPgDatabase()
+	}
 	// M0093: UPDATE is unconditionally a write — materialise the
 	// transaction's XID before the scan so foreignLockOnly /
 	// isConcurrentlyUpdated / tuple-lock acquisition see the real

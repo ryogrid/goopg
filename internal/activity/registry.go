@@ -457,6 +457,24 @@ func (r *ActivityRegistry) Snapshot() []Backend {
 	return out
 }
 
+// CountByDatName returns the number of currently registered backend slots
+// (regular + background) whose DatName equals name, INCLUDING a backend
+// that has already Register()'d itself for this same connection — mirrors
+// PG's CountDBConnections (postinit.c / procarray.c), which counts the
+// calling backend's own PGPROC alongside every other backend's, unlike its
+// self-excluding cousin CountOtherDBBackends (used by DROP DATABASE).
+// O(len(slots)); intended for connect-time use (once per TCP connection),
+// not the per-frame WaitEvent hot path. M0119-0006 (AC-002 residual #2).
+func (r *ActivityRegistry) CountByDatName(name string) int32 {
+	var n int32
+	for i := range r.slots {
+		if c := r.slots[i].cold; c != nil && c.DatName == name {
+			n++
+		}
+	}
+	return n
+}
+
 // monoToWall converts a runtimeshim.Nanotime() reading taken via this
 // registry into a wall-clock nanos value suitable for time.Unix.
 // Readings of 0 (uninitialised cold-field XactStart/QueryStart) pass

@@ -494,6 +494,63 @@ func (r *Registry) ApplyConfigEntries(entries []ConfigEntry) error {
 	return nil
 }
 
+// ReloadResult summarises one ApplyReloadEntries call for the
+// caller's log line (`goopg reload` / SIGHUP).
+type ReloadResult struct {
+	// Changed lists the canonical names of variables whose effective
+	// value actually changed.
+	Changed []string
+	// Warnings lists non-fatal problems: unknown parameters, values
+	// that failed to canonicalise, and PGC_POSTMASTER/PGC_INTERNAL
+	// entries that were present in the file but cannot take effect
+	// without a restart. A reload never fails outright — matching
+	// upstream ProcessConfigFile, which logs and keeps running.
+	Warnings []string
+}
+
+// ApplyReloadEntries re-applies parsed config-file entries to a
+// *running* server (the `goopg reload` / SIGHUP path), unlike
+// ApplyConfigEntries which is for the initial boot-time load.
+//
+// Unlike boot, a reload must not clobber PGC_POSTMASTER variables
+// (they require a restart per postgres/src/backend/utils/misc/guc.c's
+// ProcessConfigFile) nor PGC_INTERNAL ones (never settable at all);
+// both are reported as warnings and left untouched. Every other
+// context is applied with SourceConfigFile, and — because the server
+// is already live, unlike at boot — each successful change also fires
+// the registry's OnChange bridge so process-global toggles (e.g.
+// enable_nestloop_index) observe the new value immediately.
+func (r *Registry) ApplyReloadEntries(entries []ConfigEntry) ReloadResult {
+	var res ReloadResult
+	for _, e := range entries {
+		v, ok := r.Get(e.Name)
+		if !ok {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s:%d: unrecognized configuration parameter %q", e.SourceFile, e.SourceLine, e.Name))
+			continue
+		}
+		if v.Context == ContextInternal {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s:%d: parameter %q cannot be changed", e.SourceFile, e.SourceLine, v.Name))
+			continue
+		}
+		if v.Context == ContextPostmaster {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s:%d: parameter %q cannot be changed without restarting the server", e.SourceFile, e.SourceLine, v.Name))
+			continue
+		}
+		canon, err := v.canonicalize(e.Value)
+		if err != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("%s:%d: %v", e.SourceFile, e.SourceLine, err))
+			continue
+		}
+		if canon != v.Value {
+			v.Value = canon
+			v.Source = SourceConfigFile
+			r.invokeOnChange(v.Name, canon)
+			res.Changed = append(res.Changed, v.Name)
+		}
+	}
+	return res
+}
+
 // setFromFile bypasses Variable.Set's context gating — the config
 // file is allowed to set Postmaster-context variables at startup, even
 // though SET would not be.

@@ -114,9 +114,13 @@ package testport
 // anti-join previously PANICKED the backend with a build-side column-index
 // out-of-range — run to completion (exit 1, `no relations to check`) after the
 // LEFT JOIN inner-only pushdown shift/classify fix (commit 36a085dc,
-// M0110-0003 residual #2). One .pl section remains DEFERRED, documented inline
-// at its call site: the `datconnlimit = -2` invalid-database filter (needs a
-// runtime pg_database shared-catalog write goopg lacks).
+// M0110-0003 residual #2). The final residual — the `datconnlimit = -2`
+// invalid-database filter (residual #1) — is now also ported: it needed a
+// runtime `pg_database.datconnlimit` write, which goopg gained via a
+// dedicated Virtual-table UPDATE path (updateOp.nextVirtualPgDatabase) rather
+// than a generic writable-system-catalog heap (see the ledger row filed
+// against M-NIGHTLY AI-20260707-000712-004). 002_nonesuch.pl is now FULLY
+// ported with no remaining residuals.
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -448,19 +452,30 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 		})
 
 	// --- Invalid / partially dropped database won't be targeted ----------
-	// NOT PORTED (deferred, AC-002 residual #1). 002_nonesuch.pl marks a
-	// database invalid with `UPDATE pg_database SET datconnlimit = -2` and
-	// asserts pg_amcheck's database-resolution query filters it out. goopg
-	// has no runtime in-place update of on-disk shared catalogs (pg_database
-	// is initdb-only; the in-memory InMemory catalog is the runtime truth and
-	// exposes no datconnlimit write path) — see memory
-	// goopg_no_runtime_shared_catalog_inplace_update. The UPDATE is silently a
-	// no-op, so regression_invalid stays connectable and pg_amcheck reaches it
-	// (emitting `skipping database "regression_invalid": amcheck is not
-	// installed` + `no relations to check` instead of the expected `no
-	// connectable databases to check matching "regression_invalid"`). Porting
-	// this section requires the runtime pg_database.datconnlimit write
-	// capability, which is a separate milestone, not an amcheck concern.
+	// Ported (AC-002 residual #1 closed): `UPDATE pg_database SET
+	// datconnlimit = -2` now persists via catalog.InMemory.SetDatabaseConnLimit
+	// (a dedicated Virtual-table update path in updateOp.nextVirtualPgDatabase,
+	// since pg_database has no physical heap to rewrite generically), and
+	// pg_database.VirtualRows reports the override. pg_amcheck's own
+	// compile_database_list query filters `datallowconn AND datconnlimit !=
+	// -2`, so regression_invalid now resolves to zero connectable databases
+	// exactly like upstream.
+	if err := runSQLSimple(t, c, "CREATE DATABASE regression_invalid"); err != nil {
+		t.Fatalf("CREATE DATABASE regression_invalid: %v", err)
+	}
+	if err := runSQLSimple(t, c, "UPDATE pg_database SET datconnlimit = -2 WHERE datname = 'regression_invalid'"); err != nil {
+		t.Fatalf("UPDATE pg_database SET datconnlimit: %v", err)
+	}
+
+	checkAmcheck(t, c, "checking handling of invalid database",
+		[]string{"--database", "regression_invalid"},
+		1,
+		[]string{`pg_amcheck: error: no connectable databases to check matching "regression_invalid"`})
+
+	checkAmcheck(t, c, "checking handling of object in invalid database",
+		[]string{"--database", "postgres", "--table", "regression_invalid.public.foo"},
+		1,
+		[]string{`pg_amcheck: error: no connectable databases to check matching "regression_invalid.public.foo"`})
 
 	// --- Existent objects but in databases where they do not exist -------
 	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (f integer)"); err != nil {

@@ -163,6 +163,52 @@ explicit `Sync(tag)` is requested.
   layer their own row-level locking on top.
 - Pin/unpin is goroutine-safe; multiple goroutines may pin the same
   page simultaneously and read it concurrently.
+- **Implementation note (2026-07):** the pool described above (a
+  single `poolMu` + `byTag map`) is the v0 shape; the shipped
+  implementation (`internal/storage/bufpool.go` + `bufmap.go`) has
+  since moved to a lock-free hash map (`bufmap`) plus a per-slot
+  atomic state word (pin count / usage count / valid / dirty /
+  IO-inflight / generation, all packed into one `atomic.Uint64`) so
+  the fast pin/unpin path never takes a lock. `pinMu` still
+  serialises the slow paths (cache-miss load, eviction, new-page
+  allocation). This doc's mutex-based sketch is otherwise still
+  accurate in spirit and is not being rewritten here.
+- **Eviction/flush-vs-reload ordering invariant (found the hard way,
+  M-NIGHTLY loop 13):** a victim slot's tag must stay in `bufmap`
+  until its dirty flush (`flushSlot`, under the slot's IO-inflight
+  bit) has completed, not before. Removing the tag first lets a
+  concurrent `Pin` of the same tag see a bufmap miss instead of
+  correctly blocking on the slot's IO-inflight semaphore, so it takes
+  its own unordered fresh disk read via `pinLoad` — which can win the
+  race against the still-in-flight write and permanently cache
+  pre-flush (stale/virgin) content under a different slot. Any future
+  change to `evictVictim`'s ordering must preserve "flush completes,
+  THEN tag is deleted, THEN queued waiters are released" — see
+  `internal/storage/bufpool.go`'s `evictVictim` for the current,
+  fixed sequence.
+- **Checkpoint batch-flush stale-tag invariant (found the hard way,
+  M-NIGHTLY loop 17):** `FlushAllPaced` (the checkpointer's full-pool
+  flush) scans every slot ONCE up front via an *unlocked*
+  `state.Load()` + `slot.tag` read, building a `(slot, tag)` worklist
+  that `flushBatch` then processes across many later batches. Ordinary
+  buffer-pool churn can fully evict and repurpose a scanned slot for a
+  *different relation* before its batch turn arrives — `contentMu`
+  alone does not prevent this, because nothing pins the slot between
+  the scan and the flush. `flushBatch` must re-check `slot.tag ==
+  tags[i]` immediately after taking `contentMu.RLock()` (held
+  continuously through the write, so the recheck stays valid for the
+  rest of the call) and skip the write entirely for any slot that no
+  longer matches — otherwise it silently writes the slot's *new*
+  content to the *old* tag's (rel, block) via `WriteBlockAIO`, with a
+  freshly-recomputed checksum stamped over the wrong-but-real bytes
+  (invisible to checksum verification and to the race detector, since
+  every access is properly locked — the bug is a stale association,
+  not a data race). This is what previously surfaced as pgbench
+  TPC-B's `btree: item length mismatch` nightly flake (heap-page bytes
+  landing inside a btree index file). See `internal/storage/
+  bufpool.go`'s `flushBatch` for the current, fixed sequence, and
+  `internal/storage/io_trace.go` (`GOOPG_IO_TRACE=1`) for the
+  content-hash tracer that localized it.
 
 ### Sizing and alignment
 

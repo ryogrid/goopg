@@ -172,6 +172,60 @@ func TestEncodeDecodeAlterFunctionFlagsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestEncodeDecodeAlterFunctionOwnerRoundTrip is the OWNER TO counterpart
+// (M0097-0150).
+func TestEncodeDecodeAlterFunctionOwnerRoundTrip(t *testing.T) {
+	cases := []struct {
+		oid, ownerOID uint32
+	}{
+		{16384, 10},
+		{16385, 4294967295},
+		{4294967295, 0},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterFunctionOwner(c.oid, c.ownerOID)
+		if raw[0] != RecordKindAlterFunctionOwner {
+			t.Errorf("oid %d: kind byte = %d, want %d", c.oid, raw[0], RecordKindAlterFunctionOwner)
+			continue
+		}
+		gotOID, gotOwnerOID, err := DecodeAlterFunctionOwner(raw)
+		if err != nil {
+			t.Errorf("oid %d: decode err: %v", c.oid, err)
+			continue
+		}
+		if gotOID != c.oid || gotOwnerOID != c.ownerOID {
+			t.Errorf("oid %d: decoded (%d, %d)", c.oid, gotOID, gotOwnerOID)
+		}
+	}
+}
+
+// TestEncodeDecodeAlterFunctionSetSchemaRoundTrip is the SET SCHEMA
+// counterpart (M0097-0150).
+func TestEncodeDecodeAlterFunctionSetSchemaRoundTrip(t *testing.T) {
+	cases := []struct {
+		oid       uint32
+		newSchema string
+	}{
+		{16384, "app"},
+		{4294967295, "日本語スキーマ"},
+	}
+	for _, c := range cases {
+		raw := EncodeAlterFunctionSetSchema(c.oid, c.newSchema)
+		if raw[0] != RecordKindAlterFunctionSetSchema {
+			t.Errorf("oid %d: kind byte = %d, want %d", c.oid, raw[0], RecordKindAlterFunctionSetSchema)
+			continue
+		}
+		gotOID, gotNewSchema, err := DecodeAlterFunctionSetSchema(raw)
+		if err != nil {
+			t.Errorf("oid %d: decode err: %v", c.oid, err)
+			continue
+		}
+		if gotOID != c.oid || gotNewSchema != c.newSchema {
+			t.Errorf("oid %d: decoded (%d, %q)", c.oid, gotOID, gotNewSchema)
+		}
+	}
+}
+
 // TestDecodeFunctionRejectsWrongKindAndTruncatedPayload guards the
 // decoders against a mismatched kind byte and a corrupt/truncated on-disk
 // record, for every function record kind.
@@ -189,6 +243,12 @@ func TestDecodeFunctionRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 	}
 	if _, _, _, _, _, err := DecodeAlterFunctionFlags(bogus); err == nil {
 		t.Error("DecodeAlterFunctionFlags: expected error on wrong kind")
+	}
+	if _, _, err := DecodeAlterFunctionOwner(bogus); err == nil {
+		t.Error("DecodeAlterFunctionOwner: expected error on wrong kind")
+	}
+	if _, _, err := DecodeAlterFunctionSetSchema(bogus); err == nil {
+		t.Error("DecodeAlterFunctionSetSchema: expected error on wrong kind")
 	}
 
 	truncCases := []struct {
@@ -210,6 +270,14 @@ func TestDecodeFunctionRejectsWrongKindAndTruncatedPayload(t *testing.T) {
 		}},
 		{"AlterFunctionFlags", []byte{RecordKindAlterFunctionFlags, 0, 0, 0, 0, 0}, func(p []byte) error {
 			_, _, _, _, _, err := DecodeAlterFunctionFlags(p)
+			return err
+		}},
+		{"AlterFunctionOwner", []byte{RecordKindAlterFunctionOwner, 0, 0, 0, 0}, func(p []byte) error {
+			_, _, err := DecodeAlterFunctionOwner(p)
+			return err
+		}},
+		{"AlterFunctionSetSchema", []byte{RecordKindAlterFunctionSetSchema, 10, 0}, func(p []byte) error {
+			_, _, err := DecodeAlterFunctionSetSchema(p)
 			return err
 		}},
 	}

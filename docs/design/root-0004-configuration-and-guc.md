@@ -237,10 +237,8 @@ similar code paths exercise.
   Those need the catalog. Recorded as milestone 6+ work.
 - Per-database / per-role scope persistence. Variables can carry the
   scope but the values aren't loaded yet (no catalog).
-- Hot reload (`SIGHUP` / `pg_ctl reload`). The reload command lands
-  with the control socket in milestone 7. The registry already
-  separates `Source` from `Value` so a future reload can replace
-  ConfigFile-sourced values without touching Session-sourced ones.
+- Hot reload landed 2026-07-08 (M0122-0007) — see the "Hot reload
+  (2026-07-08)" section below.
 
 ## Alternatives Considered
 
@@ -273,3 +271,72 @@ similar code paths exercise.
   for reload-from-SIGHUP semantics: we replace ConfigFile-sourced
   values, leave Session/Override/EnvVar values alone — exactly
   upstream's policy.
+
+## Hot reload (2026-07-08)
+
+M0122-0007's "SIGHUP config reload" item: `startControlPlane`'s
+`OnReload` handler (`internal/server/server.go`) was a "v0 no-op" that
+only logged a line — `goopg reload` and a literal `kill -HUP
+<postmaster-pid>` had no effect on a running server. Both are now
+real, and agree with each other, since both call the same
+`Server.reloadConfig`:
+
+- The control-socket path is unchanged in shape — `cl.OnReload` still
+  answers `RELOAD` — but now calls `reloadConfig` instead of just
+  logging.
+- A new goroutine in `startControlPlane` calls `signal.Notify` on
+  `syscall.SIGHUP` and calls the same `reloadConfig` on receipt,
+  matching upstream's two reload triggers (`pg_ctl reload` itself just
+  sends SIGHUP to the postmaster; goopg's control socket is a second,
+  parallel path since goopg has no postmaster/backend process split).
+
+`Server.reloadConfig` re-reads `cfg.ConfigPath` (the file
+`cfg.Registry` was originally loaded from at boot — plumbed through
+the new `Config.ConfigPath` field, set by `cmd/goopg` next to
+`cfg.Registry`) via the existing `config.ParseConfigFile`, then calls
+the new `Registry.ApplyReloadEntries` (`internal/config/guc.go`) —
+deliberately a separate entry point from boot's `ApplyConfigEntries`,
+because a *running* server's reload must split by `Context` the way
+upstream's `ProcessConfigFile` (`guc-file.l`) does, where boot may
+not:
+
+- `ContextPostmaster` / `ContextInternal` entries are left untouched
+  and reported as a warning (`"... cannot be changed without
+  restarting the server"`) — applying them live would silently lie
+  about the server's actual behavior (e.g. `shared_buffers`, already
+  sized into a fixed-length buffer pool at boot).
+- Every other context (`ContextSigHup` primarily, but also
+  `ContextSuBackend`/`ContextBackend`/`ContextSuset`/`ContextUserset`
+  values not already overridden by a session `SET`) is applied with
+  `SourceConfigFile`, same as boot.
+- Unlike boot, each applied change also fires `Registry`'s `OnChange`
+  bridge (`invokeOnChange`) — boot's `setFromFile` bypasses it because
+  nothing has read the registry yet at that point, but a reload
+  changes a *live* value, so process-global toggles wired via
+  `Registry.OnChange` (e.g. `enable_nestloop_index` →
+  `planner.SetNLIEnabled`) must observe the new value immediately, the
+  same as a `SET` would.
+- A reload never aborts partway or crashes the server on a bad
+  entry — unknown parameters and canonicalization failures are
+  reported as warnings too, matching `ProcessConfigFile`'s "log and
+  keep the old values" behavior instead of boot's hard-fail-on-error
+  contract (`cmd/goopg start` exits 1 on a malformed file; a running
+  server must not exit on a malformed reload).
+
+Verified live against the real `cmd/goopg` binary: started with
+`checkpoint_timeout = 600` in `postgresql.conf`, `SHOW
+checkpoint_timeout` confirmed `10min`; edited the file to `900` +
+added `max_connections = 5`, ran `goopg reload -D <datadir>` — log
+showed the `max_connections` restart-required warning and
+`changed=[checkpoint_timeout]`; `SHOW checkpoint_timeout` → `15min`,
+`SHOW max_connections` → unchanged `100`. Repeated with a literal
+`kill -HUP <pid>` instead of `goopg reload` — same result. Tests:
+`TestApplyReloadEntriesAppliesSigHupSkipsPostmaster`,
+`TestApplyReloadEntriesFiresOnChange` (`internal/config/guc_test.go`),
+`TestReloadConfigAppliesSigHupSkipsPostmaster`,
+`TestReloadConfigNoPathIsNoop` (`internal/server/reload_test.go`).
+
+**Still open:** a true restart-the-listener reload for
+`ContextPostmaster` GUCs (e.g. re-binding on a changed `port`) is not
+attempted — matching upstream, those still require a full process
+restart; goopg's reload only reports them.

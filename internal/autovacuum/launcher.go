@@ -203,12 +203,17 @@ const autovacuumFreezeMaxAge = storage.TransactionID(200_000_000)
 // status that a not-yet-durable checkpoint might still need on crash recovery.
 func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
 	// Anti-wraparound trigger: force vacuum when relfrozenxid is too old.
+	// This overrides autovacuum_enabled=off below, matching autovacuum.c's
+	// relation_needs_vacanalyze: "But ignore [the user's disable] if at risk".
 	if tbl.RelFrozenXID != storage.InvalidTransactionID && l.TxnMgr != nil {
 		currentXID := l.TxnMgr.NextXID()
 		if currentXID > tbl.RelFrozenXID &&
 			currentXID-tbl.RelFrozenXID > autovacuumFreezeMaxAge {
 			return true
 		}
+	}
+	if tbl.AutovacuumEnabledSet && !tbl.AutovacuumEnabled {
+		return false
 	}
 	if tbl.Stats == nil {
 		return true
@@ -218,5 +223,8 @@ func (l *Launcher) needsVacuum(tbl *catalog.Table) bool {
 
 // needsAnalyze returns true if the table should be analyzed.
 func (l *Launcher) needsAnalyze(tbl *catalog.Table) bool {
+	if tbl.AutovacuumEnabledSet && !tbl.AutovacuumEnabled {
+		return false
+	}
 	return true
 }

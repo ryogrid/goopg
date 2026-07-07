@@ -2937,7 +2937,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if nc.ExclusionOp == "=" && strings.ToLower(nc.Method) == "btree" {
 				// btree equality exclusion == unique constraint: build a real btree
 				// so checkExclusionConstraintsForInsert can probe it at INSERT time.
-				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false, false); err != nil {
+				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false, false, nil, nil); err != nil {
 					return err
 				}
 				if idx, ok2 := o.ctx.Catalog.LookupIndex(idxName); ok2 {
@@ -2963,7 +2963,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			continue
 		}
 		primary := nc.IsPrimary
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary, nc.NullsNotDistinct); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary, nc.NullsNotDistinct, nil, nil); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3030,7 +3030,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	if len(pkCols) > 0 && !namedPKCreated {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true, false, nil, nil); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
@@ -3061,7 +3061,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				idxBaseName = c.UniqueConstraintName
 			}
 			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: idxBaseName}
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false, c.UniqueNullsNotDistinct); err != nil {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false, c.UniqueNullsNotDistinct, nil, nil); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3085,7 +3085,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, cols, inclCols, "key")}
 		tableUniqueNND := i < len(s.TableUniqueNullsNotDistinct) && s.TableUniqueNullsNotDistinct[i]
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false, tableUniqueNND); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false, tableUniqueNND, nil, nil); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3115,7 +3115,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		ec.Name = name
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
 		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false); err != nil {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false, nil, nil); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -3140,7 +3140,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
 	for _, idx := range likeUniqueIndexes {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + strings.Join(idx.Columns, "_") + "_key"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -3167,7 +3167,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx")}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false, false, nil, nil); err != nil {
 			continue // skip indexes with unsupported expression types
 		}
 	}
@@ -3935,7 +3935,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst); err != nil {
 			return err
 		}
 	}
@@ -3944,7 +3944,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// M0097-0028.
 	for _, colName := range poc.UniqueColumns {
 		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -3982,7 +3982,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false, false, nil, nil); err != nil {
 			return err
 		}
 		// Copy predicate (WHERE clause) and ColExprStrings from parent index.
@@ -5956,7 +5956,61 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			resolvedPred = nil
 		}
 	}
-	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, resolvedPred); err != nil {
+	// Store INCLUDE columns, partial index flag, predicate expression, and the
+	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
+	// at least one column is non-default so a plain index keeps empty slices and
+	// dumps byte-identically. DU-002 slice 56. Computed BEFORE createBTreeIndex
+	// so the CREATE INDEX WAL record it emits captures the real ordering
+	// (M0122-0006) — setting idx.ColDescending/ColNullsFirst only AFTER that
+	// call, as a prior version of this function did, left the WAL payload
+	// permanently defaulted to ascending/NULLS-LAST on a genuine crash restart
+	// (no intervening checkpoint), even though the heap-persisted pg_index row
+	// was correctly resynced afterward by the block below.
+	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
+	hasOpClass := indexHasOpClass(s.ColOrders)
+	hasCollation := indexHasCollation(s.ColOrders)
+	var colDescending, colNullsFirst []bool
+	if nonDefaultOrder {
+		colDescending = make([]bool, len(s.ColOrders))
+		colNullsFirst = make([]bool, len(s.ColOrders))
+		for i, ord := range s.ColOrders {
+			colDescending[i] = ord.Descending
+			colNullsFirst[i] = ord.NullsFirst
+		}
+	}
+	// Same rationale as colDescending/colNullsFirst above (M0122-0006
+	// follow-up): compute every other index property BEFORE createBTreeIndex
+	// so its CREATE INDEX WAL record captures the real values, not the
+	// defaults a post-call assignment would leave in place across a genuine
+	// crash restart.
+	var opc, coll []string
+	if hasOpClass {
+		opc = make([]string, len(s.ColOrders))
+		for i, ord := range s.ColOrders {
+			opc[i] = ord.OpClass
+		}
+	}
+	if hasCollation {
+		coll = make([]string, len(s.ColOrders))
+		for i, ord := range s.ColOrders {
+			coll[i] = ord.Collation
+		}
+	}
+	var predicateString string
+	if s.Predicate != nil {
+		predicateString = defaultExprToSQL(s.Predicate)
+	}
+	props := &btreeIndexProps{
+		Predicate:        resolvedPred,
+		HasPredicate:     s.HasPredicate,
+		PredicateString:  predicateString,
+		IncludeColumns:   s.IncludeColumns,
+		ColOpClasses:     opc,
+		ColCollations:    coll,
+		Fillfactor:       s.Fillfactor,
+		DeduplicateItems: s.DeduplicateItems,
+	}
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, colDescending, colNullsFirst, props); err != nil {
 		return err
 	}
 	if declaredHash {
@@ -5968,59 +6022,18 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			hidx.DeclaredHash = true
 		}
 	}
-	// Store INCLUDE columns, partial index flag, predicate expression, and the
-	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
-	// at least one column is non-default so a plain index keeps empty slices and
-	// dumps byte-identically. DU-002 slice 56.
-	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
-	hasOpClass := indexHasOpClass(s.ColOrders)
-	hasCollation := indexHasCollation(s.ColOrders)
 	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
-			idx.HasPredicate = s.HasPredicate
+			// HasPredicate/PredicateString/IncludeColumns/Fillfactor/
+			// DeduplicateItems/ColOpClasses/ColCollations/NullsNotDistinct are
+			// already set by createBTreeIndex above (before its WAL emission,
+			// via btreeIndexProps) — not repeated here. idx.Predicate keeps
+			// the raw WHERE-clause AST for THIS live session only: it is not
+			// WAL-persisted (only PredicateString is), since nothing reads
+			// idx.Predicate again after a restart — pg_get_indexdef/pg_dump
+			// render from PredicateString, and the build-time row filter only
+			// runs once, at CREATE INDEX time.
 			idx.Predicate = s.Predicate
-			// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump
-			// round-trip it (already range-validated above). DU-002 slice 218.
-			idx.Fillfactor = s.Fillfactor
-			// Persist `WITH (deduplicate_items=on|off)` likewise. DU-002 slice 219.
-			idx.DeduplicateItems = s.DeduplicateItems
-			if s.Predicate != nil {
-				idx.PredicateString = defaultExprToSQL(s.Predicate)
-			}
-			idx.IncludeColumns = s.IncludeColumns
-			// NULLS NOT DISTINCT (PG 15+) — record so pg_index.indnullsnotdistinct
-			// and pg_get_indexdef reproduce it for pg_dump. DU-002 slice 134.
-			idx.NullsNotDistinct = s.NullsNotDistinct
-			if nonDefaultOrder {
-				desc := make([]bool, len(s.ColOrders))
-				nullsFirst := make([]bool, len(s.ColOrders))
-				for i, ord := range s.ColOrders {
-					desc[i] = ord.Descending
-					nullsFirst[i] = ord.NullsFirst
-				}
-				idx.ColDescending = desc
-				idx.ColNullsFirst = nullsFirst
-			}
-			// Non-default per-column operator class (pg_index.indclass) so
-			// pg_get_indexdef / pg_dump re-emit ` text_pattern_ops` after the
-			// column. DU-002 slice 312.
-			if hasOpClass {
-				opc := make([]string, len(s.ColOrders))
-				for i, ord := range s.ColOrders {
-					opc[i] = ord.OpClass
-				}
-				idx.ColOpClasses = opc
-			}
-			// Non-default per-column collation (pg_index.indcollation) so
-			// pg_get_indexdef / pg_dump re-emit ` COLLATE "C"` after the column.
-			// DU-002 slice 313.
-			if hasCollation {
-				coll := make([]string, len(s.ColOrders))
-				for i, ord := range s.ColOrders {
-					coll[i] = ord.Collation
-				}
-				idx.ColCollations = coll
-			}
 			// Flush the just-set fields (reloptions on pg_class, everything else
 			// on pg_index) to the heap-persisted catalog rows — createBTreeIndex's
 			// own sync ran before any of these fields existed on idx, so without
@@ -6102,14 +6115,27 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 			nameCols[i] = col
 		}
 	}
+	// Same M0122-0006-follow-up rationale as execCreateIndex's own call site:
+	// build every index property BEFORE createBTreeIndex so its CREATE INDEX
+	// WAL record captures the real values, not a post-call assignment's
+	// defaults. PredicateString/ColOpClasses/ColCollations are inherited
+	// straight from the parent index (already resolved there).
+	props := &btreeIndexProps{
+		Predicate:        resolvedPred,
+		HasPredicate:     s.HasPredicate,
+		PredicateString:  parentIdx.PredicateString,
+		IncludeColumns:   s.IncludeColumns,
+		ColOpClasses:     parentIdx.ColOpClasses,
+		ColCollations:    parentIdx.ColCollations,
+		Fillfactor:       s.Fillfactor,
+		DeduplicateItems: s.DeduplicateItems,
+	}
 	for _, childTbl := range im.PartitionChildren(parentTbl.OID) {
 		childIdxName := parser.ObjectName{
 			Schema: childTbl.Schema,
 			Name:   o.autoIndexNameWithIncludes(childTbl, nameCols, s.IncludeColumns, "idx"),
 		}
-		// resolvedPred is a nil planner.Expr when there is no partial predicate;
-		// createBTreeIndex treats a nil predExpr[0] as "no predicate".
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, resolvedPred); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst, props); err != nil {
 			return err
 		}
 		childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName)
@@ -6122,24 +6148,25 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 		// statement) and DROP/lock walks treat the tree as one object.
 		childIdx.PartitionParentOID = parentIdx.OID
 		im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
-		// Carry the parent's partial-index / INCLUDE / expression metadata so the
-		// child's pg_get_indexdef renders identically.
+		// HasPredicate/PredicateString/IncludeColumns/ColOpClasses/
+		// ColCollations/Fillfactor/DeduplicateItems are already set by
+		// createBTreeIndex above (before its WAL emission, via
+		// btreeIndexProps) — not repeated here. childIdx.Predicate keeps the
+		// raw WHERE-clause AST for this live session only (see the identical
+		// note at execCreateIndex's own post-call block).
 		if s.HasPredicate {
-			childIdx.HasPredicate = s.HasPredicate
 			childIdx.Predicate = s.Predicate
-			childIdx.PredicateString = parentIdx.PredicateString
 		}
-		childIdx.IncludeColumns = s.IncludeColumns
 		for i, str := range parentIdx.ColExprStrings {
 			if str != "" && i < len(childIdx.ColExprStrings) {
 				childIdx.ColExprStrings[i] = str
 			}
 		}
-		// Carry the WITH-clause storage parameters too, so `CREATE INDEX ...
-		// WITH (fillfactor=N)` on a partitioned parent doesn't silently drop
-		// the option on every child (M0119-0004 index-reloptions follow-up).
-		childIdx.Fillfactor = s.Fillfactor
-		childIdx.DeduplicateItems = s.DeduplicateItems
+		// FastUpdate/GinPendingListLimit/PagesPerRange/AutoSummarize apply
+		// only to GIN/BRIN indexes, which never reach createBTreeIndex (see
+		// the catalog-only method dispatch above in execCreateIndex); kept
+		// here only for parity with the parent's WITH-clause echo, unrelated
+		// to this fix's scope.
 		childIdx.FastUpdate = s.FastUpdate
 		childIdx.GinPendingListLimit = s.GinPendingListLimit
 		childIdx.PagesPerRange = s.PagesPerRange
@@ -7283,7 +7310,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
 				}
-				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct)
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct, parentIdx.ColDescending, parentIdx.ColNullsFirst)
 			}
 		case parser.AlterTableDetachPartition:
 			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's
@@ -8733,7 +8760,7 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false, nil, nil); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -8965,7 +8992,7 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false, nil, nil); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -9431,9 +9458,33 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	return nil
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, predExpr ...planner.Expr) error {
+// btreeIndexProps carries the WHERE-clause predicate, INCLUDE columns, and
+// per-column opclass/collation/fillfactor/dedup storage parameters a CREATE
+// INDEX statement (or a partition-child echo of one) declares beyond plain
+// Columns/Unique/Primary/ColDescending/ColNullsFirst. createBTreeIndex sets
+// all of these on the freshly-created catalog.Index BEFORE emitting its
+// CREATE INDEX WAL record (M0122-0006 follow-up) — see the comment at that
+// assignment for why post-call assignment isn't durability-safe. Passed as
+// an optional trailing arg (nil/omitted for the many call sites that create
+// a plain constraint-backed index with none of these properties).
+type btreeIndexProps struct {
+	Predicate        planner.Expr // resolved WHERE predicate for build-time row filtering; nil = no predicate
+	HasPredicate     bool
+	PredicateString  string
+	IncludeColumns   []string
+	ColOpClasses     []string
+	ColCollations    []string
+	Fillfactor       int
+	DeduplicateItems *bool
+}
+
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, colDescending, colNullsFirst []bool, props ...*btreeIndexProps) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
+	}
+	var xp *btreeIndexProps
+	if len(props) > 0 {
+		xp = props[0]
 	}
 	cols := make([]*catalog.Column, len(columns))
 	for i, name := range columns {
@@ -9466,6 +9517,30 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
+	// Set the per-column ASC/DESC + NULLS ordering, and every other index
+	// property (partial predicate/INCLUDE columns/opclass/collation/
+	// fillfactor/dedup/NULLS NOT DISTINCT), BEFORE the CREATE INDEX WAL
+	// record is built below (M0122-0006 + its follow-up): a caller's own
+	// post-call resync block used to set these fields on idx AFTER this
+	// function had already emitted its WAL payload, so a genuine crash
+	// restart (no intervening checkpoint) always replayed the index with
+	// every one of these properties reverted to its default, regardless of
+	// what was actually declared, even though the heap-persisted pg_index
+	// row was already correctly resynced afterward — a WAL-vs-heap
+	// durability gap only a real, uncheckpointed SIGKILL exposed (a plain
+	// Runtime.Close() performs a shutdown checkpoint that masked it).
+	idx.ColDescending = colDescending
+	idx.ColNullsFirst = colNullsFirst
+	idx.NullsNotDistinct = nullsNotDistinct
+	if xp != nil {
+		idx.HasPredicate = xp.HasPredicate
+		idx.PredicateString = xp.PredicateString
+		idx.IncludeColumns = xp.IncludeColumns
+		idx.ColOpClasses = xp.ColOpClasses
+		idx.ColCollations = xp.ColCollations
+		idx.Fillfactor = xp.Fillfactor
+		idx.DeduplicateItems = xp.DeduplicateItems
+	}
 	// Store parsed expressions for expression-based index columns so the
 	// planner and executor can evaluate them at conflict-detection time.
 	if len(colExprs) > 0 {
@@ -9481,8 +9556,12 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	}
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
-	if len(predExpr) > 0 && predExpr[0] != nil {
-		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr[0])
+	var predExpr planner.Expr
+	if xp != nil {
+		predExpr = xp.Predicate
+	}
+	if predExpr != nil {
+		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr)
 	} else {
 		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos)
 	}
@@ -9512,14 +9591,24 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	// recovery finishes.
 	if o.ctx.Pool != nil {
 		payload := wal.EncodeCreateIndex(wal.CreateIndexPayload{
-			OID:      idx.OID,
-			TableOID: tbl.OID,
-			Schema:   idxName.Schema,
-			Name:     idxName.Name,
-			Method:   "btree",
-			Columns:  append([]string(nil), columns...),
-			Unique:   unique,
-			Primary:  primary,
+			OID:              idx.OID,
+			TableOID:         tbl.OID,
+			Schema:           idxName.Schema,
+			Name:             idxName.Name,
+			Method:           "btree",
+			Columns:          append([]string(nil), columns...),
+			Unique:           unique,
+			Primary:          primary,
+			ColDescending:    idx.ColDescending,
+			ColNullsFirst:    idx.ColNullsFirst,
+			NullsNotDistinct: idx.NullsNotDistinct,
+			HasPredicate:     idx.HasPredicate,
+			PredicateString:  idx.PredicateString,
+			IncludeColumns:   idx.IncludeColumns,
+			ColOpClasses:     idx.ColOpClasses,
+			ColCollations:    idx.ColCollations,
+			Fillfactor:       idx.Fillfactor,
+			DeduplicateItems: idx.DeduplicateItems,
 		})
 		if _, err := o.ctx.Pool.LogChangeRecord(payload); err != nil {
 			// Best-effort: roll back the in-memory mutation so
@@ -11395,6 +11484,45 @@ func (o *ddlOp) execAlterFunction(s *parser.AlterFunctionStmt) error {
 			if o.ctx.WAL != nil {
 				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionRename(oid, s.RenameTo)); werr != nil {
 					return fmt.Errorf("wal alter-function-rename: %w", werr)
+				}
+			}
+		}
+		return nil
+	}
+	// OWNER TO: update the routine owner. M0097-0150.
+	if s.NewOwner != "" {
+		ownerOID := uint32(10) // bootstrap superuser, mirrors execAlterAggregateOwner/execAlterCollation's default owner
+		if !strings.EqualFold(s.NewOwner, "current_user") {
+			im, ok := o.ctx.Catalog.(*catalog.InMemory)
+			if !ok {
+				return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "ALTER FUNCTION OWNER TO requires InMemory catalog"}
+			}
+			oid, found := im.RoleOID(s.NewOwner)
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("role %q does not exist", s.NewOwner)}
+			}
+			ownerOID = oid
+		}
+		for _, r := range routines {
+			r.Owner = ownerOID
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionOwner(r.OID, ownerOID)); werr != nil {
+					return fmt.Errorf("wal alter-function-owner: %w", werr)
+				}
+			}
+		}
+		return nil
+	}
+	// SET SCHEMA: move the routine to a new schema. M0097-0150.
+	if s.NewSchema != "" {
+		for _, r := range routines {
+			oid := r.OID
+			if err := rs.SetSchema(r, s.NewSchema); err != nil {
+				return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
+			}
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeAlterFunctionSetSchema(oid, s.NewSchema)); werr != nil {
+					return fmt.Errorf("wal alter-function-set-schema: %w", werr)
 				}
 			}
 		}
