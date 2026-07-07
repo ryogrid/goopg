@@ -113,6 +113,7 @@
    "feature": "ANY/SOME/ALL quantified subqueries",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Correlated subqueries / initplan caching / ANY-SOME-ALL stay documented as deferred"
    ],
@@ -133,6 +134,7 @@
    "feature": "DML sub-plan rendering in EXPLAIN (showing plans for INSERT/UPDATE/DELETE statements)",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "deferred items (EXPLAIN ANALYZE, FORMAT JSON, COSTS, the DML sub-plan rendering)"
    ],
@@ -576,6 +578,7 @@
    "feature": "BETWEEN SYMMETRIC operator variant that allows reversed range endpoints",
    "task_id": "m0003",
    "resume_point": "0003-0013",
+   "status": "resolved",
    "evidence": [
     "BETWEEN SYMMETRIC"
    ],
@@ -636,6 +639,7 @@
    "feature": "Support window function references by name using OVER window_name syntax and WINDOW clause definitions.",
    "task_id": "M0020",
    "resume_point": "support named window references and definitions",
+   "status": "resolved",
    "evidence": [
     "Named-window references (`OVER win_name`) and WINDOW definition clauses also deferred"
    ],
@@ -1685,6 +1689,7 @@
    "feature": "MarkPageHalfDead WAL record infrastructure is implemented but producer wiring is limited to BtreeVacuum flag-trailer path; other potential producers are not yet wired",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "`MarkPageHalfDead` infrastructure stays in place for future use (no current producer outside the BtreeVacuum flag-trailer path)"
    ],
@@ -1704,6 +1709,7 @@
    "feature": "Client-driven Pool/Manager/AIO hooks closure-capture optimization for activity-tracking overhead reduction, pending post-fix measurement",
    "task_id": "m0091-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Client-driven Pool / Manager / AIO hooks (lines 478-895) are left as-is for this commit... Plumbing fix is deferred"
    ],
@@ -1950,6 +1956,7 @@
    "feature": "evictMu lock serializes MarkDirty and WAL operations; should allow concurrent execution for better write performance.",
    "task_id": "m0099-0005",
    "resume_point": "m0099_matrix_summary.md",
+   "status": "open",
    "evidence": [
     "evictMu still serialises MarkDirty/WAL"
    ],
@@ -2473,6 +2480,7 @@
    "feature": "CTEs (Common Table Expressions) without explicit aliases are not recognized by the parser",
    "task_id": "M0097-0029",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "CTE subquery-without-alias parser gap"
    ],
@@ -2513,6 +2521,7 @@
    "feature": "Role-based access control for INSERT operations is not implemented; SET SESSION AUTHORIZATION remains a no-op so server stays in superuser mode",
    "task_id": "M0097-0040",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "requires real role-based INSERT permission checking; SET SESSION AUTHORIZATION is a no-op"
    ],
@@ -2652,7 +2661,8 @@
   {
    "feature": "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA enforcement (currently no-op)",
    "task_id": "M0097-0150",
-   "resume_point": "Implement actual ownership/schema/name changes for ALTER FUNCTION/PROCEDURE",
+   "resume_point": "OWNER TO / SET SCHEMA still parse-only no-ops (ddl.go); RENAME TO is now fully enforced (execAlterFunction, operators_ddl.go:11336, WAL-persisted)",
+   "status": "open",
    "evidence": [
     "ALTER FUNCTION/PROCEDURE OWNER TO / RENAME TO / SET SCHEMA: no-op"
    ],
@@ -3283,6 +3293,7 @@
    "feature": "HammerDB Power Test at Scale Factor 1.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "HammerDB Power Test at SF1 ... as DEFERRED"
    ],
@@ -3302,7 +3313,8 @@
   {
    "feature": "Real multi-database and multi-role isolation boundaries with proper tracking across sessions",
    "task_id": "m0003",
-   "resume_point": null,
+   "resume_point": "M0110-0001: catalog.InMemory has no per-database namespace at all (every object store is one flat server-wide map) — confirmed still fully open 2026-07-06, milestone-scale (per-database catalog + storage isolation throughout internal/catalog), see deferral ledger",
+   "status": "open",
    "evidence": [
     "real multi-database/multi-role tracking"
    ],
@@ -3323,6 +3335,7 @@
    "feature": "Index definition and tablespace information reconstruction in pg_catalog queries",
    "task_id": "m0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "indexdef / tablespace reconstruction",
     "indexdef/tablespace reconstruction"
@@ -3345,6 +3358,7 @@
    "feature": "WITH OPTIONS clause in column definitions implemented as no-op; column-level options are not processed or applied",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "WITH OPTIONS no-op"
    ],
@@ -3365,6 +3379,7 @@
    "feature": "goopg does not emit a blank data row for 0-column SELECT results; PostgreSQL outputs one that goopg omits.",
    "task_id": "m0097",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg does not currently emit"
    ],
@@ -3385,6 +3400,7 @@
    "feature": "Resolve subscriber apply stall issue during logical replication",
    "task_id": "M0103-0008",
    "resume_point": "rung 9",
+   "status": "open",
    "evidence": [
     "rung 9 (subscriber apply stall) deferred to its own design doc"
    ],
@@ -3426,6 +3442,7 @@
    "feature": "Schema mismatch between PG18 and goopg for index definitions (tgfoid/attnum derivation) needs to be reconciled in a future loop.",
    "task_id": "m0106-0010",
    "resume_point": "Reconcile both schema definitions; currently masked by OID default fallback.",
+   "status": "open",
    "evidence": [
     "a future loop should reconcile both definitions"
    ],
@@ -3446,6 +3463,7 @@
    "feature": "Join-based execution path for aggregate sublink promotion to enable faster execution on large inner result sets (currently exceeds statement timeout with 100M ops)",
    "task_id": null,
    "resume_point": "Implement join-based execution path for aggregate sublinking",
+   "status": "open",
    "evidence": [
     "A join-based execution path would be needed to make this fast enough; deferred."
    ],
@@ -3466,6 +3484,7 @@
    "feature": "H2 efficiency fix: fix_plan split and PROMPT trimming to reduce build_loop_context injection size",
    "task_id": null,
    "resume_point": "Implement fix_plan split / PROMPT trim optimization",
+   "status": "resolved",
    "evidence": [
     "H2 (fix_plan split / PROMPT trim) skipped — build_loop_context injects only a task count, not fix_plan content"
    ],
@@ -3480,12 +3499,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "medium",
-   "code_audit": "unclear: H2 efficiency fix logic not found in executor or planner subsystems"
+   "code_audit": "RESOLVED (M0122-0001 triage, 2026-07-07): this is Ralph-tooling context-budget work, not an engine feature (prior audit searched the wrong subsystems). fix_plan.md is now actively split — completed_milestones/completed_fix_plan_00{1..9}.md exist at repo root, matching the entry's own cited evidence that build_loop_context() only injects a task count rather than the full fix_plan body."
   },
   {
    "feature": "EXCLUDE USING constraints bypass btree type validation for non-compatible types (box, point); stored as catalog-only without enforcing physical index.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "createExclusionIndexStub bypasses btree type-validation (box/point columns not btree-compatible); catalog-entry-only"
    ],
@@ -3506,6 +3526,7 @@
    "feature": "Duplicate-source error handling in merge cross-partition routing is not fully implemented.",
    "task_id": "M0100-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "deferred duplicate-source error"
    ],
@@ -3526,6 +3547,7 @@
    "feature": "Server-side enforcement of character encoding constraints during cluster bootstrap and runtime",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "No server-side encoding enforcement (on-disk PG-compat)"
    ],
@@ -3545,7 +3567,8 @@
   {
    "feature": "pg_dump test tiers 002-010 requiring broad catalog-view parity and dump/restore round-trip validation",
    "task_id": null,
-   "resume_point": null,
+   "resume_point": "M0119-0004 (source M0110-0001): confirmed still fully open 2026-07-06 — catalog.InMemory has no per-database namespace at all, blocking any real dump+restore round trip; see deferral ledger for the exact resume point",
+   "status": "open",
    "evidence": [
     "002-010 stay deferred pending broad catalog-view parity + a dump/restore round-trip"
    ],
@@ -3565,7 +3588,8 @@
   {
    "feature": "pg_amcheck server-dependent test tiers (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage), blocked on verify_heapam() SRF implementation and operator-class catalog parity",
    "task_id": "AC-002",
-   "resume_point": null,
+   "resume_point": "M0119-0006 (source M0110-0003): 002_nonesuch and 003_check/004_verify_heapam's page-structural + combined-corruption tiers are now FULLY PASSING as of 2026-07-07 (datconnlimit=-2/positive-limit residuals closed, synthetic-TOAST-relation open-failure fixed, restart-after-file-removal WAL allocation blocker fixed). CREATE OPERATOR CLASS/FAMILY + pg_amop/pg_amproc member catalog registration + WAL persistence are also now implemented (internal/executor/operators_ddl.go's execCreateOpClass/registerOpClassMembers, internal/catalog/catalog.go's RegisterUserOperatorClass/RegisterAmProcMember/RegisterAmOpMember). Only 005_opclass_damage remains open: it needs (a) UPDATE pg_catalog.pg_amproc SET amproc=... — pg_amproc is Virtual-backed (VirtualRows from ListAmProcMembers) but has no updateOp Virtual-UPDATE path (unlike pg_database's nextVirtualPgDatabase), so the corruption-injection UPDATE currently affects 0 rows; and (b) the btree access method does not dispatch comparisons through a per-index opclass FUNCTION at all (internal/access/btree has zero opclass/comparator-function call sites) — CREATE INDEX ... USING btree (col custom_opclass) is cataloged but the AM always uses its hardcoded native-type comparison, so a corrupted pg_amproc entry cannot actually corrupt anything observable. (b) is index-AM-level architecture work, materially larger than a single bounded loop.",
+   "status": "open",
    "evidence": [
     "the four server-dependent tests (002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) deferred under AC-002 pending the verify_heapam() SRF + operator-class catalog parity"
    ],
@@ -3586,6 +3610,7 @@
    "feature": "MVCC/HOT-chain corruption verification in verify_heapam (004) - not faithfully portable due to on-disk varatt_external layout divergence",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "The MVCC/attribute + TOAST tiers of 004... are not faithfully portable"
    ],
@@ -3607,6 +3632,7 @@
    "feature": "pg_subtrans truncation (cleanup of subtransaction ancestry records) is deferred.",
    "task_id": "M0117-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "no pg_subtrans truncation yet"
    ],

@@ -2068,6 +2068,24 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       `docs/design/0110-0003-pg-amcheck-tap-port.md` new "Follow-up
       (2026-07-07): AC-003 restart-timeout blocker closed" section;
       `docs/design/README.md` row updated.
+      **2026-07-07 correction (M0122-0001 triage pass, doc-only, no code
+      changed): this bullet's opening line ("`005_opclass_damage`; ... needs
+      `verify_heapam()` SRF + opclass catalog parity") is stale.**
+      `CREATE OPERATOR CLASS`/`CREATE OPERATOR FAMILY` + `pg_amop`/`pg_amproc`
+      member catalog registration + WAL persistence are already fully
+      implemented (`execCreateOpClass`/`registerOpClassMembers`,
+      `internal/executor/operators_ddl.go`; `RegisterUserOperatorClass`/
+      `RegisterAmProcMember`/`RegisterAmOpMember`, `internal/catalog/
+      catalog.go`) — landed under M0119-0004's DU-002 pg_dump slices but never
+      back-referenced here. What's actually still missing for
+      `005_opclass_damage.pl` (see `.ralph/deferral_ledger.md`'s 2026-07-07
+      M0122-0001 row for the full writeup): (1) `pg_amproc` is Virtual but has
+      no Virtual-UPDATE path (only `pg_database` has one), so the test's
+      `UPDATE pg_amproc SET amproc = ...` corruption-injection step currently
+      affects 0 rows; (2) `internal/access/btree` has zero opclass/comparator-
+      function call sites — the AM never dispatches through a per-index
+      `FUNCTION 1` comparator, so a custom opclass is cataloged but inert.
+      Both remain genuinely open, index-AM-level, not a single-loop slice.
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
@@ -2106,6 +2124,36 @@ mirroring M0119's ledger `status` column.
       `unclear`/no-audit + 61 `resolution_check.ledger=open` entries (7 overlap).
       Dedupe against M0119 + `.ralph/deferral_ledger.md` so nothing is worked
       twice. This task discharges the "may already be implemented" risk.
+      **2026-07-07 (this loop): first triage batch landed — 35/181 entries now
+      carry a `status` field** (15 `resolved`, 20 `open`; 146 remain untouched).
+      Covered: (a) 6 entries whose `code_audit` already said `RESOLVED ...` but
+      lacked the `status` field (ANY/SOME/ALL, EXPLAIN DML sub-plan rendering,
+      BETWEEN SYMMETRIC, named windows, alias-less CTEs, DML RBAC) — mechanical
+      flip, no new investigation; (b) the ~20-entry `unclear`/no-`code_audit`
+      batch — fresh verification via Serena symbol search + targeted reads.
+      Biggest finding: `CREATE OPERATOR CLASS`/`CREATE OPERATOR FAMILY` +
+      `pg_amop`/`pg_amproc` member catalog registration + WAL persistence are
+      now FULLY implemented (`execCreateOpClass`/`registerOpClassMembers`,
+      `internal/executor/operators_ddl.go`; `RegisterUserOperatorClass`/
+      `RegisterAmProcMember`/`RegisterAmOpMember`, `internal/catalog/
+      catalog.go`) — this milestone's own M0119-0006 bullet above still
+      described this as unbuilt (stale, landed under M0119-0004 DU-002 slices
+      instead and never back-referenced). Only `005_opclass_damage.pl` remains
+      genuinely open in the pg_amcheck AC-003 cluster, for two concrete
+      reasons: `pg_amproc` is Virtual (`VirtualRows` from `ListAmProcMembers`)
+      but has no Virtual-UPDATE path (unlike `pg_database`'s
+      `nextVirtualPgDatabase`), so `UPDATE pg_amproc SET amproc=...` currently
+      affects 0 rows; and `internal/access/btree` has zero opclass/comparator-
+      function call sites at all — the AM never dispatches through a per-index
+      `FUNCTION 1` comparator, so even a corrupted `pg_amproc` row can't
+      actually corrupt anything observable. Both are real, index-AM-level
+      gaps, not a single-loop slice — see the `pg_amcheck server-dependent
+      test tiers` entry in `unimplemented_feat.json` for the full writeup.
+      One `open`→`resolved` flip corrected a misfiled entry ("H2 efficiency
+      fix: fix_plan split/PROMPT trim" — Ralph-tooling, not an engine
+      feature; `completed_milestones/completed_fix_plan_00{1..9}.md` already
+      exist). Next batch: continue through the remaining `resolution_check.
+      ledger=open` entries not yet covered.
 - [x] **M0122-0002 — Catalog system functions & pg_* view stubs** (~9). Quick wins:
       `pg_relation_size`/`pg_total_relation_size` (`f0b2bdb3`), `regexp_matches`
       (2026-07-04 loop #7, scalar/first-match only — SRF `'g'`-flag multi-row
