@@ -53,6 +53,7 @@
    "feature": "Implement the restart command for goopg ctl control socket (currently a documented stub).",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "restart: documented stub since v0 runs in the foreground"
    ],
@@ -93,6 +94,7 @@
    "feature": "Implement multi-database support so a single server instance can manage multiple independent databases.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "v0 deliberately defers — multi-database"
    ],
@@ -315,6 +317,7 @@
    "feature": "MESSAGE message type ('M') in pgoutput",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "'Y' TYPE / 'M' MESSAGE / 2PC / streaming v2: out of scope"
    ],
@@ -787,6 +790,7 @@
    "feature": "Implement pg_index as a persistent heap table; currently stores index metadata only in Go structs",
    "task_id": "M0030-0005",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pg_index as a real heap table deferred (index metadata remains in Go structs)"
    ],
@@ -801,7 +805,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:6424 pg_index Virtual:true not persistent"
+   "code_audit": "RESOLVED 2026-07-07 (M0113 follow-up, confirmed via M0122-0001 re-audit): syncIndexToCatalogHeap (internal/executor/operators_ddl.go, ~line 12653) writes a real pg_index heap row via writeHeapRowCanonical on catalog.IndexRelationId, and loadUserIndexesFromHeap (internal/initdb/open.go:2815) recovers index indrelid/indkey from that heap table on restart. The catalog.go:6424 Virtual:true note and initdb/index_ddl_recovery.go:4 comment cited by the earlier audit are stale documentation predating this landing."
   },
   {
    "feature": "Window function frame clauses and named windows are not yet implemented.",
@@ -967,6 +971,7 @@
    "feature": "Re-enable race condition detector (-race) for concurrent write stress tests",
    "task_id": "M0056-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -981,12 +986,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/multi_writer_stress_test.go:40 skip blocks race re-enable"
+   "code_audit": "RESOLVED 2026-07-07 (M0056-followup, confirmed via M0122-0001 re-audit): the multi-writer-stress race no longer gates on raceEnabled; nightly race-gate run 20260707-000712 shows `ok github.com/goopg/goopg/internal/access/btree 18.142s` with zero DATA RACE hits (ci/logs/20260707-000712/race/go-test.log). See deferral_ledger.md 2026-07-07 M0056-followup-multiwriter-flake row for the root-cause fix (bufpool evictVictim bufmap.Delete-before-flush race)."
   },
   {
    "feature": "Remove splitMu lock from btree operations for concurrency optimization",
    "task_id": "M0056-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -1007,6 +1013,7 @@
    "feature": "End-to-end validation of btree concurrent write protocol",
    "task_id": "M0056-0004",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "M0056-0002/0003/0004 are blocked on a separate intermittent flake"
    ],
@@ -1027,6 +1034,7 @@
    "feature": "Investigate and fix intermittent TestMultiWriterStress flake causing ~20% test failures",
    "task_id": "M0056-followup-multiwriter-flake",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "root cause not yet identified. Tracked as `M0056-followup-multiwriter-flake`"
    ],
@@ -1041,12 +1049,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/access/btree/multi_writer_stress_test.go:40 test skipped"
+   "code_audit": "RESOLVED 2026-07-07 (M0056-followup, confirmed via M0122-0001 re-audit): root cause found and fixed — evictVictim's bufmap.Delete-before-flush race in internal/storage/bufpool.go. Regression-guard test (multi_writer_stress_test.go) permanently un-skipped; see deferral_ledger.md 2026-07-07 M0056-followup-multiwriter-flake row. Remaining skip in that file is routine testing.Short() gating, unrelated to this flake."
   },
   {
    "feature": "Full splitMu removal from btree Insert slow path (Stage 2 splitMu lifting via writer-coupling)",
    "task_id": "M0055-0004-followup-stage2-splitmu-removal",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "lands two of three Stage 2 deliverables... DEFERRED (blocked on a storage-layer prerequisite)"
    ],
@@ -1309,6 +1318,7 @@
    "feature": "Q8 still returns 0 rows; the full fix requires complete IndexScan-alias plumbing that is currently in progress.",
    "task_id": "M0062-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "The IndexScan-alias plumbing is a prerequisite for the full Q8 fix, which is tracked in the M0062-0002 follow-up"
    ],
@@ -1323,7 +1333,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: docs/milestones/0062-tpch-residual-long-tail.md:46 Q8 0-rows pending"
+   "code_audit": "RESOLVED (M0062-0002/M0063-0001, confirmed via M0122-0001 re-audit): outer-column-resolution fix for NLI derived tables landed; Q8 returns 2 rows as of commit 2e6e9f9 (completed_milestones/completed_fix_plan_004.md:1831-1889), also confirmed in analysis/tpch-sf0.5-query-timings-20260616.md:46. The 0062-tpch-residual-long-tail.md:46 \"0-rows pending\" note cited by the earlier audit predates this fix."
   },
   {
    "feature": "Q21 EXISTS unnest residual zero-rows bug fix deferred to slot pipeline",
@@ -1589,6 +1599,7 @@
    "feature": "Datum struct flip (re-deferral from M0075 due to silent regression)",
    "task_id": "M0076",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "status flipped to DEFERRED with failure note"
    ],
@@ -1603,7 +1614,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: Datum struct flip was reverted; current datum.go:110 still has Buf []byte"
+   "code_audit": "RESOLVED (M0107-0002, confirmed via M0122-0001 re-audit): the specific M0075/M0076 packed-Datum flip attempt was reverted, but a later, differently-scoped flip landed as M0107-0002 (docs/design/0107-0002-datum-48b-arena-id-merge.md) — internal/executor/datum.go now uses a 48B layout (DatumKind uint8, ArenaID uint16 replacing *mctx.Context, *big.Int removed), cutting hot-path Datums to 0 GC-traced pointers. Landed 2026-05-20. The earlier audit's \"Buf []byte still present\" note is a narrow/stale reading — Buf remains only as an intentional cold-path fallback."
   },
   {
    "feature": "SeqScanOp predicate batch wiring (vectorized predicate evaluation in sequential scan)",
@@ -1871,6 +1882,7 @@
    "feature": "The loadTables function uses a type assertion for InMemory catalog and silently no-ops when called with other catalog implementations",
    "task_id": "M0087",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "loadTables uses a *catalog.InMemory type assertion and silently no-ops on any other catalog implementation"
    ],
@@ -2018,6 +2030,7 @@
    "feature": "regexp_matches() function is a set-returning function stub that returns NULL instead of match results.",
    "task_id": "m0097-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "regexp_matches stub (SRF, returns NULL)"
    ],
@@ -2032,12 +2045,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: expr.go:7288 regexp_matches() stub returns NULL instead of match results"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/executor/expr.go (regexpFirstMatchArray/regexpAllMatchesArrays/evalRegexpMatchesSRF, ~line 5326) actually compiles and runs the regex via Go's regexp package and returns real capture-group arrays (or the whole match with no groups), with correct 'g'-flag SRF row semantics and unmatched-group NULL handling. The expr.go:7288 \"stub returns NULL\" note cited by the earlier audit is stale — that line range no longer matches current code."
   },
   {
    "feature": "pg_get_serial_sequence() is a stub that returns a convention-based sequence name instead of the actual sequence.",
    "task_id": "m0097-0009",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "pg_get_serial_sequence stub (returns table_col_seq convention)"
    ],
@@ -2058,6 +2072,7 @@
    "feature": "isfinite() function is not implemented (goopg v0 has no infinity values to check).",
    "task_id": "m0097-0004",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "isfinite(x): stub"
    ],
@@ -2119,6 +2134,7 @@
    "feature": "Implement CREATE/DROP DATABASE commands with full DDL support.",
    "task_id": "m0095-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "0007: CREATE/DROP DATABASE stubs"
    ],
@@ -2133,7 +2149,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/database_ddl.go:71-104 — CREATE/DROP DATABASE implemented but trailing options (TEMPLATE, ENCODING, OWNER) ignored"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/server/database_ddl.go (tryHandleDatabaseDDL/classifyDatabaseDDL) performs real catalog mutation (catalog.CreateDatabase/DropDatabase), WAL-logs RecordKindCreateDatabase/RecordKindDropDatabase for crash recovery, and maps proper SQLSTATEs; internal/server/database_exists_test.go confirms created databases are connectable/queryable. Caveat: trailing DDL options (TEMPLATE/ENCODING/OWNER) are still ignored and there is no per-database file namespace, so per-item resolution is about the DDL command itself, not full multi-database storage isolation (tracked separately, see IDX 4 / \"Real multi-database and multi-role isolation boundaries\")."
   },
   {
    "feature": "No dual-process logical-replication test harness; replcluster currently supports physical replication only",
@@ -2199,6 +2215,7 @@
    "feature": "TOAST (out-of-line) large value storage replication",
    "task_id": "M0103-0007",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "TOAST"
    ],
@@ -2279,6 +2296,7 @@
    "feature": "WAL sender closes the replication connection before pg_basebackup considers the WAL stream complete.",
    "task_id": "M0105-0007",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "WAL sender to close the connection before pg_basebackup considers the stream complete"
    ],
@@ -2293,7 +2311,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/server/replication.go:61-62 START_REPLICATION WAL sender marked for future implementation"
+   "code_audit": "RESOLVED (M0095-0003, confirmed via M0122-0001 re-audit): commit e45ffb6a implemented `pg_basebackup -X stream`; TestPort_PgBasebackup010StreamWAL (internal/testport/pgbasebackup_port_test.go:221) runs real pg_basebackup -X stream against goopg and passes, asserting the streamed WAL segment completes cleanly. The server.go:61-62 \"marked fallback\" note cited by the earlier audit is stale."
   },
   {
    "feature": "PG standby startup fails due to timeline mismatch and invalid WAL records at the redo LSN position.",
@@ -2399,6 +2417,7 @@
    "feature": "GIST index support (required for index_including_gist regress test)",
    "task_id": "M0097-0002",
    "resume_point": "GIST index implementation",
+   "status": "open",
    "evidence": [
     "requires GIST index support, excluded per M0097-0002 policy"
    ],
@@ -2501,6 +2520,7 @@
    "feature": "PostgreSQL extensions (contrib modules) are out of scope and remain unimplemented",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Extensions remain out of scope"
    ],
@@ -2562,6 +2582,7 @@
    "feature": "I/O statistics tracking not implemented; pg_stat_io virtual table always returns empty rows.",
    "task_id": "M0095-0002",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "returns 0 rows (no I/O stats tracked in goopg v0)"
    ],
@@ -2576,12 +2597,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:5591 - pg_stat_io VirtualRows returns nil"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/executor/pgstat_io.go fetchIOStatRows builds the real 79-row PG-shaped table and fills real counters from storage.Pool (hits/reads/writes/evictions/extends + timings) and wal.Writer fsync counts/timings, wired into valuesOp.Open. TestPgStatIORowCount confirms it is no longer the empty stub cited by the earlier audit (catalog.go:5591)."
   },
   {
    "feature": "WAL summarization not running; pg_available_wal_summaries() always returns empty rows.",
    "task_id": "M0095-0002",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "always returns 0 rows (no WAL summarizer running since summarize_wal=off)"
    ],
@@ -2622,6 +2644,7 @@
    "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "LANGUAGE C functions accepted as stubs"
    ],
@@ -2642,6 +2665,7 @@
    "feature": "pg_collation_for() function returns hardcoded 'default' string; collation tracking throughout catalog and query execution is not implemented",
    "task_id": "M0097-0035",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "pg_collation_for() stub: returns \"default\" (no collation tracking in v0)"
    ],
@@ -2682,6 +2706,7 @@
    "feature": "WITH [CASCADED|LOCAL] CHECK OPTION clause enforcement (syntax accepted but not enforced)",
    "task_id": null,
    "resume_point": "Implement CHECK OPTION enforcement",
+   "status": "resolved",
    "evidence": [
     "Check enforcement is not yet implemented; the clause is accepted and ignored."
    ],
@@ -2696,12 +2721,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/catalog.go:329 view CheckOption stored but not enforced"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): checkViewCheckOption (internal/executor/operators_fk.go:1900) raises SQLSTATE 44000 on CHECK OPTION violation, wired via plan.ViewCheckQual at all INSERT/UPDATE sites (internal/executor/operators_storage.go:1980-1984,3772-3773,4393-4394,5715-5716) — real enforcement, not the stored-but-unenforced state the earlier audit (catalog.go:329) described."
   },
   {
    "feature": "Foreign Data Wrapper (FDW) functionality stubbed; CREATE FOREIGN DATA WRAPPER and CREATE SERVER create compat registry entries only, without actual FDW implementation.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "FDW stubs: CREATE FOREIGN DATA WRAPPER + CREATE SERVER → compat registry with FDW-server association"
    ],
@@ -2722,6 +2748,7 @@
    "feature": "REINDEX INDEX/TABLE command is unimplemented; operates as a no-op stub.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "no-op rebuild (v0 stub)"
    ],
@@ -2742,6 +2769,7 @@
    "feature": "pg_get_expr() function is stubbed to return empty string; does not reconstruct constraint or index expressions.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "pg_get_expr stub (→ \"\")"
    ],
@@ -2762,6 +2790,7 @@
    "feature": "MVCC/attribute tier of verify_heapam (multi-version visibility and per-column consistency checks) remains deferred beyond Tier 1 page-structure checks.",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "MVCC/attribute tier... deferred"
    ],
@@ -2782,6 +2811,7 @@
    "feature": "Four pg_amcheck TAP tests (AC-002: 002_nonesuch, 003_check, 004_verify_heapam, 005_opclass_damage) remain deferred as keystone blockers pending higher tiers.",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Keystone blocker for the four deferred pg_amcheck TAP tests (AC-002: 002_nonesuch/003_check/004_verify_heapam/005_opclass_damage)"
    ],
@@ -2802,6 +2832,7 @@
    "feature": "User schemas should be discoverable via pg_namespace heap rows during PG-standby replication, matching PostgreSQL's schema visibility model.",
    "task_id": "AC-003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "PG-standby user-schema visibility stays out of scope."
    ],
@@ -2822,6 +2853,7 @@
    "feature": "Schema definitions should be queryable via pg_namespace heap rows and indexes (2684/2685), enabling PostgreSQL standby replication to resolve schemas.",
    "task_id": "AC-003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "PG-standby visibility (pg_namespace heap row + 2684/2685 indexes) is out of scope"
    ],
@@ -2842,6 +2874,7 @@
    "feature": "The AC-002 through AC-005 PostgreSQL amcheck TAP test suite has not been ported to goopg.",
    "task_id": "M0110-0003",
    "resume_point": "S5",
+   "status": "open",
    "evidence": [
     "AC-002..AC-005 TAP port...deferred to rest of S5"
    ],
@@ -2862,6 +2895,7 @@
    "feature": "Runtime pg_database shared-catalog write for datconnlimit invalid-database filtering",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "blocked on a runtime pg_database shared-catalog write goopg lacks",
     "needs a runtime pg_database shared-catalog write goopg lacks"
@@ -2878,12 +2912,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/testport/pgamcheck002_port_test.go:118 datconnlimit write requires runtime pg_database"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): internal/server/server.go:846 rejects connections where DatabaseConnLimit(db)==catalog.DatconnlimitInvalidDB, and updateOp.nextVirtualPgDatabase (internal/executor/operators_storage.go:3585) + catalog.InMemory.SetDatabaseConnLimit persist UPDATE pg_database SET datconnlimit=-2 via the Virtual-UPDATE path; pgamcheck002_port_test.go:454-478 exercises the full invalid-database filter end-to-end and passes. Landed as commit 17fea598 (M0119-0006 AC-002 residual #2), after the earlier audit was recorded."
   },
   {
    "feature": "Opclass damage detection test suite (005_opclass_damage)",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "005_opclass_damage remain",
     "AC-003 stays defer (003_check + 005_opclass_damage remain)",
@@ -2909,6 +2944,7 @@
    "feature": "Opclass parity test suite (005_opclass_damage)",
    "task_id": "M0110-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "new AC-003 carries the deferred 003/004/005 remainder (real corruption injection + opclass parity)"
    ],
@@ -2929,6 +2965,7 @@
    "feature": "On-disk pg_tablespace heap visibility management for shared catalog operations",
    "task_id": "M0095-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "on-disk pg_tablespace heap visibility (shared-catalog runtime write)"
    ],
@@ -2949,6 +2986,7 @@
    "feature": "The 1-byte 'char' type (OID 18) cannot be disambiguated from bpchar because the parser folds both to the same internal representation",
    "task_id": "DU-002",
    "resume_point": "Modify parser to distinguish literal 'char' from bpchar during type parsing",
+   "status": "resolved",
    "evidence": [
     "\"char\" (18) is deferred: the parser folds both quoted \"char\" and bare char to ct.Name=\"char\", so disambiguating the 1-byte internal char from bpchar needs a parser change, not just a codec entry."
    ],
@@ -2963,12 +3001,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/catalog/codec.go:1356 TypeNameToOID folds char to bpchar"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): synthesizeBareCharTypmod (internal/parser/select.go:2428) and ddl.go:4598 now disambiguate bare char (→typmod=1) from quoted \"char\" (→no typmod); pg18_user_catalog_rows.go:624 and expr.go:12343 consume that signal to report atttypid=18 vs 1042. Verified by TestParseCastCharDisambiguation (internal/parser/cast_test.go). The codec.go:1356 \"folds char to bpchar\" note cited by the earlier audit is stale."
   },
   {
    "feature": "Index column ordering (ASC/DESC/NULLS FIRST/NULLS LAST) is not persisted to disk; ordering is lost across server restart despite faithful dumps within a session",
    "task_id": "DU-002",
    "resume_point": "Persist indoption bits to on-disk pg_index heap to enable cross-restart index ordering preservation",
+   "status": "open",
    "evidence": [
     "indoption bits are not persisted to the on-disk pg_index heap, so ordering is lost across a restart"
    ],
@@ -3009,6 +3048,7 @@
    "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "RESET (...) left as the pre-existing no-op (pg_dump never emits it)"
    ],
@@ -3029,6 +3069,7 @@
    "feature": "Per-column n_distinct planner hints are stored in attoptions for dump compatibility but are not used by the query planner for optimization",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg does not act on n_distinct planner hints"
    ],
@@ -3049,6 +3090,7 @@
    "feature": "SET STATISTICS column option is only supported in ALTER TABLE but not in CREATE TABLE; statistics targets cannot be specified when creating a table",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "No CREATE TABLE threading (SET STATISTICS is ALTER-only)"
    ],
@@ -3069,6 +3111,7 @@
    "feature": "TOAST compression functionality is not implemented. Compression metadata round-trips through pg_dump for schema fidelity, but actual data compression is not performed.",
    "task_id": "DU-002 slice 183",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "Dump-fidelity only: goopg does not TOAST/compress."
    ],
@@ -3109,6 +3152,7 @@
    "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "COLLATE/USING accepted but ignored"
    ],
@@ -3193,6 +3237,7 @@
    "feature": "HANDLER and VALIDATOR function references in CREATE FOREIGN DATA WRAPPER",
    "task_id": "DU-002-380",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "HANDLER/VALIDATOR refs"
    ],
@@ -3207,12 +3252,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/parser/ddl.go:462 HANDLER/VALIDATOR func references skipped"
+   "code_audit": "RESOLVED (confirmed via M0122-0001 re-audit): resolveFDWHandlerFunc/resolveFDWValidatorFunc (internal/executor/operators_ddl.go:971-1010) now real-resolve HANDLER/VALIDATOR names against pg_proc (signature-checked, raises 42883/42809 on failure) and store HandlerOID/ValidatorOID (operators_ddl.go:15155-15218), used by both CREATE and ALTER FOREIGN DATA WRAPPER. The ddl.go:462 \"skipped\" note cited by the earlier audit is stale."
   },
   {
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-378",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3233,6 +3279,7 @@
    "feature": "Persistent storage of server definitions (currently in-memory only)",
    "task_id": "DU-002-376",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "servers in-memory only"
    ],
@@ -3253,6 +3300,7 @@
    "feature": "Per-column optional type specification in CREATE TABLE OF syntax (col WITH OPTIONS form)",
    "task_id": "DU-002-374",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "per-column `OF type (col WITH OPTIONS ...)` form rejected"
    ],
@@ -3273,6 +3321,7 @@
    "feature": "Typed table support for composite types in non-public schemas",
    "task_id": "DU-002-374",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "non-public-schema composite OF uncovered"
    ],
