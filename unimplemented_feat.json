@@ -199,6 +199,7 @@
    "feature": "SASLprep string normalization, channel binding support, and scram_iterations GUC configuration for SCRAM-SHA-256.",
    "task_id": null,
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "the deferred items (SASLprep, channel binding, scram_iterations GUC)"
    ],
@@ -213,7 +214,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/scram.go:857 channel binding not supported, SASLprep absent"
+   "code_audit": "confirmed-open: internal/auth/scram.go:45,75,150 scramDefaultIterations hardcoded (scram_iterations GUC registered in internal/config/defaults.go:184 but never consulted); scram.go:279-289 channel binding explicitly rejected; no SASLprep anywhere — GUC registration is cosmetic only"
   },
   {
    "feature": "Lehman/Yao crab-walk concurrency control for B-tree index operations",
@@ -1213,6 +1214,7 @@
    "feature": "SASLprep pre-processing for SASL authentication username normalization",
    "task_id": null,
    "resume_point": "see maybe_not_completed_tasks.md for deferred details",
+   "status": "open",
    "evidence": [
     "Tasks include deferred features such as: Authentication: SASLprep"
    ],
@@ -1227,12 +1229,13 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: No SASLprep implementation found in auth package"
+   "code_audit": "confirmed-open: internal/auth/exchange.go:151-243 + scram.go:149-160 pass username/password raw with zero SASLprep/stringprep normalization anywhere in repo; docs/design/root-0003-authentication.md:232-235 self-documents SASLprep not applied in v0"
   },
   {
    "feature": "Channel binding support for SASL authentication to validate client-server channel integrity",
    "task_id": null,
    "resume_point": "see maybe_not_completed_tasks.md for deferred details",
+   "status": "open",
    "evidence": [
     "Authentication: SASLprep, channel binding"
    ],
@@ -1247,7 +1250,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/auth/scram.go:287 channel binding not yet supported"
+   "code_audit": "confirmed-open: internal/auth/scram.go:279-289 handleClientFirst hard-rejects any p=... (channel binding) gs2-cbind-flag; exchange.go:156 only advertises SCRAM-SHA-256 (never -PLUS)"
   },
   {
    "feature": "Optimize Q14 query performance (regressed from 29s baseline to 600s timeout)",
@@ -1657,6 +1660,7 @@
    "feature": "Runtime SET for track_io_timing GUC is not yet wired. Currently only static session-level configuration via postgresql.conf is supported.",
    "task_id": null,
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "Runtime SET is not yet wired (M0093 candidate)"
    ],
@@ -1671,7 +1675,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: track_io_timing GUC registered but no runtime SET handler found; claim that it's not wired appears correct"
+   "code_audit": "RESOLVED: runtime SET track_io_timing now wired live via OnChange hook (internal/server/server.go:405-409,949-954) updating activity.ActivityRegistry (internal/activity/registry.go:556-624); pinned by server_test.go:290-330 TestTrackIOTimingOnChangePropagatesToActivityRegistry, no restart required"
   },
   {
    "feature": "M0091 performance goal (TPS ≥ 1,000) remains unmet after optimization attempts. Further performance work is filed as a candidate for M0093.",
@@ -1966,6 +1970,7 @@
    "feature": "min_parallel_table_scan_size and min_parallel_index_scan_size GUCs are accepted but not acted upon; query planner ignores these settings.",
    "task_id": "m0097-0003",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "no-op stubs (values accepted but not acted upon)"
    ],
@@ -1980,7 +1985,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go:469+ GUCs registered as no-ops"
+   "code_audit": "confirmed-open: min_parallel_{table,index}_scan_size registered in internal/config/defaults.go:506,513 + surfaced in pg_settings; zero references in internal/planner and no parallel-scan/Gather executor exists to act on them — moot until real parallel query execution lands"
   },
   {
    "feature": "evictMu lock serializes MarkDirty and WAL operations; should allow concurrent execution for better write performance.",
@@ -2007,6 +2012,7 @@
    "feature": "pg_relation_size, pg_total_relation_size, pg_indexes_size, and pg_table_size are stubbed; do not return actual relation sizes.",
    "task_id": "m0097-0018",
    "resume_point": null,
+   "status": "resolved",
    "evidence": [
     "pg_relation_size/pg_total_relation_size/pg_indexes_size/pg_table_size: stubs"
    ],
@@ -2021,7 +2027,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: pg_relation_size functions found but stubbed verification needed"
+   "code_audit": "RESOLVED (M0122-0002): pg_relation_size/pg_table_size/pg_total_relation_size/pg_indexes_size compute real fork byte-sizes via storage.Pool (internal/executor/expr.go:3400-3461 relationForkSize/relationAllForksSize, dispatch expr.go:7674-7683), pinned by pg_relation_size_test.go and docs/design/0122-0002-pg-relation-size-real-sizes.md"
   },
   {
    "feature": "ALTER TYPE RENAME and OWNER operations are no-ops; type names and ownership cannot be modified.",
@@ -2589,6 +2595,7 @@
    "feature": "Planner GUC stubs (enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, and others) registered to prevent unrecognized GUC errors but may not affect actual behavior.",
    "task_id": "M0097-0069",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "register missing planner GUC stubs so that SET enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation, etc. no longer produce 'unrecognized'"
    ],
@@ -2603,7 +2610,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go:722-768 registers enable_parallel_hash, hash_mem_multiplier, from_collapse_limit, parallel_leader_participation as pure stubs"
+   "code_audit": "confirmed-open: enable_parallel_hash/hash_mem_multiplier/from_collapse_limit/parallel_leader_participation registered internal/config/defaults.go:785-823 + pg_settings catalog.go:9945-9988; zero references in internal/planner (the only cost/plan package) — pure accepted-and-ignored stubs"
   },
   {
    "feature": "I/O statistics tracking not implemented; pg_stat_io virtual table always returns empty rows.",
@@ -2651,6 +2658,7 @@
    "feature": "GUC stubs for jit, compute_query_id, and plan_cache_mode registered but not fully configured or functional.",
    "task_id": "M0097-0073",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "GUC stubs added"
    ],
@@ -2665,7 +2673,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go:283-304 registers jit, compute_query_id, plan_cache_mode as compatibility stubs only"
+   "code_audit": "confirmed-open: jit/compute_query_id/plan_cache_mode are compat stubs only (internal/config/defaults.go:288-310, comment 'Compatibility stubs for GUCs checked by pg_regress tests'), no functional consumers found repo-wide"
   },
   {
    "feature": "LANGUAGE C functions are accepted with only stub implementations that do not actually compile or execute C code",
@@ -3055,6 +3063,7 @@
    "feature": "Per-function SET configuration parameters are not tracked; all functions report NULL for the proconfig column.",
    "task_id": "DU-002",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg tracks no per-function SET clauses"
    ],
@@ -3069,7 +3078,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: initdb/pg_proc_view.go:220 - proconfig always NULL in views"
+   "code_audit": "confirmed-open: CREATE FUNCTION SET clause parsed-then-discarded (internal/parser/function.go:898-909, comment 'SET guc TO value — skip to end of clause'); proconfig hardcoded NULL at every emission site (internal/initdb/pg_proc_view.go:220,307,409,450,493; initdb.go:2625)"
   },
   {
    "feature": "ALTER TABLE … ALTER COLUMN RESET (…) is not implemented and is treated as a no-op; per-column options can be set but not cleared",
@@ -3159,6 +3168,7 @@
    "feature": "Autovacuum functionality is not implemented; autovacuum_vacuum_scale_factor values are stored and dumped for compatibility but do not trigger automatic vacuuming",
    "task_id": "M0110-0001",
    "resume_point": null,
+   "status": "open",
    "evidence": [
     "goopg has no autovacuum, so the value is advisory catalog/dump-only"
    ],
@@ -3173,7 +3183,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/executor/operators_ddl.go:1626 goopg has no autovacuum"
+   "code_audit": "PARTIAL, still open: real tick-based launcher exists (internal/autovacuum/launcher.go:83-222, dispatches VacuumWithOptions/Analyze incl. anti-wraparound XID-age forcing) but is unwired in cmd/goopg/main.go (server.Config.AutovacuumLauncher, internal/server/server.go:198,551-554, never set outside launcher_test.go); needsVacuum/needsAnalyze (launcher.go:204-222) ignore autovacuum_vacuum_scale_factor entirely, using a hardcoded RowCount>0 / XID-age check instead"
   },
   {
    "feature": "COLLATE and USING clauses in ALTER TYPE … ALTER ATTRIBUTE are accepted by the parser but their effects are ignored during execution",
