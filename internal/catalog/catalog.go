@@ -2056,8 +2056,8 @@ type InMemory struct {
 	// databaseConnLimit holds runtime `pg_database.datconnlimit` overrides
 	// written via `UPDATE pg_database SET datconnlimit = ... WHERE datname =
 	// ...` (M-NIGHTLY AI-20260707-000712-004 follow-up / AC-002 residual #1).
-	// Absent entries report 0 (PG's "no limit" default), matching the
-	// hard-coded value pg_database.VirtualRows used before this map existed.
+	// Absent entries report -1 (PG's "no limit" default, pg_database.h) via
+	// DatabaseConnLimit's comma-ok lookup.
 	databaseConnLimit map[string]int32
 	// dbRoleSettings holds per-database `ALTER DATABASE name SET config =
 	// value` overrides (pg_db_role_setting, setrole=0 scope only — ALTER
@@ -4522,12 +4522,16 @@ func (c *InMemory) DropDatabase(name string) error {
 const DatconnlimitInvalidDB int32 = -2
 
 // DatabaseConnLimit returns the runtime `pg_database.datconnlimit` override
-// recorded for name via SetDatabaseConnLimit, or 0 (PG's "no limit" default)
-// if none was ever set. M-NIGHTLY AI-20260707-000712-004 / AC-002 residual #1.
+// recorded for name via SetDatabaseConnLimit, or -1 (PG's "no limit" default,
+// pg_database.h) if none was ever set. M-NIGHTLY AI-20260707-000712-004 /
+// AC-002 residual #1.
 func (c *InMemory) DatabaseConnLimit(name string) int32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.databaseConnLimit[name]
+	if limit, ok := c.databaseConnLimit[name]; ok {
+		return limit
+	}
+	return -1
 }
 
 // SetDatabaseConnLimit records a runtime `datconnlimit` override for an
@@ -6338,8 +6342,9 @@ func (c *InMemory) registerSystemTables() {
 				"6",          // encoding: 6 = UTF8
 				datallowconn, // datallowconn: allow connections
 				// datconnlimit: runtime override via `UPDATE pg_database SET
-				// datconnlimit = ...` (SetDatabaseConnLimit), default 0 = no
-				// limit. vacuumdb/pg_amcheck filter on `datconnlimit <> -2`.
+				// datconnlimit = ...` (SetDatabaseConnLimit), default -1 = no
+				// limit (PG's pg_database.h default). vacuumdb/pg_amcheck
+				// filter on `datconnlimit <> -2`.
 				strconv.FormatInt(int64(c.DatabaseConnLimit(n)), 10),
 				datistemplate, // datistemplate: true for template0/template1
 				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2

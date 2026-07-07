@@ -2086,25 +2086,18 @@ prune-WAL round-trip). The four open items below carry the remaining unbuilt sco
       function call sites — the AM never dispatches through a per-index
       `FUNCTION 1` comparator, so a custom opclass is cataloged but inert.
       Both remain genuinely open, index-AM-level, not a single-loop slice.
-- [ ] **M0119-0006-DATCONNLIMIT-DEFAULT — URGENT, pick next** (found 2026-07-08
-      live-verifying an unrelated ALTER FUNCTION parser fix; see today's
-      deferral ledger "CRITICAL" row for the full write-up and exact fix).
-      `catalog.InMemory.DatabaseConnLimit(name)` returns the Go zero-value `0`
-      for any database that never had an explicit `SetDatabaseConnLimit` call
-      (i.e. every database in a fresh cluster) — but real PG's default is `-1`
-      (unlimited), not `0` ("reject all"). Combined with M0119-0006's
-      already-landed positive-datconnlimit enforcement
-      (`internal/server/server.go` ~line 959), this means **every
-      non-superuser role's first-ever connection to any database is
-      rejected** with `too many connections`. Zero test coverage today —
-      every existing datconnlimit test connects as the hardcoded superuser
-      name `"postgres"`, which bypasses the check. Fix: `DatabaseConnLimit`
-      should return `-1` (not the map's zero value) when no override was set
-      (comma-ok map lookup); also fix the stale "0 (PG's no limit default)"
-      comment at catalog.go:2059-2060 and check `pg_database`'s `VirtualRows`
-      builder for the same wrong-default assumption on the SELECT-side
-      render. Add a regression test: a fresh non-superuser role's first
-      connection to a never-limited database must succeed.
+- [x] **M0119-0006-DATCONNLIMIT-DEFAULT** (found 2026-07-08 live-verifying an
+      unrelated ALTER FUNCTION parser fix; fixed same-day in its own
+      follow-up loop — see deferral ledger's resolved row for the full
+      write-up). `catalog.InMemory.DatabaseConnLimit(name)` now returns `-1`
+      (comma-ok map lookup) instead of the Go zero-value `0` for any database
+      that never had an explicit `SetDatabaseConnLimit` call, matching real
+      PG's `pg_database.h` default. Fixed the stale "0 (PG's no limit
+      default)" comments at catalog.go; `pg_database`'s `VirtualRows` render
+      path needed no code change (already called `DatabaseConnLimit`).
+      Regression test `TestConnectNonSuperuserFirstConnectionUnlimitedDatabaseAccepted`
+      added (`internal/server/database_exists_test.go`), confirmed
+      non-vacuous.
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003). `030 recvlogical`
       — blocked on logical decoding (tracks the logical-replication milestone / D-004).
 
