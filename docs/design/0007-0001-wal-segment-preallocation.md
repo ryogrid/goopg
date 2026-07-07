@@ -105,11 +105,25 @@ when it sees a zero header, and the iterator breaks.
 - **`wal_recycle` (segment renaming).** Future loop. The recycler
   reuses an old segment file as the next zero-filled one rather than
   unlinking + zero-filling. Requires interaction with retention.
-- **Counters / observability.** `wal_segments_preallocated_total`,
-  `wal_init_zero_bytes_total` etc. are deferred — they want a
-  shared stats sink which doesn't yet exist.
 - **`posix_fallocate`.** Zero-write loop is the v0 implementation;
   faster preallocation primitives are out of scope.
+
+### Follow-up (2026-07-08): preallocation counters
+
+The shared stats sink this loop's "Counters / observability" bullet
+was waiting on now exists (`internal/stats.Counter`, a per-P sharded
+additive counter landed for the M0013-0003 WAL-buffer drain counters
+and the M0122-0003 fsync counters). `walBufferCounters` grows two more
+fields, `segmentsPreallocated` and `preallocatedBytes`, bumped once in
+`state.openSegment`'s `wasNew` branch — the same branch that calls
+`preallocateSegment` — so a re-open of an already-preallocated segment
+never double-counts. `Writer.SegmentsPreallocated()` /
+`Writer.PreallocatedBytes()` expose lifetime sums, surfaced as two new
+`pg_stat_wal_io` columns: `wal_segments_preallocated_total` and
+`wal_init_zero_bytes_total`. Both are `0` when `Preallocate` is off.
+See `internal/wal/wal_test.go`'s `TestPreallocationCounters` and
+`internal/initdb/wal_io_views_test.go`'s
+`TestStatWALIOPreallocationCounters`.
 
 ### Recovery semantics
 

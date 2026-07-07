@@ -6806,7 +6806,11 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		// Not a heap table — check if it's an index.
 		if idx, isIdx := o.ctx.Catalog.LookupIndex(s.Name); isIdx {
 			for _, act := range s.Actions {
-				if act.Kind == parser.AlterTableAlterColumnSet {
+				if act.Kind == parser.AlterTableAlterColumnSet || act.Kind == parser.AlterTableAlterColumnReset {
+					verb := "SET"
+					if act.Kind == parser.AlterTableAlterColumnReset {
+						verb = "RESET"
+					}
 					detail := "This operation is not supported for indexes."
 					if idx.Table != nil && len(idx.Table.PartitionKey) > 0 {
 						detail = "This operation is not supported for partitioned indexes."
@@ -6814,7 +6818,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return &ExecError{
 						Code:    "0A000",
 						Pos:     s.Pos(),
-						Message: fmt.Sprintf("ALTER action ALTER COLUMN ... SET cannot be performed on relation %q", s.Name.Name),
+						Message: fmt.Sprintf("ALTER action ALTER COLUMN ... %s cannot be performed on relation %q", verb, s.Name.Name),
 						Detail:  detail,
 					}
 				}
@@ -8043,6 +8047,55 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						changed = true
 						break
 					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
+		case parser.AlterTableAlterColumnReset:
+			// RESET (opt, …) — clear the named per-column attribute options,
+			// leaving any other recorded option untouched (mirrors upstream's
+			// ATExecResetOptions, which merges out only the named keys rather
+			// than clearing attoptions wholesale). Same heap re-sync rationale
+			// as AlterTableAlterColumnSet above: pg_attribute is a heap row
+			// populated at CREATE TABLE, so the catalog.Column mutation alone
+			// is invisible to pg_dump without the same delete+resync flush.
+			if act.ColumnName != "" && len(act.SetOptions) > 0 {
+				changed := false
+				for i := range tbl.Columns {
+					if !strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						continue
+					}
+					var kept []string
+					for _, existing := range tbl.Columns[i].Options {
+						name := existing
+						if eq := strings.IndexByte(existing, '='); eq >= 0 {
+							name = existing[:eq]
+						}
+						reset := false
+						for _, r := range act.SetOptions {
+							if strings.EqualFold(name, r) {
+								reset = true
+								break
+							}
+						}
+						if !reset {
+							kept = append(kept, existing)
+						}
+					}
+					if len(kept) != len(tbl.Columns[i].Options) {
+						tbl.Columns[i].Options = kept
+						changed = true
+					}
+					break
 				}
 				if changed && catalogHeapSyncAvailable(o.ctx) {
 					if err := o.ctx.MaterializeWriterXID(); err == nil {

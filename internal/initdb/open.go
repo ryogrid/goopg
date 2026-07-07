@@ -148,6 +148,13 @@ type OpenOptions struct {
 	// docs/design/0013-0001-wal-buffers-architecture.md.
 	WALBuffers int64
 
+	// WALSyncMethod forwards to wal.Config.SyncMethod, selecting
+	// the commit-path durability barrier. Empty resolves to
+	// wal.NewWriter's "fdatasync" default. Mirrors the
+	// `wal_sync_method` GUC. See
+	// docs/design/0007-0002-fdatasync-commit-path.md.
+	WALSyncMethod string
+
 	// AIO* control the AIO engine the storage manager (and
 	// future heap-scan / checkpointer / WAL-writer callers)
 	// will use. Maps to the upstream-aligned `io_method`,
@@ -354,6 +361,7 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		Preallocate:        opts.WALInitZero,
 		SenderMemoryBuffer: opts.WALSenderMemoryBuffer,
 		WALBuffers:         opts.WALBuffers,
+		SyncMethod:         opts.WALSyncMethod,
 		// M0101-0001: emit PG-compatible XLOG page headers so pg_waldump
 		// can parse the WAL segments. SystemID is embedded in every page
 		// header for cross-segment consistency checking.

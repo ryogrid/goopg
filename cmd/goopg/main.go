@@ -415,6 +415,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		walInitZero := boolGUC(registry, "wal_init_zero", true)
 		walSenderMemBuf := int64(intGUC(registry, "wal_sender_memory_buffer", 16<<20))
 		walBuffers := int64(intGUC(registry, "wal_buffers", 16<<20))
+		walSyncMethod := stringGUC(registry, "wal_sync_method", "fdatasync")
 		walWriterDelayMS := intGUC(registry, "wal_writer_delay", 200)
 		bgwriterDelayMS := intGUC(registry, "bgwriter_delay", 200)
 		bgwriterMaxPages := intGUC(registry, "bgwriter_lru_maxpages", 100)
@@ -440,6 +441,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			WALInitZero:           walInitZero,
 			WALSenderMemoryBuffer: walSenderMemBuf,
 			WALBuffers:            walBuffers,
+			WALSyncMethod:         walSyncMethod,
 			WalWriterDelay:        time.Duration(walWriterDelayMS) * time.Millisecond,
 			BgwriterDelay:         time.Duration(bgwriterDelayMS) * time.Millisecond,
 			BgwriterMaxPages:      bgwriterMaxPages,
@@ -874,7 +876,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 			}
 		}
 	}
-	addr, appName, user := parsePrimaryConninfoFull(conninfo)
+	addr, appName, user, sslmode := parsePrimaryConninfoFull(conninfo)
 	if addr == "" {
 		logger.Info("standby mode: primary_conninfo empty or missing host:port; walreceiver not started")
 		close(done)
@@ -911,6 +913,7 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 				Conninfo:        conninfo,
 				ApplicationName: appName,
 				ApplyLSNFunc:    applyLSNFunc,
+				SSLMode:         sslmode,
 			})
 			if err != nil {
 				logger.Warn("walreceiver dial failed; will retry",
@@ -956,23 +959,28 @@ func startWalreceiver(ctx context.Context, done chan struct{}, rt *initdb.Runtim
 // parsePrimaryConninfo extracts the host:port from a libpq-style
 // `key=value [key=value ...]` conninfo string. Defaults port to 5432
 // when host is given without one. Returns "" when no host is
-// provided. v0 honours only host + port; user / password / sslmode
-// follow in later loops.
+// provided. v0 honours host + port + sslmode; password follows in a
+// later loop once the replication connection speaks an auth
+// challenge (today it's trust-only, so a password has nowhere to go).
 func parsePrimaryConninfo(conninfo string) string {
-	addr, _, _ := parsePrimaryConninfoFull(conninfo)
+	addr, _, _, _ := parsePrimaryConninfoFull(conninfo)
 	return addr
 }
 
-// parsePrimaryConninfoFull extracts host:port, application_name, and user
-// override (if any) from a libpq-style `key=value [key=value ...]` conninfo
-// string. host:port defaults port to 5432; missing host yields empty addr.
-// application_name is forwarded to the primary in the startup parameters so
-// SyncRep can match the standby against synchronous_standby_names.
-// M0102-0005.
-func parsePrimaryConninfoFull(conninfo string) (addr, appName, user string) {
+// parsePrimaryConninfoFull extracts host:port, application_name, user
+// override, and sslmode (if any) from a libpq-style `key=value
+// [key=value ...]` conninfo string. host:port defaults port to 5432;
+// missing host yields empty addr. application_name is forwarded to
+// the primary in the startup parameters so SyncRep can match the
+// standby against synchronous_standby_names. M0102-0005. sslmode
+// defaults to libpq's "prefer" when unset; DialWalReceiver rejects
+// require/verify-ca/verify-full since goopg has no TLS implementation
+// (falling back to plaintext there would silently defeat the
+// operator's explicit encryption requirement).
+func parsePrimaryConninfoFull(conninfo string) (addr, appName, user, sslmode string) {
 	conninfo = strings.TrimSpace(conninfo)
 	if conninfo == "" {
-		return "", "", ""
+		return "", "", "", ""
 	}
 	host := ""
 	port := "5432"
@@ -992,12 +1000,14 @@ func parsePrimaryConninfoFull(conninfo string) (addr, appName, user string) {
 			appName = v
 		case "user":
 			user = v
+		case "sslmode":
+			sslmode = v
 		}
 	}
 	if host == "" {
-		return "", appName, user
+		return "", appName, user, sslmode
 	}
-	return host + ":" + port, appName, user
+	return host + ":" + port, appName, user, sslmode
 }
 
 // boolGUC reads a boolean GUC by name, returning fallback when the

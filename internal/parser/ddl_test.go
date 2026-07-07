@@ -915,6 +915,43 @@ func TestParseAlterIndexAlterColumnSet(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAlterColumnReset pins the `ALTER TABLE ... ALTER COLUMN
+// col RESET (opt, …)` parse branch — the RESET counterpart of the existing
+// SET (opt=value, …) per-column attribute option form. Bare option names
+// (no `=value`, unlike SET) must land on SetOptions verbatim.
+func TestParseAlterTableAlterColumnReset(t *testing.T) {
+	stmts, err := Parse("ALTER TABLE t ALTER COLUMN c RESET (n_distinct, n_distinct_inherited)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(stmts))
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTableStmt, got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 {
+		t.Fatalf("Actions len=%d, want 1", len(at.Actions))
+	}
+	act := at.Actions[0]
+	if act.Kind != AlterTableAlterColumnReset {
+		t.Errorf("Actions[0].Kind = %v, want AlterTableAlterColumnReset", act.Kind)
+	}
+	if act.ColumnName != "c" {
+		t.Errorf("ColumnName = %q, want %q", act.ColumnName, "c")
+	}
+	wantOpts := []string{"n_distinct", "n_distinct_inherited"}
+	if len(act.SetOptions) != len(wantOpts) {
+		t.Fatalf("SetOptions = %v, want %v", act.SetOptions, wantOpts)
+	}
+	for i, w := range wantOpts {
+		if act.SetOptions[i] != w {
+			t.Errorf("SetOptions[%d] = %q, want %q", i, act.SetOptions[i], w)
+		}
+	}
+}
+
 // TestParseAlterIndexSetReloptions pins the ALTER INDEX SET (param = value, …)
 // parse branch (design 0118-0140): `ALTER INDEX name SET (...)` — a SET clause
 // directly after the index name (no ALTER COLUMN) — now emits a single

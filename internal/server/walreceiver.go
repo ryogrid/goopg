@@ -29,6 +29,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,6 +96,16 @@ type WalReceiverConfig struct {
 	// three fields, matching the v0 (sync-replication-disabled)
 	// behaviour.
 	ApplyLSNFunc func() uint64
+
+	// SSLMode is the libpq sslmode requested in primary_conninfo.
+	// Empty is treated as libpq's "prefer" default. goopg has no TLS
+	// implementation, so "disable"/"allow"/"prefer" all connect in
+	// plaintext (matching what "prefer" would negotiate down to
+	// against any server that doesn't speak SSL); "require",
+	// "verify-ca", and "verify-full" are rejected by DialWalReceiver
+	// instead of silently downgrading to plaintext, since that would
+	// defeat the operator's explicit encryption requirement.
+	SSLMode string
 }
 
 // WalReceiver is the standby-side replication client. Construct via
@@ -122,6 +133,25 @@ type WalReceiver struct {
 	monHandle *wal.Receiver
 }
 
+// checkSSLMode rejects sslmode values that promise encryption goopg
+// cannot deliver. goopg has no TLS implementation, so a replication
+// connection is always plaintext; "disable"/"allow"/"prefer" (and
+// unset, which libpq defaults to "prefer") accept that transparently,
+// matching what those modes would negotiate down to against any real
+// server that doesn't speak SSL. "require"/"verify-ca"/"verify-full"
+// are refused instead of silently connecting in plaintext, since that
+// would defeat an operator's explicit encryption requirement.
+func checkSSLMode(mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "disable", "allow", "prefer":
+		return nil
+	case "require", "verify-ca", "verify-full":
+		return fmt.Errorf("walreceiver: sslmode=%s requires TLS, which goopg does not yet implement (use disable, allow, or prefer)", mode)
+	default:
+		return fmt.Errorf("walreceiver: invalid sslmode value %q", mode)
+	}
+}
+
 // DialWalReceiver opens the TCP connection, performs the v3 startup
 // handshake with `replication=true`, optionally consumes the auth /
 // parameter status / ReadyForQuery handshake, then issues
@@ -142,6 +172,9 @@ func DialWalReceiver(ctx context.Context, cfg WalReceiverConfig) (*WalReceiver, 
 	}
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 10 * time.Second
+	}
+	if err := checkSSLMode(cfg.SSLMode); err != nil {
+		return nil, err
 	}
 
 	dialCtx, cancel := context.WithTimeout(ctx, cfg.DialTimeout)

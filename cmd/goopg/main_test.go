@@ -645,8 +645,8 @@ func TestTransactionBuffersFromGUC_NilRegistry(t *testing.T) {
 }
 
 func TestParsePrimaryConninfoFull(t *testing.T) {
-	addr, appName, user := parsePrimaryConninfoFull(
-		"host=127.0.0.1 port=5544 user=ryo dbname=postgres application_name=standby_a")
+	addr, appName, user, sslmode := parsePrimaryConninfoFull(
+		"host=127.0.0.1 port=5544 user=ryo dbname=postgres application_name=standby_a sslmode=require")
 	if addr != "127.0.0.1:5544" {
 		t.Fatalf("addr = %q, want 127.0.0.1:5544", addr)
 	}
@@ -656,8 +656,11 @@ func TestParsePrimaryConninfoFull(t *testing.T) {
 	if user != "ryo" {
 		t.Fatalf("user = %q, want ryo", user)
 	}
+	if sslmode != "require" {
+		t.Fatalf("sslmode = %q, want require", sslmode)
+	}
 
-	addr, appName, user = parsePrimaryConninfoFull("host=127.0.0.1 application_name=standby_b")
+	addr, appName, user, sslmode = parsePrimaryConninfoFull("host=127.0.0.1 application_name=standby_b")
 	if addr != "127.0.0.1:5432" {
 		t.Fatalf("default-port addr = %q, want 127.0.0.1:5432", addr)
 	}
@@ -666,5 +669,8 @@ func TestParsePrimaryConninfoFull(t *testing.T) {
 	}
 	if user != "" {
 		t.Fatalf("default-port user = %q, want empty", user)
+	}
+	if sslmode != "" {
+		t.Fatalf("default sslmode = %q, want empty", sslmode)
 	}
 }

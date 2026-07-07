@@ -111,6 +111,56 @@ PY
 trap abort_cleanup EXIT
 trap 'exit 4' INT TERM
 
+# --- persist top-level batch logs to git on completion --------------------------
+# Commit & push ONLY the top-level report files, via explicit pathspec —
+# never `-A` / `.` / `commit -a` — so the concurrently-running ralph loop's
+# unrelated working-tree WIP is never swept into this commit. Best-effort: any
+# git failure is logged (to the run dir + a one-line progress note) but never
+# changes the batch verdict. Contention with the ralph loop's own commits is
+# absorbed by retrying around the shared .git index lock; the push is always a
+# fast-forward (or up-to-date) because origin only ever advances from this
+# single local clone.
+commit_and_push_logs() {
+    local glog="${RUN_DIR}/git-logs-push.log" branch try paths=() f
+    for f in ci/logs/action-items.md ci/logs/launch.log ci/logs/scheduler.log ci/logs/history.jsonl; do
+        [[ -e "${REPO_ROOT}/${f}" ]] && paths+=("${f}")
+    done
+    [[ ${#paths[@]} -gt 0 ]] || return 0
+    branch="$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if [[ -z "${branch}" || "${branch}" == "HEAD" ]]; then
+        progress "RUN" "log-push skipped (detached HEAD)"
+        return 0
+    fi
+
+    : > "${glog}"
+    # Stage only our three files (also picks up launch.log / scheduler.log the
+    # first time, when they are newly un-ignored and still untracked).
+    for try in 1 2 3 4 5; do
+        git -C "${REPO_ROOT}" add -- "${paths[@]}" >>"${glog}" 2>&1 && break
+        sleep 3
+    done
+    if git -C "${REPO_ROOT}" diff --cached --quiet -- "${paths[@]}" 2>/dev/null; then
+        progress "RUN" "log-push: no changes in batch log files — nothing to commit"
+        return 0
+    fi
+    for try in 1 2 3 4 5; do
+        git -C "${REPO_ROOT}" commit \
+            -m "chore(ci): nightly batch ${RUN_ID} logs (action-items, launch, scheduler, history)" \
+            -- "${paths[@]}" >>"${glog}" 2>&1 && break
+        sleep 3
+    done
+    local pushed=0
+    for try in 1 2 3 4 5; do
+        if git -C "${REPO_ROOT}" push origin "${branch}" >>"${glog}" 2>&1; then pushed=1; break; fi
+        sleep 5
+    done
+    if [[ ${pushed} -eq 1 ]]; then
+        progress "RUN" "log-push: committed + pushed batch logs to origin/${branch}"
+    else
+        progress "RUN" "log-push: commit done but push FAILED after retries — see ${glog#${REPO_ROOT}/}"
+    fi
+}
+
 # --- stage runner ---------------------------------------------------------------
 run_stage() {  # run_stage <name>  (records "<status> <elapsed>" in stages/<name>.status)
     local name="$1" t0=${SECONDS} rc=0 sp
@@ -190,4 +240,9 @@ COMPLETED=1
   while read -r d; do rm -rf -- "${d}"; done ) || true
 
 progress "RUN" "end status_rc=${final_rc} (0 pass / 2 fail / 3 inconclusive) — see summary.md"
+
+# Publish the top-level batch logs/report (must run AFTER the final progress
+# line above so the committed launch.log includes this run's "end" record).
+commit_and_push_logs || true
+
 exit ${final_rc}

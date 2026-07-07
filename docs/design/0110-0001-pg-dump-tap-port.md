@@ -15430,3 +15430,67 @@ Gates: `go build ./...` clean; `go test -count=1 ./internal/executor/...
 ./internal/catalog/... ./internal/parser/... ./internal/server/...
 ./internal/initdb/... ./internal/wal/...` PASS (no regressions);
 `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33).
+
+## Follow-up: `ALTER TABLE ... ALTER COLUMN col RESET (...)` (M0122-0007, 2026-07-08)
+
+Closes the `unimplemented_feat.json` gap for this milestone's own task_id:
+`ALTER TABLE ... ALTER COLUMN col SET (opt=value, …)` (slice 185, above) had
+no `RESET (opt, …)` counterpart — the parser's ALTER COLUMN dispatch
+(`internal/parser/ddl.go`) fell through to the generic "consume rest as
+no-op" branch for `RESET (...)`, so a previously-`SET` per-column attribute
+option (e.g. `n_distinct`) could never be cleared: the value stayed on
+`catalog.Column.Options` and pg_dump kept re-emitting the `SET (...)` clause
+forever.
+
+**Landed**: new `AlterTableAlterColumnReset` action kind
+(`internal/parser/ast.go`), parsed right after the existing `SET (...)`
+branch in the ALTER COLUMN dispatch (`internal/parser/ddl.go`) — reusing
+`parseColumnSetOptions` (it already accepts bare option names with no
+`=value`, exactly RESET's grammar) and the same `SetOptions []string` field
+SET already populates, now holding the bare names to clear. Unlike `SET`,
+`RESET` has no `STORAGE`/`COMPRESSION`/`STATISTICS`/`DEFAULT`/`NOT NULL`
+counterparts in upstream's grammar, so only the parenthesized attribute-list
+form is recognized.
+
+The executor case (`internal/executor/operators_ddl.go`) mirrors upstream's
+`ATExecResetOptions` (`postgres/src/backend/commands/tablecmds.c`): it
+merges the named keys OUT of the column's existing `Options` list rather
+than clearing it wholesale, so `SET (a=1, b=2)` followed by `RESET (a)`
+leaves `b=2` in place. Reuses the exact same heap-resync path slice 185's
+`SET` case already established (`pg_attribute` is a heap row populated at
+`CREATE TABLE`, not rendered live from `catalog.Table` — see
+[pg_attribute_alter_needs_heap_resync](../design/root-0012-executor.md) —
+so the in-memory mutation alone is invisible to `pg_dump` without the
+delete-old-rows-then-`syncTableToCatalogHeap` flush).
+
+Also extended the pre-existing `ALTER TABLE <index-name> ALTER COLUMN ...
+SET` "not supported for indexes" `0A000` guard
+(`internal/executor/operators_ddl.go`) to cover `RESET` too (same verb,
+parameterized message), so a `RESET` targeting an index name errors the same
+way `SET` already did instead of silently no-op'ing.
+
+**Tests**: `internal/parser/ddl_test.go`'s
+`TestParseAlterTableAlterColumnReset` (AST shape — action kind, column name,
+bare option names in order); `internal/executor/
+operators_ddl_alter_column_reset_test.go`'s
+`TestAlterColumnResetOptionsClearsNamedEntriesOnly` (SQL-level: `SET` two
+options, `RESET` one, assert the catalog column keeps only the un-reset
+entry, and that `pg_attribute.attoptions` — via `buildUserPGAttributeRow`,
+the same row-builder slice 185's own test drives directly — renders only the
+surviving option). Confirmed non-vacuous via `git stash` on the parser/
+executor changes alone: fails with `Options = [n_distinct=0.5
+n_distinct_inherited=-0.1]`, i.e. `RESET` left both entries untouched, as
+predicted.
+
+**Still open**: `ALTER INDEX name ALTER COLUMN col RESET (...)` (the
+index-opclass-option grammar, parsed by a separate ALTER INDEX-specific
+branch in `ddl.go`) is unchanged — out of scope here, since `SET` on that
+same path already deliberately raises `0A000` for goopg v0
+(M0097-0023 btree_index parity), so there was no working `RESET` behavior to
+preserve or regress.
+
+Gates: `go build ./...` clean; `go test -count=1 ./internal/parser/...
+./internal/executor/... ./internal/planner/... ./internal/catalog/...`
+PASS; `scripts/tpch-spotcheck.sh` PASS (Q12=2, Q13=33);
+`RALPH_PRECOMMIT_SCOPE=smoke bash scripts/ralph-precommit-test.sh` PASS
+(0 failed transactions, all 3 workloads).

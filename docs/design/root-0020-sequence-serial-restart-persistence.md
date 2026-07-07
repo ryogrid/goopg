@@ -115,8 +115,41 @@ gaps, both fixed in the follow-up commit:
   `StoreAttrDefault`). A deparse/reparse gap for an exotic expression degrades
   to the pre-record NULL-default state for that column only.
 
+## Follow-up (2026-07-08): `pg_get_serial_sequence()` real dependency lookup
+
+`pg_get_serial_sequence(table, column)` (`internal/executor/expr.go`) was a
+stub that fabricated `"public." + table + "_" + column + "_seq"` by naming
+convention regardless of whether the column actually owned a sequence. This
+diverged from real PG (`ruleutils.c`'s `pg_get_serial_sequence`, which scans
+`pg_depend` for an auto/internal dependency from a sequence onto the column)
+in three ways: it returned a name for plain non-serial columns (should be
+NULL), it kept returning the old name after the sequence was renamed, and it
+ignored a non-conventional `ALTER SEQUENCE ... OWNED BY` target.
+
+Fixed by routing through the OWNED-BY tracking this design doc's own family
+already maintains (`SetSequenceOwnedBy`/`FindSequenceOwnedBy`,
+`operators_sequence.go` — populated by every SERIAL/IDENTITY column
+registration and by explicit `ALTER SEQUENCE ... OWNED BY`, previously only
+consumed by `autoGenerateSerialValues`'s rename fallback). The function now
+strips any schema qualifier off the table argument, looks up the owning
+sequence by `table.column`, and returns NULL when none is found; the result
+is schema-qualified via the sequence's own `seqState.schema` and the shared
+`pgQuoteIdent` quoter, mirroring PG's unconditionally-qualified
+`generate_qualified_relation_name`.
+
+Known residual (recorded in `.ralph/deferral_ledger.md`, not fixed here): an
+explicit `OWNED BY` naming a schema-qualified table (e.g. `myschema.t.c`) is
+stored verbatim by the DDL path instead of normalized to the bare
+`table.column` form the implicit SERIAL/IDENTITY path always uses, so the new
+lookup's bare-form match can miss that one spelling — a narrow, pre-existing
+inconsistency, not introduced by this fix.
+
 ## Tests
 
+- `internal/executor/operators_pg_get_serial_sequence_test.go` — serial
+  column resolves to its real sequence; a plain non-serial column returns
+  NULL; a renamed sequence is followed correctly; an identity column
+  resolves too.
 - `internal/testport/serial_sequence_durability_test.go` —
   `TestPort_SerialSequenceSurvivesRestart`: BIGSERIAL auto-gen continues
   strictly above the pre-restart max (within the 32-value gap) after a clean

@@ -58,7 +58,8 @@ func TestStatWALIORendersWriterCounters(t *testing.T) {
 	// send_buffer_capacity_bytes, send_buffer_bytes_resident,
 	// send_buffer_hits, send_buffer_misses, wal_buffers_capacity_bytes,
 	// wal_buffers_bytes_resident, wal_buffers_overflow_drain_bytes,
-	// wal_buffers_flush_drain_bytes, format_version.
+	// wal_buffers_flush_drain_bytes, wal_segments_preallocated_total,
+	// wal_init_zero_bytes_total, format_version.
 	if row[0] != "65536" {
 		t.Errorf("send_buffer_capacity_bytes=%q, want 65536", row[0])
 	}
@@ -76,6 +77,66 @@ func TestStatWALIORendersWriterCounters(t *testing.T) {
 	if err != nil || resident == 0 {
 		t.Errorf("send_buffer_bytes_resident=%q, want > 0 after Append (err=%v)", row[1], err)
 	}
+}
+
+// TestStatWALIOPreallocationCounters pins the M0007 preallocation
+// counters follow-up: with Config.Preallocate on, opening the first
+// segment bumps wal_segments_preallocated_total to 1 and
+// wal_init_zero_bytes_total to the configured SegmentSize; with
+// Preallocate off (the default), both stay "0".
+func TestStatWALIOPreallocationCounters(t *testing.T) {
+	t.Run("preallocate-on", func(t *testing.T) {
+		const segSize = 8192
+		w, err := wal.NewWriter(wal.Config{
+			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
+			SegmentSize: segSize,
+			Preallocate: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		if _, _, err := w.Append([]byte("first-record")); err != nil {
+			t.Fatal(err)
+		}
+		cat := catalog.NewInMemory()
+		if err := registerStatWALIOView(cat, w); err != nil {
+			t.Fatal(err)
+		}
+		tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
+		row := tbl.VirtualRows()[0]
+		if row[8] != "1" {
+			t.Errorf("wal_segments_preallocated_total=%q, want 1", row[8])
+		}
+		if row[9] != strconv.Itoa(segSize) {
+			t.Errorf("wal_init_zero_bytes_total=%q, want %d", row[9], segSize)
+		}
+	})
+	t.Run("preallocate-off", func(t *testing.T) {
+		w, err := wal.NewWriter(wal.Config{
+			WALDir:      filepath.Join(t.TempDir(), "pg_wal"),
+			SegmentSize: 8192,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		if _, _, err := w.Append([]byte("first-record")); err != nil {
+			t.Fatal(err)
+		}
+		cat := catalog.NewInMemory()
+		if err := registerStatWALIOView(cat, w); err != nil {
+			t.Fatal(err)
+		}
+		tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_stat_wal_io"})
+		row := tbl.VirtualRows()[0]
+		if row[8] != "0" {
+			t.Errorf("wal_segments_preallocated_total=%q, want 0", row[8])
+		}
+		if row[9] != "0" {
+			t.Errorf("wal_init_zero_bytes_total=%q, want 0", row[9])
+		}
+	})
 }
 
 // TestStatWALIOFormatVersionColumn pins the M0014-0004 step-2
