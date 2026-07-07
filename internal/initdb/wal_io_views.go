@@ -31,6 +31,10 @@ import (
 //   - wal_buffers_bytes_resident (M0013-0003): live byte count in buffer.
 //   - wal_buffers_overflow_drain_bytes (M0013-0003): lifetime bytes drained on overflow.
 //   - wal_buffers_flush_drain_bytes (M0013-0003): lifetime bytes drained by FlushUpTo.
+//   - wal_segments_preallocated_total (M0007 follow-up): lifetime count of new WAL
+//     segments zero-filled by preallocateSegment.
+//   - wal_init_zero_bytes_total (M0007 follow-up): lifetime bytes written zero-filling
+//     new WAL segments.
 //   - format_version (M0014-0004): active on-disk WAL format (`legacy` / `pgcompat`).
 func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 	tbl := &catalog.Table{
@@ -45,6 +49,8 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			{Name: "wal_buffers_bytes_resident", Type: catalog.Type{Name: "text"}},
 			{Name: "wal_buffers_overflow_drain_bytes", Type: catalog.Type{Name: "text"}},
 			{Name: "wal_buffers_flush_drain_bytes", Type: catalog.Type{Name: "text"}},
+			{Name: "wal_segments_preallocated_total", Type: catalog.Type{Name: "text"}},
+			{Name: "wal_init_zero_bytes_total", Type: catalog.Type{Name: "text"}},
 			{Name: "format_version", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
@@ -71,6 +77,8 @@ func registerStatWALIOView(cat *catalog.InMemory, w *wal.Writer) error {
 			fmt.Sprintf("%d", w.WALBuffersBytesResident()),
 			fmt.Sprintf("%d", w.WALBuffersOverflowDrainBytes()),
 			fmt.Sprintf("%d", w.WALBuffersFlushDrainBytes()),
+			fmt.Sprintf("%d", w.SegmentsPreallocated()),
+			fmt.Sprintf("%d", w.PreallocatedBytes()),
 			w.Format().String(),
 		}}
 	}

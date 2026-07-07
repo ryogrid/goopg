@@ -246,6 +246,69 @@ func TestPreallocatedSegmentIsFullSize(t *testing.T) {
 	}
 }
 
+// TestPreallocationCounters pins the M0007 "Counters / observability"
+// follow-up: SegmentsPreallocated/PreallocatedBytes stay at 0 when
+// Preallocate is off, and count each newly zero-filled segment
+// (not re-opens of an already-preallocated one) when it's on.
+func TestPreallocationCounters(t *testing.T) {
+	t.Run("disabled", func(t *testing.T) {
+		walDir := filepath.Join(t.TempDir(), "pg_wal")
+		w, err := NewWriter(Config{WALDir: walDir, SegmentSize: 1024})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		if _, _, err := w.Append([]byte("short")); err != nil {
+			t.Fatal(err)
+		}
+		if got := w.SegmentsPreallocated(); got != 0 {
+			t.Errorf("SegmentsPreallocated=%d want 0 (Preallocate off)", got)
+		}
+		if got := w.PreallocatedBytes(); got != 0 {
+			t.Errorf("PreallocatedBytes=%d want 0 (Preallocate off)", got)
+		}
+	})
+	t.Run("enabled across rollover", func(t *testing.T) {
+		walDir := filepath.Join(t.TempDir(), "pg_wal")
+		const segSize = int64(1024)
+		w, err := NewWriter(Config{WALDir: walDir, SegmentSize: segSize, Preallocate: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w.Close()
+		if _, _, err := w.Append([]byte("short")); err != nil {
+			t.Fatal(err)
+		}
+		if got := w.SegmentsPreallocated(); got != 1 {
+			t.Errorf("SegmentsPreallocated=%d want 1 after first segment", got)
+		}
+		if got := w.PreallocatedBytes(); got != segSize {
+			t.Errorf("PreallocatedBytes=%d want %d after first segment", got, segSize)
+		}
+		// Re-opening the same (already preallocated) segment must not
+		// double-count: openSegment's wasNew branch only fires on
+		// first-time creation.
+		if _, _, err := w.Append([]byte("more")); err != nil {
+			t.Fatal(err)
+		}
+		if got := w.SegmentsPreallocated(); got != 1 {
+			t.Errorf("SegmentsPreallocated=%d want 1 still (no re-preallocation)", got)
+		}
+		// Force a rollover into segment 1 with a big payload; its
+		// first write must bump the counters again.
+		big := make([]byte, segSize)
+		if _, _, err := w.Append(big); err != nil {
+			t.Fatal(err)
+		}
+		if got := w.SegmentsPreallocated(); got != 2 {
+			t.Errorf("SegmentsPreallocated=%d want 2 after rollover", got)
+		}
+		if got := w.PreallocatedBytes(); got != 2*segSize {
+			t.Errorf("PreallocatedBytes=%d want %d after rollover", got, 2*segSize)
+		}
+	})
+}
+
 // TestPreallocatedSegmentRecoversCleanly: write three records
 // into a preallocated segment, close, reopen with the same
 // config. Recovery's WrittenLSN matches the third record's end

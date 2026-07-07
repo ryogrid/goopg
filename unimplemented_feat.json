@@ -499,7 +499,7 @@
    "feature": "Counters for WAL preallocation metrics and monitoring.",
    "task_id": "M0007",
    "resume_point": null,
-   "status": "open",
+   "status": "resolved",
    "evidence": [
     "counters ... remain deferred"
    ],
@@ -514,7 +514,7 @@
     "later_commits": "superseded-by-code-audit"
    },
    "confidence": "high",
-   "code_audit": "confirmed-open: internal/config/defaults.go: WAL preallocation metrics not found"
+   "code_audit": "resolved 2026-07-08: internal/wal/writer.go walBufferCounters.segmentsPreallocated/preallocatedBytes (stats.Counter, bumped in state.openSegment's wasNew branch) + Writer.SegmentsPreallocated()/PreallocatedBytes() + pg_stat_wal_io wal_segments_preallocated_total/wal_init_zero_bytes_total columns (internal/initdb/wal_io_views.go)."
   },
   {
    "feature": "parsePrimaryConninfo does not parse user, sslmode, password, and other libpq parameters beyond host and port",

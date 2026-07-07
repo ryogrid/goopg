@@ -481,6 +481,17 @@ type walBufferCounters struct {
 	// op counts are never gated on track_io_timing, only their _time
 	// siblings are — see Writer.sharedFsyncTimeNanos).
 	fsyncCount stats.Counter
+
+	// segmentsPreallocated and preallocatedBytes are the lifetime count
+	// of new WAL segments zero-filled by preallocateSegment and the
+	// total bytes written doing so — the "Counters / observability"
+	// follow-up deferred by 0007-0001-wal-segment-preallocation.md
+	// (wal_segments_preallocated_total / wal_init_zero_bytes_total).
+	// Both are bumped together in state.openSegment, only on the
+	// wasNew branch (a re-open of an existing segment never
+	// preallocates and must not double-count).
+	segmentsPreallocated stats.Counter
+	preallocatedBytes    stats.Counter
 }
 
 // drainReason classifies which counter a drainBufferBytes call
@@ -650,6 +661,27 @@ func (w *Writer) AddFsyncTimeNanos(n int64) {
 // pg_stat_io's fsync_time column. Atomic load.
 func (w *Writer) FsyncTimeNanos() int64 {
 	return w.sharedFsyncTimeNanos.Load()
+}
+
+// SegmentsPreallocated returns the lifetime count of new WAL segments
+// zero-filled by preallocateSegment (wal_segments_preallocated_total).
+// Zero when Config.Preallocate is off, since openSegment's wasNew
+// branch — the only call site — never runs. Atomic load.
+func (w *Writer) SegmentsPreallocated() int64 {
+	if w.walBufferCounters == nil {
+		return 0
+	}
+	return w.walBufferCounters.segmentsPreallocated.Sum()
+}
+
+// PreallocatedBytes returns the lifetime total bytes written by
+// preallocateSegment zero-filling new WAL segments
+// (wal_init_zero_bytes_total). Atomic load.
+func (w *Writer) PreallocatedBytes() int64 {
+	if w.walBufferCounters == nil {
+		return 0
+	}
+	return w.walBufferCounters.preallocatedBytes.Sum()
 }
 
 // WrittenLSN returns the LSN of the last byte the writer has
@@ -1965,6 +1997,10 @@ func (s *state) openSegment(segNo uint64) (*os.File, error) {
 		if err := preallocateSegment(f, s.cfg.SegmentSize); err != nil {
 			_ = f.Close()
 			return nil, err
+		}
+		if s.walBufferCounters != nil {
+			s.walBufferCounters.segmentsPreallocated.Add(1)
+			s.walBufferCounters.preallocatedBytes.Add(s.cfg.SegmentSize)
 		}
 		// Directory fsync makes the new dirent durable. Mirrors
 		// upstream's fsync_fname behaviour.
