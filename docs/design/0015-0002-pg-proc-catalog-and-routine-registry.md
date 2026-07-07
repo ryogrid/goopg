@@ -226,16 +226,27 @@ Tests: `TestParseAlterFunctionOwner`/`TestParseAlterFunctionSetSchema`/
 extended to cover both new record kinds end-to-end through a real WAL
 flush + reopen (initdb).
 
-**Still open:** the generic `SET config_param {TO|=} value` / `SET
-config_param FROM CURRENT` / `RESET` clauses on `ALTER FUNCTION` (legitimate
-PostgreSQL grammar per `gram.y`'s `common_func_opt_item: FunctionSetResetClause`,
-combinable with `VOLATILE`/etc in the same statement, unlike `OWNER
-TO`/`RENAME TO`/`SET SCHEMA`) were unreachable dead code before this loop
-(same `KwSet`-vs-`TokenIdent` bug) and remain broken after it — the fix only
-repaired the `SET SCHEMA` sub-branch inside that block. `SET name = value`
-fails because `acceptSymbol("=")` only matches `TokenSymbol`, not the
-`TokenOperator` kind `=` actually lexes as; `SET name FROM CURRENT` fails
-because the code checks for a literal `"from"` immediately after `SET`
-instead of parsing the config-parameter name first. Not a regression (this
-whole form was already a syntax error before this loop), but now a
-correctly-scoped, separately-fixable gap — see the deferral ledger.
+**Was still open, now closed (2026-07-08 follow-up):** the generic `SET
+config_param {TO|=} value` / `SET config_param FROM CURRENT` / `RESET`
+clauses on `ALTER FUNCTION` (legitimate PostgreSQL grammar per `gram.y`'s
+`common_func_opt_item: FunctionSetResetClause`, combinable with
+`VOLATILE`/etc in the same statement, unlike `OWNER TO`/`RENAME TO`/`SET
+SCHEMA`) were unreachable dead code before the row above's loop (same
+`KwSet`-vs-`TokenIdent` bug) and remained broken after it — that fix only
+repaired the `SET SCHEMA` sub-branch inside the block. This follow-up widened
+the `=`-acceptance check to also match `TokenOperator` (`=` doesn't lex as
+`TokenSymbol` in this lexer) and restructured the branch so the
+config-parameter name is always parsed before checking for `TO`/`=`/`FROM
+CURRENT`, matching `gram.y`'s actual `var_name {TO|=} var_value | var_name
+FROM CURRENT` order (the old code incorrectly checked for a literal `"from"`
+token immediately after `SET`, as if `FROM` itself could be the parameter
+name). All forms remain parse-only no-ops (goopg has no per-function
+GUC-override storage) — same as `RESET` already was. Verified live: all 5
+previously-broken forms (`SET x TO v`, `SET x = v`, `SET x FROM CURRENT`,
+`SET x TO DEFAULT`, `RESET x`, `RESET ALL`) now return `ALTER FUNCTION`
+instead of a syntax error. Test: `TestParseAlterFunctionGenericSetReset`
+(parser). **Still open, narrower:** a comma-separated value list (`SET
+search_path = app, public`, real PG `var_list` grammar) still errors — the
+no-op branch only ever consumed a single value token, a pre-existing
+limitation unchanged by this fix (not previously verified live; confirmed
+open by this follow-up's live testing) — see the deferral ledger.

@@ -7268,7 +7268,8 @@ func (p *parser) parseAlter() (Stmt, error) {
 				continue
 			}
 			// SET SCHEMA schema — store the new schema in stmt (M0097-0150).
-			// SET guc_name {TO|=} value | SET FROM CURRENT remain no-ops. SET
+			// SET guc_name {TO|=} value | SET guc_name FROM CURRENT remain
+			// no-ops (goopg has no per-function GUC-override storage). SET
 			// itself is a real keyword token (KwSet), not an ident — as is
 			// FROM (KwFrom) below; both were previously matched against
 			// TokenIdent, so this whole branch was unreachable dead code
@@ -7281,19 +7282,25 @@ func (p *parser) parseAlter() (Stmt, error) {
 					if schemaTok, err := p.parseIdent(); err == nil {
 						stmt.NewSchema = identText(schemaTok)
 					}
-				} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom {
-					p.advance() // FROM
-					p.acceptIdentKeyword("current")
 				} else {
-					// SET guc_name {TO|=} value — consume name and value as no-op.
+					// SET guc_name {TO|=} value | SET guc_name FROM CURRENT —
+					// per gram.y's var_name comes first, THEN the
+					// TO/=/FROM-CURRENT form (unlike RESET, "FROM" is never
+					// the guc name here since a bare "SET FROM" isn't valid
+					// PG grammar either way).
 					p.advance() // guc name (or quoted name)
-					if p.acceptKeyword(KwTo) || p.acceptSymbol("=") {
-						// Consume the value (could be DEFAULT, a literal, or FROM CURRENT).
-						if p.acceptIdentKeyword("default") || p.acceptIdentKeyword("from") {
-							p.acceptIdentKeyword("current")
-						} else {
-							p.advance() // value token
-						}
+					if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+						p.advance()
+					} else {
+						p.acceptKeyword(KwTo)
+					}
+					if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwFrom {
+						p.advance() // FROM
+						p.acceptIdentKeyword("current")
+					} else if p.acceptIdentKeyword("default") {
+						// value already consumed
+					} else if p.cur().Kind != TokenSymbol || p.cur().Value != ";" {
+						p.advance() // value token
 					}
 				}
 				continue

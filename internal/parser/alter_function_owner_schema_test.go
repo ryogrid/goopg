@@ -110,3 +110,50 @@ func TestParseAlterFunctionRenameAndVolatileStillWork(t *testing.T) {
 		t.Errorf("Strict = %v, want true", af.Strict)
 	}
 }
+
+// TestParseAlterFunctionGenericSetReset pins the generic `ALTER FUNCTION
+// name(args) SET guc_name {TO|=} value | SET guc_name FROM CURRENT | RESET
+// guc_name | RESET ALL` forms (gram.y's `common_func_opt_item:
+// FunctionSetResetClause`). Before this fix these all hit a syntax error:
+// the outer SET-detection gate matched only TokenIdent "set" (SET actually
+// lexes as the keyword KwSet), and even once that was fixed
+// (M0097-0150's OWNER TO/SET SCHEMA loop), `=` lexes as TokenOperator not
+// TokenSymbol so `acceptSymbol("=")` never matched, and the FROM-CURRENT
+// branch looked for a literal "from" token immediately after SET instead of
+// parsing the guc name first. goopg has no per-function GUC-override
+// storage, so all of these remain no-ops (parse-only, no dedicated
+// AlterFunctionStmt field) — this test only guards that they parse without
+// error and don't clobber unrelated fields/leave the statement stream
+// desynced.
+func TestParseAlterFunctionGenericSetReset(t *testing.T) {
+	cases := []struct {
+		sql  string
+		name string
+	}{
+		{sql: "ALTER FUNCTION myfunc(int4) SET search_path TO app", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) SET search_path = app", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) SET search_path FROM CURRENT", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) SET search_path TO DEFAULT", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) RESET search_path", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) RESET ALL", name: "myfunc"},
+		{sql: "ALTER FUNCTION myfunc(int4) IMMUTABLE SET search_path = app", name: "myfunc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			af, ok := stmts[0].(*AlterFunctionStmt)
+			if !ok {
+				t.Fatalf("stmt type = %T, want *AlterFunctionStmt", stmts[0])
+			}
+			if af.Name.Name != tc.name {
+				t.Errorf("Name.Name = %q, want %q", af.Name.Name, tc.name)
+			}
+			if af.NewSchema != "" {
+				t.Errorf("NewSchema = %q, want empty (SET guc_name is a distinct no-op form from SET SCHEMA)", af.NewSchema)
+			}
+		})
+	}
+}

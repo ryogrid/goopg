@@ -3311,6 +3311,41 @@ mirroring M0119's ledger `status` column.
       ./internal/initdb/... ./internal/planner/...` PASS; `scripts/tpch-spotcheck.sh`
       PASS (Q12=2/Q13=33); `RALPH_PRECOMMIT_SCOPE=smoke
       scripts/ralph-precommit-test.sh` PASS (0 failed, all 3 workloads).
+      **Generic `ALTER FUNCTION ... SET config_param {TO|=} value` / `SET
+      config_param FROM CURRENT` / `RESET` — done (2026-07-08 follow-up,
+      M0097-0150):** closed the resume point the row above deferred.
+      `internal/parser/ddl.go`'s ALTER FUNCTION `SET` branch widened its
+      `=`-acceptance check to also match `TokenOperator` (previously only
+      `TokenSymbol`, but `=` actually lexes as `TokenOperator` in this
+      lexer — the established `(Kind == TokenSymbol || Kind ==
+      TokenOperator) && Value == "="` idiom used elsewhere in the file was
+      missing here), and restructured so the config-param name is always
+      parsed BEFORE checking for `TO`/`=`/`FROM CURRENT`, matching real
+      `gram.y`'s `var_name {TO|=} var_value | var_name FROM CURRENT`
+      grammar order (the old code checked for a literal `"from"` token
+      immediately after `SET`, as if `FROM` could itself be the param
+      name — a form that doesn't exist in PG's grammar). All forms remain
+      parse-only no-ops (goopg has no per-function GUC-override storage),
+      matching the pre-existing `RESET` behavior. New test
+      `TestParseAlterFunctionGenericSetReset` (parser,
+      `alter_function_owner_schema_test.go`) covers `SET name TO value`,
+      `SET name = value`, `SET name FROM CURRENT`, `SET name TO DEFAULT`,
+      `RESET name`, `RESET ALL`, and a VOLATILE-combined form; confirmed
+      non-vacuous via `git stash` on `ddl.go` alone (3/7 cases fail
+      pre-fix with the exact predicted syntax errors). Verified live
+      against the real `cmd/goopg` binary: all 5 previously-broken forms
+      now return `ALTER FUNCTION` instead of a syntax error, function
+      stayed callable throughout. Discovered live (new, narrower,
+      pre-existing gap — see today's second deferral ledger row): a
+      comma-separated value list (`SET search_path = app, public`, real
+      PG `var_list` grammar) still errors — the no-op branch only ever
+      consumed a single value token, unchanged from before this fix.
+      Gates: `go build ./...`/`go vet ./...` clean; `go test
+      ./internal/parser/... ./internal/executor/... ./internal/wal/...
+      ./internal/initdb/... ./internal/planner/...` PASS;
+      `scripts/tpch-spotcheck.sh` PASS (Q12=2/Q13=33);
+      `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh` PASS
+      (0 failed, all 3 workloads).
       **Still open** (this bucket, ~11 remaining items): CREATE/DROP DATABASE
       full DDL (architecturally larger — goopg is currently single-database;
       `DROP DATABASE` always reports does-not-exist by design), REINDEX
@@ -3318,8 +3353,8 @@ mirroring M0119's ledger `status` column.
       index rebuild remains a no-op — separately-scoped, larger), tablespaces,
       `ALTER TABLE ... ALTER COLUMN RESET (...)` (unrelated to today's ALTER
       FUNCTION work — confirmed-open at ddl.go per `unimplemented_feat.json`),
-      planner/jit GUC stubs, plus the generic ALTER FUNCTION `SET`/`RESET`
-      parser gap this loop's own deferral ledger row just recorded.
+      planner/jit GUC stubs, plus the ALTER FUNCTION `SET`-value comma-list
+      gap this loop's own follow-up deferral ledger row just recorded.
 - [ ] **M0122-0008 — Auth / roles / multi-DB isolation / encoding** (~6). SASLprep
       / channel binding / `scram_iterations`, RBAC + `SET SESSION AUTHORIZATION`,
       encoding constraints during bootstrap/runtime.
